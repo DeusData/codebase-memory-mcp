@@ -1,0 +1,279 @@
+package store
+
+import "testing"
+
+func TestOpenMemory(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer s.Close()
+}
+
+func TestNodeCRUD(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer s.Close()
+
+	// Create project first
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+
+	// Insert node
+	n := &Node{
+		Project:       "test",
+		Label:         "Function",
+		Name:          "Foo",
+		QualifiedName: "test.main.Foo",
+		FilePath:      "main.go",
+		StartLine:     10,
+		EndLine:       20,
+		Properties:    map[string]any{"signature": "func Foo(x int) error"},
+	}
+	id, err := s.UpsertNode(n)
+	if err != nil {
+		t.Fatalf("UpsertNode: %v", err)
+	}
+	if id == 0 {
+		t.Fatal("expected non-zero id")
+	}
+
+	// Find by QN
+	found, err := s.FindNodeByQN("test", "test.main.Foo")
+	if err != nil {
+		t.Fatalf("FindNodeByQN: %v", err)
+	}
+	if found == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if found.Name != "Foo" {
+		t.Errorf("expected Foo, got %s", found.Name)
+	}
+	if found.Properties["signature"] != "func Foo(x int) error" {
+		t.Errorf("unexpected signature: %v", found.Properties["signature"])
+	}
+
+	// Find by name
+	nodes, err := s.FindNodesByName("test", "Foo")
+	if err != nil {
+		t.Fatalf("FindNodesByName: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(nodes))
+	}
+
+	// Count
+	count, err := s.CountNodes("test")
+	if err != nil {
+		t.Fatalf("CountNodes: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1, got %d", count)
+	}
+}
+
+func TestNodeDedup(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+
+	// Insert same qualified_name twice — should update, not duplicate
+	n1 := &Node{Project: "test", Label: "Function", Name: "Foo", QualifiedName: "test.main.Foo"}
+	n2 := &Node{Project: "test", Label: "Function", Name: "Foo", QualifiedName: "test.main.Foo", Properties: map[string]any{"updated": true}}
+
+	s.UpsertNode(n1)
+	s.UpsertNode(n2)
+
+	count, _ := s.CountNodes("test")
+	if count != 1 {
+		t.Errorf("expected 1 node after dedup, got %d", count)
+	}
+
+	// Verify it was updated
+	found, _ := s.FindNodeByQN("test", "test.main.Foo")
+	if found.Properties["updated"] != true {
+		t.Error("expected updated property")
+	}
+}
+
+func TestEdgeCRUD(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+
+	// Create two nodes
+	id1, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "A", QualifiedName: "test.A"})
+	id2, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "B", QualifiedName: "test.B"})
+
+	// Insert edge
+	_, err = s.InsertEdge(&Edge{Project: "test", SourceID: id1, TargetID: id2, Type: "CALLS"})
+	if err != nil {
+		t.Fatalf("InsertEdge: %v", err)
+	}
+
+	// Find by source
+	edges, err := s.FindEdgesBySource(id1)
+	if err != nil {
+		t.Fatalf("FindEdgesBySource: %v", err)
+	}
+	if len(edges) != 1 {
+		t.Fatalf("expected 1 edge, got %d", len(edges))
+	}
+	if edges[0].Type != "CALLS" {
+		t.Errorf("expected CALLS, got %s", edges[0].Type)
+	}
+
+	// Count
+	count, _ := s.CountEdges("test")
+	if count != 1 {
+		t.Errorf("expected 1, got %d", count)
+	}
+}
+
+func TestCascadeDelete(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer s.Close()
+
+	// Create project with nodes and edges
+	s.UpsertProject("test", "/tmp/test")
+	id1, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "A", QualifiedName: "test.A"})
+	id2, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "B", QualifiedName: "test.B"})
+	s.InsertEdge(&Edge{Project: "test", SourceID: id1, TargetID: id2, Type: "CALLS"})
+
+	// Delete project — should cascade
+	if err := s.DeleteProject("test"); err != nil {
+		t.Fatalf("DeleteProject: %v", err)
+	}
+
+	nodes, _ := s.CountNodes("test")
+	edges, _ := s.CountEdges("test")
+	if nodes != 0 {
+		t.Errorf("expected 0 nodes after cascade, got %d", nodes)
+	}
+	if edges != 0 {
+		t.Errorf("expected 0 edges after cascade, got %d", edges)
+	}
+}
+
+func TestProjectCRUD(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer s.Close()
+
+	// Create
+	if err := s.UpsertProject("myproject", "/home/user/myproject"); err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+
+	// Get
+	p, err := s.GetProject("myproject")
+	if err != nil {
+		t.Fatalf("GetProject: %v", err)
+	}
+	if p.Name != "myproject" {
+		t.Errorf("expected myproject, got %s", p.Name)
+	}
+	if p.RootPath != "/home/user/myproject" {
+		t.Errorf("unexpected root: %s", p.RootPath)
+	}
+
+	// List
+	projects, err := s.ListProjects()
+	if err != nil {
+		t.Fatalf("ListProjects: %v", err)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("expected 1 project, got %d", len(projects))
+	}
+}
+
+func TestFileHashes(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer s.Close()
+
+	s.UpsertProject("test", "/tmp/test")
+
+	// Upsert
+	if err := s.UpsertFileHash("test", "main.go", "abc123"); err != nil {
+		t.Fatalf("UpsertFileHash: %v", err)
+	}
+
+	// Get
+	hashes, err := s.GetFileHashes("test")
+	if err != nil {
+		t.Fatalf("GetFileHashes: %v", err)
+	}
+	if hashes["main.go"] != "abc123" {
+		t.Errorf("expected abc123, got %s", hashes["main.go"])
+	}
+
+	// Update
+	s.UpsertFileHash("test", "main.go", "def456")
+	hashes, _ = s.GetFileHashes("test")
+	if hashes["main.go"] != "def456" {
+		t.Errorf("expected def456, got %s", hashes["main.go"])
+	}
+}
+
+func TestSearch(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer s.Close()
+
+	s.UpsertProject("test", "/tmp/test")
+	s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "SubmitOrder", QualifiedName: "test.main.SubmitOrder", FilePath: "main.go"})
+	s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "ProcessOrder", QualifiedName: "test.service.ProcessOrder", FilePath: "service.go"})
+	s.UpsertNode(&Node{Project: "test", Label: "Class", Name: "OrderService", QualifiedName: "test.service.OrderService", FilePath: "service.go"})
+
+	// Search by label
+	results, err := s.Search(SearchParams{Project: "test", Label: "Function"})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 2 {
+		t.Errorf("expected 2 functions, got %d", len(results))
+	}
+
+	// Search by name pattern
+	results, err = s.Search(SearchParams{Project: "test", NamePattern: ".*Submit.*"})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Errorf("expected 1 match, got %d", len(results))
+	}
+
+	// Search by file pattern
+	results, err = s.Search(SearchParams{Project: "test", FilePattern: "service*"})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 2 {
+		t.Errorf("expected 2 nodes in service.go, got %d", len(results))
+	}
+}
