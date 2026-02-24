@@ -102,13 +102,17 @@ func (s *Server) registerTools() {
 	// 5. search_graph
 	s.mcp.AddTool(&mcp.Tool{
 		Name:        "search_graph",
-		Description: "Search the code graph with structured filters. Replaces raw Cypher queries with safe, parameterized search. Supports filtering by node label, name pattern (regex), file pattern (glob), relationship type, direction, and degree (fan-in/fan-out). Returns matching nodes with properties and edge counts.",
+		Description: "Search the code graph with structured filters. Replaces raw Cypher queries with safe, parameterized search. Supports filtering by project, node label, name pattern (regex), file pattern (glob), relationship type, direction, and degree (fan-in/fan-out). Returns matching nodes with properties and edge counts.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
+				"project": {
+					"type": "string",
+					"description": "Filter by project name. If omitted, searches all indexed projects."
+				},
 				"label": {
 					"type": "string",
-					"description": "Node label filter: Function, Class, Module, Method, Interface, Enum, Type, File, Package, Folder"
+					"description": "Node label filter: Function, Class, Module, Method, Interface, Enum, Type, File, Package, Folder, Route"
 				},
 				"name_pattern": {
 					"type": "string",
@@ -116,7 +120,7 @@ func (s *Server) registerTools() {
 				},
 				"file_pattern": {
 					"type": "string",
-					"description": "Glob pattern for file path (e.g. '**/order-service/**')"
+					"description": "Glob pattern for file path within the project (e.g. '**/services/**', '*.py')"
 				},
 				"relationship": {
 					"type": "string",
@@ -141,7 +145,7 @@ func (s *Server) registerTools() {
 				},
 				"limit": {
 					"type": "integer",
-					"description": "Max results (default 50, max 200)"
+					"description": "Max results to return. If omitted, returns all matching results."
 				}
 			}
 		}`),
@@ -234,7 +238,7 @@ func (s *Server) registerTools() {
 				},
 				"max_results": {
 					"type": "integer",
-					"description": "Maximum number of matches to return (default 50, max 200)"
+					"description": "Maximum number of matches to return. If omitted, returns all matches."
 				}
 			},
 			"required": ["pattern"]

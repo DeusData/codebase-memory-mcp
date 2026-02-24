@@ -403,9 +403,9 @@ func TestExecuteWhereRegex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	// HandleOrder, ValidateOrder
-	if len(result.Rows) != 2 {
-		t.Errorf("expected 2 rows, got %d", len(result.Rows))
+	// HandleOrder, ValidateOrder, SubmitOrder
+	if len(result.Rows) != 3 {
+		t.Errorf("expected 3 rows, got %d", len(result.Rows))
 	}
 }
 
@@ -414,7 +414,7 @@ func TestExecuteWhereStartsWith(t *testing.T) {
 	defer s.Close()
 
 	exec := &Executor{Store: s}
-	result, err := exec.Execute(`MATCH (f:Function) WHERE f.name STARTS WITH "Send" RETURN f.name`)
+	result, err := exec.Execute(`MATCH (f:Function) WHERE f.name STARTS WITH "Submit" RETURN f.name`)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -435,8 +435,8 @@ func TestExecuteWhereContains(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	if len(result.Rows) != 2 {
-		t.Errorf("expected 2 rows (HandleOrder, ValidateOrder), got %d", len(result.Rows))
+	if len(result.Rows) != 3 {
+		t.Errorf("expected 3 rows (HandleOrder, ValidateOrder, SubmitOrder), got %d", len(result.Rows))
 	}
 }
 

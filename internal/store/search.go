@@ -30,11 +30,10 @@ type SearchResult struct {
 
 // Search executes a parameterized search query.
 func (s *Store) Search(params SearchParams) ([]*SearchResult, error) {
-	if params.Limit <= 0 {
-		params.Limit = 50
-	}
-	if params.Limit > 200 {
-		params.Limit = 200
+	// Limit=0 means no limit; use a high ceiling for SQL
+	unlimited := params.Limit <= 0
+	if unlimited {
+		params.Limit = 100000
 	}
 
 	// Build the query dynamically with parameterized values
