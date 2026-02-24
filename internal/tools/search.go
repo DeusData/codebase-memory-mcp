@@ -22,9 +22,11 @@ func (s *Server) handleSearchGraph(_ context.Context, req *mcp.CallToolRequest) 
 		Direction:          getStringArg(args, "direction"),
 		MinDegree:          getIntArg(args, "min_degree", -1),
 		MaxDegree:          getIntArg(args, "max_degree", -1),
-		Limit:              getIntArg(args, "limit", 50),
+		Limit:              getIntArg(args, "limit", 0), // 0 = no limit
 		ExcludeEntryPoints: getBoolArg(args, "exclude_entry_points"),
 	}
+
+	projectFilter := getStringArg(args, "project")
 
 	projects, err := s.store.ListProjects()
 	if err != nil {
@@ -38,7 +40,7 @@ func (s *Server) handleSearchGraph(_ context.Context, req *mcp.CallToolRequest) 
 		}), nil
 	}
 
-	// Search across all projects, collect results
+	// Search across matching projects, collect results
 	type resultEntry struct {
 		Project        string   `json:"project"`
 		Name           string   `json:"name"`
@@ -54,6 +56,9 @@ func (s *Server) handleSearchGraph(_ context.Context, req *mcp.CallToolRequest) 
 
 	var allResults []resultEntry
 	for _, p := range projects {
+		if projectFilter != "" && p.Name != projectFilter {
+			continue
+		}
 		params.Project = p.Name
 		results, searchErr := s.store.Search(params)
 		if searchErr != nil {

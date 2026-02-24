@@ -796,6 +796,8 @@ var frameworkDecoratorPrefixes = []string{
 	"@router.get", "@router.post", "@router.put", "@router.delete", "@router.patch",
 	"@router.route", "@router.websocket",
 	"@blueprint.", "@api.", "@ns.",
+	// Python middleware and exception handlers (framework-registered)
+	"@app.middleware", "@app.exception_handler", "@app.on_event",
 	// Testing frameworks
 	"@pytest.fixture", "@pytest.mark",
 	// CLI frameworks

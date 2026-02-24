@@ -30,9 +30,9 @@ func (s *Server) handleSearchCode(_ context.Context, req *mcp.CallToolRequest) (
 	}
 
 	fileGlob := getStringArg(args, "file_pattern")
-	maxResults := getIntArg(args, "max_results", 50)
-	if maxResults > 200 {
-		maxResults = 200
+	maxResults := getIntArg(args, "max_results", 0)
+	if maxResults <= 0 {
+		maxResults = 100000 // no limit
 	}
 
 	isRegex := false

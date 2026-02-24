@@ -57,6 +57,9 @@ var (
 	// Go gin routes: .POST("/path", .GET("/path"
 	goRouteRe = regexp.MustCompile(`\.(GET|POST|PUT|DELETE|PATCH)\(\s*["']([^"']+)["']`)
 
+	// Go gin group: .Group("/prefix")
+	goGroupRe = regexp.MustCompile(`(\w+)\s*(?::=|=)\s*\w+\.Group\(\s*["']([^"']+)["']`)
+
 	// Express.js routes: app.get("/path", router.post("/path"
 	expressRouteRe = regexp.MustCompile(`\w+\.(get|post|put|delete|patch)\(\s*["'` + "`" + `]([^"'` + "`" + `]+)["'` + "`" + `]`)
 
@@ -230,14 +233,51 @@ func extractPythonRoutes(f *store.Node) []RouteHandler {
 }
 
 // extractGoRoutes extracts route registrations from Go source code (gin patterns).
+// Resolves router group prefixes by matching variable names in Group() calls
+// to the receiver of .GET/.POST calls (e.g., contracts.POST("", ...) where
+// contracts := rg.Group("/contracts")).
 func extractGoRoutes(f *store.Node, source string) []RouteHandler {
 	var routes []RouteHandler
 
-	matches := goRouteRe.FindAllStringSubmatch(source, -1)
-	for _, m := range matches {
+	// Build a map of variable name → group prefix from Group() calls
+	groupPrefixes := map[string]string{}
+	for _, gm := range goGroupRe.FindAllStringSubmatch(source, -1) {
+		varName := gm[1]
+		prefix := gm[2]
+		groupPrefixes[varName] = prefix
+	}
+
+	// Match route registrations and try to prepend group prefix
+	lines := strings.Split(source, "\n")
+	for _, line := range lines {
+		rm := goRouteRe.FindStringSubmatch(line)
+		if rm == nil {
+			continue
+		}
+		method := strings.ToUpper(rm[1])
+		path := rm[2]
+
+		// Try to find the receiver variable (e.g., "contracts" in "contracts.POST")
+		// by looking at what's before the .METHOD( call
+		idx := strings.Index(line, "."+rm[1]+"(")
+		if idx > 0 {
+			prefix := strings.TrimSpace(line[:idx])
+			// Take the last word (variable name)
+			parts := strings.Fields(prefix)
+			if len(parts) > 0 {
+				receiver := parts[len(parts)-1]
+				if gp, ok := groupPrefixes[receiver]; ok {
+					path = strings.TrimRight(gp, "/") + "/" + strings.TrimLeft(path, "/")
+					if path == "/" {
+						path = gp
+					}
+				}
+			}
+		}
+
 		routes = append(routes, RouteHandler{
-			Path:          m[2],
-			Method:        strings.ToUpper(m[1]),
+			Path:          path,
+			Method:        method,
 			FunctionName:  f.Name,
 			QualifiedName: f.QualifiedName,
 		})
