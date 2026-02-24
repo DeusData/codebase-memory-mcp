@@ -1,0 +1,28 @@
+# Binaries
+code-graph-mcp
+codebase-memory-mcp
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+coverage.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database files (local cache)
+*.db
+*.db-wal
+*.db-shm
