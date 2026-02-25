@@ -25,7 +25,7 @@ jobs:
           - os: macos-14
             goos: darwin
             goarch: arm64
-          - os: macos-13
+          - os: macos-15-intel
             goos: darwin
             goarch: amd64
     runs-on: ${{ matrix.os }}
