@@ -9,6 +9,7 @@ Parses source code with [tree-sitter](https://tree-sitter.github.io/tree-sitter/
 - **12 languages**: Python, Go, JavaScript, TypeScript, TSX, Rust, Java, C++, C#, PHP, Lua, Scala
 - **Call graph**: Resolves function calls across files and packages (import-aware, type-inferred)
 - **Cross-service HTTP linking**: Discovers REST routes (FastAPI, Gin, Express) and matches them to HTTP call sites with confidence scoring
+- **Auto-sync**: Background polling detects file changes and triggers incremental re-indexing automatically — no manual reindex needed after the initial index
 - **Incremental reindex**: Content-hash based — only re-parses changed files
 - **Cypher-like queries**: `MATCH (f:Function)-[:CALLS]->(g) WHERE f.name = 'main' RETURN g.name`
 - **Dead code detection**: Finds functions with zero callers, excluding entry points (route handlers, `main()`, framework-decorated functions)
@@ -206,7 +207,15 @@ Claude Code will call `index_repository` with your project's root path and build
 
 > **Note**: `index_repository` requires a `repo_path` parameter. When you say "Index this project", Claude Code infers the path from its working directory. If indexing fails, pass the path explicitly: `index_repository(repo_path="/absolute/path/to/project")`.
 
-**When to reindex**: Run `index_repository` again after adding new files, moving functions, or making significant code changes. Incremental reindex is fast — only changed files are re-parsed (content-hash based). Check staleness with `list_projects` which shows `indexed_at` timestamps.
+### Auto-Sync
+
+After the initial `index_repository` call, the graph **stays fresh automatically**. A background watcher polls indexed projects for file changes (mtime + size) and triggers incremental re-indexing when changes are detected. You don't need to manually call `index_repository` again — just edit your code and the graph updates within seconds.
+
+- **Adaptive polling**: The interval scales with repo size (1s for small repos, up to 60s for very large ones)
+- **Non-blocking**: Auto-sync never blocks tool queries — if a manual `index_repository` is in progress, the watcher skips that cycle
+- **Incremental**: Only changed files are re-parsed (content-hash based), so even triggered re-indexes are fast
+
+You can still call `index_repository` manually at any time to force an immediate reindex (e.g. after a large `git pull`).
 
 ## MCP Tools
 
@@ -214,8 +223,8 @@ Claude Code will call `index_repository` with your project's root path and build
 
 | Tool | Key Parameters | Description |
 |------|---------------|-------------|
-| `index_repository` | `repo_path` (required) | Index a repository into the graph. Supports incremental reindex via content hashing — only changed files are re-parsed. |
-| `list_projects` | — | List all indexed projects with `indexed_at` timestamps and node/edge counts. Use to check if a reindex is needed. |
+| `index_repository` | `repo_path` (required) | Index a repository into the graph. Only needed once — auto-sync keeps it fresh after that. Supports incremental reindex via content hashing. |
+| `list_projects` | — | List all indexed projects with `indexed_at` timestamps and node/edge counts. |
 | `delete_project` | `project_name` (required) | Remove a project and all its graph data. Irreversible. |
 
 ### Querying
@@ -414,7 +423,7 @@ Add to `~/.claude/CLAUDE.md`:
 When this MCP server is available, **prefer graph tools over grep/Explore for structural code questions**.
 Graph queries return precise results in a single tool call (~500 tokens) vs file-by-file exploration (~80K tokens).
 
-- **Before exploration/planning**: Run `index_repository` to ensure the graph is current
+- **Initial index**: Run `index_repository` once per project — auto-sync keeps it fresh after that
 - **"Who calls X?"**: `trace_call_path(function_name="X", direction="inbound")`
 - **"What does X call?"**: `trace_call_path(function_name="X", direction="outbound")`
 - **Find functions by pattern**: `search_graph(label="Function", name_pattern=".*Pattern.*")`
@@ -436,37 +445,7 @@ Add the same snippet to a specific project's `CLAUDE.md` if you only want it act
 
 ### Option C: Claude Code skill file
 
-Create `~/.claude/skills/codebase-memory.md` for automatic activation when relevant:
-
-```markdown
-# codebase-memory-mcp Skill
-
-## When to use
-- Structural code questions: "who calls X?", "what does X depend on?", "show me the call chain"
-- Dead code analysis: functions with zero callers
-- Cross-service tracing: HTTP call paths between microservices
-- Architecture overview: understanding module boundaries and dependencies
-- Pre-planning: index before designing changes to understand blast radius
-
-## When NOT to use
-- Text search (use grep/Glob instead)
-- Single file reads (use Read tool instead)
-- Syntax/formatting questions (not a graph concern)
-
-## Workflow
-1. **Ensure freshness**: `list_projects` to check `indexed_at`. If stale, `index_repository`.
-2. **Understand schema**: `get_graph_schema` to see what's indexed (node counts, edge types).
-3. **Search**: `search_graph` for filtered queries, `trace_call_path` for call chains.
-4. **Deep dive**: `get_code_snippet` to read source of interesting functions.
-5. **Complex queries**: `query_graph` with Cypher for multi-hop patterns.
-
-## Tips
-- `trace_call_path` with `direction="both"` shows full context (callers + callees)
-- `search_graph` with `file_pattern` scopes results to a service/directory
-- Route nodes (`label="Route"`) let you query REST endpoints as graph entities
-- Edge properties on HTTP_CALLS include `confidence` and `url_path`
-- Reindex after significant code changes (new files, moved functions)
-```
+Copy [`skills/codebase-memory-mcp.md`](skills/codebase-memory-mcp.md) from this repo to `~/.claude/skills/codebase-memory-mcp/SKILL.md` for automatic activation when relevant. This is the most comprehensive option — it includes decision matrices, query pitfalls, and workflow patterns.
 
 ## Ignoring Files (`.cgrignore`)
 
@@ -515,7 +494,7 @@ make install  # go install
 | `get_code_snippet` returns "node not found" | Wrong qualified name format | Use `search_graph` first to find the exact `qualified_name`, then pass it to `get_code_snippet`. See [Qualified Names](#qualified-names). |
 | `trace_call_path` returns 0 results | Exact name match — no fuzzy matching | Use `search_graph(name_pattern=".*PartialName.*")` to discover the exact function name first. |
 | Queries return results from wrong project | Multiple projects indexed, no filter | Add `project="your-project-name"` to `search_graph`. Use `list_projects` to see indexed project names. |
-| Graph is missing recently added files | Index is stale | Re-run `index_repository`. Incremental reindex only re-parses changed files. |
+| Graph is missing recently added files | Auto-sync hasn't caught up yet, or project was never indexed | Wait a few seconds for auto-sync, or run `index_repository` manually. Auto-sync polls at 1–60s intervals depending on repo size. |
 | Binary not found after install | `~/.local/bin` not on PATH | Add to your shell profile: `export PATH="$HOME/.local/bin:$PATH"` |
 | Cypher query fails with parse error | Unsupported Cypher feature | See [Supported Cypher Subset](#supported-cypher-subset). `WITH`, `COLLECT`, `OPTIONAL MATCH` are not supported. |
 
@@ -531,6 +510,7 @@ internal/
   httplink/               Cross-service HTTP route/call-site matching
   cypher/                 Cypher query lexer, parser, planner, executor
   tools/                  MCP tool handlers (11 tools)
+  watcher/                Background auto-sync (mtime+size polling, adaptive intervals)
   discover/               File discovery with .cgrignore support
   fqn/                    Qualified name computation
 ```

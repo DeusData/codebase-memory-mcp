@@ -29,6 +29,10 @@ func (s *Server) handleIndexRepository(_ context.Context, req *mcp.CallToolReque
 
 	projectName := filepath.Base(absPath)
 
+	// Lock to prevent concurrent indexing with auto-sync watcher
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+
 	// Run the indexing pipeline
 	p := pipeline.New(s.store, absPath)
 	if err := p.Run(); err != nil {

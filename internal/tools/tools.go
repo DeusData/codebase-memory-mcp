@@ -1,17 +1,24 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"sync"
 
+	"github.com/DeusData/codebase-memory-mcp/internal/pipeline"
 	"github.com/DeusData/codebase-memory-mcp/internal/store"
+	"github.com/DeusData/codebase-memory-mcp/internal/watcher"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // Server wraps the MCP server with tool handlers.
 type Server struct {
-	mcp   *mcp.Server
-	store *store.Store
+	mcp     *mcp.Server
+	store   *store.Store
+	watcher *watcher.Watcher
+	indexMu sync.Mutex
 }
 
 // NewServer creates a new MCP server with all tools registered.
@@ -21,13 +28,32 @@ func NewServer(s *store.Store) *Server {
 		mcp: mcp.NewServer(
 			&mcp.Implementation{
 				Name:    "codebase-memory-mcp",
-				Version: "0.1.0",
+				Version: "0.1.1",
 			},
 			nil,
 		),
 	}
 	srv.registerTools()
+	srv.watcher = watcher.New(s, srv.syncProject)
 	return srv
+}
+
+// StartWatcher launches the background file-change polling goroutine.
+// It stops when ctx is cancelled.
+func (s *Server) StartWatcher(ctx context.Context) {
+	go s.watcher.Run(ctx)
+}
+
+// syncProject is called by the watcher when file changes are detected.
+// Uses TryLock to skip if an index operation is already in progress.
+func (s *Server) syncProject(_, rootPath string) error {
+	if !s.indexMu.TryLock() {
+		slog.Debug("watcher.skip", "path", rootPath, "reason", "index_in_progress")
+		return nil
+	}
+	defer s.indexMu.Unlock()
+	p := pipeline.New(s.store, rootPath)
+	return p.Run()
 }
 
 // MCPServer returns the underlying MCP server.

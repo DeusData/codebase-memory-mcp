@@ -102,18 +102,16 @@ func OpenMemory() (*Store, error) {
 }
 
 // WithTransaction executes fn within a single SQLite transaction.
-// All store methods called inside fn use the transaction automatically.
-func (s *Store) WithTransaction(fn func() error) error {
+// The callback receives a transaction-scoped Store — all store methods called on
+// txStore use the transaction. The receiver's q field is never mutated, so
+// concurrent read-only handlers (using s.q == s.db) are unaffected.
+func (s *Store) WithTransaction(fn func(txStore *Store) error) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
-	s.q = tx
-	defer func() {
-		s.q = s.db
-	}()
-
-	if err := fn(); err != nil {
+	txStore := &Store{db: s.db, q: tx, dbPath: s.dbPath}
+	if err := fn(txStore); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
