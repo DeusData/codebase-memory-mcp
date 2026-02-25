@@ -9,6 +9,7 @@ REPO="DeusData/codebase-memory-mcp"
 INSTALL_DIR="$HOME/.local/bin"
 BINARY_NAME="codebase-memory-mcp"
 SOURCE_DIR="$HOME/.local/share/codebase-memory-mcp"
+CLEANUP_DIR=""  # set by download_binary for EXIT trap
 
 # --- Colors ---
 
@@ -65,7 +66,15 @@ detect_platform() {
 
     case "$arch" in
         arm64|aarch64) arch="arm64" ;;
-        x86_64|amd64)  arch="amd64" ;;
+        x86_64|amd64)
+            # On macOS, uname -m returns x86_64 under Rosetta even on Apple Silicon.
+            # Check the actual hardware to pick the right binary.
+            if [ "$os" = "darwin" ] && sysctl -n hw.optional.arm64 2>/dev/null | grep -q '1'; then
+                arch="arm64"
+            else
+                arch="amd64"
+            fi
+            ;;
         *)             die "Unsupported architecture: $arch" ;;
     esac
 
@@ -152,9 +161,9 @@ download_binary() {
     local url="https://github.com/${REPO}/releases/download/${tag}/${asset}"
 
     echo "${BOLD}Downloading ${asset}...${RESET}"
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    trap 'rm -rf "$tmpdir"' EXIT
+    CLEANUP_DIR=$(mktemp -d)
+    trap 'rm -rf "$CLEANUP_DIR"' EXIT
+    local tmpdir="$CLEANUP_DIR"
 
     fetch "$url" "$tool" > "${tmpdir}/${asset}"
     tar -xzf "${tmpdir}/${asset}" -C "$tmpdir"
