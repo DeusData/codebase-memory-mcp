@@ -469,6 +469,262 @@ func TestRouteNodesCreated(t *testing.T) {
 	}
 }
 
+func TestCrossFileGroupPrefix(t *testing.T) {
+	dir, err := os.MkdirTemp("", "httplink-crossfile-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Write a two-file Go project: main.go calls RegisterRoutes(v1.Group("/api"))
+	if err := os.MkdirAll(filepath.Join(dir, "cmd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "routes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "cmd", "main.go"), []byte(`package main
+
+func setup(r *gin.Engine) {
+	RegisterRoutes(r.Group("/api"))
+}
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "routes", "routes.go"), []byte(`package routes
+
+func RegisterRoutes(rg *gin.RouterGroup) {
+	rg.GET("/orders", ListOrders)
+	rg.POST("/orders", CreateOrder)
+}
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	project := "testproj"
+	if err := s.UpsertProject(project, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create function nodes that simulate what the pipeline would create
+	setupID, _ := s.UpsertNode(&store.Node{
+		Project:       project,
+		Label:         "Function",
+		Name:          "setup",
+		QualifiedName: "testproj.cmd.main.setup",
+		FilePath:      "cmd/main.go",
+		StartLine:     3,
+		EndLine:       5,
+	})
+
+	regID, _ := s.UpsertNode(&store.Node{
+		Project:       project,
+		Label:         "Function",
+		Name:          "RegisterRoutes",
+		QualifiedName: "testproj.routes.routes.RegisterRoutes",
+		FilePath:      "routes/routes.go",
+		StartLine:     3,
+		EndLine:       6,
+	})
+
+	// Create CALLS edge: setup -> RegisterRoutes (as pipeline pass3 would)
+	s.InsertEdge(&store.Edge{
+		Project:  project,
+		SourceID: setupID,
+		TargetID: regID,
+		Type:     "CALLS",
+	})
+
+	linker := New(s, project)
+	_, err = linker.Run()
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Verify Route nodes have the cross-file prefix /api prepended
+	routeNodes, _ := s.FindNodesByLabel(project, "Route")
+	if len(routeNodes) != 2 {
+		t.Fatalf("expected 2 Route nodes, got %d", len(routeNodes))
+	}
+
+	foundPaths := map[string]bool{}
+	for _, rn := range routeNodes {
+		path, _ := rn.Properties["path"].(string)
+		foundPaths[path] = true
+		t.Logf("Route: %s (path=%s)", rn.Name, path)
+	}
+
+	if !foundPaths["/api/orders"] {
+		t.Error("expected route path /api/orders with cross-file prefix")
+	}
+}
+
+func TestCrossFileGroupPrefixVariable(t *testing.T) {
+	dir, err := os.MkdirTemp("", "httplink-crossfile-var-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	if err := os.MkdirAll(filepath.Join(dir, "cmd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "routes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Variable-based pattern: v1 := r.Group("/api"); RegisterRoutes(v1)
+	if err := os.WriteFile(filepath.Join(dir, "cmd", "main.go"), []byte(`package main
+
+func setup(r *gin.Engine) {
+	v1 := r.Group("/api")
+	RegisterRoutes(v1)
+}
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "routes", "routes.go"), []byte(`package routes
+
+func RegisterRoutes(rg *gin.RouterGroup) {
+	rg.GET("/items", ListItems)
+}
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	project := "testproj"
+	s.UpsertProject(project, dir)
+
+	setupID, _ := s.UpsertNode(&store.Node{
+		Project: project, Label: "Function", Name: "setup",
+		QualifiedName: "testproj.cmd.main.setup",
+		FilePath: "cmd/main.go", StartLine: 3, EndLine: 6,
+	})
+
+	regID, _ := s.UpsertNode(&store.Node{
+		Project: project, Label: "Function", Name: "RegisterRoutes",
+		QualifiedName: "testproj.routes.routes.RegisterRoutes",
+		FilePath: "routes/routes.go", StartLine: 3, EndLine: 5,
+	})
+
+	s.InsertEdge(&store.Edge{
+		Project: project, SourceID: setupID, TargetID: regID, Type: "CALLS",
+	})
+
+	linker := New(s, project)
+	linker.Run()
+
+	routeNodes, _ := s.FindNodesByLabel(project, "Route")
+	if len(routeNodes) != 1 {
+		t.Fatalf("expected 1 Route node, got %d", len(routeNodes))
+	}
+
+	path, _ := routeNodes[0].Properties["path"].(string)
+	if path != "/api/items" {
+		t.Errorf("expected /api/items, got %s", path)
+	}
+}
+
+func TestRouteRegistrationCallEdges(t *testing.T) {
+	dir, err := os.MkdirTemp("", "httplink-reg-edges-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	if err := os.MkdirAll(filepath.Join(dir, "routes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "routes", "routes.go"), []byte(`package routes
+
+func RegisterRoutes(rg *gin.RouterGroup) {
+	rg.POST("/orders", h.CreateOrder)
+	rg.GET("/orders/:id", h.GetOrder)
+}
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	project := "testproj"
+	s.UpsertProject(project, dir)
+
+	// Create the registering function
+	s.UpsertNode(&store.Node{
+		Project: project, Label: "Function", Name: "RegisterRoutes",
+		QualifiedName: "testproj.routes.routes.RegisterRoutes",
+		FilePath: "routes/routes.go", StartLine: 3, EndLine: 6,
+	})
+
+	// Create handler functions (as pipeline would)
+	s.UpsertNode(&store.Node{
+		Project: project, Label: "Method", Name: "CreateOrder",
+		QualifiedName: "testproj.handlers.handler.CreateOrder",
+		FilePath: "handlers/handler.go", StartLine: 10, EndLine: 30,
+	})
+	s.UpsertNode(&store.Node{
+		Project: project, Label: "Method", Name: "GetOrder",
+		QualifiedName: "testproj.handlers.handler.GetOrder",
+		FilePath: "handlers/handler.go", StartLine: 32, EndLine: 50,
+	})
+
+	linker := New(s, project)
+	linker.Run()
+
+	// Verify CALLS edges from RegisterRoutes to handlers
+	regNode, _ := s.FindNodeByQN(project, "testproj.routes.routes.RegisterRoutes")
+	if regNode == nil {
+		t.Fatal("RegisterRoutes node not found")
+	}
+
+	edges, _ := s.FindEdgesBySourceAndType(regNode.ID, "CALLS")
+	if len(edges) < 2 {
+		t.Errorf("expected at least 2 CALLS edges from RegisterRoutes, got %d", len(edges))
+	}
+
+	// Verify that CreateOrder is a target
+	createNode, _ := s.FindNodeByQN(project, "testproj.handlers.handler.CreateOrder")
+	if createNode == nil {
+		t.Fatal("CreateOrder not found")
+	}
+	foundCreate := false
+	for _, e := range edges {
+		if e.TargetID == createNode.ID {
+			foundCreate = true
+			// Check the via property
+			if via, ok := e.Properties["via"]; ok {
+				if via != "route_registration" {
+					t.Errorf("expected via=route_registration, got %v", via)
+				}
+			}
+		}
+	}
+	if !foundCreate {
+		t.Error("expected CALLS edge from RegisterRoutes to CreateOrder")
+	}
+}
+
 func TestLinkerSkipsSameService(t *testing.T) {
 	s, err := store.OpenMemory()
 	if err != nil {
