@@ -44,14 +44,28 @@ type HTTPLink struct {
 
 // Linker discovers cross-service HTTP calls and creates HTTP_CALLS edges.
 type Linker struct {
-	store        *store.Store
-	project      string
-	routesByFunc map[string][]int // funcQN → indices into routes slice
+	store          *store.Store
+	project        string
+	config         *LinkerConfig
+	routesByFunc   map[string][]int // funcQN → indices into routes slice
+	extraCallSites []HTTPCallSite   // injected from pipeline (e.g., InfraFile URLs)
 }
 
 // New creates a new HTTP Linker.
 func New(s *store.Store, project string) *Linker {
-	return &Linker{store: s, project: project}
+	return &Linker{store: s, project: project, config: DefaultConfig()}
+}
+
+// SetConfig sets the linker configuration. If cfg is nil, defaults are used.
+func (l *Linker) SetConfig(cfg *LinkerConfig) {
+	if cfg != nil {
+		l.config = cfg
+	}
+}
+
+// AddCallSites allows the pipeline to inject additional call sites from infra files.
+func (l *Linker) AddCallSites(sites []HTTPCallSite) {
+	l.extraCallSites = append(l.extraCallSites, sites...)
 }
 
 // regex patterns for route and URL discovery
@@ -100,6 +114,13 @@ func (l *Linker) Run() ([]HTTPLink, error) {
 	}
 	rootPath := proj.RootPath
 
+	// Load config from project root if using defaults
+	if l.config.HTTPLinker.MinConfidence == nil &&
+		l.config.HTTPLinker.FuzzyMatching == nil &&
+		len(l.config.HTTPLinker.ExcludePaths) == 0 {
+		l.config = LoadConfig(rootPath)
+	}
+
 	l.routesByFunc = make(map[string][]int)
 	routes := l.discoverRoutes(rootPath)
 	slog.Info("httplink.routes", "count", len(routes))
@@ -119,6 +140,7 @@ func (l *Linker) Run() ([]HTTPLink, error) {
 	l.insertRouteNodes(routes)
 
 	callSites := l.discoverCallSites(rootPath)
+	callSites = append(callSites, l.extraCallSites...)
 	slog.Info("httplink.callsites", "count", len(callSites))
 
 	links := l.matchAndLink(routes, callSites)
@@ -131,7 +153,6 @@ func (l *Linker) Run() ([]HTTPLink, error) {
 // HANDLES edges from the handler function to the Route node.
 func (l *Linker) insertRouteNodes(routes []RouteHandler) {
 	for _, rh := range routes {
-		// Build a stable qualified name for the Route node
 		normalMethod := rh.Method
 		if normalMethod == "" {
 			normalMethod = "ANY"
@@ -139,7 +160,6 @@ func (l *Linker) insertRouteNodes(routes []RouteHandler) {
 		normalPath := strings.ReplaceAll(rh.Path, "/", "_")
 		normalPath = strings.Trim(normalPath, "_")
 		routeQN := rh.QualifiedName + ".route." + normalMethod + "." + normalPath
-
 		routeName := normalMethod + " " + rh.Path
 
 		// Use resolved handler QN if available, otherwise fall back to registering function
@@ -148,11 +168,21 @@ func (l *Linker) insertRouteNodes(routes []RouteHandler) {
 			handlerQN = rh.ResolvedHandlerQN
 		}
 
+		// Look up handler node BEFORE creating Route — we need its file_path
+		handlerNode, _ := l.store.FindNodeByQN(l.project, handlerQN)
+
+		// Inherit file_path from handler function
+		var filePath string
+		if handlerNode != nil && handlerNode.FilePath != "" {
+			filePath = handlerNode.FilePath
+		}
+
 		routeID, err := l.store.UpsertNode(&store.Node{
 			Project:       l.project,
 			Label:         "Route",
 			Name:          routeName,
 			QualifiedName: routeQN,
+			FilePath:      filePath,
 			Properties: map[string]any{
 				"method":  rh.Method,
 				"path":    rh.Path,
@@ -164,7 +194,6 @@ func (l *Linker) insertRouteNodes(routes []RouteHandler) {
 		}
 
 		// Create HANDLES edge from actual handler → Route
-		handlerNode, _ := l.store.FindNodeByQN(l.project, handlerQN)
 		if handlerNode != nil {
 			if _, edgeErr := l.store.InsertEdge(&store.Edge{
 				Project:  l.project,
@@ -647,6 +676,17 @@ var externalDomains = []string{
 	"aws.amazon.com",
 }
 
+// defaultExcludePaths are common utility endpoints that produce noise in HTTP_CALLS.
+// These are excluded from route matching by default.
+var defaultExcludePaths = []string{
+	"/health",
+	"/healthz",
+	"/ready",
+	"/readyz",
+	"/metrics",
+	"/favicon.ico",
+}
+
 // isExternalDomain checks if a domain is a well-known external API.
 func isExternalDomain(domain string) bool {
 	domain = strings.ToLower(domain)
@@ -656,6 +696,11 @@ func isExternalDomain(domain string) bool {
 		}
 	}
 	return false
+}
+
+// ExtractURLPaths finds URL path segments from text (exported for use by pipeline).
+func ExtractURLPaths(text string) []string {
+	return extractURLPaths(text)
 }
 
 // extractURLPaths finds URL path segments from text.
@@ -825,6 +870,11 @@ func (l *Linker) matchAndLink(routes []RouteHandler, callSites []HTTPCallSite) [
 				continue
 			}
 
+			// Skip noisy utility endpoints
+			if isPathExcluded(rh.Path, l.config.AllExcludePaths()) {
+				continue
+			}
+
 			// Multi-signal confidence scoring
 			pathScore := pathMatchScore(cs.Path, rh.Path)
 			if pathScore == 0 {
@@ -832,7 +882,7 @@ func (l *Linker) matchAndLink(routes []RouteHandler, callSites []HTTPCallSite) [
 			}
 
 			score := pathScore*sourceWeight(cs.SourceLabel) + methodBonus(cs.Method, rh.Method)
-			if score < matchConfidenceThreshold {
+			if score < l.config.EffectiveMinConfidence() {
 				continue
 			}
 			if score > 1.0 {
@@ -848,9 +898,11 @@ func (l *Linker) matchAndLink(routes []RouteHandler, callSites []HTTPCallSite) [
 			callerNode, _ := l.store.FindNodeByQN(l.project, cs.SourceQualifiedName)
 			handlerNode, _ := l.store.FindNodeByQN(l.project, rh.QualifiedName)
 			if callerNode != nil && handlerNode != nil {
+				band := confidenceBand(score)
 				props := map[string]any{
-					"url_path":   cs.Path,
-					"confidence": score,
+					"url_path":        cs.Path,
+					"confidence":      score,
+					"confidence_band": band,
 				}
 				if rh.Method != "" {
 					props["method"] = rh.Method
@@ -895,7 +947,8 @@ func normalizePath(path string) string {
 }
 
 // matchConfidenceThreshold is the minimum score for an HTTP_CALLS edge.
-const matchConfidenceThreshold = 0.45
+// Lowered from 0.45 to 0.25 to include speculative matches with confidence bands.
+const matchConfidenceThreshold = 0.25
 
 // pathMatchScore returns a confidence score (0.0–1.0) for how well callPath
 // matches routePath. Returns 0 if no match.

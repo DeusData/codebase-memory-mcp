@@ -28,6 +28,17 @@ func (s *Server) handleSearchGraph(_ context.Context, req *mcp.CallToolRequest) 
 		IncludeConnected:   getBoolArg(args, "include_connected"),
 	}
 
+	// Parse exclude_labels array
+	if rawLabels, ok := args["exclude_labels"]; ok {
+		if labelArr, ok := rawLabels.([]any); ok {
+			for _, l := range labelArr {
+				if s, ok := l.(string); ok {
+					params.ExcludeLabels = append(params.ExcludeLabels, s)
+				}
+			}
+		}
+	}
+
 	projectFilter := getStringArg(args, "project")
 
 	projects, err := s.store.ListProjects()

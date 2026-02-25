@@ -2,6 +2,8 @@ package pipeline
 
 import (
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -105,7 +107,20 @@ func parseComposeEnvironment(env any) map[string]string {
 	switch v := env.(type) {
 	case map[string]any:
 		for k, val := range v {
-			if s, ok := val.(string); ok && !isSecretBinding(k, s) {
+			var s string
+			switch tv := val.(type) {
+			case string:
+				s = tv
+			case int:
+				s = strconv.Itoa(tv)
+			case float64:
+				s = strconv.FormatFloat(tv, 'f', -1, 64)
+			case bool:
+				s = strconv.FormatBool(tv)
+			default:
+				continue
+			}
+			if !isSecretValue(s) {
 				result[k] = s
 			}
 		}
@@ -116,7 +131,7 @@ func parseComposeEnvironment(env any) map[string]string {
 				continue
 			}
 			parts := strings.SplitN(s, "=", 2)
-			if len(parts) == 2 && !isSecretBinding(parts[0], parts[1]) {
+			if len(parts) == 2 && !isSecretValue(parts[1]) {
 				result[parts[0]] = parts[1]
 			}
 		}
@@ -187,9 +202,10 @@ type cloudbuildFile struct {
 }
 
 type cloudbuildStep struct {
-	Name string   `yaml:"name"`
-	Args []string `yaml:"args"`
-	Env  []string `yaml:"env"`
+	Name       string   `yaml:"name"`
+	Entrypoint string   `yaml:"entrypoint"`
+	Args       []string `yaml:"args"`
+	Env        []string `yaml:"env"`
 }
 
 func parseCloudbuildFile(absPath, relPath string) []infraFile {
@@ -234,12 +250,59 @@ func buildCloudbuildProps(cb cloudbuildFile) map[string]any {
 // and extracts deployment flags.
 func extractDeployFlags(steps []cloudbuildStep, props map[string]any) {
 	for _, step := range steps {
-		if !isDeployStep(step.Args) {
-			continue
+		// Direct args format: ["gcloud", "run", "deploy", "--flag=val", ...]
+		if isDeployStep(step.Args) {
+			parseDeployArgs(step.Args, props)
+			parseDeployEnvVars(step.Args, props)
+			return
 		}
-		parseDeployArgs(step.Args, props)
-		parseDeployEnvVars(step.Args, props)
-		return // only process first deploy step
+		// Bash script format: entrypoint=bash, args=["-c", "gcloud run deploy ..."]
+		if isBashDeployStep(&step) {
+			parseBashDeployScript(step.Args[1], props)
+			return
+		}
+	}
+}
+
+// isBashDeployStep checks if a step is a bash entrypoint with a gcloud run deploy script.
+func isBashDeployStep(step *cloudbuildStep) bool {
+	isBash := step.Entrypoint == "bash" || step.Entrypoint == "/bin/bash" || step.Entrypoint == "/bin/sh"
+	if !isBash && len(step.Args) >= 2 {
+		isBash = step.Args[0] == "-c"
+	}
+	if !isBash || len(step.Args) < 2 {
+		return false
+	}
+	script := step.Args[len(step.Args)-1]
+	return strings.Contains(script, "gcloud") &&
+		strings.Contains(script, "run") &&
+		strings.Contains(script, "deploy")
+}
+
+// parseBashDeployScript extracts deploy flags from a bash script string.
+func parseBashDeployScript(script string, props map[string]any) {
+	// Normalize line continuations
+	normalized := strings.ReplaceAll(script, "\\\n", " ")
+
+	// Extract flags using the same flag map as parseDeployArgs
+	for flag, propName := range deployFlagMap {
+		re := regexp.MustCompile(regexp.QuoteMeta(flag) + `[= ]+([^\s\\]+)`)
+		if m := re.FindStringSubmatch(normalized); len(m) == 2 {
+			props[propName] = m[1]
+		}
+	}
+
+	// Extract env vars from --set-env-vars or --update-env-vars
+	envRe := regexp.MustCompile(`--(?:set|update)-env-vars[= ]+([^\s\\]+(?:,[^\s\\]+)*)`)
+	if m := envRe.FindStringSubmatch(normalized); len(m) == 2 {
+		envMap := make(map[string]string)
+		for _, pair := range strings.Split(m[1], ",") {
+			parts := strings.SplitN(pair, "=", 2)
+			if len(parts) == 2 && !isSecretBinding(parts[0], parts[1]) {
+				envMap[parts[0]] = parts[1]
+			}
+		}
+		setNonEmptyMap(props, "deploy_env_vars", envMap)
 	}
 }
 

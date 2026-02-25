@@ -109,11 +109,13 @@ func (p *Pipeline) runFullPasses(files []discover.FileInfo) error {
 	p.buildRegistry()
 	p.passImports()
 	p.passCalls()
+	p.passUsages()
 	p.cleanupASTCache()
 	if err := p.passHTTPLinks(); err != nil {
 		slog.Warn("pass4.httplink.err", "err", err)
 	}
 	p.passImplements()
+	p.passGitHistory()
 	p.updateFileHashes(files)
 	return nil
 }
@@ -156,13 +158,15 @@ func (p *Pipeline) runIncrementalPasses(
 	filesToResolve := mergeFiles(changed, dependents)
 	slog.Info("incremental.resolve", "changed", len(changed), "dependents", len(dependents))
 
-	// Delete CALLS edges for files being re-resolved
+	// Delete CALLS and USAGE edges for files being re-resolved
 	for _, f := range filesToResolve {
 		_ = p.Store.DeleteEdgesBySourceFile(p.ProjectName, f.RelPath, "CALLS")
+		_ = p.Store.DeleteEdgesBySourceFile(p.ProjectName, f.RelPath, "USAGE")
 	}
 
-	// Pass 3: Re-resolve calls for changed + dependent files
+	// Pass 3: Re-resolve calls + usages for changed + dependent files
 	p.passCallsForFiles(filesToResolve)
+	p.passUsagesForFiles(filesToResolve)
 
 	p.cleanupASTCache()
 
@@ -171,6 +175,7 @@ func (p *Pipeline) runIncrementalPasses(
 		slog.Warn("pass4.httplink.err", "err", err)
 	}
 	p.passImplements()
+	p.passGitHistory()
 
 	p.updateFileHashes(allFiles)
 	return nil
@@ -877,6 +882,10 @@ func (p *Pipeline) processFileCalls(relPath string, cached *cachedAST, spec *lan
 
 		targetQN := p.resolveCallWithTypes(calleeName, moduleQN, importMap, localTypeMap)
 		if targetQN == "" {
+			// Strategy 5: Fuzzy name-only fallback
+			if fuzzyQN, ok := p.registry.FuzzyResolve(calleeName, moduleQN); ok {
+				p.createFuzzyCallEdge(callerQN, fuzzyQN)
+			}
 			return false
 		}
 
@@ -943,6 +952,25 @@ func (p *Pipeline) createCallEdge(callerQN, targetQN string) {
 			SourceID: callerNode.ID,
 			TargetID: targetNode.ID,
 			Type:     "CALLS",
+		})
+	}
+}
+
+// createFuzzyCallEdge creates a CALLS edge with resolution_mode="fuzzy" property,
+// indicating the callee was resolved via text-based name matching rather than
+// structural analysis (imports, same-module, etc.).
+func (p *Pipeline) createFuzzyCallEdge(callerQN, targetQN string) {
+	callerNode, _ := p.Store.FindNodeByQN(p.ProjectName, callerQN)
+	targetNode, _ := p.Store.FindNodeByQN(p.ProjectName, targetQN)
+	if callerNode != nil && targetNode != nil {
+		_, _ = p.Store.InsertEdge(&store.Edge{
+			Project:  p.ProjectName,
+			SourceID: callerNode.ID,
+			TargetID: targetNode.ID,
+			Type:     "CALLS",
+			Properties: map[string]any{
+				"resolution_mode": "fuzzy",
+			},
 		})
 	}
 }
@@ -1197,12 +1225,86 @@ func (p *Pipeline) passHTTPLinks() error {
 	}
 
 	linker := httplink.New(p.Store, p.ProjectName)
+
+	// Feed InfraFile environment URLs into the HTTP linker
+	infraSites := p.extractInfraCallSites()
+	if len(infraSites) > 0 {
+		linker.AddCallSites(infraSites)
+		slog.Info("pass4.infra_callsites", "count", len(infraSites))
+	}
+
 	links, err := linker.Run()
 	if err != nil {
 		return err
 	}
 	slog.Info("pass4.httplinks", "links", len(links))
 	return nil
+}
+
+// extractInfraCallSites extracts URL values from InfraFile environment properties
+// and converts them to HTTPCallSite entries for the HTTP linker.
+func (p *Pipeline) extractInfraCallSites() []httplink.HTTPCallSite {
+	infraNodes, err := p.Store.FindNodesByLabel(p.ProjectName, "InfraFile")
+	if err != nil {
+		return nil
+	}
+
+	var sites []httplink.HTTPCallSite
+	for _, node := range infraNodes {
+		// InfraFile nodes use different property keys depending on source:
+		// compose files: "environment", Dockerfiles/shell/.env: "env_vars",
+		// cloudbuild: "deploy_env_vars"
+		for _, envKey := range []string{"environment", "env_vars", "deploy_env_vars"} {
+			sites = append(sites, extractEnvURLSites(node, envKey)...)
+		}
+	}
+	return sites
+}
+
+// extractEnvURLSites extracts HTTP call sites from a single env property of an InfraFile node.
+func extractEnvURLSites(node *store.Node, propKey string) []httplink.HTTPCallSite {
+	env, ok := node.Properties[propKey]
+	if !ok {
+		return nil
+	}
+
+	// env_vars are stored as map[string]string (from Go), but after JSON round-trip
+	// through SQLite they come back as map[string]any.
+	var sites []httplink.HTTPCallSite
+	switch envMap := env.(type) {
+	case map[string]any:
+		for _, val := range envMap {
+			valStr, ok := val.(string)
+			if !ok {
+				continue
+			}
+			sites = append(sites, urlSitesFromValue(node, valStr)...)
+		}
+	case map[string]string:
+		for _, valStr := range envMap {
+			sites = append(sites, urlSitesFromValue(node, valStr)...)
+		}
+	}
+	return sites
+}
+
+// urlSitesFromValue extracts URL paths from a string value and creates HTTPCallSite entries.
+func urlSitesFromValue(node *store.Node, val string) []httplink.HTTPCallSite {
+	if !strings.Contains(val, "http://") && !strings.Contains(val, "https://") && !strings.HasPrefix(val, "/") {
+		return nil
+	}
+
+	paths := httplink.ExtractURLPaths(val)
+	sites := make([]httplink.HTTPCallSite, 0, len(paths))
+	for _, path := range paths {
+		sites = append(sites, httplink.HTTPCallSite{
+			Path:                path,
+			SourceName:          node.Name,
+			SourceQualifiedName: node.QualifiedName,
+			SourceLabel:         "InfraFile",
+		})
+	}
+	return sites
 }
 
 // injectEnvBindings creates or updates Module nodes for config files that contain

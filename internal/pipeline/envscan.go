@@ -191,6 +191,13 @@ func isSecretBinding(key, value string) bool {
 	return false
 }
 
+// isSecretValue checks only the value pattern, not the key name.
+// Use for compose/infra files where key names like JWT_PRIVATE_KEY_ID
+// are config references, not actual secrets.
+func isSecretValue(value string) bool {
+	return secretValuePattern.MatchString(value)
+}
+
 func scanWithPatterns(absPath, relPath string, patterns []*regexp.Regexp) []EnvBinding {
 	f, err := os.Open(absPath)
 	if err != nil {

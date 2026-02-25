@@ -62,6 +62,17 @@ func (s *Store) FindEdgesByTargetAndType(targetID int64, edgeType string) ([]*Ed
 	return scanEdges(rows)
 }
 
+// FindEdgesByType returns all edges of a given type for a project.
+func (s *Store) FindEdgesByType(project, edgeType string) ([]*Edge, error) {
+	rows, err := s.q.Query(`SELECT id, project, source_id, target_id, type, properties
+		FROM edges WHERE project=? AND type=?`, project, edgeType)
+	if err != nil {
+		return nil, fmt.Errorf("find edges by type: %w", err)
+	}
+	defer rows.Close()
+	return scanEdges(rows)
+}
+
 // CountEdges returns the number of edges in a project.
 func (s *Store) CountEdges(project string) (int, error) {
 	var count int
@@ -91,6 +102,21 @@ func (s *Store) DeleteEdgesBySourceFile(project, filePath, edgeType string) erro
 			WHERE e.project=? AND n.file_path=? AND e.type=?
 		)`, project, filePath, edgeType)
 	return err
+}
+
+// FindEdgesByURLPath returns edges where url_path contains the given substring.
+// Uses the generated column index for prefix matches, falls back to json_extract for substring.
+func (s *Store) FindEdgesByURLPath(project, pathSubstring string) ([]*Edge, error) {
+	rows, err := s.q.Query(`
+		SELECT id, project, source_id, target_id, type, properties
+		FROM edges
+		WHERE project = ? AND url_path_gen LIKE ?`,
+		project, "%"+pathSubstring+"%")
+	if err != nil {
+		return nil, fmt.Errorf("find edges by url_path: %w", err)
+	}
+	defer rows.Close()
+	return scanEdges(rows)
 }
 
 func scanEdges(rows *sql.Rows) ([]*Edge, error) {

@@ -147,7 +147,7 @@ services:
       - "8080:8080"
     environment:
       PORT: "8080"
-      JWT_SECRET: "should-be-filtered"
+      JWT_SECRET: "sk-1234567890abcdefghijkl"
     depends_on:
       - db
     networks:
@@ -873,6 +873,109 @@ func TestInfraQN(t *testing.T) {
 	if !strings.Contains(qn, "::web") {
 		t.Errorf("expected ::web suffix, got %s", qn)
 	}
+}
+
+// --- Bug fix regression tests ---
+
+func TestParseComposeNonStringEnvValues(t *testing.T) {
+	content := `
+services:
+  auth-service:
+    image: auth:latest
+    environment:
+      PORT: 8090
+      DEBUG: true
+      RATE_LIMIT: 1.5
+      NAME: "string-value"
+`
+	path := writeTempFile(t, "docker-compose.yml", content)
+	results := parseComposeFile(path, "docker-compose.yml")
+	if len(results) != 1 {
+		t.Fatalf("expected 1 service, got %d", len(results))
+	}
+
+	envVars := requireMapStringString(t, results[0].properties["environment"])
+	assertEqual(t, envVars["PORT"], "8090")
+	assertEqual(t, envVars["DEBUG"], "true")
+	assertEqual(t, envVars["RATE_LIMIT"], "1.5")
+	assertEqual(t, envVars["NAME"], "string-value")
+}
+
+func TestParseComposeSecretKeyNotFiltered(t *testing.T) {
+	// Key names like JWT_PRIVATE_KEY_ID are config references, not secrets.
+	// Only actual secret VALUES should be filtered.
+	content := `
+services:
+  auth-service:
+    image: auth:latest
+    environment:
+      JWT_PRIVATE_KEY_ID: jwt-private-key
+      GOOGLE_CLIENT_SECRET_ID: google-oauth-secret
+      ACCESS_TOKEN_TTL: 15m
+      ACTUAL_SECRET: "sk-1234567890abcdef12345"
+`
+	path := writeTempFile(t, "docker-compose.yml", content)
+	results := parseComposeFile(path, "docker-compose.yml")
+	if len(results) != 1 {
+		t.Fatalf("expected 1 service, got %d", len(results))
+	}
+
+	envVars := requireMapStringString(t, results[0].properties["environment"])
+	// These should NOT be filtered — key name matches pattern but value is a reference
+	assertEqual(t, envVars["JWT_PRIVATE_KEY_ID"], "jwt-private-key")
+	assertEqual(t, envVars["GOOGLE_CLIENT_SECRET_ID"], "google-oauth-secret")
+	assertEqual(t, envVars["ACCESS_TOKEN_TTL"], "15m")
+
+	// This SHOULD be filtered — value matches secret pattern (sk-...)
+	if _, ok := envVars["ACTUAL_SECRET"]; ok {
+		t.Error("ACTUAL_SECRET should be filtered (value matches secret pattern)")
+	}
+}
+
+func TestParseCloudbuildBashScript(t *testing.T) {
+	content := `
+substitutions:
+  _SERVICE_NAME: my-service
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ['build', '-t', 'eu.gcr.io/$PROJECT_ID/$_SERVICE_NAME', '.']
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        gcloud run deploy $_SERVICE_NAME \
+          --region=europe-west3 \
+          --memory=2Gi \
+          --cpu=2 \
+          --concurrency=80 \
+          --max-instances=10 \
+          --ingress=internal-and-cloud-load-balancing \
+          --set-env-vars=LOG_LEVEL=INFO,SOURCE_ENTITY=$_SERVICE_NAME
+
+images:
+  - eu.gcr.io/$PROJECT_ID/$_SERVICE_NAME
+`
+	path := writeTempFile(t, "cloudbuild.yaml", content)
+	results := parseCloudbuildFile(path, "cloudbuild.yaml")
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+
+	props := results[0].properties
+	assertEqual(t, props["service_name"], "my-service")
+	assertEqual(t, props["deploy_region"], "europe-west3")
+	assertEqual(t, props["deploy_memory"], "2Gi")
+	assertEqual(t, props["deploy_cpu"], "2")
+	assertEqual(t, props["deploy_concurrency"], "80")
+	assertEqual(t, props["deploy_max_instances"], "10")
+	assertEqual(t, props["deploy_ingress"], "internal-and-cloud-load-balancing")
+
+	envVars := requireMapStringString(t, props["deploy_env_vars"])
+	assertEqual(t, envVars["LOG_LEVEL"], "INFO")
+	assertEqual(t, envVars["SOURCE_ENTITY"], "$_SERVICE_NAME")
 }
 
 // --- helpers ---
