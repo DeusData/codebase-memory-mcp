@@ -24,7 +24,7 @@ func ScanProjectEnvURLs(rootPath string) []EnvBinding {
 
 	_ = filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil // skip errors
+			return err
 		}
 
 		name := info.Name()
@@ -124,7 +124,7 @@ var (
 
 	// .env files: KEY=https://...
 	envFilePatterns = []*regexp.Regexp{
-		regexp.MustCompile(`^(\w+)=(https?://[^\s]+)`),
+		regexp.MustCompile(`^(\w+)=(https?://\S+)`),
 	}
 
 	// TOML: key = "https://..."

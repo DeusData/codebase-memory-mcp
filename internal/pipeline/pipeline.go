@@ -838,7 +838,6 @@ func (p *Pipeline) passCalls() {
 
 func (p *Pipeline) processFileCalls(relPath string, cached *cachedAST, spec *lang.LanguageSpec) {
 	callTypes := toSet(spec.CallNodeTypes)
-	funcTypes := toSet(spec.FunctionNodeTypes)
 	moduleQN := fqn.ModuleQN(p.ProjectName, relPath)
 
 	root := cached.Tree.RootNode()
@@ -860,47 +859,19 @@ func (p *Pipeline) processFileCalls(relPath string, cached *cachedAST, spec *lan
 			return false
 		}
 
-		// Find the enclosing function
 		callerQN := findEnclosingFunction(node, cached.Source, p.ProjectName, relPath, spec)
 		if callerQN == "" {
 			callerQN = moduleQN
 		}
 
-		// Build a local type map that includes receiver/self scope
-		localTypeMap := typeMap
-
 		// Python self.method() resolution
-		if cached.Language == lang.Python && strings.HasPrefix(calleeName, "self.") {
-			classQN := findEnclosingClassQN(node, cached.Source, p.ProjectName, relPath)
-			if classQN != "" {
-				methodName := calleeName[5:]
-				candidate := classQN + "." + methodName
-				if n, _ := p.Store.FindNodeByQN(p.ProjectName, candidate); n != nil {
-					p.createCallEdge(callerQN, candidate)
-					return false
-				}
-			}
+		if p.resolvePythonSelfCall(node, cached, calleeName, callerQN, relPath) {
+			return false
 		}
 
-		// Go receiver scoping — add receiver variable to local type map
-		if cached.Language == lang.Go {
-			enclosing := findEnclosingFuncNode(node, funcTypes)
-			if enclosing != nil {
-				varName, typeName := parseGoReceiverType(enclosing, cached.Source)
-				if varName != "" && typeName != "" {
-					classQN := resolveAsClass(typeName, p.registry, moduleQN, importMap)
-					if classQN != "" {
-						localTypeMap = make(TypeMap, len(typeMap)+1)
-						for k, v := range typeMap {
-							localTypeMap[k] = v
-						}
-						localTypeMap[varName] = classQN
-					}
-				}
-			}
-		}
+		// Go receiver scoping — extend type map with receiver variable
+		localTypeMap := p.extendTypeMapWithReceiver(node, cached, typeMap, spec, moduleQN, importMap)
 
-		// Try type-based resolution for method calls (obj.method)
 		targetQN := p.resolveCallWithTypes(calleeName, moduleQN, importMap, localTypeMap)
 		if targetQN == "" {
 			return false
@@ -909,6 +880,54 @@ func (p *Pipeline) processFileCalls(relPath string, cached *cachedAST, spec *lan
 		p.createCallEdge(callerQN, targetQN)
 		return false
 	})
+}
+
+// resolvePythonSelfCall handles Python self.method() resolution via enclosing class scope.
+// Returns true if the call was resolved.
+func (p *Pipeline) resolvePythonSelfCall(node *tree_sitter.Node, cached *cachedAST, calleeName, callerQN, relPath string) bool {
+	if cached.Language != lang.Python || !strings.HasPrefix(calleeName, "self.") {
+		return false
+	}
+	classQN := findEnclosingClassQN(node, cached.Source, p.ProjectName, relPath)
+	if classQN == "" {
+		return false
+	}
+	candidate := classQN + "." + calleeName[5:]
+	if n, _ := p.Store.FindNodeByQN(p.ProjectName, candidate); n != nil {
+		p.createCallEdge(callerQN, candidate)
+		return true
+	}
+	return false
+}
+
+// extendTypeMapWithReceiver augments the type map with the Go receiver variable
+// from the enclosing method declaration, if applicable.
+func (p *Pipeline) extendTypeMapWithReceiver(
+	node *tree_sitter.Node, cached *cachedAST, typeMap TypeMap,
+	spec *lang.LanguageSpec, moduleQN string, importMap map[string]string,
+) TypeMap {
+	if cached.Language != lang.Go {
+		return typeMap
+	}
+	funcTypes := toSet(spec.FunctionNodeTypes)
+	enclosing := findEnclosingFuncNode(node, funcTypes)
+	if enclosing == nil {
+		return typeMap
+	}
+	varName, typeName := parseGoReceiverType(enclosing, cached.Source)
+	if varName == "" || typeName == "" {
+		return typeMap
+	}
+	classQN := resolveAsClass(typeName, p.registry, moduleQN, importMap)
+	if classQN == "" {
+		return typeMap
+	}
+	localTypeMap := make(TypeMap, len(typeMap)+1)
+	for k, v := range typeMap {
+		localTypeMap[k] = v
+	}
+	localTypeMap[varName] = classQN
+	return localTypeMap
 }
 
 // createCallEdge creates a CALLS edge between caller and target by QN.
@@ -1183,7 +1202,6 @@ func (p *Pipeline) passHTTPLinks() error {
 // environment variable URL bindings. These synthetic constants feed into the
 // HTTP linker's call site discovery.
 func (p *Pipeline) injectEnvBindings(bindings []EnvBinding) {
-	// Group by file path
 	byFile := make(map[string][]EnvBinding)
 	for _, b := range bindings {
 		byFile[b.FilePath] = append(byFile[b.FilePath], b)
@@ -1192,41 +1210,11 @@ func (p *Pipeline) injectEnvBindings(bindings []EnvBinding) {
 	count := 0
 	for filePath, fileBindings := range byFile {
 		moduleQN := fqn.ModuleQN(p.ProjectName, filePath)
+		constants := buildConstantsList(fileBindings)
 
-		// Build constants list from bindings
-		var constants []string
-		for _, b := range fileBindings {
-			constants = append(constants, b.Key+" = "+b.Value)
-		}
-
-		// Cap at 50 constants per config file
-		if len(constants) > 50 {
-			constants = constants[:50]
-		}
-
-		// Merge with existing constants if module already exists
-		existing, _ := p.Store.FindNodeByQN(p.ProjectName, moduleQN)
-		if existing != nil {
-			if existConsts, ok := existing.Properties["constants"].([]any); ok {
-				seen := make(map[string]bool, len(existConsts))
-				for _, c := range existConsts {
-					if s, ok := c.(string); ok {
-						seen[s] = true
-					}
-				}
-				for _, c := range constants {
-					if !seen[c] {
-						existConsts = append(existConsts, c)
-					}
-				}
-				if existing.Properties == nil {
-					existing.Properties = map[string]any{}
-				}
-				existing.Properties["constants"] = existConsts
-				_, _ = p.Store.UpsertNode(existing)
-				count += len(fileBindings)
-				continue
-			}
+		if p.mergeWithExistingModule(moduleQN, constants) {
+			count += len(fileBindings)
+			continue
 		}
 
 		_, _ = p.Store.UpsertNode(&store.Node{
@@ -1243,6 +1231,48 @@ func (p *Pipeline) injectEnvBindings(bindings []EnvBinding) {
 	if count > 0 {
 		slog.Info("envscan.injected", "bindings", count, "files", len(byFile))
 	}
+}
+
+// buildConstantsList converts env bindings to "KEY = VALUE" constant strings, capped at 50.
+func buildConstantsList(bindings []EnvBinding) []string {
+	constants := make([]string, 0, len(bindings))
+	for _, b := range bindings {
+		constants = append(constants, b.Key+" = "+b.Value)
+	}
+	if len(constants) > 50 {
+		constants = constants[:50]
+	}
+	return constants
+}
+
+// mergeWithExistingModule merges new constants into an existing Module node's constant list.
+// Returns true if the module existed and was updated.
+func (p *Pipeline) mergeWithExistingModule(moduleQN string, constants []string) bool {
+	existing, _ := p.Store.FindNodeByQN(p.ProjectName, moduleQN)
+	if existing == nil {
+		return false
+	}
+	existConsts, ok := existing.Properties["constants"].([]any)
+	if !ok {
+		return false
+	}
+	seen := make(map[string]bool, len(existConsts))
+	for _, c := range existConsts {
+		if s, ok := c.(string); ok {
+			seen[s] = true
+		}
+	}
+	for _, c := range constants {
+		if !seen[c] {
+			existConsts = append(existConsts, c)
+		}
+	}
+	if existing.Properties == nil {
+		existing.Properties = map[string]any{}
+	}
+	existing.Properties["constants"] = existConsts
+	_, _ = p.Store.UpsertNode(existing)
+	return true
 }
 
 // jsonURLKeyPattern matches JSON keys that likely contain URL/endpoint values.

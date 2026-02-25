@@ -744,59 +744,34 @@ func RegisterRoutes(rg *gin.RouterGroup) {
 }
 
 func TestAsyncDispatchKeywords(t *testing.T) {
-	// Test the full linker flow to verify edge types.
-	// Uses a Go caller with CreateTask (async) and a Python route handler.
 	dir, err := os.MkdirTemp("", "httplink-async-*")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
 
-	// Write a Go file with CreateTask + URL (async dispatch)
-	asyncDir := filepath.Join(dir, "taskworker")
-	if err := os.MkdirAll(asyncDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(asyncDir, "dispatch.go"), []byte(`package taskworker
+	writeTestFile(t, dir, "taskworker", "dispatch.go", `package taskworker
 
 func DispatchOrder(orderID string) {
 	url := "https://api.internal.com/api/orders"
 	client.CreateTask(ctx, url, payload)
 }
-`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	// Write a Go file with requests.post + URL (sync HTTP call)
-	syncDir := filepath.Join(dir, "synccaller")
-	if err := os.MkdirAll(syncDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(syncDir, "caller.go"), []byte(`package synccaller
+`)
+	writeTestFile(t, dir, "synccaller", "caller.go", `package synccaller
 
 func CallOrder() {
 	url := "https://api.internal.com/api/orders"
 	requests.post(url, data)
 }
-`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	// Write a Go file with both sync + async keywords (sync takes precedence)
-	bothDir := filepath.Join(dir, "bothcaller")
-	if err := os.MkdirAll(bothDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(bothDir, "both.go"), []byte(`package bothcaller
+`)
+	writeTestFile(t, dir, "bothcaller", "both.go", `package bothcaller
 
 func CallAndDispatch() {
 	url := "https://api.internal.com/api/orders"
 	requests.post(url, data)
 	client.CreateTask(ctx, url, payload)
 }
-`), 0o600); err != nil {
-		t.Fatal(err)
-	}
+`)
 
 	s, err := store.OpenMemory()
 	if err != nil {
@@ -809,35 +784,15 @@ func CallAndDispatch() {
 		t.Fatal(err)
 	}
 
-	// Async caller function
-	_, _ = s.UpsertNode(&store.Node{
-		Project: project, Label: "Function", Name: "DispatchOrder",
-		QualifiedName: "testproj.taskworker.dispatch.DispatchOrder",
-		FilePath:      "taskworker/dispatch.go", StartLine: 3, EndLine: 6,
-	})
+	createTestNode(t, s, project, "DispatchOrder", "testproj.taskworker.dispatch.DispatchOrder", "taskworker/dispatch.go", 3, 6)
+	createTestNode(t, s, project, "CallOrder", "testproj.synccaller.caller.CallOrder", "synccaller/caller.go", 3, 6)
+	createTestNode(t, s, project, "CallAndDispatch", "testproj.bothcaller.both.CallAndDispatch", "bothcaller/both.go", 3, 7)
 
-	// Sync caller function
-	_, _ = s.UpsertNode(&store.Node{
-		Project: project, Label: "Function", Name: "CallOrder",
-		QualifiedName: "testproj.synccaller.caller.CallOrder",
-		FilePath:      "synccaller/caller.go", StartLine: 3, EndLine: 6,
-	})
-
-	// Both keywords caller function
-	_, _ = s.UpsertNode(&store.Node{
-		Project: project, Label: "Function", Name: "CallAndDispatch",
-		QualifiedName: "testproj.bothcaller.both.CallAndDispatch",
-		FilePath:      "bothcaller/both.go", StartLine: 3, EndLine: 7,
-	})
-
-	// Route handler (different service)
 	_, _ = s.UpsertNode(&store.Node{
 		Project: project, Label: "Function", Name: "create_order",
 		QualifiedName: "testproj.handler.routes.create_order",
 		FilePath:      "handler/routes.py",
-		Properties: map[string]any{
-			"decorators": []any{`@app.post("/api/orders")`},
-		},
+		Properties:    map[string]any{"decorators": []any{`@app.post("/api/orders")`}},
 	})
 
 	linker := New(s, project)
@@ -846,56 +801,68 @@ func CallAndDispatch() {
 		t.Fatalf("Run: %v", err)
 	}
 
-	// Build a map of callerQN -> edgeType for verification
 	edgeTypes := map[string]string{}
 	for _, link := range links {
 		edgeTypes[link.CallerQN] = link.EdgeType
 	}
 
-	// Async caller (CreateTask only) -> ASYNC_CALLS
-	if et, ok := edgeTypes["testproj.taskworker.dispatch.DispatchOrder"]; !ok {
-		t.Error("expected link from async caller DispatchOrder")
-	} else if et != "ASYNC_CALLS" {
-		t.Errorf("DispatchOrder edge type = %q, want ASYNC_CALLS", et)
-	}
+	assertEdgeType(t, edgeTypes, "testproj.taskworker.dispatch.DispatchOrder", "ASYNC_CALLS")
+	assertEdgeType(t, edgeTypes, "testproj.synccaller.caller.CallOrder", "HTTP_CALLS")
+	assertEdgeType(t, edgeTypes, "testproj.bothcaller.both.CallAndDispatch", "HTTP_CALLS")
 
-	// Sync caller (requests.post only) -> HTTP_CALLS
-	if et, ok := edgeTypes["testproj.synccaller.caller.CallOrder"]; !ok {
-		t.Error("expected link from sync caller CallOrder")
-	} else if et != "HTTP_CALLS" {
-		t.Errorf("CallOrder edge type = %q, want HTTP_CALLS", et)
-	}
+	assertStoredEdgeCounts(t, s, project, "testproj.taskworker.dispatch.DispatchOrder", 1, 0)
+	assertStoredEdgeCounts(t, s, project, "testproj.synccaller.caller.CallOrder", 0, 1)
+}
 
-	// Both keywords (sync takes precedence) -> HTTP_CALLS
-	if et, ok := edgeTypes["testproj.bothcaller.both.CallAndDispatch"]; !ok {
-		t.Error("expected link from both-keyword caller CallAndDispatch")
-	} else if et != "HTTP_CALLS" {
-		t.Errorf("CallAndDispatch edge type = %q, want HTTP_CALLS", et)
+func writeTestFile(t *testing.T, dir, subdir, filename, content string) {
+	t.Helper()
+	d := filepath.Join(dir, subdir)
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
 	}
-
-	// Verify edges in store match
-	asyncNode, _ := s.FindNodeByQN(project, "testproj.taskworker.dispatch.DispatchOrder")
-	if asyncNode != nil {
-		asyncEdges, _ := s.FindEdgesBySourceAndType(asyncNode.ID, "ASYNC_CALLS")
-		if len(asyncEdges) != 1 {
-			t.Errorf("expected 1 ASYNC_CALLS edge from async caller, got %d", len(asyncEdges))
-		}
-		httpEdges, _ := s.FindEdgesBySourceAndType(asyncNode.ID, "HTTP_CALLS")
-		if len(httpEdges) != 0 {
-			t.Errorf("expected 0 HTTP_CALLS edges from async caller, got %d", len(httpEdges))
-		}
+	if err := os.WriteFile(filepath.Join(d, filename), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
 	}
+}
 
-	syncNode, _ := s.FindNodeByQN(project, "testproj.synccaller.caller.CallOrder")
-	if syncNode != nil {
-		httpEdges, _ := s.FindEdgesBySourceAndType(syncNode.ID, "HTTP_CALLS")
-		if len(httpEdges) != 1 {
-			t.Errorf("expected 1 HTTP_CALLS edge from sync caller, got %d", len(httpEdges))
-		}
-		asyncEdges, _ := s.FindEdgesBySourceAndType(syncNode.ID, "ASYNC_CALLS")
-		if len(asyncEdges) != 0 {
-			t.Errorf("expected 0 ASYNC_CALLS edges from sync caller, got %d", len(asyncEdges))
-		}
+func createTestNode(t *testing.T, s *store.Store, project, name, qn, filePath string, startLine, endLine int) {
+	t.Helper()
+	_, err := s.UpsertNode(&store.Node{
+		Project: project, Label: "Function", Name: name,
+		QualifiedName: qn, FilePath: filePath,
+		StartLine: startLine, EndLine: endLine,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertEdgeType(t *testing.T, edgeTypes map[string]string, qn, wantType string) {
+	t.Helper()
+	et, ok := edgeTypes[qn]
+	if !ok {
+		t.Errorf("expected link from %s", qn)
+		return
+	}
+	if et != wantType {
+		t.Errorf("%s edge type = %q, want %q", qn, et, wantType)
+	}
+}
+
+func assertStoredEdgeCounts(t *testing.T, s *store.Store, project, qn string, wantAsync, wantHTTP int) {
+	t.Helper()
+	node, _ := s.FindNodeByQN(project, qn)
+	if node == nil {
+		t.Errorf("node not found: %s", qn)
+		return
+	}
+	asyncEdges, _ := s.FindEdgesBySourceAndType(node.ID, "ASYNC_CALLS")
+	if len(asyncEdges) != wantAsync {
+		t.Errorf("%s: ASYNC_CALLS edges = %d, want %d", qn, len(asyncEdges), wantAsync)
+	}
+	httpEdges, _ := s.FindEdgesBySourceAndType(node.ID, "HTTP_CALLS")
+	if len(httpEdges) != wantHTTP {
+		t.Errorf("%s: HTTP_CALLS edges = %d, want %d", qn, len(httpEdges), wantHTTP)
 	}
 }
 
