@@ -18,8 +18,9 @@ type SearchParams struct {
 	MaxDegree          int
 	Limit              int
 	Offset             int
-	ExcludeEntryPoints bool // when true, exclude nodes with is_entry_point=true
-	IncludeConnected   bool // when true, load connected node names (expensive, off by default)
+	ExcludeEntryPoints bool     // when true, exclude nodes with is_entry_point=true
+	IncludeConnected   bool     // when true, load connected node names (expensive, off by default)
+	ExcludeLabels      []string // labels to exclude from results
 }
 
 // SearchResult is a node with edge degree info.
@@ -103,6 +104,15 @@ func (s *Store) Search(params *SearchParams) (*SearchOutput, error) {
 		args = append(args, likePattern)
 	}
 
+	if len(params.ExcludeLabels) > 0 {
+		placeholders := make([]string, len(params.ExcludeLabels))
+		for i, label := range params.ExcludeLabels {
+			placeholders[i] = "?"
+			args = append(args, label)
+		}
+		conditions = append(conditions, "n.label NOT IN ("+strings.Join(placeholders, ",")+")")
+	}
+
 	where := strings.Join(conditions, " AND ")
 
 	// When Go-side filtering is needed (regex, degree), fetch more rows from SQL
@@ -180,8 +190,10 @@ func (s *Store) Search(params *SearchParams) (*SearchOutput, error) {
 
 // globToLike converts a glob pattern to SQL LIKE pattern.
 func globToLike(pattern string) string {
-	// Replace ** with % and * with %
-	result := strings.ReplaceAll(pattern, "**", "%")
+	// Handle **/ (zero-or-more directory prefix) and /** (zero-or-more directory suffix)
+	// before single * to avoid double-replacement
+	result := strings.ReplaceAll(pattern, "**/", "%")
+	result = strings.ReplaceAll(result, "/**", "%")
 	result = strings.ReplaceAll(result, "*", "%")
 	result = strings.ReplaceAll(result, "?", "_")
 	return result

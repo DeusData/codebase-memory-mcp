@@ -443,6 +443,9 @@ func TestRouteNodesCreated(t *testing.T) {
 		t.Fatalf("expected 1 Route node, got %d", len(routeNodes))
 	}
 	rn := routeNodes[0]
+	if rn.FilePath != "handler/routes.py" {
+		t.Errorf("Route file_path = %q, want 'handler/routes.py'", rn.FilePath)
+	}
 	if rn.Name != "POST /api/orders" {
 		t.Errorf("Route name = %q, want 'POST /api/orders'", rn.Name)
 	}

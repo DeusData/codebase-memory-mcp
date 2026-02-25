@@ -28,7 +28,7 @@ func NewServer(s *store.Store) *Server {
 		mcp: mcp.NewServer(
 			&mcp.Implementation{
 				Name:    "codebase-memory-mcp",
-				Version: "0.1.2",
+				Version: "0.1.3",
 			},
 			nil,
 		),
@@ -65,6 +65,7 @@ func (s *Server) registerTools() {
 	s.registerGraphTools()
 	s.registerFileTools()
 	s.registerProjectTools()
+	s.registerTraceTools()
 }
 
 // registerGraphTools registers tools for graph querying, searching, and tracing.
@@ -78,7 +79,7 @@ func (s *Server) registerGraphTools() {
 func (s *Server) registerIndexAndTraceTool() {
 	s.mcp.AddTool(&mcp.Tool{
 		Name:        "index_repository",
-		Description: "Index a repository into the code graph. Parses source files, extracts functions/classes/modules, resolves call relationships, and stores the graph for querying. Supports incremental reindex via content hashing.",
+		Description: "Index a repository into the code graph. Parses source files, extracts functions/classes/modules, resolves call relationships (CALLS), read references (USAGE), interface implementations (IMPLEMENTS + OVERRIDE), HTTP/async cross-service links, and git history change coupling (FILE_CHANGES_WITH). Supports incremental reindex via content hashing. Auto-sync keeps the graph fresh after initial indexing.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -92,7 +93,7 @@ func (s *Server) registerIndexAndTraceTool() {
 
 	s.mcp.AddTool(&mcp.Tool{
 		Name:        "trace_call_path",
-		Description: "Trace call paths from/to a function. Requires EXACT function name — if unsure, call search_graph(name_pattern=...) first to discover the correct name. Returns hop-by-hop callees/callers with edge types (CALLS, HTTP_CALLS, ASYNC_CALLS). Use depth=1 first, increase only if needed. IMPORTANT: Use direction='both' for full cross-service context — HTTP_CALLS edges from other services appear as inbound edges on backend functions, so direction='outbound' alone misses cross-service callers. For async dispatch (Cloud Tasks, Pub/Sub), find dispatch functions via search_graph(name_pattern='.*CreateTask.*') then trace via CALLS edges. If the function is not found, use search_graph with a name_pattern regex to find similar names before retrying.",
+		Description: "Trace call paths from/to a function. Requires EXACT function name — if unsure, call search_graph(name_pattern=...) first to discover the correct name. Returns hop-by-hop callees/callers with edge types (CALLS, HTTP_CALLS, ASYNC_CALLS, USAGE, OVERRIDE). USAGE edges indicate read references (callbacks, variable assignments) rather than invocations. OVERRIDE edges link struct methods to the interface methods they implement. Use depth=1 first, increase only if needed. IMPORTANT: Use direction='both' for full cross-service context — HTTP_CALLS edges from other services appear as inbound edges on backend functions, so direction='outbound' alone misses cross-service callers. For async dispatch (Cloud Tasks, Pub/Sub), find dispatch functions via search_graph(name_pattern='.*CreateTask.*') then trace via CALLS edges. If the function is not found, use search_graph with a name_pattern regex to find similar names before retrying.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -141,7 +142,7 @@ func (s *Server) registerSchemaAndSnippetTools() {
 func (s *Server) registerSearchTools() {
 	s.mcp.AddTool(&mcp.Tool{
 		Name:        "search_graph",
-		Description: "Search the code graph for nodes. Returns 10 results per page (use offset to paginate, has_more indicates more pages). For dead code: use relationship='CALLS', direction='inbound', max_degree=0, exclude_entry_points=true. For fan-out: use relationship='CALLS', direction='outbound', min_degree=N. Route nodes: properties.handler contains the actual handler function name. Prefer this over query_graph for counting — no row cap. IMPORTANT: The 'relationship' filter counts how many edges of that type each node has (degree filtering) — it does NOT return the actual edges. To list cross-service HTTP_CALLS or ASYNC_CALLS edges with their properties (url_path, confidence), use query_graph with Cypher instead: MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_path, r.confidence. Relationship types: CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD, HANDLES, CONTAINS_FILE, CONTAINS_FOLDER, CONTAINS_PACKAGE, IMPLEMENTS.",
+		Description: "Search the code graph for nodes. Returns 10 results per page (use offset to paginate, has_more indicates more pages). For dead code: use relationship='CALLS', direction='inbound', max_degree=0, exclude_entry_points=true. For fan-out: use relationship='CALLS', direction='outbound', min_degree=N. Route nodes: properties.handler contains the actual handler function name. Prefer this over query_graph for counting — no row cap. IMPORTANT: The 'relationship' filter counts how many edges of that type each node has (degree filtering) — it does NOT return the actual edges. To list cross-service HTTP_CALLS or ASYNC_CALLS edges with their properties (url_path, confidence), use query_graph with Cypher instead: MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_path, r.confidence. Relationship types: CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD, HANDLES, CONTAINS_FILE, CONTAINS_FOLDER, CONTAINS_PACKAGE, IMPLEMENTS, OVERRIDE, USAGE, FILE_CHANGES_WITH.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -193,6 +194,11 @@ func (s *Server) registerSearchTools() {
 				"include_connected": {
 					"type": "boolean",
 					"description": "Include connected node names in results (default: false). Expensive — only enable when you need to see neighbor names."
+				},
+				"exclude_labels": {
+					"type": "array",
+					"items": {"type": "string"},
+					"description": "Labels to exclude from results (e.g. ['Route'] to filter out route noise when searching by name_pattern)"
 				}
 			}
 		}`),
@@ -233,7 +239,7 @@ func (s *Server) registerSearchTools() {
 func (s *Server) registerQueryTool() {
 	s.mcp.AddTool(&mcp.Tool{
 		Name:        "query_graph",
-		Description: "Execute a Cypher-like graph query. WARNING: 200-row cap applies BEFORE aggregation — COUNT queries on large codebases silently undercount. For fan-out/fan-in counting, use search_graph with min_degree/max_degree instead. Best for: relationship patterns, filtered joins, path queries. This is the correct tool for listing cross-service edges — use MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_path, r.confidence to see HTTP links with URLs and confidence scores, or MATCH (a)-[r:ASYNC_CALLS]->(b) for async dispatch edges. Always use LIMIT. Edge types: CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD, HANDLES, IMPLEMENTS.",
+		Description: "Execute a Cypher-like graph query. WARNING: 200-row cap applies BEFORE aggregation — COUNT queries on large codebases silently undercount. For fan-out/fan-in counting, use search_graph with min_degree/max_degree instead. Best for: relationship patterns, filtered joins, path queries, and edge property filtering. Supports WHERE on edge properties: r.url_path CONTAINS 'orders', r.confidence >= 0.6, r.method = 'POST', r.confidence_band = 'high', r.validated_by_trace = true, r.coupling_score >= 0.5. This is the correct tool for listing cross-service edges — use MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_path, r.confidence, r.confidence_band to see HTTP links with URLs and confidence scores (bands: high>=0.7, medium>=0.45, speculative>=0.25), or MATCH (a)-[r:ASYNC_CALLS]->(b) for async dispatch edges. For change coupling: MATCH (a)-[r:FILE_CHANGES_WITH]->(b) RETURN a.name, b.name, r.coupling_score, r.co_change_count. For interface method overrides: MATCH (s)-[r:OVERRIDE]->(i) to find struct methods implementing interface methods. For read references (callbacks, variable assignments): MATCH (a)-[r:USAGE]->(b). Always use LIMIT. Edge types: CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD, HANDLES, IMPLEMENTS, OVERRIDE, USAGE, FILE_CHANGES_WITH.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {

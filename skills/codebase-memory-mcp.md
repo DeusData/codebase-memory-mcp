@@ -15,6 +15,10 @@
 | "What implements this interface?" | `search_graph(relationship="IMPLEMENTS")` | Graph type relationships |
 | Cross-service HTTP calls (list all edges) | `query_graph("MATCH (a)-[r:HTTP_CALLS]->(b) RETURN ...")` | Cypher returns edges with URL+confidence |
 | Cross-service HTTP calls (for one function) | `trace_call_path(direction="both")` | Finds inbound HTTP_CALLS edges too |
+| Which structs implement an interface method? | `query_graph("MATCH (s)-[r:OVERRIDE]->(i) RETURN ...")` | OVERRIDE edges link struct→interface methods |
+| Read references (callbacks, stored in vars) | `query_graph("MATCH (a)-[r:USAGE]->(b) RETURN ...")` | USAGE edges (not calls) |
+| Files that change together (hidden coupling) | `query_graph("MATCH (a)-[r:FILE_CHANGES_WITH]->(b) RETURN ...")` | Git history change coupling |
+| Validate HTTP edges with runtime traces | `ingest_traces(project, file_path)` | Enriches edges with latency/frequency |
 | Async dispatch (Cloud Tasks, Pub/Sub, SQS) | `search_graph(name_pattern=".*CreateTask.*")` then `trace_call_path` | Find dispatch functions, trace CALLS chains |
 | Async dispatch (if ASYNC_CALLS edges exist) | `query_graph("MATCH (a)-[r:ASYNC_CALLS]->(b) RETURN ...")` | Only works when URLs are resolvable literals |
 | Dead code detection | `search_graph(max_degree=0, exclude_entry_points=true)` | Degree-based filtering |
@@ -49,21 +53,29 @@ After the initial `index_repository` call, a **background watcher** polls for fi
 | What does X call? | `trace_call_path(direction="outbound")` | `query_graph` |
 | Full call context (callers + callees) | `trace_call_path(direction="both")` | `direction="outbound"` alone |
 | Find functions by pattern | `search_graph(name_pattern="...")` | `trace_call_path` |
+| Find functions, exclude noise labels | `search_graph(name_pattern="...", exclude_labels=["Route"])` | unfiltered search |
 | Count callers/callees | `search_graph` with `min_degree`/`max_degree` | `query_graph COUNT` (200-row cap) |
 | Dead code | `search_graph(max_degree=0, exclude_entry_points=true)` | `query_graph` |
 | Cross-service HTTP calls (list edges) | `query_graph("MATCH (a)-[r:HTTP_CALLS]->(b) RETURN ...")` | `search_graph(relationship="HTTP_CALLS")` |
+| Filter HTTP calls by URL path | `query_graph("... WHERE r.url_path CONTAINS 'orders' ...")` | unfiltered Cypher |
+| Filter HTTP calls by confidence | `query_graph("... WHERE r.confidence >= 0.6 ...")` | unfiltered Cypher |
+| Filter by confidence band | `query_graph("... WHERE r.confidence_band = 'high' ...")` | numeric threshold |
+| Interface method overrides | `query_graph("MATCH (s)-[:OVERRIDE]->(i) RETURN s.name, i.name")` | manual AST inspection |
+| Read refs (callbacks, stored funcs) | `query_graph("MATCH (a)-[:USAGE]->(b) RETURN a.name, b.name")` | grepping for function names |
+| Files that change together | `query_graph("MATCH (a)-[r:FILE_CHANGES_WITH]->(b) WHERE r.coupling_score >= 0.5 RETURN ...")` | manual git log analysis |
+| Validate HTTP edges with traces | `ingest_traces(project="myproj", file_path="/path/to/traces.json")` | manual trace inspection |
 | Async dispatch functions | `search_graph(name_pattern=".*CreateTask.*")` then `trace_call_path` | `search_graph(relationship="ASYNC_CALLS")` |
 | Text search | `search_code` or grep | graph tools |
 | Complex multi-hop patterns | `query_graph` with Cypher + LIMIT | `search_graph` |
 
-## Tool Reference (11 Tools)
+## Tool Reference (12 Tools)
 
 | Tool | Purpose | When to Use |
 |------|---------|-------------|
 | `index_repository` | Parse and ingest repo into graph | Only needed once per project — auto-sync keeps it fresh |
 | `trace_call_path` | BFS from/to a function (exact name match) | Primary tool for call chains — requires EXACT name |
 | `search_graph` | Structured search with filters | Find functions, dead code, fan-out, cross-service links |
-| `query_graph` | Cypher-like graph queries (200-row cap) | Complex multi-hop patterns, filtered joins |
+| `query_graph` | Cypher-like graph queries (200-row cap) | Complex multi-hop patterns, filtered joins, edge property filtering |
 | `get_graph_schema` | Node/edge counts, relationship patterns | Understand what's indexed before querying |
 | `get_code_snippet` | Read source by qualified name | After search finds a target function |
 | `search_code` | Grep-like text search within project | String literals, error messages, TODO comments |
@@ -71,6 +83,7 @@ After the initial `index_repository` call, a **background watcher** polls for fi
 | `list_directory` | List files/directories with glob filter | Explore project structure |
 | `list_projects` | See all indexed projects | Check if reindex is needed (shows `indexed_at`) |
 | `delete_project` | Remove a project from graph | Cleanup stale projects |
+| `ingest_traces` | Ingest OTLP JSON traces to validate HTTP_CALLS edges | After deploying — enrich edges with p99_latency, call_count, validated_by_trace |
 
 ## Edge Types
 
@@ -84,6 +97,9 @@ After the initial `index_repository` call, a **background watcher** polls for fi
 | `DEFINES_METHOD` | Class defines a method |
 | `HANDLES` | Route node handled by a function |
 | `IMPLEMENTS` | Type implements an interface |
+| `OVERRIDE` | Struct method overrides an interface method (e.g., FileReader.Read → Reader.Read) |
+| `USAGE` | Read reference — function passed as callback, stored in variable, not invoked |
+| `FILE_CHANGES_WITH` | Git history change coupling — files that frequently change together (properties: coupling_score, co_change_count) |
 | `CONTAINS_FILE` / `CONTAINS_FOLDER` / `CONTAINS_PACKAGE` | Structural containment |
 
 ## Critical Query Pitfalls
@@ -91,6 +107,31 @@ After the initial `index_repository` call, a **background watcher** polls for fi
 **`search_graph(relationship="HTTP_CALLS")` does NOT return edges.** It filters *nodes* by their HTTP_CALLS degree count. To see the actual cross-service links with URLs and confidence scores, use Cypher:
 ```
 query_graph("MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_path, r.confidence ORDER BY r.confidence DESC LIMIT 30")
+```
+
+**Edge property filtering works in WHERE clauses.** You can filter on any edge property:
+```
+# Filter by URL path substring
+query_graph("MATCH (a)-[r:HTTP_CALLS]->(b) WHERE r.url_path CONTAINS 'bestellung' RETURN a.name, b.name, r.url_path")
+
+# Filter by confidence threshold
+query_graph("MATCH (a)-[r:HTTP_CALLS]->(b) WHERE r.confidence >= 0.6 RETURN a.name, b.name, r.confidence LIMIT 20")
+
+# Filter by confidence band (high/medium/speculative)
+query_graph("MATCH (a)-[r:HTTP_CALLS]->(b) WHERE r.confidence_band = 'high' RETURN a.name, b.name, r.url_path")
+
+# Change coupling above threshold
+query_graph("MATCH (a)-[r:FILE_CHANGES_WITH]->(b) WHERE r.coupling_score >= 0.5 RETURN a.name, b.name, r.coupling_score, r.co_change_count LIMIT 20")
+```
+
+**Confidence bands** on HTTP_CALLS/ASYNC_CALLS edges:
+- `high` (>= 0.7): Strong structural path match
+- `medium` (0.45-0.7): Good signal, current default range
+- `speculative` (0.25-0.45): Fuzzy match, needs human review
+
+**`exclude_labels` filters out noise.** When searching by `name_pattern`, Route nodes can dominate results. Use `exclude_labels` to remove them:
+```
+search_graph(name_pattern=".*[Ff]irestore.*", exclude_labels=["Route"])
 ```
 
 **`search_graph(relationship="ASYNC_CALLS")` has the same limitation.** ASYNC_CALLS edges only exist when the URL linker can resolve dispatch URLs to route handlers. When URLs are in config variables or env vars (common for Cloud Tasks, Pub/Sub), the linker can't match them. Instead, find dispatch functions by name pattern and trace via CALLS edges:

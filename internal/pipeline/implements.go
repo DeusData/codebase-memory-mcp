@@ -7,10 +7,16 @@ import (
 	"github.com/DeusData/codebase-memory-mcp/internal/store"
 )
 
-// ifaceInfo holds an interface node and its required method names.
+// ifaceMethodInfo holds a method name and its qualified name for OVERRIDE edge creation.
+type ifaceMethodInfo struct {
+	name          string
+	qualifiedName string
+}
+
+// ifaceInfo holds an interface node and its required methods.
 type ifaceInfo struct {
 	node    *store.Node
-	methods []string
+	methods []ifaceMethodInfo
 }
 
 // passImplements detects Go interface satisfaction and creates IMPLEMENTS edges.
@@ -24,9 +30,9 @@ func (p *Pipeline) passImplements() {
 	}
 
 	structMethods, structQNPrefix := p.collectStructMethods()
-	linkCount := p.matchImplements(ifaces, structMethods, structQNPrefix)
+	linkCount, overrideCount := p.matchImplements(ifaces, structMethods, structQNPrefix)
 
-	slog.Info("pass5.implements.done", "links", linkCount)
+	slog.Info("pass5.implements.done", "links", linkCount, "overrides", overrideCount)
 }
 
 // collectGoInterfaces returns Go interfaces with their method names.
@@ -47,16 +53,19 @@ func (p *Pipeline) collectGoInterfaces() []ifaceInfo {
 			continue
 		}
 
-		var methodNames []string
+		var methods []ifaceMethodInfo
 		for _, e := range edges {
 			methodNode, _ := p.Store.FindNodeByID(e.TargetID)
 			if methodNode != nil {
-				methodNames = append(methodNames, methodNode.Name)
+				methods = append(methods, ifaceMethodInfo{
+					name:          methodNode.Name,
+					qualifiedName: methodNode.QualifiedName,
+				})
 			}
 		}
 
-		if len(methodNames) > 0 {
-			ifaces = append(ifaces, ifaceInfo{node: iface, methods: methodNames})
+		if len(methods) > 0 {
+			ifaces = append(ifaces, ifaceInfo{node: iface, methods: methods})
 		}
 	}
 	return ifaces
@@ -105,13 +114,12 @@ func (p *Pipeline) collectStructMethods() (structMethods map[string]map[string]b
 	return
 }
 
-// matchImplements checks each struct against each interface and creates IMPLEMENTS edges.
+// matchImplements checks each struct against each interface and creates IMPLEMENTS + OVERRIDE edges.
 func (p *Pipeline) matchImplements(
 	ifaces []ifaceInfo,
 	structMethods map[string]map[string]bool,
 	structQNPrefix map[string]string,
-) int {
-	linkCount := 0
+) (linkCount, overrideCount int) {
 	for _, iface := range ifaces {
 		for typeName, methodSet := range structMethods {
 			if !satisfies(iface.methods, methodSet) {
@@ -130,9 +138,47 @@ func (p *Pipeline) matchImplements(
 				Type:     "IMPLEMENTS",
 			})
 			linkCount++
+
+			overrideCount += p.createOverrideEdges(iface.methods, typeName, structQNPrefix)
 		}
 	}
-	return linkCount
+	return linkCount, overrideCount
+}
+
+// createOverrideEdges creates OVERRIDE edges from struct methods to interface methods.
+func (p *Pipeline) createOverrideEdges(
+	ifaceMethods []ifaceMethodInfo,
+	typeName string,
+	structQNPrefix map[string]string,
+) int {
+	prefix, ok := structQNPrefix[typeName]
+	if !ok {
+		return 0
+	}
+
+	count := 0
+	for _, im := range ifaceMethods {
+		// prefix already includes the type name (e.g., "pkg.FileReader" from "pkg.FileReader.Read")
+		structMethodQN := prefix + "." + im.name
+		structMethodNode, _ := p.Store.FindNodeByQN(p.ProjectName, structMethodQN)
+		if structMethodNode == nil {
+			continue
+		}
+
+		ifaceMethodNode, _ := p.Store.FindNodeByQN(p.ProjectName, im.qualifiedName)
+		if ifaceMethodNode == nil {
+			continue
+		}
+
+		_, _ = p.Store.InsertEdge(&store.Edge{
+			Project:  p.ProjectName,
+			SourceID: structMethodNode.ID,
+			TargetID: ifaceMethodNode.ID,
+			Type:     "OVERRIDE",
+		})
+		count++
+	}
+	return count
 }
 
 // findStructNode looks up the struct/class node for a given receiver type name.
@@ -169,9 +215,9 @@ func extractReceiverType(recv string) string {
 }
 
 // satisfies checks if a set of method names includes all interface methods.
-func satisfies(ifaceMethods []string, structMethodSet map[string]bool) bool {
+func satisfies(ifaceMethods []ifaceMethodInfo, structMethodSet map[string]bool) bool {
 	for _, m := range ifaceMethods {
-		if !structMethodSet[m] {
+		if !structMethodSet[m.name] {
 			return false
 		}
 	}

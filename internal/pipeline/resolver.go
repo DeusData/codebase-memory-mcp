@@ -150,6 +150,39 @@ func (r *FunctionRegistry) resolveViaNameLookup(calleeName, suffix, moduleQN str
 	return ""
 }
 
+// FuzzyResolve attempts a loose match when Resolve() returns "".
+// It searches for any registered function whose simple name matches the callee's
+// last name segment. Returns the best match (by import distance) and true,
+// or "" and false if no match is found.
+//
+// Unlike Resolve(), this does not require prefix/import agreement — it purely
+// matches on the function name. Results should be marked as "fuzzy" resolution.
+func (r *FunctionRegistry) FuzzyResolve(calleeName, moduleQN string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// Extract the simple name (last segment after dots)
+	lookupName := simpleName(calleeName)
+	candidates := r.byName[lookupName]
+
+	if len(candidates) == 0 {
+		return "", false
+	}
+
+	// If there's exactly one candidate, use it
+	if len(candidates) == 1 {
+		return candidates[0], true
+	}
+
+	// Multiple candidates: pick best by import distance
+	best := bestByImportDistance(candidates, moduleQN)
+	if best != "" {
+		return best, true
+	}
+
+	return "", false
+}
+
 // FindByName returns all qualified names with the given simple name.
 func (r *FunctionRegistry) FindByName(name string) []string {
 	r.mu.RLock()

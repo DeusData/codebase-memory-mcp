@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -178,7 +179,27 @@ func (s *Store) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(project, source_id, type);
 	`
 	_, err := s.db.Exec(schema)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Migration: add url_path generated column to edges table.
+	// Generated columns require SQLite 3.31.0+ (modernc.org/sqlite supports this).
+	// We check if the column already exists to make this idempotent.
+	var colCount int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_xinfo('edges') WHERE name='url_path_gen'`).Scan(&colCount)
+	if colCount == 0 {
+		_, err = s.db.Exec(`ALTER TABLE edges ADD COLUMN url_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties, '$.url_path'))`)
+		if err != nil {
+			// If generated columns aren't supported, skip gracefully
+			slog.Warn("schema.url_path_gen.skip", "err", err)
+		}
+	}
+
+	// Index on generated column (safe to CREATE IF NOT EXISTS)
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_edges_url_path ON edges(project, url_path_gen)`)
+
+	return nil
 }
 
 // marshalProps serializes properties to JSON.

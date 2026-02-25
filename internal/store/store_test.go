@@ -1,6 +1,9 @@
 package store
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestOpenMemory(t *testing.T) {
 	s, err := OpenMemory()
@@ -321,5 +324,158 @@ func TestSearch(t *testing.T) {
 	}
 	if output.Total != 3 {
 		t.Errorf("expected total=3, got %d", output.Total)
+	}
+}
+
+func TestGlobToLike(t *testing.T) {
+	tests := []struct {
+		pattern string
+		want    string
+	}{
+		{"**/*.py", "%%.py"},
+		{"**/dir/**", "%dir%"},
+		{"*.go", "%.go"},
+		{"src/**", "src%"},
+		{"**/test_*.py", "%test_%.py"},
+		{"file?.txt", "file_.txt"},
+		{"exact.go", "exact.go"},
+		{"**/custom-pip-package/**", "%custom-pip-package%"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.pattern, func(t *testing.T) {
+			got := globToLike(tt.pattern)
+			if got != tt.want {
+				t.Errorf("globToLike(%q) = %q, want %q", tt.pattern, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGeneratedColumnURLPath(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Check that the generated column exists
+	var colCount int
+	err = s.DB().QueryRow(`SELECT COUNT(*) FROM pragma_table_xinfo('edges') WHERE name='url_path_gen'`).Scan(&colCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if colCount != 1 {
+		t.Skip("url_path_gen column not available (SQLite version may not support generated columns)")
+	}
+}
+
+func TestFindEdgesByURLPath(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Create project
+	if err := s.UpsertProject("test-proj", "/tmp/test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create two nodes
+	srcID, _ := s.UpsertNode(&Node{
+		Project: "test-proj", Label: "Function", Name: "caller",
+		QualifiedName: "test.caller",
+	})
+	tgtID, _ := s.UpsertNode(&Node{
+		Project: "test-proj", Label: "Function", Name: "handler",
+		QualifiedName: "test.handler",
+	})
+
+	// Create HTTP_CALLS edge with url_path
+	_, err = s.InsertEdge(&Edge{
+		Project:    "test-proj",
+		SourceID:   srcID,
+		TargetID:   tgtID,
+		Type:       "HTTP_CALLS",
+		Properties: map[string]any{"url_path": "/api/orders/create", "confidence": 0.8},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Search for edges containing "orders"
+	edges, err := s.FindEdgesByURLPath("test-proj", "orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(edges) != 1 {
+		t.Fatalf("expected 1 edge, got %d", len(edges))
+	}
+	if edges[0].Properties["url_path"] != "/api/orders/create" {
+		t.Errorf("unexpected url_path: %v", edges[0].Properties["url_path"])
+	}
+
+	// Search for non-matching
+	edges, err = s.FindEdgesByURLPath("test-proj", "users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(edges) != 0 {
+		t.Fatalf("expected 0 edges, got %d", len(edges))
+	}
+}
+
+func TestSearchExcludeLabels(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create nodes with different labels
+	for i, label := range []string{"Function", "Route", "Method", "Route"} {
+		_, _ = s.UpsertNode(&Node{
+			Project:       "test",
+			Label:         label,
+			Name:          "node_" + label,
+			QualifiedName: fmt.Sprintf("test.%s.node_%d", label, i),
+			FilePath:      "test.go",
+		})
+	}
+
+	// Search without exclusion
+	output, err := s.Search(&SearchParams{
+		Project: "test",
+		Limit:   100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := output.Total
+
+	// Search with Route excluded
+	output2, err := s.Search(&SearchParams{
+		Project:       "test",
+		ExcludeLabels: []string{"Route"},
+		Limit:         100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Should have fewer results
+	if output2.Total >= total {
+		t.Errorf("exclude_labels didn't reduce results: before=%d, after=%d", total, output2.Total)
+	}
+
+	// Verify no Route nodes in results
+	for _, r := range output2.Results {
+		if r.Node.Label == "Route" {
+			t.Errorf("found Route node despite exclude_labels")
+		}
 	}
 }

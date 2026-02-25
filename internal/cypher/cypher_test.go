@@ -724,3 +724,261 @@ func TestExecuteEdgeType(t *testing.T) {
 		t.Errorf("r.type = %v, want HTTP_CALLS", result.Rows[0]["r.type"])
 	}
 }
+
+// --- Comprehensive edge property filtering tests ---
+
+// setupTestStoreMultiEdge creates a store with two HTTP_CALLS edges to test filtering.
+func setupTestStoreMultiEdge(t *testing.T) *store.Store {
+	t.Helper()
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	project := "testproj"
+	if err := s.UpsertProject(project, "/tmp/test"); err != nil {
+		t.Fatal(err)
+	}
+
+	srcID, _ := s.UpsertNode(&store.Node{
+		Project: project, Label: "Function", Name: "SendOrder",
+		QualifiedName: "testproj.caller.SendOrder",
+		FilePath:      "caller/client.go",
+	})
+
+	tgtID, _ := s.UpsertNode(&store.Node{
+		Project: project, Label: "Function", Name: "HandleOrder",
+		QualifiedName: "testproj.handler.HandleOrder",
+		FilePath:      "handler/routes.go",
+	})
+
+	tgt2ID, _ := s.UpsertNode(&store.Node{
+		Project: project, Label: "Function", Name: "HandleHealth",
+		QualifiedName: "testproj.handler.HandleHealth",
+		FilePath:      "handler/health.go",
+	})
+
+	mustInsertEdge(t, s, &store.Edge{
+		Project: project, SourceID: srcID, TargetID: tgtID,
+		Type: "HTTP_CALLS",
+		Properties: map[string]any{
+			"url_path":   "/api/orders",
+			"confidence": 0.85,
+			"method":     "POST",
+		},
+	})
+
+	mustInsertEdge(t, s, &store.Edge{
+		Project: project, SourceID: srcID, TargetID: tgt2ID,
+		Type: "HTTP_CALLS",
+		Properties: map[string]any{
+			"url_path":   "/health",
+			"confidence": 0.45,
+		},
+	})
+
+	return s
+}
+
+func TestEdgePropertyFilterContains(t *testing.T) {
+	s := setupTestStoreMultiEdge(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[r:HTTP_CALLS]->(b) WHERE r.url_path CONTAINS 'orders' RETURN a.name, b.name, r.url_path`)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Rows))
+	}
+
+	row := result.Rows[0]
+	if row["a.name"] != "SendOrder" {
+		t.Errorf("a.name = %v, want SendOrder", row["a.name"])
+	}
+	if row["b.name"] != "HandleOrder" {
+		t.Errorf("b.name = %v, want HandleOrder", row["b.name"])
+	}
+	if row["r.url_path"] != "/api/orders" {
+		t.Errorf("r.url_path = %v, want /api/orders", row["r.url_path"])
+	}
+}
+
+func TestEdgePropertyFilterNumericGTE(t *testing.T) {
+	s := setupTestStoreMultiEdge(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[r:HTTP_CALLS]->(b) WHERE r.confidence >= 0.6 RETURN a.name, b.name, r.confidence LIMIT 20`)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row (only high-confidence edge), got %d", len(result.Rows))
+	}
+
+	row := result.Rows[0]
+	if row["b.name"] != "HandleOrder" {
+		t.Errorf("b.name = %v, want HandleOrder (high confidence)", row["b.name"])
+	}
+}
+
+func TestEdgePropertyReturnWithoutFilter(t *testing.T) {
+	s := setupTestStoreMultiEdge(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_path, r.confidence LIMIT 20`)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if len(result.Rows) < 2 {
+		t.Fatalf("expected at least 2 rows, got %d", len(result.Rows))
+	}
+
+	foundOrders := false
+	foundHealth := false
+	for _, row := range result.Rows {
+		urlPath, _ := row["r.url_path"].(string)
+		if urlPath == "/api/orders" {
+			foundOrders = true
+		}
+		if urlPath == "/health" {
+			foundHealth = true
+		}
+	}
+	if !foundOrders {
+		t.Error("missing row with url_path=/api/orders")
+	}
+	if !foundHealth {
+		t.Error("missing row with url_path=/health")
+	}
+}
+
+func TestEdgePropertyFilterEquals(t *testing.T) {
+	s := setupTestStoreMultiEdge(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[r:HTTP_CALLS]->(b) WHERE r.method = 'POST' RETURN a.name, b.name`)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Rows))
+	}
+	if result.Rows[0]["b.name"] != "HandleOrder" {
+		t.Errorf("b.name = %v, want HandleOrder", result.Rows[0]["b.name"])
+	}
+}
+
+func TestEdgePropertyFilterStartsWith(t *testing.T) {
+	s := setupTestStoreMultiEdge(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	result, err := exec.Execute(`MATCH (a)-[r:HTTP_CALLS]->(b) WHERE r.url_path STARTS WITH '/api' RETURN a.name, b.name, r.url_path`)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row (only /api/orders starts with /api), got %d", len(result.Rows))
+	}
+	if result.Rows[0]["r.url_path"] != "/api/orders" {
+		t.Errorf("r.url_path = %v, want /api/orders", result.Rows[0]["r.url_path"])
+	}
+}
+
+func TestCombinedNodeAndEdgeFilter(t *testing.T) {
+	s := setupTestStoreMultiEdge(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	// Filter on both node property (early) and edge property (late)
+	result, err := exec.Execute(`MATCH (a:Function)-[r:HTTP_CALLS]->(b:Function) WHERE a.name = 'SendOrder' AND r.confidence >= 0.6 RETURN b.name, r.url_path`)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Rows))
+	}
+	if result.Rows[0]["b.name"] != "HandleOrder" {
+		t.Errorf("b.name = %v, want HandleOrder", result.Rows[0]["b.name"])
+	}
+	if result.Rows[0]["r.url_path"] != "/api/orders" {
+		t.Errorf("r.url_path = %v, want /api/orders", result.Rows[0]["r.url_path"])
+	}
+}
+
+func TestEdgePropertyFilterNoMatch(t *testing.T) {
+	s := setupTestStoreMultiEdge(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	// No edge has method = 'DELETE'
+	result, err := exec.Execute(`MATCH (a)-[r:HTTP_CALLS]->(b) WHERE r.method = 'DELETE' RETURN a.name`)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if len(result.Rows) != 0 {
+		t.Errorf("expected 0 rows, got %d", len(result.Rows))
+	}
+}
+
+func TestEdgePropertyFilterNumericLT(t *testing.T) {
+	s := setupTestStoreMultiEdge(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	// Only the health edge (0.45) should match confidence < 0.5
+	result, err := exec.Execute(`MATCH (a)-[r:HTTP_CALLS]->(b) WHERE r.confidence < 0.5 RETURN b.name, r.confidence`)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Rows))
+	}
+	if result.Rows[0]["b.name"] != "HandleHealth" {
+		t.Errorf("b.name = %v, want HandleHealth", result.Rows[0]["b.name"])
+	}
+}
+
+func TestEdgePropertyFilterRegex(t *testing.T) {
+	s := setupTestStoreMultiEdge(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	// Regex match on url_path
+	result, err := exec.Execute(`MATCH (a)-[r:HTTP_CALLS]->(b) WHERE r.url_path =~ "/api/.*" RETURN b.name`)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Rows))
+	}
+	if result.Rows[0]["b.name"] != "HandleOrder" {
+		t.Errorf("b.name = %v, want HandleOrder", result.Rows[0]["b.name"])
+	}
+}
+
+func TestEdgeBuiltinPropertyFilter(t *testing.T) {
+	s := setupTestStoreMultiEdge(t)
+	defer s.Close()
+
+	exec := &Executor{Store: s}
+	// Filter on built-in edge property r.type
+	result, err := exec.Execute(`MATCH (a)-[r]->(b) WHERE r.type = 'HTTP_CALLS' RETURN a.name, b.name LIMIT 20`)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("expected 2 rows (both HTTP_CALLS edges), got %d", len(result.Rows))
+	}
+}
