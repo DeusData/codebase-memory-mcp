@@ -1,6 +1,6 @@
 # Binaries
 code-graph-mcp
-codebase-memory-mcp
+/codebase-memory-mcp
 bin/
 *.exe
 *.dll
