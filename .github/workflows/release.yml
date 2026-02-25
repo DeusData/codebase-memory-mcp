@@ -12,6 +12,20 @@ permissions:
   contents: write
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+
   build-unix:
     strategy:
       matrix:
@@ -94,7 +108,7 @@ jobs:
           path: "*.zip"
 
   release:
-    needs: [build-unix, build-windows]
+    needs: [lint, build-unix, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write

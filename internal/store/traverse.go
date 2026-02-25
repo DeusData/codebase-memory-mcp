@@ -20,6 +20,30 @@ type EdgeInfo struct {
 	Type     string
 }
 
+type bfsQueue struct {
+	nodeID int64
+	hop    int
+}
+
+// fetchEdgesForNode retrieves edges from a node in the given direction and edge types.
+func (s *Store) fetchEdgesForNode(nodeID int64, direction string, edgeTypes []string) ([]*Edge, error) {
+	var edges []*Edge
+	for _, et := range edgeTypes {
+		var found []*Edge
+		var err error
+		if direction == "outbound" {
+			found, err = s.FindEdgesBySourceAndType(nodeID, et)
+		} else {
+			found, err = s.FindEdgesByTargetAndType(nodeID, et)
+		}
+		if err != nil {
+			return nil, err
+		}
+		edges = append(edges, found...)
+	}
+	return edges, nil
+}
+
 // BFS performs breadth-first traversal following edges of given types.
 // direction: "outbound" follows source->target, "inbound" follows target->source.
 // maxDepth caps the BFS depth, maxResults caps total visited nodes.
@@ -32,14 +56,17 @@ func (s *Store) BFS(startNodeID int64, direction string, edgeTypes []string, max
 	}
 
 	result := &TraverseResult{}
-	visited := make(map[int64]int) // nodeID -> hop
+	visited := make(map[int64]int)     // nodeID -> hop
+	nodeCache := make(map[int64]*Node) // nodeID -> resolved node
 	visited[startNodeID] = 0
 
-	type queueItem struct {
-		nodeID int64
-		hop    int
+	// Cache the start node for edge name resolution
+	startNode, err := s.FindNodeByID(startNodeID)
+	if err == nil && startNode != nil {
+		nodeCache[startNodeID] = startNode
 	}
-	queue := []queueItem{{startNodeID, 0}}
+
+	queue := []bfsQueue{{startNodeID, 0}}
 
 	for len(queue) > 0 && len(result.Visited) < maxResults {
 		item := queue[0]
@@ -49,20 +76,9 @@ func (s *Store) BFS(startNodeID int64, direction string, edgeTypes []string, max
 			continue
 		}
 
-		// Get edges from this node
-		var edges []*Edge
-		for _, et := range edgeTypes {
-			var found []*Edge
-			var err error
-			if direction == "outbound" {
-				found, err = s.FindEdgesBySourceAndType(item.nodeID, et)
-			} else {
-				found, err = s.FindEdgesByTargetAndType(item.nodeID, et)
-			}
-			if err != nil {
-				return nil, err
-			}
-			edges = append(edges, found...)
+		edges, err := s.fetchEdgesForNode(item.nodeID, direction, edgeTypes)
+		if err != nil {
+			return nil, err
 		}
 
 		for _, e := range edges {
@@ -76,28 +92,39 @@ func (s *Store) BFS(startNodeID int64, direction string, edgeTypes []string, max
 			if _, seen := visited[nextID]; !seen {
 				visited[nextID] = item.hop + 1
 
-				row := s.db.QueryRow(`SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, properties
-					FROM nodes WHERE id=?`, nextID)
-				nextNode, err := scanNode(row)
-				if err != nil || nextNode == nil {
+				nextNode, lookupErr := s.FindNodeByID(nextID)
+				if lookupErr != nil || nextNode == nil {
 					continue
 				}
+				nodeCache[nextID] = nextNode
 
 				result.Visited = append(result.Visited, &NodeHop{Node: nextNode, Hop: item.hop + 1})
-				queue = append(queue, queueItem{nextID, item.hop + 1})
+				queue = append(queue, bfsQueue{nextID, item.hop + 1})
 
 				if len(result.Visited) >= maxResults {
 					break
 				}
 			}
 
-			// Record edge info
-			var fromName, toName string
-			s.db.QueryRow("SELECT name FROM nodes WHERE id=?", e.SourceID).Scan(&fromName)
-			s.db.QueryRow("SELECT name FROM nodes WHERE id=?", e.TargetID).Scan(&toName)
+			// Record edge info using cached nodes (avoid extra queries)
+			fromName := resolveNodeName(nodeCache, s, e.SourceID)
+			toName := resolveNodeName(nodeCache, s, e.TargetID)
 			result.Edges = append(result.Edges, EdgeInfo{FromName: fromName, ToName: toName, Type: e.Type})
 		}
 	}
 
 	return result, nil
+}
+
+// resolveNodeName returns the name for a node ID, using the cache first.
+func resolveNodeName(cache map[int64]*Node, s *Store, id int64) string {
+	if n, ok := cache[id]; ok {
+		return n.Name
+	}
+	n, err := s.FindNodeByID(id)
+	if err != nil || n == nil {
+		return ""
+	}
+	cache[id] = n
+	return n.Name
 }

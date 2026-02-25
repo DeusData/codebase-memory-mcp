@@ -49,8 +49,8 @@ func (s *Server) handleDeleteProject(_ context.Context, req *mcp.CallToolRequest
 	}
 
 	// Verify project exists
-	proj, err := s.store.GetProject(name)
-	if err != nil || proj == nil {
+	proj, _ := s.store.GetProject(name)
+	if proj == nil {
 		return errResult(fmt.Sprintf("project not found: %s", name)), nil
 	}
 

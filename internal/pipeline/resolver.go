@@ -59,46 +59,62 @@ func (r *FunctionRegistry) Resolve(calleeName, moduleQN string, importMap map[st
 		suffix = parts[1]
 	}
 
-	// Strategy 1: Import map lookup
-	if importMap != nil {
-		if resolved, ok := importMap[prefix]; ok {
-			var candidate string
-			if suffix != "" {
-				// Qualified call: pkg.Func -> resolved + "." + Func
-				candidate = resolved + "." + suffix
-			} else {
-				// Direct import: from X import func -> resolved is the full QN
-				candidate = resolved
-			}
-			if _, exists := r.exact[candidate]; exists {
-				return candidate
-			}
-			// If the resolved path is a module, try appending the calleeName
-			if suffix != "" {
-				// Also try looking up just the suffix under the resolved module
-				for qn := range r.exact {
-					if strings.HasPrefix(qn, resolved+".") && strings.HasSuffix(qn, "."+suffix) {
-						return qn
-					}
-				}
+	if result := r.resolveViaImportMap(prefix, suffix, importMap); result != "" {
+		return result
+	}
+
+	if result := r.resolveViaSameModule(calleeName, suffix, moduleQN); result != "" {
+		return result
+	}
+
+	return r.resolveViaNameLookup(calleeName, suffix, moduleQN)
+}
+
+// resolveViaImportMap tries to resolve a callee using the import map (Strategy 1).
+func (r *FunctionRegistry) resolveViaImportMap(prefix, suffix string, importMap map[string]string) string {
+	if importMap == nil {
+		return ""
+	}
+	resolved, ok := importMap[prefix]
+	if !ok {
+		return ""
+	}
+	var candidate string
+	if suffix != "" {
+		candidate = resolved + "." + suffix
+	} else {
+		candidate = resolved
+	}
+	if _, exists := r.exact[candidate]; exists {
+		return candidate
+	}
+	if suffix != "" {
+		for qn := range r.exact {
+			if strings.HasPrefix(qn, resolved+".") && strings.HasSuffix(qn, "."+suffix) {
+				return qn
 			}
 		}
 	}
+	return ""
+}
 
-	// Strategy 2: Same-module match
+// resolveViaSameModule tries to resolve a callee within the same module (Strategy 2).
+func (r *FunctionRegistry) resolveViaSameModule(calleeName, suffix, moduleQN string) string {
 	sameModule := moduleQN + "." + calleeName
 	if _, exists := r.exact[sameModule]; exists {
 		return sameModule
 	}
-	// For qualified calls in the same module, try the full calleeName
 	if suffix != "" {
 		sameModuleQualified := moduleQN + "." + suffix
 		if _, exists := r.exact[sameModuleQualified]; exists {
 			return sameModuleQualified
 		}
 	}
+	return ""
+}
 
-	// Strategy 3: Project-wide single match by simple name
+// resolveViaNameLookup tries project-wide name lookup and suffix matching (Strategies 3+4).
+func (r *FunctionRegistry) resolveViaNameLookup(calleeName, suffix, moduleQN string) string {
 	lookupName := calleeName
 	if suffix != "" {
 		lookupName = suffix
@@ -109,12 +125,11 @@ func (r *FunctionRegistry) Resolve(calleeName, moduleQN string, importMap map[st
 		return candidates[0]
 	}
 
-	// Strategy 4: Suffix match with import distance scoring
 	if suffix != "" {
 		var matches []string
 		for _, qn := range candidates {
 			if strings.HasSuffix(qn, "."+calleeName) {
-				return qn // exact suffix match
+				return qn
 			}
 			if strings.HasSuffix(qn, "."+suffix) {
 				matches = append(matches, qn)
@@ -128,7 +143,6 @@ func (r *FunctionRegistry) Resolve(calleeName, moduleQN string, importMap map[st
 		}
 	}
 
-	// For non-qualified calls with multiple candidates, use import distance
 	if len(candidates) > 1 {
 		return bestByImportDistance(candidates, moduleQN)
 	}

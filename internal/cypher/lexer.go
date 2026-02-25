@@ -30,25 +30,25 @@ const (
 	TokDesc                      // DESC
 
 	// Symbols
-	TokLParen    // (
-	TokRParen    // )
-	TokLBracket  // [
-	TokRBracket  // ]
-	TokDash      // -
-	TokGT        // >
-	TokLT        // <
-	TokColon     // :
-	TokDot       // .
-	TokLBrace    // {
-	TokRBrace    // }
-	TokStar      // *
-	TokComma     // ,
-	TokEQ        // =
-	TokRegex     // =~
-	TokGTE       // >=
-	TokLTE       // <=
-	TokPipe      // |
-	TokDotDot    // ..
+	TokLParen   // (
+	TokRParen   // )
+	TokLBracket // [
+	TokRBracket // ]
+	TokDash     // -
+	TokGT       // >
+	TokLT       // <
+	TokColon    // :
+	TokDot      // .
+	TokLBrace   // {
+	TokRBrace   // }
+	TokStar     // *
+	TokComma    // ,
+	TokEQ       // =
+	TokRegex    // =~
+	TokGTE      // >=
+	TokLTE      // <=
+	TokPipe     // |
+	TokDotDot   // ..
 
 	// Literals
 	TokIdent  // identifier
@@ -60,9 +60,9 @@ const (
 
 // Token is a single lexer token.
 type Token struct {
-	Type    TokenType
-	Value   string
-	Pos     int // byte offset in the input
+	Type  TokenType
+	Value string
+	Pos   int // byte offset in the input
 }
 
 func (t Token) String() string {
@@ -90,6 +90,21 @@ var keywords = map[string]TokenType{
 	"DESC":     TokDesc,
 }
 
+// singleCharTokens maps single-character symbols to their token type.
+var singleCharTokens = map[byte]TokenType{
+	'(': TokLParen,
+	')': TokRParen,
+	'[': TokLBracket,
+	']': TokRBracket,
+	'{': TokLBrace,
+	'}': TokRBrace,
+	'*': TokStar,
+	',': TokComma,
+	'|': TokPipe,
+	':': TokColon,
+	'-': TokDash,
+}
+
 // Lexer tokenizes a Cypher query string.
 type Lexer struct {
 	input  string
@@ -110,104 +125,97 @@ func (l *Lexer) tokenize() error {
 	for l.pos < len(l.input) {
 		ch := l.input[l.pos]
 
-		// Skip whitespace
-		if unicode.IsSpace(rune(ch)) {
-			l.pos++
+		if l.skipWhitespaceAndComments(ch) {
 			continue
 		}
 
-		// Skip line comments
-		if ch == '/' && l.pos+1 < len(l.input) && l.input[l.pos+1] == '/' {
-			for l.pos < len(l.input) && l.input[l.pos] != '\n' {
-				l.pos++
-			}
-			continue
+		if err := l.lexNextToken(ch); err != nil {
+			return err
 		}
-
-		// Skip block comments
-		if ch == '/' && l.pos+1 < len(l.input) && l.input[l.pos+1] == '*' {
-			l.pos += 2
-			for l.pos+1 < len(l.input) {
-				if l.input[l.pos] == '*' && l.input[l.pos+1] == '/' {
-					l.pos += 2
-					break
-				}
-				l.pos++
-			}
-			continue
-		}
-
-		switch {
-		case ch == '(':
-			l.emit(TokLParen, "(")
-		case ch == ')':
-			l.emit(TokRParen, ")")
-		case ch == '[':
-			l.emit(TokLBracket, "[")
-		case ch == ']':
-			l.emit(TokRBracket, "]")
-		case ch == '{':
-			l.emit(TokLBrace, "{")
-		case ch == '}':
-			l.emit(TokRBrace, "}")
-		case ch == '*':
-			l.emit(TokStar, "*")
-		case ch == ',':
-			l.emit(TokComma, ",")
-		case ch == '|':
-			l.emit(TokPipe, "|")
-		case ch == ':':
-			l.emit(TokColon, ":")
-		case ch == '.':
-			if l.pos+1 < len(l.input) && l.input[l.pos+1] == '.' {
-				l.pos++
-				l.emit(TokDotDot, "..")
-			} else {
-				l.emit(TokDot, ".")
-			}
-		case ch == '-':
-			l.emit(TokDash, "-")
-		case ch == '>':
-			if l.pos+1 < len(l.input) && l.input[l.pos+1] == '=' {
-				l.pos++
-				l.emit(TokGTE, ">=")
-			} else {
-				l.emit(TokGT, ">")
-			}
-		case ch == '<':
-			if l.pos+1 < len(l.input) && l.input[l.pos+1] == '=' {
-				l.pos++
-				l.emit(TokLTE, "<=")
-			} else {
-				l.emit(TokLT, "<")
-			}
-		case ch == '=':
-			if l.pos+1 < len(l.input) && l.input[l.pos+1] == '~' {
-				l.pos++
-				l.emit(TokRegex, "=~")
-			} else {
-				l.emit(TokEQ, "=")
-			}
-		case ch == '"' || ch == '\'':
-			if err := l.lexString(ch); err != nil {
-				return err
-			}
-			continue // lexString advances pos itself
-		case isDigit(ch):
-			l.lexNumber()
-			continue // lexNumber advances pos itself
-		case isIdentStart(ch):
-			l.lexIdent()
-			continue // lexIdent advances pos itself
-		default:
-			return fmt.Errorf("unexpected char %q at pos %d", string(ch), l.pos)
-		}
-
-		l.pos++
 	}
 
 	l.tokens = append(l.tokens, Token{Type: TokEOF, Value: "", Pos: l.pos})
 	return nil
+}
+
+// skipWhitespaceAndComments skips whitespace and // or /* */ comments.
+// Returns true if something was skipped (caller should continue the loop).
+func (l *Lexer) skipWhitespaceAndComments(ch byte) bool {
+	if unicode.IsSpace(rune(ch)) {
+		l.pos++
+		return true
+	}
+	if ch == '/' && l.pos+1 < len(l.input) && l.input[l.pos+1] == '/' {
+		for l.pos < len(l.input) && l.input[l.pos] != '\n' {
+			l.pos++
+		}
+		return true
+	}
+	if ch == '/' && l.pos+1 < len(l.input) && l.input[l.pos+1] == '*' {
+		l.pos += 2
+		for l.pos+1 < len(l.input) {
+			if l.input[l.pos] == '*' && l.input[l.pos+1] == '/' {
+				l.pos += 2
+				break
+			}
+			l.pos++
+		}
+		return true
+	}
+	return false
+}
+
+// lexNextToken dispatches a single token starting at l.pos.
+func (l *Lexer) lexNextToken(ch byte) error {
+	// Single-character tokens
+	if tok, ok := singleCharTokens[ch]; ok {
+		l.emit(tok, string(ch))
+		l.pos++
+		return nil
+	}
+
+	switch {
+	case ch == '.':
+		l.lexDot()
+	case ch == '>':
+		l.lexTwoChar('=', TokGTE, TokGT, ">")
+	case ch == '<':
+		l.lexTwoChar('=', TokLTE, TokLT, "<")
+	case ch == '=':
+		l.lexTwoChar('~', TokRegex, TokEQ, "=")
+	case ch == '"' || ch == '\'':
+		return l.lexString(ch)
+	case isDigit(ch):
+		l.lexNumber()
+	case isIdentStart(ch):
+		l.lexIdent()
+	default:
+		return fmt.Errorf("unexpected char %q at pos %d", string(ch), l.pos)
+	}
+	return nil
+}
+
+// lexDot handles '.' and '..' tokens.
+func (l *Lexer) lexDot() {
+	if l.pos+1 < len(l.input) && l.input[l.pos+1] == '.' {
+		l.emit(TokDotDot, "..")
+		l.pos += 2
+	} else {
+		l.emit(TokDot, ".")
+		l.pos++
+	}
+}
+
+// lexTwoChar handles two-character tokens like >=, <=, =~.
+// If the next char matches second, emit the compound token; otherwise emit the single token.
+func (l *Lexer) lexTwoChar(second byte, compoundTok, singleTok TokenType, singleVal string) {
+	if l.pos+1 < len(l.input) && l.input[l.pos+1] == second {
+		l.emit(compoundTok, singleVal+string(second))
+		l.pos += 2
+	} else {
+		l.emit(singleTok, singleVal)
+		l.pos++
+	}
 }
 
 func (l *Lexer) emit(typ TokenType, val string) {

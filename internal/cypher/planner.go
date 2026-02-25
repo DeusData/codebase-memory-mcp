@@ -1,5 +1,7 @@
 package cypher
 
+import "fmt"
+
 // Plan represents an execution plan for a parsed Cypher query.
 type Plan struct {
 	Steps      []PlanStep
@@ -22,10 +24,10 @@ func (*ScanNodes) stepType() string { return "scan" }
 
 // ExpandRelationship follows edges from bound nodes to match target nodes.
 type ExpandRelationship struct {
-	FromVar   string   // source variable (already bound)
-	ToVar     string   // target variable (to bind)
-	RelVar    string   // optional relationship variable (to bind edge)
-	ToLabel   string   // optional label filter on target
+	FromVar   string // source variable (already bound)
+	ToVar     string // target variable (to bind)
+	RelVar    string // optional relationship variable (to bind edge)
+	ToLabel   string // optional label filter on target
 	ToProps   map[string]string
 	EdgeTypes []string // required edge types
 	Direction string   // "outbound", "inbound", "any"
@@ -43,6 +45,24 @@ type FilterWhere struct {
 
 func (*FilterWhere) stepType() string { return "filter" }
 
+// asNodePattern safely type-asserts a PatternElement to *NodePattern.
+func asNodePattern(el PatternElement) (*NodePattern, error) {
+	np, ok := el.(*NodePattern)
+	if !ok {
+		return nil, fmt.Errorf("expected *NodePattern, got %T", el)
+	}
+	return np, nil
+}
+
+// asRelPattern safely type-asserts a PatternElement to *RelPattern.
+func asRelPattern(el PatternElement) (*RelPattern, error) {
+	rp, ok := el.(*RelPattern)
+	if !ok {
+		return nil, fmt.Errorf("expected *RelPattern, got %T", el)
+	}
+	return rp, nil
+}
+
 // BuildPlan converts a parsed Query AST into an execution Plan.
 func BuildPlan(q *Query) (*Plan, error) {
 	plan := &Plan{ReturnSpec: q.Return}
@@ -53,7 +73,10 @@ func BuildPlan(q *Query) (*Plan, error) {
 	}
 
 	// First element is always a node pattern
-	firstNode := elements[0].(*NodePattern)
+	firstNode, err := asNodePattern(elements[0])
+	if err != nil {
+		return nil, fmt.Errorf("first pattern element: %w", err)
+	}
 	plan.Steps = append(plan.Steps, &ScanNodes{
 		Variable: firstNode.Variable,
 		Label:    firstNode.Label,
@@ -63,27 +86,7 @@ func BuildPlan(q *Query) (*Plan, error) {
 	// Optimization: push WHERE conditions that reference only the first
 	// scan variable BEFORE any expand steps. This dramatically reduces the
 	// number of bindings that need to be expanded.
-	var earlyFilters []Condition
-	var lateFilters []Condition
-
-	if q.Where != nil {
-		scanVar := firstNode.Variable
-		hasExpand := len(elements) > 1
-
-		if hasExpand && q.Where.Operator == "AND" {
-			// Split conditions: those referencing only scanVar go early
-			for _, c := range q.Where.Conditions {
-				if c.Variable == scanVar {
-					earlyFilters = append(earlyFilters, c)
-				} else {
-					lateFilters = append(lateFilters, c)
-				}
-			}
-		} else {
-			// Can't split OR conditions or when there's no expand
-			lateFilters = q.Where.Conditions
-		}
-	}
+	earlyFilters, lateFilters := splitWhereFilters(q.Where, firstNode.Variable, len(elements) > 1)
 
 	// Insert early filter right after scan
 	if len(earlyFilters) > 0 {
@@ -95,11 +98,21 @@ func BuildPlan(q *Query) (*Plan, error) {
 
 	// Process relationship-node pairs
 	for i := 1; i+1 < len(elements); i += 2 {
-		rel := elements[i].(*RelPattern)
-		targetNode := elements[i+1].(*NodePattern)
+		rel, err := asRelPattern(elements[i])
+		if err != nil {
+			return nil, fmt.Errorf("element[%d]: %w", i, err)
+		}
+		targetNode, err := asNodePattern(elements[i+1])
+		if err != nil {
+			return nil, fmt.Errorf("element[%d]: %w", i+1, err)
+		}
+		fromNode, err := asNodePattern(elements[i-1])
+		if err != nil {
+			return nil, fmt.Errorf("element[%d]: %w", i-1, err)
+		}
 
 		plan.Steps = append(plan.Steps, &ExpandRelationship{
-			FromVar:   elements[i-1].(*NodePattern).Variable,
+			FromVar:   fromNode.Variable,
 			ToVar:     targetNode.Variable,
 			RelVar:    rel.Variable,
 			ToLabel:   targetNode.Label,
@@ -126,4 +139,24 @@ func BuildPlan(q *Query) (*Plan, error) {
 	}
 
 	return plan, nil
+}
+
+// splitWhereFilters separates WHERE conditions into early (scan-only) and late filters.
+func splitWhereFilters(where *WhereClause, scanVar string, hasExpand bool) (early, late []Condition) {
+	if where == nil {
+		return nil, nil
+	}
+
+	if hasExpand && where.Operator == "AND" {
+		for _, c := range where.Conditions {
+			if c.Variable == scanVar {
+				early = append(early, c)
+			} else {
+				late = append(late, c)
+			}
+		}
+		return early, late
+	}
+	// Can't split OR conditions or when there's no expand
+	return nil, where.Conditions
 }

@@ -39,7 +39,7 @@ func resolveModuleStrings(root *tree_sitter.Node, source []byte, language lang.L
 
 // resolveAssignment tries to extract a (name, resolved_value) pair from
 // a top-level AST node. Returns ("","") if the node isn't a string assignment.
-func resolveAssignment(node *tree_sitter.Node, source []byte, language lang.Language, symbols map[string]string) (string, string) {
+func resolveAssignment(node *tree_sitter.Node, source []byte, language lang.Language, symbols map[string]string) (name, value string) {
 	switch language {
 	case lang.Python:
 		return resolvePython(node, source, symbols)
@@ -67,7 +67,7 @@ func resolveAssignment(node *tree_sitter.Node, source []byte, language lang.Lang
 // --- Python ---
 // expression_statement → assignment → (identifier, string|binary_operator)
 
-func resolvePython(node *tree_sitter.Node, source []byte, symbols map[string]string) (string, string) {
+func resolvePython(node *tree_sitter.Node, source []byte, symbols map[string]string) (name, value string) {
 	if node.Kind() != "expression_statement" {
 		return "", ""
 	}
@@ -80,8 +80,8 @@ func resolvePython(node *tree_sitter.Node, source []byte, symbols map[string]str
 	if nameNode == nil || valueNode == nil || nameNode.Kind() != "identifier" {
 		return "", ""
 	}
-	name := parser.NodeText(nameNode, source)
-	value := resolveStringExpr(valueNode, source, symbols)
+	name = parser.NodeText(nameNode, source)
+	value = resolveStringExpr(valueNode, source, symbols)
 	return name, value
 }
 
@@ -89,7 +89,7 @@ func resolvePython(node *tree_sitter.Node, source []byte, symbols map[string]str
 // const_declaration → const_spec → (identifier, expression_list)
 // var_declaration → var_spec → (identifier, expression_list)
 
-func resolveGo(node *tree_sitter.Node, source []byte, symbols map[string]string) (string, string) {
+func resolveGo(node *tree_sitter.Node, source []byte, symbols map[string]string) (name, value string) {
 	var spec *tree_sitter.Node
 	switch node.Kind() {
 	case "const_declaration":
@@ -114,15 +114,15 @@ func resolveGo(node *tree_sitter.Node, source []byte, symbols map[string]string)
 			return "", ""
 		}
 	}
-	name := parser.NodeText(nameNode, source)
-	value := resolveStringExpr(valueNode, source, symbols)
+	name = parser.NodeText(nameNode, source)
+	value = resolveStringExpr(valueNode, source, symbols)
 	return name, value
 }
 
 // --- JavaScript / TypeScript / TSX ---
 // lexical_declaration → variable_declarator → (identifier, value)
 
-func resolveJS(node *tree_sitter.Node, source []byte, symbols map[string]string) (string, string) {
+func resolveJS(node *tree_sitter.Node, source []byte, symbols map[string]string) (name, value string) {
 	if node.Kind() != "lexical_declaration" {
 		return "", ""
 	}
@@ -135,8 +135,8 @@ func resolveJS(node *tree_sitter.Node, source []byte, symbols map[string]string)
 	if nameNode == nil || valueNode == nil {
 		return "", ""
 	}
-	name := parser.NodeText(nameNode, source)
-	value := resolveStringExpr(valueNode, source, symbols)
+	name = parser.NodeText(nameNode, source)
+	value = resolveStringExpr(valueNode, source, symbols)
 	return name, value
 }
 
@@ -144,7 +144,7 @@ func resolveJS(node *tree_sitter.Node, source []byte, symbols map[string]string)
 // const_item → (identifier, string_literal|binary_expression|macro_invocation)
 // let_declaration → (identifier, value)
 
-func resolveRust(node *tree_sitter.Node, source []byte, symbols map[string]string) (string, string) {
+func resolveRust(node *tree_sitter.Node, source []byte, symbols map[string]string) (name, value string) {
 	switch node.Kind() {
 	case "const_item", "let_declaration":
 		// both use field "name" for identifier and "value" for the expression
@@ -160,8 +160,8 @@ func resolveRust(node *tree_sitter.Node, source []byte, symbols map[string]strin
 	if nameNode == nil || valueNode == nil {
 		return "", ""
 	}
-	name := parser.NodeText(nameNode, source)
-	value := resolveStringExpr(valueNode, source, symbols)
+	name = parser.NodeText(nameNode, source)
+	value = resolveStringExpr(valueNode, source, symbols)
 	return name, value
 }
 
@@ -169,7 +169,7 @@ func resolveRust(node *tree_sitter.Node, source []byte, symbols map[string]strin
 // class_declaration → class_body → field_declaration → variable_declarator
 // We need to look inside class bodies for static final fields.
 
-func resolveJava(node *tree_sitter.Node, source []byte, symbols map[string]string) (string, string) {
+func resolveJava(node *tree_sitter.Node, source []byte, symbols map[string]string) (name, value string) {
 	if node.Kind() != "class_declaration" {
 		return "", ""
 	}
@@ -192,8 +192,8 @@ func resolveJava(node *tree_sitter.Node, source []byte, symbols map[string]strin
 		if nameNode == nil || valueNode == nil {
 			continue
 		}
-		name := parser.NodeText(nameNode, source)
-		value := resolveStringExpr(valueNode, source, symbols)
+		name = parser.NodeText(nameNode, source)
+		value = resolveStringExpr(valueNode, source, symbols)
 		if name != "" && value != "" {
 			symbols[name] = value
 		}
@@ -204,7 +204,7 @@ func resolveJava(node *tree_sitter.Node, source []byte, symbols map[string]strin
 // --- PHP ---
 // expression_statement → assignment_expression → (variable_name, encapsed_string|binary_expression)
 
-func resolvePHP(node *tree_sitter.Node, source []byte, symbols map[string]string) (string, string) {
+func resolvePHP(node *tree_sitter.Node, source []byte, symbols map[string]string) (name, value string) {
 	if node.Kind() != "expression_statement" {
 		return "", ""
 	}
@@ -218,11 +218,11 @@ func resolvePHP(node *tree_sitter.Node, source []byte, symbols map[string]string
 		return "", ""
 	}
 	// PHP variable names include $, extract just the name part
-	name := extractPHPVarName(nameNode, source)
+	name = extractPHPVarName(nameNode, source)
 	if name == "" {
 		return "", ""
 	}
-	value := resolveStringExpr(valueNode, source, symbols)
+	value = resolveStringExpr(valueNode, source, symbols)
 	return name, value
 }
 
@@ -243,7 +243,7 @@ func extractPHPVarName(node *tree_sitter.Node, source []byte) string {
 // --- Scala ---
 // val_definition → (identifier, string|interpolated_string_expression|infix_expression)
 
-func resolveScala(node *tree_sitter.Node, source []byte, symbols map[string]string) (string, string) {
+func resolveScala(node *tree_sitter.Node, source []byte, symbols map[string]string) (name, value string) {
 	if node.Kind() != "val_definition" {
 		return "", ""
 	}
@@ -252,8 +252,8 @@ func resolveScala(node *tree_sitter.Node, source []byte, symbols map[string]stri
 	if nameNode == nil || valueNode == nil {
 		return "", ""
 	}
-	name := parser.NodeText(nameNode, source)
-	value := resolveStringExpr(valueNode, source, symbols)
+	name = parser.NodeText(nameNode, source)
+	value = resolveStringExpr(valueNode, source, symbols)
 	return name, value
 }
 
@@ -261,7 +261,7 @@ func resolveScala(node *tree_sitter.Node, source []byte, symbols map[string]stri
 // preproc_def → identifier + preproc_arg (for #define)
 // declaration → init_declarator → identifier + value (for const std::string x = "...")
 
-func resolveCPP(node *tree_sitter.Node, source []byte, symbols map[string]string) (string, string) {
+func resolveCPP(node *tree_sitter.Node, source []byte, symbols map[string]string) (name, value string) {
 	switch node.Kind() {
 	case "preproc_def":
 		// #define NAME "value"
@@ -270,7 +270,7 @@ func resolveCPP(node *tree_sitter.Node, source []byte, symbols map[string]string
 		if nameNode == nil || valueNode == nil {
 			return "", ""
 		}
-		name := parser.NodeText(nameNode, source)
+		name = parser.NodeText(nameNode, source)
 		// preproc_arg contains the raw text — try to extract string content
 		argText := strings.TrimSpace(parser.NodeText(valueNode, source))
 		if len(argText) >= 2 && argText[0] == '"' && argText[len(argText)-1] == '"' {
@@ -294,8 +294,8 @@ func resolveCPP(node *tree_sitter.Node, source []byte, symbols map[string]string
 		if nameNode == nil || valueNode == nil {
 			return "", ""
 		}
-		name := parser.NodeText(nameNode, source)
-		value := resolveStringExpr(valueNode, source, symbols)
+		name = parser.NodeText(nameNode, source)
+		value = resolveStringExpr(valueNode, source, symbols)
 		return name, value
 	}
 	return "", ""
@@ -305,7 +305,7 @@ func resolveCPP(node *tree_sitter.Node, source []byte, symbols map[string]string
 // variable_declaration → assignment_statement → variable_list + expression_list
 // Local: local x = "value" → variable_declaration containing assignment_statement
 
-func resolveLua(node *tree_sitter.Node, source []byte, symbols map[string]string) (string, string) {
+func resolveLua(node *tree_sitter.Node, source []byte, symbols map[string]string) (name, value string) {
 	if node.Kind() != "variable_declaration" {
 		return "", ""
 	}
@@ -326,8 +326,8 @@ func resolveLua(node *tree_sitter.Node, source []byte, symbols map[string]string
 		return "", ""
 	}
 
-	name := parser.NodeText(nameNode, source)
-	value := resolveStringExpr(valueNode, source, symbols)
+	name = parser.NodeText(nameNode, source)
+	value = resolveStringExpr(valueNode, source, symbols)
 	return name, value
 }
 
@@ -394,8 +394,8 @@ func resolveStringExpr(node *tree_sitter.Node, source []byte, symbols map[string
 		return resolveBinaryConcat(node, source, symbols)
 	}
 
-	// Go fmt.Sprintf / Java String.format / Lua string.format / Rust format! macro
-	if kind == "call_expression" || kind == "function_call" {
+	// Go fmt.Sprintf / Java String.format / Lua string.format / Python calls / Rust format! macro
+	if kind == "call_expression" || kind == "function_call" || kind == "call" {
 		return resolveCallExpr(node, source, symbols)
 	}
 	if kind == "macro_invocation" {
@@ -511,21 +511,34 @@ func resolveScalaInterpolated(node *tree_sitter.Node, source []byte, symbols map
 }
 
 // resolveBinaryConcat resolves string concatenation: left + right or left . right (PHP).
+// Also handles || and ?? (nullish coalescing / logical OR default patterns).
 func resolveBinaryConcat(node *tree_sitter.Node, source []byte, symbols map[string]string) string {
 	opNode := node.ChildByFieldName("operator")
 	if opNode == nil {
 		return ""
 	}
 	op := parser.NodeText(opNode, source)
-	if op != "+" && op != "." && op != ".." {
+
+	switch op {
+	case "+", ".", "..":
+		left := resolveStringExpr(node.ChildByFieldName("left"), source, symbols)
+		right := resolveStringExpr(node.ChildByFieldName("right"), source, symbols)
+		if left == "" && right == "" {
+			return ""
+		}
+		return left + right
+	case "||", "??":
+		// For || and ??, return the right operand (default value) when left can't be resolved.
+		// This handles: process.env.KEY || "https://fallback"
+		//               envVar ?? "https://default"
+		left := resolveStringExpr(node.ChildByFieldName("left"), source, symbols)
+		if left != "" {
+			return left
+		}
+		return resolveStringExpr(node.ChildByFieldName("right"), source, symbols)
+	default:
 		return ""
 	}
-	left := resolveStringExpr(node.ChildByFieldName("left"), source, symbols)
-	right := resolveStringExpr(node.ChildByFieldName("right"), source, symbols)
-	if left == "" && right == "" {
-		return ""
-	}
-	return left + right
 }
 
 // resolveCallExpr resolves format-style calls: Go fmt.Sprintf, Lua string.format, Java String.format.
@@ -539,13 +552,6 @@ func resolveCallExpr(node *tree_sitter.Node, source []byte, symbols map[string]s
 		return ""
 	}
 	funcName := parser.NodeText(funcNode, source)
-
-	switch funcName {
-	case "fmt.Sprintf", "String.format", "string.format":
-		// continue — supported format functions
-	default:
-		return ""
-	}
 
 	// Try "arguments" field (Go, Java, Lua)
 	args := node.ChildByFieldName("arguments")
@@ -568,6 +574,15 @@ func resolveCallExpr(node *tree_sitter.Node, source []byte, symbols map[string]s
 	}
 	if len(argNodes) == 0 {
 		return ""
+	}
+
+	switch funcName {
+	case "fmt.Sprintf", "String.format", "string.format":
+		// continue — supported format functions
+	default:
+		// For unknown functions with URL-like string arguments,
+		// extract the URL as a fallback. Handles getEnv(), os.environ.get(), etc.
+		return extractURLArgFallback(argNodes, source, symbols)
 	}
 
 	// First arg is the format string
@@ -594,6 +609,19 @@ func resolveCallExpr(node *tree_sitter.Node, source []byte, symbols map[string]s
 		}
 	}
 	return b.String()
+}
+
+// extractURLArgFallback scans function arguments for URL-like string literals.
+// Used for unknown function calls like getEnv("KEY", "https://..."),
+// os.environ.get("KEY", "https://..."), etc.
+func extractURLArgFallback(argNodes []*tree_sitter.Node, source []byte, symbols map[string]string) string {
+	for _, arg := range argNodes {
+		val := resolveStringExpr(arg, source, symbols)
+		if val != "" && looksLikeURL(val) {
+			return val
+		}
+	}
+	return ""
 }
 
 // resolveRustFormatMacro resolves Rust format!("...", args) macros.
@@ -671,9 +699,9 @@ func extractStringContent(node *tree_sitter.Node, source []byte) string {
 	}
 	// Look for content children (language-specific names for inner text)
 	contentKinds := map[string]bool{
-		"string_content":                      true, // Python, Rust, PHP, Scala
-		"string_fragment":                     true, // JS/TS, Java
-		"interpreted_string_literal_content":  true, // Go
+		"string_content":                     true, // Python, Rust, PHP, Scala
+		"string_fragment":                    true, // JS/TS, Java
+		"interpreted_string_literal_content": true, // Go
 	}
 	for i := uint(0); i < node.ChildCount(); i++ {
 		child := node.Child(i)

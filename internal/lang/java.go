@@ -2,8 +2,8 @@ package lang
 
 func init() {
 	Register(&LanguageSpec{
-		Language:       Java,
-		FileExtensions: []string{".java"},
+		Language:          Java,
+		FileExtensions:    []string{".java"},
 		FunctionNodeTypes: []string{"method_declaration", "constructor_declaration"},
 		ClassNodeTypes: []string{
 			"class_declaration",

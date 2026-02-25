@@ -89,19 +89,19 @@ func TestPathMatchScore(t *testing.T) {
 		max   float64
 	}{
 		// Exact matches: matchBase=0.95, confidence = 0.95 × (0.5×jaccard + 0.5×depthFactor)
-		{"/api/orders", "/api/orders", 0.78, 0.82},                  // jaccard=1.0, depth=2/3=0.667 → 0.95×0.833 ≈ 0.79
+		{"/api/orders", "/api/orders", 0.78, 0.82},                   // jaccard=1.0, depth=2/3=0.667 → 0.95×0.833 ≈ 0.79
 		{"/integrate", "/integrate", 0.60, 0.67},                     // jaccard=1.0, depth=1/3=0.333 → 0.95×0.667 ≈ 0.63
 		{"/api/v1/orders/items", "/api/v1/orders/items", 0.93, 0.96}, // jaccard=1.0, depth=4/3→1.0 → 0.95×1.0 = 0.95
 
 		// Suffix matches: matchBase=0.75
 		{"https://host/api/orders", "/api/orders", 0.60, 0.66}, // jaccard=1.0, depth=0.667 → 0.75×0.833 ≈ 0.625
 
-		// Wildcard matches: matchBase=0.55
-		{"/api/orders/123", "/api/orders/:id", 0.43, 0.48}, // jaccard({api,orders,123}∩{api,orders})=2/3=0.667, depth=1.0 → 0.55×0.833 ≈ 0.458
+		// Numeric IDs normalized to wildcard → exact match with :id (also normalized to *)
+		{"/api/orders/123", "/api/orders/:id", 0.90, 0.96}, // both normalize to /api/orders/* → exact match
 
 		// No match
 		{"/api/users", "/api/orders", 0.0, 0.0},
-		{"/", "/api/orders", 0.0, 0.0},  // empty normalized
+		{"/", "/api/orders", 0.0, 0.0}, // empty normalized
 		{"", "/api/orders", 0.0, 0.0},
 	}
 	for _, tt := range tests {
@@ -120,14 +120,14 @@ func TestSameService(t *testing.T) {
 	}{
 		// Full directory comparison: strip last 2 segments (module+name), compare rest
 		// "a.b.c.mod.func" → dir="a.b.c", so same dir = same service
-		{"a.b.c.mod.Func1", "a.b.c.mod.Func2", true},            // same dir (a.b.c)
-		{"a.b.c.mod.Func1", "a.b.x.mod.Func2", false},           // different dir (a.b.c vs a.b.x)
-		{"a.b.c.d.mod.Func", "a.b.c.d.mod.Other", true},         // same deep dir (a.b.c.d)
-		{"a.b.c.d.mod.Func", "a.b.c.e.mod.Other", false},        // different deep dir
-		{"short.x", "short.y", false},                             // only 2 segments → strip leaves empty → false
-		{"a.b", "a.b", false},                                     // 2 segments → not enough to determine
-		{"a.b.c", "a.b.c", true},                                  // 3 segments: dir="a", same
-		{"a.b.c", "x.b.c", false},                                 // 3 segments: dir="a" vs "x"
+		{"a.b.c.mod.Func1", "a.b.c.mod.Func2", true},     // same dir (a.b.c)
+		{"a.b.c.mod.Func1", "a.b.x.mod.Func2", false},    // different dir (a.b.c vs a.b.x)
+		{"a.b.c.d.mod.Func", "a.b.c.d.mod.Other", true},  // same deep dir (a.b.c.d)
+		{"a.b.c.d.mod.Func", "a.b.c.e.mod.Other", false}, // different deep dir
+		{"short.x", "short.y", false},                    // only 2 segments → strip leaves empty → false
+		{"a.b", "a.b", false},                            // 2 segments → not enough to determine
+		{"a.b.c", "a.b.c", true},                         // 3 segments: dir="a", same
+		{"a.b.c", "x.b.c", false},                        // 3 segments: dir="a" vs "x"
 		// Realistic multi-service QN patterns
 		{"myapp.docker-images.cloud-runs.order-service.main.Func", "myapp.docker-images.cloud-runs.order-service.handlers.Other", true},
 		{"myapp.docker-images.cloud-runs.order-service.main.Func", "myapp.docker-images.cloud-runs.notification-service.main.health_check", false},
@@ -252,7 +252,7 @@ func TestReadSourceLines(t *testing.T) {
 
 	content := "line1\nline2\nline3\nline4\nline5\n"
 	path := filepath.Join(dir, "test.go")
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -285,7 +285,7 @@ func TestLinkerRun(t *testing.T) {
 	}
 	if err := os.WriteFile(filepath.Join(goDir, "client.go"), []byte(`package caller
 const OrderURL = "https://api.example.com/api/orders"
-`), 0o644); err != nil {
+`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -489,7 +489,7 @@ func TestCrossFileGroupPrefix(t *testing.T) {
 func setup(r *gin.Engine) {
 	RegisterRoutes(r.Group("/api"))
 }
-`), 0o644); err != nil {
+`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -499,7 +499,7 @@ func RegisterRoutes(rg *gin.RouterGroup) {
 	rg.GET("/orders", ListOrders)
 	rg.POST("/orders", CreateOrder)
 }
-`), 0o644); err != nil {
+`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -536,12 +536,14 @@ func RegisterRoutes(rg *gin.RouterGroup) {
 	})
 
 	// Create CALLS edge: setup -> RegisterRoutes (as pipeline pass3 would)
-	s.InsertEdge(&store.Edge{
+	if _, err := s.InsertEdge(&store.Edge{
 		Project:  project,
 		SourceID: setupID,
 		TargetID: regID,
 		Type:     "CALLS",
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	linker := New(s, project)
 	_, err = linker.Run()
@@ -588,7 +590,7 @@ func setup(r *gin.Engine) {
 	v1 := r.Group("/api")
 	RegisterRoutes(v1)
 }
-`), 0o644); err != nil {
+`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -597,7 +599,7 @@ func setup(r *gin.Engine) {
 func RegisterRoutes(rg *gin.RouterGroup) {
 	rg.GET("/items", ListItems)
 }
-`), 0o644); err != nil {
+`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -608,26 +610,32 @@ func RegisterRoutes(rg *gin.RouterGroup) {
 	defer s.Close()
 
 	project := "testproj"
-	s.UpsertProject(project, dir)
+	if err := s.UpsertProject(project, dir); err != nil {
+		t.Fatal(err)
+	}
 
 	setupID, _ := s.UpsertNode(&store.Node{
 		Project: project, Label: "Function", Name: "setup",
 		QualifiedName: "testproj.cmd.main.setup",
-		FilePath: "cmd/main.go", StartLine: 3, EndLine: 6,
+		FilePath:      "cmd/main.go", StartLine: 3, EndLine: 6,
 	})
 
 	regID, _ := s.UpsertNode(&store.Node{
 		Project: project, Label: "Function", Name: "RegisterRoutes",
 		QualifiedName: "testproj.routes.routes.RegisterRoutes",
-		FilePath: "routes/routes.go", StartLine: 3, EndLine: 5,
+		FilePath:      "routes/routes.go", StartLine: 3, EndLine: 5,
 	})
 
-	s.InsertEdge(&store.Edge{
+	if _, err := s.InsertEdge(&store.Edge{
 		Project: project, SourceID: setupID, TargetID: regID, Type: "CALLS",
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	linker := New(s, project)
-	linker.Run()
+	if _, runErr := linker.Run(); runErr != nil {
+		t.Fatal(runErr)
+	}
 
 	routeNodes, _ := s.FindNodesByLabel(project, "Route")
 	if len(routeNodes) != 1 {
@@ -657,7 +665,7 @@ func RegisterRoutes(rg *gin.RouterGroup) {
 	rg.POST("/orders", h.CreateOrder)
 	rg.GET("/orders/:id", h.GetOrder)
 }
-`), 0o644); err != nil {
+`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -668,29 +676,39 @@ func RegisterRoutes(rg *gin.RouterGroup) {
 	defer s.Close()
 
 	project := "testproj"
-	s.UpsertProject(project, dir)
+	if err := s.UpsertProject(project, dir); err != nil {
+		t.Fatal(err)
+	}
 
 	// Create the registering function
-	s.UpsertNode(&store.Node{
+	if _, err := s.UpsertNode(&store.Node{
 		Project: project, Label: "Function", Name: "RegisterRoutes",
 		QualifiedName: "testproj.routes.routes.RegisterRoutes",
-		FilePath: "routes/routes.go", StartLine: 3, EndLine: 6,
-	})
+		FilePath:      "routes/routes.go", StartLine: 3, EndLine: 6,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Create handler functions (as pipeline would)
-	s.UpsertNode(&store.Node{
+	if _, err := s.UpsertNode(&store.Node{
 		Project: project, Label: "Method", Name: "CreateOrder",
 		QualifiedName: "testproj.handlers.handler.CreateOrder",
-		FilePath: "handlers/handler.go", StartLine: 10, EndLine: 30,
-	})
-	s.UpsertNode(&store.Node{
+		FilePath:      "handlers/handler.go", StartLine: 10, EndLine: 30,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertNode(&store.Node{
 		Project: project, Label: "Method", Name: "GetOrder",
 		QualifiedName: "testproj.handlers.handler.GetOrder",
-		FilePath: "handlers/handler.go", StartLine: 32, EndLine: 50,
-	})
+		FilePath:      "handlers/handler.go", StartLine: 32, EndLine: 50,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	linker := New(s, project)
-	linker.Run()
+	if _, runErr := linker.Run(); runErr != nil {
+		t.Fatal(runErr)
+	}
 
 	// Verify CALLS edges from RegisterRoutes to handlers
 	regNode, _ := s.FindNodeByQN(project, "testproj.routes.routes.RegisterRoutes")
@@ -722,6 +740,238 @@ func RegisterRoutes(rg *gin.RouterGroup) {
 	}
 	if !foundCreate {
 		t.Error("expected CALLS edge from RegisterRoutes to CreateOrder")
+	}
+}
+
+func TestAsyncDispatchKeywords(t *testing.T) {
+	// Test the full linker flow to verify edge types.
+	// Uses a Go caller with CreateTask (async) and a Python route handler.
+	dir, err := os.MkdirTemp("", "httplink-async-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Write a Go file with CreateTask + URL (async dispatch)
+	asyncDir := filepath.Join(dir, "taskworker")
+	if err := os.MkdirAll(asyncDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(asyncDir, "dispatch.go"), []byte(`package taskworker
+
+func DispatchOrder(orderID string) {
+	url := "https://api.internal.com/api/orders"
+	client.CreateTask(ctx, url, payload)
+}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a Go file with requests.post + URL (sync HTTP call)
+	syncDir := filepath.Join(dir, "synccaller")
+	if err := os.MkdirAll(syncDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(syncDir, "caller.go"), []byte(`package synccaller
+
+func CallOrder() {
+	url := "https://api.internal.com/api/orders"
+	requests.post(url, data)
+}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a Go file with both sync + async keywords (sync takes precedence)
+	bothDir := filepath.Join(dir, "bothcaller")
+	if err := os.MkdirAll(bothDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bothDir, "both.go"), []byte(`package bothcaller
+
+func CallAndDispatch() {
+	url := "https://api.internal.com/api/orders"
+	requests.post(url, data)
+	client.CreateTask(ctx, url, payload)
+}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	project := "testproj"
+	if err := s.UpsertProject(project, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Async caller function
+	_, _ = s.UpsertNode(&store.Node{
+		Project: project, Label: "Function", Name: "DispatchOrder",
+		QualifiedName: "testproj.taskworker.dispatch.DispatchOrder",
+		FilePath:      "taskworker/dispatch.go", StartLine: 3, EndLine: 6,
+	})
+
+	// Sync caller function
+	_, _ = s.UpsertNode(&store.Node{
+		Project: project, Label: "Function", Name: "CallOrder",
+		QualifiedName: "testproj.synccaller.caller.CallOrder",
+		FilePath:      "synccaller/caller.go", StartLine: 3, EndLine: 6,
+	})
+
+	// Both keywords caller function
+	_, _ = s.UpsertNode(&store.Node{
+		Project: project, Label: "Function", Name: "CallAndDispatch",
+		QualifiedName: "testproj.bothcaller.both.CallAndDispatch",
+		FilePath:      "bothcaller/both.go", StartLine: 3, EndLine: 7,
+	})
+
+	// Route handler (different service)
+	_, _ = s.UpsertNode(&store.Node{
+		Project: project, Label: "Function", Name: "create_order",
+		QualifiedName: "testproj.handler.routes.create_order",
+		FilePath:      "handler/routes.py",
+		Properties: map[string]any{
+			"decorators": []any{`@app.post("/api/orders")`},
+		},
+	})
+
+	linker := New(s, project)
+	links, err := linker.Run()
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Build a map of callerQN -> edgeType for verification
+	edgeTypes := map[string]string{}
+	for _, link := range links {
+		edgeTypes[link.CallerQN] = link.EdgeType
+	}
+
+	// Async caller (CreateTask only) -> ASYNC_CALLS
+	if et, ok := edgeTypes["testproj.taskworker.dispatch.DispatchOrder"]; !ok {
+		t.Error("expected link from async caller DispatchOrder")
+	} else if et != "ASYNC_CALLS" {
+		t.Errorf("DispatchOrder edge type = %q, want ASYNC_CALLS", et)
+	}
+
+	// Sync caller (requests.post only) -> HTTP_CALLS
+	if et, ok := edgeTypes["testproj.synccaller.caller.CallOrder"]; !ok {
+		t.Error("expected link from sync caller CallOrder")
+	} else if et != "HTTP_CALLS" {
+		t.Errorf("CallOrder edge type = %q, want HTTP_CALLS", et)
+	}
+
+	// Both keywords (sync takes precedence) -> HTTP_CALLS
+	if et, ok := edgeTypes["testproj.bothcaller.both.CallAndDispatch"]; !ok {
+		t.Error("expected link from both-keyword caller CallAndDispatch")
+	} else if et != "HTTP_CALLS" {
+		t.Errorf("CallAndDispatch edge type = %q, want HTTP_CALLS", et)
+	}
+
+	// Verify edges in store match
+	asyncNode, _ := s.FindNodeByQN(project, "testproj.taskworker.dispatch.DispatchOrder")
+	if asyncNode != nil {
+		asyncEdges, _ := s.FindEdgesBySourceAndType(asyncNode.ID, "ASYNC_CALLS")
+		if len(asyncEdges) != 1 {
+			t.Errorf("expected 1 ASYNC_CALLS edge from async caller, got %d", len(asyncEdges))
+		}
+		httpEdges, _ := s.FindEdgesBySourceAndType(asyncNode.ID, "HTTP_CALLS")
+		if len(httpEdges) != 0 {
+			t.Errorf("expected 0 HTTP_CALLS edges from async caller, got %d", len(httpEdges))
+		}
+	}
+
+	syncNode, _ := s.FindNodeByQN(project, "testproj.synccaller.caller.CallOrder")
+	if syncNode != nil {
+		httpEdges, _ := s.FindEdgesBySourceAndType(syncNode.ID, "HTTP_CALLS")
+		if len(httpEdges) != 1 {
+			t.Errorf("expected 1 HTTP_CALLS edge from sync caller, got %d", len(httpEdges))
+		}
+		asyncEdges, _ := s.FindEdgesBySourceAndType(syncNode.ID, "ASYNC_CALLS")
+		if len(asyncEdges) != 0 {
+			t.Errorf("expected 0 ASYNC_CALLS edges from sync caller, got %d", len(asyncEdges))
+		}
+	}
+}
+
+func TestExtractFunctionCallSitesAsync(t *testing.T) {
+	// Test extractFunctionCallSites directly with a temp file containing async keywords.
+	dir, err := os.MkdirTemp("", "httplink-extract-async-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Write a Go file with CreateTask and a URL
+	if err := os.MkdirAll(filepath.Join(dir, "worker"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "worker", "task.go"), []byte(`package worker
+
+func EnqueueJob(ctx context.Context) {
+	url := "https://backend.internal.com/api/process"
+	client.CreateTask(ctx, &taskspb.CreateTaskRequest{
+		HttpRequest: &taskspb.HttpRequest{Url: url},
+	})
+}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	node := &store.Node{
+		Project: "testproj", Label: "Function", Name: "EnqueueJob",
+		QualifiedName: "testproj.worker.task.EnqueueJob",
+		FilePath:      "worker/task.go", StartLine: 3, EndLine: 7,
+	}
+
+	sites := extractFunctionCallSites(node, dir)
+	if len(sites) == 0 {
+		t.Fatal("expected at least 1 call site, got 0")
+	}
+
+	foundAsync := false
+	for _, s := range sites {
+		if s.IsAsync {
+			foundAsync = true
+			if s.Path != "/api/process" {
+				t.Errorf("async site path = %q, want /api/process", s.Path)
+			}
+		}
+	}
+	if !foundAsync {
+		t.Error("expected at least one call site with IsAsync=true")
+	}
+
+	// Also test that a function with only sync keywords gets IsAsync=false
+	if err := os.WriteFile(filepath.Join(dir, "worker", "sync.go"), []byte(`package worker
+
+func SyncCall(ctx context.Context) {
+	url := "https://backend.internal.com/api/process"
+	requests.post(url, data)
+}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	syncNode := &store.Node{
+		Project: "testproj", Label: "Function", Name: "SyncCall",
+		QualifiedName: "testproj.worker.sync.SyncCall",
+		FilePath:      "worker/sync.go", StartLine: 3, EndLine: 6,
+	}
+
+	syncSites := extractFunctionCallSites(syncNode, dir)
+	if len(syncSites) == 0 {
+		t.Fatal("expected at least 1 sync call site, got 0")
+	}
+	for _, s := range syncSites {
+		if s.IsAsync {
+			t.Errorf("sync call site should have IsAsync=false, got true (path=%s)", s.Path)
+		}
 	}
 }
 

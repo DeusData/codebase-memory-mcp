@@ -3,15 +3,14 @@ package parser
 import (
 	"fmt"
 	"sync"
-	"unsafe"
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 
+	tree_sitter_lua "github.com/tree-sitter-grammars/tree-sitter-lua/bindings/go"
 	tree_sitter_cpp "github.com/tree-sitter/tree-sitter-cpp/bindings/go"
 	tree_sitter_go "github.com/tree-sitter/tree-sitter-go/bindings/go"
 	tree_sitter_java "github.com/tree-sitter/tree-sitter-java/bindings/go"
 	tree_sitter_javascript "github.com/tree-sitter/tree-sitter-javascript/bindings/go"
-	tree_sitter_lua "github.com/tree-sitter-grammars/tree-sitter-lua/bindings/go"
 	tree_sitter_php "github.com/tree-sitter/tree-sitter-php/bindings/go"
 	tree_sitter_python "github.com/tree-sitter/tree-sitter-python/bindings/go"
 	tree_sitter_rust "github.com/tree-sitter/tree-sitter-rust/bindings/go"
@@ -29,18 +28,18 @@ var (
 func initLanguages() {
 	languagesOnce.Do(func() {
 		languages = map[lang.Language]*tree_sitter.Language{
-			lang.Python:     tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_python.Language())),
-			lang.JavaScript: tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_javascript.Language())),
-			lang.TypeScript: tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_typescript.LanguageTypescript())),
-		lang.TSX:        tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_typescript.LanguageTSX())),
-			lang.Go:         tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_go.Language())),
-			lang.Rust:       tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_rust.Language())),
-			lang.Java:       tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_java.Language())),
-			lang.CPP:        tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_cpp.Language())),
+			lang.Python:     tree_sitter.NewLanguage(tree_sitter_python.Language()),
+			lang.JavaScript: tree_sitter.NewLanguage(tree_sitter_javascript.Language()),
+			lang.TypeScript: tree_sitter.NewLanguage(tree_sitter_typescript.LanguageTypescript()),
+			lang.TSX:        tree_sitter.NewLanguage(tree_sitter_typescript.LanguageTSX()),
+			lang.Go:         tree_sitter.NewLanguage(tree_sitter_go.Language()),
+			lang.Rust:       tree_sitter.NewLanguage(tree_sitter_rust.Language()),
+			lang.Java:       tree_sitter.NewLanguage(tree_sitter_java.Language()),
+			lang.CPP:        tree_sitter.NewLanguage(tree_sitter_cpp.Language()),
 			// C# skipped: upstream module path mismatch (tree-sitter-c-sharp vs tree-sitter-c_sharp)
-			lang.PHP:        tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_php.LanguagePHPOnly())),
-			lang.Lua:        tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_lua.Language())),
-			lang.Scala:      tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_scala.Language())),
+			lang.PHP:   tree_sitter.NewLanguage(tree_sitter_php.LanguagePHPOnly()),
+			lang.Lua:   tree_sitter.NewLanguage(tree_sitter_lua.Language()),
+			lang.Scala: tree_sitter.NewLanguage(tree_sitter_scala.Language()),
 		}
 	})
 }

@@ -54,72 +54,281 @@ func New(s *store.Store, repoPath string) *Pipeline {
 	}
 }
 
-// Run executes the full 3-pass pipeline.
+// Run executes the full 3-pass pipeline within a single transaction.
+// If file hashes from a previous run exist, only changed files are re-processed.
 func (p *Pipeline) Run() error {
 	slog.Info("pipeline.start", "project", p.ProjectName, "path", p.RepoPath)
 
-	// Create/update project record
-	if err := p.Store.UpsertProject(p.ProjectName, p.RepoPath); err != nil {
-		return fmt.Errorf("upsert project: %w", err)
-	}
-
-	// Discover source files
+	// Discover source files (filesystem, no DB — runs outside transaction)
 	files, err := discover.Discover(p.RepoPath, nil)
 	if err != nil {
 		return fmt.Errorf("discover: %w", err)
 	}
 	slog.Info("pipeline.discovered", "files", len(files))
 
-	// Pass 1: Structure (directories, packages, folders)
-	if err := p.passStructure(files); err != nil {
-		return fmt.Errorf("pass1 structure: %w", err)
-	}
-
-	// Pass 2: Definitions (functions, classes, modules)
-	if err := p.passDefinitions(files); err != nil {
-		return fmt.Errorf("pass2 definitions: %w", err)
-	}
-
-	// Build function registry from all definition nodes
-	p.buildRegistry()
-
-	// Store IMPORTS edges from the import maps built during pass 2
-	p.passImports()
-
-	// Pass 3: Calls (resolve call targets, create CALLS edges)
-	if err := p.passCalls(); err != nil {
-		return fmt.Errorf("pass3 calls: %w", err)
-	}
-
-	// Clean up AST cache
-	for _, cached := range p.astCache {
-		cached.Tree.Close()
-	}
-	p.astCache = nil
-
-	// Pass 4: HTTP linking (cross-service HTTP calls)
-	if err := p.passHTTPLinks(); err != nil {
-		slog.Warn("pass4.httplink.err", "err", err)
-		// Don't fail the whole pipeline for HTTP linking
-	}
-
-	// Pass 5: Interface implementation detection (Go)
-	if err := p.passImplements(); err != nil {
-		slog.Warn("pass5.implements.err", "err", err)
-	}
-
-	// Update file hashes
-	for _, f := range files {
-		hash, hashErr := fileHash(f.Path)
-		if hashErr == nil {
-			_ = p.Store.UpsertFileHash(p.ProjectName, f.RelPath, hash)
-		}
+	if err := p.Store.WithTransaction(func() error {
+		return p.runPasses(files)
+	}); err != nil {
+		return err
 	}
 
 	nc, _ := p.Store.CountNodes(p.ProjectName)
 	ec, _ := p.Store.CountEdges(p.ProjectName)
 	slog.Info("pipeline.done", "nodes", nc, "edges", ec)
 	return nil
+}
+
+// runPasses executes all indexing passes (called within a transaction).
+func (p *Pipeline) runPasses(files []discover.FileInfo) error {
+	if err := p.Store.UpsertProject(p.ProjectName, p.RepoPath); err != nil {
+		return fmt.Errorf("upsert project: %w", err)
+	}
+
+	// Classify files as changed/unchanged using stored hashes
+	changed, unchanged := p.classifyFiles(files)
+
+	// If all files are changed (first index or no hashes), do full pass
+	isFullIndex := len(unchanged) == 0
+	if isFullIndex {
+		return p.runFullPasses(files)
+	}
+
+	slog.Info("incremental.classify", "changed", len(changed), "unchanged", len(unchanged), "total", len(files))
+	return p.runIncrementalPasses(files, changed, unchanged)
+}
+
+// runFullPasses runs the complete pipeline (no incremental optimization).
+func (p *Pipeline) runFullPasses(files []discover.FileInfo) error {
+	if err := p.passStructure(files); err != nil {
+		return fmt.Errorf("pass1 structure: %w", err)
+	}
+	p.passDefinitions(files)
+	p.buildRegistry()
+	p.passImports()
+	p.passCalls()
+	p.cleanupASTCache()
+	if err := p.passHTTPLinks(); err != nil {
+		slog.Warn("pass4.httplink.err", "err", err)
+	}
+	p.passImplements()
+	p.updateFileHashes(files)
+	return nil
+}
+
+// runIncrementalPasses re-indexes only changed files + their dependents.
+func (p *Pipeline) runIncrementalPasses(
+	allFiles []discover.FileInfo,
+	changed, unchanged []discover.FileInfo,
+) error {
+	// Pass 1: Structure always runs on all files (fast, idempotent upserts)
+	if err := p.passStructure(allFiles); err != nil {
+		return fmt.Errorf("pass1 structure: %w", err)
+	}
+
+	// Remove stale nodes/edges for deleted files
+	p.removeDeletedFiles(allFiles)
+
+	// Delete nodes for changed files (will be re-created in pass 2)
+	for _, f := range changed {
+		_ = p.Store.DeleteNodesByFile(p.ProjectName, f.RelPath)
+	}
+
+	// Pass 2: Parse changed files only
+	p.passDefinitions(changed)
+
+	// Build full registry: includes nodes from unchanged files (already in DB)
+	// plus newly parsed nodes from changed files
+	p.buildRegistry()
+
+	// Re-build import maps for changed files (already done in passDefinitions)
+	// Also load import maps for unchanged files from their AST (not cached)
+	// For correctness, we need the full import map, but unchanged files don't
+	// have ASTs cached. Rebuild imports only for changed files is sufficient
+	// since unchanged file import edges still exist in DB.
+	p.passImports()
+
+	// Determine which files need call re-resolution:
+	// changed files + files that import any changed module
+	dependents := p.findDependentFiles(changed, unchanged)
+	filesToResolve := mergeFiles(changed, dependents)
+	slog.Info("incremental.resolve", "changed", len(changed), "dependents", len(dependents))
+
+	// Delete CALLS edges for files being re-resolved
+	for _, f := range filesToResolve {
+		_ = p.Store.DeleteEdgesBySourceFile(p.ProjectName, f.RelPath, "CALLS")
+	}
+
+	// Pass 3: Re-resolve calls for changed + dependent files
+	p.passCallsForFiles(filesToResolve)
+
+	p.cleanupASTCache()
+
+	// HTTP linking and implements always run fully (they clean up first)
+	if err := p.passHTTPLinks(); err != nil {
+		slog.Warn("pass4.httplink.err", "err", err)
+	}
+	p.passImplements()
+
+	p.updateFileHashes(allFiles)
+	return nil
+}
+
+// classifyFiles splits files into changed and unchanged based on stored hashes.
+func (p *Pipeline) classifyFiles(files []discover.FileInfo) (changed, unchanged []discover.FileInfo) {
+	storedHashes, err := p.Store.GetFileHashes(p.ProjectName)
+	if err != nil || len(storedHashes) == 0 {
+		return files, nil // no hashes → full index
+	}
+
+	for _, f := range files {
+		currentHash, hashErr := fileHash(f.Path)
+		if hashErr != nil {
+			changed = append(changed, f)
+			continue
+		}
+		if stored, ok := storedHashes[f.RelPath]; ok && stored == currentHash {
+			unchanged = append(unchanged, f)
+		} else {
+			changed = append(changed, f)
+		}
+	}
+	return changed, unchanged
+}
+
+// findDependentFiles finds unchanged files that import any changed file's module.
+func (p *Pipeline) findDependentFiles(changed, unchanged []discover.FileInfo) []discover.FileInfo {
+	// Build set of module QNs for changed files
+	changedModules := make(map[string]bool, len(changed))
+	for _, f := range changed {
+		mqn := fqn.ModuleQN(p.ProjectName, f.RelPath)
+		changedModules[mqn] = true
+		// Also add folder QN (for Go package-level imports)
+		dir := filepath.Dir(f.RelPath)
+		if dir != "." {
+			changedModules[fqn.FolderQN(p.ProjectName, dir)] = true
+		}
+	}
+
+	var dependents []discover.FileInfo
+	for _, f := range unchanged {
+		mqn := fqn.ModuleQN(p.ProjectName, f.RelPath)
+		importMap := p.importMaps[mqn]
+		// If no cached import map, check the store for IMPORTS edges
+		if len(importMap) == 0 {
+			importMap = p.loadImportMapFromDB(mqn)
+		}
+		for _, targetQN := range importMap {
+			if changedModules[targetQN] {
+				dependents = append(dependents, f)
+				break
+			}
+		}
+	}
+	return dependents
+}
+
+// loadImportMapFromDB reconstructs an import map from stored IMPORTS edges.
+func (p *Pipeline) loadImportMapFromDB(moduleQN string) map[string]string {
+	moduleNode, err := p.Store.FindNodeByQN(p.ProjectName, moduleQN)
+	if err != nil || moduleNode == nil {
+		return nil
+	}
+	edges, err := p.Store.FindEdgesBySourceAndType(moduleNode.ID, "IMPORTS")
+	if err != nil {
+		return nil
+	}
+	result := make(map[string]string, len(edges))
+	for _, e := range edges {
+		target, tErr := p.Store.FindNodeByID(e.TargetID)
+		if tErr != nil || target == nil {
+			continue
+		}
+		alias := ""
+		if a, ok := e.Properties["alias"].(string); ok {
+			alias = a
+		}
+		if alias != "" {
+			result[alias] = target.QualifiedName
+		}
+	}
+	return result
+}
+
+// passCallsForFiles resolves calls only for the specified files.
+func (p *Pipeline) passCallsForFiles(files []discover.FileInfo) {
+	slog.Info("pass3.calls.incremental", "files", len(files))
+	for _, f := range files {
+		cached, ok := p.astCache[f.RelPath]
+		if !ok {
+			// File not in AST cache — need to parse it
+			source, err := os.ReadFile(f.Path)
+			if err != nil {
+				continue
+			}
+			tree, err := parser.Parse(f.Language, source)
+			if err != nil {
+				continue
+			}
+			cached = &cachedAST{Tree: tree, Source: source, Language: f.Language}
+			p.astCache[f.RelPath] = cached
+		}
+		spec := lang.ForLanguage(cached.Language)
+		if spec == nil {
+			continue
+		}
+		p.processFileCalls(f.RelPath, cached, spec)
+	}
+}
+
+// removeDeletedFiles removes nodes/edges for files that no longer exist on disk.
+func (p *Pipeline) removeDeletedFiles(currentFiles []discover.FileInfo) {
+	currentSet := make(map[string]bool, len(currentFiles))
+	for _, f := range currentFiles {
+		currentSet[f.RelPath] = true
+	}
+	indexed, err := p.Store.ListFilesForProject(p.ProjectName)
+	if err != nil {
+		return
+	}
+	for _, filePath := range indexed {
+		if !currentSet[filePath] {
+			_ = p.Store.DeleteNodesByFile(p.ProjectName, filePath)
+			_ = p.Store.DeleteFileHash(p.ProjectName, filePath)
+			slog.Info("incremental.removed", "file", filePath)
+		}
+	}
+}
+
+func (p *Pipeline) cleanupASTCache() {
+	for _, cached := range p.astCache {
+		cached.Tree.Close()
+	}
+	p.astCache = nil
+}
+
+func (p *Pipeline) updateFileHashes(files []discover.FileInfo) {
+	for _, f := range files {
+		hash, hashErr := fileHash(f.Path)
+		if hashErr == nil {
+			_ = p.Store.UpsertFileHash(p.ProjectName, f.RelPath, hash)
+		}
+	}
+}
+
+// mergeFiles returns the union of two file slices (deduped by RelPath).
+func mergeFiles(a, b []discover.FileInfo) []discover.FileInfo {
+	seen := make(map[string]bool, len(a))
+	result := make([]discover.FileInfo, 0, len(a)+len(b))
+	for _, f := range a {
+		seen[f.RelPath] = true
+		result = append(result, f)
+	}
+	for _, f := range b {
+		if !seen[f.RelPath] {
+			result = append(result, f)
+		}
+	}
+	return result
 }
 
 // passStructure creates Project, Folder, Package, File nodes and containment edges.
@@ -188,7 +397,7 @@ func (p *Pipeline) passStructure(files []discover.FileInfo) error {
 	return nil
 }
 
-func (p *Pipeline) ensureDirHierarchy(relDir string, created map[string]bool, pkgIndicators map[string]bool) {
+func (p *Pipeline) ensureDirHierarchy(relDir string, created, pkgIndicators map[string]bool) {
 	if relDir == "." || relDir == "" || created[relDir] {
 		return
 	}
@@ -257,7 +466,7 @@ func (p *Pipeline) dirQN(relDir string) string {
 }
 
 // passDefinitions parses each file and extracts function/class/method/module nodes.
-func (p *Pipeline) passDefinitions(files []discover.FileInfo) error {
+func (p *Pipeline) passDefinitions(files []discover.FileInfo) {
 	slog.Info("pass2.definitions")
 
 	for _, f := range files {
@@ -272,7 +481,6 @@ func (p *Pipeline) passDefinitions(files []discover.FileInfo) error {
 			// Continue with other files
 		}
 	}
-	return nil
 }
 
 func (p *Pipeline) processFileDefinitions(f discover.FileInfo) error {
@@ -324,13 +532,13 @@ func (p *Pipeline) processFileDefinitions(f discover.FileInfo) error {
 
 		// Functions / methods
 		if funcTypes[kind] {
-			p.extractFunction(node, source, f, moduleQN, moduleID, spec)
+			p.extractFunction(node, source, f, moduleID)
 			return false // don't recurse into function body
 		}
 
 		// Classes / types / interfaces
 		if classTypes[kind] {
-			p.extractClass(node, source, f, moduleQN, moduleID, spec)
+			p.extractClass(node, source, f, moduleID, spec)
 			return false // don't recurse; extractClass handles methods internally
 		}
 
@@ -388,7 +596,7 @@ func (p *Pipeline) processFileDefinitions(f discover.FileInfo) error {
 
 func (p *Pipeline) extractFunction(
 	node *tree_sitter.Node, source []byte, f discover.FileInfo,
-	moduleQN string, moduleID int64, spec *lang.LanguageSpec,
+	moduleID int64,
 ) {
 	nameNode := node.ChildByFieldName("name")
 	if nameNode == nil {
@@ -446,8 +654,8 @@ func (p *Pipeline) extractFunction(
 		props["is_entry_point"] = true
 	}
 
-	startLine := int(node.StartPosition().Row) + 1
-	endLine := int(node.EndPosition().Row) + 1
+	startLine := safeRowToLine(node.StartPosition().Row)
+	endLine := safeRowToLine(node.EndPosition().Row)
 
 	funcID, err := p.Store.UpsertNode(&store.Node{
 		Project:       p.ProjectName,
@@ -478,7 +686,7 @@ func (p *Pipeline) extractFunction(
 
 func (p *Pipeline) extractClass(
 	node *tree_sitter.Node, source []byte, f discover.FileInfo,
-	moduleQN string, moduleID int64, spec *lang.LanguageSpec,
+	moduleID int64, spec *lang.LanguageSpec,
 ) {
 	nameNode := node.ChildByFieldName("name")
 	if nameNode == nil {
@@ -506,8 +714,8 @@ func (p *Pipeline) extractClass(
 		}
 	}
 
-	startLine := int(node.StartPosition().Row) + 1
-	endLine := int(node.EndPosition().Row) + 1
+	startLine := safeRowToLine(node.StartPosition().Row)
+	endLine := safeRowToLine(node.EndPosition().Row)
 
 	classID, err := p.Store.UpsertNode(&store.Node{
 		Project:       p.ProjectName,
@@ -532,61 +740,70 @@ func (p *Pipeline) extractClass(
 	})
 
 	// Extract methods inside the class
+	p.extractClassMethods(node, source, f, classQN, classID, spec)
+}
+
+// extractClassMethods walks a class AST node and creates Method nodes for each method found.
+func (p *Pipeline) extractClassMethods(
+	classNode *tree_sitter.Node, source []byte, f discover.FileInfo,
+	classQN string, classID int64, spec *lang.LanguageSpec,
+) {
 	funcTypes := toSet(spec.FunctionNodeTypes)
-	parser.Walk(node, func(child *tree_sitter.Node) bool {
-		if child.Id() == node.Id() {
-			return true // skip the class node itself
+	parser.Walk(classNode, func(child *tree_sitter.Node) bool {
+		if child.Id() == classNode.Id() {
+			return true
 		}
-		if funcTypes[child.Kind()] {
-			mn := child.ChildByFieldName("name")
-			if mn == nil {
-				return false
-			}
-			methodName := parser.NodeText(mn, source)
-			if methodName == "" {
-				return false
-			}
+		if !funcTypes[child.Kind()] {
+			return true
+		}
 
-			methodQN := classQN + "." + methodName
-			props := map[string]any{}
-
-			paramsNode := child.ChildByFieldName("parameters")
-			if paramsNode != nil {
-				props["signature"] = parser.NodeText(paramsNode, source)
-			}
-			for _, field := range []string{"result", "return_type", "type"} {
-				rtNode := child.ChildByFieldName(field)
-				if rtNode != nil {
-					props["return_type"] = parser.NodeText(rtNode, source)
-					break
-				}
-			}
-			props["is_exported"] = isExported(methodName, f.Language)
-
-			mStartLine := int(child.StartPosition().Row) + 1
-			mEndLine := int(child.EndPosition().Row) + 1
-
-			methodID, upsertErr := p.Store.UpsertNode(&store.Node{
-				Project:       p.ProjectName,
-				Label:         "Method",
-				Name:          methodName,
-				QualifiedName: methodQN,
-				FilePath:      f.RelPath,
-				StartLine:     mStartLine,
-				EndLine:       mEndLine,
-				Properties:    props,
-			})
-			if upsertErr == nil {
-				_, _ = p.Store.InsertEdge(&store.Edge{
-					Project:  p.ProjectName,
-					SourceID: classID,
-					TargetID: methodID,
-					Type:     "DEFINES_METHOD",
-				})
-			}
+		mn := child.ChildByFieldName("name")
+		if mn == nil {
 			return false
 		}
-		return true
+		methodName := parser.NodeText(mn, source)
+		if methodName == "" {
+			return false
+		}
+
+		methodQN := classQN + "." + methodName
+		props := map[string]any{}
+
+		paramsNode := child.ChildByFieldName("parameters")
+		if paramsNode != nil {
+			props["signature"] = parser.NodeText(paramsNode, source)
+		}
+		for _, field := range []string{"result", "return_type", "type"} {
+			rtNode := child.ChildByFieldName(field)
+			if rtNode != nil {
+				props["return_type"] = parser.NodeText(rtNode, source)
+				break
+			}
+		}
+		props["is_exported"] = isExported(methodName, f.Language)
+
+		mStartLine := safeRowToLine(child.StartPosition().Row)
+		mEndLine := safeRowToLine(child.EndPosition().Row)
+
+		methodID, upsertErr := p.Store.UpsertNode(&store.Node{
+			Project:       p.ProjectName,
+			Label:         "Method",
+			Name:          methodName,
+			QualifiedName: methodQN,
+			FilePath:      f.RelPath,
+			StartLine:     mStartLine,
+			EndLine:       mEndLine,
+			Properties:    props,
+		})
+		if upsertErr == nil {
+			_, _ = p.Store.InsertEdge(&store.Edge{
+				Project:  p.ProjectName,
+				SourceID: classID,
+				TargetID: methodID,
+				Type:     "DEFINES_METHOD",
+			})
+		}
+		return false
 	})
 }
 
@@ -607,7 +824,7 @@ func (p *Pipeline) buildRegistry() {
 }
 
 // passCalls resolves call targets and creates CALLS edges.
-func (p *Pipeline) passCalls() error {
+func (p *Pipeline) passCalls() {
 	slog.Info("pass3.calls")
 
 	for relPath, cached := range p.astCache {
@@ -617,11 +834,11 @@ func (p *Pipeline) passCalls() error {
 		}
 		p.processFileCalls(relPath, cached, spec)
 	}
-	return nil
 }
 
 func (p *Pipeline) processFileCalls(relPath string, cached *cachedAST, spec *lang.LanguageSpec) {
 	callTypes := toSet(spec.CallNodeTypes)
+	funcTypes := toSet(spec.FunctionNodeTypes)
 	moduleQN := fqn.ModuleQN(p.ProjectName, relPath)
 
 	root := cached.Tree.RootNode()
@@ -649,26 +866,63 @@ func (p *Pipeline) processFileCalls(relPath string, cached *cachedAST, spec *lan
 			callerQN = moduleQN
 		}
 
+		// Build a local type map that includes receiver/self scope
+		localTypeMap := typeMap
+
+		// Python self.method() resolution
+		if cached.Language == lang.Python && strings.HasPrefix(calleeName, "self.") {
+			classQN := findEnclosingClassQN(node, cached.Source, p.ProjectName, relPath)
+			if classQN != "" {
+				methodName := calleeName[5:]
+				candidate := classQN + "." + methodName
+				if n, _ := p.Store.FindNodeByQN(p.ProjectName, candidate); n != nil {
+					p.createCallEdge(callerQN, candidate)
+					return false
+				}
+			}
+		}
+
+		// Go receiver scoping — add receiver variable to local type map
+		if cached.Language == lang.Go {
+			enclosing := findEnclosingFuncNode(node, funcTypes)
+			if enclosing != nil {
+				varName, typeName := parseGoReceiverType(enclosing, cached.Source)
+				if varName != "" && typeName != "" {
+					classQN := resolveAsClass(typeName, p.registry, moduleQN, importMap)
+					if classQN != "" {
+						localTypeMap = make(TypeMap, len(typeMap)+1)
+						for k, v := range typeMap {
+							localTypeMap[k] = v
+						}
+						localTypeMap[varName] = classQN
+					}
+				}
+			}
+		}
+
 		// Try type-based resolution for method calls (obj.method)
-		targetQN := p.resolveCallWithTypes(calleeName, moduleQN, importMap, typeMap)
+		targetQN := p.resolveCallWithTypes(calleeName, moduleQN, importMap, localTypeMap)
 		if targetQN == "" {
 			return false
 		}
 
-		// Create CALLS edge
-		callerNode, _ := p.Store.FindNodeByQN(p.ProjectName, callerQN)
-		targetNode, _ := p.Store.FindNodeByQN(p.ProjectName, targetQN)
-		if callerNode != nil && targetNode != nil {
-			_, _ = p.Store.InsertEdge(&store.Edge{
-				Project:  p.ProjectName,
-				SourceID: callerNode.ID,
-				TargetID: targetNode.ID,
-				Type:     "CALLS",
-			})
-		}
-
+		p.createCallEdge(callerQN, targetQN)
 		return false
 	})
+}
+
+// createCallEdge creates a CALLS edge between caller and target by QN.
+func (p *Pipeline) createCallEdge(callerQN, targetQN string) {
+	callerNode, _ := p.Store.FindNodeByQN(p.ProjectName, callerQN)
+	targetNode, _ := p.Store.FindNodeByQN(p.ProjectName, targetQN)
+	if callerNode != nil && targetNode != nil {
+		_, _ = p.Store.InsertEdge(&store.Edge{
+			Project:  p.ProjectName,
+			SourceID: callerNode.ID,
+			TargetID: targetNode.ID,
+			Type:     "CALLS",
+		})
+	}
 }
 
 // resolveCallWithTypes resolves a callee name using the registry, import maps,
@@ -904,10 +1158,17 @@ func (p *Pipeline) passImports() {
 
 // passHTTPLinks runs the HTTP linker to discover cross-service HTTP calls.
 func (p *Pipeline) passHTTPLinks() error {
-	// Clean up stale Route nodes and HTTP_CALLS/HANDLES edges before re-running
+	// Clean up stale Route nodes and HTTP_CALLS/HANDLES/ASYNC_CALLS edges before re-running
 	_ = p.Store.DeleteNodesByLabel(p.ProjectName, "Route")
 	_ = p.Store.DeleteEdgesByType(p.ProjectName, "HTTP_CALLS")
 	_ = p.Store.DeleteEdgesByType(p.ProjectName, "HANDLES")
+	_ = p.Store.DeleteEdgesByType(p.ProjectName, "ASYNC_CALLS")
+
+	// Scan config files for env var URLs and create synthetic Module nodes
+	envBindings := ScanProjectEnvURLs(p.RepoPath)
+	if len(envBindings) > 0 {
+		p.injectEnvBindings(envBindings)
+	}
 
 	linker := httplink.New(p.Store, p.ProjectName)
 	links, err := linker.Run()
@@ -916,6 +1177,72 @@ func (p *Pipeline) passHTTPLinks() error {
 	}
 	slog.Info("pass4.httplinks", "links", len(links))
 	return nil
+}
+
+// injectEnvBindings creates or updates Module nodes for config files that contain
+// environment variable URL bindings. These synthetic constants feed into the
+// HTTP linker's call site discovery.
+func (p *Pipeline) injectEnvBindings(bindings []EnvBinding) {
+	// Group by file path
+	byFile := make(map[string][]EnvBinding)
+	for _, b := range bindings {
+		byFile[b.FilePath] = append(byFile[b.FilePath], b)
+	}
+
+	count := 0
+	for filePath, fileBindings := range byFile {
+		moduleQN := fqn.ModuleQN(p.ProjectName, filePath)
+
+		// Build constants list from bindings
+		var constants []string
+		for _, b := range fileBindings {
+			constants = append(constants, b.Key+" = "+b.Value)
+		}
+
+		// Cap at 50 constants per config file
+		if len(constants) > 50 {
+			constants = constants[:50]
+		}
+
+		// Merge with existing constants if module already exists
+		existing, _ := p.Store.FindNodeByQN(p.ProjectName, moduleQN)
+		if existing != nil {
+			if existConsts, ok := existing.Properties["constants"].([]any); ok {
+				seen := make(map[string]bool, len(existConsts))
+				for _, c := range existConsts {
+					if s, ok := c.(string); ok {
+						seen[s] = true
+					}
+				}
+				for _, c := range constants {
+					if !seen[c] {
+						existConsts = append(existConsts, c)
+					}
+				}
+				if existing.Properties == nil {
+					existing.Properties = map[string]any{}
+				}
+				existing.Properties["constants"] = existConsts
+				_, _ = p.Store.UpsertNode(existing)
+				count += len(fileBindings)
+				continue
+			}
+		}
+
+		_, _ = p.Store.UpsertNode(&store.Node{
+			Project:       p.ProjectName,
+			Label:         "Module",
+			Name:          filepath.Base(filePath),
+			QualifiedName: moduleQN,
+			FilePath:      filePath,
+			Properties:    map[string]any{"constants": constants},
+		})
+		count += len(fileBindings)
+	}
+
+	if count > 0 {
+		slog.Info("envscan.injected", "bindings", count, "files", len(byFile))
+	}
 }
 
 // jsonURLKeyPattern matches JSON keys that likely contain URL/endpoint values.
@@ -931,7 +1258,7 @@ func (p *Pipeline) processJSONFile(f discover.FileInfo) error {
 
 	var parsed any
 	if err := json.Unmarshal(data, &parsed); err != nil {
-		return nil // skip malformed JSON silently
+		return fmt.Errorf("json parse: %w", err)
 	}
 
 	var constants []string
@@ -999,12 +1326,19 @@ func looksLikeURL(s string) bool {
 	if strings.HasPrefix(s, "/") && strings.Count(s, "/") >= 2 {
 		// Skip version-like paths: /1.0.0, /v2, /en
 		seg := strings.TrimPrefix(s, "/")
-		if len(seg) <= 3 {
-			return false
-		}
-		return true
+		return len(seg) > 3
 	}
 	return false
+}
+
+// safeRowToLine converts a tree-sitter row (uint) to a 1-based line number (int).
+// Returns math.MaxInt if the value would overflow.
+func safeRowToLine(row uint) int {
+	const maxInt = int(^uint(0) >> 1) // math.MaxInt equivalent without importing math
+	if row > uint(maxInt-1) {
+		return maxInt
+	}
+	return int(row) + 1
 }
 
 func fileHash(path string) (string, error) {

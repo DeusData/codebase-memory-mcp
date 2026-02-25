@@ -1,6 +1,7 @@
 package cypher
 
 import (
+	"database/sql"
 	"fmt"
 	"regexp"
 	"sort"
@@ -84,10 +85,23 @@ func (e *Executor) executeStepsForProject(project string, steps []PlanStep) ([]b
 		var err error
 		switch s := step.(type) {
 		case *ScanNodes:
-			bindings, err = e.execScan(project, s, bindings)
+			// Check if the next step is a FilterWhere that can be pushed down
+			var pushDown *FilterWhere
+			if i+1 < len(steps) {
+				if fw, ok := steps[i+1].(*FilterWhere); ok {
+					pushDown = fw
+				}
+			}
+			bindings, err = e.execScan(project, s, pushDown)
 		case *ExpandRelationship:
 			bindings, err = e.execExpand(s, bindings)
 		case *FilterWhere:
+			// Skip if this was already consumed by push-down
+			if i > 0 {
+				if _, wasScan := steps[i-1].(*ScanNodes); wasScan {
+					continue // already handled in execScan
+				}
+			}
 			bindings, err = e.execFilter(s, bindings)
 		default:
 			return nil, fmt.Errorf("unknown step type: %T", step)
@@ -95,8 +109,6 @@ func (e *Executor) executeStepsForProject(project string, steps []PlanStep) ([]b
 		if err != nil {
 			return nil, err
 		}
-		// Only cap after the last step or after expand (which can explode).
-		// Never cap between scan and filter — the filter needs all candidates.
 		isLastStep := i == len(steps)-1
 		_, isExpand := step.(*ExpandRelationship)
 		if isLastStep || isExpand {
@@ -109,17 +121,66 @@ func (e *Executor) executeStepsForProject(project string, steps []PlanStep) ([]b
 	return bindings, nil
 }
 
-func (e *Executor) execScan(project string, s *ScanNodes, _ []binding) ([]binding, error) {
-	var nodes []*store.Node
-	var err error
+// sqlPushableColumns are node properties that map directly to SQL columns.
+var sqlPushableColumns = map[string]string{
+	"name":           "name",
+	"qualified_name": "qualified_name",
+	"label":          "label",
+	"file_path":      "file_path",
+}
+
+func (e *Executor) execScan(project string, s *ScanNodes, pushDown *FilterWhere) ([]binding, error) {
+	// Build dynamic SQL query with optional push-down conditions
+	query := `SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, properties FROM nodes WHERE project=?`
+	args := []any{project}
 
 	if s.Label != "" {
-		nodes, err = e.Store.FindNodesByLabel(project, s.Label)
-	} else {
-		nodes, err = e.Store.AllNodes(project)
+		query += " AND label=?"
+		args = append(args, s.Label)
 	}
+
+	// Push down WHERE conditions into SQL where possible
+	var unpushedConditions []Condition
+	if pushDown != nil {
+		for _, c := range pushDown.Conditions {
+			col, canPush := sqlPushableColumns[c.Property]
+			if !canPush {
+				unpushedConditions = append(unpushedConditions, c)
+				continue
+			}
+			switch c.Operator {
+			case "=":
+				query += " AND " + col + "=?"
+				args = append(args, c.Value)
+			case "CONTAINS":
+				query += " AND " + col + " LIKE ?"
+				args = append(args, "%"+c.Value+"%")
+			case "STARTS WITH":
+				query += " AND " + col + " LIKE ?"
+				args = append(args, c.Value+"%")
+			default:
+				// =~, numeric comparisons: can't push to SQL easily
+				unpushedConditions = append(unpushedConditions, c)
+			}
+		}
+	}
+
+	rows, err := e.Store.DB().Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("scan nodes: %w", err)
+	}
+	defer rows.Close()
+
+	var nodes []*store.Node
+	for rows.Next() {
+		n, scanErr := scanNodeFromRows(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		nodes = append(nodes, n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	// Apply inline property filters
@@ -127,8 +188,20 @@ func (e *Executor) execScan(project string, s *ScanNodes, _ []binding) ([]bindin
 		nodes = filterNodesByProps(nodes, s.Props)
 	}
 
-	var bindings []binding
+	bindings := make([]binding, 0, len(nodes))
 	for _, n := range nodes {
+		// Apply unpushed conditions in Go
+		if len(unpushedConditions) > 0 {
+			b := newBinding()
+			b.nodes[s.Variable] = n
+			match, evalErr := evaluateConditions(b, unpushedConditions, "AND")
+			if evalErr != nil {
+				return nil, evalErr
+			}
+			if !match {
+				continue
+			}
+		}
 		b := newBinding()
 		if s.Variable != "" {
 			b.nodes[s.Variable] = n
@@ -138,6 +211,17 @@ func (e *Executor) execScan(project string, s *ScanNodes, _ []binding) ([]bindin
 	return bindings, nil
 }
 
+// scanNodeFromRows scans a single node from sql.Rows.
+func scanNodeFromRows(rows *sql.Rows) (*store.Node, error) {
+	var n store.Node
+	var props string
+	if err := rows.Scan(&n.ID, &n.Project, &n.Label, &n.Name, &n.QualifiedName, &n.FilePath, &n.StartLine, &n.EndLine, &props); err != nil {
+		return nil, err
+	}
+	n.Properties = store.UnmarshalProps(props)
+	return &n, nil
+}
+
 func (e *Executor) execExpand(s *ExpandRelationship, bindings []binding) ([]binding, error) {
 	if len(bindings) == 0 {
 		return nil, nil
@@ -145,7 +229,7 @@ func (e *Executor) execExpand(s *ExpandRelationship, bindings []binding) ([]bind
 
 	isVariableLength := s.MinHops != 1 || s.MaxHops != 1
 
-	var result []binding
+	result := make([]binding, 0, len(bindings))
 	for _, b := range bindings {
 		fromNode, ok := b.nodes[s.FromVar]
 		if !ok {
@@ -180,7 +264,7 @@ func (e *Executor) expandFixedLength(b binding, fromNode *store.Node, s *ExpandR
 		return nil, err
 	}
 
-	var result []binding
+	result := make([]binding, 0, len(adjacents))
 	for _, adj := range adjacents {
 		if s.ToLabel != "" && adj.Node.Label != s.ToLabel {
 			continue
@@ -221,7 +305,7 @@ func (e *Executor) expandVariableLength(b binding, fromNode *store.Node, s *Expa
 		return nil, fmt.Errorf("bfs: %w", err)
 	}
 
-	var result []binding
+	result := make([]binding, 0, len(bfsResult.Visited))
 	for _, nh := range bfsResult.Visited {
 		if nh.Hop < s.MinHops {
 			continue
@@ -245,94 +329,94 @@ func (e *Executor) expandVariableLength(b binding, fromNode *store.Node, s *Expa
 	return result, nil
 }
 
+// findAdjacentNodes returns nodes connected to nodeID via the given edge types and direction.
 func (e *Executor) findAdjacentNodes(nodeID int64, edgeTypes []string, direction string) ([]adjacentResult, error) {
-	var allEdges []*store.Edge
+	allEdges, err := e.collectEdges(nodeID, edgeTypes, direction)
+	if err != nil {
+		return nil, err
+	}
+	return e.resolveEdgeTargets(allEdges, nodeID, direction)
+}
 
+// collectEdges gathers edges from the store based on direction and type filters.
+func (e *Executor) collectEdges(nodeID int64, edgeTypes []string, direction string) ([]*store.Edge, error) {
 	switch direction {
 	case "outbound":
-		if len(edgeTypes) > 0 {
-			for _, et := range edgeTypes {
-				edges, err := e.Store.FindEdgesBySourceAndType(nodeID, et)
-				if err != nil {
-					return nil, err
-				}
-				allEdges = append(allEdges, edges...)
-			}
-		} else {
-			edges, err := e.Store.FindEdgesBySource(nodeID)
-			if err != nil {
-				return nil, err
-			}
-			allEdges = edges
-		}
+		return e.collectDirectionalEdges(nodeID, edgeTypes, true)
 	case "inbound":
-		if len(edgeTypes) > 0 {
-			for _, et := range edgeTypes {
-				edges, err := e.Store.FindEdgesByTargetAndType(nodeID, et)
-				if err != nil {
-					return nil, err
-				}
-				allEdges = append(allEdges, edges...)
+		return e.collectDirectionalEdges(nodeID, edgeTypes, false)
+	case "any":
+		return e.collectBidirectionalEdges(nodeID, edgeTypes)
+	default:
+		return e.collectDirectionalEdges(nodeID, edgeTypes, true)
+	}
+}
+
+// collectDirectionalEdges collects edges in one direction (outbound if isSource, inbound otherwise).
+func (e *Executor) collectDirectionalEdges(nodeID int64, edgeTypes []string, isSource bool) ([]*store.Edge, error) {
+	if len(edgeTypes) > 0 {
+		var allEdges []*store.Edge
+		for _, et := range edgeTypes {
+			var edges []*store.Edge
+			var err error
+			if isSource {
+				edges, err = e.Store.FindEdgesBySourceAndType(nodeID, et)
+			} else {
+				edges, err = e.Store.FindEdgesByTargetAndType(nodeID, et)
 			}
-		} else {
-			edges, err := e.Store.FindEdgesByTarget(nodeID)
 			if err != nil {
 				return nil, err
 			}
-			allEdges = edges
+			allEdges = append(allEdges, edges...)
 		}
-	case "any":
-		outEdges, err := e.Store.FindEdgesBySource(nodeID)
-		if err != nil {
-			return nil, err
-		}
-		inEdges, err := e.Store.FindEdgesByTarget(nodeID)
-		if err != nil {
-			return nil, err
-		}
-		if len(edgeTypes) > 0 {
-			typeSet := make(map[string]bool, len(edgeTypes))
-			for _, et := range edgeTypes {
-				typeSet[et] = true
-			}
-			for _, edge := range outEdges {
-				if typeSet[edge.Type] {
-					allEdges = append(allEdges, edge)
-				}
-			}
-			for _, edge := range inEdges {
-				if typeSet[edge.Type] {
-					allEdges = append(allEdges, edge)
-				}
-			}
-		} else {
-			allEdges = append(outEdges, inEdges...)
-		}
-	default:
-		edges, err := e.Store.FindEdgesBySource(nodeID)
-		if err != nil {
-			return nil, err
-		}
-		allEdges = edges
+		return allEdges, nil
 	}
+	if isSource {
+		return e.Store.FindEdgesBySource(nodeID)
+	}
+	return e.Store.FindEdgesByTarget(nodeID)
+}
 
-	// Resolve edge targets/sources to nodes, preserving the edge
-	seen := make(map[int64]bool)
-	var results []adjacentResult
-	for _, edge := range allEdges {
-		var targetID int64
-		switch direction {
-		case "inbound":
-			targetID = edge.SourceID
-		case "any":
-			if edge.SourceID == nodeID {
-				targetID = edge.TargetID
-			} else {
-				targetID = edge.SourceID
-			}
-		default:
-			targetID = edge.TargetID
+// collectBidirectionalEdges collects edges in both directions, optionally filtered by type.
+func (e *Executor) collectBidirectionalEdges(nodeID int64, edgeTypes []string) ([]*store.Edge, error) {
+	outEdges, err := e.Store.FindEdgesBySource(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	inEdges, err := e.Store.FindEdgesByTarget(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	if len(edgeTypes) == 0 {
+		result := make([]*store.Edge, 0, len(outEdges)+len(inEdges))
+		result = append(result, outEdges...)
+		result = append(result, inEdges...)
+		return result, nil
+	}
+	typeSet := make(map[string]bool, len(edgeTypes))
+	for _, et := range edgeTypes {
+		typeSet[et] = true
+	}
+	var allEdges []*store.Edge
+	for _, edge := range outEdges {
+		if typeSet[edge.Type] {
+			allEdges = append(allEdges, edge)
 		}
+	}
+	for _, edge := range inEdges {
+		if typeSet[edge.Type] {
+			allEdges = append(allEdges, edge)
+		}
+	}
+	return allEdges, nil
+}
+
+// resolveEdgeTargets resolves edges to adjacentResult by looking up the target/source node.
+func (e *Executor) resolveEdgeTargets(allEdges []*store.Edge, nodeID int64, direction string) ([]adjacentResult, error) {
+	seen := make(map[int64]bool)
+	results := make([]adjacentResult, 0, len(allEdges))
+	for _, edge := range allEdges {
+		targetID := edgeTargetID(edge, nodeID, direction)
 		if seen[targetID] {
 			continue
 		}
@@ -345,6 +429,21 @@ func (e *Executor) findAdjacentNodes(nodeID int64, edgeTypes []string, direction
 		results = append(results, adjacentResult{Node: node, Edge: edge})
 	}
 	return results, nil
+}
+
+// edgeTargetID returns the ID of the node on the "other end" of the edge relative to nodeID.
+func edgeTargetID(edge *store.Edge, nodeID int64, direction string) int64 {
+	switch direction {
+	case "inbound":
+		return edge.SourceID
+	case "any":
+		if edge.SourceID == nodeID {
+			return edge.TargetID
+		}
+		return edge.SourceID
+	default:
+		return edge.TargetID
+	}
 }
 
 func (e *Executor) execFilter(s *FilterWhere, bindings []binding) ([]binding, error) {
@@ -430,10 +529,10 @@ func evaluateCondition(b binding, c Condition) (bool, error) {
 	}
 }
 
-func compareNumeric(actual any, expected string, op string) (bool, error) {
+func compareNumeric(actual any, expected, op string) (bool, error) {
 	expectedNum, err := strconv.ParseFloat(expected, 64)
 	if err != nil {
-		return false, nil
+		return false, fmt.Errorf("invalid numeric value %q: %w", expected, err)
 	}
 	var actualNum float64
 	switch v := actual.(type) {
@@ -444,9 +543,9 @@ func compareNumeric(actual any, expected string, op string) (bool, error) {
 	case float64:
 		actualNum = v
 	case string:
-		n, err := strconv.ParseFloat(v, 64)
-		if err != nil {
-			return false, nil
+		n, parseErr := strconv.ParseFloat(v, 64)
+		if parseErr != nil {
+			return false, fmt.Errorf("cannot compare %q as number: %w", v, parseErr)
 		}
 		actualNum = n
 	default:
@@ -553,7 +652,7 @@ func (e *Executor) defaultProjection(bindings []binding) (*Result, error) {
 			edgeVarSet[k] = true
 		}
 	}
-	var cols []string
+	cols := make([]string, 0, len(varSet)*3+len(edgeVarSet))
 	for k := range varSet {
 		cols = append(cols, k+".name", k+".qualified_name", k+".label")
 	}
@@ -562,7 +661,7 @@ func (e *Executor) defaultProjection(bindings []binding) (*Result, error) {
 	}
 	sort.Strings(cols)
 
-	var rows []map[string]any
+	rows := make([]map[string]any, 0, len(bindings))
 	for _, b := range bindings {
 		row := make(map[string]any)
 		for varName, node := range b.nodes {
@@ -584,51 +683,12 @@ func (e *Executor) defaultProjection(bindings []binding) (*Result, error) {
 }
 
 func (e *Executor) simpleProjection(bindings []binding, ret *ReturnClause) (*Result, error) {
-	var cols []string
-	for _, item := range ret.Items {
-		col := item.Variable
-		if item.Property != "" {
-			col = item.Variable + "." + item.Property
-		}
-		if item.Alias != "" {
-			col = item.Alias
-		}
-		cols = append(cols, col)
-	}
+	cols := buildColumnNames(ret.Items)
 
 	seen := make(map[string]bool)
-	var rows []map[string]any
+	rows := make([]map[string]any, 0, len(bindings))
 	for _, b := range bindings {
-		row := make(map[string]any)
-		for i, item := range ret.Items {
-			// Try node first, then edge
-			if node, ok := b.nodes[item.Variable]; ok {
-				if item.Property == "" {
-					row[cols[i]] = map[string]any{
-						"name":           node.Name,
-						"qualified_name": node.QualifiedName,
-						"label":          node.Label,
-						"file_path":      node.FilePath,
-						"start_line":     node.StartLine,
-						"end_line":       node.EndLine,
-					}
-				} else {
-					row[cols[i]] = getNodeProperty(node, item.Property)
-				}
-			} else if edge, ok := b.edges[item.Variable]; ok {
-				if item.Property == "" {
-					row[cols[i]] = map[string]any{
-						"type":      edge.Type,
-						"source_id": edge.SourceID,
-						"target_id": edge.TargetID,
-					}
-				} else {
-					row[cols[i]] = getEdgeProperty(edge, item.Property)
-				}
-			} else {
-				row[cols[i]] = nil
-			}
-		}
+		row := buildProjectionRow(b, ret.Items, cols)
 
 		// DISTINCT check
 		if ret.Distinct {
@@ -644,82 +704,20 @@ func (e *Executor) simpleProjection(bindings []binding, ret *ReturnClause) (*Res
 
 	// ORDER BY
 	if ret.OrderBy != "" {
-		orderCol := ret.OrderBy
-		// Find the matching column name
-		for i, item := range ret.Items {
-			if item.Alias == orderCol {
-				orderCol = cols[i]
-				break
-			}
-		}
+		orderCol := resolveOrderColumn(ret.OrderBy, ret.Items, cols)
 		sortRows(rows, orderCol, ret.OrderDir)
 	}
 
 	// LIMIT
-	limit := ret.Limit
-	if limit <= 0 || limit > maxResultRows {
-		limit = maxResultRows
-	}
-	if len(rows) > limit {
-		rows = rows[:limit]
-	}
+	rows = applyLimit(rows, ret.Limit)
 
 	return &Result{Columns: cols, Rows: rows}, nil
 }
 
-func (e *Executor) aggregateResults(bindings []binding, ret *ReturnClause) (*Result, error) {
-	// Group by non-COUNT items
-	var groupItems []ReturnItem
-	var countItem ReturnItem
-	for _, item := range ret.Items {
-		if item.Func == "COUNT" {
-			countItem = item
-		} else {
-			groupItems = append(groupItems, item)
-		}
-	}
-
-	// Build grouping key -> count
-	type groupEntry struct {
-		key   string
-		row   map[string]any
-		count int
-	}
-	groups := make(map[string]*groupEntry)
-	var order []string
-
-	for _, b := range bindings {
-		row := make(map[string]any)
-		var keyParts []string
-		for _, item := range groupItems {
-			col := item.Variable
-			if item.Property != "" {
-				col = item.Variable + "." + item.Property
-			}
-			if item.Alias != "" {
-				col = item.Alias
-			}
-			var val any
-			if node, ok := b.nodes[item.Variable]; ok {
-				val = getNodeProperty(node, item.Property)
-			} else if edge, ok := b.edges[item.Variable]; ok {
-				val = getEdgeProperty(edge, item.Property)
-			}
-			row[col] = val
-			keyParts = append(keyParts, fmt.Sprintf("%v", val))
-		}
-		key := strings.Join(keyParts, "\x00")
-		if g, ok := groups[key]; ok {
-			g.count++
-		} else {
-			groups[key] = &groupEntry{key: key, row: row, count: 1}
-			order = append(order, key)
-		}
-	}
-
-	// Build columns
-	var cols []string
-	for _, item := range ret.Items {
+// buildColumnNames builds column names from return items.
+func buildColumnNames(items []ReturnItem) []string {
+	cols := make([]string, 0, len(items))
+	for _, item := range items {
 		col := item.Variable
 		if item.Property != "" {
 			col = item.Variable + "." + item.Property
@@ -729,6 +727,83 @@ func (e *Executor) aggregateResults(bindings []binding, ret *ReturnClause) (*Res
 		}
 		cols = append(cols, col)
 	}
+	return cols
+}
+
+// buildProjectionRow builds a single result row from a binding.
+func buildProjectionRow(b binding, items []ReturnItem, cols []string) map[string]any {
+	row := make(map[string]any)
+	for i, item := range items {
+		row[cols[i]] = resolveItemValue(b, item)
+	}
+	return row
+}
+
+// resolveItemValue resolves a return item value from a binding (node or edge).
+func resolveItemValue(b binding, item ReturnItem) any {
+	if node, ok := b.nodes[item.Variable]; ok {
+		return resolveNodeItemValue(node, item.Property)
+	}
+	if edge, ok := b.edges[item.Variable]; ok {
+		return resolveEdgeItemValue(edge, item.Property)
+	}
+	return nil
+}
+
+// resolveNodeItemValue resolves a node return item: full node map or single property.
+func resolveNodeItemValue(node *store.Node, property string) any {
+	if property == "" {
+		return map[string]any{
+			"name":           node.Name,
+			"qualified_name": node.QualifiedName,
+			"label":          node.Label,
+			"file_path":      node.FilePath,
+			"start_line":     node.StartLine,
+			"end_line":       node.EndLine,
+		}
+	}
+	return getNodeProperty(node, property)
+}
+
+// resolveEdgeItemValue resolves an edge return item: full edge map or single property.
+func resolveEdgeItemValue(edge *store.Edge, property string) any {
+	if property == "" {
+		return map[string]any{
+			"type":      edge.Type,
+			"source_id": edge.SourceID,
+			"target_id": edge.TargetID,
+		}
+	}
+	return getEdgeProperty(edge, property)
+}
+
+// resolveOrderColumn maps an ORDER BY field to the actual column name.
+func resolveOrderColumn(orderBy string, items []ReturnItem, cols []string) string {
+	for i, item := range items {
+		if item.Alias == orderBy {
+			return cols[i]
+		}
+	}
+	return orderBy
+}
+
+// applyLimit enforces the LIMIT clause on result rows.
+func applyLimit(rows []map[string]any, limit int) []map[string]any {
+	if limit <= 0 || limit > maxResultRows {
+		limit = maxResultRows
+	}
+	if len(rows) > limit {
+		return rows[:limit]
+	}
+	return rows
+}
+
+func (e *Executor) aggregateResults(bindings []binding, ret *ReturnClause) (*Result, error) {
+	groupItems, countItem := splitAggregateItems(ret.Items)
+	groups, order := buildGroups(bindings, groupItems)
+
+	// Build columns
+	cols := buildColumnNames(ret.Items)
 
 	// Build result rows
 	countCol := countItem.Alias
@@ -736,7 +811,7 @@ func (e *Executor) aggregateResults(bindings []binding, ret *ReturnClause) (*Res
 		countCol = "COUNT(" + countItem.Variable + ")"
 	}
 
-	var rows []map[string]any
+	rows := make([]map[string]any, 0, len(order))
 	for _, key := range order {
 		g := groups[key]
 		row := g.row
@@ -750,19 +825,61 @@ func (e *Executor) aggregateResults(bindings []binding, ret *ReturnClause) (*Res
 	}
 
 	// LIMIT
-	limit := ret.Limit
-	if limit <= 0 || limit > maxResultRows {
-		limit = maxResultRows
-	}
-	if len(rows) > limit {
-		rows = rows[:limit]
-	}
+	rows = applyLimit(rows, ret.Limit)
 
 	return &Result{Columns: cols, Rows: rows}, nil
 }
 
+// splitAggregateItems separates return items into group-by items and the COUNT item.
+func splitAggregateItems(items []ReturnItem) (groupItems []ReturnItem, countItem ReturnItem) {
+	for _, item := range items {
+		if item.Func == "COUNT" {
+			countItem = item
+		} else {
+			groupItems = append(groupItems, item)
+		}
+	}
+	return groupItems, countItem
+}
+
+type groupEntry struct {
+	key   string
+	row   map[string]any
+	count int
+}
+
+// buildGroups groups bindings by non-COUNT items and counts occurrences.
+func buildGroups(bindings []binding, groupItems []ReturnItem) (groups map[string]*groupEntry, order []string) {
+	groups = make(map[string]*groupEntry)
+
+	for _, b := range bindings {
+		row := make(map[string]any)
+		var keyParts []string
+		for _, item := range groupItems {
+			col := item.Variable
+			if item.Property != "" {
+				col = item.Variable + "." + item.Property
+			}
+			if item.Alias != "" {
+				col = item.Alias
+			}
+			val := resolveItemValue(b, item)
+			row[col] = val
+			keyParts = append(keyParts, fmt.Sprintf("%v", val))
+		}
+		key := strings.Join(keyParts, "\x00")
+		if g, ok := groups[key]; ok {
+			g.count++
+		} else {
+			groups[key] = &groupEntry{key: key, row: row, count: 1}
+			order = append(order, key)
+		}
+	}
+	return groups, order
+}
+
 // sortRows sorts rows by the given column.
-func sortRows(rows []map[string]any, col string, dir string) {
+func sortRows(rows []map[string]any, col, dir string) {
 	sort.SliceStable(rows, func(i, j int) bool {
 		a, b := rows[i][col], rows[j][col]
 		cmp := compareValues(a, b)

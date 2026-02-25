@@ -36,7 +36,20 @@ func (s *Server) MCPServer() *mcp.Server {
 }
 
 func (s *Server) registerTools() {
-	// 1. index_repository
+	s.registerGraphTools()
+	s.registerFileTools()
+	s.registerProjectTools()
+}
+
+// registerGraphTools registers tools for graph querying, searching, and tracing.
+func (s *Server) registerGraphTools() {
+	s.registerIndexAndTraceTool()
+	s.registerSchemaAndSnippetTools()
+	s.registerSearchTools()
+	s.registerQueryTool()
+}
+
+func (s *Server) registerIndexAndTraceTool() {
 	s.mcp.AddTool(&mcp.Tool{
 		Name:        "index_repository",
 		Description: "Index a repository into the code graph. Parses source files, extracts functions/classes/modules, resolves call relationships, and stores the graph for querying. Supports incremental reindex via content hashing.",
@@ -51,10 +64,9 @@ func (s *Server) registerTools() {
 		}`),
 	}, s.handleIndexRepository)
 
-	// 2. trace_call_path
 	s.mcp.AddTool(&mcp.Tool{
 		Name:        "trace_call_path",
-		Description: "Trace call paths from/to a function using BFS traversal. Returns the root function with signature and module constants, hop-by-hop callees/callers, and call edges with type (CALLS or HTTP_CALLS). Use for understanding call chains and data flow.",
+		Description: "Trace call paths from/to a function. Requires EXACT function name — if unsure, call search_graph(name_pattern=...) first to discover the correct name. Returns hop-by-hop callees/callers with edge types (CALLS, HTTP_CALLS, ASYNC_CALLS). Use depth=1 first, increase only if needed. IMPORTANT: If the function is not found, use search_graph with a name_pattern regex to find similar names before retrying.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -75,15 +87,15 @@ func (s *Server) registerTools() {
 			"required": ["function_name"]
 		}`),
 	}, s.handleTraceCallPath)
+}
 
-	// 3. get_graph_schema
+func (s *Server) registerSchemaAndSnippetTools() {
 	s.mcp.AddTool(&mcp.Tool{
 		Name:        "get_graph_schema",
 		Description: "Return the schema of the indexed code graph: node label counts, edge type counts, relationship patterns (e.g. Function-CALLS->Function), and sample function/class names. Use to understand what's in the graph before querying.",
 		InputSchema: json.RawMessage(`{"type": "object"}`),
 	}, s.handleGetGraphSchema)
 
-	// 4. get_code_snippet
 	s.mcp.AddTool(&mcp.Tool{
 		Name:        "get_code_snippet",
 		Description: "Retrieve source code for a function/class by qualified name. Reads directly from disk using the stored file path and line range. Returns the source code with line numbers.",
@@ -98,11 +110,12 @@ func (s *Server) registerTools() {
 			"required": ["qualified_name"]
 		}`),
 	}, s.handleGetCodeSnippet)
+}
 
-	// 5. search_graph
+func (s *Server) registerSearchTools() {
 	s.mcp.AddTool(&mcp.Tool{
 		Name:        "search_graph",
-		Description: "Search the code graph with structured filters. Replaces raw Cypher queries with safe, parameterized search. Supports filtering by project, node label, name pattern (regex), file pattern (glob), relationship type, direction, and degree (fan-in/fan-out). Returns matching nodes with properties and edge counts.",
+		Description: "Search the code graph. Returns 10 results per page (use offset to paginate, has_more indicates more pages). For dead code: use relationship='CALLS', direction='inbound', max_degree=0, exclude_entry_points=true. For fan-out: use relationship='CALLS', direction='outbound', min_degree=N. Route nodes: properties.handler contains the actual handler function name. Prefer this over query_graph for counting — no row cap. Relationship types: CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD, HANDLES, CONTAINS_FILE, CONTAINS_FOLDER, CONTAINS_PACKAGE, IMPLEMENTS.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -124,7 +137,7 @@ func (s *Server) registerTools() {
 				},
 				"relationship": {
 					"type": "string",
-					"description": "Filter by relationship type: CALLS, HTTP_CALLS, IMPORTS, DEFINES, etc."
+					"description": "Filter by relationship type: CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD, HANDLES, CONTAINS_FILE, CONTAINS_FOLDER, CONTAINS_PACKAGE, IMPLEMENTS"
 				},
 				"direction": {
 					"type": "string",
@@ -145,39 +158,71 @@ func (s *Server) registerTools() {
 				},
 				"limit": {
 					"type": "integer",
-					"description": "Max results to return per page (default: 100)."
+					"description": "Max results per page (default: 10). Use small limits and paginate with offset — response includes has_more flag."
 				},
 				"offset": {
 					"type": "integer",
-					"description": "Number of results to skip for pagination (default: 0). Use with limit to page through results."
+					"description": "Skip N results for pagination (default: 0). Check has_more in response to know if more pages exist."
+				},
+				"include_connected": {
+					"type": "boolean",
+					"description": "Include connected node names in results (default: false). Expensive — only enable when you need to see neighbor names."
 				}
 			}
 		}`),
 	}, s.handleSearchGraph)
 
-	// 6. list_projects
 	s.mcp.AddTool(&mcp.Tool{
-		Name:        "list_projects",
-		Description: "List all indexed projects with their indexed_at timestamp, root path, and node/edge counts.",
-		InputSchema: json.RawMessage(`{"type": "object"}`),
-	}, s.handleListProjects)
-
-	// 7. delete_project
-	s.mcp.AddTool(&mcp.Tool{
-		Name:        "delete_project",
-		Description: "Delete an indexed project and all its graph data (nodes, edges, file hashes). This action is irreversible.",
+		Name:        "search_code",
+		Description: "Search for text in source code files (like grep, scoped to indexed project). Returns 10 matches per page — use offset to paginate, has_more indicates more pages. Use for string literals, error messages, TODO comments.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
-				"project_name": {
+				"pattern": {
 					"type": "string",
-					"description": "Name of the project to delete"
+					"description": "Text to search for (literal string, or regex if regex=true)"
+				},
+				"file_pattern": {
+					"type": "string",
+					"description": "Glob pattern to filter files (e.g. '*.go', '*.py')"
+				},
+				"regex": {
+					"type": "boolean",
+					"description": "Treat pattern as a regular expression (default: false)"
+				},
+				"max_results": {
+					"type": "integer",
+					"description": "Max matches per page (default: 10). Response includes has_more flag for pagination."
+				},
+				"offset": {
+					"type": "integer",
+					"description": "Skip N matches for pagination (default: 0). Check has_more in response."
 				}
 			},
-			"required": ["project_name"]
+			"required": ["pattern"]
 		}`),
-	}, s.handleDeleteProject)
+	}, s.handleSearchCode)
+}
 
+func (s *Server) registerQueryTool() {
+	s.mcp.AddTool(&mcp.Tool{
+		Name:        "query_graph",
+		Description: "Execute a Cypher-like graph query. WARNING: 200-row cap applies BEFORE aggregation — COUNT queries on large codebases silently undercount. For fan-out/fan-in counting, use search_graph with min_degree/max_degree instead. Best for: relationship patterns, filtered joins, path queries. Always use LIMIT. Edge types: CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD, HANDLES, IMPLEMENTS.",
+		InputSchema: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"query": {
+					"type": "string",
+					"description": "Cypher query, e.g. MATCH (f:Function)-[:CALLS]->(g:Function) WHERE f.name = 'main' RETURN g.name, g.qualified_name LIMIT 20"
+				}
+			},
+			"required": ["query"]
+		}`),
+	}, s.handleQueryGraph)
+}
+
+// registerFileTools registers tools for file and directory operations.
+func (s *Server) registerFileTools() {
 	// 8. read_file
 	s.mcp.AddTool(&mcp.Tool{
 		Name:        "read_file",
@@ -220,54 +265,32 @@ func (s *Server) registerTools() {
 			}
 		}`),
 	}, s.handleListDirectory)
+}
 
-	// 10. search_code
+// registerProjectTools registers tools for project management.
+func (s *Server) registerProjectTools() {
+	// 6. list_projects
 	s.mcp.AddTool(&mcp.Tool{
-		Name:        "search_code",
-		Description: "Search for text patterns within source code files. Like grep/ripgrep but scoped to indexed project files. Returns matching lines with file paths and line numbers. Use for finding string literals, error messages, TODO comments, or any text within function bodies.",
+		Name:        "list_projects",
+		Description: "List all indexed projects with their indexed_at timestamp, root path, and node/edge counts.",
+		InputSchema: json.RawMessage(`{"type": "object"}`),
+	}, s.handleListProjects)
+
+	// 7. delete_project
+	s.mcp.AddTool(&mcp.Tool{
+		Name:        "delete_project",
+		Description: "Delete an indexed project and all its graph data (nodes, edges, file hashes). This action is irreversible.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
-				"pattern": {
+				"project_name": {
 					"type": "string",
-					"description": "Text to search for (literal string, or regex if regex=true)"
-				},
-				"file_pattern": {
-					"type": "string",
-					"description": "Glob pattern to filter files (e.g. '*.go', '*.py')"
-				},
-				"regex": {
-					"type": "boolean",
-					"description": "Treat pattern as a regular expression (default: false)"
-				},
-				"max_results": {
-					"type": "integer",
-					"description": "Maximum number of matches to return per page (default: 100)."
-				},
-				"offset": {
-					"type": "integer",
-					"description": "Number of matches to skip for pagination (default: 0). Use with max_results to page through results."
+					"description": "Name of the project to delete"
 				}
 			},
-			"required": ["pattern"]
+			"required": ["project_name"]
 		}`),
-	}, s.handleSearchCode)
-
-	// 11. query_graph
-	s.mcp.AddTool(&mcp.Tool{
-		Name:        "query_graph",
-		Description: "Execute a Cypher-like graph query. Supports MATCH patterns with node labels, relationship types, variable-length paths, WHERE filters (=, =~, CONTAINS, STARTS WITH, >, <), and RETURN with COUNT/ORDER BY/LIMIT/DISTINCT. Read-only (no CREATE/DELETE).",
-		InputSchema: json.RawMessage(`{
-			"type": "object",
-			"properties": {
-				"query": {
-					"type": "string",
-					"description": "Cypher query, e.g. MATCH (f:Function)-[:CALLS]->(g:Function) WHERE f.name = 'main' RETURN g.name, g.qualified_name LIMIT 20"
-				}
-			},
-			"required": ["query"]
-		}`),
-	}, s.handleQueryGraph)
+	}, s.handleDeleteProject)
 }
 
 // jsonResult marshals data to JSON and returns as tool result.
@@ -295,7 +318,7 @@ func errResult(msg string) *mcp.CallToolResult {
 
 // parseArgs unmarshals the raw JSON arguments into a map.
 func parseArgs(req *mcp.CallToolRequest) (map[string]any, error) {
-	if req.Params.Arguments == nil || len(req.Params.Arguments) == 0 {
+	if len(req.Params.Arguments) == 0 {
 		return map[string]any{}, nil
 	}
 	var m map[string]any

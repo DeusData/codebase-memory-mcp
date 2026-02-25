@@ -73,7 +73,10 @@ func TestParseNodePattern(t *testing.T) {
 	if len(elems) != 1 {
 		t.Fatalf("expected 1 element, got %d", len(elems))
 	}
-	node := elems[0].(*NodePattern)
+	node, ok := elems[0].(*NodePattern)
+	if !ok {
+		t.Fatalf("expected *NodePattern, got %T", elems[0])
+	}
 	if node.Variable != "f" {
 		t.Errorf("expected variable 'f', got %q", node.Variable)
 	}
@@ -94,7 +97,10 @@ func TestParseRelationship(t *testing.T) {
 	if len(elems) != 3 {
 		t.Fatalf("expected 3 elements (node-rel-node), got %d", len(elems))
 	}
-	rel := elems[1].(*RelPattern)
+	rel, ok := elems[1].(*RelPattern)
+	if !ok {
+		t.Fatalf("expected *RelPattern, got %T", elems[1])
+	}
 	if len(rel.Types) != 1 || rel.Types[0] != "CALLS" {
 		t.Errorf("expected CALLS type, got %v", rel.Types)
 	}
@@ -111,7 +117,10 @@ func TestParseVariableLength(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	rel := q.Match.Pattern.Elements[1].(*RelPattern)
+	rel, ok := q.Match.Pattern.Elements[1].(*RelPattern)
+	if !ok {
+		t.Fatalf("expected *RelPattern, got %T", q.Match.Pattern.Elements[1])
+	}
 	if rel.MinHops != 1 {
 		t.Errorf("expected minHops=1, got %d", rel.MinHops)
 	}
@@ -185,7 +194,10 @@ func TestParseBidirectional(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	rel := q.Match.Pattern.Elements[1].(*RelPattern)
+	rel, ok := q.Match.Pattern.Elements[1].(*RelPattern)
+	if !ok {
+		t.Fatalf("expected *RelPattern, got %T", q.Match.Pattern.Elements[1])
+	}
 	if rel.Direction != "any" {
 		t.Errorf("expected 'any' direction, got %q", rel.Direction)
 	}
@@ -196,7 +208,10 @@ func TestParseInbound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	rel := q.Match.Pattern.Elements[1].(*RelPattern)
+	rel, ok := q.Match.Pattern.Elements[1].(*RelPattern)
+	if !ok {
+		t.Fatalf("expected *RelPattern, got %T", q.Match.Pattern.Elements[1])
+	}
 	if rel.Direction != "inbound" {
 		t.Errorf("expected inbound, got %q", rel.Direction)
 	}
@@ -207,7 +222,10 @@ func TestParseMultipleRelTypes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	rel := q.Match.Pattern.Elements[1].(*RelPattern)
+	rel, ok := q.Match.Pattern.Elements[1].(*RelPattern)
+	if !ok {
+		t.Fatalf("expected *RelPattern, got %T", q.Match.Pattern.Elements[1])
+	}
 	if len(rel.Types) != 2 {
 		t.Fatalf("expected 2 types, got %d", len(rel.Types))
 	}
@@ -322,12 +340,20 @@ func setupTestStore(t *testing.T) *store.Store {
 
 	// Edges: HandleOrder -> ValidateOrder -> SubmitOrder
 	//        HandleOrder -> LogError
-	s.InsertEdge(&store.Edge{Project: "test", SourceID: idA, TargetID: idB, Type: "CALLS"})
-	s.InsertEdge(&store.Edge{Project: "test", SourceID: idB, TargetID: idC, Type: "CALLS"})
-	s.InsertEdge(&store.Edge{Project: "test", SourceID: idA, TargetID: idE, Type: "CALLS"})
-	s.InsertEdge(&store.Edge{Project: "test", SourceID: idD, TargetID: idA, Type: "DEFINES"})
+	mustInsertEdge(t, s, &store.Edge{Project: "test", SourceID: idA, TargetID: idB, Type: "CALLS"})
+	mustInsertEdge(t, s, &store.Edge{Project: "test", SourceID: idB, TargetID: idC, Type: "CALLS"})
+	mustInsertEdge(t, s, &store.Edge{Project: "test", SourceID: idA, TargetID: idE, Type: "CALLS"})
+	mustInsertEdge(t, s, &store.Edge{Project: "test", SourceID: idD, TargetID: idA, Type: "DEFINES"})
 
 	return s
+}
+
+// mustInsertEdge inserts an edge and fails the test on error.
+func mustInsertEdge(t *testing.T, s *store.Store, edge *store.Edge) {
+	t.Helper()
+	if _, err := s.InsertEdge(edge); err != nil {
+		t.Fatalf("insert edge: %v", err)
+	}
 }
 
 func TestExecuteSimpleMatch(t *testing.T) {
@@ -614,7 +640,7 @@ func setupTestStoreWithHTTPCalls(t *testing.T) *store.Store {
 	if callerNode == nil || targetNode == nil {
 		t.Fatal("expected test nodes to exist")
 	}
-	s.InsertEdge(&store.Edge{
+	mustInsertEdge(t, s, &store.Edge{
 		Project:  "test",
 		SourceID: callerNode.ID,
 		TargetID: targetNode.ID,

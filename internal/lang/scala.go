@@ -2,8 +2,8 @@ package lang
 
 func init() {
 	Register(&LanguageSpec{
-		Language:       Scala,
-		FileExtensions: []string{".scala", ".sc"},
+		Language:          Scala,
+		FileExtensions:    []string{".scala", ".sc"},
 		FunctionNodeTypes: []string{"function_definition", "function_declaration"},
 		ClassNodeTypes: []string{
 			"class_definition",

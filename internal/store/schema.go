@@ -29,7 +29,7 @@ func (s *Store) GetSchema(project string) (*SchemaInfo, error) {
 	info := &SchemaInfo{}
 
 	// Node label counts
-	rows, err := s.db.Query("SELECT label, COUNT(*) as cnt FROM nodes WHERE project=? GROUP BY label ORDER BY cnt DESC", project)
+	rows, err := s.q.Query("SELECT label, COUNT(*) as cnt FROM nodes WHERE project=? GROUP BY label ORDER BY cnt DESC", project)
 	if err != nil {
 		return nil, fmt.Errorf("schema labels: %w", err)
 	}
@@ -46,7 +46,7 @@ func (s *Store) GetSchema(project string) (*SchemaInfo, error) {
 	}
 
 	// Edge type counts
-	rows2, err := s.db.Query("SELECT type, COUNT(*) as cnt FROM edges WHERE project=? GROUP BY type ORDER BY cnt DESC", project)
+	rows2, err := s.q.Query("SELECT type, COUNT(*) as cnt FROM edges WHERE project=? GROUP BY type ORDER BY cnt DESC", project)
 	if err != nil {
 		return nil, fmt.Errorf("schema edge types: %w", err)
 	}
@@ -63,7 +63,7 @@ func (s *Store) GetSchema(project string) (*SchemaInfo, error) {
 	}
 
 	// Relationship patterns: (src_label)-[type]->(tgt_label) with counts
-	rows3, err := s.db.Query(`
+	rows3, err := s.q.Query(`
 		SELECT sn.label, e.type, tn.label, COUNT(*) as cnt
 		FROM edges e
 		JOIN nodes sn ON e.source_id = sn.id
@@ -89,7 +89,7 @@ func (s *Store) GetSchema(project string) (*SchemaInfo, error) {
 	}
 
 	// Sample function names
-	rows4, err := s.db.Query("SELECT name FROM nodes WHERE project=? AND label='Function' ORDER BY name LIMIT 30", project)
+	rows4, err := s.q.Query("SELECT name FROM nodes WHERE project=? AND label='Function' ORDER BY name LIMIT 30", project)
 	if err != nil {
 		return nil, fmt.Errorf("schema sample funcs: %w", err)
 	}
@@ -101,9 +101,12 @@ func (s *Store) GetSchema(project string) (*SchemaInfo, error) {
 		}
 		info.SampleFunctionNames = append(info.SampleFunctionNames, name)
 	}
+	if err := rows4.Err(); err != nil {
+		return nil, err
+	}
 
 	// Sample class names
-	rows5, err := s.db.Query("SELECT name FROM nodes WHERE project=? AND label='Class' ORDER BY name LIMIT 20", project)
+	rows5, err := s.q.Query("SELECT name FROM nodes WHERE project=? AND label='Class' ORDER BY name LIMIT 20", project)
 	if err != nil {
 		return nil, fmt.Errorf("schema sample classes: %w", err)
 	}
@@ -115,9 +118,12 @@ func (s *Store) GetSchema(project string) (*SchemaInfo, error) {
 		}
 		info.SampleClassNames = append(info.SampleClassNames, name)
 	}
+	if err := rows5.Err(); err != nil {
+		return nil, err
+	}
 
 	// Sample qualified names
-	rows6, err := s.db.Query("SELECT qualified_name FROM nodes WHERE project=? LIMIT 5", project)
+	rows6, err := s.q.Query("SELECT qualified_name FROM nodes WHERE project=? LIMIT 5", project)
 	if err != nil {
 		return nil, fmt.Errorf("schema sample qns: %w", err)
 	}
@@ -128,6 +134,9 @@ func (s *Store) GetSchema(project string) (*SchemaInfo, error) {
 			return nil, err
 		}
 		info.SampleQualifiedNames = append(info.SampleQualifiedNames, qn)
+	}
+	if err := rows6.Err(); err != nil {
+		return nil, err
 	}
 
 	return info, nil

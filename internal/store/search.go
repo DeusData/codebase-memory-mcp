@@ -19,6 +19,7 @@ type SearchParams struct {
 	Limit              int
 	Offset             int
 	ExcludeEntryPoints bool // when true, exclude nodes with is_entry_point=true
+	IncludeConnected   bool // when true, load connected node names (expensive, off by default)
 }
 
 // SearchResult is a node with edge degree info.
@@ -35,8 +36,49 @@ type SearchOutput struct {
 	Total   int
 }
 
+// countDegrees populates in/out degree counts on a SearchResult.
+func (s *Store) countDegrees(sr *SearchResult, nodeID int64, relationship string) error {
+	if relationship != "" {
+		if err := s.q.QueryRow("SELECT COUNT(*) FROM edges WHERE target_id=? AND type=?", nodeID, relationship).Scan(&sr.InDegree); err != nil {
+			return fmt.Errorf("count in-degree: %w", err)
+		}
+		if err := s.q.QueryRow("SELECT COUNT(*) FROM edges WHERE source_id=? AND type=?", nodeID, relationship).Scan(&sr.OutDegree); err != nil {
+			return fmt.Errorf("count out-degree: %w", err)
+		}
+	} else {
+		if err := s.q.QueryRow("SELECT COUNT(*) FROM edges WHERE target_id=?", nodeID).Scan(&sr.InDegree); err != nil {
+			return fmt.Errorf("count in-degree: %w", err)
+		}
+		if err := s.q.QueryRow("SELECT COUNT(*) FROM edges WHERE source_id=?", nodeID).Scan(&sr.OutDegree); err != nil {
+			return fmt.Errorf("count out-degree: %w", err)
+		}
+	}
+	return nil
+}
+
+// loadConnectedNames fetches up to 10 connected node names for display.
+func (s *Store) loadConnectedNames(sr *SearchResult, nodeID int64) {
+	connRows, connErr := s.q.Query(`
+		SELECT DISTINCT n2.name FROM edges e
+		JOIN nodes n2 ON (e.target_id = n2.id OR e.source_id = n2.id)
+		WHERE (e.source_id = ? OR e.target_id = ?) AND n2.id != ?
+		LIMIT 10`, nodeID, nodeID, nodeID)
+	if connErr != nil {
+		return
+	}
+	defer connRows.Close()
+	for connRows.Next() {
+		var name string
+		if err := connRows.Scan(&name); err != nil {
+			break
+		}
+		sr.ConnectedNames = append(sr.ConnectedNames, name)
+	}
+	_ = connRows.Err()
+}
+
 // Search executes a parameterized search query with pagination support.
-func (s *Store) Search(params SearchParams) (*SearchOutput, error) {
+func (s *Store) Search(params *SearchParams) (*SearchOutput, error) {
 	// Limit=0 means use default; use a high ceiling for SQL
 	if params.Limit <= 0 {
 		params.Limit = 100000
@@ -84,7 +126,7 @@ func (s *Store) Search(params SearchParams) (*SearchOutput, error) {
 		LIMIT ?`, where)
 	args = append(args, sqlLimit)
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.q.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("search: %w", err)
 	}
@@ -113,55 +155,9 @@ func (s *Store) Search(params SearchParams) (*SearchOutput, error) {
 	}
 
 	// Build all qualifying results (before offset/limit) for accurate total count
-	var allResults []*SearchResult
-	for _, n := range nodes {
-		sr := &SearchResult{Node: n}
-
-		// Count degrees
-		if params.Relationship != "" {
-			var inCount, outCount int
-			s.db.QueryRow("SELECT COUNT(*) FROM edges WHERE target_id=? AND type=?", n.ID, params.Relationship).Scan(&inCount)
-			s.db.QueryRow("SELECT COUNT(*) FROM edges WHERE source_id=? AND type=?", n.ID, params.Relationship).Scan(&outCount)
-			sr.InDegree = inCount
-			sr.OutDegree = outCount
-		} else {
-			s.db.QueryRow("SELECT COUNT(*) FROM edges WHERE target_id=?", n.ID).Scan(&sr.InDegree)
-			s.db.QueryRow("SELECT COUNT(*) FROM edges WHERE source_id=?", n.ID).Scan(&sr.OutDegree)
-		}
-
-		// Apply degree filters (-1 means "not set")
-		degree := sr.InDegree
-		if params.Direction == "outbound" {
-			degree = sr.OutDegree
-		}
-		if params.MinDegree >= 0 && degree < params.MinDegree {
-			continue
-		}
-		if params.MaxDegree >= 0 && degree > params.MaxDegree {
-			continue
-		}
-
-		// Exclude entry points from dead code results
-		if params.ExcludeEntryPoints && isEntryPoint(n) {
-			continue
-		}
-
-		// Get connected node names (limit to 10 for display)
-		connRows, connErr := s.db.Query(`
-			SELECT DISTINCT n2.name FROM edges e
-			JOIN nodes n2 ON (e.target_id = n2.id OR e.source_id = n2.id)
-			WHERE (e.source_id = ? OR e.target_id = ?) AND n2.id != ?
-			LIMIT 10`, n.ID, n.ID, n.ID)
-		if connErr == nil {
-			for connRows.Next() {
-				var name string
-				connRows.Scan(&name)
-				sr.ConnectedNames = append(sr.ConnectedNames, name)
-			}
-			connRows.Close()
-		}
-
-		allResults = append(allResults, sr)
+	allResults, err := s.buildFilteredResults(nodes, params)
+	if err != nil {
+		return nil, err
 	}
 
 	total := len(allResults)
@@ -202,6 +198,40 @@ func isEntryPoint(n *Node) bool {
 	}
 	b, ok := ep.(bool)
 	return ok && b
+}
+
+// buildFilteredResults applies degree, direction, and entry-point filters to nodes,
+// counts degrees, and loads connected names for each qualifying result.
+func (s *Store) buildFilteredResults(nodes []*Node, params *SearchParams) ([]*SearchResult, error) {
+	results := make([]*SearchResult, 0, len(nodes))
+	for _, n := range nodes {
+		sr := &SearchResult{Node: n}
+
+		if err := s.countDegrees(sr, n.ID, params.Relationship); err != nil {
+			return nil, err
+		}
+
+		degree := sr.InDegree
+		if params.Direction == "outbound" {
+			degree = sr.OutDegree
+		}
+		if params.MinDegree >= 0 && degree < params.MinDegree {
+			continue
+		}
+		if params.MaxDegree >= 0 && degree > params.MaxDegree {
+			continue
+		}
+
+		if params.ExcludeEntryPoints && isEntryPoint(n) {
+			continue
+		}
+
+		if params.IncludeConnected {
+			s.loadConnectedNames(sr, n.ID)
+		}
+		results = append(results, sr)
+	}
+	return results, nil
 }
 
 // filterByNamePattern filters nodes by a regex name pattern.

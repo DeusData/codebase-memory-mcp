@@ -36,8 +36,8 @@ func (s *Server) handleReadFile(_ context.Context, req *mcp.CallToolRequest) (*m
 	}
 
 	// Check file exists and is not a directory
-	info, err := os.Stat(absPath)
-	if err != nil {
+	info, statErr := os.Stat(absPath)
+	if statErr != nil {
 		return errResult(fmt.Sprintf("file not found: %s", absPath)), nil
 	}
 	if info.IsDir() {
@@ -113,70 +113,17 @@ func (s *Server) handleListDirectory(_ context.Context, req *mcp.CallToolRequest
 		}
 	}
 
-	info, err := os.Stat(absPath)
-	if err != nil {
+	info, _ := os.Stat(absPath)
+	if info == nil {
 		return errResult(fmt.Sprintf("path not found: %s", absPath)), nil
 	}
 	if !info.IsDir() {
 		return errResult("path is a file, use read_file instead"), nil
 	}
 
-	type entry struct {
-		Name  string `json:"name"`
-		Path  string `json:"path"`
-		IsDir bool   `json:"is_dir"`
-		Size  int64  `json:"size,omitempty"`
-	}
-
-	var entries []entry
-
-	if globPattern != "" {
-		// Glob matching within the directory
-		matches, globErr := filepath.Glob(filepath.Join(absPath, globPattern))
-		if globErr != nil {
-			return errResult(fmt.Sprintf("glob: %v", globErr)), nil
-		}
-		for _, m := range matches {
-			fi, statErr := os.Stat(m)
-			if statErr != nil {
-				continue
-			}
-			relPath, _ := filepath.Rel(absPath, m)
-			e := entry{
-				Name:  relPath,
-				Path:  m,
-				IsDir: fi.IsDir(),
-			}
-			if !fi.IsDir() {
-				e.Size = fi.Size()
-			}
-			entries = append(entries, e)
-		}
-	} else {
-		// List immediate children
-		dirEntries, readErr := os.ReadDir(absPath)
-		if readErr != nil {
-			return errResult(fmt.Sprintf("read dir: %v", readErr)), nil
-		}
-		for _, de := range dirEntries {
-			// Skip hidden files/dirs
-			if strings.HasPrefix(de.Name(), ".") {
-				continue
-			}
-			fi, statErr := de.Info()
-			if statErr != nil {
-				continue
-			}
-			e := entry{
-				Name:  de.Name(),
-				Path:  filepath.Join(absPath, de.Name()),
-				IsDir: de.IsDir(),
-			}
-			if !de.IsDir() {
-				e.Size = fi.Size()
-			}
-			entries = append(entries, e)
-		}
+	entries, listErr := listEntries(absPath, globPattern)
+	if listErr != nil {
+		return errResult(listErr.Error()), nil
 	}
 
 	return jsonResult(map[string]any{
@@ -184,6 +131,64 @@ func (s *Server) handleListDirectory(_ context.Context, req *mcp.CallToolRequest
 		"count":     len(entries),
 		"entries":   entries,
 	}), nil
+}
+
+type dirEntry struct {
+	Name  string `json:"name"`
+	Path  string `json:"path"`
+	IsDir bool   `json:"is_dir"`
+	Size  int64  `json:"size,omitempty"`
+}
+
+func listEntries(absPath, globPattern string) ([]dirEntry, error) {
+	if globPattern != "" {
+		return listGlobEntries(absPath, globPattern)
+	}
+	return listDirChildren(absPath)
+}
+
+func listGlobEntries(absPath, globPattern string) ([]dirEntry, error) {
+	matches, globErr := filepath.Glob(filepath.Join(absPath, globPattern))
+	if globErr != nil {
+		return nil, fmt.Errorf("glob: %w", globErr)
+	}
+	entries := make([]dirEntry, 0, len(matches))
+	for _, m := range matches {
+		fi, _ := os.Stat(m)
+		if fi == nil {
+			continue
+		}
+		relPath, _ := filepath.Rel(absPath, m)
+		e := dirEntry{Name: relPath, Path: m, IsDir: fi.IsDir()}
+		if !fi.IsDir() {
+			e.Size = fi.Size()
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
+}
+
+func listDirChildren(absPath string) ([]dirEntry, error) {
+	dirEntries, readErr := os.ReadDir(absPath)
+	if readErr != nil {
+		return nil, fmt.Errorf("read dir: %w", readErr)
+	}
+	entries := make([]dirEntry, 0, len(dirEntries))
+	for _, de := range dirEntries {
+		if strings.HasPrefix(de.Name(), ".") {
+			continue
+		}
+		fi, _ := de.Info()
+		if fi == nil {
+			continue
+		}
+		e := dirEntry{Name: de.Name(), Path: filepath.Join(absPath, de.Name()), IsDir: de.IsDir()}
+		if !de.IsDir() {
+			e.Size = fi.Size()
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
 }
 
 // resolveProjectRoot finds the first indexed project root path.

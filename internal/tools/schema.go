@@ -26,7 +26,7 @@ func (s *Server) handleGetGraphSchema(_ context.Context, _ *mcp.CallToolRequest)
 		Schema  *store.SchemaInfo `json:"schema"`
 	}
 
-	var schemas []projectSchema
+	schemas := make([]projectSchema, 0, len(projects))
 	for _, p := range projects {
 		schema, schemaErr := s.store.GetSchema(p.Name)
 		if schemaErr != nil {
