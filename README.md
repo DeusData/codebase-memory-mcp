@@ -47,17 +47,72 @@ Claude Code formats and explains the results.
 
 ## Installation
 
-### Quick Install via Claude Code
+### Just Want to Get Started?
 
-The fastest way: paste the repo URL directly into Claude Code and ask it to install:
+Grab a pre-built binary from the [latest release](https://github.com/DeusData/codebase-memory-mcp/releases/latest) — no Go, no compiler, no git needed.
+
+| Platform | Binary |
+|----------|--------|
+| macOS (Apple Silicon) | `codebase-memory-mcp-darwin-arm64.tar.gz` |
+| macOS (Intel) | `codebase-memory-mcp-darwin-amd64.tar.gz` |
+| Linux (x86_64) | `codebase-memory-mcp-linux-amd64.tar.gz` |
+| Linux (ARM64 / Graviton) | `codebase-memory-mcp-linux-arm64.tar.gz` |
+| Windows (x86_64) | `codebase-memory-mcp-windows-amd64.zip` |
+
+Every release includes a `checksums.txt` with SHA-256 hashes for verification.
+
+**3 steps:**
+
+1. **Download and extract** the binary for your platform
+2. **Put it somewhere on your PATH** (e.g. `~/.local/bin/` on macOS/Linux, or any folder on Windows)
+3. **Tell Claude Code about it** — add to `.mcp.json` in your project root:
+   ```json
+   {
+     "mcpServers": {
+       "codebase-memory-mcp": {
+         "type": "stdio",
+         "command": "/path/to/codebase-memory-mcp"
+       }
+     }
+   }
+   ```
+
+Restart Claude Code, verify with `/mcp`, then say **"Index this project"** — done.
+
+> **Windows note**: Windows SmartScreen may show "Windows protected your PC" when you first run the binary. This is normal for unsigned open-source software. Click **"More info"** then **"Run anyway"**. You can verify the binary integrity using the `checksums.txt` file included in each release.
+
+### Setup Scripts (Automated)
+
+The setup scripts automate download, placement, and Claude Code configuration.
+
+**macOS / Linux:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/scripts/setup.sh | bash
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/scripts/setup-windows.ps1 | iex
+```
+
+The scripts download the correct binary for your platform, install it, and offer to auto-configure Claude Code's MCP settings.
+
+### Install via Claude Code
+
+Or just paste the repo URL into Claude Code:
 
 ```
 You: "Install this MCP server: https://github.com/DeusData/codebase-memory-mcp"
 ```
 
-Claude Code will clone, build, and configure the MCP server automatically.
+Claude Code will clone, build, and configure it automatically.
 
-### Prerequisites
+### Want to Hack on It? Build from Source
+
+<details>
+<summary>Prerequisites</summary>
 
 | Requirement | Version | Check | Install |
 |-------------|---------|-------|---------|
@@ -65,71 +120,77 @@ Claude Code will clone, build, and configure the MCP server automatically.
 | **C compiler** | gcc or clang | `gcc --version` or `clang --version` | See below |
 | **Git** | any | `git --version` | Pre-installed on most systems |
 
-**C compiler** is needed because tree-sitter uses CGO (C bindings for AST parsing):
+A **C compiler** is needed because tree-sitter uses CGO (C bindings for AST parsing):
 
-- **macOS**: Install Xcode command line tools — `xcode-select --install`. This provides `clang` and is likely already installed.
+- **macOS**: `xcode-select --install` (provides `clang`)
 - **Linux (Debian/Ubuntu)**: `sudo apt install build-essential`
 - **Linux (Fedora/RHEL)**: `sudo dnf install gcc`
-- **Windows**: Not currently supported (CGO cross-compilation is complex). Use WSL2 with the Linux instructions above.
+- **Windows**: Install [MSYS2](https://www.msys2.org/), then: `pacman -S mingw-w64-ucrt-x86_64-gcc`. Build from an MSYS2 UCRT64 shell.
 
-### Build from Source
+</details>
+
+**Via setup script:**
 
 ```bash
-# Clone the repository
-git clone https://github.com/DeusData/codebase-memory-mcp.git
-cd codebase-memory-mcp
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/scripts/setup.sh | bash -s -- --from-source
 
-# Build the binary (CGO_ENABLED=1 is the default, but be explicit)
-CGO_ENABLED=1 go build -o codebase-memory-mcp ./cmd/codebase-memory-mcp/
-
-# Option A: Move to a directory on your PATH
-sudo mv codebase-memory-mcp /usr/local/bin/
-
-# Option B: Or keep it in place and use the absolute path in MCP config
+# Windows (PowerShell) — builds inside WSL
+irm https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/scripts/setup-windows.ps1 -OutFile setup.ps1; .\setup.ps1 -FromSource
 ```
 
-### Verify
+**Or manually:**
 
 ```bash
-# Should print nothing and wait for stdio input (Ctrl+C to exit)
-codebase-memory-mcp
+git clone https://github.com/DeusData/codebase-memory-mcp.git
+cd codebase-memory-mcp
+CGO_ENABLED=1 go build -o codebase-memory-mcp ./cmd/codebase-memory-mcp/
+# Move the binary to somewhere on your PATH
+```
+
+On **Windows with MSYS2** (from a UCRT64 shell):
+
+```bash
+CGO_ENABLED=1 CC=gcc go build -o codebase-memory-mcp.exe ./cmd/codebase-memory-mcp/
+```
+
+On **Windows with WSL** (credit: [@Flipper1994](https://github.com/Flipper1994)):
+
+```bash
+# Inside WSL (Ubuntu)
+sudo apt update && sudo apt install build-essential
+# Install Go 1.23+ from https://go.dev/dl/
+git clone https://github.com/DeusData/codebase-memory-mcp.git
+cd codebase-memory-mcp
+CGO_ENABLED=1 go build -buildvcs=false -o ~/.local/bin/codebase-memory-mcp ./cmd/codebase-memory-mcp/
+```
+
+When using a WSL-built binary, configure Claude Code to invoke it via `wsl.exe`:
+
+```json
+{
+  "mcpServers": {
+    "codebase-memory-mcp": {
+      "type": "stdio",
+      "command": "wsl.exe",
+      "args": ["-d", "Ubuntu", "--", "/home/YOUR_USER/.local/bin/codebase-memory-mcp"]
+    }
+  }
+}
 ```
 
 ### Configure Claude Code
 
-Add the MCP server to your project's `.mcp.json` (per-project) or `~/.claude/settings.json` (global):
-
-**Per-project** (`.mcp.json` in project root — recommended):
+Add the MCP server to your project's `.mcp.json` (per-project, recommended) or `~/.claude/settings.json` (global):
 
 ```json
 {
   "mcpServers": {
     "codebase-memory-mcp": {
       "type": "stdio",
-      "command": "/usr/local/bin/codebase-memory-mcp"
+      "command": "/path/to/codebase-memory-mcp"
     }
   }
-}
-```
-
-**Global** (`~/.claude/settings.json`):
-
-```json
-{
-  "mcpServers": {
-    "codebase-memory-mcp": {
-      "type": "stdio",
-      "command": "/usr/local/bin/codebase-memory-mcp"
-    }
-  }
-}
-```
-
-If you kept the binary in the cloned directory, use the full path instead:
-
-```json
-{
-  "command": "/path/to/codebase-memory-mcp/codebase-memory-mcp"
 }
 ```
 
