@@ -251,29 +251,55 @@ func TestSearch(t *testing.T) {
 	s.UpsertNode(&Node{Project: "test", Label: "Class", Name: "OrderService", QualifiedName: "test.service.OrderService", FilePath: "service.go"})
 
 	// Search by label
-	results, err := s.Search(SearchParams{Project: "test", Label: "Function"})
+	output, err := s.Search(SearchParams{Project: "test", Label: "Function"})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
-	if len(results) != 2 {
-		t.Errorf("expected 2 functions, got %d", len(results))
+	if len(output.Results) != 2 {
+		t.Errorf("expected 2 functions, got %d", len(output.Results))
+	}
+	if output.Total != 2 {
+		t.Errorf("expected total=2, got %d", output.Total)
 	}
 
 	// Search by name pattern
-	results, err = s.Search(SearchParams{Project: "test", NamePattern: ".*Submit.*"})
+	output, err = s.Search(SearchParams{Project: "test", NamePattern: ".*Submit.*"})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
-	if len(results) != 1 {
-		t.Errorf("expected 1 match, got %d", len(results))
+	if len(output.Results) != 1 {
+		t.Errorf("expected 1 match, got %d", len(output.Results))
 	}
 
 	// Search by file pattern
-	results, err = s.Search(SearchParams{Project: "test", FilePattern: "service*"})
+	output, err = s.Search(SearchParams{Project: "test", FilePattern: "service*"})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
-	if len(results) != 2 {
-		t.Errorf("expected 2 nodes in service.go, got %d", len(results))
+	if len(output.Results) != 2 {
+		t.Errorf("expected 2 nodes in service.go, got %d", len(output.Results))
+	}
+
+	// Search with offset/limit pagination
+	output, err = s.Search(SearchParams{Project: "test", Limit: 1})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(output.Results) != 1 {
+		t.Errorf("expected 1 result with limit=1, got %d", len(output.Results))
+	}
+	if output.Total != 3 {
+		t.Errorf("expected total=3, got %d", output.Total)
+	}
+
+	output, err = s.Search(SearchParams{Project: "test", Limit: 1, Offset: 1})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(output.Results) != 1 {
+		t.Errorf("expected 1 result with limit=1 offset=1, got %d", len(output.Results))
+	}
+	if output.Total != 3 {
+		t.Errorf("expected total=3, got %d", output.Total)
 	}
 }

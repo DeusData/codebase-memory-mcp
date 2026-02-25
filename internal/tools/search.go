@@ -22,7 +22,8 @@ func (s *Server) handleSearchGraph(_ context.Context, req *mcp.CallToolRequest) 
 		Direction:          getStringArg(args, "direction"),
 		MinDegree:          getIntArg(args, "min_degree", -1),
 		MaxDegree:          getIntArg(args, "max_degree", -1),
-		Limit:              getIntArg(args, "limit", 0), // 0 = no limit
+		Limit:              getIntArg(args, "limit", 100),
+		Offset:             getIntArg(args, "offset", 0),
 		ExcludeEntryPoints: getBoolArg(args, "exclude_entry_points"),
 	}
 
@@ -55,16 +56,18 @@ func (s *Server) handleSearchGraph(_ context.Context, req *mcp.CallToolRequest) 
 	}
 
 	var allResults []resultEntry
+	totalAcrossProjects := 0
 	for _, p := range projects {
 		if projectFilter != "" && p.Name != projectFilter {
 			continue
 		}
 		params.Project = p.Name
-		results, searchErr := s.store.Search(params)
+		output, searchErr := s.store.Search(params)
 		if searchErr != nil {
 			continue
 		}
-		for _, r := range results {
+		totalAcrossProjects += output.Total
+		for _, r := range output.Results {
 			entry := resultEntry{
 				Project:        p.Name,
 				Name:           r.Node.Name,
@@ -82,7 +85,10 @@ func (s *Server) handleSearchGraph(_ context.Context, req *mcp.CallToolRequest) 
 	}
 
 	return jsonResult(map[string]any{
-		"total":   len(allResults),
-		"results": allResults,
+		"total":    totalAcrossProjects,
+		"limit":    params.Limit,
+		"offset":   params.Offset,
+		"has_more": params.Offset+params.Limit < totalAcrossProjects,
+		"results":  allResults,
 	}), nil
 }
