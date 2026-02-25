@@ -34,12 +34,12 @@ func (p *Parser) advance() Token {
 	return t
 }
 
-func (p *Parser) expect(typ TokenType) (Token, error) {
+func (p *Parser) expect(typ TokenType) error {
 	t := p.advance()
 	if t.Type != typ {
-		return t, fmt.Errorf("expected token %d, got %d (%q) at pos %d", typ, t.Type, t.Value, t.Pos)
+		return fmt.Errorf("expected token %d, got %d (%q) at pos %d", typ, t.Type, t.Value, t.Pos)
 	}
-	return t, nil
+	return nil
 }
 
 func (p *Parser) parseQuery() (*Query, error) {
@@ -77,7 +77,7 @@ func (p *Parser) parseQuery() (*Query, error) {
 }
 
 func (p *Parser) parseMatch() (*MatchClause, error) {
-	if _, err := p.expect(TokMatch); err != nil {
+	if err := p.expect(TokMatch); err != nil {
 		return nil, err
 	}
 	pat, err := p.parsePattern()
@@ -132,7 +132,7 @@ func (p *Parser) parseRelAndNode() (*RelPattern, *NodePattern, error) {
 	}
 
 	// Expect dash
-	if _, err := p.expect(TokDash); err != nil {
+	if err := p.expect(TokDash); err != nil {
 		return nil, nil, fmt.Errorf("expected '-' in relationship: %w", err)
 	}
 
@@ -144,7 +144,7 @@ func (p *Parser) parseRelAndNode() (*RelPattern, *NodePattern, error) {
 	}
 
 	// Expect dash
-	if _, err := p.expect(TokDash); err != nil {
+	if err := p.expect(TokDash); err != nil {
 		return nil, nil, fmt.Errorf("expected '-' after relationship: %w", err)
 	}
 
@@ -201,7 +201,7 @@ func (p *Parser) parseRelBracket(rel *RelPattern) error {
 	}
 
 	// Expect ]
-	if _, err := p.expect(TokRBracket); err != nil {
+	if err := p.expect(TokRBracket); err != nil {
 		return fmt.Errorf("expected ']' to close relationship: %w", err)
 	}
 
@@ -236,7 +236,8 @@ func (p *Parser) parseHopRange(rel *RelPattern) error {
 	//   *3      min=1, max=3 (shorthand)
 	//   (empty) min=1, max=0 (unbounded)
 
-	if p.peek().Type == TokNumber {
+	switch p.peek().Type {
+	case TokNumber:
 		n, _ := strconv.Atoi(p.advance().Value)
 		if p.peek().Type == TokDotDot {
 			// *N..M or *N..
@@ -253,7 +254,7 @@ func (p *Parser) parseHopRange(rel *RelPattern) error {
 			rel.MinHops = 1
 			rel.MaxHops = n
 		}
-	} else if p.peek().Type == TokDotDot {
+	case TokDotDot:
 		// *..M
 		p.advance() // consume ..
 		rel.MinHops = 1
@@ -263,7 +264,7 @@ func (p *Parser) parseHopRange(rel *RelPattern) error {
 		} else {
 			rel.MaxHops = 0
 		}
-	} else {
+	default:
 		// Just * with no range: unbounded
 		rel.MinHops = 1
 		rel.MaxHops = 0
@@ -273,7 +274,7 @@ func (p *Parser) parseHopRange(rel *RelPattern) error {
 }
 
 func (p *Parser) parseNodePattern() (*NodePattern, error) {
-	if _, err := p.expect(TokLParen); err != nil {
+	if err := p.expect(TokLParen); err != nil {
 		return nil, fmt.Errorf("expected '(' for node pattern: %w", err)
 	}
 
@@ -303,7 +304,7 @@ func (p *Parser) parseNodePattern() (*NodePattern, error) {
 		node.Props = props
 	}
 
-	if _, err := p.expect(TokRParen); err != nil {
+	if err := p.expect(TokRParen); err != nil {
 		return nil, fmt.Errorf("expected ')' to close node pattern: %w", err)
 	}
 
@@ -316,7 +317,7 @@ func (p *Parser) parseInlineProps() (map[string]string, error) {
 
 	for p.peek().Type != TokRBrace {
 		if len(props) > 0 {
-			if _, err := p.expect(TokComma); err != nil {
+			if err := p.expect(TokComma); err != nil {
 				return nil, fmt.Errorf("expected ',' between properties: %w", err)
 			}
 		}
@@ -328,7 +329,7 @@ func (p *Parser) parseInlineProps() (map[string]string, error) {
 		}
 
 		// :
-		if _, err := p.expect(TokColon); err != nil {
+		if err := p.expect(TokColon); err != nil {
 			return nil, fmt.Errorf("expected ':' after property key: %w", err)
 		}
 
@@ -380,7 +381,7 @@ func (p *Parser) parseCondition() (Condition, error) {
 	}
 	c.Variable = varTok.Value
 
-	if _, err := p.expect(TokDot); err != nil {
+	if err := p.expect(TokDot); err != nil {
 		return c, fmt.Errorf("expected '.' after variable in condition: %w", err)
 	}
 
@@ -469,7 +470,7 @@ func (p *Parser) parseReturn() (*ReturnClause, error) {
 	// Optional ORDER BY
 	if p.peek().Type == TokOrder {
 		p.advance() // consume ORDER
-		if _, err := p.expect(TokBy); err != nil {
+		if err := p.expect(TokBy); err != nil {
 			return nil, fmt.Errorf("expected BY after ORDER: %w", err)
 		}
 		orderTok := p.advance()
@@ -513,35 +514,53 @@ func (p *Parser) parseReturnItem() (ReturnItem, error) {
 
 	// Check for COUNT(variable)
 	if p.peek().Type == TokCount {
-		p.advance() // consume COUNT
-		item.Func = "COUNT"
-		if _, err := p.expect(TokLParen); err != nil {
-			return item, fmt.Errorf("expected '(' after COUNT: %w", err)
-		}
-		varTok := p.advance()
-		if varTok.Type != TokIdent {
-			return item, fmt.Errorf("expected variable in COUNT(), got %q", varTok.Value)
-		}
-		item.Variable = varTok.Value
-		if _, err := p.expect(TokRParen); err != nil {
-			return item, fmt.Errorf("expected ')' after COUNT variable: %w", err)
-		}
-	} else {
-		// variable or variable.property
-		varTok := p.advance()
-		if varTok.Type != TokIdent {
-			return item, fmt.Errorf("expected variable in RETURN item, got %q at pos %d", varTok.Value, varTok.Pos)
-		}
-		item.Variable = varTok.Value
+		return p.parseCountItem()
+	}
 
-		if p.peek().Type == TokDot {
-			p.advance() // consume .
-			propTok := p.advance()
-			if propTok.Type != TokIdent {
-				return item, fmt.Errorf("expected property after '.', got %q", propTok.Value)
-			}
-			item.Property = propTok.Value
+	// variable or variable.property
+	varTok := p.advance()
+	if varTok.Type != TokIdent {
+		return item, fmt.Errorf("expected variable in RETURN item, got %q at pos %d", varTok.Value, varTok.Pos)
+	}
+	item.Variable = varTok.Value
+
+	if p.peek().Type == TokDot {
+		p.advance() // consume .
+		propTok := p.advance()
+		if propTok.Type != TokIdent {
+			return item, fmt.Errorf("expected property after '.', got %q", propTok.Value)
 		}
+		item.Property = propTok.Value
+	}
+
+	// Optional AS alias
+	if p.peek().Type == TokAs {
+		p.advance() // consume AS
+		aliasTok := p.advance()
+		if aliasTok.Type != TokIdent {
+			return item, fmt.Errorf("expected alias after AS, got %q", aliasTok.Value)
+		}
+		item.Alias = aliasTok.Value
+	}
+
+	return item, nil
+}
+
+// parseCountItem parses a COUNT(variable) [AS alias] expression.
+func (p *Parser) parseCountItem() (ReturnItem, error) {
+	item := ReturnItem{}
+	p.advance() // consume COUNT
+	item.Func = "COUNT"
+	if err := p.expect(TokLParen); err != nil {
+		return item, fmt.Errorf("expected '(' after COUNT: %w", err)
+	}
+	varTok := p.advance()
+	if varTok.Type != TokIdent {
+		return item, fmt.Errorf("expected variable in COUNT(), got %q", varTok.Value)
+	}
+	item.Variable = varTok.Value
+	if err := p.expect(TokRParen); err != nil {
+		return item, fmt.Errorf("expected ')' after COUNT variable: %w", err)
 	}
 
 	// Optional AS alias

@@ -2,7 +2,6 @@ package pipeline
 
 import (
 	"testing"
-	"unsafe"
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 	tree_sitter_go "github.com/tree-sitter/tree-sitter-go/bindings/go"
@@ -13,35 +12,35 @@ import (
 	tree_sitter_rust "github.com/tree-sitter/tree-sitter-rust/bindings/go"
 	tree_sitter_scala "github.com/tree-sitter/tree-sitter-scala/bindings/go"
 
-	tree_sitter_cpp "github.com/tree-sitter/tree-sitter-cpp/bindings/go"
 	tree_sitter_lua "github.com/tree-sitter-grammars/tree-sitter-lua/bindings/go"
+	tree_sitter_cpp "github.com/tree-sitter/tree-sitter-cpp/bindings/go"
 
 	"github.com/DeusData/codebase-memory-mcp/internal/lang"
 )
 
-func parseSource(t *testing.T, language lang.Language, code string) (*tree_sitter.Tree, []byte) {
+func parseSource(t *testing.T, language lang.Language, code string) (tree *tree_sitter.Tree, source []byte) {
 	t.Helper()
 
 	var tsLang *tree_sitter.Language
 	switch language {
 	case lang.Python:
-		tsLang = tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_python.Language()))
+		tsLang = tree_sitter.NewLanguage(tree_sitter_python.Language())
 	case lang.Go:
-		tsLang = tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_go.Language()))
+		tsLang = tree_sitter.NewLanguage(tree_sitter_go.Language())
 	case lang.JavaScript:
-		tsLang = tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_javascript.Language()))
+		tsLang = tree_sitter.NewLanguage(tree_sitter_javascript.Language())
 	case lang.Rust:
-		tsLang = tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_rust.Language()))
+		tsLang = tree_sitter.NewLanguage(tree_sitter_rust.Language())
 	case lang.Java:
-		tsLang = tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_java.Language()))
+		tsLang = tree_sitter.NewLanguage(tree_sitter_java.Language())
 	case lang.PHP:
-		tsLang = tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_php.LanguagePHPOnly()))
+		tsLang = tree_sitter.NewLanguage(tree_sitter_php.LanguagePHPOnly())
 	case lang.Scala:
-		tsLang = tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_scala.Language()))
+		tsLang = tree_sitter.NewLanguage(tree_sitter_scala.Language())
 	case lang.CPP:
-		tsLang = tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_cpp.Language()))
+		tsLang = tree_sitter.NewLanguage(tree_sitter_cpp.Language())
 	case lang.Lua:
-		tsLang = tree_sitter.NewLanguage(unsafe.Pointer(tree_sitter_lua.Language()))
+		tsLang = tree_sitter.NewLanguage(tree_sitter_lua.Language())
 	default:
 		t.Fatalf("unsupported language: %s", language)
 	}
@@ -51,8 +50,8 @@ func parseSource(t *testing.T, language lang.Language, code string) (*tree_sitte
 	if err := p.SetLanguage(tsLang); err != nil {
 		t.Fatal(err)
 	}
-	source := []byte(code)
-	tree := p.Parse(source, nil)
+	source = []byte(code)
+	tree = p.Parse(source, nil)
 	return tree, source
 }
 
@@ -139,10 +138,9 @@ let concat = String::from(BASE_URL) + "/api/orders";
 
 	assertSymbol(t, symbols, "BASE_URL", "https://example.com")
 	assertSymbol(t, symbols, "url", "https://example.com/api/orders")
-	// concat: String::from(BASE_URL) is a call_expression with "String::from", not "fmt.Sprintf"
-	// The resolver sees binary_expression: call_expression + string_literal
-	// call_expression resolves to "" (not fmt.Sprintf), so concat = "" + "/api/orders"
-	assertSymbol(t, symbols, "concat", "/api/orders")
+	// concat: String::from(BASE_URL) — extractURLArgFallback resolves BASE_URL from symbols,
+	// so the full binary_expression resolves to "https://example.com" + "/api/orders"
+	assertSymbol(t, symbols, "concat", "https://example.com/api/orders")
 }
 
 func TestResolveJavaConcat(t *testing.T) {
@@ -251,6 +249,65 @@ local formatted = string.format("%s/api/items", base_url)
 	assertSymbol(t, symbols, "base_url", "https://example.com")
 	assertSymbol(t, symbols, "url", "https://example.com/api/orders")
 	assertSymbol(t, symbols, "formatted", "https://example.com/api/items")
+}
+
+func TestResolveEnvVarDefault(t *testing.T) {
+	// Python: os.environ.get("KEY", "https://example.com/api/orders")
+	code := `ORDER_URL = os.environ.get("ORDER_SERVICE_URL", "https://example.com/api/orders")
+`
+	tree, source := parseSource(t, lang.Python, code)
+	defer tree.Close()
+
+	symbols := resolveModuleStrings(tree.RootNode(), source, lang.Python)
+	assertSymbol(t, symbols, "ORDER_URL", "https://example.com/api/orders")
+}
+
+func TestResolveGoGetenvDefault(t *testing.T) {
+	// Go: getEnv("KEY", "https://example.com/api/orders") — custom wrapper
+	code := `package main
+var orderURL = getEnv("ORDER_URL", "https://example.com/api/orders")
+`
+	tree, source := parseSource(t, lang.Go, code)
+	defer tree.Close()
+
+	symbols := resolveModuleStrings(tree.RootNode(), source, lang.Go)
+	assertSymbol(t, symbols, "orderURL", "https://example.com/api/orders")
+}
+
+func TestResolveJSNullishCoalescing(t *testing.T) {
+	// JS: process.env.KEY ?? "https://fallback"
+	code := `const apiUrl = process.env.API_URL ?? "https://example.com/api";
+`
+	tree, source := parseSource(t, lang.JavaScript, code)
+	defer tree.Close()
+
+	symbols := resolveModuleStrings(tree.RootNode(), source, lang.JavaScript)
+	assertSymbol(t, symbols, "apiUrl", "https://example.com/api")
+}
+
+func TestResolveJSLogicalOrDefault(t *testing.T) {
+	// JS: process.env.KEY || "https://fallback"
+	code := `const apiUrl = process.env.API_URL || "https://example.com/api";
+`
+	tree, source := parseSource(t, lang.JavaScript, code)
+	defer tree.Close()
+
+	symbols := resolveModuleStrings(tree.RootNode(), source, lang.JavaScript)
+	assertSymbol(t, symbols, "apiUrl", "https://example.com/api")
+}
+
+func TestResolveUnknownCallNoURL(t *testing.T) {
+	// Unknown function with non-URL arguments should resolve to empty
+	code := `package main
+var x = someFunc("key", "value")
+`
+	tree, source := parseSource(t, lang.Go, code)
+	defer tree.Close()
+
+	symbols := resolveModuleStrings(tree.RootNode(), source, lang.Go)
+	if _, ok := symbols["x"]; ok {
+		t.Error("x should not be in symbols (no URL-like args)")
+	}
 }
 
 func assertSymbol(t *testing.T, symbols map[string]string, name, want string) {

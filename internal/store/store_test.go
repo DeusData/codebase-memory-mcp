@@ -7,7 +7,7 @@ func TestOpenMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenMemory: %v", err)
 	}
-	defer s.Close()
+	s.Close()
 }
 
 func TestNodeCRUD(t *testing.T) {
@@ -90,8 +90,12 @@ func TestNodeDedup(t *testing.T) {
 	n1 := &Node{Project: "test", Label: "Function", Name: "Foo", QualifiedName: "test.main.Foo"}
 	n2 := &Node{Project: "test", Label: "Function", Name: "Foo", QualifiedName: "test.main.Foo", Properties: map[string]any{"updated": true}}
 
-	s.UpsertNode(n1)
-	s.UpsertNode(n2)
+	if _, err := s.UpsertNode(n1); err != nil {
+		t.Fatalf("UpsertNode n1: %v", err)
+	}
+	if _, err := s.UpsertNode(n2); err != nil {
+		t.Fatalf("UpsertNode n2: %v", err)
+	}
 
 	count, _ := s.CountNodes("test")
 	if count != 1 {
@@ -153,10 +157,14 @@ func TestCascadeDelete(t *testing.T) {
 	defer s.Close()
 
 	// Create project with nodes and edges
-	s.UpsertProject("test", "/tmp/test")
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
 	id1, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "A", QualifiedName: "test.A"})
 	id2, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "B", QualifiedName: "test.B"})
-	s.InsertEdge(&Edge{Project: "test", SourceID: id1, TargetID: id2, Type: "CALLS"})
+	if _, err := s.InsertEdge(&Edge{Project: "test", SourceID: id1, TargetID: id2, Type: "CALLS"}); err != nil {
+		t.Fatalf("InsertEdge: %v", err)
+	}
 
 	// Delete project — should cascade
 	if err := s.DeleteProject("test"); err != nil {
@@ -214,7 +222,9 @@ func TestFileHashes(t *testing.T) {
 	}
 	defer s.Close()
 
-	s.UpsertProject("test", "/tmp/test")
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
 
 	// Upsert
 	if err := s.UpsertFileHash("test", "main.go", "abc123"); err != nil {
@@ -231,7 +241,9 @@ func TestFileHashes(t *testing.T) {
 	}
 
 	// Update
-	s.UpsertFileHash("test", "main.go", "def456")
+	if err := s.UpsertFileHash("test", "main.go", "def456"); err != nil {
+		t.Fatalf("UpsertFileHash update: %v", err)
+	}
 	hashes, _ = s.GetFileHashes("test")
 	if hashes["main.go"] != "def456" {
 		t.Errorf("expected def456, got %s", hashes["main.go"])
@@ -245,13 +257,21 @@ func TestSearch(t *testing.T) {
 	}
 	defer s.Close()
 
-	s.UpsertProject("test", "/tmp/test")
-	s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "SubmitOrder", QualifiedName: "test.main.SubmitOrder", FilePath: "main.go"})
-	s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "ProcessOrder", QualifiedName: "test.service.ProcessOrder", FilePath: "service.go"})
-	s.UpsertNode(&Node{Project: "test", Label: "Class", Name: "OrderService", QualifiedName: "test.service.OrderService", FilePath: "service.go"})
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+	if _, err := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "SubmitOrder", QualifiedName: "test.main.SubmitOrder", FilePath: "main.go"}); err != nil {
+		t.Fatalf("UpsertNode SubmitOrder: %v", err)
+	}
+	if _, err := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "ProcessOrder", QualifiedName: "test.service.ProcessOrder", FilePath: "service.go"}); err != nil {
+		t.Fatalf("UpsertNode ProcessOrder: %v", err)
+	}
+	if _, err := s.UpsertNode(&Node{Project: "test", Label: "Class", Name: "OrderService", QualifiedName: "test.service.OrderService", FilePath: "service.go"}); err != nil {
+		t.Fatalf("UpsertNode OrderService: %v", err)
+	}
 
 	// Search by label
-	output, err := s.Search(SearchParams{Project: "test", Label: "Function"})
+	output, err := s.Search(&SearchParams{Project: "test", Label: "Function"})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
@@ -263,7 +283,7 @@ func TestSearch(t *testing.T) {
 	}
 
 	// Search by name pattern
-	output, err = s.Search(SearchParams{Project: "test", NamePattern: ".*Submit.*"})
+	output, err = s.Search(&SearchParams{Project: "test", NamePattern: ".*Submit.*"})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
@@ -272,7 +292,7 @@ func TestSearch(t *testing.T) {
 	}
 
 	// Search by file pattern
-	output, err = s.Search(SearchParams{Project: "test", FilePattern: "service*"})
+	output, err = s.Search(&SearchParams{Project: "test", FilePattern: "service*"})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
@@ -281,7 +301,7 @@ func TestSearch(t *testing.T) {
 	}
 
 	// Search with offset/limit pagination
-	output, err = s.Search(SearchParams{Project: "test", Limit: 1})
+	output, err = s.Search(&SearchParams{Project: "test", Limit: 1})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
@@ -292,7 +312,7 @@ func TestSearch(t *testing.T) {
 		t.Errorf("expected total=3, got %d", output.Total)
 	}
 
-	output, err = s.Search(SearchParams{Project: "test", Limit: 1, Offset: 1})
+	output, err = s.Search(&SearchParams{Project: "test", Limit: 1, Offset: 1})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}

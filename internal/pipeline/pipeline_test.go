@@ -8,13 +8,13 @@ import (
 	"github.com/DeusData/codebase-memory-mcp/internal/store"
 )
 
-func setupTestRepo(t *testing.T) (string, func()) {
+func setupTestRepo(t *testing.T) (dir string, cleanup func()) {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "cgm-test-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	cleanup := func() { os.RemoveAll(dir) }
+	cleanup = func() { os.RemoveAll(dir) }
 
 	// Create a simple Go project
 	writeFile(t, filepath.Join(dir, "main.go"), `package main
@@ -44,12 +44,12 @@ func SubmitOrder(order interface{}) error {
 	return dir, cleanup
 }
 
-func writeFile(t *testing.T, path string, content string) {
+func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }

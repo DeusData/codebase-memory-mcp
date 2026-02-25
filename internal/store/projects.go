@@ -11,7 +11,7 @@ type Project struct {
 
 // UpsertProject creates or updates a project record.
 func (s *Store) UpsertProject(name, rootPath string) error {
-	_, err := s.db.Exec(`
+	_, err := s.q.Exec(`
 		INSERT INTO projects (name, indexed_at, root_path) VALUES (?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET indexed_at=excluded.indexed_at, root_path=excluded.root_path`,
 		name, Now(), rootPath)
@@ -21,7 +21,7 @@ func (s *Store) UpsertProject(name, rootPath string) error {
 // GetProject returns a project by name.
 func (s *Store) GetProject(name string) (*Project, error) {
 	var p Project
-	err := s.db.QueryRow("SELECT name, indexed_at, root_path FROM projects WHERE name=?", name).
+	err := s.q.QueryRow("SELECT name, indexed_at, root_path FROM projects WHERE name=?", name).
 		Scan(&p.Name, &p.IndexedAt, &p.RootPath)
 	if err != nil {
 		return nil, err
@@ -31,7 +31,7 @@ func (s *Store) GetProject(name string) (*Project, error) {
 
 // ListProjects returns all indexed projects.
 func (s *Store) ListProjects() ([]*Project, error) {
-	rows, err := s.db.Query("SELECT name, indexed_at, root_path FROM projects ORDER BY name")
+	rows, err := s.q.Query("SELECT name, indexed_at, root_path FROM projects ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +49,7 @@ func (s *Store) ListProjects() ([]*Project, error) {
 
 // DeleteProject deletes a project and all associated data (CASCADE).
 func (s *Store) DeleteProject(name string) error {
-	_, err := s.db.Exec("DELETE FROM projects WHERE name=?", name)
+	_, err := s.q.Exec("DELETE FROM projects WHERE name=?", name)
 	return err
 }
 
@@ -62,7 +62,7 @@ type FileHash struct {
 
 // UpsertFileHash stores a file's content hash.
 func (s *Store) UpsertFileHash(project, relPath, sha256 string) error {
-	_, err := s.db.Exec(`
+	_, err := s.q.Exec(`
 		INSERT INTO file_hashes (project, rel_path, sha256) VALUES (?, ?, ?)
 		ON CONFLICT(project, rel_path) DO UPDATE SET sha256=excluded.sha256`,
 		project, relPath, sha256)
@@ -71,7 +71,7 @@ func (s *Store) UpsertFileHash(project, relPath, sha256 string) error {
 
 // GetFileHashes returns all file hashes for a project.
 func (s *Store) GetFileHashes(project string) (map[string]string, error) {
-	rows, err := s.db.Query("SELECT rel_path, sha256 FROM file_hashes WHERE project=?", project)
+	rows, err := s.q.Query("SELECT rel_path, sha256 FROM file_hashes WHERE project=?", project)
 	if err != nil {
 		return nil, fmt.Errorf("get file hashes: %w", err)
 	}
@@ -87,14 +87,32 @@ func (s *Store) GetFileHashes(project string) (map[string]string, error) {
 	return result, rows.Err()
 }
 
+// ListFilesForProject returns all distinct file paths indexed for a project.
+func (s *Store) ListFilesForProject(project string) ([]string, error) {
+	rows, err := s.q.Query("SELECT DISTINCT file_path FROM nodes WHERE project=? AND file_path != ''", project)
+	if err != nil {
+		return nil, fmt.Errorf("list files: %w", err)
+	}
+	defer rows.Close()
+	var result []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, err
+		}
+		result = append(result, path)
+	}
+	return result, rows.Err()
+}
+
 // DeleteFileHash deletes a single file hash entry.
 func (s *Store) DeleteFileHash(project, relPath string) error {
-	_, err := s.db.Exec("DELETE FROM file_hashes WHERE project=? AND rel_path=?", project, relPath)
+	_, err := s.q.Exec("DELETE FROM file_hashes WHERE project=? AND rel_path=?", project, relPath)
 	return err
 }
 
 // DeleteFileHashes deletes all file hashes for a project.
 func (s *Store) DeleteFileHashes(project string) error {
-	_, err := s.db.Exec("DELETE FROM file_hashes WHERE project=?", project)
+	_, err := s.q.Exec("DELETE FROM file_hashes WHERE project=?", project)
 	return err
 }

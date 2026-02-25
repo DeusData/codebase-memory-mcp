@@ -14,7 +14,7 @@ func (s *Server) handleSearchGraph(_ context.Context, req *mcp.CallToolRequest) 
 		return errResult(err.Error()), nil
 	}
 
-	params := store.SearchParams{
+	params := &store.SearchParams{
 		Label:              getStringArg(args, "label"),
 		NamePattern:        getStringArg(args, "name_pattern"),
 		FilePattern:        getStringArg(args, "file_pattern"),
@@ -22,9 +22,10 @@ func (s *Server) handleSearchGraph(_ context.Context, req *mcp.CallToolRequest) 
 		Direction:          getStringArg(args, "direction"),
 		MinDegree:          getIntArg(args, "min_degree", -1),
 		MaxDegree:          getIntArg(args, "max_degree", -1),
-		Limit:              getIntArg(args, "limit", 100),
+		Limit:              getIntArg(args, "limit", 10),
 		Offset:             getIntArg(args, "offset", 0),
 		ExcludeEntryPoints: getBoolArg(args, "exclude_entry_points"),
+		IncludeConnected:   getBoolArg(args, "include_connected"),
 	}
 
 	projectFilter := getStringArg(args, "project")

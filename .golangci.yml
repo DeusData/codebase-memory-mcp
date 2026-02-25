@@ -1,0 +1,58 @@
+run:
+  timeout: 5m
+  go: "1.23"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - bodyclose
+    - nilerr
+    - sqlclosecheck
+    - rowserrcheck
+    - durationcheck
+    - makezero
+    - noctx
+    - gofmt
+    - goimports
+    - misspell
+    - unconvert
+    - unparam
+    - unused
+    - ineffassign
+    - gosimple
+    - prealloc
+    - cyclop
+    - funlen
+    - gocognit
+    - gocritic
+    - nestif
+    - gosec
+
+linters-settings:
+  cyclop:
+    max-complexity: 25
+  funlen:
+    lines: 120
+    statements: 80
+  gocognit:
+    min-complexity: 30
+  nestif:
+    min-complexity: 6
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+      - performance
+  gosec:
+    excludes:
+      - G404
+  errcheck:
+    check-type-assertions: true
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-dirs:
+    - vendor

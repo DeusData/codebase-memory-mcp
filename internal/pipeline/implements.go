@@ -7,32 +7,43 @@ import (
 	"github.com/DeusData/codebase-memory-mcp/internal/store"
 )
 
+// ifaceInfo holds an interface node and its required method names.
+type ifaceInfo struct {
+	node    *store.Node
+	methods []string
+}
+
 // passImplements detects Go interface satisfaction and creates IMPLEMENTS edges.
 // A struct implements an interface if it has methods matching all interface methods.
-func (p *Pipeline) passImplements() error {
+func (p *Pipeline) passImplements() {
 	slog.Info("pass5.implements")
 
-	interfaces, err := p.Store.FindNodesByLabel(p.ProjectName, "Interface")
-	if err != nil || len(interfaces) == 0 {
+	ifaces := p.collectGoInterfaces()
+	if len(ifaces) == 0 {
+		return
+	}
+
+	structMethods, structQNPrefix := p.collectStructMethods()
+	linkCount := p.matchImplements(ifaces, structMethods, structQNPrefix)
+
+	slog.Info("pass5.implements.done", "links", linkCount)
+}
+
+// collectGoInterfaces returns Go interfaces with their method names.
+func (p *Pipeline) collectGoInterfaces() []ifaceInfo {
+	interfaces, findErr := p.Store.FindNodesByLabel(p.ProjectName, "Interface")
+	if findErr != nil || len(interfaces) == 0 {
 		return nil
 	}
 
-	// Build interface -> method names map
-	type ifaceInfo struct {
-		node    *store.Node
-		methods []string
-	}
 	var ifaces []ifaceInfo
-
 	for _, iface := range interfaces {
-		// Only process Go interfaces (check file extension)
 		if !strings.HasSuffix(iface.FilePath, ".go") {
 			continue
 		}
 
-		// Find methods defined by this interface via DEFINES_METHOD edges
-		edges, err := p.Store.FindEdgesBySourceAndType(iface.ID, "DEFINES_METHOD")
-		if err != nil || len(edges) == 0 {
+		edges, edgeErr := p.Store.FindEdgesBySourceAndType(iface.ID, "DEFINES_METHOD")
+		if edgeErr != nil || len(edges) == 0 {
 			continue
 		}
 
@@ -48,25 +59,21 @@ func (p *Pipeline) passImplements() error {
 			ifaces = append(ifaces, ifaceInfo{node: iface, methods: methodNames})
 		}
 	}
+	return ifaces
+}
 
-	if len(ifaces) == 0 {
-		return nil
+// collectStructMethods builds maps of receiver type -> method names and QN prefixes
+// from Go methods with receiver properties.
+func (p *Pipeline) collectStructMethods() (structMethods map[string]map[string]bool, structQNPrefix map[string]string) {
+	methodNodes, findErr := p.Store.FindNodesByLabel(p.ProjectName, "Method")
+	if findErr != nil {
+		return nil, nil
 	}
 
-	// Build struct -> method names map from Go receiver methods.
-	// Go methods are stored as "Method" nodes with a "receiver" property
-	// containing the receiver type like "(h *Handlers)".
-	methods, err := p.Store.FindNodesByLabel(p.ProjectName, "Method")
-	if err != nil {
-		return nil
-	}
+	structMethods = make(map[string]map[string]bool)
+	structQNPrefix = make(map[string]string)
 
-	// receiverType -> set of method names
-	structMethods := make(map[string]map[string]bool)
-	// receiverType -> one sample method's QN prefix (to find the struct node)
-	structQNPrefix := make(map[string]string)
-
-	for _, m := range methods {
+	for _, m := range methodNodes {
 		if !strings.HasSuffix(m.FilePath, ".go") {
 			continue
 		}
@@ -89,55 +96,60 @@ func (p *Pipeline) passImplements() error {
 		}
 		structMethods[typeName][m.Name] = true
 
-		// Store QN prefix for finding the struct. The method QN is like
-		// "project.path.module.MethodName" — we want the module QN prefix.
 		if _, exists := structQNPrefix[typeName]; !exists {
-			// Take everything before the last dot (the method name)
 			if idx := strings.LastIndex(m.QualifiedName, "."); idx > 0 {
 				structQNPrefix[typeName] = m.QualifiedName[:idx]
 			}
 		}
 	}
+	return
+}
 
-	// Check each struct against each interface
+// matchImplements checks each struct against each interface and creates IMPLEMENTS edges.
+func (p *Pipeline) matchImplements(
+	ifaces []ifaceInfo,
+	structMethods map[string]map[string]bool,
+	structQNPrefix map[string]string,
+) int {
 	linkCount := 0
 	for _, iface := range ifaces {
 		for typeName, methodSet := range structMethods {
-			if satisfies(iface.methods, methodSet) {
-				// Find or create the struct node. In Go, structs are stored
-				// as "Class" nodes (since tree-sitter classifies type_declaration
-				// as a class-like node).
-				structQN := structQNPrefix[typeName] + "." + typeName
-				structNode, _ := p.Store.FindNodeByQN(p.ProjectName, structQN)
-
-				// If we can't find a class node by that QN, try to find it
-				// by searching Class nodes with the matching name
-				if structNode == nil {
-					classes, _ := p.Store.FindNodesByLabel(p.ProjectName, "Class")
-					for _, c := range classes {
-						if c.Name == typeName && strings.HasSuffix(c.FilePath, ".go") {
-							structNode = c
-							break
-						}
-					}
-				}
-
-				if structNode == nil {
-					continue
-				}
-
-				_, _ = p.Store.InsertEdge(&store.Edge{
-					Project:  p.ProjectName,
-					SourceID: structNode.ID,
-					TargetID: iface.node.ID,
-					Type:     "IMPLEMENTS",
-				})
-				linkCount++
+			if !satisfies(iface.methods, methodSet) {
+				continue
 			}
+
+			structNode := p.findStructNode(typeName, structQNPrefix)
+			if structNode == nil {
+				continue
+			}
+
+			_, _ = p.Store.InsertEdge(&store.Edge{
+				Project:  p.ProjectName,
+				SourceID: structNode.ID,
+				TargetID: iface.node.ID,
+				Type:     "IMPLEMENTS",
+			})
+			linkCount++
+		}
+	}
+	return linkCount
+}
+
+// findStructNode looks up the struct/class node for a given receiver type name.
+func (p *Pipeline) findStructNode(typeName string, structQNPrefix map[string]string) *store.Node {
+	if prefix, ok := structQNPrefix[typeName]; ok {
+		structQN := prefix + "." + typeName
+		if n, _ := p.Store.FindNodeByQN(p.ProjectName, structQN); n != nil {
+			return n
 		}
 	}
 
-	slog.Info("pass5.implements.done", "links", linkCount)
+	classes, _ := p.Store.FindNodesByLabel(p.ProjectName, "Class")
+	for _, c := range classes {
+		if c.Name == typeName && strings.HasSuffix(c.FilePath, ".go") {
+			return c
+		}
+	}
 	return nil
 }
 

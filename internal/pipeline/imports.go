@@ -21,7 +21,7 @@ func parseImports(
 ) map[string]string {
 	switch language {
 	case lang.Go:
-		return parseGoImports(root, source, projectName, relPath)
+		return parseGoImports(root, source, projectName)
 	case lang.Python:
 		return parsePythonImports(root, source, projectName, relPath)
 	default:
@@ -42,7 +42,7 @@ func parseImports(
 func parseGoImports(
 	root *tree_sitter.Node,
 	source []byte,
-	projectName, relPath string,
+	projectName string,
 ) map[string]string {
 	imports := make(map[string]string)
 

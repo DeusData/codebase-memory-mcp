@@ -15,11 +15,12 @@ import (
 
 // RouteHandler represents a discovered HTTP route handler.
 type RouteHandler struct {
-	Path          string
-	Method        string
-	FunctionName  string
-	QualifiedName string
-	HandlerRef    string // resolved handler function reference (e.g. "h.CreateOrder")
+	Path              string
+	Method            string
+	FunctionName      string
+	QualifiedName     string
+	HandlerRef        string // resolved handler function reference (e.g. "h.CreateOrder")
+	ResolvedHandlerQN string // set by createRegistrationCallEdges — actual handler QN
 }
 
 // HTTPCallSite represents a discovered HTTP call site.
@@ -29,6 +30,7 @@ type HTTPCallSite struct {
 	SourceName          string
 	SourceQualifiedName string
 	SourceLabel         string // "Function", "Method", or "Module"
+	IsAsync             bool   // true when source uses async dispatch keywords
 }
 
 // HTTPLink represents a matched HTTP call from caller to handler.
@@ -37,6 +39,7 @@ type HTTPLink struct {
 	CallerLabel string
 	HandlerQN   string
 	URLPath     string
+	EdgeType    string // "HTTP_CALLS" or "ASYNC_CALLS"
 }
 
 // Linker discovers cross-service HTTP calls and creates HTTP_CALLS edges.
@@ -109,11 +112,11 @@ func (l *Linker) Run() ([]HTTPLink, error) {
 	// Resolve cross-file group prefixes before inserting Route nodes
 	l.resolveCrossFileGroupPrefixes(routes, rootPath)
 
-	// Insert Route nodes and HANDLES edges
-	l.insertRouteNodes(routes)
-
-	// Create CALLS edges for route handler references (e.g. .POST("/path", h.Handler))
+	// Resolve handler references first so insertRouteNodes can use the actual handler QN
 	l.createRegistrationCallEdges(routes)
+
+	// Insert Route nodes and HANDLES edges (uses ResolvedHandlerQN from above)
+	l.insertRouteNodes(routes)
 
 	callSites := l.discoverCallSites(rootPath)
 	slog.Info("httplink.callsites", "count", len(callSites))
@@ -139,6 +142,12 @@ func (l *Linker) insertRouteNodes(routes []RouteHandler) {
 
 		routeName := normalMethod + " " + rh.Path
 
+		// Use resolved handler QN if available, otherwise fall back to registering function
+		handlerQN := rh.QualifiedName
+		if rh.ResolvedHandlerQN != "" {
+			handlerQN = rh.ResolvedHandlerQN
+		}
+
 		routeID, err := l.store.UpsertNode(&store.Node{
 			Project:       l.project,
 			Label:         "Route",
@@ -147,29 +156,33 @@ func (l *Linker) insertRouteNodes(routes []RouteHandler) {
 			Properties: map[string]any{
 				"method":  rh.Method,
 				"path":    rh.Path,
-				"handler": rh.QualifiedName,
+				"handler": handlerQN,
 			},
 		})
 		if err != nil || routeID == 0 {
 			continue
 		}
 
-		// Create HANDLES edge from handler → Route
-		handlerNode, _ := l.store.FindNodeByQN(l.project, rh.QualifiedName)
+		// Create HANDLES edge from actual handler → Route
+		handlerNode, _ := l.store.FindNodeByQN(l.project, handlerQN)
 		if handlerNode != nil {
-			l.store.InsertEdge(&store.Edge{
+			if _, edgeErr := l.store.InsertEdge(&store.Edge{
 				Project:  l.project,
 				SourceID: handlerNode.ID,
 				TargetID: routeID,
 				Type:     "HANDLES",
-			})
+			}); edgeErr != nil {
+				slog.Warn("httplink.handles_edge.err", "err", edgeErr)
+			}
 
-			// Mark handler as entry point (for Feature 4)
+			// Mark handler as entry point (for dead code detection)
 			if handlerNode.Properties == nil {
 				handlerNode.Properties = map[string]any{}
 			}
 			handlerNode.Properties["is_entry_point"] = true
-			l.store.UpsertNode(handlerNode)
+			if _, upsertErr := l.store.UpsertNode(handlerNode); upsertErr != nil {
+				slog.Warn("httplink.entry_point.err", "err", upsertErr)
+			}
 		}
 	}
 	slog.Info("httplink.route_nodes", "count", len(routes))
@@ -255,7 +268,8 @@ func extractPythonRoutes(f *store.Node) []RouteHandler {
 // to the receiver of .GET/.POST calls (e.g., contracts.POST("", ...) where
 // contracts := rg.Group("/contracts")).
 func extractGoRoutes(f *store.Node, source string) []RouteHandler {
-	var routes []RouteHandler
+	// Preallocate: most functions register a few routes
+	routes := make([]RouteHandler, 0, 4)
 
 	// Build a map of variable name → group prefix from Group() calls
 	groupPrefixes := map[string]string{}
@@ -275,23 +289,8 @@ func extractGoRoutes(f *store.Node, source string) []RouteHandler {
 		method := strings.ToUpper(rm[1])
 		path := rm[2]
 
-		// Try to find the receiver variable (e.g., "contracts" in "contracts.POST")
-		// by looking at what's before the .METHOD( call
-		idx := strings.Index(line, "."+rm[1]+"(")
-		if idx > 0 {
-			prefix := strings.TrimSpace(line[:idx])
-			// Take the last word (variable name)
-			parts := strings.Fields(prefix)
-			if len(parts) > 0 {
-				receiver := parts[len(parts)-1]
-				if gp, ok := groupPrefixes[receiver]; ok {
-					path = strings.TrimRight(gp, "/") + "/" + strings.TrimLeft(path, "/")
-					if path == "/" {
-						path = gp
-					}
-				}
-			}
-		}
+		// Try to resolve group prefix from the receiver variable
+		path = resolveGroupPrefix(line, rm[1], path, groupPrefixes)
 
 		// Capture handler reference (last argument) for CALLS edge creation
 		var handlerRef string
@@ -312,10 +311,35 @@ func extractGoRoutes(f *store.Node, source string) []RouteHandler {
 	return routes
 }
 
+// resolveGroupPrefix resolves a router group prefix for a route line.
+// It finds the receiver variable (e.g., "contracts" in "contracts.POST")
+// and looks up its group prefix.
+func resolveGroupPrefix(line, method, path string, groupPrefixes map[string]string) string {
+	idx := strings.Index(line, "."+method+"(")
+	if idx <= 0 {
+		return path
+	}
+	prefix := strings.TrimSpace(line[:idx])
+	parts := strings.Fields(prefix)
+	if len(parts) == 0 {
+		return path
+	}
+	receiver := parts[len(parts)-1]
+	gp, ok := groupPrefixes[receiver]
+	if !ok {
+		return path
+	}
+	resolved := strings.TrimRight(gp, "/") + "/" + strings.TrimLeft(path, "/")
+	if resolved == "/" {
+		return gp
+	}
+	return resolved
+}
+
 // extractExpressRoutes extracts route registrations from JS/TS source (Express/Koa patterns).
 func extractExpressRoutes(f *store.Node, source string) []RouteHandler {
-	var routes []RouteHandler
 	matches := expressRouteRe.FindAllStringSubmatch(source, -1)
+	routes := make([]RouteHandler, 0, len(matches))
 	for _, m := range matches {
 		routes = append(routes, RouteHandler{
 			Path:          m[2],
@@ -391,8 +415,8 @@ func extractRustRoutes(f *store.Node) []RouteHandler {
 
 // extractLaravelRoutes extracts route registrations from PHP Laravel source.
 func extractLaravelRoutes(f *store.Node, source string) []RouteHandler {
-	var routes []RouteHandler
 	matches := laravelRouteRe.FindAllStringSubmatch(source, -1)
+	routes := make([]RouteHandler, 0, len(matches))
 	for _, m := range matches {
 		routes = append(routes, RouteHandler{
 			Path:          m[2],
@@ -532,9 +556,24 @@ var httpClientKeywords = []string{
 	"send_request", "http_client",
 }
 
+// asyncDispatchKeywords indicate cross-service async dispatch via HTTP.
+// Functions containing these keywords create ASYNC_CALLS edges instead of HTTP_CALLS.
+var asyncDispatchKeywords = []string{
+	// Cloud Tasks (GCP) — task body contains HTTP URL
+	"CreateTask", "create_task",
+	// Pub/Sub publish (GCP) — push subscriptions deliver via HTTP
+	"topic.Publish", "publisher.publish", "topic.publish",
+	// AWS SQS/SNS — SQS + Lambda/HTTP, SNS + HTTP subscription
+	"sqs.send_message", "sns.publish",
+	// RabbitMQ — exchange → HTTP consumer
+	"basic_publish",
+	// Kafka — consumer often fronted by HTTP
+	"producer.send", "producer.Send",
+}
+
 // extractFunctionCallSites extracts HTTP paths from function source code.
 func extractFunctionCallSites(f *store.Node, rootPath string) []HTTPCallSite {
-	var sites []HTTPCallSite
+	sites := make([]HTTPCallSite, 0, 4)
 
 	if f.FilePath == "" || f.StartLine <= 0 || f.EndLine <= 0 {
 		return sites
@@ -550,8 +589,8 @@ func extractFunctionCallSites(f *store.Node, rootPath string) []HTTPCallSite {
 		return sites
 	}
 
-	// Require at least one HTTP client keyword to avoid false positives
-	// from functions that merely store URL strings in variables
+	// Require at least one HTTP client or async dispatch keyword to avoid
+	// false positives from functions that merely store URL strings in variables
 	hasHTTPClient := false
 	for _, kw := range httpClientKeywords {
 		if strings.Contains(source, kw) {
@@ -559,9 +598,21 @@ func extractFunctionCallSites(f *store.Node, rootPath string) []HTTPCallSite {
 			break
 		}
 	}
-	if !hasHTTPClient {
+
+	hasAsyncDispatch := false
+	for _, kw := range asyncDispatchKeywords {
+		if strings.Contains(source, kw) {
+			hasAsyncDispatch = true
+			break
+		}
+	}
+
+	if !hasHTTPClient && !hasAsyncDispatch {
 		return sites
 	}
+
+	// Sync (HTTP client) takes precedence over async dispatch
+	isAsync := hasAsyncDispatch && !hasHTTPClient
 
 	method := detectHTTPMethod(source)
 
@@ -573,6 +624,7 @@ func extractFunctionCallSites(f *store.Node, rootPath string) []HTTPCallSite {
 			SourceName:          f.Name,
 			SourceQualifiedName: f.QualifiedName,
 			SourceLabel:         f.Label,
+			IsAsync:             isAsync,
 		})
 	}
 
@@ -677,49 +729,64 @@ func findJSONBounds(text string) []string {
 		if opener == '[' {
 			closer = ']'
 		}
-		start := strings.IndexByte(text, opener)
-		for start >= 0 && start < len(text) {
-			depth := 0
-			inStr := false
-			for i := start; i < len(text); i++ {
-				ch := text[i]
-				if inStr {
-					if ch == '\\' {
-						i++ // skip escaped char
-						continue
-					}
-					if ch == '"' {
-						inStr = false
-					}
-					continue
-				}
-				if ch == '"' {
-					inStr = true
-				} else if ch == opener {
-					depth++
-				} else if ch == closer {
-					depth--
-					if depth == 0 {
-						candidate := text[start : i+1]
-						if len(candidate) > 5 { // skip trivially small
-							results = append(results, candidate)
-						}
-						start = i + 1
-						break
-					}
-				}
-			}
-			if depth != 0 {
-				break
-			}
-			next := strings.IndexByte(text[start:], opener)
-			if next < 0 {
-				break
-			}
-			start += next
-		}
+		results = append(results, scanJSONBlocks(text, opener, closer)...)
 	}
 	return results
+}
+
+// scanJSONBlocks scans text for balanced JSON blocks delimited by opener/closer.
+func scanJSONBlocks(text string, opener, closer byte) []string {
+	var results []string
+	start := strings.IndexByte(text, opener)
+	for start >= 0 && start < len(text) {
+		end, ok := findBalancedEnd(text, start, opener, closer)
+		if !ok {
+			break
+		}
+		candidate := text[start : end+1]
+		if len(candidate) > 5 {
+			results = append(results, candidate)
+		}
+		start = end + 1
+		next := strings.IndexByte(text[start:], opener)
+		if next < 0 {
+			break
+		}
+		start += next
+	}
+	return results
+}
+
+// findBalancedEnd finds the index of the closing bracket that balances the opener at start.
+// Returns the index and true if found, or 0 and false if unbalanced.
+func findBalancedEnd(text string, start int, opener, closer byte) (int, bool) {
+	depth := 0
+	inStr := false
+	for i := start; i < len(text); i++ {
+		ch := text[i]
+		if inStr {
+			if ch == '\\' {
+				i++ // skip escaped char
+				continue
+			}
+			if ch == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inStr = true
+		case opener:
+			depth++
+		case closer:
+			depth--
+			if depth == 0 {
+				return i, true
+			}
+		}
+	}
+	return 0, false
 }
 
 // walkJSONForURLs recursively walks parsed JSON and extracts URL paths.
@@ -772,7 +839,12 @@ func (l *Linker) matchAndLink(routes []RouteHandler, callSites []HTTPCallSite) [
 				score = 1.0
 			}
 
-			// Create HTTP_CALLS edge with confidence score
+			// Create edge with confidence score
+			edgeType := "HTTP_CALLS"
+			if cs.IsAsync {
+				edgeType = "ASYNC_CALLS"
+			}
+
 			callerNode, _ := l.store.FindNodeByQN(l.project, cs.SourceQualifiedName)
 			handlerNode, _ := l.store.FindNodeByQN(l.project, rh.QualifiedName)
 			if callerNode != nil && handlerNode != nil {
@@ -787,7 +859,7 @@ func (l *Linker) matchAndLink(routes []RouteHandler, callSites []HTTPCallSite) [
 					Project:    l.project,
 					SourceID:   callerNode.ID,
 					TargetID:   handlerNode.ID,
-					Type:       "HTTP_CALLS",
+					Type:       edgeType,
 					Properties: props,
 				})
 			}
@@ -797,6 +869,7 @@ func (l *Linker) matchAndLink(routes []RouteHandler, callSites []HTTPCallSite) [
 				CallerLabel: cs.SourceLabel,
 				HandlerQN:   rh.QualifiedName,
 				URLPath:     cs.Path,
+				EdgeType:    edgeType,
 			})
 		}
 	}
@@ -805,26 +878,37 @@ func (l *Linker) matchAndLink(routes []RouteHandler, callSites []HTTPCallSite) [
 }
 
 // normalizePath normalizes a URL path for comparison.
+// numericSegmentRe matches path segments that are pure numeric IDs.
+var numericSegmentRe = regexp.MustCompile(`/\d+(/|$)`)
+
+// uuidSegmentRe matches path segments that are UUIDs.
+var uuidSegmentRe = regexp.MustCompile(`/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(/|$)`)
+
 func normalizePath(path string) string {
 	path = strings.TrimRight(path, "/")
 	path = colonParamRe.ReplaceAllString(path, "*")
 	path = braceParamRe.ReplaceAllString(path, "*")
+	// Normalize UUIDs and numeric IDs to wildcards for better matching
+	path = uuidSegmentRe.ReplaceAllString(path, "/*$1")
+	path = numericSegmentRe.ReplaceAllString(path, "/*$1")
 	return strings.ToLower(path)
 }
 
 // matchConfidenceThreshold is the minimum score for an HTTP_CALLS edge.
-const matchConfidenceThreshold = 0.3
+const matchConfidenceThreshold = 0.45
 
 // pathMatchScore returns a confidence score (0.0–1.0) for how well callPath
 // matches routePath. Returns 0 if no match.
 //
 // Multi-signal scoring (inspired by RAD/Code2DFD research):
-//   confidence = matchBase × (0.5 × jaccard + 0.5 × depthFactor)
+//
+//	confidence = matchBase × (0.5 × jaccard + 0.5 × depthFactor)
 //
 // Where:
-//   matchBase:   exact=0.95, suffix=0.75, wildcard=0.55
-//   jaccard:     segment Jaccard similarity (non-wildcard segments)
-//   depthFactor: min(matched_segments / 3.0, 1.0) — longer paths = more specific
+//
+//	matchBase:   exact=0.95, suffix=0.75, wildcard=0.55
+//	jaccard:     segment Jaccard similarity (non-wildcard segments)
+//	depthFactor: min(matched_segments / 3.0, 1.0) — longer paths = more specific
 func pathMatchScore(callPath, routePath string) float64 {
 	normCall := normalizePath(callPath)
 	normRoute := normalizePath(routePath)
@@ -837,15 +921,16 @@ func pathMatchScore(callPath, routePath string) float64 {
 	var matchBase float64
 	var matchedCallSegs, matchedRouteSegs []string
 
-	if normCall == normRoute {
+	switch {
+	case normCall == normRoute:
 		matchBase = 0.95
 		matchedCallSegs = splitSegments(normCall)
 		matchedRouteSegs = splitSegments(normRoute)
-	} else if strings.HasSuffix(normCall, normRoute) {
+	case strings.HasSuffix(normCall, normRoute):
 		matchBase = 0.75
 		matchedCallSegs = splitSegments(normRoute) // use the route portion that matched
 		matchedRouteSegs = splitSegments(normRoute)
-	} else {
+	default:
 		// Segment-by-segment wildcard matching
 		callParts := strings.Split(normCall, "/")
 		routeParts := strings.Split(normRoute, "/")
@@ -968,8 +1053,9 @@ func pathsMatch(callPath, routePath string) bool {
 // the nodes are in the same deployable unit.
 //
 // Example: "myapp.docker-images.cloud-runs.svcA.module.func" → dir prefix "myapp.docker-images.cloud-runs.svcA"
-//          "myapp.docker-images.cloud-runs.svcB.routes.handler" → dir prefix "myapp.docker-images.cloud-runs.svcB"
-//          → different prefix → different service → returns false
+//
+//	"myapp.docker-images.cloud-runs.svcB.routes.handler" → dir prefix "myapp.docker-images.cloud-runs.svcB"
+//	→ different prefix → different service → returns false
 func sameService(qn1, qn2 string) bool {
 	parts1 := strings.Split(qn1, ".")
 	parts2 := strings.Split(qn2, ".")
@@ -997,57 +1083,62 @@ var crossFileGroupVarRe = regexp.MustCompile(`(\w+)\s*:?=\s*\w+\.Group\s*\(\s*"(
 // resolveCrossFileGroupPrefixes resolves Group() prefixes from caller functions
 // for routes that were registered without a group prefix within their own function.
 func (l *Linker) resolveCrossFileGroupPrefixes(routes []RouteHandler, rootPath string) {
-	// For each function that registered routes, check if callers pass a Group() result
 	for funcQN, indices := range l.routesByFunc {
 		funcNode, _ := l.store.FindNodeByQN(l.project, funcQN)
 		if funcNode == nil {
 			continue
 		}
 
-		// Find inbound CALLS edges to this function
 		callerEdges, _ := l.store.FindEdgesByTargetAndType(funcNode.ID, "CALLS")
 		if len(callerEdges) == 0 {
 			continue
 		}
 
-		// Check each caller's source for Group() prefix passing
-		for _, edge := range callerEdges {
-			callerNode, _ := l.store.FindNodeByID(edge.SourceID)
-			if callerNode == nil || callerNode.FilePath == "" || callerNode.StartLine <= 0 {
-				continue
-			}
+		l.resolveCallerGroupPrefixes(routes, indices, callerEdges, funcNode.Name, rootPath)
+	}
+}
 
-			callerSource := readSourceLines(rootPath, callerNode.FilePath, callerNode.StartLine, callerNode.EndLine)
-			if callerSource == "" {
-				continue
-			}
+// resolveCallerGroupPrefixes checks each caller's source for Group() prefix passing
+// and prepends the prefix to the routes at the given indices.
+func (l *Linker) resolveCallerGroupPrefixes(routes []RouteHandler, indices []int, callerEdges []*store.Edge, funcName, rootPath string) {
+	for _, edge := range callerEdges {
+		callerNode, _ := l.store.FindNodeByID(edge.SourceID)
+		if callerNode == nil || callerNode.FilePath == "" || callerNode.StartLine <= 0 {
+			continue
+		}
 
-			// Pattern 1: direct — RegisterRoutes(router.Group("/api"))
-			for _, m := range crossFileGroupRe.FindAllStringSubmatch(callerSource, -1) {
-				calledFunc := m[1]
-				prefix := m[2]
-				if calledFunc == funcNode.Name {
-					l.prependPrefixToRoutes(routes, indices, prefix)
-					break
-				}
-			}
+		callerSource := readSourceLines(rootPath, callerNode.FilePath, callerNode.StartLine, callerNode.EndLine)
+		if callerSource == "" {
+			continue
+		}
 
-			// Pattern 2: variable-based — v1 := router.Group("/api"); RegisterRoutes(v1)
-			varPrefixes := map[string]string{}
-			for _, m := range crossFileGroupVarRe.FindAllStringSubmatch(callerSource, -1) {
-				varPrefixes[m[1]] = m[2]
+		// Pattern 1: direct â RegisterRoutes(router.Group("/api"))
+		for _, m := range crossFileGroupRe.FindAllStringSubmatch(callerSource, -1) {
+			if m[1] == funcName {
+				l.prependPrefixToRoutes(routes, indices, m[2])
+				break
 			}
-			if len(varPrefixes) > 0 {
-				// Look for funcName(varName) calls
-				callRe := regexp.MustCompile(regexp.QuoteMeta(funcNode.Name) + `\s*\(\s*(\w+)`)
-				for _, cm := range callRe.FindAllStringSubmatch(callerSource, -1) {
-					argName := cm[1]
-					if prefix, ok := varPrefixes[argName]; ok {
-						l.prependPrefixToRoutes(routes, indices, prefix)
-						break
-					}
-				}
-			}
+		}
+
+		// Pattern 2: variable-based â v1 := router.Group("/api"); RegisterRoutes(v1)
+		l.resolveVarGroupPrefix(routes, indices, callerSource, funcName)
+	}
+}
+
+// resolveVarGroupPrefix resolves Group() prefixes passed via intermediate variables.
+func (l *Linker) resolveVarGroupPrefix(routes []RouteHandler, indices []int, callerSource, funcName string) {
+	varPrefixes := map[string]string{}
+	for _, m := range crossFileGroupVarRe.FindAllStringSubmatch(callerSource, -1) {
+		varPrefixes[m[1]] = m[2]
+	}
+	if len(varPrefixes) == 0 {
+		return
+	}
+	callRe := regexp.MustCompile(regexp.QuoteMeta(funcName) + `\s*\(\s*(\w+)`)
+	for _, cm := range callRe.FindAllStringSubmatch(callerSource, -1) {
+		if prefix, ok := varPrefixes[cm[1]]; ok {
+			l.prependPrefixToRoutes(routes, indices, prefix)
+			break
 		}
 	}
 }
@@ -1069,7 +1160,8 @@ func (l *Linker) prependPrefixToRoutes(routes []RouteHandler, indices []int, pre
 // to the handler functions they reference (e.g. .POST("/path", h.CreateOrder)).
 func (l *Linker) createRegistrationCallEdges(routes []RouteHandler) {
 	count := 0
-	for _, rh := range routes {
+	for i := range routes {
+		rh := &routes[i]
 		if rh.HandlerRef == "" {
 			continue
 		}
@@ -1094,6 +1186,9 @@ func (l *Linker) createRegistrationCallEdges(routes []RouteHandler) {
 
 		// Use the first match (typically unique within a project)
 		handler := handlerNodes[0]
+
+		// Propagate resolved handler QN back to route for insertRouteNodes
+		rh.ResolvedHandlerQN = handler.QualifiedName
 
 		_, _ = l.store.InsertEdge(&store.Edge{
 			Project:  l.project,

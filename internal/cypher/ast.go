@@ -33,11 +33,11 @@ func (*NodePattern) patternElement() {}
 
 // RelPattern matches a graph relationship with optional types, direction, and hops.
 type RelPattern struct {
-	Variable string   // (optional)
-	Types    []string // relationship types, e.g. ["CALLS", "HTTP_CALLS"]
-	Direction string  // "outbound", "inbound", "any"
-	MinHops  int      // for variable-length, default 1
-	MaxHops  int      // for variable-length, default 1 (0 means unbounded)
+	Variable  string   // (optional)
+	Types     []string // relationship types, e.g. ["CALLS", "HTTP_CALLS"]
+	Direction string   // "outbound", "inbound", "any"
+	MinHops   int      // for variable-length, default 1
+	MaxHops   int      // for variable-length, default 1 (0 means unbounded)
 }
 
 func (*RelPattern) patternElement() {}

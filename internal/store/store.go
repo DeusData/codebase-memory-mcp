@@ -11,9 +11,17 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Querier abstracts *sql.DB and *sql.Tx so store methods work in both contexts.
+type Querier interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
 // Store wraps a SQLite connection for graph storage.
 type Store struct {
 	db     *sql.DB
+	q      Querier // active querier: db or tx
 	dbPath string
 }
 
@@ -70,6 +78,7 @@ func OpenPath(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	s := &Store{db: db, dbPath: dbPath}
+	s.q = s.db
 	if err := s.initSchema(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
@@ -84,11 +93,31 @@ func OpenMemory() (*Store, error) {
 		return nil, fmt.Errorf("open memory db: %w", err)
 	}
 	s := &Store{db: db, dbPath: ":memory:"}
+	s.q = s.db
 	if err := s.initSchema(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
 	return s, nil
+}
+
+// WithTransaction executes fn within a single SQLite transaction.
+// All store methods called inside fn use the transaction automatically.
+func (s *Store) WithTransaction(fn func() error) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	s.q = tx
+	defer func() {
+		s.q = s.db
+	}()
+
+	if err := fn(); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 // Close closes the database connection.
@@ -146,6 +175,9 @@ func (s *Store) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id, type);
 	CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id, type);
 	CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(project, type);
+
+	CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(project, target_id, type);
+	CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(project, source_id, type);
 	`
 	_, err := s.db.Exec(schema)
 	return err
@@ -161,6 +193,11 @@ func marshalProps(props map[string]any) string {
 		return "{}"
 	}
 	return string(b)
+}
+
+// UnmarshalProps deserializes JSON properties. Exported for use by cypher executor.
+func UnmarshalProps(data string) map[string]any {
+	return unmarshalProps(data)
 }
 
 // unmarshalProps deserializes JSON properties.

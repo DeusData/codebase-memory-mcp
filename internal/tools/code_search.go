@@ -18,26 +18,49 @@ type codeMatch struct {
 	Content string `json:"content"`
 }
 
-func (s *Server) handleSearchCode(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+// searchCodeParams holds parsed parameters for a code search request.
+type searchCodeParams struct {
+	pattern    string
+	fileGlob   string
+	maxResults int
+	offset     int
+	isRegex    bool
+	re         *regexp.Regexp
+}
+
+// parseSearchCodeParams extracts and validates search_code parameters from the request.
+func parseSearchCodeParams(req *mcp.CallToolRequest) (*searchCodeParams, *mcp.CallToolResult) {
 	args, err := parseArgs(req)
 	if err != nil {
-		return errResult(err.Error()), nil
+		return nil, errResult(err.Error())
 	}
 
-	pattern := getStringArg(args, "pattern")
-	if pattern == "" {
-		return errResult("pattern is required"), nil
+	p := &searchCodeParams{
+		pattern:    getStringArg(args, "pattern"),
+		fileGlob:   getStringArg(args, "file_pattern"),
+		maxResults: getIntArg(args, "max_results", 10),
+		offset:     getIntArg(args, "offset", 0),
+		isRegex:    getBoolArg(args, "regex"),
 	}
 
-	fileGlob := getStringArg(args, "file_pattern")
-	maxResults := getIntArg(args, "max_results", 100)
-	offset := getIntArg(args, "offset", 0)
+	if p.pattern == "" {
+		return nil, errResult("pattern is required")
+	}
 
-	isRegex := false
-	if v, ok := args["regex"]; ok {
-		if b, ok := v.(bool); ok {
-			isRegex = b
+	if p.isRegex {
+		p.re, err = regexp.Compile(p.pattern)
+		if err != nil {
+			return nil, errResult(fmt.Sprintf("invalid regex: %v", err))
 		}
+	}
+
+	return p, nil
+}
+
+func (s *Server) handleSearchCode(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	params, errRes := parseSearchCodeParams(req)
+	if errRes != nil {
+		return errRes, nil
 	}
 
 	// Resolve project root
@@ -46,16 +69,48 @@ func (s *Server) handleSearchCode(_ context.Context, req *mcp.CallToolRequest) (
 		return errResult(fmt.Sprintf("resolve root: %v", err)), nil
 	}
 
-	// Compile regex or prepare literal search
-	var re *regexp.Regexp
-	if isRegex {
-		re, err = regexp.Compile(pattern)
-		if err != nil {
-			return errResult(fmt.Sprintf("invalid regex: %v", err)), nil
+	filePaths := s.collectSearchFilePaths(params.fileGlob)
+
+	// Collect all matches up to offset+maxResults for accurate total count
+	fetchLimit := params.offset + params.maxResults
+	var allMatches []codeMatch
+	for _, relPath := range filePaths {
+		if len(allMatches) >= fetchLimit {
+			break
 		}
+
+		absPath := filepath.Join(root, relPath)
+		fileMatches := searchFile(absPath, relPath, params.pattern, params.re, params.isRegex, fetchLimit-len(allMatches))
+		allMatches = append(allMatches, fileMatches...)
 	}
 
-	// Get indexed file paths from the store
+	total := len(allMatches)
+	hasMore := total >= fetchLimit
+
+	// Apply offset and limit
+	start := params.offset
+	if start > total {
+		start = total
+	}
+	end := start + params.maxResults
+	if end > total {
+		end = total
+	}
+	pageMatches := allMatches[start:end]
+
+	return jsonResult(map[string]any{
+		"pattern":     params.pattern,
+		"total":       total,
+		"limit":       params.maxResults,
+		"offset":      params.offset,
+		"has_more":    hasMore,
+		"matches":     pageMatches,
+		"files_count": len(filePaths),
+	}), nil
+}
+
+// collectSearchFilePaths gathers indexed file paths, optionally filtered by a glob pattern.
+func (s *Server) collectSearchFilePaths(fileGlob string) []string {
 	projects, _ := s.store.ListProjects()
 	var filePaths []string
 	for _, p := range projects {
@@ -66,7 +121,6 @@ func (s *Server) handleSearchCode(_ context.Context, req *mcp.CallToolRequest) (
 			}
 			if fileGlob != "" {
 				matched, _ := filepath.Match(fileGlob, filepath.Base(f.FilePath))
-				// Also try against the full relative path using double-star simulation
 				if !matched {
 					matched = globMatch(fileGlob, f.FilePath)
 				}
@@ -77,43 +131,7 @@ func (s *Server) handleSearchCode(_ context.Context, req *mcp.CallToolRequest) (
 			filePaths = append(filePaths, f.FilePath)
 		}
 	}
-
-	// Collect all matches up to offset+maxResults for accurate total count
-	fetchLimit := offset + maxResults
-	var allMatches []codeMatch
-	for _, relPath := range filePaths {
-		if len(allMatches) >= fetchLimit {
-			break
-		}
-
-		absPath := filepath.Join(root, relPath)
-		fileMatches := searchFile(absPath, relPath, pattern, re, isRegex, fetchLimit-len(allMatches))
-		allMatches = append(allMatches, fileMatches...)
-	}
-
-	total := len(allMatches)
-	hasMore := total >= fetchLimit
-
-	// Apply offset and limit
-	start := offset
-	if start > total {
-		start = total
-	}
-	end := start + maxResults
-	if end > total {
-		end = total
-	}
-	pageMatches := allMatches[start:end]
-
-	return jsonResult(map[string]any{
-		"pattern":     pattern,
-		"total":       total,
-		"limit":       maxResults,
-		"offset":      offset,
-		"has_more":    hasMore,
-		"matches":     pageMatches,
-		"files_count": len(filePaths),
-	}), nil
+	return filePaths
 }
 
 func searchFile(absPath, relPath, pattern string, re *regexp.Regexp, isRegex bool, limit int) []codeMatch {

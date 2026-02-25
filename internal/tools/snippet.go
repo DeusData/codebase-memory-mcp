@@ -23,8 +23,8 @@ func (s *Server) handleGetCodeSnippet(_ context.Context, req *mcp.CallToolReques
 	}
 
 	// Find the node across all projects
-	node, project, err := s.findNodeByQNAcrossProjects(qn)
-	if err != nil {
+	node, project, _ := s.findNodeByQNAcrossProjects(qn)
+	if node == nil {
 		return errResult(fmt.Sprintf("node not found: %s", qn)), nil
 	}
 
@@ -37,8 +37,8 @@ func (s *Server) handleGetCodeSnippet(_ context.Context, req *mcp.CallToolReques
 	}
 
 	// Resolve file path against the project's root path
-	proj, projErr := s.store.GetProject(project)
-	if projErr != nil {
+	proj, _ := s.store.GetProject(project)
+	if proj == nil {
 		return errResult(fmt.Sprintf("project not found: %s", project)), nil
 	}
 

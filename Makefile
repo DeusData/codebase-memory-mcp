@@ -1,4 +1,4 @@
-.PHONY: build test lint clean install
+.PHONY: build test lint clean install check
 
 BINARY=codebase-memory-mcp
 MODULE=github.com/DeusData/codebase-memory-mcp
@@ -9,8 +9,10 @@ build:
 test:
 	go test ./... -v
 
-lint:
-	golangci-lint run ./...
+check: lint test  ## Run lint + tests
+
+lint:  ## Run golangci-lint
+	golangci-lint run --timeout=5m ./...
 
 clean:
 	rm -rf bin/

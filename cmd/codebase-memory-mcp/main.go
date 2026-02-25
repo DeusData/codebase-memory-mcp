@@ -22,11 +22,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("store open err=%v", err)
 	}
-	defer s.Close()
 
 	srv := tools.NewServer(s)
 
-	if err := srv.MCPServer().Run(context.Background(), &mcp.StdioTransport{}); err != nil {
-		log.Fatalf("server err=%v", err)
+	runErr := srv.MCPServer().Run(context.Background(), &mcp.StdioTransport{})
+	s.Close()
+	if runErr != nil {
+		log.Fatalf("server err=%v", runErr)
 	}
 }

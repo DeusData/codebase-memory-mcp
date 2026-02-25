@@ -33,12 +33,12 @@ func (s *Server) handleTraceCallPath(_ context.Context, req *mcp.CallToolRequest
 	}
 
 	// Find the function node across all projects
-	rootNode, project, err := s.findNodeAcrossProjects(funcName)
-	if err != nil {
+	rootNode, project, _ := s.findNodeAcrossProjects(funcName)
+	if rootNode == nil {
 		return errResult(fmt.Sprintf("function not found: %s", funcName)), nil
 	}
 
-	edgeTypes := []string{"CALLS", "HTTP_CALLS"}
+	edgeTypes := []string{"CALLS", "HTTP_CALLS", "ASYNC_CALLS"}
 
 	// Build root info
 	root := buildNodeInfo(rootNode)
