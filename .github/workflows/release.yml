@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. v0.0.2)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-unix:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+          - os: macos-14
+            goos: darwin
+            goarch: arm64
+          - os: macos-13
+            goos: darwin
+            goarch: amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build binary
+        run: |
+          CGO_ENABLED=1 go build \
+            -ldflags "-X main.version=${{ inputs.version }}" \
+            -o codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }} \
+            ./cmd/codebase-memory-mcp/
+
+      - name: Create archive
+        run: tar -czf codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: "*.tar.gz"
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          path-type: inherit
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Run tests
+        shell: msys2 {0}
+        run: |
+          which go
+          go version
+          go test ./...
+
+      - name: Build binary
+        shell: msys2 {0}
+        run: |
+          CGO_ENABLED=1 CC=gcc go build \
+            -ldflags "-X main.version=${{ inputs.version }}" \
+            -o codebase-memory-mcp-windows-amd64.exe \
+            ./cmd/codebase-memory-mcp/
+
+      - name: Create archive
+        shell: pwsh
+        run: Compress-Archive -Path codebase-memory-mcp-windows-amd64.exe -DestinationPath codebase-memory-mcp-windows-amd64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codebase-memory-mcp-windows-amd64
+          path: "*.zip"
+
+  release:
+    needs: [build-unix, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: sha256sum *.tar.gz *.zip > checksums.txt
+
+      - name: Create tag
+        run: |
+          git tag ${{ inputs.version }}
+          git push origin ${{ inputs.version }}
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          files: |
+            *.tar.gz
+            *.zip
+            checksums.txt
+          generate_release_notes: true
