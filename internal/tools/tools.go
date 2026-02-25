@@ -145,7 +145,11 @@ func (s *Server) registerTools() {
 				},
 				"limit": {
 					"type": "integer",
-					"description": "Max results to return. If omitted, returns all matching results."
+					"description": "Max results to return per page (default: 100)."
+				},
+				"offset": {
+					"type": "integer",
+					"description": "Number of results to skip for pagination (default: 0). Use with limit to page through results."
 				}
 			}
 		}`),
@@ -238,7 +242,11 @@ func (s *Server) registerTools() {
 				},
 				"max_results": {
 					"type": "integer",
-					"description": "Maximum number of matches to return. If omitted, returns all matches."
+					"description": "Maximum number of matches to return per page (default: 100)."
+				},
+				"offset": {
+					"type": "integer",
+					"description": "Number of matches to skip for pagination (default: 0). Use with max_results to page through results."
 				}
 			},
 			"required": ["pattern"]

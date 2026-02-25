@@ -8,16 +8,17 @@ import (
 
 // SearchParams defines structured search parameters.
 type SearchParams struct {
-	Project             string
-	Label               string
-	NamePattern         string
-	FilePattern         string
-	Relationship        string
-	Direction           string // "inbound", "outbound", "any"
-	MinDegree           int
-	MaxDegree           int
-	Limit               int
-	ExcludeEntryPoints  bool // when true, exclude nodes with is_entry_point=true
+	Project            string
+	Label              string
+	NamePattern        string
+	FilePattern        string
+	Relationship       string
+	Direction          string // "inbound", "outbound", "any"
+	MinDegree          int
+	MaxDegree          int
+	Limit              int
+	Offset             int
+	ExcludeEntryPoints bool // when true, exclude nodes with is_entry_point=true
 }
 
 // SearchResult is a node with edge degree info.
@@ -28,11 +29,16 @@ type SearchResult struct {
 	ConnectedNames []string
 }
 
-// Search executes a parameterized search query.
-func (s *Store) Search(params SearchParams) ([]*SearchResult, error) {
-	// Limit=0 means no limit; use a high ceiling for SQL
-	unlimited := params.Limit <= 0
-	if unlimited {
+// SearchOutput wraps search results with total count for pagination.
+type SearchOutput struct {
+	Results []*SearchResult
+	Total   int
+}
+
+// Search executes a parameterized search query with pagination support.
+func (s *Store) Search(params SearchParams) (*SearchOutput, error) {
+	// Limit=0 means use default; use a high ceiling for SQL
+	if params.Limit <= 0 {
 		params.Limit = 100000
 	}
 
@@ -64,7 +70,11 @@ func (s *Store) Search(params SearchParams) ([]*SearchResult, error) {
 	if params.NamePattern != "" || hasDegreeFilter {
 		sqlLimit = 10000 // fetch enough rows for Go-side filtering
 	} else {
-		sqlLimit = params.Limit
+		// Fetch enough for offset + limit
+		sqlLimit = params.Offset + params.Limit
+		if sqlLimit > 100000 {
+			sqlLimit = 100000
+		}
 	}
 
 	query := fmt.Sprintf(`
@@ -102,14 +112,8 @@ func (s *Store) Search(params SearchParams) ([]*SearchResult, error) {
 		}
 	}
 
-	// Apply limit after name filtering (but not when degree filters are active,
-	// since degree filtering happens in the loop below with its own limit check)
-	if !hasDegreeFilter && len(nodes) > params.Limit {
-		nodes = nodes[:params.Limit]
-	}
-
-	// Build results with degree info
-	var results []*SearchResult
+	// Build all qualifying results (before offset/limit) for accurate total count
+	var allResults []*SearchResult
 	for _, n := range nodes {
 		sr := &SearchResult{Node: n}
 
@@ -157,13 +161,25 @@ func (s *Store) Search(params SearchParams) ([]*SearchResult, error) {
 			connRows.Close()
 		}
 
-		results = append(results, sr)
-		if len(results) >= params.Limit {
-			break
-		}
+		allResults = append(allResults, sr)
 	}
 
-	return results, nil
+	total := len(allResults)
+
+	// Apply offset and limit
+	start := params.Offset
+	if start > total {
+		start = total
+	}
+	end := start + params.Limit
+	if end > total {
+		end = total
+	}
+
+	return &SearchOutput{
+		Results: allResults[start:end],
+		Total:   total,
+	}, nil
 }
 
 // globToLike converts a glob pattern to SQL LIKE pattern.

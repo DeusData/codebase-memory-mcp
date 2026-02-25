@@ -30,10 +30,8 @@ func (s *Server) handleSearchCode(_ context.Context, req *mcp.CallToolRequest) (
 	}
 
 	fileGlob := getStringArg(args, "file_pattern")
-	maxResults := getIntArg(args, "max_results", 0)
-	if maxResults <= 0 {
-		maxResults = 100000 // no limit
-	}
+	maxResults := getIntArg(args, "max_results", 100)
+	offset := getIntArg(args, "offset", 0)
 
 	isRegex := false
 	if v, ok := args["regex"]; ok {
@@ -80,22 +78,40 @@ func (s *Server) handleSearchCode(_ context.Context, req *mcp.CallToolRequest) (
 		}
 	}
 
-	var matches []codeMatch
+	// Collect all matches up to offset+maxResults for accurate total count
+	fetchLimit := offset + maxResults
+	var allMatches []codeMatch
 	for _, relPath := range filePaths {
-		if len(matches) >= maxResults {
+		if len(allMatches) >= fetchLimit {
 			break
 		}
 
 		absPath := filepath.Join(root, relPath)
-		fileMatches := searchFile(absPath, relPath, pattern, re, isRegex, maxResults-len(matches))
-		matches = append(matches, fileMatches...)
+		fileMatches := searchFile(absPath, relPath, pattern, re, isRegex, fetchLimit-len(allMatches))
+		allMatches = append(allMatches, fileMatches...)
 	}
+
+	total := len(allMatches)
+	hasMore := total >= fetchLimit
+
+	// Apply offset and limit
+	start := offset
+	if start > total {
+		start = total
+	}
+	end := start + maxResults
+	if end > total {
+		end = total
+	}
+	pageMatches := allMatches[start:end]
 
 	return jsonResult(map[string]any{
 		"pattern":     pattern,
-		"total":       len(matches),
-		"truncated":   len(matches) >= maxResults,
-		"matches":     matches,
+		"total":       total,
+		"limit":       maxResults,
+		"offset":      offset,
+		"has_more":    hasMore,
+		"matches":     pageMatches,
 		"files_count": len(filePaths),
 	}), nil
 }
