@@ -66,7 +66,7 @@ func (s *Server) registerIndexAndTraceTool() {
 
 	s.mcp.AddTool(&mcp.Tool{
 		Name:        "trace_call_path",
-		Description: "Trace call paths from/to a function. Requires EXACT function name — if unsure, call search_graph(name_pattern=...) first to discover the correct name. Returns hop-by-hop callees/callers with edge types (CALLS, HTTP_CALLS, ASYNC_CALLS). Use depth=1 first, increase only if needed. IMPORTANT: If the function is not found, use search_graph with a name_pattern regex to find similar names before retrying.",
+		Description: "Trace call paths from/to a function. Requires EXACT function name — if unsure, call search_graph(name_pattern=...) first to discover the correct name. Returns hop-by-hop callees/callers with edge types (CALLS, HTTP_CALLS, ASYNC_CALLS). Use depth=1 first, increase only if needed. IMPORTANT: Use direction='both' for full cross-service context — HTTP_CALLS edges from other services appear as inbound edges on backend functions, so direction='outbound' alone misses cross-service callers. For async dispatch (Cloud Tasks, Pub/Sub), find dispatch functions via search_graph(name_pattern='.*CreateTask.*') then trace via CALLS edges. If the function is not found, use search_graph with a name_pattern regex to find similar names before retrying.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -115,7 +115,7 @@ func (s *Server) registerSchemaAndSnippetTools() {
 func (s *Server) registerSearchTools() {
 	s.mcp.AddTool(&mcp.Tool{
 		Name:        "search_graph",
-		Description: "Search the code graph. Returns 10 results per page (use offset to paginate, has_more indicates more pages). For dead code: use relationship='CALLS', direction='inbound', max_degree=0, exclude_entry_points=true. For fan-out: use relationship='CALLS', direction='outbound', min_degree=N. Route nodes: properties.handler contains the actual handler function name. Prefer this over query_graph for counting — no row cap. Relationship types: CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD, HANDLES, CONTAINS_FILE, CONTAINS_FOLDER, CONTAINS_PACKAGE, IMPLEMENTS.",
+		Description: "Search the code graph for nodes. Returns 10 results per page (use offset to paginate, has_more indicates more pages). For dead code: use relationship='CALLS', direction='inbound', max_degree=0, exclude_entry_points=true. For fan-out: use relationship='CALLS', direction='outbound', min_degree=N. Route nodes: properties.handler contains the actual handler function name. Prefer this over query_graph for counting — no row cap. IMPORTANT: The 'relationship' filter counts how many edges of that type each node has (degree filtering) — it does NOT return the actual edges. To list cross-service HTTP_CALLS or ASYNC_CALLS edges with their properties (url_path, confidence), use query_graph with Cypher instead: MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_path, r.confidence. Relationship types: CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD, HANDLES, CONTAINS_FILE, CONTAINS_FOLDER, CONTAINS_PACKAGE, IMPLEMENTS.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -207,7 +207,7 @@ func (s *Server) registerSearchTools() {
 func (s *Server) registerQueryTool() {
 	s.mcp.AddTool(&mcp.Tool{
 		Name:        "query_graph",
-		Description: "Execute a Cypher-like graph query. WARNING: 200-row cap applies BEFORE aggregation — COUNT queries on large codebases silently undercount. For fan-out/fan-in counting, use search_graph with min_degree/max_degree instead. Best for: relationship patterns, filtered joins, path queries. Always use LIMIT. Edge types: CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD, HANDLES, IMPLEMENTS.",
+		Description: "Execute a Cypher-like graph query. WARNING: 200-row cap applies BEFORE aggregation — COUNT queries on large codebases silently undercount. For fan-out/fan-in counting, use search_graph with min_degree/max_degree instead. Best for: relationship patterns, filtered joins, path queries. This is the correct tool for listing cross-service edges — use MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_path, r.confidence to see HTTP links with URLs and confidence scores, or MATCH (a)-[r:ASYNC_CALLS]->(b) for async dispatch edges. Always use LIMIT. Edge types: CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD, HANDLES, IMPLEMENTS.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
