@@ -494,6 +494,18 @@ func (p *Pipeline) extractClass(
 	// Determine specific label
 	label := classLabelForKind(node.Kind())
 
+	// Go type_spec: determine actual type from child (interface vs struct)
+	if node.Kind() == "type_spec" {
+		if typeNode := node.ChildByFieldName("type"); typeNode != nil {
+			switch typeNode.Kind() {
+			case "interface_type":
+				label = "Interface"
+			case "struct_type":
+				label = "Class"
+			}
+		}
+	}
+
 	startLine := int(node.StartPosition().Row) + 1
 	endLine := int(node.EndPosition().Row) + 1
 
@@ -838,11 +850,11 @@ func isExported(name string, language lang.Language) bool {
 
 func classLabelForKind(kind string) string {
 	switch kind {
-	case "interface_declaration", "trait_item", "trait_definition":
+	case "interface_declaration", "trait_item", "trait_definition", "trait_declaration":
 		return "Interface"
 	case "enum_declaration", "enum_item", "enum_specifier":
 		return "Enum"
-	case "type_declaration", "type_alias_declaration", "type_item":
+	case "type_declaration", "type_alias_declaration", "type_item", "type_spec", "type_alias":
 		return "Type"
 	case "union_specifier", "union_item":
 		return "Union"
