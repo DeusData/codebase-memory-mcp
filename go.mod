@@ -15,6 +15,7 @@ require (
 	github.com/tree-sitter/tree-sitter-rust v0.24.0
 	github.com/tree-sitter/tree-sitter-scala v0.24.0
 	github.com/tree-sitter/tree-sitter-typescript v0.23.2
+	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.37.1
 )
 

@@ -66,7 +66,10 @@ func (p *Pipeline) Run() error {
 	}
 	slog.Info("pipeline.discovered", "files", len(files))
 
-	if err := p.Store.WithTransaction(func() error {
+	if err := p.Store.WithTransaction(func(txStore *store.Store) error {
+		origStore := p.Store
+		p.Store = txStore
+		defer func() { p.Store = origStore }()
 		return p.runPasses(files)
 	}); err != nil {
 		return err
@@ -1177,11 +1180,15 @@ func (p *Pipeline) passImports() {
 
 // passHTTPLinks runs the HTTP linker to discover cross-service HTTP calls.
 func (p *Pipeline) passHTTPLinks() error {
-	// Clean up stale Route nodes and HTTP_CALLS/HANDLES/ASYNC_CALLS edges before re-running
+	// Clean up stale Route/InfraFile nodes and HTTP_CALLS/HANDLES/ASYNC_CALLS edges before re-running
 	_ = p.Store.DeleteNodesByLabel(p.ProjectName, "Route")
+	_ = p.Store.DeleteNodesByLabel(p.ProjectName, "InfraFile")
 	_ = p.Store.DeleteEdgesByType(p.ProjectName, "HTTP_CALLS")
 	_ = p.Store.DeleteEdgesByType(p.ProjectName, "HANDLES")
 	_ = p.Store.DeleteEdgesByType(p.ProjectName, "ASYNC_CALLS")
+
+	// Index infrastructure files (Dockerfiles, compose, cloudbuild, .env)
+	p.passInfraFiles()
 
 	// Scan config files for env var URLs and create synthetic Module nodes
 	envBindings := ScanProjectEnvURLs(p.RepoPath)

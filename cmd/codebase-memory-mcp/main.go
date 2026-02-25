@@ -25,7 +25,11 @@ func main() {
 
 	srv := tools.NewServer(s)
 
-	runErr := srv.MCPServer().Run(context.Background(), &mcp.StdioTransport{})
+	ctx, cancel := context.WithCancel(context.Background())
+	srv.StartWatcher(ctx)
+
+	runErr := srv.MCPServer().Run(ctx, &mcp.StdioTransport{})
+	cancel()
 	s.Close()
 	if runErr != nil {
 		log.Fatalf("server err=%v", runErr)
