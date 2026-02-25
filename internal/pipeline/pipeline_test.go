@@ -369,6 +369,125 @@ def run():
 	}
 }
 
+// TestGoTypeClassification verifies that Go interfaces, structs, and type aliases
+// are correctly classified as Interface, Class, and Type respectively.
+func TestGoTypeClassification(t *testing.T) {
+	dir, err := os.MkdirTemp("", "cgm-go-types-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	writeFile(t, filepath.Join(dir, "types.go"), `package types
+
+type Reader interface {
+	Read(p []byte) (n int, err error)
+}
+
+type Writer interface {
+	Write(p []byte) (n int, err error)
+}
+
+type Config struct {
+	Host string
+	Port int
+}
+
+type ID = string
+`)
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	p := New(s, dir)
+	if err := p.Run(); err != nil {
+		t.Fatalf("Pipeline.Run: %v", err)
+	}
+
+	// Check Interface nodes (Reader, Writer)
+	interfaces, _ := s.FindNodesByLabel(p.ProjectName, "Interface")
+	if len(interfaces) != 2 {
+		t.Errorf("expected 2 Interface nodes, got %d", len(interfaces))
+		for _, n := range interfaces {
+			t.Logf("  Interface: %s", n.Name)
+		}
+	}
+
+	// Check Class nodes (Config struct)
+	classes, _ := s.FindNodesByLabel(p.ProjectName, "Class")
+	if len(classes) != 1 {
+		t.Errorf("expected 1 Class node (struct), got %d", len(classes))
+		for _, n := range classes {
+			t.Logf("  Class: %s", n.Name)
+		}
+	} else if classes[0].Name != "Config" {
+		t.Errorf("expected Class name 'Config', got %q", classes[0].Name)
+	}
+
+	// Check Type nodes (ID type alias)
+	types, _ := s.FindNodesByLabel(p.ProjectName, "Type")
+	if len(types) != 1 {
+		t.Errorf("expected 1 Type node (alias), got %d", len(types))
+		for _, n := range types {
+			t.Logf("  Type: %s", n.Name)
+		}
+	} else if types[0].Name != "ID" {
+		t.Errorf("expected Type name 'ID', got %q", types[0].Name)
+	}
+}
+
+// TestGoGroupedTypeDeclaration verifies that grouped type declarations
+// (type ( ... )) also work correctly.
+func TestGoGroupedTypeDeclaration(t *testing.T) {
+	dir, err := os.MkdirTemp("", "cgm-go-grouped-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	writeFile(t, filepath.Join(dir, "models.go"), `package models
+
+type (
+	Request struct {
+		URL string
+	}
+
+	Response struct {
+		Status int
+	}
+
+	Handler interface {
+		Handle(req Request) Response
+	}
+)
+`)
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	p := New(s, dir)
+	if err := p.Run(); err != nil {
+		t.Fatalf("Pipeline.Run: %v", err)
+	}
+
+	// Should find 2 structs (Class) and 1 interface
+	classes, _ := s.FindNodesByLabel(p.ProjectName, "Class")
+	if len(classes) != 2 {
+		t.Errorf("expected 2 Class nodes (structs), got %d", len(classes))
+	}
+
+	interfaces, _ := s.FindNodesByLabel(p.ProjectName, "Interface")
+	if len(interfaces) != 1 {
+		t.Errorf("expected 1 Interface node, got %d", len(interfaces))
+	}
+}
+
 // TestFunctionRegistry tests the registry in isolation.
 func TestFunctionRegistry(t *testing.T) {
 	r := NewFunctionRegistry()
