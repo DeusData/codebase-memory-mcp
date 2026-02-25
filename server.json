@@ -1,0 +1,53 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.DeusData/codebase-memory-mcp",
+  "title": "Codebase Memory",
+  "description": "Persistent codebase knowledge graph. Survives session restarts and context compaction.",
+  "repository": {
+    "url": "https://github.com/DeusData/codebase-memory-mcp",
+    "source": "github"
+  },
+  "version": "0.1.3",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.1.3/codebase-memory-mcp-darwin-arm64.tar.gz",
+      "fileSha256": "7589a880b964abda8dfa735d2946b257752c1ad3f0a093b3146741c15a01af40",
+      "transport": {
+        "type": "stdio"
+      }
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.1.3/codebase-memory-mcp-darwin-amd64.tar.gz",
+      "fileSha256": "21db2204f9ff76c1e1f879f3eefb4c3943ded9eaaeb7c5aee4dc4c8ac5515185",
+      "transport": {
+        "type": "stdio"
+      }
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.1.3/codebase-memory-mcp-linux-amd64.tar.gz",
+      "fileSha256": "71a3874e9a3999246c0d98def6e9bee1ca88302913ee2330ddbc8cde5774cfee",
+      "transport": {
+        "type": "stdio"
+      }
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.1.3/codebase-memory-mcp-linux-arm64.tar.gz",
+      "fileSha256": "400976941a31b8f68bcff930c24f1399c8df39ff533400e0ce51f83898fcea9c",
+      "transport": {
+        "type": "stdio"
+      }
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.1.3/codebase-memory-mcp-windows-amd64.zip",
+      "fileSha256": "f5de16d05ea26b7d3aa90e0f703e114edeb9d28cc44f0b90bac44141061de4af",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

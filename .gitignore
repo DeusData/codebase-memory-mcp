@@ -26,3 +26,9 @@ Thumbs.db
 *.db
 *.db-wal
 *.db-shm
+
+# MCP Registry auth tokens
+.mcpregistry_*
+
+# Local project memory (Claude Code auto-memory)
+memory/
