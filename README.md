@@ -202,35 +202,41 @@ Restart Claude Code after adding the config. Verify with `/mcp` — you should s
 You: "Index this project"
 ```
 
-Claude Code will call `index_repository` and build the knowledge graph. After indexing, you can ask structural questions like *"what calls main?"*, *"find dead code"*, or *"show cross-service HTTP calls"*.
+Claude Code will call `index_repository` with your project's root path and build the knowledge graph. After indexing, you can ask structural questions like *"what calls main?"*, *"find dead code"*, or *"show cross-service HTTP calls"*.
+
+> **Note**: `index_repository` requires a `repo_path` parameter. When you say "Index this project", Claude Code infers the path from its working directory. If indexing fails, pass the path explicitly: `index_repository(repo_path="/absolute/path/to/project")`.
+
+**When to reindex**: Run `index_repository` again after adding new files, moving functions, or making significant code changes. Incremental reindex is fast — only changed files are re-parsed (content-hash based). Check staleness with `list_projects` which shows `indexed_at` timestamps.
 
 ## MCP Tools
 
 ### Indexing
 
-| Tool | Description |
-|------|-------------|
-| `index_repository` | Index a repository into the graph. Supports incremental reindex via content hashing. |
-| `list_projects` | List all indexed projects with timestamps and node/edge counts. |
-| `delete_project` | Remove a project and all its graph data. |
+| Tool | Key Parameters | Description |
+|------|---------------|-------------|
+| `index_repository` | `repo_path` (required) | Index a repository into the graph. Supports incremental reindex via content hashing — only changed files are re-parsed. |
+| `list_projects` | — | List all indexed projects with `indexed_at` timestamps and node/edge counts. Use to check if a reindex is needed. |
+| `delete_project` | `project_name` (required) | Remove a project and all its graph data. Irreversible. |
 
 ### Querying
 
-| Tool | Description |
-|------|-------------|
-| `search_graph` | Structured search with filters: label, name pattern (regex), file pattern (glob), relationship type, degree (fan-in/fan-out), entry point exclusion. |
-| `trace_call_path` | BFS traversal from/to a function. Returns call chains with signatures, constants, and edge types. |
-| `query_graph` | Execute Cypher-like graph queries (read-only). |
-| `get_graph_schema` | Node/edge counts, relationship patterns, sample names. |
-| `get_code_snippet` | Read source code for a function by qualified name (reads from disk). |
+| Tool | Key Parameters | Description |
+|------|---------------|-------------|
+| `search_graph` | `label`, `name_pattern`, `project`, `file_pattern`, `relationship`, `direction`, `min_degree`, `max_degree`, `exclude_entry_points`, `limit` (default 100), `offset` | Structured search with filters. Use `project` to scope to a single repo when multiple are indexed. Supports pagination via `limit`/`offset` — response includes `has_more` and `total`. |
+| `trace_call_path` | `function_name` (required), `direction` (inbound/outbound/both), `depth` (1-5, default 3) | BFS traversal from/to a function (exact name match). Returns call chains with signatures, constants, and edge types. Capped at 200 nodes. |
+| `query_graph` | `query` (required) | Execute Cypher-like graph queries (read-only). See [Supported Cypher Subset](#supported-cypher-subset) for what's supported. |
+| `get_graph_schema` | — | Node/edge counts, relationship patterns, sample names. Run this first to understand what's in the graph. |
+| `get_code_snippet` | `qualified_name` (required) | Read source code for a function by its qualified name (reads from disk). See [Qualified Names](#qualified-names) for the format. |
 
 ### File Access
 
-| Tool | Description |
-|------|-------------|
-| `search_code` | Grep-like text search within indexed project files. |
-| `read_file` | Read any file from an indexed project (with optional line range). |
-| `list_directory` | List files/directories with glob filtering. |
+> **Note**: These tools require at least one indexed project. They resolve relative paths against indexed project roots. Index a project first with `index_repository`.
+
+| Tool | Key Parameters | Description |
+|------|---------------|-------------|
+| `search_code` | `pattern` (required), `file_pattern`, `regex`, `max_results` (default 100), `offset` | Grep-like text search within indexed project files. Supports pagination via `max_results`/`offset`. |
+| `read_file` | `path`, `start_line`, `end_line` | Read any file from an indexed project. Path can be absolute or relative to project root. |
+| `list_directory` | `path`, `pattern` | List files/directories with optional glob filtering (e.g. `*.go`, `*.py`). |
 
 ## Usage Examples
 
@@ -298,6 +304,37 @@ query_graph(query="MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_pa
 search_graph(label="Function", relationship="CALLS", direction="outbound", min_degree=10)
 ```
 
+### Scope queries to a single project
+
+When multiple repositories are indexed, use `project` to avoid cross-project contamination:
+
+```
+search_graph(label="Function", name_pattern=".*Handler", project="my-api")
+```
+
+### Discover then trace (when you don't know the exact name)
+
+`trace_call_path` requires an exact function name match. Use `search_graph` first to discover the correct name:
+
+```
+search_graph(label="Function", name_pattern=".*Order.*")
+# → finds "ProcessOrder", "ValidateOrder", etc.
+
+trace_call_path(function_name="ProcessOrder", direction="inbound", depth=3)
+```
+
+### Paginate large result sets
+
+All search tools support pagination. The response includes `total`, `has_more`, `limit`, and `offset`:
+
+```
+search_graph(label="Function", limit=50, offset=0)
+# → {total: 449, has_more: true, limit: 50, offset: 0, results: [...]}
+
+search_graph(label="Function", limit=50, offset=50)
+# → next page
+```
+
 ## Graph Data Model
 
 ### Node Labels
@@ -314,6 +351,52 @@ search_graph(label="Function", relationship="CALLS", direction="outbound", min_d
 - **Module**: `constants` (list of module-level constants)
 - **Route**: `method`, `path`, `handler`
 - **All nodes**: `name`, `qualified_name`, `file_path`, `start_line`, `end_line`
+
+### Edge Properties
+
+- **HTTP_CALLS**: `confidence` (0.0–1.0), `url_path`, `http_method`
+- **CALLS**: `via` (e.g. `"route_registration"` for handler wiring)
+
+Edge properties are accessible in Cypher queries: `MATCH (a)-[r:HTTP_CALLS]->(b) RETURN r.confidence, r.url_path`
+
+### Qualified Names
+
+`get_code_snippet` and graph results use **qualified names** in the format `<project>.<path_parts>.<name>`:
+
+| Language | Source | Qualified Name |
+|----------|--------|---------------|
+| Go | `cmd/server/main.go` → `HandleRequest` | `myproject.cmd.server.main.HandleRequest` |
+| Python | `services/orders.py` → `ProcessOrder` | `myproject.services.orders.ProcessOrder` |
+| Python | `services/__init__.py` → `setup` | `myproject.services.setup` |
+| TypeScript | `src/components/App.tsx` → `App` | `myproject.src.components.App.App` |
+| Method | `UserService.GetUser` | `myproject.pkg.service.UserService.GetUser` |
+
+The format is: project name, file path with `/` replaced by `.` and extension removed, then the symbol name. Use `search_graph` to discover qualified names before passing them to `get_code_snippet`.
+
+### Supported Cypher Subset
+
+`query_graph` supports a subset of the Cypher query language. Results are capped at 200 rows.
+
+**Supported:**
+- `MATCH` with node labels: `(f:Function)`
+- `MATCH` with relationship types: `-[:CALLS]->`
+- `MATCH` with variable-length paths: `-[:CALLS*1..3]->`
+- `WHERE` with `=`, `<>`, `>`, `<`, `>=`, `<=`
+- `WHERE` with `=~` (regex), `CONTAINS`, `STARTS WITH`
+- `WHERE` with `AND`, `OR`, `NOT`
+- `RETURN` with property access: `f.name`, `r.confidence`
+- `RETURN` with `COUNT(x)`, `DISTINCT`
+- `ORDER BY` with `ASC`/`DESC`
+- `LIMIT`
+- Edge property access: `r.confidence`, `r.url_path`
+
+**Not supported:**
+- `WITH` clauses
+- `COLLECT`, `SUM`, or other aggregation functions (except `COUNT`)
+- `CREATE`, `DELETE`, `SET`, `MERGE` (read-only)
+- `OPTIONAL MATCH`
+- `UNION`
+- Variable-length path edge property binding (can't access individual edges in a path like `*1..3`)
 
 ## Teaching Claude Code to Use the Graph
 
@@ -338,8 +421,10 @@ Graph queries return precise results in a single tool call (~500 tokens) vs file
 - **Dead code**: `search_graph(label="Function", relationship="CALLS", direction="inbound", max_degree=0, exclude_entry_points=true)`
 - **Cross-service calls**: `search_graph(relationship="HTTP_CALLS")` or `query_graph` with Cypher
 - **REST routes**: `search_graph(label="Route")`
+- **Scope to one project**: `search_graph(..., project="project-name")` when multiple repos are indexed
 - **Understand structure first**: `get_graph_schema` before writing complex queries
 - **Read source**: `get_code_snippet(qualified_name="...")` after finding functions via search
+- **Discover then trace**: Use `search_graph(name_pattern=".*Partial.*")` to find exact names, then `trace_call_path`
 - **Complex patterns**: `query_graph` with Cypher for multi-hop graph traversals
 
 Use grep/Glob for text search (string literals, error messages, config values) — the graph doesn't index text content.
@@ -383,6 +468,24 @@ Create `~/.claude/skills/codebase-memory.md` for automatic activation when relev
 - Reindex after significant code changes (new files, moved functions)
 ```
 
+## Ignoring Files (`.cgrignore`)
+
+Place a `.cgrignore` file in your project root to exclude directories or files from indexing. The syntax is one glob pattern per line (comments with `#`):
+
+```
+# .cgrignore
+generated
+vendor
+__pycache__
+*.pb.go
+testdata
+fixtures
+```
+
+Patterns are matched against both directory names and relative paths using Go's `filepath.Match` syntax. Directories matching a pattern are skipped entirely (including all contents).
+
+The following directories are **always ignored** regardless of `.cgrignore`: `.git`, `node_modules`, `vendor`, `__pycache__`, `.mypy_cache`, `.venv`, `dist`, `build`, `.cache`, `.idea`, `.vscode`, and others.
+
 ## Persistence
 
 The SQLite database is stored at `~/.cache/codebase-memory-mcp/codebase-memory.db`. It persists across restarts automatically (WAL mode, ACID-safe).
@@ -401,6 +504,20 @@ make test     # Run all tests
 make lint     # Run golangci-lint
 make install  # go install
 ```
+
+## Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| `/mcp` doesn't show the server | Config not loaded or binary not found | Check `.mcp.json` path is absolute and correct. Restart Claude Code. Verify binary runs: `/path/to/codebase-memory-mcp` should output JSON. |
+| `index_repository` fails | Missing `repo_path` or path doesn't exist | Pass an absolute path: `index_repository(repo_path="/absolute/path")` |
+| `read_file` / `list_directory` returns error | No project indexed yet | Run `index_repository` first. These tools resolve paths against indexed project roots. |
+| `get_code_snippet` returns "node not found" | Wrong qualified name format | Use `search_graph` first to find the exact `qualified_name`, then pass it to `get_code_snippet`. See [Qualified Names](#qualified-names). |
+| `trace_call_path` returns 0 results | Exact name match — no fuzzy matching | Use `search_graph(name_pattern=".*PartialName.*")` to discover the exact function name first. |
+| Queries return results from wrong project | Multiple projects indexed, no filter | Add `project="your-project-name"` to `search_graph`. Use `list_projects` to see indexed project names. |
+| Graph is missing recently added files | Index is stale | Re-run `index_repository`. Incremental reindex only re-parses changed files. |
+| Binary not found after install | `~/.local/bin` not on PATH | Add to your shell profile: `export PATH="$HOME/.local/bin:$PATH"` |
+| Cypher query fails with parse error | Unsupported Cypher feature | See [Supported Cypher Subset](#supported-cypher-subset). `WITH`, `COLLECT`, `OPTIONAL MATCH` are not supported. |
 
 ## Architecture
 
