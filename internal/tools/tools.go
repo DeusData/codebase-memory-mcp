@@ -28,7 +28,7 @@ func NewServer(s *store.Store) *Server {
 		mcp: mcp.NewServer(
 			&mcp.Implementation{
 				Name:    "codebase-memory-mcp",
-				Version: "0.1.1",
+				Version: "0.1.2",
 			},
 			nil,
 		),
