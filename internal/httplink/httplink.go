@@ -19,6 +19,7 @@ type RouteHandler struct {
 	Method        string
 	FunctionName  string
 	QualifiedName string
+	HandlerRef    string // resolved handler function reference (e.g. "h.CreateOrder")
 }
 
 // HTTPCallSite represents a discovered HTTP call site.
@@ -40,8 +41,9 @@ type HTTPLink struct {
 
 // Linker discovers cross-service HTTP calls and creates HTTP_CALLS edges.
 type Linker struct {
-	store   *store.Store
-	project string
+	store        *store.Store
+	project      string
+	routesByFunc map[string][]int // funcQN → indices into routes slice
 }
 
 // New creates a new HTTP Linker.
@@ -59,6 +61,10 @@ var (
 
 	// Go gin group: .Group("/prefix")
 	goGroupRe = regexp.MustCompile(`(\w+)\s*(?::=|=)\s*\w+\.Group\(\s*["']([^"']+)["']`)
+
+	// Go gin route handler reference: captures the last argument (handler, not middleware)
+	// .POST("/path", h.CreateOrder) or .POST("/path", middleware, h.CreateOrder)
+	goRouteHandlerRe = regexp.MustCompile(`\.(GET|POST|PUT|DELETE|PATCH)\s*\(\s*"[^"]*"\s*(?:,\s*[\w.]+)*,\s*([\w.]+)\s*\)`)
 
 	// Express.js routes: app.get("/path", router.post("/path"
 	expressRouteRe = regexp.MustCompile(`\w+\.(get|post|put|delete|patch)\(\s*["'` + "`" + `]([^"'` + "`" + `]+)["'` + "`" + `]`)
@@ -91,11 +97,23 @@ func (l *Linker) Run() ([]HTTPLink, error) {
 	}
 	rootPath := proj.RootPath
 
+	l.routesByFunc = make(map[string][]int)
 	routes := l.discoverRoutes(rootPath)
 	slog.Info("httplink.routes", "count", len(routes))
 
+	// Build routesByFunc index
+	for i, rh := range routes {
+		l.routesByFunc[rh.QualifiedName] = append(l.routesByFunc[rh.QualifiedName], i)
+	}
+
+	// Resolve cross-file group prefixes before inserting Route nodes
+	l.resolveCrossFileGroupPrefixes(routes, rootPath)
+
 	// Insert Route nodes and HANDLES edges
 	l.insertRouteNodes(routes)
+
+	// Create CALLS edges for route handler references (e.g. .POST("/path", h.Handler))
+	l.createRegistrationCallEdges(routes)
 
 	callSites := l.discoverCallSites(rootPath)
 	slog.Info("httplink.callsites", "count", len(callSites))
@@ -275,11 +293,19 @@ func extractGoRoutes(f *store.Node, source string) []RouteHandler {
 			}
 		}
 
+		// Capture handler reference (last argument) for CALLS edge creation
+		var handlerRef string
+		hm := goRouteHandlerRe.FindStringSubmatch(line)
+		if hm != nil {
+			handlerRef = hm[2]
+		}
+
 		routes = append(routes, RouteHandler{
 			Path:          path,
 			Method:        method,
 			FunctionName:  f.Name,
 			QualifiedName: f.QualifiedName,
+			HandlerRef:    handlerRef,
 		})
 	}
 
@@ -956,6 +982,133 @@ func sameService(qn1, qn2 string) bool {
 	dir1 := strings.Join(parts1[:len(parts1)-strip], ".")
 	dir2 := strings.Join(parts2[:len(parts2)-strip], ".")
 	return dir1 == dir2
+}
+
+// crossFileGroupRe matches patterns like: funcName(something.Group("/prefix"))
+// Captures the function name being called and the group prefix.
+var crossFileGroupRe = regexp.MustCompile(`(\w+)\s*\(\s*\w+\.Group\s*\(\s*"([^"]+)"\s*\)`)
+
+// crossFileGroupVarRe matches the variable-based pattern:
+// varName := something.Group("/prefix")
+// ... (next line)
+// funcName(varName)
+var crossFileGroupVarRe = regexp.MustCompile(`(\w+)\s*:?=\s*\w+\.Group\s*\(\s*"([^"]+)"\s*\)`)
+
+// resolveCrossFileGroupPrefixes resolves Group() prefixes from caller functions
+// for routes that were registered without a group prefix within their own function.
+func (l *Linker) resolveCrossFileGroupPrefixes(routes []RouteHandler, rootPath string) {
+	// For each function that registered routes, check if callers pass a Group() result
+	for funcQN, indices := range l.routesByFunc {
+		funcNode, _ := l.store.FindNodeByQN(l.project, funcQN)
+		if funcNode == nil {
+			continue
+		}
+
+		// Find inbound CALLS edges to this function
+		callerEdges, _ := l.store.FindEdgesByTargetAndType(funcNode.ID, "CALLS")
+		if len(callerEdges) == 0 {
+			continue
+		}
+
+		// Check each caller's source for Group() prefix passing
+		for _, edge := range callerEdges {
+			callerNode, _ := l.store.FindNodeByID(edge.SourceID)
+			if callerNode == nil || callerNode.FilePath == "" || callerNode.StartLine <= 0 {
+				continue
+			}
+
+			callerSource := readSourceLines(rootPath, callerNode.FilePath, callerNode.StartLine, callerNode.EndLine)
+			if callerSource == "" {
+				continue
+			}
+
+			// Pattern 1: direct — RegisterRoutes(router.Group("/api"))
+			for _, m := range crossFileGroupRe.FindAllStringSubmatch(callerSource, -1) {
+				calledFunc := m[1]
+				prefix := m[2]
+				if calledFunc == funcNode.Name {
+					l.prependPrefixToRoutes(routes, indices, prefix)
+					break
+				}
+			}
+
+			// Pattern 2: variable-based — v1 := router.Group("/api"); RegisterRoutes(v1)
+			varPrefixes := map[string]string{}
+			for _, m := range crossFileGroupVarRe.FindAllStringSubmatch(callerSource, -1) {
+				varPrefixes[m[1]] = m[2]
+			}
+			if len(varPrefixes) > 0 {
+				// Look for funcName(varName) calls
+				callRe := regexp.MustCompile(regexp.QuoteMeta(funcNode.Name) + `\s*\(\s*(\w+)`)
+				for _, cm := range callRe.FindAllStringSubmatch(callerSource, -1) {
+					argName := cm[1]
+					if prefix, ok := varPrefixes[argName]; ok {
+						l.prependPrefixToRoutes(routes, indices, prefix)
+						break
+					}
+				}
+			}
+		}
+	}
+}
+
+// prependPrefixToRoutes prepends a group prefix to routes at the given indices,
+// but only if the route path doesn't already start with the prefix.
+func (l *Linker) prependPrefixToRoutes(routes []RouteHandler, indices []int, prefix string) {
+	for _, idx := range indices {
+		rh := &routes[idx]
+		normalizedPrefix := strings.TrimRight(prefix, "/")
+		if !strings.HasPrefix(rh.Path, normalizedPrefix) {
+			rh.Path = normalizedPrefix + "/" + strings.TrimLeft(rh.Path, "/")
+		}
+	}
+	slog.Info("httplink.cross_file_prefix", "prefix", prefix, "routes", len(indices))
+}
+
+// createRegistrationCallEdges creates CALLS edges from route-registering functions
+// to the handler functions they reference (e.g. .POST("/path", h.CreateOrder)).
+func (l *Linker) createRegistrationCallEdges(routes []RouteHandler) {
+	count := 0
+	for _, rh := range routes {
+		if rh.HandlerRef == "" {
+			continue
+		}
+
+		// Find the registering function node
+		registrar, _ := l.store.FindNodeByQN(l.project, rh.QualifiedName)
+		if registrar == nil {
+			continue
+		}
+
+		// Resolve handler reference — try method name (strip receiver prefix like "h.")
+		handlerName := rh.HandlerRef
+		if idx := strings.LastIndex(handlerName, "."); idx >= 0 {
+			handlerName = handlerName[idx+1:]
+		}
+
+		// Search for the handler function/method by name
+		handlerNodes, _ := l.store.FindNodesByName(l.project, handlerName)
+		if len(handlerNodes) == 0 {
+			continue
+		}
+
+		// Use the first match (typically unique within a project)
+		handler := handlerNodes[0]
+
+		_, _ = l.store.InsertEdge(&store.Edge{
+			Project:  l.project,
+			SourceID: registrar.ID,
+			TargetID: handler.ID,
+			Type:     "CALLS",
+			Properties: map[string]any{
+				"via": "route_registration",
+			},
+		})
+		count++
+	}
+	if count > 0 {
+		slog.Info("httplink.registration_edges", "count", count)
+	}
 }
 
 // readSourceLines reads specific lines from a file on disk.
