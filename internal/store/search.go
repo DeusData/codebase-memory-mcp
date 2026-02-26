@@ -249,28 +249,15 @@ func (s *Store) batchCountDegrees(nodeIDs []int64, relationship string) (map[int
 		var inQueryArgs []any
 		if relationship != "" {
 			inQuery = fmt.Sprintf("SELECT target_id, COUNT(*) FROM edges WHERE target_id IN (%s) AND type=? GROUP BY target_id", inClause)
-			inQueryArgs = append(inArgs, relationship)
+			inQueryArgs = append(append([]any{}, inArgs...), relationship)
 		} else {
 			inQuery = fmt.Sprintf("SELECT target_id, COUNT(*) FROM edges WHERE target_id IN (%s) GROUP BY target_id", inClause)
 			inQueryArgs = inArgs
 		}
 
-		rows, err := s.q.Query(inQuery, inQueryArgs...)
-		if err != nil {
+		if err := s.scanDegrees(inQuery, inQueryArgs, result, true); err != nil {
 			return nil, fmt.Errorf("batch count in-degree: %w", err)
 		}
-		for rows.Next() {
-			var id int64
-			var count int
-			if err := rows.Scan(&id, &count); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			dp := result[id]
-			dp.InDegree = count
-			result[id] = dp
-		}
-		rows.Close()
 
 		// Count outbound (source_id)
 		var outQuery string
@@ -283,25 +270,37 @@ func (s *Store) batchCountDegrees(nodeIDs []int64, relationship string) (map[int
 			outQueryArgs = inArgs
 		}
 
-		rows, err = s.q.Query(outQuery, outQueryArgs...)
-		if err != nil {
+		if err := s.scanDegrees(outQuery, outQueryArgs, result, false); err != nil {
 			return nil, fmt.Errorf("batch count out-degree: %w", err)
 		}
-		for rows.Next() {
-			var id int64
-			var count int
-			if err := rows.Scan(&id, &count); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			dp := result[id]
-			dp.OutDegree = count
-			result[id] = dp
-		}
-		rows.Close()
 	}
 
 	return result, nil
+}
+
+// scanDegrees runs a degree-count query and populates the result map.
+// If inbound is true, sets InDegree; otherwise sets OutDegree.
+func (s *Store) scanDegrees(query string, args []any, result map[int64]degreePair, inbound bool) error {
+	rows, err := s.q.Query(query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var count int
+		if err := rows.Scan(&id, &count); err != nil {
+			return err
+		}
+		dp := result[id]
+		if inbound {
+			dp.InDegree = count
+		} else {
+			dp.OutDegree = count
+		}
+		result[id] = dp
+	}
+	return rows.Err()
 }
 
 // buildFilteredResults applies degree, direction, and entry-point filters to nodes,

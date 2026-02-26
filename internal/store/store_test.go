@@ -360,12 +360,12 @@ func TestExtractLikeHints(t *testing.T) {
 		{".*Order.*Handler.*", []string{"Order", "Handler"}},
 		{"handler", []string{"handler"}},
 		{"^handleRequest$", []string{"handleRequest"}},
-		{".*", nil},               // no literal >= 3 chars
-		{".*ab.*", nil},           // "ab" is only 2 chars, below threshold
-		{".*abc.*", []string{"abc"}}, // exactly 3 chars, included
-		{".*foo|.*bar", nil},      // alternation → bail out
+		{".*", nil},                    // no literal >= 3 chars
+		{".*ab.*", nil},                // "ab" is only 2 chars, below threshold
+		{".*abc.*", []string{"abc"}},   // exactly 3 chars, included
+		{".*foo|.*bar", nil},           // alternation → bail out
 		{".*Order.*|.*Handler.*", nil}, // alternation → bail out
-		{"\\.", nil},              // escaped dot is ".", only 1 char
+		{"\\.", nil},                   // escaped dot is ".", only 1 char
 		{".*test_.*helper.*", []string{"test_", "helper"}},
 	}
 	for _, tt := range tests {
@@ -469,9 +469,9 @@ func TestPragmaSettings(t *testing.T) {
 		pragma string
 		want   string
 	}{
-		{"synchronous", "0"},     // OFF for in-memory
-		{"temp_store", "2"},      // MEMORY
-		{"foreign_keys", "1"},    // ON
+		{"synchronous", "0"},  // OFF for in-memory
+		{"temp_store", "2"},   // MEMORY
+		{"foreign_keys", "1"}, // ON
 	}
 	for _, tt := range tests {
 		var val string
@@ -739,10 +739,10 @@ func TestBatchCountDegrees(t *testing.T) {
 	idB, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "B", QualifiedName: "test.B"})
 	idC, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "C", QualifiedName: "test.C"})
 
-	s.InsertEdge(&Edge{Project: "test", SourceID: idA, TargetID: idB, Type: "CALLS"})
-	s.InsertEdge(&Edge{Project: "test", SourceID: idA, TargetID: idC, Type: "CALLS"})
-	s.InsertEdge(&Edge{Project: "test", SourceID: idB, TargetID: idC, Type: "CALLS"})
-	s.InsertEdge(&Edge{Project: "test", SourceID: idA, TargetID: idC, Type: "USAGE"})
+	_, _ = s.InsertEdge(&Edge{Project: "test", SourceID: idA, TargetID: idB, Type: "CALLS"})
+	_, _ = s.InsertEdge(&Edge{Project: "test", SourceID: idA, TargetID: idC, Type: "CALLS"})
+	_, _ = s.InsertEdge(&Edge{Project: "test", SourceID: idB, TargetID: idC, Type: "CALLS"})
+	_, _ = s.InsertEdge(&Edge{Project: "test", SourceID: idA, TargetID: idC, Type: "USAGE"})
 
 	// Batch count all types
 	degrees, err := s.batchCountDegrees([]int64{idA, idB, idC}, "")

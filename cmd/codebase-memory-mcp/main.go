@@ -186,16 +186,18 @@ func printArraySummary(toolName string, arr []any, dbPath string) {
 		}
 		fmt.Printf("%d project(s) indexed:\n", len(arr))
 		for _, item := range arr {
-			if m, ok := item.(map[string]any); ok {
-				name, _ := m["name"].(string)
-				nodes := jsonInt(m["nodes"])
-				edges := jsonInt(m["edges"])
-				indexedAt, _ := m["indexed_at"].(string)
-				rootPath, _ := m["root_path"].(string)
-				fmt.Printf("  %-30s %d nodes, %d edges  (indexed %s)\n", name, nodes, edges, indexedAt)
-				if rootPath != "" {
-					fmt.Printf("  %-30s %s\n", "", rootPath)
-				}
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			name, _ := m["name"].(string)
+			nodes := jsonInt(m["nodes"])
+			edges := jsonInt(m["edges"])
+			indexedAt, _ := m["indexed_at"].(string)
+			rootPath, _ := m["root_path"].(string)
+			fmt.Printf("  %-30s %d nodes, %d edges  (indexed %s)\n", name, nodes, edges, indexedAt)
+			if rootPath != "" {
+				fmt.Printf("  %-30s %s\n", "", rootPath)
 			}
 		}
 		fmt.Printf("\n  db: %s\n", dbPath)
@@ -228,17 +230,19 @@ func printSearchGraphSummary(data map[string]any) {
 	fmt.Println()
 
 	for _, r := range results {
-		if m, ok := r.(map[string]any); ok {
-			name, _ := m["name"].(string)
-			label, _ := m["label"].(string)
-			filePath, _ := m["file_path"].(string)
-			startLine := jsonInt(m["start_line"])
-			fmt.Printf("  [%s] %s", label, name)
-			if filePath != "" {
-				fmt.Printf("  %s:%d", filePath, startLine)
-			}
-			fmt.Println()
+		m, ok := r.(map[string]any)
+		if !ok {
+			continue
 		}
+		name, _ := m["name"].(string)
+		label, _ := m["label"].(string)
+		filePath, _ := m["file_path"].(string)
+		startLine := jsonInt(m["start_line"])
+		fmt.Printf("  [%s] %s", label, name)
+		if filePath != "" {
+			fmt.Printf("  %s:%d", filePath, startLine)
+		}
+		fmt.Println()
 	}
 }
 

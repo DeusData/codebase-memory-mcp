@@ -233,21 +233,22 @@ func (s *Store) resolveNodeIDs(project string, qns []string, idMap map[string]in
 		query := fmt.Sprintf("SELECT id, qualified_name FROM nodes WHERE project = ? AND qualified_name IN (%s)",
 			strings.Join(placeholders, ","))
 
-		rows, err := s.q.Query(query, args...)
-		if err != nil {
-			return fmt.Errorf("resolve node IDs: %w", err)
-		}
-		for rows.Next() {
-			var id int64
-			var qn string
-			if err := rows.Scan(&id, &qn); err != nil {
-				rows.Close()
-				return err
+		if err := func() error {
+			rows, err := s.q.Query(query, args...)
+			if err != nil {
+				return fmt.Errorf("resolve node IDs: %w", err)
 			}
-			idMap[qn] = id
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
+			defer rows.Close()
+			for rows.Next() {
+				var id int64
+				var qn string
+				if err := rows.Scan(&id, &qn); err != nil {
+					return err
+				}
+				idMap[qn] = id
+			}
+			return rows.Err()
+		}(); err != nil {
 			return err
 		}
 	}

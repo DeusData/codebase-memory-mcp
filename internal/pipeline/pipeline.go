@@ -569,7 +569,7 @@ func (p *Pipeline) passDefinitions(files []discover.FileInfo) {
 	slog.Info("pass2.definitions")
 
 	// Separate JSON files (processed sequentially, they're fast and few)
-	var parseableFiles []discover.FileInfo
+	parseableFiles := make([]discover.FileInfo, 0, len(files))
 	for _, f := range files {
 		if f.Language == lang.JSON {
 			if err := p.processJSONFile(f); err != nil {
@@ -1079,7 +1079,7 @@ func (p *Pipeline) resolveFileCalls(relPath string, cached *cachedAST) []resolve
 
 // processFileCalls is the legacy sequential entry point for incremental re-indexing.
 // It resolves calls for a single file and writes edges to DB immediately.
-func (p *Pipeline) processFileCalls(relPath string, cached *cachedAST, spec *lang.LanguageSpec) {
+func (p *Pipeline) processFileCalls(relPath string, cached *cachedAST, _ *lang.LanguageSpec) {
 	edges := p.resolveFileCalls(relPath, cached)
 	for _, re := range edges {
 		callerNode, _ := p.Store.FindNodeByQN(p.ProjectName, re.CallerQN)

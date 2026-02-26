@@ -78,6 +78,7 @@ func (e *Executor) executePlan(plan *Plan) (*Result, error) {
 	return e.projectResults(allBindings, plan.ReturnSpec)
 }
 
+//nolint:gocognit // step dispatch with fusion/push-down is inherently branchy
 func (e *Executor) executeStepsForProject(project string, steps []PlanStep) ([]binding, error) {
 	var bindings []binding
 
