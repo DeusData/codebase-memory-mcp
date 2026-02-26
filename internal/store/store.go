@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // Querier abstracts *sql.DB and *sql.Tx so store methods work in both contexts.
@@ -74,20 +74,24 @@ func Open(project string) (*Store, error) {
 
 // OpenPath opens a SQLite database at the given path.
 func OpenPath(dbPath string) (*Store, error) {
-	dsn := dbPath + "?_pragma=journal_mode(WAL)" +
-		"&_pragma=busy_timeout(5000)" +
-		"&_pragma=foreign_keys(ON)" +
-		"&_pragma=synchronous(NORMAL)" +
-		"&_pragma=cache_size(-8192)" +
-		"&_pragma=temp_store(MEMORY)" +
-		"&_pragma=mmap_size(268435456)" // 256 MB mmap for fast reads
-	db, err := sql.Open("sqlite", dsn)
+	dsn := dbPath + "?_journal_mode=WAL" +
+		"&_busy_timeout=5000" +
+		"&_foreign_keys=1" +
+		"&_synchronous=NORMAL" +
+		"&_cache_size=-65536" + // 64 MB
+		"&_txlock=immediate"
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	// Single connection: SQLite is single-writer, pool adds lock contention.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
+
+	// PRAGMAs not supported in mattn DSN — set via Exec after Open.
+	_, _ = db.Exec("PRAGMA temp_store = MEMORY")
+	_, _ = db.Exec("PRAGMA mmap_size = 1073741824") // 1 GB
+
 	s := &Store{db: db, dbPath: dbPath}
 	s.q = s.db
 	if err := s.initSchema(); err != nil {
@@ -99,13 +103,13 @@ func OpenPath(dbPath string) (*Store, error) {
 
 // OpenMemory opens an in-memory SQLite database (for testing).
 func OpenMemory() (*Store, error) {
-	dsn := ":memory:?_pragma=foreign_keys(ON)" +
-		"&_pragma=synchronous(OFF)" +
-		"&_pragma=temp_store(MEMORY)"
-	db, err := sql.Open("sqlite", dsn)
+	dsn := ":memory:?_foreign_keys=1" +
+		"&_synchronous=OFF"
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open memory db: %w", err)
 	}
+	_, _ = db.Exec("PRAGMA temp_store = MEMORY")
 	s := &Store{db: db, dbPath: ":memory:"}
 	s.q = s.db
 	if err := s.initSchema(); err != nil {
@@ -133,11 +137,26 @@ func (s *Store) WithTransaction(fn func(txStore *Store) error) error {
 }
 
 // Checkpoint forces a WAL checkpoint, moving pages from WAL to the main DB,
-// then runs ANALYZE so the query planner has up-to-date statistics.
-// Cost is absorbed during indexing rather than charged to the first read query.
+// then runs PRAGMA optimize so the query planner has up-to-date statistics.
+// PRAGMA optimize (SQLite 3.46+) auto-limits sampling per index, only re-analyzing
+// stale stats. Cost is absorbed during indexing rather than the first read query.
 func (s *Store) Checkpoint() {
 	_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
-	_, _ = s.db.Exec("ANALYZE")
+	_, _ = s.db.Exec("PRAGMA optimize")
+}
+
+// BeginBulkWrite switches to MEMORY journal mode for faster bulk writes.
+// Call EndBulkWrite when done to restore WAL mode.
+// MEMORY mode is rollback-safe on crash (unlike journal_mode=OFF).
+func (s *Store) BeginBulkWrite() {
+	_, _ = s.db.Exec("PRAGMA journal_mode = MEMORY")
+	_, _ = s.db.Exec("PRAGMA synchronous = OFF")
+}
+
+// EndBulkWrite restores WAL journal mode and NORMAL synchronous after bulk writes.
+func (s *Store) EndBulkWrite() {
+	_, _ = s.db.Exec("PRAGMA synchronous = NORMAL")
+	_, _ = s.db.Exec("PRAGMA journal_mode = WAL")
 }
 
 // Close closes the database connection.
@@ -210,7 +229,7 @@ func (s *Store) initSchema() error {
 	}
 
 	// Migration: add url_path generated column to edges table.
-	// Generated columns require SQLite 3.31.0+ (modernc.org/sqlite supports this).
+	// Generated columns require SQLite 3.31.0+ (mattn/go-sqlite3 supports this).
 	// We check if the column already exists to make this idempotent.
 	var colCount int
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_xinfo('edges') WHERE name='url_path_gen'`).Scan(&colCount)

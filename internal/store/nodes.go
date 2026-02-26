@@ -104,6 +104,48 @@ func (s *Store) DeleteNodesByLabel(project, label string) error {
 	return err
 }
 
+// FindNodesByIDs returns a map of nodeID → *Node for the given IDs.
+func (s *Store) FindNodesByIDs(ids []int64) (map[int64]*Node, error) {
+	if len(ids) == 0 {
+		return map[int64]*Node{}, nil
+	}
+	result := make(map[int64]*Node, len(ids))
+	const batchSize = 998 // leave room under 999 limit
+
+	for i := 0; i < len(ids); i += batchSize {
+		end := i + batchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for j, id := range chunk {
+			placeholders[j] = "?"
+			args[j] = id
+		}
+
+		query := fmt.Sprintf(
+			"SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, properties FROM nodes WHERE id IN (%s)",
+			strings.Join(placeholders, ","))
+
+		rows, err := s.q.Query(query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("find nodes by ids: %w", err)
+		}
+		nodes, err := scanNodes(rows)
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+		for _, n := range nodes {
+			result[n.ID] = n
+		}
+	}
+	return result, nil
+}
+
 // AllNodes returns all nodes for a project.
 func (s *Store) AllNodes(project string) ([]*Node, error) {
 	rows, err := s.q.Query(`SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, properties
@@ -147,8 +189,9 @@ func scanNodes(rows *sql.Rows) ([]*Node, error) {
 	return result, rows.Err()
 }
 
-// nodesBatchSize is the max rows per batch INSERT for nodes (8 cols × 100 = 800 vars < 999).
-const nodesBatchSize = 100
+// Formula-derived batch size: SQLite has a 999 bind variable limit.
+const numNodeCols = 8
+const nodesBatchSize = 999 / numNodeCols // = 124
 
 // UpsertNodeBatch inserts or updates multiple nodes in batched multi-row INSERTs.
 // Returns a map of qualifiedName → ID for all upserted nodes.

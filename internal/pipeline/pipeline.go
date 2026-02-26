@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"time"
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 	"github.com/zeebo/xxh3"
@@ -68,6 +69,9 @@ func (p *Pipeline) Run() error {
 	}
 	slog.Info("pipeline.discovered", "files", len(files))
 
+	// Use MEMORY journal mode during fresh indexing for faster bulk writes.
+	p.Store.BeginBulkWrite()
+
 	wroteData := false
 	if err := p.Store.WithTransaction(func(txStore *store.Store) error {
 		origStore := p.Store
@@ -77,8 +81,11 @@ func (p *Pipeline) Run() error {
 		wroteData, passErr = p.runPasses(files)
 		return passErr
 	}); err != nil {
+		p.Store.EndBulkWrite()
 		return err
 	}
+
+	p.Store.EndBulkWrite()
 
 	// Only checkpoint + optimize when actual data was written.
 	// No-op incremental reindexes skip this to avoid ANALYZE overhead.
@@ -121,21 +128,52 @@ func (p *Pipeline) runPasses(files []discover.FileInfo) (bool, error) {
 
 // runFullPasses runs the complete pipeline (no incremental optimization).
 func (p *Pipeline) runFullPasses(files []discover.FileInfo) error {
+	t := time.Now()
 	if err := p.passStructure(files); err != nil {
 		return fmt.Errorf("pass1 structure: %w", err)
 	}
+	slog.Info("pass.timing", "pass", "structure", "elapsed", time.Since(t))
+
+	t = time.Now()
 	p.passDefinitions(files)
+	slog.Info("pass.timing", "pass", "definitions", "elapsed", time.Since(t))
+
+	t = time.Now()
 	p.buildRegistry()
+	slog.Info("pass.timing", "pass", "registry", "elapsed", time.Since(t))
+
+	t = time.Now()
 	p.passImports()
+	slog.Info("pass.timing", "pass", "imports", "elapsed", time.Since(t))
+
+	t = time.Now()
 	p.passCalls()
+	slog.Info("pass.timing", "pass", "calls", "elapsed", time.Since(t))
+
+	t = time.Now()
 	p.passUsages()
+	slog.Info("pass.timing", "pass", "usages", "elapsed", time.Since(t))
+
 	p.cleanupASTCache()
+
+	t = time.Now()
 	if err := p.passHTTPLinks(); err != nil {
 		slog.Warn("pass4.httplink.err", "err", err)
 	}
+	slog.Info("pass.timing", "pass", "httplinks", "elapsed", time.Since(t))
+
+	t = time.Now()
 	p.passImplements()
+	slog.Info("pass.timing", "pass", "implements", "elapsed", time.Since(t))
+
+	t = time.Now()
 	p.passGitHistory()
+	slog.Info("pass.timing", "pass", "githistory", "elapsed", time.Since(t))
+
+	t = time.Now()
 	p.updateFileHashes(files)
+	slog.Info("pass.timing", "pass", "filehashes", "elapsed", time.Since(t))
+
 	return nil
 }
 
@@ -410,25 +448,12 @@ func mergeFiles(a, b []discover.FileInfo) []discover.FileInfo {
 }
 
 // passStructure creates Project, Folder, Package, File nodes and containment edges.
+// Collects all nodes/edges in memory first, then batch-writes to DB.
 func (p *Pipeline) passStructure(files []discover.FileInfo) error {
 	slog.Info("pass1.structure")
 
-	// Create project node
-	_, err := p.Store.UpsertNode(&store.Node{
-		Project:       p.ProjectName,
-		Label:         "Project",
-		Name:          p.ProjectName,
-		QualifiedName: p.ProjectName,
-	})
-	if err != nil {
-		return err
-	}
-
-	// Track which directories we've created
-	createdDirs := map[string]bool{}
-
 	// Collect all package indicators
-	packageIndicators := map[string]bool{}
+	packageIndicators := make(map[string]bool)
 	for _, l := range lang.AllLanguages() {
 		spec := lang.ForLanguage(l)
 		if spec != nil {
@@ -438,102 +463,125 @@ func (p *Pipeline) passStructure(files []discover.FileInfo) error {
 		}
 	}
 
+	// Phase A: Collect all unique directories from file paths
+	dirSet := make(map[string]bool)
 	for _, f := range files {
 		dir := filepath.Dir(f.RelPath)
+		for dir != "." && dir != "" && !dirSet[dir] {
+			dirSet[dir] = true
+			dir = filepath.Dir(dir)
+		}
+	}
 
-		// Create directory hierarchy
-		p.ensureDirHierarchy(dir, createdDirs, packageIndicators)
+	// Phase B: Check package indicators via os.Stat (batched, not interleaved with SQL)
+	dirIsPackage := make(map[string]bool, len(dirSet))
+	for dir := range dirSet {
+		absDir := filepath.Join(p.RepoPath, dir)
+		for indicator := range packageIndicators {
+			if _, err := os.Stat(filepath.Join(absDir, indicator)); err == nil {
+				dirIsPackage[dir] = true
+				break
+			}
+		}
+	}
 
-		// Create File node
-		fileQN := fqn.Compute(p.ProjectName, f.RelPath, "")
-		fileID, fileErr := p.Store.UpsertNode(&store.Node{
+	// Phase C: Build all nodes and pending edges in memory
+	var nodes []*store.Node
+	var edges []pendingEdge
+
+	// Project node
+	projectQN := p.ProjectName
+	nodes = append(nodes, &store.Node{
+		Project:       p.ProjectName,
+		Label:         "Project",
+		Name:          p.ProjectName,
+		QualifiedName: projectQN,
+	})
+
+	// Directory/Package nodes + containment edges
+	for dir := range dirSet {
+		dirName := filepath.Base(dir)
+		label := "Folder"
+		if dirIsPackage[dir] {
+			label = "Package"
+		}
+		qn := fqn.FolderQN(p.ProjectName, dir)
+		nodes = append(nodes, &store.Node{
+			Project:       p.ProjectName,
+			Label:         label,
+			Name:          dirName,
+			QualifiedName: qn,
+			FilePath:      dir,
+		})
+
+		// Containment edge from parent
+		parent := filepath.Dir(dir)
+		var parentQN string
+		if parent == "." || parent == "" {
+			parentQN = projectQN
+		} else {
+			parentQN = fqn.FolderQN(p.ProjectName, parent)
+		}
+
+		edgeType := "CONTAINS_FOLDER"
+		if dirIsPackage[dir] {
+			edgeType = "CONTAINS_PACKAGE"
+		}
+		edges = append(edges, pendingEdge{
+			SourceQN: parentQN,
+			TargetQN: qn,
+			Type:     edgeType,
+		})
+	}
+
+	// File nodes + containment edges
+	for _, f := range files {
+		fileQN := fqn.Compute(p.ProjectName, f.RelPath, "") + ".__file__"
+		nodes = append(nodes, &store.Node{
 			Project:       p.ProjectName,
 			Label:         "File",
 			Name:          filepath.Base(f.RelPath),
-			QualifiedName: fileQN + ".__file__",
+			QualifiedName: fileQN,
 			FilePath:      f.RelPath,
 			Properties:    map[string]any{"extension": filepath.Ext(f.RelPath)},
 		})
-		if fileErr != nil {
-			slog.Warn("pass1.file.err", "path", f.RelPath, "err", fileErr)
-			continue
-		}
 
-		// Create CONTAINS_FILE edge from parent dir
+		dir := filepath.Dir(f.RelPath)
 		parentQN := p.dirQN(dir)
-		parentNode, _ := p.Store.FindNodeByQN(p.ProjectName, parentQN)
-		if parentNode != nil {
-			_, _ = p.Store.InsertEdge(&store.Edge{
-				Project:  p.ProjectName,
-				SourceID: parentNode.ID,
-				TargetID: fileID,
-				Type:     "CONTAINS_FILE",
+		edges = append(edges, pendingEdge{
+			SourceQN: parentQN,
+			TargetQN: fileQN,
+			Type:     "CONTAINS_FILE",
+		})
+	}
+
+	// Phase D: Batch write all nodes
+	idMap, err := p.Store.UpsertNodeBatch(nodes)
+	if err != nil {
+		return fmt.Errorf("pass1 batch upsert: %w", err)
+	}
+
+	// Resolve pending edges to real edges using ID map
+	realEdges := make([]*store.Edge, 0, len(edges))
+	for _, pe := range edges {
+		srcID, srcOK := idMap[pe.SourceQN]
+		tgtID, tgtOK := idMap[pe.TargetQN]
+		if srcOK && tgtOK {
+			realEdges = append(realEdges, &store.Edge{
+				Project:    p.ProjectName,
+				SourceID:   srcID,
+				TargetID:   tgtID,
+				Type:       pe.Type,
+				Properties: pe.Properties,
 			})
 		}
 	}
 
+	if err := p.Store.InsertEdgeBatch(realEdges); err != nil {
+		return fmt.Errorf("pass1 batch edges: %w", err)
+	}
+
 	return nil
-}
-
-func (p *Pipeline) ensureDirHierarchy(relDir string, created, pkgIndicators map[string]bool) {
-	if relDir == "." || relDir == "" || created[relDir] {
-		return
-	}
-
-	// Ensure parent first
-	parent := filepath.Dir(relDir)
-	if parent != "." && parent != relDir {
-		p.ensureDirHierarchy(parent, created, pkgIndicators)
-	}
-
-	created[relDir] = true
-
-	// Check if this is a package
-	absDir := filepath.Join(p.RepoPath, relDir)
-	isPackage := false
-	for indicator := range pkgIndicators {
-		if _, err := os.Stat(filepath.Join(absDir, indicator)); err == nil {
-			isPackage = true
-			break
-		}
-	}
-
-	dirName := filepath.Base(relDir)
-	label := "Folder"
-	if isPackage {
-		label = "Package"
-	}
-	qn := fqn.FolderQN(p.ProjectName, relDir)
-
-	nodeID, _ := p.Store.UpsertNode(&store.Node{
-		Project:       p.ProjectName,
-		Label:         label,
-		Name:          dirName,
-		QualifiedName: qn,
-		FilePath:      relDir,
-	})
-
-	// Create containment edge from parent
-	var parentQN string
-	if parent == "." || parent == "" {
-		parentQN = p.ProjectName
-	} else {
-		parentQN = fqn.FolderQN(p.ProjectName, parent)
-	}
-
-	parentNode, _ := p.Store.FindNodeByQN(p.ProjectName, parentQN)
-	if parentNode != nil && nodeID > 0 {
-		edgeType := "CONTAINS_FOLDER"
-		if isPackage {
-			edgeType = "CONTAINS_PACKAGE"
-		}
-		_, _ = p.Store.InsertEdge(&store.Edge{
-			Project:  p.ProjectName,
-			SourceID: parentNode.ID,
-			TargetID: nodeID,
-			Type:     edgeType,
-		})
-	}
 }
 
 func (p *Pipeline) dirQN(relDir string) string {
@@ -698,6 +746,10 @@ func parseFileAST(projectName string, f discover.FileInfo) *parseResult {
 
 	var constants []string
 
+	// C/C++ macro tracking: extract macro definitions
+	isCPP := f.Language == lang.CPP
+	macroNames := make(map[string]bool) // track macro names for call site resolution
+
 	parser.Walk(root, func(node *tree_sitter.Node) bool {
 		kind := node.Kind()
 
@@ -711,6 +763,12 @@ func parseFileAST(projectName string, f discover.FileInfo) *parseResult {
 			return false
 		}
 
+		// Macro definitions (C/C++ only)
+		if isCPP && (kind == "preproc_def" || kind == "preproc_function_def") {
+			extractMacroDef(node, source, f, projectName, moduleQN, macroNames, result)
+			return false
+		}
+
 		if isConstantNode(node, f.Language) {
 			c := extractConstant(node, source)
 			if c != "" && len(c) > 1 {
@@ -720,6 +778,18 @@ func parseFileAST(projectName string, f discover.FileInfo) *parseResult {
 
 		return true
 	})
+
+	// Store macro names in result for later call resolution (pass 3)
+	if len(macroNames) > 0 {
+		if moduleNode.Properties == nil {
+			moduleNode.Properties = make(map[string]any)
+		}
+		macroList := make([]string, 0, len(macroNames))
+		for name := range macroNames {
+			macroList = append(macroList, name)
+		}
+		moduleNode.Properties["macros"] = macroList
+	}
 
 	// Resolve interpolated/concatenated strings
 	resolved := resolveModuleStrings(root, source, f.Language)
@@ -879,6 +949,9 @@ func extractClassDef(
 
 	// Extract methods inside the class
 	extractClassMethodDefs(node, source, f, projectName, classQN, spec, result)
+
+	// Extract fields inside the class/struct
+	extractClassFieldDefs(node, source, f, projectName, classQN, spec, result)
 }
 
 // extractClassMethodDefs walks a class AST node and extracts Method nodes (no DB).
@@ -942,10 +1015,186 @@ func extractClassMethodDefs(
 	})
 }
 
+// extractClassFieldDefs walks a class/struct AST node and extracts Field nodes (no DB).
+func extractClassFieldDefs(
+	classNode *tree_sitter.Node, source []byte, f discover.FileInfo,
+	projectName, classQN string, spec *lang.LanguageSpec, result *parseResult,
+) {
+	if len(spec.FieldNodeTypes) == 0 {
+		return
+	}
+	fieldTypes := toSet(spec.FieldNodeTypes)
+	funcTypes := toSet(spec.FunctionNodeTypes)
+
+	parser.Walk(classNode, func(child *tree_sitter.Node) bool {
+		if child.Id() == classNode.Id() {
+			return true
+		}
+		// Skip nested class/method definitions — they have their own extraction
+		if funcTypes[child.Kind()] {
+			return false
+		}
+		if !fieldTypes[child.Kind()] {
+			return true
+		}
+
+		fieldName := extractFieldName(child, source, f.Language)
+		if fieldName == "" {
+			return false
+		}
+
+		fieldQN := classQN + "." + fieldName
+		props := map[string]any{}
+
+		// Extract type annotation if present
+		fieldType := extractFieldType(child, source, f.Language)
+		if fieldType != "" {
+			props["type"] = fieldType
+		}
+
+		startLine := safeRowToLine(child.StartPosition().Row)
+		endLine := safeRowToLine(child.EndPosition().Row)
+
+		result.Nodes = append(result.Nodes, &store.Node{
+			Project:       projectName,
+			Label:         "Field",
+			Name:          fieldName,
+			QualifiedName: fieldQN,
+			FilePath:      f.RelPath,
+			StartLine:     startLine,
+			EndLine:       endLine,
+			Properties:    props,
+		})
+		result.PendingEdges = append(result.PendingEdges, pendingEdge{
+			SourceQN: classQN,
+			TargetQN: fieldQN,
+			Type:     "DEFINES_FIELD",
+		})
+		return false
+	})
+}
+
+// extractFieldName extracts the name from a field declaration node.
+func extractFieldName(node *tree_sitter.Node, source []byte, l lang.Language) string {
+	// Go: field_declaration has named children, first identifier is the name
+	// C++/Java: field_declaration has a "declarator" field
+	// Rust: field_declaration has a "name" field
+
+	// Try "name" field first (Rust, some others)
+	if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+		return parser.NodeText(nameNode, source)
+	}
+
+	// Try "declarator" field (C++, Java)
+	if declNode := node.ChildByFieldName("declarator"); declNode != nil {
+		// The declarator might be a pointer_declarator, array_declarator, etc.
+		// Walk to find the identifier
+		name := extractIdentifierFromDeclarator(declNode, source)
+		if name != "" {
+			return name
+		}
+	}
+
+	// Go struct fields: first child that is an identifier (field_identifier)
+	if l == lang.Go {
+		for i := uint(0); i < node.ChildCount(); i++ {
+			child := node.Child(i)
+			if child != nil && (child.Kind() == "field_identifier" || child.Kind() == "identifier") {
+				return parser.NodeText(child, source)
+			}
+		}
+	}
+
+	return ""
+}
+
+// extractIdentifierFromDeclarator walks a declarator subtree to find the identifier name.
+func extractIdentifierFromDeclarator(node *tree_sitter.Node, source []byte) string {
+	if node == nil {
+		return ""
+	}
+	switch node.Kind() {
+	case "identifier", "field_identifier":
+		return parser.NodeText(node, source)
+	case "pointer_declarator", "reference_declarator", "array_declarator":
+		if declNode := node.ChildByFieldName("declarator"); declNode != nil {
+			return extractIdentifierFromDeclarator(declNode, source)
+		}
+		// Fall through to child walk
+	}
+	// Walk children
+	for i := uint(0); i < node.ChildCount(); i++ {
+		child := node.Child(i)
+		if child != nil && (child.Kind() == "identifier" || child.Kind() == "field_identifier") {
+			return parser.NodeText(child, source)
+		}
+	}
+	return ""
+}
+
+// extractFieldType extracts the type annotation from a field declaration.
+func extractFieldType(node *tree_sitter.Node, source []byte, l lang.Language) string {
+	// Try "type" field (Go, Rust, Java)
+	if typeNode := node.ChildByFieldName("type"); typeNode != nil {
+		return parser.NodeText(typeNode, source)
+	}
+	return ""
+}
+
+// extractMacroDef extracts a Macro node from a C/C++ preprocessor definition.
+func extractMacroDef(
+	node *tree_sitter.Node, source []byte, f discover.FileInfo,
+	projectName, moduleQN string, macroNames map[string]bool, result *parseResult,
+) {
+	nameNode := node.ChildByFieldName("name")
+	if nameNode == nil {
+		return
+	}
+	name := parser.NodeText(nameNode, source)
+	if name == "" {
+		return
+	}
+
+	macroNames[name] = true
+
+	isFunctionLike := node.Kind() == "preproc_function_def"
+	macroQN := moduleQN + "::macro::" + name
+
+	props := map[string]any{
+		"is_function_like": isFunctionLike,
+	}
+
+	if isFunctionLike {
+		if paramsNode := node.ChildByFieldName("parameters"); paramsNode != nil {
+			props["parameter_count"] = paramsNode.ChildCount()
+		}
+	}
+
+	startLine := safeRowToLine(node.StartPosition().Row)
+	endLine := safeRowToLine(node.EndPosition().Row)
+
+	result.Nodes = append(result.Nodes, &store.Node{
+		Project:       projectName,
+		Label:         "Macro",
+		Name:          name,
+		QualifiedName: macroQN,
+		FilePath:      f.RelPath,
+		StartLine:     startLine,
+		EndLine:       endLine,
+		Properties:    props,
+	})
+
+	result.PendingEdges = append(result.PendingEdges, pendingEdge{
+		SourceQN: moduleQN,
+		TargetQN: macroQN,
+		Type:     "DEFINES",
+	})
+}
+
 // buildRegistry populates the FunctionRegistry from all Function, Method,
 // and Class nodes in the store.
 func (p *Pipeline) buildRegistry() {
-	labels := []string{"Function", "Method", "Class", "Type", "Interface", "Enum"}
+	labels := []string{"Function", "Method", "Class", "Type", "Interface", "Enum", "Macro"}
 	for _, label := range labels {
 		nodes, err := p.Store.FindNodesByLabel(p.ProjectName, label)
 		if err != nil {

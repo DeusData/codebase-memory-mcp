@@ -17,6 +17,7 @@ func init() {
 			"impl_item",
 			"type_item",
 		},
+		FieldNodeTypes: []string{"field_declaration"},
 		ModuleNodeTypes:   []string{"source_file", "mod_item"},
 		CallNodeTypes:     []string{"call_expression", "macro_invocation"},
 		ImportNodeTypes:   []string{"use_declaration", "extern_crate_declaration"},

@@ -30,6 +30,7 @@ type LanguageSpec struct {
 	FileExtensions    []string
 	FunctionNodeTypes []string
 	ClassNodeTypes    []string
+	FieldNodeTypes    []string // tree-sitter node kinds for struct/class fields
 	ModuleNodeTypes   []string
 	CallNodeTypes     []string
 	ImportNodeTypes   []string

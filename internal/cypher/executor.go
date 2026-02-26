@@ -15,7 +15,8 @@ const maxResultRows = 200
 
 // Executor runs Cypher execution plans against a store.
 type Executor struct {
-	Store *store.Store
+	Store      *store.Store
+	regexCache map[string]*regexp.Regexp
 }
 
 // Result holds the tabular output of a query.
@@ -37,12 +38,6 @@ func newBinding() binding {
 	}
 }
 
-// adjacentResult pairs a matched node with the edge that reached it.
-type adjacentResult struct {
-	Node *store.Node
-	Edge *store.Edge
-}
-
 // Execute parses, plans, and executes a Cypher query across all projects.
 func (e *Executor) Execute(query string) (*Result, error) {
 	q, err := Parse(query)
@@ -57,6 +52,11 @@ func (e *Executor) Execute(query string) (*Result, error) {
 }
 
 func (e *Executor) executePlan(plan *Plan) (*Result, error) {
+	// Fast path: push COUNT aggregation to SQL when pattern is fusible.
+	if result, ok := e.tryAggregateSQL(plan); ok {
+		return result, nil
+	}
+
 	projects, err := e.Store.ListProjects()
 	if err != nil {
 		return nil, fmt.Errorf("list projects: %w", err)
@@ -76,6 +76,247 @@ func (e *Executor) executePlan(plan *Plan) (*Result, error) {
 	}
 
 	return e.projectResults(allBindings, plan.ReturnSpec)
+}
+
+// tryAggregateSQL attempts to push a COUNT aggregation query entirely to SQL.
+// Returns (result, true) if the pattern is fusible, (nil, false) otherwise.
+// Fusible pattern: ScanNodes + ExpandRelationship (fixed-length 1 hop) with
+// RETURN containing COUNT and group-by items that map to SQL columns.
+func (e *Executor) tryAggregateSQL(plan *Plan) (*Result, bool) {
+	if plan.ReturnSpec == nil {
+		return nil, false
+	}
+
+	// Must have COUNT in return
+	var countItem *ReturnItem
+	var groupItems []ReturnItem
+	for i := range plan.ReturnSpec.Items {
+		item := &plan.ReturnSpec.Items[i]
+		if item.Func == "COUNT" {
+			countItem = item
+		} else {
+			groupItems = append(groupItems, *item)
+		}
+	}
+	if countItem == nil {
+		return nil, false
+	}
+
+	// Identify the fusible step pattern: optional FilterWhere between Scan and Expand
+	steps := plan.Steps
+	var scan *ScanNodes
+	var expand *ExpandRelationship
+	var filter *FilterWhere
+
+	switch len(steps) {
+	case 2:
+		s, ok1 := steps[0].(*ScanNodes)
+		ex, ok2 := steps[1].(*ExpandRelationship)
+		if !ok1 || !ok2 {
+			return nil, false
+		}
+		scan, expand = s, ex
+	case 3:
+		s, ok1 := steps[0].(*ScanNodes)
+		f, ok2 := steps[1].(*FilterWhere)
+		ex, ok3 := steps[2].(*ExpandRelationship)
+		if !ok1 || !ok3 {
+			return nil, false
+		}
+		scan, expand = s, ex
+		if ok2 {
+			filter = f
+		}
+	default:
+		return nil, false
+	}
+
+	// Must be fixed-length (1 hop)
+	if expand.MinHops != 1 || expand.MaxHops != 1 {
+		return nil, false
+	}
+	if len(expand.EdgeTypes) == 0 {
+		return nil, false
+	}
+	if len(scan.Props) > 0 || len(expand.ToProps) > 0 {
+		return nil, false // inline property filters not supported in SQL push-down
+	}
+
+	// All group-by items must reference SQL-pushable columns
+	for _, gi := range groupItems {
+		if gi.Property == "" {
+			return nil, false
+		}
+		if _, ok := sqlPushableColumns[gi.Property]; !ok {
+			return nil, false
+		}
+	}
+
+	// Filter conditions must all be pushable
+	if filter != nil {
+		for _, c := range filter.Conditions {
+			if _, ok := sqlPushableColumns[c.Property]; !ok {
+				return nil, false
+			}
+			switch c.Operator {
+			case "=", "CONTAINS", "STARTS WITH":
+				// OK
+			default:
+				return nil, false // regex, numeric not pushable
+			}
+		}
+	}
+
+	// Build the SQL query
+	projects, err := e.Store.ListProjects()
+	if err != nil {
+		return nil, false
+	}
+
+	dir := expand.Direction
+	if dir == "" {
+		dir = "outbound"
+	}
+	var srcCol, tgtCol string
+	if dir == "outbound" {
+		srcCol, tgtCol = "source_id", "target_id"
+	} else {
+		srcCol, tgtCol = "target_id", "source_id"
+	}
+
+	// Map variable names to table aliases
+	srcAlias := "src" // scan variable
+	tgtAlias := "tgt" // expand target variable
+
+	// Build SELECT columns for group-by items
+	selectParts := make([]string, 0, len(groupItems)+1)
+	groupByParts := make([]string, 0, len(groupItems))
+	for _, gi := range groupItems {
+		col := sqlPushableColumns[gi.Property]
+		var alias string
+		if gi.Variable == scan.Variable {
+			alias = srcAlias
+		} else {
+			alias = tgtAlias
+		}
+		selectParts = append(selectParts, alias+"."+col)
+		groupByParts = append(groupByParts, alias+"."+col)
+	}
+	selectParts = append(selectParts, "COUNT(*) as cnt")
+
+	// Accumulate results across all projects
+	cols := buildColumnNames(plan.ReturnSpec.Items)
+	countCol := cols[len(cols)-1] // COUNT column is last
+
+	allRows := make([]map[string]any, 0)
+
+	for _, proj := range projects {
+		var sb strings.Builder
+		args := make([]any, 0, 10)
+
+		sb.WriteString("SELECT ")
+		sb.WriteString(strings.Join(selectParts, ", "))
+		sb.WriteString(" FROM edges e")
+		sb.WriteString(fmt.Sprintf(" JOIN nodes %s ON %s.id = e.%s", srcAlias, srcAlias, srcCol))
+		sb.WriteString(fmt.Sprintf(" JOIN nodes %s ON %s.id = e.%s", tgtAlias, tgtAlias, tgtCol))
+		sb.WriteString(" WHERE e.project = ?")
+		args = append(args, proj.Name)
+
+		// Edge type filter
+		typePlaceholders := make([]string, len(expand.EdgeTypes))
+		for i, et := range expand.EdgeTypes {
+			typePlaceholders[i] = "?"
+			args = append(args, et)
+		}
+		sb.WriteString(" AND e.type IN (" + strings.Join(typePlaceholders, ",") + ")")
+
+		// Label filters
+		if scan.Label != "" {
+			sb.WriteString(fmt.Sprintf(" AND %s.label = ?", srcAlias))
+			args = append(args, scan.Label)
+		}
+		if expand.ToLabel != "" {
+			sb.WriteString(fmt.Sprintf(" AND %s.label = ?", tgtAlias))
+			args = append(args, expand.ToLabel)
+		}
+
+		// Push-down WHERE conditions
+		if filter != nil {
+			for _, c := range filter.Conditions {
+				col := sqlPushableColumns[c.Property]
+				var alias string
+				if c.Variable == scan.Variable {
+					alias = srcAlias
+				} else {
+					alias = tgtAlias
+				}
+				switch c.Operator {
+				case "=":
+					sb.WriteString(fmt.Sprintf(" AND %s.%s = ?", alias, col))
+					args = append(args, c.Value)
+				case "CONTAINS":
+					sb.WriteString(fmt.Sprintf(" AND %s.%s LIKE ?", alias, col))
+					args = append(args, "%"+c.Value+"%")
+				case "STARTS WITH":
+					sb.WriteString(fmt.Sprintf(" AND %s.%s LIKE ?", alias, col))
+					args = append(args, c.Value+"%")
+				}
+			}
+		}
+
+		sb.WriteString(" GROUP BY " + strings.Join(groupByParts, ", "))
+
+		rows, qErr := e.Store.DB().Query(sb.String(), args...)
+		if qErr != nil {
+			continue
+		}
+
+		for rows.Next() {
+			// Scan group-by values + count
+			vals := make([]any, len(groupItems)+1)
+			ptrs := make([]any, len(groupItems)+1)
+			for i := range vals {
+				ptrs[i] = &vals[i]
+			}
+			if sErr := rows.Scan(ptrs...); sErr != nil {
+				rows.Close()
+				continue
+			}
+			row := make(map[string]any)
+			for i, gi := range groupItems {
+				col := gi.Variable + "." + gi.Property
+				if gi.Alias != "" {
+					col = gi.Alias
+				}
+				// Normalize []byte to string (mattn returns []byte for TEXT cols)
+				if b, ok := vals[i].([]byte); ok {
+					row[col] = string(b)
+				} else {
+					row[col] = vals[i]
+				}
+			}
+			// Normalize COUNT to int for consistency with Go-side aggregation
+			switch v := vals[len(vals)-1].(type) {
+			case int64:
+				row[countCol] = int(v)
+			default:
+				row[countCol] = v
+			}
+			allRows = append(allRows, row)
+		}
+		rows.Close()
+	}
+
+	// ORDER BY
+	if plan.ReturnSpec.OrderBy != "" {
+		orderCol := resolveOrderColumn(plan.ReturnSpec.OrderBy, plan.ReturnSpec.Items, cols)
+		sortRows(allRows, orderCol, plan.ReturnSpec.OrderDir)
+	}
+
+	// LIMIT
+	allRows = applyLimit(allRows, plan.ReturnSpec.Limit)
+
+	return &Result{Columns: cols, Rows: allRows}, true
 }
 
 //nolint:gocognit // step dispatch with fusion/push-down is inherently branchy
@@ -335,7 +576,7 @@ func (e *Executor) execScan(project string, s *ScanNodes, pushDown *FilterWhere)
 		if len(unpushedConditions) > 0 {
 			b := newBinding()
 			b.nodes[s.Variable] = n
-			match, evalErr := evaluateConditions(b, unpushedConditions, "AND")
+			match, evalErr := e.evaluateConditions(b, unpushedConditions, "AND")
 			if evalErr != nil {
 				return nil, evalErr
 			}
@@ -370,57 +611,151 @@ func (e *Executor) execExpand(s *ExpandRelationship, bindings []binding) ([]bind
 
 	isVariableLength := s.MinHops != 1 || s.MaxHops != 1
 
+	if isVariableLength {
+		// Variable-length: use BFS per binding (already uses recursive CTE)
+		result := make([]binding, 0, len(bindings))
+		for _, b := range bindings {
+			fromNode, ok := b.nodes[s.FromVar]
+			if !ok {
+				continue
+			}
+			expanded, err := e.expandVariableLength(b, fromNode, s)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, expanded...)
+			if len(result) > maxResultRows*2 {
+				result = result[:maxResultRows*2]
+				break
+			}
+		}
+		return result, nil
+	}
+
+	// Fixed-length (1 hop): batch all source IDs, 2 queries total
+	return e.expandFixedLengthBatch(s, bindings)
+}
+
+// expandFixedLengthBatch performs fixed-length (1 hop) expansion for all bindings
+// in just 2 SQL queries: one for edges, one for target nodes.
+func (e *Executor) expandFixedLengthBatch(s *ExpandRelationship, bindings []binding) ([]binding, error) {
+	// Collect all unique source node IDs
+	sourceIDs := make([]int64, 0, len(bindings))
+	idSeen := make(map[int64]bool, len(bindings))
+	for _, b := range bindings {
+		fromNode, ok := b.nodes[s.FromVar]
+		if !ok {
+			continue
+		}
+		if !idSeen[fromNode.ID] {
+			idSeen[fromNode.ID] = true
+			sourceIDs = append(sourceIDs, fromNode.ID)
+		}
+	}
+
+	if len(sourceIDs) == 0 {
+		return nil, nil
+	}
+
+	direction := s.Direction
+	if direction == "" {
+		direction = "outbound"
+	}
+
+	// Batch 1: fetch all edges for all source IDs
+	var edgesByNode map[int64][]*store.Edge
+	var err error
+	switch direction {
+	case "outbound":
+		edgesByNode, err = e.Store.FindEdgesBySourceIDs(sourceIDs, s.EdgeTypes)
+	case "inbound":
+		edgesByNode, err = e.Store.FindEdgesByTargetIDs(sourceIDs, s.EdgeTypes)
+	case "any":
+		outEdges, outErr := e.Store.FindEdgesBySourceIDs(sourceIDs, s.EdgeTypes)
+		if outErr != nil {
+			return nil, outErr
+		}
+		inEdges, inErr := e.Store.FindEdgesByTargetIDs(sourceIDs, s.EdgeTypes)
+		if inErr != nil {
+			return nil, inErr
+		}
+		edgesByNode = outEdges
+		for id, edges := range inEdges {
+			edgesByNode[id] = append(edgesByNode[id], edges...)
+		}
+	default:
+		edgesByNode, err = e.Store.FindEdgesBySourceIDs(sourceIDs, s.EdgeTypes)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Collect all target node IDs
+	targetIDSet := make(map[int64]bool)
+	for _, edges := range edgesByNode {
+		for _, edge := range edges {
+			tid := edgeTargetID(edge, 0, direction)
+			if direction == "any" {
+				// For "any", we need to check per-source
+				targetIDSet[edge.SourceID] = true
+				targetIDSet[edge.TargetID] = true
+			} else {
+				targetIDSet[tid] = true
+			}
+		}
+	}
+	targetIDs := make([]int64, 0, len(targetIDSet))
+	for id := range targetIDSet {
+		targetIDs = append(targetIDs, id)
+	}
+
+	// Batch 2: fetch all target nodes
+	nodeMap, err := e.Store.FindNodesByIDs(targetIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build results per binding
 	result := make([]binding, 0, len(bindings))
 	for _, b := range bindings {
 		fromNode, ok := b.nodes[s.FromVar]
 		if !ok {
 			continue
 		}
+		edges := edgesByNode[fromNode.ID]
+		seen := make(map[int64]bool)
 
-		if isVariableLength {
-			expanded, err := e.expandVariableLength(b, fromNode, s)
-			if err != nil {
-				return nil, err
+		for _, edge := range edges {
+			targetID := edgeTargetID(edge, fromNode.ID, direction)
+			if seen[targetID] {
+				continue
 			}
-			result = append(result, expanded...)
-		} else {
-			expanded, err := e.expandFixedLength(b, fromNode, s)
-			if err != nil {
-				return nil, err
+			seen[targetID] = true
+
+			node, exists := nodeMap[targetID]
+			if !exists {
+				continue
 			}
-			result = append(result, expanded...)
+			if s.ToLabel != "" && node.Label != s.ToLabel {
+				continue
+			}
+			if len(s.ToProps) > 0 && !nodeMatchesProps(node, s.ToProps) {
+				continue
+			}
+			newB := copyBinding(b)
+			if s.ToVar != "" {
+				newB.nodes[s.ToVar] = node
+			}
+			if s.RelVar != "" {
+				newB.edges[s.RelVar] = edge
+			}
+			result = append(result, newB)
 		}
 
 		if len(result) > maxResultRows*2 {
 			result = result[:maxResultRows*2]
 			break
 		}
-	}
-	return result, nil
-}
-
-func (e *Executor) expandFixedLength(b binding, fromNode *store.Node, s *ExpandRelationship) ([]binding, error) {
-	adjacents, err := e.findAdjacentNodes(fromNode.ID, s.EdgeTypes, s.Direction)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]binding, 0, len(adjacents))
-	for _, adj := range adjacents {
-		if s.ToLabel != "" && adj.Node.Label != s.ToLabel {
-			continue
-		}
-		if len(s.ToProps) > 0 && !nodeMatchesProps(adj.Node, s.ToProps) {
-			continue
-		}
-		newB := copyBinding(b)
-		if s.ToVar != "" {
-			newB.nodes[s.ToVar] = adj.Node
-		}
-		if s.RelVar != "" && adj.Edge != nil {
-			newB.edges[s.RelVar] = adj.Edge
-		}
-		result = append(result, newB)
 	}
 	return result, nil
 }
@@ -470,107 +805,6 @@ func (e *Executor) expandVariableLength(b binding, fromNode *store.Node, s *Expa
 	return result, nil
 }
 
-// findAdjacentNodes returns nodes connected to nodeID via the given edge types and direction.
-func (e *Executor) findAdjacentNodes(nodeID int64, edgeTypes []string, direction string) ([]adjacentResult, error) {
-	allEdges, err := e.collectEdges(nodeID, edgeTypes, direction)
-	if err != nil {
-		return nil, err
-	}
-	return e.resolveEdgeTargets(allEdges, nodeID, direction)
-}
-
-// collectEdges gathers edges from the store based on direction and type filters.
-func (e *Executor) collectEdges(nodeID int64, edgeTypes []string, direction string) ([]*store.Edge, error) {
-	switch direction {
-	case "outbound":
-		return e.collectDirectionalEdges(nodeID, edgeTypes, true)
-	case "inbound":
-		return e.collectDirectionalEdges(nodeID, edgeTypes, false)
-	case "any":
-		return e.collectBidirectionalEdges(nodeID, edgeTypes)
-	default:
-		return e.collectDirectionalEdges(nodeID, edgeTypes, true)
-	}
-}
-
-// collectDirectionalEdges collects edges in one direction (outbound if isSource, inbound otherwise).
-func (e *Executor) collectDirectionalEdges(nodeID int64, edgeTypes []string, isSource bool) ([]*store.Edge, error) {
-	if len(edgeTypes) > 0 {
-		var allEdges []*store.Edge
-		for _, et := range edgeTypes {
-			var edges []*store.Edge
-			var err error
-			if isSource {
-				edges, err = e.Store.FindEdgesBySourceAndType(nodeID, et)
-			} else {
-				edges, err = e.Store.FindEdgesByTargetAndType(nodeID, et)
-			}
-			if err != nil {
-				return nil, err
-			}
-			allEdges = append(allEdges, edges...)
-		}
-		return allEdges, nil
-	}
-	if isSource {
-		return e.Store.FindEdgesBySource(nodeID)
-	}
-	return e.Store.FindEdgesByTarget(nodeID)
-}
-
-// collectBidirectionalEdges collects edges in both directions, optionally filtered by type.
-func (e *Executor) collectBidirectionalEdges(nodeID int64, edgeTypes []string) ([]*store.Edge, error) {
-	outEdges, err := e.Store.FindEdgesBySource(nodeID)
-	if err != nil {
-		return nil, err
-	}
-	inEdges, err := e.Store.FindEdgesByTarget(nodeID)
-	if err != nil {
-		return nil, err
-	}
-	if len(edgeTypes) == 0 {
-		result := make([]*store.Edge, 0, len(outEdges)+len(inEdges))
-		result = append(result, outEdges...)
-		result = append(result, inEdges...)
-		return result, nil
-	}
-	typeSet := make(map[string]bool, len(edgeTypes))
-	for _, et := range edgeTypes {
-		typeSet[et] = true
-	}
-	var allEdges []*store.Edge
-	for _, edge := range outEdges {
-		if typeSet[edge.Type] {
-			allEdges = append(allEdges, edge)
-		}
-	}
-	for _, edge := range inEdges {
-		if typeSet[edge.Type] {
-			allEdges = append(allEdges, edge)
-		}
-	}
-	return allEdges, nil
-}
-
-// resolveEdgeTargets resolves edges to adjacentResult by looking up the target/source node.
-func (e *Executor) resolveEdgeTargets(allEdges []*store.Edge, nodeID int64, direction string) ([]adjacentResult, error) {
-	seen := make(map[int64]bool)
-	results := make([]adjacentResult, 0, len(allEdges))
-	for _, edge := range allEdges {
-		targetID := edgeTargetID(edge, nodeID, direction)
-		if seen[targetID] {
-			continue
-		}
-		seen[targetID] = true
-
-		node, err := e.Store.FindNodeByID(targetID)
-		if err != nil || node == nil {
-			continue
-		}
-		results = append(results, adjacentResult{Node: node, Edge: edge})
-	}
-	return results, nil
-}
 
 // edgeTargetID returns the ID of the node on the "other end" of the edge relative to nodeID.
 func edgeTargetID(edge *store.Edge, nodeID int64, direction string) int64 {
@@ -590,7 +824,7 @@ func edgeTargetID(edge *store.Edge, nodeID int64, direction string) int64 {
 func (e *Executor) execFilter(s *FilterWhere, bindings []binding) ([]binding, error) {
 	var result []binding
 	for _, b := range bindings {
-		match, err := evaluateConditions(b, s.Conditions, s.Operator)
+		match, err := e.evaluateConditions(b, s.Conditions, s.Operator)
 		if err != nil {
 			return nil, err
 		}
@@ -601,10 +835,10 @@ func (e *Executor) execFilter(s *FilterWhere, bindings []binding) ([]binding, er
 	return result, nil
 }
 
-func evaluateConditions(b binding, conditions []Condition, op string) (bool, error) {
+func (e *Executor) evaluateConditions(b binding, conditions []Condition, op string) (bool, error) {
 	if op == "OR" {
 		for _, c := range conditions {
-			ok, err := evaluateCondition(b, c)
+			ok, err := e.evaluateCondition(b, c)
 			if err != nil {
 				return false, err
 			}
@@ -616,7 +850,7 @@ func evaluateConditions(b binding, conditions []Condition, op string) (bool, err
 	}
 	// AND (default)
 	for _, c := range conditions {
-		ok, err := evaluateCondition(b, c)
+		ok, err := e.evaluateCondition(b, c)
 		if err != nil {
 			return false, err
 		}
@@ -627,7 +861,24 @@ func evaluateConditions(b binding, conditions []Condition, op string) (bool, err
 	return true, nil
 }
 
-func evaluateCondition(b binding, c Condition) (bool, error) {
+// compiledRegex returns a compiled regex for the pattern, using a cache
+// to avoid recompiling the same pattern on every binding.
+func (e *Executor) compiledRegex(pattern string) (*regexp.Regexp, error) {
+	if e.regexCache == nil {
+		e.regexCache = make(map[string]*regexp.Regexp)
+	}
+	if re, ok := e.regexCache[pattern]; ok {
+		return re, nil
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+	e.regexCache[pattern] = re
+	return re, nil
+}
+
+func (e *Executor) evaluateCondition(b binding, c Condition) (bool, error) {
 	// Try node first, then edge
 	var actual any
 	if node, ok := b.nodes[c.Variable]; ok {
@@ -646,11 +897,11 @@ func evaluateCondition(b binding, c Condition) (bool, error) {
 		if !ok {
 			return false, nil
 		}
-		matched, err := regexp.MatchString(c.Value, s)
+		re, err := e.compiledRegex(c.Value)
 		if err != nil {
 			return false, fmt.Errorf("regex %q: %w", c.Value, err)
 		}
-		return matched, nil
+		return re.MatchString(s), nil
 	case "CONTAINS":
 		s, ok := actual.(string)
 		if !ok {

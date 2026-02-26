@@ -12,6 +12,7 @@ func init() {
 			"annotation_type_declaration",
 			"record_declaration",
 		},
+		FieldNodeTypes: []string{"field_declaration"},
 		ModuleNodeTypes: []string{"program"},
 		CallNodeTypes:   []string{"method_invocation"},
 		ImportNodeTypes: []string{"import_declaration"},

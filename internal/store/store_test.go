@@ -777,6 +777,18 @@ func TestBatchCountDegrees(t *testing.T) {
 	}
 }
 
+func TestBatchSizeSafety(t *testing.T) {
+	// Verify formula-derived batch sizes stay under SQLite's 999 bind variable limit.
+	if numNodeCols*nodesBatchSize >= 999 {
+		t.Errorf("node batch exceeds limit: %d cols × %d rows = %d (max 998)",
+			numNodeCols, nodesBatchSize, numNodeCols*nodesBatchSize)
+	}
+	if numEdgeCols*edgesBatchSize >= 999 {
+		t.Errorf("edge batch exceeds limit: %d cols × %d rows = %d (max 998)",
+			numEdgeCols, edgesBatchSize, numEdgeCols*edgesBatchSize)
+	}
+}
+
 func TestSearchExcludeLabels(t *testing.T) {
 	s, err := OpenMemory()
 	if err != nil {

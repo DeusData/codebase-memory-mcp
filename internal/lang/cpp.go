@@ -17,6 +17,7 @@ func init() {
 			"union_specifier",
 			"enum_specifier",
 		},
+		FieldNodeTypes: []string{"field_declaration"},
 		ModuleNodeTypes: []string{
 			"translation_unit",
 			"namespace_definition",

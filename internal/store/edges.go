@@ -120,8 +120,9 @@ func (s *Store) FindEdgesByURLPath(project, pathSubstring string) ([]*Edge, erro
 	return scanEdges(rows)
 }
 
-// edgesBatchSize is the max rows per batch INSERT for edges (5 cols × 150 = 750 vars < 999).
-const edgesBatchSize = 150
+// Formula-derived batch size: SQLite has a 999 bind variable limit.
+const numEdgeCols = 5
+const edgesBatchSize = 999 / numEdgeCols // = 199
 
 // InsertEdgeBatch inserts multiple edges in batched multi-row INSERTs.
 func (s *Store) InsertEdgeBatch(edges []*Edge) error {
@@ -159,6 +160,112 @@ func (s *Store) insertEdgeChunk(batch []*Edge) error {
 		return fmt.Errorf("insert edge batch: %w", err)
 	}
 	return nil
+}
+
+// FindEdgesBySourceIDs returns all edges where source_id is in the given set,
+// optionally filtered by edge types. Groups results by source_id for efficient lookup.
+func (s *Store) FindEdgesBySourceIDs(sourceIDs []int64, edgeTypes []string) (map[int64][]*Edge, error) {
+	if len(sourceIDs) == 0 {
+		return map[int64][]*Edge{}, nil
+	}
+
+	result := make(map[int64][]*Edge, len(sourceIDs))
+	const batchSize = 500 // leave room for type args
+
+	for i := 0; i < len(sourceIDs); i += batchSize {
+		end := i + batchSize
+		if end > len(sourceIDs) {
+			end = len(sourceIDs)
+		}
+		chunk := sourceIDs[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+len(edgeTypes))
+		for j, id := range chunk {
+			placeholders[j] = "?"
+			args = append(args, id)
+		}
+
+		query := fmt.Sprintf(
+			"SELECT id, project, source_id, target_id, type, properties FROM edges WHERE source_id IN (%s)",
+			strings.Join(placeholders, ","))
+
+		if len(edgeTypes) > 0 {
+			typePH := make([]string, len(edgeTypes))
+			for j, et := range edgeTypes {
+				typePH[j] = "?"
+				args = append(args, et)
+			}
+			query += " AND type IN (" + strings.Join(typePH, ",") + ")"
+		}
+
+		rows, err := s.q.Query(query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("find edges by source ids: %w", err)
+		}
+		edges, err := scanEdges(rows)
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range edges {
+			result[e.SourceID] = append(result[e.SourceID], e)
+		}
+	}
+	return result, nil
+}
+
+// FindEdgesByTargetIDs returns all edges where target_id is in the given set,
+// optionally filtered by edge types. Groups results by target_id.
+func (s *Store) FindEdgesByTargetIDs(targetIDs []int64, edgeTypes []string) (map[int64][]*Edge, error) {
+	if len(targetIDs) == 0 {
+		return map[int64][]*Edge{}, nil
+	}
+
+	result := make(map[int64][]*Edge, len(targetIDs))
+	const batchSize = 500
+
+	for i := 0; i < len(targetIDs); i += batchSize {
+		end := i + batchSize
+		if end > len(targetIDs) {
+			end = len(targetIDs)
+		}
+		chunk := targetIDs[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+len(edgeTypes))
+		for j, id := range chunk {
+			placeholders[j] = "?"
+			args = append(args, id)
+		}
+
+		query := fmt.Sprintf(
+			"SELECT id, project, source_id, target_id, type, properties FROM edges WHERE target_id IN (%s)",
+			strings.Join(placeholders, ","))
+
+		if len(edgeTypes) > 0 {
+			typePH := make([]string, len(edgeTypes))
+			for j, et := range edgeTypes {
+				typePH[j] = "?"
+				args = append(args, et)
+			}
+			query += " AND type IN (" + strings.Join(typePH, ",") + ")"
+		}
+
+		rows, err := s.q.Query(query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("find edges by target ids: %w", err)
+		}
+		edges, err := scanEdges(rows)
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range edges {
+			result[e.TargetID] = append(result[e.TargetID], e)
+		}
+	}
+	return result, nil
 }
 
 func scanEdges(rows *sql.Rows) ([]*Edge, error) {

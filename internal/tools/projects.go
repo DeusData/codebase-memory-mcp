@@ -58,6 +58,11 @@ func (s *Server) handleDeleteProject(_ context.Context, req *mcp.CallToolRequest
 		return errResult(fmt.Sprintf("delete failed: %v", err)), nil
 	}
 
+	// file_hashes table is not cascaded from projects — delete separately
+	if err := s.store.DeleteFileHashes(name); err != nil {
+		return errResult(fmt.Sprintf("delete file hashes failed: %v", err)), nil
+	}
+
 	return jsonResult(map[string]any{
 		"deleted": name,
 		"status":  "ok",
