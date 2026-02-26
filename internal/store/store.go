@@ -74,10 +74,20 @@ func Open(project string) (*Store, error) {
 
 // OpenPath opens a SQLite database at the given path.
 func OpenPath(dbPath string) (*Store, error) {
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)")
+	dsn := dbPath + "?_pragma=journal_mode(WAL)" +
+		"&_pragma=busy_timeout(5000)" +
+		"&_pragma=foreign_keys(ON)" +
+		"&_pragma=synchronous(NORMAL)" +
+		"&_pragma=cache_size(-8192)" +
+		"&_pragma=temp_store(MEMORY)" +
+		"&_pragma=mmap_size(268435456)" // 256 MB mmap for fast reads
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
+	// Single connection: SQLite is single-writer, pool adds lock contention.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	s := &Store{db: db, dbPath: dbPath}
 	s.q = s.db
 	if err := s.initSchema(); err != nil {
@@ -89,7 +99,10 @@ func OpenPath(dbPath string) (*Store, error) {
 
 // OpenMemory opens an in-memory SQLite database (for testing).
 func OpenMemory() (*Store, error) {
-	db, err := sql.Open("sqlite", ":memory:?_pragma=foreign_keys(ON)")
+	dsn := ":memory:?_pragma=foreign_keys(ON)" +
+		"&_pragma=synchronous(OFF)" +
+		"&_pragma=temp_store(MEMORY)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open memory db: %w", err)
 	}
@@ -119,6 +132,14 @@ func (s *Store) WithTransaction(fn func(txStore *Store) error) error {
 	return tx.Commit()
 }
 
+// Checkpoint forces a WAL checkpoint, moving pages from WAL to the main DB,
+// then runs ANALYZE so the query planner has up-to-date statistics.
+// Cost is absorbed during indexing rather than charged to the first read query.
+func (s *Store) Checkpoint() {
+	_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	_, _ = s.db.Exec("ANALYZE")
+}
+
 // Close closes the database connection.
 func (s *Store) Close() error {
 	return s.db.Close()
@@ -127,6 +148,11 @@ func (s *Store) Close() error {
 // DB returns the underlying sql.DB (for advanced queries).
 func (s *Store) DB() *sql.DB {
 	return s.db
+}
+
+// DBPath returns the filesystem path to the SQLite database.
+func (s *Store) DBPath() string {
+	return s.dbPath
 }
 
 func (s *Store) initSchema() error {

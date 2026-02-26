@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 )
 
 // UpsertNode inserts or replaces a node (dedup by qualified_name).
@@ -144,4 +145,123 @@ func scanNodes(rows *sql.Rows) ([]*Node, error) {
 		result = append(result, &n)
 	}
 	return result, rows.Err()
+}
+
+// nodesBatchSize is the max rows per batch INSERT for nodes (8 cols × 100 = 800 vars < 999).
+const nodesBatchSize = 100
+
+// UpsertNodeBatch inserts or updates multiple nodes in batched multi-row INSERTs.
+// Returns a map of qualifiedName → ID for all upserted nodes.
+func (s *Store) UpsertNodeBatch(nodes []*Node) (map[string]int64, error) {
+	if len(nodes) == 0 {
+		return map[string]int64{}, nil
+	}
+
+	result := make(map[string]int64, len(nodes))
+
+	for i := 0; i < len(nodes); i += nodesBatchSize {
+		end := i + nodesBatchSize
+		if end > len(nodes) {
+			end = len(nodes)
+		}
+		batch := nodes[i:end]
+
+		if err := s.upsertNodeChunk(batch, result); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func (s *Store) upsertNodeChunk(batch []*Node, idMap map[string]int64) error {
+	// Build multi-row INSERT
+	var sb strings.Builder
+	sb.WriteString(`INSERT INTO nodes (project, label, name, qualified_name, file_path, start_line, end_line, properties) VALUES `)
+
+	args := make([]any, 0, len(batch)*8)
+	for i, n := range batch {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString("(?,?,?,?,?,?,?,?)")
+		args = append(args, n.Project, n.Label, n.Name, n.QualifiedName, n.FilePath, n.StartLine, n.EndLine, marshalProps(n.Properties))
+	}
+	sb.WriteString(` ON CONFLICT(project, qualified_name) DO UPDATE SET
+		label=excluded.label, name=excluded.name, file_path=excluded.file_path,
+		start_line=excluded.start_line, end_line=excluded.end_line, properties=excluded.properties`)
+
+	if _, err := s.q.Exec(sb.String(), args...); err != nil {
+		return fmt.Errorf("upsert node batch: %w", err)
+	}
+
+	// Recover IDs via SELECT ... IN (...)
+	// Group by project since the UNIQUE constraint is (project, qualified_name)
+	byProject := make(map[string][]string)
+	for _, n := range batch {
+		byProject[n.Project] = append(byProject[n.Project], n.QualifiedName)
+	}
+
+	for project, qns := range byProject {
+		if err := s.resolveNodeIDs(project, qns, idMap); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resolveNodeIDs fetches IDs for a set of qualified names in a single project.
+// Respects the 999-var limit by batching the IN clause.
+func (s *Store) resolveNodeIDs(project string, qns []string, idMap map[string]int64) error {
+	// 1 var for project + N vars for QNs; batch to stay under 999
+	const maxQNsPerQuery = 998
+
+	for i := 0; i < len(qns); i += maxQNsPerQuery {
+		end := i + maxQNsPerQuery
+		if end > len(qns) {
+			end = len(qns)
+		}
+		chunk := qns[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, project)
+		for j, qn := range chunk {
+			placeholders[j] = "?"
+			args = append(args, qn)
+		}
+
+		query := fmt.Sprintf("SELECT id, qualified_name FROM nodes WHERE project = ? AND qualified_name IN (%s)",
+			strings.Join(placeholders, ","))
+
+		rows, err := s.q.Query(query, args...)
+		if err != nil {
+			return fmt.Errorf("resolve node IDs: %w", err)
+		}
+		for rows.Next() {
+			var id int64
+			var qn string
+			if err := rows.Scan(&id, &qn); err != nil {
+				rows.Close()
+				return err
+			}
+			idMap[qn] = id
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// FindNodeIDsByQNs returns a map of qualifiedName → ID for the given QNs in a project.
+func (s *Store) FindNodeIDsByQNs(project string, qns []string) (map[string]int64, error) {
+	if len(qns) == 0 {
+		return map[string]int64{}, nil
+	}
+	idMap := make(map[string]int64, len(qns))
+	if err := s.resolveNodeIDs(project, qns, idMap); err != nil {
+		return nil, err
+	}
+	return idMap, nil
 }

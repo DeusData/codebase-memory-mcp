@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 )
 
 // InsertEdge inserts an edge (dedup by source_id, target_id, type).
@@ -117,6 +118,47 @@ func (s *Store) FindEdgesByURLPath(project, pathSubstring string) ([]*Edge, erro
 	}
 	defer rows.Close()
 	return scanEdges(rows)
+}
+
+// edgesBatchSize is the max rows per batch INSERT for edges (5 cols × 150 = 750 vars < 999).
+const edgesBatchSize = 150
+
+// InsertEdgeBatch inserts multiple edges in batched multi-row INSERTs.
+func (s *Store) InsertEdgeBatch(edges []*Edge) error {
+	if len(edges) == 0 {
+		return nil
+	}
+
+	for i := 0; i < len(edges); i += edgesBatchSize {
+		end := i + edgesBatchSize
+		if end > len(edges) {
+			end = len(edges)
+		}
+		if err := s.insertEdgeChunk(edges[i:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) insertEdgeChunk(batch []*Edge) error {
+	var sb strings.Builder
+	sb.WriteString(`INSERT INTO edges (project, source_id, target_id, type, properties) VALUES `)
+
+	args := make([]any, 0, len(batch)*5)
+	for i, e := range batch {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString("(?,?,?,?,?)")
+		args = append(args, e.Project, e.SourceID, e.TargetID, e.Type, marshalProps(e.Properties))
+	}
+	sb.WriteString(` ON CONFLICT(source_id, target_id, type) DO UPDATE SET properties=excluded.properties`)
+
+	if _, err := s.q.Exec(sb.String(), args...); err != nil {
+		return fmt.Errorf("insert edge batch: %w", err)
+	}
+	return nil
 }
 
 func scanEdges(rows *sql.Rows) ([]*Edge, error) {

@@ -80,3 +80,22 @@ func TestFuzzyResolve_NoMatchForBareName(t *testing.T) {
 		t.Fatal("expected no fuzzy match on empty registry")
 	}
 }
+
+func TestRegistryExists(t *testing.T) {
+	reg := NewFunctionRegistry()
+	reg.Register("Foo", "pkg.module.Foo", "Function")
+	reg.Register("Bar", "pkg.module.Bar", "Method")
+
+	if !reg.Exists("pkg.module.Foo") {
+		t.Error("expected Foo to exist")
+	}
+	if !reg.Exists("pkg.module.Bar") {
+		t.Error("expected Bar to exist")
+	}
+	if reg.Exists("pkg.module.Missing") {
+		t.Error("expected Missing to not exist")
+	}
+	if reg.Exists("") {
+		t.Error("expected empty string to not exist")
+	}
+}

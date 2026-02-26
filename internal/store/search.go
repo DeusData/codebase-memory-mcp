@@ -37,26 +37,6 @@ type SearchOutput struct {
 	Total   int
 }
 
-// countDegrees populates in/out degree counts on a SearchResult.
-func (s *Store) countDegrees(sr *SearchResult, nodeID int64, relationship string) error {
-	if relationship != "" {
-		if err := s.q.QueryRow("SELECT COUNT(*) FROM edges WHERE target_id=? AND type=?", nodeID, relationship).Scan(&sr.InDegree); err != nil {
-			return fmt.Errorf("count in-degree: %w", err)
-		}
-		if err := s.q.QueryRow("SELECT COUNT(*) FROM edges WHERE source_id=? AND type=?", nodeID, relationship).Scan(&sr.OutDegree); err != nil {
-			return fmt.Errorf("count out-degree: %w", err)
-		}
-	} else {
-		if err := s.q.QueryRow("SELECT COUNT(*) FROM edges WHERE target_id=?", nodeID).Scan(&sr.InDegree); err != nil {
-			return fmt.Errorf("count in-degree: %w", err)
-		}
-		if err := s.q.QueryRow("SELECT COUNT(*) FROM edges WHERE source_id=?", nodeID).Scan(&sr.OutDegree); err != nil {
-			return fmt.Errorf("count out-degree: %w", err)
-		}
-	}
-	return nil
-}
-
 // loadConnectedNames fetches up to 10 connected node names for display.
 func (s *Store) loadConnectedNames(sr *SearchResult, nodeID int64) {
 	connRows, connErr := s.q.Query(`
@@ -113,19 +93,40 @@ func (s *Store) Search(params *SearchParams) (*SearchOutput, error) {
 		conditions = append(conditions, "n.label NOT IN ("+strings.Join(placeholders, ",")+")")
 	}
 
+	// When a name pattern is provided, try to extract literal substrings for SQL LIKE
+	// pre-filtering. This drastically reduces the rows Go needs to regex-match.
+	// The full regex is still applied in Go for correctness.
+	nameHasLikeHints := false
+	if params.NamePattern != "" {
+		hints := extractLikeHints(params.NamePattern)
+		if len(hints) > 0 {
+			nameHasLikeHints = true
+			var likeParts []string
+			for _, hint := range hints {
+				likeVal := "%" + hint + "%"
+				likeParts = append(likeParts, "(n.name LIKE ? OR n.qualified_name LIKE ?)")
+				args = append(args, likeVal, likeVal)
+			}
+			conditions = append(conditions, "("+strings.Join(likeParts, " AND ")+")")
+		}
+	}
+
 	where := strings.Join(conditions, " AND ")
 
-	// When Go-side filtering is needed (regex, degree), fetch more rows from SQL
-	// and apply the user limit after filtering.
+	// When Go-side filtering is needed (regex, degree), we must scan all
+	// qualifying rows since matching nodes may appear at any position.
+	// However, if we pushed LIKE hints into SQL, the result set is already
+	// narrowed and we don't need the full 200K scan for name patterns.
 	hasDegreeFilter := params.MinDegree >= 0 || params.MaxDegree >= 0
+	needsNameScan := params.NamePattern != "" && !nameHasLikeHints
 	var sqlLimit int
-	if params.NamePattern != "" || hasDegreeFilter {
-		sqlLimit = 10000 // fetch enough rows for Go-side filtering
+	if needsNameScan || hasDegreeFilter {
+		sqlLimit = 200000 // must cover full dataset for accurate Go-side filtering
 	} else {
 		// Fetch enough for offset + limit
 		sqlLimit = params.Offset + params.Limit
-		if sqlLimit > 100000 {
-			sqlLimit = 100000
+		if sqlLimit > 200000 {
+			sqlLimit = 200000
 		}
 	}
 
@@ -212,15 +213,118 @@ func isEntryPoint(n *Node) bool {
 	return ok && b
 }
 
+// degreePair stores in-degree and out-degree for a node.
+type degreePair struct {
+	InDegree  int
+	OutDegree int
+}
+
+// batchCountDegrees counts in/out degrees for a batch of node IDs.
+// Returns map[nodeID] → degreePair. Respects the 999-var limit.
+func (s *Store) batchCountDegrees(nodeIDs []int64, relationship string) (map[int64]degreePair, error) {
+	if len(nodeIDs) == 0 {
+		return map[int64]degreePair{}, nil
+	}
+
+	result := make(map[int64]degreePair, len(nodeIDs))
+	const maxIDsPerQuery = 998
+
+	for i := 0; i < len(nodeIDs); i += maxIDsPerQuery {
+		end := i + maxIDsPerQuery
+		if end > len(nodeIDs) {
+			end = len(nodeIDs)
+		}
+		chunk := nodeIDs[i:end]
+
+		placeholders := make([]string, len(chunk))
+		inArgs := make([]any, len(chunk))
+		for j, id := range chunk {
+			placeholders[j] = "?"
+			inArgs[j] = id
+		}
+		inClause := strings.Join(placeholders, ",")
+
+		// Count inbound (target_id)
+		var inQuery string
+		var inQueryArgs []any
+		if relationship != "" {
+			inQuery = fmt.Sprintf("SELECT target_id, COUNT(*) FROM edges WHERE target_id IN (%s) AND type=? GROUP BY target_id", inClause)
+			inQueryArgs = append(inArgs, relationship)
+		} else {
+			inQuery = fmt.Sprintf("SELECT target_id, COUNT(*) FROM edges WHERE target_id IN (%s) GROUP BY target_id", inClause)
+			inQueryArgs = inArgs
+		}
+
+		rows, err := s.q.Query(inQuery, inQueryArgs...)
+		if err != nil {
+			return nil, fmt.Errorf("batch count in-degree: %w", err)
+		}
+		for rows.Next() {
+			var id int64
+			var count int
+			if err := rows.Scan(&id, &count); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			dp := result[id]
+			dp.InDegree = count
+			result[id] = dp
+		}
+		rows.Close()
+
+		// Count outbound (source_id)
+		var outQuery string
+		var outQueryArgs []any
+		if relationship != "" {
+			outQuery = fmt.Sprintf("SELECT source_id, COUNT(*) FROM edges WHERE source_id IN (%s) AND type=? GROUP BY source_id", inClause)
+			outQueryArgs = append(append([]any{}, inArgs...), relationship)
+		} else {
+			outQuery = fmt.Sprintf("SELECT source_id, COUNT(*) FROM edges WHERE source_id IN (%s) GROUP BY source_id", inClause)
+			outQueryArgs = inArgs
+		}
+
+		rows, err = s.q.Query(outQuery, outQueryArgs...)
+		if err != nil {
+			return nil, fmt.Errorf("batch count out-degree: %w", err)
+		}
+		for rows.Next() {
+			var id int64
+			var count int
+			if err := rows.Scan(&id, &count); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			dp := result[id]
+			dp.OutDegree = count
+			result[id] = dp
+		}
+		rows.Close()
+	}
+
+	return result, nil
+}
+
 // buildFilteredResults applies degree, direction, and entry-point filters to nodes,
 // counts degrees, and loads connected names for each qualifying result.
 func (s *Store) buildFilteredResults(nodes []*Node, params *SearchParams) ([]*SearchResult, error) {
+	// Batch count degrees for all nodes at once
+	nodeIDs := make([]int64, len(nodes))
+	for i, n := range nodes {
+		nodeIDs[i] = n.ID
+	}
+
+	degrees, err := s.batchCountDegrees(nodeIDs, params.Relationship)
+	if err != nil {
+		return nil, err
+	}
+
 	results := make([]*SearchResult, 0, len(nodes))
 	for _, n := range nodes {
-		sr := &SearchResult{Node: n}
-
-		if err := s.countDegrees(sr, n.ID, params.Relationship); err != nil {
-			return nil, err
+		dp := degrees[n.ID]
+		sr := &SearchResult{
+			Node:      n,
+			InDegree:  dp.InDegree,
+			OutDegree: dp.OutDegree,
 		}
 
 		degree := sr.InDegree
@@ -244,6 +348,47 @@ func (s *Store) buildFilteredResults(nodes []*Node, params *SearchParams) ([]*Se
 		results = append(results, sr)
 	}
 	return results, nil
+}
+
+// extractLikeHints extracts literal substrings from a regex pattern for SQL LIKE pre-filtering.
+// Returns substrings that MUST appear in matching text (concatenated via .* or similar).
+// Conservative: returns nil for patterns with alternation (|) since AND LIKE is incorrect for OR semantics.
+func extractLikeHints(pattern string) []string {
+	// Bail out on alternation — can't safely convert OR regex to AND LIKE
+	if strings.Contains(pattern, "|") {
+		return nil
+	}
+
+	var hints []string
+	var current strings.Builder
+	i := 0
+	for i < len(pattern) {
+		ch := pattern[i]
+		switch ch {
+		case '\\':
+			// Escaped character — the next char is literal
+			if i+1 < len(pattern) {
+				current.WriteByte(pattern[i+1])
+				i += 2
+			} else {
+				i++
+			}
+		case '.', '*', '+', '?', '^', '$', '(', ')', '[', ']', '{', '}':
+			// Meta character — flush current literal segment
+			if current.Len() >= 3 { // only use hints >= 3 chars to be selective
+				hints = append(hints, current.String())
+			}
+			current.Reset()
+			i++
+		default:
+			current.WriteByte(ch)
+			i++
+		}
+	}
+	if current.Len() >= 3 {
+		hints = append(hints, current.String())
+	}
+	return hints
 }
 
 // filterByNamePattern filters nodes by a regex name pattern.

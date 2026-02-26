@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 
 	"github.com/DeusData/codebase-memory-mcp/internal/pipeline"
@@ -15,10 +16,11 @@ import (
 
 // Server wraps the MCP server with tool handlers.
 type Server struct {
-	mcp     *mcp.Server
-	store   *store.Store
-	watcher *watcher.Watcher
-	indexMu sync.Mutex
+	mcp      *mcp.Server
+	store    *store.Store
+	watcher  *watcher.Watcher
+	indexMu  sync.Mutex
+	handlers map[string]mcp.ToolHandler
 }
 
 // NewServer creates a new MCP server with all tools registered.
@@ -32,6 +34,7 @@ func NewServer(s *store.Store) *Server {
 			},
 			nil,
 		),
+		handlers: make(map[string]mcp.ToolHandler),
 	}
 	srv.registerTools()
 	srv.watcher = watcher.New(s, srv.syncProject)
@@ -61,6 +64,40 @@ func (s *Server) MCPServer() *mcp.Server {
 	return s.mcp
 }
 
+// addTool registers a tool in both the MCP server and the local dispatch map.
+func (s *Server) addTool(tool *mcp.Tool, handler mcp.ToolHandler) {
+	s.mcp.AddTool(tool, handler)
+	s.handlers[tool.Name] = handler
+}
+
+// CallTool invokes a tool handler directly by name, bypassing MCP transport.
+func (s *Server) CallTool(ctx context.Context, name string, argsJSON json.RawMessage) (*mcp.CallToolResult, error) {
+	handler, ok := s.handlers[name]
+	if !ok {
+		return nil, fmt.Errorf("unknown tool: %s", name)
+	}
+	if len(argsJSON) == 0 {
+		argsJSON = json.RawMessage(`{}`)
+	}
+	req := &mcp.CallToolRequest{
+		Params: &mcp.CallToolParamsRaw{
+			Name:      name,
+			Arguments: argsJSON,
+		},
+	}
+	return handler(ctx, req)
+}
+
+// ToolNames returns all registered tool names in sorted order.
+func (s *Server) ToolNames() []string {
+	names := make([]string, 0, len(s.handlers))
+	for name := range s.handlers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 func (s *Server) registerTools() {
 	s.registerGraphTools()
 	s.registerFileTools()
@@ -77,7 +114,7 @@ func (s *Server) registerGraphTools() {
 }
 
 func (s *Server) registerIndexAndTraceTool() {
-	s.mcp.AddTool(&mcp.Tool{
+	s.addTool(&mcp.Tool{
 		Name:        "index_repository",
 		Description: "Index a repository into the code graph. Parses source files, extracts functions/classes/modules, resolves call relationships (CALLS), read references (USAGE), interface implementations (IMPLEMENTS + OVERRIDE), HTTP/async cross-service links, and git history change coupling (FILE_CHANGES_WITH). Supports incremental reindex via content hashing. Auto-sync keeps the graph fresh after initial indexing.",
 		InputSchema: json.RawMessage(`{
@@ -91,7 +128,7 @@ func (s *Server) registerIndexAndTraceTool() {
 		}`),
 	}, s.handleIndexRepository)
 
-	s.mcp.AddTool(&mcp.Tool{
+	s.addTool(&mcp.Tool{
 		Name:        "trace_call_path",
 		Description: "Trace call paths from/to a function. Requires EXACT function name — if unsure, call search_graph(name_pattern=...) first to discover the correct name. Returns hop-by-hop callees/callers with edge types (CALLS, HTTP_CALLS, ASYNC_CALLS, USAGE, OVERRIDE). USAGE edges indicate read references (callbacks, variable assignments) rather than invocations. OVERRIDE edges link struct methods to the interface methods they implement. Use depth=1 first, increase only if needed. IMPORTANT: Use direction='both' for full cross-service context — HTTP_CALLS edges from other services appear as inbound edges on backend functions, so direction='outbound' alone misses cross-service callers. For async dispatch (Cloud Tasks, Pub/Sub), find dispatch functions via search_graph(name_pattern='.*CreateTask.*') then trace via CALLS edges. If the function is not found, use search_graph with a name_pattern regex to find similar names before retrying.",
 		InputSchema: json.RawMessage(`{
@@ -117,13 +154,13 @@ func (s *Server) registerIndexAndTraceTool() {
 }
 
 func (s *Server) registerSchemaAndSnippetTools() {
-	s.mcp.AddTool(&mcp.Tool{
+	s.addTool(&mcp.Tool{
 		Name:        "get_graph_schema",
 		Description: "Return the schema of the indexed code graph: node label counts, edge type counts, relationship patterns (e.g. Function-CALLS->Function), and sample function/class names. Use to understand what's in the graph before querying.",
 		InputSchema: json.RawMessage(`{"type": "object"}`),
 	}, s.handleGetGraphSchema)
 
-	s.mcp.AddTool(&mcp.Tool{
+	s.addTool(&mcp.Tool{
 		Name:        "get_code_snippet",
 		Description: "Retrieve source code for a function/class by qualified name. Reads directly from disk using the stored file path and line range. Returns the source code with line numbers.",
 		InputSchema: json.RawMessage(`{
@@ -140,7 +177,7 @@ func (s *Server) registerSchemaAndSnippetTools() {
 }
 
 func (s *Server) registerSearchTools() {
-	s.mcp.AddTool(&mcp.Tool{
+	s.addTool(&mcp.Tool{
 		Name:        "search_graph",
 		Description: "Search the code graph for nodes. Returns 10 results per page (use offset to paginate, has_more indicates more pages). For dead code: use relationship='CALLS', direction='inbound', max_degree=0, exclude_entry_points=true. For fan-out: use relationship='CALLS', direction='outbound', min_degree=N. Route nodes: properties.handler contains the actual handler function name. Prefer this over query_graph for counting — no row cap. IMPORTANT: The 'relationship' filter counts how many edges of that type each node has (degree filtering) — it does NOT return the actual edges. To list cross-service HTTP_CALLS or ASYNC_CALLS edges with their properties (url_path, confidence), use query_graph with Cypher instead: MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_path, r.confidence. Relationship types: CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD, HANDLES, CONTAINS_FILE, CONTAINS_FOLDER, CONTAINS_PACKAGE, IMPLEMENTS, OVERRIDE, USAGE, FILE_CHANGES_WITH.",
 		InputSchema: json.RawMessage(`{
@@ -204,7 +241,7 @@ func (s *Server) registerSearchTools() {
 		}`),
 	}, s.handleSearchGraph)
 
-	s.mcp.AddTool(&mcp.Tool{
+	s.addTool(&mcp.Tool{
 		Name:        "search_code",
 		Description: "Search for text in source code files (like grep, scoped to indexed project). Returns 10 matches per page — use offset to paginate, has_more indicates more pages. Use for string literals, error messages, TODO comments.",
 		InputSchema: json.RawMessage(`{
@@ -237,7 +274,7 @@ func (s *Server) registerSearchTools() {
 }
 
 func (s *Server) registerQueryTool() {
-	s.mcp.AddTool(&mcp.Tool{
+	s.addTool(&mcp.Tool{
 		Name:        "query_graph",
 		Description: "Execute a Cypher-like graph query. WARNING: 200-row cap applies BEFORE aggregation — COUNT queries on large codebases silently undercount. For fan-out/fan-in counting, use search_graph with min_degree/max_degree instead. Best for: relationship patterns, filtered joins, path queries, and edge property filtering. Supports WHERE on edge properties: r.url_path CONTAINS 'orders', r.confidence >= 0.6, r.method = 'POST', r.confidence_band = 'high', r.validated_by_trace = true, r.coupling_score >= 0.5. This is the correct tool for listing cross-service edges — use MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_path, r.confidence, r.confidence_band to see HTTP links with URLs and confidence scores (bands: high>=0.7, medium>=0.45, speculative>=0.25), or MATCH (a)-[r:ASYNC_CALLS]->(b) for async dispatch edges. For change coupling: MATCH (a)-[r:FILE_CHANGES_WITH]->(b) RETURN a.name, b.name, r.coupling_score, r.co_change_count. For interface method overrides: MATCH (s)-[r:OVERRIDE]->(i) to find struct methods implementing interface methods. For read references (callbacks, variable assignments): MATCH (a)-[r:USAGE]->(b). Always use LIMIT. Edge types: CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD, HANDLES, IMPLEMENTS, OVERRIDE, USAGE, FILE_CHANGES_WITH.",
 		InputSchema: json.RawMessage(`{
@@ -256,7 +293,7 @@ func (s *Server) registerQueryTool() {
 // registerFileTools registers tools for file and directory operations.
 func (s *Server) registerFileTools() {
 	// 8. read_file
-	s.mcp.AddTool(&mcp.Tool{
+	s.addTool(&mcp.Tool{
 		Name:        "read_file",
 		Description: "Read any file from the indexed project. Supports line range selection for large files. Use for reading config files (Dockerfile, go.mod, requirements.txt), source code, or any text file.",
 		InputSchema: json.RawMessage(`{
@@ -280,7 +317,7 @@ func (s *Server) registerFileTools() {
 	}, s.handleReadFile)
 
 	// 9. list_directory
-	s.mcp.AddTool(&mcp.Tool{
+	s.addTool(&mcp.Tool{
 		Name:        "list_directory",
 		Description: "List files and subdirectories in a directory. Supports glob patterns for filtering. Use for exploring project structure.",
 		InputSchema: json.RawMessage(`{
@@ -302,14 +339,14 @@ func (s *Server) registerFileTools() {
 // registerProjectTools registers tools for project management.
 func (s *Server) registerProjectTools() {
 	// 6. list_projects
-	s.mcp.AddTool(&mcp.Tool{
+	s.addTool(&mcp.Tool{
 		Name:        "list_projects",
 		Description: "List all indexed projects with their indexed_at timestamp, root path, and node/edge counts.",
 		InputSchema: json.RawMessage(`{"type": "object"}`),
 	}, s.handleListProjects)
 
 	// 7. delete_project
-	s.mcp.AddTool(&mcp.Tool{
+	s.addTool(&mcp.Tool{
 		Name:        "delete_project",
 		Description: "Delete an indexed project and all its graph data (nodes, edges, file hashes). This action is irreversible.",
 		InputSchema: json.RawMessage(`{

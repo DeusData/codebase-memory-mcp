@@ -1,12 +1,15 @@
 # codebase-memory-mcp
 
-An MCP server that remembers your codebase structure. Indexes source code into a queryable knowledge graph — functions, classes, call chains, cross-service HTTP links — all stored in embedded SQLite. Single Go binary, no Docker, no external databases.
+**Stop paying 100x more tokens for code exploration.** This MCP server indexes your codebase into a persistent knowledge graph that survives session restarts and context compaction. One graph query returns what would take dozens of grep/Glob calls — precise structural results in ~500 tokens vs ~80K tokens for file-by-file exploration.
 
-Parses source code with [tree-sitter](https://tree-sitter.github.io/tree-sitter/), extracts functions, classes, modules, call relationships, and cross-service HTTP links. Exposes the graph through 11 MCP tools for use with Claude Code or any MCP-compatible client.
+Single Go binary. No Docker, no external databases, no API keys. Download, configure, say *"Index this project"* — done.
+
+Parses source code with [tree-sitter](https://tree-sitter.github.io/tree-sitter/), extracts functions, classes, modules, call relationships, and cross-service HTTP links. Exposes the graph through 12 MCP tools for use with Claude Code or any MCP-compatible client. Also includes a **CLI mode** for direct tool invocation from the shell — no MCP client needed.
 
 ## Features
 
 - **12 languages**: Python, Go, JavaScript, TypeScript, TSX, Rust, Java, C++, C#, PHP, Lua, Scala
+- **Fast**: Sub-millisecond graph queries, incremental reindex 4x faster than full scan, optimized SQLite with LIKE pre-filtering for regex searches
 - **Call graph**: Resolves function calls across files and packages (import-aware, type-inferred)
 - **Cross-service HTTP linking**: Discovers REST routes (FastAPI, Gin, Express) and matches them to HTTP call sites with confidence scoring
 - **Auto-sync**: Background polling detects file changes and triggers incremental re-indexing automatically — no manual reindex needed after the initial index
@@ -15,6 +18,7 @@ Parses source code with [tree-sitter](https://tree-sitter.github.io/tree-sitter/
 - **Dead code detection**: Finds functions with zero callers, excluding entry points (route handlers, `main()`, framework-decorated functions)
 - **Route nodes**: REST endpoints are first-class graph entities, queryable by path/method
 - **JSON config scanning**: Extracts URLs from config/payload JSON files for cross-service linking
+- **CLI mode**: Invoke any tool directly from the shell — `codebase-memory-mcp cli search_graph '{"name_pattern": ".*Handler.*"}'`
 - **Single binary, zero infrastructure**: SQLite WAL mode, persists to `~/.cache/codebase-memory-mcp/`
 
 ## How It Works
@@ -45,6 +49,21 @@ Claude Code formats and explains the results.
 **Why no built-in LLM?** Other code graph tools embed an LLM to translate natural language into graph queries. This means extra API keys, extra cost per query, and another model to configure. With MCP, the AI assistant you're already talking to *is* the query translator — no duplication needed.
 
 **Token efficiency**: Compared to having an AI agent grep through your codebase file by file, graph queries return precise results in a single tool call. In benchmarks on a multi-service project (2,348 nodes, 3,853 edges), five structural queries consumed ~3,400 tokens via codebase-memory-mcp versus ~412,000 tokens via file-by-file exploration — a **99.2% reduction**.
+
+## Performance
+
+Benchmarked on a multi-service project (~37K nodes, ~35K edges) with Go 1.26 on Apple Silicon:
+
+| Operation | Time | Notes |
+|-----------|------|-------|
+| Fresh index (full codebase) | ~6.3s | 37K nodes, 35K edges |
+| Incremental reindex | ~1.2s | Content-hash skip for unchanged files |
+| Cypher query (relationship traversal) | <1ms | Up to 600x faster than v0.1.3 for pattern queries |
+| Name search (regex) | <10ms | SQL LIKE pre-filtering narrows before Go regex |
+| Dead code detection | ~150ms | Full graph scan with degree filtering |
+| Trace call path (3 hops) | <10ms | BFS traversal with batch degree counting |
+
+**Token efficiency**: Five structural queries consumed ~3,400 tokens via codebase-memory-mcp versus ~412,000 tokens via file-by-file grep exploration — a **99.2% reduction**.
 
 ## Installation
 
@@ -117,7 +136,7 @@ Claude Code will clone, build, and configure it automatically.
 
 | Requirement | Version | Check | Install |
 |-------------|---------|-------|---------|
-| **Go** | 1.23+ | `go version` | [go.dev/dl](https://go.dev/dl/) |
+| **Go** | 1.26+ | `go version` | [go.dev/dl](https://go.dev/dl/) |
 | **C compiler** | gcc or clang | `gcc --version` or `clang --version` | See below |
 | **Git** | any | `git --version` | Pre-installed on most systems |
 
@@ -160,7 +179,7 @@ On **Windows with WSL** (credit: [@Flipper1994](https://github.com/Flipper1994))
 ```bash
 # Inside WSL (Ubuntu)
 sudo apt update && sudo apt install build-essential
-# Install Go 1.23+ from https://go.dev/dl/
+# Install Go 1.26+ from https://go.dev/dl/
 git clone https://github.com/DeusData/codebase-memory-mcp.git
 cd codebase-memory-mcp
 CGO_ENABLED=1 go build -buildvcs=false -o ~/.local/bin/codebase-memory-mcp ./cmd/codebase-memory-mcp/
@@ -195,7 +214,7 @@ Add the MCP server to your project's `.mcp.json` (per-project, recommended) or `
 }
 ```
 
-Restart Claude Code after adding the config. Verify with `/mcp` — you should see `codebase-memory-mcp` listed with 11 tools.
+Restart Claude Code after adding the config. Verify with `/mcp` — you should see `codebase-memory-mcp` listed with 12 tools.
 
 ### First Use
 
@@ -216,6 +235,60 @@ After the initial `index_repository` call, the graph **stays fresh automatically
 - **Incremental**: Only changed files are re-parsed (content-hash based), so even triggered re-indexes are fast
 
 You can still call `index_repository` manually at any time to force an immediate reindex (e.g. after a large `git pull`).
+
+## CLI Mode
+
+Every MCP tool can be invoked directly from the command line — no MCP client needed. Useful for testing, scripting, CI pipelines, and quick one-off queries.
+
+```bash
+codebase-memory-mcp cli <tool_name> [json_args]
+```
+
+By default, the CLI prints a **human-friendly summary**. Use `--raw` for full JSON output (same format the MCP server returns).
+
+### Examples
+
+```bash
+# Index a repository
+codebase-memory-mcp cli index_repository '{"repo_path": "/path/to/repo"}'
+# → Indexed "repo": 1017 nodes, 2574 edges
+# →   db: ~/.cache/codebase-memory-mcp/codebase-memory.db
+
+# List indexed projects
+codebase-memory-mcp cli list_projects
+# → 2 project(s) indexed:
+# →   my-api       1017 nodes, 2574 edges  (indexed 2026-02-26T18:10:24Z)
+# →   my-frontend   450 nodes,  312 edges  (indexed 2026-02-26T17:34:06Z)
+
+# Search for functions
+codebase-memory-mcp cli search_graph '{"name_pattern": ".*Handler.*", "label": "Function"}'
+# → 5 result(s) found
+# →   [Function] HandleRequest  cmd/server/main.go:42
+
+# Trace call paths
+codebase-memory-mcp cli trace_call_path '{"function_name": "Search", "direction": "both"}'
+# → Trace from "Search": 8 node(s), 8 edge(s), 2 hop(s)
+
+# Run Cypher queries
+codebase-memory-mcp cli query_graph '{"query": "MATCH (f:Function) RETURN f.name LIMIT 5"}'
+# → 5 row(s) returned  [f.name]
+# →   main
+# →   HandleRequest
+
+# View graph schema
+codebase-memory-mcp cli get_graph_schema
+
+# No args needed for tools without required parameters
+codebase-memory-mcp cli list_projects
+
+# Full JSON output for scripting
+codebase-memory-mcp cli --raw search_graph '{"label": "Function", "limit": 100}' | jq '.results[].name'
+
+# List available tools
+codebase-memory-mcp cli --help
+```
+
+The CLI uses the same SQLite database as the MCP server (`~/.cache/codebase-memory-mcp/codebase-memory.db`). No watcher is started in CLI mode — each invocation is a single-shot operation.
 
 ## MCP Tools
 
@@ -501,7 +574,7 @@ make install  # go install
 ## Architecture
 
 ```
-cmd/codebase-memory-mcp/  Entry point (MCP stdio server)
+cmd/codebase-memory-mcp/  Entry point (MCP stdio server + CLI mode)
 internal/
   store/                  SQLite graph storage (nodes, edges, traversal, search)
   lang/                   Language specs (12 languages, tree-sitter node types)
@@ -509,7 +582,7 @@ internal/
   pipeline/               4-pass indexing (structure -> definitions -> calls -> HTTP links)
   httplink/               Cross-service HTTP route/call-site matching
   cypher/                 Cypher query lexer, parser, planner, executor
-  tools/                  MCP tool handlers (11 tools)
+  tools/                  MCP tool handlers (12 tools) + CLI dispatch
   watcher/                Background auto-sync (mtime+size polling, adaptive intervals)
   discover/               File discovery with .cgrignore support
   fqn/                    Qualified name computation

@@ -183,6 +183,15 @@ func (r *FunctionRegistry) FuzzyResolve(calleeName, moduleQN string) (string, bo
 	return "", false
 }
 
+// Exists returns true if a qualified name is registered.
+// Uses RLock for concurrent read safety.
+func (r *FunctionRegistry) Exists(qualifiedName string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.exact[qualifiedName]
+	return ok
+}
+
 // FindByName returns all qualified names with the given simple name.
 func (r *FunctionRegistry) FindByName(name string) []string {
 	r.mu.RLock()

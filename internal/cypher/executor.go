@@ -85,6 +85,21 @@ func (e *Executor) executeStepsForProject(project string, steps []PlanStep) ([]b
 		var err error
 		switch s := step.(type) {
 		case *ScanNodes:
+			// Fast path: ScanNodes followed by ExpandRelationship can be fused
+			// into a single SQL JOIN, avoiding N+1 queries.
+			if i+1 < len(steps) {
+				if expand, ok := steps[i+1].(*ExpandRelationship); ok && canFuseJoin(s, expand) {
+					bindings, err = e.execJoinScanExpand(project, s, expand)
+					if err != nil {
+						return nil, err
+					}
+					// Mark next step as consumed by incrementing i via a skip flag
+					// We'll handle this below.
+					steps[i+1] = &fusedExpandMarker{}
+					break
+				}
+			}
+
 			// Check if the next step is a FilterWhere that can be pushed down
 			var pushDown *FilterWhere
 			if i+1 < len(steps) {
@@ -95,6 +110,8 @@ func (e *Executor) executeStepsForProject(project string, steps []PlanStep) ([]b
 			bindings, err = e.execScan(project, s, pushDown)
 		case *ExpandRelationship:
 			bindings, err = e.execExpand(s, bindings)
+		case *fusedExpandMarker:
+			continue // already handled by JOIN fusion
 		case *FilterWhere:
 			// Skip if this was already consumed by push-down
 			if i > 0 {
@@ -116,6 +133,129 @@ func (e *Executor) executeStepsForProject(project string, steps []PlanStep) ([]b
 				bindings = bindings[:maxResultRows*2]
 			}
 		}
+	}
+
+	return bindings, nil
+}
+
+// fusedExpandMarker is a placeholder step marking an ExpandRelationship
+// that was already handled by JOIN fusion with the preceding ScanNodes.
+type fusedExpandMarker struct{}
+
+func (*fusedExpandMarker) stepType() string { return "fused" }
+
+// canFuseJoin returns true if a ScanNodes + ExpandRelationship pair can be
+// replaced by a single SQL JOIN. Requirements: fixed-length (1 hop), known
+// edge types, standard direction, no inline property filters on source.
+func canFuseJoin(scan *ScanNodes, expand *ExpandRelationship) bool {
+	if expand.MinHops != 1 || expand.MaxHops != 1 {
+		return false // variable-length paths need BFS
+	}
+	if len(expand.EdgeTypes) == 0 {
+		return false // untyped edges: keep generic path
+	}
+	if len(scan.Props) > 0 {
+		return false // inline property filters on source not supported in JOIN
+	}
+	if expand.Direction != "outbound" && expand.Direction != "inbound" && expand.Direction != "" {
+		return false
+	}
+	return true
+}
+
+// execJoinScanExpand executes a fused ScanNodes→ExpandRelationship step using
+// a single SQL JOIN, avoiding N+1 queries.
+func (e *Executor) execJoinScanExpand(project string, scan *ScanNodes, expand *ExpandRelationship) ([]binding, error) {
+	// Build type filter: type IN (?, ?, ...)
+	typePlaceholders := make([]string, len(expand.EdgeTypes))
+	args := make([]any, 0, len(expand.EdgeTypes)+2)
+	args = append(args, project)
+	for i, et := range expand.EdgeTypes {
+		typePlaceholders[i] = "?"
+		args = append(args, et)
+	}
+	typeFilter := strings.Join(typePlaceholders, ",")
+
+	// Determine join direction
+	var srcCol, tgtCol string
+	dir := expand.Direction
+	if dir == "" {
+		dir = "outbound"
+	}
+	if dir == "outbound" {
+		srcCol, tgtCol = "source_id", "target_id"
+	} else {
+		srcCol, tgtCol = "target_id", "source_id"
+	}
+
+	// Build label filters
+	var srcLabelClause, tgtLabelClause string
+	if scan.Label != "" {
+		srcLabelClause = " AND src.label = ?"
+		args = append(args, scan.Label)
+	}
+	if expand.ToLabel != "" {
+		tgtLabelClause = " AND tgt.label = ?"
+		args = append(args, expand.ToLabel)
+	}
+
+	query := fmt.Sprintf(`
+		SELECT
+			src.id, src.project, src.label, src.name, src.qualified_name, src.file_path, src.start_line, src.end_line, src.properties,
+			tgt.id, tgt.project, tgt.label, tgt.name, tgt.qualified_name, tgt.file_path, tgt.start_line, tgt.end_line, tgt.properties,
+			e.id, e.project, e.source_id, e.target_id, e.type, e.properties
+		FROM edges e
+		JOIN nodes src ON src.id = e.%s
+		JOIN nodes tgt ON tgt.id = e.%s
+		WHERE e.project = ? AND e.type IN (%s)%s%s
+		LIMIT ?`,
+		srcCol, tgtCol, typeFilter, srcLabelClause, tgtLabelClause)
+
+	args = append(args, maxResultRows*2)
+
+	rows, err := e.Store.DB().Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("join scan+expand: %w", err)
+	}
+	defer rows.Close()
+
+	var bindings []binding
+	for rows.Next() {
+		var srcN, tgtN store.Node
+		var srcProps, tgtProps string
+		var edge store.Edge
+		var edgeProps string
+
+		if err := rows.Scan(
+			&srcN.ID, &srcN.Project, &srcN.Label, &srcN.Name, &srcN.QualifiedName, &srcN.FilePath, &srcN.StartLine, &srcN.EndLine, &srcProps,
+			&tgtN.ID, &tgtN.Project, &tgtN.Label, &tgtN.Name, &tgtN.QualifiedName, &tgtN.FilePath, &tgtN.StartLine, &tgtN.EndLine, &tgtProps,
+			&edge.ID, &edge.Project, &edge.SourceID, &edge.TargetID, &edge.Type, &edgeProps,
+		); err != nil {
+			return nil, err
+		}
+		srcN.Properties = store.UnmarshalProps(srcProps)
+		tgtN.Properties = store.UnmarshalProps(tgtProps)
+		edge.Properties = store.UnmarshalProps(edgeProps)
+
+		// Apply target inline property filters
+		if len(expand.ToProps) > 0 && !nodeMatchesProps(&tgtN, expand.ToProps) {
+			continue
+		}
+
+		b := newBinding()
+		if scan.Variable != "" {
+			b.nodes[scan.Variable] = &srcN
+		}
+		if expand.ToVar != "" {
+			b.nodes[expand.ToVar] = &tgtN
+		}
+		if expand.RelVar != "" {
+			b.edges[expand.RelVar] = &edge
+		}
+		bindings = append(bindings, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	return bindings, nil

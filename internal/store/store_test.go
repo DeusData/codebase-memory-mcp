@@ -351,6 +351,39 @@ func TestGlobToLike(t *testing.T) {
 	}
 }
 
+func TestExtractLikeHints(t *testing.T) {
+	tests := []struct {
+		pattern string
+		want    []string
+	}{
+		{".*handler.*", []string{"handler"}},
+		{".*Order.*Handler.*", []string{"Order", "Handler"}},
+		{"handler", []string{"handler"}},
+		{"^handleRequest$", []string{"handleRequest"}},
+		{".*", nil},               // no literal >= 3 chars
+		{".*ab.*", nil},           // "ab" is only 2 chars, below threshold
+		{".*abc.*", []string{"abc"}}, // exactly 3 chars, included
+		{".*foo|.*bar", nil},      // alternation → bail out
+		{".*Order.*|.*Handler.*", nil}, // alternation → bail out
+		{"\\.", nil},              // escaped dot is ".", only 1 char
+		{".*test_.*helper.*", []string{"test_", "helper"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.pattern, func(t *testing.T) {
+			got := extractLikeHints(tt.pattern)
+			if len(got) != len(tt.want) {
+				t.Errorf("extractLikeHints(%q) = %v, want %v", tt.pattern, got, tt.want)
+				return
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("extractLikeHints(%q)[%d] = %q, want %q", tt.pattern, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestGeneratedColumnURLPath(t *testing.T) {
 	s, err := OpenMemory()
 	if err != nil {
@@ -422,6 +455,325 @@ func TestFindEdgesByURLPath(t *testing.T) {
 	}
 	if len(edges) != 0 {
 		t.Fatalf("expected 0 edges, got %d", len(edges))
+	}
+}
+
+func TestPragmaSettings(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	tests := []struct {
+		pragma string
+		want   string
+	}{
+		{"synchronous", "0"},     // OFF for in-memory
+		{"temp_store", "2"},      // MEMORY
+		{"foreign_keys", "1"},    // ON
+	}
+	for _, tt := range tests {
+		var val string
+		err := s.DB().QueryRow("PRAGMA " + tt.pragma).Scan(&val)
+		if err != nil {
+			t.Fatalf("PRAGMA %s: %v", tt.pragma, err)
+		}
+		if val != tt.want {
+			t.Errorf("PRAGMA %s = %q, want %q", tt.pragma, val, tt.want)
+		}
+	}
+}
+
+func TestUpsertNodeBatch(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create 150 nodes (triggers two batches: 100 + 50)
+	nodes := make([]*Node, 150)
+	for i := range nodes {
+		nodes[i] = &Node{
+			Project:       "test",
+			Label:         "Function",
+			Name:          fmt.Sprintf("func_%d", i),
+			QualifiedName: fmt.Sprintf("test.pkg.func_%d", i),
+			FilePath:      "pkg.go",
+			StartLine:     i * 10,
+			EndLine:       i*10 + 9,
+		}
+	}
+
+	idMap, err := s.UpsertNodeBatch(nodes)
+	if err != nil {
+		t.Fatalf("UpsertNodeBatch: %v", err)
+	}
+
+	if len(idMap) != 150 {
+		t.Fatalf("expected 150 IDs, got %d", len(idMap))
+	}
+
+	// Verify all IDs are non-zero and unique
+	seen := make(map[int64]bool)
+	for qn, id := range idMap {
+		if id == 0 {
+			t.Errorf("zero ID for %s", qn)
+		}
+		if seen[id] {
+			t.Errorf("duplicate ID %d", id)
+		}
+		seen[id] = true
+	}
+
+	// Verify count
+	count, _ := s.CountNodes("test")
+	if count != 150 {
+		t.Errorf("expected 150 nodes, got %d", count)
+	}
+
+	// Upsert again (should update, not duplicate)
+	for _, n := range nodes {
+		n.Properties = map[string]any{"updated": true}
+	}
+	idMap2, err := s.UpsertNodeBatch(nodes)
+	if err != nil {
+		t.Fatalf("UpsertNodeBatch re-upsert: %v", err)
+	}
+	count, _ = s.CountNodes("test")
+	if count != 150 {
+		t.Errorf("expected 150 after re-upsert, got %d", count)
+	}
+	// IDs should be the same
+	for qn, id := range idMap {
+		if idMap2[qn] != id {
+			t.Errorf("ID changed for %s: %d -> %d", qn, id, idMap2[qn])
+		}
+	}
+}
+
+func TestUpsertNodeBatchEmpty(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	idMap, err := s.UpsertNodeBatch(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idMap) != 0 {
+		t.Errorf("expected empty map, got %d entries", len(idMap))
+	}
+}
+
+func TestInsertEdgeBatch(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create nodes
+	ids := make([]int64, 10)
+	for i := range ids {
+		ids[i], _ = s.UpsertNode(&Node{
+			Project:       "test",
+			Label:         "Function",
+			Name:          fmt.Sprintf("f%d", i),
+			QualifiedName: fmt.Sprintf("test.f%d", i),
+		})
+	}
+
+	// Create 200 edges (triggers two batches: 150 + 50)
+	edges := make([]*Edge, 0, 200)
+	for i := 0; i < 200 && i < len(ids)*len(ids); i++ {
+		src := i / len(ids)
+		tgt := i % len(ids)
+		if src == tgt {
+			continue
+		}
+		edges = append(edges, &Edge{
+			Project:  "test",
+			SourceID: ids[src],
+			TargetID: ids[tgt],
+			Type:     "CALLS",
+		})
+		if len(edges) >= 200 {
+			break
+		}
+	}
+
+	if err := s.InsertEdgeBatch(edges); err != nil {
+		t.Fatalf("InsertEdgeBatch: %v", err)
+	}
+
+	count, _ := s.CountEdges("test")
+	if count != len(edges) {
+		t.Errorf("expected %d edges, got %d", len(edges), count)
+	}
+
+	// Re-insert with properties (should update via ON CONFLICT)
+	for _, e := range edges {
+		e.Properties = map[string]any{"updated": true}
+	}
+	if err := s.InsertEdgeBatch(edges); err != nil {
+		t.Fatalf("InsertEdgeBatch re-insert: %v", err)
+	}
+	count, _ = s.CountEdges("test")
+	if count != len(edges) {
+		t.Errorf("expected %d edges after re-insert, got %d", len(edges), count)
+	}
+}
+
+func TestUpsertFileHashBatch(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create 250 file hashes (triggers two batches: 200 + 50)
+	hashes := make([]FileHash, 250)
+	for i := range hashes {
+		hashes[i] = FileHash{
+			Project: "test",
+			RelPath: fmt.Sprintf("file_%d.go", i),
+			SHA256:  fmt.Sprintf("hash_%d", i),
+		}
+	}
+
+	if err := s.UpsertFileHashBatch(hashes); err != nil {
+		t.Fatalf("UpsertFileHashBatch: %v", err)
+	}
+
+	stored, err := s.GetFileHashes("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 250 {
+		t.Fatalf("expected 250 hashes, got %d", len(stored))
+	}
+
+	// Verify values
+	for _, h := range hashes {
+		if stored[h.RelPath] != h.SHA256 {
+			t.Errorf("hash mismatch for %s: got %s, want %s", h.RelPath, stored[h.RelPath], h.SHA256)
+		}
+	}
+
+	// Update hashes (should not duplicate)
+	for i := range hashes {
+		hashes[i].SHA256 = fmt.Sprintf("updated_%d", i)
+	}
+	if err := s.UpsertFileHashBatch(hashes); err != nil {
+		t.Fatal(err)
+	}
+	stored, _ = s.GetFileHashes("test")
+	if len(stored) != 250 {
+		t.Errorf("expected 250 after update, got %d", len(stored))
+	}
+	if stored["file_0.go"] != "updated_0" {
+		t.Errorf("expected updated hash, got %s", stored["file_0.go"])
+	}
+}
+
+func TestFindNodeIDsByQNs(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert nodes
+	id1, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "A", QualifiedName: "test.A"})
+	id2, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "B", QualifiedName: "test.B"})
+
+	// Lookup
+	idMap, err := s.FindNodeIDsByQNs("test", []string{"test.A", "test.B", "test.missing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idMap["test.A"] != id1 {
+		t.Errorf("test.A: expected %d, got %d", id1, idMap["test.A"])
+	}
+	if idMap["test.B"] != id2 {
+		t.Errorf("test.B: expected %d, got %d", id2, idMap["test.B"])
+	}
+	if _, ok := idMap["test.missing"]; ok {
+		t.Error("expected missing QN to not be in map")
+	}
+}
+
+func TestBatchCountDegrees(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create A -> B, A -> C, B -> C
+	idA, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "A", QualifiedName: "test.A"})
+	idB, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "B", QualifiedName: "test.B"})
+	idC, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "C", QualifiedName: "test.C"})
+
+	s.InsertEdge(&Edge{Project: "test", SourceID: idA, TargetID: idB, Type: "CALLS"})
+	s.InsertEdge(&Edge{Project: "test", SourceID: idA, TargetID: idC, Type: "CALLS"})
+	s.InsertEdge(&Edge{Project: "test", SourceID: idB, TargetID: idC, Type: "CALLS"})
+	s.InsertEdge(&Edge{Project: "test", SourceID: idA, TargetID: idC, Type: "USAGE"})
+
+	// Batch count all types
+	degrees, err := s.batchCountDegrees([]int64{idA, idB, idC}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A: in=0, out=3 (2 CALLS + 1 USAGE)
+	if degrees[idA].InDegree != 0 || degrees[idA].OutDegree != 3 {
+		t.Errorf("A: in=%d out=%d, want in=0 out=3", degrees[idA].InDegree, degrees[idA].OutDegree)
+	}
+	// B: in=1, out=1
+	if degrees[idB].InDegree != 1 || degrees[idB].OutDegree != 1 {
+		t.Errorf("B: in=%d out=%d, want in=1 out=1", degrees[idB].InDegree, degrees[idB].OutDegree)
+	}
+	// C: in=3, out=0
+	if degrees[idC].InDegree != 3 || degrees[idC].OutDegree != 0 {
+		t.Errorf("C: in=%d out=%d, want in=3 out=0", degrees[idC].InDegree, degrees[idC].OutDegree)
+	}
+
+	// Batch count filtered by CALLS
+	degrees, err = s.batchCountDegrees([]int64{idA, idC}, "CALLS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A: in=0, out=2 (CALLS only)
+	if degrees[idA].InDegree != 0 || degrees[idA].OutDegree != 2 {
+		t.Errorf("A CALLS: in=%d out=%d, want in=0 out=2", degrees[idA].InDegree, degrees[idA].OutDegree)
+	}
+	// C: in=2, out=0 (CALLS only)
+	if degrees[idC].InDegree != 2 || degrees[idC].OutDegree != 0 {
+		t.Errorf("C CALLS: in=%d out=%d, want in=2 out=0", degrees[idC].InDegree, degrees[idC].OutDegree)
 	}
 }
 

@@ -2,8 +2,10 @@ package pipeline
 
 import (
 	"log/slog"
+	"runtime"
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/DeusData/codebase-memory-mcp/internal/discover"
 	"github.com/DeusData/codebase-memory-mcp/internal/fqn"
@@ -14,19 +16,50 @@ import (
 
 // passUsages walks ASTs and creates USAGE edges for identifier references
 // that are NOT inside call expressions (those are already CALLS edges).
-// This distinguishes read references (passed as callbacks, stored in variables,
-// used in type annotations) from function invocations.
+// Uses parallel per-file resolution (Stage 1) followed by batch DB writes (Stage 2).
 func (p *Pipeline) passUsages() {
 	slog.Info("pass3b.usages")
-	count := 0
-	for relPath, cached := range p.astCache {
-		spec := lang.ForLanguage(cached.Language)
-		if spec == nil {
-			continue
-		}
-		count += p.processFileUsages(relPath, cached, spec)
+
+	type fileEntry struct {
+		relPath string
+		cached  *cachedAST
 	}
-	slog.Info("pass3b.usages.done", "edges", count)
+	var files []fileEntry
+	for relPath, cached := range p.astCache {
+		if lang.ForLanguage(cached.Language) != nil {
+			files = append(files, fileEntry{relPath, cached})
+		}
+	}
+
+	if len(files) == 0 {
+		return
+	}
+
+	// Stage 1: Parallel per-file usage resolution
+	results := make([][]resolvedEdge, len(files))
+	numWorkers := runtime.NumCPU()
+	if numWorkers > len(files) {
+		numWorkers = len(files)
+	}
+
+	g := new(errgroup.Group)
+	g.SetLimit(numWorkers)
+	for i, fe := range files {
+		g.Go(func() error {
+			results[i] = p.resolveFileUsages(fe.relPath, fe.cached)
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	// Stage 2: Batch write
+	p.flushResolvedEdges(results)
+
+	total := 0
+	for _, r := range results {
+		total += len(r)
+	}
+	slog.Info("pass3b.usages.done", "edges", total)
 }
 
 // passUsagesForFiles runs usage detection only for the specified files (incremental).
@@ -38,11 +71,21 @@ func (p *Pipeline) passUsagesForFiles(files []discover.FileInfo) {
 		if !ok {
 			continue
 		}
-		spec := lang.ForLanguage(cached.Language)
-		if spec == nil {
-			continue
+		edges := p.resolveFileUsages(f.RelPath, cached)
+		// Write edges directly for incremental (small count)
+		for _, re := range edges {
+			callerNode, _ := p.Store.FindNodeByQN(p.ProjectName, re.CallerQN)
+			targetNode, _ := p.Store.FindNodeByQN(p.ProjectName, re.TargetQN)
+			if callerNode != nil && targetNode != nil {
+				_, _ = p.Store.InsertEdge(&store.Edge{
+					Project:  p.ProjectName,
+					SourceID: callerNode.ID,
+					TargetID: targetNode.ID,
+					Type:     re.Type,
+				})
+				count++
+			}
 		}
-		count += p.processFileUsages(f.RelPath, cached, spec)
 	}
 	slog.Info("pass3b.usages.incremental.done", "edges", count)
 }
@@ -84,9 +127,15 @@ func importNodeTypes(spec *lang.LanguageSpec) map[string]bool {
 	return combined
 }
 
-// processFileUsages walks a file's AST to find identifier references that
-// are not call expressions and creates USAGE edges for resolved references.
-func (p *Pipeline) processFileUsages(relPath string, cached *cachedAST, spec *lang.LanguageSpec) int {
+// resolveFileUsages walks a file's AST to find identifier references that
+// are not call expressions and resolves them to USAGE edges.
+// Thread-safe: reads from registry (RLock) and importMaps (read-only).
+func (p *Pipeline) resolveFileUsages(relPath string, cached *cachedAST) []resolvedEdge {
+	spec := lang.ForLanguage(cached.Language)
+	if spec == nil {
+		return nil
+	}
+
 	refTypes := toSet(referenceNodeTypes(cached.Language))
 	callTypes := toSet(spec.CallNodeTypes)
 	importTypes := importNodeTypes(spec)
@@ -94,17 +143,15 @@ func (p *Pipeline) processFileUsages(relPath string, cached *cachedAST, spec *la
 	importMap := p.importMaps[moduleQN]
 
 	root := cached.Tree.RootNode()
-	count := 0
+	var edges []resolvedEdge
 
 	parser.Walk(root, func(node *tree_sitter.Node) bool {
 		kind := node.Kind()
 
-		// Skip call expression subtrees — those are handled by passCalls
 		if callTypes[kind] {
 			return false
 		}
 
-		// Skip import statement subtrees
 		if importTypes[kind] {
 			return false
 		}
@@ -113,7 +160,6 @@ func (p *Pipeline) processFileUsages(relPath string, cached *cachedAST, spec *la
 			return true
 		}
 
-		// Skip if this identifier is inside a function/class definition name
 		if isDefinitionName(node) {
 			return false
 		}
@@ -123,38 +169,24 @@ func (p *Pipeline) processFileUsages(relPath string, cached *cachedAST, spec *la
 			return false
 		}
 
-		// Find enclosing function for the "caller" side of the USAGE edge
 		callerQN := findEnclosingFunction(node, cached.Source, p.ProjectName, relPath, spec)
 		if callerQN == "" {
 			callerQN = moduleQN
 		}
 
-		// Try to resolve the reference against the registry
 		targetQN := p.registry.Resolve(refName, moduleQN, importMap)
 		if targetQN == "" {
 			return false
 		}
 
-		// Don't create USAGE edge to self
 		if targetQN == callerQN {
 			return false
 		}
 
-		// Create the USAGE edge
-		callerNode, _ := p.Store.FindNodeByQN(p.ProjectName, callerQN)
-		targetNode, _ := p.Store.FindNodeByQN(p.ProjectName, targetQN)
-		if callerNode != nil && targetNode != nil {
-			_, _ = p.Store.InsertEdge(&store.Edge{
-				Project:  p.ProjectName,
-				SourceID: callerNode.ID,
-				TargetID: targetNode.ID,
-				Type:     "USAGE",
-			})
-			count++
-		}
+		edges = append(edges, resolvedEdge{CallerQN: callerQN, TargetQN: targetQN, Type: "USAGE"})
 		return false
 	})
-	return count
+	return edges
 }
 
 // isDefinitionName returns true if the node is the name child of a function,

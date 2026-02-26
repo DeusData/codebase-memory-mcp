@@ -9,7 +9,7 @@ import (
 )
 
 func (s *Server) registerTraceTools() {
-	s.mcp.AddTool(&mcp.Tool{
+	s.addTool(&mcp.Tool{
 		Name:        "ingest_traces",
 		Description: "Ingest OpenTelemetry JSON traces (OTLP format) to validate and enrich HTTP_CALLS edges. Matches HTTP spans to existing edges by URL path, boosts confidence by +0.15 (capped at 1.0), and sets validated_by_trace=true, trace_call_count, and p99_latency_ns on matched edges. Use after index_repository to confirm static analysis predictions with runtime data. Export traces via: otel-cli or collector with OTLP JSON exporter.",
 		InputSchema: json.RawMessage(`{
