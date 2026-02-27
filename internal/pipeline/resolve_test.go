@@ -12,6 +12,7 @@ import (
 	tree_sitter_rust "github.com/tree-sitter/tree-sitter-rust/bindings/go"
 	tree_sitter_scala "github.com/tree-sitter/tree-sitter-scala/bindings/go"
 
+	tree_sitter_kotlin "github.com/tree-sitter-grammars/tree-sitter-kotlin/bindings/go"
 	tree_sitter_lua "github.com/tree-sitter-grammars/tree-sitter-lua/bindings/go"
 	tree_sitter_cpp "github.com/tree-sitter/tree-sitter-cpp/bindings/go"
 
@@ -41,6 +42,8 @@ func parseSource(t *testing.T, language lang.Language, code string) (tree *tree_
 		tsLang = tree_sitter.NewLanguage(tree_sitter_cpp.Language())
 	case lang.Lua:
 		tsLang = tree_sitter.NewLanguage(tree_sitter_lua.Language())
+	case lang.Kotlin:
+		tsLang = tree_sitter.NewLanguage(tree_sitter_kotlin.Language())
 	default:
 		t.Fatalf("unsupported language: %s", language)
 	}
@@ -186,6 +189,19 @@ val concat = baseUrl + "/api/orders"
 	assertSymbol(t, symbols, "baseUrl", "https://example.com")
 	assertSymbol(t, symbols, "url", "https://example.com/api/orders")
 	assertSymbol(t, symbols, "concat", "https://example.com/api/orders")
+}
+
+func TestResolveKotlinConcat(t *testing.T) {
+	code := `val baseUrl = "https://example.com"
+val url = baseUrl + "/api/orders"
+`
+	tree, source := parseSource(t, lang.Kotlin, code)
+	defer tree.Close()
+
+	symbols := resolveModuleStrings(tree.RootNode(), source, lang.Kotlin)
+
+	assertSymbol(t, symbols, "baseUrl", "https://example.com")
+	assertSymbol(t, symbols, "url", "https://example.com/api/orders")
 }
 
 func TestResolveUnknownVariable(t *testing.T) {

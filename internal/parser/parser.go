@@ -6,7 +6,6 @@ import (
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 
-	tree_sitter_lua "github.com/tree-sitter-grammars/tree-sitter-lua/bindings/go"
 	tree_sitter_cpp "github.com/tree-sitter/tree-sitter-cpp/bindings/go"
 	tree_sitter_c_sharp "github.com/tree-sitter/tree-sitter-c-sharp/bindings/go"
 	tree_sitter_go "github.com/tree-sitter/tree-sitter-go/bindings/go"
@@ -17,6 +16,9 @@ import (
 	tree_sitter_rust "github.com/tree-sitter/tree-sitter-rust/bindings/go"
 	tree_sitter_scala "github.com/tree-sitter/tree-sitter-scala/bindings/go"
 	tree_sitter_typescript "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
+
+	tree_sitter_kotlin "github.com/tree-sitter-grammars/tree-sitter-kotlin/bindings/go"
+	tree_sitter_lua "github.com/tree-sitter-grammars/tree-sitter-lua/bindings/go"
 
 	"github.com/DeusData/codebase-memory-mcp/internal/lang"
 )
@@ -42,6 +44,7 @@ func initLanguages() {
 			lang.PHP:    tree_sitter.NewLanguage(tree_sitter_php.LanguagePHPOnly()),
 			lang.Lua:   tree_sitter.NewLanguage(tree_sitter_lua.Language()),
 			lang.Scala: tree_sitter.NewLanguage(tree_sitter_scala.Language()),
+			lang.Kotlin: tree_sitter.NewLanguage(tree_sitter_kotlin.Language()),
 		}
 
 		parserPools = make(map[lang.Language]*sync.Pool, len(languages))

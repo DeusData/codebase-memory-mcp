@@ -110,6 +110,8 @@ func referenceNodeTypes(language lang.Language) []string {
 		return []string{"name", "member_access_expression"}
 	case lang.Scala:
 		return []string{"identifier", "field_expression"}
+	case lang.Kotlin:
+		return []string{"identifier", "navigation_expression"}
 	default:
 		return []string{"identifier"}
 	}

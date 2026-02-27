@@ -55,6 +55,8 @@ func resolveAssignment(node *tree_sitter.Node, source []byte, language lang.Lang
 		return resolvePHP(node, source, symbols)
 	case lang.Scala:
 		return resolveScala(node, source, symbols)
+	case lang.Kotlin:
+		return resolveKotlin(node, source, symbols)
 	case lang.CPP:
 		return resolveCPP(node, source, symbols)
 	case lang.Lua:
@@ -250,6 +252,49 @@ func resolveScala(node *tree_sitter.Node, source []byte, symbols map[string]stri
 	nameNode := node.ChildByFieldName("pattern")
 	valueNode := node.ChildByFieldName("value")
 	if nameNode == nil || valueNode == nil {
+		return "", ""
+	}
+	name = parser.NodeText(nameNode, source)
+	value = resolveStringExpr(valueNode, source, symbols)
+	return name, value
+}
+
+// --- Kotlin ---
+// property_declaration → variable_declaration (contains identifier) + expression (the value)
+
+func resolveKotlin(node *tree_sitter.Node, source []byte, symbols map[string]string) (name, value string) {
+	if node.Kind() != "property_declaration" {
+		return "", ""
+	}
+	// Find the variable_declaration child (contains the identifier name)
+	varDecl := findChildByKind(node, "variable_declaration")
+	if varDecl == nil {
+		return "", ""
+	}
+	// The identifier is the first named child of variable_declaration
+	nameNode := findChildByKind(varDecl, "identifier")
+	if nameNode == nil {
+		return "", ""
+	}
+	// The value expression is a direct child of property_declaration
+	// It comes after the "=" token
+	var valueNode *tree_sitter.Node
+	foundEquals := false
+	for i := uint(0); i < node.ChildCount(); i++ {
+		child := node.Child(i)
+		if child == nil {
+			continue
+		}
+		if parser.NodeText(child, source) == "=" {
+			foundEquals = true
+			continue
+		}
+		if foundEquals && child.IsNamed() {
+			valueNode = child
+			break
+		}
+	}
+	if valueNode == nil {
 		return "", ""
 	}
 	name = parser.NodeText(nameNode, source)

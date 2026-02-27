@@ -1669,6 +1669,18 @@ func extractCalleeName(node *tree_sitter.Node, source []byte, _ lang.Language) s
 		return parser.NodeText(nameNode, source)
 	}
 
+	// Kotlin call_expression: first named child is the callee expression (identifier or navigation_expression)
+	// navigation_expression: obj.method (no named fields, children are expression + identifier)
+	if node.Kind() == "call_expression" || node.Kind() == "navigation_expression" {
+		first := node.NamedChild(0)
+		if first != nil {
+			kind := first.Kind()
+			if kind == "identifier" || kind == "navigation_expression" {
+				return parser.NodeText(first, source)
+			}
+		}
+	}
+
 	return ""
 }
 
@@ -1804,7 +1816,7 @@ func isExported(name string, language lang.Language) bool {
 		return name[0] >= 'A' && name[0] <= 'Z'
 	case lang.Python:
 		return !strings.HasPrefix(name, "_")
-	case lang.Java, lang.CSharp:
+	case lang.Java, lang.CSharp, lang.Kotlin:
 		return name[0] >= 'A' && name[0] <= 'Z' // heuristic
 	default:
 		return true // assume exported

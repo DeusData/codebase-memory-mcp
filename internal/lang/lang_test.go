@@ -20,6 +20,8 @@ func TestForExtension(t *testing.T) {
 		{".php", PHP},
 		{".lua", Lua},
 		{".scala", Scala},
+		{".kt", Kotlin},
+		{".kts", Kotlin},
 	}
 	for _, tt := range tests {
 		spec := ForExtension(tt.ext)
