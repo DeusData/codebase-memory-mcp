@@ -8,6 +8,7 @@ import (
 
 	tree_sitter_lua "github.com/tree-sitter-grammars/tree-sitter-lua/bindings/go"
 	tree_sitter_cpp "github.com/tree-sitter/tree-sitter-cpp/bindings/go"
+	tree_sitter_c_sharp "github.com/tree-sitter/tree-sitter-c-sharp/bindings/go"
 	tree_sitter_go "github.com/tree-sitter/tree-sitter-go/bindings/go"
 	tree_sitter_java "github.com/tree-sitter/tree-sitter-java/bindings/go"
 	tree_sitter_javascript "github.com/tree-sitter/tree-sitter-javascript/bindings/go"
@@ -35,9 +36,9 @@ func initLanguages() {
 			lang.Go:         tree_sitter.NewLanguage(tree_sitter_go.Language()),
 			lang.Rust:       tree_sitter.NewLanguage(tree_sitter_rust.Language()),
 			lang.Java:       tree_sitter.NewLanguage(tree_sitter_java.Language()),
-			lang.CPP:        tree_sitter.NewLanguage(tree_sitter_cpp.Language()),
-			// C# skipped: upstream module path mismatch (tree-sitter-c-sharp vs tree-sitter-c_sharp)
-			lang.PHP:   tree_sitter.NewLanguage(tree_sitter_php.LanguagePHPOnly()),
+			lang.CPP:    tree_sitter.NewLanguage(tree_sitter_cpp.Language()),
+			lang.CSharp: tree_sitter.NewLanguage(tree_sitter_c_sharp.Language()),
+			lang.PHP:    tree_sitter.NewLanguage(tree_sitter_php.LanguagePHPOnly()),
 			lang.Lua:   tree_sitter.NewLanguage(tree_sitter_lua.Language()),
 			lang.Scala: tree_sitter.NewLanguage(tree_sitter_scala.Language()),
 		}

@@ -77,13 +77,54 @@ class MyClass:
 
 func TestAllLanguagesLoad(t *testing.T) {
 	for _, l := range lang.AllLanguages() {
-		if l == lang.CSharp {
-			continue // C# grammar has broken Go module path upstream
-		}
 		_, err := GetLanguage(l)
 		if err != nil {
 			t.Errorf("GetLanguage(%s): %v", l, err)
 		}
+	}
+}
+
+func TestParseCSharp(t *testing.T) {
+	source := []byte(`using System;
+
+namespace MyApp {
+    public class Greeter {
+        public string Greet(string name) {
+            return $"Hello, {name}";
+        }
+
+        private void Helper() {}
+    }
+
+    public enum Color { Red, Green, Blue }
+}
+`)
+	tree, err := Parse(lang.CSharp, source)
+	if err != nil {
+		t.Fatalf("Parse C#: %v", err)
+	}
+	defer tree.Close()
+
+	root := tree.RootNode()
+	if root == nil {
+		t.Fatal("root node is nil")
+	}
+
+	var classCount, methodCount int
+	Walk(root, func(n *tree_sitter.Node) bool {
+		switch n.Kind() {
+		case "class_declaration":
+			classCount++
+		case "method_declaration":
+			methodCount++
+		}
+		return true
+	})
+	if classCount != 1 {
+		t.Errorf("expected 1 class_declaration, got %d", classCount)
+	}
+	if methodCount != 2 {
+		t.Errorf("expected 2 method_declarations, got %d", methodCount)
 	}
 }
 
