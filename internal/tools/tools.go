@@ -24,7 +24,7 @@ import (
 )
 
 // Version is the current release version, referenced by MCP handshake and update checker.
-const Version = "0.2.0"
+const Version = "0.2.1"
 
 // releaseURL is the GitHub API endpoint for latest release. Package-level var for test injection.
 var releaseURL = "https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest"
