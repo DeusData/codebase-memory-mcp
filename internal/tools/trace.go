@@ -122,9 +122,10 @@ func (s *Server) handleTraceCallPath(_ context.Context, req *mcp.CallToolRequest
 		"total_results": len(allVisited),
 	}
 	s.addIndexStatus(responseData)
-	s.addUpdateNotice(responseData)
 
-	return jsonResult(responseData), nil
+	result := jsonResult(responseData)
+	s.addUpdateNotice(result)
+	return result, nil
 }
 
 func buildNodeInfo(n *store.Node) map[string]any {

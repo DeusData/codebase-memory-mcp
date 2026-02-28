@@ -97,7 +97,8 @@ func (s *Server) handleSearchGraph(_ context.Context, req *mcp.CallToolRequest) 
 		"results":  results,
 	}
 	s.addIndexStatus(responseData)
-	s.addUpdateNotice(responseData)
 
-	return jsonResult(responseData), nil
+	result := jsonResult(responseData)
+	s.addUpdateNotice(result)
+	return result, nil
 }

@@ -36,7 +36,8 @@ func (s *Server) handleQueryGraph(_ context.Context, req *mcp.CallToolRequest) (
 		"total":   len(result.Rows),
 	}
 	s.addIndexStatus(responseData)
-	s.addUpdateNotice(responseData)
 
-	return jsonResult(responseData), nil
+	res := jsonResult(responseData)
+	s.addUpdateNotice(res)
+	return res, nil
 }

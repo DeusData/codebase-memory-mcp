@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestCompareVersions(t *testing.T) {
@@ -55,8 +57,8 @@ func TestCheckForUpdate_NewerAvailable(t *testing.T) {
 	if !strings.Contains(notice, "v99.0.0") {
 		t.Fatalf("notice should mention v99.0.0, got: %s", notice)
 	}
-	if !strings.Contains(notice, "go install") {
-		t.Fatalf("notice should contain install command, got: %s", notice)
+	if !strings.Contains(notice, "github.com/DeusData/codebase-memory-mcp/releases/tag/v99.0.0") {
+		t.Fatalf("notice should contain releases link, got: %s", notice)
 	}
 }
 
@@ -140,15 +142,19 @@ func TestAddUpdateNotice_ShowsOnce(t *testing.T) {
 	srv := &Server{}
 	srv.updateNotice.Store("v0.2.0 → v0.3.0 available")
 
-	first := map[string]any{}
+	first := &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "{}"}}}
 	srv.addUpdateNotice(first)
-	if _, ok := first["update_available"]; !ok {
-		t.Fatal("expected update_available in first map")
+	if len(first.Content) != 2 {
+		t.Fatalf("expected 2 content blocks, got %d", len(first.Content))
+	}
+	tc, ok := first.Content[0].(*mcp.TextContent)
+	if !ok || tc.Text != "v0.2.0 → v0.3.0 available" {
+		t.Fatalf("expected notice as first content block, got %v", first.Content[0])
 	}
 
-	second := map[string]any{}
+	second := &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "{}"}}}
 	srv.addUpdateNotice(second)
-	if _, ok := second["update_available"]; ok {
-		t.Fatal("expected update_available to be absent in second map (show-once)")
+	if len(second.Content) != 1 {
+		t.Fatal("expected update notice to be absent in second call (show-once)")
 	}
 }

@@ -108,19 +108,20 @@ func (s *Server) SessionProject() string {
 
 // SetSessionRoot sets the session root path directly (for CLI mode).
 func (s *Server) SetSessionRoot(rootPath string) {
+	go s.checkForUpdate()
 	s.sessionOnce.Do(func() {
 		s.sessionRoot = rootPath
 		if rootPath != "" {
 			s.sessionProject = filepath.Base(rootPath)
 		}
 	})
-	go s.checkForUpdate()
 }
 
 // --- Session detection ---
 
 // onInitialized is called when the client sends notifications/initialized.
 func (s *Server) onInitialized(ctx context.Context, req *mcp.InitializedRequest) {
+	go s.checkForUpdate()
 	s.sessionOnce.Do(func() {
 		s.sessionRoot = s.detectSessionRoot(ctx, req.Session)
 		if s.sessionRoot != "" {
@@ -128,11 +129,11 @@ func (s *Server) onInitialized(ctx context.Context, req *mcp.InitializedRequest)
 			s.startAutoIndex()
 		}
 	})
-	go s.checkForUpdate()
 }
 
 // onRootsChanged re-detects session root if not yet set.
 func (s *Server) onRootsChanged(ctx context.Context, req *mcp.RootsListChangedRequest) {
+	go s.checkForUpdate()
 	s.sessionOnce.Do(func() {
 		s.sessionRoot = s.detectSessionRoot(ctx, req.Session)
 		if s.sessionRoot != "" {
@@ -140,7 +141,6 @@ func (s *Server) onRootsChanged(ctx context.Context, req *mcp.RootsListChangedRe
 			s.startAutoIndex()
 		}
 	})
-	go s.checkForUpdate()
 }
 
 // detectSessionRoot tries multiple fallback strategies to find the project root.
@@ -255,10 +255,10 @@ func (s *Server) addIndexStatus(data map[string]any) {
 	}
 }
 
-// addUpdateNotice injects update_available into the first tool response, then clears itself.
-func (s *Server) addUpdateNotice(data map[string]any) {
+// addUpdateNotice prepends an update notice to the first tool response, then clears itself.
+func (s *Server) addUpdateNotice(result *mcp.CallToolResult) {
 	if notice, ok := s.updateNotice.Load().(string); ok && notice != "" {
-		data["update_available"] = notice
+		result.Content = append([]mcp.Content{&mcp.TextContent{Text: notice}}, result.Content...)
 		s.updateNotice.Store("")
 	}
 }
@@ -270,22 +270,26 @@ func (s *Server) checkForUpdate() {
 
 	req, err := http.NewRequestWithContext(ctx, "GET", releaseURL, http.NoBody)
 	if err != nil {
+		slog.Warn("update check: request create failed", "err", err)
 		return
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		slog.Warn("update check: http failed", "err", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		slog.Warn("update check: bad status", "status", resp.StatusCode)
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 	if err != nil {
+		slog.Warn("update check: body read failed", "err", err)
 		return
 	}
 
@@ -293,17 +297,21 @@ func (s *Server) checkForUpdate() {
 		TagName string `json:"tag_name"`
 	}
 	if err := json.Unmarshal(body, &release); err != nil {
+		slog.Warn("update check: json parse failed", "err", err)
 		return
 	}
 
 	latest := strings.TrimPrefix(release.TagName, "v")
 	if latest == "" || latest == Version {
+		slog.Debug("update check: current", "version", Version, "latest", latest)
 		return
 	}
 	if compareVersions(latest, Version) > 0 {
-		s.updateNotice.Store(fmt.Sprintf(
-			"v%s → v%s available. Update: go install github.com/DeusData/codebase-memory-mcp/cmd/codebase-memory-mcp@v%s",
-			Version, latest, latest))
+		notice := fmt.Sprintf(
+			"⚡ Update available: v%s → v%s — download at https://github.com/DeusData/codebase-memory-mcp/releases/tag/v%s",
+			Version, latest, latest)
+		s.updateNotice.Store(notice)
+		slog.Info("update available", "current", Version, "latest", latest)
 	}
 }
 

@@ -111,9 +111,10 @@ func (s *Server) handleSearchCode(_ context.Context, req *mcp.CallToolRequest) (
 		"files_count": len(filePaths),
 	}
 	s.addIndexStatus(responseData)
-	s.addUpdateNotice(responseData)
 
-	return jsonResult(responseData), nil
+	result := jsonResult(responseData)
+	s.addUpdateNotice(result)
+	return result, nil
 }
 
 // collectSearchFilePaths gathers indexed file paths, optionally filtered by a glob pattern.
