@@ -171,7 +171,6 @@ namespace MyApp {
 	}
 }
 
-
 func TestParseRuby(t *testing.T) {
 	source := []byte(`class Greeter
   def greet(name)
@@ -192,7 +191,9 @@ func TestParseRuby(t *testing.T) {
 	Walk(root, func(n *tree_sitter.Node) bool {
 		switch n.Kind() {
 		case "class":
-			classCount++
+			if n.NamedChildCount() > 0 {
+				classCount++
+			}
 		case "method":
 			methodCount++
 		}
