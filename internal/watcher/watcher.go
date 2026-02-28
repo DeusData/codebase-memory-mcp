@@ -31,15 +31,15 @@ type IndexFunc func(projectName, rootPath string) error
 
 // Watcher polls indexed projects for file changes and triggers re-indexing.
 type Watcher struct {
-	store    *store.Store
+	router   *store.StoreRouter
 	indexFn  IndexFunc
 	projects map[string]*projectState
 }
 
 // New creates a Watcher. indexFn is called when file changes are detected.
-func New(s *store.Store, indexFn IndexFunc) *Watcher {
+func New(r *store.StoreRouter, indexFn IndexFunc) *Watcher {
 	return &Watcher{
-		store:    s,
+		router:   r,
 		indexFn:  indexFn,
 		projects: make(map[string]*projectState),
 	}
@@ -63,19 +63,30 @@ func (w *Watcher) Run(ctx context.Context) {
 
 // pollAll lists all indexed projects and polls each that is due.
 func (w *Watcher) pollAll() {
-	projects, err := w.store.ListProjects()
+	projectInfos, err := w.router.ListProjects()
 	if err != nil {
 		slog.Warn("watcher.list_projects", "err", err)
 		return
 	}
 
 	now := time.Now()
-	for _, proj := range projects {
-		state, exists := w.projects[proj.Name]
+	for _, info := range projectInfos {
+		// Get the store for this project (never cache directly)
+		st, stErr := w.router.ForProject(info.Name)
+		if stErr != nil {
+			continue
+		}
+
+		// Get the project metadata from the store
+		proj, projErr := st.GetProject(info.Name)
+		if projErr != nil || proj == nil {
+			continue
+		}
+
+		state, exists := w.projects[info.Name]
 		if !exists {
-			// First time seeing this project — capture baseline
 			state = &projectState{}
-			w.projects[proj.Name] = state
+			w.projects[info.Name] = state
 		}
 
 		if exists && now.Before(state.nextPoll) {

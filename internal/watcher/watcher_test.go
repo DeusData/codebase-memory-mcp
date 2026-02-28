@@ -11,6 +11,26 @@ import (
 	"github.com/DeusData/codebase-memory-mcp/internal/store"
 )
 
+// newTestRouter creates a StoreRouter backed by a temp directory with a project registered.
+func newTestRouter(t *testing.T, projectName, rootPath string) *store.StoreRouter {
+	t.Helper()
+	dbDir := t.TempDir()
+	r, err := store.NewRouterWithDir(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projectName != "" {
+		st, err := r.ForProject(projectName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.UpsertProject(projectName, rootPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return r
+}
+
 func TestSnapshotsEqual(t *testing.T) {
 	now := time.Now()
 
@@ -149,22 +169,14 @@ func TestCaptureSnapshotDetectsChanges(t *testing.T) {
 }
 
 func TestWatcherTriggersOnChange(t *testing.T) {
-	s, err := store.OpenMemory()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
 	tmpDir := t.TempDir()
 	goFile := filepath.Join(tmpDir, "main.go")
 	if err := os.WriteFile(goFile, []byte("package main\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	// Register the project so ListProjects returns it
-	if err := s.UpsertProject(filepath.Base(tmpDir), tmpDir); err != nil {
-		t.Fatal(err)
-	}
+	r := newTestRouter(t, filepath.Base(tmpDir), tmpDir)
+	defer r.CloseAll()
 
 	var indexCount atomic.Int32
 	indexFn := func(_, _ string) error {
@@ -172,7 +184,7 @@ func TestWatcherTriggersOnChange(t *testing.T) {
 		return nil
 	}
 
-	w := New(s, indexFn)
+	w := New(r, indexFn)
 
 	// First poll — baseline capture, no index
 	w.pollAll()
@@ -191,8 +203,8 @@ func TestWatcherTriggersOnChange(t *testing.T) {
 	}
 
 	// Modify the file
-	now := time.Now().Add(time.Second)
-	if err := os.Chtimes(goFile, now, now); err != nil {
+	futureTime := time.Now().Add(time.Second)
+	if err := os.Chtimes(goFile, futureTime, futureTime); err != nil {
 		t.Fatal(err)
 	}
 
@@ -207,13 +219,14 @@ func TestWatcherTriggersOnChange(t *testing.T) {
 }
 
 func TestWatcherCancellation(t *testing.T) {
-	s, err := store.OpenMemory()
+	dbDir := t.TempDir()
+	r, err := store.NewRouterWithDir(dbDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer r.CloseAll()
 
-	w := New(s, func(_, _ string) error { return nil })
+	w := New(r, func(_, _ string) error { return nil })
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -234,19 +247,11 @@ func TestWatcherCancellation(t *testing.T) {
 }
 
 func TestWatcherSkipsMissingRoot(t *testing.T) {
-	s, err := store.OpenMemory()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
-	// Register a project with a non-existent path
-	if err := s.UpsertProject("ghost", "/nonexistent/path"); err != nil {
-		t.Fatal(err)
-	}
+	r := newTestRouter(t, "ghost", "/nonexistent/path")
+	defer r.CloseAll()
 
 	var indexCount atomic.Int32
-	w := New(s, func(_, _ string) error {
+	w := New(r, func(_, _ string) error {
 		indexCount.Add(1)
 		return nil
 	})
@@ -258,24 +263,17 @@ func TestWatcherSkipsMissingRoot(t *testing.T) {
 }
 
 func TestWatcherNewFileTriggersIndex(t *testing.T) {
-	s, err := store.OpenMemory()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
 	tmpDir := t.TempDir()
 	goFile := filepath.Join(tmpDir, "main.go")
 	if err := os.WriteFile(goFile, []byte("package main\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := s.UpsertProject(filepath.Base(tmpDir), tmpDir); err != nil {
-		t.Fatal(err)
-	}
+	r := newTestRouter(t, filepath.Base(tmpDir), tmpDir)
+	defer r.CloseAll()
 
 	var indexCount atomic.Int32
-	w := New(s, func(_, _ string) error {
+	w := New(r, func(_, _ string) error {
 		indexCount.Add(1)
 		return nil
 	})

@@ -86,6 +86,10 @@ var (
 	// Express.js routes: app.get("/path", router.post("/path"
 	expressRouteRe = regexp.MustCompile(`\w+\.(get|post|put|delete|patch)\(\s*["'` + "`" + `]([^"'` + "`" + `]+)["'` + "`" + `]`)
 
+	// Express.js handler reference: captures last named argument (handler, not middleware)
+	// app.get("/path", handler) or app.get("/path", middleware, handler)
+	expressHandlerRe = regexp.MustCompile(`\w+\.(get|post|put|delete|patch)\(\s*["'` + "`" + `][^"'` + "`" + `]+["'` + "`" + `]\s*(?:,\s*[\w.]+)*,\s*([\w.]+)\s*\)`)
+
 	// Java Spring annotations: @GetMapping("/path"), @PostMapping, @RequestMapping
 	springMappingRe = regexp.MustCompile(`@(Get|Post|Put|Delete|Patch|Request)Mapping\(\s*(?:value\s*=\s*)?["']([^"']+)["']`)
 
@@ -94,6 +98,10 @@ var (
 
 	// PHP Laravel routes: Route::get("/path", Route::post("/path"
 	laravelRouteRe = regexp.MustCompile(`Route::(get|post|put|delete|patch)\(\s*["']([^"']+)["']`)
+
+	// Laravel handler: Route::get("/path", [Controller::class, "method"]) or "Controller@method"
+	laravelHandlerArrayRe = regexp.MustCompile(`Route::(get|post|put|delete|patch)\(\s*["'][^"']+["']\s*,\s*\[(\w+)::class\s*,\s*["'](\w+)["']\]`)
+	laravelHandlerAtRe    = regexp.MustCompile(`Route::(get|post|put|delete|patch)\(\s*["'][^"']+["']\s*,\s*["'](\w+)@(\w+)["']`)
 
 	// URL patterns in source: https://host/path or http://host/path — captures domain and path
 	urlRe = regexp.MustCompile(`https?://([a-zA-Z0-9.\-]+)(/[a-zA-Z0-9_/:.\-]+)`)
@@ -201,7 +209,8 @@ func (l *Linker) insertRouteNodes(routes []RouteHandler) {
 				TargetID: routeID,
 				Type:     "HANDLES",
 			}); edgeErr != nil {
-				slog.Warn("httplink.handles_edge.err", "err", edgeErr)
+				// FK failures expected: LastInsertId() can return stale IDs for upserted Route nodes
+				slog.Info("httplink.handles_edge.skip", "route", routeQN)
 			}
 
 			// Mark handler as entry point (for dead code detection)
@@ -367,14 +376,35 @@ func resolveGroupPrefix(line, method, path string, groupPrefixes map[string]stri
 
 // extractExpressRoutes extracts route registrations from JS/TS source (Express/Koa patterns).
 func extractExpressRoutes(f *store.Node, source string) []RouteHandler {
-	matches := expressRouteRe.FindAllStringSubmatch(source, -1)
-	routes := make([]RouteHandler, 0, len(matches))
-	for _, m := range matches {
+	// Build a per-line handler ref map for quick lookup
+	handlerRefs := map[string]string{} // "METHOD path" → handler ref
+	for _, line := range strings.Split(source, "\n") {
+		hm := expressHandlerRe.FindStringSubmatch(line)
+		if hm != nil {
+			key := strings.ToUpper(hm[1]) + " " + hm[0] // unique enough per line
+			handlerRefs[key] = hm[2]
+		}
+	}
+
+	routes := make([]RouteHandler, 0, 4)
+	for _, line := range strings.Split(source, "\n") {
+		rm := expressRouteRe.FindStringSubmatch(line)
+		if rm == nil {
+			continue
+		}
+
+		var handlerRef string
+		hm := expressHandlerRe.FindStringSubmatch(line)
+		if hm != nil {
+			handlerRef = hm[2]
+		}
+
 		routes = append(routes, RouteHandler{
-			Path:          m[2],
-			Method:        strings.ToUpper(m[1]),
+			Path:          rm[2],
+			Method:        strings.ToUpper(rm[1]),
 			FunctionName:  f.Name,
 			QualifiedName: f.QualifiedName,
+			HandlerRef:    handlerRef,
 		})
 	}
 	return routes
@@ -444,14 +474,27 @@ func extractRustRoutes(f *store.Node) []RouteHandler {
 
 // extractLaravelRoutes extracts route registrations from PHP Laravel source.
 func extractLaravelRoutes(f *store.Node, source string) []RouteHandler {
-	matches := laravelRouteRe.FindAllStringSubmatch(source, -1)
-	routes := make([]RouteHandler, 0, len(matches))
-	for _, m := range matches {
+	routes := make([]RouteHandler, 0, 4)
+	for _, line := range strings.Split(source, "\n") {
+		rm := laravelRouteRe.FindStringSubmatch(line)
+		if rm == nil {
+			continue
+		}
+
+		// Try to extract handler reference from [Controller::class, "method"] or "Controller@method"
+		var handlerRef string
+		if am := laravelHandlerArrayRe.FindStringSubmatch(line); am != nil {
+			handlerRef = am[3] // method name from [Controller::class, "method"]
+		} else if atm := laravelHandlerAtRe.FindStringSubmatch(line); atm != nil {
+			handlerRef = atm[3] // method name from "Controller@method"
+		}
+
 		routes = append(routes, RouteHandler{
-			Path:          m[2],
-			Method:        strings.ToUpper(m[1]),
+			Path:          rm[2],
+			Method:        strings.ToUpper(rm[1]),
 			FunctionName:  f.Name,
 			QualifiedName: f.QualifiedName,
+			HandlerRef:    handlerRef,
 		})
 	}
 	return routes

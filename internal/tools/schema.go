@@ -8,17 +8,27 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-func (s *Server) handleGetGraphSchema(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	projects, err := s.store.ListProjects()
+func (s *Server) handleGetGraphSchema(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, err := parseArgs(req)
 	if err != nil {
-		return errResult(fmt.Sprintf("list projects: %v", err)), nil
+		return errResult(err.Error()), nil
 	}
 
-	if len(projects) == 0 {
-		return jsonResult(map[string]any{
-			"message":  "no projects indexed",
-			"projects": []any{},
-		}), nil
+	project := getStringArg(args, "project")
+	st, err := s.resolveStore(project)
+	if err != nil {
+		return errResult(fmt.Sprintf("resolve store: %v", err)), nil
+	}
+
+	projName := s.resolveProjectName(project)
+	projects, _ := st.ListProjects()
+	if len(projects) > 0 {
+		projName = projects[0].Name
+	}
+
+	schema, schemaErr := st.GetSchema(projName)
+	if schemaErr != nil {
+		return errResult(fmt.Sprintf("schema: %v", schemaErr)), nil
 	}
 
 	type projectSchema struct {
@@ -26,19 +36,7 @@ func (s *Server) handleGetGraphSchema(_ context.Context, _ *mcp.CallToolRequest)
 		Schema  *store.SchemaInfo `json:"schema"`
 	}
 
-	schemas := make([]projectSchema, 0, len(projects))
-	for _, p := range projects {
-		schema, schemaErr := s.store.GetSchema(p.Name)
-		if schemaErr != nil {
-			continue
-		}
-		schemas = append(schemas, projectSchema{
-			Project: p.Name,
-			Schema:  schema,
-		})
-	}
-
 	return jsonResult(map[string]any{
-		"projects": schemas,
+		"projects": []projectSchema{{Project: projName, Schema: schema}},
 	}), nil
 }

@@ -135,12 +135,20 @@ func (p *Pipeline) runFullPasses(files []discover.FileInfo) error {
 	slog.Info("pass.timing", "pass", "structure", "elapsed", time.Since(t))
 
 	t = time.Now()
-	p.passDefinitions(files)
+	p.passDefinitions(files) // includes Variable extraction + enrichment
 	slog.Info("pass.timing", "pass", "definitions", "elapsed", time.Since(t))
 
 	t = time.Now()
-	p.buildRegistry()
+	p.buildRegistry() // includes Variable label
 	slog.Info("pass.timing", "pass", "registry", "elapsed", time.Since(t))
+
+	t = time.Now()
+	p.passInherits() // INHERITS edges from base_classes
+	slog.Info("pass.timing", "pass", "inherits", "elapsed", time.Since(t))
+
+	t = time.Now()
+	p.passDecorates() // DECORATES edges from decorators
+	slog.Info("pass.timing", "pass", "decorates", "elapsed", time.Since(t))
 
 	t = time.Now()
 	p.passImports()
@@ -154,11 +162,35 @@ func (p *Pipeline) runFullPasses(files []discover.FileInfo) error {
 	p.passUsages()
 	slog.Info("pass.timing", "pass", "usages", "elapsed", time.Since(t))
 
+	t = time.Now()
+	p.passUsesType() // USES_TYPE edges (signatures + body)
+	slog.Info("pass.timing", "pass", "usestype", "elapsed", time.Since(t))
+
+	t = time.Now()
+	p.passThrows() // THROWS/RAISES edges
+	slog.Info("pass.timing", "pass", "throws", "elapsed", time.Since(t))
+
+	t = time.Now()
+	p.passReadsWrites() // READS/WRITES edges
+	slog.Info("pass.timing", "pass", "readwrite", "elapsed", time.Since(t))
+
+	t = time.Now()
+	p.passConfigures() // CONFIGURES edges
+	slog.Info("pass.timing", "pass", "configures", "elapsed", time.Since(t))
+
 	p.cleanupASTCache()
 
 	t = time.Now()
+	p.passTests() // TESTS/TESTS_FILE edges (DB-only)
+	slog.Info("pass.timing", "pass", "tests", "elapsed", time.Since(t))
+
+	t = time.Now()
+	p.passCommunities() // Community nodes + MEMBER_OF edges (DB-only)
+	slog.Info("pass.timing", "pass", "communities", "elapsed", time.Since(t))
+
+	t = time.Now()
 	if err := p.passHTTPLinks(); err != nil {
-		slog.Warn("pass4.httplink.err", "err", err)
+		slog.Warn("pass.httplink.err", "err", err)
 	}
 	slog.Info("pass.timing", "pass", "httplinks", "elapsed", time.Since(t))
 
@@ -174,7 +206,27 @@ func (p *Pipeline) runFullPasses(files []discover.FileInfo) error {
 	p.updateFileHashes(files)
 	slog.Info("pass.timing", "pass", "filehashes", "elapsed", time.Since(t))
 
+	// Observability: per-edge-type counts
+	p.logEdgeCounts()
+
 	return nil
+}
+
+// logEdgeCounts logs the count of each edge type for observability.
+func (p *Pipeline) logEdgeCounts() {
+	edgeTypes := []string{
+		"CALLS", "USAGE", "IMPORTS", "DEFINES", "DEFINES_METHOD",
+		"TESTS", "TESTS_FILE", "INHERITS", "DECORATES", "USES_TYPE",
+		"THROWS", "RAISES", "READS", "WRITES", "CONFIGURES", "MEMBER_OF",
+		"HTTP_CALLS", "HANDLES", "ASYNC_CALLS", "IMPLEMENTS", "OVERRIDE",
+		"FILE_CHANGES_WITH", "CONTAINS_FILE", "CONTAINS_FOLDER", "CONTAINS_PACKAGE",
+	}
+	for _, edgeType := range edgeTypes {
+		count, err := p.Store.CountEdgesByType(p.ProjectName, edgeType)
+		if err == nil && count > 0 {
+			slog.Info("pipeline.edges", "type", edgeType, "count", count)
+		}
+	}
 }
 
 // runIncrementalPasses re-indexes only changed files + their dependents.
@@ -215,26 +267,58 @@ func (p *Pipeline) runIncrementalPasses(
 	filesToResolve := mergeFiles(changed, dependents)
 	slog.Info("incremental.resolve", "changed", len(changed), "dependents", len(dependents))
 
-	// Delete CALLS and USAGE edges for files being re-resolved
+	// Delete edges for files being re-resolved (all AST-derived edge types)
 	for _, f := range filesToResolve {
 		_ = p.Store.DeleteEdgesBySourceFile(p.ProjectName, f.RelPath, "CALLS")
 		_ = p.Store.DeleteEdgesBySourceFile(p.ProjectName, f.RelPath, "USAGE")
+		_ = p.Store.DeleteEdgesBySourceFile(p.ProjectName, f.RelPath, "USES_TYPE")
+		_ = p.Store.DeleteEdgesBySourceFile(p.ProjectName, f.RelPath, "THROWS")
+		_ = p.Store.DeleteEdgesBySourceFile(p.ProjectName, f.RelPath, "RAISES")
+		_ = p.Store.DeleteEdgesBySourceFile(p.ProjectName, f.RelPath, "READS")
+		_ = p.Store.DeleteEdgesBySourceFile(p.ProjectName, f.RelPath, "WRITES")
+		_ = p.Store.DeleteEdgesBySourceFile(p.ProjectName, f.RelPath, "CONFIGURES")
 	}
 
-	// Pass 3: Re-resolve calls + usages for changed + dependent files
+	// Re-resolve calls + usages for changed + dependent files
 	p.passCallsForFiles(filesToResolve)
 	p.passUsagesForFiles(filesToResolve)
 
+	// AST-dependent passes (run on cached files before cleanup)
+	p.passUsesType()
+	p.passThrows()
+	p.passReadsWrites()
+	p.passConfigures()
+
 	p.cleanupASTCache()
+
+	// DB-derived edge types: delete all and re-run (cheap)
+	_ = p.Store.DeleteEdgesByType(p.ProjectName, "TESTS")
+	_ = p.Store.DeleteEdgesByType(p.ProjectName, "TESTS_FILE")
+	p.passTests()
+
+	_ = p.Store.DeleteEdgesByType(p.ProjectName, "INHERITS")
+	p.passInherits()
+
+	_ = p.Store.DeleteEdgesByType(p.ProjectName, "DECORATES")
+	p.passDecorates()
+
+	// Community detection: delete old communities and MEMBER_OF, re-run
+	_ = p.Store.DeleteEdgesByType(p.ProjectName, "MEMBER_OF")
+	_ = p.Store.DeleteNodesByLabel(p.ProjectName, "Community")
+	p.passCommunities()
 
 	// HTTP linking and implements always run fully (they clean up first)
 	if err := p.passHTTPLinks(); err != nil {
-		slog.Warn("pass4.httplink.err", "err", err)
+		slog.Warn("pass.httplink.err", "err", err)
 	}
 	p.passImplements()
 	p.passGitHistory()
 
 	p.updateFileHashes(allFiles)
+
+	// Observability
+	p.logEdgeCounts()
+
 	return nil
 }
 
@@ -452,7 +536,32 @@ func mergeFiles(a, b []discover.FileInfo) []discover.FileInfo {
 func (p *Pipeline) passStructure(files []discover.FileInfo) error {
 	slog.Info("pass1.structure")
 
-	// Collect all package indicators
+	dirSet, dirIsPackage := p.classifyDirectories(files)
+
+	nodes := make([]*store.Node, 0, len(files)*2)
+	edges := make([]pendingEdge, 0, len(files)*2)
+
+	projectQN := p.ProjectName
+	nodes = append(nodes, &store.Node{
+		Project:       p.ProjectName,
+		Label:         "Project",
+		Name:          p.ProjectName,
+		QualifiedName: projectQN,
+	})
+
+	dirNodes, dirEdges := p.buildDirNodesEdges(dirSet, dirIsPackage, projectQN)
+	nodes = append(nodes, dirNodes...)
+	edges = append(edges, dirEdges...)
+
+	fileNodes, fileEdges := p.buildFileNodesEdges(files)
+	nodes = append(nodes, fileNodes...)
+	edges = append(edges, fileEdges...)
+
+	return p.batchWriteStructure(nodes, edges)
+}
+
+// classifyDirectories collects all directories and determines which are packages.
+func (p *Pipeline) classifyDirectories(files []discover.FileInfo) (allDirs, packageDirs map[string]bool) {
 	packageIndicators := make(map[string]bool)
 	for _, l := range lang.AllLanguages() {
 		spec := lang.ForLanguage(l)
@@ -463,105 +572,92 @@ func (p *Pipeline) passStructure(files []discover.FileInfo) error {
 		}
 	}
 
-	// Phase A: Collect all unique directories from file paths
-	dirSet := make(map[string]bool)
+	allDirs = make(map[string]bool)
 	for _, f := range files {
 		dir := filepath.Dir(f.RelPath)
-		for dir != "." && dir != "" && !dirSet[dir] {
-			dirSet[dir] = true
+		for dir != "." && dir != "" && !allDirs[dir] {
+			allDirs[dir] = true
 			dir = filepath.Dir(dir)
 		}
 	}
 
-	// Phase B: Check package indicators via os.Stat (batched, not interleaved with SQL)
-	dirIsPackage := make(map[string]bool, len(dirSet))
-	for dir := range dirSet {
+	packageDirs = make(map[string]bool, len(allDirs))
+	for dir := range allDirs {
 		absDir := filepath.Join(p.RepoPath, dir)
 		for indicator := range packageIndicators {
 			if _, err := os.Stat(filepath.Join(absDir, indicator)); err == nil {
-				dirIsPackage[dir] = true
+				packageDirs[dir] = true
 				break
 			}
 		}
 	}
+	return
+}
 
-	// Phase C: Build all nodes and pending edges in memory
-	var nodes []*store.Node
-	var edges []pendingEdge
+func (p *Pipeline) buildDirNodesEdges(dirSet, dirIsPackage map[string]bool, projectQN string) ([]*store.Node, []pendingEdge) {
+	nodes := make([]*store.Node, 0, len(dirSet))
+	edges := make([]pendingEdge, 0, len(dirSet))
 
-	// Project node
-	projectQN := p.ProjectName
-	nodes = append(nodes, &store.Node{
-		Project:       p.ProjectName,
-		Label:         "Project",
-		Name:          p.ProjectName,
-		QualifiedName: projectQN,
-	})
-
-	// Directory/Package nodes + containment edges
 	for dir := range dirSet {
-		dirName := filepath.Base(dir)
 		label := "Folder"
+		edgeType := "CONTAINS_FOLDER"
 		if dirIsPackage[dir] {
 			label = "Package"
+			edgeType = "CONTAINS_PACKAGE"
 		}
 		qn := fqn.FolderQN(p.ProjectName, dir)
 		nodes = append(nodes, &store.Node{
 			Project:       p.ProjectName,
 			Label:         label,
-			Name:          dirName,
+			Name:          filepath.Base(dir),
 			QualifiedName: qn,
 			FilePath:      dir,
 		})
 
-		// Containment edge from parent
 		parent := filepath.Dir(dir)
-		var parentQN string
-		if parent == "." || parent == "" {
-			parentQN = projectQN
-		} else {
+		parentQN := projectQN
+		if parent != "." && parent != "" {
 			parentQN = fqn.FolderQN(p.ProjectName, parent)
 		}
-
-		edgeType := "CONTAINS_FOLDER"
-		if dirIsPackage[dir] {
-			edgeType = "CONTAINS_PACKAGE"
-		}
-		edges = append(edges, pendingEdge{
-			SourceQN: parentQN,
-			TargetQN: qn,
-			Type:     edgeType,
-		})
+		edges = append(edges, pendingEdge{SourceQN: parentQN, TargetQN: qn, Type: edgeType})
 	}
+	return nodes, edges
+}
 
-	// File nodes + containment edges
+func (p *Pipeline) buildFileNodesEdges(files []discover.FileInfo) ([]*store.Node, []pendingEdge) {
+	nodes := make([]*store.Node, 0, len(files))
+	edges := make([]pendingEdge, 0, len(files))
+
 	for _, f := range files {
 		fileQN := fqn.Compute(p.ProjectName, f.RelPath, "") + ".__file__"
+		fileProps := map[string]any{
+			"extension": filepath.Ext(f.RelPath),
+			"is_test":   isTestFile(f.RelPath, f.Language),
+		}
+		if f.Language != "" {
+			fileProps["language"] = string(f.Language)
+		}
 		nodes = append(nodes, &store.Node{
 			Project:       p.ProjectName,
 			Label:         "File",
 			Name:          filepath.Base(f.RelPath),
 			QualifiedName: fileQN,
 			FilePath:      f.RelPath,
-			Properties:    map[string]any{"extension": filepath.Ext(f.RelPath)},
+			Properties:    fileProps,
 		})
 
-		dir := filepath.Dir(f.RelPath)
-		parentQN := p.dirQN(dir)
-		edges = append(edges, pendingEdge{
-			SourceQN: parentQN,
-			TargetQN: fileQN,
-			Type:     "CONTAINS_FILE",
-		})
+		parentQN := p.dirQN(filepath.Dir(f.RelPath))
+		edges = append(edges, pendingEdge{SourceQN: parentQN, TargetQN: fileQN, Type: "CONTAINS_FILE"})
 	}
+	return nodes, edges
+}
 
-	// Phase D: Batch write all nodes
+func (p *Pipeline) batchWriteStructure(nodes []*store.Node, edges []pendingEdge) error {
 	idMap, err := p.Store.UpsertNodeBatch(nodes)
 	if err != nil {
 		return fmt.Errorf("pass1 batch upsert: %w", err)
 	}
 
-	// Resolve pending edges to real edges using ID map
 	realEdges := make([]*store.Edge, 0, len(edges))
 	for _, pe := range edges {
 		srcID, srcOK := idMap[pe.SourceQN]
@@ -580,7 +676,6 @@ func (p *Pipeline) passStructure(files []discover.FileInfo) error {
 	if err := p.Store.InsertEdgeBatch(realEdges); err != nil {
 		return fmt.Errorf("pass1 batch edges: %w", err)
 	}
-
 	return nil
 }
 
@@ -754,7 +849,7 @@ func parseFileAST(projectName string, f discover.FileInfo) *parseResult {
 		kind := node.Kind()
 
 		if funcTypes[kind] {
-			extractFunctionDef(node, source, f, projectName, moduleQN, result)
+			extractFunctionDef(node, source, f, projectName, moduleQN, spec, result)
 			return false
 		}
 
@@ -764,7 +859,7 @@ func parseFileAST(projectName string, f discover.FileInfo) *parseResult {
 		}
 
 		// Macro definitions (C/C++ only)
-		if isCPP && (kind == "preproc_def" || kind == "preproc_function_def") {
+		if isCPP && kind == "preproc_function_def" {
 			extractMacroDef(node, source, f, projectName, moduleQN, macroNames, result)
 			return false
 		}
@@ -779,11 +874,23 @@ func parseFileAST(projectName string, f discover.FileInfo) *parseResult {
 		return true
 	})
 
-	// Store macro names in result for later call resolution (pass 3)
+	enrichModuleNode(moduleNode, macroNames, constants, root, source, f, projectName, moduleQN, spec, result)
+
+	return result
+}
+
+// enrichModuleNode populates module node properties: macros, constants, exports, variables, symbols.
+func enrichModuleNode(
+	moduleNode *store.Node, macroNames map[string]bool, constants []string,
+	root *tree_sitter.Node, source []byte, f discover.FileInfo,
+	projectName, moduleQN string, spec *lang.LanguageSpec, result *parseResult,
+) {
+	if moduleNode.Properties == nil {
+		moduleNode.Properties = make(map[string]any)
+	}
+
+	// Store macro names for call resolution
 	if len(macroNames) > 0 {
-		if moduleNode.Properties == nil {
-			moduleNode.Properties = make(map[string]any)
-		}
 		macroList := make([]string, 0, len(macroNames))
 		for name := range macroNames {
 			macroList = append(macroList, name)
@@ -791,9 +898,46 @@ func parseFileAST(projectName string, f discover.FileInfo) *parseResult {
 		moduleNode.Properties["macros"] = macroList
 	}
 
-	// Resolve interpolated/concatenated strings
-	resolved := resolveModuleStrings(root, source, f.Language)
+	// Merge interpolated/concatenated string constants
+	constants = mergeResolvedConstants(constants, root, source, f.Language)
+	if len(constants) > 0 {
+		moduleNode.Properties["constants"] = constants
+	}
 
+	moduleNode.Properties["is_test"] = isTestFile(f.RelPath, f.Language)
+
+	// exports: collect exported symbol names
+	var exports []string
+	for _, n := range result.Nodes {
+		if n.QualifiedName == moduleQN {
+			continue
+		}
+		if exp, ok := n.Properties["is_exported"].(bool); ok && exp {
+			exports = append(exports, n.Name)
+		}
+	}
+	if len(exports) > 0 {
+		moduleNode.Properties["exports"] = exports
+	}
+
+	// Extract module-level variables
+	extractVariables(root, source, f, projectName, moduleQN, spec, result)
+
+	if globalVars := extractGlobalVarNames(root, source, f, spec); len(globalVars) > 0 {
+		moduleNode.Properties["global_vars"] = globalVars
+	}
+
+	if symbols := buildSymbolSummary(result.Nodes, moduleQN); len(symbols) > 0 {
+		moduleNode.Properties["symbols"] = symbols
+	}
+
+	result.ImportMap = parseImports(root, source, f.Language, projectName, f.RelPath)
+	moduleNode.Properties["imports_count"] = len(result.ImportMap)
+}
+
+// mergeResolvedConstants adds interpolated string constants to the existing list.
+func mergeResolvedConstants(constants []string, root *tree_sitter.Node, source []byte, language lang.Language) []string {
+	resolved := resolveModuleStrings(root, source, language)
 	seen := make(map[string]bool, len(constants))
 	for _, c := range constants {
 		seen[c] = true
@@ -808,22 +952,13 @@ func parseFileAST(projectName string, f discover.FileInfo) *parseResult {
 			constants = append(constants, entry)
 		}
 	}
-
-	// Update module node with constants (replace the initial module node)
-	if len(constants) > 0 {
-		moduleNode.Properties = map[string]any{"constants": constants}
-	}
-
-	// Parse imports
-	result.ImportMap = parseImports(root, source, f.Language, projectName, f.RelPath)
-
-	return result
+	return constants
 }
 
 // extractFunctionDef extracts a function/method node and DEFINES edge as data (no DB).
 func extractFunctionDef(
 	node *tree_sitter.Node, source []byte, f discover.FileInfo,
-	projectName, moduleQN string, result *parseResult,
+	projectName, moduleQN string, spec *lang.LanguageSpec, result *parseResult,
 ) {
 	nameNode := node.ChildByFieldName("name")
 	if nameNode == nil {
@@ -842,12 +977,19 @@ func extractFunctionDef(
 	paramsNode := node.ChildByFieldName("parameters")
 	if paramsNode != nil {
 		props["signature"] = parser.NodeText(paramsNode, source)
+		if paramTypes := extractParamTypes(paramsNode, source, f.Language); len(paramTypes) > 0 {
+			props["param_types"] = paramTypes
+		}
 	}
 
 	for _, field := range []string{"result", "return_type", "type"} {
 		rtNode := node.ChildByFieldName(field)
 		if rtNode != nil {
-			props["return_type"] = parser.NodeText(rtNode, source)
+			rtText := parser.NodeText(rtNode, source)
+			props["return_type"] = rtText
+			if returnTypes := extractReturnTypes(rtNode, source, f.Language); len(returnTypes) > 0 {
+				props["return_types"] = returnTypes
+			}
 			break
 		}
 	}
@@ -860,13 +1002,12 @@ func extractFunctionDef(
 
 	props["is_exported"] = isExported(name, f.Language)
 
-	if f.Language == lang.Python {
-		decorators := extractDecorators(node, source)
-		if len(decorators) > 0 {
-			props["decorators"] = decorators
-			if hasFrameworkDecorator(decorators) {
-				props["is_entry_point"] = true
-			}
+	// Decorator extraction (Python, Java, TS/JS)
+	decorators := extractAllDecorators(node, source, f.Language, spec)
+	if len(decorators) > 0 {
+		props["decorators"] = decorators
+		if hasFrameworkDecorator(decorators) {
+			props["is_entry_point"] = true
 		}
 	}
 
@@ -876,6 +1017,20 @@ func extractFunctionDef(
 
 	startLine := safeRowToLine(node.StartPosition().Row)
 	endLine := safeRowToLine(node.EndPosition().Row)
+
+	// Enrichment: function body line count
+	lines := endLine - startLine + 1
+	if lines > 0 {
+		props["lines"] = lines
+	}
+
+	// Enrichment: complexity (branching node count)
+	if spec != nil && len(spec.BranchingNodeTypes) > 0 {
+		complexity := countBranchingNodes(node, spec.BranchingNodeTypes)
+		if complexity > 0 {
+			props["complexity"] = complexity
+		}
+	}
 
 	result.Nodes = append(result.Nodes, &store.Node{
 		Project:       projectName,
@@ -930,6 +1085,26 @@ func extractClassDef(
 	startLine := safeRowToLine(node.StartPosition().Row)
 	endLine := safeRowToLine(node.EndPosition().Row)
 
+	classProps := map[string]any{"is_exported": isExported(name, f.Language)}
+
+	// Enrichment: base classes (for INHERITS edges in Phase 2)
+	if baseClasses := extractBaseClasses(node, source, f.Language); len(baseClasses) > 0 {
+		classProps["base_classes"] = baseClasses
+	}
+
+	// Enrichment: is_abstract
+	if isAbstractClass(node, f.Language) {
+		classProps["is_abstract"] = true
+	}
+
+	// Enrichment: decorators for class-level (Java annotations, TS decorators)
+	if spec != nil {
+		decorators := extractAllDecorators(node, source, f.Language, spec)
+		if len(decorators) > 0 {
+			classProps["decorators"] = decorators
+		}
+	}
+
 	result.Nodes = append(result.Nodes, &store.Node{
 		Project:       projectName,
 		Label:         label,
@@ -938,7 +1113,7 @@ func extractClassDef(
 		FilePath:      f.RelPath,
 		StartLine:     startLine,
 		EndLine:       endLine,
-		Properties:    map[string]any{"is_exported": isExported(name, f.Language)},
+		Properties:    classProps,
 	})
 
 	result.PendingEdges = append(result.PendingEdges, pendingEdge{
@@ -952,6 +1127,25 @@ func extractClassDef(
 
 	// Extract fields inside the class/struct
 	extractClassFieldDefs(node, source, f, projectName, classQN, spec, result)
+
+	// Enrichment: method_count and field_count (count from extracted nodes)
+	var methodCount, fieldCount int
+	for _, pe := range result.PendingEdges {
+		if pe.SourceQN == classQN {
+			switch pe.Type {
+			case "DEFINES_METHOD":
+				methodCount++
+			case "DEFINES":
+				fieldCount++
+			}
+		}
+	}
+	if methodCount > 0 {
+		classProps["method_count"] = methodCount
+	}
+	if fieldCount > 0 {
+		classProps["field_count"] = fieldCount
+	}
 }
 
 // extractClassMethodDefs walks a class AST node and extracts Method nodes (no DB).
@@ -1133,7 +1327,7 @@ func extractIdentifierFromDeclarator(node *tree_sitter.Node, source []byte) stri
 }
 
 // extractFieldType extracts the type annotation from a field declaration.
-func extractFieldType(node *tree_sitter.Node, source []byte, l lang.Language) string {
+func extractFieldType(node *tree_sitter.Node, source []byte, _ lang.Language) string {
 	// Try "type" field (Go, Rust, Java)
 	if typeNode := node.ChildByFieldName("type"); typeNode != nil {
 		return parser.NodeText(typeNode, source)
@@ -1194,7 +1388,7 @@ func extractMacroDef(
 // buildRegistry populates the FunctionRegistry from all Function, Method,
 // and Class nodes in the store.
 func (p *Pipeline) buildRegistry() {
-	labels := []string{"Function", "Method", "Class", "Type", "Interface", "Enum", "Macro"}
+	labels := []string{"Function", "Method", "Class", "Type", "Interface", "Enum", "Macro", "Variable"}
 	for _, label := range labels {
 		nodes, err := p.Store.FindNodesByLabel(p.ProjectName, label)
 		if err != nil {
@@ -1495,13 +1689,15 @@ func findEnclosingFunction(node *tree_sitter.Node, source []byte, project, relPa
 }
 
 func isConstantNode(node *tree_sitter.Node, language lang.Language) bool {
-	// Only look at top-level nodes
 	parent := node.Parent()
 	if parent == nil {
 		return false
 	}
+	return isConstantForLanguage(node.Kind(), parent, language)
+}
+
+func isConstantForLanguage(kind string, parent *tree_sitter.Node, language lang.Language) bool {
 	parentKind := parent.Kind()
-	kind := node.Kind()
 
 	switch language {
 	case lang.Go:
@@ -1509,12 +1705,9 @@ func isConstantNode(node *tree_sitter.Node, language lang.Language) bool {
 	case lang.Python:
 		return parentKind == "module" && kind == "expression_statement"
 	case lang.JavaScript, lang.TypeScript, lang.TSX:
-		return parentKind == "program" && kind == "lexical_declaration"
+		return isJSConstantNode(kind, parentKind, parent)
 	case lang.Rust:
 		return parentKind == "source_file" && (kind == "const_item" || kind == "let_declaration")
-	case lang.Java:
-		// Java constants are in class bodies — handled differently (resolve.go walks class body)
-		return false
 	case lang.PHP:
 		return parentKind == "program" && kind == "expression_statement"
 	case lang.Scala:
@@ -1526,6 +1719,21 @@ func isConstantNode(node *tree_sitter.Node, language lang.Language) bool {
 	default:
 		return false
 	}
+}
+
+func isJSConstantNode(kind, parentKind string, parent *tree_sitter.Node) bool {
+	if kind != "lexical_declaration" {
+		return false
+	}
+	if parentKind == "program" {
+		return true
+	}
+	// export const X = ... → program → export_statement → lexical_declaration
+	if parentKind == "export_statement" {
+		gp := parent.Parent()
+		return gp != nil && gp.Kind() == "program"
+	}
+	return false
 }
 
 func extractConstant(node *tree_sitter.Node, source []byte) string {

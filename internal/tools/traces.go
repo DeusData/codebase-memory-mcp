@@ -42,7 +42,12 @@ func (s *Server) handleIngestTraces(_ context.Context, req *mcp.CallToolRequest)
 		return errResult("project and file_path are required"), nil
 	}
 
-	result, err := traces.Ingest(s.store, project, filePath)
+	st, err := s.resolveStore(project)
+	if err != nil {
+		return errResult("store: " + err.Error()), nil //nolint:nilerr // WHY: MCP handler contract returns tool errors in result, Go error is always nil
+	}
+
+	result, err := traces.Ingest(st, project, filePath)
 	if err != nil {
 		return errResult(err.Error()), nil
 	}

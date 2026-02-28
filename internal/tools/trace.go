@@ -3,6 +3,8 @@ package tools
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/DeusData/codebase-memory-mcp/internal/store"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -32,10 +34,38 @@ func (s *Server) handleTraceCallPath(_ context.Context, req *mcp.CallToolRequest
 		direction = "outbound"
 	}
 
-	// Find the function node across all projects
-	rootNode, project, _ := s.findNodeAcrossProjects(funcName)
+	project := getStringArg(args, "project")
+	effectiveProject := s.resolveProjectName(project)
+
+	// Find the function node
+	rootNode, foundProject, findErr := s.findNodeAcrossProjects(funcName, effectiveProject)
+	if findErr != nil && !strings.HasPrefix(findErr.Error(), "node not found") {
+		return errResult(findErr.Error()), nil
+	}
 	if rootNode == nil {
+		// Fuzzy fallback: search for similar names and return structured suggestions
+		suggestions := s.findSimilarNodes(funcName, effectiveProject, 5)
+		if len(suggestions) > 0 {
+			suggList := make([]map[string]string, len(suggestions))
+			for i, n := range suggestions {
+				suggList[i] = map[string]string{
+					"name":           n.Name,
+					"qualified_name": n.QualifiedName,
+					"label":          n.Label,
+				}
+			}
+			return jsonResult(map[string]any{
+				"error":       fmt.Sprintf("function not found: %s", funcName),
+				"suggestions": suggList,
+			}), nil
+		}
 		return errResult(fmt.Sprintf("function not found: %s", funcName)), nil
+	}
+
+	// Get the store for the found project
+	st, err := s.router.ForProject(foundProject)
+	if err != nil {
+		return errResult(fmt.Sprintf("store: %v", err)), nil
 	}
 
 	edgeTypes := []string{"CALLS", "HTTP_CALLS", "ASYNC_CALLS"}
@@ -43,27 +73,26 @@ func (s *Server) handleTraceCallPath(_ context.Context, req *mcp.CallToolRequest
 	// Build root info
 	root := buildNodeInfo(rootNode)
 
-	// Get module info (constants) by finding the module that defines this function
-	moduleInfo := s.getModuleInfo(rootNode, project)
+	// Get module info
+	moduleInfo := s.getModuleInfo(st, rootNode, foundProject)
 
 	// Run BFS
 	var allVisited []*store.NodeHop
 	var allEdges []store.EdgeInfo
 
 	if direction == "both" {
-		// Run outbound + inbound separately, merge
-		outResult, outErr := s.store.BFS(rootNode.ID, "outbound", edgeTypes, depth, 200)
+		outResult, outErr := st.BFS(rootNode.ID, "outbound", edgeTypes, depth, 200)
 		if outErr == nil {
 			allVisited = append(allVisited, outResult.Visited...)
 			allEdges = append(allEdges, outResult.Edges...)
 		}
-		inResult, inErr := s.store.BFS(rootNode.ID, "inbound", edgeTypes, depth, 200)
+		inResult, inErr := st.BFS(rootNode.ID, "inbound", edgeTypes, depth, 200)
 		if inErr == nil {
 			allVisited = append(allVisited, inResult.Visited...)
 			allEdges = append(allEdges, inResult.Edges...)
 		}
 	} else {
-		result, bfsErr := s.store.BFS(rootNode.ID, direction, edgeTypes, depth, 200)
+		result, bfsErr := st.BFS(rootNode.ID, direction, edgeTypes, depth, 200)
 		if bfsErr != nil {
 			return errResult(fmt.Sprintf("bfs err: %v", bfsErr)), nil
 		}
@@ -78,20 +107,24 @@ func (s *Server) handleTraceCallPath(_ context.Context, req *mcp.CallToolRequest
 	edges := buildEdgeList(allEdges)
 
 	// Get indexed_at from project
-	proj, _ := s.store.GetProject(project)
+	proj, _ := st.GetProject(foundProject)
 	indexedAt := ""
 	if proj != nil {
 		indexedAt = proj.IndexedAt
 	}
 
-	return jsonResult(map[string]any{
+	responseData := map[string]any{
 		"root":          root,
 		"module":        moduleInfo,
 		"hops":          hops,
 		"edges":         edges,
 		"indexed_at":    indexedAt,
 		"total_results": len(allVisited),
-	}), nil
+	}
+	s.addIndexStatus(responseData)
+	s.addUpdateNotice(responseData)
+
+	return jsonResult(responseData), nil
 }
 
 func buildNodeInfo(n *store.Node) map[string]any {
@@ -112,13 +145,12 @@ func buildNodeInfo(n *store.Node) map[string]any {
 	return info
 }
 
-func (s *Server) getModuleInfo(funcNode *store.Node, project string) map[string]any {
+func (s *Server) getModuleInfo(st *store.Store, funcNode *store.Node, project string) map[string]any {
 	if funcNode.FilePath == "" {
 		return map[string]any{}
 	}
 
-	// Find module nodes in the same file
-	modules, err := s.store.FindNodesByLabel(project, "Module")
+	modules, err := st.FindNodesByLabel(project, "Module")
 	if err != nil {
 		return map[string]any{}
 	}
@@ -161,6 +193,44 @@ func buildHops(visited []*store.NodeHop) []hopEntry {
 		}
 	}
 	return hops
+}
+
+// findSimilarNodes searches for nodes whose name contains the input string (case-insensitive).
+func (s *Server) findSimilarNodes(name, project string, limit int) []*store.Node {
+	effectiveProject := s.resolveProjectName(project)
+	if effectiveProject == "" {
+		return nil
+	}
+	if !s.router.HasProject(effectiveProject) {
+		return nil
+	}
+	st, err := s.router.ForProject(effectiveProject)
+	if err != nil {
+		return nil
+	}
+	// Get actual project name from DB
+	projName := effectiveProject
+	projects, _ := st.ListProjects()
+	if len(projects) > 0 {
+		projName = projects[0].Name
+	}
+	params := &store.SearchParams{
+		Project:       projName,
+		NamePattern:   "(?i)" + regexp.QuoteMeta(name),
+		Limit:         limit,
+		MinDegree:     -1,
+		MaxDegree:     -1,
+		ExcludeLabels: []string{"Community"},
+	}
+	out, searchErr := st.Search(params)
+	if searchErr != nil {
+		return nil
+	}
+	nodes := make([]*store.Node, len(out.Results))
+	for i, r := range out.Results {
+		nodes[i] = r.Node
+	}
+	return nodes
 }
 
 func buildEdgeList(edges []store.EdgeInfo) []map[string]any {

@@ -7,6 +7,9 @@ import (
 )
 
 // UpsertNode inserts or replaces a node (dedup by qualified_name).
+// Note: LastInsertId() can return stale IDs for ON CONFLICT DO UPDATE,
+// causing occasional FK failures in downstream edge inserts. This is
+// accepted for performance — the fallback SELECT only runs when id==0.
 func (s *Store) UpsertNode(n *Node) (int64, error) {
 	res, err := s.q.Exec(`
 		INSERT INTO nodes (project, label, name, qualified_name, file_path, start_line, end_line, properties)
@@ -130,17 +133,22 @@ func (s *Store) FindNodesByIDs(ids []int64) (map[int64]*Node, error) {
 			"SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, properties FROM nodes WHERE id IN (%s)",
 			strings.Join(placeholders, ","))
 
-		rows, err := s.q.Query(query, args...)
-		if err != nil {
-			return nil, fmt.Errorf("find nodes by ids: %w", err)
-		}
-		nodes, err := scanNodes(rows)
-		rows.Close()
-		if err != nil {
+		if err := func() error {
+			rows, err := s.q.Query(query, args...)
+			if err != nil {
+				return fmt.Errorf("find nodes by ids: %w", err)
+			}
+			defer rows.Close()
+			nodes, err := scanNodes(rows)
+			if err != nil {
+				return err
+			}
+			for _, n := range nodes {
+				result[n.ID] = n
+			}
+			return nil
+		}(); err != nil {
 			return nil, err
-		}
-		for _, n := range nodes {
-			result[n.ID] = n
 		}
 	}
 	return result, nil

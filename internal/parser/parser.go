@@ -23,6 +23,7 @@ import (
 var (
 	languagesOnce sync.Once
 	languages     map[lang.Language]*tree_sitter.Language
+	parserPools   map[lang.Language]*sync.Pool
 )
 
 func initLanguages() {
@@ -41,6 +42,20 @@ func initLanguages() {
 			lang.Lua:   tree_sitter.NewLanguage(tree_sitter_lua.Language()),
 			lang.Scala: tree_sitter.NewLanguage(tree_sitter_scala.Language()),
 		}
+
+		parserPools = make(map[lang.Language]*sync.Pool, len(languages))
+		for l, tsLang := range languages {
+			tsLang := tsLang
+			parserPools[l] = &sync.Pool{
+				New: func() any {
+					p := tree_sitter.NewParser()
+					if err := p.SetLanguage(tsLang); err != nil {
+						panic(fmt.Sprintf("set language: %v", err))
+					}
+					return p
+				},
+			}
+		}
 	})
 }
 
@@ -56,20 +71,22 @@ func GetLanguage(l lang.Language) (*tree_sitter.Language, error) {
 
 // Parse parses source code into a tree-sitter AST Tree.
 // The caller must call tree.Close() when done.
+// Parsers are pooled per language via sync.Pool to avoid per-file allocation.
 func Parse(l lang.Language, source []byte) (*tree_sitter.Tree, error) {
-	tsLang, err := GetLanguage(l)
-	if err != nil {
-		return nil, err
+	initLanguages()
+
+	pool, ok := parserPools[l]
+	if !ok {
+		return nil, fmt.Errorf("unsupported language: %s", l)
 	}
 
-	p := tree_sitter.NewParser()
-	defer p.Close()
-
-	if err := p.SetLanguage(tsLang); err != nil {
-		return nil, fmt.Errorf("set language %s: %w", l, err)
+	p, _ := pool.Get().(*tree_sitter.Parser)
+	if p == nil {
+		return nil, fmt.Errorf("failed to get parser for language %s", l)
 	}
-
 	tree := p.Parse(source, nil)
+	pool.Put(p)
+
 	if tree == nil {
 		return nil, fmt.Errorf("parse failed for language %s", l)
 	}

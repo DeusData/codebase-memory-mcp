@@ -87,224 +87,33 @@ func (e *Executor) tryAggregateSQL(plan *Plan) (*Result, bool) {
 		return nil, false
 	}
 
-	// Must have COUNT in return
-	var countItem *ReturnItem
-	var groupItems []ReturnItem
-	for i := range plan.ReturnSpec.Items {
-		item := &plan.ReturnSpec.Items[i]
-		if item.Func == "COUNT" {
-			countItem = item
-		} else {
-			groupItems = append(groupItems, *item)
-		}
-	}
+	countItem, groupItems := classifyCountItems(plan.ReturnSpec.Items)
 	if countItem == nil {
 		return nil, false
 	}
 
-	// Identify the fusible step pattern: optional FilterWhere between Scan and Expand
-	steps := plan.Steps
-	var scan *ScanNodes
-	var expand *ExpandRelationship
-	var filter *FilterWhere
-
-	switch len(steps) {
-	case 2:
-		s, ok1 := steps[0].(*ScanNodes)
-		ex, ok2 := steps[1].(*ExpandRelationship)
-		if !ok1 || !ok2 {
-			return nil, false
-		}
-		scan, expand = s, ex
-	case 3:
-		s, ok1 := steps[0].(*ScanNodes)
-		f, ok2 := steps[1].(*FilterWhere)
-		ex, ok3 := steps[2].(*ExpandRelationship)
-		if !ok1 || !ok3 {
-			return nil, false
-		}
-		scan, expand = s, ex
-		if ok2 {
-			filter = f
-		}
-	default:
+	scan, expand, filter, ok := parseFusibleSteps(plan.Steps)
+	if !ok {
 		return nil, false
 	}
 
-	// Must be fixed-length (1 hop)
-	if expand.MinHops != 1 || expand.MaxHops != 1 {
+	if !validatePushability(scan, expand, filter, groupItems) {
 		return nil, false
 	}
-	if len(expand.EdgeTypes) == 0 {
-		return nil, false
-	}
-	if len(scan.Props) > 0 || len(expand.ToProps) > 0 {
-		return nil, false // inline property filters not supported in SQL push-down
-	}
 
-	// All group-by items must reference SQL-pushable columns
-	for _, gi := range groupItems {
-		if gi.Property == "" {
-			return nil, false
-		}
-		if _, ok := sqlPushableColumns[gi.Property]; !ok {
-			return nil, false
-		}
-	}
-
-	// Filter conditions must all be pushable
-	if filter != nil {
-		for _, c := range filter.Conditions {
-			if _, ok := sqlPushableColumns[c.Property]; !ok {
-				return nil, false
-			}
-			switch c.Operator {
-			case "=", "CONTAINS", "STARTS WITH":
-				// OK
-			default:
-				return nil, false // regex, numeric not pushable
-			}
-		}
-	}
-
-	// Build the SQL query
 	projects, err := e.Store.ListProjects()
 	if err != nil {
 		return nil, false
 	}
 
-	dir := expand.Direction
-	if dir == "" {
-		dir = "outbound"
-	}
-	var srcCol, tgtCol string
-	if dir == "outbound" {
-		srcCol, tgtCol = "source_id", "target_id"
-	} else {
-		srcCol, tgtCol = "target_id", "source_id"
-	}
-
-	// Map variable names to table aliases
-	srcAlias := "src" // scan variable
-	tgtAlias := "tgt" // expand target variable
-
-	// Build SELECT columns for group-by items
-	selectParts := make([]string, 0, len(groupItems)+1)
-	groupByParts := make([]string, 0, len(groupItems))
-	for _, gi := range groupItems {
-		col := sqlPushableColumns[gi.Property]
-		var alias string
-		if gi.Variable == scan.Variable {
-			alias = srcAlias
-		} else {
-			alias = tgtAlias
-		}
-		selectParts = append(selectParts, alias+"."+col)
-		groupByParts = append(groupByParts, alias+"."+col)
-	}
-	selectParts = append(selectParts, "COUNT(*) as cnt")
-
-	// Accumulate results across all projects
+	sqlCtx := newAggregateSQLContext(scan, expand, groupItems)
 	cols := buildColumnNames(plan.ReturnSpec.Items)
 	countCol := cols[len(cols)-1] // COUNT column is last
 
 	allRows := make([]map[string]any, 0)
-
 	for _, proj := range projects {
-		var sb strings.Builder
-		args := make([]any, 0, 10)
-
-		sb.WriteString("SELECT ")
-		sb.WriteString(strings.Join(selectParts, ", "))
-		sb.WriteString(" FROM edges e")
-		sb.WriteString(fmt.Sprintf(" JOIN nodes %s ON %s.id = e.%s", srcAlias, srcAlias, srcCol))
-		sb.WriteString(fmt.Sprintf(" JOIN nodes %s ON %s.id = e.%s", tgtAlias, tgtAlias, tgtCol))
-		sb.WriteString(" WHERE e.project = ?")
-		args = append(args, proj.Name)
-
-		// Edge type filter
-		typePlaceholders := make([]string, len(expand.EdgeTypes))
-		for i, et := range expand.EdgeTypes {
-			typePlaceholders[i] = "?"
-			args = append(args, et)
-		}
-		sb.WriteString(" AND e.type IN (" + strings.Join(typePlaceholders, ",") + ")")
-
-		// Label filters
-		if scan.Label != "" {
-			sb.WriteString(fmt.Sprintf(" AND %s.label = ?", srcAlias))
-			args = append(args, scan.Label)
-		}
-		if expand.ToLabel != "" {
-			sb.WriteString(fmt.Sprintf(" AND %s.label = ?", tgtAlias))
-			args = append(args, expand.ToLabel)
-		}
-
-		// Push-down WHERE conditions
-		if filter != nil {
-			for _, c := range filter.Conditions {
-				col := sqlPushableColumns[c.Property]
-				var alias string
-				if c.Variable == scan.Variable {
-					alias = srcAlias
-				} else {
-					alias = tgtAlias
-				}
-				switch c.Operator {
-				case "=":
-					sb.WriteString(fmt.Sprintf(" AND %s.%s = ?", alias, col))
-					args = append(args, c.Value)
-				case "CONTAINS":
-					sb.WriteString(fmt.Sprintf(" AND %s.%s LIKE ?", alias, col))
-					args = append(args, "%"+c.Value+"%")
-				case "STARTS WITH":
-					sb.WriteString(fmt.Sprintf(" AND %s.%s LIKE ?", alias, col))
-					args = append(args, c.Value+"%")
-				}
-			}
-		}
-
-		sb.WriteString(" GROUP BY " + strings.Join(groupByParts, ", "))
-
-		rows, qErr := e.Store.DB().Query(sb.String(), args...)
-		if qErr != nil {
-			continue
-		}
-
-		for rows.Next() {
-			// Scan group-by values + count
-			vals := make([]any, len(groupItems)+1)
-			ptrs := make([]any, len(groupItems)+1)
-			for i := range vals {
-				ptrs[i] = &vals[i]
-			}
-			if sErr := rows.Scan(ptrs...); sErr != nil {
-				rows.Close()
-				continue
-			}
-			row := make(map[string]any)
-			for i, gi := range groupItems {
-				col := gi.Variable + "." + gi.Property
-				if gi.Alias != "" {
-					col = gi.Alias
-				}
-				// Normalize []byte to string (mattn returns []byte for TEXT cols)
-				if b, ok := vals[i].([]byte); ok {
-					row[col] = string(b)
-				} else {
-					row[col] = vals[i]
-				}
-			}
-			// Normalize COUNT to int for consistency with Go-side aggregation
-			switch v := vals[len(vals)-1].(type) {
-			case int64:
-				row[countCol] = int(v)
-			default:
-				row[countCol] = v
-			}
-			allRows = append(allRows, row)
-		}
-		rows.Close()
+		projRows := e.executeAggregateForProject(proj.Name, &sqlCtx, scan, expand, filter, groupItems, countCol)
+		allRows = append(allRows, projRows...)
 	}
 
 	// ORDER BY
@@ -317,6 +126,242 @@ func (e *Executor) tryAggregateSQL(plan *Plan) (*Result, bool) {
 	allRows = applyLimit(allRows, plan.ReturnSpec.Limit)
 
 	return &Result{Columns: cols, Rows: allRows}, true
+}
+
+// classifyCountItems separates return items into the COUNT item and group-by items.
+func classifyCountItems(items []ReturnItem) (countItem *ReturnItem, groupItems []ReturnItem) {
+	for i := range items {
+		item := &items[i]
+		if item.Func == "COUNT" {
+			countItem = item
+		} else {
+			groupItems = append(groupItems, *item)
+		}
+	}
+	return
+}
+
+// parseFusibleSteps identifies the ScanNodes + optional FilterWhere + ExpandRelationship
+// pattern from plan steps. Returns (nil, nil, nil, false) if the pattern is not fusible.
+func parseFusibleSteps(steps []PlanStep) (*ScanNodes, *ExpandRelationship, *FilterWhere, bool) {
+	switch len(steps) {
+	case 2:
+		s, ok1 := steps[0].(*ScanNodes)
+		ex, ok2 := steps[1].(*ExpandRelationship)
+		if !ok1 || !ok2 {
+			return nil, nil, nil, false
+		}
+		return s, ex, nil, true
+	case 3:
+		s, ok1 := steps[0].(*ScanNodes)
+		f, ok2 := steps[1].(*FilterWhere)
+		ex, ok3 := steps[2].(*ExpandRelationship)
+		if !ok1 || !ok3 {
+			return nil, nil, nil, false
+		}
+		var filter *FilterWhere
+		if ok2 {
+			filter = f
+		}
+		return s, ex, filter, true
+	default:
+		return nil, nil, nil, false
+	}
+}
+
+// validatePushability checks if the scan/expand/filter/group combination
+// can be pushed entirely to SQL.
+func validatePushability(scan *ScanNodes, expand *ExpandRelationship, filter *FilterWhere, groupItems []ReturnItem) bool {
+	if expand.MinHops != 1 || expand.MaxHops != 1 {
+		return false
+	}
+	if len(expand.EdgeTypes) == 0 {
+		return false
+	}
+	if len(scan.Props) > 0 || len(expand.ToProps) > 0 {
+		return false
+	}
+
+	for _, gi := range groupItems {
+		if gi.Property == "" {
+			return false
+		}
+		if _, ok := sqlPushableColumns[gi.Property]; !ok {
+			return false
+		}
+	}
+
+	if filter != nil {
+		for _, c := range filter.Conditions {
+			if _, ok := sqlPushableColumns[c.Property]; !ok {
+				return false
+			}
+			switch c.Operator {
+			case "=", "CONTAINS", "STARTS WITH":
+				// OK
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// aggregateSQLContext holds pre-computed SQL fragments for aggregate queries.
+type aggregateSQLContext struct {
+	srcCol, tgtCol     string
+	selectParts        []string
+	groupByParts       []string
+	srcAlias, tgtAlias string
+}
+
+// newAggregateSQLContext pre-computes direction-dependent columns and
+// SELECT/GROUP BY parts for the aggregate SQL query.
+func newAggregateSQLContext(scan *ScanNodes, expand *ExpandRelationship, groupItems []ReturnItem) aggregateSQLContext {
+	dir := expand.Direction
+	if dir == "" {
+		dir = "outbound"
+	}
+	var srcCol, tgtCol string
+	if dir == "outbound" {
+		srcCol, tgtCol = "source_id", "target_id"
+	} else {
+		srcCol, tgtCol = "target_id", "source_id"
+	}
+
+	srcAlias, tgtAlias := "src", "tgt"
+	selectParts := make([]string, 0, len(groupItems)+1)
+	groupByParts := make([]string, 0, len(groupItems))
+	for _, gi := range groupItems {
+		col := sqlPushableColumns[gi.Property]
+		alias := tgtAlias
+		if gi.Variable == scan.Variable {
+			alias = srcAlias
+		}
+		selectParts = append(selectParts, alias+"."+col)
+		groupByParts = append(groupByParts, alias+"."+col)
+	}
+	selectParts = append(selectParts, "COUNT(*) as cnt")
+
+	return aggregateSQLContext{
+		srcCol: srcCol, tgtCol: tgtCol,
+		selectParts: selectParts, groupByParts: groupByParts,
+		srcAlias: srcAlias, tgtAlias: tgtAlias,
+	}
+}
+
+// executeAggregateForProject runs the aggregate SQL query for a single project.
+func (e *Executor) executeAggregateForProject(
+	project string, ctx *aggregateSQLContext,
+	scan *ScanNodes, expand *ExpandRelationship, filter *FilterWhere,
+	groupItems []ReturnItem, countCol string,
+) []map[string]any {
+	query, args := buildProjectAggregateSQL(project, ctx, scan, expand, filter)
+
+	rows, qErr := e.Store.DB().Query(query, args...)
+	if qErr != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var result []map[string]any
+	for rows.Next() {
+		vals := make([]any, len(groupItems)+1)
+		ptrs := make([]any, len(groupItems)+1)
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if sErr := rows.Scan(ptrs...); sErr != nil {
+			continue
+		}
+		row := make(map[string]any)
+		for i, gi := range groupItems {
+			col := gi.Variable + "." + gi.Property
+			if gi.Alias != "" {
+				col = gi.Alias
+			}
+			if b, ok := vals[i].([]byte); ok {
+				row[col] = string(b)
+			} else {
+				row[col] = vals[i]
+			}
+		}
+		switch v := vals[len(vals)-1].(type) {
+		case int64:
+			row[countCol] = int(v)
+		default:
+			row[countCol] = v
+		}
+		result = append(result, row)
+	}
+	_ = rows.Err()
+	return result
+}
+
+// buildProjectAggregateSQL constructs the SQL query and args for one project.
+func buildProjectAggregateSQL(
+	project string, ctx *aggregateSQLContext,
+	scan *ScanNodes, expand *ExpandRelationship, filter *FilterWhere,
+) (query string, args []any) {
+	var sb strings.Builder
+	args = make([]any, 0, 10)
+
+	sb.WriteString("SELECT ")
+	sb.WriteString(strings.Join(ctx.selectParts, ", "))
+	sb.WriteString(" FROM edges e")
+	fmt.Fprintf(&sb, " JOIN nodes %s ON %s.id = e.%s", ctx.srcAlias, ctx.srcAlias, ctx.srcCol)
+	fmt.Fprintf(&sb, " JOIN nodes %s ON %s.id = e.%s", ctx.tgtAlias, ctx.tgtAlias, ctx.tgtCol)
+	sb.WriteString(" WHERE e.project = ?")
+	args = append(args, project)
+
+	// Edge type filter
+	typePlaceholders := make([]string, len(expand.EdgeTypes))
+	for i, et := range expand.EdgeTypes {
+		typePlaceholders[i] = "?"
+		args = append(args, et)
+	}
+	sb.WriteString(" AND e.type IN (" + strings.Join(typePlaceholders, ",") + ")")
+
+	// Label filters
+	if scan.Label != "" {
+		fmt.Fprintf(&sb, " AND %s.label = ?", ctx.srcAlias)
+		args = append(args, scan.Label)
+	}
+	if expand.ToLabel != "" {
+		fmt.Fprintf(&sb, " AND %s.label = ?", ctx.tgtAlias)
+		args = append(args, expand.ToLabel)
+	}
+
+	// Push-down WHERE conditions
+	if filter != nil {
+		appendFilterConditions(&sb, &args, filter, scan.Variable, ctx.srcAlias, ctx.tgtAlias)
+	}
+
+	sb.WriteString(" GROUP BY " + strings.Join(ctx.groupByParts, ", "))
+	query = sb.String()
+	return
+}
+
+// appendFilterConditions appends WHERE conditions to the SQL query builder.
+func appendFilterConditions(sb *strings.Builder, args *[]any, filter *FilterWhere, scanVar, srcAlias, tgtAlias string) {
+	for _, c := range filter.Conditions {
+		col := sqlPushableColumns[c.Property]
+		alias := tgtAlias
+		if c.Variable == scanVar {
+			alias = srcAlias
+		}
+		switch c.Operator {
+		case "=":
+			fmt.Fprintf(sb, " AND %s.%s = ?", alias, col)
+			*args = append(*args, c.Value)
+		case "CONTAINS":
+			fmt.Fprintf(sb, " AND %s.%s LIKE ?", alias, col)
+			*args = append(*args, "%"+c.Value+"%")
+		case "STARTS WITH":
+			fmt.Fprintf(sb, " AND %s.%s LIKE ?", alias, col)
+			*args = append(*args, c.Value+"%")
+		}
+	}
 }
 
 //nolint:gocognit // step dispatch with fusion/push-down is inherently branchy
@@ -639,20 +684,7 @@ func (e *Executor) execExpand(s *ExpandRelationship, bindings []binding) ([]bind
 // expandFixedLengthBatch performs fixed-length (1 hop) expansion for all bindings
 // in just 2 SQL queries: one for edges, one for target nodes.
 func (e *Executor) expandFixedLengthBatch(s *ExpandRelationship, bindings []binding) ([]binding, error) {
-	// Collect all unique source node IDs
-	sourceIDs := make([]int64, 0, len(bindings))
-	idSeen := make(map[int64]bool, len(bindings))
-	for _, b := range bindings {
-		fromNode, ok := b.nodes[s.FromVar]
-		if !ok {
-			continue
-		}
-		if !idSeen[fromNode.ID] {
-			idSeen[fromNode.ID] = true
-			sourceIDs = append(sourceIDs, fromNode.ID)
-		}
-	}
-
+	sourceIDs := collectSourceIDs(s.FromVar, bindings)
 	if len(sourceIDs) == 0 {
 		return nil, nil
 	}
@@ -662,45 +694,69 @@ func (e *Executor) expandFixedLengthBatch(s *ExpandRelationship, bindings []bind
 		direction = "outbound"
 	}
 
-	// Batch 1: fetch all edges for all source IDs
-	var edgesByNode map[int64][]*store.Edge
-	var err error
-	switch direction {
-	case "outbound":
-		edgesByNode, err = e.Store.FindEdgesBySourceIDs(sourceIDs, s.EdgeTypes)
-	case "inbound":
-		edgesByNode, err = e.Store.FindEdgesByTargetIDs(sourceIDs, s.EdgeTypes)
-	case "any":
-		outEdges, outErr := e.Store.FindEdgesBySourceIDs(sourceIDs, s.EdgeTypes)
-		if outErr != nil {
-			return nil, outErr
-		}
-		inEdges, inErr := e.Store.FindEdgesByTargetIDs(sourceIDs, s.EdgeTypes)
-		if inErr != nil {
-			return nil, inErr
-		}
-		edgesByNode = outEdges
-		for id, edges := range inEdges {
-			edgesByNode[id] = append(edgesByNode[id], edges...)
-		}
-	default:
-		edgesByNode, err = e.Store.FindEdgesBySourceIDs(sourceIDs, s.EdgeTypes)
-	}
+	edgesByNode, err := e.fetchEdgesForDirection(sourceIDs, s.EdgeTypes, direction)
 	if err != nil {
 		return nil, err
 	}
 
-	// Collect all target node IDs
+	nodeMap, err := e.Store.FindNodesByIDs(collectTargetIDs(edgesByNode, direction))
+	if err != nil {
+		return nil, err
+	}
+
+	return buildExpandedBindings(bindings, s, edgesByNode, nodeMap, direction), nil
+}
+
+// collectSourceIDs extracts unique node IDs from bindings for the given variable.
+func collectSourceIDs(fromVar string, bindings []binding) []int64 {
+	sourceIDs := make([]int64, 0, len(bindings))
+	idSeen := make(map[int64]bool, len(bindings))
+	for _, b := range bindings {
+		fromNode, ok := b.nodes[fromVar]
+		if !ok {
+			continue
+		}
+		if !idSeen[fromNode.ID] {
+			idSeen[fromNode.ID] = true
+			sourceIDs = append(sourceIDs, fromNode.ID)
+		}
+	}
+	return sourceIDs
+}
+
+// fetchEdgesForDirection fetches edges for the given source IDs and direction.
+func (e *Executor) fetchEdgesForDirection(sourceIDs []int64, edgeTypes []string, direction string) (map[int64][]*store.Edge, error) {
+	switch direction {
+	case "inbound":
+		return e.Store.FindEdgesByTargetIDs(sourceIDs, edgeTypes)
+	case "any":
+		outEdges, err := e.Store.FindEdgesBySourceIDs(sourceIDs, edgeTypes)
+		if err != nil {
+			return nil, err
+		}
+		inEdges, err := e.Store.FindEdgesByTargetIDs(sourceIDs, edgeTypes)
+		if err != nil {
+			return nil, err
+		}
+		for id, edges := range inEdges {
+			outEdges[id] = append(outEdges[id], edges...)
+		}
+		return outEdges, nil
+	default: // "outbound" or unspecified
+		return e.Store.FindEdgesBySourceIDs(sourceIDs, edgeTypes)
+	}
+}
+
+// collectTargetIDs extracts all target node IDs from edge batches.
+func collectTargetIDs(edgesByNode map[int64][]*store.Edge, direction string) []int64 {
 	targetIDSet := make(map[int64]bool)
 	for _, edges := range edgesByNode {
 		for _, edge := range edges {
-			tid := edgeTargetID(edge, 0, direction)
 			if direction == "any" {
-				// For "any", we need to check per-source
 				targetIDSet[edge.SourceID] = true
 				targetIDSet[edge.TargetID] = true
 			} else {
-				targetIDSet[tid] = true
+				targetIDSet[edgeTargetID(edge, 0, direction)] = true
 			}
 		}
 	}
@@ -708,14 +764,11 @@ func (e *Executor) expandFixedLengthBatch(s *ExpandRelationship, bindings []bind
 	for id := range targetIDSet {
 		targetIDs = append(targetIDs, id)
 	}
+	return targetIDs
+}
 
-	// Batch 2: fetch all target nodes
-	nodeMap, err := e.Store.FindNodesByIDs(targetIDs)
-	if err != nil {
-		return nil, err
-	}
-
-	// Build results per binding
+// buildExpandedBindings creates result bindings by matching edges to target nodes.
+func buildExpandedBindings(bindings []binding, s *ExpandRelationship, edgesByNode map[int64][]*store.Edge, nodeMap map[int64]*store.Node, direction string) []binding {
 	result := make([]binding, 0, len(bindings))
 	for _, b := range bindings {
 		fromNode, ok := b.nodes[s.FromVar]
@@ -733,10 +786,7 @@ func (e *Executor) expandFixedLengthBatch(s *ExpandRelationship, bindings []bind
 			seen[targetID] = true
 
 			node, exists := nodeMap[targetID]
-			if !exists {
-				continue
-			}
-			if s.ToLabel != "" && node.Label != s.ToLabel {
+			if !exists || (s.ToLabel != "" && node.Label != s.ToLabel) {
 				continue
 			}
 			if len(s.ToProps) > 0 && !nodeMatchesProps(node, s.ToProps) {
@@ -757,7 +807,7 @@ func (e *Executor) expandFixedLengthBatch(s *ExpandRelationship, bindings []bind
 			break
 		}
 	}
-	return result, nil
+	return result
 }
 
 func (e *Executor) expandVariableLength(b binding, fromNode *store.Node, s *ExpandRelationship) ([]binding, error) {
@@ -804,7 +854,6 @@ func (e *Executor) expandVariableLength(b binding, fromNode *store.Node, s *Expa
 	}
 	return result, nil
 }
-
 
 // edgeTargetID returns the ID of the node on the "other end" of the edge relative to nodeID.
 func edgeTargetID(edge *store.Edge, nodeID int64, direction string) int64 {
@@ -1171,8 +1220,28 @@ func resolveEdgeItemValue(edge *store.Edge, property string) any {
 
 // resolveOrderColumn maps an ORDER BY field to the actual column name.
 func resolveOrderColumn(orderBy string, items []ReturnItem, cols []string) string {
+	// 1. Try alias match
 	for i, item := range items {
 		if item.Alias == orderBy {
+			return cols[i]
+		}
+	}
+	// 2. Try matching aggregate expression (e.g. "COUNT(r)")
+	for i, item := range items {
+		if item.Func == "COUNT" {
+			expr := "COUNT(" + item.Variable + ")"
+			if orderBy == expr {
+				return cols[i]
+			}
+		}
+	}
+	// 3. Try matching variable.property to column name
+	for i, item := range items {
+		varProp := item.Variable
+		if item.Property != "" {
+			varProp += "." + item.Property
+		}
+		if orderBy == varProp {
 			return cols[i]
 		}
 	}
@@ -1213,7 +1282,8 @@ func (e *Executor) aggregateResults(bindings []binding, ret *ReturnClause) (*Res
 
 	// ORDER BY
 	if ret.OrderBy != "" {
-		sortRows(rows, ret.OrderBy, ret.OrderDir)
+		orderCol := resolveOrderColumn(ret.OrderBy, ret.Items, cols)
+		sortRows(rows, orderCol, ret.OrderDir)
 	}
 
 	// LIMIT

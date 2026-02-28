@@ -19,15 +19,24 @@ func (s *Server) handleQueryGraph(_ context.Context, req *mcp.CallToolRequest) (
 		return errResult("missing required 'query' parameter"), nil
 	}
 
-	exec := &cypher.Executor{Store: s.store}
+	st, err := s.resolveStore(getStringArg(args, "project"))
+	if err != nil {
+		return errResult(fmt.Sprintf("resolve store: %v", err)), nil
+	}
+
+	exec := &cypher.Executor{Store: st}
 	result, err := exec.Execute(query)
 	if err != nil {
 		return errResult(fmt.Sprintf("query error: %v", err)), nil
 	}
 
-	return jsonResult(map[string]any{
+	responseData := map[string]any{
 		"columns": result.Columns,
 		"rows":    result.Rows,
 		"total":   len(result.Rows),
-	}), nil
+	}
+	s.addIndexStatus(responseData)
+	s.addUpdateNotice(responseData)
+
+	return jsonResult(responseData), nil
 }

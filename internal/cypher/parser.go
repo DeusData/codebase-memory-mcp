@@ -469,30 +469,12 @@ func (p *Parser) parseReturn() (*ReturnClause, error) {
 
 	// Optional ORDER BY
 	if p.peek().Type == TokOrder {
-		p.advance() // consume ORDER
-		if err := p.expect(TokBy); err != nil {
-			return nil, fmt.Errorf("expected BY after ORDER: %w", err)
+		orderBy, orderDir, err := p.parseOrderBy()
+		if err != nil {
+			return nil, err
 		}
-		orderTok := p.advance()
-		if orderTok.Type != TokIdent {
-			return nil, fmt.Errorf("expected field name for ORDER BY, got %q", orderTok.Value)
-		}
-		orderField := orderTok.Value
-		if p.peek().Type == TokDot {
-			p.advance() // consume .
-			propTok := p.advance()
-			orderField = orderField + "." + propTok.Value
-		}
-		r.OrderBy = orderField
-
-		// Optional ASC/DESC
-		if p.peek().Type == TokAsc {
-			r.OrderDir = "ASC"
-			p.advance()
-		} else if p.peek().Type == TokDesc {
-			r.OrderDir = "DESC"
-			p.advance()
-		}
+		r.OrderBy = orderBy
+		r.OrderDir = orderDir
 	}
 
 	// Optional LIMIT
@@ -574,4 +556,58 @@ func (p *Parser) parseCountItem() (ReturnItem, error) {
 	}
 
 	return item, nil
+}
+
+// parseOrderBy parses ORDER BY <field|COUNT(var)> [ASC|DESC].
+func (p *Parser) parseOrderBy() (orderBy, orderDir string, err error) {
+	p.advance() // consume ORDER
+	if err := p.expect(TokBy); err != nil {
+		return "", "", fmt.Errorf("expected BY after ORDER: %w", err)
+	}
+
+	orderField, err := p.parseOrderField()
+	if err != nil {
+		return "", "", err
+	}
+
+	// Optional ASC/DESC
+	dir := ""
+	if p.peek().Type == TokAsc {
+		dir = "ASC"
+		p.advance()
+	} else if p.peek().Type == TokDesc {
+		dir = "DESC"
+		p.advance()
+	}
+	return orderField, dir, nil
+}
+
+// parseOrderField parses the field expression in ORDER BY: either COUNT(var) or var[.prop].
+func (p *Parser) parseOrderField() (string, error) {
+	if p.peek().Type == TokCount {
+		p.advance() // consume COUNT
+		if err := p.expect(TokLParen); err != nil {
+			return "", fmt.Errorf("expected '(' after COUNT in ORDER BY: %w", err)
+		}
+		varTok := p.advance()
+		if varTok.Type != TokIdent {
+			return "", fmt.Errorf("expected variable in COUNT(), got %q", varTok.Value)
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return "", fmt.Errorf("expected ')' after COUNT variable in ORDER BY: %w", err)
+		}
+		return "COUNT(" + varTok.Value + ")", nil
+	}
+
+	orderTok := p.advance()
+	if orderTok.Type != TokIdent {
+		return "", fmt.Errorf("expected field name for ORDER BY, got %q", orderTok.Value)
+	}
+	field := orderTok.Value
+	if p.peek().Type == TokDot {
+		p.advance() // consume .
+		propTok := p.advance()
+		field += "." + propTok.Value
+	}
+	return field, nil
 }

@@ -22,8 +22,14 @@ func (s *Server) handleGetCodeSnippet(_ context.Context, req *mcp.CallToolReques
 		return errResult("qualified_name is required"), nil
 	}
 
-	// Find the node across all projects
-	node, project, _ := s.findNodeByQNAcrossProjects(qn)
+	project := getStringArg(args, "project")
+	effectiveProject := s.resolveProjectName(project)
+
+	// Find the node
+	node, foundProject, findErr := s.findNodeByQNAcrossProjects(qn, effectiveProject)
+	if findErr != nil && !strings.HasPrefix(findErr.Error(), "node not found") {
+		return errResult(findErr.Error()), nil
+	}
 	if node == nil {
 		return errResult(fmt.Sprintf("node not found: %s", qn)), nil
 	}
@@ -36,10 +42,15 @@ func (s *Server) handleGetCodeSnippet(_ context.Context, req *mcp.CallToolReques
 		return errResult("node has no line range"), nil
 	}
 
-	// Resolve file path against the project's root path
-	proj, _ := s.store.GetProject(project)
+	// Get the store for the found project to look up root path
+	st, err := s.router.ForProject(foundProject)
+	if err != nil {
+		return errResult(fmt.Sprintf("store: %v", err)), nil
+	}
+
+	proj, _ := st.GetProject(foundProject)
 	if proj == nil {
-		return errResult(fmt.Sprintf("project not found: %s", project)), nil
+		return errResult(fmt.Sprintf("project not found: %s", foundProject)), nil
 	}
 
 	absPath := filepath.Join(proj.RootPath, node.FilePath)

@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/DeusData/codebase-memory-mcp/internal/store"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -26,6 +27,7 @@ type searchCodeParams struct {
 	offset     int
 	isRegex    bool
 	re         *regexp.Regexp
+	project    string
 }
 
 // parseSearchCodeParams extracts and validates search_code parameters from the request.
@@ -41,6 +43,7 @@ func parseSearchCodeParams(req *mcp.CallToolRequest) (*searchCodeParams, *mcp.Ca
 		maxResults: getIntArg(args, "max_results", 10),
 		offset:     getIntArg(args, "offset", 0),
 		isRegex:    getBoolArg(args, "regex"),
+		project:    getStringArg(args, "project"),
 	}
 
 	if p.pattern == "" {
@@ -64,12 +67,12 @@ func (s *Server) handleSearchCode(_ context.Context, req *mcp.CallToolRequest) (
 	}
 
 	// Resolve project root
-	root, err := s.resolveProjectRoot()
+	root, err := s.resolveProjectRoot(params.project)
 	if err != nil {
 		return errResult(fmt.Sprintf("resolve root: %v", err)), nil
 	}
 
-	filePaths := s.collectSearchFilePaths(params.fileGlob)
+	filePaths := s.collectSearchFilePaths(params.fileGlob, params.project)
 
 	// Collect all matches up to offset+maxResults for accurate total count
 	fetchLimit := params.offset + params.maxResults
@@ -98,7 +101,7 @@ func (s *Server) handleSearchCode(_ context.Context, req *mcp.CallToolRequest) (
 	}
 	pageMatches := allMatches[start:end]
 
-	return jsonResult(map[string]any{
+	responseData := map[string]any{
 		"pattern":     params.pattern,
 		"total":       total,
 		"limit":       params.maxResults,
@@ -106,15 +109,19 @@ func (s *Server) handleSearchCode(_ context.Context, req *mcp.CallToolRequest) (
 		"has_more":    hasMore,
 		"matches":     pageMatches,
 		"files_count": len(filePaths),
-	}), nil
+	}
+	s.addIndexStatus(responseData)
+	s.addUpdateNotice(responseData)
+
+	return jsonResult(responseData), nil
 }
 
 // collectSearchFilePaths gathers indexed file paths, optionally filtered by a glob pattern.
-func (s *Server) collectSearchFilePaths(fileGlob string) []string {
-	projects, _ := s.store.ListProjects()
+func (s *Server) collectSearchFilePaths(fileGlob, project string) []string {
 	var filePaths []string
-	for _, p := range projects {
-		files, _ := s.store.FindNodesByLabel(p.Name, "File")
+
+	collectFromStore := func(st *store.Store, projName string) {
+		files, _ := st.FindNodesByLabel(projName, "File")
 		for _, f := range files {
 			if f.FilePath == "" {
 				continue
@@ -131,6 +138,19 @@ func (s *Server) collectSearchFilePaths(fileGlob string) []string {
 			filePaths = append(filePaths, f.FilePath)
 		}
 	}
+
+	st, err := s.resolveStore(project)
+	if err != nil {
+		return filePaths
+	}
+
+	projName := s.resolveProjectName(project)
+	projects, _ := st.ListProjects()
+	if len(projects) > 0 {
+		projName = projects[0].Name
+	}
+	collectFromStore(st, projName)
+
 	return filePaths
 }
 

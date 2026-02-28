@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"strings"
 )
 
@@ -87,6 +88,13 @@ func (s *Store) DeleteEdgesByProject(project string) error {
 	return err
 }
 
+// CountEdgesByType returns the number of edges of a given type for a project.
+func (s *Store) CountEdgesByType(project, edgeType string) (int, error) {
+	var count int
+	err := s.q.QueryRow("SELECT COUNT(*) FROM edges WHERE project=? AND type=?", project, edgeType).Scan(&count)
+	return count, err
+}
+
 // DeleteEdgesByType deletes all edges of a given type for a project.
 func (s *Store) DeleteEdgesByType(project, edgeType string) error {
 	_, err := s.q.Exec("DELETE FROM edges WHERE project=? AND type=?", project, edgeType)
@@ -156,8 +164,25 @@ func (s *Store) insertEdgeChunk(batch []*Edge) error {
 	}
 	sb.WriteString(` ON CONFLICT(source_id, target_id, type) DO UPDATE SET properties=excluded.properties`)
 
-	if _, err := s.q.Exec(sb.String(), args...); err != nil {
-		return fmt.Errorf("insert edge batch: %w", err)
+	_, err := s.q.Exec(sb.String(), args...)
+	if err == nil {
+		return nil
+	}
+
+	// Batch failed (likely FK constraint from stale LastInsertId) — fall back
+	// to one-at-a-time inserts so one bad edge doesn't break the entire batch.
+	skipped := 0
+	for _, e := range batch {
+		if _, err2 := s.q.Exec(`
+			INSERT INTO edges (project, source_id, target_id, type, properties)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT(source_id, target_id, type) DO UPDATE SET properties=excluded.properties`,
+			e.Project, e.SourceID, e.TargetID, e.Type, marshalProps(e.Properties)); err2 != nil {
+			skipped++
+		}
+	}
+	if skipped > 0 {
+		slog.Info("edges.batch.fk_skip", "skipped", skipped, "total", len(batch))
 	}
 	return nil
 }
@@ -199,17 +224,22 @@ func (s *Store) FindEdgesBySourceIDs(sourceIDs []int64, edgeTypes []string) (map
 			query += " AND type IN (" + strings.Join(typePH, ",") + ")"
 		}
 
-		rows, err := s.q.Query(query, args...)
-		if err != nil {
-			return nil, fmt.Errorf("find edges by source ids: %w", err)
-		}
-		edges, err := scanEdges(rows)
-		rows.Close()
-		if err != nil {
+		if err := func() error {
+			rows, err := s.q.Query(query, args...)
+			if err != nil {
+				return fmt.Errorf("find edges by source ids: %w", err)
+			}
+			defer rows.Close()
+			edges, err := scanEdges(rows)
+			if err != nil {
+				return err
+			}
+			for _, e := range edges {
+				result[e.SourceID] = append(result[e.SourceID], e)
+			}
+			return nil
+		}(); err != nil {
 			return nil, err
-		}
-		for _, e := range edges {
-			result[e.SourceID] = append(result[e.SourceID], e)
 		}
 	}
 	return result, nil
@@ -252,17 +282,22 @@ func (s *Store) FindEdgesByTargetIDs(targetIDs []int64, edgeTypes []string) (map
 			query += " AND type IN (" + strings.Join(typePH, ",") + ")"
 		}
 
-		rows, err := s.q.Query(query, args...)
-		if err != nil {
-			return nil, fmt.Errorf("find edges by target ids: %w", err)
-		}
-		edges, err := scanEdges(rows)
-		rows.Close()
-		if err != nil {
+		if err := func() error {
+			rows, err := s.q.Query(query, args...)
+			if err != nil {
+				return fmt.Errorf("find edges by target ids: %w", err)
+			}
+			defer rows.Close()
+			edges, err := scanEdges(rows)
+			if err != nil {
+				return err
+			}
+			for _, e := range edges {
+				result[e.TargetID] = append(result[e.TargetID], e)
+			}
+			return nil
+		}(); err != nil {
 			return nil, err
-		}
-		for _, e := range edges {
-			result[e.TargetID] = append(result[e.TargetID], e)
 		}
 	}
 	return result, nil

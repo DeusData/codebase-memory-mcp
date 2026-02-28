@@ -3,6 +3,7 @@ package store
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -21,6 +22,7 @@ type SearchParams struct {
 	ExcludeEntryPoints bool     // when true, exclude nodes with is_entry_point=true
 	IncludeConnected   bool     // when true, load connected node names (expensive, off by default)
 	ExcludeLabels      []string // labels to exclude from results
+	SortBy             string   // "relevance" (default), "name", "degree"
 }
 
 // SearchResult is a node with edge degree info.
@@ -123,8 +125,11 @@ func (s *Store) Search(params *SearchParams) (*SearchOutput, error) {
 	if needsNameScan || hasDegreeFilter {
 		sqlLimit = 200000 // must cover full dataset for accurate Go-side filtering
 	} else {
-		// Fetch enough for offset + limit
-		sqlLimit = params.Offset + params.Limit
+		// Scan beyond offset+limit so total/has_more are accurate.
+		// The +1000 buffer ensures has_more is correct for result sets
+		// up to ~1000 beyond the requested page, at negligible cost
+		// (~2 extra batch degree queries ≈ 20ms worst case).
+		sqlLimit = params.Offset + params.Limit + 1000
 		if sqlLimit > 200000 {
 			sqlLimit = 200000
 		}
@@ -170,6 +175,13 @@ func (s *Store) Search(params *SearchParams) (*SearchOutput, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Sort results before pagination
+	sortBy := params.SortBy
+	if sortBy == "" {
+		sortBy = "relevance"
+	}
+	sortSearchResults(allResults, sortBy, params.NamePattern)
 
 	total := len(allResults)
 
@@ -388,6 +400,73 @@ func extractLikeHints(pattern string) []string {
 		hints = append(hints, current.String())
 	}
 	return hints
+}
+
+// sortSearchResults sorts results based on the requested sort mode.
+func sortSearchResults(results []*SearchResult, sortBy, namePattern string) {
+	switch sortBy {
+	case "name":
+		slices.SortStableFunc(results, func(a, b *SearchResult) int {
+			return strings.Compare(a.Node.Name, b.Node.Name)
+		})
+	case "degree":
+		slices.SortStableFunc(results, func(a, b *SearchResult) int {
+			return (b.InDegree + b.OutDegree) - (a.InDegree + a.OutDegree) // descending
+		})
+	default: // "relevance"
+		literalQuery := extractLiteralQuery(namePattern)
+		lowerQuery := strings.ToLower(literalQuery)
+		slices.SortStableFunc(results, func(a, b *SearchResult) int {
+			return compareRelevance(a, b, literalQuery, lowerQuery)
+		})
+	}
+}
+
+// compareRelevance implements tiered relevance: exact match > prefix match > degree.
+func compareRelevance(a, b *SearchResult, literalQuery, lowerQuery string) int {
+	if literalQuery == "" {
+		return compareDegree(a, b)
+	}
+	// Tier 1: Exact name match (case-insensitive)
+	if cmp := compareBool(strings.EqualFold(a.Node.Name, literalQuery), strings.EqualFold(b.Node.Name, literalQuery)); cmp != 0 {
+		return cmp
+	}
+	// Tier 2: Prefix match
+	if cmp := compareBool(strings.HasPrefix(strings.ToLower(a.Node.Name), lowerQuery), strings.HasPrefix(strings.ToLower(b.Node.Name), lowerQuery)); cmp != 0 {
+		return cmp
+	}
+	return compareDegree(a, b)
+}
+
+// compareBool returns -1 if a is true and b is false, 1 if opposite, 0 if equal.
+func compareBool(a, b bool) int {
+	if a == b {
+		return 0
+	}
+	if a {
+		return -1
+	}
+	return 1
+}
+
+// compareDegree compares total degree descending (higher degree first).
+func compareDegree(a, b *SearchResult) int {
+	return (b.InDegree + b.OutDegree) - (a.InDegree + a.OutDegree)
+}
+
+// extractLiteralQuery returns the literal string from a regex pattern if it contains
+// no special regex syntax beyond leading/trailing .* anchors and (?i) flag.
+func extractLiteralQuery(pattern string) string {
+	if pattern == "" {
+		return ""
+	}
+	p := strings.TrimPrefix(pattern, "(?i)")
+	p = strings.TrimPrefix(p, ".*")
+	p = strings.TrimSuffix(p, ".*")
+	if strings.ContainsAny(p, ".*+?^${}()|[]\\") {
+		return ""
+	}
+	return p
 }
 
 // filterByNamePattern filters nodes by a regex name pattern.

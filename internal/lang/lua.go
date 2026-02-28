@@ -9,5 +9,7 @@ func init() {
 		ModuleNodeTypes:   []string{"chunk"},
 		CallNodeTypes:     []string{"function_call"},
 		ImportNodeTypes:   []string{"function_call"},
+
+		BranchingNodeTypes: []string{"if_statement", "for_statement", "for_in_statement", "while_statement", "repeat_statement"},
 	})
 }

@@ -28,32 +28,38 @@ func (s *Server) handleSearchGraph(_ context.Context, req *mcp.CallToolRequest) 
 		IncludeConnected:   getBoolArg(args, "include_connected"),
 	}
 
-	// Parse exclude_labels array
+	// Parse exclude_labels array; default to excluding Community nodes
 	if rawLabels, ok := args["exclude_labels"]; ok {
 		if labelArr, ok := rawLabels.([]any); ok {
 			for _, l := range labelArr {
-				if s, ok := l.(string); ok {
-					params.ExcludeLabels = append(params.ExcludeLabels, s)
+				if str, ok := l.(string); ok {
+					params.ExcludeLabels = append(params.ExcludeLabels, str)
 				}
 			}
 		}
+	} else {
+		params.ExcludeLabels = []string{"Community"}
 	}
 
-	projectFilter := getStringArg(args, "project")
+	params.SortBy = getStringArg(args, "sort_by")
 
-	projects, err := s.store.ListProjects()
+	st, err := s.resolveStore(getStringArg(args, "project"))
 	if err != nil {
-		return errResult(fmt.Sprintf("list projects: %v", err)), nil
+		return errResult(fmt.Sprintf("resolve store: %v", err)), nil
 	}
 
-	if len(projects) == 0 {
-		return jsonResult(map[string]any{
-			"message": "no projects indexed",
-			"results": []any{},
-		}), nil
+	projName := s.resolveProjectName(getStringArg(args, "project"))
+	projects, _ := st.ListProjects()
+	if len(projects) > 0 {
+		projName = projects[0].Name
 	}
 
-	// Search across matching projects, collect results
+	params.Project = projName
+	output, searchErr := st.Search(params)
+	if searchErr != nil {
+		return errResult(fmt.Sprintf("search: %v", searchErr)), nil
+	}
+
 	type resultEntry struct {
 		Project        string   `json:"project"`
 		Name           string   `json:"name"`
@@ -67,40 +73,31 @@ func (s *Server) handleSearchGraph(_ context.Context, req *mcp.CallToolRequest) 
 		ConnectedNames []string `json:"connected_names,omitempty"`
 	}
 
-	var allResults []resultEntry
-	totalAcrossProjects := 0
-	for _, p := range projects {
-		if projectFilter != "" && p.Name != projectFilter {
-			continue
-		}
-		params.Project = p.Name
-		output, searchErr := s.store.Search(params)
-		if searchErr != nil {
-			continue
-		}
-		totalAcrossProjects += output.Total
-		for _, r := range output.Results {
-			entry := resultEntry{
-				Project:        p.Name,
-				Name:           r.Node.Name,
-				QualifiedName:  r.Node.QualifiedName,
-				Label:          r.Node.Label,
-				FilePath:       r.Node.FilePath,
-				StartLine:      r.Node.StartLine,
-				EndLine:        r.Node.EndLine,
-				InDegree:       r.InDegree,
-				OutDegree:      r.OutDegree,
-				ConnectedNames: r.ConnectedNames,
-			}
-			allResults = append(allResults, entry)
-		}
+	results := make([]resultEntry, 0, len(output.Results))
+	for _, r := range output.Results {
+		results = append(results, resultEntry{
+			Project:        projName,
+			Name:           r.Node.Name,
+			QualifiedName:  r.Node.QualifiedName,
+			Label:          r.Node.Label,
+			FilePath:       r.Node.FilePath,
+			StartLine:      r.Node.StartLine,
+			EndLine:        r.Node.EndLine,
+			InDegree:       r.InDegree,
+			OutDegree:      r.OutDegree,
+			ConnectedNames: r.ConnectedNames,
+		})
 	}
 
-	return jsonResult(map[string]any{
-		"total":    totalAcrossProjects,
+	responseData := map[string]any{
+		"total":    output.Total,
 		"limit":    params.Limit,
 		"offset":   params.Offset,
-		"has_more": params.Offset+params.Limit < totalAcrossProjects,
-		"results":  allResults,
-	}), nil
+		"has_more": params.Offset+params.Limit < output.Total,
+		"results":  results,
+	}
+	s.addIndexStatus(responseData)
+	s.addUpdateNotice(responseData)
+
+	return jsonResult(responseData), nil
 }

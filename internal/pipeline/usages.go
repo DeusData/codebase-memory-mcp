@@ -179,6 +179,11 @@ func (p *Pipeline) resolveFileUsages(relPath string, cached *cachedAST) []resolv
 			return false
 		}
 
+		// Skip Variable targets — handled by passReadsWrites (READS/WRITES edges)
+		if p.registry.LabelOf(targetQN) == "Variable" {
+			return false
+		}
+
 		if targetQN == callerQN {
 			return false
 		}

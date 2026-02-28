@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/DeusData/codebase-memory-mcp/internal/store"
@@ -25,19 +26,19 @@ func main() {
 		os.Exit(runCLI(os.Args[2:]))
 	}
 
-	s, err := store.Open("codebase-memory")
+	router, err := store.NewRouter()
 	if err != nil {
-		log.Fatalf("store open err=%v", err)
+		log.Fatalf("store router err=%v", err)
 	}
 
-	srv := tools.NewServer(s)
+	srv := tools.NewServer(router)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	srv.StartWatcher(ctx)
 
 	runErr := srv.MCPServer().Run(ctx, &mcp.StdioTransport{})
 	cancel()
-	s.Close()
+	router.CloseAll()
 	if runErr != nil {
 		log.Fatalf("server err=%v", runErr)
 	}
@@ -56,14 +57,15 @@ func runCLI(args []string) int {
 		}
 	}
 
+	router, err := store.NewRouter()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	defer router.CloseAll()
+
 	if len(positional) == 0 || positional[0] == "--help" || positional[0] == "-h" {
-		s, err := store.Open("codebase-memory")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			return 1
-		}
-		srv := tools.NewServer(s)
-		s.Close()
+		srv := tools.NewServer(router)
 		fmt.Fprintf(os.Stderr, "Usage: codebase-memory-mcp cli [--raw] <tool_name> [json_args]\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n  --raw    Print full JSON output (default: human-friendly summary)\n\n")
 		fmt.Fprintf(os.Stderr, "Available tools:\n  %s\n", strings.Join(srv.ToolNames(), "\n  "))
@@ -72,14 +74,12 @@ func runCLI(args []string) int {
 
 	toolName := positional[0]
 
-	s, err := store.Open("codebase-memory")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 1
-	}
-	defer s.Close()
+	srv := tools.NewServer(router)
 
-	srv := tools.NewServer(s)
+	// In CLI mode, try to set session root from cwd
+	if cwd, cwdErr := os.Getwd(); cwdErr == nil {
+		srv.SetSessionRoot(cwd)
+	}
 
 	var argsJSON json.RawMessage
 	if len(positional) > 1 {
@@ -116,7 +116,8 @@ func runCLI(args []string) int {
 	}
 
 	// Summary mode (default): print a human-friendly summary
-	printSummary(toolName, text, s.DBPath())
+	dbPath := filepath.Join(router.Dir(), srv.SessionProject()+".db")
+	printSummary(toolName, text, dbPath)
 	return 0
 }
 
@@ -170,6 +171,8 @@ func printSummary(toolName, text, dbPath string) {
 		printListDirSummary(data)
 	case "ingest_traces":
 		printIngestSummary(data, dbPath)
+	case "index_status":
+		printIndexStatusSummary(data)
 	default:
 		// Fallback: pretty-print the JSON
 		printRawJSON(text)
@@ -181,7 +184,7 @@ func printArraySummary(toolName string, arr []any, dbPath string) {
 	case "list_projects":
 		if len(arr) == 0 {
 			fmt.Println("No projects indexed.")
-			fmt.Printf("  db: %s\n", dbPath)
+			fmt.Printf("  db_dir: %s\n", filepath.Dir(dbPath))
 			return
 		}
 		fmt.Printf("%d project(s) indexed:\n", len(arr))
@@ -195,12 +198,19 @@ func printArraySummary(toolName string, arr []any, dbPath string) {
 			edges := jsonInt(m["edges"])
 			indexedAt, _ := m["indexed_at"].(string)
 			rootPath, _ := m["root_path"].(string)
-			fmt.Printf("  %-30s %d nodes, %d edges  (indexed %s)\n", name, nodes, edges, indexedAt)
+			isSession, _ := m["is_session_project"].(bool)
+			sessionMarker := ""
+			if isSession {
+				sessionMarker = " *"
+			}
+			fmt.Printf("  %-30s %d nodes, %d edges  (indexed %s)%s\n", name, nodes, edges, indexedAt, sessionMarker)
 			if rootPath != "" {
 				fmt.Printf("  %-30s %s\n", "", rootPath)
 			}
+			if dbp, ok := m["db_path"].(string); ok {
+				fmt.Printf("  %-30s %s\n", "", dbp)
+			}
 		}
-		fmt.Printf("\n  db: %s\n", dbPath)
 	default:
 		fmt.Printf("%d result(s)\n", len(arr))
 		printRawJSON(mustJSON(arr))
@@ -422,6 +432,49 @@ func printIngestSummary(data map[string]any, dbPath string) {
 	total := jsonInt(data["total_spans"])
 	fmt.Printf("Ingested %d span(s): %d matched, %d boosted\n", total, matched, boosted)
 	fmt.Printf("  db: %s\n", dbPath)
+}
+
+func printIndexStatusSummary(data map[string]any) {
+	project, _ := data["project"].(string)
+	status, _ := data["status"].(string)
+
+	switch status {
+	case "no_session":
+		msg, _ := data["message"].(string)
+		fmt.Println(msg)
+	case "not_indexed":
+		fmt.Printf("Project %q: not indexed\n", project)
+		if dbPath, ok := data["db_path"].(string); ok {
+			fmt.Printf("  expected db: %s\n", dbPath)
+		}
+	case "partial":
+		fmt.Printf("Project %q: partially indexed (metadata missing)\n", project)
+	case "indexing":
+		fmt.Printf("Project %q: indexing in progress\n", project)
+		if elapsed, ok := data["index_elapsed_seconds"]; ok {
+			fmt.Printf("  elapsed: %ds\n", jsonInt(elapsed))
+		}
+		if indexType, ok := data["index_type"].(string); ok {
+			fmt.Printf("  type: %s\n", indexType)
+		}
+	case "ready":
+		nodes := jsonInt(data["nodes"])
+		edges := jsonInt(data["edges"])
+		indexedAt, _ := data["indexed_at"].(string)
+		indexType, _ := data["index_type"].(string)
+		isSession, _ := data["is_session_project"].(bool)
+		fmt.Printf("Project %q: ready (%d nodes, %d edges)\n", project, nodes, edges)
+		fmt.Printf("  indexed_at: %s\n", indexedAt)
+		fmt.Printf("  index_type: %s\n", indexType)
+		if isSession {
+			fmt.Printf("  session_project: true\n")
+		}
+		if dbPath, ok := data["db_path"].(string); ok {
+			fmt.Printf("  db: %s\n", dbPath)
+		}
+	default:
+		printRawJSON(mustJSON(data))
+	}
 }
 
 // jsonInt extracts an integer from a JSON-decoded value (float64 or int).

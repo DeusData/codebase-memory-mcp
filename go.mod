@@ -32,3 +32,5 @@ require (
 	golang.org/x/sys v0.37.0 // indirect
 	golang.org/x/tools v0.38.0 // indirect
 )
+
+replace github.com/tree-sitter/go-tree-sitter => github.com/DeusData/go-tree-sitter v0.26.0-deusdata.1

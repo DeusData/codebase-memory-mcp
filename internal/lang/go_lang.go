@@ -11,5 +11,10 @@ func init() {
 		CallNodeTypes:     []string{"call_expression"},
 		ImportNodeTypes:   []string{"import_declaration"},
 		ImportFromTypes:   []string{"import_declaration"},
+
+		BranchingNodeTypes:  []string{"if_statement", "for_statement", "switch_expression", "select_statement", "case_clause", "default_clause"},
+		VariableNodeTypes:   []string{"var_declaration", "const_declaration"},
+		AssignmentNodeTypes: []string{"assignment_statement", "short_var_declaration"},
+		EnvAccessFunctions:  []string{"os.Getenv", "os.LookupEnv"},
 	})
 }

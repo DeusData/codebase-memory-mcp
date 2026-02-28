@@ -28,7 +28,7 @@ func (s *Server) handleReadFile(_ context.Context, req *mcp.CallToolRequest) (*m
 	// Resolve relative path against project root
 	absPath := filePath
 	if !filepath.IsAbs(filePath) {
-		root, rootErr := s.resolveProjectRoot()
+		root, rootErr := s.resolveProjectRoot("")
 		if rootErr != nil {
 			return errResult(fmt.Sprintf("resolve root: %v", rootErr)), nil
 		}
@@ -102,7 +102,8 @@ func (s *Server) handleListDirectory(_ context.Context, req *mcp.CallToolRequest
 	// Resolve relative path against project root
 	absPath := dirPath
 	if dirPath == "" || !filepath.IsAbs(dirPath) {
-		root, rootErr := s.resolveProjectRoot()
+		project := getStringArg(args, "project")
+		root, rootErr := s.resolveProjectRoot(project)
 		if rootErr != nil {
 			return errResult(fmt.Sprintf("resolve root: %v", rootErr)), nil
 		}
@@ -191,9 +192,31 @@ func listDirChildren(absPath string) ([]dirEntry, error) {
 	return entries, nil
 }
 
-// resolveProjectRoot finds the first indexed project root path.
-func (s *Server) resolveProjectRoot() (string, error) {
-	projects, err := s.store.ListProjects()
+// resolveProjectRoot finds a project root path by name or from session.
+func (s *Server) resolveProjectRoot(project string) (string, error) {
+	if project == "*" || project == "all" {
+		return "", fmt.Errorf("cross-project queries are not supported; use list_projects to find a specific project name, or omit the project parameter to use the current session project")
+	}
+
+	// Use session root if available and no specific project requested
+	if project == "" && s.sessionRoot != "" {
+		return s.sessionRoot, nil
+	}
+
+	projName := s.resolveProjectName(project)
+	if projName == "" {
+		return "", fmt.Errorf("no projects indexed")
+	}
+	if !s.router.HasProject(projName) {
+		return "", fmt.Errorf("project %q not found; use list_projects to see available projects", projName)
+	}
+
+	st, err := s.router.ForProject(projName)
+	if err != nil {
+		return "", err
+	}
+
+	projects, err := st.ListProjects()
 	if err != nil {
 		return "", err
 	}

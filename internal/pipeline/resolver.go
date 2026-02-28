@@ -183,6 +183,13 @@ func (r *FunctionRegistry) FuzzyResolve(calleeName, moduleQN string) (string, bo
 	return "", false
 }
 
+// LabelOf returns the node label for a qualified name, or "" if not registered.
+func (r *FunctionRegistry) LabelOf(qualifiedName string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.exact[qualifiedName]
+}
+
 // Exists returns true if a qualified name is registered.
 // Uses RLock for concurrent read safety.
 func (r *FunctionRegistry) Exists(qualifiedName string) bool {

@@ -23,5 +23,8 @@ func init() {
 			"function_call_expression",
 			"nullsafe_member_call_expression",
 		},
+
+		BranchingNodeTypes: []string{"if_statement", "for_statement", "foreach_statement", "while_statement", "switch_statement", "case_statement", "try_statement", "catch_clause"},
+		ThrowNodeTypes:     []string{"throw_expression"},
 	})
 }

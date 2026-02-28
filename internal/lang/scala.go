@@ -19,5 +19,8 @@ func init() {
 		},
 		ImportNodeTypes: []string{"import_declaration"},
 		ImportFromTypes: []string{"import_declaration"},
+
+		BranchingNodeTypes: []string{"if_expression", "for_expression", "while_expression", "match_expression", "case_clause", "try_expression", "catch_clause"},
+		ThrowNodeTypes:     []string{"throw_expression"},
 	})
 }

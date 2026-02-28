@@ -36,6 +36,23 @@ type LanguageSpec struct {
 	ImportNodeTypes   []string
 	ImportFromTypes   []string
 	PackageIndicators []string
+
+	// BranchingNodeTypes lists AST node kinds counted for complexity metric.
+	BranchingNodeTypes []string
+	// VariableNodeTypes lists module-level variable declaration node kinds.
+	VariableNodeTypes []string
+	// AssignmentNodeTypes lists assignment expression/statement node kinds.
+	AssignmentNodeTypes []string
+	// ThrowNodeTypes lists throw/raise statement node kinds.
+	ThrowNodeTypes []string
+	// ThrowsClauseField is the field name for declared throws (e.g. Java "throws").
+	ThrowsClauseField string
+	// DecoratorNodeTypes lists decorator/annotation node kinds.
+	DecoratorNodeTypes []string
+	// EnvAccessFunctions lists function names used to read env vars (e.g. "os.Getenv").
+	EnvAccessFunctions []string
+	// EnvAccessMemberPatterns lists member access patterns for env vars (e.g. "process.env").
+	EnvAccessMemberPatterns []string
 }
 
 // registry maps file extensions to language specs.

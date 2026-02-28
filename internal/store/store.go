@@ -62,12 +62,18 @@ func cacheDir() (string, error) {
 	return dir, nil
 }
 
-// Open opens or creates a SQLite database for the given project.
+// Open opens or creates a SQLite database for the given project in the default cache dir.
 func Open(project string) (*Store, error) {
 	dir, err := cacheDir()
 	if err != nil {
 		return nil, err
 	}
+	dbPath := filepath.Join(dir, project+".db")
+	return OpenPath(dbPath)
+}
+
+// OpenInDir opens or creates a SQLite database for the given project in a specific directory.
+func OpenInDir(dir, project string) (*Store, error) {
 	dbPath := filepath.Join(dir, project+".db")
 	return OpenPath(dbPath)
 }

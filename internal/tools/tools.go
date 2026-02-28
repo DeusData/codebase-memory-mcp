@@ -4,9 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/DeusData/codebase-memory-mcp/internal/pipeline"
 	"github.com/DeusData/codebase-memory-mcp/internal/store"
@@ -14,30 +23,49 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// Version is the current release version, referenced by MCP handshake and update checker.
+const Version = "0.2.0"
+
+// releaseURL is the GitHub API endpoint for latest release. Package-level var for test injection.
+var releaseURL = "https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest"
+
 // Server wraps the MCP server with tool handlers.
 type Server struct {
 	mcp      *mcp.Server
-	store    *store.Store
+	router   *store.StoreRouter
 	watcher  *watcher.Watcher
 	indexMu  sync.Mutex
 	handlers map[string]mcp.ToolHandler
+
+	// Session-aware fields (set once via sync.Once, then immutable)
+	sessionOnce    sync.Once
+	sessionRoot    string // absolute path from client
+	sessionProject string // filepath.Base(sessionRoot)
+	indexStatus    atomic.Value
+	indexStartedAt atomic.Value // time.Time — when current/last index started
+	updateNotice   atomic.Value // string — set once by checkForUpdate, cleared after first injection
 }
 
 // NewServer creates a new MCP server with all tools registered.
-func NewServer(s *store.Store) *Server {
+func NewServer(r *store.StoreRouter) *Server {
 	srv := &Server{
-		store: s,
-		mcp: mcp.NewServer(
-			&mcp.Implementation{
-				Name:    "codebase-memory-mcp",
-				Version: "0.1.3",
-			},
-			nil,
-		),
+		router:   r,
 		handlers: make(map[string]mcp.ToolHandler),
 	}
+
+	srv.mcp = mcp.NewServer(
+		&mcp.Implementation{
+			Name:    "codebase-memory-mcp",
+			Version: Version,
+		},
+		&mcp.ServerOptions{
+			InitializedHandler:      srv.onInitialized,
+			RootsListChangedHandler: srv.onRootsChanged,
+		},
+	)
+
 	srv.registerTools()
-	srv.watcher = watcher.New(s, srv.syncProject)
+	srv.watcher = watcher.New(r, srv.syncProject)
 	return srv
 }
 
@@ -49,13 +77,17 @@ func (s *Server) StartWatcher(ctx context.Context) {
 
 // syncProject is called by the watcher when file changes are detected.
 // Uses TryLock to skip if an index operation is already in progress.
-func (s *Server) syncProject(_, rootPath string) error {
+func (s *Server) syncProject(projectName, rootPath string) error {
 	if !s.indexMu.TryLock() {
 		slog.Debug("watcher.skip", "path", rootPath, "reason", "index_in_progress")
 		return nil
 	}
 	defer s.indexMu.Unlock()
-	p := pipeline.New(s.store, rootPath)
+	st, err := s.router.ForProject(projectName)
+	if err != nil {
+		return fmt.Errorf("store for %s: %w", projectName, err)
+	}
+	p := pipeline.New(st, rootPath)
 	return p.Run()
 }
 
@@ -64,7 +96,234 @@ func (s *Server) MCPServer() *mcp.Server {
 	return s.mcp
 }
 
-// addTool registers a tool in both the MCP server and the local dispatch map.
+// Router returns the underlying StoreRouter for direct access (e.g. CLI mode).
+func (s *Server) Router() *store.StoreRouter {
+	return s.router
+}
+
+// SessionProject returns the auto-detected session project name (may be empty).
+func (s *Server) SessionProject() string {
+	return s.sessionProject
+}
+
+// SetSessionRoot sets the session root path directly (for CLI mode).
+func (s *Server) SetSessionRoot(rootPath string) {
+	s.sessionOnce.Do(func() {
+		s.sessionRoot = rootPath
+		if rootPath != "" {
+			s.sessionProject = filepath.Base(rootPath)
+		}
+	})
+	go s.checkForUpdate()
+}
+
+// --- Session detection ---
+
+// onInitialized is called when the client sends notifications/initialized.
+func (s *Server) onInitialized(ctx context.Context, req *mcp.InitializedRequest) {
+	s.sessionOnce.Do(func() {
+		s.sessionRoot = s.detectSessionRoot(ctx, req.Session)
+		if s.sessionRoot != "" {
+			s.sessionProject = filepath.Base(s.sessionRoot)
+			s.startAutoIndex()
+		}
+	})
+	go s.checkForUpdate()
+}
+
+// onRootsChanged re-detects session root if not yet set.
+func (s *Server) onRootsChanged(ctx context.Context, req *mcp.RootsListChangedRequest) {
+	s.sessionOnce.Do(func() {
+		s.sessionRoot = s.detectSessionRoot(ctx, req.Session)
+		if s.sessionRoot != "" {
+			s.sessionProject = filepath.Base(s.sessionRoot)
+			s.startAutoIndex()
+		}
+	})
+	go s.checkForUpdate()
+}
+
+// detectSessionRoot tries multiple fallback strategies to find the project root.
+func (s *Server) detectSessionRoot(ctx context.Context, session *mcp.ServerSession) string {
+	// 1. Try MCP roots protocol
+	if session != nil {
+		result, err := session.ListRoots(ctx, nil)
+		if err == nil && len(result.Roots) > 0 {
+			uri := result.Roots[0].URI
+			if path, ok := parseFileURI(uri); ok {
+				slog.Info("session.root.from_roots", "path", path)
+				return path
+			}
+		}
+	}
+
+	// 2. Fall back to process working directory
+	if cwd, err := os.Getwd(); err == nil && cwd != "/" && cwd != os.Getenv("HOME") {
+		slog.Info("session.root.from_cwd", "path", cwd)
+		return cwd
+	}
+
+	// 3. Fall back to single indexed project from DB
+	projects, err := s.router.ListProjects()
+	if err == nil && len(projects) == 1 && projects[0].RootPath != "" {
+		slog.Info("session.root.from_db", "path", projects[0].RootPath)
+		return projects[0].RootPath
+	}
+
+	slog.Info("session.root.none", "reason", "no_roots_no_cwd_no_single_project")
+	return ""
+}
+
+// parseFileURI extracts a filesystem path from a file:// URI.
+func parseFileURI(uri string) (string, bool) {
+	u, err := url.Parse(uri)
+	if err != nil || u.Scheme != "file" {
+		return "", false
+	}
+	return u.Path, true
+}
+
+// startAutoIndex triggers background indexing for the session project.
+func (s *Server) startAutoIndex() {
+	hasDB := s.router.HasProject(s.sessionProject)
+
+	if !hasDB {
+		s.indexStatus.Store("indexing")
+	} else {
+		s.indexStatus.Store("ready")
+	}
+
+	go func() {
+		if !s.indexMu.TryLock() {
+			slog.Debug("autoindex.skip", "reason", "index_in_progress")
+			return
+		}
+		defer s.indexMu.Unlock()
+
+		s.indexStartedAt.Store(time.Now())
+		if !hasDB {
+			s.indexStatus.Store("indexing")
+		}
+
+		st, err := s.router.ForProject(s.sessionProject)
+		if err != nil {
+			slog.Warn("autoindex.store.err", "err", err)
+			return
+		}
+		p := pipeline.New(st, s.sessionRoot)
+		if err := p.Run(); err != nil {
+			slog.Warn("autoindex.err", "err", err)
+			return
+		}
+		s.indexStatus.Store("ready")
+		slog.Info("autoindex.done", "project", s.sessionProject)
+	}()
+}
+
+// --- Store routing ---
+
+// resolveStore returns the Store for the given project, or the session project if empty.
+func (s *Server) resolveStore(project string) (*store.Store, error) {
+	if project == "*" || project == "all" {
+		return nil, fmt.Errorf("cross-project queries are not supported; use list_projects to find a specific project name, or omit the project parameter to use the current session project")
+	}
+	if project == "" {
+		project = s.sessionProject
+	}
+	if project == "" {
+		return nil, fmt.Errorf("no project specified and no session project detected; pass project parameter")
+	}
+	if !s.router.HasProject(project) {
+		return nil, fmt.Errorf("project %q not found; use list_projects to see available projects", project)
+	}
+	return s.router.ForProject(project)
+}
+
+// resolveProjectName returns the effective project name for routing.
+func (s *Server) resolveProjectName(project string) string {
+	if project == "" {
+		return s.sessionProject
+	}
+	return project
+}
+
+// addIndexStatus adds the index_status field to response data if indexing is in progress.
+func (s *Server) addIndexStatus(data map[string]any) {
+	status, _ := s.indexStatus.Load().(string)
+	if status == "indexing" {
+		data["index_status"] = "indexing"
+	}
+}
+
+// addUpdateNotice injects update_available into the first tool response, then clears itself.
+func (s *Server) addUpdateNotice(data map[string]any) {
+	if notice, ok := s.updateNotice.Load().(string); ok && notice != "" {
+		data["update_available"] = notice
+		s.updateNotice.Store("")
+	}
+}
+
+// checkForUpdate fetches the latest GitHub release and stores a notice if newer.
+func (s *Server) checkForUpdate() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", releaseURL, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return
+	}
+
+	var release struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.Unmarshal(body, &release); err != nil {
+		return
+	}
+
+	latest := strings.TrimPrefix(release.TagName, "v")
+	if latest == "" || latest == Version {
+		return
+	}
+	if compareVersions(latest, Version) > 0 {
+		s.updateNotice.Store(fmt.Sprintf(
+			"v%s → v%s available. Update: go install github.com/DeusData/codebase-memory-mcp/cmd/codebase-memory-mcp@v%s",
+			Version, latest, latest))
+	}
+}
+
+// compareVersions compares two semver strings (e.g. "0.2.1" vs "0.2.0").
+// Returns >0 if a > b, <0 if a < b, 0 if equal.
+func compareVersions(a, b string) int {
+	aParts := strings.Split(a, ".")
+	bParts := strings.Split(b, ".")
+	for i := 0; i < len(aParts) && i < len(bParts); i++ {
+		ai, _ := strconv.Atoi(aParts[i])
+		bi, _ := strconv.Atoi(bParts[i])
+		if ai != bi {
+			return ai - bi
+		}
+	}
+	return len(aParts) - len(bParts)
+}
+
+// --- Tool registration ---
+
 func (s *Server) addTool(tool *mcp.Tool, handler mcp.ToolHandler) {
 	s.mcp.AddTool(tool, handler)
 	s.handlers[tool.Name] = handler
@@ -116,13 +375,13 @@ func (s *Server) registerGraphTools() {
 func (s *Server) registerIndexAndTraceTool() {
 	s.addTool(&mcp.Tool{
 		Name:        "index_repository",
-		Description: "Index a repository into the code graph. Parses source files, extracts functions/classes/modules, resolves call relationships (CALLS), read references (USAGE), interface implementations (IMPLEMENTS + OVERRIDE), HTTP/async cross-service links, and git history change coupling (FILE_CHANGES_WITH). Supports incremental reindex via content hashing. Auto-sync keeps the graph fresh after initial indexing.",
+		Description: "Index a repository into the code graph. Parses source files, extracts functions/classes/modules, resolves call relationships (CALLS), read references (USAGE), interface implementations (IMPLEMENTS + OVERRIDE), HTTP/async cross-service links, and git history change coupling (FILE_CHANGES_WITH). Supports incremental reindex via content hashing. Auto-sync keeps the graph fresh after initial indexing. If repo_path is omitted, uses the auto-detected session project root.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
 				"repo_path": {
 					"type": "string",
-					"description": "Absolute path to the repository to index. If omitted, uses the configured project root."
+					"description": "Absolute path to the repository to index. If omitted, uses the auto-detected session project root."
 				}
 			}
 		}`),
@@ -130,7 +389,7 @@ func (s *Server) registerIndexAndTraceTool() {
 
 	s.addTool(&mcp.Tool{
 		Name:        "trace_call_path",
-		Description: "Trace call paths from/to a function. Requires EXACT function name — if unsure, call search_graph(name_pattern=...) first to discover the correct name. Returns hop-by-hop callees/callers with edge types (CALLS, HTTP_CALLS, ASYNC_CALLS, USAGE, OVERRIDE). USAGE edges indicate read references (callbacks, variable assignments) rather than invocations. OVERRIDE edges link struct methods to the interface methods they implement. Use depth=1 first, increase only if needed. IMPORTANT: Use direction='both' for full cross-service context — HTTP_CALLS edges from other services appear as inbound edges on backend functions, so direction='outbound' alone misses cross-service callers. For async dispatch (Cloud Tasks, Pub/Sub), find dispatch functions via search_graph(name_pattern='.*CreateTask.*') then trace via CALLS edges. If the function is not found, use search_graph with a name_pattern regex to find similar names before retrying.",
+		Description: "Trace the call path of a function (who calls it, what it calls). Requires exact function name — use search_graph first to find the exact name. Follow up with get_code_snippet to read the actual source code. Returns hop-by-hop callees/callers with edge types (CALLS, HTTP_CALLS, ASYNC_CALLS, USAGE, OVERRIDE). If the function is not found, returns suggestions of similar names — use the qualified_name from suggestions in a retry. Use depth=1 first, increase only if needed. Use direction='both' for full cross-service context — HTTP_CALLS edges from other services appear as inbound edges, so direction='outbound' alone misses cross-service callers. Best practice: search_graph(name_pattern='.*Order.*') → trace_call_path(function_name='processOrder') → get_code_snippet(qualified_name='...')",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -146,6 +405,10 @@ func (s *Server) registerIndexAndTraceTool() {
 					"type": "string",
 					"description": "Traversal direction: 'outbound' (what it calls), 'inbound' (what calls it), or 'both'",
 					"enum": ["outbound", "inbound", "both"]
+				},
+				"project": {
+					"type": "string",
+					"description": "Project to trace in. Defaults to session project."
 				}
 			},
 			"required": ["function_name"]
@@ -157,7 +420,15 @@ func (s *Server) registerSchemaAndSnippetTools() {
 	s.addTool(&mcp.Tool{
 		Name:        "get_graph_schema",
 		Description: "Return the schema of the indexed code graph: node label counts, edge type counts, relationship patterns (e.g. Function-CALLS->Function), and sample function/class names. Use to understand what's in the graph before querying.",
-		InputSchema: json.RawMessage(`{"type": "object"}`),
+		InputSchema: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"project": {
+					"type": "string",
+					"description": "Project to get schema for. Defaults to session project."
+				}
+			}
+		}`),
 	}, s.handleGetGraphSchema)
 
 	s.addTool(&mcp.Tool{
@@ -169,6 +440,10 @@ func (s *Server) registerSchemaAndSnippetTools() {
 				"qualified_name": {
 					"type": "string",
 					"description": "Fully qualified name of the node (e.g. 'myproject.cmd.server.main.HandleRequest')"
+				},
+				"project": {
+					"type": "string",
+					"description": "Project to search in. Defaults to session project."
 				}
 			},
 			"required": ["qualified_name"]
@@ -179,13 +454,13 @@ func (s *Server) registerSchemaAndSnippetTools() {
 func (s *Server) registerSearchTools() {
 	s.addTool(&mcp.Tool{
 		Name:        "search_graph",
-		Description: "Search the code graph for nodes. Returns 10 results per page (use offset to paginate, has_more indicates more pages). For dead code: use relationship='CALLS', direction='inbound', max_degree=0, exclude_entry_points=true. For fan-out: use relationship='CALLS', direction='outbound', min_degree=N. Route nodes: properties.handler contains the actual handler function name. Prefer this over query_graph for counting — no row cap. IMPORTANT: The 'relationship' filter counts how many edges of that type each node has (degree filtering) — it does NOT return the actual edges. To list cross-service HTTP_CALLS or ASYNC_CALLS edges with their properties (url_path, confidence), use query_graph with Cypher instead: MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_path, r.confidence. Relationship types: CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD, HANDLES, CONTAINS_FILE, CONTAINS_FOLDER, CONTAINS_PACKAGE, IMPLEMENTS, OVERRIDE, USAGE, FILE_CHANGES_WITH.",
+		Description: "Search the code knowledge graph for functions, classes, modules, routes, and other code elements. Returns nodes matching the criteria with their connectivity (in/out degree). Results are sorted by relevance by default (exact match first, prefix match second, then by connectivity). Community nodes are excluded by default. Pass exclude_labels: [] to include them. Best practice: Chain with trace_call_path and get_code_snippet for complete answers. Example workflow: search_graph(name_pattern='.*Order.*') → trace_call_path(function_name='processOrder') → get_code_snippet(qualified_name='...'). Returns 10 results per page (use offset to paginate, has_more indicates more pages). For dead code: use relationship='CALLS', direction='inbound', max_degree=0, exclude_entry_points=true. For fan-out: use relationship='CALLS', direction='outbound', min_degree=N. Route nodes: properties.handler contains the actual handler function name. Prefer this over query_graph for counting — no row cap. IMPORTANT: The 'relationship' filter counts how many edges of that type each node has (degree filtering) — it does NOT return the actual edges. To list cross-service HTTP_CALLS or ASYNC_CALLS edges with their properties, use query_graph with Cypher instead. Relationship types: CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD, HANDLES, CONTAINS_FILE, CONTAINS_FOLDER, CONTAINS_PACKAGE, IMPLEMENTS, OVERRIDE, USAGE, FILE_CHANGES_WITH.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
 				"project": {
 					"type": "string",
-					"description": "Filter by project name. If omitted, searches all indexed projects."
+					"description": "Project to search in. Defaults to session project."
 				},
 				"label": {
 					"type": "string",
@@ -235,7 +510,12 @@ func (s *Server) registerSearchTools() {
 				"exclude_labels": {
 					"type": "array",
 					"items": {"type": "string"},
-					"description": "Labels to exclude from results (e.g. ['Route'] to filter out route noise when searching by name_pattern)"
+					"description": "Labels to exclude from results. Community nodes are excluded by default — pass [] to include them."
+				},
+				"sort_by": {
+					"type": "string",
+					"enum": ["relevance", "name", "degree"],
+					"description": "Sort order. Default: relevance (exact match first, prefix match second, then by connectivity)"
 				}
 			}
 		}`),
@@ -266,6 +546,10 @@ func (s *Server) registerSearchTools() {
 				"offset": {
 					"type": "integer",
 					"description": "Skip N matches for pagination (default: 0). Check has_more in response."
+				},
+				"project": {
+					"type": "string",
+					"description": "Project to search in. Defaults to session project."
 				}
 			},
 			"required": ["pattern"]
@@ -283,6 +567,10 @@ func (s *Server) registerQueryTool() {
 				"query": {
 					"type": "string",
 					"description": "Cypher query, e.g. MATCH (f:Function)-[:CALLS]->(g:Function) WHERE f.name = 'main' RETURN g.name, g.qualified_name LIMIT 20"
+				},
+				"project": {
+					"type": "string",
+					"description": "Project to query. Defaults to session project."
 				}
 			},
 			"required": ["query"]
@@ -292,7 +580,6 @@ func (s *Server) registerQueryTool() {
 
 // registerFileTools registers tools for file and directory operations.
 func (s *Server) registerFileTools() {
-	// 8. read_file
 	s.addTool(&mcp.Tool{
 		Name:        "read_file",
 		Description: "Read any file from the indexed project. Supports line range selection for large files. Use for reading config files (Dockerfile, go.mod, requirements.txt), source code, or any text file.",
@@ -316,7 +603,6 @@ func (s *Server) registerFileTools() {
 		}`),
 	}, s.handleReadFile)
 
-	// 9. list_directory
 	s.addTool(&mcp.Tool{
 		Name:        "list_directory",
 		Description: "List files and subdirectories in a directory. Supports glob patterns for filtering. Use for exploring project structure.",
@@ -330,6 +616,10 @@ func (s *Server) registerFileTools() {
 				"pattern": {
 					"type": "string",
 					"description": "Glob pattern to filter entries (e.g. '*.go', '*.py')"
+				},
+				"project": {
+					"type": "string",
+					"description": "Project name to resolve root from. Defaults to session project."
 				}
 			}
 		}`),
@@ -338,17 +628,15 @@ func (s *Server) registerFileTools() {
 
 // registerProjectTools registers tools for project management.
 func (s *Server) registerProjectTools() {
-	// 6. list_projects
 	s.addTool(&mcp.Tool{
 		Name:        "list_projects",
 		Description: "List all indexed projects with their indexed_at timestamp, root path, and node/edge counts.",
 		InputSchema: json.RawMessage(`{"type": "object"}`),
 	}, s.handleListProjects)
 
-	// 7. delete_project
 	s.addTool(&mcp.Tool{
 		Name:        "delete_project",
-		Description: "Delete an indexed project and all its graph data (nodes, edges, file hashes). This action is irreversible.",
+		Description: "Delete an indexed project and all its graph data (nodes, edges, file hashes). Removes the project's .db file. This action is irreversible.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -360,7 +648,23 @@ func (s *Server) registerProjectTools() {
 			"required": ["project_name"]
 		}`),
 	}, s.handleDeleteProject)
+
+	s.addTool(&mcp.Tool{
+		Name:        "index_status",
+		Description: "Check the indexing status of a project. Returns whether the project is indexed, currently indexing, or not found. Shows last indexed timestamp, node/edge counts, and whether the index is initial or incremental. Use this to check if the graph is ready for queries.",
+		InputSchema: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"project": {
+					"type": "string",
+					"description": "Project name to check. Defaults to the auto-detected session project."
+				}
+			}
+		}`),
+	}, s.handleIndexStatus)
 }
+
+// --- Helpers ---
 
 // jsonResult marshals data to JSON and returns as tool result.
 func jsonResult(data any) *mcp.CallToolResult {
@@ -403,11 +707,11 @@ func getStringArg(args map[string]any, key string) string {
 	if !ok {
 		return ""
 	}
-	s, ok := v.(string)
+	str, ok := v.(string)
 	if !ok {
 		return ""
 	}
-	return s
+	return str
 }
 
 // getIntArg extracts an integer argument with a default value.
@@ -436,14 +740,30 @@ func getBoolArg(args map[string]any, key string) bool {
 	return b
 }
 
-// findNodeAcrossProjects searches all projects for a node by simple name.
-func (s *Server) findNodeAcrossProjects(name string) (*store.Node, string, error) {
-	projects, err := s.store.ListProjects()
-	if err != nil {
-		return nil, "", fmt.Errorf("list projects: %w", err)
+// findNodeAcrossProjects searches for a node by simple name in the specified project.
+// Falls back to the session project if no filter is given.
+func (s *Server) findNodeAcrossProjects(name string, projectFilter ...string) (*store.Node, string, error) {
+	filter := s.sessionProject
+	if len(projectFilter) > 0 && projectFilter[0] != "" {
+		if projectFilter[0] == "*" || projectFilter[0] == "all" {
+			return nil, "", fmt.Errorf("cross-project queries are not supported; use list_projects to find a specific project name, or omit the project parameter to use the current session project")
+		}
+		filter = projectFilter[0]
 	}
+	if filter == "" {
+		return nil, "", fmt.Errorf("no project specified and no session project detected")
+	}
+	if !s.router.HasProject(filter) {
+		return nil, "", fmt.Errorf("project %q not found; use list_projects to see available projects", filter)
+	}
+
+	st, err := s.router.ForProject(filter)
+	if err != nil {
+		return nil, "", err
+	}
+	projects, _ := st.ListProjects()
 	for _, p := range projects {
-		nodes, findErr := s.store.FindNodesByName(p.Name, name)
+		nodes, findErr := st.FindNodesByName(p.Name, name)
 		if findErr != nil {
 			continue
 		}
@@ -454,14 +774,30 @@ func (s *Server) findNodeAcrossProjects(name string) (*store.Node, string, error
 	return nil, "", fmt.Errorf("node not found: %s", name)
 }
 
-// findNodeByQNAcrossProjects searches all projects for a node by qualified name.
-func (s *Server) findNodeByQNAcrossProjects(qn string) (*store.Node, string, error) {
-	projects, err := s.store.ListProjects()
-	if err != nil {
-		return nil, "", fmt.Errorf("list projects: %w", err)
+// findNodeByQNAcrossProjects searches for a node by qualified name in the specified project.
+// Falls back to the session project if no filter is given.
+func (s *Server) findNodeByQNAcrossProjects(qn string, projectFilter ...string) (*store.Node, string, error) {
+	filter := s.sessionProject
+	if len(projectFilter) > 0 && projectFilter[0] != "" {
+		if projectFilter[0] == "*" || projectFilter[0] == "all" {
+			return nil, "", fmt.Errorf("cross-project queries are not supported; use list_projects to find a specific project name, or omit the project parameter to use the current session project")
+		}
+		filter = projectFilter[0]
 	}
+	if filter == "" {
+		return nil, "", fmt.Errorf("no project specified and no session project detected")
+	}
+	if !s.router.HasProject(filter) {
+		return nil, "", fmt.Errorf("project %q not found; use list_projects to see available projects", filter)
+	}
+
+	st, err := s.router.ForProject(filter)
+	if err != nil {
+		return nil, "", err
+	}
+	projects, _ := st.ListProjects()
 	for _, p := range projects {
-		node, findErr := s.store.FindNodeByQN(p.Name, qn)
+		node, findErr := st.FindNodeByQN(p.Name, qn)
 		if findErr != nil {
 			continue
 		}
