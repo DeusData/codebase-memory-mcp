@@ -171,6 +171,41 @@ namespace MyApp {
 	}
 }
 
+
+func TestParseRuby(t *testing.T) {
+	source := []byte(`class Greeter
+  def greet(name)
+	"Hello, #{name}"
+  end`)
+	tree, err := Parse(lang.Ruby, source)
+	if err != nil {
+		t.Fatalf("Parse Ruby: %v", err)
+	}
+	defer tree.Close()
+
+	root := tree.RootNode()
+	if root == nil {
+		t.Fatal("root node is nil")
+	}
+
+	var classCount, methodCount int
+	Walk(root, func(n *tree_sitter.Node) bool {
+		switch n.Kind() {
+		case "class":
+			classCount++
+		case "method":
+			methodCount++
+		}
+		return true
+	})
+	if classCount != 1 {
+		t.Errorf("expected 1 class, got %d", classCount)
+	}
+	if methodCount != 1 {
+		t.Errorf("expected 1 method, got %d", methodCount)
+	}
+}
+
 func TestNodeText(t *testing.T) {
 	source := []byte(`package main
 

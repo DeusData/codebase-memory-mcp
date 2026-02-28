@@ -16,9 +16,9 @@ import (
 	tree_sitter_rust "github.com/tree-sitter/tree-sitter-rust/bindings/go"
 	tree_sitter_scala "github.com/tree-sitter/tree-sitter-scala/bindings/go"
 	tree_sitter_typescript "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
-
 	tree_sitter_kotlin "github.com/tree-sitter-grammars/tree-sitter-kotlin/bindings/go"
 	tree_sitter_lua "github.com/tree-sitter-grammars/tree-sitter-lua/bindings/go"
+	tree_sitter_ruby "github.com/tree-sitter/tree-sitter-ruby/bindings/go"
 
 	"github.com/DeusData/codebase-memory-mcp/internal/lang"
 )
@@ -45,6 +45,7 @@ func initLanguages() {
 			lang.Lua:        tree_sitter.NewLanguage(tree_sitter_lua.Language()),
 			lang.Scala:      tree_sitter.NewLanguage(tree_sitter_scala.Language()),
 			lang.Kotlin:     tree_sitter.NewLanguage(tree_sitter_kotlin.Language()),
+			lang.Ruby:       tree_sitter.NewLanguage(tree_sitter_ruby.Language()),
 		}
 
 		parserPools = make(map[lang.Language]*sync.Pool, len(languages))

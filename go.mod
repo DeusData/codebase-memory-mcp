@@ -18,6 +18,7 @@ require (
 	github.com/tree-sitter/tree-sitter-rust v0.24.0
 	github.com/tree-sitter/tree-sitter-scala v0.24.0
 	github.com/tree-sitter/tree-sitter-typescript v0.23.2
+	github.com/tree-sitter/tree-sitter-ruby v0.23.1
 	github.com/zeebo/xxh3 v1.1.0
 	golang.org/x/sync v0.17.0
 	gopkg.in/yaml.v3 v3.0.1
