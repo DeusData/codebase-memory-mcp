@@ -16,12 +16,13 @@ const (
 	PHP        Language = "php"
 	Lua        Language = "lua"
 	Scala      Language = "scala"
+	Kotlin     Language = "kotlin"
 	JSON       Language = "json" // Not in AllLanguages(); no LanguageSpec or tree-sitter grammar
 )
 
 // AllLanguages returns all supported languages.
 func AllLanguages() []Language {
-	return []Language{Python, JavaScript, TypeScript, TSX, Go, Rust, Java, CPP, CSharp, PHP, Lua, Scala}
+	return []Language{Python, JavaScript, TypeScript, TSX, Go, Rust, Java, CPP, CSharp, PHP, Lua, Scala, Kotlin}
 }
 
 // LanguageSpec defines the tree-sitter node types for a language.

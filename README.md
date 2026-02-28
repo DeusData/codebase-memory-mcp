@@ -8,7 +8,7 @@ Parses source code with [tree-sitter](https://tree-sitter.github.io/tree-sitter/
 
 ## Features
 
-- **12 languages**: Python, Go, JavaScript, TypeScript, TSX, Rust, Java, C++, C#, PHP, Lua, Scala
+- **13 languages**: Python, Go, JavaScript, TypeScript, TSX, Rust, Java, C++, C#, PHP, Lua, Scala, Kotlin
 - **Fast**: Sub-millisecond graph queries, incremental reindex 4x faster than full scan, optimized SQLite with LIKE pre-filtering for regex searches
 - **Call graph**: Resolves function calls across files and packages (import-aware, type-inferred)
 - **Cross-service HTTP linking**: Discovers REST routes (FastAPI, Gin, Express) and matches them to HTTP call sites with confidence scoring
@@ -577,7 +577,7 @@ make install  # go install
 cmd/codebase-memory-mcp/  Entry point (MCP stdio server + CLI mode)
 internal/
   store/                  SQLite graph storage (nodes, edges, traversal, search)
-  lang/                   Language specs (12 languages, tree-sitter node types)
+  lang/                   Language specs (13 languages, tree-sitter node types)
   parser/                 Tree-sitter grammar loading and AST parsing
   pipeline/               4-pass indexing (structure -> definitions -> calls -> HTTP links)
   httplink/               Cross-service HTTP route/call-site matching

@@ -20,6 +20,8 @@ func TestForExtension(t *testing.T) {
 		{".php", PHP},
 		{".lua", Lua},
 		{".scala", Scala},
+		{".kt", Kotlin},
+		{".kts", Kotlin},
 	}
 	for _, tt := range tests {
 		spec := ForExtension(tt.ext)
@@ -73,5 +75,45 @@ func TestPythonSpec(t *testing.T) {
 	}
 	if spec.PackageIndicators[0] != "__init__.py" {
 		t.Errorf("Python PackageIndicators: got %v, want [__init__.py]", spec.PackageIndicators)
+	}
+}
+
+func TestKotlinSpec(t *testing.T) {
+	spec := ForLanguage(Kotlin)
+	if spec == nil {
+		t.Fatal("Kotlin spec not registered")
+	}
+	// Should have .kt and .kts extensions
+	if len(spec.FileExtensions) != 2 {
+		t.Errorf("Kotlin FileExtensions: got %d, want 2", len(spec.FileExtensions))
+	}
+	extSet := map[string]bool{}
+	for _, ext := range spec.FileExtensions {
+		extSet[ext] = true
+	}
+	if !extSet[".kt"] || !extSet[".kts"] {
+		t.Errorf("Kotlin FileExtensions missing .kt or .kts: %v", spec.FileExtensions)
+	}
+	// Should contain function_declaration, secondary_constructor, anonymous_function
+	if len(spec.FunctionNodeTypes) != 3 {
+		t.Errorf("Kotlin FunctionNodeTypes: got %d, want 3", len(spec.FunctionNodeTypes))
+	}
+	found := map[string]bool{}
+	for _, nt := range spec.FunctionNodeTypes {
+		found[nt] = true
+	}
+	if !found["function_declaration"] || !found["secondary_constructor"] || !found["anonymous_function"] {
+		t.Errorf("Kotlin FunctionNodeTypes missing expected types: %v", spec.FunctionNodeTypes)
+	}
+	// Should contain class_declaration, object_declaration, companion_object
+	if len(spec.ClassNodeTypes) != 3 {
+		t.Errorf("Kotlin ClassNodeTypes: got %d, want 3", len(spec.ClassNodeTypes))
+	}
+	classFound := map[string]bool{}
+	for _, nt := range spec.ClassNodeTypes {
+		classFound[nt] = true
+	}
+	if !classFound["class_declaration"] || !classFound["object_declaration"] || !classFound["companion_object"] {
+		t.Errorf("Kotlin ClassNodeTypes missing expected types: %v", spec.ClassNodeTypes)
 	}
 }

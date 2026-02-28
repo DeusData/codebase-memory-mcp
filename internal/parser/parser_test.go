@@ -75,6 +75,49 @@ class MyClass:
 	}
 }
 
+func TestParseKotlin(t *testing.T) {
+	source := []byte(`fun greet(name: String): String {
+    return "Hello, $name"
+}
+
+class MyService {
+    fun process(): Unit {}
+}
+
+object Singleton {
+    fun instance(): Singleton = this
+}
+`)
+	tree, err := Parse(lang.Kotlin, source)
+	if err != nil {
+		t.Fatalf("Parse Kotlin: %v", err)
+	}
+	defer tree.Close()
+
+	root := tree.RootNode()
+	var funcCount, classCount, objectCount int
+	Walk(root, func(n *tree_sitter.Node) bool {
+		switch n.Kind() {
+		case "function_declaration":
+			funcCount++
+		case "class_declaration":
+			classCount++
+		case "object_declaration":
+			objectCount++
+		}
+		return true
+	})
+	if funcCount != 3 {
+		t.Errorf("expected 3 function_declarations, got %d", funcCount)
+	}
+	if classCount != 1 {
+		t.Errorf("expected 1 class_declaration, got %d", classCount)
+	}
+	if objectCount != 1 {
+		t.Errorf("expected 1 object_declaration, got %d", objectCount)
+	}
+}
+
 func TestAllLanguagesLoad(t *testing.T) {
 	for _, l := range lang.AllLanguages() {
 		_, err := GetLanguage(l)

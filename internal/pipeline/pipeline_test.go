@@ -488,6 +488,92 @@ type (
 	}
 }
 
+// TestPipelineKotlinProject verifies that Kotlin files are parsed and indexed
+// correctly, producing Function, Class, and Method nodes with CALLS edges.
+func TestPipelineKotlinProject(t *testing.T) {
+	dir, err := os.MkdirTemp("", "cgm-kt-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	writeFile(t, filepath.Join(dir, "Main.kt"), `
+fun greet(name: String): String {
+    return "Hello, $name"
+}
+
+fun main() {
+    val result = greet("world")
+    println(result)
+}
+`)
+
+	writeFile(t, filepath.Join(dir, "Service.kt"), `
+class OrderService {
+    fun processOrder(id: String): Boolean {
+        return true
+    }
+
+    fun submitOrder(order: String): Boolean {
+        return processOrder(order)
+    }
+}
+
+object Config {
+    val API_URL = "https://example.com/api"
+}
+`)
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	p := New(s, dir)
+	if err := p.Run(); err != nil {
+		t.Fatalf("Pipeline.Run: %v", err)
+	}
+
+	funcs, _ := s.FindNodesByLabel(p.ProjectName, "Function")
+	t.Logf("Kotlin functions: %d", len(funcs))
+	if len(funcs) < 2 { // greet, main
+		t.Errorf("expected at least 2 functions, got %d", len(funcs))
+	}
+
+	classes, _ := s.FindNodesByLabel(p.ProjectName, "Class")
+	t.Logf("Kotlin classes: %d", len(classes))
+	// OrderService + Config (object_declaration)
+	if len(classes) < 1 {
+		t.Errorf("expected at least 1 class, got %d", len(classes))
+	}
+
+	methods, _ := s.FindNodesByLabel(p.ProjectName, "Method")
+	t.Logf("Kotlin methods: %d", len(methods))
+	if len(methods) < 2 { // processOrder, submitOrder
+		t.Errorf("expected at least 2 methods, got %d", len(methods))
+	}
+
+	// Check that greet exists
+	found, _ := s.FindNodesByName(p.ProjectName, "greet")
+	if len(found) == 0 {
+		t.Error("greet not found")
+	}
+
+	// Check modules exist
+	modules, _ := s.FindNodesByLabel(p.ProjectName, "Module")
+	if len(modules) < 2 {
+		t.Errorf("expected at least 2 modules, got %d", len(modules))
+	}
+
+	// Check edges exist
+	edgeCount, _ := s.CountEdges(p.ProjectName)
+	t.Logf("Total edges: %d", edgeCount)
+	if edgeCount == 0 {
+		t.Error("expected edges, got 0")
+	}
+}
+
 // TestFunctionRegistry tests the registry in isolation.
 func TestFunctionRegistry(t *testing.T) {
 	r := NewFunctionRegistry()
