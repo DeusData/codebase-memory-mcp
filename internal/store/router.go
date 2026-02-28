@@ -48,7 +48,7 @@ func NewRouter() (*StoreRouter, error) {
 // NewRouterWithDir creates a StoreRouter using a custom directory (for testing).
 // No migration is run.
 func NewRouterWithDir(dir string) (*StoreRouter, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("mkdir: %w", err)
 	}
 	return &StoreRouter{
