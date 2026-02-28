@@ -7,6 +7,10 @@ on:
         description: "Release version (e.g. v0.0.2)"
         required: true
         type: string
+      release_notes:
+        description: "Release notes (optional — auto-generated from commits if empty)"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -135,4 +139,5 @@ jobs:
             *.tar.gz
             *.zip
             checksums.txt
-          generate_release_notes: true
+          body: ${{ inputs.release_notes || '' }}
+          generate_release_notes: ${{ inputs.release_notes == '' }}
