@@ -16,7 +16,7 @@ permissions:
   contents: write
 
 jobs:
-  lint-and-test:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,11 +31,8 @@ jobs:
           install-mode: goinstall
           args: --timeout=5m
 
-      - name: Run tests
-        run: go test ./...
-
   build-unix:
-    needs: [lint-and-test]
+    needs: [lint]
     strategy:
       matrix:
         include:
@@ -59,6 +56,9 @@ jobs:
         with:
           go-version: "1.26"
 
+      - name: Run tests
+        run: go test ./...
+
       - name: Build binary
         run: |
           CGO_ENABLED=1 go build \
@@ -75,7 +75,7 @@ jobs:
           path: "*.tar.gz"
 
   build-windows:
-    needs: [lint-and-test]
+    needs: [lint]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -89,6 +89,13 @@ jobs:
           msystem: UCRT64
           path-type: inherit
           install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Run tests
+        shell: msys2 {0}
+        run: |
+          which go
+          go version
+          go test ./...
 
       - name: Build binary
         shell: msys2 {0}
