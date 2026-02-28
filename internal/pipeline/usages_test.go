@@ -165,3 +165,100 @@ func TestIsKeywordOrBuiltin(t *testing.T) {
 		}
 	}
 }
+
+func TestPassUsagesKotlinCreatesEdges(t *testing.T) {
+	// Create a Kotlin file that defines two functions, where one references
+	// the other as a variable (callback) rather than calling it.
+	ktSource := `fun process(data: String): String {
+    return data
+}
+
+fun register() {
+    val handler = ::process
+}
+`
+	tmpDir := t.TempDir()
+	ktPath := filepath.Join(tmpDir, "Main.kt")
+	if err := os.WriteFile(ktPath, []byte(ktSource), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	p := New(s, tmpDir)
+	if err := p.Run(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Look for USAGE edges
+	edges, err := s.FindEdgesByType(p.ProjectName, "USAGE")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("USAGE edges: %d", len(edges))
+	for _, e := range edges {
+		src, _ := s.FindNodeByID(e.SourceID)
+		tgt, _ := s.FindNodeByID(e.TargetID)
+		if src != nil && tgt != nil {
+			t.Logf("  USAGE: %s -> %s", src.Name, tgt.Name)
+		}
+	}
+}
+
+func TestPassUsagesKotlinDoesNotDuplicateCalls(t *testing.T) {
+	// When a Kotlin function is called (not just referenced), only a CALLS edge
+	// should exist, not a USAGE edge for the call expression.
+	ktSource := `fun helper(): String {
+    return "ok"
+}
+
+fun main() {
+    helper()
+}
+`
+	tmpDir := t.TempDir()
+	ktPath := filepath.Join(tmpDir, "Main.kt")
+	if err := os.WriteFile(ktPath, []byte(ktSource), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	p := New(s, tmpDir)
+	if err := p.Run(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should have CALLS edge from main to helper
+	callEdges, _ := s.FindEdgesByType(p.ProjectName, "CALLS")
+	foundCall := false
+	for _, e := range callEdges {
+		src, _ := s.FindNodeByID(e.SourceID)
+		tgt, _ := s.FindNodeByID(e.TargetID)
+		if src != nil && tgt != nil && src.Name == "main" && tgt.Name == "helper" {
+			foundCall = true
+		}
+	}
+	if !foundCall {
+		t.Error("expected CALLS edge from main to helper")
+	}
+
+	// Should NOT have USAGE edge from main to helper (it's a call, not a reference)
+	usageEdges, _ := s.FindEdgesByType(p.ProjectName, "USAGE")
+	for _, e := range usageEdges {
+		src, _ := s.FindNodeByID(e.SourceID)
+		tgt, _ := s.FindNodeByID(e.TargetID)
+		if src != nil && tgt != nil && src.Name == "main" && tgt.Name == "helper" {
+			t.Error("should NOT have USAGE edge from main to helper — it's a call, not a reference")
+		}
+	}
+}

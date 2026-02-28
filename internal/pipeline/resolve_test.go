@@ -204,6 +204,22 @@ val url = baseUrl + "/api/orders"
 	assertSymbol(t, symbols, "url", "https://example.com/api/orders")
 }
 
+func TestResolveKotlinChained(t *testing.T) {
+	// 3-level chaining: A → B → C
+	code := `val host = "https://api.example.com"
+val base = host + "/v1"
+val endpoint = base + "/orders"
+`
+	tree, source := parseSource(t, lang.Kotlin, code)
+	defer tree.Close()
+
+	symbols := resolveModuleStrings(tree.RootNode(), source, lang.Kotlin)
+
+	assertSymbol(t, symbols, "host", "https://api.example.com")
+	assertSymbol(t, symbols, "base", "https://api.example.com/v1")
+	assertSymbol(t, symbols, "endpoint", "https://api.example.com/v1/orders")
+}
+
 func TestResolveUnknownVariable(t *testing.T) {
 	// When a variable can't be resolved, it should emit {}
 	code := `URL = f"{UNKNOWN_VAR}/api/orders"
