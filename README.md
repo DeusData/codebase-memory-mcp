@@ -520,7 +520,6 @@ The skill files are embedded in the binary. If you prefer to install them manual
 - `cmd/codebase-memory-mcp/assets/skills/codebase-memory-quality/SKILL.md` → `~/.claude/skills/codebase-memory-quality/SKILL.md`
 - `cmd/codebase-memory-mcp/assets/skills/codebase-memory-reference/SKILL.md` → `~/.claude/skills/codebase-memory-reference/SKILL.md`
 
-Or add a CLAUDE.md snippet — see [`skills/codebase-memory-mcp.md`](skills/codebase-memory-mcp.md) for the full reference.
 
 </details>
 
