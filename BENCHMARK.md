@@ -1,4 +1,4 @@
-# Codebase Memory MCP -- v0.2.1 Language Benchmark
+# Codebase Memory MCP -- v0.3.0 Language Benchmark
 
 ## Methodology
 
