@@ -40,12 +40,15 @@ func runInstall(args []string) int {
 	// PATH check
 	ensurePATH(binaryPath, cfg)
 
-	// Claude Code
+	// Skills (always installed — no CLI dependency)
+	installSkills(cfg)
+
+	// Claude Code MCP registration
 	if claudePath := findCLI("claude"); claudePath != "" {
 		fmt.Printf("[Claude Code] detected (%s)\n", claudePath)
-		installClaudeCode(binaryPath, claudePath, cfg)
+		registerClaudeCodeMCP(binaryPath, claudePath, cfg)
 	} else {
-		fmt.Println("[Claude Code] not found — skipping")
+		fmt.Println("[Claude Code] not found — skipping MCP registration")
 	}
 
 	fmt.Println()
@@ -183,13 +186,15 @@ func detectShellRC() string {
 	}
 }
 
-// installClaudeCode installs skills and registers the MCP server with Claude Code.
-func installClaudeCode(binaryPath, claudePath string, cfg installConfig) {
+// installSkills writes the 4 skill files to ~/.claude/skills/ and removes old monolithic skill.
+func installSkills(cfg installConfig) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		fmt.Printf("  ⚠ Cannot determine home directory: %v\n", err)
 		return
 	}
+
+	fmt.Println("[Skills]")
 
 	// Remove old monolithic skill if it exists
 	oldSkillDir := filepath.Join(home, ".claude", "skills", "codebase-memory-mcp")
@@ -230,8 +235,10 @@ func installClaudeCode(binaryPath, claudePath string, cfg installConfig) {
 		}
 		fmt.Printf("  ✓ Skill: %s\n", skillFile)
 	}
+}
 
-	// Register MCP server — remove first for idempotency
+// registerClaudeCodeMCP registers the MCP server with Claude Code CLI.
+func registerClaudeCodeMCP(binaryPath, claudePath string, cfg installConfig) {
 	if cfg.dryRun {
 		fmt.Printf("  [dry-run] Would run: %s mcp remove codebase-memory-mcp\n", claudePath)
 		fmt.Printf("  [dry-run] Would run: %s mcp add --scope user codebase-memory-mcp -- %s\n", claudePath, binaryPath)
