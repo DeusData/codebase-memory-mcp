@@ -11,6 +11,11 @@ on:
         description: "Release notes (optional — auto-generated from commits if empty)"
         required: false
         type: string
+      replace:
+        description: "Replace existing release if it exists"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -128,10 +133,16 @@ jobs:
       - name: Generate checksums
         run: sha256sum *.tar.gz *.zip > checksums.txt
 
+      - name: Delete existing release
+        if: ${{ inputs.replace }}
+        run: gh release delete "${{ inputs.version }}" --yes --cleanup-tag || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Create tag
         run: |
-          git tag ${{ inputs.version }}
-          git push origin ${{ inputs.version }}
+          git tag -f ${{ inputs.version }}
+          git push origin ${{ inputs.version }} --force
 
       - uses: softprops/action-gh-release@v2
         with:
