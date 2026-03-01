@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -20,7 +21,11 @@ func TestMain(m *testing.M) {
 		panic("create temp dir: " + err.Error())
 	}
 
-	binPath := filepath.Join(tmpDir, "codebase-memory-mcp")
+	binName := "codebase-memory-mcp"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	binPath := filepath.Join(tmpDir, binName)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	cmd := exec.CommandContext(ctx, "go", "build", "-o", binPath, "./")
 	cmd.Dir = "."
@@ -45,6 +50,15 @@ func testCmd(t *testing.T, args ...string) *exec.Cmd {
 	return exec.CommandContext(ctx, testBinPath, args...)
 }
 
+// testEnvWithHome returns env vars with HOME (and USERPROFILE on Windows) set.
+func testEnvWithHome(home string, extra ...string) []string {
+	env := append(os.Environ(), "HOME="+home)
+	if runtime.GOOS == "windows" {
+		env = append(env, "USERPROFILE="+home)
+	}
+	return append(env, extra...)
+}
+
 func TestCLI_Version(t *testing.T) {
 	out, err := testCmd(t, "--version").CombinedOutput()
 	if err != nil {
@@ -59,7 +73,7 @@ func TestCLI_Version(t *testing.T) {
 func TestCLI_InstallDryRun(t *testing.T) {
 	home := t.TempDir()
 	cmd := testCmd(t, "install", "--dry-run")
-	cmd.Env = append(os.Environ(), "HOME="+home, "PATH="+t.TempDir())
+	cmd.Env = testEnvWithHome(home, "PATH="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("install --dry-run failed: %v\n%s", err, out)
@@ -78,7 +92,7 @@ func TestCLI_InstallDryRun(t *testing.T) {
 func TestCLI_UninstallDryRun(t *testing.T) {
 	home := t.TempDir()
 	cmd := testCmd(t, "uninstall", "--dry-run")
-	cmd.Env = append(os.Environ(), "HOME="+home, "PATH="+t.TempDir())
+	cmd.Env = testEnvWithHome(home, "PATH="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("uninstall --dry-run failed: %v\n%s", err, out)
@@ -116,7 +130,7 @@ func TestCLI_InstallAndUninstall(t *testing.T) {
 
 	// Install
 	cmd := testCmd(t, "install")
-	cmd.Env = append(os.Environ(), "HOME="+home, "PATH="+emptyPath, "SHELL=/bin/zsh")
+	cmd.Env = testEnvWithHome(home, "PATH="+emptyPath, "SHELL=/bin/zsh")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("install failed: %v\n%s", err, out)
@@ -138,7 +152,7 @@ func TestCLI_InstallAndUninstall(t *testing.T) {
 
 	// Uninstall
 	cmd = testCmd(t, "uninstall")
-	cmd.Env = append(os.Environ(), "HOME="+home, "PATH="+emptyPath)
+	cmd.Env = testEnvWithHome(home, "PATH="+emptyPath)
 	out, err = cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("uninstall failed: %v\n%s", err, out)
@@ -166,7 +180,7 @@ func TestCLI_InstallRemovesOldSkill(t *testing.T) {
 	}
 
 	cmd := testCmd(t, "install")
-	cmd.Env = append(os.Environ(), "HOME="+home, "PATH="+emptyPath, "SHELL=/bin/zsh")
+	cmd.Env = testEnvWithHome(home, "PATH="+emptyPath, "SHELL=/bin/zsh")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("install failed: %v\n%s", err, out)
@@ -186,7 +200,7 @@ func TestCLI_InstallIdempotent(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		cmd := testCmd(t, "install")
-		cmd.Env = append(os.Environ(), "HOME="+home, "PATH="+emptyPath, "SHELL=/bin/zsh")
+		cmd.Env = testEnvWithHome(home, "PATH="+emptyPath, "SHELL=/bin/zsh")
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("install round %d failed: %v\n%s", i, err, out)
@@ -204,7 +218,7 @@ func TestCLI_InstallForceOverwrites(t *testing.T) {
 	emptyPath := t.TempDir()
 
 	cmd := testCmd(t, "install")
-	cmd.Env = append(os.Environ(), "HOME="+home, "PATH="+emptyPath, "SHELL=/bin/zsh")
+	cmd.Env = testEnvWithHome(home, "PATH="+emptyPath, "SHELL=/bin/zsh")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("first install failed: %v\n%s", err, out)
 	}
@@ -215,7 +229,7 @@ func TestCLI_InstallForceOverwrites(t *testing.T) {
 	}
 
 	cmd = testCmd(t, "install")
-	cmd.Env = append(os.Environ(), "HOME="+home, "PATH="+emptyPath, "SHELL=/bin/zsh")
+	cmd.Env = testEnvWithHome(home, "PATH="+emptyPath, "SHELL=/bin/zsh")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("second install failed: %v\n%s", err, out)
@@ -226,7 +240,7 @@ func TestCLI_InstallForceOverwrites(t *testing.T) {
 	}
 
 	cmd = testCmd(t, "install", "--force")
-	cmd.Env = append(os.Environ(), "HOME="+home, "PATH="+emptyPath, "SHELL=/bin/zsh")
+	cmd.Env = testEnvWithHome(home, "PATH="+emptyPath, "SHELL=/bin/zsh")
 	out, err = cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("force install failed: %v\n%s", err, out)
@@ -238,12 +252,15 @@ func TestCLI_InstallForceOverwrites(t *testing.T) {
 }
 
 func TestCLI_InstallPATHAppend(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell RC PATH append is Unix-specific")
+	}
+
 	home := t.TempDir()
-	t.Setenv("SHELL", "/bin/zsh")
 	emptyPath := t.TempDir()
 
 	cmd := testCmd(t, "install")
-	cmd.Env = append(os.Environ(), "HOME="+home, "PATH="+emptyPath, "SHELL=/bin/zsh")
+	cmd.Env = testEnvWithHome(home, "PATH="+emptyPath, "SHELL=/bin/zsh")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("install failed: %v\n%s", err, out)

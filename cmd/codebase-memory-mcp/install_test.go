@@ -3,13 +3,31 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
 
+// setTestHome overrides the home directory for both Unix (HOME) and Windows (USERPROFILE).
+func setTestHome(t *testing.T, home string) {
+	t.Helper()
+	t.Setenv("HOME", home)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", home)
+	}
+}
+
+// exeSuffix returns ".exe" on Windows, empty string otherwise.
+func exeSuffix() string {
+	if runtime.GOOS == "windows" {
+		return ".exe"
+	}
+	return ""
+}
+
 func TestInstallSkillCreation(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 
 	claudeSkillsDir := filepath.Join(home, ".claude", "skills")
 
@@ -41,7 +59,8 @@ func TestInstallSkillCreation(t *testing.T) {
 		if len(data) == 0 {
 			t.Fatalf("skill file %s is empty", skillFile)
 		}
-		if !strings.HasPrefix(string(data), "---\n") {
+		normalized := strings.ReplaceAll(string(data), "\r\n", "\n")
+		if !strings.HasPrefix(normalized, "---\n") {
 			t.Fatalf("skill %s missing YAML frontmatter", name)
 		}
 		if !strings.Contains(string(data), "name: "+name) {
@@ -52,7 +71,7 @@ func TestInstallSkillCreation(t *testing.T) {
 
 func TestInstallIdempotent(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 
 	claudeSkillsDir := filepath.Join(home, ".claude", "skills")
 
@@ -79,7 +98,7 @@ func TestInstallIdempotent(t *testing.T) {
 
 func TestUninstallRemovesSkills(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 
 	claudeSkillsDir := filepath.Join(home, ".claude", "skills")
 
@@ -110,7 +129,7 @@ func TestUninstallRemovesSkills(t *testing.T) {
 
 func TestFindCLI_NotFound(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 
 	result := findCLI("nonexistent-binary-xyz")
 	if result != "" {
@@ -121,7 +140,7 @@ func TestFindCLI_NotFound(t *testing.T) {
 func TestFindCLI_FoundOnPATH(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	fakeBin := filepath.Join(tmpDir, "fakecli")
+	fakeBin := filepath.Join(tmpDir, "fakecli"+exeSuffix())
 	if err := os.WriteFile(fakeBin, []byte("#!/bin/sh\n"), 0o600); err != nil {
 		t.Fatalf("write fake binary: %v", err)
 	}
@@ -130,15 +149,19 @@ func TestFindCLI_FoundOnPATH(t *testing.T) {
 	}
 
 	t.Setenv("PATH", tmpDir)
-	result := findCLI("fakecli")
+	result := findCLI("fakecli" + exeSuffix())
 	if result == "" {
 		t.Fatal("expected to find fakecli on PATH")
 	}
 }
 
 func TestFindCLI_FallbackPaths(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fallback paths use Unix-specific locations")
+	}
+
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 	t.Setenv("PATH", t.TempDir())
 
 	localBin := filepath.Join(home, ".local", "bin")
@@ -173,8 +196,12 @@ func TestDetectBinaryPath(t *testing.T) {
 }
 
 func TestDetectShellRC(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell RC detection is Unix-specific")
+	}
+
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 
 	tests := []struct {
 		shell    string
@@ -201,8 +228,12 @@ func TestDetectShellRC(t *testing.T) {
 }
 
 func TestDetectShellRC_BashWithBashrc(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell RC detection is Unix-specific")
+	}
+
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 	t.Setenv("SHELL", "/bin/bash")
 
 	bashrc := filepath.Join(home, ".bashrc")
@@ -233,7 +264,7 @@ func TestDryRun(t *testing.T) {
 
 func TestCodexInstructionsCreation(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 
 	instrDir := filepath.Join(home, ".codex", "instructions")
 	instrFile := filepath.Join(instrDir, "codebase-memory-mcp.md")
@@ -284,7 +315,7 @@ func TestSkillFilesContent(t *testing.T) {
 
 func TestRemoveOldMonolithicSkill(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 
 	oldDir := filepath.Join(home, ".claude", "skills", "codebase-memory-mcp")
 	if err := os.MkdirAll(oldDir, 0o750); err != nil {
