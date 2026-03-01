@@ -240,11 +240,11 @@ func installSkills(cfg installConfig) {
 // registerClaudeCodeMCP registers the MCP server with Claude Code CLI.
 func registerClaudeCodeMCP(binaryPath, claudePath string, cfg installConfig) {
 	if cfg.dryRun {
-		fmt.Printf("  [dry-run] Would run: %s mcp remove codebase-memory-mcp\n", claudePath)
+		fmt.Printf("  [dry-run] Would run: %s mcp remove -s user codebase-memory-mcp\n", claudePath)
 		fmt.Printf("  [dry-run] Would run: %s mcp add --scope user codebase-memory-mcp -- %s\n", claudePath, binaryPath)
 	} else {
 		// Silent remove (may fail if not registered — that's fine)
-		_ = execCLI(claudePath, "mcp", "remove", "codebase-memory-mcp")
+		_ = execCLI(claudePath, "mcp", "remove", "-s", "user", "codebase-memory-mcp")
 		if err := execCLI(claudePath, "mcp", "add", "--scope", "user", "codebase-memory-mcp", "--", binaryPath); err != nil {
 			fmt.Printf("  ⚠ MCP registration failed: %v\n", err)
 		} else {
@@ -321,9 +321,9 @@ func removeClaudeSkills(cfg installConfig) {
 // deregisterMCP removes the MCP server registration from a CLI.
 func deregisterMCP(cliPath, cliName string, cfg installConfig) {
 	if cfg.dryRun {
-		fmt.Printf("  [dry-run] Would run: %s mcp remove codebase-memory-mcp\n", cliPath)
+		fmt.Printf("  [dry-run] Would run: %s mcp remove -s user codebase-memory-mcp\n", cliPath)
 	} else {
-		if err := execCLI(cliPath, "mcp", "remove", "codebase-memory-mcp"); err != nil {
+		if err := execCLI(cliPath, "mcp", "remove", "-s", "user", "codebase-memory-mcp"); err != nil {
 			fmt.Printf("  ⚠ %s MCP deregistration: %v\n", cliName, err)
 		} else {
 			fmt.Printf("  ✓ %s MCP server deregistered\n", cliName)
