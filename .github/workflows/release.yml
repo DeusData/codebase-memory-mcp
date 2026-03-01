@@ -62,11 +62,11 @@ jobs:
         run: |
           CGO_ENABLED=1 go build \
             -ldflags "-X main.version=${{ inputs.version }}" \
-            -o codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }} \
+            -o codebase-memory-mcp \
             ./cmd/codebase-memory-mcp/
 
       - name: Create archive
-        run: tar -czf codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}
+        run: tar -czf codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz codebase-memory-mcp
 
       - uses: actions/upload-artifact@v4
         with:
@@ -101,12 +101,12 @@ jobs:
         run: |
           CGO_ENABLED=1 CC=gcc go build \
             -ldflags "-X main.version=${{ inputs.version }}" \
-            -o codebase-memory-mcp-windows-amd64.exe \
+            -o codebase-memory-mcp.exe \
             ./cmd/codebase-memory-mcp/
 
       - name: Create archive
         shell: pwsh
-        run: Compress-Archive -Path codebase-memory-mcp-windows-amd64.exe -DestinationPath codebase-memory-mcp-windows-amd64.zip
+        run: Compress-Archive -Path codebase-memory-mcp.exe -DestinationPath codebase-memory-mcp-windows-amd64.zip
 
       - uses: actions/upload-artifact@v4
         with:

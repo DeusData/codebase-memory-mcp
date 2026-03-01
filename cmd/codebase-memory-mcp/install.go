@@ -87,7 +87,7 @@ func runUninstall(args []string) int {
 	// Codex CLI MCP deregistration + instructions
 	if codexPath := findCLI("codex"); codexPath != "" {
 		fmt.Printf("[Codex CLI] detected (%s)\n", codexPath)
-		deregisterMCP(codexPath, "codex", cfg)
+		removeCodexMCP(cfg)
 		removeCodexInstructions(cfg)
 	}
 
@@ -254,23 +254,26 @@ func registerClaudeCodeMCP(binaryPath, claudePath string, cfg installConfig) {
 }
 
 // installCodex installs MCP registration and instructions for Codex CLI.
-func installCodex(binaryPath, codexPath string, cfg installConfig) {
+func installCodex(binaryPath, _ string, cfg installConfig) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		fmt.Printf("  ⚠ Cannot determine home directory: %v\n", err)
 		return
 	}
 
-	// Register MCP server
+	// Register MCP server via config.toml
+	configFile := filepath.Join(home, ".codex", "config.toml")
+	mcpSection := fmt.Sprintf("\n[mcp_servers.codebase-memory-mcp]\ncommand = %q\n", binaryPath)
+
 	if cfg.dryRun {
-		fmt.Printf("  [dry-run] Would run: %s mcp remove codebase-memory-mcp\n", codexPath)
-		fmt.Printf("  [dry-run] Would run: %s mcp add codebase-memory-mcp -- %s\n", codexPath, binaryPath)
+		fmt.Printf("  [dry-run] Would add MCP server to: %s\n", configFile)
 	} else {
-		_ = execCLI(codexPath, "mcp", "remove", "codebase-memory-mcp")
-		if err := execCLI(codexPath, "mcp", "add", "codebase-memory-mcp", "--", binaryPath); err != nil {
+		if err := os.MkdirAll(filepath.Dir(configFile), 0o750); err != nil {
+			fmt.Printf("  ⚠ mkdir %s: %v\n", filepath.Dir(configFile), err)
+		} else if err := upsertCodexMCP(configFile, mcpSection, binaryPath); err != nil {
 			fmt.Printf("  ⚠ MCP registration failed: %v\n", err)
 		} else {
-			fmt.Println("  ✓ MCP server registered")
+			fmt.Printf("  ✓ MCP server registered: %s\n", configFile)
 		}
 	}
 
@@ -291,6 +294,34 @@ func installCodex(binaryPath, codexPath string, cfg installConfig) {
 		}
 		fmt.Printf("  ✓ Instructions: %s\n", instrFile)
 	}
+}
+
+// upsertCodexMCP adds or updates the codebase-memory-mcp section in config.toml.
+func upsertCodexMCP(configFile, mcpSection, binaryPath string) error {
+	content, err := os.ReadFile(configFile)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	text := string(content)
+
+	// If section already exists, replace the command line
+	const sectionHeader = "[mcp_servers.codebase-memory-mcp]"
+	if idx := strings.Index(text, sectionHeader); idx >= 0 {
+		// Find the end of this section (next [ or EOF)
+		rest := text[idx+len(sectionHeader):]
+		endIdx := strings.Index(rest, "\n[")
+		if endIdx < 0 {
+			endIdx = len(rest)
+		}
+		newSection := fmt.Sprintf("%s\ncommand = %q\n", sectionHeader, binaryPath)
+		text = text[:idx] + newSection + rest[endIdx:]
+	} else {
+		// Append new section
+		text += mcpSection
+	}
+
+	return os.WriteFile(configFile, []byte(text), 0o600)
 }
 
 // removeClaudeSkills removes all 4 skill directories.
@@ -328,6 +359,46 @@ func deregisterMCP(cliPath, cliName string, cfg installConfig) {
 		} else {
 			fmt.Printf("  ✓ %s MCP server deregistered\n", cliName)
 		}
+	}
+}
+
+// removeCodexMCP removes the codebase-memory-mcp section from Codex config.toml.
+func removeCodexMCP(cfg installConfig) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	configFile := filepath.Join(home, ".codex", "config.toml")
+	content, err := os.ReadFile(configFile)
+	if err != nil {
+		return
+	}
+
+	text := string(content)
+	const sectionHeader = "[mcp_servers.codebase-memory-mcp]"
+	idx := strings.Index(text, sectionHeader)
+	if idx < 0 {
+		return
+	}
+
+	if cfg.dryRun {
+		fmt.Printf("  [dry-run] Would remove MCP section from: %s\n", configFile)
+		return
+	}
+
+	// Find end of section (next [ or EOF)
+	rest := text[idx+len(sectionHeader):]
+	endIdx := strings.Index(rest, "\n[")
+	if endIdx < 0 {
+		text = strings.TrimRight(text[:idx], "\n")
+	} else {
+		text = text[:idx] + rest[endIdx+1:]
+	}
+
+	if err := os.WriteFile(configFile, []byte(text), 0o600); err != nil {
+		fmt.Printf("  ⚠ update %s: %v\n", configFile, err)
+	} else {
+		fmt.Printf("  ✓ Removed MCP section from: %s\n", configFile)
 	}
 }
 

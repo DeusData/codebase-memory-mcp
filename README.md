@@ -72,12 +72,17 @@ Benchmarked on Apple M3 Pro, macOS Darwin 25.3.0:
 ## Quick Start
 
 1. **Download** the binary for your platform from the [latest release](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
-2. **Install**:
+2. **Extract and move** to a directory on your PATH:
+   ```bash
+   tar xzf codebase-memory-mcp-*.tar.gz
+   mv codebase-memory-mcp ~/.local/bin/   # or /usr/local/bin/
+   ```
+3. **Install**:
    ```bash
    codebase-memory-mcp install
    ```
-3. **Restart** Claude Code / Codex CLI
-4. Say **"Index this project"** — done.
+4. **Restart** Claude Code / Codex CLI
+5. Say **"Index this project"** — done.
 
 The `install` command auto-detects Claude Code and Codex CLI, registers the MCP server, installs 4 task-specific skills, and ensures the binary is on your PATH. Use `--dry-run` to preview without making changes.
 
