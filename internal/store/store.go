@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -95,8 +96,9 @@ func OpenPath(dbPath string) (*Store, error) {
 	db.SetMaxIdleConns(1)
 
 	// PRAGMAs not supported in mattn DSN — set via Exec after Open.
-	_, _ = db.Exec("PRAGMA temp_store = MEMORY")
-	_, _ = db.Exec("PRAGMA mmap_size = 1073741824") // 1 GB
+	ctx := context.Background()
+	_, _ = db.ExecContext(ctx, "PRAGMA temp_store = MEMORY")
+	_, _ = db.ExecContext(ctx, "PRAGMA mmap_size = 1073741824") // 1 GB
 
 	s := &Store{db: db, dbPath: dbPath}
 	s.q = s.db
@@ -115,7 +117,7 @@ func OpenMemory() (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open memory db: %w", err)
 	}
-	_, _ = db.Exec("PRAGMA temp_store = MEMORY")
+	_, _ = db.ExecContext(context.Background(), "PRAGMA temp_store = MEMORY")
 	s := &Store{db: db, dbPath: ":memory:"}
 	s.q = s.db
 	if err := s.initSchema(); err != nil {
@@ -129,8 +131,8 @@ func OpenMemory() (*Store, error) {
 // The callback receives a transaction-scoped Store — all store methods called on
 // txStore use the transaction. The receiver's q field is never mutated, so
 // concurrent read-only handlers (using s.q == s.db) are unaffected.
-func (s *Store) WithTransaction(fn func(txStore *Store) error) error {
-	tx, err := s.db.Begin()
+func (s *Store) WithTransaction(ctx context.Context, fn func(txStore *Store) error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
@@ -146,23 +148,23 @@ func (s *Store) WithTransaction(fn func(txStore *Store) error) error {
 // then runs PRAGMA optimize so the query planner has up-to-date statistics.
 // PRAGMA optimize (SQLite 3.46+) auto-limits sampling per index, only re-analyzing
 // stale stats. Cost is absorbed during indexing rather than the first read query.
-func (s *Store) Checkpoint() {
-	_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
-	_, _ = s.db.Exec("PRAGMA optimize")
+func (s *Store) Checkpoint(ctx context.Context) {
+	_, _ = s.db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
+	_, _ = s.db.ExecContext(ctx, "PRAGMA optimize")
 }
 
 // BeginBulkWrite switches to MEMORY journal mode for faster bulk writes.
 // Call EndBulkWrite when done to restore WAL mode.
 // MEMORY mode is rollback-safe on crash (unlike journal_mode=OFF).
-func (s *Store) BeginBulkWrite() {
-	_, _ = s.db.Exec("PRAGMA journal_mode = MEMORY")
-	_, _ = s.db.Exec("PRAGMA synchronous = OFF")
+func (s *Store) BeginBulkWrite(ctx context.Context) {
+	_, _ = s.db.ExecContext(ctx, "PRAGMA journal_mode = MEMORY")
+	_, _ = s.db.ExecContext(ctx, "PRAGMA synchronous = OFF")
 }
 
 // EndBulkWrite restores WAL journal mode and NORMAL synchronous after bulk writes.
-func (s *Store) EndBulkWrite() {
-	_, _ = s.db.Exec("PRAGMA synchronous = NORMAL")
-	_, _ = s.db.Exec("PRAGMA journal_mode = WAL")
+func (s *Store) EndBulkWrite(ctx context.Context) {
+	_, _ = s.db.ExecContext(ctx, "PRAGMA synchronous = NORMAL")
+	_, _ = s.db.ExecContext(ctx, "PRAGMA journal_mode = WAL")
 }
 
 // Close closes the database connection.
@@ -181,6 +183,7 @@ func (s *Store) DBPath() string {
 }
 
 func (s *Store) initSchema() error {
+	ctx := context.Background()
 	schema := `
 	CREATE TABLE IF NOT EXISTS projects (
 		name TEXT PRIMARY KEY,
@@ -229,7 +232,7 @@ func (s *Store) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(project, target_id, type);
 	CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(project, source_id, type);
 	`
-	_, err := s.db.Exec(schema)
+	_, err := s.db.ExecContext(ctx, schema)
 	if err != nil {
 		return err
 	}
@@ -238,9 +241,9 @@ func (s *Store) initSchema() error {
 	// Generated columns require SQLite 3.31.0+ (mattn/go-sqlite3 supports this).
 	// We check if the column already exists to make this idempotent.
 	var colCount int
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_xinfo('edges') WHERE name='url_path_gen'`).Scan(&colCount)
+	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_xinfo('edges') WHERE name='url_path_gen'`).Scan(&colCount)
 	if colCount == 0 {
-		_, err = s.db.Exec(`ALTER TABLE edges ADD COLUMN url_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties, '$.url_path'))`)
+		_, err = s.db.ExecContext(ctx, `ALTER TABLE edges ADD COLUMN url_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties, '$.url_path'))`)
 		if err != nil {
 			// If generated columns aren't supported, skip gracefully
 			slog.Warn("schema.url_path_gen.skip", "err", err)
@@ -248,7 +251,7 @@ func (s *Store) initSchema() error {
 	}
 
 	// Index on generated column (safe to CREATE IF NOT EXISTS)
-	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_edges_url_path ON edges(project, url_path_gen)`)
+	_, _ = s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_edges_url_path ON edges(project, url_path_gen)`)
 
 	return nil
 }

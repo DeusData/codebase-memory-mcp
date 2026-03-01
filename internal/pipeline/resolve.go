@@ -61,6 +61,8 @@ func resolveAssignment(node *tree_sitter.Node, source []byte, language lang.Lang
 		return resolveCPP(node, source, symbols)
 	case lang.Lua:
 		return resolveLua(node, source, symbols)
+	case lang.CSharp:
+		return resolveCSharp(node, source, symbols)
 	default:
 		return "", ""
 	}
@@ -201,6 +203,75 @@ func resolveJava(node *tree_sitter.Node, source []byte, symbols map[string]strin
 		}
 	}
 	return "", "" // all collected via symbols map directly
+}
+
+// --- C# ---
+// class_declaration → field_declaration → variable_declarator → (identifier, binary_expression|string_literal)
+
+func resolveCSharp(node *tree_sitter.Node, source []byte, symbols map[string]string) (name, value string) {
+	if node.Kind() != "class_declaration" {
+		return "", ""
+	}
+	body := node.ChildByFieldName("body")
+	if body == nil {
+		return "", ""
+	}
+	// Walk field_declarations inside the class body
+	for i := uint(0); i < body.ChildCount(); i++ {
+		child := body.Child(i)
+		if child == nil || child.Kind() != "field_declaration" {
+			continue
+		}
+		resolveCSharpFieldDecl(child, source, symbols)
+	}
+	return "", ""
+}
+
+// resolveCSharpFieldDecl resolves a single C# field_declaration into the symbols map.
+func resolveCSharpFieldDecl(field *tree_sitter.Node, source []byte, symbols map[string]string) {
+	varDecl := findChildByKind(field, "variable_declaration")
+	if varDecl == nil {
+		return
+	}
+	decl := findChildByKind(varDecl, "variable_declarator")
+	if decl == nil {
+		return
+	}
+	nameNode := decl.ChildByFieldName("name")
+	if nameNode == nil {
+		nameNode = findChildByKind(decl, "identifier")
+	}
+	if nameNode == nil {
+		return
+	}
+	valueNode := findValueAfterEquals(decl)
+	if valueNode == nil {
+		return
+	}
+	name := parser.NodeText(nameNode, source)
+	value := resolveStringExpr(valueNode, source, symbols)
+	if name != "" && value != "" {
+		symbols[name] = value
+	}
+}
+
+// findValueAfterEquals finds the first named child after a "=" token in a declarator.
+func findValueAfterEquals(decl *tree_sitter.Node) *tree_sitter.Node {
+	foundEq := false
+	for ci := uint(0); ci < decl.ChildCount(); ci++ {
+		c := decl.Child(ci)
+		if c == nil {
+			continue
+		}
+		if c.Kind() == "=" {
+			foundEq = true
+			continue
+		}
+		if foundEq && c.IsNamed() {
+			return c
+		}
+	}
+	return nil
 }
 
 // --- PHP ---

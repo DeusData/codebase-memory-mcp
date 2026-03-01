@@ -9,6 +9,7 @@ func init() {
 			"anonymous_function",
 			"function_definition",
 			"arrow_function",
+			"method_declaration",
 		},
 		ClassNodeTypes: []string{
 			"trait_declaration",
@@ -24,7 +25,11 @@ func init() {
 			"nullsafe_member_call_expression",
 		},
 
-		BranchingNodeTypes: []string{"if_statement", "for_statement", "foreach_statement", "while_statement", "switch_statement", "case_statement", "try_statement", "catch_clause"},
-		ThrowNodeTypes:     []string{"throw_expression"},
+		BranchingNodeTypes:  []string{"if_statement", "for_statement", "foreach_statement", "while_statement", "switch_statement", "case_statement", "try_statement", "catch_clause"},
+		VariableNodeTypes:   []string{"expression_statement"},
+		AssignmentNodeTypes: []string{"assignment_expression"},
+		ThrowNodeTypes:      []string{"throw_expression"},
+		DecoratorNodeTypes:  []string{"attribute_group"},
+		EnvAccessFunctions:  []string{"getenv", "env"},
 	})
 }

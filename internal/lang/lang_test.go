@@ -55,15 +55,15 @@ func TestGoSpec(t *testing.T) {
 	if spec == nil {
 		t.Fatal("Go spec not registered")
 	}
-	if len(spec.FunctionNodeTypes) != 2 {
-		t.Errorf("Go FunctionNodeTypes: got %d, want 2", len(spec.FunctionNodeTypes))
+	if len(spec.FunctionNodeTypes) != 3 {
+		t.Errorf("Go FunctionNodeTypes: got %d, want 3", len(spec.FunctionNodeTypes))
 	}
-	// Should contain function_declaration and method_declaration
+	// Should contain function_declaration, method_declaration, and method_elem (interface methods)
 	found := map[string]bool{}
 	for _, nt := range spec.FunctionNodeTypes {
 		found[nt] = true
 	}
-	if !found["function_declaration"] || !found["method_declaration"] {
+	if !found["function_declaration"] || !found["method_declaration"] || !found["method_elem"] {
 		t.Errorf("Go FunctionNodeTypes missing expected types: %v", spec.FunctionNodeTypes)
 	}
 }

@@ -42,10 +42,13 @@ func (p *Pipeline) passUsages() {
 		numWorkers = len(files)
 	}
 
-	g := new(errgroup.Group)
+	g, gctx := errgroup.WithContext(p.ctx)
 	g.SetLimit(numWorkers)
 	for i, fe := range files {
 		g.Go(func() error {
+			if gctx.Err() != nil {
+				return gctx.Err()
+			}
 			results[i] = p.resolveFileUsages(fe.relPath, fe.cached)
 			return nil
 		})
@@ -67,6 +70,9 @@ func (p *Pipeline) passUsagesForFiles(files []discover.FileInfo) {
 	slog.Info("pass3b.usages.incremental", "files", len(files))
 	count := 0
 	for _, f := range files {
+		if p.ctx.Err() != nil {
+			return
+		}
 		cached, ok := p.astCache[f.RelPath]
 		if !ok {
 			continue

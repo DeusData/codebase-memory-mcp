@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -245,7 +246,7 @@ func BenchmarkPipelineRun(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		p := New(s, repoDir)
+		p := New(context.Background(), s, repoDir)
 		if err := p.Run(); err != nil {
 			b.Fatalf("Pipeline.Run: %v", err)
 		}
@@ -264,7 +265,7 @@ func BenchmarkPipelineReindex(b *testing.B) {
 	defer s.Close()
 
 	// Initial index
-	p := New(s, repoDir)
+	p := New(context.Background(), s, repoDir)
 	if err := p.Run(); err != nil {
 		b.Fatalf("initial index: %v", err)
 	}
@@ -273,7 +274,7 @@ func BenchmarkPipelineReindex(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		p := New(s, repoDir)
+		p := New(context.Background(), s, repoDir)
 		if err := p.Run(); err != nil {
 			b.Fatalf("reindex %d: %v", i, err)
 		}
@@ -321,7 +322,7 @@ func (s *Struct%d) Method%d() int {
 				if err != nil {
 					b.Fatal(err)
 				}
-				p := New(s, dir)
+				p := New(context.Background(), s, dir)
 				if err := p.Run(); err != nil {
 					b.Fatalf("Pipeline.Run: %v", err)
 				}

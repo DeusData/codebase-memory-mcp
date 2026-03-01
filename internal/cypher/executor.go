@@ -1,6 +1,7 @@
 package cypher
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"regexp"
@@ -17,6 +18,7 @@ const maxResultRows = 200
 type Executor struct {
 	Store      *store.Store
 	regexCache map[string]*regexp.Regexp
+	ctx        context.Context // set by Execute, used for DB queries
 }
 
 // Result holds the tabular output of a query.
@@ -40,6 +42,9 @@ func newBinding() binding {
 
 // Execute parses, plans, and executes a Cypher query across all projects.
 func (e *Executor) Execute(query string) (*Result, error) {
+	if e.ctx == nil {
+		e.ctx = context.Background()
+	}
 	q, err := Parse(query)
 	if err != nil {
 		return nil, fmt.Errorf("parse: %w", err)
@@ -258,7 +263,7 @@ func (e *Executor) executeAggregateForProject(
 ) []map[string]any {
 	query, args := buildProjectAggregateSQL(project, ctx, scan, expand, filter)
 
-	rows, qErr := e.Store.DB().Query(query, args...)
+	rows, qErr := e.Store.DB().QueryContext(e.ctx, query, args...)
 	if qErr != nil {
 		return nil
 	}
@@ -500,7 +505,7 @@ func (e *Executor) execJoinScanExpand(project string, scan *ScanNodes, expand *E
 
 	args = append(args, maxResultRows*2)
 
-	rows, err := e.Store.DB().Query(query, args...)
+	rows, err := e.Store.DB().QueryContext(e.ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("join scan+expand: %w", err)
 	}
@@ -592,7 +597,7 @@ func (e *Executor) execScan(project string, s *ScanNodes, pushDown *FilterWhere)
 		}
 	}
 
-	rows, err := e.Store.DB().Query(query, args...)
+	rows, err := e.Store.DB().QueryContext(e.ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("scan nodes: %w", err)
 	}
@@ -1316,7 +1321,7 @@ func buildGroups(bindings []binding, groupItems []ReturnItem) (groups map[string
 
 	for _, b := range bindings {
 		row := make(map[string]any)
-		var keyParts []string
+		keyParts := make([]string, 0, len(groupItems))
 		for _, item := range groupItems {
 			col := item.Variable
 			if item.Property != "" {

@@ -2,6 +2,7 @@ package discover
 
 import (
 	"bufio"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,9 +61,14 @@ func shouldSkipDir(name, rel string, extraIgnore []string) bool {
 }
 
 // Discover walks a repository and returns all source files.
-func Discover(repoPath string, opts *Options) ([]FileInfo, error) {
+func Discover(ctx context.Context, repoPath string, opts *Options) ([]FileInfo, error) {
 	repoPath, err := filepath.Abs(repoPath)
 	if err != nil {
+		return nil, err
+	}
+
+	// Check cancellation before starting walk
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -78,6 +84,11 @@ func Discover(repoPath string, opts *Options) ([]FileInfo, error) {
 	var files []FileInfo
 
 	err = filepath.Walk(repoPath, func(path string, info os.FileInfo, walkErr error) error {
+		// Check context cancellation periodically during walk
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		if walkErr != nil {
 			return filepath.SkipDir
 		}

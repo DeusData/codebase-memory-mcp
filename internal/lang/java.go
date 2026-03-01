@@ -19,6 +19,7 @@ func init() {
 		ImportFromTypes: []string{"import_declaration"},
 
 		BranchingNodeTypes:  []string{"if_statement", "for_statement", "enhanced_for_statement", "while_statement", "switch_expression", "switch_block_statement_group", "try_statement", "catch_clause"},
+		VariableNodeTypes:   []string{"field_declaration", "local_variable_declaration"},
 		AssignmentNodeTypes: []string{"assignment_expression"},
 		ThrowNodeTypes:      []string{"throw_statement"},
 		ThrowsClauseField:   "throws",

@@ -7,69 +7,103 @@ import (
 	"github.com/DeusData/codebase-memory-mcp/internal/lang"
 )
 
+// testFilePattern defines how to detect test files for a language.
+type testFilePattern struct {
+	// suffixes on the base filename (e.g., "_test.go")
+	suffixes []string
+	// prefixes on the base filename (e.g., "test_")
+	prefixes []string
+	// stripExtSuffixes: suffixes checked on the base name after stripping ext (e.g., ".test", ".spec")
+	stripExtSuffixes []string
+	// testDirs: directory patterns that indicate test files
+	testDirs []string
+}
+
+// testFilePatterns maps languages to their test file detection patterns.
+var testFilePatterns = map[lang.Language]testFilePattern{
+	lang.Go: {suffixes: []string{"_test.go"}},
+	lang.Python: {
+		prefixes: []string{"test_"},
+		suffixes: []string{"_test.py"},
+		testDirs: []string{"__tests__", "tests"},
+	},
+	lang.JavaScript: {
+		stripExtSuffixes: []string{".test", ".spec"},
+		testDirs:         []string{"__tests__"},
+	},
+	lang.TypeScript: {
+		stripExtSuffixes: []string{".test", ".spec"},
+		testDirs:         []string{"__tests__"},
+	},
+	lang.TSX: {
+		stripExtSuffixes: []string{".test", ".spec"},
+		testDirs:         []string{"__tests__"},
+	},
+	lang.Java: {
+		suffixes: []string{"Test.java", "Tests.java"},
+		testDirs: []string{"src/test"},
+	},
+	lang.Rust: {
+		suffixes: []string{"_test.rs"},
+		testDirs: []string{"tests"},
+	},
+	lang.CPP: {
+		stripExtSuffixes: []string{"_test"},
+		testDirs:         []string{"test", "tests"},
+	},
+	lang.PHP: {
+		suffixes: []string{"Test.php"},
+		testDirs: []string{"tests"},
+	},
+	lang.Scala: {
+		stripExtSuffixes: []string{"Spec", "Test"},
+		testDirs:         []string{"src/test"},
+	},
+	lang.CSharp: {
+		stripExtSuffixes: []string{"Test", "Tests"},
+		testDirs:         []string{"Tests", "tests"},
+	},
+	lang.Kotlin: {
+		stripExtSuffixes: []string{"Test", "Tests", "Spec"},
+		testDirs:         []string{"src/test"},
+	},
+	lang.Lua: {
+		suffixes: []string{"_test.lua", "_spec.lua"},
+		prefixes: []string{"test_"},
+		testDirs: []string{"spec"},
+	},
+}
+
 // isTestFile returns true if the file path indicates a test file for the given language.
 func isTestFile(relPath string, language lang.Language) bool {
-	base := filepath.Base(relPath)
-	dir := filepath.Dir(relPath)
-
-	switch language {
-	case lang.Go:
-		return strings.HasSuffix(base, "_test.go")
-
-	case lang.Python:
-		if strings.HasPrefix(base, "test_") || strings.HasSuffix(base, "_test.py") {
-			return true
-		}
-		return containsTestDir(dir, "__tests__", "tests")
-
-	case lang.JavaScript, lang.TypeScript, lang.TSX:
-		noExt := strings.TrimSuffix(base, filepath.Ext(base))
-		// Handle double-extensions like .test.ts, .spec.tsx
-		if strings.HasSuffix(noExt, ".test") || strings.HasSuffix(noExt, ".spec") {
-			return true
-		}
-		return containsTestDir(dir, "__tests__")
-
-	case lang.Java:
-		if strings.HasSuffix(base, "Test.java") || strings.HasSuffix(base, "Tests.java") {
-			return true
-		}
-		return containsTestDir(dir, "src/test")
-
-	case lang.Rust:
-		if strings.HasSuffix(base, "_test.rs") {
-			return true
-		}
-		return containsTestDir(dir, "tests")
-
-	case lang.CPP:
-		noExt := strings.TrimSuffix(base, filepath.Ext(base))
-		if strings.HasSuffix(noExt, "_test") {
-			return true
-		}
-		return containsTestDir(dir, "test", "tests")
-
-	case lang.PHP:
-		if strings.HasSuffix(base, "Test.php") {
-			return true
-		}
-		return containsTestDir(dir, "tests")
-
-	case lang.Scala:
-		noExt := strings.TrimSuffix(base, filepath.Ext(base))
-		if strings.HasSuffix(noExt, "Spec") || strings.HasSuffix(noExt, "Test") {
-			return true
-		}
-		return containsTestDir(dir, "src/test")
-
-	case lang.CSharp:
-		noExt := strings.TrimSuffix(base, filepath.Ext(base))
-		if strings.HasSuffix(noExt, "Test") || strings.HasSuffix(noExt, "Tests") {
-			return true
-		}
-		return containsTestDir(dir, "Tests", "tests")
+	pattern, ok := testFilePatterns[language]
+	if !ok {
+		return false
 	}
 
+	base := filepath.Base(relPath)
+
+	for _, s := range pattern.suffixes {
+		if strings.HasSuffix(base, s) {
+			return true
+		}
+	}
+	for _, p := range pattern.prefixes {
+		if strings.HasPrefix(base, p) {
+			return true
+		}
+	}
+	if len(pattern.stripExtSuffixes) > 0 {
+		noExt := strings.TrimSuffix(base, filepath.Ext(base))
+		for _, s := range pattern.stripExtSuffixes {
+			if strings.HasSuffix(noExt, s) {
+				return true
+			}
+		}
+	}
+	if len(pattern.testDirs) > 0 {
+		return containsTestDir(filepath.Dir(relPath), pattern.testDirs...)
+	}
 	return false
 }
 
@@ -114,6 +148,10 @@ func isTestFunction(funcName string, language lang.Language) bool {
 		return strings.HasPrefix(funcName, "test_") ||
 			strings.HasPrefix(funcName, "Test")
 
+	case lang.CPP:
+		return strings.HasPrefix(funcName, "Test") ||
+			strings.HasPrefix(funcName, "test_")
+
 	case lang.PHP:
 		return strings.HasPrefix(funcName, "test") ||
 			strings.HasPrefix(funcName, "Test")
@@ -125,6 +163,14 @@ func isTestFunction(funcName string, language lang.Language) bool {
 	case lang.CSharp:
 		return strings.HasPrefix(funcName, "Test") ||
 			strings.HasSuffix(funcName, "Test")
+
+	case lang.Kotlin:
+		return strings.HasPrefix(funcName, "test") ||
+			strings.HasSuffix(funcName, "Test")
+
+	case lang.Lua:
+		return strings.HasPrefix(funcName, "test_") ||
+			strings.HasPrefix(funcName, "test")
 	}
 
 	return false

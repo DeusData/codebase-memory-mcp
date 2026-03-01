@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -42,7 +43,7 @@ func Register() {
 	}
 	defer s.Close()
 
-	p := New(s, tmpDir)
+	p := New(context.Background(), s, tmpDir)
 	if err := p.Run(); err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +107,7 @@ func Main() {
 	}
 	defer s.Close()
 
-	p := New(s, tmpDir)
+	p := New(context.Background(), s, tmpDir)
 	if err := p.Run(); err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +190,7 @@ fun register() {
 	}
 	defer s.Close()
 
-	p := New(s, tmpDir)
+	p := New(context.Background(), s, tmpDir)
 	if err := p.Run(); err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +234,7 @@ fun main() {
 	}
 	defer s.Close()
 
-	p := New(s, tmpDir)
+	p := New(context.Background(), s, tmpDir)
 	if err := p.Run(); err != nil {
 		t.Fatal(err)
 	}

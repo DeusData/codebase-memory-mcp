@@ -27,13 +27,14 @@ type projectState struct {
 }
 
 // IndexFunc is the callback signature for triggering a re-index.
-type IndexFunc func(projectName, rootPath string) error
+type IndexFunc func(ctx context.Context, projectName, rootPath string) error
 
 // Watcher polls indexed projects for file changes and triggers re-indexing.
 type Watcher struct {
 	router   *store.StoreRouter
 	indexFn  IndexFunc
 	projects map[string]*projectState
+	ctx      context.Context
 }
 
 // New creates a Watcher. indexFn is called when file changes are detected.
@@ -48,6 +49,7 @@ func New(r *store.StoreRouter, indexFn IndexFunc) *Watcher {
 // Run blocks until ctx is cancelled. Ticks at baseInterval, polling each
 // project only when its adaptive interval has elapsed.
 func (w *Watcher) Run(ctx context.Context) {
+	w.ctx = ctx
 	ticker := time.NewTicker(baseInterval)
 	defer ticker.Stop()
 
@@ -133,7 +135,7 @@ func (w *Watcher) pollProject(proj *store.Project, state *projectState) {
 	}
 
 	slog.Info("watcher.changed", "project", proj.Name, "files", len(snap))
-	if err := w.indexFn(proj.Name, proj.RootPath); err != nil {
+	if err := w.indexFn(w.ctx, proj.Name, proj.RootPath); err != nil {
 		slog.Warn("watcher.index", "project", proj.Name, "err", err)
 		// Keep old snapshot so we retry next cycle
 		state.nextPoll = time.Now().Add(interval)
@@ -149,7 +151,7 @@ func (w *Watcher) pollProject(proj *store.Project, state *projectState) {
 // captureSnapshot walks the file tree using discover.Discover and captures
 // mtime+size for each file.
 func captureSnapshot(rootPath string) (map[string]fileSnapshot, error) {
-	files, err := discover.Discover(rootPath, nil)
+	files, err := discover.Discover(context.Background(), rootPath, nil)
 	if err != nil {
 		return nil, err
 	}

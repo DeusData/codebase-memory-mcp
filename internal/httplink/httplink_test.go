@@ -3,6 +3,7 @@ package httplink
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/DeusData/codebase-memory-mcp/internal/store"
@@ -996,6 +997,447 @@ func TestLinkerSkipsSameService(t *testing.T) {
 		t.Errorf("expected 0 links (same service), got %d", len(links))
 		for _, l := range links {
 			t.Logf("  %s -> %s", l.CallerQN, l.HandlerQN)
+		}
+	}
+}
+
+func TestDetectProtocol(t *testing.T) {
+	tests := []struct {
+		name   string
+		source string
+		want   string
+	}{
+		{"go websocket upgrade", `err := websocket.Upgrade(w, r, nil, 1024, 1024)`, "ws"},
+		{"go websocket accept", `conn, err := websocket.Accept(w, r, nil)`, "ws"},
+		{"go upgrader", `conn, err := upgrader.Upgrade(w, r, nil)`, "ws"},
+		{"js ws", `ws.on("connection", func)`, "ws"},
+		{"js socketio", `io.on("connection", handler)`, "ws"},
+		{"sse content type", `w.Header().Set("Content-Type", "text/event-stream")`, "sse"},
+		{"python sse", `return EventSourceResponse(generate())`, "sse"},
+		{"java sse emitter", `SseEmitter emitter = new SseEmitter()`, "sse"},
+		{"java sse event", `ServerSentEvent event = ServerSentEvent.builder()`, "sse"},
+		{"no protocol", `return json.Marshal(result)`, ""},
+		{"empty", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := detectProtocol(tt.source)
+			if got != tt.want {
+				t.Errorf("detectProtocol() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractPythonWSRoutes(t *testing.T) {
+	node := &store.Node{
+		Name:          "ws_handler",
+		QualifiedName: "proj.api.ws_handler",
+		Properties: map[string]any{
+			"decorators": []any{
+				`@app.websocket("/ws/chat")`,
+			},
+		},
+	}
+
+	routes := extractPythonRoutes(node)
+	if len(routes) != 1 {
+		t.Fatalf("expected 1 route, got %d", len(routes))
+	}
+	if routes[0].Path != "/ws/chat" {
+		t.Errorf("path = %q, want /ws/chat", routes[0].Path)
+	}
+	if routes[0].Method != "WS" {
+		t.Errorf("method = %q, want WS", routes[0].Method)
+	}
+	if routes[0].Protocol != "ws" {
+		t.Errorf("protocol = %q, want ws", routes[0].Protocol)
+	}
+}
+
+func TestExtractSpringWSRoutes(t *testing.T) {
+	node := &store.Node{
+		Name:          "handleChat",
+		QualifiedName: "proj.ChatController.handleChat",
+		Properties: map[string]any{
+			"decorators": []any{
+				`@MessageMapping("/chat")`,
+			},
+		},
+	}
+
+	routes := extractJavaRoutes(node)
+	if len(routes) != 1 {
+		t.Fatalf("expected 1 route, got %d", len(routes))
+	}
+	if routes[0].Path != "/chat" {
+		t.Errorf("path = %q, want /chat", routes[0].Path)
+	}
+	if routes[0].Method != "WS" {
+		t.Errorf("method = %q, want WS", routes[0].Method)
+	}
+	if routes[0].Protocol != "ws" {
+		t.Errorf("protocol = %q, want ws", routes[0].Protocol)
+	}
+}
+
+func TestExtractKtorWSRoutes(t *testing.T) {
+	source := `
+	webSocket("/chat") {
+		for (frame in incoming) {
+			send(frame)
+		}
+	}
+	get("/api/health") {
+		call.respond("ok")
+	}
+`
+	node := &store.Node{
+		Name:          "configureRouting",
+		QualifiedName: "proj.Routing.configureRouting",
+	}
+
+	routes := extractKtorRoutes(node, source)
+	if len(routes) != 2 {
+		t.Fatalf("expected 2 routes, got %d", len(routes))
+	}
+
+	// Check WS route
+	wsFound := false
+	httpFound := false
+	for _, r := range routes {
+		if r.Protocol == "ws" && r.Path == "/chat" && r.Method == "WS" {
+			wsFound = true
+		}
+		if r.Path == "/api/health" && r.Method == "GET" {
+			httpFound = true
+		}
+	}
+	if !wsFound {
+		t.Error("expected WS route for /chat")
+	}
+	if !httpFound {
+		t.Error("expected HTTP route for /api/health")
+	}
+}
+
+func TestChiPrefix(t *testing.T) {
+	source := `
+func SetupRoutes(r chi.Router) {
+	r.Route("/api", func(r chi.Router) {
+		r.Get("/health", healthHandler)
+		r.Route("/users", func(r chi.Router) {
+			r.Get("/", listUsers)
+			r.Post("/{id}", updateUser)
+		})
+	})
+}
+`
+	node := &store.Node{
+		Name:          "SetupRoutes",
+		QualifiedName: "proj.SetupRoutes",
+	}
+
+	routes := extractGoRoutes(node, source)
+
+	expectedPaths := map[string]string{
+		"/api/health":     "GET",
+		"/api/users":      "GET",
+		"/api/users/{id}": "POST",
+	}
+
+	if len(routes) != len(expectedPaths) {
+		t.Fatalf("expected %d routes, got %d", len(expectedPaths), len(routes))
+		for _, r := range routes {
+			t.Logf("  %s %s", r.Method, r.Path)
+		}
+	}
+
+	for _, r := range routes {
+		wantMethod, ok := expectedPaths[r.Path]
+		if !ok {
+			t.Errorf("unexpected route: %s %s", r.Method, r.Path)
+			continue
+		}
+		if r.Method != wantMethod {
+			t.Errorf("route %s: method = %q, want %q", r.Path, r.Method, wantMethod)
+		}
+	}
+}
+
+func TestChiPrefixMixedWithGin(t *testing.T) {
+	// When no chi Route() blocks, gin group resolution should still work
+	source := `
+func RegisterRoutes(r *gin.RouterGroup) {
+	orders := r.Group("/orders")
+	orders.GET("/:id", getOrder)
+	orders.POST("", createOrder)
+}
+`
+	node := &store.Node{
+		Name:          "RegisterRoutes",
+		QualifiedName: "proj.RegisterRoutes",
+	}
+
+	routes := extractGoRoutes(node, source)
+	if len(routes) != 2 {
+		t.Fatalf("expected 2 routes, got %d", len(routes))
+	}
+
+	for _, r := range routes {
+		if !strings.HasPrefix(r.Path, "/orders") {
+			t.Errorf("expected /orders prefix, got %s", r.Path)
+		}
+	}
+}
+
+func TestFastAPIPrefix(t *testing.T) {
+	dir, err := os.MkdirTemp("", "httplink-fastapi-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Write Python files: main.py with include_router, orders/routes.py with routes
+	if err := os.MkdirAll(filepath.Join(dir, "orders"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte(`
+from orders.routes import order_router
+
+app = FastAPI()
+app.include_router(order_router, prefix="/api/v1/orders")
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	project := "testproj"
+	if err := s.UpsertProject(project, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create Module for main.py (has the include_router call)
+	_, _ = s.UpsertNode(&store.Node{
+		Project: project, Label: "Module", Name: "main.py",
+		QualifiedName: "testproj//main.py",
+		FilePath:      "main.py",
+	})
+
+	// Create Function with route in the orders module
+	_, _ = s.UpsertNode(&store.Node{
+		Project: project, Label: "Function", Name: "list_orders",
+		QualifiedName: "testproj//orders/routes.py/list_orders",
+		FilePath:      "orders/routes.py",
+		Properties: map[string]any{
+			"decorators": []any{`@order_router.get("/")`},
+		},
+	})
+
+	linker := New(s, project)
+	_, err = linker.Run()
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	routeNodes, _ := s.FindNodesByLabel(project, "Route")
+	if len(routeNodes) != 1 {
+		t.Fatalf("expected 1 Route node, got %d", len(routeNodes))
+	}
+
+	path, _ := routeNodes[0].Properties["path"].(string)
+	if path != "/api/v1/orders/" {
+		t.Errorf("expected /api/v1/orders/, got %s", path)
+	}
+}
+
+func TestExpressPrefix(t *testing.T) {
+	dir, err := os.MkdirTemp("", "httplink-express-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	if err := os.MkdirAll(filepath.Join(dir, "routes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "app.js"), []byte(`
+const orderRouter = require('./routes/orders');
+app.use("/api/orders", orderRouter);
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	project := "testproj"
+	if err := s.UpsertProject(project, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Module for app.js
+	_, _ = s.UpsertNode(&store.Node{
+		Project: project, Label: "Module", Name: "app.js",
+		QualifiedName: "testproj//app.js",
+		FilePath:      "app.js",
+	})
+
+	// Function with route in orders module
+	_, _ = s.UpsertNode(&store.Node{
+		Project: project, Label: "Function", Name: "getOrder",
+		QualifiedName: "testproj//routes/orders.js/getOrder",
+		FilePath:      "routes/orders.js",
+		StartLine:     1, EndLine: 5,
+	})
+
+	// Write the routes file with Express route
+	if err := os.WriteFile(filepath.Join(dir, "routes", "orders.js"), []byte(`
+router.get("/:id", function(req, res) {
+	res.json({id: req.params.id});
+});
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	linker := New(s, project)
+	_, err = linker.Run()
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	routeNodes, _ := s.FindNodesByLabel(project, "Route")
+	if len(routeNodes) != 1 {
+		t.Fatalf("expected 1 Route node, got %d", len(routeNodes))
+	}
+
+	path, _ := routeNodes[0].Properties["path"].(string)
+	if path != "/api/orders/:id" {
+		t.Errorf("expected /api/orders/:id, got %s", path)
+	}
+}
+
+func TestExpressRouteFiltering(t *testing.T) {
+	tests := []struct {
+		name       string
+		line       string
+		wantMatch  bool
+		wantMethod string
+		wantPath   string
+	}{
+		// Should match (allowlisted receivers)
+		{"app.get", `app.get('/api/users', handler)`, true, "GET", "/api/users"},
+		{"router.post", `router.post('/orders', handler)`, true, "POST", "/orders"},
+		{"server.put", `server.put('/items', handler)`, true, "PUT", "/items"},
+		{"api.delete", `api.delete('/users/:id', handler)`, true, "DELETE", "/users/:id"},
+		{"routes.patch", `routes.patch('/items/:id', handler)`, true, "PATCH", "/items/:id"},
+		// Should NOT match (not in allowlist)
+		{"req.get", `req.get('Content-Type')`, false, "", ""},
+		{"res.get", `res.get('key')`, false, "", ""},
+		{"this.get", `this.get('property')`, false, "", ""},
+		{"map.get", `map.get('key')`, false, "", ""},
+		{"model.delete", `model.delete('record')`, false, "", ""},
+		{"params.get", `params.get('id')`, false, "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node := &store.Node{
+				Name:          "testFunc",
+				QualifiedName: "proj.test.testFunc",
+			}
+			routes := extractExpressRoutes(node, tt.line)
+			if tt.wantMatch {
+				if len(routes) == 0 {
+					t.Errorf("expected route match, got 0 routes")
+					return
+				}
+				if routes[0].Method != tt.wantMethod {
+					t.Errorf("method = %q, want %q", routes[0].Method, tt.wantMethod)
+				}
+				if routes[0].Path != tt.wantPath {
+					t.Errorf("path = %q, want %q", routes[0].Path, tt.wantPath)
+				}
+			} else if len(routes) > 0 {
+				t.Errorf("expected no match, got %d routes: %v", len(routes), routes[0].Path)
+			}
+		})
+	}
+}
+
+func TestLaravelModuleLevelRoutes(t *testing.T) {
+	dir, err := os.MkdirTemp("", "httplink-laravel-module-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Create a Laravel-style route file with module-level Route:: calls
+	if err := os.MkdirAll(filepath.Join(dir, "routes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "routes", "api.php"), []byte(`<?php
+
+use App\Http\Controllers\OrderController;
+
+Route::get('/api/orders', [OrderController::class, 'index']);
+Route::post('/api/orders', [OrderController::class, 'store']);
+Route::get('/api/orders/{id}', [OrderController::class, 'show']);
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	project := "testproj"
+	if err := s.UpsertProject(project, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create Module node for the PHP route file (as pipeline would)
+	// No Function/Method nodes — routes are at module level
+	_, _ = s.UpsertNode(&store.Node{
+		Project:       project,
+		Label:         "Module",
+		Name:          "api.php",
+		QualifiedName: "testproj.routes.api",
+		FilePath:      "routes/api.php",
+	})
+
+	linker := New(s, project)
+	_, err = linker.Run()
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	routeNodes, _ := s.FindNodesByLabel(project, "Route")
+	if len(routeNodes) < 3 {
+		t.Fatalf("expected at least 3 Route nodes from module-level Laravel routes, got %d", len(routeNodes))
+	}
+
+	foundPaths := map[string]bool{}
+	for _, rn := range routeNodes {
+		path, _ := rn.Properties["path"].(string)
+		foundPaths[path] = true
+		t.Logf("Route: %s (path=%s)", rn.Name, path)
+	}
+
+	for _, wantPath := range []string{"/api/orders", "/api/orders/{id}"} {
+		if !foundPaths[wantPath] {
+			t.Errorf("expected route path %s", wantPath)
 		}
 	}
 }

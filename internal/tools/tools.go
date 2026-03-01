@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,7 +23,7 @@ import (
 )
 
 // Version is the current release version, referenced by MCP handshake and update checker.
-const Version = "0.2.1"
+const Version = "0.2.1-dev"
 
 // releaseURL is the GitHub API endpoint for latest release. Package-level var for test injection.
 var releaseURL = "https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest"
@@ -40,7 +39,7 @@ type Server struct {
 	// Session-aware fields (set once via sync.Once, then immutable)
 	sessionOnce    sync.Once
 	sessionRoot    string // absolute path from client
-	sessionProject string // filepath.Base(sessionRoot)
+	sessionProject string // derived from sessionRoot via ProjectNameFromPath
 	indexStatus    atomic.Value
 	indexStartedAt atomic.Value // time.Time — when current/last index started
 	updateNotice   atomic.Value // string — set once by checkForUpdate, cleared after first injection
@@ -77,7 +76,7 @@ func (s *Server) StartWatcher(ctx context.Context) {
 
 // syncProject is called by the watcher when file changes are detected.
 // Uses TryLock to skip if an index operation is already in progress.
-func (s *Server) syncProject(projectName, rootPath string) error {
+func (s *Server) syncProject(ctx context.Context, projectName, rootPath string) error {
 	if !s.indexMu.TryLock() {
 		slog.Debug("watcher.skip", "path", rootPath, "reason", "index_in_progress")
 		return nil
@@ -87,7 +86,7 @@ func (s *Server) syncProject(projectName, rootPath string) error {
 	if err != nil {
 		return fmt.Errorf("store for %s: %w", projectName, err)
 	}
-	p := pipeline.New(st, rootPath)
+	p := pipeline.New(ctx, st, rootPath)
 	return p.Run()
 }
 
@@ -112,7 +111,7 @@ func (s *Server) SetSessionRoot(rootPath string) {
 	s.sessionOnce.Do(func() {
 		s.sessionRoot = rootPath
 		if rootPath != "" {
-			s.sessionProject = filepath.Base(rootPath)
+			s.sessionProject = pipeline.ProjectNameFromPath(rootPath)
 		}
 	})
 }
@@ -125,7 +124,7 @@ func (s *Server) onInitialized(ctx context.Context, req *mcp.InitializedRequest)
 	s.sessionOnce.Do(func() {
 		s.sessionRoot = s.detectSessionRoot(ctx, req.Session)
 		if s.sessionRoot != "" {
-			s.sessionProject = filepath.Base(s.sessionRoot)
+			s.sessionProject = pipeline.ProjectNameFromPath(s.sessionRoot)
 			s.startAutoIndex()
 		}
 	})
@@ -137,7 +136,7 @@ func (s *Server) onRootsChanged(ctx context.Context, req *mcp.RootsListChangedRe
 	s.sessionOnce.Do(func() {
 		s.sessionRoot = s.detectSessionRoot(ctx, req.Session)
 		if s.sessionRoot != "" {
-			s.sessionProject = filepath.Base(s.sessionRoot)
+			s.sessionProject = pipeline.ProjectNameFromPath(s.sessionRoot)
 			s.startAutoIndex()
 		}
 	})
@@ -210,7 +209,7 @@ func (s *Server) startAutoIndex() {
 			slog.Warn("autoindex.store.err", "err", err)
 			return
 		}
-		p := pipeline.New(st, s.sessionRoot)
+		p := pipeline.New(context.Background(), st, s.sessionRoot)
 		if err := p.Run(); err != nil {
 			slog.Warn("autoindex.err", "err", err)
 			return
@@ -308,8 +307,8 @@ func (s *Server) checkForUpdate() {
 	}
 	if compareVersions(latest, Version) > 0 {
 		notice := fmt.Sprintf(
-			"⚡ Update available: v%s → v%s — download at https://github.com/DeusData/codebase-memory-mcp/releases/tag/v%s",
-			Version, latest, latest)
+			"⚡ Update available: v%s → v%s — run: codebase-memory-mcp update",
+			Version, latest)
 		s.updateNotice.Store(notice)
 		slog.Info("update available", "current", Version, "latest", latest)
 	}
@@ -476,7 +475,11 @@ func (s *Server) registerSearchTools() {
 				},
 				"name_pattern": {
 					"type": "string",
-					"description": "Regex pattern for node name (e.g. '.*Handler', 'Send.*')"
+					"description": "Regex pattern matched against the short node name only (e.g. '.*Handler', 'Send.*'). Does NOT match against file paths or qualified names."
+				},
+				"qn_pattern": {
+					"type": "string",
+					"description": "Regex pattern matched against the qualified name (includes module path, e.g. '.*tests\\.conftest\\..*', '.*services\\.order\\..*'). Use this to scope searches to specific directories or modules."
 				},
 				"file_pattern": {
 					"type": "string",

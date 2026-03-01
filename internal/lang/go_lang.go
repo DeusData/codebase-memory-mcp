@@ -4,7 +4,7 @@ func init() {
 	Register(&LanguageSpec{
 		Language:          Go,
 		FileExtensions:    []string{".go"},
-		FunctionNodeTypes: []string{"function_declaration", "method_declaration"},
+		FunctionNodeTypes: []string{"function_declaration", "method_declaration", "method_elem"},
 		ClassNodeTypes:    []string{"type_spec", "type_alias"},
 		FieldNodeTypes:    []string{"field_declaration"},
 		ModuleNodeTypes:   []string{"source_file"},

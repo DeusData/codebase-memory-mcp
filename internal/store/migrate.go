@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
@@ -40,7 +41,8 @@ func (r *StoreRouter) migrate() error {
 	defer legacyDB.Close()
 
 	// Get list of projects
-	rows, err := legacyDB.Query("SELECT name FROM projects")
+	ctx := context.Background()
+	rows, err := legacyDB.QueryContext(ctx, "SELECT name FROM projects")
 	if err != nil {
 		return fmt.Errorf("list projects: %w", err)
 	}
@@ -94,37 +96,38 @@ func (r *StoreRouter) migrateProject(legacyDB *sql.DB, projectName, targetPath s
 	targetStore.Close()
 
 	// Use ATTACH DATABASE for efficient bulk copy
-	_, err = legacyDB.Exec("ATTACH DATABASE ? AS target", targetPath)
+	ctx := context.Background()
+	_, err = legacyDB.ExecContext(ctx, "ATTACH DATABASE ? AS target", targetPath)
 	if err != nil {
 		return fmt.Errorf("attach: %w", err)
 	}
 	defer func() {
-		_, _ = legacyDB.Exec("DETACH DATABASE target")
+		_, _ = legacyDB.ExecContext(ctx, "DETACH DATABASE target")
 	}()
 
 	// Copy projects
-	_, err = legacyDB.Exec(`INSERT OR REPLACE INTO target.projects (name, indexed_at, root_path)
+	_, err = legacyDB.ExecContext(ctx, `INSERT OR REPLACE INTO target.projects (name, indexed_at, root_path)
 		SELECT name, indexed_at, root_path FROM projects WHERE name=?`, projectName)
 	if err != nil {
 		return fmt.Errorf("copy projects: %w", err)
 	}
 
 	// Copy nodes (preserving IDs)
-	_, err = legacyDB.Exec(`INSERT OR REPLACE INTO target.nodes (id, project, label, name, qualified_name, file_path, start_line, end_line, properties)
+	_, err = legacyDB.ExecContext(ctx, `INSERT OR REPLACE INTO target.nodes (id, project, label, name, qualified_name, file_path, start_line, end_line, properties)
 		SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, properties FROM nodes WHERE project=?`, projectName)
 	if err != nil {
 		return fmt.Errorf("copy nodes: %w", err)
 	}
 
 	// Copy edges (preserving IDs)
-	_, err = legacyDB.Exec(`INSERT OR REPLACE INTO target.edges (id, project, source_id, target_id, type, properties)
+	_, err = legacyDB.ExecContext(ctx, `INSERT OR REPLACE INTO target.edges (id, project, source_id, target_id, type, properties)
 		SELECT id, project, source_id, target_id, type, properties FROM edges WHERE project=?`, projectName)
 	if err != nil {
 		return fmt.Errorf("copy edges: %w", err)
 	}
 
 	// Copy file_hashes
-	_, err = legacyDB.Exec(`INSERT OR REPLACE INTO target.file_hashes (project, rel_path, sha256)
+	_, err = legacyDB.ExecContext(ctx, `INSERT OR REPLACE INTO target.file_hashes (project, rel_path, sha256)
 		SELECT project, rel_path, sha256 FROM file_hashes WHERE project=?`, projectName)
 	if err != nil {
 		return fmt.Errorf("copy file_hashes: %w", err)
@@ -132,15 +135,15 @@ func (r *StoreRouter) migrateProject(legacyDB *sql.DB, projectName, targetPath s
 
 	// Verify row counts
 	var srcNodes, tgtNodes int
-	_ = legacyDB.QueryRow("SELECT COUNT(*) FROM nodes WHERE project=?", projectName).Scan(&srcNodes)
-	_ = legacyDB.QueryRow("SELECT COUNT(*) FROM target.nodes WHERE project=?", projectName).Scan(&tgtNodes)
+	_ = legacyDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM nodes WHERE project=?", projectName).Scan(&srcNodes)
+	_ = legacyDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM target.nodes WHERE project=?", projectName).Scan(&tgtNodes)
 	if srcNodes != tgtNodes {
 		return fmt.Errorf("node count mismatch: src=%d tgt=%d", srcNodes, tgtNodes)
 	}
 
 	var srcEdges, tgtEdges int
-	_ = legacyDB.QueryRow("SELECT COUNT(*) FROM edges WHERE project=?", projectName).Scan(&srcEdges)
-	_ = legacyDB.QueryRow("SELECT COUNT(*) FROM target.edges WHERE project=?", projectName).Scan(&tgtEdges)
+	_ = legacyDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM edges WHERE project=?", projectName).Scan(&srcEdges)
+	_ = legacyDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM target.edges WHERE project=?", projectName).Scan(&tgtEdges)
 	if srcEdges != tgtEdges {
 		return fmt.Errorf("edge count mismatch: src=%d tgt=%d", srcEdges, tgtEdges)
 	}

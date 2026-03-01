@@ -14,7 +14,6 @@ func init() {
 			"enum_item",
 			"union_item",
 			"trait_item",
-			"impl_item",
 			"type_item",
 		},
 		FieldNodeTypes:    []string{"field_declaration"},

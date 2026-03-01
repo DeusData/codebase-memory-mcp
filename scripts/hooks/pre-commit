@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Pre-commit hook: mirrors the GitHub Actions lint + test jobs.
+# Same commands as .github/workflows/release.yml
+#
+# Setup (once after clone):
+#   git config core.hooksPath scripts/hooks
+
+# --- Lint ---
+if ! command -v golangci-lint &>/dev/null; then
+    echo "pre-commit: golangci-lint not found, skipping lint check"
+    echo "  install: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.10"
+else
+    echo "pre-commit: running golangci-lint..."
+    golangci-lint run --timeout=5m ./...
+fi
+
+# --- Tests ---
+echo "pre-commit: running tests..."
+go test ./... -timeout=5m

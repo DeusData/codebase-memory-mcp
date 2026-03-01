@@ -324,6 +324,13 @@ fi
 configure_claude
 check_path
 
+# --- Git hooks ---
+# If run from inside the repo, activate tracked hooks
+if [ -d "scripts/hooks" ] && git rev-parse --git-dir &>/dev/null; then
+    git config core.hooksPath scripts/hooks
+    ok "Git hooks activated (scripts/hooks/)"
+fi
+
 echo ""
 ok "Done! Restart Claude Code and verify with /mcp"
 echo ""

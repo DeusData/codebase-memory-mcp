@@ -17,6 +17,7 @@ func (s *Server) handleSearchGraph(_ context.Context, req *mcp.CallToolRequest) 
 	params := &store.SearchParams{
 		Label:              getStringArg(args, "label"),
 		NamePattern:        getStringArg(args, "name_pattern"),
+		QNPattern:          getStringArg(args, "qn_pattern"),
 		FilePattern:        getStringArg(args, "file_pattern"),
 		Relationship:       getStringArg(args, "relationship"),
 		Direction:          getStringArg(args, "direction"),

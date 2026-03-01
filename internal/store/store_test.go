@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"fmt"
 	"testing"
 )
@@ -393,7 +394,7 @@ func TestGeneratedColumnURLPath(t *testing.T) {
 
 	// Check that the generated column exists
 	var colCount int
-	err = s.DB().QueryRow(`SELECT COUNT(*) FROM pragma_table_xinfo('edges') WHERE name='url_path_gen'`).Scan(&colCount)
+	err = s.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM pragma_table_xinfo('edges') WHERE name='url_path_gen'`).Scan(&colCount)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -475,7 +476,7 @@ func TestPragmaSettings(t *testing.T) {
 	}
 	for _, tt := range tests {
 		var val string
-		err := s.DB().QueryRow("PRAGMA " + tt.pragma).Scan(&val)
+		err := s.DB().QueryRowContext(context.Background(), "PRAGMA "+tt.pragma).Scan(&val)
 		if err != nil {
 			t.Fatalf("PRAGMA %s: %v", tt.pragma, err)
 		}
