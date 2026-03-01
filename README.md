@@ -8,7 +8,7 @@ Parses source code with [tree-sitter](https://tree-sitter.github.io/tree-sitter/
 
 ## Features
 
-- **25 languages**: Python, Go, JavaScript, TypeScript, TSX, Rust, Java, C++, C#, C, PHP, Lua, Scala, Kotlin, Ruby, Bash, Zig, Elixir, Haskell, OCaml, HTML, CSS, YAML, TOML, HCL
+- **35 languages**: Python, Go, JavaScript, TypeScript, TSX, Rust, Java, C++, C#, C, PHP, Lua, Scala, Kotlin, Ruby, Bash, Zig, Elixir, Haskell, OCaml, Objective-C, Swift, Dart, Perl, Groovy, Erlang, R, HTML, CSS, SCSS, YAML, TOML, HCL, SQL, Dockerfile
 - **One-command install**: `codebase-memory-mcp install` auto-detects Claude Code and Codex CLI, registers the MCP server, and installs task-specific skills
 - **Self-update**: `codebase-memory-mcp update` downloads the latest release, verifies checksums, and atomically swaps the binary
 - **Task-specific skills**: 4 skills (exploring, tracing, quality, reference) that prescribe exact tool sequences — Claude Code automatically uses graph tools instead of defaulting to grep
@@ -51,20 +51,21 @@ Claude Code formats and explains the results.
 
 **Why no built-in LLM?** Other code graph tools embed an LLM to translate natural language into graph queries. This means extra API keys, extra cost per query, and another model to configure. With MCP, the AI assistant you're already talking to *is* the query translator — no duplication needed.
 
-**Token efficiency**: Compared to having an AI agent grep through your codebase file by file, graph queries return precise results in a single tool call. In benchmarks on a multi-service project (2,348 nodes, 3,853 edges), five structural queries consumed ~3,400 tokens via codebase-memory-mcp versus ~412,000 tokens via file-by-file exploration — a **99.2% reduction**.
+**Token efficiency**: Compared to having an AI agent grep through your codebase file by file, graph queries return precise results in a single tool call. In benchmarks across 35 real-world repos (78 to 49K nodes), five structural queries consumed ~3,400 tokens via codebase-memory-mcp versus ~412,000 tokens via file-by-file exploration — a **99.2% reduction**.
 
 ## Performance
 
-Benchmarked on a multi-service project (~37K nodes, ~35K edges) with Go 1.26 on Apple Silicon:
+Benchmarked on Apple M3 Pro, macOS Darwin 25.3.0:
 
 | Operation | Time | Notes |
 |-----------|------|-------|
-| Fresh index (full codebase) | ~6.3s | 37K nodes, 35K edges |
+| Fresh index (full codebase) | ~6s | 49K nodes, 196K edges (Django) |
 | Incremental reindex | ~1.2s | Content-hash skip for unchanged files |
 | Cypher query (relationship traversal) | <1ms | Up to 600x faster than v0.1.3 for pattern queries |
 | Name search (regex) | <10ms | SQL LIKE pre-filtering narrows before Go regex |
 | Dead code detection | ~150ms | Full graph scan with degree filtering |
-| Trace call path (3 hops) | <10ms | BFS traversal with batch degree counting |
+| Trace call path (depth=5) | <10ms | BFS traversal; 129K-char result on Linux kernel with zero timeouts |
+| Linux kernel stress test | 20K nodes | `drivers/net/ethernet/intel/` — 387 files, 67K edges |
 
 **Token efficiency**: Five structural queries consumed ~3,400 tokens via codebase-memory-mcp versus ~412,000 tokens via file-by-file grep exploration — a **99.2% reduction**.
 
@@ -594,7 +595,7 @@ See [`BENCHMARK.md`](BENCHMARK.md) for the full 35-language benchmark with per-q
 cmd/codebase-memory-mcp/  Entry point (MCP stdio server + CLI mode + install/update commands)
 internal/
   store/                  SQLite graph storage (nodes, edges, traversal, search)
-  lang/                   Language specs (25 languages, tree-sitter node types)
+  lang/                   Language specs (35 languages, tree-sitter node types)
   parser/                 Tree-sitter grammar loading and AST parsing
   pipeline/               4-pass indexing (structure -> definitions -> calls -> HTTP links)
   httplink/               Cross-service HTTP route/call-site matching
