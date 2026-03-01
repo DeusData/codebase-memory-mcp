@@ -10,7 +10,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-func (s *Server) handleIndexRepository(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleIndexRepository(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args, err := parseArgs(req)
 	if err != nil {
 		return errResult(err.Error()), nil
@@ -30,7 +30,7 @@ func (s *Server) handleIndexRepository(_ context.Context, req *mcp.CallToolReque
 		return errResult(fmt.Sprintf("invalid path: %v", err)), nil
 	}
 
-	projectName := filepath.Base(absPath)
+	projectName := pipeline.ProjectNameFromPath(absPath)
 
 	// Lock to prevent concurrent indexing with auto-sync watcher
 	s.indexMu.Lock()
@@ -43,7 +43,7 @@ func (s *Server) handleIndexRepository(_ context.Context, req *mcp.CallToolReque
 	}
 
 	// Run the indexing pipeline
-	p := pipeline.New(st, absPath)
+	p := pipeline.New(ctx, st, absPath)
 	if err := p.Run(); err != nil {
 		return errResult(fmt.Sprintf("indexing failed: %v", err)), nil
 	}

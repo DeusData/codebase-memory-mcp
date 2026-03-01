@@ -57,8 +57,8 @@ func TestCheckForUpdate_NewerAvailable(t *testing.T) {
 	if !strings.Contains(notice, "v99.0.0") {
 		t.Fatalf("notice should mention v99.0.0, got: %s", notice)
 	}
-	if !strings.Contains(notice, "github.com/DeusData/codebase-memory-mcp/releases/tag/v99.0.0") {
-		t.Fatalf("notice should contain releases link, got: %s", notice)
+	if !strings.Contains(notice, "codebase-memory-mcp update") {
+		t.Fatalf("notice should contain update command, got: %s", notice)
 	}
 }
 

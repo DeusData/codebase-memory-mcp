@@ -17,13 +17,22 @@ import (
 var version = "dev"
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "--version" {
-		fmt.Println("codebase-memory-mcp", version)
-		os.Exit(0)
-	}
-
-	if len(os.Args) >= 3 && os.Args[1] == "cli" {
-		os.Exit(runCLI(os.Args[2:]))
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--version":
+			fmt.Println("codebase-memory-mcp", version)
+			os.Exit(0)
+		case "install":
+			os.Exit(runInstall(os.Args[2:]))
+		case "uninstall":
+			os.Exit(runUninstall(os.Args[2:]))
+		case "update":
+			os.Exit(runUpdate(os.Args[2:]))
+		case "cli":
+			if len(os.Args) >= 3 {
+				os.Exit(runCLI(os.Args[2:]))
+			}
+		}
 	}
 
 	router, err := store.NewRouter()

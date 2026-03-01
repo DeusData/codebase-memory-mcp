@@ -6,19 +6,44 @@ import (
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 
+	tree_sitter_bash "github.com/tree-sitter/tree-sitter-bash/bindings/go"
 	tree_sitter_c_sharp "github.com/tree-sitter/tree-sitter-c-sharp/bindings/go"
+	tree_sitter_c "github.com/tree-sitter/tree-sitter-c/bindings/go"
 	tree_sitter_cpp "github.com/tree-sitter/tree-sitter-cpp/bindings/go"
+	tree_sitter_css "github.com/tree-sitter/tree-sitter-css/bindings/go"
 	tree_sitter_go "github.com/tree-sitter/tree-sitter-go/bindings/go"
+	tree_sitter_html "github.com/tree-sitter/tree-sitter-html/bindings/go"
 	tree_sitter_java "github.com/tree-sitter/tree-sitter-java/bindings/go"
 	tree_sitter_javascript "github.com/tree-sitter/tree-sitter-javascript/bindings/go"
+	tree_sitter_ocaml "github.com/tree-sitter/tree-sitter-ocaml/bindings/go"
 	tree_sitter_php "github.com/tree-sitter/tree-sitter-php/bindings/go"
 	tree_sitter_python "github.com/tree-sitter/tree-sitter-python/bindings/go"
+	tree_sitter_ruby "github.com/tree-sitter/tree-sitter-ruby/bindings/go"
 	tree_sitter_rust "github.com/tree-sitter/tree-sitter-rust/bindings/go"
 	tree_sitter_scala "github.com/tree-sitter/tree-sitter-scala/bindings/go"
 	tree_sitter_typescript "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
 
+	tree_sitter_hcl "github.com/tree-sitter-grammars/tree-sitter-hcl/bindings/go"
 	tree_sitter_kotlin "github.com/tree-sitter-grammars/tree-sitter-kotlin/bindings/go"
 	tree_sitter_lua "github.com/tree-sitter-grammars/tree-sitter-lua/bindings/go"
+	tree_sitter_toml "github.com/tree-sitter-grammars/tree-sitter-toml/bindings/go"
+	tree_sitter_yaml "github.com/tree-sitter-grammars/tree-sitter-yaml/bindings/go"
+	tree_sitter_zig "github.com/tree-sitter-grammars/tree-sitter-zig/bindings/go"
+
+	tree_sitter_elixir "github.com/tree-sitter/tree-sitter-elixir/bindings/go"
+	tree_sitter_haskell "github.com/tree-sitter/tree-sitter-haskell/bindings/go"
+
+	tree_sitter_objc "github.com/tree-sitter-grammars/tree-sitter-objc/bindings/go"
+	tree_sitter_scss "github.com/tree-sitter-grammars/tree-sitter-scss/bindings/go"
+
+	tree_sitter_sql "github.com/DerekStride/tree-sitter-sql/bindings/go"
+	tree_sitter_dart "github.com/UserNobody14/tree-sitter-dart/bindings/go"
+	tree_sitter_swift "github.com/alex-pinkus/tree-sitter-swift/bindings/go"
+	tree_sitter_dockerfile "github.com/camdencheek/tree-sitter-dockerfile/bindings/go"
+	tree_sitter_groovy "github.com/murtaza64/tree-sitter-groovy/bindings/go"
+	tree_sitter_r "github.com/r-lib/tree-sitter-r/bindings/go"
+	tree_sitter_erlang "github.com/tree-sitter/tree-sitter-erlang/bindings/go"
+	tree_sitter_perl "github.com/tree-sitter/tree-sitter-perl/bindings/go"
 
 	"github.com/DeusData/codebase-memory-mcp/internal/lang"
 )
@@ -45,6 +70,28 @@ func initLanguages() {
 			lang.Lua:        tree_sitter.NewLanguage(tree_sitter_lua.Language()),
 			lang.Scala:      tree_sitter.NewLanguage(tree_sitter_scala.Language()),
 			lang.Kotlin:     tree_sitter.NewLanguage(tree_sitter_kotlin.Language()),
+			lang.Ruby:       tree_sitter.NewLanguage(tree_sitter_ruby.Language()),
+			lang.C:          tree_sitter.NewLanguage(tree_sitter_c.Language()),
+			lang.Bash:       tree_sitter.NewLanguage(tree_sitter_bash.Language()),
+			lang.Zig:        tree_sitter.NewLanguage(tree_sitter_zig.Language()),
+			lang.Elixir:     tree_sitter.NewLanguage(tree_sitter_elixir.Language()),
+			lang.Haskell:    tree_sitter.NewLanguage(tree_sitter_haskell.Language()),
+			lang.OCaml:      tree_sitter.NewLanguage(tree_sitter_ocaml.LanguageOCaml()),
+			lang.HTML:       tree_sitter.NewLanguage(tree_sitter_html.Language()),
+			lang.CSS:        tree_sitter.NewLanguage(tree_sitter_css.Language()),
+			lang.YAML:       tree_sitter.NewLanguage(tree_sitter_yaml.Language()),
+			lang.TOML:       tree_sitter.NewLanguage(tree_sitter_toml.Language()),
+			lang.HCL:        tree_sitter.NewLanguage(tree_sitter_hcl.Language()),
+			lang.ObjectiveC: tree_sitter.NewLanguage(tree_sitter_objc.Language()),
+			lang.Swift:      tree_sitter.NewLanguage(tree_sitter_swift.Language()),
+			lang.Dart:       tree_sitter.NewLanguage(tree_sitter_dart.Language()),
+			lang.Perl:       tree_sitter.NewLanguage(tree_sitter_perl.Language()),
+			lang.Groovy:     tree_sitter.NewLanguage(tree_sitter_groovy.Language()),
+			lang.SCSS:       tree_sitter.NewLanguage(tree_sitter_scss.Language()),
+			lang.R:          tree_sitter.NewLanguage(tree_sitter_r.Language()),
+			lang.Erlang:     tree_sitter.NewLanguage(tree_sitter_erlang.Language()),
+			lang.SQL:        tree_sitter.NewLanguage(tree_sitter_sql.Language()),
+			lang.Dockerfile: tree_sitter.NewLanguage(tree_sitter_dockerfile.Language()),
 		}
 
 		parserPools = make(map[lang.Language]*sync.Pool, len(languages))

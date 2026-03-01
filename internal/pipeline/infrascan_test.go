@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -728,8 +729,8 @@ services:
       - "80:80"
 `)
 
-	p := New(s, tmpDir)
-	err = s.WithTransaction(func(txStore *store.Store) error {
+	p := New(context.Background(), s, tmpDir)
+	err = s.WithTransaction(context.Background(), func(txStore *store.Store) error {
 		p.Store = txStore
 		_ = txStore.UpsertProject(p.ProjectName, tmpDir)
 		p.passInfraFiles()
@@ -802,8 +803,8 @@ func TestPassInfraFilesIdempotent(t *testing.T) {
 EXPOSE 8080
 `)
 
-	p := New(s, tmpDir)
-	err = s.WithTransaction(func(txStore *store.Store) error {
+	p := New(context.Background(), s, tmpDir)
+	err = s.WithTransaction(context.Background(), func(txStore *store.Store) error {
 		p.Store = txStore
 		_ = txStore.UpsertProject(p.ProjectName, tmpDir)
 		p.passInfraFiles()
@@ -816,7 +817,7 @@ EXPOSE 8080
 	countBefore, _ := s.CountNodes(p.ProjectName)
 
 	// Run again — should delete and recreate (same count)
-	err = s.WithTransaction(func(txStore *store.Store) error {
+	err = s.WithTransaction(context.Background(), func(txStore *store.Store) error {
 		p.Store = txStore
 		_ = txStore.DeleteNodesByLabel(p.ProjectName, "InfraFile")
 		p.passInfraFiles()

@@ -38,6 +38,10 @@ func init() {
 		ImportFromTypes:   []string{"preproc_include", "template_function", "declaration"},
 		PackageIndicators: []string{"CMakeLists.txt", "Makefile", "*.vcxproj", "conanfile.txt"},
 
-		BranchingNodeTypes: []string{"if_statement", "for_statement", "for_range_loop", "while_statement", "switch_statement", "case_statement", "try_statement", "catch_clause"},
+		BranchingNodeTypes:  []string{"if_statement", "for_statement", "for_range_loop", "while_statement", "switch_statement", "case_statement", "try_statement", "catch_clause"},
+		VariableNodeTypes:   []string{"declaration"},
+		AssignmentNodeTypes: []string{"assignment_expression"},
+		ThrowNodeTypes:      []string{"throw_statement"},
+		EnvAccessFunctions:  []string{"getenv", "std::getenv"},
 	})
 }

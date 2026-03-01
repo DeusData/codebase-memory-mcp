@@ -179,7 +179,7 @@ func TestWatcherTriggersOnChange(t *testing.T) {
 	defer r.CloseAll()
 
 	var indexCount atomic.Int32
-	indexFn := func(_, _ string) error {
+	indexFn := func(_ context.Context, _, _ string) error {
 		indexCount.Add(1)
 		return nil
 	}
@@ -226,7 +226,7 @@ func TestWatcherCancellation(t *testing.T) {
 	}
 	defer r.CloseAll()
 
-	w := New(r, func(_, _ string) error { return nil })
+	w := New(r, func(_ context.Context, _, _ string) error { return nil })
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -251,7 +251,7 @@ func TestWatcherSkipsMissingRoot(t *testing.T) {
 	defer r.CloseAll()
 
 	var indexCount atomic.Int32
-	w := New(r, func(_, _ string) error {
+	w := New(r, func(_ context.Context, _, _ string) error {
 		indexCount.Add(1)
 		return nil
 	})
@@ -273,7 +273,7 @@ func TestWatcherNewFileTriggersIndex(t *testing.T) {
 	defer r.CloseAll()
 
 	var indexCount atomic.Int32
-	w := New(r, func(_, _ string) error {
+	w := New(r, func(_ context.Context, _, _ string) error {
 		indexCount.Add(1)
 		return nil
 	})

@@ -18,11 +18,42 @@ const (
 	Scala      Language = "scala"
 	Kotlin     Language = "kotlin"
 	JSON       Language = "json" // Not in AllLanguages(); no LanguageSpec or tree-sitter grammar
+
+	// Programming languages (Tier 1)
+	Ruby       Language = "ruby"
+	C          Language = "c"
+	Bash       Language = "bash"
+	Zig        Language = "zig"
+	Elixir     Language = "elixir"
+	Haskell    Language = "haskell"
+	OCaml      Language = "ocaml"
+	ObjectiveC Language = "objective-c"
+	Swift      Language = "swift"
+	Dart       Language = "dart"
+	Perl       Language = "perl"
+	Groovy     Language = "groovy"
+	Erlang     Language = "erlang"
+	R          Language = "r"
+
+	// Helper languages (Tier 2)
+	HTML       Language = "html"
+	CSS        Language = "css"
+	SCSS       Language = "scss"
+	YAML       Language = "yaml"
+	TOML       Language = "toml"
+	HCL        Language = "hcl"
+	SQL        Language = "sql"
+	Dockerfile Language = "dockerfile"
 )
 
 // AllLanguages returns all supported languages.
 func AllLanguages() []Language {
-	return []Language{Python, JavaScript, TypeScript, TSX, Go, Rust, Java, CPP, CSharp, PHP, Lua, Scala, Kotlin}
+	return []Language{
+		Python, JavaScript, TypeScript, TSX, Go, Rust, Java, CPP, CSharp, PHP, Lua, Scala, Kotlin,
+		Ruby, C, Bash, Zig, Elixir, Haskell, OCaml, ObjectiveC,
+		Swift, Dart, Perl, Groovy, Erlang, R,
+		HTML, CSS, SCSS, YAML, TOML, HCL, SQL, Dockerfile,
+	}
 }
 
 // LanguageSpec defines the tree-sitter node types for a language.

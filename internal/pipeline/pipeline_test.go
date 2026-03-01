@@ -1,6 +1,8 @@
 package pipeline
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -64,7 +66,7 @@ func TestPipelineRun(t *testing.T) {
 	}
 	defer s.Close()
 
-	p := New(s, repoDir)
+	p := New(context.Background(), s, repoDir)
 	if err := p.Run(); err != nil {
 		t.Fatalf("Pipeline.Run: %v", err)
 	}
@@ -148,7 +150,7 @@ class DataProcessor:
 	}
 	defer s.Close()
 
-	p := New(s, dir)
+	p := New(context.Background(), s, dir)
 	if err := p.Run(); err != nil {
 		t.Fatalf("Pipeline.Run: %v", err)
 	}
@@ -203,7 +205,7 @@ func run() {
 	}
 	defer s.Close()
 
-	p := New(s, dir)
+	p := New(context.Background(), s, dir)
 	if err := p.Run(); err != nil {
 		t.Fatalf("Pipeline.Run: %v", err)
 	}
@@ -267,7 +269,7 @@ def process():
 	}
 	defer s.Close()
 
-	p := New(s, dir)
+	p := New(context.Background(), s, dir)
 	if err := p.Run(); err != nil {
 		t.Fatalf("Pipeline.Run: %v", err)
 	}
@@ -333,7 +335,7 @@ def run():
 	}
 	defer s.Close()
 
-	p := New(s, dir)
+	p := New(context.Background(), s, dir)
 	if err := p.Run(); err != nil {
 		t.Fatalf("Pipeline.Run: %v", err)
 	}
@@ -402,7 +404,7 @@ type ID = string
 	}
 	defer s.Close()
 
-	p := New(s, dir)
+	p := New(context.Background(), s, dir)
 	if err := p.Run(); err != nil {
 		t.Fatalf("Pipeline.Run: %v", err)
 	}
@@ -471,7 +473,7 @@ type (
 	}
 	defer s.Close()
 
-	p := New(s, dir)
+	p := New(context.Background(), s, dir)
 	if err := p.Run(); err != nil {
 		t.Fatalf("Pipeline.Run: %v", err)
 	}
@@ -530,7 +532,7 @@ object Config {
 	}
 	defer s.Close()
 
-	p := New(s, dir)
+	p := New(context.Background(), s, dir)
 	if err := p.Run(); err != nil {
 		t.Fatalf("Pipeline.Run: %v", err)
 	}
@@ -574,6 +576,153 @@ object Config {
 	}
 }
 
+// TestLuaAnonymousFunctionExtraction verifies that MoonScript-style Lua code
+// (local f = function(...) end) extracts Function nodes correctly.
+func TestLuaAnonymousFunctionExtraction(t *testing.T) {
+	dir, err := os.MkdirTemp("", "cgm-lua-anon-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	writeFile(t, filepath.Join(dir, "app.lua"), `local run_before_filter
+run_before_filter = function(filter, r)
+  return filter(r)
+end
+
+local validate = function(data)
+  return data ~= nil
+end
+
+function named_func(x)
+  return x + 1
+end
+`)
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	p := New(context.Background(), s, dir)
+	if err := p.Run(); err != nil {
+		t.Fatalf("Pipeline.Run: %v", err)
+	}
+
+	funcs, _ := s.FindNodesByLabel(p.ProjectName, "Function")
+	t.Logf("Lua functions: %d", len(funcs))
+	for _, f := range funcs {
+		t.Logf("  %s (qn=%s)", f.Name, f.QualifiedName)
+	}
+
+	// Expect: run_before_filter, validate, named_func (3 functions)
+	if len(funcs) < 3 {
+		t.Errorf("expected at least 3 functions (incl. anonymous assigned), got %d", len(funcs))
+	}
+
+	// Verify specific functions exist
+	for _, name := range []string{"run_before_filter", "validate", "named_func"} {
+		found, _ := s.FindNodesByName(p.ProjectName, name)
+		if len(found) == 0 {
+			t.Errorf("function %q not found", name)
+		}
+	}
+}
+
+// TestCSharpModernFeatures verifies that modern C# files (file-scoped namespaces,
+// primary constructors, expression-bodied members) are fully extracted.
+func TestCSharpModernFeatures(t *testing.T) {
+	dir, err := os.MkdirTemp("", "cgm-csharp-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	writeFile(t, filepath.Join(dir, "Controller.cs"), `namespace Conduit.Features;
+
+public class UsersController {
+	public void Get() {}
+	public void Create(string name) {}
+}
+`)
+
+	writeFile(t, filepath.Join(dir, "Model.cs"), `namespace Conduit.Models {
+	class User {
+		public string Name { get; set; }
+		public int GetAge() { return 0; }
+	}
+}
+`)
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	p := New(context.Background(), s, dir)
+	if err := p.Run(); err != nil {
+		t.Fatalf("Pipeline.Run: %v", err)
+	}
+
+	modules, _ := s.FindNodesByLabel(p.ProjectName, "Module")
+	t.Logf("C# modules: %d", len(modules))
+	if len(modules) < 2 {
+		t.Errorf("expected at least 2 Module nodes for .cs files, got %d", len(modules))
+	}
+
+	classes, _ := s.FindNodesByLabel(p.ProjectName, "Class")
+	t.Logf("C# classes: %d", len(classes))
+	if len(classes) < 2 {
+		t.Errorf("expected at least 2 Class nodes, got %d", len(classes))
+	}
+
+	methods, _ := s.FindNodesByLabel(p.ProjectName, "Method")
+	t.Logf("C# methods: %d", len(methods))
+	if len(methods) < 3 { // Get, Create, GetAge
+		t.Errorf("expected at least 3 Method nodes, got %d", len(methods))
+	}
+}
+
+// TestBOMStripping verifies that files with UTF-8 BOM are parsed correctly.
+func TestBOMStripping(t *testing.T) {
+	dir, err := os.MkdirTemp("", "cgm-bom-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Write a Go file WITH UTF-8 BOM prefix
+	bom := []byte{0xEF, 0xBB, 0xBF}
+	src := []byte("package main\n\nfunc BOMFunc() {}\n")
+	content := make([]byte, 0, len(bom)+len(src))
+	content = append(content, bom...)
+	content = append(content, src...)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bom.go"), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	p := New(context.Background(), s, dir)
+	if err := p.Run(); err != nil {
+		t.Fatalf("Pipeline.Run: %v", err)
+	}
+
+	found, _ := s.FindNodesByName(p.ProjectName, "BOMFunc")
+	if len(found) == 0 {
+		t.Error("BOMFunc not found — BOM stripping may have failed")
+	}
+}
+
 // TestFunctionRegistry tests the registry in isolation.
 func TestFunctionRegistry(t *testing.T) {
 	r := NewFunctionRegistry()
@@ -612,5 +761,51 @@ func TestFunctionRegistry(t *testing.T) {
 	qn = r.Resolve("Bar", "proj.unrelated", nil)
 	if qn != "proj.pkg.Bar" {
 		t.Errorf("expected proj.pkg.Bar, got %s", qn)
+	}
+}
+
+// TestPipelineRunCancellation verifies that a pre-cancelled context makes Run() return context.Canceled.
+func TestPipelineRunCancellation(t *testing.T) {
+	repoDir, cleanup := setupTestRepo(t)
+	defer cleanup()
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel
+
+	p := New(ctx, s, repoDir)
+	err = p.Run()
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+// TestProjectNameFromPath verifies unique project names from absolute paths.
+func TestProjectNameFromPath(t *testing.T) {
+	tests := []struct{ path, want string }{
+		{"/tmp/bench/erlang/lib/stdlib/src", "tmp-bench-erlang-lib-stdlib-src"},
+		{"/Users/martin/projects/myapp", "Users-martin-projects-myapp"},
+		{"/home/user/repo", "home-user-repo"},
+		{"/single", "single"},
+	}
+	for _, tt := range tests {
+		got := ProjectNameFromPath(tt.path)
+		if got != tt.want {
+			t.Errorf("ProjectNameFromPath(%q) = %q, want %q", tt.path, got, tt.want)
+		}
+	}
+}
+
+// TestProjectNameUniqueness verifies two paths with same base name produce different project names.
+func TestProjectNameUniqueness(t *testing.T) {
+	a := ProjectNameFromPath("/tmp/bench/zig/lib/std")
+	b := ProjectNameFromPath("/tmp/bench/erlang/lib/stdlib/src")
+	if a == b {
+		t.Errorf("collision: %q == %q", a, b)
 	}
 }

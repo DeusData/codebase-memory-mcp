@@ -21,6 +21,7 @@ type RouteHandler struct {
 	QualifiedName     string
 	HandlerRef        string // resolved handler function reference (e.g. "h.CreateOrder")
 	ResolvedHandlerQN string // set by createRegistrationCallEdges — actual handler QN
+	Protocol          string // "ws", "sse", or "" (standard HTTP)
 }
 
 // HTTPCallSite represents a discovered HTTP call site.
@@ -70,25 +71,27 @@ func (l *Linker) AddCallSites(sites []HTTPCallSite) {
 
 // regex patterns for route and URL discovery
 var (
-	// Python decorators: @app.post("/path"), @router.get("/path")
-	pyRouteRe = regexp.MustCompile(`@\w+\.(get|post|put|delete|patch)\(\s*["']([^"']+)["']`)
+	// Python decorators: @app.post("/path"), @router.get(""), @router.get("/path")
+	pyRouteRe = regexp.MustCompile(`@\w+\.(get|post|put|delete|patch)\(\s*["']([^"']*)["']`)
 
-	// Go gin routes: .POST("/path", .GET("/path"
-	goRouteRe = regexp.MustCompile(`\.(GET|POST|PUT|DELETE|PATCH)\(\s*["']([^"']+)["']`)
+	// Go gin/chi routes: .POST("/path"), .Get("/path"), .POST("", handler)
+	goRouteRe = regexp.MustCompile(`\.(GET|POST|PUT|DELETE|PATCH|Get|Post|Put|Delete|Patch)\(\s*["']([^"']*)["']`)
 
 	// Go gin group: .Group("/prefix")
 	goGroupRe = regexp.MustCompile(`(\w+)\s*(?::=|=)\s*\w+\.Group\(\s*["']([^"']+)["']`)
 
-	// Go gin route handler reference: captures the last argument (handler, not middleware)
-	// .POST("/path", h.CreateOrder) or .POST("/path", middleware, h.CreateOrder)
-	goRouteHandlerRe = regexp.MustCompile(`\.(GET|POST|PUT|DELETE|PATCH)\s*\(\s*"[^"]*"\s*(?:,\s*[\w.]+)*,\s*([\w.]+)\s*\)`)
+	// Go gin/chi route handler reference: captures the last argument (handler, not middleware)
+	// .POST("/path", h.CreateOrder) or .Get("/path", handler)
+	goRouteHandlerRe = regexp.MustCompile(`\.(GET|POST|PUT|DELETE|PATCH|Get|Post|Put|Delete|Patch)\s*\(\s*"[^"]*"\s*(?:,\s*[\w.]+)*,\s*([\w.]+)\s*\)`)
 
-	// Express.js routes: app.get("/path", router.post("/path"
-	expressRouteRe = regexp.MustCompile(`\w+\.(get|post|put|delete|patch)\(\s*["'` + "`" + `]([^"'` + "`" + `]+)["'` + "`" + `]`)
+	// Go chi: r.Route("/prefix", func(r chi.Router) { ... })
+	goChiRouteRe = regexp.MustCompile(`\.Route\(\s*"([^"]+)"\s*,\s*func`)
 
-	// Express.js handler reference: captures last named argument (handler, not middleware)
-	// app.get("/path", handler) or app.get("/path", middleware, handler)
-	expressHandlerRe = regexp.MustCompile(`\w+\.(get|post|put|delete|patch)\(\s*["'` + "`" + `][^"'` + "`" + `]+["'` + "`" + `]\s*(?:,\s*[\w.]+)*,\s*([\w.]+)\s*\)`)
+	// Express.js routes: captures (receiver).(method)("path") — filtered by allowlist
+	expressRouteRe = regexp.MustCompile(`(\w+)\.(get|post|put|delete|patch)\(\s*["'` + "`" + `]([^"'` + "`" + `]+)["'` + "`" + `]`)
+
+	// Express.js handler reference: captures (receiver).(method)("path", ..., handler)
+	expressHandlerRe = regexp.MustCompile(`(\w+)\.(get|post|put|delete|patch)\(\s*["'` + "`" + `][^"'` + "`" + `]+["'` + "`" + `]\s*(?:,\s*[\w.]+)*,\s*([\w.]+)\s*\)`)
 
 	// Java Spring annotations: @GetMapping("/path"), @PostMapping, @RequestMapping
 	springMappingRe = regexp.MustCompile(`@(Get|Post|Put|Delete|Patch|Request)Mapping\(\s*(?:value\s*=\s*)?["']([^"']+)["']`)
@@ -98,6 +101,13 @@ var (
 
 	// PHP Laravel routes: Route::get("/path", Route::post("/path"
 	laravelRouteRe = regexp.MustCompile(`Route::(get|post|put|delete|patch)\(\s*["']([^"']+)["']`)
+
+	// C# ASP.NET route attributes: [HttpGet("/path")], [Route("/path")]
+	aspnetRouteRe     = regexp.MustCompile(`\[(Http(?:Get|Post|Put|Delete|Patch))\(\s*"([^"]+)"`)
+	aspnetRouteAttrRe = regexp.MustCompile(`\[Route\(\s*"([^"]+)"`)
+
+	// Kotlin Ktor routes: get("/path") {, post("/path") {
+	ktorRouteRe = regexp.MustCompile(`\b(get|post|put|delete|patch)\(\s*"([^"]+)"\s*\)`)
 
 	// Laravel handler: Route::get("/path", [Controller::class, "method"]) or "Controller@method"
 	laravelHandlerArrayRe = regexp.MustCompile(`Route::(get|post|put|delete|patch)\(\s*["'][^"']+["']\s*,\s*\[(\w+)::class\s*,\s*["'](\w+)["']\]`)
@@ -109,10 +119,39 @@ var (
 	// Path-only patterns: "/api/something" (quoted paths starting with /)
 	pathRe = regexp.MustCompile(`["'](/[a-zA-Z0-9_/:.\-]{2,})["']`)
 
+	// Python WebSocket routes: @app.websocket("/path"), @app.websocket("")
+	pyWSRouteRe = regexp.MustCompile(`@\w+\.websocket\(\s*["']([^"']*)["']`)
+
+	// Spring WebSocket: @MessageMapping("/path")
+	springWSRe = regexp.MustCompile(`@MessageMapping\(\s*["']([^"']+)["']`)
+
+	// Kotlin Ktor WebSocket: webSocket("/path") {
+	ktorWSRe = regexp.MustCompile(`\bwebSocket\(\s*"([^"]+)"\s*\)`)
+
+	// FastAPI prefix: app.include_router(var, prefix="/prefix")
+	fastAPIIncludeRe = regexp.MustCompile(`\.include_router\(\s*(\w+)\s*,\s*prefix\s*=\s*["']([^"']+)["']`)
+
+	// Python import: from module.path import var_name
+	pyImportRe = regexp.MustCompile(`from\s+([\w.]+)\s+import\s+(\w+)`)
+
+	// Express prefix: app.use("/prefix", routerVar)
+	expressUseRe = regexp.MustCompile(`\.use\(\s*["'` + "`" + `]([^"'` + "`" + `]+)["'` + "`" + `]\s*,\s*(\w+)`)
+
+	// JS/TS import patterns for router variable resolution
+	jsRequireRe = regexp.MustCompile(`(?:const|let|var)\s+(\w+)\s*=\s*require\(\s*["']([^"']+)["']`)
+	jsImportRe  = regexp.MustCompile(`import\s+(\w+)\s+from\s+["']([^"']+)["']`)
+
 	// Path param normalizers
 	colonParamRe = regexp.MustCompile(`:[a-zA-Z_]+`)
 	braceParamRe = regexp.MustCompile(`\{[a-zA-Z_]+\}`)
 )
+
+// expressReceiverAllowlist restricts Express route matching to known router variable names.
+// Prevents false positives from req.get("Header"), res.get("key"), map.get("key"), etc.
+var expressReceiverAllowlist = map[string]bool{
+	"app": true, "router": true, "server": true, "api": true,
+	"routes": true, "express": true, "route": true,
+}
 
 // Run executes the HTTP linking pass.
 func (l *Linker) Run() ([]HTTPLink, error) {
@@ -139,13 +178,15 @@ func (l *Linker) Run() ([]HTTPLink, error) {
 	}
 
 	// Resolve cross-file group prefixes before inserting Route nodes
-	l.resolveCrossFileGroupPrefixes(routes, rootPath)
+	l.resolveCrossFileGroupPrefixes(routes, rootPath) // Go gin
+	l.resolveFastAPIPrefixes(routes, rootPath)        // Python FastAPI
+	l.resolveExpressPrefixes(routes, rootPath)        // JS/TS Express
 
 	// Resolve handler references first so insertRouteNodes can use the actual handler QN
 	l.createRegistrationCallEdges(routes)
 
 	// Insert Route nodes and HANDLES edges (uses ResolvedHandlerQN from above)
-	l.insertRouteNodes(routes)
+	l.insertRouteNodes(routes, rootPath)
 
 	callSites := l.discoverCallSites(rootPath)
 	callSites = append(callSites, l.extraCallSites...)
@@ -159,71 +200,117 @@ func (l *Linker) Run() ([]HTTPLink, error) {
 
 // insertRouteNodes creates Route nodes for each discovered route handler and
 // HANDLES edges from the handler function to the Route node.
-func (l *Linker) insertRouteNodes(routes []RouteHandler) {
-	for _, rh := range routes {
-		normalMethod := rh.Method
-		if normalMethod == "" {
-			normalMethod = "ANY"
-		}
-		normalPath := strings.ReplaceAll(rh.Path, "/", "_")
-		normalPath = strings.Trim(normalPath, "_")
-		routeQN := rh.QualifiedName + ".route." + normalMethod + "." + normalPath
-		routeName := normalMethod + " " + rh.Path
-
-		// Use resolved handler QN if available, otherwise fall back to registering function
-		handlerQN := rh.QualifiedName
-		if rh.ResolvedHandlerQN != "" {
-			handlerQN = rh.ResolvedHandlerQN
-		}
-
-		// Look up handler node BEFORE creating Route — we need its file_path
-		handlerNode, _ := l.store.FindNodeByQN(l.project, handlerQN)
-
-		// Inherit file_path from handler function
-		var filePath string
-		if handlerNode != nil && handlerNode.FilePath != "" {
-			filePath = handlerNode.FilePath
-		}
-
-		routeID, err := l.store.UpsertNode(&store.Node{
-			Project:       l.project,
-			Label:         "Route",
-			Name:          routeName,
-			QualifiedName: routeQN,
-			FilePath:      filePath,
-			Properties: map[string]any{
-				"method":  rh.Method,
-				"path":    rh.Path,
-				"handler": handlerQN,
-			},
-		})
-		if err != nil || routeID == 0 {
-			continue
-		}
-
-		// Create HANDLES edge from actual handler → Route
-		if handlerNode != nil {
-			if _, edgeErr := l.store.InsertEdge(&store.Edge{
-				Project:  l.project,
-				SourceID: handlerNode.ID,
-				TargetID: routeID,
-				Type:     "HANDLES",
-			}); edgeErr != nil {
-				// FK failures expected: LastInsertId() can return stale IDs for upserted Route nodes
-				slog.Info("httplink.handles_edge.skip", "route", routeQN)
-			}
-
-			// Mark handler as entry point (for dead code detection)
-			if handlerNode.Properties == nil {
-				handlerNode.Properties = map[string]any{}
-			}
-			handlerNode.Properties["is_entry_point"] = true
-			if _, upsertErr := l.store.UpsertNode(handlerNode); upsertErr != nil {
-				slog.Warn("httplink.entry_point.err", "err", upsertErr)
-			}
-		}
+func (l *Linker) insertRouteNodes(routes []RouteHandler, rootPath string) {
+	for i := range routes {
+		l.insertSingleRouteNode(&routes[i], rootPath)
 	}
 	slog.Info("httplink.route_nodes", "count", len(routes))
+}
+
+// insertSingleRouteNode creates a Route node and HANDLES edge for one route handler.
+func (l *Linker) insertSingleRouteNode(rh *RouteHandler, rootPath string) {
+	normalMethod := rh.Method
+	if normalMethod == "" {
+		normalMethod = "ANY"
+	}
+	normalPath := strings.ReplaceAll(rh.Path, "/", "_")
+	normalPath = strings.Trim(normalPath, "_")
+	routeQN := rh.QualifiedName + ".route." + normalMethod + "." + normalPath
+	routeName := normalMethod + " " + rh.Path
+
+	// Use resolved handler QN if available, otherwise fall back to registering function
+	handlerQN := rh.QualifiedName
+	if rh.ResolvedHandlerQN != "" {
+		handlerQN = rh.ResolvedHandlerQN
+	}
+
+	// Look up handler node BEFORE creating Route — we need its file_path
+	handlerNode, _ := l.store.FindNodeByQN(l.project, handlerQN)
+
+	routeProps := l.buildRouteProps(rh, handlerNode, rootPath)
+
+	// Inherit file_path and line range from handler function
+	var filePath string
+	var startLine, endLine int
+	if handlerNode != nil {
+		if handlerNode.FilePath != "" {
+			filePath = handlerNode.FilePath
+		}
+		startLine = handlerNode.StartLine
+		endLine = handlerNode.EndLine
+	}
+
+	routeID, err := l.store.UpsertNode(&store.Node{
+		Project:       l.project,
+		Label:         "Route",
+		Name:          routeName,
+		QualifiedName: routeQN,
+		FilePath:      filePath,
+		StartLine:     startLine,
+		EndLine:       endLine,
+		Properties:    routeProps,
+	})
+	if err != nil || routeID == 0 {
+		return
+	}
+
+	l.linkHandlerToRoute(handlerNode, routeID, routeQN)
+}
+
+// buildRouteProps constructs the properties map for a Route node, including protocol detection.
+func (l *Linker) buildRouteProps(rh *RouteHandler, handlerNode *store.Node, rootPath string) map[string]any {
+	handlerQN := rh.QualifiedName
+	if rh.ResolvedHandlerQN != "" {
+		handlerQN = rh.ResolvedHandlerQN
+	}
+
+	routeProps := map[string]any{
+		"method":  rh.Method,
+		"path":    rh.Path,
+		"handler": handlerQN,
+	}
+
+	// Protocol from route extraction (Python websocket, Spring MessageMapping, Ktor webSocket)
+	if rh.Protocol != "" {
+		routeProps["protocol"] = rh.Protocol
+		return routeProps
+	}
+
+	// Detect protocol from handler source if not already set
+	if handlerNode != nil && handlerNode.FilePath != "" && handlerNode.StartLine > 0 {
+		handlerSource := readSourceLines(rootPath, handlerNode.FilePath, handlerNode.StartLine, handlerNode.EndLine)
+		if protocol := detectProtocol(handlerSource); protocol != "" {
+			routeProps["protocol"] = protocol
+		}
+	}
+
+	return routeProps
+}
+
+// linkHandlerToRoute creates HANDLES edge and marks handler as entry point.
+func (l *Linker) linkHandlerToRoute(handlerNode *store.Node, routeID int64, routeQN string) {
+	if handlerNode == nil {
+		return
+	}
+
+	if _, edgeErr := l.store.InsertEdge(&store.Edge{
+		Project:  l.project,
+		SourceID: handlerNode.ID,
+		TargetID: routeID,
+		Type:     "HANDLES",
+	}); edgeErr != nil {
+		// FK failures expected: LastInsertId() can return stale IDs for upserted Route nodes
+		slog.Info("httplink.handles_edge.skip", "route", routeQN)
+	}
+
+	// Mark handler as entry point (for dead code detection)
+	if handlerNode.Properties == nil {
+		handlerNode.Properties = map[string]any{}
+	}
+	handlerNode.Properties["is_entry_point"] = true
+	if _, upsertErr := l.store.UpsertNode(handlerNode); upsertErr != nil {
+		slog.Warn("httplink.entry_point.err", "err", upsertErr)
+	}
 }
 
 // discoverRoutes finds route handler registrations from Function nodes.
@@ -243,6 +330,9 @@ func (l *Linker) discoverRoutes(rootPath string) []RouteHandler {
 		funcs = append(funcs, methods...)
 	}
 
+	// Track which PHP files have Function/Method nodes (for dedup in module scan)
+	phpFilesWithFuncs := map[string]bool{}
+
 	for _, f := range funcs {
 		// Python: check decorators property
 		routes = append(routes, extractPythonRoutes(f)...)
@@ -253,14 +343,56 @@ func (l *Linker) discoverRoutes(rootPath string) []RouteHandler {
 		// Rust: check attribute decorators (Actix)
 		routes = append(routes, extractRustRoutes(f)...)
 
-		// Source-based route discovery (Go gin, Express.js, PHP Laravel)
+		// C# ASP.NET: check attribute decorators
+		routes = append(routes, extractASPNetRoutes(f)...)
+
+		// Source-based route discovery (Go gin, Express.js, PHP Laravel, Kotlin Ktor)
 		if f.FilePath != "" && f.StartLine > 0 && f.EndLine > 0 {
 			source := readSourceLines(rootPath, f.FilePath, f.StartLine, f.EndLine)
 			if source != "" {
 				routes = append(routes, extractGoRoutes(f, source)...)
 				routes = append(routes, extractExpressRoutes(f, source)...)
 				routes = append(routes, extractLaravelRoutes(f, source)...)
+				routes = append(routes, extractKtorRoutes(f, source)...)
 			}
+		}
+
+		if strings.HasSuffix(f.FilePath, ".php") {
+			phpFilesWithFuncs[f.FilePath] = true
+		}
+	}
+
+	// Module-level route scanning: some frameworks register routes at file top level
+	// (not inside any function body). Scan modules for route patterns.
+	modules, err := l.store.FindNodesByLabel(l.project, "Module")
+	if err != nil {
+		slog.Warn("httplink.routes.modules.err", "err", err)
+		return routes
+	}
+
+	for _, m := range modules {
+		isPHP := strings.HasSuffix(m.FilePath, ".php")
+		isJSTS := strings.HasSuffix(m.FilePath, ".js") ||
+			strings.HasSuffix(m.FilePath, ".ts") ||
+			strings.HasSuffix(m.FilePath, ".mjs") ||
+			strings.HasSuffix(m.FilePath, ".mts")
+
+		if !isPHP && !isJSTS {
+			continue
+		}
+		// For PHP: skip files where routes were already extracted from function bodies
+		if isPHP && phpFilesWithFuncs[m.FilePath] {
+			continue
+		}
+		source := readSourceFull(rootPath, m.FilePath)
+		if source == "" {
+			continue
+		}
+		if isPHP {
+			routes = append(routes, extractLaravelRoutes(m, source)...)
+		}
+		if isJSTS {
+			routes = append(routes, extractExpressRoutes(m, source)...)
 		}
 	}
 
@@ -287,6 +419,7 @@ func extractPythonRoutes(f *store.Node) []RouteHandler {
 		if !ok {
 			continue
 		}
+		// Standard HTTP routes
 		matches := pyRouteRe.FindAllStringSubmatch(decStr, -1)
 		for _, m := range matches {
 			routes = append(routes, RouteHandler{
@@ -296,30 +429,55 @@ func extractPythonRoutes(f *store.Node) []RouteHandler {
 				QualifiedName: f.QualifiedName,
 			})
 		}
+		// WebSocket routes: @app.websocket("/path")
+		if wm := pyWSRouteRe.FindStringSubmatch(decStr); wm != nil {
+			routes = append(routes, RouteHandler{
+				Path:          wm[1],
+				Method:        "WS",
+				Protocol:      "ws",
+				FunctionName:  f.Name,
+				QualifiedName: f.QualifiedName,
+			})
+		}
 	}
 
 	return routes
 }
 
-// extractGoRoutes extracts route registrations from Go source code (gin patterns).
-// Resolves router group prefixes by matching variable names in Group() calls
-// to the receiver of .GET/.POST calls (e.g., contracts.POST("", ...) where
-// contracts := rg.Group("/contracts")).
+// extractGoRoutes extracts route registrations from Go source code (gin/chi patterns).
+// Resolves gin group prefixes and chi r.Route("/prefix", func...) blocks.
 func extractGoRoutes(f *store.Node, source string) []RouteHandler {
-	// Preallocate: most functions register a few routes
 	routes := make([]RouteHandler, 0, 4)
 
-	// Build a map of variable name → group prefix from Group() calls
+	// Build a map of variable name → group prefix from gin Group() calls
 	groupPrefixes := map[string]string{}
 	for _, gm := range goGroupRe.FindAllStringSubmatch(source, -1) {
-		varName := gm[1]
-		prefix := gm[2]
-		groupPrefixes[varName] = prefix
+		groupPrefixes[gm[1]] = gm[2]
 	}
 
-	// Match route registrations and try to prepend group prefix
+	// Chi Route() prefix stack for nested r.Route("/prefix", func...) blocks
+	type chiBlock struct {
+		prefix string
+		depth  int
+	}
+	var chiStack []chiBlock
+	braceDepth := 0
+
 	lines := strings.Split(source, "\n")
 	for _, line := range lines {
+		// Detect chi .Route("/prefix", func...) blocks
+		if cm := goChiRouteRe.FindStringSubmatch(line); cm != nil {
+			chiStack = append(chiStack, chiBlock{prefix: cm[1], depth: braceDepth})
+		}
+
+		// Track brace depth
+		braceDepth += strings.Count(line, "{") - strings.Count(line, "}")
+
+		// Pop closed chi blocks
+		for len(chiStack) > 0 && braceDepth <= chiStack[len(chiStack)-1].depth {
+			chiStack = chiStack[:len(chiStack)-1]
+		}
+
 		rm := goRouteRe.FindStringSubmatch(line)
 		if rm == nil {
 			continue
@@ -327,13 +485,24 @@ func extractGoRoutes(f *store.Node, source string) []RouteHandler {
 		method := strings.ToUpper(rm[1])
 		path := rm[2]
 
-		// Try to resolve group prefix from the receiver variable
-		path = resolveGroupPrefix(line, rm[1], path, groupPrefixes)
+		// Apply chi prefix stack if active, otherwise try gin group resolution
+		if len(chiStack) > 0 {
+			var fullPrefix string
+			for _, block := range chiStack {
+				fullPrefix = strings.TrimRight(fullPrefix, "/") + "/" + strings.TrimLeft(block.prefix, "/")
+			}
+			if path == "/" || path == "" {
+				path = fullPrefix
+			} else {
+				path = strings.TrimRight(fullPrefix, "/") + "/" + strings.TrimLeft(path, "/")
+			}
+		} else {
+			path = resolveGroupPrefix(line, rm[1], path, groupPrefixes)
+		}
 
 		// Capture handler reference (last argument) for CALLS edge creation
 		var handlerRef string
-		hm := goRouteHandlerRe.FindStringSubmatch(line)
-		if hm != nil {
+		if hm := goRouteHandlerRe.FindStringSubmatch(line); hm != nil {
 			handlerRef = hm[2]
 		}
 
@@ -375,33 +544,41 @@ func resolveGroupPrefix(line, method, path string, groupPrefixes map[string]stri
 }
 
 // extractExpressRoutes extracts route registrations from JS/TS source (Express/Koa patterns).
+// Uses receiver allowlist to avoid false positives from req.get(), res.get(), etc.
 func extractExpressRoutes(f *store.Node, source string) []RouteHandler {
-	// Build a per-line handler ref map for quick lookup
-	handlerRefs := map[string]string{} // "METHOD path" → handler ref
-	for _, line := range strings.Split(source, "\n") {
-		hm := expressHandlerRe.FindStringSubmatch(line)
-		if hm != nil {
-			key := strings.ToUpper(hm[1]) + " " + hm[0] // unique enough per line
-			handlerRefs[key] = hm[2]
-		}
-	}
-
 	routes := make([]RouteHandler, 0, 4)
 	for _, line := range strings.Split(source, "\n") {
 		rm := expressRouteRe.FindStringSubmatch(line)
 		if rm == nil {
 			continue
 		}
+		// rm[1]=receiver, rm[2]=method, rm[3]=path
+		receiver := strings.ToLower(rm[1])
+		if !expressReceiverAllowlist[receiver] {
+			continue
+		}
+
+		// Express overloads .get(): with 1 arg it's a config getter (app.get('trust proxy')),
+		// with 2+ args it's a route (app.get('/path', handler)). Only .get() has this
+		// overload — .post/.put/.delete/.patch are always routes.
+		if strings.EqualFold(rm[2], "get") {
+			// Check if there's a comma after the closing quote — indicates a callback/handler arg
+			matchEnd := strings.Index(line, rm[0]) + len(rm[0])
+			rest := strings.TrimSpace(line[matchEnd:])
+			if !strings.HasPrefix(rest, ",") {
+				continue // Single-arg app.get('setting') — config getter, skip
+			}
+		}
 
 		var handlerRef string
 		hm := expressHandlerRe.FindStringSubmatch(line)
 		if hm != nil {
-			handlerRef = hm[2]
+			handlerRef = hm[3] // group 3 after adding receiver capture
 		}
 
 		routes = append(routes, RouteHandler{
-			Path:          rm[2],
-			Method:        strings.ToUpper(rm[1]),
+			Path:          rm[3],
+			Method:        strings.ToUpper(rm[2]),
 			FunctionName:  f.Name,
 			QualifiedName: f.QualifiedName,
 			HandlerRef:    handlerRef,
@@ -426,6 +603,7 @@ func extractJavaRoutes(f *store.Node) []RouteHandler {
 		if !ok {
 			continue
 		}
+		// Standard Spring HTTP mappings
 		matches := springMappingRe.FindAllStringSubmatch(decStr, -1)
 		for _, m := range matches {
 			method := strings.ToUpper(m[1])
@@ -435,6 +613,16 @@ func extractJavaRoutes(f *store.Node) []RouteHandler {
 			routes = append(routes, RouteHandler{
 				Path:          m[2],
 				Method:        method,
+				FunctionName:  f.Name,
+				QualifiedName: f.QualifiedName,
+			})
+		}
+		// Spring WebSocket: @MessageMapping("/path")
+		if wm := springWSRe.FindStringSubmatch(decStr); wm != nil {
+			routes = append(routes, RouteHandler{
+				Path:          wm[1],
+				Method:        "WS",
+				Protocol:      "ws",
 				FunctionName:  f.Name,
 				QualifiedName: f.QualifiedName,
 			})
@@ -496,6 +684,78 @@ func extractLaravelRoutes(f *store.Node, source string) []RouteHandler {
 			QualifiedName: f.QualifiedName,
 			HandlerRef:    handlerRef,
 		})
+	}
+	return routes
+}
+
+// extractASPNetRoutes extracts route handlers from C# ASP.NET attribute metadata.
+func extractASPNetRoutes(f *store.Node) []RouteHandler {
+	var routes []RouteHandler
+
+	decs, ok := f.Properties["decorators"]
+	if !ok {
+		return routes
+	}
+
+	decList, ok := decs.([]any)
+	if !ok {
+		return routes
+	}
+
+	for _, d := range decList {
+		decStr, ok := d.(string)
+		if !ok {
+			continue
+		}
+		// [HttpGet("/path")] pattern
+		matches := aspnetRouteRe.FindAllStringSubmatch(decStr, -1)
+		for _, m := range matches {
+			method := strings.TrimPrefix(m[1], "Http")
+			routes = append(routes, RouteHandler{
+				Path:          m[2],
+				Method:        strings.ToUpper(method),
+				FunctionName:  f.Name,
+				QualifiedName: f.QualifiedName,
+			})
+		}
+		// [Route("/path")] pattern
+		routeMatches := aspnetRouteAttrRe.FindAllStringSubmatch(decStr, -1)
+		for _, m := range routeMatches {
+			routes = append(routes, RouteHandler{
+				Path:          m[1],
+				Method:        "",
+				FunctionName:  f.Name,
+				QualifiedName: f.QualifiedName,
+			})
+		}
+	}
+	return routes
+}
+
+// extractKtorRoutes extracts route handlers from Kotlin Ktor source code.
+func extractKtorRoutes(f *store.Node, source string) []RouteHandler {
+	routes := make([]RouteHandler, 0, 4)
+	for _, line := range strings.Split(source, "\n") {
+		// Standard HTTP routes
+		if rm := ktorRouteRe.FindStringSubmatch(line); rm != nil {
+			routes = append(routes, RouteHandler{
+				Path:          rm[2],
+				Method:        strings.ToUpper(rm[1]),
+				FunctionName:  f.Name,
+				QualifiedName: f.QualifiedName,
+			})
+			continue
+		}
+		// WebSocket routes: webSocket("/path") {
+		if wm := ktorWSRe.FindStringSubmatch(line); wm != nil {
+			routes = append(routes, RouteHandler{
+				Path:          wm[1],
+				Method:        "WS",
+				Protocol:      "ws",
+				FunctionName:  f.Name,
+				QualifiedName: f.QualifiedName,
+			})
+		}
 	}
 	return routes
 }
@@ -624,6 +884,10 @@ var httpClientKeywords = []string{
 	"curl_easy", "cpr::Get", "cpr::Post", "httplib::",
 	// Lua
 	"socket.http", "http.request", "curl.",
+	// C#
+	"HttpClient", "WebClient", "RestClient", "HttpWebRequest",
+	// Kotlin
+	"OkHttpClient", "HttpClient", "ktor.client",
 	// Generic
 	"send_request", "http_client",
 }
@@ -641,6 +905,41 @@ var asyncDispatchKeywords = []string{
 	"basic_publish",
 	// Kafka — consumer often fronted by HTTP
 	"producer.send", "producer.Send",
+}
+
+// wsPatterns indicate WebSocket usage in handler source.
+var wsPatterns = []string{
+	// Go: gorilla/nhooyr websocket
+	"websocket.Upgrade", "websocket.Accept", "upgrader.Upgrade",
+	// JS/TS: ws library, socket.io
+	`ws.on("connection`, `io.on("connection`, "new WebSocket(",
+	// Generic
+	"WebSocketSession", "wsHandler",
+}
+
+// ssePatterns indicate Server-Sent Events usage in handler source.
+var ssePatterns = []string{
+	"text/event-stream",
+	"EventSourceResponse",
+	"SseEmitter",
+	"ServerSentEvent",
+	"event-stream",
+}
+
+// detectProtocol checks handler source for WebSocket or SSE patterns.
+// Returns "ws", "sse", or "" (standard HTTP).
+func detectProtocol(source string) string {
+	for _, p := range wsPatterns {
+		if strings.Contains(source, p) {
+			return "ws"
+		}
+	}
+	for _, p := range ssePatterns {
+		if strings.Contains(source, p) {
+			return "sse"
+		}
+	}
+	return ""
 }
 
 // extractFunctionCallSites extracts HTTP paths from function source code.
@@ -811,7 +1110,7 @@ func extractJSONStringPaths(text string) []string {
 
 // findJSONBounds extracts substrings that look like JSON objects or arrays.
 func findJSONBounds(text string) []string {
-	var results []string
+	results := make([]string, 0, 4)
 	for _, opener := range []byte{'{', '['} {
 		closer := byte('}')
 		if opener == '[' {
@@ -1138,6 +1437,151 @@ func sourceWeight(label string) float64 {
 	}
 }
 
+// resolveFastAPIPrefixes resolves include_router prefixes for FastAPI routes.
+// Scans Python Module files for app.include_router(var, prefix="/prefix") calls
+// and prepends the prefix to routes from the imported module.
+func (l *Linker) resolveFastAPIPrefixes(routes []RouteHandler, rootPath string) {
+	modules, err := l.store.FindNodesByLabel(l.project, "Module")
+	if err != nil {
+		return
+	}
+
+	for _, mod := range modules {
+		if !strings.HasSuffix(mod.FilePath, ".py") {
+			continue
+		}
+
+		source, readErr := os.ReadFile(filepath.Join(rootPath, mod.FilePath))
+		if readErr != nil {
+			continue
+		}
+		srcStr := string(source)
+
+		includes := fastAPIIncludeRe.FindAllStringSubmatch(srcStr, -1)
+		if len(includes) == 0 {
+			continue
+		}
+
+		// Build import map: var_name → dotted module path
+		imports := map[string]string{}
+		for _, m := range pyImportRe.FindAllStringSubmatch(srcStr, -1) {
+			imports[m[2]] = m[1] // var_name → module.path
+		}
+
+		for _, inc := range includes {
+			varName := inc[1]
+			prefix := inc[2]
+
+			modulePath, ok := imports[varName]
+			if !ok {
+				continue
+			}
+
+			// Convert dotted module path to file path fragment
+			fileFrag := strings.ReplaceAll(modulePath, ".", "/")
+			normalizedPrefix := strings.TrimRight(prefix, "/")
+
+			prefixed := 0
+			for i := range routes {
+				if strings.HasPrefix(routes[i].Path, normalizedPrefix) {
+					continue
+				}
+				// Match routes whose QN contains the imported module path
+				if strings.Contains(routes[i].QualifiedName, fileFrag+".py") ||
+					strings.Contains(routes[i].QualifiedName, fileFrag+"/") {
+					routes[i].Path = normalizedPrefix + "/" + strings.TrimLeft(routes[i].Path, "/")
+					prefixed++
+				}
+			}
+			if prefixed > 0 {
+				slog.Info("httplink.fastapi_prefix", "prefix", prefix, "module", modulePath, "routes", prefixed)
+			}
+		}
+	}
+}
+
+// resolveExpressPrefixes resolves app.use("/prefix", router) for Express routes.
+// Scans JS/TS Module files for .use("/prefix", routerVar) calls and prepends
+// the prefix to routes from the imported module.
+func (l *Linker) resolveExpressPrefixes(routes []RouteHandler, rootPath string) {
+	modules, err := l.store.FindNodesByLabel(l.project, "Module")
+	if err != nil {
+		return
+	}
+
+	for _, mod := range modules {
+		if !isJSTSModule(mod.FilePath) {
+			continue
+		}
+
+		source, readErr := os.ReadFile(filepath.Join(rootPath, mod.FilePath))
+		if readErr != nil {
+			continue
+		}
+		srcStr := string(source)
+
+		uses := expressUseRe.FindAllStringSubmatch(srcStr, -1)
+		if len(uses) == 0 {
+			continue
+		}
+
+		imports := buildJSImportMap(srcStr)
+		l.applyExpressUsePrefixes(routes, uses, imports)
+	}
+}
+
+// isJSTSModule returns true if the file path is a JS/TS module file.
+func isJSTSModule(filePath string) bool {
+	return strings.HasSuffix(filePath, ".js") || strings.HasSuffix(filePath, ".ts") ||
+		strings.HasSuffix(filePath, ".mjs") || strings.HasSuffix(filePath, ".tsx")
+}
+
+// buildJSImportMap builds a map of var_name to module path from require/import statements.
+func buildJSImportMap(src string) map[string]string {
+	imports := map[string]string{}
+	for _, m := range jsRequireRe.FindAllStringSubmatch(src, -1) {
+		imports[m[1]] = m[2]
+	}
+	for _, m := range jsImportRe.FindAllStringSubmatch(src, -1) {
+		imports[m[1]] = m[2]
+	}
+	return imports
+}
+
+// applyExpressUsePrefixes applies .use("/prefix", routerVar) prefix resolution to routes.
+func (l *Linker) applyExpressUsePrefixes(routes []RouteHandler, uses [][]string, imports map[string]string) {
+	for _, use := range uses {
+		prefix := use[1]
+		varName := use[2]
+
+		modulePath, ok := imports[varName]
+		if !ok {
+			continue
+		}
+
+		// Strip leading ./ from relative import
+		fileFrag := strings.TrimPrefix(modulePath, "./")
+		fileFrag = strings.TrimPrefix(fileFrag, "../")
+		normalizedPrefix := strings.TrimRight(prefix, "/")
+
+		prefixed := 0
+		for i := range routes {
+			if strings.HasPrefix(routes[i].Path, normalizedPrefix) {
+				continue
+			}
+			if strings.Contains(routes[i].QualifiedName, fileFrag+".js") ||
+				strings.Contains(routes[i].QualifiedName, fileFrag+".ts") ||
+				strings.Contains(routes[i].QualifiedName, fileFrag+"/") {
+				routes[i].Path = normalizedPrefix + "/" + strings.TrimLeft(routes[i].Path, "/")
+				prefixed++
+			}
+		}
+		if prefixed > 0 {
+			slog.Info("httplink.express_prefix", "prefix", prefix, "module", modulePath, "routes", prefixed)
+		}
+	}
+}
+
 // pathsMatch is a convenience wrapper for tests — returns true if score >= threshold.
 func pathsMatch(callPath, routePath string) bool {
 	return pathMatchScore(callPath, routePath) >= matchConfidenceThreshold
@@ -1303,6 +1747,15 @@ func (l *Linker) createRegistrationCallEdges(routes []RouteHandler) {
 }
 
 // readSourceLines reads specific lines from a file on disk.
+// readSourceFull reads the entire file content as a string.
+func readSourceFull(rootPath, relPath string) string {
+	data, err := os.ReadFile(filepath.Join(rootPath, relPath))
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
 func readSourceLines(rootPath, relPath string, startLine, endLine int) string {
 	absPath := filepath.Join(rootPath, relPath)
 	f, err := os.Open(absPath)

@@ -11,7 +11,8 @@ import (
 type SearchParams struct {
 	Project            string
 	Label              string
-	NamePattern        string
+	NamePattern        string // regex matched against short name only
+	QNPattern          string // regex matched against qualified name only
 	FilePattern        string
 	Relationship       string
 	Direction          string // "inbound", "outbound", "any"
@@ -62,15 +63,41 @@ func (s *Store) loadConnectedNames(sr *SearchResult, nodeID int64) {
 
 // Search executes a parameterized search query with pagination support.
 func (s *Store) Search(params *SearchParams) (*SearchOutput, error) {
-	// Limit=0 means use default; use a high ceiling for SQL
 	if params.Limit <= 0 {
 		params.Limit = 100000
 	}
 
-	// Build the query dynamically with parameterized values
-	var conditions []string
-	var args []any
+	conditions, args, nameHasLikeHints, qnHasLikeHints := buildSearchConditions(params)
+	where := strings.Join(conditions, " AND ")
+	sqlLimit := computeSQLLimit(params, nameHasLikeHints, qnHasLikeHints)
 
+	nodes, err := s.executeSearchQuery(where, args, sqlLimit)
+	if err != nil {
+		return nil, err
+	}
+
+	nodes, err = applyPatternFilters(nodes, params)
+	if err != nil {
+		return nil, err
+	}
+
+	allResults, err := s.buildFilteredResults(nodes, params)
+	if err != nil {
+		return nil, err
+	}
+
+	sortBy := params.SortBy
+	if sortBy == "" {
+		sortBy = "relevance"
+	}
+	sortSearchResults(allResults, sortBy, params.NamePattern)
+
+	return paginateResults(allResults, params.Offset, params.Limit), nil
+}
+
+// buildSearchConditions builds SQL WHERE conditions and args from search params.
+// Returns conditions, args, and whether LIKE hints were pushed for name/qn patterns.
+func buildSearchConditions(params *SearchParams) (conditions []string, args []any, nameHasLikeHints, qnHasLikeHints bool) {
 	conditions = append(conditions, "n.project = ?")
 	args = append(args, params.Project)
 
@@ -80,7 +107,6 @@ func (s *Store) Search(params *SearchParams) (*SearchOutput, error) {
 	}
 
 	if params.FilePattern != "" {
-		// Convert glob to SQL LIKE pattern
 		likePattern := globToLike(params.FilePattern)
 		conditions = append(conditions, "n.file_path LIKE ?")
 		args = append(args, likePattern)
@@ -98,43 +124,63 @@ func (s *Store) Search(params *SearchParams) (*SearchOutput, error) {
 	// When a name pattern is provided, try to extract literal substrings for SQL LIKE
 	// pre-filtering. This drastically reduces the rows Go needs to regex-match.
 	// The full regex is still applied in Go for correctness.
-	nameHasLikeHints := false
 	if params.NamePattern != "" {
-		hints := extractLikeHints(params.NamePattern)
-		if len(hints) > 0 {
+		if cond, condArgs := buildLikeHintCondition(params.NamePattern, "n.name"); cond != "" {
 			nameHasLikeHints = true
-			var likeParts []string
-			for _, hint := range hints {
-				likeVal := "%" + hint + "%"
-				likeParts = append(likeParts, "(n.name LIKE ? OR n.qualified_name LIKE ?)")
-				args = append(args, likeVal, likeVal)
-			}
-			conditions = append(conditions, "("+strings.Join(likeParts, " AND ")+")")
+			conditions = append(conditions, cond)
+			args = append(args, condArgs...)
 		}
 	}
 
-	where := strings.Join(conditions, " AND ")
+	// QN pattern: same LIKE hint optimization but against qualified_name only
+	if params.QNPattern != "" {
+		if cond, condArgs := buildLikeHintCondition(params.QNPattern, "n.qualified_name"); cond != "" {
+			qnHasLikeHints = true
+			conditions = append(conditions, cond)
+			args = append(args, condArgs...)
+		}
+	}
 
-	// When Go-side filtering is needed (regex, degree), we must scan all
-	// qualifying rows since matching nodes may appear at any position.
-	// However, if we pushed LIKE hints into SQL, the result set is already
-	// narrowed and we don't need the full 200K scan for name patterns.
+	return conditions, args, nameHasLikeHints, qnHasLikeHints
+}
+
+// buildLikeHintCondition extracts literal substrings from a regex pattern and returns
+// a SQL condition with LIKE clauses for pre-filtering. Returns empty string if no hints.
+func buildLikeHintCondition(pattern, column string) (condition string, args []any) {
+	hints := extractLikeHints(pattern)
+	if len(hints) == 0 {
+		return "", nil
+	}
+	likeParts := make([]string, 0, len(hints))
+	for _, hint := range hints {
+		likeVal := "%" + hint + "%"
+		likeParts = append(likeParts, column+" LIKE ?")
+		args = append(args, likeVal)
+	}
+	return "(" + strings.Join(likeParts, " AND ") + ")", args
+}
+
+// computeSQLLimit determines how many rows to fetch from SQL based on filtering needs.
+func computeSQLLimit(params *SearchParams, nameHasLikeHints, qnHasLikeHints bool) int {
 	hasDegreeFilter := params.MinDegree >= 0 || params.MaxDegree >= 0
-	needsNameScan := params.NamePattern != "" && !nameHasLikeHints
-	var sqlLimit int
-	if needsNameScan || hasDegreeFilter {
-		sqlLimit = 200000 // must cover full dataset for accurate Go-side filtering
-	} else {
-		// Scan beyond offset+limit so total/has_more are accurate.
-		// The +1000 buffer ensures has_more is correct for result sets
-		// up to ~1000 beyond the requested page, at negligible cost
-		// (~2 extra batch degree queries ≈ 20ms worst case).
-		sqlLimit = params.Offset + params.Limit + 1000
-		if sqlLimit > 200000 {
-			sqlLimit = 200000
-		}
-	}
+	needsNameScan := (params.NamePattern != "" && !nameHasLikeHints) || (params.QNPattern != "" && !qnHasLikeHints)
 
+	if needsNameScan || hasDegreeFilter {
+		return 200000 // must cover full dataset for accurate Go-side filtering
+	}
+	// Scan beyond offset+limit so total/has_more are accurate.
+	// The +1000 buffer ensures has_more is correct for result sets
+	// up to ~1000 beyond the requested page, at negligible cost
+	// (~2 extra batch degree queries ≈ 20ms worst case).
+	sqlLimit := params.Offset + params.Limit + 1000
+	if sqlLimit > 200000 {
+		sqlLimit = 200000
+	}
+	return sqlLimit
+}
+
+// executeSearchQuery runs the SQL search query and returns matching nodes.
+func (s *Store) executeSearchQuery(where string, args []any, sqlLimit int) ([]*Node, error) {
 	query := fmt.Sprintf(`
 		SELECT n.id, n.project, n.label, n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.properties
 		FROM nodes n
@@ -161,44 +207,42 @@ func (s *Store) Search(params *SearchParams) (*SearchOutput, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	return nodes, nil
+}
 
-	// Apply name pattern filter in Go (regex)
+// applyPatternFilters applies name and QN regex filters in Go.
+func applyPatternFilters(nodes []*Node, params *SearchParams) ([]*Node, error) {
+	var err error
 	if params.NamePattern != "" {
 		nodes, err = filterByNamePattern(nodes, params.NamePattern)
 		if err != nil {
 			return nil, err
 		}
 	}
-
-	// Build all qualifying results (before offset/limit) for accurate total count
-	allResults, err := s.buildFilteredResults(nodes, params)
-	if err != nil {
-		return nil, err
+	if params.QNPattern != "" {
+		nodes, err = filterByQNPattern(nodes, params.QNPattern)
+		if err != nil {
+			return nil, err
+		}
 	}
+	return nodes, nil
+}
 
-	// Sort results before pagination
-	sortBy := params.SortBy
-	if sortBy == "" {
-		sortBy = "relevance"
-	}
-	sortSearchResults(allResults, sortBy, params.NamePattern)
-
+// paginateResults applies offset and limit to results and returns the output.
+func paginateResults(allResults []*SearchResult, offset, limit int) *SearchOutput {
 	total := len(allResults)
-
-	// Apply offset and limit
-	start := params.Offset
+	start := offset
 	if start > total {
 		start = total
 	}
-	end := start + params.Limit
+	end := start + limit
 	if end > total {
 		end = total
 	}
-
 	return &SearchOutput{
 		Results: allResults[start:end],
 		Total:   total,
-	}, nil
+	}
 }
 
 // globToLike converts a glob pattern to SQL LIKE pattern.
@@ -469,7 +513,7 @@ func extractLiteralQuery(pattern string) string {
 	return p
 }
 
-// filterByNamePattern filters nodes by a regex name pattern.
+// filterByNamePattern filters nodes by a regex pattern against the short name only.
 func filterByNamePattern(nodes []*Node, pattern string) ([]*Node, error) {
 	re, err := regexp.Compile(pattern)
 	if err != nil {
@@ -477,7 +521,22 @@ func filterByNamePattern(nodes []*Node, pattern string) ([]*Node, error) {
 	}
 	var filtered []*Node
 	for _, n := range nodes {
-		if re.MatchString(n.Name) || re.MatchString(n.QualifiedName) {
+		if re.MatchString(n.Name) {
+			filtered = append(filtered, n)
+		}
+	}
+	return filtered, nil
+}
+
+// filterByQNPattern filters nodes by a regex pattern against the qualified name.
+func filterByQNPattern(nodes []*Node, pattern string) ([]*Node, error) {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("invalid qn_pattern: %w", err)
+	}
+	var filtered []*Node
+	for _, n := range nodes {
+		if re.MatchString(n.QualifiedName) {
 			filtered = append(filtered, n)
 		}
 	}

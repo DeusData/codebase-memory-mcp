@@ -2,13 +2,16 @@
 
 **Stop paying 100x more tokens for code exploration.** This MCP server indexes your codebase into a persistent knowledge graph that survives session restarts and context compaction. One graph query returns what would take dozens of grep/Glob calls — precise structural results in ~500 tokens vs ~80K tokens for file-by-file exploration.
 
-Single Go binary. No Docker, no external databases, no API keys. Download, configure, say *"Index this project"* — done.
+Single Go binary. No Docker, no external databases, no API keys. One command to install, say *"Index this project"* — done.
 
-Parses source code with [tree-sitter](https://tree-sitter.github.io/tree-sitter/), extracts functions, classes, modules, call relationships, and cross-service HTTP links. Exposes the graph through 12 MCP tools for use with Claude Code or any MCP-compatible client. Also includes a **CLI mode** for direct tool invocation from the shell — no MCP client needed.
+Parses source code with [tree-sitter](https://tree-sitter.github.io/tree-sitter/), extracts functions, classes, modules, call relationships, and cross-service HTTP links. Exposes the graph through 12 MCP tools for use with Claude Code, Codex CLI, or any MCP-compatible client. Also includes a **CLI mode** for direct tool invocation from the shell — no MCP client needed.
 
 ## Features
 
-- **13 languages**: Python, Go, JavaScript, TypeScript, TSX, Rust, Java, C++, C#, PHP, Lua, Scala, Kotlin
+- **25 languages**: Python, Go, JavaScript, TypeScript, TSX, Rust, Java, C++, C#, C, PHP, Lua, Scala, Kotlin, Ruby, Bash, Zig, Elixir, Haskell, OCaml, HTML, CSS, YAML, TOML, HCL
+- **One-command install**: `codebase-memory-mcp install` auto-detects Claude Code and Codex CLI, registers the MCP server, and installs task-specific skills
+- **Self-update**: `codebase-memory-mcp update` downloads the latest release, verifies checksums, and atomically swaps the binary
+- **Task-specific skills**: 4 skills (exploring, tracing, quality, reference) that prescribe exact tool sequences — Claude Code automatically uses graph tools instead of defaulting to grep
 - **Fast**: Sub-millisecond graph queries, incremental reindex 4x faster than full scan, optimized SQLite with LIKE pre-filtering for regex searches
 - **Call graph**: Resolves function calls across files and packages (import-aware, type-inferred)
 - **Cross-service HTTP linking**: Discovers REST routes (FastAPI, Gin, Express) and matches them to HTTP call sites with confidence scoring
@@ -65,11 +68,37 @@ Benchmarked on a multi-service project (~37K nodes, ~35K edges) with Go 1.26 on 
 
 **Token efficiency**: Five structural queries consumed ~3,400 tokens via codebase-memory-mcp versus ~412,000 tokens via file-by-file grep exploration — a **99.2% reduction**.
 
+## Quick Start
+
+1. **Download** the binary for your platform from the [latest release](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
+2. **Install**:
+   ```bash
+   codebase-memory-mcp install
+   ```
+3. **Restart** Claude Code / Codex CLI
+4. Say **"Index this project"** — done.
+
+The `install` command auto-detects Claude Code and Codex CLI, registers the MCP server, installs 4 task-specific skills, and ensures the binary is on your PATH. Use `--dry-run` to preview without making changes.
+
+### Keeping Up to Date
+
+```bash
+codebase-memory-mcp update
+```
+
+Downloads the latest release, verifies SHA-256 checksums, atomically swaps the binary, and re-applies skills. Restart Claude Code / Codex to activate.
+
+### Uninstall
+
+```bash
+codebase-memory-mcp uninstall
+```
+
+Removes skills, MCP registration, and Codex instructions. Does not remove the binary or SQLite databases.
+
 ## Installation
 
-### Just Want to Get Started?
-
-Grab a pre-built binary from the [latest release](https://github.com/DeusData/codebase-memory-mcp/releases/latest) — no Go, no compiler, no git needed.
+### Pre-built Binaries
 
 | Platform | Binary |
 |----------|--------|
@@ -81,29 +110,12 @@ Grab a pre-built binary from the [latest release](https://github.com/DeusData/co
 
 Every release includes a `checksums.txt` with SHA-256 hashes for verification.
 
-**3 steps:**
-
-1. **Download and extract** the binary for your platform
-2. **Put it somewhere on your PATH** (e.g. `~/.local/bin/` on macOS/Linux, or any folder on Windows)
-3. **Tell Claude Code about it** — add to `.mcp.json` in your project root:
-   ```json
-   {
-     "mcpServers": {
-       "codebase-memory-mcp": {
-         "type": "stdio",
-         "command": "/path/to/codebase-memory-mcp"
-       }
-     }
-   }
-   ```
-
-Restart Claude Code, verify with `/mcp`, then say **"Index this project"** — done.
-
 > **Windows note**: Windows SmartScreen may show "Windows protected your PC" when you first run the binary. This is normal for unsigned open-source software. Click **"More info"** then **"Run anyway"**. You can verify the binary integrity using the `checksums.txt` file included in each release.
 
-### Setup Scripts (Automated)
+### Setup Scripts
 
-The setup scripts automate download, placement, and Claude Code configuration.
+<details>
+<summary>Alternative: automated download + install</summary>
 
 **macOS / Linux:**
 
@@ -117,7 +129,9 @@ curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/s
 irm https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/scripts/setup-windows.ps1 | iex
 ```
 
-The scripts download the correct binary for your platform, install it, and offer to auto-configure Claude Code's MCP settings.
+The scripts download the correct binary for your platform, install it, and run `codebase-memory-mcp install` to configure Claude Code/Codex.
+
+</details>
 
 ### Install via Claude Code
 
@@ -199,7 +213,10 @@ When using a WSL-built binary, configure Claude Code to invoke it via `wsl.exe`:
 }
 ```
 
-### Configure Claude Code
+### Manual Configuration
+
+<details>
+<summary>If you prefer not to use `codebase-memory-mcp install`</summary>
 
 Add the MCP server to your project's `.mcp.json` (per-project, recommended) or `~/.claude/settings.json` (global):
 
@@ -215,6 +232,8 @@ Add the MCP server to your project's `.mcp.json` (per-project, recommended) or `
 ```
 
 Restart Claude Code after adding the config. Verify with `/mcp` — you should see `codebase-memory-mcp` listed with 12 tools.
+
+</details>
 
 ### First Use
 
@@ -480,45 +499,30 @@ The format is: project name, file path with `/` replaced by `.` and extension re
 - `UNION`
 - Variable-length path edge property binding (can't access individual edges in a path like `*1..3`)
 
-## Teaching Claude Code to Use the Graph
+## How Claude Code Uses the Graph
 
-Claude Code can use the tools without any configuration — the MCP tool descriptions are self-documenting. However, without a hint, Claude Code will default to its built-in Grep/Glob/Read tools for code questions instead of the faster graph queries.
+After `codebase-memory-mcp install`, Claude Code automatically has 4 task-specific skills that prescribe when and how to use graph tools:
 
-Add one of the following to tell Claude Code to **prefer graph tools for structural questions**.
+- **Exploring**: Codebase orientation, structure overview, finding functions/classes/routes
+- **Tracing**: Call chains, dependency analysis, cross-service HTTP calls, impact analysis
+- **Quality**: Dead code detection, fan-out analysis, refactor candidates
+- **Reference**: Tool syntax, Cypher query examples, edge types, pitfalls
 
-### Option A: Global CLAUDE.md (recommended — works across all projects)
+No CLAUDE.md changes needed — skills auto-trigger based on conversation context.
 
-Add to `~/.claude/CLAUDE.md`:
+<details>
+<summary>Manual skill installation (if not using `install` command)</summary>
 
-```markdown
-## Codebase Memory (codebase-memory-mcp)
+The skill files are embedded in the binary. If you prefer to install them manually, copy from this repo:
 
-When this MCP server is available, **prefer graph tools over grep/Explore for structural code questions**.
-Graph queries return precise results in a single tool call (~500 tokens) vs file-by-file exploration (~80K tokens).
+- `cmd/codebase-memory-mcp/assets/skills/codebase-memory-exploring/SKILL.md` → `~/.claude/skills/codebase-memory-exploring/SKILL.md`
+- `cmd/codebase-memory-mcp/assets/skills/codebase-memory-tracing/SKILL.md` → `~/.claude/skills/codebase-memory-tracing/SKILL.md`
+- `cmd/codebase-memory-mcp/assets/skills/codebase-memory-quality/SKILL.md` → `~/.claude/skills/codebase-memory-quality/SKILL.md`
+- `cmd/codebase-memory-mcp/assets/skills/codebase-memory-reference/SKILL.md` → `~/.claude/skills/codebase-memory-reference/SKILL.md`
 
-- **Initial index**: Run `index_repository` once per project — auto-sync keeps it fresh after that
-- **"Who calls X?"**: `trace_call_path(function_name="X", direction="inbound")`
-- **"What does X call?"**: `trace_call_path(function_name="X", direction="outbound")`
-- **Find functions by pattern**: `search_graph(label="Function", name_pattern=".*Pattern.*")`
-- **Dead code**: `search_graph(label="Function", relationship="CALLS", direction="inbound", max_degree=0, exclude_entry_points=true)`
-- **Cross-service calls**: `search_graph(relationship="HTTP_CALLS")` or `query_graph` with Cypher
-- **REST routes**: `search_graph(label="Route")`
-- **Scope to one project**: `search_graph(..., project="project-name")` when multiple repos are indexed
-- **Understand structure first**: `get_graph_schema` before writing complex queries
-- **Read source**: `get_code_snippet(qualified_name="...")` after finding functions via search
-- **Discover then trace**: Use `search_graph(name_pattern=".*Partial.*")` to find exact names, then `trace_call_path`
-- **Complex patterns**: `query_graph` with Cypher for multi-hop graph traversals
+Or add a CLAUDE.md snippet — see [`skills/codebase-memory-mcp.md`](skills/codebase-memory-mcp.md) for the full reference.
 
-Use grep/Glob for text search (string literals, error messages, config values) — the graph doesn't index text content.
-```
-
-### Option B: Per-project CLAUDE.md
-
-Add the same snippet to a specific project's `CLAUDE.md` if you only want it active for that project.
-
-### Option C: Claude Code skill file
-
-Copy [`skills/codebase-memory-mcp.md`](skills/codebase-memory-mcp.md) from this repo to `~/.claude/skills/codebase-memory-mcp/SKILL.md` for automatic activation when relevant. This is the most comprehensive option — it includes decision matrices, query pitfalls, and workflow patterns.
+</details>
 
 ## Ignoring Files (`.cgrignore`)
 
@@ -571,17 +575,32 @@ make install  # go install
 | Binary not found after install | `~/.local/bin` not on PATH | Add to your shell profile: `export PATH="$HOME/.local/bin:$PATH"` |
 | Cypher query fails with parse error | Unsupported Cypher feature | See [Supported Cypher Subset](#supported-cypher-subset). `WITH`, `COLLECT`, `OPTIONAL MATCH` are not supported. |
 
+## Language Benchmark
+
+Benchmarked against 35 real open-source repositories (78 to 49K nodes). 12 standardized questions per language, up to 5 retry attempts each. Grading: PASS (1.0) / PARTIAL (0.5) / FAIL (0.0). Overall: **91.8%** weighted score.
+
+| Tier | Score | Languages |
+|------|-------|-----------|
+| **Tier 1 — Excellent** | >= 90% | Lua, Kotlin, C++, Perl, Objective-C, Groovy, C, Bash, Zig, Swift, CSS, YAML, TOML, HTML, SCSS, HCL, Dockerfile |
+| **Tier 2 — Good** | 75–89% | Python, TypeScript, TSX, Go, Rust, Java, R, Dart, JavaScript, Erlang, Elixir, Scala, Ruby, PHP, C#, SQL |
+| **Tier 3 — Functional** | < 75% | OCaml (72%), Haskell (62%) |
+
+**Stress test**: Linux kernel `drivers/net/ethernet/intel/` — 20K nodes, 67K edges, 129K-char deep traces, zero timeouts.
+
+See [`BENCHMARK.md`](BENCHMARK.md) for the full 35-language benchmark with per-question scoring and methodology.
+
 ## Architecture
 
 ```
-cmd/codebase-memory-mcp/  Entry point (MCP stdio server + CLI mode)
+cmd/codebase-memory-mcp/  Entry point (MCP stdio server + CLI mode + install/update commands)
 internal/
   store/                  SQLite graph storage (nodes, edges, traversal, search)
-  lang/                   Language specs (13 languages, tree-sitter node types)
+  lang/                   Language specs (25 languages, tree-sitter node types)
   parser/                 Tree-sitter grammar loading and AST parsing
   pipeline/               4-pass indexing (structure -> definitions -> calls -> HTTP links)
   httplink/               Cross-service HTTP route/call-site matching
   cypher/                 Cypher query lexer, parser, planner, executor
+  selfupdate/             GitHub release checking, version comparison, asset download
   tools/                  MCP tool handlers (12 tools) + CLI dispatch
   watcher/                Background auto-sync (mtime+size polling, adaptive intervals)
   discover/               File discovery with .cgrignore support
