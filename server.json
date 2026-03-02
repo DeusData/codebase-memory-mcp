@@ -2,49 +2,49 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.DeusData/codebase-memory-mcp",
   "title": "Codebase Memory",
-  "description": "Persistent codebase knowledge graph — 12 languages, sub-ms queries, 99% fewer tokens than grep. Survives session restarts and context compaction.",
+  "description": "Persistent codebase knowledge graph — 35 languages, sub-ms queries, 99% fewer tokens than grep. Survives session restarts and context compaction.",
   "repository": {
     "url": "https://github.com/DeusData/codebase-memory-mcp",
     "source": "github"
   },
-  "version": "0.1.4",
+  "version": "0.3.1",
   "packages": [
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.1.4/codebase-memory-mcp-darwin-arm64.tar.gz",
-      "fileSha256": "7589a880b964abda8dfa735d2946b257752c1ad3f0a093b3146741c15a01af40",
+      "identifier": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.3.1/codebase-memory-mcp-darwin-arm64.tar.gz",
+      "fileSha256": "501affa554696b36651e8e24c23d8b11b3ee51a3d2b18277413b14aa6a75e970",
       "transport": {
         "type": "stdio"
       }
     },
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.1.4/codebase-memory-mcp-darwin-amd64.tar.gz",
-      "fileSha256": "21db2204f9ff76c1e1f879f3eefb4c3943ded9eaaeb7c5aee4dc4c8ac5515185",
+      "identifier": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.3.1/codebase-memory-mcp-darwin-amd64.tar.gz",
+      "fileSha256": "af90b12719784bdc887550f53d4d3fb84b2176ece28d4a1131f3f20d3a014726",
       "transport": {
         "type": "stdio"
       }
     },
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.1.4/codebase-memory-mcp-linux-amd64.tar.gz",
-      "fileSha256": "71a3874e9a3999246c0d98def6e9bee1ca88302913ee2330ddbc8cde5774cfee",
+      "identifier": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.3.1/codebase-memory-mcp-linux-amd64.tar.gz",
+      "fileSha256": "9c1ed6e3b73401069aebcd99dc5d35fa182304336c5686791cdd62f5ddbc0159",
       "transport": {
         "type": "stdio"
       }
     },
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.1.4/codebase-memory-mcp-linux-arm64.tar.gz",
-      "fileSha256": "400976941a31b8f68bcff930c24f1399c8df39ff533400e0ce51f83898fcea9c",
+      "identifier": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.3.1/codebase-memory-mcp-linux-arm64.tar.gz",
+      "fileSha256": "18b228405250d4aa735d22bd0d4fe829c014c60ce9ca1e3a1f92e06d333b0beb",
       "transport": {
         "type": "stdio"
       }
     },
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.1.4/codebase-memory-mcp-windows-amd64.zip",
-      "fileSha256": "f5de16d05ea26b7d3aa90e0f703e114edeb9d28cc44f0b90bac44141061de4af",
+      "identifier": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.3.1/codebase-memory-mcp-windows-amd64.zip",
+      "fileSha256": "4f42b190acbe86d823519c82434b5ebf71cc52e34f831429d45097a9a7391ddf",
       "transport": {
         "type": "stdio"
       }
