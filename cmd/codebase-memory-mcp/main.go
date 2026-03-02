@@ -182,6 +182,8 @@ func printSummary(toolName, text, dbPath string) {
 		printIngestSummary(data, dbPath)
 	case "index_status":
 		printIndexStatusSummary(data)
+	case "detect_changes":
+		printDetectChangesSummary(data)
 	default:
 		// Fallback: pretty-print the JSON
 		printRawJSON(text)
@@ -483,6 +485,36 @@ func printIndexStatusSummary(data map[string]any) {
 		}
 	default:
 		printRawJSON(mustJSON(data))
+	}
+}
+
+func printDetectChangesSummary(data map[string]any) {
+	summary, _ := data["summary"].(map[string]any)
+	changedFiles := jsonInt(summary["changed_files"])
+	changedSymbols := jsonInt(summary["changed_symbols"])
+	total := jsonInt(summary["total"])
+	critical := jsonInt(summary["critical"])
+	high := jsonInt(summary["high"])
+	medium := jsonInt(summary["medium"])
+	low := jsonInt(summary["low"])
+
+	fmt.Printf("Changes: %d file(s), %d symbol(s) modified\n", changedFiles, changedSymbols)
+	fmt.Printf("Impact: %d affected symbol(s)\n", total)
+	if total > 0 {
+		fmt.Printf("  CRITICAL: %d  HIGH: %d  MEDIUM: %d  LOW: %d\n", critical, high, medium, low)
+	}
+
+	impacted, _ := data["impacted_symbols"].([]any)
+	for _, is := range impacted {
+		m, ok := is.(map[string]any)
+		if !ok {
+			continue
+		}
+		risk, _ := m["risk"].(string)
+		name, _ := m["name"].(string)
+		label, _ := m["label"].(string)
+		changedBy, _ := m["changed_by"].(string)
+		fmt.Printf("  [%s] [%s] %s  (via %s)\n", risk, label, name, changedBy)
 	}
 }
 

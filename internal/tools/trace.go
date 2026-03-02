@@ -34,6 +34,8 @@ func (s *Server) handleTraceCallPath(_ context.Context, req *mcp.CallToolRequest
 		direction = "outbound"
 	}
 
+	riskLabels := getBoolArg(args, "risk_labels")
+
 	project := getStringArg(args, "project")
 	effectiveProject := s.resolveProjectName(project)
 
@@ -70,62 +72,70 @@ func (s *Server) handleTraceCallPath(_ context.Context, req *mcp.CallToolRequest
 
 	edgeTypes := []string{"CALLS", "HTTP_CALLS", "ASYNC_CALLS"}
 
-	// Build root info
-	root := buildNodeInfo(rootNode)
+	allVisited, allEdges, bfsErr := runTraceBFS(st, rootNode.ID, direction, edgeTypes, depth)
+	if bfsErr != nil {
+		return errResult(fmt.Sprintf("bfs err: %v", bfsErr)), nil
+	}
 
-	// Get module info
-	moduleInfo := s.getModuleInfo(st, rootNode, foundProject)
+	if riskLabels {
+		allVisited = store.DeduplicateHops(allVisited)
+	}
 
-	// Run BFS
-	var allVisited []*store.NodeHop
-	var allEdges []store.EdgeInfo
-
-	if direction == "both" {
-		outResult, outErr := st.BFS(rootNode.ID, "outbound", edgeTypes, depth, 200)
-		if outErr == nil {
-			allVisited = append(allVisited, outResult.Visited...)
-			allEdges = append(allEdges, outResult.Edges...)
-		}
-		inResult, inErr := st.BFS(rootNode.ID, "inbound", edgeTypes, depth, 200)
-		if inErr == nil {
-			allVisited = append(allVisited, inResult.Visited...)
-			allEdges = append(allEdges, inResult.Edges...)
-		}
+	var hops []hopEntry
+	if riskLabels {
+		hops = buildHopsWithRisk(allVisited)
 	} else {
-		result, bfsErr := st.BFS(rootNode.ID, direction, edgeTypes, depth, 200)
-		if bfsErr != nil {
-			return errResult(fmt.Sprintf("bfs err: %v", bfsErr)), nil
-		}
-		allVisited = result.Visited
-		allEdges = result.Edges
+		hops = buildHops(allVisited)
 	}
 
-	// Group visited nodes by hop
-	hops := buildHops(allVisited)
-
-	// Build edge list
-	edges := buildEdgeList(allEdges)
-
-	// Get indexed_at from project
-	proj, _ := st.GetProject(foundProject)
-	indexedAt := ""
-	if proj != nil {
-		indexedAt = proj.IndexedAt
+	responseData := buildTraceResponse(st, rootNode, foundProject, hops, allVisited, allEdges)
+	if riskLabels {
+		responseData["impact_summary"] = store.BuildImpactSummary(allVisited, allEdges)
 	}
-
-	responseData := map[string]any{
-		"root":          root,
-		"module":        moduleInfo,
-		"hops":          hops,
-		"edges":         edges,
-		"indexed_at":    indexedAt,
-		"total_results": len(allVisited),
-	}
+	responseData["module"] = s.getModuleInfo(st, rootNode, foundProject)
 	s.addIndexStatus(responseData)
 
 	result := jsonResult(responseData)
 	s.addUpdateNotice(result)
 	return result, nil
+}
+
+func runTraceBFS(st *store.Store, rootID int64, direction string, edgeTypes []string, depth int) ([]*store.NodeHop, []store.EdgeInfo, error) {
+	if direction == "both" {
+		var allVisited []*store.NodeHop
+		var allEdges []store.EdgeInfo
+		outResult, outErr := st.BFS(rootID, "outbound", edgeTypes, depth, 200)
+		if outErr == nil {
+			allVisited = append(allVisited, outResult.Visited...)
+			allEdges = append(allEdges, outResult.Edges...)
+		}
+		inResult, inErr := st.BFS(rootID, "inbound", edgeTypes, depth, 200)
+		if inErr == nil {
+			allVisited = append(allVisited, inResult.Visited...)
+			allEdges = append(allEdges, inResult.Edges...)
+		}
+		return allVisited, allEdges, nil
+	}
+	result, err := st.BFS(rootID, direction, edgeTypes, depth, 200)
+	if err != nil {
+		return nil, nil, err
+	}
+	return result.Visited, result.Edges, nil
+}
+
+func buildTraceResponse(st *store.Store, rootNode *store.Node, project string, hops []hopEntry, visited []*store.NodeHop, edges []store.EdgeInfo) map[string]any {
+	proj, _ := st.GetProject(project)
+	indexedAt := ""
+	if proj != nil {
+		indexedAt = proj.IndexedAt
+	}
+	return map[string]any{
+		"root":          buildNodeInfo(rootNode),
+		"hops":          hops,
+		"edges":         buildEdgeList(edges),
+		"indexed_at":    indexedAt,
+		"total_results": len(visited),
+	}
 }
 
 func buildNodeInfo(n *store.Node) map[string]any {
@@ -180,6 +190,31 @@ func buildHops(visited []*store.NodeHop) []hopEntry {
 			"name":           nh.Node.Name,
 			"qualified_name": nh.Node.QualifiedName,
 			"label":          nh.Node.Label,
+		}
+		if sig, ok := nh.Node.Properties["signature"]; ok {
+			info["signature"] = sig
+		}
+		hopMap[nh.Hop] = append(hopMap[nh.Hop], info)
+	}
+
+	var hops []hopEntry
+	for h := 1; h <= len(hopMap); h++ {
+		if nodes, ok := hopMap[h]; ok {
+			hops = append(hops, hopEntry{Hop: h, Nodes: nodes})
+		}
+	}
+	return hops
+}
+
+func buildHopsWithRisk(visited []*store.NodeHop) []hopEntry {
+	hopMap := map[int][]map[string]any{}
+	for _, nh := range visited {
+		info := map[string]any{
+			"name":           nh.Node.Name,
+			"qualified_name": nh.Node.QualifiedName,
+			"label":          nh.Node.Label,
+			"risk":           string(store.HopToRisk(nh.Hop)),
+			"hop":            nh.Hop,
 		}
 		if sig, ok := nh.Node.Properties["signature"]; ok {
 			info["signature"] = sig

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -295,9 +296,9 @@ func TestSkillFilesContent(t *testing.T) {
 
 	expectations := map[string][]string{
 		"codebase-memory-exploring": {"explore the codebase", "search_graph", "get_graph_schema"},
-		"codebase-memory-tracing":   {"who calls this function", "trace_call_path", "direction"},
+		"codebase-memory-tracing":   {"who calls this function", "trace_call_path", "direction", "risk_labels", "detect_changes"},
 		"codebase-memory-quality":   {"find dead code", "max_degree=0", "exclude_entry_points"},
-		"codebase-memory-reference": {"edge types", "query_graph", "Cypher"},
+		"codebase-memory-reference": {"edge types", "query_graph", "Cypher", "detect_changes", "14 total"},
 	}
 
 	for name, expectedPhrases := range expectations {
@@ -310,6 +311,132 @@ func TestSkillFilesContent(t *testing.T) {
 				t.Errorf("skill %q missing phrase %q", name, phrase)
 			}
 		}
+	}
+}
+
+func TestEditorMCPInstall(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	configPath := filepath.Join(home, ".cursor", "mcp.json")
+	binaryPath := "/usr/local/bin/codebase-memory-mcp"
+
+	// First install — creates file from scratch
+	installEditorMCP(binaryPath, configPath, "Cursor", installConfig{})
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("unmarshal config: %v", err)
+	}
+	servers, ok := root["mcpServers"].(map[string]any)
+	if !ok {
+		t.Fatal("expected mcpServers key")
+	}
+	entry, ok := servers["codebase-memory-mcp"].(map[string]any)
+	if !ok {
+		t.Fatal("expected codebase-memory-mcp entry")
+	}
+	if cmd, _ := entry["command"].(string); cmd != binaryPath {
+		t.Fatalf("expected command %q, got %q", binaryPath, cmd)
+	}
+}
+
+func TestEditorMCPInstallIdempotent(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	configPath := filepath.Join(home, ".cursor", "mcp.json")
+	binaryPath := "/usr/local/bin/codebase-memory-mcp"
+
+	// Install twice — second install should preserve valid JSON
+	installEditorMCP(binaryPath, configPath, "Cursor", installConfig{})
+	installEditorMCP(binaryPath, configPath, "Cursor", installConfig{})
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("double install produced invalid JSON: %v", err)
+	}
+	servers, ok := root["mcpServers"].(map[string]any)
+	if !ok {
+		t.Fatal("mcpServers is not a map")
+	}
+	if len(servers) != 1 {
+		t.Fatalf("expected 1 server, got %d", len(servers))
+	}
+}
+
+func TestEditorMCPPreservesOtherServers(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	configPath := filepath.Join(home, ".cursor", "mcp.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write config with an existing server
+	existing := `{"mcpServers": {"other-server": {"command": "/usr/bin/other"}}}`
+	if err := os.WriteFile(configPath, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	installEditorMCP("/usr/local/bin/codebase-memory-mcp", configPath, "Cursor", installConfig{})
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatal(err)
+	}
+	servers, ok := root["mcpServers"].(map[string]any)
+	if !ok {
+		t.Fatal("mcpServers is not a map")
+	}
+	if len(servers) != 2 {
+		t.Fatalf("expected 2 servers, got %d", len(servers))
+	}
+	if _, ok = servers["other-server"]; !ok {
+		t.Fatal("other-server was removed")
+	}
+	if _, ok := servers["codebase-memory-mcp"]; !ok {
+		t.Fatal("codebase-memory-mcp not added")
+	}
+}
+
+func TestEditorMCPUninstall(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	configPath := filepath.Join(home, ".cursor", "mcp.json")
+
+	// Install then uninstall
+	installEditorMCP("/usr/local/bin/codebase-memory-mcp", configPath, "Cursor", installConfig{})
+	removeEditorMCP(configPath, "Cursor", installConfig{})
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatal(err)
+	}
+	servers, ok := root["mcpServers"].(map[string]any)
+	if !ok {
+		t.Fatal("mcpServers is not a map")
+	}
+	if _, exists := servers["codebase-memory-mcp"]; exists {
+		t.Fatal("codebase-memory-mcp should be removed after uninstall")
 	}
 }
 

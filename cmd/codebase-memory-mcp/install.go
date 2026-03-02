@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -61,7 +62,15 @@ func runInstall(args []string) int {
 		fmt.Println("[Codex CLI] not found — skipping")
 	}
 
-	fmt.Println("\nDone. Restart Claude Code / Codex to activate.")
+	fmt.Println()
+
+	// Cursor
+	installEditorMCP(binaryPath, cursorConfigPath(), "Cursor", cfg)
+
+	// Windsurf
+	installEditorMCP(binaryPath, windsurfConfigPath(), "Windsurf", cfg)
+
+	fmt.Println("\nDone. Restart Claude Code / Codex / Cursor / Windsurf to activate.")
 	return 0
 }
 
@@ -90,6 +99,12 @@ func runUninstall(args []string) int {
 		removeCodexMCP(cfg)
 		removeCodexInstructions(cfg)
 	}
+
+	// Cursor
+	removeEditorMCP(cursorConfigPath(), "Cursor", cfg)
+
+	// Windsurf
+	removeEditorMCP(windsurfConfigPath(), "Windsurf", cfg)
 
 	fmt.Println("\nDone. Binary and databases were NOT removed.")
 	return 0
@@ -461,4 +476,124 @@ func execCLI(path string, args ...string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// --- Editor MCP config (Cursor, Windsurf) ---
+
+const mcpServerKey = "codebase-memory-mcp"
+
+// cursorConfigPath returns the Cursor MCP config path.
+func cursorConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".cursor", "mcp.json")
+}
+
+// windsurfConfigPath returns the Windsurf MCP config path.
+func windsurfConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".codeium", "windsurf", "mcp_config.json")
+}
+
+// installEditorMCP upserts our MCP server entry in an editor's JSON config file.
+func installEditorMCP(binaryPath, configPath, editorName string, cfg installConfig) {
+	if configPath == "" {
+		return
+	}
+
+	fmt.Printf("[%s] MCP config: %s\n", editorName, configPath)
+
+	if cfg.dryRun {
+		fmt.Printf("  [dry-run] Would upsert %s in %s\n", mcpServerKey, configPath)
+		return
+	}
+
+	// Read existing config or start fresh
+	root := make(map[string]any)
+	if data, err := os.ReadFile(configPath); err == nil {
+		if jsonErr := json.Unmarshal(data, &root); jsonErr != nil {
+			// File exists but is invalid JSON — back up and overwrite
+			fmt.Printf("  ⚠ Invalid JSON in %s, overwriting\n", configPath)
+			root = make(map[string]any)
+		}
+	}
+
+	// Ensure mcpServers map exists
+	servers, ok := root["mcpServers"].(map[string]any)
+	if !ok {
+		servers = make(map[string]any)
+	}
+
+	// Upsert our server entry
+	servers[mcpServerKey] = map[string]any{
+		"command": binaryPath,
+	}
+	root["mcpServers"] = servers
+
+	// Write back
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o750); err != nil {
+		fmt.Printf("  ⚠ mkdir %s: %v\n", filepath.Dir(configPath), err)
+		return
+	}
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		fmt.Printf("  ⚠ marshal JSON: %v\n", err)
+		return
+	}
+	if err := os.WriteFile(configPath, append(out, '\n'), 0o600); err != nil {
+		fmt.Printf("  ⚠ write %s: %v\n", configPath, err)
+		return
+	}
+	fmt.Printf("  ✓ MCP server registered in %s\n", configPath)
+}
+
+// removeEditorMCP removes our MCP server entry from an editor's JSON config file.
+func removeEditorMCP(configPath, editorName string, cfg installConfig) {
+	if configPath == "" {
+		return
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return // no config file, nothing to remove
+	}
+
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return
+	}
+
+	servers, ok := root["mcpServers"].(map[string]any)
+	if !ok {
+		return
+	}
+	if _, exists := servers[mcpServerKey]; !exists {
+		return
+	}
+
+	fmt.Printf("[%s] MCP config: %s\n", editorName, configPath)
+
+	if cfg.dryRun {
+		fmt.Printf("  [dry-run] Would remove %s from %s\n", mcpServerKey, configPath)
+		return
+	}
+
+	delete(servers, mcpServerKey)
+	root["mcpServers"] = servers
+
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		fmt.Printf("  ⚠ marshal JSON: %v\n", err)
+		return
+	}
+	if err := os.WriteFile(configPath, append(out, '\n'), 0o600); err != nil {
+		fmt.Printf("  ⚠ write %s: %v\n", configPath, err)
+		return
+	}
+	fmt.Printf("  ✓ Removed %s from %s\n", mcpServerKey, configPath)
 }

@@ -8,7 +8,7 @@ require (
 	github.com/alex-pinkus/tree-sitter-swift v0.0.0
 	github.com/camdencheek/tree-sitter-dockerfile v0.0.0
 	github.com/mattn/go-sqlite3 v1.14.34
-	github.com/modelcontextprotocol/go-sdk v1.3.1
+	github.com/modelcontextprotocol/go-sdk v1.4.0
 	github.com/murtaza64/tree-sitter-groovy v0.0.0
 	github.com/r-lib/tree-sitter-r v0.0.0
 	github.com/tree-sitter-grammars/tree-sitter-hcl v1.2.0
@@ -41,7 +41,7 @@ require (
 	github.com/tree-sitter/tree-sitter-scala v0.24.0
 	github.com/tree-sitter/tree-sitter-typescript v0.23.2
 	github.com/zeebo/xxh3 v1.1.0
-	golang.org/x/sync v0.17.0
+	golang.org/x/sync v0.19.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -53,9 +53,9 @@ require (
 	github.com/segmentio/encoding v0.5.3 // indirect
 	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
-	golang.org/x/oauth2 v0.30.0 // indirect
-	golang.org/x/sys v0.37.0 // indirect
-	golang.org/x/tools v0.38.0 // indirect
+	golang.org/x/oauth2 v0.34.0 // indirect
+	golang.org/x/sys v0.40.0 // indirect
+	golang.org/x/tools v0.41.0 // indirect
 )
 
 replace github.com/tree-sitter/go-tree-sitter => github.com/DeusData/go-tree-sitter v0.26.0-deusdata.1

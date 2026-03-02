@@ -844,3 +844,143 @@ func TestSearchExcludeLabels(t *testing.T) {
 		}
 	}
 }
+
+func TestFindNodesByFileOverlap(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create nodes with different line ranges in the same file
+	_, _ = s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "funcA", QualifiedName: "test.main.funcA", FilePath: "main.go", StartLine: 1, EndLine: 10})
+	_, _ = s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "funcB", QualifiedName: "test.main.funcB", FilePath: "main.go", StartLine: 12, EndLine: 25})
+	_, _ = s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "funcC", QualifiedName: "test.main.funcC", FilePath: "other.go", StartLine: 1, EndLine: 50})
+	// Module node should be excluded from overlap results
+	_, _ = s.UpsertNode(&Node{Project: "test", Label: "Module", Name: "main", QualifiedName: "test.main", FilePath: "main.go", StartLine: 1, EndLine: 100})
+
+	// Overlap with funcA (lines 5-8)
+	nodes, err := s.FindNodesByFileOverlap("test", "main.go", 5, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0].Name != "funcA" {
+		t.Errorf("expected funcA, got %d nodes", len(nodes))
+	}
+
+	// Overlap spanning funcA and funcB (lines 8-15)
+	nodes, err = s.FindNodesByFileOverlap("test", "main.go", 8, 15)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 2 {
+		t.Errorf("expected 2 nodes (funcA + funcB), got %d", len(nodes))
+	}
+
+	// No overlap (lines 26-30)
+	nodes, err = s.FindNodesByFileOverlap("test", "main.go", 26, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 0 {
+		t.Errorf("expected 0 nodes, got %d", len(nodes))
+	}
+
+	// Different file
+	nodes, err = s.FindNodesByFileOverlap("test", "other.go", 1, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0].Name != "funcC" {
+		t.Errorf("expected funcC, got %d nodes", len(nodes))
+	}
+}
+
+func TestBFSWithRiskLabels(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Build chain: A -> B -> C -> D
+	idA, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "A", QualifiedName: "test.A"})
+	idB, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "B", QualifiedName: "test.B"})
+	idC, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "C", QualifiedName: "test.C"})
+	idD, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "D", QualifiedName: "test.D"})
+
+	_, _ = s.InsertEdge(&Edge{Project: "test", SourceID: idA, TargetID: idB, Type: "CALLS"})
+	_, _ = s.InsertEdge(&Edge{Project: "test", SourceID: idB, TargetID: idC, Type: "CALLS"})
+	_, _ = s.InsertEdge(&Edge{Project: "test", SourceID: idC, TargetID: idD, Type: "CALLS"})
+
+	// BFS from A outbound, depth=3
+	result, err := s.BFS(idA, "outbound", []string{"CALLS"}, 3, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Deduplicate (needed for risk labels)
+	deduped := DeduplicateHops(result.Visited)
+	if len(deduped) != 3 {
+		t.Fatalf("expected 3 visited nodes (B,C,D), got %d", len(deduped))
+	}
+
+	// Verify risk labels
+	riskByName := make(map[string]RiskLevel)
+	for _, nh := range deduped {
+		riskByName[nh.Node.Name] = HopToRisk(nh.Hop)
+	}
+	if riskByName["B"] != RiskCritical {
+		t.Errorf("B: expected CRITICAL, got %s", riskByName["B"])
+	}
+	if riskByName["C"] != RiskHigh {
+		t.Errorf("C: expected HIGH, got %s", riskByName["C"])
+	}
+	if riskByName["D"] != RiskMedium {
+		t.Errorf("D: expected MEDIUM, got %s", riskByName["D"])
+	}
+
+	// Build summary
+	summary := BuildImpactSummary(deduped, result.Edges)
+	if summary.Critical != 1 || summary.High != 1 || summary.Medium != 1 {
+		t.Errorf("summary: critical=%d high=%d medium=%d, want 1/1/1", summary.Critical, summary.High, summary.Medium)
+	}
+	if summary.Total != 3 {
+		t.Errorf("total=%d, want 3", summary.Total)
+	}
+}
+
+func TestBFSWithCrossServiceEdges(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.UpsertProject("test", "/tmp/test"); err != nil {
+		t.Fatal(err)
+	}
+
+	idA, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "A", QualifiedName: "test.A"})
+	idB, _ := s.UpsertNode(&Node{Project: "test", Label: "Function", Name: "B", QualifiedName: "test.B"})
+
+	_, _ = s.InsertEdge(&Edge{Project: "test", SourceID: idA, TargetID: idB, Type: "HTTP_CALLS"})
+
+	result, err := s.BFS(idA, "outbound", []string{"CALLS", "HTTP_CALLS"}, 1, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	summary := BuildImpactSummary(result.Visited, result.Edges)
+	if !summary.HasCrossService {
+		t.Error("expected has_cross_service=true for HTTP_CALLS edge")
+	}
+}

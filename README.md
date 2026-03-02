@@ -4,12 +4,14 @@
 
 Single Go binary. No Docker, no external databases, no API keys. One command to install, say *"Index this project"* — done.
 
-Parses source code with [tree-sitter](https://tree-sitter.github.io/tree-sitter/), extracts functions, classes, modules, call relationships, and cross-service HTTP links. Exposes the graph through 12 MCP tools for use with Claude Code, Codex CLI, or any MCP-compatible client. Also includes a **CLI mode** for direct tool invocation from the shell — no MCP client needed.
+Parses source code with [tree-sitter](https://tree-sitter.github.io/tree-sitter/), extracts functions, classes, modules, call relationships, and cross-service HTTP links. Exposes the graph through 14 MCP tools for use with Claude Code, Codex CLI, Cursor, Windsurf, or any MCP-compatible client. Also includes a **CLI mode** for direct tool invocation from the shell — no MCP client needed.
 
 ## Features
 
 - **35 languages**: Python, Go, JavaScript, TypeScript, TSX, Rust, Java, C++, C#, C, PHP, Lua, Scala, Kotlin, Ruby, Bash, Zig, Elixir, Haskell, OCaml, Objective-C, Swift, Dart, Perl, Groovy, Erlang, R, HTML, CSS, SCSS, YAML, TOML, HCL, SQL, Dockerfile
-- **One-command install**: `codebase-memory-mcp install` auto-detects Claude Code and Codex CLI, registers the MCP server, and installs task-specific skills
+- **Git diff impact mapping**: `detect_changes` maps uncommitted changes to affected graph symbols + blast radius with risk classification (CRITICAL/HIGH/MEDIUM/LOW)
+- **Risk-classified tracing**: `trace_call_path` with `risk_labels=true` adds impact classification to every node in the call chain
+- **One-command install**: `codebase-memory-mcp install` auto-detects Claude Code, Codex CLI, Cursor, and Windsurf, registers the MCP server, and installs task-specific skills
 - **Self-update**: `codebase-memory-mcp update` downloads the latest release, verifies checksums, and atomically swaps the binary
 - **Task-specific skills**: 4 skills (exploring, tracing, quality, reference) that prescribe exact tool sequences — Claude Code automatically uses graph tools instead of defaulting to grep
 - **Fast**: Sub-millisecond graph queries, incremental reindex 4x faster than full scan, optimized SQLite with LIKE pre-filtering for regex searches
@@ -84,7 +86,7 @@ Benchmarked on Apple M3 Pro, macOS Darwin 25.3.0:
 4. **Restart** Claude Code / Codex CLI
 5. Say **"Index this project"** — done.
 
-The `install` command auto-detects Claude Code and Codex CLI, registers the MCP server, installs 4 task-specific skills, and ensures the binary is on your PATH. Use `--dry-run` to preview without making changes.
+The `install` command auto-detects Claude Code, Codex CLI, Cursor, and Windsurf, registers the MCP server, installs 4 task-specific skills, and ensures the binary is on your PATH. Use `--dry-run` to preview without making changes.
 
 ### Keeping Up to Date
 
@@ -237,7 +239,7 @@ Add the MCP server to your project's `.mcp.json` (per-project, recommended) or `
 }
 ```
 
-Restart Claude Code after adding the config. Verify with `/mcp` — you should see `codebase-memory-mcp` listed with 12 tools.
+Restart Claude Code after adding the config. Verify with `/mcp` — you should see `codebase-memory-mcp` listed with 14 tools.
 
 </details>
 
@@ -330,7 +332,8 @@ The CLI uses the same SQLite database as the MCP server (`~/.cache/codebase-memo
 | Tool | Key Parameters | Description |
 |------|---------------|-------------|
 | `search_graph` | `label`, `name_pattern`, `project`, `file_pattern`, `relationship`, `direction`, `min_degree`, `max_degree`, `exclude_entry_points`, `limit` (default 100), `offset` | Structured search with filters. Use `project` to scope to a single repo when multiple are indexed. Supports pagination via `limit`/`offset` — response includes `has_more` and `total`. |
-| `trace_call_path` | `function_name` (required), `direction` (inbound/outbound/both), `depth` (1-5, default 3) | BFS traversal from/to a function (exact name match). Returns call chains with signatures, constants, and edge types. Capped at 200 nodes. |
+| `trace_call_path` | `function_name` (required), `direction` (inbound/outbound/both), `depth` (1-5, default 3), `risk_labels` (boolean) | BFS traversal from/to a function (exact name match). Returns call chains with signatures, constants, and edge types. Capped at 200 nodes. With `risk_labels=true`, adds CRITICAL/HIGH/MEDIUM/LOW classification and `impact_summary`. |
+| `detect_changes` | `scope` (unstaged/staged/all/branch), `base_branch`, `depth` (1-5, default 3) | Map git diff to affected graph symbols + blast radius. Returns changed files, changed symbols, and impacted callers with risk classification. Requires git in PATH. |
 | `query_graph` | `query` (required) | Execute Cypher-like graph queries (read-only). See [Supported Cypher Subset](#supported-cypher-subset) for what's supported. |
 | `get_graph_schema` | — | Node/edge counts, relationship patterns, sample names. Run this first to understand what's in the graph. |
 | `get_code_snippet` | `qualified_name` (required) | Read source code for a function by its qualified name (reads from disk). See [Qualified Names](#qualified-names) for the format. |
@@ -369,6 +372,20 @@ trace_call_path(function_name="ProcessOrder", depth=3, direction="outbound")
 
 ```
 trace_call_path(function_name="ProcessOrder", depth=2, direction="inbound")
+```
+
+### Risk-classified impact analysis
+
+```
+trace_call_path(function_name="ProcessOrder", direction="inbound", depth=3, risk_labels=true)
+```
+
+### Detect changes (git diff impact)
+
+```
+detect_changes()
+detect_changes(scope="staged")
+detect_changes(scope="branch", base_branch="main", depth=3)
 ```
 
 ### Dead code detection
@@ -577,6 +594,7 @@ make install  # go install
 | `trace_call_path` returns 0 results | Exact name match — no fuzzy matching | Use `search_graph(name_pattern=".*PartialName.*")` to discover the exact function name first. |
 | Queries return results from wrong project | Multiple projects indexed, no filter | Add `project="your-project-name"` to `search_graph`. Use `list_projects` to see indexed project names. |
 | Graph is missing recently added files | Auto-sync hasn't caught up yet, or project was never indexed | Wait a few seconds for auto-sync, or run `index_repository` manually. Auto-sync polls at 1–60s intervals depending on repo size. |
+| `detect_changes` fails with "git not found" | git not installed or not on PATH | Install git. Required at runtime only for `detect_changes`. |
 | Binary not found after install | `~/.local/bin` not on PATH | Add to your shell profile: `export PATH="$HOME/.local/bin:$PATH"` |
 | Cypher query fails with parse error | Unsupported Cypher feature | See [Supported Cypher Subset](#supported-cypher-subset). `WITH`, `COLLECT`, `OPTIONAL MATCH` are not supported. |
 
@@ -606,7 +624,7 @@ internal/
   httplink/               Cross-service HTTP route/call-site matching
   cypher/                 Cypher query lexer, parser, planner, executor
   selfupdate/             GitHub release checking, version comparison, asset download
-  tools/                  MCP tool handlers (12 tools) + CLI dispatch
+  tools/                  MCP tool handlers (14 tools) + CLI dispatch
   watcher/                Background auto-sync (mtime+size polling, adaptive intervals)
   discover/               File discovery with .cgrignore support
   fqn/                    Qualified name computation

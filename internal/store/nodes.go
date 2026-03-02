@@ -154,6 +154,21 @@ func (s *Store) FindNodesByIDs(ids []int64) (map[int64]*Node, error) {
 	return result, nil
 }
 
+// FindNodesByFileOverlap returns nodes whose line range overlaps [startLine, endLine].
+// The fileSuffix is matched with LIKE '%' || ? against the file_path column to handle
+// relative/absolute path differences.
+func (s *Store) FindNodesByFileOverlap(project, fileSuffix string, startLine, endLine int) ([]*Node, error) {
+	rows, err := s.q.Query(`SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, properties
+		FROM nodes WHERE project=? AND file_path LIKE '%' || ? AND start_line <= ? AND end_line >= ?
+		AND label NOT IN ('Project', 'Package', 'Folder', 'File', 'Module')`,
+		project, fileSuffix, endLine, startLine)
+	if err != nil {
+		return nil, fmt.Errorf("find by file overlap: %w", err)
+	}
+	defer rows.Close()
+	return scanNodes(rows)
+}
+
 // AllNodes returns all nodes for a project.
 func (s *Store) AllNodes(project string) ([]*Node, error) {
 	rows, err := s.q.Query(`SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, properties

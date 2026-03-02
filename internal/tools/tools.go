@@ -23,7 +23,7 @@ import (
 )
 
 // Version is the current release version, referenced by MCP handshake and update checker.
-const Version = "0.2.1-dev"
+const Version = "0.3.1"
 
 // releaseURL is the GitHub API endpoint for latest release. Package-level var for test injection.
 var releaseURL = "https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest"
@@ -369,6 +369,7 @@ func (s *Server) registerTools() {
 	s.registerFileTools()
 	s.registerProjectTools()
 	s.registerTraceTools()
+	s.registerDetectChanges()
 }
 
 // registerGraphTools registers tools for graph querying, searching, and tracing.
@@ -412,6 +413,10 @@ func (s *Server) registerIndexAndTraceTool() {
 					"type": "string",
 					"description": "Traversal direction: 'outbound' (what it calls), 'inbound' (what calls it), or 'both'",
 					"enum": ["outbound", "inbound", "both"]
+				},
+				"risk_labels": {
+					"type": "boolean",
+					"description": "Add risk classification (CRITICAL/HIGH/MEDIUM/LOW) based on hop depth. Hop 1=CRITICAL, 2=HIGH, 3=MEDIUM, 4+=LOW. Includes impact_summary with counts. Default false."
 				},
 				"project": {
 					"type": "string",
@@ -461,7 +466,7 @@ func (s *Server) registerSchemaAndSnippetTools() {
 func (s *Server) registerSearchTools() {
 	s.addTool(&mcp.Tool{
 		Name:        "search_graph",
-		Description: "Search the code knowledge graph for functions, classes, modules, routes, and other code elements. Returns nodes matching the criteria with their connectivity (in/out degree). Results are sorted by relevance by default (exact match first, prefix match second, then by connectivity). Community nodes are excluded by default. Pass exclude_labels: [] to include them. Best practice: Chain with trace_call_path and get_code_snippet for complete answers. Example workflow: search_graph(name_pattern='.*Order.*') → trace_call_path(function_name='processOrder') → get_code_snippet(qualified_name='...'). Returns 10 results per page (use offset to paginate, has_more indicates more pages). For dead code: use relationship='CALLS', direction='inbound', max_degree=0, exclude_entry_points=true. For fan-out: use relationship='CALLS', direction='outbound', min_degree=N. Route nodes: properties.handler contains the actual handler function name. Prefer this over query_graph for counting — no row cap. IMPORTANT: The 'relationship' filter counts how many edges of that type each node has (degree filtering) — it does NOT return the actual edges. To list cross-service HTTP_CALLS or ASYNC_CALLS edges with their properties, use query_graph with Cypher instead. Relationship types: CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD, HANDLES, CONTAINS_FILE, CONTAINS_FOLDER, CONTAINS_PACKAGE, IMPLEMENTS, OVERRIDE, USAGE, FILE_CHANGES_WITH.",
+		Description: "Search the code knowledge graph for functions, classes, modules, routes, and other code elements. Returns nodes matching the criteria with their connectivity (in/out degree). Results are sorted by relevance by default (exact match first, prefix match second, then by connectivity). Community nodes are excluded by default. Pass exclude_labels: [] to include them. Best practice: Chain with trace_call_path and get_code_snippet for complete answers. Example workflow: search_graph(name_pattern='.*Order.*') → trace_call_path(function_name='processOrder') → get_code_snippet(qualified_name='...'). Returns 10 results per page (use offset to paginate, has_more indicates more pages). name_pattern and qn_pattern support full Go regex — one precise regex replaces multiple literal searches. See parameter descriptions for patterns. For dead code: use relationship='CALLS', direction='inbound', max_degree=0, exclude_entry_points=true. For fan-out: use relationship='CALLS', direction='outbound', min_degree=N. Route nodes: properties.handler contains the actual handler function name. Prefer this over query_graph for counting — no row cap. IMPORTANT: The 'relationship' filter counts how many edges of that type each node has (degree filtering) — it does NOT return the actual edges. To list cross-service HTTP_CALLS or ASYNC_CALLS edges with their properties, use query_graph with Cypher instead. Relationship types: CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD, HANDLES, CONTAINS_FILE, CONTAINS_FOLDER, CONTAINS_PACKAGE, IMPLEMENTS, OVERRIDE, USAGE, FILE_CHANGES_WITH.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -475,11 +480,11 @@ func (s *Server) registerSearchTools() {
 				},
 				"name_pattern": {
 					"type": "string",
-					"description": "Regex pattern matched against the short node name only (e.g. '.*Handler', 'Send.*'). Does NOT match against file paths or qualified names."
+					"description": "Regex pattern matched against the short node name only. Supports full Go regex: '.*Handler$' (suffix), '(?i)auth' (case-insensitive), 'get|set|delete' (alternatives), '^on[A-Z]' (prefix+char class). Does NOT match against file paths or qualified names — use qn_pattern for path scoping."
 				},
 				"qn_pattern": {
 					"type": "string",
-					"description": "Regex pattern matched against the qualified name (includes module path, e.g. '.*tests\\.conftest\\..*', '.*services\\.order\\..*'). Use this to scope searches to specific directories or modules."
+					"description": "Regex pattern matched against the qualified name (full module path). Use to scope searches to directories/modules: '.*services\\.order\\..*' (order service), '.*tests\\..*' (test files only), '(?i).*controller.*\\.handle.*' (handler methods in controllers). Combine with name_pattern for precise cross-cutting queries."
 				},
 				"file_pattern": {
 					"type": "string",
@@ -534,13 +539,13 @@ func (s *Server) registerSearchTools() {
 
 	s.addTool(&mcp.Tool{
 		Name:        "search_code",
-		Description: "Search for text in source code files (like grep, scoped to indexed project). Returns 10 matches per page — use offset to paginate, has_more indicates more pages. Use for string literals, error messages, TODO comments.",
+		Description: "Search for text in source code files (like grep, scoped to indexed project). Returns matching lines with file path, line number, and context. Returns 10 matches per page — use offset to paginate, has_more indicates more pages. Use for: string literals, error messages, TODO comments, config values, import statements. With regex=true, supports full Go regex — see pattern parameter for examples. Prefer search_graph for finding functions/classes by name — search_code is for text content that isn't in the graph.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
 				"pattern": {
 					"type": "string",
-					"description": "Text to search for (literal string, or regex if regex=true)"
+					"description": "Text to search for. Literal string by default; with regex=true supports full Go regex (e.g. 'err != nil', 'TODO|FIXME', '(?i)deprecated')"
 				},
 				"file_pattern": {
 					"type": "string",
