@@ -367,3 +367,40 @@ func TestLuaFuncAssignName(t *testing.T) {
 		})
 	}
 }
+
+// TestRFuncAssignName verifies that rFuncAssignName correctly extracts
+// variable names for R function assignments.
+func TestRFuncAssignName(t *testing.T) {
+	tests := []struct {
+		name     string
+		code     string
+		wantName string
+	}{
+		{"arrow_assign", "add <- function(a, b) {\n\ta + b\n}\n", "add"},
+		{"equals_assign", "square = function(n) {\n\tn * n\n}\n", "square"},
+		{"double_arrow", "greet <<- function(x) x\n", "greet"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tree, src := parseSource(t, lang.R, tt.code)
+			defer tree.Close()
+
+			var foundName string
+			parser.Walk(tree.RootNode(), func(node *tree_sitter.Node) bool {
+				if node.Kind() == "function_definition" {
+					nameNode := rFuncAssignName(node)
+					if nameNode != nil {
+						foundName = parser.NodeText(nameNode, src)
+					}
+					return false
+				}
+				return true
+			})
+
+			if foundName != tt.wantName {
+				t.Errorf("rFuncAssignName: got %q, want %q", foundName, tt.wantName)
+			}
+		})
+	}
+}
