@@ -54,7 +54,7 @@ func runUpdate(args []string) int {
 	}
 
 	if selfupdate.CompareVersions(latest, currentVersion) <= 0 {
-		fmt.Printf("Already up to date (v%s).\n", currentVersion)
+		fmt.Printf("Already up to date (%s).\n", currentVersion)
 		return 0
 	}
 
