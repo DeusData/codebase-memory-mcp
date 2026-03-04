@@ -169,7 +169,7 @@ download_binary() {
     tar -xzf "${tmpdir}/${asset}" -C "$tmpdir"
 
     mkdir -p "$INSTALL_DIR"
-    mv "${tmpdir}/codebase-memory-mcp-${platform}" "${INSTALL_DIR}/${BINARY_NAME}"
+    mv "${tmpdir}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
     chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
 
     ok "Installed to ${INSTALL_DIR}/${BINARY_NAME}"
