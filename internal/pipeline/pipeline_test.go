@@ -788,6 +788,7 @@ func TestPipelineRunCancellation(t *testing.T) {
 // TestProjectNameFromPath verifies unique project names from absolute paths.
 func TestProjectNameFromPath(t *testing.T) {
 	tests := []struct{ path, want string }{
+		{"C:/Users/project", "C-Users-project"},  
 		{"/tmp/bench/erlang/lib/stdlib/src", "tmp-bench-erlang-lib-stdlib-src"},
 		{"/Users/martin/projects/myapp", "Users-martin-projects-myapp"},
 		{"/home/user/repo", "home-user-repo"},

@@ -63,12 +63,13 @@ func New(ctx context.Context, s *store.Store, repoPath string) *Pipeline {
 }
 
 // ProjectNameFromPath derives a unique project name from an absolute path
-// by replacing path separators with dashes and trimming the leading dash.
+// by replacing path separators and colons (Windows drive letters) with dashes and trimming the leading dash.
 func ProjectNameFromPath(absPath string) string {
 	// Clean and convert to slash-separated
 	cleaned := filepath.ToSlash(filepath.Clean(absPath))
-	// Replace slashes with dashes
+	// Replace slashes and colons with dashes
 	name := strings.ReplaceAll(cleaned, "/", "-")
+	name = strings.ReplaceAll(name, ":", "-")
 	// Trim leading dash (from leading /)
 	name = strings.TrimLeft(name, "-")
 	if name == "" {
