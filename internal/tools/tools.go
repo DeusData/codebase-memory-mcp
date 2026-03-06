@@ -483,6 +483,10 @@ func (s *Server) registerIndexAndTraceTool() {
 					"type": "number",
 					"description": "Minimum confidence threshold (0.0-1.0) for CALLS edges. Filters out low-confidence fuzzy matches. Bands: high (>=0.7), medium (>=0.45), speculative (<0.45). Default 0 (no filter)."
 				},
+				"qualified_name": {
+					"type": "string",
+					"description": "Exact qualified name for disambiguation (e.g. 'auth.SessionService.Create'). Takes priority over function_name when both are provided. Use search_graph or the suggestions from a previous trace_call_path to find the correct qualified_name."
+				},
 				"project": {
 					"type": "string",
 					"description": "Project to trace in. Defaults to session project."
@@ -853,4 +857,31 @@ func (s *Server) findNodeAcrossProjects(name string, projectFilter ...string) (*
 		}
 	}
 	return nil, "", fmt.Errorf("node not found: %s", name)
+}
+
+// findNodeByQNAcrossProjects searches for a node by exact qualified name.
+func (s *Server) findNodeByQNAcrossProjects(qn string, projectFilter ...string) (*store.Node, string, error) {
+	filter := s.sessionProject
+	if len(projectFilter) > 0 && projectFilter[0] != "" {
+		filter = projectFilter[0]
+	}
+	if filter == "" {
+		return nil, "", fmt.Errorf("no project specified and no session project detected")
+	}
+	if !s.router.HasProject(filter) {
+		return nil, "", fmt.Errorf("project %q not found", filter)
+	}
+
+	st, err := s.router.ForProject(filter)
+	if err != nil {
+		return nil, "", err
+	}
+	projects, _ := st.ListProjects()
+	for _, p := range projects {
+		node, findErr := st.FindNodeByQN(p.Name, qn)
+		if findErr == nil && node != nil {
+			return node, p.Name, nil
+		}
+	}
+	return nil, "", fmt.Errorf("node not found: %s", qn)
 }

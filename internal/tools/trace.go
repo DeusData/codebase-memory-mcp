@@ -37,11 +37,22 @@ func (s *Server) handleTraceCallPath(_ context.Context, req *mcp.CallToolRequest
 	riskLabels := getBoolArg(args, "risk_labels")
 	minConfidence := getFloatArg(args, "min_confidence", 0)
 
+	qualifiedName := getStringArg(args, "qualified_name")
+
 	project := getStringArg(args, "project")
 	effectiveProject := s.resolveProjectName(project)
 
-	// Find the function node
-	rootNode, foundProject, findErr := s.findNodeAcrossProjects(funcName, effectiveProject)
+	// Find the function node — qualified_name takes priority when provided
+	var rootNode *store.Node
+	var foundProject string
+	var findErr error
+
+	if qualifiedName != "" {
+		rootNode, foundProject, findErr = s.findNodeByQNAcrossProjects(qualifiedName, effectiveProject)
+	}
+	if rootNode == nil {
+		rootNode, foundProject, findErr = s.findNodeAcrossProjects(funcName, effectiveProject)
+	}
 	if findErr != nil && !strings.HasPrefix(findErr.Error(), "node not found") {
 		return errResult(findErr.Error()), nil
 	}
