@@ -209,7 +209,7 @@ func enrichModuleNodeCBM(moduleNode *store.Node, cbmResult *cbm.FileResult, _ *p
 }
 
 // inferTypesCBM builds a TypeMap from CBM TypeAssign data + registry resolution.
-// Also infers types from Go method receivers (e.g., func (h *Handler) → h:Handler).
+// Replaces the 14 language-specific infer*Types() functions.
 func inferTypesCBM(
 	typeAssigns []cbm.TypeAssign,
 	defs []cbm.Definition,
@@ -276,7 +276,7 @@ func (p *Pipeline) resolveFileCallsCBM(relPath string, ext *cachedExtraction) []
 	moduleQN := fqn.ModuleQN(p.ProjectName, relPath)
 	importMap := p.importMaps[moduleQN]
 
-	// Build type map from CBM type assignments + receiver types
+	// Build type map from CBM type assignments
 	typeMap := inferTypesCBM(ext.Result.TypeAssigns, ext.Result.Definitions, p.registry, moduleQN, importMap)
 
 	var edges []resolvedEdge
