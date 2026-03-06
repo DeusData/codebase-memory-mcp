@@ -67,7 +67,28 @@ func cbmParseFileFromSource(projectName string, f discover.FileInfo, source []by
 
 	// Convert CBM definitions to store.Node objects
 	for i := range cbmResult.Definitions {
-		node, edge := cbmDefToNode(&cbmResult.Definitions[i], projectName, moduleQN)
+		// Fix: mark test functions as entry points.
+		// The C extractor only sets is_test on the module, not on individual functions.
+		// Test functions (Go Test*/Benchmark*/Example*, Python test_*, etc.) are invoked
+		// by the test runner, not by the call graph — they must be entry points.
+		def := &cbmResult.Definitions[i]
+		if cbmResult.IsTestFile && !def.IsEntryPoint &&
+			(def.Label == "Function" || def.Label == "Method") &&
+			isTestFunction(def.Name, f.Language) {
+			def.IsEntryPoint = true
+			def.IsTest = true
+		}
+
+		// Mark exported handler methods as entry points.
+		// Echo handlers are registered via method value references (g.POST("", h.Method))
+		// which the C extractor doesn't track as explicit calls.
+		if !def.IsEntryPoint && def.Label == "Method" && def.IsExported &&
+			strings.Contains(f.RelPath, "handler") &&
+			strings.Contains(def.Signature, "echo.Context") {
+			def.IsEntryPoint = true
+		}
+
+		node, edge := cbmDefToNode(def, projectName, moduleQN)
 		result.Nodes = append(result.Nodes, node)
 		result.PendingEdges = append(result.PendingEdges, edge)
 	}
