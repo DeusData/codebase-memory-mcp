@@ -4,19 +4,19 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>codebase-memory-mcp — Code Knowledge Graph for AI Assistants</title>
-    <meta name="description" content="MCP server that indexes codebases into a persistent knowledge graph. 35 languages, 120x fewer tokens, single Go binary. Works with Claude Code, Codex CLI, Cursor, Windsurf.">
-    <meta name="keywords" content="MCP server, code analysis, knowledge graph, tree-sitter, Claude Code, Codex, Cursor, Windsurf, developer tools, code exploration, token reduction">
+    <meta name="description" content="MCP server that indexes codebases into a persistent knowledge graph. 59 languages, 120x fewer tokens, single Go binary. Works with Claude Code, Codex CLI, Cursor, Windsurf, Gemini CLI, VS Code, Zed.">
+    <meta name="keywords" content="MCP server, code analysis, knowledge graph, tree-sitter, Claude Code, Codex, Cursor, Windsurf, Gemini CLI, VS Code, Zed, developer tools, code exploration, token reduction">
 
     <!-- Open Graph -->
     <meta property="og:title" content="codebase-memory-mcp — Code Knowledge Graph for AI Assistants">
-    <meta property="og:description" content="120x fewer tokens for AI code exploration. 35 languages, sub-ms queries, single Go binary.">
+    <meta property="og:description" content="120x fewer tokens for AI code exploration. 59 languages, sub-ms queries, single Go binary.">
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://deusdata.github.io/codebase-memory-mcp">
 
     <!-- Twitter Card -->
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="codebase-memory-mcp — Code Knowledge Graph for AI Assistants">
-    <meta name="twitter:description" content="120x fewer tokens for AI code exploration. 35 languages, sub-ms queries, single Go binary.">
+    <meta name="twitter:description" content="120x fewer tokens for AI code exploration. 59 languages, sub-ms queries, single Go binary.">
 
     <link rel="canonical" href="https://deusdata.github.io/codebase-memory-mcp">
 
@@ -210,7 +210,7 @@
                 <div class="label">fewer tokens</div>
             </div>
             <div class="stat">
-                <div class="number">35</div>
+                <div class="number">59</div>
                 <div class="label">languages</div>
             </div>
             <div class="stat">
@@ -240,7 +240,7 @@
             <span class="cmd">"Index this project"</span>
         </div>
         <p style="color: var(--text-secondary); font-size: 0.9rem;">
-            Works with Claude Code, Codex CLI, Cursor, and Windsurf. Also has a CLI mode for direct terminal use.
+            Works with Claude Code, Codex CLI, Cursor, Windsurf, Gemini CLI, VS Code, and Zed. Also has a CLI mode for direct terminal use.
         </p>
     </section>
 
@@ -312,8 +312,8 @@
             </tbody>
         </table>
         <p style="color: var(--text-secondary); font-size: 0.875rem; margin-top: 8px;">
-            Tested across 35 real open-source repos (78 to 49K nodes). Stress tested on Linux kernel
-            (20K nodes, 67K edges, zero timeouts).
+            Tested across 31 languages with agent-vs-agent methodology (372 questions).
+            MCP achieves 90% of Explorer quality at 20-100x lower per-query cost.
             <a href="https://github.com/DeusData/codebase-memory-mcp/blob/main/BENCHMARK_REPORT.md">Full benchmark report &rarr;</a>
         </p>
     </section>
@@ -322,8 +322,8 @@
         <h2>Features</h2>
         <div class="features">
             <div class="feature">
-                <h3>35 Languages</h3>
-                <p>Python, Go, JS, TS, Rust, Java, C++, C#, PHP, Ruby, Kotlin, Scala, Zig, Elixir, Haskell, and 20 more via tree-sitter grammars.</p>
+                <h3>59 Languages</h3>
+                <p>Python, Go, JS, TS, TSX, Rust, Java, C++, C#, C, PHP, Ruby, Kotlin, Scala, Zig, Elixir, Haskell, OCaml, Swift, Dart, and 39 more via vendored tree-sitter grammars.</p>
             </div>
             <div class="feature">
                 <h3>Call Graph Tracing</h3>
@@ -371,11 +371,11 @@
                 </tr>
             </thead>
             <tbody>
-                <tr><td>Languages</td><td class="win">35</td><td>8-11</td></tr>
+                <tr><td>Languages</td><td class="win">59</td><td>8-11</td></tr>
                 <tr><td>Runtime</td><td class="win">Single Go binary</td><td>Node.js (npx)</td></tr>
                 <tr><td>Runtime dependency</td><td class="win">None</td><td>Node.js</td></tr>
                 <tr><td>Embedded LLM</td><td class="win">No (uses your MCP client)</td><td>Yes (extra API key + cost)</td></tr>
-                <tr><td>Published benchmarks</td><td class="win">Yes (35 repos, Linux kernel)</td><td>No</td></tr>
+                <tr><td>Published benchmarks</td><td class="win">Yes (31 langs, 372 questions)</td><td>No</td></tr>
                 <tr><td>Auto-sync</td><td class="win">Yes</td><td>No</td></tr>
                 <tr><td>MCP tools</td><td class="win">12</td><td>7</td></tr>
                 <tr><td>Cross-service HTTP linking</td><td class="win">Yes</td><td>No</td></tr>
