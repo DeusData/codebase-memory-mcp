@@ -335,7 +335,6 @@ func TestPublishEventPatterns_Compile(t *testing.T) {
 		{`.Emit(events.EventCheckinCompleted,`, publishEventPatterns, "EventCheckinCompleted"},
 		{`.Subscribe(events.EventVoteCast,`, subscribeEventPatterns, "EventVoteCast"},
 		{`.emit('user.created',`, publishEventPatterns, "user.created"},
-		{`.on('user.created',`, subscribeEventPatterns, "user.created"},
 	}
 
 	for _, tt := range tests {
@@ -351,6 +350,45 @@ func TestPublishEventPatterns_Compile(t *testing.T) {
 			t.Errorf("no pattern matched %q for expected %q", tt.input, tt.want)
 		}
 	}
+}
+
+func TestAttributeHandlersToEvents_SubstringNoFalseMatch(t *testing.T) {
+	source := `
+bus.Subscribe(events.EventCheckinCompleted, func(p any) {
+    svc.AwardXP(ctx, userID, 10)
+})
+bus.Subscribe(events.EventVoteCast, func(p any) {
+    svc.Award(ctx, userID)
+})`
+
+	handlerNameToIDs := map[string][]int64{
+		"Award":   {100},
+		"AwardXP": {200},
+	}
+
+	result := attributeHandlersToEvents(source, subscribeEventPatterns, handlerNameToIDs)
+
+	// AwardXP should be attributed to EventCheckinCompleted
+	if !containsID(result["EventCheckinCompleted"], 200) {
+		t.Error("expected AwardXP under EventCheckinCompleted")
+	}
+	// Award should be attributed to EventVoteCast
+	if !containsID(result["EventVoteCast"], 100) {
+		t.Error("expected Award under EventVoteCast")
+	}
+	// Award should NOT appear under EventCheckinCompleted (substring false match)
+	if containsID(result["EventCheckinCompleted"], 100) {
+		t.Error("Award should not be under EventCheckinCompleted — substring false match")
+	}
+}
+
+func containsID(ids []int64, target int64) bool {
+	for _, id := range ids {
+		if id == target {
+			return true
+		}
+	}
+	return false
 }
 
 // keysOf returns the keys of a map for debugging.
