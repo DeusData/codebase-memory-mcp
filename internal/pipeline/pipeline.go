@@ -346,6 +346,10 @@ func (p *Pipeline) runFullPasses(files []discover.FileInfo) error {
 	slog.Info("pass.timing", "pass", "configlinker", "elapsed", time.Since(t))
 
 	t = time.Now()
+	p.passPubSubLinks()
+	slog.Info("pass.timing", "pass", "pubsublinks", "elapsed", time.Since(t))
+
+	t = time.Now()
 	p.passGitHistory()
 	slog.Info("pass.timing", "pass", "githistory", "elapsed", time.Since(t))
 
@@ -503,6 +507,7 @@ func (p *Pipeline) runIncrementalPasses(
 		slog.Warn("pass.httplink.err", "err", err)
 	}
 	p.passConfigLinker()
+	p.passPubSubLinks()
 	p.passImplements()
 	p.passGitHistory()
 
