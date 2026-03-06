@@ -9,36 +9,32 @@ import (
 )
 
 // publishMethodNames are method names that indicate event publishing (case-insensitive).
+// Only high-signal names are included to avoid false positives with generic methods.
 var publishMethodNames = map[string]bool{
 	"publish":   true,
 	"emit":      true,
 	"dispatch":  true,
 	"fire":      true,
-	"send":      true,
-	"notify":    true,
-	"trigger":   true,
 	"broadcast": true,
 }
 
 // subscribeMethodNames are method names that indicate event subscribing (case-insensitive).
 var subscribeMethodNames = map[string]bool{
 	"subscribe":   true,
-	"on":          true,
 	"addlistener": true,
 	"listen":      true,
-	"handle":      true,
-	"register":    true,
 }
 
-// passPubSubLinks detects in-process event bus patterns (Publish/Subscribe with shared
-// event constants) and creates ASYNC_CALLS edges between publisher functions and
-// subscriber registration functions.
+// passPubSubLinks detects in-process event bus patterns and creates ASYNC_CALLS
+// edges from publisher functions to the handler functions called by subscribers.
 //
 // Algorithm:
 //  1. Find all CALLS edges whose target is a known publish/subscribe method name.
-//  2. For each such caller, find USAGE edges to identify referenced event constants.
-//  3. Match publishers and subscribers that share the same event constant.
-//  4. Create ASYNC_CALLS edges from publisher functions to subscriber functions.
+//  2. For subscribers: collect the other functions they CALL (the actual handlers).
+//  3. Create ASYNC_CALLS edges from each publisher to each subscriber handler.
+//
+// This approach avoids relying on USAGE edges for event constant matching, which
+// fails because the C extractor skips identifiers inside call expressions.
 func (p *Pipeline) passPubSubLinks() {
 	t := time.Now()
 
@@ -60,9 +56,10 @@ func (p *Pipeline) passPubSubLinks() {
 	}
 
 	// Partition callers into publishers and subscribers based on target method name.
-	// Key: caller node ID, Value: true.
 	publisherIDs := make(map[int64]bool)
 	subscriberIDs := make(map[int64]bool)
+	// Track the Publish/Subscribe target QNs to exclude them from handler list.
+	pubsubTargetQNs := make(map[string]bool)
 
 	for _, e := range callEdges {
 		target := nodeLookup[e.TargetID]
@@ -72,8 +69,10 @@ func (p *Pipeline) passPubSubLinks() {
 		nameLower := strings.ToLower(target.Name)
 		if publishMethodNames[nameLower] {
 			publisherIDs[e.SourceID] = true
+			pubsubTargetQNs[target.QualifiedName] = true
 		} else if subscribeMethodNames[nameLower] {
 			subscriberIDs[e.SourceID] = true
+			pubsubTargetQNs[target.QualifiedName] = true
 		}
 	}
 
@@ -82,94 +81,65 @@ func (p *Pipeline) passPubSubLinks() {
 		return
 	}
 
-	// Find USAGE edges from publisher and subscriber functions to identify
-	// which event constants each references.
-	allCandidateIDs := make([]int64, 0, len(publisherIDs)+len(subscriberIDs))
-	for id := range publisherIDs {
-		allCandidateIDs = append(allCandidateIDs, id)
-	}
-	for id := range subscriberIDs {
-		allCandidateIDs = append(allCandidateIDs, id)
-	}
-
-	usageBySource, err := p.Store.FindEdgesBySourceIDs(allCandidateIDs, []string{"USAGE"})
-	if err != nil {
-		slog.Warn("pubsub.usage_err", "err", err)
-		return
+	// For each subscriber function, collect the OTHER functions it calls
+	// (excluding Publish/Subscribe themselves and error handlers).
+	// These are the actual event handler functions.
+	subscriberHandlers := make(map[int64][]int64) // subscriberID → []handlerNodeID
+	excludeNames := map[string]bool{
+		"error": true, "warn": true, "info": true, "debug": true,
+		"printf": true, "println": true, "sprintf": true, "errorf": true,
 	}
 
-	// Collect all USAGE target node IDs so we can resolve their names.
-	usageTargetIDs := make([]int64, 0)
-	for _, edges := range usageBySource {
-		for _, e := range edges {
-			usageTargetIDs = append(usageTargetIDs, e.TargetID)
-		}
-	}
-	usageTargetNodes, err := p.Store.FindNodesByIDs(usageTargetIDs)
-	if err != nil {
-		slog.Warn("pubsub.usage_target_err", "err", err)
-		return
-	}
-
-	// Build event constant → publisher functions and event constant → subscriber functions.
-	// An "event constant" is identified by its qualified name (the USAGE target QN).
-	eventToPublishers := make(map[string][]int64)  // eventQN → []publisherNodeID
-	eventToSubscribers := make(map[string][]int64) // eventQN → []subscriberNodeID
-	eventNames := make(map[string]string)          // eventQN → short name
-
-	for sourceID, edges := range usageBySource {
-		for _, e := range edges {
-			targetNode := usageTargetNodes[e.TargetID]
-			if targetNode == nil {
-				continue
-			}
-			// Only consider Variable nodes (constants) as event identifiers.
-			if targetNode.Label != "Variable" {
-				continue
-			}
-			eventQN := targetNode.QualifiedName
-			eventNames[eventQN] = targetNode.Name
-
-			if publisherIDs[sourceID] {
-				eventToPublishers[eventQN] = append(eventToPublishers[eventQN], sourceID)
-			}
-			if subscriberIDs[sourceID] {
-				eventToSubscribers[eventQN] = append(eventToSubscribers[eventQN], sourceID)
-			}
-		}
-	}
-
-	// Create ASYNC_CALLS edges: for each event constant that has both publishers and
-	// subscribers, link every publisher to every subscriber.
-	var edges []*store.Edge
-	seen := make(map[[2]int64]bool) // dedup (sourceID, targetID) pairs
-
-	for eventQN, pubs := range eventToPublishers {
-		subs, ok := eventToSubscribers[eventQN]
-		if !ok {
+	for _, e := range callEdges {
+		if !subscriberIDs[e.SourceID] {
 			continue
 		}
-		eventName := eventNames[eventQN]
-		for _, pubID := range pubs {
-			for _, subID := range subs {
-				if pubID == subID {
-					continue // don't self-link
+		target := nodeLookup[e.TargetID]
+		if target == nil {
+			continue
+		}
+		// Skip the pub/sub methods themselves
+		if pubsubTargetQNs[target.QualifiedName] {
+			continue
+		}
+		// Skip logging/error utility functions
+		if excludeNames[strings.ToLower(target.Name)] {
+			continue
+		}
+		subscriberHandlers[e.SourceID] = append(subscriberHandlers[e.SourceID], e.TargetID)
+	}
+
+	// Create ASYNC_CALLS edges: from each publisher to each handler function
+	// called by any subscriber.
+	var edges []*store.Edge
+	seen := make(map[[2]int64]bool)
+
+	for pubID := range publisherIDs {
+		for _, handlers := range subscriberHandlers {
+			for _, handlerID := range handlers {
+				if pubID == handlerID {
+					continue
 				}
-				key := [2]int64{pubID, subID}
+				key := [2]int64{pubID, handlerID}
 				if seen[key] {
 					continue
 				}
 				seen[key] = true
 
+				handlerNode := nodeLookup[handlerID]
+				handlerName := ""
+				if handlerNode != nil {
+					handlerName = handlerNode.Name
+				}
+
 				edges = append(edges, &store.Edge{
 					Project:  p.ProjectName,
 					SourceID: pubID,
-					TargetID: subID,
+					TargetID: handlerID,
 					Type:     "ASYNC_CALLS",
 					Properties: map[string]any{
-						"event_name":      eventName,
-						"event_qn":        eventQN,
-						"confidence":      0.8,
+						"handler_name":    handlerName,
+						"confidence":      0.7,
 						"confidence_band": "high",
 						"async_type":      "event_bus",
 					},
@@ -187,7 +157,7 @@ func (p *Pipeline) passPubSubLinks() {
 	slog.Info("pubsub.done",
 		"publishers", len(publisherIDs),
 		"subscribers", len(subscriberIDs),
-		"matched_events", countMatchedEvents(eventToPublishers, eventToSubscribers),
+		"handlers", len(subscriberHandlers),
 		"edges_created", len(edges),
 		"elapsed", time.Since(t),
 	)
@@ -208,14 +178,3 @@ func collectEdgeNodeIDs(edges []*store.Edge) []int64 {
 	return ids
 }
 
-// countMatchedEvents returns the number of event constants that have both
-// publishers and subscribers.
-func countMatchedEvents(pubs, subs map[string][]int64) int {
-	count := 0
-	for eventQN := range pubs {
-		if _, ok := subs[eventQN]; ok {
-			count++
-		}
-	}
-	return count
-}
