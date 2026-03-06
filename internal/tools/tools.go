@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,7 +25,7 @@ import (
 )
 
 // Version is the current release version, referenced by MCP handshake and update checker.
-const Version = "0.4.0"
+const Version = "0.4.3"
 
 // releaseURL is the GitHub API endpoint for latest release. Package-level var for test injection.
 var releaseURL = "https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest"
@@ -180,7 +181,12 @@ func parseFileURI(uri string) (string, bool) {
 	if err != nil || u.Scheme != "file" {
 		return "", false
 	}
-	return u.Path, true
+	path := u.Path
+	// On Windows, file:///C:/path parses to /C:/path — strip leading / before drive letter
+	if len(path) >= 3 && path[0] == '/' && path[2] == ':' {
+		path = path[1:]
+	}
+	return filepath.FromSlash(path), true
 }
 
 // startAutoIndex triggers background indexing for the session project.
