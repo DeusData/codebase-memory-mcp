@@ -135,7 +135,14 @@ func (r *FunctionRegistry) resolveViaNameLookup(calleeName, suffix, moduleQN str
 	// Strategy 3: unique name — single candidate project-wide
 	if len(candidates) == 1 {
 		conf := 0.75
-		if importMap != nil && !isImportReachable(candidates[0], importMap) {
+		reachable := importMap == nil || isImportReachable(candidates[0], importMap)
+		if !reachable {
+			// Cross-app guard: in monorepos, reject unique_name matches across
+			// app boundaries (e.g., apps/mobile → apps/api-go). These can only
+			// communicate via HTTP_CALLS, not direct CALLS edges.
+			if isCrossApp(moduleQN, candidates[0]) {
+				return ResolutionResult{}
+			}
 			conf *= 0.5
 		}
 		return ResolutionResult{QualifiedName: candidates[0], Strategy: "unique_name", Confidence: conf, CandidateCount: 1}
@@ -225,8 +232,12 @@ func (r *FunctionRegistry) FuzzyResolve(calleeName, moduleQN string, importMap m
 
 	// If there's exactly one candidate, use it
 	if len(candidates) == 1 {
+		reachable := importMap == nil || isImportReachable(candidates[0], importMap)
+		if !reachable && isCrossApp(moduleQN, candidates[0]) {
+			return ResolutionResult{}, false
+		}
 		conf := 0.40
-		if importMap != nil && !isImportReachable(candidates[0], importMap) {
+		if !reachable {
 			conf *= 0.5
 		}
 		return ResolutionResult{
@@ -241,14 +252,23 @@ func (r *FunctionRegistry) FuzzyResolve(calleeName, moduleQN string, importMap m
 		filtered = filterImportReachable(candidates, importMap)
 	}
 	if len(filtered) == 0 {
-		// No import-reachable candidates — use original with penalty
-		best := bestByImportDistance(candidates, moduleQN)
+		// No import-reachable candidates — filter cross-app, then pick best
+		var sameApp []string
+		for _, c := range candidates {
+			if !isCrossApp(moduleQN, c) {
+				sameApp = append(sameApp, c)
+			}
+		}
+		if len(sameApp) == 0 {
+			return ResolutionResult{}, false
+		}
+		best := bestByImportDistance(sameApp, moduleQN)
 		if best == "" {
 			return ResolutionResult{}, false
 		}
 		return ResolutionResult{
 			QualifiedName: best, Strategy: "fuzzy",
-			Confidence: 0.30 * 0.5, CandidateCount: len(candidates),
+			Confidence: 0.30 * 0.5, CandidateCount: len(sameApp),
 		}, true
 	}
 	if len(filtered) == 1 {
@@ -388,6 +408,33 @@ func filterImportReachable(candidates []string, importMap map[string]string) []s
 		}
 	}
 	return filtered
+}
+
+// isCrossApp detects when caller and callee are in different app boundaries
+// within a monorepo. Qualified names encode the file path, so we extract the
+// first 3 dotted segments after the project name (e.g., "apps.mobile.src" vs
+// "apps.api-go.internal") and reject if they diverge. This prevents false
+// CALLS edges between frontend and backend that can only communicate via HTTP.
+func isCrossApp(callerQN, candidateQN string) bool {
+	callerApp := appSegment(callerQN)
+	candidateApp := appSegment(candidateQN)
+	if callerApp == "" || candidateApp == "" {
+		return false // can't determine, don't block
+	}
+	return callerApp != candidateApp
+}
+
+// appSegment extracts the app boundary segment from a qualified name.
+// For "Project.apps.mobile.src.components.X" → "apps.mobile"
+// For "Project.apps.api-go.internal.event.X" → "apps.api-go"
+// For "Project.scripts.foo.X" → "scripts.foo"
+// Returns "" if the QN is too short to determine.
+func appSegment(qn string) string {
+	parts := strings.SplitN(qn, ".", 4) // [project, dir1, dir2, rest]
+	if len(parts) < 3 {
+		return ""
+	}
+	return parts[1] + "." + parts[2]
 }
 
 // confidenceBand returns a human-readable band label for a confidence score.
