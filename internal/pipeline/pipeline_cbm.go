@@ -307,6 +307,9 @@ func (p *Pipeline) resolveFileCallsCBM(relPath string, ext *cachedExtraction) []
 		result := p.resolveCallWithTypes(calleeName, moduleQN, importMap, typeMap)
 		if result.QualifiedName == "" {
 			if fuzzyResult, ok := p.registry.FuzzyResolve(calleeName, moduleQN, importMap); ok {
+				if fuzzyResult.QualifiedName == callerQN {
+					continue // skip self-reference
+				}
 				edges = append(edges, resolvedEdge{
 					CallerQN: callerQN,
 					TargetQN: fuzzyResult.QualifiedName,
@@ -319,6 +322,10 @@ func (p *Pipeline) resolveFileCallsCBM(relPath string, ext *cachedExtraction) []
 				})
 			}
 			continue
+		}
+
+		if result.QualifiedName == callerQN {
+			continue // skip self-reference
 		}
 
 		edges = append(edges, resolvedEdge{
