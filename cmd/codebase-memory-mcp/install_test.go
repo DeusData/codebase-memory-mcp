@@ -440,6 +440,208 @@ func TestEditorMCPUninstall(t *testing.T) {
 	}
 }
 
+func TestGeminiConfigPath(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	path := geminiConfigPath()
+	if path == "" {
+		t.Fatal("geminiConfigPath returned empty")
+	}
+	if !strings.HasSuffix(path, filepath.Join(".gemini", "settings.json")) {
+		t.Fatalf("unexpected path: %s", path)
+	}
+}
+
+func TestGeminiMCPInstall(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	configPath := filepath.Join(home, ".gemini", "settings.json")
+	binaryPath := "/usr/local/bin/codebase-memory-mcp"
+
+	// Gemini uses same mcpServers format as Cursor
+	installEditorMCP(binaryPath, configPath, "Gemini CLI", installConfig{})
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	servers, ok := root["mcpServers"].(map[string]any)
+	if !ok {
+		t.Fatal("expected mcpServers key")
+	}
+	if _, ok := servers["codebase-memory-mcp"]; !ok {
+		t.Fatal("codebase-memory-mcp not registered")
+	}
+}
+
+func TestVSCodeMCPInstall(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	configPath := filepath.Join(home, "Code", "User", "mcp.json")
+	binaryPath := "/usr/local/bin/codebase-memory-mcp"
+
+	installVSCodeMCP(binaryPath, configPath, installConfig{})
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	servers, ok := root["servers"].(map[string]any)
+	if !ok {
+		t.Fatal("expected servers key")
+	}
+	entry, ok := servers["codebase-memory-mcp"].(map[string]any)
+	if !ok {
+		t.Fatal("codebase-memory-mcp not registered")
+	}
+	if entry["type"] != "stdio" {
+		t.Fatalf("expected type=stdio, got %v", entry["type"])
+	}
+	if entry["command"] != binaryPath {
+		t.Fatalf("expected command=%s, got %v", binaryPath, entry["command"])
+	}
+}
+
+func TestVSCodeMCPUninstall(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	configPath := filepath.Join(home, "Code", "User", "mcp.json")
+	binaryPath := "/usr/local/bin/codebase-memory-mcp"
+
+	installVSCodeMCP(binaryPath, configPath, installConfig{})
+	removeVSCodeMCP(configPath, installConfig{})
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatal(err)
+	}
+	servers, ok := root["servers"].(map[string]any)
+	if !ok {
+		t.Fatal("servers key missing")
+	}
+	if _, exists := servers["codebase-memory-mcp"]; exists {
+		t.Fatal("codebase-memory-mcp should be removed")
+	}
+}
+
+func TestZedMCPInstall(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	configPath := filepath.Join(home, ".config", "zed", "settings.json")
+	binaryPath := "/usr/local/bin/codebase-memory-mcp"
+
+	installZedMCP(binaryPath, configPath, installConfig{})
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	servers, ok := root["context_servers"].(map[string]any)
+	if !ok {
+		t.Fatal("expected context_servers key")
+	}
+	entry, ok := servers["codebase-memory-mcp"].(map[string]any)
+	if !ok {
+		t.Fatal("codebase-memory-mcp not registered")
+	}
+	if entry["source"] != "custom" {
+		t.Fatalf("expected source=custom, got %v", entry["source"])
+	}
+	if entry["command"] != binaryPath {
+		t.Fatalf("expected command=%s, got %v", binaryPath, entry["command"])
+	}
+}
+
+func TestZedMCPPreservesSettings(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	configPath := filepath.Join(home, ".config", "zed", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-existing Zed settings
+	existing := `{"theme": "One Dark", "vim_mode": true}`
+	if err := os.WriteFile(configPath, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	installZedMCP("/usr/local/bin/codebase-memory-mcp", configPath, installConfig{})
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatal(err)
+	}
+	// Original settings preserved
+	if root["theme"] != "One Dark" {
+		t.Fatal("theme setting was lost")
+	}
+	if root["vim_mode"] != true {
+		t.Fatal("vim_mode setting was lost")
+	}
+	// MCP server added
+	servers, ok := root["context_servers"].(map[string]any)
+	if !ok {
+		t.Fatal("context_servers missing")
+	}
+	if _, ok := servers["codebase-memory-mcp"]; !ok {
+		t.Fatal("codebase-memory-mcp not added")
+	}
+}
+
+func TestZedMCPUninstall(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	configPath := filepath.Join(home, ".config", "zed", "settings.json")
+	binaryPath := "/usr/local/bin/codebase-memory-mcp"
+
+	installZedMCP(binaryPath, configPath, installConfig{})
+	removeZedMCP(configPath, installConfig{})
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatal(err)
+	}
+	servers, ok := root["context_servers"].(map[string]any)
+	if !ok {
+		t.Fatal("context_servers key missing")
+	}
+	if _, exists := servers["codebase-memory-mcp"]; exists {
+		t.Fatal("codebase-memory-mcp should be removed")
+	}
+}
+
 func TestRemoveOldMonolithicSkill(t *testing.T) {
 	home := t.TempDir()
 	setTestHome(t, home)

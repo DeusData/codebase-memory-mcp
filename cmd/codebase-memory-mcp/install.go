@@ -70,7 +70,16 @@ func runInstall(args []string) int {
 	// Windsurf
 	installEditorMCP(binaryPath, windsurfConfigPath(), "Windsurf", cfg)
 
-	fmt.Println("\nDone. Restart Claude Code / Codex / Cursor / Windsurf to activate.")
+	// Gemini CLI (same mcpServers format as Cursor/Windsurf)
+	installEditorMCP(binaryPath, geminiConfigPath(), "Gemini CLI", cfg)
+
+	// VS Code Copilot (uses "servers" key with "type" field)
+	installVSCodeMCP(binaryPath, vscodeConfigPath(), cfg)
+
+	// Zed (uses "context_servers" key with "source" field)
+	installZedMCP(binaryPath, zedConfigPath(), cfg)
+
+	fmt.Println("\nDone. Restart your editor/CLI to activate.")
 	return 0
 }
 
@@ -105,6 +114,15 @@ func runUninstall(args []string) int {
 
 	// Windsurf
 	removeEditorMCP(windsurfConfigPath(), "Windsurf", cfg)
+
+	// Gemini CLI
+	removeEditorMCP(geminiConfigPath(), "Gemini CLI", cfg)
+
+	// VS Code Copilot
+	removeVSCodeMCP(vscodeConfigPath(), cfg)
+
+	// Zed
+	removeZedMCP(zedConfigPath(), cfg)
 
 	fmt.Println("\nDone. Binary and databases were NOT removed.")
 	return 0
@@ -585,6 +603,238 @@ func removeEditorMCP(configPath, editorName string, cfg installConfig) {
 
 	delete(servers, mcpServerKey)
 	root["mcpServers"] = servers
+
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		fmt.Printf("  ⚠ marshal JSON: %v\n", err)
+		return
+	}
+	if err := os.WriteFile(configPath, append(out, '\n'), 0o600); err != nil {
+		fmt.Printf("  ⚠ write %s: %v\n", configPath, err)
+		return
+	}
+	fmt.Printf("  ✓ Removed %s from %s\n", mcpServerKey, configPath)
+}
+
+// --- Gemini CLI ---
+
+// geminiConfigPath returns the Gemini CLI settings path.
+func geminiConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".gemini", "settings.json")
+}
+
+// --- VS Code Copilot ---
+
+// vscodeConfigPath returns the VS Code user-level MCP config path.
+func vscodeConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		return filepath.Join(home, "Library", "Application Support", "Code", "User", "mcp.json")
+	case "linux":
+		return filepath.Join(home, ".config", "Code", "User", "mcp.json")
+	case "windows":
+		if appData := os.Getenv("APPDATA"); appData != "" {
+			return filepath.Join(appData, "Code", "User", "mcp.json")
+		}
+	}
+	return ""
+}
+
+// installVSCodeMCP upserts our MCP server in VS Code's mcp.json (uses "servers" key).
+func installVSCodeMCP(binaryPath, configPath string, cfg installConfig) {
+	if configPath == "" {
+		return
+	}
+
+	fmt.Printf("[VS Code] MCP config: %s\n", configPath)
+
+	if cfg.dryRun {
+		fmt.Printf("  [dry-run] Would upsert %s in %s\n", mcpServerKey, configPath)
+		return
+	}
+
+	root := make(map[string]any)
+	if data, err := os.ReadFile(configPath); err == nil {
+		if jsonErr := json.Unmarshal(data, &root); jsonErr != nil {
+			fmt.Printf("  ⚠ Invalid JSON in %s, overwriting\n", configPath)
+			root = make(map[string]any)
+		}
+	}
+
+	servers, ok := root["servers"].(map[string]any)
+	if !ok {
+		servers = make(map[string]any)
+	}
+
+	servers[mcpServerKey] = map[string]any{
+		"type":    "stdio",
+		"command": binaryPath,
+	}
+	root["servers"] = servers
+
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o750); err != nil {
+		fmt.Printf("  ⚠ mkdir %s: %v\n", filepath.Dir(configPath), err)
+		return
+	}
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		fmt.Printf("  ⚠ marshal JSON: %v\n", err)
+		return
+	}
+	if err := os.WriteFile(configPath, append(out, '\n'), 0o600); err != nil {
+		fmt.Printf("  ⚠ write %s: %v\n", configPath, err)
+		return
+	}
+	fmt.Printf("  ✓ MCP server registered in %s\n", configPath)
+}
+
+// removeVSCodeMCP removes our MCP server from VS Code's mcp.json.
+func removeVSCodeMCP(configPath string, cfg installConfig) {
+	if configPath == "" {
+		return
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return
+	}
+
+	servers, ok := root["servers"].(map[string]any)
+	if !ok {
+		return
+	}
+	if _, exists := servers[mcpServerKey]; !exists {
+		return
+	}
+
+	fmt.Printf("[VS Code] MCP config: %s\n", configPath)
+
+	if cfg.dryRun {
+		fmt.Printf("  [dry-run] Would remove %s from %s\n", mcpServerKey, configPath)
+		return
+	}
+
+	delete(servers, mcpServerKey)
+	root["servers"] = servers
+
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		fmt.Printf("  ⚠ marshal JSON: %v\n", err)
+		return
+	}
+	if err := os.WriteFile(configPath, append(out, '\n'), 0o600); err != nil {
+		fmt.Printf("  ⚠ write %s: %v\n", configPath, err)
+		return
+	}
+	fmt.Printf("  ✓ Removed %s from %s\n", mcpServerKey, configPath)
+}
+
+// --- Zed ---
+
+// zedConfigPath returns the Zed settings path.
+func zedConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "zed", "settings.json")
+}
+
+// installZedMCP upserts our MCP server in Zed's settings.json under "context_servers".
+func installZedMCP(binaryPath, configPath string, cfg installConfig) {
+	if configPath == "" {
+		return
+	}
+
+	fmt.Printf("[Zed] MCP config: %s\n", configPath)
+
+	if cfg.dryRun {
+		fmt.Printf("  [dry-run] Would upsert %s in %s\n", mcpServerKey, configPath)
+		return
+	}
+
+	root := make(map[string]any)
+	if data, err := os.ReadFile(configPath); err == nil {
+		if jsonErr := json.Unmarshal(data, &root); jsonErr != nil {
+			// Zed settings.json likely has other settings — don't overwrite on bad JSON
+			fmt.Printf("  ⚠ Invalid JSON in %s, skipping\n", configPath)
+			return
+		}
+	}
+
+	servers, ok := root["context_servers"].(map[string]any)
+	if !ok {
+		servers = make(map[string]any)
+	}
+
+	servers[mcpServerKey] = map[string]any{
+		"source":  "custom",
+		"command": binaryPath,
+	}
+	root["context_servers"] = servers
+
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o750); err != nil {
+		fmt.Printf("  ⚠ mkdir %s: %v\n", filepath.Dir(configPath), err)
+		return
+	}
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		fmt.Printf("  ⚠ marshal JSON: %v\n", err)
+		return
+	}
+	if err := os.WriteFile(configPath, append(out, '\n'), 0o600); err != nil {
+		fmt.Printf("  ⚠ write %s: %v\n", configPath, err)
+		return
+	}
+	fmt.Printf("  ✓ MCP server registered in %s\n", configPath)
+}
+
+// removeZedMCP removes our MCP server from Zed's settings.json.
+func removeZedMCP(configPath string, cfg installConfig) {
+	if configPath == "" {
+		return
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return
+	}
+
+	servers, ok := root["context_servers"].(map[string]any)
+	if !ok {
+		return
+	}
+	if _, exists := servers[mcpServerKey]; !exists {
+		return
+	}
+
+	fmt.Printf("[Zed] MCP config: %s\n", configPath)
+
+	if cfg.dryRun {
+		fmt.Printf("  [dry-run] Would remove %s from %s\n", mcpServerKey, configPath)
+		return
+	}
+
+	delete(servers, mcpServerKey)
+	root["context_servers"] = servers
 
 	out, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {

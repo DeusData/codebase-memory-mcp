@@ -126,9 +126,9 @@ var AllowedDownloadPrefixes = []string{
 	"https://api.github.com/",
 }
 
-// DownloadAsset downloads a release asset and returns the body reader and content length.
-// Caller must close the returned ReadCloser.
-func DownloadAsset(ctx context.Context, rawURL string) (io.ReadCloser, int64, error) {
+// DownloadAsset downloads a release asset and returns the full body as bytes.
+// The response body is fully read before returning to avoid premature context cancellation.
+func DownloadAsset(ctx context.Context, rawURL string) ([]byte, error) {
 	allowed := false
 	for _, prefix := range AllowedDownloadPrefixes {
 		if strings.HasPrefix(rawURL, prefix) {
@@ -137,7 +137,7 @@ func DownloadAsset(ctx context.Context, rawURL string) (io.ReadCloser, int64, er
 		}
 	}
 	if !allowed {
-		return nil, 0, fmt.Errorf("refusing to download from non-GitHub URL: %s", rawURL)
+		return nil, fmt.Errorf("refusing to download from non-GitHub URL: %s", rawURL)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
@@ -145,20 +145,20 @@ func DownloadAsset(ctx context.Context, rawURL string) (io.ReadCloser, int64, er
 
 	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, http.NoBody)
 	if err != nil {
-		return nil, 0, fmt.Errorf("create request: %w", err)
+		return nil, fmt.Errorf("create request: %w", err)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("download: %w", err)
+		return nil, fmt.Errorf("download: %w", err)
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		resp.Body.Close()
-		return nil, 0, fmt.Errorf("download status=%d", resp.StatusCode)
+		return nil, fmt.Errorf("download status=%d", resp.StatusCode)
 	}
 
-	return resp.Body, resp.ContentLength, nil
+	return io.ReadAll(io.LimitReader(resp.Body, 500<<20)) // 500 MB safety limit
 }
 
 // DownloadChecksums downloads and parses the checksums.txt file from a release.
@@ -169,15 +169,9 @@ func DownloadChecksums(ctx context.Context, release *Release) (map[string]string
 		return nil, fmt.Errorf("checksums.txt not found in release")
 	}
 
-	body, _, err := DownloadAsset(ctx, asset.BrowserDownloadURL)
+	data, err := DownloadAsset(ctx, asset.BrowserDownloadURL)
 	if err != nil {
 		return nil, fmt.Errorf("download checksums: %w", err)
-	}
-	defer body.Close()
-
-	data, err := io.ReadAll(io.LimitReader(body, 1<<16))
-	if err != nil {
-		return nil, fmt.Errorf("read checksums: %w", err)
 	}
 
 	checksums := make(map[string]string)

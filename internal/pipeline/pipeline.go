@@ -67,10 +67,16 @@ func New(ctx context.Context, s *store.Store, repoPath string, mode discover.Ind
 // ProjectNameFromPath derives a unique project name from an absolute path
 // by replacing path separators with dashes and trimming the leading dash.
 func ProjectNameFromPath(absPath string) string {
-	// Clean and convert to slash-separated
+	// Clean and normalize separators (backslash is not a separator on non-Windows)
 	cleaned := filepath.ToSlash(filepath.Clean(absPath))
-	// Replace slashes with dashes
+	cleaned = strings.ReplaceAll(cleaned, "\\", "/")
+	// Replace slashes and colons with dashes
 	name := strings.ReplaceAll(cleaned, "/", "-")
+	name = strings.ReplaceAll(name, ":", "-")
+	// Collapse consecutive dashes (e.g. C:/ → C--)
+	for strings.Contains(name, "--") {
+		name = strings.ReplaceAll(name, "--", "-")
+	}
 	// Trim leading dash (from leading /)
 	name = strings.TrimLeft(name, "-")
 	if name == "" {

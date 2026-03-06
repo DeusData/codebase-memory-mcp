@@ -67,8 +67,10 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: |
+          # Strip leading 'v' — version var should be bare semver (e.g. 0.4.0)
+          CLEAN_VERSION="${VERSION#v}"
           CGO_ENABLED=1 go build \
-            -ldflags "-X main.version=$VERSION" \
+            -ldflags "-X main.version=$CLEAN_VERSION" \
             -o codebase-memory-mcp \
             ./cmd/codebase-memory-mcp/
 
@@ -111,8 +113,10 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: |
+          # Strip leading 'v' — version var should be bare semver (e.g. 0.4.0)
+          CLEAN_VERSION="${VERSION#v}"
           CGO_ENABLED=1 CC=gcc go build \
-            -ldflags "-X main.version=$VERSION" \
+            -ldflags "-X main.version=$CLEAN_VERSION" \
             -o codebase-memory-mcp.exe \
             ./cmd/codebase-memory-mcp/
 

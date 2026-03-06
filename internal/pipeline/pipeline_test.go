@@ -793,6 +793,10 @@ func TestProjectNameFromPath(t *testing.T) {
 		{"/Users/martin/projects/myapp", "Users-martin-projects-myapp"},
 		{"/home/user/repo", "home-user-repo"},
 		{"/single", "single"},
+		// Windows paths (#20)
+		{"C:/Users/project", "C-Users-project"},
+		{"D:\\Projects\\myapp", "D-Projects-myapp"},
+		{"C:\\Temp\\codebase-memory-mcp", "C-Temp-codebase-memory-mcp"},
 	}
 	for _, tt := range tests {
 		got := ProjectNameFromPath(tt.path)

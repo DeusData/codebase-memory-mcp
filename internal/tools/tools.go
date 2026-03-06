@@ -680,7 +680,7 @@ func (s *Server) registerProjectTools() {
 	s.addTool(&mcp.Tool{
 		Name:        "list_projects",
 		Description: "List all indexed projects with their indexed_at timestamp, root path, and node/edge counts.",
-		InputSchema: json.RawMessage(`{"type": "object"}`),
+		InputSchema: json.RawMessage(`{"type": "object", "properties": {}}`),
 	}, s.handleListProjects)
 
 	s.addTool(&mcp.Tool{

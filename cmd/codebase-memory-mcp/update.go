@@ -29,7 +29,7 @@ func runUpdate(args []string) int {
 		}
 	}
 
-	currentVersion := strings.TrimSuffix(version, "-dev")
+	currentVersion := strings.TrimPrefix(strings.TrimSuffix(version, "-dev"), "v")
 	fmt.Printf("\ncodebase-memory-mcp %s — checking for updates...\n", version)
 
 	if runtime.GOOS == "windows" {
@@ -87,7 +87,7 @@ func runUpdate(args []string) int {
 	fmt.Println("Re-applying installation...")
 	runInstall([]string{})
 
-	fmt.Printf("\nUpdated to v%s. Restart Claude Code / Codex to activate.\n", latest)
+	fmt.Printf("\nUpdated to v%s. Restart your editor/CLI to activate.\n", latest)
 	return 0
 }
 
@@ -101,15 +101,9 @@ func downloadAndVerify(ctx context.Context, release *selfupdate.Release, assetNa
 	}
 
 	fmt.Printf("Downloading %s...\n", assetName)
-	body, _, err := selfupdate.DownloadAsset(ctx, asset.BrowserDownloadURL)
+	tarballData, err := selfupdate.DownloadAsset(ctx, asset.BrowserDownloadURL)
 	if err != nil {
 		return nil, fmt.Errorf("download: %w", err)
-	}
-
-	tarballData, err := io.ReadAll(body)
-	body.Close()
-	if err != nil {
-		return nil, fmt.Errorf("read download: %w", err)
 	}
 
 	if checksums != nil {
