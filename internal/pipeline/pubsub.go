@@ -42,8 +42,8 @@ var publishEventPatterns = []*regexp.Regexp{
 var subscribeEventPatterns = []*regexp.Regexp{
 	// Go: bus.Subscribe(events.EventCheckinCompleted, func(...) { ... })
 	regexp.MustCompile(`\.(?i:Subscribe|AddListener|Listen)\(\s*(?:\w+\.)?(\w+)`),
-	// JS/TS: emitter.on('event-name', handler)
-	regexp.MustCompile(`\.(?i:on|addListener|listen|subscribe)\(\s*['"]([^'"]+)['"]`),
+	// JS/TS: emitter.addListener('event-name', handler) or emitter.subscribe('event-name', handler)
+	regexp.MustCompile(`\.(?i:addListener|listen|subscribe)\(\s*['"]([^'"]+)['"]`),
 }
 
 // subscribeCallLine holds a Subscribe call's event name and its source line number.
@@ -335,11 +335,16 @@ func attributeHandlersToEvents(source string, patterns []*regexp.Regexp, handler
 	// For each handler name, find its call sites in the source and attribute
 	// to the nearest preceding Subscribe call.
 	for handlerName, hIDs := range handlerNameToIDs {
-		// Find all lines where this handler is called.
-		// Pattern: handlerName appears as a function call (followed by '(' or preceded by '.')
+		// Find the handler name followed by '(' to confirm it's a call site,
+		// not a substring of another identifier or a string/comment.
 		for lineIdx, line := range lines {
 			lineNum := lineIdx + 1 // 1-based
-			if !strings.Contains(line, handlerName) {
+			idx := strings.Index(line, handlerName)
+			if idx < 0 {
+				continue
+			}
+			endIdx := idx + len(handlerName)
+			if endIdx >= len(line) || line[endIdx] != '(' {
 				continue
 			}
 			// Verify it looks like a call, not just a comment or string

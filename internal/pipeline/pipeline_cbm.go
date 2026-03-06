@@ -79,10 +79,11 @@ func cbmParseFileFromSource(projectName string, f discover.FileInfo, source []by
 			def.IsTest = true
 		}
 
-		// Mark exported handler methods as entry points.
+		// Mark exported Go handler methods as entry points.
 		// Echo handlers are registered via method value references (g.POST("", h.Method))
 		// which the C extractor doesn't track as explicit calls.
 		if !def.IsEntryPoint && def.Label == "Method" && def.IsExported &&
+			f.Language == lang.Go &&
 			strings.Contains(f.RelPath, "handler") &&
 			strings.Contains(def.Signature, "echo.Context") {
 			def.IsEntryPoint = true
