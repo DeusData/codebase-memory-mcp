@@ -1214,6 +1214,34 @@ func (p *Pipeline) resolveCallWithTypes(
 			if p.registry.Exists(candidate) {
 				return ResolutionResult{QualifiedName: candidate, Strategy: "type_dispatch", Confidence: 0.90, CandidateCount: 1}
 			}
+
+			// Two-hop resolution for chained field access: h.svc.Method()
+			// where h is *Handler and svc is a field. Resolve the last
+			// segment as a method name, excluding methods from the same
+			// module as the receiver (avoids self-referencing).
+			if strings.Contains(methodName, ".") {
+				chainParts := strings.Split(methodName, ".")
+				lastMethod := chainParts[len(chainParts)-1]
+				allCandidates := p.registry.FindByName(lastMethod)
+				// Exclude candidates from the receiver's module (same file)
+				receiverModule := modulePrefix(classQN)
+				var candidates []string
+				for _, c := range allCandidates {
+					if modulePrefix(c) != receiverModule {
+						candidates = append(candidates, c)
+					}
+				}
+				if len(candidates) == 1 {
+					return ResolutionResult{QualifiedName: candidates[0], Strategy: "type_dispatch", Confidence: 0.80, CandidateCount: 1}
+				}
+				if len(candidates) > 1 {
+					// Prefer candidates closest to caller's module tree
+					best := bestByImportDistance(candidates, moduleQN)
+					if best != "" {
+						return ResolutionResult{QualifiedName: best, Strategy: "type_dispatch", Confidence: 0.70, CandidateCount: len(candidates)}
+					}
+				}
+			}
 		}
 	}
 

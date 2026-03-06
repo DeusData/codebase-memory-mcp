@@ -67,7 +67,19 @@ func cbmParseFileFromSource(projectName string, f discover.FileInfo, source []by
 
 	// Convert CBM definitions to store.Node objects
 	for i := range cbmResult.Definitions {
-		node, edge := cbmDefToNode(&cbmResult.Definitions[i], projectName, moduleQN)
+		// Fix: mark test functions as entry points.
+		// The C extractor only sets is_test on the module, not on individual functions.
+		// Test functions (Go Test*/Benchmark*/Example*, Python test_*, etc.) are invoked
+		// by the test runner, not by the call graph — they must be entry points.
+		def := &cbmResult.Definitions[i]
+		if cbmResult.IsTestFile && !def.IsEntryPoint &&
+			(def.Label == "Function" || def.Label == "Method") &&
+			isTestFunction(def.Name, f.Language) {
+			def.IsEntryPoint = true
+			def.IsTest = true
+		}
+
+		node, edge := cbmDefToNode(def, projectName, moduleQN)
 		result.Nodes = append(result.Nodes, node)
 		result.PendingEdges = append(result.PendingEdges, edge)
 	}
@@ -197,9 +209,10 @@ func enrichModuleNodeCBM(moduleNode *store.Node, cbmResult *cbm.FileResult, _ *p
 }
 
 // inferTypesCBM builds a TypeMap from CBM TypeAssign data + registry resolution.
-// Replaces the 14 language-specific infer*Types() functions.
+// Also infers types from Go method receivers (e.g., func (h *Handler) → h:Handler).
 func inferTypesCBM(
 	typeAssigns []cbm.TypeAssign,
+	defs []cbm.Definition,
 	registry *FunctionRegistry,
 	moduleQN string,
 	importMap map[string]string,
@@ -216,13 +229,45 @@ func inferTypesCBM(
 		}
 	}
 
-	// Return type propagation is handled by CBM TypeAssigns which already
-	// detect constructor patterns. Additional return-type-based inference
-	// from the returnTypes map is still useful for non-constructor calls.
-	// This would require the call data which we have in CBM Calls.
-	// For now, constructor-based inference covers the primary use case.
+	// Receiver type inference: for Go methods like func (h *Handler) Foo(),
+	// the receiver "h" has type Handler. Extract this from the Receiver field
+	// and add to the TypeMap so calls like h.svc.Method() can resolve.
+	for i := range defs {
+		if defs[i].Receiver == "" || defs[i].Label != "Method" {
+			continue
+		}
+		varName, typeName := parseGoReceiver(defs[i].Receiver)
+		if varName == "" || typeName == "" {
+			continue
+		}
+		if _, exists := types[varName]; exists {
+			continue // don't overwrite explicit type assignments
+		}
+		classQN := resolveAsClass(typeName, registry, moduleQN, importMap)
+		if classQN != "" {
+			types[varName] = classQN
+		}
+	}
 
 	return types
+}
+
+// parseGoReceiver extracts (varName, typeName) from a Go receiver string.
+// Examples: "(h *Handler)" → ("h", "Handler"), "(s MyService)" → ("s", "MyService")
+func parseGoReceiver(recv string) (string, string) {
+	// Strip parens
+	recv = strings.TrimSpace(recv)
+	recv = strings.TrimPrefix(recv, "(")
+	recv = strings.TrimSuffix(recv, ")")
+	recv = strings.TrimSpace(recv)
+
+	parts := strings.Fields(recv)
+	if len(parts) != 2 {
+		return "", ""
+	}
+	varName := parts[0]
+	typeName := strings.TrimPrefix(parts[1], "*")
+	return varName, typeName
 }
 
 // resolveFileCallsCBM resolves all call targets using pre-extracted CBM data.
@@ -231,8 +276,8 @@ func (p *Pipeline) resolveFileCallsCBM(relPath string, ext *cachedExtraction) []
 	moduleQN := fqn.ModuleQN(p.ProjectName, relPath)
 	importMap := p.importMaps[moduleQN]
 
-	// Build type map from CBM type assignments
-	typeMap := inferTypesCBM(ext.Result.TypeAssigns, p.registry, moduleQN, importMap)
+	// Build type map from CBM type assignments + receiver types
+	typeMap := inferTypesCBM(ext.Result.TypeAssigns, ext.Result.Definitions, p.registry, moduleQN, importMap)
 
 	var edges []resolvedEdge
 
