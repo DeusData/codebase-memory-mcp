@@ -55,6 +55,14 @@ func testEnvWithHome(home string, extra ...string) []string {
 	env := append(os.Environ(), "HOME="+home)
 	if runtime.GOOS == "windows" {
 		env = append(env, "USERPROFILE="+home)
+		// On Windows, DLL lookup uses PATH. Tests that replace PATH with an
+		// empty dir break DLL resolution for CGo binaries (MSYS2 libgcc etc).
+		// Append the original PATH so DLLs remain findable.
+		for i, e := range extra {
+			if strings.HasPrefix(e, "PATH=") {
+				extra[i] = e + string(os.PathListSeparator) + os.Getenv("PATH")
+			}
+		}
 	}
 	return append(env, extra...)
 }
