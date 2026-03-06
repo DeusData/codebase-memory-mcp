@@ -1219,6 +1219,8 @@ func (p *Pipeline) resolveCallWithTypes(
 			// where h is *Handler and svc is a field. Resolve the last
 			// segment as a method name, excluding methods from the same
 			// module as the receiver (avoids self-referencing).
+			// Primarily useful for Go receiver patterns; resolves only the
+			// last segment (a.b.c.d() → resolves d()), not intermediate hops.
 			if strings.Contains(methodName, ".") {
 				chainParts := strings.Split(methodName, ".")
 				lastMethod := chainParts[len(chainParts)-1]
