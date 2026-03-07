@@ -999,6 +999,27 @@ func TestFORMParse_Regression(t *testing.T) {
 	}
 }
 
+func TestFORMCall_Regression(t *testing.T) {
+	src := []byte("#procedure myproc(x)\n  id `x' = 0;\n#endprocedure\n#procedure caller()\n  #call myproc(1)\n#endprocedure\n")
+	r, err := ExtractFile(src, lang.FORM, "t", "calc.frm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Calls) == 0 {
+		t.Fatal("expected at least one call extracted from #call myproc(1), got none")
+	}
+	found := false
+	for _, c := range r.Calls {
+		if c.CalleeName == "myproc" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected callee 'myproc' in calls, got: %+v", r.Calls)
+	}
+}
+
 // --- Magma ---
 func TestMagmaFunction_Regression(t *testing.T) {
 	src := []byte("function Factorial(n)\n  if n le 1 then\n    return 1;\n  end if;\n  return n * Factorial(n - 1);\nend function;\n")
@@ -1061,4 +1082,201 @@ func TestMagmaCall_Regression(t *testing.T) {
 	if !found {
 		t.Errorf("expected call to 'Bar', got calls: %v", r.Calls)
 	}
+}
+
+// --- MATLAB Calls ---
+func TestMATLABCall_Regression(t *testing.T) {
+	src := []byte("function y = foo(x)\n  y = inv(x);\n  disp hello\nend\n")
+	r, err := ExtractFile(src, lang.MATLAB, "t", "foo.matlab")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Should extract function_call "inv" and command "disp"
+	if len(r.Calls) == 0 {
+		t.Fatal("expected calls to be extracted, got 0")
+	}
+	foundInv := false
+	foundDisp := false
+	for _, c := range r.Calls {
+		if c.CalleeName == "inv" {
+			foundInv = true
+		}
+		if c.CalleeName == "disp" {
+			foundDisp = true
+		}
+	}
+	if !foundInv {
+		t.Errorf("expected call to 'inv', got calls: %v", r.Calls)
+	}
+	if !foundDisp {
+		t.Errorf("expected call to 'disp', got calls: %v", r.Calls)
+	}
+}
+
+// --- Lean Calls ---
+func TestLeanCall_Regression(t *testing.T) {
+	src := []byte("def fib : Nat → Nat\n  | 0 => 1\n  | 1 => 1\n  | n + 2 => fib (n + 1) + fib n\n")
+	r, err := ExtractFile(src, lang.Lean, "t", "Fib.lean")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Calls) == 0 {
+		t.Fatal("expected calls to be extracted, got 0")
+	}
+	found := false
+	for _, c := range r.Calls {
+		if c.CalleeName == "fib" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected call to 'fib', got calls: %v", r.Calls)
+	}
+}
+
+func TestLeanTypeAnnotationNotCall_Regression(t *testing.T) {
+	// "List Nat" in a binder type should not produce a "List" call.
+	// "IO.println" in the body should be extracted.
+	src := []byte("def listLen (xs : List Nat) : Nat := 0\ndef greet : IO Unit := IO.println \"hi\"\n")
+	r, err := ExtractFile(src, lang.Lean, "t", "Types.lean")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// "List" in explicit_binder type should be filtered
+	for _, c := range r.Calls {
+		if c.CalleeName == "List" {
+			t.Errorf("type-position apply %q (binder type) should not be extracted as a call", c.CalleeName)
+		}
+	}
+	// IO.println in the body should be present
+	foundPrintln := false
+	for _, c := range r.Calls {
+		if c.CalleeName == "IO.println" || c.CalleeName == "println" {
+			foundPrintln = true
+		}
+	}
+	if !foundPrintln {
+		t.Errorf("expected call to IO.println/println, got calls: %v", r.Calls)
+	}
+}
+
+// --- Wolfram ---
+func TestWolframFunction_Regression(t *testing.T) {
+	src := []byte("f[x_] := x^2\ng[x_] = x + 1\n")
+	r, err := ExtractFile(src, lang.Wolfram, "t", "funcs.wl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fns := defsWithLabel(r, "Function")
+	if len(fns) < 2 {
+		t.Fatalf("expected at least 2 functions, got %d: %v", len(fns), fns)
+	}
+	assertHasName(t, fns, "f")
+	assertHasName(t, fns, "g")
+}
+
+func TestWolframCall_Regression(t *testing.T) {
+	src := []byte("f[x_] := g[x] + h[x]\n")
+	r, err := ExtractFile(src, lang.Wolfram, "t", "calls.wl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Calls) == 0 {
+		t.Fatal("expected calls to be extracted, got 0")
+	}
+	foundG := false
+	foundH := false
+	for _, c := range r.Calls {
+		if c.CalleeName == "g" {
+			foundG = true
+		}
+		if c.CalleeName == "h" {
+			foundH = true
+		}
+	}
+	if !foundG {
+		t.Errorf("expected call to 'g', got calls: %v", r.Calls)
+	}
+	if !foundH {
+		t.Errorf("expected call to 'h', got calls: %v", r.Calls)
+	}
+	// "f" should NOT appear as a call (it's the definition LHS)
+	for _, c := range r.Calls {
+		if c.CalleeName == "f" {
+			t.Errorf("'f' should not be a call (it's a definition LHS), but found in calls")
+		}
+	}
+}
+
+func TestWolframCallerAttribution_Regression(t *testing.T) {
+	// Calls inside a function body should have the enclosing function as caller,
+	// not the file path (module QN). This verifies func_kinds_wolfram is wired
+	// into func_kinds_for_lang so cbm_find_enclosing_func returns the def node.
+	src := []byte("f[x_] := g[x] + h[x]\n")
+	r, err := ExtractFile(src, lang.Wolfram, "t", "caller.wl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Calls) == 0 {
+		t.Fatal("expected calls, got 0")
+	}
+	for _, c := range r.Calls {
+		if c.CalleeName == "g" || c.CalleeName == "h" {
+			// enclosing_func_qn must NOT be the module path (file path)
+			if c.EnclosingFuncQN == "" || c.EnclosingFuncQN == "t.caller" {
+				t.Errorf("call to %q: enclosing_func_qn is file path %q, want function QN", c.CalleeName, c.EnclosingFuncQN)
+			}
+		}
+	}
+}
+
+func TestWolframParse_Regression(t *testing.T) {
+	src := []byte("x = 42;\ny = x + 1;\n")
+	_, err := ExtractFile(src, lang.Wolfram, "t", "simple.wl")
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWolframImport_Regression(t *testing.T) {
+	src := []byte("<< \"utils.wl\"\nNeeds[\"Package`\"]\n")
+	r, err := ExtractFile(src, lang.Wolfram, "t", "main.wl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Imports) == 0 {
+		t.Fatalf("expected imports, got 0")
+	}
+}
+
+func TestWolframNestedDef_Regression(t *testing.T) {
+	// set_delayed (non-top) inside Module should also be extracted
+	src := []byte("main[x_] := Module[{localF}, localF[t_] := t + 1; localF[x]]\n")
+	r, err := ExtractFile(src, lang.Wolfram, "t", "nested.wl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fns := defsWithLabel(r, "Function")
+	assertHasName(t, fns, "main")
+	assertHasName(t, fns, "localF")
+}
+
+func TestMagmaDisambiguation_Regression(t *testing.T) {
+	// Magma code with 'end function;' should be extractable as Magma
+	src := []byte(`function Factorial(n)
+  if n le 1 then
+    return 1;
+  end if;
+  return n * Factorial(n - 1);
+end function;
+`)
+	r, err := ExtractFile(src, lang.Magma, "t", "test.m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fns := defsWithLabel(r, "Function")
+	if len(fns) == 0 {
+		t.Fatal("expected at least 1 function from Magma code")
+	}
+	assertHasName(t, fns, "Factorial")
 }

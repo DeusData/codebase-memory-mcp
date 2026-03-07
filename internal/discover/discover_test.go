@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/DeusData/codebase-memory-mcp/internal/lang"
 )
 
 func TestDiscoverBasic(t *testing.T) {
@@ -40,6 +42,40 @@ func TestDiscoverBasic(t *testing.T) {
 		if f.Language == "" {
 			t.Error("expected non-empty Language")
 		}
+	}
+}
+
+func TestDisambiguateM(t *testing.T) {
+	dir := t.TempDir()
+
+	tests := []struct {
+		name    string
+		content string
+		want    lang.Language
+	}{
+		{"objc", "@interface Foo\n@end\n", lang.ObjectiveC},
+		{"matlab_function", "function y = foo(x)\n  y = x^2;\nend\n", lang.MATLAB},
+		{"matlab_comment", "% This is MATLAB\nx = 1;\n", lang.MATLAB},
+		{"magma_end_function", "function Fact(n)\n  return n;\nend function;\n", lang.Magma},
+		{"magma_procedure", "procedure DoStuff(~x)\n  x := 1;\nend procedure;\n", lang.Magma},
+		{"magma_intrinsic", "intrinsic IsSmall(x :: RngIntElt) -> BoolElt\n", lang.Magma},
+		{"magma_end_if", "if n le 1 then\n  return 1;\nend if;\n", lang.Magma},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(dir, tt.name+".m")
+			if err := os.WriteFile(path, []byte(tt.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			got, ok := disambiguateM(path)
+			if !ok {
+				t.Fatal("disambiguateM returned ok=false")
+			}
+			if got != tt.want {
+				t.Errorf("disambiguateM(%s) = %s, want %s", tt.name, got, tt.want)
+			}
+		})
 	}
 }
 

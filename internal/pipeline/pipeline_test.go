@@ -814,3 +814,54 @@ func TestProjectNameUniqueness(t *testing.T) {
 		t.Errorf("collision: %q == %q", a, b)
 	}
 }
+
+func TestFORMProcedureCallResolution(t *testing.T) {
+	dir, err := os.MkdirTemp("", "cbm-form-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Two procedures: caller calls callee via #call
+	writeFile(t, filepath.Join(dir, "calc.frm"), `#procedure callee(x)
+  id x = 0;
+#endprocedure
+#procedure caller()
+  #call callee(1)
+#endprocedure
+`)
+
+	s, err := store.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	p := New(context.Background(), s, dir, discover.ModeFull)
+	if err := p.Run(); err != nil {
+		t.Fatalf("Pipeline.Run: %v", err)
+	}
+
+	funcs, _ := s.FindNodesByLabel(p.ProjectName, "Function")
+	t.Logf("FORM functions: %d", len(funcs))
+	for _, f := range funcs {
+		t.Logf("  func: %s (%s)", f.Name, f.QualifiedName)
+	}
+
+	edges, _ := s.FindEdgesByType(p.ProjectName, "CALLS")
+	t.Logf("CALLS edges: %d", len(edges))
+	found := false
+	for _, e := range edges {
+		src, _ := s.FindNodeByID(e.SourceID)
+		tgt, _ := s.FindNodeByID(e.TargetID)
+		if src != nil && tgt != nil {
+			t.Logf("  CALLS: %s -> %s", src.Name, tgt.Name)
+		}
+		if tgt != nil && tgt.Name == "callee" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected a CALLS edge from caller to callee, got none")
+	}
+}

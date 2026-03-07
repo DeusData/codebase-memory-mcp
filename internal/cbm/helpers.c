@@ -290,6 +290,7 @@ static const char* func_kinds_matlab[] = {"function_definition",NULL};
 static const char* func_kinds_lean[] = {"def","theorem","instance","abbrev",NULL};
 static const char* func_kinds_form[] = {"procedure_definition",NULL};
 static const char* func_kinds_magma[] = {"function_definition","procedure_definition","intrinsic_definition",NULL};
+static const char* func_kinds_wolfram[] = {"set_delayed_top","set_top","set_delayed","set",NULL};
 static const char* func_kinds_generic[] = {"function_declaration","function_definition","method_declaration","method_definition",NULL};
 
 static const char** func_kinds_for_lang(CBMLanguage lang) {
@@ -319,6 +320,7 @@ static const char** func_kinds_for_lang(CBMLanguage lang) {
         case CBM_LANG_LEAN:       return func_kinds_lean;
         case CBM_LANG_FORM:       return func_kinds_form;
         case CBM_LANG_MAGMA:      return func_kinds_magma;
+        case CBM_LANG_WOLFRAM:    return func_kinds_wolfram;
         default:                  return func_kinds_generic;
     }
 }
@@ -341,6 +343,23 @@ TSNode cbm_find_enclosing_func(TSNode node, CBMLanguage lang) {
 
 // Get the name of a function node (basic: try "name" field)
 static const char* func_node_name(CBMArena* a, TSNode func_node, const char* source, CBMLanguage lang) {
+    // Wolfram: set_delayed_top/set_top/set_delayed/set — LHS is apply(user_symbol("f"), ...)
+    if (lang == CBM_LANG_WOLFRAM) {
+        const char* nk = ts_node_type(func_node);
+        if (strcmp(nk, "set_delayed_top") == 0 || strcmp(nk, "set_top") == 0 ||
+            strcmp(nk, "set_delayed") == 0     || strcmp(nk, "set") == 0) {
+            if (ts_node_named_child_count(func_node) > 0) {
+                TSNode lhs = ts_node_named_child(func_node, 0);
+                if (strcmp(ts_node_type(lhs), "apply") == 0 && ts_node_named_child_count(lhs) > 0) {
+                    TSNode head = ts_node_named_child(lhs, 0);
+                    if (strcmp(ts_node_type(head), "user_symbol") == 0)
+                        return cbm_node_text(a, head, source);
+                }
+            }
+            return NULL;
+        }
+    }
+
     TSNode name_node = ts_node_child_by_field_name(func_node, "name", 4);
     if (!ts_node_is_null(name_node)) {
         return cbm_node_text(a, name_node, source);

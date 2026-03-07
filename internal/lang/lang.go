@@ -47,10 +47,11 @@ const (
 	EmacsLisp  Language = "emacslisp"
 
 	// Scientific/math languages
-	MATLAB Language = "matlab"
-	Lean   Language = "lean"
-	FORM   Language = "form"
-	Magma  Language = "magma"
+	MATLAB  Language = "matlab"
+	Lean    Language = "lean"
+	FORM    Language = "form"
+	Magma   Language = "magma"
+	Wolfram Language = "wolfram"
 
 	// Helper languages (Tier 2)
 	HTML       Language = "html"
@@ -83,7 +84,7 @@ func AllLanguages() []Language {
 		Swift, Dart, Perl, Groovy, Erlang, R,
 		Clojure, FSharp, Julia, VimScript, Nix, CommonLisp, Elm, Fortran,
 		CUDA, COBOL, Verilog, EmacsLisp,
-		MATLAB, Lean, FORM, Magma,
+		MATLAB, Lean, FORM, Magma, Wolfram,
 		HTML, CSS, SCSS, YAML, TOML, HCL, SQL, Dockerfile,
 		JSON, XML, Markdown, Makefile, CMake, Protobuf, GraphQL,
 		Vue, Svelte, Meson, GLSL, INI,

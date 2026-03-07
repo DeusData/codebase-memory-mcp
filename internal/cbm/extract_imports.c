@@ -14,6 +14,7 @@ static void parse_c_imports(CBMExtractCtx* ctx);
 static void parse_ruby_imports(CBMExtractCtx* ctx);
 static void parse_lua_imports(CBMExtractCtx* ctx);
 static void parse_generic_imports(CBMExtractCtx* ctx, const char* node_type);
+static void parse_wolfram_imports(CBMExtractCtx* ctx);
 
 // Helper: strip quotes from a string literal
 static char* strip_quotes(CBMArena* a, const char* s) {
@@ -530,6 +531,61 @@ static void parse_generic_imports(CBMExtractCtx* ctx, const char* node_type) {
     }
 }
 
+// --- Wolfram imports ---
+// get_top: << "package" (Get["file"])
+// apply where first child is builtin_symbol "Needs" with string arg
+
+static void walk_wolfram_imports(CBMExtractCtx* ctx, TSNode node) {
+    CBMArena* a = ctx->arena;
+    const char* kind = ts_node_type(node);
+
+    // get_top: << "path" → import
+    if (strcmp(kind, "get_top") == 0) {
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode child = ts_node_named_child(node, i);
+            const char* ck = ts_node_type(child);
+            if (strcmp(ck, "string") == 0 || strcmp(ck, "user_symbol") == 0) {
+                char* text = cbm_node_text(a, child, ctx->source);
+                if (text && text[0]) {
+                    char* path = strip_quotes(a, text);
+                    CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+                    cbm_imports_push(&ctx->result->imports, a, imp);
+                }
+                break;
+            }
+        }
+    }
+
+    // Needs["package`"] — apply where head is builtin_symbol "Needs"
+    if (strcmp(kind, "apply") == 0 && ts_node_named_child_count(node) >= 2) {
+        TSNode head = ts_node_named_child(node, 0);
+        if (strcmp(ts_node_type(head), "builtin_symbol") == 0) {
+            char* name = cbm_node_text(a, head, ctx->source);
+            if (name && strcmp(name, "Needs") == 0) {
+                // Second named child should be the string argument
+                TSNode arg = ts_node_named_child(node, 1);
+                char* text = cbm_node_text(a, arg, ctx->source);
+                if (text && text[0]) {
+                    char* path = strip_quotes(a, text);
+                    CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+                    cbm_imports_push(&ctx->result->imports, a, imp);
+                }
+            }
+        }
+    }
+
+    // Recurse
+    uint32_t count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        walk_wolfram_imports(ctx, ts_node_child(node, i));
+    }
+}
+
+static void parse_wolfram_imports(CBMExtractCtx* ctx) {
+    walk_wolfram_imports(ctx, ctx->root);
+}
+
 // --- Main dispatch ---
 
 void cbm_extract_imports(CBMExtractCtx* ctx) {
@@ -617,6 +673,9 @@ void cbm_extract_imports(CBMExtractCtx* ctx) {
             break;
         case CBM_LANG_MAGMA:
             parse_generic_imports(ctx, "load_statement");
+            break;
+        case CBM_LANG_WOLFRAM:
+            parse_wolfram_imports(ctx);
             break;
         default:
             break;

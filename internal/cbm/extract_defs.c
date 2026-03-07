@@ -237,6 +237,21 @@ static TSNode resolve_func_name(TSNode node, CBMLanguage lang, const char* sourc
     // Magma: function/procedure/intrinsic_definition — name via "name" field (standard)
     // Both use standard "name" field which is handled above at line 33
 
+    // Wolfram: set_delayed_top/set_top — LHS is apply(user_symbol("f"), ...) for f[x_] := ...
+    if (lang == CBM_LANG_WOLFRAM &&
+        (strcmp(kind, "set_delayed_top") == 0 || strcmp(kind, "set_top") == 0 ||
+         strcmp(kind, "set_delayed") == 0 || strcmp(kind, "set") == 0)) {
+        if (ts_node_named_child_count(node) > 0) {
+            TSNode lhs = ts_node_named_child(node, 0);
+            if (strcmp(ts_node_type(lhs), "apply") == 0 && ts_node_named_child_count(lhs) > 0) {
+                TSNode head = ts_node_named_child(lhs, 0);
+                if (strcmp(ts_node_type(head), "user_symbol") == 0) return head;
+            }
+        }
+        TSNode null_node = {0};
+        return null_node;
+    }
+
     // C/C++/CUDA/GLSL: function_definition — name is inside the declarator chain
     // C grammar: function_definition{declarator:function_declarator{declarator:identifier}}
     if ((lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
@@ -1897,7 +1912,10 @@ static void walk_defs(CBMExtractCtx* ctx, TSNode node, const CBMLangSpec* spec) 
     // Function types
     if (cbm_kind_in_set(node, spec->function_node_types)) {
         extract_func_def(ctx, node, spec);
-        return; // don't recurse into function bodies for nested defs
+        // Wolfram: continue recursing — nested set_delayed inside Module/Block are valid defs
+        if (ctx->language != CBM_LANG_WOLFRAM) {
+            return; // don't recurse into function bodies for nested defs
+        }
     }
 
     // Rust impl blocks

@@ -128,6 +128,7 @@ func Shutdown() {
 	C.cbm_shutdown()
 }
 
+
 // ProfileStats holds accumulated profiling data from C extraction.
 type ProfileStats struct {
 	ParseNs   uint64
@@ -209,7 +210,8 @@ var languageToC = map[lang.Language]C.CBMLanguage{
 	lang.MATLAB: C.CBM_LANG_MATLAB,
 	lang.Lean:   C.CBM_LANG_LEAN,
 	lang.FORM:   C.CBM_LANG_FORM,
-	lang.Magma:  C.CBM_LANG_MAGMA,
+	lang.Magma:   C.CBM_LANG_MAGMA,
+	lang.Wolfram: C.CBM_LANG_WOLFRAM,
 }
 
 // ParseTimeoutMicros is the default per-file parse timeout (10 seconds).

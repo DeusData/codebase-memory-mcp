@@ -67,6 +67,7 @@ extern const TSLanguage* tree_sitter_matlab(void);
 extern const TSLanguage* tree_sitter_lean(void);
 extern const TSLanguage* tree_sitter_form(void);
 extern const TSLanguage* tree_sitter_magma(void);
+extern const TSLanguage* tree_sitter_wolfram(void);
 
 // -- Empty sentinel --
 static const char* empty_types[] = {NULL};
@@ -554,6 +555,7 @@ static const char* ini_var_types[] = {"setting",NULL};
 static const char* matlab_func_types[] = {"function_definition",NULL};
 static const char* matlab_class_types[] = {"class_definition",NULL};
 static const char* matlab_module_types[] = {"source_file",NULL};
+static const char* matlab_call_types[] = {"function_call","command",NULL};
 static const char* matlab_branch_types[] = {"if_statement","for_statement","while_statement","switch_statement","try_statement",NULL};
 static const char* matlab_var_types[] = {"assignment",NULL};
 
@@ -561,6 +563,7 @@ static const char* matlab_var_types[] = {"assignment",NULL};
 static const char* lean_func_types[] = {"def","theorem","instance","abbrev",NULL};
 static const char* lean_class_types[] = {"structure","class_inductive","inductive",NULL};
 static const char* lean_module_types[] = {"module",NULL};
+static const char* lean_call_types[] = {"apply",NULL};
 static const char* lean_import_types[] = {"import",NULL};
 static const char* lean_branch_types[] = {"if","match","do",NULL};
 
@@ -580,6 +583,12 @@ static const char* magma_call_types[] = {"call_expression",NULL};
 static const char* magma_import_types[] = {"load_statement",NULL};
 static const char* magma_branch_types[] = {"if_statement","for_statement","while_statement","repeat_statement","case_statement",NULL};
 static const char* magma_var_types[] = {"assignment_statement",NULL};
+
+// ==================== WOLFRAM ====================
+static const char* wolfram_func_types[] = {"set_delayed_top","set_top","set_delayed","set",NULL};
+static const char* wolfram_module_types[] = {"source_file",NULL};
+static const char* wolfram_call_types[] = {"apply",NULL};
+static const char* wolfram_import_types[] = {"get_top",NULL};
 
 // ==================== NEW LANG ENV ACCESS ====================
 static const char* julia_env_funcs[] = {"ENV",NULL};
@@ -885,13 +894,13 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
      empty_types, empty_types, empty_types, ini_var_types, empty_types,
      empty_types, NULL, empty_types, NULL, NULL},
 
-    // CBM_LANG_MATLAB (definitions-only, no call graph due to A(1) ambiguity)
-    {CBM_LANG_MATLAB, matlab_func_types, matlab_class_types, empty_types, matlab_module_types, empty_types,
+    // CBM_LANG_MATLAB
+    {CBM_LANG_MATLAB, matlab_func_types, matlab_class_types, empty_types, matlab_module_types, matlab_call_types,
      empty_types, empty_types, matlab_branch_types, matlab_var_types, matlab_var_types,
      empty_types, NULL, empty_types, NULL, NULL},
 
-    // CBM_LANG_LEAN (definitions-only, Lean 4 syntax is runtime-extensible)
-    {CBM_LANG_LEAN, lean_func_types, lean_class_types, empty_types, lean_module_types, empty_types,
+    // CBM_LANG_LEAN
+    {CBM_LANG_LEAN, lean_func_types, lean_class_types, empty_types, lean_module_types, lean_call_types,
      lean_import_types, empty_types, lean_branch_types, empty_types, empty_types,
      empty_types, NULL, empty_types, NULL, NULL},
 
@@ -903,6 +912,11 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
     // CBM_LANG_MAGMA
     {CBM_LANG_MAGMA, magma_func_types, empty_types, empty_types, magma_module_types, magma_call_types,
      magma_import_types, empty_types, magma_branch_types, magma_var_types, magma_var_types,
+     empty_types, NULL, empty_types, NULL, NULL},
+
+    // CBM_LANG_WOLFRAM
+    {CBM_LANG_WOLFRAM, wolfram_func_types, empty_types, empty_types, wolfram_module_types, wolfram_call_types,
+     wolfram_import_types, empty_types, empty_types, empty_types, empty_types,
      empty_types, NULL, empty_types, NULL, NULL},
 };
 
@@ -976,6 +990,7 @@ const TSLanguage* cbm_ts_language(CBMLanguage lang) {
         case CBM_LANG_LEAN:       return tree_sitter_lean();
         case CBM_LANG_FORM:       return tree_sitter_form();
         case CBM_LANG_MAGMA:      return tree_sitter_magma();
+        case CBM_LANG_WOLFRAM:    return tree_sitter_wolfram();
         default:                  return NULL;
     }
 }

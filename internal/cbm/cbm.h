@@ -74,6 +74,7 @@ typedef enum {
     CBM_LANG_LEAN,
     CBM_LANG_FORM,
     CBM_LANG_MAGMA,
+    CBM_LANG_WOLFRAM,
     CBM_LANG_COUNT
 } CBMLanguage;
 
@@ -294,6 +295,7 @@ void cbm_shutdown(void);
 // Profiling: get accumulated parse/extraction times and file count.
 void cbm_get_profile(uint64_t* parse_ns, uint64_t* extract_ns, uint64_t* files);
 void cbm_reset_profile(void);
+
 
 // --- Internal helpers used by extractors ---
 

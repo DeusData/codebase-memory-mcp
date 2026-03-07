@@ -214,7 +214,10 @@ var objcMarkers = regexp.MustCompile(`@interface|@implementation|@protocol|@prop
 // MATLAB markers adapted from GitHub Linguist heuristics.yml
 var matlabMarkers = regexp.MustCompile(`(?m)^\s*function\b|^\s*classdef\b|^\s*%%|^\s*%[^{]`)
 
-// disambiguateM determines whether a .m file is MATLAB or Objective-C.
+// Magma markers — semicolons after end-blocks and procedure/intrinsic keywords are unique to Magma
+var magmaMarkers = regexp.MustCompile(`(?m)end\s+(function|procedure|intrinsic)\s*;|\bintrinsic\s+\w+\s*\(|\bprocedure\s+\w+\s*\(|end\s+if\s*;|end\s+for\s*;|end\s+while\s*;`)
+
+// disambiguateM determines whether a .m file is MATLAB, Objective-C, or Magma.
 // Returns the detected language and true, or ("", false) if undetermined.
 func disambiguateM(path string) (lang.Language, bool) {
 	f, err := os.Open(path)
@@ -233,6 +236,10 @@ func disambiguateM(path string) (lang.Language, bool) {
 
 	if objcMarkers.MatchString(head) {
 		return lang.ObjectiveC, true
+	}
+	// Check Magma before MATLAB — both use 'function' keyword but Magma has 'end function;'
+	if magmaMarkers.MatchString(head) {
+		return lang.Magma, true
 	}
 	if matlabMarkers.MatchString(head) {
 		return lang.MATLAB, true
