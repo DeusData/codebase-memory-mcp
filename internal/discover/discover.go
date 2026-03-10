@@ -21,7 +21,7 @@ var IGNORE_PATTERNS = map[string]bool{
 	".npm": true, ".nyc_output": true, ".pnpm-store": true,
 	".pytest_cache": true, ".qdrant_code_embeddings": true,
 	".ruff_cache": true, ".svn": true, ".tmp": true, ".tox": true,
-	".venv": true, ".vs": true, ".vscode": true, ".yarn": true,
+	".venv": true, ".vs": true, ".vscode": true, ".worktrees": true, ".yarn": true,
 	"__pycache__": true, "bin": true, "bower_components": true,
 	"build": true, "coverage": true, "dist": true, "env": true,
 	"htmlcov": true, "node_modules": true, "obj": true, "out": true,
