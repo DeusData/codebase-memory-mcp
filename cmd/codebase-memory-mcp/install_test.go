@@ -642,6 +642,122 @@ func TestZedMCPUninstall(t *testing.T) {
 	}
 }
 
+func TestOpenCodeConfigPath(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	path := opencodeConfigPath()
+	if path == "" {
+		t.Fatal("opencodeConfigPath returned empty")
+	}
+	if !strings.HasSuffix(path, filepath.Join(".config", "opencode", "opencode.json")) {
+		t.Fatalf("unexpected path: %s", path)
+	}
+}
+
+func TestOpenCodeMCPInstall(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	configPath := filepath.Join(home, ".config", "opencode", "opencode.json")
+	binaryPath := "/usr/local/bin/codebase-memory-mcp"
+
+	installOpenCodeMCP(binaryPath, configPath, installConfig{})
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	servers, ok := root["mcp"].(map[string]any)
+	if !ok {
+		t.Fatal("expected mcp key")
+	}
+	entry, ok := servers["codebase-memory-mcp"].(map[string]any)
+	if !ok {
+		t.Fatal("codebase-memory-mcp not registered")
+	}
+	if entry["type"] != "local" {
+		t.Fatalf("expected type=local, got %v", entry["type"])
+	}
+	cmd, ok := entry["command"].([]any)
+	if !ok || len(cmd) != 1 || cmd[0] != binaryPath {
+		t.Fatalf("expected command=[%s], got %v", binaryPath, entry["command"])
+	}
+}
+
+func TestOpenCodeMCPPreservesSettings(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	configPath := filepath.Join(home, ".config", "opencode", "opencode.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-existing OpenCode settings
+	existing := `{"provider": "anthropic", "model": "claude-sonnet-4-20250514"}`
+	if err := os.WriteFile(configPath, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	installOpenCodeMCP("/usr/local/bin/codebase-memory-mcp", configPath, installConfig{})
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatal(err)
+	}
+	// Original settings preserved
+	if root["provider"] != "anthropic" {
+		t.Fatal("provider setting was lost")
+	}
+	if root["model"] != "claude-sonnet-4-20250514" {
+		t.Fatal("model setting was lost")
+	}
+	// MCP server added
+	servers, ok := root["mcp"].(map[string]any)
+	if !ok {
+		t.Fatal("mcp key missing")
+	}
+	if _, ok := servers["codebase-memory-mcp"]; !ok {
+		t.Fatal("codebase-memory-mcp not added")
+	}
+}
+
+func TestOpenCodeMCPUninstall(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	configPath := filepath.Join(home, ".config", "opencode", "opencode.json")
+	binaryPath := "/usr/local/bin/codebase-memory-mcp"
+
+	installOpenCodeMCP(binaryPath, configPath, installConfig{})
+	removeOpenCodeMCP(configPath, installConfig{})
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatal(err)
+	}
+	servers, ok := root["mcp"].(map[string]any)
+	if !ok {
+		t.Fatal("mcp key missing")
+	}
+	if _, exists := servers["codebase-memory-mcp"]; exists {
+		t.Fatal("codebase-memory-mcp should be removed")
+	}
+}
+
 func TestRemoveOldMonolithicSkill(t *testing.T) {
 	home := t.TempDir()
 	setTestHome(t, home)

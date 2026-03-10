@@ -79,6 +79,9 @@ func runInstall(args []string) int {
 	// Zed (uses "context_servers" key with "source" field)
 	installZedMCP(binaryPath, zedConfigPath(), cfg)
 
+	// OpenCode (uses "mcp" key with "type":"local" and command array)
+	installOpenCodeMCP(binaryPath, opencodeConfigPath(), cfg)
+
 	fmt.Println("\nDone. Restart your editor/CLI to activate.")
 	return 0
 }
@@ -123,6 +126,9 @@ func runUninstall(args []string) int {
 
 	// Zed
 	removeZedMCP(zedConfigPath(), cfg)
+
+	// OpenCode
+	removeOpenCodeMCP(opencodeConfigPath(), cfg)
 
 	fmt.Println("\nDone. Binary and databases were NOT removed.")
 	return 0
@@ -835,6 +841,111 @@ func removeZedMCP(configPath string, cfg installConfig) {
 
 	delete(servers, mcpServerKey)
 	root["context_servers"] = servers
+
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		fmt.Printf("  ⚠ marshal JSON: %v\n", err)
+		return
+	}
+	if err := os.WriteFile(configPath, append(out, '\n'), 0o600); err != nil {
+		fmt.Printf("  ⚠ write %s: %v\n", configPath, err)
+		return
+	}
+	fmt.Printf("  ✓ Removed %s from %s\n", mcpServerKey, configPath)
+}
+
+// --- OpenCode ---
+
+// opencodeConfigPath returns the OpenCode global config path.
+func opencodeConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "opencode", "opencode.json")
+}
+
+// installOpenCodeMCP upserts our MCP server in OpenCode's config (uses "mcp" key with "type":"local").
+func installOpenCodeMCP(binaryPath, configPath string, cfg installConfig) {
+	if configPath == "" {
+		return
+	}
+
+	fmt.Printf("[OpenCode] MCP config: %s\n", configPath)
+
+	if cfg.dryRun {
+		fmt.Printf("  [dry-run] Would upsert %s in %s\n", mcpServerKey, configPath)
+		return
+	}
+
+	root := make(map[string]any)
+	if data, err := os.ReadFile(configPath); err == nil {
+		if jsonErr := json.Unmarshal(data, &root); jsonErr != nil {
+			fmt.Printf("  ⚠ Invalid JSON in %s, overwriting\n", configPath)
+			root = make(map[string]any)
+		}
+	}
+
+	servers, ok := root["mcp"].(map[string]any)
+	if !ok {
+		servers = make(map[string]any)
+	}
+
+	servers[mcpServerKey] = map[string]any{
+		"type":    "local",
+		"command": []string{binaryPath},
+	}
+	root["mcp"] = servers
+
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o750); err != nil {
+		fmt.Printf("  ⚠ mkdir %s: %v\n", filepath.Dir(configPath), err)
+		return
+	}
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		fmt.Printf("  ⚠ marshal JSON: %v\n", err)
+		return
+	}
+	if err := os.WriteFile(configPath, append(out, '\n'), 0o600); err != nil {
+		fmt.Printf("  ⚠ write %s: %v\n", configPath, err)
+		return
+	}
+	fmt.Printf("  ✓ MCP server registered in %s\n", configPath)
+}
+
+// removeOpenCodeMCP removes our MCP server from OpenCode's config.
+func removeOpenCodeMCP(configPath string, cfg installConfig) {
+	if configPath == "" {
+		return
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return
+	}
+
+	servers, ok := root["mcp"].(map[string]any)
+	if !ok {
+		return
+	}
+	if _, exists := servers[mcpServerKey]; !exists {
+		return
+	}
+
+	fmt.Printf("[OpenCode] MCP config: %s\n", configPath)
+
+	if cfg.dryRun {
+		fmt.Printf("  [dry-run] Would remove %s from %s\n", mcpServerKey, configPath)
+		return
+	}
+
+	delete(servers, mcpServerKey)
+	root["mcp"] = servers
 
 	out, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
