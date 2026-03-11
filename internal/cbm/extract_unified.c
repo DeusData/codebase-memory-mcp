@@ -79,6 +79,12 @@ static const char* compute_func_qn(CBMExtractCtx* ctx, TSNode node,
         }
     }
 
+    // Swift: function_declaration uses simple_identifier child, not "name" field
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_SWIFT &&
+        strcmp(ts_node_type(node), "function_declaration") == 0) {
+        name_node = cbm_find_child_by_kind(node, "simple_identifier");
+    }
+
     if (ts_node_is_null(name_node)) return NULL;
 
     char* name = cbm_node_text(ctx->arena, name_node, ctx->source);

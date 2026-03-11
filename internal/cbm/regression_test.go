@@ -146,6 +146,85 @@ func TestSwiftStruct_Regression(t *testing.T) {
 	assertHasName(t, defsWithLabel(r, "Method"), "distance")
 }
 
+func TestSwiftSimpleCall_Regression(t *testing.T) {
+	src := []byte("func main() { greet() }\nfunc greet() { print(\"hello\") }\n")
+	r, err := ExtractFile(src, lang.Swift, "t", "main.swift")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Calls) == 0 {
+		t.Fatal("expected calls, got 0")
+	}
+	found := false
+	for _, c := range r.Calls {
+		if c.CalleeName == "greet" {
+			found = true
+			if c.EnclosingFuncQN == "" {
+				t.Error("greet() call should have enclosing function QN")
+			}
+		}
+	}
+	if !found {
+		t.Error("call to greet() not found")
+	}
+}
+
+func TestSwiftMethodCall_Regression(t *testing.T) {
+	src := []byte("class Foo {\n    func bar() { baz.run() }\n}\n")
+	r, err := ExtractFile(src, lang.Swift, "t", "Foo.swift")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, c := range r.Calls {
+		if c.CalleeName == "baz.run" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("call to baz.run() not found in Foo.bar")
+	}
+}
+
+func TestSwiftConstructor_Regression(t *testing.T) {
+	src := []byte("func create() { let x = MyClass() }\n")
+	r, err := ExtractFile(src, lang.Swift, "t", "create.swift")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, c := range r.Calls {
+		if c.CalleeName == "MyClass" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("constructor call MyClass() not found")
+	}
+}
+
+func TestSwiftChainedCall_Regression(t *testing.T) {
+	src := []byte("func setup() { AlarmScheduler.shared.startKeepAlive() }\n")
+	r, err := ExtractFile(src, lang.Swift, "t", "setup.swift")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Calls) == 0 {
+		t.Fatal("expected calls for chained dot syntax, got 0")
+	}
+	// Should capture the full navigation expression
+	found := false
+	for _, c := range r.Calls {
+		t.Logf("Call: callee=%q enclosing=%q", c.CalleeName, c.EnclosingFuncQN)
+		if c.CalleeName != "" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("chained call not extracted")
+	}
+}
+
 // --- Kotlin ---
 func TestKotlinFunction_Regression(t *testing.T) {
 	src := []byte("fun greet(name: String): String = \"Hello $name\"\nfun main() { println(greet(\"World\")) }\n")

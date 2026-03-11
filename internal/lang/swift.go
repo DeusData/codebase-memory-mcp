@@ -15,7 +15,7 @@ func init() {
 		},
 		FieldNodeTypes:  []string{"property_declaration"},
 		ModuleNodeTypes: []string{"source_file"},
-		CallNodeTypes:   []string{"call_expression"},
+		CallNodeTypes:   []string{"call_expression", "constructor_expression"},
 		ImportNodeTypes: []string{"import_declaration"},
 		BranchingNodeTypes: []string{
 			"if_statement", "guard_statement", "for_statement",
