@@ -1253,9 +1253,10 @@ func resolveOrderColumn(orderBy string, items []ReturnItem, cols []string) strin
 	return orderBy
 }
 
-// applyLimit enforces the LIMIT clause on result rows.
+// applyLimit caps result rows. Explicit LIMIT values are respected;
+// when no LIMIT is specified, maxResultRows (200) is used as default.
 func applyLimit(rows []map[string]any, limit int) []map[string]any {
-	if limit <= 0 || limit > maxResultRows {
+	if limit <= 0 {
 		limit = maxResultRows
 	}
 	if len(rows) > limit {
