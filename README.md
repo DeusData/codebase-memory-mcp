@@ -4,7 +4,7 @@
 
 Single Go binary. No Docker, no external databases, no API keys. One command to install, say *"Index this project"* — done.
 
-Parses source code with [tree-sitter](https://tree-sitter.github.io/tree-sitter/), extracts functions, classes, modules, call relationships, and cross-service HTTP links. Exposes the graph through 12 MCP tools for use with Claude Code, Codex CLI, Cursor, Windsurf, Gemini CLI, VS Code, Zed, or any MCP-compatible client. Also includes a **CLI mode** for direct tool invocation from the shell — no MCP client needed.
+Parses source code with [tree-sitter](https://tree-sitter.github.io/tree-sitter/), extracts functions, classes, modules, call relationships, and cross-service HTTP links. Exposes the graph through 14 MCP tools for use with Claude Code, Codex CLI, Cursor, Windsurf, Gemini CLI, VS Code, Zed, or any MCP-compatible client. Also includes a **CLI mode** for direct tool invocation from the shell — no MCP client needed.
 
 ## Features
 
@@ -18,6 +18,8 @@ Parses source code with [tree-sitter](https://tree-sitter.github.io/tree-sitter/
 - **One-command install**: `codebase-memory-mcp install` auto-detects Claude Code, Codex CLI, Cursor, Windsurf, Gemini CLI, VS Code, and Zed, registers the MCP server, and installs task-specific skills
 - **Self-update**: `codebase-memory-mcp update` downloads the latest release, verifies checksums, and atomically swaps the binary
 - **Task-specific skills**: 4 skills (exploring, tracing, quality, reference) that prescribe exact tool sequences — Claude Code automatically uses graph tools instead of defaulting to grep
+- **Go: tree-sitter + LSP hybrid**: Go gets enhanced cross-file type resolution via a built-in LSP-style type resolver that runs alongside tree-sitter parsing. This produces higher-confidence call edges by resolving method calls through interface embeddings, struct field access, and cross-package type inference. **This hybrid approach is coming soon for additional languages.**
+- **`.gitignore` + `.cbmignore` support**: Respects your full `.gitignore` hierarchy (nested files + `.git/info/exclude`). Add a `.cbmignore` for additional indexer-specific exclusions using gitignore-style patterns. Symlinks are always skipped.
 - **Fast**: Sub-millisecond graph queries, incremental reindex 4x faster than full scan, optimized SQLite with LIKE pre-filtering for regex searches
 - **Call graph**: Resolves function calls across files and packages (import-aware, type-inferred)
 - **Cross-service HTTP linking**: Discovers REST routes (FastAPI, Gin, Express) and matches them to HTTP call sites with confidence scoring
@@ -243,7 +245,7 @@ Add the MCP server to your project's `.mcp.json` (per-project, recommended) or `
 }
 ```
 
-Restart Claude Code after adding the config. Verify with `/mcp` — you should see `codebase-memory-mcp` listed with 12 tools.
+Restart Claude Code after adding the config. Verify with `/mcp` — you should see `codebase-memory-mcp` listed with 14 tools.
 
 </details>
 
@@ -609,23 +611,36 @@ The skill files are embedded in the binary. If you prefer to install them manual
 
 </details>
 
-## Ignoring Files (`.cgrignore`)
+## Ignoring Files
 
-Place a `.cgrignore` file in your project root to exclude directories or files from indexing. The syntax is one glob pattern per line (comments with `#`):
+File ignoring is **layered** — each layer stacks on top of the previous one:
+
+### 1. Hardcoded patterns (always active)
+
+Directories like `.git`, `node_modules`, `dist`, `__pycache__`, `.venv`, `.cache`, `.idea`, `.vscode`, `vendor`, and ~50 other unambiguous build/cache directories are always skipped. Symlinked files and directories are also always skipped (prevents duplicate indexing).
+
+### 2. `.gitignore` (automatic for git repos)
+
+The indexer respects your full `.gitignore` hierarchy — including nested `.gitignore` files in subdirectories and `.git/info/exclude`. No configuration needed; if a file is gitignored, it won't be indexed.
+
+### 3. `.cbmignore` (project-specific exclusions)
+
+Place a `.cbmignore` file in your project root to exclude additional files from indexing that aren't in `.gitignore`. Uses full **gitignore-style pattern syntax** (globstar `**`, negation `!`, directory-only trailing `/`):
 
 ```
-# .cgrignore
-generated
-vendor
-__pycache__
+# .cbmignore — additional patterns for codebase-memory-mcp indexing
+generated/
 *.pb.go
-testdata
-fixtures
+*_generated.*
+testdata/
+docs/api/
 ```
 
-Patterns are matched against both directory names and relative paths using Go's `filepath.Match` syntax. Directories matching a pattern are skipped entirely (including all contents).
+`.cbmignore` stacks on top of `.gitignore` — patterns in `.cbmignore` are additive exclusions. This is useful for files that should be in git but don't need to be in the code graph (e.g., generated code, large data fixtures, vendored docs).
 
-The following directories are **always ignored** regardless of `.cgrignore`: `.git`, `node_modules`, `vendor`, `__pycache__`, `.mypy_cache`, `.venv`, `dist`, `build`, `.cache`, `.idea`, `.vscode`, and others.
+### 4. `.cgrignore` (legacy, backward-compatible)
+
+The older `.cgrignore` format is still supported. It uses simpler `filepath.Match` glob patterns (one per line). If you have an existing `.cgrignore`, it will continue to work alongside `.cbmignore`.
 
 ## Persistence
 
@@ -683,14 +698,14 @@ cmd/codebase-memory-mcp/  Entry point (MCP stdio server + CLI mode + install/upd
 internal/
   store/                  SQLite graph storage (nodes, edges, traversal, search, architecture, Louvain clustering)
   lang/                   Language specs (64 languages, tree-sitter node types)
-  cbm/                    Vendored tree-sitter C grammars (64 languages) and AST extraction engine
+  cbm/                    Vendored tree-sitter C grammars (64 languages), AST extraction engine, and LSP-style type resolver (Go hybrid)
   pipeline/               Multi-pass indexing (structure → definitions → calls → HTTP links → config links → communities → tests)
   httplink/               Cross-service HTTP route/call-site matching
   cypher/                 Cypher query lexer, parser, planner, executor
   selfupdate/             GitHub release checking, version comparison, asset download
-  tools/                  MCP tool handlers (12 tools) + CLI dispatch
+  tools/                  MCP tool handlers (14 tools) + CLI dispatch
   watcher/                Background auto-sync (mtime+size polling, adaptive intervals)
-  discover/               File discovery with .cgrignore support
+  discover/               File discovery with .gitignore, .cbmignore, and symlink handling
   fqn/                    Qualified name computation
   traces/                 OpenTelemetry trace ingestion for HTTP_CALLS validation
 ```
