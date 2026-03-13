@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -180,8 +181,19 @@ func (p *Pipeline) Run() error {
 
 	// Discover source files (filesystem, no DB — runs outside transaction)
 	discoverOpts := &discover.Options{Mode: p.Mode}
+	// Apply per-mode file size caps.
+	// Fast mode: 512 KB — avoids large minified assets.
+	// Full mode: 2 MB (default) — guards against huge generated bundles.
+	// Override: CODEBASE_MAX_FILE_SIZE_BYTES env var (any mode).
+	const defaultFullModeMaxFileSize int64 = 2 * 1024 * 1024 // 2 MB
+	discoverOpts.MaxFileSize = defaultFullModeMaxFileSize
 	if p.Mode == discover.ModeFast {
-		discoverOpts.MaxFileSize = 512 * 1024 // 512KB cutoff in fast mode
+		discoverOpts.MaxFileSize = 512 * 1024 // 512 KB
+	}
+	if override := os.Getenv("CODEBASE_MAX_FILE_SIZE_BYTES"); override != "" {
+		if v, err := strconv.ParseInt(override, 10, 64); err == nil && v > 0 {
+			discoverOpts.MaxFileSize = v
+		}
 	}
 	files, err := discover.Discover(p.ctx, p.RepoPath, discoverOpts)
 	if err != nil {
