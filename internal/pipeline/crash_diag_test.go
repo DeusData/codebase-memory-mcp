@@ -41,7 +41,7 @@ func captureMemSnapshot(stage string) memSnapshot {
 // 3 large files (~1MB each) and indexes it in full mode while sampling
 // runtime.MemStats every 500ms. The goal is to capture peak heap usage
 // and GC behavior under moderate load.
-func TestCrashDiag_MemoryPressure(t *testing.T) {
+func TestCrashDiag_MemoryPressure(t *testing.T) { //nolint:funlen // integration test: long by design
 	dir := t.TempDir()
 
 	// Create .git marker
