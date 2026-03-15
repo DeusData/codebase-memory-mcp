@@ -1,9 +1,12 @@
 package tools
 
 import (
+	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 
+	"github.com/DeusData/codebase-memory-mcp/internal/metrics"
 	"github.com/DeusData/codebase-memory-mcp/internal/store"
 )
 
@@ -136,6 +139,33 @@ func TestInitMetricsTracker(t *testing.T) {
 		srv := NewServer(router, WithConfig(cfg))
 		if srv.metricsTracker != nil {
 			t.Error("expected metricsTracker to be nil when disabled")
+		}
+	})
+
+	t.Run("custom metrics_path via config", func(t *testing.T) {
+		router, err := store.NewRouterWithDir(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(router.CloseAll)
+		cfg, err := store.OpenConfigInDir(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { cfg.Close() })
+
+		customPath := filepath.Join(t.TempDir(), "custom-savings.json")
+		cfg.Set(store.ConfigMetricsPath, customPath)
+
+		srv := NewServer(router, WithConfig(cfg))
+		if srv.metricsTracker == nil {
+			t.Fatal("expected metricsTracker to be non-nil with custom path")
+		}
+
+		// Record something and verify it wrote to the custom path
+		srv.metricsTracker.Record(metrics.TokenMetadata{TokensSaved: 100, CostAvoided: 0.001})
+		if _, err := os.Stat(customPath); err != nil {
+			t.Errorf("expected savings file at custom path %s: %v", customPath, err)
 		}
 	})
 }

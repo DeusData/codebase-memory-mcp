@@ -3,8 +3,51 @@ package store
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 )
+
+func TestCacheDir_EnvOverride(t *testing.T) {
+	customDir := filepath.Join(t.TempDir(), "custom-db-dir")
+
+	// Set env, call cacheDir, restore
+	old := os.Getenv("CODEBASE_MEMORY_DB_DIR")
+	t.Setenv("CODEBASE_MEMORY_DB_DIR", customDir)
+	defer os.Setenv("CODEBASE_MEMORY_DB_DIR", old)
+
+	dir, err := cacheDir()
+	if err != nil {
+		t.Fatalf("cacheDir() with env override: %v", err)
+	}
+	if dir != customDir {
+		t.Errorf("cacheDir() = %q, want %q", dir, customDir)
+	}
+
+	// Directory should have been created
+	info, err := os.Stat(customDir)
+	if err != nil {
+		t.Fatalf("expected dir to exist: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatal("expected a directory")
+	}
+}
+
+func TestCacheDir_Default(t *testing.T) {
+	// Unset env to test default path
+	t.Setenv("CODEBASE_MEMORY_DB_DIR", "")
+
+	dir, err := cacheDir()
+	if err != nil {
+		t.Fatalf("cacheDir() default: %v", err)
+	}
+	home, _ := os.UserHomeDir()
+	expected := filepath.Join(home, ".cache", "codebase-memory-mcp")
+	if dir != expected {
+		t.Errorf("cacheDir() = %q, want %q", dir, expected)
+	}
+}
 
 func TestOpenMemory(t *testing.T) {
 	s, err := OpenMemory()

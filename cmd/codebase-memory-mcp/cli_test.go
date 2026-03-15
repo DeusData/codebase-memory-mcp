@@ -268,6 +268,153 @@ func TestCLI_InstallForceOverwrites(t *testing.T) {
 	}
 }
 
+func TestCLI_InstallProject(t *testing.T) {
+	home := t.TempDir()
+	projDir := t.TempDir()
+
+	cmd := testCmd(t, "install", "--project", projDir)
+	cmd.Env = testEnvWithHome(home, "PATH="+t.TempDir(), "SHELL=/bin/zsh")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install --project failed: %v\n%s", err, out)
+	}
+	output := string(out)
+
+	// Should write project-local .mcp.json
+	mcpJSON := filepath.Join(projDir, ".mcp.json")
+	data, err := os.ReadFile(mcpJSON)
+	if err != nil {
+		t.Fatalf("expected .mcp.json at %s: %v", mcpJSON, err)
+	}
+	if !strings.Contains(string(data), "codebase-memory-mcp") {
+		t.Fatalf("expected codebase-memory-mcp in .mcp.json, got: %s", data)
+	}
+
+	// Should still install skills globally
+	skillFile := filepath.Join(home, ".claude", "skills", "codebase-memory-exploring", "SKILL.md")
+	if _, err := os.Stat(skillFile); err != nil {
+		t.Fatal("skills should be installed globally even with --project")
+	}
+
+	// Should NOT contain editor registration output (Cursor, VS Code, etc.)
+	if strings.Contains(output, "[Cursor]") || strings.Contains(output, "[VS Code") {
+		t.Fatal("--project should skip global editor registrations")
+	}
+}
+
+func TestCLI_InstallProjectDryRun(t *testing.T) {
+	home := t.TempDir()
+	projDir := t.TempDir()
+
+	cmd := testCmd(t, "install", "--project", projDir, "--dry-run")
+	cmd.Env = testEnvWithHome(home, "PATH="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install --project --dry-run failed: %v\n%s", err, out)
+	}
+	output := string(out)
+	if !strings.Contains(output, "dry-run") {
+		t.Fatal("expected dry-run in output")
+	}
+
+	// Should NOT create .mcp.json
+	mcpJSON := filepath.Join(projDir, ".mcp.json")
+	if _, err := os.Stat(mcpJSON); !os.IsNotExist(err) {
+		t.Fatal("dry-run should not create .mcp.json")
+	}
+}
+
+func TestCLI_UninstallProject(t *testing.T) {
+	home := t.TempDir()
+	projDir := t.TempDir()
+
+	// First install
+	cmd := testCmd(t, "install", "--project", projDir)
+	cmd.Env = testEnvWithHome(home, "PATH="+t.TempDir(), "SHELL=/bin/zsh")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("install --project failed: %v\n%s", err, out)
+	}
+
+	// Verify .mcp.json exists
+	mcpJSON := filepath.Join(projDir, ".mcp.json")
+	if _, err := os.Stat(mcpJSON); err != nil {
+		t.Fatal("expected .mcp.json after install")
+	}
+
+	// Uninstall
+	cmd = testCmd(t, "uninstall", "--project", projDir)
+	cmd.Env = testEnvWithHome(home, "PATH="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("uninstall --project failed: %v\n%s", err, out)
+	}
+
+	// .mcp.json should be removed (it only had our entry)
+	if _, err := os.Stat(mcpJSON); !os.IsNotExist(err) {
+		t.Fatal(".mcp.json should be removed after uninstall --project (no other servers)")
+	}
+}
+
+func TestCLI_UninstallProjectPreservesOtherServers(t *testing.T) {
+	projDir := t.TempDir()
+	home := t.TempDir()
+
+	// Write .mcp.json with our entry + another server
+	mcpJSON := filepath.Join(projDir, ".mcp.json")
+	initial := `{
+  "mcpServers": {
+    "codebase-memory-mcp": {"command": "/usr/bin/cmm"},
+    "other-server": {"command": "/usr/bin/other"}
+  }
+}`
+	if err := os.WriteFile(mcpJSON, []byte(initial), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := testCmd(t, "uninstall", "--project", projDir)
+	cmd.Env = testEnvWithHome(home, "PATH="+t.TempDir())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("uninstall --project failed: %v\n%s", err, out)
+	}
+
+	// .mcp.json should still exist with the other server
+	data, err := os.ReadFile(mcpJSON)
+	if err != nil {
+		t.Fatal("expected .mcp.json to still exist")
+	}
+	if strings.Contains(string(data), "codebase-memory-mcp") {
+		t.Fatal("our entry should be removed")
+	}
+	if !strings.Contains(string(data), "other-server") {
+		t.Fatal("other server entry should be preserved")
+	}
+}
+
+func TestCLI_InstallCLAUDE_CONFIG_DIR(t *testing.T) {
+	home := t.TempDir()
+	customClaudeDir := filepath.Join(t.TempDir(), "custom-claude")
+
+	cmd := testCmd(t, "install")
+	cmd.Env = testEnvWithHome(home, "PATH="+t.TempDir(), "SHELL=/bin/zsh",
+		"CLAUDE_CONFIG_DIR="+customClaudeDir)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install with CLAUDE_CONFIG_DIR failed: %v\n%s", err, out)
+	}
+
+	// Skills should be under the custom dir, not ~/.claude
+	skillFile := filepath.Join(customClaudeDir, "skills", "codebase-memory-exploring", "SKILL.md")
+	if _, err := os.Stat(skillFile); err != nil {
+		t.Fatalf("skills should be under CLAUDE_CONFIG_DIR (%s): %v", customClaudeDir, err)
+	}
+
+	// Should NOT be under default ~/.claude
+	defaultSkill := filepath.Join(home, ".claude", "skills", "codebase-memory-exploring", "SKILL.md")
+	if _, err := os.Stat(defaultSkill); !os.IsNotExist(err) {
+		t.Fatal("skills should NOT be under default ~/.claude when CLAUDE_CONFIG_DIR is set")
+	}
+}
+
 func TestCLI_InstallPATHAppend(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell RC PATH append is Unix-specific")

@@ -130,13 +130,43 @@ func runInstall(args []string) int {
 
 func runUninstall(args []string) int {
 	cfg := installConfig{}
-	for _, a := range args {
-		if a == "--dry-run" {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--dry-run":
 			cfg.dryRun = true
+		case "--project":
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
+				cfg.project = args[i+1]
+				i++
+			} else {
+				cwd, err := os.Getwd()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "error: cannot determine cwd: %v\n", err)
+					return 1
+				}
+				cfg.project = cwd
+			}
 		}
 	}
 
+	// Resolve relative project path to absolute
+	if cfg.project != "" && !filepath.IsAbs(cfg.project) {
+		abs, err := filepath.Abs(cfg.project)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: cannot resolve project path: %v\n", err)
+			return 1
+		}
+		cfg.project = abs
+	}
+
 	fmt.Printf("\ncodebase-memory-mcp %s — uninstall\n\n", version)
+
+	// Project-local: only remove the .mcp.json entry
+	if cfg.project != "" {
+		removeProjectMCPJSON(cfg.project, cfg)
+		fmt.Println("\nDone.")
+		return 0
+	}
 
 	// Remove Claude Code skills
 	removeClaudeSkills(cfg)
@@ -463,6 +493,67 @@ func writeProjectMCPJSON(projectDir, binaryPath string, cfg installConfig) {
 		return
 	}
 	fmt.Printf("  ✓ Project-local .mcp.json written\n")
+}
+
+// removeProjectMCPJSON removes the codebase-memory-mcp entry from a project-local .mcp.json.
+func removeProjectMCPJSON(projectDir string, cfg installConfig) {
+	configPath := filepath.Join(projectDir, ".mcp.json")
+	fmt.Printf("[Claude Code] Remove project-local MCP entry: %s\n", configPath)
+
+	if cfg.dryRun {
+		fmt.Printf("  [dry-run] Would remove %s entry from %s\n", mcpServerKey, configPath)
+		return
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Printf("  ○ No .mcp.json found at %s\n", configPath)
+		} else {
+			fmt.Printf("  ⚠ read %s: %v\n", configPath, err)
+		}
+		return
+	}
+
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		fmt.Printf("  ⚠ invalid JSON in %s: %v\n", configPath, err)
+		return
+	}
+
+	servers, ok := root["mcpServers"].(map[string]any)
+	if !ok {
+		fmt.Printf("  ○ No mcpServers section in %s\n", configPath)
+		return
+	}
+	if _, exists := servers[mcpServerKey]; !exists {
+		fmt.Printf("  ○ %s not registered in %s\n", mcpServerKey, configPath)
+		return
+	}
+
+	delete(servers, mcpServerKey)
+
+	// If mcpServers is now empty, remove the file entirely
+	if len(servers) == 0 {
+		if err := os.Remove(configPath); err != nil {
+			fmt.Printf("  ⚠ remove %s: %v\n", configPath, err)
+		} else {
+			fmt.Printf("  ✓ Removed %s (no other servers)\n", configPath)
+		}
+		return
+	}
+
+	root["mcpServers"] = servers
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		fmt.Printf("  ⚠ marshal JSON: %v\n", err)
+		return
+	}
+	if err := os.WriteFile(configPath, append(out, '\n'), 0o600); err != nil {
+		fmt.Printf("  ⚠ write %s: %v\n", configPath, err)
+		return
+	}
+	fmt.Printf("  ✓ Removed %s entry from %s\n", mcpServerKey, configPath)
 }
 
 // deregisterMCP removes the MCP server registration from a CLI.
