@@ -89,6 +89,19 @@ func (c *ConfigStore) GetInt(key string, defaultVal int) int {
 	return n
 }
 
+// GetFloat64 returns a float64 config value.
+func (c *ConfigStore) GetFloat64(key string, defaultVal float64) float64 {
+	raw := c.Get(key, "")
+	if raw == "" {
+		return defaultVal
+	}
+	f, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return defaultVal
+	}
+	return f
+}
+
 // Set stores a key-value pair (upsert).
 func (c *ConfigStore) Set(key, value string) error {
 	_, err := c.db.ExecContext(context.Background(),
@@ -143,4 +156,18 @@ const (
 	// Accepts human-readable sizes: "2G", "512M", "4096M".
 	// Default: empty (no limit). Applied on server startup.
 	ConfigMemLimit = "mem_limit"
+
+	// ConfigMetricsEnabled controls whether token savings estimation is computed
+	// and included in tool responses. Default: true.
+	// Set to false with: codebase-memory-mcp config set metrics_enabled false
+	ConfigMetricsEnabled = "metrics_enabled"
+
+	// ConfigPricingModel selects the token pricing model for cost estimation.
+	// Supported values: "claude-sonnet" (default), "claude-opus", "gpt-4o", "custom".
+	// When "custom", ConfigCustomPricePerToken is used.
+	ConfigPricingModel = "pricing_model"
+
+	// ConfigCustomPricePerToken is the USD cost per output token used when
+	// ConfigPricingModel is "custom". Example: 0.000015 for $15/M tokens.
+	ConfigCustomPricePerToken = "custom_price_per_token"
 )
