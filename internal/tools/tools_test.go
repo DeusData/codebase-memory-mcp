@@ -3,6 +3,8 @@ package tools
 import (
 	"runtime"
 	"testing"
+
+	"github.com/DeusData/codebase-memory-mcp/internal/store"
 )
 
 func TestParseFileURI(t *testing.T) {
@@ -49,6 +51,93 @@ func TestParseFileURI(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPriceForConfig(t *testing.T) {
+	tests := []struct {
+		name  string
+		cfg   func(t *testing.T) *store.ConfigStore
+		want  float64
+	}{
+		{"nil config", func(t *testing.T) *store.ConfigStore { return nil }, 0.000015},
+		{"default (claude-sonnet)", func(t *testing.T) *store.ConfigStore {
+			c, err := store.OpenConfigInDir(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { c.Close() })
+			return c
+		}, 0.000015},
+		{"claude-opus", func(t *testing.T) *store.ConfigStore {
+			c, err := store.OpenConfigInDir(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { c.Close() })
+			c.Set(store.ConfigPricingModel, "claude-opus")
+			return c
+		}, 0.000075},
+		{"gpt-4o", func(t *testing.T) *store.ConfigStore {
+			c, err := store.OpenConfigInDir(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { c.Close() })
+			c.Set(store.ConfigPricingModel, "gpt-4o")
+			return c
+		}, 0.000010},
+		{"custom", func(t *testing.T) *store.ConfigStore {
+			c, err := store.OpenConfigInDir(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { c.Close() })
+			c.Set(store.ConfigPricingModel, "custom")
+			c.Set(store.ConfigCustomPricePerToken, "0.00005")
+			return c
+		}, 0.00005},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := priceForConfig(tt.cfg(t))
+			if got != tt.want {
+				t.Errorf("priceForConfig() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInitMetricsTracker(t *testing.T) {
+	t.Run("default enabled", func(t *testing.T) {
+		router, err := store.NewRouterWithDir(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(router.CloseAll)
+		srv := NewServer(router)
+		if srv.metricsTracker == nil {
+			t.Error("expected metricsTracker to be non-nil by default")
+		}
+	})
+
+	t.Run("disabled via config", func(t *testing.T) {
+		router, err := store.NewRouterWithDir(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(router.CloseAll)
+		cfg, err := store.OpenConfigInDir(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { cfg.Close() })
+		cfg.Set(store.ConfigMetricsEnabled, "false")
+
+		srv := NewServer(router, WithConfig(cfg))
+		if srv.metricsTracker != nil {
+			t.Error("expected metricsTracker to be nil when disabled")
+		}
+	})
 }
 
 // windowsPath converts forward slashes to backslashes for Windows comparison.

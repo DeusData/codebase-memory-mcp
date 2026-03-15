@@ -814,6 +814,14 @@ func (s *Server) initMetricsTracker() {
 
 // resultWithMeta wraps data with a _meta field containing token savings estimation.
 // If tracker is non-nil, also records the savings cumulatively.
+//
+// Currently instrumented: search_graph, get_code_snippet.
+// NOT instrumented (intentionally): trace_call_path, query_graph, search_code,
+// get_architecture, get_graph_schema, detect_changes, index_repository,
+// list_projects, index_status, manage_adr, delete_project.
+// Rationale: validating the _meta pattern on high-value tools first; tools like
+// index_repository and list_projects have no file-read equivalent so savings = 0.
+// Use this wrapper to add more tools incrementally.
 func resultWithMeta(data map[string]any, meta metrics.TokenMetadata, tracker *metrics.Tracker) *mcp.CallToolResult {
 	data["_meta"] = meta
 	if tracker != nil {

@@ -19,11 +19,11 @@ type TokenMetadata struct {
 	BaselineTokens   int     `json:"baseline_tokens"`
 	ResponseTokens   int     `json:"response_tokens"`
 	CostAvoided      float64 `json:"cost_avoided"`
-	CompressionRatio float64 `json:"compression_ratio"`
+	ReductionRatio float64 `json:"reduction_ratio"`
 }
 
 // EstimateTokens approximates token count from byte length using
-// the standard English heuristic of 1 token ≈ 4 characters.
+// the heuristic of 1 token ≈ 4 bytes (accurate for ASCII-heavy source code).
 func EstimateTokens(s string) int {
 	return len(s) / 4
 }
@@ -48,7 +48,7 @@ func CalculateSavings(baselineBytes, responseBytes int, pricePerToken float64) T
 		BaselineTokens:   baseline,
 		ResponseTokens:   response,
 		CostAvoided:      math.Round(float64(saved)*pricePerToken*1e6) / 1e6,
-		CompressionRatio: ratio,
+		ReductionRatio: ratio,
 	}
 }
 
@@ -61,12 +61,13 @@ type savingsRecord struct {
 }
 
 // Tracker accumulates token savings across calls and persists totals.
+// Use Snapshot() to read totals safely — do not access fields directly.
 type Tracker struct {
 	mu               sync.Mutex
 	path             string
-	InstallID        string
-	TotalTokensSaved int64
-	TotalCostAvoided float64
+	installID        string
+	totalTokensSaved int64
+	totalCostAvoided float64
 }
 
 // NewTracker loads or creates savings.json at path. Generates a random
@@ -79,20 +80,20 @@ func NewTracker(path string) *Tracker {
 		if !os.IsNotExist(err) {
 			slog.Warn("metrics: failed to read savings file", "path", path, "err", err)
 		}
-		t.InstallID = newInstallID()
+		t.installID = newInstallID()
 		return t
 	}
 
 	var rec savingsRecord
 	if err := json.Unmarshal(data, &rec); err != nil {
 		slog.Warn("metrics: malformed savings file, starting fresh", "path", path, "err", err)
-		t.InstallID = newInstallID()
+		t.installID = newInstallID()
 		return t
 	}
 
-	t.InstallID = rec.InstallID
-	t.TotalTokensSaved = rec.TotalTokensSaved
-	t.TotalCostAvoided = rec.TotalCostAvoided
+	t.installID = rec.InstallID
+	t.totalTokensSaved = rec.TotalTokensSaved
+	t.totalCostAvoided = rec.TotalCostAvoided
 	return t
 }
 
@@ -102,13 +103,13 @@ func (t *Tracker) Record(meta TokenMetadata) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	t.TotalTokensSaved += int64(meta.TokensSaved)
-	t.TotalCostAvoided += meta.CostAvoided
+	t.totalTokensSaved += int64(meta.TokensSaved)
+	t.totalCostAvoided += meta.CostAvoided
 
 	rec := savingsRecord{
-		InstallID:        t.InstallID,
-		TotalTokensSaved: t.TotalTokensSaved,
-		TotalCostAvoided: t.TotalCostAvoided,
+		InstallID:        t.installID,
+		TotalTokensSaved: t.totalTokensSaved,
+		TotalCostAvoided: t.totalCostAvoided,
 		LastUpdated:      time.Now().UTC().Format(time.RFC3339),
 	}
 
@@ -144,14 +145,14 @@ func (t *Tracker) Record(meta TokenMetadata) {
 		return
 	}
 
-	slog.Debug("metrics: savings persisted", "path", t.path, "total_tokens_saved", t.TotalTokensSaved)
+	slog.Debug("metrics: savings persisted", "path", t.path, "total_tokens_saved", t.totalTokensSaved)
 }
 
 // Snapshot returns current cumulative totals under lock.
 func (t *Tracker) Snapshot() (totalTokensSaved int64, totalCostAvoided float64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.TotalTokensSaved, t.TotalCostAvoided
+	return t.totalTokensSaved, t.totalCostAvoided
 }
 
 func newInstallID() string {

@@ -516,7 +516,7 @@ func TestGetCodeSnippet_MetaField(t *testing.T) {
 	tokensSaved, _ := meta["tokens_saved"].(float64)
 	baselineTokens, _ := meta["baseline_tokens"].(float64)
 	responseTokens, _ := meta["response_tokens"].(float64)
-	compressionRatio, _ := meta["compression_ratio"].(float64)
+	reductionRatio, _ := meta["reduction_ratio"].(float64)
 
 	if tokensSaved < 0 {
 		t.Errorf("tokens_saved should be >= 0, got %v", tokensSaved)
@@ -527,7 +527,7 @@ func TestGetCodeSnippet_MetaField(t *testing.T) {
 	if responseTokens <= 0 {
 		t.Errorf("response_tokens should be > 0, got %v", responseTokens)
 	}
-	if compressionRatio <= 0 {
-		t.Errorf("compression_ratio should be > 0, got %v", compressionRatio)
+	if reductionRatio <= 0 {
+		t.Errorf("reduction_ratio should be > 0, got %v", reductionRatio)
 	}
 }

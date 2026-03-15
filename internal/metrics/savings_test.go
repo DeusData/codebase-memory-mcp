@@ -23,7 +23,7 @@ func TestCalculateSavings(t *testing.T) {
 		responseBytes        int
 		pricePerToken        float64
 		wantTokensSaved      int
-		wantCompressionRatio float64
+		wantReductionRatio float64
 	}{
 		{
 			name:                 "NormalCase",
@@ -31,7 +31,7 @@ func TestCalculateSavings(t *testing.T) {
 			responseBytes:        400,
 			pricePerToken:        0.000015,
 			wantTokensSaved:      900,
-			wantCompressionRatio: 0.1,
+			wantReductionRatio: 0.1,
 		},
 		{
 			name:                 "NoSavings",
@@ -39,7 +39,7 @@ func TestCalculateSavings(t *testing.T) {
 			responseBytes:        200,
 			pricePerToken:        0.000015,
 			wantTokensSaved:      0,
-			wantCompressionRatio: 2.0,
+			wantReductionRatio: 2.0,
 		},
 		{
 			name:                 "ZeroBaseline",
@@ -47,7 +47,7 @@ func TestCalculateSavings(t *testing.T) {
 			responseBytes:        400,
 			pricePerToken:        0.000015,
 			wantTokensSaved:      0,
-			wantCompressionRatio: 0.0,
+			wantReductionRatio: 0.0,
 		},
 		{
 			name:                 "ZeroBoth",
@@ -55,7 +55,7 @@ func TestCalculateSavings(t *testing.T) {
 			responseBytes:        0,
 			pricePerToken:        0.000015,
 			wantTokensSaved:      0,
-			wantCompressionRatio: 0.0,
+			wantReductionRatio: 0.0,
 		},
 	}
 
@@ -65,8 +65,8 @@ func TestCalculateSavings(t *testing.T) {
 			if got.TokensSaved != tt.wantTokensSaved {
 				t.Errorf("TokensSaved = %d, want %d", got.TokensSaved, tt.wantTokensSaved)
 			}
-			if got.CompressionRatio != tt.wantCompressionRatio {
-				t.Errorf("CompressionRatio = %v, want %v", got.CompressionRatio, tt.wantCompressionRatio)
+			if got.ReductionRatio != tt.wantReductionRatio {
+				t.Errorf("ReductionRatio = %v, want %v", got.ReductionRatio, tt.wantReductionRatio)
 			}
 		})
 	}
@@ -137,8 +137,8 @@ func TestTracker_LoadExisting(t *testing.T) {
 	}
 
 	tr := NewTracker(path)
-	if tr.InstallID != "abc123" {
-		t.Errorf("InstallID = %q, want %q", tr.InstallID, "abc123")
+	if tr.installID != "abc123" {
+		t.Errorf("InstallID = %q, want %q", tr.installID, "abc123")
 	}
 
 	tr.Record(TokenMetadata{TokensSaved: 200})
