@@ -1,8 +1,10 @@
 package pipeline
 
 import (
+	"fmt"
 	"log/slog"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/DeusData/codebase-memory-mcp/internal/cbm"
@@ -19,10 +21,29 @@ type cachedExtraction struct {
 	Language lang.Language
 }
 
+// Per-language file size limits to prevent tree-sitter stack overflows.
+// SQL deeply recurses on bulk INSERTs; Windows has a 1MB default C stack.
+const (
+	maxSQLFileSize     = 1 << 20 // 1 MB
+	maxGeneralFileSize = 4 << 20 // 4 MB
+)
+
 // cbmParseFile reads a file, calls cbm.ExtractFile(), and converts the
 // result to the same parseResult format used by the batch write infrastructure.
 // This replaces parseFileAST() — all AST walking happens in C.
 func cbmParseFile(projectName string, f discover.FileInfo) *parseResult {
+	// Guard: SQL tree-sitter grammar deeply recurses on large files (bulk INSERT
+	// dumps), exhausting the C stack — especially on Windows (1 MB default).
+	if f.Language == lang.SQL && f.Size > maxSQLFileSize {
+		slog.Info("cbm.skip.large_sql", "path", f.RelPath, "size", f.Size)
+		return &parseResult{File: f, Err: fmt.Errorf("skipped: SQL file too large (%d bytes, max %d)", f.Size, maxSQLFileSize)}
+	}
+	// General safety: files > 4 MB are likely generated/vendored and risk OOM or stack issues.
+	if f.Size > maxGeneralFileSize {
+		slog.Info("cbm.skip.large_file", "path", f.RelPath, "size", f.Size)
+		return &parseResult{File: f, Err: fmt.Errorf("skipped: file too large (%d bytes, max %d)", f.Size, maxGeneralFileSize)}
+	}
+
 	source, cleanup, err := mmapFile(f.Path)
 	if cleanup != nil {
 		defer cleanup()
@@ -252,6 +273,12 @@ func (p *Pipeline) resolveFileCallsCBM(relPath string, ext *cachedExtraction) []
 			edges = append(edges, edge)
 		}
 	}
+
+	// Python: track FastAPI Depends(func_ref) as CALLS edges
+	edges = append(edges, p.extractPythonDependsEdges(relPath, ext)...)
+
+	// C/C++: track dynamic DLL resolution (GetProcAddress/dlsym/Resolve) as CALLS edges
+	edges = append(edges, p.extractDLLResolveEdges(relPath, ext)...)
 
 	return edges
 }
@@ -602,4 +629,233 @@ func isCheckedException(excName string) bool {
 		return true
 	}
 	return false
+}
+
+// --- Python FastAPI Depends() tracking (#27) ---
+
+// pythonDependsRe matches Depends(func_ref) patterns in Python function signatures.
+// Captures the function reference passed to Depends().
+var pythonDependsRe = regexp.MustCompile(`Depends\(\s*([\w.]+)`)
+
+// extractPythonDependsEdges scans Python function signatures for Depends(func_ref)
+// patterns and creates CALLS edges from the endpoint to the dependency function.
+// Without this, functions referenced via Depends() appear as dead code (in_degree=0).
+func (p *Pipeline) extractPythonDependsEdges(relPath string, ext *cachedExtraction) []resolvedEdge {
+	if ext.Language != lang.Python || ext.Result == nil {
+		return nil
+	}
+
+	// Early bail: check if any call in this file targets "Depends"
+	hasDependsCall := false
+	for _, call := range ext.Result.Calls {
+		if call.CalleeName == "Depends" || strings.HasSuffix(call.CalleeName, ".Depends") {
+			hasDependsCall = true
+			break
+		}
+	}
+	if !hasDependsCall {
+		return nil
+	}
+
+	// Read full file source
+	source := readFileSource(p.RepoPath, relPath)
+	if len(source) == 0 {
+		return nil
+	}
+	lines := strings.Split(string(source), "\n")
+
+	moduleQN := fqn.ModuleQN(p.ProjectName, relPath)
+	importMap := p.importMaps[moduleQN]
+
+	var edges []resolvedEdge
+	seen := make(map[[2]string]bool)
+
+	for _, def := range ext.Result.Definitions {
+		if def.Label != "Function" && def.Label != "Method" {
+			continue
+		}
+		if def.StartLine <= 0 {
+			continue
+		}
+
+		// Extract function signature lines (def line through closing paren + colon).
+		// Signatures can span multiple lines in Python.
+		sigEnd := def.StartLine + 15 // scan up to 15 lines for multi-line signatures
+		if def.EndLine > 0 && sigEnd > def.EndLine {
+			sigEnd = def.EndLine
+		}
+		if sigEnd > len(lines) {
+			sigEnd = len(lines)
+		}
+
+		var sig strings.Builder
+		for i := def.StartLine - 1; i < sigEnd; i++ {
+			sig.WriteString(lines[i])
+			sig.WriteByte('\n')
+			trimmed := strings.TrimSpace(lines[i])
+			// Stop once we hit the colon that ends the function definition
+			if strings.HasSuffix(trimmed, "):") || strings.HasSuffix(trimmed, ") :") ||
+				strings.HasSuffix(trimmed, ") -> None:") || strings.Contains(trimmed, ") ->") {
+				break
+			}
+		}
+
+		sigStr := sig.String()
+		matches := pythonDependsRe.FindAllStringSubmatch(sigStr, -1)
+		for _, m := range matches {
+			funcRef := m[1]
+			if funcRef == "" {
+				continue
+			}
+
+			key := [2]string{def.QualifiedName, funcRef}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+
+			result := p.registry.Resolve(funcRef, moduleQN, importMap)
+			if result.QualifiedName == "" {
+				continue
+			}
+
+			edges = append(edges, resolvedEdge{
+				CallerQN: def.QualifiedName,
+				TargetQN: result.QualifiedName,
+				Type:     "CALLS",
+				Properties: map[string]any{
+					"confidence":          0.95,
+					"confidence_band":     "high",
+					"resolution_strategy": "fastapi_depends",
+				},
+			})
+		}
+	}
+
+	if len(edges) > 0 {
+		slog.Info("pass3.fastapi_depends", "file", relPath, "edges", len(edges))
+	}
+	return edges
+}
+
+// --- C/C++ dynamic DLL resolution tracking (#29) ---
+
+// DLL resolution patterns for C/C++ dynamic linking.
+var (
+	// GetProcAddress(handle, "FunctionName") — Win32 API
+	dllGetProcAddrRe = regexp.MustCompile(`GetProcAddress\s*\(\s*\w+\s*,\s*["'](\w+)["']`)
+	// dlsym(handle, "function_name") — POSIX
+	dllDlsymRe = regexp.MustCompile(`dlsym\s*\(\s*\w+\s*,\s*["'](\w+)["']`)
+	// obj.Resolve("FunctionName") or obj->Resolve("FunctionName") — custom DLL loaders
+	dllResolveRe = regexp.MustCompile(`(?:->|\.)\s*Resolve\s*\(\s*["'](\w+)["']`)
+	// LoadLibrary("dll_name.dll") or dlopen("lib.so") — DLL name extraction
+	dllLoadRe = regexp.MustCompile(`(?:LoadLibrary[AW]?|dlopen)\s*\(\s*["']([^"']+)["']`)
+)
+
+// extractDLLResolveEdges scans C/C++ function source for dynamic DLL resolution
+// patterns (GetProcAddress, dlsym, Resolve) and creates CALLS edges to synthetic
+// external function nodes, enabling call graph tracking across DLL boundaries.
+func (p *Pipeline) extractDLLResolveEdges(relPath string, ext *cachedExtraction) []resolvedEdge {
+	if ext.Language != lang.CPP && ext.Language != lang.C {
+		return nil
+	}
+	if ext.Result == nil {
+		return nil
+	}
+
+	// Early bail: check if any call targets a DLL resolution function
+	hasDLLCall := false
+	for _, call := range ext.Result.Calls {
+		name := call.CalleeName
+		if name == "GetProcAddress" || name == "GetProcAddressA" || name == "GetProcAddressW" ||
+			name == "dlsym" || strings.HasSuffix(name, ".Resolve") || strings.HasSuffix(name, "->Resolve") {
+			hasDLLCall = true
+			break
+		}
+	}
+	if !hasDLLCall {
+		return nil
+	}
+
+	// Read full file source
+	source := readFileSource(p.RepoPath, relPath)
+	if len(source) == 0 {
+		return nil
+	}
+	sourceStr := string(source)
+	sourceLines := strings.Split(sourceStr, "\n")
+
+	// Extract DLL name from LoadLibrary/dlopen calls (best-effort)
+	dllName := "external"
+	if m := dllLoadRe.FindStringSubmatch(sourceStr); m != nil {
+		dllName = filepath.Base(m[1])
+		// Strip extension
+		if ext := filepath.Ext(dllName); ext != "" {
+			dllName = strings.TrimSuffix(dllName, ext)
+		}
+	}
+
+	moduleQN := fqn.ModuleQN(p.ProjectName, relPath)
+
+	var edges []resolvedEdge
+	seen := make(map[[2]string]bool)
+
+	for _, def := range ext.Result.Definitions {
+		if def.Label != "Function" && def.Label != "Method" {
+			continue
+		}
+		if def.StartLine <= 0 || def.EndLine <= 0 {
+			continue
+		}
+
+		// Extract function body source
+		endLine := def.EndLine
+		if endLine > len(sourceLines) {
+			endLine = len(sourceLines)
+		}
+		var body strings.Builder
+		for i := def.StartLine - 1; i < endLine; i++ {
+			body.WriteString(sourceLines[i])
+			body.WriteByte('\n')
+		}
+		bodyStr := body.String()
+
+		// Match DLL resolution patterns
+		for _, re := range []*regexp.Regexp{dllGetProcAddrRe, dllDlsymRe, dllResolveRe} {
+			for _, m := range re.FindAllStringSubmatch(bodyStr, -1) {
+				funcName := m[1]
+				if funcName == "" {
+					continue
+				}
+
+				callerQN := def.QualifiedName
+				targetQN := moduleQN + ".dll." + dllName + "." + funcName
+
+				key := [2]string{callerQN, targetQN}
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+
+				edges = append(edges, resolvedEdge{
+					CallerQN: callerQN,
+					TargetQN: targetQN,
+					Type:     "CALLS",
+					Properties: map[string]any{
+						"confidence":          0.85,
+						"confidence_band":     "high",
+						"resolution_strategy": "dll_resolve",
+						"dll_name":            dllName,
+						"dll_function":        funcName,
+					},
+				})
+			}
+		}
+	}
+
+	if len(edges) > 0 {
+		slog.Info("pass3.dll_resolve", "file", relPath, "edges", len(edges))
+	}
+
+	return edges
 }

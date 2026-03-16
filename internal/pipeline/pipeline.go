@@ -1328,9 +1328,9 @@ func collectEdgeQNs(results [][]resolvedEdge) (qnSet map[string]struct{}, totalE
 	return qnSet, totalEdges
 }
 
-// createLSPStubNodes creates stub nodes for LSP-resolved targets that don't exist in the graph.
-// This happens for stdlib/external methods (e.g., context.Context.Done) that
-// the LSP resolver correctly identifies but aren't indexed as nodes.
+// createLSPStubNodes creates stub nodes for targets that don't exist in the graph.
+// This handles LSP-resolved targets (stdlib/external methods) and DLL-resolved
+// targets (dynamic DLL function references from GetProcAddress/dlsym/Resolve).
 func (p *Pipeline) createLSPStubNodes(results [][]resolvedEdge, qnToID map[string]int64) {
 	var stubs []*store.Node
 	stubQNs := make(map[string]bool)
@@ -1343,7 +1343,7 @@ func (p *Pipeline) createLSPStubNodes(results [][]resolvedEdge, qnToID map[strin
 				continue
 			}
 			strategy, _ := re.Properties["resolution_strategy"].(string)
-			if !strings.HasPrefix(strategy, "lsp_") {
+			if !strings.HasPrefix(strategy, "lsp_") && strategy != "dll_resolve" {
 				continue
 			}
 			stubQNs[re.TargetQN] = true
@@ -1355,12 +1355,21 @@ func (p *Pipeline) createLSPStubNodes(results [][]resolvedEdge, qnToID map[strin
 			if strings.Count(re.TargetQN, ".") >= 2 {
 				label = "Method"
 			}
+
+			props := map[string]any{"stub": true, "source": strategy}
+			// Carry over DLL metadata for DLL-resolved stubs
+			if strategy == "dll_resolve" {
+				if dllName, ok := re.Properties["dll_name"].(string); ok {
+					props["dll_name"] = dllName
+				}
+			}
+
 			stubs = append(stubs, &store.Node{
 				Project:       p.ProjectName,
 				Label:         label,
 				Name:          name,
 				QualifiedName: re.TargetQN,
-				Properties:    map[string]any{"stub": true, "source": "lsp_resolution"},
+				Properties:    props,
 			})
 		}
 	}

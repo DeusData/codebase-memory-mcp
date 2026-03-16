@@ -375,14 +375,22 @@ func (l *Linker) discoverRoutes(rootPath string) []RouteHandler {
 		// C# ASP.NET: check attribute decorators
 		routes = append(routes, extractASPNetRoutes(f)...)
 
-		// Source-based route discovery (Go gin, Express.js, PHP Laravel, Kotlin Ktor)
+		// Source-based route discovery — each extractor only runs on its own language's files
+		// to prevent false positives (e.g., Python dict .get() matching Ktor/Go route regex).
 		if f.FilePath != "" && f.StartLine > 0 && f.EndLine > 0 {
+			ext := strings.ToLower(filepath.Ext(f.FilePath))
 			source := readSourceLines(rootPath, f.FilePath, f.StartLine, f.EndLine)
 			if source != "" {
-				routes = append(routes, extractGoRoutes(f, source)...)
-				routes = append(routes, extractExpressRoutes(f, source)...)
-				routes = append(routes, extractLaravelRoutes(f, source)...)
-				routes = append(routes, extractKtorRoutes(f, source)...)
+				switch ext {
+				case ".go":
+					routes = append(routes, extractGoRoutes(f, source)...)
+				case ".js", ".ts", ".mjs", ".mts", ".jsx", ".tsx":
+					routes = append(routes, extractExpressRoutes(f, source)...)
+				case ".php":
+					routes = append(routes, extractLaravelRoutes(f, source)...)
+				case ".kt", ".kts":
+					routes = append(routes, extractKtorRoutes(f, source)...)
+				}
 			}
 		}
 
