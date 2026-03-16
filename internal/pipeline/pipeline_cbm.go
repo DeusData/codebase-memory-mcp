@@ -716,7 +716,18 @@ func (p *Pipeline) extractPythonDependsEdges(relPath string, ext *cachedExtracti
 
 			result := p.registry.Resolve(funcRef, moduleQN, importMap)
 			if result.QualifiedName == "" {
-				continue
+				// Fallback for import aliases: Depends(_dep_require_admin) where
+				// _dep_require_admin is aliased from "require_admin". Extract the
+				// original function name from the import path and retry.
+				if importPath, ok := importMap[funcRef]; ok {
+					if lastDot := strings.LastIndex(importPath, "."); lastDot >= 0 {
+						originalName := importPath[lastDot+1:]
+						result = p.registry.Resolve(originalName, moduleQN, importMap)
+					}
+				}
+				if result.QualifiedName == "" {
+					continue
+				}
 			}
 
 			edges = append(edges, resolvedEdge{
