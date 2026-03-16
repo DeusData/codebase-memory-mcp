@@ -375,14 +375,25 @@ func (l *Linker) discoverRoutes(rootPath string) []RouteHandler {
 		// C# ASP.NET: check attribute decorators
 		routes = append(routes, extractASPNetRoutes(f)...)
 
-		// Source-based route discovery (Go gin, Express.js, PHP Laravel, Kotlin Ktor)
+		// Source-based route discovery — scoped by file extension to avoid
+		// cross-framework false positives (e.g. Ktor regex matching PHP Cache::get)
 		if f.FilePath != "" && f.StartLine > 0 && f.EndLine > 0 {
 			source := readSourceLines(rootPath, f.FilePath, f.StartLine, f.EndLine)
 			if source != "" {
-				routes = append(routes, extractGoRoutes(f, source)...)
-				routes = append(routes, extractExpressRoutes(f, source)...)
-				routes = append(routes, extractLaravelRoutes(f, source)...)
-				routes = append(routes, extractKtorRoutes(f, source)...)
+				fp := f.FilePath
+				if strings.HasSuffix(fp, ".go") {
+					routes = append(routes, extractGoRoutes(f, source)...)
+				}
+				if strings.HasSuffix(fp, ".js") || strings.HasSuffix(fp, ".ts") ||
+					strings.HasSuffix(fp, ".mjs") || strings.HasSuffix(fp, ".mts") {
+					routes = append(routes, extractExpressRoutes(f, source)...)
+				}
+				if strings.HasSuffix(fp, ".php") {
+					routes = append(routes, extractLaravelRoutes(f, source)...)
+				}
+				if strings.HasSuffix(fp, ".kt") || strings.HasSuffix(fp, ".kts") {
+					routes = append(routes, extractKtorRoutes(f, source)...)
+				}
 			}
 		}
 
@@ -711,8 +722,15 @@ func extractLaravelRoutes(f *store.Node, source string) []RouteHandler {
 			handlerRef = atm[3] // method name from "Controller@method"
 		}
 
+		path := rm[2]
+		// Skip non-route strings that match the regex but contain characters
+		// invalid in URL paths (e.g., cache keys, interpolated expressions).
+		if strings.ContainsAny(path, "$:") {
+			continue
+		}
+
 		routes = append(routes, RouteHandler{
-			Path:          rm[2],
+			Path:          path,
 			Method:        strings.ToUpper(rm[1]),
 			FunctionName:  f.Name,
 			QualifiedName: f.QualifiedName,
