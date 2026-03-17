@@ -16,16 +16,16 @@ jobs:
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsqlite3-dev zlib1g-dev cppcheck clang-tidy clang-format
+          sudo apt-get install -y libsqlite3-dev zlib1g-dev cppcheck
 
       - name: clang-format
-        run: make -f Makefile.cbm lint-format
+        run: make -f Makefile.cbm lint-format CLANG_FORMAT=clang-format-18
 
       - name: cppcheck
         run: make -f Makefile.cbm lint-cppcheck
 
       - name: clang-tidy
-        run: make -f Makefile.cbm lint-tidy
+        run: make -f Makefile.cbm lint-tidy CLANG_TIDY=clang-tidy-18
 
   # ── Step 2: Unit tests (ASan + UBSan) ────────────────────────
   test:

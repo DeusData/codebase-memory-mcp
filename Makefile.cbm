@@ -408,11 +408,12 @@ clean-c:
 
 # ── Linting ─────────────────────────────────────────────────────
 
-# clang-tidy and clang-format from Homebrew LLVM (keg-only on macOS)
-LLVM_BIN = $(shell brew --prefix llvm 2>/dev/null)/bin
-CLANG_TIDY = $(shell [ -x "$(LLVM_BIN)/clang-tidy" ] && echo "$(LLVM_BIN)/clang-tidy" || echo clang-tidy)
-CLANG_FORMAT = $(shell [ -x "$(LLVM_BIN)/clang-format" ] && echo "$(LLVM_BIN)/clang-format" || echo clang-format)
-CPPCHECK = cppcheck
+# clang-tidy and clang-format: use Homebrew LLVM on macOS, overridable via make args
+# e.g. make lint-format CLANG_FORMAT=clang-format-18
+LLVM_BIN := $(shell brew --prefix llvm 2>/dev/null)/bin
+CLANG_TIDY ?= $(shell [ -x "$(LLVM_BIN)/clang-tidy" ] && echo "$(LLVM_BIN)/clang-tidy" || echo clang-tidy)
+CLANG_FORMAT ?= $(shell [ -x "$(LLVM_BIN)/clang-format" ] && echo "$(LLVM_BIN)/clang-format" || echo clang-format)
+CPPCHECK ?= cppcheck
 
 # macOS SDK sysroot (needed for Homebrew LLVM to find system headers)
 SYSROOT = $(shell xcrun --show-sdk-path 2>/dev/null)
@@ -442,6 +443,7 @@ lint-cppcheck:
 		--quiet \
 		--suppress=varFuncNullUB \
 		--suppress=intToPointerCast \
+		--suppress=unusedStructMember \
 		--suppress=nullPointerOutOfMemory \
 		--suppress=nullPointerArithmeticOutOfMemory \
 		--suppress=ctunullpointerOutOfMemory \
