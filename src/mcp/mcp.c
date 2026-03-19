@@ -343,9 +343,7 @@ char *cbm_mcp_initialize_response(void) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
-    yyjson_mut_val *proto = yyjson_mut_obj(doc);
-    yyjson_mut_obj_add_str(doc, proto, "version", "2024-11-05");
-    yyjson_mut_obj_add_val(doc, root, "protocolVersion", proto);
+    yyjson_mut_obj_add_str(doc, root, "protocolVersion", "2024-11-05");
 
     yyjson_mut_val *impl = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_str(doc, impl, "name", "codebase-memory-mcp");
