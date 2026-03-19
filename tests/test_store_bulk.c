@@ -141,6 +141,8 @@ TEST(bulk_crash_recovery) {
     ASSERT_GT(pid, 0);
     int status;
     waitpid(pid, &status, 0);
+    /* Confirm child exited normally so the write actually occurred. */
+    ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 
     /* Recovery: database must open cleanly. */
     cbm_store_t *recovered = cbm_store_open_path(db_path);
