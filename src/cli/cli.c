@@ -2126,6 +2126,12 @@ int cbm_cmd_install(int argc, char **argv) {
         printf("  hooks: PreToolUse (Grep|Glob reminder)\n");
     }
 
+    /* Steps 5-12: Global agent installs — skipped when --project is used
+     * because those tools use their own global config directories, not the
+     * project-local .claude/ tree. */
+    const char *shell_rc = "";
+    if (!has_project) {
+
     /* Step 5: Install Codex CLI */
     if (agents.codex) {
         printf("Codex CLI:\n");
@@ -2255,18 +2261,23 @@ int cbm_cmd_install(int argc, char **argv) {
     /* Step 12: Ensure PATH */
     char bin_dir[1024];
     snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
-    const char *rc = cbm_detect_shell_rc(home);
-    if (rc[0]) {
-        int path_rc = cbm_ensure_path(bin_dir, rc, dry_run);
+    shell_rc = cbm_detect_shell_rc(home);
+    if (shell_rc[0]) {
+        int path_rc = cbm_ensure_path(bin_dir, shell_rc, dry_run);
         if (path_rc == 0) {
-            printf("\nAdded %s to PATH in %s\n", bin_dir, rc);
+            printf("\nAdded %s to PATH in %s\n", bin_dir, shell_rc);
         } else if (path_rc == 1) {
             printf("\nPATH already includes %s\n", bin_dir);
         }
     }
 
-    printf("\nInstall complete. Restart your shell or run:\n");
-    printf("  source %s\n", rc);
+    } /* end if (!has_project) */
+
+    printf("\nInstall complete.");
+    if (!has_project && shell_rc[0]) {
+        printf(" Restart your shell or run:\n  source %s", shell_rc);
+    }
+    printf("\n");
     if (dry_run) {
         printf("\n(dry-run — no files were modified)\n");
     }
@@ -2503,6 +2514,25 @@ int cbm_cmd_uninstall(int argc, char **argv) {
 int cbm_cmd_update(int argc, char **argv) {
     parse_auto_answer(argc, argv);
 
+    bool has_project = false;
+    char project_path[1024];
+    project_path[0] = '\0';
+
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--project") == 0) {
+            has_project = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                snprintf(project_path, sizeof(project_path), "%s", argv[i + 1]);
+                i++;
+            } else {
+                if (!getcwd(project_path, sizeof(project_path))) {
+                    fprintf(stderr, "error: getcwd failed\n");
+                    return 1;
+                }
+            }
+        }
+    }
+
     const char *home = getenv("HOME");
     if (!home) {
         fprintf(stderr, "error: HOME not set\n");
@@ -2673,7 +2703,16 @@ int cbm_cmd_update(int argc, char **argv) {
     char skills_dir[1024];
     snprintf(skills_dir, sizeof(skills_dir), "%s/skills", claude_dir_upd);
     int skill_count = cbm_install_skills(skills_dir, true, false);
-    printf("Updated %d skill(s).\n", skill_count);
+    printf("Updated %d global skill(s).\n", skill_count);
+
+    /* Also update project-local skills if --project was specified. */
+    if (has_project) {
+        char proj_skills_dir[1024];
+        snprintf(proj_skills_dir, sizeof(proj_skills_dir), "%s/.claude/skills", project_path);
+        int proj_skill_count = cbm_install_skills(proj_skills_dir, true, false);
+        printf("Updated %d project skill(s) in %s/.claude/skills.\n", proj_skill_count,
+               project_path);
+    }
 
     /* Step 7: Verify new version */
     printf("\nUpdate complete. Verifying:\n");
