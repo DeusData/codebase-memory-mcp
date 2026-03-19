@@ -2353,6 +2353,10 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         printf("  removed PreToolUse hook\n");
     }
 
+    /* Steps below (other agents, indexes, binary) are global-only — skip when
+     * --project is used so only the project-local .claude/ tree is touched. */
+    if (!has_project) {
+
     if (agents.codex) {
         char config_path[1024];
         snprintf(config_path, sizeof(config_path), "%s/.codex/config.toml", home);
@@ -2501,6 +2505,8 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         }
         printf("Removed %s\n", bin_path);
     }
+
+    } /* end if (!has_project) */
 
     printf("\nUninstall complete.\n");
     if (dry_run) {
