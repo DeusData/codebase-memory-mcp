@@ -140,7 +140,12 @@ int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type);
 int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path);
 
 /* Flush the buffer to an existing store via the store API.
- * Used for incremental indexing. Returns 0 on success. */
+ * Deletes existing project data first. Returns 0 on success. */
 int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store);
+
+/* Merge the buffer into an existing store WITHOUT deleting existing data.
+ * Upserts nodes, inserts edges. Used for incremental indexing.
+ * Returns 0 on success. */
+int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store);
 
 #endif /* CBM_GRAPH_BUFFER_H */

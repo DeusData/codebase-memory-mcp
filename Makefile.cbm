@@ -159,6 +159,7 @@ PIPELINE_SRCS = \
     src/pipeline/fqn.c \
     src/pipeline/registry.c \
     src/pipeline/pipeline.c \
+    src/pipeline/pipeline_incremental.c \
     src/pipeline/worker_pool.c \
     src/pipeline/pass_parallel.c \
     src/pipeline/pass_definitions.c \

@@ -1082,3 +1082,62 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     free(temp_to_real);
     return 0;
 }
+
+int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store) {
+    if (!gb || !store) {
+        return -1;
+    }
+
+    /* Begin bulk mode — no project wipe */
+    cbm_store_begin(store);
+
+    /* Build temp_id → real_id map */
+    int64_t max_temp_id = gb->next_id;
+    int64_t *temp_to_real = calloc(max_temp_id, sizeof(int64_t));
+
+    for (int i = 0; i < gb->nodes.count; i++) {
+        cbm_gbuf_node_t *n = gb->nodes.items[i];
+
+        if (!cbm_ht_get(gb->node_by_qn, n->qualified_name)) {
+            continue;
+        }
+
+        cbm_node_t sn = {
+            .project = gb->project,
+            .label = n->label,
+            .name = n->name,
+            .qualified_name = n->qualified_name,
+            .file_path = n->file_path,
+            .start_line = n->start_line,
+            .end_line = n->end_line,
+            .properties_json = n->properties_json,
+        };
+        int64_t real_id = cbm_store_upsert_node(store, &sn);
+        if (real_id > 0 && n->id < max_temp_id) {
+            temp_to_real[n->id] = real_id;
+        }
+    }
+
+    for (int i = 0; i < gb->edges.count; i++) {
+        cbm_gbuf_edge_t *e = gb->edges.items[i];
+        int64_t real_src = (e->source_id < max_temp_id) ? temp_to_real[e->source_id] : 0;
+        int64_t real_tgt = (e->target_id < max_temp_id) ? temp_to_real[e->target_id] : 0;
+        if (real_src == 0 || real_tgt == 0) {
+            continue;
+        }
+
+        cbm_edge_t se = {
+            .project = gb->project,
+            .source_id = real_src,
+            .target_id = real_tgt,
+            .type = e->type,
+            .properties_json = e->properties_json,
+        };
+        cbm_store_insert_edge(store, &se);
+    }
+
+    cbm_store_commit(store);
+
+    free(temp_to_real);
+    return 0;
+}

@@ -377,7 +377,7 @@ static const char *swift_class_types[] = {"class_declaration", "protocol_declara
                                           "struct_declaration", "enum_declaration", NULL};
 static const char *swift_field_types[] = {"property_declaration", NULL};
 static const char *swift_module_types[] = {"source_file", NULL};
-static const char *swift_call_types[] = {"call_expression", NULL};
+static const char *swift_call_types[] = {"call_expression", "constructor_expression", NULL};
 static const char *swift_import_types[] = {"import_declaration", NULL};
 static const char *swift_branch_types[] = {"if_statement",    "guard_statement",  "for_statement",
                                            "while_statement", "switch_statement", NULL};

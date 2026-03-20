@@ -4700,6 +4700,192 @@ TEST(registry_find_ending_with) {
     PASS();
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ *  Incremental reindex tests
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Helper: create a simple 2-file Go project for incremental tests */
+static char g_incr_tmpdir[256];
+static char g_incr_dbpath[512];
+
+static int setup_incremental_repo(void) {
+    snprintf(g_incr_tmpdir, sizeof(g_incr_tmpdir), "/tmp/cbm_incr_XXXXXX");
+    if (!cbm_mkdtemp(g_incr_tmpdir)) {
+        return -1;
+    }
+    snprintf(g_incr_dbpath, sizeof(g_incr_dbpath), "%s/test.db", g_incr_tmpdir);
+
+    char path[512];
+    FILE *f;
+
+    /* main.go — calls Helper() */
+    snprintf(path, sizeof(path), "%s/main.go", g_incr_tmpdir);
+    f = fopen(path, "w");
+    if (!f) { return -1; }
+    fprintf(f, "package main\n\nfunc main() {\n\tHelper()\n}\n");
+    fclose(f);
+
+    /* helper.go — defines Helper() */
+    snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    f = fopen(path, "w");
+    if (!f) { return -1; }
+    fprintf(f, "package main\n\nfunc Helper() string {\n\treturn \"hello\"\n}\n");
+    fclose(f);
+
+    return 0;
+}
+
+static void cleanup_incremental_repo(void) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_incr_tmpdir);
+    (void)system(cmd);
+}
+
+TEST(incremental_full_then_noop) {
+    /* Full index, then re-run → should detect no changes and skip */
+    if (setup_incremental_repo() != 0) { SKIP("setup failed"); }
+
+    /* First: full index */
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    /* Verify nodes exist */
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_before = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_before, 0);
+    cbm_store_close(s);
+
+    /* Second: incremental — nothing changed → should be no-op */
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_after = cbm_store_count_nodes(s, project);
+    /* Node count should be same (no duplicates, no loss) */
+    ASSERT_EQ(nodes_after, nodes_before);
+    cbm_store_close(s);
+    free(project);
+
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_detects_changed_file) {
+    /* Full index, modify one file, re-index → changed file re-parsed */
+    if (setup_incremental_repo() != 0) { SKIP("setup failed"); }
+
+    /* First: full index */
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    /* Modify helper.go — add a new function */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package main\n\n"
+               "func Helper() string {\n\treturn \"hello\"\n}\n\n"
+               "func NewFunc() int {\n\treturn 42\n}\n");
+    fclose(f);
+
+    /* Second: incremental — should detect change and re-index */
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    /* Verify node count increased (NewFunc was added) */
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_after = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_after, 0);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    free(project);
+
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_detects_deleted_file) {
+    /* Full index, delete a file, re-index → deleted file's nodes removed */
+    if (setup_incremental_repo() != 0) { SKIP("setup failed"); }
+
+    /* First: full index */
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    /* Delete helper.go */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    unlink(path);
+
+    /* Second: incremental — should remove Helper nodes */
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    /* Verify node count decreased (Helper's file was deleted) */
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_after = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_after, 0); /* still has main.go nodes */
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    free(project);
+
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_new_file_added) {
+    /* Full index, add a new file, re-index → new file's nodes appear */
+    if (setup_incremental_repo() != 0) { SKIP("setup failed"); }
+
+    /* First: full index */
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    /* Add extra.go */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/extra.go", g_incr_tmpdir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package main\n\nfunc Extra() bool {\n\treturn true\n}\n");
+    fclose(f);
+
+    /* Second: incremental — should pick up Extra */
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_after = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_after, 0);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    free(project);
+
+    cleanup_incremental_repo();
+    PASS();
+}
+
 SUITE(pipeline) {
     /* Lifecycle */
     RUN_TEST(pipeline_create_free);
@@ -4875,4 +5061,9 @@ SUITE(pipeline) {
     RUN_TEST(githistory_compute_change_coupling);
     RUN_TEST(githistory_coupling_skips_large_commits);
     RUN_TEST(githistory_coupling_limits_output);
+    /* Incremental reindex */
+    RUN_TEST(incremental_full_then_noop);
+    RUN_TEST(incremental_detects_changed_file);
+    RUN_TEST(incremental_detects_deleted_file);
+    RUN_TEST(incremental_new_file_added);
 }

@@ -258,11 +258,13 @@ static const tool_def_t TOOLS[] = {
      "name\"]}"},
 
     {"get_code_snippet",
-     "Get source code for a specific function, class, or symbol by qualified name. Use INSTEAD OF "
-     "reading entire files when you need one function's implementation.",
-     "{\"type\":\"object\",\"properties\":{\"qualified_name\":{\"type\":\"string\"},\"project\":{"
-     "\"type\":\"string\"},\"auto_resolve\":{\"type\":\"boolean\",\"default\":false},\"include_"
-     "neighbors\":{\"type\":\"boolean\",\"default\":false}},\"required\":[\"qualified_name\"]}"},
+     "Read source code for a function/class/symbol. IMPORTANT: First call search_graph to find the "
+     "exact qualified_name, then pass it here. This is a read tool, not a search tool. Accepts "
+     "full qualified_name (exact match) or short function name (returns suggestions if ambiguous).",
+     "{\"type\":\"object\",\"properties\":{\"qualified_name\":{\"type\":\"string\",\"description\":"
+     "\"Full qualified_name from search_graph, or short function name\"},\"project\":{"
+     "\"type\":\"string\"},\"include_neighbors\":{"
+     "\"type\":\"boolean\",\"default\":false}},\"required\":[\"qualified_name\"]}"},
 
     {"get_graph_schema", "Get the schema of the knowledge graph (node labels, edge types)",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}}}"},
@@ -739,6 +741,24 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_arr_add_val(types, typ);
     }
     yyjson_mut_obj_add_val(doc, root, "edge_types", types);
+
+    /* Check ADR presence */
+    cbm_project_t proj_info = {0};
+    if (cbm_store_get_project(store, project, &proj_info) == 0 && proj_info.root_path) {
+        char adr_path[4096];
+        snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md", proj_info.root_path);
+        struct stat adr_st;
+        // NOLINTNEXTLINE(readability-implicit-bool-conversion)
+        bool adr_exists = (stat(adr_path, &adr_st) == 0);
+        yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
+        if (!adr_exists) {
+            yyjson_mut_obj_add_str(
+                doc, root, "adr_hint",
+                "No ADR found. Use manage_adr(mode='update') to persist architectural "
+                "decisions across sessions. Run get_architecture(aspects=['all']) first.");
+        }
+        cbm_project_free_fields(&proj_info);
+    }
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
@@ -1255,6 +1275,21 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             int edges = cbm_store_count_edges(store, project_name);
             yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
             yyjson_mut_obj_add_int(doc, root, "edges", edges);
+
+            /* Check ADR presence and suggest creation if missing */
+            char adr_path[4096];
+            snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md", repo_path);
+            struct stat adr_st;
+            // NOLINTNEXTLINE(readability-implicit-bool-conversion)
+            bool adr_exists = (stat(adr_path, &adr_st) == 0);
+            yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
+            if (!adr_exists) {
+                yyjson_mut_obj_add_str(
+                    doc, root, "adr_hint",
+                    "Project indexed. Consider creating an Architecture Decision Record: "
+                    "explore the codebase with get_architecture(aspects=['all']), then use "
+                    "manage_adr(mode='store') to persist architectural insights across sessions.");
+            }
         }
     }
 
@@ -1293,8 +1328,8 @@ static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count
 
     char msg[512];
     snprintf(msg, sizeof(msg),
-             "%d matches found for \"%s\" — use a qualified_name "
-             "from the suggestions to disambiguate",
+             "%d matches for \"%s\". Pick a qualified_name from suggestions below, "
+             "or use search_graph(name_pattern=\"...\") to narrow results.",
              count, input);
     yyjson_mut_obj_add_str(doc, root, "message", msg);
 
@@ -1472,36 +1507,40 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
 static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     char *qn = cbm_mcp_get_string_arg(args, "qualified_name");
     char *project = cbm_mcp_get_string_arg(args, "project");
-    cbm_store_t *store = resolve_store(srv, project);
-    bool auto_resolve = cbm_mcp_get_bool_arg(args, "auto_resolve");
     bool include_neighbors = cbm_mcp_get_bool_arg(args, "include_neighbors");
 
     if (!qn) {
         free(project);
         return cbm_mcp_text_result("qualified_name is required", true);
     }
+
+    cbm_store_t *store = resolve_store(srv, project);
     if (!store) {
         free(qn);
         free(project);
-        return cbm_mcp_text_result("{\"error\":\"no project loaded\"}", true);
+        return cbm_mcp_text_result("no project loaded — run index_repository first", true);
     }
+
+    /* Default to current project (same as all other tools) */
+    const char *effective_project = project ? project : srv->current_project;
 
     /* Tier 1: Exact QN match */
     cbm_node_t node = {0};
-    int rc = cbm_store_find_node_by_qn(store, project, qn, &node);
+    int rc = cbm_store_find_node_by_qn(store, effective_project, qn, &node);
     if (rc == CBM_STORE_OK) {
-        char *result =
-            build_snippet_response(srv, &node, NULL /*exact*/, include_neighbors, NULL, 0);
+        char *result = build_snippet_response(srv, &node, NULL, include_neighbors, NULL, 0);
         free_node_contents(&node);
         free(qn);
         free(project);
         return result;
     }
 
-    /* Tier 2: QN suffix match */
+    /* Tier 2: Suffix match — handles partial QNs ("main.HandleRequest")
+     * and short names ("ProcessOrder") via LIKE '%.X'. */
     cbm_node_t *suffix_nodes = NULL;
     int suffix_count = 0;
-    cbm_store_find_nodes_by_qn_suffix(store, project, qn, &suffix_nodes, &suffix_count);
+    cbm_store_find_nodes_by_qn_suffix(store, effective_project, qn, &suffix_nodes, &suffix_count);
+
     if (suffix_count == 1) {
         copy_node(&suffix_nodes[0], &node);
         cbm_store_free_nodes(suffix_nodes, suffix_count);
@@ -1512,154 +1551,23 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         return result;
     }
 
-    /* Tier 3: Short name match */
-    cbm_node_t *name_nodes = NULL;
-    int name_count = 0;
-    cbm_store_find_nodes_by_name(store, project, qn, &name_nodes, &name_count);
-    if (name_count == 1) {
-        copy_node(&name_nodes[0], &node);
-        cbm_store_free_nodes(name_nodes, name_count);
+    if (suffix_count > 1) {
+        char *result = snippet_suggestions(qn, suffix_nodes, suffix_count);
         cbm_store_free_nodes(suffix_nodes, suffix_count);
-        char *result = build_snippet_response(srv, &node, "name", include_neighbors, NULL, 0);
-        free_node_contents(&node);
-        free(qn);
-        free(project);
-        return result;
-    }
-
-    /* Ambiguous: collect candidates from suffix + name tiers (dedup by id) */
-    int total_cand = suffix_count + name_count;
-    if (total_cand > 0) {
-        /* Dedup by node ID */
-        cbm_node_t *candidates = calloc((size_t)total_cand, sizeof(cbm_node_t));
-        int cand_count = 0;
-
-        for (int i = 0; i < suffix_count; i++) {
-            copy_node(&suffix_nodes[i], &candidates[cand_count++]);
-        }
-        for (int i = 0; i < name_count; i++) {
-            bool dup = false;
-            for (int j = 0; j < cand_count; j++) {
-                if (candidates[j].id == name_nodes[i].id) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (!dup) {
-                copy_node(&name_nodes[i], &candidates[cand_count++]);
-            }
-        }
-
-        cbm_store_free_nodes(suffix_nodes, suffix_count);
-        cbm_store_free_nodes(name_nodes, name_count);
-
-        /* Auto-resolve: pick best candidate by degree */
-        if (auto_resolve && cand_count >= 2 && cand_count <= 2) {
-            /* Find best: highest total degree, prefer non-test files */
-            int best_idx = 0;
-            int best_deg = -1;
-            bool best_is_test = false;
-            for (int i = 0; i < cand_count; i++) {
-                int in_d = 0;
-                int out_d = 0;
-                cbm_store_node_degree(store, candidates[i].id, &in_d, &out_d);
-                int deg = in_d + out_d;
-                bool is_test =
-                    // NOLINTNEXTLINE(readability-implicit-bool-conversion)
-                    candidates[i].file_path && strstr(candidates[i].file_path, "_test") != NULL;
-                if (i == 0 || (best_is_test && !is_test) ||
-                    (!best_is_test == !is_test && deg > best_deg) ||
-                    (!best_is_test == !is_test && deg == best_deg && candidates[i].qualified_name &&
-                     best_idx >= 0 && candidates[best_idx].qualified_name &&
-                     strcmp(candidates[i].qualified_name, candidates[best_idx].qualified_name) <
-                         0)) {
-                    best_idx = i;
-                    best_deg = deg;
-                    best_is_test = is_test;
-                }
-            }
-
-            copy_node(&candidates[best_idx], &node);
-
-            /* Build alternatives list (skip the picked one) */
-            cbm_node_t *alts = calloc((size_t)(cand_count - 1), sizeof(cbm_node_t));
-            int alt_count = 0;
-            for (int i = 0; i < cand_count; i++) {
-                if (i != best_idx) {
-                    copy_node(&candidates[i], &alts[alt_count++]);
-                }
-            }
-
-            for (int i = 0; i < cand_count; i++) {
-                free_node_contents(&candidates[i]);
-            }
-            free(candidates);
-
-            char *result =
-                build_snippet_response(srv, &node, "auto_best", include_neighbors, alts, alt_count);
-            free_node_contents(&node);
-            for (int i = 0; i < alt_count; i++) {
-                free_node_contents(&alts[i]);
-            }
-            free(alts);
-            free(qn);
-            free(project);
-            return result;
-        }
-
-        /* Return suggestions */
-        char *result = snippet_suggestions(qn, candidates, cand_count);
-        for (int i = 0; i < cand_count; i++) {
-            free_node_contents(&candidates[i]);
-        }
-        free(candidates);
         free(qn);
         free(project);
         return result;
     }
 
     cbm_store_free_nodes(suffix_nodes, suffix_count);
-    cbm_store_free_nodes(name_nodes, name_count);
-
-    /* Tier 4: Fuzzy — try last segment for name-based search */
-    const char *dot = strrchr(qn, '.');
-    const char *search_name = dot ? dot + 1 : qn;
-
-    /* Use search with name pattern for fuzzy matching */
-    cbm_search_params_t params = {0};
-    params.project = project;
-    params.name_pattern = search_name;
-    params.limit = 5;
-    params.min_degree = -1;
-    params.max_degree = -1;
-    const char *excl[] = {"Community", NULL};
-    params.exclude_labels = excl;
-
-    cbm_search_output_t search_out = {0};
-    if (cbm_store_search(store, &params, &search_out) == CBM_STORE_OK && search_out.count > 0) {
-        /* Build suggestions from search results */
-        cbm_node_t *fuzzy = calloc((size_t)search_out.count, sizeof(cbm_node_t));
-        for (int i = 0; i < search_out.count; i++) {
-            copy_node(&search_out.results[i].node, &fuzzy[i]);
-        }
-        int fuzzy_count = search_out.count;
-        cbm_store_search_free(&search_out);
-
-        char *result = snippet_suggestions(qn, fuzzy, fuzzy_count);
-        for (int i = 0; i < fuzzy_count; i++) {
-            free_node_contents(&fuzzy[i]);
-        }
-        free(fuzzy);
-        free(qn);
-        free(project);
-        return result;
-    }
-    cbm_store_search_free(&search_out);
-
-    /* Nothing found */
     free(qn);
     free(project);
-    return cbm_mcp_text_result("symbol not found", true);
+
+    /* Nothing found — guide the caller toward search_graph */
+    return cbm_mcp_text_result(
+        "symbol not found. Use search_graph(name_pattern=\"...\") first to discover "
+        "the exact qualified_name, then pass it to get_code_snippet.",
+        true);
 }
 
 /* ── search_code ──────────────────────────────────────────────── */
@@ -1960,6 +1868,14 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
         } else {
             yyjson_mut_obj_add_str(doc, root_obj, "content", "");
             yyjson_mut_obj_add_str(doc, root_obj, "status", "no_adr");
+            yyjson_mut_obj_add_str(
+                doc, root_obj, "adr_hint",
+                "No ADR yet. Create one with manage_adr(mode='update', "
+                "content='## PURPOSE\\n...\\n\\n## STACK\\n...\\n\\n## ARCHITECTURE\\n..."
+                "\\n\\n## PATTERNS\\n...\\n\\n## TRADEOFFS\\n...\\n\\n## PHILOSOPHY\\n...'). "
+                "For guided creation: explore the codebase with get_architecture, "
+                "then draft and store. Sections: PURPOSE, STACK, ARCHITECTURE, "
+                "PATTERNS, TRADEOFFS, PHILOSOPHY.");
         }
     }
 

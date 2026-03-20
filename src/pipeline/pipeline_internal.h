@@ -401,4 +401,16 @@ typedef struct {
  * Returns number of bindings written to out (up to max_out). */
 int cbm_scan_project_env_urls(const char *root_path, cbm_env_binding_t *out, int max_out);
 
+/* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
+
+/* Run incremental re-index on an existing disk DB.
+ * Classifies files by mtime+size, deletes changed nodes, re-parses changed
+ * files, merges into disk DB. Returns 0 on success. */
+int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
+                                 int file_count);
+
+/* Pipeline accessors for incremental use */
+const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
+atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
+
 #endif /* CBM_PIPELINE_INTERNAL_H */

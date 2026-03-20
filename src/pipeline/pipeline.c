@@ -15,6 +15,7 @@
 // NOLINTNEXTLINE(misc-include-cleaner) — worker_pool.h included for interface contract
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
+#include "store/store.h"
 #include "discover/discover.h"
 #include "foundation/platform.h"
 #include "foundation/compat_fs.h"
@@ -28,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <sys/stat.h>
 #include <time.h>
 
 /* ── Internal state ──────────────────────────────────────────────── */
@@ -106,6 +108,33 @@ void cbm_pipeline_cancel(cbm_pipeline_t *p) {
 
 const char *cbm_pipeline_project_name(const cbm_pipeline_t *p) {
     return p ? p->project_name : NULL;
+}
+
+const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p) {
+    return p ? p->repo_path : NULL;
+}
+
+atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p) {
+    return p ? &p->cancelled : NULL;
+}
+
+/* Resolve the DB path for this pipeline. Caller must free(). */
+static char *resolve_db_path(const cbm_pipeline_t *p) {
+    char *path = malloc(1024);
+    if (!path) {
+        return NULL;
+    }
+    if (p->db_path) {
+        snprintf(path, 1024, "%s", p->db_path);
+    } else {
+        // NOLINTNEXTLINE(concurrency-mt-unsafe)
+        const char *home = getenv("HOME");
+        if (!home) {
+            home = "/tmp";
+        }
+        snprintf(path, 1024, "%s/.cache/codebase-memory-mcp/%s.db", home, p->project_name);
+    }
+    return path;
 }
 
 static int check_cancel(const cbm_pipeline_t *p) {
@@ -294,6 +323,36 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         cbm_discover_free(files, file_count);
         return -1;
     }
+
+    /* Check for existing DB with file hashes → incremental path */
+    {
+        char *db_path = resolve_db_path(p);
+        if (db_path) {
+            struct stat db_st;
+            if (stat(db_path, &db_st) == 0) {
+                /* DB exists — check if it has file hashes */
+                cbm_store_t *check_store = cbm_store_open_path(db_path);
+                if (check_store) {
+                    cbm_file_hash_t *hashes = NULL;
+                    int hash_count = 0;
+                    cbm_store_get_file_hashes(check_store, p->project_name, &hashes, &hash_count);
+                    cbm_store_free_file_hashes(hashes, hash_count);
+                    cbm_store_close(check_store);
+
+                    if (hash_count > 0) {
+                        cbm_log_info("pipeline.route", "path", "incremental", "stored_hashes",
+                                     itoa_buf(hash_count));
+                        rc = cbm_pipeline_run_incremental(p, db_path, files, file_count);
+                        cbm_discover_free(files, file_count);
+                        free(db_path);
+                        return rc;
+                    }
+                }
+            }
+            free(db_path);
+        }
+    }
+    cbm_log_info("pipeline.route", "path", "full");
 
     /* Phase 2: Create graph buffer and registry */
     p->gbuf = cbm_gbuf_new(p->project_name, p->repo_path);
@@ -649,6 +708,31 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
             goto cleanup;
         }
         cbm_log_info("pass.timing", "pass", "dump", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+
+        /* Persist file hashes so next run can use incremental path */
+        cbm_store_t *hash_store = cbm_store_open_path(db_path);
+        if (hash_store) {
+            cbm_store_delete_file_hashes(hash_store, p->project_name);
+            for (int i = 0; i < file_count; i++) {
+                struct stat fst;
+                if (stat(files[i].path, &fst) == 0) {
+                    int64_t mtime_ns;
+#ifdef __APPLE__
+                    mtime_ns = ((int64_t)fst.st_mtimespec.tv_sec * 1000000000LL) +
+                               (int64_t)fst.st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+                    mtime_ns = (int64_t)fst.st_mtime * 1000000000LL;
+#else
+                    mtime_ns =
+                        ((int64_t)fst.st_mtim.tv_sec * 1000000000LL) + (int64_t)fst.st_mtim.tv_nsec;
+#endif
+                    cbm_store_upsert_file_hash(hash_store, p->project_name, files[i].rel_path, "",
+                                               mtime_ns, fst.st_size);
+                }
+            }
+            cbm_store_close(hash_store);
+            cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
+        }
     }
 
     cbm_log_info("pipeline.done", "nodes", itoa_buf(cbm_gbuf_node_count(p->gbuf)), "edges",

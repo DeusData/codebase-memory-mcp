@@ -43,7 +43,9 @@ struct cbm_store {
     sqlite3_stmt *stmt_upsert_node;
     sqlite3_stmt *stmt_find_node_by_id;
     sqlite3_stmt *stmt_find_node_by_qn;
+    sqlite3_stmt *stmt_find_node_by_qn_any; /* QN lookup without project filter */
     sqlite3_stmt *stmt_find_nodes_by_name;
+    sqlite3_stmt *stmt_find_nodes_by_name_any; /* name lookup without project filter */
     sqlite3_stmt *stmt_find_nodes_by_label;
     sqlite3_stmt *stmt_find_nodes_by_file;
     sqlite3_stmt *stmt_count_nodes;
@@ -372,7 +374,9 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_upsert_node);
     finalize_stmt(&s->stmt_find_node_by_id);
     finalize_stmt(&s->stmt_find_node_by_qn);
+    finalize_stmt(&s->stmt_find_node_by_qn_any);
     finalize_stmt(&s->stmt_find_nodes_by_name);
+    finalize_stmt(&s->stmt_find_nodes_by_name_any);
     finalize_stmt(&s->stmt_find_nodes_by_label);
     finalize_stmt(&s->stmt_find_nodes_by_file);
     finalize_stmt(&s->stmt_count_nodes);
@@ -721,6 +725,64 @@ int cbm_store_find_node_by_qn(cbm_store_t *s, const char *project, const char *q
         return CBM_STORE_OK;
     }
     return CBM_STORE_NOT_FOUND;
+}
+
+int cbm_store_find_node_by_qn_any(cbm_store_t *s, const char *qn, cbm_node_t *out) {
+    if (!s || !s->db) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_find_node_by_qn_any,
+                       "SELECT id, project, label, name, qualified_name, file_path, "
+                       "start_line, end_line, properties FROM nodes "
+                       "WHERE qualified_name = ?1 LIMIT 1;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, 1, qn);
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        scan_node(stmt, out);
+        return CBM_STORE_OK;
+    }
+    return CBM_STORE_NOT_FOUND;
+}
+
+int cbm_store_find_nodes_by_name_any(cbm_store_t *s, const char *name, cbm_node_t **out,
+                                     int *count) {
+    if (!s || !s->db) {
+        *out = NULL;
+        *count = 0;
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_find_nodes_by_name_any,
+                       "SELECT id, project, label, name, qualified_name, file_path, "
+                       "start_line, end_line, properties FROM nodes "
+                       "WHERE name = ?1;");
+    if (!stmt) {
+        *out = NULL;
+        *count = 0;
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, 1, name);
+
+    int cap = 16;
+    int n = 0;
+    cbm_node_t *arr = malloc(cap * sizeof(cbm_node_t));
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (n >= cap) {
+            cap *= 2;
+            arr = safe_realloc(arr, cap * sizeof(cbm_node_t));
+        }
+        scan_node(stmt, &arr[n]);
+        n++;
+    }
+    *out = arr;
+    *count = n;
+    return CBM_STORE_OK;
 }
 
 int cbm_store_find_node_ids_by_qns(cbm_store_t *s, const char *project, const char **qns,
@@ -1280,20 +1342,29 @@ int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const
     char like_pattern[512];
     snprintf(like_pattern, sizeof(like_pattern), "%%.%s", suffix);
 
-    const char *sql = "SELECT id, project, label, name, qualified_name, file_path, "
-                      "start_line, end_line, properties FROM nodes "
-                      "WHERE project = ?1 AND (qualified_name LIKE ?2 OR qualified_name = ?3)";
+    const char *sql_with_project =
+        "SELECT id, project, label, name, qualified_name, file_path, "
+        "start_line, end_line, properties FROM nodes "
+        "WHERE project = ?1 AND (qualified_name LIKE ?2 OR qualified_name = ?3)";
+    const char *sql_any = "SELECT id, project, label, name, qualified_name, file_path, "
+                          "start_line, end_line, properties FROM nodes "
+                          "WHERE (qualified_name LIKE ?1 OR qualified_name = ?2)";
 
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL);
+    int rc = sqlite3_prepare_v2(s->db, project ? sql_with_project : sql_any, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         store_set_error_sqlite(s, "qn_suffix prepare");
         return CBM_STORE_ERR;
     }
 
-    bind_text(stmt, 1, project);
-    bind_text(stmt, 2, like_pattern);
-    bind_text(stmt, 3, suffix);
+    if (project) {
+        bind_text(stmt, 1, project);
+        bind_text(stmt, 2, like_pattern);
+        bind_text(stmt, 3, suffix);
+    } else {
+        bind_text(stmt, 1, like_pattern);
+        bind_text(stmt, 2, suffix);
+    }
 
     int cap = 8;
     int n = 0;

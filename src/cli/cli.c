@@ -1290,22 +1290,40 @@ int cbm_remove_antigravity_mcp(const char *config_path) {
 
 /* ── Claude Code pre-tool hooks ───────────────────────────────── */
 
-#define CMM_HOOK_MATCHER "Grep|Glob|Read"
+#define CMM_HOOK_MATCHER "Grep|Glob|Read|Search"
 #define CMM_HOOK_COMMAND                                                        \
     "echo 'Reminder: prefer codebase-memory-mcp search_graph/trace_call_path/"  \
-    "get_code_snippet over Grep/Glob/Read for code discovery. "                 \
+    "get_code_snippet over Grep/Glob/Read/Search for code discovery. "          \
     "Use get_code_snippet(qualified_name) instead of Read to view a function. " \
     "Fall back only if MCP returns insufficient results.' >&2"
 
-/* Check if a PreToolUse array entry matches our hook (by matcher string) */
+/* Old matcher values from previous versions — recognized during upgrade so
+ * upsert_hooks_json can remove them before inserting the current matcher. */
+static const char *cmm_old_matchers[] = {
+    "Grep|Glob|Read",
+    NULL,
+};
+
+/* Check if a PreToolUse array entry matches our hook (current or old matcher). */
 static bool is_cmm_hook_entry(yyjson_mut_val *entry, const char *matcher_str) {
     yyjson_mut_val *matcher = yyjson_mut_obj_get(entry, "matcher");
     if (!matcher || !yyjson_mut_is_str(matcher)) {
         return false;
     }
     const char *val = yyjson_mut_get_str(matcher);
-    // NOLINTNEXTLINE(readability-implicit-bool-conversion)
-    return val != NULL && strcmp(val, matcher_str) == 0;
+    if (!val) {
+        return false;
+    }
+    if (strcmp(val, matcher_str) == 0) {
+        return true;
+    }
+    /* Also match old versions for backwards-compatible upgrade */
+    for (int i = 0; cmm_old_matchers[i]; i++) {
+        if (strcmp(val, cmm_old_matchers[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* Generic hook upsert for both Claude Code and Gemini CLI */

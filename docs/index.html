@@ -406,10 +406,18 @@
                 <tr><td>Agents supported</td><td class="win">8</td><td>1-2</td></tr>
                 <tr><td>Cross-service HTTP linking</td><td class="win">Yes</td><td>No</td></tr>
                 <tr><td>Cypher queries</td><td class="win">Yes</td><td>No</td></tr>
+                <tr><td>Incremental reindex</td><td class="win">Yes (&lt;1ms no-op)</td><td>No</td></tr>
+                <tr><td>Pre-tool hooks</td><td class="win">Yes (agents prefer graph tools)</td><td>No</td></tr>
                 <tr><td>Visual web UI</td><td class="win">Yes (3D graph)</td><td class="win">Yes</td></tr>
-                <tr><td>Graph RAG chat</td><td class="lose">No</td><td class="win">Yes</td></tr>
+                <tr><td>Graph RAG / embeddings</td><td>Not needed*</td><td>Yes</td></tr>
             </tbody>
         </table>
+        <p style="color: var(--text-secondary); font-size: 0.875rem; margin-top: 12px;">
+            *Graph RAG and semantic embeddings solve a human problem &mdash; fuzzy "find something similar" queries.
+            MCP agents don't need this: they make precise structural queries via tool calls and synthesize results themselves.
+            codebase-memory-mcp is purpose-built for agents &mdash; exact patterns, call chain tracing, and structural search
+            at machine speed.
+        </p>
     </section>
 </div>
 

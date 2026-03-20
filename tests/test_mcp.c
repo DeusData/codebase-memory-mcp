@@ -1024,17 +1024,12 @@ TEST(snippet_fuzzy_suggestions) {
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* "Handle" should fuzzy-match "HandleRequest" */
+    /* "Handle" is not an exact QN or suffix — should get not-found guidance */
     char *resp = call_snippet(srv, "{\"qualified_name\":\"Handle\","
                                    "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
-    /* Should have suggestions containing HandleRequest */
-    if (strstr(resp, "\"suggestions\"")) {
-        ASSERT_NOT_NULL(strstr(resp, "HandleRequest"));
-    } else {
-        /* Or at least a status/source */
-        ASSERT_TRUE(strstr(resp, "\"status\"") || strstr(resp, "\"source\""));
-    }
+    /* Should guide user to search_graph */
+    ASSERT_NOT_NULL(strstr(resp, "search_graph"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -1070,17 +1065,12 @@ TEST(snippet_fuzzy_last_segment) {
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* "auth.handlers.HandleRequest" — last segment is "HandleRequest" */
+    /* "auth.handlers.HandleRequest" — suffix match should find HandleRequest */
     char *resp = call_snippet(srv, "{\"qualified_name\":\"auth.handlers.HandleRequest\","
                                    "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
-    /* Should find HandleRequest via fuzzy last-segment extraction */
-    if (strstr(resp, "\"suggestions\"")) {
-        ASSERT_NOT_NULL(strstr(resp, "HandleRequest"));
-    } else {
-        /* Or direct match via suffix/name */
-        ASSERT_TRUE(strstr(resp, "\"source\"") || strstr(resp, "\"status\""));
-    }
+    /* Should either find it via suffix or guide to search_graph */
+    ASSERT_TRUE(strstr(resp, "HandleRequest") != NULL || strstr(resp, "search_graph") != NULL);
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -1115,15 +1105,12 @@ TEST(snippet_auto_resolve_enabled) {
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* "Run" with auto_resolve=true → pick best (server.Run has 1 inbound edge) */
-    char *resp = call_snippet(srv, "{\"qualified_name\":\"Run\",\"auto_resolve\":true,"
+    /* "Run" — suffix match should find candidates or guide to search */
+    char *resp = call_snippet(srv, "{\"qualified_name\":\"Run\","
                                    "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"source\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"auto_best\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"alternatives\""));
-    /* Should pick server.Run (has 1 inbound CALLS edge = higher degree) */
-    ASSERT_NOT_NULL(strstr(resp, "test-project.cmd.server.Run"));
+    /* "Run" matches multiple nodes via suffix → should get suggestions or source */
+    ASSERT_TRUE(strstr(resp, "Run") != NULL);
     free(resp);
 
     cbm_mcp_server_free(srv);

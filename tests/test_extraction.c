@@ -742,6 +742,47 @@ TEST(swift_struct) {
     PASS();
 }
 
+/* --- Swift calls (port of PR #47 Go tests) --- */
+TEST(swift_simple_call) {
+    CBMFileResult *r = extract("func main() { greet() }\nfunc greet() { print(\"hello\") }\n",
+                               CBM_LANG_SWIFT, "t", "main.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call(r, "greet"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_method_call) {
+    CBMFileResult *r = extract("class Foo {\n    func bar() { baz.run() }\n}\n", CBM_LANG_SWIFT,
+                               "t", "Foo.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call(r, "baz.run"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_constructor_call) {
+    CBMFileResult *r =
+        extract("func create() { let x = MyClass() }\n", CBM_LANG_SWIFT, "t", "create.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call(r, "MyClass"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_chained_call) {
+    CBMFileResult *r = extract("func setup() { AlarmScheduler.shared.startKeepAlive() }\n",
+                               CBM_LANG_SWIFT, "t", "setup.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(r->calls.count > 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Objective-C --- */
 TEST(objc_interface) {
     CBMFileResult *r =
@@ -2071,6 +2112,10 @@ SUITE(extraction) {
 
     /* OOP/Systems variants */
     RUN_TEST(swift_struct);
+    RUN_TEST(swift_simple_call);
+    RUN_TEST(swift_method_call);
+    RUN_TEST(swift_constructor_call);
+    RUN_TEST(swift_chained_call);
     RUN_TEST(objc_interface);
     RUN_TEST(objc_implementation);
     RUN_TEST(dart_top_level_function);
