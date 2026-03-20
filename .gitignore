@@ -39,6 +39,9 @@ build/
 node_modules/
 graph-ui/dist/
 
+# Service-graph binary
+service-graph/bin/
+
 # Generated reports
 BENCHMARK_REPORT.md
 TEST_PLAN.md

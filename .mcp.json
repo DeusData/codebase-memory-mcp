@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "codebase-memory-mcp": {
-      "command": "/Users/martinvogel/.local/bin/codebase-memory-mcp",
-      "args": []
+    "codebase-memory": {
+      "command": "./service-graph/bin/codebase-memory-mcp",
+      "env": { "REPOS_DIR": "" }
     }
   }
 }

@@ -2,7 +2,7 @@
 
 **The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a single static binary for macOS, Linux, and Windows — download, run `install`, done.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 64 languages, enhanced with LSP-style hybrid type resolution for Go, C, and C++ (more languages coming soon) — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 14 MCP tools. Zero dependencies. Plug and play across 8 coding agents.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 64 languages, enhanced with LSP-style hybrid type resolution for Go, C, and C++ (more languages coming soon) — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 21 MCP tools (14 intra-repo code analysis + 7 cross-repo service dependency mapping). Zero dependencies. Plug and play across 8 coding agents.
 
 <p align="center">
   <img src="docs/graph-ui-screenshot.png" alt="Graph visualization UI showing the codebase-memory-mcp knowledge graph" width="800">
@@ -18,7 +18,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search. One graph query replaces dozens of grep/read cycles.
 - **8 agents, one command** — `install` auto-detects Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode and configures MCP entries, instruction files, and pre-tool hooks for each.
 - **Built-in graph visualization** — 3D interactive UI at `localhost:9749` (optional UI binary variant).
-- **14 MCP tools** — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
+- **21 MCP tools** — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, plus cross-repo service dependency mapping (Pub/Sub, GraphQL, database).
 
 ## Quick Start
 
@@ -203,7 +203,7 @@ Add to `~/.claude/.mcp.json` (global) or project `.mcp.json`:
 }
 ```
 
-Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 14 tools.
+Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 21 tools.
 
 </details>
 
@@ -262,6 +262,20 @@ codebase-memory-mcp cli --raw search_graph '{"label": "Function"}' | jq '.result
 | `search_code` | Grep-like text search within indexed project files. |
 | `manage_adr` | CRUD for Architecture Decision Records. |
 | `ingest_traces` | Ingest runtime traces to validate HTTP_CALLS edges. |
+
+### Cross-Repo Service Graph
+
+These 7 tools provide cross-repository dependency mapping — Pub/Sub event flows, GraphQL federation, and database ownership across microservices. Set `REPOS_DIR` to auto-discover repos, or pass explicit paths.
+
+| Tool | Description |
+|------|-------------|
+| `scan_repos` | Scan repositories and build the service dependency graph. Two-phase Pub/Sub resolution across repos. |
+| `list_services` | List all discovered services with edge counts per type. |
+| `list_topics` | List all Pub/Sub topics with their publishers and subscribers. |
+| `trace_message` | Trace a Pub/Sub message flow: publisher → topic → subscribers, with file locations. |
+| `find_dependencies` | Show all dependencies for a service, grouped by type (publishes, subscribes, GraphQL, DB). |
+| `get_graph` | Return the full dependency graph as JSON, with optional filter (pubsub/graphql/database). |
+| `shared_resources` | Find resources accessed by multiple services — coupling points and dangling leaves. |
 
 ## Graph Data Model
 
@@ -323,9 +337,11 @@ Plus: Clojure, F#, Julia, Vim Script, Nix, Common Lisp, Elm, Fortran, CUDA, COBO
 
 ## Architecture
 
+The unified binary is built via CGo — the C codebase compiles into a static library (`libcbm.a`) that the Go binary links against. The Go MCP server routes the original 14 C tools through the bridge and handles 7 service-graph tools natively.
+
 ```
-src/
-  main.c              Entry point (MCP stdio server + CLI + install/update/config)
+src/                  C codebase (compiled into libcbm.a)
+  main.c              Original entry point (standalone C binary)
   mcp/                MCP server (14 tools, JSON-RPC 2.0, session detection, auto-index)
   cli/                Install/uninstall/update/config (8 agents, hooks, instructions)
   store/              SQLite graph storage (nodes, edges, traversal, search, Louvain)
@@ -337,6 +353,24 @@ src/
   ui/                 Embedded HTTP server + 3D graph visualization
   foundation/         Platform abstractions (threads, filesystem, logging, memory)
 internal/cbm/         Vendored tree-sitter grammars (64 languages) + AST extraction engine
+
+service-graph/        Go codebase (unified MCP binary entry point)
+  main.go             Entry point
+  cbm/bridge.go       CGo bridge to libcbm.a (Init, HandleTool, ToolsList, Close)
+  graph/types.go      ServiceNode, TopicNode, Edge, ServiceGraph types
+  graph/store.go      SQLite storage for the service dependency graph
+  graph/graph.go      Two-phase scan orchestration, dangling leaf detection
+  scanner/discover.go File + repo discovery (REPOS_DIR auto-detection)
+  scanner/pubsub.go   Cross-repo two-phase Pub/Sub resolution
+  scanner/graphql.go  GraphQL schema + operation scanning
+  scanner/database.go Database table + query pattern scanning
+  mcp/server.go       Unified 21-tool MCP server (stdio JSON-RPC 2.0)
+```
+
+### Building
+
+```bash
+make service-graph    # builds libcbm.a + Go binary → service-graph/bin/codebase-memory-mcp
 ```
 
 ## License

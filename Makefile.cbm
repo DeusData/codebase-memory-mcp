@@ -433,6 +433,31 @@ $(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(
 cbm: $(BUILD_DIR)/codebase-memory-mcp
 	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp"
 
+# ── Static library for CGo embedding ─────────────────────────
+
+.PHONY: libcbm
+
+# Build static library from all production sources (excluding main.c)
+$(BUILD_DIR)/libcbm.a: $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
+	@echo "Compiling production sources to object files..."
+	@for src in $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(SQLITE_WRITER_SRC); do \
+		obj=$(BUILD_DIR)/lib_$$(echo $$src | sed 's|/|_|g' | sed 's|\.c$$|.o|'); \
+		echo "  CC $$src -> $$obj"; \
+		$(CC) $(CFLAGS_PROD) -c -o $$obj $$src || exit 1; \
+	done
+	@echo "Archiving libcbm.a..."
+	ar rcs $@ $(BUILD_DIR)/lib_*.o $(OBJS_VENDORED_PROD)
+
+$(BUILD_DIR)/include: | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/include/mcp
+	mkdir -p $(BUILD_DIR)/include/foundation
+	mkdir -p $(BUILD_DIR)/include/store
+	cp src/mcp/mcp.h $(BUILD_DIR)/include/mcp/
+	cp src/foundation/mem.h $(BUILD_DIR)/include/foundation/
+
+libcbm: $(BUILD_DIR)/libcbm.a $(BUILD_DIR)/include
+	@echo "Built: $(BUILD_DIR)/libcbm.a"
+
 # ── Build with embedded UI (requires Node.js) ───────────────────
 
 # Swap embedded_stub.c for the generated embedded_assets.c
