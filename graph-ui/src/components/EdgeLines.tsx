@@ -29,6 +29,14 @@ const EDGE_TYPE_COLORS: Record<string, string> = {
   ASYNC_CALLS: "#ec4899",
   MEMBER_OF: "#64748b",
   TESTS_FILE: "#06b6d4",
+  /* Service-graph edge types */
+  publishes: "#34d399",
+  subscribes: "#60a5fa",
+  graphql_query: "#f472b6",
+  graphql_mutation: "#e879f9",
+  graphql_exposes: "#c084fc",
+  db_owns: "#fb923c",
+  db_reads: "#fbbf24",
 };
 
 const DEFAULT_EDGE_COLOR = "#1C8585";

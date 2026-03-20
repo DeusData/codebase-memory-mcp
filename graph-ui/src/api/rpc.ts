@@ -37,11 +37,21 @@ export async function callTool<T = unknown>(
     throw new RpcError(json.error.code ?? -1, json.error.message ?? "unknown");
   }
 
-  /* MCP tool results are wrapped: { result: { content: [{ text: "..." }] } } */
-  const text = json?.result?.content?.[0]?.text;
-  if (text === undefined) {
-    return json.result as T;
+  /* MCP tool results are wrapped: { result: { content: [{ text: "..." }], isError?: true } } */
+  const result = json?.result;
+  if (result?.isError) {
+    throw new RpcError(-1, result.content?.[0]?.text ?? "tool error");
   }
 
-  return JSON.parse(text) as T;
+  const text = result?.content?.[0]?.text;
+  if (text === undefined) {
+    return result as T;
+  }
+
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    // Tool returned plain text, not JSON — return as-is
+    return text as T;
+  }
 }

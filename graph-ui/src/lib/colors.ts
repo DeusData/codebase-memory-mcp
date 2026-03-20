@@ -20,6 +20,31 @@ export function colorForLabel(label: string): string {
   return LABEL_COLORS[label] ?? DEFAULT_COLOR;
 }
 
+/* ── Service-graph node colors (by kind) ──────────────── */
+
+export const SERVICE_NODE_COLORS: Record<string, string> = {
+  Service: "#22d3ee",
+  Topic: "#a78bfa",
+  GraphQL: "#f472b6",
+  Table: "#fb923c",
+};
+
+/* ── Service-graph edge colors (by relationship type) ── */
+
+export const SERVICE_EDGE_COLORS: Record<string, string> = {
+  publishes: "#34d399",
+  subscribes: "#60a5fa",
+  graphql_query: "#f472b6",
+  graphql_mutation: "#e879f9",
+  graphql_exposes: "#c084fc",
+  db_owns: "#fb923c",
+  db_reads: "#fbbf24",
+};
+
+export function colorForServiceKind(kind: string): string {
+  return SERVICE_NODE_COLORS[kind] ?? DEFAULT_COLOR;
+}
+
 /* Stellar spectral type legend (for the graph view) */
 export const STELLAR_LEGEND = [
   { type: "O (Blue Giant)", color: "#80a0ff", description: "50+ connections" },

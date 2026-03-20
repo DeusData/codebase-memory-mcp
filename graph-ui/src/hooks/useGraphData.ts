@@ -1,5 +1,9 @@
 import { useCallback, useState } from "react";
-import type { GraphData } from "../lib/types";
+import type { GraphData, ServiceGraph } from "../lib/types";
+import { callTool } from "../api/rpc";
+import { layoutServiceGraph } from "../lib/serviceGraphLayout";
+
+export const SERVICE_GRAPH_SENTINEL = "__service_graph__";
 
 interface UseGraphDataResult {
   data: GraphData | null;
@@ -33,7 +37,13 @@ export function useGraphData(): UseGraphDataResult {
     setLoading(true);
     setError(null);
     try {
-      const result = await fetchLayout(project, 50000);
+      let result: GraphData;
+      if (project === SERVICE_GRAPH_SENTINEL) {
+        const sg = await callTool<ServiceGraph>("get_graph");
+        result = layoutServiceGraph(sg);
+      } else {
+        result = await fetchLayout(project, 50000);
+      }
       setData(result);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to fetch layout");

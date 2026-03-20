@@ -47,3 +47,45 @@ export interface ProcessInfo {
   command: string;
   is_self: boolean;
 }
+
+/* ── Service Graph types (match Go service-graph/graph/types.go) ── */
+
+export interface ServiceNode {
+  id: string;
+  repoPath: string;
+  description?: string;
+}
+
+export interface TopicNode {
+  id: string;
+  options?: Record<string, string>;
+}
+
+export interface GraphQLEndpointNode {
+  id: string;
+  schemaFiles: string[];
+  gatewayUrl?: string;
+}
+
+export interface DatabaseTableNode {
+  id: string;
+  orm?: string;
+}
+
+export interface ServiceEdge {
+  source: string;
+  target: string;
+  type: string;
+  file: string;
+  line: number;
+  metadata?: Record<string, string>;
+}
+
+export interface ServiceGraph {
+  services: ServiceNode[];
+  topics: TopicNode[];
+  graphqlEndpoints: GraphQLEndpointNode[];
+  tables: DatabaseTableNode[];
+  edges: ServiceEdge[];
+  scannedAt: string;
+}

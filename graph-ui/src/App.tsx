@@ -2,6 +2,7 @@ import { useState } from "react";
 import { GraphTab } from "./components/GraphTab";
 import { StatsTab } from "./components/StatsTab";
 import { ControlTab } from "./components/ControlTab";
+import { SERVICE_GRAPH_SENTINEL } from "./hooks/useGraphData";
 import type { TabId } from "./lib/types";
 
 const TABS: { id: TabId; label: string }[] = [
@@ -48,7 +49,7 @@ export function App() {
           <div className="flex items-center gap-2 px-3 py-1 rounded-lg bg-white/[0.04] border border-border/30">
             <span className="text-[10px] text-foreground/30 uppercase tracking-wider">Graph</span>
             <span className="text-[11px] text-primary font-mono truncate max-w-[300px]">
-              {selectedProject}
+              {selectedProject === SERVICE_GRAPH_SENTINEL ? "Service Graph" : selectedProject}
             </span>
             <button
               onClick={() => { setSelectedProject(null); setActiveTab("stats"); }}

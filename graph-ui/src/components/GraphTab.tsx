@@ -1,12 +1,14 @@
 import { useEffect, useState, useCallback, useMemo } from "react";
 import { Button } from "@/components/ui/button";
-import { useGraphData } from "../hooks/useGraphData";
+import { useGraphData, SERVICE_GRAPH_SENTINEL } from "../hooks/useGraphData";
+import { useServiceOverlay } from "../hooks/useServiceOverlay";
 import {
   GraphScene,
   computeCameraTarget,
   type CameraTarget,
 } from "./GraphScene";
 import { Sidebar } from "./Sidebar";
+import { ServiceSidebar } from "./ServiceSidebar";
 import { FilterPanel } from "./FilterPanel";
 import { NodeDetailPanel } from "./NodeDetailPanel";
 import { ResizeHandle } from "./ResizeHandle";
@@ -38,6 +40,9 @@ export function GraphTab({ project }: GraphTabProps) {
   const [showLabels, setShowLabels] = useState(true);
   const [leftWidth, setLeftWidth] = useState(() => loadWidth("cbm-left-w", 260));
   const [rightWidth, setRightWidth] = useState(() => loadWidth("cbm-right-w", 280));
+  const [overlayEnabled, setOverlayEnabled] = useState(false);
+
+  const isServiceGraph = project === SERVICE_GRAPH_SENTINEL;
 
   /* Filter state — all enabled by default */
   const [enabledLabels, setEnabledLabels] = useState<Set<string>>(new Set());
@@ -53,7 +58,7 @@ export function GraphTab({ project }: GraphTabProps) {
   }, [data]);
 
   /* Compute filtered data */
-  const filteredData: GraphData | null = useMemo(() => {
+  const baseFilteredData: GraphData | null = useMemo(() => {
     if (!data) return null;
 
     const nodes = data.nodes.filter((n) => enabledLabels.has(n.label));
@@ -68,11 +73,30 @@ export function GraphTab({ project }: GraphTabProps) {
     return { nodes, edges, total_nodes: data.total_nodes };
   }, [data, enabledLabels, enabledEdgeTypes]);
 
+  /* Cross-service overlay (only for regular code graphs, not the service graph view) */
+  const { overlayNodes, overlayEdges } = useServiceOverlay(
+    !isServiceGraph && overlayEnabled ? data : null,
+    !isServiceGraph && overlayEnabled && project ? project : null,
+  );
+
+  /* Merge overlay into filtered data when toggle is on */
+  const filteredData: GraphData | null = useMemo(() => {
+    if (!baseFilteredData) return null;
+    if (!overlayEnabled || isServiceGraph || overlayNodes.length === 0) return baseFilteredData;
+
+    return {
+      nodes: [...baseFilteredData.nodes, ...overlayNodes],
+      edges: [...baseFilteredData.edges, ...overlayEdges],
+      total_nodes: baseFilteredData.total_nodes + overlayNodes.length,
+    };
+  }, [baseFilteredData, overlayEnabled, isServiceGraph, overlayNodes, overlayEdges]);
+
   useEffect(() => {
     if (project) {
       fetchOverview(project);
       setHighlightedIds(null);
       setSelectedPath(null);
+      setOverlayEnabled(false);
     }
   }, [project, fetchOverview]);
 
@@ -216,11 +240,19 @@ export function GraphTab({ project }: GraphTabProps) {
           onEnableAll={enableAll}
           onDisableAll={disableAll}
         />
-        <Sidebar
-          nodes={filteredData.nodes}
-          onSelectPath={handleSelectPath}
-          selectedPath={selectedPath}
-        />
+        {isServiceGraph ? (
+          <ServiceSidebar
+            nodes={filteredData.nodes}
+            onSelectNode={handleSelectPath}
+            selectedPath={selectedPath}
+          />
+        ) : (
+          <Sidebar
+            nodes={filteredData.nodes}
+            onSelectPath={handleSelectPath}
+            selectedPath={selectedPath}
+          />
+        )}
       </div>
       <ResizeHandle
         side="left"
@@ -275,6 +307,16 @@ export function GraphTab({ project }: GraphTabProps) {
               }}
             >
               Clear
+            </Button>
+          )}
+          {!isServiceGraph && (
+            <Button
+              variant={overlayEnabled ? "default" : "outline"}
+              size="sm"
+              onClick={() => setOverlayEnabled((v) => !v)}
+              title="Toggle cross-service edges overlay"
+            >
+              Cross-service
             </Button>
           )}
           <Button

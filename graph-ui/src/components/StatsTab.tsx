@@ -1,7 +1,10 @@
 import { useMemo, useState, useCallback, useEffect } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useProjects } from "../hooks/useProjects";
-import { colorForLabel } from "../lib/colors";
+import { colorForLabel, SERVICE_NODE_COLORS } from "../lib/colors";
+import { callTool } from "../api/rpc";
+import { SERVICE_GRAPH_SENTINEL } from "../hooks/useGraphData";
+import type { ServiceGraph } from "../lib/types";
 
 interface StatsTabProps {
   onSelectProject: (project: string) => void;
@@ -302,6 +305,115 @@ function IndexProgress({ onDone }: { onDone: () => void }) {
   );
 }
 
+/* ── Service Graph Card ─────────────────────────────────── */
+
+function ServiceGraphCard({ onSelectProject, repoPaths }: { onSelectProject: (p: string) => void; repoPaths: string[] }) {
+  const [stats, setStats] = useState<{ services: number; topics: number; graphql: number; tables: number; edges: number } | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
+
+  const fetchStats = useCallback(async () => {
+    try {
+      const sg = await callTool<ServiceGraph>("get_graph");
+      setStats({
+        services: sg.services?.length ?? 0,
+        topics: sg.topics?.length ?? 0,
+        graphql: sg.graphqlEndpoints?.length ?? 0,
+        tables: sg.tables?.length ?? 0,
+        edges: sg.edges?.length ?? 0,
+      });
+    } catch {
+      // Service graph not available or empty
+      setStats(null);
+    }
+  }, []);
+
+  useEffect(() => { fetchStats(); }, [fetchStats]);
+
+  const handleScan = async () => {
+    setScanning(true);
+    setScanError(null);
+    try {
+      // Pass indexed project root paths so scan_repos knows what to scan
+      const args: Record<string, unknown> = {};
+      if (repoPaths.length > 0) {
+        args.repos = repoPaths;
+      }
+      await callTool("scan_repos", args);
+      await fetchStats();
+    } catch (e) {
+      setScanError(e instanceof Error ? e.message : "Scan failed");
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  const hasData = stats && stats.services > 0;
+
+  return (
+    <div className="rounded-xl border border-border/30 bg-white/[0.02] hover:bg-white/[0.035] transition-all p-5 mb-6">
+      <div className="flex items-start justify-between gap-3 mb-3">
+        <div className="min-w-0 flex items-start gap-2.5">
+          <div className="mt-1.5">
+            <span
+              className="relative inline-block w-[8px] h-[8px] rounded-full"
+              style={{ backgroundColor: SERVICE_NODE_COLORS.Service, boxShadow: `0 0 6px ${SERVICE_NODE_COLORS.Service}80` }}
+            />
+          </div>
+          <div className="min-w-0">
+            <h3 className="text-[14px] font-semibold text-foreground/90 mb-0.5">Service Graph</h3>
+            <p className="text-[11px] text-foreground/20">Cross-service topology: Pub/Sub, GraphQL, Database</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-1.5 shrink-0">
+          <button
+            onClick={handleScan}
+            disabled={scanning}
+            className="px-3 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.07] text-[12px] text-foreground/40 font-medium transition-all disabled:opacity-30"
+          >
+            {scanning ? (
+              <span className="flex items-center gap-2">
+                <span className="w-3 h-3 border-2 border-foreground/20 border-t-foreground/50 rounded-full animate-spin" />
+                Scanning...
+              </span>
+            ) : "Scan Repos"}
+          </button>
+          {hasData && (
+            <button
+              onClick={() => onSelectProject(SERVICE_GRAPH_SENTINEL)}
+              className="px-3 py-1.5 rounded-lg bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-medium transition-all"
+            >
+              View Graph
+            </button>
+          )}
+        </div>
+      </div>
+      {scanError && (
+        <div className="rounded-lg bg-destructive/10 border border-destructive/20 px-3 py-2 mb-3">
+          <p className="text-destructive text-[11px]">{scanError}</p>
+        </div>
+      )}
+      {hasData && (
+        <div className="flex gap-6 text-[12px] text-foreground/30">
+          {[
+            { label: "services", value: stats!.services, color: SERVICE_NODE_COLORS.Service },
+            { label: "topics", value: stats!.topics, color: SERVICE_NODE_COLORS.Topic },
+            { label: "graphql", value: stats!.graphql, color: SERVICE_NODE_COLORS.GraphQL },
+            { label: "tables", value: stats!.tables, color: SERVICE_NODE_COLORS.Table },
+            { label: "edges", value: stats!.edges, color: undefined },
+          ].filter(s => s.value > 0).map((s) => (
+            <span key={s.label}>
+              <strong className="tabular-nums" style={s.color ? { color: s.color + "bb" } : { color: "var(--foreground-55)" }}>
+                {s.value.toLocaleString()}
+              </strong>{" "}{s.label}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ── Main Stats Tab ─────────────────────────────────────── */
 
 export function StatsTab({ onSelectProject }: StatsTabProps) {
@@ -340,6 +452,8 @@ export function StatsTab({ onSelectProject }: StatsTabProps) {
             ))}
           </div>
         )}
+
+        <ServiceGraphCard onSelectProject={onSelectProject} repoPaths={projects.map(p => p.project.root_path)} />
 
         {indexing && <IndexProgress onDone={() => { setIndexing(false); refresh(); }} />}
 
