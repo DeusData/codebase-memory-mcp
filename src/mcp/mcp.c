@@ -238,7 +238,10 @@ static const tool_def_t TOOLS[] = {
      "{\"type\":\"integer\"},\"max_degree\":{\"type\":\"integer\"},\"exclude_entry_points\":{"
      "\"type\":\"boolean\"},\"include_connected\":{\"type\":\"boolean\"},\"limit\":{\"type\":"
      "\"integer\",\"description\":\"Max results. Default: "
-     "unlimited\"},\"offset\":{\"type\":\"integer\",\"default\":0}}}"},
+     "unlimited\"},\"offset\":{\"type\":\"integer\",\"default\":0},"
+     "\"include_dependencies\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Include "
+     "indexed dependency symbols in results. Results from dependencies have source:dependency. "
+     "Default: false (only project code).\"}}}"},
 
     {"query_graph",
      "Execute a Cypher query against the knowledge graph for complex multi-hop patterns, "
