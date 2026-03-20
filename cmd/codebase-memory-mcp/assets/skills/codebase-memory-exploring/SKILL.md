@@ -31,9 +31,10 @@ If already indexed, skip — auto-sync keeps the graph fresh.
 
 ```
 get_graph_schema
+search_graph(mode="summary")  # aggregate counts by label and file (top 20)
 ```
 
-This returns node label counts (functions, classes, routes, etc.), edge type counts, and relationship patterns. Use it to understand what's in the graph before querying.
+`get_graph_schema` returns node/edge counts and relationship patterns. `mode=summary` on `search_graph` gives aggregate counts by label type and top 20 files — useful for understanding codebase scope before drilling down.
 
 ### Step 3: Find specific code elements
 
@@ -84,7 +85,8 @@ list_directory(path="src/services")
 
 ## Key Tips
 
-- Results default to 10 per page. Check `has_more` and use `offset` to paginate.
+- Results default to 50 per page. Check `has_more` and use `offset` to paginate. Use `pagination_hint` in the response for next page.
+- Use `compact=true` on `search_graph` to reduce token usage by omitting redundant `name` fields.
 - Use `project` parameter when multiple repos are indexed.
 - Route nodes have a `properties.handler` field with the actual handler function name.
 - `exclude_labels` removes noise (e.g., `exclude_labels=["Route"]` when searching by name pattern).
