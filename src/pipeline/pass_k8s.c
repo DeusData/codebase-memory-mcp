@@ -5,7 +5,7 @@
  *   1. Check if it is a kustomize overlay (kustomization.yaml / kustomization.yml)
  *      → emit a Module node and IMPORTS edges for each resources/bases/patches entry
  *   2. Else if it is a generic k8s manifest (apiVersion: detected)
- *      → emit one Resource node per top-level resource document
+ *      → emit one Resource node per file (first document only — multi-document YAML is not yet supported)
  *
  * Depends on: pass_infrascan.c (cbm_is_kustomize_file, cbm_is_k8s_manifest, cbm_infra_qn),
  *             extraction layer (cbm.h), graph_buffer, pipeline internals.

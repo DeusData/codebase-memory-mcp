@@ -86,7 +86,7 @@ Language support is split between two layers:
 
 ### Infrastructure Languages (Infra-Pass Pattern)
 
-Languages like **Dockerfile**, **docker-compose**, **Kubernetes manifests**, and **Kustomize** do not use tree-sitter grammars. Instead they follow an *infra-pass* pattern:
+Languages like **Dockerfile**, **docker-compose**, **Kubernetes manifests**, and **Kustomize** do not require a new tree-sitter grammar. Instead they follow an *infra-pass* pattern, reusing the existing tree-sitter YAML grammar where applicable:
 
 1. **Detection helpers** in `src/pipeline/pass_infrascan.c` — functions like `cbm_is_dockerfile()`, `cbm_is_k8s_manifest()`, `cbm_is_kustomize_file()` identify files by name and/or content heuristics (e.g., presence of `apiVersion:`).
 2. **Custom extractors** in `internal/cbm/extract_k8s.c` — tree-sitter-based parsers that walk the YAML AST (using the tree-sitter YAML grammar) and populate `CBMFileResult` with imports and definitions.
@@ -94,7 +94,7 @@ Languages like **Dockerfile**, **docker-compose**, **Kubernetes manifests**, and
 
 **When adding a new infrastructure language:**
 - Add a detection helper (`cbm_is_<lang>_file()`) in `pass_infrascan.c` or a new `pass_<lang>.c`.
-- Add the `CBM_LANG_<LANG>` enum value in `cbm_language.h` and a row in the language table in `lang_specs.c`.
+- Add the `CBM_LANG_<LANG>` enum value in `internal/cbm/cbm.h` and a row in the language table in `lang_specs.c`.
 - Write a custom extractor that returns `CBMFileResult*` — do not add a tree-sitter grammar.
 - Register the pass in `pipeline.c`.
 - Add tests in `tests/test_pipeline.c` following the `TEST(infra_is_dockerfile)` and `TEST(k8s_extract_manifest)` patterns.
