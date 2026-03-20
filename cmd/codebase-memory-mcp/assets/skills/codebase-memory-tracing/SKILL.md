@@ -58,6 +58,7 @@ After finding interesting callers/callees, read their source:
 
 ```
 get_code_snippet(qualified_name="project.path.module.FunctionName")
+get_code_snippet(qualified_name="project.path.module.FunctionName", mode="signature")  # API only, saves tokens
 ```
 
 ## Cross-Service HTTP Calls
@@ -121,5 +122,6 @@ Returns changed files, changed symbols, and impacted callers with risk classific
 - Start with `depth=1` for quick answers, increase only if needed (max 5).
 - Edge types in trace results: `CALLS` (direct), `HTTP_CALLS` (cross-service), `ASYNC_CALLS` (async dispatch), `USAGE` (read reference), `OVERRIDE` (interface implementation).
 - `search_graph(relationship="HTTP_CALLS")` filters nodes by degree — it does NOT return edges. Use `query_graph` with Cypher to see actual edges with properties.
-- Results are capped at 200 nodes per trace.
+- Default `max_results=25` per direction (configurable). Use `max_results=100` for exhaustive traces.
+- Use `compact=true` on `trace_call_path` to reduce token usage by omitting redundant `name` fields.
 - `detect_changes` requires git in PATH.

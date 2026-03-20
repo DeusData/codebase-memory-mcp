@@ -95,7 +95,8 @@ search_graph(
 
 ## Key Tips
 
-- `search_graph` with degree filters has no row cap (unlike `query_graph` which caps at 200).
+- `search_graph` defaults to 50 results per page. Use `limit` for more, or `mode=summary` to see total counts first.
+- Use `compact=true` on `search_graph` to reduce token usage in dead code results.
 - Use `file_pattern` to scope analysis to specific directories: `file_pattern="**/services/**"`.
 - Dead code detection works best after a full index — run `index_repository` if the project was recently set up.
-- Paginate results with `limit` and `offset` — check `has_more` in the response.
+- Paginate results with `limit` and `offset` — check `has_more` and `pagination_hint` in the response.
