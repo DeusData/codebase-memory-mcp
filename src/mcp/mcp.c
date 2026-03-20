@@ -267,14 +267,17 @@ static const tool_def_t TOOLS[] = {
      "{\"type\":\"integer\"},\"max_degree\":{\"type\":\"integer\"},\"exclude_entry_points\":{"
      "\"type\":\"boolean\"},\"include_connected\":{\"type\":\"boolean\"},\"limit\":{\"type\":"
      "\"integer\",\"description\":\"Max results per page (configurable via search_limit config key). "
-     "Response includes has_more and pagination_hint when more pages exist. Set limit=0 for no cap."
+     "Response includes has_more and pagination_hint when more pages exist."
      "\"},\"offset\":{\"type\":\"integer\",\"default\":0,\"description\":\"Skip N results "
      "for pagination. Check pagination_hint in response for next page offset.\"},"
      "\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"summary\"],\"default\":\"full\","
      "\"description\":\"full=individual results (default), summary=aggregate counts by label and "
      "file. Use summary first to understand scope, then full with filters to drill down."
      "\"},\"compact\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Omit redundant "
-     "name field when it matches the last segment of qualified_name. Reduces token usage.\"}}}"},
+     "name field when it matches the last segment of qualified_name. Reduces token usage.\"},"
+     "\"include_dependencies\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Include "
+     "indexed dependency symbols in results. Results from dependencies have source:dependency. "
+     "Default: false (only project code).\"}}}"},
 
     {"query_graph",
      "Execute a Cypher query against the knowledge graph for complex multi-hop patterns, "
@@ -335,8 +338,9 @@ static const tool_def_t TOOLS[] = {
      "messages, and config values that are not in the knowledge graph.",
      "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"project\":{\"type\":"
      "\"string\"},\"file_pattern\":{\"type\":\"string\"},\"regex\":{\"type\":\"boolean\","
-     "\"default\":false},\"limit\":{\"type\":\"integer\",\"default\":50,\"description\":\"Max "
-     "results (default: 50). Set higher for exhaustive text search.\"}},\"required\":["
+     "\"default\":false},\"limit\":{\"type\":\"integer\",\"description\":\"Max "
+     "results (configurable via search_limit config key). Set higher for exhaustive text search."
+     "\"}},\"required\":["
      "\"pattern\"]}"},
 
     {"list_projects", "List all indexed projects", "{\"type\":\"object\",\"properties\":{}}"},
@@ -853,8 +857,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     int max_degree = cbm_mcp_get_int_arg(args, "max_degree", -1);
 
     /* Summary mode needs all results for accurate aggregation */
-    bool is_summary_early = search_mode && strcmp(search_mode, "summary") == 0;
-    int effective_limit = is_summary_early ? 10000 : limit;
+    bool is_summary = search_mode && strcmp(search_mode, "summary") == 0;
+    int effective_limit = is_summary ? 10000 : limit;
 
     cbm_search_params_t params = {
         .project = project,
@@ -876,14 +880,13 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
 
     yyjson_mut_obj_add_int(doc, root, "total", out.total);
 
-    bool is_summary = search_mode && strcmp(search_mode, "summary") == 0;
-
     if (is_summary) {
         /* Summary mode: aggregate counts by label and file (top 20) */
         yyjson_mut_val *by_label = yyjson_mut_obj(doc);
         yyjson_mut_val *by_file = yyjson_mut_obj(doc);
 
-        /* Simple aggregation — use parallel arrays for small cardinality sets */
+        /* Simple aggregation — 64 slots for labels (CBM defines ~12 label types),
+         * 20 slots for top files. Excess entries are silently capped. */
         const char *labels[64] = {0};
         int label_counts[64] = {0};
         int label_n = 0;
@@ -1045,9 +1048,9 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
             /* Build a truncated response with metadata */
             char trunc_json[256];
             snprintf(trunc_json, sizeof(trunc_json),
-                     "{\"truncated\":true,\"total_bytes\":%zu,\"rows_returned\":%d,"
+                     "{\"truncated\":true,\"total_bytes\":%lu,\"rows_returned\":%d,"
                      "\"hint\":\"Add LIMIT to your Cypher query\"}",
-                     json_len, total_rows);
+                     (unsigned long)json_len, total_rows);
             char *res = cbm_mcp_text_result(trunc_json, false);
             free(json);
             return res;
