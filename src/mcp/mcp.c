@@ -231,7 +231,9 @@ char *cbm_mcp_text_result(const char *text, bool is_error) {
         yyjson_mut_obj_add_bool(doc, root, "isError", true);
     }
 
-    /* Token metadata (RTK pattern: tracking) */
+    /* Token metadata: helps LLMs gauge context cost before requesting more data.
+     * _result_bytes = byte length of the inner JSON text payload.
+     * _est_tokens = bytes / 4 (same heuristic as RTK's estimate_tokens). */
     size_t text_len = text ? strlen(text) : 0;
     yyjson_mut_obj_add_int(doc, root, "_result_bytes", (int64_t)text_len);
     yyjson_mut_obj_add_int(doc, root, "_est_tokens", (int64_t)((text_len + 3) / 4));
@@ -954,6 +956,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_arr_add_val(results, item);
         }
         yyjson_mut_obj_add_val(doc, root, "results", results);
+        /* Pagination: tell the caller how to get the next page */
         bool more = out.total > offset + out.count;
         yyjson_mut_obj_add_bool(doc, root, "has_more", more);
         if (more) {
@@ -1578,7 +1581,8 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
             truncated = true;
         } else if (mode && strcmp(mode, "head_tail") == 0 && max_lines > 0 &&
                    total_lines > max_lines) {
-            /* Head+tail mode: read first 60% and last 40% */
+            /* Head+tail mode: read first 60% (signature/setup) and last 40%
+             * (return/cleanup). Middle implementation detail is omitted. */
             int head_count = (max_lines * 60) / 100;
             int tail_count = max_lines - head_count;
             if (head_count < 1) head_count = 1;
