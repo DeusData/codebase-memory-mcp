@@ -803,12 +803,16 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     int min_degree = cbm_mcp_get_int_arg(args, "min_degree", -1);
     int max_degree = cbm_mcp_get_int_arg(args, "max_degree", -1);
 
+    /* Summary mode needs all results for accurate aggregation */
+    bool is_summary_early = search_mode && strcmp(search_mode, "summary") == 0;
+    int effective_limit = is_summary_early ? 10000 : limit;
+
     cbm_search_params_t params = {
         .project = project,
         .label = label,
         .name_pattern = name_pattern,
         .file_pattern = file_pattern,
-        .limit = limit,
+        .limit = effective_limit,
         .offset = offset,
         .min_degree = min_degree,
         .max_degree = max_degree,
@@ -894,7 +898,15 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_arr_add_val(results, item);
         }
         yyjson_mut_obj_add_val(doc, root, "results", results);
-        yyjson_mut_obj_add_bool(doc, root, "has_more", out.total > offset + out.count);
+        bool more = out.total > offset + out.count;
+        yyjson_mut_obj_add_bool(doc, root, "has_more", more);
+        if (more) {
+            char hint[128];
+            snprintf(hint, sizeof(hint),
+                     "Use offset:%d and limit:%d for next page (%d total)",
+                     offset + out.count, limit, (int)out.total);
+            yyjson_mut_obj_add_strcpy(doc, root, "pagination_hint", hint);
+        }
     }
 
     char *json = yy_doc_to_str(doc);
