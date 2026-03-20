@@ -1289,12 +1289,14 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         int64_t *seen_out = calloc((size_t)tr_out.visited_count + 1, sizeof(int64_t));
         int seen_out_n = 0;
         for (int i = 0; i < tr_out.visited_count; i++) {
-            bool dup = false;
-            for (int j = 0; j < seen_out_n; j++) {
-                if (seen_out[j] == tr_out.visited[i].node.id) { dup = true; break; }
+            if (seen_out) { /* OOM-safe: skip dedup if calloc failed */
+                bool dup = false;
+                for (int j = 0; j < seen_out_n; j++) {
+                    if (seen_out[j] == tr_out.visited[i].node.id) { dup = true; break; }
+                }
+                if (dup) continue;
+                seen_out[seen_out_n++] = tr_out.visited[i].node.id;
             }
-            if (dup) continue;
-            seen_out[seen_out_n++] = tr_out.visited[i].node.id;
             yyjson_mut_val *item = yyjson_mut_obj(doc);
             if (!compact || !ends_with_segment(tr_out.visited[i].node.qualified_name,
                                                tr_out.visited[i].node.name)) {
@@ -1321,12 +1323,14 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         int64_t *seen_in = calloc((size_t)tr_in.visited_count + 1, sizeof(int64_t));
         int seen_in_n = 0;
         for (int i = 0; i < tr_in.visited_count; i++) {
-            bool dup = false;
-            for (int j = 0; j < seen_in_n; j++) {
-                if (seen_in[j] == tr_in.visited[i].node.id) { dup = true; break; }
+            if (seen_in) { /* OOM-safe: skip dedup if calloc failed */
+                bool dup = false;
+                for (int j = 0; j < seen_in_n; j++) {
+                    if (seen_in[j] == tr_in.visited[i].node.id) { dup = true; break; }
+                }
+                if (dup) continue;
+                seen_in[seen_in_n++] = tr_in.visited[i].node.id;
             }
-            if (dup) continue;
-            seen_in[seen_in_n++] = tr_in.visited[i].node.id;
             yyjson_mut_val *item = yyjson_mut_obj(doc);
             if (!compact || !ends_with_segment(tr_in.visited[i].node.qualified_name,
                                                tr_in.visited[i].node.name)) {
@@ -1629,9 +1633,14 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
         snprintf(marker, sizeof(marker), "\n[... %d lines omitted ...]\n", omitted);
         size_t combined_sz = strlen(source) + strlen(marker) + strlen(source_tail) + 1;
         char *combined = malloc(combined_sz);
-        snprintf(combined, combined_sz, "%s%s%s", source, marker, source_tail);
-        yyjson_mut_obj_add_strcpy(doc, root_obj, "source", combined);
-        free(combined);
+        if (combined) {
+            snprintf(combined, combined_sz, "%s%s%s", source, marker, source_tail);
+            yyjson_mut_obj_add_strcpy(doc, root_obj, "source", combined);
+            free(combined);
+        } else {
+            /* OOM fallback: output head only */
+            yyjson_mut_obj_add_str(doc, root_obj, "source", source);
+        }
     } else if (source) {
         yyjson_mut_obj_add_str(doc, root_obj, "source", source);
     } else {
