@@ -42,19 +42,27 @@
 #define SNIPPET_DEFAULT_LINES 50
 
 /* Default result limit for search_graph and search_code.
- * Prevents unbounded 500K-result responses. Callers can override. */
+ * Prevents unbounded 500K-result responses. Callers can override.
+ * Configurable via config key "search_limit". */
 #define CBM_DEFAULT_SEARCH_LIMIT 50
+#define CBM_CONFIG_SEARCH_LIMIT "search_limit"
 
 /* Default max source lines returned by get_code_snippet.
- * Set to 0 for unlimited. Prevents huge functions from consuming tokens. */
+ * Set to 0 for unlimited. Prevents huge functions from consuming tokens.
+ * Configurable via config key "snippet_max_lines". */
 #define CBM_DEFAULT_SNIPPET_MAX_LINES 200
+#define CBM_CONFIG_SNIPPET_MAX_LINES "snippet_max_lines"
 
-/* Default max BFS results for trace_call_path per direction. */
+/* Default max BFS results for trace_call_path per direction.
+ * Configurable via config key "trace_max_results". */
 #define CBM_DEFAULT_TRACE_MAX_RESULTS 25
+#define CBM_CONFIG_TRACE_MAX_RESULTS "trace_max_results"
 
 /* Default max output bytes for query_graph responses.
- * Caps worst-case at ~8000 tokens. Set to 0 for unlimited. */
+ * Caps worst-case at ~8000 tokens. Set to 0 for unlimited.
+ * Configurable via config key "query_max_output_bytes". */
 #define CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES 32768
+#define CBM_CONFIG_QUERY_MAX_OUTPUT_BYTES "query_max_output_bytes"
 
 /* Idle store eviction: close cached project store after this many seconds
  * of inactivity to free SQLite memory during idle periods. */
@@ -251,43 +259,67 @@ static const tool_def_t TOOLS[] = {
     {"search_graph",
      "Search the code knowledge graph for functions, classes, routes, and variables. Use INSTEAD "
      "OF grep/glob when finding code definitions, implementations, or relationships. Returns "
-     "precise results in one call.",
+     "precise results in one call. When has_more=true, use offset+limit to paginate. "
+     "Use mode=summary for quick codebase overview without individual results.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"label\":{\"type\":"
      "\"string\"},\"name_pattern\":{\"type\":\"string\"},\"qn_pattern\":{\"type\":\"string\"},"
      "\"file_pattern\":{\"type\":\"string\"},\"relationship\":{\"type\":\"string\"},\"min_degree\":"
      "{\"type\":\"integer\"},\"max_degree\":{\"type\":\"integer\"},\"exclude_entry_points\":{"
      "\"type\":\"boolean\"},\"include_connected\":{\"type\":\"boolean\"},\"limit\":{\"type\":"
-     "\"integer\",\"description\":\"Max results (default: 50). Use higher values for exhaustive search."
-     "\"},\"offset\":{\"type\":\"integer\",\"default\":0}}}"},
+     "\"integer\",\"description\":\"Max results per page (configurable via search_limit config key). "
+     "Response includes has_more and pagination_hint when more pages exist. Set limit=0 for no cap."
+     "\"},\"offset\":{\"type\":\"integer\",\"default\":0,\"description\":\"Skip N results "
+     "for pagination. Check pagination_hint in response for next page offset.\"},"
+     "\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"summary\"],\"default\":\"full\","
+     "\"description\":\"full=individual results (default), summary=aggregate counts by label and "
+     "file. Use summary first to understand scope, then full with filters to drill down."
+     "\"},\"compact\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Omit redundant "
+     "name field when it matches the last segment of qualified_name. Reduces token usage.\"}}}"},
 
     {"query_graph",
      "Execute a Cypher query against the knowledge graph for complex multi-hop patterns, "
-     "aggregations, and cross-service analysis.",
+     "aggregations, and cross-service analysis. Output is capped by default (configurable via "
+     "query_max_output_bytes config key) — set max_output_bytes=0 for unlimited or add LIMIT.",
      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Cypher "
      "query\"},\"project\":{\"type\":\"string\"},\"max_rows\":{\"type\":\"integer\","
-     "\"description\":"
-     "\"Optional row limit. Default: unlimited (100k ceiling)\"}},\"required\":[\"query\"]}"},
+     "\"description\":\"Scan-level row limit (default: unlimited). Note: this limits how many "
+     "nodes are scanned, not how many rows are returned. For output size control, use "
+     "max_output_bytes or add LIMIT to your Cypher query.\"},\"max_output_bytes\":{\"type\":"
+     "\"integer\",\"description\":\"Max response size in bytes (configurable via "
+     "query_max_output_bytes config key). Set to 0 for unlimited. When exceeded, returns "
+     "truncated=true with total_bytes and hint to add LIMIT.\"}},\"required\":[\"query\"]}"},
 
     {"trace_call_path",
      "Trace function call paths — who calls a function and what it calls. Use INSTEAD OF grep when "
-     "finding callers, dependencies, or impact analysis.",
+     "finding callers, dependencies, or impact analysis. Shows candidates array when function name "
+     "is ambiguous. Results are deduplicated (cycles don't inflate counts).",
      "{\"type\":\"object\",\"properties\":{\"function_name\":{\"type\":\"string\"},\"project\":{"
      "\"type\":\"string\"},\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\","
-     "\"both\"],\"default\":\"both\"},\"depth\":{\"type\":\"integer\",\"default\":3},\"edge_"
-     "types\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"function_"
-     "name\"]}"},
+     "\"both\"],\"default\":\"both\"},\"depth\":{\"type\":\"integer\",\"default\":3},\"max_results"
+     "\":{\"type\":\"integer\",\"description\":\"Max nodes per direction (configurable via "
+     "trace_max_results config key). Set higher for exhaustive traces. Response includes "
+     "callees_total/callers_total for truncation awareness.\"},\"compact\":{\"type\":\"boolean\","
+     "\"default\":false,\"description\":"
+     "\"Omit redundant name field. Saves tokens.\"},\"edge_types\":{\"type\":\"array\",\"items\":{"
+     "\"type\":\"string\"}}},\"required\":[\"function_name\"]}"},
 
     {"get_code_snippet",
      "Get source code for a specific function, class, or symbol by qualified name. Use INSTEAD OF "
-     "reading entire files when you need one function's implementation.",
+     "reading entire files when you need one function's implementation. Use mode=signature for "
+     "quick API lookup (99%% token savings). Use mode=head_tail for large functions to see both "
+     "the signature and return/cleanup code. When truncated=true, set max_lines=0 for full source.",
      "{\"type\":\"object\",\"properties\":{\"qualified_name\":{\"type\":\"string\"},\"project\":{"
-     "\"type\":\"string\"},\"auto_resolve\":{\"type\":\"boolean\",\"default\":false},\"include_"
-     "neighbors\":{\"type\":\"boolean\",\"default\":false},\"max_lines\":{\"type\":\"integer\","
-     "\"description\":\"Max source lines (default: 200, 0=unlimited)\"},\"mode\":{\"type\":"
-     "\"string\",\"enum\":[\"full\",\"signature\",\"head_tail\"],\"default\":\"full\","
-     "\"description\":\"full=source with max_lines cap, signature=API signature only, "
-     "head_tail=first 60%% + last 40%% preserving return/cleanup\"}},\"required\":"
-     "[\"qualified_name\"]}"},
+     "\"type\":\"string\"},\"auto_resolve\":{\"type\":\"boolean\",\"default\":false,\"description\":"
+     "\"Auto-pick best match when name is ambiguous (by degree). Shows alternatives in response."
+     "\"},\"include_neighbors\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Include "
+     "caller/callee names (up to 10 each). Adds context but increases response size.\"},"
+     "\"max_lines\":{\"type\":\"integer\",\"description\":\"Max source lines "
+     "(configurable via snippet_max_lines config key). Set to 0 for unlimited. When truncated, "
+     "response includes total_lines and signature for context.\"},\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"signature\","
+     "\"head_tail\"],\"default\":\"full\",\"description\":\"full=source up to max_lines, "
+     "signature=API signature+params+return type only (no source body, ~99%% savings), "
+     "head_tail=first 60%% + last 40%% of max_lines with omission marker (preserves return/"
+     "cleanup code)\"}},\"required\":[\"qualified_name\"]}"},
 
     {"get_graph_schema", "Get the schema of the knowledge graph (node labels, edge types)",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}}}"},
@@ -303,8 +335,8 @@ static const tool_def_t TOOLS[] = {
      "messages, and config values that are not in the knowledge graph.",
      "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"project\":{\"type\":"
      "\"string\"},\"file_pattern\":{\"type\":\"string\"},\"regex\":{\"type\":\"boolean\","
-     "\"default\":false},\"limit\":{\"type\":\"integer\",\"description\":\"Max results (default: 50)."
-     "\"}},\"required\":["
+     "\"default\":false},\"limit\":{\"type\":\"integer\",\"default\":50,\"description\":\"Max "
+     "results (default: 50). Set higher for exhaustive text search.\"}},\"required\":["
      "\"pattern\"]}"},
 
     {"list_projects", "List all indexed projects", "{\"type\":\"object\",\"properties\":{}}"},
@@ -796,7 +828,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     char *label = cbm_mcp_get_string_arg(args, "label");
     char *name_pattern = cbm_mcp_get_string_arg(args, "name_pattern");
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
-    int limit = cbm_mcp_get_int_arg(args, "limit", CBM_DEFAULT_SEARCH_LIMIT);
+    int cfg_search_limit = cbm_config_get_int(srv->config, CBM_CONFIG_SEARCH_LIMIT,
+                                               CBM_DEFAULT_SEARCH_LIMIT);
+    int limit = cbm_mcp_get_int_arg(args, "limit", cfg_search_limit);
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
     bool compact = cbm_mcp_get_bool_arg(args, "compact");
     char *search_mode = cbm_mcp_get_string_arg(args, "mode");
@@ -929,7 +963,9 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
     cbm_store_t *store = resolve_store(srv, project);
     int max_rows = cbm_mcp_get_int_arg(args, "max_rows", 0);
-    int max_output_bytes = cbm_mcp_get_int_arg(args, "max_output_bytes", CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES);
+    int cfg_max_output = cbm_config_get_int(srv->config, CBM_CONFIG_QUERY_MAX_OUTPUT_BYTES,
+                                            CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES);
+    int max_output_bytes = cbm_mcp_get_int_arg(args, "max_output_bytes", cfg_max_output);
 
     if (!query) {
         free(project);
@@ -1149,7 +1185,9 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_t *store = resolve_store(srv, project);
     char *direction = cbm_mcp_get_string_arg(args, "direction");
     int depth = cbm_mcp_get_int_arg(args, "depth", 3);
-    int max_results = cbm_mcp_get_int_arg(args, "max_results", CBM_DEFAULT_TRACE_MAX_RESULTS);
+    int cfg_trace_max = cbm_config_get_int(srv->config, CBM_CONFIG_TRACE_MAX_RESULTS,
+                                            CBM_DEFAULT_TRACE_MAX_RESULTS);
+    int max_results = cbm_mcp_get_int_arg(args, "max_results", cfg_trace_max);
     bool compact = cbm_mcp_get_bool_arg(args, "compact");
 
     if (!func_name) {
@@ -1694,7 +1732,9 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_t *store = resolve_store(srv, project);
     bool auto_resolve = cbm_mcp_get_bool_arg(args, "auto_resolve");
     bool include_neighbors = cbm_mcp_get_bool_arg(args, "include_neighbors");
-    int max_lines = cbm_mcp_get_int_arg(args, "max_lines", CBM_DEFAULT_SNIPPET_MAX_LINES);
+    int cfg_max_lines = cbm_config_get_int(srv->config, CBM_CONFIG_SNIPPET_MAX_LINES,
+                                           CBM_DEFAULT_SNIPPET_MAX_LINES);
+    int max_lines = cbm_mcp_get_int_arg(args, "max_lines", cfg_max_lines);
     char *snippet_mode = cbm_mcp_get_string_arg(args, "mode");
 
     if (!qn) {
@@ -1902,7 +1942,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char *pattern = cbm_mcp_get_string_arg(args, "pattern");
     char *project = cbm_mcp_get_string_arg(args, "project");
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
-    int limit = cbm_mcp_get_int_arg(args, "limit", CBM_DEFAULT_SEARCH_LIMIT);
+    int cfg_search_limit_sc = cbm_config_get_int(srv->config, CBM_CONFIG_SEARCH_LIMIT,
+                                                   CBM_DEFAULT_SEARCH_LIMIT);
+    int limit = cbm_mcp_get_int_arg(args, "limit", cfg_search_limit_sc);
     bool use_regex = cbm_mcp_get_bool_arg(args, "regex");
 
     if (!pattern) {
