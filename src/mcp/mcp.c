@@ -274,10 +274,7 @@ static const tool_def_t TOOLS[] = {
      "\"description\":\"full=individual results (default), summary=aggregate counts by label and "
      "file. Use summary first to understand scope, then full with filters to drill down."
      "\"},\"compact\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Omit redundant "
-     "name field when it matches the last segment of qualified_name. Reduces token usage.\"},"
-     "\"include_dependencies\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Include "
-     "indexed dependency symbols in results. Results from dependencies have source:dependency. "
-     "Default: false (only project code).\"}}}"},
+     "name field when it matches the last segment of qualified_name. Reduces token usage.\"}}}"},
 
     {"query_graph",
      "Execute a Cypher query against the knowledge graph for complex multi-hop patterns, "
