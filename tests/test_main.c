@@ -47,6 +47,7 @@ extern void suite_worker_pool(void);
 extern void suite_parallel(void);
 extern void suite_mem(void);
 extern void suite_ui(void);
+extern void suite_depindex(void);
 extern void suite_integration(void);
 
 int main(void) {
@@ -129,6 +130,9 @@ int main(void) {
 
     /* UI (config, embedded assets, layout) */
     RUN_SUITE(ui);
+
+    /* Dependency indexing */
+    RUN_SUITE(depindex);
 
     /* Integration (end-to-end) */
     RUN_SUITE(integration);
