@@ -22,18 +22,37 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 
 ## Quick Start
 
-1. **Download** the binary for your platform from the [latest release](https://github.com/DeusData/codebase-memory-mcp/releases/latest):
-   - `codebase-memory-mcp-<os>-<arch>.tar.gz` — standard (MCP server only)
-   - `codebase-memory-mcp-ui-<os>-<arch>.tar.gz` — with embedded graph visualization
+> **Important:** This fork includes 7 cross-repo service graph tools (Pub/Sub, GraphQL, database scanning) on top of the upstream 14 intra-repo tools. To get all 21 tools, you must **build from source** — pre-built binaries from the upstream project only include 14 tools.
 
-2. **Extract and install**:
-   ```bash
-   tar xzf codebase-memory-mcp-*.tar.gz
-   mv codebase-memory-mcp ~/.local/bin/
-   codebase-memory-mcp install
-   ```
+### Full build (all 21 tools — recommended)
 
-3. **Restart** your coding agent. Say **"Index this project"** — done.
+Prerequisites: C compiler (gcc/clang), Go 1.21+, zlib.
+
+```bash
+git clone https://github.com/Shidfar/codebase-memory-mcp.git
+cd codebase-memory-mcp
+make service-graph
+# Binary at: service-graph/bin/codebase-memory-mcp
+
+# Install to PATH and configure all detected agents:
+cp service-graph/bin/codebase-memory-mcp ~/.local/bin/
+codebase-memory-mcp install
+```
+
+### Pre-built binaries (14 intra-repo tools only)
+
+If you only need intra-repo code analysis (no cross-repo Pub/Sub, GraphQL, or database scanning), you can download a pre-built binary from the [upstream releases](https://github.com/DeusData/codebase-memory-mcp/releases/latest):
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/scripts/setup.sh | bash
+```
+
+> **Note:** Pre-built binaries include 14 tools: `index_repository`, `search_graph`, `query_graph`, `trace_call_path`, `get_code_snippet`, `get_graph_schema`, `get_architecture`, `search_code`, `list_projects`, `delete_project`, `index_status`, `detect_changes`, `manage_adr`, `ingest_traces`. The 7 service graph tools (`scan_repos`, `list_services`, `list_topics`, `trace_message`, `find_dependencies`, `get_graph`, `shared_resources`) require building from source.
+
+### Post-install
+
+Restart your coding agent. Say **"Index this project"** — done.
 
 The `install` command auto-detects all installed coding agents and configures MCP server entries, instruction files, skills, and pre-tool hooks for each.
 
@@ -166,20 +185,27 @@ You: "Install this MCP server: https://github.com/DeusData/codebase-memory-mcp"
 ### Build from Source
 
 <details>
-<summary>Prerequisites: C compiler + zlib</summary>
+<summary>Prerequisites</summary>
 
 | Requirement | Check | Install |
 |-------------|-------|---------|
 | **C compiler** (gcc or clang) | `gcc --version` or `clang --version` | macOS: `xcode-select --install`, Linux: `apt install build-essential` |
 | **C++ compiler** | `g++ --version` or `clang++ --version` | Same as above |
+| **Go 1.21+** | `go version` | [go.dev/dl](https://go.dev/dl/) |
 | **zlib** | — | macOS: included, Linux: `apt install zlib1g-dev` |
 | **Git** | `git --version` | Pre-installed on most systems |
 
 </details>
 
 ```bash
-git clone https://github.com/DeusData/codebase-memory-mcp.git
+git clone https://github.com/Shidfar/codebase-memory-mcp.git
 cd codebase-memory-mcp
+
+# Full build — all 21 tools (14 intra-repo + 7 cross-repo service graph)
+make service-graph
+# Binary at: service-graph/bin/codebase-memory-mcp
+
+# C-only build — 14 intra-repo tools only (no Go required)
 scripts/build.sh                    # standard binary
 scripts/build.sh --with-ui          # with graph visualization
 # Binary at: build/c/codebase-memory-mcp
@@ -321,6 +347,7 @@ SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across rest
 | `trace_call_path` returns 0 results | Use `search_graph(name_pattern=".*PartialName.*")` first to find the exact name. |
 | Queries return wrong project results | Add `project="name"` parameter. Use `list_projects` to see names. |
 | Binary not found after install | Add to PATH: `export PATH="$HOME/.local/bin:$PATH"` |
+| Only 14 tools showing, missing `scan_repos` etc. | You're running the C-only binary. Build from source with `make service-graph` to get all 21 tools. See [Quick Start](#quick-start). |
 | UI not loading | Ensure you downloaded the `ui` variant and ran `--ui=true`. Check `http://localhost:9749`. |
 
 ## Language Support
@@ -370,8 +397,11 @@ service-graph/        Go codebase (unified MCP binary entry point)
 ### Building
 
 ```bash
-make service-graph    # builds libcbm.a + Go binary → service-graph/bin/codebase-memory-mcp
+make service-graph    # builds libcbm.a + Go binary → service-graph/bin/codebase-memory-mcp (all 21 tools)
+make -f Makefile.cbm  # builds C-only libcbm.a + standalone binary (14 tools)
 ```
+
+See [Build from Source](#build-from-source) for prerequisites and install instructions.
 
 ## License
 
