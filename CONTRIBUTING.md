@@ -137,19 +137,33 @@ QA round fix commits must use the format `fix(scope): address QA round N` (e.g. 
 
    Do NOT prescribe what to test upfront. Discover what matters by reading the code.
 
-   Report format (use a markdown code block):
-   - Model used: (e.g., Claude Opus 4.6, GPT-5.3 Codex (high or xhigh), Gemini 3.1 Pro)
-   - What was tested
-   - Expected vs actual
-   - Severity (critical / major / minor)
-   - Confirmed vs hypothetical
-   ````
+   Report format — post as **rendered markdown**, not a fenced code block. Use this structure:
+
+   ```
+   ## QA Round N — `branch-name`
+
+   **Model used:** Claude Opus 4.6
+
+   ### Findings
+
+   **[Finding N] SEVERITY: Title**
+   - **What was tested:** ...
+   - **Expected vs actual:** ...
+   - **Severity:** critical / major / minor / nit
+   - **Confirmed vs hypothetical:** ...
+
+   ---
+
+   **SUMMARY: N critical, N major, N minor findings.**
+   ```
+
+   > **Formatting note:** Paste the report as plain markdown text in the PR comment box — do not wrap the entire report in a fenced code block (` ``` `). GitHub renders markdown in comments; wrapping it defeats this and makes the report harder to read.
 
    **Step B — Fix the findings.** Copy the QA report and paste it into your original working session (or a new session on the same branch). Tell it to fix the issues found. Each QA round's fixes must be a **separate commit** — do not amend previous commits. Use the format `fix(scope): address QA round N`.
 
    **Step C — Repeat.** Go back to Step A with a fresh session. The new QA round will see the fix commits from Step B and look for anything still missed. Continue until a round comes back clean or only has hypothetical/minor findings.
 
-   **Proving your work:** Paste each round's QA report as a separate comment on the PR. Reviewers will cross-reference the reports against the fix commits in the PR history.
+   **Proving your work:** Paste each round's QA report as a separate PR comment in rendered markdown. Reviewers will cross-reference the reports against the fix commits in the PR history.
 
 
 ## Security
