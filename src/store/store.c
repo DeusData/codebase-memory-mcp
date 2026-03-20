@@ -1852,8 +1852,9 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     // NOLINTNEXTLINE(readability-implicit-bool-conversion)
     const char *name_col = has_degree_wrap ? "name" : "n.name";
     char order_limit[128];
-    snprintf(order_limit, sizeof(order_limit), " ORDER BY %s LIMIT %d OFFSET %d", name_col, limit,
-             offset);
+    const char *id_col = has_degree_wrap ? "id" : "n.id";
+    snprintf(order_limit, sizeof(order_limit), " ORDER BY %s, %s LIMIT %d OFFSET %d", name_col,
+             id_col, limit, offset);
     strncat(sql, order_limit, sizeof(sql) - strlen(sql) - 1);
 
     /* Execute count query */

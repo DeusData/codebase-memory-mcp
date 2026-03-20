@@ -1957,7 +1957,7 @@ static void rb_add_row(result_builder_t *rb, const char **values) {
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters,readability-function-cognitive-complexity,readability-function-size)
 /* Hard ceiling: queries returning more than this trigger an error instead of data.
  * Prevents accidental multi-GB JSON payloads from unbounded MATCH (n) RETURN n. */
-#define CYPHER_RESULT_CEILING 100000
+#define CYPHER_RESULT_CEILING 10000
 
 /* ── Binding virtual variables (for WITH clause) ──────────────── */
 
