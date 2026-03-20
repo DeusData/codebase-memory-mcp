@@ -7,6 +7,7 @@ description: >
   "identify high fan-out functions", "find complex functions",
   "code quality audit", "find functions nobody calls",
   "reduce codebase size", "refactor candidates", "cleanup candidates",
+  "shared resources", "coupling between services", "dangling dependencies",
   or needs code quality analysis.
 ---
 
@@ -93,9 +94,41 @@ search_graph(
 )
 ```
 
+## Cross-Service Coupling Analysis (Service Graph)
+
+### Find shared resources (coupling points)
+
+```
+shared_resources
+```
+
+Lists resources (Pub/Sub topics, DB tables) accessed by multiple services — these are coupling hotspots.
+
+Filter by type:
+```
+shared_resources(filter="pubsub")
+shared_resources(filter="database")
+```
+
+### Detect dangling dependencies
+
+```
+shared_resources(filter="dangling")
+```
+
+Finds:
+- Topics subscribed to but never published (external publisher or missing code)
+- Topics published but never subscribed to (dead code or external consumer)
+- DB tables read but not owned (cross-service data dependency)
+
+These are potential dead code paths or unresolved external dependencies.
+
+**Important:** Run `scan_repos` once before using these tools.
+
 ## Key Tips
 
 - `search_graph` with degree filters has no row cap (unlike `query_graph` which caps at 200).
 - Use `file_pattern` to scope analysis to specific directories: `file_pattern="**/services/**"`.
 - Dead code detection works best after a full index — run `index_repository` if the project was recently set up.
 - Paginate results with `limit` and `offset` — check `has_more` in the response.
+- Use `shared_resources(filter="dangling")` for cross-service dead code detection (topics/tables with no matching publisher/owner).

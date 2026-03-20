@@ -4,8 +4,10 @@ description: >
   This skill should be used when the user asks "who calls this function",
   "what does X call", "trace the call chain", "find callers of",
   "show dependencies", "what depends on", "trace call path",
-  "find all references to", "impact analysis", or needs to understand
-  function call relationships and dependency chains.
+  "find all references to", "impact analysis", "trace message",
+  "who publishes this topic", "who subscribes to", "pubsub flow",
+  "message flow", or needs to understand function call relationships,
+  dependency chains, or cross-service message flows.
 ---
 
 # Call Chain Tracing via Knowledge Graph
@@ -116,6 +118,44 @@ detect_changes(scope="branch", base_branch="main")
 
 Returns changed files, changed symbols, and impacted callers with risk classification. Scopes: `unstaged`, `staged`, `all` (default), `branch`.
 
+## Cross-Repo Pub/Sub Tracing (Service Graph)
+
+For tracing message flows across services — who publishes and who subscribes.
+
+### Trace a Pub/Sub message flow
+
+```
+trace_message(topic="user-created")
+```
+
+Returns an ASCII flowchart: publisher → topic → subscribers, with file:line locations. Accepts partial topic names.
+
+### List all topics and their connections
+
+```
+list_topics
+```
+
+Shows every Pub/Sub topic with all publishers and subscribers.
+
+### Full service dependency view
+
+```
+find_dependencies(service="ddi-service")
+```
+
+Shows everything a service publishes, subscribes to, queries via GraphQL, and DB tables it accesses. Accepts partial names.
+
+### Find dangling dependencies (broken chains)
+
+```
+shared_resources(filter="dangling")
+```
+
+Shows topics subscribed but not published (external publisher), topics published but not subscribed (dead code?), and DB tables read but not owned.
+
+**Important:** Run `scan_repos` once before using these tools.
+
 ## Key Tips
 
 - Start with `depth=1` for quick answers, increase only if needed (max 5).
@@ -123,3 +163,4 @@ Returns changed files, changed symbols, and impacted callers with risk classific
 - `search_graph(relationship="HTTP_CALLS")` filters nodes by degree — it does NOT return edges. Use `query_graph` with Cypher to see actual edges with properties.
 - Results are capped at 200 nodes per trace.
 - `detect_changes` requires git in PATH.
+- For cross-service Pub/Sub tracing, use `trace_message` (service graph) instead of `trace_call_path` (intra-repo graph).

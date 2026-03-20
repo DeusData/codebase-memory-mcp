@@ -9,7 +9,9 @@ description: >
 
 # Codebase Memory MCP — Tool Reference
 
-## Tools (14 total)
+## Tools (21 total)
+
+### Intra-Repo Tools (14)
 
 | Tool | Purpose |
 |------|---------|
@@ -27,6 +29,18 @@ description: >
 | `read_file` | Read any file from indexed project |
 | `list_directory` | List files/directories with glob filter |
 | `ingest_traces` | Ingest OpenTelemetry traces to validate HTTP_CALLS edges |
+
+### Cross-Repo Service Graph Tools (7)
+
+| Tool | Purpose |
+|------|---------|
+| `scan_repos` | Scan repos and build service dependency graph (Pub/Sub, GraphQL, DB). Run first. |
+| `list_services` | List all discovered services with dependency counts |
+| `list_topics` | List all Pub/Sub topics with publishers and subscribers (with file:line) |
+| `trace_message` | Trace Pub/Sub flow: publisher → topic → subscribers. Accepts partial topic names. |
+| `find_dependencies` | Show all dependencies for a service grouped by type (pub/sub, GraphQL, DB). Accepts partial names. |
+| `get_graph` | Return full dependency graph as JSON. Filter: `all`, `pubsub`, `graphql`, `database`. |
+| `shared_resources` | Find coupling points: resources accessed by multiple services + dangling leaves. Filter: `all`, `pubsub`, `database`, `dangling`. |
 
 ## Edge Types
 
@@ -148,7 +162,26 @@ search_code(pattern="(?i)(POST|PUT).*\\/api\\/v[0-9]\\/orders", regex=true)
 | Full call context | `trace_call_path(direction="both")` |
 | Find by name pattern | `search_graph(name_pattern="...")` |
 | Dead code | `search_graph(max_degree=0, exclude_entry_points=true)` |
-| Cross-service edges | `query_graph` with Cypher |
+| Cross-service edges (intra-repo) | `query_graph` with Cypher |
 | Impact of local changes | `detect_changes()` |
 | Risk-classified trace | `trace_call_path(risk_labels=true)` |
 | Text search | `search_code` or Grep |
+| What services exist? | `list_services` |
+| How does service X connect? | `find_dependencies(service="X")` |
+| Who publishes/subscribes topic? | `trace_message(topic="X")` |
+| All Pub/Sub topics | `list_topics` |
+| Coupling between services | `shared_resources` |
+| Unresolved dependencies | `shared_resources(filter="dangling")` |
+| Full service graph as JSON | `get_graph(filter="all")` |
+
+## Service Graph Edge Types
+
+| Type | Meaning |
+|------|---------|
+| `publishes` | Service publishes to a Pub/Sub topic |
+| `subscribes` | Service subscribes to a Pub/Sub topic |
+| `graphql_query` | Service executes a GraphQL query |
+| `graphql_mutation` | Service executes a GraphQL mutation |
+| `graphql_exposes` | Service exposes a GraphQL schema |
+| `db_owns` | Service owns a database table (defined in models/migrations) |
+| `db_reads` | Service reads a database table (query calls) |
