@@ -12,6 +12,8 @@ description: >
 
 # Call Chain Tracing via Knowledge Graph
 
+**IMPORTANT: Always use these tools FIRST for tracing callers, dependencies, or impact analysis. Only fall back to Grep if graph tools return no results.**
+
 Use graph tools to trace function call relationships. One `trace_call_path` call replaces dozens of grep searches across files.
 
 ## Workflow

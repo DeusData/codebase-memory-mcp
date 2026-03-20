@@ -1,8 +1,9 @@
 # Codebase Knowledge Graph
 
-This project has a code knowledge graph available via MCP tools. Use it for
-structural questions instead of grep — one graph query returns what would take
-dozens of file-by-file searches.
+This project has a code knowledge graph available via MCP tools. **Always use
+these tools FIRST for code discovery, tracing, and structural questions.** Only
+fall back to grep/file search if graph tools return no results or insufficient
+data. One graph query returns what would take dozens of file-by-file searches.
 
 ## Finding Code
 

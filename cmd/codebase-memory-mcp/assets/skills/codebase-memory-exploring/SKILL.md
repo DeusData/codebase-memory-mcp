@@ -11,6 +11,8 @@ description: >
 
 # Codebase Exploration via Knowledge Graph
 
+**IMPORTANT: Always use these tools FIRST for any code exploration task. Only fall back to Grep/Glob if graph tools return no results or insufficient data.**
+
 Use graph tools for structural code questions. They return precise results in ~500 tokens vs ~80K for grep-based exploration.
 
 ## Workflow

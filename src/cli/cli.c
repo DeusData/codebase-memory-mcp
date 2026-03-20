@@ -1292,10 +1292,10 @@ int cbm_remove_antigravity_mcp(const char *config_path) {
 
 #define CMM_HOOK_MATCHER "Grep|Glob|Read|Search"
 #define CMM_HOOK_COMMAND                                                        \
-    "echo 'Reminder: prefer codebase-memory-mcp search_graph/trace_call_path/"  \
-    "get_code_snippet over Grep/Glob/Read/Search for code discovery. "          \
-    "Use get_code_snippet(qualified_name) instead of Read to view a function. " \
-    "Fall back only if MCP returns insufficient results.' >&2"
+    "echo 'STOP: You MUST try codebase-memory-mcp tools first "                \
+    "(search_graph/trace_call_path/get_code_snippet/search_code) before using " \
+    "Grep/Glob/Read. Only proceed with this tool if MCP returned no results "   \
+    "or you need raw text/string literal search.' >&2"
 
 /* Old matcher values from previous versions — recognized during upgrade so
  * upsert_hooks_json can remove them before inserting the current matcher. */

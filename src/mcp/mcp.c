@@ -229,9 +229,9 @@ static const tool_def_t TOOLS[] = {
      "\"full\"}},\"required\":[\"repo_path\"]}"},
 
     {"search_graph",
-     "Search the code knowledge graph for functions, classes, routes, and variables. Use INSTEAD "
-     "OF grep/glob when finding code definitions, implementations, or relationships. Returns "
-     "precise results in one call.",
+     "PREFERRED over Grep/Glob for code discovery. Search the knowledge graph for functions, "
+     "classes, routes, and variables. Returns precise results in one call. Fall back to Grep "
+     "only if this returns no matches.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"label\":{\"type\":"
      "\"string\"},\"name_pattern\":{\"type\":\"string\"},\"qn_pattern\":{\"type\":\"string\"},"
      "\"file_pattern\":{\"type\":\"string\"},\"relationship\":{\"type\":\"string\"},\"min_degree\":"
@@ -249,8 +249,8 @@ static const tool_def_t TOOLS[] = {
      "\"Optional row limit. Default: unlimited (100k ceiling)\"}},\"required\":[\"query\"]}"},
 
     {"trace_call_path",
-     "Trace function call paths — who calls a function and what it calls. Use INSTEAD OF grep when "
-     "finding callers, dependencies, or impact analysis.",
+     "PREFERRED over Grep for finding callers and dependencies. Trace function call paths — who "
+     "calls a function and what it calls. Fall back to Grep only if this returns no matches.",
      "{\"type\":\"object\",\"properties\":{\"function_name\":{\"type\":\"string\"},\"project\":{"
      "\"type\":\"string\"},\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\","
      "\"both\"],\"default\":\"both\"},\"depth\":{\"type\":\"integer\",\"default\":3},\"edge_"
@@ -258,9 +258,9 @@ static const tool_def_t TOOLS[] = {
      "name\"]}"},
 
     {"get_code_snippet",
-     "Read source code for a function/class/symbol. IMPORTANT: First call search_graph to find the "
-     "exact qualified_name, then pass it here. This is a read tool, not a search tool. Accepts "
-     "full qualified_name (exact match) or short function name (returns suggestions if ambiguous).",
+     "PREFERRED over Read for viewing function/class source code. First call search_graph to find "
+     "the exact qualified_name, then pass it here. Accepts full qualified_name (exact match) or "
+     "short function name (returns suggestions if ambiguous). Fall back to Read only if needed.",
      "{\"type\":\"object\",\"properties\":{\"qualified_name\":{\"type\":\"string\",\"description\":"
      "\"Full qualified_name from search_graph, or short function name\"},\"project\":{"
      "\"type\":\"string\"},\"include_neighbors\":{"
@@ -270,14 +270,14 @@ static const tool_def_t TOOLS[] = {
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}}}"},
 
     {"get_architecture",
-     "Get high-level architecture overview — packages, services, dependencies, and project "
-     "structure at a glance.",
+     "PREFERRED over file exploration for understanding project structure. Get high-level "
+     "architecture overview — packages, services, dependencies, and project structure at a glance.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"aspects\":{\"type\":"
      "\"array\",\"items\":{\"type\":\"string\"}}}}"},
 
     {"search_code",
-     "Search source code content with text or regex patterns. Use for string literals, error "
-     "messages, and config values that are not in the knowledge graph.",
+     "Search source code content with text or regex patterns. Use this INSTEAD of Grep for "
+     "string literals, error messages, and config values within indexed projects.",
      "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"project\":{\"type\":"
      "\"string\"},\"file_pattern\":{\"type\":\"string\"},\"regex\":{\"type\":\"boolean\","
      "\"default\":false},\"limit\":{\"type\":\"integer\",\"description\":\"Max results. Default: "

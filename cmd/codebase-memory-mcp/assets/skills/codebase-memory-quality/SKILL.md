@@ -13,6 +13,8 @@ description: >
 
 # Code Quality Analysis via Knowledge Graph
 
+**IMPORTANT: Always use these tools FIRST for code quality analysis. Only fall back to Grep if graph tools return no results.**
+
 Use graph degree filtering to find dead code, high-complexity functions, and refactor candidates — all in single tool calls.
 
 ## Workflow
