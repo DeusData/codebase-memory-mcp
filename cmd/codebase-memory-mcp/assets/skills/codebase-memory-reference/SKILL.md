@@ -9,7 +9,7 @@ description: >
 
 # Codebase Memory MCP — Tool Reference
 
-## Tools (14 total)
+## Tools (15 total)
 
 | Tool | Purpose |
 |------|---------|
@@ -17,15 +17,14 @@ description: >
 | `index_status` | Check indexing status (ready/indexing/not found) |
 | `list_projects` | List all indexed projects with timestamps and counts |
 | `delete_project` | Remove a project from the graph |
-| `search_graph` | Structured search with filters (name, label, degree, file pattern) |
+| `search_graph` | Structured search with filters (name, label, degree, file pattern). Use `include_dependencies=true` to include library symbols. |
 | `search_code` | Grep-like text search within indexed project files |
 | `trace_call_path` | BFS call chain traversal (exact name match required). Supports `risk_labels=true` for impact classification. |
 | `detect_changes` | Map git diff to affected symbols + blast radius with risk scoring |
 | `query_graph` | Cypher-like graph queries (200-row cap) |
 | `get_graph_schema` | Node/edge counts, relationship patterns |
 | `get_code_snippet` | Read source code by qualified name |
-| `read_file` | Read any file from indexed project |
-| `list_directory` | List files/directories with glob filter |
+| `index_dependencies` | Index dependency/library source into separate `_deps.db`. Use `include_dependencies=true` on query tools to include. |
 | `ingest_traces` | Ingest OpenTelemetry traces to validate HTTP_CALLS edges |
 
 ## Edge Types
@@ -152,3 +151,5 @@ search_code(pattern="(?i)(POST|PUT).*\\/api\\/v[0-9]\\/orders", regex=true)
 | Impact of local changes | `detect_changes()` |
 | Risk-classified trace | `trace_call_path(risk_labels=true)` |
 | Text search | `search_code` or Grep |
+| Search library APIs | `search_graph(include_dependencies=true)` |
+| Index library source | `index_dependencies(project=..., package_manager=...)` |
