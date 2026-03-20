@@ -48,6 +48,7 @@ extern void suite_parallel(void);
 extern void suite_mem(void);
 extern void suite_ui(void);
 extern void suite_token_reduction(void);
+extern void suite_depindex(void);
 extern void suite_integration(void);
 
 int main(void) {
@@ -133,6 +134,9 @@ int main(void) {
 
     /* Token reduction */
     RUN_SUITE(token_reduction);
+
+    /* Dependency indexing */
+    RUN_SUITE(depindex);
 
     /* Integration (end-to-end) */
     RUN_SUITE(integration);
