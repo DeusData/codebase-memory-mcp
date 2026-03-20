@@ -329,6 +329,20 @@ static const tool_def_t TOOLS[] = {
     {"ingest_traces", "Ingest runtime traces to enhance the knowledge graph",
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\"},\"project\":{\"type\":"
      "\"string\"}},\"required\":[\"traces\"]}"},
+
+    {"index_dependencies",
+     "Index dependency/library source code into a SEPARATE dependency graph for API reference. "
+     "Dependency symbols are stored in {project}_deps.db and are NOT included in queries unless "
+     "include_dependencies=true is passed. This prevents confusion between your code and library code.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"project\":{\"type\":\"string\",\"description\":\"Existing project to add dependencies to\"},"
+     "\"package_manager\":{\"type\":\"string\",\"enum\":[\"uv\",\"cargo\",\"npm\",\"bun\"],"
+     "\"description\":\"Package manager to resolve dependencies from\"},"
+     "\"packages\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
+     "\"description\":\"Package names to index (omit for auto-detect from lockfiles)\"},"
+     "\"public_only\":{\"type\":\"boolean\",\"default\":true,"
+     "\"description\":\"Index only exported/public symbols\"}"
+     "},\"required\":[\"project\",\"package_manager\"]}"},
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
@@ -800,6 +814,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
     bool compact = cbm_mcp_get_bool_arg(args, "compact");
     char *search_mode = cbm_mcp_get_string_arg(args, "mode");
+    bool include_deps = cbm_mcp_get_bool_arg(args, "include_dependencies");
     int min_degree = cbm_mcp_get_int_arg(args, "min_degree", -1);
     int max_degree = cbm_mcp_get_int_arg(args, "max_degree", -1);
 
@@ -891,6 +906,10 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                                    sr->node.file_path ? sr->node.file_path : "");
             yyjson_mut_obj_add_int(doc, item, "in_degree", sr->in_degree);
             yyjson_mut_obj_add_int(doc, item, "out_degree", sr->out_degree);
+            /* AI grounding: mark source provenance when dependencies are included */
+            if (include_deps) {
+                yyjson_mut_obj_add_str(doc, item, "source", "project");
+            }
             yyjson_mut_arr_add_val(results, item);
         }
         yyjson_mut_obj_add_val(doc, root, "results", results);
@@ -2231,6 +2250,47 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+/* ── index_dependencies ───────────────────────────────────────── */
+
+static char *handle_index_dependencies(cbm_mcp_server_t *srv, const char *args) {
+    char *project = cbm_mcp_get_string_arg(args, "project");
+    char *pkg_mgr = cbm_mcp_get_string_arg(args, "package_manager");
+
+    if (!project) {
+        free(pkg_mgr);
+        return cbm_mcp_text_result("project is required", true);
+    }
+    if (!pkg_mgr) {
+        free(project);
+        return cbm_mcp_text_result("package_manager is required", true);
+    }
+
+    /* TODO: Implement full dependency indexing pipeline.
+     * For now, return a structured response indicating the tool is registered
+     * but full dep resolution/indexing is not yet implemented. */
+    (void)srv;
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    yyjson_mut_obj_add_str(doc, root, "status", "not_yet_implemented");
+    yyjson_mut_obj_add_str(doc, root, "project", project);
+    yyjson_mut_obj_add_str(doc, root, "package_manager", pkg_mgr);
+    yyjson_mut_obj_add_str(doc, root, "note",
+                           "Dependency indexing pipeline (depindex module) not yet built. "
+                           "Tool registered and parameter validation works.");
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    free(project);
+    free(pkg_mgr);
+
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
@@ -2282,6 +2342,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "ingest_traces") == 0) {
         return handle_ingest_traces(srv, args_json);
+    }
+    if (strcmp(tool_name, "index_dependencies") == 0) {
+        return handle_index_dependencies(srv, args_json);
     }
 
     char msg[256];
