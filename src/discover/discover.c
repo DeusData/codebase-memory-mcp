@@ -87,9 +87,12 @@ static const char *FAST_PATTERNS[] = {".d.ts",      ".bundle.", ".chunk.", ".gen
 
 /* ── Ignored JSON filenames ──────────────────────────────────────── */
 
+/* package.json and composer.json REMOVED — they contain dep declarations
+ * needed by pass_configlink and dep auto-discovery. Tree-sitter JSON
+ * grammar + extract_defs.c already handle them correctly. */
 static const char *IGNORED_JSON_FILES[] = {
-    "package.json",       "package-lock.json", "tsconfig.json",
-    "jsconfig.json",      "composer.json",     "composer.lock",
+    "package-lock.json",  "tsconfig.json",
+    "jsconfig.json",      "composer.lock",
     "yarn.lock",          "openapi.json",      "swagger.json",
     "jest.config.json",   ".eslintrc.json",    ".prettierrc.json",
     ".babelrc.json",      "tslint.json",       "angular.json",
@@ -129,9 +132,26 @@ static bool str_contains(const char *s, const char *sub) {
 
 /* ── Public filter functions ─────────────────────────────────────── */
 
+/* DEP mode: minimal skip list — only VCS, IDE, caches, test dirs.
+ * Keeps vendor/, dist/, bin/, scripts/, third_party/ for dep source. */
+static const char *DEP_SKIP_DIRS[] = {
+    ".git", ".hg", ".svn",
+    ".idea", ".vs", ".vscode",
+    "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".cache", "htmlcov", "coverage",
+    "node_modules",
+    ".next", ".nuxt", ".angular",
+    "__tests__", "__mocks__", "__snapshots__",
+    NULL
+};
+
 bool cbm_should_skip_dir(const char *dirname, cbm_index_mode_t mode) {
     if (!dirname) {
         return false;
+    }
+
+    if (mode == CBM_MODE_DEP) {
+        return str_in_list(dirname, DEP_SKIP_DIRS);
     }
 
     if (str_in_list(dirname, ALWAYS_SKIP_DIRS)) {
@@ -158,7 +178,7 @@ bool cbm_has_ignored_suffix(const char *filename, cbm_index_mode_t mode) {
         }
     }
 
-    if (mode == CBM_MODE_FAST) {
+    if (mode == CBM_MODE_FAST || mode == CBM_MODE_DEP) {
         for (int i = 0; FAST_IGNORED_SUFFIXES[i]; i++) {
             if (ends_with(filename, FAST_IGNORED_SUFFIXES[i])) {
                 return true;
@@ -174,7 +194,7 @@ bool cbm_should_skip_filename(const char *filename, cbm_index_mode_t mode) {
         return false;
     }
 
-    if (mode == CBM_MODE_FAST) {
+    if (mode == CBM_MODE_FAST || mode == CBM_MODE_DEP) {
         if (str_in_list(filename, FAST_SKIP_FILENAMES)) {
             return true;
         }
@@ -183,8 +203,29 @@ bool cbm_should_skip_filename(const char *filename, cbm_index_mode_t mode) {
     return false;
 }
 
+/* DEP mode skip patterns: skip tests/mocks but NOT .d.ts (TS API surface) */
+static const char *DEP_SKIP_PATTERNS[] = {
+    ".spec.", ".test.", ".stories.",
+    "mock_", "_mock.", "_test_helpers.",
+    ".generated.", ".pb.go", "_pb2.py",
+    NULL
+};
+
 bool cbm_matches_fast_pattern(const char *filename, cbm_index_mode_t mode) {
-    if (!filename || mode != CBM_MODE_FAST) {
+    if (!filename) {
+        return false;
+    }
+
+    if (mode == CBM_MODE_DEP) {
+        for (int i = 0; DEP_SKIP_PATTERNS[i]; i++) {
+            if (str_contains(filename, DEP_SKIP_PATTERNS[i])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (mode != CBM_MODE_FAST) {
         return false;
     }
 

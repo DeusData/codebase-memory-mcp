@@ -38,6 +38,7 @@ struct cbm_pipeline {
     char *project_name;
     cbm_index_mode_t mode;
     atomic_int cancelled;
+    cbm_store_t *flush_store; /* when set, use flush_to_store instead of dump_to_sqlite */
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -87,6 +88,17 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     return p;
 }
 
+void cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
+    if (!p || !name) return;
+    free(p->project_name);
+    p->project_name = strdup(name);
+}
+
+void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store) {
+    if (!p) return;
+    p->flush_store = store;
+}
+
 void cbm_pipeline_free(cbm_pipeline_t *p) {
     if (!p) {
         return;
@@ -94,7 +106,7 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     free(p->repo_path);
     free(p->db_path);
     free(p->project_name);
-    /* gbuf, store, registry freed during/after run */
+    /* gbuf, store, registry freed during/after run. flush_store NOT owned by pipeline. */
     free(p);
 }
 
@@ -643,7 +655,11 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
             cbm_mkdir_p(db_dir, 0755);
         }
 
-        rc = cbm_gbuf_dump_to_sqlite(p->gbuf, db_path);
+        if (p->flush_store) {
+            rc = cbm_gbuf_flush_to_store(p->gbuf, p->flush_store);
+        } else {
+            rc = cbm_gbuf_dump_to_sqlite(p->gbuf, db_path);
+        }
         if (rc != 0) {
             cbm_log_error("pipeline.err", "phase", "dump");
             goto cleanup;

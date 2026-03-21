@@ -99,22 +99,24 @@ int cbm_store_restore_from(cbm_store_t *dst, cbm_store_t *src);
 /* ── Search ─────────────────────────────────────────────────────── */
 
 typedef struct {
-    const char *project;
-    const char *label;        /* NULL = any label */
-    const char *name_pattern; /* regex on name, NULL = any */
-    const char *qn_pattern;   /* regex on qualified_name, NULL = any */
-    const char *file_pattern; /* glob on file_path, NULL = any */
-    const char *relationship; /* edge type filter, NULL = any */
-    const char *direction;    /* "inbound" / "outbound" / "any", NULL = any */
-    int min_degree;           /* -1 = no filter (default), 0+ = minimum */
-    int max_degree;           /* -1 = no filter (default), 0+ = maximum */
-    int limit;                /* 0 = default (10) */
+    const char *project;          /* exact or prefix match */
+    const char *project_pattern;  /* LIKE pattern (from glob), mutually exclusive with project */
+    bool project_exact;           /* true = exact match only (no prefix), used for "self" */
+    const char *label;            /* NULL = any label */
+    const char *name_pattern;     /* regex on name, NULL = any */
+    const char *qn_pattern;       /* regex on qualified_name, NULL = any */
+    const char *file_pattern;     /* glob on file_path, NULL = any */
+    const char *relationship;     /* edge type filter, NULL = any */
+    const char *direction;        /* "inbound" / "outbound" / "any", NULL = any */
+    int min_degree;               /* -1 = no filter (default), 0+ = minimum */
+    int max_degree;               /* -1 = no filter (default), 0+ = maximum */
+    int limit;                    /* 0 = default (10) */
     int offset;
     bool exclude_entry_points;
     bool include_connected;
-    const char *sort_by; /* "relevance" / "name" / "degree", NULL = relevance */
+    const char *sort_by;          /* "relevance" / "name" / "degree", NULL = relevance */
     bool case_sensitive;
-    const char **exclude_labels; /* NULL-terminated array, or NULL */
+    const char **exclude_labels;  /* NULL-terminated array, or NULL */
 } cbm_search_params_t;
 
 typedef struct {
