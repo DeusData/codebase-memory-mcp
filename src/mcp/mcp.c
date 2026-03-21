@@ -20,6 +20,7 @@
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
+#include <sqlite3.h>
 
 #ifdef _WIN32
 #include <process.h> /* _getpid */
@@ -750,6 +751,71 @@ static void fill_project_params(const project_expand_t *pe, cbm_search_params_t 
 
 /* ── Tool handler implementations ─────────────────────────────── */
 
+/* Validate that a file is a codebase-memory-mcp SQLite database.
+ * Returns true if file has SQLite magic bytes AND contains the expected
+ * 'nodes' table (core schema indicator).
+ * On ANY error: returns false, logs actionable warning to stderr,
+ * does NOT crash, does NOT hang, does NOT modify the file.
+ * Opens read-only with busy_timeout to avoid hanging on locked files. */
+static bool validate_cbm_db(const char *path) {
+    if (!path) return false;
+
+    struct stat vst;
+    if (stat(path, &vst) != 0) return false;
+    if (vst.st_size == 0) {
+        cbm_log_warn("db.skip", "path", path, "reason", "empty_file");
+        return false;
+    }
+
+    /* Check SQLite magic bytes (first 16 bytes = "SQLite format 3\0") */
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        cbm_log_warn("db.skip", "path", path, "reason", "cannot_open");
+        return false;
+    }
+    char magic[16];
+    size_t n = fread(magic, 1, 16, f);
+    fclose(f);
+    if (n < 16 || memcmp(magic, "SQLite format 3", 15) != 0) {
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        cbm_log_warn("db.skip", "file", base, "reason", "not_sqlite");
+        return false;
+    }
+
+    /* Open READ-ONLY — never modify foreign databases.
+     * Check for 'nodes' table which is the core cbm schema indicator. */
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL);
+    if (rc != SQLITE_OK) {
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        cbm_log_warn("db.skip", "file", base, "reason", "sqlite_open_failed");
+        if (db) sqlite3_close(db);
+        return false;
+    }
+    sqlite3_busy_timeout(db, 1000); /* 1s max — don't hang on locked files */
+
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db,
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes' LIMIT 1;",
+        -1, &stmt, NULL);
+    bool valid = false;
+    if (rc == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+        valid = true;
+    } else {
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        cbm_log_warn("db.skip", "file", base,
+                     "reason", "not_cbm_database",
+                     "hint", "File in cache dir lacks codebase-memory-mcp schema. "
+                             "Move it aside if not needed.");
+    }
+    if (stmt) sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return valid;
+}
+
 /* list_projects: scan cache directory for .db files.
  * Each project is a single .db file — no central registry needed. */
 static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
@@ -777,9 +843,10 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
                 continue;
             }
 
-            /* Skip temp/internal files */
+            /* Skip temp/internal files and corrupt project names */
             if (strncmp(name, "tmp-", 4) == 0 || strncmp(name, "_", 1) == 0 ||
-                strncmp(name, ":memory:", 8) == 0) {
+                strncmp(name, ":memory:", 8) == 0 ||
+                strcmp(name, "..db") == 0 || strcmp(name, ".db") == 0) {
                 continue;
             }
 
@@ -787,11 +854,22 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
             char project_name[1024];
             snprintf(project_name, sizeof(project_name), "%.*s", (int)(len - 3), name);
 
+            /* Skip invalid project names (corrupt entries like ..db) */
+            if (project_name[0] == '\0' || strcmp(project_name, ".") == 0 ||
+                strcmp(project_name, "..") == 0) {
+                continue;
+            }
+
             /* Get file metadata */
             char full_path[2048];
             snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name);
             struct stat st;
             if (stat(full_path, &st) != 0) {
+                continue;
+            }
+
+            /* Validate db structure before opening — skip corrupt/non-cbm files */
+            if (!validate_cbm_db(full_path)) {
                 continue;
             }
 
@@ -2473,6 +2551,17 @@ static void detect_session(cbm_mcp_server_t *srv) {
         char *name = cbm_project_name_from_path(srv->session_root);
         snprintf(srv->session_project, sizeof(srv->session_project), "%s", name);
         free(name);
+    }
+
+    /* Validate derived project name — don't create dbs for empty/dot names */
+    if (srv->session_project[0] == '\0' ||
+        strcmp(srv->session_project, ".") == 0 ||
+        strcmp(srv->session_project, "..") == 0) {
+        cbm_log_warn("session.invalid_name", "derived", srv->session_project,
+                     "cwd", srv->session_root,
+                     "hint", "Cannot derive valid project name from CWD");
+        srv->session_project[0] = '\0';
+        srv->session_root[0] = '\0';
     }
 }
 
