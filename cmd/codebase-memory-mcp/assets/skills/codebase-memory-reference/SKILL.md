@@ -9,7 +9,7 @@ description: >
 
 # Codebase Memory MCP — Tool Reference
 
-## Tools (15 total)
+## Tools (14 total)
 
 | Tool | Purpose |
 |------|---------|
@@ -24,7 +24,6 @@ description: >
 | `query_graph` | Cypher-like graph queries. Output capped at `max_output_bytes` (default 32KB). |
 | `get_graph_schema` | Node/edge counts, relationship patterns |
 | `get_code_snippet` | Read source code by qualified name. Supports `mode=signature` (API only) and `mode=head_tail` (preserve start+end). |
-| `index_dependencies` | Index dependency/library source into separate `_deps.db`. Use `include_dependencies=true` on query tools to include. |
 | `ingest_traces` | Ingest OpenTelemetry traces to validate HTTP_CALLS edges |
 
 ## Edge Types
@@ -144,7 +143,6 @@ These parameters reduce response size (tokens) without affecting indexed data:
 | `max_lines=N` | `get_code_snippet` | Cap source lines (default 200, set 0 for unlimited) |
 | `max_output_bytes=N` | `query_graph` | Cap response bytes (default 32KB, set 0 for unlimited) |
 | `max_results=N` | `trace_call_path` | Cap BFS results per direction (default 25) |
-| `include_dependencies=true` | `search_graph` | Include dependency symbols (marked with `source:dependency`) |
 
 All defaults are configurable via `codebase-memory-mcp config set <key> <value>`:
 `search_limit`, `snippet_max_lines`, `trace_max_results`, `query_max_output_bytes`.
@@ -173,5 +171,3 @@ All defaults are configurable via `codebase-memory-mcp config set <key> <value>`
 | Quick codebase overview | `search_graph(mode="summary")` |
 | Function API only | `get_code_snippet(mode="signature")` |
 | Large function safely | `get_code_snippet(mode="head_tail")` |
-| Search library APIs | `search_graph(include_dependencies=true)` |
-| Index library source | `index_dependencies(project=..., package_manager=...)` |
