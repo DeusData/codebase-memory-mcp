@@ -118,7 +118,7 @@ QA round fix commits must use the format `fix(scope): address QA round N` (e.g. 
    - Sidebar-linked issues (via the GitHub "Development" section on the PR)
 2. Describe what changed and why. Include before/after if relevant.
 3. Test your changes against at least one real project (not the repo itself).
-4. **Run QA review before marking ready.** Repeat this cycle at least 3 times (or until the latest report contains no confirmed critical/major issues):
+4. **Run QA review before marking ready.** Run this cycle until a round comes back clean (no confirmed critical or major findings). If the first round is already clean, no further rounds are needed:
 
    > **Docs-only or trivial PRs:** The QA round requirement only applies when the PR touches logic paths. PRs that only change docs, CI config, or repo metadata skip the check automatically.
 
