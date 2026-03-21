@@ -53,4 +53,22 @@ char **cbm_str_split(CBMArena *a, const char *s, char delim, int *out_count);
  * Returns true if safe, false if the string contains shell metacharacters. */
 bool cbm_validate_shell_arg(const char *s);
 
+/* Safe snprintf append: clamps offset to prevent buffer overflow on truncation.
+ * When snprintf truncates, it returns what it WOULD have written, which can make
+ * offset > bufsize. Next call: bufsize - offset wraps unsigned → huge → overflow.
+ * This macro guards against that by checking bounds before writing and clamping after.
+ *
+ * Usage: CBM_SNPRINTF_APPEND(buf, sizeof(buf), off, "fmt %s", arg);
+ * Requires: <stdio.h> included by caller. */
+#define CBM_SNPRINTF_APPEND(buf, sz, off, ...)                                       \
+    do {                                                                             \
+        if ((off) >= 0 && (off) < (int)(sz)) {                                       \
+            int _cbm_r = snprintf((buf) + (off), (sz) - (size_t)(off), __VA_ARGS__); \
+            if (_cbm_r > 0)                                                          \
+                (off) += _cbm_r;                                                     \
+            if ((off) >= (int)(sz))                                                  \
+                (off) = (int)(sz) - 1;                                               \
+        }                                                                            \
+    } while (0)
+
 #endif /* CBM_STR_UTIL_H */

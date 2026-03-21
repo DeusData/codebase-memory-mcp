@@ -11,6 +11,7 @@ Contributions are welcome. This guide covers setup, testing, and PR guidelines.
 ```bash
 git clone https://github.com/DeusData/codebase-memory-mcp.git
 cd codebase-memory-mcp
+git config core.hooksPath scripts/hooks  # activates pre-commit security checks
 scripts/build.sh
 ```
 

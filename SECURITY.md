@@ -26,6 +26,10 @@ This project implements multiple layers of security verification. Every release 
   - Layer 7: MCP robustness (23 adversarial JSON-RPC payloads)
   - Layer 8: Vendored dependency integrity (SHA-256 checksums, dangerous call scan)
 - **All dangerous function calls** require a reviewed entry in `scripts/security-allowlist.txt`
+- **Time-bomb pattern detection** — scans for `time()`/`sleep()` near dangerous calls (could indicate delayed activation)
+- **MCP tool handler file read audit** — tracks file read count in `mcp.c` against an expected maximum (detects added file reads that could exfiltrate data through tool responses)
+- **CodeQL SAST** — static application security testing on every push (taint analysis, CWE detection, data flow tracking). Any open alert blocks the release.
+- **Fuzz testing** — random/mutated inputs to MCP server and Cypher parser (60 seconds per build). Catches crashes, segfaults, and memory errors that structured tests miss.
 - **Native antivirus scanning** on every platform (any detection fails the build):
   - **Windows**: Windows Defender with ML heuristics — the same engine end users run
   - **Linux**: ClamAV with daily signature updates

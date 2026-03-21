@@ -383,11 +383,6 @@ int cbm_scan_project_env_urls(const char *root_path, cbm_env_binding_t *out, int
                 continue;
             }
 
-            /* Skip large files (>1MB) */
-            if (st.st_size > (long)1024 * 1024) {
-                continue;
-            }
-
             /* Determine file type */
             file_type_t ft = detect_file_type(ent->name);
             if (ft == FT_UNKNOWN) {
@@ -400,9 +395,16 @@ int cbm_scan_project_env_urls(const char *root_path, cbm_env_binding_t *out, int
                 rel++;
             }
 
-            /* Read and scan file line by line */
+            /* Open first, then fstat on fd to avoid TOCTOU race */
             FILE *f = fopen(full_path, "r");
             if (!f) {
+                continue;
+            }
+
+            /* Recheck size on the open fd (not the path) */
+            struct stat fst;
+            if (fstat(fileno(f), &fst) != 0 || fst.st_size > (long)1024 * 1024) {
+                fclose(f);
                 continue;
             }
 
