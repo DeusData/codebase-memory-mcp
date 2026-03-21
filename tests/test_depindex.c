@@ -457,6 +457,78 @@ TEST(dep_discover_max_files_guard) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  FIXTURE: Project + dep nodes in same db for integration tests
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Create an MCP server with project AND dep nodes indexed. */
+static cbm_mcp_server_t *setup_proj_with_deps(char *tmp_dir, size_t tmp_sz) {
+    snprintf(tmp_dir, tmp_sz, "/tmp/cbm_depfull_XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir))
+        return NULL;
+
+    char proj_dir[512];
+    snprintf(proj_dir, sizeof(proj_dir), "%s/project", tmp_dir);
+    cbm_mkdir(proj_dir);
+
+    /* Write a source file */
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/app.py", proj_dir);
+    FILE *fp = fopen(src_path, "w");
+    if (!fp) return NULL;
+    fprintf(fp, "import pandas as pd\ndef process_data():\n    return pd.DataFrame()\n");
+    fclose(fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) return NULL;
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    if (!st) { cbm_mcp_server_free(srv); return NULL; }
+
+    const char *proj_name = "testproj";
+    cbm_mcp_server_set_project(srv, proj_name);
+    cbm_mcp_server_set_session_project(srv, proj_name);
+    cbm_store_upsert_project(st, proj_name, proj_dir);
+
+    /* Project node */
+    cbm_node_t n1 = {0};
+    n1.project = proj_name;
+    n1.label = "Function";
+    n1.name = "process_data";
+    n1.qualified_name = "testproj.app.process_data";
+    n1.file_path = "app.py";
+    n1.start_line = 2;
+    n1.end_line = 3;
+    n1.properties_json = "{\"is_exported\":true}";
+    cbm_store_upsert_node(st, &n1);
+
+    /* Dep nodes */
+    cbm_store_upsert_project(st, "testproj.dep.pandas", "/tmp/pandas");
+
+    cbm_node_t n_df = {0};
+    n_df.project = "testproj.dep.pandas";
+    n_df.label = "Class";
+    n_df.name = "DataFrame";
+    n_df.qualified_name = "testproj.dep.pandas.DataFrame";
+    n_df.file_path = "pandas/core/frame.py";
+    n_df.start_line = 100;
+    n_df.end_line = 500;
+    n_df.properties_json = "{\"is_exported\":true}";
+    cbm_store_upsert_node(st, &n_df);
+
+    cbm_node_t n_read = {0};
+    n_read.project = "testproj.dep.pandas";
+    n_read.label = "Function";
+    n_read.name = "read_csv";
+    n_read.qualified_name = "testproj.dep.pandas.read_csv";
+    n_read.file_path = "pandas/io/parsers.py";
+    n_read.start_line = 50;
+    n_read.end_line = 80;
+    n_read.properties_json = "{\"is_exported\":true}";
+    cbm_store_upsert_node(st, &n_read);
+
+    return srv;
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  DEPINDEX HELPER UNIT TESTS
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -642,6 +714,106 @@ TEST(test_dep_reindex_replaces) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  RESULT TAGGING: source field on all search results
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(test_search_results_have_source_field) {
+    /* ALL search results must have source:"project" or source:"dependency" */
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_proj_with_deps(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* Search with no project filter — should return both project + dep nodes */
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"testproj\","
+                                    "\"label\":\"Function\"}");
+    char *resp = extract_text_content_di(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    /* Project results must have source:"project" */
+    ASSERT_NOT_NULL(strstr(resp, "\"source\":\"project\""));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
+TEST(test_search_dep_results_tagged_dependency) {
+    /* Dep results must have source:"dependency", package, read_only */
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_proj_with_deps(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* Search dep nodes via project_pattern */
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"testproj\","
+                                    "\"label\":\"Class\"}");
+    char *resp = extract_text_content_di(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    /* DataFrame is a dep node — should have source:dependency */
+    if (strstr(resp, "DataFrame")) {
+        ASSERT_NOT_NULL(strstr(resp, "\"source\":\"dependency\""));
+        ASSERT_NOT_NULL(strstr(resp, "\"read_only\":true"));
+        ASSERT_NOT_NULL(strstr(resp, "\"package\":\"pandas\""));
+    }
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
+TEST(test_search_response_has_session_project) {
+    /* Every response must include session_project */
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_proj_with_deps(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"testproj\","
+                                    "\"label\":\"Function\"}");
+    char *resp = extract_text_content_di(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    ASSERT_NOT_NULL(strstr(resp, "\"session_project\":\"testproj\""));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  INDEX STATUS: dep info in response
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(test_index_status_shows_deps) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_proj_with_deps(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(srv, "index_status",
+                                    "{\"project\":\"testproj\"}");
+    char *resp = extract_text_content_di(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    /* Should include dependency info */
+    ASSERT_TRUE(strstr(resp, "\"dependencies\"") != NULL ||
+                strstr(resp, "\"dependency_count\"") != NULL);
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -684,4 +856,12 @@ SUITE(depindex) {
     RUN_TEST(test_resolve_npm_node_modules);
     RUN_TEST(test_pipeline_set_project_name);
     RUN_TEST(test_dep_reindex_replaces);
+
+    /* Result tagging */
+    RUN_TEST(test_search_results_have_source_field);
+    RUN_TEST(test_search_dep_results_tagged_dependency);
+    RUN_TEST(test_search_response_has_session_project);
+
+    /* Index status deps */
+    RUN_TEST(test_index_status_shows_deps);
 }

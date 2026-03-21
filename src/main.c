@@ -17,6 +17,7 @@
 #include "watcher/watcher.h"
 #include "pipeline/pipeline.h"
 #include "store/store.h"
+#include "depindex/depindex.h"
 #include "cli/cli.h"
 #include "foundation/log.h"
 #include "foundation/compat_thread.h"
@@ -85,6 +86,19 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
 
     int rc = cbm_pipeline_run(p);
     cbm_pipeline_free(p);
+
+    /* Re-index dependencies after fresh dump. Uses cbm_project_name_from_path
+     * for consistent naming (matches pipeline's project_name derivation). */
+    if (rc == 0) {
+        char *pname = cbm_project_name_from_path(root_path);
+        cbm_store_t *store = cbm_store_open(pname);
+        if (store) {
+            cbm_dep_auto_index(pname, root_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT);
+            cbm_store_close(store);
+        }
+        free(pname);
+    }
+    cbm_mem_collect();
     return rc;
 }
 
