@@ -91,6 +91,18 @@ static int create_test_project(void) {
                "}\n");
     fclose(f);
 
+    /* Generated artifact under build/ should be ignored by search_code */
+    snprintf(path, sizeof(path), "%s/build", g_tmpdir);
+    if (cbm_mkdir(path) != 0)
+        return -1;
+
+    snprintf(path, sizeof(path), "%s/build/artifact.txt", g_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "greet should not be returned from generated artifacts\n");
+    fclose(f);
+
     return 0;
 }
 
@@ -367,6 +379,19 @@ TEST(integ_mcp_get_architecture) {
     PASS();
 }
 
+TEST(integ_mcp_search_code_ignores_build_artifacts) {
+    char args[256];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"pattern\":\"greet\",\"limit\":10}",
+             g_project);
+
+    char *resp = call_tool("search_code", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "main.py"));
+    ASSERT_NULL(strstr(resp, "build/artifact.txt"));
+    free(resp);
+    PASS();
+}
+
 TEST(integ_mcp_trace_call_path) {
     /* Trace outbound calls from Compute → should reach Add and Multiply */
     char args[256];
@@ -556,6 +581,7 @@ SUITE(integration) {
     RUN_TEST(integ_mcp_query_graph_calls);
     RUN_TEST(integ_mcp_get_graph_schema);
     RUN_TEST(integ_mcp_get_architecture);
+    RUN_TEST(integ_mcp_search_code_ignores_build_artifacts);
     RUN_TEST(integ_mcp_trace_call_path);
     RUN_TEST(integ_mcp_index_status);
 

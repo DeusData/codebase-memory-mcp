@@ -17,6 +17,7 @@
 #include "foundation/platform.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/compat_regex.h"
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
 #include "foundation/str_util.h"
@@ -34,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <time.h>
 
@@ -1626,6 +1628,51 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── search_code ──────────────────────────────────────────────── */
 
+static bool search_code_glob_match(const char *pattern, const char *path) {
+    if (!pattern || !path) {
+        return false;
+    }
+    if (*pattern == '\0') {
+        return *path == '\0';
+    }
+    if (*pattern == '*') {
+        while (*pattern == '*') {
+            pattern++;
+        }
+        if (*pattern == '\0') {
+            return true;
+        }
+        while (*path) {
+            if (search_code_glob_match(pattern, path)) {
+                return true;
+            }
+            path++;
+        }
+        return false;
+    }
+    if (*pattern == '?') {
+        return *path != '\0' && search_code_glob_match(pattern + 1, path + 1);
+    }
+    return *pattern == *path && search_code_glob_match(pattern + 1, path + 1);
+}
+
+static bool search_code_file_is_binary(FILE *fp) {
+    unsigned char buf[4096];
+    size_t nread;
+
+    if (!fp) {
+        return false;
+    }
+    nread = fread(buf, 1, sizeof(buf), fp);
+    if (ferror(fp)) {
+        clearerr(fp);
+        rewind(fp);
+        return true;
+    }
+    rewind(fp);
+    return memchr(buf, '\0', nread) != NULL;
+}
+
 static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char *pattern = cbm_mcp_get_string_arg(args, "pattern");
     char *project = cbm_mcp_get_string_arg(args, "project");
@@ -1647,50 +1694,20 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("project not found or not indexed", true);
     }
 
-    /* Reject shell metacharacters in user-supplied arguments */
-    if (!cbm_validate_shell_arg(root_path) ||
-        (file_pattern && !cbm_validate_shell_arg(file_pattern))) {
+    cbm_store_t *store = resolve_store(srv, project);
+    if (!store) {
         free(root_path);
         free(pattern);
         free(project);
         free(file_pattern);
-        return cbm_mcp_text_result("path or file_pattern contains invalid characters", true);
+        return cbm_mcp_text_result("project not found or not indexed", true);
     }
 
-    /* Write pattern to temp file to avoid shell injection */
-    char tmpfile[256];
-#ifdef _WIN32
-    snprintf(tmpfile, sizeof(tmpfile), "/tmp/cbm_search_%d.pat", (int)_getpid());
-#else
-    snprintf(tmpfile, sizeof(tmpfile), "/tmp/cbm_search_%d.pat", (int)getpid());
-#endif
-    FILE *tf = fopen(tmpfile, "w");
-    if (!tf) {
-        free(root_path);
-        free(pattern);
-        free(project);
-        free(file_pattern);
-        return cbm_mcp_text_result("search failed: temp file", true);
-    }
-    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
-    (void)fprintf(tf, "%s\n", pattern);
-    (void)fclose(tf);
-
-    char cmd[4096];
-    // NOLINTNEXTLINE(readability-implicit-bool-conversion)
-    const char *flag = use_regex ? "-E" : "-F";
-    if (file_pattern) {
-        snprintf(cmd, sizeof(cmd), "grep -rn %s --include='%s' -m %d -f '%s' '%s' 2>/dev/null",
-                 flag, file_pattern, limit * 3, tmpfile, root_path);
-    } else {
-        snprintf(cmd, sizeof(cmd), "grep -rn %s -m %d -f '%s' '%s' 2>/dev/null", flag, limit * 3,
-                 tmpfile, root_path);
-    }
-
-    // NOLINTNEXTLINE(bugprone-command-processor,cert-env33-c)
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        cbm_unlink(tmpfile);
+    cbm_node_t *files = NULL;
+    int file_count = 0;
+    int rc = cbm_store_find_nodes_by_label(store, project ? project : srv->current_project, "File",
+                                           &files, &file_count);
+    if (rc != CBM_STORE_OK) {
         free(root_path);
         free(pattern);
         free(project);
@@ -1698,63 +1715,90 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("search failed", true);
     }
 
+    cbm_regex_t regex = {0};
+    bool regex_ready = false;
+    if (use_regex) {
+        if (cbm_regcomp(&regex, pattern, CBM_REG_EXTENDED) != CBM_REG_OK) {
+            cbm_store_free_nodes(files, file_count);
+            free(root_path);
+            free(pattern);
+            free(project);
+            free(file_pattern);
+            return cbm_mcp_text_result("invalid regex pattern", true);
+        }
+        regex_ready = true;
+    }
+
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root_obj);
 
     yyjson_mut_val *matches = yyjson_mut_arr(doc);
-    char line[2048];
     int count = 0;
-    size_t root_len = strlen(root_path);
-
-    while (fgets(line, sizeof(line), fp) && count < limit) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-            line[--len] = '\0';
+    for (int i = 0; i < file_count && count < limit; i++) {
+        cbm_node_t *file_node = &files[i];
+        if (!file_node->file_path || file_node->file_path[0] == '\0') {
+            continue;
         }
-        if (len == 0) {
+        if (file_pattern && !search_code_glob_match(file_pattern, file_node->file_path)) {
+            continue;
+        }
+        size_t path_len = strlen(root_path) + strlen(file_node->file_path) + 2;
+        char *abs_path = malloc(path_len);
+        if (!abs_path) {
+            continue;
+        }
+        snprintf(abs_path, path_len, "%s/%s", root_path, file_node->file_path);
+
+        FILE *fp = fopen(abs_path, "rb");
+        free(abs_path);
+        if (!fp) {
+            continue;
+        }
+        if (search_code_file_is_binary(fp)) {
+            fclose(fp);
             continue;
         }
 
-        /* grep output: /abs/path/file:lineno:content */
-        char *colon1 = strchr(line, ':');
-        if (!colon1) {
-            continue;
-        }
-        char *colon2 = strchr(colon1 + 1, ':');
-        if (!colon2) {
-            continue;
-        }
-
-        *colon1 = '\0';
-        *colon2 = '\0';
-
-        /* Strip root_path prefix to get relative path */
-        const char *file = line;
-        if (strncmp(file, root_path, root_len) == 0) {
-            file += root_len;
-            if (*file == '/') {
-                file++;
+        char *line = NULL;
+        size_t cap = 0;
+        ssize_t nread;
+        int lineno = 0;
+        while (count < limit && (nread = cbm_getline(&line, &cap, fp)) > 0) {
+            lineno++;
+            while (nread > 0 && (line[nread - 1] == '\n' || line[nread - 1] == '\r')) {
+                line[--nread] = '\0';
             }
-        }
-        int lineno = (int)strtol(colon1 + 1, NULL, 10);
-        const char *content = colon2 + 1;
+            bool matched = false;
+            if (use_regex) {
+                matched = cbm_regexec(&regex, line, 0, NULL, 0) == CBM_REG_OK;
+            } else {
+                matched = strstr(line, pattern) != NULL;
+            }
+            if (!matched) {
+                continue;
+            }
 
-        yyjson_mut_val *item = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_str(doc, item, "file", file);
-        yyjson_mut_obj_add_int(doc, item, "line", lineno);
-        yyjson_mut_obj_add_str(doc, item, "content", content);
-        yyjson_mut_arr_add_val(matches, item);
-        count++;
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, item, "file", file_node->file_path);
+            yyjson_mut_obj_add_int(doc, item, "line", lineno);
+            yyjson_mut_obj_add_strcpy(doc, item, "content", line);
+            yyjson_mut_arr_add_val(matches, item);
+            count++;
+        }
+        free(line);
+        fclose(fp);
     }
-    cbm_pclose(fp);
-    cbm_unlink(tmpfile); /* Clean up pattern file after grep is done */
 
     yyjson_mut_obj_add_val(doc, root_obj, "matches", matches);
     yyjson_mut_obj_add_int(doc, root_obj, "count", count);
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+    if (regex_ready) {
+        cbm_regfree(&regex);
+    }
+    cbm_store_free_nodes(files, file_count);
     free(root_path);
     free(pattern);
     free(project);
