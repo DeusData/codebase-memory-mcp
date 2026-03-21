@@ -185,7 +185,7 @@ TRACES_SRCS = src/traces/traces.c
 WATCHER_SRCS = src/watcher/watcher.c
 
 # CLI module (new)
-CLI_SRCS = src/cli/cli.c
+CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c
 
 # UI module (graph visualization)
 UI_SRCS = \
