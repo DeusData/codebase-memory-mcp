@@ -216,3 +216,19 @@ int64_t cbm_file_size(const char *path) {
 }
 
 #endif /* _WIN32 */
+
+/* ── Home directory (cross-platform) ──────────────────────────── */
+
+const char *cbm_get_home_dir(void) {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
+    const char *h = getenv("HOME");
+    if (h && h[0]) {
+        return h;
+    }
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
+    h = getenv("USERPROFILE");
+    if (h && h[0]) {
+        return h;
+    }
+    return NULL;
+}

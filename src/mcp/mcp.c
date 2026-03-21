@@ -564,10 +564,9 @@ bool cbm_mcp_server_has_cached_store(cbm_mcp_server_t *srv) {
 /* Returns the platform cache directory: ~/.cache/codebase-memory-mcp
  * Writes to buf, returns buf for convenience. */
 static const char *cache_dir(char *buf, size_t bufsz) {
-    // NOLINTNEXTLINE(concurrency-mt-unsafe)
-    const char *home = getenv("HOME");
+    const char *home = cbm_get_home_dir();
     if (!home) {
-        home = "/tmp";
+        home = cbm_tmpdir();
     }
     snprintf(buf, bufsz, "%s/.cache/codebase-memory-mcp", home);
     return buf;
@@ -1995,8 +1994,7 @@ static void detect_session(cbm_mcp_server_t *srv) {
     /* 1. Try CWD */
     char cwd[1024];
     if (getcwd(cwd, sizeof(cwd)) != NULL) {
-        // NOLINTNEXTLINE(concurrency-mt-unsafe)
-        const char *home = getenv("HOME");
+        const char *home = cbm_get_home_dir();
         /* Skip useless roots: / and $HOME */
         if (strcmp(cwd, "/") != 0 && (home == NULL || strcmp(cwd, home) != 0)) {
             snprintf(srv->session_root, sizeof(srv->session_root), "%s", cwd);
@@ -2067,8 +2065,7 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     }
 
     /* Check if project already has a DB */
-    // NOLINTNEXTLINE(concurrency-mt-unsafe)
-    const char *home = getenv("HOME");
+    const char *home = cbm_get_home_dir();
     if (home) {
         char db_check[1024];
         snprintf(db_check, sizeof(db_check), "%s/.cache/codebase-memory-mcp/%s.db", home,
