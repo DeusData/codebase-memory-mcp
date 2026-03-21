@@ -35,12 +35,14 @@
 
 /* ── Manifest / dep section tables ──────────────────────────────── */
 
+/* Use the shared manifest file list from depindex.h for DRY.
+ * Adding new manifest files to CBM_MANIFEST_FILES covers both
+ * dep discovery and config linking automatically. */
+#include "depindex/depindex.h"
+
 static bool is_manifest_file(const char *basename) {
-    static const char *names[] = {"Cargo.toml",       "package.json",  "go.mod",
-                                  "requirements.txt", "Gemfile",       "build.gradle",
-                                  "pom.xml",          "composer.json", NULL};
-    for (int i = 0; names[i]; i++) {
-        if (strcmp(basename, names[i]) == 0) {
+    for (int i = 0; CBM_MANIFEST_FILES[i]; i++) {
+        if (strcmp(basename, CBM_MANIFEST_FILES[i]) == 0) {
             return true;
         }
     }

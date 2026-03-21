@@ -33,6 +33,7 @@ typedef struct cbm_pipeline cbm_pipeline_t;
 typedef enum {
     CBM_MODE_FULL = 0, /* Full index: read everything, build from scratch */
     CBM_MODE_FAST = 1, /* Fast: skip non-essential files (media, docs, etc.) */
+    CBM_MODE_DEP  = 2, /* Dep: like FAST but keeps vendor/, .d.ts, third_party/ */
 } cbm_index_mode_t;
 #endif
 
@@ -50,6 +51,15 @@ int cbm_pipeline_run(cbm_pipeline_t *p);
 
 /* Request cancellation of a running pipeline (thread-safe). */
 void cbm_pipeline_cancel(cbm_pipeline_t *p);
+
+/* Override the auto-derived project name (e.g., for myapp.dep.pandas).
+ * Must be called before cbm_pipeline_run(). Copies the string. */
+void cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name);
+
+/* Set a store to flush into instead of dumping to a new SQLite file.
+ * When set, pipeline uses cbm_gbuf_flush_to_store() which upserts by project name.
+ * Must be called before cbm_pipeline_run(). Pipeline does NOT own the store. */
+void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store);
 
 /* Get the project name derived from repo_path. Returned string is
  * owned by the pipeline. Valid until cbm_pipeline_free(). */

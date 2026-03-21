@@ -232,9 +232,10 @@ TEST(tool_index_dependencies_missing_project) {
     PASS();
 }
 
-TEST(tool_index_dependencies_missing_package_manager) {
+TEST(tool_index_dependencies_missing_packages) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
+    /* packages[] is now required */
     char *resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":51,\"method\":\"tools/call\","
              "\"params\":{\"name\":\"index_dependencies\","
@@ -456,6 +457,191 @@ TEST(dep_discover_max_files_guard) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  DEPINDEX HELPER UNIT TESTS
+ * ══════════════════════════════════════════════════════════════════ */
+
+#include <depindex/depindex.h>
+#include <pipeline/pipeline.h>
+
+TEST(test_parse_pkg_manager_valid) {
+    ASSERT_EQ(cbm_parse_pkg_manager("uv"), CBM_PKG_UV);
+    ASSERT_EQ(cbm_parse_pkg_manager("pip"), CBM_PKG_UV);
+    ASSERT_EQ(cbm_parse_pkg_manager("cargo"), CBM_PKG_CARGO);
+    ASSERT_EQ(cbm_parse_pkg_manager("npm"), CBM_PKG_NPM);
+    ASSERT_EQ(cbm_parse_pkg_manager("bun"), CBM_PKG_BUN);
+    ASSERT_EQ(cbm_parse_pkg_manager("custom"), CBM_PKG_CUSTOM);
+    PASS();
+}
+
+TEST(test_parse_pkg_manager_invalid) {
+    ASSERT_EQ(cbm_parse_pkg_manager("nonexistent"), CBM_PKG_COUNT);
+    ASSERT_EQ(cbm_parse_pkg_manager(NULL), CBM_PKG_COUNT);
+    ASSERT_EQ(cbm_parse_pkg_manager(""), CBM_PKG_COUNT);
+    PASS();
+}
+
+TEST(test_pkg_manager_str_roundtrip) {
+    ASSERT_STR_EQ(cbm_pkg_manager_str(CBM_PKG_UV), "uv");
+    ASSERT_STR_EQ(cbm_pkg_manager_str(CBM_PKG_CARGO), "cargo");
+    ASSERT_STR_EQ(cbm_pkg_manager_str(CBM_PKG_NPM), "npm");
+    ASSERT_STR_EQ(cbm_pkg_manager_str(CBM_PKG_COUNT), "unknown");
+    PASS();
+}
+
+TEST(test_dep_project_name_format) {
+    char *name = cbm_dep_project_name("myapp", "pandas");
+    ASSERT_NOT_NULL(name);
+    ASSERT_STR_EQ(name, "myapp.dep.pandas");
+    free(name);
+
+    name = cbm_dep_project_name("myapp", "serde");
+    ASSERT_NOT_NULL(name);
+    ASSERT_STR_EQ(name, "myapp.dep.serde");
+    free(name);
+
+    /* NULL inputs */
+    ASSERT_NULL(cbm_dep_project_name(NULL, "pandas"));
+    ASSERT_NULL(cbm_dep_project_name("myapp", NULL));
+    PASS();
+}
+
+TEST(test_is_dep_project_with_session) {
+    /* With session context — precise prefix check */
+    ASSERT_TRUE(cbm_is_dep_project("myapp.dep.pandas", "myapp"));
+    ASSERT_TRUE(cbm_is_dep_project("myapp.dep.serde", "myapp"));
+    ASSERT_FALSE(cbm_is_dep_project("myapp", "myapp"));
+    ASSERT_FALSE(cbm_is_dep_project("otherapp.dep.pandas", "myapp"));
+    ASSERT_FALSE(cbm_is_dep_project(NULL, "myapp"));
+    PASS();
+}
+
+TEST(test_is_dep_project_without_session) {
+    /* Without session context — fallback strstr check */
+    ASSERT_TRUE(cbm_is_dep_project("myapp.dep.pandas", NULL));
+    ASSERT_TRUE(cbm_is_dep_project("dep.cargo.serde", NULL));
+    ASSERT_FALSE(cbm_is_dep_project("myapp", NULL));
+    ASSERT_FALSE(cbm_is_dep_project("deputy", NULL));
+    PASS();
+}
+
+TEST(test_detect_ecosystem_python) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_eco_py_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) { SKIP("Could not create temp dir"); }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/pyproject.toml", tmp);
+    FILE *fp = fopen(path, "w");
+    if (fp) { fprintf(fp, "[project]\nname = \"test\"\n"); fclose(fp); }
+    ASSERT_EQ(cbm_detect_ecosystem(tmp), CBM_PKG_UV);
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
+TEST(test_detect_ecosystem_rust) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_eco_rs_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) { SKIP("Could not create temp dir"); }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/Cargo.toml", tmp);
+    FILE *fp = fopen(path, "w");
+    if (fp) { fprintf(fp, "[package]\nname = \"test\"\n"); fclose(fp); }
+    ASSERT_EQ(cbm_detect_ecosystem(tmp), CBM_PKG_CARGO);
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
+TEST(test_detect_ecosystem_none) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_eco_none_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) { SKIP("Could not create temp dir"); }
+    ASSERT_EQ(cbm_detect_ecosystem(tmp), CBM_PKG_COUNT);
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
+TEST(test_is_manifest_path) {
+    ASSERT_TRUE(cbm_is_manifest_path("src/Cargo.toml"));
+    ASSERT_TRUE(cbm_is_manifest_path("/Users/x/myapp/pyproject.toml"));
+    ASSERT_TRUE(cbm_is_manifest_path("package.json"));
+    ASSERT_FALSE(cbm_is_manifest_path("src/main.rs"));
+    ASSERT_FALSE(cbm_is_manifest_path(NULL));
+    PASS();
+}
+
+TEST(test_resolve_npm_node_modules) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_resolve_npm_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) { SKIP("Could not create temp dir"); }
+
+    /* Create node_modules/react/ with package.json */
+    char nm[512];
+    snprintf(nm, sizeof(nm), "%s/node_modules", tmp);
+    cbm_mkdir(nm);
+    snprintf(nm, sizeof(nm), "%s/node_modules/react", tmp);
+    cbm_mkdir(nm);
+    char pj[512];
+    snprintf(pj, sizeof(pj), "%s/package.json", nm);
+    FILE *fp = fopen(pj, "w");
+    if (fp) { fprintf(fp, "{\"name\":\"react\",\"version\":\"18.2.0\"}\n"); fclose(fp); }
+
+    cbm_dep_resolved_t out = {0};
+    ASSERT_EQ(cbm_resolve_pkg_source(CBM_PKG_NPM, "react", tmp, &out), 0);
+    ASSERT_NOT_NULL(out.path);
+    ASSERT_NOT_NULL(strstr(out.path, "node_modules/react"));
+    cbm_dep_resolved_free(&out);
+
+    /* Non-existent package */
+    cbm_dep_resolved_t out2 = {0};
+    ASSERT_EQ(cbm_resolve_pkg_source(CBM_PKG_NPM, "nonexistent", tmp, &out2), -1);
+
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
+TEST(test_pipeline_set_project_name) {
+    cbm_pipeline_t *p = cbm_pipeline_new("/tmp", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    const char *orig = cbm_pipeline_project_name(p);
+    ASSERT_NOT_NULL(orig);
+    /* Set custom name */
+    cbm_pipeline_set_project_name(p, "myapp.dep.pandas");
+    ASSERT_STR_EQ(cbm_pipeline_project_name(p), "myapp.dep.pandas");
+    cbm_pipeline_free(p);
+    PASS();
+}
+
+TEST(test_dep_reindex_replaces) {
+    /* Verify upsert replaces old nodes for same QN, not duplicates. */
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+
+    /* Must register project first (foreign key) */
+    cbm_store_upsert_project(store, "test.dep.pandas", "/tmp/pandas");
+
+    cbm_node_t n1 = {0};
+    n1.project = "test.dep.pandas";
+    n1.label = "Function";
+    n1.name = "old_func";
+    n1.qualified_name = "test.dep.pandas.old_func";
+    n1.file_path = "pandas/__init__.py";
+    n1.start_line = 1;
+    n1.end_line = 3;
+    n1.properties_json = "{}";
+    cbm_store_upsert_node(store, &n1);
+
+    int count1 = cbm_store_count_nodes(store, "test.dep.pandas");
+    ASSERT_EQ(count1, 1);
+
+    /* Upsert with same QN — should not duplicate */
+    cbm_store_upsert_node(store, &n1);
+    int count2 = cbm_store_count_nodes(store, "test.dep.pandas");
+    ASSERT_EQ(count2, 1);
+
+    cbm_store_close(store);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -463,7 +649,7 @@ SUITE(depindex) {
     /* MCP tool registration and validation */
     RUN_TEST(tool_index_dependencies_listed);
     RUN_TEST(tool_index_dependencies_missing_project);
-    RUN_TEST(tool_index_dependencies_missing_package_manager);
+    RUN_TEST(tool_index_dependencies_missing_packages);
 
     /* AI grounding: core vs dependency disambiguation */
     RUN_TEST(search_graph_default_excludes_deps);
@@ -483,4 +669,19 @@ SUITE(depindex) {
     /* Dependency discovery */
     RUN_TEST(dep_discover_skips_test_dirs);
     RUN_TEST(dep_discover_max_files_guard);
+
+    /* Depindex helpers */
+    RUN_TEST(test_parse_pkg_manager_valid);
+    RUN_TEST(test_parse_pkg_manager_invalid);
+    RUN_TEST(test_pkg_manager_str_roundtrip);
+    RUN_TEST(test_dep_project_name_format);
+    RUN_TEST(test_is_dep_project_with_session);
+    RUN_TEST(test_is_dep_project_without_session);
+    RUN_TEST(test_detect_ecosystem_python);
+    RUN_TEST(test_detect_ecosystem_rust);
+    RUN_TEST(test_detect_ecosystem_none);
+    RUN_TEST(test_is_manifest_path);
+    RUN_TEST(test_resolve_npm_node_modules);
+    RUN_TEST(test_pipeline_set_project_name);
+    RUN_TEST(test_dep_reindex_replaces);
 }
