@@ -308,6 +308,22 @@ TEST(server_handle_tools_list) {
     PASS();
 }
 
+TEST(server_handle_roots_list) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"roots/list\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":99"));
+    ASSERT_NOT_NULL(strstr(resp, "\"roots\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"uri\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"name\""));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(server_handle_unknown_method) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -319,6 +335,84 @@ TEST(server_handle_unknown_method) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+static char *run_server_stream(const char *input) {
+    FILE *in = tmpfile();
+    FILE *out = tmpfile();
+    char *buf = NULL;
+    long sz;
+
+    if (!in || !out) {
+        if (in) {
+            fclose(in);
+        }
+        if (out) {
+            fclose(out);
+        }
+        return NULL;
+    }
+
+    if (!input) {
+        fclose(in);
+        fclose(out);
+        return NULL;
+    }
+    fwrite(input, 1, strlen(input), in);
+    rewind(in);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        fclose(in);
+        fclose(out);
+        return NULL;
+    }
+
+    cbm_mcp_server_run(srv, in, out);
+    cbm_mcp_server_free(srv);
+
+    rewind(out);
+    fseek(out, 0, SEEK_END);
+    sz = ftell(out);
+    rewind(out);
+
+    buf = malloc((size_t)sz + 1);
+    if (!buf) {
+        fclose(in);
+        fclose(out);
+        return NULL;
+    }
+    fread(buf, 1, (size_t)sz, out);
+    buf[sz] = '\0';
+
+    fclose(in);
+    fclose(out);
+    return buf;
+}
+
+TEST(server_run_raw_stream_without_newlines) {
+    const char *input =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}"
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}";
+    char *resp = run_server_stream(input);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":1"));
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":2"));
+    free(resp);
+    PASS();
+}
+
+TEST(server_run_content_length_framed) {
+    const char *body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/list\"}";
+    char input[256];
+    snprintf(input, sizeof(input), "Content-Length: %zu\r\n\r\n%s", strlen(body), body);
+
+    char *resp = run_server_stream(input);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "Content-Length:"));
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":7"));
+    free(resp);
     PASS();
 }
 
@@ -1248,7 +1342,10 @@ SUITE(mcp) {
     RUN_TEST(server_handle_initialize);
     RUN_TEST(server_handle_initialized_notification);
     RUN_TEST(server_handle_tools_list);
+    RUN_TEST(server_handle_roots_list);
     RUN_TEST(server_handle_unknown_method);
+    RUN_TEST(server_run_raw_stream_without_newlines);
+    RUN_TEST(server_run_content_length_framed);
 
     /* Tool handlers */
     RUN_TEST(tool_list_projects_empty);

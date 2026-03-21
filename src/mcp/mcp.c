@@ -30,6 +30,7 @@
 #include <poll.h>
 #endif
 #include <yyjson/yyjson.h>
+#include <ctype.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,6 +75,224 @@ static char *yy_doc_to_str(yyjson_mut_doc *doc) {
     size_t len = 0;
     char *s = yyjson_mut_write(doc, YYJSON_WRITE_ALLOW_INVALID_UNICODE, &len);
     return s;
+}
+
+static char *path_basename_ptr(const char *path) {
+    const char *slash;
+    if (!path || !path[0]) {
+        return "";
+    }
+    slash = strrchr(path, '/');
+    if (!slash || !slash[1]) {
+        return (char *)path;
+    }
+    return (char *)(slash + 1);
+}
+
+static char *path_to_file_uri(const char *path) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t len = strlen(path);
+    size_t cap = len * 3 + 8;
+    char *uri = malloc(cap);
+    size_t pos = 0;
+
+    if (!uri) {
+        return NULL;
+    }
+    memcpy(uri, "file://", 7);
+    pos = 7;
+
+    for (size_t i = 0; i < len; i++) {
+        unsigned char ch = (unsigned char)path[i];
+        bool safe = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                    (ch >= '0' && ch <= '9') || ch == '/' || ch == '-' || ch == '_' || ch == '.' ||
+                    ch == '~';
+        if (safe) {
+            uri[pos++] = (char)ch;
+            continue;
+        }
+        uri[pos++] = '%';
+        uri[pos++] = hex[ch >> 4];
+        uri[pos++] = hex[ch & 0x0f];
+    }
+    uri[pos] = '\0';
+    return uri;
+}
+
+static bool ensure_read_buffer(char **buf, size_t *cap, size_t need_len) {
+    if (!buf || !cap) {
+        return false;
+    }
+    if (*cap > need_len) {
+        return true;
+    }
+
+    size_t new_cap = *cap > 0 ? *cap : 256;
+    while (new_cap <= need_len) {
+        new_cap *= 2;
+    }
+
+    char *tmp = realloc(*buf, new_cap);
+    if (!tmp) {
+        return false;
+    }
+    *buf = tmp;
+    *cap = new_cap;
+    return true;
+}
+
+static int read_stream_line(FILE *in, int first_ch, char **buf, size_t *cap) {
+    size_t len = 0;
+    int ch = first_ch;
+
+    if (!in || !buf || !cap) {
+        return -1;
+    }
+
+    while (ch != EOF) {
+        if (!ensure_read_buffer(buf, cap, len + 1)) {
+            return -1;
+        }
+        (*buf)[len++] = (char)ch;
+        if (ch == '\n') {
+            break;
+        }
+        ch = fgetc(in);
+    }
+
+    if (len == 0) {
+        return 0;
+    }
+    if (!ensure_read_buffer(buf, cap, len)) {
+        return -1;
+    }
+    (*buf)[len] = '\0';
+    return (int)len;
+}
+
+static int read_raw_json_message(FILE *in, int first_ch, char **buf, size_t *cap) {
+    size_t len = 0;
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    int ch = first_ch;
+
+    if (first_ch != '{' && first_ch != '[') {
+        return -1;
+    }
+
+    for (;;) {
+        if (ch == EOF) {
+            return -1;
+        }
+        if (!ensure_read_buffer(buf, cap, len + 1)) {
+            return -1;
+        }
+        (*buf)[len++] = (char)ch;
+
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
+        } else if (ch == '"') {
+            in_string = true;
+        } else if (ch == '{' || ch == '[') {
+            depth++;
+        } else if (ch == '}' || ch == ']') {
+            depth--;
+            if (depth == 0) {
+                break;
+            }
+        }
+
+        ch = fgetc(in);
+    }
+
+    if (!ensure_read_buffer(buf, cap, len)) {
+        return -1;
+    }
+    (*buf)[len] = '\0';
+    return (int)len;
+}
+
+static int read_next_mcp_message(FILE *in, char **buf, size_t *cap, bool *framed) {
+    int ch;
+
+    if (!in || !buf || !cap || !framed) {
+        return -1;
+    }
+    *framed = false;
+
+    for (;;) {
+        ch = fgetc(in);
+        if (ch == EOF) {
+            return 0;
+        }
+        if (!isspace((unsigned char)ch)) {
+            break;
+        }
+    }
+
+    if (ch == '{' || ch == '[') {
+        return read_raw_json_message(in, ch, buf, cap);
+    }
+
+    if (ch == 'C') {
+        *framed = true;
+        int line_len = read_stream_line(in, ch, buf, cap);
+        if (line_len <= 0) {
+            return line_len;
+        }
+
+        size_t len = strlen(*buf);
+        while (len > 0 && ((*buf)[len - 1] == '\n' || (*buf)[len - 1] == '\r')) {
+            (*buf)[--len] = '\0';
+        }
+
+        if (strncmp(*buf, "Content-Length:", 15) != 0) {
+            return -1;
+        }
+
+        int content_len = (int)strtol(*buf + 15, NULL, 10);
+        if (content_len <= 0 || content_len > 10 * 1024 * 1024) {
+            return -1;
+        }
+
+        for (;;) {
+            ch = fgetc(in);
+            if (ch == EOF) {
+                return -1;
+            }
+            line_len = read_stream_line(in, ch, buf, cap);
+            if (line_len < 0) {
+                return -1;
+            }
+
+            len = strlen(*buf);
+            while (len > 0 && ((*buf)[len - 1] == '\n' || (*buf)[len - 1] == '\r')) {
+                (*buf)[--len] = '\0';
+            }
+            if (len == 0) {
+                break;
+            }
+        }
+
+        if (!ensure_read_buffer(buf, cap, (size_t)content_len)) {
+            return -1;
+        }
+        size_t nread = fread(*buf, 1, (size_t)content_len, in);
+        if (nread != (size_t)content_len) {
+            return -1;
+        }
+        (*buf)[content_len] = '\0';
+        return content_len;
+    }
+
+    return -1;
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -388,7 +607,10 @@ char *cbm_mcp_initialize_response(const char *params_json) {
 
     yyjson_mut_val *caps = yyjson_mut_obj(doc);
     yyjson_mut_val *tools_cap = yyjson_mut_obj(doc);
+    yyjson_mut_val *roots_cap = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_bool(doc, roots_cap, "listChanged", false);
     yyjson_mut_obj_add_val(doc, caps, "tools", tools_cap);
+    yyjson_mut_obj_add_val(doc, caps, "roots", roots_cap);
     yyjson_mut_obj_add_val(doc, root, "capabilities", caps);
 
     char *out = yy_doc_to_str(doc);
@@ -2338,6 +2560,29 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         start_update_check(srv);
         detect_session(srv);
         maybe_auto_index(srv);
+    } else if (strcmp(req.method, "roots/list") == 0) {
+        char cwd[1024];
+        if (!getcwd(cwd, sizeof(cwd))) {
+            snprintf(cwd, sizeof(cwd), ".");
+        }
+
+        char *uri = path_to_file_uri(cwd);
+        const char *name = path_basename_ptr(cwd);
+
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+        yyjson_mut_val *roots = yyjson_mut_arr(doc);
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+
+        yyjson_mut_obj_add_str(doc, item, "uri", uri ? uri : "file://.");
+        yyjson_mut_obj_add_str(doc, item, "name", name && name[0] ? name : cwd);
+        yyjson_mut_arr_add_val(roots, item);
+        yyjson_mut_obj_add_val(doc, root, "roots", roots);
+
+        result_json = yy_doc_to_str(doc);
+        yyjson_mut_doc_free(doc);
+        free(uri);
     } else if (strcmp(req.method, "tools/list") == 0) {
         result_json = cbm_mcp_tools_list();
     } else if (strcmp(req.method, "tools/call") == 0) {
@@ -2371,100 +2616,26 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
 int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
     char *line = NULL;
     size_t cap = 0;
-    int fd = cbm_fileno(in);
 
     for (;;) {
-        /* Poll with idle timeout so we can evict unused stores between requests.
-         * MCP is request-response (one line at a time), so mixing poll() on the
-         * raw fd with getline() on the buffered FILE* is safe in practice. */
-#ifdef _WIN32
-        /* Windows: WaitForSingleObject on stdin handle */
-        HANDLE hStdin = (HANDLE)_get_osfhandle(fd);
-        DWORD wr = WaitForSingleObject(hStdin, STORE_IDLE_TIMEOUT_S * 1000);
-        if (wr == WAIT_FAILED) {
+        bool framed = false;
+        int msg_len = read_next_mcp_message(in, &line, &cap, &framed);
+        if (msg_len <= 0) {
             break;
         }
-        if (wr == WAIT_TIMEOUT) {
-            cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
-            continue;
-        }
-#else
-        struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int pr = poll(&pfd, 1, STORE_IDLE_TIMEOUT_S * 1000);
-
-        if (pr < 0) {
-            break; /* error or signal */
-        }
-        if (pr == 0) {
-            /* Timeout — evict idle store to free resources */
-            cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
-            continue;
-        }
-#endif
-
-        if (cbm_getline(&line, &cap, in) <= 0) {
-            break;
-        }
-
-        /* Trim trailing newline/CR */
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len == 0) {
-            continue;
-        }
-
-        /* Content-Length framing support (LSP-style transport).
-         * Some MCP clients (OpenCode, VS Code extensions) send:
-         *   Content-Length: <n>\r\n\r\n<json>
-         * instead of bare JSONL. Detect the header, read the payload,
-         * and respond with the same framing. */
-        if (strncmp(line, "Content-Length:", 15) == 0) {
-            int content_len = (int)strtol(line + 15, NULL, 10);
-            if (content_len <= 0 || content_len > 10 * 1024 * 1024) {
-                continue; /* invalid or too large */
-            }
-
-            /* Skip blank line(s) between header and body */
-            while (cbm_getline(&line, &cap, in) > 0) {
-                size_t hlen = strlen(line);
-                while (hlen > 0 && (line[hlen - 1] == '\n' || line[hlen - 1] == '\r')) {
-                    line[--hlen] = '\0';
-                }
-                if (hlen == 0) {
-                    break; /* found the blank separator */
-                }
-                /* Skip other headers (e.g. Content-Type) */
-            }
-
-            /* Read exact content_len bytes */
-            char *body = malloc((size_t)content_len + 1);
-            if (!body) {
-                continue;
-            }
-            size_t nread = fread(body, 1, (size_t)content_len, in);
-            body[nread] = '\0';
-
-            char *resp = cbm_mcp_server_handle(srv, body);
-            free(body);
-
-            if (resp) {
-                size_t rlen = strlen(resp);
-                (void)fprintf(out, "Content-Length: %zu\r\n\r\n%s", rlen, resp);
-                (void)fflush(out);
-                free(resp);
-            }
-            continue;
-        }
-
         char *resp = cbm_mcp_server_handle(srv, line);
-        if (resp) {
+        if (!resp) {
+            continue;
+        }
+        if (framed) {
+            size_t rlen = strlen(resp);
+            (void)fprintf(out, "Content-Length: %zu\r\n\r\n%s", rlen, resp);
+        } else {
             // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
             (void)fprintf(out, "%s\n", resp);
-            (void)fflush(out);
-            free(resp);
         }
+        (void)fflush(out);
+        free(resp);
     }
 
     free(line);
