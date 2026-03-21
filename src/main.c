@@ -281,6 +281,12 @@ int main(int argc, char **argv) {
         cbm_log_warn("ui.no_assets", "hint", "rebuild with: make -f Makefile.cbm cbm-with-ui");
     }
 
+    /* MCP stdio: force unbuffered I/O so responses are sent immediately.
+     * C defaults to fully-buffered when stdout is piped (as MCP clients do).
+     * fflush() is already called after each write, but this is defense-in-depth. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stdin, NULL, _IONBF, 0);
+
     /* Run MCP event loop (blocks until EOF or signal) */
     int rc = cbm_mcp_server_run(g_server, stdin, stdout);
 
