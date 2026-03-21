@@ -35,6 +35,15 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 
 3. **Restart** your coding agent. Say **"Index this project"** — done.
 
+If you are using [asdf-vm](https://asdf-vm.com), you can also install as follows:
+
+```shell
+asdf plugin add codebase-memory-mcp https://github.com/shaolang/codebase-memory-mcp
+asdf install codebase-memory-mcp latest
+asdf set codebase-memory-mcp latest     # or if you aren't in ~/, asdf set -p codebase-memory-mcp latest
+codebase-memory-mcp install
+```
+
 The `install` command auto-detects all installed coding agents and configures MCP server entries, instruction files, skills, and pre-tool hooks for each.
 
 ### Graph Visualization UI
