@@ -6,7 +6,8 @@
 #include "platform.h"
 #include "compat.h"
 
-#include <stdint.h> // uint64_t, int64_t
+#include <stdint.h>  // uint64_t, int64_t
+#include <stdlib.h>  // getenv
 
 #ifdef _WIN32
 

@@ -13,6 +13,7 @@
 #include <store/store.h>
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
+#include <foundation/platform.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -105,9 +106,9 @@ static int integration_setup(void) {
         return -1;
 
     /* Build db path for direct store queries (pipeline writes here) */
-    const char *home = getenv("HOME");
+    const char *home = cbm_get_home_dir();
     if (!home)
-        home = "/tmp";
+        home = cbm_tmpdir();
     snprintf(g_dbpath, sizeof(g_dbpath), "%s/.cache/codebase-memory-mcp/%s.db", home, g_project);
 
     /* Ensure cache dir exists */
