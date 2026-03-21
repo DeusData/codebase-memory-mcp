@@ -1,42 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Pre-commit hook: C linting + tests.
-# Mirrors the lint targets in Makefile.cbm.
+# Pre-commit hook: linters + security audit + build + tests.
 #
-# Setup (once after clone):
+# Activated automatically via scripts/setup.sh or manually:
 #   git config core.hooksPath scripts/hooks
 
-LLVM_BIN="$(brew --prefix llvm 2>/dev/null)/bin"
+echo "pre-commit: running all linters in parallel..."
+make -j3 -f Makefile.cbm lint
 
-# Resolve tool paths (Homebrew LLVM is keg-only on macOS)
-CLANG_TIDY="${LLVM_BIN}/clang-tidy"
-CLANG_FORMAT="${LLVM_BIN}/clang-format"
-[ -x "$CLANG_TIDY" ] || CLANG_TIDY="clang-tidy"
-[ -x "$CLANG_FORMAT" ] || CLANG_FORMAT="clang-format"
+echo "pre-commit: security audit (source-level)..."
+scripts/security-audit.sh
 
-# --- clang-format (blocking — fastest, check first) ---
-echo "pre-commit: checking formatting..."
-make -f Makefile.cbm lint-format CLANG_FORMAT="$CLANG_FORMAT"
-
-# --- cppcheck (blocking) ---
-if command -v cppcheck &>/dev/null; then
-    echo "pre-commit: running cppcheck..."
-    make -f Makefile.cbm lint-cppcheck
-else
-    echo "pre-commit: cppcheck not found, skipping"
-    echo "  install: brew install cppcheck"
-fi
-
-# --- clang-tidy (blocking) ---
-if command -v "$CLANG_TIDY" &>/dev/null; then
-    echo "pre-commit: running clang-tidy..."
-    make -f Makefile.cbm lint-tidy CLANG_TIDY="$CLANG_TIDY"
-else
-    echo "pre-commit: clang-tidy not found, skipping"
-    echo "  install: brew install llvm"
-fi
-
-# --- Build + Tests (blocking) ---
 echo "pre-commit: building and running tests..."
-make -f Makefile.cbm test
+make -j$(sysctl -n hw.ncpu 2>/dev/null || nproc) -f Makefile.cbm test

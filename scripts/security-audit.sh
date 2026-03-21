@@ -184,6 +184,102 @@ if ! $FOPEN_FOUND; then
     echo "OK: All file writes are in expected locations."
 fi
 
+# ── 4. Time-bomb pattern detection ────────────────────────────────
+# Scan for time/clock/sleep near dangerous calls — could indicate
+# code that activates malicious behavior after a delay or date.
+
+echo ""
+echo "--- Scanning for time-bomb patterns ---"
+
+TIMEBOMB_FOUND=false
+while IFS= read -r file; do
+    relfile="${file#"$ROOT/"}"
+
+    # Extract line numbers of dangerous calls
+    DANGER_LINES=$(grep -n 'system(\|popen(\|cbm_popen(\|connect(\|execl(' "$file" 2>/dev/null \
+        | grep -v '^\s*//' | grep -v '^\s*\*' | grep -v '#define' \
+        | cut -d: -f1 || true)
+
+    [ -z "$DANGER_LINES" ] && continue
+
+    # For each dangerous call, check if time/clock/sleep appears within 10 lines
+    for dline in $DANGER_LINES; do
+        start=$((dline > 10 ? dline - 10 : 1))
+        end=$((dline + 10))
+        NEARBY=$(sed -n "${start},${end}p" "$file" 2>/dev/null \
+            | grep -E 'time\(|clock\(|sleep\(|nanosleep\(|usleep\(' \
+            | grep -v '^\s*//' | grep -v '^\s*\*' | grep -v 'timeout' | grep -v 'elapsed' || true)
+        if [ -n "$NEARBY" ]; then
+            echo "REVIEW: ${relfile}:${dline}: time-related call near dangerous function"
+            echo "  $NEARBY"
+            TIMEBOMB_FOUND=true
+        fi
+    done
+done < <(find "$ROOT/src" -name '*.c' -type f | sort)
+
+if ! $TIMEBOMB_FOUND; then
+    echo "OK: No suspicious time-bomb patterns found."
+fi
+
+# ── 5. MCP tool handler file read audit ──────────────────────────
+# The MCP server (mcp.c) handles tool calls that return data to the
+# client. A malicious PR could add file reads that exfiltrate sensitive
+# data (e.g., ~/.ssh/id_rsa) through the normal tool response channel.
+# Track all file-reading functions in mcp.c against an allow-list.
+
+echo ""
+echo "--- Scanning MCP tool handlers for file reads ---"
+
+MCP_FILE="$ROOT/src/mcp/mcp.c"
+MCP_READS_OK=true
+if [ -f "$MCP_FILE" ]; then
+    # Known safe file reads in mcp.c (with line-range context)
+    # - search_code: writes pattern to tmpfile, reads grep output
+    # - get_code_snippet: reads source via read_file_lines (path-contained)
+    # - manage_adr: reads/writes ADR files
+    # - detect_changes: reads git diff output
+    # Count fopen/fread calls and compare against expected
+    FOPEN_COUNT=$(grep -c 'fopen\|fread\|read_file' "$MCP_FILE" 2>/dev/null || echo "0")
+    # Known count as of v0.5.5: update this when legitimate reads are added
+    EXPECTED_MAX=12
+    if [ "$FOPEN_COUNT" -gt "$EXPECTED_MAX" ]; then
+        echo "REVIEW: src/mcp/mcp.c has $FOPEN_COUNT file read operations (expected max $EXPECTED_MAX)"
+        echo "  New file reads in MCP tool handlers must be reviewed for data exfiltration risk."
+        MCP_READS_OK=false
+    fi
+fi
+
+if $MCP_READS_OK; then
+    echo "OK: MCP tool handler file reads within expected count."
+fi
+
+# ── 6. GitHub Actions pinned to SHA ───────────────────────────────
+# Mutable tags (@v4) can be moved by compromised maintainers.
+# All Actions must be pinned to full commit SHAs.
+
+echo ""
+echo "--- Scanning for unpinned GitHub Actions ---"
+
+UNPINNED_FOUND=false
+if [ -d "$ROOT/.github/workflows" ]; then
+    while IFS= read -r file; do
+        relfile="${file#"$ROOT/"}"
+        # Only check files tracked by git (skip stale untracked files)
+        git ls-files --error-unmatch "$file" > /dev/null 2>&1 || continue
+        while IFS= read -r match; do
+            [[ -z "$match" ]] && continue
+            echo "BLOCKED: ${relfile}: ${match}"
+            echo "  -> Pin to SHA: uses: owner/action@<commit-sha> # version"
+            fail
+            UNPINNED_FOUND=true
+        done < <(grep -nE 'uses:.*@v[0-9]' "$file" 2>/dev/null || true)
+    done < <(find "$ROOT/.github/workflows" -name '*.yml' -type f | sort)
+fi
+
+if ! $UNPINNED_FOUND; then
+    echo "OK: All GitHub Actions pinned to commit SHAs."
+fi
+
 # ── Summary ──────────────────────────────────────────────────────
 
 echo ""

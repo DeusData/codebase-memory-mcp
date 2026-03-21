@@ -6,6 +6,7 @@
  */
 #include "cli/cli.h"
 #include "foundation/compat.h"
+#include "foundation/str_util.h"
 
 // the correct standard headers are included below but clang-tidy doesn't map them.
 #include <ctype.h>
@@ -15,6 +16,7 @@
 #define CBM_VERSION "dev"
 #endif
 #include <errno.h>  // EEXIST
+#include <fcntl.h>  // open, O_WRONLY, O_CREAT, O_TRUNC
 #include <stdint.h> // uintptr_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -2784,25 +2786,33 @@ int cbm_cmd_update(int argc, char **argv) {
             return 1;
         }
 
+        /* Open with final permissions atomically (no TOCTOU between write and chmod) */
+#ifndef _WIN32
+        int fd = open(bin_dest, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+        if (fd < 0) {
+            fprintf(stderr, "error: cannot write to %s\n", bin_dest);
+            free(bin_data);
+            return 1;
+        }
+        FILE *out = fdopen(fd, "wb");
+#else
         FILE *out = fopen(bin_dest, "wb");
+#endif
         if (!out) {
             fprintf(stderr, "error: cannot write to %s\n", bin_dest);
             free(bin_data);
+#ifndef _WIN32
+            close(fd);
+#endif
             return 1;
         }
         fwrite(bin_data, 1, (size_t)bin_len, out);
         fclose(out);
         free(bin_data);
-
-        /* Make executable */
-#ifndef _WIN32
-        chmod(bin_dest, 0755);
-#endif
     } else {
-        /* Windows: unzip */
-        snprintf(cmd, sizeof(cmd), "unzip -o -d '%s' '%s' 2>/dev/null", bin_dir, tmp_archive);
-        // NOLINTNEXTLINE(cert-env33-c) — intentional CLI subprocess for extraction
-        rc = system(cmd);
+        /* Zip extraction: exec unzip directly without shell interpretation */
+        const char *unzip_argv[] = {"unzip", "-o", "-d", bin_dir, tmp_archive, NULL};
+        rc = cbm_exec_no_shell(unzip_argv);
         cbm_unlink(tmp_archive);
         if (rc != 0) {
             fprintf(stderr, "error: extraction failed\n");
@@ -2823,11 +2833,12 @@ int cbm_cmd_update(int argc, char **argv) {
     int skill_count = cbm_install_skills(skills_dir, true, false);
     printf("Updated %d skill(s).\n", skill_count);
 
-    /* Step 7: Verify new version */
+    /* Step 7: Verify new version (exec directly, no shell interpretation) */
     printf("\nUpdate complete. Verifying:\n");
-    snprintf(cmd, sizeof(cmd), "'%s' --version", bin_dest);
-    // NOLINTNEXTLINE(cert-env33-c,clang-analyzer-optin.taint.GenericTaint)
-    (void)system(cmd);
+    {
+        const char *ver_argv[] = {bin_dest, "--version", NULL};
+        (void)cbm_exec_no_shell(ver_argv);
+    }
 
     printf("\nAll project indexes were cleared. They will be rebuilt\n");
     printf("automatically when you next use the MCP server.\n");

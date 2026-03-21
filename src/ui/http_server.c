@@ -274,6 +274,9 @@ static void handle_processes(struct mg_connection *c) {
                                 "\"elapsed\":\"%s\",\"command\":\"%s\",\"is_self\":%s}",
                                 pid, (double)cpu, (double)rss / 1024.0, elapsed, comm,
                                 pid == (int)getpid() ? "true" : "false");
+                if (pos >= (int)sizeof(buf)) {
+                    pos = (int)sizeof(buf) - 1;
+                }
                 proc_count++;
             }
         }
@@ -415,6 +418,9 @@ static void handle_browse(struct mg_connection *c, struct mg_http_message *hm) {
         if (count > 0)
             buf[pos++] = ',';
         pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "\"%s\"", ent->d_name);
+        if (pos >= (int)sizeof(buf)) {
+            pos = (int)sizeof(buf) - 1;
+        }
         count++;
 
         if (count >= 200)
