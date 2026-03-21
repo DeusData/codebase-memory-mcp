@@ -483,73 +483,84 @@ jobs:
             assets/*.zip
 
       # ── Wait for VirusTotal results and check for detections ──
+      # The action outputs comma-separated "file=URL" pairs.
+      # URLs are https://www.virustotal.com/gui/file/<sha256> permalinks.
+      # We extract the SHA256, query the API for scan stats, and gate on detections.
       - name: Check VirusTotal scan results
         env:
           VT_API_KEY: ${{ secrets.VIRUS_TOTAL_SCANNER_API_KEY }}
           VT_ANALYSIS: ${{ steps.virustotal.outputs.analysis }}
         run: |
-          echo "=== Waiting for VirusTotal scan results ==="
+          echo "=== Checking VirusTotal scan results ==="
           DETECTIONS=0
 
-          while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            URL=$(echo "$line" | cut -d'=' -f2-)
+          # Split comma-separated output into newlines
+          echo "$VT_ANALYSIS" | tr ',' '\n' | while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+            FILE=$(echo "$entry" | cut -d'=' -f1)
+            URL=$(echo "$entry" | cut -d'=' -f2-)
+            BASENAME=$(basename "$FILE")
 
-            # Extract analysis ID from URL (last path segment)
-            ANALYSIS_ID=$(echo "$URL" | grep -oE '[a-zA-Z0-9_-]+$')
-            if [ -z "$ANALYSIS_ID" ]; then
-              echo "WARNING: Could not extract analysis ID from $URL"
+            # Extract SHA256 hash from URL (last path segment of /gui/file/<hash>)
+            SHA256=$(echo "$URL" | grep -oE '[a-f0-9]{64}')
+            if [ -z "$SHA256" ]; then
+              echo "WARNING: Could not extract SHA256 from $URL — skipping"
               continue
             fi
 
-            FILE=$(echo "$line" | cut -d'=' -f1)
-            BASENAME=$(basename "$FILE")
-
-            # Poll until analysis completes (max 5 minutes per file)
+            # Poll the file report until last_analysis_results are available
             for attempt in $(seq 1 30); do
               RESULT=$(curl -sf --max-time 10 \
                 -H "x-apikey: $VT_API_KEY" \
-                "https://www.virustotal.com/api/v3/analyses/$ANALYSIS_ID" 2>/dev/null || echo "{}")
+                "https://www.virustotal.com/api/v3/files/$SHA256" 2>/dev/null || echo "")
 
-              STATUS=$(echo "$RESULT" | python3 -c "
+              if [ -z "$RESULT" ]; then
+                echo "  $BASENAME: waiting for scan (attempt $attempt/30)..."
+                sleep 10
+                continue
+              fi
+
+              MALICIOUS=$(echo "$RESULT" | python3 -c "
           import json, sys
           d = json.loads(sys.stdin.read())
-          print(d.get('data', {}).get('attributes', {}).get('status', 'queued'))
-          " 2>/dev/null || echo "queued")
-
-              if [ "$STATUS" = "completed" ]; then
-                MALICIOUS=$(echo "$RESULT" | python3 -c "
-          import json, sys
-          d = json.loads(sys.stdin.read())
-          stats = d.get('data', {}).get('attributes', {}).get('stats', {})
+          stats = d.get('data', {}).get('attributes', {}).get('last_analysis_stats', {})
           print(stats.get('malicious', 0))
           " 2>/dev/null || echo "0")
 
-                SUSPICIOUS=$(echo "$RESULT" | python3 -c "
+              SUSPICIOUS=$(echo "$RESULT" | python3 -c "
           import json, sys
           d = json.loads(sys.stdin.read())
-          stats = d.get('data', {}).get('attributes', {}).get('stats', {})
+          stats = d.get('data', {}).get('attributes', {}).get('last_analysis_stats', {})
           print(stats.get('suspicious', 0))
           " 2>/dev/null || echo "0")
 
-                echo "$BASENAME: malicious=$MALICIOUS suspicious=$SUSPICIOUS"
+              TOTAL=$(echo "$RESULT" | python3 -c "
+          import json, sys
+          d = json.loads(sys.stdin.read())
+          stats = d.get('data', {}).get('attributes', {}).get('last_analysis_stats', {})
+          print(sum(stats.values()))
+          " 2>/dev/null || echo "0")
+
+              if [ "$TOTAL" -gt 0 ]; then
+                echo "$BASENAME: $MALICIOUS malicious, $SUSPICIOUS suspicious (of $TOTAL engines)"
 
                 if [ "$MALICIOUS" -gt 0 ] || [ "$SUSPICIOUS" -gt 0 ]; then
-                  echo "BLOCKED: $BASENAME flagged by $MALICIOUS malicious + $SUSPICIOUS suspicious engine(s)!"
-                  DETECTIONS=$((DETECTIONS + 1))
+                  echo "BLOCKED: $BASENAME flagged! See $URL"
+                  echo "FAIL" >> /tmp/vt_gate_fail
                 fi
                 break
               fi
 
-              echo "  $BASENAME: scan $STATUS (attempt $attempt/30)..."
+              echo "  $BASENAME: waiting for scan results (attempt $attempt/30)..."
               sleep 10
             done
-          done <<< "$VT_ANALYSIS"
+          done
 
-          if [ "$DETECTIONS" -gt 0 ]; then
+          if [ -f /tmp/vt_gate_fail ]; then
+            FAIL_COUNT=$(wc -l < /tmp/vt_gate_fail | tr -d ' ')
             echo ""
             echo "=== VIRUSTOTAL GATE FAILED ==="
-            echo "$DETECTIONS binary(ies) flagged as malicious or suspicious."
+            echo "$FAIL_COUNT binary(ies) flagged as malicious or suspicious."
             echo "Draft release will NOT be published. Investigate before retrying."
             exit 1
           fi
@@ -596,16 +607,20 @@ jobs:
           REPORT=$'---\n\n### Security Verification\n\n'
           REPORT+=$'All release binaries have been independently verified:\n\n'
 
-          # VirusTotal results
+          # VirusTotal results (comma-separated "file=URL" pairs)
           REPORT+=$'**VirusTotal** — scanned by 70+ antivirus engines:\n\n'
           REPORT+=$'| Binary | Scan |\n|--------|------|\n'
-          while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            FILE=$(echo "$line" | cut -d'=' -f1)
-            URL=$(echo "$line" | cut -d'=' -f2-)
+          echo "$VT_ANALYSIS" | tr ',' '\n' | while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+            FILE=$(echo "$entry" | cut -d'=' -f1)
+            URL=$(echo "$entry" | cut -d'=' -f2-)
             BASENAME=$(basename "$FILE")
-            REPORT+="| $BASENAME | [View Report]($URL) |"$'\n'
-          done <<< "$VT_ANALYSIS"
+            echo "| $BASENAME | [View Report]($URL) |"
+          done >> /tmp/vt_table
+          if [ -f /tmp/vt_table ]; then
+            REPORT+=$(cat /tmp/vt_table)$'\n'
+            rm -f /tmp/vt_table
+          fi
 
           # OpenSSF Scorecard
           REPORT+=$'\n**OpenSSF Scorecard** — repository security health: **'"$SCORECARD_SCORE"$'/10**\n'
