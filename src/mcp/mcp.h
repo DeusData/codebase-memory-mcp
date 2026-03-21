@@ -124,6 +124,9 @@ cbm_store_t *cbm_mcp_server_store(cbm_mcp_server_t *srv);
  * This prevents resolve_store() from trying to open a .db file when tools specify a project. */
 void cbm_mcp_server_set_project(cbm_mcp_server_t *srv, const char *project);
 
+/* Set the session project name (for testing and manual override). */
+void cbm_mcp_server_set_session_project(cbm_mcp_server_t *srv, const char *name);
+
 /* ── URI helpers ───────────────────────────────────────────────── */
 
 /* Parse a file:// URI and extract the filesystem path.

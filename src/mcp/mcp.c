@@ -523,6 +523,11 @@ void cbm_mcp_server_set_project(cbm_mcp_server_t *srv, const char *project) {
     srv->current_project = project ? heap_strdup(project) : NULL;
 }
 
+void cbm_mcp_server_set_session_project(cbm_mcp_server_t *srv, const char *name) {
+    if (!srv || !name) return;
+    snprintf(srv->session_project, sizeof(srv->session_project), "%s", name);
+}
+
 void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w) {
     if (srv) {
         srv->watcher = w;
@@ -649,6 +654,99 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
                 true);                                                                            \
         }                                                                                         \
     } while (0)
+
+/* ── Smart project param expansion ─────────────────────────────── */
+
+typedef enum { MATCH_NONE, MATCH_EXACT, MATCH_PREFIX, MATCH_GLOB } match_mode_t;
+
+typedef struct {
+    char *value;       /* expanded project string (heap) or NULL. Caller must free. */
+    match_mode_t mode; /* how to match in SQL */
+} project_expand_t;
+
+/* Expand project param shorthands (self/dep/glob/prefix).
+ * Takes ownership of raw — caller must NOT free raw after this call.
+ * Returns expanded result. Caller must free(result.value).
+ * Runtime: O(1) — fixed number of string comparisons + one snprintf + strdup.
+ * Memory: one heap allocation for result.value. */
+static project_expand_t expand_project_param(cbm_mcp_server_t *srv, char *raw) {
+    project_expand_t r = {.value = NULL, .mode = MATCH_NONE};
+    if (!raw) return r;
+
+    /* Guard: if session_project is empty, skip all expansion rules */
+    if (!srv->session_project[0]) {
+        r.value = raw;
+        r.mode = strchr(raw, '*') ? MATCH_GLOB : MATCH_PREFIX;
+        return r;
+    }
+
+    size_t sp_len = strlen(srv->session_project);
+    char buf[4096];
+
+    /* Rule 1: "self" prefix → replace with session project name */
+    if (strncmp(raw, "self", 4) == 0 && (raw[4] == '\0' || raw[4] == '.')) {
+        bool is_self_only = (raw[4] == '\0');
+        snprintf(buf, sizeof(buf), "%s%s", srv->session_project, raw + 4);
+        free(raw);
+        r.value = heap_strdup(buf);
+        r.mode = is_self_only ? MATCH_EXACT : MATCH_PREFIX;
+        if (r.mode == MATCH_PREFIX && strchr(r.value, '*')) r.mode = MATCH_GLOB;
+        return r;
+    }
+
+    /* Rule 2: "dep" / "deps" exactly → "{session}.dep" */
+    if (strcmp(raw, "dep") == 0 || strcmp(raw, "deps") == 0) {
+        snprintf(buf, sizeof(buf), "%s.dep", srv->session_project);
+        free(raw);
+        r.value = heap_strdup(buf);
+        r.mode = MATCH_PREFIX;
+        return r;
+    }
+
+    /* Rule 3: starts with "dep." → prepend session */
+    if (strncmp(raw, "dep.", 4) == 0) {
+        snprintf(buf, sizeof(buf), "%s.%s", srv->session_project, raw);
+        free(raw);
+        r.value = heap_strdup(buf);
+        r.mode = strchr(r.value, '*') ? MATCH_GLOB : MATCH_PREFIX;
+        return r;
+    }
+
+    /* Rule 4: starts with "{session}." but next segment isn't "dep" → insert .dep. */
+    if (strncmp(raw, srv->session_project, sp_len) == 0 && raw[sp_len] == '.' &&
+        !(strncmp(raw + sp_len + 1, "dep", 3) == 0 &&
+          (raw[sp_len + 4] == '.' || raw[sp_len + 4] == '\0'))) {
+        snprintf(buf, sizeof(buf), "%s.dep.%s", srv->session_project, raw + sp_len + 1);
+        free(raw);
+        r.value = heap_strdup(buf);
+        r.mode = strchr(r.value, '*') ? MATCH_GLOB : MATCH_PREFIX;
+        return r;
+    }
+
+    /* Rule 5: everything else — as-is (bare words are project names) */
+    r.value = raw;
+    r.mode = strchr(raw, '*') ? MATCH_GLOB : MATCH_PREFIX;
+    return r;
+}
+
+/* Fill cbm_search_params_t project fields from an expand result.
+ * Also translates * → % for SQL LIKE in glob mode. */
+static void fill_project_params(const project_expand_t *pe, cbm_search_params_t *params) {
+    switch (pe->mode) {
+    case MATCH_GLOB:
+        params->project_pattern = pe->value;
+        break;
+    case MATCH_EXACT:
+        params->project = pe->value;
+        params->project_exact = true;
+        break;
+    case MATCH_PREFIX:
+        params->project = pe->value;
+        break;
+    case MATCH_NONE:
+        break;
+    }
+}
 
 /* ── Tool handler implementations ─────────────────────────────── */
 
@@ -779,28 +877,41 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
 }
 
 static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
-    char *project = cbm_mcp_get_string_arg(args, "project");
-    cbm_store_t *store = resolve_store(srv, project);
-    REQUIRE_STORE(store, project);
+    char *raw_project = cbm_mcp_get_string_arg(args, "project");
+    project_expand_t pe = expand_project_param(srv, raw_project);
+
+    /* DB selection: if session_project is set and expanded value starts with it,
+     * use session store. Otherwise pass expanded value to resolve_store (opens .db). */
+    const char *db_project = pe.value; /* default: pass through to resolve_store */
+    if (pe.value && srv->session_project[0] &&
+        strncmp(pe.value, srv->session_project, strlen(srv->session_project)) == 0) {
+        db_project = srv->session_project; /* deps are in session db */
+    }
+    cbm_store_t *store = resolve_store(srv, db_project);
+    if (!store) {
+        free(pe.value);
+        return cbm_mcp_text_result(
+            "{\"error\":\"no project loaded\","
+            "\"hint\":\"Run index_repository with repo_path to index the project first.\"}", true);
+    }
+
     char *label = cbm_mcp_get_string_arg(args, "label");
     char *name_pattern = cbm_mcp_get_string_arg(args, "name_pattern");
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
     int limit = cbm_mcp_get_int_arg(args, "limit", 500000);
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
-    bool include_deps = cbm_mcp_get_bool_arg(args, "include_dependencies");
     int min_degree = cbm_mcp_get_int_arg(args, "min_degree", -1);
     int max_degree = cbm_mcp_get_int_arg(args, "max_degree", -1);
 
-    cbm_search_params_t params = {
-        .project = project,
-        .label = label,
-        .name_pattern = name_pattern,
-        .file_pattern = file_pattern,
-        .limit = limit,
-        .offset = offset,
-        .min_degree = min_degree,
-        .max_degree = max_degree,
-    };
+    cbm_search_params_t params = {0};
+    fill_project_params(&pe, &params);
+    params.label = label;
+    params.name_pattern = name_pattern;
+    params.file_pattern = file_pattern;
+    params.limit = limit;
+    params.offset = offset;
+    params.min_degree = min_degree;
+    params.max_degree = max_degree;
 
     cbm_search_output_t out = {0};
     cbm_store_search(store, &params, &out);
@@ -810,6 +921,10 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_set_root(doc, root);
 
     yyjson_mut_obj_add_int(doc, root, "total", out.total);
+
+    /* Always include session_project so AI knows the project name */
+    if (srv->session_project[0])
+        yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
 
     yyjson_mut_val *results = yyjson_mut_arr(doc);
     for (int i = 0; i < out.count; i++) {
@@ -823,10 +938,20 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                                sr->node.file_path ? sr->node.file_path : "");
         yyjson_mut_obj_add_int(doc, item, "in_degree", sr->in_degree);
         yyjson_mut_obj_add_int(doc, item, "out_degree", sr->out_degree);
-        /* AI grounding: mark source provenance when dependencies are included */
-        if (include_deps) {
-            yyjson_mut_obj_add_str(doc, item, "source", "project");
+
+        /* Unconditional source tagging — critical for AI grounding.
+         * Every result tagged source:"project" or source:"dependency".
+         * Dep results also get package name and read_only:true. */
+        bool is_dep = cbm_is_dep_project(sr->node.project, srv->session_project);
+        yyjson_mut_obj_add_str(doc, item, "source", is_dep ? "dependency" : "project");
+        if (is_dep && sr->node.project) {
+            /* Extract package name after ".dep." segment */
+            size_t sp_len2 = strlen(srv->session_project);
+            const char *pkg = sr->node.project + sp_len2 + CBM_DEP_SEPARATOR_LEN;
+            yyjson_mut_obj_add_strcpy(doc, item, "package", pkg);
+            yyjson_mut_obj_add_bool(doc, item, "read_only", true);
         }
+
         yyjson_mut_arr_add_val(results, item);
     }
     yyjson_mut_obj_add_val(doc, root, "results", results);
@@ -836,7 +961,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_free(doc);
     cbm_store_search_free(&out);
 
-    free(project);
+    free(pe.value);
     free(label);
     free(name_pattern);
     free(file_pattern);
@@ -917,6 +1042,9 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
+    if (srv->session_project[0])
+        yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
+
     if (project) {
         int nodes = cbm_store_count_nodes(store, project);
         int edges = cbm_store_count_edges(store, project);
@@ -924,6 +1052,51 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
         yyjson_mut_obj_add_int(doc, root, "edges", edges);
         yyjson_mut_obj_add_str(doc, root, "status", nodes > 0 ? "ready" : "empty");
+
+        /* Report indexed dependencies by searching for {project}.dep.% nodes.
+         * Uses project_pattern for LIKE query to find all dep projects. */
+        char dep_like[4096];
+        snprintf(dep_like, sizeof(dep_like), "%s.dep.%%", project);
+        cbm_search_params_t dep_params = {0};
+        dep_params.project_pattern = dep_like;
+        dep_params.limit = 100;
+        cbm_search_output_t dep_out = {0};
+        if (cbm_store_search(store, &dep_params, &dep_out) == 0 && dep_out.count > 0) {
+            /* Collect unique dep project names */
+            yyjson_mut_val *dep_arr = yyjson_mut_arr(doc);
+            const char *last_dep_proj = "";
+            int dep_count = 0;
+            for (int i = 0; i < dep_out.count; i++) {
+                const char *proj = dep_out.results[i].node.project;
+                if (!proj || strcmp(proj, last_dep_proj) == 0) continue;
+                last_dep_proj = proj;
+                /* Extract package name from "myproj.dep.pandas" */
+                const char *dep_sep = strstr(proj, CBM_DEP_SEPARATOR);
+                if (!dep_sep) continue;
+                const char *pkg = dep_sep + CBM_DEP_SEPARATOR_LEN;
+                yyjson_mut_val *d = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, d, "package", pkg);
+                int dn = cbm_store_count_nodes(store, proj);
+                yyjson_mut_obj_add_int(doc, d, "nodes", dn);
+                yyjson_mut_arr_add_val(dep_arr, d);
+                dep_count++;
+            }
+            if (dep_count > 0) {
+                yyjson_mut_obj_add_val(doc, root, "dependencies", dep_arr);
+                yyjson_mut_obj_add_int(doc, root, "dependency_count", dep_count);
+            }
+            cbm_store_search_free(&dep_out);
+        }
+
+        /* Report detected ecosystem */
+        cbm_project_t proj_info;
+        if (cbm_store_get_project(store, project, &proj_info) == 0 && proj_info.root_path) {
+            cbm_pkg_manager_t eco = cbm_detect_ecosystem(proj_info.root_path);
+            if (eco != CBM_PKG_COUNT) {
+                yyjson_mut_obj_add_str(doc, root, "detected_ecosystem",
+                                       cbm_pkg_manager_str(eco));
+            }
+        }
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "no_project");
     }
@@ -1284,12 +1457,27 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     if (rc == 0) {
         cbm_store_t *store = resolve_store(srv, project_name);
         if (store) {
+            /* Auto-detect ecosystem and index installed deps from fresh graph.
+             * Queries manifest files already indexed by pipeline step 1. */
+            int deps_reindexed = cbm_dep_auto_index(
+                project_name, repo_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT);
+
             int nodes = cbm_store_count_nodes(store, project_name);
             int edges = cbm_store_count_edges(store, project_name);
             yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
             yyjson_mut_obj_add_int(doc, root, "edges", edges);
+            if (deps_reindexed > 0)
+                yyjson_mut_obj_add_int(doc, root, "dependencies_indexed", deps_reindexed);
+
+            cbm_pkg_manager_t eco = cbm_detect_ecosystem(repo_path);
+            if (eco != CBM_PKG_COUNT)
+                yyjson_mut_obj_add_str(doc, root, "detected_ecosystem",
+                                       cbm_pkg_manager_str(eco));
         }
     }
+
+    if (srv->session_project[0])
+        yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
@@ -2302,17 +2490,23 @@ static void *autoindex_thread(void *arg) {
 
     int rc = cbm_pipeline_run(p);
     cbm_pipeline_free(p);
-    cbm_mem_collect(); /* return mimalloc pages to OS after indexing */
 
     if (rc == 0) {
+        /* Re-index dependencies after fresh dump */
+        cbm_store_t *store = resolve_store(srv, srv->session_project);
+        if (store) {
+            cbm_dep_auto_index(srv->session_project, srv->session_root,
+                               store, CBM_DEFAULT_AUTO_DEP_LIMIT);
+        }
+
         cbm_log_info("autoindex.done", "project", srv->session_project);
-        /* Register with watcher for ongoing change detection */
         if (srv->watcher) {
             cbm_watcher_watch(srv->watcher, srv->session_project, srv->session_root);
         }
     } else {
         cbm_log_warn("autoindex.err", "msg", "pipeline_run_failed");
     }
+    cbm_mem_collect();
     return NULL;
 }
 
