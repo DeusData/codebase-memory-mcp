@@ -177,6 +177,9 @@ PIPELINE_SRCS = \
     src/pipeline/pass_infrascan.c \
     src/pipeline/httplink.c
 
+# Depindex module (dependency/reference API indexing)
+DEPINDEX_SRCS = src/depindex/depindex.c
+
 # Traces module (new)
 TRACES_SRCS = src/traces/traces.c
 
@@ -223,7 +226,7 @@ TRE_CFLAGS = -std=c11 -g -O1 -w -Ivendored/tre
 YYJSON_SRC = vendored/yyjson/yyjson.c
 
 # All production sources
-PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
+PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(DEPINDEX_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
                   $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(SQLITE_WRITER_SRC)
 

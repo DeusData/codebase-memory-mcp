@@ -66,6 +66,7 @@ void cbm_gitignore_free(cbm_gitignore_t *gi);
 typedef enum {
     CBM_MODE_FULL = 0, /* parse everything supported */
     CBM_MODE_FAST = 1, /* aggressive filtering for speed */
+    CBM_MODE_DEP  = 2, /* dep: like FAST but keeps vendor/, .d.ts, third_party/ */
 } cbm_index_mode_t;
 #endif
 

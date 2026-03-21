@@ -11,6 +11,7 @@
 #include "store/store.h"
 #include "cypher/cypher.h"
 #include "pipeline/pipeline.h"
+#include "depindex/depindex.h"
 #include "cli/cli.h"
 #include "watcher/watcher.h"
 #include "foundation/mem.h"
@@ -277,11 +278,13 @@ static const tool_def_t TOOLS[] = {
      "\"array\",\"items\":{\"type\":\"string\"}}}}"},
 
     {"search_code",
-     "Search source code content with text or regex patterns. Use for string literals, error "
-     "messages, and config values that are not in the knowledge graph.",
+     "Search source code content with text or regex patterns. Case-insensitive by default. "
+     "Use for string literals, error messages, and config values not in the knowledge graph.",
      "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"project\":{\"type\":"
      "\"string\"},\"file_pattern\":{\"type\":\"string\"},\"regex\":{\"type\":\"boolean\","
-     "\"default\":false},\"limit\":{\"type\":\"integer\",\"description\":\"Max results. Default: "
+     "\"default\":false},\"case_sensitive\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"Match case-sensitively. Default false (case-insensitive).\"},"
+     "\"limit\":{\"type\":\"integer\",\"description\":\"Max results. Default: "
      "unlimited\"}},\"required\":["
      "\"pattern\"]}"},
 
@@ -309,18 +312,23 @@ static const tool_def_t TOOLS[] = {
      "\"string\"}},\"required\":[\"traces\"]}"},
 
     {"index_dependencies",
-     "Index dependency/library source code into a SEPARATE dependency graph for API reference. "
-     "Dependency symbols are stored in {project}_deps.db and are NOT included in queries unless "
-     "include_dependencies=true is passed. This prevents confusion between your code and library code.",
+     "Index dependency/library source for API reference. Works with ANY language (78 supported). "
+     "Deps stored with {project}.dep.{name} project names, tagged source:dependency in results. "
+     "PRIMARY: Use source_paths (works for all languages). "
+     "SHORTCUT: package_manager auto-resolves paths for uv/cargo/npm/bun.",
      "{\"type\":\"object\",\"properties\":{"
-     "\"project\":{\"type\":\"string\",\"description\":\"Existing project to add dependencies to\"},"
-     "\"package_manager\":{\"type\":\"string\",\"enum\":[\"uv\",\"cargo\",\"npm\",\"bun\"],"
-     "\"description\":\"Package manager to resolve dependencies from\"},"
+     "\"project\":{\"type\":\"string\",\"description\":\"Existing indexed project to add deps to\"},"
+     "\"source_paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
+     "\"description\":\"Dep source directories, paired 1:1 with packages[]. Any language.\"},"
      "\"packages\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
-     "\"description\":\"Package names to index (omit for auto-detect from lockfiles)\"},"
+     "\"description\":\"Dep names, paired 1:1 with source_paths[]. "
+     "Creates {project}.dep.{name} in the graph.\"},"
+     "\"package_manager\":{\"type\":\"string\","
+     "\"description\":\"Auto-resolve source_paths for installed packages. "
+     "Supported: uv/pip/cargo/npm/bun. Errors include source_path hints.\"},"
      "\"public_only\":{\"type\":\"boolean\",\"default\":true,"
      "\"description\":\"Index only exported/public symbols\"}"
-     "},\"required\":[\"project\",\"package_manager\"]}"},
+     "},\"required\":[\"project\",\"packages\"]}"},
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
@@ -630,13 +638,16 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     return srv->store;
 }
 
-/* Bail with empty JSON result when no store is available. */
-#define REQUIRE_STORE(store, project)                                              \
-    do {                                                                           \
-        if (!(store)) {                                                            \
-            free(project);                                                         \
-            return cbm_mcp_text_result("{\"error\":\"no project loaded\"}", true); \
-        }                                                                          \
+/* Bail with JSON error + hint when no store is available. */
+#define REQUIRE_STORE(store, project)                                                             \
+    do {                                                                                          \
+        if (!(store)) {                                                                           \
+            free(project);                                                                        \
+            return cbm_mcp_text_result(                                                           \
+                "{\"error\":\"no project loaded\","                                               \
+                "\"hint\":\"Run index_repository with repo_path to index the project first.\"}", \
+                true);                                                                            \
+        }                                                                                         \
     } while (0)
 
 /* ── Tool handler implementations ─────────────────────────────── */
@@ -1727,13 +1738,25 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     (void)fclose(tf);
 
     char cmd[4096];
-    // NOLINTNEXTLINE(readability-implicit-bool-conversion)
-    const char *flag = use_regex ? "-E" : "-F";
+    /* Case-sensitivity: default case-insensitive, opt-in sensitive. */
+    bool case_sensitive = cbm_mcp_get_bool_arg(args, "case_sensitive");
+    const char *flag;
+    if (use_regex) {
+        flag = case_sensitive ? "-E" : "-Ei";
+    } else {
+        flag = case_sensitive ? "-F" : "-Fi";
+    }
+    /* Use a generous -m limit to avoid early termination on repos with
+     * many files. The actual result limit is enforced in post-processing.
+     * Old limit*3 was too small — grep stops after N total matches across
+     * ALL files, so alphabetically early directories exhaust the limit. */
+    int grep_limit = limit * 50;
+    if (grep_limit < 500) grep_limit = 500;
     if (file_pattern) {
         snprintf(cmd, sizeof(cmd), "grep -rn %s --include='%s' -m %d -f '%s' '%s' 2>/dev/null",
-                 flag, file_pattern, limit * 3, tmpfile, root_path);
+                 flag, file_pattern, grep_limit, tmpfile, root_path);
     } else {
-        snprintf(cmd, sizeof(cmd), "grep -rn %s -m %d -f '%s' '%s' 2>/dev/null", flag, limit * 3,
+        snprintf(cmd, sizeof(cmd), "grep -rn %s -m %d -f '%s' '%s' 2>/dev/null", flag, grep_limit,
                  tmpfile, root_path);
     }
 
@@ -2035,37 +2058,137 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
 
 static char *handle_index_dependencies(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
-    char *pkg_mgr = cbm_mcp_get_string_arg(args, "package_manager");
+    char *pkg_mgr_str = cbm_mcp_get_string_arg(args, "package_manager");
 
     if (!project) {
-        free(pkg_mgr);
-        return cbm_mcp_text_result("project is required", true);
-    }
-    if (!pkg_mgr) {
-        free(project);
-        return cbm_mcp_text_result("package_manager is required", true);
+        free(pkg_mgr_str);
+        return cbm_mcp_text_result("{\"error\":\"project is required\"}", true);
     }
 
-    /* TODO: Implement full dependency indexing pipeline.
-     * For now, return a structured response indicating the tool is registered
-     * but full dep resolution/indexing is not yet implemented. */
-    (void)srv;
+    /* Parse packages[] array */
+    yyjson_doc *doc_args = yyjson_read(args, strlen(args), 0);
+    yyjson_val *root_args = yyjson_doc_get_root(doc_args);
+    yyjson_val *packages_val = yyjson_obj_get(root_args, "packages");
+    yyjson_val *source_paths_val = yyjson_obj_get(root_args, "source_paths");
+
+    if (!packages_val || !yyjson_is_arr(packages_val) || yyjson_arr_size(packages_val) == 0) {
+        yyjson_doc_free(doc_args);
+        free(project);
+        free(pkg_mgr_str);
+        return cbm_mcp_text_result(
+            "{\"error\":\"packages[] is required\"}", true);
+    }
+
+    bool has_paths = source_paths_val && yyjson_is_arr(source_paths_val);
+    bool has_mgr = pkg_mgr_str != NULL;
+    if (!has_paths && !has_mgr) {
+        yyjson_doc_free(doc_args);
+        free(project);
+        free(pkg_mgr_str);
+        return cbm_mcp_text_result(
+            "{\"error\":\"Either source_paths[] or package_manager is required\"}", true);
+    }
+
+    cbm_store_t *store = resolve_store(srv, project);
+    if (!store) {
+        yyjson_doc_free(doc_args);
+        free(project);
+        free(pkg_mgr_str);
+        return cbm_mcp_text_result(
+            "{\"error\":\"no project loaded\","
+            "\"hint\":\"Run index_repository with repo_path first.\"}", true);
+    }
+
+    cbm_pkg_manager_t mgr = has_mgr ? cbm_parse_pkg_manager(pkg_mgr_str) : CBM_PKG_CUSTOM;
+
+    /* Get project root for package_manager resolution */
+    char *root_path = NULL;
+    if (has_mgr) {
+        cbm_project_t proj_info;
+        if (cbm_store_get_project(store, project, &proj_info) == 0) {
+            root_path = heap_strdup(proj_info.root_path);
+        }
+    }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "ok");
+    yyjson_mut_val *pkg_results = yyjson_mut_arr(doc);
 
-    yyjson_mut_obj_add_str(doc, root, "status", "not_yet_implemented");
-    yyjson_mut_obj_add_str(doc, root, "project", project);
-    yyjson_mut_obj_add_str(doc, root, "package_manager", pkg_mgr);
-    yyjson_mut_obj_add_str(doc, root, "note",
-                           "Dependency indexing pipeline (depindex module) not yet built. "
-                           "Tool registered and parameter validation works.");
+    size_t pkg_count = yyjson_arr_size(packages_val);
+    for (size_t i = 0; i < pkg_count; i++) {
+        yyjson_val *pkg_val = yyjson_arr_get(packages_val, i);
+        const char *pkg_name = yyjson_get_str(pkg_val);
+        if (!pkg_name) continue;
+
+        yyjson_mut_val *pr = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, pr, "name", pkg_name);
+
+        /* Resolve source directory */
+        const char *source_dir = NULL;
+        char *resolved_path = NULL;
+
+        if (has_paths && i < yyjson_arr_size(source_paths_val)) {
+            yyjson_val *sp = yyjson_arr_get(source_paths_val, i);
+            source_dir = yyjson_get_str(sp);
+        } else if (has_mgr && root_path) {
+            cbm_dep_resolved_t resolved = {0};
+            if (cbm_resolve_pkg_source(mgr, pkg_name, root_path, &resolved) == 0) {
+                resolved_path = heap_strdup(resolved.path);
+                source_dir = resolved_path;
+                if (resolved.version)
+                    yyjson_mut_obj_add_str(doc, pr, "version", resolved.version);
+                cbm_dep_resolved_free(&resolved);
+            }
+        }
+
+        if (!source_dir || access(source_dir, F_OK) != 0) {
+            yyjson_mut_obj_add_str(doc, pr, "status", "not_found");
+            yyjson_mut_obj_add_str(doc, pr, "hint",
+                "Use source_paths[] with the directory containing dep source.");
+            yyjson_mut_arr_append(pkg_results, pr);
+            free(resolved_path);
+            continue;
+        }
+
+        /* Run pipeline: flush dep into project db */
+        char *dep_proj = cbm_dep_project_name(project, pkg_name);
+        cbm_pipeline_t *dp = cbm_pipeline_new(source_dir, NULL, CBM_MODE_DEP);
+        if (dp) {
+            cbm_pipeline_set_project_name(dp, dep_proj);
+            cbm_pipeline_set_flush_store(dp, store);
+            int rc = cbm_pipeline_run(dp);
+            cbm_pipeline_free(dp);
+
+            if (rc == 0) {
+                int nodes = cbm_store_count_nodes(store, dep_proj);
+                int edges = cbm_store_count_edges(store, dep_proj);
+                yyjson_mut_obj_add_str(doc, pr, "status", "indexed");
+                yyjson_mut_obj_add_int(doc, pr, "nodes", nodes);
+                yyjson_mut_obj_add_int(doc, pr, "edges", edges);
+            } else {
+                yyjson_mut_obj_add_str(doc, pr, "status", "index_failed");
+            }
+        } else {
+            yyjson_mut_obj_add_str(doc, pr, "status", "pipeline_failed");
+            yyjson_mut_obj_add_str(doc, pr, "hint", "Out of memory or invalid source path.");
+        }
+        free(dep_proj);
+        free(resolved_path);
+        yyjson_mut_arr_append(pkg_results, pr);
+    }
+
+    yyjson_mut_obj_add_val(doc, root, "packages", pkg_results);
+    if (srv->session_project[0])
+        yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+    yyjson_doc_free(doc_args);
     free(project);
-    free(pkg_mgr);
+    free(pkg_mgr_str);
+    free(root_path);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
@@ -2154,31 +2277,14 @@ static void detect_session(cbm_mcp_server_t *srv) {
         }
     }
 
-    /* Derive project name from path */
+    /* Derive project name from path — MUST match cbm_project_name_from_path()
+     * (fqn.c:168) which the pipeline uses for db file naming and node project column.
+     * Previous code used "last 2 segments" convention which produced different names,
+     * breaking expand_project_param() and maybe_auto_index db file checks. */
     if (srv->session_root[0]) {
-        /* Use last two path components joined by dash, matching Go's ProjectNameFromPath */
-        const char *p = srv->session_root;
-        const char *last_slash = strrchr(p, '/');
-        if (last_slash && last_slash > p) {
-            const char *prev = last_slash - 1;
-            while (prev > p && *prev != '/') {
-                prev--;
-            }
-            if (*prev == '/') {
-                prev++;
-            }
-            snprintf(srv->session_project, sizeof(srv->session_project), "%.*s",
-                     (int)(strlen(p) - (size_t)(prev - p)), prev);
-            /* Replace / with - */
-            for (char *c = srv->session_project; *c; c++) {
-                if (*c == '/') {
-                    *c = '-';
-                }
-            }
-        } else {
-            snprintf(srv->session_project, sizeof(srv->session_project), "%s",
-                     last_slash ? last_slash + 1 : p);
-        }
+        char *name = cbm_project_name_from_path(srv->session_root);
+        snprintf(srv->session_project, sizeof(srv->session_project), "%s", name);
+        free(name);
     }
 }
 
