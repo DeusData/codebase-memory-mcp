@@ -398,36 +398,79 @@ static const tool_def_t TOOLS[] = {
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
 
-char *cbm_mcp_tools_list(void) {
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root = yyjson_mut_obj(doc);
-    yyjson_mut_doc_set_root(doc, root);
+/* ── Streamlined tool definitions (Phase 9: 3 visible tools) ─── */
 
-    yyjson_mut_val *tools = yyjson_mut_arr(doc);
+static const tool_def_t STREAMLINED_TOOLS[] = {
+    {"search_code_graph",
+     "Search the code knowledge graph for functions, classes, routes, variables, "
+     "and relationships. Use INSTEAD OF grep/glob for code definitions and structure. "
+     "Supports Cypher queries via 'cypher' param for complex patterns. "
+     "Results sorted by PageRank (structural importance) by default.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"project\":{\"type\":\"string\",\"description\":\"Project name, path, or filter. "
+     "Accepts: project name, directory path (/path/to/repo), 'self' (project only), "
+     "'dep'/'deps' (dependencies only), 'dep.pandas' (specific dep), glob patterns.\"},"
+     "\"cypher\":{\"type\":\"string\",\"description\":\"Cypher query for complex multi-hop "
+     "patterns. When provided, other filter params are ignored. Add LIMIT.\"},"
+     "\"label\":{\"type\":\"string\"},\"name_pattern\":{\"type\":\"string\"},"
+     "\"qn_pattern\":{\"type\":\"string\"},\"file_pattern\":{\"type\":\"string\"},"
+     "\"sort_by\":{\"type\":\"string\",\"enum\":[\"relevance\",\"name\",\"degree\"]},"
+     "\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"summary\"]},"
+     "\"compact\":{\"type\":\"boolean\"},\"include_dependencies\":{\"type\":\"boolean\"},"
+     "\"limit\":{\"type\":\"integer\"},\"offset\":{\"type\":\"integer\"},"
+     "\"min_degree\":{\"type\":\"integer\"},\"max_degree\":{\"type\":\"integer\"},"
+     "\"max_output_bytes\":{\"type\":\"integer\",\"description\":\"Max response bytes (cypher mode). 0=unlimited.\"},"
+     "\"relationship\":{\"type\":\"string\"},"
+     "\"exclude_entry_points\":{\"type\":\"boolean\"},"
+     "\"include_connected\":{\"type\":\"boolean\"}"
+     "}}"},
 
-    for (int i = 0; i < TOOL_COUNT; i++) {
-        yyjson_mut_val *tool = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_str(doc, tool, "name", TOOLS[i].name);
-        yyjson_mut_obj_add_str(doc, tool, "description", TOOLS[i].description);
+    {"trace_call_path",
+     "Trace function call paths — who calls a function and what it calls. "
+     "Use for callers, dependencies, and impact analysis. "
+     "Results sorted by PageRank within each hop level.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"function_name\":{\"type\":\"string\",\"description\":\"Function name to trace\"},"
+     "\"project\":{\"type\":\"string\"},"
+     "\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\",\"both\"]},"
+     "\"depth\":{\"type\":\"integer\",\"default\":3},"
+     "\"max_results\":{\"type\":\"integer\"},"
+     "\"compact\":{\"type\":\"boolean\"},"
+     "\"edge_types\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}"
+     "},\"required\":[\"function_name\"]}"},
 
-        /* Parse input schema JSON and embed */
-        yyjson_doc *schema_doc =
-            yyjson_read(TOOLS[i].input_schema, strlen(TOOLS[i].input_schema), 0);
-        if (schema_doc) {
-            yyjson_mut_val *schema = yyjson_val_mut_copy(doc, yyjson_doc_get_root(schema_doc));
-            yyjson_mut_obj_add_val(doc, tool, "inputSchema", schema);
-            yyjson_doc_free(schema_doc);
-        }
+    {"get_code",
+     "Get source code for a function, class, or symbol by qualified name. "
+     "Use INSTEAD OF reading entire files. Use mode=signature for API lookup (99%% savings). "
+     "Use mode=head_tail for large functions (preserves return code).",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"qualified_name\":{\"type\":\"string\",\"description\":\"Qualified name from search results\"},"
+     "\"project\":{\"type\":\"string\"},"
+     "\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"signature\",\"head_tail\"]},"
+     "\"max_lines\":{\"type\":\"integer\"},"
+     "\"auto_resolve\":{\"type\":\"boolean\"},"
+     "\"include_neighbors\":{\"type\":\"boolean\"}"
+     "},\"required\":[\"qualified_name\"]}"},
+};
+static const int STREAMLINED_TOOL_COUNT = sizeof(STREAMLINED_TOOLS) / sizeof(STREAMLINED_TOOLS[0]);
 
-        yyjson_mut_arr_add_val(tools, tool);
+/* Config key for tool visibility mode */
+#define CBM_CONFIG_TOOL_MODE "tool_mode"
+
+static void emit_tool(yyjson_mut_doc *doc, yyjson_mut_val *tools, const tool_def_t *t) {
+    yyjson_mut_val *tool = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, tool, "name", t->name);
+    yyjson_mut_obj_add_str(doc, tool, "description", t->description);
+    yyjson_doc *schema_doc = yyjson_read(t->input_schema, strlen(t->input_schema), 0);
+    if (schema_doc) {
+        yyjson_mut_val *schema = yyjson_val_mut_copy(doc, yyjson_doc_get_root(schema_doc));
+        yyjson_mut_obj_add_val(doc, tool, "inputSchema", schema);
+        yyjson_doc_free(schema_doc);
     }
-
-    yyjson_mut_obj_add_val(doc, root, "tools", tools);
-
-    char *out = yy_doc_to_str(doc);
-    yyjson_mut_doc_free(doc);
-    return out;
+    yyjson_mut_arr_add_val(tools, tool);
 }
+
+/* cbm_mcp_tools_list() defined after struct cbm_mcp_server (needs full type) */
 
 char *cbm_mcp_initialize_response(void) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -569,7 +612,50 @@ struct cbm_mcp_server {
     struct cbm_config *config;   /* external config ref (not owned) */
     cbm_thread_t autoindex_tid;
     bool autoindex_active; /* true if auto-index thread was started */
+    bool context_injected; /* true after first _context header sent (Phase 9) */
 };
+
+/* ── Tool list (needs full struct definition above) ──────────── */
+
+char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
+    const char *tool_mode = "streamlined";
+    if (srv && srv->config) {
+        tool_mode = cbm_config_get(srv->config, CBM_CONFIG_TOOL_MODE, "streamlined");
+    }
+    bool classic = (strcmp(tool_mode, "classic") == 0);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    yyjson_mut_val *tools = yyjson_mut_arr(doc);
+
+    if (!classic) {
+        /* Streamlined mode: emit 3 consolidated tools */
+        for (int i = 0; i < STREAMLINED_TOOL_COUNT; i++) {
+            emit_tool(doc, tools, &STREAMLINED_TOOLS[i]);
+        }
+        /* Also emit individually-enabled tools */
+        for (int i = 0; i < TOOL_COUNT; i++) {
+            char key[64];
+            snprintf(key, sizeof(key), "tool_%s", TOOLS[i].name);
+            if (srv && srv->config && cbm_config_get_bool(srv->config, key, false)) {
+                emit_tool(doc, tools, &TOOLS[i]);
+            }
+        }
+    } else {
+        /* Classic mode: all 15 original tools */
+        for (int i = 0; i < TOOL_COUNT; i++) {
+            emit_tool(doc, tools, &TOOLS[i]);
+        }
+    }
+
+    yyjson_mut_obj_add_val(doc, root, "tools", tools);
+
+    char *out = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return out;
+}
 
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
     cbm_mcp_server_t *srv = calloc(1, sizeof(*srv));
@@ -751,6 +837,24 @@ typedef struct {
 static project_expand_t expand_project_param(cbm_mcp_server_t *srv, char *raw) {
     project_expand_t r = {.value = NULL, .mode = MATCH_NONE};
     if (!raw) return r;
+
+    /* Rule 0: Path detection — convert paths to project names.
+     * Enables: search_code_graph(project="/path/to/repo") */
+    if (raw[0] == '/' || raw[0] == '~' || (raw[0] == '.' && raw[1] == '/') ||
+        (strchr(raw, '/') != NULL && raw[0] != '*')) {
+        char *resolved = realpath(raw, NULL);
+        const char *path = resolved ? resolved : raw;
+        char *name = cbm_project_name_from_path(path);
+        if (resolved && srv->session_root[0] == '\0') {
+            snprintf(srv->session_root, sizeof(srv->session_root), "%s", resolved);
+            snprintf(srv->session_project, sizeof(srv->session_project), "%s", name);
+        }
+        free(raw);
+        free(resolved);
+        r.value = name;
+        r.mode = MATCH_PREFIX;
+        return r;
+    }
 
     /* Guard: if session_project is empty, skip all expansion rules */
     if (!srv->session_project[0]) {
@@ -2868,6 +2972,21 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
         return cbm_mcp_text_result("missing tool name", true);
     }
 
+    /* Phase 9: consolidated tool names (streamlined mode) */
+    if (strcmp(tool_name, "search_code_graph") == 0) {
+        /* Check if cypher param is present → route to query_graph handler */
+        char *cypher = cbm_mcp_get_string_arg(args_json, "cypher");
+        if (cypher) {
+            free(cypher);
+            return handle_query_graph(srv, args_json);
+        }
+        return handle_search_graph(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_code") == 0) {
+        return handle_get_code_snippet(srv, args_json);
+    }
+
+    /* Original tool names (classic mode or individually enabled) */
     if (strcmp(tool_name, "list_projects") == 0) {
         return handle_list_projects(srv, args_json);
     }
@@ -3196,7 +3315,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         detect_session(srv);
         maybe_auto_index(srv);
     } else if (strcmp(req.method, "tools/list") == 0) {
-        result_json = cbm_mcp_tools_list();
+        result_json = cbm_mcp_tools_list(srv);
     } else if (strcmp(req.method, "tools/call") == 0) {
         char *tool_name = req.params_raw ? cbm_mcp_get_tool_name(req.params_raw) : NULL;
         char *tool_args =
