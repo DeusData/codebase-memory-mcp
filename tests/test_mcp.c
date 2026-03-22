@@ -108,23 +108,16 @@ TEST(mcp_initialize_response) {
 }
 
 TEST(mcp_tools_list) {
-    char *json = cbm_mcp_tools_list();
+    char *json = cbm_mcp_tools_list(NULL);
     ASSERT_NOT_NULL(json);
-    /* Should contain all 14 tools */
-    ASSERT_NOT_NULL(strstr(json, "index_repository"));
-    ASSERT_NOT_NULL(strstr(json, "search_graph"));
-    ASSERT_NOT_NULL(strstr(json, "query_graph"));
+    /* When srv=NULL (no config), returns streamlined tools (3 consolidated) */
+    ASSERT_NOT_NULL(strstr(json, "search_code_graph"));
     ASSERT_NOT_NULL(strstr(json, "trace_call_path"));
-    ASSERT_NOT_NULL(strstr(json, "get_code_snippet"));
-    ASSERT_NOT_NULL(strstr(json, "get_graph_schema"));
-    ASSERT_NOT_NULL(strstr(json, "get_architecture"));
-    ASSERT_NOT_NULL(strstr(json, "search_code"));
-    ASSERT_NOT_NULL(strstr(json, "list_projects"));
-    ASSERT_NOT_NULL(strstr(json, "delete_project"));
-    ASSERT_NOT_NULL(strstr(json, "index_status"));
-    ASSERT_NOT_NULL(strstr(json, "detect_changes"));
-    ASSERT_NOT_NULL(strstr(json, "manage_adr"));
-    ASSERT_NOT_NULL(strstr(json, "ingest_traces"));
+    ASSERT_NOT_NULL(strstr(json, "get_code"));
+    /* Old names should NOT appear in streamlined mode */
+    ASSERT_NULL(strstr(json, "\"index_repository\""));
+    ASSERT_NULL(strstr(json, "\"search_graph\""));
+    ASSERT_NULL(strstr(json, "\"query_graph\""));
     free(json);
     PASS();
 }
@@ -252,8 +245,9 @@ TEST(server_handle_tools_list) {
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"id\":2"));
-    ASSERT_NOT_NULL(strstr(resp, "search_graph"));
-    ASSERT_NOT_NULL(strstr(resp, "query_graph"));
+    /* Streamlined mode: consolidated tools */
+    ASSERT_NOT_NULL(strstr(resp, "search_code_graph"));
+    ASSERT_NOT_NULL(strstr(resp, "trace_call_path"));
     free(resp);
 
     cbm_mcp_server_free(srv);

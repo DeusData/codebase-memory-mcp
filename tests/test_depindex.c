@@ -209,10 +209,11 @@ static cbm_mcp_server_t *setup_dep_query_server(char *tmp_dir, size_t tmp_sz) {
  * ══════════════════════════════════════════════════════════════════ */
 
 TEST(tool_index_dependencies_listed) {
-    char *json = cbm_mcp_tools_list();
+    char *json = cbm_mcp_tools_list(NULL);
     ASSERT_NOT_NULL(json);
-    /* index_dependencies should appear in the tool list */
-    ASSERT_NOT_NULL(strstr(json, "index_dependencies"));
+    /* In streamlined mode (NULL srv), index_dependencies is hidden.
+     * But search_code_graph (consolidated) should be present. */
+    ASSERT_NOT_NULL(strstr(json, "search_code_graph"));
     free(json);
     PASS();
 }

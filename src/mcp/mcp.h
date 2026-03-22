@@ -13,9 +13,10 @@
 
 /* ── Forward declarations ─────────────────────────────────────── */
 
-typedef struct cbm_store cbm_store_t; /* from store/store.h */
-struct cbm_watcher;                   /* from watcher/watcher.h */
-struct cbm_config;                    /* from cli/cli.h */
+typedef struct cbm_store cbm_store_t;       /* from store/store.h */
+typedef struct cbm_mcp_server cbm_mcp_server_t; /* forward decl for tools_list */
+struct cbm_watcher;                         /* from watcher/watcher.h */
+struct cbm_config;                          /* from cli/cli.h */
 
 /* ── JSON-RPC types ───────────────────────────────────────────── */
 
@@ -52,8 +53,9 @@ char *cbm_jsonrpc_format_error(int64_t id, int code, const char *message);
 /* Format an MCP tool result with text content. Returns heap-allocated JSON. */
 char *cbm_mcp_text_result(const char *text, bool is_error);
 
-/* Format the tools/list response. Returns heap-allocated JSON. */
-char *cbm_mcp_tools_list(void);
+/* Format the tools/list response. Filters by tool_mode config.
+ * srv may be NULL (returns all tools). Uses the typedef declared below. */
+char *cbm_mcp_tools_list(cbm_mcp_server_t *srv);
 
 /* Format the initialize response. Returns heap-allocated JSON. */
 char *cbm_mcp_initialize_response(void);
@@ -78,7 +80,7 @@ char *cbm_mcp_get_arguments(const char *params_json);
 
 /* ── MCP Server ───────────────────────────────────────────────── */
 
-typedef struct cbm_mcp_server cbm_mcp_server_t;
+/* cbm_mcp_server_t forward-declared above in Forward declarations */
 
 /* Create an MCP server. store_path is the SQLite database directory. */
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path);
