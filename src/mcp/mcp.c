@@ -1012,6 +1012,18 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
 
+    /* Verify project is registered — resolve_store uses SQLITE_OPEN_CREATE so
+     * store is always non-NULL even for unindexed projects. Without this check
+     * get_architecture would silently return {total_nodes:0} instead of an error. */
+    if (project) {
+        cbm_project_t proj_check = {0};
+        if (cbm_store_get_project(store, project, &proj_check) != CBM_STORE_OK) {
+            free(project);
+            return cbm_mcp_text_result("{\"error\":\"project not indexed — run index_repository first\"}", true);
+        }
+        cbm_project_free_fields(&proj_check);
+    }
+
     cbm_schema_info_t schema = {0};
     cbm_store_get_schema(store, project, &schema);
 

@@ -229,15 +229,15 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory) {
     if (in_memory) {
         rc = exec_sql(s, "PRAGMA synchronous = OFF;");
     } else {
+        rc = exec_sql(s, "PRAGMA busy_timeout = 10000;");
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
         rc = exec_sql(s, "PRAGMA journal_mode = WAL;");
         if (rc != CBM_STORE_OK) {
             return rc;
         }
         rc = exec_sql(s, "PRAGMA synchronous = NORMAL;");
-        if (rc != CBM_STORE_OK) {
-            return rc;
-        }
-        rc = exec_sql(s, "PRAGMA busy_timeout = 10000;");
         if (rc != CBM_STORE_OK) {
             return rc;
         }
