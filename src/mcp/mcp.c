@@ -2389,16 +2389,15 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
             continue;
         }
 #else
-        struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int pr = poll(&pfd, 1, STORE_IDLE_TIMEOUT_S * 1000);
-
-        if (pr < 0) {
-            break; /* error or signal */
-        }
-        if (pr == 0) {
-            /* Timeout — evict idle store to free resources */
-            cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
-            continue;
+        int has_buffered = (in->_IO_read_ptr < in->_IO_read_end);  // glibc-specific
+        if (!has_buffered) {
+            struct pollfd pfd = {.fd = fd, .events = POLLIN};
+            int pr = poll(&pfd, 1, STORE_IDLE_TIMEOUT_S * 1000);
+            if (pr < 0) break;
+            if (pr == 0) {
+                cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
+                continue;
+            }
         }
 #endif
 
