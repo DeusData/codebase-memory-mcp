@@ -12,6 +12,7 @@
 #include "cypher/cypher.h"
 #include "pipeline/pipeline.h"
 #include "depindex/depindex.h"
+#include "pagerank/pagerank.h"
 #include "cli/cli.h"
 #include "watcher/watcher.h"
 #include "foundation/mem.h"
@@ -274,6 +275,9 @@ static const tool_def_t TOOLS[] = {
      "Response includes has_more and pagination_hint when more pages exist."
      "\"},\"offset\":{\"type\":\"integer\",\"default\":0,\"description\":\"Skip N results "
      "for pagination. Check pagination_hint in response for next page offset.\"},"
+     "\"sort_by\":{\"type\":\"string\",\"enum\":[\"relevance\",\"name\",\"degree\"],"
+     "\"description\":\"Sort order: relevance (PageRank structural importance, default), "
+     "name (alphabetical), degree (most connected).\"},"
      "\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"summary\"],\"default\":\"full\","
      "\"description\":\"full=individual results (default), summary=aggregate counts by label and "
      "file. Use summary first to understand scope, then full with filters to drill down."
@@ -1050,6 +1054,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     char *label = cbm_mcp_get_string_arg(args, "label");
     char *name_pattern = cbm_mcp_get_string_arg(args, "name_pattern");
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
+    char *sort_by = cbm_mcp_get_string_arg(args, "sort_by");
     int cfg_search_limit = cbm_config_get_int(srv->config, CBM_CONFIG_SEARCH_LIMIT,
                                                CBM_DEFAULT_SEARCH_LIMIT);
     int limit = cbm_mcp_get_int_arg(args, "limit", cfg_search_limit);
@@ -1068,6 +1073,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     params.label = label;
     params.name_pattern = name_pattern;
     params.file_pattern = file_pattern;
+    params.sort_by = sort_by;
     params.limit = effective_limit;
     params.offset = offset;
     params.min_degree = min_degree;
@@ -1153,6 +1159,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                                    sr->node.file_path ? sr->node.file_path : "");
             yyjson_mut_obj_add_int(doc, item, "in_degree", sr->in_degree);
             yyjson_mut_obj_add_int(doc, item, "out_degree", sr->out_degree);
+            if (sr->pagerank_score > 0.0)
+                yyjson_mut_obj_add_real(doc, item, "pagerank", sr->pagerank_score);
 
             /* Unconditional source tagging — critical for AI grounding.
              * Every result tagged source:"project" or source:"dependency".
@@ -1190,6 +1198,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     free(name_pattern);
     free(file_pattern);
     free(search_mode);
+    free(sort_by);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
@@ -1568,6 +1577,11 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                 doc, item, "qualified_name",
                 tr_out.visited[i].node.qualified_name ? tr_out.visited[i].node.qualified_name : "");
             yyjson_mut_obj_add_int(doc, item, "hop", tr_out.visited[i].hop);
+            {
+                double pr = cbm_pagerank_get(store, tr_out.visited[i].node.id);
+                if (pr > 0.0)
+                    yyjson_mut_obj_add_real(doc, item, "pagerank", pr);
+            }
             /* Boundary tagging: mark if callee is in a dependency */
             bool callee_dep = cbm_is_dep_project(tr_out.visited[i].node.project,
                                                   srv->session_project);
@@ -1610,6 +1624,11 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                 doc, item, "qualified_name",
                 tr_in.visited[i].node.qualified_name ? tr_in.visited[i].node.qualified_name : "");
             yyjson_mut_obj_add_int(doc, item, "hop", tr_in.visited[i].hop);
+            {
+                double pr = cbm_pagerank_get(store, tr_in.visited[i].node.id);
+                if (pr > 0.0)
+                    yyjson_mut_obj_add_real(doc, item, "pagerank", pr);
+            }
             /* Boundary tagging: mark if caller is in a dependency */
             bool caller_dep = cbm_is_dep_project(tr_in.visited[i].node.project,
                                                   srv->session_project);
@@ -1773,6 +1792,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
              * Queries manifest files already indexed by pipeline step 1. */
             int deps_reindexed = cbm_dep_auto_index(
                 project_name, repo_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT);
+
+            /* Compute PageRank + LinkRank on full graph (project + deps) */
+            cbm_pagerank_compute_default(store, project_name);
 
             int nodes = cbm_store_count_nodes(store, project_name);
             int edges = cbm_store_count_edges(store, project_name);
@@ -2761,6 +2783,9 @@ static char *handle_index_dependencies(cbm_mcp_server_t *srv, const char *args) 
     if (srv->session_project[0])
         yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
 
+    /* Recompute PageRank after adding dep nodes so relevance sort includes them */
+    cbm_pagerank_compute_default(store, project);
+
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     yyjson_doc_free(doc_args);
@@ -2898,6 +2923,7 @@ static void *autoindex_thread(void *arg) {
         if (store) {
             cbm_dep_auto_index(srv->session_project, srv->session_root,
                                store, CBM_DEFAULT_AUTO_DEP_LIMIT);
+            cbm_pagerank_compute_default(store, srv->session_project);
         }
 
         cbm_log_info("autoindex.done", "project", srv->session_project);

@@ -123,6 +123,7 @@ typedef struct {
     cbm_node_t node;
     int in_degree;
     int out_degree;
+    double pagerank_score;  /* PageRank rank, 0.0 if not computed */
     /* connected_names: allocated array of strings, count in connected_count */
     const char **connected_names;
     int connected_count;
@@ -200,6 +201,10 @@ void cbm_store_close(cbm_store_t *s);
 
 /* Get the last error message (static string, valid until next call). */
 const char *cbm_store_error(cbm_store_t *s);
+
+/* Raw SQLite handle — use for pagerank/linkrank bulk inserts.
+ * Do NOT use for schema modifications. Returns NULL if store is NULL. */
+struct sqlite3 *cbm_store_get_db(cbm_store_t *s);
 
 /* ── Transaction ────────────────────────────────────────────────── */
 
