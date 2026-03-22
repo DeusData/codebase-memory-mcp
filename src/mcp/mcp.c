@@ -1568,6 +1568,14 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                 doc, item, "qualified_name",
                 tr_out.visited[i].node.qualified_name ? tr_out.visited[i].node.qualified_name : "");
             yyjson_mut_obj_add_int(doc, item, "hop", tr_out.visited[i].hop);
+            /* Boundary tagging: mark if callee is in a dependency */
+            bool callee_dep = cbm_is_dep_project(tr_out.visited[i].node.project,
+                                                  srv->session_project);
+            yyjson_mut_obj_add_str(doc, item, "source",
+                                   callee_dep ? "dependency" : "project");
+            if (callee_dep) {
+                yyjson_mut_obj_add_bool(doc, item, "read_only", true);
+            }
             yyjson_mut_arr_add_val(callees, item);
         }
         free(seen_out);
@@ -1602,6 +1610,14 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                 doc, item, "qualified_name",
                 tr_in.visited[i].node.qualified_name ? tr_in.visited[i].node.qualified_name : "");
             yyjson_mut_obj_add_int(doc, item, "hop", tr_in.visited[i].hop);
+            /* Boundary tagging: mark if caller is in a dependency */
+            bool caller_dep = cbm_is_dep_project(tr_in.visited[i].node.project,
+                                                  srv->session_project);
+            yyjson_mut_obj_add_str(doc, item, "source",
+                                   caller_dep ? "dependency" : "project");
+            if (caller_dep) {
+                yyjson_mut_obj_add_bool(doc, item, "read_only", true);
+            }
             yyjson_mut_arr_add_val(callers, item);
         }
         free(seen_in);
@@ -2012,6 +2028,14 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
             yyjson_mut_arr_append(arr, a);
         }
         yyjson_mut_obj_add_val(doc, root_obj, "alternatives", arr);
+    }
+
+    /* Provenance tagging: mark if snippet is from a dependency */
+    bool snippet_dep = cbm_is_dep_project(node->project, srv->session_project);
+    yyjson_mut_obj_add_str(doc, root_obj, "source",
+                           snippet_dep ? "dependency" : "project");
+    if (snippet_dep) {
+        yyjson_mut_obj_add_bool(doc, root_obj, "read_only", true);
     }
 
     char *json = yy_doc_to_str(doc);
