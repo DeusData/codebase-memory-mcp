@@ -1889,7 +1889,7 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         BIND_TEXT(like_pattern);
     }
 
-    /* Exclude labels: add NOT IN clause directly (no bind params — values are code-provided) */
+    /* Exclude labels: use parameterized placeholders to prevent SQL injection */
     if (params->exclude_labels) {
         char excl_clause[512] = "n.label NOT IN (";
         int elen = (int)strlen(excl_clause);
@@ -1900,11 +1900,12 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
                     elen = (int)sizeof(excl_clause) - 1;
                 }
             }
-            elen += snprintf(excl_clause + elen, sizeof(excl_clause) - (size_t)elen, "'%s'",
-                             params->exclude_labels[i]);
+            elen += snprintf(excl_clause + elen, sizeof(excl_clause) - (size_t)elen, "?%d",
+                             bind_idx + 1);
             if (elen >= (int)sizeof(excl_clause)) {
                 elen = (int)sizeof(excl_clause) - 1;
             }
+            BIND_TEXT(params->exclude_labels[i]);
         }
         snprintf(excl_clause + elen, sizeof(excl_clause) - (size_t)elen, ")");
         ADD_WHERE(excl_clause);
@@ -2040,8 +2041,9 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
     }
     out->root = root;
 
-    /* Build edge type IN clause */
-    char types_clause[512] = "'CALLS'";
+    /* Build edge type IN clause with parameterized placeholders */
+    char types_clause[512] = "?1";
+    const char *default_edge_type = "CALLS";
     if (edge_type_count > 0) {
         int tlen = 0;
         for (int i = 0; i < edge_type_count; i++) {
@@ -2051,8 +2053,8 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
                     tlen = (int)sizeof(types_clause) - 1;
                 }
             }
-            tlen += snprintf(types_clause + tlen, sizeof(types_clause) - (size_t)tlen, "'%s'",
-                             edge_types[i]);
+            tlen += snprintf(types_clause + tlen, sizeof(types_clause) - (size_t)tlen, "?%d",
+                             i + 1);
             if (tlen >= (int)sizeof(types_clause)) {
                 tlen = (int)sizeof(types_clause) - 1;
             }
@@ -2097,6 +2099,15 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
     if (rc != SQLITE_OK) {
         store_set_error_sqlite(s, "bfs prepare");
         return CBM_STORE_ERR;
+    }
+
+    /* Bind edge type parameters */
+    if (edge_type_count > 0) {
+        for (int i = 0; i < edge_type_count; i++) {
+            bind_text(stmt, i + 1, edge_types[i]);
+        }
+    } else {
+        bind_text(stmt, 1, default_edge_type);
     }
 
     int cap = 16;
@@ -2147,6 +2158,15 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         sqlite3_stmt *estmt = NULL;
         rc = sqlite3_prepare_v2(s->db, edge_sql, -1, &estmt, NULL);
         if (rc == SQLITE_OK) {
+            /* Bind edge type parameters for the edge query */
+            if (edge_type_count > 0) {
+                for (int i = 0; i < edge_type_count; i++) {
+                    bind_text(estmt, i + 1, edge_types[i]);
+                }
+            } else {
+                bind_text(estmt, 1, default_edge_type);
+            }
+
             int ecap = 8;
             int en = 0;
             cbm_edge_info_t *edges = malloc(ecap * sizeof(cbm_edge_info_t));

@@ -75,6 +75,9 @@ typedef enum {
     CBM_LANG_FORM,
     CBM_LANG_MAGMA,
     CBM_LANG_WOLFRAM,
+    // Hardware description languages
+    CBM_LANG_DEVICETREE,
+    CBM_LANG_VHDL,
     CBM_LANG_COUNT
 } CBMLanguage;
 

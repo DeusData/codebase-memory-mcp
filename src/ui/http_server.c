@@ -604,8 +604,22 @@ static void *index_thread_fn(void *arg) {
     }
 
     char log_file[256];
-    char json_arg[1200];
-    snprintf(json_arg, sizeof(json_arg), "{\"repo_path\":\"%s\"}", job->root_path);
+
+    /* JSON-escape root_path to prevent injection via double-quotes or backslashes */
+    char escaped_path[2048];
+    {
+        const char *s = job->root_path;
+        size_t j = 0;
+        for (; *s && j < sizeof(escaped_path) - 2; s++) {
+            if (*s == '"' || *s == '\\') {
+                escaped_path[j++] = '\\';
+            }
+            escaped_path[j++] = *s;
+        }
+        escaped_path[j] = '\0';
+    }
+    char json_arg[4096];
+    snprintf(json_arg, sizeof(json_arg), "{\"repo_path\":\"%s\"}", escaped_path);
 
 #ifdef _WIN32
     snprintf(log_file, sizeof(log_file), "%s\\cbm_index_%d.log",
