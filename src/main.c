@@ -18,6 +18,7 @@
 #include "pipeline/pipeline.h"
 #include "store/store.h"
 #include "depindex/depindex.h"
+#include "pagerank/pagerank.h"
 #include "cli/cli.h"
 #include "foundation/log.h"
 #include "foundation/compat_thread.h"
@@ -94,6 +95,7 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
         cbm_store_t *store = cbm_store_open(pname);
         if (store) {
             cbm_dep_auto_index(pname, root_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT);
+            cbm_pagerank_compute_default(store, pname);
             cbm_store_close(store);
         }
         free(pname);
