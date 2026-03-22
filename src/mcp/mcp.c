@@ -1959,8 +1959,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             int deps_reindexed = cbm_dep_auto_index(
                 project_name, repo_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT);
 
-            /* Compute PageRank + LinkRank on full graph (project + deps) */
-            cbm_pagerank_compute_default(store, project_name);
+            /* Compute PageRank + LinkRank on full graph (project + deps).
+             * Uses config-backed edge weights when config is available. */
+            cbm_pagerank_compute_with_config(store, project_name, srv->config);
 
             int nodes = cbm_store_count_nodes(store, project_name);
             int edges = cbm_store_count_edges(store, project_name);
@@ -3104,7 +3105,7 @@ static void *autoindex_thread(void *arg) {
         if (store) {
             cbm_dep_auto_index(srv->session_project, srv->session_root,
                                store, CBM_DEFAULT_AUTO_DEP_LIMIT);
-            cbm_pagerank_compute_default(store, srv->session_project);
+            cbm_pagerank_compute_with_config(store, srv->session_project, srv->config);
         }
 
         cbm_log_info("autoindex.done", "project", srv->session_project);
