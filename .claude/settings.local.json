@@ -1,0 +1,43 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__codebase-memory-mcp__index_repository",
+      "Bash(make -f Makefile.cbm cbm)",
+      "Bash(where make:*)",
+      "Read(//c/msys64/clang64/bin/**)",
+      "Read(//c/msys64/usr/bin/**)",
+      "Bash(export PATH=\"/c/msys64/clang64/bin:/c/msys64/usr/bin:$PATH\")",
+      "Bash(make -f Makefile.cbm cbm CC=clang CXX=clang++)",
+      "Bash(export TMP=\"$TEMP\")",
+      "Bash(export TMPDIR=\"$TEMP\")",
+      "Bash(clang --version)",
+      "Bash(export TMP=/c/msys64/tmp)",
+      "Bash(export TEMP=/c/msys64/tmp)",
+      "Bash(export TMPDIR=/c/msys64/tmp)",
+      "Bash(clang -x c - -o /dev/null)",
+      "Bash(make -f Makefile.cbm cbm CC=clang CXX=clang++ -j1)",
+      "Bash(export TMP='C:\\\\msys64\\\\tmp')",
+      "Bash(export TEMP='C:\\\\msys64\\\\tmp')",
+      "Bash(export TMPDIR='C:\\\\msys64\\\\tmp')",
+      "Bash(clang -v -x c -c /dev/null -o /dev/null)",
+      "Bash(clang -c /tmp/test.c -o /tmp/test.o)",
+      "Bash(rm -f /tmp/test.c /tmp/test.o)",
+      "Bash(TMPDIR=C:/msys64/tmp TMP=C:/msys64/tmp TEMP=C:/msys64/tmp make -f Makefile.cbm cbm CC=clang CXX=clang++ -j1)",
+      "Bash(strace clang:*)",
+      "Bash(clang -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Isrc -Ivendored -Ivendored/sqlite3 -Ivendored/mimalloc/include -Iinternal/cbm -Iinternal/cbm/vendored/ts_runtime/include -O2 -c src/foundation/platform.c -o /tmp/platform_test.o)",
+      "Bash(export PATH=\"/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH\")",
+      "Bash(gcc --version)",
+      "Bash(make -f Makefile.cbm cbm CC=gcc CXX=g++ SANITIZE=)",
+      "Bash(export TMPDIR=\"$USERPROFILE/AppData/Local/Temp\")",
+      "Bash(export TMP=\"$TMPDIR\")",
+      "Bash(export TEMP=\"$TMPDIR\")",
+      "Read(//c/tools/codebase-memory-mcp.fork/$APPDATA/Code/User/globalStorage/**)",
+      "Read(//c/tools/codebase-memory-mcp.fork/$HOME/.config/Code/User/globalStorage/**)",
+      "Bash(CFLAGS=\"-std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare -Wno-format-truncation -Wno-unused-result -Wno-stringop-truncation -Wno-alloc-size-larger-than -Isrc -Ivendored -Ivendored/sqlite3 -Ivendored/mimalloc/include -Iinternal/cbm -Iinternal/cbm/vendored/ts_runtime/include -O2\")",
+      "Bash(for f:*)",
+      "Bash(do echo:*)",
+      "Bash(gcc $CFLAGS -c \"$f\" -o /dev/null)",
+      "Bash(done)"
+    ]
+  }
+}

@@ -97,6 +97,92 @@ int64_t cbm_file_size(const char *path) {
     return (int64_t)sz.QuadPart;
 }
 
+const char *cbm_self_exe_path(void) {
+    static char buf[1024];
+    DWORD len = GetModuleFileNameA(NULL, buf, sizeof(buf));
+    if (len == 0 || len >= sizeof(buf)) {
+        return "";
+    }
+    cbm_normalize_path_sep(buf);
+    return buf;
+}
+
+char *cbm_normalize_path_sep(char *path) {
+    if (path) {
+        for (char *p = path; *p; p++) {
+            if (*p == '\\') {
+                *p = '/';
+            }
+        }
+    }
+    return path;
+}
+
+/* Convert MSYS2/Git Bash path to native Windows path (in-place).
+ * /c/Users/... → C:/Users/...   (single drive letter after leading /) */
+static void msys_to_native(char *path) {
+    if (path[0] == '/' && path[1] != '\0' && path[2] == '/') {
+        char drive = path[1];
+        if ((drive >= 'a' && drive <= 'z') || (drive >= 'A' && drive <= 'Z')) {
+            /* Shift left: overwrite leading '/' with drive letter, inject ':' */
+            path[0] = (char)(drive >= 'a' ? drive - 32 : drive); /* uppercase */
+            path[1] = ':';
+            /* rest of path starting from path[2] is already correct */
+        }
+    }
+}
+
+const char *cbm_home_dir(void) {
+    static char buf[1024];
+    const char *h = getenv("HOME");
+    if (!h || !h[0]) {
+        h = getenv("USERPROFILE");
+    }
+    if (!h || !h[0]) {
+        return NULL;
+    }
+    snprintf(buf, sizeof(buf), "%s", h);
+    cbm_normalize_path_sep(buf);
+    msys_to_native(buf);
+    return buf;
+}
+
+const char *cbm_app_config_dir(void) {
+    static char buf[1024];
+    const char *d = getenv("APPDATA");
+    if (!d || !d[0]) {
+        /* Fallback: USERPROFILE/AppData/Roaming */
+        const char *home = cbm_home_dir();
+        if (!home) {
+            return NULL;
+        }
+        snprintf(buf, sizeof(buf), "%s/AppData/Roaming", home);
+        return buf;
+    }
+    snprintf(buf, sizeof(buf), "%s", d);
+    cbm_normalize_path_sep(buf);
+    msys_to_native(buf);
+    return buf;
+}
+
+const char *cbm_app_local_dir(void) {
+    static char buf[1024];
+    const char *d = getenv("LOCALAPPDATA");
+    if (!d || !d[0]) {
+        /* Fallback: USERPROFILE/AppData/Local */
+        const char *home = cbm_home_dir();
+        if (!home) {
+            return NULL;
+        }
+        snprintf(buf, sizeof(buf), "%s/AppData/Local", home);
+        return buf;
+    }
+    snprintf(buf, sizeof(buf), "%s", d);
+    cbm_normalize_path_sep(buf);
+    msys_to_native(buf);
+    return buf;
+}
+
 #else /* POSIX (macOS + Linux) */
 
 /* ── POSIX implementation ─────────────────────────────────────── */
@@ -109,6 +195,7 @@ int64_t cbm_file_size(const char *path) {
 
 #ifdef __APPLE__
 #include <mach/mach_time.h>
+#include <mach-o/dyld.h> // _NSGetExecutablePath
 #include <sys/sysctl.h>
 #else
 #include <sched.h>
@@ -213,6 +300,68 @@ int64_t cbm_file_size(const char *path) {
         return -1;
     }
     return (int64_t)st.st_size;
+}
+
+const char *cbm_self_exe_path(void) {
+    static char buf[1024];
+#ifdef __APPLE__
+    uint32_t sz = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &sz) != 0) {
+        return "";
+    }
+    /* Resolve symlinks to get canonical path */
+    char *resolved = realpath(buf, NULL);
+    if (resolved) {
+        snprintf(buf, sizeof(buf), "%s", resolved);
+        free(resolved);
+    }
+#else
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        return "";
+    }
+    buf[len] = '\0';
+#endif
+    return buf;
+}
+
+char *cbm_normalize_path_sep(char *path) {
+    /* No-op on POSIX — paths already use forward slashes. */
+    (void)path;
+    return path;
+}
+
+const char *cbm_home_dir(void) {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
+    return getenv("HOME");
+}
+
+const char *cbm_app_config_dir(void) {
+    static char buf[1024];
+#ifdef __APPLE__
+    /* macOS: callers prepend "Library/Application Support/..." */
+    return cbm_home_dir();
+#else
+    /* Linux: XDG_CONFIG_HOME or ~/.config */
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    if (xdg && xdg[0]) {
+        snprintf(buf, sizeof(buf), "%s", xdg);
+        return buf;
+    }
+    const char *home = cbm_home_dir();
+    if (!home) {
+        return NULL;
+    }
+    snprintf(buf, sizeof(buf), "%s/.config", home);
+    return buf;
+#endif
+}
+
+const char *cbm_app_local_dir(void) {
+    /* On POSIX there is no distinction between "roaming" and "local" app data.
+     * Delegate to cbm_app_config_dir() so callers compile on all platforms. */
+    return cbm_app_config_dir();
 }
 
 #endif /* _WIN32 */

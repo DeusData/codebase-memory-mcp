@@ -6,6 +6,7 @@
  */
 #include "cli/cli.h"
 #include "foundation/compat.h"
+#include "foundation/platform.h"
 #include "foundation/str_util.h"
 
 // the correct standard headers are included below but clang-tidy doesn't map them.
@@ -843,13 +844,26 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     }
 
     /* Zed: platform-specific config dir */
+    {
 #ifdef __APPLE__
-    snprintf(path, sizeof(path), "%s/Library/Application Support/Zed", home_dir);
+        const char *zed_base = cbm_app_config_dir();
+        if (zed_base) {
+            snprintf(path, sizeof(path), "%s/Library/Application Support/Zed", zed_base);
+        }
+#elif defined(_WIN32)
+        const char *zed_base = cbm_app_local_dir();
+        if (zed_base) {
+            snprintf(path, sizeof(path), "%s/Zed", zed_base);
+        }
 #else
-    snprintf(path, sizeof(path), "%s/.config/zed", home_dir);
+        const char *zed_base = cbm_app_config_dir();
+        if (zed_base) {
+            snprintf(path, sizeof(path), "%s/zed", zed_base);
+        }
 #endif
-    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
-        agents.zed = true;
+        if (zed_base && stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            agents.zed = true;
+        }
     }
 
     /* OpenCode: binary on PATH */
@@ -872,19 +886,33 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     }
 
     /* KiloCode: globalStorage dir */
-    snprintf(path, sizeof(path), "%s/.config/Code/User/globalStorage/kilocode.kilo-code", home_dir);
-    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
-        agents.kilocode = true;
+    {
+        const char *app_cfg = cbm_app_config_dir();
+        if (app_cfg) {
+#ifdef __APPLE__
+            snprintf(path, sizeof(path), "%s/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code", app_cfg);
+#else
+            snprintf(path, sizeof(path), "%s/Code/User/globalStorage/kilocode.kilo-code", app_cfg);
+#endif
+            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                agents.kilocode = true;
+            }
+        }
     }
 
     /* VS Code: User config dir */
+    {
+        const char *app_cfg = cbm_app_config_dir();
+        if (app_cfg) {
 #ifdef __APPLE__
-    snprintf(path, sizeof(path), "%s/Library/Application Support/Code/User", home_dir);
+            snprintf(path, sizeof(path), "%s/Library/Application Support/Code/User", app_cfg);
 #else
-    snprintf(path, sizeof(path), "%s/.config/Code/User", home_dir);
+            snprintf(path, sizeof(path), "%s/Code/User", app_cfg);
 #endif
-    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
-        agents.vscode = true;
+            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                agents.vscode = true;
+            }
+        }
     }
 
     /* OpenClaw: ~/.openclaw/ dir */
@@ -1650,7 +1678,7 @@ unsigned char *cbm_extract_binary_from_targz(const unsigned char *data, int data
 static const char *get_cache_dir(const char *home_dir) {
     static char buf[1024];
     if (!home_dir) {
-        home_dir = getenv("HOME");
+        home_dir = cbm_home_dir();
     }
     if (!home_dir) {
         return NULL;
@@ -1874,8 +1902,7 @@ int cbm_cmd_config(int argc, char **argv) {
         return 0;
     }
 
-    // NOLINTNEXTLINE(concurrency-mt-unsafe)
-    const char *home = getenv("HOME");
+    const char *home = cbm_home_dir();
     if (!home) {
         fprintf(stderr, "error: HOME not set\n");
         return 1;
@@ -2105,7 +2132,7 @@ int cbm_cmd_install(int argc, char **argv) {
         }
     }
 
-    const char *home = getenv("HOME");
+    const char *home = cbm_home_dir();
     if (!home) {
         fprintf(stderr, "error: HOME not set\n");
         return 1;
@@ -2144,9 +2171,15 @@ int cbm_cmd_install(int argc, char **argv) {
         }
     }
 
-    /* Step 2: Binary path */
+    /* Step 2: Binary path — use actual running executable location */
     char self_path[1024];
-    snprintf(self_path, sizeof(self_path), "%s/.local/bin/codebase-memory-mcp", home);
+    const char *exe = cbm_self_exe_path();
+    if (exe[0]) {
+        snprintf(self_path, sizeof(self_path), "%s", exe);
+    } else {
+        /* Fallback to conventional location */
+        snprintf(self_path, sizeof(self_path), "%s/.local/bin/codebase-memory-mcp", home);
+    }
 
     /* Step 3: Detect agents */
     cbm_detected_agents_t agents = cbm_detect_agents(home);
@@ -2275,9 +2308,11 @@ int cbm_cmd_install(int argc, char **argv) {
         char config_path[1024];
 #ifdef __APPLE__
         snprintf(config_path, sizeof(config_path),
-                 "%s/Library/Application Support/Zed/settings.json", home);
+                 "%s/Library/Application Support/Zed/settings.json", cbm_app_config_dir());
+#elif defined(_WIN32)
+        snprintf(config_path, sizeof(config_path), "%s/Zed/settings.json", cbm_app_local_dir());
 #else
-        snprintf(config_path, sizeof(config_path), "%s/.config/zed/settings.json", home);
+        snprintf(config_path, sizeof(config_path), "%s/zed/settings.json", cbm_app_config_dir());
 #endif
         if (!dry_run) {
             cbm_install_zed_mcp(self_path, config_path);
@@ -2336,9 +2371,16 @@ int cbm_cmd_install(int argc, char **argv) {
     if (agents.kilocode) {
         printf("KiloCode:\n");
         char config_path[1024];
+        const char *kilo_cfg = cbm_app_config_dir();
+#ifdef __APPLE__
         snprintf(config_path, sizeof(config_path),
-                 "%s/.config/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json",
-                 home);
+                 "%s/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json",
+                 kilo_cfg);
+#else
+        snprintf(config_path, sizeof(config_path),
+                 "%s/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json",
+                 kilo_cfg);
+#endif
         if (!dry_run) {
             cbm_install_editor_mcp(self_path, config_path);
         }
@@ -2357,11 +2399,12 @@ int cbm_cmd_install(int argc, char **argv) {
     if (agents.vscode) {
         printf("VS Code:\n");
         char config_path[1024];
+        const char *vs_cfg = cbm_app_config_dir();
 #ifdef __APPLE__
         snprintf(config_path, sizeof(config_path),
-                 "%s/Library/Application Support/Code/User/mcp.json", home);
+                 "%s/Library/Application Support/Code/User/mcp.json", vs_cfg);
 #else
-        snprintf(config_path, sizeof(config_path), "%s/.config/Code/User/mcp.json", home);
+        snprintf(config_path, sizeof(config_path), "%s/Code/User/mcp.json", vs_cfg);
 #endif
         if (!dry_run) {
             cbm_install_vscode_mcp(self_path, config_path);
@@ -2380,9 +2423,15 @@ int cbm_cmd_install(int argc, char **argv) {
         printf("  mcp: %s\n", config_path);
     }
 
-    /* Step 14: Ensure PATH */
+    /* Step 14: Ensure PATH — derive bin directory from actual executable */
     char bin_dir[1024];
-    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
+    snprintf(bin_dir, sizeof(bin_dir), "%s", self_path);
+    char *last_slash = strrchr(bin_dir, '/');
+    if (last_slash) {
+        *last_slash = '\0';
+    } else {
+        snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
+    }
     const char *rc = cbm_detect_shell_rc(home);
     if (rc[0]) {
         int path_rc = cbm_ensure_path(bin_dir, rc, dry_run);
@@ -2412,7 +2461,7 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         }
     }
 
-    const char *home = getenv("HOME");
+    const char *home = cbm_home_dir();
     if (!home) {
         fprintf(stderr, "error: HOME not set\n");
         return 1;
@@ -2492,9 +2541,11 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         char config_path[1024];
 #ifdef __APPLE__
         snprintf(config_path, sizeof(config_path),
-                 "%s/Library/Application Support/Zed/settings.json", home);
+                 "%s/Library/Application Support/Zed/settings.json", cbm_app_config_dir());
+#elif defined(_WIN32)
+        snprintf(config_path, sizeof(config_path), "%s/Zed/settings.json", cbm_app_local_dir());
 #else
-        snprintf(config_path, sizeof(config_path), "%s/.config/zed/settings.json", home);
+        snprintf(config_path, sizeof(config_path), "%s/zed/settings.json", cbm_app_config_dir());
 #endif
         if (!dry_run) {
             cbm_remove_zed_mcp(config_path);
@@ -2545,9 +2596,16 @@ int cbm_cmd_uninstall(int argc, char **argv) {
 
     if (agents.kilocode) {
         char config_path[1024];
+        const char *kilo_cfg = cbm_app_config_dir();
+#ifdef __APPLE__
         snprintf(config_path, sizeof(config_path),
-                 "%s/.config/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json",
-                 home);
+                 "%s/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json",
+                 kilo_cfg);
+#else
+        snprintf(config_path, sizeof(config_path),
+                 "%s/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json",
+                 kilo_cfg);
+#endif
         if (!dry_run) {
             cbm_remove_editor_mcp(config_path);
         }
@@ -2563,11 +2621,12 @@ int cbm_cmd_uninstall(int argc, char **argv) {
 
     if (agents.vscode) {
         char config_path[1024];
+        const char *vs_cfg = cbm_app_config_dir();
 #ifdef __APPLE__
         snprintf(config_path, sizeof(config_path),
-                 "%s/Library/Application Support/Code/User/mcp.json", home);
+                 "%s/Library/Application Support/Code/User/mcp.json", vs_cfg);
 #else
-        snprintf(config_path, sizeof(config_path), "%s/.config/Code/User/mcp.json", home);
+        snprintf(config_path, sizeof(config_path), "%s/Code/User/mcp.json", vs_cfg);
 #endif
         if (!dry_run) {
             cbm_remove_vscode_mcp(config_path);
@@ -2635,7 +2694,7 @@ int cbm_cmd_uninstall(int argc, char **argv) {
 int cbm_cmd_update(int argc, char **argv) {
     parse_auto_answer(argc, argv);
 
-    const char *home = getenv("HOME");
+    const char *home = cbm_home_dir();
     if (!home) {
         fprintf(stderr, "error: HOME not set\n");
         return 1;
@@ -2746,13 +2805,25 @@ int cbm_cmd_update(int argc, char **argv) {
         /* crc == -1: could not verify (warning only), crc == 0: verified OK */
     }
 
-    /* Step 5: Extract binary */
+    /* Step 5: Extract binary — update in place at the current exe location */
     char bin_dest[1024];
-    snprintf(bin_dest, sizeof(bin_dest), "%s/.local/bin/codebase-memory-mcp", home);
+    const char *exe = cbm_self_exe_path();
+    if (exe[0]) {
+        snprintf(bin_dest, sizeof(bin_dest), "%s", exe);
+    } else {
+        snprintf(bin_dest, sizeof(bin_dest), "%s/.local/bin/codebase-memory-mcp", home);
+    }
 
     /* Ensure install directory exists */
     char bin_dir[1024];
-    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
+    snprintf(bin_dir, sizeof(bin_dir), "%s", bin_dest);
+    /* Strip filename to get directory */
+    char *last_slash = strrchr(bin_dir, '/');
+    if (last_slash) {
+        *last_slash = '\0';
+    } else {
+        snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
+    }
     cbm_mkdir_p(bin_dir, 0755);
 
     if (strcmp(ext, "tar.gz") == 0) {

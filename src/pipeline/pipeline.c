@@ -127,8 +127,7 @@ static char *resolve_db_path(const cbm_pipeline_t *p) {
     if (p->db_path) {
         snprintf(path, 1024, "%s", p->db_path);
     } else {
-        // NOLINTNEXTLINE(concurrency-mt-unsafe)
-        const char *home = getenv("HOME");
+        const char *home = cbm_home_dir();
         if (!home) {
             home = "/tmp";
         }
@@ -680,8 +679,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!check_cancel(p)) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
-        // NOLINTNEXTLINE(concurrency-mt-unsafe) — called once during single-threaded dump
-        const char *home = getenv("HOME");
+        const char *home = cbm_home_dir();
         char db_path[1024];
         if (p->db_path) {
             snprintf(db_path, sizeof(db_path), "%s", p->db_path);

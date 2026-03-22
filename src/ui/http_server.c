@@ -377,7 +377,7 @@ static void handle_browse(struct mg_connection *c, struct mg_http_message *hm) {
     char path[1024] = {0};
     if (!get_query_param(hm->query, "path", path, (int)sizeof(path)) || path[0] == '\0') {
         /* Default to home directory */
-        const char *home = getenv("HOME");
+        const char *home = cbm_home_dir();
         if (home)
             snprintf(path, sizeof(path), "%s", home);
         else
@@ -452,7 +452,7 @@ static void handle_adr_get(struct mg_connection *c, struct mg_http_message *hm) 
         return;
     }
 
-    const char *home = getenv("HOME");
+    const char *home = cbm_home_dir();
     if (!home)
         home = "/tmp";
     char db_path[1024];
@@ -545,7 +545,7 @@ static void handle_adr_save(struct mg_connection *c, struct mg_http_message *hm)
     const char *proj = yyjson_get_str(v_proj);
     const char *content = yyjson_get_str(v_content);
 
-    const char *home = getenv("HOME");
+    const char *home = cbm_home_dir();
     if (!home)
         home = "/tmp";
     char db_path[1024];
@@ -832,7 +832,7 @@ static void handle_delete_project(struct mg_connection *c, struct mg_http_messag
         return;
     }
 
-    const char *home = getenv("HOME"); // NOLINT(concurrency-mt-unsafe)
+    const char *home = cbm_home_dir();
     if (!home)
         home = "/tmp";
     char db_path[1024];
@@ -870,7 +870,7 @@ static void handle_project_health(struct mg_connection *c, struct mg_http_messag
         return;
     }
 
-    const char *home = getenv("HOME"); // NOLINT(concurrency-mt-unsafe)
+    const char *home = cbm_home_dir();
     if (!home)
         home = "/tmp";
     char db_path[1024];
@@ -928,7 +928,7 @@ static void handle_layout(struct mg_connection *c, struct mg_http_message *hm) {
     }
 
     /* Open a read-only store for this project */
-    const char *home = getenv("HOME"); // NOLINT(concurrency-mt-unsafe)
+    const char *home = cbm_home_dir();
     if (!home)
         home = "/tmp";
     char db_path[1024];

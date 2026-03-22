@@ -72,6 +72,36 @@ bool cbm_file_exists(const char *path);
 /* Check if path is a directory. */
 bool cbm_is_dir(const char *path);
 
+/* Get the user's home directory.
+ * POSIX: returns HOME. Windows: returns HOME, then USERPROFILE.
+ * Path is normalized to forward slashes.
+ * Returns static buffer — do NOT free. Returns NULL on failure. */
+const char *cbm_home_dir(void);
+
+/* Get the application config directory.
+ * macOS: returns HOME (caller appends "Library/Application Support/App/...").
+ * Linux: returns XDG_CONFIG_HOME or HOME/.config (caller appends "app/...").
+ * Windows: returns APPDATA, e.g. "C:/Users/x/AppData/Roaming" (caller appends "App/...").
+ * Path is normalized to forward slashes.
+ * Returns static buffer — do NOT free. Returns NULL on failure. */
+const char *cbm_app_config_dir(void);
+
+/* Get the application local data directory.
+ * macOS/Linux: same as cbm_app_config_dir().
+ * Windows: returns LOCALAPPDATA, e.g. "C:/Users/x/AppData/Local" (caller appends "App/...").
+ * Path is normalized to forward slashes.
+ * Returns static buffer — do NOT free. Returns NULL on failure. */
+const char *cbm_app_local_dir(void);
+
+/* Get the absolute path of the currently running executable.
+ * Returns static buffer — do NOT free. Returns "" on failure. */
+const char *cbm_self_exe_path(void);
+
+/* Normalize path separators to forward slashes (in-place).
+ * On Windows, converts backslashes to forward slashes.
+ * On POSIX, this is a no-op. Returns the input pointer. */
+char *cbm_normalize_path_sep(char *path);
+
 /* Get file size. Returns -1 on error. */
 int64_t cbm_file_size(const char *path);
 

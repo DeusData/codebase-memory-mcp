@@ -370,8 +370,7 @@ cbm_store_t *cbm_store_open(const char *project) {
         return NULL;
     }
     /* Build path: ~/.cache/codebase-memory-mcp/<project>.db */
-    const char *home = getenv("HOME"); // NOLINT(concurrency-mt-unsafe) — called once during
-                                       // single-threaded store open, never concurrently
+    const char *home = cbm_home_dir();
     if (!home) {
         home = "/tmp";
     }
