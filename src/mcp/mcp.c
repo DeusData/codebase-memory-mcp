@@ -2389,7 +2389,13 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
             continue;
         }
 #else
-        int has_buffered = (in->_IO_read_ptr < in->_IO_read_end);  // glibc-specific
+#ifdef __GLIBC__
+        int has_buffered = (in->_IO_read_ptr < in->_IO_read_end);
+#else
+        /* macOS / BSD: use __srget-style check.
+         * fp->_r is the count of unread bytes in the buffer. */
+        int has_buffered = (in->_r > 0);
+#endif
         if (!has_buffered) {
             struct pollfd pfd = {.fd = fd, .events = POLLIN};
             int pr = poll(&pfd, 1, STORE_IDLE_TIMEOUT_S * 1000);
