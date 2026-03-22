@@ -363,11 +363,73 @@ int cbm_dep_auto_index(const char *project_name, const char *project_root,
 
 /* ── Cross-Boundary Edges ──────────────────────────────────────── */
 
-/* Cross-boundary edge creation links project IMPORTS to dep modules.
- * Deferred to Phase 3 completion when store gains project_pattern support.
- * Dep nodes are queryable via search_graph regardless. */
+/* Cross-boundary edge creation links project IMPORTS nodes to dep Module nodes.
+ *
+ * For each IMPORTS node in the project, check if a matching Module node exists
+ * in any dep project (project_name.dep.*). If so, create an IMPORTS edge from
+ * the project's import node to the dep's module node.
+ *
+ * This enables trace_call_path to follow imports across the project/dep boundary. */
 int cbm_dep_link_cross_edges(cbm_store_t *store, const char *project_name) {
-    (void)store;
-    (void)project_name;
-    return 0;
+    if (!store || !project_name || !project_name[0]) return 0;
+
+    /* Find all IMPORTS nodes in the main project */
+    cbm_search_params_t params = {0};
+    params.project = project_name;
+    params.project_exact = true;
+    params.label = "Variable";  /* import statements are typically Variable nodes */
+    params.limit = 500;
+
+    cbm_search_output_t out = {0};
+    int rc = cbm_store_search(store, &params, &out);
+    if (rc != 0 || out.count == 0) {
+        cbm_store_search_free(&out);
+        return 0;
+    }
+
+    int linked = 0;
+
+    /* For each import, look for a matching Module in dep projects */
+    for (int i = 0; i < out.count; i++) {
+        const char *import_name = out.results[i].node.name;
+        if (!import_name || !import_name[0]) continue;
+
+        /* Build dep project pattern: project_name.dep.% */
+        char dep_pattern[CBM_NAME_MAX];
+        snprintf(dep_pattern, sizeof(dep_pattern), "%s" CBM_DEP_SEPARATOR "%%",
+                 project_name);
+
+        /* Search for Module with matching name in dep projects */
+        cbm_search_params_t dep_params = {0};
+        dep_params.name_pattern = import_name;
+        dep_params.project_pattern = dep_pattern;
+        dep_params.label = "Module";
+        dep_params.limit = 1;
+
+        cbm_search_output_t dep_out = {0};
+        int drc = cbm_store_search(store, &dep_params, &dep_out);
+        if (drc == 0 && dep_out.count > 0) {
+            /* Create cross-boundary IMPORTS edge */
+            cbm_edge_t edge = {
+                .source_id = out.results[i].node.id,
+                .target_id = dep_out.results[0].node.id,
+                .type = "IMPORTS",
+                .project = project_name,
+            };
+            cbm_store_insert_edge(store, &edge);
+            linked++;
+        }
+        cbm_store_search_free(&dep_out);
+    }
+
+    cbm_store_search_free(&out);
+
+    if (linked > 0) {
+        char linked_str[16];
+        snprintf(linked_str, sizeof(linked_str), "%d", linked);
+        cbm_log_info("dep.cross_edges", "project", project_name,
+                     "linked", linked_str);
+    }
+
+    return linked;
 }
