@@ -73,6 +73,12 @@ struct cbm_store {
     sqlite3_stmt *stmt_delete_file_hashes;
 };
 
+/* ── Public accessor ────────────────────────────────────────────── */
+
+sqlite3 *cbm_store_get_db(cbm_store_t *s) {
+    return s ? s->db : NULL;
+}
+
 /* ── Helpers ────────────────────────────────────────────────────── */
 
 static void store_set_error(cbm_store_t *s, const char *msg) {
@@ -195,6 +201,18 @@ static int init_schema(cbm_store_t *s) {
                       "  source_hash TEXT NOT NULL,"
                       "  created_at TEXT NOT NULL,"
                       "  updated_at TEXT NOT NULL"
+                      ");"
+                      "CREATE TABLE IF NOT EXISTS pagerank ("
+                      "  node_id INTEGER PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,"
+                      "  project TEXT NOT NULL,"
+                      "  rank REAL NOT NULL DEFAULT 0.0,"
+                      "  computed_at TEXT NOT NULL"
+                      ");"
+                      "CREATE TABLE IF NOT EXISTS linkrank ("
+                      "  edge_id INTEGER PRIMARY KEY REFERENCES edges(id) ON DELETE CASCADE,"
+                      "  project TEXT NOT NULL,"
+                      "  rank REAL NOT NULL DEFAULT 0.0,"
+                      "  computed_at TEXT NOT NULL"
                       ");";
 
     return exec_sql(s, ddl);
@@ -209,7 +227,10 @@ static int create_user_indexes(cbm_store_t *s) {
         "CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id, type);"
         "CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(project, type);"
         "CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(project, target_id, type);"
-        "CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(project, source_id, type);";
+        "CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(project, source_id, type);"
+        "CREATE INDEX IF NOT EXISTS idx_pagerank_project ON pagerank(project);"
+        "CREATE INDEX IF NOT EXISTS idx_pagerank_rank ON pagerank(project, rank DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_linkrank_project ON linkrank(project);";
     return exec_sql(s, sql);
 }
 
@@ -1734,12 +1755,25 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     char count_sql[4096];
     int bind_idx = 0;
 
-    /* We build a query that selects nodes with optional degree subqueries */
-    const char *select_cols =
-        "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
-        "n.file_path, n.start_line, n.end_line, n.properties, "
-        "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.type = 'CALLS') AS in_deg, "
-        "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND e.type = 'CALLS') AS out_deg ";
+    /* Conditionally join pagerank table only when sort_by is relevance.
+     * Avoids JOIN overhead for name/degree sorts. */
+    bool use_pagerank = (!params->sort_by ||
+                         strcmp(params->sort_by, "relevance") == 0);
+    const char *select_cols;
+    if (use_pagerank) {
+        select_cols =
+            "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+            "n.file_path, n.start_line, n.end_line, n.properties, "
+            "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.type = 'CALLS') AS in_deg, "
+            "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND e.type = 'CALLS') AS out_deg, "
+            "COALESCE(pr.rank, 0.0) AS pr_rank ";
+    } else {
+        select_cols =
+            "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+            "n.file_path, n.start_line, n.end_line, n.properties, "
+            "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.type = 'CALLS') AS in_deg, "
+            "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND e.type = 'CALLS') AS out_deg ";
+    }
 
     /* Start building WHERE */
     char where[2048] = "";
@@ -1825,10 +1859,13 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     }
 
     /* Build full SQL */
+    const char *from_join = use_pagerank
+        ? "FROM nodes n LEFT JOIN pagerank pr ON pr.node_id = n.id"
+        : "FROM nodes n";
     if (nparams > 0) {
-        snprintf(sql, sizeof(sql), "%s FROM nodes n WHERE %s", select_cols, where);
+        snprintf(sql, sizeof(sql), "%s %s WHERE %s", select_cols, from_join, where);
     } else {
-        snprintf(sql, sizeof(sql), "%s FROM nodes n", select_cols);
+        snprintf(sql, sizeof(sql), "%s %s", select_cols, from_join);
     }
 
     /* Degree filters: -1 = no filter, 0+ = active filter.
@@ -1863,19 +1900,40 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     // NOLINTNEXTLINE(readability-implicit-bool-conversion)
     const char *name_col = has_degree_wrap ? "name" : "n.name";
     char order_limit[128];
-    /* Stable pagination: ORDER BY name, id prevents duplicates across pages.
-     * When project_pattern includes deps, add project-first sort so project
-     * results appear before dependency results. */
+    /* Sort dispatch: relevance (PageRank), name, degree.
+     * Stable pagination via secondary sort on name, id. */
     const char *id_col = has_degree_wrap ? "id" : "n.id";
-    if (params->project_pattern && !params->sort_by) {
-        const char *proj_col = has_degree_wrap ? "project" : "n.project";
+    const char *pr_col = has_degree_wrap ? "pr_rank" : "pr_rank";
+    if (use_pagerank) {
+        /* Relevance sort: PageRank DESC, then dep-last, then name for stability */
+        if (params->project_pattern) {
+            const char *proj_col = has_degree_wrap ? "project" : "n.project";
+            snprintf(order_limit, sizeof(order_limit),
+                     " ORDER BY %s DESC, "
+                     "CASE WHEN %s LIKE '%%.dep.%%' THEN 1 ELSE 0 END, %s, %s"
+                     " LIMIT %d OFFSET %d",
+                     pr_col, proj_col, name_col, id_col, limit, offset);
+        } else {
+            snprintf(order_limit, sizeof(order_limit),
+                     " ORDER BY %s DESC, %s, %s LIMIT %d OFFSET %d",
+                     pr_col, name_col, id_col, limit, offset);
+        }
+    } else if (params->sort_by && strcmp(params->sort_by, "degree") == 0) {
         snprintf(order_limit, sizeof(order_limit),
-                 " ORDER BY CASE WHEN %s LIKE '%%.dep.%%' THEN 1 ELSE 0 END, %s, %s"
-                 " LIMIT %d OFFSET %d",
-                 proj_col, name_col, id_col, limit, offset);
-    } else {
-        snprintf(order_limit, sizeof(order_limit), " ORDER BY %s, %s LIMIT %d OFFSET %d",
+                 " ORDER BY (in_deg + out_deg) DESC, %s, %s LIMIT %d OFFSET %d",
                  name_col, id_col, limit, offset);
+    } else {
+        /* name sort (explicit or fallback) */
+        if (params->project_pattern) {
+            const char *proj_col = has_degree_wrap ? "project" : "n.project";
+            snprintf(order_limit, sizeof(order_limit),
+                     " ORDER BY CASE WHEN %s LIKE '%%.dep.%%' THEN 1 ELSE 0 END, %s, %s"
+                     " LIMIT %d OFFSET %d",
+                     proj_col, name_col, id_col, limit, offset);
+        } else {
+            snprintf(order_limit, sizeof(order_limit), " ORDER BY %s, %s LIMIT %d OFFSET %d",
+                     name_col, id_col, limit, offset);
+        }
     }
     strncat(sql, order_limit, sizeof(sql) - strlen(sql) - 1);
 
@@ -1918,6 +1976,7 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         scan_node(main_stmt, &results[n].node);
         results[n].in_degree = sqlite3_column_int(main_stmt, 9);
         results[n].out_degree = sqlite3_column_int(main_stmt, 10);
+        results[n].pagerank_score = use_pagerank ? sqlite3_column_double(main_stmt, 11) : 0.0;
         n++;
     }
 
@@ -2004,11 +2063,13 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
              "  WHERE e.type IN (%s) AND bfs.hop < %d"
              ")"
              "SELECT DISTINCT n.id, n.project, n.label, n.name, n.qualified_name, "
-             "n.file_path, n.start_line, n.end_line, n.properties, bfs.hop "
+             "n.file_path, n.start_line, n.end_line, n.properties, bfs.hop, "
+             "COALESCE(pr.rank, 0.0) AS pr_rank "
              "FROM bfs "
              "JOIN nodes n ON n.id = bfs.node_id "
+             "LEFT JOIN pagerank pr ON pr.node_id = n.id "
              "WHERE bfs.hop > 0 " /* exclude root */
-             "ORDER BY bfs.hop "
+             "ORDER BY bfs.hop, pr_rank DESC "
              "LIMIT %d;",
              (long long)start_id, next_id, join_cond, types_clause, max_depth, max_results);
 
@@ -2050,12 +2111,15 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
 
         char edge_sql[8192];
         snprintf(edge_sql, sizeof(edge_sql),
-                 "SELECT n1.name, n2.name, e.type "
+                 "SELECT n1.name, n2.name, e.type, "
+                 "COALESCE(lr.rank, 0.0) AS lr_rank "
                  "FROM edges e "
                  "JOIN nodes n1 ON n1.id = e.source_id "
                  "JOIN nodes n2 ON n2.id = e.target_id "
+                 "LEFT JOIN linkrank lr ON lr.edge_id = e.id "
                  "WHERE e.source_id IN (%s) AND e.target_id IN (%s) "
-                 "AND e.type IN (%s)",
+                 "AND e.type IN (%s) "
+                 "ORDER BY lr_rank DESC",
                  id_set, id_set, types_clause);
 
         sqlite3_stmt *estmt = NULL;
@@ -2073,7 +2137,7 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
                 edges[en].from_name = heap_strdup((const char *)sqlite3_column_text(estmt, 0));
                 edges[en].to_name = heap_strdup((const char *)sqlite3_column_text(estmt, 1));
                 edges[en].type = heap_strdup((const char *)sqlite3_column_text(estmt, 2));
-                edges[en].confidence = 1.0;
+                edges[en].confidence = sqlite3_column_double(estmt, 3);
                 en++;
             }
             sqlite3_finalize(estmt);
