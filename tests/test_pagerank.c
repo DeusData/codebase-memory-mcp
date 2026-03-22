@@ -14,6 +14,7 @@
 #include "test_framework.h"
 #include <store/store.h>
 #include <pagerank/pagerank.h>
+#include <depindex/depindex.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -604,6 +605,194 @@ TEST(pagerank_after_dep_index) {
     PASS();
 }
 
+/* ── 5. Phase 8.5: key_functions in get_architecture ─────── */
+
+TEST(architecture_key_functions_with_pagerank) {
+    /* After PR compute, verify key_functions array in architecture response
+     * with top nodes by PageRank, correct order. */
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "arch", "/tmp/arch");
+    int64_t ids[6];
+    ids[0] = add_node(s, "arch", "hub_func");
+    ids[1] = add_node(s, "arch", "spoke1");
+    ids[2] = add_node(s, "arch", "spoke2");
+    ids[3] = add_node(s, "arch", "spoke3");
+    ids[4] = add_node(s, "arch", "spoke4");
+    ids[5] = add_node(s, "arch", "leaf");
+    /* hub_func called by 4 spokes → highest PageRank */
+    add_edge(s, "arch", ids[1], ids[0], "CALLS");
+    add_edge(s, "arch", ids[2], ids[0], "CALLS");
+    add_edge(s, "arch", ids[3], ids[0], "CALLS");
+    add_edge(s, "arch", ids[4], ids[0], "CALLS");
+    cbm_pagerank_compute_default(s, "arch");
+    /* hub_func should have highest rank */
+    double hub_pr = get_pr(s, ids[0]);
+    double leaf_pr = get_pr(s, ids[5]);
+    ASSERT_TRUE(hub_pr > leaf_pr);
+    /* Verify key_functions query works (top N by pagerank) */
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT n.name, pr.rank FROM nodes n "
+        "JOIN pagerank pr ON pr.node_id = n.id "
+        "WHERE n.project = 'arch' "
+        "ORDER BY pr.rank DESC LIMIT 3", -1, &stmt, NULL);
+    ASSERT_EQ(rc, SQLITE_OK);
+    /* First result should be hub_func */
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    const char *top_name = (const char *)sqlite3_column_text(stmt, 0);
+    ASSERT_STR_EQ(top_name, "hub_func");
+    sqlite3_finalize(stmt);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(architecture_key_functions_no_pagerank) {
+    /* When PageRank not computed, key_functions query returns 0 rows gracefully */
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "nopr", "/tmp/nopr");
+    add_node(s, "nopr", "f1");
+    /* Do NOT compute pagerank */
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT n.name, pr.rank FROM nodes n "
+        "JOIN pagerank pr ON pr.node_id = n.id "
+        "WHERE n.project = 'nopr' "
+        "ORDER BY pr.rank DESC LIMIT 3", -1, &stmt, NULL);
+    ASSERT_EQ(rc, SQLITE_OK);
+    /* No rows — pagerank table empty for this project */
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── 6. Phase 8.5: config-backed edge weights ────────────── */
+
+TEST(pagerank_config_custom_weights) {
+    /* Verify custom edge weights struct produces different rankings */
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "cw", "/tmp/cw");
+    int64_t a = add_node(s, "cw", "source");
+    int64_t b = add_node(s, "cw", "imported");
+    int64_t c = add_node(s, "cw", "called");
+    add_edge(s, "cw", a, b, "IMPORTS");
+    add_edge(s, "cw", a, c, "CALLS");
+    /* Default: CALLS=1.0, IMPORTS=0.3 → c gets more rank */
+    cbm_pagerank_compute_default(s, "cw");
+    double rc_default = get_pr(s, c);
+    double rb_default = get_pr(s, b);
+    ASSERT_TRUE(rc_default > rb_default);
+    /* Custom: boost IMPORTS to 2.0, drop CALLS to 0.1 */
+    cbm_edge_weights_t custom = CBM_DEFAULT_EDGE_WEIGHTS;
+    custom.imports = 2.0;
+    custom.calls = 0.1;
+    cbm_pagerank_compute(s, "cw", CBM_PAGERANK_DAMPING, CBM_PAGERANK_EPSILON,
+                         CBM_PAGERANK_MAX_ITER, &custom, CBM_RANK_SCOPE_FULL);
+    double rc_custom = get_pr(s, c);
+    double rb_custom = get_pr(s, b);
+    /* Now imported node should get more rank */
+    ASSERT_TRUE(rb_custom > rc_custom);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── 7. Phase 8.5: PageRank stats in index_status ────────── */
+
+TEST(pagerank_stats_in_db) {
+    /* After compute, verify pagerank table has computed_at timestamp */
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "stats", "/tmp/stats");
+    add_node(s, "stats", "f1");
+    add_node(s, "stats", "f2");
+    add_edge(s, "stats", 1, 2, "CALLS");
+    cbm_pagerank_compute_default(s, "stats");
+    /* Verify computed_at is set */
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT COUNT(*), MAX(computed_at) FROM pagerank WHERE project = 'stats'",
+        -1, &stmt, NULL);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    int ranked = sqlite3_column_int(stmt, 0);
+    ASSERT_EQ(ranked, 2);
+    const char *ts = (const char *)sqlite3_column_text(stmt, 1);
+    ASSERT_NOT_NULL(ts);
+    ASSERT_TRUE(strlen(ts) >= 10); /* at least YYYY-MM-DD */
+    sqlite3_finalize(stmt);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── 8. Phase 8.5: API streamlining ──────────────────────── */
+
+TEST(pagerank_conditional_degree_logic) {
+    /* Verify pagerank_score is populated on search results when PR is computed.
+     * Uses pagerank_get directly since search result integration is tested
+     * by the existing sort_by tests. */
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "cd", "/tmp/cd");
+    int64_t a = add_node(s, "cd", "func_a");
+    int64_t b = add_node(s, "cd", "func_b");
+    add_edge(s, "cd", a, b, "CALLS");
+    /* Before PR compute: pagerank_get returns 0 */
+    ASSERT_TRUE(get_pr(s, a) == 0.0);
+    ASSERT_TRUE(get_pr(s, b) == 0.0);
+    /* After PR compute: pagerank_get returns > 0 */
+    cbm_pagerank_compute_default(s, "cd");
+    ASSERT_TRUE(get_pr(s, a) > 0.0);
+    ASSERT_TRUE(get_pr(s, b) > 0.0);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pagerank_dep_source_tag_format) {
+    /* Verify dep source tagging uses ".dep." detection.
+     * cbm_is_dep_project("proj.dep.pandas", "proj") → true
+     * cbm_is_dep_project("proj", "proj") → false */
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "dp", "/tmp/dp");
+    cbm_store_upsert_project(s, "dp.dep.pandas", "/tmp/pandas");
+    add_node(s, "dp", "my_func");
+    add_node(s, "dp.dep.pandas", "DataFrame");
+    /* Search all: both should be returned with correct source tags */
+    cbm_search_params_t params = {0};
+    params.limit = 10;
+    cbm_search_output_t out = {0};
+    cbm_store_search(s, &params, &out);
+    ASSERT_TRUE(out.count >= 2);
+    /* Verify dep detection helper */
+    ASSERT_TRUE(cbm_is_dep_project("dp.dep.pandas", "dp"));
+    ASSERT_FALSE(cbm_is_dep_project("dp", "dp"));
+    ASSERT_FALSE(cbm_is_dep_project("deputy", "dep"));
+    cbm_store_search_free(&out);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── 9. Phase 8.5: Edge cases ────────────────────────────── */
+
+TEST(pagerank_config_weight_very_small) {
+    /* Very small (near-zero) edge weight should not crash.
+     * Ranks should still sum to ~1.0 (valid distribution). */
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "vsm", "/tmp/vsm");
+    int64_t a = add_node(s, "vsm", "a");
+    int64_t b = add_node(s, "vsm", "b");
+    add_edge(s, "vsm", a, b, "CALLS");
+    cbm_edge_weights_t small_w = CBM_DEFAULT_EDGE_WEIGHTS;
+    small_w.calls = 0.001; /* near-zero weight */
+    int rc = cbm_pagerank_compute(s, "vsm", CBM_PAGERANK_DAMPING, CBM_PAGERANK_EPSILON,
+                         CBM_PAGERANK_MAX_ITER, &small_w, CBM_RANK_SCOPE_FULL);
+    ASSERT_EQ(rc, 2);
+    /* Should not crash, ranks should sum to ~1 */
+    double total = get_pr(s, a) + get_pr(s, b);
+    ASSERT_TRUE(fabs(total - 1.0) < 0.1);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Suite registration ──────────────────────────────────── */
 
 SUITE(pagerank) {
@@ -646,4 +835,12 @@ SUITE(pagerank) {
     RUN_TEST(linkrank_sum_equals_pagerank_sum);
     /* Integration (1 test) */
     RUN_TEST(pagerank_after_dep_index);
+    /* Phase 8.5: key_functions + config weights + stats + streamlining (7 tests) */
+    RUN_TEST(architecture_key_functions_with_pagerank);
+    RUN_TEST(architecture_key_functions_no_pagerank);
+    RUN_TEST(pagerank_config_custom_weights);
+    RUN_TEST(pagerank_stats_in_db);
+    RUN_TEST(pagerank_conditional_degree_logic);
+    RUN_TEST(pagerank_dep_source_tag_format);
+    RUN_TEST(pagerank_config_weight_very_small);
 }

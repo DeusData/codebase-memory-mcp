@@ -12,6 +12,9 @@
 
 #include <store/store.h>
 
+/* Forward declaration — full definition in cli/cli.h */
+struct cbm_config;
+
 /* ── Algorithm defaults (config-overridable) ──────────────── */
 
 #define CBM_PAGERANK_DAMPING    0.85   /* Standard Google PageRank damping */
@@ -21,6 +24,17 @@
 /* Config keys for runtime tuning */
 #define CBM_CONFIG_PAGERANK_MAX_ITER "pagerank_max_iter"
 #define CBM_CONFIG_RANK_SCOPE        "rank_scope"
+
+/* Config keys for edge type weights (all doubles, override via `config set`) */
+#define CBM_CONFIG_EDGE_WEIGHT_CALLS          "edge_weight_calls"
+#define CBM_CONFIG_EDGE_WEIGHT_DEFINES_METHOD  "edge_weight_defines_method"
+#define CBM_CONFIG_EDGE_WEIGHT_DEFINES         "edge_weight_defines"
+#define CBM_CONFIG_EDGE_WEIGHT_IMPORTS         "edge_weight_imports"
+#define CBM_CONFIG_EDGE_WEIGHT_USAGE           "edge_weight_usage"
+#define CBM_CONFIG_EDGE_WEIGHT_CONFIGURES      "edge_weight_configures"
+#define CBM_CONFIG_EDGE_WEIGHT_HTTP_CALLS      "edge_weight_http_calls"
+#define CBM_CONFIG_EDGE_WEIGHT_ASYNC_CALLS     "edge_weight_async_calls"
+#define CBM_CONFIG_EDGE_WEIGHT_DEFAULT         "edge_weight_default"
 
 /* ── Internal tuning constants ────────────────────────────── */
 
@@ -71,6 +85,12 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
 
 /* Convenience: compute with defaults (FULL scope, d=0.85, eps=1e-6, 20 iter) */
 int cbm_pagerank_compute_default(cbm_store_t *store, const char *project);
+
+/* Convenience: compute with config-backed edge weights.
+ * Reads edge_weight_* config keys, falls back to CBM_DEFAULT_EDGE_WEIGHTS.
+ * cfg may be NULL (uses defaults). */
+int cbm_pagerank_compute_with_config(cbm_store_t *store, const char *project,
+                                     struct cbm_config *cfg);
 
 /* Get PageRank score for a single node. Returns 0.0 if not computed. */
 double cbm_pagerank_get(cbm_store_t *store, int64_t node_id);

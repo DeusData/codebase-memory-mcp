@@ -1157,10 +1157,13 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_obj_add_str(doc, item, "label", sr->node.label ? sr->node.label : "");
             yyjson_mut_obj_add_str(doc, item, "file_path",
                                    sr->node.file_path ? sr->node.file_path : "");
-            yyjson_mut_obj_add_int(doc, item, "in_degree", sr->in_degree);
-            yyjson_mut_obj_add_int(doc, item, "out_degree", sr->out_degree);
-            if (sr->pagerank_score > 0.0)
+            if (sr->pagerank_score > 0.0) {
                 yyjson_mut_obj_add_real(doc, item, "pagerank", sr->pagerank_score);
+            } else {
+                /* Degree fields only when PageRank not available — PR subsumes degree info */
+                yyjson_mut_obj_add_int(doc, item, "in_degree", sr->in_degree);
+                yyjson_mut_obj_add_int(doc, item, "out_degree", sr->out_degree);
+            }
 
             /* Unconditional source tagging — critical for AI grounding.
              * Every result tagged source:"project" or source:"dependency".
@@ -1351,6 +1354,30 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
                                        cbm_pkg_manager_str(eco));
             }
         }
+        /* Report PageRank stats */
+        {
+            sqlite3 *db = cbm_store_get_db(store);
+            if (db) {
+                sqlite3_stmt *pr_stmt = NULL;
+                const char *pr_sql = "SELECT COUNT(*), MAX(computed_at) "
+                                     "FROM pagerank WHERE project = ?1";
+                if (sqlite3_prepare_v2(db, pr_sql, -1, &pr_stmt, NULL) == SQLITE_OK) {
+                    sqlite3_bind_text(pr_stmt, 1, project, -1, SQLITE_TRANSIENT);
+                    if (sqlite3_step(pr_stmt) == SQLITE_ROW) {
+                        int ranked = sqlite3_column_int(pr_stmt, 0);
+                        if (ranked > 0) {
+                            yyjson_mut_val *pr_obj = yyjson_mut_obj(doc);
+                            yyjson_mut_obj_add_int(doc, pr_obj, "ranked_nodes", ranked);
+                            const char *ts = (const char *)sqlite3_column_text(pr_stmt, 1);
+                            if (ts)
+                                yyjson_mut_obj_add_strcpy(doc, pr_obj, "computed_at", ts);
+                            yyjson_mut_obj_add_val(doc, root, "pagerank", pr_obj);
+                        }
+                    }
+                    sqlite3_finalize(pr_stmt);
+                }
+            }
+        }
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "no_project");
     }
@@ -1462,6 +1489,41 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_arr_add_str(doc, pats, schema.rel_patterns[i]);
         }
         yyjson_mut_obj_add_val(doc, root, "relationship_patterns", pats);
+    }
+
+    /* Key functions: top 10 nodes by PageRank (most structurally important) */
+    {
+        sqlite3 *db = cbm_store_get_db(store);
+        if (db) {
+            const char *kf_sql = project
+                ? "SELECT n.name, n.qualified_name, n.label, n.file_path, pr.rank "
+                  "FROM nodes n JOIN pagerank pr ON pr.node_id = n.id "
+                  "WHERE n.project = ?1 ORDER BY pr.rank DESC LIMIT 10"
+                : "SELECT n.name, n.qualified_name, n.label, n.file_path, pr.rank "
+                  "FROM nodes n JOIN pagerank pr ON pr.node_id = n.id "
+                  "ORDER BY pr.rank DESC LIMIT 10";
+            sqlite3_stmt *kf_stmt = NULL;
+            if (sqlite3_prepare_v2(db, kf_sql, -1, &kf_stmt, NULL) == SQLITE_OK) {
+                if (project) sqlite3_bind_text(kf_stmt, 1, project, -1, SQLITE_TRANSIENT);
+                yyjson_mut_val *kf_arr = yyjson_mut_arr(doc);
+                while (sqlite3_step(kf_stmt) == SQLITE_ROW) {
+                    yyjson_mut_val *kf = yyjson_mut_obj(doc);
+                    const char *n = (const char *)sqlite3_column_text(kf_stmt, 0);
+                    const char *qn = (const char *)sqlite3_column_text(kf_stmt, 1);
+                    const char *lbl = (const char *)sqlite3_column_text(kf_stmt, 2);
+                    const char *fp = (const char *)sqlite3_column_text(kf_stmt, 3);
+                    double rank = sqlite3_column_double(kf_stmt, 4);
+                    if (n) yyjson_mut_obj_add_strcpy(doc, kf, "name", n);
+                    if (qn) yyjson_mut_obj_add_strcpy(doc, kf, "qualified_name", qn);
+                    if (lbl) yyjson_mut_obj_add_strcpy(doc, kf, "label", lbl);
+                    if (fp) yyjson_mut_obj_add_strcpy(doc, kf, "file_path", fp);
+                    yyjson_mut_obj_add_real(doc, kf, "pagerank", rank);
+                    yyjson_mut_arr_add_val(kf_arr, kf);
+                }
+                sqlite3_finalize(kf_stmt);
+                yyjson_mut_obj_add_val(doc, root, "key_functions", kf_arr);
+            }
+        }
     }
 
     char *json = yy_doc_to_str(doc);

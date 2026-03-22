@@ -9,6 +9,7 @@
  */
 
 #include "pagerank.h"
+#include <cli/cli.h>
 #include <foundation/log.h>
 #include <foundation/platform.h>
 #include <math.h>
@@ -350,6 +351,28 @@ int cbm_pagerank_compute_default(cbm_store_t *store, const char *project) {
         CBM_PAGERANK_DAMPING, CBM_PAGERANK_EPSILON,
         CBM_PAGERANK_MAX_ITER, &CBM_DEFAULT_EDGE_WEIGHTS,
         CBM_DEFAULT_RANK_SCOPE);
+}
+
+int cbm_pagerank_compute_with_config(cbm_store_t *store, const char *project,
+                                     cbm_config_t *cfg) {
+    if (!cfg) return cbm_pagerank_compute_default(store, project);
+
+    cbm_edge_weights_t w;
+    w.calls          = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS,          CBM_DEFAULT_EDGE_WEIGHTS.calls);
+    w.defines_method = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_DEFINES_METHOD, CBM_DEFAULT_EDGE_WEIGHTS.defines_method);
+    w.defines        = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_DEFINES,        CBM_DEFAULT_EDGE_WEIGHTS.defines);
+    w.imports        = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_IMPORTS,        CBM_DEFAULT_EDGE_WEIGHTS.imports);
+    w.usage          = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_USAGE,          CBM_DEFAULT_EDGE_WEIGHTS.usage);
+    w.configures     = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_CONFIGURES,     CBM_DEFAULT_EDGE_WEIGHTS.configures);
+    w.http_calls     = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_HTTP_CALLS,     CBM_DEFAULT_EDGE_WEIGHTS.http_calls);
+    w.async_calls    = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_ASYNC_CALLS,    CBM_DEFAULT_EDGE_WEIGHTS.async_calls);
+    w.default_weight = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_DEFAULT,        CBM_DEFAULT_EDGE_WEIGHTS.default_weight);
+
+    int max_iter = cbm_config_get_int(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, CBM_PAGERANK_MAX_ITER);
+
+    return cbm_pagerank_compute(store, project,
+        CBM_PAGERANK_DAMPING, CBM_PAGERANK_EPSILON,
+        max_iter, &w, CBM_DEFAULT_RANK_SCOPE);
 }
 
 double cbm_pagerank_get(cbm_store_t *store, int64_t node_id) {
