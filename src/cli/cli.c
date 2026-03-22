@@ -1784,6 +1784,19 @@ int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val) {
     return (int)v;
 }
 
+double cbm_config_get_double(cbm_config_t *cfg, const char *key, double default_val) {
+    const char *val = cbm_config_get(cfg, key, NULL);
+    if (!val) {
+        return default_val;
+    }
+    char *endptr;
+    double v = strtod(val, &endptr);
+    if (endptr == val || *endptr != '\0') {
+        return default_val;
+    }
+    return v;
+}
+
 int cbm_config_set(cbm_config_t *cfg, const char *key, const char *value) {
     if (!cfg || !key || !value) {
         return -1;

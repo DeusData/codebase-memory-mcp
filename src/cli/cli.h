@@ -221,6 +221,9 @@ bool cbm_config_get_bool(cbm_config_t *cfg, const char *key, bool default_val);
 /* Get a config value as int. Returns default_val if not found or invalid. */
 int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val);
 
+/* Get a config value as double. Returns default_val if not found or invalid. */
+double cbm_config_get_double(cbm_config_t *cfg, const char *key, double default_val);
+
 /* Set a config value. Returns 0 on success. */
 int cbm_config_set(cbm_config_t *cfg, const char *key, const char *value);
 
