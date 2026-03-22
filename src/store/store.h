@@ -190,6 +190,10 @@ cbm_store_t *cbm_store_open_memory(void);
 /* Open a file-backed database at the given path. Creates if needed. */
 cbm_store_t *cbm_store_open_path(const char *db_path);
 
+/* Open an existing file-backed database for querying only (no SQLITE_OPEN_CREATE).
+ * Returns NULL if the file does not exist — never creates a new .db file. */
+cbm_store_t *cbm_store_open_path_query(const char *db_path);
+
 /* Open database for a named project in the default cache dir. */
 cbm_store_t *cbm_store_open(const char *project);
 

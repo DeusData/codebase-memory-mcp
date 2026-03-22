@@ -365,6 +365,45 @@ cbm_store_t *cbm_store_open_path(const char *db_path) {
     return store_open_internal(db_path, false);
 }
 
+cbm_store_t *cbm_store_open_path_query(const char *db_path) {
+    if (!db_path) {
+        return NULL;
+    }
+
+    cbm_store_t *s = calloc(1, sizeof(cbm_store_t));
+    if (!s) {
+        return NULL;
+    }
+
+    /* Open read-write but do NOT create — returns SQLITE_CANTOPEN if absent. */
+    int rc = sqlite3_open_v2(db_path, &s->db, SQLITE_OPEN_READWRITE, NULL);
+    if (rc != SQLITE_OK) {
+        /* File does not exist or cannot be opened — return NULL without creating. */
+        free(s);
+        return NULL;
+    }
+
+    s->db_path = heap_strdup(db_path);
+
+    /* Security: block ATTACH/DETACH to prevent file creation via SQL injection. */
+    sqlite3_set_authorizer(s->db, store_authorizer, NULL);
+
+    /* Register REGEXP functions. */
+    sqlite3_create_function(s->db, "regexp", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
+                            sqlite_regexp, NULL, NULL);
+    sqlite3_create_function(s->db, "iregexp", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
+                            sqlite_iregexp, NULL, NULL);
+
+    if (configure_pragmas(s, false) != CBM_STORE_OK) {
+        sqlite3_close(s->db);
+        free((void *)s->db_path);
+        free(s);
+        return NULL;
+    }
+
+    return s;
+}
+
 cbm_store_t *cbm_store_open(const char *project) {
     if (!project) {
         return NULL;

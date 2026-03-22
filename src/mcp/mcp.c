@@ -637,10 +637,11 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
         srv->store = NULL;
     }
 
-    /* Open project's .db file */
+    /* Open project's .db file — query-only open (no SQLITE_OPEN_CREATE) to
+     * prevent ghost .db file creation for unknown/unindexed projects. */
     char path[1024];
     project_db_path(project, path, sizeof(path));
-    srv->store = cbm_store_open_path(path);
+    srv->store = cbm_store_open_path_query(path);
     srv->owns_store = true;
     free(srv->current_project);
     srv->current_project = heap_strdup(project);
