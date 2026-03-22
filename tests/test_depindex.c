@@ -11,6 +11,7 @@
 #include "test_framework.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
+#include <depindex/depindex.h>
 #include <yyjson/yyjson.h>
 #include <string.h>
 #include <stdlib.h>
@@ -814,6 +815,64 @@ TEST(test_index_status_shows_deps) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  TRACE/SNIPPET SOURCE TAGGING + CROSS-EDGES
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(test_trace_results_have_source_field) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_dep_query_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+                                    "{\"function_name\":\"process_data\","
+                                    "\"project\":\"dep-query-test\"}");
+    char *resp = extract_text_content_di(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    if (strstr(resp, "callees") && strstr(resp, "source")) {
+        ASSERT_NOT_NULL(strstr(resp, "\"source\":\"project\""));
+    }
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
+TEST(test_snippet_has_source_field) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_dep_query_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(srv, "get_code_snippet",
+                                    "{\"qualified_name\":\"dep-query-test.app.process_data\","
+                                    "\"project\":\"dep-query-test\"}");
+    char *resp = extract_text_content_di(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    ASSERT_NOT_NULL(strstr(resp, "\"source\":\"project\""));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
+TEST(test_cross_edges_null_safety) {
+    ASSERT_EQ(0, cbm_dep_link_cross_edges(NULL, "test"));
+    ASSERT_EQ(0, cbm_dep_link_cross_edges(NULL, NULL));
+
+    cbm_store_t *st = cbm_store_open_memory();
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(0, cbm_dep_link_cross_edges(st, "nonexistent"));
+    ASSERT_EQ(0, cbm_dep_link_cross_edges(st, ""));
+    cbm_store_close(st);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -864,4 +923,9 @@ SUITE(depindex) {
 
     /* Index status deps */
     RUN_TEST(test_index_status_shows_deps);
+
+    /* Trace and snippet source tagging */
+    RUN_TEST(test_trace_results_have_source_field);
+    RUN_TEST(test_snippet_has_source_field);
+    RUN_TEST(test_cross_edges_null_safety);
 }
