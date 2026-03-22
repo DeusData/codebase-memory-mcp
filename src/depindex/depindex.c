@@ -373,18 +373,12 @@ int cbm_dep_auto_index(const char *project_name, const char *project_root,
 int cbm_dep_link_cross_edges(cbm_store_t *store, const char *project_name) {
     if (!store || !project_name || !project_name[0]) return 0;
 
-    /* Build dep project LIKE pattern once (invariant across loop) */
-    char dep_pattern[CBM_NAME_MAX];
-    snprintf(dep_pattern, sizeof(dep_pattern), "%s" CBM_DEP_SEPARATOR "%%",
-             project_name);
-
-    /* Find Variable nodes in the project — import statements are extracted as
-     * Variable nodes by tree-sitter extractors (extract_imports.c). */
+    /* Find all IMPORTS nodes in the main project */
     cbm_search_params_t params = {0};
     params.project = project_name;
     params.project_exact = true;
-    params.label = "Variable";
-    params.limit = CBM_DEFAULT_AUTO_DEP_LIMIT;
+    params.label = "Variable";  /* import statements are typically Variable nodes */
+    params.limit = 500;
 
     cbm_search_output_t out = {0};
     int rc = cbm_store_search(store, &params, &out);
@@ -395,12 +389,17 @@ int cbm_dep_link_cross_edges(cbm_store_t *store, const char *project_name) {
 
     int linked = 0;
 
-    /* For each import variable, look for a matching Module in dep projects */
+    /* For each import, look for a matching Module in dep projects */
     for (int i = 0; i < out.count; i++) {
         const char *import_name = out.results[i].node.name;
         if (!import_name || !import_name[0]) continue;
 
-        /* Search for Module with matching name across all dep projects */
+        /* Build dep project pattern: project_name.dep.% */
+        char dep_pattern[CBM_NAME_MAX];
+        snprintf(dep_pattern, sizeof(dep_pattern), "%s" CBM_DEP_SEPARATOR "%%",
+                 project_name);
+
+        /* Search for Module with matching name in dep projects */
         cbm_search_params_t dep_params = {0};
         dep_params.name_pattern = import_name;
         dep_params.project_pattern = dep_pattern;
@@ -410,6 +409,7 @@ int cbm_dep_link_cross_edges(cbm_store_t *store, const char *project_name) {
         cbm_search_output_t dep_out = {0};
         int drc = cbm_store_search(store, &dep_params, &dep_out);
         if (drc == 0 && dep_out.count > 0) {
+            /* Create cross-boundary IMPORTS edge */
             cbm_edge_t edge = {
                 .source_id = out.results[i].node.id,
                 .target_id = dep_out.results[0].node.id,

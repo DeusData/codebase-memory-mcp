@@ -819,7 +819,6 @@ TEST(test_index_status_shows_deps) {
  * ══════════════════════════════════════════════════════════════════ */
 
 TEST(test_trace_results_have_source_field) {
-    /* trace_call_path results for project nodes must have source:"project" */
     char tmp[256];
     cbm_mcp_server_t *srv = setup_dep_query_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
@@ -831,7 +830,6 @@ TEST(test_trace_results_have_source_field) {
     free(raw);
     ASSERT_NOT_NULL(resp);
 
-    /* Callees should have source field tagged as "project" */
     if (strstr(resp, "callees") && strstr(resp, "source")) {
         ASSERT_NOT_NULL(strstr(resp, "\"source\":\"project\""));
     }
@@ -843,7 +841,6 @@ TEST(test_trace_results_have_source_field) {
 }
 
 TEST(test_snippet_has_source_field) {
-    /* get_code_snippet results must have source field */
     char tmp[256];
     cbm_mcp_server_t *srv = setup_dep_query_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
@@ -855,7 +852,6 @@ TEST(test_snippet_has_source_field) {
     free(raw);
     ASSERT_NOT_NULL(resp);
 
-    /* Project snippet must have source:"project" */
     ASSERT_NOT_NULL(strstr(resp, "\"source\":\"project\""));
 
     free(resp);
@@ -865,11 +861,9 @@ TEST(test_snippet_has_source_field) {
 }
 
 TEST(test_cross_edges_null_safety) {
-    /* cbm_dep_link_cross_edges must handle NULL/empty args safely */
     ASSERT_EQ(0, cbm_dep_link_cross_edges(NULL, "test"));
     ASSERT_EQ(0, cbm_dep_link_cross_edges(NULL, NULL));
 
-    /* With a valid store but no deps, should return 0 (no edges linked) */
     cbm_store_t *st = cbm_store_open_memory();
     ASSERT_NOT_NULL(st);
     ASSERT_EQ(0, cbm_dep_link_cross_edges(st, "nonexistent"));
