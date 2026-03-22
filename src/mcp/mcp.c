@@ -652,7 +652,7 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
         yyjson_mut_val *hint_tool = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_str(doc, hint_tool, "name", "_hidden_tools");
         yyjson_mut_obj_add_str(doc, hint_tool, "description",
-            "12 additional tools available but hidden in streamlined mode. "
+            "14 additional tools available but hidden in streamlined mode. "
             "Hidden: index_repository, search_graph, query_graph, get_code_snippet, "
             "get_graph_schema, get_architecture, search_code, list_projects, "
             "delete_project, index_status, detect_changes, manage_adr, "
@@ -828,8 +828,49 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
 }
 
 /* Bail with JSON error + hint when no store is available. */
+/* Auto-index on first use: when store is NULL, session_root is set, and
+ * auto_index_on_first_use is enabled, run the pipeline synchronously.
+ * This eliminates the need for an explicit index_repository call.
+ * MCP is strict request-response — synchronous blocking is safe here
+ * (same pattern used by handle_index_repository at line ~1959). */
 #define REQUIRE_STORE(store, project)                                                             \
     do {                                                                                          \
+        if (!(store) && srv->session_root[0] && access(srv->session_root, F_OK) == 0) {              \
+            /* Try auto-index on first use (only if session_root is a real directory) */           \
+            if (srv->autoindex_active) {                                                          \
+                /* Background thread running — wait for it to complete */                         \
+                cbm_thread_join(&srv->autoindex_tid);                                              \
+                srv->autoindex_active = false;                                                    \
+                /* Re-resolve store after background index finished */                            \
+                store = resolve_store(srv, project);                                              \
+            }                                                                                     \
+            if (!(store)) {                                                                       \
+                /* No background thread or it failed — try sync index */                          \
+                cbm_pipeline_t *_p = cbm_pipeline_new(                                            \
+                    srv->session_root, NULL, CBM_MODE_FULL);                                      \
+                if (_p) {                                                                         \
+                    cbm_log_info("autoindex.sync", "project", srv->session_project);               \
+                    cbm_pipeline_run(_p);                                                         \
+                    cbm_pipeline_free(_p);                                                        \
+                    /* Invalidate + reopen store */                                                \
+                    if (srv->owns_store && srv->store) {                                          \
+                        cbm_store_close(srv->store);                                              \
+                        srv->store = NULL;                                                        \
+                    }                                                                             \
+                    free(srv->current_project);                                                   \
+                    srv->current_project = NULL;                                                  \
+                    store = resolve_store(srv, srv->session_project);                              \
+                    /* Also compute PageRank + auto-index deps */                                 \
+                    if (store) {                                                                  \
+                        cbm_dep_auto_index(srv->session_project, srv->session_root,               \
+                                           store, CBM_DEFAULT_AUTO_DEP_LIMIT);                    \
+                        cbm_pagerank_compute_with_config(store, srv->session_project,              \
+                                                        srv->config);                             \
+                    }                                                                             \
+                    cbm_mem_collect();                                                             \
+                }                                                                                 \
+            }                                                                                     \
+        }                                                                                         \
         if (!(store)) {                                                                           \
             free(project);                                                                        \
             return cbm_mcp_text_result(                                                           \
@@ -838,6 +879,94 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
                 true);                                                                            \
         }                                                                                         \
     } while (0)
+
+/* ── Auto-context injection (Phase 9) ─────────────────────────── */
+
+/* Inject _context header into the FIRST tool response after session starts.
+ * Contains architecture, schema, status — eliminates the need for separate
+ * get_architecture / get_graph_schema / index_status / list_projects calls.
+ * Subsequent responses include only session_project (lightweight). */
+static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                cbm_mcp_server_t *srv, cbm_store_t *store) {
+    /* Always include session_project */
+    if (srv->session_project[0])
+        yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
+
+    if (srv->context_injected) return;
+    srv->context_injected = true;
+
+    yyjson_mut_val *ctx = yyjson_mut_obj(doc);
+
+    if (!store) {
+        yyjson_mut_obj_add_str(doc, ctx, "status", "not_indexed");
+        yyjson_mut_obj_add_str(doc, ctx, "hint",
+            "Project not yet indexed. Use index_repository or set auto_index=true.");
+        yyjson_mut_obj_add_val(doc, root, "_context", ctx);
+        return;
+    }
+
+    yyjson_mut_obj_add_str(doc, ctx, "status", "ready");
+
+    /* Node/edge counts */
+    const char *proj = srv->session_project[0] ? srv->session_project : NULL;
+    int nodes = cbm_store_count_nodes(store, proj);
+    int edges = cbm_store_count_edges(store, proj);
+    yyjson_mut_obj_add_int(doc, ctx, "nodes", nodes);
+    yyjson_mut_obj_add_int(doc, ctx, "edges", edges);
+
+    /* Schema: node labels + edge types */
+    cbm_schema_info_t schema = {0};
+    cbm_store_get_schema(store, proj, &schema);
+    yyjson_mut_val *label_arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < schema.node_label_count; i++) {
+        yyjson_mut_val *lbl = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, lbl, "label", schema.node_labels[i].label);
+        yyjson_mut_obj_add_int(doc, lbl, "count", schema.node_labels[i].count);
+        yyjson_mut_arr_add_val(label_arr, lbl);
+    }
+    yyjson_mut_obj_add_val(doc, ctx, "node_labels", label_arr);
+
+    yyjson_mut_val *type_arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < schema.edge_type_count; i++) {
+        yyjson_mut_val *et = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, et, "type", schema.edge_types[i].type);
+        yyjson_mut_obj_add_int(doc, et, "count", schema.edge_types[i].count);
+        yyjson_mut_arr_add_val(type_arr, et);
+    }
+    yyjson_mut_obj_add_val(doc, ctx, "edge_types", type_arr);
+    cbm_store_schema_free(&schema);
+
+    /* PageRank stats */
+    sqlite3 *db = cbm_store_get_db(store);
+    if (db && proj) {
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(db,
+                "SELECT COUNT(*), MAX(computed_at) FROM pagerank WHERE project = ?1",
+                -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, proj, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                int ranked = sqlite3_column_int(stmt, 0);
+                if (ranked > 0) {
+                    yyjson_mut_obj_add_int(doc, ctx, "ranked_nodes", ranked);
+                    const char *ts = (const char *)sqlite3_column_text(stmt, 1);
+                    if (ts) yyjson_mut_obj_add_strcpy(doc, ctx, "pagerank_computed_at", ts);
+                }
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    /* Detected ecosystem */
+    if (srv->session_root[0]) {
+        cbm_pkg_manager_t eco = cbm_detect_ecosystem(srv->session_root);
+        if (eco != CBM_PKG_COUNT) {
+            yyjson_mut_obj_add_str(doc, ctx, "detected_ecosystem",
+                                   cbm_pkg_manager_str(eco));
+        }
+    }
+
+    yyjson_mut_obj_add_val(doc, root, "_context", ctx);
+}
 
 /* ── Smart project param expansion ─────────────────────────────── */
 
@@ -1167,6 +1296,34 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         db_project = srv->session_project; /* deps are in session db */
     }
     cbm_store_t *store = resolve_store(srv, db_project);
+    /* Auto-index on first use — same logic as REQUIRE_STORE macro.
+     * Handles: CWD-based session_root, explicit path via Rule 0, MCP roots. */
+    if (!store && srv->session_root[0] && access(srv->session_root, F_OK) == 0) {
+        if (srv->autoindex_active) {
+            cbm_thread_join(&srv->autoindex_tid);
+            srv->autoindex_active = false;
+            store = resolve_store(srv, db_project);
+        }
+        if (!store) {
+            cbm_pipeline_t *_p = cbm_pipeline_new(srv->session_root, NULL, CBM_MODE_FULL);
+            if (_p) {
+                cbm_log_info("autoindex.sync", "project", srv->session_project);
+                cbm_pipeline_run(_p);
+                cbm_pipeline_free(_p);
+                if (srv->owns_store && srv->store) {
+                    cbm_store_close(srv->store); srv->store = NULL;
+                }
+                free(srv->current_project); srv->current_project = NULL;
+                store = resolve_store(srv, srv->session_project);
+                if (store) {
+                    cbm_dep_auto_index(srv->session_project, srv->session_root,
+                                       store, CBM_DEFAULT_AUTO_DEP_LIMIT);
+                    cbm_pagerank_compute_with_config(store, srv->session_project, srv->config);
+                }
+                cbm_mem_collect();
+            }
+        }
+    }
     if (!store) {
         free(pe.value);
         return cbm_mcp_text_result(
@@ -1211,9 +1368,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
 
     yyjson_mut_obj_add_int(doc, root, "total", out.total);
 
-    /* Always include session_project so AI knows the project name */
-    if (srv->session_project[0])
-        yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
+    /* Auto-context: first response gets full architecture/schema/_context header.
+     * Subsequent responses just get session_project. */
+    inject_context_once(doc, root, srv, store);
 
     if (is_summary) {
         /* Summary mode: aggregate counts by label and file (top 20) */

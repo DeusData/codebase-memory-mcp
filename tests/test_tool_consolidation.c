@@ -235,6 +235,51 @@ TEST(index_status_has_session_project) {
     PASS();
 }
 
+/* ── 7. Context injection ─────────────────────────────────── */
+
+TEST(first_response_has_context_header) {
+    /* First search_graph call should include _context with schema/status.
+     * Uses in-memory store (no session_root) so auto-index won't trigger. */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, "ctx_test");
+    char *result = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"name_pattern\":\"test\"}");
+    ASSERT_NOT_NULL(result);
+    /* First response should have _context */
+    ASSERT_NOT_NULL(strstr(result, "_context"));
+    ASSERT_NOT_NULL(strstr(result, "status"));
+    free(result);
+
+    /* Second call should NOT have _context (already injected) */
+    char *result2 = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"name_pattern\":\"test2\"}");
+    ASSERT_NOT_NULL(result2);
+    ASSERT_NULL(strstr(result2, "_context"));
+    /* But session_project should still be present */
+    ASSERT_NOT_NULL(strstr(result2, "session_project"));
+    free(result2);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(context_has_schema_info) {
+    /* _context should include node_labels and edge_types arrays */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *result = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"name_pattern\":\"x\"}");
+    ASSERT_NOT_NULL(result);
+    /* In-memory store has schema tables → should see these fields */
+    ASSERT_NOT_NULL(strstr(result, "_context"));
+    ASSERT_NOT_NULL(strstr(result, "node_labels"));
+    ASSERT_NOT_NULL(strstr(result, "edge_types"));
+    free(result);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* ── Suite registration ──────────────────────────────────── */
 
 SUITE(tool_consolidation) {
@@ -257,4 +302,7 @@ SUITE(tool_consolidation) {
     /* Session context */
     RUN_TEST(search_graph_has_session_project);
     RUN_TEST(index_status_has_session_project);
+    /* Context injection */
+    RUN_TEST(first_response_has_context_header);
+    RUN_TEST(context_has_schema_info);
 }
