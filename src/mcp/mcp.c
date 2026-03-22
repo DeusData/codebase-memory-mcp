@@ -618,9 +618,12 @@ struct cbm_mcp_server {
 /* ── Tool list (needs full struct definition above) ──────────── */
 
 char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
-    const char *tool_mode = "streamlined";
-    if (srv && srv->config) {
-        tool_mode = cbm_config_get(srv->config, CBM_CONFIG_TOOL_MODE, "streamlined");
+    /* Env var CBM_TOOL_MODE overrides config (for backwards compat without config store) */
+    const char *tool_mode = getenv("CBM_TOOL_MODE");
+    if (!tool_mode || tool_mode[0] == '\0') {
+        tool_mode = (srv && srv->config)
+            ? cbm_config_get(srv->config, CBM_CONFIG_TOOL_MODE, "streamlined")
+            : "streamlined";
     }
     bool classic = (strcmp(tool_mode, "classic") == 0);
 
@@ -643,6 +646,22 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
                 emit_tool(doc, tools, &TOOLS[i]);
             }
         }
+
+        /* Progressive disclosure: list hidden tools so AI knows they exist.
+         * Added as a special tool entry with description explaining how to enable. */
+        yyjson_mut_val *hint_tool = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, hint_tool, "name", "_hidden_tools");
+        yyjson_mut_obj_add_str(doc, hint_tool, "description",
+            "12 additional tools available but hidden in streamlined mode. "
+            "Hidden: index_repository, search_graph, query_graph, get_code_snippet, "
+            "get_graph_schema, get_architecture, search_code, list_projects, "
+            "delete_project, index_status, detect_changes, manage_adr, "
+            "ingest_traces, index_dependencies. "
+            "Enable all: set env CBM_TOOL_MODE=classic or config set tool_mode classic. "
+            "Enable one: config set tool_<name> true (e.g. tool_index_repository true).");
+        yyjson_mut_obj_add_str(doc, hint_tool, "inputSchema",
+            "{\"type\":\"object\",\"properties\":{}}");
+        yyjson_mut_arr_add_val(tools, hint_tool);
     } else {
         /* Classic mode: all 15 original tools */
         for (int i = 0; i < TOOL_COUNT; i++) {
@@ -1560,6 +1579,9 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
+    if (srv->session_project[0])
+        yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
+
     if (project) {
         yyjson_mut_obj_add_str(doc, root, "project", project);
     }
@@ -1808,6 +1830,9 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         free(seen_in);
         yyjson_mut_obj_add_val(doc, root, "callers", callers);
     }
+
+    if (srv->session_project[0])
+        yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
 
     /* Serialize BEFORE freeing traversal results (yyjson borrows strings) */
     char *json = yy_doc_to_str(doc);
