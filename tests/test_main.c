@@ -50,6 +50,7 @@ extern void suite_ui(void);
 extern void suite_token_reduction(void);
 extern void suite_depindex(void);
 extern void suite_pagerank(void);
+extern void suite_tool_consolidation(void);
 extern void suite_integration(void);
 
 int main(void) {
@@ -141,6 +142,9 @@ int main(void) {
 
     /* PageRank (node + edge ranking) */
     RUN_SUITE(pagerank);
+
+    /* Tool consolidation (Phase 9) */
+    RUN_SUITE(tool_consolidation);
 
     /* Integration (end-to-end) */
     RUN_SUITE(integration);
