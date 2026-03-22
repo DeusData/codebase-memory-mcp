@@ -174,6 +174,67 @@ TEST(null_tool_name_returns_error) {
     PASS();
 }
 
+/* ── 5. Progressive disclosure ────────────────────────────── */
+
+TEST(streamlined_mode_has_hidden_tools_hint) {
+    /* Streamlined tool list should include _hidden_tools entry
+     * that tells the AI what tools are available and how to enable them. */
+    char *json = cbm_mcp_tools_list(NULL);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "_hidden_tools"));
+    ASSERT_NOT_NULL(strstr(json, "CBM_TOOL_MODE"));
+    ASSERT_NOT_NULL(strstr(json, "index_repository"));
+    ASSERT_NOT_NULL(strstr(json, "tool_mode"));
+    free(json);
+    PASS();
+}
+
+TEST(hidden_tools_still_dispatch) {
+    /* Even though hidden in streamlined mode, calling hidden tool names
+     * still works — dispatch is unconditional. This ensures the AI can
+     * use hidden tools after learning about them from the hint. */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    /* index_status is hidden in streamlined mode but should still dispatch */
+    char *result = cbm_mcp_handle_tool(srv, "index_status", "{}");
+    ASSERT_NOT_NULL(result);
+    /* Should get a response about no project, not unknown tool */
+    ASSERT_NULL(strstr(result, "unknown"));
+    free(result);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── 6. Session context in responses ─────────────────────── */
+
+TEST(search_graph_has_session_project) {
+    /* search_graph response should include session_project */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, "test_proj");
+    char *result = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"name_pattern\":\"nonexistent\"}");
+    ASSERT_NOT_NULL(result);
+    ASSERT_NOT_NULL(strstr(result, "session_project"));
+    ASSERT_NOT_NULL(strstr(result, "test_proj"));
+    free(result);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(index_status_has_session_project) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, "my_proj");
+    char *result = cbm_mcp_handle_tool(srv, "index_status", "{}");
+    ASSERT_NOT_NULL(result);
+    ASSERT_NOT_NULL(strstr(result, "session_project"));
+    ASSERT_NOT_NULL(strstr(result, "my_proj"));
+    free(result);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* ── Suite registration ──────────────────────────────────── */
 
 SUITE(tool_consolidation) {
@@ -190,4 +251,10 @@ SUITE(tool_consolidation) {
     /* Edge cases */
     RUN_TEST(unknown_tool_returns_error);
     RUN_TEST(null_tool_name_returns_error);
+    /* Progressive disclosure */
+    RUN_TEST(streamlined_mode_has_hidden_tools_hint);
+    RUN_TEST(hidden_tools_still_dispatch);
+    /* Session context */
+    RUN_TEST(search_graph_has_session_project);
+    RUN_TEST(index_status_has_session_project);
 }
