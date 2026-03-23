@@ -21,22 +21,43 @@
 
 /* ── Default edge weights (aider/RepoMapper-inspired) ──────── */
 
+/* Tuned for Python/JS/TS codebases where USAGE edges capture type references,
+ * attribute access, and isinstance — the primary way classes are referenced.
+ *
+ * Key design choices:
+ *   - USAGE raised to 0.7: classes like EventContext have 400 USAGE refs but
+ *     were ranked #9 at 0.2 weight. USAGE is the dominant reference type in
+ *     Python/JS (type hints, attribute access, isinstance).
+ *   - TESTS lowered to 0.05: 3900 test edges were inflating production function
+ *     scores. A function called by 50 tests shouldn't outrank one called by
+ *     20 production functions.
+ *   - DEFINES lowered to 0.1: "Module DEFINES Function" edges leak rank to
+ *     container nodes without indicating architectural importance.
+ *   - WRITES/DECORATES explicit: small but non-zero contribution. */
 const cbm_edge_weights_t CBM_DEFAULT_EDGE_WEIGHTS = {
-    .calls = 1.0, .defines_method = 0.8, .defines = 0.5,
-    .imports = 0.3, .usage = 0.2, .configures = 0.1,
-    .http_calls = 0.5, .async_calls = 0.8, .default_weight = 0.3
+    .calls = 1.0, .defines_method = 0.5, .defines = 0.1,
+    .imports = 0.3, .usage = 0.7, .configures = 0.1,
+    .http_calls = 0.5, .async_calls = 0.8,
+    .tests = 0.05, .writes = 0.15, .decorates = 0.2,
+    .default_weight = 0.1,
+    .member_rank_factor = 0.5
 };
 
 /* ── Edge weight lookup (ordered by frequency) ─────────────── */
 
 static double edge_type_weight(const cbm_edge_weights_t *w, const char *type) {
     if (!type) return w->default_weight;
+    /* Ordered by frequency (most common first for fast path) */
     if (strcmp(type, "CALLS") == 0)          return w->calls;
-    if (strcmp(type, "IMPORTS") == 0)        return w->imports;
-    if (strcmp(type, "USAGE") == 0)          return w->usage;
     if (strcmp(type, "DEFINES") == 0)        return w->defines;
+    if (strcmp(type, "TESTS") == 0)          return w->tests;
+    if (strcmp(type, "USAGE") == 0)          return w->usage;
     if (strcmp(type, "DEFINES_METHOD") == 0) return w->defines_method;
+    if (strcmp(type, "WRITES") == 0)         return w->writes;
     if (strcmp(type, "CONFIGURES") == 0)     return w->configures;
+    if (strcmp(type, "IMPORTS") == 0)        return w->imports;
+    if (strcmp(type, "DECORATES") == 0)      return w->decorates;
+    if (strcmp(type, "MEMBER_OF") == 0)      return w->member_rank_factor;
     if (strcmp(type, "HTTP_CALLS") == 0)     return w->http_calls;
     if (strcmp(type, "ASYNC_CALLS") == 0)    return w->async_calls;
     return w->default_weight;
@@ -142,9 +163,11 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     id_map_t map = {0};
     int N = 0, E = 0, result = -1;
 
-    /* ── Step 1: Load node IDs ────────────────────────────── */
+    char **node_labels = NULL; /* label per node, parallel to node_ids */
+
+    /* ── Step 1: Load node IDs + labels ───────────────────── */
     char sql_buf[512];
-    snprintf(sql_buf, sizeof(sql_buf), "SELECT id FROM nodes WHERE %s",
+    snprintf(sql_buf, sizeof(sql_buf), "SELECT id, label FROM nodes WHERE %s",
              scope_where(scope));
 
     sqlite3_stmt *stmt = NULL;
@@ -154,15 +177,20 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
 
     int cap = CBM_PAGERANK_INITIAL_CAP;
     node_ids = malloc((size_t)cap * sizeof(int64_t));
-    if (!node_ids) { sqlite3_finalize(stmt); return -1; }
+    node_labels = malloc((size_t)cap * sizeof(char *));
+    if (!node_ids || !node_labels) { sqlite3_finalize(stmt); free(node_ids); free(node_labels); return -1; }
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         if (N >= cap) {
             cap *= 2;
             node_ids = safe_realloc(node_ids, (size_t)cap * sizeof(int64_t));
-            if (!node_ids) { sqlite3_finalize(stmt); return -1; }
+            node_labels = safe_realloc(node_labels, (size_t)cap * sizeof(char *));
+            if (!node_ids || !node_labels) { sqlite3_finalize(stmt); return -1; }
         }
-        node_ids[N++] = sqlite3_column_int64(stmt, 0);
+        node_ids[N] = sqlite3_column_int64(stmt, 0);
+        const char *lbl = (const char *)sqlite3_column_text(stmt, 1);
+        node_labels[N] = lbl ? strdup(lbl) : NULL;
+        N++;
     }
     sqlite3_finalize(stmt);
     stmt = NULL;
@@ -260,6 +288,11 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
         if (delta < epsilon) { iter++; break; }
     }
 
+    /* Member-rank propagation is handled naturally by MEMBER_OF edges
+     * (Method→Class) inserted during the pipeline. No post-hoc aggregation
+     * needed — the power iteration above already propagated rank via
+     * MEMBER_OF edges at the configured member_rank_factor weight. */
+
     /* ── Step 5: Store PageRank in db ─────────────────────── */
     char ts[CBM_ISO_TIMESTAMP_LEN];
     iso_now(ts, sizeof(ts));
@@ -338,6 +371,10 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
 cleanup:
     if (stmt) sqlite3_finalize(stmt);  /* defensive: finalize any in-flight stmt */
     free(node_ids);
+    if (node_labels) {
+        for (int i = 0; i < N; i++) free(node_labels[i]);
+        free(node_labels);
+    }
     id_map_free(&map);
     free(edges);
     free(out_weight);
@@ -366,7 +403,11 @@ int cbm_pagerank_compute_with_config(cbm_store_t *store, const char *project,
     w.configures     = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_CONFIGURES,     CBM_DEFAULT_EDGE_WEIGHTS.configures);
     w.http_calls     = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_HTTP_CALLS,     CBM_DEFAULT_EDGE_WEIGHTS.http_calls);
     w.async_calls    = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_ASYNC_CALLS,    CBM_DEFAULT_EDGE_WEIGHTS.async_calls);
-    w.default_weight = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_DEFAULT,        CBM_DEFAULT_EDGE_WEIGHTS.default_weight);
+    w.tests          = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_TESTS,          CBM_DEFAULT_EDGE_WEIGHTS.tests);
+    w.writes         = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_WRITES,         CBM_DEFAULT_EDGE_WEIGHTS.writes);
+    w.decorates      = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_DECORATES,      CBM_DEFAULT_EDGE_WEIGHTS.decorates);
+    w.default_weight      = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_DEFAULT,        CBM_DEFAULT_EDGE_WEIGHTS.default_weight);
+    w.member_rank_factor  = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_MEMBER_OF,    CBM_DEFAULT_EDGE_WEIGHTS.member_rank_factor);
 
     int max_iter = cbm_config_get_int(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, CBM_PAGERANK_MAX_ITER);
 

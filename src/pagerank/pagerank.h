@@ -34,7 +34,11 @@ struct cbm_config;
 #define CBM_CONFIG_EDGE_WEIGHT_CONFIGURES      "edge_weight_configures"
 #define CBM_CONFIG_EDGE_WEIGHT_HTTP_CALLS      "edge_weight_http_calls"
 #define CBM_CONFIG_EDGE_WEIGHT_ASYNC_CALLS     "edge_weight_async_calls"
-#define CBM_CONFIG_EDGE_WEIGHT_DEFAULT         "edge_weight_default"
+#define CBM_CONFIG_EDGE_WEIGHT_TESTS            "edge_weight_tests"
+#define CBM_CONFIG_EDGE_WEIGHT_WRITES           "edge_weight_writes"
+#define CBM_CONFIG_EDGE_WEIGHT_DECORATES        "edge_weight_decorates"
+#define CBM_CONFIG_EDGE_WEIGHT_DEFAULT          "edge_weight_default"
+#define CBM_CONFIG_EDGE_WEIGHT_MEMBER_OF       "edge_weight_member_of"
 
 /* ── Internal tuning constants ────────────────────────────── */
 
@@ -56,15 +60,19 @@ typedef enum {
 /* ── Edge type weights ────────────────────────────────────── */
 
 typedef struct {
-    double calls;           /* CALLS edges — direct function calls */
-    double defines_method;  /* DEFINES_METHOD — class->method */
-    double defines;         /* DEFINES — declaration->definition */
+    double calls;           /* CALLS — direct function/method calls */
+    double defines_method;  /* DEFINES_METHOD — class defines method (structural) */
+    double defines;         /* DEFINES — module/file defines symbol (structural, low signal) */
     double imports;         /* IMPORTS — module imports */
-    double usage;           /* USAGE — variable/type references */
+    double usage;           /* USAGE — type references, attribute access, isinstance (high for Python) */
     double configures;      /* CONFIGURES — config file links */
-    double http_calls;      /* HTTP_CALLS — cross-service */
+    double http_calls;      /* HTTP_CALLS — cross-service calls */
     double async_calls;     /* ASYNC_CALLS — async function calls */
+    double tests;           /* TESTS — test function tests production code (dampened) */
+    double writes;          /* WRITES — function writes to variable/file */
+    double decorates;       /* DECORATES — decorator applied to function */
     double default_weight;  /* Fallback for unknown edge types */
+    double member_rank_factor; /* Fraction of member rank aggregated to parent class (0=disabled) */
 } cbm_edge_weights_t;
 
 extern const cbm_edge_weights_t CBM_DEFAULT_EDGE_WEIGHTS;
