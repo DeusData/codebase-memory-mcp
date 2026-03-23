@@ -3744,18 +3744,25 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
 /* Default file limit for auto-indexing new projects */
 #define DEFAULT_AUTO_INDEX_LIMIT 50000
 
-    /* Check auto_index config (defaults to true so resources have data at startup) */
+    /* Check auto_index: env var CBM_AUTO_INDEX > config DB > default (true).
+     * Defaults to true so resources have data at startup. */
     bool auto_index = true;
     int file_limit = DEFAULT_AUTO_INDEX_LIMIT;
-    if (srv->config) {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
+    const char *auto_env = getenv("CBM_AUTO_INDEX");
+    if (auto_env && auto_env[0]) {
+        auto_index = (strcmp(auto_env, "true") == 0 || strcmp(auto_env, "1") == 0);
+    } else if (srv->config) {
         auto_index = cbm_config_get_bool(srv->config, CBM_CONFIG_AUTO_INDEX, true);
+    }
+    if (srv->config) {
         file_limit =
             cbm_config_get_int(srv->config, CBM_CONFIG_AUTO_INDEX_LIMIT, DEFAULT_AUTO_INDEX_LIMIT);
     }
 
     if (!auto_index) {
         cbm_log_info("autoindex.skip", "reason", "disabled", "hint",
-                     "run: codebase-memory-mcp config set auto_index true");
+                     "export CBM_AUTO_INDEX=true  OR  codebase-memory-mcp config set auto_index true");
         return;
     }
 
