@@ -1674,7 +1674,7 @@ TEST(cli_upsert_claude_hook_fresh) {
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "PreToolUse") != NULL);
     ASSERT(strstr(data, "Grep|Glob|Read") != NULL);
-    ASSERT(strstr(data, "codebase-memory-mcp") != NULL);
+    ASSERT(strstr(data, "cbm-code-discovery-gate") != NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -1722,9 +1722,9 @@ TEST(cli_upsert_claude_hook_replace) {
 
     const char *data = read_test_file(settingspath);
     ASSERT_NOT_NULL(data);
-    /* Old message gone, new message present */
+    /* Old message gone, new hook script path present */
     ASSERT(strstr(data, "old-cmm-message") == NULL);
-    ASSERT(strstr(data, "codebase-memory-mcp") != NULL);
+    ASSERT(strstr(data, "cbm-code-discovery-gate") != NULL);
 
     test_rmdir_r(tmpdir);
     PASS();

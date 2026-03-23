@@ -192,6 +192,31 @@ bool cbm_is_env_file(const char *name) {
     return false;
 }
 
+bool cbm_is_kustomize_file(const char *name) {
+    if (!name) {
+        return false;
+    }
+    char lower[256];
+    to_lower(name, lower, sizeof(lower));
+    if (strcmp(lower, "kustomization.yaml") == 0) {
+        return true;
+    }
+    return strcmp(lower, "kustomization.yml") == 0;
+}
+
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+bool cbm_is_k8s_manifest(const char *name, const char *content) {
+    if (!name || !content || cbm_is_kustomize_file(name)) {
+        return false;
+    }
+    enum { K8S_PEEK_SZ = 4097 };
+    char buf[K8S_PEEK_SZ];
+    size_t n = strnlen(content, 4096);
+    memcpy(buf, content, n);
+    buf[n] = '\0';
+    return ci_strstr(buf, "apiVersion:") != NULL;
+}
+
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 bool cbm_is_shell_script(const char *name, const char *ext) {
     (void)name;

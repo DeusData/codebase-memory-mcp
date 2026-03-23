@@ -19,6 +19,7 @@
 #include "store/store.h"
 #include "cli/cli.h"
 #include "foundation/log.h"
+#include "foundation/platform.h"
 #include "foundation/compat_thread.h"
 #include "foundation/mem.h"
 #include "ui/config.h"
@@ -221,7 +222,7 @@ int main(int argc, char **argv) {
 
     /* Open config store for runtime settings */
     char config_dir[1024];
-    const char *cfg_home = getenv("HOME");
+    const char *cfg_home = cbm_get_home_dir();
     cbm_config_t *runtime_config = NULL;
     if (cfg_home) {
         snprintf(config_dir, sizeof(config_dir), "%s/.cache/codebase-memory-mcp", cfg_home);

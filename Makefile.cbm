@@ -115,6 +115,7 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_type_refs.c \
     $(CBM_DIR)/extract_type_assigns.c \
     $(CBM_DIR)/extract_env_accesses.c \
+    $(CBM_DIR)/extract_k8s.c \
     $(CBM_DIR)/helpers.c \
     $(CBM_DIR)/lang_specs.c
 
@@ -148,6 +149,7 @@ MCP_SRCS = src/mcp/mcp.c
 # Discover module (new)
 DISCOVER_SRCS = \
     src/discover/language.c \
+    src/discover/userconfig.c \
     src/discover/gitignore.c \
     src/discover/discover.c
 
@@ -176,6 +178,7 @@ PIPELINE_SRCS = \
     src/pipeline/pass_envscan.c \
     src/pipeline/pass_compile_commands.c \
     src/pipeline/pass_infrascan.c \
+    src/pipeline/pass_k8s.c \
     src/pipeline/httplink.c
 
 # Traces module (new)
@@ -259,6 +262,7 @@ TEST_MCP_SRCS = \
 
 TEST_DISCOVER_SRCS = \
     tests/test_language.c \
+    tests/test_userconfig.c \
     tests/test_gitignore.c \
     tests/test_discover.c
 
@@ -288,7 +292,9 @@ TEST_MEM_SRCS = tests/test_mem.c
 
 TEST_UI_SRCS = tests/test_ui.c
 
-ALL_TEST_SRCS = $(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_HTTPLINK_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_INTEGRATION_SRCS)
+TEST_SECURITY_SRCS = tests/test_security.c
+
+ALL_TEST_SRCS = $(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_HTTPLINK_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_SECURITY_SRCS) $(TEST_INTEGRATION_SRCS)
 
 # ── Build directories ────────────────────────────────────────────
 

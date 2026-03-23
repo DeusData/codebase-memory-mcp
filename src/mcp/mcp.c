@@ -20,6 +20,7 @@
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
 #include "foundation/str_util.h"
+#include "foundation/compat_regex.h"
 
 #ifdef _WIN32
 #include <process.h> /* _getpid */
@@ -278,12 +279,21 @@ static const tool_def_t TOOLS[] = {
      "\"array\",\"items\":{\"type\":\"string\"}}}}"},
 
     {"search_code",
-     "Search source code content with text or regex patterns. Use for string literals, error "
-     "messages, and config values that are not in the knowledge graph.",
+     "Graph-augmented code search. Finds text patterns via grep, then enriches results with "
+     "the knowledge graph: deduplicates matches into containing functions, ranks by structural "
+     "importance (definitions first, popular functions next, tests last). "
+     "Modes: compact (default, signatures only — token efficient), full (with source), "
+     "files (just file paths). Use path_filter regex to scope results.",
      "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"project\":{\"type\":"
-     "\"string\"},\"file_pattern\":{\"type\":\"string\"},\"regex\":{\"type\":\"boolean\","
-     "\"default\":false},\"limit\":{\"type\":\"integer\",\"description\":\"Max results. Default: "
-     "unlimited\"}},\"required\":["
+     "\"string\"},\"file_pattern\":{\"type\":\"string\",\"description\":\"Glob for grep "
+     "--include (e.g. *.go)\"},\"path_filter\":{\"type\":\"string\",\"description\":\"Regex "
+     "filter on result file paths (e.g. ^src/ or \\\\.(go|ts)$)\"},\"mode\":{\"type\":\"string\","
+     "\"enum\":[\"compact\",\"full\",\"files\"],\"default\":\"compact\",\"description\":\"compact: "
+     "signatures+metadata (default). full: with source. files: just file list.\"},"
+     "\"context\":{\"type\":\"integer\",\"description\":\"Lines of context around each match "
+     "(like grep -C). Only used in compact mode.\"},"
+     "\"regex\":{\"type\":\"boolean\",\"default\":false},\"limit\":{\"type\":\"integer\","
+     "\"description\":\"Max results (default 10)\",\"default\":10}},\"required\":["
      "\"pattern\"]}"},
 
     {"list_projects", "List all indexed projects", "{\"type\":\"object\",\"properties\":{}}"},
@@ -598,10 +608,9 @@ bool cbm_mcp_server_has_cached_store(cbm_mcp_server_t *srv) {
 /* Returns the platform cache directory: ~/.cache/codebase-memory-mcp
  * Writes to buf, returns buf for convenience. */
 static const char *cache_dir(char *buf, size_t bufsz) {
-    // NOLINTNEXTLINE(concurrency-mt-unsafe)
-    const char *home = getenv("HOME");
+    const char *home = cbm_get_home_dir();
     if (!home) {
-        home = "/tmp";
+        home = cbm_tmpdir();
     }
     snprintf(buf, bufsz, "%s/.cache/codebase-memory-mcp", home);
     return buf;
@@ -1625,19 +1634,312 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         true);
 }
 
-/* ── search_code ──────────────────────────────────────────────── */
+/* ── search_code v2: graph-augmented code search ─────────────── */
+
+/* Strip non-ASCII bytes to guarantee valid UTF-8 JSON output */
+enum { ASCII_MAX = 127 };
+static void sanitize_ascii(char *s) {
+    for (unsigned char *p = (unsigned char *)s; *p; p++) {
+        if (*p > ASCII_MAX) {
+            *p = '?';
+        }
+    }
+}
+
+/* Intermediate grep match */
+typedef struct {
+    char file[512];
+    int line;
+    char content[1024];
+} grep_match_t;
+
+/* Deduped result: one per containing graph node */
+typedef struct {
+    int64_t node_id; /* 0 = raw match (no containing node) */
+    char node_name[256];
+    char qualified_name[512];
+    char label[64];
+    char file[512];
+    int start_line;
+    int end_line;
+    int in_degree;
+    int out_degree;
+    int score;
+    int match_lines[64];
+    int match_count;
+} search_result_t;
+
+/* Score a result for ranking: project source first, vendored last, tests lowest */
+enum { SCORE_FUNC = 10, SCORE_ROUTE = 15, SCORE_VENDORED = -50, SCORE_TEST = -5 };
+enum { MAX_LINE_SPAN = 999999 };
+
+static int compute_search_score(const search_result_t *r) {
+    int score = r->in_degree;
+    if (strcmp(r->label, "Function") == 0 || strcmp(r->label, "Method") == 0) {
+        score += SCORE_FUNC;
+    }
+    if (strcmp(r->label, "Route") == 0) {
+        score += SCORE_ROUTE;
+    }
+    if (strstr(r->file, "vendored/") || strstr(r->file, "vendor/") ||
+        strstr(r->file, "node_modules/")) {
+        score += SCORE_VENDORED;
+    }
+    /* Penalize test files */
+    if (strstr(r->file, "test") || strstr(r->file, "spec") || strstr(r->file, "_test.")) {
+        score += SCORE_TEST;
+    }
+    return score;
+}
+
+static int search_result_cmp(const void *a, const void *b) {
+    const search_result_t *ra = (const search_result_t *)a;
+    const search_result_t *rb = (const search_result_t *)b;
+    return rb->score - ra->score; /* descending */
+}
+
+/* Build the grep command string based on scoped vs recursive mode */
+static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
+                           const char *file_pattern, const char *tmpfile, const char *filelist,
+                           const char *root_path) {
+    // NOLINTNEXTLINE(readability-implicit-bool-conversion)
+    const char *flag = use_regex ? "-E" : "-F";
+    if (scoped) {
+        if (file_pattern) {
+            snprintf(cmd, cmd_sz, "xargs grep -n %s --include='%s' -f '%s' < '%s' 2>/dev/null",
+                     flag, file_pattern, tmpfile, filelist);
+        } else {
+            snprintf(cmd, cmd_sz, "xargs grep -n %s -f '%s' < '%s' 2>/dev/null", flag, tmpfile,
+                     filelist);
+        }
+    } else {
+        if (file_pattern) {
+            snprintf(cmd, cmd_sz, "grep -rn %s --include='%s' -f '%s' '%s' 2>/dev/null", flag,
+                     file_pattern, tmpfile, root_path);
+        } else {
+            snprintf(cmd, cmd_sz, "grep -rn %s -f '%s' '%s' 2>/dev/null", flag, tmpfile, root_path);
+        }
+    }
+}
+
+/* Phase 4: assemble JSON output from search results */
+static char *assemble_search_output(search_result_t *sr, int sr_count, grep_match_t *raw,
+                                    int raw_count, int gm_count, int limit, int mode,
+                                    int context_lines, const char *root_path) {
+    enum { MODE_COMPACT = 0, MODE_FULL = 1, MODE_FILES = 2 };
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root_obj);
+
+    int output_count = sr_count < limit ? sr_count : limit;
+
+    if (mode == MODE_FILES) {
+        yyjson_mut_val *files_arr = yyjson_mut_arr(doc);
+        char *seen_files[512];
+        int seen_count = 0;
+        for (int fi = 0; fi < output_count; fi++) {
+            bool dup = false;
+            for (int j = 0; j < seen_count; j++) {
+                if (strcmp(seen_files[j], sr[fi].file) == 0) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup && seen_count < 512) {
+                seen_files[seen_count++] = sr[fi].file;
+                yyjson_mut_arr_add_str(doc, files_arr, sr[fi].file);
+            }
+        }
+        for (int fi = 0; fi < raw_count && seen_count < 512; fi++) {
+            bool dup = false;
+            for (int j = 0; j < seen_count; j++) {
+                if (strcmp(seen_files[j], raw[fi].file) == 0) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                seen_files[seen_count++] = raw[fi].file;
+                yyjson_mut_arr_add_str(doc, files_arr, raw[fi].file);
+            }
+        }
+        yyjson_mut_obj_add_val(doc, root_obj, "files", files_arr);
+    } else {
+        yyjson_mut_val *results_arr = yyjson_mut_arr(doc);
+        for (int ri = 0; ri < output_count; ri++) {
+            search_result_t *r = &sr[ri];
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+
+            yyjson_mut_obj_add_str(doc, item, "node", r->node_name);
+            yyjson_mut_obj_add_str(doc, item, "qualified_name", r->qualified_name);
+            yyjson_mut_obj_add_str(doc, item, "label", r->label);
+            yyjson_mut_obj_add_str(doc, item, "file", r->file);
+            yyjson_mut_obj_add_int(doc, item, "start_line", r->start_line);
+            yyjson_mut_obj_add_int(doc, item, "end_line", r->end_line);
+            yyjson_mut_obj_add_int(doc, item, "in_degree", r->in_degree);
+            yyjson_mut_obj_add_int(doc, item, "out_degree", r->out_degree);
+
+            yyjson_mut_val *ml = yyjson_mut_arr(doc);
+            for (int j = 0; j < r->match_count; j++) {
+                yyjson_mut_arr_add_int(doc, ml, r->match_lines[j]);
+            }
+            yyjson_mut_obj_add_val(doc, item, "match_lines", ml);
+
+            if (r->start_line > 0 && r->end_line > 0) {
+                char abs_path[1024];
+                snprintf(abs_path, sizeof(abs_path), "%s/%s", root_path, r->file);
+
+                if (mode == MODE_FULL) {
+                    char *source = read_file_lines(abs_path, r->start_line, r->end_line);
+                    if (source) {
+                        sanitize_ascii(source);
+                        yyjson_mut_obj_add_strcpy(doc, item, "source", source);
+                        free(source);
+                    }
+                } else if (context_lines > 0 && r->match_count > 0) {
+                    int first_match = r->match_lines[0];
+                    int last_match = r->match_lines[r->match_count - 1];
+                    int ctx_start = first_match - context_lines;
+                    int ctx_end = last_match + context_lines;
+                    if (ctx_start < 1) {
+                        ctx_start = 1;
+                    }
+                    char *ctx = read_file_lines(abs_path, ctx_start, ctx_end);
+                    if (ctx) {
+                        sanitize_ascii(ctx);
+                        yyjson_mut_obj_add_strcpy(doc, item, "context", ctx);
+                        yyjson_mut_obj_add_int(doc, item, "context_start", ctx_start);
+                        free(ctx);
+                    }
+                }
+            }
+
+            yyjson_mut_arr_add_val(results_arr, item);
+        }
+        yyjson_mut_obj_add_val(doc, root_obj, "results", results_arr);
+
+        enum { MAX_RAW = 20 };
+        yyjson_mut_val *raw_arr = yyjson_mut_arr(doc);
+        int raw_output = raw_count < MAX_RAW ? raw_count : MAX_RAW;
+        for (int ri = 0; ri < raw_output; ri++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, item, "file", raw[ri].file);
+            yyjson_mut_obj_add_int(doc, item, "line", raw[ri].line);
+            yyjson_mut_obj_add_str(doc, item, "content", raw[ri].content);
+            yyjson_mut_arr_add_val(raw_arr, item);
+        }
+        yyjson_mut_obj_add_val(doc, root_obj, "raw_matches", raw_arr);
+    }
+
+    /* Directory distribution */
+    {
+        yyjson_mut_val *dirs = yyjson_mut_obj(doc);
+        char dir_names[64][128];
+        int dir_counts[64];
+        int dir_n = 0;
+        for (int di = 0; di < sr_count; di++) {
+            char top[128] = "";
+            const char *slash = strchr(sr[di].file, '/');
+            if (slash) {
+                size_t dlen = (size_t)(slash - sr[di].file + 1);
+                if (dlen >= sizeof(top)) {
+                    dlen = sizeof(top) - 1;
+                }
+                memcpy(top, sr[di].file, dlen);
+                top[dlen] = '\0';
+            } else {
+                snprintf(top, sizeof(top), "%s", sr[di].file);
+            }
+            int found = -1;
+            for (int d = 0; d < dir_n; d++) {
+                if (strcmp(dir_names[d], top) == 0) {
+                    found = d;
+                    break;
+                }
+            }
+            if (found >= 0) {
+                dir_counts[found]++;
+            } else if (dir_n < 64) {
+                snprintf(dir_names[dir_n], sizeof(dir_names[0]), "%s", top);
+                dir_counts[dir_n] = 1;
+                dir_n++;
+            }
+        }
+        for (int d = 0; d < dir_n; d++) {
+            yyjson_mut_val *key = yyjson_mut_strcpy(doc, dir_names[d]);
+            yyjson_mut_val *val = yyjson_mut_int(doc, dir_counts[d]);
+            yyjson_mut_obj_add(dirs, key, val);
+        }
+        yyjson_mut_obj_add_val(doc, root_obj, "directories", dirs);
+    }
+
+    /* Summary stats */
+    yyjson_mut_obj_add_int(doc, root_obj, "total_grep_matches", gm_count);
+    yyjson_mut_obj_add_int(doc, root_obj, "total_results", sr_count);
+    yyjson_mut_obj_add_int(doc, root_obj, "raw_match_count", raw_count);
+    if (sr_count > 0 && gm_count > 0) {
+        char ratio[32];
+        snprintf(ratio, sizeof(ratio), "%.1fx", (double)gm_count / (double)(sr_count + raw_count));
+        yyjson_mut_obj_add_strcpy(doc, root_obj, "dedup_ratio", ratio);
+    }
+
+    char *json = yy_doc_to_str(doc);
+    if (json) {
+        sanitize_ascii(json);
+    }
+    yyjson_mut_doc_free(doc);
+
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
 
 static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char *pattern = cbm_mcp_get_string_arg(args, "pattern");
     char *project = cbm_mcp_get_string_arg(args, "project");
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
-    int limit = cbm_mcp_get_int_arg(args, "limit", 500000);
+    char *path_filter = cbm_mcp_get_string_arg(args, "path_filter");
+    char *mode_str = cbm_mcp_get_string_arg(args, "mode");
+    int limit = cbm_mcp_get_int_arg(args, "limit", 10);
+    int context_lines = cbm_mcp_get_int_arg(args, "context", 0);
     bool use_regex = cbm_mcp_get_bool_arg(args, "regex");
+
+    /* Parse mode: compact (default), full, files */
+    enum { MODE_COMPACT, MODE_FULL, MODE_FILES };
+    int mode = MODE_COMPACT;
+    if (mode_str) {
+        if (strcmp(mode_str, "full") == 0) {
+            mode = MODE_FULL;
+        } else if (strcmp(mode_str, "files") == 0) {
+            mode = MODE_FILES;
+        }
+        free(mode_str);
+    }
+
+    /* Compile path_filter regex if provided */
+    cbm_regex_t path_regex;
+    bool has_path_filter = false;
+    if (path_filter && path_filter[0]) {
+        if (cbm_regcomp(&path_regex, path_filter, CBM_REG_EXTENDED | CBM_REG_NOSUB) == CBM_REG_OK) {
+            has_path_filter = true;
+        }
+        free(path_filter);
+        path_filter = NULL;
+    } else {
+        free(path_filter);
+        path_filter = NULL;
+    }
 
     if (!pattern) {
         free(project);
         free(file_pattern);
         return cbm_mcp_text_result("pattern is required", true);
+    }
+
+    /* Resolve project */
+    if (!project && srv->session_project[0]) {
+        project = heap_strdup(srv->session_project);
     }
 
     char *root_path = get_project_root(srv, project);
@@ -1658,7 +1960,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("path or file_pattern contains invalid characters", true);
     }
 
-    /* Write pattern to temp file to avoid shell injection */
+    /* ── Phase 1: Grep scan ──────────────────────────────────── */
+
     char tmpfile[256];
 #ifdef _WIN32
     snprintf(tmpfile, sizeof(tmpfile), "/tmp/cbm_search_%d.pat", (int)_getpid());
@@ -1677,21 +1980,53 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     (void)fprintf(tf, "%s\n", pattern);
     (void)fclose(tf);
 
-    char cmd[4096];
-    // NOLINTNEXTLINE(readability-implicit-bool-conversion)
-    const char *flag = use_regex ? "-E" : "-F";
-    if (file_pattern) {
-        snprintf(cmd, sizeof(cmd), "grep -rn %s --include='%s' -m %d -f '%s' '%s' 2>/dev/null",
-                 flag, file_pattern, limit * 3, tmpfile, root_path);
-    } else {
-        snprintf(cmd, sizeof(cmd), "grep -rn %s -m %d -f '%s' '%s' 2>/dev/null", flag, limit * 3,
-                 tmpfile, root_path);
+    /* No grep-level match limit — let grep find all matches, then dedup and
+     * cap in our code. The -m flag caused results from large vendored files
+     * to exhaust the quota before reaching project source files. */
+    enum { GREP_MAX_MATCHES = 500 };
+    int grep_limit = GREP_MAX_MATCHES;
+
+    /* Scope grep to indexed files only — avoids scanning vendored/generated code.
+     * Query the graph for distinct file paths, write them to a temp file,
+     * then use xargs to pass them to grep. Falls back to recursive grep if
+     * no indexed files found (project not fully indexed). */
+    char filelist[256];
+    snprintf(filelist, sizeof(filelist), "%s.files", tmpfile);
+    bool scoped = false;
+
+    cbm_store_t *pre_store = resolve_store(srv, project);
+    if (pre_store) {
+        const char *pn = project ? project : srv->session_project;
+        char **indexed_files = NULL;
+        int indexed_count = 0;
+        if (pn &&
+            cbm_store_list_files(pre_store, pn, &indexed_files, &indexed_count) == CBM_STORE_OK &&
+            indexed_count > 0) {
+            FILE *fl = fopen(filelist, "w");
+            if (fl) {
+                for (int fi = 0; fi < indexed_count; fi++) {
+                    fprintf(fl, "%s/%s\n", root_path, indexed_files[fi]);
+                }
+                fclose(fl);
+                scoped = true;
+            }
+            for (int fi = 0; fi < indexed_count; fi++) {
+                free(indexed_files[fi]);
+            }
+            free(indexed_files);
+        }
     }
+
+    char cmd[4096];
+    build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist, root_path);
 
     // NOLINTNEXTLINE(bugprone-command-processor,cert-env33-c)
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
         cbm_unlink(tmpfile);
+        if (scoped) {
+            cbm_unlink(filelist);
+        }
         free(root_path);
         free(pattern);
         free(project);
@@ -1699,16 +2034,14 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("search failed", true);
     }
 
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
-    yyjson_mut_doc_set_root(doc, root_obj);
-
-    yyjson_mut_val *matches = yyjson_mut_arr(doc);
+    /* Collect grep matches into array */
+    int gm_cap = 64;
+    int gm_count = 0;
+    grep_match_t *gm = malloc(gm_cap * sizeof(grep_match_t));
     char line[2048];
-    int count = 0;
     size_t root_len = strlen(root_path);
 
-    while (fgets(line, sizeof(line), fp) && count < limit) {
+    while (fgets(line, sizeof(line), fp) && gm_count < grep_limit) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
             line[--len] = '\0';
@@ -1717,7 +2050,6 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
             continue;
         }
 
-        /* grep output: /abs/path/file:lineno:content */
         char *colon1 = strchr(line, ':');
         if (!colon1) {
             continue;
@@ -1730,7 +2062,6 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         *colon1 = '\0';
         *colon2 = '\0';
 
-        /* Strip root_path prefix to get relative path */
         const char *file = line;
         if (strncmp(file, root_path, root_len) == 0) {
             file += root_len;
@@ -1738,31 +2069,178 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
                 file++;
             }
         }
-        int lineno = (int)strtol(colon1 + 1, NULL, 10);
-        const char *content = colon2 + 1;
 
-        yyjson_mut_val *item = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_str(doc, item, "file", file);
-        yyjson_mut_obj_add_int(doc, item, "line", lineno);
-        yyjson_mut_obj_add_str(doc, item, "content", content);
-        yyjson_mut_arr_add_val(matches, item);
-        count++;
+        /* Apply path_filter regex — skip files that don't match */
+        if (has_path_filter && cbm_regexec(&path_regex, file, 0, NULL, 0) != CBM_REG_OK) {
+            continue;
+        }
+
+        if (gm_count >= gm_cap) {
+            gm_cap *= 2;
+            gm = safe_realloc(gm, gm_cap * sizeof(grep_match_t));
+        }
+        snprintf(gm[gm_count].file, sizeof(gm[0].file), "%s", file);
+        gm[gm_count].line = (int)strtol(colon1 + 1, NULL, 10);
+        snprintf(gm[gm_count].content, sizeof(gm[0].content), "%s", colon2 + 1);
+        sanitize_ascii(gm[gm_count].content);
+        gm_count++;
     }
     cbm_pclose(fp);
-    cbm_unlink(tmpfile); /* Clean up pattern file after grep is done */
+    cbm_unlink(tmpfile);
+    if (scoped) {
+        cbm_unlink(filelist);
+    }
 
-    yyjson_mut_obj_add_val(doc, root_obj, "matches", matches);
-    yyjson_mut_obj_add_int(doc, root_obj, "count", count);
+    /* ── Phase 2+3: Block expansion + graph ranking ──────────── */
+    /* Sort grep matches by file for contiguous processing.
+     * Then: one SQL query per unique file for nodes, one batch query for all degrees. */
 
-    char *json = yy_doc_to_str(doc);
-    yyjson_mut_doc_free(doc);
+    cbm_store_t *store = resolve_store(srv, project);
+    const char *proj_name = project ? project : srv->session_project;
+
+    int sr_cap = 32;
+    int sr_count = 0;
+    search_result_t *sr = calloc(sr_cap, sizeof(search_result_t));
+
+    int raw_cap = 32;
+    int raw_count = 0;
+    grep_match_t *raw = malloc(raw_cap * sizeof(grep_match_t));
+
+    /* Sort matches by file path for contiguous per-file processing */
+    qsort(gm, gm_count, sizeof(grep_match_t), (int (*)(const void *, const void *))strcmp);
+
+    /* Process matches file-by-file (contiguous runs after sort) */
+    int i = 0;
+    while (i < gm_count) {
+        const char *cur_file = gm[i].file;
+        int file_start = i;
+
+        /* Find end of this file's run */
+        while (i < gm_count && strcmp(gm[i].file, cur_file) == 0) {
+            i++;
+        }
+        int file_end = i; /* [file_start, file_end) */
+
+        /* One SQL query: load all nodes in this file */
+        cbm_node_t *file_nodes = NULL;
+        int file_node_count = 0;
+        if (store && proj_name) {
+            cbm_store_find_nodes_by_file(store, proj_name, cur_file, &file_nodes, &file_node_count);
+        }
+
+        /* Match each grep hit to tightest containing node (in-memory) */
+        for (int mi = file_start; mi < file_end; mi++) {
+            int best = -1;
+            int best_span = MAX_LINE_SPAN;
+            for (int j = 0; j < file_node_count; j++) {
+                if (file_nodes[j].start_line <= gm[mi].line &&
+                    file_nodes[j].end_line >= gm[mi].line) {
+                    int span = file_nodes[j].end_line - file_nodes[j].start_line;
+                    if (span < best_span) {
+                        best = j;
+                        best_span = span;
+                    }
+                }
+            }
+
+            if (best >= 0) {
+                cbm_node_t *n = &file_nodes[best];
+
+                /* Dedup: check if node already in results */
+                int existing = -1;
+                for (int j = 0; j < sr_count; j++) {
+                    if (sr[j].node_id == n->id) {
+                        existing = j;
+                        break;
+                    }
+                }
+
+                if (existing >= 0) {
+                    if (sr[existing].match_count < 64) {
+                        sr[existing].match_lines[sr[existing].match_count++] = gm[mi].line;
+                    }
+                } else {
+                    if (sr_count >= sr_cap) {
+                        sr_cap *= 2;
+                        sr = safe_realloc(sr, sr_cap * sizeof(search_result_t));
+                        memset(&sr[sr_count], 0, (sr_cap - sr_count) * sizeof(search_result_t));
+                    }
+                    search_result_t *r = &sr[sr_count];
+                    r->node_id = n->id;
+                    snprintf(r->node_name, sizeof(r->node_name), "%s", n->name ? n->name : "");
+                    snprintf(r->qualified_name, sizeof(r->qualified_name), "%s",
+                             n->qualified_name ? n->qualified_name : "");
+                    snprintf(r->label, sizeof(r->label), "%s", n->label ? n->label : "");
+                    snprintf(r->file, sizeof(r->file), "%s", n->file_path ? n->file_path : "");
+                    r->start_line = n->start_line;
+                    r->end_line = n->end_line;
+                    r->match_lines[0] = gm[mi].line;
+                    r->match_count = 1;
+                    sr_count++;
+                }
+            } else {
+                if (raw_count >= raw_cap) {
+                    raw_cap *= 2;
+                    raw = safe_realloc(raw, raw_cap * sizeof(grep_match_t));
+                }
+                raw[raw_count++] = gm[mi];
+            }
+        }
+
+        /* Free file nodes */
+        for (int j = 0; j < file_node_count; j++) {
+            free((void *)file_nodes[j].project);
+            free((void *)file_nodes[j].label);
+            free((void *)file_nodes[j].name);
+            free((void *)file_nodes[j].qualified_name);
+            free((void *)file_nodes[j].file_path);
+            free((void *)file_nodes[j].properties_json);
+        }
+        free(file_nodes);
+    }
+
+    /* Phase 3: batch degree query — ONE query for all results instead of 2×N */
+    if (store && sr_count > 0) {
+        int64_t *ids = malloc(sr_count * sizeof(int64_t));
+        int *in_degs = malloc(sr_count * sizeof(int));
+        int *out_degs = malloc(sr_count * sizeof(int));
+        for (int j = 0; j < sr_count; j++) {
+            ids[j] = sr[j].node_id;
+        }
+        if (cbm_store_batch_count_degrees(store, ids, sr_count, "CALLS", in_degs, out_degs) ==
+            CBM_STORE_OK) {
+            for (int j = 0; j < sr_count; j++) {
+                sr[j].in_degree = in_degs[j];
+                sr[j].out_degree = out_degs[j];
+            }
+        }
+        free(ids);
+        free(in_degs);
+        free(out_degs);
+    }
+
+    /* Compute scores and sort */
+    for (int j = 0; j < sr_count; j++) {
+        sr[j].score = compute_search_score(&sr[j]);
+    }
+    if (sr_count > 1) {
+        qsort(sr, sr_count, sizeof(search_result_t), search_result_cmp);
+    }
+
+    /* ── Phase 4: Context assembly (extracted helper) ─────────── */
+
+    char *result = assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode,
+                                          context_lines, root_path);
+    free(gm);
+    free(sr);
+    free(raw);
     free(root_path);
     free(pattern);
     free(project);
     free(file_pattern);
-
-    char *result = cbm_mcp_text_result(json, false);
-    free(json);
+    if (has_path_filter) {
+        cbm_regfree(&path_regex);
+    }
     return result;
 }
 
@@ -2074,8 +2552,7 @@ static void detect_session(cbm_mcp_server_t *srv) {
     /* 1. Try CWD */
     char cwd[1024];
     if (getcwd(cwd, sizeof(cwd)) != NULL) {
-        // NOLINTNEXTLINE(concurrency-mt-unsafe)
-        const char *home = getenv("HOME");
+        const char *home = cbm_get_home_dir();
         /* Skip useless roots: / and $HOME */
         if (strcmp(cwd, "/") != 0 && (home == NULL || strcmp(cwd, home) != 0)) {
             snprintf(srv->session_root, sizeof(srv->session_root), "%s", cwd);
@@ -2146,8 +2623,7 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     }
 
     /* Check if project already has a DB */
-    // NOLINTNEXTLINE(concurrency-mt-unsafe)
-    const char *home = getenv("HOME");
+    const char *home = cbm_get_home_dir();
     if (home) {
         char db_check[1024];
         snprintf(db_check, sizeof(db_check), "%s/.cache/codebase-memory-mcp/%s.db", home,

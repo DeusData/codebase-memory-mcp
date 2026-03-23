@@ -26,6 +26,7 @@ extern void suite_store_search(void);
 extern void suite_cypher(void);
 extern void suite_mcp(void);
 extern void suite_language(void);
+extern void suite_userconfig(void);
 extern void suite_gitignore(void);
 extern void suite_discover(void);
 extern void suite_graph_buffer(void);
@@ -48,6 +49,7 @@ extern void suite_worker_pool(void);
 extern void suite_parallel(void);
 extern void suite_mem(void);
 extern void suite_ui(void);
+extern void suite_security(void);
 extern void suite_integration(void);
 
 int main(void) {
@@ -80,6 +82,7 @@ int main(void) {
 
     /* Discover (M2) */
     RUN_SUITE(language);
+    RUN_SUITE(userconfig);
     RUN_SUITE(gitignore);
     RUN_SUITE(discover);
 
@@ -131,6 +134,9 @@ int main(void) {
 
     /* UI (config, embedded assets, layout) */
     RUN_SUITE(ui);
+
+    /* Security defenses */
+    RUN_SUITE(security);
 
     /* Integration (end-to-end) */
     RUN_SUITE(integration);

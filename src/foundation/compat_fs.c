@@ -144,6 +144,13 @@ int cbm_rmdir(const char *path) {
     return _rmdir(path);
 }
 
+int cbm_exec_no_shell(const char *const *argv) {
+    if (!argv || !argv[0]) {
+        return -1;
+    }
+    return (int)_spawnvp(_P_WAIT, argv[0], argv);
+}
+
 #else /* POSIX */
 
 /* ── POSIX implementation ─────────────────────────────────────── */
@@ -151,6 +158,7 @@ int cbm_rmdir(const char *path) {
 #include <dirent.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 struct cbm_dir {
@@ -246,6 +254,32 @@ int cbm_unlink(const char *path) {
 
 int cbm_rmdir(const char *path) {
     return rmdir(path);
+}
+
+int cbm_exec_no_shell(const char *const *argv) {
+    if (!argv || !argv[0]) {
+        return -1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        return -1;
+    }
+    if (pid == 0) {
+        /* Child: exec directly — no shell interpretation */
+        /* 127 = standard "command not found" exit code (POSIX convention) */
+        enum { EXEC_NOT_FOUND = 127 };
+        execvp(argv[0], (char *const *)argv);
+        _exit(EXEC_NOT_FOUND);
+    }
+    /* Parent: wait for child */
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        return -1;
+    }
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    return -1; /* killed by signal */
 }
 
 #endif /* _WIN32 */

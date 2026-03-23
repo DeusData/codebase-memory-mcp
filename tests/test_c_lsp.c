@@ -7050,8 +7050,12 @@ TEST(clsp_nocrash_extremely_large_function) {
     int off = 0;
     off += snprintf(src + off, sizeof(src) - off, "struct W { void m() {} };\n");
     off += snprintf(src + off, sizeof(src) - off, "void test() {\n");
-    for (int i = 0; i < 50; i++)
-        off += snprintf(src + off, sizeof(src) - off, "    W w%d;\n", i);
+    for (int i = 0; i < 50; i++) {
+        off += snprintf(src + off, sizeof(src) - (size_t)off, "    W w%d;\n", i);
+        if (off >= (int)sizeof(src)) {
+            off = (int)sizeof(src) - 1;
+        }
+    }
     off += snprintf(src + off, sizeof(src) - off, "    W w0;\n");
     off += snprintf(src + off, sizeof(src) - off, "    w0.m();\n");
     off += snprintf(src + off, sizeof(src) - off, "}\n");

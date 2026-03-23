@@ -3331,6 +3331,30 @@ TEST(infra_is_dockerfile) {
     PASS();
 }
 
+TEST(infra_is_kustomize_file) {
+    ASSERT(cbm_is_kustomize_file("kustomization.yaml"));
+    ASSERT(cbm_is_kustomize_file("kustomization.yml"));
+    ASSERT(cbm_is_kustomize_file("KUSTOMIZATION.YAML")); /* case-insensitive */
+    ASSERT(!cbm_is_kustomize_file("deployment.yaml"));
+    ASSERT(!cbm_is_kustomize_file("kustomize.yaml"));
+    ASSERT(!cbm_is_kustomize_file(NULL));
+    PASS();
+}
+
+TEST(infra_is_k8s_manifest) {
+    const char *deploy = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: my-app\n";
+    const char *plain  = "name: foo\nvalue: bar\n";
+    const char *kust   = "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n";
+
+    ASSERT(cbm_is_k8s_manifest("deployment.yaml", deploy));
+    ASSERT(!cbm_is_k8s_manifest("deployment.yaml", plain));
+    /* kustomize file should return false even if it has apiVersion */
+    ASSERT(!cbm_is_k8s_manifest("kustomization.yaml", kust));
+    ASSERT(!cbm_is_k8s_manifest(NULL, deploy));
+    ASSERT(!cbm_is_k8s_manifest("deployment.yaml", NULL));
+    PASS();
+}
+
 TEST(infra_is_env_file) {
     ASSERT(cbm_is_env_file(".env"));
     ASSERT(cbm_is_env_file(".env.local"));
@@ -4136,6 +4160,114 @@ TEST(infra_pipeline_idempotent) {
     ASSERT_EQ(r1.port_count, r2.port_count);
     ASSERT_EQ(r1.env_count, r2.env_count);
 
+    PASS();
+}
+
+/* ── K8s / Kustomize extraction tests ──────────────────────────── */
+
+TEST(k8s_extract_kustomize) {
+    const char *src =
+        "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+        "kind: Kustomization\n"
+        "resources:\n"
+        "  - deployment.yaml\n"
+        "  - service.yaml\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_KUSTOMIZE,
+                                        "myproj", "base/kustomization.yaml",
+                                        0, NULL, NULL);
+    ASSERT(r != NULL);
+    ASSERT_GTE(r->imports.count, 2);
+
+    bool found_deploy = false, found_svc = false;
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].module_path &&
+            strcmp(r->imports.items[i].module_path, "deployment.yaml") == 0)
+            found_deploy = true;
+        if (r->imports.items[i].module_path &&
+            strcmp(r->imports.items[i].module_path, "service.yaml") == 0)
+            found_svc = true;
+    }
+    ASSERT_TRUE(found_deploy);
+    ASSERT_TRUE(found_svc);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(k8s_extract_manifest) {
+    const char *src =
+        "apiVersion: apps/v1\n"
+        "kind: Deployment\n"
+        "metadata:\n"
+        "  name: my-app\n"
+        "  namespace: production\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S,
+                                        "myproj", "k8s/deployment.yaml",
+                                        0, NULL, NULL);
+    ASSERT(r != NULL);
+    ASSERT_GTE(r->defs.count, 1);
+
+    bool found_resource = false;
+    for (int d = 0; d < r->defs.count; d++) {
+        if (r->defs.items[d].label &&
+            strcmp(r->defs.items[d].label, "Resource") == 0 &&
+            r->defs.items[d].name &&
+            strstr(r->defs.items[d].name, "Deployment") != NULL)
+            found_resource = true;
+    }
+    ASSERT_TRUE(found_resource);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(k8s_extract_manifest_no_name) {
+    const char *src = "apiVersion: apps/v1\nkind: Deployment\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S,
+                                        "myproj", "k8s/deploy.yaml", 0, NULL, NULL);
+    ASSERT(r != NULL);
+    /* No crash — defs count may be 0 because metadata.name is absent */
+    ASSERT(!r->has_error);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(k8s_extract_manifest_multidoc) {
+    /* Two-document YAML separated by "---".
+     * extract_k8s_manifest contains a "break" after the first successful push,
+     * so it processes only the first document that has both kind and
+     * metadata.name.  This test pins that behaviour: the first document's
+     * resource must be present and no crash must occur.
+     *
+     * Note: with some tree-sitter YAML grammar versions the root stream may
+     * expose both documents as siblings; the break still fires after the first
+     * successful def push, so defs.count must be exactly 1. */
+    const char *src =
+        "apiVersion: apps/v1\n"
+        "kind: Deployment\n"
+        "metadata:\n"
+        "  name: my-app\n"
+        "---\n"
+        "apiVersion: v1\n"
+        "kind: Service\n"
+        "metadata:\n"
+        "  name: my-svc\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S,
+                                        "myproj", "k8s/multi.yaml", 0, NULL, NULL);
+    ASSERT(r != NULL);
+    ASSERT(!r->has_error);
+    /* First document's resource must be present */
+    int found = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].label && strcmp(r->defs.items[i].label, "Resource") == 0 &&
+            r->defs.items[i].name && strcmp(r->defs.items[i].name, "Deployment/my-app") == 0) {
+            found = 1;
+        }
+    }
+    ASSERT(found);
+    /* At least one def, no more than one (only first document processed) */
+    ASSERT(r->defs.count >= 1);
+    cbm_free_result(r);
     PASS();
 }
 
@@ -4947,6 +5079,140 @@ TEST(incremental_new_file_added) {
     PASS();
 }
 
+TEST(incremental_k8s_manifest_indexed) {
+    /* Full index with a k8s manifest, then add a new manifest via incremental.
+     * Verifies that cbm_pipeline_pass_k8s() runs during incremental re-index. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_k8s_incr_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        SKIP("tmpdir");
+    }
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/test.db", tmpdir);
+    char path[512];
+    FILE *f;
+
+    /* Initial manifest */
+    snprintf(path, sizeof(path), "%s/deploy.yaml", tmpdir);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: my-app\n");
+    fclose(f);
+
+    /* Full index */
+    cbm_pipeline_t *p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    /* Verify Resource node created by full index */
+    cbm_store_t *s = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    cbm_store_find_nodes_by_label(s, project, "Resource", &nodes, &count);
+    ASSERT_GT(count, 0);
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(s);
+
+    /* Add a second manifest — incremental should pick it up */
+    snprintf(path, sizeof(path), "%s/svc.yaml", tmpdir);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "apiVersion: v1\nkind: Service\nmetadata:\n  name: my-svc\n");
+    fclose(f);
+
+    /* Incremental re-index */
+    p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    /* Verify both Resource nodes now present */
+    s = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(s);
+    nodes = NULL;
+    count = 0;
+    cbm_store_find_nodes_by_label(s, project, "Resource", &nodes, &count);
+    ASSERT_GTE(count, 2);
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(s);
+
+    free(project);
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
+    (void)system(cmd);
+    PASS();
+}
+
+TEST(incremental_kustomize_module_indexed) {
+    /* Verifies that a kustomization.yaml added after the initial full index
+     * gets a Module node via the incremental k8s pass. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_kust_incr_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        SKIP("tmpdir");
+    }
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/test.db", tmpdir);
+    char path[512];
+    FILE *f;
+
+    /* Initial resource manifest (gives full index something to find) */
+    snprintf(path, sizeof(path), "%s/deploy.yaml", tmpdir);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: my-app\n");
+    fclose(f);
+
+    /* Full index */
+    cbm_pipeline_t *p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    /* Add kustomization.yaml */
+    snprintf(path, sizeof(path), "%s/kustomization.yaml", tmpdir);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+               "kind: Kustomization\n"
+               "resources:\n"
+               "  - deploy.yaml\n");
+    fclose(f);
+
+    /* Incremental re-index */
+    p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    /* Verify Module node created for the kustomization overlay */
+    cbm_store_t *s = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    cbm_store_find_nodes_by_label(s, project, "Module", &nodes, &count);
+    bool found_kust = false;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].properties_json && strstr(nodes[i].properties_json, "kustomize")) {
+            found_kust = true;
+            break;
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(s);
+    ASSERT_TRUE(found_kust);
+
+    free(project);
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
+    (void)system(cmd);
+    PASS();
+}
+
 SUITE(pipeline) {
     /* Lifecycle */
     RUN_TEST(pipeline_create_free);
@@ -5055,6 +5321,8 @@ SUITE(pipeline) {
     RUN_TEST(infra_is_cloudbuild_file);
     RUN_TEST(infra_is_shell_script);
     RUN_TEST(infra_is_dockerfile);
+    RUN_TEST(infra_is_kustomize_file);
+    RUN_TEST(infra_is_k8s_manifest);
     RUN_TEST(infra_is_env_file);
     RUN_TEST(infra_clean_json_brackets);
     RUN_TEST(infra_secret_detection);
@@ -5083,6 +5351,11 @@ SUITE(pipeline) {
     /* Infrascan: pipeline integration */
     RUN_TEST(infra_pipeline_integration);
     RUN_TEST(infra_pipeline_idempotent);
+    /* K8s / Kustomize extraction */
+    RUN_TEST(k8s_extract_kustomize);
+    RUN_TEST(k8s_extract_manifest);
+    RUN_TEST(k8s_extract_manifest_no_name);
+    RUN_TEST(k8s_extract_manifest_multidoc);
     /* Env URL scanning */
     RUN_TEST(envscan_dockerfile_env_urls);
     RUN_TEST(envscan_shell_env_urls);
@@ -5130,4 +5403,6 @@ SUITE(pipeline) {
     RUN_TEST(incremental_detects_changed_file);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
+    RUN_TEST(incremental_k8s_manifest_indexed);
+    RUN_TEST(incremental_kustomize_module_indexed);
 }

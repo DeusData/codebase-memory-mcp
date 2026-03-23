@@ -265,6 +265,18 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_log_info("pass.timing", "pass", "incr_semantic", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
 
+    /* k8s pass runs after semantic (vs. after definitions in the full pipeline) because
+     * incremental has no parallel extraction phase to position it alongside.
+     * Note: File→Resource DEFINES edges and cross-file kustomize IMPORTS edges are not
+     * emitted here — File nodes (from pass_structure) are absent in the incremental gbuf,
+     * and gbuf_find_by_qn only resolves nodes from changed files.  This is a known
+     * structural limitation of the incremental architecture. */
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    if (cbm_pipeline_pass_k8s(&ctx, changed_files, ci) != 0) {
+        cbm_log_info("incremental.warn", "msg", "k8s_pass_failed");
+    }
+    cbm_log_info("pass.timing", "pass", "incr_k8s", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+
     /* Merge new nodes/edges from gbuf into disk DB */
     int new_nodes = cbm_gbuf_node_count(gbuf);
     int new_edges = cbm_gbuf_edge_count(gbuf);

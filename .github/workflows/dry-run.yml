@@ -25,7 +25,7 @@ jobs:
     if: ${{ !inputs.skip_lint }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install build deps
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev cmake
@@ -37,7 +37,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang-format-20
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         id: cppcheck-cache
         with:
           path: /opt/cppcheck
@@ -64,7 +64,7 @@ jobs:
     if: ${{ !inputs.skip_lint }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: "Layer 1: Static allow-list audit"
         run: scripts/security-audit.sh
@@ -74,6 +74,79 @@ jobs:
 
       - name: "Layer 8: Vendored dependency integrity"
         run: scripts/security-vendored.sh
+
+  # ── Step 1c: CodeQL SAST gate ────────────────────────────────
+  codeql-gate:
+    if: ${{ !inputs.skip_lint }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for CodeQL on current commit (max 45 min)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CURRENT_SHA="${{ github.sha }}"
+          echo "Current commit: $CURRENT_SHA"
+          echo "Waiting for CodeQL to complete on this commit..."
+
+          for attempt in $(seq 1 90); do
+            LATEST=$(gh api repos/${{ github.repository }}/actions/workflows/codeql.yml/runs?per_page=5 \
+              --jq '.workflow_runs[] | select(.head_sha == "'"$CURRENT_SHA"'") | "\(.conclusion) \(.status)"' 2>/dev/null | head -1 || echo "")
+
+            if [ -z "$LATEST" ]; then
+              echo "  Attempt $attempt/90: No CodeQL run found for $CURRENT_SHA yet..."
+              sleep 30
+              continue
+            fi
+
+            CONCLUSION=$(echo "$LATEST" | cut -d' ' -f1)
+            STATUS=$(echo "$LATEST" | cut -d' ' -f2)
+
+            if [ "$STATUS" = "completed" ] && [ "$CONCLUSION" = "success" ]; then
+              echo "=== CodeQL completed successfully on current commit ==="
+              exit 0
+            elif [ "$STATUS" = "completed" ]; then
+              echo "BLOCKED: CodeQL completed with conclusion: $CONCLUSION"
+              exit 1
+            fi
+
+            echo "  Attempt $attempt/90: CodeQL status=$STATUS (waiting 30s)..."
+            sleep 30
+          done
+
+          echo "BLOCKED: CodeQL did not complete within 45 minutes"
+          exit 1
+
+      - name: Check for open code scanning alerts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Wait for GitHub to finish processing alert state changes.
+          # There is a race between CodeQL marking the workflow as "completed"
+          # and the alerts API reflecting new/closed alerts from that scan.
+          echo "Waiting 60s for alert API to settle after CodeQL completion..."
+          sleep 60
+
+          # Poll alerts twice with a gap to confirm the count is stable
+          ALERTS1=$(gh api 'repos/${{ github.repository }}/code-scanning/alerts?state=open' --jq 'length' 2>/dev/null || echo "0")
+          echo "Open alerts (check 1): $ALERTS1"
+          sleep 15
+          ALERTS2=$(gh api 'repos/${{ github.repository }}/code-scanning/alerts?state=open' --jq 'length' 2>/dev/null || echo "0")
+          echo "Open alerts (check 2): $ALERTS2"
+
+          # Use the higher count (conservative — if either check sees alerts, block)
+          ALERTS=$ALERTS2
+          if [ "$ALERTS1" -gt "$ALERTS2" ]; then
+            ALERTS=$ALERTS1
+          fi
+
+          if [ "$ALERTS" -gt 0 ]; then
+            echo "BLOCKED: $ALERTS open code scanning alert(s) found."
+            gh api 'repos/${{ github.repository }}/code-scanning/alerts?state=open' \
+              --jq '.[] | "  #\(.number) [\(.rule.security_severity_level // .rule.severity)] \(.rule.id) — \(.most_recent_instance.location.path):\(.most_recent_instance.location.start_line)"' 2>/dev/null || true
+            echo "Fix them: https://github.com/${{ github.repository }}/security/code-scanning"
+            exit 1
+          fi
+          echo "=== CodeQL gate passed (0 open alerts) ==="
 
   # ── Step 2: Unit tests (ASan + UBSan) ───────────────────────
   # macOS: use cc (Apple Clang) — GCC on macOS doesn't ship ASan runtime
@@ -104,7 +177,7 @@ jobs:
             cxx: c++
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install deps (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
@@ -118,9 +191,9 @@ jobs:
     needs: [lint]
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
         with:
           msystem: CLANG64
           path-type: inherit
@@ -163,13 +236,13 @@ jobs:
             cxx: c++
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install deps (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: "22"
 
@@ -178,8 +251,9 @@ jobs:
 
       - name: Archive standard binary
         run: |
+          cp LICENSE build/c/
           tar -czf codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
-            -C build/c codebase-memory-mcp
+            -C build/c codebase-memory-mcp LICENSE
 
       - name: Build UI binary
         run: scripts/build.sh --with-ui CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
@@ -190,10 +264,11 @@ jobs:
 
       - name: Archive UI binary
         run: |
+          cp LICENSE build/c/
           tar -czf codebase-memory-mcp-ui-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
-            -C build/c codebase-memory-mcp
+            -C build/c codebase-memory-mcp LICENSE
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
           path: "*.tar.gz"
@@ -203,9 +278,9 @@ jobs:
     needs: [test-unix, test-windows]
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
         with:
           msystem: CLANG64
           path-type: inherit
@@ -215,7 +290,7 @@ jobs:
             make
             zip
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: "22"
 
@@ -229,7 +304,7 @@ jobs:
           BIN=build/c/codebase-memory-mcp
           [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
           cp "$BIN" codebase-memory-mcp.exe
-          zip codebase-memory-mcp-windows-amd64.zip codebase-memory-mcp.exe
+          zip codebase-memory-mcp-windows-amd64.zip codebase-memory-mcp.exe LICENSE
 
       - name: Build UI binary
         shell: msys2 {0}
@@ -241,9 +316,9 @@ jobs:
           BIN=build/c/codebase-memory-mcp
           [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
           cp "$BIN" codebase-memory-mcp-ui.exe
-          zip codebase-memory-mcp-ui-windows-amd64.zip codebase-memory-mcp-ui.exe
+          zip codebase-memory-mcp-ui-windows-amd64.zip codebase-memory-mcp-ui.exe LICENSE
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binaries-windows-amd64
           path: "*.zip"
@@ -271,9 +346,9 @@ jobs:
         variant: [standard, ui]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
 
@@ -302,6 +377,37 @@ jobs:
         if: matrix.variant == 'standard' && matrix.goos == 'linux' && matrix.goarch == 'amd64'
         run: scripts/security-fuzz.sh ./codebase-memory-mcp
 
+      - name: Fuzz testing (60s random input)
+        if: matrix.variant == 'standard' && matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: scripts/security-fuzz-random.sh ./codebase-memory-mcp 60
+
+      - name: ClamAV scan (Linux)
+        if: matrix.variant == 'standard' && startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq clamav > /dev/null 2>&1
+          sudo sed -i 's/^Example/#Example/' /etc/clamav/freshclam.conf 2>/dev/null || true
+          grep -q "DatabaseMirror" /etc/clamav/freshclam.conf 2>/dev/null || \
+            echo "DatabaseMirror database.clamav.net" | sudo tee -a /etc/clamav/freshclam.conf > /dev/null
+          sudo freshclam --quiet
+          echo "=== ClamAV scan ==="
+          clamscan --no-summary ./codebase-memory-mcp
+          echo "=== ClamAV: clean ==="
+
+      - name: ClamAV scan (macOS)
+        if: matrix.variant == 'standard' && startsWith(matrix.os, 'macos')
+        run: |
+          brew install clamav > /dev/null 2>&1
+          CLAMAV_ETC=$(brew --prefix)/etc/clamav
+          if [ ! -f "$CLAMAV_ETC/freshclam.conf" ]; then
+            cp "$CLAMAV_ETC/freshclam.conf.sample" "$CLAMAV_ETC/freshclam.conf" 2>/dev/null || true
+            sed -i '' 's/^Example/#Example/' "$CLAMAV_ETC/freshclam.conf" 2>/dev/null || true
+            echo "DatabaseMirror database.clamav.net" >> "$CLAMAV_ETC/freshclam.conf"
+          fi
+          freshclam --quiet --no-warnings 2>/dev/null || freshclam --quiet 2>/dev/null || echo "WARNING: freshclam update failed, using bundled signatures"
+          echo "=== ClamAV scan (macOS) ==="
+          clamscan --no-summary ./codebase-memory-mcp
+          echo "=== ClamAV: clean ==="
+
   smoke-windows:
     if: ${{ !inputs.skip_builds }}
     needs: [build-windows]
@@ -311,9 +417,9 @@ jobs:
         variant: [standard, ui]
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
         with:
           msystem: CLANG64
           path-type: inherit
@@ -321,7 +427,7 @@ jobs:
             mingw-w64-clang-x86_64-python3
             unzip
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: binaries-windows-amd64
 
@@ -345,3 +451,17 @@ jobs:
         if: matrix.variant == 'standard'
         shell: msys2 {0}
         run: scripts/security-install.sh ./codebase-memory-mcp.exe
+
+      - name: Windows Defender scan
+        if: matrix.variant == 'standard'
+        shell: pwsh
+        run: |
+          Write-Host "=== Windows Defender scan (with ML heuristics) ==="
+          & "C:\Program Files\Windows Defender\MpCmdRun.exe" -SignatureUpdate 2>$null
+          $result = & "C:\Program Files\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File "$PWD\codebase-memory-mcp.exe" -DisableRemediation
+          Write-Host $result
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "BLOCKED: Windows Defender flagged the binary!"
+            exit 1
+          }
+          Write-Host "=== Windows Defender: clean ==="

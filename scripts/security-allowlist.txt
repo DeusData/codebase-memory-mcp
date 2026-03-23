@@ -4,14 +4,14 @@
 # Any call to a listed function in a .c file under src/ that is NOT on this
 # list causes the security audit (scripts/security-audit.sh) to fail.
 
-# ── Foundation: platform abstraction (defines cbm_popen wrapper) ───────────
+# ── Foundation: platform abstraction (defines cbm_popen wrapper + shell-free exec) ──
 src/foundation/compat_fs.c:popen:cbm_popen wrapper definition (POSIX)
 src/foundation/compat_fs.c:cbm_popen:cbm_popen function definition
+src/foundation/compat_fs.c:fork:cbm_exec_no_shell — fork+execvp for shell-free subprocess execution
+src/foundation/compat_fs.c:execvp:cbm_exec_no_shell — direct exec without shell interpretation
 
 # ── CLI: update command (user-initiated, interactive) ──────────────────────
 src/cli/cli.c:system:curl download of release binary (update cmd)
-src/cli/cli.c:system:unzip extraction on Windows (update cmd)
-src/cli/cli.c:system:version verification after update (update cmd)
 src/cli/cli.c:cbm_popen:sha256 checksum verification (update cmd)
 src/cli/cli.c:popen:sha256 checksum computation via shasum
 

@@ -11,6 +11,7 @@ Contributions are welcome. This guide covers setup, testing, and PR guidelines.
 ```bash
 git clone https://github.com/DeusData/codebase-memory-mcp.git
 cd codebase-memory-mcp
+git config core.hooksPath scripts/hooks  # activates pre-commit security checks
 scripts/build.sh
 ```
 
@@ -84,14 +85,45 @@ Language support is split between two layers:
 4. Add a test case in `tests/test_pipeline.c` for integration-level fixes
 5. Verify with a real open-source repo
 
+### Infrastructure Languages (Infra-Pass Pattern)
+
+Languages like **Dockerfile**, **docker-compose**, **Kubernetes manifests**, and **Kustomize** do not require a new tree-sitter grammar. Instead they follow an *infra-pass* pattern, reusing the existing tree-sitter YAML grammar where applicable:
+
+1. **Detection helpers** in `src/pipeline/pass_infrascan.c` — functions like `cbm_is_dockerfile()`, `cbm_is_k8s_manifest()`, `cbm_is_kustomize_file()` identify files by name and/or content heuristics (e.g., presence of `apiVersion:`).
+2. **Custom extractors** in `internal/cbm/extract_k8s.c` — tree-sitter-based parsers that walk the YAML AST (using the tree-sitter YAML grammar) and populate `CBMFileResult` with imports and definitions.
+3. **Pipeline pass** (`pass_k8s.c`, `pass_infrascan.c`) — calls the extractor and emits graph nodes/edges. K8s manifests emit `Resource` nodes; Kustomize files emit `Module` nodes with `IMPORTS` edges to referenced resource files.
+
+**When adding a new infrastructure language:**
+- Add a detection helper (`cbm_is_<lang>_file()`) in `pass_infrascan.c` or a new `pass_<lang>.c`.
+- Add the `CBM_LANG_<LANG>` enum value in `internal/cbm/cbm.h` and a row in the language table in `lang_specs.c`.
+- Write a custom extractor that returns `CBMFileResult*` — do not add a tree-sitter grammar.
+- Register the pass in `pipeline.c`.
+- Add tests in `tests/test_pipeline.c` following the `TEST(infra_is_dockerfile)` and `TEST(k8s_extract_manifest)` patterns.
+
+## Commit Format
+
+Use conventional commits: `type(scope): description`
+
+| Type | When to use |
+|------|-------------|
+| `feat` | New feature or capability |
+| `fix` | Bug fix |
+| `test` | Adding or updating tests |
+| `refactor` | Code change that neither fixes a bug nor adds a feature |
+| `perf` | Performance improvement |
+| `docs` | Documentation only |
+| `chore` | Build scripts, CI, dependency updates |
+
+Examples: `fix(store): set busy_timeout before WAL`, `feat(cli): add --progress flag`
+
 ## Pull Request Guidelines
 
+- **One issue per PR.** Each PR must address exactly one bug, one feature, or one refactor. Do not bundle multiple fixes or feature additions into a single PR. If your change touches multiple areas, split it into separate PRs.
+- **Open an issue first.** Every PR should reference a tracking issue (`Fixes #N` or `Closes #N`). This ensures the change is discussed before code is written.
 - **C code only** — this project was rewritten from Go to pure C in v0.5.0. Go PRs will be acknowledged and potentially ported, but cannot be merged directly.
-- One logical change per PR — don't bundle unrelated features
 - Include tests for new functionality
 - Run `scripts/test.sh` and `scripts/lint.sh` before submitting
 - Keep PRs focused — avoid unrelated reformatting or refactoring
-- Reference the issue number in your PR description
 
 ## Security
 

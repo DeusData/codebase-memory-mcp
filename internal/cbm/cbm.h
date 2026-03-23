@@ -75,6 +75,8 @@ typedef enum {
     CBM_LANG_FORM,
     CBM_LANG_MAGMA,
     CBM_LANG_WOLFRAM,
+    CBM_LANG_KUSTOMIZE, // kustomization.yaml — Kubernetes overlay tool
+    CBM_LANG_K8S,       // Generic Kubernetes manifest (apiVersion: detected)
     CBM_LANG_COUNT
 } CBMLanguage;
 
@@ -360,5 +362,8 @@ void cbm_extract_type_assigns(CBMExtractCtx *ctx);
 
 // Single-pass unified extraction (replaces the 7 calls above except defs+imports).
 void cbm_extract_unified(CBMExtractCtx *ctx);
+
+// K8s / Kustomize semantic extractor (called when language is CBM_LANG_K8S or CBM_LANG_KUSTOMIZE).
+void cbm_extract_k8s(CBMExtractCtx *ctx);
 
 #endif // CBM_H

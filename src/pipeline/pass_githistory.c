@@ -168,7 +168,8 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
 
         /* Diff parent_tree → tree to find changed files */
         git_diff *diff = NULL;
-        git_diff_options diff_opts = GIT_DIFF_OPTIONS_INIT;
+        git_diff_options diff_opts;
+        git_diff_options_init(&diff_opts, GIT_DIFF_OPTIONS_VERSION);
         if (git_diff_tree_to_tree(&diff, repo, parent_tree, tree, &diff_opts) == 0) {
             commit_t current = {0};
 

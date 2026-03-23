@@ -199,13 +199,7 @@ build_from_source() {
     echo "${BOLD}Building binary (this may take a minute)...${RESET}"
     mkdir -p "$INSTALL_DIR"
 
-    local build_flags=""
-    # Use -buildvcs=false in WSL (git metadata fails across filesystem boundaries)
-    if grep -qi microsoft /proc/version 2>/dev/null; then
-        build_flags="-buildvcs=false"
-    fi
-
-    (cd "$SOURCE_DIR" && CGO_ENABLED=1 go build $build_flags -o "${INSTALL_DIR}/${BINARY_NAME}" ./cmd/codebase-memory-mcp/)
+    (cd "$SOURCE_DIR" && scripts/build.sh && cp build/c/codebase-memory-mcp "${INSTALL_DIR}/${BINARY_NAME}")
 
     ok "Built and installed to ${INSTALL_DIR}/${BINARY_NAME}"
 }

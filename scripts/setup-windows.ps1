@@ -213,7 +213,7 @@ if ($FromSource) {
     Write-Host ""
     Write-Host "Building binary (this may take a minute)..." -ForegroundColor White
     $wslBinaryPath = "/home/$wslUser/.local/bin/$BinaryName"
-    Invoke-WSL "mkdir -p /home/$wslUser/.local/bin && cd $sourceDir && CGO_ENABLED=1 go build -buildvcs=false -o $wslBinaryPath ./cmd/codebase-memory-mcp/"
+    Invoke-WSL "mkdir -p /home/$wslUser/.local/bin && cd $sourceDir && scripts/build.sh && cp build/c/codebase-memory-mcp $wslBinaryPath"
     Write-Ok "Built to $wslBinaryPath (inside WSL)"
 
     # Verify

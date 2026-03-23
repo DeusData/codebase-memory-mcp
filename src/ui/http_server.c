@@ -274,6 +274,9 @@ static void handle_processes(struct mg_connection *c) {
                                 "\"elapsed\":\"%s\",\"command\":\"%s\",\"is_self\":%s}",
                                 pid, (double)cpu, (double)rss / 1024.0, elapsed, comm,
                                 pid == (int)getpid() ? "true" : "false");
+                if (pos >= (int)sizeof(buf)) {
+                    pos = (int)sizeof(buf) - 1;
+                }
                 proc_count++;
             }
         }
@@ -374,7 +377,7 @@ static void handle_browse(struct mg_connection *c, struct mg_http_message *hm) {
     char path[1024] = {0};
     if (!get_query_param(hm->query, "path", path, (int)sizeof(path)) || path[0] == '\0') {
         /* Default to home directory */
-        const char *home = getenv("HOME");
+        const char *home = cbm_get_home_dir();
         if (home)
             snprintf(path, sizeof(path), "%s", home);
         else
@@ -415,6 +418,9 @@ static void handle_browse(struct mg_connection *c, struct mg_http_message *hm) {
         if (count > 0)
             buf[pos++] = ',';
         pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "\"%s\"", ent->d_name);
+        if (pos >= (int)sizeof(buf)) {
+            pos = (int)sizeof(buf) - 1;
+        }
         count++;
 
         if (count >= 200)
@@ -446,9 +452,9 @@ static void handle_adr_get(struct mg_connection *c, struct mg_http_message *hm) 
         return;
     }
 
-    const char *home = getenv("HOME");
+    const char *home = cbm_get_home_dir();
     if (!home)
-        home = "/tmp";
+        home = cbm_tmpdir();
     char db_path[1024];
     snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home, name);
 
@@ -539,9 +545,9 @@ static void handle_adr_save(struct mg_connection *c, struct mg_http_message *hm)
     const char *proj = yyjson_get_str(v_proj);
     const char *content = yyjson_get_str(v_content);
 
-    const char *home = getenv("HOME");
+    const char *home = cbm_get_home_dir();
     if (!home)
-        home = "/tmp";
+        home = cbm_tmpdir();
     char db_path[1024];
     snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home, proj);
 
@@ -826,9 +832,9 @@ static void handle_delete_project(struct mg_connection *c, struct mg_http_messag
         return;
     }
 
-    const char *home = getenv("HOME"); // NOLINT(concurrency-mt-unsafe)
+    const char *home = cbm_get_home_dir();
     if (!home)
-        home = "/tmp";
+        home = cbm_tmpdir();
     char db_path[1024];
     snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home, name);
 
@@ -864,9 +870,9 @@ static void handle_project_health(struct mg_connection *c, struct mg_http_messag
         return;
     }
 
-    const char *home = getenv("HOME"); // NOLINT(concurrency-mt-unsafe)
+    const char *home = cbm_get_home_dir();
     if (!home)
-        home = "/tmp";
+        home = cbm_tmpdir();
     char db_path[1024];
     snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home, name);
 
@@ -922,9 +928,9 @@ static void handle_layout(struct mg_connection *c, struct mg_http_message *hm) {
     }
 
     /* Open a read-only store for this project */
-    const char *home = getenv("HOME"); // NOLINT(concurrency-mt-unsafe)
+    const char *home = cbm_get_home_dir();
     if (!home)
-        home = "/tmp";
+        home = cbm_tmpdir();
     char db_path[1024];
     snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home, project);
 
