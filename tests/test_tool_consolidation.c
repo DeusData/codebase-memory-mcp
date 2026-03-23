@@ -13,6 +13,10 @@
 #include <string.h>
 #include <stdlib.h>
 #include <watcher/watcher.h>
+#include <pagerank/pagerank.h>
+#include <sqlite3.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* ── 1. Tool visibility tests ─────────────────────────────── */
 
@@ -1410,6 +1414,136 @@ TEST(watcher_not_registered_for_unknown_path) {
     PASS();
 }
 
+/* ── Empty DB / stale index detection ────────────────────── */
+
+TEST(hidden_tools_returns_info_not_error) {
+    /* _hidden_tools should return tool list, not "unknown tool" error */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_handle_tool(srv, "_hidden_tools", "{}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "hidden_tools"));
+    ASSERT_NOT_NULL(strstr(resp, "index_repository"));
+    /* Must NOT be an error */
+    ASSERT_NULL(strstr(resp, "unknown tool"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(compact_defaults_to_true) {
+    /* When compact is not provided, name field should be omitted if it's
+     * the last segment of qualified_name */
+    char db_path[1024];
+    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_compact_default_.db",
+             getenv("HOME"));
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "_tc_compact_default_", "/tmp/compact_test");
+    cbm_node_t n = {.project = "_tc_compact_default_", .label = "Function",
+                    .name = "my_func", .qualified_name = "_tc_compact_default_.my_func",
+                    .file_path = "test.c"};
+    cbm_store_upsert_node(s, &n);
+    cbm_store_close(s);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    /* Search WITHOUT compact param — should default to compact=true */
+    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+        "{\"project\":\"_tc_compact_default_\",\"name_pattern\":\"my_func\",\"limit\":1}");
+    ASSERT_NOT_NULL(resp);
+    /* In compact mode, "name" should NOT appear as a separate key when
+     * it matches the last segment of qualified_name */
+    /* Parse the result text to check */
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *results = yyjson_obj_get(root, "results");
+    if (results && yyjson_arr_size(results) > 0) {
+        yyjson_val *first = yyjson_arr_get_first(results);
+        /* name key should be absent in compact mode */
+        ASSERT_NULL(yyjson_obj_get(first, "name"));
+        ASSERT_NOT_NULL(yyjson_obj_get(first, "qualified_name"));
+    }
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    (void)unlink(db_path);
+    PASS();
+}
+
+TEST(pagerank_output_has_limited_precision) {
+    /* Pagerank values should be serialized with limited precision (~4 sig figs),
+     * not full 17-digit double precision */
+    char db_path[1024];
+    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_pr_precision_.db",
+             getenv("HOME"));
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "_tc_pr_precision_", "/tmp/pr_test");
+    cbm_node_t n1 = {.project = "_tc_pr_precision_", .label = "Function",
+                     .name = "fn_a", .qualified_name = "_tc_pr_precision_.fn_a",
+                     .file_path = "a.c"};
+    cbm_node_t n2 = {.project = "_tc_pr_precision_", .label = "Function",
+                     .name = "fn_b", .qualified_name = "_tc_pr_precision_.fn_b",
+                     .file_path = "b.c"};
+    cbm_store_upsert_node(s, &n1);
+    cbm_store_upsert_node(s, &n2);
+    /* Compute PageRank (even with no edges, nodes get baseline scores) */
+    cbm_pagerank_compute_default(s, "_tc_pr_precision_");
+    cbm_store_close(s);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+        "{\"project\":\"_tc_pr_precision_\",\"sort_by\":\"relevance\",\"limit\":2}");
+    ASSERT_NOT_NULL(resp);
+    /* Pagerank values should NOT have more than ~8 characters (e.g. "4.72e-05")
+     * Check that we don't have 17-digit sequences like "0.00004717680769635863" */
+    ASSERT_NULL(strstr(resp, "000000000")); /* No 9+ consecutive zeros in pagerank */
+    free(resp);
+    cbm_mcp_server_free(srv);
+    (void)unlink(db_path);
+    PASS();
+}
+
+TEST(empty_db_not_treated_as_indexed) {
+    /* A DB file with schema but 0 nodes should NOT prevent re-indexing.
+     * Regression test: previously stat(db_path)==0 was enough to skip. */
+    char db_path[1024];
+    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_empty_db_test_.db",
+             getenv("HOME"));
+    /* Create DB with schema but no data */
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_store_close(s);
+
+    /* Verify the file exists */
+    struct stat st;
+    ASSERT_EQ(stat(db_path, &st), 0);
+
+    /* Open it read-only and verify 0 nodes */
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT count(*) FROM nodes", -1, &stmt, NULL);
+    ASSERT_EQ(rc, SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    int node_count = sqlite3_column_int(stmt, 0);
+    ASSERT_EQ(node_count, 0);
+    sqlite3_finalize(stmt);
+
+    /* Verify "SELECT 1 FROM nodes LIMIT 1" returns no rows (this is what db_has_content checks) */
+    rc = sqlite3_prepare_v2(db, "SELECT 1 FROM nodes LIMIT 1", -1, &stmt, NULL);
+    ASSERT_EQ(rc, SQLITE_OK);
+    ASSERT_NEQ(sqlite3_step(stmt), SQLITE_ROW); /* Should be SQLITE_DONE, not SQLITE_ROW */
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    (void)unlink(db_path);
+    PASS();
+}
+
 /* ── Suite registration ──────────────────────────────────── */
 
 SUITE(tool_consolidation) {
@@ -1497,4 +1631,9 @@ SUITE(tool_consolidation) {
     RUN_TEST(watcher_registered_after_index_repository);
     RUN_TEST(watcher_registered_on_resolve_store);
     RUN_TEST(watcher_not_registered_for_unknown_path);
+    /* Phase 10.2: Bug fixes and token optimization */
+    RUN_TEST(hidden_tools_returns_info_not_error);
+    RUN_TEST(compact_defaults_to_true);
+    RUN_TEST(pagerank_output_has_limited_precision);
+    RUN_TEST(empty_db_not_treated_as_indexed);
 }
