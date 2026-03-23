@@ -1,5 +1,5 @@
 /*
- * mcp.c — MCP server: JSON-RPC 2.0 over stdio with 14 graph tools.
+ * mcp.c — MCP server: JSON-RPC 2.0 over stdio with 15 graph tools.
  *
  * Uses yyjson for fast JSON parsing/building.
  * Single-threaded event loop: read line → parse → dispatch → respond.
@@ -329,6 +329,13 @@ static const tool_def_t TOOLS[] = {
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\",\"items\":{\"type\":"
      "\"object\"}},\"project\":{\"type\":"
      "\"string\"}},\"required\":[\"traces\",\"project\"]}"},
+
+    {"touch_project",
+     "Reset the adaptive poll timer for a project so the next watcher cycle "
+     "runs check_changes() immediately. Useful from git hooks or editor "
+     "save hooks to trigger reindex without waiting for the poll interval.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\","
+     "\"description\":\"Project name to touch\"}},\"required\":[\"project\"]}"},
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
@@ -2842,6 +2849,33 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+/* touch_project: reset adaptive backoff so next poll cycle is immediate. */
+static char *handle_touch_project(cbm_mcp_server_t *srv, const char *args) {
+    char *project = cbm_mcp_get_string_arg(args, "project");
+    if (!project) {
+        return cbm_mcp_text_result("project is required", true);
+    }
+    if (!srv->watcher) {
+        free(project);
+        return cbm_mcp_text_result("watcher not running", true);
+    }
+    cbm_watcher_touch(srv->watcher, project);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "project", project);
+    yyjson_mut_obj_add_str(doc, root, "status", "touched");
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    free(project);
+
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
@@ -2893,6 +2927,10 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     if (strcmp(tool_name, "ingest_traces") == 0) {
         return handle_ingest_traces(srv, args_json);
     }
+    if (strcmp(tool_name, "touch_project") == 0) {
+        return handle_touch_project(srv, args_json);
+    }
+
     char msg[256];
     snprintf(msg, sizeof(msg), "unknown tool: %s", tool_name);
     return cbm_mcp_text_result(msg, true);
