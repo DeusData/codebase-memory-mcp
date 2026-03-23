@@ -12,6 +12,7 @@
 #include <yyjson/yyjson.h>
 #include <string.h>
 #include <stdlib.h>
+#include <watcher/watcher.h>
 
 /* ── 1. Tool visibility tests ─────────────────────────────── */
 
@@ -1311,6 +1312,104 @@ TEST(get_code_cold_start_parses_project_from_qn) {
     PASS();
 }
 
+/* ── Watcher registration tests ──────────────────────────── */
+
+TEST(watcher_registered_after_index_repository) {
+    /* Create a tiny temp repo so indexing succeeds quickly */
+    char repo_path[] = "/tmp/cbm_watch_test_XXXXXX";
+    ASSERT_NOT_NULL(mkdtemp(repo_path));
+    char src_path[256];
+    snprintf(src_path, sizeof(src_path), "%s/test.c", repo_path);
+    FILE *f = fopen(src_path, "w");
+    if (f) { fprintf(f, "void hello(void) {}\n"); fclose(f); }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
+    ASSERT_NOT_NULL(w);
+    cbm_mcp_server_set_watcher(srv, w);
+
+    char args[512];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", repo_path);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+
+    ASSERT_TRUE(cbm_watcher_watch_count(w) > 0);
+
+    cbm_mcp_server_free(srv);
+    cbm_watcher_free(w);
+    (void)unlink(src_path);
+    (void)rmdir(repo_path);
+    PASS();
+}
+
+TEST(watcher_registered_on_resolve_store) {
+    /* Pre-populate a DB with a project that has a known root_path */
+    char db_path[1024];
+    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_watcher_.db",
+             getenv("HOME"));
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "_tc_watcher_", "/tmp/cbm_watcher_root");
+    cbm_node_t n = {.project = "_tc_watcher_", .label = "Function",
+                    .name = "watcher_fn", .qualified_name = "_tc_watcher_.watcher_fn",
+                    .file_path = "watcher_fn.c"};
+    cbm_store_upsert_node(s, &n);
+    cbm_store_close(s);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
+    ASSERT_NOT_NULL(w);
+    cbm_mcp_server_set_watcher(srv, w);
+
+    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+        "{\"project\":\"_tc_watcher_\",\"name_pattern\":\"watcher_fn\",\"limit\":1}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+
+    ASSERT_TRUE(cbm_watcher_watch_count(w) > 0);
+
+    cbm_mcp_server_free(srv);
+    cbm_watcher_free(w);
+    (void)unlink(db_path);
+    PASS();
+}
+
+TEST(watcher_not_registered_for_unknown_path) {
+    /* Project entry exists but root_path is empty — watcher must NOT be registered */
+    char db_path[1024];
+    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_watcher_nopath_.db",
+             getenv("HOME"));
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "_tc_watcher_nopath_", "");
+    cbm_node_t n = {.project = "_tc_watcher_nopath_", .label = "Function",
+                    .name = "nopath_fn", .qualified_name = "_tc_watcher_nopath_.nopath_fn",
+                    .file_path = "nopath_fn.c"};
+    cbm_store_upsert_node(s, &n);
+    cbm_store_close(s);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
+    ASSERT_NOT_NULL(w);
+    cbm_mcp_server_set_watcher(srv, w);
+
+    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+        "{\"project\":\"_tc_watcher_nopath_\",\"name_pattern\":\"nopath_fn\",\"limit\":1}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+
+    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+
+    cbm_mcp_server_free(srv);
+    cbm_watcher_free(w);
+    (void)unlink(db_path);
+    PASS();
+}
+
 /* ── Suite registration ──────────────────────────────────── */
 
 SUITE(tool_consolidation) {
@@ -1395,4 +1494,7 @@ SUITE(tool_consolidation) {
     RUN_TEST(get_code_no_project_uses_open_store_tier1);
     RUN_TEST(get_code_single_fuzzy_result_resolves_not_ambiguous);
     RUN_TEST(get_code_cold_start_parses_project_from_qn);
+    RUN_TEST(watcher_registered_after_index_repository);
+    RUN_TEST(watcher_registered_on_resolve_store);
+    RUN_TEST(watcher_not_registered_for_unknown_path);
 }
