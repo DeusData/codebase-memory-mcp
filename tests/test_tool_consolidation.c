@@ -455,6 +455,10 @@ TEST(resources_list_has_mimeType_and_description) {
     ASSERT_NOT_NULL(strstr(resp, "application/json"));
     ASSERT_NOT_NULL(strstr(resp, "description"));
     ASSERT_NOT_NULL(strstr(resp, "name"));
+    /* Resource descriptions should be actionable — tell AI when to read them */
+    ASSERT_NOT_NULL(strstr(resp, "Read this"));
+    ASSERT_NOT_NULL(strstr(resp, "Cypher"));  /* schema mentions Cypher */
+    ASSERT_NOT_NULL(strstr(resp, "PageRank")); /* architecture mentions PageRank */
     free(resp);
     cbm_mcp_server_free(srv);
     PASS();
@@ -602,7 +606,37 @@ TEST(no_initialize_defaults_to_legacy_behavior) {
     PASS();
 }
 
-/* ── 10. Error message quality tests ─────────────────────── */
+/* ── 10. Tool-resource cross-referencing tests ───────────── */
+
+TEST(tool_descriptions_reference_resources) {
+    /* Tool descriptions should tell the AI about available resources
+     * so it knows to read codebase://schema before writing Cypher, etc. */
+    char *json = cbm_mcp_tools_list(NULL);
+    ASSERT_NOT_NULL(json);
+    /* search_code_graph should mention schema and architecture resources */
+    ASSERT_NOT_NULL(strstr(json, "codebase://schema"));
+    ASSERT_NOT_NULL(strstr(json, "codebase://architecture"));
+    /* get_code should reference search_code_graph for qualified names */
+    ASSERT_NOT_NULL(strstr(json, "search_code_graph"));
+    free(json);
+    PASS();
+}
+
+TEST(hidden_tools_hint_mentions_resources) {
+    /* The _hidden_tools progressive disclosure hint should tell the AI
+     * about context resources so it can read them without enabling tools */
+    char *json = cbm_mcp_tools_list(NULL);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "_hidden_tools"));
+    /* Should mention all 3 resource URIs */
+    ASSERT_NOT_NULL(strstr(json, "codebase://schema"));
+    ASSERT_NOT_NULL(strstr(json, "codebase://architecture"));
+    ASSERT_NOT_NULL(strstr(json, "codebase://status"));
+    free(json);
+    PASS();
+}
+
+/* ── 11. Error message quality tests ─────────────────────── */
 
 TEST(error_no_project_loaded_has_hint) {
     /* search_graph with a nonexistent project name → resolve_store returns NULL
@@ -766,6 +800,9 @@ SUITE(tool_consolidation) {
     RUN_TEST(legacy_client_gets_context_only_on_first_call);
     RUN_TEST(empty_resources_capability_counts_as_support);
     RUN_TEST(no_initialize_defaults_to_legacy_behavior);
+    /* Tool descriptions reference resources */
+    RUN_TEST(tool_descriptions_reference_resources);
+    RUN_TEST(hidden_tools_hint_mentions_resources);
     /* Error message quality */
     RUN_TEST(error_no_project_loaded_has_hint);
     RUN_TEST(error_function_not_found_includes_name);
