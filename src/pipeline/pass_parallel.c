@@ -930,12 +930,15 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             }
             free(file_qn);
 
-            /* DEFINES_METHOD edge: Class → Method */
+            /* DEFINES_METHOD edge: Class → Method
+             * MEMBER_OF reverse edge: Method → Class (enables PageRank to
+             * propagate member importance back to the parent class) */
             if (def->parent_class && strcmp(def->label, "Method") == 0) {
                 const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(ctx->gbuf, def->parent_class);
                 if (parent && def_node) {
                     cbm_gbuf_insert_edge(ctx->gbuf, parent->id, def_node->id, "DEFINES_METHOD",
                                          "{}");
+                    cbm_gbuf_insert_edge(ctx->gbuf, def_node->id, parent->id, "MEMBER_OF", "{}");
                 }
             }
         }
