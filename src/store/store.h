@@ -117,6 +117,7 @@ typedef struct {
     const char *sort_by;          /* "relevance" / "name" / "degree", NULL = relevance */
     bool case_sensitive;
     const char **exclude_labels;  /* NULL-terminated array, or NULL */
+    const char **exclude_paths;   /* NULL-terminated array of glob patterns to exclude by file_path */
 } cbm_search_params_t;
 
 typedef struct {

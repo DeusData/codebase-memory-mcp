@@ -81,6 +81,10 @@ static void add_pagerank_val(yyjson_mut_doc *doc, yyjson_mut_val *obj, double v)
  * of inactivity to free SQLite memory during idle periods. */
 #define STORE_IDLE_TIMEOUT_S 60
 
+/* Config key: comma-separated glob patterns to exclude from key_functions.
+ * Set via: config set key_functions_exclude "scripts/,tools/,tests/" */
+#define CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE "key_functions_exclude"
+
 /* Directory permissions: rwxr-xr-x */
 #define ADR_DIR_PERMS 0755
 
@@ -295,7 +299,10 @@ static const tool_def_t TOOLS[] = {
      "name field when it matches the last segment of qualified_name. Reduces token usage.\"},"
      "\"include_dependencies\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Include "
      "indexed dependency symbols in results. Results from dependencies have source:dependency. "
-     "Default: false (only project code).\"}}}"},
+     "Default: false (only project code).\"},"
+     "\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Glob "
+     "patterns for file paths to exclude from results (e.g. [\\\"tests/**\\\",\\\"scripts/**\\\"])."
+     "\"}}}"},
 
     {"query_graph",
      "Execute a Cypher query against the knowledge graph for complex multi-hop patterns, "
@@ -322,7 +329,9 @@ static const tool_def_t TOOLS[] = {
      "callees_total/callers_total for truncation awareness.\"},\"compact\":{\"type\":\"boolean\","
      "\"default\":false,\"description\":"
      "\"Omit redundant name field. Saves tokens.\"},\"edge_types\":{\"type\":\"array\",\"items\":{"
-     "\"type\":\"string\"}}},\"required\":[\"function_name\"]}"},
+     "\"type\":\"string\"}},\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
+     "\"description\":\"Glob patterns for file paths to exclude from trace results."
+     "\"}},\"required\":[\"function_name\"]}"},
 
     {"get_code_snippet",
      "Get source code for a specific function, class, or symbol by qualified name. Use INSTEAD OF "
@@ -435,7 +444,9 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "\"max_output_bytes\":{\"type\":\"integer\",\"description\":\"Max response bytes (cypher mode). 0=unlimited.\"},"
      "\"relationship\":{\"type\":\"string\"},"
      "\"exclude_entry_points\":{\"type\":\"boolean\"},"
-     "\"include_connected\":{\"type\":\"boolean\"}"
+     "\"include_connected\":{\"type\":\"boolean\"},"
+     "\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
+     "\"description\":\"Glob patterns for file paths to exclude (e.g. [\\\"tests/**\\\",\\\"scripts/**\\\"])\"}"
      "}}"},
 
     {"trace_call_path",
@@ -450,7 +461,9 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "\"depth\":{\"type\":\"integer\",\"default\":3},"
      "\"max_results\":{\"type\":\"integer\"},"
      "\"compact\":{\"type\":\"boolean\"},"
-     "\"edge_types\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}"
+     "\"edge_types\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},"
+     "\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
+     "\"description\":\"Glob patterns for file paths to exclude from trace results\"}"
      "},\"required\":[\"function_name\"]}"},
 
     {"get_code",
@@ -614,12 +627,53 @@ bool cbm_mcp_get_bool_arg_default(const char *args_json, const char *key, bool d
     return result;
 }
 
+/* Extract a JSON array of strings from args. Returns heap-allocated
+ * NULL-terminated array of heap-allocated strings. Caller must free each
+ * string and the array itself. Returns NULL if key absent or not array. */
+static char **cbm_mcp_get_string_array_arg(const char *args_json, const char *key, int *out_count) {
+    if (out_count) *out_count = 0;
+    yyjson_doc *doc = yyjson_read(args_json, strlen(args_json), 0);
+    if (!doc) return NULL;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *arr = yyjson_obj_get(root, key);
+    if (!arr || !yyjson_is_arr(arr)) {
+        yyjson_doc_free(doc);
+        return NULL;
+    }
+    int n = (int)yyjson_arr_size(arr);
+    if (n == 0) {
+        yyjson_doc_free(doc);
+        return NULL;
+    }
+    char **result = calloc((size_t)(n + 1), sizeof(char *));
+    int count = 0;
+    yyjson_val *item;
+    yyjson_arr_iter iter = yyjson_arr_iter_with(arr);
+    while ((item = yyjson_arr_iter_next(&iter))) {
+        if (yyjson_is_str(item)) {
+            result[count++] = heap_strdup(yyjson_get_str(item));
+        }
+    }
+    result[count] = NULL;
+    if (out_count) *out_count = count;
+    yyjson_doc_free(doc);
+    return result;
+}
+
+static void free_string_array(char **arr) {
+    if (!arr) return;
+    for (int i = 0; arr[i]; i++) free(arr[i]);
+    free(arr);
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  MCP SERVER
  * ══════════════════════════════════════════════════════════════════ */
 
 /* Forward declarations for functions defined after first use */
 static void notify_resources_updated(cbm_mcp_server_t *srv);
+static char *build_key_functions_sql(const char *exclude_csv, const char **exclude_arr);
+char *cbm_glob_to_like(const char *pattern); /* store.c */
 
 struct cbm_mcp_server {
     cbm_store_t *store;        /* currently open project store (or NULL) */
@@ -1496,6 +1550,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     params.offset = offset;
     params.min_degree = min_degree;
     params.max_degree = max_degree;
+    int exclude_count = 0;
+    char **exclude = cbm_mcp_get_string_array_arg(args, "exclude", &exclude_count);
+    params.exclude_paths = (const char **)exclude;
 
     cbm_search_output_t out = {0};
     cbm_store_search(store, &params, &out);
@@ -1624,6 +1681,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     free(file_pattern);
     free(search_mode);
     free(sort_by);
+    free_string_array(exclude);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
@@ -1922,17 +1980,18 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_val(doc, root, "relationship_patterns", pats);
     }
 
-    /* Key functions: top 10 nodes by PageRank (most structurally important) */
+    /* Key functions: top 10 by PageRank with config + param exclude patterns */
     {
         sqlite3 *db = cbm_store_get_db(store);
         if (db) {
-            const char *kf_sql = project
-                ? "SELECT n.name, n.qualified_name, n.label, n.file_path, pr.rank "
-                  "FROM nodes n JOIN pagerank pr ON pr.node_id = n.id "
-                  "WHERE n.project = ?1 ORDER BY pr.rank DESC LIMIT 10"
-                : "SELECT n.name, n.qualified_name, n.label, n.file_path, pr.rank "
-                  "FROM nodes n JOIN pagerank pr ON pr.node_id = n.id "
-                  "ORDER BY pr.rank DESC LIMIT 10";
+            int excl_count = 0;
+            char **excl_arr = cbm_mcp_get_string_array_arg(args, "exclude", &excl_count);
+            const char *excl_csv = srv->config
+                ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "")
+                : "";
+            char *kf_sql_heap = build_key_functions_sql(excl_csv, (const char **)excl_arr);
+            free_string_array(excl_arr);
+            const char *kf_sql = kf_sql_heap;
             sqlite3_stmt *kf_stmt = NULL;
             if (sqlite3_prepare_v2(db, kf_sql, -1, &kf_stmt, NULL) == SQLITE_OK) {
                 if (project) sqlite3_bind_text(kf_stmt, 1, project, -1, SQLITE_TRANSIENT);
@@ -1954,6 +2013,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
                 sqlite3_finalize(kf_stmt);
                 yyjson_mut_obj_add_val(doc, root, "key_functions", kf_arr);
             }
+            free(kf_sql_heap);
         }
     }
 
@@ -3684,11 +3744,11 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
 /* Default file limit for auto-indexing new projects */
 #define DEFAULT_AUTO_INDEX_LIMIT 50000
 
-    /* Check auto_index config */
-    bool auto_index = false;
+    /* Check auto_index config (defaults to true so resources have data at startup) */
+    bool auto_index = true;
     int file_limit = DEFAULT_AUTO_INDEX_LIMIT;
     if (srv->config) {
-        auto_index = cbm_config_get_bool(srv->config, CBM_CONFIG_AUTO_INDEX, false);
+        auto_index = cbm_config_get_bool(srv->config, CBM_CONFIG_AUTO_INDEX, true);
         file_limit =
             cbm_config_get_int(srv->config, CBM_CONFIG_AUTO_INDEX_LIMIT, DEFAULT_AUTO_INDEX_LIMIT);
     }
@@ -3962,6 +4022,55 @@ static void build_resource_schema(yyjson_mut_doc *doc, yyjson_mut_val *root,
     cbm_store_schema_free(&schema);
 }
 
+/* CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE defined in constants section at top of file */
+
+/* Build a key_functions SQL query with optional exclude patterns.
+ * exclude_csv: comma-separated globs from config, or NULL.
+ * exclude_arr: NULL-terminated array from tool param, or NULL.
+ * Returns a heap-allocated SQL string. Caller must free. */
+static char *build_key_functions_sql(const char *exclude_csv,
+                                     const char **exclude_arr) {
+    char sql[4096];
+    int pos = 0;
+    pos += snprintf(sql + pos, sizeof(sql) - pos,
+        "SELECT n.name, n.qualified_name, n.label, n.file_path, pr.rank "
+        "FROM pagerank pr JOIN nodes n ON n.id = pr.node_id "
+        "WHERE pr.project = ?1 "
+        "AND n.label IN ('Function','Class','Method','Interface') ");
+
+    /* Apply config-based excludes (comma-separated globs) */
+    if (exclude_csv && exclude_csv[0]) {
+        char *csv_copy = heap_strdup(exclude_csv);
+        char *tok = strtok(csv_copy, ",");
+        while (tok && pos < (int)sizeof(sql) - 128) {
+            while (*tok == ' ') tok++; /* trim leading space */
+            char *like = cbm_glob_to_like(tok);
+            if (like) {
+                pos += snprintf(sql + pos, sizeof(sql) - pos,
+                    "AND n.file_path NOT LIKE '%s' ", like);
+                free(like);
+            }
+            tok = strtok(NULL, ",");
+        }
+        free(csv_copy);
+    }
+
+    /* Apply param-based excludes (array of globs) */
+    if (exclude_arr) {
+        for (int i = 0; exclude_arr[i] && pos < (int)sizeof(sql) - 128; i++) {
+            char *like = cbm_glob_to_like(exclude_arr[i]);
+            if (like) {
+                pos += snprintf(sql + pos, sizeof(sql) - pos,
+                    "AND n.file_path NOT LIKE '%s' ", like);
+                free(like);
+            }
+        }
+    }
+
+    snprintf(sql + pos, sizeof(sql) - pos, "ORDER BY pr.rank DESC LIMIT 10");
+    return heap_strdup(sql);
+}
+
 /* Build architecture resource content. */
 static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                         cbm_mcp_server_t *srv) {
@@ -3978,14 +4087,14 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
     yyjson_mut_obj_add_int(doc, root, "total_nodes", nodes);
     yyjson_mut_obj_add_int(doc, root, "total_edges", edges);
 
-    /* Key functions by PageRank (top 10) */
+    /* Key functions by PageRank (top 10), with config-driven exclude patterns */
     struct sqlite3 *db = cbm_store_get_db(store);
     if (db && proj) {
+        const char *excl_csv = srv->config
+            ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "")
+            : "";
+        char *sql = build_key_functions_sql(excl_csv, NULL);
         sqlite3_stmt *stmt = NULL;
-        const char *sql =
-            "SELECT n.name, n.qualified_name, n.label, n.file_path, pr.rank "
-            "FROM pagerank pr JOIN nodes n ON n.id = pr.node_id "
-            "WHERE pr.project = ?1 ORDER BY pr.rank DESC LIMIT 10";
         if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
             sqlite3_bind_text(stmt, 1, proj, -1, SQLITE_TRANSIENT);
             yyjson_mut_val *kf_arr = yyjson_mut_arr(doc);
@@ -4006,6 +4115,7 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
             yyjson_mut_obj_add_val(doc, root, "key_functions", kf_arr);
             sqlite3_finalize(stmt);
         }
+        free(sql);
     }
 
     /* Relationship patterns from schema */
