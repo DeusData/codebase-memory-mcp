@@ -3517,10 +3517,13 @@ static void send_notification(cbm_mcp_server_t *srv, const char *method) {
     }
 }
 
-/* Send notifications/resources/updated after index operations. */
+/* Send notifications/resources/list_changed after index operations.
+ * Per MCP spec: list_changed is for when the server's resource data changes
+ * (we declared listChanged:true in capabilities). notifications/resources/updated
+ * is only for per-resource subscriptions (we don't support subscribe). */
 static void notify_resources_updated(cbm_mcp_server_t *srv) {
     if (srv->client_has_resources)
-        send_notification(srv, "notifications/resources/updated");
+        send_notification(srv, "notifications/resources/list_changed");
 }
 
 /* Handle resources/list — return 3 resource URIs. */
@@ -3765,8 +3768,14 @@ static char *handle_resources_read(cbm_mcp_server_t *srv, const char *params_raw
         build_resource_status(doc, content_obj, srv);
     } else {
         yyjson_mut_doc_free(doc);
+        char msg[512];
+        snprintf(msg, sizeof(msg),
+            "Resource not found: '%s'. "
+            "Available resources: codebase://schema, codebase://architecture, codebase://status. "
+            "Use resources/list to discover all resources.",
+            uri);
         free(uri);
-        return cbm_jsonrpc_format_error(0, -32602, "Unknown resource URI");
+        return cbm_jsonrpc_format_error(0, -32002, msg);
     }
 
     /* Format as resources/read response: {contents: [{uri, mimeType, text}]} */
