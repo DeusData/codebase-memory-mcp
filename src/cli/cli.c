@@ -1832,21 +1832,92 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
     return rc;
 }
 
+/* ── Config registry ──────────────────────────────────────────── */
+
+const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
+    /* Indexing */
+    {"auto_index",          "true",  "CBM_AUTO_INDEX",          "Indexing", "Auto-index session project on startup"},
+    {"auto_index_limit",    "50000", "CBM_AUTO_INDEX_LIMIT",    "Indexing", "Max files for auto-indexing (skip larger repos)"},
+    {"reindex_on_startup",  "false", "CBM_REINDEX_ON_STARTUP",  "Indexing", "Re-index stale projects on restart"},
+    {"reindex_stale_seconds","0",    NULL,                       "Indexing", "Max DB age in seconds before stale (0=disabled)"},
+    /* Search */
+    {"search_limit",        "50",    NULL, "Search",  "Default max results for search_code_graph"},
+    {"trace_max_results",   "25",    NULL, "Search",  "Default max nodes per direction in trace_call_path"},
+    {"query_max_output_bytes","32768",NULL, "Search", "Max output bytes for query_graph (0=unlimited)"},
+    {"snippet_max_lines",   "200",   NULL, "Search",  "Max source lines in get_code_snippet (0=unlimited)"},
+    {"key_functions_exclude","",     "CBM_KEY_FUNCTIONS_EXCLUDE","Search", "Comma-separated globs to exclude from key_functions"},
+    /* Tools */
+    {"tool_mode",           "streamlined","CBM_TOOL_MODE", "Tools", "Tool visibility: streamlined (3 tools) or classic (15)"},
+    /* PageRank */
+    {"pagerank_max_iter",   "20",    NULL, "PageRank", "Max power iterations for PageRank convergence"},
+    {"rank_scope",          "project",NULL,"PageRank", "PageRank scope: project or global"},
+    {"edge_weight_calls",         "1.0", NULL, "PageRank", "Edge weight for CALLS relationships"},
+    {"edge_weight_defines_method","0.8", NULL, "PageRank", "Edge weight for DEFINES_METHOD"},
+    {"edge_weight_defines",       "0.5", NULL, "PageRank", "Edge weight for DEFINES"},
+    {"edge_weight_imports",       "0.3", NULL, "PageRank", "Edge weight for IMPORTS"},
+    {"edge_weight_usage",         "0.2", NULL, "PageRank", "Edge weight for USAGE"},
+    {"edge_weight_configures",    "0.1", NULL, "PageRank", "Edge weight for CONFIGURES"},
+    {"edge_weight_http_calls",    "0.5", NULL, "PageRank", "Edge weight for HTTP_CALLS"},
+    {"edge_weight_async_calls",   "0.8", NULL, "PageRank", "Edge weight for ASYNC_CALLS"},
+    {"edge_weight_default",       "0.3", NULL, "PageRank", "Edge weight for unknown edge types"},
+    /* Dependencies */
+    {"auto_index_deps",     "true",  NULL, "Dependencies", "Auto-index installed packages (from package.json, Cargo.toml, etc.)"},
+    {"auto_dep_limit",      "20",    NULL, "Dependencies", "Max packages to index (e.g. 20 = top 20 deps like numpy, express)"},
+    {"dep_max_files",       "1000",  NULL, "Dependencies", "Max source files per package (large packages truncated, 0=unlimited)"},
+    {NULL, NULL, NULL, NULL, NULL} /* sentinel */
+};
+
+/* Get config value with env var override priority: env > db > default.
+ * Looks up the registry entry for the key to find the env var name. */
+const char *cbm_config_get_effective(cbm_config_t *cfg, const char *key, const char *default_val) {
+    /* Check env var override first */
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, key) == 0 && CBM_CONFIG_REGISTRY[i].env_var) {
+            // NOLINTNEXTLINE(concurrency-mt-unsafe)
+            const char *env = getenv(CBM_CONFIG_REGISTRY[i].env_var);
+            if (env && env[0]) return env;
+            break;
+        }
+    }
+    /* Fall back to DB value or default */
+    return cbm_config_get(cfg, key, default_val);
+}
+
 /* ── Config CLI subcommand ────────────────────────────────────── */
 
 int cbm_cmd_config(int argc, char **argv) {
     if (argc == 0) {
         printf("Usage: codebase-memory-mcp config <command> [args]\n\n");
         printf("Commands:\n");
-        printf("  list             Show all config values\n");
-        printf("  get <key>        Get a config value\n");
+        printf("  list             Show all config values (with env overrides)\n");
+        printf("  get <key>        Get effective value (env > db > default)\n");
         printf("  set <key> <val>  Set a config value\n");
         printf("  reset <key>      Reset a key to default\n\n");
+        printf("Storage: ~/.cache/codebase-memory-mcp/_config.db\n");
+        printf("Priority: environment variable > config set > default\n\n");
+        printf("Examples:\n");
+        printf("  codebase-memory-mcp config set auto_index false\n");
+        printf("  codebase-memory-mcp config set key_functions_exclude \"scripts/**,tests/**\"\n");
+        printf("  CBM_AUTO_INDEX=false codebase-memory-mcp   # env override for one run\n");
+        printf("  export CBM_TOOL_MODE=classic               # env override for session\n\n");
+        /* Print keys grouped by category with env var info */
         printf("Config keys:\n");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX, "false",
-               "Enable auto-indexing on MCP session start");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX_LIMIT, "50000",
-               "Max files for auto-indexing new projects");
+        const char *last_cat = "";
+        for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+            const cbm_config_entry_t *e = &CBM_CONFIG_REGISTRY[i];
+            if (strcmp(e->category, last_cat) != 0) {
+                if (i > 0) printf("\n");
+                printf("  [%s]\n", e->category);
+                last_cat = e->category;
+            }
+            if (e->env_var) {
+                printf("  %-28s default=%-8s %s [env: %s]\n",
+                    e->key, e->default_val, e->description, e->env_var);
+            } else {
+                printf("  %-28s default=%-8s %s\n",
+                    e->key, e->default_val, e->description);
+            }
+        }
         return 0;
     }
 
@@ -1868,17 +1939,42 @@ int cbm_cmd_config(int argc, char **argv) {
 
     int rc = 0;
     if (strcmp(argv[0], "list") == 0 || strcmp(argv[0], "ls") == 0) {
-        printf("Configuration:\n");
-        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX, "false"));
-        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX_LIMIT,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "50000"));
+        const char *last_cat = "";
+        for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+            const cbm_config_entry_t *e = &CBM_CONFIG_REGISTRY[i];
+            /* Print category header when it changes */
+            if (strcmp(e->category, last_cat) != 0) {
+                if (i > 0) printf("\n");
+                printf("[%s]\n", e->category);
+                last_cat = e->category;
+            }
+            const char *val = cbm_config_get_effective(cfg, e->key, e->default_val);
+            /* Check if env var is active */
+            const char *source = "";
+            if (e->env_var) {
+                // NOLINTNEXTLINE(concurrency-mt-unsafe)
+                const char *env = getenv(e->env_var);
+                if (env && env[0]) source = " (env)";
+            }
+            /* Check if DB value differs from default */
+            const char *db_val = cbm_config_get(cfg, e->key, NULL);
+            if (!source[0] && db_val) source = " (set)";
+            printf("  %-28s = %-12s%s\n", e->key, val, source);
+        }
     } else if (strcmp(argv[0], "get") == 0) {
         if (argc < 2) {
             fprintf(stderr, "Usage: config get <key>\n");
             rc = 1;
         } else {
-            printf("%s\n", cbm_config_get(cfg, argv[1], ""));
+            /* Find default from registry */
+            const char *def = "";
+            for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+                if (strcmp(CBM_CONFIG_REGISTRY[i].key, argv[1]) == 0) {
+                    def = CBM_CONFIG_REGISTRY[i].default_val;
+                    break;
+                }
+            }
+            printf("%s\n", cbm_config_get_effective(cfg, argv[1], def));
         }
     } else if (strcmp(argv[0], "set") == 0) {
         if (argc < 3) {

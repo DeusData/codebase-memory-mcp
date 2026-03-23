@@ -234,6 +234,23 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key);
 #define CBM_CONFIG_AUTO_INDEX "auto_index"
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
 
+/* ── Config registry (all known keys, defaults, env overrides) ── */
+
+typedef struct {
+    const char *key;          /* config key name */
+    const char *default_val;  /* default value as string */
+    const char *env_var;      /* env var override name, NULL if none */
+    const char *category;     /* display category for config list */
+    const char *description;  /* one-line description */
+} cbm_config_entry_t;
+
+/* All known config keys. Defined in cli.c. NULL-terminated. */
+extern const cbm_config_entry_t CBM_CONFIG_REGISTRY[];
+
+/* Get config value with env var override: env > db > default.
+ * Returns pointer valid until next call (static buffer). */
+const char *cbm_config_get_effective(cbm_config_t *cfg, const char *key, const char *default_val);
+
 /* ── Subcommands (wired from main.c) ─────────────────────────── */
 
 /* install: copy binary, install skills, install editor MCP configs, ensure PATH.
