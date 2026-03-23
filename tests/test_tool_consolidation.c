@@ -869,10 +869,16 @@ TEST(resource_status_returns_not_indexed_when_no_store) {
 TEST(dep_search_explicit_dep_project_name) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
+    /* Use unique name to avoid creating DB files that interfere with other tests */
     char *r = cbm_mcp_handle_tool(srv, "search_graph",
-        "{\"project\":\"nonexistent.dep.pandas\",\"name_pattern\":\".*\",\"limit\":1}");
+        "{\"project\":\"_tc_deptest_proj_.dep.pandas\",\"name_pattern\":\".*\",\"limit\":1}");
     ASSERT_NOT_NULL(r);
     free(r);
+    /* Clean up any DB file that resolve_store may have created */
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/.cache/codebase-memory-mcp/_tc_deptest_proj_.db",
+             getenv("HOME"));
+    (void)unlink(path);
     cbm_mcp_server_free(srv);
     PASS();
 }
