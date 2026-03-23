@@ -115,7 +115,9 @@ static int git_head(const char *root_path, char *out, size_t out_size) {
     return -1;
 }
 
-/* Returns true if working tree has changes (modified, untracked, etc.) */
+/* Returns true if working tree has changes (modified, untracked, etc.).
+ * Also checks submodules via `git submodule foreach` to detect uncommitted
+ * changes inside submodules that `git status` alone would not report. */
 static bool git_is_dirty(const char *root_path) {
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
@@ -132,6 +134,34 @@ static bool git_is_dirty(const char *root_path) {
     bool dirty = false;
     if (fgets(line, sizeof(line), fp)) {
         /* Any output means changes */
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len > 0) {
+            dirty = true;
+        }
+    }
+    cbm_pclose(fp);
+
+    if (dirty) {
+        return true;
+    }
+
+    /* Check submodules: uncommitted changes inside a submodule are invisible
+     * to the parent's `git status` unless --recurse-submodules is supported.
+     * Use `git submodule foreach` as a portable fallback. */
+    snprintf(cmd, sizeof(cmd),
+             "git --no-optional-locks -C '%s' submodule foreach --quiet --recursive "
+             "'git status --porcelain --untracked-files=normal 2>/dev/null' "
+             "2>/dev/null",
+             root_path);
+    // NOLINTNEXTLINE(bugprone-command-processor,cert-env33-c)
+    fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return false;
+    }
+    if (fgets(line, sizeof(line), fp)) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
             line[--len] = '\0';
@@ -256,15 +286,17 @@ void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name) {
     }
 }
 
-void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name) {
+bool cbm_watcher_touch(cbm_watcher_t *w, const char *project_name) {
     if (!w || !project_name) {
-        return;
+        return false;
     }
     project_state_t *s = cbm_ht_get(w->projects, project_name);
     if (s) {
         /* Reset backoff — poll immediately on next cycle */
         s->next_poll_ns = 0;
+        return true;
     }
+    return false;
 }
 
 int cbm_watcher_watch_count(const cbm_watcher_t *w) {

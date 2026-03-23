@@ -406,6 +406,7 @@ static const char skill_reference_content[] =
     "- `delete_project` — remove a project\n"
     "- `manage_adr` — architecture decision records\n"
     "- `ingest_traces` — import runtime traces\n"
+    "- `touch_project` — reset poll timer for on-demand reindex\n"
     "\n"
     "## Edge Types\n"
     "CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD,\n"

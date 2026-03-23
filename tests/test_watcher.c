@@ -229,7 +229,8 @@ TEST(watcher_stop_flag) {
 
 TEST(watcher_detects_git_commit) {
     /* Create a temporary git repo */
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_test_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_test_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
@@ -282,7 +283,8 @@ TEST(watcher_detects_git_commit) {
 
 TEST(watcher_detects_dirty_worktree) {
     /* Create a temporary git repo */
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_dirty_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_dirty_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
@@ -326,7 +328,8 @@ TEST(watcher_detects_dirty_worktree) {
 
 TEST(watcher_detects_new_file) {
     /* Create a temporary git repo */
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_newf_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_newf_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
@@ -371,7 +374,8 @@ TEST(watcher_detects_new_file) {
 
 TEST(watcher_no_change_no_reindex) {
     /* Create a temporary git repo */
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_nochg_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_nochg_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
@@ -414,8 +418,10 @@ TEST(watcher_no_change_no_reindex) {
 
 TEST(watcher_multiple_projects) {
     /* Create two temporary git repos */
-    char tmpdirA[256]; snprintf(tmpdirA, sizeof(tmpdirA), "/tmp/cbm_watcher_mA_XXXXXX");
-    char tmpdirB[256]; snprintf(tmpdirB, sizeof(tmpdirB), "/tmp/cbm_watcher_mB_XXXXXX");
+    char tmpdirA[256];
+    snprintf(tmpdirA, sizeof(tmpdirA), "/tmp/cbm_watcher_mA_XXXXXX");
+    char tmpdirB[256];
+    snprintf(tmpdirB, sizeof(tmpdirB), "/tmp/cbm_watcher_mB_XXXXXX");
     if (!cbm_mkdtemp(tmpdirA) || !cbm_mkdtemp(tmpdirB))
         SKIP("cbm_mkdtemp failed");
 
@@ -475,7 +481,8 @@ TEST(watcher_multiple_projects) {
 TEST(watcher_non_git_skips) {
     /* Non-git dir → baseline sets is_git=false → poll never reindexes.
      * Port of TestProbeStrategyNonGit behavior. */
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_nongit_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_nongit_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
@@ -524,7 +531,8 @@ TEST(watcher_interval_blocks_repoll) {
     /* After baseline, the adaptive interval (5s minimum) should block
      * immediate re-polling. Without touch(), the next poll is a no-op.
      * Port of TestWatcherGitNoChanges' interval behavior. */
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_intv_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_intv_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
@@ -598,7 +606,8 @@ TEST(watcher_git_removed_no_crash) {
     /* Init git repo, baseline, remove .git, poll → should not crash.
      * Port of TestStrategyDowngradeGitToDirMtime behavior (C version
      * doesn't downgrade — just git commands fail silently). */
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_rmgit_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_rmgit_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
@@ -643,7 +652,8 @@ TEST(watcher_git_removed_no_crash) {
 TEST(watcher_continued_dirty) {
     /* If working tree stays dirty, each poll should re-trigger reindex.
      * Port of repeated git sentinel detection behavior. */
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_cont_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_cont_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
@@ -711,7 +721,8 @@ TEST(watcher_continued_dirty) {
 TEST(watcher_baseline_dirty_repo) {
     /* Baseline on a repo that already has uncommitted changes.
      * Port of TestGitSentinelDetectsEdit (dirty from the start). */
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_bld_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_bld_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
@@ -755,7 +766,8 @@ TEST(watcher_baseline_dirty_repo) {
 TEST(watcher_unwatch_prunes_state) {
     /* Watch, baseline, unwatch → project state removed.
      * Port of TestPollAllPrunesUnwatched + TestWatcherPrunesDeletedProjects. */
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_prune_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_prune_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
@@ -801,7 +813,8 @@ TEST(watcher_unwatch_prunes_state) {
 TEST(watcher_watch_after_unwatch) {
     /* Re-watching after unwatch should start fresh (new baseline).
      * Tests lifecycle correctness. */
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_rewatch_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_rewatch_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
@@ -862,7 +875,8 @@ TEST(watcher_watch_after_unwatch) {
 TEST(watcher_detects_file_delete) {
     /* Port of TestFSNotifyDetectsFileDelete:
      * Delete a tracked file → git status shows change → reindex triggered. */
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_del_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_del_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
@@ -907,7 +921,8 @@ TEST(watcher_detects_file_delete) {
 TEST(watcher_detects_subdir_file) {
     /* Port of TestFSNotifyWatchesNewSubdir:
      * Create new subdir + file in it → git detects untracked → reindex. */
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_sub_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_sub_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
@@ -978,7 +993,8 @@ TEST(watcher_full_flow_new_file) {
      * Full lifecycle: watch → baseline → add file → detect change.
      * This is a more thorough version of watcher_detects_new_file
      * that mirrors the Go test's structure exactly. */
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_ffnf_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_ffnf_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
@@ -1028,7 +1044,8 @@ TEST(watcher_fallback_still_detects) {
      * Even when the "primary" strategy has issues, the watcher
      * still detects changes. In C, we test that after removing .git
      * and re-creating it, changes are still detected on re-watch. */
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_fb_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_fb_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
@@ -1086,8 +1103,10 @@ TEST(watcher_poll_only_watched_projects) {
     /* Port of TestPollAllOnlyWatched:
      * Two repos exist, only one is watched → only the watched one
      * gets polled and can trigger reindex. */
-    char tmpdirA[256]; snprintf(tmpdirA, sizeof(tmpdirA), "/tmp/cbm_watcher_owA_XXXXXX");
-    char tmpdirB[256]; snprintf(tmpdirB, sizeof(tmpdirB), "/tmp/cbm_watcher_owB_XXXXXX");
+    char tmpdirA[256];
+    snprintf(tmpdirA, sizeof(tmpdirA), "/tmp/cbm_watcher_owA_XXXXXX");
+    char tmpdirB[256];
+    snprintf(tmpdirB, sizeof(tmpdirB), "/tmp/cbm_watcher_owB_XXXXXX");
     if (!cbm_mkdtemp(tmpdirA) || !cbm_mkdtemp(tmpdirB))
         SKIP("cbm_mkdtemp failed");
 
@@ -1145,7 +1164,8 @@ TEST(watcher_touch_resets_immediate) {
     /* Port of TestTouchProjectUpdatesTimestamp:
      * Verify that touch() resets the adaptive backoff so the next
      * poll actually checks for changes immediately. */
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_tch_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_tch_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
@@ -1195,7 +1215,8 @@ TEST(watcher_modify_tracked_file) {
      * Modify tracked file content (not just create/delete) → detected.
      * Similar to watcher_detects_dirty_worktree but modifies specific
      * tracked file content rather than appending. */
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_mod_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_mod_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
@@ -1233,6 +1254,134 @@ TEST(watcher_modify_tracked_file) {
     cbm_watcher_touch(w, "mod-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
+    system(cmd);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  SUBMODULE DETECTION + TOUCH RESET
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(watcher_detects_submodule_dirty) {
+    /* Verify that the watcher detects uncommitted changes inside a git
+     * submodule even when the parent's git status ignores submodule dirty
+     * state (ignore=dirty in .gitmodules). The submodule foreach second
+     * stage in git_is_dirty() is the only detection mechanism here. */
+    char parent[256], submod[256];
+    snprintf(submod, sizeof(submod), "/tmp/cbm_watcher_submod_sub_XXXXXX");
+    snprintf(parent, sizeof(parent), "/tmp/cbm_watcher_submod_par_XXXXXX");
+    if (!cbm_mkdtemp(submod) || !cbm_mkdtemp(parent))
+        SKIP("cbm_mkdtemp failed");
+
+    char cmd[1024];
+
+    /* Init the submodule repo */
+    snprintf(cmd, sizeof(cmd),
+             "cd '%s' && git init -q && git config user.email test@test && "
+             "git config user.name test && echo 'hello' > lib.c && "
+             "git add lib.c && git commit -q -m 'init submod'",
+             submod);
+    if (system(cmd) != 0) {
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s' '%s'", submod, parent);
+        system(cmd);
+        SKIP("git not available");
+    }
+
+    /* Init parent repo, add submodule, and set ignore=dirty so that the
+     * parent's git status --porcelain does NOT report submodule working-tree
+     * changes. This isolates the submodule foreach second stage. */
+    snprintf(cmd, sizeof(cmd),
+             "cd '%s' && git init -q && git config user.email test@test && "
+             "git config user.name test && "
+             "git -c protocol.file.allow=always submodule add '%s' sub 2>/dev/null && "
+             "git config -f .gitmodules submodule.sub.ignore dirty && "
+             "git add -A && git commit -q -m 'init parent with submod (ignore=dirty)'",
+             parent, submod);
+    if (system(cmd) != 0) {
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s' '%s'", submod, parent);
+        system(cmd);
+        SKIP("git submodule add not available");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "par-repo", parent);
+    index_call_count = 0;
+
+    /* Baseline */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    /* Make an uncommitted change inside the submodule (not committed to submod) */
+    snprintf(cmd, sizeof(cmd), "echo 'modified' >> '%s/sub/lib.c'", parent);
+    system(cmd);
+
+    /* Touch + poll → submodule foreach should detect the dirty submodule */
+    cbm_watcher_touch(w, "par-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    /* Cleanup */
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s' '%s'", parent, submod);
+    system(cmd);
+    PASS();
+}
+
+TEST(watcher_touch_resets_interval_dedicated) {
+    /* Dedicated test: cbm_watcher_touch() resets next_poll_ns=0 so the
+     * next poll_once() immediately checks for changes instead of waiting
+     * for the adaptive interval to expire. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_tchd_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "cd '%s' && git init -q && git config user.email test@test && "
+             "git config user.name test && echo 'hello' > file.txt && "
+             "git add file.txt && git commit -q -m 'init'",
+             tmpdir);
+    if (system(cmd) != 0) {
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
+        system(cmd);
+        SKIP("git not available");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "tchd-repo", tmpdir);
+    index_call_count = 0;
+
+    /* Baseline */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    /* Make repo dirty */
+    snprintf(cmd, sizeof(cmd), "echo 'dirty' >> '%s/file.txt'", tmpdir);
+    system(cmd);
+
+    /* Poll without touch — interval blocks (adaptive backoff not yet elapsed) */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0); /* blocked by interval */
+
+    /* Touch resets timer — next poll proceeds immediately */
+    cbm_watcher_touch(w, "tchd-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1); /* detected */
+
+    /* Make more changes, touch again — still works */
+    snprintf(cmd, sizeof(cmd), "echo 'more dirt' >> '%s/file.txt'", tmpdir);
+    system(cmd);
+    cbm_watcher_touch(w, "tchd-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2);
 
     cbm_watcher_free(w);
     cbm_store_close(store);
@@ -1295,4 +1444,8 @@ SUITE(watcher) {
     RUN_TEST(watcher_poll_only_watched_projects);
     RUN_TEST(watcher_touch_resets_immediate);
     RUN_TEST(watcher_modify_tracked_file);
+
+    /* Submodule detection + touch reset */
+    RUN_TEST(watcher_detects_submodule_dirty);
+    RUN_TEST(watcher_touch_resets_interval_dedicated);
 }
