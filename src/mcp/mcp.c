@@ -1335,12 +1335,17 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     char *raw_project = cbm_mcp_get_string_arg(args, "project");
     project_expand_t pe = expand_project_param(srv, raw_project);
 
-    /* DB selection: if session_project is set and expanded value starts with it,
-     * use session store. Otherwise pass expanded value to resolve_store (opens .db). */
+    /* DB selection: if expanded value IS the session project or a dep of it
+     * (session.dep.X), use session store. Otherwise open the requested project's DB.
+     * The check requires the char after session_project to be '.' or '\0' to avoid
+     * prefix collisions (e.g., "myapp" matching "myapp-other-project"). */
     const char *db_project = pe.value; /* default: pass through to resolve_store */
-    if (pe.value && srv->session_project[0] &&
-        strncmp(pe.value, srv->session_project, strlen(srv->session_project)) == 0) {
-        db_project = srv->session_project; /* deps are in session db */
+    if (pe.value && srv->session_project[0]) {
+        size_t sp_len = strlen(srv->session_project);
+        if (strncmp(pe.value, srv->session_project, sp_len) == 0 &&
+            (pe.value[sp_len] == '.' || pe.value[sp_len] == '\0')) {
+            db_project = srv->session_project; /* deps are in session db */
+        }
     }
     cbm_store_t *store = resolve_store(srv, db_project);
     /* Auto-index on first use — same logic as REQUIRE_STORE macro.
