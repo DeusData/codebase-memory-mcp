@@ -129,7 +129,7 @@ TEST(mcp_initialize_response) {
 TEST(mcp_tools_list) {
     char *json = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(json);
-    /* Should contain all 14 tools */
+    /* Should contain all 15 tools */
     ASSERT_NOT_NULL(strstr(json, "index_repository"));
     ASSERT_NOT_NULL(strstr(json, "search_graph"));
     ASSERT_NOT_NULL(strstr(json, "query_graph"));
@@ -144,6 +144,7 @@ TEST(mcp_tools_list) {
     ASSERT_NOT_NULL(strstr(json, "detect_changes"));
     ASSERT_NOT_NULL(strstr(json, "manage_adr"));
     ASSERT_NOT_NULL(strstr(json, "ingest_traces"));
+    ASSERT_NOT_NULL(strstr(json, "touch_project"));
     free(json);
     PASS();
 }
@@ -702,6 +703,38 @@ TEST(tool_ingest_traces_empty) {
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "accepted"));
     free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  TOUCH PROJECT
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(mcp_touch_project_no_watcher) {
+    /* When watcher is NULL (CLI mode), touch_project returns "watcher not running"
+     * error rather than crashing. */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    /* srv->watcher is NULL by default */
+
+    char *result = cbm_mcp_handle_tool(srv, "touch_project", "{\"project\":\"x\"}");
+    ASSERT_NOT_NULL(result);
+    ASSERT_NOT_NULL(strstr(result, "watcher not running"));
+    free(result);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(mcp_touch_project_missing_arg) {
+    /* touch_project without project arg returns "project is required" error. */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+
+    char *result = cbm_mcp_handle_tool(srv, "touch_project", "{}");
+    ASSERT_NOT_NULL(result);
+    ASSERT_NOT_NULL(strstr(result, "project is required"));
+    free(result);
 
     cbm_mcp_server_free(srv);
     PASS();
@@ -1716,6 +1749,10 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
     RUN_TEST(tool_ingest_traces_basic);
     RUN_TEST(tool_ingest_traces_empty);
+
+    /* touch_project */
+    RUN_TEST(mcp_touch_project_no_watcher);
+    RUN_TEST(mcp_touch_project_missing_arg);
 
     /* Idle store eviction */
     RUN_TEST(store_idle_eviction);
