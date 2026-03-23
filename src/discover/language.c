@@ -257,6 +257,15 @@ static const ext_entry_t EXT_TABLE[] = {
 
     /* Zig */
     {".zig", CBM_LANG_ZIG},
+
+    /* DeviceTree */
+    {".dts", CBM_LANG_DEVICETREE},
+    {".dtsi", CBM_LANG_DEVICETREE},
+    {".dtso", CBM_LANG_DEVICETREE},
+
+    /* VHDL */
+    {".vhd", CBM_LANG_VHDL},
+    {".vhdl", CBM_LANG_VHDL},
 };
 
 #define EXT_TABLE_SIZE (sizeof(EXT_TABLE) / sizeof(EXT_TABLE[0]))
@@ -345,6 +354,8 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_FORM] = "FORM",
     [CBM_LANG_MAGMA] = "Magma",
     [CBM_LANG_WOLFRAM] = "Wolfram",
+    [CBM_LANG_DEVICETREE] = "DeviceTree",
+    [CBM_LANG_VHDL] = "VHDL",
 };
 
 /* ── Public API ──────────────────────────────────────────────────── */

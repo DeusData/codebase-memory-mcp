@@ -70,6 +70,8 @@ extern const TSLanguage *tree_sitter_lean(void);
 extern const TSLanguage *tree_sitter_form(void);
 extern const TSLanguage *tree_sitter_magma(void);
 extern const TSLanguage *tree_sitter_wolfram(void);
+extern const TSLanguage *tree_sitter_devicetree(void);
+extern const TSLanguage *tree_sitter_vhdl(void);
 
 // -- Empty sentinel --
 static const char *empty_types[] = {NULL};
@@ -709,6 +711,22 @@ static const char *wolfram_module_types[] = {"source_file", NULL};
 static const char *wolfram_call_types[] = {"apply", NULL};
 static const char *wolfram_import_types[] = {"get_top", NULL};
 
+// ==================== DEVICETREE ====================
+static const char *devicetree_module_types[] = {"file", NULL};
+static const char *devicetree_func_types[] = {"node", NULL};
+static const char *devicetree_var_types[] = {"property", NULL};
+
+// ==================== VHDL ====================
+static const char *vhdl_func_types[] = {"subprogram_body", NULL};
+static const char *vhdl_class_types[] = {"entity_declaration", "architecture_body",
+                                         "package_declaration", "package_body", NULL};
+static const char *vhdl_module_types[] = {"design_file", NULL};
+static const char *vhdl_call_types[] = {"function_call", "procedure_call_statement", NULL};
+static const char *vhdl_var_types[] = {"variable_declaration", "signal_declaration",
+                                       "constant_declaration", NULL};
+static const char *vhdl_branch_types[] = {"if_statement", "case_statement", "loop_statement",
+                                          NULL};
+
 // ==================== NEW LANG ENV ACCESS ====================
 static const char *julia_env_funcs[] = {"ENV", NULL};
 static const char *nix_env_funcs[] = {"builtins.getEnv", NULL};
@@ -1041,6 +1059,16 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
     {CBM_LANG_WOLFRAM, wolfram_func_types, empty_types, empty_types, wolfram_module_types,
      wolfram_call_types, wolfram_import_types, empty_types, empty_types, empty_types, empty_types,
      empty_types, NULL, empty_types, NULL, NULL},
+
+    // CBM_LANG_DEVICETREE
+    {CBM_LANG_DEVICETREE, devicetree_func_types, empty_types, empty_types, devicetree_module_types,
+     empty_types, empty_types, empty_types, empty_types, devicetree_var_types, empty_types,
+     empty_types, NULL, empty_types, NULL, NULL},
+
+    // CBM_LANG_VHDL
+    {CBM_LANG_VHDL, vhdl_func_types, vhdl_class_types, empty_types, vhdl_module_types,
+     vhdl_call_types, empty_types, empty_types, vhdl_branch_types, vhdl_var_types, empty_types,
+     empty_types, NULL, empty_types, NULL, NULL},
 };
 
 const CBMLangSpec *cbm_lang_spec(CBMLanguage lang) {
@@ -1180,6 +1208,10 @@ const TSLanguage *cbm_ts_language(CBMLanguage lang) {
         return tree_sitter_magma();
     case CBM_LANG_WOLFRAM:
         return tree_sitter_wolfram();
+    case CBM_LANG_DEVICETREE:
+        return tree_sitter_devicetree();
+    case CBM_LANG_VHDL:
+        return tree_sitter_vhdl();
     default:
         return NULL;
     }
