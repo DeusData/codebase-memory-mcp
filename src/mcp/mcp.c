@@ -816,6 +816,21 @@ static const char *project_db_path(const char *project, char *buf, size_t bufsz)
 /* Open the right project's .db file for query tools.
  * Caches the connection — reopens only when project changes.
  * Tracks last-access time so the event loop can evict idle stores. */
+/* Extract the parent project name from a dep project name.
+ * "myapp.dep.pandas" → "myapp", "myapp.dep" → "myapp", "myapp" → "myapp".
+ * Returns a stack buffer pointer (caller must NOT free). */
+static const char *parent_project_for_db(const char *project, char *buf, size_t bufsz) {
+    const char *dep = strstr(project, ".dep");
+    if (dep && (dep[4] == '.' || dep[4] == '\0')) {
+        size_t len = (size_t)(dep - project);
+        if (len >= bufsz) len = bufsz - 1;
+        memcpy(buf, project, len);
+        buf[len] = '\0';
+        return buf;
+    }
+    return project; /* no .dep → use as-is */
+}
+
 static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     if (!project) {
         return srv->store; /* no project specified → use whatever's open */
@@ -823,8 +838,13 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
 
     srv->store_last_used = time(NULL);
 
-    /* Already open for this project? */
-    if (srv->current_project && strcmp(srv->current_project, project) == 0 && srv->store) {
+    /* Dep projects (e.g., "myapp.dep.pandas") live in the parent project's DB
+     * ("myapp.db"), not in a separate "myapp.dep.pandas.db". Extract parent. */
+    char parent_buf[1024];
+    const char *db_project = parent_project_for_db(project, parent_buf, sizeof(parent_buf));
+
+    /* Already open for this project's DB? */
+    if (srv->current_project && strcmp(srv->current_project, db_project) == 0 && srv->store) {
         return srv->store;
     }
 
@@ -836,11 +856,11 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
 
     /* Open project's .db file */
     char path[1024];
-    project_db_path(project, path, sizeof(path));
+    project_db_path(db_project, path, sizeof(path));
     srv->store = cbm_store_open_path(path);
     srv->owns_store = true;
     free(srv->current_project);
-    srv->current_project = heap_strdup(project);
+    srv->current_project = heap_strdup(db_project);
 
     return srv->store;
 }
@@ -1473,9 +1493,13 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             bool is_dep = cbm_is_dep_project(sr->node.project, srv->session_project);
             yyjson_mut_obj_add_str(doc, item, "source", is_dep ? "dependency" : "project");
             if (is_dep && sr->node.project) {
-                size_t sp_len2 = strlen(srv->session_project);
-                const char *pkg = sr->node.project + sp_len2 + CBM_DEP_SEPARATOR_LEN;
-                yyjson_mut_obj_add_strcpy(doc, item, "package", pkg);
+                /* Extract package name: find ".dep." and take everything after it.
+                 * "myapp.dep.pandas" → "pandas", "myapp.dep.uv.pandas" → "uv.pandas" */
+                const char *dep_sep = strstr(sr->node.project, CBM_DEP_SEPARATOR);
+                if (dep_sep) {
+                    const char *pkg = dep_sep + CBM_DEP_SEPARATOR_LEN;
+                    yyjson_mut_obj_add_strcpy(doc, item, "package", pkg);
+                }
                 yyjson_mut_obj_add_bool(doc, item, "read_only", true);
             }
 

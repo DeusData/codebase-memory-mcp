@@ -580,11 +580,14 @@ TEST(test_dep_project_name_format) {
 }
 
 TEST(test_is_dep_project_with_session) {
-    /* With session context — precise prefix check */
+    /* With session context — precise prefix check first, then generic .dep. fallback */
     ASSERT_TRUE(cbm_is_dep_project("myapp.dep.pandas", "myapp"));
     ASSERT_TRUE(cbm_is_dep_project("myapp.dep.serde", "myapp"));
     ASSERT_FALSE(cbm_is_dep_project("myapp", "myapp"));
-    ASSERT_FALSE(cbm_is_dep_project("otherapp.dep.pandas", "myapp"));
+    /* Cross-project deps: otherapp.dep.pandas contains ".dep." → IS a dep.
+     * This is correct: when querying across projects, dep nodes from any project
+     * should be tagged as dependencies for AI grounding (read_only, source tagging). */
+    ASSERT_TRUE(cbm_is_dep_project("otherapp.dep.pandas", "myapp"));
     ASSERT_FALSE(cbm_is_dep_project(NULL, "myapp"));
     PASS();
 }
