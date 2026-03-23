@@ -1803,6 +1803,8 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
 
     char bind_buf[64];
     char *like_pattern = NULL;
+    char proj_like[1024]; /* prefix match pattern — must outlive BIND_TEXT usage */
+    proj_like[0] = '\0';
 
     if (params->project_pattern) {
         /* Glob/LIKE pattern from smart project param (e.g., "myapp.dep.%") */
@@ -1815,10 +1817,15 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         ADD_WHERE(bind_buf);
         BIND_TEXT(params->project);
     } else if (params->project) {
-        /* Default: exact match (same as before — prefix matching added in mcp.c) */
-        snprintf(bind_buf, sizeof(bind_buf), "n.project = ?%d", bind_idx + 1);
+        /* Prefix match: project itself + any dep sub-projects (e.g., myapp.dep.pandas).
+         * Uses (exact OR LIKE prefix) to include deps in same DB. */
+        snprintf(proj_like, sizeof(proj_like), "%s.%%", params->project);
+        snprintf(bind_buf, sizeof(bind_buf),
+                 "(n.project = ?%d OR n.project LIKE ?%d)",
+                 bind_idx + 1, bind_idx + 2);
         ADD_WHERE(bind_buf);
         BIND_TEXT(params->project);
+        BIND_TEXT(proj_like);
     }
     if (params->label) {
         snprintf(bind_buf, sizeof(bind_buf), "n.label = ?%d", bind_idx + 1);

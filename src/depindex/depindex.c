@@ -63,12 +63,17 @@ char *cbm_dep_project_name(const char *project, const char *package_name) {
 
 bool cbm_is_dep_project(const char *project_name, const char *session_project) {
     if (!project_name) return false;
+    /* Check session-specific match first (e.g., "myapp.dep.pandas" with session "myapp") */
     if (session_project && session_project[0]) {
         size_t sp_len = strlen(session_project);
-        return (strncmp(project_name, session_project, sp_len) == 0 &&
-                strncmp(project_name + sp_len, CBM_DEP_SEPARATOR,
-                        CBM_DEP_SEPARATOR_LEN) == 0);
+        if (strncmp(project_name, session_project, sp_len) == 0 &&
+            strncmp(project_name + sp_len, CBM_DEP_SEPARATOR,
+                    CBM_DEP_SEPARATOR_LEN) == 0) {
+            return true;
+        }
     }
+    /* Generic fallback: any project containing ".dep." or starting with "dep." is a dep.
+     * Handles cross-project queries where session_project doesn't match. */
     return strstr(project_name, CBM_DEP_SEPARATOR) != NULL ||
            strncmp(project_name, "dep.", 4) == 0;
 }
