@@ -3635,10 +3635,18 @@ static char *handle_resources_list(cbm_mcp_server_t *srv) {
     return out;
 }
 
+/* Resolve session store for resource handlers. Opens the session project DB
+ * if not already open, so resources return data even before any tool call. */
+static cbm_store_t *resolve_resource_store(cbm_mcp_server_t *srv) {
+    const char *proj = srv->session_project[0] ? srv->session_project : NULL;
+    if (proj) return resolve_store(srv, proj);
+    return srv->store;
+}
+
 /* Build schema resource content (reuses inject_context_once logic). */
 static void build_resource_schema(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                   cbm_mcp_server_t *srv) {
-    cbm_store_t *store = srv->store;
+    cbm_store_t *store = resolve_resource_store(srv);
     const char *proj = srv->session_project[0] ? srv->session_project : NULL;
 
     if (!store) {
@@ -3672,7 +3680,7 @@ static void build_resource_schema(yyjson_mut_doc *doc, yyjson_mut_val *root,
 /* Build architecture resource content. */
 static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                         cbm_mcp_server_t *srv) {
-    cbm_store_t *store = srv->store;
+    cbm_store_t *store = resolve_resource_store(srv);
     const char *proj = srv->session_project[0] ? srv->session_project : NULL;
 
     if (!store) {
@@ -3731,7 +3739,7 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
 /* Build status resource content. */
 static void build_resource_status(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                   cbm_mcp_server_t *srv) {
-    cbm_store_t *store = srv->store;
+    cbm_store_t *store = resolve_resource_store(srv);
     const char *proj = srv->session_project[0] ? srv->session_project : NULL;
 
     if (proj) yyjson_mut_obj_add_str(doc, root, "project", proj);
@@ -3820,19 +3828,17 @@ static char *handle_resources_read(cbm_mcp_server_t *srv, const char *params_raw
     if (!uri)
         return cbm_jsonrpc_format_error(0, -32602, "Missing uri parameter");
 
-    /* Build resource content */
+    /* Build resource content — root IS the content object */
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
-    yyjson_mut_val *content_obj = yyjson_mut_obj(doc);
-
     if (strcmp(uri, "codebase://schema") == 0) {
-        build_resource_schema(doc, content_obj, srv);
+        build_resource_schema(doc, root, srv);
     } else if (strcmp(uri, "codebase://architecture") == 0) {
-        build_resource_architecture(doc, content_obj, srv);
+        build_resource_architecture(doc, root, srv);
     } else if (strcmp(uri, "codebase://status") == 0) {
-        build_resource_status(doc, content_obj, srv);
+        build_resource_status(doc, root, srv);
     } else {
         yyjson_mut_doc_free(doc);
         char msg[512];
