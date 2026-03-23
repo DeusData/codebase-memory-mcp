@@ -3812,8 +3812,12 @@ static void build_resource_status(yyjson_mut_doc *doc, yyjson_mut_val *root,
     }
 }
 
-/* Handle resources/read — dispatch by URI. */
-static char *handle_resources_read(cbm_mcp_server_t *srv, const char *params_raw) {
+/* Handle resources/read — dispatch by URI.
+ * Returns result JSON on success (caller wraps in JSON-RPC response).
+ * On error, sets *err_out to a pre-formatted JSON-RPC error and returns NULL. */
+static char *handle_resources_read(cbm_mcp_server_t *srv, const char *params_raw,
+                                   int64_t req_id, char **err_out) {
+    *err_out = NULL;
     /* Extract URI from params */
     char *uri = NULL;
     if (params_raw) {
@@ -3825,8 +3829,10 @@ static char *handle_resources_read(cbm_mcp_server_t *srv, const char *params_raw
             yyjson_doc_free(pdoc);
         }
     }
-    if (!uri)
-        return cbm_jsonrpc_format_error(0, -32602, "Missing uri parameter");
+    if (!uri) {
+        *err_out = cbm_jsonrpc_format_error(req_id, -32602, "Missing uri parameter");
+        return NULL;
+    }
 
     /* Build resource content — root IS the content object */
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -3848,7 +3854,8 @@ static char *handle_resources_read(cbm_mcp_server_t *srv, const char *params_raw
             "Use resources/list to discover all resources.",
             uri);
         free(uri);
-        return cbm_jsonrpc_format_error(0, -32002, msg);
+        *err_out = cbm_jsonrpc_format_error(req_id, -32002, msg);
+        return NULL;
     }
 
     /* Format as resources/read response: {contents: [{uri, mimeType, text}]} */
@@ -3910,7 +3917,15 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     } else if (strcmp(req.method, "resources/list") == 0) {
         result_json = handle_resources_list(srv);
     } else if (strcmp(req.method, "resources/read") == 0) {
-        result_json = handle_resources_read(srv, req.params_raw);
+        /* handle_resources_read may return a pre-formatted JSON-RPC error (id=0).
+         * Detect by checking for NULL result_json — errors are returned via err_out. */
+        char *err_out = NULL;
+        result_json = handle_resources_read(srv, req.params_raw, req.id, &err_out);
+        if (err_out) {
+            /* Error already formatted as JSON-RPC with correct id — return directly */
+            cbm_jsonrpc_request_free(&req);
+            return err_out;
+        }
     } else if (strcmp(req.method, "tools/list") == 0) {
         result_json = cbm_mcp_tools_list(srv);
     } else if (strcmp(req.method, "tools/call") == 0) {

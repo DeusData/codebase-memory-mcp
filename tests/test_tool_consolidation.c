@@ -754,6 +754,112 @@ TEST(error_resource_not_found_has_spec_code) {
     PASS();
 }
 
+/* ── 12. JSON-RPC response structure tests (e2e) ─────────── */
+
+TEST(resource_error_is_top_level_not_nested_in_result) {
+    /* BUG found by binary testing: resource errors were double-wrapped.
+     * handle_resources_read returned a pre-formatted JSON-RPC error, but
+     * cbm_mcp_server_handle wrapped it again in cbm_jsonrpc_format_response.
+     * Result: {result: {jsonrpc, id:0, error: {...}}} instead of {error: {...}}
+     * Fix: error path returns early before the wrapper. */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"resources/read\","
+        "\"params\":{\"uri\":\"codebase://nonexistent\"}}");
+    ASSERT_NOT_NULL(resp);
+    /* Must have top-level "error" key, NOT nested inside "result" */
+    ASSERT_NOT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NULL(strstr(resp, "\"result\""));
+    /* Error id must match request id */
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":42"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(resource_error_missing_uri_is_top_level) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"resources/read\","
+        "\"params\":{}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NULL(strstr(resp, "\"result\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":99"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(resource_error_no_params_is_top_level) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"resources/read\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NULL(strstr(resp, "\"result\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":77"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(resource_success_has_result_not_error) {
+    /* Complement: successful reads must have "result", NOT "error" */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"resources/read\","
+        "\"params\":{\"uri\":\"codebase://status\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"result\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":50"));
+    ASSERT_NOT_NULL(strstr(resp, "contents"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(resource_schema_returns_real_data_when_indexed) {
+    /* After search_graph opens the session store, resources should return real data.
+     * Uses cbm_mcp_server_new(NULL) which creates an in-memory store. */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    /* Force store open via a tool call */
+    char *r1 = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"name_pattern\":\"x\"}");
+    free(r1);
+    /* Now read schema resource — should have node_labels/edge_types arrays */
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\","
+        "\"params\":{\"uri\":\"codebase://schema\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "contents"));
+    /* text field should have node_labels (may be empty array but key must exist) */
+    ASSERT_NOT_NULL(strstr(resp, "node_labels"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(resource_status_returns_not_indexed_when_no_store) {
+    /* Fresh server with no session — status resource should say not_indexed */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    /* Don't set session_project, don't call any tools */
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\","
+        "\"params\":{\"uri\":\"codebase://status\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "contents"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* ── Suite registration ──────────────────────────────────── */
 
 SUITE(tool_consolidation) {
@@ -810,4 +916,11 @@ SUITE(tool_consolidation) {
     RUN_TEST(error_missing_required_param_has_hint);
     RUN_TEST(error_unknown_tool_lists_valid_tools);
     RUN_TEST(error_resource_not_found_has_spec_code);
+    /* JSON-RPC response structure (e2e) */
+    RUN_TEST(resource_error_is_top_level_not_nested_in_result);
+    RUN_TEST(resource_error_missing_uri_is_top_level);
+    RUN_TEST(resource_error_no_params_is_top_level);
+    RUN_TEST(resource_success_has_result_not_error);
+    RUN_TEST(resource_schema_returns_real_data_when_indexed);
+    RUN_TEST(resource_status_returns_not_indexed_when_no_store);
 }
