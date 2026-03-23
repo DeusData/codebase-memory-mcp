@@ -39,17 +39,24 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     ".ccls-cache", ".clangd", "elm-stuff", "_opam", ".cpcache", ".shadow-cljs",
     /* Deploy */
     ".vercel", ".netlify",
+    /* Vendored / third-party code (always skip — use CBM_MODE_DEP for dep source) */
+    "vendor", "vendored", "third_party", "thirdparty", "3rdparty", "external",
     /* Misc */
-    ".qdrant_code_embeddings", ".tmp", "vendor", NULL};
+    ".qdrant_code_embeddings", ".tmp", NULL};
+
+/* Prefix patterns for vendored directory names that vary (e.g. "vendored_libs",
+ * "vendor-bundle"). Checked when exact match fails. Kept short for performance. */
+static const char *VENDORED_DIR_PREFIXES[] = {
+    "vendor", "3rdparty", "third_party", "thirdparty", NULL};
 
 static const char *FAST_SKIP_DIRS[] = {
     "generated", "gen",           "auto-generated", "fixtures",     "testdata",    "test_data",
     "__tests__", "__mocks__",     "__snapshots__",  "__fixtures__", "__test__",    "docs",
     "doc",       "documentation", "examples",       "example",      "samples",     "sample",
-    "assets",    "static",        "public",         "media",        "third_party", "thirdparty",
-    "3rdparty",  "external",      "migrations",     "seeds",        "e2e",         "integration",
-    "locale",    "locales",       "i18n",           "l10n",         "scripts",     "tools",
-    "hack",      "bin",           "build",          "out",          NULL};
+    "assets",    "static",        "public",         "media",        "migrations",  "seeds",
+    "e2e",       "integration",   "locale",         "locales",      "i18n",        "l10n",
+    "scripts",   "tools",         "hack",           "bin",          "build",       "out",
+    NULL};
 
 /* ── Ignored suffixes ────────────────────────────────────────────── */
 
@@ -145,6 +152,23 @@ static const char *DEP_SKIP_DIRS[] = {
     NULL
 };
 
+/* Check if dirname starts with any vendored prefix (e.g. "vendor-bundle",
+ * "vendored_libs", "third_party_deps"). Catches naming variations that
+ * exact match misses. */
+static bool has_vendored_prefix(const char *dirname) {
+    for (int i = 0; VENDORED_DIR_PREFIXES[i]; i++) {
+        size_t plen = strlen(VENDORED_DIR_PREFIXES[i]);
+        if (strncmp(dirname, VENDORED_DIR_PREFIXES[i], plen) == 0) {
+            /* Match if dirname equals prefix or next char is a separator */
+            char next = dirname[plen];
+            if (next == '\0' || next == '-' || next == '_' || next == '.') {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 bool cbm_should_skip_dir(const char *dirname, cbm_index_mode_t mode) {
     if (!dirname) {
         return false;
@@ -155,6 +179,12 @@ bool cbm_should_skip_dir(const char *dirname, cbm_index_mode_t mode) {
     }
 
     if (str_in_list(dirname, ALWAYS_SKIP_DIRS)) {
+        return true;
+    }
+
+    /* Prefix-based vendored detection catches variations like
+     * "vendored_libs", "vendor-bundle", "third_party_deps" */
+    if (has_vendored_prefix(dirname)) {
         return true;
     }
 
