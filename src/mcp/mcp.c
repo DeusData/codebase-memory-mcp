@@ -677,8 +677,13 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
             "Context resources: read codebase://schema for node labels and edge types, "
             "codebase://architecture for key functions and graph overview, "
             "codebase://status for index status and dependency info.");
-        yyjson_mut_obj_add_str(doc, hint_tool, "inputSchema",
-            "{\"type\":\"object\",\"properties\":{}}");
+        /* inputSchema MUST be a JSON object, not a string — Claude Code rejects
+         * the entire tools/list if any tool has a string inputSchema. */
+        yyjson_mut_val *hint_schema = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, hint_schema, "type", "object");
+        yyjson_mut_val *hint_props = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_val(doc, hint_schema, "properties", hint_props);
+        yyjson_mut_obj_add_val(doc, hint_tool, "inputSchema", hint_schema);
         yyjson_mut_arr_add_val(tools, hint_tool);
     } else {
         /* Classic mode: all 15 original tools */
