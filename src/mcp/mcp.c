@@ -405,7 +405,10 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "Search the code knowledge graph for functions, classes, routes, variables, "
      "and relationships. Use INSTEAD OF grep/glob for code definitions and structure. "
      "Supports Cypher queries via 'cypher' param for complex patterns. "
-     "Results sorted by PageRank (structural importance) by default.",
+     "Results sorted by PageRank (structural importance) by default. "
+     "Read codebase://schema for available node labels (Function, Class, etc.) and edge types "
+     "(CALLS, IMPORTS, etc.) before writing Cypher queries. "
+     "Read codebase://architecture for key functions and graph overview.",
      "{\"type\":\"object\",\"properties\":{"
      "\"project\":{\"type\":\"string\",\"description\":\"Project name, path, or filter. "
      "Accepts: project name, directory path (/path/to/repo), 'self' (project only), "
@@ -427,8 +430,9 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
 
     {"trace_call_path",
      "Trace function call paths — who calls a function and what it calls. "
-     "Use for callers, dependencies, and impact analysis. "
-     "Results sorted by PageRank within each hop level.",
+     "Use for impact analysis, understanding callers, and finding dependencies. "
+     "Results sorted by PageRank within each hop level. "
+     "Read codebase://architecture for key functions to start tracing from.",
      "{\"type\":\"object\",\"properties\":{"
      "\"function_name\":{\"type\":\"string\",\"description\":\"Function name to trace\"},"
      "\"project\":{\"type\":\"string\"},"
@@ -442,7 +446,8 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
     {"get_code",
      "Get source code for a function, class, or symbol by qualified name. "
      "Use INSTEAD OF reading entire files. Use mode=signature for API lookup (99%% savings). "
-     "Use mode=head_tail for large functions (preserves return code).",
+     "Use mode=head_tail for large functions (preserves return code). "
+     "Get qualified_name values from search_code_graph results.",
      "{\"type\":\"object\",\"properties\":{"
      "\"qualified_name\":{\"type\":\"string\",\"description\":\"Qualified name from search results\"},"
      "\"project\":{\"type\":\"string\"},"
@@ -668,7 +673,10 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
             "delete_project, index_status, detect_changes, manage_adr, "
             "ingest_traces, index_dependencies. "
             "Enable all: set env CBM_TOOL_MODE=classic or config set tool_mode classic. "
-            "Enable one: config set tool_<name> true (e.g. tool_index_repository true).");
+            "Enable one: config set tool_<name> true (e.g. tool_index_repository true). "
+            "Context resources: read codebase://schema for node labels and edge types, "
+            "codebase://architecture for key functions and graph overview, "
+            "codebase://status for index status and dependency info.");
         yyjson_mut_obj_add_str(doc, hint_tool, "inputSchema",
             "{\"type\":\"object\",\"properties\":{}}");
         yyjson_mut_arr_add_val(tools, hint_tool);
@@ -3592,7 +3600,9 @@ static char *handle_resources_list(cbm_mcp_server_t *srv) {
     yyjson_mut_obj_add_str(doc, r1, "uri", "codebase://schema");
     yyjson_mut_obj_add_str(doc, r1, "name", "Code Graph Schema");
     yyjson_mut_obj_add_str(doc, r1, "description",
-        "Node labels and edge types with counts in the indexed code graph.");
+        "Node labels (Function, Class, Module, etc.) and edge types (CALLS, IMPORTS, "
+        "DEFINES_METHOD, etc.) with counts. Read this before writing Cypher queries "
+        "to know valid labels and relationship types.");
     yyjson_mut_obj_add_str(doc, r1, "mimeType", "application/json");
     yyjson_mut_arr_add_val(arr, r1);
 
@@ -3601,7 +3611,9 @@ static char *handle_resources_list(cbm_mcp_server_t *srv) {
     yyjson_mut_obj_add_str(doc, r2, "uri", "codebase://architecture");
     yyjson_mut_obj_add_str(doc, r2, "name", "Architecture Overview");
     yyjson_mut_obj_add_str(doc, r2, "description",
-        "Graph size, key functions by PageRank, and relationship patterns.");
+        "Total nodes/edges, top 10 key functions ranked by PageRank (structural "
+        "importance), and relationship patterns. Read this first to understand "
+        "codebase structure and find important entry points.");
     yyjson_mut_obj_add_str(doc, r2, "mimeType", "application/json");
     yyjson_mut_arr_add_val(arr, r2);
 
@@ -3610,7 +3622,10 @@ static char *handle_resources_list(cbm_mcp_server_t *srv) {
     yyjson_mut_obj_add_str(doc, r3, "uri", "codebase://status");
     yyjson_mut_obj_add_str(doc, r3, "name", "Index Status");
     yyjson_mut_obj_add_str(doc, r3, "description",
-        "Indexing status, node/edge counts, PageRank stats, detected ecosystem, dependencies.");
+        "Project name, indexing status (ready/empty/not_indexed), node/edge counts, "
+        "PageRank computation stats, detected package ecosystem, and indexed "
+        "dependencies list. Read this to check if the project is indexed and "
+        "what dependencies are available.");
     yyjson_mut_obj_add_str(doc, r3, "mimeType", "application/json");
     yyjson_mut_arr_add_val(arr, r3);
 
