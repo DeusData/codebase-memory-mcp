@@ -72,6 +72,9 @@ int cbm_mcp_get_int_arg(const char *args_json, const char *key, int default_val)
 /* Extract a bool argument. Returns false if not found. */
 bool cbm_mcp_get_bool_arg(const char *args_json, const char *key);
 
+/* Extract a bool argument with explicit default. Returns default_val if key absent. */
+bool cbm_mcp_get_bool_arg_default(const char *args_json, const char *key, bool default_val);
+
 /* Extract the tool name from a tools/call params JSON. Heap-allocated. */
 char *cbm_mcp_get_tool_name(const char *params_json);
 

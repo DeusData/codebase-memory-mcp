@@ -41,6 +41,16 @@
 
 /* ── Constants ────────────────────────────────────────────────── */
 
+/* Add a "pagerank" key with value formatted to 4 significant figures.
+ * Writes directly as a raw JSON number (e.g. 4.755e-05) — no double round-trip.
+ * 4 sig figs preserves ranking distinguishability while saving ~12 chars/value.
+ * This is the single place pagerank values are serialized to JSON. */
+static void add_pagerank_val(yyjson_mut_doc *doc, yyjson_mut_val *obj, double v) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.4g", v);
+    yyjson_mut_obj_add_val(doc, obj, "pagerank", yyjson_mut_rawcpy(doc, buf));
+}
+
 /* Default snippet fallback line count (when end_line unknown) */
 #define SNIPPET_DEFAULT_LINES 50
 
@@ -281,7 +291,7 @@ static const tool_def_t TOOLS[] = {
      "\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"summary\"],\"default\":\"full\","
      "\"description\":\"full=individual results (default), summary=aggregate counts by label and "
      "file. Use summary first to understand scope, then full with filters to drill down."
-     "\"},\"compact\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Omit redundant "
+     "\"},\"compact\":{\"type\":\"boolean\",\"default\":true,\"description\":\"Omit redundant "
      "name field when it matches the last segment of qualified_name. Reduces token usage.\"},"
      "\"include_dependencies\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Include "
      "indexed dependency symbols in results. Results from dependencies have source:dependency. "
@@ -586,13 +596,17 @@ int cbm_mcp_get_int_arg(const char *args_json, const char *key, int default_val)
 
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 bool cbm_mcp_get_bool_arg(const char *args_json, const char *key) {
+    return cbm_mcp_get_bool_arg_default(args_json, key, false);
+}
+
+bool cbm_mcp_get_bool_arg_default(const char *args_json, const char *key, bool default_val) {
     yyjson_doc *doc = yyjson_read(args_json, strlen(args_json), 0);
     if (!doc) {
-        return false;
+        return default_val;
     }
     yyjson_val *root = yyjson_doc_get_root(doc);
     yyjson_val *val = yyjson_obj_get(root, key);
-    bool result = false;
+    bool result = default_val;
     if (val && yyjson_is_bool(val)) {
         result = yyjson_get_bool(val);
     }
@@ -1388,15 +1402,21 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
-static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
-    char *raw_project = cbm_mcp_get_string_arg(args, "project");
+/* Expand a raw project param, resolve the correct store, and auto-index if needed.
+ * Returns the resolved store (or NULL). Sets *out_pe to the expand result
+ * (caller must free out_pe->value). Handles:
+ *   - expand_project_param (Rule 0: /path → project name)
+ *   - DB selection with prefix collision avoidance
+ *   - Auto-index on first use (join background thread or sync index) */
+static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
+                                           char *raw_project,
+                                           project_expand_t *out_pe) {
     project_expand_t pe = expand_project_param(srv, raw_project);
 
     /* DB selection: if expanded value IS the session project or a dep of it
-     * (session.dep.X), use session store. Otherwise open the requested project's DB.
-     * The check requires the char after session_project to be '.' or '\0' to avoid
-     * prefix collisions (e.g., "myapp" matching "myapp-other-project"). */
-    const char *db_project = pe.value; /* default: pass through to resolve_store */
+     * (session.dep.X), use session store. The check requires the char after
+     * session_project to be '.' or '\0' to avoid prefix collisions. */
+    const char *db_project = pe.value;
     if (pe.value && srv->session_project[0]) {
         size_t sp_len = strlen(srv->session_project);
         if (strncmp(pe.value, srv->session_project, sp_len) == 0 &&
@@ -1405,8 +1425,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         }
     }
     cbm_store_t *store = resolve_store(srv, db_project);
-    /* Auto-index on first use — same logic as REQUIRE_STORE macro.
-     * Handles: CWD-based session_root, explicit path via Rule 0, MCP roots. */
+
+    /* Auto-index on first use (same logic as REQUIRE_STORE macro). */
     if (!store && srv->session_root[0] && access(srv->session_root, F_OK) == 0) {
         if (srv->autoindex_active) {
             cbm_thread_join(&srv->autoindex_tid);
@@ -1433,6 +1453,15 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             }
         }
     }
+
+    *out_pe = pe; /* caller takes ownership of pe.value */
+    return store;
+}
+
+static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
+    char *raw_project = cbm_mcp_get_string_arg(args, "project");
+    project_expand_t pe = {0};
+    cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
     if (!store) {
         free(pe.value);
         return cbm_mcp_text_result(
@@ -1448,7 +1477,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                                                CBM_DEFAULT_SEARCH_LIMIT);
     int limit = cbm_mcp_get_int_arg(args, "limit", cfg_search_limit);
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
-    bool compact = cbm_mcp_get_bool_arg(args, "compact");
+    bool compact = cbm_mcp_get_bool_arg_default(args, "compact", true);
     char *search_mode = cbm_mcp_get_string_arg(args, "mode");
     int min_degree = cbm_mcp_get_int_arg(args, "min_degree", -1);
     int max_degree = cbm_mcp_get_int_arg(args, "max_degree", -1);
@@ -1547,7 +1576,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_obj_add_str(doc, item, "file_path",
                                    sr->node.file_path ? sr->node.file_path : "");
             if (sr->pagerank_score > 0.0) {
-                yyjson_mut_obj_add_real(doc, item, "pagerank", sr->pagerank_score);
+                add_pagerank_val(doc, item, sr->pagerank_score);
             } else {
                 /* Degree fields only when PageRank not available — PR subsumes degree info */
                 yyjson_mut_obj_add_int(doc, item, "in_degree", sr->in_degree);
@@ -1919,7 +1948,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
                     if (qn) yyjson_mut_obj_add_strcpy(doc, kf, "qualified_name", qn);
                     if (lbl) yyjson_mut_obj_add_strcpy(doc, kf, "label", lbl);
                     if (fp) yyjson_mut_obj_add_strcpy(doc, kf, "file_path", fp);
-                    yyjson_mut_obj_add_real(doc, kf, "pagerank", rank);
+                    add_pagerank_val(doc, kf, rank);
                     yyjson_mut_arr_add_val(kf_arr, kf);
                 }
                 sqlite3_finalize(kf_stmt);
@@ -1940,14 +1969,16 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
 
 static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *func_name = cbm_mcp_get_string_arg(args, "function_name");
-    char *project = cbm_mcp_get_string_arg(args, "project");
-    cbm_store_t *store = resolve_store(srv, project);
+    char *raw_project = cbm_mcp_get_string_arg(args, "project");
+    project_expand_t pe = {0};
+    cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
+    char *project = pe.value; /* take ownership for free() below */
     char *direction = cbm_mcp_get_string_arg(args, "direction");
     int depth = cbm_mcp_get_int_arg(args, "depth", 3);
     int cfg_trace_max = cbm_config_get_int(srv->config, CBM_CONFIG_TRACE_MAX_RESULTS,
                                             CBM_DEFAULT_TRACE_MAX_RESULTS);
     int max_results = cbm_mcp_get_int_arg(args, "max_results", cfg_trace_max);
-    bool compact = cbm_mcp_get_bool_arg(args, "compact");
+    bool compact = cbm_mcp_get_bool_arg_default(args, "compact", true);
 
     if (!func_name) {
         free(project);
@@ -2052,7 +2083,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             {
                 double pr = cbm_pagerank_get(store, tr_out.visited[i].node.id);
                 if (pr > 0.0)
-                    yyjson_mut_obj_add_real(doc, item, "pagerank", pr);
+                    add_pagerank_val(doc, item, pr);
             }
             /* Boundary tagging: mark if callee is in a dependency */
             bool callee_dep = cbm_is_dep_project(tr_out.visited[i].node.project,
@@ -2099,7 +2130,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             {
                 double pr = cbm_pagerank_get(store, tr_in.visited[i].node.id);
                 if (pr > 0.0)
-                    yyjson_mut_obj_add_real(doc, item, "pagerank", pr);
+                    add_pagerank_val(doc, item, pr);
             }
             /* Boundary tagging: mark if caller is in a dependency */
             bool caller_dep = cbm_is_dep_project(tr_in.visited[i].node.project,
@@ -3435,6 +3466,18 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
         return handle_index_dependencies(srv, args_json);
     }
 
+    /* _hidden_tools: informational pseudo-tool for progressive disclosure */
+    if (strcmp(tool_name, "_hidden_tools") == 0) {
+        return cbm_mcp_text_result(
+            "{\"hidden_tools\":[\"index_repository\",\"search_graph\",\"query_graph\","
+            "\"get_code_snippet\",\"get_graph_schema\",\"get_architecture\",\"search_code\","
+            "\"list_projects\",\"delete_project\",\"index_status\",\"detect_changes\","
+            "\"manage_adr\",\"ingest_traces\",\"index_dependencies\"],"
+            "\"enable_all\":\"set env CBM_TOOL_MODE=classic or config set tool_mode classic\","
+            "\"enable_one\":\"config set tool_<name> true (e.g. tool_index_repository true)\","
+            "\"resources\":[\"codebase://schema\",\"codebase://architecture\",\"codebase://status\"]}", false);
+    }
+
     char msg[512];
     snprintf(msg, sizeof(msg),
         "{\"error\":\"unknown tool: '%s'\","
@@ -3522,30 +3565,121 @@ static void *autoindex_thread(void *arg) {
     return NULL;
 }
 
+/* Check if a DB file has actual content (at least 1 node).
+ * Returns true if DB exists AND has nodes. Lightweight raw SQLite check. */
+static bool db_has_content(const char *db_path) {
+    struct stat st;
+    if (stat(db_path, &st) != 0) return false; /* file doesn't exist */
+
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return false;
+    }
+    sqlite3_stmt *stmt = NULL;
+    bool has = false;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM nodes LIMIT 1", -1, &stmt, NULL) == SQLITE_OK) {
+        has = (sqlite3_step(stmt) == SQLITE_ROW);
+        sqlite3_finalize(stmt);
+    }
+    sqlite3_close(db);
+    return has;
+}
+
+/* Check if a DB's index is stale by comparing DB file mtime against latest
+ * git commit time. If the repo has commits newer than the DB, it's stale.
+ * Also stale if DB is older than max_age_seconds (0 = disabled).
+ * Returns false on any error (conservative: don't trigger unnecessary reindex). */
+static bool db_is_stale(const char *db_path, const char *repo_path, int max_age_seconds) {
+    struct stat db_st;
+    if (stat(db_path, &db_st) != 0) return false;
+    time_t db_mtime = db_st.st_mtime;
+
+    /* Check age-based staleness (configurable, 0 = disabled).
+     * Guard against clock skew: only consider stale if now > db_mtime. */
+    if (max_age_seconds > 0) {
+        time_t now = time(NULL);
+        if (now > db_mtime && (now - db_mtime) > max_age_seconds) return true;
+    }
+
+    /* Check git HEAD commit time vs DB mtime */
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+        "git -C '%s' log -1 --format=%%ct HEAD 2>/dev/null", repo_path);
+    // NOLINTNEXTLINE(bugprone-command-processor,cert-env33-c)
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) return false;
+    char line[64] = {0};
+    if (fgets(line, sizeof(line), fp)) {
+        long commit_time = strtol(line, NULL, 10);
+        cbm_pclose(fp);
+        /* Stale if latest commit is newer than DB */
+        return commit_time > (long)db_mtime;
+    }
+    cbm_pclose(fp);
+    return false;
+}
+
+/* Config keys for reindex behavior */
+#define CBM_CONFIG_REINDEX_ON_STARTUP "reindex_on_startup"
+#define CBM_CONFIG_REINDEX_STALE_SECONDS "reindex_stale_seconds"
+
 /* Start auto-indexing if configured and project not yet indexed. */
 static void maybe_auto_index(cbm_mcp_server_t *srv) {
     if (srv->session_root[0] == '\0') {
         return; /* no session root detected */
     }
 
-    /* Check if project already has a DB */
+    /* Check if project already has a populated DB */
     // NOLINTNEXTLINE(concurrency-mt-unsafe)
     const char *home = getenv("HOME");
+    bool needs_index = true;
+    char db_check[1024] = {0};
     if (home) {
-        char db_check[1024];
         snprintf(db_check, sizeof(db_check), "%s/.cache/codebase-memory-mcp/%s.db", home,
                  srv->session_project);
-        struct stat st;
-        if (stat(db_check, &st) == 0) {
-            /* Already indexed → register watcher for change detection */
-            cbm_log_info("autoindex.skip", "reason", "already_indexed", "project",
-                         srv->session_project);
-            if (srv->watcher) {
-                cbm_watcher_watch(srv->watcher, srv->session_project, srv->session_root);
+
+        if (db_has_content(db_check)) {
+            /* DB exists and has nodes — check if stale */
+            bool reindex_on_startup = srv->config
+                ? cbm_config_get_bool(srv->config, CBM_CONFIG_REINDEX_ON_STARTUP, false)
+                : false;
+            int stale_seconds = srv->config
+                ? cbm_config_get_int(srv->config, CBM_CONFIG_REINDEX_STALE_SECONDS, 0)
+                : 0;
+            bool stale = db_is_stale(db_check, srv->session_root, stale_seconds);
+
+            if (stale && reindex_on_startup) {
+                cbm_log_info("autoindex.stale", "reason", "commits_newer_than_index", "project",
+                             srv->session_project);
+                needs_index = true;
+            } else {
+                if (stale) {
+                    cbm_log_info("autoindex.stale_skipped", "reason", "reindex_on_startup=false",
+                                 "hint", "set reindex_on_startup true to auto-update on restart",
+                                 "project", srv->session_project);
+                } else {
+                    cbm_log_info("autoindex.skip", "reason", "already_indexed", "project",
+                                 srv->session_project);
+                }
+                /* Register watcher for live change detection */
+                if (srv->watcher) {
+                    cbm_watcher_watch(srv->watcher, srv->session_project, srv->session_root);
+                }
+                needs_index = false;
             }
-            return;
+        } else {
+            struct stat st;
+            if (stat(db_check, &st) == 0) {
+                /* DB file exists but has 0 nodes — treat as not indexed */
+                cbm_log_info("autoindex.empty_db", "reason", "db_exists_but_empty", "project",
+                             srv->session_project);
+            }
+            needs_index = true;
         }
     }
+
+    if (!needs_index) return;
 
 /* Default file limit for auto-indexing new projects */
 #define DEFAULT_AUTO_INDEX_LIMIT 50000
@@ -3775,9 +3909,20 @@ static char *handle_resources_list(cbm_mcp_server_t *srv) {
     return out;
 }
 
-/* Resolve session store for resource handlers. Opens the session project DB
- * if not already open, so resources return data even before any tool call. */
+/* Get the active project name: current_project (from last tool call) or session_project. */
+static const char *active_project_name(cbm_mcp_server_t *srv) {
+    if (srv->current_project) return srv->current_project;
+    return srv->session_project[0] ? srv->session_project : NULL;
+}
+
+/* Resolve store for resource handlers. Prefers the currently-open project
+ * (set by the most recent tool call) over the session project, so resources
+ * reflect data the user is actually querying — not the empty CWD project. */
 static cbm_store_t *resolve_resource_store(cbm_mcp_server_t *srv) {
+    /* 1. Use currently-open project (set by last resolve_store call) */
+    if (srv->current_project && srv->store)
+        return srv->store;
+    /* 2. Fall back to session project */
     const char *proj = srv->session_project[0] ? srv->session_project : NULL;
     if (proj) return resolve_store(srv, proj);
     return srv->store;
@@ -3787,7 +3932,7 @@ static cbm_store_t *resolve_resource_store(cbm_mcp_server_t *srv) {
 static void build_resource_schema(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                   cbm_mcp_server_t *srv) {
     cbm_store_t *store = resolve_resource_store(srv);
-    const char *proj = srv->session_project[0] ? srv->session_project : NULL;
+    const char *proj = active_project_name(srv);
 
     if (!store) {
         yyjson_mut_obj_add_str(doc, root, "status", "not_indexed");
@@ -3821,7 +3966,7 @@ static void build_resource_schema(yyjson_mut_doc *doc, yyjson_mut_val *root,
 static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                         cbm_mcp_server_t *srv) {
     cbm_store_t *store = resolve_resource_store(srv);
-    const char *proj = srv->session_project[0] ? srv->session_project : NULL;
+    const char *proj = active_project_name(srv);
 
     if (!store) {
         yyjson_mut_obj_add_str(doc, root, "status", "not_indexed");
@@ -3855,7 +4000,7 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
                 if (qn) yyjson_mut_obj_add_strcpy(doc, kf, "qualified_name", qn);
                 if (label) yyjson_mut_obj_add_strcpy(doc, kf, "label", label);
                 if (fp) yyjson_mut_obj_add_strcpy(doc, kf, "file_path", fp);
-                yyjson_mut_obj_add_real(doc, kf, "pagerank", rank);
+                add_pagerank_val(doc, kf, rank);
                 yyjson_mut_arr_add_val(kf_arr, kf);
             }
             yyjson_mut_obj_add_val(doc, root, "key_functions", kf_arr);
@@ -3880,7 +4025,7 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
 static void build_resource_status(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                   cbm_mcp_server_t *srv) {
     cbm_store_t *store = resolve_resource_store(srv);
-    const char *proj = srv->session_project[0] ? srv->session_project : NULL;
+    const char *proj = active_project_name(srv);
 
     if (proj) yyjson_mut_obj_add_str(doc, root, "project", proj);
 
