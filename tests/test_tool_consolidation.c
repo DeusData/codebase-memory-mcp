@@ -7,6 +7,8 @@
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include <mcp/mcp.h>
+#include <store/store.h>
+#include <depindex/depindex.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -860,6 +862,123 @@ TEST(resource_status_returns_not_indexed_when_no_store) {
     PASS();
 }
 
+/* ── 13. Dep search bug regression tests ─────────────────── */
+
+/* Bug 1: resolve_store must route dep project names to parent DB.
+ * "myapp.dep.pandas" should open myapp.db, not myapp.dep.pandas.db. */
+TEST(dep_search_explicit_dep_project_name) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *r = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"project\":\"nonexistent.dep.pandas\",\"name_pattern\":\".*\",\"limit\":1}");
+    ASSERT_NOT_NULL(r);
+    free(r);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Bug 2: Store prefix match — search with project name must include deps. */
+TEST(store_prefix_match_includes_deps) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "myapp", "/tmp/myapp");
+    cbm_store_upsert_project(s, "myapp.dep.lib", "/tmp/lib");
+    cbm_node_t n1 = {.project = "myapp", .label = "Function", .name = "main",
+                      .qualified_name = "myapp.main", .file_path = "main.c"};
+    cbm_store_upsert_node(s, &n1);
+    cbm_node_t n2 = {.project = "myapp.dep.lib", .label = "Function", .name = "lib_fn",
+                      .qualified_name = "myapp.dep.lib.lib_fn", .file_path = "lib.c"};
+    cbm_store_upsert_node(s, &n2);
+    cbm_search_params_t params = {0};
+    params.project = "myapp";
+    params.limit = 10;
+    cbm_search_output_t out = {0};
+    cbm_store_search(s, &params, &out);
+    ASSERT_TRUE(out.count >= 2);
+    bool found_project = false, found_dep = false;
+    for (int i = 0; i < out.count; i++) {
+        if (strcmp(out.results[i].node.project, "myapp") == 0) found_project = true;
+        if (strcmp(out.results[i].node.project, "myapp.dep.lib") == 0) found_dep = true;
+    }
+    ASSERT_TRUE(found_project);
+    ASSERT_TRUE(found_dep);
+    cbm_store_search_free(&out);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Bug 2 complement: exact match should NOT include deps. */
+TEST(store_exact_match_excludes_deps) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "myapp", "/tmp/myapp");
+    cbm_store_upsert_project(s, "myapp.dep.lib", "/tmp/lib");
+    cbm_node_t n1 = {.project = "myapp", .label = "Function", .name = "main",
+                      .qualified_name = "myapp.main", .file_path = "main.c"};
+    cbm_store_upsert_node(s, &n1);
+    cbm_node_t n2 = {.project = "myapp.dep.lib", .label = "Function", .name = "lib_fn",
+                      .qualified_name = "myapp.dep.lib.lib_fn", .file_path = "lib.c"};
+    cbm_store_upsert_node(s, &n2);
+    cbm_search_params_t params = {0};
+    params.project = "myapp";
+    params.project_exact = true;
+    params.limit = 10;
+    cbm_search_output_t out = {0};
+    cbm_store_search(s, &params, &out);
+    ASSERT_EQ(out.count, 1);
+    ASSERT_STR_EQ(out.results[0].node.project, "myapp");
+    cbm_store_search_free(&out);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Bug 3: cbm_is_dep_project must detect deps from any project. */
+TEST(is_dep_project_cross_project_detection) {
+    ASSERT_TRUE(cbm_is_dep_project("otherapp.dep.pandas", "myapp"));
+    ASSERT_TRUE(cbm_is_dep_project("otherapp.dep.serde", "myapp"));
+    ASSERT_TRUE(cbm_is_dep_project("myapp.dep.pandas", "myapp"));
+    ASSERT_FALSE(cbm_is_dep_project("myapp", "myapp"));
+    ASSERT_FALSE(cbm_is_dep_project("otherapp", "myapp"));
+    ASSERT_FALSE(cbm_is_dep_project("deputy", "myapp"));
+    PASS();
+}
+
+/* E2E: Full dep workflow — index + deps + search returns both with correct tags. */
+TEST(e2e_dep_search_returns_project_and_dep_results) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "app", "/tmp/app");
+    cbm_store_upsert_project(s, "app.dep.mylib", "/tmp/lib");
+    cbm_node_t n1 = {.project = "app", .label = "Function", .name = "app_main",
+                      .qualified_name = "app.app_main", .file_path = "main.c"};
+    cbm_store_upsert_node(s, &n1);
+    cbm_node_t n2 = {.project = "app.dep.mylib", .label = "Function", .name = "lib_helper",
+                      .qualified_name = "app.dep.mylib.lib_helper", .file_path = "lib.c"};
+    cbm_store_upsert_node(s, &n2);
+    cbm_search_params_t params = {0};
+    params.project = "app";
+    params.limit = 10;
+    cbm_search_output_t out = {0};
+    cbm_store_search(s, &params, &out);
+    ASSERT_EQ(out.count, 2);
+    bool found_dep = false, found_proj = false;
+    for (int i = 0; i < out.count; i++) {
+        if (cbm_is_dep_project(out.results[i].node.project, "app")) {
+            found_dep = true;
+            const char *sep = strstr(out.results[i].node.project, ".dep.");
+            ASSERT_NOT_NULL(sep);
+            ASSERT_STR_EQ(sep + 5, "mylib");
+        } else {
+            found_proj = true;
+        }
+    }
+    ASSERT_TRUE(found_dep);
+    ASSERT_TRUE(found_proj);
+    cbm_store_search_free(&out);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Suite registration ──────────────────────────────────── */
 
 SUITE(tool_consolidation) {
@@ -923,4 +1042,10 @@ SUITE(tool_consolidation) {
     RUN_TEST(resource_success_has_result_not_error);
     RUN_TEST(resource_schema_returns_real_data_when_indexed);
     RUN_TEST(resource_status_returns_not_indexed_when_no_store);
+    /* Dep search bug regressions */
+    RUN_TEST(dep_search_explicit_dep_project_name);
+    RUN_TEST(store_prefix_match_includes_deps);
+    RUN_TEST(store_exact_match_excludes_deps);
+    RUN_TEST(is_dep_project_cross_project_detection);
+    RUN_TEST(e2e_dep_search_returns_project_and_dep_results);
 }
