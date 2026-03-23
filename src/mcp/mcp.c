@@ -2859,7 +2859,13 @@ static char *handle_touch_project(cbm_mcp_server_t *srv, const char *args) {
         free(project);
         return cbm_mcp_text_result("watcher not running", true);
     }
-    cbm_watcher_touch(srv->watcher, project);
+    bool found = cbm_watcher_touch(srv->watcher, project);
+    if (!found) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "project '%s' not found in watch list", project);
+        free(project);
+        return cbm_mcp_text_result(msg, true);
+    }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);

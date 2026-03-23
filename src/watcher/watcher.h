@@ -45,8 +45,9 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
 /* Remove a project from the watch list. */
 void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name);
 
-/* Refresh a project's timestamp (resets adaptive backoff). */
-void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name);
+/* Refresh a project's timestamp (resets adaptive backoff).
+ * Returns true if the project was found, false otherwise. */
+bool cbm_watcher_touch(cbm_watcher_t *w, const char *project_name);
 
 /* ── Polling ────────────────────────────────────────────────────── */
 

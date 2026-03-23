@@ -1566,9 +1566,9 @@ TEST(watcher_null_watch_count) {
 
 TEST(watcher_detects_submodule_dirty) {
     /* Verify that the watcher detects uncommitted changes inside a git
-     * submodule. Without --recurse-submodules, git status only reports
-     * the submodule HEAD pointer change, not uncommitted file edits inside
-     * the submodule. */
+     * submodule even when the parent's git status ignores submodule dirty
+     * state (ignore=dirty in .gitmodules). The submodule foreach second
+     * stage in git_is_dirty() is the only detection mechanism here. */
     char parent[256], submod[256];
     snprintf(submod, sizeof(submod), "/tmp/cbm_watcher_submod_sub_XXXXXX");
     snprintf(parent, sizeof(parent), "/tmp/cbm_watcher_submod_par_XXXXXX");
@@ -1589,12 +1589,15 @@ TEST(watcher_detects_submodule_dirty) {
         SKIP("git not available");
     }
 
-    /* Init parent repo and add submodule */
+    /* Init parent repo, add submodule, and set ignore=dirty so that the
+     * parent's git status --porcelain does NOT report submodule working-tree
+     * changes. This isolates the submodule foreach second stage. */
     snprintf(cmd, sizeof(cmd),
              "cd '%s' && git init -q && git config user.email test@test && "
              "git config user.name test && "
              "git -c protocol.file.allow=always submodule add '%s' sub 2>/dev/null && "
-             "git add -A && git commit -q -m 'init parent with submod'",
+             "git config -f .gitmodules submodule.sub.ignore dirty && "
+             "git add -A && git commit -q -m 'init parent with submod (ignore=dirty)'",
              parent, submod);
     if (system(cmd) != 0) {
         snprintf(cmd, sizeof(cmd), "rm -rf '%s' '%s'", submod, parent);
@@ -1615,7 +1618,7 @@ TEST(watcher_detects_submodule_dirty) {
     snprintf(cmd, sizeof(cmd), "echo 'modified' >> '%s/sub/lib.c'", parent);
     system(cmd);
 
-    /* Touch + poll → --recurse-submodules should detect the dirty submodule */
+    /* Touch + poll → submodule foreach should detect the dirty submodule */
     cbm_watcher_touch(w, "par-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1);

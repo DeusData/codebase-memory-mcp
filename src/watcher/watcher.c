@@ -278,15 +278,17 @@ void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name) {
     }
 }
 
-void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name) {
+bool cbm_watcher_touch(cbm_watcher_t *w, const char *project_name) {
     if (!w || !project_name) {
-        return;
+        return false;
     }
     project_state_t *s = cbm_ht_get(w->projects, project_name);
     if (s) {
         /* Reset backoff — poll immediately on next cycle */
         s->next_poll_ns = 0;
+        return true;
     }
+    return false;
 }
 
 int cbm_watcher_watch_count(const cbm_watcher_t *w) {
