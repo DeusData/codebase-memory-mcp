@@ -18,6 +18,7 @@
 #include "pipeline/pipeline.h"
 #include "store/store.h"
 #include "cli/cli.h"
+#include "cli/progress_sink.h"
 #include "foundation/log.h"
 #include "foundation/compat_thread.h"
 #include "foundation/mem.h"
@@ -41,6 +42,20 @@ static cbm_watcher_t *g_watcher = NULL;
 static cbm_mcp_server_t *g_server = NULL;
 static cbm_http_server_t *g_http_server = NULL;
 static atomic_int g_shutdown = 0;
+
+/* ── CLI progress / SIGINT state ─────────────────────────────────── */
+
+/* Active pipeline during --progress CLI run; set before cbm_pipeline_run().
+ * volatile ensures the signal handler always observes the current pointer. */
+static cbm_pipeline_t *volatile g_cli_pipeline = NULL;
+
+/* SIGINT handler for CLI --progress mode: cancel the active pipeline. */
+static void cli_sigint_handler(int sig) {
+    (void)sig;
+    if (g_cli_pipeline) {
+        cbm_pipeline_cancel(g_cli_pipeline);
+    }
+}
 
 static void signal_handler(int sig) {
     (void)sig;
@@ -97,13 +112,125 @@ static int run_cli(int argc, char **argv) {
         return 1;
     }
 
+    /* Scan argv for --progress; strip it by shifting remaining args down. */
+    bool progress_enabled = false;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--progress") == 0) {
+            progress_enabled = true;
+            /* Shift remaining args left to close the gap. */
+            for (int j = i; j < argc - 1; j++) {
+                argv[j] = argv[j + 1];
+            }
+            argc--;
+            break; /* Only strip first occurrence. */
+        }
+    }
+
+    if (argc < 1) {
+        // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+        (void)fprintf(stderr, "Usage: codebase-memory-mcp cli <tool_name> [json_args]\n");
+        return 1;
+    }
+
     const char *tool_name = argv[0];
     const char *args_json = argc >= 2 ? argv[1] : "{}";
 
+    /* Install progress sink and SIGINT handler when --progress is requested. */
+    if (progress_enabled) {
+        cbm_progress_sink_init(stderr);
+#ifdef _WIN32
+        signal(SIGINT, cli_sigint_handler);
+#else
+        // NOLINTNEXTLINE(misc-include-cleaner)
+        struct sigaction sa_cli = {0};
+        // NOLINTNEXTLINE(misc-include-cleaner)
+        sa_cli.sa_handler = cli_sigint_handler;
+        sigemptyset(&sa_cli.sa_mask);
+        sa_cli.sa_flags = 0;
+        sigaction(SIGINT, &sa_cli, NULL);
+#endif
+    }
+
+    int rc = 0;
+
+    /* For index_repository with --progress: bypass cbm_mcp_handle_tool so we
+     * can set g_cli_pipeline before the blocking cbm_pipeline_run() call,
+     * enabling SIGINT cancellation via cli_sigint_handler. */
+    if (progress_enabled && strcmp(tool_name, "index_repository") == 0) {
+        char *repo_path = cbm_mcp_get_string_arg(args_json, "repo_path");
+        char *mode_str = cbm_mcp_get_string_arg(args_json, "mode");
+
+        if (!repo_path) {
+            free(mode_str);
+            // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+            (void)fprintf(stderr, "index_repository: repo_path is required\n");
+            cbm_progress_sink_fini();
+            return 1;
+        }
+
+        cbm_index_mode_t mode = CBM_MODE_FULL;
+        if (mode_str && strcmp(mode_str, "fast") == 0) {
+            mode = CBM_MODE_FAST;
+        }
+        free(mode_str);
+
+        cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
+        if (!p) {
+            free(repo_path);
+            // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+            (void)fprintf(stderr, "index_repository: failed to create pipeline\n");
+            cbm_progress_sink_fini();
+            return 1;
+        }
+
+        char *project_name = cbm_project_name_from_path(repo_path);
+
+        /* Expose pipeline to SIGINT handler before the blocking run. */
+        g_cli_pipeline = p;
+        rc = cbm_pipeline_run(p);
+        g_cli_pipeline = NULL;
+
+        cbm_pipeline_free(p);
+        cbm_mem_collect();
+
+        /* Assemble JSON result and print to stdout (same shape as
+         * handle_index_repository in mcp.c). */
+        if (rc == 0 && project_name) {
+            cbm_store_t *store = cbm_store_open(project_name);
+            int nodes = store ? cbm_store_count_nodes(store, project_name) : 0;
+            int edges = store ? cbm_store_count_edges(store, project_name) : 0;
+            if (store) {
+                cbm_store_close(store);
+            }
+            /* NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+             */
+            printf("{\"project\":\"%s\",\"status\":\"indexed\",\"nodes\":%d,\"edges\":%d}\n",
+                   project_name, nodes, edges);
+        } else {
+            /* NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+             */
+            printf("{\"project\":\"%s\",\"status\":\"error\"}\n",
+                   project_name ? project_name : "unknown");
+        }
+
+        free(project_name);
+        free(repo_path);
+        cbm_progress_sink_fini();
+        return rc == 0 ? 0 : 1;
+    }
+
+    /* Default path: delegate to cbm_mcp_handle_tool.
+     * Note: --progress is silently accepted here but no pipeline events will
+     * fire for non-index_repository tools, so nothing is emitted to stderr.
+     * This is intentional — unknown flags are silently ignored for forward
+     * compatibility. */
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     if (!srv) {
         // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
         (void)fprintf(stderr, "Failed to create server\n");
+        if (progress_enabled) {
+            cbm_progress_sink_fini();
+        }
         return 1;
     }
 
@@ -114,6 +241,9 @@ static int run_cli(int argc, char **argv) {
     }
 
     cbm_mcp_server_free(srv);
+    if (progress_enabled) {
+        cbm_progress_sink_fini();
+    }
     return 0;
 }
 
@@ -156,8 +286,26 @@ int main(int argc, char **argv) {
             return 0;
         }
         if (strcmp(argv[i], "cli") == 0) {
+            int cli_argc = argc - i - 1;
+            char **cli_argv = argv + i + 1;
+            /* Pre-scan for --progress: suppress mem.init on stderr by
+             * temporarily raising the log level to WARN before cbm_mem_init().
+             * run_cli() installs the full progress sink after arg-stripping. */
+            bool has_progress = false;
+            for (int j = 0; j < cli_argc; j++) {
+                if (strcmp(cli_argv[j], "--progress") == 0) {
+                    has_progress = true;
+                    break;
+                }
+            }
+            if (has_progress) {
+                cbm_log_set_level(CBM_LOG_WARN);
+            }
             cbm_mem_init(0.5);
-            return run_cli(argc - i - 1, argv + i + 1);
+            if (has_progress) {
+                cbm_log_set_level(CBM_LOG_INFO);
+            }
+            return run_cli(cli_argc, cli_argv);
         }
         if (strcmp(argv[i], "install") == 0) {
             return cbm_cmd_install(argc - i - 1, argv + i + 1);

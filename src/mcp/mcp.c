@@ -647,13 +647,19 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
         srv->store = NULL;
     }
 
-    /* Open project's .db file */
+    /* Open project's .db file — query-only open (no SQLITE_OPEN_CREATE) to
+     * prevent ghost .db file creation for unknown/unindexed projects. */
     char path[1024];
     project_db_path(project, path, sizeof(path));
-    srv->store = cbm_store_open_path(path);
-    srv->owns_store = true;
-    free(srv->current_project);
-    srv->current_project = heap_strdup(project);
+    srv->store = cbm_store_open_path_query(path);
+    if (srv->store) {
+        /* Only update ownership and cached project name on successful open.
+         * When the file is absent, store is NULL and current_project retains
+         * its previous value so the next call correctly retries the open. */
+        srv->owns_store = true;
+        free(srv->current_project);
+        srv->current_project = heap_strdup(project);
+    }
 
     return srv->store;
 }
@@ -755,10 +761,37 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+/* verify_project_indexed — returns a heap-allocated error JSON string when the
+ * named project has not been indexed yet, or NULL when the project exists.
+ * resolve_store uses cbm_store_open_path_query (no SQLITE_OPEN_CREATE), so
+ * store is NULL for missing .db files (REQUIRE_STORE fires first). This
+ * function catches the remaining case: a .db file exists but has no indexed
+ * nodes (e.g., an empty or half-initialised project).
+ * Callers that receive a non-NULL return value must free(project) themselves
+ * before returning the error string. */
+static char *verify_project_indexed(cbm_store_t *store, const char *project) {
+    if (!project) {
+        return NULL; /* default project — always exists */
+    }
+    cbm_project_t proj_check = {0};
+    if (cbm_store_get_project(store, project, &proj_check) != CBM_STORE_OK) {
+        return cbm_mcp_text_result(
+            "{\"error\":\"project not indexed — run index_repository first\"}", true);
+    }
+    cbm_project_free_fields(&proj_check);
+    return NULL;
+}
+
 static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
+
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed) {
+        free(project);
+        return not_indexed;
+    }
 
     cbm_schema_info_t schema = {0};
     cbm_store_get_schema(store, project, &schema);
@@ -817,6 +850,13 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
+
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed) {
+        free(project);
+        return not_indexed;
+    }
+
     char *label = cbm_mcp_get_string_arg(args, "label");
     char *name_pattern = cbm_mcp_get_string_arg(args, "name_pattern");
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
@@ -890,6 +930,13 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         free(project);
         free(query);
         return cbm_mcp_text_result("{\"error\":\"no project loaded\"}", true);
+    }
+
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed) {
+        free(project);
+        free(query);
+        return not_indexed;
     }
 
     cbm_cypher_result_t result = {0};
@@ -1022,6 +1069,12 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
 
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed) {
+        free(project);
+        return not_indexed;
+    }
+
     cbm_schema_info_t schema = {0};
     cbm_store_get_schema(store, project, &schema);
 
@@ -1095,6 +1148,15 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         free(direction);
         return cbm_mcp_text_result("{\"error\":\"no project loaded\"}", true);
     }
+
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed) {
+        free(func_name);
+        free(project);
+        free(direction);
+        return not_indexed;
+    }
+
     if (!direction) {
         direction = heap_strdup("both");
     }
@@ -1582,7 +1644,14 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     if (!store) {
         free(qn);
         free(project);
-        return cbm_mcp_text_result("no project loaded — run index_repository first", true);
+        return cbm_mcp_text_result("{\"error\":\"no project loaded\"}", true);
+    }
+
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed) {
+        free(qn);
+        free(project);
+        return not_indexed;
     }
 
     /* Default to current project (same as all other tools) */
@@ -2376,6 +2445,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     char adr_path[4096];
     snprintf(adr_path, sizeof(adr_path), "%s/adr.md", adr_dir);
 
+    char *adr_buf = NULL; /* freed after yy_doc_to_str — yyjson holds pointer, not copy */
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root_obj);
@@ -2416,12 +2486,12 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
             (void)fseek(fp, 0, SEEK_END);
             long sz = ftell(fp);
             (void)fseek(fp, 0, SEEK_SET);
-            char *buf = malloc(sz + 1);
-            size_t n = fread(buf, 1, sz, fp);
-            buf[n] = '\0';
+            adr_buf = malloc(sz + 1);
+            size_t n = fread(adr_buf, 1, sz, fp);
+            adr_buf[n] = '\0';
             (void)fclose(fp);
-            yyjson_mut_obj_add_str(doc, root_obj, "content", buf);
-            free(buf);
+            yyjson_mut_obj_add_str(doc, root_obj, "content", adr_buf);
+            /* do NOT free adr_buf here: yyjson stores the pointer, not a copy */
         } else {
             yyjson_mut_obj_add_str(doc, root_obj, "content", "");
             yyjson_mut_obj_add_str(doc, root_obj, "status", "no_adr");
@@ -2438,6 +2508,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+    free(adr_buf); /* safe to free now — doc has been serialized */
     free(root_path);
     free(project);
     free(mode_str);

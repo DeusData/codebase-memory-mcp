@@ -64,12 +64,12 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
     }
     va_end(args);
 
-    /* Write to stderr */
-    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
-    (void)fprintf(stderr, "%s\n", line_buf);
-
-    /* Send to sink if registered */
-    if (g_log_sink) {
+    /* Write to stderr only when no custom sink is registered.
+     * A registered sink takes over all output responsibility. */
+    if (!g_log_sink) {
+        // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+        (void)fprintf(stderr, "%s\n", line_buf);
+    } else {
         g_log_sink(line_buf);
     }
 }
@@ -84,10 +84,10 @@ void cbm_log_int(CBMLogLevel level, const char *msg, const char *key, int64_t va
     snprintf(line_buf, sizeof(line_buf), "level=%s msg=%s %s=%" PRId64, level_str(level),
              msg ? msg : "", key ? key : "?", value);
 
-    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
-    (void)fprintf(stderr, "%s\n", line_buf);
-
-    if (g_log_sink) {
+    if (!g_log_sink) {
+        // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+        (void)fprintf(stderr, "%s\n", line_buf);
+    } else {
         g_log_sink(line_buf);
     }
 }
