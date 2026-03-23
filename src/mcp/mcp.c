@@ -1966,6 +1966,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     char adr_path[4096];
     snprintf(adr_path, sizeof(adr_path), "%s/adr.md", adr_dir);
 
+    char *adr_buf = NULL; /* freed after yy_doc_to_str — yyjson holds pointer, not copy */
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root_obj);
@@ -2006,12 +2007,12 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
             (void)fseek(fp, 0, SEEK_END);
             long sz = ftell(fp);
             (void)fseek(fp, 0, SEEK_SET);
-            char *buf = malloc(sz + 1);
-            size_t n = fread(buf, 1, sz, fp);
-            buf[n] = '\0';
+            adr_buf = malloc(sz + 1);
+            size_t n = fread(adr_buf, 1, sz, fp);
+            adr_buf[n] = '\0';
             (void)fclose(fp);
-            yyjson_mut_obj_add_str(doc, root_obj, "content", buf);
-            free(buf);
+            yyjson_mut_obj_add_str(doc, root_obj, "content", adr_buf);
+            /* do NOT free adr_buf here: yyjson stores the pointer, not a copy */
         } else {
             yyjson_mut_obj_add_str(doc, root_obj, "content", "");
             yyjson_mut_obj_add_str(doc, root_obj, "status", "no_adr");
@@ -2028,6 +2029,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+    free(adr_buf); /* safe to free now — doc has been serialized */
     free(root_path);
     free(project);
     free(mode_str);
