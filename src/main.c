@@ -302,13 +302,16 @@ int main(int argc, char **argv) {
         g_http_server = NULL;
     }
 
+    /* Join autoindex thread first — it may reference watcher and store.
+     * cbm_mcp_server_free joins the autoindex thread internally. */
+    cbm_mcp_server_free(g_server);
+
     if (watcher_started) {
         cbm_watcher_stop(g_watcher);
         cbm_thread_join(&watcher_tid);
     }
     cbm_watcher_free(g_watcher);
     cbm_store_close(watch_store);
-    cbm_mcp_server_free(g_server);
     cbm_config_close(runtime_config);
 
     g_watcher = NULL;

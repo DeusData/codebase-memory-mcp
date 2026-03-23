@@ -154,14 +154,19 @@ static int strategy_key_symbols(cbm_gbuf_t *gb) {
         return 0;
     }
 
-    config_entry_t config_entries[4096];
+    /* Heap-allocate: these structs are too large for stack (4MB+ total),
+     * which causes SIGBUS in background threads with default 512KB stack. */
+    config_entry_t *config_entries = calloc(4096, sizeof(config_entry_t));
+    if (!config_entries) return 0;
     int config_count = collect_config_entries(vars, var_count, config_entries, 4096);
 
     if (config_count == 0) {
+        free(config_entries);
         return 0;
     }
 
-    code_entry_t code_entries[8192];
+    code_entry_t *code_entries = calloc(8192, sizeof(code_entry_t));
+    if (!code_entries) { free(config_entries); return 0; }
     int code_count = collect_code_entries(gb, code_entries, 8192);
 
     int edge_count = 0;
@@ -191,6 +196,8 @@ static int strategy_key_symbols(cbm_gbuf_t *gb) {
         }
     }
 
+    free(config_entries);
+    free(code_entries);
     return edge_count;
 }
 
@@ -276,10 +283,12 @@ static int strategy_dep_imports(cbm_gbuf_t *gb) {
         return 0;
     }
 
-    dep_entry_t deps[2048];
+    dep_entry_t *deps = calloc(2048, sizeof(dep_entry_t));
+    if (!deps) return 0;
     int dep_count = collect_manifest_deps(vars, var_count, deps, 2048);
 
     if (dep_count == 0) {
+        free(deps);
         return 0;
     }
 
@@ -349,7 +358,7 @@ static int strategy_dep_imports(cbm_gbuf_t *gb) {
         }
     }
 
-    /* gbuf data is borrowed — no free */
+    free(deps);
     return edge_count;
 }
 
