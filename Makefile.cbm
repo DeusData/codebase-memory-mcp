@@ -4,8 +4,15 @@
 #   make -f Makefile.cbm test           # Build + run all tests (ASan + UBSan)
 #   make -f Makefile.cbm test-foundation # Foundation tests only (fast)
 #   make -f Makefile.cbm test-tsan      # Thread sanitizer build
-#   make -f Makefile.cbm cbm            # Production binary
+#   make -f Makefile.cbm cbm            # Production binary (auto-signed on macOS)
+#   make -f Makefile.cbm install        # Build + install to INSTALL_DIR (default ~/.local/bin)
 #   make -f Makefile.cbm clean-c        # Remove build artifacts
+#
+# macOS signing note:
+#   macOS 25+ enforces ad-hoc code signatures on binaries.  Copying a binary
+#   without re-signing causes immediate SIGKILL at runtime.  This Makefile
+#   runs `codesign --force --sign -` automatically after every build and
+#   install step on macOS.  On Linux and other platforms the step is a no-op.
 
 # Compiler selection — override via: make CC=gcc CXX=g++
 # macOS: cc (Apple Clang) — universal binary with ASan support
@@ -34,6 +41,33 @@ LIBGIT2_FLAGS = -DHAVE_LIBGIT2 $(LIBGIT2_CFLAGS)
 else
 LIBGIT2_FLAGS =
 LIBGIT2_LIBS =
+endif
+
+# ── Platform detection & code signing ───────────────────────────
+# macOS 25+ kills unsigned or invalidly-signed binaries with SIGKILL.
+# codesign --force --sign - applies an ad-hoc signature (no Apple Developer
+# account required).  On Linux/other platforms this entire block is a no-op.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+CODESIGN_BIN := $(shell command -v codesign 2>/dev/null)
+ifneq ($(CODESIGN_BIN),)
+# codesign is available — sign and report
+define codesign_binary
+	@$(CODESIGN_BIN) --force --sign - $(1) 2>&1 && \
+		echo "  ✓ signed $(1) (ad-hoc, macOS 25+ compatible)" || \
+		{ echo "  ✗ WARNING: codesign failed for $(1) — binary may crash on macOS 25+"; true; }
+endef
+else
+# codesign not found — warn but don't fail the build
+define codesign_binary
+	@echo "  ✗ WARNING: codesign not found — $(1) may crash on macOS 25+ (install Xcode CLT)"
+endef
+endif
+else
+# Non-macOS: signing is a documented no-op
+define codesign_binary
+	@echo "  (signing skipped — not macOS)"
+endef
 endif
 
 # GCC-only warning suppressions (Clang rejects unknown -Wno-* with -Werror).
@@ -323,7 +357,7 @@ PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format
+.PHONY: test test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format install
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -446,6 +480,17 @@ $(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(
 
 cbm: $(BUILD_DIR)/codebase-memory-mcp
 	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp"
+	$(call codesign_binary,$(BUILD_DIR)/codebase-memory-mcp)
+
+# ── Install to INSTALL_DIR (default ~/.local/bin) ────────────────
+# Re-signs after copy — required on macOS 25+ where cp invalidates the
+# existing ad-hoc signature and an unsigned binary gets SIGKILL at startup.
+INSTALL_DIR ?= $(HOME)/.local/bin
+install: cbm
+	@echo "Installing to $(INSTALL_DIR)/codebase-memory-mcp ..."
+	cp $(BUILD_DIR)/codebase-memory-mcp $(INSTALL_DIR)/codebase-memory-mcp
+	$(call codesign_binary,$(INSTALL_DIR)/codebase-memory-mcp)
+	@echo "Done. Run: $(INSTALL_DIR)/codebase-memory-mcp"
 
 # ── Build with embedded UI (requires Node.js) ───────────────────
 
