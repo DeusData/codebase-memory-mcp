@@ -72,6 +72,33 @@ services:
       WINEDEBUG=-all wine64 build/c/test-runner.exe &&
       echo '=== Windows test: OK ==='
 
+  # ── Smoke test (build + run smoke-test.sh) ──────────────────
+  smoke:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile
+    platform: linux/arm64
+    volumes:
+      - ..:/src
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        scripts/build.sh CC=gcc CXX=g++ &&
+        scripts/smoke-test.sh ./build/c/codebase-memory-mcp
+
+  smoke-amd64:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile
+    platform: linux/amd64
+    volumes:
+      - ..:/src
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        scripts/build.sh CC=gcc CXX=g++ &&
+        scripts/smoke-test.sh ./build/c/codebase-memory-mcp
+
   # ── Lint ────────────────────────────────────────────────────
   lint:
     build:

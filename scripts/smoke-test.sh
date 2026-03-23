@@ -177,15 +177,23 @@ cat > "$SHUTDOWN_TMPDIR/input.jsonl" << 'JSONL'
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
 JSONL
 
-# Run binary with EOF and check it exits within 5 seconds
-timeout 5 "$BINARY" < "$SHUTDOWN_TMPDIR/input.jsonl" > /dev/null 2>&1 || true
-EXIT_CODE=$?
-rm -rf "$SHUTDOWN_TMPDIR"
-
-if [ "$EXIT_CODE" -eq 124 ]; then
+# Run binary with EOF and wait up to 5 seconds (portable — no `timeout` needed)
+"$BINARY" < "$SHUTDOWN_TMPDIR/input.jsonl" > /dev/null 2>&1 &
+SHUTDOWN_PID=$!
+SHUTDOWN_WAITED=0
+while kill -0 "$SHUTDOWN_PID" 2>/dev/null && [ "$SHUTDOWN_WAITED" -lt 5 ]; do
+  sleep 1
+  SHUTDOWN_WAITED=$((SHUTDOWN_WAITED + 1))
+done
+if kill -0 "$SHUTDOWN_PID" 2>/dev/null; then
+  kill "$SHUTDOWN_PID" 2>/dev/null || true
+  wait "$SHUTDOWN_PID" 2>/dev/null || true
+  rm -rf "$SHUTDOWN_TMPDIR"
   echo "FAIL: binary did not exit within 5 seconds after EOF"
   exit 1
 fi
+wait "$SHUTDOWN_PID" 2>/dev/null || true
+rm -rf "$SHUTDOWN_TMPDIR"
 echo "OK: clean shutdown"
 
 # 4b: No residual processes (skip on Windows/MSYS2 where pgrep may not work)
@@ -336,6 +344,90 @@ fi
 echo "OK: Content-Length framing works (OpenCode compatible)"
 
 rm -f "$MCP_CL_INPUT" "$MCP_CL_OUTPUT" "$MCP_TOOL_INPUT" "$MCP_TOOL_OUTPUT"
+
+echo ""
+echo "=== Phase 6: CLI subcommands ==="
+
+# 6a: install --dry-run -y
+echo "--- Phase 6a: install --dry-run ---"
+INSTALL_OUT=$("$BINARY" install --dry-run -y 2>&1)
+if ! echo "$INSTALL_OUT" | grep -qi 'install\|skill\|mcp\|agent'; then
+  echo "FAIL: install --dry-run produced unexpected output"
+  echo "$INSTALL_OUT"
+  exit 1
+fi
+if ! echo "$INSTALL_OUT" | grep -qi 'dry-run'; then
+  echo "FAIL: install --dry-run did not indicate dry-run mode"
+  exit 1
+fi
+echo "OK: install --dry-run completed"
+
+# 6b: uninstall --dry-run -y
+echo "--- Phase 6b: uninstall --dry-run ---"
+UNINSTALL_OUT=$("$BINARY" uninstall --dry-run -y 2>&1)
+if ! echo "$UNINSTALL_OUT" | grep -qi 'uninstall\|remov'; then
+  echo "FAIL: uninstall --dry-run produced unexpected output"
+  echo "$UNINSTALL_OUT"
+  exit 1
+fi
+echo "OK: uninstall --dry-run completed"
+
+# 6c: update --dry-run --standard -y
+echo "--- Phase 6c: update --dry-run ---"
+UPDATE_OUT=$("$BINARY" update --dry-run --standard -y 2>&1)
+if ! echo "$UPDATE_OUT" | grep -qi 'dry-run'; then
+  echo "FAIL: update --dry-run did not indicate dry-run mode"
+  echo "$UPDATE_OUT"
+  exit 1
+fi
+if ! echo "$UPDATE_OUT" | grep -qi 'standard'; then
+  echo "FAIL: update --dry-run did not respect --standard flag"
+  exit 1
+fi
+echo "OK: update --dry-run --standard completed"
+
+# 6d: config set/get/reset round-trip
+echo "--- Phase 6d: config set/get/reset ---"
+"$BINARY" config set auto_index true 2>/dev/null
+CONFIG_VAL=$("$BINARY" config get auto_index 2>/dev/null)
+if ! echo "$CONFIG_VAL" | grep -q 'true'; then
+  echo "FAIL: config get auto_index returned '$CONFIG_VAL', expected 'true'"
+  exit 1
+fi
+"$BINARY" config reset auto_index 2>/dev/null
+echo "OK: config set/get/reset round-trip"
+
+echo ""
+echo "=== Phase 7: MCP advanced tool calls ==="
+
+# 7a: search_code via MCP (graph-augmented v2)
+echo "--- Phase 7a: search_code via MCP ---"
+MCP_SC_INPUT=$(mktemp)
+MCP_SC_OUTPUT=$(mktemp)
+cat > "$MCP_SC_INPUT" << SCEOF
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"1.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"index_repository","arguments":{"repo_path":"$TMPDIR","mode":"fast"}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_code","arguments":{"pattern":"compute","mode":"compact","limit":3}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_code_snippet","arguments":{"qualified_name":"compute"}}}
+SCEOF
+
+mcp_run "$MCP_SC_INPUT" "$MCP_SC_OUTPUT" 30
+
+if ! grep -q '"id":3' "$MCP_SC_OUTPUT"; then
+  echo "FAIL: search_code response (id:3) missing"
+  exit 1
+fi
+echo "OK: search_code v2 via MCP"
+
+# 7b: get_code_snippet via MCP
+if ! grep -q '"id":4' "$MCP_SC_OUTPUT"; then
+  echo "FAIL: get_code_snippet response (id:4) missing"
+  exit 1
+fi
+echo "OK: get_code_snippet via MCP"
+
+rm -f "$MCP_SC_INPUT" "$MCP_SC_OUTPUT"
 
 echo ""
 echo "=== smoke-test: ALL PASSED ==="

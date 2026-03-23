@@ -258,17 +258,34 @@ int cbm_copy_file(const char *src, const char *dst) {
     return rc == 0 ? 0 : -1;
 }
 
-/* Replace a binary file: unlink first (handles read-only existing files),
- * then create with the given data and permissions. */
+/* Replace a binary file. Unlinks the old file first (handles read-only and
+ * running binaries on Unix where unlink succeeds on open files). On all
+ * platforms, the caller should tell the user to restart after update. */
 int cbm_replace_binary(const char *path, const unsigned char *data, int len, int mode) {
     if (!path || !data || len <= 0) {
         return -1;
     }
 
-    /* Remove existing file first — handles the case where the old binary
-     * has no write permission (e.g., 0500). unlink() only requires write
-     * permission on the parent directory, not the file itself. */
-    (void)cbm_unlink(path);
+    /* Remove existing file if it exists. On Unix, unlink works even if the
+     * binary is running (inode stays alive until the process exits). On Windows,
+     * unlink fails on running .exe — rename it aside as fallback. */
+    struct stat st_check;
+    if (stat(path, &st_check) == 0) {
+        /* File exists — remove or rename it */
+        if (cbm_unlink(path) != 0) {
+#ifdef _WIN32
+            /* Windows: can't unlink running .exe — rename aside */
+            char old_path[1024];
+            snprintf(old_path, sizeof(old_path), "%s.old", path);
+            (void)cbm_unlink(old_path);
+            if (rename(path, old_path) != 0) {
+                return -1;
+            }
+#else
+            return -1;
+#endif
+        }
+    }
 
 #ifndef _WIN32
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, (mode_t)mode);
@@ -281,6 +298,7 @@ int cbm_replace_binary(const char *path, const unsigned char *data, int len, int
         return -1;
     }
 #else
+    (void)mode;
     FILE *f = fopen(path, "wb");
     if (!f) {
         return -1;
@@ -2705,6 +2723,18 @@ int cbm_cmd_uninstall(int argc, char **argv) {
 int cbm_cmd_update(int argc, char **argv) {
     parse_auto_answer(argc, argv);
 
+    bool dry_run = false;
+    int variant_flag = 0; /* 0 = ask, 1 = standard, 2 = ui */
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--dry-run") == 0) {
+            dry_run = true;
+        } else if (strcmp(argv[i], "--standard") == 0) {
+            variant_flag = 1;
+        } else if (strcmp(argv[i], "--ui") == 0) {
+            variant_flag = 2;
+        }
+    }
+
     const char *home = cbm_get_home_dir();
     if (!home) {
         fprintf(stderr, "error: HOME not set (use USERPROFILE on Windows)\n");
@@ -2734,28 +2764,38 @@ int cbm_cmd_update(int argc, char **argv) {
         printf("Found %d existing index(es) that must be rebuilt after update:\n", index_count);
         cbm_list_indexes(home);
         printf("\n");
-        if (!prompt_yn("Delete these indexes and continue with update?")) {
-            printf("Update cancelled.\n");
+        if (!dry_run) {
+            if (!prompt_yn("Delete these indexes and continue with update?")) {
+                printf("Update cancelled.\n");
+                return 1;
+            }
+            int removed = cbm_remove_indexes(home);
+            printf("Removed %d index(es).\n\n", removed);
+        } else {
+            printf("(dry-run — indexes would be deleted)\n\n");
+        }
+    }
+
+    /* Step 2: Determine variant (--standard / --ui flags skip interactive prompt) */
+    bool want_ui = false;
+    if (variant_flag == 1) {
+        want_ui = false;
+    } else if (variant_flag == 2) {
+        want_ui = true;
+    } else {
+        printf("Which binary variant do you want?\n");
+        printf("  1) standard  — MCP server only\n");
+        printf("  2) ui        — MCP server + embedded graph visualization\n");
+        printf("Choose (1/2): ");
+        (void)fflush(stdout);
+
+        char choice[16];
+        if (!fgets(choice, sizeof(choice), stdin)) {
+            fprintf(stderr, "error: failed to read input\n");
             return 1;
         }
-        int removed = cbm_remove_indexes(home);
-        printf("Removed %d index(es).\n\n", removed);
+        want_ui = (choice[0] == '2');
     }
-
-    /* Step 2: Ask for UI variant */
-    printf("Which binary variant do you want?\n");
-    printf("  1) standard  — MCP server only\n");
-    printf("  2) ui        — MCP server + embedded graph visualization\n");
-    printf("Choose (1/2): ");
-    (void)fflush(stdout);
-
-    char choice[16];
-    if (!fgets(choice, sizeof(choice), stdin)) {
-        fprintf(stderr, "error: failed to read input\n");
-        return 1;
-    }
-    // NOLINTNEXTLINE(readability-implicit-bool-conversion)
-    bool want_ui = (choice[0] == '2') ? true : false;
     // NOLINTNEXTLINE(readability-implicit-bool-conversion)
     const char *variant = want_ui ? "ui-" : "";
     // NOLINTNEXTLINE(readability-implicit-bool-conversion)
@@ -2779,8 +2819,22 @@ int cbm_cmd_update(int argc, char **argv) {
                  os, arch, ext);
     }
 
-    printf("\nDownloading %s binary for %s/%s ...\n", variant_label, os, arch);
+    if (dry_run) {
+        printf("\nWould download %s binary for %s/%s ...\n", variant_label, os, arch);
+    } else {
+        printf("\nDownloading %s binary for %s/%s ...\n", variant_label, os, arch);
+    }
     printf("  %s\n", url);
+
+    if (dry_run) {
+        printf("\n(dry-run — skipping download, extraction, and binary replacement)\n");
+        printf("  target: %s/.local/bin/codebase-memory-mcp\n", home);
+        printf("  variant: %s\n", variant_label);
+        printf("  os/arch: %s/%s\n", os, arch);
+        printf("\nUpdate dry-run complete.\n");
+        (void)variant;
+        return 0;
+    }
 
     /* Step 4: Download using curl */
     char tmp_archive[256];
@@ -2897,6 +2951,7 @@ int cbm_cmd_update(int argc, char **argv) {
 
     printf("\nAll project indexes were cleared. They will be rebuilt\n");
     printf("automatically when you next use the MCP server.\n");
+    printf("\nPlease restart your MCP client to use the new binary.\n");
     (void)variant;
     return 0;
 }
