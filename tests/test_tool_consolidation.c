@@ -351,7 +351,11 @@ TEST(resources_read_unknown_uri) {
         "\"params\":{\"uri\":\"codebase://nonexistent\"}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "error"));
-    ASSERT_NOT_NULL(strstr(resp, "Unknown resource URI"));
+    /* MCP spec: resource not found = -32002 */
+    ASSERT_NOT_NULL(strstr(resp, "-32002"));
+    /* Error message should include the bad URI and list valid resources */
+    ASSERT_NOT_NULL(strstr(resp, "codebase://nonexistent"));
+    ASSERT_NOT_NULL(strstr(resp, "codebase://schema"));
     free(resp);
     cbm_mcp_server_free(srv);
     PASS();
