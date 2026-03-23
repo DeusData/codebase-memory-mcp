@@ -1188,6 +1188,129 @@ TEST(prefix_collision_session_is_substring_of_project) {
     PASS();
 }
 
+/* ── 16. get_code NULL-project regression tests ─────────── */
+
+/* Bug: Tier 1-3 use WHERE project = ?1, so they return nothing when project
+ * is NULL (SQL NULL comparison is always false). Fix: eff_project falls back
+ * to srv->current_project when the caller omits the project param.
+ *
+ * Test: after search_graph opens a store, get_code with no project param
+ * should resolve via Tier 1 exact QN match. */
+TEST(get_code_no_project_uses_open_store_tier1) {
+    /* Create a file DB with one node */
+    char db_path[1024];
+    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_gc_proj_.db",
+             getenv("HOME"));
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "_tc_gc_proj_", "/tmp");
+    cbm_node_t n = {.project = "_tc_gc_proj_", .label = "Function",
+                    .name = "tc_resolve_fn",
+                    .qualified_name = "_tc_gc_proj_.src.tc_resolve_fn",
+                    .file_path = "src/tc_resolve_fn.c"};
+    cbm_store_upsert_node(s, &n);
+    cbm_store_close(s);
+
+    /* Create server; call search_graph to open the store (sets current_project) */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *sr = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"project\":\"_tc_gc_proj_\",\"name_pattern\":\"tc_resolve_fn\",\"limit\":1}");
+    ASSERT_NOT_NULL(sr);
+    free(sr);
+
+    /* get_code with no project param — eff_project must fall back to current_project */
+    char *gr = cbm_mcp_handle_tool(srv, "get_code",
+        "{\"qualified_name\":\"_tc_gc_proj_.src.tc_resolve_fn\"}");
+    ASSERT_NOT_NULL(gr);
+    /* Must NOT be ambiguous — Tier 1 exact QN should resolve via eff_project */
+    ASSERT_NULL(strstr(gr, "\"ambiguous\""));
+    /* Must contain the function name in the response */
+    ASSERT_NOT_NULL(strstr(gr, "tc_resolve_fn"));
+    free(gr);
+
+    cbm_mcp_server_free(srv);
+    (void)unlink(db_path);
+    PASS();
+}
+
+/* Bug: Tier 4 fuzzy search finding exactly 1 result returned status=ambiguous.
+ * Fix: when fuzzy_count == 1, resolve immediately instead of calling
+ * snippet_suggestions which always sets status=ambiguous. */
+TEST(get_code_single_fuzzy_result_resolves_not_ambiguous) {
+    /* Create a file DB with one node */
+    char db_path[1024];
+    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_gc_fuzzy_.db",
+             getenv("HOME"));
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "_tc_gc_fuzzy_", "/tmp");
+    cbm_node_t n = {.project = "_tc_gc_fuzzy_", .label = "Function",
+                    .name = "tc_unique_fuzzy_fn",
+                    .qualified_name = "_tc_gc_fuzzy_.src.tc_unique_fuzzy_fn",
+                    .file_path = "src/tc_unique_fuzzy_fn.c"};
+    cbm_store_upsert_node(s, &n);
+    cbm_store_close(s);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    /* Open the store via search_graph so current_project is set */
+    char *sr = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"project\":\"_tc_gc_fuzzy_\",\"name_pattern\":\"tc_unique_fuzzy_fn\",\"limit\":1}");
+    ASSERT_NOT_NULL(sr);
+    free(sr);
+
+    /* QN with a wrong prefix — Tiers 1-3 will miss, Tier 4 fuzzy finds 1 by name */
+    char *gr = cbm_mcp_handle_tool(srv, "get_code",
+        "{\"qualified_name\":\"wrong.prefix.tc_unique_fuzzy_fn\"}");
+    ASSERT_NOT_NULL(gr);
+    /* Must NOT be ambiguous — single fuzzy result should auto-resolve */
+    ASSERT_NULL(strstr(gr, "\"ambiguous\""));
+    /* Must contain the function name */
+    ASSERT_NOT_NULL(strstr(gr, "tc_unique_fuzzy_fn"));
+    free(gr);
+
+    cbm_mcp_server_free(srv);
+    (void)unlink(db_path);
+    PASS();
+}
+
+/* Option C: cold-start test — no prior search_code_graph call.
+ * extract_project_from_qn() must find the DB by scanning dot-prefixes of the
+ * QN, so get_code works even when srv->current_project is unset. */
+TEST(get_code_cold_start_parses_project_from_qn) {
+    char db_path[1024];
+    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_gc_cold_.db",
+             getenv("HOME"));
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "_tc_gc_cold_", "/tmp");
+    cbm_node_t n = {.project = "_tc_gc_cold_", .label = "Function",
+                    .name = "tc_cold_fn",
+                    .qualified_name = "_tc_gc_cold_.src.tc_cold_fn",
+                    .file_path = "src/tc_cold_fn.c"};
+    cbm_store_upsert_node(s, &n);
+    cbm_store_close(s);
+
+    /* Fresh server — no prior tool calls, srv->current_project is unset */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* get_code with no project — must parse "_tc_gc_cold_" from the QN */
+    char *gr = cbm_mcp_handle_tool(srv, "get_code",
+        "{\"qualified_name\":\"_tc_gc_cold_.src.tc_cold_fn\"}");
+    ASSERT_NOT_NULL(gr);
+    /* Cold-start Option C: must resolve, not return ambiguous or not-found */
+    ASSERT_NULL(strstr(gr, "\"ambiguous\""));
+    ASSERT_NULL(strstr(gr, "\"error\""));
+    ASSERT_NOT_NULL(strstr(gr, "tc_cold_fn"));
+    free(gr);
+
+    cbm_mcp_server_free(srv);
+    (void)unlink(db_path);
+    PASS();
+}
+
 /* ── Suite registration ──────────────────────────────────── */
 
 SUITE(tool_consolidation) {
@@ -1268,4 +1391,8 @@ SUITE(tool_consolidation) {
     RUN_TEST(prefix_collision_longer_name_with_dot_not_dep);
     RUN_TEST(prefix_collision_completely_different_project);
     RUN_TEST(prefix_collision_session_is_substring_of_project);
+    /* get_code NULL-project regression */
+    RUN_TEST(get_code_no_project_uses_open_store_tier1);
+    RUN_TEST(get_code_single_fuzzy_result_resolves_not_ambiguous);
+    RUN_TEST(get_code_cold_start_parses_project_from_qn);
 }

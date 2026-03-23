@@ -816,6 +816,54 @@ static const char *project_db_path(const char *project, char *buf, size_t bufsz)
     return buf;
 }
 
+/* ── QN project extraction ─────────────────────────────────────── */
+
+/* Try to identify the project prefix of a qualified name by scanning each
+ * dot-separated prefix and checking if a matching DB file exists.
+ * Returns a heap-allocated project name (caller must free), or NULL if no
+ * matching DB is found.  Cost: one access() call per dot in the QN (~5-10). */
+static char *extract_project_from_qn(const char *qn) {
+    if (!qn) return NULL;
+    const char *home = getenv("HOME");
+    if (!home) return NULL;
+
+    /* Scan each dot-separated prefix of the QN and test if a matching DB file
+     * exists.  Walk left-to-right so the last hit is the longest (most
+     * specific) match.  Record only the winning offset to do a single strdup
+     * at the end — avoids repeated alloc/free on multi-dot project names. */
+    size_t qn_len = strlen(qn);
+    char *candidate = malloc(qn_len + 1);
+    if (!candidate) return NULL;
+    memcpy(candidate, qn, qn_len + 1);
+
+    size_t best_end = 0; /* length of the longest matching prefix found */
+    char db_path[1024];
+    const char *home_val = home;
+
+    for (size_t i = 0; i < qn_len; i++) {
+        if (candidate[i] == '.') {
+            candidate[i] = '\0';
+            snprintf(db_path, sizeof(db_path),
+                     "%s/.cache/codebase-memory-mcp/%s.db", home_val, candidate);
+            if (access(db_path, F_OK) == 0) {
+                best_end = i; /* length of this prefix */
+            }
+            candidate[i] = '.';
+        }
+    }
+
+    char *result = NULL;
+    if (best_end > 0) {
+        result = malloc(best_end + 1);
+        if (result) {
+            memcpy(result, qn, best_end);
+            result[best_end] = '\0';
+        }
+    }
+    free(candidate);
+    return result; /* NULL if no matching DB found; caller frees */
+}
+
 /* ── Store resolution ──────────────────────────────────────────── */
 
 /* Open the right project's .db file for query tools.
@@ -2513,6 +2561,24 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     char *qn = cbm_mcp_get_string_arg(args, "qualified_name");
     char *project = cbm_mcp_get_string_arg(args, "project");
     cbm_store_t *store = resolve_store(srv, project);
+    /* When no project param given, try to parse the project prefix from the
+     * qualified name by checking for a matching .db file.  This is Option C:
+     * the QN is self-describing, so we can always open the right store even on
+     * a cold start (no prior search_code_graph call).
+     * Falls back to the currently-open store's project as a secondary option. */
+    const char *eff_project = project;
+    if (!eff_project && qn) {
+        /* Option C: QN is self-describing — try to find the project prefix by
+         * checking for a matching .db file.  assign into project so the
+         * existing free(project) calls at every exit path own the memory. */
+        project = extract_project_from_qn(qn);
+        if (project) {
+            eff_project = project;
+            store = resolve_store(srv, project); /* open the correct DB */
+        } else if (srv->current_project && srv->current_project[0]) {
+            eff_project = srv->current_project; /* fallback: last-used project */
+        }
+    }
     bool auto_resolve = cbm_mcp_get_bool_arg(args, "auto_resolve");
     bool include_neighbors = cbm_mcp_get_bool_arg(args, "include_neighbors");
     int cfg_max_lines = cbm_config_get_int(srv->config, CBM_CONFIG_SNIPPET_MAX_LINES,
@@ -2539,7 +2605,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
 
     /* Tier 1: Exact QN match */
     cbm_node_t node = {0};
-    int rc = cbm_store_find_node_by_qn(store, project, qn, &node);
+    int rc = cbm_store_find_node_by_qn(store, eff_project, qn, &node);
     if (rc == CBM_STORE_OK) {
         char *result =
             build_snippet_response(srv, &node, NULL /*exact*/, include_neighbors, NULL, 0,
@@ -2554,7 +2620,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     /* Tier 2: QN suffix match */
     cbm_node_t *suffix_nodes = NULL;
     int suffix_count = 0;
-    cbm_store_find_nodes_by_qn_suffix(store, project, qn, &suffix_nodes, &suffix_count);
+    cbm_store_find_nodes_by_qn_suffix(store, eff_project, qn, &suffix_nodes, &suffix_count);
     if (suffix_count == 1) {
         copy_node(&suffix_nodes[0], &node);
         cbm_store_free_nodes(suffix_nodes, suffix_count);
@@ -2570,7 +2636,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     /* Tier 3: Short name match */
     cbm_node_t *name_nodes = NULL;
     int name_count = 0;
-    cbm_store_find_nodes_by_name(store, project, qn, &name_nodes, &name_count);
+    cbm_store_find_nodes_by_name(store, eff_project, qn, &name_nodes, &name_count);
     if (name_count == 1) {
         copy_node(&name_nodes[0], &node);
         cbm_store_free_nodes(name_nodes, name_count);
@@ -2610,8 +2676,22 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         cbm_store_free_nodes(suffix_nodes, suffix_count);
         cbm_store_free_nodes(name_nodes, name_count);
 
-        /* Auto-resolve: pick best candidate by degree */
-        if (auto_resolve && cand_count >= 2 && cand_count <= 2) {
+        /* Single candidate after dedup — resolve immediately, not ambiguous */
+        if (cand_count == 1) {
+            copy_node(&candidates[0], &node);
+            free_node_contents(&candidates[0]);
+            free(candidates);
+            char *result = build_snippet_response(srv, &node, "name", include_neighbors, NULL, 0,
+                                                         max_lines, snippet_mode);
+            free_node_contents(&node);
+            free(qn);
+            free(project);
+            free(snippet_mode);
+            return result;
+        }
+
+        /* Auto-resolve: pick best candidate by degree when 2+ candidates */
+        if (auto_resolve && cand_count >= 2) {
             /* Find best: highest total degree, prefer non-test files */
             int best_idx = 0;
             int best_deg = -1;
@@ -2687,7 +2767,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
 
     /* Use search with name pattern for fuzzy matching */
     cbm_search_params_t params = {0};
-    params.project = project;
+    params.project = eff_project;
     params.name_pattern = search_name;
     params.limit = 5;
     params.min_degree = -1;
@@ -2704,6 +2784,20 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         }
         int fuzzy_count = search_out.count;
         cbm_store_search_free(&search_out);
+
+        /* Single fuzzy result — resolve immediately rather than reporting ambiguous */
+        if (fuzzy_count == 1) {
+            copy_node(&fuzzy[0], &node);
+            free_node_contents(&fuzzy[0]);
+            free(fuzzy);
+            char *result = build_snippet_response(srv, &node, "fuzzy", include_neighbors, NULL, 0,
+                                                         max_lines, snippet_mode);
+            free_node_contents(&node);
+            free(qn);
+            free(project);
+            free(snippet_mode);
+            return result;
+        }
 
         char *result = snippet_suggestions(qn, fuzzy, fuzzy_count);
         for (int i = 0; i < fuzzy_count; i++) {
