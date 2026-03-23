@@ -9,6 +9,7 @@
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <depindex/depindex.h>
+#include <yyjson/yyjson.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -985,9 +986,54 @@ TEST(e2e_dep_search_returns_project_and_dep_results) {
     PASS();
 }
 
+/* ── 14. MCP protocol conformance (binary-level) ─────────── */
+
+TEST(all_tools_have_object_inputSchema) {
+    /* BUG found by dogfooding: _hidden_tools had inputSchema as a JSON string
+     * instead of a JSON object. Claude Code rejected the entire tools/list,
+     * making all 3 real tools invisible. MCP spec requires inputSchema to be
+     * a JSON Schema object, not a serialized string.
+     * This test parses the tools/list JSON and verifies every tool's
+     * inputSchema is a JSON object (not string, not null, not array). */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
+    ASSERT_NOT_NULL(resp);
+
+    /* Parse the response and check each tool */
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *result = yyjson_obj_get(root, "result");
+    ASSERT_NOT_NULL(result);
+    yyjson_val *tools = yyjson_obj_get(result, "tools");
+    ASSERT_NOT_NULL(tools);
+    ASSERT_TRUE(yyjson_is_arr(tools));
+
+    size_t idx, max;
+    yyjson_val *tool;
+    yyjson_arr_foreach(tools, idx, max, tool) {
+        yyjson_val *name = yyjson_obj_get(tool, "name");
+        yyjson_val *schema = yyjson_obj_get(tool, "inputSchema");
+        const char *tool_name = yyjson_get_str(name);
+        /* inputSchema MUST be a JSON object, NOT a string */
+        ASSERT_NOT_NULL(schema);
+        ASSERT_TRUE(yyjson_is_obj(schema));  /* fails if string/null/array */
+        (void)tool_name; /* used for debugging if assertion fails */
+    }
+
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* ── Suite registration ──────────────────────────────────── */
 
 SUITE(tool_consolidation) {
+    /* MCP protocol conformance */
+    RUN_TEST(all_tools_have_object_inputSchema);
     /* Tool visibility */
     RUN_TEST(streamlined_mode_shows_3_tools);
     RUN_TEST(classic_mode_shows_all_15_tools);
