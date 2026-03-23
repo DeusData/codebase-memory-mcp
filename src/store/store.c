@@ -1784,7 +1784,7 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     struct {
         enum { BV_TEXT } type;
         const char *text;
-    } binds[16];
+    } binds[32]; /* 16 base params + up to 16 exclude patterns */
 
 #define ADD_WHERE(cond)                                                    \
     do {                                                                   \
@@ -1863,6 +1863,19 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         }
         snprintf(excl_clause + elen, sizeof(excl_clause) - (size_t)elen, ")");
         ADD_WHERE(excl_clause);
+    }
+
+    /* Exclude paths: add NOT LIKE clauses for each glob pattern */
+    char *exclude_like_patterns[16] = {0};
+    int exclude_count = 0;
+    if (params->exclude_paths) {
+        for (int i = 0; params->exclude_paths[i] && exclude_count < 16; i++) {
+            exclude_like_patterns[exclude_count] = cbm_glob_to_like(params->exclude_paths[i]);
+            snprintf(bind_buf, sizeof(bind_buf), "n.file_path NOT LIKE ?%d", bind_idx + 1);
+            ADD_WHERE(bind_buf);
+            BIND_TEXT(exclude_like_patterns[exclude_count]);
+            exclude_count++;
+        }
     }
 
     /* Build full SQL */
@@ -1963,6 +1976,7 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     if (rc != SQLITE_OK) {
         store_set_error_sqlite(s, "search prepare");
         free(like_pattern);
+        for (int i = 0; i < exclude_count; i++) free(exclude_like_patterns[i]);
         return CBM_STORE_ERR;
     }
 
@@ -1989,6 +2003,7 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
 
     sqlite3_finalize(main_stmt);
     free(like_pattern);
+    for (int i = 0; i < exclude_count; i++) free(exclude_like_patterns[i]);
 
     out->results = results;
     out->count = n;

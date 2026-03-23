@@ -1544,6 +1544,127 @@ TEST(empty_db_not_treated_as_indexed) {
     PASS();
 }
 
+/* ── Exclude param tests ─────────────────────────────────── */
+
+TEST(search_exclude_filters_file_paths) {
+    /* exclude param should remove matching results */
+    char db_path[1024];
+    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_exclude_test_.db",
+             getenv("HOME"));
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "_tc_exclude_test_", "/tmp/exclude_test");
+    cbm_node_t n1 = {.project = "_tc_exclude_test_", .label = "Function",
+                     .name = "core_fn", .qualified_name = "_tc_exclude_test_.core_fn",
+                     .file_path = "src/main.c"};
+    cbm_node_t n2 = {.project = "_tc_exclude_test_", .label = "Function",
+                     .name = "test_fn", .qualified_name = "_tc_exclude_test_.test_fn",
+                     .file_path = "tests/test_main.c"};
+    cbm_node_t n3 = {.project = "_tc_exclude_test_", .label = "Function",
+                     .name = "script_fn", .qualified_name = "_tc_exclude_test_.script_fn",
+                     .file_path = "scripts/setup.sh"};
+    cbm_store_upsert_node(s, &n1);
+    cbm_store_upsert_node(s, &n2);
+    cbm_store_upsert_node(s, &n3);
+    cbm_store_close(s);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* Without exclude: should find all 3 */
+    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+        "{\"project\":\"_tc_exclude_test_\",\"limit\":10}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "core_fn"));
+    ASSERT_NOT_NULL(strstr(resp, "test_fn"));
+    ASSERT_NOT_NULL(strstr(resp, "script_fn"));
+    free(resp);
+
+    /* With exclude: should filter out tests and scripts */
+    resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+        "{\"project\":\"_tc_exclude_test_\",\"limit\":10,"
+        "\"exclude\":[\"tests/**\",\"scripts/**\"]}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "core_fn"));
+    ASSERT_NULL(strstr(resp, "test_fn"));
+    ASSERT_NULL(strstr(resp, "script_fn"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    (void)unlink(db_path);
+    PASS();
+}
+
+TEST(search_exclude_empty_array_no_effect) {
+    /* Empty exclude array should not filter anything */
+    char db_path[1024];
+    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_excl_empty_.db",
+             getenv("HOME"));
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "_tc_excl_empty_", "/tmp/excl_empty");
+    cbm_node_t n1 = {.project = "_tc_excl_empty_", .label = "Function",
+                     .name = "fn1", .qualified_name = "_tc_excl_empty_.fn1",
+                     .file_path = "src/a.c"};
+    cbm_store_upsert_node(s, &n1);
+    cbm_store_close(s);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+        "{\"project\":\"_tc_excl_empty_\",\"limit\":10,\"exclude\":[]}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "fn1"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    (void)unlink(db_path);
+    PASS();
+}
+
+TEST(search_exclude_all_returns_empty) {
+    /* Excluding everything should return 0 results, not error */
+    char db_path[1024];
+    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_excl_all_.db",
+             getenv("HOME"));
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "_tc_excl_all_", "/tmp/excl_all");
+    cbm_node_t n1 = {.project = "_tc_excl_all_", .label = "Function",
+                     .name = "fn1", .qualified_name = "_tc_excl_all_.fn1",
+                     .file_path = "src/a.c"};
+    cbm_store_upsert_node(s, &n1);
+    cbm_store_close(s);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+        "{\"project\":\"_tc_excl_all_\",\"limit\":10,\"exclude\":[\"**\"]}");
+    ASSERT_NOT_NULL(resp);
+    /* Should not contain fn1 (it was excluded) and should not be an error */
+    ASSERT_NULL(strstr(resp, "fn1"));
+    /* The response should contain "results" (empty array) not an error */
+    ASSERT_NOT_NULL(strstr(resp, "results"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    (void)unlink(db_path);
+    PASS();
+}
+
+TEST(exclude_param_in_tool_schema) {
+    /* Both streamlined and classic tool schemas should include exclude param */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *tools = cbm_mcp_tools_list(srv);
+    ASSERT_NOT_NULL(tools);
+    /* search_code_graph should have exclude */
+    ASSERT_NOT_NULL(strstr(tools, "\"exclude\""));
+    free(tools);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* ── Suite registration ──────────────────────────────────── */
 
 SUITE(tool_consolidation) {
@@ -1636,4 +1757,9 @@ SUITE(tool_consolidation) {
     RUN_TEST(compact_defaults_to_true);
     RUN_TEST(pagerank_output_has_limited_precision);
     RUN_TEST(empty_db_not_treated_as_indexed);
+    /* Exclude param */
+    RUN_TEST(search_exclude_filters_file_paths);
+    RUN_TEST(search_exclude_empty_array_no_effect);
+    RUN_TEST(search_exclude_all_returns_empty);
+    RUN_TEST(exclude_param_in_tool_schema);
 }
