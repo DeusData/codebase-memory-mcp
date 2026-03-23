@@ -914,6 +914,15 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     srv->owns_store = true;
     free(srv->current_project);
     srv->current_project = heap_strdup(db_project);
+    /* Register newly-accessed project with watcher (root_path from DB) */
+    if (srv->watcher && srv->store) {
+        cbm_project_t proj = {0};
+        if (cbm_store_get_project(srv->store, db_project, &proj) == CBM_STORE_OK
+            && proj.root_path && proj.root_path[0]) {
+            cbm_watcher_watch(srv->watcher, db_project, proj.root_path);
+            cbm_project_free_fields(&proj);  /* store.h:578 */
+        }
+    }
 
     return srv->store;
 }
@@ -2266,6 +2275,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             /* Compute PageRank + LinkRank on full graph (project + deps).
              * Uses config-backed edge weights when config is available. */
             cbm_pagerank_compute_with_config(store, project_name, srv->config);
+            /* Register project with watcher so future file changes trigger auto-reindex */
+            if (srv->watcher)
+                cbm_watcher_watch(srv->watcher, project_name, repo_path);
 
             int nodes = cbm_store_count_nodes(store, project_name);
             int edges = cbm_store_count_edges(store, project_name);
