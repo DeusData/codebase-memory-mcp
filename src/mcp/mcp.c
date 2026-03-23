@@ -487,6 +487,11 @@ char *cbm_mcp_initialize_response(void) {
     yyjson_mut_val *caps = yyjson_mut_obj(doc);
     yyjson_mut_val *tools_cap = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_val(doc, caps, "tools", tools_cap);
+    /* Advertise MCP resources capability — clients can read codebase://schema etc. */
+    yyjson_mut_val *res_cap = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_bool(doc, res_cap, "subscribe", false);
+    yyjson_mut_obj_add_bool(doc, res_cap, "listChanged", true);
+    yyjson_mut_obj_add_val(doc, caps, "resources", res_cap);
     yyjson_mut_obj_add_val(doc, root, "capabilities", caps);
 
     char *out = yy_doc_to_str(doc);
@@ -594,6 +599,9 @@ bool cbm_mcp_get_bool_arg(const char *args_json, const char *key) {
  *  MCP SERVER
  * ══════════════════════════════════════════════════════════════════ */
 
+/* Forward declarations for functions defined after first use */
+static void notify_resources_updated(cbm_mcp_server_t *srv);
+
 struct cbm_mcp_server {
     cbm_store_t *store;        /* currently open project store (or NULL) */
     bool owns_store;           /* true if we opened the store */
@@ -613,6 +621,8 @@ struct cbm_mcp_server {
     cbm_thread_t autoindex_tid;
     bool autoindex_active; /* true if auto-index thread was started */
     bool context_injected; /* true after first _context header sent (Phase 9) */
+    bool client_has_resources; /* true if client advertised resources capability */
+    FILE *out_stream;          /* stdout for sending notifications (set in server_run) */
 };
 
 /* ── Tool list (needs full struct definition above) ──────────── */
@@ -891,6 +901,10 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
     /* Always include session_project */
     if (srv->session_project[0])
         yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
+
+    /* If client supports MCP resources, skip _context injection — client reads
+     * codebase://schema, codebase://architecture, codebase://status instead. */
+    if (srv->client_has_resources) return;
 
     if (srv->context_injected) return;
     srv->context_injected = true;
@@ -2162,6 +2176,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     if (srv->session_project[0])
         yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
 
+    /* Notify resource-capable clients that graph data changed */
+    if (rc == 0) notify_resources_updated(srv);
+
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     free(project_name);
@@ -3135,6 +3152,9 @@ static char *handle_index_dependencies(cbm_mcp_server_t *srv, const char *args) 
     /* Recompute PageRank after adding dep nodes so relevance sort includes them */
     cbm_pagerank_compute_default(store, project);
 
+    /* Notify resource-capable clients that graph data changed */
+    notify_resources_updated(srv);
+
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     yyjson_doc_free(doc_args);
@@ -3291,6 +3311,7 @@ static void *autoindex_thread(void *arg) {
         }
 
         cbm_log_info("autoindex.done", "project", srv->session_project);
+        notify_resources_updated(srv);
         if (srv->watcher) {
             cbm_watcher_watch(srv->watcher, srv->session_project, srv->session_root);
         }
@@ -3476,6 +3497,302 @@ static char *inject_update_notice(cbm_mcp_server_t *srv, char *result_json) {
     return result_json;
 }
 
+/* ── MCP Resources (Phase 10) ─────────────────────────────────── */
+
+/* Send a JSON-RPC notification (no id) to the client's output stream.
+ * Used for notifications/resources/updated after index operations. */
+static void send_notification(cbm_mcp_server_t *srv, const char *method) {
+    if (!srv || !srv->out_stream) return;
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+    yyjson_mut_obj_add_str(doc, root, "method", method);
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    if (json) {
+        (void)fprintf(srv->out_stream, "%s\n", json);
+        (void)fflush(srv->out_stream);
+        free(json);
+    }
+}
+
+/* Send notifications/resources/updated after index operations. */
+static void notify_resources_updated(cbm_mcp_server_t *srv) {
+    if (srv->client_has_resources)
+        send_notification(srv, "notifications/resources/updated");
+}
+
+/* Handle resources/list — return 3 resource URIs. */
+static char *handle_resources_list(cbm_mcp_server_t *srv) {
+    (void)srv;
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+
+    /* Resource 1: schema */
+    yyjson_mut_val *r1 = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, r1, "uri", "codebase://schema");
+    yyjson_mut_obj_add_str(doc, r1, "name", "Code Graph Schema");
+    yyjson_mut_obj_add_str(doc, r1, "description",
+        "Node labels and edge types with counts in the indexed code graph.");
+    yyjson_mut_obj_add_str(doc, r1, "mimeType", "application/json");
+    yyjson_mut_arr_add_val(arr, r1);
+
+    /* Resource 2: architecture */
+    yyjson_mut_val *r2 = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, r2, "uri", "codebase://architecture");
+    yyjson_mut_obj_add_str(doc, r2, "name", "Architecture Overview");
+    yyjson_mut_obj_add_str(doc, r2, "description",
+        "Graph size, key functions by PageRank, and relationship patterns.");
+    yyjson_mut_obj_add_str(doc, r2, "mimeType", "application/json");
+    yyjson_mut_arr_add_val(arr, r2);
+
+    /* Resource 3: status */
+    yyjson_mut_val *r3 = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, r3, "uri", "codebase://status");
+    yyjson_mut_obj_add_str(doc, r3, "name", "Index Status");
+    yyjson_mut_obj_add_str(doc, r3, "description",
+        "Indexing status, node/edge counts, PageRank stats, detected ecosystem, dependencies.");
+    yyjson_mut_obj_add_str(doc, r3, "mimeType", "application/json");
+    yyjson_mut_arr_add_val(arr, r3);
+
+    yyjson_mut_obj_add_val(doc, root, "resources", arr);
+    char *out = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return out;
+}
+
+/* Build schema resource content (reuses inject_context_once logic). */
+static void build_resource_schema(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                  cbm_mcp_server_t *srv) {
+    cbm_store_t *store = srv->store;
+    const char *proj = srv->session_project[0] ? srv->session_project : NULL;
+
+    if (!store) {
+        yyjson_mut_obj_add_str(doc, root, "status", "not_indexed");
+        return;
+    }
+
+    cbm_schema_info_t schema = {0};
+    cbm_store_get_schema(store, proj, &schema);
+
+    yyjson_mut_val *label_arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < schema.node_label_count; i++) {
+        yyjson_mut_val *lbl = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, lbl, "label", schema.node_labels[i].label);
+        yyjson_mut_obj_add_int(doc, lbl, "count", schema.node_labels[i].count);
+        yyjson_mut_arr_add_val(label_arr, lbl);
+    }
+    yyjson_mut_obj_add_val(doc, root, "node_labels", label_arr);
+
+    yyjson_mut_val *type_arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < schema.edge_type_count; i++) {
+        yyjson_mut_val *et = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, et, "type", schema.edge_types[i].type);
+        yyjson_mut_obj_add_int(doc, et, "count", schema.edge_types[i].count);
+        yyjson_mut_arr_add_val(type_arr, et);
+    }
+    yyjson_mut_obj_add_val(doc, root, "edge_types", type_arr);
+    cbm_store_schema_free(&schema);
+}
+
+/* Build architecture resource content. */
+static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                        cbm_mcp_server_t *srv) {
+    cbm_store_t *store = srv->store;
+    const char *proj = srv->session_project[0] ? srv->session_project : NULL;
+
+    if (!store) {
+        yyjson_mut_obj_add_str(doc, root, "status", "not_indexed");
+        return;
+    }
+
+    int nodes = cbm_store_count_nodes(store, proj);
+    int edges = cbm_store_count_edges(store, proj);
+    yyjson_mut_obj_add_int(doc, root, "total_nodes", nodes);
+    yyjson_mut_obj_add_int(doc, root, "total_edges", edges);
+
+    /* Key functions by PageRank (top 10) */
+    struct sqlite3 *db = cbm_store_get_db(store);
+    if (db && proj) {
+        sqlite3_stmt *stmt = NULL;
+        const char *sql =
+            "SELECT n.name, n.qualified_name, n.label, n.file_path, pr.rank "
+            "FROM pagerank pr JOIN nodes n ON n.id = pr.node_id "
+            "WHERE pr.project = ?1 ORDER BY pr.rank DESC LIMIT 10";
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, proj, -1, SQLITE_TRANSIENT);
+            yyjson_mut_val *kf_arr = yyjson_mut_arr(doc);
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                yyjson_mut_val *kf = yyjson_mut_obj(doc);
+                const char *name = (const char *)sqlite3_column_text(stmt, 0);
+                const char *qn = (const char *)sqlite3_column_text(stmt, 1);
+                const char *label = (const char *)sqlite3_column_text(stmt, 2);
+                const char *fp = (const char *)sqlite3_column_text(stmt, 3);
+                double rank = sqlite3_column_double(stmt, 4);
+                if (name) yyjson_mut_obj_add_strcpy(doc, kf, "name", name);
+                if (qn) yyjson_mut_obj_add_strcpy(doc, kf, "qualified_name", qn);
+                if (label) yyjson_mut_obj_add_strcpy(doc, kf, "label", label);
+                if (fp) yyjson_mut_obj_add_strcpy(doc, kf, "file_path", fp);
+                yyjson_mut_obj_add_real(doc, kf, "pagerank", rank);
+                yyjson_mut_arr_add_val(kf_arr, kf);
+            }
+            yyjson_mut_obj_add_val(doc, root, "key_functions", kf_arr);
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    /* Relationship patterns from schema */
+    cbm_schema_info_t schema = {0};
+    cbm_store_get_schema(store, proj, &schema);
+    if (schema.rel_pattern_count > 0) {
+        yyjson_mut_val *rp_arr = yyjson_mut_arr(doc);
+        for (int i = 0; i < schema.rel_pattern_count; i++) {
+            yyjson_mut_arr_add_strcpy(doc, rp_arr, schema.rel_patterns[i]);
+        }
+        yyjson_mut_obj_add_val(doc, root, "relationship_patterns", rp_arr);
+    }
+    cbm_store_schema_free(&schema);
+}
+
+/* Build status resource content. */
+static void build_resource_status(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                  cbm_mcp_server_t *srv) {
+    cbm_store_t *store = srv->store;
+    const char *proj = srv->session_project[0] ? srv->session_project : NULL;
+
+    if (proj) yyjson_mut_obj_add_str(doc, root, "project", proj);
+
+    if (!store) {
+        yyjson_mut_obj_add_str(doc, root, "status", "not_indexed");
+        return;
+    }
+
+    int nodes = cbm_store_count_nodes(store, proj);
+    int edges = cbm_store_count_edges(store, proj);
+    yyjson_mut_obj_add_str(doc, root, "status", nodes > 0 ? "ready" : "empty");
+    yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
+    yyjson_mut_obj_add_int(doc, root, "edges", edges);
+
+    /* PageRank stats */
+    struct sqlite3 *db = cbm_store_get_db(store);
+    if (db && proj) {
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(db,
+                "SELECT COUNT(*), MAX(computed_at) FROM pagerank WHERE project = ?1",
+                -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, proj, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                int ranked = sqlite3_column_int(stmt, 0);
+                if (ranked > 0) {
+                    yyjson_mut_obj_add_int(doc, root, "ranked_nodes", ranked);
+                    const char *ts = (const char *)sqlite3_column_text(stmt, 1);
+                    if (ts) yyjson_mut_obj_add_strcpy(doc, root, "pagerank_computed_at", ts);
+                }
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    /* Detected ecosystem */
+    if (srv->session_root[0]) {
+        cbm_pkg_manager_t eco = cbm_detect_ecosystem(srv->session_root);
+        if (eco != CBM_PKG_COUNT)
+            yyjson_mut_obj_add_str(doc, root, "detected_ecosystem",
+                                   cbm_pkg_manager_str(eco));
+    }
+
+    /* Dependencies — query projects table for dep entries */
+    if (db && proj) {
+        sqlite3_stmt *stmt = NULL;
+        char pattern[512];
+        snprintf(pattern, sizeof(pattern), "%s.dep.%%", proj);
+        if (sqlite3_prepare_v2(db,
+                "SELECT name FROM projects WHERE name LIKE ?1 ORDER BY name",
+                -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, pattern, -1, SQLITE_TRANSIENT);
+            yyjson_mut_val *dep_arr = yyjson_mut_arr(doc);
+            int dep_count = 0;
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                const char *dname = (const char *)sqlite3_column_text(stmt, 0);
+                if (dname) {
+                    yyjson_mut_val *d = yyjson_mut_obj(doc);
+                    yyjson_mut_obj_add_strcpy(doc, d, "name", dname);
+                    int dn = cbm_store_count_nodes(store, dname);
+                    yyjson_mut_obj_add_int(doc, d, "nodes", dn);
+                    yyjson_mut_arr_add_val(dep_arr, d);
+                    dep_count++;
+                }
+            }
+            sqlite3_finalize(stmt);
+            if (dep_count > 0)
+                yyjson_mut_obj_add_val(doc, root, "dependencies", dep_arr);
+        }
+    }
+}
+
+/* Handle resources/read — dispatch by URI. */
+static char *handle_resources_read(cbm_mcp_server_t *srv, const char *params_raw) {
+    /* Extract URI from params */
+    char *uri = NULL;
+    if (params_raw) {
+        yyjson_doc *pdoc = yyjson_read(params_raw, strlen(params_raw), 0);
+        if (pdoc) {
+            yyjson_val *u = yyjson_obj_get(yyjson_doc_get_root(pdoc), "uri");
+            if (u && yyjson_is_str(u))
+                uri = heap_strdup(yyjson_get_str(u));
+            yyjson_doc_free(pdoc);
+        }
+    }
+    if (!uri)
+        return cbm_jsonrpc_format_error(0, -32602, "Missing uri parameter");
+
+    /* Build resource content */
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    yyjson_mut_val *content_obj = yyjson_mut_obj(doc);
+
+    if (strcmp(uri, "codebase://schema") == 0) {
+        build_resource_schema(doc, content_obj, srv);
+    } else if (strcmp(uri, "codebase://architecture") == 0) {
+        build_resource_architecture(doc, content_obj, srv);
+    } else if (strcmp(uri, "codebase://status") == 0) {
+        build_resource_status(doc, content_obj, srv);
+    } else {
+        yyjson_mut_doc_free(doc);
+        free(uri);
+        return cbm_jsonrpc_format_error(0, -32602, "Unknown resource URI");
+    }
+
+    /* Format as resources/read response: {contents: [{uri, mimeType, text}]} */
+    char *content_json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+
+    yyjson_mut_doc *rdoc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *rroot = yyjson_mut_obj(rdoc);
+    yyjson_mut_doc_set_root(rdoc, rroot);
+
+    yyjson_mut_val *contents = yyjson_mut_arr(rdoc);
+    yyjson_mut_val *item = yyjson_mut_obj(rdoc);
+    yyjson_mut_obj_add_strcpy(rdoc, item, "uri", uri);
+    yyjson_mut_obj_add_str(rdoc, item, "mimeType", "application/json");
+    if (content_json)
+        yyjson_mut_obj_add_strcpy(rdoc, item, "text", content_json);
+    yyjson_mut_arr_add_val(contents, item);
+    yyjson_mut_obj_add_val(rdoc, rroot, "contents", contents);
+
+    char *out = yy_doc_to_str(rdoc);
+    yyjson_mut_doc_free(rdoc);
+    free(content_json);
+    free(uri);
+    return out;
+}
+
 /* ── Server request handler ───────────────────────────────────── */
 
 char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
@@ -3494,9 +3811,24 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
 
     if (strcmp(req.method, "initialize") == 0) {
         result_json = cbm_mcp_initialize_response();
+        /* Parse client capabilities to detect resources support */
+        if (req.params_raw) {
+            yyjson_doc *pdoc = yyjson_read(req.params_raw, strlen(req.params_raw), 0);
+            if (pdoc) {
+                yyjson_val *proot = yyjson_doc_get_root(pdoc);
+                yyjson_val *ccaps = yyjson_obj_get(proot, "capabilities");
+                if (ccaps && yyjson_obj_get(ccaps, "resources"))
+                    srv->client_has_resources = true;
+                yyjson_doc_free(pdoc);
+            }
+        }
         start_update_check(srv);
         detect_session(srv);
         maybe_auto_index(srv);
+    } else if (strcmp(req.method, "resources/list") == 0) {
+        result_json = handle_resources_list(srv);
+    } else if (strcmp(req.method, "resources/read") == 0) {
+        result_json = handle_resources_read(srv, req.params_raw);
     } else if (strcmp(req.method, "tools/list") == 0) {
         result_json = cbm_mcp_tools_list(srv);
     } else if (strcmp(req.method, "tools/call") == 0) {
@@ -3528,6 +3860,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
 
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
+    srv->out_stream = out; /* store for sending notifications */
     char *line = NULL;
     size_t cap = 0;
     int fd = cbm_fileno(in);

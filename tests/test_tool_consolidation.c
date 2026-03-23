@@ -280,6 +280,143 @@ TEST(context_has_schema_info) {
     PASS();
 }
 
+/* ── 7. MCP Resources tests (Phase 10) ───────────────────── */
+
+TEST(resources_list_returns_3_resources) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/list\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "codebase://schema"));
+    ASSERT_NOT_NULL(strstr(resp, "codebase://architecture"));
+    ASSERT_NOT_NULL(strstr(resp, "codebase://status"));
+    ASSERT_NOT_NULL(strstr(resp, "Code Graph Schema"));
+    ASSERT_NOT_NULL(strstr(resp, "Architecture Overview"));
+    ASSERT_NOT_NULL(strstr(resp, "Index Status"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(resources_read_schema) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/read\","
+        "\"params\":{\"uri\":\"codebase://schema\"}}");
+    ASSERT_NOT_NULL(resp);
+    /* Response should contain contents array with schema data */
+    ASSERT_NOT_NULL(strstr(resp, "contents"));
+    ASSERT_NOT_NULL(strstr(resp, "codebase://schema"));
+    ASSERT_NOT_NULL(strstr(resp, "application/json"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(resources_read_architecture) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"resources/read\","
+        "\"params\":{\"uri\":\"codebase://architecture\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "contents"));
+    ASSERT_NOT_NULL(strstr(resp, "codebase://architecture"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(resources_read_status) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"resources/read\","
+        "\"params\":{\"uri\":\"codebase://status\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "contents"));
+    ASSERT_NOT_NULL(strstr(resp, "codebase://status"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(resources_read_unknown_uri) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"resources/read\","
+        "\"params\":{\"uri\":\"codebase://nonexistent\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "error"));
+    ASSERT_NOT_NULL(strstr(resp, "Unknown resource URI"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(initialize_advertises_resources_capability) {
+    char *resp = cbm_mcp_initialize_response();
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "resources"));
+    ASSERT_NOT_NULL(strstr(resp, "listChanged"));
+    free(resp);
+    PASS();
+}
+
+TEST(initialize_parses_client_resources_capability) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    /* Send initialize with client capabilities including resources */
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+        "\"params\":{\"protocolVersion\":\"2024-11-05\","
+        "\"capabilities\":{\"resources\":{\"subscribe\":false}},"
+        "\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+
+    /* After initialize with resources capability, context injection should be skipped.
+     * Call a tool — should have session_project but NOT _context. */
+    char *result = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"name_pattern\":\"x\"}");
+    ASSERT_NOT_NULL(result);
+    /* session_project should still appear */
+    ASSERT_NOT_NULL(strstr(result, "session_project") != NULL ?
+        strstr(result, "session_project") : result);
+    /* _context should NOT appear (client uses resources/read instead) */
+    ASSERT_NULL(strstr(result, "_context"));
+    free(result);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(no_resources_capability_gets_context_injection) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    /* Send initialize WITHOUT resources capability */
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+        "\"params\":{\"protocolVersion\":\"2024-11-05\","
+        "\"capabilities\":{},"
+        "\"clientInfo\":{\"name\":\"old-client\",\"version\":\"1.0\"}}}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+
+    /* Without resources capability, first tool call should get _context */
+    char *result = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"name_pattern\":\"x\"}");
+    ASSERT_NOT_NULL(result);
+    ASSERT_NOT_NULL(strstr(result, "_context"));
+    free(result);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* ── Suite registration ──────────────────────────────────── */
 
 SUITE(tool_consolidation) {
@@ -305,4 +442,13 @@ SUITE(tool_consolidation) {
     /* Context injection */
     RUN_TEST(first_response_has_context_header);
     RUN_TEST(context_has_schema_info);
+    /* MCP Resources (Phase 10) */
+    RUN_TEST(resources_list_returns_3_resources);
+    RUN_TEST(resources_read_schema);
+    RUN_TEST(resources_read_architecture);
+    RUN_TEST(resources_read_status);
+    RUN_TEST(resources_read_unknown_uri);
+    RUN_TEST(initialize_advertises_resources_capability);
+    RUN_TEST(initialize_parses_client_resources_capability);
+    RUN_TEST(no_resources_capability_gets_context_injection);
 }

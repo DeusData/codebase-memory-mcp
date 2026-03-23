@@ -33,6 +33,7 @@ Thumbs.db
 # Local project memory (Claude Code auto-memory)
 memory/
 reference/
+.claude/
 
 # Build artifacts
 build/
