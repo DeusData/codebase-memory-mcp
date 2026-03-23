@@ -421,6 +421,305 @@ TEST(no_resources_capability_gets_context_injection) {
     PASS();
 }
 
+/* ── 8. MCP spec compliance tests ─────────────────────────── */
+
+TEST(initialize_response_has_protocol_version) {
+    char *resp = cbm_mcp_initialize_response();
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "protocolVersion"));
+    ASSERT_NOT_NULL(strstr(resp, "2024-11-05"));
+    ASSERT_NOT_NULL(strstr(resp, "serverInfo"));
+    ASSERT_NOT_NULL(strstr(resp, "codebase-memory-mcp"));
+    free(resp);
+    PASS();
+}
+
+TEST(initialize_resources_cap_subscribe_false) {
+    /* Server must advertise subscribe:false (we don't support per-resource subscriptions) */
+    char *resp = cbm_mcp_initialize_response();
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"subscribe\":false"));
+    ASSERT_NOT_NULL(strstr(resp, "\"listChanged\":true"));
+    free(resp);
+    PASS();
+}
+
+TEST(resources_list_has_mimeType_and_description) {
+    /* MCP spec requires name, uri; recommends description and mimeType */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/list\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "mimeType"));
+    ASSERT_NOT_NULL(strstr(resp, "application/json"));
+    ASSERT_NOT_NULL(strstr(resp, "description"));
+    ASSERT_NOT_NULL(strstr(resp, "name"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(resources_read_response_has_contents_array) {
+    /* MCP spec: resources/read returns {contents: [{uri, mimeType, text}]} */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\","
+        "\"params\":{\"uri\":\"codebase://status\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"contents\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"uri\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"mimeType\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"text\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(resources_read_missing_uri_param) {
+    /* resources/read with no uri → error -32602 (invalid params) */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\","
+        "\"params\":{}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "error"));
+    ASSERT_NOT_NULL(strstr(resp, "Missing uri"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(resources_read_no_params_at_all) {
+    /* resources/read with no params object */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "error"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── 9. Client behavioral difference tests ───────────────── */
+
+TEST(resource_client_never_gets_context_across_multiple_calls) {
+    /* Resource-capable client should NEVER see _context, even across many calls */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+        "\"params\":{\"protocolVersion\":\"2024-11-05\","
+        "\"capabilities\":{\"resources\":{}},"
+        "\"clientInfo\":{\"name\":\"modern\",\"version\":\"2.0\"}}}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+
+    /* 3 consecutive tool calls — none should have _context */
+    for (int i = 0; i < 3; i++) {
+        char *r = cbm_mcp_handle_tool(srv, "search_graph",
+            "{\"name_pattern\":\"test\"}");
+        ASSERT_NOT_NULL(r);
+        ASSERT_NULL(strstr(r, "_context"));
+        /* But session_project should always be present */
+        ASSERT_NOT_NULL(strstr(r, "session_project"));
+        free(r);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(legacy_client_gets_context_only_on_first_call) {
+    /* Legacy client: _context on first call, NOT on subsequent calls */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+        "\"params\":{\"protocolVersion\":\"2024-11-05\","
+        "\"capabilities\":{},"
+        "\"clientInfo\":{\"name\":\"legacy\",\"version\":\"1.0\"}}}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+
+    /* First call: MUST have _context */
+    char *r1 = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"name_pattern\":\"test\"}");
+    ASSERT_NOT_NULL(r1);
+    ASSERT_NOT_NULL(strstr(r1, "_context"));
+    free(r1);
+
+    /* Second call: must NOT have _context (one-shot) */
+    char *r2 = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"name_pattern\":\"test2\"}");
+    ASSERT_NOT_NULL(r2);
+    ASSERT_NULL(strstr(r2, "_context"));
+    ASSERT_NOT_NULL(strstr(r2, "session_project"));
+    free(r2);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(empty_resources_capability_counts_as_support) {
+    /* MCP spec: capabilities.resources:{} means resources supported
+     * (neither subscribe nor listChanged, but resources protocol works) */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+        "\"params\":{\"protocolVersion\":\"2024-11-05\","
+        "\"capabilities\":{\"resources\":{}},"
+        "\"clientInfo\":{\"name\":\"minimal\",\"version\":\"1.0\"}}}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+
+    /* Empty resources:{} still means client supports resources → no _context */
+    char *r = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"name_pattern\":\"x\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(strstr(r, "_context"));
+    free(r);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(no_initialize_defaults_to_legacy_behavior) {
+    /* Server with no initialize call → defaults to legacy (no resources) */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    /* Call tool directly without initialize → should get _context (legacy) */
+    char *r = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"name_pattern\":\"x\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "_context"));
+    free(r);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── 10. Error message quality tests ─────────────────────── */
+
+TEST(error_no_project_loaded_has_hint) {
+    /* search_graph with a nonexistent project name → resolve_store returns NULL
+     * but cbm_mcp_server_new creates a default store. Use a project name that
+     * won't match any DB file to trigger the error. The REQUIRE_STORE macro
+     * in search_graph handles auto-index, but for a fake project path it will
+     * still fail and return the hint. Test via the error structure in trace. */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    /* trace_call_path goes through REQUIRE_STORE → no project loaded if store NULL.
+     * With cbm_mcp_server_new(NULL), resolve_store(NULL) returns the default store.
+     * The function_not_found error (which also has hint) tests the pattern. */
+    char *r = cbm_mcp_handle_tool(srv, "trace_call_path",
+        "{\"function_name\":\"nonexistent_fn\"}");
+    ASSERT_NOT_NULL(r);
+    /* The response should have a hint field (either "no project loaded" or "not found") */
+    ASSERT_NOT_NULL(strstr(r, "hint"));
+    free(r);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(error_function_not_found_includes_name) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *r = cbm_mcp_handle_tool(srv, "trace_call_path",
+        "{\"function_name\":\"nonexistent_xyz_func\"}");
+    ASSERT_NOT_NULL(r);
+    /* Error should include the function name that was searched for */
+    ASSERT_NOT_NULL(strstr(r, "nonexistent_xyz_func"));
+    ASSERT_NOT_NULL(strstr(r, "hint"));
+    free(r);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(error_symbol_not_found_includes_qn) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *r = cbm_mcp_handle_tool(srv, "get_code_snippet",
+        "{\"qualified_name\":\"nonexistent.module.func_xyz\"}");
+    ASSERT_NOT_NULL(r);
+    /* Error should include the qualified name that was searched for */
+    ASSERT_NOT_NULL(strstr(r, "nonexistent.module.func_xyz"));
+    ASSERT_NOT_NULL(strstr(r, "hint"));
+    free(r);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(error_missing_required_param_has_hint) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* query_graph missing query param */
+    char *r1 = cbm_mcp_handle_tool(srv, "query_graph", "{}");
+    ASSERT_NOT_NULL(r1);
+    ASSERT_NOT_NULL(strstr(r1, "query is required"));
+    ASSERT_NOT_NULL(strstr(r1, "hint"));
+    free(r1);
+
+    /* trace_call_path missing function_name */
+    char *r2 = cbm_mcp_handle_tool(srv, "trace_call_path", "{}");
+    ASSERT_NOT_NULL(r2);
+    ASSERT_NOT_NULL(strstr(r2, "function_name is required"));
+    ASSERT_NOT_NULL(strstr(r2, "hint"));
+    free(r2);
+
+    /* get_code_snippet missing qualified_name */
+    char *r3 = cbm_mcp_handle_tool(srv, "get_code_snippet", "{}");
+    ASSERT_NOT_NULL(r3);
+    ASSERT_NOT_NULL(strstr(r3, "qualified_name is required"));
+    ASSERT_NOT_NULL(strstr(r3, "hint"));
+    free(r3);
+
+    /* search_code missing pattern */
+    char *r4 = cbm_mcp_handle_tool(srv, "search_code", "{}");
+    ASSERT_NOT_NULL(r4);
+    ASSERT_NOT_NULL(strstr(r4, "pattern is required"));
+    ASSERT_NOT_NULL(strstr(r4, "hint"));
+    free(r4);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(error_unknown_tool_lists_valid_tools) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *r = cbm_mcp_handle_tool(srv, "nonexistent_tool_xyz", "{}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "nonexistent_tool_xyz"));
+    ASSERT_NOT_NULL(strstr(r, "hint"));
+    ASSERT_NOT_NULL(strstr(r, "search_code_graph"));
+    ASSERT_NOT_NULL(strstr(r, "tools/list"));
+    free(r);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(error_resource_not_found_has_spec_code) {
+    /* MCP spec: resource not found = -32002 with actionable message */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\","
+        "\"params\":{\"uri\":\"codebase://bad_uri_xyz\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "-32002"));
+    ASSERT_NOT_NULL(strstr(resp, "bad_uri_xyz"));
+    ASSERT_NOT_NULL(strstr(resp, "codebase://schema"));
+    ASSERT_NOT_NULL(strstr(resp, "resources/list"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* ── Suite registration ──────────────────────────────────── */
 
 SUITE(tool_consolidation) {
@@ -455,4 +754,23 @@ SUITE(tool_consolidation) {
     RUN_TEST(initialize_advertises_resources_capability);
     RUN_TEST(initialize_parses_client_resources_capability);
     RUN_TEST(no_resources_capability_gets_context_injection);
+    /* MCP spec compliance */
+    RUN_TEST(initialize_response_has_protocol_version);
+    RUN_TEST(initialize_resources_cap_subscribe_false);
+    RUN_TEST(resources_list_has_mimeType_and_description);
+    RUN_TEST(resources_read_response_has_contents_array);
+    RUN_TEST(resources_read_missing_uri_param);
+    RUN_TEST(resources_read_no_params_at_all);
+    /* Client behavioral differences */
+    RUN_TEST(resource_client_never_gets_context_across_multiple_calls);
+    RUN_TEST(legacy_client_gets_context_only_on_first_call);
+    RUN_TEST(empty_resources_capability_counts_as_support);
+    RUN_TEST(no_initialize_defaults_to_legacy_behavior);
+    /* Error message quality */
+    RUN_TEST(error_no_project_loaded_has_hint);
+    RUN_TEST(error_function_not_found_includes_name);
+    RUN_TEST(error_symbol_not_found_includes_qn);
+    RUN_TEST(error_missing_required_param_has_hint);
+    RUN_TEST(error_unknown_tool_lists_valid_tools);
+    RUN_TEST(error_resource_not_found_has_spec_code);
 }

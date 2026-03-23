@@ -1513,12 +1513,16 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
 
     if (!query) {
         free(project);
-        return cbm_mcp_text_result("query is required", true);
+        return cbm_mcp_text_result(
+            "{\"error\":\"query is required\","
+            "\"hint\":\"Pass a Cypher query string, e.g. MATCH (n:Function) RETURN n.name LIMIT 10\"}", true);
     }
     if (!store) {
         free(project);
         free(query);
-        return cbm_mcp_text_result("{\"error\":\"no project loaded\"}", true);
+        return cbm_mcp_text_result(
+            "{\"error\":\"no project loaded\","
+            "\"hint\":\"Run index_repository with repo_path to index the project first.\"}", true);
     }
 
     cbm_cypher_result_t result = {0};
@@ -1689,7 +1693,9 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
 static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     char *name = cbm_mcp_get_string_arg(args, "project_name");
     if (!name) {
-        return cbm_mcp_text_result("project_name is required", true);
+        return cbm_mcp_text_result(
+            "{\"error\":\"project_name is required\","
+            "\"hint\":\"Pass the project name to delete. Use list_projects to see available projects.\"}", true);
     }
 
     /* Close store if it's the project being deleted */
@@ -1847,13 +1853,17 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     if (!func_name) {
         free(project);
         free(direction);
-        return cbm_mcp_text_result("function_name is required", true);
+        return cbm_mcp_text_result(
+            "{\"error\":\"function_name is required\","
+            "\"hint\":\"Pass the name of a function to trace, e.g. {\\\"function_name\\\":\\\"main\\\"}\"}", true);
     }
     if (!store) {
         free(func_name);
         free(project);
         free(direction);
-        return cbm_mcp_text_result("{\"error\":\"no project loaded\"}", true);
+        return cbm_mcp_text_result(
+            "{\"error\":\"no project loaded\","
+            "\"hint\":\"Run index_repository with repo_path to index the project first.\"}", true);
     }
     if (!direction) {
         direction = heap_strdup("both");
@@ -1865,11 +1875,15 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_find_nodes_by_name(store, project, func_name, &nodes, &node_count);
 
     if (node_count == 0) {
+        char errbuf[512];
+        snprintf(errbuf, sizeof(errbuf),
+            "{\"error\":\"function not found: '%s'\","
+            "\"hint\":\"Use search_code_graph with name_pattern to find similar symbols.\"}", func_name);
         free(func_name);
         free(project);
         free(direction);
         cbm_store_free_nodes(nodes, 0);
-        return cbm_mcp_text_result("{\"error\":\"function not found\"}", true);
+        return cbm_mcp_text_result(errbuf, true);
     }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -2109,7 +2123,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     if (!repo_path) {
         free(mode_str);
-        return cbm_mcp_text_result("repo_path is required", true);
+        return cbm_mcp_text_result(
+            "{\"error\":\"repo_path is required\","
+            "\"hint\":\"Pass the absolute path to the project root directory.\"}", true);
     }
 
     cbm_index_mode_t mode = CBM_MODE_FULL;
@@ -2121,7 +2137,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
     if (!p) {
         free(repo_path);
-        return cbm_mcp_text_result("failed to create pipeline", true);
+        return cbm_mcp_text_result(
+            "{\"error\":\"failed to create indexing pipeline\","
+            "\"hint\":\"Check that repo_path exists and is readable. The directory may be empty or inaccessible.\"}", true);
     }
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
@@ -2463,13 +2481,18 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     if (!qn) {
         free(project);
         free(snippet_mode);
-        return cbm_mcp_text_result("qualified_name is required", true);
+        return cbm_mcp_text_result(
+            "{\"error\":\"qualified_name is required\","
+            "\"hint\":\"Pass a symbol qualified name, e.g. {\\\"qualified_name\\\":\\\"myapp.src.main.handle_request\\\"}. "
+            "Use search_code_graph to find qualified names.\"}", true);
     }
     if (!store) {
         free(qn);
         free(project);
         free(snippet_mode);
-        return cbm_mcp_text_result("{\"error\":\"no project loaded\"}", true);
+        return cbm_mcp_text_result(
+            "{\"error\":\"no project loaded\","
+            "\"hint\":\"Run index_repository with repo_path to index the project first.\"}", true);
     }
 
     /* Tier 1: Exact QN match */
@@ -2653,10 +2676,16 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_search_free(&search_out);
 
     /* Nothing found */
-    free(qn);
-    free(project);
-    free(snippet_mode);
-    return cbm_mcp_text_result("symbol not found", true);
+    {
+        char errbuf[512];
+        snprintf(errbuf, sizeof(errbuf),
+            "{\"error\":\"symbol not found: '%s'\","
+            "\"hint\":\"Use search_code_graph with name_pattern to find the correct qualified_name.\"}", qn);
+        free(qn);
+        free(project);
+        free(snippet_mode);
+        return cbm_mcp_text_result(errbuf, true);
+    }
 }
 
 /* ── search_code ──────────────────────────────────────────────── */
@@ -2673,7 +2702,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     if (!pattern) {
         free(project);
         free(file_pattern);
-        return cbm_mcp_text_result("pattern is required", true);
+        return cbm_mcp_text_result(
+            "{\"error\":\"pattern is required\","
+            "\"hint\":\"Pass a text pattern or regex (with regex:true) to search source code.\"}", true);
     }
 
     char *root_path = get_project_root(srv, project);
@@ -2681,7 +2712,10 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         free(pattern);
         free(project);
         free(file_pattern);
-        return cbm_mcp_text_result("project not found or not indexed", true);
+        return cbm_mcp_text_result(
+            "{\"error\":\"project not found or not indexed\","
+            "\"hint\":\"Run index_repository with repo_path to index the project first, "
+            "or use list_projects to see available projects.\"}", true);
     }
 
     /* Write pattern to temp file to avoid shell injection */
@@ -2697,7 +2731,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         free(pattern);
         free(project);
         free(file_pattern);
-        return cbm_mcp_text_result("search failed: temp file", true);
+        return cbm_mcp_text_result(
+            "{\"error\":\"search failed: could not create temp file\","
+            "\"hint\":\"Check that /tmp is writable and has disk space.\"}", true);
     }
     // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
     (void)fprintf(tf, "%s\n", pattern);
@@ -2734,7 +2770,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         free(pattern);
         free(project);
         free(file_pattern);
-        return cbm_mcp_text_result("search failed", true);
+        return cbm_mcp_text_result(
+            "{\"error\":\"search failed: grep command could not execute\","
+            "\"hint\":\"Check that grep is installed and the project root directory exists.\"}", true);
     }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -2819,7 +2857,10 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     if (!root_path) {
         free(project);
         free(base_branch);
-        return cbm_mcp_text_result("project not found", true);
+        return cbm_mcp_text_result(
+            "{\"error\":\"project not found\","
+            "\"hint\":\"Run index_repository with repo_path to index the project first, "
+            "or use list_projects to see available projects.\"}", true);
     }
 
     /* Get changed files via git */
@@ -2835,7 +2876,9 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         free(root_path);
         free(project);
         free(base_branch);
-        return cbm_mcp_text_result("git diff failed", true);
+        return cbm_mcp_text_result(
+            "{\"error\":\"git diff failed\","
+            "\"hint\":\"Check that git is installed and the project is a git repository.\"}", true);
     }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -2914,7 +2957,10 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
         free(project);
         free(mode_str);
         free(content);
-        return cbm_mcp_text_result("project not found", true);
+        return cbm_mcp_text_result(
+            "{\"error\":\"project not found\","
+            "\"hint\":\"Run index_repository with repo_path to index the project first, "
+            "or use list_projects to see available projects.\"}", true);
     }
 
     char adr_dir[4096];
@@ -3172,7 +3218,10 @@ static char *handle_index_dependencies(cbm_mcp_server_t *srv, const char *args) 
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
     if (!tool_name) {
-        return cbm_mcp_text_result("missing tool name", true);
+        return cbm_mcp_text_result(
+            "{\"error\":\"missing tool name\","
+            "\"hint\":\"Available tools: search_code_graph, trace_call_path, get_code. "
+            "Use tools/list to see all available tools.\"}", true);
     }
 
     /* Phase 9: consolidated tool names (streamlined mode) */
@@ -3238,8 +3287,11 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
         return handle_index_dependencies(srv, args_json);
     }
 
-    char msg[256];
-    snprintf(msg, sizeof(msg), "unknown tool: %s", tool_name);
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+        "{\"error\":\"unknown tool: '%s'\","
+        "\"hint\":\"Available tools: search_code_graph, trace_call_path, get_code. "
+        "Use tools/list to see all available tools.\"}", tool_name);
     return cbm_mcp_text_result(msg, true);
 }
 
