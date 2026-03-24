@@ -41,7 +41,7 @@ The `install` command auto-detects all installed coding agents and configures MC
 If you are using [asdf-vm](https://asdf-vm.com), you can also install as follows:
 
 ```shell
-asdf plugin add codebase-memory-mcp https://github.com/shaolang/codebase-memory-mcp
+asdf plugin add codebase-memory-mcp https://github.com/shaolang/asdf-codebase-memory-mcp
 asdf install codebase-memory-mcp latest
 asdf set codebase-memory-mcp latest     # or if you aren't in ~/, asdf set -p codebase-memory-mcp latest
 ```
