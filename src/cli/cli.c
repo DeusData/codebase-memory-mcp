@@ -13,6 +13,7 @@
 #include <ctype.h>
 #ifndef _WIN32
 #include <signal.h>
+#include <unistd.h>
 #endif
 #include "foundation/compat_fs.h"
 
@@ -2172,6 +2173,14 @@ static bool prompt_yn(const char *question) {
         return false;
     }
 
+    /* Non-interactive stdin: default to "no" to avoid hanging */
+#ifndef _WIN32
+    if (!isatty(fileno(stdin))) {
+        fprintf(stderr, "error: interactive prompt requires a terminal. Use -y or -n flags.\n");
+        return false;
+    }
+#endif
+
     printf("%s (y/n): ", question);
     (void)fflush(stdout);
 
@@ -2982,6 +2991,13 @@ int cbm_cmd_update(int argc, char **argv) {
     } else if (variant_flag == 2) {
         want_ui = true;
     } else {
+#ifndef _WIN32
+        if (!isatty(fileno(stdin))) {
+            fprintf(stderr, "error: variant selection requires a terminal. "
+                            "Use --standard or --ui flag.\n");
+            return 1;
+        }
+#endif
         printf("Which binary variant do you want?\n");
         printf("  1) standard  — MCP server only\n");
         printf("  2) ui        — MCP server + embedded graph visualization\n");
