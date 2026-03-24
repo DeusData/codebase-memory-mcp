@@ -55,9 +55,13 @@ static const char *path_last(CBMArena *a, const char *path) {
 static void parse_go_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
 
-    uint32_t root_count = ts_node_child_count(ctx->root);
-    for (uint32_t i = 0; i < root_count; i++) {
-        TSNode decl = ts_node_child(ctx->root, i);
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode decl = ts_tree_cursor_current_node(&cursor);
         if (strcmp(ts_node_type(decl), "import_declaration") != 0) {
             continue;
         }
@@ -121,7 +125,8 @@ static void parse_go_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-    }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
 }
 
 // --- Python imports ---
@@ -131,9 +136,13 @@ static void parse_go_imports(CBMExtractCtx *ctx) {
 static void parse_python_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
 
-    uint32_t count = ts_node_child_count(ctx->root);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode node = ts_node_child(ctx->root, i);
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
         const char *kind = ts_node_type(node);
 
         if (strcmp(kind, "import_statement") == 0) {
@@ -227,7 +236,8 @@ static void parse_python_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-    }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
 }
 
 // --- ES module imports (JS/TS/TSX) ---
@@ -347,9 +357,13 @@ static void parse_es_imports(CBMExtractCtx *ctx) {
 static void parse_java_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
 
-    uint32_t count = ts_node_child_count(ctx->root);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode node = ts_node_child(ctx->root, i);
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
         if (strcmp(ts_node_type(node), "import_declaration") != 0) {
             continue;
         }
@@ -368,7 +382,8 @@ static void parse_java_imports(CBMExtractCtx *ctx) {
                 break;
             }
         }
-    }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
 }
 
 // --- Rust imports ---
@@ -377,9 +392,13 @@ static void parse_java_imports(CBMExtractCtx *ctx) {
 static void parse_rust_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
 
-    uint32_t count = ts_node_child_count(ctx->root);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode node = ts_node_child(ctx->root, i);
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
         if (strcmp(ts_node_type(node), "use_declaration") != 0) {
             continue;
         }
@@ -399,7 +418,8 @@ static void parse_rust_imports(CBMExtractCtx *ctx) {
 
         CBMImport imp = {.local_name = path_last(a, full), .module_path = full};
         cbm_imports_push(&ctx->result->imports, a, imp);
-    }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
 }
 
 // --- C/C++ imports ---
@@ -408,9 +428,13 @@ static void parse_rust_imports(CBMExtractCtx *ctx) {
 static void parse_c_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
 
-    uint32_t count = ts_node_child_count(ctx->root);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode node = ts_node_child(ctx->root, i);
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
         const char *kind = ts_node_type(node);
         if (strcmp(kind, "preproc_include") != 0 && strcmp(kind, "preproc_import") != 0) {
             continue;
@@ -447,7 +471,8 @@ static void parse_c_imports(CBMExtractCtx *ctx) {
 
         CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
         cbm_imports_push(&ctx->result->imports, a, imp);
-    }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
 }
 
 // --- Ruby imports ---
@@ -458,9 +483,13 @@ static void parse_ruby_imports(CBMExtractCtx *ctx) {
 
     // Walk for call nodes with "require" or "require_relative"
     // Simple: walk top-level children
-    uint32_t count = ts_node_child_count(ctx->root);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode node = ts_node_child(ctx->root, i);
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
         const char *kind = ts_node_type(node);
         if (strcmp(kind, "call") != 0 && strcmp(kind, "command_call") != 0) {
             continue;
@@ -511,7 +540,8 @@ static void parse_ruby_imports(CBMExtractCtx *ctx) {
 
         CBMImport imp = {.local_name = path_last(a, arg_text), .module_path = arg_text};
         cbm_imports_push(&ctx->result->imports, a, imp);
-    }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
 }
 
 // --- Lua imports ---
@@ -520,9 +550,13 @@ static void parse_ruby_imports(CBMExtractCtx *ctx) {
 static void parse_lua_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
 
-    uint32_t count = ts_node_child_count(ctx->root);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode node = ts_node_child(ctx->root, i);
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
         // Lua: local X = require("Y") → assignment_statement or variable_declaration
         // containing function_call(require, "Y")
         char *text = cbm_node_text(a, node, ctx->source);
@@ -567,7 +601,8 @@ static void parse_lua_imports(CBMExtractCtx *ctx) {
         char *mod = cbm_arena_strndup(a, start, (size_t)(end - start));
         CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
         cbm_imports_push(&ctx->result->imports, a, imp);
-    }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
 }
 
 // --- Generic import parsing for languages with simple import_declaration ---

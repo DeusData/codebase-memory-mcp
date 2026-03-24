@@ -1671,6 +1671,104 @@ TEST(js_imports) {
     PASS();
 }
 
+TEST(go_imports) {
+    CBMFileResult *r =
+        extract("package main\n\nimport \"fmt\"\nimport (\n    \"os\"\n    net \"net/http\"\n)\n",
+                CBM_LANG_GO, "t", "main.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_GT(r->imports.count, 0);
+    ASSERT(has_import(r, "fmt"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(java_imports) {
+    CBMFileResult *r =
+        extract("import java.util.List;\nimport java.util.ArrayList;\nimport static java.lang.Math.PI;\n"
+                "public class Foo {}\n",
+                CBM_LANG_JAVA, "t", "Foo.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_GT(r->imports.count, 0);
+    ASSERT(has_import(r, "java.util.List"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rust_imports) {
+    CBMFileResult *r =
+        extract("use std::collections::HashMap;\nuse std::io::{self, Write};\nuse serde::Serialize;\n"
+                "fn main() {}\n",
+                CBM_LANG_RUST, "t", "main.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_GT(r->imports.count, 0);
+    ASSERT(has_import(r, "std::collections::HashMap"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(c_imports) {
+    CBMFileResult *r =
+        extract("#include <stdio.h>\n#include <stdlib.h>\n#include \"mylib.h\"\n\nint main() { return 0; }\n",
+                CBM_LANG_C, "t", "main.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_GT(r->imports.count, 0);
+    ASSERT(has_import(r, "stdio.h"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(ruby_imports) {
+    CBMFileResult *r =
+        extract("require 'json'\nrequire 'net/http'\nrequire_relative 'helpers'\n\nclass Foo; end\n",
+                CBM_LANG_RUBY, "t", "app.rb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_GT(r->imports.count, 0);
+    ASSERT(has_import(r, "json"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(lua_imports) {
+    CBMFileResult *r =
+        extract("local json = require(\"dkjson\")\nlocal http = require(\"socket.http\")\n\nlocal function greet() end\n",
+                CBM_LANG_LUA, "t", "main.lua");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_GT(r->imports.count, 0);
+    ASSERT(has_import(r, "dkjson"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(import_stress_go) {
+    /* Stress test: 5,000 single-line Go imports.
+     * Verifies O(N) behaviour — would hang indefinitely with the O(N²) loop. */
+    const int N = 5000;
+    /* Each line: import "pkg/NNNNN"\n  = ~20 chars; total ~100KB */
+    int buf_size = N * 24 + 64;
+    char *src = malloc((size_t)buf_size);
+    ASSERT_NOT_NULL(src);
+
+    int pos = 0;
+    pos += snprintf(src + pos, (size_t)(buf_size - pos), "package stress\n");
+    for (int k = 0; k < N; k++) {
+        pos += snprintf(src + pos, (size_t)(buf_size - pos), "import \"pkg/%05d\"\n", k);
+    }
+
+    CBMFileResult *r = extract(src, CBM_LANG_GO, "t", "stress.go");
+    free(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(r->imports.count, N);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * config_extraction_test.go ports (25 tests)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -2192,6 +2290,13 @@ SUITE(extraction) {
     RUN_TEST(go_calls);
     RUN_TEST(python_imports);
     RUN_TEST(js_imports);
+    RUN_TEST(go_imports);
+    RUN_TEST(java_imports);
+    RUN_TEST(rust_imports);
+    RUN_TEST(c_imports);
+    RUN_TEST(ruby_imports);
+    RUN_TEST(lua_imports);
+    RUN_TEST(import_stress_go);
 
     /* config_extraction_test.go ports */
     RUN_TEST(toml_basic_table_and_pair);
