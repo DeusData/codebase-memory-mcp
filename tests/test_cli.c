@@ -1450,8 +1450,10 @@ TEST(cli_upsert_opencode_mcp_fresh) {
     ASSERT(strstr(data, "codebase-memory-mcp") != NULL);
     ASSERT(strstr(data, "/usr/local/bin/codebase-memory-mcp") != NULL);
     ASSERT(strstr(data, "\"enabled\":true") != NULL || strstr(data, "\"enabled\": true") != NULL);
-    ASSERT(strstr(data, "\"type\"") != NULL);
-    ASSERT(strstr(data, "\"local\"") != NULL);
+    /* command must be emitted as an array, not a string */
+    ASSERT(strstr(data, "\"command\":[") != NULL || strstr(data, "\"command\": [") != NULL);
+    /* type must be explicitly set to \"local\" */
+    ASSERT(strstr(data, "\"type\":\"local\"") != NULL || strstr(data, "\"type\": \"local\"") != NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
