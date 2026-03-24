@@ -1309,7 +1309,11 @@ int cbm_upsert_opencode_mcp(const char *binary_path, const char *config_path) {
     yyjson_mut_obj_remove_key(mcp, "codebase-memory-mcp");
 
     yyjson_mut_val *entry = yyjson_mut_obj(mdoc);
-    yyjson_mut_obj_add_str(mdoc, entry, "command", binary_path);
+    yyjson_mut_obj_add_bool(mdoc, entry, "enabled", true);
+    yyjson_mut_obj_add_str(mdoc, entry, "type", "local");
+    yyjson_mut_val *cmd_arr = yyjson_mut_arr(mdoc);
+    yyjson_mut_arr_add_str(mdoc, cmd_arr, binary_path);
+    yyjson_mut_obj_add_val(mdoc, entry, "command", cmd_arr);
     yyjson_mut_obj_add_val(mdoc, mcp, "codebase-memory-mcp", entry);
 
     int rc = write_json_file(config_path, mdoc);

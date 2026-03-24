@@ -1449,6 +1449,9 @@ TEST(cli_upsert_opencode_mcp_fresh) {
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "codebase-memory-mcp") != NULL);
     ASSERT(strstr(data, "/usr/local/bin/codebase-memory-mcp") != NULL);
+    ASSERT(strstr(data, "\"enabled\":true") != NULL || strstr(data, "\"enabled\": true") != NULL);
+    ASSERT(strstr(data, "\"type\"") != NULL);
+    ASSERT(strstr(data, "\"local\"") != NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
