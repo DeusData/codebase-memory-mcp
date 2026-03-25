@@ -1843,6 +1843,15 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         ADD_WHERE(bind_buf);
         BIND_TEXT(params->name_pattern);
     }
+    if (params->qn_pattern) {
+        if (params->case_sensitive) {
+            snprintf(bind_buf, sizeof(bind_buf), "n.qualified_name REGEXP ?%d", bind_idx + 1);
+        } else {
+            snprintf(bind_buf, sizeof(bind_buf), "iregexp(?%d, n.qualified_name)", bind_idx + 1);
+        }
+        ADD_WHERE(bind_buf);
+        BIND_TEXT(params->qn_pattern);
+    }
     if (params->file_pattern) {
         like_pattern = cbm_glob_to_like(params->file_pattern);
         snprintf(bind_buf, sizeof(bind_buf), "n.file_path LIKE ?%d", bind_idx + 1);
@@ -1878,6 +1887,19 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         }
     }
 
+    if (params->relationship) {
+        /* Filter: nodes involved in edges of this type (either direction).
+         * Local buf: EXISTS query is ~97 chars — exceeds bind_buf[64]. */
+        char rel_cond[128];
+        snprintf(rel_cond, sizeof(rel_cond),
+                 "EXISTS (SELECT 1 FROM edges e "
+                 "WHERE (e.source_id = n.id OR e.target_id = n.id) "
+                 "AND e.type = ?%d)",
+                 bind_idx + 1);
+        ADD_WHERE(rel_cond); /* ADD_WHERE copies rel_cond into where[] immediately */
+        BIND_TEXT(params->relationship);
+    }
+
     /* Build full SQL */
     const char *from_join = use_pagerank
         ? "FROM nodes n LEFT JOIN pagerank pr ON pr.node_id = n.id"
@@ -1888,25 +1910,35 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         snprintf(sql, sizeof(sql), "%s %s", select_cols, from_join);
     }
 
-    /* Degree filters: -1 = no filter, 0+ = active filter.
-     * Wraps in subquery to filter on computed degree columns. */
+    /* Degree + entry-point filters: wrap in subquery to filter on computed degree columns.
+     * Merged: exclude_entry_points adds "in_deg > 0" to same WHERE clause — avoids
+     * double subquery nesting that would result from a separate wrap. */
     // NOLINTNEXTLINE(readability-implicit-bool-conversion)
     bool has_degree_filter = (params->min_degree >= 0 || params->max_degree >= 0);
-    if (has_degree_filter) {
+    if (has_degree_filter || params->exclude_entry_points) {
         char inner_sql[4096];
         snprintf(inner_sql, sizeof(inner_sql), "%s", sql);
+        /* Build the WHERE conditions for the outer subquery */
+        char sub_where[256] = "";
+        int sw = 0;
         if (params->min_degree >= 0 && params->max_degree >= 0) {
-            snprintf(
-                sql, sizeof(sql),
-                "SELECT * FROM (%s) WHERE (in_deg + out_deg) >= %d AND (in_deg + out_deg) <= %d",
-                inner_sql, params->min_degree, params->max_degree);
+            sw += snprintf(sub_where + sw, sizeof(sub_where) - (size_t)sw,
+                           "(in_deg + out_deg) >= %d AND (in_deg + out_deg) <= %d",
+                           params->min_degree, params->max_degree);
         } else if (params->min_degree >= 0) {
-            snprintf(sql, sizeof(sql), "SELECT * FROM (%s) WHERE (in_deg + out_deg) >= %d",
-                     inner_sql, params->min_degree);
-        } else {
-            snprintf(sql, sizeof(sql), "SELECT * FROM (%s) WHERE (in_deg + out_deg) <= %d",
-                     inner_sql, params->max_degree);
+            sw += snprintf(sub_where + sw, sizeof(sub_where) - (size_t)sw,
+                           "(in_deg + out_deg) >= %d", params->min_degree);
+        } else if (params->max_degree >= 0) {
+            sw += snprintf(sub_where + sw, sizeof(sub_where) - (size_t)sw,
+                           "(in_deg + out_deg) <= %d", params->max_degree);
         }
+        if (params->exclude_entry_points) {
+            if (sw > 0) {
+                sw += snprintf(sub_where + sw, sizeof(sub_where) - (size_t)sw, " AND ");
+            }
+            snprintf(sub_where + sw, sizeof(sub_where) - (size_t)sw, "in_deg > 0");
+        }
+        snprintf(sql, sizeof(sql), "SELECT * FROM (%s) WHERE %s", inner_sql, sub_where);
     }
 
     /* Count query (wrap the full query) */
@@ -1916,7 +1948,7 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
      * When degree filter wraps in subquery, column refs lose the "n." prefix. */
     int limit = params->limit > 0 ? params->limit : 500000;
     int offset = params->offset;
-    bool has_degree_wrap = has_degree_filter;
+    bool has_degree_wrap = has_degree_filter || params->exclude_entry_points;
     // NOLINTNEXTLINE(readability-implicit-bool-conversion)
     const char *name_col = has_degree_wrap ? "name" : "n.name";
     char order_limit[128];

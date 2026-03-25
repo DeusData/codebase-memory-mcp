@@ -784,6 +784,402 @@ TEST(response_includes_meta_fields) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  SEARCH PARAMETERIZATION ACCURACY
+ *  TDD: Tests written BEFORE implementation.
+ *  RED before changes applied. GREEN after.
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* ── Parameterization test fixture ──────────────────────────── */
+/*
+ * Creates a minimal server with:
+ *   Project "sp-test":
+ *     node id=1: Function name="main"            qn="sp-test.main.main"
+ *                no inbound CALLS (in_deg=0 — entry point)
+ *     node id=2: Function name="process_request" qn="sp-test.handlers.process_request"
+ *                inbound CALLS from main (in_deg=1)
+ *     node id=3: Function name="fetch_data"      qn="sp-test.http.fetch_data"
+ *                outbound HTTP_CALLS to process_request (in_deg=0)
+ *   Project "sp-test.dep.mypkg":
+ *     node id=4: Function name="dep_helper"      qn="sp-test.dep.mypkg.dep_helper"
+ *
+ *   Edges:
+ *     CALLS:      id=1 -> id=2  (main calls process_request)
+ *     HTTP_CALLS: id=3 -> id=2  (fetch_data HTTP calls to process_request)
+ *
+ * Node IDs are predictable: fresh in-memory SQLite, autoincrement from 1.
+ */
+static cbm_mcp_server_t *setup_sp_server(void) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv)
+        return NULL;
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    if (!st) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+
+    cbm_mcp_server_set_project(srv, "sp-test");
+    cbm_store_upsert_project(st, "sp-test", "/tmp");
+    cbm_store_upsert_project(st, "sp-test.dep.mypkg", "/tmp/dep");
+
+    cbm_node_t n1 = {0};
+    n1.project = "sp-test";
+    n1.label = "Function";
+    n1.name = "main";
+    n1.qualified_name = "sp-test.main.main";
+    n1.file_path = "main.py";
+    n1.start_line = 1;
+    n1.end_line = 5;
+    n1.properties_json = "{}";
+    cbm_store_upsert_node(st, &n1);
+
+    cbm_node_t n2 = {0};
+    n2.project = "sp-test";
+    n2.label = "Function";
+    n2.name = "process_request";
+    n2.qualified_name = "sp-test.handlers.process_request";
+    n2.file_path = "handlers.py";
+    n2.start_line = 1;
+    n2.end_line = 10;
+    n2.properties_json = "{}";
+    cbm_store_upsert_node(st, &n2);
+
+    cbm_node_t n3 = {0};
+    n3.project = "sp-test";
+    n3.label = "Function";
+    n3.name = "fetch_data";
+    n3.qualified_name = "sp-test.http.fetch_data";
+    n3.file_path = "http.py";
+    n3.start_line = 1;
+    n3.end_line = 8;
+    n3.properties_json = "{}";
+    cbm_store_upsert_node(st, &n3);
+
+    cbm_node_t n4 = {0};
+    n4.project = "sp-test.dep.mypkg";
+    n4.label = "Function";
+    n4.name = "dep_helper";
+    n4.qualified_name = "sp-test.dep.mypkg.dep_helper";
+    n4.file_path = "mypkg/helper.py";
+    n4.start_line = 1;
+    n4.end_line = 5;
+    n4.properties_json = "{}";
+    cbm_store_upsert_node(st, &n4);
+
+    /* CALLS: main(id=1) -> process_request(id=2) */
+    cbm_edge_t e1 = {0};
+    e1.project = "sp-test";
+    e1.source_id = 1;
+    e1.target_id = 2;
+    e1.type = "CALLS";
+    e1.properties_json = "{}";
+    cbm_store_insert_edge(st, &e1);
+
+    /* HTTP_CALLS: fetch_data(id=3) -> process_request(id=2) */
+    cbm_edge_t e2 = {0};
+    e2.project = "sp-test";
+    e2.source_id = 3;
+    e2.target_id = 2;
+    e2.type = "HTTP_CALLS";
+    e2.properties_json = "{}";
+    cbm_store_insert_edge(st, &e2);
+
+    return srv;
+}
+
+/* ── Changes 2.1 + 1.1 + 1.3: qn_pattern filters qualified_name ── */
+
+TEST(search_graph_qn_pattern_filters_results) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"sp-test\","
+                                    "\"qn_pattern\":\".*handlers.*\","
+                                    "\"include_dependencies\":false}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *results = yyjson_obj_get(root, "results");
+    ASSERT_NOT_NULL(results);
+    /* Only process_request qn contains "handlers". Expect 1 result.
+     * RED: qn_pattern ignored, returns all 3 project nodes. GREEN: 1. */
+    ASSERT_EQ((int)yyjson_arr_size(results), 1);
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(search_graph_qn_pattern_no_match_returns_empty) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"sp-test\","
+                                    "\"qn_pattern\":\".*nonexistent_module.*\","
+                                    "\"include_dependencies\":false}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *results = yyjson_obj_get(yyjson_doc_get_root(doc), "results");
+    /* RED: qn_pattern ignored, returns all nodes. GREEN: 0. */
+    ASSERT_EQ((int)yyjson_arr_size(results), 0);
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── Changes 2.2 + 1.1 + 1.3: relationship filters by edge type ── */
+
+TEST(search_graph_relationship_filters_to_matching_edge_type) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"sp-test\","
+                                    "\"relationship\":\"HTTP_CALLS\","
+                                    "\"include_dependencies\":false}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *results = yyjson_obj_get(yyjson_doc_get_root(doc), "results");
+    ASSERT_NOT_NULL(results);
+    /* fetch_data (source) + process_request (target) both involved in HTTP_CALLS.
+     * main has no HTTP_CALLS edges -> excluded.
+     * RED: all 3 returned. GREEN: 2 (both endpoints of HTTP_CALLS). */
+    ASSERT_EQ((int)yyjson_arr_size(results), 2);
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(search_graph_relationship_nonexistent_type_returns_empty) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"sp-test\","
+                                    "\"relationship\":\"WRITES\","
+                                    "\"include_dependencies\":false}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *results = yyjson_obj_get(yyjson_doc_get_root(doc), "results");
+    /* No WRITES edges exist. RED: all nodes returned. GREEN: 0. */
+    ASSERT_EQ((int)yyjson_arr_size(results), 0);
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── Changes 2.3 + 1.2 + 1.3: exclude_entry_points ─────────── */
+
+TEST(search_graph_exclude_entry_points_removes_zero_inbound) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"sp-test\","
+                                    "\"exclude_entry_points\":true,"
+                                    "\"include_dependencies\":false}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *results = yyjson_obj_get(yyjson_doc_get_root(doc), "results");
+    ASSERT_NOT_NULL(results);
+    /* main(in_deg=0) + fetch_data(in_deg=0) excluded. process_request(in_deg=1) kept.
+     * RED: all 3 returned. GREEN: 1. */
+    ASSERT_EQ((int)yyjson_arr_size(results), 1);
+    yyjson_val *first = yyjson_arr_get(results, 0);
+    /* Check qualified_name (always present; name may be omitted by compact=true default) */
+    yyjson_val *qn = yyjson_obj_get(first, "qualified_name");
+    ASSERT_STR_EQ(yyjson_get_str(qn), "sp-test.handlers.process_request");
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(search_graph_exclude_entry_points_false_keeps_all) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"sp-test\","
+                                    "\"exclude_entry_points\":false,"
+                                    "\"include_dependencies\":false}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *results = yyjson_obj_get(yyjson_doc_get_root(doc), "results");
+    ASSERT_EQ((int)yyjson_arr_size(results), 3);
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── Change 1.3: include_dependencies ──────────────────────── */
+
+TEST(search_graph_include_dependencies_true_includes_dep_nodes) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    /* Default: include_dependencies not specified = true */
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"sp-test\"}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    /* dep_helper from sp-test.dep.mypkg should appear in results */
+    ASSERT_NOT_NULL(strstr(resp, "dep_helper"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(search_graph_include_dependencies_false_excludes_dep_nodes) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"sp-test\","
+                                    "\"include_dependencies\":false}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *results = yyjson_obj_get(yyjson_doc_get_root(doc), "results");
+    /* dep_helper (project=sp-test.dep.mypkg) must NOT appear.
+     * RED: include_dependencies ignored -- may return 4. GREEN: exactly 3. */
+    ASSERT_EQ((int)yyjson_arr_size(results), 3);
+    ASSERT_NULL(strstr(resp, "dep_helper"));
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── Change 3.1 reverted: trace compact default remains true ─── */
+
+TEST(trace_call_path_compact_defaults_to_true) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    /* No compact param -> defaults to true -> name omitted when it matches qn suffix */
+    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+                                    "{\"function_name\":\"main\","
+                                    "\"project\":\"sp-test\","
+                                    "\"direction\":\"outbound\"}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    /* Parse and check: callees[0] should NOT have "name" key (compact=true default).
+     * main -> process_request. qn "sp-test.handlers.process_request",
+     * name "process_request". ends_with_segment(qn, name) is TRUE => name omitted. */
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *callees = yyjson_obj_get(root, "callees");
+    ASSERT_NOT_NULL(callees);
+    ASSERT_GT((int)yyjson_arr_size(callees), 0);
+    yyjson_val *first_callee = yyjson_arr_get(callees, 0);
+    /* compact=true default: name matches last segment of qn -> name field OMITTED */
+    ASSERT_NULL(yyjson_obj_get(first_callee, "name"));
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(trace_call_path_compact_false_includes_name) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+                                    "{\"function_name\":\"main\","
+                                    "\"project\":\"sp-test\","
+                                    "\"direction\":\"outbound\","
+                                    "\"compact\":false}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *callees = yyjson_obj_get(root, "callees");
+    ASSERT_NOT_NULL(callees);
+    ASSERT_GT((int)yyjson_arr_size(callees), 0);
+    yyjson_val *first_callee = yyjson_arr_get(callees, 0);
+    /* compact=false explicit: name field present even though name matches qn suffix */
+    ASSERT_NOT_NULL(yyjson_obj_get(first_callee, "name"));
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── Change 3.2: trace edge_types user param ────────────────── */
+
+TEST(trace_call_path_edge_types_http_calls_traverses_http_edges) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    /* fetch_data(id=3) has HTTP_CALLS -> process_request(id=2).
+     * With edge_types=["HTTP_CALLS"] outbound, process_request should appear.
+     * With CALLS-only (old hardcoded): no CALLS from fetch_data -> empty callees. */
+    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+                                    "{\"function_name\":\"fetch_data\","
+                                    "\"project\":\"sp-test\","
+                                    "\"direction\":\"outbound\","
+                                    "\"edge_types\":[\"HTTP_CALLS\"]}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *callees = yyjson_obj_get(yyjson_doc_get_root(doc), "callees");
+    ASSERT_NOT_NULL(callees);
+    /* RED: edge_types ignored, CALLS used, fetch_data has no CALLS -> callees empty.
+     * GREEN: HTTP_CALLS traversed -> process_request in callees. */
+    ASSERT_GT((int)yyjson_arr_size(callees), 0);
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(trace_call_path_default_edge_types_calls_only) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    /* Without edge_types -> default CALLS -> main -> process_request appears */
+    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+                                    "{\"function_name\":\"main\","
+                                    "\"project\":\"sp-test\","
+                                    "\"direction\":\"outbound\"}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *callees = yyjson_obj_get(yyjson_doc_get_root(doc), "callees");
+    /* main has CALLS -> process_request. Default behavior unchanged. */
+    ASSERT_NOT_NULL(callees);
+    ASSERT_GT((int)yyjson_arr_size(callees), 0);
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -823,4 +1219,18 @@ SUITE(token_reduction) {
 
     /* 1.8 Token Metadata */
     RUN_TEST(response_includes_meta_fields);
+
+    /* Search Parameterization Accuracy */
+    RUN_TEST(search_graph_qn_pattern_filters_results);
+    RUN_TEST(search_graph_qn_pattern_no_match_returns_empty);
+    RUN_TEST(search_graph_relationship_filters_to_matching_edge_type);
+    RUN_TEST(search_graph_relationship_nonexistent_type_returns_empty);
+    RUN_TEST(search_graph_exclude_entry_points_removes_zero_inbound);
+    RUN_TEST(search_graph_exclude_entry_points_false_keeps_all);
+    RUN_TEST(search_graph_include_dependencies_true_includes_dep_nodes);
+    RUN_TEST(search_graph_include_dependencies_false_excludes_dep_nodes);
+    RUN_TEST(trace_call_path_compact_defaults_to_true);
+    RUN_TEST(trace_call_path_compact_false_includes_name);
+    RUN_TEST(trace_call_path_edge_types_http_calls_traverses_http_edges);
+    RUN_TEST(trace_call_path_default_edge_types_calls_only);
 }
