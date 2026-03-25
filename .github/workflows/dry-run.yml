@@ -380,6 +380,11 @@ jobs:
           SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
           tar -czf "/tmp/smoke-server/codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}.tar.gz" \
             -C /tmp/smoke-server codebase-memory-mcp
+          # Also serve under standard name so install.sh + update --standard work
+          if [ -n "$SUFFIX" ]; then
+            cp "/tmp/smoke-server/codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}.tar.gz" \
+               "/tmp/smoke-server/codebase-memory-mcp-${OS}-${ARCH}.tar.gz"
+          fi
           cd /tmp/smoke-server
           sha256sum *.tar.gz > checksums.txt 2>/dev/null || shasum -a 256 *.tar.gz > checksums.txt
           python3 -m http.server 18080 -d /tmp/smoke-server &
@@ -476,6 +481,10 @@ jobs:
           SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
           cd /tmp/smoke-server
           zip -q "codebase-memory-mcp${SUFFIX}-windows-amd64.zip" codebase-memory-mcp.exe
+          # Also serve under standard name
+          if [ -n "$SUFFIX" ]; then
+            cp "codebase-memory-mcp${SUFFIX}-windows-amd64.zip" "codebase-memory-mcp-windows-amd64.zip"
+          fi
           sha256sum *.zip > checksums.txt
           python3 -m http.server 18080 -d /tmp/smoke-server &
 

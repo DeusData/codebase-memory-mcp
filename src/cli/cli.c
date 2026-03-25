@@ -2682,7 +2682,11 @@ int cbm_cmd_install(int argc, char **argv) {
 
     /* Step 2: Binary path */
     char self_path[1024];
+#ifdef _WIN32
+    snprintf(self_path, sizeof(self_path), "%s/.local/bin/codebase-memory-mcp.exe", home);
+#else
     snprintf(self_path, sizeof(self_path), "%s/.local/bin/codebase-memory-mcp", home);
+#endif
 
     /* Step 3: Install/refresh all agent configs */
     cbm_install_agent_configs(home, self_path, force, dry_run);
@@ -3103,7 +3107,11 @@ int cbm_cmd_update(int argc, char **argv) {
 
     /* Step 5: Extract binary */
     char bin_dest[1024];
+#ifdef _WIN32
+    snprintf(bin_dest, sizeof(bin_dest), "%s/.local/bin/codebase-memory-mcp.exe", home);
+#else
     snprintf(bin_dest, sizeof(bin_dest), "%s/.local/bin/codebase-memory-mcp", home);
+#endif
 
     /* Ensure install directory exists */
     char bin_dir[1024];

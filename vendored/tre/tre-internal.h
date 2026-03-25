@@ -9,6 +9,13 @@
 #ifndef TRE_INTERNAL_H
 #define TRE_INTERNAL_H 1
 
+#ifdef _WIN32
+#include <basetsd.h>
+typedef SSIZE_T ssize_t;
+#else
+#include <sys/types.h> /* ssize_t */
+#endif
+
 #ifdef HAVE_WCHAR_H
 #include <wchar.h>
 #endif /* HAVE_WCHAR_H */
