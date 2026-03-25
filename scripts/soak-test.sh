@@ -269,8 +269,9 @@ collect_snapshot
 # Derive project name (same logic as cbm_project_name_from_path)
 PROJ_NAME=$(echo "$SOAK_PROJECT" | sed 's|^/||; s|/|-|g')
 
-BASELINE_RSS=$(python3 -c "import json; d=json.load(open('/tmp/cbm-diagnostics-${SERVER_PID}.json')); print(d.get('rss_bytes',0))" 2>/dev/null || echo "0")
-BASELINE_FDS=$(python3 -c "import json; d=json.load(open('/tmp/cbm-diagnostics-${SERVER_PID}.json')); print(d.get('fd_count',0))" 2>/dev/null || echo "0")
+DIAG_FILE="/tmp/cbm-diagnostics-${SERVER_PID}.json"
+BASELINE_RSS=$(cat "$DIAG_FILE" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('rss_bytes',0))" 2>/dev/null || echo "0")
+BASELINE_FDS=$(cat "$DIAG_FILE" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('fd_count',0))" 2>/dev/null || echo "0")
 echo "OK: baseline RSS=${BASELINE_RSS} FDs=${BASELINE_FDS}"
 
 # ── Phase 3: Compressed workload loop ────────────────────────────

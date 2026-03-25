@@ -523,8 +523,8 @@ printf '[existing_section]\nline_from_user = true\n' > "$FAKE_HOME/.codex/config
 # Run install
 HOME="$FAKE_HOME" PATH="$FAKE_HOME/.local/bin:$PATH" "$BINARY" install -y 2>&1 || true
 
-# Helper for JSON validation
-json_get() { python3 -c "import json,sys,os; f='$1'; d=json.load(open(f)) if os.path.isfile(f) else {}; print($2)" 2>/dev/null || echo ""; }
+# Helper for JSON validation (pipe file to python — avoids MSYS2 path translation issues)
+json_get() { cat "$1" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print($2)" 2>/dev/null || echo ""; }
 
 # 8a: Claude Code MCP (new path) — correct command
 CMD=$(json_get "$FAKE_HOME/.claude.json" "d.get('mcpServers',{}).get('codebase-memory-mcp',{}).get('command','')")
@@ -1044,7 +1044,7 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
   echo "OK 14b: updated binary runs"
 
   # 14c: Verify agent config was refreshed (stale path replaced)
-  UPD_CMD=$(python3 -c "import json,sys,os; f='$UPDATE_HOME/.claude.json'; d=json.load(open(f)) if os.path.isfile(f) else {}; print(d.get('mcpServers',{}).get('codebase-memory-mcp',{}).get('command',''))" 2>/dev/null || echo "")
+  UPD_CMD=$(cat "$UPDATE_HOME/.claude.json" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('mcpServers',{}).get('codebase-memory-mcp',{}).get('command',''))" 2>/dev/null || echo "")
   if [ "$UPD_CMD" = "/old/stale/path" ]; then
     echo "FAIL 14c: agent config still has stale path after update"
     exit 1
