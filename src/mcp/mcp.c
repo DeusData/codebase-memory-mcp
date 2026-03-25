@@ -297,9 +297,9 @@ static const tool_def_t TOOLS[] = {
      "file. Use summary first to understand scope, then full with filters to drill down."
      "\"},\"compact\":{\"type\":\"boolean\",\"default\":true,\"description\":\"Omit redundant "
      "name field when it matches the last segment of qualified_name. Reduces token usage.\"},"
-     "\"include_dependencies\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Include "
+     "\"include_dependencies\":{\"type\":\"boolean\",\"default\":true,\"description\":\"Include "
      "indexed dependency symbols in results. Results from dependencies have source:dependency. "
-     "Default: false (only project code).\"},"
+     "Default: true (includes dep sub-projects). Set false to scope to project code only.\"},"
      "\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Glob "
      "patterns for file paths to exclude from results (e.g. [\\\"tests/**\\\",\\\"scripts/**\\\"])."
      "\"}}}"},
@@ -327,7 +327,7 @@ static const tool_def_t TOOLS[] = {
      "\":{\"type\":\"integer\",\"description\":\"Max nodes per direction (configurable via "
      "trace_max_results config key). Set higher for exhaustive traces. Response includes "
      "callees_total/callers_total for truncation awareness.\"},\"compact\":{\"type\":\"boolean\","
-     "\"default\":false,\"description\":"
+     "\"default\":true,\"description\":"
      "\"Omit redundant name field. Saves tokens.\"},\"edge_types\":{\"type\":\"array\",\"items\":{"
      "\"type\":\"string\"}},\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
      "\"description\":\"Glob patterns for file paths to exclude from trace results."
@@ -1525,7 +1525,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
 
     char *label = cbm_mcp_get_string_arg(args, "label");
     char *name_pattern = cbm_mcp_get_string_arg(args, "name_pattern");
+    char *qn_pattern = cbm_mcp_get_string_arg(args, "qn_pattern");
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
+    char *relationship = cbm_mcp_get_string_arg(args, "relationship");
     char *sort_by = cbm_mcp_get_string_arg(args, "sort_by");
     int cfg_search_limit = cbm_config_get_int(srv->config, CBM_CONFIG_SEARCH_LIMIT,
                                                CBM_DEFAULT_SEARCH_LIMIT);
@@ -1535,6 +1537,11 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     char *search_mode = cbm_mcp_get_string_arg(args, "mode");
     int min_degree = cbm_mcp_get_int_arg(args, "min_degree", -1);
     int max_degree = cbm_mcp_get_int_arg(args, "max_degree", -1);
+    bool exclude_entry_points = cbm_mcp_get_bool_arg_default(args, "exclude_entry_points", false);
+    bool include_connected = cbm_mcp_get_bool_arg_default(args, "include_connected", false);
+    /* Default true: prefix match includes myproject.dep.* sub-projects.
+     * false: forces exact match (only effective when project set + not glob mode). */
+    bool include_dependencies = cbm_mcp_get_bool_arg_default(args, "include_dependencies", true);
 
     /* Summary mode needs all results for accurate aggregation */
     bool is_summary = search_mode && strcmp(search_mode, "summary") == 0;
@@ -1542,14 +1549,24 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_search_params_t params = {0};
     fill_project_params(&pe, &params);
+    /* include_dependencies=false: force exact match to exclude dep sub-projects.
+     * Guard: only effective for MATCH_PREFIX (project set, no glob pattern).
+     * MATCH_GLOB (project_pattern set) and MATCH_NONE (no project) are unaffected. */
+    if (!include_dependencies && params.project && !params.project_pattern) {
+        params.project_exact = true;
+    }
     params.label = label;
     params.name_pattern = name_pattern;
+    params.qn_pattern = qn_pattern;
     params.file_pattern = file_pattern;
+    params.relationship = relationship;
     params.sort_by = sort_by;
     params.limit = effective_limit;
     params.offset = offset;
     params.min_degree = min_degree;
     params.max_degree = max_degree;
+    params.exclude_entry_points = exclude_entry_points;
+    params.include_connected = include_connected;
     int exclude_count = 0;
     char **exclude = cbm_mcp_get_string_array_arg(args, "exclude", &exclude_count);
     params.exclude_paths = (const char **)exclude;
@@ -1678,7 +1695,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     free(pe.value);
     free(label);
     free(name_pattern);
+    free(qn_pattern);
     free(file_pattern);
+    free(relationship);
     free(search_mode);
     free(sort_by);
     free_string_array(exclude);
@@ -2099,8 +2118,18 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                                nodes[0].qualified_name ? nodes[0].qualified_name : "");
     }
 
-    const char *edge_types[] = {"CALLS"};
-    int edge_type_count = 1;
+    /* Extract edge_types here — after all early returns — to avoid memory leaks.
+     * free_string_array(NULL) is NULL-safe (mcp.c:663). */
+    int edge_type_count_user = 0;
+    char **edge_types_user = cbm_mcp_get_string_array_arg(args, "edge_types",
+                                                           &edge_type_count_user);
+    /* Use user-supplied edge_types if provided, else default to CALLS only.
+     * default_edge_types is stack-local; no ownership transfer needed. */
+    const char *default_edge_types[] = {"CALLS"};
+    const char **edge_types = (edge_type_count_user > 0)
+        ? (const char **)edge_types_user
+        : default_edge_types;
+    int edge_type_count = (edge_type_count_user > 0) ? edge_type_count_user : 1;
 
     /* Run BFS for each requested direction.
      * IMPORTANT: yyjson_mut_obj_add_str borrows pointers — we must keep
@@ -2225,6 +2254,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     free(func_name);
     free(project);
     free(direction);
+    free_string_array(edge_types_user); /* NULL-safe; reuses existing helper (mcp.c:663) */
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
