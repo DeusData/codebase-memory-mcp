@@ -295,11 +295,13 @@ static const tool_def_t TOOLS[] = {
      "\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"summary\"],\"default\":\"full\","
      "\"description\":\"full=individual results (default), summary=aggregate counts by label and "
      "file. Use summary first to understand scope, then full with filters to drill down."
-     "\"},\"compact\":{\"type\":\"boolean\",\"default\":true,\"description\":\"Omit redundant "
-     "name field when it matches the last segment of qualified_name. Reduces token usage.\"},"
+     "\"},\"compact\":{\"type\":\"boolean\",\"default\":true,\"description\":\"Omit fields at their "
+     "default: name when it equals qualified_name's last segment (e.g. \\\"main\\\" in "
+     "\\\"pkg.main\\\"), empty label/file_path, and zero degrees. Absent fields assume defaults: "
+     "label/file_path='', degree=0. Saves tokens.\"},"
      "\"include_dependencies\":{\"type\":\"boolean\",\"default\":true,\"description\":\"Include "
-     "indexed dependency symbols in results. Results from dependencies have source:dependency. "
-     "Default: true (includes dep sub-projects). Set false to scope to project code only.\"},"
+     "symbols from dependency sub-projects (marked source=dependency in results). Set false to "
+     "scope to project code only.\"},"
      "\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Glob "
      "patterns for file paths to exclude from results (e.g. [\\\"tests/**\\\",\\\"scripts/**\\\"])."
      "\"}}}"},
@@ -310,9 +312,8 @@ static const tool_def_t TOOLS[] = {
      "query_max_output_bytes config key) — set max_output_bytes=0 for unlimited or add LIMIT.",
      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Cypher "
      "query\"},\"project\":{\"type\":\"string\"},\"max_rows\":{\"type\":\"integer\","
-     "\"description\":\"Scan-level row limit (default: unlimited). Note: this limits how many "
-     "nodes are scanned, not how many rows are returned. For output size control, use "
-     "max_output_bytes or add LIMIT to your Cypher query.\"},\"max_output_bytes\":{\"type\":"
+     "\"description\":\"Scan-level row limit (default: unlimited). Note: limits nodes scanned, "
+     "not rows returned. For output size, use max_output_bytes or add LIMIT to your Cypher query.\"},\"max_output_bytes\":{\"type\":"
      "\"integer\",\"description\":\"Max response size in bytes (configurable via "
      "query_max_output_bytes config key). Set to 0 for unlimited. When exceeded, returns "
      "truncated=true with total_bytes and hint to add LIMIT.\"}},\"required\":[\"query\"]}"},
@@ -328,7 +329,7 @@ static const tool_def_t TOOLS[] = {
      "trace_max_results config key). Set higher for exhaustive traces. Response includes "
      "callees_total/callers_total for truncation awareness.\"},\"compact\":{\"type\":\"boolean\","
      "\"default\":true,\"description\":"
-     "\"Omit redundant name field. Saves tokens.\"},\"edge_types\":{\"type\":\"array\",\"items\":{"
+     "\"Omit name when it equals qualified_name's last segment (e.g. \\\"main\\\" in \\\"pkg.main\\\"). Reduces token count.\"},\"edge_types\":{\"type\":\"array\",\"items\":{"
      "\"type\":\"string\"}},\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
      "\"description\":\"Glob patterns for file paths to exclude from trace results."
      "\"}},\"required\":[\"function_name\"]}"},
@@ -366,7 +367,7 @@ static const tool_def_t TOOLS[] = {
      "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"project\":{\"type\":"
      "\"string\"},\"file_pattern\":{\"type\":\"string\"},\"regex\":{\"type\":\"boolean\","
      "\"default\":false},\"case_sensitive\":{\"type\":\"boolean\",\"default\":false,"
-     "\"description\":\"Match case-sensitively. Default false (case-insensitive).\"},"
+     "\"description\":\"Match case-sensitively (default: case-insensitive).\"},"
      "\"limit\":{\"type\":\"integer\",\"description\":\"Max "
      "results (configurable via search_limit config key). Set higher for exhaustive text search."
      "\"}},\"required\":["
@@ -1646,15 +1647,21 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             }
             yyjson_mut_obj_add_str(doc, item, "qualified_name",
                                    sr->node.qualified_name ? sr->node.qualified_name : "");
-            yyjson_mut_obj_add_str(doc, item, "label", sr->node.label ? sr->node.label : "");
-            yyjson_mut_obj_add_str(doc, item, "file_path",
-                                   sr->node.file_path ? sr->node.file_path : "");
+            if (sr->node.label && sr->node.label[0]) {
+                yyjson_mut_obj_add_str(doc, item, "label", sr->node.label);
+            }
+            if (sr->node.file_path && sr->node.file_path[0]) {
+                yyjson_mut_obj_add_str(doc, item, "file_path", sr->node.file_path);
+            }
             if (sr->pagerank_score > 0.0) {
                 add_pagerank_val(doc, item, sr->pagerank_score);
             } else {
-                /* Degree fields only when PageRank not available — PR subsumes degree info */
-                yyjson_mut_obj_add_int(doc, item, "in_degree", sr->in_degree);
-                yyjson_mut_obj_add_int(doc, item, "out_degree", sr->out_degree);
+                /* Degree fields only when PageRank not available — PR subsumes degree info.
+                 * Zero degrees add no information; omit to save tokens. */
+                if (sr->in_degree > 0)
+                    yyjson_mut_obj_add_int(doc, item, "in_degree", sr->in_degree);
+                if (sr->out_degree > 0)
+                    yyjson_mut_obj_add_int(doc, item, "out_degree", sr->out_degree);
             }
 
             /* Unconditional source tagging — critical for AI grounding.
@@ -2109,8 +2116,8 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_val *c = yyjson_mut_obj(doc);
             yyjson_mut_obj_add_str(doc, c, "qualified_name",
                                    nodes[i].qualified_name ? nodes[i].qualified_name : "");
-            yyjson_mut_obj_add_str(doc, c, "file_path",
-                                   nodes[i].file_path ? nodes[i].file_path : "");
+            if (nodes[i].file_path && nodes[i].file_path[0])
+                yyjson_mut_obj_add_str(doc, c, "file_path", nodes[i].file_path);
             yyjson_mut_arr_append(candidates, c);
         }
         yyjson_mut_obj_add_val(doc, root, "candidates", candidates);
