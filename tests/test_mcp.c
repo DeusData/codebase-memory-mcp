@@ -629,6 +629,52 @@ static cbm_mcp_server_t *setup_pagerank_server(void) {
     return srv;
 }
 
+static cbm_mcp_server_t *setup_truncation_server(void) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    if (!st) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+
+    cbm_store_upsert_project(st, "test-budget", "/tmp/test-budget");
+    cbm_mcp_server_set_project(srv, "test-budget");
+
+    const char *sig =
+        "{\"signature\":\"func BudgetedOperation(alpha int, beta int, gamma int, delta int, "
+        "epsilon int, zeta int, eta int, theta int, iota int) string\"}";
+    const char *names[] = {"Root", "A", "B", "C", "D", "E"};
+    int64_t ids[6] = {0};
+
+    for (int i = 0; i < 6; i++) {
+        char qn[128];
+        snprintf(qn, sizeof(qn), "test-budget.%s", names[i]);
+        cbm_node_t node = {
+            .project = "test-budget",
+            .label = "Function",
+            .name = names[i],
+            .qualified_name = qn,
+            .file_path = "pkg/budget.go",
+            .start_line = 10 + (i * 5),
+            .end_line = 13 + (i * 5),
+            .properties_json = sig,
+        };
+        ids[i] = cbm_store_upsert_node(st, &node);
+    }
+
+    for (int i = 0; i < 5; i++) {
+        cbm_edge_t edge = {
+            .project = "test-budget", .source_id = ids[i], .target_id = ids[i + 1], .type = "CALLS"};
+        cbm_store_insert_edge(st, &edge);
+    }
+
+    return srv;
+}
+
 TEST(tool_get_architecture_summary_truncated) {
     char tmp_dir[256];
     cbm_mcp_server_t *srv = setup_arch_summary_server(tmp_dir, sizeof(tmp_dir));
@@ -1225,6 +1271,118 @@ TEST(tool_trace_call_path_ranked_pagerank) {
     free(raw);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_search_graph_max_tokens_truncates) {
+    cbm_mcp_server_t *srv = setup_pagerank_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"test-rank\",\"label\":\"Function\",\"limit\":10,\"max_tokens\":1}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"truncated\":true"));
+    ASSERT_NOT_NULL(strstr(text, "\"shown\""));
+    ASSERT_NOT_NULL(strstr(text, "\"total_results\""));
+    ASSERT_NOT_NULL(strstr(text, "\"name\":\"Hub\""));
+    free(text);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_call_path_max_tokens_truncates) {
+    cbm_mcp_server_t *srv = setup_pagerank_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "trace_call_path",
+        "{\"project\":\"test-rank\",\"function_name\":\"Root\",\"direction\":\"outbound\","
+        "\"depth\":3,\"max_tokens\":1}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"truncated\":true"));
+    ASSERT_NOT_NULL(strstr(text, "\"shown\""));
+    ASSERT_NOT_NULL(strstr(text, "\"total_results\""));
+    ASSERT_NOT_NULL(strstr(text, "\"callees\""));
+    free(text);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_search_graph_long_signature_budget_respected) {
+    cbm_mcp_server_t *srv = setup_truncation_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"test-budget\",\"label\":\"Function\",\"limit\":10,\"max_tokens\":100}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"truncated\":true"));
+    ASSERT_NOT_NULL(strstr(text, "\"shown\":1"));
+    free(text);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_call_path_chain_shows_omitted_count) {
+    cbm_mcp_server_t *srv = setup_truncation_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "trace_call_path",
+        "{\"project\":\"test-budget\",\"function_name\":\"Root\",\"direction\":\"outbound\","
+        "\"depth\":5,\"max_tokens\":100}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"truncated\":true"));
+    ASSERT_NOT_NULL(strstr(text, "\"callees_chain\":\""));
+    ASSERT_NOT_NULL(strstr(text, "more) ->"));
+    free(text);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_query_graph_max_tokens_truncates) {
+    char tmp_dir[256];
+    cbm_mcp_server_t *srv = setup_arch_summary_server(tmp_dir, sizeof(tmp_dir));
+    ASSERT_NOT_NULL(srv);
+    char *proj_name = cbm_project_name_from_path(tmp_dir);
+    ASSERT_NOT_NULL(proj_name);
+
+    char args[1024];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"query\":\"MATCH (f:Function) RETURN f.name, f.qualified_name, "
+             "f.file_path\",\"max_tokens\":1}",
+             proj_name);
+
+    char *raw = cbm_mcp_handle_tool(srv, "query_graph", args);
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"truncated\":true"));
+    ASSERT_NOT_NULL(strstr(text, "\"shown\""));
+    ASSERT_NOT_NULL(strstr(text, "\"total_results\""));
+    ASSERT_NOT_NULL(strstr(text, "\"columns\""));
+    free(text);
+    free(raw);
+    free(proj_name);
+
+    cleanup_arch_summary_server(tmp_dir, srv);
     PASS();
 }
 
@@ -1943,6 +2101,8 @@ SUITE(mcp) {
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);
     RUN_TEST(tool_search_graph_ranked_pagerank);
+    RUN_TEST(tool_search_graph_max_tokens_truncates);
+    RUN_TEST(tool_search_graph_long_signature_budget_respected);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);
 
@@ -1956,7 +2116,10 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_summary_project_path_alias);
     RUN_TEST(tool_get_key_symbols_ranked);
     RUN_TEST(tool_trace_call_path_ranked_pagerank);
+    RUN_TEST(tool_trace_call_path_max_tokens_truncates);
+    RUN_TEST(tool_trace_call_path_chain_shows_omitted_count);
     RUN_TEST(tool_query_graph_missing_query);
+    RUN_TEST(tool_query_graph_max_tokens_truncates);
 
     /* Pipeline-dependent tool handlers */
     RUN_TEST(tool_index_repository_missing_path);

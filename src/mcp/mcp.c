@@ -46,6 +46,12 @@
 /* Default snippet fallback line count */
 #define SNIPPET_DEFAULT_LINES 50
 
+/* Approximate output budget: 1 token ~= 4 chars. */
+#define DEFAULT_MAX_TOKENS 2000
+#define MIN_JSON_CHAR_BUDGET 128
+#define MAX_FULL_BUDGET_ITEMS 5
+#define MAX_COMPACT_QUERY_CELL_CHARS 96
+
 /* Idle store eviction: close cached project store after this many seconds
  * of inactivity to free SQLite memory during idle periods. */
 #define STORE_IDLE_TIMEOUT_S 60
@@ -78,6 +84,243 @@ static char *yy_doc_to_str(yyjson_mut_doc *doc) {
     size_t len = 0;
     char *s = yyjson_mut_write(doc, YYJSON_WRITE_ALLOW_INVALID_UNICODE, &len);
     return s;
+}
+
+static size_t max_tokens_to_char_budget(int max_tokens) {
+    if (max_tokens <= 0) {
+        max_tokens = DEFAULT_MAX_TOKENS;
+    }
+    size_t budget = (size_t)max_tokens * 4U;
+    if (budget < MIN_JSON_CHAR_BUDGET) {
+        budget = MIN_JSON_CHAR_BUDGET;
+    }
+    return budget;
+}
+
+static char *json_string_field_dup(const char *json, const char *key) {
+    if (!json || !key) {
+        return NULL;
+    }
+
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) {
+        return NULL;
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *value = root ? yyjson_obj_get(root, key) : NULL;
+    const char *str = value ? yyjson_get_str(value) : NULL;
+    char *dup = str ? heap_strdup(str) : NULL;
+    yyjson_doc_free(doc);
+    return dup;
+}
+
+static char *node_signature_dup(const cbm_node_t *node) {
+    if (!node) {
+        return NULL;
+    }
+    return json_string_field_dup(node->properties_json, "signature");
+}
+
+static size_t estimate_signature_field_chars(const cbm_node_t *node) {
+    char *signature = node_signature_dup(node);
+    if (!signature || !signature[0]) {
+        free(signature);
+        return 0;
+    }
+
+    size_t size = strlen(signature) + 24;
+    free(signature);
+    return size;
+}
+
+static char *truncate_text_copy(const char *text, size_t max_chars) {
+    if (!text) {
+        return heap_strdup("");
+    }
+
+    size_t len = strlen(text);
+    if (len <= max_chars) {
+        return heap_strdup(text);
+    }
+    if (max_chars <= 3) {
+        char *out = malloc(max_chars + 1);
+        if (!out) {
+            return NULL;
+        }
+        for (size_t i = 0; i < max_chars; i++) {
+            out[i] = '.';
+        }
+        out[max_chars] = '\0';
+        return out;
+    }
+
+    char *out = malloc(max_chars + 1);
+    if (!out) {
+        return NULL;
+    }
+    size_t keep = max_chars - 3;
+    memcpy(out, text, keep);
+    memcpy(out + keep, "...", 4);
+    return out;
+}
+
+static char *build_compact_hop_chain(const cbm_node_hop_t *hops, int count) {
+    if (!hops || count <= 0) {
+        return NULL;
+    }
+
+    const char *first = NULL;
+    const char *last = NULL;
+    int named_count = 0;
+    for (int i = 0; i < count; i++) {
+        if (hops[i].node.name && hops[i].node.name[0]) {
+            if (!first) {
+                first = hops[i].node.name;
+            }
+            last = hops[i].node.name;
+            named_count++;
+        }
+    }
+    if (!first) {
+        return NULL;
+    }
+    if (named_count <= 1 || !last || strcmp(first, last) == 0) {
+        return heap_strdup(first);
+    }
+    if (named_count == 2) {
+        size_t len = strlen(first) + strlen(last) + strlen(" -> ") + 1;
+        char *chain = malloc(len);
+        if (!chain) {
+            return NULL;
+        }
+        snprintf(chain, len, "%s -> %s", first, last);
+        return chain;
+    }
+
+    int omitted = named_count - 2;
+    char omitted_buf[32];
+    snprintf(omitted_buf, sizeof(omitted_buf), "%d", omitted);
+
+    size_t len =
+        strlen(first) + strlen(last) + strlen(omitted_buf) + strlen(" -> ... ( more) -> ") + 1;
+    char *chain = malloc(len);
+    if (!chain) {
+        return NULL;
+    }
+    snprintf(chain, len, "%s -> ... (%d more) -> %s", first, omitted, last);
+    return chain;
+}
+
+static size_t estimate_search_result_chars(const cbm_search_result_t *sr, bool compact) {
+    size_t size = 96;
+    size += strlen(sr->node.name ? sr->node.name : "");
+    size += strlen(sr->node.file_path ? sr->node.file_path : "");
+    size += estimate_signature_field_chars(&sr->node);
+    if (!compact) {
+        size += strlen(sr->node.qualified_name ? sr->node.qualified_name : "");
+        size += strlen(sr->node.label ? sr->node.label : "");
+        size += 48;
+    } else {
+        size += 24;
+    }
+    return size;
+}
+
+static void add_search_result_item(yyjson_mut_doc *doc, yyjson_mut_val *results,
+                                   const cbm_search_result_t *sr, bool compact) {
+    yyjson_mut_val *item = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, item, "name", sr->node.name ? sr->node.name : "");
+    yyjson_mut_obj_add_str(doc, item, "file_path", sr->node.file_path ? sr->node.file_path : "");
+    yyjson_mut_obj_add_int(doc, item, "start_line", sr->node.start_line);
+
+    char *signature = node_signature_dup(&sr->node);
+    if (signature && signature[0]) {
+        yyjson_mut_obj_add_strcpy(doc, item, "signature", signature);
+    }
+    free(signature);
+
+    if (compact) {
+        yyjson_mut_obj_add_bool(doc, item, "compact", true);
+    } else {
+        yyjson_mut_obj_add_str(doc, item, "qualified_name",
+                               sr->node.qualified_name ? sr->node.qualified_name : "");
+        yyjson_mut_obj_add_str(doc, item, "label", sr->node.label ? sr->node.label : "");
+        yyjson_mut_obj_add_int(doc, item, "end_line", sr->node.end_line);
+        yyjson_mut_obj_add_int(doc, item, "in_degree", sr->in_degree);
+        yyjson_mut_obj_add_int(doc, item, "out_degree", sr->out_degree);
+        yyjson_mut_obj_add_real(doc, item, "pagerank", sr->pagerank);
+    }
+
+    yyjson_mut_arr_add_val(results, item);
+}
+
+static size_t estimate_node_hop_chars(const cbm_node_hop_t *hop, bool compact) {
+    size_t size = 80;
+    size += strlen(hop->node.name ? hop->node.name : "");
+    size += strlen(hop->node.file_path ? hop->node.file_path : "");
+    size += estimate_signature_field_chars(&hop->node);
+    if (!compact) {
+        size += strlen(hop->node.qualified_name ? hop->node.qualified_name : "");
+        size += 40;
+    } else {
+        size += 20;
+    }
+    return size;
+}
+
+static void add_node_hop_item(yyjson_mut_doc *doc, yyjson_mut_val *items, const cbm_node_hop_t *hop,
+                              bool compact) {
+    yyjson_mut_val *item = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, item, "name", hop->node.name ? hop->node.name : "");
+    yyjson_mut_obj_add_str(doc, item, "file_path", hop->node.file_path ? hop->node.file_path : "");
+    yyjson_mut_obj_add_int(doc, item, "start_line", hop->node.start_line);
+    yyjson_mut_obj_add_int(doc, item, "hop", hop->hop);
+
+    char *signature = node_signature_dup(&hop->node);
+    if (signature && signature[0]) {
+        yyjson_mut_obj_add_strcpy(doc, item, "signature", signature);
+    }
+    free(signature);
+
+    if (compact) {
+        yyjson_mut_obj_add_bool(doc, item, "compact", true);
+    } else {
+        yyjson_mut_obj_add_str(doc, item, "qualified_name",
+                               hop->node.qualified_name ? hop->node.qualified_name : "");
+        yyjson_mut_obj_add_real(doc, item, "pagerank", hop->pagerank);
+    }
+
+    yyjson_mut_arr_add_val(items, item);
+}
+
+static size_t estimate_query_row_chars(const char *const *row, int col_count, bool compact) {
+    size_t size = 8;
+    for (int c = 0; c < col_count; c++) {
+        size += 4;
+        if (!row[c]) {
+            continue;
+        }
+        size += compact ? strnlen(row[c], MAX_COMPACT_QUERY_CELL_CHARS) : strlen(row[c]);
+    }
+    return size;
+}
+
+static void add_query_row(yyjson_mut_doc *doc, yyjson_mut_val *rows, const char *const *row,
+                          int col_count,
+                          bool compact) {
+    yyjson_mut_val *out_row = yyjson_mut_arr(doc);
+    for (int c = 0; c < col_count; c++) {
+        const char *cell = row[c] ? row[c] : "";
+        if (compact) {
+            char *clipped = truncate_text_copy(cell, MAX_COMPACT_QUERY_CELL_CHARS);
+            yyjson_mut_arr_add_strcpy(doc, out_row, clipped ? clipped : "");
+            free(clipped);
+        } else {
+            yyjson_mut_arr_add_str(doc, out_row, cell);
+        }
+    }
+    yyjson_mut_arr_add_val(rows, out_row);
 }
 
 typedef struct {
@@ -349,7 +592,9 @@ static const tool_def_t TOOLS[] = {
      "\"type\":\"boolean\"},\"include_connected\":{\"type\":\"boolean\"},\"limit\":{\"type\":"
      "\"integer\",\"description\":\"Max results. Default: "
      "unlimited\"},\"offset\":{\"type\":\"integer\",\"default\":0},\"ranked\":{\"type\":\"boolean\","
-     "\"default\":true,\"description\":\"Sort results by PageRank importance when available.\"}},"
+     "\"default\":true,\"description\":\"Sort results by PageRank importance when available.\"},"
+     "\"max_tokens\":{\"type\":\"integer\",\"default\":2000,\"description\":\"Maximum output "
+     "size. Truncates lower-ranked results when needed.\"}},"
      "\"required\":[\"project\"]}"},
 
     {"query_graph",
@@ -359,7 +604,9 @@ static const tool_def_t TOOLS[] = {
      "query\"},\"project\":{\"type\":\"string\"},\"max_rows\":{\"type\":\"integer\","
      "\"description\":"
      "\"Optional row limit. Default: unlimited (100k "
-     "ceiling)\"}},\"required\":[\"query\",\"project\"]}"},
+     "ceiling)\"},\"max_tokens\":{\"type\":\"integer\",\"default\":2000,\"description\":"
+     "\"Maximum output size. Compacts lower-priority rows when needed.\"}},"
+     "\"required\":[\"query\",\"project\"]}"},
 
     {"trace_call_path",
      "Trace function call paths — who calls a function and what it calls. Use INSTEAD OF grep when "
@@ -368,7 +615,9 @@ static const tool_def_t TOOLS[] = {
      "\"type\":\"string\"},\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\","
      "\"both\"],\"default\":\"both\"},\"depth\":{\"type\":\"integer\",\"default\":3},\"edge_"
      "types\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"ranked\":{\"type\":\"boolean\","
-     "\"default\":true,\"description\":\"Sort callers/callees by PageRank importance.\"}},"
+     "\"default\":true,\"description\":\"Sort callers/callees by PageRank importance.\"},"
+     "\"max_tokens\":{\"type\":\"integer\",\"default\":2000,\"description\":\"Maximum output "
+     "size. Truncates lower-ranked path results when needed.\"}},"
      "\"required\":[\"function_name\",\"project\"]}"},
 
     {"get_code_snippet",
@@ -1087,7 +1336,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
     int min_degree = cbm_mcp_get_int_arg(args, "min_degree", -1);
     int max_degree = cbm_mcp_get_int_arg(args, "max_degree", -1);
+    int max_tokens = cbm_mcp_get_int_arg(args, "max_tokens", DEFAULT_MAX_TOKENS);
     bool ranked = cbm_mcp_get_bool_arg_default(args, "ranked", true);
+    size_t char_budget = max_tokens_to_char_budget(max_tokens);
 
     cbm_search_params_t params = {
         .project = project,
@@ -1112,24 +1363,55 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
 
     yyjson_mut_val *results = yyjson_mut_arr(doc);
     for (int i = 0; i < out.count; i++) {
-        cbm_search_result_t *sr = &out.results[i];
-        yyjson_mut_val *item = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_str(doc, item, "name", sr->node.name ? sr->node.name : "");
-        yyjson_mut_obj_add_str(doc, item, "qualified_name",
-                               sr->node.qualified_name ? sr->node.qualified_name : "");
-        yyjson_mut_obj_add_str(doc, item, "label", sr->node.label ? sr->node.label : "");
-        yyjson_mut_obj_add_str(doc, item, "file_path",
-                               sr->node.file_path ? sr->node.file_path : "");
-        yyjson_mut_obj_add_int(doc, item, "in_degree", sr->in_degree);
-        yyjson_mut_obj_add_int(doc, item, "out_degree", sr->out_degree);
-        yyjson_mut_obj_add_real(doc, item, "pagerank", sr->pagerank);
-        yyjson_mut_arr_add_val(results, item);
+        add_search_result_item(doc, results, &out.results[i], false);
     }
     yyjson_mut_obj_add_val(doc, root, "results", results);
     yyjson_mut_obj_add_bool(doc, root, "has_more", out.total > offset + out.count);
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+
+    if (json && strlen(json) > char_budget) {
+        free(json);
+
+        doc = yyjson_mut_doc_new(NULL);
+        root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+
+        yyjson_mut_obj_add_int(doc, root, "total", out.total);
+        yyjson_mut_obj_add_bool(doc, root, "truncated", true);
+        yyjson_mut_obj_add_int(doc, root, "total_results", out.total);
+
+        results = yyjson_mut_arr(doc);
+        size_t used = 96;
+        int shown = 0;
+        int full_items = 0;
+        for (int i = 0; i < out.count; i++) {
+            bool compact = full_items >= MAX_FULL_BUDGET_ITEMS;
+            size_t estimate = estimate_search_result_chars(&out.results[i], compact);
+            if (used + estimate > char_budget && !compact) {
+                compact = true;
+                estimate = estimate_search_result_chars(&out.results[i], true);
+            }
+            if (used + estimate > char_budget && shown > 0) {
+                break;
+            }
+            if (used + estimate <= char_budget || shown == 0) {
+                add_search_result_item(doc, results, &out.results[i], compact);
+                used += estimate;
+                shown++;
+                if (!compact) {
+                    full_items++;
+                }
+            }
+        }
+        yyjson_mut_obj_add_val(doc, root, "results", results);
+        yyjson_mut_obj_add_int(doc, root, "shown", shown);
+        yyjson_mut_obj_add_bool(doc, root, "has_more", out.total > offset + shown);
+        json = yy_doc_to_str(doc);
+        yyjson_mut_doc_free(doc);
+    }
+
     cbm_store_search_free(&out);
 
     free(project);
@@ -1147,6 +1429,8 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
     cbm_store_t *store = resolve_store(srv, project);
     int max_rows = cbm_mcp_get_int_arg(args, "max_rows", 0);
+    int max_tokens = cbm_mcp_get_int_arg(args, "max_tokens", DEFAULT_MAX_TOKENS);
+    size_t char_budget = max_tokens_to_char_budget(max_tokens);
 
     if (!query) {
         free(project);
@@ -1194,17 +1478,63 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     /* rows */
     yyjson_mut_val *rows = yyjson_mut_arr(doc);
     for (int r = 0; r < result.row_count; r++) {
-        yyjson_mut_val *row = yyjson_mut_arr(doc);
-        for (int c = 0; c < result.col_count; c++) {
-            yyjson_mut_arr_add_str(doc, row, result.rows[r][c]);
-        }
-        yyjson_mut_arr_add_val(rows, row);
+        add_query_row(doc, rows, result.rows[r], result.col_count, false);
     }
     yyjson_mut_obj_add_val(doc, root, "rows", rows);
     yyjson_mut_obj_add_int(doc, root, "total", result.row_count);
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+
+    if (json && strlen(json) > char_budget) {
+        free(json);
+
+        doc = yyjson_mut_doc_new(NULL);
+        root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+
+        cols = yyjson_mut_arr(doc);
+        for (int i = 0; i < result.col_count; i++) {
+            yyjson_mut_arr_add_str(doc, cols, result.columns[i]);
+        }
+        yyjson_mut_obj_add_val(doc, root, "columns", cols);
+
+        rows = yyjson_mut_arr(doc);
+        yyjson_mut_obj_add_bool(doc, root, "truncated", true);
+        yyjson_mut_obj_add_int(doc, root, "total_results", result.row_count);
+
+        size_t used = 96;
+        for (int i = 0; i < result.col_count; i++) {
+            used += strlen(result.columns[i] ? result.columns[i] : "") + 4;
+        }
+        int shown = 0;
+        int full_rows = 0;
+        for (int r = 0; r < result.row_count; r++) {
+            bool compact = full_rows >= MAX_FULL_BUDGET_ITEMS;
+            size_t estimate = estimate_query_row_chars(result.rows[r], result.col_count, compact);
+            if (used + estimate > char_budget && !compact) {
+                compact = true;
+                estimate = estimate_query_row_chars(result.rows[r], result.col_count, true);
+            }
+            if (used + estimate > char_budget && shown > 0) {
+                break;
+            }
+            if (used + estimate <= char_budget || shown == 0) {
+                add_query_row(doc, rows, result.rows[r], result.col_count, compact);
+                used += estimate;
+                shown++;
+                if (!compact) {
+                    full_rows++;
+                }
+            }
+        }
+        yyjson_mut_obj_add_val(doc, root, "rows", rows);
+        yyjson_mut_obj_add_int(doc, root, "total", result.row_count);
+        yyjson_mut_obj_add_int(doc, root, "shown", shown);
+        json = yy_doc_to_str(doc);
+        yyjson_mut_doc_free(doc);
+    }
+
     cbm_cypher_result_free(&result);
     free(query);
     free(project);
@@ -1685,7 +2015,9 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_t *store = resolve_store(srv, project);
     char *direction = cbm_mcp_get_string_arg(args, "direction");
     int depth = cbm_mcp_get_int_arg(args, "depth", 3);
+    int max_tokens = cbm_mcp_get_int_arg(args, "max_tokens", DEFAULT_MAX_TOKENS);
     bool ranked = cbm_mcp_get_bool_arg_default(args, "ranked", true);
+    size_t char_budget = max_tokens_to_char_budget(max_tokens);
 
     if (!func_name) {
         free(project);
@@ -1758,15 +2090,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
 
         yyjson_mut_val *callees = yyjson_mut_arr(doc);
         for (int i = 0; i < tr_out.visited_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "name",
-                                   tr_out.visited[i].node.name ? tr_out.visited[i].node.name : "");
-            yyjson_mut_obj_add_str(
-                doc, item, "qualified_name",
-                tr_out.visited[i].node.qualified_name ? tr_out.visited[i].node.qualified_name : "");
-            yyjson_mut_obj_add_int(doc, item, "hop", tr_out.visited[i].hop);
-            yyjson_mut_obj_add_real(doc, item, "pagerank", tr_out.visited[i].pagerank);
-            yyjson_mut_arr_add_val(callees, item);
+            add_node_hop_item(doc, callees, &tr_out.visited[i], false);
         }
         yyjson_mut_obj_add_val(doc, root, "callees", callees);
     }
@@ -1781,15 +2105,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
 
         yyjson_mut_val *callers = yyjson_mut_arr(doc);
         for (int i = 0; i < tr_in.visited_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "name",
-                                   tr_in.visited[i].node.name ? tr_in.visited[i].node.name : "");
-            yyjson_mut_obj_add_str(
-                doc, item, "qualified_name",
-                tr_in.visited[i].node.qualified_name ? tr_in.visited[i].node.qualified_name : "");
-            yyjson_mut_obj_add_int(doc, item, "hop", tr_in.visited[i].hop);
-            yyjson_mut_obj_add_real(doc, item, "pagerank", tr_in.visited[i].pagerank);
-            yyjson_mut_arr_add_val(callers, item);
+            add_node_hop_item(doc, callers, &tr_in.visited[i], false);
         }
         yyjson_mut_obj_add_val(doc, root, "callers", callers);
     }
@@ -1797,6 +2113,105 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     /* Serialize BEFORE freeing traversal results (yyjson borrows strings) */
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+
+    if (json && strlen(json) > char_budget) {
+        free(json);
+
+        doc = yyjson_mut_doc_new(NULL);
+        root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+
+        yyjson_mut_obj_add_str(doc, root, "function", func_name);
+        yyjson_mut_obj_add_str(doc, root, "direction", direction);
+        yyjson_mut_obj_add_bool(doc, root, "truncated", true);
+
+        int total_results = 0;
+        if (do_outbound) {
+            total_results += tr_out.visited_count;
+        }
+        if (do_inbound) {
+            total_results += tr_in.visited_count;
+        }
+        yyjson_mut_obj_add_int(doc, root, "total_results", total_results);
+
+        size_t used = 96 + strlen(func_name) + strlen(direction);
+        int shown = 0;
+
+        if (do_outbound) {
+            yyjson_mut_val *callees = yyjson_mut_arr(doc);
+            int shown_callees = 0;
+            int full_callees = 0;
+            for (int i = 0; i < tr_out.visited_count; i++) {
+                bool compact = full_callees >= MAX_FULL_BUDGET_ITEMS;
+                size_t estimate = estimate_node_hop_chars(&tr_out.visited[i], compact);
+                if (used + estimate > char_budget && !compact) {
+                    compact = true;
+                    estimate = estimate_node_hop_chars(&tr_out.visited[i], true);
+                }
+                if (used + estimate > char_budget && shown > 0) {
+                    break;
+                }
+                if (used + estimate <= char_budget || shown == 0) {
+                    add_node_hop_item(doc, callees, &tr_out.visited[i], compact);
+                    used += estimate;
+                    shown++;
+                    shown_callees++;
+                    if (!compact) {
+                        full_callees++;
+                    }
+                }
+            }
+            yyjson_mut_obj_add_val(doc, root, "callees", callees);
+            if (shown_callees < tr_out.visited_count) {
+                char *chain = build_compact_hop_chain(tr_out.visited + shown_callees,
+                                                      tr_out.visited_count - shown_callees);
+                if (chain && chain[0]) {
+                    yyjson_mut_obj_add_strcpy(doc, root, "callees_chain", chain);
+                }
+                free(chain);
+            }
+        }
+
+        if (do_inbound) {
+            yyjson_mut_val *callers = yyjson_mut_arr(doc);
+            int shown_callers = 0;
+            int full_callers = 0;
+            for (int i = 0; i < tr_in.visited_count; i++) {
+                bool compact = full_callers >= MAX_FULL_BUDGET_ITEMS;
+                size_t estimate = estimate_node_hop_chars(&tr_in.visited[i], compact);
+                if (used + estimate > char_budget && !compact) {
+                    compact = true;
+                    estimate = estimate_node_hop_chars(&tr_in.visited[i], true);
+                }
+                if (used + estimate > char_budget && shown > 0) {
+                    break;
+                }
+                if (used + estimate <= char_budget || shown == 0) {
+                    add_node_hop_item(doc, callers, &tr_in.visited[i], compact);
+                    used += estimate;
+                    shown++;
+                    shown_callers++;
+                    if (!compact) {
+                        full_callers++;
+                    }
+                }
+            }
+            yyjson_mut_obj_add_val(doc, root, "callers", callers);
+            if (shown_callers < tr_in.visited_count) {
+                char *chain =
+                    build_compact_hop_chain(tr_in.visited + shown_callers,
+                                            tr_in.visited_count - shown_callers);
+                if (chain && chain[0]) {
+                    yyjson_mut_obj_add_strcpy(doc, root, "callers_chain", chain);
+                }
+                free(chain);
+            }
+        }
+
+        yyjson_mut_obj_add_int(doc, root, "shown", shown);
+        json = yy_doc_to_str(doc);
+        yyjson_mut_doc_free(doc);
+    }
 
     /* Now safe to free traversal data */
     if (do_outbound) {
