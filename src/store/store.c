@@ -127,6 +127,43 @@ static char *heap_strdup(const char *s) {
     return d;
 }
 
+static bool sqlite_uri_path_safe_char(unsigned char c) {
+    return isalnum(c) || c == '/' || c == '.' || c == '_' || c == '-' || c == '~' || c == ':';
+}
+
+static char *sqlite_readonly_immutable_uri(const char *db_path) {
+    if (!db_path) {
+        return NULL;
+    }
+
+    static const char suffix[] = "?mode=ro&immutable=1";
+    size_t path_len = strlen(db_path);
+    size_t cap = strlen("file:") + (path_len * 3) + sizeof(suffix);
+    char *uri = malloc(cap);
+    if (!uri) {
+        return NULL;
+    }
+
+    char *dst = uri;
+    memcpy(dst, "file:", strlen("file:"));
+    dst += strlen("file:");
+
+    static const char hex[] = "0123456789ABCDEF";
+    for (size_t i = 0; i < path_len; i++) {
+        unsigned char c = (unsigned char)db_path[i];
+        if (sqlite_uri_path_safe_char(c)) {
+            *dst++ = (char)c;
+        } else {
+            *dst++ = '%';
+            *dst++ = hex[(c >> 4) & 0x0F];
+            *dst++ = hex[c & 0x0F];
+        }
+    }
+
+    memcpy(dst, suffix, sizeof(suffix));
+    return uri;
+}
+
 static bool store_has_node_scores_table(cbm_store_t *s) {
     if (!s || !s->db) {
         return false;
@@ -436,8 +473,18 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
         return NULL;
     }
 
-    /* Open read-only and do NOT create — query tools should never need write access. */
-    int rc = sqlite3_open_v2(db_path, &s->db, SQLITE_OPEN_READONLY, NULL);
+    /* Query tools read atomically-written snapshot DBs. Open them via an
+     * immutable URI so SQLite does not try to create WAL/SHM sidecars when the
+     * file was produced by the direct page writer and later reopened in WAL
+     * mode by the indexing pipeline. */
+    char *uri = sqlite_readonly_immutable_uri(db_path);
+    if (!uri) {
+        free(s);
+        return NULL;
+    }
+
+    int rc = sqlite3_open_v2(uri, &s->db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL);
+    free(uri);
     if (rc != SQLITE_OK) {
         /* sqlite3_open_v2 allocates a handle even on failure — must close it. */
         sqlite3_close(s->db);
