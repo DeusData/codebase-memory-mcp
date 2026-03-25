@@ -2920,6 +2920,697 @@ int cbm_deduplicate_hops(const cbm_node_hop_t *hops, int hop_count, cbm_node_hop
     return CBM_STORE_OK;
 }
 
+typedef struct {
+    int64_t id;
+    int hop;
+} impact_visit_t;
+
+typedef struct {
+    int64_t id;
+    cbm_node_t node;
+    double pagerank;
+} impact_cached_node_t;
+
+typedef struct {
+    CBMHashTable *seen_ids;
+    char **seen_keys;
+    int seen_key_count;
+    int seen_key_cap;
+    impact_visit_t *queue;
+    int queue_count;
+    int queue_cap;
+    impact_visit_t *visited;
+    int visited_count;
+    int visited_cap;
+} impact_walk_t;
+
+static void impact_walk_free(impact_walk_t *walk) {
+    if (!walk) {
+        return;
+    }
+    if (walk->seen_ids) {
+        cbm_ht_free(walk->seen_ids);
+    }
+    for (int i = 0; i < walk->seen_key_count; i++) {
+        free(walk->seen_keys[i]);
+    }
+    free(walk->seen_keys);
+    free(walk->queue);
+    free(walk->visited);
+    memset(walk, 0, sizeof(*walk));
+}
+
+static void impact_cached_nodes_free(impact_cached_node_t *nodes, int count) {
+    if (!nodes) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        cbm_node_free_fields(&nodes[i].node);
+    }
+    free(nodes);
+}
+
+static bool impact_label_is_callable(const char *label) {
+    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
+                     strcmp(label, "Class") == 0);
+}
+
+static bool impact_json_bool_field(const char *json, const char *key) {
+    if (!json || !json[0] || !key) {
+        return false;
+    }
+
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) {
+        return false;
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *value = root ? yyjson_obj_get(root, key) : NULL;
+    bool result = false;
+    if (value) {
+        if (yyjson_is_bool(value)) {
+            result = yyjson_is_true(value);
+        } else if (yyjson_is_uint(value)) {
+            result = yyjson_get_uint(value) != 0;
+        } else if (yyjson_is_int(value)) {
+            result = yyjson_get_sint(value) != 0;
+        }
+    }
+    yyjson_doc_free(doc);
+    return result;
+}
+
+static bool impact_node_is_entry_point(const cbm_node_t *node) {
+    if (!node) {
+        return false;
+    }
+    return impact_json_bool_field(node->properties_json, "is_entry_point");
+}
+
+static int impact_walk_enqueue(impact_walk_t *walk, int64_t id, int hop, bool record_visit) {
+    char key_buf[32];
+    snprintf(key_buf, sizeof(key_buf), "%lld", (long long)id);
+    if (walk->seen_ids && cbm_ht_get(walk->seen_ids, key_buf)) {
+        return CBM_STORE_OK;
+    }
+
+    char *key = heap_strdup(key_buf);
+    if (!key) {
+        return CBM_STORE_ERR;
+    }
+
+    if (walk->seen_key_count >= walk->seen_key_cap) {
+        int new_cap = walk->seen_key_cap > 0 ? walk->seen_key_cap * 2 : 16;
+        walk->seen_keys = safe_realloc(walk->seen_keys, (size_t)new_cap * sizeof(char *));
+        walk->seen_key_cap = new_cap;
+    }
+    walk->seen_keys[walk->seen_key_count++] = key;
+    cbm_ht_set(walk->seen_ids, key, (void *)1);
+
+    if (walk->queue_count >= walk->queue_cap) {
+        int new_cap = walk->queue_cap > 0 ? walk->queue_cap * 2 : 16;
+        walk->queue = safe_realloc(walk->queue, (size_t)new_cap * sizeof(impact_visit_t));
+        walk->queue_cap = new_cap;
+    }
+    walk->queue[walk->queue_count++] = (impact_visit_t){.id = id, .hop = hop};
+
+    if (record_visit) {
+        if (walk->visited_count >= walk->visited_cap) {
+            int new_cap = walk->visited_cap > 0 ? walk->visited_cap * 2 : 16;
+            walk->visited = safe_realloc(walk->visited, (size_t)new_cap * sizeof(impact_visit_t));
+            walk->visited_cap = new_cap;
+        }
+        walk->visited[walk->visited_count++] = (impact_visit_t){.id = id, .hop = hop};
+    }
+
+    return CBM_STORE_OK;
+}
+
+static bool impact_node_in_top_five_percent(cbm_store_t *s, const char *project, double pagerank) {
+    if (!s || !s->db || !project || pagerank <= 0.0 || !store_has_node_scores_table(s)) {
+        return false;
+    }
+
+    const char *total_sql =
+        "SELECT COUNT(*) FROM nodes WHERE project=?1 AND label IN ('Function','Method','Class')";
+    sqlite3_stmt *stmt = NULL;
+    int total = 0;
+    if (sqlite3_prepare_v2(s->db, total_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    bind_text(stmt, 1, project);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        total = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    if (total <= 0) {
+        return false;
+    }
+
+    int top_count = (total * 5 + 99) / 100;
+    if (top_count < 1) {
+        top_count = 1;
+    }
+
+    const char *higher_sql =
+        "SELECT COUNT(*) "
+        "FROM nodes n "
+        "JOIN node_scores ns ON ns.project = n.project AND ns.node_id = n.id "
+        "WHERE n.project=?1 AND n.label IN ('Function','Method','Class') "
+        "AND COALESCE(ns.pagerank, 0.0) > ?2";
+    int higher = total;
+    if (sqlite3_prepare_v2(s->db, higher_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    bind_text(stmt, 1, project);
+    sqlite3_bind_double(stmt, 2, pagerank);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        higher = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+
+    return higher < top_count;
+}
+
+static int impact_select_target(cbm_store_t *s, const char *project, const char *symbol,
+                                cbm_node_t *out_node, int *out_in_degree, double *out_pagerank) {
+    memset(out_node, 0, sizeof(*out_node));
+    *out_in_degree = 0;
+    *out_pagerank = 0.0;
+
+    if (!s || !s->db || !project || !symbol) {
+        return CBM_STORE_ERR;
+    }
+
+    bool has_scores = store_has_node_scores_table(s);
+    char sql[1024];
+    snprintf(sql, sizeof(sql),
+             "SELECT n.id, n.project, n.label, n.name, n.qualified_name, n.file_path, "
+             "n.start_line, n.end_line, n.properties, "
+             "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.type = 'CALLS') AS "
+             "in_deg, %s "
+             "FROM nodes n %s "
+             "WHERE n.project=?1 AND n.name=?2 AND n.label IN ('Function','Method','Class') "
+             "ORDER BY CASE WHEN lower(COALESCE(n.file_path, '')) LIKE '%%test%%' THEN 1 "
+             "ELSE 0 END, pagerank DESC, in_deg DESC, "
+             "n.qualified_name ASC LIMIT 1;",
+             has_scores ? "COALESCE(ns.pagerank, 0.0) AS pagerank" : "0.0 AS pagerank",
+             has_scores
+                 ? "LEFT JOIN node_scores ns ON ns.project = n.project AND ns.node_id = n.id"
+                 : "");
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "impact_select_target");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, 1, project);
+    bind_text(stmt, 2, symbol);
+
+    int rc = CBM_STORE_NOT_FOUND;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        scan_node(stmt, out_node);
+        *out_in_degree = sqlite3_column_int(stmt, 9);
+        *out_pagerank = sqlite3_column_double(stmt, 10);
+        rc = CBM_STORE_OK;
+    } else {
+        store_set_error(s, "symbol not found");
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+static int impact_cached_node_cmp(const void *lhs, const void *rhs) {
+    const impact_cached_node_t *a = lhs;
+    const impact_cached_node_t *b = rhs;
+    if (a->id < b->id) {
+        return -1;
+    }
+    if (a->id > b->id) {
+        return 1;
+    }
+    return 0;
+}
+
+static const impact_cached_node_t *impact_find_cached_node(const impact_cached_node_t *nodes,
+                                                           int count, int64_t id) {
+    int lo = 0;
+    int hi = count - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (nodes[mid].id == id) {
+            return &nodes[mid];
+        }
+        if (nodes[mid].id < id) {
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return NULL;
+}
+
+static int impact_fetch_nodes_with_scores(cbm_store_t *s, const char *project,
+                                          const impact_visit_t *visits, int visit_count,
+                                          impact_cached_node_t **out_nodes, int *out_count) {
+    *out_nodes = NULL;
+    *out_count = 0;
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+    if (!visits || visit_count <= 0) {
+        return CBM_STORE_OK;
+    }
+
+    bool has_scores = store_has_node_scores_table(s);
+    size_t sql_cap = 512 + ((size_t)visit_count * 8U);
+    char *sql = malloc(sql_cap);
+    if (!sql) {
+        return CBM_STORE_ERR;
+    }
+
+    int written = snprintf(
+        sql, sql_cap,
+        "SELECT n.id, n.project, n.label, n.name, n.qualified_name, n.file_path, "
+        "n.start_line, n.end_line, n.properties, %s "
+        "FROM nodes n %s WHERE n.project=?1 AND n.id IN (",
+        has_scores ? "COALESCE(ns.pagerank, 0.0) AS pagerank" : "0.0 AS pagerank",
+        has_scores ? "LEFT JOIN node_scores ns ON ns.project = n.project AND ns.node_id = n.id"
+                   : "");
+    if (written < 0 || (size_t)written >= sql_cap) {
+        free(sql);
+        return CBM_STORE_ERR;
+    }
+
+    size_t len = (size_t)written;
+    for (int i = 0; i < visit_count; i++) {
+        written = snprintf(sql + len, sql_cap - len, "%s?%d", i > 0 ? "," : "", i + 2);
+        if (written < 0 || (size_t)written >= sql_cap - len) {
+            free(sql);
+            return CBM_STORE_ERR;
+        }
+        len += (size_t)written;
+    }
+    written = snprintf(sql + len, sql_cap - len, ") ORDER BY n.id");
+    if (written < 0 || (size_t)written >= sql_cap - len) {
+        free(sql);
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        free(sql);
+        store_set_error_sqlite(s, "impact_fetch_nodes_with_scores");
+        return CBM_STORE_ERR;
+    }
+    free(sql);
+
+    bind_text(stmt, 1, project);
+    for (int i = 0; i < visit_count; i++) {
+        sqlite3_bind_int64(stmt, i + 2, visits[i].id);
+    }
+
+    impact_cached_node_t *nodes = calloc((size_t)visit_count, sizeof(*nodes));
+    if (!nodes) {
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+
+    int count = 0;
+    int rc = CBM_STORE_OK;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (count >= visit_count) {
+            rc = CBM_STORE_ERR;
+            break;
+        }
+        scan_node(stmt, &nodes[count].node);
+        nodes[count].id = nodes[count].node.id;
+        nodes[count].pagerank = sqlite3_column_double(stmt, 9);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+
+    if (rc != CBM_STORE_OK) {
+        impact_cached_nodes_free(nodes, count);
+        return rc;
+    }
+
+    if (count > 1) {
+        qsort(nodes, (size_t)count, sizeof(*nodes), impact_cached_node_cmp);
+    }
+    *out_nodes = nodes;
+    *out_count = count;
+    return CBM_STORE_OK;
+}
+
+static int impact_enqueue_neighbors(cbm_store_t *s, impact_walk_t *walk, int64_t node_id,
+                                    const char *edge_type, bool inbound, int next_hop) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    int rc = inbound ? cbm_store_find_edges_by_target_type(s, node_id, edge_type, &edges, &edge_count)
+                     : cbm_store_find_edges_by_source_type(s, node_id, edge_type, &edges, &edge_count);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    for (int i = 0; i < edge_count; i++) {
+        int64_t next_id = inbound ? edges[i].source_id : edges[i].target_id;
+        rc = impact_walk_enqueue(walk, next_id, next_hop, true);
+        if (rc != CBM_STORE_OK) {
+            cbm_store_free_edges(edges, edge_count);
+            return rc;
+        }
+    }
+
+    cbm_store_free_edges(edges, edge_count);
+    return CBM_STORE_OK;
+}
+
+static int impact_append_item(cbm_impact_item_t **arr, int *count, int *cap, const cbm_node_t *node,
+                              const char *type, double pagerank, int hop) {
+    if (*count >= *cap) {
+        int new_cap = *cap > 0 ? *cap * 2 : 8;
+        *arr = safe_realloc(*arr, (size_t)new_cap * sizeof(cbm_impact_item_t));
+        *cap = new_cap;
+    }
+
+    cbm_impact_item_t item = {0};
+    item.name = heap_strdup(safe_str(node ? node->name : NULL));
+    item.file = heap_strdup(safe_str(node ? node->file_path : NULL));
+    item.type = heap_strdup(safe_str(type));
+    item.pagerank = pagerank;
+    item.hop = hop;
+
+    if (!item.name || !item.file || !item.type) {
+        free((void *)item.name);
+        free((void *)item.file);
+        free((void *)item.type);
+        return CBM_STORE_ERR;
+    }
+
+    (*arr)[(*count)++] = item;
+    return CBM_STORE_OK;
+}
+
+static int impact_append_test(cbm_affected_test_t **arr, int *count, int *cap, const cbm_node_t *node) {
+    if (*count >= *cap) {
+        int new_cap = *cap > 0 ? *cap * 2 : 4;
+        *arr = safe_realloc(*arr, (size_t)new_cap * sizeof(cbm_affected_test_t));
+        *cap = new_cap;
+    }
+
+    cbm_affected_test_t item = {0};
+    item.name = heap_strdup(safe_str(node ? node->name : NULL));
+    item.file = heap_strdup(safe_str(node ? node->file_path : NULL));
+    if (!item.name || !item.file) {
+        free((void *)item.name);
+        free((void *)item.file);
+        return CBM_STORE_ERR;
+    }
+
+    (*arr)[(*count)++] = item;
+    return CBM_STORE_OK;
+}
+
+static int impact_item_cmp(const void *lhs, const void *rhs) {
+    const cbm_impact_item_t *a = lhs;
+    const cbm_impact_item_t *b = rhs;
+    if (a->pagerank < b->pagerank) {
+        return 1;
+    }
+    if (a->pagerank > b->pagerank) {
+        return -1;
+    }
+    if (a->hop != b->hop) {
+        return a->hop - b->hop;
+    }
+    return strcmp(safe_str(a->name), safe_str(b->name));
+}
+
+static int impact_direct_caller_count(const cbm_impact_analysis_t *out) {
+    int direct_callers = 0;
+    for (int i = 0; i < out->direct_count; i++) {
+        if (out->direct[i].type && strcmp(out->direct[i].type, "route") == 0) {
+            continue;
+        }
+        direct_callers++;
+    }
+    return direct_callers;
+}
+
+static int impact_route_entry_count(const cbm_impact_analysis_t *out) {
+    int total = 0;
+    const cbm_impact_item_t *groups[] = {out->direct, out->indirect, out->transitive};
+    const int counts[] = {out->direct_count, out->indirect_count, out->transitive_count};
+    for (int g = 0; g < 3; g++) {
+        for (int i = 0; i < counts[g]; i++) {
+            const char *type = groups[g][i].type;
+            if (type && (strcmp(type, "route") == 0 || strcmp(type, "entry_point") == 0)) {
+                total++;
+            }
+        }
+    }
+    return total;
+}
+
+static char *impact_build_summary(const cbm_impact_analysis_t *out) {
+    int direct_callers = impact_direct_caller_count(out);
+    int route_entries = impact_route_entry_count(out);
+    int tests = out->affected_test_count;
+    int transitive = out->transitive_count;
+
+    char buf[256];
+    if (transitive > 0) {
+        snprintf(buf, sizeof(buf), "%d direct callers, %d route/entry points, %d affected tests, "
+                                   "%d transitive impacts",
+                 direct_callers, route_entries, tests, transitive);
+    } else {
+        snprintf(buf, sizeof(buf), "%d direct callers, %d route/entry points, %d affected tests",
+                 direct_callers, route_entries, tests);
+    }
+    return heap_strdup(buf);
+}
+
+static char *impact_determine_risk(const cbm_impact_analysis_t *out, bool top_five_percent) {
+    int direct_callers = impact_direct_caller_count(out);
+    int indirect_reach = out->indirect_count + out->transitive_count;
+    int route_entries = impact_route_entry_count(out);
+    bool has_tests = out->affected_test_count > 0;
+
+    if (direct_callers >= 3 || route_entries > 0 || top_five_percent) {
+        return heap_strdup("high");
+    }
+
+    if (direct_callers >= 1 && direct_callers <= 2 && indirect_reach > 0) {
+        return heap_strdup(has_tests ? "low" : "medium");
+    }
+
+    return heap_strdup("low");
+}
+
+int cbm_store_get_impact_analysis(cbm_store_t *s, const char *project, const char *symbol,
+                                  int depth, cbm_impact_analysis_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!s || !s->db || !project || !symbol) {
+        store_set_error(s, "impact analysis requires project and symbol");
+        return CBM_STORE_ERR;
+    }
+    if (depth < 1) {
+        depth = 1;
+    }
+
+    cbm_node_t target = {0};
+    int target_in_degree = 0;
+    double target_pagerank = 0.0;
+    int rc = impact_select_target(s, project, symbol, &target, &target_in_degree, &target_pagerank);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    impact_walk_t walk = {0};
+    walk.seen_ids = cbm_ht_create(64);
+    if (!walk.seen_ids) {
+        cbm_node_free_fields(&target);
+        store_set_error(s, "impact analysis alloc failed");
+        return CBM_STORE_ERR;
+    }
+
+    rc = impact_walk_enqueue(&walk, target.id, 0, false);
+    if (rc != CBM_STORE_OK) {
+        impact_walk_free(&walk);
+        cbm_node_free_fields(&target);
+        store_set_error(s, "impact analysis alloc failed");
+        return rc;
+    }
+
+    for (int head = 0; head < walk.queue_count; head++) {
+        impact_visit_t current = walk.queue[head];
+        if (current.hop >= depth) {
+            continue;
+        }
+
+        cbm_node_t node = {0};
+        if (cbm_store_find_node_by_id(s, current.id, &node) != CBM_STORE_OK) {
+            continue;
+        }
+
+        int next_hop = current.hop + 1;
+        if (impact_label_is_callable(node.label)) {
+            rc = impact_enqueue_neighbors(s, &walk, current.id, "CALLS", true, next_hop);
+            if (rc == CBM_STORE_OK) {
+                rc = impact_enqueue_neighbors(s, &walk, current.id, "HANDLES", false, next_hop);
+            }
+        } else if (node.label && strcmp(node.label, "Route") == 0) {
+            rc = impact_enqueue_neighbors(s, &walk, current.id, "HTTP_CALLS", true, next_hop);
+            if (rc == CBM_STORE_OK) {
+                rc = impact_enqueue_neighbors(s, &walk, current.id, "ASYNC_CALLS", true, next_hop);
+            }
+        } else {
+            rc = CBM_STORE_OK;
+        }
+
+        cbm_node_free_fields(&node);
+        if (rc != CBM_STORE_OK) {
+            impact_walk_free(&walk);
+            cbm_node_free_fields(&target);
+            cbm_store_impact_analysis_free(out);
+            store_set_error(s, "impact analysis traversal failed");
+            return rc;
+        }
+    }
+
+    impact_cached_node_t *cached_nodes = NULL;
+    int cached_count = 0;
+    rc = impact_fetch_nodes_with_scores(s, project, walk.visited, walk.visited_count, &cached_nodes,
+                                        &cached_count);
+    if (rc != CBM_STORE_OK) {
+        impact_walk_free(&walk);
+        cbm_node_free_fields(&target);
+        cbm_store_impact_analysis_free(out);
+        store_set_error(s, "impact analysis lookup failed");
+        return rc;
+    }
+
+    int direct_cap = 0;
+    int indirect_cap = 0;
+    int transitive_cap = 0;
+    int test_cap = 0;
+
+    for (int i = 0; i < walk.visited_count; i++) {
+        const impact_cached_node_t *cached =
+            impact_find_cached_node(cached_nodes, cached_count, walk.visited[i].id);
+        if (!cached) {
+            continue;
+        }
+
+        const cbm_node_t *node = &cached->node;
+        double pagerank = cached->pagerank;
+        bool is_test = cbm_is_test_file_path(node->file_path);
+        bool is_entry_point = impact_node_is_entry_point(node);
+
+        if (is_test) {
+            rc = impact_append_test(&out->affected_tests, &out->affected_test_count, &test_cap, node);
+        } else {
+            const char *item_type = (node->label && strcmp(node->label, "Route") == 0)
+                                        ? "route"
+                                        : (is_entry_point ? "entry_point" : "caller");
+            if (walk.visited[i].hop == 1) {
+                rc = impact_append_item(&out->direct, &out->direct_count, &direct_cap, node,
+                                        item_type, pagerank, walk.visited[i].hop);
+            } else if (walk.visited[i].hop <= 3) {
+                rc = impact_append_item(&out->indirect, &out->indirect_count, &indirect_cap, node,
+                                        item_type, pagerank, walk.visited[i].hop);
+            } else {
+                rc = impact_append_item(&out->transitive, &out->transitive_count, &transitive_cap,
+                                        node, item_type, pagerank, walk.visited[i].hop);
+            }
+        }
+
+        if (rc != CBM_STORE_OK) {
+            impact_cached_nodes_free(cached_nodes, cached_count);
+            impact_walk_free(&walk);
+            cbm_node_free_fields(&target);
+            cbm_store_impact_analysis_free(out);
+            store_set_error(s, "impact analysis alloc failed");
+            return rc;
+        }
+    }
+
+    if (out->direct_count > 1) {
+        qsort(out->direct, (size_t)out->direct_count, sizeof(cbm_impact_item_t), impact_item_cmp);
+    }
+    if (out->indirect_count > 1) {
+        qsort(out->indirect, (size_t)out->indirect_count, sizeof(cbm_impact_item_t),
+              impact_item_cmp);
+    }
+    if (out->transitive_count > 1) {
+        qsort(out->transitive, (size_t)out->transitive_count, sizeof(cbm_impact_item_t),
+              impact_item_cmp);
+    }
+
+    out->symbol = heap_strdup(safe_str(target.name));
+    out->qualified_name = heap_strdup(safe_str(target.qualified_name));
+    out->file = heap_strdup(safe_str(target.file_path));
+    out->pagerank = target_pagerank;
+    bool top_five_percent = impact_node_in_top_five_percent(s, project, target_pagerank);
+    out->risk_score = impact_determine_risk(out, top_five_percent);
+    out->summary = impact_build_summary(out);
+
+    impact_cached_nodes_free(cached_nodes, cached_count);
+    impact_walk_free(&walk);
+    cbm_node_free_fields(&target);
+
+    if (!out->symbol || !out->qualified_name || !out->file || !out->risk_score || !out->summary) {
+        cbm_store_impact_analysis_free(out);
+        store_set_error(s, "impact analysis alloc failed");
+        return CBM_STORE_ERR;
+    }
+
+    (void)target_in_degree;
+    return CBM_STORE_OK;
+}
+
+void cbm_store_impact_analysis_free(cbm_impact_analysis_t *out) {
+    if (!out) {
+        return;
+    }
+
+    for (int i = 0; i < out->direct_count; i++) {
+        free((void *)out->direct[i].name);
+        free((void *)out->direct[i].file);
+        free((void *)out->direct[i].type);
+    }
+    free(out->direct);
+
+    for (int i = 0; i < out->indirect_count; i++) {
+        free((void *)out->indirect[i].name);
+        free((void *)out->indirect[i].file);
+        free((void *)out->indirect[i].type);
+    }
+    free(out->indirect);
+
+    for (int i = 0; i < out->transitive_count; i++) {
+        free((void *)out->transitive[i].name);
+        free((void *)out->transitive[i].file);
+        free((void *)out->transitive[i].type);
+    }
+    free(out->transitive);
+
+    for (int i = 0; i < out->affected_test_count; i++) {
+        free((void *)out->affected_tests[i].name);
+        free((void *)out->affected_tests[i].file);
+    }
+    free(out->affected_tests);
+
+    free((void *)out->symbol);
+    free((void *)out->qualified_name);
+    free((void *)out->file);
+    free((void *)out->risk_score);
+    free((void *)out->summary);
+    memset(out, 0, sizeof(*out));
+}
+
 /* ── Schema ─────────────────────────────────────────────────────── */
 
 int cbm_store_get_schema(cbm_store_t *s, const char *project, cbm_schema_info_t *out) {

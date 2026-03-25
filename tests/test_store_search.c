@@ -82,6 +82,239 @@ static cbm_store_t *setup_pagerank_store(int64_t *ids) {
     return s;
 }
 
+static cbm_store_t *setup_impact_store(bool with_pagerank) {
+    cbm_store_t *s = cbm_store_open_memory();
+    if (!s) {
+        return NULL;
+    }
+    cbm_store_upsert_project(s, "impact", "/tmp/impact");
+
+    cbm_node_t nodes[] = {
+        {.project = "impact",
+         .label = "Function",
+         .name = "ProcessOrder",
+         .qualified_name = "impact.service.ProcessOrder",
+         .file_path = "app/services/order_service.php"},
+        {.project = "impact",
+         .label = "Method",
+         .name = "HandleOrder",
+         .qualified_name = "impact.controller.OrderController.HandleOrder",
+         .file_path = "app/controllers/OrderController.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "CliEntry",
+         .qualified_name = "impact.cli.CliEntry",
+         .file_path = "app/cli/order_cli.php",
+         .properties_json = "{\"is_entry_point\":true}"},
+        {.project = "impact",
+         .label = "Route",
+         .name = "POST /orders",
+         .qualified_name = "impact.route.post_orders",
+         .file_path = "routes/api.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "CheckoutApi",
+         .qualified_name = "impact.http.CheckoutApi",
+         .file_path = "app/http/CheckoutApi.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "OrderWebhook",
+         .qualified_name = "impact.jobs.OrderWebhook",
+         .file_path = "app/jobs/OrderWebhook.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "BrowserFlow",
+         .qualified_name = "impact.ui.BrowserFlow",
+         .file_path = "app/ui/browser_flow.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "ProcessOrderTest",
+         .qualified_name = "impact.tests.ProcessOrderTest",
+         .file_path = "tests/process_order_test.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "Notify",
+         .qualified_name = "impact.notify.Notify",
+         .file_path = "app/services/notify.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "TaskRunner",
+         .qualified_name = "impact.tasks.TaskRunner",
+         .file_path = "app/tasks/task_runner.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "Scheduler",
+         .qualified_name = "impact.scheduler.Scheduler",
+         .file_path = "app/schedule/scheduler.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "FormatAmount",
+         .qualified_name = "impact.money.FormatAmount",
+         .file_path = "app/util/money.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "Checkout",
+         .qualified_name = "impact.checkout.Checkout",
+         .file_path = "app/checkout/checkout.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "Duplicate",
+         .qualified_name = "impact.core.Duplicate",
+         .file_path = "app/core/duplicate.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "Duplicate",
+         .qualified_name = "impact.tests.Duplicate",
+         .file_path = "tests/duplicate_test.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "CoreCallerA",
+         .qualified_name = "impact.core.CoreCallerA",
+         .file_path = "app/core/core_caller_a.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "CoreCallerB",
+         .qualified_name = "impact.core.CoreCallerB",
+         .file_path = "app/core/core_caller_b.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "TestCaller",
+         .qualified_name = "impact.tests.TestCaller",
+         .file_path = "tests/test_caller.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "TestCaller2",
+         .qualified_name = "impact.tests.TestCaller2",
+         .file_path = "tests/test_caller_two.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "TestCaller3",
+         .qualified_name = "impact.tests.TestCaller3",
+         .file_path = "tests/test_caller_three.php"},
+    };
+
+    enum {
+        ID_PROCESS_ORDER,
+        ID_HANDLE_ORDER,
+        ID_CLI_ENTRY,
+        ID_ROUTE,
+        ID_CHECKOUT_API,
+        ID_ORDER_WEBHOOK,
+        ID_BROWSER_FLOW,
+        ID_PROCESS_ORDER_TEST,
+        ID_NOTIFY,
+        ID_TASK_RUNNER,
+        ID_SCHEDULER,
+        ID_FORMAT_AMOUNT,
+        ID_CHECKOUT,
+        ID_DUPLICATE_PROD,
+        ID_DUPLICATE_TEST,
+        ID_CORE_CALLER_A,
+        ID_CORE_CALLER_B,
+        ID_TEST_CALLER,
+        ID_TEST_CALLER_2,
+        ID_TEST_CALLER_3,
+        ID_COUNT
+    };
+    int64_t ids[ID_COUNT] = {0};
+    for (int i = 0; i < ID_COUNT; i++) {
+        ids[i] = cbm_store_upsert_node(s, &nodes[i]);
+    }
+
+    cbm_edge_t edges[] = {
+        {.project = "impact",
+         .source_id = ids[ID_HANDLE_ORDER],
+         .target_id = ids[ID_PROCESS_ORDER],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_CLI_ENTRY],
+         .target_id = ids[ID_PROCESS_ORDER],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_PROCESS_ORDER_TEST],
+         .target_id = ids[ID_PROCESS_ORDER],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_HANDLE_ORDER],
+         .target_id = ids[ID_ROUTE],
+         .type = "HANDLES"},
+        {.project = "impact",
+         .source_id = ids[ID_CHECKOUT_API],
+         .target_id = ids[ID_ROUTE],
+         .type = "HTTP_CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_ORDER_WEBHOOK],
+         .target_id = ids[ID_ROUTE],
+         .type = "ASYNC_CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_BROWSER_FLOW],
+         .target_id = ids[ID_CHECKOUT_API],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_TASK_RUNNER],
+         .target_id = ids[ID_NOTIFY],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_SCHEDULER],
+         .target_id = ids[ID_TASK_RUNNER],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_CHECKOUT],
+         .target_id = ids[ID_FORMAT_AMOUNT],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_CORE_CALLER_A],
+         .target_id = ids[ID_DUPLICATE_PROD],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_CORE_CALLER_B],
+         .target_id = ids[ID_DUPLICATE_PROD],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_TEST_CALLER],
+         .target_id = ids[ID_DUPLICATE_TEST],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_TEST_CALLER_2],
+         .target_id = ids[ID_DUPLICATE_TEST],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_TEST_CALLER_3],
+         .target_id = ids[ID_DUPLICATE_TEST],
+         .type = "CALLS"},
+    };
+    const int edge_count = (int)(sizeof(edges) / sizeof(edges[0]));
+    for (int i = 0; i < edge_count; i++) {
+        cbm_store_insert_edge(s, &edges[i]);
+    }
+
+    if (with_pagerank && cbm_store_compute_pagerank(s, "impact", 20, 0.85) != CBM_STORE_OK) {
+        cbm_store_close(s);
+        return NULL;
+    }
+    return s;
+}
+
+static const cbm_impact_item_t *find_impact_item(const cbm_impact_item_t *items, int count,
+                                                 const char *name) {
+    for (int i = 0; i < count; i++) {
+        if (items[i].name && strcmp(items[i].name, name) == 0) {
+            return &items[i];
+        }
+    }
+    return NULL;
+}
+
+static const cbm_affected_test_t *find_affected_test(const cbm_affected_test_t *items, int count,
+                                                     const char *name) {
+    for (int i = 0; i < count; i++) {
+        if (items[i].name && strcmp(items[i].name, name) == 0) {
+            return &items[i];
+        }
+    }
+    return NULL;
+}
+
 /* ── Search by label ────────────────────────────────────────────── */
 
 TEST(store_search_by_label) {
@@ -1244,6 +1477,126 @@ TEST(store_is_test_file_various) {
 
 /* ── Risk/impact edge cases ────────────────────────────────────── */
 
+TEST(store_get_impact_analysis_high_risk_with_routes_and_tests) {
+    cbm_store_t *s = setup_impact_store(false);
+    ASSERT_NOT_NULL(s);
+
+    cbm_impact_analysis_t out = {0};
+    ASSERT_EQ(cbm_store_get_impact_analysis(s, "impact", "ProcessOrder", 4, &out), CBM_STORE_OK);
+
+    ASSERT_STR_EQ(out.symbol, "ProcessOrder");
+    ASSERT_STR_EQ(out.qualified_name, "impact.service.ProcessOrder");
+    ASSERT_STR_EQ(out.file, "app/services/order_service.php");
+    ASSERT_EQ(out.direct_count, 2);
+    ASSERT_EQ(out.indirect_count, 3);
+    ASSERT_EQ(out.transitive_count, 1);
+    ASSERT_EQ(out.affected_test_count, 1);
+    ASSERT_STR_EQ(out.risk_score, "high");
+    ASSERT_STR_EQ(out.summary,
+                  "2 direct callers, 2 route/entry points, 1 affected tests, 1 transitive impacts");
+
+    const cbm_impact_item_t *entry = find_impact_item(out.direct, out.direct_count, "CliEntry");
+    ASSERT_NOT_NULL(entry);
+    ASSERT_STR_EQ(entry->type, "entry_point");
+
+    const cbm_impact_item_t *handler =
+        find_impact_item(out.direct, out.direct_count, "HandleOrder");
+    ASSERT_NOT_NULL(handler);
+    ASSERT_STR_EQ(handler->type, "caller");
+
+    const cbm_impact_item_t *route =
+        find_impact_item(out.indirect, out.indirect_count, "POST /orders");
+    ASSERT_NOT_NULL(route);
+    ASSERT_STR_EQ(route->type, "route");
+
+    const cbm_impact_item_t *browser =
+        find_impact_item(out.transitive, out.transitive_count, "BrowserFlow");
+    ASSERT_NOT_NULL(browser);
+    ASSERT_STR_EQ(browser->type, "caller");
+
+    const cbm_affected_test_t *test =
+        find_affected_test(out.affected_tests, out.affected_test_count, "ProcessOrderTest");
+    ASSERT_NOT_NULL(test);
+    ASSERT_STR_EQ(test->file, "tests/process_order_test.php");
+
+    cbm_store_impact_analysis_free(&out);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_get_impact_analysis_medium_risk) {
+    cbm_store_t *s = setup_impact_store(false);
+    ASSERT_NOT_NULL(s);
+
+    cbm_impact_analysis_t out = {0};
+    ASSERT_EQ(cbm_store_get_impact_analysis(s, "impact", "Notify", 3, &out), CBM_STORE_OK);
+
+    ASSERT_STR_EQ(out.symbol, "Notify");
+    ASSERT_EQ(out.direct_count, 1);
+    ASSERT_EQ(out.indirect_count, 1);
+    ASSERT_EQ(out.transitive_count, 0);
+    ASSERT_EQ(out.affected_test_count, 0);
+    ASSERT_STR_EQ(out.risk_score, "medium");
+    ASSERT_STR_EQ(out.summary, "1 direct callers, 0 route/entry points, 0 affected tests");
+
+    const cbm_impact_item_t *direct =
+        find_impact_item(out.direct, out.direct_count, "TaskRunner");
+    ASSERT_NOT_NULL(direct);
+    ASSERT_STR_EQ(direct->type, "caller");
+
+    const cbm_impact_item_t *indirect =
+        find_impact_item(out.indirect, out.indirect_count, "Scheduler");
+    ASSERT_NOT_NULL(indirect);
+    ASSERT_STR_EQ(indirect->type, "caller");
+
+    cbm_store_impact_analysis_free(&out);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_get_impact_analysis_low_risk) {
+    cbm_store_t *s = setup_impact_store(false);
+    ASSERT_NOT_NULL(s);
+
+    cbm_impact_analysis_t out = {0};
+    ASSERT_EQ(cbm_store_get_impact_analysis(s, "impact", "FormatAmount", 3, &out), CBM_STORE_OK);
+
+    ASSERT_STR_EQ(out.symbol, "FormatAmount");
+    ASSERT_EQ(out.direct_count, 1);
+    ASSERT_EQ(out.indirect_count, 0);
+    ASSERT_EQ(out.transitive_count, 0);
+    ASSERT_EQ(out.affected_test_count, 0);
+    ASSERT_STR_EQ(out.risk_score, "low");
+    ASSERT_STR_EQ(out.summary, "1 direct callers, 0 route/entry points, 0 affected tests");
+
+    const cbm_impact_item_t *direct = find_impact_item(out.direct, out.direct_count, "Checkout");
+    ASSERT_NOT_NULL(direct);
+    ASSERT_STR_EQ(direct->type, "caller");
+
+    cbm_store_impact_analysis_free(&out);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_get_impact_analysis_ambiguous_symbol_prefers_ranked_match) {
+    cbm_store_t *s = setup_impact_store(true);
+    ASSERT_NOT_NULL(s);
+
+    cbm_impact_analysis_t out = {0};
+    ASSERT_EQ(cbm_store_get_impact_analysis(s, "impact", "Duplicate", 2, &out), CBM_STORE_OK);
+
+    ASSERT_STR_EQ(out.symbol, "Duplicate");
+    ASSERT_STR_EQ(out.qualified_name, "impact.core.Duplicate");
+    ASSERT_STR_EQ(out.file, "app/core/duplicate.php");
+    ASSERT_EQ(out.direct_count, 2);
+    ASSERT_NOT_NULL(find_impact_item(out.direct, out.direct_count, "CoreCallerA"));
+    ASSERT_NOT_NULL(find_impact_item(out.direct, out.direct_count, "CoreCallerB"));
+
+    cbm_store_impact_analysis_free(&out);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_hop_to_risk_all_levels) {
     /* hop 0 hits the default case → LOW */
     ASSERT_EQ(cbm_hop_to_risk(0), CBM_RISK_LOW);
@@ -1343,6 +1696,10 @@ SUITE(store_search) {
     RUN_TEST(store_qn_to_top_package_many_segments);
     RUN_TEST(store_qn_to_top_package_null);
     RUN_TEST(store_is_test_file_various);
+    RUN_TEST(store_get_impact_analysis_high_risk_with_routes_and_tests);
+    RUN_TEST(store_get_impact_analysis_medium_risk);
+    RUN_TEST(store_get_impact_analysis_low_risk);
+    RUN_TEST(store_get_impact_analysis_ambiguous_symbol_prefers_ranked_match);
     RUN_TEST(store_hop_to_risk_all_levels);
     RUN_TEST(store_risk_label_all_levels);
     RUN_TEST(store_impact_summary_empty);

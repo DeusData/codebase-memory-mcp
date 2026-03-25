@@ -1,5 +1,5 @@
 /*
- * mcp.c — MCP server: JSON-RPC 2.0 over stdio with 16 graph tools.
+ * mcp.c — MCP server: JSON-RPC 2.0 over stdio with graph tools.
  *
  * Uses yyjson for fast JSON parsing/building.
  * Single-threaded event loop: read line → parse → dispatch → respond.
@@ -321,6 +321,134 @@ static void add_query_row(yyjson_mut_doc *doc, yyjson_mut_val *rows, const char 
         }
     }
     yyjson_mut_arr_add_val(rows, out_row);
+}
+
+static int impact_output_direct_caller_count(const cbm_impact_analysis_t *impact) {
+    int direct_callers = 0;
+    for (int i = 0; i < impact->direct_count; i++) {
+        if (impact->direct[i].type && strcmp(impact->direct[i].type, "route") == 0) {
+            continue;
+        }
+        direct_callers++;
+    }
+    return direct_callers;
+}
+
+static int impact_output_route_entry_count(const cbm_impact_analysis_t *impact) {
+    int total = 0;
+    const cbm_impact_item_t *groups[] = {impact->direct, impact->indirect, impact->transitive};
+    const int counts[] = {impact->direct_count, impact->indirect_count, impact->transitive_count};
+    for (int g = 0; g < 3; g++) {
+        for (int i = 0; i < counts[g]; i++) {
+            const char *type = groups[g][i].type;
+            if (type && (strcmp(type, "route") == 0 || strcmp(type, "entry_point") == 0)) {
+                total++;
+            }
+        }
+    }
+    return total;
+}
+
+static int impact_output_total_results(const cbm_impact_analysis_t *impact, bool include_tests) {
+    int total = impact->direct_count + impact->indirect_count + impact->transitive_count;
+    if (include_tests) {
+        total += impact->affected_test_count;
+    }
+    return total;
+}
+
+static char *impact_output_summary_dup(const cbm_impact_analysis_t *impact, bool include_tests) {
+    int direct_callers = impact_output_direct_caller_count(impact);
+    int route_entries = impact_output_route_entry_count(impact);
+    int tests = impact->affected_test_count;
+    int transitive = impact->transitive_count;
+
+    char buf[256];
+    if (include_tests) {
+        if (transitive > 0) {
+            snprintf(buf, sizeof(buf),
+                     "%d direct callers, %d route/entry points, %d affected tests, %d transitive impacts",
+                     direct_callers, route_entries, tests, transitive);
+        } else {
+            snprintf(buf, sizeof(buf), "%d direct callers, %d route/entry points, %d affected tests",
+                     direct_callers, route_entries, tests);
+        }
+    } else if (transitive > 0) {
+        snprintf(buf, sizeof(buf), "%d direct callers, %d route/entry points, %d transitive impacts",
+                 direct_callers, route_entries, transitive);
+    } else {
+        snprintf(buf, sizeof(buf), "%d direct callers, %d route/entry points",
+                 direct_callers, route_entries);
+    }
+    return heap_strdup(buf);
+}
+
+static size_t estimate_impact_item_chars(const cbm_impact_item_t *item, bool compact) {
+    size_t size = 72;
+    size += strlen(item->name ? item->name : "");
+    size += strlen(item->file ? item->file : "");
+    size += strlen(item->type ? item->type : "");
+    size += compact ? 16 : 32;
+    return size;
+}
+
+static void add_impact_item_json(yyjson_mut_doc *doc, yyjson_mut_val *arr,
+                                 const cbm_impact_item_t *item, bool compact) {
+    yyjson_mut_val *entry = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, entry, "name", item->name ? item->name : "");
+    yyjson_mut_obj_add_str(doc, entry, "file", item->file ? item->file : "");
+    yyjson_mut_obj_add_str(doc, entry, "type", item->type ? item->type : "");
+    if (compact) {
+        yyjson_mut_obj_add_bool(doc, entry, "compact", true);
+    } else {
+        yyjson_mut_obj_add_real(doc, entry, "pagerank", item->pagerank);
+    }
+    yyjson_mut_arr_add_val(arr, entry);
+}
+
+static size_t estimate_affected_test_chars(const cbm_affected_test_t *item) {
+    size_t size = 48;
+    size += strlen(item->name ? item->name : "");
+    size += strlen(item->file ? item->file : "");
+    return size;
+}
+
+static void add_affected_test_json(yyjson_mut_doc *doc, yyjson_mut_val *arr,
+                                   const cbm_affected_test_t *item) {
+    yyjson_mut_val *entry = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, entry, "name", item->name ? item->name : "");
+    yyjson_mut_obj_add_str(doc, entry, "file", item->file ? item->file : "");
+    yyjson_mut_arr_add_val(arr, entry);
+}
+
+static void add_budgeted_impact_group(yyjson_mut_doc *doc, yyjson_mut_val *impact_obj,
+                                      const char *group_name, const cbm_impact_item_t *items,
+                                      int count, size_t char_budget, size_t *used, int *shown,
+                                      int *full_items, bool *stop) {
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    if (!*stop) {
+        for (int i = 0; i < count; i++) {
+            bool compact = *full_items >= MAX_FULL_BUDGET_ITEMS;
+            size_t estimate = estimate_impact_item_chars(&items[i], compact);
+            if (*used + estimate > char_budget && !compact) {
+                compact = true;
+                estimate = estimate_impact_item_chars(&items[i], true);
+            }
+            if (*used + estimate > char_budget && *shown > 0) {
+                *stop = true;
+                break;
+            }
+            if (*used + estimate <= char_budget || *shown == 0) {
+                add_impact_item_json(doc, arr, &items[i], compact);
+                *used += estimate;
+                (*shown)++;
+                if (!compact) {
+                    (*full_items)++;
+                }
+            }
+        }
+    }
+    yyjson_mut_obj_add_val(doc, impact_obj, group_name, arr);
 }
 
 typedef struct {
@@ -661,6 +789,17 @@ static const tool_def_t TOOLS[] = {
      "\"integer\",\"default\":20},\"focus\":{\"type\":\"string\",\"description\":\"Optional "
      "keyword to narrow symbols by name, qualified name, or file path.\"}},\"required\":["
      "\"project\"]}"},
+
+    {"get_impact_analysis",
+     "Analyze the blast radius of changing a symbol: direct callers, indirect reach, routes, "
+     "affected tests, and a low/medium/high risk score.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"symbol\":{\"type\":"
+     "\"string\",\"description\":\"Exact function, method, or class name.\"},\"depth\":{"
+     "\"type\":\"integer\",\"default\":3},\"include_tests\":{\"type\":\"boolean\",\"default\":true,"
+     "\"description\":\"Include affected test files in the output array.\"},\"max_tokens\":{"
+     "\"type\":\"integer\",\"default\":2000,\"description\":\"Maximum output size. Controls "
+     "detail level.\"}},\"required\":["
+     "\"project\",\"symbol\"]}"},
 
     {"search_code",
      "Graph-augmented code search. Finds text patterns via grep, then enriches results with "
@@ -1764,6 +1903,169 @@ static char *handle_get_key_symbols(cbm_mcp_server_t *srv, const char *args) {
         free(json);
         return result;
     }
+}
+
+static char *handle_get_impact_analysis(cbm_mcp_server_t *srv, const char *args) {
+    char *project = cbm_mcp_get_string_arg(args, "project");
+    char *symbol = cbm_mcp_get_string_arg(args, "symbol");
+    int depth = cbm_mcp_get_int_arg(args, "depth", 3);
+    bool include_tests = cbm_mcp_get_bool_arg_default(args, "include_tests", true);
+    int max_tokens = cbm_mcp_get_int_arg(args, "max_tokens", DEFAULT_MAX_TOKENS);
+    size_t char_budget = max_tokens_to_char_budget(max_tokens);
+    cbm_store_t *store = resolve_store(srv, project);
+
+    if (!symbol) {
+        free(project);
+        return cbm_mcp_text_result("symbol is required", true);
+    }
+    REQUIRE_STORE(store, project);
+
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed) {
+        free(project);
+        free(symbol);
+        return not_indexed;
+    }
+
+    cbm_impact_analysis_t impact = {0};
+    int rc = cbm_store_get_impact_analysis(store, project, symbol, depth, &impact);
+    if (rc == CBM_STORE_NOT_FOUND) {
+        char err[512];
+        snprintf(err, sizeof(err),
+                 "symbol not found. Use search_graph(name_pattern=\".*%s.*\") first to discover "
+                 "the exact symbol name.",
+                 symbol);
+        free(project);
+        free(symbol);
+        return cbm_mcp_text_result(err, true);
+    }
+    if (rc != CBM_STORE_OK) {
+        free(project);
+        free(symbol);
+        cbm_store_impact_analysis_free(&impact);
+        return cbm_mcp_text_result("failed to build impact analysis", true);
+    }
+
+    char *summary_text = impact_output_summary_dup(&impact, include_tests);
+    if (!summary_text) {
+        summary_text = heap_strdup(impact.summary ? impact.summary : "");
+    }
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    yyjson_mut_obj_add_str(doc, root, "symbol", impact.symbol ? impact.symbol : "");
+    yyjson_mut_obj_add_str(doc, root, "qualified_name",
+                           impact.qualified_name ? impact.qualified_name : "");
+    yyjson_mut_obj_add_str(doc, root, "file", impact.file ? impact.file : "");
+    yyjson_mut_obj_add_real(doc, root, "pagerank", impact.pagerank);
+
+    yyjson_mut_val *impact_obj = yyjson_mut_obj(doc);
+    yyjson_mut_val *direct = yyjson_mut_arr(doc);
+    for (int i = 0; i < impact.direct_count; i++) {
+        add_impact_item_json(doc, direct, &impact.direct[i], false);
+    }
+    yyjson_mut_obj_add_val(doc, impact_obj, "direct", direct);
+
+    yyjson_mut_val *indirect = yyjson_mut_arr(doc);
+    for (int i = 0; i < impact.indirect_count; i++) {
+        add_impact_item_json(doc, indirect, &impact.indirect[i], false);
+    }
+    yyjson_mut_obj_add_val(doc, impact_obj, "indirect", indirect);
+
+    yyjson_mut_val *transitive = yyjson_mut_arr(doc);
+    for (int i = 0; i < impact.transitive_count; i++) {
+        add_impact_item_json(doc, transitive, &impact.transitive[i], false);
+    }
+    yyjson_mut_obj_add_val(doc, impact_obj, "transitive", transitive);
+    yyjson_mut_obj_add_val(doc, root, "impact", impact_obj);
+
+    yyjson_mut_val *tests = yyjson_mut_arr(doc);
+    if (include_tests) {
+        for (int i = 0; i < impact.affected_test_count; i++) {
+            add_affected_test_json(doc, tests, &impact.affected_tests[i]);
+        }
+    }
+    yyjson_mut_obj_add_val(doc, root, "affected_tests", tests);
+
+    yyjson_mut_obj_add_str(doc, root, "risk_score",
+                           impact.risk_score ? impact.risk_score : "");
+    yyjson_mut_obj_add_str(doc, root, "summary", summary_text ? summary_text : "");
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+
+    if (json && strlen(json) > char_budget) {
+        free(json);
+
+        doc = yyjson_mut_doc_new(NULL);
+        root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+
+        yyjson_mut_obj_add_str(doc, root, "symbol", impact.symbol ? impact.symbol : "");
+        yyjson_mut_obj_add_str(doc, root, "qualified_name",
+                               impact.qualified_name ? impact.qualified_name : "");
+        yyjson_mut_obj_add_str(doc, root, "file", impact.file ? impact.file : "");
+        yyjson_mut_obj_add_real(doc, root, "pagerank", impact.pagerank);
+        yyjson_mut_obj_add_bool(doc, root, "truncated", true);
+        yyjson_mut_obj_add_int(doc, root, "total_results",
+                               impact_output_total_results(&impact, include_tests));
+
+        size_t used = 96;
+        used += strlen(impact.symbol ? impact.symbol : "");
+        used += strlen(impact.qualified_name ? impact.qualified_name : "");
+        used += strlen(impact.file ? impact.file : "");
+        used += strlen(impact.risk_score ? impact.risk_score : "");
+        used += strlen(summary_text ? summary_text : "");
+
+        yyjson_mut_val *impact_obj2 = yyjson_mut_obj(doc);
+        int shown = 0;
+        int full_items = 0;
+        bool stop = false;
+
+        add_budgeted_impact_group(doc, impact_obj2, "direct", impact.direct, impact.direct_count,
+                                  char_budget, &used, &shown, &full_items, &stop);
+        add_budgeted_impact_group(doc, impact_obj2, "indirect", impact.indirect,
+                                  impact.indirect_count, char_budget, &used, &shown, &full_items,
+                                  &stop);
+        add_budgeted_impact_group(doc, impact_obj2, "transitive", impact.transitive,
+                                  impact.transitive_count, char_budget, &used, &shown,
+                                  &full_items, &stop);
+        yyjson_mut_obj_add_val(doc, root, "impact", impact_obj2);
+
+        yyjson_mut_val *tests2 = yyjson_mut_arr(doc);
+        if (include_tests && !stop) {
+            for (int i = 0; i < impact.affected_test_count; i++) {
+                size_t estimate = estimate_affected_test_chars(&impact.affected_tests[i]);
+                if (used + estimate > char_budget && shown > 0) {
+                    break;
+                }
+                if (used + estimate <= char_budget || shown == 0) {
+                    add_affected_test_json(doc, tests2, &impact.affected_tests[i]);
+                    used += estimate;
+                    shown++;
+                }
+            }
+        }
+        yyjson_mut_obj_add_val(doc, root, "affected_tests", tests2);
+        yyjson_mut_obj_add_str(doc, root, "risk_score",
+                               impact.risk_score ? impact.risk_score : "");
+        yyjson_mut_obj_add_str(doc, root, "summary", summary_text ? summary_text : "");
+        yyjson_mut_obj_add_int(doc, root, "shown", shown);
+
+        json = yy_doc_to_str(doc);
+        yyjson_mut_doc_free(doc);
+    }
+
+    free(summary_text);
+    cbm_store_impact_analysis_free(&impact);
+    free(project);
+    free(symbol);
+
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
 }
 
 static int node_hop_rank_cmp(const void *lhs, const void *rhs) {
@@ -3607,6 +3909,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "get_key_symbols") == 0) {
         return handle_get_key_symbols(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_impact_analysis") == 0) {
+        return handle_get_impact_analysis(srv, args_json);
     }
     if (strcmp(tool_name, "get_architecture_summary") == 0) {
         return handle_get_architecture_summary(srv, args_json);

@@ -140,6 +140,7 @@ TEST(mcp_tools_list) {
     ASSERT_NOT_NULL(strstr(json, "get_graph_schema"));
     ASSERT_NOT_NULL(strstr(json, "get_architecture"));
     ASSERT_NOT_NULL(strstr(json, "get_key_symbols"));
+    ASSERT_NOT_NULL(strstr(json, "get_impact_analysis"));
     ASSERT_NOT_NULL(strstr(json, "get_architecture_summary"));
     ASSERT_NOT_NULL(strstr(json, "search_code"));
     ASSERT_NOT_NULL(strstr(json, "list_projects"));
@@ -670,6 +671,186 @@ static cbm_mcp_server_t *setup_truncation_server(void) {
         cbm_edge_t edge = {
             .project = "test-budget", .source_id = ids[i], .target_id = ids[i + 1], .type = "CALLS"};
         cbm_store_insert_edge(st, &edge);
+    }
+
+    return srv;
+}
+
+static cbm_mcp_server_t *setup_impact_server(void) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    if (!st) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+
+    cbm_store_upsert_project(st, "impact", "/tmp/impact");
+    cbm_mcp_server_set_project(srv, "impact");
+
+    cbm_node_t nodes[] = {
+        {.project = "impact",
+         .label = "Function",
+         .name = "ProcessOrder",
+         .qualified_name = "impact.service.ProcessOrder",
+         .file_path = "app/services/order_service.php"},
+        {.project = "impact",
+         .label = "Method",
+         .name = "HandleOrder",
+         .qualified_name = "impact.controller.OrderController.HandleOrder",
+         .file_path = "app/controllers/OrderController.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "CliEntry",
+         .qualified_name = "impact.cli.CliEntry",
+         .file_path = "app/cli/order_cli.php",
+         .properties_json = "{\"is_entry_point\":true}"},
+        {.project = "impact",
+         .label = "Route",
+         .name = "POST /orders",
+         .qualified_name = "impact.route.post_orders",
+         .file_path = "routes/api.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "CheckoutApi",
+         .qualified_name = "impact.http.CheckoutApi",
+         .file_path = "app/http/CheckoutApi.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "OrderWebhook",
+         .qualified_name = "impact.jobs.OrderWebhook",
+         .file_path = "app/jobs/OrderWebhook.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "BrowserFlow",
+         .qualified_name = "impact.ui.BrowserFlow",
+         .file_path = "app/ui/browser_flow.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "ProcessOrderTest",
+         .qualified_name = "impact.tests.ProcessOrderTest",
+         .file_path = "tests/process_order_test.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "Duplicate",
+         .qualified_name = "impact.core.Duplicate",
+         .file_path = "app/core/duplicate.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "Duplicate",
+         .qualified_name = "impact.tests.Duplicate",
+         .file_path = "tests/duplicate_test.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "CoreCallerA",
+         .qualified_name = "impact.core.CoreCallerA",
+         .file_path = "app/core/core_caller_a.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "CoreCallerB",
+         .qualified_name = "impact.core.CoreCallerB",
+         .file_path = "app/core/core_caller_b.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "TestCaller",
+         .qualified_name = "impact.tests.TestCaller",
+         .file_path = "tests/test_caller.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "TestCaller2",
+         .qualified_name = "impact.tests.TestCaller2",
+         .file_path = "tests/test_caller_two.php"},
+        {.project = "impact",
+         .label = "Function",
+         .name = "TestCaller3",
+         .qualified_name = "impact.tests.TestCaller3",
+         .file_path = "tests/test_caller_three.php"},
+    };
+
+    enum {
+        ID_PROCESS_ORDER,
+        ID_HANDLE_ORDER,
+        ID_CLI_ENTRY,
+        ID_ROUTE,
+        ID_CHECKOUT_API,
+        ID_ORDER_WEBHOOK,
+        ID_BROWSER_FLOW,
+        ID_PROCESS_ORDER_TEST,
+        ID_DUPLICATE_PROD,
+        ID_DUPLICATE_TEST,
+        ID_CORE_CALLER_A,
+        ID_CORE_CALLER_B,
+        ID_TEST_CALLER,
+        ID_TEST_CALLER_2,
+        ID_TEST_CALLER_3,
+        ID_COUNT
+    };
+    int64_t ids[ID_COUNT] = {0};
+    for (int i = 0; i < ID_COUNT; i++) {
+        ids[i] = cbm_store_upsert_node(st, &nodes[i]);
+    }
+
+    cbm_edge_t edges[] = {
+        {.project = "impact",
+         .source_id = ids[ID_HANDLE_ORDER],
+         .target_id = ids[ID_PROCESS_ORDER],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_CLI_ENTRY],
+         .target_id = ids[ID_PROCESS_ORDER],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_PROCESS_ORDER_TEST],
+         .target_id = ids[ID_PROCESS_ORDER],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_HANDLE_ORDER],
+         .target_id = ids[ID_ROUTE],
+         .type = "HANDLES"},
+        {.project = "impact",
+         .source_id = ids[ID_CHECKOUT_API],
+         .target_id = ids[ID_ROUTE],
+         .type = "HTTP_CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_ORDER_WEBHOOK],
+         .target_id = ids[ID_ROUTE],
+         .type = "ASYNC_CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_BROWSER_FLOW],
+         .target_id = ids[ID_CHECKOUT_API],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_CORE_CALLER_A],
+         .target_id = ids[ID_DUPLICATE_PROD],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_CORE_CALLER_B],
+         .target_id = ids[ID_DUPLICATE_PROD],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_TEST_CALLER],
+         .target_id = ids[ID_DUPLICATE_TEST],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_TEST_CALLER_2],
+         .target_id = ids[ID_DUPLICATE_TEST],
+         .type = "CALLS"},
+        {.project = "impact",
+         .source_id = ids[ID_TEST_CALLER_3],
+         .target_id = ids[ID_DUPLICATE_TEST],
+         .type = "CALLS"},
+    };
+    const int edge_count = (int)(sizeof(edges) / sizeof(edges[0]));
+    for (int i = 0; i < edge_count; i++) {
+        cbm_store_insert_edge(st, &edges[i]);
+    }
+
+    if (cbm_store_compute_pagerank(st, "impact", 20, 0.85) != CBM_STORE_OK) {
+        cbm_mcp_server_free(srv);
+        return NULL;
     }
 
     return srv;
@@ -1383,6 +1564,125 @@ TEST(tool_query_graph_max_tokens_truncates) {
     free(proj_name);
 
     cleanup_arch_summary_server(tmp_dir, srv);
+    PASS();
+}
+
+TEST(tool_get_impact_analysis_basic) {
+    cbm_mcp_server_t *srv = setup_impact_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "get_impact_analysis",
+        "{\"project\":\"impact\",\"symbol\":\"ProcessOrder\",\"depth\":4}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"symbol\":\"ProcessOrder\""));
+    ASSERT_NOT_NULL(strstr(text, "\"qualified_name\":\"impact.service.ProcessOrder\""));
+    ASSERT_NOT_NULL(strstr(text, "\"risk_score\":\"high\""));
+    ASSERT_NOT_NULL(strstr(
+        text,
+        "\"summary\":\"2 direct callers, 2 route/entry points, 1 affected tests, 1 transitive impacts\""));
+    ASSERT_NOT_NULL(strstr(text, "\"affected_tests\":["));
+    free(text);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_impact_analysis_missing_symbol) {
+    cbm_mcp_server_t *srv = setup_impact_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "get_impact_analysis", "{\"project\":\"impact\",\"symbol\":\"MissingSymbol\"}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NOT_NULL(strstr(raw, "search_graph(name_pattern"));
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_impact_analysis_ambiguous_symbol_picks_top_match) {
+    cbm_mcp_server_t *srv = setup_impact_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw =
+        cbm_mcp_handle_tool(srv, "get_impact_analysis",
+                            "{\"project\":\"impact\",\"symbol\":\"Duplicate\",\"depth\":2}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"qualified_name\":\"impact.core.Duplicate\""));
+    ASSERT_NOT_NULL(strstr(text, "\"file\":\"app/core/duplicate.php\""));
+    free(text);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_impact_analysis_include_tests_false) {
+    cbm_mcp_server_t *srv = setup_impact_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "get_impact_analysis",
+        "{\"project\":\"impact\",\"symbol\":\"ProcessOrder\",\"depth\":4,\"include_tests\":false}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"affected_tests\":[]"));
+    ASSERT_NOT_NULL(
+        strstr(text, "\"summary\":\"2 direct callers, 2 route/entry points, 1 transitive impacts\""));
+    free(text);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_impact_analysis_max_tokens_truncates) {
+    cbm_mcp_server_t *srv = setup_impact_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "get_impact_analysis",
+        "{\"project\":\"impact\",\"symbol\":\"ProcessOrder\",\"depth\":4,\"max_tokens\":1}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"truncated\":true"));
+    ASSERT_NOT_NULL(strstr(text, "\"total_results\""));
+    ASSERT_NOT_NULL(strstr(text, "\"shown\""));
+    ASSERT_NOT_NULL(strstr(text, "\"impact\""));
+    free(text);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_impact_analysis_route_and_entry_point_typing) {
+    cbm_mcp_server_t *srv = setup_impact_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "get_impact_analysis",
+        "{\"project\":\"impact\",\"symbol\":\"ProcessOrder\",\"depth\":4}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(
+        strstr(text, "\"name\":\"CliEntry\",\"file\":\"app/cli/order_cli.php\",\"type\":\"entry_point\""));
+    ASSERT_NOT_NULL(
+        strstr(text, "\"name\":\"POST /orders\",\"file\":\"routes/api.php\",\"type\":\"route\""));
+    free(text);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
     PASS();
 }
 
@@ -2120,6 +2420,12 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_chain_shows_omitted_count);
     RUN_TEST(tool_query_graph_missing_query);
     RUN_TEST(tool_query_graph_max_tokens_truncates);
+    RUN_TEST(tool_get_impact_analysis_basic);
+    RUN_TEST(tool_get_impact_analysis_missing_symbol);
+    RUN_TEST(tool_get_impact_analysis_ambiguous_symbol_picks_top_match);
+    RUN_TEST(tool_get_impact_analysis_include_tests_false);
+    RUN_TEST(tool_get_impact_analysis_max_tokens_truncates);
+    RUN_TEST(tool_get_impact_analysis_route_and_entry_point_typing);
 
     /* Pipeline-dependent tool handlers */
     RUN_TEST(tool_index_repository_missing_path);
