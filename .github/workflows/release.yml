@@ -535,6 +535,11 @@ jobs:
             goarch: arm64
             cc: cc
             cxx: c++
+          - os: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            cc: cc
+            cxx: c++
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - name: Install deps (Linux)
@@ -585,7 +590,7 @@ jobs:
           path: soak-results/
           retention-days: 14
 
-  # ── Step 5b: ASan soak (Linux only, parallel) ─────────────────
+  # ── Step 5b: ASan soak (Linux + macOS, parallel with smoke) ────
   soak-asan:
     if: ${{ inputs.soak_level == 'full' }}
     needs: [build-unix]
@@ -596,17 +601,34 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            goos: linux
             goarch: amd64
+            cc: gcc
+            cxx: g++
           - os: ubuntu-24.04-arm
+            goos: linux
             goarch: arm64
+            cc: gcc
+            cxx: g++
+          - os: macos-14
+            goos: darwin
+            goarch: arm64
+            cc: cc
+            cxx: c++
+          - os: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            cc: cc
+            cxx: c++
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
-      - name: Install deps
+      - name: Install deps (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 git
       - name: Build (ASan + LeakSanitizer)
         run: |
           SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer"
-          scripts/build.sh CC=gcc CXX=g++ EXTRA_CFLAGS="$SANITIZE" EXTRA_LDFLAGS="$SANITIZE"
+          scripts/build.sh --version ${{ inputs.version }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} EXTRA_CFLAGS="$SANITIZE" EXTRA_LDFLAGS="$SANITIZE"
       - name: ASan soak (15 min)
         env:
           ASAN_OPTIONS: "detect_leaks=1:halt_on_error=0:log_path=soak-results/asan"
@@ -615,7 +637,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: soak-asan-linux-${{ matrix.goarch }}
+          name: soak-asan-${{ matrix.goos }}-${{ matrix.goarch }}
           path: soak-results/
           retention-days: 14
 
