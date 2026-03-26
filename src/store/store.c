@@ -1794,14 +1794,33 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
             sqlite3_finalize(check);
         }
     }
+    /* Choose degree columns based on degree_mode param.
+     * degree_mode: "weighted"→weighted_in/out, "calls_only"→calls_in/out,
+     * NULL/"unweighted"→total_in/out (default). Only applies when has_degree_table. */
+    const char *in_expr  = "COALESCE(nd.total_in, 0)";
+    const char *out_expr = "COALESCE(nd.total_out, 0)";
+    if (has_degree_table && params->degree_mode) {
+        if (strcmp(params->degree_mode, "weighted") == 0) {
+            in_expr  = "COALESCE(nd.weighted_in, 0)";
+            out_expr = "COALESCE(nd.weighted_out, 0)";
+        } else if (strcmp(params->degree_mode, "calls_only") == 0) {
+            in_expr  = "COALESCE(nd.calls_in, 0)";
+            out_expr = "COALESCE(nd.calls_out, 0)";
+        }
+    }
+    char sel_with_pr_deg[512];
+    char sel_deg_only[512];
+    snprintf(sel_with_pr_deg, sizeof(sel_with_pr_deg),
+        "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+        "n.file_path, n.start_line, n.end_line, n.properties, "
+        "%s AS in_deg, %s AS out_deg, COALESCE(pr.rank, 0.0) AS pr_rank ", in_expr, out_expr);
+    snprintf(sel_deg_only, sizeof(sel_deg_only),
+        "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+        "n.file_path, n.start_line, n.end_line, n.properties, "
+        "%s AS in_deg, %s AS out_deg ", in_expr, out_expr);
     const char *select_cols;
     if (use_pagerank && has_degree_table) {
-        select_cols =
-            "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
-            "n.file_path, n.start_line, n.end_line, n.properties, "
-            "COALESCE(nd.total_in, 0) AS in_deg, "
-            "COALESCE(nd.total_out, 0) AS out_deg, "
-            "COALESCE(pr.rank, 0.0) AS pr_rank ";
+        select_cols = sel_with_pr_deg;
     } else if (use_pagerank) {
         select_cols =
             "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
@@ -1810,11 +1829,7 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
             "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id) AS out_deg, "
             "COALESCE(pr.rank, 0.0) AS pr_rank ";
     } else if (has_degree_table) {
-        select_cols =
-            "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
-            "n.file_path, n.start_line, n.end_line, n.properties, "
-            "COALESCE(nd.total_in, 0) AS in_deg, "
-            "COALESCE(nd.total_out, 0) AS out_deg ";
+        select_cols = sel_deg_only;
     } else {
         select_cols =
             "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
@@ -2029,6 +2044,29 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         snprintf(order_limit, sizeof(order_limit),
                  " ORDER BY (in_deg + out_deg) DESC, %s, %s LIMIT %d OFFSET %d",
                  name_col, id_col, limit, offset);
+    } else if (params->sort_by && strcmp(params->sort_by, "calls") == 0) {
+        if (has_degree_table) {
+            snprintf(order_limit, sizeof(order_limit),
+                     " ORDER BY COALESCE(nd.calls_in + nd.calls_out, 0) DESC, %s, %s"
+                     " LIMIT %d OFFSET %d",
+                     name_col, id_col, limit, offset);
+        } else {
+            /* Fallback: no precomputed calls data — use total degree */
+            snprintf(order_limit, sizeof(order_limit),
+                     " ORDER BY (in_deg + out_deg) DESC, %s, %s LIMIT %d OFFSET %d",
+                     name_col, id_col, limit, offset);
+        }
+    } else if (params->sort_by && strcmp(params->sort_by, "linkrank") == 0) {
+        if (has_degree_table) {
+            snprintf(order_limit, sizeof(order_limit),
+                     " ORDER BY COALESCE(nd.linkrank_in, 0) DESC, %s, %s LIMIT %d OFFSET %d",
+                     name_col, id_col, limit, offset);
+        } else {
+            /* Fallback: no precomputed linkrank — use total degree */
+            snprintf(order_limit, sizeof(order_limit),
+                     " ORDER BY (in_deg + out_deg) DESC, %s, %s LIMIT %d OFFSET %d",
+                     name_col, id_col, limit, offset);
+        }
     } else {
         /* name sort (explicit or fallback) */
         if (params->project_pattern) {
@@ -2879,7 +2917,7 @@ static int arch_routes(cbm_store_t *s, const char *project, cbm_architecture_inf
     return CBM_STORE_OK;
 }
 
-enum { CBM_ARCH_HOTSPOT_DEFAULT_LIMIT = 10 };
+enum { CBM_ARCH_HOTSPOT_DEFAULT_LIMIT = 25 };
 
 static int arch_hotspots(cbm_store_t *s, const char *project, cbm_architecture_info_t *out,
                          int limit) {
@@ -3919,7 +3957,8 @@ static bool want_aspect(const char **aspects, int aspect_count, const char *name
 }
 
 int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char **aspects,
-                               int aspect_count, cbm_architecture_info_t *out) {
+                               int aspect_count, cbm_architecture_info_t *out,
+                               int hotspot_limit) {
     memset(out, 0, sizeof(*out));
     int rc;
 
@@ -3948,7 +3987,8 @@ int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char *
         }
     }
     if (want_aspect(aspects, aspect_count, "hotspots")) {
-        rc = arch_hotspots(s, project, out, CBM_ARCH_HOTSPOT_DEFAULT_LIMIT);
+        rc = arch_hotspots(s, project, out,
+                           hotspot_limit > 0 ? hotspot_limit : CBM_ARCH_HOTSPOT_DEFAULT_LIMIT);
         if (rc != CBM_STORE_OK) {
             return rc;
         }

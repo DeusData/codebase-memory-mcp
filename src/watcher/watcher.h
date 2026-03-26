@@ -54,9 +54,10 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name);
  * Returns the number of projects that were reindexed. */
 int cbm_watcher_poll_once(cbm_watcher_t *w);
 
-/* Run the blocking poll loop. Polls every base_interval_ms until
- * cbm_watcher_stop() is called. Returns 0 on clean shutdown. */
-int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms);
+/* Run the blocking poll loop. Polls every base_ms until cbm_watcher_stop() is called.
+ * max_ms caps the adaptive interval for large repos. 0 = use defaults (5000/60000).
+ * Returns 0 on clean shutdown. */
+int cbm_watcher_run(cbm_watcher_t *w, int base_ms, int max_ms);
 
 /* Request the run loop to stop (thread-safe). */
 void cbm_watcher_stop(cbm_watcher_t *w);
@@ -66,7 +67,8 @@ void cbm_watcher_stop(cbm_watcher_t *w);
 /* Return the number of projects in the watch list. */
 int cbm_watcher_watch_count(const cbm_watcher_t *w);
 
-/* Return the adaptive poll interval (ms) for a given file count. */
-int cbm_watcher_poll_interval_ms(int file_count);
+/* Return the adaptive poll interval (ms) for a given file count.
+ * base_ms/max_ms: 0 = use defaults (POLL_BASE_MS=5000, POLL_MAX_MS=60000). */
+int cbm_watcher_poll_interval_ms(int file_count, int base_ms, int max_ms);
 
 #endif /* CBM_WATCHER_H */

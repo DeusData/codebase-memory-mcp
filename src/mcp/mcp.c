@@ -85,6 +85,8 @@ static void add_pagerank_val(yyjson_mut_doc *doc, yyjson_mut_val *obj, double v)
 /* Config key: comma-separated glob patterns to exclude from key_functions.
  * Set via: config set key_functions_exclude "scripts/,tools/,tests/" */
 #define CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE "key_functions_exclude"
+#define CBM_CONFIG_KEY_FUNCTIONS_COUNT   "key_functions_count"
+#define CBM_CONFIG_ARCH_HOTSPOT_LIMIT    "arch_hotspot_limit"
 
 /* Directory permissions: rwxr-xr-x */
 #define ADR_DIR_PERMS 0755
@@ -290,9 +292,10 @@ static const tool_def_t TOOLS[] = {
      "Response includes has_more and pagination_hint when more pages exist."
      "\"},\"offset\":{\"type\":\"integer\",\"default\":0,\"description\":\"Skip N results "
      "for pagination. Check pagination_hint in response for next page offset.\"},"
-     "\"sort_by\":{\"type\":\"string\",\"enum\":[\"relevance\",\"name\",\"degree\"],"
+     "\"sort_by\":{\"type\":\"string\",\"enum\":[\"relevance\",\"name\",\"degree\",\"calls\",\"linkrank\"],"
      "\"description\":\"Sort order: relevance (PageRank structural importance, default), "
-     "name (alphabetical), degree (most connected).\"},"
+     "name (alphabetical), degree (most connected by edge weight), "
+     "calls (most direct function calls in+out), linkrank (link-based rank score).\"},"
      "\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"summary\"],\"default\":\"full\","
      "\"description\":\"full=individual results (default), summary=aggregate counts by label and "
      "file. Use summary first to understand scope, then full with filters to drill down."
@@ -440,7 +443,7 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "patterns. When provided, other filter params are ignored. Add LIMIT.\"},"
      "\"label\":{\"type\":\"string\"},\"name_pattern\":{\"type\":\"string\"},"
      "\"qn_pattern\":{\"type\":\"string\"},\"file_pattern\":{\"type\":\"string\"},"
-     "\"sort_by\":{\"type\":\"string\",\"enum\":[\"relevance\",\"name\",\"degree\"]},"
+     "\"sort_by\":{\"type\":\"string\",\"enum\":[\"relevance\",\"name\",\"degree\",\"calls\",\"linkrank\"]},"
      "\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"summary\"]},"
      "\"compact\":{\"type\":\"boolean\"},\"include_dependencies\":{\"type\":\"boolean\"},"
      "\"limit\":{\"type\":\"integer\"},\"offset\":{\"type\":\"integer\"},"
@@ -679,7 +682,7 @@ static void free_string_array(char **arr) {
 
 /* Forward declarations for functions defined after first use */
 static void notify_resources_updated(cbm_mcp_server_t *srv);
-static char *build_key_functions_sql(const char *exclude_csv, const char **exclude_arr);
+static char *build_key_functions_sql(const char *exclude_csv, const char **exclude_arr, int limit);
 char *cbm_glob_to_like(const char *pattern); /* store.c */
 
 struct cbm_mcp_server {
@@ -1600,7 +1603,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         char errbuf[256];
         snprintf(errbuf, sizeof(errbuf),
             "{\"error\":\"invalid sort_by '%s'\","
-            "\"hint\":\"Valid values: relevance, name, degree\"}", sort_by);
+            "\"hint\":\"Valid values: relevance, name, degree, calls, linkrank\"}", sort_by);
         free(label); free(name_pattern); free(qn_pattern); free(file_pattern);
         free(relationship); free(sort_by); free(pe.value);
         return cbm_mcp_text_result(errbuf, true);
@@ -1649,6 +1652,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     params.file_pattern = file_pattern;
     params.relationship = relationship;
     params.sort_by = sort_by;
+    params.degree_mode = srv->config
+        ? cbm_config_get(srv->config, "degree_mode", NULL)
+        : NULL;
     params.limit = effective_limit;
     params.offset = offset;
     params.min_degree = min_degree;
@@ -2177,7 +2183,10 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
             const char *excl_csv = srv->config
                 ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "")
                 : "";
-            char *kf_sql_heap = build_key_functions_sql(excl_csv, (const char **)excl_arr);
+            int kf_limit = srv->config
+                ? cbm_config_get_int(srv->config, CBM_CONFIG_KEY_FUNCTIONS_COUNT, 25)
+                : 25;
+            char *kf_sql_heap = build_key_functions_sql(excl_csv, (const char **)excl_arr, kf_limit);
             free_string_array(excl_arr);
             const char *kf_sql = kf_sql_heap;
             sqlite3_stmt *kf_stmt = NULL;
@@ -4276,7 +4285,7 @@ static void build_resource_schema(yyjson_mut_doc *doc, yyjson_mut_val *root,
  * exclude_arr: NULL-terminated array from tool param, or NULL.
  * Returns a heap-allocated SQL string. Caller must free. */
 static char *build_key_functions_sql(const char *exclude_csv,
-                                     const char **exclude_arr) {
+                                     const char **exclude_arr, int limit) {
     char sql[4096];
     int pos = 0;
     pos += snprintf(sql + pos, sizeof(sql) - pos,
@@ -4314,7 +4323,8 @@ static char *build_key_functions_sql(const char *exclude_csv,
         }
     }
 
-    snprintf(sql + pos, sizeof(sql) - pos, "ORDER BY pr.rank DESC LIMIT 10");
+    snprintf(sql + pos, sizeof(sql) - pos, "ORDER BY pr.rank DESC LIMIT %d",
+             limit > 0 ? limit : 25);
     return heap_strdup(sql);
 }
 
@@ -4340,7 +4350,10 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
         const char *excl_csv = srv->config
             ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "")
             : "";
-        char *sql = build_key_functions_sql(excl_csv, NULL);
+        int kf_limit = srv->config
+            ? cbm_config_get_int(srv->config, CBM_CONFIG_KEY_FUNCTIONS_COUNT, 25)
+            : 25;
+        char *sql = build_key_functions_sql(excl_csv, NULL, kf_limit);
         sqlite3_stmt *stmt = NULL;
         if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
             sqlite3_bind_text(stmt, 1, proj, -1, SQLITE_TRANSIENT);

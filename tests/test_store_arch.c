@@ -141,7 +141,7 @@ static cbm_store_t *setup_arch_test_store(void) {
 TEST(arch_get_all) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, 0, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, 0, &info, 0), CBM_STORE_OK);
 
     ASSERT_TRUE(info.language_count > 0);
     ASSERT_TRUE(info.package_count > 0);
@@ -160,7 +160,7 @@ TEST(arch_entry_points_exclude_tests) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"entry_points"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0), CBM_STORE_OK);
 
     for (int i = 0; i < info.entry_point_count; i++) {
         ASSERT_TRUE(strstr(info.entry_points[i].file, "test") == NULL);
@@ -177,7 +177,7 @@ TEST(arch_hotspots_exclude_tests) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"hotspots"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0), CBM_STORE_OK);
 
     for (int i = 0; i < info.hotspot_count; i++) {
         ASSERT_TRUE(strstr(info.hotspots[i].name, "Test") == NULL);
@@ -192,7 +192,7 @@ TEST(arch_specific_aspects) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
     const char *aspects[] = {"languages", "hotspots"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 2, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 2, &info, 0), CBM_STORE_OK);
 
     ASSERT_TRUE(info.language_count > 0);
     ASSERT_TRUE(info.hotspot_count > 0);
@@ -213,7 +213,7 @@ TEST(arch_empty_project) {
 
     cbm_architecture_info_t info;
     const char *aspects[] = {"all"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "empty", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "empty", aspects, 1, &info, 0), CBM_STORE_OK);
     /* All should be empty but no errors */
 
     cbm_store_architecture_free(&info);
@@ -226,7 +226,7 @@ TEST(arch_languages) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"languages"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0), CBM_STORE_OK);
 
     /* Check Go=3, Python=1, JavaScript=1 */
     int go_count = 0, py_count = 0, js_count = 0;
@@ -252,7 +252,7 @@ TEST(arch_routes) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"routes"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0), CBM_STORE_OK);
 
     ASSERT_EQ(info.route_count, 1);
     ASSERT_STR_EQ(info.routes[0].method, "POST");
@@ -269,7 +269,7 @@ TEST(arch_hotspots) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"hotspots"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0), CBM_STORE_OK);
 
     ASSERT_TRUE(info.hotspot_count > 0);
     /* ProcessOrder should be a hotspot (called by HandleRequest) */
@@ -293,7 +293,7 @@ TEST(arch_boundaries) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"boundaries"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0), CBM_STORE_OK);
 
     ASSERT_TRUE(info.boundary_count > 0);
     /* server → handler and handler → service should be present */
@@ -319,7 +319,7 @@ TEST(arch_layers) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"layers"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0), CBM_STORE_OK);
 
     ASSERT_TRUE(info.layer_count > 0);
     /* Handler package has routes, should be "api" */
@@ -339,7 +339,7 @@ TEST(arch_file_tree) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"file_tree"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0), CBM_STORE_OK);
 
     ASSERT_TRUE(info.file_tree_count > 0);
     /* Check that entries have valid types */
@@ -358,7 +358,7 @@ TEST(arch_clusters) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"clusters"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0), CBM_STORE_OK);
 
     /* With 5 functions and 4 edges, Louvain should find at least 1 cluster */
     if (info.cluster_count == 0) {

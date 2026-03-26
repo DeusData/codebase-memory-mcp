@@ -59,10 +59,17 @@ static void signal_handler(int sig) {
 
 /* ── Watcher background thread ──────────────────────────────────── */
 
+typedef struct {
+    cbm_watcher_t *w;
+    int base_ms;
+    int max_ms;
+} watcher_thread_args_t;
+
+static watcher_thread_args_t g_watcher_args; /* lifetime: static, no free needed */
+
 static void *watcher_thread(void *arg) {
-    cbm_watcher_t *w = arg;
-#define WATCHER_BASE_INTERVAL_MS 5000
-    cbm_watcher_run(w, WATCHER_BASE_INTERVAL_MS);
+    watcher_thread_args_t *a = arg;
+    cbm_watcher_run(a->w, a->base_ms, a->max_ms);
     return NULL;
 }
 
@@ -265,7 +272,14 @@ int main(int argc, char **argv) {
     bool watcher_started = false;
 
     if (g_watcher) {
-        if (cbm_thread_create(&watcher_tid, 0, watcher_thread, g_watcher) == 0) {
+        g_watcher_args.w        = g_watcher;
+        g_watcher_args.base_ms  = runtime_config
+            ? cbm_config_get_int(runtime_config, "watcher_poll_base_ms", 5000)
+            : 5000;
+        g_watcher_args.max_ms   = runtime_config
+            ? cbm_config_get_int(runtime_config, "watcher_poll_max_ms", 60000)
+            : 60000;
+        if (cbm_thread_create(&watcher_tid, 0, watcher_thread, &g_watcher_args) == 0) {
             watcher_started = true;
         }
     }

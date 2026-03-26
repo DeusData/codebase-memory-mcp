@@ -20,36 +20,36 @@
 
 TEST(poll_interval_base) {
     /* 0 files → 5s base */
-    int ms = cbm_watcher_poll_interval_ms(0);
+    int ms = cbm_watcher_poll_interval_ms(0, 0, 0);
     ASSERT_EQ(ms, 5000);
     PASS();
 }
 
 TEST(poll_interval_scaling) {
     /* 1000 files → 5000 + 2*1000 = 7000ms */
-    int ms = cbm_watcher_poll_interval_ms(1000);
+    int ms = cbm_watcher_poll_interval_ms(1000, 0, 0);
     ASSERT_EQ(ms, 7000);
 
     /* 5000 files → 5000 + 10*1000 = 15000ms */
-    ms = cbm_watcher_poll_interval_ms(5000);
+    ms = cbm_watcher_poll_interval_ms(5000, 0, 0);
     ASSERT_EQ(ms, 15000);
     PASS();
 }
 
 TEST(poll_interval_cap) {
     /* 100K files → capped at 60s */
-    int ms = cbm_watcher_poll_interval_ms(100000);
+    int ms = cbm_watcher_poll_interval_ms(100000, 0, 0);
     ASSERT_EQ(ms, 60000);
     PASS();
 }
 
 TEST(poll_interval_small) {
     /* 499 files → 5000 + 0*1000 = 5000ms (integer division) */
-    int ms = cbm_watcher_poll_interval_ms(499);
+    int ms = cbm_watcher_poll_interval_ms(499, 0, 0);
     ASSERT_EQ(ms, 5000);
 
     /* 500 files → 5000 + 1*1000 = 6000ms */
-    ms = cbm_watcher_poll_interval_ms(500);
+    ms = cbm_watcher_poll_interval_ms(500, 0, 0);
     ASSERT_EQ(ms, 6000);
     PASS();
 }
@@ -215,7 +215,7 @@ TEST(watcher_stop_flag) {
     cbm_watcher_stop(w);
 
     /* Run should return immediately */
-    int rc = cbm_watcher_run(w, 1000);
+    int rc = cbm_watcher_run(w, 1000, 0);
     ASSERT_EQ(rc, 0);
 
     cbm_watcher_free(w);
@@ -580,7 +580,7 @@ TEST(watcher_poll_interval_full_table) {
     };
     int n = (int)(sizeof(tests) / sizeof(tests[0]));
     for (int i = 0; i < n; i++) {
-        int got = cbm_watcher_poll_interval_ms(tests[i].files);
+        int got = cbm_watcher_poll_interval_ms(tests[i].files, 0, 0);
         if (got != tests[i].expected_ms) {
             fprintf(stderr, "FAIL pollInterval(%d) = %d, want %d\n", tests[i].files, got,
                     tests[i].expected_ms);

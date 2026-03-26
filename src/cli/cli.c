@@ -1835,40 +1835,195 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
 /* ── Config registry ──────────────────────────────────────────── */
 
 const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
-    /* Indexing */
-    {"auto_index",          "true",  "CBM_AUTO_INDEX",          "Indexing", "Auto-index session project on startup"},
-    {"auto_index_limit",    "50000", "CBM_AUTO_INDEX_LIMIT",    "Indexing", "Max files for auto-indexing (skip larger repos)"},
-    {"reindex_on_startup",  "false", "CBM_REINDEX_ON_STARTUP",  "Indexing", "Re-index stale projects on restart"},
-    {"reindex_stale_seconds","0",    NULL,                       "Indexing", "Max DB age in seconds before stale (0=disabled)"},
-    /* Search */
-    {"search_limit",        "50",    NULL, "Search",  "Default max results for search_code_graph"},
-    {"trace_max_results",   "25",    NULL, "Search",  "Default max nodes per direction in trace_call_path"},
-    {"query_max_output_bytes","32768",NULL, "Search", "Max output bytes for query_graph (0=unlimited)"},
-    {"snippet_max_lines",   "200",   NULL, "Search",  "Max source lines in get_code_snippet (0=unlimited)"},
-    {"key_functions_exclude","",     "CBM_KEY_FUNCTIONS_EXCLUDE","Search", "Comma-separated globs to exclude from key_functions"},
-    /* Tools */
-    {"tool_mode",           "streamlined","CBM_TOOL_MODE", "Tools", "Tool visibility: streamlined (3 tools) or classic (15)"},
-    /* PageRank */
-    {"pagerank_max_iter",   "20",    NULL, "PageRank", "Max power iterations for PageRank convergence"},
-    {"rank_scope",          "project",NULL,"PageRank", "PageRank scope: project or global"},
-    {"edge_weight_calls",         "1.0",  NULL, "PageRank", "Edge weight: direct function/method calls"},
-    {"edge_weight_usage",         "0.7",  NULL, "PageRank", "Edge weight: type refs, attribute access, isinstance"},
-    {"edge_weight_defines_method","0.5",  NULL, "PageRank", "Edge weight: class defines method (structural)"},
-    {"edge_weight_imports",       "0.3",  NULL, "PageRank", "Edge weight: module imports"},
-    {"edge_weight_decorates",     "0.2",  NULL, "PageRank", "Edge weight: decorator applied to function"},
-    {"edge_weight_writes",        "0.15", NULL, "PageRank", "Edge weight: function writes to variable/file"},
-    {"edge_weight_defines",       "0.1",  NULL, "PageRank", "Edge weight: module defines symbol (structural noise)"},
-    {"edge_weight_configures",    "0.1",  NULL, "PageRank", "Edge weight: config file links"},
-    {"edge_weight_tests",         "0.05", NULL, "PageRank", "Edge weight: test→production (dampened to avoid inflation)"},
-    {"edge_weight_http_calls",    "0.5",  NULL, "PageRank", "Edge weight: cross-service HTTP calls"},
-    {"edge_weight_async_calls",   "0.8",  NULL, "PageRank", "Edge weight: async function calls"},
-    {"edge_weight_default",       "0.1",  NULL, "PageRank", "Edge weight: fallback for unrecognized edge types"},
-    {"edge_weight_member_of",     "0.5",  NULL, "PageRank", "Edge weight: rank flow from method to parent class via MEMBER_OF (0=disabled)"},
-    /* Dependencies */
-    {"auto_index_deps",     "true",  NULL, "Dependencies", "Auto-index installed packages (from package.json, Cargo.toml, etc.)"},
-    {"auto_dep_limit",      "20",    NULL, "Dependencies", "Max packages to index (e.g. 20 = top 20 deps like numpy, express)"},
-    {"dep_max_files",       "1000",  NULL, "Dependencies", "Max source files per package (large packages truncated, 0=unlimited)"},
-    {NULL, NULL, NULL, NULL, NULL} /* sentinel */
+    /* ── Indexing ── */
+    {"auto_index", "true", "CBM_AUTO_INDEX", "Indexing",
+     "Auto-index session project on startup",
+     "true|false",
+     "Enable to always have fresh data; disable for manual control or CI environments."},
+    {"auto_index_limit", "50000", "CBM_AUTO_INDEX_LIMIT", "Indexing",
+     "Max files before auto-index is skipped (0=no limit, index everything)",
+     "0-10000000",
+     "Protects against accidentally indexing huge monorepos. Raise for large codebases. "
+     "Set 0 to disable the limit and always index regardless of repo size."},
+    {"reindex_on_startup", "false", "CBM_REINDEX_ON_STARTUP", "Indexing",
+     "Re-index stale projects when server starts",
+     "true|false",
+     "Enable for always-fresh indexes (adds startup latency). Prefer reindex_stale_seconds for scheduled refresh."},
+    {"reindex_stale_seconds", "0", NULL, "Indexing",
+     "Re-index if DB is older than N seconds (0=disabled)",
+     "0-2592000",
+     "0=disabled. 3600=hourly, 86400=daily, 604800=weekly. Runs on startup if stale."},
+    /* ── Search ── */
+    {"search_limit", "50", NULL, "Search",
+     "Default max results for search_code_graph",
+     "1-100000",
+     "Higher = more results but more tokens. Overridden by limit param per-query. "
+     "50 is good for exploration; 200+ for exhaustive analysis."},
+    {"trace_max_results", "25", NULL, "Search",
+     "Default max nodes per direction in trace_call_path",
+     "1-10000",
+     "Controls how far call chains are traced. 25 covers typical call depth; raise to 100+ for deep dependency tracing."},
+    {"query_max_output_bytes", "32768", NULL, "Search",
+     "Max response bytes for query_graph (0=unlimited)",
+     "0-104857600",
+     "32KB default prevents huge responses. Set 0 for unlimited Cypher results. Raise for bulk analysis queries."},
+    {"snippet_max_lines", "200", NULL, "Search",
+     "Max source lines returned by get_code (0=unlimited)",
+     "0-1000000",
+     "200 lines covers most functions. Set 0 for unlimited to get full file contents."},
+    {"key_functions_exclude", "", "CBM_KEY_FUNCTIONS_EXCLUDE", "Search",
+     "Comma-separated glob patterns to exclude from architecture key functions",
+     "glob patterns, e.g. graph-ui/**,tests/**",
+     "Use to remove UI, generated code, or test helpers from the architecture view. "
+     "Example: 'graph-ui/**,tools/**,scripts/**,tests/**'."},
+    {"key_functions_count", "25", NULL, "Search",
+     "Max key functions returned in codebase://architecture and search context",
+     "1-10000",
+     "The architecture resource ranks every symbol by PageRank importance and returns the top N. "
+     "Use 25 for most projects. Raise to 50-100 for large multi-language codebases where "
+     "important functions may not appear in the first 25. Lower to 10 when tokens are limited."},
+    /* ── Tools ── */
+    {"tool_mode", "streamlined", "CBM_TOOL_MODE", "Tools",
+     "Which set of tools the MCP server exposes: 3 combined tools or all 15 individual tools",
+     "streamlined|classic",
+     "'streamlined' (default): exposes search_code_graph (search+Cypher), trace_call_path, get_code. "
+     "'classic': exposes all 15 individual tools including index_repository, query_graph, get_architecture, "
+     "list_projects, detect_changes, manage_adr, etc. "
+     "You can also enable individual classic tools without switching modes: "
+     "config set tool_index_repository true"},
+    /* ── PageRank ── */
+    {"pagerank_max_iter", "20", NULL, "PageRank",
+     "Max iterations for PageRank algorithm before stopping (more = more accurate convergence)",
+     "1-10000",
+     "PageRank is an iterative algorithm — each iteration refines importance scores. "
+     "20 iterations converges in ~5ms for 16K-node codebases. Typical convergence is 10-15 iters. "
+     "Raise to 50-100 for very large codebases (>100K nodes). "
+     "Diminishing returns above convergence — set too high wastes CPU at reindex time."},
+    {"rank_scope", "project", NULL, "PageRank",
+     "Whether PageRank importance is computed per-project or across all indexed projects",
+     "project|full",
+     "'project' (default): each project's symbols are scored independently — scores are "
+     "comparable within a project but not across projects. "
+     "'full': scores all projects in one global computation — enables cross-project comparison "
+     "but is slower and dependency scores mix with your project's scores."},
+    {"edge_weight_calls", "1.0", NULL, "PageRank",
+     "How much importance flows along direct function/method call edges (CALLS)",
+     "0.0-100.0",
+     "PageRank works like Google PageRank: importance flows along edges. Higher weight = more "
+     "importance flows when one function calls another. 1.0 is the anchor — all other weights "
+     "are relative to it. Increase to 2.0 for call-heavy C/Rust codebases. "
+     "Decrease to 0.5 for event-driven systems where direct calls aren't the primary coupling."},
+    {"edge_weight_usage", "0.7", NULL, "PageRank",
+     "How much importance flows along type-reference edges: type annotations, attribute access, isinstance (USAGE)",
+     "0.0-100.0",
+     "USAGE edges are created when code references a type (e.g. 'x: MyClass', 'isinstance(x, Foo)'). "
+     "These are dense in TypeScript/Python and can inflate UI utilities over core functions. "
+     "Reduce to 0.2-0.3 if type annotations are dominating your architecture results."},
+    {"edge_weight_defines_method", "0.5", NULL, "PageRank",
+     "How much importance flows from a class to each method it defines (DEFINES_METHOD)",
+     "0.0-100.0",
+     "Every class has one DEFINES_METHOD edge per method. Higher = classes with many methods rank "
+     "higher relative to standalone functions. Lower to 0.1 to treat functions and class methods equally."},
+    {"edge_weight_imports", "0.3", NULL, "PageRank",
+     "How much importance flows along module import edges (IMPORTS)",
+     "0.0-100.0",
+     "Created when file A imports file/module B. Higher promotes widely-imported utility modules "
+     "(e.g. a shared 'utils.py' imported by 50 files). Raise to 0.6-0.8 to emphasize shared infrastructure; "
+     "keep low if star-imports create many spurious edges."},
+    {"edge_weight_decorates", "0.2", NULL, "PageRank",
+     "How much importance flows from a decorator to the function it decorates (DECORATES)",
+     "0.0-100.0",
+     "Created when @decorator is applied to a function. Raise to 0.5+ in Python web frameworks "
+     "where @route, @cached, @requires_auth are semantically important architectural markers."},
+    {"edge_weight_writes", "0.15", NULL, "PageRank",
+     "How much importance flows when a function writes to a variable or file (WRITES)",
+     "0.0-100.0",
+     "Tracks side effects: function writes to a shared variable or file. Raise for ETL or "
+     "data-pipeline codebases where write targets (databases, output files) are the primary output."},
+    {"edge_weight_defines", "0.1", NULL, "PageRank",
+     "How much importance flows from a file/module to each symbol it defines (DEFINES — structural)",
+     "0.0-100.0",
+     "Every function has exactly one DEFINES edge from its containing file. This is purely structural "
+     "bookkeeping — keep very low (0.01-0.1). Raising this inflates ALL symbols in a file equally, "
+     "which is rarely what you want."},
+    {"edge_weight_configures", "0.1", NULL, "PageRank",
+     "How much importance flows from config files to the code they configure (CONFIGURES)",
+     "0.0-100.0",
+     "Created when a config file references a code symbol (e.g. a YAML file referencing a handler "
+     "class). Raise to 0.3+ for infrastructure projects where config -> code coupling is important."},
+    {"edge_weight_tests", "0.05", NULL, "PageRank",
+     "How much importance flows from test code to the production function it tests (TESTS)",
+     "0.0-100.0",
+     "Intentionally very low so test files don't inflate production function rankings. A function "
+     "with 100 tests would otherwise rank at the top of every project. Raise only if you want "
+     "heavily-tested functions to rank higher (useful for spotting critical code paths)."},
+    {"edge_weight_http_calls", "0.5", NULL, "PageRank",
+     "How much importance flows along cross-service HTTP call edges (HTTP_CALLS)",
+     "0.0-100.0",
+     "Created when code makes an HTTP call to another service endpoint. Raise to 1.0-2.0 for "
+     "microservice architectures where HTTP calls ARE the primary coupling between components "
+     "and you want service entry points to appear prominently in architecture results."},
+    {"edge_weight_async_calls", "0.8", NULL, "PageRank",
+     "How much importance flows along async function call edges (ASYNC_CALLS)",
+     "0.0-100.0",
+     "Like edge_weight_calls but for async/await call patterns. Slightly lower than sync calls "
+     "by default. Reduce to 0.3 for heavily async Node.js or Python asyncio codebases where "
+     "awaited spans are dense and create noise in the rankings."},
+    {"edge_weight_default", "0.1", NULL, "PageRank",
+     "Fallback importance weight for edge types not listed above",
+     "0.0-100.0",
+     "Safety net for any edge types added in future without explicit weights. "
+     "Rarely affects results. Keep low."},
+    {"edge_weight_member_of", "0.5", NULL, "PageRank",
+     "How much importance flows from a method back up to its parent class (MEMBER_OF — reverse structural)",
+     "0.0-100.0",
+     "Set to 0 to disable (method importance stays in the method, not the class). "
+     "Higher values propagate method-level importance up to the parent class — "
+     "raise to 0.8 to make heavily-called classes rank higher than individual methods."},
+    /* ── Watcher ── */
+    {"watcher_poll_base_ms", "5000", NULL, "Watcher",
+     "Base file-watcher poll interval in milliseconds",
+     "100-3600000",
+     "5 seconds by default. Lower for faster change detection (100ms for dev loops); "
+     "raise for large repos to reduce CPU overhead. Actual interval scales with file count."},
+    {"watcher_poll_max_ms", "60000", NULL, "Watcher",
+     "Maximum file-watcher poll interval in milliseconds (cap for large repos)",
+     "100-3600000",
+     "60 seconds for repos with 50K+ files. Lower to 10000 for faster detection in large repos "
+     "if CPU allows. Formula: min(base + file_count/500 * 1000, max)."},
+    /* ── Architecture ── */
+    {"arch_hotspot_limit", "25", NULL, "Architecture",
+     "Max hotspot functions shown in the classic get_architecture tool's hotspots section",
+     "1-10000",
+     "Hotspots are functions ranked by how many times they are directly called (calls_in count). "
+     "They identify the most-invoked code — good candidates for optimization and risk assessment. "
+     "25 is enough for orientation; raise to 100 for exhaustive call-density analysis. "
+     "Only applies to the classic 'get_architecture' tool (tool_mode=classic)."},
+    /* ── Degree / Sort ── */
+    {"degree_mode", "weighted", NULL, "Degree",
+     "What 'degree' means for min_degree/max_degree filters and sort_by=degree ranking",
+     "weighted|unweighted|calls_only",
+     "Degree = how connected a symbol is. 'weighted' multiplies each connection by its edge type weight "
+     "(e.g. a direct call counts 1.0x, a test call counts 0.05x) — best overall signal. "
+     "'unweighted' = raw connection count regardless of type. "
+     "'calls_only' = only count direct function call connections — best for finding the most-called functions."},
+    /* ── Dependencies ── */
+    {"auto_index_deps", "true", NULL, "Dependencies",
+     "Auto-index installed packages from package.json, Cargo.toml, go.mod, etc.",
+     "true|false",
+     "Enable to trace calls into dependencies (e.g. find all callers of a library function). "
+     "Disable for faster indexing when cross-package search is not needed."},
+    {"auto_dep_limit", "20", NULL, "Dependencies",
+     "Max number of packages to auto-index",
+     "0-10000",
+     "20 covers the most-used imports. Raise to 100+ for comprehensive dependency analysis. "
+     "0 = unlimited (may be very slow for large dependency trees)."},
+    {"dep_max_files", "1000", NULL, "Dependencies",
+     "Max source files per dependency package (0=unlimited)",
+     "0-1000000",
+     "Caps indexing of large packages (TensorFlow, LLVM). 1000 covers most packages. "
+     "Set 0 for unlimited if you need complete large-package analysis."},
+    {NULL, NULL, NULL, NULL, NULL, NULL, NULL} /* sentinel */
 };
 
 /* Get config value with env var override priority: env > db > default.
@@ -1915,12 +2070,18 @@ int cbm_cmd_config(int argc, char **argv) {
                 last_cat = e->category;
             }
             if (e->env_var) {
-                printf("  %-28s default=%-8s %s [env: %s]\n",
-                    e->key, e->default_val, e->description, e->env_var);
+                printf("  %-30s default=%-14s [env: %s]\n",
+                    e->key, e->default_val, e->env_var);
             } else {
-                printf("  %-28s default=%-8s %s\n",
-                    e->key, e->default_val, e->description);
+                printf("  %-30s default=%-14s\n",
+                    e->key, e->default_val);
             }
+            if (e->range || e->description)
+                printf("      [%-20s]  %s\n",
+                       e->range ? e->range : "any",
+                       e->description ? e->description : "");
+            if (e->guidance)
+                printf("      %s\n\n", e->guidance);
         }
         return 0;
     }
@@ -1963,7 +2124,13 @@ int cbm_cmd_config(int argc, char **argv) {
             /* Check if DB value differs from default */
             const char *db_val = cbm_config_get(cfg, e->key, NULL);
             if (!source[0] && db_val) source = " (set)";
-            printf("  %-28s = %-12s%s\n", e->key, val, source);
+            printf("  %-30s = %-14s%s\n", e->key, val, source);
+            if (e->range || e->description)
+                printf("      [%-20s]  %s\n",
+                       e->range ? e->range : "any",
+                       e->description ? e->description : "");
+            if (e->guidance)
+                printf("      %s\n\n", e->guidance);
         }
     } else if (strcmp(argv[0], "get") == 0) {
         if (argc < 2) {
@@ -1972,13 +2139,21 @@ int cbm_cmd_config(int argc, char **argv) {
         } else {
             /* Find default from registry */
             const char *def = "";
+            const cbm_config_entry_t *found_entry = NULL;
             for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
                 if (strcmp(CBM_CONFIG_REGISTRY[i].key, argv[1]) == 0) {
                     def = CBM_CONFIG_REGISTRY[i].default_val;
+                    found_entry = &CBM_CONFIG_REGISTRY[i];
                     break;
                 }
             }
             printf("%s\n", cbm_config_get_effective(cfg, argv[1], def));
+            if (found_entry) {
+                if (found_entry->range)
+                    printf("range: %s\n", found_entry->range);
+                if (found_entry->guidance)
+                    printf("guidance: %s\n", found_entry->guidance);
+            }
         }
     } else if (strcmp(argv[0], "set") == 0) {
         if (argc < 3) {
