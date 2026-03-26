@@ -53,3 +53,4 @@ graph-ui/dist/
 # Generated reports
 BENCHMARK_REPORT.md
 TEST_PLAN.md
+scripts/autotune_results.json
