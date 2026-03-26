@@ -5921,6 +5921,7 @@ static char *build_search_session_hint(cbm_mcp_server_t *srv, cbm_store_t *store
     }
 
     char buf[SESSION_HINT_MAX_CHARS];
+    buf[0] = '\0';
     int off = 0;
 
     /* Count already-seen results */
@@ -5931,11 +5932,11 @@ static char *build_search_session_hint(cbm_mcp_server_t *srv, cbm_store_t *store
         }
     }
     if (seen > 0 && seen < out->count) {
-        off += snprintf(buf, sizeof(buf),
-                        "%d of %d results were already examined this session.", seen, out->count);
+        HINT_SNPRINTF(buf, sizeof(buf), off,
+                      "%d of %d results were already examined this session.", seen, out->count);
     } else if (seen > 0 && seen == out->count) {
-        off += snprintf(buf, sizeof(buf),
-                        "All %d results were already examined this session.", out->count);
+        HINT_SNPRINTF(buf, sizeof(buf), off,
+                      "All %d results were already examined this session.", out->count);
     }
 
     off += append_global_pagerank_hint(srv, store, project, buf, off, (int)sizeof(buf));
