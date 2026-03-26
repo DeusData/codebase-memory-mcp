@@ -2958,6 +2958,91 @@ TEST(session_has_area_membership) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  SESSION SUMMARY (Phase 7C)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(session_summary_empty) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(srv, "get_session_summary", "{}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "Session Summary"));
+    ASSERT_NOT_NULL(strstr(text, "0 queries"));
+    free(text);
+    free(raw);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(session_summary_after_tools) {
+    cbm_mcp_server_t *srv = setup_impact_server();
+    ASSERT_NOT_NULL(srv);
+
+    /* Call explore + understand to populate session */
+    char *r1 = cbm_mcp_handle_tool(srv, "explore",
+                                   "{\"project\":\"impact\",\"area\":\"Order\"}");
+    free(r1);
+    char *r2 = cbm_mcp_handle_tool(srv, "understand",
+                                   "{\"project\":\"impact\",\"symbol\":\"ProcessOrder\"}");
+    free(r2);
+
+    char *raw = cbm_mcp_handle_tool(srv, "get_session_summary",
+                                    "{\"project\":\"impact\"}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+
+    /* Should contain markdown structure */
+    ASSERT_NOT_NULL(strstr(text, "Session Summary"));
+    /* Should mention areas explored */
+    ASSERT_NOT_NULL(strstr(text, "Areas explored"));
+    ASSERT_NOT_NULL(strstr(text, "Order"));
+    /* Should mention symbols */
+    ASSERT_NOT_NULL(strstr(text, "Symbols investigated"));
+    ASSERT_NOT_NULL(strstr(text, "ProcessOrder"));
+
+    free(text);
+    free(raw);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(session_summary_with_impact) {
+    cbm_mcp_server_t *srv = setup_impact_server();
+    ASSERT_NOT_NULL(srv);
+
+    /* Run impact analysis to populate session */
+    char *r1 = cbm_mcp_handle_tool(srv, "get_impact_analysis",
+                                   "{\"project\":\"impact\",\"symbol\":\"ProcessOrder\"}");
+    free(r1);
+
+    char *raw = cbm_mcp_handle_tool(srv, "get_session_summary",
+                                    "{\"project\":\"impact\"}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "Session Summary"));
+    ASSERT_NOT_NULL(strstr(text, "Impact analyses"));
+    ASSERT_NOT_NULL(strstr(text, "ProcessOrder"));
+
+    free(text);
+    free(raw);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(session_summary_tools_list) {
+    char *tools_json = cbm_mcp_tools_list();
+    ASSERT_NOT_NULL(tools_json);
+    ASSERT_NOT_NULL(strstr(tools_json, "get_session_summary"));
+    free(tools_json);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -3136,4 +3221,10 @@ SUITE(mcp) {
     RUN_TEST(session_hint_prepare_change_edited_file);
     RUN_TEST(session_hint_not_present_first_call);
     RUN_TEST(session_has_area_membership);
+
+    /* Session summary (Phase 7C) */
+    RUN_TEST(session_summary_empty);
+    RUN_TEST(session_summary_after_tools);
+    RUN_TEST(session_summary_with_impact);
+    RUN_TEST(session_summary_tools_list);
 }

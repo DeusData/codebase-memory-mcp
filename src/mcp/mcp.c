@@ -885,6 +885,15 @@ static const tool_def_t TOOLS[] = {
      "\"description\":\"Include graph neighbors of touched symbols that have not been "
      "examined yet.\"},\"limit\":{\"type\":\"integer\",\"default\":10,"
      "\"description\":\"Max related_untouched items.\"}},\"required\":[]}"},
+
+    {"get_session_summary",
+     "Compact markdown session summary for context recovery after compaction. "
+     "Shows files touched, symbols investigated with PageRank, areas explored, "
+     "and suggested next steps.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\","
+     "\"description\":\"Project name (needed for PageRank enrichment and next-step "
+     "suggestions).\"},\"max_tokens\":{\"type\":\"integer\",\"default\":2000,"
+     "\"description\":\"Maximum output size.\"}},\"required\":[]}"},
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
@@ -5965,7 +5974,7 @@ static void maybe_add_session_hint(yyjson_mut_doc *doc, yyjson_mut_val *root, co
     }
 }
 
-/* ── Session context (Phase 7A) ────────────────────────────────── */
+/* ── Session helpers (shared by 7A + 7C) ──────────────────────── */
 
 /* Callback: free a strdup'd hash table key (for temporary candidate sets). */
 static void free_ht_key_cb(const char *key, void *value, void *userdata) {
@@ -5974,7 +5983,7 @@ static void free_ht_key_cb(const char *key, void *value, void *userdata) {
     free((void *)key);
 }
 
-/* Callback: append key to a yyjson array. */
+/* Callback: append key to a yyjson array (used by get_session_context). */
 typedef struct {
     yyjson_mut_doc *doc;
     yyjson_mut_val *arr;
@@ -5985,7 +5994,7 @@ static void append_key_to_json_arr(const char *key, void *userdata) {
     yyjson_mut_arr_add_strcpy(ctx->doc, ctx->arr, key);
 }
 
-/* Callback: collect symbol names into a list for related_untouched lookup. */
+/* Callback: collect symbol names into a list for neighbor lookup. */
 typedef struct {
     const char **names;
     int count;
@@ -5998,6 +6007,215 @@ static void collect_symbol_name(const char *key, void *userdata) {
         nc->names[nc->count++] = key;
     }
 }
+
+/* ── Session summary (Phase 7C) ────────────────────────────────── */
+
+/* Callback context for iterating session sets into markdown. */
+typedef struct {
+    markdown_builder_t *md;
+    int count; /* items emitted so far */
+} md_list_ctx_t;
+
+static void append_key_comma_separated(const char *key, void *userdata) {
+    md_list_ctx_t *ctx = (md_list_ctx_t *)userdata;
+    if (ctx->count > 0) {
+        (void)markdown_builder_append_raw(ctx->md, ", ");
+    }
+    (void)markdown_builder_append_raw(ctx->md, key);
+    ctx->count++;
+}
+
+static void append_key_bullet(const char *key, void *userdata) {
+    md_list_ctx_t *ctx = (md_list_ctx_t *)userdata;
+    (void)markdown_builder_appendf(ctx->md, "- %s\n", key);
+    ctx->count++;
+}
+
+static char *handle_get_session_summary(cbm_mcp_server_t *srv, const char *args) {
+    char *project = cbm_mcp_get_string_arg(args, "project");
+    int max_tokens = cbm_mcp_get_int_arg(args, "max_tokens", DEFAULT_MAX_TOKENS);
+
+    cbm_session_state_t *ss = ensure_session(srv);
+    cbm_store_t *store = project ? resolve_store(srv, project) : NULL;
+
+    size_t char_budget = max_tokens_to_char_budget(max_tokens);
+    markdown_builder_t md;
+    markdown_builder_init(&md, char_budget);
+
+    /* ── Header ──────────────────────────────────────────────── */
+    time_t start = cbm_session_start_time(ss);
+    time_t now = time(NULL);
+    int elapsed = (int)(now - start);
+    if (elapsed < 0) elapsed = 0;
+    int minutes = elapsed / 60;
+    int seconds = elapsed % 60;
+    int qc = cbm_session_query_count(ss);
+
+    if (minutes > 0) {
+        (void)markdown_builder_appendf(&md, "## Session Summary (%d queries, %dm%ds)\n\n",
+                                       qc, minutes, seconds);
+    } else {
+        (void)markdown_builder_appendf(&md, "## Session Summary (%d queries, %ds)\n\n",
+                                       qc, seconds);
+    }
+
+    /* ── Files touched ───────────────────────────────────────── */
+    int read_count = cbm_session_files_read_count(ss);
+    int edited_count = cbm_session_files_edited_count(ss);
+
+    if (read_count > 0 || edited_count > 0) {
+        (void)markdown_builder_append_raw(&md, "### Files touched\n");
+        if (read_count > 0) {
+            (void)markdown_builder_append_raw(&md, "- **Read:** ");
+            md_list_ctx_t ctx = {.md = &md, .count = 0};
+            cbm_session_foreach_file_read(ss, append_key_comma_separated, &ctx);
+            (void)markdown_builder_append_raw(&md, "\n");
+        }
+        if (edited_count > 0) {
+            (void)markdown_builder_append_raw(&md, "- **Edited:** ");
+            md_list_ctx_t ctx = {.md = &md, .count = 0};
+            cbm_session_foreach_file_edited(ss, append_key_comma_separated, &ctx);
+            (void)markdown_builder_append_raw(&md, "\n");
+        }
+        (void)markdown_builder_append_raw(&md, "\n");
+    }
+
+    /* ── Symbols investigated ────────────────────────────────── */
+    int sym_count = cbm_session_symbols_count(ss);
+    int impact_count = cbm_session_impacts_count(ss);
+
+    if (sym_count > 0 || impact_count > 0) {
+        (void)markdown_builder_append_raw(&md, "### Symbols investigated\n");
+
+        /* Collect queried symbol names */
+        const char *sym_names[30];
+        name_collector_t sc = {.names = sym_names, .count = 0, .cap = 30};
+        cbm_session_foreach_symbol(ss, collect_symbol_name, &sc);
+
+        for (int i = 0; i < sc.count; i++) {
+            const char *name = sc.names[i];
+
+            /* Look up PageRank if store available */
+            if (store) {
+                cbm_key_symbol_t *ks = NULL;
+                int ks_count = 0;
+                cbm_store_get_key_symbols(store, project, name, 1, &ks, &ks_count);
+                if (ks_count > 0 && ks[0].name && strcmp(ks[0].name, name) == 0) {
+                    (void)markdown_builder_appendf(&md, "- %s (%d callers, PageRank %.4f)",
+                                                   name, ks[0].in_degree, ks[0].pagerank);
+                } else {
+                    (void)markdown_builder_appendf(&md, "- %s", name);
+                }
+                cbm_store_key_symbols_free(ks, ks_count);
+            } else {
+                (void)markdown_builder_appendf(&md, "- %s", name);
+            }
+            (void)markdown_builder_append_raw(&md, "\n");
+        }
+        (void)markdown_builder_append_raw(&md, "\n");
+    }
+
+    /* ── Impact analyses ─────────────────────────────────────── */
+    if (impact_count > 0) {
+        (void)markdown_builder_append_raw(&md, "### Impact analyses run\n");
+        md_list_ctx_t ctx = {.md = &md, .count = 0};
+        cbm_session_foreach_impact(ss, append_key_bullet, &ctx);
+        (void)markdown_builder_append_raw(&md, "\n");
+    }
+
+    /* ── Areas explored ──────────────────────────────────────── */
+    int area_count = cbm_session_areas_count(ss);
+    if (area_count > 0) {
+        (void)markdown_builder_append_raw(&md, "### Areas explored\n");
+        md_list_ctx_t ctx = {.md = &md, .count = 0};
+        cbm_session_foreach_area(ss, append_key_bullet, &ctx);
+        (void)markdown_builder_append_raw(&md, "\n");
+    }
+
+    /* ── Suggested next steps ────────────────────────────────── */
+    if (store && sym_count > 0) {
+        {
+            /* Collect symbols for neighbor lookup */
+            const char *lookup_names[20];
+            name_collector_t nc = {.names = lookup_names, .count = 0, .cap = 20};
+            cbm_session_foreach_symbol(ss, collect_symbol_name, &nc);
+            cbm_session_foreach_impact(ss, collect_symbol_name, &nc);
+
+            /* Temporary dedup set for candidates */
+            CBMHashTable *candidates = cbm_ht_create(64);
+            for (int i = 0; i < nc.count; i++) {
+                cbm_node_t *nodes = NULL;
+                int ncount = 0;
+                cbm_store_find_nodes_by_name(store, project, lookup_names[i], &nodes, &ncount);
+                for (int j = 0; j < ncount; j++) {
+                    char **callers = NULL;
+                    char **callees = NULL;
+                    int caller_count = 0, callee_count = 0;
+                    cbm_store_node_neighbor_names(store, nodes[j].id, 10, &callers, &caller_count,
+                                                  &callees, &callee_count);
+                    for (int k = 0; k < caller_count; k++) {
+                        if (callers[k] && !cbm_session_has_symbol(ss, callers[k]) &&
+                            !cbm_ht_has(candidates, callers[k])) {
+                            char *key = strdup(callers[k]);
+                            if (key) cbm_ht_set(candidates, key, (void *)lookup_names[i]);
+                        }
+                    }
+                    for (int k = 0; k < callee_count; k++) {
+                        if (callees[k] && !cbm_session_has_symbol(ss, callees[k]) &&
+                            !cbm_ht_has(candidates, callees[k])) {
+                            char *key = strdup(callees[k]);
+                            if (key) cbm_ht_set(candidates, key, (void *)lookup_names[i]);
+                        }
+                    }
+                    for (int k = 0; k < caller_count; k++) free(callers[k]);
+                    free(callers);
+                    for (int k = 0; k < callee_count; k++) free(callees[k]);
+                    free(callees);
+                }
+                cbm_store_free_nodes(nodes, ncount);
+            }
+
+            if (cbm_ht_count(candidates) > 0) {
+                cbm_key_symbol_t *key_syms = NULL;
+                int ks_count = 0;
+                cbm_store_get_key_symbols(store, project, NULL, 200, &key_syms, &ks_count);
+
+                bool header_emitted = false;
+                int emitted = 0;
+                for (int i = 0; i < ks_count && emitted < 5; i++) {
+                    if (key_syms[i].name && cbm_ht_has(candidates, key_syms[i].name)) {
+                        if (!header_emitted) {
+                            (void)markdown_builder_append_raw(&md, "### Suggested next steps\n");
+                            header_emitted = true;
+                        }
+                        const char *reason =
+                            (const char *)cbm_ht_get(candidates, key_syms[i].name);
+                        (void)markdown_builder_appendf(
+                            &md, "- Examine %s%s%s (neighbor of %s, not yet examined)\n",
+                            key_syms[i].name,
+                            key_syms[i].file_path ? " in " : "",
+                            key_syms[i].file_path ? key_syms[i].file_path : "",
+                            reason ? reason : "queried symbol");
+                        emitted++;
+                    }
+                }
+                cbm_store_key_symbols_free(key_syms, ks_count);
+            }
+
+            cbm_ht_foreach(candidates, free_ht_key_cb, NULL);
+            cbm_ht_free(candidates);
+        }
+    }
+
+    char *markdown = markdown_builder_finish(&md);
+    free(project);
+
+    char *result = cbm_mcp_text_result(markdown ? markdown : "", false);
+    free(markdown);
+    return result;
+}
+
+/* ── Session context (Phase 7A) ────────────────────────────────── */
 
 static char *handle_get_session_context(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
@@ -6224,6 +6442,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "get_session_context") == 0) {
         return handle_get_session_context(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_session_summary") == 0) {
+        return handle_get_session_summary(srv, args_json);
     }
 
     char msg[256];
