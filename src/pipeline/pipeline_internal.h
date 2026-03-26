@@ -401,4 +401,9 @@ typedef struct {
  * Returns number of bindings written to out (up to max_out). */
 int cbm_scan_project_env_urls(const char *root_path, cbm_env_binding_t *out, int max_out);
 
+/* Free all compiled regex patterns used by cbm_scan_project_env_urls.
+ * Patterns are compiled lazily on first use and cached for the process lifetime.
+ * Call this in test teardown to release ~26KB of regex memory cleanly. */
+void cbm_envscan_free_patterns(void);
+
 #endif /* CBM_PIPELINE_INTERNAL_H */

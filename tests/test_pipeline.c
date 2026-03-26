@@ -4875,4 +4875,7 @@ SUITE(pipeline) {
     RUN_TEST(githistory_compute_change_coupling);
     RUN_TEST(githistory_coupling_skips_large_commits);
     RUN_TEST(githistory_coupling_limits_output);
+    /* Release pipeline-level global state (compiled regex patterns etc.).
+     * Patterns are compiled on first use and cached; free once at suite end. */
+    cbm_pipeline_global_cleanup();
 }

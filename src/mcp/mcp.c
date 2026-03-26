@@ -986,10 +986,11 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     /* Register newly-accessed project with watcher (root_path from DB) */
     if (srv->watcher && srv->store) {
         cbm_project_t proj = {0};
-        if (cbm_store_get_project(srv->store, db_project, &proj) == CBM_STORE_OK
-            && proj.root_path && proj.root_path[0]) {
-            cbm_watcher_watch(srv->watcher, db_project, proj.root_path);
-            cbm_project_free_fields(&proj);  /* store.h:578 */
+        if (cbm_store_get_project(srv->store, db_project, &proj) == CBM_STORE_OK) {
+            if (proj.root_path && proj.root_path[0])
+                cbm_watcher_watch(srv->watcher, db_project, proj.root_path);
+            /* Always free fields — cbm_store_get_project heap-allocates even empty strings */
+            cbm_project_free_fields(&proj);
         }
     }
 
@@ -1642,8 +1643,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         for (int i = 0; i < out.count; i++) {
             cbm_search_result_t *sr = &out.results[i];
             yyjson_mut_val *item = yyjson_mut_obj(doc);
-            if (!compact || !ends_with_segment(sr->node.qualified_name, sr->node.name)) {
-                yyjson_mut_obj_add_str(doc, item, "name", sr->node.name ? sr->node.name : "");
+            if ((!compact || !ends_with_segment(sr->node.qualified_name, sr->node.name)) &&
+                sr->node.name && sr->node.name[0]) {
+                yyjson_mut_obj_add_str(doc, item, "name", sr->node.name);
             }
             yyjson_mut_obj_add_str(doc, item, "qualified_name",
                                    sr->node.qualified_name ? sr->node.qualified_name : "");
@@ -1692,6 +1694,47 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                      "Use offset:%d and limit:%d for next page (%d total)",
                      offset + out.count, limit, (int)out.total);
             yyjson_mut_obj_add_strcpy(doc, root, "pagination_hint", hint);
+        }
+    }
+
+    /* When searching for dep projects returns nothing, explain why.
+     * Heuristic: dep search if expanded value ends with ".dep" (from "dep"/"deps" shorthand)
+     * or project_pattern contains ".dep." — both indicate a dependency project query. */
+    if (out.total == 0) {
+        bool is_dep_search = false;
+        if (pe.mode == MATCH_PREFIX && pe.value) {
+            size_t n = strlen(pe.value);
+            is_dep_search = (n >= 4 && strcmp(pe.value + n - 4, ".dep") == 0);
+        } else if (pe.mode == MATCH_GLOB && pe.value) {
+            is_dep_search = (strstr(pe.value, ".dep.") != NULL ||
+                             strstr(pe.value, ".dep%") != NULL);
+        }
+        if (is_dep_search) {
+            /* Detect what build system is in use to give an actionable hint */
+            cbm_pkg_manager_t eco = CBM_PKG_COUNT;
+            if (srv->session_root[0])
+                eco = cbm_detect_ecosystem(srv->session_root);
+            char hint[1024];
+            if (eco == CBM_PKG_COUNT) {
+                snprintf(hint, sizeof(hint),
+                    "No dependency sub-projects indexed, and no recognized build system "
+                    "detected in '%s'. Supported: Python/uv (pyproject.toml, requirements.txt), "
+                    "Rust/cargo, npm/bun (package.json), Go (go.mod), JVM/Maven/Gradle, "
+                    ".NET/NuGet (*.csproj), Ruby/Bundler (Gemfile), PHP/Composer, "
+                    "Swift/SPM, Dart/pub, Elixir/Mix, C-Make (Makefile), C-CMake, "
+                    "C-Meson, C-Conan, or generic vendor/ directory. "
+                    "Re-index after adding a manifest file.",
+                    srv->session_root[0] ? srv->session_root : "(unknown project root)");
+            } else {
+                snprintf(hint, sizeof(hint),
+                    "No dependency sub-projects indexed yet for %s build system '%s'. "
+                    "Dep scanning runs automatically on index_repository. "
+                    "If deps are vendored in vendor/ vendored/ third_party/ etc., "
+                    "re-run index_repository(repo_path=\"%s\") to trigger dep discovery.",
+                    cbm_pkg_manager_str(eco), cbm_pkg_manager_str(eco),
+                    srv->session_root[0] ? srv->session_root : "<repo_path>");
+            }
+            yyjson_mut_obj_add_strcpy(doc, root, "hint", hint);
         }
     }
 
@@ -1828,41 +1871,48 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         dep_params.project_pattern = dep_like;
         dep_params.limit = 100;
         cbm_search_output_t dep_out = {0};
-        if (cbm_store_search(store, &dep_params, &dep_out) == 0 && dep_out.count > 0) {
+        if (cbm_store_search(store, &dep_params, &dep_out) == 0) {
             /* Collect unique dep project names */
-            yyjson_mut_val *dep_arr = yyjson_mut_arr(doc);
-            const char *last_dep_proj = "";
-            int dep_count = 0;
-            for (int i = 0; i < dep_out.count; i++) {
-                const char *proj = dep_out.results[i].node.project;
-                if (!proj || strcmp(proj, last_dep_proj) == 0) continue;
-                last_dep_proj = proj;
-                /* Extract package name from "myproj.dep.pandas" */
-                const char *dep_sep = strstr(proj, CBM_DEP_SEPARATOR);
-                if (!dep_sep) continue;
-                const char *pkg = dep_sep + CBM_DEP_SEPARATOR_LEN;
-                yyjson_mut_val *d = yyjson_mut_obj(doc);
-                yyjson_mut_obj_add_strcpy(doc, d, "package", pkg);
-                int dn = cbm_store_count_nodes(store, proj);
-                yyjson_mut_obj_add_int(doc, d, "nodes", dn);
-                yyjson_mut_arr_add_val(dep_arr, d);
-                dep_count++;
+            if (dep_out.count > 0) {
+                yyjson_mut_val *dep_arr = yyjson_mut_arr(doc);
+                const char *last_dep_proj = "";
+                int dep_count = 0;
+                for (int i = 0; i < dep_out.count; i++) {
+                    const char *proj = dep_out.results[i].node.project;
+                    if (!proj || strcmp(proj, last_dep_proj) == 0) continue;
+                    last_dep_proj = proj;
+                    /* Extract package name from "myproj.dep.pandas" */
+                    const char *dep_sep = strstr(proj, CBM_DEP_SEPARATOR);
+                    if (!dep_sep) continue;
+                    const char *pkg = dep_sep + CBM_DEP_SEPARATOR_LEN;
+                    yyjson_mut_val *d = yyjson_mut_obj(doc);
+                    yyjson_mut_obj_add_strcpy(doc, d, "package", pkg);
+                    int dn = cbm_store_count_nodes(store, proj);
+                    yyjson_mut_obj_add_int(doc, d, "nodes", dn);
+                    yyjson_mut_arr_add_val(dep_arr, d);
+                    dep_count++;
+                }
+                if (dep_count > 0) {
+                    yyjson_mut_obj_add_val(doc, root, "dependencies", dep_arr);
+                    yyjson_mut_obj_add_int(doc, root, "dependency_count", dep_count);
+                }
             }
-            if (dep_count > 0) {
-                yyjson_mut_obj_add_val(doc, root, "dependencies", dep_arr);
-                yyjson_mut_obj_add_int(doc, root, "dependency_count", dep_count);
-            }
+            /* Always free search results — cbm_store_search allocates even when count==0 */
             cbm_store_search_free(&dep_out);
         }
 
         /* Report detected ecosystem */
         cbm_project_t proj_info;
-        if (cbm_store_get_project(store, project, &proj_info) == 0 && proj_info.root_path) {
-            cbm_pkg_manager_t eco = cbm_detect_ecosystem(proj_info.root_path);
-            if (eco != CBM_PKG_COUNT) {
-                yyjson_mut_obj_add_str(doc, root, "detected_ecosystem",
-                                       cbm_pkg_manager_str(eco));
+        if (cbm_store_get_project(store, project, &proj_info) == 0) {
+            if (proj_info.root_path) {
+                cbm_pkg_manager_t eco = cbm_detect_ecosystem(proj_info.root_path);
+                if (eco != CBM_PKG_COUNT) {
+                    yyjson_mut_obj_add_str(doc, root, "detected_ecosystem",
+                                           cbm_pkg_manager_str(eco));
+                }
             }
+            /* Always free project fields — cbm_store_get_project heap-allocates strings */
+            cbm_project_free_fields(&proj_info);
         }
         /* Report PageRank stats */
         {
@@ -2029,10 +2079,11 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
                     const char *lbl = (const char *)sqlite3_column_text(kf_stmt, 2);
                     const char *fp = (const char *)sqlite3_column_text(kf_stmt, 3);
                     double rank = sqlite3_column_double(kf_stmt, 4);
-                    if (n) yyjson_mut_obj_add_strcpy(doc, kf, "name", n);
-                    if (qn) yyjson_mut_obj_add_strcpy(doc, kf, "qualified_name", qn);
-                    if (lbl) yyjson_mut_obj_add_strcpy(doc, kf, "label", lbl);
-                    if (fp) yyjson_mut_obj_add_strcpy(doc, kf, "file_path", fp);
+                    if (n && !ends_with_segment(qn, n))
+                        yyjson_mut_obj_add_strcpy(doc, kf, "name", n);
+                    if (qn)  yyjson_mut_obj_add_strcpy(doc, kf, "qualified_name", qn);
+                    if (lbl && lbl[0]) yyjson_mut_obj_add_strcpy(doc, kf, "label", lbl);
+                    if (fp  && fp[0])  yyjson_mut_obj_add_strcpy(doc, kf, "file_path", fp);
                     add_pagerank_val(doc, kf, rank);
                     yyjson_mut_arr_add_val(kf_arr, kf);
                 }
@@ -2167,10 +2218,10 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                 seen_out[seen_out_n++] = tr_out.visited[i].node.id;
             }
             yyjson_mut_val *item = yyjson_mut_obj(doc);
-            if (!compact || !ends_with_segment(tr_out.visited[i].node.qualified_name,
-                                               tr_out.visited[i].node.name)) {
-                yyjson_mut_obj_add_str(doc, item, "name",
-                                       tr_out.visited[i].node.name ? tr_out.visited[i].node.name : "");
+            if ((!compact || !ends_with_segment(tr_out.visited[i].node.qualified_name,
+                                                tr_out.visited[i].node.name)) &&
+                tr_out.visited[i].node.name && tr_out.visited[i].node.name[0]) {
+                yyjson_mut_obj_add_str(doc, item, "name", tr_out.visited[i].node.name);
             }
             yyjson_mut_obj_add_str(
                 doc, item, "qualified_name",
@@ -2214,10 +2265,10 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                 seen_in[seen_in_n++] = tr_in.visited[i].node.id;
             }
             yyjson_mut_val *item = yyjson_mut_obj(doc);
-            if (!compact || !ends_with_segment(tr_in.visited[i].node.qualified_name,
-                                               tr_in.visited[i].node.name)) {
-                yyjson_mut_obj_add_str(doc, item, "name",
-                                       tr_in.visited[i].node.name ? tr_in.visited[i].node.name : "");
+            if ((!compact || !ends_with_segment(tr_in.visited[i].node.qualified_name,
+                                                tr_in.visited[i].node.name)) &&
+                tr_in.visited[i].node.name && tr_in.visited[i].node.name[0]) {
+                yyjson_mut_obj_add_str(doc, item, "name", tr_in.visited[i].node.name);
             }
             yyjson_mut_obj_add_str(
                 doc, item, "qualified_name",
@@ -2240,6 +2291,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         }
         free(seen_in);
         yyjson_mut_obj_add_val(doc, root, "callers", callers);
+        yyjson_mut_obj_add_int(doc, root, "callers_total", tr_in.visited_count);
     }
 
     if (srv->session_project[0])
@@ -2472,9 +2524,12 @@ static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count
         yyjson_mut_val *s = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_str(doc, s, "qualified_name",
                                nodes[i].qualified_name ? nodes[i].qualified_name : "");
-        yyjson_mut_obj_add_str(doc, s, "name", nodes[i].name ? nodes[i].name : "");
-        yyjson_mut_obj_add_str(doc, s, "label", nodes[i].label ? nodes[i].label : "");
-        yyjson_mut_obj_add_str(doc, s, "file_path", nodes[i].file_path ? nodes[i].file_path : "");
+        if (nodes[i].name && nodes[i].name[0])
+            yyjson_mut_obj_add_str(doc, s, "name", nodes[i].name);
+        if (nodes[i].label && nodes[i].label[0])
+            yyjson_mut_obj_add_str(doc, s, "label", nodes[i].label);
+        if (nodes[i].file_path && nodes[i].file_path[0])
+            yyjson_mut_obj_add_str(doc, s, "file_path", nodes[i].file_path);
         yyjson_mut_arr_append(arr, s);
     }
     yyjson_mut_obj_add_val(doc, root, "suggestions", arr);
@@ -2491,7 +2546,7 @@ static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count
 static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
                                     const char *match_method, bool include_neighbors,
                                     cbm_node_t *alternatives, int alt_count,
-                                    int max_lines, const char *mode) {
+                                    int max_lines, const char *mode, bool compact) {
     char *root_path = get_project_root(srv, node->project);
 
     int start = node->start_line > 0 ? node->start_line : 1;
@@ -2537,10 +2592,13 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root_obj);
 
-    yyjson_mut_obj_add_str(doc, root_obj, "name", node->name ? node->name : "");
+    if (node->name && node->name[0] &&
+        (!compact || !ends_with_segment(node->qualified_name, node->name)))
+        yyjson_mut_obj_add_str(doc, root_obj, "name", node->name);
     yyjson_mut_obj_add_str(doc, root_obj, "qualified_name",
                            node->qualified_name ? node->qualified_name : "");
-    yyjson_mut_obj_add_str(doc, root_obj, "label", node->label ? node->label : "");
+    if (node->label && node->label[0])
+        yyjson_mut_obj_add_str(doc, root_obj, "label", node->label);
 
     const char *display_path = "";
     if (abs_path) {
@@ -2548,7 +2606,8 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     } else if (node->file_path) {
         display_path = node->file_path;
     }
-    yyjson_mut_obj_add_str(doc, root_obj, "file_path", display_path);
+    if (display_path[0])
+        yyjson_mut_obj_add_str(doc, root_obj, "file_path", display_path);
     yyjson_mut_obj_add_int(doc, root_obj, "start_line", start);
     yyjson_mut_obj_add_int(doc, root_obj, "end_line", end);
 
@@ -2605,13 +2664,23 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
                         continue;
                     }
                     if (yyjson_is_str(val)) {
-                        yyjson_mut_obj_add_str(doc, root_obj, k, yyjson_get_str(val));
+                        const char *sv = yyjson_get_str(val);
+                        if (sv && sv[0])
+                            yyjson_mut_obj_add_str(doc, root_obj, k, sv);
                     } else if (yyjson_is_bool(val)) {
-                        yyjson_mut_obj_add_bool(doc, root_obj, k, yyjson_get_bool(val));
+                        bool bv = yyjson_get_bool(val);
+                        /* compact: omit false booleans (false = absent/default) */
+                        if (!compact || bv)
+                            yyjson_mut_obj_add_bool(doc, root_obj, k, bv);
                     } else if (yyjson_is_int(val)) {
-                        yyjson_mut_obj_add_int(doc, root_obj, k, yyjson_get_int(val));
+                        int64_t iv = yyjson_get_int(val);
+                        /* compact: omit zero integers (0 = absent/default) */
+                        if (!compact || iv != 0)
+                            yyjson_mut_obj_add_int(doc, root_obj, k, iv);
                     } else if (yyjson_is_real(val)) {
-                        yyjson_mut_obj_add_real(doc, root_obj, k, yyjson_get_real(val));
+                        double rv = yyjson_get_real(val);
+                        if (!compact || rv != 0.0)
+                            yyjson_mut_obj_add_real(doc, root_obj, k, rv);
                     }
                 }
             }
@@ -2659,8 +2728,8 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
             yyjson_mut_obj_add_str(doc, a, "qualified_name",
                                    alternatives[i].qualified_name ? alternatives[i].qualified_name
                                                                   : "");
-            yyjson_mut_obj_add_str(doc, a, "file_path",
-                                   alternatives[i].file_path ? alternatives[i].file_path : "");
+            if (alternatives[i].file_path && alternatives[i].file_path[0])
+                yyjson_mut_obj_add_str(doc, a, "file_path", alternatives[i].file_path);
             yyjson_mut_arr_append(arr, a);
         }
         yyjson_mut_obj_add_val(doc, root_obj, "alternatives", arr);
@@ -2719,6 +2788,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
             eff_project = srv->current_project; /* fallback: last-used project */
         }
     }
+    bool compact = cbm_mcp_get_bool_arg_default(args, "compact", true);
     bool auto_resolve = cbm_mcp_get_bool_arg(args, "auto_resolve");
     bool include_neighbors = cbm_mcp_get_bool_arg(args, "include_neighbors");
     int cfg_max_lines = cbm_config_get_int(srv->config, CBM_CONFIG_SNIPPET_MAX_LINES,
@@ -2749,7 +2819,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     if (rc == CBM_STORE_OK) {
         char *result =
             build_snippet_response(srv, &node, NULL /*exact*/, include_neighbors, NULL, 0,
-                                      max_lines, snippet_mode);
+                                      max_lines, snippet_mode, compact);
         free_node_contents(&node);
         free(qn);
         free(project);
@@ -2765,7 +2835,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         copy_node(&suffix_nodes[0], &node);
         cbm_store_free_nodes(suffix_nodes, suffix_count);
         char *result = build_snippet_response(srv, &node, "suffix", include_neighbors, NULL, 0,
-                                                     max_lines, snippet_mode);
+                                                     max_lines, snippet_mode, compact);
         free_node_contents(&node);
         free(qn);
         free(project);
@@ -2782,7 +2852,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         cbm_store_free_nodes(name_nodes, name_count);
         cbm_store_free_nodes(suffix_nodes, suffix_count);
         char *result = build_snippet_response(srv, &node, "name", include_neighbors, NULL, 0,
-                                                     max_lines, snippet_mode);
+                                                     max_lines, snippet_mode, compact);
         free_node_contents(&node);
         free(qn);
         free(project);
@@ -2822,7 +2892,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
             free_node_contents(&candidates[0]);
             free(candidates);
             char *result = build_snippet_response(srv, &node, "name", include_neighbors, NULL, 0,
-                                                         max_lines, snippet_mode);
+                                                         max_lines, snippet_mode, compact);
             free_node_contents(&node);
             free(qn);
             free(project);
@@ -2874,7 +2944,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
 
             char *result =
                 build_snippet_response(srv, &node, "auto_best", include_neighbors, alts, alt_count,
-                                          max_lines, snippet_mode);
+                                          max_lines, snippet_mode, compact);
             free_node_contents(&node);
             for (int i = 0; i < alt_count; i++) {
                 free_node_contents(&alts[i]);
@@ -2931,7 +3001,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
             free_node_contents(&fuzzy[0]);
             free(fuzzy);
             char *result = build_snippet_response(srv, &node, "fuzzy", include_neighbors, NULL, 0,
-                                                         max_lines, snippet_mode);
+                                                         max_lines, snippet_mode, compact);
             free_node_contents(&node);
             free(qn);
             free(project);
@@ -3191,7 +3261,8 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
             if (nodes[i].label && strcmp(nodes[i].label, "File") != 0 &&
                 strcmp(nodes[i].label, "Folder") != 0 && strcmp(nodes[i].label, "Project") != 0) {
                 yyjson_mut_val *item = yyjson_mut_obj(doc);
-                yyjson_mut_obj_add_str(doc, item, "name", nodes[i].name ? nodes[i].name : "");
+                if (nodes[i].name && nodes[i].name[0])
+                    yyjson_mut_obj_add_str(doc, item, "name", nodes[i].name);
                 yyjson_mut_obj_add_str(doc, item, "label", nodes[i].label);
                 yyjson_mut_obj_add_str(doc, item, "file", line);
                 yyjson_mut_arr_add_val(impacted, item);
@@ -4149,10 +4220,11 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
                 const char *label = (const char *)sqlite3_column_text(stmt, 2);
                 const char *fp = (const char *)sqlite3_column_text(stmt, 3);
                 double rank = sqlite3_column_double(stmt, 4);
-                if (name) yyjson_mut_obj_add_strcpy(doc, kf, "name", name);
-                if (qn) yyjson_mut_obj_add_strcpy(doc, kf, "qualified_name", qn);
-                if (label) yyjson_mut_obj_add_strcpy(doc, kf, "label", label);
-                if (fp) yyjson_mut_obj_add_strcpy(doc, kf, "file_path", fp);
+                if (name && !ends_with_segment(qn, name))
+                    yyjson_mut_obj_add_strcpy(doc, kf, "name", name);
+                if (qn)              yyjson_mut_obj_add_strcpy(doc, kf, "qualified_name", qn);
+                if (label && label[0]) yyjson_mut_obj_add_strcpy(doc, kf, "label", label);
+                if (fp    && fp[0])    yyjson_mut_obj_add_strcpy(doc, kf, "file_path", fp);
                 add_pagerank_val(doc, kf, rank);
                 yyjson_mut_arr_add_val(kf_arr, kf);
             }

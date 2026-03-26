@@ -45,6 +45,12 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 
+/* Release all process-lifetime global state held by the pipeline subsystem
+ * (e.g., lazily-compiled regex patterns used by pass_envscan).
+ * Call once at server shutdown, after all pipelines have been freed and all
+ * background indexing threads have been joined.  Safe to call multiple times. */
+void cbm_pipeline_global_cleanup(void);
+
 /* Run the full indexing pipeline. Returns 0 on success, -1 on error.
  * Discovers files, extracts, resolves, and dumps to SQLite. */
 int cbm_pipeline_run(cbm_pipeline_t *p);

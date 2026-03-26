@@ -130,6 +130,8 @@ static int run_cli(int argc, char **argv) {
     }
 
     cbm_mcp_server_free(srv);
+    /* CLI mode: no background threads, safe to clean up global state now. */
+    cbm_pipeline_global_cleanup();
     return 0;
 }
 
@@ -305,6 +307,12 @@ int main(int argc, char **argv) {
     /* Join autoindex thread first — it may reference watcher and store.
      * cbm_mcp_server_free joins the autoindex thread internally. */
     cbm_mcp_server_free(g_server);
+
+    /* Release pipeline-level global state (compiled regex patterns etc.).
+     * Called here — after ALL server threads are joined — to avoid a race between
+     * the stdio server's autoindex thread (joined above) and the HTTP server's
+     * cleanup (which ran earlier in cbm_http_server_free). */
+    cbm_pipeline_global_cleanup();
 
     if (watcher_started) {
         cbm_watcher_stop(g_watcher);

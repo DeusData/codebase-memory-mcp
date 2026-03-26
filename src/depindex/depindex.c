@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 /* ── Package Manager Parse/String ──────────────────────────────── */
 
@@ -24,19 +25,21 @@ cbm_pkg_manager_t cbm_parse_pkg_manager(const char *s) {
         const char *name;
         cbm_pkg_manager_t val;
     } table[] = {
-        {"uv", CBM_PKG_UV},       {"pip", CBM_PKG_UV},
-        {"poetry", CBM_PKG_UV},   {"pdm", CBM_PKG_UV},
-        {"python", CBM_PKG_UV},   {"cargo", CBM_PKG_CARGO},
-        {"npm", CBM_PKG_NPM},     {"yarn", CBM_PKG_NPM},
-        {"pnpm", CBM_PKG_NPM},    {"bun", CBM_PKG_BUN},
-        {"go", CBM_PKG_GO},       {"jvm", CBM_PKG_JVM},
-        {"maven", CBM_PKG_JVM},   {"gradle", CBM_PKG_JVM},
+        {"uv", CBM_PKG_UV},         {"pip", CBM_PKG_UV},
+        {"poetry", CBM_PKG_UV},     {"pdm", CBM_PKG_UV},
+        {"python", CBM_PKG_UV},     {"cargo", CBM_PKG_CARGO},
+        {"npm", CBM_PKG_NPM},       {"yarn", CBM_PKG_NPM},
+        {"pnpm", CBM_PKG_NPM},      {"bun", CBM_PKG_BUN},
+        {"go", CBM_PKG_GO},         {"jvm", CBM_PKG_JVM},
+        {"maven", CBM_PKG_JVM},     {"gradle", CBM_PKG_JVM},
         {"dotnet", CBM_PKG_DOTNET}, {"nuget", CBM_PKG_DOTNET},
-        {"ruby", CBM_PKG_RUBY},   {"bundler", CBM_PKG_RUBY},
-        {"php", CBM_PKG_PHP},     {"composer", CBM_PKG_PHP},
-        {"swift", CBM_PKG_SWIFT}, {"dart", CBM_PKG_DART},
-        {"pub", CBM_PKG_DART},    {"mix", CBM_PKG_MIX},
-        {"hex", CBM_PKG_MIX},     {"custom", CBM_PKG_CUSTOM},
+        {"ruby", CBM_PKG_RUBY},     {"bundler", CBM_PKG_RUBY},
+        {"php", CBM_PKG_PHP},       {"composer", CBM_PKG_PHP},
+        {"swift", CBM_PKG_SWIFT},   {"dart", CBM_PKG_DART},
+        {"pub", CBM_PKG_DART},      {"mix", CBM_PKG_MIX},
+        {"hex", CBM_PKG_MIX},       {"make", CBM_PKG_MAKE},
+        {"cmake", CBM_PKG_CMAKE},   {"meson", CBM_PKG_MESON},
+        {"conan", CBM_PKG_CONAN},   {"custom", CBM_PKG_CUSTOM},
         {NULL, CBM_PKG_COUNT},
     };
     for (int i = 0; table[i].name; i++) {
@@ -46,9 +49,12 @@ cbm_pkg_manager_t cbm_parse_pkg_manager(const char *s) {
 }
 
 const char *cbm_pkg_manager_str(cbm_pkg_manager_t mgr) {
-    static const char *names[] = {"uv",    "cargo", "npm",   "bun",  "go",
-                                  "jvm",   "dotnet", "ruby", "php",  "swift",
-                                  "dart",  "mix",   "custom"};
+    static const char *names[] = {
+        "uv",    "cargo",  "npm",   "bun",   "go",
+        "jvm",   "dotnet", "ruby",  "php",   "swift",
+        "dart",  "mix",    "make",  "cmake", "meson",
+        "conan", "custom"
+    };
     return mgr < CBM_PKG_COUNT ? names[mgr] : "unknown";
 }
 
@@ -90,26 +96,102 @@ bool cbm_is_manifest_path(const char *file_path) {
 
 /* ── Ecosystem Detection ───────────────────────────────────────── */
 
+/* Scan project_root directory for a file matching any of the given basenames.
+ * Returns true if any match found — used for wildcard-like detection (e.g. *.csproj). */
+static bool dir_contains_suffix(const char *project_root, const char *suffix) {
+    cbm_dir_t *d = cbm_opendir(project_root);
+    if (!d) return false;
+    cbm_dirent_t *ent;
+    size_t slen = strlen(suffix);
+    while ((ent = cbm_readdir(d)) != NULL) {
+        size_t nlen = strlen(ent->name);
+        if (nlen >= slen && strcmp(ent->name + nlen - slen, suffix) == 0) {
+            cbm_closedir(d);
+            return true;
+        }
+    }
+    cbm_closedir(d);
+    return false;
+}
+
+/* Check for a vendored dependency directory (vendor/, vendored/, third_party/, etc.).
+ * Returns true if any conventional vendor dir exists with at least one subdirectory. */
+static bool has_vendored_deps_dir(const char *project_root) {
+    static const char *vendor_dirs[] = {
+        "vendor", "vendored", "third_party", "thirdparty",
+        "deps", "external", "ext", "contrib", "lib",
+        "_vendor", "submodules", NULL
+    };
+    char path[CBM_PATH_MAX];
+    for (int i = 0; vendor_dirs[i]; i++) {
+        snprintf(path, sizeof(path), "%s/%s", project_root, vendor_dirs[i]);
+        cbm_dir_t *d = cbm_opendir(path);
+        if (!d) continue;
+        cbm_dirent_t *ent;
+        bool has_subdir = false;
+        while ((ent = cbm_readdir(d)) != NULL) {
+            if (ent->name[0] == '.') continue;
+            char sub[CBM_PATH_MAX];
+            snprintf(sub, sizeof(sub), "%s/%s", path, ent->name);
+            struct stat st;
+            if (stat(sub, &st) == 0 && S_ISDIR(st.st_mode)) { has_subdir = true; break; }
+        }
+        cbm_closedir(d);
+        if (has_subdir) return true;
+    }
+    return false;
+}
+
 cbm_pkg_manager_t cbm_detect_ecosystem(const char *project_root) {
     if (!project_root) return CBM_PKG_COUNT;
     char path[CBM_PATH_MAX];
 
-    snprintf(path, sizeof(path), "%s/pyproject.toml", project_root);
-    if (access(path, F_OK) == 0) return CBM_PKG_UV;
-    snprintf(path, sizeof(path), "%s/setup.py", project_root);
-    if (access(path, F_OK) == 0) return CBM_PKG_UV;
-    snprintf(path, sizeof(path), "%s/Cargo.toml", project_root);
-    if (access(path, F_OK) == 0) return CBM_PKG_CARGO;
-    snprintf(path, sizeof(path), "%s/package.json", project_root);
-    if (access(path, F_OK) == 0) return CBM_PKG_NPM;
-    snprintf(path, sizeof(path), "%s/bun.lockb", project_root);
-    if (access(path, F_OK) == 0) return CBM_PKG_BUN;
-    snprintf(path, sizeof(path), "%s/go.mod", project_root);
-    if (access(path, F_OK) == 0) return CBM_PKG_GO;
-    snprintf(path, sizeof(path), "%s/pom.xml", project_root);
-    if (access(path, F_OK) == 0) return CBM_PKG_JVM;
-    snprintf(path, sizeof(path), "%s/build.gradle", project_root);
-    if (access(path, F_OK) == 0) return CBM_PKG_JVM;
+/* Macro: check file exists → return manager */
+#define CHECK(file, mgr) \
+    do { snprintf(path, sizeof(path), "%s/" file, project_root); \
+         if (access(path, F_OK) == 0) return (mgr); } while (0)
+
+    /* Interpreted-language ecosystems (highest confidence — unique lockfiles/manifests) */
+    CHECK("bun.lockb",       CBM_PKG_BUN);   /* bun before npm: more specific */
+    CHECK("pyproject.toml",  CBM_PKG_UV);
+    CHECK("setup.py",        CBM_PKG_UV);
+    CHECK("requirements.txt",CBM_PKG_UV);
+    CHECK("Pipfile",         CBM_PKG_UV);
+    CHECK("Cargo.toml",      CBM_PKG_CARGO);
+    CHECK("go.mod",          CBM_PKG_GO);
+    CHECK("pom.xml",         CBM_PKG_JVM);
+    CHECK("build.gradle",    CBM_PKG_JVM);
+    CHECK("build.gradle.kts",CBM_PKG_JVM);
+    CHECK("package.json",    CBM_PKG_NPM);
+    CHECK("Gemfile",         CBM_PKG_RUBY);
+    CHECK("composer.json",   CBM_PKG_PHP);
+    CHECK("Package.swift",   CBM_PKG_SWIFT);
+    CHECK("pubspec.yaml",    CBM_PKG_DART);
+    CHECK("mix.exs",         CBM_PKG_MIX);
+
+    /* .NET: check well-known files first, then scan for *.csproj / *.fsproj */
+    CHECK("global.json",            CBM_PKG_DOTNET);
+    CHECK("Directory.Build.props",  CBM_PKG_DOTNET);
+    CHECK("NuGet.Config",           CBM_PKG_DOTNET);
+    if (dir_contains_suffix(project_root, ".csproj") ||
+        dir_contains_suffix(project_root, ".fsproj") ||
+        dir_contains_suffix(project_root, ".vbproj")) return CBM_PKG_DOTNET;
+
+    /* C/C++ build systems */
+    CHECK("conanfile.txt",   CBM_PKG_CONAN);  /* Conan before CMake: conanfile may coexist */
+    CHECK("conanfile.py",    CBM_PKG_CONAN);
+    CHECK("vcpkg.json",      CBM_PKG_CMAKE);  /* vcpkg always used with CMake */
+    CHECK("CMakeLists.txt",  CBM_PKG_CMAKE);
+    CHECK("meson.build",     CBM_PKG_MESON);
+    CHECK("Makefile",        CBM_PKG_MAKE);
+    CHECK("GNUmakefile",     CBM_PKG_MAKE);
+    CHECK("BSDmakefile",     CBM_PKG_MAKE);
+    CHECK("Makefile.cbm",    CBM_PKG_MAKE); /* non-standard but used by codebase-memory-mcp itself */
+
+#undef CHECK
+
+    /* Generic: vendored deps in vendor/ vendored/ etc. (any language with bundled deps) */
+    if (has_vendored_deps_dir(project_root)) return CBM_PKG_CUSTOM;
 
     return CBM_PKG_COUNT;
 }
@@ -268,6 +350,42 @@ void cbm_dep_discovered_free(cbm_dep_discovered_t *deps, int count) {
     free(deps);
 }
 
+/* Discover vendored dependencies by scanning conventional vendor directories.
+ * Used for C/C++ build systems (Make, CMake, Meson, Conan) and generic CBM_PKG_CUSTOM.
+ * Each named subdirectory in vendor/ vendored/ third_party/ etc. becomes a dep entry. */
+static int discover_vendored_deps(const char *project_root, cbm_dep_discovered_t **out,
+                                  int *count, int max_results) {
+    static const char *vendor_dirs[] = {
+        "vendor", "vendored", "third_party", "thirdparty",
+        "deps", "external", "ext", "contrib", "lib",
+        "_vendor", "submodules", NULL
+    };
+
+    *out = calloc((size_t)max_results, sizeof(cbm_dep_discovered_t));
+    if (!*out) return -1;
+    *count = 0;
+
+    char dir_path[CBM_PATH_MAX];
+    for (int vi = 0; vendor_dirs[vi] && *count < max_results; vi++) {
+        snprintf(dir_path, sizeof(dir_path), "%s/%s", project_root, vendor_dirs[vi]);
+        cbm_dir_t *d = cbm_opendir(dir_path);
+        if (!d) continue;
+        cbm_dirent_t *ent;
+        while ((ent = cbm_readdir(d)) != NULL && *count < max_results) {
+            if (ent->name[0] == '.') continue;
+            char sub[CBM_PATH_MAX];
+            snprintf(sub, sizeof(sub), "%s/%s", dir_path, ent->name);
+            struct stat st;
+            if (stat(sub, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+            (*out)[*count].package = strdup(ent->name);
+            (*out)[*count].path    = strdup(sub);
+            (*count)++;
+        }
+        cbm_closedir(d);
+    }
+    return 0;
+}
+
 /* Discover installed deps by querying the graph for Variable nodes
  * in manifest files under dependency sections.
  * Runtime: O(search_limit) for query + O(N) for filtering + O(N) for resolution.
@@ -280,6 +398,14 @@ int cbm_discover_installed_deps(cbm_pkg_manager_t mgr, const char *project_root,
     *out = NULL;
     *count = 0;
     if (max_results <= 0) max_results = CBM_DEFAULT_AUTO_DEP_LIMIT;
+
+    /* C/C++ build systems and generic vendored deps: scan vendor directories directly.
+     * These don't have a registry/lockfile to parse; deps live in the source tree. */
+    if (mgr == CBM_PKG_MAKE || mgr == CBM_PKG_CMAKE ||
+        mgr == CBM_PKG_MESON || mgr == CBM_PKG_CONAN ||
+        mgr == CBM_PKG_CUSTOM) {
+        return discover_vendored_deps(project_root, out, count, max_results);
+    }
 
     cbm_search_params_t params = {0};
     params.project = project_name;

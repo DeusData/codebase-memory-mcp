@@ -118,6 +118,9 @@ endif
 LDFLAGS = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS)
 LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(LIBGIT2_LIBS) $(WIN32_LIBS)
 LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz -fsanitize=thread $(LIBGIT2_LIBS) $(WIN32_LIBS)
+# nosan: no ASan/UBSan — required for macOS 'leaks' tool (incompatible with ASan malloc replacement)
+CFLAGS_NOSAN  = $(CFLAGS_COMMON) -g -O1
+LDFLAGS_NOSAN = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS)
 
 # ── Source files ─────────────────────────────────────────────────
 
@@ -236,8 +239,9 @@ UI_SRCS = \
 # Mongoose HTTP library (vendored, compiled with relaxed warnings)
 MONGOOSE_SRC = vendored/mongoose/mongoose.c
 MONGOOSE_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -Ivendored -DMG_ENABLE_LOG=0
-MONGOOSE_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Ivendored -DMG_ENABLE_LOG=0 \
-                       $(SANITIZE)
+MONGOOSE_CFLAGS_TEST  = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Ivendored -DMG_ENABLE_LOG=0 \
+                        $(SANITIZE)
+MONGOOSE_CFLAGS_NOSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Ivendored -DMG_ENABLE_LOG=0
 
 # mimalloc (vendored, global allocator override)
 MIMALLOC_SRC = vendored/mimalloc/src/static.c
@@ -357,7 +361,7 @@ PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format install
+.PHONY: test test-foundation test-tsan test-leak test-analyze cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format install test-runner-nosan
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -430,7 +434,62 @@ $(BUILD_DIR)/prod_tre.o: $(TRE_SRC) | $(BUILD_DIR)
 	$(CC) $(TRE_CFLAGS) -O2 -c -o $@ $<
 endif
 
-OBJS_VENDORED_TEST = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $(GRAMMAR_OBJS_TEST) $(TS_RUNTIME_OBJ_TEST) $(LSP_OBJ_TEST) $(PP_OBJ_TEST) $(MONGOOSE_OBJ_TEST)
+OBJS_VENDORED_TEST  = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $(GRAMMAR_OBJS_TEST) $(TS_RUNTIME_OBJ_TEST) $(LSP_OBJ_TEST) $(PP_OBJ_TEST) $(MONGOOSE_OBJ_TEST)
+
+# ── Nosan build: ASan-free test runner for macOS heap leak detection ─────────
+#
+# WHY THIS EXISTS:
+#   'make test-leak' uses Apple's 'leaks --atExit' tool to find heap leaks.
+#   But leaks cannot inspect a process that uses a custom malloc (such as ASan).
+#   The regular test-runner is built with -fsanitize=address,undefined, which
+#   replaces malloc → leaks aborts with "unable to inspect heap ranges".
+#
+# HOW IT WORKS:
+#   We rebuild all ASan-instrumented vendored objects without -fsanitize flags
+#   into $(NOSAN_DIR), then link test-runner-nosan against them.
+#   The resulting binary runs the full test suite under Apple's heap profiler.
+#   Full leak report is written to $(LEAK_LOG) = build/c/leak-report.txt.
+#
+# HOW TO USE:
+#   make test-leak          # runs full suite + heap check, saves report to LEAK_LOG
+#   cat build/c/leak-report.txt   # review complete leak report after run
+#
+# WHICH OBJECTS NEED NOSAN VARIANTS (use SANITIZE in their *_TEST flags):
+#   sqlite3, lsp_all, preprocessor, grammar/*.c, ts_runtime, mongoose
+# WHICH ARE REUSED AS-IS (never use SANITIZE):
+#   mimalloc  (MIMALLOC_CFLAGS_TEST has no -fsanitize)
+#   tre        (only on Windows; TRE_CFLAGS has no -fsanitize)
+#
+NOSAN_DIR            = $(BUILD_DIR)/nosan
+GRAMMAR_CFLAGS_NOSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
+GRAMMAR_OBJS_NOSAN   = $(patsubst $(CBM_DIR)/%.c,$(NOSAN_DIR)/%.o,$(GRAMMAR_SRCS))
+
+$(NOSAN_DIR):
+	mkdir -p $(NOSAN_DIR)
+
+# Grammar C files (tree-sitter parsers) — recompiled without ASan/UBSan
+$(NOSAN_DIR)/%.o: $(CBM_DIR)/%.c | $(NOSAN_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_NOSAN) -c -o $@ $<
+
+$(NOSAN_DIR)/ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(NOSAN_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_NOSAN) -c -o $@ $<
+
+$(NOSAN_DIR)/lsp_all.o: $(CBM_DIR)/lsp_all.c | $(NOSAN_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_NOSAN) -c -o $@ $<
+
+$(NOSAN_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(NOSAN_DIR)
+	$(CXX) $(CXXFLAGS_COMMON) -g -O1 -w -I$(CBM_DIR)/vendored -c -o $@ $<
+
+$(NOSAN_DIR)/sqlite3.o: $(SQLITE3_SRC) | $(NOSAN_DIR)
+	$(CC) $(SQLITE3_CFLAGS_TEST) -c -o $@ $<
+
+$(NOSAN_DIR)/mongoose.o: $(MONGOOSE_SRC) | $(NOSAN_DIR)
+	$(CC) $(MONGOOSE_CFLAGS_NOSAN) -c -o $@ $<
+
+OBJS_VENDORED_NOSAN = $(MIMALLOC_OBJ_TEST) $(NOSAN_DIR)/sqlite3.o $(TRE_OBJ_TEST) \
+                      $(GRAMMAR_OBJS_NOSAN) $(NOSAN_DIR)/ts_runtime.o \
+                      $(NOSAN_DIR)/lsp_all.o $(NOSAN_DIR)/preprocessor.o \
+                      $(NOSAN_DIR)/mongoose.o
 
 $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TEST) -o $@ \
@@ -439,6 +498,13 @@ $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_
 		$(OBJS_VENDORED_TEST) \
 		$(LDFLAGS_TEST)
 
+$(BUILD_DIR)/test-runner-nosan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_NOSAN) | $(BUILD_DIR) $(NOSAN_DIR)
+	$(CC) $(CFLAGS_NOSAN) -o $@ \
+		$(ALL_TEST_SRCS) $(PROD_SRCS) \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(SQLITE_WRITER_SRC) \
+		$(OBJS_VENDORED_NOSAN) \
+		$(LDFLAGS_NOSAN)
+
 test: $(BUILD_DIR)/test-runner
 	cd $(CURDIR) && $(BUILD_DIR)/test-runner
 
@@ -446,6 +512,37 @@ test: $(BUILD_DIR)/test-runner
 
 test-tsan:
 	@echo "TSan not yet wired for full extraction tests"
+
+# ── Leak detection ───────────────────────────────────────────────
+# macOS: uses `leaks --atExit` (Apple Clang LSan not available on all versions)
+# Linux: ASAN_OPTIONS=detect_leaks=1 (GCC/Clang ASan always includes LSan)
+# Note: if false positives appear from system libraries on Linux, create lsan.supp
+#   and set LSAN_OPTIONS=suppressions=lsan.supp
+LEAK_LOG = $(BUILD_DIR)/leak-report.txt
+ifeq ($(UNAME_S),Darwin)
+# macOS: 'leaks' cannot inspect ASan-instrumented processes (ASan replaces malloc).
+# Use test-runner-nosan (no ASan/UBSan) so leaks can walk the heap.
+test-leak: $(BUILD_DIR)/test-runner-nosan
+	@echo "Running heap leak detection via 'leaks --atExit' on nosan build (macOS). May take 2-5 minutes."
+	@echo "Full report saved to $(LEAK_LOG). Exit 0 = no leaks."
+	leaks --atExit -- $(BUILD_DIR)/test-runner-nosan 2>&1 | tee $(LEAK_LOG); exit $${PIPESTATUS[0]}
+else
+test-leak: $(BUILD_DIR)/test-runner
+	@echo "Running heap leak detection via ASan/LSan (Linux). Full report saved to $(LEAK_LOG). Exit 0 = no leaks."
+	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test-runner 2>&1 | tee $(LEAK_LOG); exit $${PIPESTATUS[0]}
+endif
+
+# ── Static analysis (Clang analyzer only — GCC has no --analyze flag) ──────
+ifeq ($(IS_GCC),no)
+test-analyze: $(ALL_TEST_SRCS) $(PROD_SRCS)
+	@echo "Running Clang static analyzer..."
+	$(CC) --analyze $(CFLAGS_COMMON) \
+		$(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) 2>&1 | \
+		grep -E "warning:|error:|note:" || echo "No issues found."
+else
+test-analyze:
+	@echo "Static analysis skipped: requires Clang (not GCC). Install clang and re-run."
+endif
 
 # ── Production binary ────────────────────────────────────────────
 
