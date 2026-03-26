@@ -397,6 +397,34 @@ int cbm_gbuf_find_by_name(const cbm_gbuf_t *gb, const char *name, const cbm_gbuf
     return 0;
 }
 
+/* HC-1: DRY helper for name+label+file resolution fallback.
+ * Used by pass_calls.c (B2) and pass_normalize.c (B17).
+ * Runtime: O(1) hash + O(k) filter where k = name matches (~1-3). */
+const cbm_gbuf_node_t *cbm_gbuf_resolve_by_name_in_file(
+    const cbm_gbuf_t *gb, const char *qn, const char *file_path,
+    const char **label_filter, int label_count)
+{
+    if (!gb || !qn || !file_path) return NULL;
+    const char *dot = strrchr(qn, '.');
+    const char *short_name = dot ? dot + 1 : qn;
+    if (!short_name[0]) return NULL;
+
+    const cbm_gbuf_node_t **matches = NULL;
+    int match_count = 0;
+    cbm_gbuf_find_by_name(gb, short_name, &matches, &match_count);
+
+    for (int m = 0; m < match_count; m++) {
+        if (!matches[m]->file_path || strcmp(matches[m]->file_path, file_path) != 0)
+            continue;
+        if (!matches[m]->label) continue;
+        for (int l = 0; l < label_count; l++) {
+            if (strcmp(matches[m]->label, label_filter[l]) == 0)
+                return matches[m];
+        }
+    }
+    return NULL;
+}
+
 int cbm_gbuf_node_count(const cbm_gbuf_t *gb) {
     /* Use QN hash table count since it's authoritative (handles deletes) */
     return gb ? (int)cbm_ht_count(gb->node_by_qn) : 0;

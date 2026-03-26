@@ -635,6 +635,16 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         ctx.prescan_path_map = NULL;
     }
 
+    /* Normalization: enforce structural invariants (I2: Method→Class, I3: Field→Class).
+     * Runs after ALL files processed so all Class nodes exist in the gbuf.
+     * Runtime: O(M+F) where M=Methods, F=Fields. Memory: O(1). Latency: <10ms. */
+    if (!check_cancel(p)) {
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        cbm_pipeline_pass_normalize(p->gbuf);
+        cbm_log_info("pass.timing", "pass", "normalize", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t)));
+    }
+
     /* Direct dump: construct B-tree pages in C, fwrite() to .db file.
      * Zero SQLite library involvement — cbm_write_db() builds the binary
      * format directly from flat arrays. Atomic: writes .tmp then renames. */

@@ -21,6 +21,7 @@ typedef struct {
     const char **decorator_node_types;
     const char **env_access_functions;       // NULL-terminated (NULL if none)
     const char **env_access_member_patterns; // NULL-terminated (NULL if none)
+    const char **section_node_types;         // B11: config/markup containers (→ Section label, NOT Class)
 } CBMLangSpec;
 
 // Get the language spec for a given language. Returns NULL for unsupported.

@@ -702,16 +702,18 @@ TEST(store_node_degree) {
     cbm_store_insert_edge(s, &e4);
 
     int inA, outA, inB, outB, inC, outC;
+    /* DF-1: cbm_store_node_degree returns total degree (all edge types).
+     * A: 0 in, 3 out (2 CALLS + 1 USAGE). B: 1 in, 1 out. C: 3 in (2 CALLS + 1 USAGE), 0 out. */
     cbm_store_node_degree(s, idA, &inA, &outA);
     ASSERT_EQ(inA, 0);
-    ASSERT_EQ(outA, 2);
+    ASSERT_EQ(outA, 3);
 
     cbm_store_node_degree(s, idB, &inB, &outB);
     ASSERT_EQ(inB, 1);
     ASSERT_EQ(outB, 1);
 
     cbm_store_node_degree(s, idC, &inC, &outC);
-    ASSERT_EQ(inC, 2);
+    ASSERT_EQ(inC, 3);
     ASSERT_EQ(outC, 0);
 
     cbm_store_close(s);

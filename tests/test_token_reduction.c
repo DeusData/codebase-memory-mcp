@@ -625,10 +625,11 @@ TEST(search_graph_summary_mode) {
     free(raw);
     ASSERT_NOT_NULL(resp);
 
-    /* Should have aggregate fields, NOT individual results */
+    /* Should have aggregate fields + G1: empty results array (not suppressed) */
     ASSERT_NOT_NULL(strstr(resp, "\"total\""));
     ASSERT_NOT_NULL(strstr(resp, "\"by_label\""));
-    ASSERT_NULL(strstr(resp, "\"results\""));
+    /* G1: summary mode now includes "results":[] and "results_suppressed":true */
+    ASSERT_NOT_NULL(strstr(resp, "\"results\""));
 
     free(resp);
     cbm_mcp_server_free(srv);

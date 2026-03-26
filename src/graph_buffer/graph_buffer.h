@@ -132,6 +132,13 @@ int cbm_gbuf_edge_count_by_type(const cbm_gbuf_t *gb, const char *type);
 /* Delete all edges of a type. */
 int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type);
 
+/* HC-1: DRY helper for name+label+file resolution fallback.
+ * Extracts short name via strrchr('.'), uses nodes_by_name hash (O(1)),
+ * filters by file_path and label_filter set. Used by pass_calls and pass_normalize. */
+const cbm_gbuf_node_t *cbm_gbuf_resolve_by_name_in_file(
+    const cbm_gbuf_t *gb, const char *qn, const char *file_path,
+    const char **label_filter, int label_count);
+
 /* ── Dump to SQLite ──────────────────────────────────────────────── */
 
 /* Dump the entire buffer to a SQLite file using the direct page writer.

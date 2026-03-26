@@ -232,13 +232,22 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
             total_calls++;
 
-            /* Find enclosing function node (source of CALLS edge) */
+            /* Find enclosing function node (source of CALLS edge).
+             * Resolution chain: exact QN → name+file filter → module fallback.
+             * Each step uses O(1) hash table lookup. */
             const cbm_gbuf_node_t *source_node = NULL;
             if (call->enclosing_func_qn) {
                 source_node = cbm_gbuf_find_by_qn(ctx->gbuf, call->enclosing_func_qn);
             }
+            /* B2/B5: Name-based fallback when exact QN mismatches.
+             * Uses DRY shared helper — O(1) hash + O(k) filter. */
+            if (!source_node && call->enclosing_func_qn) {
+                static const char *callable_labels[] = {"Function", "Method"};
+                source_node = cbm_gbuf_resolve_by_name_in_file(
+                    ctx->gbuf, call->enclosing_func_qn, rel, callable_labels, 2);
+            }
             if (!source_node) {
-                /* Try module-level: file node as source */
+                /* Module-level fallback: file node as source */
                 char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
                 source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
                 free(file_qn);
