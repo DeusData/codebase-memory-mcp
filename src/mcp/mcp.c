@@ -1423,6 +1423,7 @@ static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
+    cbm_normalize_path_sep(repo_path);
 
     if (!repo_path) {
         free(mode_str);
@@ -1584,13 +1585,14 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
 #ifdef _WIN32
         if (_fullpath(real_root, root_path, sizeof(real_root)) &&
             _fullpath(real_file, abs_path, sizeof(real_file))) {
+            cbm_normalize_path_sep(real_root);
+            cbm_normalize_path_sep(real_file);
 #else
         if (realpath(root_path, real_root) && realpath(abs_path, real_file)) {
 #endif
             size_t root_len = strlen(real_root);
             if (strncmp(real_file, real_root, root_len) == 0 &&
-                (real_file[root_len] == '/' || real_file[root_len] == '\\' ||
-                 real_file[root_len] == '\0')) {
+                (real_file[root_len] == '/' || real_file[root_len] == '\0')) {
                 path_ok = true;
             }
         }

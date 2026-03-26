@@ -5,6 +5,7 @@
  * Handles Python __init__.py, JS/TS index.{js,ts}, path separators.
  */
 #include "pipeline/pipeline.h"
+#include "foundation/platform.h"
 
 #include <stddef.h> // NULL
 #include <stdio.h>
@@ -58,12 +59,8 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
     /* Work on a mutable copy for path manipulation */
     char *path = strdup(rel_path ? rel_path : "");
 
-    /* Convert backslash to forward slash */
-    for (char *p = path; *p; p++) {
-        if (*p == '\\') {
-            *p = '/';
-        }
-    }
+    /* Normalize path separators */
+    cbm_normalize_path_sep(path);
 
     /* Strip file extension */
     {
@@ -136,11 +133,7 @@ char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir) {
 
     /* Work on mutable copy */
     char *dir = strdup(rel_dir ? rel_dir : "");
-    for (char *p = dir; *p; p++) {
-        if (*p == '\\') {
-            *p = '/';
-        }
-    }
+    cbm_normalize_path_sep(dir);
 
     const char *segments[256];
     int seg_count = 0;
@@ -174,12 +167,8 @@ char *cbm_project_name_from_path(const char *abs_path) {
     char *path = strdup(abs_path);
     size_t len = strlen(path);
 
-    /* Convert \ to / */
-    for (size_t i = 0; i < len; i++) {
-        if (path[i] == '\\') {
-            path[i] = '/';
-        }
-    }
+    /* Normalize path separators */
+    cbm_normalize_path_sep(path);
 
     /* Replace / and : with - */
     for (size_t i = 0; i < len; i++) {

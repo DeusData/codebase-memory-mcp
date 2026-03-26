@@ -97,6 +97,17 @@ int64_t cbm_file_size(const char *path) {
     return (int64_t)sz.QuadPart;
 }
 
+char *cbm_normalize_path_sep(char *path) {
+    if (path) {
+        for (char *p = path; *p; p++) {
+            if (*p == '\\') {
+                *p = '/';
+            }
+        }
+    }
+    return path;
+}
+
 #else /* POSIX (macOS + Linux) */
 
 /* ── POSIX implementation ─────────────────────────────────────── */
@@ -215,20 +226,31 @@ int64_t cbm_file_size(const char *path) {
     return (int64_t)st.st_size;
 }
 
+char *cbm_normalize_path_sep(char *path) {
+    /* No-op on POSIX — paths already use forward slashes. */
+    (void)path;
+    return path;
+}
+
 #endif /* _WIN32 */
 
 /* ── Home directory (cross-platform) ──────────────────────────── */
 
 const char *cbm_get_home_dir(void) {
+    static char buf[1024];
     // NOLINTNEXTLINE(concurrency-mt-unsafe)
     const char *h = getenv("HOME");
     if (h && h[0]) {
-        return h;
+        snprintf(buf, sizeof(buf), "%s", h);
+        cbm_normalize_path_sep(buf);
+        return buf;
     }
     // NOLINTNEXTLINE(concurrency-mt-unsafe)
     h = getenv("USERPROFILE");
     if (h && h[0]) {
-        return h;
+        snprintf(buf, sizeof(buf), "%s", h);
+        cbm_normalize_path_sep(buf);
+        return buf;
     }
     return NULL;
 }

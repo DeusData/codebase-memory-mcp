@@ -81,4 +81,9 @@ bool cbm_is_dir(const char *path);
 /* Get file size. Returns -1 on error. */
 int64_t cbm_file_size(const char *path);
 
+/* Normalize path separators to forward slashes (in-place).
+ * On Windows, converts backslashes to forward slashes.
+ * On POSIX, this is a no-op. Returns the input pointer. */
+char *cbm_normalize_path_sep(char *path);
+
 #endif /* CBM_PLATFORM_H */
