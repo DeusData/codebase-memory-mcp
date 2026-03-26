@@ -1,0 +1,36 @@
+# clangd configuration for codebase-memory-mcp
+#
+# Mirrors the include paths and defines from Makefile.cbm CFLAGS_COMMON so
+# clangd can resolve all headers without needing compile_commands.json.
+# Paths are relative to the project root (where this file lives).
+#
+# Works with both clang (macOS/Linux) and gcc — clangd uses these flags
+# directly regardless of which compiler is selected for the build.
+
+CompileFlags:
+  Add:
+    - -std=c11
+    - -D_DEFAULT_SOURCE
+    # Project source headers
+    - -Isrc
+    # Vendored libraries: yyjson, xxhash, sqlite3 wrappers
+    - -Ivendored
+    - -Ivendored/sqlite3
+    - -Ivendored/mimalloc/include
+    # Internal cbm extraction layer and tree-sitter runtime
+    - -Iinternal/cbm
+    - -Iinternal/cbm/vendored/ts_runtime/include
+  # Remove flags clangd cannot handle (sanitizer, link flags)
+  Remove:
+    - -fsanitize=*
+    - -fno-omit-frame-pointer
+    - -lstdc++
+    - -lpthread
+    - -lm
+    - -lz
+
+Diagnostics:
+  # Suppress false-positive "implicit declaration" warnings caused by
+  # clangd analysing files in isolation without the full TU context.
+  Suppress:
+    - pp_file_not_found

@@ -22,6 +22,16 @@ coverage.txt
 .DS_Store
 Thumbs.db
 
+# Git worktrees (created by Claude Code subagents)
+.worktrees/
+
+# Runtime/session artifacts
+session_project
+project
+project|params.project
+conductor/
+with
+
 # Database files (local cache)
 *.db
 *.db-wal
