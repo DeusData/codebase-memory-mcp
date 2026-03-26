@@ -242,6 +242,8 @@ typedef struct {
     const char *env_var;      /* env var override name, NULL if none */
     const char *category;     /* display category for config list */
     const char *description;  /* one-line description */
+    const char *range;        /* broadest feasible range/valid values */
+    const char *guidance;     /* actionable: why change it, effect on output */
 } cbm_config_entry_t;
 
 /* All known config keys. Defined in cli.c. NULL-terminated. */

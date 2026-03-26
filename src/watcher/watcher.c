@@ -49,6 +49,8 @@ struct cbm_watcher {
     void *user_data;
     CBMHashTable *projects; /* name → project_state_t* */
     atomic_int stopped;
+    int poll_base_ms;  /* 0 = use POLL_BASE_MS default */
+    int poll_max_ms;   /* 0 = use POLL_MAX_MS default */
 };
 
 /* ── Constants ─────────────────────────────────────────────────── */
@@ -76,10 +78,12 @@ static int64_t now_ns(void) {
 
 /* ── Adaptive interval ──────────────────────────────────────────── */
 
-int cbm_watcher_poll_interval_ms(int file_count) {
-    int ms = POLL_BASE_MS + ((file_count / POLL_FILE_STEP) * 1000);
-    if (ms > POLL_MAX_MS) {
-        ms = POLL_MAX_MS;
+int cbm_watcher_poll_interval_ms(int file_count, int base_ms, int max_ms) {
+    if (base_ms <= 0) base_ms = POLL_BASE_MS;
+    if (max_ms  <= 0) max_ms  = POLL_MAX_MS;
+    int ms = base_ms + ((file_count / POLL_FILE_STEP) * 1000);
+    if (ms > max_ms) {
+        ms = max_ms;
     }
     return ms;
 }
@@ -269,7 +273,7 @@ int cbm_watcher_watch_count(const cbm_watcher_t *w) {
 /* ── Single poll cycle ──────────────────────────────────────────── */
 
 /* Init baseline for a project: check if git, get HEAD, count files */
-static void init_baseline(project_state_t *s) {
+static void init_baseline(project_state_t *s, const cbm_watcher_t *w) {
     struct stat st;
     if (stat(s->root_path, &st) != 0) {
         cbm_log_warn("watcher.root_gone", "project", s->project_name, "path", s->root_path);
@@ -284,7 +288,7 @@ static void init_baseline(project_state_t *s) {
     if (s->is_git) {
         git_head(s->root_path, s->last_head, sizeof(s->last_head));
         s->file_count = git_file_count(s->root_path);
-        s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
+        s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count, w->poll_base_ms, w->poll_max_ms);
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "git", "files",
                      s->file_count > 0 ? "yes" : "0");
     } else {
@@ -333,7 +337,7 @@ static void poll_project(const char *key, void *val, void *ud) {
 
     /* Initialize baseline on first poll */
     if (!s->baseline_done) {
-        init_baseline(s);
+        init_baseline(s, ctx->w);
         return;
     }
 
@@ -364,7 +368,7 @@ static void poll_project(const char *key, void *val, void *ud) {
             git_head(s->root_path, s->last_head, sizeof(s->last_head));
             /* Refresh file count for interval */
             s->file_count = git_file_count(s->root_path);
-            s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
+            s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count, ctx->w->poll_base_ms, ctx->w->poll_max_ms);
         } else {
             cbm_log_warn("watcher.index.err", "project", s->project_name);
         }
@@ -395,13 +399,13 @@ void cbm_watcher_stop(cbm_watcher_t *w) {
     }
 }
 
-int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms) {
+int cbm_watcher_run(cbm_watcher_t *w, int base_ms, int max_ms) {
     if (!w) {
         return -1;
     }
-    if (base_interval_ms <= 0) {
-        base_interval_ms = POLL_BASE_MS;
-    }
+    int base_interval_ms = (base_ms > 0) ? base_ms : POLL_BASE_MS;
+    w->poll_base_ms = base_interval_ms;
+    w->poll_max_ms  = (max_ms  > 0) ? max_ms  : POLL_MAX_MS;
 
     cbm_log_info("watcher.start", "interval_ms", base_interval_ms > 999 ? "multi-sec" : "fast");
 

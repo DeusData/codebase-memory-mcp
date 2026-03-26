@@ -110,11 +110,12 @@ typedef struct {
     const char *direction;        /* "inbound" / "outbound" / "any", NULL = any */
     int min_degree;               /* -1 = no filter (default), 0+ = minimum */
     int max_degree;               /* -1 = no filter (default), 0+ = maximum */
-    int limit;                    /* 0 = default (10) */
+    int limit;                    /* 0 = unlimited */
     int offset;
     bool exclude_entry_points;
     bool include_connected;
-    const char *sort_by;          /* "relevance" / "name" / "degree", NULL = relevance */
+    const char *sort_by;          /* "relevance" / "name" / "degree" / "calls" / "linkrank", NULL = relevance */
+    const char *degree_mode;      /* "weighted" / "unweighted" / "calls_only", NULL = unweighted */
     bool case_sensitive;
     const char **exclude_labels;  /* NULL-terminated array, or NULL */
     const char **exclude_paths;   /* NULL-terminated array of glob patterns to exclude by file_path */
@@ -495,7 +496,8 @@ typedef struct {
 } cbm_architecture_info_t;
 
 int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char **aspects,
-                               int aspect_count, cbm_architecture_info_t *out);
+                               int aspect_count, cbm_architecture_info_t *out,
+                               int hotspot_limit);
 void cbm_store_architecture_free(cbm_architecture_info_t *out);
 
 /* ── ADR (Architecture Decision Record) ────────────────────────── */
