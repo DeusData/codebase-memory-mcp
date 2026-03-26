@@ -26,6 +26,30 @@ Key test files:
 - `internal/pipeline/astdump_test.go` — 90+ AST structure cases
 - `internal/pipeline/pipeline_test.go` — integration tests
 
+## Run C Server Tests
+
+The MCP server core is written in C and has its own test suite under `tests/`:
+
+```bash
+make -f Makefile.cbm test          # full suite with ASan + UBSan
+make -f Makefile.cbm test-leak     # heap leak check (see below)
+make -f Makefile.cbm test-analyze  # Clang static analyzer (requires clang, not gcc)
+```
+
+**Memory leak detection:**
+
+On **macOS**, `test-leak` builds a sanitizer-free binary (`test-runner-nosan`) and runs Apple's
+`leaks --atExit` on it. ASan replaces malloc, so the standard `test-runner` cannot be inspected
+by `leaks` — the separate nosan build is required.
+
+On **Linux**, `test-leak` runs the regular `test-runner` with `ASAN_OPTIONS=detect_leaks=1` to
+activate LSan.
+
+In both cases the full report is written to `build/c/leak-report.txt`. A clean run ends with:
+```
+Process NNNNN: 0 leaks for 0 total leaked bytes.
+```
+
 ## Run Linter
 
 ```bash
