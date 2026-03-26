@@ -695,6 +695,8 @@ struct cbm_mcp_server {
     struct cbm_config *config;   /* external config ref (not owned) */
     cbm_thread_t autoindex_tid;
     bool autoindex_active; /* true if auto-index thread was started */
+    bool autoindex_failed; /* IX-1: true if last auto-index attempt failed */
+    bool just_autoindexed; /* IX-3: true after auto-index completes, reset on next search */
     bool context_injected; /* true after first _context header sent (Phase 9) */
     bool client_has_resources; /* true if client advertised resources capability */
     FILE *out_stream;          /* stdout for sending notifications (set in server_run) */
@@ -1021,28 +1023,48 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
                     srv->session_root, NULL, CBM_MODE_FULL);                                      \
                 if (_p) {                                                                         \
                     cbm_log_info("autoindex.sync", "project", srv->session_project);               \
-                    cbm_pipeline_run(_p);                                                         \
+                    int _rc = cbm_pipeline_run(_p);                                               \
                     cbm_pipeline_free(_p);                                                        \
-                    /* Invalidate + reopen store */                                                \
-                    if (srv->owns_store && srv->store) {                                          \
-                        cbm_store_close(srv->store);                                              \
-                        srv->store = NULL;                                                        \
-                    }                                                                             \
-                    free(srv->current_project);                                                   \
-                    srv->current_project = NULL;                                                  \
-                    store = resolve_store(srv, srv->session_project);                              \
-                    /* Also compute PageRank + auto-index deps */                                 \
-                    if (store) {                                                                  \
-                        cbm_dep_auto_index(srv->session_project, srv->session_root,               \
-                                           store, CBM_DEFAULT_AUTO_DEP_LIMIT);                    \
-                        cbm_pagerank_compute_with_config(store, srv->session_project,              \
-                                                        srv->config);                             \
+                    if (_rc != 0) {                                                               \
+                        /* IX-1: Auto-index FAILED */                                             \
+                        srv->autoindex_failed = true;                                             \
+                        cbm_log_error("autoindex.failed", "project",                              \
+                                      srv->session_project);                                      \
+                    } else {                                                                      \
+                        srv->autoindex_failed = false;                                            \
+                        srv->just_autoindexed = true;                                             \
+                        /* Invalidate + reopen store */                                           \
+                        if (srv->owns_store && srv->store) {                                      \
+                            cbm_store_close(srv->store);                                          \
+                            srv->store = NULL;                                                    \
+                        }                                                                         \
+                        free(srv->current_project);                                               \
+                        srv->current_project = NULL;                                              \
+                        store = resolve_store(srv, srv->session_project);                          \
+                        if (store) {                                                              \
+                            cbm_dep_auto_index(srv->session_project, srv->session_root,           \
+                                               store, CBM_DEFAULT_AUTO_DEP_LIMIT);                \
+                            cbm_pagerank_compute_with_config(store, srv->session_project,          \
+                                                            srv->config);                         \
+                        }                                                                         \
                     }                                                                             \
                     cbm_mem_collect();                                                             \
+                } else {                                                                          \
+                    srv->autoindex_failed = true;                                                  \
+                    cbm_log_error("autoindex.create_failed", "root",                              \
+                                  srv->session_root);                                              \
                 }                                                                                 \
             }                                                                                     \
         }                                                                                         \
         if (!(store)) {                                                                           \
+            if (srv->autoindex_failed) {                                                          \
+                free(project);                                                                    \
+                return cbm_mcp_text_result(                                                       \
+                    "{\"error\":\"auto-indexing failed for this project\","                        \
+                    "\"detail\":\"The pipeline failed. Check file permissions and project size.\"," \
+                    "\"fix\":\"Run index_repository explicitly with repo_path for detailed errors.\"}", \
+                    true);                                                                        \
+            }                                                                                     \
             free(project);                                                                        \
             return cbm_mcp_text_result(                                                           \
                 "{\"error\":\"no project loaded\","                                               \
@@ -1151,6 +1173,11 @@ typedef struct {
     char *value;       /* expanded project string (heap) or NULL. Caller must free. */
     match_mode_t mode; /* how to match in SQL */
 } project_expand_t;
+
+/* Forward declaration — defined below, needed by handle_get_graph_schema */
+static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
+                                           char *raw_project,
+                                           project_expand_t *out_pe);
 
 /* Expand project param shorthands (self/dep/glob/prefix).
  * Takes ownership of raw — caller must NOT free raw after this call.
@@ -1420,8 +1447,10 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
 }
 
 static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
-    char *project = cbm_mcp_get_string_arg(args, "project");
-    cbm_store_t *store = resolve_store(srv, project);
+    char *raw_project = cbm_mcp_get_string_arg(args, "project");
+    project_expand_t pe = {0};
+    cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
+    char *project = pe.value;
     REQUIRE_STORE(store, project);
 
     cbm_schema_info_t schema = {0};
@@ -1917,8 +1946,10 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
 }
 
 static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
-    char *project = cbm_mcp_get_string_arg(args, "project");
-    cbm_store_t *store = resolve_store(srv, project);
+    char *raw_project = cbm_mcp_get_string_arg(args, "project");
+    project_expand_t pe = {0};
+    cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
+    char *project = pe.value;
     REQUIRE_STORE(store, project);
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -2077,8 +2108,10 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
 }
 
 static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
-    char *project = cbm_mcp_get_string_arg(args, "project");
-    cbm_store_t *store = resolve_store(srv, project);
+    char *raw_project = cbm_mcp_get_string_arg(args, "project");
+    project_expand_t pe = {0};
+    cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
+    char *project = pe.value;
     REQUIRE_STORE(store, project);
 
     cbm_schema_info_t schema = {0};
@@ -2855,8 +2888,10 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
 
 static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     char *qn = cbm_mcp_get_string_arg(args, "qualified_name");
-    char *project = cbm_mcp_get_string_arg(args, "project");
-    cbm_store_t *store = resolve_store(srv, project);
+    char *raw_project = cbm_mcp_get_string_arg(args, "project");
+    project_expand_t pe = {0};
+    cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
+    char *project = pe.value;
     /* When no project param given, try to parse the project prefix from the
      * qualified name by checking for a matching .db file.  This is Option C:
      * the QN is self-describing, so we can always open the right store even on
@@ -3503,10 +3538,10 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
 /* ── index_dependencies ───────────────────────────────────────── */
 
 static char *handle_index_dependencies(cbm_mcp_server_t *srv, const char *args) {
-    char *project = cbm_mcp_get_string_arg(args, "project");
+    char *raw_project = cbm_mcp_get_string_arg(args, "project");
     char *pkg_mgr_str = cbm_mcp_get_string_arg(args, "package_manager");
 
-    if (!project) {
+    if (!raw_project) {
         free(pkg_mgr_str);
         return cbm_mcp_text_result("{\"error\":\"project is required\"}", true);
     }
@@ -3519,7 +3554,7 @@ static char *handle_index_dependencies(cbm_mcp_server_t *srv, const char *args) 
 
     if (!packages_val || !yyjson_is_arr(packages_val) || yyjson_arr_size(packages_val) == 0) {
         yyjson_doc_free(doc_args);
-        free(project);
+        free(raw_project);
         free(pkg_mgr_str);
         return cbm_mcp_text_result(
             "{\"error\":\"packages[] is required\"}", true);
@@ -3529,12 +3564,16 @@ static char *handle_index_dependencies(cbm_mcp_server_t *srv, const char *args) 
     bool has_mgr = pkg_mgr_str != NULL;
     if (!has_paths && !has_mgr) {
         yyjson_doc_free(doc_args);
-        free(project);
+        free(raw_project);
         free(pkg_mgr_str);
         return cbm_mcp_text_result(
             "{\"error\":\"Either source_paths[] or package_manager is required\"}", true);
     }
 
+    /* DRY: expand "self"/"dep"/path shortcuts */
+    project_expand_t pe = {0};
+    (void)resolve_project_store(srv, raw_project, &pe);
+    char *project = pe.value ? pe.value : raw_project;
     cbm_store_t *store = resolve_store(srv, project);
     if (!store) {
         yyjson_doc_free(doc_args);
@@ -4342,14 +4381,36 @@ static void build_resource_status(yyjson_mut_doc *doc, yyjson_mut_val *root,
 
     if (proj) yyjson_mut_obj_add_str(doc, root, "project", proj);
 
+    /* IX-2: Check for indexing-in-progress BEFORE checking store contents */
+    if (srv->autoindex_active) {
+        yyjson_mut_obj_add_str(doc, root, "status", "indexing");
+        yyjson_mut_obj_add_str(doc, root, "hint",
+            "Indexing is in progress. Results will be available when status changes to 'ready'. "
+            "This typically takes 5-30 seconds depending on project size.");
+        return;
+    }
+
     if (!store) {
         yyjson_mut_obj_add_str(doc, root, "status", "not_indexed");
+        /* IX-1: Report if auto-index was attempted and failed */
+        if (srv->autoindex_failed) {
+            yyjson_mut_obj_add_str(doc, root, "detail",
+                "Auto-indexing was attempted but failed. Run index_repository explicitly for detailed errors.");
+        } else {
+            yyjson_mut_obj_add_str(doc, root, "action_required",
+                "Call index_repository with repo_path to index this project.");
+        }
         return;
     }
 
     int nodes = cbm_store_count_nodes(store, proj);
     int edges = cbm_store_count_edges(store, proj);
     yyjson_mut_obj_add_str(doc, root, "status", nodes > 0 ? "ready" : "empty");
+    if (nodes == 0 && !srv->autoindex_failed) {
+        yyjson_mut_obj_add_str(doc, root, "hint",
+            "Project store exists but is empty. This may happen if the project has no recognized source files, "
+            "or if indexing hasn't completed yet. Try index_repository for explicit indexing.");
+    }
     yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
     yyjson_mut_obj_add_int(doc, root, "edges", edges);
 
