@@ -45,8 +45,16 @@ case "${1:-full}" in
         $COMPOSE run --rm smoke
         ;;
     windows)
-        echo "=== Windows: cross-compile (mingw-w64) ==="
-        $COMPOSE run --rm build-windows
+        echo "=== Windows: cross-compile + smoke (Wine) ==="
+        $COMPOSE run --rm smoke-windows
+        ;;
+    smoke-windows)
+        echo "=== Windows: smoke test (cross-compile + Wine) ==="
+        $COMPOSE run --rm smoke-windows
+        ;;
+    soak-windows)
+        echo "=== Windows: soak test (cross-compile + Wine, 10 min) ==="
+        $COMPOSE run --rm soak-windows
         ;;
     amd64)
         echo "=== Linux amd64: test + build ==="
@@ -62,8 +70,8 @@ case "${1:-full}" in
         $COMPOSE run --rm test-amd64
         $COMPOSE run --rm build-amd64
         $COMPOSE run --rm smoke-amd64
-        echo "=== Windows: cross-compile ==="
-        $COMPOSE run --rm build-windows
+        echo "=== Windows: cross-compile + smoke (Wine) ==="
+        $COMPOSE run --rm smoke-windows
         echo "=== All platforms passed ==="
         ;;
     lint)

@@ -2934,7 +2934,11 @@ int cbm_cmd_uninstall(int argc, char **argv) {
 
     /* Step 3: Remove binary */
     char bin_path[1024];
+#ifdef _WIN32
+    snprintf(bin_path, sizeof(bin_path), "%s/.local/bin/codebase-memory-mcp.exe", home);
+#else
     snprintf(bin_path, sizeof(bin_path), "%s/.local/bin/codebase-memory-mcp", home);
+#endif
     struct stat st;
     if (stat(bin_path, &st) == 0) {
         if (!dry_run) {

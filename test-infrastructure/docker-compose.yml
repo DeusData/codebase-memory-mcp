@@ -99,6 +99,36 @@ services:
         scripts/build.sh CC=gcc CXX=g++ &&
         scripts/smoke-test.sh ./build/c/codebase-memory-mcp
 
+  # ── Windows smoke (cross-compile + Wine) ──────────────────
+  smoke-windows:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile.mingw
+    platform: linux/amd64
+    volumes:
+      - ..:/src
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        scripts/build.sh CC=x86_64-w64-mingw32-clang CXX=x86_64-w64-mingw32-clang++ &&
+        mv build/c/codebase-memory-mcp build/c/codebase-memory-mcp.exe 2>/dev/null || true &&
+        WINEDEBUG=-all scripts/smoke-test.sh ./build/c/codebase-memory-mcp.exe
+
+  # ── Windows soak (cross-compile + Wine) ───────────────────
+  soak-windows:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile.mingw
+    platform: linux/amd64
+    volumes:
+      - ..:/src
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        scripts/build.sh CC=x86_64-w64-mingw32-clang CXX=x86_64-w64-mingw32-clang++ &&
+        mv build/c/codebase-memory-mcp build/c/codebase-memory-mcp.exe 2>/dev/null || true &&
+        CBM_DIAGNOSTICS=1 WINEDEBUG=-all scripts/soak-test.sh ./build/c/codebase-memory-mcp.exe 10
+
   # ── Lint ────────────────────────────────────────────────────
   lint:
     build:
