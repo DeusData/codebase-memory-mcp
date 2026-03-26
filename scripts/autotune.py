@@ -7,9 +7,10 @@ Usage:
                                [--repo-url NAME=URL ...]
 
 Sends JSON-RPC directly to the binary via stdin/stdout (no MCP client library).
-For each experiment: resets config to defaults, applies overrides, queries
-codebase://architecture for each repo, scores results against the expected top-10
-ground truth, and reports the best-scoring configuration.
+For each experiment: resets config to defaults, applies overrides, deletes each
+repo's SQLite DB, then queries codebase://architecture (which triggers a full
+reindex including PageRank with the new weights). Scores results against the
+expected top-10 ground truth and reports the best-scoring configuration.
 
 Config changes are GLOBAL (stored in the binary's SQLite config DB). The script
 resets all tunable keys to defaults on exit — including after errors — via atexit.
@@ -22,7 +23,7 @@ Repo discovery order (for each repo):
 
 Examples:
   python3 scripts/autotune.py
-  python3 scripts/autotune.py --timeout 120   # for first-time indexing
+  python3 scripts/autotune.py --timeout 300    # override per-repo timeout
   python3 scripts/autotune.py --clone --repo-url rtk=https://github.com/user/rtk
   python3 scripts/autotune.py --binary /usr/local/bin/codebase-memory-mcp
 """
@@ -31,6 +32,8 @@ from __future__ import annotations
 import argparse
 import atexit
 import json
+import os
+import re
 import subprocess
 import sys
 import time
@@ -155,6 +158,10 @@ EXPERIMENTS: list[Experiment] = [
                {"key_functions_count": "25",
                 "key_functions_exclude": "graph-ui/**,tools/**,scripts/**"},
                "Filter TypeScript UI and tooling — exposes C core functions"),
+    Experiment("exclude_ui_tests",
+               {"key_functions_count": "25",
+                "key_functions_exclude": "graph-ui/**,tools/**,scripts/**,tests/**"},
+               "Filter UI, tooling, and test files — exposes C core + Python/Rust prod"),
     Experiment("calls_boost",
                {"key_functions_count": "25",
                 "edge_weight_calls": "2.0",
@@ -170,12 +177,12 @@ EXPERIMENTS: list[Experiment] = [
                 "edge_weight_tests": "0.01",
                 "edge_weight_usage": "0.3"},
                "Suppress test-file influence on production rankings"),
-    Experiment("calls_boost_excl",
+    Experiment("calls_boost_excl_tests",
                {"key_functions_count": "25",
                 "edge_weight_calls": "2.0",
                 "edge_weight_usage": "0.3",
-                "key_functions_exclude": "graph-ui/**,tools/**,scripts/**"},
-               "Combined: boost calls + exclude UI"),
+                "key_functions_exclude": "graph-ui/**,tools/**,scripts/**,tests/**"},
+               "Combined: boost calls + exclude UI and tests"),
     Experiment("more_iters",
                {"key_functions_count": "25",
                 "pagerank_max_iter": "100"},
@@ -235,15 +242,32 @@ def _jsonrpc(req_id: int, method: str, params: dict[str, Any] | None = None) -> 
     return json.dumps(msg)
 
 
-def _send_batch(binary: str, messages: list[str], timeout: int) -> dict[int, Any]:
-    """Send newline-delimited JSON-RPC to the binary via stdin, parse stdout responses."""
+def _send_batch(binary: str, messages: list[str], timeout: int,
+                env: dict[str, str] | None = None,
+                cwd: str | None = None) -> dict[int, Any]:
+    """Open a stdio MCP session with the binary, send messages, return responses.
+
+    Messages are processed sequentially by the binary's message loop. Synchronous
+    tool calls (like index_repository) block until complete before the binary reads
+    the next message — so ordering guarantees correct sequencing of index→query.
+
+    env: extra environment variables to merge (e.g. CBM_TOOL_MODE=classic).
+    cwd: working directory for the binary subprocess. CRITICAL: the binary uses
+         getcwd() (not rootUri) to set session_root and session_project, so this
+         must be set to repo_root for architecture queries to return the right data.
+    """
     payload = "\n".join(messages) + "\n"
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
     try:
         proc = subprocess.run(
             [binary],
             input=payload.encode(),
             capture_output=True,
             timeout=timeout,
+            env=merged_env,
+            cwd=cwd,
         )
     except subprocess.TimeoutExpired:
         print(f"  [warn] binary timed out after {timeout}s — "
@@ -267,38 +291,49 @@ def _send_batch(binary: str, messages: list[str], timeout: int) -> dict[int, Any
     return responses
 
 
-def query_architecture(binary: str, repo_root: str, timeout: int,
-                       retries: int = 2) -> list[dict[str, Any]]:
-    """Query codebase://architecture, return key_functions list.
+def index_and_query_architecture(binary: str, repo_root: str,
+                                 timeout: int) -> list[dict[str, Any]]:
+    """Open one MCP session, synchronously index the repo, then read architecture.
 
-    Retries on empty results: the binary may still be indexing on first call.
+    Uses CBM_TOOL_MODE=classic so index_repository is available. Messages are:
+      1. initialize  (sets session root)
+      2. tools/call index_repository  (synchronous pipeline + PageRank; blocks)
+      3. resources/read codebase://architecture  (reads fresh ranked data)
+
+    The binary processes these in order — index completes before architecture read.
     """
     init = _jsonrpc(1, "initialize", {
         "protocolVersion": "2024-11-05",
-        "capabilities": {"resources": {}},
+        "capabilities": {"tools": {}, "resources": {}},
         "clientInfo": {"name": "autotune", "version": "1.0"},
         "rootUri": f"file://{repo_root}",
     })
-    read = _jsonrpc(2, "resources/read", {"uri": "codebase://architecture"})
+    index_call = _jsonrpc(2, "tools/call", {
+        "name": "index_repository",
+        "arguments": {"repo_path": repo_root},
+    })
+    arch_read = _jsonrpc(3, "resources/read", {"uri": "codebase://architecture"})
 
-    for attempt in range(retries + 1):
-        responses = _send_batch(binary, [init, read], timeout)
-        r2 = responses.get(2, {})
-        contents = r2.get("result", {}).get("contents", [])
-        if contents:
-            try:
-                data = json.loads(contents[0].get("text", "{}"))
-                kf = data.get("key_functions", [])
-                if kf:
-                    return kf
-            except (json.JSONDecodeError, KeyError):
-                pass
-        if attempt < retries:
-            wait = 3 * (attempt + 1)
-            print(f"  [retry {attempt + 1}/{retries}] empty results — "
-                  f"waiting {wait}s (repo may still be indexing)...")
-            time.sleep(wait)
+    responses = _send_batch(
+        binary,
+        [init, index_call, arch_read],
+        timeout,
+        env={"CBM_TOOL_MODE": "classic"},
+        cwd=repo_root,
+    )
 
+    r2 = responses.get(2, {})
+    if r2.get("error"):
+        print(f"  [warn] index_repository error: {r2['error']}", file=sys.stderr)
+
+    r3 = responses.get(3, {})
+    contents = r3.get("result", {}).get("contents", [])
+    if contents:
+        try:
+            data = json.loads(contents[0].get("text", "{}"))
+            return data.get("key_functions", [])
+        except (json.JSONDecodeError, KeyError):
+            pass
     return []
 
 
@@ -322,6 +357,30 @@ def reset_to_defaults(binary: str) -> None:
     """
     for k, v in DEFAULTS.items():
         set_config(binary, k, v)
+
+
+def project_name_from_path(repo_path: Path) -> str:
+    """Mirror cbm_project_name_from_path() from src/pipeline/fqn.c.
+
+    Converts an absolute path to the DB filename stem used by the binary:
+      /Users/bob/myrepo  →  Users-bob-myrepo
+    """
+    s = str(repo_path.resolve())
+    s = s.replace("\\", "/")
+    s = re.sub(r"[/:]", "-", s)
+    s = re.sub(r"-{2,}", "-", s)
+    s = s.strip("-")
+    return s or "root"
+
+
+def delete_project_db(repo_path: Path) -> None:
+    """Delete the binary's SQLite DB for a repo so index_repository does a full reindex."""
+    name = project_name_from_path(repo_path)
+    db = Path.home() / ".cache" / "codebase-memory-mcp" / f"{name}.db"
+    if db.exists():
+        db.unlink()
+        print(f"  [delete db] {db.name}")
+
 
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
@@ -349,7 +408,7 @@ def main() -> None:
         epilog=(
             "Examples:\n"
             "  python3 scripts/autotune.py\n"
-            "  python3 scripts/autotune.py --timeout 120   # for first-time indexing\n"
+            "  python3 scripts/autotune.py --timeout 300    # override per-repo timeout\n"
             "  python3 scripts/autotune.py --clone --repo-url rtk=https://github.com/user/rtk\n"
             "  python3 scripts/autotune.py --binary /usr/local/bin/codebase-memory-mcp\n"
             "\n"
@@ -367,8 +426,20 @@ def main() -> None:
     parser.add_argument(
         "--timeout",
         type=int,
-        default=60,
-        help="Seconds before JSON-RPC times out (default: 60; raise for first-time indexing)",
+        default=1200,
+        help="Seconds before JSON-RPC times out per repo per experiment (default: 1200)",
+    )
+    parser.add_argument(
+        "--top-matches",
+        type=int,
+        default=10,
+        help="How many top key_functions to display per repo per experiment (default: 10)",
+    )
+    parser.add_argument(
+        "--key-count",
+        type=int,
+        default=25,
+        help="key_functions_count to request (default: 25; overrides experiment baseline)",
     )
     parser.add_argument(
         "--clone",
@@ -417,11 +488,17 @@ def main() -> None:
     # Always reset config on exit — even after Ctrl-C or crash
     atexit.register(reset_to_defaults, binary)
 
+    # Apply --key-count as a floor on all experiments' key_functions_count
+    key_count_str = str(args.key_count)
+    for exp in EXPERIMENTS:
+        exp.overrides.setdefault("key_functions_count", key_count_str)
+
     total_expected = sum(len(repo.expected) for repo, _ in resolved)
     print(f"Binary:    {binary}")
     print(f"Repos:     {[(repo.name, str(path)) for repo, path in resolved]}")
-    print(f"Timeout:   {args.timeout}s per query")
-    print(f"Max score: {total_expected} ({len(resolved)} repos x ~10 each)\n")
+    print(f"Timeout:   {args.timeout}s per repo per experiment")
+    print(f"key_count: {args.key_count}  top_matches: {args.top_matches}")
+    print(f"Max score: {total_expected} ({len(resolved)} repos × {len(REPOS[0].expected)} each)\n")
 
     best_experiment: Experiment | None = None
     best_score = -1
@@ -437,20 +514,39 @@ def main() -> None:
             print(f"  config set {k} = {v!r}")
 
         total_score = 0
+        exp_repo_results: list[dict[str, Any]] = []
         for repo, repo_path in resolved:
-            kf = query_architecture(binary, str(repo_path), args.timeout)
+            # One MCP session: initialize → tools/call index_repository (synchronous,
+            # forces full pipeline+PageRank with current edge weights) → read architecture.
+            # Do NOT delete the DB first — an empty DB triggers the background autoindex
+            # thread which races with the explicit index_repository tool call.
+            print(f"  [index+query] {repo.name}...", end=" ", flush=True)
+            kf = index_and_query_architecture(binary, str(repo_path), args.timeout)
             if not kf:
-                print(f"  [warn] {repo.name}: no key_functions returned — "
-                      "ensure repo is indexed: codebase-memory-mcp index <path>")
+                print(f"no key_functions returned")
+                exp_repo_results.append({"repo": repo.name, "score": 0,
+                                          "top_n": [], "matched": []})
                 continue
             score = score_result(kf, repo.expected)
             total_score += score
-            top5 = [kf_item.get("name") or kf_item.get("qualified_name", "?")
-                    for kf_item in kf[:5]]
-            print(f"  {repo.name}: {score}/{len(repo.expected)}  top-5: {top5}")
+            n = args.top_matches
+            def _fname(item: dict[str, Any]) -> str:
+                name = item.get("name", "")
+                if name:
+                    return name
+                qn = item.get("qualified_name", "")
+                return qn.split(".")[-1] if qn else "?"
+            top_n = [_fname(item) for item in kf[:n]]
+            # matched = expected names that appear anywhere in the full key_functions list
+            all_names = {_fname(item).lower() for item in kf}
+            matched = [e for e in repo.expected if e.lower() in all_names]
+            print(f"{score}/{len(repo.expected)}  matched={matched or 'none'}")
+            print(f"    top-{n}: {top_n}")
+            exp_repo_results.append({"repo": repo.name, "score": score,
+                                      "top_n": top_n, "matched": matched})
 
         print(f"  TOTAL: {total_score}/{total_expected}")
-        all_results.append((exp.label, total_score))
+        all_results.append((exp.label, total_score, exp_repo_results, exp.overrides))
         if total_score > best_score:
             best_score = total_score
             best_experiment = exp
@@ -469,9 +565,40 @@ def main() -> None:
         print(f"  codebase-memory-mcp config set {k} {v!r}")
 
     print("\nAll results (best first):")
-    for label, score in sorted(all_results, key=lambda x: x[1], reverse=True):
-        marker = " <" if label == best_experiment.label else ""
-        print(f"  {score:3d}/{total_expected}  {label}{marker}")
+    sorted_results = sorted(all_results, key=lambda x: x[1], reverse=True)
+    for label, score, _repo_results, _overrides in sorted_results:
+        marker = " ◀ BEST" if label == best_experiment.label else ""
+        bar = "█" * score + "░" * (total_expected - score)
+        print(f"  {score:3d}/{total_expected}  [{bar}]  {label}{marker}")
+
+    # ── Save run record to JSON ────────────────────────────────────────────────
+    results_file = _SCRIPT_DIR / "autotune_results.json"
+    run_record: dict[str, Any] = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "binary": binary,
+        "repos": [repo.name for repo, _ in resolved],
+        "total_expected": total_expected,
+        "best": {"label": best_experiment.label, "score": best_score,
+                 "overrides": best_experiment.overrides},
+        "experiments": [
+            {
+                "label": label,
+                "score": score,
+                "overrides": overrides,
+                "repos": repo_results,
+            }
+            for label, score, repo_results, overrides in all_results
+        ],
+    }
+    existing: list[dict[str, Any]] = []
+    if results_file.exists():
+        try:
+            existing = json.loads(results_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            existing = []
+    existing.append(run_record)
+    results_file.write_text(json.dumps(existing, indent=2))
+    print(f"\nRun saved → {results_file}")
 
 
 if __name__ == "__main__":
