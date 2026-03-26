@@ -425,10 +425,12 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
     {"search_code_graph",
      "Search the code knowledge graph for functions, classes, routes, variables, "
      "and relationships. Use INSTEAD OF grep/glob for code definitions and structure. "
-     "Supports Cypher queries via 'cypher' param for complex patterns. "
+     "Projects are auto-indexed on first query — no manual setup needed. "
+     "Supports Cypher queries via 'cypher' param for complex multi-hop patterns "
+     "(when cypher is set, label/name_pattern/sort_by filters are ignored — use WHERE instead). "
      "Results sorted by PageRank (structural importance) by default. "
-     "Read codebase://schema for available node labels (Function, Class, etc.) and edge types "
-     "(CALLS, IMPORTS, etc.) before writing Cypher queries. "
+     "mode=summary returns aggregate counts (results_suppressed=true). "
+     "Read codebase://schema for node labels, edge types, and Cypher examples. "
      "Read codebase://architecture for key functions and graph overview.",
      "{\"type\":\"object\",\"properties\":{"
      "\"project\":{\"type\":\"string\",\"description\":\"Project name, path, or filter. "
@@ -454,7 +456,9 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
     {"trace_call_path",
      "Trace function call paths — who calls a function and what it calls. "
      "Use for impact analysis, understanding callers, and finding dependencies. "
-     "Results sorted by PageRank within each hop level. "
+     "Auto-indexes the project on first use if not already indexed. "
+     "Results sorted by PageRank within each hop level. depth < 1 clamped to 1. "
+     "direction must be inbound, outbound, or both (invalid values return error). "
      "Read codebase://architecture for key functions to start tracing from.",
      "{\"type\":\"object\",\"properties\":{"
      "\"function_name\":{\"type\":\"string\",\"description\":\"Function name to trace\"},"
@@ -472,6 +476,7 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "Get source code for a function, class, or symbol by qualified name. "
      "Use INSTEAD OF reading entire files. Use mode=signature for API lookup (99%% savings). "
      "Use mode=head_tail for large functions (preserves return code). "
+     "Module nodes return metadata only — use auto_resolve=true for file source. "
      "Get qualified_name values from search_code_graph results.",
      "{\"type\":\"object\",\"properties\":{"
      "\"qualified_name\":{\"type\":\"string\",\"description\":\"Qualified name from search results\"},"
@@ -744,11 +749,12 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
             "get_graph_schema, get_architecture, search_code, list_projects, "
             "delete_project, index_status, detect_changes, manage_adr, "
             "ingest_traces, index_dependencies. "
+            "Projects auto-index on first query (no manual setup needed). "
             "Enable all: set env CBM_TOOL_MODE=classic or config set tool_mode classic. "
             "Enable one: config set tool_<name> true (e.g. tool_index_repository true). "
-            "Context resources: read codebase://schema for node labels and edge types, "
-            "codebase://architecture for key functions and graph overview, "
-            "codebase://status for index status and dependency info.");
+            "Resources: codebase://schema (labels, edge types, Cypher examples), "
+            "codebase://architecture (key functions, graph overview), "
+            "codebase://status (index state: ready/indexing/not_indexed/empty).");
         /* inputSchema MUST be a JSON object, not a string — Claude Code rejects
          * the entire tools/list if any tool has a string inputSchema. */
         yyjson_mut_val *hint_schema = yyjson_mut_obj(doc);
@@ -4197,10 +4203,10 @@ static char *handle_resources_list(cbm_mcp_server_t *srv) {
     yyjson_mut_obj_add_str(doc, r3, "uri", "codebase://status");
     yyjson_mut_obj_add_str(doc, r3, "name", "Index Status");
     yyjson_mut_obj_add_str(doc, r3, "description",
-        "Project name, indexing status (ready/empty/not_indexed), node/edge counts, "
-        "PageRank computation stats, detected package ecosystem, and indexed "
-        "dependencies list. Read this to check if the project is indexed and "
-        "what dependencies are available.");
+        "Project name, indexing status (ready/empty/not_indexed/indexing), "
+        "node/edge counts, PageRank stats, detected ecosystem, dependency list. "
+        "Status 'indexing' = in progress, 'not_indexed' includes action_required hint. "
+        "Auto-index failure reports detail and fix suggestion.");
     yyjson_mut_obj_add_str(doc, r3, "mimeType", "application/json");
     yyjson_mut_arr_add_val(arr, r3);
 
