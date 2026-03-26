@@ -886,7 +886,9 @@ TEST(snippet_exact_qn) {
         call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
                           "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"HandleRequest\""));
+    /* compact: name omitted when it equals last segment of qualified_name */
+    ASSERT_NULL(strstr(resp, "\"name\":\"HandleRequest\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\""));
     ASSERT_NOT_NULL(strstr(resp, "\"source\""));
     /* Exact match should NOT have match_method */
     ASSERT_NULL(strstr(resp, "\"match_method\""));
@@ -896,6 +898,27 @@ TEST(snippet_exact_qn) {
     /* Caller/callee counts: 0 callers, 2 callees */
     ASSERT_NOT_NULL(strstr(resp, "\"callers\":0"));
     ASSERT_NOT_NULL(strstr(resp, "\"callees\":2"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* ── TestSnippet_CompactFalse: name present when compact=false ── */
+
+TEST(snippet_compact_false_name_present) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* compact=false: name must be present even when it equals last segment of QN */
+    char *resp = call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                                   "\"project\":\"test-project\","
+                                   "\"compact\":false}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"HandleRequest\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\""));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -913,7 +936,9 @@ TEST(snippet_qn_suffix) {
     char *resp = call_snippet(srv, "{\"qualified_name\":\"main.HandleRequest\","
                                    "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"HandleRequest\""));
+    /* compact: name omitted when it equals last segment of qualified_name */
+    ASSERT_NULL(strstr(resp, "\"name\":\"HandleRequest\""));
+    ASSERT_NOT_NULL(strstr(resp, "HandleRequest")); /* present in qualified_name */
     ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"suffix\""));
     ASSERT_NOT_NULL(strstr(resp, "\"source\""));
     free(resp);
@@ -934,7 +959,9 @@ TEST(snippet_unique_short_name) {
     char *resp = call_snippet(srv, "{\"qualified_name\":\"ProcessOrder\","
                                    "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"ProcessOrder\""));
+    /* compact: name omitted when it equals last segment of qualified_name */
+    ASSERT_NULL(strstr(resp, "\"name\":\"ProcessOrder\""));
+    ASSERT_NOT_NULL(strstr(resp, "ProcessOrder")); /* present in qualified_name */
     ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"suffix\""));
     ASSERT_NOT_NULL(strstr(resp, "\"source\""));
     free(resp);
@@ -955,7 +982,9 @@ TEST(snippet_name_tier) {
     char *resp = call_snippet(srv, "{\"qualified_name\":\"HandleRequest\","
                                    "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"HandleRequest\""));
+    /* compact: name omitted when it equals last segment of qualified_name */
+    ASSERT_NULL(strstr(resp, "\"name\":\"HandleRequest\""));
+    ASSERT_NOT_NULL(strstr(resp, "HandleRequest")); /* present in qualified_name */
     ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"suffix\""));
     free(resp);
 
@@ -1247,6 +1276,7 @@ SUITE(mcp) {
 
     /* Snippet resolution (port of snippet_test.go) */
     RUN_TEST(snippet_exact_qn);
+    RUN_TEST(snippet_compact_false_name_present);
     RUN_TEST(snippet_qn_suffix);
     RUN_TEST(snippet_unique_short_name);
     RUN_TEST(snippet_name_tier);

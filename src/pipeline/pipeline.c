@@ -110,6 +110,14 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     free(p);
 }
 
+void cbm_pipeline_global_cleanup(void) {
+    /* Release lazily-compiled regex patterns held by pass_envscan.
+     * These are compiled on first call to cbm_scan_project_env_urls() and
+     * cached for the process lifetime.  Call this once at server shutdown,
+     * after all pipelines and background indexing threads have finished. */
+    cbm_envscan_free_patterns();
+}
+
 void cbm_pipeline_cancel(cbm_pipeline_t *p) {
     if (p) {
         atomic_store(&p->cancelled, 1);

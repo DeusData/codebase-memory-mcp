@@ -20,6 +20,9 @@
 
 /* ── Helpers (reuse patterns from test_mcp.c) ────────────────── */
 
+/* Forward declaration — definition is in the SEARCH PARAMETERIZATION section */
+static cbm_mcp_server_t *setup_sp_server(void);
+
 static char *extract_text_content_tr(const char *mcp_result) {
     if (!mcp_result)
         return NULL;
@@ -556,6 +559,56 @@ TEST(trace_compact_omits_redundant_name) {
     PASS();
 }
 
+TEST(search_graph_compact_defaults_to_true) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    /* No compact param -> default is true -> name omitted when name == last qn segment.
+     * All sp-test nodes satisfy this (e.g. name="main", qn="sp-test.main.main"). */
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"sp-test\","
+                                    "\"include_dependencies\":false}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *results = yyjson_obj_get(yyjson_doc_get_root(doc), "results");
+    ASSERT_NOT_NULL(results);
+    ASSERT_GT((int)yyjson_arr_size(results), 0);
+    yyjson_val *first = yyjson_arr_get(results, 0);
+    /* compact=true default: name == last qn segment -> name field OMITTED */
+    ASSERT_NULL(yyjson_obj_get(first, "name"));
+    ASSERT_NOT_NULL(yyjson_obj_get(first, "qualified_name"));
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(search_graph_compact_false_includes_name) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"sp-test\","
+                                    "\"include_dependencies\":false,"
+                                    "\"compact\":false}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *results = yyjson_obj_get(yyjson_doc_get_root(doc), "results");
+    ASSERT_NOT_NULL(results);
+    ASSERT_GT((int)yyjson_arr_size(results), 0);
+    yyjson_val *first = yyjson_arr_get(results, 0);
+    /* compact=false: name field present even when name matches qn suffix */
+    ASSERT_NOT_NULL(yyjson_obj_get(first, "name"));
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  1.4 SUMMARY MODE
  * ══════════════════════════════════════════════════════════════════ */
@@ -780,6 +833,151 @@ TEST(response_includes_meta_fields) {
     free(raw);
     cbm_mcp_server_free(srv);
     cleanup_limit_test_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  1.9 FIELD OMISSION (empty label / file_path not emitted)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(search_graph_omits_empty_label_and_file_path) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_mcp_server_set_project(srv, "empty-test");
+    cbm_store_upsert_project(st, "empty-test", "/tmp");
+
+    /* Node with empty label and empty file_path */
+    cbm_node_t n = {0};
+    n.project = "empty-test";
+    n.label = "";
+    n.name = "anon_func";
+    n.qualified_name = "empty-test.mod.anon_func";
+    n.file_path = "";
+    n.properties_json = "{}";
+    cbm_store_upsert_node(st, &n);
+
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"empty-test\",\"compact\":false}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *results = yyjson_obj_get(yyjson_doc_get_root(doc), "results");
+    ASSERT_NOT_NULL(results);
+    ASSERT_EQ((int)yyjson_arr_size(results), 1);
+    yyjson_val *item = yyjson_arr_get(results, 0);
+    /* Empty label and file_path must be omitted, not emitted as "" */
+    ASSERT_NULL(yyjson_obj_get(item, "label"));
+    ASSERT_NULL(yyjson_obj_get(item, "file_path"));
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(search_graph_includes_nonempty_label_and_file_path) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_mcp_server_set_project(srv, "nonempty-test");
+    cbm_store_upsert_project(st, "nonempty-test", "/tmp");
+
+    cbm_node_t n = {0};
+    n.project = "nonempty-test";
+    n.label = "Function";
+    n.name = "do_work";
+    n.qualified_name = "nonempty-test.worker.do_work";
+    n.file_path = "worker.py";
+    n.properties_json = "{}";
+    cbm_store_upsert_node(st, &n);
+
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"nonempty-test\",\"compact\":false}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *results = yyjson_obj_get(yyjson_doc_get_root(doc), "results");
+    ASSERT_NOT_NULL(results);
+    ASSERT_EQ((int)yyjson_arr_size(results), 1);
+    yyjson_val *item = yyjson_arr_get(results, 0);
+    /* Non-empty label and file_path must be present with correct values */
+    ASSERT_NOT_NULL(yyjson_obj_get(item, "label"));
+    ASSERT_NOT_NULL(yyjson_obj_get(item, "file_path"));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(item, "label")), "Function");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(item, "file_path")), "worker.py");
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* TDD: Zero in_degree/out_degree fields omitted when no edges.
+ * RED until Change 3 (zero degree omission) is implemented in mcp.c. */
+TEST(search_graph_omits_zero_degrees) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_mcp_server_set_project(srv, "degree-test");
+    cbm_store_upsert_project(st, "degree-test", "/tmp");
+
+    /* Node with no edges -> in_degree=0, out_degree=0 */
+    cbm_node_t n = {0};
+    n.project = "degree-test";
+    n.label = "Function";
+    n.name = "isolated";
+    n.qualified_name = "degree-test.mod.isolated";
+    n.file_path = "mod.py";
+    n.properties_json = "{}";
+    cbm_store_upsert_node(st, &n);
+
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"degree-test\",\"compact\":false}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *results = yyjson_obj_get(yyjson_doc_get_root(doc), "results");
+    ASSERT_NOT_NULL(results);
+    ASSERT_EQ((int)yyjson_arr_size(results), 1);
+    yyjson_val *item = yyjson_arr_get(results, 0);
+    /* Zero in_degree and out_degree must be omitted, not emitted as 0 */
+    ASSERT_NULL(yyjson_obj_get(item, "in_degree"));
+    ASSERT_NULL(yyjson_obj_get(item, "out_degree"));
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Non-zero degrees must still be present (regression guard for Change 3). */
+TEST(search_graph_includes_nonzero_degrees) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    /* process_request has in_degree=2 (CALLS from main, HTTP_CALLS from fetch_data) */
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"sp-test\","
+                                    "\"qn_pattern\":\".*process_request.*\","
+                                    "\"include_dependencies\":false,"
+                                    "\"compact\":false}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *results = yyjson_obj_get(yyjson_doc_get_root(doc), "results");
+    ASSERT_NOT_NULL(results);
+    ASSERT_EQ((int)yyjson_arr_size(results), 1);
+    yyjson_val *item = yyjson_arr_get(results, 0);
+    /* process_request has non-zero in_degree -> must be present */
+    ASSERT_NOT_NULL(yyjson_obj_get(item, "in_degree"));
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
     PASS();
 }
 
@@ -1180,6 +1378,285 @@ TEST(trace_call_path_default_edge_types_calls_only) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  2.0 JSON OUTPUT MINIFICATION
+ *  All tool responses must be single-line minified JSON.
+ *  yy_doc_to_str uses YYJSON_WRITE_ALLOW_INVALID_UNICODE (no PRETTY).
+ *  Tests verify this contract holds across the full API surface.
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(all_mcp_responses_are_minified_json) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+
+    const char *tools[] = {"search_graph", "trace_call_path", "get_architecture", "query_graph"};
+    const char *args[]  = {
+        "{\"project\":\"sp-test\",\"limit\":3}",
+        "{\"function_name\":\"main\",\"project\":\"sp-test\"}",
+        "{\"project\":\"sp-test\"}",
+        "{\"query\":\"MATCH (n) RETURN n.name LIMIT 3\",\"project\":\"sp-test\"}"
+    };
+    for (int t = 0; t < 4; t++) {
+        char *raw  = cbm_mcp_handle_tool(srv, tools[t], args[t]);
+        char *text = extract_text_content_tr(raw);
+        free(raw);
+        ASSERT_NOT_NULL(text);
+        /* Pretty-printed JSON always contains newlines — must be absent */
+        ASSERT_NULL(strstr(text, "\n"));
+        free(text);
+    }
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  2.1 trace_call_path FIELD OMISSION (TDD)
+ *  Candidates block uses empty-string fallback for file_path (mcp.c:2116).
+ *  RED until candidates block is fixed like search_graph.
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Empty file_path in a candidate must be omitted, not emitted as "". */
+TEST(trace_call_path_candidates_omits_empty_file_path) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+
+    /* Second "main" node with empty file_path forces ambiguity */
+    cbm_node_t dup = {0};
+    dup.project = "sp-test";
+    dup.label = "Function";
+    dup.name = "main";
+    dup.qualified_name = "sp-test.alt.main";
+    dup.file_path = "";
+    dup.properties_json = "{}";
+    cbm_store_upsert_node(st, &dup);
+
+    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+                                    "{\"function_name\":\"main\","
+                                    "\"project\":\"sp-test\"}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"candidates\""));
+
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *candidates = yyjson_obj_get(yyjson_doc_get_root(doc), "candidates");
+    ASSERT_NOT_NULL(candidates);
+
+    bool found = false;
+    for (size_t i = 0; i < yyjson_arr_size(candidates); i++) {
+        yyjson_val *c = yyjson_arr_get(candidates, i);
+        yyjson_val *qn = yyjson_obj_get(c, "qualified_name");
+        if (qn && strcmp(yyjson_get_str(qn), "sp-test.alt.main") == 0) {
+            /* Candidate with empty file_path must NOT have the key */
+            ASSERT_NULL(yyjson_obj_get(c, "file_path"));
+            found = true;
+        }
+    }
+    ASSERT_TRUE(found);
+
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Non-empty file_path in candidates must still be present (regression guard). */
+TEST(trace_call_path_candidates_includes_nonempty_file_path) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+
+    cbm_node_t dup = {0};
+    dup.project = "sp-test";
+    dup.label = "Function";
+    dup.name = "main";
+    dup.qualified_name = "sp-test.alt.main";
+    dup.file_path = "alt.py";
+    dup.properties_json = "{}";
+    cbm_store_upsert_node(st, &dup);
+
+    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+                                    "{\"function_name\":\"main\","
+                                    "\"project\":\"sp-test\"}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *candidates = yyjson_obj_get(yyjson_doc_get_root(doc), "candidates");
+    ASSERT_NOT_NULL(candidates);
+
+    /* All candidates here have non-empty file_path -> key must be present */
+    for (size_t i = 0; i < yyjson_arr_size(candidates); i++) {
+        yyjson_val *c = yyjson_arr_get(candidates, i);
+        ASSERT_NOT_NULL(yyjson_obj_get(c, "file_path"));
+    }
+
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  2.2 get_architecture COMPACT COVERAGE
+ *  key_functions already uses null-guards (if (n), if (lbl), if (fp)).
+ *  Tests verify the contract and that output remains minified.
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(get_architecture_output_is_minified_and_no_empty_fields) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_mcp_server_set_project(srv, "arch-test");
+    cbm_store_upsert_project(st, "arch-test", "/tmp");
+
+    cbm_node_t n = {0};
+    n.project = "arch-test";
+    n.label = "Function";
+    n.name = "entry_point";
+    n.qualified_name = "arch-test.main.entry_point";
+    n.file_path = "main.py";
+    n.properties_json = "{}";
+    cbm_store_upsert_node(st, &n);
+
+    char *raw = cbm_mcp_handle_tool(srv, "get_architecture",
+                                    "{\"project\":\"arch-test\"}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    /* Must be minified */
+    ASSERT_NULL(strstr(resp, "\n"));
+
+    /* key_functions block must never emit empty-string values */
+    ASSERT_NULL(strstr(resp, "\"name\":\"\""));
+    ASSERT_NULL(strstr(resp, "\"label\":\"\""));
+    ASSERT_NULL(strstr(resp, "\"file_path\":\"\""));
+    ASSERT_NULL(strstr(resp, "\"qualified_name\":\"\""));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  2.3 trace_call_path callers_total field
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(trace_call_path_response_includes_callers_total) {
+    /* TDD RED: callers_total never emitted (Bug C) — becomes GREEN after fix */
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    /* direction=both triggers do_inbound=true; main has no callers but
+     * callers_total must still appear in the response */
+    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+                                    "{\"function_name\":\"main\","
+                                    "\"project\":\"sp-test\","
+                                    "\"direction\":\"both\"}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    /* callers_total must be present even when callers array is empty */
+    ASSERT_NOT_NULL(strstr(resp, "\"callers_total\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  2.4 get_code_snippet empty field omission
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(get_code_snippet_omits_empty_name_label) {
+    /* TDD RED: name/label emitted as "" when NULL/empty (Bug B) */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_mcp_server_set_project(srv, "snip-test");
+    cbm_store_upsert_project(st, "snip-test", "/tmp");
+
+    /* Node with empty name and empty label — exercises the "" guard */
+    cbm_node_t n = {0};
+    n.project = "snip-test";
+    n.name = "";          /* empty — should NOT appear as "name":"" */
+    n.label = "";         /* empty — should NOT appear as "label":"" */
+    n.qualified_name = "snip-test.mod.empty_node";
+    n.file_path = "";     /* empty — should NOT appear as "file_path":"" */
+    n.start_line = 1;
+    n.end_line = 2;
+    n.properties_json = "{}";
+    cbm_store_upsert_node(st, &n);
+
+    char *raw = cbm_mcp_handle_tool(srv, "get_code_snippet",
+                                    "{\"qualified_name\":\"snip-test.mod.empty_node\","
+                                    "\"project\":\"snip-test\"}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"name\":\"\""));
+    ASSERT_NULL(strstr(resp, "\"label\":\"\""));
+    ASSERT_NULL(strstr(resp, "\"file_path\":\"\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  2.5 get_architecture compact applied to key_functions
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(get_architecture_compact_omits_redundant_name_in_key_functions) {
+    /* TDD RED: key_functions always emits name (Bug A) — becomes GREEN after fix.
+     * All sp-test nodes have name == last segment of qualified_name, so
+     * compact should omit every name field in key_functions. */
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "get_architecture",
+                                    "{\"project\":\"sp-test\"}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    /* Parse key_functions and assert no entry has a "name" key that equals
+     * the last segment of its "qualified_name" */
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *kfs = yyjson_obj_get(root, "key_functions");
+    if (kfs && yyjson_is_arr(kfs)) {
+        size_t idx, max;
+        yyjson_val *kf;
+        yyjson_arr_foreach(kfs, idx, max, kf) {
+            yyjson_val *name_val = yyjson_obj_get(kf, "name");
+            yyjson_val *qn_val   = yyjson_obj_get(kf, "qualified_name");
+            if (name_val && qn_val) {
+                const char *nm = yyjson_get_str(name_val);
+                const char *qn = yyjson_get_str(qn_val);
+                /* If name is present, it must NOT equal the last segment of qn */
+                if (nm && qn) {
+                    size_t qn_len = strlen(qn);
+                    size_t nm_len = strlen(nm);
+                    bool is_suffix = (nm_len < qn_len) &&
+                                     (qn[qn_len - nm_len - 1] == '.' ||
+                                      qn[qn_len - nm_len - 1] == ':' ||
+                                      qn[qn_len - nm_len - 1] == '/') &&
+                                     strcmp(qn + qn_len - nm_len, nm) == 0;
+                    ASSERT_FALSE(is_suffix); /* compact must have omitted this */
+                }
+            }
+        }
+    }
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -1202,6 +1679,8 @@ SUITE(token_reduction) {
 
     /* 1.3 Compact Mode */
     RUN_TEST(search_graph_compact_omits_redundant_name);
+    RUN_TEST(search_graph_compact_defaults_to_true);
+    RUN_TEST(search_graph_compact_false_includes_name);
     RUN_TEST(trace_compact_omits_redundant_name);
 
     /* 1.4 Summary Mode */
@@ -1220,6 +1699,22 @@ SUITE(token_reduction) {
     /* 1.8 Token Metadata */
     RUN_TEST(response_includes_meta_fields);
 
+    /* 1.9 Field Omission */
+    RUN_TEST(search_graph_omits_empty_label_and_file_path);
+    RUN_TEST(search_graph_includes_nonempty_label_and_file_path);
+    RUN_TEST(search_graph_omits_zero_degrees);
+    RUN_TEST(search_graph_includes_nonzero_degrees);
+
+    /* 2.0 JSON Output Minification */
+    RUN_TEST(all_mcp_responses_are_minified_json);
+
+    /* 2.1 trace_call_path Field Omission */
+    RUN_TEST(trace_call_path_candidates_omits_empty_file_path);
+    RUN_TEST(trace_call_path_candidates_includes_nonempty_file_path);
+
+    /* 2.2 get_architecture Compact Coverage */
+    RUN_TEST(get_architecture_output_is_minified_and_no_empty_fields);
+
     /* Search Parameterization Accuracy */
     RUN_TEST(search_graph_qn_pattern_filters_results);
     RUN_TEST(search_graph_qn_pattern_no_match_returns_empty);
@@ -1233,4 +1728,13 @@ SUITE(token_reduction) {
     RUN_TEST(trace_call_path_compact_false_includes_name);
     RUN_TEST(trace_call_path_edge_types_http_calls_traverses_http_edges);
     RUN_TEST(trace_call_path_default_edge_types_calls_only);
+
+    /* 2.3 callers_total field completeness */
+    RUN_TEST(trace_call_path_response_includes_callers_total);
+
+    /* 2.4 get_code_snippet empty field omission */
+    RUN_TEST(get_code_snippet_omits_empty_name_label);
+
+    /* 2.5 get_architecture compact key_functions */
+    RUN_TEST(get_architecture_compact_omits_redundant_name_in_key_functions);
 }

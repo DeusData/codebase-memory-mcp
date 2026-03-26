@@ -30,10 +30,17 @@ typedef struct cbm_store cbm_store_t;
  * These are the basenames of files that declare project dependencies.
  * When adding a new manifest file, add it here — all consumers pick it up. */
 static const char *CBM_MANIFEST_FILES[] = {
+    /* Interpreted languages */
     "Cargo.toml", "pyproject.toml", "package.json", "go.mod",
-    "requirements.txt", "Gemfile", "build.gradle", "pom.xml",
-    "composer.json", "pubspec.yaml", "mix.exs", "Package.swift",
-    "setup.py", "Pipfile", NULL
+    "requirements.txt", "Gemfile", "build.gradle", "build.gradle.kts",
+    "pom.xml", "composer.json", "pubspec.yaml", "mix.exs", "Package.swift",
+    "setup.py", "Pipfile", "bun.lockb",
+    /* .NET */
+    "global.json", "Directory.Build.props", "NuGet.Config",
+    /* C/C++ build systems */
+    "Makefile", "GNUmakefile", "Makefile.cbm", "CMakeLists.txt", "meson.build",
+    "conanfile.txt", "conanfile.py", "vcpkg.json",
+    NULL
 };
 
 /* Default limits (convention: -1=unlimited, 0=disabled, >0=limit) */
@@ -48,20 +55,24 @@ static const char *CBM_MANIFEST_FILES[] = {
 /* ── Package Manager Enum ──────────────────────────────────────── */
 
 typedef enum {
-    CBM_PKG_UV = 0,
-    CBM_PKG_CARGO,
-    CBM_PKG_NPM,
-    CBM_PKG_BUN,
-    CBM_PKG_GO,
-    CBM_PKG_JVM,
-    CBM_PKG_DOTNET,
-    CBM_PKG_RUBY,
-    CBM_PKG_PHP,
-    CBM_PKG_SWIFT,
-    CBM_PKG_DART,
-    CBM_PKG_MIX,
-    CBM_PKG_CUSTOM,
-    CBM_PKG_COUNT /* sentinel / invalid */
+    CBM_PKG_UV = 0,  /* Python: uv/pip/poetry/pdm (pyproject.toml, setup.py, requirements.txt, Pipfile) */
+    CBM_PKG_CARGO,   /* Rust: cargo (Cargo.toml) */
+    CBM_PKG_NPM,     /* Node.js: npm/yarn/pnpm (package.json) */
+    CBM_PKG_BUN,     /* Bun: (bun.lockb) */
+    CBM_PKG_GO,      /* Go modules: (go.mod) */
+    CBM_PKG_JVM,     /* JVM: Maven/Gradle (pom.xml, build.gradle, build.gradle.kts) */
+    CBM_PKG_DOTNET,  /* .NET: NuGet (*.csproj, *.fsproj, global.json, Directory.Build.props) */
+    CBM_PKG_RUBY,    /* Ruby: Bundler (Gemfile) */
+    CBM_PKG_PHP,     /* PHP: Composer (composer.json) */
+    CBM_PKG_SWIFT,   /* Swift: SPM (Package.swift) */
+    CBM_PKG_DART,    /* Dart: pub (pubspec.yaml) */
+    CBM_PKG_MIX,     /* Elixir: Mix (mix.exs) */
+    CBM_PKG_MAKE,    /* C/C++: Make (Makefile, GNUmakefile) */
+    CBM_PKG_CMAKE,   /* C/C++: CMake (CMakeLists.txt, vcpkg.json) */
+    CBM_PKG_MESON,   /* C/C++: Meson (meson.build) */
+    CBM_PKG_CONAN,   /* C/C++: Conan (conanfile.txt, conanfile.py) */
+    CBM_PKG_CUSTOM,  /* Generic: vendored deps (vendor/, vendored/, third_party/, deps/, etc.) */
+    CBM_PKG_COUNT    /* sentinel / invalid */
 } cbm_pkg_manager_t;
 
 /* Parse "uv"/"cargo"/"npm"/"bun"/etc → enum. Returns CBM_PKG_COUNT if unknown. */

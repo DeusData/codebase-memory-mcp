@@ -195,10 +195,20 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     sqlite3_finalize(stmt);
     stmt = NULL;
 
-    if (N == 0) { free(node_ids); return 0; }
+    if (N == 0) {
+        free(node_ids);
+        free(node_labels); /* no strdup'd elements since N==0 */
+        return 0;
+    }
 
     /* Build id->index map */
-    if (id_map_init(&map, N) != 0) { free(node_ids); return -1; }
+    if (id_map_init(&map, N) != 0) {
+        free(node_ids);
+        /* free all strdup'd labels accumulated before the failure */
+        for (int i = 0; i < N; i++) free(node_labels[i]);
+        free(node_labels);
+        return -1;
+    }
     for (int i = 0; i < N; i++) id_map_put(&map, node_ids[i], i);
 
     /* ── Step 2: Load weighted edges ──────────────────────── */
