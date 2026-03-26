@@ -127,16 +127,18 @@ REPOS: list[Repo] = [
 
 
 # ── Config defaults ───────────────────────────────────────────────────────────
+# Best values from autotune run 2026-03-26: calls_boost_excl_tests scored 6/30
+# (boosting call edges and excluding test/UI/tooling paths surfaces prod functions).
 # Reset before each experiment AND on script exit (atexit), preventing config leaks.
 
 DEFAULTS: dict[str, str] = {
-    "edge_weight_calls":     "1.0",
-    "edge_weight_usage":     "0.7",
+    "edge_weight_calls":     "2.0",   # boosted: call edges are strongest signal
+    "edge_weight_usage":     "0.3",   # dampened: type-reference edges add noise
     "edge_weight_defines":   "0.1",
     "edge_weight_tests":     "0.05",
     "edge_weight_imports":   "0.3",
     "key_functions_count":   "25",
-    "key_functions_exclude": "",
+    "key_functions_exclude": "graph-ui/**,tools/**,scripts/**,tests/**",
     "pagerank_max_iter":     "20",
 }
 
