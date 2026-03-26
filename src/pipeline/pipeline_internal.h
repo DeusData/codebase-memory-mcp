@@ -387,6 +387,9 @@ int cbm_pipeline_pass_decorator_tags(cbm_gbuf_t *gbuf, const char *project);
  * Uses prescan cache when available, falls back to disk reads. */
 int cbm_pipeline_pass_configlink(cbm_pipeline_ctx_t *ctx);
 
+/* Pre-dump pass: structural invariant enforcement (Method→Class, Field→Class edges). */
+void cbm_pipeline_pass_normalize(cbm_gbuf_t *gb);
+
 /* ── Env URL scanner (pass_envscan.c) ────────────────────────────── */
 
 typedef struct {

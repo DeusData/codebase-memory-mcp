@@ -721,326 +721,326 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
     // CBM_LANG_GO
     {CBM_LANG_GO, go_func_types, go_class_types, go_field_types, go_module_types, go_call_types,
      go_import_types, go_import_types, go_branch_types, go_var_types, go_assign_types, empty_types,
-     NULL, empty_types, go_env_funcs, NULL},
+     NULL, empty_types, go_env_funcs, NULL, NULL},
 
     // CBM_LANG_PYTHON
     {CBM_LANG_PYTHON, py_func_types, py_class_types, empty_types, py_module_types, py_call_types,
      py_import_types, py_import_from_types, py_branch_types, py_var_types, py_var_types,
-     py_throw_types, NULL, py_decorator_types, py_env_funcs, py_env_members},
+     py_throw_types, NULL, py_decorator_types, py_env_funcs, py_env_members, NULL},
 
     // CBM_LANG_JAVASCRIPT
     {CBM_LANG_JAVASCRIPT, js_func_types, js_class_types, empty_types, js_module_types,
      js_call_types, js_import_types, js_import_types, js_branch_types, js_var_types,
      (const char *[]){"assignment_expression", "augmented_assignment_expression", NULL},
-     js_throw_types, NULL, empty_types, NULL, js_env_members},
+     js_throw_types, NULL, empty_types, NULL, js_env_members, NULL},
 
     // CBM_LANG_TYPESCRIPT
     {CBM_LANG_TYPESCRIPT, ts_func_types, ts_class_types, empty_types, js_module_types,
      js_call_types, js_import_types, js_import_types, js_branch_types, js_var_types,
      (const char *[]){"assignment_expression", "augmented_assignment_expression", NULL},
-     js_throw_types, NULL, ts_decorator_types, NULL, ts_env_members},
+     js_throw_types, NULL, ts_decorator_types, NULL, ts_env_members, NULL},
 
     // CBM_LANG_TSX
     {CBM_LANG_TSX, ts_func_types, ts_class_types, empty_types, js_module_types, js_call_types,
      js_import_types, js_import_types, js_branch_types, js_var_types,
      (const char *[]){"assignment_expression", "augmented_assignment_expression", NULL},
-     js_throw_types, NULL, ts_decorator_types, NULL, ts_env_members},
+     js_throw_types, NULL, ts_decorator_types, NULL, ts_env_members, NULL},
 
     // CBM_LANG_RUST
     {CBM_LANG_RUST, rust_func_types, rust_class_types, rust_field_types, rust_module_types,
      rust_call_types, rust_import_types, rust_import_from_types, rust_branch_types, rust_var_types,
-     rust_assign_types, empty_types, NULL, rust_decorator_types, rust_env_funcs, NULL},
+     rust_assign_types, empty_types, NULL, rust_decorator_types, rust_env_funcs, NULL, NULL},
 
     // CBM_LANG_JAVA
     {CBM_LANG_JAVA, java_func_types, java_class_types, java_field_types, java_module_types,
      java_call_types, java_import_types, java_import_types, java_branch_types, java_var_types,
-     java_assign_types, java_throw_types, "throws", java_decorator_types, java_env_funcs, NULL},
+     java_assign_types, java_throw_types, "throws", java_decorator_types, java_env_funcs, NULL, NULL},
 
     // CBM_LANG_CPP
     {CBM_LANG_CPP, cpp_func_types, cpp_class_types, cpp_field_types, cpp_module_types,
      cpp_call_types, cpp_import_types, cpp_import_types, cpp_branch_types, cpp_var_types,
-     cpp_assign_types, cpp_throw_types, NULL, empty_types, cpp_env_funcs, NULL},
+     cpp_assign_types, cpp_throw_types, NULL, empty_types, cpp_env_funcs, NULL, NULL},
 
     // CBM_LANG_CSHARP
     {CBM_LANG_CSHARP, cs_func_types, cs_class_types, empty_types, cs_module_types, cs_call_types,
      cs_import_types, cs_import_types, cs_branch_types, cs_var_types, cs_assign_types,
-     cs_throw_types, NULL, cs_decorator_types, cs_env_funcs, NULL},
+     cs_throw_types, NULL, cs_decorator_types, cs_env_funcs, NULL, NULL},
 
     // CBM_LANG_PHP
     {CBM_LANG_PHP, php_func_types, php_class_types, empty_types, php_module_types, php_call_types,
      empty_types, empty_types, php_branch_types, php_var_types, php_assign_types, php_throw_types,
-     NULL, php_decorator_types, php_env_funcs, NULL},
+     NULL, php_decorator_types, php_env_funcs, NULL, NULL},
 
     // CBM_LANG_LUA
     {CBM_LANG_LUA, lua_func_types, empty_types, empty_types, lua_module_types, lua_call_types,
      lua_import_types, empty_types, lua_branch_types, lua_var_types, lua_assign_types, empty_types,
-     NULL, empty_types, lua_env_funcs, NULL},
+     NULL, empty_types, lua_env_funcs, NULL, NULL},
 
     // CBM_LANG_SCALA
     {CBM_LANG_SCALA, scala_func_types, scala_class_types, empty_types, scala_module_types,
      scala_call_types, scala_import_types, scala_import_types, scala_branch_types, scala_var_types,
-     scala_assign_types, scala_throw_types, NULL, empty_types, scala_env_funcs, NULL},
+     scala_assign_types, scala_throw_types, NULL, empty_types, scala_env_funcs, NULL, NULL},
 
     // CBM_LANG_KOTLIN
     {CBM_LANG_KOTLIN, kotlin_func_types, kotlin_class_types, empty_types, kotlin_module_types,
      kotlin_call_types, kotlin_import_types, kotlin_import_types, kotlin_branch_types,
      kotlin_var_types, kotlin_assign_types, kotlin_throw_types, NULL, kotlin_decorator_types,
-     kotlin_env_funcs, NULL},
+     kotlin_env_funcs, NULL, NULL},
 
     // CBM_LANG_RUBY
     {CBM_LANG_RUBY, ruby_func_types, ruby_class_types, empty_types, ruby_module_types,
      ruby_call_types, ruby_import_types, empty_types, ruby_branch_types, ruby_var_types,
-     ruby_assign_types, empty_types, NULL, empty_types, NULL, ruby_env_members},
+     ruby_assign_types, empty_types, NULL, empty_types, NULL, ruby_env_members, NULL},
 
     // CBM_LANG_C
     {CBM_LANG_C, c_func_types, c_class_types, c_field_types, c_module_types, c_call_types,
      c_import_types, empty_types, c_branch_types, c_var_types, c_assign_types, empty_types, NULL,
-     empty_types, c_env_funcs, NULL},
+     empty_types, c_env_funcs, NULL, NULL},
 
     // CBM_LANG_BASH
     {CBM_LANG_BASH, bash_func_types, empty_types, empty_types, bash_module_types, bash_call_types,
      bash_import_types, empty_types, bash_branch_types, bash_var_types, bash_var_types, empty_types,
-     NULL, empty_types, NULL, NULL},
+     NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_ZIG
     {CBM_LANG_ZIG, zig_func_types, zig_class_types, zig_field_types, zig_module_types,
      zig_call_types, zig_import_types, empty_types, zig_branch_types, zig_var_types,
-     zig_assign_types, empty_types, NULL, empty_types, zig_env_funcs, NULL},
+     zig_assign_types, empty_types, NULL, empty_types, zig_env_funcs, NULL, NULL},
 
     // CBM_LANG_ELIXIR
     {CBM_LANG_ELIXIR, elixir_func_types, empty_types, empty_types, elixir_module_types,
      elixir_call_types, elixir_import_types, empty_types, elixir_branch_types, elixir_var_types,
-     elixir_var_types, empty_types, NULL, empty_types, elixir_env_funcs, NULL},
+     elixir_var_types, empty_types, NULL, empty_types, elixir_env_funcs, NULL, NULL},
 
     // CBM_LANG_HASKELL
     {CBM_LANG_HASKELL, haskell_func_types, haskell_class_types, empty_types, haskell_module_types,
      haskell_call_types, haskell_import_types, empty_types, haskell_branch_types, haskell_var_types,
-     haskell_var_types, empty_types, NULL, empty_types, haskell_env_funcs, NULL},
+     haskell_var_types, empty_types, NULL, empty_types, haskell_env_funcs, NULL, NULL},
 
     // CBM_LANG_OCAML
     {CBM_LANG_OCAML, ocaml_func_types, ocaml_class_types, empty_types, ocaml_module_types,
      ocaml_call_types, ocaml_import_types, empty_types, ocaml_branch_types, ocaml_var_types,
-     ocaml_var_types, empty_types, NULL, empty_types, ocaml_env_funcs, NULL},
+     ocaml_var_types, empty_types, NULL, empty_types, ocaml_env_funcs, NULL, NULL},
 
     // CBM_LANG_OBJC
     {CBM_LANG_OBJC, objc_func_types, objc_class_types, objc_field_types, objc_module_types,
      objc_call_types, objc_import_types, empty_types, objc_branch_types, objc_var_types,
-     objc_assign_types, empty_types, NULL, empty_types, NULL, NULL},
+     objc_assign_types, empty_types, NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_SWIFT
     {CBM_LANG_SWIFT, swift_func_types, swift_class_types, swift_field_types, swift_module_types,
      swift_call_types, swift_import_types, empty_types, swift_branch_types, swift_var_types,
-     swift_assign_types, swift_throw_types, NULL, swift_decorator_types, NULL, NULL},
+     swift_assign_types, swift_throw_types, NULL, swift_decorator_types, NULL, NULL, NULL},
 
     // CBM_LANG_DART
     {CBM_LANG_DART, dart_func_types, dart_class_types, dart_field_types, dart_module_types,
      dart_call_types, dart_import_types, empty_types, dart_branch_types, dart_var_types,
-     dart_assign_types, dart_throw_types, NULL, dart_decorator_types, NULL, NULL},
+     dart_assign_types, dart_throw_types, NULL, dart_decorator_types, NULL, NULL, NULL},
 
     // CBM_LANG_PERL
     {CBM_LANG_PERL, perl_func_types, empty_types, empty_types, perl_module_types, perl_call_types,
      perl_import_types, empty_types, perl_branch_types, perl_var_types, perl_assign_types,
-     empty_types, NULL, empty_types, perl_env_funcs, NULL},
+     empty_types, NULL, empty_types, perl_env_funcs, NULL, NULL},
 
     // CBM_LANG_GROOVY
     {CBM_LANG_GROOVY, groovy_func_types, groovy_class_types, empty_types, groovy_module_types,
      groovy_call_types, groovy_import_types, empty_types, groovy_branch_types, groovy_var_types,
-     groovy_assign_types, groovy_throw_types, NULL, groovy_decorator_types, NULL, NULL},
+     groovy_assign_types, groovy_throw_types, NULL, groovy_decorator_types, NULL, NULL, NULL},
 
     // CBM_LANG_ERLANG
     {CBM_LANG_ERLANG, erlang_func_types, empty_types, empty_types, erlang_module_types,
      erlang_call_types, erlang_import_types, empty_types, erlang_branch_types, erlang_var_types,
-     erlang_assign_types, erlang_throw_types, NULL, empty_types, NULL, NULL},
+     erlang_assign_types, erlang_throw_types, NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_R
     {CBM_LANG_R, r_func_types, empty_types, empty_types, r_module_types, r_call_types,
      r_import_types, empty_types, r_branch_types, r_var_types, r_var_types, empty_types, NULL,
-     empty_types, r_env_funcs, NULL},
+     empty_types, r_env_funcs, NULL, NULL},
 
     // CBM_LANG_HTML
     {CBM_LANG_HTML, empty_types, empty_types, empty_types, html_module_types, empty_types,
      empty_types, empty_types, empty_types, empty_types, empty_types, empty_types, NULL,
-     empty_types, NULL, NULL},
+     empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_CSS
     {CBM_LANG_CSS, empty_types, empty_types, empty_types, css_module_types, empty_types,
      css_import_types, empty_types, empty_types, empty_types, empty_types, empty_types, NULL,
-     empty_types, NULL, NULL},
+     empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_SCSS
     {CBM_LANG_SCSS, scss_func_types, empty_types, empty_types, scss_module_types, scss_call_types,
      scss_import_types, empty_types, scss_branch_types, scss_var_types, empty_types, empty_types,
-     NULL, empty_types, NULL, NULL},
+     NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_YAML
     {CBM_LANG_YAML, empty_types, empty_types, empty_types, yaml_module_types, empty_types,
      empty_types, empty_types, empty_types, yaml_var_types, empty_types, empty_types, NULL,
-     empty_types, NULL, NULL},
+     empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_TOML
     {CBM_LANG_TOML, empty_types, toml_class_types, empty_types, toml_module_types, empty_types,
      empty_types, empty_types, empty_types, toml_var_types, empty_types, empty_types, NULL,
-     empty_types, NULL, NULL},
+     empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_HCL
     {CBM_LANG_HCL, empty_types, hcl_class_types, empty_types, hcl_module_types, hcl_call_types,
      empty_types, empty_types, empty_types, hcl_var_types, empty_types, empty_types, NULL,
-     empty_types, NULL, NULL},
+     empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_SQL
     {CBM_LANG_SQL, sql_func_types, empty_types, sql_field_types, sql_module_types, sql_call_types,
      empty_types, empty_types, sql_branch_types, sql_var_types, empty_types, empty_types, NULL,
-     empty_types, NULL, NULL},
+     empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_DOCKERFILE
     {CBM_LANG_DOCKERFILE, empty_types, empty_types, empty_types, dockerfile_module_types,
      empty_types, empty_types, empty_types, empty_types, dockerfile_var_types, empty_types,
-     empty_types, NULL, empty_types, NULL, NULL},
+     empty_types, NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_CLOJURE
     {CBM_LANG_CLOJURE, empty_types, empty_types, empty_types, clojure_module_types,
      clojure_call_types, empty_types, empty_types, empty_types, empty_types, empty_types,
-     empty_types, NULL, empty_types, NULL, NULL},
+     empty_types, NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_FSHARP
     {CBM_LANG_FSHARP, fsharp_func_types, fsharp_class_types, empty_types, fsharp_module_types,
      fsharp_call_types, fsharp_import_types, empty_types, fsharp_branch_types, fsharp_var_types,
-     fsharp_var_types, empty_types, NULL, empty_types, fsharp_env_funcs, NULL},
+     fsharp_var_types, empty_types, NULL, empty_types, fsharp_env_funcs, NULL, NULL},
 
     // CBM_LANG_JULIA
     {CBM_LANG_JULIA, julia_func_types, julia_class_types, empty_types, julia_module_types,
      julia_call_types, julia_import_types, empty_types, julia_branch_types, julia_var_types,
-     julia_assign_types, julia_throw_types, NULL, empty_types, julia_env_funcs, NULL},
+     julia_assign_types, julia_throw_types, NULL, empty_types, julia_env_funcs, NULL, NULL},
 
     // CBM_LANG_VIMSCRIPT
     {CBM_LANG_VIMSCRIPT, vim_func_types, empty_types, empty_types, vim_module_types, vim_call_types,
      empty_types, empty_types, vim_branch_types, vim_var_types, vim_var_types, empty_types, NULL,
-     empty_types, NULL, NULL},
+     empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_NIX
     {CBM_LANG_NIX, nix_func_types, empty_types, empty_types, nix_module_types, nix_call_types,
      empty_types, empty_types, nix_branch_types, nix_var_types, nix_var_types, empty_types, NULL,
-     empty_types, nix_env_funcs, NULL},
+     empty_types, nix_env_funcs, NULL, NULL},
 
     // CBM_LANG_COMMONLISP
     {CBM_LANG_COMMONLISP, commonlisp_func_types, empty_types, empty_types, commonlisp_module_types,
      commonlisp_call_types, empty_types, empty_types, empty_types, empty_types, empty_types,
-     empty_types, NULL, empty_types, NULL, NULL},
+     empty_types, NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_ELM
     {CBM_LANG_ELM, elm_func_types, elm_class_types, empty_types, elm_module_types, elm_call_types,
      elm_import_types, empty_types, elm_branch_types, empty_types, empty_types, empty_types, NULL,
-     empty_types, NULL, NULL},
+     empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_FORTRAN
     {CBM_LANG_FORTRAN, fortran_func_types, fortran_class_types, empty_types, fortran_module_types,
      fortran_call_types, fortran_import_types, empty_types, fortran_branch_types, fortran_var_types,
-     fortran_assign_types, empty_types, NULL, empty_types, fortran_env_funcs, NULL},
+     fortran_assign_types, empty_types, NULL, empty_types, fortran_env_funcs, NULL, NULL},
 
     // CBM_LANG_CUDA (reuses C++ node types)
     {CBM_LANG_CUDA, cpp_func_types, cpp_class_types, cpp_field_types, cpp_module_types,
      cpp_call_types, cpp_import_types, cpp_import_types, cpp_branch_types, cpp_var_types,
-     cpp_assign_types, cpp_throw_types, NULL, empty_types, cpp_env_funcs, NULL},
+     cpp_assign_types, cpp_throw_types, NULL, empty_types, cpp_env_funcs, NULL, NULL},
 
     // CBM_LANG_COBOL
     {CBM_LANG_COBOL, cobol_func_types, empty_types, empty_types, cobol_module_types,
      cobol_call_types, empty_types, empty_types, cobol_branch_types, cobol_var_types, empty_types,
-     empty_types, NULL, empty_types, NULL, NULL},
+     empty_types, NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_VERILOG
     {CBM_LANG_VERILOG, verilog_func_types, verilog_class_types, empty_types, verilog_module_types,
      verilog_call_types, empty_types, empty_types, verilog_branch_types, verilog_var_types,
-     verilog_assign_types, empty_types, NULL, empty_types, NULL, NULL},
+     verilog_assign_types, empty_types, NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_EMACSLISP
     {CBM_LANG_EMACSLISP, elisp_func_types, empty_types, empty_types, elisp_module_types,
      elisp_call_types, empty_types, empty_types, empty_types, empty_types, empty_types, empty_types,
-     NULL, empty_types, NULL, NULL},
+     NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_JSON
     {CBM_LANG_JSON, empty_types, empty_types, empty_types, json_module_types, empty_types,
      empty_types, empty_types, empty_types, json_var_types, empty_types, empty_types, NULL,
-     empty_types, NULL, NULL},
+     empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_XML
     {CBM_LANG_XML, empty_types, xml_class_types, empty_types, xml_module_types, empty_types,
      empty_types, empty_types, empty_types, empty_types, empty_types, empty_types, NULL,
-     empty_types, NULL, NULL},
+     empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_MARKDOWN
     {CBM_LANG_MARKDOWN, empty_types, markdown_class_types, empty_types, markdown_module_types,
      empty_types, empty_types, empty_types, empty_types, empty_types, empty_types, empty_types,
-     NULL, empty_types, NULL, NULL},
+     NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_MAKEFILE
     {CBM_LANG_MAKEFILE, makefile_func_types, empty_types, empty_types, makefile_module_types,
      makefile_call_types, makefile_import_types, empty_types, empty_types, makefile_var_types,
-     empty_types, empty_types, NULL, empty_types, NULL, NULL},
+     empty_types, empty_types, NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_CMAKE
     {CBM_LANG_CMAKE, empty_types, empty_types, empty_types, cmake_module_types, cmake_call_types,
      empty_types, empty_types, empty_types, empty_types, empty_types, empty_types, NULL,
-     empty_types, NULL, NULL},
+     empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_PROTOBUF
     {CBM_LANG_PROTOBUF, empty_types, protobuf_class_types, protobuf_field_types,
      protobuf_module_types, empty_types, protobuf_import_types, empty_types, empty_types,
-     empty_types, empty_types, empty_types, NULL, empty_types, NULL, NULL},
+     empty_types, empty_types, empty_types, NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_GRAPHQL
     {CBM_LANG_GRAPHQL, empty_types, graphql_class_types, graphql_field_types, graphql_module_types,
      empty_types, empty_types, empty_types, empty_types, empty_types, empty_types, empty_types,
-     NULL, empty_types, NULL, NULL},
+     NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_VUE
     {CBM_LANG_VUE, empty_types, empty_types, empty_types, vue_module_types, empty_types,
      empty_types, empty_types, empty_types, empty_types, empty_types, empty_types, NULL,
-     empty_types, NULL, NULL},
+     empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_SVELTE
     {CBM_LANG_SVELTE, empty_types, empty_types, empty_types, svelte_module_types, empty_types,
      empty_types, empty_types, svelte_branch_types, empty_types, empty_types, empty_types, NULL,
-     empty_types, NULL, NULL},
+     empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_MESON
     {CBM_LANG_MESON, meson_func_types, empty_types, empty_types, meson_module_types,
      meson_call_types, empty_types, empty_types, meson_branch_types, meson_var_types,
-     meson_var_types, empty_types, NULL, empty_types, NULL, NULL},
+     meson_var_types, empty_types, NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_GLSL (reuses C node types)
     {CBM_LANG_GLSL, c_func_types, c_class_types, c_field_types, c_module_types, c_call_types,
      c_import_types, empty_types, c_branch_types, c_var_types, c_assign_types, empty_types, NULL,
-     empty_types, NULL, NULL},
+     empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_INI
     {CBM_LANG_INI, empty_types, ini_class_types, empty_types, ini_module_types, empty_types,
      empty_types, empty_types, empty_types, ini_var_types, empty_types, empty_types, NULL,
-     empty_types, NULL, NULL},
+     empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_MATLAB
     {CBM_LANG_MATLAB, matlab_func_types, matlab_class_types, empty_types, matlab_module_types,
      matlab_call_types, empty_types, empty_types, matlab_branch_types, matlab_var_types,
-     matlab_var_types, empty_types, NULL, empty_types, NULL, NULL},
+     matlab_var_types, empty_types, NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_LEAN
     {CBM_LANG_LEAN, lean_func_types, lean_class_types, empty_types, lean_module_types,
      lean_call_types, lean_import_types, empty_types, lean_branch_types, empty_types, empty_types,
-     empty_types, NULL, empty_types, NULL, NULL},
+     empty_types, NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_FORM
     {CBM_LANG_FORM, form_func_types, empty_types, empty_types, form_module_types, form_call_types,
      form_import_types, empty_types, form_branch_types, form_var_types, form_assign_types,
-     empty_types, NULL, empty_types, NULL, NULL},
+     empty_types, NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_MAGMA
     {CBM_LANG_MAGMA, magma_func_types, empty_types, empty_types, magma_module_types,
      magma_call_types, magma_import_types, empty_types, magma_branch_types, magma_var_types,
-     magma_var_types, empty_types, NULL, empty_types, NULL, NULL},
+     magma_var_types, empty_types, NULL, empty_types, NULL, NULL, NULL},
 
     // CBM_LANG_WOLFRAM
     {CBM_LANG_WOLFRAM, wolfram_func_types, empty_types, empty_types, wolfram_module_types,
      wolfram_call_types, wolfram_import_types, empty_types, empty_types, empty_types, empty_types,
-     empty_types, NULL, empty_types, NULL, NULL},
+     empty_types, NULL, empty_types, NULL, NULL, NULL},
 };
 
 const CBMLangSpec *cbm_lang_spec(CBMLanguage lang) {

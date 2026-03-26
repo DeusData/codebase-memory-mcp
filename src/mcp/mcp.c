@@ -21,6 +21,7 @@
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
+#include "foundation/compat_regex.h"
 #include <sqlite3.h>
 
 #ifdef _WIN32
@@ -1526,17 +1527,67 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     }
 
     char *label = cbm_mcp_get_string_arg(args, "label");
+    /* F1: treat empty string as "no filter" */
+    if (label && label[0] == '\0') { free(label); label = NULL; }
     char *name_pattern = cbm_mcp_get_string_arg(args, "name_pattern");
     char *qn_pattern = cbm_mcp_get_string_arg(args, "qn_pattern");
+    /* F9: pre-validate regex patterns — O(1) per pattern via cbm_regcomp */
+    if (name_pattern) {
+        cbm_regex_t re;
+        if (cbm_regcomp(&re, name_pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB) != 0) {
+            char errbuf[512];
+            snprintf(errbuf, sizeof(errbuf),
+                "{\"error\":\"invalid regex in name_pattern: '%s'\","
+                "\"hint\":\"Escape special chars with \\\\\\\\ or use plain text\"}", name_pattern);
+            free(label); free(name_pattern); free(pe.value);
+            return cbm_mcp_text_result(errbuf, true);
+        }
+        cbm_regfree(&re);
+    }
+    if (qn_pattern) {
+        cbm_regex_t re;
+        if (cbm_regcomp(&re, qn_pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB) != 0) {
+            char errbuf[512];
+            snprintf(errbuf, sizeof(errbuf),
+                "{\"error\":\"invalid regex in qn_pattern: '%s'\","
+                "\"hint\":\"Escape special chars with \\\\\\\\ or use plain text\"}", qn_pattern);
+            free(label); free(name_pattern); free(qn_pattern); free(pe.value);
+            return cbm_mcp_text_result(errbuf, true);
+        }
+        cbm_regfree(&re);
+    }
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
     char *relationship = cbm_mcp_get_string_arg(args, "relationship");
     char *sort_by = cbm_mcp_get_string_arg(args, "sort_by");
+    /* F6: validate sort_by enum — O(1) string comparisons */
+    if (sort_by && strcmp(sort_by, "relevance") != 0 && strcmp(sort_by, "name") != 0 &&
+        strcmp(sort_by, "degree") != 0) {
+        char errbuf[256];
+        snprintf(errbuf, sizeof(errbuf),
+            "{\"error\":\"invalid sort_by '%s'\","
+            "\"hint\":\"Valid values: relevance, name, degree\"}", sort_by);
+        free(label); free(name_pattern); free(qn_pattern); free(file_pattern);
+        free(relationship); free(sort_by); free(pe.value);
+        return cbm_mcp_text_result(errbuf, true);
+    }
     int cfg_search_limit = cbm_config_get_int(srv->config, CBM_CONFIG_SEARCH_LIMIT,
                                                CBM_DEFAULT_SEARCH_LIMIT);
     int limit = cbm_mcp_get_int_arg(args, "limit", cfg_search_limit);
+    /* F4: treat limit<=0 as default */
+    if (limit <= 0) limit = cfg_search_limit;
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
     bool compact = cbm_mcp_get_bool_arg_default(args, "compact", true);
     char *search_mode = cbm_mcp_get_string_arg(args, "mode");
+    /* F7: validate mode enum — O(1) */
+    if (search_mode && strcmp(search_mode, "full") != 0 && strcmp(search_mode, "summary") != 0) {
+        char errbuf[256];
+        snprintf(errbuf, sizeof(errbuf),
+            "{\"error\":\"invalid mode '%s'\","
+            "\"hint\":\"Valid values: full, summary\"}", search_mode);
+        free(label); free(name_pattern); free(qn_pattern); free(file_pattern);
+        free(relationship); free(sort_by); free(search_mode); free(pe.value);
+        return cbm_mcp_text_result(errbuf, true);
+    }
     int min_degree = cbm_mcp_get_int_arg(args, "min_degree", -1);
     int max_degree = cbm_mcp_get_int_arg(args, "max_degree", -1);
     bool exclude_entry_points = cbm_mcp_get_bool_arg_default(args, "exclude_entry_points", false);
@@ -1637,6 +1688,12 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         }
         yyjson_mut_obj_add_val(doc, root, "by_label", by_label);
         yyjson_mut_obj_add_val(doc, root, "by_file_top20", by_file);
+        /* G1: make suppression explicit so callers know results exist */
+        yyjson_mut_val *empty_arr = yyjson_mut_arr(doc);
+        yyjson_mut_obj_add_val(doc, root, "results", empty_arr);
+        yyjson_mut_obj_add_bool(doc, root, "results_suppressed", true);
+        yyjson_mut_obj_add_str(doc, root, "hint",
+            "mode='summary' returns counts only. Use mode='full' with compact=true for node records.");
     } else {
         /* Full mode: individual results */
         yyjson_mut_val *results = yyjson_mut_arr(doc);
@@ -1758,9 +1815,14 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
 }
 
 static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
-    char *query = cbm_mcp_get_string_arg(args, "query");
-    char *project = cbm_mcp_get_string_arg(args, "project");
-    cbm_store_t *store = resolve_store(srv, project);
+    /* B7: schema says "cypher" but handler read "query" — fix to read "cypher" first */
+    char *query = cbm_mcp_get_string_arg(args, "cypher");
+    if (!query) query = cbm_mcp_get_string_arg(args, "query"); /* backward compat */
+    /* CQ-2: use resolve_project_store for "self"/"dep"/path expansion */
+    char *raw_project = cbm_mcp_get_string_arg(args, "project");
+    project_expand_t pe = {0};
+    cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
+    char *project = pe.value;
     int max_rows = cbm_mcp_get_int_arg(args, "max_rows", 0);
     int cfg_max_output = cbm_config_get_int(srv->config, CBM_CONFIG_QUERY_MAX_OUTPUT_BYTES,
                                             CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES);
@@ -1814,6 +1876,17 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     }
     yyjson_mut_obj_add_val(doc, root, "rows", rows);
     yyjson_mut_obj_add_int(doc, root, "total", result.row_count);
+
+    /* CQ-3: Warn when filter params combined with cypher — they're silently ignored */
+    {
+        char *ignored_label = cbm_mcp_get_string_arg(args, "label");
+        if (ignored_label) {
+            yyjson_mut_obj_add_str(doc, root, "warning",
+                "cypher param present — label, name_pattern, file_pattern, sort_by, and other "
+                "filter params are ignored in Cypher mode. Use WHERE clause instead.");
+            free(ignored_label);
+        }
+    }
 
     char *json = yy_doc_to_str(doc);
     int total_rows = result.row_count;
@@ -2112,6 +2185,8 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *project = pe.value; /* take ownership for free() below */
     char *direction = cbm_mcp_get_string_arg(args, "direction");
     int depth = cbm_mcp_get_int_arg(args, "depth", 3);
+    /* F10: clamp depth to minimum 1 — O(1) */
+    if (depth < 1) depth = 1;
     int cfg_trace_max = cbm_config_get_int(srv->config, CBM_CONFIG_TRACE_MAX_RESULTS,
                                             CBM_DEFAULT_TRACE_MAX_RESULTS);
     int max_results = cbm_mcp_get_int_arg(args, "max_results", cfg_trace_max);
@@ -2131,6 +2206,18 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result(
             "{\"error\":\"no project loaded\","
             "\"hint\":\"Run index_repository with repo_path to index the project first.\"}", true);
+    }
+    /* F15: validate direction enum — O(1) */
+    if (direction && strcmp(direction, "inbound") != 0 &&
+        strcmp(direction, "outbound") != 0 && strcmp(direction, "both") != 0) {
+        char errbuf[256];
+        snprintf(errbuf, sizeof(errbuf),
+            "{\"error\":\"invalid direction '%s'\","
+            "\"hint\":\"Valid values: inbound, outbound, both\"}", direction);
+        free(func_name);
+        free(project);
+        free(direction);
+        return cbm_mcp_text_result(errbuf, true);
     }
     if (!direction) {
         direction = heap_strdup("both");

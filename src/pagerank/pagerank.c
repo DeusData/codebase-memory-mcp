@@ -70,6 +70,7 @@ typedef struct {
     int dst_idx;
     int64_t edge_id;
     double weight;
+    bool is_calls;  /* DF-1: true if edge type == "CALLS" */
 } pr_edge_t;
 
 /* ── ISO timestamp helper ────────────────────────────────────── */
@@ -160,6 +161,10 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     int64_t *node_ids = NULL;
     pr_edge_t *edges = NULL;
     double *out_weight = NULL, *rank = NULL, *new_rank = NULL;
+    /* DF-1: degree accumulators (freed at cleanup) */
+    int *total_in = NULL, *total_out = NULL;
+    int *calls_in = NULL, *calls_out = NULL;
+    double *w_in = NULL;
     id_map_t map = {0};
     int N = 0, E = 0, result = -1;
 
@@ -242,6 +247,7 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
         edges[E].dst_idx = di;
         edges[E].edge_id = eid;
         edges[E].weight = edge_type_weight(weights, type);
+        edges[E].is_calls = (type && strcmp(type, "CALLS") == 0);
         E++;
     }
     sqlite3_finalize(stmt);
@@ -253,8 +259,22 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     new_rank = malloc((size_t)N * sizeof(double));
     if (!out_weight || !rank || !new_rank) goto cleanup;
 
-    for (int e = 0; e < E; e++)
-        out_weight[edges[e].src_idx] += edges[e].weight;
+    /* DF-1: Allocate degree accumulators (OOM-safe: if any fails, skip degree) */
+    total_in = calloc((size_t)N, sizeof(int));
+    total_out = calloc((size_t)N, sizeof(int));
+    calls_in = calloc((size_t)N, sizeof(int));
+    calls_out = calloc((size_t)N, sizeof(int));
+    w_in = calloc((size_t)N, sizeof(double));
+
+    for (int e = 0; e < E; e++) {
+        int s = edges[e].src_idx;
+        int d = edges[e].dst_idx;
+        out_weight[s] += edges[e].weight;
+        /* Degree accumulators — guarded against OOM */
+        if (total_in) { total_out[s]++; total_in[d]++; }
+        if (w_in) { w_in[d] += edges[e].weight; }
+        if (edges[e].is_calls && calls_in) { calls_out[s]++; calls_in[d]++; }
+    }
 
     /* ── Step 4: Power iteration ──────────────────────────── */
     double init_rank = 1.0 / N;
@@ -368,6 +388,56 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
         sqlite3_finalize(lr_stmt);
     }
 
+    /* ── Step 7: Compute and store node_degree ──────────── */
+    if (total_in) {
+        /* Accumulate linkrank_in per destination node */
+        double *lr_in = calloc((size_t)N, sizeof(double));
+        if (lr_in) {
+            for (int e = 0; e < E; e++) {
+                int s_idx = edges[e].src_idx;
+                if (out_weight[s_idx] > 0.0) {
+                    double lr = rank[s_idx] * edges[e].weight / out_weight[s_idx];
+                    lr_in[edges[e].dst_idx] += lr;
+                }
+            }
+        }
+        /* Clear old degree data */
+        snprintf(sql_buf, sizeof(sql_buf), "DELETE FROM node_degree WHERE %s",
+                 scope_where(scope));
+        if (sqlite3_prepare_v2(db, sql_buf, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+            stmt = NULL;
+        }
+        /* Batch insert — O(N) within single transaction */
+        sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+        const char *deg_sql =
+            "INSERT OR REPLACE INTO node_degree "
+            "(node_id, project, total_in, total_out, calls_in, calls_out, "
+            " weighted_in, weighted_out, linkrank_in, computed_at) "
+            "SELECT ?1, project, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 FROM nodes WHERE id = ?1";
+        sqlite3_stmt *deg_stmt = NULL;
+        if (sqlite3_prepare_v2(db, deg_sql, -1, &deg_stmt, NULL) == SQLITE_OK) {
+            for (int i = 0; i < N; i++) {
+                sqlite3_bind_int64(deg_stmt, 1, node_ids[i]);
+                sqlite3_bind_int(deg_stmt, 2, total_in[i]);
+                sqlite3_bind_int(deg_stmt, 3, total_out[i]);
+                sqlite3_bind_int(deg_stmt, 4, calls_in ? calls_in[i] : 0);
+                sqlite3_bind_int(deg_stmt, 5, calls_out ? calls_out[i] : 0);
+                sqlite3_bind_double(deg_stmt, 6, w_in ? w_in[i] : 0.0);
+                sqlite3_bind_double(deg_stmt, 7, out_weight[i]);
+                sqlite3_bind_double(deg_stmt, 8, lr_in ? lr_in[i] : 0.0);
+                sqlite3_bind_text(deg_stmt, 9, ts, -1, SQLITE_TRANSIENT);
+                sqlite3_step(deg_stmt);
+                sqlite3_reset(deg_stmt);
+            }
+            sqlite3_finalize(deg_stmt);
+        }
+        sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+        free(lr_in);
+    }
+
     /* ── Logging ──────────────────────────────────────────── */
     char iter_s[CBM_LOG_INT_BUF], n_s[CBM_LOG_INT_BUF], e_s[CBM_LOG_INT_BUF];
     snprintf(iter_s, sizeof(iter_s), "%d", iter);
@@ -390,6 +460,11 @@ cleanup:
     free(out_weight);
     free(rank);
     free(new_rank);
+    free(total_in);
+    free(total_out);
+    free(calls_in);
+    free(calls_out);
+    free(w_in);
     return result;
 }
 

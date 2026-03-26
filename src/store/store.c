@@ -213,7 +213,21 @@ static int init_schema(cbm_store_t *s) {
                       "  project TEXT NOT NULL,"
                       "  rank REAL NOT NULL DEFAULT 0.0,"
                       "  computed_at TEXT NOT NULL"
-                      ");";
+                      ");"
+                      "CREATE TABLE IF NOT EXISTS node_degree ("
+                      "  node_id INTEGER PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,"
+                      "  project TEXT NOT NULL,"
+                      "  total_in INTEGER DEFAULT 0,"
+                      "  total_out INTEGER DEFAULT 0,"
+                      "  calls_in INTEGER DEFAULT 0,"
+                      "  calls_out INTEGER DEFAULT 0,"
+                      "  weighted_in REAL DEFAULT 0,"
+                      "  weighted_out REAL DEFAULT 0,"
+                      "  linkrank_in REAL DEFAULT 0,"
+                      "  computed_at TEXT"
+                      ");"
+                      "CREATE INDEX IF NOT EXISTS idx_node_degree_project"
+                      "  ON node_degree(project);";
 
     return exec_sql(s, ddl);
 }
@@ -1341,22 +1355,32 @@ void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *ou
     *in_deg = 0;
     *out_deg = 0;
 
-    const char *in_sql = "SELECT COUNT(*) FROM edges WHERE target_id = ?1 AND type = 'CALLS'";
+    /* DF-1: Fast path — precomputed table (O(1) indexed lookup) */
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db, in_sql, -1, &stmt, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT total_in, total_out FROM node_degree WHERE node_id = ?1",
+            -1, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_int64(stmt, 1, node_id);
         if (sqlite3_step(stmt) == SQLITE_ROW) {
             *in_deg = sqlite3_column_int(stmt, 0);
+            *out_deg = sqlite3_column_int(stmt, 1);
+            sqlite3_finalize(stmt);
+            return;
         }
         sqlite3_finalize(stmt);
     }
 
-    const char *out_sql = "SELECT COUNT(*) FROM edges WHERE source_id = ?1 AND type = 'CALLS'";
+    /* Slow fallback: count ALL edges (when node_degree table empty) */
+    const char *in_sql = "SELECT COUNT(*) FROM edges WHERE target_id = ?1";
+    if (sqlite3_prepare_v2(s->db, in_sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, node_id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) *in_deg = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+    }
+    const char *out_sql = "SELECT COUNT(*) FROM edges WHERE source_id = ?1";
     if (sqlite3_prepare_v2(s->db, out_sql, -1, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_int64(stmt, 1, node_id);
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-            *out_deg = sqlite3_column_int(stmt, 0);
-        }
+        if (sqlite3_step(stmt) == SQLITE_ROW) *out_deg = sqlite3_column_int(stmt, 0);
         sqlite3_finalize(stmt);
     }
 }
@@ -1759,20 +1783,44 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
      * Avoids JOIN overhead for name/degree sorts. */
     bool use_pagerank = (!params->sort_by ||
                          strcmp(params->sort_by, "relevance") == 0);
+    /* DF-1: Use precomputed node_degree table when available (O(1) JOIN vs O(|E|) subquery).
+     * HC-6: Falls back to edge COUNT when node_degree is empty. */
+    bool has_degree_table = false;
+    {
+        sqlite3_stmt *check = NULL;
+        if (sqlite3_prepare_v2(s->db,
+                "SELECT 1 FROM node_degree LIMIT 1", -1, &check, NULL) == SQLITE_OK) {
+            has_degree_table = (sqlite3_step(check) == SQLITE_ROW);
+            sqlite3_finalize(check);
+        }
+    }
     const char *select_cols;
-    if (use_pagerank) {
+    if (use_pagerank && has_degree_table) {
         select_cols =
             "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
             "n.file_path, n.start_line, n.end_line, n.properties, "
-            "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.type = 'CALLS') AS in_deg, "
-            "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND e.type = 'CALLS') AS out_deg, "
+            "COALESCE(nd.total_in, 0) AS in_deg, "
+            "COALESCE(nd.total_out, 0) AS out_deg, "
             "COALESCE(pr.rank, 0.0) AS pr_rank ";
+    } else if (use_pagerank) {
+        select_cols =
+            "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+            "n.file_path, n.start_line, n.end_line, n.properties, "
+            "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id) AS in_deg, "
+            "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id) AS out_deg, "
+            "COALESCE(pr.rank, 0.0) AS pr_rank ";
+    } else if (has_degree_table) {
+        select_cols =
+            "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+            "n.file_path, n.start_line, n.end_line, n.properties, "
+            "COALESCE(nd.total_in, 0) AS in_deg, "
+            "COALESCE(nd.total_out, 0) AS out_deg ";
     } else {
         select_cols =
             "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
             "n.file_path, n.start_line, n.end_line, n.properties, "
-            "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.type = 'CALLS') AS in_deg, "
-            "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND e.type = 'CALLS') AS out_deg ";
+            "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id) AS in_deg, "
+            "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id) AS out_deg ";
     }
 
     /* Start building WHERE */
@@ -1901,9 +1949,16 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     }
 
     /* Build full SQL */
-    const char *from_join = use_pagerank
-        ? "FROM nodes n LEFT JOIN pagerank pr ON pr.node_id = n.id"
-        : "FROM nodes n";
+    const char *from_join;
+    if (use_pagerank && has_degree_table)
+        from_join = "FROM nodes n LEFT JOIN pagerank pr ON pr.node_id = n.id "
+                    "LEFT JOIN node_degree nd ON nd.node_id = n.id";
+    else if (use_pagerank)
+        from_join = "FROM nodes n LEFT JOIN pagerank pr ON pr.node_id = n.id";
+    else if (has_degree_table)
+        from_join = "FROM nodes n LEFT JOIN node_degree nd ON nd.node_id = n.id";
+    else
+        from_join = "FROM nodes n";
     if (nparams > 0) {
         snprintf(sql, sizeof(sql), "%s %s WHERE %s", select_cols, from_join, where);
     } else {
@@ -2824,14 +2879,42 @@ static int arch_routes(cbm_store_t *s, const char *project, cbm_architecture_inf
     return CBM_STORE_OK;
 }
 
-static int arch_hotspots(cbm_store_t *s, const char *project, cbm_architecture_info_t *out) {
-    const char *sql = "SELECT n.name, n.qualified_name, COUNT(*) as fan_in "
-                      "FROM nodes n JOIN edges e ON e.target_id = n.id AND e.type = 'CALLS' "
-                      "WHERE n.project=?1 AND n.label IN ('Function', 'Method') "
-                      "AND (json_extract(n.properties, '$.is_test') IS NULL OR "
-                      "json_extract(n.properties, '$.is_test') != 1) "
-                      "AND n.file_path NOT LIKE '%test%' "
-                      "GROUP BY n.id ORDER BY fan_in DESC LIMIT 10";
+enum { CBM_ARCH_HOTSPOT_DEFAULT_LIMIT = 10 };
+
+static int arch_hotspots(cbm_store_t *s, const char *project, cbm_architecture_info_t *out,
+                         int limit) {
+    /* DF-1 Site 7: Use precomputed calls_in when available. HC-6: fallback to edge COUNT. */
+    if (limit <= 0) limit = CBM_ARCH_HOTSPOT_DEFAULT_LIMIT;
+    bool has_degree = false;
+    {
+        sqlite3_stmt *chk = NULL;
+        if (sqlite3_prepare_v2(s->db, "SELECT 1 FROM node_degree LIMIT 1", -1, &chk, NULL) == SQLITE_OK) {
+            has_degree = (sqlite3_step(chk) == SQLITE_ROW);
+            sqlite3_finalize(chk);
+        }
+    }
+    char sql[512];
+    if (has_degree) {
+        snprintf(sql, sizeof(sql),
+            "SELECT n.name, n.qualified_name, COALESCE(nd.calls_in, 0) as fan_in "
+            "FROM nodes n "
+            "LEFT JOIN node_degree nd ON nd.node_id = n.id "
+            "WHERE n.project=?1 AND n.label IN ('Function', 'Method') "
+            "AND (json_extract(n.properties, '$.is_test') IS NULL OR "
+            "json_extract(n.properties, '$.is_test') != 1) "
+            "AND n.file_path NOT LIKE '%%test%%' "
+            "AND COALESCE(nd.calls_in, 0) > 0 "
+            "ORDER BY fan_in DESC LIMIT %d", limit);
+    } else {
+        snprintf(sql, sizeof(sql),
+            "SELECT n.name, n.qualified_name, COUNT(*) as fan_in "
+            "FROM nodes n JOIN edges e ON e.target_id = n.id AND e.type = 'CALLS' "
+            "WHERE n.project=?1 AND n.label IN ('Function', 'Method') "
+            "AND (json_extract(n.properties, '$.is_test') IS NULL OR "
+            "json_extract(n.properties, '$.is_test') != 1) "
+            "AND n.file_path NOT LIKE '%%test%%' "
+            "GROUP BY n.id ORDER BY fan_in DESC LIMIT %d", limit);
+    }
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "arch_hotspots");
@@ -2892,7 +2975,9 @@ static int arch_boundaries(cbm_store_t *s, const char *project, cbm_cross_pkg_bo
     sqlite3_finalize(nstmt);
 
     /* Scan edges, count cross-package calls */
-    const char *esql = "SELECT source_id, target_id FROM edges WHERE project=?1 AND type='CALLS'";
+    /* DF-1 Site 8: Include all behavioral edge types for boundary analysis */
+    const char *esql = "SELECT source_id, target_id FROM edges "
+                       "WHERE project=?1 AND type IN ('CALLS','HTTP_CALLS','ASYNC_CALLS')";
     sqlite3_stmt *estmt = NULL;
     if (sqlite3_prepare_v2(s->db, esql, -1, &estmt, NULL) != SQLITE_OK) {
         for (int i = 0; i < nn; i++) {
@@ -3863,7 +3948,7 @@ int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char *
         }
     }
     if (want_aspect(aspects, aspect_count, "hotspots")) {
-        rc = arch_hotspots(s, project, out);
+        rc = arch_hotspots(s, project, out, CBM_ARCH_HOTSPOT_DEFAULT_LIMIT);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
