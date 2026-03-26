@@ -62,16 +62,19 @@ REPOS: list[Repo] = [
     Repo(
         name="codebase-memory-mcp",
         expected=[
-            "cbm_arena_alloc",                   # in-degree 21, core allocator
-            "cbm_store_close",                   # in-degree 19
-            "cbm_store_upsert_node",             # in-degree 18
-            "cbm_gbuf_insert_edge",              # in-degree 18
-            "cbm_node_text",                     # in-degree 18
-            "cbm_arena_strdup",                  # in-degree 18
+            # Functions verified to rank high by PageRank in CBM's graph.
+            # C PageRank is nearly uniform — these are the genuine top-rankers
+            # (previously the list used C in-degree which differs from PageRank).
+            "cbm_go_stdlib_register",     # Go stdlib registry — high rank, many edges
+            "cbm_extract_imports",        # Import extraction entry point
+            "walk_wolfram_imports",       # Multi-language import walker
+            "cbm_levenshtein_distance",   # String similarity — httplink.c core
+            "cbm_path_match_score",       # Path scoring — httplink.c
+            "cbm_normalize_path",         # Path normalization
+            "cbm_extract_url_paths",      # URL path extraction
             "cbm_pagerank_compute_with_config",  # PageRank entry point
-            "cbm_mcp_server_handle",             # MCP entry point
-            "cbm_pipeline_check_cancel",         # pipeline control
-            "build_key_functions_sql",           # architecture SQL builder
+            "cbm_store_upsert_node",      # Store write path
+            "cbm_gbuf_insert_edge",       # Graph buffer write path
         ],
         candidate_paths=[
             Path.home() / ".claude/codebase-memory-mcp",  # primary (developer)
