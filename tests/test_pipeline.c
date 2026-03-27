@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include "graph_buffer/graph_buffer.h"
 #include "yyjson/yyjson.h"
+#include <sqlite3.h>
 
 /* ── Helper: create temp test repo with known layout ───────────── */
 
@@ -4971,6 +4972,44 @@ TEST(incremental_full_then_noop) {
     PASS();
 }
 
+TEST(incremental_noop_backfills_pagerank) {
+    if (setup_incremental_repo() != 0) { SKIP("setup failed"); }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(sqlite3_exec(cbm_store_get_db(s), "DELETE FROM node_scores;", NULL, NULL, NULL),
+              SQLITE_OK);
+    cbm_store_close(s);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(s),
+                                 "SELECT COUNT(*) FROM node_scores WHERE project = ?1;", -1,
+                                 &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_text(stmt, 1, project, -1, SQLITE_STATIC), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_GT(sqlite3_column_int(stmt, 0), 0);
+    sqlite3_finalize(stmt);
+    cbm_store_close(s);
+    free(project);
+
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_detects_changed_file) {
     /* Full index, modify one file, re-index → changed file re-parsed */
     if (setup_incremental_repo() != 0) { SKIP("setup failed"); }
@@ -5914,6 +5953,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_fastapi_depends_edges);
     /* Incremental */
     RUN_TEST(incremental_full_then_noop);
+    RUN_TEST(incremental_noop_backfills_pagerank);
     RUN_TEST(incremental_detects_changed_file);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);

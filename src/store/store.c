@@ -9,11 +9,14 @@
 // for ISO timestamp
 
 #include "store/store.h"
+#include "foundation/hash_table.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
 #include "foundation/compat_regex.h"
 
 #include <sqlite3.h>
+#include <yyjson/yyjson.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +41,8 @@ struct cbm_store {
     sqlite3 *db;
     const char *db_path; /* heap-allocated, or NULL for :memory: */
     char errbuf[512];
+    bool node_scores_checked;
+    bool node_scores_exists;
 
     /* Prepared statements (lazily initialized, cached for lifetime) */
     sqlite3_stmt *stmt_upsert_node;
@@ -122,6 +127,68 @@ static char *heap_strdup(const char *s) {
     return d;
 }
 
+static bool sqlite_uri_path_safe_char(unsigned char c) {
+    return isalnum(c) || c == '/' || c == '.' || c == '_' || c == '-' || c == '~' || c == ':';
+}
+
+static char *sqlite_readonly_immutable_uri(const char *db_path) {
+    if (!db_path) {
+        return NULL;
+    }
+
+    static const char suffix[] = "?mode=ro&immutable=1";
+    size_t path_len = strlen(db_path);
+    size_t cap = strlen("file:") + (path_len * 3) + sizeof(suffix);
+    char *uri = malloc(cap);
+    if (!uri) {
+        return NULL;
+    }
+
+    char *dst = uri;
+    memcpy(dst, "file:", strlen("file:"));
+    dst += strlen("file:");
+
+    static const char hex[] = "0123456789ABCDEF";
+    for (size_t i = 0; i < path_len; i++) {
+        unsigned char c = (unsigned char)db_path[i];
+        if (sqlite_uri_path_safe_char(c)) {
+            *dst++ = (char)c;
+        } else {
+            *dst++ = '%';
+            *dst++ = hex[(c >> 4) & 0x0F];
+            *dst++ = hex[c & 0x0F];
+        }
+    }
+
+    memcpy(dst, suffix, sizeof(suffix));
+    return uri;
+}
+
+static bool store_has_node_scores_table(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return false;
+    }
+    if (s->node_scores_checked) {
+        return s->node_scores_exists;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(
+        s->db,
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='node_scores' LIMIT 1;", -1,
+        &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        s->node_scores_checked = true;
+        s->node_scores_exists = false;
+        return false;
+    }
+
+    s->node_scores_exists = (sqlite3_step(stmt) == SQLITE_ROW);
+    s->node_scores_checked = true;
+    sqlite3_finalize(stmt);
+    return s->node_scores_exists;
+}
+
 /* Prepare a statement (cached). If already prepared, reset+clear. */
 static sqlite3_stmt *prepare_cached(cbm_store_t *s, sqlite3_stmt **slot, const char *sql) {
     if (!s || !s->db) {
@@ -197,6 +264,12 @@ static int init_schema(cbm_store_t *s) {
                       "  source_hash TEXT NOT NULL,"
                       "  created_at TEXT NOT NULL,"
                       "  updated_at TEXT NOT NULL"
+                      ");"
+                      "CREATE TABLE IF NOT EXISTS node_scores ("
+                      "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+                      "  node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,"
+                      "  pagerank REAL NOT NULL,"
+                      "  PRIMARY KEY (project, node_id)"
                       ");";
 
     return exec_sql(s, ddl);
@@ -211,7 +284,8 @@ static int create_user_indexes(cbm_store_t *s) {
         "CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id, type);"
         "CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(project, type);"
         "CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(project, target_id, type);"
-        "CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(project, source_id, type);";
+        "CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(project, source_id, type);"
+        "CREATE INDEX IF NOT EXISTS idx_node_scores_rank ON node_scores(project, pagerank DESC);";
     return exec_sql(s, sql);
 }
 
@@ -244,6 +318,27 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory) {
         rc = exec_sql(s, "PRAGMA mmap_size = 67108864;"); /* 64 MB */
     }
     return rc;
+}
+
+static int configure_query_pragmas(cbm_store_t *s) {
+    int rc;
+    rc = exec_sql(s, "PRAGMA foreign_keys = ON;");
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = exec_sql(s, "PRAGMA temp_store = MEMORY;");
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = exec_sql(s, "PRAGMA busy_timeout = 10000;");
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = exec_sql(s, "PRAGMA query_only = ON;");
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    return exec_sql(s, "PRAGMA mmap_size = 67108864;"); /* 64 MB */
 }
 
 /* ── REGEXP function for SQLite ──────────────────────────────────── */
@@ -351,6 +446,9 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
         return NULL;
     }
 
+    s->node_scores_checked = true;
+    s->node_scores_exists = true;
+
     return s;
 }
 
@@ -375,8 +473,18 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
         return NULL;
     }
 
-    /* Open read-write but do NOT create — returns SQLITE_CANTOPEN if absent. */
-    int rc = sqlite3_open_v2(db_path, &s->db, SQLITE_OPEN_READWRITE, NULL);
+    /* Query tools read atomically-written snapshot DBs. Open them via an
+     * immutable URI so SQLite does not try to create WAL/SHM sidecars when the
+     * file was produced by the direct page writer and later reopened in WAL
+     * mode by the indexing pipeline. */
+    char *uri = sqlite_readonly_immutable_uri(db_path);
+    if (!uri) {
+        free(s);
+        return NULL;
+    }
+
+    int rc = sqlite3_open_v2(uri, &s->db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL);
+    free(uri);
     if (rc != SQLITE_OK) {
         /* sqlite3_open_v2 allocates a handle even on failure — must close it. */
         sqlite3_close(s->db);
@@ -385,6 +493,8 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     }
 
     s->db_path = heap_strdup(db_path);
+    s->node_scores_checked = false;
+    s->node_scores_exists = false;
 
     /* Security: block ATTACH/DETACH to prevent file creation via SQL injection. */
     sqlite3_set_authorizer(s->db, store_authorizer, NULL);
@@ -395,7 +505,7 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     sqlite3_create_function(s->db, "iregexp", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
                             sqlite_iregexp, NULL, NULL);
 
-    if (configure_pragmas(s, false) != CBM_STORE_OK) {
+    if (configure_query_pragmas(s) != CBM_STORE_OK) {
         sqlite3_close(s->db);
         free((void *)s->db_path);
         free(s);
@@ -575,7 +685,8 @@ int cbm_store_drop_indexes(cbm_store_t *s) {
                        "DROP INDEX IF EXISTS idx_edges_target;"
                        "DROP INDEX IF EXISTS idx_edges_type;"
                        "DROP INDEX IF EXISTS idx_edges_target_type;"
-                       "DROP INDEX IF EXISTS idx_edges_source_type;");
+                       "DROP INDEX IF EXISTS idx_edges_source_type;"
+                       "DROP INDEX IF EXISTS idx_node_scores_rank;");
 }
 
 int cbm_store_create_indexes(cbm_store_t *s) {
@@ -1810,6 +1921,335 @@ int cbm_store_restore_from(cbm_store_t *dst, cbm_store_t *src) {
     return CBM_STORE_OK;
 }
 
+/* ── PageRank ───────────────────────────────────────────────────── */
+
+typedef struct {
+    int src_idx;
+    int dst_idx;
+} cbm_pagerank_edge_ref_t;
+
+static int pagerank_find_node_index(const int64_t *node_ids, int count, int64_t node_id) {
+    int lo = 0;
+    int hi = count - 1;
+    while (lo <= hi) {
+        int mid = lo + ((hi - lo) / 2);
+        if (node_ids[mid] == node_id) {
+            return mid;
+        }
+        if (node_ids[mid] < node_id) {
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return -1;
+}
+
+int cbm_store_compute_pagerank(cbm_store_t *s, const char *project, int iterations, double damping) {
+    int rc = CBM_STORE_OK;
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_stmt *insert_stmt = NULL;
+    int64_t *node_ids = NULL;
+    int node_cap = 0;
+    int node_count = 0;
+    cbm_pagerank_edge_ref_t *edges = NULL;
+    int edge_cap = 0;
+    int edge_count = 0;
+    int *out_degree = NULL;
+    double *scores = NULL;
+    double *next_scores = NULL;
+
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+    if (!store_has_node_scores_table(s)) {
+        store_set_error(s, "node_scores table is unavailable");
+        return CBM_STORE_ERR;
+    }
+    if (iterations <= 0) {
+        iterations = 20;
+    }
+    if (damping <= 0.0 || damping >= 1.0) {
+        damping = 0.85;
+    }
+
+    rc = sqlite3_prepare_v2(
+        s->db,
+        "SELECT id FROM nodes "
+        "WHERE project = ?1 AND label IN ('Function','Method','Class') "
+        "ORDER BY id;",
+        -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_set_error_sqlite(s, "pagerank.nodes");
+        rc = CBM_STORE_ERR;
+        goto cleanup;
+    }
+    bind_text(stmt, 1, project);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (node_count >= node_cap) {
+            node_cap = node_cap > 0 ? node_cap * 2 : 128;
+            node_ids = safe_realloc(node_ids, (size_t)node_cap * sizeof(int64_t));
+        }
+        node_ids[node_count++] = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+
+    if (node_count > 0) {
+        out_degree = calloc((size_t)node_count, sizeof(int));
+        scores = malloc((size_t)node_count * sizeof(double));
+        next_scores = malloc((size_t)node_count * sizeof(double));
+        if (!out_degree || !scores || !next_scores) {
+            store_set_error(s, "pagerank allocation failed");
+            rc = CBM_STORE_ERR;
+            goto cleanup;
+        }
+
+        rc = sqlite3_prepare_v2(
+            s->db,
+            "SELECT source_id, target_id FROM edges WHERE project = ?1 AND type = 'CALLS' "
+            "ORDER BY source_id, target_id;",
+            -1, &stmt, NULL);
+        if (rc != SQLITE_OK) {
+            store_set_error_sqlite(s, "pagerank.edges");
+            rc = CBM_STORE_ERR;
+            goto cleanup;
+        }
+        bind_text(stmt, 1, project);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int src_idx =
+                pagerank_find_node_index(node_ids, node_count, sqlite3_column_int64(stmt, 0));
+            int dst_idx =
+                pagerank_find_node_index(node_ids, node_count, sqlite3_column_int64(stmt, 1));
+            if (src_idx < 0 || dst_idx < 0) {
+                continue;
+            }
+            if (edge_count >= edge_cap) {
+                edge_cap = edge_cap > 0 ? edge_cap * 2 : 256;
+                edges = safe_realloc(edges, (size_t)edge_cap * sizeof(cbm_pagerank_edge_ref_t));
+            }
+            edges[edge_count].src_idx = src_idx;
+            edges[edge_count].dst_idx = dst_idx;
+            out_degree[src_idx]++;
+            edge_count++;
+        }
+        sqlite3_finalize(stmt);
+        stmt = NULL;
+
+        for (int i = 0; i < node_count; i++) {
+            scores[i] = 1.0 / (double)node_count;
+        }
+
+        for (int iter = 0; iter < iterations; iter++) {
+            double dangling_mass = 0.0;
+            double base = 0.0;
+
+            for (int i = 0; i < node_count; i++) {
+                if (out_degree[i] == 0) {
+                    dangling_mass += scores[i];
+                }
+            }
+
+            base = ((1.0 - damping) + (damping * dangling_mass)) / (double)node_count;
+            for (int i = 0; i < node_count; i++) {
+                next_scores[i] = base;
+            }
+
+            for (int i = 0; i < edge_count; i++) {
+                int src_idx = edges[i].src_idx;
+                int dst_idx = edges[i].dst_idx;
+                if (out_degree[src_idx] > 0) {
+                    next_scores[dst_idx] +=
+                        damping * (scores[src_idx] / (double)out_degree[src_idx]);
+                }
+            }
+
+            {
+                double *tmp = scores;
+                scores = next_scores;
+                next_scores = tmp;
+            }
+        }
+    }
+
+    rc = cbm_store_begin(s);
+    if (rc != CBM_STORE_OK) {
+        goto cleanup;
+    }
+
+    rc = sqlite3_prepare_v2(s->db, "DELETE FROM node_scores WHERE project = ?1;", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_set_error_sqlite(s, "pagerank.delete");
+        cbm_store_rollback(s);
+        rc = CBM_STORE_ERR;
+        goto cleanup;
+    }
+    bind_text(stmt, 1, project);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "pagerank.delete");
+        sqlite3_finalize(stmt);
+        stmt = NULL;
+        cbm_store_rollback(s);
+        rc = CBM_STORE_ERR;
+        goto cleanup;
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+
+    if (node_count == 0) {
+        rc = cbm_store_commit(s);
+        goto cleanup;
+    }
+
+    rc = sqlite3_prepare_v2(
+        s->db, "INSERT INTO node_scores (project, node_id, pagerank) VALUES (?1, ?2, ?3);", -1,
+        &insert_stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_set_error_sqlite(s, "pagerank.insert");
+        cbm_store_rollback(s);
+        rc = CBM_STORE_ERR;
+        goto cleanup;
+    }
+
+    for (int i = 0; i < node_count; i++) {
+        sqlite3_reset(insert_stmt);
+        sqlite3_clear_bindings(insert_stmt);
+        bind_text(insert_stmt, 1, project);
+        sqlite3_bind_int64(insert_stmt, 2, node_ids[i]);
+        sqlite3_bind_double(insert_stmt, 3, scores[i]);
+        if (sqlite3_step(insert_stmt) != SQLITE_DONE) {
+            store_set_error_sqlite(s, "pagerank.insert");
+            sqlite3_finalize(insert_stmt);
+            insert_stmt = NULL;
+            cbm_store_rollback(s);
+            rc = CBM_STORE_ERR;
+            goto cleanup;
+        }
+    }
+
+    sqlite3_finalize(insert_stmt);
+    insert_stmt = NULL;
+    rc = cbm_store_commit(s);
+    if (rc != CBM_STORE_OK) {
+        goto cleanup;
+    }
+
+    rc = CBM_STORE_OK;
+
+cleanup:
+    if (stmt) {
+        sqlite3_finalize(stmt);
+    }
+    if (insert_stmt) {
+        sqlite3_finalize(insert_stmt);
+    }
+    free(node_ids);
+    free(edges);
+    free(out_degree);
+    free(scores);
+    free(next_scores);
+    return rc;
+}
+
+int cbm_store_get_key_symbols(cbm_store_t *s, const char *project, const char *focus, int limit,
+                              cbm_key_symbol_t **out, int *count) {
+    sqlite3_stmt *stmt = NULL;
+    cbm_key_symbol_t *symbols = NULL;
+    int cap = 0;
+    int n = 0;
+    char *focus_like = NULL;
+    bool has_scores = false;
+    char sql[2048];
+
+    if (out) {
+        *out = NULL;
+    }
+    if (count) {
+        *count = 0;
+    }
+    if (!s || !s->db || !project || !out || !count) {
+        return CBM_STORE_ERR;
+    }
+
+    if (limit <= 0) {
+        limit = 20;
+    }
+    has_scores = store_has_node_scores_table(s);
+    if (focus && focus[0]) {
+        size_t len = strlen(focus);
+        focus_like = malloc(len + 3);
+        if (!focus_like) {
+            return CBM_STORE_ERR;
+        }
+        focus_like[0] = '%';
+        memcpy(focus_like + 1, focus, len);
+        focus_like[len + 1] = '%';
+        focus_like[len + 2] = '\0';
+    }
+
+    snprintf(
+        sql, sizeof(sql),
+        "SELECT n.name, n.qualified_name, n.label, n.file_path, "
+        "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.type = 'CALLS') AS in_deg, "
+        "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND e.type = 'CALLS') AS out_deg, "
+        "%s "
+        "FROM nodes n %s "
+        "WHERE n.project = ?1 AND n.label IN ('Function','Method','Class') %s"
+        "ORDER BY pagerank DESC, in_deg DESC, out_deg DESC, n.name "
+        "LIMIT %d;",
+        has_scores ? "COALESCE(ns.pagerank, 0.0) AS pagerank" : "0.0 AS pagerank",
+        has_scores ? "LEFT JOIN node_scores ns ON ns.project = n.project AND ns.node_id = n.id"
+                   : "",
+        focus_like ? "AND (n.name LIKE ?2 OR n.qualified_name LIKE ?2 OR n.file_path LIKE ?2) "
+                   : "",
+        limit);
+
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "key_symbols.prepare");
+        free(focus_like);
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, 1, project);
+    if (focus_like) {
+        bind_text(stmt, 2, focus_like);
+    }
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (n >= cap) {
+            cap = cap > 0 ? cap * 2 : 16;
+            symbols = safe_realloc(symbols, (size_t)cap * sizeof(cbm_key_symbol_t));
+        }
+        memset(&symbols[n], 0, sizeof(cbm_key_symbol_t));
+        symbols[n].name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        symbols[n].qualified_name = heap_strdup((const char *)sqlite3_column_text(stmt, 1));
+        symbols[n].label = heap_strdup((const char *)sqlite3_column_text(stmt, 2));
+        symbols[n].file_path = heap_strdup((const char *)sqlite3_column_text(stmt, 3));
+        symbols[n].in_degree = sqlite3_column_int(stmt, 4);
+        symbols[n].out_degree = sqlite3_column_int(stmt, 5);
+        symbols[n].pagerank = sqlite3_column_double(stmt, 6);
+        n++;
+    }
+
+    sqlite3_finalize(stmt);
+    free(focus_like);
+    *out = symbols;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
+void cbm_store_key_symbols_free(cbm_key_symbol_t *symbols, int count) {
+    if (!symbols) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free((void *)symbols[i].name);
+        free((void *)symbols[i].qualified_name);
+        free((void *)symbols[i].label);
+        free((void *)symbols[i].file_path);
+    }
+    free(symbols);
+}
+
 /* ── Search ─────────────────────────────────────────────────────── */
 
 /* Convert a glob pattern to SQL LIKE pattern. */
@@ -1954,13 +2394,14 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     char sql[4096];
     char count_sql[4096];
     int bind_idx = 0;
+    bool has_scores = store_has_node_scores_table(s);
 
     /* We build a query that selects nodes with optional degree subqueries */
     const char *select_cols =
         "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
         "n.file_path, n.start_line, n.end_line, n.properties, "
         "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.type = 'CALLS') AS in_deg, "
-        "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND e.type = 'CALLS') AS out_deg ";
+        "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND e.type = 'CALLS') AS out_deg, ";
 
     /* Start building WHERE */
     char where[2048] = "";
@@ -2012,6 +2453,15 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         ADD_WHERE(bind_buf);
         BIND_TEXT(params->name_pattern);
     }
+    if (params->qn_pattern) {
+        if (params->case_sensitive) {
+            snprintf(bind_buf, sizeof(bind_buf), "n.qualified_name REGEXP ?%d", bind_idx + 1);
+        } else {
+            snprintf(bind_buf, sizeof(bind_buf), "iregexp(?%d, n.qualified_name)", bind_idx + 1);
+        }
+        ADD_WHERE(bind_buf);
+        BIND_TEXT(params->qn_pattern);
+    }
     if (params->file_pattern) {
         like_pattern = cbm_glob_to_like(params->file_pattern);
         snprintf(bind_buf, sizeof(bind_buf), "n.file_path LIKE ?%d", bind_idx + 1);
@@ -2043,9 +2493,18 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
 
     /* Build full SQL */
     if (nparams > 0) {
-        snprintf(sql, sizeof(sql), "%s FROM nodes n WHERE %s", select_cols, where);
+        snprintf(sql, sizeof(sql), "%s%s FROM nodes n %s WHERE %s", select_cols,
+                 has_scores ? "COALESCE(ns.pagerank, 0.0) AS pagerank" : "0.0 AS pagerank",
+                 has_scores
+                     ? "LEFT JOIN node_scores ns ON ns.project = n.project AND ns.node_id = n.id"
+                     : "",
+                 where);
     } else {
-        snprintf(sql, sizeof(sql), "%s FROM nodes n", select_cols);
+        snprintf(sql, sizeof(sql), "%s%s FROM nodes n %s", select_cols,
+                 has_scores ? "COALESCE(ns.pagerank, 0.0) AS pagerank" : "0.0 AS pagerank",
+                 has_scores
+                     ? "LEFT JOIN node_scores ns ON ns.project = n.project AND ns.node_id = n.id"
+                     : "");
     }
 
     /* Degree filters: -1 = no filter, 0+ = active filter.
@@ -2076,12 +2535,20 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
      * When degree filter wraps in subquery, column refs lose the "n." prefix. */
     int limit = params->limit > 0 ? params->limit : 500000;
     int offset = params->offset;
-    bool has_degree_wrap = has_degree_filter;
-    // NOLINTNEXTLINE(readability-implicit-bool-conversion)
-    const char *name_col = has_degree_wrap ? "name" : "n.name";
+    const char *sort_by = (params->sort_by && params->sort_by[0]) ? params->sort_by : "name";
     char order_limit[128];
-    snprintf(order_limit, sizeof(order_limit), " ORDER BY %s LIMIT %d OFFSET %d", name_col, limit,
-             offset);
+    if (strcmp(sort_by, "degree") == 0) {
+        snprintf(order_limit, sizeof(order_limit),
+                 " ORDER BY (in_deg + out_deg) DESC, pagerank DESC, name LIMIT %d OFFSET %d",
+                 limit, offset);
+    } else if (strcmp(sort_by, "relevance") == 0) {
+        snprintf(order_limit, sizeof(order_limit),
+                 " ORDER BY pagerank DESC, (in_deg + out_deg) DESC, name LIMIT %d OFFSET %d",
+                 limit, offset);
+    } else {
+        snprintf(order_limit, sizeof(order_limit), " ORDER BY name LIMIT %d OFFSET %d", limit,
+                 offset);
+    }
     strncat(sql, order_limit, sizeof(sql) - strlen(sql) - 1);
 
     /* Execute count query */
@@ -2123,6 +2590,7 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         scan_node(main_stmt, &results[n].node);
         results[n].in_degree = sqlite3_column_int(main_stmt, 9);
         results[n].out_degree = sqlite3_column_int(main_stmt, 10);
+        results[n].pagerank = sqlite3_column_double(main_stmt, 11);
         n++;
     }
 
@@ -2195,6 +2663,7 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
     char sql[4096];
     const char *join_cond;
     const char *next_id;
+    bool has_scores = store_has_node_scores_table(s);
     // NOLINTNEXTLINE(readability-implicit-bool-conversion)
     bool is_inbound = direction && strcmp(direction, "inbound") == 0;
 
@@ -2216,13 +2685,18 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
              "  WHERE e.type IN (%s) AND bfs.hop < %d"
              ")"
              "SELECT DISTINCT n.id, n.project, n.label, n.name, n.qualified_name, "
-             "n.file_path, n.start_line, n.end_line, n.properties, bfs.hop "
+             "n.file_path, n.start_line, n.end_line, n.properties, bfs.hop, %s "
              "FROM bfs "
              "JOIN nodes n ON n.id = bfs.node_id "
+             "%s "
              "WHERE bfs.hop > 0 " /* exclude root */
              "ORDER BY bfs.hop "
              "LIMIT %d;",
-             (long long)start_id, next_id, join_cond, types_clause, max_depth, max_results);
+             (long long)start_id, next_id, join_cond, types_clause, max_depth,
+             has_scores ? "COALESCE(ns.pagerank, 0.0) AS pagerank" : "0.0 AS pagerank",
+             has_scores ? "LEFT JOIN node_scores ns ON ns.project = n.project AND ns.node_id = n.id"
+                        : "",
+             max_results);
 
     sqlite3_stmt *stmt = NULL;
     rc = sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL);
@@ -2251,6 +2725,7 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         }
         scan_node(stmt, &visited[n].node);
         visited[n].hop = sqlite3_column_int(stmt, 9);
+        visited[n].pagerank = sqlite3_column_double(stmt, 10);
         n++;
     }
 
@@ -2452,6 +2927,712 @@ int cbm_deduplicate_hops(const cbm_node_hop_t *hops, int hop_count, cbm_node_hop
     *out = safe_realloc(result, n * sizeof(cbm_node_hop_t));
     *out_count = n;
     return CBM_STORE_OK;
+}
+
+typedef struct {
+    int64_t id;
+    int hop;
+} impact_visit_t;
+
+typedef struct {
+    int64_t id;
+    cbm_node_t node;
+    double pagerank;
+} impact_cached_node_t;
+
+typedef struct {
+    CBMHashTable *seen_ids;
+    char **seen_keys;
+    int seen_key_count;
+    int seen_key_cap;
+    impact_visit_t *queue;
+    int queue_count;
+    int queue_cap;
+    impact_visit_t *visited;
+    int visited_count;
+    int visited_cap;
+} impact_walk_t;
+
+static void impact_walk_free(impact_walk_t *walk) {
+    if (!walk) {
+        return;
+    }
+    if (walk->seen_ids) {
+        cbm_ht_free(walk->seen_ids);
+    }
+    for (int i = 0; i < walk->seen_key_count; i++) {
+        free(walk->seen_keys[i]);
+    }
+    free(walk->seen_keys);
+    free(walk->queue);
+    free(walk->visited);
+    memset(walk, 0, sizeof(*walk));
+}
+
+static void impact_cached_nodes_free(impact_cached_node_t *nodes, int count) {
+    if (!nodes) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        cbm_node_free_fields(&nodes[i].node);
+    }
+    free(nodes);
+}
+
+static bool impact_label_is_callable(const char *label) {
+    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
+                     strcmp(label, "Class") == 0);
+}
+
+static bool impact_json_bool_field(const char *json, const char *key) {
+    if (!json || !json[0] || !key) {
+        return false;
+    }
+
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) {
+        return false;
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *value = root ? yyjson_obj_get(root, key) : NULL;
+    bool result = false;
+    if (value) {
+        if (yyjson_is_bool(value)) {
+            result = yyjson_is_true(value);
+        } else if (yyjson_is_uint(value)) {
+            result = yyjson_get_uint(value) != 0;
+        } else if (yyjson_is_int(value)) {
+            result = yyjson_get_sint(value) != 0;
+        }
+    }
+    yyjson_doc_free(doc);
+    return result;
+}
+
+static bool impact_node_is_entry_point(const cbm_node_t *node) {
+    if (!node) {
+        return false;
+    }
+    return impact_json_bool_field(node->properties_json, "is_entry_point");
+}
+
+static int impact_walk_enqueue(impact_walk_t *walk, int64_t id, int hop, bool record_visit) {
+    char key_buf[32];
+    snprintf(key_buf, sizeof(key_buf), "%lld", (long long)id);
+    if (walk->seen_ids && cbm_ht_get(walk->seen_ids, key_buf)) {
+        return CBM_STORE_OK;
+    }
+
+    char *key = heap_strdup(key_buf);
+    if (!key) {
+        return CBM_STORE_ERR;
+    }
+
+    if (walk->seen_key_count >= walk->seen_key_cap) {
+        int new_cap = walk->seen_key_cap > 0 ? walk->seen_key_cap * 2 : 16;
+        walk->seen_keys = safe_realloc(walk->seen_keys, (size_t)new_cap * sizeof(char *));
+        walk->seen_key_cap = new_cap;
+    }
+    walk->seen_keys[walk->seen_key_count++] = key;
+    cbm_ht_set(walk->seen_ids, key, (void *)1);
+
+    if (walk->queue_count >= walk->queue_cap) {
+        int new_cap = walk->queue_cap > 0 ? walk->queue_cap * 2 : 16;
+        walk->queue = safe_realloc(walk->queue, (size_t)new_cap * sizeof(impact_visit_t));
+        walk->queue_cap = new_cap;
+    }
+    walk->queue[walk->queue_count++] = (impact_visit_t){.id = id, .hop = hop};
+
+    if (record_visit) {
+        if (walk->visited_count >= walk->visited_cap) {
+            int new_cap = walk->visited_cap > 0 ? walk->visited_cap * 2 : 16;
+            walk->visited = safe_realloc(walk->visited, (size_t)new_cap * sizeof(impact_visit_t));
+            walk->visited_cap = new_cap;
+        }
+        walk->visited[walk->visited_count++] = (impact_visit_t){.id = id, .hop = hop};
+    }
+
+    return CBM_STORE_OK;
+}
+
+static bool impact_node_in_top_five_percent(cbm_store_t *s, const char *project, double pagerank) {
+    if (!s || !s->db || !project || pagerank <= 0.0 || !store_has_node_scores_table(s)) {
+        return false;
+    }
+
+    const char *total_sql =
+        "SELECT COUNT(*) FROM nodes WHERE project=?1 AND label IN ('Function','Method','Class')";
+    sqlite3_stmt *stmt = NULL;
+    int total = 0;
+    if (sqlite3_prepare_v2(s->db, total_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    bind_text(stmt, 1, project);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        total = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    if (total <= 0) {
+        return false;
+    }
+
+    int top_count = (total * 5 + 99) / 100;
+    if (top_count < 1) {
+        top_count = 1;
+    }
+
+    const char *higher_sql =
+        "SELECT COUNT(*) "
+        "FROM nodes n "
+        "JOIN node_scores ns ON ns.project = n.project AND ns.node_id = n.id "
+        "WHERE n.project=?1 AND n.label IN ('Function','Method','Class') "
+        "AND COALESCE(ns.pagerank, 0.0) > ?2";
+    int higher = total;
+    if (sqlite3_prepare_v2(s->db, higher_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    bind_text(stmt, 1, project);
+    sqlite3_bind_double(stmt, 2, pagerank);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        higher = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+
+    return higher < top_count;
+}
+
+static int impact_select_target(cbm_store_t *s, const char *project, const char *symbol,
+                                cbm_node_t *out_node, int *out_in_degree, double *out_pagerank) {
+    memset(out_node, 0, sizeof(*out_node));
+    *out_in_degree = 0;
+    *out_pagerank = 0.0;
+
+    if (!s || !s->db || !project || !symbol) {
+        return CBM_STORE_ERR;
+    }
+
+    bool has_scores = store_has_node_scores_table(s);
+    char sql[1024];
+    snprintf(sql, sizeof(sql),
+             "SELECT n.id, n.project, n.label, n.name, n.qualified_name, n.file_path, "
+             "n.start_line, n.end_line, n.properties, "
+             "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.type = 'CALLS') AS "
+             "in_deg, %s "
+             "FROM nodes n %s "
+             "WHERE n.project=?1 AND n.name=?2 AND n.label IN ('Function','Method','Class') "
+             "ORDER BY CASE WHEN lower(COALESCE(n.file_path, '')) LIKE '%%test%%' THEN 1 "
+             "ELSE 0 END, pagerank DESC, in_deg DESC, "
+             "n.qualified_name ASC LIMIT 1;",
+             has_scores ? "COALESCE(ns.pagerank, 0.0) AS pagerank" : "0.0 AS pagerank",
+             has_scores
+                 ? "LEFT JOIN node_scores ns ON ns.project = n.project AND ns.node_id = n.id"
+                 : "");
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "impact_select_target");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, 1, project);
+    bind_text(stmt, 2, symbol);
+
+    int rc = CBM_STORE_NOT_FOUND;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        scan_node(stmt, out_node);
+        *out_in_degree = sqlite3_column_int(stmt, 9);
+        *out_pagerank = sqlite3_column_double(stmt, 10);
+        rc = CBM_STORE_OK;
+    } else {
+        store_set_error(s, "symbol not found");
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+static int impact_cached_node_cmp(const void *lhs, const void *rhs) {
+    const impact_cached_node_t *a = lhs;
+    const impact_cached_node_t *b = rhs;
+    if (a->id < b->id) {
+        return -1;
+    }
+    if (a->id > b->id) {
+        return 1;
+    }
+    return 0;
+}
+
+static const impact_cached_node_t *impact_find_cached_node(const impact_cached_node_t *nodes,
+                                                           int count, int64_t id) {
+    int lo = 0;
+    int hi = count - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (nodes[mid].id == id) {
+            return &nodes[mid];
+        }
+        if (nodes[mid].id < id) {
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return NULL;
+}
+
+/* Chunk size for IN(...) batches — stays well under SQLite's default
+ * SQLITE_MAX_VARIABLE_NUMBER (999), leaving room for the ?1 project bind. */
+#define IMPACT_FETCH_CHUNK_SIZE 900
+
+static int impact_fetch_nodes_with_scores(cbm_store_t *s, const char *project,
+                                          const impact_visit_t *visits, int visit_count,
+                                          impact_cached_node_t **out_nodes, int *out_count) {
+    *out_nodes = NULL;
+    *out_count = 0;
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+    if (!visits || visit_count <= 0) {
+        return CBM_STORE_OK;
+    }
+
+    impact_cached_node_t *nodes = calloc((size_t)visit_count, sizeof(*nodes));
+    if (!nodes) {
+        return CBM_STORE_ERR;
+    }
+
+    bool has_scores = store_has_node_scores_table(s);
+    int count = 0;
+    int rc = CBM_STORE_OK;
+
+    for (int chunk_start = 0; chunk_start < visit_count; chunk_start += IMPACT_FETCH_CHUNK_SIZE) {
+        int chunk_end = chunk_start + IMPACT_FETCH_CHUNK_SIZE;
+        if (chunk_end > visit_count) chunk_end = visit_count;
+        int chunk_size = chunk_end - chunk_start;
+
+        size_t sql_cap = 512 + ((size_t)chunk_size * 8U);
+        char *sql = malloc(sql_cap);
+        if (!sql) {
+            impact_cached_nodes_free(nodes, count);
+            return CBM_STORE_ERR;
+        }
+
+        int written = snprintf(
+            sql, sql_cap,
+            "SELECT n.id, n.project, n.label, n.name, n.qualified_name, n.file_path, "
+            "n.start_line, n.end_line, n.properties, %s "
+            "FROM nodes n %s WHERE n.project=?1 AND n.id IN (",
+            has_scores ? "COALESCE(ns.pagerank, 0.0) AS pagerank" : "0.0 AS pagerank",
+            has_scores ? "LEFT JOIN node_scores ns ON ns.project = n.project AND ns.node_id = n.id"
+                       : "");
+        if (written < 0 || (size_t)written >= sql_cap) {
+            free(sql);
+            impact_cached_nodes_free(nodes, count);
+            return CBM_STORE_ERR;
+        }
+
+        size_t len = (size_t)written;
+        for (int i = 0; i < chunk_size; i++) {
+            written = snprintf(sql + len, sql_cap - len, "%s?%d", i > 0 ? "," : "", i + 2);
+            if (written < 0 || (size_t)written >= sql_cap - len) {
+                free(sql);
+                impact_cached_nodes_free(nodes, count);
+                return CBM_STORE_ERR;
+            }
+            len += (size_t)written;
+        }
+        written = snprintf(sql + len, sql_cap - len, ") ORDER BY n.id");
+        if (written < 0 || (size_t)written >= sql_cap - len) {
+            free(sql);
+            impact_cached_nodes_free(nodes, count);
+            return CBM_STORE_ERR;
+        }
+
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+            free(sql);
+            store_set_error_sqlite(s, "impact_fetch_nodes_with_scores");
+            impact_cached_nodes_free(nodes, count);
+            return CBM_STORE_ERR;
+        }
+        free(sql);
+
+        bind_text(stmt, 1, project);
+        for (int i = 0; i < chunk_size; i++) {
+            sqlite3_bind_int64(stmt, i + 2, visits[chunk_start + i].id);
+        }
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            if (count >= visit_count) {
+                rc = CBM_STORE_ERR;
+                break;
+            }
+            scan_node(stmt, &nodes[count].node);
+            nodes[count].id = nodes[count].node.id;
+            nodes[count].pagerank = sqlite3_column_double(stmt, 9);
+            count++;
+        }
+        sqlite3_finalize(stmt);
+
+        if (rc != CBM_STORE_OK) {
+            impact_cached_nodes_free(nodes, count);
+            return rc;
+        }
+    }
+
+    if (count > 1) {
+        qsort(nodes, (size_t)count, sizeof(*nodes), impact_cached_node_cmp);
+    }
+    *out_nodes = nodes;
+    *out_count = count;
+    return CBM_STORE_OK;
+}
+
+static int impact_enqueue_neighbors(cbm_store_t *s, impact_walk_t *walk, int64_t node_id,
+                                    const char *edge_type, bool inbound, int next_hop) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    int rc = inbound ? cbm_store_find_edges_by_target_type(s, node_id, edge_type, &edges, &edge_count)
+                     : cbm_store_find_edges_by_source_type(s, node_id, edge_type, &edges, &edge_count);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    for (int i = 0; i < edge_count; i++) {
+        int64_t next_id = inbound ? edges[i].source_id : edges[i].target_id;
+        rc = impact_walk_enqueue(walk, next_id, next_hop, true);
+        if (rc != CBM_STORE_OK) {
+            cbm_store_free_edges(edges, edge_count);
+            return rc;
+        }
+    }
+
+    cbm_store_free_edges(edges, edge_count);
+    return CBM_STORE_OK;
+}
+
+static int impact_append_item(cbm_impact_item_t **arr, int *count, int *cap, const cbm_node_t *node,
+                              const char *type, double pagerank, int hop) {
+    if (*count >= *cap) {
+        int new_cap = *cap > 0 ? *cap * 2 : 8;
+        *arr = safe_realloc(*arr, (size_t)new_cap * sizeof(cbm_impact_item_t));
+        *cap = new_cap;
+    }
+
+    cbm_impact_item_t item = {0};
+    item.name = heap_strdup(safe_str(node ? node->name : NULL));
+    item.file = heap_strdup(safe_str(node ? node->file_path : NULL));
+    item.type = heap_strdup(safe_str(type));
+    item.pagerank = pagerank;
+    item.hop = hop;
+
+    if (!item.name || !item.file || !item.type) {
+        free((void *)item.name);
+        free((void *)item.file);
+        free((void *)item.type);
+        return CBM_STORE_ERR;
+    }
+
+    (*arr)[(*count)++] = item;
+    return CBM_STORE_OK;
+}
+
+static int impact_append_test(cbm_affected_test_t **arr, int *count, int *cap, const cbm_node_t *node) {
+    if (*count >= *cap) {
+        int new_cap = *cap > 0 ? *cap * 2 : 4;
+        *arr = safe_realloc(*arr, (size_t)new_cap * sizeof(cbm_affected_test_t));
+        *cap = new_cap;
+    }
+
+    cbm_affected_test_t item = {0};
+    item.name = heap_strdup(safe_str(node ? node->name : NULL));
+    item.file = heap_strdup(safe_str(node ? node->file_path : NULL));
+    if (!item.name || !item.file) {
+        free((void *)item.name);
+        free((void *)item.file);
+        return CBM_STORE_ERR;
+    }
+
+    (*arr)[(*count)++] = item;
+    return CBM_STORE_OK;
+}
+
+static int impact_item_cmp(const void *lhs, const void *rhs) {
+    const cbm_impact_item_t *a = lhs;
+    const cbm_impact_item_t *b = rhs;
+    if (a->pagerank < b->pagerank) {
+        return 1;
+    }
+    if (a->pagerank > b->pagerank) {
+        return -1;
+    }
+    if (a->hop != b->hop) {
+        return a->hop - b->hop;
+    }
+    return strcmp(safe_str(a->name), safe_str(b->name));
+}
+
+static int impact_direct_caller_count(const cbm_impact_analysis_t *out) {
+    int direct_callers = 0;
+    for (int i = 0; i < out->direct_count; i++) {
+        if (out->direct[i].type && strcmp(out->direct[i].type, "route") == 0) {
+            continue;
+        }
+        direct_callers++;
+    }
+    return direct_callers;
+}
+
+static int impact_route_entry_count(const cbm_impact_analysis_t *out) {
+    int total = 0;
+    const cbm_impact_item_t *groups[] = {out->direct, out->indirect, out->transitive};
+    const int counts[] = {out->direct_count, out->indirect_count, out->transitive_count};
+    for (int g = 0; g < 3; g++) {
+        for (int i = 0; i < counts[g]; i++) {
+            const char *type = groups[g][i].type;
+            if (type && (strcmp(type, "route") == 0 || strcmp(type, "entry_point") == 0)) {
+                total++;
+            }
+        }
+    }
+    return total;
+}
+
+static char *impact_build_summary(const cbm_impact_analysis_t *out) {
+    int direct_callers = impact_direct_caller_count(out);
+    int route_entries = impact_route_entry_count(out);
+    int tests = out->affected_test_count;
+    int transitive = out->transitive_count;
+
+    char buf[256];
+    if (transitive > 0) {
+        snprintf(buf, sizeof(buf), "%d direct callers, %d route/entry points, %d affected tests, "
+                                   "%d transitive impacts",
+                 direct_callers, route_entries, tests, transitive);
+    } else {
+        snprintf(buf, sizeof(buf), "%d direct callers, %d route/entry points, %d affected tests",
+                 direct_callers, route_entries, tests);
+    }
+    return heap_strdup(buf);
+}
+
+static char *impact_determine_risk(const cbm_impact_analysis_t *out, bool top_five_percent) {
+    int direct_callers = impact_direct_caller_count(out);
+    int indirect_reach = out->indirect_count + out->transitive_count;
+    int route_entries = impact_route_entry_count(out);
+    bool has_tests = out->affected_test_count > 0;
+
+    if (direct_callers >= 3 || route_entries > 0 || top_five_percent) {
+        return heap_strdup("high");
+    }
+
+    if (direct_callers >= 1 && direct_callers <= 2 && indirect_reach > 0) {
+        return heap_strdup(has_tests ? "low" : "medium");
+    }
+
+    return heap_strdup("low");
+}
+
+int cbm_store_get_impact_analysis(cbm_store_t *s, const char *project, const char *symbol,
+                                  int depth, cbm_impact_analysis_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!s || !s->db || !project || !symbol) {
+        store_set_error(s, "impact analysis requires project and symbol");
+        return CBM_STORE_ERR;
+    }
+    if (depth < 1) {
+        depth = 1;
+    }
+
+    cbm_node_t target = {0};
+    int target_in_degree = 0;
+    double target_pagerank = 0.0;
+    int rc = impact_select_target(s, project, symbol, &target, &target_in_degree, &target_pagerank);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    impact_walk_t walk = {0};
+    walk.seen_ids = cbm_ht_create(64);
+    if (!walk.seen_ids) {
+        cbm_node_free_fields(&target);
+        store_set_error(s, "impact analysis alloc failed");
+        return CBM_STORE_ERR;
+    }
+
+    rc = impact_walk_enqueue(&walk, target.id, 0, false);
+    if (rc != CBM_STORE_OK) {
+        impact_walk_free(&walk);
+        cbm_node_free_fields(&target);
+        store_set_error(s, "impact analysis alloc failed");
+        return rc;
+    }
+
+    for (int head = 0; head < walk.queue_count; head++) {
+        impact_visit_t current = walk.queue[head];
+        if (current.hop >= depth) {
+            continue;
+        }
+
+        cbm_node_t node = {0};
+        if (cbm_store_find_node_by_id(s, current.id, &node) != CBM_STORE_OK) {
+            continue;
+        }
+
+        int next_hop = current.hop + 1;
+        if (impact_label_is_callable(node.label)) {
+            rc = impact_enqueue_neighbors(s, &walk, current.id, "CALLS", true, next_hop);
+            if (rc == CBM_STORE_OK) {
+                rc = impact_enqueue_neighbors(s, &walk, current.id, "HANDLES", false, next_hop);
+            }
+        } else if (node.label && strcmp(node.label, "Route") == 0) {
+            rc = impact_enqueue_neighbors(s, &walk, current.id, "HTTP_CALLS", true, next_hop);
+            if (rc == CBM_STORE_OK) {
+                rc = impact_enqueue_neighbors(s, &walk, current.id, "ASYNC_CALLS", true, next_hop);
+            }
+        } else {
+            rc = CBM_STORE_OK;
+        }
+
+        cbm_node_free_fields(&node);
+        if (rc != CBM_STORE_OK) {
+            impact_walk_free(&walk);
+            cbm_node_free_fields(&target);
+            cbm_store_impact_analysis_free(out);
+            store_set_error(s, "impact analysis traversal failed");
+            return rc;
+        }
+    }
+
+    impact_cached_node_t *cached_nodes = NULL;
+    int cached_count = 0;
+    rc = impact_fetch_nodes_with_scores(s, project, walk.visited, walk.visited_count, &cached_nodes,
+                                        &cached_count);
+    if (rc != CBM_STORE_OK) {
+        impact_walk_free(&walk);
+        cbm_node_free_fields(&target);
+        cbm_store_impact_analysis_free(out);
+        store_set_error(s, "impact analysis lookup failed");
+        return rc;
+    }
+
+    int direct_cap = 0;
+    int indirect_cap = 0;
+    int transitive_cap = 0;
+    int test_cap = 0;
+
+    for (int i = 0; i < walk.visited_count; i++) {
+        const impact_cached_node_t *cached =
+            impact_find_cached_node(cached_nodes, cached_count, walk.visited[i].id);
+        if (!cached) {
+            continue;
+        }
+
+        const cbm_node_t *node = &cached->node;
+        double pagerank = cached->pagerank;
+        bool is_test = cbm_is_test_file_path(node->file_path);
+        bool is_entry_point = impact_node_is_entry_point(node);
+
+        if (is_test) {
+            rc = impact_append_test(&out->affected_tests, &out->affected_test_count, &test_cap, node);
+        } else {
+            const char *item_type = (node->label && strcmp(node->label, "Route") == 0)
+                                        ? "route"
+                                        : (is_entry_point ? "entry_point" : "caller");
+            if (walk.visited[i].hop == 1) {
+                rc = impact_append_item(&out->direct, &out->direct_count, &direct_cap, node,
+                                        item_type, pagerank, walk.visited[i].hop);
+            } else if (walk.visited[i].hop <= 3) {
+                rc = impact_append_item(&out->indirect, &out->indirect_count, &indirect_cap, node,
+                                        item_type, pagerank, walk.visited[i].hop);
+            } else {
+                rc = impact_append_item(&out->transitive, &out->transitive_count, &transitive_cap,
+                                        node, item_type, pagerank, walk.visited[i].hop);
+            }
+        }
+
+        if (rc != CBM_STORE_OK) {
+            impact_cached_nodes_free(cached_nodes, cached_count);
+            impact_walk_free(&walk);
+            cbm_node_free_fields(&target);
+            cbm_store_impact_analysis_free(out);
+            store_set_error(s, "impact analysis alloc failed");
+            return rc;
+        }
+    }
+
+    if (out->direct_count > 1) {
+        qsort(out->direct, (size_t)out->direct_count, sizeof(cbm_impact_item_t), impact_item_cmp);
+    }
+    if (out->indirect_count > 1) {
+        qsort(out->indirect, (size_t)out->indirect_count, sizeof(cbm_impact_item_t),
+              impact_item_cmp);
+    }
+    if (out->transitive_count > 1) {
+        qsort(out->transitive, (size_t)out->transitive_count, sizeof(cbm_impact_item_t),
+              impact_item_cmp);
+    }
+
+    out->symbol = heap_strdup(safe_str(target.name));
+    out->qualified_name = heap_strdup(safe_str(target.qualified_name));
+    out->file = heap_strdup(safe_str(target.file_path));
+    out->pagerank = target_pagerank;
+    bool top_five_percent = impact_node_in_top_five_percent(s, project, target_pagerank);
+    out->risk_score = impact_determine_risk(out, top_five_percent);
+    out->summary = impact_build_summary(out);
+
+    impact_cached_nodes_free(cached_nodes, cached_count);
+    impact_walk_free(&walk);
+    cbm_node_free_fields(&target);
+
+    if (!out->symbol || !out->qualified_name || !out->file || !out->risk_score || !out->summary) {
+        cbm_store_impact_analysis_free(out);
+        store_set_error(s, "impact analysis alloc failed");
+        return CBM_STORE_ERR;
+    }
+
+    (void)target_in_degree;
+    return CBM_STORE_OK;
+}
+
+void cbm_store_impact_analysis_free(cbm_impact_analysis_t *out) {
+    if (!out) {
+        return;
+    }
+
+    for (int i = 0; i < out->direct_count; i++) {
+        free((void *)out->direct[i].name);
+        free((void *)out->direct[i].file);
+        free((void *)out->direct[i].type);
+    }
+    free(out->direct);
+
+    for (int i = 0; i < out->indirect_count; i++) {
+        free((void *)out->indirect[i].name);
+        free((void *)out->indirect[i].file);
+        free((void *)out->indirect[i].type);
+    }
+    free(out->indirect);
+
+    for (int i = 0; i < out->transitive_count; i++) {
+        free((void *)out->transitive[i].name);
+        free((void *)out->transitive[i].file);
+        free((void *)out->transitive[i].type);
+    }
+    free(out->transitive);
+
+    for (int i = 0; i < out->affected_test_count; i++) {
+        free((void *)out->affected_tests[i].name);
+        free((void *)out->affected_tests[i].file);
+    }
+    free(out->affected_tests);
+
+    free((void *)out->symbol);
+    free((void *)out->qualified_name);
+    free((void *)out->file);
+    free((void *)out->risk_score);
+    free((void *)out->summary);
+    memset(out, 0, sizeof(*out));
 }
 
 /* ── Schema ─────────────────────────────────────────────────────── */
@@ -4082,6 +5263,1112 @@ void cbm_store_architecture_free(cbm_architecture_info_t *out) {
         free((void *)out->file_tree[i].type);
     }
     free(out->file_tree);
+    memset(out, 0, sizeof(*out));
+}
+
+typedef struct {
+    int64_t node_id;
+    char *path;
+    int inbound_calls;
+    int outbound_calls;
+} arch_summary_file_row_t;
+
+typedef struct {
+    int community;
+    int *member_indices;
+    int member_count;
+    int member_cap;
+} arch_summary_cluster_row_t;
+
+static char *summary_focus_term(const char *focus) {
+    if (!focus || !focus[0]) {
+        return NULL;
+    }
+    size_t len = strlen(focus);
+    char *term = malloc(len + 1);
+    if (!term) {
+        return NULL;
+    }
+    for (size_t i = 0; i < len; i++) {
+        term[i] = (char)tolower((unsigned char)focus[i]);
+    }
+    term[len] = '\0';
+    return term;
+}
+
+static char *summary_focus_like(const char *focus) {
+    char *term = summary_focus_term(focus);
+    if (!term) {
+        return NULL;
+    }
+    size_t len = strlen(term);
+    char *like = malloc(len + 3);
+    if (!like) {
+        free(term);
+        return NULL;
+    }
+    like[0] = '%';
+    memcpy(like + 1, term, len);
+    like[len + 1] = '%';
+    like[len + 2] = '\0';
+    free(term);
+    return like;
+}
+
+static bool summary_text_matches(const char *focus_term, const char *text) {
+    if (!focus_term || !focus_term[0]) {
+        return true;
+    }
+    if (!text || !text[0]) {
+        return false;
+    }
+    return cbm_strcasestr(text, focus_term) != NULL;
+}
+
+static int summary_count_nodes(cbm_store_t *s, const char *project, const char *label_sql,
+                               const char *focus_like) {
+    char sql[2048];
+    if (focus_like && focus_like[0]) {
+        snprintf(sql, sizeof(sql),
+                 "SELECT COUNT(*) FROM nodes "
+                 "WHERE project=?1 AND %s "
+                 "AND (json_extract(properties, '$.is_test') IS NULL OR "
+                 "json_extract(properties, '$.is_test') != 1) "
+                 "AND lower(COALESCE(file_path, '')) NOT LIKE '%%test%%' "
+                 "AND (lower(COALESCE(name, '')) LIKE ?2 "
+                 "OR lower(COALESCE(qualified_name, '')) LIKE ?2 "
+                 "OR lower(COALESCE(file_path, '')) LIKE ?2 "
+                 "OR lower(COALESCE(properties, '')) LIKE ?2);",
+                 label_sql);
+    } else {
+        snprintf(sql, sizeof(sql),
+                 "SELECT COUNT(*) FROM nodes "
+                 "WHERE project=?1 AND %s "
+                 "AND (json_extract(properties, '$.is_test') IS NULL OR "
+                 "json_extract(properties, '$.is_test') != 1) "
+                 "AND lower(COALESCE(file_path, '')) NOT LIKE '%%test%%';",
+                 label_sql);
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "summary_count_nodes");
+        return 0; /* return 0 rather than -1 so callers display "0" not "-1" */
+    }
+    bind_text(stmt, 1, project);
+    if (focus_like && focus_like[0]) {
+        bind_text(stmt, 2, focus_like);
+    }
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+static int summary_file_row_cmp(const void *lhs, const void *rhs) {
+    const arch_summary_file_row_t *a = lhs;
+    const arch_summary_file_row_t *b = rhs;
+    int64_t a_score = (int64_t)a->inbound_calls + (int64_t)a->outbound_calls;
+    int64_t b_score = (int64_t)b->inbound_calls + (int64_t)b->outbound_calls;
+    if (a_score != b_score) {
+        return b_score > a_score ? 1 : -1;
+    }
+    if (a->inbound_calls != b->inbound_calls) {
+        return b->inbound_calls > a->inbound_calls ? 1 : -1;
+    }
+    if (!a->path) {
+        return 1;
+    }
+    if (!b->path) {
+        return -1;
+    }
+    return strcmp(a->path, b->path);
+}
+
+static void summary_copy_json_scalar(yyjson_val *val, char *out, size_t out_sz) {
+    if (out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!val) {
+        return;
+    }
+
+    if (yyjson_is_str(val)) {
+        snprintf(out, out_sz, "%s", yyjson_get_str(val));
+        return;
+    }
+    if (yyjson_is_bool(val)) {
+        snprintf(out, out_sz, "%s", yyjson_get_bool(val) ? "true" : "false");
+        return;
+    }
+    if (yyjson_is_int(val) || yyjson_is_sint(val)) {
+        snprintf(out, out_sz, "%lld", (long long)yyjson_get_sint(val));
+        return;
+    }
+    if (yyjson_is_uint(val)) {
+        snprintf(out, out_sz, "%llu", (unsigned long long)yyjson_get_uint(val));
+        return;
+    }
+    if (yyjson_is_real(val)) {
+        snprintf(out, out_sz, "%.17g", yyjson_get_real(val));
+    }
+}
+
+static void summary_extract_route_fields(const char *props, char *method, size_t method_sz,
+                                         char *path, size_t path_sz, char *handler,
+                                         size_t handler_sz) {
+    method[0] = '\0';
+    path[0] = '\0';
+    handler[0] = '\0';
+    if (!props) {
+        return;
+    }
+
+    yyjson_doc *doc = yyjson_read(props, strlen(props), 0);
+    if (!doc) {
+        return;
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (yyjson_is_obj(root)) {
+        summary_copy_json_scalar(yyjson_obj_get(root, "method"), method, method_sz);
+        summary_copy_json_scalar(yyjson_obj_get(root, "path"), path, path_sz);
+        summary_copy_json_scalar(yyjson_obj_get(root, "handler"), handler, handler_sz);
+    }
+    yyjson_doc_free(doc);
+}
+
+static int summary_collect_file_rows(cbm_store_t *s, const char *project, const char *focus_like,
+                                     arch_summary_file_row_t **out_rows, int *out_count,
+                                     cbm_louvain_edge_t **out_edges, int *out_edge_count) {
+    *out_rows = NULL;
+    *out_count = 0;
+    *out_edges = NULL;
+    *out_edge_count = 0;
+
+    const char *files_sql_no_focus =
+        "SELECT id, COALESCE(NULLIF(file_path, ''), name) "
+        "FROM nodes "
+        "WHERE project=?1 AND label='File' "
+        "AND lower(COALESCE(file_path, '')) NOT LIKE '%test%' "
+        "ORDER BY 2;";
+    const char *files_sql_focus =
+        "SELECT n.id, COALESCE(NULLIF(n.file_path, ''), n.name) "
+        "FROM nodes n "
+        "WHERE n.project=?1 AND n.label='File' "
+        "AND lower(COALESCE(n.file_path, '')) NOT LIKE '%test%' "
+        "AND (lower(COALESCE(n.file_path, '')) LIKE ?2 "
+        "OR lower(COALESCE(n.name, '')) LIKE ?2 "
+        "OR lower(COALESCE(n.qualified_name, '')) LIKE ?2 "
+        "OR EXISTS (SELECT 1 FROM nodes m "
+        "           WHERE m.project = n.project "
+        "             AND m.file_path = n.file_path "
+        "             AND lower(COALESCE(m.file_path, '')) NOT LIKE '%test%' "
+        "             AND (lower(COALESCE(m.name, '')) LIKE ?2 "
+        "                  OR lower(COALESCE(m.qualified_name, '')) LIKE ?2 "
+        "                  OR lower(COALESCE(m.file_path, '')) LIKE ?2 "
+        "                  OR lower(COALESCE(m.properties, '')) LIKE ?2))) "
+        "ORDER BY 2;";
+
+    sqlite3_stmt *stmt = NULL;
+    const char *files_sql = (focus_like && focus_like[0]) ? files_sql_focus : files_sql_no_focus;
+    if (sqlite3_prepare_v2(s->db, files_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "summary_collect_files");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, 1, project);
+    if (focus_like && focus_like[0]) {
+        bind_text(stmt, 2, focus_like);
+    }
+
+    int cap = 16;
+    int count = 0;
+    arch_summary_file_row_t *rows = calloc(cap, sizeof(arch_summary_file_row_t));
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (count >= cap) {
+            int old_cap = cap;
+            cap *= 2;
+            rows = safe_realloc(rows, (size_t)cap * sizeof(arch_summary_file_row_t));
+            memset(rows + old_cap, 0, (size_t)(cap - old_cap) * sizeof(arch_summary_file_row_t));
+        }
+        rows[count].node_id = sqlite3_column_int64(stmt, 0);
+        rows[count].path = heap_strdup((const char *)sqlite3_column_text(stmt, 1));
+        count++;
+    }
+    sqlite3_finalize(stmt);
+
+    CBMHashTable *file_rows = cbm_ht_create(count > 0 ? (uint32_t)count * 2U : 32U);
+    if (!file_rows) {
+        for (int i = 0; i < count; i++) {
+            free(rows[i].path);
+        }
+        free(rows);
+        store_set_error(s, "summary_collect_file_rows: file lookup alloc failed");
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < count; i++) {
+        if (rows[i].path && rows[i].path[0]) {
+            cbm_ht_set(file_rows, rows[i].path, (void *)((intptr_t)i + 1));
+        }
+    }
+
+    const char *edges_sql =
+        "SELECT src.file_path, dst.file_path "
+        "FROM edges e "
+        "JOIN nodes src ON src.id = e.source_id "
+        "JOIN nodes dst ON dst.id = e.target_id "
+        "WHERE e.project=?1 AND e.type='CALLS' "
+        "AND src.file_path <> '' AND dst.file_path <> '' "
+        "AND src.file_path <> dst.file_path "
+        "AND lower(src.file_path) NOT LIKE '%test%' "
+        "AND lower(dst.file_path) NOT LIKE '%test%';";
+
+    stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, edges_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        cbm_ht_free(file_rows);
+        for (int i = 0; i < count; i++) {
+            free(rows[i].path);
+        }
+        free(rows);
+        store_set_error_sqlite(s, "summary_collect_edges");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, 1, project);
+
+    int edge_cap = 64;
+    int edge_count = 0;
+    cbm_louvain_edge_t *edges = malloc((size_t)edge_cap * sizeof(cbm_louvain_edge_t));
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *src_file = (const char *)sqlite3_column_text(stmt, 0);
+        const char *dst_file = (const char *)sqlite3_column_text(stmt, 1);
+        intptr_t src_val = (intptr_t)(src_file ? cbm_ht_get(file_rows, src_file) : NULL);
+        intptr_t dst_val = (intptr_t)(dst_file ? cbm_ht_get(file_rows, dst_file) : NULL);
+        int src_idx = src_val ? (int)(src_val - 1) : -1;
+        int dst_idx = dst_val ? (int)(dst_val - 1) : -1;
+        if (src_idx < 0 || dst_idx < 0 || src_idx == dst_idx) {
+            continue;
+        }
+
+        rows[src_idx].outbound_calls++;
+        rows[dst_idx].inbound_calls++;
+
+        if (edge_count >= edge_cap) {
+            edge_cap *= 2;
+            edges = safe_realloc(edges, (size_t)edge_cap * sizeof(cbm_louvain_edge_t));
+        }
+        edges[edge_count].src = rows[src_idx].node_id;
+        edges[edge_count].dst = rows[dst_idx].node_id;
+        edge_count++;
+    }
+    sqlite3_finalize(stmt);
+    cbm_ht_free(file_rows);
+
+    *out_rows = rows;
+    *out_count = count;
+    *out_edges = edges;
+    *out_edge_count = edge_count;
+    return CBM_STORE_OK;
+}
+
+static int summary_fill_key_symbols(cbm_store_t *s, const char *project, cbm_arch_summary_file_t *file) {
+    const char *sql =
+        "SELECT name, "
+        "CASE WHEN end_line >= start_line AND start_line > 0 "
+        "THEN end_line - start_line + 1 ELSE 0 END AS span "
+        "FROM nodes "
+        "WHERE project=?1 AND file_path=?2 "
+        "AND label IN ('Function','Method') "
+        "AND (json_extract(properties, '$.is_test') IS NULL OR "
+        "json_extract(properties, '$.is_test') != 1) "
+        "ORDER BY span DESC, name "
+        "LIMIT 3;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "summary_fill_key_symbols");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, 1, project);
+    bind_text(stmt, 2, file->file);
+
+    int cap = 4;
+    int count = 0;
+    cbm_arch_summary_symbol_t *symbols = calloc(cap, sizeof(cbm_arch_summary_symbol_t));
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (count >= cap) {
+            cap *= 2;
+            symbols = safe_realloc(symbols, (size_t)cap * sizeof(cbm_arch_summary_symbol_t));
+        }
+        symbols[count].name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        symbols[count].span_lines = sqlite3_column_int(stmt, 1);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+
+    file->symbols = symbols;
+    file->symbol_count = count;
+    return CBM_STORE_OK;
+}
+
+static int summary_find_handler_node(cbm_store_t *s, const char *project, const char *handler,
+                                     int64_t *out_id, char **out_file_path) {
+    *out_id = 0;
+    *out_file_path = NULL;
+    if (!handler || !handler[0]) {
+        return CBM_STORE_NOT_FOUND;
+    }
+
+    char owner[256] = "";
+    char member[256] = "";
+    const char *sep = strchr(handler, '@');
+    int sep_len = 1;
+    const char *scope = strstr(handler, "::");
+    if (scope && (!sep || scope < sep)) {
+        sep = scope;
+        sep_len = 2;
+    }
+
+    if (sep) {
+        size_t owner_len = (size_t)(sep - handler);
+        if (owner_len >= sizeof(owner)) {
+            owner_len = sizeof(owner) - 1;
+        }
+        memcpy(owner, handler, owner_len);
+        owner[owner_len] = '\0';
+        snprintf(member, sizeof(member), "%s", sep + sep_len);
+    } else {
+        snprintf(member, sizeof(member), "%s", handler);
+    }
+
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_name(s, project, member, &nodes, &count) != CBM_STORE_OK ||
+        count == 0) {
+        cbm_store_free_nodes(nodes, count);
+        return CBM_STORE_NOT_FOUND;
+    }
+
+    int pick = 0;
+    for (int i = 0; i < count; i++) {
+        if (owner[0] &&
+            ((nodes[i].qualified_name && cbm_strcasestr(nodes[i].qualified_name, owner)) ||
+             (nodes[i].file_path && cbm_strcasestr(nodes[i].file_path, owner)))) {
+            pick = i;
+            break;
+        }
+        if (!owner[0] && nodes[i].file_path && !cbm_is_test_file_path(nodes[i].file_path)) {
+            pick = i;
+            break;
+        }
+    }
+
+    *out_id = nodes[pick].id;
+    if (nodes[pick].file_path && nodes[pick].file_path[0]) {
+        *out_file_path = heap_strdup(nodes[pick].file_path);
+    }
+    cbm_store_free_nodes(nodes, count);
+    return CBM_STORE_OK;
+}
+
+static int summary_query_primary_callee(cbm_store_t *s, int64_t source_id, const char *source_file,
+                                        char **out_name, int64_t *out_id, char **out_file_path) {
+    *out_name = NULL;
+    if (out_id) {
+        *out_id = 0;
+    }
+    if (out_file_path) {
+        *out_file_path = NULL;
+    }
+
+    const char *sql =
+        "SELECT n.id, n.name, COALESCE(n.file_path, '') "
+        "FROM edges e "
+        "JOIN nodes n ON n.id = e.target_id "
+        "WHERE e.source_id=?1 AND e.type='CALLS' "
+        "AND (json_extract(n.properties, '$.is_test') IS NULL OR "
+        "json_extract(n.properties, '$.is_test') != 1) "
+        "ORDER BY CASE "
+        "           WHEN ?2 <> '' AND COALESCE(n.file_path, '') <> '' "
+        "             AND COALESCE(n.file_path, '') <> ?2 THEN 0 "
+        "           ELSE 1 "
+        "         END, "
+        "         CASE WHEN n.label IN ('Method','Function') THEN 0 ELSE 1 END, "
+        "         n.name "
+        "LIMIT 1;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "summary_query_primary_callee");
+        return CBM_STORE_ERR;
+    }
+    sqlite3_bind_int64(stmt, 1, source_id);
+    bind_text(stmt, 2, source_file ? source_file : "");
+
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(stmt, 1);
+        const char *file_path = (const char *)sqlite3_column_text(stmt, 2);
+        if (out_id) {
+            *out_id = sqlite3_column_int64(stmt, 0);
+        }
+        *out_name = heap_strdup(name);
+        if (out_file_path && file_path && file_path[0]) {
+            *out_file_path = heap_strdup(file_path);
+        }
+    }
+    sqlite3_finalize(stmt);
+    return CBM_STORE_OK;
+}
+
+static int summary_collect_routes(cbm_store_t *s, const char *project, const char *focus_term,
+                                  cbm_arch_summary_route_t **out_arr, int *out_count) {
+    *out_arr = NULL;
+    *out_count = 0;
+
+    const char *sql =
+        "SELECT name, properties, COALESCE(file_path, '') "
+        "FROM nodes "
+        "WHERE project=?1 AND label='Route' "
+        "AND (json_extract(properties, '$.is_test') IS NULL OR "
+        "json_extract(properties, '$.is_test') != 1) "
+        "ORDER BY name;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "summary_collect_routes");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, 1, project);
+
+    int cap = 8;
+    int count = 0;
+    cbm_arch_summary_route_t *routes = calloc(cap, sizeof(cbm_arch_summary_route_t));
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(stmt, 0);
+        const char *props = (const char *)sqlite3_column_text(stmt, 1);
+        const char *route_file = (const char *)sqlite3_column_text(stmt, 2);
+        if (cbm_is_test_file_path(route_file)) {
+            continue;
+        }
+
+        char method[64];
+        char path[512];
+        char handler[256];
+        summary_extract_route_fields(props, method, sizeof(method), path, sizeof(path), handler,
+                                     sizeof(handler));
+
+        if (!path[0] && name) {
+            snprintf(path, sizeof(path), "%s", name);
+        }
+
+        int64_t handler_id = 0;
+        char *handler_file = NULL;
+        if (handler[0]) {
+            (void)summary_find_handler_node(s, project, handler, &handler_id, &handler_file);
+        }
+
+        char *service = NULL;
+        char *next = NULL;
+        char *service_file = NULL;
+        int64_t service_id = 0;
+        if (handler_id > 0) {
+            (void)summary_query_primary_callee(s, handler_id, handler_file, &service, &service_id,
+                                               &service_file);
+            if (service_id > 0) {
+                (void)summary_query_primary_callee(s, service_id,
+                                                   service_file ? service_file : handler_file, &next,
+                                                   NULL, NULL);
+            }
+        }
+
+        if (focus_term && focus_term[0] &&
+            !summary_text_matches(focus_term, method) &&
+            !summary_text_matches(focus_term, path) &&
+            !summary_text_matches(focus_term, handler) &&
+            !summary_text_matches(focus_term, service) &&
+            !summary_text_matches(focus_term, next) &&
+            !summary_text_matches(focus_term, handler_file)) {
+            free(service_file);
+            free(handler_file);
+            free(service);
+            free(next);
+            continue;
+        }
+
+        if (count >= cap) {
+            cap *= 2;
+            routes = safe_realloc(routes, (size_t)cap * sizeof(cbm_arch_summary_route_t));
+        }
+
+        routes[count].method = heap_strdup(method[0] ? method : "");
+        routes[count].path = heap_strdup(path[0] ? path : "");
+        routes[count].handler = heap_strdup(handler[0] ? handler : "");
+        routes[count].service = service;
+        routes[count].next = next;
+        routes[count].handler_file = handler_file;
+        free(service_file);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+
+    *out_arr = routes;
+    *out_count = count;
+    return CBM_STORE_OK;
+}
+
+static void summary_cluster_add_member(arch_summary_cluster_row_t *cluster, int member_index) {
+    if (cluster->member_count >= cluster->member_cap) {
+        cluster->member_cap = cluster->member_cap ? cluster->member_cap * 2 : 4;
+        cluster->member_indices =
+            safe_realloc(cluster->member_indices, (size_t)cluster->member_cap * sizeof(int));
+    }
+    cluster->member_indices[cluster->member_count++] = member_index;
+}
+
+static const char *summary_handler_owner_token(const char *handler, char *buf, size_t buf_size) {
+    if (!handler || !handler[0] || !buf || buf_size == 0) {
+        return NULL;
+    }
+
+    const char *sep = strchr(handler, '@');
+    size_t len = sep ? (size_t)(sep - handler) : strlen(handler);
+    const char *scope = strstr(handler, "::");
+    if (scope && (!sep || scope < sep)) {
+        len = (size_t)(scope - handler);
+    }
+    if (len == 0) {
+        return NULL;
+    }
+    if (len >= buf_size) {
+        len = buf_size - 1;
+    }
+    memcpy(buf, handler, len);
+    buf[len] = '\0';
+    return buf;
+}
+
+static int summary_cluster_cmp(const void *lhs, const void *rhs) {
+    const arch_summary_cluster_row_t *a = lhs;
+    const arch_summary_cluster_row_t *b = rhs;
+    return b->member_count - a->member_count;
+}
+
+static bool summary_cluster_has_file(const arch_summary_cluster_row_t *cluster,
+                                     const arch_summary_file_row_t *rows, const char *path) {
+    if (!cluster || !rows || !path) {
+        return false;
+    }
+    for (int i = 0; i < cluster->member_count; i++) {
+        const char *candidate = rows[cluster->member_indices[i]].path;
+        if (candidate && strcmp(candidate, path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool summary_cluster_matches_route(const arch_summary_cluster_row_t *cluster,
+                                          const arch_summary_file_row_t *rows,
+                                          const cbm_arch_summary_route_t *route) {
+    char owner_buf[256];
+    const char *owner = NULL;
+
+    if (!cluster || !rows || !route) {
+        return false;
+    }
+    if (summary_cluster_has_file(cluster, rows, route->handler_file)) {
+        return true;
+    }
+
+    owner = summary_handler_owner_token(route->handler, owner_buf, sizeof(owner_buf));
+    if (!owner || !owner[0]) {
+        return false;
+    }
+
+    for (int i = 0; i < cluster->member_count; i++) {
+        const char *candidate = rows[cluster->member_indices[i]].path;
+        if (candidate && cbm_strcasestr(candidate, owner)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int summary_build_clusters(const arch_summary_file_row_t *rows, int row_count,
+                                  const cbm_louvain_edge_t *edges, int edge_count,
+                                  const cbm_arch_summary_route_t *routes, int route_count,
+                                  cbm_arch_summary_cluster_t **out_arr, int *out_count) {
+    *out_arr = NULL;
+    *out_count = 0;
+    if (row_count == 0 || edge_count == 0) {
+        return CBM_STORE_OK;
+    }
+
+    int64_t *node_ids = malloc((size_t)row_count * sizeof(int64_t));
+    for (int i = 0; i < row_count; i++) {
+        node_ids[i] = rows[i].node_id;
+    }
+
+    cbm_louvain_result_t *results = NULL;
+    int result_count = 0;
+    int rc = cbm_louvain(node_ids, row_count, edges, edge_count, &results, &result_count);
+    free(node_ids);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    CBMHashTable *row_by_id = cbm_ht_create(row_count > 0 ? (uint32_t)row_count * 2U : 32U);
+    char(*row_id_keys)[32] = NULL;
+    if (!row_by_id) {
+        free(results);
+        return CBM_STORE_ERR;
+    }
+    row_id_keys = calloc((size_t)row_count, sizeof(*row_id_keys));
+    if (!row_id_keys) {
+        cbm_ht_free(row_by_id);
+        free(results);
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < row_count; i++) {
+        snprintf(row_id_keys[i], sizeof(row_id_keys[i]), "%lld", (long long)rows[i].node_id);
+        cbm_ht_set(row_by_id, row_id_keys[i], (void *)((intptr_t)i + 1));
+    }
+
+    int cap = 8;
+    int count = 0;
+    arch_summary_cluster_row_t *clusters = calloc(cap, sizeof(arch_summary_cluster_row_t));
+    for (int i = 0; i < result_count; i++) {
+        char result_key[32];
+        snprintf(result_key, sizeof(result_key), "%lld", (long long)results[i].node_id);
+        intptr_t row_val = (intptr_t)cbm_ht_get(row_by_id, result_key);
+        int member_index = row_val ? (int)(row_val - 1) : -1;
+        if (member_index < 0) {
+            continue;
+        }
+
+        int slot = -1;
+        for (int j = 0; j < count; j++) {
+            if (clusters[j].community == results[i].community) {
+                slot = j;
+                break;
+            }
+        }
+        if (slot < 0) {
+            if (count >= cap) {
+                int old_cap = cap;
+                cap *= 2;
+                clusters = safe_realloc(clusters, (size_t)cap * sizeof(arch_summary_cluster_row_t));
+                memset(clusters + old_cap, 0,
+                       (size_t)(cap - old_cap) * sizeof(arch_summary_cluster_row_t));
+            }
+            slot = count++;
+            clusters[slot].community = results[i].community;
+        }
+        summary_cluster_add_member(&clusters[slot], member_index);
+    }
+    free(row_id_keys);
+    cbm_ht_free(row_by_id);
+    free(results);
+
+    int write_idx = 0;
+    for (int i = 0; i < count; i++) {
+        if (clusters[i].member_count < 2) {
+            free(clusters[i].member_indices);
+            continue;
+        }
+        if (write_idx != i) {
+            clusters[write_idx] = clusters[i];
+        }
+        write_idx++;
+    }
+    count = write_idx;
+    if (count == 0) {
+        free(clusters);
+        return CBM_STORE_OK;
+    }
+
+    qsort(clusters, (size_t)count, sizeof(arch_summary_cluster_row_t), summary_cluster_cmp);
+    if (count > 6) {
+        for (int i = 6; i < count; i++) {
+            free(clusters[i].member_indices);
+        }
+        count = 6;
+    }
+
+    cbm_arch_summary_cluster_t *out = calloc((size_t)count, sizeof(cbm_arch_summary_cluster_t));
+    for (int i = 0; i < count; i++) {
+        out[i].id = i + 1;
+        out[i].file_count = clusters[i].member_count;
+
+        int core_count = clusters[i].member_count < 3 ? clusters[i].member_count : 3;
+        // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
+        out[i].core_files = calloc((size_t)core_count, sizeof(char *));
+        out[i].core_file_count = core_count;
+        for (int core = 0; core < core_count; core++) {
+            int best_idx = -1;
+            int best_score = -1;
+            for (int m = 0; m < clusters[i].member_count; m++) {
+                int row_idx = clusters[i].member_indices[m];
+                int score = rows[row_idx].inbound_calls + rows[row_idx].outbound_calls;
+                bool already_used = false;
+                for (int prev = 0; prev < core; prev++) {
+                    const char *used = out[i].core_files[prev];
+                    if (used && rows[row_idx].path && strcmp(used, rows[row_idx].path) == 0) {
+                        already_used = true;
+                        break;
+                    }
+                }
+                if (!already_used && score > best_score) {
+                    best_score = score;
+                    best_idx = row_idx;
+                }
+            }
+            if (best_idx >= 0) {
+                ((char **)out[i].core_files)[core] = heap_strdup(rows[best_idx].path);
+            }
+        }
+
+        int entry_cap = 4;
+        int entry_count = 0;
+        // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
+        char **entries = calloc((size_t)entry_cap, sizeof(char *));
+        for (int r = 0; r < route_count; r++) {
+            if (!summary_cluster_matches_route(&clusters[i], rows, &routes[r])) {
+                continue;
+            }
+            char label[768];
+            if (routes[r].method && routes[r].method[0]) {
+                snprintf(label, sizeof(label), "%s %s", routes[r].method,
+                         routes[r].path ? routes[r].path : "");
+            } else {
+                snprintf(label, sizeof(label), "%s", routes[r].path ? routes[r].path : "");
+            }
+            bool duplicate = false;
+            for (int e = 0; e < entry_count; e++) {
+                if (strcmp(entries[e], label) == 0) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                continue;
+            }
+            if (entry_count >= entry_cap) {
+                entry_cap *= 2;
+                entries = safe_realloc(entries, (size_t)entry_cap * sizeof(char *));
+            }
+            entries[entry_count++] = heap_strdup(label);
+        }
+        out[i].entry_points = (const char **)entries;
+        out[i].entry_point_count = entry_count;
+        free(clusters[i].member_indices);
+    }
+    free(clusters);
+
+    *out_arr = out;
+    *out_count = count;
+    return CBM_STORE_OK;
+}
+
+static int summary_collect_hot_functions(cbm_store_t *s, const char *project, const char *focus_like,
+                                         cbm_arch_summary_function_t **out_arr, int *out_count) {
+    *out_arr = NULL;
+    *out_count = 0;
+
+    char sql[2048];
+    if (focus_like && focus_like[0]) {
+        snprintf(sql, sizeof(sql),
+                 "SELECT n.name, COALESCE(n.file_path, ''), COUNT(*) AS fan_in "
+                 "FROM nodes n "
+                 "JOIN edges e ON e.target_id = n.id AND e.type='CALLS' "
+                 "WHERE n.project=?1 "
+                 "AND n.label IN ('Function','Method') "
+                 "AND (json_extract(n.properties, '$.is_test') IS NULL OR "
+                 "json_extract(n.properties, '$.is_test') != 1) "
+                 "AND lower(COALESCE(n.file_path, '')) NOT LIKE '%%test%%' "
+                 "AND (lower(COALESCE(n.name, '')) LIKE ?2 "
+                 "OR lower(COALESCE(n.qualified_name, '')) LIKE ?2 "
+                 "OR lower(COALESCE(n.file_path, '')) LIKE ?2 "
+                 "OR lower(COALESCE(n.properties, '')) LIKE ?2) "
+                 "GROUP BY n.id "
+                 "HAVING fan_in >= 5 "
+                 "ORDER BY fan_in DESC, n.name "
+                 "LIMIT 15;");
+    } else {
+        snprintf(sql, sizeof(sql),
+                 "SELECT n.name, COALESCE(n.file_path, ''), COUNT(*) AS fan_in "
+                 "FROM nodes n "
+                 "JOIN edges e ON e.target_id = n.id AND e.type='CALLS' "
+                 "WHERE n.project=?1 "
+                 "AND n.label IN ('Function','Method') "
+                 "AND (json_extract(n.properties, '$.is_test') IS NULL OR "
+                 "json_extract(n.properties, '$.is_test') != 1) "
+                 "AND lower(COALESCE(n.file_path, '')) NOT LIKE '%%test%%' "
+                 "GROUP BY n.id "
+                 "HAVING fan_in >= 5 "
+                 "ORDER BY fan_in DESC, n.name "
+                 "LIMIT 15;");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "summary_collect_hot_functions");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, 1, project);
+    if (focus_like && focus_like[0]) {
+        bind_text(stmt, 2, focus_like);
+    }
+
+    int cap = 8;
+    int count = 0;
+    cbm_arch_summary_function_t *arr = calloc(cap, sizeof(cbm_arch_summary_function_t));
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (count >= cap) {
+            cap *= 2;
+            arr = safe_realloc(arr, (size_t)cap * sizeof(cbm_arch_summary_function_t));
+        }
+        arr[count].name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        arr[count].file = heap_strdup((const char *)sqlite3_column_text(stmt, 1));
+        arr[count].in_degree = sqlite3_column_int(stmt, 2);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+
+    *out_arr = arr;
+    *out_count = count;
+    return CBM_STORE_OK;
+}
+
+static const char *summary_entry_group_name(const char *label) {
+    if (!label || !label[0]) {
+        return "Other";
+    }
+    if (strcmp(label, "Route") == 0) {
+        return "Routes";
+    }
+    if (cbm_strcasestr(label, "command")) {
+        return "Commands";
+    }
+    if (cbm_strcasestr(label, "job")) {
+        return "Jobs";
+    }
+    if (cbm_strcasestr(label, "cron") || cbm_strcasestr(label, "schedule")) {
+        return "Crons";
+    }
+    if (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0) {
+        return "Functions";
+    }
+    return "Other";
+}
+
+static int summary_add_entry_group(cbm_arch_summary_entry_group_t **groups, int *count, int *cap,
+                                   const char *kind, int add_count) {
+    if (!kind || add_count <= 0) {
+        return CBM_STORE_OK;
+    }
+    for (int i = 0; i < *count; i++) {
+        if (strcmp((*groups)[i].kind, kind) == 0) {
+            (*groups)[i].count += add_count;
+            return CBM_STORE_OK;
+        }
+    }
+    if (*count >= *cap) {
+        *cap = *cap ? *cap * 2 : 4;
+        *groups = safe_realloc(*groups, (size_t)*cap * sizeof(cbm_arch_summary_entry_group_t));
+    }
+    (*groups)[*count].kind = heap_strdup(kind);
+    (*groups)[*count].count = add_count;
+    (*count)++;
+    return CBM_STORE_OK;
+}
+
+static int summary_collect_entry_points(cbm_store_t *s, const char *project, const char *focus_like,
+                                        int route_count, cbm_arch_summary_entry_group_t **out_arr,
+                                        int *out_count) {
+    *out_arr = NULL;
+    *out_count = 0;
+
+    int cap = 4;
+    int count = 0;
+    cbm_arch_summary_entry_group_t *groups =
+        calloc((size_t)cap, sizeof(cbm_arch_summary_entry_group_t));
+    if (route_count > 0) {
+        (void)summary_add_entry_group(&groups, &count, &cap, "Routes", route_count);
+    }
+
+    char sql[2048];
+    if (focus_like && focus_like[0]) {
+        snprintf(sql, sizeof(sql),
+                 "SELECT label, COUNT(*) "
+                 "FROM nodes "
+                 "WHERE project=?1 "
+                 "AND json_extract(properties, '$.is_entry_point') = 1 "
+                 "AND (json_extract(properties, '$.is_test') IS NULL OR "
+                 "json_extract(properties, '$.is_test') != 1) "
+                 "AND lower(COALESCE(file_path, '')) NOT LIKE '%%test%%' "
+                 "AND (lower(COALESCE(name, '')) LIKE ?2 "
+                 "OR lower(COALESCE(qualified_name, '')) LIKE ?2 "
+                 "OR lower(COALESCE(file_path, '')) LIKE ?2 "
+                 "OR lower(COALESCE(properties, '')) LIKE ?2) "
+                 "GROUP BY label;");
+    } else {
+        snprintf(sql, sizeof(sql),
+                 "SELECT label, COUNT(*) "
+                 "FROM nodes "
+                 "WHERE project=?1 "
+                 "AND json_extract(properties, '$.is_entry_point') = 1 "
+                 "AND (json_extract(properties, '$.is_test') IS NULL OR "
+                 "json_extract(properties, '$.is_test') != 1) "
+                 "AND lower(COALESCE(file_path, '')) NOT LIKE '%%test%%' "
+                 "GROUP BY label;");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        free(groups);
+        store_set_error_sqlite(s, "summary_collect_entry_points");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, 1, project);
+    if (focus_like && focus_like[0]) {
+        bind_text(stmt, 2, focus_like);
+    }
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *label = (const char *)sqlite3_column_text(stmt, 0);
+        int label_count = sqlite3_column_int(stmt, 1);
+        const char *kind = summary_entry_group_name(label);
+        if (strcmp(kind, "Routes") == 0) {
+            continue;
+        }
+        (void)summary_add_entry_group(&groups, &count, &cap, kind, label_count);
+    }
+    sqlite3_finalize(stmt);
+
+    *out_arr = groups;
+    *out_count = count;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_get_architecture_summary(cbm_store_t *s, const char *project, const char *focus,
+                                       cbm_architecture_summary_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!s || !project) {
+        return CBM_STORE_ERR;
+    }
+
+    char *focus_like = summary_focus_like(focus);
+    char *focus_term = summary_focus_term(focus);
+    arch_summary_file_row_t *rows = NULL;
+    cbm_louvain_edge_t *edges = NULL;
+    int row_count = 0;
+    int edge_count = 0;
+    int rc = summary_collect_file_rows(s, project, focus_like, &rows, &row_count, &edges, &edge_count);
+    if (rc != CBM_STORE_OK) {
+        free(focus_like);
+        free(focus_term);
+        return rc;
+    }
+    out->total_files = summary_count_nodes(s, project, "label='File'", NULL);
+    out->total_functions = summary_count_nodes(s, project, "label IN ('Function','Method')", NULL);
+    out->total_classes = summary_count_nodes(s, project, "label IN ('Class','Interface')", NULL);
+    out->total_routes = summary_count_nodes(s, project, "label='Route'", NULL);
+
+    qsort(rows, (size_t)row_count, sizeof(arch_summary_file_row_t), summary_file_row_cmp);
+    int top_file_count = row_count < 15 ? row_count : 15;
+    if (top_file_count > 0) {
+        out->files = calloc((size_t)top_file_count, sizeof(cbm_arch_summary_file_t));
+        out->file_count = top_file_count;
+        for (int i = 0; i < top_file_count; i++) {
+            out->files[i].file = heap_strdup(rows[i].path);
+            out->files[i].inbound_calls = rows[i].inbound_calls;
+            out->files[i].outbound_calls = rows[i].outbound_calls;
+            rc = summary_fill_key_symbols(s, project, &out->files[i]);
+            if (rc != CBM_STORE_OK) {
+                break;
+            }
+        }
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = summary_collect_routes(s, project, focus_term, &out->routes, &out->route_count);
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = summary_build_clusters(rows, row_count, edges, edge_count, out->routes, out->route_count,
+                                    &out->clusters, &out->cluster_count);
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = summary_collect_hot_functions(s, project, focus_like, &out->functions,
+                                           &out->function_count);
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = summary_collect_entry_points(s, project, focus_like, out->total_routes,
+                                          &out->entry_points, &out->entry_point_count);
+    }
+
+    for (int i = 0; i < row_count; i++) {
+        free(rows[i].path);
+    }
+    free(rows);
+    free(edges);
+    free(focus_like);
+    free(focus_term);
+
+    if (rc != CBM_STORE_OK) {
+        cbm_store_architecture_summary_free(out);
+    }
+    return rc;
+}
+
+void cbm_store_architecture_summary_free(cbm_architecture_summary_t *out) {
+    if (!out) {
+        return;
+    }
+    for (int i = 0; i < out->file_count; i++) {
+        free((void *)out->files[i].file);
+        for (int j = 0; j < out->files[i].symbol_count; j++) {
+            free((void *)out->files[i].symbols[j].name);
+        }
+        free(out->files[i].symbols);
+    }
+    free(out->files);
+
+    for (int i = 0; i < out->route_count; i++) {
+        free((void *)out->routes[i].method);
+        free((void *)out->routes[i].path);
+        free((void *)out->routes[i].handler);
+        free((void *)out->routes[i].service);
+        free((void *)out->routes[i].next);
+        free((void *)out->routes[i].handler_file);
+    }
+    free(out->routes);
+
+    for (int i = 0; i < out->cluster_count; i++) {
+        for (int j = 0; j < out->clusters[i].core_file_count; j++) {
+            free((void *)out->clusters[i].core_files[j]);
+        }
+        // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
+        free(out->clusters[i].core_files);
+        for (int j = 0; j < out->clusters[i].entry_point_count; j++) {
+            free((void *)out->clusters[i].entry_points[j]);
+        }
+        // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
+        free(out->clusters[i].entry_points);
+    }
+    free(out->clusters);
+
+    for (int i = 0; i < out->function_count; i++) {
+        free((void *)out->functions[i].name);
+        free((void *)out->functions[i].file);
+    }
+    free(out->functions);
+
+    for (int i = 0; i < out->entry_point_count; i++) {
+        free((void *)out->entry_points[i].kind);
+    }
+    free(out->entry_points);
     memset(out, 0, sizeof(*out));
 }
 
