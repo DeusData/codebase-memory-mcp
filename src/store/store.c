@@ -3171,6 +3171,10 @@ static const impact_cached_node_t *impact_find_cached_node(const impact_cached_n
     return NULL;
 }
 
+/* Chunk size for IN(...) batches — stays well under SQLite's default
+ * SQLITE_MAX_VARIABLE_NUMBER (999), leaving room for the ?1 project bind. */
+#define IMPACT_FETCH_CHUNK_SIZE 900
+
 static int impact_fetch_nodes_with_scores(cbm_store_t *s, const char *project,
                                           const impact_visit_t *visits, int visit_count,
                                           impact_cached_node_t **out_nodes, int *out_count) {
@@ -3183,77 +3187,88 @@ static int impact_fetch_nodes_with_scores(cbm_store_t *s, const char *project,
         return CBM_STORE_OK;
     }
 
-    bool has_scores = store_has_node_scores_table(s);
-    size_t sql_cap = 512 + ((size_t)visit_count * 8U);
-    char *sql = malloc(sql_cap);
-    if (!sql) {
-        return CBM_STORE_ERR;
-    }
-
-    int written = snprintf(
-        sql, sql_cap,
-        "SELECT n.id, n.project, n.label, n.name, n.qualified_name, n.file_path, "
-        "n.start_line, n.end_line, n.properties, %s "
-        "FROM nodes n %s WHERE n.project=?1 AND n.id IN (",
-        has_scores ? "COALESCE(ns.pagerank, 0.0) AS pagerank" : "0.0 AS pagerank",
-        has_scores ? "LEFT JOIN node_scores ns ON ns.project = n.project AND ns.node_id = n.id"
-                   : "");
-    if (written < 0 || (size_t)written >= sql_cap) {
-        free(sql);
-        return CBM_STORE_ERR;
-    }
-
-    size_t len = (size_t)written;
-    for (int i = 0; i < visit_count; i++) {
-        written = snprintf(sql + len, sql_cap - len, "%s?%d", i > 0 ? "," : "", i + 2);
-        if (written < 0 || (size_t)written >= sql_cap - len) {
-            free(sql);
-            return CBM_STORE_ERR;
-        }
-        len += (size_t)written;
-    }
-    written = snprintf(sql + len, sql_cap - len, ") ORDER BY n.id");
-    if (written < 0 || (size_t)written >= sql_cap - len) {
-        free(sql);
-        return CBM_STORE_ERR;
-    }
-
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        free(sql);
-        store_set_error_sqlite(s, "impact_fetch_nodes_with_scores");
-        return CBM_STORE_ERR;
-    }
-    free(sql);
-
-    bind_text(stmt, 1, project);
-    for (int i = 0; i < visit_count; i++) {
-        sqlite3_bind_int64(stmt, i + 2, visits[i].id);
-    }
-
     impact_cached_node_t *nodes = calloc((size_t)visit_count, sizeof(*nodes));
     if (!nodes) {
-        sqlite3_finalize(stmt);
         return CBM_STORE_ERR;
     }
 
+    bool has_scores = store_has_node_scores_table(s);
     int count = 0;
     int rc = CBM_STORE_OK;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        if (count >= visit_count) {
-            rc = CBM_STORE_ERR;
-            break;
-        }
-        scan_node(stmt, &nodes[count].node);
-        nodes[count].id = nodes[count].node.id;
-        nodes[count].pagerank = sqlite3_column_double(stmt, 9);
-        count++;
-    }
-    sqlite3_finalize(stmt);
 
-    if (rc != CBM_STORE_OK) {
-        impact_cached_nodes_free(nodes, count);
-        return rc;
+    for (int chunk_start = 0; chunk_start < visit_count; chunk_start += IMPACT_FETCH_CHUNK_SIZE) {
+        int chunk_end = chunk_start + IMPACT_FETCH_CHUNK_SIZE;
+        if (chunk_end > visit_count) chunk_end = visit_count;
+        int chunk_size = chunk_end - chunk_start;
+
+        size_t sql_cap = 512 + ((size_t)chunk_size * 8U);
+        char *sql = malloc(sql_cap);
+        if (!sql) {
+            impact_cached_nodes_free(nodes, count);
+            return CBM_STORE_ERR;
+        }
+
+        int written = snprintf(
+            sql, sql_cap,
+            "SELECT n.id, n.project, n.label, n.name, n.qualified_name, n.file_path, "
+            "n.start_line, n.end_line, n.properties, %s "
+            "FROM nodes n %s WHERE n.project=?1 AND n.id IN (",
+            has_scores ? "COALESCE(ns.pagerank, 0.0) AS pagerank" : "0.0 AS pagerank",
+            has_scores ? "LEFT JOIN node_scores ns ON ns.project = n.project AND ns.node_id = n.id"
+                       : "");
+        if (written < 0 || (size_t)written >= sql_cap) {
+            free(sql);
+            impact_cached_nodes_free(nodes, count);
+            return CBM_STORE_ERR;
+        }
+
+        size_t len = (size_t)written;
+        for (int i = 0; i < chunk_size; i++) {
+            written = snprintf(sql + len, sql_cap - len, "%s?%d", i > 0 ? "," : "", i + 2);
+            if (written < 0 || (size_t)written >= sql_cap - len) {
+                free(sql);
+                impact_cached_nodes_free(nodes, count);
+                return CBM_STORE_ERR;
+            }
+            len += (size_t)written;
+        }
+        written = snprintf(sql + len, sql_cap - len, ") ORDER BY n.id");
+        if (written < 0 || (size_t)written >= sql_cap - len) {
+            free(sql);
+            impact_cached_nodes_free(nodes, count);
+            return CBM_STORE_ERR;
+        }
+
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+            free(sql);
+            store_set_error_sqlite(s, "impact_fetch_nodes_with_scores");
+            impact_cached_nodes_free(nodes, count);
+            return CBM_STORE_ERR;
+        }
+        free(sql);
+
+        bind_text(stmt, 1, project);
+        for (int i = 0; i < chunk_size; i++) {
+            sqlite3_bind_int64(stmt, i + 2, visits[chunk_start + i].id);
+        }
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            if (count >= visit_count) {
+                rc = CBM_STORE_ERR;
+                break;
+            }
+            scan_node(stmt, &nodes[count].node);
+            nodes[count].id = nodes[count].node.id;
+            nodes[count].pagerank = sqlite3_column_double(stmt, 9);
+            count++;
+        }
+        sqlite3_finalize(stmt);
+
+        if (rc != CBM_STORE_OK) {
+            impact_cached_nodes_free(nodes, count);
+            return rc;
+        }
     }
 
     if (count > 1) {

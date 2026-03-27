@@ -1918,7 +1918,14 @@ static char *handle_get_impact_analysis(cbm_mcp_server_t *srv, const char *args)
         free(project);
         return cbm_mcp_text_result("symbol is required", true);
     }
-    REQUIRE_STORE(store, project);
+    if (!store) {
+        char *_err = build_project_list_error("project not found or not indexed");
+        char *_res = cbm_mcp_text_result(_err, true);
+        free(_err);
+        free(project);
+        free(symbol);
+        return _res;
+    }
 
     char *not_indexed = verify_project_indexed(store, project);
     if (not_indexed) {

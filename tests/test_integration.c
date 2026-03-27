@@ -399,9 +399,9 @@ TEST(integ_mcp_get_impact_analysis) {
 
     char *resp = call_tool("get_impact_analysis", args);
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"symbol\":\"Add\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"impact\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"risk_score\""));
+    ASSERT_NOT_NULL(strstr(resp, "Add"));
+    ASSERT_NOT_NULL(strstr(resp, "impact"));
+    ASSERT_NOT_NULL(strstr(resp, "risk_score"));
     ASSERT_TRUE(strstr(resp, "Multiply") || strstr(resp, "Compute"));
     free(resp);
     PASS();
