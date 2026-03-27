@@ -1660,9 +1660,53 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_find_nodes_by_name(store, project, func_name, &nodes, &node_count);
 
     if (node_count == 0) {
-        free(func_name);
-        free(project);
-        free(direction);
+        /* Fuzzy fallback: try substring match when exact name not found.
+         * This handles cases like searching for "RecordingSession" when only
+         * "ContinuousRecordingSessionDataGen" exists. */
+        cbm_search_params_t fuzzy = {0};
+        char pattern[512];
+        snprintf(pattern, sizeof(pattern), ".*%s.*", func_name);
+        fuzzy.project = project;
+        fuzzy.name_pattern = pattern;
+        fuzzy.limit = 10;
+        cbm_search_output_t fuzzy_results = {0};
+        cbm_store_search(store, &fuzzy, &fuzzy_results);
+
+        if (fuzzy_results.count > 0) {
+            /* Return fuzzy matches as suggestions */
+            yyjson_mut_doc *fdoc = yyjson_mut_doc_new(NULL);
+            yyjson_mut_val *froot = yyjson_mut_obj(fdoc);
+            yyjson_mut_doc_set_root(fdoc, froot);
+            yyjson_mut_obj_add_str(fdoc, froot, "status", "not_found_exact");
+            char msg[512];
+            snprintf(msg, sizeof(msg),
+                     "No exact match for '%s'. Found %d partial matches — "
+                     "use one of these exact names:", func_name, fuzzy_results.count);
+            yyjson_mut_obj_add_strcpy(fdoc, froot, "message", msg);
+            yyjson_mut_val *suggestions = yyjson_mut_arr(fdoc);
+            for (int i = 0; i < fuzzy_results.count; i++) {
+                yyjson_mut_val *si = yyjson_mut_obj(fdoc);
+                yyjson_mut_obj_add_strcpy(fdoc, si, "name",
+                    fuzzy_results.results[i].node.name ? fuzzy_results.results[i].node.name : "");
+                yyjson_mut_obj_add_strcpy(fdoc, si, "label",
+                    fuzzy_results.results[i].node.label ? fuzzy_results.results[i].node.label : "");
+                yyjson_mut_obj_add_strcpy(fdoc, si, "file_path",
+                    fuzzy_results.results[i].node.file_path ? fuzzy_results.results[i].node.file_path : "");
+                yyjson_mut_obj_add_int(fdoc, si, "line", fuzzy_results.results[i].node.start_line);
+                yyjson_mut_arr_add_val(suggestions, si);
+            }
+            yyjson_mut_obj_add_val(fdoc, froot, "suggestions", suggestions);
+            char *fjson = yy_doc_to_str(fdoc);
+            yyjson_mut_doc_free(fdoc);
+            cbm_store_search_free(&fuzzy_results);
+            free(func_name); free(project); free(direction);
+            cbm_store_free_nodes(nodes, 0);
+            char *result = cbm_mcp_text_result(fjson, false);
+            free(fjson);
+            return result;
+        }
+        cbm_store_search_free(&fuzzy_results);
+        free(func_name); free(project); free(direction);
         cbm_store_free_nodes(nodes, 0);
         return cbm_mcp_text_result("{\"error\":\"function not found\"}", true);
     }
@@ -1792,6 +1836,25 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_val(doc, root, "candidates", cands);
     }
 
+    /* Check if the node has any edges at all. If not, return basic info only.
+     * This avoids BFS crashes on nodes with 0 edges (e.g. Type nodes, empty Classes). */
+    {
+        int in_deg = 0;
+        int out_deg = 0;
+        cbm_store_node_degree(store, nodes[best_idx].id, &in_deg, &out_deg);
+        if (in_deg == 0 && out_deg == 0) {
+            /* No edges — return basic info */
+            char *json = yy_doc_to_str(doc);
+            yyjson_mut_doc_free(doc);
+            free(start_ids);
+            cbm_store_free_nodes(nodes, node_count);
+            free(func_name); free(project); free(direction);
+            char *result = cbm_mcp_text_result(json, false);
+            free(json);
+            return result;
+        }
+    }
+
     /* ── Categorized edge query: like GitNexus context() ──
      * Instead of flat BFS, query each edge type separately and return
      * categorized results: incoming.calls, incoming.imports, incoming.extends,
@@ -1810,8 +1873,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
 
     /* Collect all traversal results for lifetime management */
     #define MAX_TR 64
-    cbm_traverse_result_t all_tr[MAX_TR];
-    memset(all_tr, 0, sizeof(all_tr));
+    cbm_traverse_result_t *all_tr = calloc(MAX_TR, sizeof(cbm_traverse_result_t));
     int tr_count = 0;
 
     if (do_inbound) {
@@ -2047,6 +2109,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     for (int t = 0; t < tr_count; t++) {
         cbm_store_traverse_free(&all_tr[t]);
     }
+    free(all_tr);
     #undef EDGE_QUERY_MAX
     #undef MAX_TR
 
