@@ -93,6 +93,9 @@ void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w);
 /* Set external config store reference (for auto_index setting). Not owned. */
 void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg);
 
+/* Set the session root path (for auto-index on first tool call). */
+void cbm_mcp_server_set_session_root(cbm_mcp_server_t *srv, const char *repo_path);
+
 /* Run the MCP server event loop on the given streams (typically stdin/stdout).
  * Blocks until EOF on input. Returns 0 on success, -1 on error. */
 int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out);
