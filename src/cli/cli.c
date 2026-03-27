@@ -15,6 +15,9 @@
 #include <signal.h>
 #include <unistd.h>
 #endif
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #include "foundation/compat_fs.h"
 
 #ifndef CBM_VERSION
@@ -2689,13 +2692,30 @@ int cbm_cmd_install(int argc, char **argv) {
     }
 #endif
 
-    /* Step 2: Binary path */
-    char self_path[1024];
+    /* Step 2: Binary path — detect actual location at runtime.
+     * install.ps1 places the binary in $LOCALAPPDATA/Programs/ but the old
+     * code hardcoded ~/.local/bin/, causing broken MCP configs on Windows.
+     * Use the same pattern as http_server.c:index_thread_fn(). */
+    char self_path[1024] = {0};
 #ifdef _WIN32
-    snprintf(self_path, sizeof(self_path), "%s/.local/bin/codebase-memory-mcp.exe", home);
+    GetModuleFileNameA(NULL, self_path, sizeof(self_path));
+    cbm_normalize_path_sep(self_path);
+#elif defined(__APPLE__)
+    uint32_t sp_sz = sizeof(self_path);
+    if (_NSGetExecutablePath(self_path, &sp_sz) != 0)
+        self_path[0] = '\0';
 #else
-    snprintf(self_path, sizeof(self_path), "%s/.local/bin/codebase-memory-mcp", home);
+    ssize_t sp_len = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
+    if (sp_len > 0)
+        self_path[sp_len] = '\0';
 #endif
+    if (!self_path[0]) {
+#ifdef _WIN32
+        snprintf(self_path, sizeof(self_path), "%s/.local/bin/codebase-memory-mcp.exe", home);
+#else
+        snprintf(self_path, sizeof(self_path), "%s/.local/bin/codebase-memory-mcp", home);
+#endif
+    }
 
     /* Step 3: Install/refresh all agent configs */
     cbm_install_agent_configs(home, self_path, force, dry_run);
