@@ -162,6 +162,7 @@ static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_inf
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
                                  int file_count) {
     struct timespec t0;
+    struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
 
     const char *project = cbm_pipeline_project_name(p);
@@ -194,6 +195,15 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     /* Fast path: nothing changed → skip */
     if (n_changed == 0 && deleted_count == 0) {
         cbm_log_info("incremental.noop", "reason", "no_changes");
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        if (cbm_store_compute_pagerank(store, project, 20, 0.85) != CBM_STORE_OK) {
+            /* Preserve the successful no-op index result even if ranking refresh fails. */
+            cbm_log_warn("incremental.warn", "msg", "pagerank_failed", "project", project,
+                         "error", cbm_store_error(store));
+        } else {
+            cbm_log_info("pass.timing", "pass", "incr_pagerank", "elapsed_ms",
+                         itoa_buf((int)elapsed_ms(t)));
+        }
         free(is_changed);
         free(deleted);
         cbm_store_free_file_hashes(stored, stored_count);
@@ -246,7 +256,6 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     };
 
     /* Run passes on changed files only */
-    struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     cbm_pipeline_pass_definitions(&ctx, changed_files, ci);
     cbm_log_info("pass.timing", "pass", "incr_definitions", "elapsed_ms",
@@ -286,6 +295,15 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     /* Persist updated file hashes for ALL files */
     persist_hashes(store, project, files, file_count);
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    if (cbm_store_compute_pagerank(store, project, 20, 0.85) != CBM_STORE_OK) {
+        cbm_log_warn("incremental.warn", "msg", "pagerank_failed", "project", project, "error",
+                     cbm_store_error(store));
+    } else {
+        cbm_log_info("pass.timing", "pass", "incr_pagerank", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t)));
+    }
 
     /* Cleanup */
     cbm_gbuf_free(gbuf);
