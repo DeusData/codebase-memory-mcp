@@ -6,10 +6,12 @@
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include <mcp/mcp.h>
+#include <pipeline/pipeline.h>
 #include <store/store.h>
 #include <yyjson/yyjson.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING
@@ -129,7 +131,7 @@ TEST(mcp_initialize_response) {
 TEST(mcp_tools_list) {
     char *json = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(json);
-    /* Should contain all 14 tools */
+    /* Should contain all public tools */
     ASSERT_NOT_NULL(strstr(json, "index_repository"));
     ASSERT_NOT_NULL(strstr(json, "search_graph"));
     ASSERT_NOT_NULL(strstr(json, "query_graph"));
@@ -137,6 +139,8 @@ TEST(mcp_tools_list) {
     ASSERT_NOT_NULL(strstr(json, "get_code_snippet"));
     ASSERT_NOT_NULL(strstr(json, "get_graph_schema"));
     ASSERT_NOT_NULL(strstr(json, "get_architecture"));
+    ASSERT_NOT_NULL(strstr(json, "get_key_symbols"));
+    ASSERT_NOT_NULL(strstr(json, "get_architecture_summary"));
     ASSERT_NOT_NULL(strstr(json, "search_code"));
     ASSERT_NOT_NULL(strstr(json, "list_projects"));
     ASSERT_NOT_NULL(strstr(json, "delete_project"));
@@ -487,6 +491,233 @@ TEST(tool_get_architecture_empty) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_architecture_summary_missing_project) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":25,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"get_architecture_summary\","
+                                   "\"arguments\":{}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "project is required"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+static cbm_mcp_server_t *setup_arch_summary_server(char *tmp_dir, size_t tmp_sz) {
+    snprintf(tmp_dir, tmp_sz, "/tmp/cbm_mcp_arch_XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        return NULL;
+    }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        rmdir(tmp_dir);
+        return NULL;
+    }
+
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    if (!st) {
+        cbm_mcp_server_free(srv);
+        rmdir(tmp_dir);
+        return NULL;
+    }
+
+    char *proj_name = cbm_project_name_from_path(tmp_dir);
+    if (!proj_name) {
+        cbm_mcp_server_free(srv);
+        rmdir(tmp_dir);
+        return NULL;
+    }
+
+    cbm_mcp_server_set_project(srv, proj_name);
+    cbm_store_upsert_project(st, proj_name, tmp_dir);
+
+    int64_t prev_fn_id = 0;
+    for (int i = 0; i < 24; i++) {
+        char file_name[64];
+        char file_qn[128];
+        char fn_name[32];
+        char fn_qn[160];
+
+        snprintf(file_name, sizeof(file_name), "pkg/file%02d.go", i);
+        snprintf(file_qn, sizeof(file_qn), "%s.pkg.file%02d", proj_name, i);
+        snprintf(fn_name, sizeof(fn_name), "Fn%02d", i);
+        snprintf(fn_qn, sizeof(fn_qn), "%s.pkg.file%02d.%s", proj_name, i, fn_name);
+
+        cbm_node_t file = {.project = proj_name,
+                           .label = "File",
+                           .name = file_name,
+                           .qualified_name = file_qn,
+                           .file_path = file_name};
+        cbm_store_upsert_node(st, &file);
+
+        cbm_node_t fn = {.project = proj_name,
+                         .label = "Function",
+                         .name = fn_name,
+                         .qualified_name = fn_qn,
+                         .file_path = file_name,
+                         .start_line = 1,
+                         .end_line = 40 + i};
+        int64_t fn_id = cbm_store_upsert_node(st, &fn);
+        if (prev_fn_id > 0) {
+            cbm_edge_t edge = {
+                .project = proj_name, .source_id = prev_fn_id, .target_id = fn_id, .type = "CALLS"};
+            cbm_store_insert_edge(st, &edge);
+        }
+        prev_fn_id = fn_id;
+    }
+
+    free(proj_name);
+    return srv;
+}
+
+static void cleanup_arch_summary_server(char *tmp_dir, cbm_mcp_server_t *srv) {
+    cbm_mcp_server_free(srv);
+    if (tmp_dir && tmp_dir[0]) {
+        rmdir(tmp_dir);
+    }
+}
+
+static cbm_mcp_server_t *setup_pagerank_server(void) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    if (!st) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+
+    cbm_store_upsert_project(st, "test-rank", "/tmp/test-rank");
+    cbm_mcp_server_set_project(srv, "test-rank");
+
+    cbm_node_t nodes[] = {
+        {.project = "test-rank", .label = "Function", .name = "Root", .qualified_name = "test-rank.Root"},
+        {.project = "test-rank", .label = "Function", .name = "Small", .qualified_name = "test-rank.Small"},
+        {.project = "test-rank", .label = "Function", .name = "Hub", .qualified_name = "test-rank.Hub"},
+        {.project = "test-rank", .label = "Function", .name = "Leaf", .qualified_name = "test-rank.Leaf"},
+        {.project = "test-rank", .label = "Function", .name = "CallerB", .qualified_name = "test-rank.CallerB"},
+        {.project = "test-rank", .label = "Function", .name = "CallerC", .qualified_name = "test-rank.CallerC"},
+    };
+    int64_t ids[6];
+    for (int i = 0; i < 6; i++) {
+        ids[i] = cbm_store_upsert_node(st, &nodes[i]);
+    }
+
+    cbm_edge_t edges[] = {
+        {.project = "test-rank", .source_id = ids[0], .target_id = ids[1], .type = "CALLS"},
+        {.project = "test-rank", .source_id = ids[1], .target_id = ids[2], .type = "CALLS"},
+        {.project = "test-rank", .source_id = ids[4], .target_id = ids[2], .type = "CALLS"},
+        {.project = "test-rank", .source_id = ids[5], .target_id = ids[2], .type = "CALLS"},
+    };
+    for (int i = 0; i < 4; i++) {
+        cbm_store_insert_edge(st, &edges[i]);
+    }
+
+    if (cbm_store_compute_pagerank(st, "test-rank", 20, 0.85) != CBM_STORE_OK) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+    return srv;
+}
+
+static cbm_mcp_server_t *setup_truncation_server(void) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    if (!st) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+
+    cbm_store_upsert_project(st, "test-budget", "/tmp/test-budget");
+    cbm_mcp_server_set_project(srv, "test-budget");
+
+    const char *sig =
+        "{\"signature\":\"func BudgetedOperation(alpha int, beta int, gamma int, delta int, "
+        "epsilon int, zeta int, eta int, theta int, iota int) string\"}";
+    const char *names[] = {"Root", "A", "B", "C", "D", "E"};
+    int64_t ids[6] = {0};
+
+    for (int i = 0; i < 6; i++) {
+        char qn[128];
+        snprintf(qn, sizeof(qn), "test-budget.%s", names[i]);
+        cbm_node_t node = {
+            .project = "test-budget",
+            .label = "Function",
+            .name = names[i],
+            .qualified_name = qn,
+            .file_path = "pkg/budget.go",
+            .start_line = 10 + (i * 5),
+            .end_line = 13 + (i * 5),
+            .properties_json = sig,
+        };
+        ids[i] = cbm_store_upsert_node(st, &node);
+    }
+
+    for (int i = 0; i < 5; i++) {
+        cbm_edge_t edge = {
+            .project = "test-budget", .source_id = ids[i], .target_id = ids[i + 1], .type = "CALLS"};
+        cbm_store_insert_edge(st, &edge);
+    }
+
+    return srv;
+}
+
+TEST(tool_get_architecture_summary_truncated) {
+    char tmp_dir[256];
+    cbm_mcp_server_t *srv = setup_arch_summary_server(tmp_dir, sizeof(tmp_dir));
+    ASSERT_NOT_NULL(srv);
+    char *proj_name = cbm_project_name_from_path(tmp_dir);
+    ASSERT_NOT_NULL(proj_name);
+
+    char req[1024];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":26,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"get_architecture_summary\","
+              "\"arguments\":{\"project\":\"%s\",\"max_tokens\":1}}}",
+             proj_name);
+
+    char *resp = cbm_mcp_server_handle(srv, req);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "## Project:"));
+    ASSERT_NOT_NULL(strstr(resp, "_Truncated at max_tokens._"));
+    free(resp);
+    free(proj_name);
+
+    cleanup_arch_summary_server(tmp_dir, srv);
+    PASS();
+}
+
+TEST(tool_get_architecture_summary_project_path_alias) {
+    char tmp_dir[256];
+    cbm_mcp_server_t *srv = setup_arch_summary_server(tmp_dir, sizeof(tmp_dir));
+    ASSERT_NOT_NULL(srv);
+
+    char req[1024];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":27,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"get_architecture_summary\","
+             "\"arguments\":{\"project_path\":\"%s\",\"max_tokens\":64}}}",
+             tmp_dir);
+
+    char *resp = cbm_mcp_server_handle(srv, req);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "## Project:"));
+    free(resp);
+
+    cleanup_arch_summary_server(tmp_dir, srv);
     PASS();
 }
 
@@ -979,6 +1210,180 @@ static char *extract_text_content(const char *mcp_result) {
     char *result = str ? strdup(str) : strdup(mcp_result);
     yyjson_doc_free(doc);
     return result;
+}
+
+TEST(tool_search_graph_ranked_pagerank) {
+    cbm_mcp_server_t *srv = setup_pagerank_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"test-rank\",\"label\":\"Function\",\"limit\":10}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"pagerank\""));
+    ASSERT_NOT_NULL(strstr(text, "\"name\":\"Hub\""));
+    ASSERT_NOT_NULL(strstr(text, "\"name\":\"Small\""));
+    ASSERT_TRUE(strstr(text, "\"name\":\"Hub\"") < strstr(text, "\"name\":\"Small\""));
+    free(text);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_key_symbols_ranked) {
+    cbm_mcp_server_t *srv = setup_pagerank_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw =
+        cbm_mcp_handle_tool(srv, "get_key_symbols", "{\"project\":\"test-rank\",\"limit\":3}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"results\""));
+    ASSERT_NOT_NULL(strstr(text, "\"pagerank\""));
+    ASSERT_NOT_NULL(strstr(text, "\"name\":\"Hub\""));
+    ASSERT_TRUE(strstr(text, "\"name\":\"Hub\"") < strstr(text, "\"name\":\"Small\""));
+    free(text);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_call_path_ranked_pagerank) {
+    cbm_mcp_server_t *srv = setup_pagerank_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "trace_call_path",
+        "{\"project\":\"test-rank\",\"function_name\":\"Root\",\"direction\":\"outbound\",\"depth\":3}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"callees\""));
+    ASSERT_NOT_NULL(strstr(text, "\"pagerank\""));
+    ASSERT_NOT_NULL(strstr(text, "\"name\":\"Hub\""));
+    ASSERT_NOT_NULL(strstr(text, "\"name\":\"Small\""));
+    ASSERT_TRUE(strstr(text, "\"name\":\"Hub\"") < strstr(text, "\"name\":\"Small\""));
+    free(text);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_search_graph_max_tokens_truncates) {
+    cbm_mcp_server_t *srv = setup_pagerank_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"test-rank\",\"label\":\"Function\",\"limit\":10,\"max_tokens\":1}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"truncated\":true"));
+    ASSERT_NOT_NULL(strstr(text, "\"shown\""));
+    ASSERT_NOT_NULL(strstr(text, "\"total_results\""));
+    ASSERT_NOT_NULL(strstr(text, "\"name\":\"Hub\""));
+    free(text);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_call_path_max_tokens_truncates) {
+    cbm_mcp_server_t *srv = setup_pagerank_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "trace_call_path",
+        "{\"project\":\"test-rank\",\"function_name\":\"Root\",\"direction\":\"outbound\","
+        "\"depth\":3,\"max_tokens\":1}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"truncated\":true"));
+    ASSERT_NOT_NULL(strstr(text, "\"shown\""));
+    ASSERT_NOT_NULL(strstr(text, "\"total_results\""));
+    ASSERT_NOT_NULL(strstr(text, "\"callees\""));
+    free(text);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_search_graph_long_signature_budget_respected) {
+    cbm_mcp_server_t *srv = setup_truncation_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"test-budget\",\"label\":\"Function\",\"limit\":10,\"max_tokens\":100}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"truncated\":true"));
+    ASSERT_NOT_NULL(strstr(text, "\"shown\":1"));
+    free(text);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_call_path_chain_shows_omitted_count) {
+    cbm_mcp_server_t *srv = setup_truncation_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "trace_call_path",
+        "{\"project\":\"test-budget\",\"function_name\":\"Root\",\"direction\":\"outbound\","
+        "\"depth\":5,\"max_tokens\":100}");
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"truncated\":true"));
+    ASSERT_NOT_NULL(strstr(text, "\"callees_chain\":\""));
+    ASSERT_NOT_NULL(strstr(text, "more) ->"));
+    free(text);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_query_graph_max_tokens_truncates) {
+    char tmp_dir[256];
+    cbm_mcp_server_t *srv = setup_arch_summary_server(tmp_dir, sizeof(tmp_dir));
+    ASSERT_NOT_NULL(srv);
+    char *proj_name = cbm_project_name_from_path(tmp_dir);
+    ASSERT_NOT_NULL(proj_name);
+
+    char args[1024];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"query\":\"MATCH (f:Function) RETURN f.name, f.qualified_name, "
+             "f.file_path\",\"max_tokens\":1}",
+             proj_name);
+
+    char *raw = cbm_mcp_handle_tool(srv, "query_graph", args);
+    ASSERT_NOT_NULL(raw);
+    char *text = extract_text_content(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"truncated\":true"));
+    ASSERT_NOT_NULL(strstr(text, "\"shown\""));
+    ASSERT_NOT_NULL(strstr(text, "\"total_results\""));
+    ASSERT_NOT_NULL(strstr(text, "\"columns\""));
+    free(text);
+    free(raw);
+    free(proj_name);
+
+    cleanup_arch_summary_server(tmp_dir, srv);
+    PASS();
 }
 
 /* Call get_code_snippet and extract inner text content.
@@ -1695,6 +2100,9 @@ SUITE(mcp) {
     RUN_TEST(tool_get_graph_schema_empty);
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);
+    RUN_TEST(tool_search_graph_ranked_pagerank);
+    RUN_TEST(tool_search_graph_max_tokens_truncates);
+    RUN_TEST(tool_search_graph_long_signature_budget_respected);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);
 
@@ -1703,7 +2111,15 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
+    RUN_TEST(tool_get_architecture_summary_missing_project);
+    RUN_TEST(tool_get_architecture_summary_truncated);
+    RUN_TEST(tool_get_architecture_summary_project_path_alias);
+    RUN_TEST(tool_get_key_symbols_ranked);
+    RUN_TEST(tool_trace_call_path_ranked_pagerank);
+    RUN_TEST(tool_trace_call_path_max_tokens_truncates);
+    RUN_TEST(tool_trace_call_path_chain_shows_omitted_count);
     RUN_TEST(tool_query_graph_missing_query);
+    RUN_TEST(tool_query_graph_max_tokens_truncates);
 
     /* Pipeline-dependent tool handlers */
     RUN_TEST(tool_index_repository_missing_path);

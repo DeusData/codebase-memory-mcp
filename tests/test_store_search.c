@@ -47,6 +47,41 @@ static cbm_store_t *setup_search_store(int64_t *ids) {
     return s;
 }
 
+static cbm_store_t *setup_pagerank_store(int64_t *ids) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t nodes[] = {
+        {.project = "test", .label = "Function", .name = "Root", .qualified_name = "test.Root"},
+        {.project = "test", .label = "Function", .name = "Small", .qualified_name = "test.Small"},
+        {.project = "test", .label = "Function", .name = "Hub", .qualified_name = "test.Hub"},
+        {.project = "test", .label = "Function", .name = "Leaf", .qualified_name = "test.Leaf"},
+        {.project = "test", .label = "Function", .name = "CallerB", .qualified_name = "test.CallerB"},
+        {.project = "test", .label = "Function", .name = "CallerC", .qualified_name = "test.CallerC"},
+    };
+    const int node_count = (int)(sizeof(nodes) / sizeof(nodes[0]));
+    for (int i = 0; i < node_count; i++) {
+        ids[i] = cbm_store_upsert_node(s, &nodes[i]);
+    }
+
+    cbm_edge_t edges[] = {
+        {.project = "test", .source_id = ids[0], .target_id = ids[1], .type = "CALLS"},
+        {.project = "test", .source_id = ids[1], .target_id = ids[2], .type = "CALLS"},
+        {.project = "test", .source_id = ids[4], .target_id = ids[2], .type = "CALLS"},
+        {.project = "test", .source_id = ids[5], .target_id = ids[2], .type = "CALLS"},
+    };
+    const int edge_count = (int)(sizeof(edges) / sizeof(edges[0]));
+    for (int i = 0; i < edge_count; i++) {
+        cbm_store_insert_edge(s, &edges[i]);
+    }
+
+    if (cbm_store_compute_pagerank(s, "test", 20, 0.85) != CBM_STORE_OK) {
+        cbm_store_close(s);
+        return NULL;
+    }
+    return s;
+}
+
 /* ── Search by label ────────────────────────────────────────────── */
 
 TEST(store_search_by_label) {
@@ -590,6 +625,46 @@ TEST(store_search_case_insensitive) {
     ASSERT_EQ(rc, CBM_STORE_OK);
     ASSERT_EQ(out2.count, 0);
     cbm_store_search_free(&out2);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_search_ranked_by_pagerank) {
+    int64_t ids[6];
+    cbm_store_t *s = setup_pagerank_store(ids);
+    ASSERT_NOT_NULL(s);
+
+    cbm_search_params_t params = {.project = "test",
+                                  .label = "Function",
+                                  .limit = 10,
+                                  .min_degree = -1,
+                                  .max_degree = -1,
+                                  .sort_by = "relevance"};
+    cbm_search_output_t out = {0};
+    int rc = cbm_store_search(s, &params, &out);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_GTE(out.count, 4);
+    ASSERT_STR_EQ(out.results[0].node.name, "Hub");
+    ASSERT_TRUE(out.results[0].pagerank > out.results[1].pagerank);
+    cbm_store_search_free(&out);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_get_key_symbols_ranked) {
+    int64_t ids[6];
+    cbm_store_t *s = setup_pagerank_store(ids);
+    ASSERT_NOT_NULL(s);
+    cbm_key_symbol_t *symbols = NULL;
+    int count = 0;
+
+    ASSERT_EQ(cbm_store_get_key_symbols(s, "test", NULL, 3, &symbols, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 3);
+    ASSERT_STR_EQ(symbols[0].name, "Hub");
+    ASSERT_TRUE(symbols[0].pagerank > symbols[1].pagerank);
+    cbm_store_key_symbols_free(symbols, count);
 
     cbm_store_close(s);
     PASS();
@@ -1217,6 +1292,8 @@ SUITE(store_search) {
     RUN_TEST(store_search_all);
     RUN_TEST(store_search_exclude_labels);
     RUN_TEST(store_search_case_insensitive);
+    RUN_TEST(store_search_ranked_by_pagerank);
+    RUN_TEST(store_get_key_symbols_ranked);
     RUN_TEST(store_bfs_outbound);
     RUN_TEST(store_bfs_inbound);
     RUN_TEST(store_bfs_cross_service);

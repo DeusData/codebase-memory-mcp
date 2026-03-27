@@ -5,11 +5,14 @@
  * TestNodeDedup, TestProjectCRUD, TestUpsertNodeBatch, etc.)
  */
 #include "test_framework.h"
+#include "sqlite_writer.h"
 #include <store/store.h>
 #include <sqlite3.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* ── Schema / Open / Close ──────────────────────────────────────── */
 
@@ -108,6 +111,81 @@ TEST(store_project_delete) {
     ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
 
     cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_open_path_query_readonly_db) {
+    char path[] = "/tmp/cbm_store_query_XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_TRUE(fd >= 0);
+    close(fd);
+
+    cbm_store_t *writer = cbm_store_open_path(path);
+    ASSERT_NOT_NULL(writer);
+    ASSERT_EQ(cbm_store_upsert_project(writer, "readonly-proj", "/tmp/readonly-proj"), CBM_STORE_OK);
+    cbm_store_close(writer);
+
+    ASSERT_EQ(chmod(path, 0444), 0);
+
+    cbm_store_t *reader = cbm_store_open_path_query(path);
+    ASSERT_NOT_NULL(reader);
+
+    cbm_project_t proj = {0};
+    ASSERT_EQ(cbm_store_get_project(reader, "readonly-proj", &proj), CBM_STORE_OK);
+    ASSERT_STR_EQ(proj.root_path, "/tmp/readonly-proj");
+    cbm_project_free_fields(&proj);
+    cbm_store_close(reader);
+
+    chmod(path, 0644);
+    unlink(path);
+    PASS();
+}
+
+TEST(store_open_path_query_direct_writer_db) {
+    char path[] = "/tmp/cbm_store_query_writer_XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_TRUE(fd >= 0);
+    close(fd);
+
+    CBMDumpNode node = {
+        .id = 1,
+        .project = "writer-proj",
+        .label = "Function",
+        .name = "Hello",
+        .qualified_name = "writer-proj.main.Hello",
+        .file_path = "main.go",
+        .start_line = 1,
+        .end_line = 3,
+        .properties = "{}",
+    };
+    ASSERT_EQ(cbm_write_db(path, "writer-proj", "/tmp/writer-proj", "2026-03-25T00:00:00Z",
+                           &node, 1, NULL, 0),
+              0);
+
+    /* Reopen in the same way the pipeline does to add post-dump metadata. */
+    cbm_store_t *writer = cbm_store_open_path(path);
+    ASSERT_NOT_NULL(writer);
+    ASSERT_EQ(cbm_store_upsert_file_hash(writer, "writer-proj", "main.go", "abc123", 1, 64),
+              CBM_STORE_OK);
+    cbm_store_close(writer);
+
+    cbm_store_t *reader = cbm_store_open_path_query(path);
+    ASSERT_NOT_NULL(reader);
+    ASSERT_TRUE(cbm_store_check_integrity(reader));
+
+    cbm_project_t proj = {0};
+    ASSERT_EQ(cbm_store_get_project(reader, "writer-proj", &proj), CBM_STORE_OK);
+    ASSERT_STR_EQ(proj.root_path, "/tmp/writer-proj");
+    cbm_project_free_fields(&proj);
+
+    cbm_node_t found = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(reader, "writer-proj", "writer-proj.main.Hello", &found),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(found.name, "Hello");
+    cbm_node_free_fields(&found);
+
+    cbm_store_close(reader);
+    unlink(path);
     PASS();
 }
 
@@ -1511,6 +1589,8 @@ SUITE(store_nodes) {
     RUN_TEST(store_project_crud);
     RUN_TEST(store_project_update);
     RUN_TEST(store_project_delete);
+    RUN_TEST(store_open_path_query_readonly_db);
+    RUN_TEST(store_open_path_query_direct_writer_db);
     RUN_TEST(store_node_crud);
     RUN_TEST(store_node_dedup);
     RUN_TEST(store_node_find_by_label);

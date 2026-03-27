@@ -379,6 +379,215 @@ TEST(arch_clusters) {
     PASS();
 }
 
+TEST(arch_summary_basic) {
+    cbm_store_t *s = setup_arch_test_store();
+    cbm_architecture_summary_t summary;
+    memset(&summary, 0, sizeof(summary));
+
+    ASSERT_EQ(cbm_store_get_architecture_summary(s, "test", NULL, &summary), CBM_STORE_OK);
+    ASSERT_EQ(summary.total_files, 5);
+    ASSERT_TRUE(summary.total_functions >= 5);
+    ASSERT_EQ(summary.total_routes, 1);
+    ASSERT_TRUE(summary.file_count > 0);
+    ASSERT_NOT_NULL(summary.files[0].file);
+    ASSERT_EQ(summary.route_count, 1);
+    ASSERT_STR_EQ(summary.routes[0].handler, "HandleRequest");
+    ASSERT_STR_EQ(summary.routes[0].service, "ProcessOrder");
+    ASSERT_STR_EQ(summary.routes[0].next, "ValidateOrder");
+    ASSERT_TRUE(summary.entry_point_count > 0);
+
+    cbm_store_architecture_summary_free(&summary);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_summary_focus) {
+    cbm_store_t *s = setup_arch_test_store();
+    cbm_architecture_summary_t summary;
+    memset(&summary, 0, sizeof(summary));
+
+    ASSERT_EQ(cbm_store_get_architecture_summary(s, "test", "service", &summary), CBM_STORE_OK);
+    ASSERT_EQ(summary.total_files, 5);
+    ASSERT_TRUE(summary.total_functions >= 5);
+    ASSERT_TRUE(summary.file_count >= 1);
+    ASSERT_NOT_NULL(strstr(summary.files[0].file, "service.go"));
+    ASSERT_EQ(summary.total_routes, 1);
+    ASSERT_EQ(summary.route_count, 0);
+
+    cbm_store_architecture_summary_free(&summary);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_summary_many_files) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t prev_fn_id = 0;
+    for (int i = 0; i < 20; i++) {
+        char file_name[64];
+        char file_qn[96];
+        char fn_name[32];
+        char fn_qn[128];
+        snprintf(file_name, sizeof(file_name), "pkg/file%02d.go", i);
+        snprintf(file_qn, sizeof(file_qn), "test.pkg.file%02d", i);
+        snprintf(fn_name, sizeof(fn_name), "Fn%02d", i);
+        snprintf(fn_qn, sizeof(fn_qn), "test.pkg.file%02d.%s", i, fn_name);
+
+        cbm_node_t file = {.project = "test",
+                           .label = "File",
+                           .name = file_name,
+                           .qualified_name = file_qn,
+                           .file_path = file_name};
+        cbm_store_upsert_node(s, &file);
+
+        cbm_node_t fn = {.project = "test",
+                         .label = "Function",
+                         .name = fn_name,
+                         .qualified_name = fn_qn,
+                         .file_path = file_name};
+        int64_t fn_id = cbm_store_upsert_node(s, &fn);
+        if (prev_fn_id > 0) {
+            cbm_edge_t e = {
+                .project = "test", .source_id = prev_fn_id, .target_id = fn_id, .type = "CALLS"};
+            cbm_store_insert_edge(s, &e);
+        }
+        prev_fn_id = fn_id;
+    }
+
+    cbm_architecture_summary_t summary;
+    memset(&summary, 0, sizeof(summary));
+    ASSERT_EQ(cbm_store_get_architecture_summary(s, "test", NULL, &summary), CBM_STORE_OK);
+    ASSERT_EQ(summary.total_files, 20);
+    ASSERT_TRUE(summary.file_count > 0);
+    ASSERT_TRUE(summary.total_functions >= 20);
+
+    cbm_store_architecture_summary_free(&summary);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_summary_cluster_growth) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    for (int pair = 0; pair < 9; pair++) {
+        int64_t pair_ids[2] = {0};
+        for (int idx = 0; idx < 2; idx++) {
+            int file_no = pair * 2 + idx;
+            char file_name[64];
+            char file_qn[96];
+            char fn_name[32];
+            char fn_qn[128];
+            snprintf(file_name, sizeof(file_name), "cluster/file%02d.go", file_no);
+            snprintf(file_qn, sizeof(file_qn), "test.cluster.file%02d", file_no);
+            snprintf(fn_name, sizeof(fn_name), "Fn%02d", file_no);
+            snprintf(fn_qn, sizeof(fn_qn), "test.cluster.file%02d.%s", file_no, fn_name);
+
+            cbm_node_t file = {.project = "test",
+                               .label = "File",
+                               .name = file_name,
+                               .qualified_name = file_qn,
+                               .file_path = file_name};
+            cbm_store_upsert_node(s, &file);
+
+            cbm_node_t fn = {.project = "test",
+                             .label = "Function",
+                             .name = fn_name,
+                             .qualified_name = fn_qn,
+                             .file_path = file_name};
+            pair_ids[idx] = cbm_store_upsert_node(s, &fn);
+        }
+
+        cbm_edge_t edge = {
+            .project = "test", .source_id = pair_ids[0], .target_id = pair_ids[1], .type = "CALLS"};
+        cbm_store_insert_edge(s, &edge);
+    }
+
+    cbm_architecture_summary_t summary;
+    memset(&summary, 0, sizeof(summary));
+    ASSERT_EQ(cbm_store_get_architecture_summary(s, "test", NULL, &summary), CBM_STORE_OK);
+    ASSERT_EQ(summary.total_files, 18);
+    ASSERT_TRUE(summary.cluster_count > 0);
+    ASSERT_TRUE(summary.clusters[0].file_count >= 2);
+
+    cbm_store_architecture_summary_free(&summary);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_summary_cluster_entry_fallback) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    cbm_node_t controller_file = {.project = "test",
+                                  .label = "File",
+                                  .name = "app/Http/Controllers/OrderController.php",
+                                  .qualified_name = "test.app.controllers.OrderController",
+                                  .file_path = "app/Http/Controllers/OrderController.php"};
+    cbm_node_t service_file = {.project = "test",
+                               .label = "File",
+                               .name = "app/Services/OrderService.php",
+                               .qualified_name = "test.app.services.OrderService",
+                               .file_path = "app/Services/OrderService.php"};
+    cbm_store_upsert_node(s, &controller_file);
+    cbm_store_upsert_node(s, &service_file);
+
+    cbm_node_t controller_fn = {.project = "test",
+                                .label = "Method",
+                                .name = "handle",
+                                .qualified_name = "test.app.controllers.OrderController.handle",
+                                .file_path = "app/Http/Controllers/OrderController.php"};
+    cbm_node_t service_fn = {.project = "test",
+                             .label = "Method",
+                             .name = "processOrder",
+                             .qualified_name = "test.app.services.OrderService.processOrder",
+                             .file_path = "app/Services/OrderService.php"};
+    int64_t controller_id = cbm_store_upsert_node(s, &controller_fn);
+    int64_t service_id = cbm_store_upsert_node(s, &service_fn);
+
+    cbm_edge_t edge = {
+        .project = "test", .source_id = controller_id, .target_id = service_id, .type = "CALLS"};
+    cbm_store_insert_edge(s, &edge);
+
+    cbm_node_t route = {.project = "test",
+                        .label = "Route",
+                        .name = "/orders",
+                        .qualified_name = "test.routes.orders",
+                        .properties_json =
+                            "{\"method\":\"POST\",\"path\":\"/orders\",\"handler\":"
+                            "\"OrderController@store\"}"};
+    cbm_store_upsert_node(s, &route);
+
+    cbm_architecture_summary_t summary;
+    memset(&summary, 0, sizeof(summary));
+    ASSERT_EQ(cbm_store_get_architecture_summary(s, "test", NULL, &summary), CBM_STORE_OK);
+    ASSERT_EQ(summary.route_count, 1);
+    ASSERT_TRUE(summary.routes[0].handler_file == NULL);
+    ASSERT_TRUE(summary.cluster_count > 0);
+
+    bool found_entry = false;
+    for (int i = 0; i < summary.cluster_count; i++) {
+        for (int j = 0; j < summary.clusters[i].entry_point_count; j++) {
+            if (strcmp(summary.clusters[i].entry_points[j], "POST /orders") == 0) {
+                found_entry = true;
+                break;
+            }
+        }
+        if (found_entry) {
+            break;
+        }
+    }
+    ASSERT_TRUE(found_entry);
+
+    cbm_store_architecture_summary_free(&summary);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── ADR tests ──────────────────────────────────────────────────── */
 
 TEST(adr_store_and_retrieve) {
@@ -978,6 +1187,11 @@ SUITE(store_arch) {
     RUN_TEST(arch_layers);
     RUN_TEST(arch_file_tree);
     RUN_TEST(arch_clusters);
+    RUN_TEST(arch_summary_basic);
+    RUN_TEST(arch_summary_focus);
+    RUN_TEST(arch_summary_many_files);
+    RUN_TEST(arch_summary_cluster_growth);
+    RUN_TEST(arch_summary_cluster_entry_fallback);
 
     /* ADR */
     RUN_TEST(adr_store_and_retrieve);
