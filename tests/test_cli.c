@@ -533,41 +533,34 @@ TEST(cli_remove_old_monolithic_skill) {
 }
 
 TEST(cli_skill_files_content) {
-    /* Port of TestSkillFilesContent */
+    /* Consolidated skill: all 4 former skills merged into one */
     const cbm_skill_t *sk = cbm_get_skills();
-    ASSERT_EQ(CBM_SKILL_COUNT, 4);
+    ASSERT_EQ(CBM_SKILL_COUNT, 1);
 
-    /* Check exploring skill */
-    bool found_exploring = false, found_tracing = false;
-    bool found_quality = false, found_reference = false;
-    for (int i = 0; i < CBM_SKILL_COUNT; i++) {
-        if (strcmp(sk[i].name, "codebase-memory-exploring") == 0) {
-            found_exploring = true;
-            ASSERT(strstr(sk[i].content, "search_graph") != NULL);
-            ASSERT(strstr(sk[i].content, "get_graph_schema") != NULL);
-        }
-        if (strcmp(sk[i].name, "codebase-memory-tracing") == 0) {
-            found_tracing = true;
-            ASSERT(strstr(sk[i].content, "trace_call_path") != NULL);
-            ASSERT(strstr(sk[i].content, "direction") != NULL);
-            ASSERT(strstr(sk[i].content, "detect_changes") != NULL);
-        }
-        if (strcmp(sk[i].name, "codebase-memory-quality") == 0) {
-            found_quality = true;
-            ASSERT(strstr(sk[i].content, "max_degree=0") != NULL);
-            ASSERT(strstr(sk[i].content, "exclude_entry_points") != NULL);
-        }
-        if (strcmp(sk[i].name, "codebase-memory-reference") == 0) {
-            found_reference = true;
-            ASSERT(strstr(sk[i].content, "query_graph") != NULL);
-            ASSERT(strstr(sk[i].content, "Cypher") != NULL);
-            ASSERT(strstr(sk[i].content, "14 total") != NULL);
-        }
-    }
-    ASSERT_TRUE(found_exploring);
-    ASSERT_TRUE(found_tracing);
-    ASSERT_TRUE(found_quality);
-    ASSERT_TRUE(found_reference);
+    /* The single consolidated skill must cover all use cases */
+    ASSERT(strcmp(sk[0].name, "codebase-memory") == 0);
+
+    /* Exploring capabilities */
+    ASSERT(strstr(sk[0].content, "search_graph") != NULL);
+    ASSERT(strstr(sk[0].content, "get_graph_schema") != NULL);
+
+    /* Tracing capabilities */
+    ASSERT(strstr(sk[0].content, "trace_call_path") != NULL);
+    ASSERT(strstr(sk[0].content, "direction") != NULL);
+    ASSERT(strstr(sk[0].content, "detect_changes") != NULL);
+
+    /* Quality capabilities */
+    ASSERT(strstr(sk[0].content, "max_degree=0") != NULL);
+    ASSERT(strstr(sk[0].content, "exclude_entry_points") != NULL);
+
+    /* Reference capabilities */
+    ASSERT(strstr(sk[0].content, "query_graph") != NULL);
+    ASSERT(strstr(sk[0].content, "Cypher") != NULL);
+    ASSERT(strstr(sk[0].content, "14 MCP Tools") != NULL);
+
+    /* Gotchas section (new — highest-value content per Anthropic best practices) */
+    ASSERT(strstr(sk[0].content, "Gotchas") != NULL);
+
     PASS();
 }
 
