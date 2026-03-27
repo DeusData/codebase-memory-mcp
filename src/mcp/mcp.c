@@ -240,7 +240,9 @@ static const tool_def_t TOOLS[] = {
      "\"string\"},\"name_pattern\":{\"type\":\"string\"},\"qn_pattern\":{\"type\":\"string\"},"
      "\"file_pattern\":{\"type\":\"string\"},\"relationship\":{\"type\":\"string\"},\"min_degree\":"
      "{\"type\":\"integer\"},\"max_degree\":{\"type\":\"integer\"},\"exclude_entry_points\":{"
-     "\"type\":\"boolean\"},\"include_connected\":{\"type\":\"boolean\"},\"limit\":{\"type\":"
+     "\"type\":\"boolean\"},\"include_connected\":{\"type\":\"boolean\",\"description\":"
+     "\"Include connected node names for up to the first 50 results, capped at 10 names per "
+     "result.\"},\"limit\":{\"type\":"
      "\"integer\",\"description\":\"Max results. Default: "
      "unlimited\"},\"offset\":{\"type\":\"integer\",\"default\":0}},\"required\":[\"project\"]}"},
 
