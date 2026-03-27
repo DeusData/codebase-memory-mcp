@@ -1995,3 +1995,119 @@ int cbm_extract_channels(const char *source, cbm_channel_match_t *out, int max_o
     cbm_regfree(&re);
     return count;
 }
+
+/* ── C# channel extraction: Socket.IO with constant resolution ─── */
+
+/* Extract channels from C# source that uses constant names for event strings.
+ * Pattern: _socket.Emit(CONSTANT_NAME, data) / _socket.OnRequest<T>(CONSTANT_NAME, ...)
+ * Resolves constants via: const string CONSTANT_NAME = "ActualChannelName"; */
+int cbm_extract_csharp_channels(const char *source, cbm_channel_match_t *out, int max_out) {
+    if (!source || !*source) return 0;
+
+    /* Pass 1: Collect const string mappings: name → value */
+    typedef struct { char name[128]; char value[256]; } const_map_t;
+    const_map_t cmap[128];
+    int cmap_count = 0;
+
+    cbm_regex_t re_const;
+    if (cbm_regcomp(&re_const,
+            "const[[:space:]]+string[[:space:]]+([A-Z_][A-Z_0-9]*)[[:space:]]*=[[:space:]]*\"([^\"]{1,128})\"",
+            CBM_REG_EXTENDED) == 0) {
+        const char *p = source;
+        cbm_regmatch_t cm[3];
+        while (cmap_count < 128 && cbm_regexec(&re_const, p, 3, cm, 0) == 0) {
+            int nlen = cm[1].rm_eo - cm[1].rm_so;
+            int vlen = cm[2].rm_eo - cm[2].rm_so;
+            if (nlen > 0 && nlen < 128 && vlen > 0 && vlen < 256) {
+                memcpy(cmap[cmap_count].name, p + cm[1].rm_so, (size_t)nlen);
+                cmap[cmap_count].name[nlen] = '\0';
+                memcpy(cmap[cmap_count].value, p + cm[2].rm_so, (size_t)vlen);
+                cmap[cmap_count].value[vlen] = '\0';
+                cmap_count++;
+            }
+            p += cm[0].rm_eo;
+        }
+        cbm_regfree(&re_const);
+    }
+
+    /* Pass 2: Find .Emit( and .OnRequest patterns */
+    int count = 0;
+
+    /* Pattern: .Emit(IDENTIFIER  or  .OnRequest<...>(IDENTIFIER */
+    cbm_regex_t re_emit;
+    if (cbm_regcomp(&re_emit,
+            "\\.(Emit|OnRequest)[^(]*\\([[:space:]]*([A-Z_][A-Z_0-9]*)",
+            CBM_REG_EXTENDED) == 0) {
+        const char *p = source;
+        cbm_regmatch_t em[3];
+        while (count < max_out && cbm_regexec(&re_emit, p, 3, em, 0) == 0) {
+            int mlen = em[1].rm_eo - em[1].rm_so;
+            char method[16];
+            if (mlen >= (int)sizeof(method)) mlen = (int)sizeof(method) - 1;
+            memcpy(method, p + em[1].rm_so, (size_t)mlen);
+            method[mlen] = '\0';
+
+            int ilen = em[2].rm_eo - em[2].rm_so;
+            char ident[128];
+            if (ilen >= (int)sizeof(ident)) ilen = (int)sizeof(ident) - 1;
+            memcpy(ident, p + em[2].rm_so, (size_t)ilen);
+            ident[ilen] = '\0';
+
+            /* Resolve constant to string value */
+            const char *resolved = NULL;
+            for (int i = 0; i < cmap_count; i++) {
+                if (strcmp(cmap[i].name, ident) == 0) {
+                    resolved = cmap[i].value;
+                    break;
+                }
+            }
+
+            if (resolved) {
+                strncpy(out[count].channel, resolved, sizeof(out[count].channel) - 1);
+                out[count].channel[sizeof(out[count].channel) - 1] = '\0';
+
+                if (strcmp(method, "Emit") == 0) {
+                    strncpy(out[count].direction, "emit", sizeof(out[count].direction) - 1);
+                } else {
+                    strncpy(out[count].direction, "listen", sizeof(out[count].direction) - 1);
+                }
+                strncpy(out[count].transport, "socketio", sizeof(out[count].transport) - 1);
+                count++;
+            }
+            p += em[0].rm_eo;
+        }
+        cbm_regfree(&re_emit);
+    }
+
+    /* Also match direct string literal patterns: .Emit("ChannelName" */
+    cbm_regex_t re_literal;
+    if (cbm_regcomp(&re_literal,
+            "\\.(Emit|On|OnRequest)[^(]*\\([[:space:]]*\"([^\"]{1,128})\"",
+            CBM_REG_EXTENDED) == 0) {
+        const char *p = source;
+        cbm_regmatch_t lm[3];
+        while (count < max_out && cbm_regexec(&re_literal, p, 3, lm, 0) == 0) {
+            int mlen = lm[1].rm_eo - lm[1].rm_so;
+            char method[16];
+            if (mlen >= (int)sizeof(method)) mlen = (int)sizeof(method) - 1;
+            memcpy(method, p + lm[1].rm_so, (size_t)mlen);
+            method[mlen] = '\0';
+
+            int clen = lm[2].rm_eo - lm[2].rm_so;
+            strncpy(out[count].channel, p + lm[2].rm_so, (size_t)(clen < 255 ? clen : 255));
+            out[count].channel[clen < 255 ? clen : 255] = '\0';
+
+            if (strcmp(method, "Emit") == 0) {
+                strncpy(out[count].direction, "emit", sizeof(out[count].direction) - 1);
+            } else {
+                strncpy(out[count].direction, "listen", sizeof(out[count].direction) - 1);
+            }
+            strncpy(out[count].transport, "socketio", sizeof(out[count].transport) - 1);
+            count++;
+            p += lm[0].rm_eo;
+        }
+        cbm_regfree(&re_literal);
+    }
+
+    return count;
+}

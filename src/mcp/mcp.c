@@ -1774,11 +1774,14 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         cbm_store_find_edges_by_source_type(store, nodes[best_idx].id, "DEFINES_METHOD",
                                             &dm_edges, &dm_count);
         if (dm_count > 0) {
-            start_ids = malloc((size_t)dm_count * sizeof(int64_t));
-            for (int i = 0; i < dm_count; i++) {
+            /* Cap at 5 methods to prevent excessive BFS calls (each method
+             * spawns ~6 BFS queries across edge type categories) */
+            int use_count = dm_count > 5 ? 5 : dm_count;
+            start_ids = malloc((size_t)use_count * sizeof(int64_t));
+            for (int i = 0; i < use_count; i++) {
                 start_ids[i] = dm_edges[i].target_id;
             }
-            start_id_count = dm_count;
+            start_id_count = use_count;
         }
         /* Free edge data */
         for (int i = 0; i < dm_count; i++) {
@@ -1842,8 +1845,11 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         int in_deg = 0;
         int out_deg = 0;
         cbm_store_node_degree(store, nodes[best_idx].id, &in_deg, &out_deg);
-        if (in_deg == 0 && out_deg == 0) {
-            /* No edges — return basic info */
+        if (in_deg == 0 && out_deg == 0 && !is_class_like) {
+            /* No CALLS edges and not a Class — return basic info.
+             * Class/Interface nodes skip this check because they have
+             * DEFINES_METHOD and INHERITS edges that aren't counted by
+             * cbm_store_node_degree (which only counts CALLS). */
             char *json = yy_doc_to_str(doc);
             yyjson_mut_doc_free(doc);
             free(start_ids);
@@ -2013,12 +2019,14 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_obj_add_val(doc, outgoing, "calls", calls_arr);
         }
 
-        /* Outgoing DEFINES_METHOD (for Classes) */
+        /* Outgoing DEFINES_METHOD (for Classes).
+         * Use the original Class node ID, not start_ids (which are method IDs).
+         * DEFINES_METHOD edges go FROM the Class TO its Methods. */
         {
             int saved_tr = tr_count;
-            for (int s = 0; s < start_id_count && tr_count < MAX_TR; s++) {
+            if (is_class_like && tr_count < MAX_TR) {
                 const char *dm_types[] = {"DEFINES_METHOD"};
-                cbm_store_bfs(store, start_ids[s], "outbound", dm_types, 1, 1, EDGE_QUERY_MAX,
+                cbm_store_bfs(store, nodes[best_idx].id, "outbound", dm_types, 1, 1, 30,
                               &all_tr[tr_count]);
                 tr_count++;
             }

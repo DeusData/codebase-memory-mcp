@@ -4956,13 +4956,14 @@ void cbm_store_free_process_steps(cbm_process_step_t *arr, int count) {
 
 /* ── Channels (cross-service message tracing) ────────────────────── */
 
-/* Forward declaration of channel extractor from httplink.c */
+/* Forward declaration of channel extractors from httplink.c */
 typedef struct {
     char channel[256];
     char direction[8];
     char transport[32];
 } cbm_channel_match_t;
 int cbm_extract_channels(const char *source, cbm_channel_match_t *out, int max_out);
+int cbm_extract_csharp_channels(const char *source, cbm_channel_match_t *out, int max_out);
 
 int cbm_store_detect_channels(cbm_store_t *s, const char *project, const char *repo_path) {
     if (!s || !s->db || !project || !repo_path) return 0;
@@ -4972,11 +4973,12 @@ int cbm_store_detect_channels(cbm_store_t *s, const char *project, const char *r
     snprintf(del, sizeof(del), "DELETE FROM channels WHERE project = '%s'", project);
     exec_sql(s, del);
 
-    /* Find all JS/TS Function/Method nodes with source file references */
+    /* Find all Function/Method nodes with source file references in supported languages */
     const char *sql = "SELECT id, name, file_path, start_line, end_line FROM nodes "
-                      "WHERE project = ?1 AND label IN ('Function','Method','Module') "
+                      "WHERE project = ?1 AND label IN ('Function','Method','Module','Class') "
                       "AND (file_path LIKE '%.ts' OR file_path LIKE '%.js' "
-                      "OR file_path LIKE '%.tsx' OR file_path LIKE '%.py')";
+                      "OR file_path LIKE '%.tsx' OR file_path LIKE '%.py' "
+                      "OR file_path LIKE '%.cs')";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
     bind_text(stmt, 1, project);
@@ -5029,7 +5031,15 @@ int cbm_store_detect_channels(cbm_store_t *s, const char *project, const char *r
         if (source) {
             source[src_len] = '\0';
             cbm_channel_match_t matches[64];
-            int mc = cbm_extract_channels(source, matches, 64);
+            int mc = 0;
+            /* Use language-appropriate extractor */
+            bool is_cs = fpath && (strstr(fpath, ".cs") != NULL &&
+                                   strstr(fpath, ".css") == NULL);
+            if (is_cs) {
+                mc = cbm_extract_csharp_channels(source, matches, 64);
+            } else {
+                mc = cbm_extract_channels(source, matches, 64);
+            }
             for (int i = 0; i < mc && ins; i++) {
                 sqlite3_reset(ins);
                 bind_text(ins, 1, project);
