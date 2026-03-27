@@ -281,6 +281,13 @@ static const tool_def_t TOOLS[] = {
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"aspects\":{\"type\":"
      "\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]}"},
 
+    {"list_processes",
+     "List discovered execution flows (processes). Each process is a named path from an entry "
+     "point through the call graph to a terminal node that crosses a community boundary. "
+     "Processes are auto-detected during indexing using BFS from entry points + Louvain "
+     "community detection. Returns up to 300 processes ordered by step count.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":[\"project\"]}"},
+
     {"search_code",
      "Graph-augmented code search. Finds text patterns via grep, then enriches results with "
      "the knowledge graph: deduplicates matches into containing functions, ranks by structural "
@@ -1152,6 +1159,45 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     free(name);
+
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
+static char *handle_list_processes(cbm_mcp_server_t *srv, const char *args) {
+    char *project = cbm_mcp_get_string_arg(args, "project");
+    cbm_store_t *store = resolve_store(srv, project);
+    REQUIRE_STORE(store, project);
+
+    cbm_process_info_t *procs = NULL;
+    int count = 0;
+    cbm_store_list_processes(store, project, &procs, &count);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    yyjson_mut_obj_add_int(doc, root, "total", count);
+
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < count; i++) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_int(doc, item, "id", procs[i].id);
+        yyjson_mut_obj_add_strcpy(doc, item, "label", procs[i].label ? procs[i].label : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "process_type",
+                                  procs[i].process_type ? procs[i].process_type : "");
+        yyjson_mut_obj_add_int(doc, item, "step_count", procs[i].step_count);
+        yyjson_mut_obj_add_int(doc, item, "entry_point_id", procs[i].entry_point_id);
+        yyjson_mut_obj_add_int(doc, item, "terminal_id", procs[i].terminal_id);
+        yyjson_mut_arr_add_val(arr, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "processes", arr);
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    cbm_store_free_processes(procs, count);
+    free(project);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
@@ -2918,6 +2964,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "get_architecture") == 0) {
         return handle_get_architecture(srv, args_json);
+    }
+    if (strcmp(tool_name, "list_processes") == 0) {
+        return handle_list_processes(srv, args_json);
     }
 
     /* Pipeline-dependent tools */

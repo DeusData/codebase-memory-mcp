@@ -518,6 +518,36 @@ int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char *
                                int aspect_count, cbm_architecture_info_t *out);
 void cbm_store_architecture_free(cbm_architecture_info_t *out);
 
+/* ── Processes (execution flows) ─────────────────────────────────── */
+
+typedef struct {
+    int64_t id;
+    const char *label;        /* "EntryPoint → Terminal" */
+    const char *process_type; /* "cross_community" or "intra_community" */
+    int step_count;
+    int64_t entry_point_id;
+    int64_t terminal_id;
+} cbm_process_info_t;
+
+typedef struct {
+    int64_t node_id;
+    const char *name;
+    const char *qualified_name;
+    const char *file_path;
+    int step;
+} cbm_process_step_t;
+
+int cbm_store_list_processes(cbm_store_t *s, const char *project,
+                             cbm_process_info_t **out, int *count);
+int cbm_store_get_process_steps(cbm_store_t *s, int64_t process_id,
+                                cbm_process_step_t **out, int *count);
+void cbm_store_free_processes(cbm_process_info_t *arr, int count);
+void cbm_store_free_process_steps(cbm_process_step_t *arr, int count);
+
+/* Detect execution flows from entry points via BFS + Louvain community crossing.
+ * Writes results to processes + process_steps tables. Returns count of processes found. */
+int cbm_store_detect_processes(cbm_store_t *s, const char *project, int max_processes);
+
 /* ── ADR (Architecture Decision Record) ────────────────────────── */
 
 #define CBM_ADR_MAX_LENGTH 8000

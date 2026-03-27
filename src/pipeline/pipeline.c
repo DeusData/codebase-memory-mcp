@@ -828,6 +828,17 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
                     "SELECT id, name, qualified_name, label, file_path FROM nodes;");
                 cbm_store_close(fts_store);
             }
+
+            /* ── Process detection: discover execution flows from entry points ── */
+            {
+                cbm_store_t *proc_store = cbm_store_open_path(db_path);
+                if (proc_store) {
+                    int nprocs = cbm_store_detect_processes(proc_store, p->project_name, 300);
+                    cbm_log_info("pass.done", "pass", "processes",
+                                 "detected", itoa_buf(nprocs));
+                    cbm_store_close(proc_store);
+                }
+            }
         }
     }
 

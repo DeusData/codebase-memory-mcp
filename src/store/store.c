@@ -191,7 +191,22 @@ static int init_schema(cbm_store_t *s) {
                       "  properties TEXT DEFAULT '{}',"
                       "  UNIQUE(source_id, target_id, type)"
                       ");"
-                      "CREATE TABLE IF NOT EXISTS project_summaries ("
+                       "CREATE TABLE IF NOT EXISTS processes ("
+                       "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                       "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+                       "  label TEXT NOT NULL,"
+                       "  process_type TEXT NOT NULL DEFAULT 'cross_community',"
+                       "  step_count INTEGER NOT NULL DEFAULT 0,"
+                       "  entry_point_id INTEGER NOT NULL,"
+                       "  terminal_id INTEGER NOT NULL"
+                       ");"
+                       "CREATE TABLE IF NOT EXISTS process_steps ("
+                       "  process_id INTEGER NOT NULL REFERENCES processes(id) ON DELETE CASCADE,"
+                       "  node_id INTEGER NOT NULL,"
+                       "  step INTEGER NOT NULL,"
+                       "  PRIMARY KEY (process_id, step)"
+                       ");"
+                       "CREATE TABLE IF NOT EXISTS project_summaries ("
                       "  project TEXT PRIMARY KEY,"
                       "  summary TEXT NOT NULL,"
                       "  source_hash TEXT NOT NULL,"
@@ -4453,6 +4468,314 @@ void cbm_store_architecture_free(cbm_architecture_info_t *out) {
     }
     free(out->file_tree);
     memset(out, 0, sizeof(*out));
+}
+
+/* ── Processes (execution flows) ──────────────────────────────── */
+
+/* Detect execution flows: BFS from entry points, identify cross-community paths. */
+int cbm_store_detect_processes(cbm_store_t *s, const char *project, int max_processes) {
+    if (!s || !s->db || !project) return 0;
+
+    /* Clear existing processes */
+    {
+        char sql[512];
+        snprintf(sql, sizeof(sql),
+                 "DELETE FROM process_steps WHERE process_id IN "
+                 "(SELECT id FROM processes WHERE project = '%s')", project);
+        exec_sql(s, sql);
+        snprintf(sql, sizeof(sql), "DELETE FROM processes WHERE project = '%s'", project);
+        exec_sql(s, sql);
+    }
+
+    /* 1. Find entry point node IDs */
+    const char *ep_sql =
+        "SELECT id, name FROM nodes WHERE project = ?1 "
+        "AND (json_extract(properties, '$.is_entry_point') = 1 OR label = 'Route') "
+        "AND label NOT IN ('File','Folder','Module','Project')";
+    sqlite3_stmt *ep_stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, ep_sql, -1, &ep_stmt, NULL) != SQLITE_OK) return 0;
+    bind_text(ep_stmt, 1, project);
+
+    int ep_cap = 512;
+    int ep_count = 0;
+    int64_t *ep_ids = malloc((size_t)ep_cap * sizeof(int64_t));
+    char **ep_names = malloc((size_t)ep_cap * sizeof(char *));
+
+    while (sqlite3_step(ep_stmt) == SQLITE_ROW) {
+        if (ep_count >= ep_cap) {
+            ep_cap *= 2;
+            ep_ids = safe_realloc(ep_ids, (size_t)ep_cap * sizeof(int64_t));
+            ep_names = safe_realloc(ep_names, (size_t)ep_cap * sizeof(char *));
+        }
+        ep_ids[ep_count] = sqlite3_column_int64(ep_stmt, 0);
+        const char *nm = (const char *)sqlite3_column_text(ep_stmt, 1);
+        ep_names[ep_count] = heap_strdup(nm ? nm : "?");
+        ep_count++;
+    }
+    sqlite3_finalize(ep_stmt);
+
+    if (ep_count == 0) {
+        free(ep_ids);
+        free(ep_names);
+        return 0;
+    }
+
+    /* 2. Load nodes + CALLS edges for Louvain */
+    const char *nsql = "SELECT id FROM nodes WHERE project=?1 "
+                       "AND label IN ('Function','Method','Class','Interface')";
+    sqlite3_stmt *nst = NULL;
+    int all_cap = 4096;
+    int all_count = 0;
+    int64_t *all_ids = malloc((size_t)all_cap * sizeof(int64_t));
+    if (sqlite3_prepare_v2(s->db, nsql, -1, &nst, NULL) == SQLITE_OK) {
+        bind_text(nst, 1, project);
+        while (sqlite3_step(nst) == SQLITE_ROW) {
+            if (all_count >= all_cap) {
+                all_cap *= 2;
+                all_ids = safe_realloc(all_ids, (size_t)all_cap * sizeof(int64_t));
+            }
+            all_ids[all_count++] = sqlite3_column_int64(nst, 0);
+        }
+        sqlite3_finalize(nst);
+    }
+
+    const char *esql = "SELECT source_id, target_id FROM edges WHERE project=?1 AND type='CALLS'";
+    sqlite3_stmt *est = NULL;
+    int le_cap = 8192;
+    int le_count = 0;
+    cbm_louvain_edge_t *ledges = malloc((size_t)le_cap * sizeof(cbm_louvain_edge_t));
+    if (sqlite3_prepare_v2(s->db, esql, -1, &est, NULL) == SQLITE_OK) {
+        bind_text(est, 1, project);
+        while (sqlite3_step(est) == SQLITE_ROW) {
+            if (le_count >= le_cap) {
+                le_cap *= 2;
+                ledges = safe_realloc(ledges, (size_t)le_cap * sizeof(cbm_louvain_edge_t));
+            }
+            ledges[le_count].src = sqlite3_column_int64(est, 0);
+            ledges[le_count].dst = sqlite3_column_int64(est, 1);
+            le_count++;
+        }
+        sqlite3_finalize(est);
+    }
+
+    /* 3. Run Louvain */
+    cbm_louvain_result_t *lresults = NULL;
+    int lcount = 0;
+    if (all_count > 1 && le_count > 0) {
+        cbm_louvain(all_ids, all_count, ledges, le_count, &lresults, &lcount);
+    }
+    free(all_ids);
+    free(ledges);
+
+    /* Build node_id → community lookup (parallel arrays — O(n) scan per lookup,
+     * acceptable for entry_point_count * visited_count iterations) */
+    int64_t *comm_nids = NULL;
+    int *comm_vals = NULL;
+    int comm_size = 0;
+    if (lresults && lcount > 0) {
+        comm_nids = malloc((size_t)lcount * sizeof(int64_t));
+        comm_vals = malloc((size_t)lcount * sizeof(int));
+        for (int i = 0; i < lcount; i++) {
+            comm_nids[i] = lresults[i].node_id;
+            comm_vals[i] = lresults[i].community;
+        }
+        comm_size = lcount;
+    }
+    free(lresults);
+
+    /* 4. BFS from each entry point, detect cross-community flows */
+    sqlite3_stmt *ins_proc = NULL;
+    sqlite3_stmt *ins_step = NULL;
+    sqlite3_prepare_v2(s->db,
+        "INSERT INTO processes(project,label,process_type,step_count,"
+        "entry_point_id,terminal_id) VALUES(?1,?2,?3,?4,?5,?6)",
+        -1, &ins_proc, NULL);
+    sqlite3_prepare_v2(s->db,
+        "INSERT INTO process_steps(process_id,node_id,step) VALUES(?1,?2,?3)",
+        -1, &ins_step, NULL);
+
+    exec_sql(s, "BEGIN TRANSACTION");
+    int proc_count = 0;
+
+    for (int ei = 0; ei < ep_count && proc_count < max_processes; ei++) {
+        const char *bfs_types[] = {"CALLS"};
+        cbm_traverse_result_t tr = {0};
+        cbm_store_bfs(s, ep_ids[ei], "outbound", bfs_types, 1, 8, 200, &tr);
+
+        if (tr.visited_count < 2) {
+            cbm_store_traverse_free(&tr);
+            continue;
+        }
+
+        /* Find deepest cross-community node */
+        int ep_comm = -1;
+        for (int c = 0; c < comm_size; c++) {
+            if (comm_nids[c] == ep_ids[ei]) { ep_comm = comm_vals[c]; break; }
+        }
+
+        int64_t terminal_id = ep_ids[ei];
+        const char *terminal_name = ep_names[ei];
+        int max_hop = 0;
+        bool is_cross = false;
+
+        for (int v = 0; v < tr.visited_count; v++) {
+            int node_comm = -1;
+            for (int c = 0; c < comm_size; c++) {
+                if (comm_nids[c] == tr.visited[v].node.id) { node_comm = comm_vals[c]; break; }
+            }
+            if (node_comm != ep_comm && node_comm >= 0 && ep_comm >= 0) {
+                if (tr.visited[v].hop > max_hop) {
+                    max_hop = tr.visited[v].hop;
+                    terminal_id = tr.visited[v].node.id;
+                    terminal_name = tr.visited[v].node.name ? tr.visited[v].node.name : "?";
+                    is_cross = true;
+                }
+            }
+        }
+
+        if (!is_cross) {
+            cbm_store_traverse_free(&tr);
+            continue;
+        }
+
+        /* Label: "EntryPoint → Terminal" (UTF-8 arrow) */
+        char label[512];
+        snprintf(label, sizeof(label), "%s \xe2\x86\x92 %s", ep_names[ei], terminal_name);
+
+        if (ins_proc) {
+            sqlite3_reset(ins_proc);
+            bind_text(ins_proc, 1, project);
+            bind_text(ins_proc, 2, label);
+            bind_text(ins_proc, 3, "cross_community");
+            sqlite3_bind_int(ins_proc, 4, tr.visited_count + 1);
+            sqlite3_bind_int64(ins_proc, 5, ep_ids[ei]);
+            sqlite3_bind_int64(ins_proc, 6, terminal_id);
+            sqlite3_step(ins_proc);
+        }
+
+        int64_t proc_id = sqlite3_last_insert_rowid(s->db);
+
+        /* Insert steps */
+        if (ins_step) {
+            sqlite3_reset(ins_step);
+            sqlite3_bind_int64(ins_step, 1, proc_id);
+            sqlite3_bind_int64(ins_step, 2, ep_ids[ei]);
+            sqlite3_bind_int(ins_step, 3, 0);
+            sqlite3_step(ins_step);
+
+            for (int v = 0; v < tr.visited_count; v++) {
+                sqlite3_reset(ins_step);
+                sqlite3_bind_int64(ins_step, 1, proc_id);
+                sqlite3_bind_int64(ins_step, 2, tr.visited[v].node.id);
+                sqlite3_bind_int(ins_step, 3, tr.visited[v].hop);
+                sqlite3_step(ins_step);
+            }
+        }
+
+        cbm_store_traverse_free(&tr);
+        proc_count++;
+    }
+
+    exec_sql(s, "COMMIT");
+    if (ins_proc) sqlite3_finalize(ins_proc);
+    if (ins_step) sqlite3_finalize(ins_step);
+
+    free(comm_nids);
+    free(comm_vals);
+    for (int i = 0; i < ep_count; i++) free(ep_names[i]);
+    free(ep_names);
+    free(ep_ids);
+
+    return proc_count;
+}
+
+int cbm_store_list_processes(cbm_store_t *s, const char *project,
+                             cbm_process_info_t **out, int *count) {
+    *out = NULL;
+    *count = 0;
+    const char *sql = "SELECT p.id, p.label, p.process_type, p.step_count, "
+                      "p.entry_point_id, p.terminal_id "
+                      "FROM processes p WHERE p.project = ?1 "
+                      "ORDER BY p.step_count DESC LIMIT 300";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_OK; /* Table may not exist yet */
+    }
+    bind_text(stmt, 1, project);
+
+    int cap = 64;
+    int n = 0;
+    cbm_process_info_t *arr = calloc((size_t)cap, sizeof(cbm_process_info_t));
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (n >= cap) {
+            cap *= 2;
+            arr = safe_realloc(arr, (size_t)cap * sizeof(cbm_process_info_t));
+        }
+        arr[n].id = sqlite3_column_int64(stmt, 0);
+        arr[n].label = heap_strdup((const char *)sqlite3_column_text(stmt, 1));
+        arr[n].process_type = heap_strdup((const char *)sqlite3_column_text(stmt, 2));
+        arr[n].step_count = sqlite3_column_int(stmt, 3);
+        arr[n].entry_point_id = sqlite3_column_int64(stmt, 4);
+        arr[n].terminal_id = sqlite3_column_int64(stmt, 5);
+        n++;
+    }
+    sqlite3_finalize(stmt);
+    *out = arr;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_get_process_steps(cbm_store_t *s, int64_t process_id,
+                                cbm_process_step_t **out, int *count) {
+    *out = NULL;
+    *count = 0;
+    const char *sql = "SELECT ps.node_id, n.name, n.qualified_name, n.file_path, ps.step "
+                      "FROM process_steps ps JOIN nodes n ON n.id = ps.node_id "
+                      "WHERE ps.process_id = ?1 ORDER BY ps.step";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_OK;
+    }
+    sqlite3_bind_int64(stmt, 1, process_id);
+
+    int cap = 16;
+    int n = 0;
+    cbm_process_step_t *arr = calloc((size_t)cap, sizeof(cbm_process_step_t));
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (n >= cap) {
+            cap *= 2;
+            arr = safe_realloc(arr, (size_t)cap * sizeof(cbm_process_step_t));
+        }
+        arr[n].node_id = sqlite3_column_int64(stmt, 0);
+        arr[n].name = heap_strdup((const char *)sqlite3_column_text(stmt, 1));
+        arr[n].qualified_name = heap_strdup((const char *)sqlite3_column_text(stmt, 2));
+        arr[n].file_path = heap_strdup((const char *)sqlite3_column_text(stmt, 3));
+        arr[n].step = sqlite3_column_int(stmt, 4);
+        n++;
+    }
+    sqlite3_finalize(stmt);
+    *out = arr;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
+void cbm_store_free_processes(cbm_process_info_t *arr, int count) {
+    for (int i = 0; i < count; i++) {
+        free((void *)arr[i].label);
+        free((void *)arr[i].process_type);
+    }
+    free(arr);
+}
+
+void cbm_store_free_process_steps(cbm_process_step_t *arr, int count) {
+    for (int i = 0; i < count; i++) {
+        free((void *)arr[i].name);
+        free((void *)arr[i].qualified_name);
+        free((void *)arr[i].file_path);
+    }
+    free(arr);
 }
 
 /* ── ADR (Architecture Decision Record) ────────────────────────── */
