@@ -526,6 +526,151 @@ TEST(integ_store_bfs_traversal) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  PARAM WIRING TESTS (previously-ignored search/trace params)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(integ_search_graph_relationship_filter) {
+    char args[512];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"relationship\":\"CALLS\",\"label\":\"Function\",\"limit\":50}",
+             g_project);
+
+    char *resp = call_tool("search_graph", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "total"));
+    ASSERT_NOT_NULL(strstr(resp, "greet"));
+
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"relationship\":\"NONEXISTENT_EDGE\",\"label\":\"Function\","
+             "\"limit\":50}",
+             g_project);
+    char *resp2 = call_tool("search_graph", args);
+    ASSERT_NOT_NULL(resp2);
+    ASSERT_TRUE(strstr(resp2, "greet") == NULL);
+
+    free(resp);
+    free(resp2);
+    PASS();
+}
+
+TEST(integ_search_graph_exclude_entry_points) {
+    char args[512];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"label\":\"Function\",\"limit\":50}",
+             g_project);
+    char *resp_all = call_tool("search_graph", args);
+    ASSERT_NOT_NULL(resp_all);
+
+    snprintf(
+        args, sizeof(args),
+        "{\"project\":\"%s\",\"exclude_entry_points\":true,\"label\":\"Function\",\"limit\":50}",
+        g_project);
+    char *resp_filtered = call_tool("search_graph", args);
+    ASSERT_NOT_NULL(resp_filtered);
+
+    ASSERT_NOT_NULL(strstr(resp_filtered, "greet"));
+    ASSERT_NOT_NULL(strstr(resp_filtered, "Add"));
+
+    free(resp_all);
+    free(resp_filtered);
+    PASS();
+}
+
+TEST(integ_search_graph_include_connected) {
+    char args[512];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"include_connected\":true,\"name_pattern\":\"Multiply\","
+             "\"label\":\"Function\",\"limit\":10}",
+             g_project);
+
+    char *resp = call_tool("search_graph", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "Multiply"));
+    ASSERT_NOT_NULL(strstr(resp, "connected_names"));
+    ASSERT_NOT_NULL(strstr(resp, "Add"));
+    free(resp);
+    PASS();
+}
+
+TEST(integ_trace_call_path_custom_edge_types) {
+    char args[512];
+    snprintf(args, sizeof(args),
+             "{\"function_name\":\"Multiply\",\"project\":\"%s\","
+             "\"direction\":\"outbound\",\"edge_types\":[\"CALLS\"]}",
+             g_project);
+
+    char *resp = call_tool("trace_call_path", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "Add"));
+    ASSERT_NOT_NULL(strstr(resp, "callees"));
+    free(resp);
+    PASS();
+}
+
+TEST(integ_trace_call_path_imports_edge_type) {
+    char args[512];
+    snprintf(args, sizeof(args),
+             "{\"function_name\":\"Multiply\",\"project\":\"%s\","
+             "\"direction\":\"both\",\"edge_types\":[\"IMPORTS\"]}",
+             g_project);
+
+    char *resp = call_tool("trace_call_path", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "function"));
+    ASSERT_TRUE(strstr(resp, "Add") == NULL);
+    free(resp);
+    PASS();
+}
+
+TEST(integ_trace_call_path_nonexistent_with_edge_types) {
+    char args[512];
+    snprintf(args, sizeof(args),
+             "{\"function_name\":\"NonExistentFunction\",\"project\":\"%s\","
+             "\"edge_types\":[\"CALLS\",\"IMPORTS\"]}",
+             g_project);
+
+    char *resp = call_tool("trace_call_path", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "not found"));
+    free(resp);
+    PASS();
+}
+
+TEST(integ_trace_call_path_empty_edge_types) {
+    char args[512];
+    snprintf(args, sizeof(args),
+             "{\"function_name\":\"Multiply\",\"project\":\"%s\","
+             "\"direction\":\"outbound\",\"edge_types\":[]}",
+             g_project);
+
+    char *resp = call_tool("trace_call_path", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "Add") == NULL);
+    ASSERT_NOT_NULL(strstr(resp, "callees"));
+    free(resp);
+    PASS();
+}
+
+TEST(integ_search_graph_dead_code_with_exclude_entry_points) {
+    char args[512];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"label\":\"Function\",\"max_degree\":0,\"limit\":50}",
+             g_project);
+    char *resp_dead = call_tool("search_graph", args);
+    ASSERT_NOT_NULL(resp_dead);
+
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"label\":\"Function\",\"max_degree\":0,"
+             "\"exclude_entry_points\":true,\"limit\":50}",
+             g_project);
+    char *resp_combo = call_tool("search_graph", args);
+    ASSERT_NOT_NULL(resp_combo);
+
+    free(resp_dead);
+    free(resp_combo);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -534,7 +679,7 @@ SUITE(integration) {
     if (integration_setup() != 0) {
         printf("  %-50s", "integration_setup");
         printf("SKIP (setup failed)\n");
-        tf_skip_count += 16; /* skip all integration tests */
+        tf_skip_count += 24; /* skip all integration tests */
         integration_teardown();
         return;
     }
@@ -567,6 +712,16 @@ SUITE(integration) {
     RUN_TEST(integ_pipeline_fqn_module);
     RUN_TEST(integ_pipeline_project_name);
     RUN_TEST(integ_pipeline_cancel);
+
+    /* Param wiring tests */
+    RUN_TEST(integ_search_graph_relationship_filter);
+    RUN_TEST(integ_search_graph_exclude_entry_points);
+    RUN_TEST(integ_search_graph_include_connected);
+    RUN_TEST(integ_trace_call_path_custom_edge_types);
+    RUN_TEST(integ_trace_call_path_imports_edge_type);
+    RUN_TEST(integ_trace_call_path_nonexistent_with_edge_types);
+    RUN_TEST(integ_trace_call_path_empty_edge_types);
+    RUN_TEST(integ_search_graph_dead_code_with_exclude_entry_points);
 
     /* Destructive tests (run last!) */
     RUN_TEST(integ_mcp_delete_project);

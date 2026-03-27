@@ -1955,12 +1955,33 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     char count_sql[4096];
     int bind_idx = 0;
 
-    /* We build a query that selects nodes with optional degree subqueries */
-    const char *select_cols =
-        "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
-        "n.file_path, n.start_line, n.end_line, n.properties, "
-        "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.type = 'CALLS') AS in_deg, "
-        "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND e.type = 'CALLS') AS out_deg ";
+    /* When a relationship filter is active, compute degree using that edge type
+     * so that min_degree/max_degree/exclude_entry_points filter consistently.
+     * Edge type is validated to contain only safe chars (A-Z, a-z, 0-9, _)
+     * to prevent SQL injection since it's inlined in the SELECT clause. */
+    const char *deg_edge_type = "CALLS";
+    if (params->relationship) {
+        bool safe = true;
+        for (const char *p = params->relationship; *p; p++) {
+            if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+                  (*p >= '0' && *p <= '9') || *p == '_')) {
+                safe = false;
+                break;
+            }
+        }
+        if (safe && params->relationship[0] != '\0' && strlen(params->relationship) <= 64) {
+            deg_edge_type = params->relationship;
+        }
+    }
+    char select_cols[640];
+    snprintf(select_cols, sizeof(select_cols),
+             "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+             "n.file_path, n.start_line, n.end_line, n.properties, "
+             "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.type = '%s'"
+             " AND e.source_id != e.target_id) AS in_deg, "
+             "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND e.type = '%s'"
+             " AND e.source_id != e.target_id) AS out_deg ",
+             deg_edge_type, deg_edge_type);
 
     /* Start building WHERE */
     char where[2048] = "";
@@ -2019,6 +2040,17 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         BIND_TEXT(like_pattern);
     }
 
+    /* Relationship filter: only include nodes that have at least one edge of this type */
+    if (params->relationship) {
+        char rel_clause[256];
+        snprintf(rel_clause, sizeof(rel_clause),
+                 "EXISTS (SELECT 1 FROM edges e2 WHERE e2.type = ?%d"
+                 " AND (e2.source_id = n.id OR e2.target_id = n.id))",
+                 bind_idx + 1);
+        ADD_WHERE(rel_clause);
+        BIND_TEXT(params->relationship);
+    }
+
     /* Exclude labels: use parameterized placeholders to prevent SQL injection */
     if (params->exclude_labels) {
         char excl_clause[512] = "n.label NOT IN (";
@@ -2051,7 +2083,8 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     /* Degree filters: -1 = no filter, 0+ = active filter.
      * Wraps in subquery to filter on computed degree columns. */
     // NOLINTNEXTLINE(readability-implicit-bool-conversion)
-    bool has_degree_filter = (params->min_degree >= 0 || params->max_degree >= 0);
+    bool has_degree_filter =
+        (params->min_degree >= 0 || params->max_degree >= 0 || params->exclude_entry_points);
     if (has_degree_filter) {
         char inner_sql[4096];
         snprintf(inner_sql, sizeof(inner_sql), "%s", sql);
@@ -2063,9 +2096,17 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         } else if (params->min_degree >= 0) {
             snprintf(sql, sizeof(sql), "SELECT * FROM (%s) WHERE (in_deg + out_deg) >= %d",
                      inner_sql, params->min_degree);
-        } else {
+        } else if (params->max_degree >= 0) {
             snprintf(sql, sizeof(sql), "SELECT * FROM (%s) WHERE (in_deg + out_deg) <= %d",
                      inner_sql, params->max_degree);
+        } else {
+            /* Only exclude_entry_points is active */
+            snprintf(sql, sizeof(sql), "SELECT * FROM (%s) WHERE 1=1", inner_sql);
+        }
+
+        /* Exclude entry points: functions that call things but aren't called themselves */
+        if (params->exclude_entry_points) {
+            strncat(sql, " AND NOT (in_deg = 0 AND out_deg > 0)", sizeof(sql) - strlen(sql) - 1);
         }
     }
 
@@ -2128,6 +2169,54 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
 
     sqlite3_finalize(main_stmt);
     free(like_pattern);
+
+    /* Populate connected_names if requested.
+     * Capped to first 50 results to prevent N+1 blowup on large result sets. */
+    if (params->include_connected && n > 0) {
+        int conn_limit = n < 50 ? n : 50;
+        const char *edge_type = params->relationship ? params->relationship : "CALLS";
+
+        char conn_sql[512];
+        snprintf(conn_sql, sizeof(conn_sql),
+                 "SELECT DISTINCT name FROM ("
+                 "  SELECT tn.name FROM edges e JOIN nodes tn ON tn.id = e.target_id"
+                 "  WHERE e.source_id = ?1 AND e.type = ?2 AND tn.id != ?1"
+                 "  UNION"
+                 "  SELECT sn.name FROM edges e JOIN nodes sn ON sn.id = e.source_id"
+                 "  WHERE e.target_id = ?1 AND e.type = ?2 AND sn.id != ?1"
+                 ") ORDER BY name LIMIT 10");
+
+        sqlite3_stmt *conn_stmt = NULL;
+        int conn_rc = sqlite3_prepare_v2(s->db, conn_sql, -1, &conn_stmt, NULL);
+        if (conn_rc == SQLITE_OK) {
+            for (int i = 0; i < conn_limit; i++) {
+                sqlite3_reset(conn_stmt);
+                sqlite3_bind_int64(conn_stmt, 1, results[i].node.id);
+                bind_text(conn_stmt, 2, edge_type);
+                int ccap = 4;
+                int cn = 0;
+                const char **names = NULL;
+                while (sqlite3_step(conn_stmt) == SQLITE_ROW) {
+                    if (!names) {
+                        names = malloc((size_t)ccap * sizeof(const char *));
+                    }
+                    if (cn >= ccap) {
+                        ccap *= 2;
+                        names = safe_realloc(names, (size_t)ccap * sizeof(const char *));
+                    }
+                    const char *cname = (const char *)sqlite3_column_text(conn_stmt, 0);
+                    names[cn++] = cname ? heap_strdup(cname) : heap_strdup("");
+                }
+                if (cn > 0) {
+                    results[i].connected_names = names;
+                    results[i].connected_count = cn;
+                } else {
+                    free(names);
+                }
+            }
+            sqlite3_finalize(conn_stmt);
+        }
+    }
 
     out->results = results;
     out->count = n;
