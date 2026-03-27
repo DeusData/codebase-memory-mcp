@@ -212,7 +212,47 @@ static int create_user_indexes(cbm_store_t *s) {
         "CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(project, type);"
         "CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(project, target_id, type);"
         "CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(project, source_id, type);";
-    return exec_sql(s, sql);
+    int rc = exec_sql(s, sql);
+    if (rc != SQLITE_OK) return rc;
+
+    /* FTS5 full-text search index on node names for BM25 ranking.
+     * content='nodes' makes it an external-content table — synced via triggers.
+     * Each DDL statement must be executed separately for FTS5 compatibility. */
+    {
+        char *fts_err = NULL;
+        int fts_rc = sqlite3_exec(s->db,
+            "CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5("
+            "name, qualified_name, label, file_path,"
+            "content='nodes', content_rowid='id',"
+            "tokenize='unicode61 remove_diacritics 2'"
+            ");",
+            NULL, NULL, &fts_err);
+        if (fts_rc != SQLITE_OK) {
+            sqlite3_free(fts_err);
+            /* Non-fatal — FTS5 may not be compiled in. Fall back to regex search. */
+            return SQLITE_OK;
+        }
+    }
+
+    /* Sync triggers: keep FTS index up to date when nodes change */
+    exec_sql(s, "CREATE TRIGGER IF NOT EXISTS nodes_fts_ai AFTER INSERT ON nodes BEGIN"
+                "  INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path)"
+                "  VALUES (new.id, new.name, new.qualified_name, new.label, new.file_path);"
+                "END;");
+
+    exec_sql(s, "CREATE TRIGGER IF NOT EXISTS nodes_fts_ad AFTER DELETE ON nodes BEGIN"
+                "  INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, label, file_path)"
+                "  VALUES ('delete', old.id, old.name, old.qualified_name, old.label, old.file_path);"
+                "END;");
+
+    exec_sql(s, "CREATE TRIGGER IF NOT EXISTS nodes_fts_au AFTER UPDATE ON nodes BEGIN"
+                "  INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, label, file_path)"
+                "  VALUES ('delete', old.id, old.name, old.qualified_name, old.label, old.file_path);"
+                "  INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path)"
+                "  VALUES (new.id, new.name, new.qualified_name, new.label, new.file_path);"
+                "END;");
+
+    return SQLITE_OK;
 }
 
 static int configure_pragmas(cbm_store_t *s, bool in_memory) {
@@ -472,6 +512,10 @@ static void finalize_stmt(sqlite3_stmt **s) {
         sqlite3_finalize(*s);
         *s = NULL;
     }
+}
+
+int cbm_store_exec(cbm_store_t *s, const char *sql) {
+    return exec_sql(s, sql);
 }
 
 void cbm_store_close(cbm_store_t *s) {
@@ -1954,6 +1998,125 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     char sql[4096];
     char count_sql[4096];
     int bind_idx = 0;
+
+    /* ── FTS5 BM25 path: when params->query is set, use full-text search ── */
+    if (params->query && params->query[0]) {
+        /* Build FTS5 query: JOIN nodes_fts for BM25 ranking.
+         * Tokenize the user query into FTS5 OR terms for broader matching.
+         * "authentication middleware" → "authentication OR middleware" */
+        char fts_query[1024];
+        {
+            const char *q = params->query;
+            int fqlen = 0;
+            bool in_word = false;
+            bool first_word = true;
+            while (*q && fqlen < (int)sizeof(fts_query) - 20) {
+                if ((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') ||
+                    (*q >= '0' && *q <= '9') || *q == '_' || *q == '-') {
+                    if (!in_word && !first_word) {
+                        fqlen += snprintf(fts_query + fqlen, sizeof(fts_query) - fqlen, " OR ");
+                    }
+                    fts_query[fqlen++] = *q;
+                    in_word = true;
+                    first_word = false;
+                } else {
+                    if (in_word) {
+                        fts_query[fqlen++] = ' ';
+                    }
+                    in_word = false;
+                }
+                q++;
+            }
+            fts_query[fqlen] = '\0';
+        }
+
+        char fts_sql[4096];
+        /* Join with FTS5 table, filter by project/label, order by BM25 rank */
+        int flen = snprintf(fts_sql, sizeof(fts_sql),
+            "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+            "n.file_path, n.start_line, n.end_line, n.properties, "
+            "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.type = 'CALLS') AS in_deg, "
+            "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND e.type = 'CALLS') AS out_deg, "
+            "bm25(nodes_fts) AS rank "
+            "FROM nodes_fts "
+            "JOIN nodes n ON n.id = nodes_fts.rowid "
+            "WHERE nodes_fts MATCH ?1");
+
+        int fts_bind_idx = 1;
+        if (params->project) {
+            fts_bind_idx++;
+            flen += snprintf(fts_sql + flen, sizeof(fts_sql) - flen,
+                             " AND n.project = ?%d", fts_bind_idx);
+        }
+        if (params->label) {
+            fts_bind_idx++;
+            flen += snprintf(fts_sql + flen, sizeof(fts_sql) - flen,
+                             " AND n.label = ?%d", fts_bind_idx);
+        }
+
+        int limit = params->limit > 0 ? params->limit : 50;
+        flen += snprintf(fts_sql + flen, sizeof(fts_sql) - flen,
+                         " ORDER BY rank LIMIT %d OFFSET %d", limit, params->offset);
+
+        /* Count query */
+        char fts_count[4096];
+        snprintf(fts_count, sizeof(fts_count),
+                 "SELECT COUNT(*) FROM nodes_fts "
+                 "JOIN nodes n ON n.id = nodes_fts.rowid "
+                 "WHERE nodes_fts MATCH ?1%s%s",
+                 params->project ? " AND n.project = ?2" : "",
+                 params->label ? (params->project ? " AND n.label = ?3" : " AND n.label = ?2") : "");
+
+        /* Execute count */
+        sqlite3_stmt *cnt_stmt = NULL;
+        if (sqlite3_prepare_v2(s->db, fts_count, -1, &cnt_stmt, NULL) == SQLITE_OK) {
+            bind_text(cnt_stmt, 1, fts_query);
+            int bi = 1;
+            if (params->project) { bi++; bind_text(cnt_stmt, bi, params->project); }
+            if (params->label) { bi++; bind_text(cnt_stmt, bi, params->label); }
+            if (sqlite3_step(cnt_stmt) == SQLITE_ROW) {
+                out->total = sqlite3_column_int(cnt_stmt, 0);
+            }
+            sqlite3_finalize(cnt_stmt);
+        }
+
+        /* Execute main query */
+        sqlite3_stmt *main_stmt = NULL;
+        int rc = sqlite3_prepare_v2(s->db, fts_sql, -1, &main_stmt, NULL);
+        if (rc != SQLITE_OK) {
+            /* FTS5 table may not exist for older DBs — fall through to regex path */
+            /* FTS5 table may not exist for older DBs — silently fall through */
+            goto regex_path;
+        }
+        bind_text(main_stmt, 1, fts_query);
+        {
+            int bi = 1;
+            if (params->project) { bi++; bind_text(main_stmt, bi, params->project); }
+            if (params->label) { bi++; bind_text(main_stmt, bi, params->label); }
+        }
+
+        int cap = 16;
+        int n = 0;
+        cbm_search_result_t *results = malloc(cap * sizeof(cbm_search_result_t));
+        while (sqlite3_step(main_stmt) == SQLITE_ROW) {
+            if (n >= cap) {
+                cap *= 2;
+                results = safe_realloc(results, cap * sizeof(cbm_search_result_t));
+            }
+            memset(&results[n], 0, sizeof(cbm_search_result_t));
+            scan_node(main_stmt, &results[n].node);
+            results[n].in_degree = sqlite3_column_int(main_stmt, 9);
+            results[n].out_degree = sqlite3_column_int(main_stmt, 10);
+            n++;
+        }
+        sqlite3_finalize(main_stmt);
+        out->results = results;
+        out->count = n;
+        return CBM_STORE_OK;
+    }
+
+regex_path:
+    /* ── Regex path: original regex-based search ── */
 
     /* We build a query that selects nodes with optional degree subqueries */
     const char *select_cols =

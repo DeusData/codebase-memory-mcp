@@ -108,6 +108,7 @@ typedef struct {
     const char *name_pattern; /* regex on name, NULL = any */
     const char *qn_pattern;   /* regex on qualified_name, NULL = any */
     const char *file_pattern; /* glob on file_path, NULL = any */
+    const char *query;        /* free-text BM25 query via FTS5, NULL = disabled */
     const char *relationship; /* edge type filter, NULL = any */
     const char *direction;    /* "inbound" / "outbound" / "any", NULL = any */
     int min_degree;           /* -1 = no filter (default), 0+ = minimum */
@@ -208,6 +209,9 @@ cbm_store_t *cbm_store_open(const char *project);
 
 /* Close the store and free all resources. NULL-safe. */
 void cbm_store_close(cbm_store_t *s);
+
+/* Execute a raw SQL statement (for DDL, DML, etc.). */
+int cbm_store_exec(cbm_store_t *s, const char *sql);
 
 /* Get the underlying sqlite3 handle (for testing only). */
 struct sqlite3 *cbm_store_get_db(cbm_store_t *s);

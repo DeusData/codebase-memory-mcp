@@ -818,6 +818,16 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
             }
             cbm_store_close(hash_store);
             cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
+
+            /* Backfill FTS5 index: the direct B-tree dump bypasses SQLite triggers,
+             * so the FTS5 table is empty after indexing. Populate it in bulk now. */
+            cbm_store_t *fts_store = cbm_store_open_path(db_path);
+            if (fts_store) {
+                cbm_store_exec(fts_store,
+                    "INSERT OR REPLACE INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+                    "SELECT id, name, qualified_name, label, file_path FROM nodes;");
+                cbm_store_close(fts_store);
+            }
         }
     }
 

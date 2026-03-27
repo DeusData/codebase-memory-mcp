@@ -940,6 +940,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     char *label = cbm_mcp_get_string_arg(args, "label");
     char *name_pattern = cbm_mcp_get_string_arg(args, "name_pattern");
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
+    char *query = cbm_mcp_get_string_arg(args, "query");
+    char *sort_by = cbm_mcp_get_string_arg(args, "sort_by");
     int limit = cbm_mcp_get_int_arg(args, "limit", 500000);
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
     int min_degree = cbm_mcp_get_int_arg(args, "min_degree", -1);
@@ -950,6 +952,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         .label = label,
         .name_pattern = name_pattern,
         .file_pattern = file_pattern,
+        .query = query,
+        .sort_by = sort_by,
         .limit = limit,
         .offset = offset,
         .min_degree = min_degree,
@@ -990,6 +994,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     free(label);
     free(name_pattern);
     free(file_pattern);
+    free(query);
+    free(sort_by);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
