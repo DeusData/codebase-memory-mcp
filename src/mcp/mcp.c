@@ -1265,6 +1265,84 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("{\"error\":\"function not found\"}", true);
     }
 
+    /* Pick the best node for tracing. Strategy:
+     * 1. Prefer Function/Method nodes that are NOT constructors (same name as a
+     *    Class in the result set — constructors rarely have interesting CALLS).
+     * 2. If only Class/Interface nodes match, resolve through DEFINES_METHOD. */
+    int best_idx = 0;
+    bool has_class = false;
+    int class_idx = -1;
+    for (int i = 0; i < node_count; i++) {
+        const char *lbl = nodes[i].label;
+        if (lbl && (strcmp(lbl, "Class") == 0 || strcmp(lbl, "Interface") == 0)) {
+            has_class = true;
+            if (class_idx < 0) class_idx = i;
+        }
+    }
+    /* Look for a non-constructor Function/Method */
+    bool found_callable = false;
+    for (int i = 0; i < node_count; i++) {
+        const char *lbl = nodes[i].label;
+        if (lbl && (strcmp(lbl, "Function") == 0 || strcmp(lbl, "Method") == 0)) {
+            /* Skip if this is a constructor (same name as a Class in results) */
+            if (has_class) continue;
+            best_idx = i;
+            found_callable = true;
+            break;
+        }
+    }
+    /* If no non-constructor callable was found but we have a Class, use the Class */
+    if (!found_callable && class_idx >= 0) {
+        best_idx = class_idx;
+    }
+
+    /* Determine if the selected node is a Class or Interface. If so, we need to
+     * resolve through DEFINES_METHOD edges to find the actual callable methods,
+     * then run BFS from each method and merge results. */
+    bool is_class_like = false;
+    const char *best_label = nodes[best_idx].label;
+    if (best_label &&
+        (strcmp(best_label, "Class") == 0 || strcmp(best_label, "Interface") == 0)) {
+        is_class_like = true;
+    }
+
+    /* Collect BFS start IDs: either the single node, or all methods of the class */
+    int64_t *start_ids = NULL;
+    int start_id_count = 0;
+
+    if (is_class_like) {
+        /* Find all DEFINES_METHOD targets of this class */
+        cbm_edge_t *dm_edges = NULL;
+        int dm_count = 0;
+        cbm_store_find_edges_by_source_type(store, nodes[best_idx].id, "DEFINES_METHOD",
+                                            &dm_edges, &dm_count);
+        if (dm_count > 0) {
+            start_ids = malloc((size_t)dm_count * sizeof(int64_t));
+            for (int i = 0; i < dm_count; i++) {
+                start_ids[i] = dm_edges[i].target_id;
+            }
+            start_id_count = dm_count;
+        }
+        /* Free edge data */
+        for (int i = 0; i < dm_count; i++) {
+            free((void *)dm_edges[i].project);
+            free((void *)dm_edges[i].type);
+            free((void *)dm_edges[i].properties_json);
+        }
+        free(dm_edges);
+
+        /* If no methods found, fall back to the class node itself */
+        if (start_id_count == 0) {
+            start_ids = malloc(sizeof(int64_t));
+            start_ids[0] = nodes[best_idx].id;
+            start_id_count = 1;
+        }
+    } else {
+        start_ids = malloc(sizeof(int64_t));
+        start_ids[0] = nodes[best_idx].id;
+        start_id_count = 1;
+    }
+
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
@@ -1272,8 +1350,9 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_str(doc, root, "function", func_name);
     yyjson_mut_obj_add_str(doc, root, "direction", direction);
 
-    const char *edge_types[] = {"CALLS"};
-    int edge_type_count = 1;
+    /* Include HTTP_CALLS and ASYNC_CALLS alongside CALLS for broader coverage */
+    const char *edge_types[] = {"CALLS", "HTTP_CALLS", "ASYNC_CALLS"};
+    int edge_type_count = 3;
 
     /* Run BFS for each requested direction.
      * IMPORTANT: yyjson_mut_obj_add_str borrows pointers — we must keep
@@ -1283,41 +1362,59 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     // NOLINTNEXTLINE(readability-implicit-bool-conversion)
     bool do_inbound = strcmp(direction, "inbound") == 0 || strcmp(direction, "both") == 0;
 
-    cbm_traverse_result_t tr_out = {0};
-    cbm_traverse_result_t tr_in = {0};
+    /* For class resolution, we run BFS from each method and merge results.
+     * We keep all traversal results alive until after JSON serialization. */
+    cbm_traverse_result_t *all_tr_out = NULL;
+    cbm_traverse_result_t *all_tr_in = NULL;
+    int tr_out_count = 0;
+    int tr_in_count = 0;
 
     if (do_outbound) {
-        cbm_store_bfs(store, nodes[0].id, "outbound", edge_types, edge_type_count, depth, 100,
-                      &tr_out);
+        all_tr_out = calloc((size_t)start_id_count, sizeof(cbm_traverse_result_t));
+        tr_out_count = start_id_count;
 
         yyjson_mut_val *callees = yyjson_mut_arr(doc);
-        for (int i = 0; i < tr_out.visited_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "name",
-                                   tr_out.visited[i].node.name ? tr_out.visited[i].node.name : "");
-            yyjson_mut_obj_add_str(
-                doc, item, "qualified_name",
-                tr_out.visited[i].node.qualified_name ? tr_out.visited[i].node.qualified_name : "");
-            yyjson_mut_obj_add_int(doc, item, "hop", tr_out.visited[i].hop);
-            yyjson_mut_arr_add_val(callees, item);
+        for (int s = 0; s < start_id_count; s++) {
+            cbm_store_bfs(store, start_ids[s], "outbound", edge_types, edge_type_count, depth, 100,
+                          &all_tr_out[s]);
+            for (int i = 0; i < all_tr_out[s].visited_count; i++) {
+                yyjson_mut_val *item = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_str(
+                    doc, item, "name",
+                    all_tr_out[s].visited[i].node.name ? all_tr_out[s].visited[i].node.name : "");
+                yyjson_mut_obj_add_str(
+                    doc, item, "qualified_name",
+                    all_tr_out[s].visited[i].node.qualified_name
+                        ? all_tr_out[s].visited[i].node.qualified_name
+                        : "");
+                yyjson_mut_obj_add_int(doc, item, "hop", all_tr_out[s].visited[i].hop);
+                yyjson_mut_arr_add_val(callees, item);
+            }
         }
         yyjson_mut_obj_add_val(doc, root, "callees", callees);
     }
 
     if (do_inbound) {
-        cbm_store_bfs(store, nodes[0].id, "inbound", edge_types, edge_type_count, depth, 100,
-                      &tr_in);
+        all_tr_in = calloc((size_t)start_id_count, sizeof(cbm_traverse_result_t));
+        tr_in_count = start_id_count;
 
         yyjson_mut_val *callers = yyjson_mut_arr(doc);
-        for (int i = 0; i < tr_in.visited_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "name",
-                                   tr_in.visited[i].node.name ? tr_in.visited[i].node.name : "");
-            yyjson_mut_obj_add_str(
-                doc, item, "qualified_name",
-                tr_in.visited[i].node.qualified_name ? tr_in.visited[i].node.qualified_name : "");
-            yyjson_mut_obj_add_int(doc, item, "hop", tr_in.visited[i].hop);
-            yyjson_mut_arr_add_val(callers, item);
+        for (int s = 0; s < start_id_count; s++) {
+            cbm_store_bfs(store, start_ids[s], "inbound", edge_types, edge_type_count, depth, 100,
+                          &all_tr_in[s]);
+            for (int i = 0; i < all_tr_in[s].visited_count; i++) {
+                yyjson_mut_val *item = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_str(
+                    doc, item, "name",
+                    all_tr_in[s].visited[i].node.name ? all_tr_in[s].visited[i].node.name : "");
+                yyjson_mut_obj_add_str(
+                    doc, item, "qualified_name",
+                    all_tr_in[s].visited[i].node.qualified_name
+                        ? all_tr_in[s].visited[i].node.qualified_name
+                        : "");
+                yyjson_mut_obj_add_int(doc, item, "hop", all_tr_in[s].visited[i].hop);
+                yyjson_mut_arr_add_val(callers, item);
+            }
         }
         yyjson_mut_obj_add_val(doc, root, "callers", callers);
     }
@@ -1327,13 +1424,16 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_free(doc);
 
     /* Now safe to free traversal data */
-    if (do_outbound) {
-        cbm_store_traverse_free(&tr_out);
+    for (int s = 0; s < tr_out_count; s++) {
+        cbm_store_traverse_free(&all_tr_out[s]);
     }
-    if (do_inbound) {
-        cbm_store_traverse_free(&tr_in);
+    free(all_tr_out);
+    for (int s = 0; s < tr_in_count; s++) {
+        cbm_store_traverse_free(&all_tr_in[s]);
     }
+    free(all_tr_in);
 
+    free(start_ids);
     cbm_store_free_nodes(nodes, node_count);
     free(func_name);
     free(project);
