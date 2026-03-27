@@ -818,6 +818,38 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
             }
             cbm_store_close(hash_store);
             cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
+
+            /* Backfill FTS5 index: the direct B-tree dump bypasses SQLite triggers,
+             * so the FTS5 table is empty after indexing. Populate it in bulk now. */
+            cbm_store_t *fts_store = cbm_store_open_path(db_path);
+            if (fts_store) {
+                cbm_store_exec(fts_store,
+                    "INSERT OR REPLACE INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+                    "SELECT id, name, qualified_name, label, file_path FROM nodes;");
+                cbm_store_close(fts_store);
+            }
+
+            /* ── Process detection: discover execution flows from entry points ── */
+            {
+                cbm_store_t *proc_store = cbm_store_open_path(db_path);
+                if (proc_store) {
+                    int nprocs = cbm_store_detect_processes(proc_store, p->project_name, 300);
+                    cbm_log_info("pass.done", "pass", "processes",
+                                 "detected", itoa_buf(nprocs));
+                    cbm_store_close(proc_store);
+                }
+            }
+
+            /* ── Channel detection: scan source for emit/on patterns ── */
+            {
+                cbm_store_t *ch_store = cbm_store_open_path(db_path);
+                if (ch_store) {
+                    int nch = cbm_store_detect_channels(ch_store, p->project_name, p->repo_path);
+                    cbm_log_info("pass.done", "pass", "channels",
+                                 "detected", itoa_buf(nch));
+                    cbm_store_close(ch_store);
+                }
+            }
         }
     }
 

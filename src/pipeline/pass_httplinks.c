@@ -277,6 +277,9 @@ static int discover_node_routes(const cbm_gbuf_node_t *n, const cbm_pipeline_ctx
                 nr = cbm_extract_express_routes(n->name, n->qualified_name, source, out + total,
                                                 max_out - total);
                 total += nr;
+                nr = cbm_extract_hapi_routes(n->name, n->qualified_name, source, out + total,
+                                             max_out - total);
+                total += nr;
             }
             if (has_suffix(fp, ".php")) {
                 nr = cbm_extract_laravel_routes(n->name, n->qualified_name, source, out + total,
@@ -323,6 +326,8 @@ static int discover_module_routes(const cbm_gbuf_node_t *mod, const cbm_pipeline
     if (is_js) {
         total += cbm_extract_express_routes(mod->name, mod->qualified_name, source, out + total,
                                             max_out - total);
+        total += cbm_extract_hapi_routes(mod->name, mod->qualified_name, source, out + total,
+                                         max_out - total);
     }
     free(source);
     return total;
@@ -880,6 +885,64 @@ static int insert_route_nodes(cbm_pipeline_ctx_t *ctx, cbm_route_handler_t *rout
     int count = 0;
     for (int i = 0; i < route_count; i++) {
         cbm_route_handler_t *rh = &routes[i];
+
+        /* Reject obviously invalid route paths.
+         * Vendored/minified JS files (e.g. tsc.js, typescript.js) inside non-JS
+         * repos can produce false positives where JS operators/keywords get
+         * matched as route paths by the Express extractor. */
+        {
+            const char *p = rh->path;
+            /* Skip empty paths */
+            if (!p || !*p) continue;
+
+            /* Reject paths that are JS operators or keywords — not valid URL routes */
+            static const char *const invalid_paths[] = {
+                "!", "+", "++", "-", "--", ":", "~", "void", "null", "true",
+                "false", "throw", "this", "typeof", "delete", "new", "return",
+                "undefined", "NaN", "Infinity", "var", "let", "const",
+                "function", "class", "if", "else", "for", "while", "do",
+                "switch", "case", "break", "continue", "try", "catch",
+                "finally", "with", "in", "of", "yield", "await", "async",
+                "super", "import", "export", "default", "extends", "static",
+                "_this", "self", "__proto__", "arguments", "range",
+                NULL
+            };
+            bool rejected = false;
+            /* Work with a trimmed copy for comparison */
+            char trimmed[256];
+            /* Trim leading whitespace */
+            while (*p == ' ' || *p == '\t') p++;
+            strncpy(trimmed, p, sizeof(trimmed) - 1);
+            trimmed[sizeof(trimmed) - 1] = '\0';
+            /* Trim trailing whitespace */
+            size_t tlen = strlen(trimmed);
+            while (tlen > 0 && (trimmed[tlen - 1] == ' ' || trimmed[tlen - 1] == '\t' ||
+                                trimmed[tlen - 1] == '\n' || trimmed[tlen - 1] == '\r')) {
+                trimmed[--tlen] = '\0';
+            }
+            for (int k = 0; invalid_paths[k]; k++) {
+                if (strcmp(trimmed, invalid_paths[k]) == 0) {
+                    rejected = true;
+                    break;
+                }
+            }
+            if (rejected) continue;
+
+            /* Reject single-character non-slash paths (e.g. "*", "?", "#") */
+            if (p[0] && !p[1] && p[0] != '/') continue;
+
+            /* Reject paths that contain no alphanumeric or slash characters.
+             * Valid routes like "/api/v1" always have at least one alnum. */
+            bool has_alnum_or_slash = false;
+            for (const char *c = p; *c; c++) {
+                if ((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+                    (*c >= '0' && *c <= '9') || *c == '/') {
+                    has_alnum_or_slash = true;
+                    break;
+                }
+            }
+            if (!has_alnum_or_slash) continue;
+        }
 
         /* Build Route QN and name */
         char normal_method[16];

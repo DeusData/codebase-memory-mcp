@@ -565,10 +565,58 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
             }
         }
     }
-    // C/C++ specific: handle base_class_clause (contains access specifiers + type names)
+    // C# specific: handle base_list node (contains base types separated by commas)
     {
         uint32_t count = ts_node_child_count(node);
         for (uint32_t i = 0; i < count; i++) {
+            TSNode child = ts_node_child(node, i);
+            if (strcmp(ts_node_type(child), "base_list") == 0) {
+                const char *bases[16];
+                int base_count = 0;
+                uint32_t bnc = ts_node_named_child_count(child);
+                for (uint32_t bi = 0; bi < bnc && base_count < MAX_BASES_MINUS_1; bi++) {
+                    TSNode bc = ts_node_named_child(child, bi);
+                    const char *bk = ts_node_type(bc);
+                    // C# base types can be: identifier, generic_name, qualified_name,
+                    // or wrapped in a simple_base_type / primary_constructor_base_type
+                    char *text = NULL;
+                    if (strcmp(bk, "identifier") == 0 || strcmp(bk, "generic_name") == 0 ||
+                        strcmp(bk, "qualified_name") == 0) {
+                        text = cbm_node_text(a, bc, source);
+                    } else {
+                        // For wrapper nodes (simple_base_type etc.), extract the first
+                        // named child which should be the type identifier
+                        TSNode inner = ts_node_named_child(bc, 0);
+                        if (!ts_node_is_null(inner)) {
+                            text = cbm_node_text(a, inner, source);
+                        }
+                    }
+                    if (text && text[0]) {
+                        // Strip generic args for resolution: "List<int>" → "List"
+                        char *angle = strchr(text, '<');
+                        if (angle) *angle = '\0';
+                        bases[base_count++] = text;
+                    }
+                }
+                if (base_count > 0) {
+                    const char **result =
+                        (const char **)cbm_arena_alloc(a, (base_count + 1) * sizeof(const char *));
+                    if (result) {
+                        for (int j = 0; j < base_count; j++) {
+                            result[j] = bases[j];
+                        }
+                        result[base_count] = NULL;
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+
+    // C/C++ specific: handle base_class_clause (contains access specifiers + type names)
+    {
+        uint32_t count2 = ts_node_child_count(node);
+        for (uint32_t i = 0; i < count2; i++) {
             TSNode child = ts_node_child(node, i);
             if (strcmp(ts_node_type(child), "base_class_clause") == 0) {
                 // Extract type identifiers from base_class_clause, skipping access specifiers

@@ -344,4 +344,101 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
             }
         }
     }
+
+    // C# delegate/event patterns
+    if (ctx->language == CBM_LANG_CSHARP) {
+        // Fix 1: event += MethodName (bare method reference subscription)
+        // Creates a CALLS edge from the subscribing method to the handler method.
+        // e.g. _socket.OnConnected += SocketOnConnected;
+        if (strcmp(kind, "assignment_expression") == 0) {
+            TSNode op = ts_node_child_by_field_name(node, "operator", 8);
+            if (!ts_node_is_null(op)) {
+                char *op_text = cbm_node_text(ctx->arena, op, ctx->source);
+                if (op_text && strcmp(op_text, "+=") == 0) {
+                    TSNode right = ts_node_child_by_field_name(node, "right", 5);
+                    if (!ts_node_is_null(right)) {
+                        const char *rk = ts_node_type(right);
+                        if (strcmp(rk, "identifier") == 0 ||
+                            strcmp(rk, "member_access_expression") == 0) {
+                            char *callee = cbm_node_text(ctx->arena, right, ctx->source);
+                            if (callee && callee[0] && !cbm_is_keyword(callee, ctx->language)) {
+                                CBMCall call;
+                                call.callee_name = callee;
+                                call.enclosing_func_qn = state->enclosing_func_qn;
+                                cbm_calls_push(&ctx->result->calls, ctx->arena, call);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fix 2: delegate?.Invoke() → resolve to receiver (delegate) name.
+        // C# delegates are invoked via .Invoke() or ?.Invoke() — the callee name
+        // "Invoke" resolves to nothing. Instead, extract the receiver (delegate property)
+        // name, which is more likely to match a registered symbol.
+        // e.g. OnConnected?.Invoke(this, e) → creates CALLS edge to "OnConnected"
+        //
+        // C# tree-sitter AST for "OnConnected?.Invoke(this, e)":
+        //   invocation_expression
+        //     function: conditional_access_expression
+        //       expression: identifier "OnConnected"    ← receiver
+        //       member_binding_expression
+        //         name: identifier "Invoke"              ← method
+        //     arguments: argument_list
+        if (cbm_kind_in_set(node, spec->call_node_types)) {
+            TSNode func_node2 = ts_node_child_by_field_name(node, "function", 8);
+            if (!ts_node_is_null(func_node2)) {
+                const char *fk2 = ts_node_type(func_node2);
+                bool is_invoke = false;
+                TSNode receiver2 = {0}; // NOLINT
+
+                if (strcmp(fk2, "conditional_access_expression") == 0) {
+                    // ?. access: look for member_binding_expression child
+                    uint32_t ncc = ts_node_named_child_count(func_node2);
+                    for (uint32_t ci = 0; ci < ncc; ci++) {
+                        TSNode child = ts_node_named_child(func_node2, ci);
+                        const char *ck = ts_node_type(child);
+                        if (strcmp(ck, "member_binding_expression") == 0) {
+                            TSNode name_n = ts_node_child_by_field_name(child, "name", 4);
+                            if (!ts_node_is_null(name_n)) {
+                                char *nm = cbm_node_text(ctx->arena, name_n, ctx->source);
+                                if (nm && strcmp(nm, "Invoke") == 0) {
+                                    is_invoke = true;
+                                }
+                            }
+                        }
+                        if (strcmp(ck, "identifier") == 0 ||
+                            strcmp(ck, "member_access_expression") == 0) {
+                            receiver2 = child;
+                        }
+                    }
+                } else if (strcmp(fk2, "member_access_expression") == 0) {
+                    // Dot access: obj.Invoke(...)
+                    TSNode name_n = ts_node_child_by_field_name(func_node2, "name", 4);
+                    if (!ts_node_is_null(name_n)) {
+                        char *nm = cbm_node_text(ctx->arena, name_n, ctx->source);
+                        if (nm && strcmp(nm, "Invoke") == 0) {
+                            is_invoke = true;
+                            TSNode expr = ts_node_child_by_field_name(func_node2,
+                                                                      "expression", 10);
+                            if (!ts_node_is_null(expr)) {
+                                receiver2 = expr;
+                            }
+                        }
+                    }
+                }
+
+                if (is_invoke && !ts_node_is_null(receiver2)) {
+                    char *recv = cbm_node_text(ctx->arena, receiver2, ctx->source);
+                    if (recv && recv[0] && !cbm_is_keyword(recv, ctx->language)) {
+                        CBMCall call;
+                        call.callee_name = recv;
+                        call.enclosing_func_qn = state->enclosing_func_qn;
+                        cbm_calls_push(&ctx->result->calls, ctx->arena, call);
+                    }
+                }
+            }
+        }
+    }
 }

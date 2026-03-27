@@ -362,7 +362,6 @@ static int count_segments(const char *path) {
     return count;
 }
 
-/* Jaccard similarity of path segments (intersection/union) */
 static double segment_jaccard(const char *norm_call, const char *norm_route) {
     /* Split into segments */
     char a[1024];
@@ -1379,6 +1378,193 @@ int cbm_extract_express_routes(const char *name, const char *qn, const char *sou
     return count;
 }
 
+/* ── Route extraction: Hapi.js ─────────────────────────────────── */
+
+/* Extract a quoted string value after a colon, e.g. method: 'GET' → "GET".
+ * Returns the number of chars consumed from `src` (0 on failure). */
+static int hapi_extract_string_value(const char *src, char *out, int outsz) {
+    const char *p = src;
+    /* Skip whitespace after colon */
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    char quote = *p;
+    if (quote != '\'' && quote != '"' && quote != '`') return 0;
+    p++;
+    const char *start = p;
+    while (*p && *p != quote) p++;
+    if (*p != quote) return 0;
+    int len = (int)(p - start);
+    if (len >= outsz) len = outsz - 1;
+    memcpy(out, start, (size_t)len);
+    out[len] = '\0';
+    return (int)(p + 1 - src);
+}
+
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+int cbm_extract_hapi_routes(const char *name, const char *qn, const char *source,
+                            cbm_route_handler_t *out, int max_out) {
+    if (!source || !*source) {
+        return 0;
+    }
+
+    int count = 0;
+    const char *p = source;
+
+    /* Scan for object literals containing method: and path: properties.
+     * Hapi pattern:
+     *   { method: 'GET', path: '/api/users', handler: ... }
+     * or:
+     *   { method: 'POST', path: '/api/users', handler: UsersController.create }
+     *
+     * We look for "method:" followed by a string value, then scan nearby for
+     * "path:" followed by a string value (or vice versa). */
+    while (*p && count < max_out) {
+        /* Find next "method:" or "method :" */
+        const char *mkey = strstr(p, "method");
+        if (!mkey) break;
+
+        /* Verify it looks like a property key (preceded by space/newline/comma/brace) */
+        if (mkey > source) {
+            char before = *(mkey - 1);
+            if (before != ' ' && before != '\t' && before != '\n' && before != '\r' &&
+                before != ',' && before != '{') {
+                p = mkey + 6;
+                continue;
+            }
+        }
+
+        const char *after_method = mkey + 6;
+        /* Skip optional whitespace and colon */
+        while (*after_method == ' ' || *after_method == '\t') after_method++;
+        if (*after_method != ':') {
+            p = after_method;
+            continue;
+        }
+        after_method++; /* skip ':' */
+
+        char method_val[16] = {0};
+        int consumed = hapi_extract_string_value(after_method, method_val, sizeof(method_val));
+        if (consumed == 0) {
+            p = after_method;
+            continue;
+        }
+
+        /* Uppercase the method */
+        for (int j = 0; method_val[j]; j++) {
+            method_val[j] = (char)toupper((unsigned char)method_val[j]);
+        }
+
+        /* Validate it's a real HTTP method */
+        if (strcmp(method_val, "GET") != 0 && strcmp(method_val, "POST") != 0 &&
+            strcmp(method_val, "PUT") != 0 && strcmp(method_val, "DELETE") != 0 &&
+            strcmp(method_val, "PATCH") != 0 && strcmp(method_val, "OPTIONS") != 0 &&
+            strcmp(method_val, "HEAD") != 0 && strcmp(method_val, "*") != 0) {
+            p = after_method + consumed;
+            continue;
+        }
+
+        /* Search for "path:" within the same object literal — look forward from the
+         * method: position. Both method: and path: are in the same {...} block,
+         * typically within 300 chars of each other. Also search a small window
+         * backward in case path: comes before method: in the object. */
+        const char *search_start = (mkey - 300 > source) ? mkey - 300 : source;
+        const char *search_end_limit = mkey + 500;
+        char path_val[256] = {0};
+        bool found_path = false;
+
+        /* Find the enclosing '{' to scope the search to this object literal */
+        const char *obj_start = mkey;
+        int brace_depth = 0;
+        while (obj_start > source) {
+            obj_start--;
+            if (*obj_start == '{') {
+                if (brace_depth == 0) break;
+                brace_depth--;
+            } else if (*obj_start == '}') {
+                brace_depth++;
+            }
+        }
+        if (*obj_start == '{') {
+            search_start = obj_start;
+        }
+
+        const char *pkey = search_start;
+        while ((pkey = strstr(pkey, "path")) != NULL && pkey < search_end_limit) {
+            /* Verify it looks like a property key */
+            if (pkey > source) {
+                char pb = *(pkey - 1);
+                if (pb != ' ' && pb != '\t' && pb != '\n' && pb != '\r' &&
+                    pb != ',' && pb != '{') {
+                    pkey += 4;
+                    continue;
+                }
+            }
+            const char *after_path = pkey + 4;
+            while (*after_path == ' ' || *after_path == '\t') after_path++;
+            if (*after_path != ':') {
+                pkey += 4;
+                continue;
+            }
+            after_path++;
+            int pc = hapi_extract_string_value(after_path, path_val, sizeof(path_val));
+            if (pc > 0 && path_val[0] == '/') {
+                found_path = true;
+                break;
+            }
+            pkey += 4;
+        }
+
+        if (found_path) {
+            /* Optionally extract handler reference — scope to same object */
+            char handler_val[256] = {0};
+            const char *hkey = strstr(obj_start, "handler");
+            while (hkey && hkey < search_end_limit) {
+                /* Verify property key */
+                if (hkey > source) {
+                    char hb = *(hkey - 1);
+                    if (hb != ' ' && hb != '\t' && hb != '\n' && hb != '\r' &&
+                        hb != ',' && hb != '{') {
+                        hkey = strstr(hkey + 7, "handler");
+                        continue;
+                    }
+                }
+                const char *after_handler = hkey + 7;
+                while (*after_handler == ' ' || *after_handler == '\t') after_handler++;
+                if (*after_handler == ':') {
+                    after_handler++;
+                    while (*after_handler == ' ' || *after_handler == '\t') after_handler++;
+                    /* Handler can be identifier.identifier or just identifier */
+                    const char *hs = after_handler;
+                    while (*after_handler && *after_handler != ',' && *after_handler != '\n' &&
+                           *after_handler != '}' && *after_handler != ' ') {
+                        after_handler++;
+                    }
+                    int hlen = (int)(after_handler - hs);
+                    if (hlen > 0 && hlen < (int)sizeof(handler_val)) {
+                        memcpy(handler_val, hs, (size_t)hlen);
+                        handler_val[hlen] = '\0';
+                    }
+                }
+                break;
+            }
+
+            cbm_route_handler_t *r = &out[count];
+            memset(r, 0, sizeof(*r));
+            strncpy(r->method, method_val, sizeof(r->method) - 1);
+            strncpy(r->path, path_val, sizeof(r->path) - 1);
+            strncpy(r->function_name, name ? name : "", sizeof(r->function_name) - 1);
+            strncpy(r->qualified_name, qn ? qn : "", sizeof(r->qualified_name) - 1);
+            if (handler_val[0]) {
+                strncpy(r->handler_ref, handler_val, sizeof(r->handler_ref) - 1);
+            }
+            count++;
+        }
+
+        p = after_method + consumed;
+    }
+
+    return count;
+}
+
 /* ── Route extraction: Laravel ─────────────────────────────────── */
 
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
@@ -1716,6 +1902,211 @@ int cbm_httplink_all_exclude_paths(const cbm_httplink_config_t *cfg, const char 
         for (int i = 0; i < cfg->exclude_path_count && count < max_out; i++) {
             out[count++] = cfg->exclude_paths[i];
         }
+    }
+
+    return count;
+}
+
+/* ── Channel extraction: Socket.IO / EventEmitter ────────────────── */
+
+typedef struct cbm_channel_match {
+    char channel[256];
+    char direction[8]; /* "emit" or "listen" */
+    char transport[32]; /* "socketio", "eventemitter" */
+} cbm_channel_match_t;
+
+int cbm_extract_channels(const char *source, cbm_channel_match_t *out, int max_out) {
+    if (!source || !*source) return 0;
+
+    cbm_regex_t re;
+    if (cbm_regcomp(&re,
+            "([a-zA-Z_][a-zA-Z0-9_]*)\\.("
+            "emit|on|once|addListener|removeListener"
+            ")\\([[:space:]]*['\"`]([^'\"`]{1,128})['\"`]",
+            CBM_REG_EXTENDED) != 0) {
+        return 0;
+    }
+
+    static const char *channel_receivers[] = {
+        "socket", "io", "client", "server", "connection",
+        "emitter", "eventEmitter", "eventBus", "bus", "pubsub",
+        "producer", "consumer", "channel", "broker",
+        "nsp", "namespace", "this", NULL
+    };
+
+    int count = 0;
+    const char *p = source;
+    cbm_regmatch_t match[4];
+
+    while (count < max_out && cbm_regexec(&re, p, 4, match, 0) == 0) {
+        int rlen = match[1].rm_eo - match[1].rm_so;
+        char receiver[64];
+        if (rlen >= (int)sizeof(receiver)) rlen = (int)sizeof(receiver) - 1;
+        memcpy(receiver, p + match[1].rm_so, (size_t)rlen);
+        receiver[rlen] = '\0';
+
+        bool is_channel = false;
+        for (int i = 0; channel_receivers[i]; i++) {
+            if (strcasecmp(receiver, channel_receivers[i]) == 0) {
+                is_channel = true;
+                break;
+            }
+        }
+
+        if (is_channel) {
+            int mlen = match[2].rm_eo - match[2].rm_so;
+            char method[32];
+            if (mlen >= (int)sizeof(method)) mlen = (int)sizeof(method) - 1;
+            memcpy(method, p + match[2].rm_so, (size_t)mlen);
+            method[mlen] = '\0';
+
+            int clen = match[3].rm_eo - match[3].rm_so;
+            if (clen >= (int)sizeof(out[count].channel))
+                clen = (int)sizeof(out[count].channel) - 1;
+            memcpy(out[count].channel, p + match[3].rm_so, (size_t)clen);
+            out[count].channel[clen] = '\0';
+
+            const char *ch = out[count].channel;
+            if (strcmp(ch, "error") != 0 && strcmp(ch, "close") != 0 &&
+                strcmp(ch, "end") != 0 && strcmp(ch, "data") != 0 &&
+                strcmp(ch, "connect") != 0 && strcmp(ch, "disconnect") != 0 &&
+                strcmp(ch, "connection") != 0 && strcmp(ch, "message") != 0 &&
+                strcmp(ch, "open") != 0 && strcmp(ch, "drain") != 0 &&
+                strcmp(ch, "finish") != 0 && strcmp(ch, "pipe") != 0 &&
+                strcmp(ch, "unpipe") != 0 && strcmp(ch, "readable") != 0 &&
+                strcmp(ch, "resume") != 0 && strcmp(ch, "pause") != 0) {
+                if (strcmp(method, "emit") == 0) {
+                    strncpy(out[count].direction, "emit", sizeof(out[count].direction) - 1);
+                } else {
+                    strncpy(out[count].direction, "listen", sizeof(out[count].direction) - 1);
+                }
+                if (strcasecmp(receiver, "socket") == 0 || strcasecmp(receiver, "io") == 0 ||
+                    strcasecmp(receiver, "nsp") == 0 || strcasecmp(receiver, "namespace") == 0) {
+                    strncpy(out[count].transport, "socketio", sizeof(out[count].transport) - 1);
+                } else {
+                    strncpy(out[count].transport, "eventemitter", sizeof(out[count].transport) - 1);
+                }
+                count++;
+            }
+        }
+        p += match[0].rm_eo;
+    }
+
+    cbm_regfree(&re);
+    return count;
+}
+
+/* ── C# channel extraction: Socket.IO with constant resolution ─── */
+
+/* Extract channels from C# source that uses constant names for event strings.
+ * Pattern: _socket.Emit(CONSTANT_NAME, data) / _socket.OnRequest<T>(CONSTANT_NAME, ...)
+ * Resolves constants via: const string CONSTANT_NAME = "ActualChannelName"; */
+int cbm_extract_csharp_channels(const char *source, cbm_channel_match_t *out, int max_out) {
+    if (!source || !*source) return 0;
+
+    /* Pass 1: Collect const string mappings: name → value */
+    typedef struct { char name[128]; char value[256]; } const_map_t;
+    const_map_t cmap[128];
+    int cmap_count = 0;
+
+    cbm_regex_t re_const;
+    if (cbm_regcomp(&re_const,
+            "const[[:space:]]+string[[:space:]]+([A-Z_][A-Z_0-9]*)[[:space:]]*=[[:space:]]*\"([^\"]{1,128})\"",
+            CBM_REG_EXTENDED) == 0) {
+        const char *p = source;
+        cbm_regmatch_t cm[3];
+        while (cmap_count < 128 && cbm_regexec(&re_const, p, 3, cm, 0) == 0) {
+            int nlen = cm[1].rm_eo - cm[1].rm_so;
+            int vlen = cm[2].rm_eo - cm[2].rm_so;
+            if (nlen > 0 && nlen < 128 && vlen > 0 && vlen < 256) {
+                memcpy(cmap[cmap_count].name, p + cm[1].rm_so, (size_t)nlen);
+                cmap[cmap_count].name[nlen] = '\0';
+                memcpy(cmap[cmap_count].value, p + cm[2].rm_so, (size_t)vlen);
+                cmap[cmap_count].value[vlen] = '\0';
+                cmap_count++;
+            }
+            p += cm[0].rm_eo;
+        }
+        cbm_regfree(&re_const);
+    }
+
+    /* Pass 2: Find .Emit( and .OnRequest patterns */
+    int count = 0;
+
+    /* Pattern: .Emit(IDENTIFIER  or  .OnRequest<...>(IDENTIFIER */
+    cbm_regex_t re_emit;
+    if (cbm_regcomp(&re_emit,
+            "\\.(Emit|OnRequest)[^(]*\\([[:space:]]*([A-Z_][A-Z_0-9]*)",
+            CBM_REG_EXTENDED) == 0) {
+        const char *p = source;
+        cbm_regmatch_t em[3];
+        while (count < max_out && cbm_regexec(&re_emit, p, 3, em, 0) == 0) {
+            int mlen = em[1].rm_eo - em[1].rm_so;
+            char method[16];
+            if (mlen >= (int)sizeof(method)) mlen = (int)sizeof(method) - 1;
+            memcpy(method, p + em[1].rm_so, (size_t)mlen);
+            method[mlen] = '\0';
+
+            int ilen = em[2].rm_eo - em[2].rm_so;
+            char ident[128];
+            if (ilen >= (int)sizeof(ident)) ilen = (int)sizeof(ident) - 1;
+            memcpy(ident, p + em[2].rm_so, (size_t)ilen);
+            ident[ilen] = '\0';
+
+            /* Resolve constant to string value */
+            const char *resolved = NULL;
+            for (int i = 0; i < cmap_count; i++) {
+                if (strcmp(cmap[i].name, ident) == 0) {
+                    resolved = cmap[i].value;
+                    break;
+                }
+            }
+
+            if (resolved) {
+                strncpy(out[count].channel, resolved, sizeof(out[count].channel) - 1);
+                out[count].channel[sizeof(out[count].channel) - 1] = '\0';
+
+                if (strcmp(method, "Emit") == 0) {
+                    strncpy(out[count].direction, "emit", sizeof(out[count].direction) - 1);
+                } else {
+                    strncpy(out[count].direction, "listen", sizeof(out[count].direction) - 1);
+                }
+                strncpy(out[count].transport, "socketio", sizeof(out[count].transport) - 1);
+                count++;
+            }
+            p += em[0].rm_eo;
+        }
+        cbm_regfree(&re_emit);
+    }
+
+    /* Also match direct string literal patterns: .Emit("ChannelName" */
+    cbm_regex_t re_literal;
+    if (cbm_regcomp(&re_literal,
+            "\\.(Emit|On|OnRequest)[^(]*\\([[:space:]]*\"([^\"]{1,128})\"",
+            CBM_REG_EXTENDED) == 0) {
+        const char *p = source;
+        cbm_regmatch_t lm[3];
+        while (count < max_out && cbm_regexec(&re_literal, p, 3, lm, 0) == 0) {
+            int mlen = lm[1].rm_eo - lm[1].rm_so;
+            char method[16];
+            if (mlen >= (int)sizeof(method)) mlen = (int)sizeof(method) - 1;
+            memcpy(method, p + lm[1].rm_so, (size_t)mlen);
+            method[mlen] = '\0';
+
+            int clen = lm[2].rm_eo - lm[2].rm_so;
+            strncpy(out[count].channel, p + lm[2].rm_so, (size_t)(clen < 255 ? clen : 255));
+            out[count].channel[clen < 255 ? clen : 255] = '\0';
+
+            if (strcmp(method, "Emit") == 0) {
+                strncpy(out[count].direction, "emit", sizeof(out[count].direction) - 1);
+            } else {
+                strncpy(out[count].direction, "listen", sizeof(out[count].direction) - 1);
+            }
+            strncpy(out[count].transport, "socketio", sizeof(out[count].transport) - 1);
+            count++;
+            p += lm[0].rm_eo;
+        }
+        cbm_regfree(&re_literal);
     }
 
     return count;

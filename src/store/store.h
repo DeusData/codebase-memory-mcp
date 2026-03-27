@@ -108,6 +108,7 @@ typedef struct {
     const char *name_pattern; /* regex on name, NULL = any */
     const char *qn_pattern;   /* regex on qualified_name, NULL = any */
     const char *file_pattern; /* glob on file_path, NULL = any */
+    const char *query;        /* free-text BM25 query via FTS5, NULL = disabled */
     const char *relationship; /* edge type filter, NULL = any */
     const char *direction;    /* "inbound" / "outbound" / "any", NULL = any */
     int min_degree;           /* -1 = no filter (default), 0+ = minimum */
@@ -208,6 +209,9 @@ cbm_store_t *cbm_store_open(const char *project);
 
 /* Close the store and free all resources. NULL-safe. */
 void cbm_store_close(cbm_store_t *s);
+
+/* Execute a raw SQL statement (for DDL, DML, etc.). */
+int cbm_store_exec(cbm_store_t *s, const char *sql);
 
 /* Get the underlying sqlite3 handle (for testing only). */
 struct sqlite3 *cbm_store_get_db(cbm_store_t *s);
@@ -513,6 +517,57 @@ typedef struct {
 int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char **aspects,
                                int aspect_count, cbm_architecture_info_t *out);
 void cbm_store_architecture_free(cbm_architecture_info_t *out);
+
+/* ── Processes (execution flows) ─────────────────────────────────── */
+
+typedef struct {
+    int64_t id;
+    const char *label;        /* "EntryPoint → Terminal" */
+    const char *process_type; /* "cross_community" or "intra_community" */
+    int step_count;
+    int64_t entry_point_id;
+    int64_t terminal_id;
+} cbm_process_info_t;
+
+typedef struct {
+    int64_t node_id;
+    const char *name;
+    const char *qualified_name;
+    const char *file_path;
+    int step;
+} cbm_process_step_t;
+
+int cbm_store_list_processes(cbm_store_t *s, const char *project,
+                             cbm_process_info_t **out, int *count);
+int cbm_store_get_process_steps(cbm_store_t *s, int64_t process_id,
+                                cbm_process_step_t **out, int *count);
+void cbm_store_free_processes(cbm_process_info_t *arr, int count);
+void cbm_store_free_process_steps(cbm_process_step_t *arr, int count);
+
+/* Detect execution flows from entry points via BFS + Louvain community crossing. */
+int cbm_store_detect_processes(cbm_store_t *s, const char *project, int max_processes);
+
+/* ── Channels (cross-service message tracing) ────────────────────── */
+
+typedef struct {
+    const char *channel_name;
+    const char *direction;  /* "emit" or "listen" */
+    const char *transport;  /* "socketio", "eventemitter" */
+    const char *project;
+    const char *file_path;
+    const char *function_name;
+} cbm_channel_info_t;
+
+/* Detect channel emit/listen patterns in indexed source files.
+ * Reads source from disk for JS/TS/Python files and scans for
+ * socket.emit/on, emitter.emit/on patterns. */
+int cbm_store_detect_channels(cbm_store_t *s, const char *project, const char *repo_path);
+
+/* Query channels by name (partial match). If channel is NULL, returns all.
+ * If project is NULL, searches across all loaded projects. */
+int cbm_store_find_channels(cbm_store_t *s, const char *project, const char *channel,
+                            cbm_channel_info_t **out, int *count);
+void cbm_store_free_channels(cbm_channel_info_t *arr, int count);
 
 /* ── ADR (Architecture Decision Record) ────────────────────────── */
 

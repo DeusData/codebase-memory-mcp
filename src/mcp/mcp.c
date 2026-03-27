@@ -281,6 +281,39 @@ static const tool_def_t TOOLS[] = {
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"aspects\":{\"type\":"
      "\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]}"},
 
+    {"list_processes",
+     "List discovered execution flows (processes). Each process is a named path from an entry "
+     "point through the call graph to a terminal node that crosses a community boundary. "
+     "Processes are auto-detected during indexing using BFS from entry points + Louvain "
+     "community detection. Returns up to 300 processes ordered by step count.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":[\"project\"]}"},
+
+    {"get_process_steps",
+     "Get the ordered step list for a specific execution flow. Returns each function "
+     "in the flow with file_path, qualified_name, and step number. Use after list_processes "
+     "to drill into a specific flow for step-by-step debugging.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "\"process_id\":{\"type\":\"number\",\"description\":\"Process ID from list_processes\"}}"
+     ",\"required\":[\"project\",\"process_id\"]}"},
+
+    {"get_impact",
+     "Analyze blast radius of changing a symbol. Returns all upstream callers grouped by "
+     "depth (d=1 WILL BREAK, d=2 LIKELY AFFECTED), affected processes, risk assessment "
+     "(LOW/MEDIUM/HIGH/CRITICAL), and affected modules. Use before modifying shared code.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "\"target\":{\"type\":\"string\",\"description\":\"Function or class name to analyze\"},"
+     "\"direction\":{\"type\":\"string\",\"enum\":[\"upstream\",\"downstream\"],\"default\":\"upstream\"},"
+     "\"max_depth\":{\"type\":\"number\",\"default\":3}}"
+     ",\"required\":[\"project\",\"target\"]}"},
+
+    {"get_channels",
+     "Find message channels (Socket.IO events, EventEmitter signals) across projects. "
+     "Shows which functions emit and listen on each channel, enabling cross-service "
+     "message flow tracing. Auto-detects patterns during indexing. "
+     "Query by channel name (partial match) and/or project.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "\"channel\":{\"type\":\"string\",\"description\":\"Channel name filter (partial match)\"}}}"},
+
     {"search_code",
      "Graph-augmented code search. Finds text patterns via grep, then enriches results with "
      "the knowledge graph: deduplicates matches into containing functions, ranks by structural "
@@ -940,6 +973,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     char *label = cbm_mcp_get_string_arg(args, "label");
     char *name_pattern = cbm_mcp_get_string_arg(args, "name_pattern");
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
+    char *query = cbm_mcp_get_string_arg(args, "query");
+    char *sort_by = cbm_mcp_get_string_arg(args, "sort_by");
     int limit = cbm_mcp_get_int_arg(args, "limit", 500000);
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
     int min_degree = cbm_mcp_get_int_arg(args, "min_degree", -1);
@@ -950,6 +985,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         .label = label,
         .name_pattern = name_pattern,
         .file_pattern = file_pattern,
+        .query = query,
+        .sort_by = sort_by,
         .limit = limit,
         .offset = offset,
         .min_degree = min_degree,
@@ -990,6 +1027,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     free(label);
     free(name_pattern);
     free(file_pattern);
+    free(query);
+    free(sort_by);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
@@ -1152,6 +1191,263 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+static char *handle_get_process_steps(cbm_mcp_server_t *srv, const char *args) {
+    char *project = cbm_mcp_get_string_arg(args, "project");
+    int64_t process_id = (int64_t)cbm_mcp_get_int_arg(args, "process_id", 0);
+    cbm_store_t *store = resolve_store(srv, project);
+    REQUIRE_STORE(store, project);
+
+    cbm_process_step_t *steps = NULL;
+    int count = 0;
+    cbm_store_get_process_steps(store, process_id, &steps, &count);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_int(doc, root, "total_steps", count);
+
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < count; i++) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_int(doc, item, "step", steps[i].step);
+        yyjson_mut_obj_add_strcpy(doc, item, "name", steps[i].name ? steps[i].name : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "qualified_name",
+                                  steps[i].qualified_name ? steps[i].qualified_name : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "file_path",
+                                  steps[i].file_path ? steps[i].file_path : "");
+        yyjson_mut_arr_add_val(arr, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "steps", arr);
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    cbm_store_free_process_steps(steps, count);
+    free(project);
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
+static char *handle_get_impact(cbm_mcp_server_t *srv, const char *args) {
+    char *project = cbm_mcp_get_string_arg(args, "project");
+    char *target = cbm_mcp_get_string_arg(args, "target");
+    char *direction = cbm_mcp_get_string_arg(args, "direction");
+    int max_depth = cbm_mcp_get_int_arg(args, "max_depth", 3);
+    cbm_store_t *store = resolve_store(srv, project);
+    REQUIRE_STORE(store, project);
+
+    if (!direction) direction = heap_strdup("upstream");
+    bool is_upstream = strcmp(direction, "upstream") == 0;
+    const char *bfs_dir = is_upstream ? "inbound" : "outbound";
+
+    /* Find target node */
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    cbm_store_find_nodes_by_name(store, project, target, &nodes, &node_count);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    if (node_count == 0) {
+        yyjson_mut_obj_add_strcpy(doc, root, "error", "symbol not found");
+        char *json = yy_doc_to_str(doc);
+        yyjson_mut_doc_free(doc);
+        free(target); free(project); free(direction);
+        char *r = cbm_mcp_text_result(json, true);
+        free(json);
+        return r;
+    }
+
+    /* Pick best node (prefer Function/Method) */
+    int best = 0;
+    for (int i = 0; i < node_count; i++) {
+        if (nodes[i].label && (strcmp(nodes[i].label, "Function") == 0 ||
+                               strcmp(nodes[i].label, "Method") == 0)) {
+            best = i;
+            break;
+        }
+    }
+
+    yyjson_mut_obj_add_strcpy(doc, root, "target", target);
+    yyjson_mut_obj_add_strcpy(doc, root, "direction", direction);
+    yyjson_mut_obj_add_strcpy(doc, root, "file_path",
+                              nodes[best].file_path ? nodes[best].file_path : "");
+    yyjson_mut_obj_add_int(doc, root, "line", nodes[best].start_line);
+
+    /* BFS with full depth */
+    const char *call_types[] = {"CALLS", "HTTP_CALLS", "ASYNC_CALLS", "USAGE"};
+    cbm_traverse_result_t tr = {0};
+    cbm_store_bfs(store, nodes[best].id, bfs_dir, call_types, 4, max_depth, 200, &tr);
+
+    /* Group by depth */
+    yyjson_mut_val *d1_arr = yyjson_mut_arr(doc);
+    yyjson_mut_val *d2_arr = yyjson_mut_arr(doc);
+    yyjson_mut_val *d3_arr = yyjson_mut_arr(doc);
+    int depth_counts[10] = {0};
+    int total_affected = 0;
+
+    for (int i = 0; i < tr.visited_count; i++) {
+        int h = tr.visited[i].hop;
+        if (h >= 1 && h <= max_depth) {
+            if (h < 10) depth_counts[h]++;
+            total_affected++;
+
+            cbm_node_t *vn = &tr.visited[i].node;
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, item, "name", vn->name ? vn->name : "");
+            yyjson_mut_obj_add_str(doc, item, "file_path", vn->file_path ? vn->file_path : "");
+            yyjson_mut_obj_add_str(doc, item, "label", vn->label ? vn->label : "");
+            yyjson_mut_obj_add_int(doc, item, "line", vn->start_line);
+
+            if (h == 1) yyjson_mut_arr_add_val(d1_arr, item);
+            else if (h == 2) yyjson_mut_arr_add_val(d2_arr, item);
+            else yyjson_mut_arr_add_val(d3_arr, item);
+        }
+    }
+    yyjson_mut_val *by_depth = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_val(doc, by_depth, "d1_will_break", d1_arr);
+    yyjson_mut_obj_add_val(doc, by_depth, "d2_likely_affected", d2_arr);
+    yyjson_mut_obj_add_val(doc, by_depth, "d3_may_need_testing", d3_arr);
+    yyjson_mut_obj_add_val(doc, root, "by_depth", by_depth);
+
+    /* Risk assessment */
+    const char *risk;
+    if (depth_counts[1] >= 20) risk = "CRITICAL";
+    else if (depth_counts[1] >= 10) risk = "HIGH";
+    else if (depth_counts[1] >= 3) risk = "MEDIUM";
+    else risk = "LOW";
+
+    yyjson_mut_obj_add_str(doc, root, "risk", risk);
+    yyjson_mut_obj_add_int(doc, root, "total_affected", total_affected);
+    yyjson_mut_obj_add_int(doc, root, "direct_callers", depth_counts[1]);
+
+    /* Summary labels per depth */
+    yyjson_mut_val *summary = yyjson_mut_obj(doc);
+    char d1_label[64]; snprintf(d1_label, sizeof(d1_label), "%d WILL BREAK", depth_counts[1]);
+    char d2_label[64]; snprintf(d2_label, sizeof(d2_label), "%d LIKELY AFFECTED", depth_counts[2]);
+    char d3_label[64]; snprintf(d3_label, sizeof(d3_label), "%d MAY NEED TESTING", depth_counts[3]);
+    yyjson_mut_obj_add_strcpy(doc, summary, "d1", d1_label);
+    yyjson_mut_obj_add_strcpy(doc, summary, "d2", d2_label);
+    yyjson_mut_obj_add_strcpy(doc, summary, "d3", d3_label);
+    yyjson_mut_obj_add_val(doc, root, "summary", summary);
+
+    /* Affected processes */
+    {
+        cbm_process_info_t *procs = NULL;
+        int pcount = 0;
+        cbm_store_list_processes(store, project, &procs, &pcount);
+        yyjson_mut_val *paff = yyjson_mut_arr(doc);
+        int pc = 0;
+        for (int pi = 0; pi < pcount && pc < 20; pi++) {
+            if (procs[pi].label && target && strstr(procs[pi].label, target)) {
+                yyjson_mut_val *pitem = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, pitem, "label", procs[pi].label);
+                yyjson_mut_obj_add_int(doc, pitem, "step_count", procs[pi].step_count);
+                yyjson_mut_arr_add_val(paff, pitem);
+                pc++;
+            }
+        }
+        yyjson_mut_obj_add_val(doc, root, "affected_processes", paff);
+        cbm_store_free_processes(procs, pcount);
+    }
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    cbm_store_traverse_free(&tr);
+    cbm_store_free_nodes(nodes, node_count);
+    free(target); free(project); free(direction);
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
+static char *handle_get_channels(cbm_mcp_server_t *srv, const char *args) {
+    char *project = cbm_mcp_get_string_arg(args, "project");
+    char *channel = cbm_mcp_get_string_arg(args, "channel");
+    cbm_store_t *store = resolve_store(srv, project);
+    REQUIRE_STORE(store, project);
+
+    cbm_channel_info_t *channels = NULL;
+    int count = 0;
+    cbm_store_find_channels(store, project, channel, &channels, &count);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    yyjson_mut_obj_add_int(doc, root, "total", count);
+
+    /* Group by channel name for readable output */
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < count; i++) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, item, "channel",
+                                  channels[i].channel_name ? channels[i].channel_name : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "direction",
+                                  channels[i].direction ? channels[i].direction : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "transport",
+                                  channels[i].transport ? channels[i].transport : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "project",
+                                  channels[i].project ? channels[i].project : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "file",
+                                  channels[i].file_path ? channels[i].file_path : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "function",
+                                  channels[i].function_name ? channels[i].function_name : "");
+        yyjson_mut_arr_add_val(arr, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "channels", arr);
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    cbm_store_free_channels(channels, count);
+    free(project);
+    free(channel);
+
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
+static char *handle_list_processes(cbm_mcp_server_t *srv, const char *args) {
+    char *project = cbm_mcp_get_string_arg(args, "project");
+    cbm_store_t *store = resolve_store(srv, project);
+    REQUIRE_STORE(store, project);
+
+    cbm_process_info_t *procs = NULL;
+    int count = 0;
+    cbm_store_list_processes(store, project, &procs, &count);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    yyjson_mut_obj_add_int(doc, root, "total", count);
+
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < count; i++) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_int(doc, item, "id", procs[i].id);
+        yyjson_mut_obj_add_strcpy(doc, item, "label", procs[i].label ? procs[i].label : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "process_type",
+                                  procs[i].process_type ? procs[i].process_type : "");
+        yyjson_mut_obj_add_int(doc, item, "step_count", procs[i].step_count);
+        yyjson_mut_obj_add_int(doc, item, "entry_point_id", procs[i].entry_point_id);
+        yyjson_mut_obj_add_int(doc, item, "terminal_id", procs[i].terminal_id);
+        yyjson_mut_arr_add_val(arr, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "processes", arr);
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    cbm_store_free_processes(procs, count);
+    free(project);
+
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
 static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
     cbm_store_t *store = resolve_store(srv, project);
@@ -1168,6 +1464,12 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
 
     int node_count = cbm_store_count_nodes(store, project);
     int edge_count = cbm_store_count_edges(store, project);
+
+    /* Call the full architecture analysis */
+    cbm_architecture_info_t arch = {0};
+    const char *all_aspects[] = {"languages", "hotspots", "routes", "entry_points",
+                                 "packages", "clusters", "layers", "boundaries"};
+    cbm_store_get_architecture(store, project, all_aspects, 8, &arch);
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -1199,6 +1501,105 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     }
     yyjson_mut_obj_add_val(doc, root, "edge_types", types);
 
+    /* Languages */
+    if (arch.language_count > 0) {
+        yyjson_mut_val *langs = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.language_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, item, "language",
+                                      arch.languages[i].language ? arch.languages[i].language : "");
+            yyjson_mut_obj_add_int(doc, item, "files", arch.languages[i].file_count);
+            yyjson_mut_arr_add_val(langs, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "languages", langs);
+    }
+
+    /* Hotspots (high fan-in functions) */
+    if (arch.hotspot_count > 0) {
+        yyjson_mut_val *spots = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.hotspot_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, item, "name",
+                                      arch.hotspots[i].name ? arch.hotspots[i].name : "");
+            yyjson_mut_obj_add_strcpy(
+                doc, item, "qualified_name",
+                arch.hotspots[i].qualified_name ? arch.hotspots[i].qualified_name : "");
+            yyjson_mut_obj_add_int(doc, item, "fan_in", arch.hotspots[i].fan_in);
+            yyjson_mut_arr_add_val(spots, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "hotspots", spots);
+    }
+
+    /* Routes */
+    if (arch.route_count > 0) {
+        yyjson_mut_val *routes_arr = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.route_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, item, "method",
+                                      arch.routes[i].method ? arch.routes[i].method : "");
+            yyjson_mut_obj_add_strcpy(doc, item, "path",
+                                      arch.routes[i].path ? arch.routes[i].path : "");
+            yyjson_mut_obj_add_strcpy(doc, item, "handler",
+                                      arch.routes[i].handler ? arch.routes[i].handler : "");
+            yyjson_mut_arr_add_val(routes_arr, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "routes", routes_arr);
+    }
+
+    /* Entry points */
+    if (arch.entry_point_count > 0) {
+        yyjson_mut_val *eps = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.entry_point_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, item, "name",
+                                      arch.entry_points[i].name ? arch.entry_points[i].name : "");
+            yyjson_mut_obj_add_strcpy(
+                doc, item, "qualified_name",
+                arch.entry_points[i].qualified_name ? arch.entry_points[i].qualified_name : "");
+            yyjson_mut_obj_add_strcpy(doc, item, "file",
+                                      arch.entry_points[i].file ? arch.entry_points[i].file : "");
+            yyjson_mut_arr_add_val(eps, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "entry_points", eps);
+    }
+
+    /* Packages */
+    if (arch.package_count > 0) {
+        yyjson_mut_val *pkgs = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.package_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, item, "name",
+                                      arch.packages[i].name ? arch.packages[i].name : "");
+            yyjson_mut_obj_add_int(doc, item, "node_count", arch.packages[i].node_count);
+            yyjson_mut_obj_add_int(doc, item, "fan_in", arch.packages[i].fan_in);
+            yyjson_mut_obj_add_int(doc, item, "fan_out", arch.packages[i].fan_out);
+            yyjson_mut_arr_add_val(pkgs, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "packages", pkgs);
+    }
+
+    /* Clusters */
+    if (arch.cluster_count > 0) {
+        yyjson_mut_val *cls = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.cluster_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_int(doc, item, "id", arch.clusters[i].id);
+            yyjson_mut_obj_add_strcpy(doc, item, "label",
+                                      arch.clusters[i].label ? arch.clusters[i].label : "");
+            yyjson_mut_obj_add_int(doc, item, "members", arch.clusters[i].members);
+            yyjson_mut_obj_add_real(doc, item, "cohesion", arch.clusters[i].cohesion);
+            if (arch.clusters[i].top_node_count > 0) {
+                yyjson_mut_val *tn = yyjson_mut_arr(doc);
+                for (int j = 0; j < arch.clusters[i].top_node_count; j++) {
+                    yyjson_mut_arr_add_strcpy(doc, tn, arch.clusters[i].top_nodes[j]);
+                }
+                yyjson_mut_obj_add_val(doc, item, "top_nodes", tn);
+            }
+            yyjson_mut_arr_add_val(cls, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "clusters", cls);
+    }
+
     /* Relationship patterns */
     if (schema.rel_pattern_count > 0) {
         yyjson_mut_val *pats = yyjson_mut_arr(doc);
@@ -1210,6 +1611,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+    cbm_store_architecture_free(&arch);
     cbm_store_schema_free(&schema);
     free(project);
 
@@ -1258,11 +1660,147 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_find_nodes_by_name(store, project, func_name, &nodes, &node_count);
 
     if (node_count == 0) {
-        free(func_name);
-        free(project);
-        free(direction);
+        /* Fuzzy fallback: try substring match when exact name not found.
+         * This handles cases like searching for "RecordingSession" when only
+         * "ContinuousRecordingSessionDataGen" exists. */
+        cbm_search_params_t fuzzy = {0};
+        char pattern[512];
+        snprintf(pattern, sizeof(pattern), ".*%s.*", func_name);
+        fuzzy.project = project;
+        fuzzy.name_pattern = pattern;
+        fuzzy.limit = 10;
+        cbm_search_output_t fuzzy_results = {0};
+        cbm_store_search(store, &fuzzy, &fuzzy_results);
+
+        if (fuzzy_results.count > 0) {
+            /* Return fuzzy matches as suggestions */
+            yyjson_mut_doc *fdoc = yyjson_mut_doc_new(NULL);
+            yyjson_mut_val *froot = yyjson_mut_obj(fdoc);
+            yyjson_mut_doc_set_root(fdoc, froot);
+            yyjson_mut_obj_add_str(fdoc, froot, "status", "not_found_exact");
+            char msg[512];
+            snprintf(msg, sizeof(msg),
+                     "No exact match for '%s'. Found %d partial matches — "
+                     "use one of these exact names:", func_name, fuzzy_results.count);
+            yyjson_mut_obj_add_strcpy(fdoc, froot, "message", msg);
+            yyjson_mut_val *suggestions = yyjson_mut_arr(fdoc);
+            for (int i = 0; i < fuzzy_results.count; i++) {
+                yyjson_mut_val *si = yyjson_mut_obj(fdoc);
+                yyjson_mut_obj_add_strcpy(fdoc, si, "name",
+                    fuzzy_results.results[i].node.name ? fuzzy_results.results[i].node.name : "");
+                yyjson_mut_obj_add_strcpy(fdoc, si, "label",
+                    fuzzy_results.results[i].node.label ? fuzzy_results.results[i].node.label : "");
+                yyjson_mut_obj_add_strcpy(fdoc, si, "file_path",
+                    fuzzy_results.results[i].node.file_path ? fuzzy_results.results[i].node.file_path : "");
+                yyjson_mut_obj_add_int(fdoc, si, "line", fuzzy_results.results[i].node.start_line);
+                yyjson_mut_arr_add_val(suggestions, si);
+            }
+            yyjson_mut_obj_add_val(fdoc, froot, "suggestions", suggestions);
+            char *fjson = yy_doc_to_str(fdoc);
+            yyjson_mut_doc_free(fdoc);
+            cbm_store_search_free(&fuzzy_results);
+            free(func_name); free(project); free(direction);
+            cbm_store_free_nodes(nodes, 0);
+            char *result = cbm_mcp_text_result(fjson, false);
+            free(fjson);
+            return result;
+        }
+        cbm_store_search_free(&fuzzy_results);
+        free(func_name); free(project); free(direction);
         cbm_store_free_nodes(nodes, 0);
         return cbm_mcp_text_result("{\"error\":\"function not found\"}", true);
+    }
+
+    /* Pick the best node for tracing. Strategy:
+     * 1. Prefer Function/Method nodes that are NOT constructors (same name as a
+     *    Class in the result set — constructors rarely have interesting CALLS).
+     * 2. If only Class/Interface nodes match, resolve through DEFINES_METHOD. */
+    int best_idx = 0;
+    bool has_class = false;
+    int class_idx = -1;
+    for (int i = 0; i < node_count; i++) {
+        const char *lbl = nodes[i].label;
+        if (lbl && (strcmp(lbl, "Class") == 0 || strcmp(lbl, "Interface") == 0)) {
+            has_class = true;
+            if (class_idx < 0) class_idx = i;
+        }
+    }
+    /* Look for a non-constructor Function/Method */
+    bool found_callable = false;
+    for (int i = 0; i < node_count; i++) {
+        const char *lbl = nodes[i].label;
+        if (lbl && (strcmp(lbl, "Function") == 0 || strcmp(lbl, "Method") == 0)) {
+            /* Skip if this is a constructor (same name as a Class in results) */
+            if (has_class) continue;
+            best_idx = i;
+            found_callable = true;
+            break;
+        }
+    }
+    /* If no non-constructor callable was found but we have a Class, use the Class */
+    if (!found_callable && class_idx >= 0) {
+        best_idx = class_idx;
+    }
+
+    /* Track disambiguation info — added to the main doc after creation */
+    int callable_count = 0;
+    for (int i = 0; i < node_count; i++) {
+        const char *lbl = nodes[i].label;
+        if (lbl && strcmp(lbl, "File") != 0 && strcmp(lbl, "Folder") != 0 &&
+            strcmp(lbl, "Module") != 0 && strcmp(lbl, "Variable") != 0 &&
+            strcmp(lbl, "Section") != 0 && strcmp(lbl, "Project") != 0) {
+            callable_count++;
+        }
+    }
+
+    /* Determine if the selected node is a Class or Interface. If so, we need to
+     * resolve through DEFINES_METHOD edges to find the actual callable methods,
+     * then run BFS from each method and merge results. */
+    bool is_class_like = false;
+    const char *best_label = nodes[best_idx].label;
+    if (best_label &&
+        (strcmp(best_label, "Class") == 0 || strcmp(best_label, "Interface") == 0)) {
+        is_class_like = true;
+    }
+
+    /* Collect BFS start IDs: either the single node, or all methods of the class */
+    int64_t *start_ids = NULL;
+    int start_id_count = 0;
+
+    if (is_class_like) {
+        /* Find all DEFINES_METHOD targets of this class */
+        cbm_edge_t *dm_edges = NULL;
+        int dm_count = 0;
+        cbm_store_find_edges_by_source_type(store, nodes[best_idx].id, "DEFINES_METHOD",
+                                            &dm_edges, &dm_count);
+        if (dm_count > 0) {
+            /* Cap at 5 methods to prevent excessive BFS calls (each method
+             * spawns ~6 BFS queries across edge type categories) */
+            int use_count = dm_count > 5 ? 5 : dm_count;
+            start_ids = malloc((size_t)use_count * sizeof(int64_t));
+            for (int i = 0; i < use_count; i++) {
+                start_ids[i] = dm_edges[i].target_id;
+            }
+            start_id_count = use_count;
+        }
+        /* Free edge data */
+        for (int i = 0; i < dm_count; i++) {
+            free((void *)dm_edges[i].project);
+            free((void *)dm_edges[i].type);
+            free((void *)dm_edges[i].properties_json);
+        }
+        free(dm_edges);
+
+        /* If no methods found, fall back to the class node itself */
+        if (start_id_count == 0) {
+            start_ids = malloc(sizeof(int64_t));
+            start_ids[0] = nodes[best_idx].id;
+            start_id_count = 1;
+        }
+    } else {
+        start_ids = malloc(sizeof(int64_t));
+        start_ids[0] = nodes[best_idx].id;
+        start_id_count = 1;
     }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -1272,68 +1810,318 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_str(doc, root, "function", func_name);
     yyjson_mut_obj_add_str(doc, root, "direction", direction);
 
-    const char *edge_types[] = {"CALLS"};
-    int edge_type_count = 1;
+    /* Add matched node info */
+    yyjson_mut_obj_add_strcpy(doc, root, "matched_file",
+                              nodes[best_idx].file_path ? nodes[best_idx].file_path : "");
+    yyjson_mut_obj_add_strcpy(doc, root, "matched_label",
+                              nodes[best_idx].label ? nodes[best_idx].label : "");
+    yyjson_mut_obj_add_int(doc, root, "matched_line", nodes[best_idx].start_line);
 
-    /* Run BFS for each requested direction.
-     * IMPORTANT: yyjson_mut_obj_add_str borrows pointers — we must keep
-     * traversal results alive until after yy_doc_to_str serialization. */
+    /* Disambiguation: list all callable candidates when multiple match */
+    if (callable_count > 1) {
+        yyjson_mut_val *cands = yyjson_mut_arr(doc);
+        for (int i = 0; i < node_count; i++) {
+            const char *lbl = nodes[i].label;
+            if (lbl && strcmp(lbl, "File") != 0 && strcmp(lbl, "Folder") != 0 &&
+                strcmp(lbl, "Module") != 0 && strcmp(lbl, "Variable") != 0 &&
+                strcmp(lbl, "Section") != 0 && strcmp(lbl, "Project") != 0) {
+                yyjson_mut_val *ci = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, ci, "name",
+                                          nodes[i].name ? nodes[i].name : "");
+                yyjson_mut_obj_add_strcpy(doc, ci, "label",
+                                          nodes[i].label ? nodes[i].label : "");
+                yyjson_mut_obj_add_strcpy(doc, ci, "file_path",
+                                          nodes[i].file_path ? nodes[i].file_path : "");
+                yyjson_mut_obj_add_int(doc, ci, "line", nodes[i].start_line);
+                yyjson_mut_arr_add_val(cands, ci);
+            }
+        }
+        yyjson_mut_obj_add_val(doc, root, "candidates", cands);
+    }
+
+    /* Check if the node has any edges at all. If not, return basic info only.
+     * This avoids BFS crashes on nodes with 0 edges (e.g. Type nodes, empty Classes). */
+    {
+        int in_deg = 0;
+        int out_deg = 0;
+        cbm_store_node_degree(store, nodes[best_idx].id, &in_deg, &out_deg);
+        if (in_deg == 0 && out_deg == 0 && !is_class_like) {
+            /* No CALLS edges and not a Class — return basic info.
+             * Class/Interface nodes skip this check because they have
+             * DEFINES_METHOD and INHERITS edges that aren't counted by
+             * cbm_store_node_degree (which only counts CALLS). */
+            char *json = yy_doc_to_str(doc);
+            yyjson_mut_doc_free(doc);
+            free(start_ids);
+            cbm_store_free_nodes(nodes, node_count);
+            free(func_name); free(project); free(direction);
+            char *result = cbm_mcp_text_result(json, false);
+            free(json);
+            return result;
+        }
+    }
+
+    /* ── Categorized edge query: like GitNexus context() ──
+     * Instead of flat BFS, query each edge type separately and return
+     * categorized results: incoming.calls, incoming.imports, incoming.extends,
+     * outgoing.calls, outgoing.has_method, outgoing.has_property.
+     * This gives investigation-grade output where a QA engineer can see
+     * exactly which functions CALL this vs which files IMPORT it. */
+
+    /* Helper: query edges for specific types and build JSON array.
+     * Uses strcpy variants since nodes are freed per-query. */
+    #define EDGE_QUERY_MAX 30
+
     // NOLINTNEXTLINE(readability-implicit-bool-conversion)
     bool do_outbound = strcmp(direction, "outbound") == 0 || strcmp(direction, "both") == 0;
     // NOLINTNEXTLINE(readability-implicit-bool-conversion)
     bool do_inbound = strcmp(direction, "inbound") == 0 || strcmp(direction, "both") == 0;
 
-    cbm_traverse_result_t tr_out = {0};
-    cbm_traverse_result_t tr_in = {0};
-
-    if (do_outbound) {
-        cbm_store_bfs(store, nodes[0].id, "outbound", edge_types, edge_type_count, depth, 100,
-                      &tr_out);
-
-        yyjson_mut_val *callees = yyjson_mut_arr(doc);
-        for (int i = 0; i < tr_out.visited_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "name",
-                                   tr_out.visited[i].node.name ? tr_out.visited[i].node.name : "");
-            yyjson_mut_obj_add_str(
-                doc, item, "qualified_name",
-                tr_out.visited[i].node.qualified_name ? tr_out.visited[i].node.qualified_name : "");
-            yyjson_mut_obj_add_int(doc, item, "hop", tr_out.visited[i].hop);
-            yyjson_mut_arr_add_val(callees, item);
-        }
-        yyjson_mut_obj_add_val(doc, root, "callees", callees);
-    }
+    /* Collect all traversal results for lifetime management */
+    #define MAX_TR 64
+    cbm_traverse_result_t *all_tr = calloc(MAX_TR, sizeof(cbm_traverse_result_t));
+    int tr_count = 0;
 
     if (do_inbound) {
-        cbm_store_bfs(store, nodes[0].id, "inbound", edge_types, edge_type_count, depth, 100,
-                      &tr_in);
+        yyjson_mut_val *incoming = yyjson_mut_obj(doc);
 
-        yyjson_mut_val *callers = yyjson_mut_arr(doc);
-        for (int i = 0; i < tr_in.visited_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "name",
-                                   tr_in.visited[i].node.name ? tr_in.visited[i].node.name : "");
-            yyjson_mut_obj_add_str(
-                doc, item, "qualified_name",
-                tr_in.visited[i].node.qualified_name ? tr_in.visited[i].node.qualified_name : "");
-            yyjson_mut_obj_add_int(doc, item, "hop", tr_in.visited[i].hop);
-            yyjson_mut_arr_add_val(callers, item);
+        /* Incoming CALLS (direct callers — hop 1 only for clean results).
+         * For Classes: also include USAGE and DEFINES edges which capture
+         * file-level references like `new MyClass()` and `import MyClass`.
+         * Query both the class node AND its methods as BFS roots. */
+        {
+            const char *call_types[] = {"CALLS", "HTTP_CALLS", "ASYNC_CALLS", "USAGE", "RAISES"};
+            /* Always include the original node (Class or Function) */
+            if (tr_count < MAX_TR) {
+                cbm_store_bfs(store, nodes[best_idx].id, "inbound", call_types, 5, 1,
+                              EDGE_QUERY_MAX, &all_tr[tr_count]);
+                tr_count++;
+            }
+            /* Also include methods for class resolution */
+            for (int s = 0; s < start_id_count && tr_count < MAX_TR; s++) {
+                if (start_ids[s] == nodes[best_idx].id) continue; /* already queried */
+                cbm_store_bfs(store, start_ids[s], "inbound", call_types, 5, 1, EDGE_QUERY_MAX,
+                              &all_tr[tr_count]);
+                if (all_tr[tr_count].visited_count > 0) {
+                    tr_count++;
+                }
+            }
         }
-        yyjson_mut_obj_add_val(doc, root, "callers", callers);
+        /* Build calls array from all BFS results */
+        yyjson_mut_val *calls_arr = yyjson_mut_arr(doc);
+        for (int t = 0; t < tr_count; t++) {
+            for (int i = 0; i < all_tr[t].visited_count; i++) {
+                cbm_node_t *vn = &all_tr[t].visited[i].node;
+                yyjson_mut_val *item = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_str(doc, item, "name", vn->name ? vn->name : "");
+                yyjson_mut_obj_add_str(doc, item, "file_path", vn->file_path ? vn->file_path : "");
+                yyjson_mut_obj_add_int(doc, item, "line", vn->start_line);
+                yyjson_mut_arr_add_val(calls_arr, item);
+            }
+        }
+        yyjson_mut_obj_add_val(doc, incoming, "calls", calls_arr);
+
+        /* Incoming IMPORTS */
+        {
+            int saved_tr = tr_count;
+            for (int s = 0; s < start_id_count && tr_count < MAX_TR; s++) {
+                const char *imp_types[] = {"IMPORTS"};
+                cbm_store_bfs(store, start_ids[s], "inbound", imp_types, 1, 1, EDGE_QUERY_MAX,
+                              &all_tr[tr_count]);
+                tr_count++;
+            }
+            yyjson_mut_val *imp_arr = yyjson_mut_arr(doc);
+            for (int t = saved_tr; t < tr_count; t++) {
+                for (int i = 0; i < all_tr[t].visited_count; i++) {
+                    cbm_node_t *vn = &all_tr[t].visited[i].node;
+                    yyjson_mut_val *item = yyjson_mut_obj(doc);
+                    yyjson_mut_obj_add_str(doc, item, "name", vn->name ? vn->name : "");
+                    yyjson_mut_obj_add_str(doc, item, "file_path", vn->file_path ? vn->file_path : "");
+                    yyjson_mut_arr_add_val(imp_arr, item);
+                }
+            }
+            yyjson_mut_obj_add_val(doc, incoming, "imports", imp_arr);
+        }
+
+        /* Incoming INHERITS (who extends this) */
+        {
+            int saved_tr = tr_count;
+            for (int s = 0; s < start_id_count && tr_count < MAX_TR; s++) {
+                const char *inh_types[] = {"INHERITS"};
+                cbm_store_bfs(store, start_ids[s], "inbound", inh_types, 1, 1, EDGE_QUERY_MAX,
+                              &all_tr[tr_count]);
+                tr_count++;
+            }
+            yyjson_mut_val *inh_arr = yyjson_mut_arr(doc);
+            for (int t = saved_tr; t < tr_count; t++) {
+                for (int i = 0; i < all_tr[t].visited_count; i++) {
+                    cbm_node_t *vn = &all_tr[t].visited[i].node;
+                    yyjson_mut_val *item = yyjson_mut_obj(doc);
+                    yyjson_mut_obj_add_str(doc, item, "name", vn->name ? vn->name : "");
+                    yyjson_mut_obj_add_str(doc, item, "file_path", vn->file_path ? vn->file_path : "");
+                    yyjson_mut_arr_add_val(inh_arr, item);
+                }
+            }
+            yyjson_mut_obj_add_val(doc, incoming, "extends", inh_arr);
+        }
+
+        yyjson_mut_obj_add_val(doc, root, "incoming", incoming);
+
+        /* Also include deeper BFS (hop 2+) as a separate "transitive_callers" field
+         * for users who need it — but only on CALLS, capped at 50. */
+        if (depth > 1) {
+            int saved_tr2 = tr_count;
+            for (int s = 0; s < start_id_count && tr_count < MAX_TR; s++) {
+                const char *call_types[] = {"CALLS", "HTTP_CALLS", "ASYNC_CALLS"};
+                cbm_store_bfs(store, start_ids[s], "inbound", call_types, 3, depth, 50,
+                              &all_tr[tr_count]);
+                tr_count++;
+            }
+            yyjson_mut_val *trans_arr = yyjson_mut_arr(doc);
+            for (int t = saved_tr2; t < tr_count; t++) {
+                for (int i = 0; i < all_tr[t].visited_count; i++) {
+                    if (all_tr[t].visited[i].hop <= 1) continue; /* skip hop 1, already shown */
+                    cbm_node_t *vn = &all_tr[t].visited[i].node;
+                    yyjson_mut_val *item = yyjson_mut_obj(doc);
+                    yyjson_mut_obj_add_str(doc, item, "name", vn->name ? vn->name : "");
+                    yyjson_mut_obj_add_str(doc, item, "file_path", vn->file_path ? vn->file_path : "");
+                    yyjson_mut_obj_add_int(doc, item, "hop", all_tr[t].visited[i].hop);
+                    yyjson_mut_arr_add_val(trans_arr, item);
+                }
+            }
+            yyjson_mut_obj_add_val(doc, root, "transitive_callers", trans_arr);
+        }
+    }
+
+    if (do_outbound) {
+        yyjson_mut_val *outgoing = yyjson_mut_obj(doc);
+
+        /* Outgoing CALLS */
+        {
+            int saved_tr = tr_count;
+            for (int s = 0; s < start_id_count && tr_count < MAX_TR; s++) {
+                const char *call_types[] = {"CALLS", "HTTP_CALLS", "ASYNC_CALLS"};
+                cbm_store_bfs(store, start_ids[s], "outbound", call_types, 3, 1, EDGE_QUERY_MAX,
+                              &all_tr[tr_count]);
+                tr_count++;
+            }
+            yyjson_mut_val *calls_arr = yyjson_mut_arr(doc);
+            for (int t = saved_tr; t < tr_count; t++) {
+                for (int i = 0; i < all_tr[t].visited_count; i++) {
+                    cbm_node_t *vn = &all_tr[t].visited[i].node;
+                    yyjson_mut_val *item = yyjson_mut_obj(doc);
+                    yyjson_mut_obj_add_str(doc, item, "name", vn->name ? vn->name : "");
+                    yyjson_mut_obj_add_str(doc, item, "file_path", vn->file_path ? vn->file_path : "");
+                    yyjson_mut_obj_add_int(doc, item, "line", vn->start_line);
+                    yyjson_mut_arr_add_val(calls_arr, item);
+                }
+            }
+            yyjson_mut_obj_add_val(doc, outgoing, "calls", calls_arr);
+        }
+
+        /* Outgoing DEFINES_METHOD (for Classes).
+         * Use the original Class node ID, not start_ids (which are method IDs).
+         * DEFINES_METHOD edges go FROM the Class TO its Methods. */
+        {
+            int saved_tr = tr_count;
+            if (is_class_like && tr_count < MAX_TR) {
+                const char *dm_types[] = {"DEFINES_METHOD"};
+                cbm_store_bfs(store, nodes[best_idx].id, "outbound", dm_types, 1, 1, 30,
+                              &all_tr[tr_count]);
+                tr_count++;
+            }
+            yyjson_mut_val *methods_arr = yyjson_mut_arr(doc);
+            for (int t = saved_tr; t < tr_count; t++) {
+                for (int i = 0; i < all_tr[t].visited_count; i++) {
+                    cbm_node_t *vn = &all_tr[t].visited[i].node;
+                    yyjson_mut_val *item = yyjson_mut_obj(doc);
+                    yyjson_mut_obj_add_str(doc, item, "name", vn->name ? vn->name : "");
+                    yyjson_mut_obj_add_str(doc, item, "file_path", vn->file_path ? vn->file_path : "");
+                    yyjson_mut_obj_add_int(doc, item, "line", vn->start_line);
+                    yyjson_mut_arr_add_val(methods_arr, item);
+                }
+            }
+            yyjson_mut_obj_add_val(doc, outgoing, "has_method", methods_arr);
+        }
+
+        /* Outgoing INHERITS (what this extends) */
+        {
+            int saved_tr = tr_count;
+            const char *inh_types[] = {"INHERITS"};
+            cbm_store_bfs(store, nodes[best_idx].id, "outbound", inh_types, 1, 1, 10,
+                          &all_tr[tr_count]);
+            tr_count++;
+            yyjson_mut_val *ext_arr = yyjson_mut_arr(doc);
+            for (int t = saved_tr; t < tr_count; t++) {
+                for (int i = 0; i < all_tr[t].visited_count; i++) {
+                    cbm_node_t *vn = &all_tr[t].visited[i].node;
+                    yyjson_mut_val *item = yyjson_mut_obj(doc);
+                    yyjson_mut_obj_add_str(doc, item, "name", vn->name ? vn->name : "");
+                    yyjson_mut_obj_add_str(doc, item, "file_path", vn->file_path ? vn->file_path : "");
+                    yyjson_mut_arr_add_val(ext_arr, item);
+                }
+            }
+            yyjson_mut_obj_add_val(doc, outgoing, "extends", ext_arr);
+        }
+
+        yyjson_mut_obj_add_val(doc, root, "outgoing", outgoing);
+    }
+
+    /* Process participation */
+    {
+        cbm_process_info_t *procs = NULL;
+        int pcount = 0;
+        cbm_store_list_processes(store, project, &procs, &pcount);
+        if (pcount > 0) {
+            yyjson_mut_val *flows = yyjson_mut_arr(doc);
+            int flow_count = 0;
+            for (int pi = 0; pi < pcount && flow_count < 20; pi++) {
+                bool participates = false;
+                if (procs[pi].entry_point_id == nodes[best_idx].id ||
+                    procs[pi].terminal_id == nodes[best_idx].id) {
+                    participates = true;
+                }
+                if (!participates) {
+                    for (int si = 0; si < start_id_count; si++) {
+                        if (procs[pi].entry_point_id == start_ids[si] ||
+                            procs[pi].terminal_id == start_ids[si]) {
+                            participates = true;
+                            break;
+                        }
+                    }
+                }
+                if (!participates && func_name && procs[pi].label) {
+                    if (strstr(procs[pi].label, func_name) != NULL) {
+                        participates = true;
+                    }
+                }
+                if (participates) {
+                    yyjson_mut_val *fi = yyjson_mut_obj(doc);
+                    yyjson_mut_obj_add_strcpy(doc, fi, "label",
+                                              procs[pi].label ? procs[pi].label : "");
+                    yyjson_mut_obj_add_int(doc, fi, "step_count", procs[pi].step_count);
+                    yyjson_mut_arr_add_val(flows, fi);
+                    flow_count++;
+                }
+            }
+            if (flow_count > 0) yyjson_mut_obj_add_val(doc, root, "processes", flows);
+        }
+        cbm_store_free_processes(procs, pcount);
     }
 
     /* Serialize BEFORE freeing traversal results (yyjson borrows strings) */
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
 
-    /* Now safe to free traversal data */
-    if (do_outbound) {
-        cbm_store_traverse_free(&tr_out);
+    /* Now safe to free all traversal data */
+    for (int t = 0; t < tr_count; t++) {
+        cbm_store_traverse_free(&all_tr[t]);
     }
-    if (do_inbound) {
-        cbm_store_traverse_free(&tr_in);
-    }
+    free(all_tr);
+    #undef EDGE_QUERY_MAX
+    #undef MAX_TR
 
+    free(start_ids);
     cbm_store_free_nodes(nodes, node_count);
     free(func_name);
     free(project);
@@ -2502,7 +3290,10 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
             continue;
         }
 
-        yyjson_mut_arr_add_str(doc, changed, line);
+        /* Use strcpy variants: line is a stack buffer reused each iteration,
+         * and node strings are freed by cbm_store_free_nodes below.
+         * yyjson_mut_*_add_str only borrows pointers — strcpy makes copies. */
+        yyjson_mut_arr_add_strcpy(doc, changed, line);
         file_count++;
 
         /* Find symbols defined in this file */
@@ -2514,9 +3305,9 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
             if (nodes[i].label && strcmp(nodes[i].label, "File") != 0 &&
                 strcmp(nodes[i].label, "Folder") != 0 && strcmp(nodes[i].label, "Project") != 0) {
                 yyjson_mut_val *item = yyjson_mut_obj(doc);
-                yyjson_mut_obj_add_str(doc, item, "name", nodes[i].name ? nodes[i].name : "");
-                yyjson_mut_obj_add_str(doc, item, "label", nodes[i].label);
-                yyjson_mut_obj_add_str(doc, item, "file", line);
+                yyjson_mut_obj_add_strcpy(doc, item, "name", nodes[i].name ? nodes[i].name : "");
+                yyjson_mut_obj_add_strcpy(doc, item, "label", nodes[i].label);
+                yyjson_mut_obj_add_strcpy(doc, item, "file", line);
                 yyjson_mut_arr_add_val(impacted, item);
             }
         }
@@ -2703,6 +3494,18 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "get_architecture") == 0) {
         return handle_get_architecture(srv, args_json);
+    }
+    if (strcmp(tool_name, "list_processes") == 0) {
+        return handle_list_processes(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_channels") == 0) {
+        return handle_get_channels(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_process_steps") == 0) {
+        return handle_get_process_steps(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_impact") == 0) {
+        return handle_get_impact(srv, args_json);
     }
 
     /* Pipeline-dependent tools */

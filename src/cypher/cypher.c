@@ -1561,6 +1561,9 @@ typedef struct {
 } binding_t;
 
 /* Get node property by name */
+/* Forward declaration — full implementation below */
+static const char *json_extract_prop(const char *json, const char *key, char *buf, size_t buf_sz);
+
 static const char *node_prop(const cbm_node_t *n, const char *prop) {
     if (!n || !prop) {
         return "";
@@ -1587,6 +1590,24 @@ static const char *node_prop(const cbm_node_t *n, const char *prop) {
         static char buf[32];
         snprintf(buf, sizeof(buf), "%d", n->end_line);
         return buf;
+    }
+    if (strcmp(prop, "file") == 0) {
+        return n->file_path ? n->file_path : "";
+    }
+    if (strcmp(prop, "id") == 0) {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "%lld", (long long)n->id);
+        return buf;
+    }
+    /* Fall through to JSON properties for unknown fields.
+     * This enables queries like WHERE n.is_entry_point = true
+     * or WHERE n.confidence > 0.5 on properties stored in properties_json. */
+    if (n->properties_json) {
+        static char json_buf[1024];
+        const char *val = json_extract_prop(n->properties_json, prop, json_buf, sizeof(json_buf));
+        if (val && val[0]) {
+            return val;
+        }
     }
     return "";
 }
