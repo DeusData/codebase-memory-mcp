@@ -572,6 +572,9 @@ static void prescan_routes(const char *source, int source_len, const CBMFileResu
                 nr = cbm_extract_express_routes(def->name, def->qualified_name, func_src,
                                                 routes + total, 16 - total);
                 total += nr;
+                nr = cbm_extract_hapi_routes(def->name, def->qualified_name, func_src,
+                                             routes + total, 16 - total);
+                total += nr;
                 nr = cbm_extract_laravel_routes(def->name, def->qualified_name, func_src,
                                                 routes + total, 16 - total);
                 total += nr;
@@ -608,6 +611,8 @@ static void prescan_routes(const char *source, int source_len, const CBMFileResu
             if (is_js) {
                 total += cbm_extract_express_routes(basename, "", source, mod_routes + total,
                                                     16 - total);
+                total += cbm_extract_hapi_routes(basename, "", source, mod_routes + total,
+                                                  16 - total);
             }
             for (int r = 0; r < total; r++) {
                 prescan_add_route(ps, &mod_routes[r]);

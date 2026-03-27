@@ -277,6 +277,9 @@ static int discover_node_routes(const cbm_gbuf_node_t *n, const cbm_pipeline_ctx
                 nr = cbm_extract_express_routes(n->name, n->qualified_name, source, out + total,
                                                 max_out - total);
                 total += nr;
+                nr = cbm_extract_hapi_routes(n->name, n->qualified_name, source, out + total,
+                                             max_out - total);
+                total += nr;
             }
             if (has_suffix(fp, ".php")) {
                 nr = cbm_extract_laravel_routes(n->name, n->qualified_name, source, out + total,
@@ -323,6 +326,8 @@ static int discover_module_routes(const cbm_gbuf_node_t *mod, const cbm_pipeline
     if (is_js) {
         total += cbm_extract_express_routes(mod->name, mod->qualified_name, source, out + total,
                                             max_out - total);
+        total += cbm_extract_hapi_routes(mod->name, mod->qualified_name, source, out + total,
+                                         max_out - total);
     }
     free(source);
     return total;

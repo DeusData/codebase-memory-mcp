@@ -113,6 +113,10 @@ int cbm_extract_ktor_routes(const char *name, const char *qn, const char *source
 int cbm_extract_express_routes(const char *name, const char *qn, const char *source,
                                cbm_route_handler_t *out, int max_out);
 
+/* Hapi.js object-literal routes: { method: 'GET', path: '/api/...', handler: ... } */
+int cbm_extract_hapi_routes(const char *name, const char *qn, const char *source,
+                            cbm_route_handler_t *out, int max_out);
+
 /* Extract PHP Laravel routes from source.
  * Returns count. */
 int cbm_extract_laravel_routes(const char *name, const char *qn, const char *source,

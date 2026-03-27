@@ -1379,6 +1379,193 @@ int cbm_extract_express_routes(const char *name, const char *qn, const char *sou
     return count;
 }
 
+/* ── Route extraction: Hapi.js ─────────────────────────────────── */
+
+/* Extract a quoted string value after a colon, e.g. method: 'GET' → "GET".
+ * Returns the number of chars consumed from `src` (0 on failure). */
+static int hapi_extract_string_value(const char *src, char *out, int outsz) {
+    const char *p = src;
+    /* Skip whitespace after colon */
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    char quote = *p;
+    if (quote != '\'' && quote != '"' && quote != '`') return 0;
+    p++;
+    const char *start = p;
+    while (*p && *p != quote) p++;
+    if (*p != quote) return 0;
+    int len = (int)(p - start);
+    if (len >= outsz) len = outsz - 1;
+    memcpy(out, start, (size_t)len);
+    out[len] = '\0';
+    return (int)(p + 1 - src);
+}
+
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+int cbm_extract_hapi_routes(const char *name, const char *qn, const char *source,
+                            cbm_route_handler_t *out, int max_out) {
+    if (!source || !*source) {
+        return 0;
+    }
+
+    int count = 0;
+    const char *p = source;
+
+    /* Scan for object literals containing method: and path: properties.
+     * Hapi pattern:
+     *   { method: 'GET', path: '/api/users', handler: ... }
+     * or:
+     *   { method: 'POST', path: '/api/users', handler: UsersController.create }
+     *
+     * We look for "method:" followed by a string value, then scan nearby for
+     * "path:" followed by a string value (or vice versa). */
+    while (*p && count < max_out) {
+        /* Find next "method:" or "method :" */
+        const char *mkey = strstr(p, "method");
+        if (!mkey) break;
+
+        /* Verify it looks like a property key (preceded by space/newline/comma/brace) */
+        if (mkey > source) {
+            char before = *(mkey - 1);
+            if (before != ' ' && before != '\t' && before != '\n' && before != '\r' &&
+                before != ',' && before != '{') {
+                p = mkey + 6;
+                continue;
+            }
+        }
+
+        const char *after_method = mkey + 6;
+        /* Skip optional whitespace and colon */
+        while (*after_method == ' ' || *after_method == '\t') after_method++;
+        if (*after_method != ':') {
+            p = after_method;
+            continue;
+        }
+        after_method++; /* skip ':' */
+
+        char method_val[16] = {0};
+        int consumed = hapi_extract_string_value(after_method, method_val, sizeof(method_val));
+        if (consumed == 0) {
+            p = after_method;
+            continue;
+        }
+
+        /* Uppercase the method */
+        for (int j = 0; method_val[j]; j++) {
+            method_val[j] = (char)toupper((unsigned char)method_val[j]);
+        }
+
+        /* Validate it's a real HTTP method */
+        if (strcmp(method_val, "GET") != 0 && strcmp(method_val, "POST") != 0 &&
+            strcmp(method_val, "PUT") != 0 && strcmp(method_val, "DELETE") != 0 &&
+            strcmp(method_val, "PATCH") != 0 && strcmp(method_val, "OPTIONS") != 0 &&
+            strcmp(method_val, "HEAD") != 0 && strcmp(method_val, "*") != 0) {
+            p = after_method + consumed;
+            continue;
+        }
+
+        /* Search for "path:" within the same object literal — look forward from the
+         * method: position. Both method: and path: are in the same {...} block,
+         * typically within 300 chars of each other. Also search a small window
+         * backward in case path: comes before method: in the object. */
+        const char *search_start = (mkey - 300 > source) ? mkey - 300 : source;
+        const char *search_end_limit = mkey + 500;
+        char path_val[256] = {0};
+        bool found_path = false;
+
+        /* Find the enclosing '{' to scope the search to this object literal */
+        const char *obj_start = mkey;
+        int brace_depth = 0;
+        while (obj_start > source) {
+            obj_start--;
+            if (*obj_start == '{') {
+                if (brace_depth == 0) break;
+                brace_depth--;
+            } else if (*obj_start == '}') {
+                brace_depth++;
+            }
+        }
+        if (*obj_start == '{') {
+            search_start = obj_start;
+        }
+
+        const char *pkey = search_start;
+        while ((pkey = strstr(pkey, "path")) != NULL && pkey < search_end_limit) {
+            /* Verify it looks like a property key */
+            if (pkey > source) {
+                char pb = *(pkey - 1);
+                if (pb != ' ' && pb != '\t' && pb != '\n' && pb != '\r' &&
+                    pb != ',' && pb != '{') {
+                    pkey += 4;
+                    continue;
+                }
+            }
+            const char *after_path = pkey + 4;
+            while (*after_path == ' ' || *after_path == '\t') after_path++;
+            if (*after_path != ':') {
+                pkey += 4;
+                continue;
+            }
+            after_path++;
+            int pc = hapi_extract_string_value(after_path, path_val, sizeof(path_val));
+            if (pc > 0 && path_val[0] == '/') {
+                found_path = true;
+                break;
+            }
+            pkey += 4;
+        }
+
+        if (found_path) {
+            /* Optionally extract handler reference — scope to same object */
+            char handler_val[256] = {0};
+            const char *hkey = strstr(obj_start, "handler");
+            while (hkey && hkey < search_end_limit) {
+                /* Verify property key */
+                if (hkey > source) {
+                    char hb = *(hkey - 1);
+                    if (hb != ' ' && hb != '\t' && hb != '\n' && hb != '\r' &&
+                        hb != ',' && hb != '{') {
+                        hkey = strstr(hkey + 7, "handler");
+                        continue;
+                    }
+                }
+                const char *after_handler = hkey + 7;
+                while (*after_handler == ' ' || *after_handler == '\t') after_handler++;
+                if (*after_handler == ':') {
+                    after_handler++;
+                    while (*after_handler == ' ' || *after_handler == '\t') after_handler++;
+                    /* Handler can be identifier.identifier or just identifier */
+                    const char *hs = after_handler;
+                    while (*after_handler && *after_handler != ',' && *after_handler != '\n' &&
+                           *after_handler != '}' && *after_handler != ' ') {
+                        after_handler++;
+                    }
+                    int hlen = (int)(after_handler - hs);
+                    if (hlen > 0 && hlen < (int)sizeof(handler_val)) {
+                        memcpy(handler_val, hs, (size_t)hlen);
+                        handler_val[hlen] = '\0';
+                    }
+                }
+                break;
+            }
+
+            cbm_route_handler_t *r = &out[count];
+            memset(r, 0, sizeof(*r));
+            strncpy(r->method, method_val, sizeof(r->method) - 1);
+            strncpy(r->path, path_val, sizeof(r->path) - 1);
+            strncpy(r->function_name, name ? name : "", sizeof(r->function_name) - 1);
+            strncpy(r->qualified_name, qn ? qn : "", sizeof(r->qualified_name) - 1);
+            if (handler_val[0]) {
+                strncpy(r->handler_ref, handler_val, sizeof(r->handler_ref) - 1);
+            }
+            count++;
+        }
+
+        p = after_method + consumed;
+    }
+
+    return count;
+}
+
 /* ── Route extraction: Laravel ─────────────────────────────────── */
 
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
