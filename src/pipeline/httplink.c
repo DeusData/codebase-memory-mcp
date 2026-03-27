@@ -362,7 +362,6 @@ static int count_segments(const char *path) {
     return count;
 }
 
-/* Jaccard similarity of path segments (intersection/union) */
 static double segment_jaccard(const char *norm_call, const char *norm_route) {
     /* Split into segments */
     char a[1024];
@@ -1905,5 +1904,94 @@ int cbm_httplink_all_exclude_paths(const cbm_httplink_config_t *cfg, const char 
         }
     }
 
+    return count;
+}
+
+/* ── Channel extraction: Socket.IO / EventEmitter ────────────────── */
+
+typedef struct cbm_channel_match {
+    char channel[256];
+    char direction[8]; /* "emit" or "listen" */
+    char transport[32]; /* "socketio", "eventemitter" */
+} cbm_channel_match_t;
+
+int cbm_extract_channels(const char *source, cbm_channel_match_t *out, int max_out) {
+    if (!source || !*source) return 0;
+
+    cbm_regex_t re;
+    if (cbm_regcomp(&re,
+            "([a-zA-Z_][a-zA-Z0-9_]*)\\.("
+            "emit|on|once|addListener|removeListener"
+            ")\\([[:space:]]*['\"`]([^'\"`]{1,128})['\"`]",
+            CBM_REG_EXTENDED) != 0) {
+        return 0;
+    }
+
+    static const char *channel_receivers[] = {
+        "socket", "io", "client", "server", "connection",
+        "emitter", "eventEmitter", "eventBus", "bus", "pubsub",
+        "producer", "consumer", "channel", "broker",
+        "nsp", "namespace", "this", NULL
+    };
+
+    int count = 0;
+    const char *p = source;
+    cbm_regmatch_t match[4];
+
+    while (count < max_out && cbm_regexec(&re, p, 4, match, 0) == 0) {
+        int rlen = match[1].rm_eo - match[1].rm_so;
+        char receiver[64];
+        if (rlen >= (int)sizeof(receiver)) rlen = (int)sizeof(receiver) - 1;
+        memcpy(receiver, p + match[1].rm_so, (size_t)rlen);
+        receiver[rlen] = '\0';
+
+        bool is_channel = false;
+        for (int i = 0; channel_receivers[i]; i++) {
+            if (strcasecmp(receiver, channel_receivers[i]) == 0) {
+                is_channel = true;
+                break;
+            }
+        }
+
+        if (is_channel) {
+            int mlen = match[2].rm_eo - match[2].rm_so;
+            char method[32];
+            if (mlen >= (int)sizeof(method)) mlen = (int)sizeof(method) - 1;
+            memcpy(method, p + match[2].rm_so, (size_t)mlen);
+            method[mlen] = '\0';
+
+            int clen = match[3].rm_eo - match[3].rm_so;
+            if (clen >= (int)sizeof(out[count].channel))
+                clen = (int)sizeof(out[count].channel) - 1;
+            memcpy(out[count].channel, p + match[3].rm_so, (size_t)clen);
+            out[count].channel[clen] = '\0';
+
+            const char *ch = out[count].channel;
+            if (strcmp(ch, "error") != 0 && strcmp(ch, "close") != 0 &&
+                strcmp(ch, "end") != 0 && strcmp(ch, "data") != 0 &&
+                strcmp(ch, "connect") != 0 && strcmp(ch, "disconnect") != 0 &&
+                strcmp(ch, "connection") != 0 && strcmp(ch, "message") != 0 &&
+                strcmp(ch, "open") != 0 && strcmp(ch, "drain") != 0 &&
+                strcmp(ch, "finish") != 0 && strcmp(ch, "pipe") != 0 &&
+                strcmp(ch, "unpipe") != 0 && strcmp(ch, "readable") != 0 &&
+                strcmp(ch, "resume") != 0 && strcmp(ch, "pause") != 0) {
+                if (strcmp(method, "emit") == 0) {
+                    strncpy(out[count].direction, "emit", sizeof(out[count].direction) - 1);
+                } else {
+                    strncpy(out[count].direction, "listen", sizeof(out[count].direction) - 1);
+                }
+                if (strcasecmp(receiver, "socket") == 0 || strcasecmp(receiver, "io") == 0 ||
+                    strcasecmp(receiver, "nsp") == 0 || strcasecmp(receiver, "namespace") == 0) {
+                    strncpy(out[count].transport, "socketio", sizeof(out[count].transport) - 1);
+                } else {
+                    strncpy(out[count].transport, "eventemitter", sizeof(out[count].transport) - 1);
+                }
+                count++;
+            }
+        }
+        p += match[0].rm_eo;
+    }
+
+    cbm_regfree(&re);
     return count;
 }

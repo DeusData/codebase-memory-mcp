@@ -839,6 +839,17 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
                     cbm_store_close(proc_store);
                 }
             }
+
+            /* ── Channel detection: scan source for emit/on patterns ── */
+            {
+                cbm_store_t *ch_store = cbm_store_open_path(db_path);
+                if (ch_store) {
+                    int nch = cbm_store_detect_channels(ch_store, p->project_name, p->repo_path);
+                    cbm_log_info("pass.done", "pass", "channels",
+                                 "detected", itoa_buf(nch));
+                    cbm_store_close(ch_store);
+                }
+            }
         }
     }
 

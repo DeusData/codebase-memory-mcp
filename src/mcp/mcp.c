@@ -288,6 +288,14 @@ static const tool_def_t TOOLS[] = {
      "community detection. Returns up to 300 processes ordered by step count.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":[\"project\"]}"},
 
+    {"get_channels",
+     "Find message channels (Socket.IO events, EventEmitter signals) across projects. "
+     "Shows which functions emit and listen on each channel, enabling cross-service "
+     "message flow tracing. Auto-detects patterns during indexing. "
+     "Query by channel name (partial match) and/or project.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "\"channel\":{\"type\":\"string\",\"description\":\"Channel name filter (partial match)\"}}}"},
+
     {"search_code",
      "Graph-augmented code search. Finds text patterns via grep, then enriches results with "
      "the knowledge graph: deduplicates matches into containing functions, ranks by structural "
@@ -1159,6 +1167,53 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     free(name);
+
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
+static char *handle_get_channels(cbm_mcp_server_t *srv, const char *args) {
+    char *project = cbm_mcp_get_string_arg(args, "project");
+    char *channel = cbm_mcp_get_string_arg(args, "channel");
+    cbm_store_t *store = resolve_store(srv, project);
+    REQUIRE_STORE(store, project);
+
+    cbm_channel_info_t *channels = NULL;
+    int count = 0;
+    cbm_store_find_channels(store, project, channel, &channels, &count);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    yyjson_mut_obj_add_int(doc, root, "total", count);
+
+    /* Group by channel name for readable output */
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < count; i++) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, item, "channel",
+                                  channels[i].channel_name ? channels[i].channel_name : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "direction",
+                                  channels[i].direction ? channels[i].direction : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "transport",
+                                  channels[i].transport ? channels[i].transport : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "project",
+                                  channels[i].project ? channels[i].project : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "file",
+                                  channels[i].file_path ? channels[i].file_path : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "function",
+                                  channels[i].function_name ? channels[i].function_name : "");
+        yyjson_mut_arr_add_val(arr, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "channels", arr);
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    cbm_store_free_channels(channels, count);
+    free(project);
+    free(channel);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
@@ -2967,6 +3022,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "list_processes") == 0) {
         return handle_list_processes(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_channels") == 0) {
+        return handle_get_channels(srv, args_json);
     }
 
     /* Pipeline-dependent tools */

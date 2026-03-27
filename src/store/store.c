@@ -206,6 +206,18 @@ static int init_schema(cbm_store_t *s) {
                        "  step INTEGER NOT NULL,"
                        "  PRIMARY KEY (process_id, step)"
                        ");"
+                       "CREATE TABLE IF NOT EXISTS channels ("
+                       "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                       "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+                       "  channel_name TEXT NOT NULL,"
+                       "  direction TEXT NOT NULL,"  /* 'emit' or 'listen' */
+                       "  transport TEXT NOT NULL DEFAULT 'socketio',"
+                       "  node_id INTEGER NOT NULL,"
+                       "  file_path TEXT DEFAULT '',"
+                       "  function_name TEXT DEFAULT ''"
+                       ");"
+                       "CREATE INDEX IF NOT EXISTS idx_channels_name ON channels(channel_name);"
+                       "CREATE INDEX IF NOT EXISTS idx_channels_project ON channels(project);"
                        "CREATE TABLE IF NOT EXISTS project_summaries ("
                       "  project TEXT PRIMARY KEY,"
                       "  summary TEXT NOT NULL,"
@@ -4774,6 +4786,179 @@ void cbm_store_free_process_steps(cbm_process_step_t *arr, int count) {
         free((void *)arr[i].name);
         free((void *)arr[i].qualified_name);
         free((void *)arr[i].file_path);
+    }
+    free(arr);
+}
+
+/* ── Channels (cross-service message tracing) ────────────────────── */
+
+/* Forward declaration of channel extractor from httplink.c */
+typedef struct {
+    char channel[256];
+    char direction[8];
+    char transport[32];
+} cbm_channel_match_t;
+int cbm_extract_channels(const char *source, cbm_channel_match_t *out, int max_out);
+
+int cbm_store_detect_channels(cbm_store_t *s, const char *project, const char *repo_path) {
+    if (!s || !s->db || !project || !repo_path) return 0;
+
+    /* Clear existing channels for this project */
+    char del[256];
+    snprintf(del, sizeof(del), "DELETE FROM channels WHERE project = '%s'", project);
+    exec_sql(s, del);
+
+    /* Find all JS/TS Function/Method nodes with source file references */
+    const char *sql = "SELECT id, name, file_path, start_line, end_line FROM nodes "
+                      "WHERE project = ?1 AND label IN ('Function','Method','Module') "
+                      "AND (file_path LIKE '%.ts' OR file_path LIKE '%.js' "
+                      "OR file_path LIKE '%.tsx' OR file_path LIKE '%.py')";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    bind_text(stmt, 1, project);
+
+    sqlite3_stmt *ins = NULL;
+    sqlite3_prepare_v2(s->db,
+        "INSERT INTO channels(project,channel_name,direction,transport,node_id,file_path,function_name) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7)", -1, &ins, NULL);
+
+    exec_sql(s, "BEGIN TRANSACTION");
+    int total = 0;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int64_t node_id = sqlite3_column_int64(stmt, 0);
+        const char *name = (const char *)sqlite3_column_text(stmt, 1);
+        const char *fpath = (const char *)sqlite3_column_text(stmt, 2);
+        int start = sqlite3_column_int(stmt, 3);
+        int end = sqlite3_column_int(stmt, 4);
+
+        if (!fpath || !fpath[0] || start <= 0 || end <= 0) continue;
+
+        /* Read source lines from disk */
+        char full_path[2048];
+        snprintf(full_path, sizeof(full_path), "%s/%s", repo_path, fpath);
+
+        FILE *f = fopen(full_path, "r");
+        if (!f) continue;
+
+        /* Read relevant lines */
+        char *source = NULL;
+        size_t src_len = 0;
+        size_t src_cap = 0;
+        int line_num = 0;
+        char line[4096];
+
+        while (fgets(line, sizeof(line), f)) {
+            line_num++;
+            if (line_num < start) continue;
+            if (line_num > end) break;
+            size_t ll = strlen(line);
+            if (src_len + ll >= src_cap) {
+                src_cap = (src_cap == 0) ? 4096 : src_cap * 2;
+                source = safe_realloc(source, src_cap);
+            }
+            memcpy(source + src_len, line, ll);
+            src_len += ll;
+        }
+        fclose(f);
+
+        if (source) {
+            source[src_len] = '\0';
+            cbm_channel_match_t matches[64];
+            int mc = cbm_extract_channels(source, matches, 64);
+            for (int i = 0; i < mc && ins; i++) {
+                sqlite3_reset(ins);
+                bind_text(ins, 1, project);
+                bind_text(ins, 2, matches[i].channel);
+                bind_text(ins, 3, matches[i].direction);
+                bind_text(ins, 4, matches[i].transport);
+                sqlite3_bind_int64(ins, 5, node_id);
+                bind_text(ins, 6, fpath);
+                bind_text(ins, 7, name ? name : "");
+                sqlite3_step(ins);
+                total++;
+            }
+            free(source);
+        }
+    }
+
+    exec_sql(s, "COMMIT");
+    sqlite3_finalize(stmt);
+    if (ins) sqlite3_finalize(ins);
+    return total;
+}
+
+int cbm_store_find_channels(cbm_store_t *s, const char *project, const char *channel,
+                            cbm_channel_info_t **out, int *count) {
+    *out = NULL;
+    *count = 0;
+
+    /* Build query — if project is NULL, search all; if channel is NULL, return all */
+    char sql[1024];
+    if (project && channel) {
+        snprintf(sql, sizeof(sql),
+                 "SELECT channel_name, direction, transport, project, file_path, function_name "
+                 "FROM channels WHERE project = ?1 AND channel_name LIKE ?2 "
+                 "ORDER BY channel_name LIMIT 500");
+    } else if (project) {
+        snprintf(sql, sizeof(sql),
+                 "SELECT channel_name, direction, transport, project, file_path, function_name "
+                 "FROM channels WHERE project = ?1 ORDER BY channel_name LIMIT 500");
+    } else if (channel) {
+        snprintf(sql, sizeof(sql),
+                 "SELECT channel_name, direction, transport, project, file_path, function_name "
+                 "FROM channels WHERE channel_name LIKE ?1 ORDER BY channel_name LIMIT 500");
+    } else {
+        snprintf(sql, sizeof(sql),
+                 "SELECT channel_name, direction, transport, project, file_path, function_name "
+                 "FROM channels ORDER BY channel_name LIMIT 500");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) return CBM_STORE_OK;
+
+    int bi = 0;
+    if (project && channel) {
+        bind_text(stmt, 1, project);
+        char pat[256];
+        snprintf(pat, sizeof(pat), "%%%s%%", channel);
+        bind_text(stmt, 2, pat);
+    } else if (project) {
+        bind_text(stmt, 1, project);
+    } else if (channel) {
+        char pat[256];
+        snprintf(pat, sizeof(pat), "%%%s%%", channel);
+        bind_text(stmt, 1, pat);
+    }
+    (void)bi;
+
+    int cap = 64;
+    int n = 0;
+    cbm_channel_info_t *arr = calloc((size_t)cap, sizeof(cbm_channel_info_t));
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (n >= cap) { cap *= 2; arr = safe_realloc(arr, (size_t)cap * sizeof(cbm_channel_info_t)); }
+        arr[n].channel_name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        arr[n].direction = heap_strdup((const char *)sqlite3_column_text(stmt, 1));
+        arr[n].transport = heap_strdup((const char *)sqlite3_column_text(stmt, 2));
+        arr[n].project = heap_strdup((const char *)sqlite3_column_text(stmt, 3));
+        arr[n].file_path = heap_strdup((const char *)sqlite3_column_text(stmt, 4));
+        arr[n].function_name = heap_strdup((const char *)sqlite3_column_text(stmt, 5));
+        n++;
+    }
+    sqlite3_finalize(stmt);
+    *out = arr;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
+void cbm_store_free_channels(cbm_channel_info_t *arr, int count) {
+    for (int i = 0; i < count; i++) {
+        free((void *)arr[i].channel_name);
+        free((void *)arr[i].direction);
+        free((void *)arr[i].transport);
+        free((void *)arr[i].project);
+        free((void *)arr[i].file_path);
+        free((void *)arr[i].function_name);
     }
     free(arr);
 }

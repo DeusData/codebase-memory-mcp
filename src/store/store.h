@@ -544,9 +544,30 @@ int cbm_store_get_process_steps(cbm_store_t *s, int64_t process_id,
 void cbm_store_free_processes(cbm_process_info_t *arr, int count);
 void cbm_store_free_process_steps(cbm_process_step_t *arr, int count);
 
-/* Detect execution flows from entry points via BFS + Louvain community crossing.
- * Writes results to processes + process_steps tables. Returns count of processes found. */
+/* Detect execution flows from entry points via BFS + Louvain community crossing. */
 int cbm_store_detect_processes(cbm_store_t *s, const char *project, int max_processes);
+
+/* ── Channels (cross-service message tracing) ────────────────────── */
+
+typedef struct {
+    const char *channel_name;
+    const char *direction;  /* "emit" or "listen" */
+    const char *transport;  /* "socketio", "eventemitter" */
+    const char *project;
+    const char *file_path;
+    const char *function_name;
+} cbm_channel_info_t;
+
+/* Detect channel emit/listen patterns in indexed source files.
+ * Reads source from disk for JS/TS/Python files and scans for
+ * socket.emit/on, emitter.emit/on patterns. */
+int cbm_store_detect_channels(cbm_store_t *s, const char *project, const char *repo_path);
+
+/* Query channels by name (partial match). If channel is NULL, returns all.
+ * If project is NULL, searches across all loaded projects. */
+int cbm_store_find_channels(cbm_store_t *s, const char *project, const char *channel,
+                            cbm_channel_info_t **out, int *count);
+void cbm_store_free_channels(cbm_channel_info_t *arr, int count);
 
 /* ── ADR (Architecture Decision Record) ────────────────────────── */
 
