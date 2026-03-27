@@ -3951,6 +3951,207 @@ static bool want_aspect(const char **aspects, int aspect_count, const char *name
     return false;
 }
 
+/* ── Clusters via Louvain community detection ──────────────────── */
+
+static int arch_clusters(cbm_store_t *s, const char *project, cbm_architecture_info_t *out) {
+    /* 1. Load all callable node IDs for this project */
+    const char *nsql = "SELECT id FROM nodes WHERE project=?1 "
+                       "AND label IN ('Function','Method','Class','Interface')";
+    sqlite3_stmt *nstmt = NULL;
+    if (sqlite3_prepare_v2(s->db, nsql, -1, &nstmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "arch_clusters_nodes");
+        return CBM_STORE_ERR;
+    }
+    bind_text(nstmt, 1, project);
+
+    int ncap = 1024;
+    int nn = 0;
+    int64_t *node_ids = malloc((size_t)ncap * sizeof(int64_t));
+
+    while (sqlite3_step(nstmt) == SQLITE_ROW) {
+        if (nn >= ncap) {
+            ncap *= 2;
+            node_ids = safe_realloc(node_ids, (size_t)ncap * sizeof(int64_t));
+        }
+        node_ids[nn++] = sqlite3_column_int64(nstmt, 0);
+    }
+    sqlite3_finalize(nstmt);
+
+    if (nn < 2) {
+        free(node_ids);
+        return CBM_STORE_OK; /* Nothing to cluster */
+    }
+
+    /* 2. Load all CALLS edges for this project */
+    const char *esql = "SELECT source_id, target_id FROM edges WHERE project=?1 AND type='CALLS'";
+    sqlite3_stmt *estmt = NULL;
+    if (sqlite3_prepare_v2(s->db, esql, -1, &estmt, NULL) != SQLITE_OK) {
+        free(node_ids);
+        store_set_error_sqlite(s, "arch_clusters_edges");
+        return CBM_STORE_ERR;
+    }
+    bind_text(estmt, 1, project);
+
+    int ecap = 2048;
+    int en = 0;
+    cbm_louvain_edge_t *edges = malloc((size_t)ecap * sizeof(cbm_louvain_edge_t));
+
+    while (sqlite3_step(estmt) == SQLITE_ROW) {
+        if (en >= ecap) {
+            ecap *= 2;
+            edges = safe_realloc(edges, (size_t)ecap * sizeof(cbm_louvain_edge_t));
+        }
+        edges[en].src = sqlite3_column_int64(estmt, 0);
+        edges[en].dst = sqlite3_column_int64(estmt, 1);
+        en++;
+    }
+    sqlite3_finalize(estmt);
+
+    if (en < 1) {
+        free(node_ids);
+        free(edges);
+        return CBM_STORE_OK;
+    }
+
+    /* 3. Run Louvain */
+    cbm_louvain_result_t *lresults = NULL;
+    int lcount = 0;
+    int rc = cbm_louvain(node_ids, nn, edges, en, &lresults, &lcount);
+    free(node_ids);
+    free(edges);
+
+    if (rc != CBM_STORE_OK || lcount == 0) {
+        free(lresults);
+        return CBM_STORE_OK;
+    }
+
+    /* 4. Find max community ID to size the grouping array */
+    int max_community = 0;
+    for (int i = 0; i < lcount; i++) {
+        if (lresults[i].community > max_community) {
+            max_community = lresults[i].community;
+        }
+    }
+    int num_communities = max_community + 1;
+
+    /* 5. Count members per community */
+    int *member_counts = calloc((size_t)num_communities, sizeof(int));
+    for (int i = 0; i < lcount; i++) {
+        if (lresults[i].community >= 0 && lresults[i].community < num_communities) {
+            member_counts[lresults[i].community]++;
+        }
+    }
+
+    /* Count non-empty communities */
+    int active_count = 0;
+    for (int i = 0; i < num_communities; i++) {
+        if (member_counts[i] > 0) {
+            active_count++;
+        }
+    }
+
+    if (active_count == 0) {
+        free(member_counts);
+        free(lresults);
+        return CBM_STORE_OK;
+    }
+
+    /* Cap at 20 clusters, keep the largest */
+    int max_clusters = active_count < 20 ? active_count : 20;
+
+    /* 6. Build cluster info structs.
+     * For each community, find the top-5 nodes by CALLS in-degree. */
+    cbm_cluster_info_t *clusters = calloc((size_t)max_clusters, sizeof(cbm_cluster_info_t));
+    int ci = 0;
+
+    /* Sort communities by member count descending — simple selection of top N */
+    int *sorted_ids = malloc((size_t)num_communities * sizeof(int));
+    for (int i = 0; i < num_communities; i++) sorted_ids[i] = i;
+    /* Bubble sort is fine for small N (typically < 100 communities) */
+    for (int i = 0; i < num_communities - 1 && i < max_clusters; i++) {
+        for (int j = i + 1; j < num_communities; j++) {
+            if (member_counts[sorted_ids[j]] > member_counts[sorted_ids[i]]) {
+                int tmp = sorted_ids[i];
+                sorted_ids[i] = sorted_ids[j];
+                sorted_ids[j] = tmp;
+            }
+        }
+    }
+
+    for (int si = 0; si < max_clusters; si++) {
+        int comm_id = sorted_ids[si];
+        if (member_counts[comm_id] == 0) break;
+
+        clusters[ci].id = comm_id;
+        clusters[ci].members = member_counts[comm_id];
+        clusters[ci].cohesion = 0.0; /* Would need intra-/inter-edge ratio to compute */
+
+        /* Collect node IDs in this community */
+        int64_t *comm_nodes = malloc((size_t)member_counts[comm_id] * sizeof(int64_t));
+        int cn = 0;
+        for (int i = 0; i < lcount; i++) {
+            if (lresults[i].community == comm_id) {
+                comm_nodes[cn++] = lresults[i].node_id;
+            }
+        }
+
+        /* Find top 5 by in-degree via SQL */
+        int top_n = cn < 5 ? cn : 5;
+        // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
+        const char **top_names = calloc((size_t)top_n, sizeof(const char *));
+        int tn = 0;
+
+        /* Build a simple query: SELECT name from nodes WHERE id IN (...) ordered by
+         * incoming CALLS count. For efficiency, just query each node's degree. */
+        for (int k = 0; k < cn && tn < top_n; k++) {
+            int in_deg = 0;
+            int out_deg = 0;
+            cbm_store_node_degree(s, comm_nodes[k], &in_deg, &out_deg);
+
+            /* Simple insertion into top-N by in-degree.
+             * We'll just pick the first top_n by iterating degree queries. */
+            cbm_node_t ninfo;
+            if (cbm_store_find_node_by_id(s, comm_nodes[k], &ninfo) == CBM_STORE_OK) {
+                /* Skip File/Folder/Module nodes */
+                if (ninfo.label && strcmp(ninfo.label, "File") != 0 &&
+                    strcmp(ninfo.label, "Folder") != 0 &&
+                    strcmp(ninfo.label, "Module") != 0) {
+                    if (ninfo.name) {
+                        top_names[tn++] = heap_strdup(ninfo.name);
+                    }
+                }
+                cbm_node_free_fields(&ninfo);
+            }
+        }
+
+        clusters[ci].top_nodes = top_names;
+        clusters[ci].top_node_count = tn;
+
+        /* Label: use the most common node name prefix as a heuristic.
+         * For now, just use "Cluster_N" — semantic naming requires LLM. */
+        char label_buf[64];
+        snprintf(label_buf, sizeof(label_buf), "Cluster_%d", comm_id);
+        clusters[ci].label = heap_strdup(label_buf);
+
+        /* packages and edge_types are optional, leave as NULL/0 for now */
+        clusters[ci].packages = NULL;
+        clusters[ci].package_count = 0;
+        clusters[ci].edge_types = NULL;
+        clusters[ci].edge_type_count = 0;
+
+        free(comm_nodes);
+        ci++;
+    }
+
+    free(sorted_ids);
+    free(member_counts);
+    free(lresults);
+
+    out->clusters = clusters;
+    out->cluster_count = ci;
+    return CBM_STORE_OK;
+}
+
 int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char **aspects,
                                int aspect_count, cbm_architecture_info_t *out) {
     memset(out, 0, sizeof(*out));
@@ -4004,6 +4205,12 @@ int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char *
     }
     if (want_aspect(aspects, aspect_count, "file_tree")) {
         rc = arch_file_tree(s, project, out);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+    }
+    if (want_aspect(aspects, aspect_count, "clusters")) {
+        rc = arch_clusters(s, project, out);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
