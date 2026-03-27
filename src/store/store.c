@@ -2058,16 +2058,25 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         }
 
         char fts_sql[4096];
-        /* Join with FTS5 table, filter by project/label, order by BM25 rank */
+        /* Join with FTS5 table, filter by project/label, order by BM25 rank.
+         * Exclude noise labels (File, Folder, Module, Section, Variable, Project)
+         * and boost Function/Method/Class via a structural score added to BM25. */
         int flen = snprintf(fts_sql, sizeof(fts_sql),
             "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
             "n.file_path, n.start_line, n.end_line, n.properties, "
             "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.type = 'CALLS') AS in_deg, "
             "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND e.type = 'CALLS') AS out_deg, "
-            "bm25(nodes_fts) AS rank "
+            "(bm25(nodes_fts) "
+            " - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
+            "        WHEN n.label IN ('Class','Interface','Type') THEN 5.0 "
+            "        WHEN n.label = 'Route' THEN 8.0 "
+            "        ELSE 0.0 END "
+            " - CASE WHEN (SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.type = 'CALLS') > 5 THEN 3.0 ELSE 0.0 END"
+            ") AS rank "
             "FROM nodes_fts "
             "JOIN nodes n ON n.id = nodes_fts.rowid "
-            "WHERE nodes_fts MATCH ?1");
+            "WHERE nodes_fts MATCH ?1"
+            " AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project')");
 
         int fts_bind_idx = 1;
         if (params->project) {
@@ -2085,12 +2094,14 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         flen += snprintf(fts_sql + flen, sizeof(fts_sql) - flen,
                          " ORDER BY rank LIMIT %d OFFSET %d", limit, params->offset);
 
-        /* Count query */
+        /* Count query — same exclusions as main query */
         char fts_count[4096];
         snprintf(fts_count, sizeof(fts_count),
                  "SELECT COUNT(*) FROM nodes_fts "
                  "JOIN nodes n ON n.id = nodes_fts.rowid "
-                 "WHERE nodes_fts MATCH ?1%s%s",
+                 "WHERE nodes_fts MATCH ?1"
+                 " AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project')"
+                 "%s%s",
                  params->project ? " AND n.project = ?2" : "",
                  params->label ? (params->project ? " AND n.label = ?3" : " AND n.label = ?2") : "");
 
@@ -4612,14 +4623,34 @@ int cbm_store_detect_processes(cbm_store_t *s, const char *project, int max_proc
     for (int ei = 0; ei < ep_count && proc_count < max_processes; ei++) {
         const char *bfs_types[] = {"CALLS"};
         cbm_traverse_result_t tr = {0};
-        cbm_store_bfs(s, ep_ids[ei], "outbound", bfs_types, 1, 8, 200, &tr);
+        cbm_store_bfs(s, ep_ids[ei], "outbound", bfs_types, 1, 8, 50, &tr);
 
         if (tr.visited_count < 2) {
             cbm_store_traverse_free(&tr);
             continue;
         }
 
-        /* Find deepest cross-community node */
+        /* Find the best cross-community terminal node.
+         * Instead of just picking the deepest hop (which gives generic utility functions
+         * like "update", "findOne"), score candidates by domain specificity:
+         * - Longer names score higher (domain-specific names are longer)
+         * - Generic names (update, get, set, find, create, delete, push, pop, error,
+         *   log, emit, send, save, load, init, close, open) score 0
+         * - Names starting with uppercase score higher (likely domain classes/handlers) */
+        static const char *generic_names[] = {
+            "update", "get", "set", "find", "findOne", "findAll", "create", "delete",
+            "push", "pop", "error", "log", "emit", "send", "save", "load", "init",
+            "close", "open", "call", "apply", "bind", "then", "catch", "resolve",
+            "reject", "next", "done", "callback", "handler", "run", "execute",
+            "start", "stop", "reset", "clear", "add", "remove", "insert",
+            "forEach", "map", "filter", "reduce", "assign", "merge", "clone",
+            "parse", "format", "validate", "check", "test", "assert",
+            "toString", "valueOf", "toJSON", "default", "index", "main",
+            "getInstance", "getConnection", "getConfig", "getLogger",
+            "request", "response", "query", "result", "data", "value",
+            "defaultFilter", "_refreshCookies", NULL
+        };
+
         int ep_comm = -1;
         for (int c = 0; c < comm_size; c++) {
             if (comm_nids[c] == ep_ids[ei]) { ep_comm = comm_vals[c]; break; }
@@ -4627,7 +4658,7 @@ int cbm_store_detect_processes(cbm_store_t *s, const char *project, int max_proc
 
         int64_t terminal_id = ep_ids[ei];
         const char *terminal_name = ep_names[ei];
-        int max_hop = 0;
+        int best_score = -1;
         bool is_cross = false;
 
         for (int v = 0; v < tr.visited_count; v++) {
@@ -4636,10 +4667,41 @@ int cbm_store_detect_processes(cbm_store_t *s, const char *project, int max_proc
                 if (comm_nids[c] == tr.visited[v].node.id) { node_comm = comm_vals[c]; break; }
             }
             if (node_comm != ep_comm && node_comm >= 0 && ep_comm >= 0) {
-                if (tr.visited[v].hop > max_hop) {
-                    max_hop = tr.visited[v].hop;
+                const char *nm = tr.visited[v].node.name;
+                if (!nm) continue;
+
+                /* Score: name length * 10 + hop * 5, minus penalty for generics */
+                int score = (int)strlen(nm) * 10 + tr.visited[v].hop * 5;
+
+                /* Penalty for generic names */
+                bool is_generic = false;
+                for (int g = 0; generic_names[g]; g++) {
+                    if (strcmp(nm, generic_names[g]) == 0) {
+                        is_generic = true;
+                        break;
+                    }
+                }
+                if (is_generic) score = 0;
+
+                /* Bonus for CamelCase names starting with uppercase (domain handlers) */
+                if (nm[0] >= 'A' && nm[0] <= 'Z') score += 50;
+
+                /* Bonus for names containing domain verbs */
+                if (strstr(nm, "Handler") || strstr(nm, "Controller") ||
+                    strstr(nm, "Service") || strstr(nm, "Storage") ||
+                    strstr(nm, "Plugin") || strstr(nm, "Middleware") ||
+                    strstr(nm, "Permission") || strstr(nm, "Authorization") ||
+                    strstr(nm, "Scope") || strstr(nm, "Role") ||
+                    strstr(nm, "Session") || strstr(nm, "User") ||
+                    strstr(nm, "Course") || strstr(nm, "Evaluation") ||
+                    strstr(nm, "Scenario")) {
+                    score += 100;
+                }
+
+                if (score > best_score) {
+                    best_score = score;
                     terminal_id = tr.visited[v].node.id;
-                    terminal_name = tr.visited[v].node.name ? tr.visited[v].node.name : "?";
+                    terminal_name = nm;
                     is_cross = true;
                 }
             }

@@ -1509,6 +1509,17 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         best_idx = class_idx;
     }
 
+    /* Track disambiguation info — added to the main doc after creation */
+    int callable_count = 0;
+    for (int i = 0; i < node_count; i++) {
+        const char *lbl = nodes[i].label;
+        if (lbl && strcmp(lbl, "File") != 0 && strcmp(lbl, "Folder") != 0 &&
+            strcmp(lbl, "Module") != 0 && strcmp(lbl, "Variable") != 0 &&
+            strcmp(lbl, "Section") != 0 && strcmp(lbl, "Project") != 0) {
+            callable_count++;
+        }
+    }
+
     /* Determine if the selected node is a Class or Interface. If so, we need to
      * resolve through DEFINES_METHOD edges to find the actual callable methods,
      * then run BFS from each method and merge results. */
@@ -1563,6 +1574,35 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_str(doc, root, "function", func_name);
     yyjson_mut_obj_add_str(doc, root, "direction", direction);
 
+    /* Add matched node info */
+    yyjson_mut_obj_add_strcpy(doc, root, "matched_file",
+                              nodes[best_idx].file_path ? nodes[best_idx].file_path : "");
+    yyjson_mut_obj_add_strcpy(doc, root, "matched_label",
+                              nodes[best_idx].label ? nodes[best_idx].label : "");
+    yyjson_mut_obj_add_int(doc, root, "matched_line", nodes[best_idx].start_line);
+
+    /* Disambiguation: list all callable candidates when multiple match */
+    if (callable_count > 1) {
+        yyjson_mut_val *cands = yyjson_mut_arr(doc);
+        for (int i = 0; i < node_count; i++) {
+            const char *lbl = nodes[i].label;
+            if (lbl && strcmp(lbl, "File") != 0 && strcmp(lbl, "Folder") != 0 &&
+                strcmp(lbl, "Module") != 0 && strcmp(lbl, "Variable") != 0 &&
+                strcmp(lbl, "Section") != 0 && strcmp(lbl, "Project") != 0) {
+                yyjson_mut_val *ci = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, ci, "name",
+                                          nodes[i].name ? nodes[i].name : "");
+                yyjson_mut_obj_add_strcpy(doc, ci, "label",
+                                          nodes[i].label ? nodes[i].label : "");
+                yyjson_mut_obj_add_strcpy(doc, ci, "file_path",
+                                          nodes[i].file_path ? nodes[i].file_path : "");
+                yyjson_mut_obj_add_int(doc, ci, "line", nodes[i].start_line);
+                yyjson_mut_arr_add_val(cands, ci);
+            }
+        }
+        yyjson_mut_obj_add_val(doc, root, "candidates", cands);
+    }
+
     /* Include HTTP_CALLS and ASYNC_CALLS alongside CALLS for broader coverage */
     const char *edge_types[] = {"CALLS", "HTTP_CALLS", "ASYNC_CALLS"};
     int edge_type_count = 3;
@@ -1591,15 +1631,15 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             cbm_store_bfs(store, start_ids[s], "outbound", edge_types, edge_type_count, depth, 100,
                           &all_tr_out[s]);
             for (int i = 0; i < all_tr_out[s].visited_count; i++) {
+                cbm_node_t *vn = &all_tr_out[s].visited[i].node;
                 yyjson_mut_val *item = yyjson_mut_obj(doc);
-                yyjson_mut_obj_add_str(
-                    doc, item, "name",
-                    all_tr_out[s].visited[i].node.name ? all_tr_out[s].visited[i].node.name : "");
-                yyjson_mut_obj_add_str(
-                    doc, item, "qualified_name",
-                    all_tr_out[s].visited[i].node.qualified_name
-                        ? all_tr_out[s].visited[i].node.qualified_name
-                        : "");
+                yyjson_mut_obj_add_str(doc, item, "name", vn->name ? vn->name : "");
+                yyjson_mut_obj_add_str(doc, item, "qualified_name",
+                                       vn->qualified_name ? vn->qualified_name : "");
+                yyjson_mut_obj_add_str(doc, item, "file_path",
+                                       vn->file_path ? vn->file_path : "");
+                yyjson_mut_obj_add_str(doc, item, "label", vn->label ? vn->label : "");
+                yyjson_mut_obj_add_int(doc, item, "line", vn->start_line);
                 yyjson_mut_obj_add_int(doc, item, "hop", all_tr_out[s].visited[i].hop);
                 yyjson_mut_arr_add_val(callees, item);
             }
@@ -1616,15 +1656,15 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             cbm_store_bfs(store, start_ids[s], "inbound", edge_types, edge_type_count, depth, 100,
                           &all_tr_in[s]);
             for (int i = 0; i < all_tr_in[s].visited_count; i++) {
+                cbm_node_t *vn = &all_tr_in[s].visited[i].node;
                 yyjson_mut_val *item = yyjson_mut_obj(doc);
-                yyjson_mut_obj_add_str(
-                    doc, item, "name",
-                    all_tr_in[s].visited[i].node.name ? all_tr_in[s].visited[i].node.name : "");
-                yyjson_mut_obj_add_str(
-                    doc, item, "qualified_name",
-                    all_tr_in[s].visited[i].node.qualified_name
-                        ? all_tr_in[s].visited[i].node.qualified_name
-                        : "");
+                yyjson_mut_obj_add_str(doc, item, "name", vn->name ? vn->name : "");
+                yyjson_mut_obj_add_str(doc, item, "qualified_name",
+                                       vn->qualified_name ? vn->qualified_name : "");
+                yyjson_mut_obj_add_str(doc, item, "file_path",
+                                       vn->file_path ? vn->file_path : "");
+                yyjson_mut_obj_add_str(doc, item, "label", vn->label ? vn->label : "");
+                yyjson_mut_obj_add_int(doc, item, "line", vn->start_line);
                 yyjson_mut_obj_add_int(doc, item, "hop", all_tr_in[s].visited[i].hop);
                 yyjson_mut_arr_add_val(callers, item);
             }
