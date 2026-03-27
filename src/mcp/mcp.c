@@ -1169,6 +1169,12 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     int node_count = cbm_store_count_nodes(store, project);
     int edge_count = cbm_store_count_edges(store, project);
 
+    /* Call the full architecture analysis */
+    cbm_architecture_info_t arch = {0};
+    const char *all_aspects[] = {"languages", "hotspots", "routes", "entry_points",
+                                 "packages", "clusters", "layers", "boundaries"};
+    cbm_store_get_architecture(store, project, all_aspects, 8, &arch);
+
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
@@ -1199,6 +1205,105 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     }
     yyjson_mut_obj_add_val(doc, root, "edge_types", types);
 
+    /* Languages */
+    if (arch.language_count > 0) {
+        yyjson_mut_val *langs = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.language_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, item, "language",
+                                      arch.languages[i].language ? arch.languages[i].language : "");
+            yyjson_mut_obj_add_int(doc, item, "files", arch.languages[i].file_count);
+            yyjson_mut_arr_add_val(langs, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "languages", langs);
+    }
+
+    /* Hotspots (high fan-in functions) */
+    if (arch.hotspot_count > 0) {
+        yyjson_mut_val *spots = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.hotspot_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, item, "name",
+                                      arch.hotspots[i].name ? arch.hotspots[i].name : "");
+            yyjson_mut_obj_add_strcpy(
+                doc, item, "qualified_name",
+                arch.hotspots[i].qualified_name ? arch.hotspots[i].qualified_name : "");
+            yyjson_mut_obj_add_int(doc, item, "fan_in", arch.hotspots[i].fan_in);
+            yyjson_mut_arr_add_val(spots, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "hotspots", spots);
+    }
+
+    /* Routes */
+    if (arch.route_count > 0) {
+        yyjson_mut_val *routes_arr = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.route_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, item, "method",
+                                      arch.routes[i].method ? arch.routes[i].method : "");
+            yyjson_mut_obj_add_strcpy(doc, item, "path",
+                                      arch.routes[i].path ? arch.routes[i].path : "");
+            yyjson_mut_obj_add_strcpy(doc, item, "handler",
+                                      arch.routes[i].handler ? arch.routes[i].handler : "");
+            yyjson_mut_arr_add_val(routes_arr, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "routes", routes_arr);
+    }
+
+    /* Entry points */
+    if (arch.entry_point_count > 0) {
+        yyjson_mut_val *eps = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.entry_point_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, item, "name",
+                                      arch.entry_points[i].name ? arch.entry_points[i].name : "");
+            yyjson_mut_obj_add_strcpy(
+                doc, item, "qualified_name",
+                arch.entry_points[i].qualified_name ? arch.entry_points[i].qualified_name : "");
+            yyjson_mut_obj_add_strcpy(doc, item, "file",
+                                      arch.entry_points[i].file ? arch.entry_points[i].file : "");
+            yyjson_mut_arr_add_val(eps, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "entry_points", eps);
+    }
+
+    /* Packages */
+    if (arch.package_count > 0) {
+        yyjson_mut_val *pkgs = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.package_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, item, "name",
+                                      arch.packages[i].name ? arch.packages[i].name : "");
+            yyjson_mut_obj_add_int(doc, item, "node_count", arch.packages[i].node_count);
+            yyjson_mut_obj_add_int(doc, item, "fan_in", arch.packages[i].fan_in);
+            yyjson_mut_obj_add_int(doc, item, "fan_out", arch.packages[i].fan_out);
+            yyjson_mut_arr_add_val(pkgs, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "packages", pkgs);
+    }
+
+    /* Clusters */
+    if (arch.cluster_count > 0) {
+        yyjson_mut_val *cls = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.cluster_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_int(doc, item, "id", arch.clusters[i].id);
+            yyjson_mut_obj_add_strcpy(doc, item, "label",
+                                      arch.clusters[i].label ? arch.clusters[i].label : "");
+            yyjson_mut_obj_add_int(doc, item, "members", arch.clusters[i].members);
+            yyjson_mut_obj_add_real(doc, item, "cohesion", arch.clusters[i].cohesion);
+            if (arch.clusters[i].top_node_count > 0) {
+                yyjson_mut_val *tn = yyjson_mut_arr(doc);
+                for (int j = 0; j < arch.clusters[i].top_node_count; j++) {
+                    yyjson_mut_arr_add_strcpy(doc, tn, arch.clusters[i].top_nodes[j]);
+                }
+                yyjson_mut_obj_add_val(doc, item, "top_nodes", tn);
+            }
+            yyjson_mut_arr_add_val(cls, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "clusters", cls);
+    }
+
     /* Relationship patterns */
     if (schema.rel_pattern_count > 0) {
         yyjson_mut_val *pats = yyjson_mut_arr(doc);
@@ -1210,6 +1315,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+    cbm_store_architecture_free(&arch);
     cbm_store_schema_free(&schema);
     free(project);
 
