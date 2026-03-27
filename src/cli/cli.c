@@ -15,6 +15,9 @@
 #include <signal.h>
 #include <unistd.h>
 #endif
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #include "foundation/compat_fs.h"
 
 #ifndef CBM_VERSION
@@ -175,8 +178,13 @@ const char *cbm_find_cli(const char *name, const char *home_dir) {
         char path_copy[4096];
         snprintf(path_copy, sizeof(path_copy), "%s", path_env);
         char *saveptr;
+#ifdef _WIN32
+        const char *path_sep = ";";
+#else
+        const char *path_sep = ":";
+#endif
         // NOLINTNEXTLINE(misc-include-cleaner) — strtok_r provided by standard header
-        char *dir = strtok_r(path_copy, ":", &saveptr);
+        char *dir = strtok_r(path_copy, path_sep, &saveptr);
         while (dir) {
             snprintf(buf, sizeof(buf), "%s/%s", dir, name);
             struct stat st;
@@ -184,7 +192,14 @@ const char *cbm_find_cli(const char *name, const char *home_dir) {
             if (stat(buf, &st) == 0 && (st.st_mode & S_IXUSR)) {
                 return buf;
             }
-            dir = strtok_r(NULL, ":", &saveptr);
+#ifdef _WIN32
+            /* On Windows, also try with .exe extension */
+            snprintf(buf, sizeof(buf), "%s/%s.exe", dir, name);
+            if (stat(buf, &st) == 0) {
+                return buf;
+            }
+#endif
+            dir = strtok_r(NULL, path_sep, &saveptr);
         }
     }
 
@@ -218,6 +233,15 @@ const char *cbm_find_cli(const char *name, const char *home_dir) {
                 snprintf(buf, sizeof(buf), "%s", paths[i]);
                 return buf;
             }
+#ifdef _WIN32
+            /* On Windows, also try with .exe extension */
+            char exe_path[512];
+            snprintf(exe_path, sizeof(exe_path), "%s.exe", paths[i]);
+            if (stat(exe_path, &st) == 0) {
+                snprintf(buf, sizeof(buf), "%s", exe_path);
+                return buf;
+            }
+#endif
         }
     }
 
@@ -2689,13 +2713,29 @@ int cbm_cmd_install(int argc, char **argv) {
     }
 #endif
 
-    /* Step 2: Binary path */
-    char self_path[1024];
+    /* Step 2: Binary path — detect actual location at runtime */
+    char self_path[1024] = {0};
 #ifdef _WIN32
-    snprintf(self_path, sizeof(self_path), "%s/.local/bin/codebase-memory-mcp.exe", home);
+    GetModuleFileNameA(NULL, self_path, sizeof(self_path));
+    /* Normalize backslashes to forward slashes for JSON configs */
+    cbm_normalize_path_sep(self_path);
+#elif defined(__APPLE__)
+    uint32_t sp_sz = sizeof(self_path);
+    if (_NSGetExecutablePath(self_path, &sp_sz) != 0)
+        self_path[0] = '\0';
 #else
-    snprintf(self_path, sizeof(self_path), "%s/.local/bin/codebase-memory-mcp", home);
+    ssize_t sp_len = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
+    if (sp_len > 0)
+        self_path[sp_len] = '\0';
 #endif
+    /* Fallback to assumed ~/.local/bin/ if runtime detection failed */
+    if (!self_path[0]) {
+#ifdef _WIN32
+        snprintf(self_path, sizeof(self_path), "%s/.local/bin/codebase-memory-mcp.exe", home);
+#else
+        snprintf(self_path, sizeof(self_path), "%s/.local/bin/codebase-memory-mcp", home);
+#endif
+    }
 
     /* Step 3: Install/refresh all agent configs */
     cbm_install_agent_configs(home, self_path, force, dry_run);
