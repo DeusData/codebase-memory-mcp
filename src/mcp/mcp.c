@@ -1672,6 +1672,62 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_val(doc, root, "callers", callers);
     }
 
+    /* Add process participation: which execution flows does the traced node appear in? */
+    {
+        cbm_process_info_t *procs = NULL;
+        int pcount = 0;
+        cbm_store_list_processes(store, project, &procs, &pcount);
+
+        if (pcount > 0) {
+            yyjson_mut_val *flows = yyjson_mut_arr(doc);
+            int flow_count = 0;
+
+            /* Check each process for participation by the traced node.
+             * Match by name (case-insensitive) since the process may store
+             * a different node ID for the same logical function. */
+            for (int pi = 0; pi < pcount && flow_count < 20; pi++) {
+                bool participates = false;
+                /* Check original matched node by ID */
+                if (procs[pi].entry_point_id == nodes[best_idx].id ||
+                    procs[pi].terminal_id == nodes[best_idx].id) {
+                    participates = true;
+                }
+                /* Check start_ids (method IDs for class resolution) */
+                if (!participates) {
+                    for (int si = 0; si < start_id_count; si++) {
+                        if (procs[pi].entry_point_id == start_ids[si] ||
+                            procs[pi].terminal_id == start_ids[si]) {
+                            participates = true;
+                            break;
+                        }
+                    }
+                }
+                /* Fallback: match by function name in the process label */
+                if (!participates && func_name && procs[pi].label) {
+                    /* Process labels are "EntryName → TerminalName" */
+                    if (strstr(procs[pi].label, func_name) != NULL) {
+                        participates = true;
+                    }
+                }
+                if (participates) {
+                    yyjson_mut_val *fi = yyjson_mut_obj(doc);
+                    yyjson_mut_obj_add_strcpy(doc, fi, "label",
+                                              procs[pi].label ? procs[pi].label : "");
+                    yyjson_mut_obj_add_strcpy(doc, fi, "process_type",
+                                              procs[pi].process_type ? procs[pi].process_type : "");
+                    yyjson_mut_obj_add_int(doc, fi, "step_count", procs[pi].step_count);
+                    yyjson_mut_arr_add_val(flows, fi);
+                    flow_count++;
+                }
+            }
+
+            if (flow_count > 0) {
+                yyjson_mut_obj_add_val(doc, root, "processes", flows);
+            }
+        }
+        cbm_store_free_processes(procs, pcount);
+    }
+
     /* Serialize BEFORE freeing traversal results (yyjson borrows strings) */
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);

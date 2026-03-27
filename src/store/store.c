@@ -4328,11 +4328,113 @@ static int arch_clusters(cbm_store_t *s, const char *project, cbm_architecture_i
         clusters[ci].top_nodes = top_names;
         clusters[ci].top_node_count = tn;
 
-        /* Label: use the most common node name prefix as a heuristic.
-         * For now, just use "Cluster_N" — semantic naming requires LLM. */
-        char label_buf[64];
-        snprintf(label_buf, sizeof(label_buf), "Cluster_%d", comm_id);
-        clusters[ci].label = heap_strdup(label_buf);
+        /* Derive semantic label from most common directory in member file paths.
+         * E.g. members in controllers/ → "Controllers", components/ → "Components" */
+        {
+            /* Query file paths for a sample of cluster members */
+            char dir_counts[64][64]; /* directory names */
+            int dir_freqs[64];       /* frequency counts */
+            int dir_n = 0;
+            memset(dir_freqs, 0, sizeof(dir_freqs));
+
+            int sample_limit = cn < 50 ? cn : 50;
+            for (int k = 0; k < sample_limit; k++) {
+                cbm_node_t ni;
+                if (cbm_store_find_node_by_id(s, comm_nodes[k], &ni) == CBM_STORE_OK) {
+                    if (ni.file_path && ni.file_path[0]) {
+                        /* Extract the deepest meaningful directory segment.
+                         * E.g. "src/controllers/users-controller.ts" → "controllers" */
+                        const char *fp = ni.file_path;
+                        const char *best_dir = NULL;
+                        const char *p2 = fp;
+                        const char *prev_slash = NULL;
+                        while (*p2) {
+                            if (*p2 == '/') {
+                                if (prev_slash) {
+                                    /* Extract segment between prev_slash+1 and p2 */
+                                    int slen = (int)(p2 - prev_slash - 1);
+                                    if (slen > 0 && slen < 60) {
+                                        /* Skip generic dirs: src, lib, dist, build, test, node_modules */
+                                        char seg[64];
+                                        memcpy(seg, prev_slash + 1, (size_t)slen);
+                                        seg[slen] = '\0';
+                                        if (strcmp(seg, "src") != 0 && strcmp(seg, "lib") != 0 &&
+                                            strcmp(seg, "dist") != 0 && strcmp(seg, "build") != 0 &&
+                                            strcmp(seg, "node_modules") != 0 &&
+                                            strcmp(seg, "test") != 0 && strcmp(seg, "tests") != 0 &&
+                                            strcmp(seg, "shared") != 0 && strcmp(seg, "utils") != 0 &&
+                                            strcmp(seg, "internal") != 0 && strcmp(seg, "generated") != 0) {
+                                            best_dir = prev_slash + 1;
+                                        }
+                                    }
+                                }
+                                prev_slash = p2;
+                            }
+                            p2++;
+                        }
+                        if (best_dir) {
+                            const char *end = strchr(best_dir, '/');
+                            int dlen = end ? (int)(end - best_dir) : (int)strlen(best_dir);
+                            if (dlen > 0 && dlen < 60) {
+                                char dname[64];
+                                memcpy(dname, best_dir, (size_t)dlen);
+                                dname[dlen] = '\0';
+                                /* Find or add to dir_counts */
+                                bool found_dir = false;
+                                for (int d = 0; d < dir_n; d++) {
+                                    if (strcmp(dir_counts[d], dname) == 0) {
+                                        dir_freqs[d]++;
+                                        found_dir = true;
+                                        break;
+                                    }
+                                }
+                                if (!found_dir && dir_n < 64) {
+                                    strncpy(dir_counts[dir_n], dname, 63);
+                                    dir_counts[dir_n][63] = '\0';
+                                    dir_freqs[dir_n] = 1;
+                                    dir_n++;
+                                }
+                            }
+                        }
+                    }
+                    cbm_node_free_fields(&ni);
+                }
+            }
+
+            /* Pick the most frequent directory name */
+            char label_buf[64];
+            int best_freq = 0;
+            int best_di = -1;
+            for (int d = 0; d < dir_n; d++) {
+                if (dir_freqs[d] > best_freq) {
+                    best_freq = dir_freqs[d];
+                    best_di = d;
+                }
+            }
+            if (best_di >= 0 && best_freq >= 3) {
+                /* Capitalize first letter */
+                char cap_name[64];
+                strncpy(cap_name, dir_counts[best_di], sizeof(cap_name) - 1);
+                cap_name[sizeof(cap_name) - 1] = '\0';
+                if (cap_name[0] >= 'a' && cap_name[0] <= 'z') {
+                    cap_name[0] = cap_name[0] - 'a' + 'A';
+                }
+                /* Convert kebab-case to TitleCase: "users-controller" → "UsersController" */
+                for (int j = 0; cap_name[j]; j++) {
+                    if (cap_name[j] == '-' && cap_name[j + 1]) {
+                        /* Remove dash and capitalize next */
+                        memmove(&cap_name[j], &cap_name[j + 1], strlen(&cap_name[j + 1]) + 1);
+                        if (cap_name[j] >= 'a' && cap_name[j] <= 'z') {
+                            cap_name[j] = cap_name[j] - 'a' + 'A';
+                        }
+                    }
+                }
+                snprintf(label_buf, sizeof(label_buf), "%s", cap_name);
+            } else {
+                snprintf(label_buf, sizeof(label_buf), "Cluster_%d", comm_id);
+            }
+            clusters[ci].label = heap_strdup(label_buf);
+        }
 
         /* packages and edge_types are optional, leave as NULL/0 for now */
         clusters[ci].packages = NULL;
