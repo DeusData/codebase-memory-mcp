@@ -2602,7 +2602,10 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
             continue;
         }
 
-        yyjson_mut_arr_add_str(doc, changed, line);
+        /* Use strcpy variants: line is a stack buffer reused each iteration,
+         * and node strings are freed by cbm_store_free_nodes below.
+         * yyjson_mut_*_add_str only borrows pointers — strcpy makes copies. */
+        yyjson_mut_arr_add_strcpy(doc, changed, line);
         file_count++;
 
         /* Find symbols defined in this file */
@@ -2614,9 +2617,9 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
             if (nodes[i].label && strcmp(nodes[i].label, "File") != 0 &&
                 strcmp(nodes[i].label, "Folder") != 0 && strcmp(nodes[i].label, "Project") != 0) {
                 yyjson_mut_val *item = yyjson_mut_obj(doc);
-                yyjson_mut_obj_add_str(doc, item, "name", nodes[i].name ? nodes[i].name : "");
-                yyjson_mut_obj_add_str(doc, item, "label", nodes[i].label);
-                yyjson_mut_obj_add_str(doc, item, "file", line);
+                yyjson_mut_obj_add_strcpy(doc, item, "name", nodes[i].name ? nodes[i].name : "");
+                yyjson_mut_obj_add_strcpy(doc, item, "label", nodes[i].label);
+                yyjson_mut_obj_add_strcpy(doc, item, "file", line);
                 yyjson_mut_arr_add_val(impacted, item);
             }
         }
