@@ -1,0 +1,192 @@
+name: Build & Test Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Build version tag (e.g. v0.5.7-fix1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Lint ──────────────────────────────────────────────────────
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev cmake
+
+      - name: Install LLVM 20
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" | sudo tee /etc/apt/sources.list.d/llvm-20.list
+          sudo apt-get update
+          sudo apt-get install -y clang-format-20
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: cppcheck-cache
+        with:
+          path: /opt/cppcheck
+          key: cppcheck-2.20.0-ubuntu-amd64
+
+      - name: Build cppcheck 2.20.0
+        if: steps.cppcheck-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch 2.20.0 https://github.com/danmar/cppcheck.git /tmp/cppcheck
+          cmake -S /tmp/cppcheck -B /tmp/cppcheck/build -DCMAKE_BUILD_TYPE=Release -DHAVE_RULES=OFF -DCMAKE_INSTALL_PREFIX=/opt/cppcheck
+          cmake --build /tmp/cppcheck/build -j$(nproc)
+          cmake --install /tmp/cppcheck/build
+
+      - name: Add cppcheck to PATH
+        run: echo "/opt/cppcheck/bin" >> "$GITHUB_PATH"
+
+      - name: Lint
+        run: scripts/lint.sh CLANG_FORMAT=clang-format-20
+
+  # ── Unit tests (Windows) ──────────────────────────────────────
+  test-windows:
+    needs: [lint]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-compiler-rt
+            mingw-w64-clang-x86_64-zlib
+            make
+
+      - name: Test
+        shell: msys2 {0}
+        run: scripts/test.sh CC=clang CXX=clang++
+
+  # ── Build Windows binaries ────────────────────────────────────
+  build-windows:
+    needs: [test-windows]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-zlib
+            make
+            zip
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: "22"
+
+      - name: Build standard binary
+        shell: msys2 {0}
+        run: scripts/build.sh --version ${{ inputs.version }} CC=clang CXX=clang++
+
+      - name: Archive standard binary
+        shell: msys2 {0}
+        run: |
+          BIN=build/c/codebase-memory-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          cp "$BIN" codebase-memory-mcp.exe
+          zip codebase-memory-mcp-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1
+
+      - name: Build UI binary
+        shell: msys2 {0}
+        run: scripts/build.sh --with-ui --version ${{ inputs.version }} CC=clang CXX=clang++
+
+      - name: Archive UI binary
+        shell: msys2 {0}
+        run: |
+          BIN=build/c/codebase-memory-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          cp "$BIN" codebase-memory-mcp.exe
+          zip codebase-memory-mcp-ui-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: binaries-windows-amd64
+          path: "*.zip"
+
+  # ── Smoke test Windows binaries ───────────────────────────────
+  smoke-windows:
+    needs: [build-windows]
+    strategy:
+      matrix:
+        variant: [standard, ui]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-python3
+            unzip
+            zip
+            coreutils
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: binaries-windows-amd64
+
+      - name: Extract binary
+        shell: msys2 {0}
+        run: |
+          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
+          unzip -o "codebase-memory-mcp${SUFFIX}-windows-amd64.zip"
+          [ -n "$SUFFIX" ] && cp "codebase-memory-mcp${SUFFIX}.exe" codebase-memory-mcp.exe || true
+
+      - name: Start artifact server for E2E smoke tests
+        shell: msys2 {0}
+        run: |
+          mkdir -p /tmp/smoke-server
+          cp codebase-memory-mcp.exe /tmp/smoke-server/codebase-memory-mcp.exe
+          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
+          cd /tmp/smoke-server
+          zip -q "codebase-memory-mcp${SUFFIX}-windows-amd64.zip" codebase-memory-mcp.exe
+          # Also serve under standard name
+          if [ -n "$SUFFIX" ]; then
+            cp "codebase-memory-mcp${SUFFIX}-windows-amd64.zip" "codebase-memory-mcp-windows-amd64.zip"
+          fi
+          sha256sum *.zip > checksums.txt
+          python3 -m http.server 18080 -d /tmp/smoke-server &
+
+      - name: Smoke test (${{ matrix.variant }}, windows-amd64)
+        shell: msys2 {0}
+        run: scripts/smoke-test.sh ./codebase-memory-mcp.exe
+        env:
+          SMOKE_DOWNLOAD_URL: http://localhost:18080
+
+  # ── Create release with Windows binaries ──────────────────────
+  release:
+    needs: [smoke-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: binaries-windows-amd64
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ inputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ inputs.version }}" \
+            --notes "Windows build with path fixes (PR #157)" \
+            --prerelease \
+            *.zip
