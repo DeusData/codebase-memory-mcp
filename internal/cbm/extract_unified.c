@@ -153,9 +153,32 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
 
         // 4. Push scope markers for boundary nodes
         if (spec->function_node_types && cbm_kind_in_set(node, spec->function_node_types)) {
-            const char *fqn = compute_func_qn(ctx, node, spec, &state);
-            if (fqn) {
-                push_scope(&state, SCOPE_FUNC, depth, fqn);
+            // Fix 3: C# lambda_expression inside += assignment should NOT create
+            // a new scope boundary. Calls inside the lambda body should be attributed
+            // to the outer method that subscribes the event handler, not to an
+            // anonymous lambda. This matches the semantic intent: the subscribing
+            // method IS responsible for what runs when the event fires.
+            bool skip_scope = false;
+            if (ctx->language == CBM_LANG_CSHARP &&
+                strcmp(ts_node_type(node), "lambda_expression") == 0) {
+                TSNode parent = ts_node_parent(node);
+                if (!ts_node_is_null(parent) &&
+                    strcmp(ts_node_type(parent), "assignment_expression") == 0) {
+                    TSNode op = ts_node_child_by_field_name(parent, "operator", 8);
+                    if (!ts_node_is_null(op)) {
+                        char *op_text = cbm_node_text(ctx->arena, op, ctx->source);
+                        if (op_text && (strcmp(op_text, "+=") == 0 ||
+                                        strcmp(op_text, "-=") == 0)) {
+                            skip_scope = true;
+                        }
+                    }
+                }
+            }
+            if (!skip_scope) {
+                const char *fqn = compute_func_qn(ctx, node, spec, &state);
+                if (fqn) {
+                    push_scope(&state, SCOPE_FUNC, depth, fqn);
+                }
             }
         } else if (spec->class_node_types && cbm_kind_in_set(node, spec->class_node_types)) {
             const char *cqn = compute_class_qn(ctx, node);
