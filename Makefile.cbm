@@ -145,7 +145,7 @@ STORE_SRCS = src/store/store.c
 CYPHER_SRCS = src/cypher/cypher.c
 
 # MCP server module (new)
-MCP_SRCS = src/mcp/mcp.c
+MCP_SRCS = src/mcp/mcp.c src/mcp/session.c
 
 # Discover module (new)
 DISCOVER_SRCS = \
