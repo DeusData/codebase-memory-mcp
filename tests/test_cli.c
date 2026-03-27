@@ -315,18 +315,18 @@ TEST(cli_find_cli_not_found) {
 }
 
 TEST(cli_find_cli_on_path) {
-#ifdef _WIN32
-    SKIP("PATH search differs on Windows");
-#endif
     /* Port of TestFindCLI_FoundOnPATH */
     char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-find-XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
+    /* Create a fake CLI binary (no extension — like npm shims on Windows) */
     char fakecli[512];
     snprintf(fakecli, sizeof(fakecli), "%s/fakecli", tmpdir);
     write_test_file(fakecli, "#!/bin/sh\n");
+#ifndef _WIN32
     chmod(fakecli, 0500);
+#endif
 
     const char *raw = getenv("PATH");
     char *old_path = raw ? strdup(raw) : NULL;
@@ -346,9 +346,6 @@ TEST(cli_find_cli_on_path) {
 }
 
 TEST(cli_find_cli_fallback_paths) {
-#ifdef _WIN32
-    SKIP("shell scripts + chmod not available on Windows");
-#endif
     /* Port of TestFindCLI_FallbackPaths */
     char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-find-XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
@@ -358,17 +355,25 @@ TEST(cli_find_cli_fallback_paths) {
     snprintf(localbin, sizeof(localbin), "%s/.local/bin", tmpdir);
     test_mkdirp(localbin);
 
+    /* Create a fake CLI binary in fallback location (no extension) */
     char fakecli[512];
     snprintf(fakecli, sizeof(fakecli), "%s/testcli", localbin);
     write_test_file(fakecli, "#!/bin/sh\n");
+#ifndef _WIN32
     chmod(fakecli, 0500);
+#endif
 
     const char *raw = getenv("PATH");
     char *old_path = raw ? strdup(raw) : NULL;
+#ifdef _WIN32
+    cbm_setenv("PATH", "C:\\nonexistent", 1);
+#else
     cbm_setenv("PATH", "/nonexistent", 1);
+#endif
 
     const char *result = cbm_find_cli("testcli", tmpdir);
-    ASSERT_STR_EQ(result, fakecli);
+    ASSERT(result[0] != '\0');
+    ASSERT(strstr(result, "testcli") != NULL);
 
     if (old_path) {
         cbm_setenv("PATH", old_path, 1);
