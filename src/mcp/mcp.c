@@ -1486,12 +1486,54 @@ static char *handle_get_impact(cbm_mcp_server_t *srv, const char *args) {
 static char *handle_get_channels(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
     char *channel = cbm_mcp_get_string_arg(args, "channel");
-    cbm_store_t *store = resolve_store(srv, project);
-    REQUIRE_STORE(store, project);
 
+    /* Cross-repo channel query: when project is NULL, iterate all indexed projects */
     cbm_channel_info_t *channels = NULL;
     int count = 0;
-    cbm_store_find_channels(store, project, channel, &channels, &count);
+
+    if (!project || strlen(project) == 0) {
+        char dir_path[1024];
+        cache_dir(dir_path, sizeof(dir_path));
+        cbm_dir_t *d = cbm_opendir(dir_path);
+        if (d) {
+            cbm_dirent_t *entry;
+            while ((entry = cbm_readdir(d)) != NULL) {
+                const char *n = entry->name;
+                size_t len = strlen(n);
+                if (len < 4 || strcmp(n + len - 3, ".db") != 0) continue;
+                if (strncmp(n, "tmp-", 4) == 0 || strncmp(n, "_", 1) == 0) continue;
+
+                /* Extract project name (filename without .db) */
+                char proj_name[512];
+                snprintf(proj_name, sizeof(proj_name), "%.*s", (int)(len - 3), n);
+
+                /* Open this project's store and query channels */
+                char db_path[2048];
+                snprintf(db_path, sizeof(db_path), "%s/%s", dir_path, n);
+                cbm_store_t *ps = cbm_store_open_path_query(db_path);
+                if (!ps) continue;
+
+                cbm_channel_info_t *proj_ch = NULL;
+                int proj_count = 0;
+                cbm_store_find_channels(ps, proj_name, channel, &proj_ch, &proj_count);
+
+                if (proj_count > 0) {
+                    /* Merge into main results */
+                    channels = safe_realloc(channels,
+                                            (count + proj_count) * sizeof(cbm_channel_info_t));
+                    memcpy(channels + count, proj_ch, proj_count * sizeof(cbm_channel_info_t));
+                    count += proj_count;
+                    free(proj_ch); /* shallow free — info fields now owned by channels[] */
+                }
+                cbm_store_close(ps);
+            }
+            cbm_closedir(d);
+        }
+    } else {
+        cbm_store_t *store = resolve_store(srv, project);
+        REQUIRE_STORE(store, project);
+        cbm_store_find_channels(store, project, channel, &channels, &count);
+    }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -2163,6 +2205,29 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                 }
             }
             yyjson_mut_obj_add_val(doc, outgoing, "has_method", methods_arr);
+        }
+
+        /* Outgoing HAS_PROPERTY (for Classes — class properties). */
+        {
+            int saved_tr = tr_count;
+            if (is_class_like && tr_count < MAX_TR) {
+                const char *hp_types[] = {"HAS_PROPERTY"};
+                cbm_store_bfs(store, nodes[best_idx].id, "outbound", hp_types, 1, 1, 30,
+                              &all_tr[tr_count]);
+                tr_count++;
+            }
+            yyjson_mut_val *props_arr = yyjson_mut_arr(doc);
+            for (int t = saved_tr; t < tr_count; t++) {
+                for (int i = 0; i < all_tr[t].visited_count; i++) {
+                    cbm_node_t *vn = &all_tr[t].visited[i].node;
+                    yyjson_mut_val *item = yyjson_mut_obj(doc);
+                    yyjson_mut_obj_add_str(doc, item, "name", vn->name ? vn->name : "");
+                    yyjson_mut_obj_add_str(doc, item, "file_path", vn->file_path ? vn->file_path : "");
+                    yyjson_mut_obj_add_int(doc, item, "line", vn->start_line);
+                    yyjson_mut_arr_add_val(props_arr, item);
+                }
+            }
+            yyjson_mut_obj_add_val(doc, outgoing, "has_property", props_arr);
         }
 
         /* Outgoing INHERITS (what this extends) */
