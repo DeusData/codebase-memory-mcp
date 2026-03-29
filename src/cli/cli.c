@@ -950,6 +950,12 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
         agents.openclaw = true;
     }
 
+    /* Kiro: ~/.kiro/ */
+    snprintf(path, sizeof(path), "%s/.kiro", home_dir);
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        agents.kiro = true;
+    }
+
     return agents;
 }
 
@@ -2420,9 +2426,12 @@ static void cbm_install_agent_configs(const char *home, const char *binary_path,
     if (agents.openclaw) {
         printf(" OpenClaw");
     }
+    if (agents.kiro) {
+        printf(" Kiro");
+    }
     if (!agents.claude_code && !agents.codex && !agents.gemini && !agents.zed && !agents.opencode &&
         !agents.antigravity && !agents.aider && !agents.kilocode && !agents.vscode &&
-        !agents.openclaw) {
+        !agents.openclaw && !agents.kiro) {
         printf(" (none)");
     }
     printf("\n\n");
@@ -2612,6 +2621,21 @@ static void cbm_install_agent_configs(const char *home, const char *binary_path,
             cbm_install_editor_mcp(binary_path, config_path);
         }
         printf("  mcp: %s\n", config_path);
+    }
+
+    /* Kiro */
+    if (agents.kiro) {
+        char mcp_path[1024];
+        snprintf(mcp_path, sizeof(mcp_path), "%s/.kiro/settings/mcp.json", home);
+        if (!dry_run) {
+            /* Ensure ~/.kiro/settings/ directory exists */
+            char settings_dir[1024];
+            snprintf(settings_dir, sizeof(settings_dir), "%s/.kiro/settings", home);
+            cbm_mkdir_p(settings_dir, 0755);
+            cbm_install_editor_mcp(binary_path, mcp_path);
+        }
+        printf("Kiro:\n");
+        printf("  mcp: %s\n", mcp_path);
     }
 }
 
@@ -2902,6 +2926,15 @@ int cbm_cmd_uninstall(int argc, char **argv) {
             cbm_remove_editor_mcp(config_path);
         }
         printf("OpenClaw: removed MCP config entry\n");
+    }
+
+    if (agents.kiro) {
+        char mcp_path[1024];
+        snprintf(mcp_path, sizeof(mcp_path), "%s/.kiro/settings/mcp.json", home);
+        if (!dry_run) {
+            cbm_remove_editor_mcp(mcp_path);
+        }
+        printf("Kiro: removed MCP config entry\n");
     }
 
     /* Step 2: Remove indexes */
