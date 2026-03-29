@@ -2480,11 +2480,55 @@ int cbm_store_get_schema(cbm_store_t *s, const char *project, cbm_schema_info_t 
             }
             arr[n].label = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
             arr[n].count = sqlite3_column_int(stmt, 1);
+            arr[n].properties = NULL;
+            arr[n].property_count = 0;
             n++;
         }
         sqlite3_finalize(stmt);
         out->node_labels = arr;
         out->node_label_count = n;
+    }
+
+    /* Node label property keys: base columns + distinct JSON property keys per label */
+    {
+        /* Base columns always present on every node */
+        static const char *node_base_cols[] = {
+            "name", "qualified_name", "file_path", "start_line", "end_line"
+        };
+        static const int node_base_col_count = 5;
+
+        const char *prop_sql =
+            "SELECT DISTINCT je.key "
+            "FROM nodes, json_each(nodes.properties) AS je "
+            "WHERE nodes.project = ?1 AND nodes.label = ?2 "
+            "  AND nodes.properties != '{}' "
+            "ORDER BY je.key "
+            "LIMIT 50;";
+
+        for (int i = 0; i < out->node_label_count; i++) {
+            /* Count: base + JSON keys (up to 50) */
+            int pcap = node_base_col_count + 50;
+            char **props = malloc(pcap * sizeof(char *));
+            int pn = 0;
+
+            /* Prepend base columns */
+            for (int b = 0; b < node_base_col_count; b++) {
+                props[pn++] = heap_strdup(node_base_cols[b]);
+            }
+
+            /* Append distinct JSON property keys */
+            sqlite3_stmt *pstmt = NULL;
+            sqlite3_prepare_v2(s->db, prop_sql, -1, &pstmt, NULL);
+            bind_text(pstmt, 1, project);
+            bind_text(pstmt, 2, out->node_labels[i].label);
+            while (sqlite3_step(pstmt) == SQLITE_ROW && pn < pcap) {
+                props[pn++] = heap_strdup((const char *)sqlite3_column_text(pstmt, 0));
+            }
+            sqlite3_finalize(pstmt);
+
+            out->node_labels[i].properties = props;
+            out->node_labels[i].property_count = pn;
+        }
     }
 
     /* Edge types */
@@ -2505,11 +2549,52 @@ int cbm_store_get_schema(cbm_store_t *s, const char *project, cbm_schema_info_t 
             }
             arr[n].type = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
             arr[n].count = sqlite3_column_int(stmt, 1);
+            arr[n].properties = NULL;
+            arr[n].property_count = 0;
             n++;
         }
         sqlite3_finalize(stmt);
         out->edge_types = arr;
         out->edge_type_count = n;
+    }
+
+    /* Edge type property keys: base columns + distinct JSON property keys per type */
+    {
+        /* Base columns always present on every edge */
+        static const char *edge_base_cols[] = {"source_id", "target_id"};
+        static const int edge_base_col_count = 2;
+
+        const char *prop_sql =
+            "SELECT DISTINCT je.key "
+            "FROM edges, json_each(edges.properties) AS je "
+            "WHERE edges.project = ?1 AND edges.type = ?2 "
+            "  AND edges.properties != '{}' "
+            "ORDER BY je.key "
+            "LIMIT 50;";
+
+        for (int i = 0; i < out->edge_type_count; i++) {
+            int pcap = edge_base_col_count + 50;
+            char **props = malloc(pcap * sizeof(char *));
+            int pn = 0;
+
+            /* Prepend base columns */
+            for (int b = 0; b < edge_base_col_count; b++) {
+                props[pn++] = heap_strdup(edge_base_cols[b]);
+            }
+
+            /* Append distinct JSON property keys */
+            sqlite3_stmt *pstmt = NULL;
+            sqlite3_prepare_v2(s->db, prop_sql, -1, &pstmt, NULL);
+            bind_text(pstmt, 1, project);
+            bind_text(pstmt, 2, out->edge_types[i].type);
+            while (sqlite3_step(pstmt) == SQLITE_ROW && pn < pcap) {
+                props[pn++] = heap_strdup((const char *)sqlite3_column_text(pstmt, 0));
+            }
+            sqlite3_finalize(pstmt);
+
+            out->edge_types[i].properties = props;
+            out->edge_types[i].property_count = pn;
+        }
     }
 
     return CBM_STORE_OK;
@@ -2521,11 +2606,19 @@ void cbm_store_schema_free(cbm_schema_info_t *out) {
     }
     for (int i = 0; i < out->node_label_count; i++) {
         free((void *)out->node_labels[i].label);
+        for (int j = 0; j < out->node_labels[i].property_count; j++) {
+            free(out->node_labels[i].properties[j]);
+        }
+        free(out->node_labels[i].properties);
     }
     free(out->node_labels);
 
     for (int i = 0; i < out->edge_type_count; i++) {
         free((void *)out->edge_types[i].type);
+        for (int j = 0; j < out->edge_types[i].property_count; j++) {
+            free(out->edge_types[i].properties[j]);
+        }
+        free(out->edge_types[i].properties);
     }
     free(out->edge_types);
 
