@@ -1052,6 +1052,10 @@ static int parse_return_or_with(parser_t *p, cbm_return_clause_t **out, bool is_
             cbm_token_type_t ft = peek(p)->type;
             advance(p);
             expect(p, TOK_LPAREN);
+            /* Check for DISTINCT inside aggregate: count(DISTINCT ...) */
+            if (match(p, TOK_DISTINCT)) {
+                item.distinct_arg = true;
+            }
             if (match(p, TOK_STAR)) {
                 item.variable = heap_strdup("*");
             } else {
@@ -2568,6 +2572,10 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
                 double *sums;
                 int *counts;
                 double *mins, *maxs;
+                /* For count(DISTINCT ...): per-column arrays of seen values */
+                const char ***distinct_seen; /* [col][seen_idx] */
+                int *distinct_seen_count;    /* count per column */
+                int *distinct_seen_cap;      /* capacity per column */
             } with_agg_t;
             int agg_cap = 256;
             with_agg_t *aggs = calloc(agg_cap, sizeof(with_agg_t));
@@ -2606,6 +2614,9 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
                     aggs[found].counts = calloc(wc->count, sizeof(int));
                     aggs[found].mins = malloc(wc->count * sizeof(double));
                     aggs[found].maxs = malloc(wc->count * sizeof(double));
+                    aggs[found].distinct_seen = calloc(wc->count, sizeof(const char **));
+                    aggs[found].distinct_seen_count = calloc(wc->count, sizeof(int));
+                    aggs[found].distinct_seen_cap = calloc(wc->count, sizeof(int));
                     for (int ci = 0; ci < wc->count; ci++) {
                         aggs[found].mins[ci] = 1e308;
                         aggs[found].maxs[ci] = -1e308;
@@ -2624,9 +2635,34 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
                     if (!wc->items[ci].func) {
                         continue;
                     }
-                    aggs[found].counts[ci]++;
                     const char *raw = binding_get_virtual(&bindings[bi], wc->items[ci].variable,
                                                           wc->items[ci].property);
+                    /* count(DISTINCT ...): only count if value not already seen */
+                    if (wc->items[ci].distinct_arg && strcmp(wc->items[ci].func, "COUNT") == 0) {
+                        bool already = false;
+                        for (int di = 0; di < aggs[found].distinct_seen_count[ci]; di++) {
+                            if (aggs[found].distinct_seen[ci][di] &&
+                                strcmp(aggs[found].distinct_seen[ci][di], raw) == 0) {
+                                already = true;
+                                break;
+                            }
+                        }
+                        if (!already) {
+                            /* Track the value */
+                            if (aggs[found].distinct_seen_count[ci] >= aggs[found].distinct_seen_cap[ci]) {
+                                int newcap = aggs[found].distinct_seen_cap[ci] < 16 ? 16 :
+                                             aggs[found].distinct_seen_cap[ci] * 2;
+                                aggs[found].distinct_seen[ci] = safe_realloc(
+                                    aggs[found].distinct_seen[ci], newcap * sizeof(const char *));
+                                aggs[found].distinct_seen_cap[ci] = newcap;
+                            }
+                            aggs[found].distinct_seen[ci][aggs[found].distinct_seen_count[ci]++] =
+                                heap_strdup(raw);
+                            aggs[found].counts[ci]++;
+                        }
+                    } else {
+                        aggs[found].counts[ci]++;
+                    }
                     double dv = strtod(raw, NULL);
                     aggs[found].sums[ci] += dv;
                     if (dv < aggs[found].mins[ci]) {
@@ -2703,6 +2739,17 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
                 free(aggs[a].counts);
                 free(aggs[a].mins);
                 free(aggs[a].maxs);
+                if (aggs[a].distinct_seen) {
+                    for (int ci = 0; ci < wc->count; ci++) {
+                        for (int di = 0; di < aggs[a].distinct_seen_count[ci]; di++) {
+                            free((void *)aggs[a].distinct_seen[ci][di]);
+                        }
+                        free(aggs[a].distinct_seen[ci]);
+                    }
+                    free(aggs[a].distinct_seen);
+                    free(aggs[a].distinct_seen_count);
+                    free(aggs[a].distinct_seen_cap);
+                }
             }
             free(aggs);
         } else {

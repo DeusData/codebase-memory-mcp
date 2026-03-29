@@ -218,6 +218,8 @@ static int init_schema(cbm_store_t *s) {
                        ");"
                        "CREATE INDEX IF NOT EXISTS idx_channels_name ON channels(channel_name);"
                        "CREATE INDEX IF NOT EXISTS idx_channels_project ON channels(project);"
+                       "CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_unique "
+                       "ON channels(project, channel_name, direction, file_path, function_name);"
                        "CREATE TABLE IF NOT EXISTS project_summaries ("
                       "  project TEXT PRIMARY KEY,"
                       "  summary TEXT NOT NULL,"
@@ -4968,10 +4970,16 @@ int cbm_extract_csharp_channels(const char *source, cbm_channel_match_t *out, in
 int cbm_store_detect_channels(cbm_store_t *s, const char *project, const char *repo_path) {
     if (!s || !s->db || !project || !repo_path) return 0;
 
-    /* Clear existing channels for this project */
-    char del[256];
-    snprintf(del, sizeof(del), "DELETE FROM channels WHERE project = '%s'", project);
-    exec_sql(s, del);
+    /* Clear existing channels for this project (parameterized — no SQL injection) */
+    {
+        sqlite3_stmt *del_stmt = NULL;
+        sqlite3_prepare_v2(s->db, "DELETE FROM channels WHERE project = ?1", -1, &del_stmt, NULL);
+        if (del_stmt) {
+            bind_text(del_stmt, 1, project);
+            sqlite3_step(del_stmt);
+            sqlite3_finalize(del_stmt);
+        }
+    }
 
     /* Find all Function/Method nodes with source file references in supported languages */
     const char *sql = "SELECT id, name, file_path, start_line, end_line FROM nodes "
@@ -4985,7 +4993,7 @@ int cbm_store_detect_channels(cbm_store_t *s, const char *project, const char *r
 
     sqlite3_stmt *ins = NULL;
     sqlite3_prepare_v2(s->db,
-        "INSERT INTO channels(project,channel_name,direction,transport,node_id,file_path,function_name) "
+        "INSERT OR IGNORE INTO channels(project,channel_name,direction,transport,node_id,file_path,function_name) "
         "VALUES(?1,?2,?3,?4,?5,?6,?7)", -1, &ins, NULL);
 
     exec_sql(s, "BEGIN TRANSACTION");
@@ -5067,24 +5075,25 @@ int cbm_store_find_channels(cbm_store_t *s, const char *project, const char *cha
     *out = NULL;
     *count = 0;
 
-    /* Build query — if project is NULL, search all; if channel is NULL, return all */
+    /* Build query — if project is NULL, search all; if channel is NULL, return all.
+     * Use DISTINCT to prevent duplicate rows from different extraction passes. */
     char sql[1024];
     if (project && channel) {
         snprintf(sql, sizeof(sql),
-                 "SELECT channel_name, direction, transport, project, file_path, function_name "
+                 "SELECT DISTINCT channel_name, direction, transport, project, file_path, function_name "
                  "FROM channels WHERE project = ?1 AND channel_name LIKE ?2 "
                  "ORDER BY channel_name LIMIT 500");
     } else if (project) {
         snprintf(sql, sizeof(sql),
-                 "SELECT channel_name, direction, transport, project, file_path, function_name "
+                 "SELECT DISTINCT channel_name, direction, transport, project, file_path, function_name "
                  "FROM channels WHERE project = ?1 ORDER BY channel_name LIMIT 500");
     } else if (channel) {
         snprintf(sql, sizeof(sql),
-                 "SELECT channel_name, direction, transport, project, file_path, function_name "
+                 "SELECT DISTINCT channel_name, direction, transport, project, file_path, function_name "
                  "FROM channels WHERE channel_name LIKE ?1 ORDER BY channel_name LIMIT 500");
     } else {
         snprintf(sql, sizeof(sql),
-                 "SELECT channel_name, direction, transport, project, file_path, function_name "
+                 "SELECT DISTINCT channel_name, direction, transport, project, file_path, function_name "
                  "FROM channels ORDER BY channel_name LIMIT 500");
     }
 

@@ -238,6 +238,7 @@ typedef struct {
     const char *func;      /* "COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT",
                               "toLower", "toUpper", "toString" or NULL */
     cbm_case_expr_t *kase; /* CASE expression (NULL if not CASE) */
+    bool distinct_arg;     /* true when func is count(DISTINCT ...) */
 } cbm_return_item_t;
 
 typedef struct {
