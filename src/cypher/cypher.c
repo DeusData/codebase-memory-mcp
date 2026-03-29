@@ -631,6 +631,39 @@ static void expr_free(cbm_expr_t *e) {
         // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
         free(e->cond.in_values);
     }
+    if (e->type == EXPR_NOT_EXISTS) {
+        if (e->sub_pattern) {
+            /* Free pattern nodes and rels */
+            for (int i = 0; i < e->sub_pattern->node_count; i++) {
+                free((void *)e->sub_pattern->nodes[i].variable);
+                free((void *)e->sub_pattern->nodes[i].label);
+            }
+            for (int i = 0; i < e->sub_pattern->rel_count; i++) {
+                free((void *)e->sub_pattern->rels[i].variable);
+                for (int t = 0; t < e->sub_pattern->rels[i].type_count; t++) {
+                    free((void *)e->sub_pattern->rels[i].types[t]);
+                }
+                free(e->sub_pattern->rels[i].types);
+                free((void *)e->sub_pattern->rels[i].direction);
+            }
+            free(e->sub_pattern->nodes);
+            free(e->sub_pattern->rels);
+            free(e->sub_pattern);
+        }
+        if (e->sub_where) {
+            cbm_where_clause_t *sw = (cbm_where_clause_t *)e->sub_where;
+            if (sw->root) expr_free(sw->root);
+            for (int i = 0; i < sw->count; i++) {
+                free((void *)sw->conditions[i].variable);
+                free((void *)sw->conditions[i].property);
+                free((void *)sw->conditions[i].op);
+                free((void *)sw->conditions[i].value);
+            }
+            free(sw->conditions);
+            free((void *)sw->op);
+            free(sw);
+        }
+    }
     expr_free(e->left);
     expr_free(e->right);
     free(e);
@@ -695,6 +728,8 @@ static const char *unsupported_clause_error(cbm_token_type_t type) {
 
 /* Forward declarations for recursive descent */
 static cbm_expr_t *parse_or_expr(parser_t *p);
+static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat);
+static int parse_where(parser_t *p, cbm_where_clause_t **out);
 
 /* Parse a single condition: var.prop OP value | var.prop IS [NOT] NULL | var.prop IN [...] */
 static cbm_expr_t *parse_condition_expr(parser_t *p) {
@@ -833,9 +868,40 @@ static cbm_expr_t *parse_atom_expr(parser_t *p) {
     return parse_condition_expr(p);
 }
 
-/* NOT: NOT atom | atom */
+/* NOT: NOT EXISTS { MATCH ... WHERE ... } | NOT atom | atom */
 static cbm_expr_t *parse_not_expr(parser_t *p) {
     if (match(p, TOK_NOT)) {
+        /* NOT EXISTS { MATCH (pattern) WHERE ... } — correlated subquery */
+        if (check(p, TOK_EXISTS)) {
+            advance(p); /* consume EXISTS */
+            if (!expect(p, TOK_LBRACE)) return NULL;
+
+            cbm_expr_t *e = calloc(1, sizeof(cbm_expr_t));
+            e->type = EXPR_NOT_EXISTS;
+
+            /* Parse inner MATCH pattern */
+            if (!expect(p, TOK_MATCH)) { free(e); return NULL; }
+            e->sub_pattern = calloc(1, sizeof(cbm_pattern_t));
+            if (parse_match_pattern(p, e->sub_pattern) < 0) {
+                free(e->sub_pattern);
+                free(e);
+                return NULL;
+            }
+
+            /* Optional inner WHERE */
+            cbm_where_clause_t *inner_where = NULL;
+            parse_where(p, &inner_where);
+            e->sub_where = inner_where;
+
+            if (!expect(p, TOK_RBRACE)) {
+                /* Cleanup on parse failure */
+                free(e->sub_pattern);
+                free(e->sub_where);
+                free(e);
+                return NULL;
+            }
+            return e;
+        }
         cbm_expr_t *child = parse_not_expr(p);
         return child ? expr_not(child) : NULL;
     }
@@ -1788,6 +1854,16 @@ static void binding_set(binding_t *b, const char *var, const cbm_node_t *node) {
     b->var_count++;
 }
 
+/* Forward declarations for NOT EXISTS subquery evaluation */
+static void scan_pattern_nodes(cbm_store_t *store, const char *project, int max_rows,
+                               cbm_node_pattern_t *first, cbm_node_t **out_nodes,
+                               int *out_count);
+static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_t **bindings,
+                                int *bind_count, const int *bind_cap, const char **var_name,
+                                bool is_optional);
+static bool eval_where(const cbm_where_clause_t *w, binding_t *b, cbm_store_t *store,
+                       const char *project, int max_rows);
+
 /* Evaluate a WHERE condition against a binding */
 static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
     const char *actual;
@@ -1880,8 +1956,10 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
     return (int)(c->negated ? !result : result);
 }
 
-/* Recursive expression tree evaluator */
-static bool eval_expr(const cbm_expr_t *e, binding_t *b) {
+/* Recursive expression tree evaluator.
+ * store is needed for EXPR_NOT_EXISTS (correlated subquery expansion). */
+static bool eval_expr(const cbm_expr_t *e, binding_t *b, cbm_store_t *store,
+                      const char *project, int max_rows) {
     if (!e) {
         return true;
     }
@@ -1889,24 +1967,176 @@ static bool eval_expr(const cbm_expr_t *e, binding_t *b) {
     case EXPR_CONDITION:
         return eval_condition(&e->cond, b);
     case EXPR_AND:
-        return (eval_expr(e->left, b) && eval_expr(e->right, b)) != 0;
+        return (eval_expr(e->left, b, store, project, max_rows) &&
+                eval_expr(e->right, b, store, project, max_rows)) != 0;
     case EXPR_OR:
-        return (eval_expr(e->left, b) || eval_expr(e->right, b)) != 0;
+        return (eval_expr(e->left, b, store, project, max_rows) ||
+                eval_expr(e->right, b, store, project, max_rows)) != 0;
     case EXPR_NOT:
-        return (!eval_expr(e->left, b)) != 0;
+        return (!eval_expr(e->left, b, store, project, max_rows)) != 0;
     case EXPR_XOR:
-        return eval_expr(e->left, b) != eval_expr(e->right, b);
+        return eval_expr(e->left, b, store, project, max_rows) !=
+               eval_expr(e->right, b, store, project, max_rows);
+    case EXPR_NOT_EXISTS: {
+        if (!e->sub_pattern || !store) return true;
+        cbm_pattern_t *sp = e->sub_pattern;
+
+        /* OPTIMIZATION: For the common pattern
+         *   MATCH (n:Function) WHERE NOT EXISTS { MATCH (caller)-[e]->(n) WHERE e.type = 'CALLS' }
+         * we detect when the inner pattern's TARGET variable is already bound from
+         * the outer scope. Instead of scanning all possible callers, we directly
+         * query edges TO the bound node — O(1) per node instead of O(N). */
+        if (sp->rel_count == 1 && sp->node_count == 2) {
+            const char *start_var = sp->nodes[0].variable;
+            const char *end_var = sp->nodes[1].variable;
+            cbm_rel_pattern_t *rel = &sp->rels[0];
+
+            /* Check which end is bound from outer scope */
+            cbm_node_t *bound_node = NULL;
+            bool bound_is_target = false;
+            if (end_var && binding_get(b, end_var)) {
+                bound_node = binding_get(b, end_var);
+                bound_is_target = true;
+            } else if (start_var && binding_get(b, start_var)) {
+                bound_node = binding_get(b, start_var);
+            }
+
+            if (bound_node && bound_node->id > 0) {
+                /* Fast path: query edges directly to/from the bound node */
+                cbm_edge_t *edges = NULL;
+                int edge_count = 0;
+                bool found_match = false;
+
+                for (int ti = 0; ti < rel->type_count && !found_match; ti++) {
+                    const char *edge_type = rel->types[ti];
+                    if (bound_is_target) {
+                        /* bound node is the target: look for edges incoming TO it */
+                        cbm_store_find_edges_by_target_type(store, bound_node->id,
+                                                            edge_type, &edges, &edge_count);
+                    } else {
+                        /* bound node is the source: look for edges outgoing FROM it */
+                        cbm_store_find_edges_by_source_type(store, bound_node->id,
+                                                            edge_type, &edges, &edge_count);
+                    }
+                    /* Apply inner WHERE filter if present */
+                    cbm_where_clause_t *inner_w = (cbm_where_clause_t *)e->sub_where;
+                    if (edge_count > 0 && inner_w) {
+                        /* Build a temporary binding with the edge to check WHERE conditions */
+                        for (int ei = 0; ei < edge_count && !found_match; ei++) {
+                            binding_t tmp = *b; /* shallow copy of outer binding */
+                            const char *edge_var = rel->variable;
+                            if (edge_var) {
+                                binding_set_edge(&tmp, edge_var, &edges[ei]);
+                            }
+                            if (eval_where(inner_w, &tmp, store, project, max_rows)) {
+                                found_match = true;
+                            }
+                        }
+                    } else if (edge_count > 0) {
+                        found_match = true;
+                    }
+                    /* Free edges */
+                    for (int ei = 0; ei < edge_count; ei++) {
+                        free((void *)edges[ei].project);
+                        free((void *)edges[ei].type);
+                        free((void *)edges[ei].properties_json);
+                    }
+                    free(edges);
+                    edges = NULL;
+                    edge_count = 0;
+                }
+
+                if (rel->type_count == 0 && !found_match) {
+                    /* No type filter — check ANY edge */
+                    cbm_edge_t *all_edges = NULL;
+                    int all_count = 0;
+                    if (bound_is_target) {
+                        cbm_store_find_edges_by_target_type(store, bound_node->id,
+                                                            NULL, &all_edges, &all_count);
+                    } else {
+                        cbm_store_find_edges_by_source_type(store, bound_node->id,
+                                                            NULL, &all_edges, &all_count);
+                    }
+                    if (all_count > 0) found_match = true;
+                    for (int ei = 0; ei < all_count; ei++) {
+                        free((void *)all_edges[ei].project);
+                        free((void *)all_edges[ei].type);
+                        free((void *)all_edges[ei].properties_json);
+                    }
+                    free(all_edges);
+                }
+
+                return !found_match;
+            }
+        }
+
+        /* SLOW PATH: Full subquery expansion for complex patterns.
+         * Used when no variable is bound from outer scope, or multi-hop patterns. */
+        const char *start_var = sp->nodes[0].variable;
+        cbm_node_t *scanned = NULL;
+        int scan_count = 0;
+        cbm_node_t *outer_node = start_var ? binding_get(b, start_var) : NULL;
+
+        if (outer_node) {
+            scanned = calloc(1, sizeof(cbm_node_t));
+            scanned[0] = *outer_node;
+            scanned[0].name = outer_node->name ? heap_strdup(outer_node->name) : NULL;
+            scanned[0].label = outer_node->label ? heap_strdup(outer_node->label) : NULL;
+            scanned[0].file_path = outer_node->file_path ? heap_strdup(outer_node->file_path) : NULL;
+            scanned[0].project = outer_node->project ? heap_strdup(outer_node->project) : NULL;
+            scanned[0].qualified_name = outer_node->qualified_name ? heap_strdup(outer_node->qualified_name) : NULL;
+            scan_count = 1;
+        } else {
+            scan_pattern_nodes(store, project, max_rows, &sp->nodes[0],
+                               &scanned, &scan_count);
+        }
+
+        if (scan_count == 0) {
+            free(scanned);
+            return true;
+        }
+
+        const char *var = start_var ? start_var : "_ne";
+        int sub_cap = scan_count > 4 ? scan_count : 4;
+        binding_t *sub_bindings = calloc(sub_cap, sizeof(binding_t));
+        int sub_count = 0;
+        for (int i = 0; i < scan_count && sub_count < sub_cap; i++) {
+            binding_set(&sub_bindings[sub_count], var, &scanned[i]);
+            sub_count++;
+        }
+        free(scanned);
+
+        if (sub_count > 0 && sp->rel_count > 0) {
+            expand_pattern_rels(store, sp, &sub_bindings, &sub_count, &sub_cap,
+                                &var, false);
+        }
+
+        bool any_match = false;
+        cbm_where_clause_t *inner_w = (cbm_where_clause_t *)e->sub_where;
+        for (int i = 0; i < sub_count && !any_match; i++) {
+            bool pass = inner_w ? eval_where(inner_w, &sub_bindings[i], store, project, max_rows) : true;
+            if (pass) any_match = true;
+        }
+        for (int i = 0; i < sub_count; i++) {
+            for (int v = 0; v < sub_bindings[i].var_count; v++) {
+                node_fields_free(&sub_bindings[i].var_nodes[v]);
+            }
+        }
+        free(sub_bindings);
+        return !any_match;
+    }
     }
     return true;
 }
 
 /* Evaluate WHERE clause — uses expression tree if available, falls back to legacy */
-static bool eval_where(const cbm_where_clause_t *w, binding_t *b) {
+static bool eval_where(const cbm_where_clause_t *w, binding_t *b, cbm_store_t *store,
+                       const char *project, int max_rows) {
     if (!w) {
         return true;
     }
     if (w->root) {
-        return eval_expr(w->root, b);
+        return eval_expr(w->root, b, store, project, max_rows);
     }
 
     /* Legacy flat evaluation */
@@ -2046,7 +2276,7 @@ static const char *eval_case_expr(const cbm_case_expr_t *k, binding_t *b) {
         return "";
     }
     for (int i = 0; i < k->branch_count; i++) {
-        if (eval_expr(k->branches[i].when_expr, b)) {
+        if (eval_expr(k->branches[i].when_expr, b, NULL, NULL, 0)) {
             return k->branches[i].then_val ? k->branches[i].then_val : "";
         }
     }
@@ -2429,9 +2659,9 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
         bool pass = true;
         if (q->where && pat0->rel_count > 0) {
             /* With expression tree, evaluate full tree — unbound vars pass through */
-            pass = eval_where(q->where, &b);
+            pass = eval_where(q->where, &b, store, project, max_rows);
         } else if (q->where && pat0->rel_count == 0) {
-            pass = eval_where(q->where, &b);
+            pass = eval_where(q->where, &b, store, project, max_rows);
         }
 
         if (pass) {
@@ -2532,7 +2762,7 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     if (q->where && (pat0->rel_count > 0 || q->pattern_count > 1)) {
         int kept = 0;
         for (int i = 0; i < bind_count; i++) {
-            if (eval_where(q->where, &bindings[i])) {
+            if (eval_where(q->where, &bindings[i], store, project, max_rows)) {
                 if (kept != i) {
                     bindings[kept] = bindings[i];
                 }
@@ -2840,7 +3070,7 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
         if (q->post_with_where) {
             int kept = 0;
             for (int i = 0; i < bind_count; i++) {
-                if (eval_where(q->post_with_where, &bindings[i])) {
+                if (eval_where(q->post_with_where, &bindings[i], store, project, max_rows)) {
                     if (kept != i) {
                         bindings[kept] = bindings[i];
                     }

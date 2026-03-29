@@ -199,7 +199,8 @@ typedef enum {
     EXPR_AND,
     EXPR_OR,
     EXPR_NOT,
-    EXPR_XOR
+    EXPR_XOR,
+    EXPR_NOT_EXISTS /* NOT EXISTS { MATCH ... WHERE ... } */
 } cbm_expr_type_t;
 
 typedef struct cbm_expr cbm_expr_t;
@@ -208,6 +209,9 @@ struct cbm_expr {
     cbm_condition_t cond; /* leaf (EXPR_CONDITION only) */
     cbm_expr_t *left;     /* AND/OR/XOR left; NOT child */
     cbm_expr_t *right;    /* AND/OR/XOR right; NULL for NOT */
+    /* NOT EXISTS subquery (EXPR_NOT_EXISTS only) */
+    cbm_pattern_t *sub_pattern; /* inner MATCH pattern */
+    void *sub_where;            /* cbm_where_clause_t* — void to avoid circular dep */
 };
 
 typedef struct {
