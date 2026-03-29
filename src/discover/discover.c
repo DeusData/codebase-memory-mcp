@@ -228,12 +228,56 @@ static void fl_add(file_list_t *fl, const char *abs_path, const char *rel_path, 
 
 /* ── Recursive walk ──────────────────────────────────────────────── */
 
+/*
+ * Compute the path relative to a nested .gitignore's directory.
+ *
+ * rel_path     — path relative to repo root, e.g. "webapp/src/foo.js"
+ * local_prefix — rel_prefix at the time the local gitignore was loaded,
+ *                e.g. "webapp"
+ *
+ * Returns a pointer into rel_path past the local_prefix component, e.g.
+ * "src/foo.js", or rel_path itself when local_prefix is empty.
+ */
+static const char *local_rel_path(const char *rel_path, const char *local_prefix) {
+    if (!local_prefix || local_prefix[0] == '\0') {
+        return rel_path;
+    }
+    size_t prefix_len = strlen(local_prefix);
+    /* rel_path must start with local_prefix followed by '/' */
+    if (strncmp(rel_path, local_prefix, prefix_len) == 0 && rel_path[prefix_len] == '/') {
+        return rel_path + prefix_len + 1;
+    }
+    return rel_path;
+}
+
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters,misc-no-recursion)
 static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_discover_opts_t *opts,
                      const cbm_gitignore_t *gitignore, const cbm_gitignore_t *cbmignore,
+                     const cbm_gitignore_t *local_gi, const char *local_gi_prefix,
                      file_list_t *out) {
+    /* Load a nested .gitignore from this directory if:
+     *   - we are inside a subdirectory (rel_prefix is non-empty), AND
+     *   - no ancestor directory has already provided a local gitignore.
+     * The root .gitignore (rel_prefix == "") is already handled by the
+     * caller via the separate `gitignore` parameter, so we skip it here
+     * to avoid redundant matching. */
+    cbm_gitignore_t *owned_local_gi = NULL;
+    if (!local_gi && rel_prefix[0] != '\0') {
+        char gi_path[4096];
+        snprintf(gi_path, sizeof(gi_path), "%s/.gitignore", dir_path);
+        struct stat gi_st;
+        if (stat(gi_path, &gi_st) == 0 && S_ISREG(gi_st.st_mode)) {
+            owned_local_gi = cbm_gitignore_load(gi_path);
+            if (owned_local_gi) {
+                local_gi = owned_local_gi;
+                local_gi_prefix = rel_prefix;
+            }
+        }
+    }
+
     cbm_dir_t *d = cbm_opendir(dir_path);
     if (!d) {
+        cbm_gitignore_free(owned_local_gi);
         return;
     }
 
@@ -272,16 +316,24 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
                 continue;
             }
 
-            /* Check gitignore */
+            /* Check root gitignore (repo-relative path) */
             if (gitignore && cbm_gitignore_matches(gitignore, rel_path, true)) {
                 continue;
+            }
+            /* Check nested gitignore (path relative to gitignore's directory) */
+            if (local_gi) {
+                const char *lrel = local_rel_path(rel_path, local_gi_prefix);
+                if (cbm_gitignore_matches(local_gi, lrel, true)) {
+                    continue;
+                }
             }
             if (cbmignore && cbm_gitignore_matches(cbmignore, rel_path, true)) {
                 continue;
             }
 
-            /* Recurse */
-            walk_dir(abs_path, rel_path, opts, gitignore, cbmignore, out);
+            /* Recurse — pass local_gi so it applies to all descendants */
+            walk_dir(abs_path, rel_path, opts, gitignore, cbmignore, local_gi, local_gi_prefix,
+                     out);
         } else if (S_ISREG(st.st_mode)) {
             cbm_index_mode_t mode = opts ? opts->mode : CBM_MODE_FULL;
 
@@ -300,9 +352,16 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
                 continue;
             }
 
-            /* Check gitignore */
+            /* Check root gitignore (repo-relative path) */
             if (gitignore && cbm_gitignore_matches(gitignore, rel_path, false)) {
                 continue;
+            }
+            /* Check nested gitignore (path relative to gitignore's directory) */
+            if (local_gi) {
+                const char *lrel = local_rel_path(rel_path, local_gi_prefix);
+                if (cbm_gitignore_matches(local_gi, lrel, false)) {
+                    continue;
+                }
             }
             if (cbmignore && cbm_gitignore_matches(cbmignore, rel_path, false)) {
                 continue;
@@ -338,6 +397,7 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
     }
 
     cbm_closedir(d);
+    cbm_gitignore_free(owned_local_gi);
 }
 
 /* ── Public API ──────────────────────────────────────────────────── */
@@ -376,9 +436,14 @@ int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_fil
         cbmignore = cbm_gitignore_load(gi_path);
     }
 
-    /* Walk */
+    /* Walk — pass NULL for local_gi/local_gi_prefix initially; walk_dir will
+     * discover any nested .gitignores on-the-fly as it descends into
+     * subdirectories.  Note: the root .gitignore is checked via the separate
+     * `gitignore` parameter (repo-relative paths); if walk_dir also loads it
+     * as a nested gitignore for the root directory, the patterns are applied
+     * twice but produce the same result (benign redundancy). */
     file_list_t fl = {0};
-    walk_dir(repo_path, "", opts, gitignore, cbmignore, &fl);
+    walk_dir(repo_path, "", opts, gitignore, cbmignore, NULL, NULL, &fl);
 
     /* Cleanup */
     cbm_gitignore_free(gitignore);

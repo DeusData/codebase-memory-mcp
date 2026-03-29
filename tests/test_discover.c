@@ -659,6 +659,144 @@ TEST(discover_cbmignore_no_git) {
     PASS();
 }
 
+/* --- Issue #178: nested .gitignore files should be respected --- */
+
+/* Basic nested .gitignore: webapp/.gitignore with ".output" should exclude
+ * webapp/.output/ and its contents from indexing. */
+TEST(discover_nested_gitignore) {
+    SKIP_UNIX_SHELL;
+    const char *base = "/tmp/test_discover_nested_gi";
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "rm -rf %s && mkdir -p %s/.git && "
+             "mkdir -p %s/webapp/.output/chunks && "
+             "mkdir -p %s/webapp/src && "
+             "printf '.output\\n' > %s/webapp/.gitignore && "
+             "echo 'package main' > %s/main.go && "
+             "echo 'const x = 1' > %s/webapp/src/app.js && "
+             "echo 'const chunk = 1' > %s/webapp/.output/chunks/app.js",
+             base, base, base, base, base, base, base, base);
+    system(cmd);
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+
+    bool found_output = false;
+    for (int i = 0; i < count; i++) {
+        if (strstr(files[i].rel_path, ".output"))
+            found_output = true;
+    }
+    ASSERT_FALSE(found_output); /* .output excluded by webapp/.gitignore */
+
+    /* webapp/src/app.js and main.go should be present */
+    bool found_app = false, found_main = false;
+    for (int i = 0; i < count; i++) {
+        if (strstr(files[i].rel_path, "webapp/src/app.js"))
+            found_app = true;
+        if (strstr(files[i].rel_path, "main.go"))
+            found_main = true;
+    }
+    ASSERT_TRUE(found_app);
+    ASSERT_TRUE(found_main);
+
+    cbm_discover_free(files, count);
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
+    system(cmd);
+    PASS();
+}
+
+/* Nested .gitignore patterns apply to deeper descendants, not just immediate
+ * children: webapp/.gitignore with "generated/" should exclude
+ * webapp/src/generated/foo.go even though it is two levels deep. */
+TEST(discover_nested_gitignore_deep) {
+    SKIP_UNIX_SHELL;
+    const char *base = "/tmp/test_discover_nested_gi_deep";
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "rm -rf %s && mkdir -p %s/.git && "
+             "mkdir -p %s/webapp/src/generated && "
+             "mkdir -p %s/webapp/src/api && "
+             "printf 'generated/\\n' > %s/webapp/.gitignore && "
+             "echo 'const x = 1' > %s/webapp/src/api/routes.js && "
+             "echo 'const g = 1' > %s/webapp/src/generated/schema.js",
+             base, base, base, base, base, base, base);
+    system(cmd);
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+
+    bool found_generated = false, found_routes = false;
+    for (int i = 0; i < count; i++) {
+        if (strstr(files[i].rel_path, "generated"))
+            found_generated = true;
+        if (strstr(files[i].rel_path, "routes.js"))
+            found_routes = true;
+    }
+    ASSERT_FALSE(found_generated); /* excluded by nested gitignore */
+    ASSERT_TRUE(found_routes);     /* not excluded */
+
+    cbm_discover_free(files, count);
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
+    system(cmd);
+    PASS();
+}
+
+/* Root .gitignore and nested .gitignore both apply independently. */
+TEST(discover_nested_gitignore_stacks_with_root) {
+    SKIP_UNIX_SHELL;
+    const char *base = "/tmp/test_discover_nested_gi_stack";
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "rm -rf %s && mkdir -p %s/.git && "
+             "mkdir -p %s/webapp/.output && "
+             "mkdir -p %s/webapp/src && "
+             "printf '*.log\\n' > %s/.gitignore && "
+             "printf '.output\\n' > %s/webapp/.gitignore && "
+             "echo 'package main' > %s/main.go && "
+             "echo 'error log' > %s/error.log && "
+             "echo 'const x = 1' > %s/webapp/src/app.js && "
+             "echo 'output data' > %s/webapp/.output/data.js",
+             base, base, base, base, base, base, base, base, base, base);
+    system(cmd);
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+
+    bool found_log = false, found_output = false;
+    bool found_main = false, found_app = false;
+    for (int i = 0; i < count; i++) {
+        if (strstr(files[i].rel_path, ".log"))
+            found_log = true;
+        if (strstr(files[i].rel_path, ".output"))
+            found_output = true;
+        if (strstr(files[i].rel_path, "main.go"))
+            found_main = true;
+        if (strstr(files[i].rel_path, "app.js"))
+            found_app = true;
+    }
+    ASSERT_FALSE(found_log);    /* excluded by root .gitignore */
+    ASSERT_FALSE(found_output); /* excluded by nested .gitignore */
+    ASSERT_TRUE(found_main);
+    ASSERT_TRUE(found_app);
+
+    cbm_discover_free(files, count);
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
+    system(cmd);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(discover) {
@@ -747,4 +885,9 @@ SUITE(discover) {
     RUN_TEST(discover_generic_dirs_full_mode);
     RUN_TEST(discover_generic_dirs_fast_mode);
     RUN_TEST(discover_cbmignore_no_git);
+
+    /* Nested .gitignore tests (issue #178) */
+    RUN_TEST(discover_nested_gitignore);
+    RUN_TEST(discover_nested_gitignore_deep);
+    RUN_TEST(discover_nested_gitignore_stacks_with_root);
 }
