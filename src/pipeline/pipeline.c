@@ -501,6 +501,18 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     }
     cbm_log_info("pipeline.route", "path", "full");
 
+    /* Phase 1.5: Build package specifier map (JS/TS monorepo support) */
+    struct timespec t_pkg;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t_pkg);
+    CBMHashTable *pkg_map = cbm_pipeline_build_pkg_map(p->repo_path, p->project_name);
+    if (pkg_map) {
+        char pkg_count[16];
+        snprintf(pkg_count, sizeof(pkg_count), "%d", (int)cbm_ht_count(pkg_map));
+        cbm_log_info("pass.done", "pass", "pkg_map", "packages", pkg_count);
+    }
+    cbm_log_info("pass.timing", "pass", "pkg_map", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t_pkg)));
+
     /* Phase 2: Create graph buffer and registry */
     p->gbuf = cbm_gbuf_new(p->project_name, p->repo_path);
     p->registry = cbm_registry_new();
@@ -515,6 +527,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         .gbuf = p->gbuf,
         .registry = p->registry,
         .cancelled = &p->cancelled,
+        .pkg_map = pkg_map,
     };
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
@@ -891,6 +904,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
                  itoa_buf((int)elapsed_ms(t0)));
 
 cleanup:
+    cbm_pipeline_free_pkg_map(pkg_map);
     cbm_discover_free(files, file_count);
     cbm_gbuf_free(p->gbuf);
     p->gbuf = NULL;
