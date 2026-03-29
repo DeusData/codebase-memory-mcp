@@ -2516,15 +2516,16 @@ int cbm_store_get_schema(cbm_store_t *s, const char *project, cbm_schema_info_t 
                 props[pn++] = heap_strdup(node_base_cols[b]);
             }
 
-            /* Append distinct JSON property keys */
+            /* Append distinct JSON property keys (capped at 50 to bound allocation) */
             sqlite3_stmt *pstmt = NULL;
-            sqlite3_prepare_v2(s->db, prop_sql, -1, &pstmt, NULL);
-            bind_text(pstmt, 1, project);
-            bind_text(pstmt, 2, out->node_labels[i].label);
-            while (sqlite3_step(pstmt) == SQLITE_ROW && pn < pcap) {
-                props[pn++] = heap_strdup((const char *)sqlite3_column_text(pstmt, 0));
+            if (sqlite3_prepare_v2(s->db, prop_sql, -1, &pstmt, NULL) == SQLITE_OK) {
+                bind_text(pstmt, 1, project);
+                bind_text(pstmt, 2, out->node_labels[i].label);
+                while (sqlite3_step(pstmt) == SQLITE_ROW && pn < pcap) {
+                    props[pn++] = heap_strdup((const char *)sqlite3_column_text(pstmt, 0));
+                }
+                sqlite3_finalize(pstmt);
             }
-            sqlite3_finalize(pstmt);
 
             out->node_labels[i].properties = props;
             out->node_labels[i].property_count = pn;
@@ -2582,15 +2583,16 @@ int cbm_store_get_schema(cbm_store_t *s, const char *project, cbm_schema_info_t 
                 props[pn++] = heap_strdup(edge_base_cols[b]);
             }
 
-            /* Append distinct JSON property keys */
+            /* Append distinct JSON property keys (capped at 50 to bound allocation) */
             sqlite3_stmt *pstmt = NULL;
-            sqlite3_prepare_v2(s->db, prop_sql, -1, &pstmt, NULL);
-            bind_text(pstmt, 1, project);
-            bind_text(pstmt, 2, out->edge_types[i].type);
-            while (sqlite3_step(pstmt) == SQLITE_ROW && pn < pcap) {
-                props[pn++] = heap_strdup((const char *)sqlite3_column_text(pstmt, 0));
+            if (sqlite3_prepare_v2(s->db, prop_sql, -1, &pstmt, NULL) == SQLITE_OK) {
+                bind_text(pstmt, 1, project);
+                bind_text(pstmt, 2, out->edge_types[i].type);
+                while (sqlite3_step(pstmt) == SQLITE_ROW && pn < pcap) {
+                    props[pn++] = heap_strdup((const char *)sqlite3_column_text(pstmt, 0));
+                }
+                sqlite3_finalize(pstmt);
             }
-            sqlite3_finalize(pstmt);
 
             out->edge_types[i].properties = props;
             out->edge_types[i].property_count = pn;
