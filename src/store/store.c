@@ -4666,7 +4666,11 @@ int cbm_store_detect_processes(cbm_store_t *s, const char *project, int max_proc
         sqlite3_finalize(nst);
     }
 
-    const char *esql = "SELECT source_id, target_id FROM edges WHERE project=?1 AND type='CALLS'";
+    /* Include CALLS, HANDLES, and HTTP_CALLS for Louvain community detection.
+     * HANDLES connects Route → handler, HTTP_CALLS connects client → API endpoint.
+     * Without these, Express/Hapi route flows are invisible to process detection. */
+    const char *esql = "SELECT source_id, target_id FROM edges WHERE project=?1 "
+                       "AND type IN ('CALLS','HANDLES','HTTP_CALLS','ASYNC_CALLS')";
     sqlite3_stmt *est = NULL;
     int le_cap = 8192;
     int le_count = 0;
@@ -4725,9 +4729,9 @@ int cbm_store_detect_processes(cbm_store_t *s, const char *project, int max_proc
     int proc_count = 0;
 
     for (int ei = 0; ei < ep_count && proc_count < max_processes; ei++) {
-        const char *bfs_types[] = {"CALLS"};
+        const char *bfs_types[] = {"CALLS", "HANDLES", "HTTP_CALLS", "ASYNC_CALLS"};
         cbm_traverse_result_t tr = {0};
-        cbm_store_bfs(s, ep_ids[ei], "outbound", bfs_types, 1, 8, 50, &tr);
+        cbm_store_bfs(s, ep_ids[ei], "outbound", bfs_types, 4, 8, 50, &tr);
 
         if (tr.visited_count < 2) {
             cbm_store_traverse_free(&tr);
