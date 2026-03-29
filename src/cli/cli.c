@@ -2956,10 +2956,58 @@ int cbm_cmd_uninstall(int argc, char **argv) {
 
 /* ── Subcommand: update ───────────────────────────────────────── */
 
+/*
+ * Fetch the latest release tag from GitHub by following the redirect of
+ * the /releases/latest URL.  Returns a malloc'd string like "v0.5.7" or
+ * NULL on any failure (network error, unexpected header format, etc.).
+ * Caller must free() the returned string.
+ */
+static char *fetch_latest_tag(void) {
+    /* curl -sfI prints only headers; -L is intentionally omitted so we
+     * see the Location header of the first redirect. */
+    // NOLINTNEXTLINE(bugprone-command-processor,cert-env33-c)
+    FILE *fp = cbm_popen(
+        "curl -sfI https://github.com/DeusData/codebase-memory-mcp/releases/latest 2>/dev/null",
+        "r");
+    if (!fp) {
+        return NULL;
+    }
+
+    char line[512];
+    char *tag = NULL;
+    while (fgets(line, sizeof(line), fp)) {
+        /* Header names are case-insensitive; curl lowercases them on most
+         * platforms but we match both forms to be safe. */
+        if (strncasecmp(line, "location:", 9) != 0) {
+            continue;
+        }
+        /* Find the last '/' — the tag name follows it */
+        char *slash = strrchr(line, '/');
+        if (!slash) {
+            break;
+        }
+        slash++; /* skip the '/' itself */
+        /* Trim trailing whitespace / CRLF */
+        size_t len = strlen(slash);
+        while (len > 0 && (slash[len - 1] == '\r' || slash[len - 1] == '\n' ||
+                           slash[len - 1] == ' ')) {
+            slash[--len] = '\0';
+        }
+        if (len == 0) {
+            break;
+        }
+        tag = strdup(slash);
+        break;
+    }
+    cbm_pclose(fp);
+    return tag;
+}
+
 int cbm_cmd_update(int argc, char **argv) {
     parse_auto_answer(argc, argv);
 
     bool dry_run = false;
+    bool force = false;
     int variant_flag = 0; /* 0 = ask, 1 = standard, 2 = ui */
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
@@ -2968,6 +3016,37 @@ int cbm_cmd_update(int argc, char **argv) {
             variant_flag = 1;
         } else if (strcmp(argv[i], "--ui") == 0) {
             variant_flag = 2;
+        } else if (strcmp(argv[i], "--force") == 0) {
+            force = true;
+        }
+    }
+
+    /* Version check — skipped when --force or CBM_DOWNLOAD_URL is set */
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
+    const char *dl_url_override = getenv("CBM_DOWNLOAD_URL");
+    if (!force && (!dl_url_override || !dl_url_override[0])) {
+        char *latest = fetch_latest_tag();
+        if (latest) {
+            int cmp = cbm_compare_versions(latest, CBM_VERSION);
+            if (cmp <= 0) {
+                /* latest <= current — already up to date */
+                if (cmp < 0) {
+                    /* current is ahead of latest (e.g. dev build) */
+                    printf("Already up to date (%s, ahead of latest %s).\n",
+                           CBM_VERSION, latest);
+                } else {
+                    printf("Already up to date (%s).\n", CBM_VERSION);
+                }
+                free(latest);
+                return 0;
+            }
+            /* Newer version available — inform and continue */
+            printf("Update available: %s -> %s\n", CBM_VERSION, latest);
+            free(latest);
+        } else {
+            fprintf(stderr,
+                    "warning: could not check latest version (network unavailable?). "
+                    "Proceeding with update.\n");
         }
     }
 
