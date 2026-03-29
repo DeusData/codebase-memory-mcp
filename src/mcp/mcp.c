@@ -1259,14 +1259,76 @@ static char *handle_get_impact(cbm_mcp_server_t *srv, const char *args) {
         return r;
     }
 
-    /* Pick best node (prefer Function/Method) */
+    /* Pick best node: prefer Class over Constructor when both share the same name.
+     * This mirrors the disambiguation logic in trace_call_path so that impact
+     * analysis on a class name (e.g. "UserService") resolves to the Class node
+     * and then fans out through DEFINES_METHOD to all its methods.  Previously
+     * this picked the Constructor/Method first, which has 0 callers. */
     int best = 0;
+    bool has_class = false;
+    int class_idx = -1;
     for (int i = 0; i < node_count; i++) {
-        if (nodes[i].label && (strcmp(nodes[i].label, "Function") == 0 ||
-                               strcmp(nodes[i].label, "Method") == 0)) {
+        const char *lbl = nodes[i].label;
+        if (lbl && (strcmp(lbl, "Class") == 0 || strcmp(lbl, "Interface") == 0)) {
+            has_class = true;
+            if (class_idx < 0) class_idx = i;
+        }
+    }
+    /* Look for a non-constructor Function/Method (skip if same name as Class) */
+    bool found_callable = false;
+    for (int i = 0; i < node_count; i++) {
+        const char *lbl = nodes[i].label;
+        if (lbl && (strcmp(lbl, "Function") == 0 || strcmp(lbl, "Method") == 0)) {
+            if (has_class) continue; /* skip constructor */
             best = i;
+            found_callable = true;
             break;
         }
+    }
+    if (!found_callable && class_idx >= 0) {
+        best = class_idx;
+    }
+
+    /* Resolve start IDs: if target is a Class/Interface, expand through
+     * DEFINES_METHOD edges to get all method node IDs for BFS. */
+    int64_t *start_ids = NULL;
+    int start_id_count = 0;
+    bool is_class_like = false;
+    const char *best_label = nodes[best].label;
+    if (best_label &&
+        (strcmp(best_label, "Class") == 0 || strcmp(best_label, "Interface") == 0)) {
+        is_class_like = true;
+    }
+
+    if (is_class_like) {
+        cbm_edge_t *dm_edges = NULL;
+        int dm_count = 0;
+        cbm_store_find_edges_by_source_type(store, nodes[best].id, "DEFINES_METHOD",
+                                            &dm_edges, &dm_count);
+        if (dm_count > 0) {
+            /* For impact we use all methods (unlike trace which caps at 5) */
+            int use_count = dm_count > 30 ? 30 : dm_count;
+            start_ids = malloc((size_t)use_count * sizeof(int64_t));
+            for (int i = 0; i < use_count; i++) {
+                start_ids[i] = dm_edges[i].target_id;
+            }
+            start_id_count = use_count;
+        }
+        for (int i = 0; i < dm_count; i++) {
+            free((void *)dm_edges[i].project);
+            free((void *)dm_edges[i].type);
+            free((void *)dm_edges[i].properties_json);
+        }
+        free(dm_edges);
+        if (start_id_count == 0) {
+            start_ids = malloc(sizeof(int64_t));
+            start_ids[0] = nodes[best].id;
+            start_id_count = 1;
+        }
+    } else {
+        start_ids = malloc(sizeof(int64_t));
+        start_ids[0] = nodes[best].id;
+        start_id_count = 1;
     }
 
     yyjson_mut_obj_add_strcpy(doc, root, "target", target);
@@ -1275,10 +1337,53 @@ static char *handle_get_impact(cbm_mcp_server_t *srv, const char *args) {
                               nodes[best].file_path ? nodes[best].file_path : "");
     yyjson_mut_obj_add_int(doc, root, "line", nodes[best].start_line);
 
-    /* BFS with full depth */
+    /* BFS from each start ID and merge results.  For classes this fans out
+     * through all methods, giving a true blast radius instead of 0. */
     const char *call_types[] = {"CALLS", "HTTP_CALLS", "ASYNC_CALLS", "USAGE"};
     cbm_traverse_result_t tr = {0};
-    cbm_store_bfs(store, nodes[best].id, bfs_dir, call_types, 4, max_depth, 200, &tr);
+
+    if (start_id_count == 1) {
+        cbm_store_bfs(store, start_ids[0], bfs_dir, call_types, 4, max_depth, 200, &tr);
+    } else {
+        /* Multi-method BFS: run from each method, collect unique visited nodes */
+        cbm_traverse_result_t *subs = calloc((size_t)start_id_count, sizeof(*subs));
+        int total_visited = 0;
+        for (int s = 0; s < start_id_count; s++) {
+            cbm_store_bfs(store, start_ids[s], bfs_dir, call_types, 4, max_depth,
+                          200, &subs[s]);
+            total_visited += subs[s].visited_count;
+        }
+        /* Merge into tr: allocate worst-case, then dedup by node id */
+        if (total_visited > 0) {
+            tr.visited = malloc((size_t)total_visited * sizeof(cbm_node_hop_t));
+            tr.visited_count = 0;
+            for (int s = 0; s < start_id_count; s++) {
+                for (int v = 0; v < subs[s].visited_count; v++) {
+                    int64_t vid = subs[s].visited[v].node.id;
+                    /* Check for duplicate (same node already in tr) */
+                    bool dup = false;
+                    for (int e = 0; e < tr.visited_count; e++) {
+                        if (tr.visited[e].node.id == vid) {
+                            /* Keep the one with smaller hop (closer = more impacted) */
+                            if (subs[s].visited[v].hop < tr.visited[e].hop)
+                                tr.visited[e].hop = subs[s].visited[v].hop;
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup && tr.visited_count < total_visited) {
+                        tr.visited[tr.visited_count] = subs[s].visited[v];
+                        tr.visited_count++;
+                    }
+                }
+            }
+        }
+        /* Free sub-traversals (but NOT their visited[].node fields — we moved them) */
+        for (int s = 0; s < start_id_count; s++) {
+            free(subs[s].edges);
+        }
+        free(subs);
+    }
 
     /* Group by depth */
     yyjson_mut_val *d1_arr = yyjson_mut_arr(doc);
@@ -1332,7 +1437,9 @@ static char *handle_get_impact(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_strcpy(doc, summary, "d3", d3_label);
     yyjson_mut_obj_add_val(doc, root, "summary", summary);
 
-    /* Affected processes */
+    /* Affected processes — match by checking if any BFS-visited node name
+     * appears in the process label, OR if the target name itself appears.
+     * This catches processes that flow through the target's methods. */
     {
         cbm_process_info_t *procs = NULL;
         int pcount = 0;
@@ -1340,7 +1447,20 @@ static char *handle_get_impact(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_val *paff = yyjson_mut_arr(doc);
         int pc = 0;
         for (int pi = 0; pi < pcount && pc < 20; pi++) {
-            if (procs[pi].label && target && strstr(procs[pi].label, target)) {
+            if (!procs[pi].label) continue;
+            bool match = false;
+            /* Check target name */
+            if (target && strstr(procs[pi].label, target)) match = true;
+            /* Check BFS-visited node names (d=1 callers are most likely) */
+            if (!match) {
+                for (int v = 0; v < tr.visited_count && !match; v++) {
+                    if (tr.visited[v].hop == 1 && tr.visited[v].node.name &&
+                        strstr(procs[pi].label, tr.visited[v].node.name)) {
+                        match = true;
+                    }
+                }
+            }
+            if (match) {
                 yyjson_mut_val *pitem = yyjson_mut_obj(doc);
                 yyjson_mut_obj_add_strcpy(doc, pitem, "label", procs[pi].label);
                 yyjson_mut_obj_add_int(doc, pitem, "step_count", procs[pi].step_count);
@@ -1356,6 +1476,7 @@ static char *handle_get_impact(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_free(doc);
     cbm_store_traverse_free(&tr);
     cbm_store_free_nodes(nodes, node_count);
+    free(start_ids);
     free(target); free(project); free(direction);
     char *result = cbm_mcp_text_result(json, false);
     free(json);
