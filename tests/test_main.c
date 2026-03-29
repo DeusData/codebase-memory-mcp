@@ -49,6 +49,7 @@ extern void suite_cli(void);
 extern void suite_system_info(void);
 extern void suite_worker_pool(void);
 extern void suite_parallel(void);
+extern void suite_pkgmap(void);
 extern void suite_mem(void);
 extern void suite_ui(void);
 extern void suite_security(void);
@@ -133,6 +134,9 @@ int main(void) {
 
     /* Parallel pipeline */
     RUN_SUITE(parallel);
+
+    /* Package specifier resolution (JS/TS monorepos) */
+    RUN_SUITE(pkgmap);
 
     /* mem + arena + slab integration */
     RUN_SUITE(mem);

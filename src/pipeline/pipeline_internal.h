@@ -44,7 +44,32 @@ typedef struct {
      * and pass_calls/usages/semantic reuse cached results instead of re-extracting.
      * Indexed by file position in the files[] array. Owned by pipeline.c. */
     CBMFileResult **result_cache;
+
+    /* Package specifier → module QN map for JS/TS monorepo resolution.
+     * Built by cbm_pipeline_build_pkg_map() before pass_definitions.
+     * NULL when no package.json files found. Read-only during passes. */
+    CBMHashTable *pkg_map;
 } cbm_pipeline_ctx_t;
+
+/* Package map entry: resolved package metadata. */
+typedef struct {
+    char *module_qn; /* fqn_module result for the entry point */
+    char *pkg_dir;   /* relative path to package directory (for subpath resolution) */
+} cbm_pkg_entry_t;
+
+/* Build package specifier map by scanning for package.json files.
+ * Returns a hash table (package name → cbm_pkg_entry_t*), or NULL if
+ * no packages found. Caller must free with cbm_pipeline_free_pkg_map(). */
+CBMHashTable *cbm_pipeline_build_pkg_map(const char *repo_path, const char *project_name);
+
+/* Free a package map and all its entries. NULL-safe. */
+void cbm_pipeline_free_pkg_map(CBMHashTable *pkg_map);
+
+/* Resolve a module specifier to a QN string.
+ * If module_path is a package specifier and found in pkg_map, returns the
+ * mapped QN. Otherwise falls back to cbm_pipeline_fqn_module().
+ * Caller must free() the returned string. */
+char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *module_path);
 
 /* Check cancellation. Returns non-zero if cancelled. */
 static inline int cbm_pipeline_check_cancel(const cbm_pipeline_ctx_t *ctx) {

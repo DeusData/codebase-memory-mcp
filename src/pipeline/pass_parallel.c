@@ -644,7 +644,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                 continue;
             }
 
-            char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
+            char *target_qn = cbm_pipeline_resolve_module(ctx, imp->module_path);
             const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
 
             char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
