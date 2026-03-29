@@ -1,5 +1,7 @@
 # codebase-memory-mcp
 
+[![SafeSkill 84/100](https://img.shields.io/badge/SafeSkill-84%2F100_Passes%20with%20Notes-yellow)](https://safeskill.dev/scan/deusdata-codebase-memory-mcp)
+
 [![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/dry-run.yml?label=CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/dry-run.yml)
