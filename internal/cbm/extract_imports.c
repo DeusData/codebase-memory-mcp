@@ -340,6 +340,88 @@ static void walk_es_imports(CBMExtractCtx *ctx, TSNode node) {
         return;
     }
 
+    /* CommonJS: const X = require("Y"), const { A, B } = require("Y")
+     * Tree-sitter structure: variable_declarator → name + value(call_expression)
+     * We detect require() calls inside lexical_declaration/variable_declaration. */
+    if (strcmp(kind, "variable_declarator") == 0 || strcmp(kind, "assignment_expression") == 0) {
+        TSNode value = ts_node_child_by_field_name(node, "value", 5);
+        if (ts_node_is_null(value)) {
+            value = ts_node_child_by_field_name(node, "right", 5);
+        }
+        if (!ts_node_is_null(value) && strcmp(ts_node_type(value), "call_expression") == 0) {
+            TSNode func = ts_node_child_by_field_name(value, "function", 8);
+            if (!ts_node_is_null(func) && strcmp(ts_node_type(func), "identifier") == 0) {
+                char *fname = cbm_node_text(a, func, ctx->source);
+                if (fname && strcmp(fname, "require") == 0) {
+                    /* Extract the require() argument */
+                    TSNode args = ts_node_child_by_field_name(value, "arguments", 9);
+                    if (!ts_node_is_null(args) && ts_node_named_child_count(args) > 0) {
+                        TSNode arg0 = ts_node_named_child(args, 0);
+                        const char *at = ts_node_type(arg0);
+                        if (strcmp(at, "string") == 0 || strcmp(at, "string_literal") == 0 ||
+                            strcmp(at, "template_string") == 0) {
+                            char *path = strip_quotes(a, cbm_node_text(a, arg0, ctx->source));
+                            if (path && path[0]) {
+                                /* Get the variable name(s) being assigned */
+                                TSNode lhs = ts_node_child_by_field_name(node, "name", 4);
+                                if (ts_node_is_null(lhs)) {
+                                    lhs = ts_node_child_by_field_name(node, "left", 4);
+                                }
+                                if (!ts_node_is_null(lhs)) {
+                                    const char *lk = ts_node_type(lhs);
+                                    if (strcmp(lk, "identifier") == 0) {
+                                        char *name = cbm_node_text(a, lhs, ctx->source);
+                                        CBMImport imp = {.local_name = name, .module_path = path};
+                                        cbm_imports_push(&ctx->result->imports, a, imp);
+                                    } else if (strcmp(lk, "object_pattern") == 0) {
+                                        /* Destructured: const { A, B } = require("Y") */
+                                        uint32_t nc = ts_node_named_child_count(lhs);
+                                        for (uint32_t k = 0; k < nc; k++) {
+                                            TSNode prop = ts_node_named_child(lhs, k);
+                                            const char *pk = ts_node_type(prop);
+                                            if (strcmp(pk, "shorthand_property_identifier_pattern") == 0 ||
+                                                strcmp(pk, "shorthand_property_identifier") == 0 ||
+                                                strcmp(pk, "identifier") == 0) {
+                                                char *name = cbm_node_text(a, prop, ctx->source);
+                                                CBMImport imp = {.local_name = name, .module_path = path};
+                                                cbm_imports_push(&ctx->result->imports, a, imp);
+                                            } else if (strcmp(pk, "pair_pattern") == 0 ||
+                                                       strcmp(pk, "pair") == 0) {
+                                                TSNode val = ts_node_child_by_field_name(prop, "value", 5);
+                                                if (!ts_node_is_null(val)) {
+                                                    char *name = cbm_node_text(a, val, ctx->source);
+                                                    CBMImport imp = {.local_name = name, .module_path = path};
+                                                    cbm_imports_push(&ctx->result->imports, a, imp);
+                                                }
+                                            }
+                                        }
+                                    } else if (strcmp(lk, "array_pattern") == 0) {
+                                        /* Array destructured: const [A, B] = require("Y") */
+                                        uint32_t nc = ts_node_named_child_count(lhs);
+                                        for (uint32_t k = 0; k < nc; k++) {
+                                            TSNode elem = ts_node_named_child(lhs, k);
+                                            if (strcmp(ts_node_type(elem), "identifier") == 0) {
+                                                char *name = cbm_node_text(a, elem, ctx->source);
+                                                CBMImport imp = {.local_name = name, .module_path = path};
+                                                cbm_imports_push(&ctx->result->imports, a, imp);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    /* Fallback: use last path segment as name */
+                                    CBMImport imp = {.local_name = path_last(a, path),
+                                                     .module_path = path};
+                                    cbm_imports_push(&ctx->result->imports, a, imp);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        /* Don't return — let it recurse to catch nested requires */
+    }
+
 recurse:;
     uint32_t count = ts_node_child_count(node);
     for (uint32_t i = 0; i < count; i++) {

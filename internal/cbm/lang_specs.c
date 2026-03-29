@@ -114,6 +114,7 @@ static const char *js_class_types[] = {"class_declaration", "class", NULL};
 static const char *js_module_types[] = {"program", NULL};
 static const char *js_call_types[] = {"call_expression", NULL};
 static const char *js_import_types[] = {"import_statement", "lexical_declaration",
+                                        "variable_declaration", "expression_statement",
                                         "export_statement", NULL};
 static const char *js_branch_types[] = {"if_statement",    "for_statement",    "for_in_statement",
                                         "while_statement", "switch_statement", "case_clause",
