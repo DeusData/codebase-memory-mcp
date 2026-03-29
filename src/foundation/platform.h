@@ -70,6 +70,17 @@ int cbm_default_worker_count(bool initial);
  * Returns NULL when neither is set. */
 const char *cbm_get_home_dir(void);
 
+/* App data directories (cross-platform).
+ * Windows: APPDATA (Roaming) — e.g. C:/Users/.../AppData/Roaming
+ * macOS:   HOME (callers append "Library/Application Support/...")
+ * Linux:   XDG_CONFIG_HOME or ~/.config
+ * Returns NULL when the directory cannot be determined. */
+const char *cbm_app_config_dir(void);
+
+/* Windows: LOCALAPPDATA — e.g. C:/Users/.../AppData/Local
+ * macOS/Linux: same as cbm_app_config_dir(). */
+const char *cbm_app_local_dir(void);
+
 /* ── File system ───────────────────────────────────────────────── */
 
 /* Check if a path exists. */

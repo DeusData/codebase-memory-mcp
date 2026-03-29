@@ -108,6 +108,40 @@ char *cbm_normalize_path_sep(char *path) {
     return path;
 }
 
+const char *cbm_app_config_dir(void) {
+    static char buf[1024];
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
+    const char *d = getenv("APPDATA");
+    if (!d || !d[0]) {
+        const char *home = cbm_get_home_dir();
+        if (!home) {
+            return NULL;
+        }
+        snprintf(buf, sizeof(buf), "%s/AppData/Roaming", home);
+        return buf;
+    }
+    snprintf(buf, sizeof(buf), "%s", d);
+    cbm_normalize_path_sep(buf);
+    return buf;
+}
+
+const char *cbm_app_local_dir(void) {
+    static char buf[1024];
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
+    const char *d = getenv("LOCALAPPDATA");
+    if (!d || !d[0]) {
+        const char *home = cbm_get_home_dir();
+        if (!home) {
+            return NULL;
+        }
+        snprintf(buf, sizeof(buf), "%s/AppData/Local", home);
+        return buf;
+    }
+    snprintf(buf, sizeof(buf), "%s", d);
+    cbm_normalize_path_sep(buf);
+    return buf;
+}
+
 #else /* POSIX (macOS + Linux) */
 
 /* ── POSIX implementation ─────────────────────────────────────── */
@@ -261,3 +295,33 @@ const char *cbm_get_home_dir(void) {
     }
     return NULL;
 }
+
+#ifndef _WIN32
+const char *cbm_app_config_dir(void) {
+    static char buf[1024];
+#ifdef __APPLE__
+    /* macOS: callers prepend "Library/Application Support/..." */
+    return cbm_get_home_dir();
+#else
+    /* Linux: XDG_CONFIG_HOME or ~/.config */
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    if (xdg && xdg[0]) {
+        snprintf(buf, sizeof(buf), "%s", xdg);
+        return buf;
+    }
+    const char *home = cbm_get_home_dir();
+    if (!home) {
+        return NULL;
+    }
+    snprintf(buf, sizeof(buf), "%s/.config", home);
+    return buf;
+#endif
+}
+
+const char *cbm_app_local_dir(void) {
+    /* On POSIX there is no distinction between "roaming" and "local" app data.
+     * Delegate to cbm_app_config_dir() so callers compile on all platforms. */
+    return cbm_app_config_dir();
+}
+#endif /* _WIN32 */

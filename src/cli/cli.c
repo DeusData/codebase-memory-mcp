@@ -900,13 +900,26 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     }
 
     /* Zed: platform-specific config dir */
+    {
 #ifdef __APPLE__
-    snprintf(path, sizeof(path), "%s/Library/Application Support/Zed", home_dir);
+        const char *zed_base = cbm_app_config_dir();
+        if (zed_base) {
+            snprintf(path, sizeof(path), "%s/Library/Application Support/Zed", zed_base);
+        }
+#elif defined(_WIN32)
+        const char *zed_base = cbm_app_local_dir();
+        if (zed_base) {
+            snprintf(path, sizeof(path), "%s/Zed", zed_base);
+        }
 #else
-    snprintf(path, sizeof(path), "%s/.config/zed", home_dir);
+        const char *zed_base = cbm_app_config_dir();
+        if (zed_base) {
+            snprintf(path, sizeof(path), "%s/zed", zed_base);
+        }
 #endif
-    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
-        agents.zed = true;
+        if (zed_base && stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            agents.zed = true;
+        }
     }
 
     /* OpenCode: binary on PATH */
@@ -935,13 +948,18 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     }
 
     /* VS Code: User config dir */
+    {
+        const char *app_cfg = cbm_app_config_dir();
+        if (app_cfg) {
 #ifdef __APPLE__
-    snprintf(path, sizeof(path), "%s/Library/Application Support/Code/User", home_dir);
+            snprintf(path, sizeof(path), "%s/Library/Application Support/Code/User", app_cfg);
 #else
-    snprintf(path, sizeof(path), "%s/.config/Code/User", home_dir);
+            snprintf(path, sizeof(path), "%s/Code/User", app_cfg);
 #endif
-    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
-        agents.vscode = true;
+            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                agents.vscode = true;
+            }
+        }
     }
 
     /* OpenClaw: ~/.openclaw/ dir */
@@ -2510,9 +2528,11 @@ static void cbm_install_agent_configs(const char *home, const char *binary_path,
         char config_path[1024];
 #ifdef __APPLE__
         snprintf(config_path, sizeof(config_path),
-                 "%s/Library/Application Support/Zed/settings.json", home);
+                 "%s/Library/Application Support/Zed/settings.json", cbm_app_config_dir());
+#elif defined(_WIN32)
+        snprintf(config_path, sizeof(config_path), "%s/Zed/settings.json", cbm_app_local_dir());
 #else
-        snprintf(config_path, sizeof(config_path), "%s/.config/zed/settings.json", home);
+        snprintf(config_path, sizeof(config_path), "%s/zed/settings.json", cbm_app_config_dir());
 #endif
         if (!dry_run) {
             cbm_install_zed_mcp(binary_path, config_path);
@@ -2591,11 +2611,12 @@ static void cbm_install_agent_configs(const char *home, const char *binary_path,
     if (agents.vscode) {
         printf("VS Code:\n");
         char config_path[1024];
+        const char *vs_cfg = cbm_app_config_dir();
 #ifdef __APPLE__
         snprintf(config_path, sizeof(config_path),
-                 "%s/Library/Application Support/Code/User/mcp.json", home);
+                 "%s/Library/Application Support/Code/User/mcp.json", vs_cfg);
 #else
-        snprintf(config_path, sizeof(config_path), "%s/.config/Code/User/mcp.json", home);
+        snprintf(config_path, sizeof(config_path), "%s/Code/User/mcp.json", vs_cfg);
 #endif
         if (!dry_run) {
             cbm_install_vscode_mcp(binary_path, config_path);
@@ -2812,9 +2833,11 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         char config_path[1024];
 #ifdef __APPLE__
         snprintf(config_path, sizeof(config_path),
-                 "%s/Library/Application Support/Zed/settings.json", home);
+                 "%s/Library/Application Support/Zed/settings.json", cbm_app_config_dir());
+#elif defined(_WIN32)
+        snprintf(config_path, sizeof(config_path), "%s/Zed/settings.json", cbm_app_local_dir());
 #else
-        snprintf(config_path, sizeof(config_path), "%s/.config/zed/settings.json", home);
+        snprintf(config_path, sizeof(config_path), "%s/zed/settings.json", cbm_app_config_dir());
 #endif
         if (!dry_run) {
             cbm_remove_zed_mcp(config_path);
@@ -2883,11 +2906,12 @@ int cbm_cmd_uninstall(int argc, char **argv) {
 
     if (agents.vscode) {
         char config_path[1024];
+        const char *vs_cfg = cbm_app_config_dir();
 #ifdef __APPLE__
         snprintf(config_path, sizeof(config_path),
-                 "%s/Library/Application Support/Code/User/mcp.json", home);
+                 "%s/Library/Application Support/Code/User/mcp.json", vs_cfg);
 #else
-        snprintf(config_path, sizeof(config_path), "%s/.config/Code/User/mcp.json", home);
+        snprintf(config_path, sizeof(config_path), "%s/Code/User/mcp.json", vs_cfg);
 #endif
         if (!dry_run) {
             cbm_remove_vscode_mcp(config_path);
