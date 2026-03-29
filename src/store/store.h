@@ -163,11 +163,15 @@ typedef struct {
 typedef struct {
     const char *label;
     int count;
+    char **properties;    /* distinct property keys for this label (base + JSON) */
+    int property_count;
 } cbm_label_count_t;
 
 typedef struct {
     const char *type;
     int count;
+    char **properties;    /* distinct property keys for this edge type (base + JSON) */
+    int property_count;
 } cbm_type_count_t;
 
 typedef struct {
