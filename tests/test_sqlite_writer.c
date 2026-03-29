@@ -372,6 +372,69 @@ TEST(sw_multi_page) {
     PASS();
 }
 
+/* ── Oversized node: properties JSON > 65KB triggers overflow pages ─ */
+
+TEST(sw_oversized_node) {
+    char path[256];
+    ASSERT_EQ(make_temp_db(path, sizeof(path)), 0);
+
+    /* Build a properties JSON string that exceeds max_local (65501 bytes).
+     * Use 70000 bytes of padding inside the JSON value so the full record,
+     * which includes other text columns, is well above the threshold. */
+    int prop_len = 70000;
+    char *big_props = (char *)malloc(prop_len + 1);
+    ASSERT_NOT_NULL(big_props);
+    memset(big_props, 'x', prop_len);
+    big_props[0] = '"';
+    big_props[prop_len - 1] = '"';
+    big_props[prop_len] = '\0';
+
+    CBMDumpNode nodes[1] = {{
+        .id = 1,
+        .project = "test",
+        .label = "Function",
+        .name = "huge_fn",
+        .qualified_name = "test.huge_fn",
+        .file_path = "huge.go",
+        .start_line = 1,
+        .end_line = 9999,
+        .properties = big_props,
+    }};
+
+    int rc = cbm_write_db(path, "test", "/tmp/test", "2026-03-28T00:00:00Z", nodes, 1, NULL, 0);
+    free(big_props);
+    ASSERT_EQ(rc, 0);
+
+    sqlite3 *db = NULL;
+    rc = sqlite3_open(path, &db);
+    ASSERT_EQ(rc, SQLITE_OK);
+
+    /* Integrity check — SQLite will validate overflow page chain */
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &stmt, NULL);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "ok");
+    sqlite3_finalize(stmt);
+
+    /* Verify we can read the node back */
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM nodes", -1, &stmt, NULL);
+    sqlite3_step(stmt);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+    sqlite3_finalize(stmt);
+
+    /* Verify the name round-trips correctly */
+    sqlite3_prepare_v2(db, "SELECT name FROM nodes WHERE id=1", -1, &stmt, NULL);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "huge_fn");
+    sqlite3_finalize(stmt);
+
+    sqlite3_close(db);
+    unlink(path);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(sqlite_writer) {
@@ -379,4 +442,5 @@ SUITE(sqlite_writer) {
     RUN_TEST(sw_scale_and_indexes);
     RUN_TEST(sw_empty);
     RUN_TEST(sw_multi_page);
+    RUN_TEST(sw_oversized_node);
 }
