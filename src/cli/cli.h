@@ -118,6 +118,7 @@ typedef struct {
     bool antigravity; /* ~/.gemini/antigravity/ exists */
     bool aider;       /* aider on PATH */
     bool kilocode;    /* KiloCode globalStorage dir exists */
+    bool kiro;        /* ~/.kiro/ exists */
     bool vscode;      /* VS Code User config dir exists */
     bool openclaw;    /* ~/.openclaw/ exists */
 } cbm_detected_agents_t;
