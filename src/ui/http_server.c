@@ -16,6 +16,7 @@
 #include "ui/layout3d.h"
 #include "mcp/mcp.h"
 #include "store/store.h"
+#include "cli/cli.h"
 /* pipeline.h no longer needed — indexing runs as subprocess */
 #include "foundation/log.h"
 #include "foundation/platform.h"
@@ -452,11 +453,10 @@ static void handle_adr_get(struct mg_connection *c, struct mg_http_message *hm) 
         return;
     }
 
-    const char *home = cbm_get_home_dir();
-    if (!home)
-        home = cbm_tmpdir();
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) cache_dir = cbm_tmpdir();
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home, name);
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache_dir, name);
 
     cbm_store_t *store = cbm_store_open_path(db_path);
     if (!store) {
@@ -545,11 +545,10 @@ static void handle_adr_save(struct mg_connection *c, struct mg_http_message *hm)
     const char *proj = yyjson_get_str(v_proj);
     const char *content = yyjson_get_str(v_content);
 
-    const char *home = cbm_get_home_dir();
-    if (!home)
-        home = cbm_tmpdir();
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) cache_dir = cbm_tmpdir();
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home, proj);
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache_dir, proj);
 
     cbm_store_t *store = cbm_store_open_path(db_path);
     yyjson_doc_free(doc);
@@ -846,11 +845,10 @@ static void handle_delete_project(struct mg_connection *c, struct mg_http_messag
         return;
     }
 
-    const char *home = cbm_get_home_dir();
-    if (!home)
-        home = cbm_tmpdir();
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) cache_dir = cbm_tmpdir();
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home, name);
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache_dir, name);
 
     if (!cbm_file_exists(db_path)) {
         mg_http_reply(c, 404, g_cors_json,
@@ -884,11 +882,10 @@ static void handle_project_health(struct mg_connection *c, struct mg_http_messag
         return;
     }
 
-    const char *home = cbm_get_home_dir();
-    if (!home)
-        home = cbm_tmpdir();
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) cache_dir = cbm_tmpdir();
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home, name);
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache_dir, name);
 
     if (!cbm_file_exists(db_path)) {
         mg_http_reply(c, 200, g_cors_json,
@@ -942,11 +939,10 @@ static void handle_layout(struct mg_connection *c, struct mg_http_message *hm) {
     }
 
     /* Open a read-only store for this project */
-    const char *home = cbm_get_home_dir();
-    if (!home)
-        home = cbm_tmpdir();
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) cache_dir = cbm_tmpdir();
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home, project);
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache_dir, project);
 
     if (!cbm_file_exists(db_path)) {
         mg_http_reply(c, 404, g_cors_json,

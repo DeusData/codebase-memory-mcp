@@ -9,6 +9,7 @@
 // for ISO timestamp
 
 #include "store/store.h"
+#include "cli/cli.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
 #include "foundation/compat_regex.h"
@@ -457,13 +458,15 @@ cbm_store_t *cbm_store_open(const char *project) {
     if (!project) {
         return NULL;
     }
-    /* Build path: ~/.cache/codebase-memory-mcp/<project>.db */
-    const char *home = cbm_get_home_dir();
-    if (!home) {
-        home = cbm_tmpdir();
+    /* Build path: <cache_dir>/<project>.db
+     * Cache dir is resolved via CBM_CACHE_DIR env var or ~/.cache/codebase-memory-mcp */
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) {
+        /* Fallback to tmp if home is unavailable */
+        cache_dir = cbm_tmpdir();
     }
     char path[1024];
-    snprintf(path, sizeof(path), "%s/.cache/codebase-memory-mcp/%s.db", home, project);
+    snprintf(path, sizeof(path), "%s/%s.db", cache_dir, project);
     return store_open_internal(path, false);
 }
 

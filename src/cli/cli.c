@@ -1872,16 +1872,29 @@ unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_l
 
 /* ── Index management ─────────────────────────────────────────── */
 
-static const char *get_cache_dir(const char *home_dir) {
+const char *cbm_resolve_cache_dir(void) {
     static char buf[1024];
-    if (!home_dir) {
-        home_dir = cbm_get_home_dir();
+    /* CBM_CACHE_DIR env var takes highest priority */
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
+    const char *env_dir = getenv("CBM_CACHE_DIR");
+    if (env_dir && env_dir[0] != '\0') {
+        snprintf(buf, sizeof(buf), "%s", env_dir);
+        return buf;
     }
+    /* Default: ~/.cache/codebase-memory-mcp */
+    const char *home_dir = cbm_get_home_dir();
     if (!home_dir) {
         return NULL;
     }
     snprintf(buf, sizeof(buf), "%s/.cache/codebase-memory-mcp", home_dir);
     return buf;
+}
+
+static const char *get_cache_dir(const char *home_dir) {
+    /* home_dir argument is ignored — use cbm_resolve_cache_dir() for
+     * consistent env-var and default resolution. */
+    (void)home_dir;
+    return cbm_resolve_cache_dir();
 }
 
 int cbm_list_indexes(const char *home_dir) {
@@ -2096,17 +2109,16 @@ int cbm_cmd_config(int argc, char **argv) {
                "Enable auto-indexing on MCP session start");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX_LIMIT, "50000",
                "Max files for auto-indexing new projects");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_CACHE_DIR, "(auto)",
+               "Cache directory (read-only display; set via CBM_CACHE_DIR env var)");
         return 0;
     }
 
-    const char *home = cbm_get_home_dir();
-    if (!home) {
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) {
         fprintf(stderr, "error: HOME not set (use USERPROFILE on Windows)\n");
         return 1;
     }
-
-    char cache_dir[1024];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
 
     cbm_config_t *cfg = cbm_config_open(cache_dir);
     if (!cfg) {
@@ -2121,6 +2133,7 @@ int cbm_cmd_config(int argc, char **argv) {
                cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX, "false"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX_LIMIT,
                cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "50000"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_CACHE_DIR, cache_dir);
     } else if (strcmp(argv[0], "get") == 0) {
         if (argc < 2) {
             fprintf(stderr, "Usage: config get <key>\n");

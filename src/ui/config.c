@@ -6,6 +6,7 @@
  */
 #include "ui/config.h"
 #include "ui/embedded_assets.h"
+#include "cli/cli.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/compat_fs.h"
@@ -20,11 +21,9 @@
 /* ── Path ────────────────────────────────────────────────────── */
 
 void cbm_ui_config_path(char *buf, int bufsz) {
-    const char *home = cbm_get_home_dir();
-    if (!home) {
-        home = cbm_tmpdir();
-    }
-    snprintf(buf, (size_t)bufsz, "%s/.cache/codebase-memory-mcp/config.json", home);
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) cache_dir = cbm_tmpdir();
+    snprintf(buf, (size_t)bufsz, "%s/config.json", cache_dir);
 }
 
 /* ── Load ────────────────────────────────────────────────────── */

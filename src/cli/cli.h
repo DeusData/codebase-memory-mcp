@@ -242,6 +242,12 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key);
 /* Well-known config keys */
 #define CBM_CONFIG_AUTO_INDEX "auto_index"
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
+#define CBM_CONFIG_CACHE_DIR "cache_dir"
+
+/* Resolve the cache directory.
+ * Priority: CBM_CACHE_DIR env var → ~/.cache/codebase-memory-mcp
+ * Returns a pointer to a static buffer; do not free. */
+const char *cbm_resolve_cache_dir(void);
 
 /* ── Subcommands (wired from main.c) ─────────────────────────── */
 
