@@ -271,6 +271,13 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                     cbm_gbuf_insert_edge(ctx->gbuf, parent->id, node_id, "DEFINES_METHOD", "{}");
                 }
             }
+            /* HAS_PROPERTY edge: Class → Property */
+            if (def->parent_class && def->label && strcmp(def->label, "Property") == 0) {
+                const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(ctx->gbuf, def->parent_class);
+                if (parent && node_id > 0) {
+                    cbm_gbuf_insert_edge(ctx->gbuf, parent->id, node_id, "HAS_PROPERTY", "{}");
+                }
+            }
 
             total_defs++;
         }

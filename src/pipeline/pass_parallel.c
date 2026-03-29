@@ -943,6 +943,14 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                                          "{}");
                 }
             }
+            /* HAS_PROPERTY edge: Class → Property */
+            if (def->parent_class && def->label && strcmp(def->label, "Property") == 0) {
+                const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(ctx->gbuf, def->parent_class);
+                if (parent && def_node) {
+                    cbm_gbuf_insert_edge(ctx->gbuf, parent->id, def_node->id, "HAS_PROPERTY",
+                                         "{}");
+                }
+            }
         }
 
         /* IMPORTS edges */

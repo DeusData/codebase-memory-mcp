@@ -1810,6 +1810,61 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
             continue;
         }
 
+        /* C#/Java property extraction: property_declaration, auto_property_declaration.
+         * Creates a "Property" node with parent_class set for DEFINES_METHOD edge. */
+        const char *child_type = ts_node_type(child);
+        if (child_type &&
+            (strcmp(child_type, "property_declaration") == 0 ||
+             strcmp(child_type, "indexer_declaration") == 0 ||
+             strcmp(child_type, "event_declaration") == 0 ||
+             strcmp(child_type, "event_field_declaration") == 0)) {
+            TSNode name_node = ts_node_child_by_field_name(child, "name", 4);
+            if (ts_node_is_null(name_node)) {
+                /* indexer_declaration doesn't have a 'name' field, use "this" */
+                if (strcmp(child_type, "indexer_declaration") == 0) {
+                    CBMDefinition pdef;
+                    memset(&pdef, 0, sizeof(pdef));
+                    pdef.name = cbm_arena_strdup(ctx->arena, "this[]");
+                    pdef.qualified_name = cbm_arena_sprintf(ctx->arena, "%s.this[]", class_qn);
+                    pdef.label = "Property";
+                    pdef.file_path = ctx->rel_path;
+                    pdef.parent_class = class_qn;
+                    pdef.start_line = ts_node_start_point(child).row + 1;
+                    pdef.end_line = ts_node_end_point(child).row + 1;
+                    pdef.lines = (int)(pdef.end_line - pdef.start_line + 1);
+                    TSNode type_node = ts_node_child_by_field_name(child, "type", 4);
+                    if (!ts_node_is_null(type_node)) {
+                        pdef.return_type = cbm_node_text(ctx->arena, type_node, ctx->source);
+                    }
+                    cbm_defs_push(&ctx->result->defs, ctx->arena, pdef);
+                }
+                continue;
+            }
+            char *pname = cbm_node_text(ctx->arena, name_node, ctx->source);
+            if (pname && pname[0]) {
+                CBMDefinition pdef;
+                memset(&pdef, 0, sizeof(pdef));
+                pdef.name = pname;
+                pdef.qualified_name = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, pname);
+                pdef.label = "Property";
+                pdef.file_path = ctx->rel_path;
+                pdef.parent_class = class_qn;
+                pdef.start_line = ts_node_start_point(child).row + 1;
+                pdef.end_line = ts_node_end_point(child).row + 1;
+                pdef.lines = (int)(pdef.end_line - pdef.start_line + 1);
+                pdef.is_exported = cbm_is_exported(pname, ctx->language);
+                /* Extract type */
+                TSNode type_node = ts_node_child_by_field_name(child, "type", 4);
+                if (!ts_node_is_null(type_node)) {
+                    pdef.return_type = cbm_node_text(ctx->arena, type_node, ctx->source);
+                }
+                pdef.decorators = extract_decorators(ctx->arena, child, ctx->source,
+                                                     ctx->language, spec);
+                cbm_defs_push(&ctx->result->defs, ctx->arena, pdef);
+            }
+            continue;
+        }
+
         if (!cbm_kind_in_set(child, spec->function_node_types)) {
             continue;
         }
