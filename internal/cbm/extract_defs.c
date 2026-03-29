@@ -1190,6 +1190,16 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         def.is_entry_point = true;
     }
 
+    // C/C++ entry point detection: WinMain, DllMain, GTest, MFC
+    if ((ctx->language == CBM_LANG_C || ctx->language == CBM_LANG_CPP) && !def.is_entry_point) {
+        if (strcmp(name, "WinMain") == 0 || strcmp(name, "wWinMain") == 0 ||
+            strcmp(name, "DllMain") == 0 || strcmp(name, "wmain") == 0 ||
+            strcmp(name, "_tmain") == 0 || strcmp(name, "InitInstance") == 0 ||
+            strcmp(name, "OnInitDialog") == 0) {
+            def.is_entry_point = true;
+        }
+    }
+
     // C# entry point detection: Windows Service lifecycle, ASP.NET controllers
     if (ctx->language == CBM_LANG_CSHARP && !def.is_entry_point) {
         // Windows Service lifecycle entry points
@@ -1724,6 +1734,16 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, const char *class_
     // Case-insensitive "main" check
     if (strcasecmp(name, "main") == 0) {
         def.is_entry_point = true;
+    }
+
+    // C/C++ entry point detection: WinMain, DllMain, GTest, MFC
+    if ((ctx->language == CBM_LANG_C || ctx->language == CBM_LANG_CPP) && !def.is_entry_point) {
+        if (strcmp(name, "WinMain") == 0 || strcmp(name, "wWinMain") == 0 ||
+            strcmp(name, "DllMain") == 0 || strcmp(name, "wmain") == 0 ||
+            strcmp(name, "_tmain") == 0 || strcmp(name, "InitInstance") == 0 ||
+            strcmp(name, "OnInitDialog") == 0) {
+            def.is_entry_point = true;
+        }
     }
 
     // C# entry point detection: Windows Service lifecycle, ASP.NET controllers
