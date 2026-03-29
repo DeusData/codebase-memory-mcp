@@ -4647,6 +4647,60 @@ int cbm_store_detect_processes(cbm_store_t *s, const char *project, int max_proc
         return 0;
     }
 
+    /* 1b. Resolve Route entry points to handler Functions.
+     * Route nodes have 0 outgoing edges (only incoming HANDLES from Modules).
+     * For each Route, find the Module that HANDLES it, then find Functions in
+     * the same file that have outgoing CALLS. Replace the Route entry point
+     * with those Functions — they're the real BFS starting points. */
+    {
+        const char *resolve_sql =
+            "SELECT DISTINCT fn.id, fn.name FROM edges e "
+            "JOIN nodes m ON m.id = e.source_id AND m.label = 'Module' "
+            "JOIN nodes fn ON fn.file_path = m.file_path "
+            "AND fn.label IN ('Function','Method') AND fn.project = ?2 "
+            "WHERE e.target_id = ?1 AND e.type = 'HANDLES' AND e.project = ?2";
+        sqlite3_stmt *res_stmt = NULL;
+        sqlite3_prepare_v2(s->db, resolve_sql, -1, &res_stmt, NULL);
+
+        if (res_stmt) {
+            int orig_count = ep_count;
+            for (int i = 0; i < orig_count; i++) {
+                /* Check if this entry point is a Route node */
+                const char *check_sql = "SELECT label FROM nodes WHERE id = ?1";
+                sqlite3_stmt *chk = NULL;
+                sqlite3_prepare_v2(s->db, check_sql, -1, &chk, NULL);
+                if (!chk) continue;
+                sqlite3_bind_int64(chk, 1, ep_ids[i]);
+                const char *label = NULL;
+                if (sqlite3_step(chk) == SQLITE_ROW) {
+                    label = (const char *)sqlite3_column_text(chk, 0);
+                }
+                bool is_route = (label && strcmp(label, "Route") == 0);
+                sqlite3_finalize(chk);
+
+                if (!is_route) continue;
+
+                /* Resolve Route → Module → Functions */
+                sqlite3_reset(res_stmt);
+                sqlite3_bind_int64(res_stmt, 1, ep_ids[i]);
+                bind_text(res_stmt, 2, project);
+
+                while (sqlite3_step(res_stmt) == SQLITE_ROW) {
+                    if (ep_count >= ep_cap) {
+                        ep_cap *= 2;
+                        ep_ids = safe_realloc(ep_ids, (size_t)ep_cap * sizeof(int64_t));
+                        ep_names = safe_realloc(ep_names, (size_t)ep_cap * sizeof(char *));
+                    }
+                    ep_ids[ep_count] = sqlite3_column_int64(res_stmt, 0);
+                    const char *fn_name = (const char *)sqlite3_column_text(res_stmt, 1);
+                    ep_names[ep_count] = heap_strdup(fn_name ? fn_name : "?");
+                    ep_count++;
+                }
+            }
+            sqlite3_finalize(res_stmt);
+        }
+    }
+
     /* 2. Load nodes + CALLS edges for Louvain */
     const char *nsql = "SELECT id FROM nodes WHERE project=?1 "
                        "AND label IN ('Function','Method','Class','Interface')";
@@ -4815,9 +4869,32 @@ int cbm_store_detect_processes(cbm_store_t *s, const char *project, int max_proc
             }
         }
 
+        /* If no cross-community terminal was found, still accept flows with ≥3 steps.
+         * This prevents filtering out legitimate API flows (route → controller → storage)
+         * that happen to stay within one Louvain community due to flat call patterns.
+         * Pick the deepest non-generic node as terminal for the label. */
         if (!is_cross) {
-            cbm_store_traverse_free(&tr);
-            continue;
+            if (tr.visited_count < 3) {
+                cbm_store_traverse_free(&tr);
+                continue;
+            }
+            /* Find best terminal by hop depth + name quality */
+            for (int v = 0; v < tr.visited_count; v++) {
+                const char *nm = tr.visited[v].node.name;
+                if (!nm) continue;
+                bool is_generic = false;
+                for (int g = 0; generic_names[g]; g++) {
+                    if (strcmp(nm, generic_names[g]) == 0) { is_generic = true; break; }
+                }
+                if (is_generic) continue;
+                int score = (int)strlen(nm) * 10 + tr.visited[v].hop * 5;
+                if (nm[0] >= 'A' && nm[0] <= 'Z') score += 50;
+                if (score > best_score) {
+                    best_score = score;
+                    terminal_id = tr.visited[v].node.id;
+                    terminal_name = nm;
+                }
+            }
         }
 
         /* Label: "EntryPoint → Terminal" (UTF-8 arrow) */
