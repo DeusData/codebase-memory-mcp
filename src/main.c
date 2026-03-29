@@ -232,12 +232,11 @@ int main(int argc, char **argv) {
     sigaction(SIGINT, &sa, NULL);
 #endif
 
-    /* Open config store for runtime settings */
-    char config_dir[1024];
-    const char *cfg_home = cbm_get_home_dir();
+    /* Open config store for runtime settings.
+     * Cache dir is resolved via CBM_CACHE_DIR env var or ~/.cache/codebase-memory-mcp */
     cbm_config_t *runtime_config = NULL;
-    if (cfg_home) {
-        snprintf(config_dir, sizeof(config_dir), "%s/.cache/codebase-memory-mcp", cfg_home);
+    const char *config_dir = cbm_resolve_cache_dir();
+    if (config_dir) {
         runtime_config = cbm_config_open(config_dir);
     }
 
