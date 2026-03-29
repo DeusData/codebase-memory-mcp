@@ -80,6 +80,17 @@ The `install` command automatically strips macOS quarantine attributes and ad-ho
 
 The `install` command auto-detects all installed coding agents and configures MCP server entries, instruction files, skills, and pre-tool hooks for each.
 
+### asdf
+If you are using [asdf-vm](https://asdf-vm.com), you can also install as follows:
+
+```shell
+asdf plugin add codebase-memory-mcp https://github.com/shaolang/asdf-codebase-memory-mcp
+asdf install codebase-memory-mcp latest
+asdf set codebase-memory-mcp latest     # or if you aren't in ~/, asdf set -p codebase-memory-mcp latest
+```
+
+Note that after running `codebase-memory-mcp install`, you'd need to update the coding agent's configuration (e.g., `~/.claude.json`) to point it to the correct path in asdf, i.e., `~/.asdf/shims/codebase-memory-mcp`, as codebase-memory-mcp assumes it's always located in `~/.local/bin`.
+
 ### Graph Visualization UI
 
 If you downloaded the `ui` variant:
