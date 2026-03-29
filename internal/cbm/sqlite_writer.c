@@ -690,6 +690,82 @@ static uint8_t *build_table_cell(int64_t rowid, const uint8_t *payload, int payl
     return cell;
 }
 
+// Build a table leaf cell with overflow: stores only the first local_len bytes of
+// payload inline, followed by a 4-byte overflow page number.
+// total_payload_len is the FULL original payload length (written as the payload-size
+// varint so SQLite knows the real record size).
+static uint8_t *build_table_cell_overflow(int64_t rowid, const uint8_t *payload,
+                                          int total_payload_len, int local_len,
+                                          uint32_t overflow_page, int *out_cell_len) {
+    int rl = varint_len(total_payload_len);
+    int kl = varint_len(rowid);
+    // cell = varint(total_payload_len) + varint(rowid) + payload[0..local_len) + uint32(overflow)
+    int total = rl + kl + local_len + 4;
+    uint8_t *cell = (uint8_t *)malloc(total);
+    if (!cell) {
+        return NULL;
+    }
+    int pos = 0;
+    pos += put_varint(cell + pos, total_payload_len);
+    pos += put_varint(cell + pos, rowid);
+    memcpy(cell + pos, payload, local_len);
+    pos += local_len;
+    put_u32(cell + pos, overflow_page);
+    pos += 4;
+    *out_cell_len = pos;
+    return cell;
+}
+
+// --- Overflow page writer ---
+// Writes overflow pages for payload bytes that exceed local storage.
+// Returns the first overflow page number (embedded in the leaf cell).
+// Each overflow page: 4-byte next-page pointer + up to (PAGE_SIZE-4) bytes of data.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+static uint32_t write_overflow_pages(FILE *fp, uint32_t *next_page, const uint8_t *data,
+                                     int data_len) {
+    int per_page = PAGE_SIZE - 4; // 4 bytes reserved for next-page pointer
+    uint32_t first_page = 0;
+    long prev_next_ptr_offset = -1; // file offset of the next-page field in the previous overflow page
+
+    int offset = 0;
+    while (offset < data_len) {
+        uint32_t pnum = (*next_page)++;
+        if (first_page == 0) {
+            first_page = pnum;
+        }
+
+        // Backpatch previous overflow page's next-page pointer
+        if (prev_next_ptr_offset >= 0) {
+            uint8_t ptr[4];
+            put_u32(ptr, pnum);
+            // NOLINTNEXTLINE(cert-err33-c)
+            fseek(fp, prev_next_ptr_offset, SEEK_SET);
+            // NOLINTNEXTLINE(cert-err33-c)
+            fwrite(ptr, 1, 4, fp);
+        }
+
+        int chunk = data_len - offset;
+        if (chunk > per_page) {
+            chunk = per_page;
+        }
+
+        uint8_t page[PAGE_SIZE];
+        memset(page, 0, PAGE_SIZE);
+        put_u32(page, 0); // next-page pointer — 0 for now, backpatched on next iteration
+        memcpy(page + 4, data + offset, chunk);
+
+        long page_offset = (long)(pnum - 1) * PAGE_SIZE;
+        prev_next_ptr_offset = page_offset; // next-page pointer is at byte 0 of this page
+        // NOLINTNEXTLINE(cert-err33-c)
+        fseek(fp, page_offset, SEEK_SET);
+        // NOLINTNEXTLINE(cert-err33-c)
+        fwrite(page, 1, PAGE_SIZE, fp);
+
+        offset += chunk;
+    }
+    return first_page;
+}
+
 // --- Index record builders ---
 
 // Build an index entry for a 2-column TEXT index (project, col) + rowid.
@@ -840,12 +916,49 @@ static void pb_ensure_leaf_cap(PageBuilder *pb) {
     }
 }
 
+// SQLite overflow thresholds for leaf table B-tree pages (PAGE_SIZE=65536, reserved=0):
+//   usable    = PAGE_SIZE = 65536
+//   max_local = usable - 35 = 65501
+//   min_local = (usable - 12) * 32 / 255 - 23 = 8199  (C integer arithmetic, same as SQLite)
+//
+// These must match SQLite's btree.c formulas exactly:
+//   pBt->maxLeaf = usableSize - 35
+//   pBt->minLeaf = (usableSize-12)*32/255 - 23
+#define TABLE_OVERFLOW_MAX_LOCAL 65501
+#define TABLE_OVERFLOW_MIN_LOCAL 8199
+
 // Add a table cell to the PageBuilder, flushing leaf pages as needed.
+// If the payload exceeds max_local, overflow pages are written and only the
+// local portion plus a 4-byte overflow page pointer is stored in the leaf cell.
 static void pb_add_table_cell_with_flush(PageBuilder *pb, int64_t rowid, const uint8_t *payload,
                                          // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
                                          int payload_len, int64_t prev_rowid) {
     int cell_len = 0;
-    uint8_t *cell = build_table_cell(rowid, payload, payload_len, &cell_len);
+    uint8_t *cell = NULL;
+
+    if (payload_len > TABLE_OVERFLOW_MAX_LOCAL) {
+        // Compute local_len per SQLite spec §overflow-pages for leaf table cells.
+        int local_len =
+            TABLE_OVERFLOW_MIN_LOCAL +
+            ((payload_len - TABLE_OVERFLOW_MIN_LOCAL) % (PAGE_SIZE - 4));
+        if (local_len > TABLE_OVERFLOW_MAX_LOCAL) {
+            local_len = TABLE_OVERFLOW_MIN_LOCAL;
+        }
+
+        // Write overflow pages for the bytes that don't fit locally.
+        uint32_t overflow_page =
+            write_overflow_pages(pb->fp, &pb->next_page, payload + local_len,
+                                 payload_len - local_len);
+        if (overflow_page == 0) {
+            return; // overflow write failed
+        }
+
+        cell = build_table_cell_overflow(rowid, payload, payload_len, local_len, overflow_page,
+                                         &cell_len);
+    } else {
+        cell = build_table_cell(rowid, payload, payload_len, &cell_len);
+    }
+
     if (!cell) {
         return;
     }
