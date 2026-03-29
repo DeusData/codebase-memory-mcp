@@ -576,16 +576,20 @@ char *cbm_layout_to_json(const cbm_layout_result_t *r) {
     for (int i = 0; i < r->node_count; i++) {
         yyjson_mut_val *nd = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_int(doc, nd, "id", r->nodes[i].id);
-        yyjson_mut_obj_add_real(doc, nd, "x", (double)r->nodes[i].x);
-        yyjson_mut_obj_add_real(doc, nd, "y", (double)r->nodes[i].y);
-        yyjson_mut_obj_add_real(doc, nd, "z", (double)r->nodes[i].z);
+        double nx = isfinite(r->nodes[i].x) ? (double)r->nodes[i].x : 0.0;
+        double ny = isfinite(r->nodes[i].y) ? (double)r->nodes[i].y : 0.0;
+        double nz = isfinite(r->nodes[i].z) ? (double)r->nodes[i].z : 0.0;
+        yyjson_mut_obj_add_real(doc, nd, "x", nx);
+        yyjson_mut_obj_add_real(doc, nd, "y", ny);
+        yyjson_mut_obj_add_real(doc, nd, "z", nz);
         if (r->nodes[i].label)
             yyjson_mut_obj_add_str(doc, nd, "label", r->nodes[i].label);
         if (r->nodes[i].name)
             yyjson_mut_obj_add_str(doc, nd, "name", r->nodes[i].name);
         if (r->nodes[i].file_path)
             yyjson_mut_obj_add_str(doc, nd, "file_path", r->nodes[i].file_path);
-        yyjson_mut_obj_add_real(doc, nd, "size", (double)r->nodes[i].size);
+        double nsz = isfinite(r->nodes[i].size) ? (double)r->nodes[i].size : 1.0;
+        yyjson_mut_obj_add_real(doc, nd, "size", nsz);
         char hex[8];
         snprintf(hex, sizeof(hex), "#%06x", r->nodes[i].color);
         yyjson_mut_obj_add_strcpy(doc, nd, "color", hex);
@@ -606,7 +610,21 @@ char *cbm_layout_to_json(const cbm_layout_result_t *r) {
     yyjson_mut_obj_add_int(doc, root, "total_nodes", r->total_nodes);
 
     size_t len = 0;
-    char *json = yyjson_mut_write(doc, 0, &len);
+    yyjson_write_err write_err = {0};
+    char *json = yyjson_mut_write_opts(doc, YYJSON_WRITE_ALLOW_INVALID_UNICODE, NULL, &len, &write_err);
     yyjson_mut_doc_free(doc);
+
+    if (json) {
+        char sz[32];
+        snprintf(sz, sizeof(sz), "%zu", len);
+        cbm_log_info("layout.json.ok", "bytes", sz);
+    } else {
+        char code[16];
+        snprintf(code, sizeof(code), "%u", write_err.code);
+        cbm_log_error("layout.json.failed",
+                      "code", code,
+                      "msg", write_err.msg ? write_err.msg : "unknown");
+    }
+
     return json;
 }
