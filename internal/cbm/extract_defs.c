@@ -5,6 +5,7 @@
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include <stdint.h>          // uint32_t
 #include <string.h>
+#include <strings.h>  /* strcasecmp */
 #include <ctype.h>
 
 // Field name lengths for ts_node_child_by_field_name() calls.
@@ -1184,9 +1185,70 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         }
     }
 
-    // main is always an entry point
-    if (strcmp(name, "main") == 0) {
+    // main/Main is always an entry point (case-insensitive for C#/Java)
+    if (strcasecmp(name, "main") == 0) {
         def.is_entry_point = true;
+    }
+
+    // C# entry point detection: Windows Service lifecycle, ASP.NET controllers
+    if (ctx->language == CBM_LANG_CSHARP && !def.is_entry_point) {
+        // Windows Service lifecycle entry points
+        if (strcmp(name, "OnStart") == 0 || strcmp(name, "OnStartImpl") == 0 ||
+            strcmp(name, "OnStop") == 0 || strcmp(name, "OnStopImpl") == 0 ||
+            strcmp(name, "Run") == 0 || strcmp(name, "Execute") == 0 ||
+            strcmp(name, "Configure") == 0 || strcmp(name, "ConfigureServices") == 0) {
+            def.is_entry_point = true;
+        }
+        // ASP.NET controller decorators: [HttpGet], [HttpPost], [Route], etc.
+        if (!def.is_entry_point && def.decorators) {
+            for (const char **d = def.decorators; *d; d++) {
+                if (strstr(*d, "HttpGet") || strstr(*d, "HttpPost") ||
+                    strstr(*d, "HttpPut") || strstr(*d, "HttpDelete") ||
+                    strstr(*d, "HttpPatch") || strstr(*d, "Route") ||
+                    strstr(*d, "ApiController") || strstr(*d, "Authorize")) {
+                    def.is_entry_point = true;
+                    break;
+                }
+            }
+        }
+        // Test entry points: [TestMethod], [Fact], [Test], [SetUp]
+        if (!def.is_entry_point && def.decorators) {
+            for (const char **d = def.decorators; *d; d++) {
+                if (strstr(*d, "TestMethod") || strstr(*d, "Fact") ||
+                    strstr(*d, "Test") || strstr(*d, "SetUp") ||
+                    strstr(*d, "TestInitialize")) {
+                    def.is_entry_point = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Java entry point detection: Spring Boot, Vert.x, JAX-RS, JUnit
+    if (ctx->language == CBM_LANG_JAVA && !def.is_entry_point) {
+        // Vert.x lifecycle and common server patterns
+        if (strcmp(name, "start") == 0 || strcmp(name, "configure") == 0 ||
+            strcmp(name, "init") == 0 || strcmp(name, "run") == 0 ||
+            strcmp(name, "handle") == 0) {
+            def.is_entry_point = true;
+        }
+        // Spring/JAX-RS/JUnit decorators
+        if (!def.is_entry_point && def.decorators) {
+            for (const char **d = def.decorators; *d; d++) {
+                if (strstr(*d, "RequestMapping") || strstr(*d, "GetMapping") ||
+                    strstr(*d, "PostMapping") || strstr(*d, "PutMapping") ||
+                    strstr(*d, "DeleteMapping") || strstr(*d, "PatchMapping") ||
+                    strstr(*d, "Endpoint") || strstr(*d, "EventHandler") ||
+                    strstr(*d, "Scheduled") || strstr(*d, "Bean") ||
+                    strstr(*d, "Override") || strstr(*d, "Test") ||
+                    strstr(*d, "GET") || strstr(*d, "POST") ||
+                    strstr(*d, "PUT") || strstr(*d, "DELETE") ||
+                    strstr(*d, "Path") || strstr(*d, "Consumes")) {
+                    def.is_entry_point = true;
+                    break;
+                }
+            }
+        }
     }
 
     cbm_defs_push(&ctx->result->defs, a, def);
@@ -1656,6 +1718,58 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, const char *class_
 
     if (spec->branching_node_types && spec->branching_node_types[0]) {
         def.complexity = cbm_count_branching(child, spec->branching_node_types);
+    }
+
+    // Entry point detection for class methods (same rules as extract_func_def)
+    // Case-insensitive "main" check
+    if (strcasecmp(name, "main") == 0) {
+        def.is_entry_point = true;
+    }
+
+    // C# entry point detection: Windows Service lifecycle, ASP.NET controllers
+    if (ctx->language == CBM_LANG_CSHARP && !def.is_entry_point) {
+        if (strcmp(name, "OnStart") == 0 || strcmp(name, "OnStartImpl") == 0 ||
+            strcmp(name, "OnStop") == 0 || strcmp(name, "OnStopImpl") == 0 ||
+            strcmp(name, "Run") == 0 || strcmp(name, "Execute") == 0 ||
+            strcmp(name, "Configure") == 0 || strcmp(name, "ConfigureServices") == 0) {
+            def.is_entry_point = true;
+        }
+        if (!def.is_entry_point && def.decorators) {
+            for (const char **d = def.decorators; *d; d++) {
+                if (strstr(*d, "HttpGet") || strstr(*d, "HttpPost") ||
+                    strstr(*d, "HttpPut") || strstr(*d, "HttpDelete") ||
+                    strstr(*d, "HttpPatch") || strstr(*d, "Route") ||
+                    strstr(*d, "ApiController") || strstr(*d, "Authorize")) {
+                    def.is_entry_point = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Java entry point detection
+    if (ctx->language == CBM_LANG_JAVA && !def.is_entry_point) {
+        if (strcmp(name, "start") == 0 || strcmp(name, "configure") == 0 ||
+            strcmp(name, "init") == 0 || strcmp(name, "run") == 0 ||
+            strcmp(name, "handle") == 0) {
+            def.is_entry_point = true;
+        }
+        if (!def.is_entry_point && def.decorators) {
+            for (const char **d = def.decorators; *d; d++) {
+                if (strstr(*d, "RequestMapping") || strstr(*d, "GetMapping") ||
+                    strstr(*d, "PostMapping") || strstr(*d, "PutMapping") ||
+                    strstr(*d, "DeleteMapping") || strstr(*d, "PatchMapping") ||
+                    strstr(*d, "Endpoint") || strstr(*d, "EventHandler") ||
+                    strstr(*d, "Scheduled") || strstr(*d, "Bean") ||
+                    strstr(*d, "Override") || strstr(*d, "Test") ||
+                    strstr(*d, "GET") || strstr(*d, "POST") ||
+                    strstr(*d, "PUT") || strstr(*d, "DELETE") ||
+                    strstr(*d, "Path") || strstr(*d, "Consumes")) {
+                    def.is_entry_point = true;
+                    break;
+                }
+            }
+        }
     }
 
     cbm_defs_push(&ctx->result->defs, a, def);
