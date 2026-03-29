@@ -339,6 +339,20 @@ codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-in
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
 
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the database storage directory. All project indexes and config are stored here. |
+| `CBM_DOWNLOAD_URL` | GitHub Releases | Override the download base URL for `update` (testing). |
+| `CBM_DIAGNOSTICS` | *(unset)* | Enable diagnostic logging when set. |
+
+```bash
+# Store indexes in a project-specific directory
+export CBM_CACHE_DIR=~/my-projects/foo
+codebase-memory-mcp config list   # shows cache_dir = ~/my-projects/foo
+```
+
 ## Custom File Extensions
 
 Map additional file extensions to supported languages via JSON config files. Useful for framework-specific extensions like `.blade.php` (Laravel) or `.mjs` (ES modules).
