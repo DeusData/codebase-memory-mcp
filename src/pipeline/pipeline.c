@@ -12,6 +12,7 @@
  */
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "cli/cli.h"
 // NOLINTNEXTLINE(misc-include-cleaner) — worker_pool.h included for interface contract
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
@@ -159,11 +160,9 @@ static char *resolve_db_path(const cbm_pipeline_t *p) {
     if (p->db_path) {
         snprintf(path, 1024, "%s", p->db_path);
     } else {
-        const char *home = cbm_get_home_dir();
-        if (!home) {
-            home = cbm_tmpdir();
-        }
-        snprintf(path, 1024, "%s/.cache/codebase-memory-mcp/%s.db", home, p->project_name);
+        const char *cache_dir = cbm_resolve_cache_dir();
+        if (!cache_dir) cache_dir = cbm_tmpdir();
+        snprintf(path, 1024, "%s/%s.db", cache_dir, p->project_name);
     }
     return path;
 }
@@ -832,16 +831,13 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!check_cancel(p)) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
-        const char *home = cbm_get_home_dir();
         char db_path[1024];
         if (p->db_path) {
             snprintf(db_path, sizeof(db_path), "%s", p->db_path);
         } else {
-            if (!home) {
-                home = cbm_tmpdir();
-            }
-            snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home,
-                     p->project_name);
+            const char *cache_dir = cbm_resolve_cache_dir();
+            if (!cache_dir) cache_dir = cbm_tmpdir();
+            snprintf(db_path, sizeof(db_path), "%s/%s.db", cache_dir, p->project_name);
         }
 
         /* Ensure parent directory exists (e.g. ~/.cache/codebase-memory-mcp/) */
