@@ -79,6 +79,65 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         }
     }
 
+    /* C/C++/CUDA/GLSL: function_definition has no "name" field.
+     * Name is buried in declarator chain: function_definition → declarator →
+     * function_declarator → declarator → identifier.  Walk the chain. */
+    if ((ctx->language == CBM_LANG_C || ctx->language == CBM_LANG_CPP ||
+         ctx->language == CBM_LANG_CUDA || ctx->language == CBM_LANG_GLSL)) {
+        const char *nk = ts_node_type(node);
+        bool is_func_def = (strcmp(nk, "function_definition") == 0);
+        /* Template declarations wrap the function_definition */
+        TSNode inner_func = node;
+        if (strcmp(nk, "template_declaration") == 0) {
+            for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
+                TSNode ch = ts_node_named_child(node, i);
+                if (strcmp(ts_node_type(ch), "function_definition") == 0) {
+                    inner_func = ch;
+                    is_func_def = true;
+                    break;
+                }
+            }
+        }
+        if (is_func_def) {
+            TSNode decl = ts_node_child_by_field_name(inner_func, "declarator", 10);
+            for (int depth = 0; depth < 8 && !ts_node_is_null(decl); depth++) {
+                const char *dk = ts_node_type(decl);
+                if (strcmp(dk, "identifier") == 0 || strcmp(dk, "field_identifier") == 0) {
+                    char *name = cbm_node_text(ctx->arena, decl, ctx->source);
+                    if (name && name[0]) {
+                        if (state->enclosing_class_qn) {
+                            return cbm_arena_sprintf(ctx->arena, "%s.%s",
+                                                     state->enclosing_class_qn, name);
+                        }
+                        return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+                    }
+                    return NULL;
+                }
+                if (strcmp(dk, "qualified_identifier") == 0 ||
+                    strcmp(dk, "scoped_identifier") == 0) {
+                    TSNode id = cbm_find_child_by_kind(decl, "identifier");
+                    if (ts_node_is_null(id))
+                        id = cbm_find_child_by_kind(decl, "field_identifier");
+                    if (!ts_node_is_null(id)) {
+                        char *name = cbm_node_text(ctx->arena, id, ctx->source);
+                        if (name && name[0]) {
+                            return cbm_fqn_compute(ctx->arena, ctx->project,
+                                                   ctx->rel_path, name);
+                        }
+                    }
+                    return NULL;
+                }
+                /* Unwrap: function_declarator → inner declarator */
+                TSNode inner = ts_node_child_by_field_name(decl, "declarator", 10);
+                if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0) {
+                    inner = ts_node_named_child(decl, 0);
+                }
+                decl = inner;
+            }
+            return NULL; /* couldn't resolve C/C++ function name */
+        }
+    }
+
     TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
 
     // Arrow function: name from parent variable_declarator

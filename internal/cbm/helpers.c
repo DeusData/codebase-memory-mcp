@@ -444,6 +444,34 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
         }
     }
 
+    /* C/C++/CUDA/GLSL: function_definition has no "name" field.
+     * Name is inside declarator chain: function_definition → declarator →
+     * function_declarator → declarator → identifier. */
+    if ((lang == CBM_LANG_C || lang == CBM_LANG_CPP ||
+         lang == CBM_LANG_CUDA || lang == CBM_LANG_GLSL) &&
+        strcmp(ts_node_type(func_node), "function_definition") == 0) {
+        TSNode decl = ts_node_child_by_field_name(func_node, "declarator", 10);
+        for (int depth = 0; depth < 8 && !ts_node_is_null(decl); depth++) {
+            const char *dk = ts_node_type(decl);
+            if (strcmp(dk, "identifier") == 0 || strcmp(dk, "field_identifier") == 0) {
+                return cbm_node_text(a, decl, source);
+            }
+            if (strcmp(dk, "qualified_identifier") == 0 ||
+                strcmp(dk, "scoped_identifier") == 0) {
+                TSNode id = cbm_find_child_by_kind(decl, "identifier");
+                if (ts_node_is_null(id))
+                    id = cbm_find_child_by_kind(decl, "field_identifier");
+                if (!ts_node_is_null(id)) return cbm_node_text(a, id, source);
+                return NULL;
+            }
+            TSNode inner = ts_node_child_by_field_name(decl, "declarator", 10);
+            if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0)
+                inner = ts_node_named_child(decl, 0);
+            decl = inner;
+        }
+        return NULL;
+    }
+
     TSNode name_node = ts_node_child_by_field_name(func_node, "name", 4);
     if (!ts_node_is_null(name_node)) {
         return cbm_node_text(a, name_node, source);
