@@ -349,6 +349,34 @@ static void free_edge_array(cbm_edge_t *edges, int count) {
     free(edges);
 }
 
+/* ── Node ID → index map (for fast edge filtering) ──────────── */
+
+typedef struct {
+    int64_t id;
+    int idx;
+} node_id_entry_t;
+
+static int cmp_node_id_entry(const void *a, const void *b) {
+    int64_t da = ((const node_id_entry_t *)a)->id;
+    int64_t db = ((const node_id_entry_t *)b)->id;
+    return (da > db) - (da < db);
+}
+
+/* Binary search: returns node index or -1 if not found. */
+static int find_node_index(const node_id_entry_t *map, int count, int64_t id) {
+    int lo = 0, hi = count - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (map[mid].id == id)
+            return map[mid].idx;
+        if (map[mid].id < id)
+            lo = mid + 1;
+        else
+            hi = mid - 1;
+    }
+    return -1;
+}
+
 /* ── Public API ───────────────────────────────────────────────── */
 
 cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
@@ -384,61 +412,83 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
         return r;
     }
 
-    /* 2. Query edges */
-    int total_edges = 0, edge_cap = 256;
+    /* 2. Build sorted node-ID → index map for O(log n) edge filtering */
+    node_id_entry_t *id_map = malloc((size_t)n * sizeof(node_id_entry_t));
+    if (!id_map) {
+        cbm_store_search_free(&search_out);
+        cbm_layout_result_t *r = calloc(1, sizeof(*r));
+        if (r)
+            r->total_nodes = total_count;
+        return r;
+    }
+    for (int i = 0; i < n; i++) {
+        id_map[i].id = search_out.results[i].node.id;
+        id_map[i].idx = i;
+    }
+    qsort(id_map, (size_t)n, sizeof(node_id_entry_t), cmp_node_id_entry);
+
+    /* 3. Query edges — keep only those connecting selected nodes */
+    int *deg = calloc((size_t)n, sizeof(int));
+    int mapped = 0, edge_cap = 256;
     cbm_edge_t *all_edges = malloc((size_t)edge_cap * sizeof(cbm_edge_t));
+    int *es = malloc((size_t)edge_cap * sizeof(int));
+    int *ed = malloc((size_t)edge_cap * sizeof(int));
     cbm_schema_info_t schema;
     memset(&schema, 0, sizeof(schema));
-    if (cbm_store_get_schema(store, project, &schema) == CBM_STORE_OK) {
+    if (deg && all_edges && es && ed &&
+        cbm_store_get_schema(store, project, &schema) == CBM_STORE_OK) {
         for (int t = 0; t < schema.edge_type_count; t++) {
             cbm_edge_t *te = NULL;
             int tc = 0;
             if (cbm_store_find_edges_by_type(store, project, schema.edge_types[t].type, &te, &tc) ==
                 CBM_STORE_OK) {
                 for (int e = 0; e < tc; e++) {
-                    if (total_edges >= edge_cap) {
-                        edge_cap *= 2;
-                        cbm_edge_t *tmp = realloc(all_edges, (size_t)edge_cap * sizeof(cbm_edge_t));
-                        if (!tmp) {
-                            free_edge_array(te + e, tc - e);
-                            break;
+                    int si = find_node_index(id_map, n, te[e].source_id);
+                    int di = find_node_index(id_map, n, te[e].target_id);
+                    if (si >= 0 && di >= 0) {
+                        if (mapped >= edge_cap) {
+                            int new_cap = edge_cap * 2;
+                            cbm_edge_t *tmp_e = realloc(all_edges, (size_t)new_cap * sizeof(cbm_edge_t));
+                            int *tmp_s = realloc(es, (size_t)new_cap * sizeof(int));
+                            int *tmp_d = realloc(ed, (size_t)new_cap * sizeof(int));
+                            if (!tmp_e || !tmp_s || !tmp_d) {
+                                if (tmp_e) all_edges = tmp_e;
+                                if (tmp_s) es = tmp_s;
+                                if (tmp_d) ed = tmp_d;
+                                /* Free remaining batch entries */
+                                for (int r = e; r < tc; r++) {
+                                    free((void *)te[r].project);
+                                    free((void *)te[r].type);
+                                    free((void *)te[r].properties_json);
+                                }
+                                free(te);
+                                goto edges_done;
+                            }
+                            all_edges = tmp_e;
+                            es = tmp_s;
+                            ed = tmp_d;
+                            edge_cap = new_cap;
                         }
-                        all_edges = tmp;
+                        all_edges[mapped] = te[e];
+                        memset(&te[e], 0, sizeof(cbm_edge_t));
+                        es[mapped] = si;
+                        ed[mapped] = di;
+                        deg[si]++;
+                        deg[di]++;
+                        mapped++;
+                    } else {
+                        free((void *)te[e].project);
+                        free((void *)te[e].type);
+                        free((void *)te[e].properties_json);
                     }
-                    all_edges[total_edges++] = te[e];
-                    memset(&te[e], 0, sizeof(cbm_edge_t));
                 }
                 free(te);
             }
         }
+edges_done:
         cbm_store_schema_free(&schema);
     }
-
-    /* 3. Map edges + degree */
-    int *deg = calloc((size_t)n, sizeof(int));
-    int *es = calloc((size_t)(total_edges > 0 ? total_edges : 1), sizeof(int));
-    int *ed = calloc((size_t)(total_edges > 0 ? total_edges : 1), sizeof(int));
-    int mapped = 0;
-    if (es && ed && deg) {
-        for (int e = 0; e < total_edges; e++) {
-            int si = -1, di = -1;
-            for (int i = 0; i < n; i++) {
-                if (search_out.results[i].node.id == all_edges[e].source_id)
-                    si = i;
-                if (search_out.results[i].node.id == all_edges[e].target_id)
-                    di = i;
-                if (si >= 0 && di >= 0)
-                    break;
-            }
-            if (si >= 0 && di >= 0) {
-                es[mapped] = si;
-                ed[mapped] = di;
-                deg[si]++;
-                deg[di]++;
-                mapped++;
-            }
-        }
-    }
+    free(id_map);
 
     /* 4. Call depth for z-axis */
     int *cdepth = calloc((size_t)n, sizeof(int));
@@ -461,7 +511,7 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
         free(ed);
         free(cdepth);
         cbm_layout_free(result);
-        free_edge_array(all_edges, total_edges);
+        free_edge_array(all_edges, mapped);
         cbm_store_search_free(&search_out);
         return NULL;
     }
@@ -544,7 +594,7 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
     free(es);
     free(ed);
     free(cdepth);
-    free_edge_array(all_edges, total_edges);
+    free_edge_array(all_edges, mapped);
     cbm_store_search_free(&search_out);
     return result;
 }
