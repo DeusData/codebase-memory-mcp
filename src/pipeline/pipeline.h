@@ -82,6 +82,10 @@ char *cbm_pipeline_fqn_module(const char *project, const char *rel_path);
 /* Folder QN: project.dir.parts. Caller must free(). */
 char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir);
 
+/* Resolve an import module_path relative to the importing file's directory.
+ * Handles ./ and ../ resolution. Bare modules returned unchanged. Caller must free(). */
+char *cbm_pipeline_resolve_import_path(const char *importer_rel_path, const char *module_path);
+
 /* Derive project name from an absolute path.
  * Replaces / and : with -, collapses --, trims leading -.
  * Caller must free() the returned string. */

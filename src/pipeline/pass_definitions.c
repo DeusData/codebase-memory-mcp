@@ -288,28 +288,76 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         total_imports += result->imports.count;
 
         /* Store per-file import map for later use by pass_calls.
-         * For each import, create an IMPORTS edge: File → imported module. */
-        for (int j = 0; j < result->imports.count; j++) {
-            CBMImport *imp = &result->imports.items[j];
-            if (!imp->module_path) {
-                continue;
-            }
-
-            /* Find or create the target module node */
-            char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
-            const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
-
+         * For each import, create an IMPORTS edge: File → imported module.
+         * Resolve relative paths (./ ../) and probe common extensions. */
+        {
             char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
             const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-
-            if (source_node && target) {
-                char imp_props[256];
-                snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}",
-                         imp->local_name ? imp->local_name : "");
-                cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
-            }
-            free(target_qn);
             free(file_qn);
+
+            for (int j = 0; j < result->imports.count && source_node; j++) {
+                CBMImport *imp = &result->imports.items[j];
+                if (!imp->module_path) {
+                    continue;
+                }
+
+                /* Resolve relative paths against importing file's directory */
+                char *resolved = cbm_pipeline_resolve_import_path(rel, imp->module_path);
+                char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, resolved);
+                const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
+
+                /* Probe common extensions */
+                if (!target) {
+                    static const char *exts[] = {
+                        ".js", ".ts", ".tsx", ".jsx", ".mjs", ".mts",
+                        ".css", ".scss", ".json", NULL
+                    };
+                    for (int e = 0; !target && exts[e]; e++) {
+                        char buf[2048];
+                        snprintf(buf, sizeof(buf), "%s%s", resolved, exts[e]);
+                        free(target_qn);
+                        target_qn = cbm_pipeline_fqn_module(ctx->project_name, buf);
+                        target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
+                    }
+                }
+
+                /* Probe /index variants */
+                if (!target) {
+                    static const char *idx[] = {
+                        "/index.js", "/index.ts", "/index.tsx", "/index.jsx",
+                        "/index.mjs", "/index", NULL
+                    };
+                    for (int e = 0; !target && idx[e]; e++) {
+                        char buf[2048];
+                        snprintf(buf, sizeof(buf), "%s%s", resolved, idx[e]);
+                        free(target_qn);
+                        target_qn = cbm_pipeline_fqn_module(ctx->project_name, buf);
+                        target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
+                    }
+                }
+
+                /* C/C++ include: try .h, .hpp */
+                if (!target) {
+                    static const char *hdr[] = {".h", ".hpp", ".hh", NULL};
+                    for (int e = 0; !target && hdr[e]; e++) {
+                        char buf[2048];
+                        snprintf(buf, sizeof(buf), "%s%s", resolved, hdr[e]);
+                        free(target_qn);
+                        target_qn = cbm_pipeline_fqn_module(ctx->project_name, buf);
+                        target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
+                    }
+                }
+
+                if (target) {
+                    char imp_props[256];
+                    snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}",
+                             imp->local_name ? imp->local_name : "");
+                    cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS",
+                                         imp_props);
+                }
+                free(target_qn);
+                free(resolved);
+            }
         }
 
         /* Cache or free the extraction result */

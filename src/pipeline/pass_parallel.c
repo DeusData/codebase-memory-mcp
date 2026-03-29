@@ -953,20 +953,65 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             }
         }
 
-        /* IMPORTS edges */
-        for (int j = 0; j < result->imports.count; j++) {
+        /* IMPORTS edges — resolve relative paths and probe extensions */
+        char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+        const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
+        free(file_qn);
+
+        for (int j = 0; j < result->imports.count && source_node; j++) {
             CBMImport *imp = &result->imports.items[j];
             if (!imp->module_path) {
                 continue;
             }
 
-            char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
+            /* Resolve relative paths (./ ../) against importing file's directory */
+            char *resolved = cbm_pipeline_resolve_import_path(rel, imp->module_path);
+            char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, resolved);
             const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
 
-            char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
-            const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
+            /* Probe common extensions if no exact match: .js, .ts, .tsx, .jsx, .mjs */
+            if (!target) {
+                static const char *exts[] = {
+                    ".js", ".ts", ".tsx", ".jsx", ".mjs", ".mts",
+                    ".css", ".scss", ".json", NULL
+                };
+                for (int e = 0; !target && exts[e]; e++) {
+                    char buf[2048];
+                    snprintf(buf, sizeof(buf), "%s%s", resolved, exts[e]);
+                    free(target_qn);
+                    target_qn = cbm_pipeline_fqn_module(ctx->project_name, buf);
+                    target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
+                }
+            }
 
-            if (source_node && target) {
+            /* Probe /index variants (directory imports) */
+            if (!target) {
+                static const char *idx[] = {
+                    "/index.js", "/index.ts", "/index.tsx", "/index.jsx",
+                    "/index.mjs", "/index", NULL
+                };
+                for (int e = 0; !target && idx[e]; e++) {
+                    char buf[2048];
+                    snprintf(buf, sizeof(buf), "%s%s", resolved, idx[e]);
+                    free(target_qn);
+                    target_qn = cbm_pipeline_fqn_module(ctx->project_name, buf);
+                    target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
+                }
+            }
+
+            /* C/C++ include: try .h, .hpp variants */
+            if (!target && (resolved[0] != '.' || resolved[1] == '.')) {
+                static const char *hdr[] = {".h", ".hpp", ".hh", NULL};
+                for (int e = 0; !target && hdr[e]; e++) {
+                    char buf[2048];
+                    snprintf(buf, sizeof(buf), "%s%s", resolved, hdr[e]);
+                    free(target_qn);
+                    target_qn = cbm_pipeline_fqn_module(ctx->project_name, buf);
+                    target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
+                }
+            }
+
+            if (target) {
                 char imp_props[256];
                 snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}",
                          imp->local_name ? imp->local_name : "");
@@ -974,7 +1019,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                 imports_edges++;
             }
             free(target_qn);
-            free(file_qn);
+            free(resolved);
         }
     }
 

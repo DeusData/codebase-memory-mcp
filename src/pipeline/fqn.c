@@ -158,6 +158,91 @@ char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir) {
     return result;
 }
 
+/**
+ * Resolve an import module_path relative to the importing file's directory.
+ *
+ * For relative paths (starting with ./ or ../), resolves against the importer's
+ * directory. For bare module specifiers (no ./ prefix), returns a copy unchanged.
+ *
+ * Examples (importer_rel_path="src/routes/api.js"):
+ *   "./controllers/auth"     → "src/routes/controllers/auth"
+ *   "../utils/helpers"       → "src/utils/helpers"
+ *   "lodash"                 → "lodash" (bare module, unchanged)
+ *   "@hapi/hapi"             → "@hapi/hapi" (scoped package, unchanged)
+ *
+ * Returns: heap-allocated resolved path. Caller must free().
+ */
+char *cbm_pipeline_resolve_import_path(const char *importer_rel_path, const char *module_path) {
+    if (!module_path || !module_path[0]) {
+        return strdup("");
+    }
+
+    /* Bare module specifier — no relative path resolution needed */
+    if (module_path[0] != '.') {
+        return strdup(module_path);
+    }
+
+    /* Get the importing file's directory */
+    char *importer_dir = strdup(importer_rel_path ? importer_rel_path : "");
+    cbm_normalize_path_sep(importer_dir);
+    char *last_slash = strrchr(importer_dir, '/');
+    if (last_slash) {
+        *(last_slash + 1) = '\0'; /* keep trailing slash */
+    } else {
+        importer_dir[0] = '\0'; /* file is at root */
+    }
+
+    /* Concatenate: importer_dir + module_path */
+    size_t dir_len = strlen(importer_dir);
+    size_t mod_len = strlen(module_path);
+    char *combined = malloc(dir_len + mod_len + 2);
+    snprintf(combined, dir_len + mod_len + 2, "%s%s", importer_dir, module_path);
+    free(importer_dir);
+
+    /* Normalize: resolve . and .. segments */
+    cbm_normalize_path_sep(combined);
+    const char *segments[256];
+    int seg_count = 0;
+
+    char *tok = combined;
+    while (tok && *tok) {
+        char *slash = strchr(tok, '/');
+        if (slash) *slash = '\0';
+
+        if (strcmp(tok, ".") == 0) {
+            /* skip */
+        } else if (strcmp(tok, "..") == 0) {
+            if (seg_count > 0) seg_count--; /* pop parent */
+        } else if (tok[0] != '\0') {
+            if (seg_count < 255) {
+                segments[seg_count++] = tok;
+            }
+        }
+
+        tok = slash ? slash + 1 : NULL;
+    }
+
+    /* Rebuild path */
+    if (seg_count == 0) {
+        free(combined);
+        return strdup("");
+    }
+
+    size_t total = 0;
+    for (int i = 0; i < seg_count; i++) {
+        total += strlen(segments[i]) + 1;
+    }
+    char *result = malloc(total + 1);
+    result[0] = '\0';
+    for (int i = 0; i < seg_count; i++) {
+        if (i > 0) strcat(result, "/");
+        strcat(result, segments[i]);
+    }
+
+    free(combined);
+    return result;
+}
+
 char *cbm_project_name_from_path(const char *abs_path) {
     if (!abs_path || !abs_path[0]) {
         return strdup("root");
