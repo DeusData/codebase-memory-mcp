@@ -5047,6 +5047,7 @@ typedef struct {
 } cbm_channel_match_t;
 int cbm_extract_channels(const char *source, cbm_channel_match_t *out, int max_out);
 int cbm_extract_csharp_channels(const char *source, cbm_channel_match_t *out, int max_out);
+int cbm_extract_js_channels_constants(const char *source, cbm_channel_match_t *out, int max_out);
 
 int cbm_store_detect_channels(cbm_store_t *s, const char *project, const char *repo_path) {
     if (!s || !s->db || !project || !repo_path) return 0;
@@ -5147,6 +5148,72 @@ int cbm_store_detect_channels(cbm_store_t *s, const char *project, const char *r
 
     exec_sql(s, "COMMIT");
     sqlite3_finalize(stmt);
+
+    /* Second pass: JS/TS constant resolution on full files.
+     * The per-node pass above only sees function bodies — constants defined at file
+     * scope are invisible. This pass reads complete JS/TS files that contain Socket.IO
+     * patterns and resolves constant channel names. */
+    {
+        const char *file_sql =
+            "SELECT DISTINCT file_path FROM nodes WHERE project = ?1 "
+            "AND (file_path LIKE '%.js' OR file_path LIKE '%.ts' OR file_path LIKE '%.tsx') "
+            "AND label NOT IN ('File','Folder','Project')";
+        sqlite3_stmt *fst = NULL;
+        sqlite3_prepare_v2(s->db, file_sql, -1, &fst, NULL);
+        if (fst) {
+            bind_text(fst, 1, project);
+            exec_sql(s, "BEGIN TRANSACTION");
+
+            /* Re-prepare insert for this transaction */
+            sqlite3_stmt *ins2 = NULL;
+            sqlite3_prepare_v2(s->db,
+                "INSERT OR IGNORE INTO channels"
+                "(project,channel_name,direction,transport,node_id,file_path,function_name) "
+                "VALUES(?1,?2,?3,?4,0,?5,'(file-level)')", -1, &ins2, NULL);
+
+            while (sqlite3_step(fst) == SQLITE_ROW) {
+                const char *fpath = (const char *)sqlite3_column_text(fst, 0);
+                if (!fpath) continue;
+
+                char full_path[2048];
+                snprintf(full_path, sizeof(full_path), "%s/%s", repo_path, fpath);
+
+                FILE *f = fopen(full_path, "r");
+                if (!f) continue;
+
+                /* Read entire file */
+                fseek(f, 0, SEEK_END);
+                long fsize = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                if (fsize <= 0 || fsize > 512 * 1024) { fclose(f); continue; } /* skip huge files */
+                char *full_source = malloc((size_t)fsize + 1);
+                size_t nread = fread(full_source, 1, (size_t)fsize, f);
+                full_source[nread] = '\0';
+                fclose(f);
+
+                cbm_channel_match_t matches[64];
+                int mc = cbm_extract_js_channels_constants(full_source, matches, 64);
+
+                for (int i = 0; i < mc && ins2; i++) {
+                    /* Filter out short constant names (single-letter variables) */
+                    if (strlen(matches[i].channel) < 3) continue;
+                    sqlite3_reset(ins2);
+                    bind_text(ins2, 1, project);
+                    bind_text(ins2, 2, matches[i].channel);
+                    bind_text(ins2, 3, matches[i].direction);
+                    bind_text(ins2, 4, matches[i].transport);
+                    bind_text(ins2, 5, fpath);
+                    sqlite3_step(ins2);
+                    total++;
+                }
+                free(full_source);
+            }
+            exec_sql(s, "COMMIT");
+            sqlite3_finalize(fst);
+            if (ins2) sqlite3_finalize(ins2);
+        }
+    }
+
     if (ins) sqlite3_finalize(ins);
     return total;
 }

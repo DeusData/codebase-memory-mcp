@@ -1996,6 +1996,145 @@ int cbm_extract_channels(const char *source, cbm_channel_match_t *out, int max_o
     return count;
 }
 
+/* ── JS/TS channel extraction: constant resolution pass ─────────── */
+
+/* Second pass for JS/TS: resolves .emit(CONSTANT) and .on(CONSTANT) where
+ * the channel name is a JS constant instead of a string literal.
+ * Pattern: socket.on(SOME_CONSTANT, handler) / this.emit(EVENT_NAME, data)
+ * Resolves via: const SOME_CONSTANT = 'ActualChannelName'; */
+int cbm_extract_js_channels_constants(const char *source, cbm_channel_match_t *out, int max_out) {
+    if (!source || !*source) return 0;
+
+    /* Pass 1: collect const NAME = 'value' and const NAME = "value" mappings */
+    typedef struct { char name[128]; char value[256]; } js_const_t;
+    js_const_t consts[256];
+    int nconsts = 0;
+
+    cbm_regex_t const_re;
+    if (cbm_regcomp(&const_re,
+            "const[[:space:]]+([A-Z_][A-Z0-9_]*)[[:space:]]*=[[:space:]]*['\"]([^'\"]{1,128})['\"]",
+            CBM_REG_EXTENDED) != 0) {
+        return 0;
+    }
+
+    const char *p = source;
+    cbm_regmatch_t cm[3];
+    while (nconsts < 256 && cbm_regexec(&const_re, p, 3, cm, 0) == 0) {
+        int nlen = cm[1].rm_eo - cm[1].rm_so;
+        int vlen = cm[2].rm_eo - cm[2].rm_so;
+        if (nlen < (int)sizeof(consts[0].name) && vlen < (int)sizeof(consts[0].value)) {
+            memcpy(consts[nconsts].name, p + cm[1].rm_so, (size_t)nlen);
+            consts[nconsts].name[nlen] = '\0';
+            memcpy(consts[nconsts].value, p + cm[2].rm_so, (size_t)vlen);
+            consts[nconsts].value[vlen] = '\0';
+            nconsts++;
+        }
+        p += cm[0].rm_eo;
+    }
+    cbm_regfree(&const_re);
+
+    if (nconsts == 0) return 0;
+
+    /* Pass 2: find .emit(CONSTANT) and .on(CONSTANT) with bare identifiers */
+    static const char *channel_receivers[] = {
+        "socket", "io", "client", "server", "connection",
+        "emitter", "eventEmitter", "eventBus", "this",
+        "socketIoEventEmitter", "socketServer", "nsp", NULL
+    };
+
+    /* Match both receiver.on(CONSTANT) and chained .on(CONSTANT) patterns.
+     * The chained pattern starts with optional whitespace + dot. */
+    cbm_regex_t call_re;
+    if (cbm_regcomp(&call_re,
+            "([a-zA-Z_][a-zA-Z0-9_]*)?\\.("
+            "emit|on|once|addListener|onRequest|respond"
+            ")\\([[:space:]]*([A-Z_][A-Z0-9_]*)",
+            CBM_REG_EXTENDED) != 0) {
+        return 0;
+    }
+
+    int count = 0;
+    p = source;
+    cbm_regmatch_t mm[4];
+    while (count < max_out && cbm_regexec(&call_re, p, 4, mm, 0) == 0) {
+        int rlen = mm[1].rm_eo - mm[1].rm_so;
+        char receiver[64];
+        bool is_chained = (rlen <= 0); /* method chaining: no receiver captured */
+        if (rlen > 0) {
+            if (rlen >= (int)sizeof(receiver)) rlen = (int)sizeof(receiver) - 1;
+            memcpy(receiver, p + mm[1].rm_so, (size_t)rlen);
+            receiver[rlen] = '\0';
+        } else {
+            receiver[0] = '\0';
+        }
+
+        bool is_channel = is_chained; /* chained .on() assumed to be on socket object */
+        if (!is_chained) {
+            for (int i = 0; channel_receivers[i]; i++) {
+                if (strcasecmp(receiver, channel_receivers[i]) == 0) {
+                    is_channel = true;
+                    break;
+                }
+            }
+        }
+
+        if (is_channel) {
+            int mlen = mm[2].rm_eo - mm[2].rm_so;
+            char method[32];
+            if (mlen >= (int)sizeof(method)) mlen = (int)sizeof(method) - 1;
+            memcpy(method, p + mm[2].rm_so, (size_t)mlen);
+            method[mlen] = '\0';
+
+            int clen = mm[3].rm_eo - mm[3].rm_so;
+            char constant_name[128];
+            if (clen >= (int)sizeof(constant_name)) clen = (int)sizeof(constant_name) - 1;
+            memcpy(constant_name, p + mm[3].rm_so, (size_t)clen);
+            constant_name[clen] = '\0';
+
+            /* Resolve constant to string value */
+            const char *resolved = NULL;
+            for (int c = 0; c < nconsts; c++) {
+                if (strcmp(consts[c].name, constant_name) == 0) {
+                    resolved = consts[c].value;
+                    break;
+                }
+            }
+
+            if (resolved) {
+                strncpy(out[count].channel, resolved, sizeof(out[count].channel) - 1);
+                out[count].channel[sizeof(out[count].channel) - 1] = '\0';
+            } else {
+                /* Unresolved constant — use the constant name as channel name */
+                strncpy(out[count].channel, constant_name, sizeof(out[count].channel) - 1);
+                out[count].channel[sizeof(out[count].channel) - 1] = '\0';
+            }
+
+            /* Skip generic events */
+            const char *ch = out[count].channel;
+            if (strcmp(ch, "error") != 0 && strcmp(ch, "close") != 0 &&
+                strcmp(ch, "end") != 0 && strcmp(ch, "data") != 0 &&
+                strcmp(ch, "connect") != 0 && strcmp(ch, "disconnect") != 0 &&
+                strcmp(ch, "connection") != 0 && strcmp(ch, "message") != 0) {
+                if (strcmp(method, "emit") == 0 || strcmp(method, "respond") == 0) {
+                    strncpy(out[count].direction, "emit", sizeof(out[count].direction) - 1);
+                } else {
+                    strncpy(out[count].direction, "listen", sizeof(out[count].direction) - 1);
+                }
+                if (strcasecmp(receiver, "socket") == 0 || strcasecmp(receiver, "io") == 0 ||
+                    strcasecmp(receiver, "nsp") == 0 || strcasecmp(receiver, "socketServer") == 0) {
+                    strncpy(out[count].transport, "socketio", sizeof(out[count].transport) - 1);
+                } else {
+                    strncpy(out[count].transport, "eventemitter", sizeof(out[count].transport) - 1);
+                }
+                count++;
+            }
+        }
+        p += mm[0].rm_eo;
+    }
+    cbm_regfree(&call_re);
+    return count;
+}
+
 /* ── C# channel extraction: Socket.IO with constant resolution ─── */
 
 /* Extract channels from C# source that uses constant names for event strings.
