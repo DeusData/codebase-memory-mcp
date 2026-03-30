@@ -236,13 +236,25 @@ static const tool_def_t TOOLS[] = {
     {"search_graph",
      "Search the code knowledge graph for functions, classes, routes, and variables. Use INSTEAD "
      "OF grep/glob when finding code definitions, implementations, or relationships. Returns "
-     "precise results in one call.",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"label\":{\"type\":"
-     "\"string\"},\"name_pattern\":{\"type\":\"string\"},\"qn_pattern\":{\"type\":\"string\"},"
-     "\"file_pattern\":{\"type\":\"string\"},\"relationship\":{\"type\":\"string\"},\"min_degree\":"
-     "{\"type\":\"integer\"},\"max_degree\":{\"type\":\"integer\"},\"exclude_entry_points\":{"
-     "\"type\":\"boolean\"},\"include_connected\":{\"type\":\"boolean\"},\"limit\":{\"type\":"
-     "\"integer\",\"description\":\"Max results. Default: "
+     "precise results in one call. Two modes: (1) query='search terms' for BM25 ranked full-text "
+     "search with structural boosting (recommended for discovery and conceptual search), "
+     "(2) name_pattern='regex' for exact pattern matching.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "\"query\":{\"type\":\"string\",\"description\":\"Natural language or keyword search using "
+     "BM25 full-text ranking. Searches function names, class names, qualified names, and file "
+     "paths. Results ranked by relevance with structural boosting (Functions/Methods +10, "
+     "Routes +8, Classes +5, high-fan-in +3). Filters out noise nodes (File/Folder/Module/"
+     "Variable). Example: 'session management' or 'error handling'. When provided, name_pattern "
+     "is ignored.\"},"
+     "\"label\":{\"type\":\"string\"},\"name_pattern\":{\"type\":\"string\"},"
+     "\"qn_pattern\":{\"type\":\"string\"},"
+     "\"file_pattern\":{\"type\":\"string\"},\"relationship\":{\"type\":\"string\"},"
+     "\"min_degree\":{\"type\":\"integer\"},\"max_degree\":{\"type\":\"integer\"},"
+     "\"exclude_entry_points\":{\"type\":\"boolean\"},\"include_connected\":{\"type\":"
+     "\"boolean\"},"
+     "\"sort_by\":{\"type\":\"string\",\"description\":\"Sort by: relevance (default with "
+     "query), name, file_path\"},"
+     "\"limit\":{\"type\":\"integer\",\"description\":\"Max results. Default: "
      "unlimited\"},\"offset\":{\"type\":\"integer\",\"default\":0}},\"required\":[\"project\"]}"},
 
     {"query_graph",
