@@ -9,6 +9,7 @@
 
 #include "mcp/mcp.h"
 #include "store/store.h"
+#include <sqlite3.h>
 #include "cypher/cypher.h"
 #include "pipeline/pipeline.h"
 #include "cli/cli.h"
@@ -1002,6 +1003,21 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
 
     yyjson_mut_obj_add_int(doc, root, "total", out.total);
 
+    /* For each result, look up which execution flows it participates in.
+     * This enables process-grouped search results similar to GitNexus's
+     * flow-aware query output. Uses a single prepared statement. */
+    sqlite3_stmt *proc_stmt = NULL;
+    {
+        const char *psql =
+            "SELECT DISTINCT p.id, p.label, p.step_count FROM process_steps ps "
+            "JOIN processes p ON p.id = ps.process_id AND p.project = ?2 "
+            "WHERE ps.node_id = ?1 LIMIT 5";
+        sqlite3_prepare_v2(cbm_store_get_db(store), psql, -1, &proc_stmt, NULL);
+        if (proc_stmt) {
+            sqlite3_bind_text(proc_stmt, 2, project, -1, SQLITE_STATIC);
+        }
+    }
+
     yyjson_mut_val *results = yyjson_mut_arr(doc);
     for (int i = 0; i < out.count; i++) {
         cbm_search_result_t *sr = &out.results[i];
@@ -1014,8 +1030,28 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                                sr->node.file_path ? sr->node.file_path : "");
         yyjson_mut_obj_add_int(doc, item, "in_degree", sr->in_degree);
         yyjson_mut_obj_add_int(doc, item, "out_degree", sr->out_degree);
+
+        /* Process participation */
+        if (proc_stmt && sr->node.id > 0) {
+            sqlite3_reset(proc_stmt);
+            sqlite3_bind_int64(proc_stmt, 1, sr->node.id);
+
+            yyjson_mut_val *proc_arr = yyjson_mut_arr(doc);
+            while (sqlite3_step(proc_stmt) == SQLITE_ROW) {
+                yyjson_mut_val *pobj = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_int(doc, pobj, "id", sqlite3_column_int64(proc_stmt, 0));
+                const char *plabel = (const char *)sqlite3_column_text(proc_stmt, 1);
+                yyjson_mut_obj_add_strcpy(doc, pobj, "label", plabel ? plabel : "");
+                yyjson_mut_obj_add_int(doc, pobj, "step_count", sqlite3_column_int(proc_stmt, 2));
+                yyjson_mut_arr_add_val(proc_arr, pobj);
+            }
+            yyjson_mut_obj_add_val(doc, item, "processes", proc_arr);
+        }
+
         yyjson_mut_arr_add_val(results, item);
     }
+    if (proc_stmt) sqlite3_finalize(proc_stmt);
+
     yyjson_mut_obj_add_val(doc, root, "results", results);
     yyjson_mut_obj_add_bool(doc, root, "has_more", out.total > offset + out.count);
 
