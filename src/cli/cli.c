@@ -175,16 +175,26 @@ const char *cbm_find_cli(const char *name, const char *home_dir) {
         char path_copy[4096];
         snprintf(path_copy, sizeof(path_copy), "%s", path_env);
         char *saveptr;
+#ifdef _WIN32
+        const char *path_sep = ";";
+#else
+        const char *path_sep = ":";
+#endif
         // NOLINTNEXTLINE(misc-include-cleaner) — strtok_r provided by standard header
-        char *dir = strtok_r(path_copy, ":", &saveptr);
+        char *dir = strtok_r(path_copy, path_sep, &saveptr);
         while (dir) {
             snprintf(buf, sizeof(buf), "%s/%s", dir, name);
             struct stat st;
+#ifdef _WIN32
+            /* On Windows, S_IXUSR is not meaningful — just check file exists */
+            if (stat(buf, &st) == 0) {
+#else
             // NOLINTNEXTLINE(misc-include-cleaner) — S_IXUSR provided by standard header
             if (stat(buf, &st) == 0 && (st.st_mode & S_IXUSR)) {
+#endif
                 return buf;
             }
-            dir = strtok_r(NULL, ":", &saveptr);
+            dir = strtok_r(NULL, path_sep, &saveptr);
         }
     }
 
@@ -214,7 +224,11 @@ const char *cbm_find_cli(const char *name, const char *home_dir) {
                 continue;
             }
             struct stat st;
+#ifdef _WIN32
+            if (stat(paths[i], &st) == 0) {
+#else
             if (stat(paths[i], &st) == 0 && (st.st_mode & S_IXUSR)) {
+#endif
                 snprintf(buf, sizeof(buf), "%s", paths[i]);
                 return buf;
             }
