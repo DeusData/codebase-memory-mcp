@@ -902,6 +902,11 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_val *lbl = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_str(doc, lbl, "label", schema.node_labels[i].label);
         yyjson_mut_obj_add_int(doc, lbl, "count", schema.node_labels[i].count);
+        yyjson_mut_val *props = yyjson_mut_arr(doc);
+        for (int j = 0; j < schema.node_labels[i].property_count; j++) {
+            yyjson_mut_arr_add_str(doc, props, schema.node_labels[i].properties[j]);
+        }
+        yyjson_mut_obj_add_val(doc, lbl, "properties", props);
         yyjson_mut_arr_add_val(labels, lbl);
     }
     yyjson_mut_obj_add_val(doc, root, "node_labels", labels);
@@ -911,6 +916,11 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_val *typ = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_str(doc, typ, "type", schema.edge_types[i].type);
         yyjson_mut_obj_add_int(doc, typ, "count", schema.edge_types[i].count);
+        yyjson_mut_val *eprops = yyjson_mut_arr(doc);
+        for (int j = 0; j < schema.edge_types[i].property_count; j++) {
+            yyjson_mut_arr_add_str(doc, eprops, schema.edge_types[i].properties[j]);
+        }
+        yyjson_mut_obj_add_val(doc, typ, "properties", eprops);
         yyjson_mut_arr_add_val(types, typ);
     }
     yyjson_mut_obj_add_val(doc, root, "edge_types", types);

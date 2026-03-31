@@ -301,7 +301,7 @@ codebase-memory-mcp cli --raw search_graph '{"label": "Function"}' | jq '.result
 | `trace_call_path` | BFS traversal — who calls a function and what it calls. Depth 1-5. |
 | `detect_changes` | Map git diff to affected symbols + blast radius with risk classification. |
 | `query_graph` | Execute Cypher-like graph queries (read-only). |
-| `get_graph_schema` | Node/edge counts, relationship patterns. Run this first. |
+| `get_graph_schema` | Node/edge counts, relationship patterns, property definitions per label. Run this first. |
 | `get_code_snippet` | Read source code for a function by qualified name. |
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `search_code` | Grep-like text search within indexed project files. |
