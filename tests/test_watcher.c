@@ -641,8 +641,9 @@ TEST(watcher_git_removed_no_crash) {
 }
 
 TEST(watcher_continued_dirty) {
-    /* If working tree stays dirty, each poll should re-trigger reindex.
-     * Port of repeated git sentinel detection behavior. */
+    /* If working tree stays dirty with SAME content, subsequent polls must NOT
+     * re-trigger reindex — hash-based detection prevents the infinite loop.
+     * Only a new commit (HEAD change) triggers a reindex after the initial one. */
     char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_cont_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
@@ -677,10 +678,10 @@ TEST(watcher_continued_dirty) {
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1);
 
-    /* Still dirty — should detect again */
+    /* Still dirty with SAME content — hash unchanged, must NOT retrigger */
     cbm_watcher_touch(w, "cont-repo");
     cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 2);
+    ASSERT_EQ(index_call_count, 1); /* Fix: same dirty hash → no extra reindex */
 
     /* Commit to clean up, then poll — should not trigger */
     snprintf(cmd, sizeof(cmd), "cd '%s' && git add file.txt && git commit -q -m 'clean'", tmpdir);
@@ -1241,6 +1242,116 @@ TEST(watcher_modify_tracked_file) {
     PASS();
 }
 
+TEST(watcher_dirty_hash_stable) {
+    /* Core fix: after first reindex for a dirty tree, repeated polls with the
+     * same dirty content must NOT retrigger (same porcelain hash). */
+    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_dhs_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "cd '%s' && git init -q && git config user.email test@test && "
+             "git config user.name test && echo 'hello' > file.txt && "
+             "git add file.txt && git commit -q -m 'init'",
+             tmpdir);
+    if (system(cmd) != 0) {
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
+        system(cmd);
+        SKIP("git not available");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "dhs-repo", tmpdir);
+    index_call_count = 0;
+
+    /* Baseline */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    /* Make dirty */
+    snprintf(cmd, sizeof(cmd), "echo 'dirty' >> '%s/file.txt'", tmpdir);
+    system(cmd);
+
+    /* First poll after edit → reindex */
+    cbm_watcher_touch(w, "dhs-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    /* Three more polls with identical dirty content → no further reindexes */
+    cbm_watcher_touch(w, "dhs-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    cbm_watcher_touch(w, "dhs-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    cbm_watcher_touch(w, "dhs-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1); /* stable — hash-based dedup works */
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
+    system(cmd);
+    PASS();
+}
+
+TEST(watcher_watch_idempotent) {
+    /* Fix 2: calling cbm_watcher_watch() twice with same project+path must be
+     * idempotent — state is preserved (no reset of baseline or dirty hash). */
+    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_wid_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "cd '%s' && git init -q && git config user.email test@test && "
+             "git config user.name test && echo 'hello' > file.txt && "
+             "git add file.txt && git commit -q -m 'init'",
+             tmpdir);
+    if (system(cmd) != 0) {
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
+        system(cmd);
+        SKIP("git not available");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+
+    /* First watch */
+    cbm_watcher_watch(w, "wid-repo", tmpdir);
+    index_call_count = 0;
+
+    /* Baseline poll */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    /* Make dirty and trigger reindex */
+    snprintf(cmd, sizeof(cmd), "echo 'dirty' >> '%s/file.txt'", tmpdir);
+    system(cmd);
+    cbm_watcher_touch(w, "wid-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    /* Re-watch same project+path (idempotent — must not reset state) */
+    cbm_watcher_watch(w, "wid-repo", tmpdir);
+
+    /* Poll with same dirty content — if state was reset, baseline re-runs then
+     * dirty detection fires again (count would become 2). With the fix it stays 1. */
+    cbm_watcher_touch(w, "wid-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1); /* idempotent watch: state preserved */
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
+    system(cmd);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
@@ -1283,6 +1394,8 @@ SUITE(watcher) {
     RUN_TEST(watcher_git_removed_no_crash);
     RUN_TEST(watcher_continued_dirty);
     RUN_TEST(watcher_baseline_dirty_repo);
+    RUN_TEST(watcher_dirty_hash_stable);
+    RUN_TEST(watcher_watch_idempotent);
     RUN_TEST(watcher_unwatch_prunes_state);
     RUN_TEST(watcher_watch_after_unwatch);
 

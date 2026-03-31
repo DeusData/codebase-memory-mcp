@@ -7,6 +7,8 @@
  *
  * Per-project state tracks:
  *   - Last git HEAD hash (detects commits, checkout, pull)
+ *   - Last dirty-tree hash (djb2 of git status --porcelain; prevents reindex
+ *     loop when tree is permanently dirty — only reindexes when content changes)
  *   - Last poll time + adaptive interval
  *   - Whether the project is a git repo
  *
@@ -32,7 +34,8 @@
 typedef struct {
     char *project_name;
     char *root_path;
-    char last_head[64]; /* git HEAD hash */
+    char last_head[64];       /* git HEAD hash */
+    char last_dirty_hash[17]; /* djb2 hex of git status --porcelain output */
     bool is_git;        /* false → skip polling */
     bool baseline_done; /* true after first poll */
     int file_count;     /* approximate, for interval calc */
@@ -118,8 +121,19 @@ static int git_head(const char *root_path, char *out, size_t out_size) {
     return -1;
 }
 
-/* Returns true if working tree has changes (modified, untracked, etc.) */
-static bool git_is_dirty(const char *root_path) {
+/* djb2 hash over a string — non-cryptographic, fast, good distribution */
+static uint64_t djb2(const char *s) {
+    uint64_t h = 5381;
+    while (*s) {
+        h = ((h << 5) + h) ^ (unsigned char)*s++;
+    }
+    return h;
+}
+
+/* Read full git status --porcelain output into a 16-char hex hash.
+ * Returns the number of bytes read (>0 means dirty), -1 on popen failure.
+ * out_hex17 must be at least 17 bytes. */
+static int git_dirty_hash(const char *root_path, char *out_hex17) {
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
              "git --no-optional-locks -C '%s' status --porcelain "
@@ -128,23 +142,18 @@ static bool git_is_dirty(const char *root_path) {
     // NOLINTNEXTLINE(bugprone-command-processor,cert-env33-c)
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
-        return false;
+        strcpy(out_hex17, "0000000000000000");
+        return -1;
     }
-
-    char line[256];
-    bool dirty = false;
-    if (fgets(line, sizeof(line), fp)) {
-        /* Any output means changes */
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len > 0) {
-            dirty = true;
-        }
-    }
+    char buf[4096] = {0};
+    // NOLINTNEXTLINE(bugprone-not-null-terminated-result) — buf has extra NUL byte
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    buf[n] = '\0';
     cbm_pclose(fp);
-    return dirty;
+    uint64_t h = djb2(n > 0 ? buf : "");
+    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+    snprintf(out_hex17, 17, "%016llx", (unsigned long long)h);
+    return (int)n; /* >0 means dirty */
 }
 
 /* Count tracked files via git ls-files */
@@ -228,11 +237,19 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
         return;
     }
 
-    /* Remove old entry first (key points to state's project_name) */
-    project_state_t *old = cbm_ht_get(w->projects, project_name);
-    if (old) {
+    /* If already watching this project at the same path, preserve existing state.
+     * This prevents unnecessary baseline resets when resolve_store() calls us on
+     * every project switch — which would discard the accumulated HEAD/dirty hashes
+     * and trigger redundant git commands on the next poll cycle. */
+    project_state_t *existing = cbm_ht_get(w->projects, project_name);
+    if (existing && strcmp(existing->root_path, root_path) == 0) {
+        return; /* idempotent — state preserved */
+    }
+
+    /* Path changed or first watch: replace old entry */
+    if (existing) {
         cbm_ht_delete(w->projects, project_name);
-        state_free(old);
+        state_free(existing);
     }
 
     project_state_t *s = state_new(project_name, root_path);
@@ -310,13 +327,25 @@ static bool check_changes(project_state_t *s) {
         if (s->last_head[0] != '\0' && strcmp(head, s->last_head) != 0) {
             /* HEAD moved — commit, checkout, pull */
             strncpy(s->last_head, head, sizeof(s->last_head) - 1);
+            s->last_dirty_hash[0] = '\0'; /* HEAD moved: clear hash to force recheck */
             return true;
         }
         strncpy(s->last_head, head, sizeof(s->last_head) - 1);
     }
 
-    /* Check working tree */
-    return git_is_dirty(s->root_path);
+    /* Check working tree — only reindex if content actually changed since last poll */
+    char new_hash[17];
+    int dirty = git_dirty_hash(s->root_path, new_hash);
+    if (dirty <= 0) {
+        /* Clean tree — clear hash so future dirt is always caught */
+        s->last_dirty_hash[0] = '\0';
+        return false;
+    }
+    if (strcmp(new_hash, s->last_dirty_hash) == 0) {
+        return false; /* same dirty state as last check — no new changes */
+    }
+    strncpy(s->last_dirty_hash, new_hash, sizeof(s->last_dirty_hash) - 1);
+    return true;
 }
 
 /* Context for poll_once foreach callback */
@@ -366,6 +395,8 @@ static void poll_project(const char *key, void *val, void *ud) {
             ctx->reindexed++;
             /* Update HEAD after successful reindex */
             git_head(s->root_path, s->last_head, sizeof(s->last_head));
+            /* Refresh dirty hash so same uncommitted changes don't retrigger */
+            git_dirty_hash(s->root_path, s->last_dirty_hash);
             /* Refresh file count for interval */
             s->file_count = git_file_count(s->root_path);
             s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count, ctx->w->poll_base_ms, ctx->w->poll_max_ms);
