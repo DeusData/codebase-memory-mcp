@@ -1299,6 +1299,144 @@ TEST(watcher_dirty_hash_stable) {
     PASS();
 }
 
+TEST(watcher_dirty_content_change_retriggered) {
+    /* Fix 1 bidirectionality: after first dirty reindex, changing dirty content
+     * (different porcelain output → different hash) MUST fire a second reindex.
+     * This proves hash-based detection allows new changes, not just blocks all. */
+    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_dcc_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    char cmd[512];
+    /* Commit two files so dirtying each produces a distinct porcelain output */
+    snprintf(cmd, sizeof(cmd),
+             "cd '%s' && git init -q && git config user.email test@test && "
+             "git config user.name test && echo 'hello' > file.txt && "
+             "echo 'world' > file2.txt && "
+             "git add file.txt file2.txt && git commit -q -m 'init'",
+             tmpdir);
+    if (system(cmd) != 0) {
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
+        system(cmd);
+        SKIP("git not available");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "dcc-repo", tmpdir);
+    index_call_count = 0;
+
+    /* Baseline */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    /* First edit — dirty file.txt only; porcelain = " M file.txt" */
+    snprintf(cmd, sizeof(cmd), "echo 'edit-A' >> '%s/file.txt'", tmpdir);
+    system(cmd);
+    cbm_watcher_touch(w, "dcc-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1); /* first dirty detection */
+
+    /* Same dirty state — no retrigger */
+    cbm_watcher_touch(w, "dcc-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1); /* hash stable → no reindex */
+
+    /* Second edit — also dirty file2.txt; porcelain now has two modified files
+     * → different hash → must trigger a second reindex */
+    snprintf(cmd, sizeof(cmd), "echo 'edit-B' >> '%s/file2.txt'", tmpdir);
+    system(cmd);
+    cbm_watcher_touch(w, "dcc-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2); /* new dirty hash → second reindex */
+
+    /* Same dirty state again — stable */
+    cbm_watcher_touch(w, "dcc-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2); /* stable */
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
+    system(cmd);
+    PASS();
+}
+
+TEST(watcher_watch_path_change_resets_state) {
+    /* Fix 2 correctness: re-watching same project with a DIFFERENT path must
+     * replace state (new baseline), not return early. This verifies the path
+     * comparison in cbm_watcher_watch() is working correctly. */
+    char tmpdirA[256]; snprintf(tmpdirA, sizeof(tmpdirA), "/tmp/cbm_watcher_pca_XXXXXX");
+    char tmpdirB[256]; snprintf(tmpdirB, sizeof(tmpdirB), "/tmp/cbm_watcher_pcb_XXXXXX");
+    if (!cbm_mkdtemp(tmpdirA) || !cbm_mkdtemp(tmpdirB))
+        SKIP("cbm_mkdtemp failed");
+
+    char cmd[512];
+    /* Init repo A */
+    snprintf(cmd, sizeof(cmd),
+             "cd '%s' && git init -q && git config user.email test@test && "
+             "git config user.name test && echo 'repoA' > a.txt && "
+             "git add a.txt && git commit -q -m 'init-A'",
+             tmpdirA);
+    if (system(cmd) != 0) {
+        SKIP("git not available");
+    }
+    /* Init repo B (already clean — nothing to detect after baseline) */
+    snprintf(cmd, sizeof(cmd),
+             "cd '%s' && git init -q && git config user.email test@test && "
+             "git config user.name test && echo 'repoB' > b.txt && "
+             "git add b.txt && git commit -q -m 'init-B'",
+             tmpdirB);
+    if (system(cmd) != 0) {
+        SKIP("git not available");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+
+    /* Watch project-X pointing at A */
+    cbm_watcher_watch(w, "project-X", tmpdirA);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+    index_call_count = 0;
+
+    /* Baseline on A */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    /* Make A dirty and trigger reindex so state has accumulated head+hash */
+    snprintf(cmd, sizeof(cmd), "echo 'dirty-A' >> '%s/a.txt'", tmpdirA);
+    system(cmd);
+    cbm_watcher_touch(w, "project-X");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    /* Re-watch project-X with path B — must replace state, not return early */
+    cbm_watcher_watch(w, "project-X", tmpdirB);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1); /* still 1 project */
+
+    /* First poll on B → baseline (no reindex) */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1); /* baseline never triggers */
+
+    /* Second poll on B (clean) → no reindex */
+    cbm_watcher_touch(w, "project-X");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1); /* B is clean */
+
+    /* Now dirty B → detect */
+    snprintf(cmd, sizeof(cmd), "echo 'dirty-B' >> '%s/b.txt'", tmpdirB);
+    system(cmd);
+    cbm_watcher_touch(w, "project-X");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2); /* B's dirty state detected */
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s' '%s'", tmpdirA, tmpdirB);
+    system(cmd);
+    PASS();
+}
+
 TEST(watcher_watch_idempotent) {
     /* Fix 2: calling cbm_watcher_watch() twice with same project+path must be
      * idempotent — state is preserved (no reset of baseline or dirty hash). */
@@ -1395,6 +1533,8 @@ SUITE(watcher) {
     RUN_TEST(watcher_continued_dirty);
     RUN_TEST(watcher_baseline_dirty_repo);
     RUN_TEST(watcher_dirty_hash_stable);
+    RUN_TEST(watcher_dirty_content_change_retriggered);
+    RUN_TEST(watcher_watch_path_change_resets_state);
     RUN_TEST(watcher_watch_idempotent);
     RUN_TEST(watcher_unwatch_prunes_state);
     RUN_TEST(watcher_watch_after_unwatch);
