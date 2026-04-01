@@ -5,6 +5,7 @@
  * Handles Python __init__.py, JS/TS index.{js,ts}, path separators.
  */
 #include "pipeline/pipeline.h"
+#include "foundation/constants.h"
 #include "foundation/platform.h"
 
 #include <stddef.h> // NULL
@@ -12,7 +13,7 @@
 #include <stdlib.h>
 #include <string.h> // strdup
 
-/* Maximum path segments in a FQN (256 slots total, -2 for project + name) */
+/* Maximum path segments in a FQN (CBM_SZ_256 slots total, -2 for project + name) */
 #define FQN_MAX_PATH_SEGS 254
 #define FQN_MAX_DIR_SEGS 255
 
@@ -30,7 +31,7 @@ static char *join_segments(const char **segments, int count) {
             total++; /* dot separator */
         }
     }
-    char *result = malloc(total + 1);
+    char *result = malloc(total + SKIP_ONE);
     if (!result) {
         return NULL;
     }
@@ -50,7 +51,7 @@ static char *join_segments(const char **segments, int count) {
 /* Strip file extension from the last path component. */
 static void strip_file_extension(char *path) {
     char *last_slash = strrchr(path, '/');
-    char *start = last_slash ? last_slash + 1 : path;
+    char *start = last_slash ? last_slash + SKIP_ONE : path;
     char *ext = strrchr(start, '.');
     if (ext) {
         *ext = '\0';
@@ -72,7 +73,7 @@ static int tokenize_path(char *path, const char **segments, int max_segs) {
         if (tok[0] != '\0') {
             segments[count++] = tok;
         }
-        tok = slash ? slash + 1 : NULL;
+        tok = slash ? slash + SKIP_ONE : NULL;
     }
     return count;
 }
@@ -81,10 +82,10 @@ static int tokenize_path(char *path, const char **segments, int max_segs) {
  * symbol name is provided. Keeps it when no name is given to avoid QN
  * collision with Folder nodes for the same directory. */
 static void strip_init_or_index(const char **segments, int *seg_count, const char *name) {
-    if (*seg_count <= 1) {
+    if (*seg_count <= SKIP_ONE) {
         return;
     }
-    const char *last = segments[*seg_count - 1];
+    const char *last = segments[*seg_count - SKIP_ONE];
     if (strcmp(last, "__init__") != 0 && strcmp(last, "index") != 0) {
         return;
     }
@@ -104,7 +105,7 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
     cbm_normalize_path_sep(path);
     strip_file_extension(path);
 
-    const char *segments[256];
+    const char *segments[CBM_SZ_256];
     int seg_count = 0;
     segments[seg_count++] = project;
     seg_count += tokenize_path(path, segments + seg_count, FQN_MAX_PATH_SEGS);
@@ -133,7 +134,7 @@ char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir) {
     char *dir = strdup(rel_dir ? rel_dir : "");
     cbm_normalize_path_sep(dir);
 
-    const char *segments[256];
+    const char *segments[CBM_SZ_256];
     int seg_count = 0;
     segments[seg_count++] = project;
 
@@ -147,7 +148,7 @@ char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir) {
             if (tok[0] != '\0') {
                 segments[seg_count++] = tok;
             }
-            tok = slash ? slash + 1 : NULL;
+            tok = slash ? slash + SKIP_ONE : NULL;
         }
     }
 
@@ -195,7 +196,7 @@ char *cbm_project_name_from_path(const char *abs_path) {
 
     /* Trim trailing dashes */
     size_t slen = strlen(start);
-    while (slen > 0 && start[slen - 1] == '-') {
+    while (slen > 0 && start[slen - SKIP_ONE] == '-') {
         start[--slen] = '\0';
     }
 

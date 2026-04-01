@@ -10,6 +10,7 @@
  * The result: clean separated clusters (from the ring) with locally
  * optimized intra-cluster positions (from the force simulation).
  */
+#include "foundation/constants.h"
 #include "ui/layout3d.h"
 #include "foundation/log.h"
 
@@ -119,7 +120,7 @@ typedef struct octree_node {
 } octree_node_t;
 
 static octree_node_t *octree_new(float ox, float oy, float oz, float half) {
-    octree_node_t *n = calloc(1, sizeof(*n));
+    octree_node_t *n = calloc(CBM_ALLOC_ONE, sizeof(*n));
     if (!n)
         return NULL;
     n->ox = ox;
@@ -325,7 +326,7 @@ static void compute_call_depth(int n, const int *es, const int *ed, int ne, cons
             if (es[e] == c) {
                 int t = ed[e];
                 if (t >= 0 && t < n && depth[t] == -1) {
-                    depth[t] = cd + 1;
+                    depth[t] = cd + SKIP_ONE;
                     q[tail++] = t;
                 }
             }
@@ -373,19 +374,19 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
     cbm_search_output_t search_out;
     memset(&search_out, 0, sizeof(search_out));
     if (cbm_store_search(store, &params, &search_out) != CBM_STORE_OK)
-        return calloc(1, sizeof(cbm_layout_result_t));
+        return calloc(CBM_ALLOC_ONE, sizeof(cbm_layout_result_t));
 
     int n = search_out.count, total_count = search_out.total;
     if (n == 0) {
         cbm_store_search_free(&search_out);
-        cbm_layout_result_t *r = calloc(1, sizeof(*r));
+        cbm_layout_result_t *r = calloc(CBM_ALLOC_ONE, sizeof(*r));
         if (r)
             r->total_nodes = total_count;
         return r;
     }
 
     /* 2. Query edges */
-    int total_edges = 0, edge_cap = 256;
+    int total_edges = 0, edge_cap = CBM_SZ_256;
     cbm_edge_t *all_edges = malloc((size_t)edge_cap * sizeof(cbm_edge_t));
     cbm_schema_info_t schema;
     memset(&schema, 0, sizeof(schema));
@@ -453,7 +454,7 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
 
     /* 5. Seed positions: ring by directory cluster key + z from call depth */
     body_t *bodies = calloc((size_t)n, sizeof(body_t));
-    cbm_layout_result_t *result = calloc(1, sizeof(*result));
+    cbm_layout_result_t *result = calloc(CBM_ALLOC_ONE, sizeof(*result));
     if (!result || !bodies) {
         free(bodies);
         free(deg);
@@ -474,7 +475,7 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
         const char *fp = sn->file_path ? sn->file_path : "";
 
         /* Cluster key = first 3 dir components */
-        char ck[256] = {0};
+        char ck[CBM_SZ_256] = {0};
         {
             const char *p = fp;
             int sl = 0, ki = 0;
@@ -586,7 +587,7 @@ char *cbm_layout_to_json(const cbm_layout_result_t *r) {
         if (r->nodes[i].file_path)
             yyjson_mut_obj_add_str(doc, nd, "file_path", r->nodes[i].file_path);
         yyjson_mut_obj_add_real(doc, nd, "size", (double)r->nodes[i].size);
-        char hex[8];
+        char hex[CBM_SZ_8];
         snprintf(hex, sizeof(hex), "#%06x", r->nodes[i].color);
         yyjson_mut_obj_add_strcpy(doc, nd, "color", hex);
         yyjson_mut_arr_append(na, nd);

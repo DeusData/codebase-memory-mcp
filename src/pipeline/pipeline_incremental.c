@@ -9,6 +9,9 @@
  *
  * Called from pipeline.c when a DB with stored hashes already exists.
  */
+#include "foundation/constants.h"
+
+enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24, INCR_WAL_BUF = 1040 };
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
@@ -44,9 +47,9 @@ static double elapsed_ms(struct timespec start) {
 
 /* itoa into static buffer — matches pipeline.c helper */
 static const char *itoa_buf(int v) {
-    static _Thread_local char buf[4][24];
+    static _Thread_local char buf[INCR_RING_BUF][INCR_TS_BUF];
     static _Thread_local int idx = 0;
-    idx = (idx + 1) & 3;
+    idx = (idx + SKIP_ONE) & INCR_RING_MASK;
     snprintf(buf[idx], sizeof(buf[idx]), "%d", v);
     return buf[idx];
 }
@@ -79,7 +82,8 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
     int n_unchanged = 0;
 
     /* Build lookup: rel_path -> stored hash */
-    CBMHashTable *ht = cbm_ht_create(stored_count > 0 ? (size_t)stored_count * 2 : 64);
+    CBMHashTable *ht =
+        cbm_ht_create(stored_count > 0 ? (size_t)stored_count * PAIR_LEN : CBM_SZ_64);
     for (int i = 0; i < stored_count; i++) {
         cbm_ht_set(ht, stored[i].rel_path, &stored[i]);
     }
@@ -117,19 +121,19 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
 /* Find stored files that no longer exist on disk. Returns count. */
 static int find_deleted_files(cbm_file_info_t *files, int file_count, cbm_file_hash_t *stored,
                               int stored_count, char ***out_deleted) {
-    CBMHashTable *current = cbm_ht_create((size_t)file_count * 2);
+    CBMHashTable *current = cbm_ht_create((size_t)file_count * PAIR_LEN);
     for (int i = 0; i < file_count; i++) {
         cbm_ht_set(current, files[i].rel_path, &files[i]);
     }
 
     int count = 0;
-    int cap = 64;
+    int cap = CBM_SZ_64;
     char **deleted = malloc((size_t)cap * sizeof(char *));
 
     for (int i = 0; i < stored_count; i++) {
         if (!cbm_ht_get(current, stored[i].rel_path)) {
             if (count >= cap) {
-                cap *= 2;
+                cap *= PAIR_LEN;
                 char **tmp = realloc(deleted, (size_t)cap * sizeof(char *));
                 if (!tmp) {
                     break;
@@ -174,7 +178,7 @@ static void run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *change
 
 #define MIN_FILES_FOR_PARALLEL_INCR 50
     int worker_count = cbm_default_worker_count(true);
-    bool use_parallel = (worker_count > 1 && ci > MIN_FILES_FOR_PARALLEL_INCR);
+    bool use_parallel = (worker_count > SKIP_ONE && ci > MIN_FILES_FOR_PARALLEL_INCR);
 
     if (use_parallel) {
         cbm_log_info("incremental.mode", "mode", "parallel", "workers", itoa_buf(worker_count),
@@ -218,7 +222,7 @@ static void run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *change
     }
 }
 
-/* Run post-extraction passes (tests, decorator tags, configlink, httplinks). */
+/* Run post-extraction passes (tests, decorator tags, configlink). */
 static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci,
                            const char *project) {
     struct timespec t;
@@ -236,13 +240,7 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
     cbm_pipeline_pass_configlink(ctx);
     cbm_log_info("pass.timing", "pass", "incr_configlink", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
-
-    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    cbm_pipeline_pass_httplinks(ctx);
-    cbm_log_info("pass.timing", "pass", "incr_httplinks", "elapsed_ms",
-                 itoa_buf((int)elapsed_ms(t)));
 }
-
 /* Delete old DB and dump merged graph + hashes to disk. */
 static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
                              cbm_file_info_t *files, int file_count) {
@@ -250,8 +248,8 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
     cbm_unlink(db_path);
-    char wal[1040];
-    char shm[1040];
+    char wal[INCR_WAL_BUF];
+    char shm[INCR_WAL_BUF];
     snprintf(wal, sizeof(wal), "%s-wal", db_path);
     snprintf(shm, sizeof(shm), "%s-shm", db_path);
     cbm_unlink(wal);
@@ -281,7 +279,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_store_t *store = cbm_store_open_path(db_path);
     if (!store) {
         cbm_log_error("incremental.err", "msg", "open_db_failed", "path", db_path);
-        return -1;
+        return CBM_NOT_FOUND;
     }
 
     /* Load stored file hashes */
@@ -315,7 +313,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_store_free_file_hashes(stored, stored_count);
 
     /* Build list of changed files */
-    cbm_file_info_t *changed_files = malloc((size_t)n_changed * sizeof(cbm_file_info_t));
+    cbm_file_info_t *changed_files =
+        (n_changed > 0) ? malloc((size_t)n_changed * sizeof(cbm_file_info_t)) : NULL;
     int ci = 0;
     for (int i = 0; i < file_count; i++) {
         if (is_changed[i]) {
@@ -346,7 +345,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         }
         free(deleted);
         cbm_store_close(store);
-        return -1;
+        return CBM_NOT_FOUND;
     }
 
     cbm_store_close(store);

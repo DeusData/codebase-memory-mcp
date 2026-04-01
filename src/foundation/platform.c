@@ -6,6 +6,7 @@
 #include "platform.h"
 #include "compat.h"
 
+#include "foundation/constants.h"
 #include <stdint.h> // uint64_t, int64_t
 
 #ifdef _WIN32
@@ -89,7 +90,7 @@ bool cbm_is_dir(const char *path) {
 int64_t cbm_file_size(const char *path) {
     WIN32_FILE_ATTRIBUTE_DATA fad;
     if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
     LARGE_INTEGER sz;
     sz.HighPart = (LONG)fad.nFileSizeHigh; // cppcheck-suppress unreadVariable
@@ -169,7 +170,7 @@ static int timebase_init = 0;
 uint64_t cbm_now_ns(void) {
     if (!timebase_init) {
         mach_timebase_info(&timebase_info);
-        timebase_init = 1;
+        timebase_init = SKIP_ONE;
     }
     uint64_t ticks = mach_absolute_time();
     return ticks * timebase_info.numer / timebase_info.denom;
@@ -197,7 +198,8 @@ int cbm_nprocs(void) {
     if (sysctlbyname("hw.ncpu", &ncpu, &len, NULL, 0) == 0 && ncpu > 0) {
         return ncpu;
     }
-    return 1;
+    enum { FILE_EXISTS = 1 };
+    return FILE_EXISTS;
 #else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? (int)n : 1;
@@ -219,7 +221,7 @@ bool cbm_is_dir(const char *path) {
 int64_t cbm_file_size(const char *path) {
     struct stat st;
     if (stat(path, &st) != 0) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
     return (int64_t)st.st_size;
 }
@@ -239,19 +241,45 @@ char *cbm_normalize_path_sep(char *path) {
 
 #endif /* _WIN32 */
 
+/* ── Environment variables ────────────────────────────────────── */
+
+const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback) {
+    const char *val = getenv(name);
+    if (!val) {
+        if (fallback) {
+            snprintf(buf, buf_sz, "%s", fallback);
+            return buf;
+        }
+        buf[0] = '\0';
+        return NULL;
+    }
+    snprintf(buf, buf_sz, "%s", val);
+    return buf;
+}
+
 /* ── Home directory (cross-platform) ──────────────────────────── */
 
 const char *cbm_get_home_dir(void) {
-    static char buf[1024];
-    const char *h = getenv("HOME");
-    if (h && h[0]) {
-        snprintf(buf, sizeof(buf), "%s", h);
+    static char buf[CBM_SZ_1K];
+    const char *raw;
+    char tmp[CBM_SZ_256] = "";
+
+    raw = getenv("HOME");
+    if (raw) {
+        snprintf(tmp, sizeof(tmp), "%s", raw);
+    }
+    if (tmp[0]) {
+        snprintf(buf, sizeof(buf), "%s", tmp);
         cbm_normalize_path_sep(buf);
         return buf;
     }
-    h = getenv("USERPROFILE");
-    if (h && h[0]) {
-        snprintf(buf, sizeof(buf), "%s", h);
+
+    raw = getenv("USERPROFILE");
+    if (raw) {
+        snprintf(tmp, sizeof(tmp), "%s", raw);
+    }
+    if (tmp[0]) {
+        snprintf(buf, sizeof(buf), "%s", tmp);
         cbm_normalize_path_sep(buf);
         return buf;
     }

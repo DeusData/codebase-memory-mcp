@@ -12,9 +12,16 @@
 #include "arena.h"
 #include "helpers.h"
 #include "tree_sitter/api.h"
+#include "foundation/constants.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
+/* Local constants. */
+enum {
+    K8S_BUF_SIZE = 256,
+    RESULT_BUF_SIZE = 512,
+};
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -26,28 +33,32 @@
 // child (the tree-sitter YAML grammar often wraps scalars in flow_node).
 // Returns NULL for non-scalar node types.
 static const char *get_scalar_text(CBMArena *a, TSNode node, const char *source) {
-    const char *type = ts_node_type(node);
-    // Unwrap flow_node: the actual scalar is the first named child
-    if (strcmp(type, "flow_node") == 0) {
-        TSNode inner = ts_node_named_child(node, 0);
-        if (ts_node_is_null(inner)) {
-            return NULL;
+    enum { MAX_UNWRAP = 4 };
+    for (int depth = 0; depth < MAX_UNWRAP; depth++) {
+        const char *type = ts_node_type(node);
+        if (strcmp(type, "flow_node") == 0) {
+            TSNode inner = ts_node_named_child(node, 0);
+            if (ts_node_is_null(inner)) {
+                return NULL;
+            }
+            node = inner;
+            continue;
         }
-        return get_scalar_text(a, inner, source);
-    }
-    if (strcmp(type, "plain_scalar") == 0) {
-        return cbm_node_text(a, node, source);
-    }
-    if (strcmp(type, "double_quote_scalar") == 0 || strcmp(type, "single_quote_scalar") == 0) {
-        const char *raw = cbm_node_text(a, node, source);
-        if (!raw) {
-            return NULL;
+        if (strcmp(type, "plain_scalar") == 0) {
+            return cbm_node_text(a, node, source);
         }
-        size_t len = strlen(raw);
-        if (len >= 2) {
-            return cbm_arena_strndup(a, raw + 1, len - 2);
+        if (strcmp(type, "double_quote_scalar") == 0 || strcmp(type, "single_quote_scalar") == 0) {
+            const char *raw = cbm_node_text(a, node, source);
+            if (!raw) {
+                return NULL;
+            }
+            size_t len = strlen(raw);
+            if (len >= PAIR_LEN) {
+                return cbm_arena_strndup(a, raw + SKIP_ONE, len - PAIR_LEN);
+            }
+            return raw;
         }
-        return raw;
+        break;
     }
     return NULL;
 }
@@ -122,7 +133,7 @@ static void process_kustomize_pair(CBMExtractCtx *ctx, TSNode pair) {
         return;
     }
 
-    TSNode val_node = ts_node_named_child(pair, 1);
+    TSNode val_node = ts_node_named_child(pair, SKIP_ONE);
     if (ts_node_is_null(val_node)) {
         return;
     }
@@ -179,7 +190,7 @@ static void extract_metadata_name(CBMArena *a, TSNode meta_mapping, const char *
         if (!mkey_text || strcmp(mkey_text, "name") != 0) {
             continue;
         }
-        TSNode mval = ts_node_named_child(mpair, 1);
+        TSNode mval = ts_node_named_child(mpair, SKIP_ONE);
         if (ts_node_is_null(mval)) {
             continue;
         }
@@ -192,7 +203,7 @@ static void extract_metadata_name(CBMArena *a, TSNode meta_mapping, const char *
 
 // Unwrap a block_mapping_pair value through optional block_node.
 static TSNode unwrap_pair_value(TSNode pair) {
-    TSNode val_node = ts_node_named_child(pair, 1);
+    TSNode val_node = ts_node_named_child(pair, SKIP_ONE);
     if (ts_node_is_null(val_node)) {
         return val_node;
     }
@@ -263,8 +274,8 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
             continue;
         }
 
-        char kind_buf[256] = {0};
-        char meta_name_buf[256] = {0};
+        char kind_buf[K8S_BUF_SIZE] = {0};
+        char meta_name_buf[K8S_BUF_SIZE] = {0};
         extract_k8s_scalars(ctx, mapping, kind_buf, sizeof(kind_buf), meta_name_buf,
                             sizeof(meta_name_buf));
 
@@ -273,7 +284,7 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
             continue;
         }
 
-        char def_name[512];
+        char def_name[RESULT_BUF_SIZE];
         snprintf(def_name, sizeof(def_name), "%s/%s", kind_buf, meta_name_buf);
 
         CBMDefinition def = {0};
@@ -281,8 +292,8 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
         def.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->module_qn, def_name);
         def.label = cbm_arena_strdup(a, "Resource");
         def.file_path = ctx->rel_path;
-        def.start_line = ts_node_start_point(mapping).row + 1;
-        def.end_line = ts_node_end_point(mapping).row + 1;
+        def.start_line = ts_node_start_point(mapping).row + TS_LINE_OFFSET;
+        def.end_line = ts_node_end_point(mapping).row + TS_LINE_OFFSET;
         cbm_defs_push(&ctx->result->defs, a, def);
 
         break; // Only the first document per file

@@ -1,9 +1,13 @@
 #include "cbm.h"
+#include "arena.h"
 #include "helpers.h"
 #include "lang_specs.h"
 #include "extract_unified.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
-#include <stdint.h>          // uint32_t
+#include "foundation/constants.h"
+
+enum { MAX_EXCEPTION_NAME_LEN = 100, LAST_IDX = 1 };
+#include <stdint.h> // uint32_t
 #include <string.h>
 #include <ctype.h>
 
@@ -28,12 +32,12 @@ static char *resolve_exception_name(CBMArena *a, TSNode throw_node, const char *
         if (strcmp(ck, "call") == 0 || strcmp(ck, "call_expression") == 0 ||
             strcmp(ck, "new_expression") == 0 || strcmp(ck, "object_creation_expression") == 0 ||
             strcmp(ck, "instance_expression") == 0) {
-            TSNode fn = ts_node_child_by_field_name(child, "function", 8);
+            TSNode fn = ts_node_child_by_field_name(child, TS_FIELD("function"));
             if (ts_node_is_null(fn)) {
                 fn = ts_node_child_by_field_name(child, "constructor", FIELD_LEN_CONSTRUCTOR);
             }
             if (ts_node_is_null(fn)) {
-                fn = ts_node_child_by_field_name(child, "type", 4);
+                fn = ts_node_child_by_field_name(child, TS_FIELD("type"));
             }
             if (ts_node_is_null(fn) && ts_node_named_child_count(child) > 0) {
                 fn = ts_node_named_child(child, 0);
@@ -84,8 +88,8 @@ static void process_throw_node(CBMExtractCtx *ctx, TSNode node, const CBMLangSpe
     if (cbm_kind_in_set(node, spec->throw_node_types)) {
         char *exc_name = resolve_exception_name(ctx->arena, node, ctx->source);
         if (exc_name && exc_name[0]) {
-            if (strlen(exc_name) > 100) {
-                exc_name[100] = '\0';
+            if (strlen(exc_name) > MAX_EXCEPTION_NAME_LEN) {
+                exc_name[MAX_EXCEPTION_NAME_LEN] = '\0';
             }
             CBMThrow thr;
             thr.exception_name = exc_name;
@@ -98,7 +102,7 @@ static void process_throw_node(CBMExtractCtx *ctx, TSNode node, const CBMLangSpe
 }
 
 // Iterative throw walker
-#define THROWS_STACK_CAP 512
+#define THROWS_STACK_CAP CBM_SZ_512
 static void walk_throws(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
     TSNode stack[THROWS_STACK_CAP];
     int top = 0;
@@ -107,7 +111,7 @@ static void walk_throws(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec
         TSNode node = stack[--top];
         process_throw_node(ctx, node, spec);
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - 1; i >= 0 && top < THROWS_STACK_CAP; i--) {
+        for (int i = (int)count - LAST_IDX; i >= 0 && top < THROWS_STACK_CAP; i--) {
             stack[top++] = ts_node_child(node, (uint32_t)i);
         }
     }
@@ -117,7 +121,7 @@ static void walk_throws(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec
 
 // Try to emit a write for an assignment node.
 static void try_emit_assignment_write(CBMExtractCtx *ctx, TSNode node, const char *func_qn) {
-    TSNode left = ts_node_child_by_field_name(node, "left", 4);
+    TSNode left = ts_node_child_by_field_name(node, TS_FIELD("left"));
     if (ts_node_is_null(left)) {
         if (ts_node_child_count(node) > 0) {
             left = ts_node_child(node, 0);
@@ -140,7 +144,7 @@ static void try_emit_assignment_write(CBMExtractCtx *ctx, TSNode node, const cha
     }
 }
 
-#define READWRITE_STACK_CAP 512
+#define READWRITE_STACK_CAP CBM_SZ_512
 static void walk_readwrites(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
     TSNode stack[READWRITE_STACK_CAP];
     int top = 0;
@@ -151,7 +155,7 @@ static void walk_readwrites(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *
             try_emit_assignment_write(ctx, node, cbm_enclosing_func_qn_cached(ctx, node));
         }
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - 1; i >= 0 && top < READWRITE_STACK_CAP; i--) {
+        for (int i = (int)count - LAST_IDX; i >= 0 && top < READWRITE_STACK_CAP; i--) {
             stack[top++] = ts_node_child(node, (uint32_t)i);
         }
     }
@@ -187,8 +191,8 @@ void handle_throws(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     if (has_throws && cbm_kind_in_set(node, spec->throw_node_types)) {
         char *exc_name = resolve_exception_name(ctx->arena, node, ctx->source);
         if (exc_name && exc_name[0]) {
-            if (strlen(exc_name) > 100) {
-                exc_name[100] = '\0';
+            if (strlen(exc_name) > MAX_EXCEPTION_NAME_LEN) {
+                exc_name[MAX_EXCEPTION_NAME_LEN] = '\0';
             }
             CBMThrow thr;
             thr.exception_name = exc_name;
@@ -206,7 +210,7 @@ void handle_readwrites(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
     }
 
     if (cbm_kind_in_set(node, spec->assignment_node_types)) {
-        TSNode left = ts_node_child_by_field_name(node, "left", 4);
+        TSNode left = ts_node_child_by_field_name(node, TS_FIELD("left"));
         if (ts_node_is_null(left)) {
             if (ts_node_child_count(node) > 0) {
                 left = ts_node_child(node, 0);

@@ -7,6 +7,19 @@
  *
  * Port of internal/pipeline/envscan.go:ScanProjectEnvURLs().
  */
+#include "foundation/constants.h"
+
+enum {
+    ENV_REGEX_MAX = 5,
+    ENV_GRP_1 = 1,
+    ENV_GRP_2 = 2,
+    ENV_GRP_3 = 3,
+    ENV_GRP_4 = 4,
+    ENV_GRP_5 = 5,
+    ENV_EXT_LEN = 4, /* strlen(".env") */
+};
+
+#define SLEN(s) (sizeof(s) - 1)
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "foundation/log.h"
@@ -53,7 +66,7 @@ static void compile_patterns(void) {
     cbm_regcomp(&properties_re, "(" W "+)[[:space:]]*=[[:space:]]*(https?://[^ \t]+)",
                 CBM_REG_EXTENDED);
 
-    patterns_compiled = 1;
+    patterns_compiled = SKIP_ONE;
 }
 
 #undef W
@@ -63,7 +76,7 @@ static void compile_patterns(void) {
 
 static int is_dockerfile_name(const char *name) {
     /* Case-insensitive check */
-    char lower[256];
+    char lower[CBM_SZ_256];
     size_t len = strlen(name);
     if (len >= sizeof(lower)) {
         return 0;
@@ -73,21 +86,21 @@ static int is_dockerfile_name(const char *name) {
     }
 
     if (strcmp(lower, "dockerfile") == 0) {
-        return 1;
+        return SKIP_ONE;
     }
 #define DOCKERFILE_SUFFIX_LEN 11 /* strlen("dockerfile.") == strlen(".dockerfile") */
     if (strncmp(lower, "dockerfile.", DOCKERFILE_SUFFIX_LEN) == 0) {
-        return 1;
+        return SKIP_ONE;
     }
     if (len > DOCKERFILE_SUFFIX_LEN &&
         strcmp(lower + len - DOCKERFILE_SUFFIX_LEN, ".dockerfile") == 0) {
-        return 1;
+        return SKIP_ONE;
     }
     return 0;
 }
 
 static int is_env_file_name(const char *name) {
-    char lower[256];
+    char lower[CBM_SZ_256];
     size_t len = strlen(name);
     if (len >= sizeof(lower)) {
         return 0;
@@ -97,19 +110,19 @@ static int is_env_file_name(const char *name) {
     }
 
     if (strcmp(lower, ".env") == 0) {
-        return 1;
+        return SKIP_ONE;
     }
-    if (strncmp(lower, ".env.", 5) == 0) {
-        return 1;
+    if (strncmp(lower, ".env.", SLEN(".env.")) == 0) {
+        return SKIP_ONE;
     }
-    if (len > 4 && strcmp(lower + len - 4, ".env") == 0) {
-        return 1;
+    if (len > ENV_EXT_LEN && strcmp(lower + len - ENV_EXT_LEN, ".env") == 0) {
+        return SKIP_ONE;
     }
     return 0;
 }
 
 static int is_secret_file(const char *name) {
-    char lower[256];
+    char lower[CBM_SZ_256];
     size_t len = strlen(name);
     if (len >= sizeof(lower)) {
         return 0;
@@ -123,7 +136,7 @@ static int is_secret_file(const char *name) {
         "id_ed25519",      ".pem",        ".key",     NULL};
     for (int i = 0; patterns[i]; i++) {
         if (strstr(lower, patterns[i])) {
-            return 1;
+            return SKIP_ONE;
         }
     }
     return 0;
@@ -137,7 +150,7 @@ static int is_ignored_dir(const char *name) {
         ".idea", ".vscode",      "dist", "build", ".next",       ".nuxt",  "target",     NULL};
     for (int i = 0; dirs[i]; i++) {
         if (strcmp(name, dirs[i]) == 0) {
-            return 1;
+            return SKIP_ONE;
         }
     }
     return 0;
@@ -203,63 +216,63 @@ static int extract_kv_groups(const char *trimmed, const cbm_regmatch_t *m, int k
     key_out[klen] = '\0';
     memcpy(val_out, trimmed + m[val_grp].rm_so, vlen);
     val_out[vlen] = '\0';
-    return 1;
+    return SKIP_ONE;
 }
 
 /* Try to scan a Dockerfile line. */
 static int scan_dockerfile_line(const char *line, char *key, size_t ksz, char *val, size_t vsz) {
-    cbm_regmatch_t m[5];
-    if (cbm_regexec(&dockerfile_re, line, 4, m, 0) != 0) {
+    cbm_regmatch_t m[ENV_REGEX_MAX];
+    if (cbm_regexec(&dockerfile_re, line, ENV_GRP_4, m, 0) != 0) {
         return 0;
     }
-    if (!extract_kv_groups(line, m, 2, 3, key, ksz, val, vsz)) {
+    if (!extract_kv_groups(line, m, ENV_GRP_2, ENV_GRP_3, key, ksz, val, vsz)) {
         return 0;
     }
     size_t vl = strlen(val);
-    while (vl > 0 && (val[vl - 1] == '"' || val[vl - 1] == '\'')) {
+    while (vl > 0 && (val[vl - SKIP_ONE] == '"' || val[vl - SKIP_ONE] == '\'')) {
         val[--vl] = '\0';
     }
-    return 1;
+    return SKIP_ONE;
 }
 
 /* Try to scan a YAML line. */
 static int scan_yaml_line(const char *line, char *key, size_t ksz, char *val, size_t vsz) {
-    cbm_regmatch_t m[5];
-    if (cbm_regexec(&yaml_kv_re, line, 3, m, 0) == 0 &&
-        extract_kv_groups(line, m, 1, 2, key, ksz, val, vsz)) {
-        return 1;
+    cbm_regmatch_t m[ENV_REGEX_MAX];
+    if (cbm_regexec(&yaml_kv_re, line, ENV_GRP_3, m, 0) == 0 &&
+        extract_kv_groups(line, m, ENV_GRP_1, ENV_GRP_2, key, ksz, val, vsz)) {
+        return SKIP_ONE;
     }
-    if (cbm_regexec(&yaml_setenv_re, line, 3, m, 0) == 0 &&
-        extract_kv_groups(line, m, 1, 2, key, ksz, val, vsz)) {
-        return 1;
+    if (cbm_regexec(&yaml_setenv_re, line, ENV_GRP_3, m, 0) == 0 &&
+        extract_kv_groups(line, m, ENV_GRP_1, ENV_GRP_2, key, ksz, val, vsz)) {
+        return SKIP_ONE;
     }
     return 0;
 }
 
 /* Try to scan a Terraform line. */
 static int scan_terraform_line(const char *line, char *key, size_t ksz, char *val, size_t vsz) {
-    cbm_regmatch_t m[5];
-    if (cbm_regexec(&terraform_re, line, 3, m, 0) != 0) {
+    cbm_regmatch_t m[ENV_REGEX_MAX];
+    if (cbm_regexec(&terraform_re, line, ENV_GRP_3, m, 0) != 0) {
         return 0;
     }
-    int vlen = (m[2].rm_eo - m[2].rm_so);
+    int vlen = (m[ENV_GRP_2].rm_eo - m[ENV_GRP_2].rm_so);
     if (vlen <= 0 || vlen >= (int)vsz) {
         return 0;
     }
-    strncpy(key, "_tf_default", ksz - 1);
-    key[ksz - 1] = '\0';
-    memcpy(val, line + m[2].rm_so, vlen);
+    strncpy(key, "_tf_default", ksz - SKIP_ONE);
+    key[ksz - SKIP_ONE] = '\0';
+    memcpy(val, line + m[ENV_GRP_2].rm_so, vlen);
     val[vlen] = '\0';
-    return 1;
+    return SKIP_ONE;
 }
 
 /* Try single-regex scan (shell, envfile, toml, properties). */
 static int scan_regex_line(cbm_regex_t *re, const char *line, int kg, int vg, char *key, size_t ksz,
                            char *val, size_t vsz) {
-    cbm_regmatch_t m[5];
-    if (cbm_regexec(re, line, 5, m, 0) == 0 &&
+    cbm_regmatch_t m[ENV_REGEX_MAX];
+    if (cbm_regexec(re, line, ENV_GRP_5, m, 0) == 0 &&
         extract_kv_groups(line, m, kg, vg, key, ksz, val, vsz)) {
-        return 1;
+        return SKIP_ONE;
     }
     return 0;
 }
@@ -270,7 +283,7 @@ static int scan_line(const char *line, file_type_t ft, char *key_out, size_t key
     while (*trimmed == ' ' || *trimmed == '\t') {
         trimmed++;
     }
-    if (*trimmed == '#' || (trimmed[0] == '/' && trimmed[1] == '/')) {
+    if (*trimmed == '#' || (trimmed[0] == '/' && trimmed[SKIP_ONE] == '/')) {
         return 0;
     }
 
@@ -282,13 +295,17 @@ static int scan_line(const char *line, file_type_t ft, char *key_out, size_t key
     case FT_TERRAFORM:
         return scan_terraform_line(trimmed, key_out, key_sz, val_out, val_sz);
     case FT_SHELL:
-        return scan_regex_line(&shell_re, trimmed, 2, 3, key_out, key_sz, val_out, val_sz);
+        return scan_regex_line(&shell_re, trimmed, ENV_GRP_2, ENV_GRP_3, key_out, key_sz, val_out,
+                               val_sz);
     case FT_ENVFILE:
-        return scan_regex_line(&envfile_re, trimmed, 1, 2, key_out, key_sz, val_out, val_sz);
+        return scan_regex_line(&envfile_re, trimmed, ENV_GRP_1, ENV_GRP_2, key_out, key_sz, val_out,
+                               val_sz);
     case FT_TOML:
-        return scan_regex_line(&toml_re, trimmed, 1, 2, key_out, key_sz, val_out, val_sz);
+        return scan_regex_line(&toml_re, trimmed, ENV_GRP_1, ENV_GRP_2, key_out, key_sz, val_out,
+                               val_sz);
     case FT_PROPERTIES:
-        return scan_regex_line(&properties_re, trimmed, 1, 2, key_out, key_sz, val_out, val_sz);
+        return scan_regex_line(&properties_re, trimmed, ENV_GRP_1, ENV_GRP_2, key_out, key_sz,
+                               val_out, val_sz);
     default:
         return 0;
     }
@@ -305,25 +322,26 @@ static int scan_env_file(const char *full_path, const char *rel, file_type_t ft,
     }
 
     struct stat fst;
-    if (fstat(fileno(f), &fst) != 0 || fst.st_size > (long)1024 * 1024) {
-        fclose(f);
+    if (fstat(fileno(f), &fst) != 0 || fst.st_size > (long)CBM_SZ_1K * CBM_SZ_1K) {
+        (void)fclose(f);
         return 0;
     }
 
     int count = 0;
-    char line[2048];
+    char line[CBM_SZ_2K];
     while (fgets(line, sizeof(line), f) && count < max_out) {
         size_t ll = strlen(line);
-        while (ll > 0 && (line[ll - 1] == '\n' || line[ll - 1] == '\r')) {
+        while (ll > 0 && (line[ll - SKIP_ONE] == '\n' || line[ll - SKIP_ONE] == '\r')) {
             line[--ll] = '\0';
         }
 
-        char key[128];
-        char value[512];
+        char key[CBM_SZ_128];
+        char value[CBM_SZ_512];
         if (!scan_line(line, ft, key, sizeof(key), value, sizeof(value))) {
             continue;
         }
-        if (strncmp(value, "http://", 7) != 0 && strncmp(value, "https://", 8) != 0) {
+        if (strncmp(value, "http://", SLEN("http://")) != 0 &&
+            strncmp(value, "https://", SLEN("https://")) != 0) {
             continue;
         }
         if (cbm_is_secret_binding(key, value) || cbm_is_secret_value(value)) {
@@ -331,11 +349,11 @@ static int scan_env_file(const char *full_path, const char *rel, file_type_t ft,
         }
 
         strncpy(out[count].key, key, sizeof(out[count].key) - 1);
-        out[count].key[sizeof(out[count].key) - 1] = '\0';
+        out[count].key[sizeof(out[count].key) - SKIP_ONE] = '\0';
         strncpy(out[count].value, value, sizeof(out[count].value) - 1);
-        out[count].value[sizeof(out[count].value) - 1] = '\0';
+        out[count].value[sizeof(out[count].value) - SKIP_ONE] = '\0';
         strncpy(out[count].file_path, rel, sizeof(out[count].file_path) - 1);
-        out[count].file_path[sizeof(out[count].file_path) - 1] = '\0';
+        out[count].file_path[sizeof(out[count].file_path) - SKIP_ONE] = '\0';
         count++;
     }
     (void)fclose(f);
@@ -344,9 +362,9 @@ static int scan_env_file(const char *full_path, const char *rel, file_type_t ft,
 
 /* Process a single directory entry for env scanning. Returns bindings added. */
 static int process_env_entry(cbm_dirent_t *ent, const char *dir_path, const char *root_path,
-                             cbm_env_binding_t *out, int max_out, char path_stack[][512],
+                             cbm_env_binding_t *out, int max_out, char path_stack[][CBM_SZ_512],
                              int *stack_top) {
-    char full_path[512];
+    char full_path[CBM_SZ_512];
     snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->name);
 
     struct stat st;
@@ -354,9 +372,9 @@ static int process_env_entry(cbm_dirent_t *ent, const char *dir_path, const char
         return 0;
     }
     if (S_ISDIR(st.st_mode)) {
-        if (!is_ignored_dir(ent->name) && *stack_top < 256) {
+        if (!is_ignored_dir(ent->name) && *stack_top < CBM_SZ_256) {
             strncpy(path_stack[*stack_top], full_path, sizeof(path_stack[0]) - 1);
-            path_stack[*stack_top][sizeof(path_stack[0]) - 1] = '\0';
+            path_stack[*stack_top][sizeof(path_stack[0]) - SKIP_ONE] = '\0';
             (*stack_top)++;
         }
         return 0;
@@ -382,16 +400,16 @@ int cbm_scan_project_env_urls(const char *root_path, cbm_env_binding_t *out, int
     compile_patterns();
 
     int count = 0;
-    char path_stack[256][512];
-    int stack_top = 1;
+    char path_stack[CBM_SZ_256][CBM_SZ_512];
+    int stack_top = SKIP_ONE;
     strncpy(path_stack[0], root_path, sizeof(path_stack[0]) - 1);
-    path_stack[0][sizeof(path_stack[0]) - 1] = '\0';
+    path_stack[0][sizeof(path_stack[0]) - SKIP_ONE] = '\0';
 
     while (stack_top > 0 && count < max_out) {
         stack_top--;
-        char dir_path[512];
-        strncpy(dir_path, path_stack[stack_top], sizeof(dir_path) - 1);
-        dir_path[sizeof(dir_path) - 1] = '\0';
+        char dir_path[CBM_SZ_512];
+        strncpy(dir_path, path_stack[stack_top], sizeof(dir_path) - SKIP_ONE);
+        dir_path[sizeof(dir_path) - SKIP_ONE] = '\0';
 
         cbm_dir_t *d = cbm_opendir(dir_path);
         if (!d) {

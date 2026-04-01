@@ -334,6 +334,102 @@ jobs:
           name: binaries-windows-amd64
           path: "*.zip"
 
+  # ── Step 3b: Build portable Linux binaries (musl static) ────
+  build-linux-portable:
+    needs: [test-unix, test-windows]
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: alpine:3.21
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install musl build deps
+        run: apk add --no-cache build-base linux-headers zlib-dev zlib-static nodejs npm
+
+      - name: Build standard binary (static)
+        run: scripts/build.sh --version ${{ inputs.version }} CC=gcc CXX=g++ STATIC=1
+
+      - name: Verify static linking
+        run: |
+          file build/c/codebase-memory-mcp | grep -q "statically linked"
+          echo "=== Confirmed: fully static binary ==="
+
+      - name: Archive standard binary
+        run: |
+          cp LICENSE install.sh build/c/
+          tar -czf codebase-memory-mcp-linux-${{ matrix.arch }}-portable.tar.gz \
+            -C build/c codebase-memory-mcp LICENSE install.sh
+
+      - name: Build UI binary (static)
+        run: scripts/build.sh --with-ui --version ${{ inputs.version }} CC=gcc CXX=g++ STATIC=1
+
+      - name: Archive UI binary
+        run: |
+          cp LICENSE install.sh build/c/
+          tar -czf codebase-memory-mcp-ui-linux-${{ matrix.arch }}-portable.tar.gz \
+            -C build/c codebase-memory-mcp LICENSE install.sh
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: binaries-linux-${{ matrix.arch }}-portable
+          path: "*.tar.gz"
+
+  build-windows:
+    needs: [test-unix, test-windows]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-zlib
+            make
+            zip
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: "22"
+
+      - name: Build standard binary
+        shell: msys2 {0}
+        run: scripts/build.sh --version ${{ inputs.version }} CC=clang CXX=clang++
+
+      - name: Archive standard binary
+        shell: msys2 {0}
+        run: |
+          BIN=build/c/codebase-memory-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          cp "$BIN" codebase-memory-mcp.exe
+          zip codebase-memory-mcp-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1
+
+      - name: Build UI binary
+        shell: msys2 {0}
+        run: scripts/build.sh --with-ui --version ${{ inputs.version }} CC=clang CXX=clang++
+
+      - name: Archive UI binary
+        shell: msys2 {0}
+        run: |
+          BIN=build/c/codebase-memory-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          cp "$BIN" codebase-memory-mcp.exe
+          zip codebase-memory-mcp-ui-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: binaries-windows-amd64
+          path: "*.zip"
+
   # ── Step 4: Smoke test every binary ─────────────────────────
   smoke-unix:
     needs: [build-unix]

@@ -3,7 +3,23 @@
 #include "cbm.h"   // CBMExtractCtx, CBMLanguage, CBM_LANG_*, EFCEntry, EFC_SIZE
 #include "lang_specs.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
-#include <stdint.h>          // uint32_t
+#include "foundation/constants.h"
+
+enum {
+    MIN_ROUTE_LEN = 3,
+    MIN_SYS_PATH_LEN = 4,
+    MAX_ROUTE_SCAN = 20,
+    NOEXT_BUF = 256,
+    MIN_HEX_LEN = 3,
+    MAX_HEX_NAME_LEN = 64,
+    INIT_FILE_LEN = 8,  /* strlen("__init__") */
+    INDEX_FILE_LEN = 5, /* strlen("index") */
+    NOT_FOUND = -1,
+};
+
+/* Prefix length helper for strncmp with string literals. */
+#define SLEN(s) (sizeof(s) - SKIP_ONE)
+#include <stdint.h> // uint32_t
 #include <string.h>
 #include <ctype.h>
 #include <stdio.h>
@@ -171,7 +187,7 @@ static bool has_prefix(const char *str, const char *prefix) {
 // Extract basename from path
 static const char *path_basename(const char *path) {
     const char *last = strrchr(path, '/');
-    return last ? last + 1 : path;
+    return last ? last + SKIP_ONE : path;
 }
 
 // Strip extension from basename
@@ -180,7 +196,7 @@ static void strip_ext(const char *base, char *buf, size_t buflen) {
     if (dot && dot != base) {
         size_t len = (size_t)(dot - base);
         if (len >= buflen) {
-            len = buflen - 1;
+            len = buflen - SKIP_ONE;
         }
         memcpy(buf, base, len);
         buf[len] = '\0';
@@ -203,7 +219,7 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang) {
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX: {
-        char noext[256];
+        char noext[NOEXT_BUF];
         strip_ext(base, noext, sizeof(noext));
         return has_suffix(noext, ".test") || has_suffix(noext, ".spec") ||
                has_suffix(noext, "_test") || has_suffix(noext, "_spec") ||
@@ -280,18 +296,25 @@ bool cbm_has_ancestor_kind(TSNode node, const char *kind, int max_depth) {
 }
 
 // Recursive branching count
-static int count_branching_rec(TSNode node, const char **types) {
+#define BRANCHING_STACK_CAP 4096
+static int count_branching_iter(TSNode root, const char **types) {
+    TSNode stack[BRANCHING_STACK_CAP];
+    int top = 0;
     int count = 0;
-    const char *kind = ts_node_type(node);
-    for (const char **t = types; *t; t++) {
-        if (strcmp(kind, *t) == 0) {
-            count++;
-            break;
+    stack[top++] = root;
+    while (top > 0) {
+        TSNode node = stack[--top];
+        const char *kind = ts_node_type(node);
+        for (const char **t = types; *t; t++) {
+            if (strcmp(kind, *t) == 0) {
+                count++;
+                break;
+            }
         }
-    }
-    uint32_t n = ts_node_child_count(node);
-    for (uint32_t i = 0; i < n; i++) {
-        count += count_branching_rec(ts_node_child(node, i), types);
+        uint32_t n = ts_node_child_count(node);
+        for (int i = (int)n - SKIP_ONE; i >= 0 && top < BRANCHING_STACK_CAP; i--) {
+            stack[top++] = ts_node_child(node, (uint32_t)i);
+        }
     }
     return count;
 }
@@ -300,7 +323,7 @@ int cbm_count_branching(TSNode node, const char **branching_types) {
     if (!branching_types) {
         return 0;
     }
-    return count_branching_rec(node, branching_types);
+    return count_branching_iter(node, branching_types);
 }
 
 // --- Enclosing function detection ---
@@ -432,7 +455,7 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
         }
     }
 
-    TSNode name_node = ts_node_child_by_field_name(func_node, "name", 4);
+    TSNode name_node = ts_node_child_by_field_name(func_node, TS_FIELD("name"));
     if (!ts_node_is_null(name_node)) {
         return cbm_node_text(a, name_node, source);
     }
@@ -440,7 +463,7 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
     if (strcmp(ts_node_type(func_node), "arrow_function") == 0) {
         TSNode parent = ts_node_parent(func_node);
         if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "variable_declarator") == 0) {
-            TSNode vname = ts_node_child_by_field_name(parent, "name", 4);
+            TSNode vname = ts_node_child_by_field_name(parent, TS_FIELD("name"));
             if (!ts_node_is_null(vname)) {
                 return cbm_node_text(a, vname, source);
             }
@@ -467,7 +490,7 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
         TSNode cur = ts_node_parent(func_node);
         while (!ts_node_is_null(cur)) {
             if (cbm_kind_in_set(cur, spec->class_node_types)) {
-                TSNode class_name = ts_node_child_by_field_name(cur, "name", 4);
+                TSNode class_name = ts_node_child_by_field_name(cur, TS_FIELD("name"));
                 if (!ts_node_is_null(class_name)) {
                     char *cname = cbm_node_text(a, class_name, source);
                     if (cname && cname[0]) {
@@ -489,7 +512,7 @@ const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node) {
     uint32_t pos = ts_node_start_byte(node);
 
     // Check cache: find a function range that contains this position.
-    // Linear scan is fine for EFC_SIZE=64 (all entries fit in ~1 cache line).
+    // Linear scan is fine for EFC_SIZE=CBM_SZ_64 (all entries fit in ~1 cache line).
     for (int i = 0; i < ctx->ef_cache.count; i++) {
         EFCEntry *e = &ctx->ef_cache.entries[i];
         if (pos >= e->start_byte && pos < e->end_byte) {
@@ -676,10 +699,10 @@ bool cbm_is_module_level(TSNode node, CBMLanguage lang) {
 // Internal helper: find extension start in basename (returns length without ext)
 static size_t strip_ext_len(const char *s, size_t len) {
     for (size_t i = len; i > 0; i--) {
-        if (s[i - 1] == '.') {
-            return i - 1;
+        if (s[i - SKIP_ONE] == '.') {
+            return i - SKIP_ONE;
         }
-        if (s[i - 1] == '/') {
+        if (s[i - SKIP_ONE] == '/') {
             break;
         }
     }
@@ -691,10 +714,10 @@ static bool should_skip_fqn_part(const char *part, size_t part_len, bool is_last
     if (!is_last || !has_name) {
         return false;
     }
-    if (part_len == 8 && memcmp(part, "__init__", 8) == 0) {
+    if (part_len == INIT_FILE_LEN && memcmp(part, "__init__", INIT_FILE_LEN) == 0) {
         return true;
     }
-    if (part_len == 5 && memcmp(part, "index", 5) == 0) {
+    if (part_len == INDEX_FILE_LEN && memcmp(part, "index", INDEX_FILE_LEN) == 0) {
         return true;
     }
     return false;
@@ -717,7 +740,7 @@ static char *append_path_segments(char *out, const char *rel_path, size_t plen, 
                 out += part_len;
             }
         }
-        start = part_end + 1;
+        start = part_end + SKIP_ONE;
     }
     return out;
 }
@@ -727,7 +750,7 @@ char *cbm_fqn_compute(CBMArena *a, const char *project, const char *rel_path, co
     size_t path_len = strlen(rel_path);
     size_t name_len = name ? strlen(name) : 0;
 
-    size_t max_len = proj_len + 1 + path_len + 1 + name_len + 1;
+    size_t max_len = proj_len + SKIP_ONE + path_len + SKIP_ONE + name_len + SKIP_ONE;
     char *buf = (char *)cbm_arena_alloc(a, max_len);
     if (!buf) {
         return NULL;
@@ -757,7 +780,7 @@ char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir) {
     // project.dir1.dir2
     size_t proj_len = strlen(project);
     size_t dir_len = strlen(rel_dir);
-    size_t max_len = proj_len + 1 + dir_len + 1;
+    size_t max_len = proj_len + SKIP_ONE + dir_len + SKIP_ONE;
     char *buf = (char *)cbm_arena_alloc(a, max_len);
     if (!buf) {
         return NULL;
@@ -767,7 +790,7 @@ char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir) {
     memcpy(out, project, proj_len);
     out += proj_len;
 
-    if (dir_len > 0 && !(dir_len == 1 && rel_dir[0] == '.')) {
+    if (dir_len > 0 && !(dir_len == SKIP_ONE && rel_dir[0] == '.')) {
         const char *start = rel_dir;
         const char *end_ptr = rel_dir + dir_len;
         while (start < end_ptr) {
@@ -779,7 +802,7 @@ char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir) {
                 memcpy(out, start, part_len);
                 out += part_len;
             }
-            start = part_end + 1;
+            start = part_end + SKIP_ONE;
         }
     }
     *out = '\0';
@@ -790,14 +813,14 @@ char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir) {
 
 // Check if a slash-prefixed string looks like a filesystem path.
 static bool is_filesystem_path(const char *s, int len) {
-    if (len <= 4) {
+    if (len <= MIN_SYS_PATH_LEN) {
         return false;
     }
-    return strncmp(s, "/usr/", 5) == 0 || strncmp(s, "/bin/", 5) == 0 ||
-           strncmp(s, "/etc/", 5) == 0 || strncmp(s, "/var/", 5) == 0 ||
-           strncmp(s, "/tmp/", 5) == 0 || strncmp(s, "/opt/", 5) == 0 ||
-           strncmp(s, "/home/", 6) == 0 || strncmp(s, "/dev/", 5) == 0 ||
-           strncmp(s, "/sys/", 5) == 0 || strncmp(s, "/proc/", 6) == 0;
+    return strncmp(s, "/usr/", SLEN("/usr/")) == 0 || strncmp(s, "/bin/", SLEN("/bin/")) == 0 ||
+           strncmp(s, "/etc/", SLEN("/etc/")) == 0 || strncmp(s, "/var/", SLEN("/var/")) == 0 ||
+           strncmp(s, "/tmp/", SLEN("/tmp/")) == 0 || strncmp(s, "/opt/", SLEN("/opt/")) == 0 ||
+           strncmp(s, "/home/", SLEN("/home/")) == 0 || strncmp(s, "/dev/", SLEN("/dev/")) == 0 ||
+           strncmp(s, "/sys/", SLEN("/sys/")) == 0 || strncmp(s, "/proc/", SLEN("/proc/")) == 0;
 }
 
 // Check if a slash-prefixed string looks like a REST API path.
@@ -805,19 +828,19 @@ static bool is_rest_path(const char *s, int len) {
     if (is_filesystem_path(s, len)) {
         return false;
     }
-    if (len > 1 && s[len - 1] == '/') {
+    if (len > SKIP_ONE && s[len - SKIP_ONE] == '/') {
         return false; /* regex pattern */
     }
-    if (s[1] == '^') {
+    if (s[SKIP_ONE] == '^') {
         return false; /* regex */
     }
-    if (len == 1 || (len == 2 && s[1] == '/')) {
+    if (len == SKIP_ONE || (len == PAIR_LEN && s[SKIP_ONE] == '/')) {
         return false; /* bare / or // */
     }
-    if (s[1] == '.') {
+    if (s[SKIP_ONE] == '.') {
         return false; /* relative path */
     }
-    for (int i = 1; i < len && i < 20; i++) {
+    for (int i = SKIP_ONE; i < len && i < MAX_ROUTE_SCAN; i++) {
         char c = s[i];
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
             return true;
@@ -827,7 +850,7 @@ static bool is_rest_path(const char *s, int len) {
 }
 
 static bool is_url_like(const char *s, int len) {
-    if (len < 3) {
+    if (len < MIN_ROUTE_LEN) {
         return false;
     }
     if (strstr(s, "://")) {
@@ -852,7 +875,7 @@ static bool has_config_extension(const char *s, int len) {
 }
 
 static bool is_env_var_pattern(const char *s, int len) {
-    if (len < 3 || len > 64) {
+    if (len < MIN_ROUTE_LEN || len > MAX_HEX_NAME_LEN) {
         return false;
     }
     bool has_upper = false;
@@ -873,8 +896,8 @@ static bool is_env_var_pattern(const char *s, int len) {
 }
 
 int cbm_classify_string(const char *str, int len) {
-    if (!str || len < 2) {
-        return -1;
+    if (!str || len < PAIR_LEN) {
+        return NOT_FOUND;
     }
 
     if (is_url_like(str, len)) {
@@ -887,5 +910,5 @@ int cbm_classify_string(const char *str, int len) {
         return CBM_STRREF_CONFIG;
     }
 
-    return -1;
+    return NOT_FOUND;
 }

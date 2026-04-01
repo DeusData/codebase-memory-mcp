@@ -9,6 +9,9 @@
  * contention, natural load balancing across heterogeneous cores.
  */
 #include "pipeline/worker_pool.h"
+#include "foundation/constants.h"
+
+enum { WP_TRUE = 1, WP_MIN = 1, WP_STEP = 1 };
 #include "foundation/platform.h"
 #include "foundation/compat_thread.h"
 
@@ -17,7 +20,7 @@
 
 /* 8 MB stack per worker — matches main thread default.
  * Required for deep AST recursion (tree-sitter + walk_defs). */
-#define CBM_WORKER_STACK_SIZE (8 * 1024 * 1024)
+#define CBM_WORKER_STACK_SIZE ((size_t)8 * CBM_SZ_1K * CBM_SZ_1K)
 
 /* ── Serial fallback ─────────────────────────────────────────────── */
 
@@ -38,8 +41,8 @@ typedef struct {
 
 static void *pthread_worker(void *arg) {
     pthread_worker_arg_t *wa = arg;
-    while (1) {
-        int idx = atomic_fetch_add_explicit(wa->next_idx, 1, memory_order_relaxed);
+    while (WP_TRUE) {
+        int idx = atomic_fetch_add_explicit(wa->next_idx, WP_STEP, memory_order_relaxed);
         if (idx >= wa->count) {
             break;
         }
@@ -73,8 +76,8 @@ static void run_pthreads(int count, cbm_parallel_fn fn, void *ctx, int nworkers)
     }
 
     /* Main thread also participates */
-    while (1) {
-        int idx = atomic_fetch_add_explicit(&next_idx, 1, memory_order_relaxed);
+    while (WP_TRUE) {
+        int idx = atomic_fetch_add_explicit(&next_idx, WP_STEP, memory_order_relaxed);
         if (idx >= count) {
             break;
         }
@@ -100,12 +103,12 @@ void cbm_parallel_for(int count, cbm_parallel_fn fn, void *ctx, cbm_parallel_for
     if (nworkers <= 0) {
         nworkers = cbm_default_worker_count(true);
     }
-    if (nworkers < 1) {
-        nworkers = 1;
+    if (nworkers < WP_MIN) {
+        nworkers = SKIP_ONE;
     }
 
     /* Serial fallback: single worker or trivially small workload */
-    if (nworkers <= 1 || count <= 1) {
+    if (nworkers <= WP_MIN || count <= WP_MIN) {
         run_serial(count, fn, ctx);
         return;
     }

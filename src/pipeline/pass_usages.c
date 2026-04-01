@@ -11,6 +11,7 @@
  *
  * Depends on: pass_definitions having populated the registry and graph buffer
  */
+#include "foundation/constants.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
@@ -31,27 +32,31 @@ static char *read_file(const char *path, int *out_len) {
     (void)fseek(f, 0, SEEK_END);
     long size = ftell(f);
     (void)fseek(f, 0, SEEK_SET);
-    if (size <= 0 || size > (long)100 * 1024 * 1024) {
+    if (size <= 0 || size > (long)CBM_PERCENT * CBM_SZ_1K * CBM_SZ_1K) {
         (void)fclose(f);
         return NULL;
     }
-    char *buf = malloc(size + 1);
+    char *buf = malloc(size + SKIP_ONE);
     if (!buf) {
         (void)fclose(f);
         return NULL;
     }
-    size_t nread = fread(buf, 1, size, f);
+    size_t nread = fread(buf, SKIP_ONE, size, f);
     (void)fclose(f);
+    if (nread > (size_t)size) {
+        nread = (size_t)size;
+    }
     buf[nread] = '\0';
     *out_len = (int)nread;
     return buf;
 }
 
 static const char *itoa_log(int val) {
-    static CBM_TLS char bufs[4][32];
+    enum { RING_BUF_COUNT = 4, RING_BUF_MASK = 3 };
+    static CBM_TLS char bufs[RING_BUF_COUNT][CBM_SZ_32];
     static CBM_TLS int idx = 0;
     int i = idx;
-    idx = (idx + 1) & 3;
+    idx = (idx + SKIP_ONE) & RING_BUF_MASK;
     snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
     return bufs[i];
 }
@@ -216,7 +221,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             continue;
         }
 
-        char uprops[256];
+        char uprops[CBM_SZ_256];
         snprintf(uprops, sizeof(uprops), "{\"callee\":\"%s\"}", usage->ref_name);
         cbm_gbuf_insert_edge(ctx->gbuf, src->id, tgt->id, "USAGE", uprops);
         resolved++;
@@ -303,7 +308,7 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
-            return -1;
+            return CBM_NOT_FOUND;
         }
 
         const char *path = files[i].path;

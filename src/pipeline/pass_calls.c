@@ -9,6 +9,9 @@
  *
  * Depends on: pass_definitions having populated the registry and graph buffer
  */
+#include "foundation/constants.h"
+
+enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
@@ -35,20 +38,23 @@ static char *read_file(const char *path, int *out_len) {
     long size = ftell(f);
     (void)fseek(f, 0, SEEK_SET);
 
-    if (size <= 0 || size > (long)100 * 1024 * 1024) {
+    if (size <= 0 || size > (long)CBM_PERCENT * CBM_SZ_1K * CBM_SZ_1K) {
         (void)fclose(f);
         return NULL;
     }
 
-    char *buf = malloc(size + 1);
+    char *buf = malloc(size + SKIP_ONE);
     if (!buf) {
         (void)fclose(f);
         return NULL;
     }
 
-    size_t nread = fread(buf, 1, size, f);
+    size_t nread = fread(buf, SKIP_ONE, size, f);
     (void)fclose(f);
 
+    if (nread > (size_t)size) {
+        nread = (size_t)size;
+    }
     buf[nread] = '\0';
     *out_len = (int)nread;
     return buf;
@@ -56,10 +62,10 @@ static char *read_file(const char *path, int *out_len) {
 
 /* Format int for logging. Thread-safe via TLS. */
 static const char *itoa_log(int val) {
-    static CBM_TLS char bufs[4][32];
+    static CBM_TLS char bufs[PC_RING][CBM_SZ_32];
     static CBM_TLS int idx = 0;
     int i = idx;
-    idx = (idx + 1) & 3;
+    idx = (idx + SKIP_ONE) & PC_RING_MASK;
     snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
     return bufs[i];
 }
@@ -178,11 +184,11 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
     char route_qn[CBM_ROUTE_QN_SIZE];
     snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method ? method : "ANY",
              call->first_string_arg);
-    char route_props[256];
+    char route_props[CBM_SZ_256];
     snprintf(route_props, sizeof(route_props), "{\"method\":\"%s\"}", method ? method : "ANY");
     int64_t route_id = cbm_gbuf_upsert_node(ctx->gbuf, "Route", call->first_string_arg, route_qn,
                                             "", 0, 0, route_props);
-    char props[512];
+    char props[CBM_SZ_512];
     snprintf(props, sizeof(props),
              "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"route_registration\"}",
              call->callee_name, call->first_string_arg);
@@ -193,7 +199,7 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
         if (hres.qualified_name != NULL && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_qn(ctx->gbuf, hres.qualified_name);
             if (handler != NULL) {
-                char hprops[256];
+                char hprops[CBM_SZ_256];
                 snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}", hres.qualified_name);
                 cbm_gbuf_insert_edge(ctx->gbuf, handler->id, route_id, "HANDLES", hprops);
             }
@@ -206,10 +212,19 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
 static int64_t create_svc_route_node(cbm_pipeline_ctx_t *ctx, const char *url, cbm_svc_kind_t svc,
                                      const char *method, const char *broker) {
     char route_qn[CBM_ROUTE_QN_SIZE];
-    const char *prefix =
-        (svc == CBM_SVC_HTTP) ? (method ? method : "ANY") : (broker ? broker : "async");
+    const char *prefix;
+    if (svc == CBM_SVC_HTTP) {
+        prefix = method ? method : "ANY";
+    } else {
+        prefix = broker ? broker : "async";
+    }
     snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", prefix, url);
-    const char *rp = (svc == CBM_SVC_HTTP) ? (method ? method : "{}") : (broker ? broker : "{}");
+    const char *rp;
+    if (svc == CBM_SVC_HTTP) {
+        rp = method ? method : "{}";
+    } else {
+        rp = broker ? broker : "{}";
+    }
     return cbm_gbuf_upsert_node(ctx->gbuf, "Route", url, route_qn, "", 0, 0, rp);
 }
 
@@ -220,9 +235,9 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     bool is_url = (url_or_topic && url_or_topic[0] != '\0' &&
                    (url_or_topic[0] == '/' || strstr(url_or_topic, "://") != NULL));
     bool is_topic = (url_or_topic && url_or_topic[0] != '\0' && svc == CBM_SVC_ASYNC &&
-                     strlen(url_or_topic) > 2);
+                     strlen(url_or_topic) > PAIR_LEN);
     if (!is_url && !is_topic) {
-        char props[512];
+        char props[CBM_SZ_512];
         snprintf(props, sizeof(props),
                  "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
                  call->callee_name, res->confidence, res->strategy ? res->strategy : "unknown",
@@ -236,14 +251,14 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     const char *broker =
         (svc == CBM_SVC_ASYNC) ? cbm_service_pattern_broker(res->qualified_name) : NULL;
     int64_t route_id = create_svc_route_node(ctx, url_or_topic, svc, method, broker);
-    char props[512];
+    char props[CBM_SZ_512];
     snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"%s%s%s%s%s}",
              call->callee_name, url_or_topic, method ? ",\"method\":\"" : "", method ? method : "",
              method ? "\"" : "", broker ? ",\"broker\":\"" : "", broker ? broker : "");
     if (broker) {
         size_t plen = strlen(props);
-        if (plen > 0 && props[plen - 1] != '}') {
-            snprintf(props + plen - 1, sizeof(props) - plen + 1, "\"}");
+        if (plen > 0 && props[plen - SKIP_ONE] != '}') {
+            snprintf(props + plen - 1, sizeof(props) - plen + SKIP_ONE, "\"}");
         }
     }
     cbm_gbuf_insert_edge(ctx->gbuf, source->id, route_id, edge_type, props);
@@ -264,14 +279,14 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         return;
     }
     if (svc == CBM_SVC_CONFIG) {
-        char props[512];
+        char props[CBM_SZ_512];
         snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"key\":\"%s\",\"confidence\":%.2f}",
                  call->callee_name, call->first_string_arg ? call->first_string_arg : "",
                  res->confidence);
         cbm_gbuf_insert_edge(ctx->gbuf, source->id, target->id, "CONFIGURES", props);
         return;
     }
-    char props[512];
+    char props[CBM_SZ_512];
     snprintf(props, sizeof(props),
              "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
              call->callee_name, res->confidence, res->strategy ? res->strategy : "unknown",
@@ -313,7 +328,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const cha
     }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
                          imp_count);
-    return 1;
+    return SKIP_ONE;
 }
 
 static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
@@ -346,7 +361,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
-            return -1;
+            return CBM_NOT_FOUND;
         }
 
         const char *rel = files[i].rel_path;
@@ -411,12 +426,12 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
 /* Extract Python function signature text from source starting at given line. Caller frees. */
 static char *extract_py_signature(const char *source, int start_line, int end_line) {
-    int sig_end = start_line + 15;
+    int sig_end = start_line + PC_SIG_SCAN;
     if (end_line > 0 && sig_end > end_line) {
         sig_end = end_line;
     }
     const char *p = source;
-    int line = 1;
+    int line = SKIP_ONE;
     while (*p && line < start_line) {
         if (*p == '\n') {
             line++;
@@ -429,12 +444,12 @@ static char *extract_py_signature(const char *source, int start_line, int end_li
             line++;
         }
         p++;
-        if (p > sig_start + 1 && p[-1] == ':' && p[-2] == ')') {
+        if (p > sig_start + SKIP_ONE && p[-SKIP_ONE] == ':' && p[-PAIR_LEN] == ')') {
             break;
         }
     }
     size_t sig_len = (size_t)(p - sig_start);
-    char *sig = malloc(sig_len + 1);
+    char *sig = malloc(sig_len + SKIP_ONE);
     if (!sig) {
         return NULL;
     }
@@ -448,15 +463,15 @@ static int scan_depends_in_sig(cbm_pipeline_ctx_t *ctx, const cbm_regex_t *re, c
                                const CBMDefinition *def, const char *module_qn, const char **ik,
                                const char **iv, int ic) {
     int count = 0;
-    cbm_regmatch_t match[2];
+    cbm_regmatch_t match[PC_REGEX_GRP];
     const char *scan = sig;
-    while (cbm_regexec(re, scan, 2, match, 0) == 0) {
-        int ref_len = match[1].rm_eo - match[1].rm_so;
-        char func_ref[256];
+    while (cbm_regexec(re, scan, PC_REGEX_GRP, match, 0) == 0) {
+        int ref_len = match[SKIP_ONE].rm_eo - match[SKIP_ONE].rm_so;
+        char func_ref[CBM_SZ_256];
         if (ref_len >= (int)sizeof(func_ref)) {
-            ref_len = (int)sizeof(func_ref) - 1;
+            ref_len = (int)sizeof(func_ref) - SKIP_ONE;
         }
-        memcpy(func_ref, scan + match[1].rm_so, (size_t)ref_len);
+        memcpy(func_ref, scan + match[SKIP_ONE].rm_so, (size_t)ref_len);
         func_ref[ref_len] = '\0';
         cbm_resolution_t res = cbm_registry_resolve(ctx->registry, func_ref, module_qn, ik, iv, ic);
         if (res.qualified_name && res.qualified_name[0] != '\0') {

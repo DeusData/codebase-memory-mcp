@@ -12,6 +12,7 @@
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
@@ -75,14 +76,31 @@ static void delete_file_at(const char *rel_path) {
     unlink(path);
 }
 
-/* Run a reformatter on N files: appends "# reformatted" comment */
+/* Append "# reformatted" to up to max_files .py files in subdir (cross-platform). */
 static int reformat_files(const char *subdir, int max_files) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-             "find '%s/%s' -name '*.py' -type f 2>/dev/null | head -%d | "
-             "while read f; do echo '# reformatted' >> \"$f\"; done",
-             g_repodir, subdir, max_files);
-    return system(cmd);
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/%s", g_repodir, subdir);
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return -1;
+    }
+    cbm_dirent_t *entry;
+    int count = 0;
+    while ((entry = cbm_readdir(d)) != NULL && count < max_files) {
+        size_t nlen = strlen(entry->name);
+        if (nlen < 4 || strcmp(entry->name + nlen - 3, ".py") != 0) {
+            continue;
+        }
+        if (entry->is_dir) {
+            continue;
+        }
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", dir, entry->name);
+        th_append_file(path, "# reformatted\n");
+        count++;
+    }
+    cbm_closedir(d);
+    return 0;
 }
 
 static char *index_repo(void) {
@@ -235,9 +253,7 @@ static void incremental_teardown(void) {
     free(g_project);
     g_project = NULL;
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_tmpdir);
-    (void)system(cmd);
+    th_rmtree(g_tmpdir);
 }
 
 /* ══════════════════════════════════════════════════════════════════

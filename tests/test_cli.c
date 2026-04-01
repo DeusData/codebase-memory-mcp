@@ -11,6 +11,7 @@
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <cli/cli.h>
 #include <foundation/yaml.h>
 #include <string.h>
@@ -59,9 +60,7 @@ static int test_mkdirp(const char *path) {
 
 /* Helper: recursive remove */
 static void test_rmdir_r(const char *path) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
-    system(cmd);
+    th_rmtree(path);
 }
 
 /* Helper: create tar.gz with a single file */
@@ -321,9 +320,6 @@ TEST(cli_find_cli_not_found) {
 }
 
 TEST(cli_find_cli_on_path) {
-#ifdef _WIN32
-    SKIP("PATH search differs on Windows");
-#endif
     /* Port of TestFindCLI_FoundOnPATH */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-find-XXXXXX");
@@ -333,7 +329,7 @@ TEST(cli_find_cli_on_path) {
     char fakecli[512];
     snprintf(fakecli, sizeof(fakecli), "%s/fakecli", tmpdir);
     write_test_file(fakecli, "#!/bin/sh\n");
-    chmod(fakecli, 0500);
+    th_make_executable(fakecli);
 
     const char *raw = getenv("PATH");
     char *old_path = raw ? strdup(raw) : NULL;
@@ -353,9 +349,6 @@ TEST(cli_find_cli_on_path) {
 }
 
 TEST(cli_find_cli_fallback_paths) {
-#ifdef _WIN32
-    SKIP("shell scripts + chmod not available on Windows");
-#endif
     /* Port of TestFindCLI_FallbackPaths */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-find-XXXXXX");
@@ -369,7 +362,7 @@ TEST(cli_find_cli_fallback_paths) {
     char fakecli[512];
     snprintf(fakecli, sizeof(fakecli), "%s/testcli", localbin);
     write_test_file(fakecli, "#!/bin/sh\n");
-    chmod(fakecli, 0500);
+    th_make_executable(fakecli);
 
     const char *raw = getenv("PATH");
     char *old_path = raw ? strdup(raw) : NULL;
@@ -2278,7 +2271,7 @@ TEST(replace_binary_overwrites_readonly) {
     ASSERT_NOT_NULL(f);
     fputs("old-content", f);
     fclose(f);
-    chmod(path, 0500); /* r-x------ */
+    th_make_executable(path); /* r-x------ */
 
     /* Replace it with new content */
     const unsigned char new_data[] = "new-content-replaced";

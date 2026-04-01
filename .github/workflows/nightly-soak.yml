@@ -51,7 +51,7 @@ jobs:
           echo "Skipping ${{ matrix.goos }}-${{ matrix.goarch }} (filter: ${{ inputs.platforms }})"
           exit 0
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
 
       - name: Install deps (Linux)
         if: startsWith(matrix.os, 'ubuntu')
@@ -65,7 +65,7 @@ jobs:
 
       - name: Upload soak metrics
         if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nightly-soak-${{ matrix.goos }}-${{ matrix.goarch }}
           path: soak-results/
@@ -95,7 +95,7 @@ jobs:
         if: ${{ !contains(matrix.filter, inputs.platforms || 'all') }}
         run: exit 0
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
 
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 git
@@ -112,8 +112,91 @@ jobs:
 
       - name: Upload ASan soak metrics
         if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nightly-asan-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: soak-results/
+          retention-days: 30
+
+  # ── Nightly soak: portable Linux (musl static) ──────────────
+  soak-nightly-portable:
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: alpine:3.21
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+            filter: all linux-only
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            filter: all linux-only
+    steps:
+      - name: Check platform filter
+        if: ${{ !contains(matrix.filter, inputs.platforms || 'all') }}
+        run: exit 0
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install musl build deps
+        run: apk add --no-cache build-base linux-headers zlib-dev zlib-static python3 git nodejs npm
+
+      - name: Build (release mode, static)
+        run: scripts/build.sh CC=gcc CXX=g++ STATIC=1
+
+      - name: Nightly soak (${{ inputs.duration_minutes || 240 }} min, portable)
+        run: scripts/soak-test.sh build/c/codebase-memory-mcp ${{ inputs.duration_minutes || 240 }}
+
+      - name: Upload soak metrics
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: nightly-soak-linux-${{ matrix.arch }}-portable
+          path: soak-results/
+          retention-days: 30
+
+  soak-nightly-asan-portable:
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: alpine:3.21
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+            filter: all linux-only
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            filter: all linux-only
+    steps:
+      - name: Check platform filter
+        if: ${{ !contains(matrix.filter, inputs.platforms || 'all') }}
+        run: exit 0
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install musl build deps
+        run: apk add --no-cache build-base linux-headers zlib-dev zlib-static python3 git nodejs npm
+
+      - name: Build (ASan + LeakSanitizer, static)
+        run: |
+          SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          scripts/build.sh CC=gcc CXX=g++ STATIC=1 EXTRA_CFLAGS="$SANITIZE" EXTRA_LDFLAGS="$SANITIZE"
+
+      - name: ASan soak (60 min, portable)
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:halt_on_error=0:log_path=soak-results/asan"
+        run: scripts/soak-test.sh build/c/codebase-memory-mcp 60
+
+      - name: Upload ASan soak metrics
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: nightly-asan-linux-${{ matrix.arch }}-portable
           path: soak-results/
           retention-days: 30

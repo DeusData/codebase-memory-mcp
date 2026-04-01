@@ -50,3 +50,6 @@ graph-ui/dist/
 BENCHMARK_REPORT.md
 TEST_PLAN.md
 CHANGELOG.md
+
+# Soak test output
+soak-results/

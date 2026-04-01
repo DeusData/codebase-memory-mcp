@@ -20,7 +20,11 @@
 /* Safe realloc: frees old pointer on failure instead of leaking it.
  * Returns NULL on allocation failure (old memory is freed). */
 static inline void *safe_realloc(void *ptr, size_t size) {
-    void *tmp = realloc(ptr, size); // NOLINT(clang-analyzer-optin.portability.UnixAPI)
+    enum { SAFE_REALLOC_MIN = 1 };
+    if (size == 0) {
+        size = SAFE_REALLOC_MIN;
+    }
+    void *tmp = realloc(ptr, size);
     if (!tmp) {
         free(ptr);
     }
@@ -63,6 +67,13 @@ cbm_system_info_t cbm_system_info(void);
  * initial=true:  all cores (user is waiting for initial index)
  * initial=false: max(1, perf_cores-1) (leave headroom for user apps) */
 int cbm_default_worker_count(bool initial);
+
+/* ── Environment variables ──────────────────────────────────────── */
+
+/* Thread-safe getenv: copies the value into a caller-provided buffer.
+ * Returns buf on success, or fallback if the variable is unset.
+ * Returns NULL when the variable is unset and fallback is NULL. */
+const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback);
 
 /* ── Home directory ─────────────────────────────────────────────── */
 

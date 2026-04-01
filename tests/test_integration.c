@@ -9,6 +9,7 @@
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
@@ -150,9 +151,7 @@ static void integration_teardown(void) {
     g_project = NULL;
 
     /* Clean up temp project */
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_tmpdir);
-    system(cmd);
+    th_rmtree(g_tmpdir);
 
     /* Clean up cache db */
     unlink(g_dbpath);

@@ -10,6 +10,9 @@
  * skipped (fail-open). Missing files are silently ignored.
  */
 #include "discover/userconfig.h"
+#include "foundation/constants.h"
+
+enum { MAX_CONFIG_SIZE = 65536 };
 #include "foundation/log.h"
 
 #include <yyjson/yyjson.h>
@@ -130,9 +133,9 @@ static CBMLanguage lang_from_string(const char *s) {
     }
 
     /* Build a lowercase copy for comparison */
-    char lower[64];
+    char lower[CBM_SZ_64];
     size_t i;
-    for (i = 0; i < sizeof(lower) - 1 && s[i]; i++) {
+    for (i = 0; i < sizeof(lower) - SKIP_ONE && s[i]; i++) {
         lower[i] = (char)tolower((unsigned char)s[i]);
     }
     lower[i] = '\0';
@@ -153,14 +156,21 @@ static CBMLanguage lang_from_string(const char *s) {
  * Uses $XDG_CONFIG_HOME if set, else ~/.config.
  */
 static void cbm_app_config_dir(char *buf, size_t bufsz) {
-    // NOLINT(concurrency-mt-unsafe) — called before worker threads
-    const char *xdg = getenv("XDG_CONFIG_HOME");
-    if (xdg && xdg[0]) {
+    char xdg[CBM_SZ_512] = {0};
+    char home[CBM_SZ_512] = {0};
+    const char *env_val = getenv("XDG_CONFIG_HOME");
+    if (env_val && env_val[0]) {
+        snprintf(xdg, sizeof(xdg), "%s", env_val);
+    }
+    if (xdg[0]) {
         snprintf(buf, bufsz, "%s/codebase-memory-mcp", xdg);
     } else {
-        const char *home = getenv("HOME"); // NOLINT(concurrency-mt-unsafe)
-        if (!home || !home[0]) {
-            home = "/tmp";
+        env_val = getenv("HOME");
+        if (env_val && env_val[0]) {
+            snprintf(home, sizeof(home), "%s", env_val);
+        }
+        if (!home[0]) {
+            snprintf(home, sizeof(home), "/tmp");
         }
         snprintf(buf, bufsz, "%s/.config/codebase-memory-mcp", home);
     }
@@ -219,15 +229,15 @@ static int parse_extra_extensions(yyjson_val *root, cbm_userext_t **entries, int
         }
 
         /* Grow the array */
-        cbm_userext_t *tmp = realloc(*entries, (size_t)(*count + 1) * sizeof(cbm_userext_t));
+        cbm_userext_t *tmp = realloc(*entries, (size_t)(*count + SKIP_ONE) * sizeof(cbm_userext_t));
         if (!tmp) {
-            return -1;
+            return CBM_NOT_FOUND;
         }
         *entries = tmp;
 
         char *ext_copy = strdup(ext_str);
         if (!ext_copy) {
-            return -1;
+            return CBM_NOT_FOUND;
         }
 
         (*entries)[*count].ext = ext_copy;
@@ -248,26 +258,35 @@ static int load_config_file(const char *path, cbm_userext_t **entries, int *coun
         return 0; /* file absent — silently ignore */
     }
 
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) {
+        (void)fclose(f);
+        return 0;
+    }
     long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        (void)fclose(f);
+        return 0;
+    }
 
-    if (len <= 0 || len > 65536) {
-        fclose(f);
-        if (len > 65536) {
+    if (len <= 0 || len > MAX_CONFIG_SIZE) {
+        (void)fclose(f);
+        if (len > MAX_CONFIG_SIZE) {
             cbm_log_warn("userconfig.file_too_large", "path", path);
         }
         return 0;
     }
 
-    char *buf = malloc((size_t)len + 1);
+    char *buf = malloc((size_t)len + SKIP_ONE);
     if (!buf) {
-        fclose(f);
-        return -1;
+        (void)fclose(f);
+        return CBM_NOT_FOUND;
     }
 
-    size_t nread = fread(buf, 1, (size_t)len, f);
-    fclose(f);
+    size_t nread = fread(buf, SKIP_ONE, (size_t)len, f);
+    (void)fclose(f);
+    if (nread > (size_t)len) {
+        nread = (size_t)len;
+    }
     buf[nread] = '\0';
 
     yyjson_doc *doc = yyjson_read(buf, nread, 0);
@@ -287,7 +306,7 @@ static int load_config_file(const char *path, cbm_userext_t **entries, int *coun
 /* ── Public API ──────────────────────────────────────────────────── */
 
 cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
-    cbm_userconfig_t *cfg = calloc(1, sizeof(cbm_userconfig_t));
+    cbm_userconfig_t *cfg = calloc(CBM_ALLOC_ONE, sizeof(cbm_userconfig_t));
     if (!cfg) {
         return NULL;
     }
@@ -297,7 +316,7 @@ cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
 
     /* ── Step 1: Load global config ── */
     enum { PATH_BUF_SZ = 1280 };
-    char global_dir[1024];
+    char global_dir[CBM_SZ_1K];
     cbm_app_config_dir(global_dir, sizeof(global_dir));
 
     char global_path[PATH_BUF_SZ];
@@ -342,8 +361,8 @@ cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
             if (entries[g].ext && strcmp(entries[g].ext, entries[p].ext) == 0) {
                 /* Remove global entry: overwrite with last global entry */
                 free(entries[g].ext);
-                entries[g] = entries[global_count - 1];
-                entries[global_count - 1].ext = NULL; /* mark as consumed */
+                entries[g] = entries[global_count - SKIP_ONE];
+                entries[global_count - SKIP_ONE].ext = NULL; /* mark as consumed */
                 global_count--;
                 break;
             }

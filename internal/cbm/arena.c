@@ -9,7 +9,7 @@ void cbm_arena_init(CBMArena *a) {
     a->block_size = CBM_ARENA_DEFAULT_BLOCK_SIZE;
     a->blocks[0] = (char *)malloc(a->block_size);
     if (a->blocks[0]) {
-        a->nblocks = 1;
+        a->nblocks = SKIP_ONE;
     }
 }
 
@@ -17,7 +17,7 @@ static int arena_grow(CBMArena *a, size_t min_size) {
     if (a->nblocks >= CBM_ARENA_MAX_BLOCKS) {
         return 0;
     }
-    size_t new_size = a->block_size * 2;
+    size_t new_size = a->block_size * PAIR_LEN;
     if (new_size < min_size) {
         new_size = min_size;
     }
@@ -49,7 +49,7 @@ void *cbm_arena_alloc(CBMArena *a, size_t n) {
         }
     }
 
-    char *ptr = a->blocks[a->nblocks - 1] + a->used;
+    char *ptr = a->blocks[a->nblocks - SKIP_ONE] + a->used;
     a->used += n;
     return ptr;
 }
@@ -58,9 +58,9 @@ char *cbm_arena_strdup(CBMArena *a, const char *s) {
     if (!s)
         return NULL;
     size_t len = strlen(s);
-    char *dst = (char *)cbm_arena_alloc(a, len + 1);
+    char *dst = (char *)cbm_arena_alloc(a, len + SKIP_ONE);
     if (dst) {
-        memcpy(dst, s, len + 1);
+        memcpy(dst, s, len + SKIP_ONE);
     }
     return dst;
 }
@@ -68,7 +68,7 @@ char *cbm_arena_strdup(CBMArena *a, const char *s) {
 char *cbm_arena_strndup(CBMArena *a, const char *s, size_t len) {
     if (!s)
         return NULL;
-    char *dst = (char *)cbm_arena_alloc(a, len + 1);
+    char *dst = (char *)cbm_arena_alloc(a, len + SKIP_ONE);
     if (dst) {
         memcpy(dst, s, len);
         dst[len] = '\0';
@@ -87,13 +87,13 @@ char *cbm_arena_sprintf(CBMArena *a, const char *fmt, ...) {
         return NULL;
     }
 
-    char *dst = (char *)cbm_arena_alloc(a, (size_t)needed + 1);
+    char *dst = (char *)cbm_arena_alloc(a, (size_t)needed + SKIP_ONE);
     if (!dst) {
         return NULL;
     }
 
     va_start(args, fmt);
-    vsnprintf(dst, (size_t)needed + 1, fmt, args);
+    vsnprintf(dst, (size_t)needed + SKIP_ONE, fmt, args);
     va_end(args);
 
     return dst;

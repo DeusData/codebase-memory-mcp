@@ -3,10 +3,24 @@
 #include "helpers.h"
 #include "lang_specs.h"
 #include "extract_unified.h"
+#include "foundation/constants.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include <stdint.h>          // uint32_t
 #include <string.h>
 #include <ctype.h>
+
+/* Max ancestor depth for Lean type-position check. */
+enum { LEAN_MAX_PARENT_DEPTH = 20 };
+/* Max positional args to scan for URL/string. */
+enum { MAX_POSITIONAL_SCAN = 3 };
+/* Max positional args to scan for handler ref. */
+enum { MAX_HANDLER_SCAN = 4 };
+/* Max string arg length before rejection. */
+enum { MAX_STRING_ARG_LEN = CBM_SZ_512 };
+/* Min printable ASCII (space). */
+enum { MIN_PRINTABLE = 0x20 };
+/* Handler arg scan start index (skip first positional). */
+enum { HANDLER_START_IDX = 1 };
 
 /* Look up a module-level string constant by name. */
 static const char *lookup_string_constant(const CBMExtractCtx *ctx, const char *name) {
@@ -35,8 +49,8 @@ static const char *strip_quotes(CBMArena *a, const char *text) {
         return NULL;
     }
     int len = (int)strlen(text);
-    if (len >= 2 && (text[0] == '"' || text[0] == '\'')) {
-        return cbm_arena_strndup(a, text + 1, (size_t)(len - 2));
+    if (len >= CBM_QUOTE_PAIR && (text[0] == '"' || text[0] == '\'')) {
+        return cbm_arena_strndup(a, text + CBM_QUOTE_OFFSET, (size_t)(len - CBM_QUOTE_PAIR));
     }
     return text;
 }
@@ -53,7 +67,7 @@ static void extract_jsx_refs(CBMExtractCtx *ctx, TSNode node);
 // only if it overlaps the body range of the enclosing declaration.
 static bool lean_is_in_type_position(TSNode node) {
     TSNode cur = ts_node_parent(node);
-    for (int depth = 0; depth < 20; depth++) {
+    for (int depth = 0; depth < LEAN_MAX_PARENT_DEPTH; depth++) {
         if (ts_node_is_null(cur)) {
             return false;
         }
@@ -70,7 +84,7 @@ static bool lean_is_in_type_position(TSNode node) {
             // Check if apply comes after the type annotation.
             // Strategy: if the node starts after the end of the "type" field, it's in value
             // position. If there's no "type" field, allow the call (no annotation to filter).
-            TSNode type_field = ts_node_child_by_field_name(cur, "type", 4);
+            TSNode type_field = ts_node_child_by_field_name(cur, TS_FIELD("type"));
             if (ts_node_is_null(type_field)) {
                 return false; // no type annotation → allow call
             }
@@ -90,7 +104,7 @@ static bool lean_is_in_type_position(TSNode node) {
 // Try common field-based callee resolution (function, name, method fields).
 static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *source) {
     // Try "function" field
-    TSNode func_node = ts_node_child_by_field_name(node, "function", 8);
+    TSNode func_node = ts_node_child_by_field_name(node, TS_FIELD("function"));
     if (!ts_node_is_null(func_node)) {
         const char *fk = ts_node_type(func_node);
         if (strcmp(fk, "identifier") == 0 || strcmp(fk, "simple_identifier") == 0 ||
@@ -104,10 +118,10 @@ static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *so
     }
 
     // Try "name" field (Java method_invocation)
-    TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+    TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
     if (!ts_node_is_null(name_node)) {
         char *name = cbm_node_text(a, name_node, source);
-        TSNode obj = ts_node_child_by_field_name(node, "object", 6);
+        TSNode obj = ts_node_child_by_field_name(node, TS_FIELD("object"));
         if (!ts_node_is_null(obj) && name) {
             char *obj_text = cbm_node_text(a, obj, source);
             if (obj_text && obj_text[0]) {
@@ -118,10 +132,10 @@ static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *so
     }
 
     // Ruby: "method" + "receiver" fields
-    TSNode method_node = ts_node_child_by_field_name(node, "method", 6);
+    TSNode method_node = ts_node_child_by_field_name(node, TS_FIELD("method"));
     if (!ts_node_is_null(method_node)) {
         char *method = cbm_node_text(a, method_node, source);
-        TSNode recv = ts_node_child_by_field_name(node, "receiver", 8);
+        TSNode recv = ts_node_child_by_field_name(node, TS_FIELD("receiver"));
         if (!ts_node_is_null(recv) && method) {
             char *recv_text = cbm_node_text(a, recv, source);
             if (recv_text && recv_text[0]) {
@@ -147,12 +161,13 @@ static char *extract_fp_callee(CBMArena *a, TSNode node, const char *source, con
         }
     }
     if (strcmp(nk, "infix") == 0 || strcmp(nk, "infix_expression") == 0) {
-        TSNode op = ts_node_child_by_field_name(node, "operator", 8);
+        TSNode op = ts_node_child_by_field_name(node, TS_FIELD("operator"));
         if (!ts_node_is_null(op)) {
             return cbm_node_text(a, op, source);
         }
-        if (ts_node_child_count(node) >= 3) {
-            return cbm_node_text(a, ts_node_child(node, 1), source);
+        enum { INFIX_MIN_CHILDREN = 3, INFIX_OP_IDX = 1 };
+        if (ts_node_child_count(node) >= INFIX_MIN_CHILDREN) {
+            return cbm_node_text(a, ts_node_child(node, INFIX_OP_IDX), source);
         }
     }
     return NULL;
@@ -211,9 +226,9 @@ static char *extract_scripting_callee(CBMArena *a, TSNode node, const char *sour
         return cbm_node_text(a, ts_node_child(node, 0), source);
     }
     if (lang == CBM_LANG_PHP) {
-        TSNode func_node = ts_node_child_by_field_name(node, "function", 8);
+        TSNode func_node = ts_node_child_by_field_name(node, TS_FIELD("function"));
         if (ts_node_is_null(func_node)) {
-            func_node = ts_node_child_by_field_name(node, "name", 4);
+            func_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
         }
         return ts_node_is_null(func_node) ? NULL : cbm_node_text(a, func_node, source);
     }
@@ -231,7 +246,7 @@ static char *extract_objc_callee(CBMArena *a, TSNode node, const char *source, c
     if (strcmp(nk, "message_expression") != 0) {
         return NULL;
     }
-    TSNode selector = ts_node_child_by_field_name(node, "selector", 8);
+    TSNode selector = ts_node_child_by_field_name(node, TS_FIELD("selector"));
     return ts_node_is_null(selector) ? NULL : cbm_node_text(a, selector, source);
 }
 
@@ -304,15 +319,15 @@ static const char *strip_and_validate_string_arg(CBMArena *a, char *text) {
         return NULL;
     }
     int len = (int)strlen(text);
-    if (len >= 2 && (text[0] == '"' || text[0] == '\'')) {
-        text = cbm_arena_strndup(a, text + 1, (size_t)(len - 2));
-        len -= 2;
+    if (len >= CBM_QUOTE_PAIR && (text[0] == '"' || text[0] == '\'')) {
+        text = cbm_arena_strndup(a, text + CBM_QUOTE_OFFSET, (size_t)(len - CBM_QUOTE_PAIR));
+        len -= CBM_QUOTE_PAIR;
     }
-    if (!text || len <= 0 || len >= 512) {
+    if (!text || len <= 0 || len >= MAX_STRING_ARG_LEN) {
         return NULL;
     }
     for (int vi = 0; vi < len; vi++) {
-        if ((unsigned char)text[vi] < 0x20 && text[vi] != '\t') {
+        if ((unsigned char)text[vi] < MIN_PRINTABLE && text[vi] != '\t') {
             return NULL;
         }
     }
@@ -322,7 +337,7 @@ static const char *strip_and_validate_string_arg(CBMArena *a, char *text) {
 // Extract first string argument from a call's arguments node.
 static const char *extract_first_string_arg(CBMExtractCtx *ctx, TSNode args) {
     uint32_t nc = ts_node_named_child_count(args);
-    for (uint32_t ai = 0; ai < nc && ai < 3; ai++) {
+    for (uint32_t ai = 0; ai < nc && ai < MAX_POSITIONAL_SCAN; ai++) {
         TSNode arg = ts_node_named_child(args, ai);
         const char *ak = ts_node_type(arg);
         if (is_string_like(ak)) {
@@ -334,7 +349,7 @@ static const char *extract_first_string_arg(CBMExtractCtx *ctx, TSNode args) {
 }
 
 // Walk AST for call nodes (iterative)
-#define CALLS_STACK_CAP 512
+#define CALLS_STACK_CAP CBM_SZ_512
 static void walk_calls(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
     TSNode stack[CALLS_STACK_CAP];
     int top = 0;
@@ -351,7 +366,7 @@ static void walk_calls(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec)
                 call.callee_name = callee;
                 call.enclosing_func_qn = cbm_enclosing_func_qn_cached(ctx, node);
 
-                TSNode args = ts_node_child_by_field_name(node, "arguments", 9);
+                TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
                 if (!ts_node_is_null(args)) {
                     call.first_string_arg = extract_first_string_arg(ctx, args);
                 }
@@ -367,7 +382,8 @@ static void walk_calls(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec)
         }
 
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - 1; i >= 0 && top < CALLS_STACK_CAP; i--) {
+        enum { LAST_IDX_OFFSET = 1 };
+        for (int i = (int)(count - LAST_IDX_OFFSET); i >= 0 && top < CALLS_STACK_CAP; i--) {
             stack[top++] = ts_node_child(node, (uint32_t)i);
         }
     }
@@ -375,7 +391,7 @@ static void walk_calls(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec)
 
 // Extract JSX component references (uppercase = component, lowercase = HTML)
 static void extract_jsx_refs(CBMExtractCtx *ctx, TSNode node) {
-    TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+    TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
     if (ts_node_is_null(name_node)) {
         return;
     }
@@ -409,10 +425,10 @@ void cbm_extract_calls(CBMExtractCtx *ctx) {
 
 // Process a keyword argument (keyword_argument or pair node).
 static void process_keyword_arg(CBMExtractCtx *ctx, TSNode arg_node, CBMCallArg *ca) {
-    TSNode key_n = ts_node_child_by_field_name(arg_node, "name", 4);
-    TSNode val_n = ts_node_child_by_field_name(arg_node, "value", 5);
+    TSNode key_n = ts_node_child_by_field_name(arg_node, TS_FIELD("name"));
+    TSNode val_n = ts_node_child_by_field_name(arg_node, TS_FIELD("value"));
     if (ts_node_is_null(key_n)) {
-        key_n = ts_node_child_by_field_name(arg_node, "key", 3);
+        key_n = ts_node_child_by_field_name(arg_node, TS_FIELD("key"));
     }
     if (!ts_node_is_null(key_n)) {
         ca->keyword = cbm_node_text(ctx->arena, key_n, ctx->source);
@@ -496,10 +512,10 @@ static const char *extract_string_value(CBMExtractCtx *ctx, TSNode val_node) {
 
 // Try to extract URL/topic from a keyword_argument or pair node.
 static const char *extract_keyword_url(CBMExtractCtx *ctx, TSNode arg) {
-    TSNode key_node = ts_node_child_by_field_name(arg, "name", 4);
-    TSNode val_node = ts_node_child_by_field_name(arg, "value", 5);
+    TSNode key_node = ts_node_child_by_field_name(arg, TS_FIELD("name"));
+    TSNode val_node = ts_node_child_by_field_name(arg, TS_FIELD("value"));
     if (ts_node_is_null(key_node)) {
-        key_node = ts_node_child_by_field_name(arg, "key", 3);
+        key_node = ts_node_child_by_field_name(arg, TS_FIELD("key"));
     }
     if (ts_node_is_null(key_node) || ts_node_is_null(val_node)) {
         return NULL;
@@ -544,7 +560,7 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
             continue;
         }
 
-        if (ai < 3) {
+        if (ai < MAX_POSITIONAL_SCAN) {
             const char *val = extract_positional_url(ctx, arg, ak);
             if (val) {
                 return val;
@@ -557,7 +573,7 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
 // Extract second argument name (handler ref for route registrations).
 static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
     uint32_t nc = ts_node_named_child_count(args);
-    for (uint32_t ai = 1; ai < nc && ai < 4; ai++) {
+    for (uint32_t ai = HANDLER_START_IDX; ai < nc && ai < MAX_HANDLER_SCAN; ai++) {
         TSNode arg2 = ts_node_named_child(args, ai);
         const char *ak2 = ts_node_type(arg2);
         if (strcmp(ak2, "identifier") == 0 || strcmp(ak2, "member_expression") == 0 ||
@@ -575,7 +591,7 @@ static void extract_jsx_component_ref(CBMExtractCtx *ctx, TSNode node, const cha
     if (strcmp(kind, "jsx_self_closing_element") != 0 && strcmp(kind, "jsx_opening_element") != 0) {
         return;
     }
-    TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+    TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
     if (ts_node_is_null(name_node)) {
         return;
     }
@@ -600,7 +616,7 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
             call.callee_name = callee;
             call.enclosing_func_qn = state->enclosing_func_qn;
 
-            TSNode args = ts_node_child_by_field_name(node, "arguments", 9);
+            TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
             if (!ts_node_is_null(args)) {
                 call.first_string_arg = extract_url_or_topic_arg(ctx, args);
                 if (call.first_string_arg && call.first_string_arg[0] == '/') {

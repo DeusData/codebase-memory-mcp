@@ -15,6 +15,7 @@
 //   - Varints: 1-9 bytes, big-endian, MSB continuation
 
 #include "sqlite_writer.h"
+#include "foundation/constants.h"
 #include "foundation/compat_thread.h"
 
 #include <stddef.h> // NULL
@@ -33,6 +34,75 @@
 #define VARINT_MASK 0x7f
 #define VARINT_CONTINUE 0x80
 #define BYTE_MASK 0xff
+
+enum {
+    VARINT_SHIFT = 7,
+    VARINT_BUF_SIZE = 10,
+    VARINT_MIN_LEN = 1,
+    SERIAL_INT8 = 1,
+    SERIAL_INT16 = 2,
+    SERIAL_INT24 = 3,
+    SERIAL_INT32 = 4,
+    SERIAL_INT48 = 5,
+    SERIAL_INT64 = 6,
+    SERIAL_FLOAT64 = 7,
+    SERIAL_CONST_ZERO = 8,
+    SERIAL_CONST_ONE = 9,
+    SERIAL_SIZE_INT8 = 1,
+    SERIAL_SIZE_INT16 = 2,
+    SERIAL_SIZE_INT24 = 3,
+    SERIAL_SIZE_INT32 = 4,
+    SERIAL_SIZE_INT48 = 6,
+    SERIAL_SIZE_INT64 = 8,
+    BTREE_HEADER_SIZE = 8,
+    BTREE_INTERIOR_HDR = 12,
+    BTREE_PTR_SIZE = 4,
+    CELL_PTR_SIZE = 2,
+    INITIAL_PAGE_CAP = 4096,
+    INITIAL_LEAF_CAP = 256,
+    INITIAL_PARENT_CAP = 64,
+    GROWTH_FACTOR = 2,
+    VARINT_MAX_BYTES = 9,
+    INT64_BYTES = 8,
+    SORT_THRESHOLD = 20,
+    MAX_NAME_LEN = 64,
+    HASH_INIT = 5381,
+    HASH_MULT = 33,
+    HDR_FREEBLOCK_OFF = 1,
+    HDR_CELLCOUNT_OFF = 3,
+    HDR_CONTENT_OFF = 5,
+    HDR_FRAGBYTES_OFF = 7,
+    HDR_RIGHTCHILD_OFF = 8,
+    INTERIOR_TABLE_FLAG = 0x05,
+    INTERIOR_INDEX_FLAG = 0x02,
+    NEWLINE_BYTE = 0x0A,
+    NODE_SORT_THREADS = 4,
+    EDGE_SORT_THREADS = 7,
+    TOTAL_SORT_THREADS = 11,
+    ERR_SORT_FAILED = -4,
+    ERR_WRITE_FAILED = -3,
+    ERR_MASTER_OVERFLOW = -2,
+    MAX_EMBED_FRACTION = 64,
+    MIN_EMBED_FRACTION = 32,
+    LEAF_PAYLOAD_FRACTION = 32,
+    INTERIOR_CELL_BUF = 20,
+    FIRST_ROWID = 1,
+    FIRST_DATA_PAGE = 2,
+    NSORT_NAME = 1,
+    NSORT_FILE = 2,
+    NSORT_QN = 3,
+    ESORT_TARGET = 1,
+    ESORT_TYPE = 2,
+    ESORT_PROJ_TGT_TYPE = 3,
+    ESORT_PROJ_SRC_TYPE = 4,
+    ESORT_URL_PATH = 5,
+    ESORT_SRC_TGT_TYPE = 6,
+    SQLITE_HEADER_SIZE = 100,
+    SHIFT_8 = 8,
+    SHIFT_16 = 16,
+    SHIFT_24 = 24,
+};
+#define TEXT_SERIAL_BASE 13
 
 // SQLite text serial type offset: serial_type = len*2 + TEXT_SERIAL_BASE.
 #define TEXT_SERIAL_BASE 13
@@ -82,10 +152,10 @@ static int put_varint(uint8_t *buf, int64_t value) {
     uint64_t v = (uint64_t)value;
     if (v <= VARINT_MASK) {
         buf[0] = (uint8_t)v;
-        return 1;
+        return SERIAL_SIZE_INT8;
     }
     // Encode in big-endian with MSB continuation bits
-    uint8_t tmp[10];
+    uint8_t tmp[VARINT_BUF_SIZE];
     int n = 0;
     while (v > VARINT_MASK) {
         tmp[n++] = (uint8_t)(v & VARINT_MASK);
@@ -104,7 +174,7 @@ static int put_varint(uint8_t *buf, int64_t value) {
 
 static int varint_len(int64_t value) {
     uint64_t v = (uint64_t)value;
-    int n = 1;
+    int n = VARINT_MIN_LEN;
     while (v > VARINT_MASK) {
         v >>= 7;
         n++;
@@ -114,33 +184,33 @@ static int varint_len(int64_t value) {
 
 // SQLite serial type for a TEXT value
 static int64_t text_serial_type(int len) {
-    return (len * 2) + TEXT_SERIAL_BASE;
+    return (len * PAIR_LEN) + TEXT_SERIAL_BASE;
 }
 
 // SQLite serial type for an integer value
 static int64_t int_serial_type(int64_t val) {
     if (val == 0) {
-        return 8; // integer value 0
+        return SERIAL_CONST_ZERO;
     }
-    if (val == 1) {
-        return 9; // integer value 1
+    if (val == SERIAL_INT8) {
+        return SERIAL_CONST_ONE;
     }
     if (val >= -INT8_MAX_VAL - 1 && val <= INT8_MAX_VAL) {
-        return 1; // 1 byte
+        return SERIAL_SIZE_INT8;
     }
     if (val >= -INT16_MAX_VAL - 1 && val <= INT16_MAX_VAL) {
-        return 2; // 2 bytes
+        return SERIAL_SIZE_INT16;
     }
     if (val >= INT24_MIN_VAL && val <= INT24_MAX_VAL) {
-        return 3; // 3 bytes
+        return SERIAL_SIZE_INT24;
     }
     if (val >= INT32_MIN_VAL && val <= INT32_MAX_VAL) {
-        return 4; // 4 bytes
+        return SERIAL_SIZE_INT32;
     }
     if (val >= INT48_MIN_VAL && val <= INT48_MAX_VAL) {
-        return 5; // 6 bytes
+        return SERIAL_SIZE_INT48;
     }
-    return 6; // 8 bytes
+    return SERIAL_SIZE_INT64;
 }
 
 // Bytes needed to store an integer of given serial type
@@ -148,20 +218,20 @@ static int int_storage_bytes(int serial_type) {
     switch (serial_type) {
     case 0:
         return 0; // NULL
-    case 1:
-        return 1;
-    case 2:
-        return 2;
-    case 3:
-        return 3;
-    case 4:
-        return 4;
-    case 5:
-        return 6;
-    case 6:
-        return 8;
-    case 8: // integer 0
-    case 9: // integer 1
+    case SERIAL_INT8:
+        return SERIAL_SIZE_INT8;
+    case SERIAL_INT16:
+        return SERIAL_SIZE_INT16;
+    case SERIAL_INT24:
+        return SERIAL_SIZE_INT24;
+    case SERIAL_INT32:
+        return SERIAL_SIZE_INT32;
+    case SERIAL_INT48:
+        return SERIAL_SIZE_INT48;
+    case SERIAL_INT64:
+        return SERIAL_SIZE_INT64;
+    case SERIAL_CONST_ZERO: // integer 0
+    case SERIAL_CONST_ONE:  // integer 1
     default:
         return 0;
     }
@@ -171,21 +241,21 @@ static int int_storage_bytes(int serial_type) {
 static void put_int_be(uint8_t *buf, int64_t val, int nbytes) {
     for (int i = nbytes - 1; i >= 0; i--) {
         buf[i] = (uint8_t)(val & BYTE_MASK);
-        val >>= 8; // NOLINT(readability-magic-numbers) — standard byte shift
+        val >>= SHIFT_8;
     }
 }
 
 // Write a 2-byte big-endian value
 static void put_u16(uint8_t *buf, uint16_t val) {
-    buf[0] = (uint8_t)(val >> 8);
+    buf[0] = (uint8_t)(val >> SHIFT_8);
     buf[1] = (uint8_t)(val & BYTE_MASK);
 }
 
 // Write a 4-byte big-endian value
 static void put_u32(uint8_t *buf, uint32_t val) {
-    buf[0] = (uint8_t)(val >> 24); // NOLINT(readability-magic-numbers) — standard byte shift
-    buf[1] = (uint8_t)(val >> 16); // NOLINT(readability-magic-numbers) — standard byte shift
-    buf[2] = (uint8_t)(val >> 8);  // NOLINT(readability-magic-numbers) — standard byte shift
+    buf[0] = (uint8_t)(val >> SHIFT_24);
+    buf[SKIP_ONE] = (uint8_t)(val >> SHIFT_16);
+    buf[2] = (uint8_t)(val >> SHIFT_8);
     buf[3] = (uint8_t)(val & BYTE_MASK);
 }
 
@@ -207,13 +277,13 @@ static bool dynbuf_ensure(DynBuf *b, int needed) {
     if (b->len + needed <= b->cap) {
         return true;
     }
-    int newcap = b->cap == 0 ? 4096 : b->cap;
+    int newcap = b->cap == 0 ? INITIAL_PAGE_CAP : b->cap;
     while (newcap < b->len + needed) {
-        newcap *= 2;
+        newcap *= GROWTH_FACTOR;
     }
     uint8_t *p = (uint8_t *)realloc(b->data, newcap);
     if (!p) {
-        fprintf(stderr, "cbm_write_db: dynbuf realloc failed size=%d\n", newcap);
+        (void)fprintf(stderr, "cbm_write_db: dynbuf realloc failed size=%d\n", newcap);
         return false;
     }
     b->data = p;
@@ -267,13 +337,13 @@ static void rec_add_null(RecordBuilder *r) {
 
 static void rec_add_int(RecordBuilder *r, int64_t val) {
     int64_t st = int_serial_type(val);
-    uint8_t vbuf[9];
+    uint8_t vbuf[VARINT_MAX_BYTES];
     int vlen = put_varint(vbuf, st);
     dynbuf_append(&r->header, vbuf, vlen);
 
     int nbytes = int_storage_bytes((int)st);
     if (nbytes > 0) {
-        uint8_t ibuf[8];
+        uint8_t ibuf[INT64_BYTES];
         put_int_be(ibuf, val, nbytes);
         dynbuf_append(&r->body, ibuf, nbytes);
     }
@@ -282,7 +352,7 @@ static void rec_add_int(RecordBuilder *r, int64_t val) {
 static void rec_add_text(RecordBuilder *r, const char *s) {
     int slen = s ? (int)strlen(s) : 0;
     int64_t st = text_serial_type(slen);
-    uint8_t vbuf[9];
+    uint8_t vbuf[VARINT_MAX_BYTES];
     int vlen = put_varint(vbuf, st);
     dynbuf_append(&r->header, vbuf, vlen);
     if (slen > 0) {
@@ -352,9 +422,9 @@ static void pb_init(PageBuilder *pb, FILE *fp, uint32_t start_page, bool is_inde
     pb->is_index = is_index;
     pb->cell_count = 0;
     pb->content_offset = PAGE_SIZE;
-    pb->page1_offset = (start_page == 1) ? 100 : 0;
+    pb->page1_offset = (start_page == SKIP_ONE) ? SQLITE_HEADER_SIZE : 0;
     // Header: flag(1) + freeblock(2) + cell_count(2) + content_start(2) + fragmented(1) = 8
-    pb->ptr_offset = pb->page1_offset + 8;
+    pb->ptr_offset = pb->page1_offset + BTREE_HEADER_SIZE;
     memset(pb->page, 0, PAGE_SIZE);
     pb->leaves = NULL;
     pb->leaf_count = 0;
@@ -379,21 +449,21 @@ static void pb_flush_leaf(PageBuilder *pb) {
     int hdr = pb->page1_offset;
     // Write leaf page header
     pb->page[hdr + 0] = pb->is_index ? BTREE_LEAF_INDEX : BTREE_LEAF_TABLE; // leaf flag
-    put_u16(pb->page + hdr + 1, 0);                                         // first freeblock
-    put_u16(pb->page + hdr + 3, (uint16_t)pb->cell_count);
-    put_u16(pb->page + hdr + 5, (uint16_t)pb->content_offset);
-    pb->page[hdr + 7] = 0; // fragmented free bytes
+    put_u16(pb->page + hdr + HDR_FREEBLOCK_OFF, 0);                         // first freeblock
+    put_u16(pb->page + hdr + HDR_CELLCOUNT_OFF, (uint16_t)pb->cell_count);
+    put_u16(pb->page + hdr + HDR_CONTENT_OFF, (uint16_t)pb->content_offset);
+    pb->page[hdr + HDR_FRAGBYTES_OFF] = 0; // fragmented free bytes
 
     // Write page to file
     uint32_t page_num = pb->next_page;
-    long offset = (long)(page_num - 1) * PAGE_SIZE;
-    fseek(pb->fp, offset, SEEK_SET);
-    fwrite(pb->page, 1, PAGE_SIZE, pb->fp);
+    long offset = (long)(page_num - SKIP_ONE) * PAGE_SIZE;
+    (void)fseek(pb->fp, offset, SEEK_SET);
+    (void)fwrite(pb->page, SKIP_ONE, PAGE_SIZE, pb->fp);
 
     // Record this leaf for interior page building
     if (pb->leaf_count >= pb->leaf_cap) {
         int old_cap = pb->leaf_cap;
-        pb->leaf_cap = old_cap == 0 ? 256 : old_cap * 2;
+        pb->leaf_cap = old_cap == 0 ? INITIAL_LEAF_CAP : old_cap * GROWTH_FACTOR;
         void *tmp = realloc(pb->leaves, (size_t)pb->leaf_cap * sizeof(PageRef));
         if (!tmp) {
             free(pb->leaves);
@@ -412,15 +482,15 @@ static void pb_flush_leaf(PageBuilder *pb) {
     pb->next_page++;
     pb->cell_count = 0;
     pb->content_offset = PAGE_SIZE;
-    pb->page1_offset = 0; // only page 1 has the 100-byte header
-    pb->ptr_offset = 8;   // standard B-tree header size for non-page-1
+    pb->page1_offset = 0;               // only page 1 has the 100-byte header
+    pb->ptr_offset = BTREE_HEADER_SIZE; // standard B-tree header size for non-page-1
     memset(pb->page, 0, PAGE_SIZE);
 }
 
 // Check if a cell of given size fits in the current page
 static bool pb_cell_fits(PageBuilder *pb, int cell_len) {
     // Cell pointer (2 bytes) + cell content
-    int available = pb->content_offset - pb->ptr_offset - 2;
+    int available = pb->content_offset - pb->ptr_offset - CELL_PTR_SIZE;
     return cell_len <= available;
 }
 
@@ -434,7 +504,7 @@ static void pb_add_cell(PageBuilder *pb, const uint8_t *cell, int cell_len) {
 
     // Write cell pointer (grows up)
     put_u16(pb->page + pb->ptr_offset, (uint16_t)pb->content_offset);
-    pb->ptr_offset += 2;
+    pb->ptr_offset += CELL_PTR_SIZE;
     pb->cell_count++;
 }
 
@@ -460,9 +530,9 @@ static int build_interior_cell(const PageRef *child, bool is_index, uint8_t *cel
     *out_heap = NULL;
     if (!is_index) {
         put_u32(cell_buf, child->page_num);
-        return 4 + put_varint(cell_buf + 4, child->max_key);
+        return BTREE_PTR_SIZE + put_varint(cell_buf + BTREE_PTR_SIZE, child->max_key);
     }
-    int clen = 4 + child->sep_cell_len;
+    int clen = BTREE_PTR_SIZE + child->sep_cell_len;
     uint8_t *data = (uint8_t *)malloc(clen);
     put_u32(data, child->page_num);
     memcpy(data + 4, child->sep_cell, child->sep_cell_len);
@@ -477,24 +547,24 @@ static int write_interior_page(PageBuilder *pb, uint8_t *page, int cell_count, i
                                int right_child_idx, bool is_index, PageRef **parents,
                                int parent_count, int *parent_cap) {
     uint32_t pnum = pb->next_page++;
-    page[0] = is_index ? 0x02 : 0x05;
-    put_u16(page + 1, 0);
-    put_u16(page + 3, (uint16_t)cell_count);
-    put_u16(page + 5, (uint16_t)content_offset);
-    page[7] = 0;
-    put_u32(page + 8, right_child_page);
+    page[0] = is_index ? INTERIOR_INDEX_FLAG : INTERIOR_TABLE_FLAG;
+    put_u16(page + HDR_FREEBLOCK_OFF, 0);
+    put_u16(page + HDR_CELLCOUNT_OFF, (uint16_t)cell_count);
+    put_u16(page + HDR_CONTENT_OFF, (uint16_t)content_offset);
+    page[HDR_FRAGBYTES_OFF] = 0;
+    put_u32(page + HDR_RIGHTCHILD_OFF, right_child_page);
 
-    fseek(pb->fp, (long)(pnum - 1) * PAGE_SIZE, SEEK_SET);
-    fwrite(page, 1, PAGE_SIZE, pb->fp);
+    (void)fseek(pb->fp, (long)(pnum - SKIP_ONE) * PAGE_SIZE, SEEK_SET);
+    (void)fwrite(page, SKIP_ONE, PAGE_SIZE, pb->fp);
 
     if (parent_count >= *parent_cap) {
         int old_pcap = *parent_cap;
-        *parent_cap = old_pcap == 0 ? 64 : old_pcap * 2;
+        *parent_cap = old_pcap == 0 ? INITIAL_PARENT_CAP : old_pcap * GROWTH_FACTOR;
         PageRef *tmp = (PageRef *)realloc(*parents, *parent_cap * sizeof(PageRef));
         if (!tmp) {
             free(*parents);
             *parents = NULL;
-            return -1;
+            return CBM_NOT_FOUND;
         }
         *parents = tmp;
         memset(&(*parents)[old_pcap], 0,
@@ -511,7 +581,7 @@ static int write_interior_page(PageBuilder *pb, uint8_t *page, int cell_count, i
         (*parents)[parent_count].sep_cell = NULL;
         (*parents)[parent_count].sep_cell_len = 0;
     }
-    return parent_count + 1;
+    return parent_count + SKIP_ONE;
 }
 
 // Free a PageRef array (sep_cell allocations), unless it's the original leaves.
@@ -529,13 +599,13 @@ static void free_children(PageRef *children, int child_count, const PageRef *lea
 static void fill_interior_page(uint8_t *page, const PageRef *children, int child_count,
                                bool is_index, int *idx, int *cell_count, int *content_offset,
                                int *ptr_offset) {
-    while (*idx < child_count - 1) {
-        uint8_t tbuf[20];
+    while (*idx < child_count - SKIP_ONE) {
+        uint8_t tbuf[INTERIOR_CELL_BUF];
         uint8_t *heap_cell = NULL;
         int clen = build_interior_cell(&children[*idx], is_index, tbuf, &heap_cell);
         uint8_t *cell_data = heap_cell ? heap_cell : tbuf;
 
-        int available = *content_offset - *ptr_offset - 2;
+        int available = *content_offset - *ptr_offset - CELL_PTR_SIZE;
         if (clen > available && *cell_count > 0) {
             free(heap_cell);
             break;
@@ -544,7 +614,7 @@ static void fill_interior_page(uint8_t *page, const PageRef *children, int child
         *content_offset -= clen;
         memcpy(page + *content_offset, cell_data, clen);
         put_u16(page + *ptr_offset, (uint16_t)*content_offset);
-        *ptr_offset += 2;
+        *ptr_offset += CELL_PTR_SIZE;
         (*cell_count)++;
         free(heap_cell);
         (*idx)++;
@@ -555,14 +625,14 @@ static uint32_t pb_build_interior(PageBuilder *pb, bool is_index) {
     if (!pb->leaves) {
         return 0;
     }
-    if (pb->leaf_count <= 1) {
+    if (pb->leaf_count <= SKIP_ONE) {
         return pb->leaves[0].page_num;
     }
 
     PageRef *children = pb->leaves;
     int child_count = pb->leaf_count;
 
-    while (child_count > 1 && children) {
+    while (child_count > SKIP_ONE && children) {
         PageRef *parents = NULL;
         int parent_count = 0;
         int parent_cap = 0;
@@ -573,17 +643,17 @@ static uint32_t pb_build_interior(PageBuilder *pb, bool is_index) {
             memset(page, 0, PAGE_SIZE);
             int cell_count = 0;
             int content_offset = PAGE_SIZE;
-            int ptr_offset = 12;
+            int ptr_offset = BTREE_INTERIOR_HDR;
 
             fill_interior_page(page, children, child_count, is_index, &i, &cell_count,
                                &content_offset, &ptr_offset);
 
-            int right_child_idx = (i < child_count - 1) ? i : child_count - 1;
+            int right_child_idx = (i < child_count - SKIP_ONE) ? i : child_count - SKIP_ONE;
             uint32_t right_child_page = 0;
             if (right_child_idx >= 0 && right_child_idx < child_count) {
                 right_child_page = children[right_child_idx].page_num;
             }
-            if (i < child_count - 1) {
+            if (i < child_count - SKIP_ONE) {
                 i++;
             } else {
                 i = child_count;
@@ -824,7 +894,7 @@ static bool pb_ensure_leaf_cap(PageBuilder *pb) {
     if (pb->leaf_count < pb->leaf_cap) {
         return true;
     }
-    pb->leaf_cap = pb->leaf_cap == 0 ? 256 : pb->leaf_cap * 2;
+    pb->leaf_cap = pb->leaf_cap == 0 ? INITIAL_LEAF_CAP : pb->leaf_cap * GROWTH_FACTOR;
     void *tmp = realloc(pb->leaves, (size_t)pb->leaf_cap * sizeof(PageRef));
     if (!tmp) {
         free(pb->leaves);
@@ -875,9 +945,9 @@ static uint32_t pb_finalize_table(PageBuilder *pb, uint32_t *next_page, int64_t 
 
     *next_page = pb->next_page;
     uint32_t root;
-    if (pb->leaf_count == 1) {
+    if (pb->leaf_count == SKIP_ONE) {
         root = pb->leaves[0].page_num;
-    } else if (pb->leaf_count > 1) {
+    } else if (pb->leaf_count > SKIP_ONE) {
         root = pb_build_interior(pb, false);
         *next_page = pb->next_page;
     } else {
@@ -897,20 +967,20 @@ static uint32_t write_table_btree(FILE *fp, uint32_t *next_page, const uint8_t *
         uint32_t pnum = (*next_page)++;
         uint8_t page[PAGE_SIZE];
         memset(page, 0, PAGE_SIZE);
-        int hdr = first_is_page1 ? 100 : 0;
-        page[hdr] = BTREE_LEAF_TABLE;                 // leaf table
-        put_u16(page + hdr + 1, 0);                   // no freeblocks
-        put_u16(page + hdr + 3, 0);                   // 0 cells
-        put_u16(page + hdr + 5, (uint16_t)PAGE_SIZE); // content at end of page
-        page[hdr + 7] = 0;                            // 0 fragmented bytes
-        fseek(fp, (long)(pnum - 1) * PAGE_SIZE, SEEK_SET);
-        fwrite(page, 1, PAGE_SIZE, fp);
+        int hdr = first_is_page1 ? SQLITE_HEADER_SIZE : 0;
+        page[hdr] = BTREE_LEAF_TABLE;                               // leaf table
+        put_u16(page + hdr + HDR_FREEBLOCK_OFF, 0);                 // no freeblocks
+        put_u16(page + hdr + HDR_CELLCOUNT_OFF, 0);                 // 0 cells
+        put_u16(page + hdr + HDR_CONTENT_OFF, (uint16_t)PAGE_SIZE); // content at end of page
+        page[hdr + HDR_FRAGBYTES_OFF] = 0;                          // 0 fragmented bytes
+        (void)fseek(fp, (long)(pnum - SKIP_ONE) * PAGE_SIZE, SEEK_SET);
+        (void)fwrite(page, SKIP_ONE, PAGE_SIZE, fp);
         return pnum;
     }
 
     PageBuilder pb;
     pb_init(&pb, fp, *next_page, false);
-    pb.page1_offset = first_is_page1 ? 100 : 0;
+    pb.page1_offset = first_is_page1 ? SQLITE_HEADER_SIZE : 0;
     pb.ptr_offset = pb.page1_offset + 8;
 
     for (int i = 0; i < count; i++) {
@@ -934,7 +1004,7 @@ static bool pb_promote_and_flush(PageBuilder *pb, uint8_t **cells, int *cell_len
     // Un-add the last cell
     pb->cell_count--;
     pb->content_offset += cell_lens[prev_idx];
-    pb->ptr_offset -= 2;
+    pb->ptr_offset -= CELL_PTR_SIZE;
 
     pb_flush_leaf(pb);
     return true;
@@ -945,13 +1015,13 @@ static uint32_t write_empty_index_leaf(FILE *fp, uint32_t *next_page) {
     uint32_t pnum = (*next_page)++;
     uint8_t page[PAGE_SIZE];
     memset(page, 0, PAGE_SIZE);
-    page[0] = 0x0A;
-    put_u16(page + 1, 0);
-    put_u16(page + 3, 0);
-    put_u16(page + 5, (uint16_t)PAGE_SIZE);
-    page[7] = 0;
-    fseek(fp, (long)(pnum - 1) * PAGE_SIZE, SEEK_SET);
-    fwrite(page, 1, PAGE_SIZE, fp);
+    page[0] = NEWLINE_BYTE;
+    put_u16(page + HDR_FREEBLOCK_OFF, 0);
+    put_u16(page + HDR_CELLCOUNT_OFF, 0);
+    put_u16(page + HDR_CONTENT_OFF, (uint16_t)PAGE_SIZE);
+    page[HDR_FRAGBYTES_OFF] = 0;
+    (void)fseek(fp, (long)(pnum - SKIP_ONE) * PAGE_SIZE, SEEK_SET);
+    (void)fwrite(page, SKIP_ONE, PAGE_SIZE, fp);
     return pnum;
 }
 
@@ -991,7 +1061,7 @@ static uint32_t write_index_btree(FILE *fp, uint32_t *next_page, uint8_t **cells
     uint32_t root;
     if (!pb.leaves) {
         root = 0;
-    } else if (pb.leaf_count == 1) {
+    } else if (pb.leaf_count == SKIP_ONE) {
         root = pb.leaves[0].page_num;
     } else {
         root = pb_build_interior(&pb, true);
@@ -1048,8 +1118,8 @@ static inline const char *safe_str(const char *s) {
 static int *make_sorted_perm(int n, int (*cmp)(const void *, const void *)) {
     int *perm = (int *)malloc(n * sizeof(int));
     if (!perm) {
-        fprintf(stderr, "cbm_write_db: perm malloc failed n=%d size=%zu\n", n,
-                (size_t)n * sizeof(int));
+        (void)fprintf(stderr, "cbm_write_db: perm malloc failed n=%d size=%zu\n", n,
+                      (size_t)n * sizeof(int));
         return NULL;
     }
     for (int i = 0; i < n; i++) {
@@ -1187,10 +1257,10 @@ static int cmp_edge_by_url_path(const void *a, const void *b) {
         return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
     }
     if (na) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
     if (nb) {
-        return 1;
+        return SERIAL_SIZE_INT8;
     }
     int c = strcmp(ua, ub);
     if (c) {
@@ -1403,7 +1473,7 @@ static int write_data_tables(write_db_ctx_t *w, uint32_t *nodes_root, uint32_t *
             int rec_len;
             uint8_t *rec = build_node_record(&w->nodes[i], &rec_len);
             if (!rec) {
-                return -3;
+                return ERR_WRITE_FAILED;
             }
             pb_add_table_cell_with_flush(&pb, w->nodes[i].id, rec, rec_len,
                                          i > 0 ? w->nodes[i - 1].id : 0);
@@ -1421,7 +1491,7 @@ static int write_data_tables(write_db_ctx_t *w, uint32_t *nodes_root, uint32_t *
             int rec_len;
             uint8_t *rec = build_edge_record(&w->edges[i], &rec_len);
             if (!rec) {
-                return -3;
+                return ERR_WRITE_FAILED;
             }
             pb_add_table_cell_with_flush(&pb, w->edges[i].id, rec, rec_len,
                                          i > 0 ? w->edges[i - 1].id : 0);
@@ -1443,7 +1513,7 @@ static void write_metadata_tables(write_db_ctx_t *w, uint32_t *projects_root,
         build_project_record(w->project, w->indexed_at, w->root_path, &proj_rec_len);
     const uint8_t *proj_recs[] = {proj_rec};
     int proj_lens[] = {proj_rec_len};
-    int64_t proj_rowids[] = {1};
+    int64_t proj_rowids[] = {FIRST_ROWID};
     *projects_root =
         write_table_btree(w->fp, &w->next_page, proj_recs, proj_lens, proj_rowids, 1, false);
     free(proj_rec);
@@ -1469,7 +1539,7 @@ static void write_metadata_tables(write_db_ctx_t *w, uint32_t *projects_root,
 
     const uint8_t *seq_recs[] = {seq1, seq2};
     int seq_lens[] = {seq1_len, seq2_len};
-    int64_t seq_rowids[] = {1, 2};
+    int64_t seq_rowids[] = {FIRST_ROWID, FIRST_DATA_PAGE};
     *sqlite_seq_root =
         write_table_btree(w->fp, &w->next_page, seq_recs, seq_lens, seq_rowids, 2, false);
     free(seq1);
@@ -1481,11 +1551,11 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
                  int edge_count) {
     FILE *fp = fopen(path, "wb");
     if (!fp) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
 
     write_db_ctx_t w = {.fp = fp,
-                        .next_page = 2,
+                        .next_page = FIRST_DATA_PAGE,
                         .project = project,
                         .root_path = root_path,
                         .indexed_at = indexed_at,
@@ -1499,7 +1569,7 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
     uint32_t edges_root;
     int rc = write_data_tables(&w, &nodes_root, &edges_root);
     if (rc != 0) {
-        fclose(fp);
+        (void)fclose(fp);
         return rc;
     }
 
@@ -1537,14 +1607,14 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
     };
 
     {
-        cbm_thread_t st[11];
+        cbm_thread_t st[TOTAL_SORT_THREADS];
         int nt = 0;
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < NODE_SORT_THREADS; i++) {
             if (nsorts[i].count > 0) {
                 cbm_thread_create(&st[nt++], 0, sort_worker, &nsorts[i]);
             }
         }
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < EDGE_SORT_THREADS; i++) {
             if (esorts[i].count > 0) {
                 cbm_thread_create(&st[nt++], 0, sort_worker, &esorts[i]);
             }
@@ -1556,42 +1626,44 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
 
     uint32_t idx_nodes_label_root =
         build_node_index_sorted(fp, &next_page, nodes, node_count, nsorts[0].perm, ncol_label);
-    uint32_t idx_nodes_name_root =
-        build_node_index_sorted(fp, &next_page, nodes, node_count, nsorts[1].perm, ncol_name);
-    uint32_t idx_nodes_file_root =
-        build_node_index_sorted(fp, &next_page, nodes, node_count, nsorts[2].perm, ncol_file);
+    uint32_t idx_nodes_name_root = build_node_index_sorted(fp, &next_page, nodes, node_count,
+                                                           nsorts[NSORT_NAME].perm, ncol_name);
+    uint32_t idx_nodes_file_root = build_node_index_sorted(fp, &next_page, nodes, node_count,
+                                                           nsorts[NSORT_FILE].perm, ncol_file);
     uint32_t autoindex_nodes_root =
-        build_node_index_sorted(fp, &next_page, nodes, node_count, nsorts[3].perm, ncol_qn);
+        build_node_index_sorted(fp, &next_page, nodes, node_count, nsorts[NSORT_QN].perm, ncol_qn);
 
     if ((node_count > 0) && (!idx_nodes_label_root || !idx_nodes_name_root ||
                              !idx_nodes_file_root || !autoindex_nodes_root)) {
-        fclose(fp);
-        return -4;
+        (void)fclose(fp);
+        return ERR_SORT_FAILED;
     }
 
     // --- Edge indexes (all sorted) ---
 
     uint32_t idx_edges_source_root =
         build_edge_index_sorted(fp, &next_page, edges, edge_count, esorts[0].perm, ecell_source);
-    uint32_t idx_edges_target_root =
-        build_edge_index_sorted(fp, &next_page, edges, edge_count, esorts[1].perm, ecell_target);
-    uint32_t idx_edges_type_root =
-        build_edge_index_sorted(fp, &next_page, edges, edge_count, esorts[2].perm, ecell_type);
-    uint32_t idx_edges_target_type_root = build_edge_index_sorted(
-        fp, &next_page, edges, edge_count, esorts[3].perm, ecell_proj_target_type);
-    uint32_t idx_edges_source_type_root = build_edge_index_sorted(
-        fp, &next_page, edges, edge_count, esorts[4].perm, ecell_proj_source_type);
-    uint32_t idx_edges_url_path_root =
-        build_edge_index_sorted(fp, &next_page, edges, edge_count, esorts[5].perm, ecell_url_path);
-    uint32_t autoindex_edges_root = build_edge_index_sorted(fp, &next_page, edges, edge_count,
-                                                            esorts[6].perm, ecell_src_tgt_type);
+    uint32_t idx_edges_target_root = build_edge_index_sorted(
+        fp, &next_page, edges, edge_count, esorts[ESORT_TARGET].perm, ecell_target);
+    uint32_t idx_edges_type_root = build_edge_index_sorted(fp, &next_page, edges, edge_count,
+                                                           esorts[ESORT_TYPE].perm, ecell_type);
+    uint32_t idx_edges_target_type_root =
+        build_edge_index_sorted(fp, &next_page, edges, edge_count, esorts[ESORT_PROJ_TGT_TYPE].perm,
+                                ecell_proj_target_type);
+    uint32_t idx_edges_source_type_root =
+        build_edge_index_sorted(fp, &next_page, edges, edge_count, esorts[ESORT_PROJ_SRC_TYPE].perm,
+                                ecell_proj_source_type);
+    uint32_t idx_edges_url_path_root = build_edge_index_sorted(
+        fp, &next_page, edges, edge_count, esorts[ESORT_URL_PATH].perm, ecell_url_path);
+    uint32_t autoindex_edges_root = build_edge_index_sorted(
+        fp, &next_page, edges, edge_count, esorts[ESORT_SRC_TGT_TYPE].perm, ecell_src_tgt_type);
 
     if (edge_count > 0 &&
         (!idx_edges_source_root || !idx_edges_target_root || !idx_edges_type_root ||
          !idx_edges_target_type_root || !idx_edges_source_type_root || !idx_edges_url_path_root ||
          !autoindex_edges_root)) {
-        fclose(fp);
-        return -4;
+        (void)fclose(fp);
+        return ERR_SORT_FAILED;
     }
 
     // Autoindex for projects(name TEXT PK) — single text column
@@ -1601,7 +1673,7 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
         RecordBuilder r;
         rec_init(&r);
         rec_add_text(&r, project);
-        rec_add_int(&r, 1); // rowid
+        rec_add_int(&r, FIRST_ROWID); /* rowid */
         int plen = 0;
         uint8_t *payload = rec_finalize(&r, &plen);
         rec_free(&r);
@@ -1692,7 +1764,7 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
     int *master_lens = (int *)malloc(master_count * sizeof(int));
     int64_t *master_rowids = (int64_t *)malloc(master_count * sizeof(int64_t));
     for (int i = 0; i < master_count; i++) {
-        master_rowids[i] = i + 1;
+        master_rowids[i] = i + SKIP_ONE;
         master_records[i] = build_master_record(&master[i], &master_lens[i]);
     }
 
@@ -1707,10 +1779,10 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
         memset(page1, 0, PAGE_SIZE);
 
         // B-tree header starts at offset 100 on page 1
-        int hdr = 100;
+        int hdr = SQLITE_HEADER_SIZE;
         page1[hdr] = BTREE_LEAF_TABLE; // leaf table
         int content_off = PAGE_SIZE;
-        int ptr_off = hdr + 8;
+        int ptr_off = hdr + BTREE_HEADER_SIZE;
         int mcell_count = 0;
 
         for (int i = 0; i < master_count; i++) {
@@ -1719,7 +1791,7 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
                 build_table_cell(master_rowids[i], master_records[i], master_lens[i], &cell_len);
 
             // Check fit
-            int available = content_off - ptr_off - 2;
+            int available = content_off - ptr_off - CELL_PTR_SIZE;
             if (cell_len > available) {
                 // Master entries should always fit on page 1 (they're small SQL strings).
                 // If not, this is a bug — fail gracefully.
@@ -1730,53 +1802,53 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
                 free(master_records);
                 free(master_lens);
                 free(master_rowids);
-                fclose(fp);
-                return -2;
+                (void)fclose(fp);
+                return ERR_MASTER_OVERFLOW;
             }
 
             content_off -= cell_len;
             memcpy(page1 + content_off, cell, cell_len);
             put_u16(page1 + ptr_off, (uint16_t)content_off);
-            ptr_off += 2;
+            ptr_off += CELL_PTR_SIZE;
             mcell_count++;
             free(cell);
         }
 
-        put_u16(page1 + hdr + 1, 0); // freeblock
-        put_u16(page1 + hdr + 3, (uint16_t)mcell_count);
-        put_u16(page1 + hdr + 5, (uint16_t)content_off);
-        page1[hdr + 7] = 0; // fragmented
+        put_u16(page1 + hdr + HDR_FREEBLOCK_OFF, 0); // freeblock
+        put_u16(page1 + hdr + HDR_CELLCOUNT_OFF, (uint16_t)mcell_count);
+        put_u16(page1 + hdr + HDR_CONTENT_OFF, (uint16_t)content_off);
+        page1[hdr + HDR_FRAGBYTES_OFF] = 0; // fragmented
 
         // Write the 100-byte SQLite file header
         memcpy(page1, "SQLite format 3\000", 16);
         /* Page size 65536 is encoded as 1 in the 2-byte header field */
         put_u16(page1 + HDR_OFF_PAGE_SIZE, (uint16_t)1);
-        page1[HDR_OFF_WRITE_VERSION] = FILE_FORMAT;            // file format write version
-        page1[HDR_OFF_READ_VERSION] = FILE_FORMAT;             // file format read version
-        page1[HDR_OFF_RESERVED] = 0;                           // reserved space per page
-        page1[HDR_OFF_MAX_EMBED_FRAC] = 64;                    // max embedded payload fraction
-        page1[HDR_OFF_MIN_EMBED_FRAC] = 32;                    // min embedded payload fraction
-        page1[HDR_OFF_LEAF_FRAC] = 32;                         // leaf payload fraction
-        put_u32(page1 + HDR_OFF_FILE_CHANGE, 0);               // file change counter (set below)
-        put_u32(page1 + HDR_OFF_DB_SIZE, next_page - 1);       // total pages
-        put_u32(page1 + HDR_OFF_FREELIST_TRUNK, 0);            // first freelist trunk page
-        put_u32(page1 + HDR_OFF_FREELIST_COUNT, 0);            // total freelist pages
-        put_u32(page1 + HDR_OFF_SCHEMA_COOKIE, 1);             // schema cookie
-        put_u32(page1 + HDR_OFF_SCHEMA_FORMAT, SCHEMA_FORMAT); // schema format number
-        put_u32(page1 + HDR_OFF_DEFAULT_CACHE, 0);             // default page cache size
-        put_u32(page1 + HDR_OFF_AUTOVAC_TOP, 0);               // largest root page (auto-vacuum)
-        put_u32(page1 + HDR_OFF_TEXT_ENCODING, 1);             // text encoding: UTF-8
-        put_u32(page1 + HDR_OFF_USER_VERSION, 0);              // user version
-        put_u32(page1 + HDR_OFF_INCR_VACUUM, 0);               // incremental vacuum mode
-        put_u32(page1 + HDR_OFF_APP_ID, 0);                    // application ID
+        page1[HDR_OFF_WRITE_VERSION] = FILE_FORMAT;             // file format write version
+        page1[HDR_OFF_READ_VERSION] = FILE_FORMAT;              // file format read version
+        page1[HDR_OFF_RESERVED] = 0;                            // reserved space per page
+        page1[HDR_OFF_MAX_EMBED_FRAC] = MAX_EMBED_FRACTION;     // max embedded payload fraction
+        page1[HDR_OFF_MIN_EMBED_FRAC] = MIN_EMBED_FRACTION;     // min embedded payload fraction
+        page1[HDR_OFF_LEAF_FRAC] = LEAF_PAYLOAD_FRACTION;       // leaf payload fraction
+        put_u32(page1 + HDR_OFF_FILE_CHANGE, 0);                // file change counter (set below)
+        put_u32(page1 + HDR_OFF_DB_SIZE, next_page - SKIP_ONE); // total pages
+        put_u32(page1 + HDR_OFF_FREELIST_TRUNK, 0);             // first freelist trunk page
+        put_u32(page1 + HDR_OFF_FREELIST_COUNT, 0);             // total freelist pages
+        put_u32(page1 + HDR_OFF_SCHEMA_COOKIE, 1);              // schema cookie
+        put_u32(page1 + HDR_OFF_SCHEMA_FORMAT, SCHEMA_FORMAT);  // schema format number
+        put_u32(page1 + HDR_OFF_DEFAULT_CACHE, 0);              // default page cache size
+        put_u32(page1 + HDR_OFF_AUTOVAC_TOP, 0);                // largest root page (auto-vacuum)
+        put_u32(page1 + HDR_OFF_TEXT_ENCODING, 1);              // text encoding: UTF-8
+        put_u32(page1 + HDR_OFF_USER_VERSION, 0);               // user version
+        put_u32(page1 + HDR_OFF_INCR_VACUUM, 0);                // incremental vacuum mode
+        put_u32(page1 + HDR_OFF_APP_ID, 0);                     // application ID
         // Bytes 72-91: reserved for expansion (zeros)
         put_u32(page1 + HDR_OFF_VERSION_VALID, 1); // version-valid-for (change counter)
         put_u32(page1 + HDR_OFF_SQLITE_VERSION, SQLITE_VERSION); // SQLite version number
         // Set file change counter = version-valid-for = 1
         put_u32(page1 + HDR_OFF_FILE_CHANGE, 1);
 
-        fseek(fp, 0, SEEK_SET);
-        fwrite(page1, 1, PAGE_SIZE, fp);
+        (void)fseek(fp, 0, SEEK_SET);
+        (void)fwrite(page1, SKIP_ONE, PAGE_SIZE, fp);
     }
 
     for (int i = 0; i < master_count; i++) {
@@ -1788,16 +1860,16 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
 
     // Ensure file size is exactly next_page * PAGE_SIZE
     // (pad any remaining space)
-    fseek(fp, 0, SEEK_END);
+    (void)fseek(fp, 0, SEEK_END);
     long file_size = ftell(fp);
-    long expected_size = (long)(next_page - 1) * PAGE_SIZE;
+    long expected_size = (long)(next_page - SKIP_ONE) * PAGE_SIZE;
     if (file_size < expected_size) {
         // Pad with zeros
         uint8_t zero = 0;
-        fseek(fp, expected_size - 1, SEEK_SET);
-        fwrite(&zero, 1, 1, fp);
+        (void)fseek(fp, expected_size - SKIP_ONE, SEEK_SET);
+        (void)fwrite(&zero, SKIP_ONE, SKIP_ONE, fp);
     }
 
-    fclose(fp);
+    (void)fclose(fp);
     return 0;
 }

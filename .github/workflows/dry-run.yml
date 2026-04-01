@@ -30,7 +30,7 @@ jobs:
     if: ${{ inputs.skip_lint != true }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install build deps
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev cmake
@@ -42,7 +42,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang-format-20
 
-      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         id: cppcheck-cache
         with:
           path: /opt/cppcheck
@@ -69,7 +69,7 @@ jobs:
     if: ${{ inputs.skip_lint != true }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: "Layer 1: Static allow-list audit"
         run: scripts/security-audit.sh
@@ -182,7 +182,7 @@ jobs:
             cxx: c++
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install deps (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
@@ -196,7 +196,7 @@ jobs:
     needs: [lint]
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
         with:
@@ -241,7 +241,7 @@ jobs:
             cxx: c++
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install deps (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
@@ -281,9 +281,57 @@ jobs:
           tar -czf codebase-memory-mcp-ui-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
             -C build/c codebase-memory-mcp LICENSE
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: "*.tar.gz"
+
+  # ── Step 3b: Build portable Linux binaries (musl static) ────
+  build-linux-portable:
+    if: ${{ inputs.skip_builds != true && always() && (needs.test-unix.result == 'success' || needs.test-unix.result == 'skipped') && (needs.test-windows.result == 'success' || needs.test-windows.result == 'skipped') }}
+    needs: [test-unix, test-windows]
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: alpine:3.21
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install musl build deps
+        run: apk add --no-cache build-base linux-headers zlib-dev zlib-static nodejs npm
+
+      - name: Build standard binary (static)
+        run: scripts/build.sh CC=gcc CXX=g++ STATIC=1
+
+      - name: Verify static linking
+        run: |
+          file build/c/codebase-memory-mcp | grep -q "statically linked"
+          echo "=== Confirmed: fully static binary ==="
+
+      - name: Archive standard binary
+        run: |
+          cp LICENSE build/c/
+          tar -czf codebase-memory-mcp-linux-${{ matrix.arch }}-portable.tar.gz \
+            -C build/c codebase-memory-mcp LICENSE
+
+      - name: Build UI binary (static)
+        run: scripts/build.sh --with-ui CC=gcc CXX=g++ STATIC=1
+
+      - name: Archive UI binary
+        run: |
+          cp LICENSE build/c/
+          tar -czf codebase-memory-mcp-ui-linux-${{ matrix.arch }}-portable.tar.gz \
+            -C build/c codebase-memory-mcp LICENSE
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: binaries-linux-${{ matrix.arch }}-portable
           path: "*.tar.gz"
 
   build-windows:
@@ -291,7 +339,7 @@ jobs:
     needs: [test-unix, test-windows]
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
         with:
@@ -331,7 +379,7 @@ jobs:
           cp "$BIN" codebase-memory-mcp-ui.exe
           zip codebase-memory-mcp-ui-windows-amd64.zip codebase-memory-mcp-ui.exe LICENSE
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binaries-windows-amd64
           path: "*.zip"
@@ -359,7 +407,7 @@ jobs:
         variant: [standard, ui]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -450,7 +498,7 @@ jobs:
         variant: [standard, ui]
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
         with:
@@ -518,6 +566,81 @@ jobs:
           }
           Write-Host "=== Windows Defender: clean ==="
 
+  # ── Step 4b: Smoke test portable Linux binaries ──────────────
+  smoke-linux-portable:
+    if: ${{ !cancelled() && inputs.skip_builds != true }}
+    needs: [build-linux-portable]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+        variant: [standard, ui]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: binaries-linux-${{ matrix.arch }}-portable
+
+      - name: Extract binary
+        run: |
+          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
+          tar -xzf codebase-memory-mcp${SUFFIX}-linux-${{ matrix.arch }}-portable.tar.gz
+          chmod +x codebase-memory-mcp
+
+      - name: Start artifact server for E2E smoke tests
+        run: |
+          mkdir -p /tmp/smoke-server
+          cp codebase-memory-mcp /tmp/smoke-server/
+          ARCH=${{ matrix.arch }}
+          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
+          tar -czf "/tmp/smoke-server/codebase-memory-mcp${SUFFIX}-linux-${ARCH}-portable.tar.gz" \
+            -C /tmp/smoke-server codebase-memory-mcp
+          # Also serve under standard name so install.sh + update --standard work
+          cp "/tmp/smoke-server/codebase-memory-mcp${SUFFIX}-linux-${ARCH}-portable.tar.gz" \
+             "/tmp/smoke-server/codebase-memory-mcp-linux-${ARCH}.tar.gz"
+          if [ -n "$SUFFIX" ]; then
+            cp "/tmp/smoke-server/codebase-memory-mcp${SUFFIX}-linux-${ARCH}-portable.tar.gz" \
+               "/tmp/smoke-server/codebase-memory-mcp${SUFFIX}-linux-${ARCH}.tar.gz"
+          fi
+          cd /tmp/smoke-server
+          sha256sum *.tar.gz > checksums.txt 2>/dev/null || shasum -a 256 *.tar.gz > checksums.txt
+          python3 -m http.server 18080 -d /tmp/smoke-server &
+
+      - name: Smoke test (portable ${{ matrix.variant }}, linux-${{ matrix.arch }})
+        run: scripts/smoke-test.sh ./codebase-memory-mcp
+        env:
+          SMOKE_DOWNLOAD_URL: http://localhost:18080
+
+      - name: Binary string audit (portable linux-${{ matrix.arch }})
+        if: matrix.variant == 'standard'
+        run: scripts/security-strings.sh ./codebase-memory-mcp
+
+      - name: Install output audit (portable linux-${{ matrix.arch }})
+        if: matrix.variant == 'standard'
+        run: scripts/security-install.sh ./codebase-memory-mcp
+
+      - name: Network egress test (portable linux-${{ matrix.arch }})
+        if: matrix.variant == 'standard'
+        run: scripts/security-network.sh ./codebase-memory-mcp
+
+      - name: ClamAV scan (portable Linux)
+        if: matrix.variant == 'standard'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq clamav > /dev/null 2>&1
+          sudo sed -i 's/^Example/#Example/' /etc/clamav/freshclam.conf 2>/dev/null || true
+          grep -q "DatabaseMirror" /etc/clamav/freshclam.conf 2>/dev/null || \
+            echo "DatabaseMirror database.clamav.net" | sudo tee -a /etc/clamav/freshclam.conf > /dev/null
+          sudo freshclam --quiet
+          echo "=== ClamAV scan (portable) ==="
+          clamscan --no-summary ./codebase-memory-mcp
+          echo "=== ClamAV: clean ==="
+
   # ── Step 6: Soak tests (after smoke, per-platform) ──────────
   soak-quick:
     if: ${{ !cancelled() && inputs.soak_level != 'none' && inputs.skip_builds != true }}
@@ -549,7 +672,7 @@ jobs:
             cc: cc
             cxx: c++
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
 
       - name: Install deps (Linux)
         if: startsWith(matrix.os, 'ubuntu')
@@ -563,7 +686,7 @@ jobs:
 
       - name: Upload soak metrics
         if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: soak-quick-${{ matrix.goos }}-${{ matrix.goarch }}
           path: soak-results/
@@ -575,7 +698,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
 
       - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
         with:
@@ -602,7 +725,7 @@ jobs:
 
       - name: Upload soak metrics
         if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: soak-quick-windows-amd64
           path: soak-results/
@@ -638,7 +761,7 @@ jobs:
             cc: cc
             cxx: c++
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
 
       - name: Install deps (Linux)
         if: startsWith(matrix.os, 'ubuntu')
@@ -656,7 +779,7 @@ jobs:
 
       - name: Upload ASan soak metrics
         if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: soak-asan-${{ matrix.goos }}-${{ matrix.goarch }}
           path: soak-results/
@@ -668,7 +791,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
         with:
           msystem: CLANG64
@@ -695,8 +818,84 @@ jobs:
           scripts/soak-test.sh "$BIN" 15
       - name: Upload ASan soak metrics
         if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: soak-asan-windows-amd64
+          path: soak-results/
+          retention-days: 14
+
+  # ── Step 6c: Quick soak (portable Linux, musl static) ──────────
+  soak-quick-linux-portable:
+    if: ${{ !cancelled() && inputs.soak_level != 'none' && inputs.skip_builds != true }}
+    needs: [build-linux-portable]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: alpine:3.21
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install musl build deps
+        run: apk add --no-cache build-base linux-headers zlib-dev zlib-static python3 git nodejs npm
+
+      - name: Build (release mode, static)
+        run: scripts/build.sh CC=gcc CXX=g++ STATIC=1
+
+      - name: Quick soak (10 min)
+        run: scripts/soak-test.sh build/c/codebase-memory-mcp 10
+
+      - name: Upload soak metrics
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: soak-quick-linux-${{ matrix.arch }}-portable
+          path: soak-results/
+          retention-days: 14
+
+  # ── Step 6d: ASan soak (portable Linux, musl static) ──────────
+  soak-asan-linux-portable:
+    if: ${{ !cancelled() && inputs.soak_level == 'full' && inputs.skip_builds != true }}
+    needs: [build-linux-portable]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: alpine:3.21
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install musl build deps
+        run: apk add --no-cache build-base linux-headers zlib-dev zlib-static python3 git nodejs npm
+
+      - name: Build (ASan + LeakSanitizer, static)
+        run: |
+          SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          scripts/build.sh CC=gcc CXX=g++ STATIC=1 EXTRA_CFLAGS="$SANITIZE" EXTRA_LDFLAGS="$SANITIZE"
+
+      - name: ASan soak (15 min)
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:halt_on_error=0:log_path=soak-results/asan"
+        run: scripts/soak-test.sh build/c/codebase-memory-mcp 15
+
+      - name: Upload ASan soak metrics
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: soak-asan-linux-${{ matrix.arch }}-portable
           path: soak-results/
           retention-days: 14

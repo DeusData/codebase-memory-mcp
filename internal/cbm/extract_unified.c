@@ -4,7 +4,11 @@
 #include "helpers.h"
 #include "lang_specs.h"      // CBMLangSpec, cbm_lang_spec, CBM_LANG_*
 #include "tree_sitter/api.h" // TSNode, TSTreeCursor, ts_tree_cursor_*, ts_node_*
-#include <stdint.h>          // uint32_t, uint8_t
+#include "foundation/constants.h"
+
+enum { MAX_INFRA_BINDINGS = 8 };
+
+#include <stdint.h> // uint32_t, uint8_t
 #include <string.h>
 
 // --- Scope stack management ---
@@ -21,7 +25,7 @@ static void push_scope(WalkState *state, uint8_t kind, uint32_t depth, const cha
 
 // Pop scopes that we've ascended out of (depth >= current cursor depth).
 static void pop_expired_scopes(WalkState *state, uint32_t cur_depth) {
-    while (state->scope_top > 0 && state->scopes[state->scope_top - 1].depth >= cur_depth) {
+    while (state->scope_top > 0 && state->scopes[state->scope_top - SKIP_ONE].depth >= cur_depth) {
         state->scope_top--;
     }
 }
@@ -77,11 +81,11 @@ static const char *compute_wolfram_func_qn(CBMExtractCtx *ctx, TSNode node) {
 
 // Resolve the name node for a function, handling arrow functions.
 static TSNode resolve_func_name_node(TSNode node) {
-    TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+    TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
     if (ts_node_is_null(name_node) && strcmp(ts_node_type(node), "arrow_function") == 0) {
         TSNode parent = ts_node_parent(node);
         if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "variable_declarator") == 0) {
-            name_node = ts_node_child_by_field_name(parent, "name", 4);
+            name_node = ts_node_child_by_field_name(parent, TS_FIELD("name"));
         }
     }
     return name_node;
@@ -113,7 +117,7 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
 
 // Compute class QN for scope tracking.
 static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node) {
-    TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+    TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
     if (ts_node_is_null(name_node)) {
         return NULL;
     }
@@ -149,15 +153,15 @@ static void handle_string_constants(CBMExtractCtx *ctx, TSNode node, const WalkS
     }
 
     /* Find name (left side) and value (right side) */
-    TSNode name_node = ts_node_child_by_field_name(node, "left", 4);
-    TSNode value_node = ts_node_child_by_field_name(node, "right", 5);
+    TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("left"));
+    TSNode value_node = ts_node_child_by_field_name(node, TS_FIELD("right"));
 
     /* Some grammars use "name" + "value" fields */
     if (ts_node_is_null(name_node)) {
-        name_node = ts_node_child_by_field_name(node, "name", 4);
+        name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
     }
     if (ts_node_is_null(value_node)) {
-        value_node = ts_node_child_by_field_name(node, "value", 5);
+        value_node = ts_node_child_by_field_name(node, TS_FIELD("value"));
     }
 
     if (ts_node_is_null(name_node) || ts_node_is_null(value_node)) {
@@ -183,8 +187,8 @@ static void handle_string_constants(CBMExtractCtx *ctx, TSNode node, const WalkS
 
     /* Strip quotes from value */
     int vlen = (int)strlen(value);
-    if (vlen >= 2 && (value[0] == '"' || value[0] == '\'')) {
-        value = cbm_arena_strndup(ctx->arena, value + 1, (size_t)(vlen - 2));
+    if (vlen >= CBM_QUOTE_PAIR && (value[0] == '"' || value[0] == '\'')) {
+        value = cbm_arena_strndup(ctx->arena, value + SKIP_ONE, (size_t)(vlen - PAIR_LEN));
         if (!value) {
             return;
         }
@@ -226,9 +230,9 @@ static void handle_string_refs(CBMExtractCtx *ctx, TSNode node, const WalkState 
     /* Strip quotes if present */
     int len = (int)strlen(text);
     const char *content = text;
-    if (len >= 2 && (text[0] == '"' || text[0] == '\'')) {
-        content = text + 1;
-        len -= 2;
+    if (len >= CBM_QUOTE_PAIR && (text[0] == '"' || text[0] == '\'')) {
+        content = text + SKIP_ONE;
+        len -= PAIR_LEN;
         if (len <= 0) {
             return;
         }
@@ -268,9 +272,9 @@ static void emit_yaml_leaf_value(CBMExtractCtx *ctx, TSNode val, const char *pat
 
     int vlen = (int)strlen(val_text);
     const char *content = val_text;
-    if (vlen >= 2 && (val_text[0] == '"' || val_text[0] == '\'')) {
-        content = val_text + 1;
-        vlen -= 2;
+    if (vlen >= CBM_QUOTE_PAIR && (val_text[0] == '"' || val_text[0] == '\'')) {
+        content = val_text + SKIP_ONE;
+        vlen -= PAIR_LEN;
         if (vlen <= 0) {
             return;
         }
@@ -295,46 +299,61 @@ static void emit_yaml_leaf_value(CBMExtractCtx *ctx, TSNode val, const char *pat
     cbm_stringref_push(&ctx->result->string_refs, ctx->arena, ref);
 }
 
-static void walk_yaml_mapping(CBMExtractCtx *ctx, TSNode node, const char *prefix) {
-    uint32_t nc = ts_node_named_child_count(node);
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode child = ts_node_named_child(node, i);
-        if (strcmp(ts_node_type(child), "block_mapping_pair") != 0) {
-            continue;
-        }
+typedef struct {
+    TSNode node;
+    const char *prefix;
+} yaml_walk_frame_t;
+#define YAML_WALK_STACK_CAP CBM_SZ_256
 
-        TSNode key = ts_node_child_by_field_name(child, "key", 3);
-        if (ts_node_is_null(key)) {
-            continue;
+/* Push block_mapping children of a block_node/block_mapping value onto the walk stack. */
+static void push_yaml_block_children(TSNode val, const char *path, yaml_walk_frame_t *stack,
+                                     int *top) {
+    uint32_t vnc = ts_node_named_child_count(val);
+    for (int vi = (int)vnc - SKIP_ONE; vi >= 0 && *top < YAML_WALK_STACK_CAP; vi--) {
+        TSNode vc = ts_node_named_child(val, (uint32_t)vi);
+        const char *vctype = ts_node_type(vc);
+        if (strcmp(vctype, "block_mapping") == 0 || strcmp(vctype, "block_mapping_pair") == 0) {
+            stack[(*top)++] = (yaml_walk_frame_t){vc, path};
         }
-        char *key_text = cbm_node_text(ctx->arena, key, ctx->source);
-        if (!key_text || !key_text[0]) {
-            continue;
-        }
+    }
+}
 
-        const char *path =
-            prefix ? cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, key_text) : key_text;
+static void walk_yaml_mapping(CBMExtractCtx *ctx, TSNode root, const char *root_prefix) {
+    yaml_walk_frame_t stack[YAML_WALK_STACK_CAP];
+    int top = 0;
+    stack[top++] = (yaml_walk_frame_t){root, root_prefix};
 
-        TSNode val = ts_node_child_by_field_name(child, "value", 5);
-        if (ts_node_is_null(val)) {
-            continue;
-        }
-        const char *vk = ts_node_type(val);
-
-        if (strcmp(vk, "block_node") == 0 || strcmp(vk, "block_mapping") == 0) {
-            uint32_t vnc = ts_node_named_child_count(val);
-            for (uint32_t vi = 0; vi < vnc; vi++) {
-                TSNode vc = ts_node_named_child(val, vi);
-                const char *vctype = ts_node_type(vc);
-                if (strcmp(vctype, "block_mapping") == 0 ||
-                    strcmp(vctype, "block_mapping_pair") == 0) {
-                    walk_yaml_mapping(ctx, vc, path);
-                }
+    while (top > 0) {
+        yaml_walk_frame_t frame = stack[--top];
+        TSNode node = frame.node;
+        const char *prefix = frame.prefix;
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode child = ts_node_named_child(node, i);
+            if (strcmp(ts_node_type(child), "block_mapping_pair") != 0) {
+                continue;
             }
-            continue;
+            TSNode key = ts_node_child_by_field_name(child, TS_FIELD("key"));
+            if (ts_node_is_null(key)) {
+                continue;
+            }
+            char *key_text = cbm_node_text(ctx->arena, key, ctx->source);
+            if (!key_text || !key_text[0]) {
+                continue;
+            }
+            const char *path =
+                prefix ? cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, key_text) : key_text;
+            TSNode val = ts_node_child_by_field_name(child, TS_FIELD("value"));
+            if (ts_node_is_null(val)) {
+                continue;
+            }
+            const char *vk = ts_node_type(val);
+            if (strcmp(vk, "block_node") == 0 || strcmp(vk, "block_mapping") == 0) {
+                push_yaml_block_children(val, path, stack, &top);
+                continue;
+            }
+            emit_yaml_leaf_value(ctx, val, path);
         }
-
-        emit_yaml_leaf_value(ctx, val, path);
     }
 }
 
@@ -396,8 +415,8 @@ static char *strip_yaml_quotes(CBMArena *a, char *v) {
         return v;
     }
     int vlen = (int)strlen(v);
-    if (vlen >= 2 && (v[0] == '"' || v[0] == '\'')) {
-        return cbm_arena_strndup(a, v + 1, (size_t)(vlen - 2));
+    if (vlen >= CBM_QUOTE_PAIR && (v[0] == '"' || v[0] == '\'')) {
+        return cbm_arena_strndup(a, v + SKIP_ONE, (size_t)(vlen - PAIR_LEN));
     }
     return v;
 }
@@ -417,13 +436,13 @@ static void scan_nested_mapping_targets(CBMExtractCtx *ctx, TSNode val, const ch
             if (strcmp(ts_node_type(mp), "block_mapping_pair") != 0) {
                 continue;
             }
-            TSNode mk = ts_node_child_by_field_name(mp, "key", 3);
-            TSNode mv = ts_node_child_by_field_name(mp, "value", 5);
+            TSNode mk = ts_node_child_by_field_name(mp, TS_FIELD("key"));
+            TSNode mv = ts_node_child_by_field_name(mp, TS_FIELD("value"));
             if (ts_node_is_null(mk) || ts_node_is_null(mv)) {
                 continue;
             }
             char *mktext = cbm_node_text(ctx->arena, mk, ctx->source);
-            if (mktext && is_target_key(mktext) && *n_targets < 8) {
+            if (mktext && is_target_key(mktext) && *n_targets < MAX_INFRA_BINDINGS) {
                 char *mvtext =
                     strip_yaml_quotes(ctx->arena, cbm_node_text(ctx->arena, mv, ctx->source));
                 if (mvtext && strstr(mvtext, "://")) {
@@ -453,10 +472,10 @@ static void emit_infra_bindings(CBMExtractCtx *ctx, const char **sources, const 
 }
 
 static void scan_mapping_for_bindings(CBMExtractCtx *ctx, TSNode mapping) {
-    const char *sources[8] = {NULL};
-    const char *source_keys[8] = {NULL};
+    const char *sources[MAX_INFRA_BINDINGS] = {NULL};
+    const char *source_keys[MAX_INFRA_BINDINGS] = {NULL};
     int n_sources = 0;
-    const char *targets[8] = {NULL};
+    const char *targets[MAX_INFRA_BINDINGS] = {NULL};
     int n_targets = 0;
 
     uint32_t nc = ts_node_named_child_count(mapping);
@@ -465,8 +484,8 @@ static void scan_mapping_for_bindings(CBMExtractCtx *ctx, TSNode mapping) {
         if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
             continue;
         }
-        TSNode key = ts_node_child_by_field_name(pair, "key", 3);
-        TSNode val = ts_node_child_by_field_name(pair, "value", 5);
+        TSNode key = ts_node_child_by_field_name(pair, TS_FIELD("key"));
+        TSNode val = ts_node_child_by_field_name(pair, TS_FIELD("value"));
         if (ts_node_is_null(key) || ts_node_is_null(val)) {
             continue;
         }
@@ -478,12 +497,12 @@ static void scan_mapping_for_bindings(CBMExtractCtx *ctx, TSNode mapping) {
         const char *vtype = ts_node_type(val);
         if (strcmp(vtype, "block_node") != 0 && strcmp(vtype, "block_mapping") != 0) {
             char *v = strip_yaml_quotes(ctx->arena, cbm_node_text(ctx->arena, val, ctx->source));
-            if (is_source_key(k) && n_sources < 8) {
+            if (is_source_key(k) && n_sources < MAX_INFRA_BINDINGS) {
                 sources[n_sources] = v;
                 source_keys[n_sources] = k;
                 n_sources++;
             }
-            if (is_target_key(k) && n_targets < 8 && v && strstr(v, "://")) {
+            if (is_target_key(k) && n_targets < MAX_INFRA_BINDINGS && v && strstr(v, "://")) {
                 targets[n_targets++] = v;
             }
         } else {
@@ -494,19 +513,20 @@ static void scan_mapping_for_bindings(CBMExtractCtx *ctx, TSNode mapping) {
     emit_infra_bindings(ctx, sources, source_keys, n_sources, targets, n_targets);
 }
 
-/* Walk a YAML block_sequence looking for list items with infra bindings */
-static void scan_yaml_for_infra_bindings(CBMExtractCtx *ctx, TSNode node) {
-    const char *kind = ts_node_type(node);
-
-    /* List items are block_sequence → block_sequence_item → block_mapping */
-    if (strcmp(kind, "block_mapping") == 0) {
-        scan_mapping_for_bindings(ctx, node);
-    }
-
-    /* Recurse into children */
-    uint32_t nc = ts_node_named_child_count(node);
-    for (uint32_t i = 0; i < nc; i++) {
-        scan_yaml_for_infra_bindings(ctx, ts_node_named_child(node, i));
+#define INFRA_SCAN_STACK_CAP CBM_SZ_512
+static void scan_yaml_for_infra_bindings(CBMExtractCtx *ctx, TSNode root) {
+    TSNode stack[INFRA_SCAN_STACK_CAP];
+    int top = 0;
+    stack[top++] = root;
+    while (top > 0) {
+        TSNode node = stack[--top];
+        if (strcmp(ts_node_type(node), "block_mapping") == 0) {
+            scan_mapping_for_bindings(ctx, node);
+        }
+        uint32_t nc = ts_node_named_child_count(node);
+        for (int i = (int)nc - SKIP_ONE; i >= 0 && top < INFRA_SCAN_STACK_CAP; i--) {
+            stack[top++] = ts_node_named_child(node, (uint32_t)i);
+        }
     }
 }
 
@@ -537,7 +557,7 @@ static void scan_hcl_nested_block_targets(CBMExtractCtx *ctx, TSNode block, cons
             continue;
         }
         TSNode bkey = ts_node_named_child(bchild, 0);
-        TSNode bval = ts_node_named_child(bchild, 1);
+        TSNode bval = ts_node_named_child(bchild, SKIP_ONE);
         if (ts_node_is_null(bkey) || ts_node_is_null(bval)) {
             continue;
         }
@@ -546,17 +566,17 @@ static void scan_hcl_nested_block_targets(CBMExtractCtx *ctx, TSNode block, cons
             continue;
         }
         char *bv = extract_hcl_string_val(ctx->arena, bval, ctx->source);
-        if (bv && strstr(bv, "://") && *n_targets < 8) {
+        if (bv && strstr(bv, "://") && *n_targets < MAX_INFRA_BINDINGS) {
             targets[(*n_targets)++] = bv;
         }
     }
 }
 
 static void scan_hcl_block_for_bindings(CBMExtractCtx *ctx, TSNode block) {
-    const char *sources[8] = {NULL};
-    const char *source_keys[8] = {NULL};
+    const char *sources[MAX_INFRA_BINDINGS] = {NULL};
+    const char *source_keys[MAX_INFRA_BINDINGS] = {NULL};
     int n_sources = 0;
-    const char *targets[8] = {NULL};
+    const char *targets[MAX_INFRA_BINDINGS] = {NULL};
     int n_targets = 0;
 
     uint32_t nc = ts_node_named_child_count(block);
@@ -566,7 +586,7 @@ static void scan_hcl_block_for_bindings(CBMExtractCtx *ctx, TSNode block) {
 
         if (strcmp(ck, "attribute") == 0) {
             TSNode key_node = ts_node_named_child(child, 0);
-            TSNode val_node = ts_node_named_child(child, 1);
+            TSNode val_node = ts_node_named_child(child, SKIP_ONE);
             if (ts_node_is_null(key_node) || ts_node_is_null(val_node)) {
                 continue;
             }
@@ -580,12 +600,12 @@ static void scan_hcl_block_for_bindings(CBMExtractCtx *ctx, TSNode block) {
                 continue;
             }
 
-            if (is_source_key(key) && n_sources < 8) {
+            if (is_source_key(key) && n_sources < MAX_INFRA_BINDINGS) {
                 sources[n_sources] = val;
                 source_keys[n_sources] = key;
                 n_sources++;
             }
-            if (is_target_key(key) && n_targets < 8 && strstr(val, "://")) {
+            if (is_target_key(key) && n_targets < MAX_INFRA_BINDINGS && strstr(val, "://")) {
                 targets[n_targets++] = val;
             }
         } else if (strcmp(ck, "block") == 0) {
@@ -649,7 +669,7 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
             push_scope(state, SCOPE_CLASS, depth, cqn);
         }
     } else if (ctx->language == CBM_LANG_RUST && strcmp(ts_node_type(node), "impl_item") == 0) {
-        TSNode type_node = ts_node_child_by_field_name(node, "type", 4);
+        TSNode type_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
         if (!ts_node_is_null(type_node)) {
             char *type_name = cbm_node_text(ctx->arena, type_node, ctx->source);
             if (type_name && type_name[0]) {

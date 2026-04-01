@@ -9,6 +9,22 @@
  *
  * Depends on: pass_calls having populated CALLS edges
  */
+#include "foundation/constants.h"
+
+enum {
+    PT_RING = 4,
+    PT_RING_MASK = 3,
+    PT_TEST_LEN = 4,      /* strlen("Test") */
+    PT_DESCRIBE_LEN = 9,  /* strlen("Describe") + 1... actually strlen("describe_") */
+    PT_CONTEXT_LEN = 7,   /* strlen("context") */
+    PT_SUFFIX_LEN = 8,    /* strlen("_test.go") */
+    PT_EXT_PY = 3,        /* strlen(".py") / strlen(".go") */
+    PT_PYTEST_PREFIX = 5, /* strlen("test_") */
+    PT_SEARCH_COUNT = 2,  /* number of search passes */
+    PT_FOUND_SKIP = 5,    /* strlen("_test") + 1 or strlen("_spec") + 1 */
+};
+
+#define SLEN(s) (sizeof(s) - 1)
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
@@ -19,10 +35,10 @@
 #include <string.h>
 
 static const char *itoa_log(int val) {
-    static char bufs[4][32];
+    static char bufs[PT_RING][CBM_SZ_32];
     static int idx = 0;
     int i = idx;
-    idx = (idx + 1) & 3;
+    idx = (idx + SKIP_ONE) & PT_RING_MASK;
     snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
     return bufs[i];
 }
@@ -47,11 +63,11 @@ bool cbm_is_test_path(const char *path) {
         return false;
     }
     const char *base = strrchr(path, '/');
-    base = base ? base + 1 : path;
+    base = base ? base + SKIP_ONE : path;
     size_t len = strlen(path);
 
     /* Prefix-based: Python test_*.py */
-    if (strncmp(base, "test_", 5) == 0) {
+    if (strncmp(base, "test_", SLEN("test_")) == 0) {
         return true;
     }
 
@@ -81,8 +97,9 @@ bool cbm_is_test_path(const char *path) {
         return true;
     }
     /* Also match if path STARTS with these directories */
-    if (strncmp(path, "tests/", 6) == 0 || strncmp(path, "test/", 5) == 0 ||
-        strncmp(path, "spec/", 5) == 0 || strncmp(path, "__tests__/", 10) == 0) {
+    if (strncmp(path, "tests/", SLEN("tests/")) == 0 ||
+        strncmp(path, "test/", SLEN("test/")) == 0 || strncmp(path, "spec/", SLEN("spec/")) == 0 ||
+        strncmp(path, "__tests__/", SLEN("__tests__/")) == 0) {
         return true;
     }
 
@@ -101,22 +118,26 @@ bool cbm_is_test_func_name(const char *name) {
     }
     /* Go: Test/Benchmark/Example + uppercase letter or end-of-string.
      * "TestFoo" = test, "Testable" = not test (lowercase after prefix). */
-    if (strncmp(name, "Test", 4) == 0 && (name[4] == '\0' || (name[4] >= 'A' && name[4] <= 'Z'))) {
+    if (strncmp(name, "Test", SLEN("Test")) == 0 &&
+        (name[PT_TEST_LEN] == '\0' || (name[PT_TEST_LEN] >= 'A' && name[PT_TEST_LEN] <= 'Z'))) {
         return true;
     }
-    if (strncmp(name, "Benchmark", 9) == 0 &&
-        (name[9] == '\0' || (name[9] >= 'A' && name[9] <= 'Z'))) {
+    if (strncmp(name, "Benchmark", SLEN("Benchmark")) == 0 &&
+        (name[PT_DESCRIBE_LEN] == '\0' ||
+         (name[PT_DESCRIBE_LEN] >= 'A' && name[PT_DESCRIBE_LEN] <= 'Z'))) {
         return true;
     }
-    if (strncmp(name, "Example", 7) == 0 &&
-        (name[7] == '\0' || (name[7] >= 'A' && name[7] <= 'Z'))) {
+    if (strncmp(name, "Example", SLEN("Example")) == 0 &&
+        (name[PT_CONTEXT_LEN] == '\0' ||
+         (name[PT_CONTEXT_LEN] >= 'A' && name[PT_CONTEXT_LEN] <= 'Z'))) {
         return true;
     }
     /* Python/Rust/C++/Lua/Java: test_ or test prefix (lowercase) */
-    if (strncmp(name, "test_", 5) == 0) {
+    if (strncmp(name, "test_", SLEN("test_")) == 0) {
         return true;
     }
-    if (strncmp(name, "test", 4) == 0 && name[4] >= 'A' && name[4] <= 'Z') {
+    if (strncmp(name, "test", SLEN("test")) == 0 && name[PT_TEST_LEN] >= 'A' &&
+        name[PT_TEST_LEN] <= 'Z') {
         return true;
     }
     /* JS/TS: test/it/describe + lifecycle hooks */
@@ -135,15 +156,15 @@ bool cbm_is_test_func_name(const char *name) {
 /* Assemble dir/name+ext into a heap-allocated path. */
 static char *build_path(const char *test_path, size_t dir_len, const char *name, size_t name_len,
                         const char *ext, size_t ext_len) {
-    char *result = malloc(dir_len + 1 + name_len + ext_len + 1);
+    char *result = malloc(dir_len + SKIP_ONE + name_len + ext_len + SKIP_ONE);
     if (dir_len > 0) {
         memcpy(result, test_path, dir_len);
         result[dir_len] = '/';
-        memcpy(result + dir_len + 1, name, name_len);
-        memcpy(result + dir_len + 1 + name_len, ext, ext_len + 1);
+        memcpy(result + dir_len + SKIP_ONE, name, name_len);
+        memcpy(result + dir_len + SKIP_ONE + name_len, ext, ext_len + SKIP_ONE);
     } else {
         memcpy(result, name, name_len);
-        memcpy(result + name_len, ext, ext_len + 1);
+        memcpy(result + name_len, ext, ext_len + SKIP_ONE);
     }
     return result;
 }
@@ -157,28 +178,29 @@ static char *test_to_prod_path(const char *test_path) {
 
     const char *base = strrchr(test_path, '/');
     size_t dir_len = base ? (size_t)(base - test_path) : 0;
-    base = base ? base + 1 : test_path;
+    base = base ? base + SKIP_ONE : test_path;
 
     /* Go: foo_test.go → foo.go */
     const char *suffix = strstr(base, "_test.go");
-    if (suffix && suffix[8] == '\0') {
-        return build_path(test_path, dir_len, base, (size_t)(suffix - base), ".go", 3);
+    if (suffix && suffix[PT_SUFFIX_LEN] == '\0') {
+        return build_path(test_path, dir_len, base, (size_t)(suffix - base), ".go", PT_EXT_PY);
     }
 
     /* Python: test_foo.py → foo.py */
-    if (strncmp(base, "test_", 5) == 0) {
+    if (strncmp(base, "test_", SLEN("test_")) == 0) {
         const char *ext = strstr(base, ".py");
-        if (ext && ext[3] == '\0') {
-            return build_path(test_path, dir_len, base + 5, (size_t)(ext - base - 5), ".py", 3);
+        if (ext && ext[PT_EXT_PY] == '\0') {
+            return build_path(test_path, dir_len, base + PT_PYTEST_PREFIX,
+                              (size_t)(ext - base - PT_PYTEST_PREFIX), ".py", PT_EXT_PY);
         }
     }
 
     /* JS/TS: foo.test.ts → foo.ts, foo.spec.ts → foo.ts */
-    for (int s = 0; s < 2; s++) {
+    for (int s = 0; s < PT_SEARCH_COUNT; s++) {
         const char *pat = s == 0 ? ".test." : ".spec.";
         const char *found = strstr(base, pat);
         if (found) {
-            const char *ext = found + 5;
+            const char *ext = found + PT_FOUND_SKIP;
             return build_path(test_path, dir_len, base, (size_t)(found - base), ext, strlen(ext));
         }
     }

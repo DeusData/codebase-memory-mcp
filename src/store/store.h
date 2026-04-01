@@ -535,8 +535,9 @@ void cbm_store_adr_free(cbm_adr_t *adr);
 /* ADR section parsing/rendering (pure functions, no store needed) */
 
 typedef struct {
-    char *keys[16];
-    char *values[16];
+    enum { PROPS_MAX = 16 };
+    char *keys[PROPS_MAX];
+    char *values[PROPS_MAX];
     int count;
 } cbm_adr_sections_t;
 

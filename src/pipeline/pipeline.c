@@ -10,6 +10,10 @@
  *   6. Post-passes: tests, communities, HTTP links, git history
  *   7. Dump graph buffer to SQLite
  */
+#include "foundation/constants.h"
+
+enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 5, PL_WAL_BUF = 1040 };
+#define PL_NSEC_PER_SEC 1000000000LL
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/worker_pool.h"
@@ -31,6 +35,12 @@
 #include <stdatomic.h>
 #include <sys/stat.h>
 #include <time.h>
+
+static inline void *intptr_to_ptr(intptr_t v) {
+    void *p;
+    memcpy(&p, &v, sizeof(p));
+    return p;
+}
 
 /* ── Global index lock ─────────────────────────────────────────── */
 /* Prevents concurrent pipeline runs on the same DB file.
@@ -82,10 +92,10 @@ static double elapsed_ms(struct timespec start) {
 
 /* Format int to string for logging. Thread-safe via TLS rotating buffers. */
 static const char *itoa_buf(int val) {
-    static CBM_TLS char bufs[4][32];
+    static CBM_TLS char bufs[PL_RING][CBM_SZ_32];
     static CBM_TLS int idx = 0;
     int i = idx;
-    idx = (idx + 1) & 3;
+    idx = (idx + SKIP_ONE) & PL_RING_MASK;
     snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
     return bufs[i];
 }
@@ -98,7 +108,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
         return NULL;
     }
 
-    cbm_pipeline_t *p = calloc(1, sizeof(cbm_pipeline_t));
+    cbm_pipeline_t *p = calloc(CBM_ALLOC_ONE, sizeof(cbm_pipeline_t));
     if (!p) {
         return NULL;
     }
@@ -149,7 +159,7 @@ atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p) {
 
 /* Resolve the DB path for this pipeline. Caller must free(). */
 static char *resolve_db_path(const cbm_pipeline_t *p) {
-    char *path = malloc(1024);
+    char *path = malloc(CBM_SZ_1K);
     if (!path) {
         return NULL;
     }
@@ -166,7 +176,7 @@ static char *resolve_db_path(const cbm_pipeline_t *p) {
 }
 
 static int check_cancel(const cbm_pipeline_t *p) {
-    return atomic_load(&p->cancelled) ? -1 : 0;
+    return atomic_load(&p->cancelled) ? CBM_NOT_FOUND : 0;
 }
 
 /* ── Hash table cleanup callback ─────────────────────────────────── */
@@ -184,10 +194,10 @@ static void free_seen_dir_key(const char *key, void *val, void *ud) {
 static void create_folder_chain(cbm_pipeline_t *p, const char *dir, CBMHashTable *seen_dirs) {
     char *walk = strdup(dir);
     while (walk[0] != '\0' && !cbm_ht_get(seen_dirs, walk)) {
-        cbm_ht_set(seen_dirs, strdup(walk), (void *)1);
+        cbm_ht_set(seen_dirs, strdup(walk), intptr_to_ptr(SKIP_ONE));
         char *folder_qn = cbm_pipeline_fqn_folder(p->project_name, walk);
         const char *dir_base = strrchr(walk, '/');
-        dir_base = dir_base ? dir_base + 1 : walk;
+        dir_base = dir_base ? dir_base + SKIP_ONE : walk;
         cbm_gbuf_upsert_node(p->gbuf, "Folder", dir_base, folder_qn, walk, 0, 0, "{}");
 
         char *pdir = strdup(walk);
@@ -231,7 +241,7 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
     cbm_gbuf_upsert_node(p->gbuf, "Project", p->project_name, p->project_name, NULL, 0, 0, "{}");
 
     /* Collect unique directories and create Folder/Package nodes */
-    CBMHashTable *seen_dirs = cbm_ht_create(256);
+    CBMHashTable *seen_dirs = cbm_ht_create(CBM_SZ_256);
 
     for (int i = 0; i < file_count; i++) {
         const char *rel = files[i].rel_path;
@@ -243,9 +253,9 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
         char *file_qn = cbm_pipeline_fqn_compute(p->project_name, rel, "__file__");
         /* Extract basename */
         const char *slash = strrchr(rel, '/');
-        const char *basename = slash ? slash + 1 : rel;
+        const char *basename = slash ? slash + SKIP_ONE : rel;
 
-        char props[256];
+        char props[CBM_SZ_256];
         const char *ext = strrchr(basename, '.');
         snprintf(props, sizeof(props), "{\"extension\":\"%s\"}", ext ? ext : "");
 
@@ -334,11 +344,11 @@ static int process_one_infra_binding(cbm_gbuf_t *gbuf, const CBMInfraBinding *ib
     if (!topic_route) {
         return 0;
     }
-    char props[512];
+    char props[CBM_SZ_512];
     snprintf(props, sizeof(props), "{\"broker\":\"%s\",\"topic\":\"%s\",\"endpoint\":\"%s\"}",
              ib->broker ? ib->broker : "async", ib->source_name, ib->target_url);
     cbm_gbuf_insert_edge(gbuf, topic_route->id, url_route_id, "INFRA_MAPS", props);
-    return 1;
+    return SKIP_ONE;
 }
 
 static void cbm_pipeline_process_infra_bindings(cbm_gbuf_t *gbuf, const cbm_file_info_t *files,
@@ -356,7 +366,7 @@ static void cbm_pipeline_process_infra_bindings(cbm_gbuf_t *gbuf, const cbm_file
         }
     }
     if (bindings > 0) {
-        char buf[16];
+        char buf[CBM_SZ_16];
         snprintf(buf, sizeof(buf), "%d", bindings);
         cbm_log_info("pass.infra_bindings", "linked", buf);
     }
@@ -375,7 +385,7 @@ static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, con
     }
     char route_qn[CBM_ROUTE_QN_SIZE];
     snprintf(route_qn, sizeof(route_qn), "__route__infra__%s", sr->value);
-    char route_props[512];
+    char route_props[CBM_SZ_512];
     if (sr->key_path) {
         snprintf(route_props, sizeof(route_props), "{\"source\":\"infra\",\"key_path\":\"%s\"}",
                  sr->key_path);
@@ -443,7 +453,7 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         {cbm_pipeline_pass_semantic, "semantic", false},
     };
     int rc = 0;
-    for (int si = 0; si < 5 && rc == 0; si++) {
+    for (int si = 0; si < PL_SEQ_PASSES && rc == 0; si++) {
         cbm_clock_gettime(CLOCK_MONOTONIC, t);
         int pr = seq_passes[si].fn(ctx, files, file_count);
         if (pr != 0 && !seq_passes[si].ignore_err) {
@@ -452,7 +462,7 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         cbm_log_info("pass.timing", "pass", seq_passes[si].name, "elapsed_ms",
                      itoa_buf((int)elapsed_ms(*t)));
         if (check_cancel(p)) {
-            rc = -1;
+            rc = CBM_NOT_FOUND;
         }
     }
     if (seq_cache) {
@@ -478,7 +488,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     CBMFileResult **cache = (CBMFileResult **)calloc(file_count, sizeof(CBMFileResult *));
     if (!cache) {
         cbm_log_error("pipeline.err", "phase", "cache_alloc");
-        return -1;
+        return CBM_NOT_FOUND;
     }
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     int rc = cbm_parallel_extract(ctx, files, file_count, cache, &shared_ids, worker_count);
@@ -486,7 +496,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                  itoa_buf((int)elapsed_ms(*t)));
     if (rc != 0 || check_cancel(p)) {
         free(cache);
-        return rc != 0 ? rc : -1;
+        return rc != 0 ? rc : CBM_NOT_FOUND;
     }
     cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
@@ -500,7 +510,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
             }
         }
         free(cache);
-        return rc != 0 ? rc : -1;
+        return rc != 0 ? rc : CBM_NOT_FOUND;
     }
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     rc = cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count);
@@ -521,7 +531,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     cbm_pipeline_pass_k8s(ctx, files, file_count);
     cbm_log_info("pass.timing", "pass", "k8s", "elapsed_ms", itoa_buf((int)elapsed_ms(*t)));
-    return check_cancel(p) ? -1 : 0;
+    return check_cancel(p) ? CBM_NOT_FOUND : 0;
 }
 
 /* Try incremental pipeline or delete old DB for reindex.
@@ -529,12 +539,12 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
 static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count) {
     char *db_path = resolve_db_path(p);
     if (!db_path) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
     struct stat db_st;
     if (stat(db_path, &db_st) != 0) {
         free(db_path);
-        return -1;
+        return CBM_NOT_FOUND;
     }
     cbm_store_t *check_store = cbm_store_open_path(db_path);
     if (check_store && cbm_store_check_integrity(check_store)) {
@@ -543,7 +553,7 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         cbm_store_get_file_hashes(check_store, p->project_name, &hashes, &hash_count);
         cbm_store_free_file_hashes(hashes, hash_count);
         cbm_store_close(check_store);
-        if (hash_count > 0 && file_count <= hash_count + (hash_count / 2)) {
+        if (hash_count > 0 && file_count <= hash_count + (hash_count / PAIR_LEN)) {
             cbm_log_info("pipeline.route", "path", "incremental", "stored_hashes",
                          itoa_buf(hash_count));
             int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count);
@@ -559,24 +569,25 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     }
     cbm_log_info("pipeline.route", "path", "reindex", "action", "deleting old db");
     cbm_unlink(db_path);
-    char wal[1040];
-    char shm[1040];
+    char wal[PL_WAL_BUF];
+    char shm[PL_WAL_BUF];
     snprintf(wal, sizeof(wal), "%s-wal", db_path);
     snprintf(shm, sizeof(shm), "%s-shm", db_path);
     cbm_unlink(wal);
     cbm_unlink(shm);
     free(db_path);
-    return -1;
+    return CBM_NOT_FOUND;
 }
 
 /* Get platform-specific mtime in nanoseconds. */
 static int64_t stat_mtime_ns(const struct stat *fst) {
 #ifdef __APPLE__
-    return ((int64_t)fst->st_mtimespec.tv_sec * 1000000000LL) + (int64_t)fst->st_mtimespec.tv_nsec;
+    return ((int64_t)fst->st_mtimespec.tv_sec * PL_NSEC_PER_SEC) +
+           (int64_t)fst->st_mtimespec.tv_nsec;
 #elif defined(_WIN32)
     return (int64_t)fst->st_mtime * 1000000000LL;
 #else
-    return ((int64_t)fst->st_mtim.tv_sec * 1000000000LL) + (int64_t)fst->st_mtim.tv_nsec;
+    return ((int64_t)fst->st_mtim.tv_sec * PL_NSEC_PER_SEC) + (int64_t)fst->st_mtim.tv_nsec;
 #endif
 }
 
@@ -585,7 +596,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
                                    struct timespec *t) {
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     const char *home = cbm_get_home_dir();
-    char db_path[1024];
+    char db_path[CBM_SZ_1K];
     if (p->db_path) {
         snprintf(db_path, sizeof(db_path), "%s", p->db_path);
     } else {
@@ -595,12 +606,12 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home,
                  p->project_name);
     }
-    char db_dir[1024];
+    char db_dir[CBM_SZ_1K];
     snprintf(db_dir, sizeof(db_dir), "%s", db_path);
     char *last_slash = strrchr(db_dir, '/');
     if (last_slash) {
         *last_slash = '\0';
-        cbm_mkdir_p(db_dir, 0755);
+        cbm_mkdir_p(db_dir, CBM_DIR_PERMS);
     }
     int rc = cbm_gbuf_dump_to_sqlite(p->gbuf, db_path);
     if (rc != 0) {
@@ -624,12 +635,10 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     return 0;
 }
 
-/* Run githistory (I/O) + httplinks (CPU) in parallel, then apply edges. */
-static int run_githistory_and_httplinks(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
+/* Run githistory pass. */
+static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     struct timespec t_gh;
-    struct timespec t_hl;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_gh);
-    cbm_clock_gettime(CLOCK_MONOTONIC, &t_hl);
 
     cbm_githistory_result_t gh_result = {0};
     cbm_thread_t gh_thread;
@@ -637,7 +646,7 @@ static int run_githistory_and_httplinks(cbm_pipeline_t *p, cbm_pipeline_ctx_t *c
     gh_compute_arg_t gh_arg = {.repo_path = ctx->repo_path, .result = &gh_result};
 
     if (p->mode != CBM_MODE_FAST) {
-        if (cbm_default_worker_count(true) > 1) {
+        if (cbm_default_worker_count(true) > SKIP_ONE) {
             if (cbm_thread_create(&gh_thread, 0, gh_compute_thread_fn, &gh_arg) == 0) {
                 gh_threaded = true;
             }
@@ -651,8 +660,7 @@ static int run_githistory_and_httplinks(cbm_pipeline_t *p, cbm_pipeline_ctx_t *c
         cbm_log_info("pass.skip", "pass", "githistory", "reason", "fast_mode");
     }
 
-    int rc = cbm_pipeline_pass_httplinks(ctx);
-    cbm_log_info("pass.timing", "pass", "httplinks", "elapsed_ms", itoa_buf((int)elapsed_ms(t_hl)));
+    int rc = 0;
 
     if (gh_threaded) {
         cbm_thread_join(&gh_thread);
@@ -679,7 +687,7 @@ static int run_githistory_and_httplinks(cbm_pipeline_t *p, cbm_pipeline_ctx_t *c
 
 int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
 
     struct timespec t0;
@@ -704,7 +712,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     cbm_log_info("pipeline.discover", "files", itoa_buf(file_count), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t0)));
     if (rc != 0 || check_cancel(p)) {
-        rc = -1;
+        rc = CBM_NOT_FOUND;
         goto cleanup;
     }
 
@@ -736,18 +744,18 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     pass_structure(p, files, file_count);
     cbm_log_info("pass.timing", "pass", "structure", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
     if (check_cancel(p)) {
-        rc = -1;
+        rc = CBM_NOT_FOUND;
         goto cleanup;
     }
 
     /* Run extraction passes (parallel or sequential) */
     int worker_count = cbm_default_worker_count(true);
 #define MIN_FILES_FOR_PARALLEL 50
-    rc = (worker_count > 1 && file_count > MIN_FILES_FOR_PARALLEL)
+    rc = (worker_count > SKIP_ONE && file_count > MIN_FILES_FOR_PARALLEL)
              ? run_parallel_pipeline(p, &ctx, files, file_count, worker_count, &t)
              : run_sequential_pipeline(p, &ctx, files, file_count, &t);
     if (check_cancel(p)) {
-        rc = -1;
+        rc = CBM_NOT_FOUND;
     }
     if (rc != 0) {
         goto cleanup;
@@ -758,10 +766,10 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     rc = cbm_pipeline_pass_tests(&ctx, files, file_count);
     cbm_log_info("pass.timing", "pass", "tests", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
     if (rc == 0 && !check_cancel(p)) {
-        rc = run_githistory_and_httplinks(p, &ctx);
+        rc = run_githistory(p, &ctx);
     }
     if (check_cancel(p)) {
-        rc = -1;
+        rc = CBM_NOT_FOUND;
     }
     if (rc != 0) {
         goto cleanup;

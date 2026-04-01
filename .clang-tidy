@@ -3,31 +3,8 @@
 # ALL checks enabled. WarningsAsErrors: '*'.
 # Check thresholds configured for idiomatic C11 (not C++).
 #
-# Globally disabled checks must have an upstream bug reference or
-# architectural justification. Re-evaluate on LLVM upgrades.
-#
-# Documented LLVM false positives:
-#   bugprone-multi-level-implicit-pointer-conversion  — LLVM #93959, relaxed in LLVM 19
-#   clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling — LLVM #64027
-#   clang-analyzer-optin.portability.UnixAPI — malloc(0) behavior, guarded in code
-#
-# Architectural:
-#   bugprone-command-processor — popen required for git, inputs validated
-#   cert-env33-c — popen/system needed for git commands, inputs validated
-#
-# Pending fix (phases 4-6):
-#   bugprone-easily-swappable-parameters — Phase 5: struct params
-#   concurrency-mt-unsafe — Phase 4: thread-safe wrappers
-#   cert-err33-c — Phase 4: check fwrite/fseek return values
-#   performance-no-int-to-ptr — Phase 4: union type-punning
-#   bugprone-branch-clone — Phase 6
-#   readability-avoid-nested-conditional-operator — Phase 6
-#   readability-redundant-casting — Phase 6
-#   bugprone-implicit-widening-of-multiplication-result — Phase 6
-#   bugprone-unchecked-string-to-number-conversion — Phase 6
-#   clang-analyzer-core.CallAndMessage — Phase 6
-#   clang-analyzer-core.NullPointerArithm — Phase 6
-#   clang-analyzer-security.insecureAPI.strcpy — Phase 6
+# Only C++ idiom checks and confirmed LLVM false positives are disabled.
+# Everything else must be fixed in code.
 
 Checks: >
   -*,
@@ -41,41 +18,20 @@ Checks: >
   portability-*,
   readability-*,
   clang-analyzer-*,
-  -misc-no-recursion,
-  -readability-implicit-bool-conversion,
   -bugprone-multi-level-implicit-pointer-conversion,
+  -readability-implicit-bool-conversion,
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
-  -clang-analyzer-optin.portability.UnixAPI,
   -clang-analyzer-security.ArrayBound,
-  -clang-analyzer-unix.Malloc,
-  -misc-include-cleaner,
-  -bugprone-command-processor,
-  -bugprone-suspicious-include,
-  -cert-env33-c,
-  -bugprone-easily-swappable-parameters,
-  -concurrency-mt-unsafe,
-  -cert-err33-c,
-  -performance-no-int-to-ptr,
-  -bugprone-branch-clone,
-  -readability-avoid-nested-conditional-operator,
-  -readability-redundant-casting,
-  -bugprone-implicit-widening-of-multiplication-result,
-  -bugprone-unchecked-string-to-number-conversion,
-  -clang-analyzer-core.CallAndMessage,
-  -clang-analyzer-core.NullPointerArithm,
-  -clang-analyzer-security.insecureAPI.strcpy,
 
 WarningsAsErrors: '*'
 
 CheckOptions:
-  bugprone-implicit-widening-of-multiplication-result.UseCXXStaticCastsInCppSources: false
   readability-identifier-length.MinimumVariableNameLength: 1
   readability-identifier-length.MinimumParameterNameLength: 1
   readability-identifier-length.MinimumLoopCounterNameLength: 1
-  readability-implicit-bool-conversion.AllowIntegerConditions: true
-  readability-implicit-bool-conversion.AllowPointerConditions: true
-  readability-magic-numbers.IgnoredIntegerValues: "1;2;3;4;5;6;7;8;9;10;11;12;14;15;16;20;24;32;48;64;100;128;200;256;493;512;755;1000;1024;1040;2048;4096;8192;16384;32768;65536;500000;1000000;1000000000"
-  readability-magic-numbers.IgnoredFloatingPointValues: "0.0;0.25;0.5;0.7;0.75;0.8;0.85;0.9;0.95;1.0;2.0;100.0;1e308"
+  readability-magic-numbers.IgnoredIntegerValues: ""
+  readability-magic-numbers.IgnoredFloatingPointValues: ""
+  bugprone-easily-swappable-parameters.MinimumLength: 3
   readability-function-cognitive-complexity.Threshold: 25
   readability-function-size.StatementThreshold: 200
   readability-function-size.LineThreshold: 400
