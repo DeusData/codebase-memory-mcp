@@ -208,8 +208,11 @@ void cbm_watcher_free(cbm_watcher_t *w) {
     if (!w) {
         return;
     }
+    cbm_mutex_lock(&w->projects_mu);
     cbm_ht_foreach(w->projects, free_state_entry, NULL);
     cbm_ht_free(w->projects);
+    w->projects = NULL;
+    cbm_mutex_unlock(&w->projects_mu);
     cbm_mutex_destroy(&w->projects_mu);
     free(w);
 }
@@ -237,6 +240,11 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
     }
 
     project_state_t *s = state_new(project_name, root_path);
+    if (!s) {
+        cbm_mutex_unlock(&w->projects_mu);
+        cbm_log_warn("watcher.watch.oom", "project", project_name);
+        return;
+    }
     cbm_ht_set(w->projects, s->project_name, s);
     cbm_mutex_unlock(&w->projects_mu);
     cbm_log_info("watcher.watch", "project", project_name, "path", root_path);
@@ -271,11 +279,14 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name) {
     cbm_mutex_unlock(&w->projects_mu);
 }
 
-int cbm_watcher_watch_count(const cbm_watcher_t *w) {
+int cbm_watcher_watch_count(cbm_watcher_t *w) {
     if (!w) {
         return 0;
     }
-    return (int)cbm_ht_count(w->projects);
+    cbm_mutex_lock(&w->projects_mu);
+    int count = (int)cbm_ht_count(w->projects);
+    cbm_mutex_unlock(&w->projects_mu);
+    return count;
 }
 
 /* ── Single poll cycle ──────────────────────────────────────────── */
