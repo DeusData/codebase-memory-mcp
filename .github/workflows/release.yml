@@ -24,9 +24,7 @@ on:
         default: 'quick'
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
   # ── 1. Lint + Security + CodeQL ────────────────────────────────
