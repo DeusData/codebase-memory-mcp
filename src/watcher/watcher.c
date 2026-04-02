@@ -406,6 +406,10 @@ int cbm_watcher_poll_once(cbm_watcher_t *w) {
         .now = now_ns(),
         .reindexed = 0,
     };
+    /* NOTE: holds projects_mu across the foreach, which includes slow git
+     * commands and index_fn.  This is acceptable because watch/unwatch/touch
+     * are rare (MCP-request-driven) and index_fn must NOT call back into
+     * watcher APIs.  If that contract changes, switch to a snapshot approach. */
     cbm_mutex_lock(&w->projects_mu);
     cbm_ht_foreach(w->projects, poll_project, &ctx);
     cbm_mutex_unlock(&w->projects_mu);
