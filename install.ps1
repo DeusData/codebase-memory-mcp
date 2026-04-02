@@ -75,7 +75,7 @@ try {
 
 # Extract
 Write-Host "Extracting..."
-Expand-Archive -Path "$TmpDir\$Archive" -DestinationPath $TmpDir -Force
+Expand-Archive -Path "$TmpDir\$Archive" -OutputPath $TmpDir -Force
 
 $DlBin = Join-Path $TmpDir $BinName
 if (-not (Test-Path $DlBin)) {
