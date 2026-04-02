@@ -294,7 +294,9 @@ static const tool_def_t TOOLS[] = {
      "with arg expressions. cross_service: follow HTTP_CALLS+ASYNC_CALLS+DATA_FLOWS through "
      "Routes.\"},\"parameter_name\":{\"type\":\"string\",\"description\":\"For data_flow mode: "
      "scope trace to a specific parameter name\"},\"edge_types\":{\"type\":\"array\",\"items\":{"
-     "\"type\":\"string\"}}},\"required\":[\"function_name\",\"project\"]}"},
+     "\"type\":\"string\"}},\"risk_labels\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"Add risk classification (CRITICAL/HIGH/MEDIUM/LOW) based on hop distance"
+     "\"}},\"required\":[\"function_name\",\"project\"]}"},
 
     {"get_code_snippet",
      "Read source code for a function/class/symbol. IMPORTANT: First call search_graph to find the "
@@ -1312,7 +1314,8 @@ static yyjson_doc *resolve_trace_edge_types(const char *args, const char *mode,
 }
 
 /* Convert BFS traversal results into a yyjson_mut array of {name, qualified_name, hop}. */
-static yyjson_mut_val *bfs_to_json_array(yyjson_mut_doc *doc, cbm_traverse_result_t *tr) {
+static yyjson_mut_val *bfs_to_json_array(yyjson_mut_doc *doc, cbm_traverse_result_t *tr,
+                                         bool risk_labels) {
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
     for (int i = 0; i < tr->visited_count; i++) {
         yyjson_mut_val *item = yyjson_mut_obj(doc);
@@ -1322,6 +1325,10 @@ static yyjson_mut_val *bfs_to_json_array(yyjson_mut_doc *doc, cbm_traverse_resul
             doc, item, "qualified_name",
             tr->visited[i].node.qualified_name ? tr->visited[i].node.qualified_name : "");
         yyjson_mut_obj_add_int(doc, item, "hop", tr->visited[i].hop);
+        if (risk_labels) {
+            yyjson_mut_obj_add_str(doc, item, "risk",
+                                   cbm_risk_label(cbm_hop_to_risk(tr->visited[i].hop)));
+        }
         yyjson_mut_arr_add_val(arr, item);
     }
     return arr;
@@ -1335,6 +1342,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *mode = cbm_mcp_get_string_arg(args, "mode");
     char *param_name = cbm_mcp_get_string_arg(args, "parameter_name");
     int depth = cbm_mcp_get_int_arg(args, "depth", MCP_DEFAULT_DEPTH);
+    bool risk_labels = cbm_mcp_get_bool_arg(args, "risk_labels");
 
     if (!func_name) {
         free(project);
@@ -1411,13 +1419,13 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     if (do_outbound) {
         cbm_store_bfs(store, nodes[0].id, "outbound", edge_types, edge_type_count, depth,
                       MCP_BFS_LIMIT, &tr_out);
-        yyjson_mut_obj_add_val(doc, root, "callees", bfs_to_json_array(doc, &tr_out));
+        yyjson_mut_obj_add_val(doc, root, "callees", bfs_to_json_array(doc, &tr_out, risk_labels));
     }
 
     if (do_inbound) {
         cbm_store_bfs(store, nodes[0].id, "inbound", edge_types, edge_type_count, depth,
                       MCP_BFS_LIMIT, &tr_in);
-        yyjson_mut_obj_add_val(doc, root, "callers", bfs_to_json_array(doc, &tr_in));
+        yyjson_mut_obj_add_val(doc, root, "callers", bfs_to_json_array(doc, &tr_in, risk_labels));
     }
 
     /* Serialize BEFORE freeing traversal results (yyjson borrows strings) */

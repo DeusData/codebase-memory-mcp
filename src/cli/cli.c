@@ -405,6 +405,7 @@ static const char skill_content[] =
     "| Dead code | `search_graph(max_degree=0, exclude_entry_points=true)` |\n"
     "| Cross-service edges | `query_graph` with Cypher |\n"
     "| Impact of local changes | `detect_changes()` |\n"
+    "| Risk-classified trace | `trace_path(risk_labels=true)` |\n"
     "| Text search | `search_code` or Grep |\n"
     "\n"
     "## Exploration Workflow\n"

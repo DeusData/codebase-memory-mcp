@@ -18,6 +18,7 @@
 #include "pipeline/pipeline.h"
 #include "store/store.h"
 #include "cli/cli.h"
+#include "cli/progress_sink.h"
 #include "foundation/constants.h"
 
 enum {
@@ -117,16 +118,43 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
 
 static int run_cli(int argc, char **argv) {
     if (argc < MAIN_MIN_ARGC) {
-        (void)fprintf(stderr, "Usage: codebase-memory-mcp cli <tool_name> [json_args]\n");
+        (void)fprintf(stderr,
+                      "Usage: codebase-memory-mcp cli [--progress] <tool_name> [json_args]\n");
+        return SKIP_ONE;
+    }
+
+    /* Strip --progress flag from argv. */
+    bool progress = false;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--progress") == 0) {
+            progress = true;
+            for (int j = i; j < argc - SKIP_ONE; j++) {
+                argv[j] = argv[j + SKIP_ONE];
+            }
+            argc--;
+            break;
+        }
+    }
+
+    if (argc < MAIN_MIN_ARGC) {
+        (void)fprintf(stderr,
+                      "Usage: codebase-memory-mcp cli [--progress] <tool_name> [json_args]\n");
         return SKIP_ONE;
     }
 
     const char *tool_name = argv[0];
     const char *args_json = argc >= MAIN_CLI_ARGC ? argv[SKIP_ONE] : "{}";
 
+    if (progress) {
+        cbm_progress_sink_init(stderr);
+    }
+
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     if (!srv) {
         (void)fprintf(stderr, "Failed to create server\n");
+        if (progress) {
+            cbm_progress_sink_fini();
+        }
         return SKIP_ONE;
     }
 
@@ -137,6 +165,9 @@ static int run_cli(int argc, char **argv) {
     }
 
     cbm_mcp_server_free(srv);
+    if (progress) {
+        cbm_progress_sink_fini();
+    }
     return 0;
 }
 

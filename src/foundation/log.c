@@ -65,12 +65,12 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
     }
     va_end(args);
 
-    /* Write to stderr */
-    (void)fprintf(stderr, "%s\n", line_buf);
-
-    /* Send to sink if registered */
+    /* When a sink is registered it takes over all output (exclusive).
+     * Otherwise write structured log to stderr. */
     if (g_log_sink) {
         g_log_sink(line_buf);
+    } else {
+        (void)fprintf(stderr, "%s\n", line_buf);
     }
 }
 
@@ -83,9 +83,9 @@ void cbm_log_int(CBMLogLevel level, const char *msg, const char *key, int64_t va
     snprintf(line_buf, sizeof(line_buf), "level=%s msg=%s %s=%" PRId64, level_str(level),
              msg ? msg : "", key ? key : "?", value);
 
-    (void)fprintf(stderr, "%s\n", line_buf);
-
     if (g_log_sink) {
         g_log_sink(line_buf);
+    } else {
+        (void)fprintf(stderr, "%s\n", line_buf);
     }
 }
