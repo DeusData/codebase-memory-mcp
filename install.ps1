@@ -75,7 +75,19 @@ try {
 
 # Extract
 Write-Host "Extracting..."
-Expand-Archive -Path "$TmpDir\$Archive" -OutputPath $TmpDir -Force
+$expandParams = @{
+    Path  = "$TmpDir\$Archive"
+    Force = $true
+}
+$expandCmd = Get-Command Expand-Archive -ErrorAction Stop
+if ($expandCmd.Parameters.ContainsKey('DestinationPath')) {
+    $expandParams['DestinationPath'] = $TmpDir
+} elseif ($expandCmd.Parameters.ContainsKey('OutputPath')) {
+    $expandParams['OutputPath'] = $TmpDir
+} else {
+    throw "Expand-Archive does not support DestinationPath or OutputPath parameters."
+}
+Expand-Archive @expandParams
 
 $DlBin = Join-Path $TmpDir $BinName
 if (-not (Test-Path $DlBin)) {
