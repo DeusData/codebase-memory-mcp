@@ -134,14 +134,25 @@ static int g_log_count = 0;
 static cbm_mutex_t g_log_mutex;
 static atomic_int g_log_mutex_init = 0;
 
+static void log_mutex_ensure_init(void) {
+    /* CAS from 0 → 1: exactly one thread initializes the mutex */
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&g_log_mutex_init, &expected, 1)) {
+        cbm_mutex_init(&g_log_mutex);
+        atomic_store(&g_log_mutex_init, 2); /* 2 = fully initialized */
+    } else {
+        /* Another thread is initializing — spin until done */
+        while (atomic_load(&g_log_mutex_init) != 2) {
+            /* tight spin is fine — init takes nanoseconds */
+        }
+    }
+}
+
 /* Called from a log hook — appends a line to the ring buffer (thread-safe) */
 void cbm_ui_log_append(const char *line) {
     if (!line)
         return;
-    if (!atomic_load(&g_log_mutex_init)) {
-        cbm_mutex_init(&g_log_mutex);
-        atomic_store(&g_log_mutex_init, 1);
-    }
+    log_mutex_ensure_init();
     cbm_mutex_lock(&g_log_mutex);
     snprintf(g_log_ring[g_log_head], LOG_LINE_MAX, "%s", line);
     g_log_head = (g_log_head + 1) % LOG_RING_SIZE;
@@ -160,6 +171,7 @@ static void handle_logs(struct mg_connection *c, struct mg_http_message *hm) {
             max_lines = v;
     }
 
+    log_mutex_ensure_init();
     cbm_mutex_lock(&g_log_mutex);
     int count = g_log_count < max_lines ? g_log_count : max_lines;
     int start = (g_log_head - count + LOG_RING_SIZE) % LOG_RING_SIZE;
