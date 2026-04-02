@@ -3230,6 +3230,18 @@ static void handle_content_length_frame(cbm_mcp_server_t *srv, FILE *in, FILE *o
 }
 
 #ifndef _WIN32
+/* Check poll revents for fatal conditions (closed fd, error, hangup without data).
+ * Returns true if the fd is in an unrecoverable state. */
+static bool poll_revents_fatal(short revents) {
+    if (revents & (POLLNVAL | POLLERR)) {
+        return true;
+    }
+    if ((revents & POLLHUP) && !(revents & POLLIN)) {
+        return true;
+    }
+    return false;
+}
+
 /* Unix 3-phase poll: non-blocking fd check, FILE* buffer peek, blocking poll.
  * Returns: 1 = data ready, 0 = timeout (evicted idle stores), -1 = error/EOF. */
 static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
@@ -3240,6 +3252,9 @@ static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
         return -1;
     }
     if (pr > 0) {
+        if (poll_revents_fatal(pfd.revents)) {
+            return -1;
+        }
         return 1;
     }
 
@@ -3254,6 +3269,9 @@ static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
         if (pr == 0) {
             cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
             return 0;
+        }
+        if (poll_revents_fatal(pfd.revents)) {
+            return -1;
         }
         return 1;
     }
@@ -3275,6 +3293,9 @@ static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
         if (pr == 0) {
             cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
             return 0;
+        }
+        if (poll_revents_fatal(pfd.revents)) {
+            return -1;
         }
         return 1;
     }
