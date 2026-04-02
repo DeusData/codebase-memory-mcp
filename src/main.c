@@ -32,7 +32,11 @@
 #include <string.h>
 #include <signal.h>
 #include <stdatomic.h>
+#ifndef _WIN32
 #include <unistd.h>
+#else
+#include <io.h>
+#endif
 
 #ifndef CBM_VERSION
 #define CBM_VERSION "dev"
@@ -54,10 +58,14 @@ static void signal_handler(int sig) {
     if (g_http_server) {
         cbm_http_server_stop(g_http_server);
     }
-    /* Close the raw fd to unblock poll() in the MCP event loop.
-     * Do NOT use fclose(stdin) — it is not async-signal-safe and can
-     * corrupt the FILE* if getline/fgetc holds its internal lock. */
+    /* Close the raw fd to unblock poll()/WaitForSingleObject in the MCP
+     * event loop.  Do NOT use fclose(stdin) — it is not async-signal-safe
+     * and can corrupt the FILE* if getline/fgetc holds its internal lock. */
+#ifndef _WIN32
     (void)close(STDIN_FILENO);
+#else
+    (void)_close(_fileno(stdin));
+#endif
 }
 
 /* ── Watcher background thread ──────────────────────────────────── */
