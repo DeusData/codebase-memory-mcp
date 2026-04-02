@@ -135,6 +135,10 @@ static cbm_mutex_t g_log_mutex;
 static atomic_int g_log_mutex_init = 0;
 
 static void log_mutex_ensure_init(void) {
+    /* Fast path: already initialized — single atomic load, no CAS */
+    if (atomic_load(&g_log_mutex_init) == 2) {
+        return;
+    }
     /* CAS from 0 → 1: exactly one thread initializes the mutex */
     int expected = 0;
     if (atomic_compare_exchange_strong(&g_log_mutex_init, &expected, 1)) {
@@ -143,7 +147,7 @@ static void log_mutex_ensure_init(void) {
     } else {
         /* Another thread is initializing — spin until done */
         while (atomic_load(&g_log_mutex_init) != 2) {
-            /* tight spin is fine — init takes nanoseconds */
+            cbm_usleep(1); /* yield rather than tight-spin */
         }
     }
 }
