@@ -279,13 +279,14 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name) {
     cbm_mutex_unlock(&w->projects_mu);
 }
 
-int cbm_watcher_watch_count(cbm_watcher_t *w) {
+int cbm_watcher_watch_count(const cbm_watcher_t *w) {
     if (!w) {
         return 0;
     }
-    cbm_mutex_lock(&w->projects_mu);
+    cbm_mutex_t *mu = (cbm_mutex_t *)&w->projects_mu;
+    cbm_mutex_lock(mu);
     int count = (int)cbm_ht_count(w->projects);
-    cbm_mutex_unlock(&w->projects_mu);
+    cbm_mutex_unlock(mu);
     return count;
 }
 
