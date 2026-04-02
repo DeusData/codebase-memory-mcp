@@ -66,8 +66,9 @@ bool cbm_pipeline_try_lock(void);
  * Returns true if acquired, false on timeout. */
 bool cbm_pipeline_lock_timeout(int timeout_ms);
 
-/* Acquire the global index lock, blocking up to 60s.
- * On timeout, force-acquires the lock (assumes previous holder crashed). */
+/* Acquire the global index lock, blocking indefinitely.
+ * Logs a warning after ~60s but never breaks mutual exclusion.
+ * For bounded waits, use cbm_pipeline_lock_timeout() instead. */
 void cbm_pipeline_lock(void);
 
 /* Release the global index lock. */

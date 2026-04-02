@@ -44,11 +44,12 @@ bool cbm_pipeline_try_lock(void) {
     return atomic_exchange(&g_pipeline_busy, 1) == 0;
 }
 
-#define LOCK_SPIN_NS 100000000  /* 100ms between lock retries */
-#define LOCK_TIMEOUT_RETRIES 600 /* 600 × 100ms = 60s max wait */
+#define LOCK_SPIN_NS  100000000 /* 100ms between lock retries */
+#define LOCK_SPIN_MS  (LOCK_SPIN_NS / 1000000)
+#define LOCK_TIMEOUT_MS 60000  /* 60s max wait before warning */
 
 bool cbm_pipeline_lock_timeout(int timeout_ms) {
-    int retries = timeout_ms / 100;
+    int retries = timeout_ms / LOCK_SPIN_MS;
     if (retries <= 0) {
         retries = 1;
     }
@@ -59,16 +60,19 @@ bool cbm_pipeline_lock_timeout(int timeout_ms) {
         struct timespec ts = {0, LOCK_SPIN_NS};
         cbm_nanosleep(&ts, NULL);
     }
-    cbm_log_warn("pipeline.lock.timeout", "waited_ms", itoa_buf(retries * 100));
+    cbm_log_warn("pipeline.lock.timeout", "waited_ms",
+                 itoa_buf(retries * LOCK_SPIN_MS));
     return false;
 }
 
 void cbm_pipeline_lock(void) {
-    if (!cbm_pipeline_lock_timeout(LOCK_TIMEOUT_RETRIES * 100)) {
-        cbm_log_warn("pipeline.lock.force", "msg",
-                     "timeout expired, forcing lock acquisition");
-        /* Force acquire — the previous holder likely crashed */
-        atomic_store(&g_pipeline_busy, 1);
+    int warned = 0;
+    while (!cbm_pipeline_lock_timeout(LOCK_TIMEOUT_MS)) {
+        if (!warned) {
+            cbm_log_warn("pipeline.lock.stall", "msg",
+                         "lock held >60s, still waiting (will not break exclusion)");
+            warned = 1;
+        }
     }
 }
 
