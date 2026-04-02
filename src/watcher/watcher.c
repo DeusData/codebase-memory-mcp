@@ -20,6 +20,7 @@
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/str_util.h"
+#include "foundation/compat_thread.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,6 +49,7 @@ struct cbm_watcher {
     cbm_index_fn index_fn;
     void *user_data;
     CBMHashTable *projects; /* name → project_state_t* */
+    cbm_mutex_t projects_mu; /* protects projects hash table */
     atomic_int stopped;
 };
 
@@ -197,6 +199,7 @@ cbm_watcher_t *cbm_watcher_new(cbm_store_t *store, cbm_index_fn index_fn, void *
     w->index_fn = index_fn;
     w->user_data = user_data;
     w->projects = cbm_ht_create(32);
+    cbm_mutex_init(&w->projects_mu);
     atomic_init(&w->stopped, 0);
     return w;
 }
@@ -207,6 +210,7 @@ void cbm_watcher_free(cbm_watcher_t *w) {
     }
     cbm_ht_foreach(w->projects, free_state_entry, NULL);
     cbm_ht_free(w->projects);
+    cbm_mutex_destroy(&w->projects_mu);
     free(w);
 }
 
@@ -224,6 +228,7 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
         return;
     }
 
+    cbm_mutex_lock(&w->projects_mu);
     /* Remove old entry first (key points to state's project_name) */
     project_state_t *old = cbm_ht_get(w->projects, project_name);
     if (old) {
@@ -233,6 +238,7 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
 
     project_state_t *s = state_new(project_name, root_path);
     cbm_ht_set(w->projects, s->project_name, s);
+    cbm_mutex_unlock(&w->projects_mu);
     cbm_log_info("watcher.watch", "project", project_name, "path", root_path);
 }
 
@@ -240,11 +246,15 @@ void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name) {
     if (!w || !project_name) {
         return;
     }
+    cbm_mutex_lock(&w->projects_mu);
     project_state_t *s = cbm_ht_get(w->projects, project_name);
     if (s) {
         cbm_ht_delete(w->projects, project_name);
         state_free(s);
+        cbm_mutex_unlock(&w->projects_mu);
         cbm_log_info("watcher.unwatch", "project", project_name);
+    } else {
+        cbm_mutex_unlock(&w->projects_mu);
     }
 }
 
@@ -252,11 +262,13 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name) {
     if (!w || !project_name) {
         return;
     }
+    cbm_mutex_lock(&w->projects_mu);
     project_state_t *s = cbm_ht_get(w->projects, project_name);
     if (s) {
         /* Reset backoff — poll immediately on next cycle */
         s->next_poll_ns = 0;
     }
+    cbm_mutex_unlock(&w->projects_mu);
 }
 
 int cbm_watcher_watch_count(const cbm_watcher_t *w) {
@@ -382,7 +394,9 @@ int cbm_watcher_poll_once(cbm_watcher_t *w) {
         .now = now_ns(),
         .reindexed = 0,
     };
+    cbm_mutex_lock(&w->projects_mu);
     cbm_ht_foreach(w->projects, poll_project, &ctx);
+    cbm_mutex_unlock(&w->projects_mu);
     return ctx.reindexed;
 }
 
