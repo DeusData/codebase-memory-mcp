@@ -32,6 +32,9 @@
 #include <sys/stat.h>
 #include <time.h>
 
+/* Forward declaration — defined below after struct definitions */
+static const char *itoa_buf(int val);
+
 /* ── Global index lock ─────────────────────────────────────────── */
 /* Prevents concurrent pipeline runs on the same DB file.
  * Atomic spinlock: 0 = free, 1 = locked. */
@@ -41,12 +44,31 @@ bool cbm_pipeline_try_lock(void) {
     return atomic_exchange(&g_pipeline_busy, 1) == 0;
 }
 
-#define LOCK_SPIN_NS 100000000 /* 100ms between lock retries */
+#define LOCK_SPIN_NS 100000000  /* 100ms between lock retries */
+#define LOCK_TIMEOUT_RETRIES 600 /* 600 × 100ms = 60s max wait */
 
-void cbm_pipeline_lock(void) {
-    while (atomic_exchange(&g_pipeline_busy, 1) != 0) {
+bool cbm_pipeline_lock_timeout(int timeout_ms) {
+    int retries = timeout_ms / 100;
+    if (retries <= 0) {
+        retries = 1;
+    }
+    for (int i = 0; i < retries; i++) {
+        if (atomic_exchange(&g_pipeline_busy, 1) == 0) {
+            return true;
+        }
         struct timespec ts = {0, LOCK_SPIN_NS};
         cbm_nanosleep(&ts, NULL);
+    }
+    cbm_log_warn("pipeline.lock.timeout", "waited_ms", itoa_buf(retries * 100));
+    return false;
+}
+
+void cbm_pipeline_lock(void) {
+    if (!cbm_pipeline_lock_timeout(LOCK_TIMEOUT_RETRIES * 100)) {
+        cbm_log_warn("pipeline.lock.force", "msg",
+                     "timeout expired, forcing lock acquisition");
+        /* Force acquire — the previous holder likely crashed */
+        atomic_store(&g_pipeline_busy, 1);
     }
 }
 

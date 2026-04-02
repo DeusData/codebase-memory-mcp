@@ -62,8 +62,12 @@ const char *cbm_pipeline_project_name(const cbm_pipeline_t *p);
  * Use this in the watcher — skip reindex if busy. */
 bool cbm_pipeline_try_lock(void);
 
-/* Acquire the global index lock, blocking until available.
- * Use this in MCP handler and autoindex — wait for busy watcher to finish. */
+/* Acquire the global index lock with timeout (milliseconds).
+ * Returns true if acquired, false on timeout. */
+bool cbm_pipeline_lock_timeout(int timeout_ms);
+
+/* Acquire the global index lock, blocking up to 60s.
+ * On timeout, force-acquires the lock (assumes previous holder crashed). */
 void cbm_pipeline_lock(void);
 
 /* Release the global index lock. */
