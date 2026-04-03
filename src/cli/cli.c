@@ -3310,10 +3310,85 @@ static int select_update_variant(int variant_flag) {
     return (choice[0] == '2') ? CLI_TRUE : 0;
 }
 
+/* Case-insensitive prefix match (portable — no strncasecmp dependency). */
+static bool prefix_icase(const char *s, const char *prefix) {
+    while (*prefix) {
+        if (tolower((unsigned char)*s) != tolower((unsigned char)*prefix)) {
+            return false;
+        }
+        s++;
+        prefix++;
+    }
+    return true;
+}
+
+/* Fetch latest release tag from GitHub via redirect header.
+ * Returns heap-allocated tag (e.g. "v0.5.7") or NULL on failure. */
+static char *fetch_latest_tag(void) {
+    FILE *fp = cbm_popen(
+        "curl -sfI https://github.com/DeusData/codebase-memory-mcp/releases/latest 2>/dev/null",
+        "r");
+    if (!fp) {
+        return NULL;
+    }
+    char line[CBM_SZ_512];
+    char *tag = NULL;
+    while (fgets(line, sizeof(line), fp)) {
+        if (!prefix_icase(line, "location:")) {
+            continue;
+        }
+        char *slash = strrchr(line, '/');
+        if (!slash) {
+            break;
+        }
+        slash++;
+        size_t len = strlen(slash);
+        while (len > 0 && (slash[len - SKIP_ONE] == '\r' || slash[len - SKIP_ONE] == '\n' ||
+                           slash[len - SKIP_ONE] == ' ')) {
+            slash[--len] = '\0';
+        }
+        if (len > 0) {
+            tag = strdup(slash);
+        }
+        break;
+    }
+    cbm_pclose(fp);
+    return tag;
+}
+
+/* Check if current version is already latest. Returns true to skip update. */
+static bool check_already_latest(void) {
+    char dl_env[CBM_SZ_256] = "";
+    cbm_safe_getenv("CBM_DOWNLOAD_URL", dl_env, sizeof(dl_env), NULL);
+    if (dl_env[0]) {
+        return false; /* testing override — always update */
+    }
+    char *latest = fetch_latest_tag();
+    if (!latest) {
+        (void)fprintf(stderr, "warning: could not check latest version (network unavailable?). "
+                              "Proceeding with update.\n");
+        return false;
+    }
+    int cmp = cbm_compare_versions(latest, CBM_VERSION);
+    if (cmp <= 0) {
+        if (cmp < 0) {
+            printf("Already up to date (%s, ahead of latest %s).\n", CBM_VERSION, latest);
+        } else {
+            printf("Already up to date (%s).\n", CBM_VERSION);
+        }
+        free(latest);
+        return true;
+    }
+    printf("Update available: %s -> %s\n", CBM_VERSION, latest);
+    free(latest);
+    return false;
+}
+
 int cbm_cmd_update(int argc, char **argv) {
     parse_auto_answer(argc, argv);
 
     bool dry_run = false;
+    bool force = false;
     int variant_flag = 0; /* 0 = ask, 1 = standard, 2 = ui */
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
@@ -3322,6 +3397,8 @@ int cbm_cmd_update(int argc, char **argv) {
             variant_flag = VARIANT_A;
         } else if (strcmp(argv[i], "--ui") == 0) {
             variant_flag = VARIANT_B;
+        } else if (strcmp(argv[i], "--force") == 0) {
+            force = true;
         }
     }
 
@@ -3332,6 +3409,11 @@ int cbm_cmd_update(int argc, char **argv) {
     }
 
     printf("codebase-memory-mcp update (current: %s)\n\n", CBM_VERSION);
+
+    /* Version check — skip download if already on latest. */
+    if (!force && check_already_latest()) {
+        return 0;
+    }
 
     /* Step 1: Check for existing indexes */
     if (update_clear_indexes(home, dry_run) != 0) {
