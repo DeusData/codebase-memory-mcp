@@ -269,6 +269,13 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {
         persist_hashes(hash_store, project, files, file_count);
+
+        /* Rebuild FTS5 index: btree dump bypasses triggers */
+        cbm_store_exec(hash_store, "DELETE FROM nodes_fts;");
+        cbm_store_exec(hash_store,
+            "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+            "SELECT id, cbm_camel_split(name), qualified_name, label, file_path FROM nodes;");
+
         cbm_store_close(hash_store);
     }
 }

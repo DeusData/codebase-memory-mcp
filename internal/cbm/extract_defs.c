@@ -955,6 +955,7 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
                                        "implements_clause",
                                        "argument_list",
                                        "inheritance_specifier",
+                                       "base_list", /* C# class Foo : IBar */
                                        NULL};
     return find_base_from_children(a, node, source, base_types);
 }
