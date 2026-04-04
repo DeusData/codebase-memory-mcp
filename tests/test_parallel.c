@@ -288,6 +288,240 @@ TEST(parallel_total_edges) {
     PASS();
 }
 
+/* ── GDScript Parallel Parity Tests ─────────────────────────────── */
+
+static char g_gd_tmpdir[512];
+static cbm_gbuf_t *g_gd_seq_gbuf = NULL;
+static cbm_gbuf_t *g_gd_par_gbuf = NULL;
+static int g_gd_parity_setup_done = 0;
+
+static int setup_gdscript_repo(void) {
+    snprintf(g_gd_tmpdir, sizeof(g_gd_tmpdir), "/tmp/cbm_gd_par_XXXXXX");
+    if (!cbm_mkdtemp(g_gd_tmpdir))
+        return -1;
+
+    char path[512];
+
+    /* actors/ */
+    snprintf(path, sizeof(path), "%s/actors", g_gd_tmpdir);
+    cbm_mkdir(path);
+
+    /* base.gd */
+    snprintf(path, sizeof(path), "%s/actors/base.gd", g_gd_tmpdir);
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "class_name Base\nsignal hit\nfunc ping():\n    pass\n");
+    fclose(f);
+
+    /* receiver.gd */
+    snprintf(path, sizeof(path), "%s/actors/receiver.gd", g_gd_tmpdir);
+    f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "class_name Receiver\nsignal hit\n");
+    fclose(f);
+
+    /* weapon.gd */
+    snprintf(path, sizeof(path), "%s/actors/weapon.gd", g_gd_tmpdir);
+    f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "class_name Weapon\n");
+    fclose(f);
+
+    /* player.gd */
+    snprintf(path, sizeof(path), "%s/actors/player.gd", g_gd_tmpdir);
+    f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f,
+        "class_name Player\n"
+        "const BaseAlias = preload(\"res://actors/base.gd\")\n"
+        "const ReceiverClass = preload(\"res://actors/receiver.gd\")\n"
+        "extends BaseAlias\n"
+        "signal hit\n"
+        "const Weapon = preload(\"res://actors/weapon.gd\")\n"
+        "var WeaponRel = load(\"weapon.gd\")\n"
+        "const Scene = preload(\"res://actors/player.tscn\")\n"
+        "func attack():\n"
+        "    emit_signal(\"hit\")\n"
+        "    self.hit.emit()\n"
+        "    hit.connect(_on_hit)\n"
+        "    var r = ReceiverClass.new()\n"
+        "    r.hit.connect(_on_receiver_hit)\n"
+        "    r.hit.emit()\n"
+        "    helper()\n"
+        "\n"
+        "func helper():\n"
+        "    pass\n");
+    fclose(f);
+
+    /* player_path_extends.gd */
+    snprintf(path, sizeof(path), "%s/actors/player_path_extends.gd", g_gd_tmpdir);
+    f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "class_name PlayerPath\nextends \"res://actors/base.gd\"\nfunc attack_path():\n    pass\n");
+    fclose(f);
+
+    /* player_named_extends.gd */
+    snprintf(path, sizeof(path), "%s/actors/player_named_extends.gd", g_gd_tmpdir);
+    f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "class_name PlayerNamed\nextends Base\nfunc attack_named():\n    pass\n");
+    fclose(f);
+
+    /* player_preload_extends.gd */
+    snprintf(path, sizeof(path), "%s/actors/player_preload_extends.gd", g_gd_tmpdir);
+    f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "class_name PlayerPreloadPath\nextends preload(\"res://actors/base.gd\")\nfunc attack_preload_path():\n    pass\n");
+    fclose(f);
+
+    /* nameless_script.gd */
+    snprintf(path, sizeof(path), "%s/actors/nameless_script.gd", g_gd_tmpdir);
+    f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "extends \"res://actors/base.gd\"\nsignal ghost_hit\nfunc ghost_attack():\n    emit_signal(\"ghost_hit\")\n");
+    fclose(f);
+
+    /* dynamic_receiver.gd */
+    snprintf(path, sizeof(path), "%s/actors/dynamic_receiver.gd", g_gd_tmpdir);
+    f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "class_name DynamicReceiverCase\nfunc attack_dynamic(target):\n    target.hit.emit()\n");
+    fclose(f);
+
+    /* builtin_base.gd */
+    snprintf(path, sizeof(path), "%s/actors/builtin_base.gd", g_gd_tmpdir);
+    f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "class_name BuiltinBaseCase\nextends Node2D\nfunc tick_builtin():\n    pass\n");
+    fclose(f);
+
+    /* player.tscn (non-code asset) */
+    snprintf(path, sizeof(path), "%s/actors/player.tscn", g_gd_tmpdir);
+    f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "[gd_scene load_steps=2 format=3]\n");
+    fclose(f);
+
+    return 0;
+}
+
+static void teardown_gdscript_repo(void) {
+    if (g_gd_tmpdir[0]) {
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_gd_tmpdir);
+        (void)system(cmd);
+    }
+    g_gd_tmpdir[0] = '\0';
+}
+
+static int ensure_gd_parity_setup(void) {
+    if (g_gd_parity_setup_done)
+        return 0;
+
+    if (setup_gdscript_repo() != 0)
+        return -1;
+
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    if (cbm_discover(g_gd_tmpdir, &opts, &files, &file_count) != 0)
+        return -1;
+
+    const char *project = "gd-par-test";
+
+    g_gd_seq_gbuf = run_sequential(project, g_gd_tmpdir, files, file_count);
+    g_gd_par_gbuf = run_parallel(project, g_gd_tmpdir, files, file_count, 2);
+
+    cbm_discover_free(files, file_count);
+    g_gd_parity_setup_done = 1;
+    return 0;
+}
+
+static void gd_parity_teardown(void) {
+    if (g_gd_seq_gbuf) {
+        cbm_gbuf_free(g_gd_seq_gbuf);
+        g_gd_seq_gbuf = NULL;
+    }
+    if (g_gd_par_gbuf) {
+        cbm_gbuf_free(g_gd_par_gbuf);
+        g_gd_par_gbuf = NULL;
+    }
+    teardown_gdscript_repo();
+    g_gd_parity_setup_done = 0;
+}
+
+static int assert_gd_edge_type_parity(const char *type) {
+    if (ensure_gd_parity_setup() != 0)
+        return -1;
+    int seq = cbm_gbuf_edge_count_by_type(g_gd_seq_gbuf, type);
+    int par = cbm_gbuf_edge_count_by_type(g_gd_par_gbuf, type);
+    if (seq != par) {
+        printf("  FAIL: GDScript %s edges: seq=%d par=%d\n", type, seq, par);
+        return 1;
+    }
+    return 0;
+}
+
+TEST(gdscript_parallel_calls_parity) {
+    int rc = assert_gd_edge_type_parity("CALLS");
+    if (rc == -1)
+        SKIP("setup failed");
+    ASSERT_EQ(rc, 0);
+    PASS();
+}
+
+TEST(gdscript_parallel_inherits_parity) {
+    int rc = assert_gd_edge_type_parity("INHERITS");
+    if (rc == -1)
+        SKIP("setup failed");
+    ASSERT_EQ(rc, 0);
+    PASS();
+}
+
+TEST(gdscript_parallel_imports_parity) {
+    int rc = assert_gd_edge_type_parity("IMPORTS");
+    if (rc == -1)
+        SKIP("setup failed");
+    ASSERT_EQ(rc, 0);
+    PASS();
+}
+
+TEST(gdscript_parallel_defines_method_parity) {
+    int rc = assert_gd_edge_type_parity("DEFINES_METHOD");
+    if (rc == -1)
+        SKIP("setup failed");
+    ASSERT_EQ(rc, 0);
+    PASS();
+}
+
+TEST(gdscript_parallel_defines_parity) {
+    int rc = assert_gd_edge_type_parity("DEFINES");
+    if (rc == -1)
+        SKIP("setup failed");
+    ASSERT_EQ(rc, 0);
+    PASS();
+}
+
+TEST(gdscript_parallel_node_count) {
+    if (ensure_gd_parity_setup() != 0)
+        SKIP("setup failed");
+    int seq = cbm_gbuf_node_count(g_gd_seq_gbuf);
+    int par = cbm_gbuf_node_count(g_gd_par_gbuf);
+    ASSERT_GT(seq, 0);
+    ASSERT_EQ(seq, par);
+    PASS();
+}
+
+TEST(gdscript_parallel_total_edges) {
+    if (ensure_gd_parity_setup() != 0)
+        SKIP("setup failed");
+    int seq = cbm_gbuf_edge_count(g_gd_seq_gbuf);
+    int par = cbm_gbuf_edge_count(g_gd_par_gbuf);
+    ASSERT_GT(seq, 0);
+    ASSERT_EQ(seq, par);
+    PASS();
+}
+
 /* ── Empty file list ──────────────────────────────────────────────── */
 
 TEST(parallel_empty_files) {
@@ -452,6 +686,16 @@ SUITE(parallel) {
     RUN_TEST(parallel_total_edges);
     RUN_TEST(parallel_empty_files);
 
+    /* GDScript parallel parity tests */
+    RUN_TEST(gdscript_parallel_node_count);
+    RUN_TEST(gdscript_parallel_calls_parity);
+    RUN_TEST(gdscript_parallel_inherits_parity);
+    RUN_TEST(gdscript_parallel_imports_parity);
+    RUN_TEST(gdscript_parallel_defines_method_parity);
+    RUN_TEST(gdscript_parallel_defines_parity);
+    RUN_TEST(gdscript_parallel_total_edges);
+
     /* Cleanup shared state */
     parity_teardown();
+    gd_parity_teardown();
 }

@@ -275,10 +275,298 @@ static bool is_checked_exception(const char *name) {
     if (!name) {
         return false;
     }
-    if (strstr(name, "Error") || strstr(name, "Panic") || strstr(name, "error") ||
-        strstr(name, "panic")) {
-        return false;
+    return false;
+}
+
+static const char *lookup_import_map_value(const char *name, const char **imp_keys,
+                                            const char **imp_vals, int imp_count) {
+    if (!name || !imp_keys || !imp_vals) return NULL;
+    for (int i = 0; i < imp_count; i++) {
+        if (imp_keys[i] && imp_vals[i] && strcmp(imp_keys[i], name) == 0) {
+            return imp_vals[i];
+        }
     }
+    return NULL;
+}
+
+/* ── GDScript helpers (mirrored from pass_calls.c for parallel parity) ── */
+
+static bool str_ends_with(const char *str, const char *suffix) {
+    if (!str || !suffix) return false;
+    size_t str_len = strlen(str);
+    size_t suffix_len = strlen(suffix);
+    if (suffix_len > str_len) return false;
+    return strcmp(str + str_len - suffix_len, suffix) == 0;
+}
+
+static size_t gdscript_signal_member_suffix_len(const char *callee_name) {
+    if (!callee_name) return 0;
+    if (str_ends_with(callee_name, ".emit")) return 5;
+    if (str_ends_with(callee_name, ".connect")) return 8;
+    return 0;
+}
+
+static bool strip_last_qn_segment(const char *qn, char *out, size_t out_size) {
+    if (!qn || !out || out_size == 0) return false;
+    const char *last_dot = strrchr(qn, '.');
+    if (!last_dot) return false;
+    size_t len = (size_t)(last_dot - qn);
+    if (len + 1 > out_size) return false;
+    memcpy(out, qn, len);
+    out[len] = '\0';
+    return true;
+}
+
+static bool gdscript_script_anchor_qn(const cbm_gbuf_node_t *source_node, char *out, size_t out_size) {
+    if (!source_node || !source_node->qualified_name || !source_node->label) return false;
+    if (strcmp(source_node->label, "Class") == 0) {
+        snprintf(out, out_size, "%s", source_node->qualified_name);
+        return true;
+    }
+    if (strcmp(source_node->label, "Method") == 0) {
+        return strip_last_qn_segment(source_node->qualified_name, out, out_size);
+    }
+    return false;
+}
+
+static bool gdscript_signal_target_qn(const CBMCall *call, const char *anchor_qn, char *out, size_t out_size) {
+    if (!call || !call->callee_name || !anchor_qn || !call->first_string_arg || !call->first_string_arg[0])
+        return false;
+    if (strcmp(call->callee_name, "emit_signal") == 0) {
+        snprintf(out, out_size, "%s.signal.%s", anchor_qn, call->first_string_arg);
+        return true;
+    }
+    size_t callee_len = strlen(call->callee_name);
+    size_t suffix_len = gdscript_signal_member_suffix_len(call->callee_name);
+    if (suffix_len == 0) return false;
+    size_t receiver_len = callee_len - suffix_len;
+    if (receiver_len == 0) return false;
+    const char *last_dot = call->callee_name + receiver_len;
+    const char *signal_start = call->callee_name;
+    for (const char *p = last_dot; p > call->callee_name; --p) {
+        if (*(p - 1) == '.') { signal_start = p; break; }
+    }
+    size_t signal_len = (size_t)(last_dot - signal_start);
+    if (signal_len == 0 || strncmp(signal_start, call->first_string_arg, signal_len) != 0 ||
+        call->first_string_arg[signal_len] != '\0') return false;
+    if (!(strncmp(call->callee_name, "self.", 5) == 0 ||
+          memchr(call->callee_name, '.', receiver_len) == NULL)) return false;
+    snprintf(out, out_size, "%s.signal.%s", anchor_qn, call->first_string_arg);
+    return true;
+}
+
+static bool gdscript_same_script_target_qn(const CBMCall *call, const char *anchor_qn, char *out, size_t out_size) {
+    if (!call || !call->callee_name || !anchor_qn) return false;
+    if (gdscript_signal_target_qn(call, anchor_qn, out, out_size)) return true;
+    if (strchr(call->callee_name, '.') != NULL) return false;
+    snprintf(out, out_size, "%s.%s", anchor_qn, call->callee_name);
+    return true;
+}
+
+static bool gdscript_anchor_matches_module(const char *class_qn, const char *module_qn) {
+    if (!class_qn || !module_qn) return false;
+    char script_qn[512];
+    snprintf(script_qn, sizeof(script_qn), "%s.__script__", module_qn);
+    if (strcmp(class_qn, script_qn) == 0) return true;
+    size_t prefix_len = strlen(module_qn);
+    if (strncmp(class_qn, module_qn, prefix_len) != 0 || class_qn[prefix_len] != '.') return false;
+    return strchr(class_qn + prefix_len + 1, '.') == NULL;
+}
+
+static bool gdscript_should_skip_generic_fallback(const CBMCall *call) {
+    if (!call || !call->callee_name) return false;
+    return gdscript_signal_member_suffix_len(call->callee_name) > 0;
+}
+
+static const char *find_gdscript_script_anchor(const cbm_gbuf_t *gbuf, const char *file_path,
+                                                const char *module_qn) {
+    const cbm_gbuf_node_t **classes = NULL;
+    int class_count = 0;
+    if (cbm_gbuf_find_by_label(gbuf, "Class", &classes, &class_count) != 0) return NULL;
+    for (int i = 0; i < class_count; i++) {
+        const cbm_gbuf_node_t *cls = classes[i];
+        if (!cls->file_path || !cls->qualified_name) continue;
+        /* Match: exact path OR file_path ends with the relative path */
+        bool path_match = strcmp(cls->file_path, file_path) == 0;
+        if (!path_match) {
+            size_t fp_len = strlen(cls->file_path);
+            size_t rel_len = strlen(file_path);
+            if (fp_len > rel_len && cls->file_path[fp_len - rel_len - 1] == '/') {
+                path_match = strcmp(cls->file_path + fp_len - rel_len, file_path) == 0;
+            }
+        }
+        if (!path_match) continue;
+        if (gdscript_anchor_matches_module(cls->qualified_name, module_qn)) {
+            return cls->qualified_name;
+        }
+    }
+    return NULL;
+}
+
+static bool is_classish_label(const char *label) {
+    return label && (strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
+                     strcmp(label, "Type") == 0 || strcmp(label, "Enum") == 0);
+}
+
+static bool gdscript_extract_module_path(const char *target_name, char *out, size_t out_size) {
+    if (!target_name || !out || out_size == 0) return false;
+    const char *start = strstr(target_name, "\"");
+    if (!start) return false;
+    start++;
+    const char *end = strstr(start, ".gd\"");
+    if (!end) return false;
+    end += 3;
+    const char *path_start = start;
+    if (strncmp(path_start, "res://", 6) == 0) path_start += 6;
+    size_t len = (size_t)(end - path_start);
+    if (len + 1 > out_size) return false;
+    memcpy(out, path_start, len);
+    out[len] = '\0';
+    return true;
+}
+
+static bool gdscript_preload_extends_base_from_source(const char *source, char *out,
+                                                       size_t out_size) {
+    if (!source || !out || out_size == 0) return false;
+    for (const char *line = source; line && *line; ) {
+        const char *next = strchr(line, '\n');
+        const char *scan = line;
+        while (*scan == ' ' || *scan == '\t') scan++;
+        if (strncmp(scan, "func ", 5) == 0 || strncmp(scan, "class ", 6) == 0) return false;
+        if (strncmp(scan, "extends preload(\"", 17) == 0) {
+            const char *start = scan + 17;
+            const char *end = strstr(start, ".gd\"");
+            if (!end || (next && end > next)) return false;
+            end += 3;
+            if (strncmp(start, "res://", 6) == 0) start += 6;
+            size_t len = (size_t)(end - start);
+            if (len == 0 || len + 1 > out_size) return false;
+            memcpy(out, start, len);
+            out[len] = '\0';
+            return true;
+        }
+        line = next ? next + 1 : NULL;
+    }
+    return false;
+}
+
+static const char *promote_gdscript_target_to_class(const cbm_registry_t *registry,
+                                                     const cbm_gbuf_t *gbuf,
+                                                     const char *project_name,
+                                                     const char *resolved_qn,
+                                                     const char *raw_target_name) {
+    const char *file_path = NULL;
+    char *module_qn_owned = NULL;
+    char extracted_path[512];
+
+    if (resolved_qn) {
+        const char *label = cbm_registry_label_of(registry, resolved_qn);
+        if (is_classish_label(label)) return resolved_qn;
+        const cbm_gbuf_node_t *resolved_node = cbm_gbuf_find_by_qn(gbuf, resolved_qn);
+        if (resolved_node && resolved_node->file_path &&
+            str_ends_with(resolved_node->file_path, ".gd")) {
+            file_path = resolved_node->file_path;
+        }
+    }
+    if (!file_path && raw_target_name && str_ends_with(raw_target_name, ".gd")) {
+        file_path = raw_target_name;
+    }
+    if (!file_path && raw_target_name &&
+        gdscript_extract_module_path(raw_target_name, extracted_path, sizeof(extracted_path))) {
+        file_path = extracted_path;
+    }
+    if (!file_path) return NULL;
+
+    module_qn_owned = cbm_pipeline_fqn_module(project_name, file_path);
+    const char *anchor_qn = find_gdscript_script_anchor(gbuf, file_path, module_qn_owned);
+    free(module_qn_owned);
+    return anchor_qn;
+}
+
+static bool gdscript_receiver_var_name(const CBMCall *call, char *out, size_t out_size) {
+    if (!call || !call->callee_name || !out || out_size == 0) return false;
+    size_t callee_len = strlen(call->callee_name);
+    size_t suffix_len = 0;
+    if (str_ends_with(call->callee_name, ".emit")) suffix_len = 5;
+    else if (str_ends_with(call->callee_name, ".connect")) suffix_len = 8;
+    else return false;
+    size_t receiver_len = callee_len - suffix_len;
+    const char *first_dot = memchr(call->callee_name, '.', receiver_len);
+    if (!first_dot) return false;
+    size_t root_len = (size_t)(first_dot - call->callee_name);
+    if (root_len == 0 || root_len + 1 > out_size) return false;
+    memcpy(out, call->callee_name, root_len);
+    out[root_len] = '\0';
+    return strcmp(out, "self") != 0;
+}
+
+static const char *gdscript_type_assign_for_receiver(const CBMFileResult *result,
+                                                      const CBMCall *call,
+                                                      const char *receiver_name) {
+    if (!result || !call || !receiver_name || !receiver_name[0]) return NULL;
+    const char *match = NULL;
+    for (int i = 0; i < result->type_assigns.count; i++) {
+        const CBMTypeAssign *ta = &result->type_assigns.items[i];
+        if (!ta->var_name || !ta->type_name || !ta->enclosing_func_qn) continue;
+        if (call->enclosing_func_qn && strcmp(ta->enclosing_func_qn, call->enclosing_func_qn) != 0)
+            continue;
+        if (strcmp(ta->var_name, receiver_name) == 0) match = ta->type_name;
+    }
+    return match;
+}
+
+static bool gdscript_normalize_type_name(const char *type_name, char *out, size_t out_size) {
+    if (!type_name || !type_name[0] || !out || out_size == 0) return false;
+    size_t len = strlen(type_name);
+    if (len > 4 && strcmp(type_name + len - 4, ".new") == 0) len -= 4;
+    if (len + 1 > out_size) return false;
+    memcpy(out, type_name, len);
+    out[len] = '\0';
+    return true;
+}
+
+static bool gdscript_receiver_signal_target_qn(const cbm_registry_t *registry,
+                                                const cbm_gbuf_t *gbuf,
+                                                const char *project_name,
+                                                const CBMFileResult *result,
+                                                const CBMCall *call,
+                                                const char *module_qn,
+                                                const char **imp_keys,
+                                                const char **imp_vals,
+                                                int imp_count,
+                                                char *out, size_t out_size) {
+    if (!call || !call->callee_name || !call->first_string_arg || !call->first_string_arg[0])
+        return false;
+    size_t suffix_len = gdscript_signal_member_suffix_len(call->callee_name);
+    if (suffix_len == 0) return false;
+
+    char receiver_name[128];
+    if (!gdscript_receiver_var_name(call, receiver_name, sizeof(receiver_name))) return false;
+
+    const char *type_name = gdscript_type_assign_for_receiver(result, call, receiver_name);
+    if (!type_name) return false;
+
+    char normalized_type[256];
+    if (!gdscript_normalize_type_name(type_name, normalized_type, sizeof(normalized_type)))
+        return false;
+
+    const char *import_target = lookup_import_map_value(normalized_type, imp_keys, imp_vals, imp_count);
+    const char *target_anchor = NULL;
+    if (import_target) {
+        target_anchor = promote_gdscript_target_to_class(registry, gbuf, project_name,
+                                                          import_target, import_target);
+    }
+    if (!target_anchor) {
+        cbm_resolution_t target_res = cbm_registry_resolve(registry, normalized_type, module_qn,
+                                                            imp_keys, imp_vals, imp_count);
+        if (target_res.qualified_name && target_res.qualified_name[0]) {
+            target_anchor = promote_gdscript_target_to_class(registry, gbuf, project_name,
+                                                              target_res.qualified_name, NULL);
+        }
+    }
+    if (!target_anchor) return false;
+
+    snprintf(out, out_size, "%s.signal.%s", target_anchor, call->first_string_arg);
     return true;
 }
 
@@ -993,8 +1281,35 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                 continue;
             }
 
-            cbm_resolution_t res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn,
-                                                        imp_keys, imp_vals, imp_count);
+            /* GDScript signal/same-script resolution (mirrored from pass_calls.c) */
+            cbm_resolution_t res = {0};
+            if (rc->files[file_idx].language == CBM_LANG_GDSCRIPT) {
+                char anchor_qn[512];
+                char gdscript_target_qn[768];
+                bool has_anchor_qn = gdscript_script_anchor_qn(source_node, anchor_qn, sizeof(anchor_qn));
+                if (has_anchor_qn &&
+                    gdscript_same_script_target_qn(call, anchor_qn, gdscript_target_qn,
+                                                   sizeof(gdscript_target_qn))) {
+                    res = cbm_registry_resolve(rc->registry, gdscript_target_qn, module_qn,
+                                               imp_keys, imp_vals, imp_count);
+                }
+                if ((!res.qualified_name || res.qualified_name[0] == '\0') &&
+                    gdscript_receiver_signal_target_qn(rc->registry, rc->main_gbuf,
+                                                        rc->project_name, result, call,
+                                                        module_qn, imp_keys, imp_vals, imp_count,
+                                                        gdscript_target_qn, sizeof(gdscript_target_qn))) {
+                    res = cbm_registry_resolve(rc->registry, gdscript_target_qn, module_qn,
+                                               imp_keys, imp_vals, imp_count);
+                }
+                if ((!res.qualified_name || res.qualified_name[0] == '\0') &&
+                    gdscript_should_skip_generic_fallback(call)) {
+                    continue;
+                }
+            }
+            if (!res.qualified_name || res.qualified_name[0] == '\0') {
+                res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn,
+                                           imp_keys, imp_vals, imp_count);
+            }
             if (!res.qualified_name || res.qualified_name[0] == '\0') {
                 /* Unresolved call — still check for route registration by callee suffix.
                  * Handles patterns like app.include_router(r, prefix="/path") where
@@ -1140,9 +1455,52 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
             /* INHERITS */
             if (def->base_classes) {
                 for (int b = 0; def->base_classes[b]; b++) {
-                    const char *base_qn =
-                        resolve_as_class(rc->registry, def->base_classes[b], module_qn, imp_keys,
-                                         imp_vals, imp_count);
+                    const char *base_qn = NULL;
+
+                    /* GDScript: promote .gd targets to script-anchor class QNs */
+                    if (rc->files[file_idx].language == CBM_LANG_GDSCRIPT) {
+                        fprintf(stderr, "DEBUG INHERITS: file=%s base_classes[%d]=%s\n",
+                                rel, b, def->base_classes[b]);
+                        /* First try resolve_as_class for named class targets */
+                        base_qn = resolve_as_class(rc->registry, def->base_classes[b], module_qn,
+                                                   imp_keys, imp_vals, imp_count);
+                        fprintf(stderr, "  resolve_as_class -> %s\n", base_qn ? base_qn : "(null)");
+                        /* If that failed, try GDScript-specific promotion */
+                        if (!base_qn) {
+                            /* Check if base_classes[b] is a .gd path or alias */
+                            const char *import_target = lookup_import_map_value(
+                                def->base_classes[b], imp_keys, imp_vals, imp_count);
+                            fprintf(stderr, "  import_target -> %s\n", import_target ? import_target : "(null)");
+                            if (import_target && str_ends_with(import_target, ".gd")) {
+                                base_qn = promote_gdscript_target_to_class(
+                                    rc->registry, rc->main_gbuf, rc->project_name,
+                                    import_target, import_target);
+                                fprintf(stderr, "  promote(import_target) -> %s\n", base_qn ? base_qn : "(null)");
+                            }
+                            if (!base_qn && str_ends_with(def->base_classes[b], ".gd")) {
+                                base_qn = promote_gdscript_target_to_class(
+                                    rc->registry, rc->main_gbuf, rc->project_name,
+                                    def->base_classes[b], def->base_classes[b]);
+                                fprintf(stderr, "  promote(base_classes) -> %s\n", base_qn ? base_qn : "(null)");
+                            }
+                            /* Try resolving as a class name and then promoting if it's a .gd file */
+                            if (!base_qn) {
+                                cbm_resolution_t res = cbm_registry_resolve(
+                                    rc->registry, def->base_classes[b], module_qn,
+                                    imp_keys, imp_vals, imp_count);
+                                fprintf(stderr, "  registry_resolve -> %s\n", res.qualified_name ? res.qualified_name : "(null)");
+                                if (res.qualified_name && res.qualified_name[0]) {
+                                    base_qn = promote_gdscript_target_to_class(
+                                        rc->registry, rc->main_gbuf, rc->project_name,
+                                        res.qualified_name, def->base_classes[b]);
+                                    fprintf(stderr, "  promote(resolved) -> %s\n", base_qn ? base_qn : "(null)");
+                                }
+                            }
+                        }
+                    } else {
+                        base_qn = resolve_as_class(rc->registry, def->base_classes[b], module_qn,
+                                                   imp_keys, imp_vals, imp_count);
+                    }
                     if (!base_qn) {
                         continue;
                     }
@@ -1153,6 +1511,33 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                     cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, base_node->id, "INHERITS",
                                          "{}");
                     ws->semantic_resolved++;
+                }
+            } else if (rc->files[file_idx].language == CBM_LANG_GDSCRIPT && node->label &&
+                       strcmp(node->label, "Class") == 0 && node->qualified_name &&
+                       gdscript_anchor_matches_module(node->qualified_name, module_qn)) {
+                /* Fallback: read source file for extends preload("...") patterns
+                 * that the extractor didn't capture as base_classes */
+                char *fallback_source = NULL;
+                int fallback_len = 0;
+                const char *full_path = rc->files[file_idx].path;
+                fallback_source = read_file(full_path, &fallback_len);
+                if (fallback_source) {
+                    char module_path[512];
+                    if (gdscript_preload_extends_base_from_source(fallback_source, module_path,
+                                                                   sizeof(module_path))) {
+                        const char *base_qn = promote_gdscript_target_to_class(
+                            rc->registry, rc->main_gbuf, rc->project_name, NULL, module_path);
+                        if (base_qn) {
+                            const cbm_gbuf_node_t *base_node =
+                                cbm_gbuf_find_by_qn(rc->main_gbuf, base_qn);
+                            if (base_node && node->id != base_node->id) {
+                                cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, base_node->id,
+                                                     "INHERITS", "{}");
+                                ws->semantic_resolved++;
+                            }
+                        }
+                    }
+                    free(fallback_source);
                 }
             }
 
