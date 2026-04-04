@@ -11,6 +11,7 @@ bin/
 *.test
 *.out
 coverage.txt
+.artifacts/gdscript-proof/
 
 # Test fixture temp dirs (created by C test suite in CWD instead of /tmp/)
 cbm_*/
