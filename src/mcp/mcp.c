@@ -1553,6 +1553,30 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
     return store;
 }
 
+/* Convert shell-glob wildcards to POSIX ERE: bare '*' → '.*', bare '?' → '.'
+ * "Bare" means not already preceded by '.' or '\'. This lets users pass
+ * glob-style patterns like "*tool*" and have them work as ".*tool.*". */
+static char *glob_to_regex(const char *glob) {
+    size_t len = strlen(glob);
+    /* Worst case: every char expands to 2 chars plus NUL */
+    char *out = malloc(len * 2 + 1);
+    if (!out) return NULL;
+    size_t o = 0;
+    for (size_t i = 0; i < len; i++) {
+        char prev = i > 0 ? glob[i - 1] : 0;
+        if (glob[i] == '*' && prev != '.' && prev != '\\') {
+            out[o++] = '.';
+            out[o++] = '*';
+        } else if (glob[i] == '?' && prev != '.' && prev != '\\') {
+            out[o++] = '.';
+        } else {
+            out[o++] = glob[i];
+        }
+    }
+    out[o] = '\0';
+    return out;
+}
+
 static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     char *raw_project = cbm_mcp_get_string_arg(args, "project");
     project_expand_t pe = {0};
@@ -1569,37 +1593,58 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     if (label && label[0] == '\0') { free(label); label = NULL; }
     char *name_pattern = cbm_mcp_get_string_arg(args, "name_pattern");
     char *qn_pattern = cbm_mcp_get_string_arg(args, "qn_pattern");
-    /* F9: pre-validate regex patterns — O(1) per pattern via cbm_regcomp */
+    /* F9: pre-validate regex patterns — auto-convert glob wildcards to regex.
+     * Users/agents frequently pass *tool* (glob) instead of .*tool.* (regex).
+     * On regex compilation failure, try glob_to_regex() conversion before erroring. */
     if (name_pattern) {
         cbm_regex_t re;
         if (cbm_regcomp(&re, name_pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB) != 0) {
-            char errbuf[512];
-            snprintf(errbuf, sizeof(errbuf),
-                "{\"error\":\"invalid regex in name_pattern: '%s'\","
-                "\"hint\":\"Escape special chars with \\\\\\\\ or use plain text\"}", name_pattern);
-            free(label); free(name_pattern); free(pe.value);
-            return cbm_mcp_text_result(errbuf, true);
+            char *converted = glob_to_regex(name_pattern);
+            if (converted && cbm_regcomp(&re, converted, CBM_REG_EXTENDED | CBM_REG_NOSUB) == 0) {
+                cbm_regfree(&re);
+                free(name_pattern);
+                name_pattern = converted;
+            } else {
+                free(converted);
+                char errbuf[512];
+                snprintf(errbuf, sizeof(errbuf),
+                    "{\"error\":\"invalid regex in name_pattern: '%s'\","
+                    "\"hint\":\"Use regex syntax: '.*tool.*' instead of '*tool*'\"}", name_pattern);
+                free(label); free(name_pattern); free(pe.value);
+                return cbm_mcp_text_result(errbuf, true);
+            }
+        } else {
+            cbm_regfree(&re);
         }
-        cbm_regfree(&re);
     }
     if (qn_pattern) {
         cbm_regex_t re;
         if (cbm_regcomp(&re, qn_pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB) != 0) {
-            char errbuf[512];
-            snprintf(errbuf, sizeof(errbuf),
-                "{\"error\":\"invalid regex in qn_pattern: '%s'\","
-                "\"hint\":\"Escape special chars with \\\\\\\\ or use plain text\"}", qn_pattern);
-            free(label); free(name_pattern); free(qn_pattern); free(pe.value);
-            return cbm_mcp_text_result(errbuf, true);
+            char *converted = glob_to_regex(qn_pattern);
+            if (converted && cbm_regcomp(&re, converted, CBM_REG_EXTENDED | CBM_REG_NOSUB) == 0) {
+                cbm_regfree(&re);
+                free(qn_pattern);
+                qn_pattern = converted;
+            } else {
+                free(converted);
+                char errbuf[512];
+                snprintf(errbuf, sizeof(errbuf),
+                    "{\"error\":\"invalid regex in qn_pattern: '%s'\","
+                    "\"hint\":\"Use regex syntax: '.*tool.*' instead of '*tool*'\"}", qn_pattern);
+                free(label); free(name_pattern); free(qn_pattern); free(pe.value);
+                return cbm_mcp_text_result(errbuf, true);
+            }
+        } else {
+            cbm_regfree(&re);
         }
-        cbm_regfree(&re);
     }
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
     char *relationship = cbm_mcp_get_string_arg(args, "relationship");
     char *sort_by = cbm_mcp_get_string_arg(args, "sort_by");
     /* F6: validate sort_by enum — O(1) string comparisons */
     if (sort_by && strcmp(sort_by, "relevance") != 0 && strcmp(sort_by, "name") != 0 &&
-        strcmp(sort_by, "degree") != 0) {
+        strcmp(sort_by, "degree") != 0 && strcmp(sort_by, "calls") != 0 &&
+        strcmp(sort_by, "linkrank") != 0) {
         char errbuf[256];
         snprintf(errbuf, sizeof(errbuf),
             "{\"error\":\"invalid sort_by '%s'\","
@@ -2276,6 +2321,25 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     int node_count = 0;
     cbm_store_find_nodes_by_name(store, project, func_name, &nodes, &node_count);
 
+    if (node_count == 0) {
+        /* Fallback: case-insensitive substring search via cbm_store_search.
+         * Only fires when exact match misses — zero overhead on hit. */
+        cbm_search_params_t sp = {0};
+        fill_project_params(&pe, &sp);
+        sp.name_pattern = func_name;
+        sp.case_sensitive = false;
+        sp.limit = 5;
+        sp.min_degree = -1;
+        sp.max_degree = -1;
+        cbm_search_output_t sout = {0};
+        if (cbm_store_search(store, &sp, &sout) == 0 && sout.count > 0) {
+            const char *found_project = sout.results[0].node.project;
+            cbm_store_find_nodes_by_name(store,
+                                         found_project ? found_project : project,
+                                         sout.results[0].node.name, &nodes, &node_count);
+        }
+        cbm_store_search_free(&sout);
+    }
     if (node_count == 0) {
         char errbuf[512];
         snprintf(errbuf, sizeof(errbuf),
