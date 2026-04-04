@@ -1,7 +1,11 @@
 /*
  * traces.c — OTLP trace processing helpers.
  */
+#include <stdint.h>
 #include "traces/traces.h"
+#include "foundation/constants.h"
+
+enum { TRACE_PATH_SLASHES = 3, TRACE_NOT_FOUND = -1 };
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -33,11 +37,11 @@ const char *cbm_extract_path_from_url(const char *url, char *buf, size_t buf_sz)
 
     /* Find the third '/' which starts the path: https://host/path */
     int slashes = 0;
-    int idx = -1;
+    int idx = TRACE_NOT_FOUND;
     for (int i = 0; url[i]; i++) {
         if (url[i] == '/') {
             slashes++;
-            if (slashes == 3) {
+            if (slashes == TRACE_PATH_SLASHES) {
                 idx = i;
                 break;
             }
@@ -50,7 +54,7 @@ const char *cbm_extract_path_from_url(const char *url, char *buf, size_t buf_sz)
 
     /* Copy path, stopping at '?' */
     size_t j = 0;
-    for (int i = idx; url[i] && url[i] != '?' && j < buf_sz - 1; i++) {
+    for (int i = idx; url[i] && url[i] != '?' && j < buf_sz - SKIP_ONE; i++) {
         buf[j++] = url[i];
     }
     buf[j] = '\0';
@@ -63,8 +67,8 @@ int64_t cbm_parse_duration(const char *start_nano, const char *end_nano) {
     if (!start_nano || !end_nano) {
         return 0;
     }
-    int64_t start = strtoll(start_nano, NULL, 10);
-    int64_t end = strtoll(end_nano, NULL, 10);
+    int64_t start = strtoll(start_nano, NULL, CBM_DECIMAL_BASE);
+    int64_t end = strtoll(end_nano, NULL, CBM_DECIMAL_BASE);
     return (end > start) ? (end - start) : 0;
 }
 
@@ -80,7 +84,7 @@ bool cbm_extract_http_info(const cbm_trace_span_t *span, const char *service_nam
     out->span_kind = span->kind;
 
     bool has_http = false;
-    static char url_buf[1024];
+    static char url_buf[CBM_SZ_1K];
 
     for (int i = 0; i < span->attr_count; i++) {
         const char *key = span->attributes[i].key;
@@ -129,9 +133,10 @@ int64_t cbm_calculate_p99(int64_t *values, int count) {
     }
     qsort(values, count, sizeof(int64_t), cmp_int64);
 #define P99_PERCENTILE 0.99
+
     int idx = (int)((double)count * P99_PERCENTILE);
     if (idx >= count) {
-        idx = count - 1;
+        idx = count - SKIP_ONE;
     }
     return values[idx];
 }

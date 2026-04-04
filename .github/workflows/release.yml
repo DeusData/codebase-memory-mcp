@@ -1,3 +1,4 @@
+# Release pipeline: lint → test → build → smoke → soak → draft → verify → publish
 name: Release
 
 on:
@@ -17,684 +18,52 @@ on:
         type: boolean
         default: false
       soak_level:
-        description: 'Soak test level: full (quick+asan), quick (10min only), none (skip)'
+        description: 'Soak: full (quick+asan), quick (10min), none'
         type: choice
         options: ['full', 'quick', 'none']
         default: 'quick'
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
-  # ── Step 1: Lint (clang-format + cppcheck) ───────────────────
+  # ── 1. Lint + Security + CodeQL ────────────────────────────────
   lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+    uses: ./.github/workflows/_lint.yml
+    secrets: inherit
 
-      - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev cmake
-
-      - name: Install LLVM 20
-        run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" | sudo tee /etc/apt/sources.list.d/llvm-20.list
-          sudo apt-get update
-          sudo apt-get install -y clang-format-20
-
-      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
-        id: cppcheck-cache
-        with:
-          path: /opt/cppcheck
-          key: cppcheck-2.20.0-ubuntu-amd64
-
-      - name: Build cppcheck 2.20.0
-        if: steps.cppcheck-cache.outputs.cache-hit != 'true'
-        run: |
-          git clone --depth 1 --branch 2.20.0 https://github.com/danmar/cppcheck.git /tmp/cppcheck
-          cmake -S /tmp/cppcheck -B /tmp/cppcheck/build -DCMAKE_BUILD_TYPE=Release -DHAVE_RULES=OFF -DCMAKE_INSTALL_PREFIX=/opt/cppcheck
-          cmake --build /tmp/cppcheck/build -j$(nproc)
-          cmake --install /tmp/cppcheck/build
-
-      - name: Add cppcheck to PATH
-        run: echo "/opt/cppcheck/bin" >> "$GITHUB_PATH"
-
-      - name: Lint
-        run: scripts/lint.sh CLANG_FORMAT=clang-format-20
-
-  # ── Step 1b: Security audit (source-only, runs parallel with lint+tests) ──
-  # No build needed — scans source files and vendored deps only.
-  # Binary-level security (L2/L3/L4/L7) runs in smoke jobs per-platform.
-  security-static:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: "Layer 1: Static allow-list audit"
-        run: scripts/security-audit.sh
-
-      - name: "Layer 6: UI security audit"
-        run: scripts/security-ui.sh
-
-      - name: "Layer 8: Vendored dependency integrity"
-        run: scripts/security-vendored.sh
-
-  # ── Step 1c: CodeQL SAST gate ────────────────────────────────
-  # Verifies CodeQL has run on the current commit AND has 0 open alerts.
-  # Prevents false green from stale/missing scans.
-  codeql-gate:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Wait for CodeQL on current commit (max 45 min)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          CURRENT_SHA="${{ github.sha }}"
-          echo "Current commit: $CURRENT_SHA"
-          echo "Waiting for CodeQL to complete on this commit..."
-
-          for attempt in $(seq 1 90); do
-            LATEST=$(gh api repos/${{ github.repository }}/actions/workflows/codeql.yml/runs?per_page=5 \
-              --jq '.workflow_runs[] | select(.head_sha == "'"$CURRENT_SHA"'") | "\(.conclusion) \(.status)"' 2>/dev/null | head -1 || echo "")
-
-            if [ -z "$LATEST" ]; then
-              echo "  Attempt $attempt/90: No CodeQL run found for $CURRENT_SHA yet..."
-              sleep 30
-              continue
-            fi
-
-            CONCLUSION=$(echo "$LATEST" | cut -d' ' -f1)
-            STATUS=$(echo "$LATEST" | cut -d' ' -f2)
-
-            if [ "$STATUS" = "completed" ] && [ "$CONCLUSION" = "success" ]; then
-              echo "=== CodeQL completed successfully on current commit ==="
-              exit 0
-            elif [ "$STATUS" = "completed" ]; then
-              echo "BLOCKED: CodeQL completed with conclusion: $CONCLUSION"
-              exit 1
-            fi
-
-            echo "  Attempt $attempt/90: CodeQL status=$STATUS (waiting 30s)..."
-            sleep 30
-          done
-
-          echo "BLOCKED: CodeQL did not complete within 45 minutes"
-          exit 1
-
-      - name: Check for open code scanning alerts
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Wait for GitHub to finish processing alert state changes.
-          # There is a race between CodeQL marking the workflow as "completed"
-          # and the alerts API reflecting new/closed alerts from that scan.
-          echo "Waiting 60s for alert API to settle after CodeQL completion..."
-          sleep 60
-
-          # Poll alerts twice with a gap to confirm the count is stable
-          ALERTS1=$(gh api 'repos/${{ github.repository }}/code-scanning/alerts?state=open' --jq 'length' 2>/dev/null || echo "0")
-          echo "Open alerts (check 1): $ALERTS1"
-          sleep 15
-          ALERTS2=$(gh api 'repos/${{ github.repository }}/code-scanning/alerts?state=open' --jq 'length' 2>/dev/null || echo "0")
-          echo "Open alerts (check 2): $ALERTS2"
-
-          # Use the higher count (conservative — if either check sees alerts, block)
-          ALERTS=$ALERTS2
-          if [ "$ALERTS1" -gt "$ALERTS2" ]; then
-            ALERTS=$ALERTS1
-          fi
-
-          if [ "$ALERTS" -gt 0 ]; then
-            echo "BLOCKED: $ALERTS open code scanning alert(s) found."
-            gh api 'repos/${{ github.repository }}/code-scanning/alerts?state=open' \
-              --jq '.[] | "  #\(.number) [\(.rule.security_severity_level // .rule.severity)] \(.rule.id) — \(.most_recent_instance.location.path):\(.most_recent_instance.location.start_line)"' 2>/dev/null || true
-            echo "Fix them: https://github.com/${{ github.repository }}/security/code-scanning"
-            exit 1
-          fi
-          echo "=== CodeQL gate passed (0 open alerts on current commit) ==="
-
-  # ── Step 2: Unit tests (ASan + UBSan) ───────────────────────
-  # macOS: use cc (Apple Clang) — GCC on macOS doesn't ship ASan runtime
-  # Linux: use system gcc — full ASan/UBSan support
-  # Windows: MSYS2 MinGW GCC
-  test-unix:
+  # ── 2. Tests (all platforms, full suite for release) ───────────
+  test:
     needs: [lint]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            arch: amd64
-            cc: gcc
-            cxx: g++
-          - os: ubuntu-24.04-arm
-            arch: arm64
-            cc: gcc
-            cxx: g++
-          - os: macos-14
-            arch: arm64
-            cc: cc
-            cxx: c++
-          - os: macos-15-intel
-            arch: amd64
-            cc: cc
-            cxx: c++
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+    uses: ./.github/workflows/_test.yml
+    with:
+      skip_perf: false
 
-      - name: Install deps (Ubuntu)
-        if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+  # ── 3. Build all platforms ─────────────────────────────────────
+  build:
+    needs: [test]
+    uses: ./.github/workflows/_build.yml
+    with:
+      version: ${{ inputs.version }}
 
-      - name: Test
-        run: scripts/test.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+  # ── 4. Smoke test every binary ─────────────────────────────────
+  smoke:
+    needs: [build]
+    uses: ./.github/workflows/_smoke.yml
 
-  test-windows:
-    needs: [lint]
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
-        with:
-          msystem: CLANG64
-          path-type: inherit
-          install: >-
-            mingw-w64-clang-x86_64-clang
-            mingw-w64-clang-x86_64-compiler-rt
-            mingw-w64-clang-x86_64-zlib
-            make
-
-      - name: Test
-        shell: msys2 {0}
-        run: scripts/test.sh CC=clang CXX=clang++
-
-  # ── Step 3: Build binaries (standard + UI, all OS) ──────────
-  build-unix:
-    needs: [test-unix, test-windows]
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            goos: linux
-            goarch: amd64
-            cc: gcc
-            cxx: g++
-          - os: ubuntu-24.04-arm
-            goos: linux
-            goarch: arm64
-            cc: gcc
-            cxx: g++
-          - os: macos-14
-            goos: darwin
-            goarch: arm64
-            cc: cc
-            cxx: c++
-          - os: macos-15-intel
-            goos: darwin
-            goarch: amd64
-            cc: cc
-            cxx: c++
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install deps (Ubuntu)
-        if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
-
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
-        with:
-          node-version: "22"
-
-      - name: Build standard binary
-        run: scripts/build.sh --version ${{ inputs.version }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
-
-      - name: Ad-hoc sign macOS binary
-        if: startsWith(matrix.os, 'macos')
-        run: codesign --sign - --force build/c/codebase-memory-mcp
-
-      - name: Archive standard binary
-        run: |
-          cp LICENSE install.sh build/c/
-          tar -czf codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
-            -C build/c codebase-memory-mcp LICENSE install.sh
-
-      - name: Build UI binary
-        run: scripts/build.sh --with-ui --version ${{ inputs.version }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
-
-      - name: Ad-hoc sign macOS UI binary
-        if: startsWith(matrix.os, 'macos')
-        run: codesign --sign - --force build/c/codebase-memory-mcp
-
-      - name: Frontend integrity scan (post-build dist/)
-        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
-        run: scripts/security-ui.sh
-
-      - name: Archive UI binary
-        run: |
-          cp LICENSE install.sh build/c/
-          tar -czf codebase-memory-mcp-ui-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
-            -C build/c codebase-memory-mcp LICENSE install.sh
-
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: "*.tar.gz"
-
-  build-windows:
-    needs: [test-unix, test-windows]
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
-        with:
-          msystem: CLANG64
-          path-type: inherit
-          install: >-
-            mingw-w64-clang-x86_64-clang
-            mingw-w64-clang-x86_64-zlib
-            make
-            zip
-
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
-        with:
-          node-version: "22"
-
-      - name: Build standard binary
-        shell: msys2 {0}
-        run: scripts/build.sh --version ${{ inputs.version }} CC=clang CXX=clang++
-
-      - name: Archive standard binary
-        shell: msys2 {0}
-        run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          cp "$BIN" codebase-memory-mcp.exe
-          zip codebase-memory-mcp-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1
-
-      - name: Build UI binary
-        shell: msys2 {0}
-        run: scripts/build.sh --with-ui --version ${{ inputs.version }} CC=clang CXX=clang++
-
-      - name: Archive UI binary
-        shell: msys2 {0}
-        run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          cp "$BIN" codebase-memory-mcp.exe
-          zip codebase-memory-mcp-ui-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1
-
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: binaries-windows-amd64
-          path: "*.zip"
-
-  # ── Step 4: Smoke test every binary ─────────────────────────
-  smoke-unix:
-    needs: [build-unix]
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            goos: linux
-            goarch: amd64
-          - os: ubuntu-24.04-arm
-            goos: linux
-            goarch: arm64
-          - os: macos-14
-            goos: darwin
-            goarch: arm64
-          - os: macos-15-intel
-            goos: darwin
-            goarch: amd64
-        variant: [standard, ui]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
-
-      - name: Extract binary
-        run: |
-          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
-          tar -xzf codebase-memory-mcp${SUFFIX}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
-          chmod +x codebase-memory-mcp
-
-      - name: Start artifact server for E2E smoke tests
-        run: |
-          mkdir -p /tmp/smoke-server
-          cp codebase-memory-mcp /tmp/smoke-server/
-          OS=${{ matrix.goos }}
-          ARCH=${{ matrix.goarch }}
-          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
-          tar -czf "/tmp/smoke-server/codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}.tar.gz" \
-            -C /tmp/smoke-server codebase-memory-mcp
-          # Also serve under standard name so install.sh + update --standard work
-          if [ -n "$SUFFIX" ]; then
-            cp "/tmp/smoke-server/codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}.tar.gz" \
-               "/tmp/smoke-server/codebase-memory-mcp-${OS}-${ARCH}.tar.gz"
-          fi
-          cd /tmp/smoke-server
-          sha256sum *.tar.gz > checksums.txt 2>/dev/null || shasum -a 256 *.tar.gz > checksums.txt
-          python3 -m http.server 18080 -d /tmp/smoke-server &
-
-      - name: Smoke test (${{ matrix.variant }}, ${{ matrix.goos }}-${{ matrix.goarch }})
-        run: scripts/smoke-test.sh ./codebase-memory-mcp
-        env:
-          SMOKE_DOWNLOAD_URL: http://localhost:18080
-
-      - name: Binary string audit (${{ matrix.goos }}-${{ matrix.goarch }})
-        if: matrix.variant == 'standard'
-        run: scripts/security-strings.sh ./codebase-memory-mcp
-
-      - name: Install output audit (${{ matrix.goos }}-${{ matrix.goarch }})
-        if: matrix.variant == 'standard'
-        run: scripts/security-install.sh ./codebase-memory-mcp
-
-      - name: Network egress test (${{ matrix.goos }}-${{ matrix.goarch }})
-        if: matrix.variant == 'standard'
-        run: scripts/security-network.sh ./codebase-memory-mcp
-
-      - name: MCP robustness test
-        if: matrix.variant == 'standard' && matrix.goos == 'linux' && matrix.goarch == 'amd64'
-        run: scripts/security-fuzz.sh ./codebase-memory-mcp
-
-      - name: Fuzz testing (60s random input)
-        if: matrix.variant == 'standard' && matrix.goos == 'linux' && matrix.goarch == 'amd64'
-        run: scripts/security-fuzz-random.sh ./codebase-memory-mcp 60
-
-      # Native platform antivirus scan
-      - name: ClamAV scan (Linux)
-        if: matrix.variant == 'standard' && startsWith(matrix.os, 'ubuntu')
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq clamav > /dev/null 2>&1
-          # Ensure freshclam config has DatabaseMirror set
-          sudo sed -i 's/^Example/#Example/' /etc/clamav/freshclam.conf 2>/dev/null || true
-          grep -q "DatabaseMirror" /etc/clamav/freshclam.conf 2>/dev/null || \
-            echo "DatabaseMirror database.clamav.net" | sudo tee -a /etc/clamav/freshclam.conf > /dev/null
-          sudo freshclam --quiet
-          echo "=== ClamAV scan ==="
-          clamscan --no-summary ./codebase-memory-mcp
-          echo "=== ClamAV: clean ==="
-
-      - name: ClamAV scan (macOS)
-        if: matrix.variant == 'standard' && startsWith(matrix.os, 'macos')
-        run: |
-          brew install clamav > /dev/null 2>&1
-          CLAMAV_ETC=$(brew --prefix)/etc/clamav
-          if [ ! -f "$CLAMAV_ETC/freshclam.conf" ]; then
-            cp "$CLAMAV_ETC/freshclam.conf.sample" "$CLAMAV_ETC/freshclam.conf" 2>/dev/null || true
-            sed -i '' 's/^Example/#Example/' "$CLAMAV_ETC/freshclam.conf" 2>/dev/null || true
-            echo "DatabaseMirror database.clamav.net" >> "$CLAMAV_ETC/freshclam.conf"
-          fi
-          # Download signatures (--no-warnings suppresses X509 store errors on macOS)
-          freshclam --quiet --no-warnings 2>/dev/null || freshclam --quiet 2>/dev/null || echo "WARNING: freshclam update failed, using bundled signatures"
-          echo "=== ClamAV scan (macOS) ==="
-          clamscan --no-summary ./codebase-memory-mcp
-          echo "=== ClamAV: clean ==="
-
-  smoke-windows:
-    needs: [build-windows]
-    strategy:
-      matrix:
-        variant: [standard, ui]
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
-        with:
-          msystem: CLANG64
-          path-type: inherit
-          install: >-
-            mingw-w64-clang-x86_64-python3
-            unzip
-            zip
-            coreutils
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: binaries-windows-amd64
-
-      - name: Extract binary
-        shell: msys2 {0}
-        run: |
-          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
-          unzip -o "codebase-memory-mcp${SUFFIX}-windows-amd64.zip"
-          [ -n "$SUFFIX" ] && cp "codebase-memory-mcp${SUFFIX}.exe" codebase-memory-mcp.exe || true
-
-      - name: Start artifact server for E2E smoke tests
-        shell: msys2 {0}
-        run: |
-          mkdir -p /tmp/smoke-server
-          cp codebase-memory-mcp.exe /tmp/smoke-server/codebase-memory-mcp.exe
-          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
-          cd /tmp/smoke-server
-          zip -q "codebase-memory-mcp${SUFFIX}-windows-amd64.zip" codebase-memory-mcp.exe
-          # Also serve under standard name
-          if [ -n "$SUFFIX" ]; then
-            cp "codebase-memory-mcp${SUFFIX}-windows-amd64.zip" "codebase-memory-mcp-windows-amd64.zip"
-          fi
-          sha256sum *.zip > checksums.txt
-          python3 -m http.server 18080 -d /tmp/smoke-server &
-
-      - name: Smoke test (${{ matrix.variant }}, windows-amd64)
-        shell: msys2 {0}
-        run: scripts/smoke-test.sh ./codebase-memory-mcp.exe
-        env:
-          SMOKE_DOWNLOAD_URL: http://localhost:18080
-
-      - name: Binary string audit (windows-amd64)
-        if: matrix.variant == 'standard'
-        shell: msys2 {0}
-        run: scripts/security-strings.sh ./codebase-memory-mcp.exe
-
-      - name: Install output audit (windows-amd64)
-        if: matrix.variant == 'standard'
-        shell: msys2 {0}
-        run: scripts/security-install.sh ./codebase-memory-mcp.exe
-
-      # Windows Defender scan (includes ML heuristics — catches what VirusTotal misses)
-      - name: Windows Defender scan
-        if: matrix.variant == 'standard'
-        shell: pwsh
-        run: |
-          Write-Host "=== Windows Defender scan (with ML heuristics) ==="
-          # Update definitions first
-          & "C:\Program Files\Windows Defender\MpCmdRun.exe" -SignatureUpdate 2>$null
-          # Full scan of the binary
-          $result = & "C:\Program Files\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File "$PWD\codebase-memory-mcp.exe" -DisableRemediation
-          Write-Host $result
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "BLOCKED: Windows Defender flagged the binary!"
-            Write-Host "Exit code: $LASTEXITCODE"
-            exit 1
-          }
-          Write-Host "=== Windows Defender: clean ==="
-
-  # ── Step 5a: Quick soak (parallel with smoke, per-platform) ────
-  soak-quick:
+  # ── 5. Soak tests ─────────────────────────────────────────────
+  soak:
     if: ${{ inputs.soak_level != 'none' }}
-    needs: [build-unix]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            goos: linux
-            goarch: amd64
-            cc: gcc
-            cxx: g++
-          - os: ubuntu-24.04-arm
-            goos: linux
-            goarch: arm64
-            cc: gcc
-            cxx: g++
-          - os: macos-14
-            goos: darwin
-            goarch: arm64
-            cc: cc
-            cxx: c++
-          - os: macos-15-intel
-            goos: darwin
-            goarch: amd64
-            cc: cc
-            cxx: c++
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
-      - name: Install deps (Linux)
-        if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 git
-      - name: Build (release mode)
-        run: scripts/build.sh --version ${{ inputs.version }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
-      - name: Quick soak (10 min)
-        run: scripts/soak-test.sh build/c/codebase-memory-mcp 10
-      - name: Upload soak metrics
-        if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: soak-quick-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: soak-results/
-          retention-days: 14
+    needs: [build]
+    uses: ./.github/workflows/_soak.yml
+    with:
+      duration_minutes: 10
+      run_asan: ${{ inputs.soak_level == 'full' }}
+      version: ${{ inputs.version }}
 
-  # ── Step 5a-win: Quick soak (Windows, separate job) ─────────────
-  soak-quick-windows:
-    if: ${{ inputs.soak_level != 'none' }}
-    needs: [build-windows]
-    runs-on: windows-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
-      - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
-        with:
-          msystem: CLANG64
-          path-type: inherit
-          install: >-
-            mingw-w64-clang-x86_64-clang
-            mingw-w64-clang-x86_64-zlib
-            mingw-w64-clang-x86_64-python3
-            make
-            git
-            coreutils
-      - name: Build (release mode)
-        shell: msys2 {0}
-        run: scripts/build.sh --version ${{ inputs.version }} CC=clang CXX=clang++
-      - name: Quick soak (10 min)
-        shell: msys2 {0}
-        run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          scripts/soak-test.sh "$BIN" 10
-      - name: Upload soak metrics
-        if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: soak-quick-windows-amd64
-          path: soak-results/
-          retention-days: 14
-
-  # ── Step 5b: ASan soak (Linux + macOS, parallel with smoke) ────
-  soak-asan:
-    if: ${{ inputs.soak_level == 'full' }}
-    needs: [build-unix]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            goos: linux
-            goarch: amd64
-            cc: gcc
-            cxx: g++
-          - os: ubuntu-24.04-arm
-            goos: linux
-            goarch: arm64
-            cc: gcc
-            cxx: g++
-          - os: macos-14
-            goos: darwin
-            goarch: arm64
-            cc: cc
-            cxx: c++
-          - os: macos-15-intel
-            goos: darwin
-            goarch: amd64
-            cc: cc
-            cxx: c++
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
-      - name: Install deps (Linux)
-        if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 git
-      - name: Build (ASan + LeakSanitizer)
-        run: |
-          SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer"
-          scripts/build.sh --version ${{ inputs.version }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} EXTRA_CFLAGS="$SANITIZE" EXTRA_LDFLAGS="$SANITIZE"
-      - name: ASan soak (15 min)
-        env:
-          ASAN_OPTIONS: "detect_leaks=1:halt_on_error=0:log_path=soak-results/asan"
-        run: scripts/soak-test.sh build/c/codebase-memory-mcp 15
-      - name: Upload ASan soak metrics
-        if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: soak-asan-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: soak-results/
-          retention-days: 14
-
-  soak-asan-windows:
-    if: ${{ inputs.soak_level == 'full' }}
-    needs: [build-windows]
-    runs-on: windows-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
-      - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
-        with:
-          msystem: CLANG64
-          path-type: inherit
-          install: >-
-            mingw-w64-clang-x86_64-clang
-            mingw-w64-clang-x86_64-zlib
-            mingw-w64-clang-x86_64-python3
-            make
-            git
-            coreutils
-      - name: Build (ASan, no LeakSan on Windows)
-        shell: msys2 {0}
-        run: |
-          SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer"
-          scripts/build.sh --version ${{ inputs.version }} CC=clang CXX=clang++ EXTRA_CFLAGS="$SANITIZE" EXTRA_LDFLAGS="$SANITIZE"
-      - name: ASan soak (15 min, no leak detection)
-        shell: msys2 {0}
-        env:
-          ASAN_OPTIONS: "detect_leaks=0:halt_on_error=0:log_path=soak-results/asan"
-        run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          scripts/soak-test.sh "$BIN" 15
-      - name: Upload ASan soak metrics
-        if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: soak-asan-windows-amd64
-          path: soak-results/
-          retention-days: 14
-
-  # ── Step 6: Create DRAFT release (not public yet) ─────────────
+  # ── 6. Create DRAFT release ───────────────────────────────────
   release-draft:
-    needs: [smoke-unix, smoke-windows, security-static, codeql-gate, soak-quick, soak-quick-windows, soak-asan, soak-asan-windows]
+    needs: [smoke, soak, lint]
     if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
     permissions:
@@ -714,27 +83,15 @@ jobs:
       - name: Generate checksums
         run: sha256sum *.tar.gz *.zip > checksums.txt
 
-      # ── Artifact attestations (SLSA provenance) ──────────────
-      - name: Attest build provenance (tar.gz)
+      - name: Attest build provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
-          subject-path: '*.tar.gz'
+          subject-path: '*.tar.gz,*.zip,checksums.txt'
 
-      - name: Attest build provenance (zip)
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
-        with:
-          subject-path: '*.zip'
-
-      - name: Attest build provenance (checksums)
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
-        with:
-          subject-path: 'checksums.txt'
-
-      # ── SBOM generation (SPDX format) ──────────────────────────
       - name: Generate SBOM
         run: |
           python3 -c "
-          import json, uuid
+          import json
           sbom = {
             'spdxVersion': 'SPDX-2.3',
             'dataLicense': 'CC0-1.0',
@@ -764,17 +121,15 @@ jobs:
           subject-path: '*.tar.gz'
           sbom-path: 'sbom.json'
 
-      # ── Sigstore cosign signing ──────────────────────────────
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
-      - name: Sign release artifacts with cosign
+      - name: Sign artifacts
         run: |
           for f in *.tar.gz *.zip checksums.txt; do
             cosign sign-blob --yes --bundle "${f}.bundle" "$f"
           done
 
-      # ── Create DRAFT release (not visible to users yet) ──────
       - name: Delete existing release
         if: ${{ inputs.replace }}
         env:
@@ -802,10 +157,7 @@ jobs:
           body: ${{ inputs.release_notes || '' }}
           generate_release_notes: ${{ inputs.release_notes == '' }}
 
-  # ── Step 6: Verify draft release ─────────────────────────────
-  # Scans binaries with VirusTotal, runs OpenSSF Scorecard.
-  # If verification passes, appends results and publishes.
-  # If it fails, the draft stays unpublished.
+  # ── 7. Verify + Publish ────────────────────────────────────────
   verify:
     needs: [release-draft]
     runs-on: ubuntu-latest
@@ -816,10 +168,6 @@ jobs:
         with:
           persist-credentials: false
 
-      # ── VirusTotal scan ──────────────────────────────────────
-      # Extract raw binaries from archives before scanning.
-      # VirusTotal may not unpack archives >3MB, so we scan the
-      # actual executables that users will run.
       - name: Download and extract release binaries
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -827,205 +175,35 @@ jobs:
         run: |
           mkdir -p assets binaries
           gh release download "$VERSION" --dir assets --repo "$GITHUB_REPOSITORY" --pattern '*.tar.gz' --pattern '*.zip'
-          ls -la assets/
-
-          # Extract binaries from archives for scanning
           for f in assets/*.tar.gz; do
             NAME=$(basename "$f" .tar.gz)
             tar -xzf "$f" -C binaries/ 2>/dev/null || true
-            # Rename to include platform for identification
-            if [ -f binaries/codebase-memory-mcp ]; then
-              mv binaries/codebase-memory-mcp "binaries/${NAME}"
-            fi
+            [ -f binaries/codebase-memory-mcp ] && mv binaries/codebase-memory-mcp "binaries/${NAME}"
           done
           for f in assets/*.zip; do
             NAME=$(basename "$f" .zip)
             unzip -o "$f" -d binaries/ 2>/dev/null || true
-            if [ -f binaries/codebase-memory-mcp.exe ]; then
-              mv binaries/codebase-memory-mcp.exe "binaries/${NAME}.exe"
-            fi
+            [ -f binaries/codebase-memory-mcp.exe ] && mv binaries/codebase-memory-mcp.exe "binaries/${NAME}.exe"
           done
-          # Also include install scripts (users curl | sh these)
-          cp install.sh binaries/install.sh 2>/dev/null || true
-          cp install.ps1 binaries/install.ps1 2>/dev/null || true
-
-          echo "=== Files for scanning ==="
+          cp install.sh binaries/ 2>/dev/null || true
+          cp install.ps1 binaries/ 2>/dev/null || true
           ls -la binaries/
 
-      - name: Scan extracted binaries with VirusTotal
+      - name: VirusTotal scan
         uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0
         id: virustotal
         with:
           vt_api_key: ${{ secrets.VIRUS_TOTAL_SCANNER_API_KEY }}
-          files: |
-            binaries/*
+          files: binaries/*
 
-      # ── Wait for ALL VirusTotal engines to complete, then check ──
-      # The action outputs comma-separated "file=URL" pairs.
-      # URLs are /gui/file-analysis/<base64_id>/detection — we extract the
-      # base64 analysis ID and poll /api/v3/analyses/<id> until completed.
-      - name: Check VirusTotal scan results (wait for 100% completion)
+      - name: Wait for VirusTotal results
         env:
           VT_API_KEY: ${{ secrets.VIRUS_TOTAL_SCANNER_API_KEY }}
           VT_ANALYSIS: ${{ steps.virustotal.outputs.analysis }}
-        run: |
-          echo "=== Waiting for VirusTotal scans to fully complete ==="
-          MIN_ENGINES=60
-          rm -f /tmp/vt_gate_fail
+        run: scripts/ci/check-virustotal.sh
 
-          echo "$VT_ANALYSIS" | tr ',' '\n' | while IFS= read -r entry; do
-            [ -z "$entry" ] && continue
-            FILE=$(echo "$entry" | cut -d'=' -f1)
-            URL=$(echo "$entry" | cut -d'=' -f2-)
-            BASENAME=$(basename "$FILE")
-
-            # Extract base64 analysis ID from URL: /gui/file-analysis/<ID>/detection
-            ANALYSIS_ID=$(echo "$URL" | sed -n 's|.*/file-analysis/\([^/]*\)/.*|\1|p')
-            if [ -z "$ANALYSIS_ID" ]; then
-              echo "WARNING: Could not extract analysis ID from $URL"
-              # Try SHA256 fallback (older action versions use /gui/file/<sha256>)
-              ANALYSIS_ID=$(echo "$URL" | grep -oE '[a-f0-9]{64}')
-              if [ -z "$ANALYSIS_ID" ]; then
-                echo "BLOCKED: Cannot parse VirusTotal URL: $URL"
-                echo "FAIL" >> /tmp/vt_gate_fail
-                continue
-              fi
-            fi
-
-            # Poll /api/v3/analyses/<id> until status=completed (max 120 min)
-            SCAN_COMPLETE=false
-            for attempt in $(seq 1 720); do
-              RESULT=$(curl -sf --max-time 10 \
-                -H "x-apikey: $VT_API_KEY" \
-                "https://www.virustotal.com/api/v3/analyses/$ANALYSIS_ID" 2>/dev/null || echo "")
-
-              if [ -z "$RESULT" ]; then
-                echo "  $BASENAME: waiting (attempt $attempt)..."
-                sleep 10
-                continue
-              fi
-
-              STATS=$(echo "$RESULT" | python3 -c "
-          import json, sys
-          d = json.loads(sys.stdin.read())
-          attrs = d.get('data', {}).get('attributes', {})
-          status = attrs.get('status', 'queued')
-          stats = attrs.get('stats', {})
-          malicious = stats.get('malicious', 0)
-          suspicious = stats.get('suspicious', 0)
-          undetected = stats.get('undetected', 0)
-          harmless = stats.get('harmless', 0)
-          total = sum(stats.values())
-          completed = malicious + suspicious + undetected + harmless
-          print(f'{status},{malicious},{suspicious},{completed},{total}')
-          " 2>/dev/null || echo "queued,0,0,0,0")
-
-              STATUS=$(echo "$STATS" | cut -d',' -f1)
-              MALICIOUS=$(echo "$STATS" | cut -d',' -f2)
-              SUSPICIOUS=$(echo "$STATS" | cut -d',' -f3)
-              COMPLETED=$(echo "$STATS" | cut -d',' -f4)
-              TOTAL=$(echo "$STATS" | cut -d',' -f5)
-
-              if [ "$STATUS" = "completed" ]; then
-                echo "$BASENAME: $MALICIOUS malicious, $SUSPICIOUS suspicious ($COMPLETED completed, $TOTAL total engines)"
-
-                if [ "$MALICIOUS" -gt 0 ] || [ "$SUSPICIOUS" -gt 0 ]; then
-                  echo "BLOCKED: $BASENAME flagged! See $URL"
-                  echo "FAIL" >> /tmp/vt_gate_fail
-                fi
-                SCAN_COMPLETE=true
-                break
-              fi
-
-              echo "  $BASENAME: $STATUS (attempt $attempt)..."
-              sleep 10
-            done
-
-            if [ "$SCAN_COMPLETE" != "true" ]; then
-              # Script files (sh, ps1) are low-priority in VT queue — warn but don't block
-              echo "BLOCKED: $BASENAME scan did not complete within 120 minutes!"
-              echo "FAIL" >> /tmp/vt_gate_fail
-            fi
-          done
-
-          if [ -f /tmp/vt_gate_fail ]; then
-            FAIL_COUNT=$(wc -l < /tmp/vt_gate_fail | tr -d ' ')
-            echo ""
-            echo "=== VIRUSTOTAL GATE FAILED ==="
-            echo "$FAIL_COUNT binary(ies) flagged or scan incomplete."
-            echo "Draft release will NOT be published. Investigate before retrying."
-            exit 1
-          fi
-
-          echo "=== All binaries clean (all engines completed) ==="
-
-      # ── OpenSSF Scorecard gate ──────────────────────────────────
-      # Fetch public score and block release if repo health degrades below threshold.
-      - name: OpenSSF Scorecard gate (minimum 4.0)
-        run: |
-          SCORE=$(curl -sf "https://api.scorecard.dev/projects/github.com/DeusData/codebase-memory-mcp" 2>/dev/null \
-            | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('score',0))" 2>/dev/null \
-            || echo "0")
-          echo "OpenSSF Scorecard: $SCORE/10"
-          if python3 -c "exit(0 if float('$SCORE') >= 4.0 else 1)" 2>/dev/null; then
-            echo "=== Scorecard gate passed (>= 4.0) ==="
-          else
-            echo "BLOCKED: Scorecard $SCORE/10 is below minimum 4.0"
-            echo "Check https://scorecard.dev/viewer/?uri=github.com/DeusData/codebase-memory-mcp"
-            exit 1
-          fi
-
-      # ── Append results + publish ─────────────────────────────
-      - name: Append security verification and publish release
+      - name: Publish release
         env:
-          VT_ANALYSIS: ${{ steps.virustotal.outputs.analysis }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version }}
-        run: |
-          echo "=== Building security verification report ==="
-
-          REPORT=$'---\n\n### Security Verification\n\n'
-          REPORT+=$'All release binaries have been independently verified:\n\n'
-
-          # VirusTotal results (comma-separated "file=URL" pairs)
-          REPORT+=$'**VirusTotal** — scanned by 70+ antivirus engines:\n\n'
-          REPORT+=$'| Binary | Scan |\n|--------|------|\n'
-          echo "$VT_ANALYSIS" | tr ',' '\n' | while IFS= read -r entry; do
-            [ -z "$entry" ] && continue
-            FILE=$(echo "$entry" | cut -d'=' -f1)
-            URL=$(echo "$entry" | cut -d'=' -f2-)
-            BASENAME=$(basename "$FILE")
-            echo "| $BASENAME | [View Report]($URL) |"
-          done >> /tmp/vt_table
-          if [ -f /tmp/vt_table ]; then
-            REPORT+=$(cat /tmp/vt_table)$'\n'
-            rm -f /tmp/vt_table
-          fi
-
-          # Build provenance
-          REPORT+=$'**Build Provenance (SLSA)** — cryptographic proof each binary was built by GitHub Actions from this repo:\n'
-          REPORT+=$'```\ngh attestation verify <downloaded-file> --repo DeusData/codebase-memory-mcp\n```\n\n'
-
-          # Cosign
-          REPORT+=$'**Sigstore cosign** — keyless signature verification:\n'
-          REPORT+=$'```\ncosign verify-blob --bundle <file>.bundle <file>\n```\n\n'
-
-          # Native AV scans
-          REPORT+=$'**Native antivirus scans** — all binaries passed these scans before this release was created (any detection would have blocked the release):\n'
-          REPORT+=$'- Windows: Windows Defender with ML heuristics (the same engine end users run)\n'
-          REPORT+=$'- Linux: ClamAV with daily signature updates\n'
-          REPORT+=$'- macOS: ClamAV with daily signature updates\n\n'
-
-          # SBOM
-          REPORT+=$'**SBOM** — Software Bill of Materials (`sbom.json`) lists all vendored dependencies.\n\n'
-
-          REPORT+=$'See [SECURITY.md](https://github.com/DeusData/codebase-memory-mcp/blob/main/SECURITY.md) for full details.\n'
-
-          # Append to release notes
-          EXISTING=$(gh release view "$VERSION" --json body --jq '.body' --repo "$GITHUB_REPOSITORY")
-          printf '%s\n\n%s\n' "$EXISTING" "$REPORT" | gh release edit "$VERSION" --notes-file - --repo "$GITHUB_REPOSITORY"
-
-          # ── Publish: promote draft to public release ─────────
-          gh release edit "$VERSION" --draft=false --repo "$GITHUB_REPOSITORY"
-
-          echo "=== Release verified and published ==="
+        run: gh release edit "$VERSION" --draft=false --repo "$GITHUB_REPOSITORY"

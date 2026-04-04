@@ -1,3 +1,4 @@
+#include "foundation/constants.h"
 /*
  * pipeline_internal.h — Internal pipeline state shared between pass files.
  *
@@ -48,7 +49,7 @@ typedef struct {
 
 /* Check cancellation. Returns non-zero if cancelled. */
 static inline int cbm_pipeline_check_cancel(const cbm_pipeline_ctx_t *ctx) {
-    return atomic_load(ctx->cancelled) ? -1 : 0;
+    return atomic_load(ctx->cancelled) ? CBM_NOT_FOUND : 0;
 }
 
 /* ── Testable helpers ────────────────────────────────────────────── */
@@ -64,8 +65,8 @@ bool cbm_is_test_func_name(const char *name);
 
 /* Coupling result from computeChangeCoupling */
 typedef struct {
-    char file_a[512];
-    char file_b[512];
+    char file_a[CBM_SZ_512];
+    char file_b[CBM_SZ_512];
     int co_change_count;
     double coupling_score;
 } cbm_change_coupling_t;
@@ -90,13 +91,13 @@ int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx);
 /* ── Git diff helpers (pass_gitdiff.c) ───────────────────────────── */
 
 typedef struct {
-    char status[4]; /* "M", "A", "D", "R" */
-    char path[512];
-    char old_path[512]; /* non-empty only for renames */
+    char status[CBM_SZ_4]; /* M/A/D/R */ /* "M", "A", "D", "R" */
+    char path[CBM_SZ_512];
+    char old_path[CBM_SZ_512]; /* non-empty only for renames */
 } cbm_changed_file_t;
 
 typedef struct {
-    char path[512];
+    char path[CBM_SZ_512];
     int start_line;
     int end_line;
 } cbm_changed_hunk_t;
@@ -142,7 +143,7 @@ typedef struct {
     int include_count;
     char **defines;
     int define_count;
-    char standard[32];
+    char standard[CBM_SZ_32];
 } cbm_compile_flags_t;
 
 /* Split a shell command string into arguments (handles quoting).
@@ -184,81 +185,81 @@ void cbm_clean_json_brackets(const char *s, char *out, size_t out_sz);
 
 /* Key-value pair for environment variables / config entries */
 typedef struct {
-    char key[128];
-    char value[512];
+    char key[CBM_SZ_128];
+    char value[CBM_SZ_512];
 } cbm_env_kv_t;
 
 /* Dockerfile parsing result */
 typedef struct {
-    char base_image[256];
-    char stage_images[16][256];
-    char stage_names[16][128];
+    char base_image[CBM_SZ_256];
+    char stage_images[CBM_SZ_16][CBM_SZ_256];
+    char stage_names[CBM_SZ_16][CBM_SZ_128];
     int stage_count;
-    char exposed_ports[16][32];
+    char exposed_ports[CBM_SZ_16][CBM_SZ_32];
     int port_count;
-    cbm_env_kv_t env_vars[64];
+    cbm_env_kv_t env_vars[CBM_SZ_64];
     int env_count;
-    char build_args[32][128];
+    char build_args[CBM_SZ_32][CBM_SZ_128];
     int build_arg_count;
-    char workdir[256];
-    char cmd[512];
-    char entrypoint[512];
-    char healthcheck[512];
-    char user[64];
+    char workdir[CBM_SZ_256];
+    char cmd[CBM_SZ_512];
+    char entrypoint[CBM_SZ_512];
+    char healthcheck[CBM_SZ_512];
+    char user[CBM_SZ_64];
 } cbm_dockerfile_result_t;
 
 /* Dotenv parsing result */
 typedef struct {
-    cbm_env_kv_t env_vars[64];
+    cbm_env_kv_t env_vars[CBM_SZ_64];
     int env_count;
 } cbm_dotenv_result_t;
 
 /* Shell script parsing result */
 typedef struct {
-    char shebang[256];
-    cbm_env_kv_t env_vars[64];
+    char shebang[CBM_SZ_256];
+    cbm_env_kv_t env_vars[CBM_SZ_64];
     int env_count;
-    char sources[16][256];
+    char sources[CBM_SZ_16][CBM_SZ_256];
     int source_count;
-    char docker_cmds[16][256];
+    char docker_cmds[CBM_SZ_16][CBM_SZ_256];
     int docker_cmd_count;
 } cbm_shell_result_t;
 
 /* Terraform variable */
 typedef struct {
-    char name[128];
-    char type[64];
-    char default_val[256];
-    char description[256];
+    char name[CBM_SZ_128];
+    char type[CBM_SZ_64];
+    char default_val[CBM_SZ_256];
+    char description[CBM_SZ_256];
 } cbm_tf_variable_t;
 
 /* Terraform resource / data source */
 typedef struct {
-    char type[128];
-    char name[128];
+    char type[CBM_SZ_128];
+    char name[CBM_SZ_128];
 } cbm_tf_resource_t;
 
 /* Terraform module */
 typedef struct {
-    char tf_name[128];
-    char source[256];
+    char tf_name[CBM_SZ_128];
+    char source[CBM_SZ_256];
 } cbm_tf_module_t;
 
 /* Terraform parsing result */
 typedef struct {
-    cbm_tf_resource_t resources[32];
+    cbm_tf_resource_t resources[CBM_SZ_32];
     int resource_count;
-    cbm_tf_variable_t variables[32];
+    cbm_tf_variable_t variables[CBM_SZ_32];
     int variable_count;
-    char outputs[32][128];
+    char outputs[CBM_SZ_32][CBM_SZ_128];
     int output_count;
-    char providers[16][128];
+    char providers[CBM_SZ_16][CBM_SZ_128];
     int provider_count;
-    cbm_tf_module_t modules[16];
+    cbm_tf_module_t modules[CBM_SZ_16];
     int module_count;
-    cbm_tf_resource_t data_sources[16];
+    cbm_tf_resource_t data_sources[CBM_SZ_16];
     int data_source_count;
-    char backend[128];
+    char backend[CBM_SZ_128];
     bool has_locals;
 } cbm_terraform_result_t;
 
@@ -343,20 +344,21 @@ int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result
 /* Apply pre-computed couplings to the graph buffer (main thread only). */
 int cbm_pipeline_githistory_apply(cbm_pipeline_ctx_t *ctx, const cbm_githistory_result_t *result);
 
-int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx);
-
 /* Pre-dump pass: decorator tags enrichment (operates on gbuf). */
 int cbm_pipeline_pass_decorator_tags(cbm_gbuf_t *gbuf, const char *project);
 
 /* Pre-dump pass: config ↔ code linking. */
 int cbm_pipeline_pass_configlink(cbm_pipeline_ctx_t *ctx);
 
+/* Pre-dump pass: SIMILAR_TO edges via MinHash fingerprinting. */
+int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx);
+
 /* ── Env URL scanner (pass_envscan.c) ────────────────────────────── */
 
 typedef struct {
-    char key[128];
-    char value[512];
-    char file_path[256];
+    char key[CBM_SZ_128];
+    char value[CBM_SZ_512];
+    char file_path[CBM_SZ_256];
 } cbm_env_binding_t;
 
 /* Scan a project directory for environment variable assignments with URL values.

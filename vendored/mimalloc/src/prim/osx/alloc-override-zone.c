@@ -64,7 +64,8 @@ static void* zone_valloc(malloc_zone_t* zone, size_t size) {
 
 static void zone_free(malloc_zone_t* zone, void* p) {
   MI_UNUSED(zone);
-  mi_cfree(p);
+  // mi_cfree(p);  // checked free as `zone_free` may be called with invalid pointers
+  mi_free(p); // with the page_map and pagemap_commit=1 we can use the regular free
 }
 
 static void* zone_realloc(malloc_zone_t* zone, void* p, size_t newsize) {
@@ -83,7 +84,7 @@ static void zone_destroy(malloc_zone_t* zone) {
 }
 
 static unsigned zone_batch_malloc(malloc_zone_t* zone, size_t size, void** ps, unsigned count) {
-  size_t i;
+  unsigned i;
   for (i = 0; i < count; i++) {
     ps[i] = zone_malloc(zone, size);
     if (ps[i] == NULL) break;

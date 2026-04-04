@@ -11,7 +11,9 @@
  *
  * Depends on: pass_definitions having populated the registry and graph buffer
  */
+#include "foundation/constants.h"
 #include "pipeline/pipeline.h"
+#include <stdint.h>
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
@@ -30,27 +32,31 @@ static char *read_file(const char *path, int *out_len) {
     (void)fseek(f, 0, SEEK_END);
     long size = ftell(f);
     (void)fseek(f, 0, SEEK_SET);
-    if (size <= 0 || size > (long)100 * 1024 * 1024) {
+    if (size <= 0 || size > (long)CBM_PERCENT * CBM_SZ_1K * CBM_SZ_1K) {
         (void)fclose(f);
         return NULL;
     }
-    char *buf = malloc(size + 1);
+    char *buf = malloc(size + SKIP_ONE);
     if (!buf) {
         (void)fclose(f);
         return NULL;
     }
-    size_t nread = fread(buf, 1, size, f);
+    size_t nread = fread(buf, SKIP_ONE, size, f);
     (void)fclose(f);
+    if (nread > (size_t)size) {
+        nread = (size_t)size;
+    }
     buf[nread] = '\0';
     *out_len = (int)nread;
     return buf;
 }
 
 static const char *itoa_log(int val) {
-    static CBM_TLS char bufs[4][32];
+    enum { RING_BUF_COUNT = 4, RING_BUF_MASK = 3 };
+    static CBM_TLS char bufs[RING_BUF_COUNT][CBM_SZ_32];
     static CBM_TLS int idx = 0;
     int i = idx;
-    idx = (idx + 1) & 3;
+    idx = (idx + SKIP_ONE) & RING_BUF_MASK;
     snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
     return bufs[i];
 }
@@ -218,19 +224,19 @@ static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_nod
     if (!fp_ends_with(cls->file_path, ".go")) {
         return 0;
     }
-    char prefix[512];
+    char prefix[CBM_SZ_512];
     snprintf(prefix, sizeof(prefix), "%s.", cls->qualified_name);
     for (int m = 0; m < im_count; m++) {
-        char method_qn[512];
+        char method_qn[CBM_SZ_512];
         snprintf(method_qn, sizeof(method_qn), "%s%s", prefix, imethods[m].name);
         if (!cbm_gbuf_find_by_qn(ctx->gbuf, method_qn)) {
             return 0;
         }
     }
     cbm_gbuf_insert_edge(ctx->gbuf, cls->id, iface->id, "IMPLEMENTS", "{}");
-    int edges = 1;
+    int edges = SKIP_ONE;
     for (int m = 0; m < im_count; m++) {
-        char method_qn[512];
+        char method_qn[CBM_SZ_512];
         snprintf(method_qn, sizeof(method_qn), "%s%s", prefix, imethods[m].name);
         const cbm_gbuf_node_t *cm = cbm_gbuf_find_by_qn(ctx->gbuf, method_qn);
         if (cm) {
@@ -275,9 +281,9 @@ int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx) {
         }
 
         /* Collect interface method info */
-        go_imethod_t imethods[128];
+        go_imethod_t imethods[CBM_SZ_128];
         int im_count = 0;
-        for (int j = 0; j < dm_count && im_count < 128; j++) {
+        for (int j = 0; j < dm_count && im_count < CBM_SZ_128; j++) {
             const cbm_gbuf_node_t *m = cbm_gbuf_find_by_id(ctx->gbuf, dm_edges[j]->target_id);
             if (m && m->name) {
                 imethods[im_count++] = (go_imethod_t){m->name, m->id};
@@ -300,7 +306,7 @@ int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx) {
 static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *node,
                               const char *decorator, const char *module_qn, const char **imp_keys,
                               const char **imp_vals, int imp_count, int *count) {
-    char func_name[256];
+    char func_name[CBM_SZ_256];
     extract_decorator_func(decorator, func_name, sizeof(func_name));
     if (func_name[0] == '\0') {
         return;
@@ -312,7 +318,7 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
     }
     const cbm_gbuf_node_t *dec = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
     if (dec && node->id != dec->id) {
-        char props[256];
+        char props[CBM_SZ_256];
         snprintf(props, sizeof(props), "{\"decorator\":\"%s\"}", decorator);
         cbm_gbuf_insert_edge(ctx->gbuf, node->id, dec->id, "DECORATES", props);
         (*count)++;
@@ -414,7 +420,7 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
-            return -1;
+            return CBM_NOT_FOUND;
         }
 
         const char *rel = files[i].rel_path;

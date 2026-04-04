@@ -4,20 +4,8 @@
  * RED phase: Tests define expected filtering behavior for the discover module.
  */
 #include "test_framework.h"
-#include "../src/foundation/compat.h"
+#include "test_helpers.h"
 #include "discover/discover.h"
-#ifndef _WIN32
-#include <sys/stat.h>
-#endif
-
-/* Discover integration tests use system("rm -rf && mkdir -p && echo >")
- * which are Unix shell commands not available on Windows.
- * TODO: Port to C file operations for full Windows support. */
-#ifdef _WIN32
-#define SKIP_UNIX_SHELL SKIP("uses Unix shell — Windows port pending")
-#else
-#define SKIP_UNIX_SHELL ((void)0)
-#endif
 
 /* ── Directory skip (always skipped) ───────────────────────────── */
 
@@ -263,20 +251,15 @@ TEST(pattern_dts_full) {
     PASS();
 }
 
-/* ── File discovery (integration) ──────────────────────────────── */
+/* ── File discovery (integration) — cross-platform via test_helpers.h ── */
 
 TEST(discover_simple) {
-    SKIP_UNIX_SHELL;
-    /* Create a temp directory with a few files */
-    const char *base = "/tmp/test_discover_simple";
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "rm -rf %s && mkdir -p %s/src && "
-             "echo 'package main' > %s/src/main.go && "
-             "echo 'print(1)' > %s/src/app.py && "
-             "echo 'binary' > %s/src/icon.png", /* should be filtered */
-             base, base, base, base, base);
-    system(cmd);
+    char *base = th_mktempdir("cbm_disc_simple");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "src/app.py"), "print(1)\n");
+    th_write_file(TH_PATH(base, "src/icon.png"), "binary\n");
 
     cbm_discover_opts_t opts = {0};
     cbm_file_info_t *files = NULL;
@@ -286,7 +269,6 @@ TEST(discover_simple) {
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(count, 2); /* main.go + app.py, not icon.png */
 
-    /* Verify languages detected */
     bool found_go = false, found_py = false;
     for (int i = 0; i < count; i++) {
         if (files[i].language == CBM_LANG_GO)
@@ -298,21 +280,17 @@ TEST(discover_simple) {
     ASSERT_TRUE(found_py);
 
     cbm_discover_free(files, count);
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
-    system(cmd);
+    th_cleanup(base);
     PASS();
 }
 
 TEST(discover_skips_git_dir) {
-    SKIP_UNIX_SHELL;
-    const char *base = "/tmp/test_discover_gitdir";
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "rm -rf %s && mkdir -p %s/.git && mkdir -p %s/src && "
-             "echo 'x' > %s/.git/config && "
-             "echo 'package main' > %s/src/main.go",
-             base, base, base, base, base);
-    system(cmd);
+    char *base = th_mktempdir("cbm_disc_git");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".git/config"), "x\n");
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
 
     cbm_discover_opts_t opts = {0};
     cbm_file_info_t *files = NULL;
@@ -320,25 +298,21 @@ TEST(discover_skips_git_dir) {
 
     int rc = cbm_discover(base, &opts, &files, &count);
     ASSERT_EQ(rc, 0);
-    ASSERT_EQ(count, 1); /* only main.go, .git/config excluded */
+    ASSERT_EQ(count, 1);
 
     cbm_discover_free(files, count);
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
-    system(cmd);
+    th_cleanup(base);
     PASS();
 }
 
 TEST(discover_with_gitignore) {
-    SKIP_UNIX_SHELL;
-    const char *base = "/tmp/test_discover_gitignore";
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "rm -rf %s && mkdir -p %s/src && mkdir -p %s/.git && "
-             "echo '*.log' > %s/.gitignore && "
-             "echo 'package main' > %s/src/main.go && "
-             "echo 'error' > %s/src/debug.log",
-             base, base, base, base, base, base);
-    system(cmd);
+    char *base = th_mktempdir("cbm_disc_gi");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "*.log\n");
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "src/debug.log"), "error\n");
 
     cbm_discover_opts_t opts = {0};
     cbm_file_info_t *files = NULL;
@@ -346,39 +320,40 @@ TEST(discover_with_gitignore) {
 
     int rc = cbm_discover(base, &opts, &files, &count);
     ASSERT_EQ(rc, 0);
-    /* Should find main.go only, debug.log ignored by .gitignore */
     ASSERT_EQ(count, 1);
     ASSERT_EQ(files[0].language, CBM_LANG_GO);
 
     cbm_discover_free(files, count);
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
-    system(cmd);
+    th_cleanup(base);
     PASS();
 }
 
 TEST(discover_max_file_size) {
-    SKIP_UNIX_SHELL;
-    const char *base = "/tmp/test_discover_maxsize";
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "rm -rf %s && mkdir -p %s && "
-             "echo 'small' > %s/small.go && "
-             "dd if=/dev/zero of=%s/big.go bs=1024 count=100 2>/dev/null",
-             base, base, base, base);
-    system(cmd);
+    char *base = th_mktempdir("cbm_disc_size");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "small.go"), "small\n");
+    /* Create a large file (> 1KB) */
+    char bigpath[512];
+    snprintf(bigpath, sizeof(bigpath), "%s/big.go", base);
+    FILE *f = fopen(bigpath, "w");
+    ASSERT(f != NULL);
+    for (int i = 0; i < 200; i++) {
+        fprintf(f, "// padding line %d to exceed 1KB\n", i);
+    }
+    fclose(f);
 
     cbm_discover_opts_t opts = {0};
-    opts.max_file_size = 1024; /* 1KB limit */
+    opts.max_file_size = 1024;
     cbm_file_info_t *files = NULL;
     int count = 0;
 
     int rc = cbm_discover(base, &opts, &files, &count);
     ASSERT_EQ(rc, 0);
-    ASSERT_EQ(count, 1); /* only small.go */
+    ASSERT_EQ(count, 1);
 
     cbm_discover_free(files, count);
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
-    system(cmd);
+    th_cleanup(base);
     PASS();
 }
 
@@ -391,29 +366,28 @@ TEST(discover_null_path) {
 }
 
 TEST(discover_nonexistent_path) {
+    char *base = th_mktempdir("cbm_disc_noexist");
+    char fake[512];
+    snprintf(fake, sizeof(fake), "%s/nonexistent_12345", base ? base : "/tmp");
     cbm_file_info_t *files = NULL;
     int count = 0;
-    int rc = cbm_discover("/tmp/nonexistent_repo_12345", NULL, &files, &count);
+    int rc = cbm_discover(fake, NULL, &files, &count);
     ASSERT_EQ(rc, -1);
+    th_cleanup(base);
     PASS();
 }
 
 TEST(discover_free_null) {
-    cbm_discover_free(NULL, 0); /* should not crash */
+    cbm_discover_free(NULL, 0);
     PASS();
 }
 
-/* --- Ported from discover_test.go: TestDiscoverSkipsWorktrees --- */
 TEST(discover_skips_worktrees) {
-    SKIP_UNIX_SHELL;
-    const char *base = "/tmp/test_discover_worktrees";
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "rm -rf %s && mkdir -p %s/src && mkdir -p %s/.worktrees/feature/src && "
-             "echo 'package main' > %s/src/main.go && "
-             "echo 'package app' > %s/.worktrees/feature/src/app.go",
-             base, base, base, base, base);
-    system(cmd);
+    char *base = th_mktempdir("cbm_disc_wt");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    th_write_file(TH_PATH(base, ".worktrees/feature/src/app.go"), "package app\n");
 
     cbm_discover_opts_t opts = {0};
     cbm_file_info_t *files = NULL;
@@ -421,36 +395,30 @@ TEST(discover_skips_worktrees) {
 
     int rc = cbm_discover(base, &opts, &files, &count);
     ASSERT_EQ(rc, 0);
-    ASSERT_EQ(count, 1); /* only main.go, .worktrees skipped */
+    ASSERT_EQ(count, 1);
 
     bool found_main = false;
     for (int i = 0; i < count; i++) {
         if (strstr(files[i].rel_path, "main.go"))
             found_main = true;
-        /* Must NOT find worktree file */
         ASSERT_NULL(strstr(files[i].rel_path, ".worktrees"));
     }
     ASSERT_TRUE(found_main);
 
     cbm_discover_free(files, count);
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
-    system(cmd);
+    th_cleanup(base);
     PASS();
 }
 
-/* --- Ported from discover_test.go: TestCBMIgnoreBasic --- */
 TEST(discover_cbmignore) {
-    SKIP_UNIX_SHELL;
-    const char *base = "/tmp/test_discover_cbmignore";
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "rm -rf %s && mkdir -p %s/generated && mkdir -p %s/.git && "
-             "echo 'generated/\n*.pb.go' > %s/.cbmignore && "
-             "echo 'package main' > %s/main.go && "
-             "echo 'package gen' > %s/generated/types.go && "
-             "echo 'package api' > %s/api.pb.go",
-             base, base, base, base, base, base, base);
-    system(cmd);
+    char *base = th_mktempdir("cbm_disc_cbmi");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".cbmignore"), "generated/\n*.pb.go\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "generated/types.go"), "package gen\n");
+    th_write_file(TH_PATH(base, "api.pb.go"), "package api\n");
 
     cbm_discover_opts_t opts = {0};
     cbm_file_info_t *files = NULL;
@@ -458,28 +426,23 @@ TEST(discover_cbmignore) {
 
     int rc = cbm_discover(base, &opts, &files, &count);
     ASSERT_EQ(rc, 0);
-    ASSERT_EQ(count, 1); /* only main.go */
+    ASSERT_EQ(count, 1);
     ASSERT_TRUE(strstr(files[0].rel_path, "main.go") != NULL);
 
     cbm_discover_free(files, count);
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
-    system(cmd);
+    th_cleanup(base);
     PASS();
 }
 
-/* --- Ported from discover_test.go: TestCBMIgnoreStacksOnGitignore --- */
 TEST(discover_cbmignore_stacks) {
-    SKIP_UNIX_SHELL;
-    const char *base = "/tmp/test_discover_cbmignore_stack";
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "rm -rf %s && mkdir -p %s/docs && mkdir -p %s/.git && "
-             "echo '*.log' > %s/.gitignore && "
-             "echo 'docs/' > %s/.cbmignore && "
-             "echo 'package main' > %s/main.go && "
-             "echo 'package docs' > %s/docs/api.go",
-             base, base, base, base, base, base, base);
-    system(cmd);
+    char *base = th_mktempdir("cbm_disc_stack");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "*.log\n");
+    th_write_file(TH_PATH(base, ".cbmignore"), "docs/\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "docs/api.go"), "package docs\n");
 
     cbm_discover_opts_t opts = {0};
     cbm_file_info_t *files = NULL;
@@ -487,7 +450,6 @@ TEST(discover_cbmignore_stacks) {
 
     int rc = cbm_discover(base, &opts, &files, &count);
     ASSERT_EQ(rc, 0);
-    /* main.go only — docs/api.go excluded by .cbmignore */
     ASSERT_EQ(count, 1);
 
     bool found_docs = false;
@@ -498,22 +460,24 @@ TEST(discover_cbmignore_stacks) {
     ASSERT_FALSE(found_docs);
 
     cbm_discover_free(files, count);
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
-    system(cmd);
+    th_cleanup(base);
     PASS();
 }
 
-/* --- Ported from discover_test.go: TestSymlinkedFilesSkipped --- */
 TEST(discover_symlink_skipped) {
-    SKIP_UNIX_SHELL;
-    const char *base = "/tmp/test_discover_symlink";
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "rm -rf %s && mkdir -p %s && "
-             "echo 'package main' > %s/real.go && "
-             "ln -sf %s/real.go %s/link.go",
-             base, base, base, base, base);
-    system(cmd);
+#ifdef _WIN32
+    /* Symlinks require elevated privileges on Windows — skip.
+     * Guard the entire body: symlink() doesn't exist on Windows. */
+    SKIP("symlinks need admin on Windows");
+#else
+    char *base = th_mktempdir("cbm_disc_sym");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "real.go"), "package main\n");
+    char real_path[512], link_path[512];
+    snprintf(real_path, sizeof(real_path), "%s/real.go", base);
+    snprintf(link_path, sizeof(link_path), "%s/link.go", base);
+    symlink(real_path, link_path);
 
     cbm_discover_opts_t opts = {0};
     cbm_file_info_t *files = NULL;
@@ -521,7 +485,7 @@ TEST(discover_symlink_skipped) {
 
     int rc = cbm_discover(base, &opts, &files, &count);
     ASSERT_EQ(rc, 0);
-    ASSERT_EQ(count, 1); /* only real.go, not link.go (symlink) */
+    ASSERT_EQ(count, 1);
 
     bool found_real = false, found_link = false;
     for (int i = 0; i < count; i++) {
@@ -534,29 +498,22 @@ TEST(discover_symlink_skipped) {
     ASSERT_FALSE(found_link);
 
     cbm_discover_free(files, count);
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
-    system(cmd);
+    th_cleanup(base);
     PASS();
+#endif
 }
 
-/* --- Ported from discover_test.go: TestNewIgnorePatterns --- */
 TEST(discover_new_ignore_patterns) {
-    SKIP_UNIX_SHELL;
-    const char *base = "/tmp/test_discover_newignore";
-    /* Create dirs that should be in IGNORE_PATTERNS */
-    const char *dirs[] = {".next", ".terraform", "zig-cache", ".cargo", "elm-stuff", "bazel-out"};
-    int ndirs = 6;
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s && mkdir -p %s", base, base);
-    system(cmd);
+    char *base = th_mktempdir("cbm_disc_newign");
+    ASSERT(base != NULL);
 
-    for (int i = 0; i < ndirs; i++) {
-        snprintf(cmd, sizeof(cmd), "mkdir -p %s/%s && echo 'package x' > %s/%s/file.go", base,
-                 dirs[i], base, dirs[i]);
-        system(cmd);
+    const char *dirs[] = {".next", ".terraform", "zig-cache", ".cargo", "elm-stuff", "bazel-out"};
+    for (int i = 0; i < 6; i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s/file.go", base, dirs[i]);
+        th_write_file(path, "package x\n");
     }
-    snprintf(cmd, sizeof(cmd), "echo 'package main' > %s/main.go", base);
-    system(cmd);
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
 
     cbm_discover_opts_t opts = {0};
     cbm_file_info_t *files = NULL;
@@ -564,28 +521,21 @@ TEST(discover_new_ignore_patterns) {
 
     int rc = cbm_discover(base, &opts, &files, &count);
     ASSERT_EQ(rc, 0);
-    /* Only main.go — all dirs should be skipped */
     ASSERT_EQ(count, 1);
     ASSERT_TRUE(strstr(files[0].rel_path, "main.go") != NULL);
 
     cbm_discover_free(files, count);
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
-    system(cmd);
+    th_cleanup(base);
     PASS();
 }
 
-/* --- Ported from discover_test.go: TestGenericDirsNotIgnoredInFullMode --- */
 TEST(discover_generic_dirs_full_mode) {
-    SKIP_UNIX_SHELL;
-    const char *base = "/tmp/test_discover_generic_full";
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "rm -rf %s && mkdir -p %s/bin && mkdir -p %s/build && mkdir -p %s/out && "
-             "echo 'package bin' > %s/bin/main.go && "
-             "echo 'package build' > %s/build/main.go && "
-             "echo 'package out' > %s/out/main.go",
-             base, base, base, base, base, base, base);
-    system(cmd);
+    char *base = th_mktempdir("cbm_disc_genfull");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "bin/main.go"), "package bin\n");
+    th_write_file(TH_PATH(base, "build/main.go"), "package build\n");
+    th_write_file(TH_PATH(base, "out/main.go"), "package out\n");
 
     cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
     cbm_file_info_t *files = NULL;
@@ -593,27 +543,20 @@ TEST(discover_generic_dirs_full_mode) {
 
     int rc = cbm_discover(base, &opts, &files, &count);
     ASSERT_EQ(rc, 0);
-    /* bin, build, out should NOT be skipped in full mode */
     ASSERT_EQ(count, 3);
 
     cbm_discover_free(files, count);
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
-    system(cmd);
+    th_cleanup(base);
     PASS();
 }
 
-/* --- Ported from discover_test.go: TestGenericDirsIgnoredInFastMode --- */
 TEST(discover_generic_dirs_fast_mode) {
-    SKIP_UNIX_SHELL;
-    const char *base = "/tmp/test_discover_generic_fast";
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "rm -rf %s && mkdir -p %s/bin && mkdir -p %s/build && mkdir -p %s/out && "
-             "echo 'package bin' > %s/bin/main.go && "
-             "echo 'package build' > %s/build/main.go && "
-             "echo 'package out' > %s/out/main.go",
-             base, base, base, base, base, base, base);
-    system(cmd);
+    char *base = th_mktempdir("cbm_disc_genfast");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "bin/main.go"), "package bin\n");
+    th_write_file(TH_PATH(base, "build/main.go"), "package build\n");
+    th_write_file(TH_PATH(base, "out/main.go"), "package out\n");
 
     cbm_discover_opts_t opts = {.mode = CBM_MODE_FAST};
     cbm_file_info_t *files = NULL;
@@ -621,28 +564,20 @@ TEST(discover_generic_dirs_fast_mode) {
 
     int rc = cbm_discover(base, &opts, &files, &count);
     ASSERT_EQ(rc, 0);
-    /* bin, build, out should be skipped in fast mode */
     ASSERT_EQ(count, 0);
 
     cbm_discover_free(files, count);
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
-    system(cmd);
+    th_cleanup(base);
     PASS();
 }
 
-/* --- Ported from discover_test.go: TestCBMIgnoreWithoutGitRepo --- */
 TEST(discover_cbmignore_no_git) {
-    SKIP_UNIX_SHELL;
-    const char *base = "/tmp/test_discover_cbmignore_nogit";
-    char cmd[512];
-    /* No .git directory — .cbmignore should still work */
-    snprintf(cmd, sizeof(cmd),
-             "rm -rf %s && mkdir -p %s/scratch && "
-             "echo 'scratch/' > %s/.cbmignore && "
-             "echo 'package main' > %s/main.go && "
-             "echo 'package scratch' > %s/scratch/tmp.go",
-             base, base, base, base, base);
-    system(cmd);
+    char *base = th_mktempdir("cbm_disc_nogit");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, ".cbmignore"), "scratch/\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "scratch/tmp.go"), "package scratch\n");
 
     cbm_discover_opts_t opts = {0};
     cbm_file_info_t *files = NULL;
@@ -650,12 +585,11 @@ TEST(discover_cbmignore_no_git) {
 
     int rc = cbm_discover(base, &opts, &files, &count);
     ASSERT_EQ(rc, 0);
-    ASSERT_EQ(count, 1); /* only main.go */
+    ASSERT_EQ(count, 1);
     ASSERT_TRUE(strstr(files[0].rel_path, "main.go") != NULL);
 
     cbm_discover_free(files, count);
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
-    system(cmd);
+    th_cleanup(base);
     PASS();
 }
 
@@ -729,7 +663,7 @@ SUITE(discover) {
     RUN_TEST(pattern_stories);
     RUN_TEST(pattern_dts_full);
 
-    /* Integration tests */
+    /* Integration tests (cross-platform) */
     RUN_TEST(discover_simple);
     RUN_TEST(discover_skips_git_dir);
     RUN_TEST(discover_with_gitignore);
@@ -738,7 +672,7 @@ SUITE(discover) {
     RUN_TEST(discover_nonexistent_path);
     RUN_TEST(discover_free_null);
 
-    /* Go test ports */
+    /* Go test ports (cross-platform) */
     RUN_TEST(discover_skips_worktrees);
     RUN_TEST(discover_cbmignore);
     RUN_TEST(discover_cbmignore_stacks);

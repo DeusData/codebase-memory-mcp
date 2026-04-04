@@ -5,6 +5,7 @@
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <store/store.h>
 #include <string.h>
 #include <stdlib.h>
@@ -420,9 +421,6 @@ TEST(store_search_exclude_labels) {
 /* ── Dump to file ──────────────────────────────────────────────── */
 
 TEST(store_dump_to_file) {
-#ifdef _WIN32
-    SKIP("temp file path handling — Windows port pending");
-#endif
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
 
@@ -438,10 +436,9 @@ TEST(store_dump_to_file) {
     ASSERT_TRUE(id > 0);
 
     /* Dump to temp file */
-    char path[256]; snprintf(path, sizeof(path), "/tmp/cbm_test_dump_XXXXXX");
-    int fd = cbm_mkstemp(path);
-    ASSERT_TRUE(fd >= 0);
-    close(fd);
+    char *td = th_mktempdir("cbm_dump");
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test.db", td);
 
     int rc = cbm_store_dump_to_file(s, path);
     ASSERT_EQ(rc, CBM_STORE_OK);

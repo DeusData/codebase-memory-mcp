@@ -103,6 +103,8 @@ typedef struct {
     const char *route_method;  // HTTP method from decorator (e.g., "POST") or NULL
     int complexity;            // cyclomatic complexity
     int lines;                 // body line count
+    uint32_t *fingerprint;     // MinHash fingerprint (arena-allocated, K values) or NULL
+    int fingerprint_k;         // number of hash values (CBM_MINHASH_K or 0)
     bool is_exported;
     bool is_abstract;
     bool is_test;
@@ -390,7 +392,12 @@ void cbm_destroy_thread_parser(void);
 void cbm_shutdown(void);
 
 // Profiling: get accumulated parse/extraction times and file count.
-void cbm_get_profile(uint64_t *parse_ns, uint64_t *extract_ns, uint64_t *files);
+typedef struct {
+    uint64_t *parse_ns;
+    uint64_t *extract_ns;
+    uint64_t *files;
+} cbm_profile_out_t;
+void cbm_get_profile(cbm_profile_out_t out);
 uint64_t cbm_get_lsp_ns(void);
 uint64_t cbm_get_preprocess_ns(void);
 uint64_t cbm_get_files_preprocessed(void);

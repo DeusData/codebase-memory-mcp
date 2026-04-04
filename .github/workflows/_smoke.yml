@@ -1,0 +1,193 @@
+# Reusable: smoke test every binary (standard + UI, all platforms)
+name: Smoke
+
+on:
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+          - os: macos-14
+            goos: darwin
+            goarch: arm64
+          - os: macos-15-intel
+            goos: darwin
+            goarch: amd64
+        variant: [standard, ui]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+
+      - name: Extract binary
+        run: |
+          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
+          tar -xzf codebase-memory-mcp${SUFFIX}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+          chmod +x codebase-memory-mcp
+
+      - name: Start artifact server
+        run: |
+          mkdir -p /tmp/smoke-server
+          cp codebase-memory-mcp /tmp/smoke-server/
+          OS=${{ matrix.goos }}; ARCH=${{ matrix.goarch }}
+          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
+          tar -czf "/tmp/smoke-server/codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}.tar.gz" \
+            -C /tmp/smoke-server codebase-memory-mcp
+          if [ -n "$SUFFIX" ]; then
+            cp "/tmp/smoke-server/codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}.tar.gz" \
+               "/tmp/smoke-server/codebase-memory-mcp-${OS}-${ARCH}.tar.gz"
+          fi
+          cd /tmp/smoke-server
+          sha256sum *.tar.gz > checksums.txt 2>/dev/null || shasum -a 256 *.tar.gz > checksums.txt
+          python3 -m http.server 18080 -d /tmp/smoke-server &
+
+      - name: Smoke test
+        run: scripts/smoke-test.sh ./codebase-memory-mcp
+        env:
+          SMOKE_DOWNLOAD_URL: http://localhost:18080
+
+      - name: Security audits (standard only)
+        if: matrix.variant == 'standard'
+        run: |
+          scripts/security-strings.sh ./codebase-memory-mcp
+          scripts/security-install.sh ./codebase-memory-mcp
+          scripts/security-network.sh ./codebase-memory-mcp
+
+      - name: MCP robustness test (linux-amd64 standard only)
+        if: matrix.variant == 'standard' && matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          scripts/security-fuzz.sh ./codebase-memory-mcp
+          scripts/security-fuzz-random.sh ./codebase-memory-mcp 60
+
+      - name: ClamAV scan (Linux)
+        if: matrix.variant == 'standard' && startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq clamav > /dev/null 2>&1
+          sudo sed -i 's/^Example/#Example/' /etc/clamav/freshclam.conf 2>/dev/null || true
+          grep -q "DatabaseMirror" /etc/clamav/freshclam.conf 2>/dev/null || \
+            echo "DatabaseMirror database.clamav.net" | sudo tee -a /etc/clamav/freshclam.conf > /dev/null
+          sudo freshclam --quiet
+          clamscan --no-summary ./codebase-memory-mcp
+
+      - name: ClamAV scan (macOS)
+        if: matrix.variant == 'standard' && startsWith(matrix.os, 'macos')
+        run: |
+          brew install clamav > /dev/null 2>&1
+          CLAMAV_ETC=$(brew --prefix)/etc/clamav
+          if [ ! -f "$CLAMAV_ETC/freshclam.conf" ]; then
+            cp "$CLAMAV_ETC/freshclam.conf.sample" "$CLAMAV_ETC/freshclam.conf" 2>/dev/null || true
+            sed -i '' 's/^Example/#Example/' "$CLAMAV_ETC/freshclam.conf" 2>/dev/null || true
+            echo "DatabaseMirror database.clamav.net" >> "$CLAMAV_ETC/freshclam.conf"
+          fi
+          freshclam --quiet --no-warnings 2>/dev/null || freshclam --quiet 2>/dev/null || echo "WARNING: freshclam update failed"
+          clamscan --no-summary ./codebase-memory-mcp
+
+  smoke-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [standard, ui]
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-python3
+            unzip
+            zip
+            coreutils
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: binaries-windows-amd64
+
+      - name: Extract binary
+        shell: msys2 {0}
+        run: |
+          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
+          unzip -o "codebase-memory-mcp${SUFFIX}-windows-amd64.zip"
+          [ -n "$SUFFIX" ] && cp "codebase-memory-mcp${SUFFIX}.exe" codebase-memory-mcp.exe || true
+
+      - name: Start artifact server
+        shell: msys2 {0}
+        run: |
+          mkdir -p /tmp/smoke-server
+          cp codebase-memory-mcp.exe /tmp/smoke-server/
+          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
+          cd /tmp/smoke-server
+          zip -q "codebase-memory-mcp${SUFFIX}-windows-amd64.zip" codebase-memory-mcp.exe
+          if [ -n "$SUFFIX" ]; then
+            cp "codebase-memory-mcp${SUFFIX}-windows-amd64.zip" "codebase-memory-mcp-windows-amd64.zip"
+          fi
+          sha256sum *.zip > checksums.txt
+          python3 -m http.server 18080 -d /tmp/smoke-server &
+
+      - name: Smoke test
+        shell: msys2 {0}
+        run: scripts/smoke-test.sh ./codebase-memory-mcp.exe
+        env:
+          SMOKE_DOWNLOAD_URL: http://localhost:18080
+
+      - name: Security audits (standard only)
+        if: matrix.variant == 'standard'
+        shell: msys2 {0}
+        run: |
+          scripts/security-strings.sh ./codebase-memory-mcp.exe
+          scripts/security-install.sh ./codebase-memory-mcp.exe
+
+      - name: Windows Defender scan (standard only)
+        if: matrix.variant == 'standard'
+        shell: pwsh
+        run: |
+          & "C:\Program Files\Windows Defender\MpCmdRun.exe" -SignatureUpdate 2>$null
+          $result = & "C:\Program Files\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File "$PWD\codebase-memory-mcp.exe" -DisableRemediation
+          Write-Host $result
+          if ($LASTEXITCODE -ne 0) { Write-Host "BLOCKED: Windows Defender flagged binary!"; exit 1 }
+          Write-Host "=== Windows Defender: clean ==="
+
+  smoke-linux-portable:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+        variant: [standard, ui]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: binaries-linux-${{ matrix.arch }}-portable
+
+      - name: Extract and smoke test
+        run: |
+          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
+          tar -xzf codebase-memory-mcp${SUFFIX}-linux-${{ matrix.arch }}-portable.tar.gz
+          chmod +x codebase-memory-mcp
+          scripts/smoke-test.sh ./codebase-memory-mcp

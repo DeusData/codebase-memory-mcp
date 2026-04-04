@@ -10,6 +10,10 @@
 #include "discover/userconfig.h"
 #include "cbm.h" // CBMLanguage, CBM_LANG_*
 
+#include "foundation/constants.h"
+
+enum { LANG_SCAN_PASSES = 2 };
+#define SLEN(s) (sizeof(s) - 1)
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
@@ -417,7 +421,7 @@ CBMLanguage cbm_language_for_filename(const char *filename) {
             if (lang != CBM_LANG_COUNT) {
                 return lang;
             }
-            p = strchr(p + 1, '.');
+            p = strchr(p + SKIP_ONE, '.');
         }
     }
 
@@ -456,7 +460,7 @@ static bool has_magma_end_markers(const char *buf) {
 /* Check for "intrinsic Name(" or "procedure Name(" patterns. */
 static bool has_magma_callable_pattern(const char *buf) {
     const char *markers[] = {"intrinsic ", "procedure "};
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < LANG_SCAN_PASSES; i++) {
         const char *p = strstr(buf, markers[i]);
         if (!p) {
             continue;
@@ -480,16 +484,18 @@ static bool has_matlab_line_markers(const char *buf) {
         while (*p == ' ' || *p == '\t') {
             p++;
         }
-        if (strncmp(p, "function ", 9) == 0 || strncmp(p, "function\t", 9) == 0 ||
-            strncmp(p, "classdef ", 9) == 0 || strncmp(p, "classdef\t", 9) == 0 ||
-            strncmp(p, "%%", 2) == 0 || (*p == '%' && *(p + 1) != '{')) {
+        if (strncmp(p, "function ", SLEN("function ")) == 0 ||
+            strncmp(p, "function\t", SLEN("function\t")) == 0 ||
+            strncmp(p, "classdef ", SLEN("classdef ")) == 0 ||
+            strncmp(p, "classdef\t", SLEN("classdef\t")) == 0 || strncmp(p, "%%", PAIR_LEN) == 0 ||
+            (*p == '%' && *(p + SKIP_ONE) != '{')) {
             return true;
         }
         const char *nl = strchr(line, '\n');
         if (!nl) {
             break;
         }
-        line = nl + 1;
+        line = nl + SKIP_ONE;
     }
     return false;
 }
@@ -505,8 +511,8 @@ CBMLanguage cbm_disambiguate_m(const char *path) {
     }
 
     /* Read first 4KB */
-    char buf[4096 + 1];
-    size_t n = fread(buf, 1, 4096, f);
+    char buf[CBM_SZ_4K + SKIP_ONE];
+    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
     buf[n] = '\0';
     (void)fclose(f);
 

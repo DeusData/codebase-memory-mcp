@@ -4,6 +4,7 @@
  * POSIX: direct wrappers around opendir/readdir/closedir, popen/pclose, mkdir, unlink.
  * Windows: FindFirstFile/FindNextFile, _popen/_pclose, _mkdir, _unlink.
  */
+#include "foundation/constants.h"
 #include "foundation/compat_fs.h"
 
 #include <stdio.h>
@@ -40,13 +41,13 @@ cbm_dir_t *cbm_opendir(const char *path) {
         return NULL;
     }
     memcpy(pattern, path, len);
-    if (len > 0 && path[len - 1] != '\\' && path[len - 1] != '/') {
+    if (len > 0 && path[len - SKIP_ONE] != '\\' && path[len - SKIP_ONE] != '/') {
         pattern[len++] = '\\';
     }
     pattern[len++] = '*';
     pattern[len] = '\0';
 
-    cbm_dir_t *d = (cbm_dir_t *)calloc(1, sizeof(cbm_dir_t));
+    cbm_dir_t *d = (cbm_dir_t *)calloc(CBM_ALLOC_ONE, sizeof(cbm_dir_t));
     if (!d) {
         free(pattern);
         return NULL;
@@ -87,7 +88,7 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
 
     size_t nlen = strlen(d->find_data.cFileName);
     if (nlen >= CBM_DIRENT_NAME_MAX) {
-        nlen = CBM_DIRENT_NAME_MAX - 1;
+        nlen = CBM_DIRENT_NAME_MAX - SKIP_ONE;
     }
     memcpy(d->entry.name, d->find_data.cFileName, nlen);
     d->entry.name[nlen] = '\0';
@@ -124,7 +125,7 @@ bool cbm_mkdir_p(const char *path, int mode) {
     if (!tmp) {
         return false;
     }
-    for (char *p = tmp + 1; *p; p++) {
+    for (char *p = tmp + SKIP_ONE; *p; p++) {
         if (*p == '/' || *p == '\\') {
             *p = '\0';
             _mkdir(tmp); /* ignore errors for intermediate dirs */
@@ -146,7 +147,7 @@ int cbm_rmdir(const char *path) {
 
 int cbm_exec_no_shell(const char *const *argv) {
     if (!argv || !argv[0]) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
     return (int)_spawnvp(_P_WAIT, argv[0], argv);
 }
@@ -174,7 +175,7 @@ cbm_dir_t *cbm_opendir(const char *path) {
     if (!dir) {
         return NULL;
     }
-    cbm_dir_t *d = (cbm_dir_t *)calloc(1, sizeof(cbm_dir_t));
+    cbm_dir_t *d = (cbm_dir_t *)calloc(CBM_ALLOC_ONE, sizeof(cbm_dir_t));
     if (!d) {
         closedir(dir);
         return NULL;
@@ -191,12 +192,13 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
     while ((de = readdir(d->dir)) != NULL) {
         /* Skip "." and ".." */
         if (de->d_name[0] == '.' &&
-            (de->d_name[1] == '\0' || (de->d_name[1] == '.' && de->d_name[2] == '\0'))) {
+            (de->d_name[SKIP_ONE] == '\0' ||
+             (de->d_name[SKIP_ONE] == '.' && de->d_name[PAIR_LEN] == '\0'))) {
             continue;
         }
         size_t nlen = strlen(de->d_name);
         if (nlen >= CBM_DIRENT_NAME_MAX) {
-            nlen = CBM_DIRENT_NAME_MAX - 1;
+            nlen = CBM_DIRENT_NAME_MAX - SKIP_ONE;
         }
         memcpy(d->entry.name, de->d_name, nlen);
         d->entry.name[nlen] = '\0';
@@ -234,7 +236,7 @@ bool cbm_mkdir_p(const char *path, int mode) {
     if (!tmp) {
         return false;
     }
-    for (char *p = tmp + 1; *p; p++) {
+    for (char *p = tmp + SKIP_ONE; *p; p++) {
         if (*p == '/') {
             *p = '\0';
             mkdir(tmp, (mode_t)mode); /* ignore intermediate errors */
@@ -256,11 +258,11 @@ int cbm_rmdir(const char *path) {
 
 int cbm_exec_no_shell(const char *const *argv) {
     if (!argv || !argv[0]) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
     pid_t pid = fork();
     if (pid < 0) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
     if (pid == 0) {
         /* Child: exec directly — no shell interpretation */
@@ -272,12 +274,12 @@ int cbm_exec_no_shell(const char *const *argv) {
     /* Parent: wait for child */
     int status = 0;
     if (waitpid(pid, &status, 0) < 0) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
     if (WIFEXITED(status)) {
         return WEXITSTATUS(status);
     }
-    return -1; /* killed by signal */
+    return CBM_NOT_FOUND; /* killed by signal */
 }
 
 #endif /* _WIN32 */

@@ -11,6 +11,7 @@
 #include "discover/discover.h"
 #include "cbm.h" // CBMLanguage, CBM_LANG_COUNT, CBM_LANG_JSON
 
+#include "foundation/constants.h"
 #include "foundation/compat_fs.h"
 #include <stdint.h> // int64_t
 #include <stdio.h>
@@ -208,7 +209,7 @@ typedef struct {
 static void fl_add(file_list_t *fl, const char *abs_path, const char *rel_path, CBMLanguage lang,
                    int64_t size) {
     if (fl->count >= fl->capacity) {
-        int new_cap = fl->capacity ? fl->capacity * 2 : 256;
+        int new_cap = fl->capacity ? fl->capacity * PAIR_LEN : CBM_SZ_256;
         cbm_file_info_t *new_files = realloc(fl->files, new_cap * sizeof(cbm_file_info_t));
         if (!new_files) {
             return;
@@ -290,14 +291,14 @@ static CBMLanguage detect_file_language(const char *entry_name, const char *abs_
 static int safe_stat(const char *abs_path, struct stat *st) {
 #ifdef _WIN32
     if (stat(abs_path, st) != 0) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
 #else
     if (lstat(abs_path, st) != 0) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
     if (S_ISLNK(st->st_mode)) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
 #endif
     return 0;
@@ -317,41 +318,71 @@ static void walk_dir_process_file(const char *abs_path, const char *rel_path, co
     fl_add(out, abs_path, rel_path, lang, size);
 }
 
-static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_discover_opts_t *opts,
-                     const cbm_gitignore_t *gitignore, const cbm_gitignore_t *cbmignore,
-                     file_list_t *out) {
-    cbm_dir_t *d = cbm_opendir(dir_path);
-    if (!d) {
+typedef struct {
+    char dir[CBM_SZ_4K];
+    char prefix[CBM_SZ_4K];
+} walk_frame_t;
+#define WALK_STACK_CAP 512
+/* Build abs/rel paths and process one directory entry. */
+static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *frame,
+                                   const cbm_discover_opts_t *opts,
+                                   const cbm_gitignore_t *gitignore,
+                                   const cbm_gitignore_t *cbmignore, walk_frame_t *stack, int *top,
+                                   file_list_t *out) {
+    char abs_path[CBM_SZ_4K];
+    char rel_path[CBM_SZ_4K];
+    snprintf(abs_path, sizeof(abs_path), "%s/%s", frame->dir, entry->name);
+    if (frame->prefix[0] != '\0') {
+        snprintf(rel_path, sizeof(rel_path), "%s/%s", frame->prefix, entry->name);
+    } else {
+        snprintf(rel_path, sizeof(rel_path), "%s", entry->name);
+    }
+
+    struct stat st;
+    if (safe_stat(abs_path, &st) != 0) {
         return;
     }
 
-    cbm_dirent_t *entry;
-    while ((entry = cbm_readdir(d)) != NULL) {
-        char abs_path[4096];
-        char rel_path[4096];
-        snprintf(abs_path, sizeof(abs_path), "%s/%s", dir_path, entry->name);
-        if (rel_prefix[0] != '\0') {
-            snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_prefix, entry->name);
-        } else {
-            snprintf(rel_path, sizeof(rel_path), "%s", entry->name);
+    if (S_ISDIR(st.st_mode)) {
+        if (!should_skip_directory(entry->name, rel_path, opts, gitignore, cbmignore)) {
+            if (*top < WALK_STACK_CAP) {
+                snprintf(stack[*top].dir, CBM_SZ_4K, "%s", abs_path);
+                snprintf(stack[*top].prefix, CBM_SZ_4K, "%s", rel_path);
+                (*top)++;
+            }
         }
+    } else if (S_ISREG(st.st_mode)) {
+        walk_dir_process_file(abs_path, rel_path, entry->name, opts, gitignore, cbmignore,
+                              st.st_size, out);
+    }
+}
 
-        struct stat st;
-        if (safe_stat(abs_path, &st) != 0) {
+static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_discover_opts_t *opts,
+                     const cbm_gitignore_t *gitignore, const cbm_gitignore_t *cbmignore,
+                     file_list_t *out) {
+    walk_frame_t *stack = calloc(WALK_STACK_CAP, sizeof(walk_frame_t));
+    if (!stack) {
+        return;
+    }
+    int top = 0;
+    snprintf(stack[top].dir, CBM_SZ_4K, "%s", dir_path);
+    snprintf(stack[top].prefix, CBM_SZ_4K, "%s", rel_prefix);
+    top++;
+
+    while (top > 0) {
+        walk_frame_t frame = stack[--top];
+        cbm_dir_t *d = cbm_opendir(frame.dir);
+        if (!d) {
             continue;
         }
 
-        if (S_ISDIR(st.st_mode)) {
-            if (!should_skip_directory(entry->name, rel_path, opts, gitignore, cbmignore)) {
-                walk_dir(abs_path, rel_path, opts, gitignore, cbmignore, out);
-            }
-        } else if (S_ISREG(st.st_mode)) {
-            walk_dir_process_file(abs_path, rel_path, entry->name, opts, gitignore, cbmignore,
-                                  st.st_size, out);
+        cbm_dirent_t *entry;
+        while ((entry = cbm_readdir(d)) != NULL) {
+            walk_dir_process_entry(entry, &frame, opts, gitignore, cbmignore, stack, &top, out);
         }
+        cbm_closedir(d);
     }
-
-    cbm_closedir(d);
+    free(stack);
 }
 
 /* ── Public API ──────────────────────────────────────────────────── */
@@ -359,7 +390,7 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
 int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
                  int *count) {
     if (!repo_path || !out || !count) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
 
     *out = NULL;
@@ -368,12 +399,12 @@ int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_fil
     /* Verify directory exists */
     struct stat st;
     if (stat(repo_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
 
     /* Load gitignore if .git directory exists */
     cbm_gitignore_t *gitignore = NULL;
-    char gi_path[4096];
+    char gi_path[CBM_SZ_4K];
     snprintf(gi_path, sizeof(gi_path), "%s/.git", repo_path);
     struct stat gi_stat;
     if (stat(gi_path, &gi_stat) == 0 && S_ISDIR(gi_stat.st_mode)) {

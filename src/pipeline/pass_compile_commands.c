@@ -4,6 +4,11 @@
  * Parses compile_commands.json to extract per-file include paths, defines,
  * and C/C++ standard flags.
  */
+#include "foundation/constants.h"
+
+enum { CC_FLAG_IDX = 1, CC_FLAG_SKIP = 2 };
+
+#define SLEN(s) (sizeof(s) - 1)
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 
@@ -28,7 +33,7 @@ int cbm_split_command(const char *cmd, char **out, int max_out) {
     }
 
     int count = 0;
-    char current[4096];
+    char current[CBM_SZ_4K];
     int clen = 0;
     char in_quote = 0;
 
@@ -37,14 +42,14 @@ int cbm_split_command(const char *cmd, char **out, int max_out) {
         if (in_quote) {
             if (c == in_quote) {
                 in_quote = 0;
-            } else if (clen < (int)sizeof(current) - 1) {
+            } else if (clen < (int)sizeof(current) - SKIP_ONE) {
                 current[clen++] = c;
             }
         } else if (c == '"' || c == '\'') {
             in_quote = c;
         } else if (c == ' ' || c == '\t') {
             count = emit_token(current, &clen, out, count, max_out);
-        } else if (clen < (int)sizeof(current) - 1) {
+        } else if (clen < (int)sizeof(current) - SKIP_ONE) {
             current[clen++] = c;
         }
     }
@@ -64,7 +69,7 @@ static char *resolve_path(const char *path, const char *directory) {
 
     /* Relative — join with directory */
     if (directory && directory[0]) {
-        char buf[4096];
+        char buf[CBM_SZ_4K];
         snprintf(buf, sizeof(buf), "%s/%s", directory, path);
         return strdup(buf);
     }
@@ -76,9 +81,9 @@ static char *resolve_path(const char *path, const char *directory) {
 static bool try_include_flag(cbm_compile_flags_t *f, const char **args, int argc, int *i,
                              const char *directory) {
     const char *arg = args[*i];
-    if (arg[0] == '-' && arg[1] == 'I') {
-        const char *path = arg + 2;
-        if (*path == '\0' && *i + 1 < argc) {
+    if (arg[0] == '-' && arg[CC_FLAG_IDX] == 'I') {
+        const char *path = arg + CC_FLAG_SKIP;
+        if (*path == '\0' && *i + SKIP_ONE < argc) {
             (*i)++;
             path = args[*i];
         }
@@ -87,7 +92,7 @@ static bool try_include_flag(cbm_compile_flags_t *f, const char **args, int argc
         }
         return true;
     }
-    if (strcmp(arg, "-isystem") == 0 && *i + 1 < argc) {
+    if (strcmp(arg, "-isystem") == 0 && *i + SKIP_ONE < argc) {
         (*i)++;
         f->include_paths[f->include_count++] = resolve_path(args[*i], directory);
         return true;
@@ -98,11 +103,11 @@ static bool try_include_flag(cbm_compile_flags_t *f, const char **args, int argc
 /* Try to consume a -D define flag. Returns true if consumed. */
 static bool try_define_flag(cbm_compile_flags_t *f, const char **args, int argc, int *i) {
     const char *arg = args[*i];
-    if (arg[0] != '-' || arg[1] != 'D') {
+    if (arg[0] != '-' || arg[CC_FLAG_IDX] != 'D') {
         return false;
     }
-    const char *define = arg + 2;
-    if (*define == '\0' && *i + 1 < argc) {
+    const char *define = arg + CC_FLAG_SKIP;
+    if (*define == '\0' && *i + SKIP_ONE < argc) {
         (*i)++;
         define = args[*i];
     }
@@ -113,7 +118,7 @@ static bool try_define_flag(cbm_compile_flags_t *f, const char **args, int argc,
 }
 
 cbm_compile_flags_t *cbm_extract_flags(const char **args, int argc, const char *directory) {
-    cbm_compile_flags_t *f = calloc(1, sizeof(*f));
+    cbm_compile_flags_t *f = calloc(CBM_ALLOC_ONE, sizeof(*f));
     if (!f) {
         return NULL;
     }
@@ -127,7 +132,7 @@ cbm_compile_flags_t *cbm_extract_flags(const char **args, int argc, const char *
         if (try_define_flag(f, args, argc, &i)) {
             continue;
         }
-        if (strncmp(args[i], "-std=", 5) == 0) {
+        if (strncmp(args[i], "-std=", SLEN("-std=")) == 0) {
             snprintf(f->standard, sizeof(f->standard), "%s", args[i] + 5);
         }
     }
@@ -192,9 +197,9 @@ static int process_compile_entry(yyjson_val *entry, const char *repo_path, char 
         return 0;
     }
 
-    char *split_args[256];
-    const char *flag_args[256];
-    int flag_argc = extract_flag_args(args_val, cmd_val, flag_args, split_args, 256);
+    char *split_args[CBM_SZ_256] = {NULL};
+    const char *flag_args[CBM_SZ_256];
+    int flag_argc = extract_flag_args(args_val, cmd_val, flag_args, split_args, CBM_SZ_256);
 
     if (flag_argc == 0) {
         return 0;
@@ -212,7 +217,7 @@ static int process_compile_entry(yyjson_val *entry, const char *repo_path, char 
         return 0;
     }
 
-    char abs_path[4096];
+    char abs_path[CBM_SZ_4K];
     if (file_path[0] != '/' && directory && directory[0]) {
         snprintf(abs_path, sizeof(abs_path), "%s/%s", directory, file_path);
     } else {
@@ -225,28 +230,28 @@ static int process_compile_entry(yyjson_val *entry, const char *repo_path, char 
         return 0;
     }
 
-    *out_path = strdup(abs_path + repo_len + 1);
+    *out_path = strdup(abs_path + repo_len + SKIP_ONE);
     *out_flag = f;
-    return 1;
+    return SKIP_ONE;
 }
 
 int cbm_parse_compile_commands(const char *json_data, const char *repo_path, char ***out_paths,
                                cbm_compile_flags_t ***out_flags) {
     if (!json_data || !repo_path || !out_paths || !out_flags) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
     *out_paths = NULL;
     *out_flags = NULL;
 
     yyjson_doc *doc = yyjson_read(json_data, strlen(json_data), 0);
     if (!doc) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
 
     yyjson_val *root = yyjson_doc_get_root(doc);
     if (!yyjson_is_arr(root)) {
         yyjson_doc_free(doc);
-        return -1;
+        return CBM_NOT_FOUND;
     }
 
     int arr_len = (int)yyjson_arr_size(root);

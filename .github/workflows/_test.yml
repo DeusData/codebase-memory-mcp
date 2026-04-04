@@ -1,0 +1,67 @@
+# Reusable: unit + integration tests on all platforms
+name: Test
+
+on:
+  workflow_call:
+    inputs:
+      skip_perf:
+        description: 'Skip incremental perf tests (phases 2-7)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  test-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-24.04-arm
+            cc: gcc
+            cxx: g++
+          - os: macos-14
+            cc: cc
+            cxx: c++
+          - os: macos-15-intel
+            cc: cc
+            cxx: c++
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install deps (Ubuntu)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      - name: Test
+        run: scripts/test.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+        env:
+          CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
+
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-compiler-rt
+            mingw-w64-clang-x86_64-zlib
+            make
+
+      - name: Test
+        shell: msys2 {0}
+        run: scripts/test.sh CC=clang CXX=clang++
+        env:
+          CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}

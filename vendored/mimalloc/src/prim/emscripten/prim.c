@@ -1,5 +1,5 @@
 /* ----------------------------------------------------------------------------
-Copyright (c) 2018-2023, Microsoft Research, Daan Leijen, Alon Zakai
+Copyright (c) 2018-2025, Microsoft Research, Daan Leijen, Alon Zakai
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
@@ -58,7 +58,7 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config) {
 extern void emmalloc_free(void*);
 
 int _mi_prim_free(void* addr, size_t size) {
-  MI_UNUSED(size);
+  if (size==0) return 0;
   emmalloc_free(addr);
   return 0;
 }
@@ -110,6 +110,11 @@ int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit) {
 }
 
 int _mi_prim_reset(void* addr, size_t size) {
+  MI_UNUSED(addr); MI_UNUSED(size);
+  return 0;
+}
+
+int _mi_prim_reuse(void* addr, size_t size) {
   MI_UNUSED(addr); MI_UNUSED(size);
   return 0;
 }
@@ -203,12 +208,12 @@ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
 #if defined(MI_USE_PTHREADS)
 
 // use pthread local storage keys to detect thread ending
-// (and used with MI_TLS_PTHREADS for the default heap)
+// (and used with MI_TLS_PTHREADS for the default theap)
 pthread_key_t _mi_heap_default_key = (pthread_key_t)(-1);
 
 static void mi_pthread_done(void* value) {
   if (value!=NULL) {
-    _mi_thread_done((mi_heap_t*)value);
+    _mi_thread_done((mi_theap_t*)value);
   }
 }
 
@@ -221,9 +226,9 @@ void _mi_prim_thread_done_auto_done(void) {
   // nothing to do
 }
 
-void _mi_prim_thread_associate_default_heap(mi_heap_t* heap) {
+void _mi_prim_thread_associate_default_theap(mi_theap_t* theap) {
   if (_mi_heap_default_key != (pthread_key_t)(-1)) {  // can happen during recursive invocation on freeBSD
-    pthread_setspecific(_mi_heap_default_key, heap);
+    pthread_setspecific(_mi_heap_default_key, theap);
   }
 }
 
@@ -237,8 +242,11 @@ void _mi_prim_thread_done_auto_done(void) {
   // nothing
 }
 
-void _mi_prim_thread_associate_default_heap(mi_heap_t* heap) {
-  MI_UNUSED(heap);
-
+void _mi_prim_thread_associate_default_theap(mi_theap_t* theap) {
+  MI_UNUSED(theap);
 }
 #endif
+
+bool _mi_prim_thread_is_in_threadpool(void) {
+  return false;
+}

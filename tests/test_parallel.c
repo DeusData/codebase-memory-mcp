@@ -8,6 +8,7 @@
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/worker_pool.h"
@@ -71,9 +72,7 @@ static int setup_parallel_repo(void) {
 }
 
 static void rm_rf(const char *path) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
-    (void)system(cmd);
+    th_rmtree(path);
 }
 
 static void teardown_parallel_repo(void) {

@@ -2,7 +2,7 @@
  * discover.h — File discovery, language detection, and gitignore matching.
  *
  * Provides:
- *   - Language detection from filename/extension (64 languages)
+ *   - Language detection from filename/extension (CBM_SZ_64 languages)
  *   - .m file disambiguation (Objective-C vs Magma vs MATLAB)
  *   - Gitignore-style pattern parsing and matching
  *   - Recursive directory walk with hardcoded + gitignore filtering

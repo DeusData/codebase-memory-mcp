@@ -21,18 +21,25 @@
 // Maximum pattern count for bitmask mode.
 #define CBM_AC_MAX_BITMASK 64
 
+#define CBM_AC_BYTE_RANGE 256
+#define CBM_AC_NO_STATE (-1)
+#define CBM_AC_ROOT_STATES 1
+#define CBM_AC_ALLOC_ONE 1
+#define CBM_AC_PATTERN_BIT(p) (1ULL << (p))
+#define CBM_AC_CLEAR_LOW_BIT(b) ((b) & ((b) - 1ULL))
+
 // Decompression buffer alignment mask (round up to 64KB chunks).
 #define DECOMP_BUF_ALIGN_MASK 0xFFFF
 
 struct CBMAutomaton {
     int num_states;
     int num_patterns;
-    int alpha_size;         // 256 for raw byte, or smaller for mapped alphabet
-    uint8_t alpha_map[256]; // byte → mapped index (identity if alpha_size==256)
-    int *go_table;          // [num_states * alpha_size] — pre-computed transitions
-    uint64_t *output;       // [num_states] — bitmask of matching pattern IDs
-    int *output_list;       // [num_states] — linked list: pattern ID or -1
-    int *output_next;       // [num_states] — next pointer for output_list chain
+    int alpha_size;                       // 256 for raw byte, or smaller for mapped alphabet
+    uint8_t alpha_map[CBM_AC_BYTE_RANGE]; // byte → mapped index (identity if alpha_size==256)
+    int *go_table;                        // [num_states * alpha_size] — pre-computed transitions
+    uint64_t *output;                     // [num_states] — bitmask of matching pattern IDs
+    int *output_list;                     // [num_states] — linked list: pattern ID or -1
+    int *output_next;                     // [num_states] — next pointer for output_list chain
 };
 
 // ─── Build ─────────────────────────────────────────────────────────────────
@@ -64,27 +71,27 @@ static void queue_free(Queue *q) {
 // Phase 1: Build trie (goto function) from patterns. Returns state count.
 static int ac_build_trie(CBMAutomaton *ac, const char **patterns, const int *lengths, int count) {
     int alpha_size = ac->alpha_size;
-    int num_states = 1; // state 0 = root
+    int num_states = CBM_AC_ROOT_STATES; // state 0 = root
 
     for (int p = 0; p < count; p++) {
         int state = 0;
         for (int j = 0; j < lengths[p]; j++) {
             int c = ac->alpha_map[(unsigned char)patterns[p][j]];
             int idx = (state * alpha_size) + c;
-            if (ac->go_table[idx] == -1) {
+            if (ac->go_table[idx] == CBM_AC_NO_STATE) {
                 ac->go_table[idx] = num_states++;
             }
             state = ac->go_table[idx];
         }
         if (p < CBM_AC_MAX_BITMASK) {
-            ac->output[state] |= (1ULL << p);
+            ac->output[state] |= CBM_AC_PATTERN_BIT(p);
         }
         ac->output_list[state] = p;
     }
 
     // Root self-loops for unmatched bytes.
     for (int c = 0; c < alpha_size; c++) {
-        if (ac->go_table[c] == -1) {
+        if (ac->go_table[c] == CBM_AC_NO_STATE) {
             ac->go_table[c] = 0;
         }
     }
@@ -112,10 +119,11 @@ static void ac_build_failure(CBMAutomaton *ac, int num_states) {
         for (int c = 0; c < alpha_size; c++) {
             int idx = (r * alpha_size) + c;
             int s = ac->go_table[idx];
-            if (s != -1) {
+            if (s != CBM_AC_NO_STATE) {
                 fail[s] = ac->go_table[(fail[r] * alpha_size) + c];
                 ac->output[s] |= ac->output[fail[s]];
-                if (ac->output_next[s] == -1 && ac->output_list[fail[s]] != -1) {
+                if (ac->output_next[s] == CBM_AC_NO_STATE &&
+                    ac->output_list[fail[s]] != CBM_AC_NO_STATE) {
                     ac->output_next[s] = fail[s];
                 }
                 queue_push(&q, s);
@@ -171,34 +179,34 @@ CBMAutomaton *cbm_ac_build(const char **patterns, const int *lengths, int count,
         return NULL;
     }
     if (alpha_size <= 0) {
-        alpha_size = 256;
+        alpha_size = CBM_AC_BYTE_RANGE;
     }
 
-    int max_states = 1;
+    int max_states = CBM_AC_ROOT_STATES;
     for (int i = 0; i < count; i++) {
         max_states += lengths[i];
     }
 
-    CBMAutomaton *ac = (CBMAutomaton *)calloc(1, sizeof(CBMAutomaton));
+    CBMAutomaton *ac = (CBMAutomaton *)calloc(CBM_AC_ALLOC_ONE, sizeof(CBMAutomaton));
     ac->alpha_size = alpha_size;
     ac->num_patterns = count;
 
     if (alpha_map) {
-        memcpy(ac->alpha_map, alpha_map, 256);
+        memcpy(ac->alpha_map, alpha_map, CBM_AC_BYTE_RANGE);
     } else {
-        for (int i = 0; i < 256; i++) {
+        for (int i = 0; i < CBM_AC_BYTE_RANGE; i++) {
             ac->alpha_map[i] = (uint8_t)i;
         }
     }
 
     ac->go_table = (int *)malloc((size_t)max_states * alpha_size * sizeof(int));
-    memset(ac->go_table, -1, (size_t)max_states * alpha_size * sizeof(int));
+    memset(ac->go_table, CBM_AC_NO_STATE, (size_t)max_states * alpha_size * sizeof(int));
     ac->output = (uint64_t *)calloc(max_states, sizeof(uint64_t));
     ac->output_list = (int *)malloc(max_states * sizeof(int));
     ac->output_next = (int *)malloc(max_states * sizeof(int));
     for (int i = 0; i < max_states; i++) {
-        ac->output_list[i] = -1;
-        ac->output_next[i] = -1;
+        ac->output_list[i] = CBM_AC_NO_STATE;
+        ac->output_next[i] = CBM_AC_NO_STATE;
     }
 
     int num_states = ac_build_trie(ac, patterns, lengths, count);
@@ -252,7 +260,7 @@ static char *get_decomp_buf(int needed) {
         free(tls_decomp_buf);
         // Round up to 64KB chunks for reuse.
         int cap = (needed + DECOMP_BUF_ALIGN_MASK) & ~DECOMP_BUF_ALIGN_MASK;
-        tls_decomp_buf = (char *)malloc((size_t)cap);
+        tls_decomp_buf = (cap > 0) ? (char *)malloc((size_t)cap) : NULL;
         tls_decomp_cap = cap;
     }
     return tls_decomp_buf;
@@ -385,13 +393,13 @@ int cbm_ac_scan_batch(const CBMAutomaton *ac, const char *names_buf, const int *
                     out_matches[total].name_index = n;
                     out_matches[total].pattern_id = pid;
                     total++;
-                    seen |= (1ULL << pid);
-                    bits &= bits - 1; // clear lowest set bit
+                    seen |= CBM_AC_PATTERN_BIT(pid);
+                    bits = CBM_AC_CLEAR_LOW_BIT(bits);
                 }
 
                 // Follow output_next for patterns beyond bitmask range.
                 int next_state = ac->output_next[s];
-                if (next_state == -1 || next_state == s) {
+                if (next_state == CBM_AC_NO_STATE || next_state == s) {
                     break;
                 }
                 s = next_state;

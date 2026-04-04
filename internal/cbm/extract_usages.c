@@ -3,7 +3,10 @@
 #include "lang_specs.h"
 #include "extract_unified.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
-#include <stdint.h>          // uint32_t
+#include "foundation/constants.h"
+
+enum { MAX_PARENT_DEPTH = 10, LAST_IDX = 1 };
+#include <stdint.h> // uint32_t
 #include <string.h>
 #include <ctype.h>
 
@@ -14,7 +17,7 @@ static void walk_usages(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec
 static bool is_inside_call(TSNode node, const CBMLangSpec *spec) {
     TSNode cur = ts_node_parent(node);
     int depth = 0;
-    while (!ts_node_is_null(cur) && depth < 10) {
+    while (!ts_node_is_null(cur) && depth < MAX_PARENT_DEPTH) {
         if (cbm_kind_in_set(cur, spec->call_node_types)) {
             return true;
         }
@@ -31,7 +34,7 @@ static bool is_inside_import(TSNode node, const CBMLangSpec *spec) {
     }
     TSNode cur = ts_node_parent(node);
     int depth = 0;
-    while (!ts_node_is_null(cur) && depth < 10) {
+    while (!ts_node_is_null(cur) && depth < MAX_PARENT_DEPTH) {
         if (cbm_kind_in_set(cur, spec->import_node_types)) {
             return true;
         }
@@ -76,7 +79,7 @@ static bool is_definition_name(TSNode node) {
     if (ts_node_is_null(parent)) {
         return false;
     }
-    TSNode name_field = ts_node_child_by_field_name(parent, "name", 4);
+    TSNode name_field = ts_node_child_by_field_name(parent, TS_FIELD("name"));
     return !ts_node_is_null(name_field) &&
            ts_node_start_byte(name_field) == ts_node_start_byte(node) &&
            ts_node_end_byte(name_field) == ts_node_end_byte(node);
@@ -113,7 +116,7 @@ static void walk_usages(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec
         TSNode node = stack[--top];
         try_emit_usage(ctx, node, spec);
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - 1; i >= 0 && top < USAGES_STACK_CAP; i--) {
+        for (int i = (int)count - LAST_IDX; i >= 0 && top < USAGES_STACK_CAP; i--) {
             stack[top++] = ts_node_child(node, (uint32_t)i);
         }
     }
@@ -149,7 +152,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     // Skip if it's a definition name (left side of assignment, function name)
     TSNode parent = ts_node_parent(node);
     if (!ts_node_is_null(parent)) {
-        TSNode name_field = ts_node_child_by_field_name(parent, "name", 4);
+        TSNode name_field = ts_node_child_by_field_name(parent, TS_FIELD("name"));
         if (!ts_node_is_null(name_field) &&
             ts_node_start_byte(name_field) == ts_node_start_byte(node) &&
             ts_node_end_byte(name_field) == ts_node_end_byte(node)) {

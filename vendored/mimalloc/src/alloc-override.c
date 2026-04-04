@@ -71,24 +71,20 @@ typedef void* mi_nothrow_t;
   #define MI_INTERPOSE_FUN(oldfun,newfun) { (const void*)&newfun, (const void*)&oldfun }
   #define MI_INTERPOSE_MI(fun)            MI_INTERPOSE_FUN(fun,mi_##fun)
 
-  __attribute__((used)) static struct mi_interpose_s _mi_interposes[]  __attribute__((section("__DATA, __interpose"))) =
+  #define MI_INTERPOSE_DECLS(name)        __attribute__((used)) static struct mi_interpose_s name[]  __attribute__((section("__DATA, __interpose")))
+
+  MI_INTERPOSE_DECLS(_mi_interposes) =
   {
     MI_INTERPOSE_MI(malloc),
     MI_INTERPOSE_MI(calloc),
     MI_INTERPOSE_MI(realloc),
     MI_INTERPOSE_MI(strdup),
-    #if defined(MAC_OS_X_VERSION_10_7) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_7
-    MI_INTERPOSE_MI(strndup),
-    #endif
     MI_INTERPOSE_MI(realpath),
     MI_INTERPOSE_MI(posix_memalign),
     MI_INTERPOSE_MI(reallocf),
     MI_INTERPOSE_MI(valloc),
     MI_INTERPOSE_FUN(malloc_size,mi_malloc_size_checked),
     MI_INTERPOSE_MI(malloc_good_size),
-    #if defined(MAC_OS_X_VERSION_10_15) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_15
-    MI_INTERPOSE_MI(aligned_alloc),
-    #endif
     #ifdef MI_OSX_ZONE
     // we interpose malloc_default_zone in alloc-override-osx.c so we can use mi_free safely
     MI_INTERPOSE_MI(free),
@@ -98,6 +94,12 @@ typedef void* mi_nothrow_t;
     MI_INTERPOSE_FUN(free,mi_cfree), // use safe free that checks if pointers are from us
     MI_INTERPOSE_FUN(vfree,mi_cfree),
     #endif
+  };
+  MI_INTERPOSE_DECLS(_mi_interposes_10_7) __OSX_AVAILABLE(10.7) = {
+    MI_INTERPOSE_MI(strndup),
+  };
+  MI_INTERPOSE_DECLS(_mi_interposes_10_15) __OSX_AVAILABLE(10.15) = {
+    MI_INTERPOSE_MI(aligned_alloc),
   };
 
   #ifdef __cplusplus
@@ -134,14 +136,14 @@ typedef void* mi_nothrow_t;
   mi_decl_export void* malloc(size_t size)              MI_FORWARD1(mi_malloc, size)
   mi_decl_export void* calloc(size_t size, size_t n)    MI_FORWARD2(mi_calloc, size, n)
   mi_decl_export void* realloc(void* p, size_t newsize) MI_FORWARD2(mi_realloc, p, newsize)
-  mi_decl_export void  free(void* p)                    MI_FORWARD0(mi_free, p)  
+  mi_decl_export void  free(void* p)                    MI_FORWARD0(mi_free, p)
   // In principle we do not need to forward `strdup`/`strndup` but on some systems these do not use `malloc` internally (but a more primitive call)
   // We only override if `strdup` is not a macro (as on some older libc's, see issue #885)
   #if !defined(strdup)
   mi_decl_export char* strdup(const char* str)             MI_FORWARD1(mi_strdup, str)
   #endif
   #if !defined(strndup) && (!defined(__APPLE__) || (defined(MAC_OS_X_VERSION_10_7) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_7))
-  mi_decl_export char* strndup(const char* str, size_t n)  MI_FORWARD2(mi_strndup, str, n)   
+  mi_decl_export char* strndup(const char* str, size_t n)  MI_FORWARD2(mi_strndup, str, n)
   #endif
 #endif
 
@@ -202,17 +204,17 @@ typedef void* mi_nothrow_t;
   void _ZdaPv(void* p)            MI_FORWARD0(mi_free,p) // delete[]
   void _ZdlPvm(void* p, size_t n) MI_FORWARD02(mi_free_size,p,n)
   void _ZdaPvm(void* p, size_t n) MI_FORWARD02(mi_free_size,p,n)
-  
+
   void _ZdlPvSt11align_val_t(void* p, size_t al)            { mi_free_aligned(p,al); }
   void _ZdaPvSt11align_val_t(void* p, size_t al)            { mi_free_aligned(p,al); }
   void _ZdlPvmSt11align_val_t(void* p, size_t n, size_t al) { mi_free_size_aligned(p,n,al); }
   void _ZdaPvmSt11align_val_t(void* p, size_t n, size_t al) { mi_free_size_aligned(p,n,al); }
 
-  void _ZdlPvRKSt9nothrow_t(void* p, mi_nothrow_t tag)      { MI_UNUSED(tag); mi_free(p); }  // operator delete(void*, std::nothrow_t const&) 
+  void _ZdlPvRKSt9nothrow_t(void* p, mi_nothrow_t tag)      { MI_UNUSED(tag); mi_free(p); }  // operator delete(void*, std::nothrow_t const&)
   void _ZdaPvRKSt9nothrow_t(void* p, mi_nothrow_t tag)      { MI_UNUSED(tag); mi_free(p); }  // operator delete[](void*, std::nothrow_t const&)
-  void _ZdlPvSt11align_val_tRKSt9nothrow_t(void* p, size_t al, mi_nothrow_t tag) { MI_UNUSED(tag); mi_free_aligned(p,al); } // operator delete(void*, std::align_val_t, std::nothrow_t const&) 
-  void _ZdaPvSt11align_val_tRKSt9nothrow_t(void* p, size_t al, mi_nothrow_t tag) { MI_UNUSED(tag); mi_free_aligned(p,al); } // operator delete[](void*, std::align_val_t, std::nothrow_t const&) 
-  
+  void _ZdlPvSt11align_val_tRKSt9nothrow_t(void* p, size_t al, mi_nothrow_t tag) { MI_UNUSED(tag); mi_free_aligned(p,al); } // operator delete(void*, std::align_val_t, std::nothrow_t const&)
+  void _ZdaPvSt11align_val_tRKSt9nothrow_t(void* p, size_t al, mi_nothrow_t tag) { MI_UNUSED(tag); mi_free_aligned(p,al); } // operator delete[](void*, std::align_val_t, std::nothrow_t const&)
+
   #if (MI_INTPTR_SIZE==8)
     void* _Znwm(size_t n)                             MI_FORWARD1(mi_new,n)  // new 64-bit
     void* _Znam(size_t n)                             MI_FORWARD1(mi_new,n)  // new[] 64-bit

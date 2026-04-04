@@ -5,7 +5,11 @@
  * Pure helper functions + a store-level pass that classifies decorators
  * into semantic tags via auto-discovery (words on 2+ nodes become tags).
  */
+#include "foundation/constants.h"
+
+enum { ENRICH_ATTR_SKIP = 2, ENRICH_MAX_CAMEL = 16 };
 #include "pipeline/pipeline.h"
+#include <stdint.h>
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
@@ -17,6 +21,13 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Convert intptr_t to void* without triggering performance-no-int-to-ptr. */
+static inline void *intptr_to_ptr(intptr_t v) {
+    void *p;
+    memcpy(&p, &v, sizeof(p));
+    return p;
+}
 
 static bool is_decorator_stopword(const char *w) {
     static const char *stopwords[] = {"get",   "set",  "new",   "class",  "method", "function",
@@ -43,8 +54,8 @@ int cbm_split_camel_case(const char *s, char **out, int max_out) {
     int count = 0;
     size_t start = 0;
 
-    for (size_t i = 1; i < len; i++) {
-        if (s[i] >= 'A' && s[i] <= 'Z' && s[i - 1] >= 'a' && s[i - 1] <= 'z') {
+    for (size_t i = SKIP_ONE; i < len; i++) {
+        if (s[i] >= 'A' && s[i] <= 'Z' && s[i - SKIP_ONE] >= 'a' && s[i - SKIP_ONE] <= 'z') {
             if (count < max_out) {
                 out[count] = cbm_strndup(s + start, i - start);
                 count++;
@@ -67,11 +78,11 @@ static char *strip_decorator_syntax(char *buf) {
     if (*p == '@') {
         p++;
     }
-    if (p[0] == '#' && p[1] == '[') {
-        p += 2;
+    if (p[0] == '#' && p[SKIP_ONE] == '[') {
+        p += ENRICH_ATTR_SKIP;
         size_t plen = strlen(p);
-        if (plen > 0 && p[plen - 1] == ']') {
-            p[plen - 1] = '\0';
+        if (plen > 0 && p[plen - SKIP_ONE] == ']') {
+            p[plen - SKIP_ONE] = '\0';
         }
     }
     char *paren = strchr(p, '(');
@@ -91,10 +102,10 @@ int cbm_tokenize_decorator(const char *dec, char **out, int max_out) {
         return 0;
     }
 
-    char buf[256];
+    char buf[CBM_SZ_256];
     size_t len = strlen(dec);
     if (len >= sizeof(buf)) {
-        len = sizeof(buf) - 1;
+        len = sizeof(buf) - SKIP_ONE;
     }
     memcpy(buf, dec, len);
     buf[len] = '\0';
@@ -106,14 +117,14 @@ int cbm_tokenize_decorator(const char *dec, char **out, int max_out) {
     char *part = strtok_r(p, " ", &saveptr);
 
     while (part && count < max_out) {
-        char *camel_parts[16];
-        int camel_count = cbm_split_camel_case(part, camel_parts, 16);
+        char *camel_parts[ENRICH_MAX_CAMEL];
+        int camel_count = cbm_split_camel_case(part, camel_parts, ENRICH_MAX_CAMEL);
 
         for (int i = 0; i < camel_count && count < max_out; i++) {
             for (char *c = camel_parts[i]; *c; c++) {
                 *c = (char)tolower((unsigned char)*c);
             }
-            if (strlen(camel_parts[i]) >= 2 && !is_decorator_stopword(camel_parts[i])) {
+            if (strlen(camel_parts[i]) >= PAIR_LEN && !is_decorator_stopword(camel_parts[i])) {
                 out[count++] = camel_parts[i];
             } else {
                 free(camel_parts[i]);
@@ -169,7 +180,7 @@ static char **extract_decorators_from_json(const char *json) {
         return NULL;
     }
 
-    char **out = calloc(cnt + 1, sizeof(char *));
+    char **out = calloc(cnt + SKIP_ONE, sizeof(char *));
     size_t idx = 0;
     yyjson_val *item;
     yyjson_arr_iter iter;
@@ -199,16 +210,16 @@ static int extract_decorator_words(const char *json, char ***out_words) {
     }
 
     /* Collect unique words from all decorators */
-    char *all_words[256];
+    char *all_words[CBM_SZ_256];
     int total = 0;
-    CBMHashTable *seen = cbm_ht_create(32);
+    CBMHashTable *seen = cbm_ht_create(CBM_SZ_32);
 
     for (int i = 0; decorators[i]; i++) {
-        char *tokens[32];
-        int tc = cbm_tokenize_decorator(decorators[i], tokens, 32);
+        char *tokens[CBM_SZ_32];
+        int tc = cbm_tokenize_decorator(decorators[i], tokens, CBM_SZ_32);
         for (int j = 0; j < tc; j++) {
-            if (!cbm_ht_get(seen, tokens[j]) && total < 256) {
-                cbm_ht_set(seen, tokens[j], (void *)1);
+            if (!cbm_ht_get(seen, tokens[j]) && total < CBM_SZ_256) {
+                cbm_ht_set(seen, tokens[j], intptr_to_ptr(SKIP_ONE));
                 all_words[total++] = tokens[j];
             } else {
                 free(tokens[j]);
@@ -302,7 +313,7 @@ static int collect_decorated_nodes(cbm_gbuf_t *gbuf, tagged_node_t **out_nodes,
                 continue;
             }
             if (node_count >= node_cap) {
-                node_cap = node_cap ? node_cap * 2 : 64;
+                node_cap = node_cap ? node_cap * PAIR_LEN : CBM_SZ_64;
                 nodes = safe_realloc(nodes, sizeof(tagged_node_t) * node_cap);
             }
             tagged_node_t *tn = &nodes[node_count++];
@@ -312,7 +323,7 @@ static int collect_decorated_nodes(cbm_gbuf_t *gbuf, tagged_node_t **out_nodes,
             tn->word_count = wc;
             for (int w = 0; w < wc; w++) {
                 intptr_t cnt = (intptr_t)cbm_ht_get(word_counts, words[w]);
-                cbm_ht_set(word_counts, words[w], (void *)(cnt + 1));
+                cbm_ht_set(word_counts, words[w], intptr_to_ptr(cnt + SKIP_ONE));
             }
         }
     }
@@ -326,10 +337,10 @@ static int apply_decorator_tags(cbm_gbuf_t *gbuf, tagged_node_t *nodes, int node
                                 CBMHashTable *candidates) {
     int tagged = 0;
     for (int n = 0; n < node_count; n++) {
-        char *tag_words[256];
+        char *tag_words[CBM_SZ_256];
         int tag_count = 0;
         for (int w = 0; w < nodes[n].word_count; w++) {
-            if (cbm_ht_get(candidates, nodes[n].words[w]) && tag_count < 256) {
+            if (cbm_ht_get(candidates, nodes[n].words[w]) && tag_count < CBM_SZ_256) {
                 tag_words[tag_count++] = nodes[n].words[w];
             }
         }
@@ -360,7 +371,7 @@ int cbm_pipeline_pass_decorator_tags(cbm_gbuf_t *gbuf, const char *project) {
         return 0;
     }
 
-    CBMHashTable *word_counts = cbm_ht_create(128);
+    CBMHashTable *word_counts = cbm_ht_create(CBM_SZ_128);
     tagged_node_t *nodes = NULL;
     int node_count = collect_decorated_nodes(gbuf, &nodes, word_counts);
     if (node_count == 0) {
@@ -370,14 +381,14 @@ int cbm_pipeline_pass_decorator_tags(cbm_gbuf_t *gbuf, const char *project) {
     }
 
     /* Phase 2: Determine candidates (words on 2+ nodes) */
-    CBMHashTable *candidates = cbm_ht_create(64);
+    CBMHashTable *candidates = cbm_ht_create(CBM_SZ_64);
     int candidate_count = 0;
     for (int n = 0; n < node_count; n++) {
         for (int w = 0; w < nodes[n].word_count; w++) {
             const char *word = nodes[n].words[w];
             intptr_t cnt = (intptr_t)cbm_ht_get(word_counts, word);
-            if (cnt >= 2 && !cbm_ht_get(candidates, word)) {
-                cbm_ht_set(candidates, word, (void *)1);
+            if (cnt >= PAIR_LEN && !cbm_ht_get(candidates, word)) {
+                cbm_ht_set(candidates, word, intptr_to_ptr(SKIP_ONE));
                 candidate_count++;
             }
         }

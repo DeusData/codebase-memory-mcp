@@ -12,10 +12,21 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc/prim.h"
 #include <stdio.h>   // fputs, stderr
 
+// xbox has no console IO
+#if !defined(WINAPI_FAMILY_PARTITION) || WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP | WINAPI_PARTITION_SYSTEM)
+#define MI_HAS_CONSOLE_IO
+#endif
 
 //---------------------------------------------
 // Dynamically bind Windows API points for portability
 //---------------------------------------------
+
+#if defined(_MSC_VER)
+#pragma warning(disable:4996)   // don't use GetVersionExW
+#endif
+
+static DWORD win_major_version = 6;
+static DWORD win_minor_version = 0;
 
 // We use VirtualAlloc2 for aligned allocation, but it is only supported on Windows 10 and Windows Server 2016.
 // So, we need to look it up dynamically to run on older systems. (use __stdcall for 32-bit compatibility)
@@ -45,22 +56,35 @@ typedef struct MI_MEM_ADDRESS_REQUIREMENTS_S {
 #define MI_MEM_EXTENDED_PARAMETER_NONPAGED_HUGE   0x00000010
 
 #include <winternl.h>
-typedef PVOID    (__stdcall *PVirtualAlloc2)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MI_MEM_EXTENDED_PARAMETER*, ULONG);
-typedef NTSTATUS (__stdcall *PNtAllocateVirtualMemoryEx)(HANDLE, PVOID*, SIZE_T*, ULONG, ULONG, MI_MEM_EXTENDED_PARAMETER*, ULONG);
+typedef PVOID (__stdcall *PVirtualAlloc2)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MI_MEM_EXTENDED_PARAMETER*, ULONG);
+typedef LONG  (__stdcall *PNtAllocateVirtualMemoryEx)(HANDLE, PVOID*, SIZE_T*, ULONG, ULONG, MI_MEM_EXTENDED_PARAMETER*, ULONG);  // avoid NTSTATUS as it is not defined on xbox (pr #1084)
 static PVirtualAlloc2 pVirtualAlloc2 = NULL;
 static PNtAllocateVirtualMemoryEx pNtAllocateVirtualMemoryEx = NULL;
 
-// Similarly, GetNumaProcessorNodeEx is only supported since Windows 7
+// Similarly, GetNumaProcessorNodeEx is only supported since Windows 7  (and GetNumaNodeProcessorMask is not supported on xbox)
 typedef struct MI_PROCESSOR_NUMBER_S { WORD Group; BYTE Number; BYTE Reserved; } MI_PROCESSOR_NUMBER;
 
 typedef VOID (__stdcall *PGetCurrentProcessorNumberEx)(MI_PROCESSOR_NUMBER* ProcNumber);
 typedef BOOL (__stdcall *PGetNumaProcessorNodeEx)(MI_PROCESSOR_NUMBER* Processor, PUSHORT NodeNumber);
 typedef BOOL (__stdcall* PGetNumaNodeProcessorMaskEx)(USHORT Node, PGROUP_AFFINITY ProcessorMask);
 typedef BOOL (__stdcall *PGetNumaProcessorNode)(UCHAR Processor, PUCHAR NodeNumber);
+typedef BOOL (__stdcall* PGetNumaNodeProcessorMask)(UCHAR Node, PULONGLONG ProcessorMask);
+typedef BOOL (__stdcall* PGetNumaHighestNodeNumber)(PULONG Node);
 static PGetCurrentProcessorNumberEx pGetCurrentProcessorNumberEx = NULL;
 static PGetNumaProcessorNodeEx      pGetNumaProcessorNodeEx = NULL;
 static PGetNumaNodeProcessorMaskEx  pGetNumaNodeProcessorMaskEx = NULL;
 static PGetNumaProcessorNode        pGetNumaProcessorNode = NULL;
+static PGetNumaNodeProcessorMask    pGetNumaNodeProcessorMask = NULL;
+static PGetNumaHighestNodeNumber    pGetNumaHighestNodeNumber = NULL;
+
+// Not available on xbox
+typedef SIZE_T(__stdcall* PGetLargePageMinimum)(VOID);
+static PGetLargePageMinimum pGetLargePageMinimum = NULL;
+
+// Available after Windows XP
+typedef BOOL (__stdcall *PGetPhysicallyInstalledSystemMemory)( PULONGLONG TotalMemoryInKilobytes );
+typedef BOOL (__stdcall* PGetVersionExW)(LPOSVERSIONINFOW lpVersionInformation);
+
 
 //---------------------------------------------
 // Enable large page support dynamically (if possible)
@@ -71,6 +95,7 @@ static bool win_enable_large_os_pages(size_t* large_page_size)
   static bool large_initialized = false;
   if (large_initialized) return (_mi_os_large_page_size() > 0);
   large_initialized = true;
+  if (pGetLargePageMinimum==NULL) return false;  // no large page support (xbox etc.)
 
   // Try to see if large OS pages are supported
   // To use large pages on Windows, we first need access permission
@@ -89,8 +114,8 @@ static bool win_enable_large_os_pages(size_t* large_page_size)
       if (ok) {
         err = GetLastError();
         ok = (err == ERROR_SUCCESS);
-        if (ok && large_page_size != NULL) {
-          *large_page_size = GetLargePageMinimum();
+        if (ok && large_page_size != NULL && pGetLargePageMinimum != NULL) {
+          *large_page_size = (*pGetLargePageMinimum)();
         }
       }
     }
@@ -108,31 +133,30 @@ static bool win_enable_large_os_pages(size_t* large_page_size)
 // Initialize
 //---------------------------------------------
 
+static DWORD win_allocation_granularity = 64*MI_KiB;
+
 void _mi_prim_mem_init( mi_os_mem_config_t* config )
 {
   config->has_overcommit = false;
   config->has_partial_free = false;
   config->has_virtual_reserve = true;
+
   // get the page size
-  SYSTEM_INFO si;
+  SYSTEM_INFO si; _mi_memzero_var(si);
   GetSystemInfo(&si);
   if (si.dwPageSize > 0) { config->page_size = si.dwPageSize; }
-  if (si.dwAllocationGranularity > 0) { config->alloc_granularity = si.dwAllocationGranularity; }
+  if (si.dwAllocationGranularity > 0) {
+    config->alloc_granularity = si.dwAllocationGranularity;
+    win_allocation_granularity = si.dwAllocationGranularity;
+  }
   // get virtual address bits
   if ((uintptr_t)si.lpMaximumApplicationAddress > 0) {
-    const size_t vbits = MI_INTPTR_BITS - mi_clz((uintptr_t)si.lpMaximumApplicationAddress);
+    const size_t vbits = MI_SIZE_BITS - mi_clz((uintptr_t)si.lpMaximumApplicationAddress);
     config->virtual_address_bits = vbits;
   }
-  // get physical memory
-  ULONGLONG memInKiB = 0;
-  if (GetPhysicallyInstalledSystemMemory(&memInKiB)) {
-    if (memInKiB > 0 && memInKiB < (SIZE_MAX / MI_KiB)) {
-      config->physical_memory = memInKiB * MI_KiB;
-    }
-  }
+
   // get the VirtualAlloc2 function
-  HINSTANCE  hDll;
-  hDll = LoadLibrary(TEXT("kernelbase.dll"));
+  HINSTANCE hDll = LoadLibrary(TEXT("kernelbase.dll"));
   if (hDll != NULL) {
     // use VirtualAlloc2FromApp if possible as it is available to Windows store apps
     pVirtualAlloc2 = (PVirtualAlloc2)(void (*)(void))GetProcAddress(hDll, "VirtualAlloc2FromApp");
@@ -152,8 +176,32 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config )
     pGetNumaProcessorNodeEx = (PGetNumaProcessorNodeEx)(void (*)(void))GetProcAddress(hDll, "GetNumaProcessorNodeEx");
     pGetNumaNodeProcessorMaskEx = (PGetNumaNodeProcessorMaskEx)(void (*)(void))GetProcAddress(hDll, "GetNumaNodeProcessorMaskEx");
     pGetNumaProcessorNode = (PGetNumaProcessorNode)(void (*)(void))GetProcAddress(hDll, "GetNumaProcessorNode");
+    pGetNumaNodeProcessorMask = (PGetNumaNodeProcessorMask)(void (*)(void))GetProcAddress(hDll, "GetNumaNodeProcessorMask");
+    pGetNumaHighestNodeNumber = (PGetNumaHighestNodeNumber)(void (*)(void))GetProcAddress(hDll, "GetNumaHighestNodeNumber");
+    pGetLargePageMinimum = (PGetLargePageMinimum)(void (*)(void))GetProcAddress(hDll, "GetLargePageMinimum");
+    // Get physical memory (not available on XP, so check dynamically)
+    PGetPhysicallyInstalledSystemMemory pGetPhysicallyInstalledSystemMemory = (PGetPhysicallyInstalledSystemMemory)(void (*)(void))GetProcAddress(hDll,"GetPhysicallyInstalledSystemMemory");
+    if (pGetPhysicallyInstalledSystemMemory != NULL) {
+      ULONGLONG memInKiB = 0;
+      if ((*pGetPhysicallyInstalledSystemMemory)(&memInKiB)) {
+        if (memInKiB > 0 && memInKiB <= SIZE_MAX) {
+          config->physical_memory_in_kib = (size_t)memInKiB;
+        }
+      }
+    }
+    // Get Windows version
+    PGetVersionExW pGetVersionExW = (PGetVersionExW)(void (*)(void))GetProcAddress(hDll, "GetVersionExW");
+    if (pGetVersionExW != NULL) {
+      OSVERSIONINFOW version; _mi_memzero_var(version);
+      version.dwOSVersionInfoSize = sizeof(version);
+      if ((*pGetVersionExW)(&version)) {
+        win_major_version = version.dwMajorVersion;
+        win_minor_version = version.dwMinorVersion;
+      }
+    }
     FreeLibrary(hDll);
   }
+  // Enable large/huge OS page support?
   if (mi_option_is_enabled(mi_option_allow_large_os_pages) || mi_option_is_enabled(mi_option_reserve_huge_os_pages)) {
     win_enable_large_os_pages(&config->large_page_size);
   }
@@ -173,9 +221,9 @@ int _mi_prim_free(void* addr, size_t size ) {
     // In mi_os_mem_alloc_aligned the fallback path may have returned a pointer inside
     // the memory region returned by VirtualAlloc; in that case we need to free using
     // the start of the region.
-    MEMORY_BASIC_INFORMATION info = { 0 };
+    MEMORY_BASIC_INFORMATION info; _mi_memzero_var(info);
     VirtualQuery(addr, &info, sizeof(info));
-    if (info.AllocationBase < addr && ((uint8_t*)addr - (uint8_t*)info.AllocationBase) < (ptrdiff_t)MI_SEGMENT_SIZE) {
+    if (info.AllocationBase < addr && ((uint8_t*)addr - (uint8_t*)info.AllocationBase) < (ptrdiff_t)(4*MI_MiB)) {
       errcode = 0;
       err = (VirtualFree(info.AllocationBase, 0, MEM_RELEASE) == 0);
       if (err) { errcode = GetLastError(); }
@@ -203,7 +251,7 @@ static void* win_virtual_alloc_prim_once(void* addr, size_t size, size_t try_ali
   }
   #endif
   // on modern Windows try use VirtualAlloc2 for aligned allocation
-  if (addr == NULL && try_alignment > 1 && (try_alignment % _mi_os_page_size()) == 0 && pVirtualAlloc2 != NULL) {
+  if (addr == NULL && try_alignment > win_allocation_granularity && (try_alignment % _mi_os_page_size()) == 0 && pVirtualAlloc2 != NULL) {
     MI_MEM_ADDRESS_REQUIREMENTS reqs = { 0, 0, 0 };
     reqs.Alignment = try_alignment;
     MI_MEM_EXTENDED_PARAMETER param = { {0, 0}, {0} };
@@ -239,7 +287,7 @@ static void* win_virtual_alloc_prim(void* addr, size_t size, size_t try_alignmen
       // success, return the address
       return p;
     }
-    else if (max_retry_msecs > 0 && (try_alignment <= 2*MI_SEGMENT_ALIGN) &&
+    else if (max_retry_msecs > 0 && (try_alignment <= 8*MI_MiB) &&
               (flags&MEM_COMMIT) != 0 && (flags&MEM_LARGE_PAGES) == 0 &&
               win_is_out_of_memory_error(GetLastError())) {
       // if committing regular memory and being out-of-memory,
@@ -263,8 +311,9 @@ static void* win_virtual_alloc(void* addr, size_t size, size_t try_alignment, DW
   static _Atomic(size_t) large_page_try_ok; // = 0;
   void* p = NULL;
   // Try to allocate large OS pages (2MiB) if allowed or required.
-  if ((large_only || _mi_os_use_large_page(size, try_alignment))
-      && allow_large && (flags&MEM_COMMIT)!=0 && (flags&MEM_RESERVE)!=0) {
+  if ((large_only || (_mi_os_canuse_large_page(size, try_alignment) && mi_option_is_enabled(mi_option_allow_large_os_pages)))
+      && allow_large && (flags&MEM_COMMIT)!=0 && (flags&MEM_RESERVE)!=0)
+  {
     size_t try_ok = mi_atomic_load_acquire(&large_page_try_ok);
     if (!large_only && try_ok > 0) {
       // if a large page allocation fails, it seems the calls to VirtualAlloc get very expensive.
@@ -344,6 +393,11 @@ int _mi_prim_reset(void* addr, size_t size) {
   return (p != NULL ? 0 : (int)GetLastError());
 }
 
+int _mi_prim_reuse(void* addr, size_t size) {
+  MI_UNUSED(addr); MI_UNUSED(size);
+  return 0;
+}
+
 int _mi_prim_protect(void* addr, size_t size, bool protect) {
   DWORD oldprotect = 0;
   BOOL ok = VirtualProtect(addr, size, protect ? PAGE_NOACCESS : PAGE_READWRITE, &oldprotect);
@@ -375,7 +429,7 @@ static void* _mi_prim_alloc_huge_os_pagesx(void* hint_addr, size_t size, int num
     }
     SIZE_T psize = size;
     void* base = hint_addr;
-    NTSTATUS err = (*pNtAllocateVirtualMemoryEx)(GetCurrentProcess(), &base, &psize, flags, PAGE_READWRITE, params, param_count);
+    LONG err = (*pNtAllocateVirtualMemoryEx)(GetCurrentProcess(), &base, &psize, flags, PAGE_READWRITE, params, param_count);
     if (err == 0 && base != NULL) {
       return base;
     }
@@ -429,9 +483,11 @@ size_t _mi_prim_numa_node(void) {
 
 size_t _mi_prim_numa_node_count(void) {
   ULONG numa_max = 0;
-  GetNumaHighestNodeNumber(&numa_max);
+  if (pGetNumaHighestNodeNumber!=NULL) {
+    (*pGetNumaHighestNodeNumber)(&numa_max);
+  }
   // find the highest node number that has actual processors assigned to it. Issue #282
-  while(numa_max > 0) {
+  while (numa_max > 0) {
     if (pGetNumaNodeProcessorMaskEx != NULL) {
       // Extended API is supported
       GROUP_AFFINITY affinity;
@@ -442,8 +498,10 @@ size_t _mi_prim_numa_node_count(void) {
     else {
       // Vista or earlier, use older API that is limited to 64 processors.
       ULONGLONG mask;
-      if (GetNumaNodeProcessorMask((UCHAR)numa_max, &mask)) {
-        if (mask != 0) break; // found the maximum non-empty node
+      if (pGetNumaNodeProcessorMask != NULL) {
+        if ((*pGetNumaNodeProcessorMask)((UCHAR)numa_max, &mask)) {
+          if (mask != 0) break; // found the maximum non-empty node
+        }
       };
     }
     // max node was invalid or had no processor assigned, try again
@@ -533,17 +591,21 @@ void _mi_prim_out_stderr( const char* msg )
   if (!_mi_preloading()) {
     // _cputs(msg);  // _cputs cannot be used as it aborts when failing to lock the console
     static HANDLE hcon = INVALID_HANDLE_VALUE;
-    static bool hconIsConsole;
+    static bool hconIsConsole = false;
     if (hcon == INVALID_HANDLE_VALUE) {
-      CONSOLE_SCREEN_BUFFER_INFO sbi;
       hcon = GetStdHandle(STD_ERROR_HANDLE);
+      #ifdef MI_HAS_CONSOLE_IO
+      CONSOLE_SCREEN_BUFFER_INFO sbi;
       hconIsConsole = ((hcon != INVALID_HANDLE_VALUE) && GetConsoleScreenBufferInfo(hcon, &sbi));
+      #endif
     }
     const size_t len = _mi_strlen(msg);
     if (len > 0 && len < UINT32_MAX) {
       DWORD written = 0;
       if (hconIsConsole) {
+        #ifdef MI_HAS_CONSOLE_IO
         WriteConsoleA(hcon, msg, (DWORD)len, &written, NULL);
+        #endif
       }
       else if (hcon != INVALID_HANDLE_VALUE) {
         // use direct write if stderr was redirected
@@ -614,28 +676,73 @@ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
 #endif  // MI_USE_RTLGENRANDOM
 
 
+//----------------------------------------------------------------
+// Thread pool?
+//----------------------------------------------------------------
+
+bool _mi_prim_thread_is_in_threadpool(void) {
+#if (MI_ARCH_X64 || MI_ARCH_X86 || MI_ARCH_ARM64)
+  if (win_major_version >= 6) {
+    // check if this thread belongs to a windows threadpool
+    // see: <https://www.geoffchappell.com/studies/windows/km/ntoskrnl/inc/api/pebteb/teb/index.htm>
+    struct _TEB* const teb = NtCurrentTeb();
+    void* const pool_data = *((void**)((uint8_t*)teb + (MI_SIZE_BITS == 32 ? 0x0F90 : 0x1778)));
+    return (pool_data != NULL);
+  }
+#endif
+  return false;
+}
+
 
 //----------------------------------------------------------------
 // Process & Thread Init/Done
 //----------------------------------------------------------------
 
+#if MI_WIN_USE_FIXED_TLS==1
+mi_decl_cache_align size_t _mi_win_tls_offset = 0;
+#endif
+
+//static void mi_debug_out(const char* s) {
+//  HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+//  WriteConsole(h, s, (DWORD)_mi_strlen(s), NULL, NULL);
+//}
+
+static void mi_win_tls_init(DWORD reason) {
+  if (reason==DLL_PROCESS_ATTACH || reason==DLL_THREAD_ATTACH) {
+    #if MI_WIN_USE_FIXED_TLS==1  // we must allocate a TLS slot dynamically
+    if (_mi_win_tls_offset == 0 && reason == DLL_PROCESS_ATTACH) {
+      const DWORD tls_slot = TlsAlloc();  // usually returns slot 1
+      if (tls_slot == TLS_OUT_OF_INDEXES) {
+        _mi_error_message(EFAULT, "unable to allocate the a TLS slot (rebuild without MI_WIN_USE_FIXED_TLS?)\n");
+      }
+      _mi_win_tls_offset = (size_t)tls_slot * sizeof(void*);
+    }
+    #endif
+    #if MI_HAS_TLS_SLOT >= 2  // we must initialize the TLS slot before any allocation
+    if (_mi_theap_default() == NULL) {
+      _mi_theap_default_set((mi_theap_t*)&_mi_theap_empty);
+      #if MI_DEBUG && MI_WIN_USE_FIXED_TLS==1
+      void* const p = TlsGetValue((DWORD)(_mi_win_tls_offset / sizeof(void*)));
+      mi_assert_internal(p == (void*)&_mi_theap_empty);
+      #endif
+    }
+    #endif
+  }
+}
+
 static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
   MI_UNUSED(reserved);
   MI_UNUSED(module);
-  #if MI_TLS_SLOT >= 2
-  if ((reason==DLL_PROCESS_ATTACH || reason==DLL_THREAD_ATTACH) && mi_prim_get_default_heap() == NULL) {
-    _mi_heap_set_default_direct((mi_heap_t*)&_mi_heap_empty);
-  }
-  #endif
+  mi_win_tls_init(reason);
   if (reason==DLL_PROCESS_ATTACH) {
-    _mi_process_load();
+    _mi_auto_process_init();
   }
   else if (reason==DLL_PROCESS_DETACH) {
-    _mi_process_done();
+    _mi_auto_process_done();
   }
   else if (reason==DLL_THREAD_DETACH && !_mi_is_redirected()) {
     _mi_thread_done(NULL);
-  }    
+  }
 }
 
 
@@ -643,7 +750,7 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
   #define MI_PRIM_HAS_PROCESS_ATTACH  1
 
   // Windows DLL: easy to hook into process_init and thread_done
-  __declspec(dllexport) BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
+  BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     mi_win_main((PVOID)inst,reason,reserved);
     return TRUE;
   }
@@ -651,8 +758,8 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
   // nothing to do since `_mi_thread_done` is handled through the DLL_THREAD_DETACH event.
   void _mi_prim_thread_init_auto_done(void) { }
   void _mi_prim_thread_done_auto_done(void) { }
-  void _mi_prim_thread_associate_default_heap(mi_heap_t* heap) {
-    MI_UNUSED(heap);
+  void _mi_prim_thread_associate_default_theap(mi_theap_t* theap) {
+    MI_UNUSED(theap);
   }
 
 #elif !defined(MI_WIN_USE_FLS)
@@ -708,8 +815,8 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
   // nothing to do since `_mi_thread_done` is handled through the DLL_THREAD_DETACH event.
   void _mi_prim_thread_init_auto_done(void) { }
   void _mi_prim_thread_done_auto_done(void) { }
-  void _mi_prim_thread_associate_default_heap(mi_heap_t* heap) {
-    MI_UNUSED(heap);
+  void _mi_prim_thread_associate_default_theap(mi_theap_t* theap) {
+    MI_UNUSED(theap);
   }
 
 #else // deprecated: statically linked, use fiber api
@@ -721,7 +828,7 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
 
     static int mi_process_attach(void) {
       mi_win_main(NULL,DLL_PROCESS_ATTACH,NULL);
-      atexit(&_mi_process_done);
+      atexit(&_mi_auto_process_done);
       return 0;
     }
     typedef int(*mi_crt_callback_t)(void);
@@ -748,10 +855,10 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
   static DWORD mi_fls_key = (DWORD)(-1);
 
   static void NTAPI mi_fls_done(PVOID value) {
-    mi_heap_t* heap = (mi_heap_t*)value;
-    if (heap != NULL) {
-      _mi_thread_done(heap);
-      FlsSetValue(mi_fls_key, NULL);  // prevent recursion as _mi_thread_done may set it back to the main heap, issue #672
+    mi_theap_t* theap = (mi_theap_t*)value;
+    if (theap != NULL) {
+      _mi_thread_done(theap);
+      FlsSetValue(mi_fls_key, NULL);  // prevent recursion as _mi_thread_done may set it back to the main theap, issue #672
     }
   }
 
@@ -765,9 +872,9 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
     FlsFree(mi_fls_key);
   }
 
-  void _mi_prim_thread_associate_default_heap(mi_heap_t* heap) {
+  void _mi_prim_thread_associate_default_theap(mi_theap_t* theap) {
     mi_assert_internal(mi_fls_key != (DWORD)(-1));
-    FlsSetValue(mi_fls_key, heap);
+    FlsSetValue(mi_fls_key, theap);
   }
 #endif
 
@@ -788,11 +895,7 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
   #endif
   mi_decl_export void _mi_redirect_entry(DWORD reason) {
     // called on redirection; careful as this may be called before DllMain
-    #if MI_TLS_SLOT >= 2
-    if ((reason==DLL_PROCESS_ATTACH || reason==DLL_THREAD_ATTACH) && mi_prim_get_default_heap() == NULL) {
-      _mi_heap_set_default_direct((mi_heap_t*)&_mi_heap_empty);
-    }
-    #endif
+    mi_win_tls_init(reason);
     if (reason == DLL_PROCESS_ATTACH) {
       mi_redirected = true;
     }
@@ -815,3 +918,4 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
     mi_allocator_done();
   }
 #endif
+

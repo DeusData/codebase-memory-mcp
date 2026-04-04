@@ -10,12 +10,17 @@
  *
  * Depends on: extraction layer (cbm.h), graph_buffer, pipeline internals
  */
+#include "foundation/constants.h"
+
+enum { PD_RING = 4, PD_RING_MASK = 3, PD_JSON_MARGIN = 10, PD_ESC_MARGIN = 3, PD_ESC_SPACE = 2 };
 #include "pipeline/pipeline.h"
+#include <stdint.h>
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
 #include "cbm.h"
+#include "simhash/minhash.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,20 +38,24 @@ static char *read_file(const char *path, int *out_len) {
     long size = ftell(f);
     (void)fseek(f, 0, SEEK_SET);
 
-    if (size <= 0 || size > (long)100 * 1024 * 1024) { /* 100 MB sanity limit */
+    if (size <= 0 ||
+        size > (long)CBM_PERCENT * CBM_SZ_1K * CBM_SZ_1K) { /* CBM_PERCENT MB sanity limit */
         (void)fclose(f);
         return NULL;
     }
 
-    char *buf = malloc(size + 1);
+    char *buf = malloc(size + SKIP_ONE);
     if (!buf) {
         (void)fclose(f);
         return NULL;
     }
 
-    size_t nread = fread(buf, 1, size, f);
+    size_t nread = fread(buf, SKIP_ONE, size, f);
     (void)fclose(f);
 
+    if (nread > (size_t)size) {
+        nread = (size_t)size;
+    }
     buf[nread] = '\0';
     *out_len = (int)nread;
     return buf;
@@ -54,10 +63,10 @@ static char *read_file(const char *path, int *out_len) {
 
 /* Format int to string for logging. Thread-safe via TLS. */
 static const char *itoa_log(int val) {
-    static CBM_TLS char bufs[4][32];
+    static CBM_TLS char bufs[PD_RING][CBM_SZ_32];
     static CBM_TLS int idx = 0;
     int i = idx;
-    idx = (idx + 1) & 3;
+    idx = (idx + SKIP_ONE) & PD_RING_MASK;
     snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
     return bufs[i];
 }
@@ -84,16 +93,16 @@ static int def_json_escape_char(char *buf, size_t avail, char ch) {
         esc = 't';
         break;
     default:
-        if (avail >= 1) {
+        if (avail >= SKIP_ONE) {
             buf[0] = ch;
         }
-        return 1;
+        return SKIP_ONE;
     }
-    if (avail >= 2) {
+    if (avail >= PD_ESC_SPACE) {
         buf[0] = '\\';
-        buf[1] = esc;
+        buf[SKIP_ONE] = esc;
     }
-    return 2;
+    return PD_ESC_SPACE;
 }
 
 static void append_json_string(char *buf, size_t bufsize, size_t *pos, const char *key,
@@ -101,7 +110,7 @@ static void append_json_string(char *buf, size_t bufsize, size_t *pos, const cha
     if (!val || val[0] == '\0') {
         return;
     }
-    if (*pos >= bufsize - 10) {
+    if (*pos >= bufsize - PD_JSON_MARGIN) {
         return;
     }
     size_t p = *pos;
@@ -110,10 +119,10 @@ static void append_json_string(char *buf, size_t bufsize, size_t *pos, const cha
         return;
     }
     p += (size_t)w;
-    for (const char *s = val; *s && p < bufsize - 3; s++) {
-        p += (size_t)def_json_escape_char(buf + p, bufsize - p - 2, *s);
+    for (const char *s = val; *s && p < bufsize - PD_ESC_MARGIN; s++) {
+        p += (size_t)def_json_escape_char(buf + p, bufsize - p - PD_ESC_SPACE, *s);
     }
-    if (p < bufsize - 1) {
+    if (p < bufsize - SKIP_ONE) {
         buf[p++] = '"';
     }
     buf[p] = '\0';
@@ -123,36 +132,36 @@ static void append_json_string(char *buf, size_t bufsize, size_t *pos, const cha
 /* Append a JSON array of strings: ,"key":["a","b","c"] */
 static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const char *key,
                                   const char **arr) {
-    if (!arr || !arr[0] || *pos >= bufsize - 10) {
+    if (!arr || !arr[0] || *pos >= bufsize - PD_JSON_MARGIN) {
         return;
     }
     size_t p = *pos;
     int n = snprintf(buf + p, bufsize - p, ",\"%s\":[", key);
-    if (n <= 0 || p + (size_t)n >= bufsize - 2) {
+    if (n <= 0 || p + (size_t)n >= bufsize - PD_ESC_SPACE) {
         return;
     }
     p += (size_t)n;
     for (int i = 0; arr[i]; i++) {
-        if (i > 0 && p < bufsize - 1) {
+        if (i > 0 && p < bufsize - SKIP_ONE) {
             buf[p++] = ',';
         }
-        if (p < bufsize - 1) {
+        if (p < bufsize - SKIP_ONE) {
             buf[p++] = '"';
         }
-        for (const char *s = arr[i]; *s && p < bufsize - 2; s++) {
+        for (const char *s = arr[i]; *s && p < bufsize - PD_ESC_SPACE; s++) {
             if (*s == '"' || *s == '\\') {
                 buf[p++] = '\\';
-                if (p >= bufsize - 2) {
+                if (p >= bufsize - PD_ESC_SPACE) {
                     break;
                 }
             }
             buf[p++] = *s;
         }
-        if (p < bufsize - 1) {
+        if (p < bufsize - SKIP_ONE) {
             buf[p++] = '"';
         }
     }
-    if (p < bufsize - 1) {
+    if (p < bufsize - SKIP_ONE) {
         buf[p++] = ']';
     }
     buf[p] = '\0';
@@ -183,9 +192,17 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
 
-    if (pos < bufsize - 1) {
+    /* MinHash fingerprint — append if present and buffer has room. */
+    if (def->fingerprint && def->fingerprint_k > 0 &&
+        pos + CBM_MINHASH_HEX_LEN + CBM_MINHASH_JSON_OVERHEAD < bufsize) {
+        char fp_hex[CBM_MINHASH_HEX_BUF];
+        cbm_minhash_to_hex((const cbm_minhash_t *)def->fingerprint, fp_hex, sizeof(fp_hex));
+        append_json_string(buf, bufsize, &pos, "fp", fp_hex);
+    }
+
+    if (pos < bufsize - SKIP_ONE) {
         buf[pos] = '}';
-        buf[pos + 1] = '\0';
+        buf[pos + SKIP_ONE] = '\0';
     }
 }
 
@@ -194,7 +211,7 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     if (!def->qualified_name || !def->name) {
         return;
     }
-    char props[2048];
+    char props[CBM_SZ_2K];
     build_def_props(props, sizeof(props), def);
     int64_t node_id = cbm_gbuf_upsert_node(
         ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
@@ -232,7 +249,7 @@ static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileRe
         char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
         const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
         if (source_node && target) {
-            char imp_props[256];
+            char imp_props[CBM_SZ_256];
             snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}",
                      imp->local_name ? imp->local_name : "");
             cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
@@ -258,7 +275,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
-            return -1;
+            return CBM_NOT_FOUND;
         }
 
         const char *path = files[i].path;

@@ -32,7 +32,7 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config ) {
 
 int _mi_prim_free(void* addr, size_t size ) {
   MI_UNUSED(addr); MI_UNUSED(size);
-  // wasi heap cannot be shrunk
+  // wasi theap cannot be shrunk
   return 0;
 }
 
@@ -62,7 +62,7 @@ int _mi_prim_free(void* addr, size_t size ) {
 #endif
 
 #if defined(MI_USE_PTHREADS)
-static pthread_mutex_t mi_heap_grow_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t mi_theap_grow_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 static void* mi_prim_mem_grow(size_t size, size_t try_alignment) {
@@ -70,11 +70,11 @@ static void* mi_prim_mem_grow(size_t size, size_t try_alignment) {
   if (try_alignment <= 1) {
     // `sbrk` is not thread safe in general so try to protect it (we could skip this on WASM but leave it in for now)
     #if defined(MI_USE_PTHREADS)
-    pthread_mutex_lock(&mi_heap_grow_mutex);
+    pthread_mutex_lock(&mi_theap_grow_mutex);
     #endif
     p = mi_memory_grow(size);
     #if defined(MI_USE_PTHREADS)
-    pthread_mutex_unlock(&mi_heap_grow_mutex);
+    pthread_mutex_unlock(&mi_theap_grow_mutex);
     #endif
   }
   else {
@@ -84,7 +84,7 @@ static void* mi_prim_mem_grow(size_t size, size_t try_alignment) {
     // between getting the current size and actual allocation
     // (also, `sbrk` is not thread safe in general)
     #if defined(MI_USE_PTHREADS)
-    pthread_mutex_lock(&mi_heap_grow_mutex);
+    pthread_mutex_lock(&mi_theap_grow_mutex);
     #endif
     {
       void* current = mi_memory_grow(0);  // get current size
@@ -95,7 +95,7 @@ static void* mi_prim_mem_grow(size_t size, size_t try_alignment) {
       }
     }
     #if defined(MI_USE_PTHREADS)
-    pthread_mutex_unlock(&mi_heap_grow_mutex);
+    pthread_mutex_unlock(&mi_theap_grow_mutex);
     #endif
     if (base != NULL) {
       p = mi_align_up_ptr(base, try_alignment);
@@ -145,6 +145,11 @@ int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit) {
 }
 
 int _mi_prim_reset(void* addr, size_t size) {
+  MI_UNUSED(addr); MI_UNUSED(size);
+  return 0;
+}
+
+int _mi_prim_reuse(void* addr, size_t size) {
   MI_UNUSED(addr); MI_UNUSED(size);
   return 0;
 }
@@ -274,6 +279,10 @@ void _mi_prim_thread_done_auto_done(void) {
   // nothing
 }
 
-void _mi_prim_thread_associate_default_heap(mi_heap_t* heap) {
-  MI_UNUSED(heap);
+void _mi_prim_thread_associate_default_theap(mi_theap_t* theap) {
+  MI_UNUSED(theap);
+}
+
+bool _mi_prim_thread_is_in_threadpool(void) {
+  return false;
 }

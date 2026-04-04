@@ -41,7 +41,6 @@ extern void suite_go_lsp(void);
 extern void suite_c_lsp(void);
 extern void suite_store_arch(void);
 extern void suite_store_bulk(void);
-extern void suite_httplink(void);
 extern void suite_traces(void);
 extern void suite_configlink(void);
 extern void suite_infrascan(void);
@@ -55,6 +54,7 @@ extern void suite_security(void);
 extern void suite_yaml(void);
 extern void suite_integration(void);
 extern void suite_incremental(void);
+extern void suite_simhash(void);
 
 int main(void) {
     printf("\n  codebase-memory-mcp  C test suite\n");
@@ -113,7 +113,6 @@ int main(void) {
     RUN_SUITE(store_arch);
 
     /* HTTP link */
-    RUN_SUITE(httplink);
 
     /* Traces helpers */
     RUN_SUITE(traces);
@@ -145,6 +144,9 @@ int main(void) {
 
     /* YAML parser */
     RUN_SUITE(yaml);
+
+    /* SimHash / SIMILAR_TO */
+    RUN_SUITE(simhash);
 
     /* Integration (end-to-end) */
     RUN_SUITE(integration);
