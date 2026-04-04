@@ -336,6 +336,7 @@ static const char *func_kinds_zig[] = {"function_declaration", "test_declaration
 static const char *func_kinds_bash[] = {"function_definition", NULL};
 static const char *func_kinds_erlang[] = {"function_clause", NULL};
 static const char *func_kinds_csharp[] = {"method_declaration", "constructor_declaration", NULL};
+static const char *func_kinds_gdscript[] = {"function_definition", "constructor_definition", NULL};
 static const char *func_kinds_matlab[] = {"function_definition", NULL};
 static const char *func_kinds_lean[] = {"def", "theorem", "instance", "abbrev", NULL};
 static const char *func_kinds_form[] = {"procedure_definition", NULL};
@@ -387,6 +388,8 @@ static const char **func_kinds_for_lang(CBMLanguage lang) {
         return func_kinds_erlang;
     case CBM_LANG_CSHARP:
         return func_kinds_csharp;
+    case CBM_LANG_GDSCRIPT:
+        return func_kinds_gdscript;
     case CBM_LANG_MATLAB:
         return func_kinds_matlab;
     case CBM_LANG_LEAN:
@@ -444,6 +447,10 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
         }
     }
 
+    if (lang == CBM_LANG_GDSCRIPT && strcmp(ts_node_type(func_node), "constructor_definition") == 0) {
+        return "_init";
+    }
+
     TSNode name_node = ts_node_child_by_field_name(func_node, "name", 4);
     if (!ts_node_is_null(name_node)) {
         return cbm_node_text(a, name_node, source);
@@ -462,12 +469,71 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
 }
 
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+static const char *gdscript_enclosing_class_qn(CBMArena *a, TSNode func_node, const char *source,
+                                                const char *project, const char *rel_path,
+                                                const CBMLangSpec *spec) {
+    if (!spec || !spec->class_node_types) {
+        return NULL;
+    }
+
+    const char *class_names[32] = {0};
+    int class_count = 0;
+
+    TSNode cur = ts_node_parent(func_node);
+    while (!ts_node_is_null(cur)) {
+        if (cbm_kind_in_set(cur, spec->class_node_types)) {
+            TSNode class_name = ts_node_child_by_field_name(cur, "name", 4);
+            if (!ts_node_is_null(class_name)) {
+                const char *cname = cbm_node_text(a, class_name, source);
+                if (cname && cname[0] && class_count < 32) {
+                    class_names[class_count++] = cname;
+                }
+            }
+        }
+        cur = ts_node_parent(cur);
+    }
+
+    if (class_count == 0) {
+        return NULL;
+    }
+
+    TSNode root = func_node;
+    TSNode parent = ts_node_parent(root);
+    while (!ts_node_is_null(parent)) {
+        root = parent;
+        parent = ts_node_parent(root);
+    }
+
+    const char *class_qn = cbm_gdscript_anchor_qn(a, root, source, project, rel_path);
+    if (!class_qn || !class_qn[0]) {
+        return NULL;
+    }
+
+    for (int i = class_count - 1; i >= 0; i--) {
+        class_qn = cbm_arena_sprintf(a, "%s.%s", class_qn, class_names[i]);
+    }
+    return class_qn;
+}
+
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
                                   // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
                                   const char *project, const char *rel_path,
                                   const char *module_qn) {
     TSNode func_node = cbm_find_enclosing_func(node, lang);
     if (ts_node_is_null(func_node)) {
+        if (lang == CBM_LANG_GDSCRIPT) {
+            TSNode root = node;
+            TSNode parent = ts_node_parent(root);
+            while (!ts_node_is_null(parent)) {
+                root = parent;
+                parent = ts_node_parent(root);
+            }
+            const char *anchor_qn = cbm_gdscript_anchor_qn(a, root, source, project, rel_path);
+            if (anchor_qn && anchor_qn[0]) {
+                return anchor_qn;
+            }
+        }
         return module_qn;
     }
     const char *name = func_node_name(a, func_node, source, lang);
@@ -477,6 +543,14 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
 
     // Check if the function is inside a class — compute classQN.funcName
     const CBMLangSpec *spec = cbm_lang_spec(lang);
+    if (lang == CBM_LANG_GDSCRIPT) {
+        const char *gdscript_class_qn =
+            gdscript_enclosing_class_qn(a, func_node, source, project, rel_path, spec);
+        if (gdscript_class_qn && gdscript_class_qn[0]) {
+            return cbm_arena_sprintf(a, "%s.%s", gdscript_class_qn, name);
+        }
+    }
+
     if (spec && spec->class_node_types) {
         TSNode cur = ts_node_parent(func_node);
         while (!ts_node_is_null(cur)) {
@@ -494,7 +568,199 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
         }
     }
 
+    if (lang == CBM_LANG_GDSCRIPT) {
+        TSNode root = func_node;
+        TSNode parent = ts_node_parent(root);
+        while (!ts_node_is_null(parent)) {
+            root = parent;
+            parent = ts_node_parent(root);
+        }
+
+        const char *anchor_qn = cbm_gdscript_anchor_qn(a, root, source, project, rel_path);
+        if (anchor_qn && anchor_qn[0]) {
+            return cbm_arena_sprintf(a, "%s.%s", anchor_qn, name);
+        }
+    }
+
     return cbm_fqn_compute(a, project, rel_path, name);
+}
+
+static const char *gdscript_statement_name(CBMArena *a, TSNode node, const char *source) {
+    TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+    if (!ts_node_is_null(name_node)) {
+        return cbm_node_text(a, name_node, source);
+    }
+
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(node, i);
+        const char *kind = ts_node_type(child);
+        if (strcmp(kind, "identifier") == 0 || strcmp(kind, "type_identifier") == 0 ||
+            strcmp(kind, "name") == 0) {
+            return cbm_node_text(a, child, source);
+        }
+    }
+
+    if (count > 0) {
+        return cbm_node_text(a, ts_node_named_child(node, 0), source);
+    }
+    return NULL;
+}
+
+const char *cbm_gdscript_normalize_path(CBMArena *a, const char *raw_path, const char *rel_path) {
+    if (!raw_path || !raw_path[0]) {
+        return NULL;
+    }
+
+    bool is_absolute = false;
+    const char *path = raw_path;
+    if (strncmp(path, "res://", 6) == 0) {
+        path += 6;
+        is_absolute = true;
+    } else if (strstr(path, "://") != NULL) {
+        return NULL;
+    } else if (path[0] == '/') {
+        is_absolute = true;
+    }
+
+    if (!has_suffix(path, ".gd")) {
+        return NULL;
+    }
+
+    if (path[0] == '/') {
+        path++;
+    }
+
+    char joined[1024] = {0};
+    if (is_absolute) {
+        snprintf(joined, sizeof(joined), "%s", path);
+    } else {
+        const char *slash = rel_path ? strrchr(rel_path, '/') : NULL;
+        if (slash) {
+            size_t prefix_len = (size_t)(slash - rel_path);
+            if (prefix_len > 0 && prefix_len < sizeof(joined) - 2) {
+                memcpy(joined, rel_path, prefix_len);
+                joined[prefix_len] = '/';
+                joined[prefix_len + 1] = '\0';
+            }
+        }
+        strncat(joined, path, sizeof(joined) - strlen(joined) - 1);
+    }
+
+    char tmp[1024] = {0};
+    snprintf(tmp, sizeof(tmp), "%s", joined);
+    const char *parts[128] = {0};
+    int count = 0;
+    char *save = NULL;
+    char *tok = strtok_r(tmp, "/", &save);
+    while (tok && count < 128) {
+        if (strcmp(tok, ".") == 0 || strcmp(tok, "") == 0) {
+            tok = strtok_r(NULL, "/", &save);
+            continue;
+        }
+        if (strcmp(tok, "..") == 0) {
+            if (count > 0) {
+                count--;
+            } else {
+                return NULL;
+            }
+            tok = strtok_r(NULL, "/", &save);
+            continue;
+        }
+        parts[count++] = tok;
+        tok = strtok_r(NULL, "/", &save);
+    }
+
+    if (count == 0) {
+        return NULL;
+    }
+
+    char normalized[1024] = {0};
+    for (int i = 0; i < count; i++) {
+        if (i > 0) {
+            strncat(normalized, "/", sizeof(normalized) - strlen(normalized) - 1);
+        }
+        strncat(normalized, parts[i], sizeof(normalized) - strlen(normalized) - 1);
+    }
+
+    return cbm_arena_strdup(a, normalized);
+}
+
+static const char *gdscript_normalize_extends_base(CBMArena *a, const char *base,
+                                                    const char *rel_path) {
+    if (!base || !base[0]) {
+        return base;
+    }
+
+    const char *normalized = base;
+    size_t len = strlen(normalized);
+    if (len >= 2 && (normalized[0] == '"' || normalized[0] == '\'') &&
+        normalized[len - 1] == normalized[0]) {
+        normalized = cbm_arena_strndup(a, normalized + 1, len - 2);
+    }
+
+    if (strncmp(normalized, "preload(\"", 9) == 0 || strncmp(normalized, "preload('\"", 9) == 0) {
+        const char *quote = strchr(normalized, '(');
+        if (quote && (quote[1] == '"' || quote[1] == '\'')) {
+            char q = quote[1];
+            const char *start = quote + 2;
+            const char *end = strrchr(start, q);
+            if (end && end > start) {
+                normalized = cbm_arena_strndup(a, start, end - start);
+            }
+        }
+    }
+
+    const char *path_normalized = cbm_gdscript_normalize_path(a, normalized, rel_path);
+    if (path_normalized) {
+        return path_normalized;
+    }
+
+    return normalized;
+}
+
+const char *cbm_gdscript_anchor_name(CBMArena *a, TSNode root, const char *source) {
+    uint32_t count = ts_node_named_child_count(root);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(root, i);
+        if (strcmp(ts_node_type(child), "class_name_statement") == 0) {
+            const char *name = gdscript_statement_name(a, child, source);
+            if (name && name[0]) {
+                return name;
+            }
+        }
+    }
+    return "__script__";
+}
+
+const char *cbm_gdscript_anchor_qn(CBMArena *a, TSNode root, const char *source,
+                                   const char *project, const char *rel_path) {
+    const char *anchor_name = cbm_gdscript_anchor_name(a, root, source);
+    const char *module_qn = cbm_fqn_module(a, project, rel_path);
+    return cbm_arena_sprintf(a, "%s.%s", module_qn, anchor_name);
+}
+
+const char **cbm_gdscript_anchor_base_classes(CBMArena *a, TSNode root, const char *source,
+                                              const char *rel_path) {
+    uint32_t count = ts_node_named_child_count(root);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(root, i);
+        if (strcmp(ts_node_type(child), "extends_statement") == 0) {
+            const char *base = gdscript_statement_name(a, child, source);
+            if (!base || !base[0]) {
+                return NULL;
+            }
+            base = gdscript_normalize_extends_base(a, base, rel_path);
+            const char **bases = (const char **)cbm_arena_alloc(a, 2 * sizeof(const char *));
+            if (!bases) {
+                return NULL;
+            }
+            bases[0] = base;
+            bases[1] = NULL;
+            return bases;
+        }
+    }
+    return NULL;
 }
 
 // --- Cached enclosing function QN ---
@@ -716,6 +982,9 @@ bool cbm_is_module_level(TSNode node, CBMLanguage lang) {
     case CBM_LANG_MAGMA:
         parents = module_parents_magma;
         break;
+    case CBM_LANG_GDSCRIPT:
+        parents = module_parents_elixir;
+        break; // source
     default:
         return false;
     }

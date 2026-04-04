@@ -14,9 +14,11 @@
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
+#include "foundation/platform.h"
 #include "foundation/compat.h"
 #include "cbm.h"
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,6 +63,43 @@ static const char *itoa_log(int val) {
     idx = (idx + 1) & 3;
     snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
     return bufs[i];
+}
+
+static bool fp_ends_with(const char *fp, const char *suffix) {
+    if (!fp || !suffix) {
+        return false;
+    }
+    size_t fplen = strlen(fp);
+    size_t sflen = strlen(suffix);
+    return fplen >= sflen && strcmp(fp + fplen - sflen, suffix) == 0;
+}
+
+static const char *module_name_from_path(const char *path) {
+    if (!path || !path[0]) {
+        return "module";
+    }
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    static CBM_TLS char name[256];
+    snprintf(name, sizeof(name), "%s", base);
+    char *dot = strrchr(name, '.');
+    if (dot) {
+        *dot = '\0';
+    }
+    return name;
+}
+
+static bool repo_file_exists(const cbm_pipeline_ctx_t *ctx, const char *rel_path) {
+    if (!ctx || !ctx->repo_path || !rel_path || !rel_path[0]) {
+        return false;
+    }
+
+    char full_path[1024];
+    if (snprintf(full_path, sizeof(full_path), "%s/%s", ctx->repo_path, rel_path) >=
+        (int)sizeof(full_path)) {
+        return false;
+    }
+    return cbm_file_exists(full_path);
 }
 
 /* Append a JSON-escaped string value to buf at position *pos.
@@ -296,6 +335,16 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             /* Find or create the target module node */
             char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
             const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
+            if (fp_ends_with(imp->module_path, ".gd") && !repo_file_exists(ctx, imp->module_path)) {
+                target = NULL;
+            } else if (!target && fp_ends_with(imp->module_path, ".gd")) {
+                int64_t target_id =
+                    cbm_gbuf_upsert_node(ctx->gbuf, "Module", module_name_from_path(imp->module_path),
+                                         target_qn, imp->module_path, 0, 0, "{}");
+                if (target_id > 0) {
+                    target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
+                }
+            }
 
             char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
             const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);

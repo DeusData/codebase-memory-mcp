@@ -97,6 +97,7 @@ static const lang_name_entry_t LANG_NAME_TABLE[] = {
     {"cuda", CBM_LANG_CUDA},
     {"cobol", CBM_LANG_COBOL},
     {"verilog", CBM_LANG_VERILOG},
+    {"gdscript", CBM_LANG_GDSCRIPT},
     {"emacs lisp", CBM_LANG_EMACSLISP},
     {"emacslisp", CBM_LANG_EMACSLISP},
     {"json", CBM_LANG_JSON},

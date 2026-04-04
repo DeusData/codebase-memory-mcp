@@ -4928,6 +4928,886 @@ TEST(pipeline_fastapi_depends_edges) {
     PASS();
 }
 
+TEST(pipeline_gdscript_same_script_calls_and_signals) {
+    const char *files[] = {"player.gd"};
+    const char *contents[] = {
+        "class_name Player\n"
+        "signal hit\n"
+        "func helper():\n"
+        "    pass\n"
+        "func call_helper():\n"
+        "    helper()\n"
+        "func emit_hit():\n"
+        "    emit_signal(\"hit\")\n"
+        "func relay_hit():\n"
+        "    self.hit.emit()\n"
+        "func connect_hit():\n"
+        "    hit.connect(_on_hit)\n"
+        "func _on_hit():\n"
+        "    pass\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0) {
+        SKIP("tmpdir");
+    }
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *call_helper = NULL;
+    cbm_node_t *emit_hit = NULL;
+    cbm_node_t *relay_hit = NULL;
+    cbm_node_t *connect_hit = NULL;
+    cbm_node_t *helper = NULL;
+    int call_helper_count = 0;
+    int emit_hit_count = 0;
+    int relay_hit_count = 0;
+    int connect_hit_count = 0;
+    int helper_count = 0;
+    cbm_store_find_nodes_by_name(s, proj, "call_helper", &call_helper, &call_helper_count);
+    cbm_store_find_nodes_by_name(s, proj, "emit_hit", &emit_hit, &emit_hit_count);
+    cbm_store_find_nodes_by_name(s, proj, "relay_hit", &relay_hit, &relay_hit_count);
+    cbm_store_find_nodes_by_name(s, proj, "connect_hit", &connect_hit, &connect_hit_count);
+    cbm_store_find_nodes_by_name(s, proj, "helper", &helper, &helper_count);
+    ASSERT_GT(call_helper_count, 0);
+    ASSERT_GT(emit_hit_count, 0);
+    ASSERT_GT(relay_hit_count, 0);
+    ASSERT_GT(connect_hit_count, 0);
+    ASSERT_GT(helper_count, 0);
+
+    cbm_node_t *functions = NULL;
+    int function_count = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Function", &functions, &function_count);
+    ASSERT_GT(function_count, 0);
+
+    char signal_qn[512];
+    snprintf(signal_qn, sizeof(signal_qn), "%s.player.Player.signal.hit", proj);
+    int64_t signal_id = 0;
+    for (int i = 0; i < function_count; i++) {
+        if (strcmp(functions[i].qualified_name, signal_qn) == 0) {
+            signal_id = functions[i].id;
+            break;
+        }
+    }
+    ASSERT_GT(signal_id, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    bool found_call_helper = false;
+    cbm_store_find_edges_by_source_type(s, call_helper[0].id, "CALLS", &edges, &edge_count);
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].target_id == helper[0].id && edges[i].properties_json &&
+            strstr(edges[i].properties_json, "\"callee\":\"helper\"") != NULL) {
+            found_call_helper = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_call_helper);
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+        edges = NULL;
+    }
+
+    bool found_emit_signal = false;
+    edge_count = 0;
+    cbm_store_find_edges_by_source_type(s, emit_hit[0].id, "CALLS", &edges, &edge_count);
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].target_id == signal_id && edges[i].properties_json &&
+            strstr(edges[i].properties_json, "\"callee\":\"emit_signal\"") != NULL) {
+            found_emit_signal = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_emit_signal);
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+        edges = NULL;
+    }
+
+    bool found_self_emit = false;
+    edge_count = 0;
+    cbm_store_find_edges_by_source_type(s, relay_hit[0].id, "CALLS", &edges, &edge_count);
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].target_id == signal_id && edges[i].properties_json &&
+            strstr(edges[i].properties_json, "\"callee\":\"self.hit.emit\"") != NULL) {
+            found_self_emit = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_self_emit);
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+        edges = NULL;
+    }
+
+    bool found_hit_connect = false;
+    edge_count = 0;
+    cbm_store_find_edges_by_source_type(s, connect_hit[0].id, "CALLS", &edges, &edge_count);
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].target_id == signal_id && edges[i].properties_json &&
+            strstr(edges[i].properties_json, "\"callee\":\"hit.connect\"") != NULL) {
+            found_hit_connect = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_hit_connect);
+
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    if (functions) {
+        cbm_store_free_nodes(functions, function_count);
+    }
+    if (call_helper) {
+        cbm_store_free_nodes(call_helper, call_helper_count);
+    }
+    if (emit_hit) {
+        cbm_store_free_nodes(emit_hit, emit_hit_count);
+    }
+    if (relay_hit) {
+        cbm_store_free_nodes(relay_hit, relay_hit_count);
+    }
+    if (connect_hit) {
+        cbm_store_free_nodes(connect_hit, connect_hit_count);
+    }
+    if (helper) {
+        cbm_store_free_nodes(helper, helper_count);
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_gdscript_inherits_script_anchor) {
+    const char *files[] = {"actors/base_enemy.gd", "actors/enemy.gd"};
+    const char *contents[] = {
+        "class_name BaseEnemy\n"
+        "func roar():\n"
+        "    pass\n",
+        "class_name Enemy\n"
+        "extends \"res://actors/base_enemy.gd\"\n"
+        "func attack():\n"
+        "    pass\n"};
+
+    if (setup_lang_repo(files, contents, 2) != 0) {
+        SKIP("tmpdir");
+    }
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *base_nodes = NULL;
+    cbm_node_t *enemy_nodes = NULL;
+    int base_count = 0;
+    int enemy_count = 0;
+    cbm_store_find_nodes_by_name(s, proj, "BaseEnemy", &base_nodes, &base_count);
+    cbm_store_find_nodes_by_name(s, proj, "Enemy", &enemy_nodes, &enemy_count);
+    ASSERT_GT(base_count, 0);
+    ASSERT_GT(enemy_count, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_source_type(s, enemy_nodes[0].id, "INHERITS", &edges, &edge_count);
+    bool found_inherits = false;
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].target_id == base_nodes[0].id) {
+            found_inherits = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_inherits);
+
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    if (base_nodes) {
+        cbm_store_free_nodes(base_nodes, base_count);
+    }
+    if (enemy_nodes) {
+        cbm_store_free_nodes(enemy_nodes, enemy_count);
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_gdscript_dotted_receiver_signal_does_not_resolve_to_local_anchor) {
+    const char *files[] = {"player.gd"};
+    const char *contents[] = {
+        "class_name Player\n"
+        "signal died\n"
+        "func setup(enemy):\n"
+        "    enemy.died.connect(_on_died)\n"
+        "func _on_died():\n"
+        "    pass\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0) {
+        SKIP("tmpdir");
+    }
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *setup_nodes = NULL;
+    int setup_count = 0;
+    cbm_store_find_nodes_by_name(s, proj, "setup", &setup_nodes, &setup_count);
+    ASSERT_GT(setup_count, 0);
+
+    cbm_node_t *functions = NULL;
+    int function_count = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Function", &functions, &function_count);
+    ASSERT_GT(function_count, 0);
+
+    char signal_qn[512];
+    snprintf(signal_qn, sizeof(signal_qn), "%s.player.Player.signal.died", proj);
+    int64_t signal_id = 0;
+    for (int i = 0; i < function_count; i++) {
+        if (strcmp(functions[i].qualified_name, signal_qn) == 0) {
+            signal_id = functions[i].id;
+            break;
+        }
+    }
+    ASSERT_GT(signal_id, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_source_type(s, setup_nodes[0].id, "CALLS", &edges, &edge_count);
+    bool found_local_signal = false;
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].target_id == signal_id) {
+            found_local_signal = true;
+            break;
+        }
+    }
+    ASSERT_FALSE(found_local_signal);
+
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    if (functions) {
+        cbm_store_free_nodes(functions, function_count);
+    }
+    if (setup_nodes) {
+        cbm_store_free_nodes(setup_nodes, setup_count);
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_gdscript_object_connect_string_arg_does_not_resolve_to_local_anchor) {
+    const char *files[] = {"player.gd"};
+    const char *contents[] = {
+        "class_name Player\n"
+        "signal hit\n"
+        "func setup(button):\n"
+        "    button.connect(\"hit\", _on_hit)\n"
+        "func _on_hit():\n"
+        "    pass\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0) {
+        SKIP("tmpdir");
+    }
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *setup_nodes = NULL;
+    int setup_count = 0;
+    cbm_store_find_nodes_by_name(s, proj, "setup", &setup_nodes, &setup_count);
+    ASSERT_GT(setup_count, 0);
+
+    cbm_node_t *functions = NULL;
+    int function_count = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Function", &functions, &function_count);
+    ASSERT_GT(function_count, 0);
+
+    char signal_qn[512];
+    snprintf(signal_qn, sizeof(signal_qn), "%s.player.Player.signal.hit", proj);
+    int64_t signal_id = 0;
+    for (int i = 0; i < function_count; i++) {
+        if (strcmp(functions[i].qualified_name, signal_qn) == 0) {
+            signal_id = functions[i].id;
+            break;
+        }
+    }
+    ASSERT_GT(signal_id, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    bool found_local_signal = false;
+    cbm_store_find_edges_by_source_type(s, setup_nodes[0].id, "CALLS", &edges, &edge_count);
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].target_id == signal_id) {
+            found_local_signal = true;
+            break;
+        }
+    }
+    ASSERT_FALSE(found_local_signal);
+
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    if (functions) {
+        cbm_store_free_nodes(functions, function_count);
+    }
+    if (setup_nodes) {
+        cbm_store_free_nodes(setup_nodes, setup_count);
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_gdscript_unknown_receiver_calls_do_not_resolve_generic_symbols) {
+    const char *files[] = {"player.gd"};
+    const char *contents[] = {
+        "class_name Player\n"
+        "func connect():\n"
+        "    pass\n"
+        "func emit():\n"
+        "    pass\n"
+        "func setup(button):\n"
+        "    button.connect(\"hit\", _on_hit)\n"
+        "    button.emit()\n"
+        "func _on_hit():\n"
+        "    pass\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0) {
+        SKIP("tmpdir");
+    }
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *setup_nodes = NULL;
+    cbm_node_t *connect_nodes = NULL;
+    cbm_node_t *emit_nodes = NULL;
+    int setup_count = 0;
+    int connect_count = 0;
+    int emit_count = 0;
+    cbm_store_find_nodes_by_name(s, proj, "setup", &setup_nodes, &setup_count);
+    cbm_store_find_nodes_by_name(s, proj, "connect", &connect_nodes, &connect_count);
+    cbm_store_find_nodes_by_name(s, proj, "emit", &emit_nodes, &emit_count);
+    ASSERT_GT(setup_count, 0);
+    ASSERT_GT(connect_count, 0);
+    ASSERT_GT(emit_count, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    bool found_connect = false;
+    bool found_emit = false;
+    cbm_store_find_edges_by_source_type(s, setup_nodes[0].id, "CALLS", &edges, &edge_count);
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].target_id == connect_nodes[0].id) {
+            found_connect = true;
+        }
+        if (edges[i].target_id == emit_nodes[0].id) {
+            found_emit = true;
+        }
+    }
+    ASSERT_FALSE(found_connect);
+    ASSERT_FALSE(found_emit);
+
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    if (setup_nodes) {
+        cbm_store_free_nodes(setup_nodes, setup_count);
+    }
+    if (connect_nodes) {
+        cbm_store_free_nodes(connect_nodes, connect_count);
+    }
+    if (emit_nodes) {
+        cbm_store_free_nodes(emit_nodes, emit_count);
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_gdscript_receiver_type_comment_does_not_infer_signal_target) {
+    const char *files[] = {"actors/receiver.gd", "actors/player.gd"};
+    const char *contents[] = {
+        "class_name Receiver\n"
+        "signal hit\n"
+        "func _noop():\n"
+        "    pass\n",
+        "class_name Player\n"
+        "const ReceiverClass = preload(\"res://actors/receiver.gd\")\n"
+        "func setup():\n"
+        "    # var r = ReceiverClass.new()\n"
+        "    r.hit.connect(_on_hit)\n"
+        "func _on_hit():\n"
+        "    pass\n"};
+
+    if (setup_lang_repo(files, contents, 2) != 0) {
+        SKIP("tmpdir");
+    }
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *setup_nodes = NULL;
+    cbm_node_t *functions = NULL;
+    int setup_count = 0;
+    int function_count = 0;
+    cbm_store_find_nodes_by_name(s, proj, "setup", &setup_nodes, &setup_count);
+    cbm_store_find_nodes_by_label(s, proj, "Function", &functions, &function_count);
+    ASSERT_GT(setup_count, 0);
+    ASSERT_GT(function_count, 0);
+
+    char signal_qn[512];
+    snprintf(signal_qn, sizeof(signal_qn), "%s.actors.receiver.Receiver.signal.hit", proj);
+    int64_t signal_id = 0;
+    for (int i = 0; i < function_count; i++) {
+        if (strcmp(functions[i].qualified_name, signal_qn) == 0) {
+            signal_id = functions[i].id;
+            break;
+        }
+    }
+    ASSERT_GT(signal_id, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    bool found_signal = false;
+    cbm_store_find_edges_by_source_type(s, setup_nodes[0].id, "CALLS", &edges, &edge_count);
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].target_id == signal_id) {
+            found_signal = true;
+            break;
+        }
+    }
+    ASSERT_FALSE(found_signal);
+
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    if (functions) {
+        cbm_store_free_nodes(functions, function_count);
+    }
+    if (setup_nodes) {
+        cbm_store_free_nodes(setup_nodes, setup_count);
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_gdscript_receiver_type_multiline_string_does_not_infer_signal_target) {
+    const char *files[] = {"actors/receiver.gd", "actors/player.gd"};
+    const char *contents[] = {
+        "class_name Receiver\n"
+        "signal hit\n"
+        "func _noop():\n"
+        "    pass\n",
+        "class_name Player\n"
+        "const ReceiverClass = preload(\"res://actors/receiver.gd\")\n"
+        "const DOC = \"\"\"\n"
+        "func setup():\n"
+        "    var r = ReceiverClass.new()\n"
+        "\"\"\"\n"
+        "func setup():\n"
+        "    r.hit.connect(_on_hit)\n"
+        "func _on_hit():\n"
+        "    pass\n"};
+
+    if (setup_lang_repo(files, contents, 2) != 0) {
+        SKIP("tmpdir");
+    }
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *setup_nodes = NULL;
+    cbm_node_t *functions = NULL;
+    int setup_count = 0;
+    int function_count = 0;
+    cbm_store_find_nodes_by_name(s, proj, "setup", &setup_nodes, &setup_count);
+    cbm_store_find_nodes_by_label(s, proj, "Function", &functions, &function_count);
+    ASSERT_GT(setup_count, 0);
+    ASSERT_GT(function_count, 0);
+
+    char signal_qn[512];
+    snprintf(signal_qn, sizeof(signal_qn), "%s.actors.receiver.Receiver.signal.hit", proj);
+    int64_t signal_id = 0;
+    for (int i = 0; i < function_count; i++) {
+        if (strcmp(functions[i].qualified_name, signal_qn) == 0) {
+            signal_id = functions[i].id;
+            break;
+        }
+    }
+    ASSERT_GT(signal_id, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    bool found_signal = false;
+    cbm_store_find_edges_by_source_type(s, setup_nodes[0].id, "CALLS", &edges, &edge_count);
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].target_id == signal_id) {
+            found_signal = true;
+            break;
+        }
+    }
+    ASSERT_FALSE(found_signal);
+
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    if (functions) {
+        cbm_store_free_nodes(functions, function_count);
+    }
+    if (setup_nodes) {
+        cbm_store_free_nodes(setup_nodes, setup_count);
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_gdscript_receiver_typed_signal_calls) {
+    const char *files[] = {"actors/receiver.gd", "actors/player.gd"};
+    const char *contents[] = {
+        "class_name Receiver\n"
+        "signal hit\n"
+        "func _noop():\n"
+        "    pass\n",
+        "class_name Player\n"
+        "const ReceiverClass = preload(\"res://actors/receiver.gd\")\n"
+        "func connect_remote():\n"
+        "    var r = ReceiverClass.new()\n"
+        "    r.hit.connect(_on_receiver_hit)\n"
+        "func emit_remote():\n"
+        "    var r = ReceiverClass.new()\n"
+        "    r.hit.emit()\n"
+        "func _on_receiver_hit():\n"
+        "    pass\n"};
+
+    if (setup_lang_repo(files, contents, 2) != 0) {
+        SKIP("tmpdir");
+    }
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *connect_nodes = NULL;
+    cbm_node_t *emit_nodes = NULL;
+    cbm_node_t *functions = NULL;
+    int connect_count = 0;
+    int emit_count = 0;
+    int function_count = 0;
+    cbm_store_find_nodes_by_name(s, proj, "connect_remote", &connect_nodes, &connect_count);
+    cbm_store_find_nodes_by_name(s, proj, "emit_remote", &emit_nodes, &emit_count);
+    cbm_store_find_nodes_by_label(s, proj, "Function", &functions, &function_count);
+    ASSERT_GT(connect_count, 0);
+    ASSERT_GT(emit_count, 0);
+    ASSERT_GT(function_count, 0);
+
+    char signal_qn[512];
+    snprintf(signal_qn, sizeof(signal_qn), "%s.actors.receiver.Receiver.signal.hit", proj);
+    int64_t signal_id = 0;
+    for (int i = 0; i < function_count; i++) {
+        if (strcmp(functions[i].qualified_name, signal_qn) == 0) {
+            signal_id = functions[i].id;
+            break;
+        }
+    }
+    ASSERT_GT(signal_id, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    bool found_connect = false;
+    cbm_store_find_edges_by_source_type(s, connect_nodes[0].id, "CALLS", &edges, &edge_count);
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].target_id == signal_id && edges[i].properties_json &&
+            strstr(edges[i].properties_json, "\"callee\":\"r.hit.connect\"") != NULL) {
+            found_connect = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_connect);
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+        edges = NULL;
+    }
+
+    bool found_emit = false;
+    edge_count = 0;
+    cbm_store_find_edges_by_source_type(s, emit_nodes[0].id, "CALLS", &edges, &edge_count);
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].target_id == signal_id && edges[i].properties_json &&
+            strstr(edges[i].properties_json, "\"callee\":\"r.hit.emit\"") != NULL) {
+            found_emit = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_emit);
+
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    if (functions) {
+        cbm_store_free_nodes(functions, function_count);
+    }
+    if (connect_nodes) {
+        cbm_store_free_nodes(connect_nodes, connect_count);
+    }
+    if (emit_nodes) {
+        cbm_store_free_nodes(emit_nodes, emit_count);
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_gdscript_inherits_alias_named_and_preload_paths) {
+    const char *files[] = {"actors/base.gd",          "actors/player_alias.gd",
+                           "actors/player_named.gd",  "actors/player_path.gd",
+                           "actors/player_preload.gd"};
+    const char *contents[] = {
+        "class_name Base\n"
+        "func ping():\n"
+        "    pass\n",
+        "class_name PlayerAlias\n"
+        "const BaseAlias = preload(\"res://actors/base.gd\")\n"
+        "extends BaseAlias\n"
+        "func attack_alias():\n"
+        "    pass\n",
+        "class_name PlayerNamed\n"
+        "extends Base\n"
+        "func attack_named():\n"
+        "    pass\n",
+        "class_name PlayerPath\n"
+        "extends \"res://actors/base.gd\"\n"
+        "func attack_path():\n"
+        "    pass\n",
+        "class_name PlayerPreloadPath\n"
+        "extends preload(\"res://actors/base.gd\")\n"
+        "func attack_preload():\n"
+        "    pass\n"};
+
+    if (setup_lang_repo(files, contents, 5) != 0) {
+        SKIP("tmpdir");
+    }
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *base_nodes = NULL;
+    int base_count = 0;
+    cbm_store_find_nodes_by_name(s, proj, "Base", &base_nodes, &base_count);
+    ASSERT_GT(base_count, 0);
+
+    const char *derived_names[] = {"PlayerAlias", "PlayerNamed", "PlayerPath", "PlayerPreloadPath"};
+    for (int d = 0; d < 4; d++) {
+        cbm_node_t *derived_nodes = NULL;
+        int derived_count = 0;
+        cbm_store_find_nodes_by_name(s, proj, derived_names[d], &derived_nodes, &derived_count);
+        ASSERT_GT(derived_count, 0);
+
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        bool found_inherits = false;
+        cbm_store_find_edges_by_source_type(s, derived_nodes[0].id, "INHERITS", &edges, &edge_count);
+        for (int i = 0; i < edge_count; i++) {
+            if (edges[i].target_id == base_nodes[0].id) {
+                found_inherits = true;
+                break;
+            }
+        }
+        ASSERT_TRUE(found_inherits);
+
+        if (edges) {
+            cbm_store_free_edges(edges, edge_count);
+        }
+        if (derived_nodes) {
+            cbm_store_free_nodes(derived_nodes, derived_count);
+        }
+    }
+
+    if (base_nodes) {
+        cbm_store_free_nodes(base_nodes, base_count);
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_gdscript_import_edge_persists_for_resolvable_preload_target) {
+    const char *files[] = {"actors/receiver.gd", "actors/player.gd"};
+    const char *contents[] = {
+        "class_name Receiver\n"
+        "signal hit\n",
+        "class_name Player\n"
+        "const ReceiverClass = preload(\"res://actors/receiver.gd\")\n"
+        "func attack():\n"
+        "    pass\n"};
+
+    if (setup_lang_repo(files, contents, 2) != 0) {
+        SKIP("tmpdir");
+    }
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    char file_qn[512];
+    char module_qn[512];
+    snprintf(file_qn, sizeof(file_qn), "%s.actors.player.__file__", proj);
+    snprintf(module_qn, sizeof(module_qn), "%s.actors.receiver", proj);
+
+    cbm_node_t file_node = {0};
+    cbm_node_t module_node = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, proj, file_qn, &file_node), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, proj, module_qn, &module_node), CBM_STORE_OK);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    bool found_import = false;
+    cbm_store_find_edges_by_source_type(s, file_node.id, "IMPORTS", &edges, &edge_count);
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].target_id == module_node.id) {
+            found_import = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_import);
+
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    cbm_node_free_fields(&file_node);
+    cbm_node_free_fields(&module_node);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_gdscript_import_edge_skips_missing_preload_target) {
+    const char *files[] = {"actors/player.gd"};
+    const char *contents[] = {
+        "class_name Player\n"
+        "const MissingClass = preload(\"res://actors/missing.gd\")\n"
+        "func attack():\n"
+        "    pass\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0) {
+        SKIP("tmpdir");
+    }
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    char file_qn[512];
+    char module_qn[512];
+    snprintf(file_qn, sizeof(file_qn), "%s.actors.player.__file__", proj);
+    snprintf(module_qn, sizeof(module_qn), "%s.actors.missing", proj);
+
+    cbm_node_t file_node = {0};
+    cbm_node_t module_node = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, proj, file_qn, &file_node), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, proj, module_qn, &module_node), CBM_STORE_NOT_FOUND);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_source_type(s, file_node.id, "IMPORTS", &edges, &edge_count);
+    ASSERT_EQ(edge_count, 0);
+
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    cbm_node_free_fields(&file_node);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
 /* DLL resolve test removed — feature removed due to Windows Defender
  * false positive (Wacatac.B!ml). See issue #89. */
 
@@ -5777,6 +6657,17 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_bom_stripping);
     RUN_TEST(pipeline_form_call_resolution);
     RUN_TEST(pipeline_python_type_inference);
+    RUN_TEST(pipeline_gdscript_same_script_calls_and_signals);
+    RUN_TEST(pipeline_gdscript_inherits_script_anchor);
+    RUN_TEST(pipeline_gdscript_dotted_receiver_signal_does_not_resolve_to_local_anchor);
+    RUN_TEST(pipeline_gdscript_object_connect_string_arg_does_not_resolve_to_local_anchor);
+    RUN_TEST(pipeline_gdscript_unknown_receiver_calls_do_not_resolve_generic_symbols);
+    RUN_TEST(pipeline_gdscript_receiver_type_comment_does_not_infer_signal_target);
+    RUN_TEST(pipeline_gdscript_receiver_type_multiline_string_does_not_infer_signal_target);
+    RUN_TEST(pipeline_gdscript_receiver_typed_signal_calls);
+    RUN_TEST(pipeline_gdscript_inherits_alias_named_and_preload_paths);
+    RUN_TEST(pipeline_gdscript_import_edge_persists_for_resolvable_preload_target);
+    RUN_TEST(pipeline_gdscript_import_edge_skips_missing_preload_target);
     /* Docstring integration (port of TestDocstringIntegration) */
     RUN_TEST(pipeline_docstring_go_function);
     RUN_TEST(pipeline_docstring_python_function);

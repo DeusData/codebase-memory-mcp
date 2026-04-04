@@ -31,12 +31,32 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
 static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
                                  const CBMLangSpec *spec);
 static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
+static void emit_gdscript_anchor_def(CBMExtractCtx *ctx);
+static void extract_gdscript_signal_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 
 // --- Helpers ---
 
 // Get "name" field from a node
 static TSNode func_name_node(TSNode node) {
     return ts_node_child_by_field_name(node, "name", 4);
+}
+
+static TSNode gdscript_name_node(TSNode node) {
+    TSNode name_node = func_name_node(node);
+    if (!ts_node_is_null(name_node)) {
+        return name_node;
+    }
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(node, i);
+        const char *kind = ts_node_type(child);
+        if (strcmp(kind, "identifier") == 0 || strcmp(kind, "type_identifier") == 0 ||
+            strcmp(kind, "name") == 0) {
+            return child;
+        }
+    }
+    TSNode null_node = {0};
+    return null_node;
 }
 
 // Resolve the name node for a function, handling language-specific quirks
@@ -1015,12 +1035,18 @@ static const char **extract_param_types(CBMArena *a, TSNode params, const char *
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
-    TSNode name_node = resolve_func_name(node, ctx->language, ctx->source);
-    if (ts_node_is_null(name_node)) {
-        return;
+    const char *kind = ts_node_type(node);
+    char *name = NULL;
+    if (ctx->language == CBM_LANG_GDSCRIPT && strcmp(kind, "constructor_definition") == 0) {
+        name = cbm_arena_strdup(a, "_init");
+    } else {
+        TSNode name_node = resolve_func_name(node, ctx->language, ctx->source);
+        if (ts_node_is_null(name_node)) {
+            return;
+        }
+        name = cbm_node_text(a, name_node, ctx->source);
     }
 
-    char *name = cbm_node_text(a, name_node, ctx->source);
     if (!name || !name[0] || strcmp(name, "function") == 0) {
         return;
     }
@@ -1123,6 +1149,16 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         def.label = "Method";
     }
 
+    if (ctx->language == CBM_LANG_GDSCRIPT) {
+        const char *class_qn = ctx->enclosing_class_qn;
+        if (!class_qn) {
+            class_qn = cbm_gdscript_anchor_qn(a, ctx->root, ctx->source, ctx->project, ctx->rel_path);
+        }
+        def.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
+        def.label = "Method";
+        def.parent_class = class_qn;
+    }
+
     // Decorators
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
 
@@ -1148,6 +1184,56 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     }
 
     cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+static void emit_gdscript_anchor_def(CBMExtractCtx *ctx) {
+    CBMDefinition def;
+    memset(&def, 0, sizeof(def));
+
+    def.name = cbm_gdscript_anchor_name(ctx->arena, ctx->root, ctx->source);
+    def.qualified_name =
+        cbm_gdscript_anchor_qn(ctx->arena, ctx->root, ctx->source, ctx->project, ctx->rel_path);
+    def.label = "Class";
+    def.file_path = ctx->rel_path;
+    def.start_line = 1;
+    def.end_line = ts_node_end_point(ctx->root).row + 1;
+    def.is_exported = true;
+    def.base_classes =
+        cbm_gdscript_anchor_base_classes(ctx->arena, ctx->root, ctx->source, ctx->rel_path);
+
+    cbm_defs_push(&ctx->result->defs, ctx->arena, def);
+}
+
+static void extract_gdscript_signal_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
+    (void)spec;
+    TSNode name_node = gdscript_name_node(node);
+    if (ts_node_is_null(name_node)) {
+        return;
+    }
+
+    char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
+    if (!name || !name[0]) {
+        return;
+    }
+
+    const char *class_qn = ctx->enclosing_class_qn;
+    if (!class_qn) {
+        class_qn =
+            cbm_gdscript_anchor_qn(ctx->arena, ctx->root, ctx->source, ctx->project, ctx->rel_path);
+    }
+
+    CBMDefinition def;
+    memset(&def, 0, sizeof(def));
+    def.name = name;
+    def.qualified_name = cbm_arena_sprintf(ctx->arena, "%s.signal.%s", class_qn, name);
+    def.label = "Function";
+    def.file_path = ctx->rel_path;
+    def.parent_class = class_qn;
+    def.start_line = ts_node_start_point(node).row + 1;
+    def.end_line = ts_node_end_point(node).row + 1;
+    def.is_exported = true;
+
+    cbm_defs_push(&ctx->result->defs, ctx->arena, def);
 }
 
 // --- Class definition extraction ---
@@ -1401,7 +1487,12 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.start_line = ts_node_start_point(node).row + 1;
     def.end_line = ts_node_end_point(node).row + 1;
     def.is_exported = cbm_is_exported(name, ctx->language);
-    def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
+    if (ctx->language == CBM_LANG_GDSCRIPT) {
+        def.base_classes =
+            cbm_gdscript_anchor_base_classes(a, node, ctx->source, ctx->rel_path);
+    } else {
+        def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
+    }
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
 
@@ -1631,6 +1722,24 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
     for (uint32_t i = 0; i < count; i++) {
         TSNode child = ts_node_child(body, i);
         if (ts_node_is_null(child)) {
+            continue;
+        }
+
+        if (ctx->language == CBM_LANG_GDSCRIPT &&
+            strcmp(ts_node_type(child), "signal_statement") == 0) {
+            const char *saved_enclosing = ctx->enclosing_class_qn;
+            ctx->enclosing_class_qn = class_qn;
+            extract_gdscript_signal_def(ctx, child, spec);
+            ctx->enclosing_class_qn = saved_enclosing;
+            continue;
+        }
+
+        if (ctx->language == CBM_LANG_GDSCRIPT &&
+            strcmp(ts_node_type(child), "constructor_definition") == 0) {
+            const char *saved_enclosing = ctx->enclosing_class_qn;
+            ctx->enclosing_class_qn = class_qn;
+            extract_func_def(ctx, child, spec);
+            ctx->enclosing_class_qn = saved_enclosing;
             continue;
         }
 
@@ -2698,6 +2807,11 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, 
         return;
     }
 
+    if (ctx->language == CBM_LANG_GDSCRIPT && strcmp(kind, "signal_statement") == 0) {
+        extract_gdscript_signal_def(ctx, node, spec);
+        return;
+    }
+
     // Function types
     if (cbm_kind_in_set(node, spec->function_node_types)) {
         // C++/CUDA: template_declaration may wrap a class, not a function.
@@ -2812,8 +2926,18 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
     mod.is_test = ctx->result->is_test_file;
     cbm_defs_push(&ctx->result->defs, a, mod);
 
+    if (ctx->language == CBM_LANG_GDSCRIPT) {
+        emit_gdscript_anchor_def(ctx);
+        ctx->enclosing_class_qn =
+            cbm_gdscript_anchor_qn(a, ctx->root, ctx->source, ctx->project, ctx->rel_path);
+    }
+
     // Walk AST for function/class definitions
     walk_defs(ctx, ctx->root, spec, 0);
+
+    if (ctx->language == CBM_LANG_GDSCRIPT) {
+        ctx->enclosing_class_qn = NULL;
+    }
 
     // Extract module-level variables
     extract_variables(ctx, ctx->root, spec);

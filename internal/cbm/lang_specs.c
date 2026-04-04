@@ -70,6 +70,7 @@ extern const TSLanguage *tree_sitter_lean(void);
 extern const TSLanguage *tree_sitter_form(void);
 extern const TSLanguage *tree_sitter_magma(void);
 extern const TSLanguage *tree_sitter_wolfram(void);
+extern const TSLanguage *tree_sitter_gdscript(void);
 
 // -- Empty sentinel --
 static const char *empty_types[] = {NULL};
@@ -709,6 +710,22 @@ static const char *wolfram_module_types[] = {"source_file", NULL};
 static const char *wolfram_call_types[] = {"apply", NULL};
 static const char *wolfram_import_types[] = {"get_top", NULL};
 
+// ==================== GDSCRIPT ====================
+// Task 3: parser dispatch plus script-anchor-aware defs/signals/class statements.
+static const char *gdscript_func_types[] = {"function_definition", "constructor_definition",
+                                            NULL};
+static const char *gdscript_class_types[] = {"class_definition", NULL};
+static const char *gdscript_module_types[] = {"source", NULL};
+static const char *gdscript_call_types[] = {"call", "attribute_call", NULL};
+static const char *gdscript_import_types[] = {"call", "attribute_call", "extends_statement",
+                                              NULL};
+static const char *gdscript_branch_types[] = {"if_statement", "elif_clause", "else_clause",
+                                              "for_statement", "while_statement",
+                                              "match_statement", NULL};
+static const char *gdscript_var_types[] = {"variable_statement", "export_variable_statement",
+                                           "onready_variable_statement", "const_statement", NULL};
+static const char *gdscript_assign_types[] = {"assignment", "augmented_assignment", NULL};
+
 // ==================== NEW LANG ENV ACCESS ====================
 static const char *julia_env_funcs[] = {"ENV", NULL};
 static const char *nix_env_funcs[] = {"builtins.getEnv", NULL};
@@ -1042,6 +1059,12 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
      wolfram_call_types, wolfram_import_types, empty_types, empty_types, empty_types, empty_types,
      empty_types, NULL, empty_types, NULL, NULL},
 
+    // CBM_LANG_GDSCRIPT
+    {CBM_LANG_GDSCRIPT, gdscript_func_types, gdscript_class_types, empty_types,
+     gdscript_module_types, gdscript_call_types, gdscript_import_types, empty_types,
+     gdscript_branch_types, gdscript_var_types, gdscript_assign_types, empty_types, NULL,
+     empty_types, NULL, NULL},
+
     // CBM_LANG_KUSTOMIZE — reuses YAML grammar; semantic extraction via cbm_extract_k8s()
     {CBM_LANG_KUSTOMIZE, empty_types, empty_types, empty_types, yaml_module_types, empty_types,
      empty_types, empty_types, empty_types, empty_types, empty_types, empty_types, NULL,
@@ -1184,6 +1207,8 @@ const TSLanguage *cbm_ts_language(CBMLanguage lang) {
         return tree_sitter_matlab();
     case CBM_LANG_LEAN:
         return tree_sitter_lean();
+    case CBM_LANG_GDSCRIPT:
+        return tree_sitter_gdscript();
     case CBM_LANG_FORM:
         return tree_sitter_form();
     case CBM_LANG_MAGMA:

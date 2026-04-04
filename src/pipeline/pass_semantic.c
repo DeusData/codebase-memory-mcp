@@ -156,6 +156,26 @@ static void free_import_map(const char **keys, const char **vals, int count) {
     }
 }
 
+static const char *lookup_import_map_value(const char *name, const char **imp_keys,
+                                           const char **imp_vals, int imp_count) {
+    if (!name || !imp_keys || !imp_vals) {
+        return NULL;
+    }
+    for (int i = 0; i < imp_count; i++) {
+        if (imp_keys[i] && imp_vals[i] && strcmp(imp_keys[i], name) == 0) {
+            return imp_vals[i];
+        }
+    }
+    return NULL;
+}
+
+static bool is_classish_label(const char *label) {
+    return label && (strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
+                     strcmp(label, "Type") == 0 || strcmp(label, "Enum") == 0);
+}
+
+static bool fp_ends_with(const char *fp, const char *suffix);
+
 /* Resolve a class/type name through the registry. Returns borrowed QN or NULL. */
 static const char *resolve_as_class(const cbm_registry_t *reg, const char *name,
                                     const char *module_qn, const char **imp_keys,
@@ -171,11 +191,152 @@ static const char *resolve_as_class(const cbm_registry_t *reg, const char *name,
     if (!label) {
         return NULL;
     }
-    if (strcmp(label, "Class") != 0 && strcmp(label, "Interface") != 0 &&
-        strcmp(label, "Type") != 0 && strcmp(label, "Enum") != 0) {
+    if (!is_classish_label(label)) {
         return NULL;
     }
     return res.qualified_name;
+}
+
+static bool gdscript_anchor_matches_module(const char *class_qn, const char *module_qn) {
+    if (!class_qn || !module_qn) {
+        return false;
+    }
+    char script_qn[512];
+    snprintf(script_qn, sizeof(script_qn), "%s.__script__", module_qn);
+    if (strcmp(class_qn, script_qn) == 0) {
+        return true;
+    }
+    size_t prefix_len = strlen(module_qn);
+    if (strncmp(class_qn, module_qn, prefix_len) != 0 || class_qn[prefix_len] != '.') {
+        return false;
+    }
+    return strchr(class_qn + prefix_len + 1, '.') == NULL;
+}
+
+static bool gdscript_extract_module_path(const char *target_name, char *out, size_t out_size) {
+    if (!target_name || !out || out_size == 0) {
+        return false;
+    }
+
+    const char *start = strstr(target_name, "\"");
+    if (!start) {
+        return false;
+    }
+    start++;
+    const char *end = strstr(start, ".gd\"");
+    if (!end) {
+        return false;
+    }
+    end += 3;
+
+    const char *path_start = start;
+    if (strncmp(path_start, "res://", 6) == 0) {
+        path_start += 6;
+    }
+    size_t len = (size_t)(end - path_start);
+    if (len + 1 > out_size) {
+        return false;
+    }
+    memcpy(out, path_start, len);
+    out[len] = '\0';
+    return true;
+}
+
+static bool gdscript_preload_extends_base_from_source(const char *source, char *out,
+                                                      size_t out_size) {
+    if (!source || !out || out_size == 0) {
+        return false;
+    }
+    for (const char *line = source; line && *line; ) {
+        const char *next = strchr(line, '\n');
+        const char *scan = line;
+        while (*scan == ' ' || *scan == '\t') {
+            scan++;
+        }
+        if (strncmp(scan, "func ", 5) == 0 || strncmp(scan, "class ", 6) == 0) {
+            return false;
+        }
+        if (strncmp(scan, "extends preload(\"", 17) == 0) {
+            const char *start = scan + 17;
+            const char *end = strstr(start, ".gd\"");
+            if (!end || (next && end > next)) {
+                return false;
+            }
+            end += 3;
+            if (strncmp(start, "res://", 6) == 0) {
+                start += 6;
+            }
+            size_t len = (size_t)(end - start);
+            if (len == 0 || len + 1 > out_size) {
+                return false;
+            }
+            memcpy(out, start, len);
+            out[len] = '\0';
+            return true;
+        }
+        line = next ? next + 1 : NULL;
+    }
+    return false;
+}
+
+static const char *find_gdscript_script_anchor(cbm_pipeline_ctx_t *ctx, const char *file_path,
+                                               const char *module_qn) {
+    const cbm_gbuf_node_t **classes = NULL;
+    int class_count = 0;
+    if (cbm_gbuf_find_by_label(ctx->gbuf, "Class", &classes, &class_count) != 0) {
+        return NULL;
+    }
+    for (int i = 0; i < class_count; i++) {
+        const cbm_gbuf_node_t *cls = classes[i];
+        if (!cls->file_path || !cls->qualified_name) {
+            continue;
+        }
+        if (strcmp(cls->file_path, file_path) != 0) {
+            continue;
+        }
+        if (gdscript_anchor_matches_module(cls->qualified_name, module_qn)) {
+            return cls->qualified_name;
+        }
+    }
+    return NULL;
+}
+
+static const char *promote_gdscript_target_to_class(cbm_pipeline_ctx_t *ctx,
+                                                    const char *resolved_qn,
+                                                    const char *raw_target_name) {
+    const char *file_path = NULL;
+    char *module_qn_owned = NULL;
+    const char *module_qn = NULL;
+
+    if (resolved_qn) {
+        const char *label = cbm_registry_label_of(ctx->registry, resolved_qn);
+        if (is_classish_label(label)) {
+            return resolved_qn;
+        }
+        const cbm_gbuf_node_t *resolved_node = cbm_gbuf_find_by_qn(ctx->gbuf, resolved_qn);
+        if (resolved_node && resolved_node->file_path && fp_ends_with(resolved_node->file_path, ".gd")) {
+            file_path = resolved_node->file_path;
+        }
+    }
+
+    if (!file_path && raw_target_name && fp_ends_with(raw_target_name, ".gd")) {
+        file_path = raw_target_name;
+    }
+    char extracted_module_path[512];
+    if (!file_path && raw_target_name && gdscript_extract_module_path(raw_target_name,
+                                                                      extracted_module_path,
+                                                                      sizeof(extracted_module_path))) {
+        file_path = extracted_module_path;
+    }
+    if (!file_path) {
+        return NULL;
+    }
+
+    module_qn_owned = cbm_pipeline_fqn_module(ctx->project_name, file_path);
+    module_qn = module_qn_owned;
+    const char *anchor_qn = find_gdscript_script_anchor(ctx, file_path, module_qn);
+    free(module_qn_owned);
+    return anchor_qn;
 }
 
 /* Extract decorator function name: "@app.route('/api')" → "app.route" */
@@ -374,9 +535,27 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
             /* INHERITS: base_classes */
             if (def->base_classes) {
                 for (int b = 0; def->base_classes[b]; b++) {
-                    const char *base_qn =
-                        resolve_as_class(ctx->registry, def->base_classes[b], module_qn, imp_keys,
-                                         imp_vals, imp_count);
+                    const char *base_name = def->base_classes[b];
+                    cbm_resolution_t base_res =
+                        cbm_registry_resolve(ctx->registry, base_name, module_qn, imp_keys,
+                                             imp_vals, imp_count);
+                    const char *base_qn = NULL;
+                    if (base_res.qualified_name &&
+                        is_classish_label(cbm_registry_label_of(ctx->registry,
+                                                                base_res.qualified_name))) {
+                        base_qn = base_res.qualified_name;
+                    } else {
+                        base_qn = promote_gdscript_target_to_class(ctx, base_res.qualified_name,
+                                                                   base_name);
+                        if (!base_qn) {
+                            const char *import_target =
+                                lookup_import_map_value(base_name, imp_keys, imp_vals, imp_count);
+                            if (import_target) {
+                                base_qn = promote_gdscript_target_to_class(ctx, import_target,
+                                                                           base_name);
+                            }
+                        }
+                    }
                     if (!base_qn) {
                         continue;
                     }
@@ -388,6 +567,25 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
 
                     cbm_gbuf_insert_edge(ctx->gbuf, node->id, base_node->id, "INHERITS", "{}");
                     inherits_count++;
+                }
+            } else if (files[i].language == CBM_LANG_GDSCRIPT && node->label &&
+                       strcmp(node->label, "Class") == 0 && node->qualified_name &&
+                       gdscript_anchor_matches_module(node->qualified_name, module_qn)) {
+                int fallback_len = 0;
+                char *fallback_source = read_file(path, &fallback_len);
+                if (fallback_source) {
+                    char module_path[512];
+                    if (gdscript_preload_extends_base_from_source(fallback_source, module_path,
+                                                                  sizeof(module_path))) {
+                        const char *base_qn = promote_gdscript_target_to_class(ctx, NULL, module_path);
+                        const cbm_gbuf_node_t *base_node =
+                            base_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, base_qn) : NULL;
+                        if (base_node && node->id != base_node->id) {
+                            cbm_gbuf_insert_edge(ctx->gbuf, node->id, base_node->id, "INHERITS", "{}");
+                            inherits_count++;
+                        }
+                    }
+                    free(fallback_source);
                 }
             }
 

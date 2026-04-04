@@ -23,6 +23,7 @@
 /* Strategy 1: import_map — direct import → high confidence */
 #define CONF_IMPORT_MAP 0.95
 #define CONF_IMPORT_MAP_SUFFIX 0.85
+#define CONF_EXACT_QUALIFIED_NAME 0.99
 /* Strategy 2: same_module — same file/package → high confidence */
 #define CONF_SAME_MODULE 0.90
 /* Strategy 3: unique_name — only one candidate project-wide */
@@ -416,6 +417,11 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
                                       const char **import_map_vals, int import_map_count) {
     if (!r || !callee_name) {
         return empty_result();
+    }
+
+    const char *exact = cbm_ht_get_key(r->exact, callee_name);
+    if (exact) {
+        return (cbm_resolution_t){exact, "exact_qualified_name", CONF_EXACT_QUALIFIED_NAME, 1};
     }
 
     /* Split callee: "pkg.Func" → prefix="pkg", suffix="Func" */

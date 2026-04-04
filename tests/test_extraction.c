@@ -47,6 +47,42 @@ static int __attribute__((unused)) has_import(CBMFileResult *r, const char *path
     return 0;
 }
 
+/* Check if any import has exactly local name + module path. */
+static int has_import_exact(CBMFileResult *r, const char *local_name, const char *module_path) {
+    for (int i = 0; i < r->imports.count; i++) {
+        CBMImport *imp = &r->imports.items[i];
+        if (imp->local_name && imp->module_path && strcmp(imp->local_name, local_name) == 0 &&
+            strcmp(imp->module_path, module_path) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Check if any string_ref has exactly the given value. */
+static int has_string_ref_value(CBMFileResult *r, const char *value) {
+    for (int i = 0; i < r->string_refs.count; i++) {
+        const CBMStringRef *ref = &r->string_refs.items[i];
+        if (ref->value && strcmp(ref->value, value) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Check if any string_ref has exactly value + enclosing scope QN. */
+static int has_string_ref_with_enclosing(CBMFileResult *r, const char *value,
+                                         const char *enclosing_qn) {
+    for (int i = 0; i < r->string_refs.count; i++) {
+        const CBMStringRef *ref = &r->string_refs.items[i];
+        if (ref->value && ref->enclosing_func_qn && strcmp(ref->value, value) == 0 &&
+            strcmp(ref->enclosing_func_qn, enclosing_qn) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Count definitions with a given label. */
 static int count_defs_with_label(CBMFileResult *r, const char *label) {
     int count = 0;
@@ -1745,6 +1781,828 @@ TEST(lua_imports) {
     PASS();
 }
 
+TEST(gdscript_parse_basic) {
+    CBMFileResult *r = extract("func _ready():\n    pass\n", CBM_LANG_GDSCRIPT, "t", "main.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_constructor_definition_maps_to_init_method_and_scope) {
+    const char *src = "class_name Player\n"
+                      "func _init(name):\n"
+                      "    print(\"ctor\")\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int saw_init_method = 0;
+    int saw_ctor_call_scope = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Method") == 0 && strcmp(d->name, "_init") == 0) {
+            saw_init_method = 1;
+            ASSERT_STR_EQ(d->qualified_name, "t.player.Player._init");
+            ASSERT_STR_EQ(d->parent_class, "t.player.Player");
+        }
+    }
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *c = &r->calls.items[i];
+        if (strcmp(c->callee_name, "print") == 0) {
+            saw_ctor_call_scope = 1;
+            ASSERT_STR_EQ(c->enclosing_func_qn, "t.player.Player._init");
+        }
+    }
+
+    ASSERT_TRUE(saw_init_method);
+    ASSERT_TRUE(saw_ctor_call_scope);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_defs_anchor_and_methods) {
+    const char *src = "class_name Player\n"
+                      "extends Node2D\n"
+                      "@export var speed = 10\n"
+                      "signal hit\n"
+                      "func _ready():\n"
+                      "    pass\n";
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int class_count = 0;
+    const char *anchor_qn = NULL;
+    int has_export_var = 0;
+    int has_signal_qn = 0;
+    int has_method_parent_match = 0;
+    int has_script_suffix = 0;
+
+    for (int i = 0; i < r->defs.count; i++) {
+        CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Class") == 0 && strcmp(d->name, "Player") == 0) {
+            class_count++;
+            anchor_qn = d->qualified_name;
+            ASSERT_NOT_NULL(anchor_qn);
+            ASSERT_STR_EQ(anchor_qn, "t.player.Player");
+            if (strstr(anchor_qn, ".__script__") != NULL) {
+                has_script_suffix = 1;
+            }
+            if (d->base_classes && d->base_classes[0]) {
+                ASSERT(strstr(d->base_classes[0], "Node2D") != NULL);
+            }
+        }
+        if (strcmp(d->label, "Variable") == 0 && strcmp(d->name, "speed") == 0) {
+            has_export_var = 1;
+        }
+        if (strcmp(d->label, "Function") == 0 &&
+            strcmp(d->qualified_name, "t.player.Player.signal.hit") == 0) {
+            has_signal_qn = 1;
+        }
+        if (strcmp(d->label, "Method") == 0 && strcmp(d->name, "_ready") == 0) {
+            if (d->parent_class && strcmp(d->parent_class, "t.player.Player") == 0) {
+                has_method_parent_match = 1;
+            }
+        }
+    }
+
+    ASSERT_EQ(class_count, 1);
+    ASSERT_FALSE(has_script_suffix);
+    ASSERT(has_def(r, "Method", "_ready"));
+    ASSERT_TRUE(has_export_var);
+    ASSERT_TRUE(has_signal_qn);
+    ASSERT_TRUE(has_method_parent_match);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_defs_script_fallback_anchor) {
+    const char *src = "extends Node\n"
+                      "func tick():\n"
+                      "    pass\n";
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "npc.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int class_count = 0;
+    const char *anchor_qn = NULL;
+    int method_parent_ok = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Class") == 0) {
+            class_count++;
+            anchor_qn = d->qualified_name;
+            ASSERT_NOT_NULL(anchor_qn);
+            ASSERT_STR_EQ(anchor_qn, "t.npc.__script__");
+        }
+    }
+    for (int i = 0; i < r->defs.count; i++) {
+        CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Method") == 0 && strcmp(d->name, "tick") == 0 &&
+            d->parent_class && anchor_qn && strcmp(d->parent_class, anchor_qn) == 0) {
+            method_parent_ok = 1;
+        }
+    }
+
+    ASSERT_EQ(class_count, 1);
+    ASSERT_TRUE(method_parent_ok);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_defs_static_func_var_and_class_stmt) {
+    const char *src = "class_name Utility\n"
+                      "var hp = 100\n"
+                      "static func make_id():\n"
+                      "    return 1\n"
+                      "class Inner:\n"
+                      "    signal spawned\n"
+                      "    func f():\n"
+                      "        pass\n";
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "utility.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const char *anchor_qn = "t.utility.Utility";
+    int has_static_method = 0;
+    int has_alias_name_on_anchor = 0;
+    int anchor_count = 0;
+    int has_inner_class = 0;
+    int has_inner_method = 0;
+    int has_inner_signal = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Class") == 0) {
+            if (strcmp(d->name, "Utility") == 0 && strcmp(d->qualified_name, anchor_qn) == 0) {
+                anchor_count++;
+                has_alias_name_on_anchor = 1;
+            }
+            if (strcmp(d->name, "Inner") == 0 &&
+                strcmp(d->qualified_name, "t.utility.Utility.Inner") == 0) {
+                has_inner_class = 1;
+            }
+        }
+        if (strcmp(d->label, "Method") == 0 && strcmp(d->name, "make_id") == 0 &&
+            d->parent_class && strcmp(d->parent_class, anchor_qn) == 0) {
+            has_static_method = 1;
+        }
+        if (strcmp(d->label, "Method") == 0 && strcmp(d->name, "f") == 0 &&
+            d->parent_class && strcmp(d->parent_class, "t.utility.Utility.Inner") == 0) {
+            has_inner_method = 1;
+        }
+        if (strcmp(d->label, "Function") == 0 &&
+            strcmp(d->qualified_name, "t.utility.Utility.Inner.signal.spawned") == 0) {
+            has_inner_signal = 1;
+        }
+    }
+
+    ASSERT_EQ(anchor_count, 1);
+    ASSERT_TRUE(has_alias_name_on_anchor);
+    ASSERT(has_def(r, "Variable", "hp"));
+    ASSERT_TRUE(has_static_method);
+    ASSERT_TRUE(has_inner_class);
+    ASSERT_TRUE(has_inner_method);
+    ASSERT_TRUE(has_inner_signal);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_signal_calls_and_import_alias) {
+    const char *src = "class_name Player\n"
+                      "const Enemy = preload(\"res://actors/enemy.gd\")\n"
+                      "var EnemyLocal = load(\"enemy_local.gd\")\n"
+                      "var SceneRef = preload(\"res://actors/enemy.tscn\")\n"
+                      "var SceneLocal = load(\"enemy_local.tscn\")\n"
+                      "func attack():\n"
+                      "    emit_signal(\"hit\", 1)\n"
+                      "    hit.emit(2)\n"
+                      "    hit.connect(_on_hit)\n"
+                      "    preload(\"res://actors/effect.gd\")\n"
+                      "    load(dyn_path)\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT(has_import_exact(r, "Enemy", "actors/enemy.gd"));
+    ASSERT(has_import_exact(r, "EnemyLocal", "enemy_local.gd"));
+    ASSERT(has_import(r, "actors/effect.gd"));
+
+    for (int i = 0; i < r->imports.count; i++) {
+        CBMImport *imp = &r->imports.items[i];
+        ASSERT_FALSE(imp->module_path && strstr(imp->module_path, ".tscn") != NULL);
+    }
+
+    ASSERT(has_string_ref_value(r, "res://actors/enemy.tscn"));
+    ASSERT(has_string_ref_value(r, "enemy_local.tscn"));
+
+    int saw_emit_signal = 0;
+    int saw_dot_emit = 0;
+    int saw_dot_connect = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *c = &r->calls.items[i];
+        if (strcmp(c->callee_name, "emit_signal") == 0) {
+            saw_emit_signal = 1;
+            ASSERT_STR_EQ(c->enclosing_func_qn, "t.player.Player.attack");
+            ASSERT_STR_EQ(c->first_string_arg, "hit");
+        }
+        if (strcmp(c->callee_name, "hit.emit") == 0) {
+            saw_dot_emit = 1;
+            ASSERT_STR_EQ(c->enclosing_func_qn, "t.player.Player.attack");
+            ASSERT_STR_EQ(c->first_string_arg, "hit");
+        }
+        if (strcmp(c->callee_name, "hit.connect") == 0) {
+            saw_dot_connect = 1;
+            ASSERT_STR_EQ(c->enclosing_func_qn, "t.player.Player.attack");
+            ASSERT_STR_EQ(c->first_string_arg, "hit");
+        }
+    }
+
+    ASSERT_TRUE(saw_emit_signal);
+    ASSERT_TRUE(saw_dot_emit);
+    ASSERT_TRUE(saw_dot_connect);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_top_level_string_ref_uses_script_anchor_scope) {
+    const char *src = "class_name Player\n"
+                      "const API_URL = \"https://example.com/api\"\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT(has_string_ref_with_enclosing(r, "https://example.com/api", "t.player.Player"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_signal_metadata_dotted_receivers) {
+    const char *src = "class_name Player\n"
+                      "func attack():\n"
+                      "    self.hit.emit()\n"
+                      "    enemy.died.connect(_on_died)\n"
+                      "    enemy.died.connect(\"override\", _on_died)\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int saw_self_hit_emit = 0;
+    int saw_enemy_died_connect = 0;
+    int saw_enemy_died_connect_with_string = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *c = &r->calls.items[i];
+        if (strcmp(c->callee_name, "self.hit.emit") == 0) {
+            saw_self_hit_emit = 1;
+            ASSERT_STR_EQ(c->first_string_arg, "hit");
+        }
+        if (strcmp(c->callee_name, "enemy.died.connect") == 0) {
+            if (c->first_string_arg && strcmp(c->first_string_arg, "override") == 0) {
+                saw_enemy_died_connect_with_string = 1;
+                ASSERT_STR_EQ(c->first_string_arg, "override");
+            } else {
+                saw_enemy_died_connect = 1;
+                ASSERT_STR_EQ(c->first_string_arg, "died");
+            }
+        }
+    }
+
+    ASSERT_TRUE(saw_self_hit_emit);
+    ASSERT_TRUE(saw_enemy_died_connect);
+    ASSERT_TRUE(saw_enemy_died_connect_with_string);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_signal_metadata_receiver_emit_prefers_receiver_name_over_payload) {
+    const char *src = "class_name Player\n"
+                      "const PAYLOAD_CONST = \"payload\"\n"
+                      "func attack(hit, crit):\n"
+                      "    hit.emit(\"payload\")\n"
+                      "    crit.emit(PAYLOAD_CONST)\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int saw_hit_emit = 0;
+    int saw_crit_emit = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *c = &r->calls.items[i];
+        if (strcmp(c->callee_name, "hit.emit") == 0) {
+            saw_hit_emit = 1;
+            ASSERT_STR_EQ(c->first_string_arg, "hit");
+        }
+        if (strcmp(c->callee_name, "crit.emit") == 0) {
+            saw_crit_emit = 1;
+            ASSERT_STR_EQ(c->first_string_arg, "crit");
+        }
+    }
+
+    ASSERT_TRUE(saw_hit_emit);
+    ASSERT_TRUE(saw_crit_emit);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_signal_metadata_connect_keeps_receiver_signal_with_extra_args) {
+    const char *src = "class_name Player\n"
+                      "func setup(enemy):\n"
+                      "    enemy.died.connect(Callable(self, \"_on_died\"), CONNECT_ONE_SHOT)\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int saw_died_connect = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *c = &r->calls.items[i];
+        if (strcmp(c->callee_name, "enemy.died.connect") == 0) {
+            saw_died_connect = 1;
+            ASSERT_STR_EQ(c->first_string_arg, "died");
+        }
+    }
+
+    ASSERT_TRUE(saw_died_connect);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_signal_metadata_connect_keeps_dotless_receiver_signal_with_flags) {
+    const char *src = "class_name Player\n"
+                      "func setup(hit):\n"
+                      "    hit.connect(_on_hit, CONNECT_ONE_SHOT)\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int saw_hit_connect = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *c = &r->calls.items[i];
+        if (strcmp(c->callee_name, "hit.connect") == 0) {
+            saw_hit_connect = 1;
+            ASSERT_STR_EQ(c->first_string_arg, "hit");
+        }
+    }
+
+    ASSERT_TRUE(saw_hit_connect);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_imports_ignore_non_global_and_dynamic_loads) {
+    const char *src = "func setup():\n"
+                      "    foo.load(\"res://actors/enemy.gd\")\n"
+                      "    foo.preload(\"res://actors/effect.gd\")\n"
+                      "    reload(\"res://actors/enemy.gd\")\n"
+                      "    custom_preload(\"res://actors/enemy.gd\")\n"
+                      "    load(base + \"enemy.gd\")\n"
+                      "    const Foo = preload(prefix + \"enemy.gd\")\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_EQ(r->imports.count, 0);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_chained_callee_parenthesized_receivers) {
+    const char *src = "class_name Player\n"
+                      "func setup(node):\n"
+                      "    get_tree().root.add_child(node)\n"
+                      "    get_tree().create_timer(1.0).timeout.connect(_on_timeout)\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int saw_add_child = 0;
+    int saw_timeout_connect = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *c = &r->calls.items[i];
+        if (strcmp(c->callee_name, "get_tree().root.add_child") == 0) {
+            saw_add_child = 1;
+            ASSERT_STR_EQ(c->enclosing_func_qn, "t.player.Player.setup");
+        }
+        if (strcmp(c->callee_name, "get_tree().create_timer(1.0).timeout.connect") == 0) {
+            saw_timeout_connect = 1;
+            ASSERT_STR_EQ(c->enclosing_func_qn, "t.player.Player.setup");
+            ASSERT_STR_EQ(c->first_string_arg, "timeout");
+        }
+    }
+
+    ASSERT_TRUE(saw_add_child);
+    ASSERT_TRUE(saw_timeout_connect);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_import_from_plain_assignment_preload) {
+    const char *src = "func setup():\n"
+                      "    enemy_scene = preload(\"res://actors/enemy.gd\")\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT(has_import_exact(r, "enemy_scene", "actors/enemy.gd"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_signal_calls_resolve_const_signal_name) {
+    const char *src = "class_name Player\n"
+                      "const HIT = \"hit\"\n"
+                      "func attack():\n"
+                      "    emit_signal(HIT)\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int saw_emit_signal = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *c = &r->calls.items[i];
+        if (strcmp(c->callee_name, "emit_signal") == 0) {
+            saw_emit_signal = 1;
+            ASSERT_STR_EQ(c->first_string_arg, "hit");
+        }
+    }
+    ASSERT_TRUE(saw_emit_signal);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_nested_class_constructor_definition_maps_to_init_method) {
+    const char *src = "class_name Utility\n"
+                      "class Inner:\n"
+                      "    func _init():\n"
+                      "        print(\"ctor\")\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "utility.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int saw_inner_init_method = 0;
+    int saw_inner_ctor_call_scope = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Method") == 0 && strcmp(d->name, "_init") == 0) {
+            saw_inner_init_method = 1;
+            ASSERT_STR_EQ(d->qualified_name, "t.utility.Utility.Inner._init");
+            ASSERT_STR_EQ(d->parent_class, "t.utility.Utility.Inner");
+        }
+    }
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *c = &r->calls.items[i];
+        if (strcmp(c->callee_name, "print") == 0) {
+            saw_inner_ctor_call_scope = 1;
+            ASSERT_STR_EQ(c->enclosing_func_qn, "t.utility.Utility.Inner._init");
+        }
+    }
+
+    ASSERT_TRUE(saw_inner_init_method);
+    ASSERT_TRUE(saw_inner_ctor_call_scope);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_nested_class_const_does_not_resolve_outer_emit_signal_name) {
+    const char *src = "class_name Player\n"
+                      "class Inner:\n"
+                      "    const HIT = \"hit\"\n"
+                      "func attack():\n"
+                      "    emit_signal(HIT)\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int saw_emit_signal = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *c = &r->calls.items[i];
+        if (strcmp(c->callee_name, "emit_signal") == 0) {
+            saw_emit_signal = 1;
+            ASSERT_TRUE(c->first_string_arg == NULL);
+            ASSERT_STR_EQ(c->enclosing_func_qn, "t.player.Player.attack");
+        }
+    }
+    ASSERT_TRUE(saw_emit_signal);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_extends_path_is_normalized_for_import_and_base_class) {
+    const char *src = "class_name Enemy\n"
+                      "extends \"res://actors/base_enemy.gd\"\n"
+                      "func _ready():\n"
+                      "    pass\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "enemy.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT(has_import(r, "actors/base_enemy.gd"));
+
+    int saw_enemy_class = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Class") == 0 && strcmp(d->name, "Enemy") == 0) {
+            saw_enemy_class = 1;
+            ASSERT_NOT_NULL(d->base_classes);
+            ASSERT_NOT_NULL(d->base_classes[0]);
+            ASSERT_STR_EQ(d->base_classes[0], "actors/base_enemy.gd");
+        }
+    }
+    ASSERT_TRUE(saw_enemy_class);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_aliasless_relative_preload_does_not_set_gd_local_name) {
+    const char *src = "func setup():\n"
+                      "    preload(\"enemy.gd\")\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int saw_enemy_import = 0;
+    for (int i = 0; i < r->imports.count; i++) {
+        CBMImport *imp = &r->imports.items[i];
+        if (imp->module_path && strcmp(imp->module_path, "enemy.gd") == 0) {
+            saw_enemy_import = 1;
+            ASSERT(imp->local_name == NULL || strcmp(imp->local_name, "gd") != 0);
+        }
+    }
+    ASSERT_TRUE(saw_enemy_import);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_connect_with_unresolved_signal_arg_does_not_infer_receiver_name) {
+    const char *src = "class_name Player\n"
+                      "func setup(button, signal_name):\n"
+                      "    button.connect(signal_name, _on_pressed)\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int saw_button_connect = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *c = &r->calls.items[i];
+        if (strcmp(c->callee_name, "button.connect") == 0) {
+            saw_button_connect = 1;
+            ASSERT_TRUE(c->first_string_arg == NULL);
+        }
+    }
+    ASSERT_TRUE(saw_button_connect);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_alias_imports_ignore_dynamic_quoted_prefix_expressions) {
+    const char *src = "const Foo = preload(\"enemy.gd\" + suffix)\n"
+                      "var Bar = load(\"enemy.gd\" % x)\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_EQ(r->imports.count, 0);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_emit_signal_unresolved_identifier_does_not_populate_signal_metadata) {
+    const char *src = "class_name Player\n"
+                      "func attack(signal_name):\n"
+                      "    emit_signal(signal_name)\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int saw_emit_signal = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *c = &r->calls.items[i];
+        if (strcmp(c->callee_name, "emit_signal") == 0) {
+            saw_emit_signal = 1;
+            ASSERT_TRUE(c->first_string_arg == NULL);
+        }
+    }
+    ASSERT_TRUE(saw_emit_signal);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_extends_relative_path_is_normalized_consistently) {
+    const char *src = "class_name Enemy\n"
+                      "extends \"../base/base_enemy.gd\"\n"
+                      "func _ready():\n"
+                      "    pass\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "actors/enemies/enemy.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT(has_import(r, "actors/base/base_enemy.gd"));
+
+    int saw_enemy_class = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Class") == 0 && strcmp(d->name, "Enemy") == 0) {
+            saw_enemy_class = 1;
+            ASSERT_NOT_NULL(d->base_classes);
+            ASSERT_NOT_NULL(d->base_classes[0]);
+            ASSERT_STR_EQ(d->base_classes[0], "actors/base/base_enemy.gd");
+        }
+    }
+    ASSERT_TRUE(saw_enemy_class);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_callee_parsing_handles_parentheses_inside_string_args) {
+    const char *src = "func setup():\n"
+                      "    bar(\"(\")\n"
+                      "    baz(\")\")\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int saw_bar = 0;
+    int saw_baz = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *c = &r->calls.items[i];
+        if (strcmp(c->callee_name, "bar") == 0) {
+            saw_bar = 1;
+        }
+        if (strcmp(c->callee_name, "baz") == 0) {
+            saw_baz = 1;
+        }
+        ASSERT_FALSE(strstr(c->callee_name, "\"") != NULL);
+    }
+    ASSERT_TRUE(saw_bar);
+    ASSERT_TRUE(saw_baz);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_signal_metadata_ignores_dynamic_receiver_emit_connect) {
+    const char *src = "class_name Player\n"
+                      "func setup():\n"
+                      "    signal_factory().connect(_on_hit)\n"
+                      "    get_signal().emit()\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int saw_factory_connect = 0;
+    int saw_get_signal_emit = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *c = &r->calls.items[i];
+        if (strcmp(c->callee_name, "signal_factory().connect") == 0) {
+            saw_factory_connect = 1;
+            ASSERT_TRUE(c->first_string_arg == NULL);
+        }
+        if (strcmp(c->callee_name, "get_signal().emit") == 0) {
+            saw_get_signal_emit = 1;
+            ASSERT_TRUE(c->first_string_arg == NULL);
+        }
+    }
+
+    ASSERT_TRUE(saw_factory_connect);
+    ASSERT_TRUE(saw_get_signal_emit);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_nested_class_extends_preserves_base_classes) {
+    const char *src = "class_name Utility\n"
+                      "class Foo extends Bar:\n"
+                      "    pass\n"
+                      "class PathFoo extends \"res://actors/base_enemy.gd\":\n"
+                      "    pass\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "utility.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int saw_foo = 0;
+    int saw_path_foo = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Class") == 0 && strcmp(d->name, "Foo") == 0) {
+            saw_foo = 1;
+            ASSERT_NOT_NULL(d->base_classes);
+            ASSERT_NOT_NULL(d->base_classes[0]);
+            ASSERT_STR_EQ(d->base_classes[0], "Bar");
+        }
+        if (strcmp(d->label, "Class") == 0 && strcmp(d->name, "PathFoo") == 0) {
+            saw_path_foo = 1;
+            ASSERT_NOT_NULL(d->base_classes);
+            ASSERT_NOT_NULL(d->base_classes[0]);
+            ASSERT_STR_EQ(d->base_classes[0], "actors/base_enemy.gd");
+        }
+    }
+
+    ASSERT_TRUE(saw_foo);
+    ASSERT_TRUE(saw_path_foo);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_aliasless_res_preload_and_extends_do_not_set_local_name) {
+    const char *src = "extends \"res://actors/base_enemy.gd\"\n"
+                      "func setup():\n"
+                      "    preload(\"res://actors/effect.gd\")\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "actors/enemies/enemy.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int saw_base_import = 0;
+    int saw_effect_import = 0;
+    for (int i = 0; i < r->imports.count; i++) {
+        CBMImport *imp = &r->imports.items[i];
+        if (imp->module_path && strcmp(imp->module_path, "actors/base_enemy.gd") == 0) {
+            saw_base_import = 1;
+            ASSERT_TRUE(imp->local_name == NULL);
+        }
+        if (imp->module_path && strcmp(imp->module_path, "actors/effect.gd") == 0) {
+            saw_effect_import = 1;
+            ASSERT_TRUE(imp->local_name == NULL);
+        }
+    }
+    ASSERT_TRUE(saw_base_import);
+    ASSERT_TRUE(saw_effect_import);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_above_root_relative_path_is_rejected) {
+    const char *src = "class_name Enemy\n"
+                      "extends \"../../../base_enemy.gd\"\n"
+                      "func setup():\n"
+                      "    preload(\"../../../effect.gd\")\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "actors/enemies/enemy.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_FALSE(has_import(r, "base_enemy.gd"));
+    ASSERT_FALSE(has_import(r, "effect.gd"));
+
+    int saw_enemy = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Class") == 0 && strcmp(d->name, "Enemy") == 0) {
+            saw_enemy = 1;
+            ASSERT_NOT_NULL(d->base_classes);
+            ASSERT_NOT_NULL(d->base_classes[0]);
+            ASSERT_STR_EQ(d->base_classes[0], "../../../base_enemy.gd");
+        }
+    }
+    ASSERT_TRUE(saw_enemy);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(import_stress_go) {
     /* Stress test: 5,000 single-line Go imports.
      * Verifies O(N) behaviour — would hang indefinitely with the O(N²) loop. */
@@ -2296,6 +3154,34 @@ SUITE(extraction) {
     RUN_TEST(c_imports);
     RUN_TEST(ruby_imports);
     RUN_TEST(lua_imports);
+    RUN_TEST(gdscript_parse_basic);
+    RUN_TEST(gdscript_constructor_definition_maps_to_init_method_and_scope);
+    RUN_TEST(gdscript_defs_anchor_and_methods);
+    RUN_TEST(gdscript_defs_script_fallback_anchor);
+    RUN_TEST(gdscript_defs_static_func_var_and_class_stmt);
+    RUN_TEST(gdscript_signal_calls_and_import_alias);
+    RUN_TEST(gdscript_top_level_string_ref_uses_script_anchor_scope);
+    RUN_TEST(gdscript_signal_metadata_dotted_receivers);
+    RUN_TEST(gdscript_signal_metadata_receiver_emit_prefers_receiver_name_over_payload);
+    RUN_TEST(gdscript_signal_metadata_connect_keeps_receiver_signal_with_extra_args);
+    RUN_TEST(gdscript_signal_metadata_connect_keeps_dotless_receiver_signal_with_flags);
+    RUN_TEST(gdscript_imports_ignore_non_global_and_dynamic_loads);
+    RUN_TEST(gdscript_chained_callee_parenthesized_receivers);
+    RUN_TEST(gdscript_import_from_plain_assignment_preload);
+    RUN_TEST(gdscript_signal_calls_resolve_const_signal_name);
+    RUN_TEST(gdscript_nested_class_constructor_definition_maps_to_init_method);
+    RUN_TEST(gdscript_nested_class_const_does_not_resolve_outer_emit_signal_name);
+    RUN_TEST(gdscript_extends_path_is_normalized_for_import_and_base_class);
+    RUN_TEST(gdscript_aliasless_relative_preload_does_not_set_gd_local_name);
+    RUN_TEST(gdscript_connect_with_unresolved_signal_arg_does_not_infer_receiver_name);
+    RUN_TEST(gdscript_alias_imports_ignore_dynamic_quoted_prefix_expressions);
+    RUN_TEST(gdscript_emit_signal_unresolved_identifier_does_not_populate_signal_metadata);
+    RUN_TEST(gdscript_extends_relative_path_is_normalized_consistently);
+    RUN_TEST(gdscript_callee_parsing_handles_parentheses_inside_string_args);
+    RUN_TEST(gdscript_signal_metadata_ignores_dynamic_receiver_emit_connect);
+    RUN_TEST(gdscript_nested_class_extends_preserves_base_classes);
+    RUN_TEST(gdscript_aliasless_res_preload_and_extends_do_not_set_local_name);
+    RUN_TEST(gdscript_above_root_relative_path_is_rejected);
     RUN_TEST(import_stress_go);
 
     /* config_extraction_test.go ports */

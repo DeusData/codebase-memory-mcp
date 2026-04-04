@@ -46,6 +46,170 @@ static void walk_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec)
 static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, CBMLanguage lang);
 static void extract_jsx_refs(CBMExtractCtx *ctx, TSNode node);
 
+static bool gdscript_signal_call_name(const char *callee) {
+    if (!callee || !callee[0]) {
+        return false;
+    }
+    if (strcmp(callee, "emit_signal") == 0 || strcmp(callee, ".emit") == 0 ||
+        strcmp(callee, ".connect") == 0) {
+        return true;
+    }
+    size_t len = strlen(callee);
+    return (len >= 5 && strcmp(callee + (len - 5), ".emit") == 0) ||
+           (len >= 8 && strcmp(callee + (len - 8), ".connect") == 0);
+}
+
+static bool gdscript_is_identifier_segment(const char *text, size_t len) {
+    if (!text || len == 0) {
+        return false;
+    }
+    if (!(text[0] == '_' || isalpha((unsigned char)text[0]))) {
+        return false;
+    }
+    for (size_t i = 1; i < len; i++) {
+        unsigned char ch = (unsigned char)text[i];
+        if (!(ch == '_' || isalnum(ch))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static const char *gdscript_signal_name_from_callee(CBMArena *a, const char *callee) {
+    if (!callee || !callee[0]) {
+        return NULL;
+    }
+    size_t len = strlen(callee);
+    size_t end = 0;
+    if (len >= 5 && strcmp(callee + (len - 5), ".emit") == 0) {
+        end = len - 5;
+    } else if (len >= 8 && strcmp(callee + (len - 8), ".connect") == 0) {
+        end = len - 8;
+    } else {
+        return NULL;
+    }
+
+    const char *segment_start = callee;
+    for (size_t i = end; i > 0; i--) {
+        if (callee[i - 1] == '.') {
+            segment_start = callee + i;
+            break;
+        }
+    }
+    size_t seg_start = (size_t)(segment_start - callee);
+    if (seg_start >= end) {
+        return NULL;
+    }
+    size_t seg_len = end - seg_start;
+    if (!gdscript_is_identifier_segment(segment_start, seg_len)) {
+        return NULL;
+    }
+    return cbm_arena_strndup(a, segment_start, seg_len);
+}
+
+static bool gdscript_callee_receiver_has_dot(const char *callee, size_t suffix_len) {
+    if (!callee) {
+        return false;
+    }
+    size_t len = strlen(callee);
+    if (len <= suffix_len) {
+        return false;
+    }
+    size_t receiver_len = len - suffix_len;
+    for (size_t i = 0; i < receiver_len; i++) {
+        if (callee[i] == '.') {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool gdscript_identifier_is_flag_constant(const char *text) {
+    if (!text || !text[0]) {
+        return false;
+    }
+    bool saw_alpha = false;
+    for (size_t i = 0; text[i]; i++) {
+        unsigned char ch = (unsigned char)text[i];
+        if (isalpha(ch)) {
+            saw_alpha = true;
+            if (!isupper(ch)) {
+                return false;
+            }
+        } else if (!(isdigit(ch) || ch == '_')) {
+            return false;
+        }
+    }
+    return saw_alpha;
+}
+
+static char *gdscript_callee_from_text(CBMArena *a, const char *raw) {
+    if (!raw || !raw[0]) {
+        return NULL;
+    }
+
+    size_t len = strlen(raw);
+    while (len > 0 && isspace((unsigned char)raw[len - 1])) {
+        len--;
+    }
+    if (len == 0) {
+        return NULL;
+    }
+
+    // Normal case for a call expression: trim only the outer call arguments,
+    // preserving any parentheses in the receiver chain (e.g. get_tree().root.foo()).
+    if (raw[len - 1] == ')') {
+        int depth = 0;
+        bool in_single = false;
+        bool in_double = false;
+        bool escape = false;
+        for (size_t i = len; i > 0; i--) {
+            char ch = raw[i - 1];
+            if (escape) {
+                escape = false;
+                continue;
+            }
+            if ((in_single || in_double) && ch == '\\') {
+                escape = true;
+                continue;
+            }
+            if (!in_double && ch == '\'' && !escape) {
+                in_single = !in_single;
+                continue;
+            }
+            if (!in_single && ch == '"' && !escape) {
+                in_double = !in_double;
+                continue;
+            }
+            if (in_single || in_double) {
+                continue;
+            }
+            if (ch == ')') {
+                depth++;
+            } else if (ch == '(') {
+                depth--;
+                if (depth == 0) {
+                    size_t callee_len = i - 1;
+                    while (callee_len > 0 && isspace((unsigned char)raw[callee_len - 1])) {
+                        callee_len--;
+                    }
+                    if (callee_len > 0) {
+                        return cbm_arena_strndup(a, raw, callee_len);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    const char *lparen = strchr(raw, '(');
+    size_t fallback_len = lparen ? (size_t)(lparen - raw) : len;
+    while (fallback_len > 0 && isspace((unsigned char)raw[fallback_len - 1])) {
+        fallback_len--;
+    }
+    return fallback_len > 0 ? cbm_arena_strndup(a, raw, fallback_len) : NULL;
+}
+
 // Lean 4: check if an apply node is inside a type annotation.
 // Strategy: walk up to the nearest declaration boundary; if the apply falls
 // inside that declaration's explicit_binder/implicit_binder, or before the
@@ -96,6 +260,61 @@ static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, C
             return NULL;
         }
         // Fall through to generic handler
+    }
+
+    if (lang == CBM_LANG_GDSCRIPT) {
+        const char *nk = ts_node_type(node);
+        if (strcmp(nk, "call") == 0 || strcmp(nk, "attribute_call") == 0) {
+            TSNode text_node = node;
+            if (strcmp(nk, "attribute_call") == 0) {
+                TSNode parent = ts_node_parent(node);
+                if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "attribute") == 0) {
+                    text_node = parent;
+                }
+            }
+
+            char *raw = cbm_node_text(a, text_node, source);
+            if (raw && raw[0]) {
+                char *callee = gdscript_callee_from_text(a, raw);
+                if (callee && callee[0]) {
+                    return callee;
+                }
+            }
+        }
+
+        if (ts_node_named_child_count(node) > 0) {
+            TSNode first = ts_node_named_child(node, 0);
+            const char *fk = ts_node_type(first);
+            if (strcmp(fk, "arguments") != 0) {
+                char *raw = cbm_node_text(a, first, source);
+                if (raw && raw[0]) {
+                    return raw;
+                }
+            }
+        }
+
+        TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+        TSNode obj = ts_node_child_by_field_name(node, "object", 6);
+        if (!ts_node_is_null(name_node)) {
+            char *name = cbm_node_text(a, name_node, source);
+            if (!ts_node_is_null(obj) && name && name[0]) {
+                char *obj_text = cbm_node_text(a, obj, source);
+                if (obj_text && obj_text[0]) {
+                    return cbm_arena_sprintf(a, "%s.%s", obj_text, name);
+                }
+            }
+            if (name && name[0]) {
+                return name;
+            }
+        }
+
+        TSNode function_node = ts_node_child_by_field_name(node, "function", 8);
+        if (!ts_node_is_null(function_node)) {
+            char *raw = cbm_node_text(a, function_node, source);
+            if (raw && raw[0]) {
+                return raw;
+            }
+        }
     }
 
     // Try "function" field (most languages: call_expression, etc.)
@@ -581,6 +800,72 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
                         strcmp(ak2, "selector_expression") == 0 || strcmp(ak2, "attribute") == 0 ||
                         strcmp(ak2, "field_expression") == 0) {
                         call.second_arg_name = cbm_node_text(ctx->arena, arg2, ctx->source);
+                    }
+                }
+            }
+
+            if (ctx->language == CBM_LANG_GDSCRIPT && gdscript_signal_call_name(call.callee_name)) {
+                const char *signal_name =
+                    gdscript_signal_name_from_callee(ctx->arena, call.callee_name);
+                size_t callee_len = strlen(call.callee_name);
+                bool callee_is_emit =
+                    (strcmp(call.callee_name, ".emit") == 0) ||
+                    (callee_len >= 5 && strcmp(call.callee_name + (callee_len - 5), ".emit") == 0);
+                bool callee_is_connect =
+                    (strcmp(call.callee_name, ".connect") == 0) ||
+                    (callee_len >= 8 &&
+                     strcmp(call.callee_name + (callee_len - 8), ".connect") == 0);
+                if (strcmp(call.callee_name, "emit_signal") == 0) {
+                    if (!call.first_string_arg && !ts_node_is_null(args) &&
+                        ts_node_named_child_count(args) > 0) {
+                        TSNode first = ts_node_named_child(args, 0);
+                        const char *fk = ts_node_type(first);
+                        if (is_string_like(fk)) {
+                            char *text = cbm_node_text(ctx->arena, first, ctx->source);
+                            if (text && text[0]) {
+                                call.first_string_arg = strip_quotes(ctx->arena, text);
+                            }
+                        }
+                    }
+                } else if (callee_is_emit && signal_name) {
+                    /* Receiver-form signal emit metadata should prefer receiver signal. */
+                    call.first_string_arg = signal_name;
+                } else if (!call.first_string_arg && signal_name) {
+                    bool allow_receiver_signal_infer = true;
+                    if (callee_is_connect && !ts_node_is_null(args) &&
+                        ts_node_named_child_count(args) > 0) {
+                        uint32_t argc = ts_node_named_child_count(args);
+                        TSNode first = ts_node_named_child(args, 0);
+                        const char *fk = ts_node_type(first);
+                        if (is_string_like(fk)) {
+                            allow_receiver_signal_infer = false;
+                        } else if (strcmp(fk, "identifier") == 0 || strcmp(fk, "name") == 0 ||
+                                   strcmp(fk, "type_identifier") == 0) {
+                            /*
+                             * Suppress only when arg0 is likely explicit signal naming in
+                             * object.connect(signal_name, ...). Keep receiver-derived metadata
+                             * for explicit signal receivers like enemy.died.connect(...).
+                             */
+                            if (argc >= 2 &&
+                                !gdscript_callee_receiver_has_dot(call.callee_name, 8)) {
+                                bool second_arg_is_flag = false;
+                                TSNode second = ts_node_named_child(args, 1);
+                                const char *sk = ts_node_type(second);
+                                if (strcmp(sk, "identifier") == 0 || strcmp(sk, "name") == 0 ||
+                                    strcmp(sk, "type_identifier") == 0) {
+                                    char *second_text =
+                                        cbm_node_text(ctx->arena, second, ctx->source);
+                                    second_arg_is_flag =
+                                        gdscript_identifier_is_flag_constant(second_text);
+                                }
+                                if (!second_arg_is_flag) {
+                                    allow_receiver_signal_infer = false;
+                                }
+                            }
+                        }
+                    }
+                    if (allow_receiver_signal_infer) {
+                        call.first_string_arg = signal_name;
                     }
                 }
             }

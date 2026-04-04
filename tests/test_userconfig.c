@@ -83,6 +83,24 @@ TEST(userconfig_global_via_env) {
     PASS();
 }
 
+TEST(userconfig_gdscript_name_mapping) {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "%s/uctest_gdscript_name_mapping", cbm_tmpdir());
+    cbm_mkdir_p(dir, 0755);
+
+    char proj[512];
+    snprintf(proj, sizeof(proj), "%s/.codebase-memory.json", dir);
+    ASSERT_EQ(write_json(proj, "{\"extra_extensions\":{\".foo\":\"gdscript\"}}"), 0);
+
+    cbm_userconfig_t *cfg = cbm_userconfig_load(dir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_userconfig_lookup(cfg, ".foo"), CBM_LANG_GDSCRIPT);
+
+    cbm_userconfig_free(cfg);
+    remove(proj);
+    PASS();
+}
+
 /* ── Tests: project wins over global ────────────────────────────── */
 
 TEST(userconfig_project_wins_over_global) {
@@ -211,6 +229,7 @@ SUITE(userconfig) {
     RUN_TEST(userconfig_project_basic);
     RUN_TEST(userconfig_global_via_env);
     RUN_TEST(userconfig_project_wins_over_global);
+    RUN_TEST(userconfig_gdscript_name_mapping);
     RUN_TEST(userconfig_unknown_lang_skipped);
     RUN_TEST(userconfig_missing_files_ok);
     RUN_TEST(userconfig_integration_override);

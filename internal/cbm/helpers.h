@@ -53,6 +53,14 @@ char *cbm_fqn_compute(CBMArena *a, const char *project, const char *rel_path, co
 // Module QN (file without name): project.rel_path_parts
 char *cbm_fqn_module(CBMArena *a, const char *project, const char *rel_path);
 
+// GDScript synthetic script-anchor helpers.
+const char *cbm_gdscript_anchor_name(CBMArena *a, TSNode root, const char *source);
+const char *cbm_gdscript_anchor_qn(CBMArena *a, TSNode root, const char *source,
+                                   const char *project, const char *rel_path);
+const char *cbm_gdscript_normalize_path(CBMArena *a, const char *raw_path, const char *rel_path);
+const char **cbm_gdscript_anchor_base_classes(CBMArena *a, TSNode root, const char *source,
+                                              const char *rel_path);
+
 // Folder QN: project.dir_parts
 char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir);
 

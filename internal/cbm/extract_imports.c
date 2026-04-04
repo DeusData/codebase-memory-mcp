@@ -20,6 +20,7 @@ static void parse_ruby_imports(CBMExtractCtx *ctx);
 static void parse_lua_imports(CBMExtractCtx *ctx);
 static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type);
 static void parse_wolfram_imports(CBMExtractCtx *ctx);
+static void parse_gdscript_imports(CBMExtractCtx *ctx);
 
 // Helper: strip quotes from a string literal
 static char *strip_quotes(CBMArena *a, const char *s) {
@@ -47,6 +48,241 @@ static const char *path_last(CBMArena *a, const char *path) {
         return cbm_arena_strdup(a, last + 1);
     }
     return path;
+}
+
+static bool gdscript_is_load_like(const char *callee) {
+    if (!callee || !callee[0]) {
+        return false;
+    }
+    return strcmp(callee, "preload") == 0 || strcmp(callee, "load") == 0;
+}
+
+static const char *gdscript_call_callee(CBMArena *a, TSNode node, const char *source) {
+    TSNode function_node = ts_node_child_by_field_name(node, "function", 8);
+    if (!ts_node_is_null(function_node)) {
+        return cbm_node_text(a, function_node, source);
+    }
+
+    TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+    if (!ts_node_is_null(name_node)) {
+        const char *name = cbm_node_text(a, name_node, source);
+        TSNode obj = ts_node_child_by_field_name(node, "object", 6);
+        if (!ts_node_is_null(obj) && name && name[0]) {
+            const char *obj_text = cbm_node_text(a, obj, source);
+            if (obj_text && obj_text[0]) {
+                return cbm_arena_sprintf(a, "%s.%s", obj_text, name);
+            }
+        }
+        return name;
+    }
+
+    // Fallback for grammars that don't expose name/function fields on call nodes.
+    if (ts_node_named_child_count(node) > 0) {
+        TSNode first = ts_node_named_child(node, 0);
+        const char *first_text = cbm_node_text(a, first, source);
+        if (first_text && first_text[0]) {
+            return first_text;
+        }
+    }
+
+    return NULL;
+}
+
+static bool gdscript_is_global_load_call(CBMArena *a, TSNode node, const char *source) {
+    if (strcmp(ts_node_type(node), "attribute_call") == 0) {
+        return false;
+    }
+
+    const char *callee = gdscript_call_callee(a, node, source);
+    if (!gdscript_is_load_like(callee)) {
+        return false;
+    }
+
+    TSNode object_node = ts_node_child_by_field_name(node, "object", 6);
+    if (!ts_node_is_null(object_node)) {
+        return false;
+    }
+
+    TSNode function_node = ts_node_child_by_field_name(node, "function", 8);
+    if (!ts_node_is_null(function_node)) {
+        const char *fn_text = cbm_node_text(a, function_node, source);
+        if (fn_text && strchr(fn_text, '.') != NULL) {
+            return false;
+        }
+    }
+
+    const char *call_text = cbm_node_text(a, node, source);
+    if (call_text && call_text[0]) {
+        const char *open = strchr(call_text, '(');
+        if (open) {
+            for (const char *p = call_text; p < open; p++) {
+                if (*p == '.') {
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+static const char *gdscript_extract_load_path(CBMExtractCtx *ctx, TSNode call_node) {
+    TSNode args = ts_node_child_by_field_name(call_node, "arguments", 9);
+    if (!ts_node_is_null(args) && ts_node_named_child_count(args) > 0) {
+        TSNode first = ts_node_named_child(args, 0);
+        const char *kind = ts_node_type(first);
+        if (strcmp(kind, "string") == 0 || strcmp(kind, "string_literal") == 0) {
+            char *raw = strip_quotes(ctx->arena, cbm_node_text(ctx->arena, first, ctx->source));
+            return cbm_gdscript_normalize_path(ctx->arena, raw, ctx->rel_path);
+        }
+    }
+
+    return NULL;
+}
+
+static void gdscript_maybe_emit_import(CBMExtractCtx *ctx, const char *local_name,
+                                       const char *module_path) {
+    if (!module_path || !module_path[0]) {
+        return;
+    }
+    const char *local = NULL;
+    if (local_name && local_name[0]) {
+        local = local_name;
+    }
+    for (int i = 0; i < ctx->result->imports.count; i++) {
+        const CBMImport *existing = &ctx->result->imports.items[i];
+        const char *existing_local = existing->local_name ? existing->local_name : "";
+        const char *new_local = local ? local : "";
+        if (existing->module_path && strcmp(existing->module_path, module_path) == 0 &&
+            strcmp(existing_local, new_local) == 0) {
+            return;
+        }
+    }
+    CBMImport imp = {.local_name = local, .module_path = module_path};
+    cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+}
+
+static void gdscript_alias_from_statement_text(CBMExtractCtx *ctx, TSNode node) {
+    char *text = cbm_node_text(ctx->arena, node, ctx->source);
+    if (!text || !text[0]) {
+        return;
+    }
+
+    const char *p = text;
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    const char *kw = NULL;
+    if (strncmp(p, "const ", 6) == 0) {
+        kw = p + 6;
+    } else if (strncmp(p, "var ", 4) == 0) {
+        kw = p + 4;
+    } else {
+        return;
+    }
+
+    const char *name_start = kw;
+    while (*kw && (isalnum((unsigned char)*kw) || *kw == '_')) {
+        kw++;
+    }
+    if (kw == name_start) {
+        return;
+    }
+    const char *local_name = cbm_arena_strndup(ctx->arena, name_start, (size_t)(kw - name_start));
+
+    const char *eq = strchr(kw, '=');
+    if (!eq) {
+        return;
+    }
+
+    const char *rhs = eq + 1;
+    while (*rhs == ' ' || *rhs == '\t') {
+        rhs++;
+    }
+
+    const char *load_call = NULL;
+    if (strncmp(rhs, "preload(", 8) == 0) {
+        load_call = rhs + 8;
+    } else if (strncmp(rhs, "load(", 5) == 0) {
+        load_call = rhs + 5;
+    }
+    if (!load_call) {
+        return;
+    }
+
+    while (*load_call == ' ' || *load_call == '\t') {
+        load_call++;
+    }
+    if (*load_call != '"' && *load_call != '\'') {
+        return;
+    }
+
+    char delim = *load_call;
+    const char *q1 = load_call + 1;
+    const char *q2 = strchr(q1, delim);
+    if (!q2 || q2 <= q1) {
+        return;
+    }
+
+    const char *after = q2 + 1;
+    while (*after == ' ' || *after == '\t') {
+        after++;
+    }
+    if (*after != ')') {
+        return;
+    }
+    after++;
+    while (*after == ' ' || *after == '\t') {
+        after++;
+    }
+    if (*after == ';') {
+        after++;
+        while (*after == ' ' || *after == '\t') {
+            after++;
+        }
+    }
+    if (*after != '\0') {
+        return;
+    }
+
+    const char *raw = cbm_arena_strndup(ctx->arena, q1, (size_t)(q2 - q1));
+    const char *module_path = cbm_gdscript_normalize_path(ctx->arena, raw, ctx->rel_path);
+    if (module_path) {
+        gdscript_maybe_emit_import(ctx, local_name, module_path);
+    }
+}
+
+static const char *gdscript_assignment_lhs_identifier(CBMArena *a, TSNode assignment,
+                                                       const char *source) {
+    TSNode lhs = ts_node_child_by_field_name(assignment, "left", 4);
+    if (ts_node_is_null(lhs)) {
+        lhs = ts_node_child_by_field_name(assignment, "name", 4);
+    }
+    if (ts_node_is_null(lhs)) {
+        return NULL;
+    }
+
+    const char *lhs_kind = ts_node_type(lhs);
+    if (strcmp(lhs_kind, "identifier") == 0 || strcmp(lhs_kind, "name") == 0 ||
+        strcmp(lhs_kind, "type_identifier") == 0) {
+        const char *text = cbm_node_text(a, lhs, source);
+        return (text && text[0]) ? text : NULL;
+    }
+
+    const char *text = cbm_node_text(a, lhs, source);
+    if (!text || !text[0]) {
+        return NULL;
+    }
+
+    if (!(isalpha((unsigned char)text[0]) || text[0] == '_')) {
+        return NULL;
+    }
+    for (const char *p = text + 1; *p; p++) {
+        if (!(isalnum((unsigned char)*p) || *p == '_')) {
+            return NULL;
+        }
+    }
+    return text;
 }
 
 // --- Go imports ---
@@ -720,6 +956,136 @@ static void parse_wolfram_imports(CBMExtractCtx *ctx) {
     walk_wolfram_imports(ctx, ctx->root);
 }
 
+// NOLINTNEXTLINE(misc-no-recursion) — intentional AST tree walk
+static void walk_gdscript_imports(CBMExtractCtx *ctx, TSNode node) {
+    CBMArena *a = ctx->arena;
+    const char *kind = ts_node_type(node);
+
+    if (strcmp(kind, "const_statement") == 0 || strcmp(kind, "variable_statement") == 0 ||
+        strcmp(kind, "onready_variable_statement") == 0 ||
+        strcmp(kind, "export_variable_statement") == 0) {
+        TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+        TSNode value_node = ts_node_child_by_field_name(node, "value", 5);
+        if (ts_node_is_null(value_node)) {
+            uint32_t nc = ts_node_named_child_count(node);
+            for (uint32_t i = 0; i < nc; i++) {
+                TSNode c = ts_node_named_child(node, i);
+                const char *ck = ts_node_type(c);
+                if (strcmp(ck, "call") == 0 || strcmp(ck, "attribute_call") == 0) {
+                    value_node = c;
+                    break;
+                }
+            }
+        }
+
+        if (!ts_node_is_null(value_node)) {
+            if (gdscript_is_global_load_call(a, value_node, ctx->source)) {
+                const char *module_path = gdscript_extract_load_path(ctx, value_node);
+                if (module_path) {
+                    const char *local_name =
+                        !ts_node_is_null(name_node) ? cbm_node_text(a, name_node, ctx->source) : NULL;
+                    gdscript_maybe_emit_import(ctx, local_name, module_path);
+                }
+            }
+        }
+
+        gdscript_alias_from_statement_text(ctx, node);
+
+    }
+
+    if (strcmp(kind, "assignment") == 0) {
+        TSNode rhs = ts_node_child_by_field_name(node, "right", 5);
+        if (ts_node_is_null(rhs)) {
+            rhs = ts_node_child_by_field_name(node, "value", 5);
+        }
+        if (ts_node_is_null(rhs)) {
+            uint32_t nc = ts_node_named_child_count(node);
+            for (uint32_t i = 0; i < nc; i++) {
+                TSNode c = ts_node_named_child(node, i);
+                const char *ck = ts_node_type(c);
+                if (strcmp(ck, "call") == 0 || strcmp(ck, "attribute_call") == 0) {
+                    rhs = c;
+                    break;
+                }
+            }
+        }
+
+        if (!ts_node_is_null(rhs) && gdscript_is_global_load_call(a, rhs, ctx->source)) {
+            const char *module_path = gdscript_extract_load_path(ctx, rhs);
+            if (module_path) {
+                const char *local_name =
+                    gdscript_assignment_lhs_identifier(a, node, ctx->source);
+                gdscript_maybe_emit_import(ctx, local_name, module_path);
+            }
+        }
+    }
+
+    if (strcmp(kind, "call") == 0 || strcmp(kind, "attribute_call") == 0) {
+        TSNode parent = ts_node_parent(node);
+        const char *pk = ts_node_is_null(parent) ? "" : ts_node_type(parent);
+        if (!(strcmp(pk, "const_statement") == 0 || strcmp(pk, "variable_statement") == 0 ||
+              strcmp(pk, "onready_variable_statement") == 0 ||
+              strcmp(pk, "export_variable_statement") == 0 || strcmp(pk, "assignment") == 0)) {
+            if (gdscript_is_global_load_call(a, node, ctx->source)) {
+                const char *module_path = gdscript_extract_load_path(ctx, node);
+                if (module_path) {
+                    gdscript_maybe_emit_import(ctx, NULL, module_path);
+                }
+            }
+        }
+
+        TSNode alias_scope = node;
+        if (strcmp(pk, "const_statement") == 0 || strcmp(pk, "variable_statement") == 0 ||
+            strcmp(pk, "onready_variable_statement") == 0 ||
+            strcmp(pk, "export_variable_statement") == 0) {
+            alias_scope = parent;
+        }
+        gdscript_alias_from_statement_text(ctx, alias_scope);
+    }
+
+    if (strcmp(kind, "expression_statement") == 0 || strcmp(kind, "statement") == 0) {
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode child = ts_node_named_child(node, i);
+            const char *ck = ts_node_type(child);
+            if (strcmp(ck, "call") == 0 || strcmp(ck, "attribute_call") == 0) {
+                if (gdscript_is_global_load_call(a, child, ctx->source)) {
+                    const char *module_path = gdscript_extract_load_path(ctx, child);
+                    if (module_path) {
+                        gdscript_maybe_emit_import(ctx, NULL, module_path);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    if (strcmp(kind, "extends_statement") == 0) {
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode child = ts_node_named_child(node, i);
+            const char *ck = ts_node_type(child);
+            if (strcmp(ck, "string") == 0 || strcmp(ck, "string_literal") == 0) {
+                const char *raw = strip_quotes(a, cbm_node_text(a, child, ctx->source));
+                const char *module_path = cbm_gdscript_normalize_path(a, raw, ctx->rel_path);
+                if (module_path) {
+                    gdscript_maybe_emit_import(ctx, NULL, module_path);
+                }
+                break;
+            }
+        }
+    }
+
+    uint32_t count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        walk_gdscript_imports(ctx, ts_node_child(node, i));
+    }
+}
+
+static void parse_gdscript_imports(CBMExtractCtx *ctx) {
+    walk_gdscript_imports(ctx, ctx->root);
+}
+
 // --- Main dispatch ---
 
 void cbm_extract_imports(CBMExtractCtx *ctx) {
@@ -810,6 +1176,9 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         break;
     case CBM_LANG_WOLFRAM:
         parse_wolfram_imports(ctx);
+        break;
+    case CBM_LANG_GDSCRIPT:
+        parse_gdscript_imports(ctx);
         break;
     default:
         break;

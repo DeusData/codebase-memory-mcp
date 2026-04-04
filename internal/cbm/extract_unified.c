@@ -28,8 +28,8 @@ static void pop_expired_scopes(WalkState *state, uint32_t cur_depth) {
 }
 
 // Recompute state flags from the current scope stack.
-static void recompute_state(WalkState *state, const char *module_qn) {
-    state->enclosing_func_qn = module_qn;
+static void recompute_state(WalkState *state, const char *top_level_qn) {
+    state->enclosing_func_qn = top_level_qn;
     state->enclosing_class_qn = NULL;
     state->inside_call = false;
     state->inside_import = false;
@@ -79,6 +79,13 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         }
     }
 
+    const char *node_kind = ts_node_type(node);
+    const char *name = NULL;
+
+    if (ctx->language == CBM_LANG_GDSCRIPT && strcmp(node_kind, "constructor_definition") == 0) {
+        name = "_init";
+    }
+
     TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
 
     // Arrow function: name from parent variable_declarator
@@ -89,23 +96,34 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         }
     }
 
-    if (ts_node_is_null(name_node)) {
+    if (!name && ts_node_is_null(name_node)) {
         return NULL;
     }
 
-    char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
-    if (!name || !name[0]) {
-        return NULL;
+    if (!name) {
+        name = cbm_node_text(ctx->arena, name_node, ctx->source);
+        if (!name || !name[0]) {
+            return NULL;
+        }
     }
 
     if (state->enclosing_class_qn) {
         return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name);
     }
+
+    if (ctx->language == CBM_LANG_GDSCRIPT) {
+        const char *anchor_qn =
+            cbm_gdscript_anchor_qn(ctx->arena, ctx->root, ctx->source, ctx->project, ctx->rel_path);
+        if (anchor_qn && anchor_qn[0]) {
+            return cbm_arena_sprintf(ctx->arena, "%s.%s", anchor_qn, name);
+        }
+    }
+
     return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
 }
 
 // Compute class QN for scope tracking.
-static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node) {
+static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, WalkState *state) {
     TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
     if (ts_node_is_null(name_node)) {
         return NULL;
@@ -116,6 +134,18 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node) {
         return NULL;
     }
 
+    if (state && state->enclosing_class_qn && state->enclosing_class_qn[0]) {
+        return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name);
+    }
+
+    if (ctx->language == CBM_LANG_GDSCRIPT) {
+        const char *anchor_qn =
+            cbm_gdscript_anchor_qn(ctx->arena, ctx->root, ctx->source, ctx->project, ctx->rel_path);
+        if (anchor_qn && anchor_qn[0]) {
+            return cbm_arena_sprintf(ctx->arena, "%s.%s", anchor_qn, name);
+        }
+    }
+
     return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
 }
 
@@ -124,9 +154,13 @@ static bool is_string_node(const char *kind);
 
 // --- Module-level constant collection ---
 
-static void handle_string_constants(CBMExtractCtx *ctx, TSNode node, const WalkState *state) {
+static void handle_string_constants(CBMExtractCtx *ctx, TSNode node, const WalkState *state,
+                                    const char *top_level_qn) {
     /* Only collect at module level (not inside functions/classes) */
-    if (state->enclosing_func_qn != NULL && state->enclosing_func_qn != ctx->module_qn) {
+    if (state->enclosing_func_qn != NULL && state->enclosing_func_qn != top_level_qn) {
+        return;
+    }
+    if (state->enclosing_class_qn != NULL) {
         return;
     }
 
@@ -137,7 +171,7 @@ static void handle_string_constants(CBMExtractCtx *ctx, TSNode node, const WalkS
     /* JS/TS: variable_declarator, lexical_declaration */
     if (strcmp(kind, "assignment") != 0 && strcmp(kind, "expression_statement") != 0 &&
         strcmp(kind, "short_var_declaration") != 0 && strcmp(kind, "const_spec") != 0 &&
-        strcmp(kind, "variable_declarator") != 0) {
+        strcmp(kind, "variable_declarator") != 0 && strcmp(kind, "const_statement") != 0) {
         return;
     }
 
@@ -159,7 +193,8 @@ static void handle_string_constants(CBMExtractCtx *ctx, TSNode node, const WalkS
 
     /* Name must be an identifier */
     const char *name_kind = ts_node_type(name_node);
-    if (strcmp(name_kind, "identifier") != 0 && strcmp(name_kind, "constant") != 0) {
+    if (strcmp(name_kind, "identifier") != 0 && strcmp(name_kind, "constant") != 0 &&
+        strcmp(name_kind, "name") != 0 && strcmp(name_kind, "type_identifier") != 0) {
         return;
     }
 
@@ -205,6 +240,116 @@ static bool is_string_node(const char *kind) {
             strcmp(kind, "double_quote_scalar") == 0 || strcmp(kind, "single_quote_scalar") == 0);
 }
 
+static bool has_suffix_n(const char *s, int len, const char *suffix) {
+    int slen = (int)strlen(suffix);
+    if (!s || !suffix || len < slen) {
+        return false;
+    }
+    return strncmp(s + (len - slen), suffix, (size_t)slen) == 0;
+}
+
+static bool gdscript_is_global_load_call_node(CBMExtractCtx *ctx, TSNode call_node) {
+    if (strcmp(ts_node_type(call_node), "attribute_call") == 0) {
+        return false;
+    }
+
+    TSNode object_node = ts_node_child_by_field_name(call_node, "object", 6);
+    if (!ts_node_is_null(object_node)) {
+        return false;
+    }
+
+    const char *callee = NULL;
+    TSNode function_node = ts_node_child_by_field_name(call_node, "function", 8);
+    if (!ts_node_is_null(function_node)) {
+        callee = cbm_node_text(ctx->arena, function_node, ctx->source);
+    }
+    if (!callee || !callee[0]) {
+        TSNode name_node = ts_node_child_by_field_name(call_node, "name", 4);
+        if (!ts_node_is_null(name_node)) {
+            callee = cbm_node_text(ctx->arena, name_node, ctx->source);
+        }
+    }
+
+    if (!callee || !callee[0]) {
+        const char *call_text = cbm_node_text(ctx->arena, call_node, ctx->source);
+        if (!call_text || !call_text[0]) {
+            return false;
+        }
+        const char *open = strchr(call_text, '(');
+        if (!open || open == call_text) {
+            return false;
+        }
+        while (call_text < open && (*call_text == ' ' || *call_text == '\t')) {
+            call_text++;
+        }
+        const char *end = open;
+        while (end > call_text && (*(end - 1) == ' ' || *(end - 1) == '\t')) {
+            end--;
+        }
+        size_t n = (size_t)(end - call_text);
+        if (!((n == 4 && strncmp(call_text, "load", 4) == 0) ||
+              (n == 7 && strncmp(call_text, "preload", 7) == 0))) {
+            return false;
+        }
+        for (const char *p = call_text; p < end; p++) {
+            if (*p == '.') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if (!(strcmp(callee, "preload") == 0 || strcmp(callee, "load") == 0)) {
+        return false;
+    }
+
+    return strchr(callee, '.') == NULL;
+}
+
+static bool gdscript_is_scene_load_target(CBMExtractCtx *ctx, TSNode string_node, const char *content,
+                                          int len) {
+    if (!content || len <= 0 || !has_suffix_n(content, len, ".tscn")) {
+        return false;
+    }
+
+    TSNode arg_node = string_node;
+    TSNode args_node = ts_node_parent(arg_node);
+    if (!ts_node_is_null(args_node)) {
+        const char *parent_kind = ts_node_type(args_node);
+        if (strcmp(parent_kind, "string") == 0 || strcmp(parent_kind, "string_literal") == 0) {
+            arg_node = args_node;
+            args_node = ts_node_parent(arg_node);
+        }
+    }
+    if (ts_node_is_null(args_node)) {
+        return false;
+    }
+
+    const char *args_kind = ts_node_type(args_node);
+    if (!(strcmp(args_kind, "arguments") == 0 || strcmp(args_kind, "argument_list") == 0)) {
+        return false;
+    }
+
+    if (ts_node_named_child_count(args_node) == 0) {
+        return false;
+    }
+    TSNode first_arg = ts_node_named_child(args_node, 0);
+    if (!ts_node_eq(first_arg, arg_node)) {
+        return false;
+    }
+
+    TSNode call_node = ts_node_parent(args_node);
+    if (ts_node_is_null(call_node)) {
+        return false;
+    }
+    const char *call_kind = ts_node_type(call_node);
+    if (!(strcmp(call_kind, "call") == 0 || strcmp(call_kind, "attribute_call") == 0)) {
+        return false;
+    }
+
+    return gdscript_is_global_load_call_node(ctx, call_node);
+}
+
 static void handle_string_refs(CBMExtractCtx *ctx, TSNode node, const WalkState *state) {
     const char *kind = ts_node_type(node);
     if (!is_string_node(kind)) {
@@ -230,6 +375,10 @@ static void handle_string_refs(CBMExtractCtx *ctx, TSNode node, const WalkState 
 
     /* Classify */
     int kind_val = cbm_classify_string(content, len);
+    if (kind_val < 0 && ctx->language == CBM_LANG_GDSCRIPT &&
+        gdscript_is_scene_load_target(ctx, node, content, len)) {
+        kind_val = CBM_STRREF_CONFIG;
+    }
     if (kind_val < 0) {
         return;
     }
@@ -535,6 +684,15 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     WalkState state;
     memset(&state, 0, sizeof(state));
 
+    const char *top_level_qn = ctx->module_qn;
+    if (ctx->language == CBM_LANG_GDSCRIPT) {
+        const char *anchor_qn =
+            cbm_gdscript_anchor_qn(ctx->arena, ctx->root, ctx->source, ctx->project, ctx->rel_path);
+        if (anchor_qn && anchor_qn[0]) {
+            top_level_qn = anchor_qn;
+        }
+    }
+
     uint32_t depth = 0;
 
     for (;;) {
@@ -544,10 +702,10 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
         pop_expired_scopes(&state, depth);
 
         // 2. Recompute state from remaining scopes
-        recompute_state(&state, ctx->module_qn);
+        recompute_state(&state, top_level_qn);
 
         // 3. Dispatch to all handlers
-        handle_string_constants(ctx, node, &state);
+        handle_string_constants(ctx, node, &state, top_level_qn);
         handle_calls(ctx, node, spec, &state);
         handle_usages(ctx, node, spec, &state);
         handle_throws(ctx, node, spec, &state);
@@ -574,7 +732,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
                 push_scope(&state, SCOPE_FUNC, depth, fqn);
             }
         } else if (spec->class_node_types && cbm_kind_in_set(node, spec->class_node_types)) {
-            const char *cqn = compute_class_qn(ctx, node);
+            const char *cqn = compute_class_qn(ctx, node, &state);
             if (cqn) {
                 push_scope(&state, SCOPE_CLASS, depth, cqn);
             }

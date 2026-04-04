@@ -114,6 +114,7 @@ static const ext_entry_t EXT_TABLE[] = {
     /* GraphQL */
     {".gql", CBM_LANG_GRAPHQL},
     {".graphql", CBM_LANG_GRAPHQL},
+    {".gd", CBM_LANG_GDSCRIPT},
 
     /* Groovy */
     {".gradle", CBM_LANG_GROOVY},
@@ -359,6 +360,7 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_FORM] = "FORM",
     [CBM_LANG_MAGMA] = "Magma",
     [CBM_LANG_WOLFRAM] = "Wolfram",
+    [CBM_LANG_GDSCRIPT] = "GDScript",
     [CBM_LANG_KUSTOMIZE] = "Kustomize",
     [CBM_LANG_K8S] = "Kubernetes",
 };

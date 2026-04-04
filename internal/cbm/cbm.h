@@ -75,6 +75,7 @@ typedef enum {
     CBM_LANG_FORM,
     CBM_LANG_MAGMA,
     CBM_LANG_WOLFRAM,
+    CBM_LANG_GDSCRIPT,
     CBM_LANG_KUSTOMIZE, // kustomization.yaml — Kubernetes overlay tool
     CBM_LANG_K8S,       // Generic Kubernetes manifest (apiVersion: detected)
     CBM_LANG_COUNT

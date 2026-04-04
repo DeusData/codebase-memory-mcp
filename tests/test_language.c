@@ -411,6 +411,10 @@ TEST(lang_ext_graphql) {
     ASSERT_EQ(cbm_language_for_extension(".graphql"), CBM_LANG_GRAPHQL);
     PASS();
 }
+TEST(lang_ext_gdscript) {
+    ASSERT_EQ(cbm_language_for_extension(".gd"), CBM_LANG_GDSCRIPT);
+    PASS();
+}
 TEST(lang_ext_gql) {
     ASSERT_EQ(cbm_language_for_extension(".gql"), CBM_LANG_GRAPHQL);
     PASS();
@@ -527,6 +531,10 @@ TEST(lang_name_python) {
 }
 TEST(lang_name_cpp) {
     ASSERT_STR_EQ(cbm_language_name(CBM_LANG_CPP), "C++");
+    PASS();
+}
+TEST(lang_name_gdscript) {
+    ASSERT_STR_EQ(cbm_language_name(CBM_LANG_GDSCRIPT), "GDScript");
     PASS();
 }
 TEST(lang_name_csharp) {
@@ -706,6 +714,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_protobuf);
     RUN_TEST(lang_ext_graphql);
     RUN_TEST(lang_ext_gql);
+    RUN_TEST(lang_ext_gdscript);
     RUN_TEST(lang_ext_vue);
     RUN_TEST(lang_ext_svelte);
     RUN_TEST(lang_ext_meson);
@@ -738,6 +747,7 @@ SUITE(language) {
     RUN_TEST(lang_name_go);
     RUN_TEST(lang_name_python);
     RUN_TEST(lang_name_cpp);
+    RUN_TEST(lang_name_gdscript);
     RUN_TEST(lang_name_csharp);
     RUN_TEST(lang_name_unknown);
 

@@ -388,6 +388,20 @@ TEST(resolve_import_map_suffix) {
     PASS();
 }
 
+TEST(resolve_exact_qualified_name) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "hit", "proj.player.Player.signal.hit", "Function");
+
+    cbm_resolution_t res = cbm_registry_resolve(r, "proj.player.Player.signal.hit",
+                                                "proj.player.Player", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.player.Player.signal.hit");
+    ASSERT_STR_EQ(res.strategy, "exact_qualified_name");
+    ASSERT_TRUE(res.confidence >= 0.95);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
 /* ── Import reachability tests ────────────────────────────────── */
 
 TEST(resolve_is_import_reachable) {
@@ -621,6 +635,7 @@ SUITE(registry) {
     /* Suffix match + import map suffix */
     RUN_TEST(resolve_suffix_match);
     RUN_TEST(resolve_import_map_suffix);
+    RUN_TEST(resolve_exact_qualified_name);
     /* Import reachability */
     RUN_TEST(resolve_is_import_reachable);
     RUN_TEST(resolve_import_reachable_prefix);
