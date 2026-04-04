@@ -207,12 +207,45 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
 
 /* Build import map from graph buffer IMPORTS edges (read-only access to gbuf). */
 static int build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path,
+                            const CBMFileResult *result,
                             // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
                             const char ***out_keys, const char ***out_vals, int *out_count) {
     *out_keys = NULL;
     *out_vals = NULL;
     *out_count = 0;
 
+    /* Fast path: build from cached extraction result (no JSON parsing) */
+    if (result && result->imports.count > 0) {
+        // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
+        const char **keys = calloc((size_t)result->imports.count, sizeof(const char *));
+        // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
+        const char **vals = calloc((size_t)result->imports.count, sizeof(const char *));
+        int count = 0;
+
+        for (int i = 0; i < result->imports.count; i++) {
+            const CBMImport *imp = &result->imports.items[i];
+            if (!imp->local_name || !imp->local_name[0] || !imp->module_path) {
+                continue;
+            }
+            char *target_qn = cbm_pipeline_fqn_module(project_name, imp->module_path);
+            const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(gbuf, target_qn);
+            free(target_qn);
+            if (!target) {
+                continue;
+            }
+            // NOLINTNEXTLINE(misc-include-cleaner) — strdup provided by standard header
+            keys[count] = cbm_strndup(imp->local_name, strlen(imp->local_name));
+            vals[count] = target->qualified_name; /* borrowed from gbuf */
+            count++;
+        }
+
+        *out_keys = keys;
+        *out_vals = vals;
+        *out_count = count;
+        return 0;
+    }
+
+    /* Slow path: scan graph buffer IMPORTS edges + parse JSON properties */
     char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(gbuf, file_qn);
     free(file_qn);
@@ -408,6 +441,34 @@ static bool is_classish_label(const char *label) {
                      strcmp(label, "Type") == 0 || strcmp(label, "Enum") == 0);
 }
 
+/* ── GDScript import helpers (mirror pass_definitions.c) ─────────── */
+
+static bool gdscript_fp_ends_with(const char *fp, const char *suffix) {
+    if (!fp || !suffix) return false;
+    size_t fplen = strlen(fp);
+    size_t sflen = strlen(suffix);
+    return fplen >= sflen && strcmp(fp + fplen - sflen, suffix) == 0;
+}
+
+static const char *gdscript_module_name_from_path(const char *path) {
+    if (!path || !path[0]) return "module";
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    static CBM_TLS char name[256];
+    snprintf(name, sizeof(name), "%s", base);
+    char *dot = strrchr(name, '.');
+    if (dot) *dot = '\0';
+    return name;
+}
+
+static bool gdscript_repo_file_exists(const cbm_pipeline_ctx_t *ctx, const char *rel_path) {
+    if (!ctx || !ctx->repo_path || !rel_path || !rel_path[0]) return false;
+    char full_path[1024];
+    if (snprintf(full_path, sizeof(full_path), "%s/%s", ctx->repo_path, rel_path) >=
+        (int)sizeof(full_path)) return false;
+    return cbm_file_exists(full_path);
+}
+
 static bool gdscript_extract_module_path(const char *target_name, char *out, size_t out_size) {
     if (!target_name || !out || out_size == 0) return false;
     const char *start = strstr(target_name, "\"");
@@ -425,6 +486,14 @@ static bool gdscript_extract_module_path(const char *target_name, char *out, siz
     return true;
 }
 
+/* Forward declaration — gdscript_find_preload_target calls this */
+static const char *promote_gdscript_target_to_class(const cbm_registry_t *registry,
+                                                     const cbm_gbuf_t *gbuf,
+                                                     const char *project_name,
+                                                     const char *resolved_qn,
+                                                     const char *raw_target_name,
+                                                     const char *source_text);
+
 static bool gdscript_preload_extends_base_from_source(const char *source, char *out,
                                                        size_t out_size) {
     if (!source || !out || out_size == 0) return false;
@@ -432,11 +501,18 @@ static bool gdscript_preload_extends_base_from_source(const char *source, char *
         const char *next = strchr(line, '\n');
         const char *scan = line;
         while (*scan == ' ' || *scan == '\t') scan++;
-        if (strncmp(scan, "func ", 5) == 0 || strncmp(scan, "class ", 6) == 0) return false;
+        if (strncmp(scan, "func ", 5) == 0) {
+            return false;
+        }
+        if (strncmp(scan, "class ", 6) == 0) {
+            return false;
+        }
         if (strncmp(scan, "extends preload(\"", 17) == 0) {
             const char *start = scan + 17;
             const char *end = strstr(start, ".gd\"");
-            if (!end || (next && end > next)) return false;
+            if (!end || (next && end > next)) {
+                return false;
+            }
             end += 3;
             if (strncmp(start, "res://", 6) == 0) start += 6;
             size_t len = (size_t)(end - start);
@@ -450,21 +526,64 @@ static bool gdscript_preload_extends_base_from_source(const char *source, char *
     return false;
 }
 
+/* Scan source for `const/var Name = preload("res://path.gd")` and return
+ * the promoted script-anchor QN of the preload target. */
+static const char *gdscript_find_preload_target(const cbm_registry_t *registry,
+                                                  const cbm_gbuf_t *gbuf,
+                                                  const char *project_name,
+                                                  const char *source,
+                                                  const char *var_name) {
+    if (!source || !var_name || !var_name[0]) return NULL;
+    char pattern[512];
+    int plen = snprintf(pattern, sizeof(pattern), "%s = preload(\"", var_name);
+    for (const char *p = source; p && *p; ) {
+        const char *match = strstr(p, pattern);
+        if (!match) break;
+        const char *path_start = match + plen;
+        const char *path_end = strstr(path_start, ".gd\"");
+        if (!path_end) { p = match + 1; continue; }
+        path_end += 3;
+        char raw_path[512];
+        size_t path_len = (size_t)(path_end - path_start);
+        if (path_len == 0 || path_len + 1 > sizeof(raw_path)) { p = match + 1; continue; }
+        memcpy(raw_path, path_start, path_len);
+        raw_path[path_len] = '\0';
+        /* Strip res:// prefix for promote */
+        const char *clean_path = raw_path;
+        if (strncmp(clean_path, "res://", 6) == 0) clean_path += 6;
+        const char *anchor = promote_gdscript_target_to_class(registry, gbuf, project_name,
+                                                               clean_path, clean_path, NULL);
+        if (anchor) return anchor;
+        p = match + 1;
+    }
+    return NULL;
+}
+
 static const char *promote_gdscript_target_to_class(const cbm_registry_t *registry,
                                                      const cbm_gbuf_t *gbuf,
                                                      const char *project_name,
                                                      const char *resolved_qn,
-                                                     const char *raw_target_name) {
+                                                     const char *raw_target_name,
+                                                     const char *source_text) {
     const char *file_path = NULL;
     char *module_qn_owned = NULL;
     char extracted_path[512];
 
     if (resolved_qn) {
         const char *label = cbm_registry_label_of(registry, resolved_qn);
-        if (is_classish_label(label)) return resolved_qn;
+        if (is_classish_label(label)) {
+            return resolved_qn;
+        }
         const cbm_gbuf_node_t *resolved_node = cbm_gbuf_find_by_qn(gbuf, resolved_qn);
         if (resolved_node && resolved_node->file_path &&
             str_ends_with(resolved_node->file_path, ".gd")) {
+            /* Non-classish node in a .gd file — could be a preload alias variable.
+             * Try to resolve it from source before falling back to the file's own anchor. */
+            if (source_text && raw_target_name && raw_target_name[0]) {
+                const char *preload_target = gdscript_find_preload_target(
+                    registry, gbuf, project_name, source_text, raw_target_name);
+                if (preload_target) return preload_target;
+            }
             file_path = resolved_node->file_path;
         }
     }
@@ -475,7 +594,9 @@ static const char *promote_gdscript_target_to_class(const cbm_registry_t *regist
         gdscript_extract_module_path(raw_target_name, extracted_path, sizeof(extracted_path))) {
         file_path = extracted_path;
     }
-    if (!file_path) return NULL;
+    if (!file_path) {
+        return NULL;
+    }
 
     module_qn_owned = cbm_pipeline_fqn_module(project_name, file_path);
     const char *anchor_qn = find_gdscript_script_anchor(gbuf, file_path, module_qn_owned);
@@ -525,6 +646,246 @@ static bool gdscript_normalize_type_name(const char *type_name, char *out, size_
     return true;
 }
 
+static bool is_identifier_char(char ch) {
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+           ch == '_';
+}
+
+static bool range_contains_identifier(const char *start, const char *end, const char *name) {
+    if (!start || !end || !name || !name[0] || start >= end) {
+        return false;
+    }
+    size_t name_len = strlen(name);
+    for (const char *p = start; p && p < end; p++) {
+        if (strncmp(p, name, name_len) != 0) {
+            continue;
+        }
+        char prev = (p > start) ? *(p - 1) : '\0';
+        char next = (p + name_len < end) ? p[name_len] : '\0';
+        if (!is_identifier_char(prev) && !is_identifier_char(next)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool range_contains_keyword_decl(const char *start, const char *end, const char *keyword,
+                                        const char *name) {
+    if (!start || !end || !keyword || !name || !name[0] || start >= end) {
+        return false;
+    }
+    size_t keyword_len = strlen(keyword);
+    for (const char *p = start; p && p < end; p++) {
+        if (strncmp(p, keyword, keyword_len) != 0) {
+            continue;
+        }
+        char prev = (p > start) ? *(p - 1) : '\0';
+        if (is_identifier_char(prev)) {
+            continue;
+        }
+        const char *name_start = p + keyword_len;
+        while (name_start < end && (*name_start == ' ' || *name_start == '\t')) {
+            name_start++;
+        }
+        if (name_start < end && strncmp(name_start, name, strlen(name)) == 0) {
+            char next = name_start[strlen(name)];
+            if (!is_identifier_char(next)) {
+                return true;
+            }
+        }
+        p = name_start;
+    }
+    return false;
+}
+
+static bool gdscript_name_shadowed_in_func_source(const char *source, const char *func_qn,
+                                                  const char *name) {
+    if (!source || !func_qn || !name || !name[0]) {
+        return false;
+    }
+
+    const char *func_name = strrchr(func_qn, '.');
+    func_name = func_name ? func_name + 1 : func_qn;
+
+    size_t func_name_len = strlen(func_name);
+    const char *func_start = NULL;
+    for (const char *line = source; line && *line;) {
+        const char *next = strchr(line, '\n');
+        const char *scan = line;
+        while (*scan == ' ' || *scan == '\t') {
+            scan++;
+        }
+        if (strncmp(scan, "func ", 5) == 0 && strncmp(scan + 5, func_name, func_name_len) == 0 &&
+            scan[5 + func_name_len] == '(') {
+            func_start = scan;
+            break;
+        }
+        line = next ? next + 1 : NULL;
+    }
+    if (!func_start) {
+        return false;
+    }
+    const char *line_end = strchr(func_start, '\n');
+    if (!line_end) {
+        line_end = source + strlen(source);
+    }
+
+    const char *params_start = strchr(func_start, '(');
+    const char *params_end = params_start ? strchr(params_start, ')') : NULL;
+    if (params_start && params_end && params_end <= line_end &&
+        range_contains_identifier(params_start + 1, params_end, name)) {
+        return true;
+    }
+
+    const char *func_end = source + strlen(source);
+    for (const char *line = line_end; line && *line;) {
+        const char *next = strchr(line, '\n');
+        const char *scan = line;
+        if (*scan == '\n') {
+            scan++;
+        }
+        while (*scan == ' ' || *scan == '\t') {
+            scan++;
+        }
+        if (strncmp(scan, "func ", 5) == 0 || strncmp(scan, "class ", 6) == 0 ||
+            strncmp(scan, "class_name ", 11) == 0) {
+            func_end = line;
+            break;
+        }
+        line = next ? next + 1 : NULL;
+    }
+    return range_contains_keyword_decl(line_end, func_end, "var", name) ||
+           range_contains_keyword_decl(line_end, func_end, "const", name);
+}
+
+static const CBMDefinition *gdscript_find_definition_by_qn(const CBMFileResult *result,
+                                                            const char *func_qn) {
+    if (!result || !func_qn) return NULL;
+    for (int i = 0; i < result->defs.count; i++) {
+        if (result->defs.items[i].qualified_name &&
+            strcmp(result->defs.items[i].qualified_name, func_qn) == 0) {
+            return &result->defs.items[i];
+        }
+    }
+    return NULL;
+}
+
+static const char *source_line_start(const char *source, uint32_t line_no) {
+    if (!source || line_no == 0) return NULL;
+    const char *p = source;
+    for (uint32_t line = 1; line < line_no; line++) {
+        const char *nl = strchr(p, '\n');
+        if (!nl) return NULL;
+        p = nl + 1;
+    }
+    return p;
+}
+
+static bool gdscript_func_body_range_from_definition(const CBMFileResult *result, const char *source,
+                                                      const char *func_qn, const char **out_body_start,
+                                                      const char **out_func_end) {
+    if (!result || !source || !func_qn || !out_body_start || !out_func_end) return false;
+    const CBMDefinition *def = gdscript_find_definition_by_qn(result, func_qn);
+    if (!def || def->start_line == 0 || def->end_line < def->start_line) return false;
+    const char *header_start = source_line_start(source, def->start_line);
+    if (!header_start) return false;
+    const char *body_start = strchr(header_start, '\n');
+    if (!body_start) {
+        body_start = source + strlen(source);
+    } else {
+        body_start++;
+    }
+    const char *func_end = source_line_start(source, def->end_line + 1);
+    if (!func_end) func_end = source + strlen(source);
+    *out_body_start = body_start;
+    *out_func_end = func_end;
+    return true;
+}
+
+static bool gdscript_match_receiver_assignment_line(const char *line_start, const char *line_end,
+                                                     const char *receiver_name, char *out,
+                                                     size_t out_size) {
+    if (!line_start || !line_end || !receiver_name || !receiver_name[0] || !out || out_size == 0)
+        return false;
+    const char *scan = line_start;
+    while (scan < line_end && (*scan == ' ' || *scan == '\t')) scan++;
+    if (scan >= line_end || *scan == '#') return false;
+    const char *prefix = NULL;
+    if ((size_t)(line_end - scan) > 4 && strncmp(scan, "var ", 4) == 0) {
+        prefix = "var ";
+    } else if ((size_t)(line_end - scan) > 6 && strncmp(scan, "const ", 6) == 0) {
+        prefix = "const ";
+    } else {
+        return false;
+    }
+    scan += strlen(prefix);
+    size_t receiver_len = strlen(receiver_name);
+    if ((size_t)(line_end - scan) <= receiver_len || strncmp(scan, receiver_name, receiver_len) != 0 ||
+        is_identifier_char(scan[receiver_len])) return false;
+    scan += receiver_len;
+    while (scan < line_end && (*scan == ' ' || *scan == '\t')) scan++;
+    if (scan >= line_end || *scan != '=') return false;
+    scan++;
+    while (scan < line_end && (*scan == ' ' || *scan == '\t')) scan++;
+    if (scan >= line_end || !(*scan >= 'A' && *scan <= 'Z')) return false;
+    const char *call_end = NULL;
+    for (const char *p = scan; p + 4 <= line_end; p++) {
+        if (strncmp(p, ".new", 4) == 0) { call_end = p; break; }
+    }
+    if (!call_end || call_end == scan) return false;
+    size_t len = (size_t)(call_end - scan);
+    if (len + 1 > out_size) return false;
+    memcpy(out, scan, len);
+    out[len] = '\0';
+    return true;
+}
+
+static void gdscript_update_triple_quote_state(const char *line_start, const char *line_end,
+                                                char *quote_char) {
+    if (!line_start || !line_end || !quote_char) return;
+    for (const char *p = line_start; p + 2 < line_end; p++) {
+        if (*quote_char) {
+            if (p[0] == *quote_char && p[1] == *quote_char && p[2] == *quote_char) {
+                *quote_char = '\0';
+                p += 2;
+            }
+            continue;
+        }
+        if ((p[0] == '\'' || p[0] == '"') && p[1] == p[0] && p[2] == p[0]) {
+            *quote_char = p[0];
+            p += 2;
+        }
+    }
+}
+
+static bool gdscript_infer_receiver_type_from_source(const CBMFileResult *result, const char *source,
+                                                      const char *func_qn, const char *receiver_name,
+                                                      char *out, size_t out_size) {
+    const char *body_start = NULL;
+    const char *func_end = NULL;
+    if (!result || !source || !func_qn || !receiver_name || !receiver_name[0] || !out ||
+        out_size == 0 ||
+        !gdscript_func_body_range_from_definition(result, source, func_qn, &body_start, &func_end)) {
+        return false;
+    }
+    char triple_quote = '\0';
+    for (const char *line = body_start; line && line < func_end && *line; ) {
+        const char *next = strchr(line, '\n');
+        const char *line_end = next ? next : func_end;
+        if (line_end > func_end) line_end = func_end;
+        bool in_triple_quote = (triple_quote != '\0');
+        gdscript_update_triple_quote_state(line, line_end, &triple_quote);
+        if (!in_triple_quote && triple_quote == '\0') {
+            bool matched = gdscript_match_receiver_assignment_line(line, line_end, receiver_name, out, out_size);
+            if (matched) {
+                return true;
+            }
+        }
+        line = next ? next + 1 : NULL;
+    }
+    return false;
+}
+
 static bool gdscript_receiver_signal_target_qn(const cbm_registry_t *registry,
                                                 const cbm_gbuf_t *gbuf,
                                                 const char *project_name,
@@ -534,6 +895,7 @@ static bool gdscript_receiver_signal_target_qn(const cbm_registry_t *registry,
                                                 const char **imp_keys,
                                                 const char **imp_vals,
                                                 int imp_count,
+                                                const char *source_text,
                                                 char *out, size_t out_size) {
     if (!call || !call->callee_name || !call->first_string_arg || !call->first_string_arg[0])
         return false;
@@ -543,25 +905,40 @@ static bool gdscript_receiver_signal_target_qn(const cbm_registry_t *registry,
     char receiver_name[128];
     if (!gdscript_receiver_var_name(call, receiver_name, sizeof(receiver_name))) return false;
 
+    char inferred_type[256] = {0};
     const char *type_name = gdscript_type_assign_for_receiver(result, call, receiver_name);
-    if (!type_name) return false;
+    if (!type_name) {
+        if (source_text && gdscript_infer_receiver_type_from_source(result, source_text, call->enclosing_func_qn,
+                                                       receiver_name, inferred_type,
+                                                       sizeof(inferred_type))) {
+            type_name = inferred_type;
+        } else {
+            return false;
+        }
+    }
 
     char normalized_type[256];
-    if (!gdscript_normalize_type_name(type_name, normalized_type, sizeof(normalized_type)))
+    if (!gdscript_normalize_type_name(type_name, normalized_type, sizeof(normalized_type))) {
         return false;
+    }
 
     const char *import_target = lookup_import_map_value(normalized_type, imp_keys, imp_vals, imp_count);
+
     const char *target_anchor = NULL;
     if (import_target) {
         target_anchor = promote_gdscript_target_to_class(registry, gbuf, project_name,
-                                                          import_target, import_target);
-    }
-    if (!target_anchor) {
+                                                          import_target, import_target,
+                                                          source_text);
+    } else {
         cbm_resolution_t target_res = cbm_registry_resolve(registry, normalized_type, module_qn,
                                                             imp_keys, imp_vals, imp_count);
-        if (target_res.qualified_name && target_res.qualified_name[0]) {
+        if (target_res.qualified_name &&
+            is_classish_label(cbm_registry_label_of(registry, target_res.qualified_name))) {
+            target_anchor = target_res.qualified_name;
+        } else {
             target_anchor = promote_gdscript_target_to_class(registry, gbuf, project_name,
-                                                              target_res.qualified_name, NULL);
+                                                              target_res.qualified_name, NULL,
+                                                              source_text);
         }
     }
     if (!target_anchor) return false;
@@ -935,6 +1312,21 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
             const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
 
+            /* GDScript: create Module node for .gd imports if missing
+             * (matches pass_definitions.c lines 338-347) */
+            if (gdscript_fp_ends_with(imp->module_path, ".gd") &&
+                !gdscript_repo_file_exists(ctx, imp->module_path)) {
+                target = NULL;
+            } else if (!target && gdscript_fp_ends_with(imp->module_path, ".gd")) {
+                int64_t target_id =
+                    cbm_gbuf_upsert_node(ctx->gbuf, "Module",
+                                         gdscript_module_name_from_path(imp->module_path),
+                                         target_qn, imp->module_path, 0, 0, "{}");
+                if (target_id > 0) {
+                    target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
+                }
+            }
+
             char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
             const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
 
@@ -1253,11 +1645,18 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         const char *rel = rc->files[file_idx].rel_path;
 
+        /* Read source for GDScript receiver type inference */
+        char *gdscript_source = NULL;
+        if (rc->files[file_idx].language == CBM_LANG_GDSCRIPT) {
+            int gdscript_source_len = 0;
+            gdscript_source = read_file(rc->files[file_idx].path, &gdscript_source_len);
+        }
+
         /* Build import map (read-only access to main_gbuf) */
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(rc->main_gbuf, rc->project_name, rel, &imp_keys, &imp_vals, &imp_count);
+        build_import_map(rc->main_gbuf, rc->project_name, rel, result, &imp_keys, &imp_vals, &imp_count);
 
         char *module_qn = cbm_pipeline_fqn_module(rc->project_name, rel);
 
@@ -1287,7 +1686,18 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                 char anchor_qn[512];
                 char gdscript_target_qn[768];
                 bool has_anchor_qn = gdscript_script_anchor_qn(source_node, anchor_qn, sizeof(anchor_qn));
-                if (has_anchor_qn &&
+                bool allow_same_script_signal = true;
+                if (call->first_string_arg && call->first_string_arg[0] && gdscript_source &&
+                    gdscript_signal_member_suffix_len(call->callee_name) > 0 &&
+                    memchr(call->callee_name, '.',
+                           strlen(call->callee_name) -
+                               gdscript_signal_member_suffix_len(call->callee_name)) == NULL) {
+                    allow_same_script_signal =
+                        !gdscript_name_shadowed_in_func_source(gdscript_source,
+                                                               call->enclosing_func_qn,
+                                                               call->first_string_arg);
+                }
+                if (has_anchor_qn && allow_same_script_signal &&
                     gdscript_same_script_target_qn(call, anchor_qn, gdscript_target_qn,
                                                    sizeof(gdscript_target_qn))) {
                     res = cbm_registry_resolve(rc->registry, gdscript_target_qn, module_qn,
@@ -1297,6 +1707,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                     gdscript_receiver_signal_target_qn(rc->registry, rc->main_gbuf,
                                                         rc->project_name, result, call,
                                                         module_qn, imp_keys, imp_vals, imp_count,
+                                                        gdscript_source,
                                                         gdscript_target_qn, sizeof(gdscript_target_qn))) {
                     res = cbm_registry_resolve(rc->registry, gdscript_target_qn, module_qn,
                                                imp_keys, imp_vals, imp_count);
@@ -1459,42 +1870,43 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
                     /* GDScript: promote .gd targets to script-anchor class QNs */
                     if (rc->files[file_idx].language == CBM_LANG_GDSCRIPT) {
-                        fprintf(stderr, "DEBUG INHERITS: file=%s base_classes[%d]=%s\n",
-                                rel, b, def->base_classes[b]);
                         /* First try resolve_as_class for named class targets */
                         base_qn = resolve_as_class(rc->registry, def->base_classes[b], module_qn,
                                                    imp_keys, imp_vals, imp_count);
-                        fprintf(stderr, "  resolve_as_class -> %s\n", base_qn ? base_qn : "(null)");
                         /* If that failed, try GDScript-specific promotion */
                         if (!base_qn) {
                             /* Check if base_classes[b] is a .gd path or alias */
                             const char *import_target = lookup_import_map_value(
                                 def->base_classes[b], imp_keys, imp_vals, imp_count);
-                            fprintf(stderr, "  import_target -> %s\n", import_target ? import_target : "(null)");
-                            if (import_target && str_ends_with(import_target, ".gd")) {
+                            if (import_target && (str_ends_with(import_target, ".gd") ||
+                                (strchr(import_target, '/') == NULL && strchr(import_target, ':') == NULL))) {
                                 base_qn = promote_gdscript_target_to_class(
                                     rc->registry, rc->main_gbuf, rc->project_name,
-                                    import_target, import_target);
-                                fprintf(stderr, "  promote(import_target) -> %s\n", base_qn ? base_qn : "(null)");
+                                    import_target, import_target, gdscript_source);
                             }
                             if (!base_qn && str_ends_with(def->base_classes[b], ".gd")) {
                                 base_qn = promote_gdscript_target_to_class(
                                     rc->registry, rc->main_gbuf, rc->project_name,
-                                    def->base_classes[b], def->base_classes[b]);
-                                fprintf(stderr, "  promote(base_classes) -> %s\n", base_qn ? base_qn : "(null)");
+                                    def->base_classes[b], def->base_classes[b], gdscript_source);
                             }
                             /* Try resolving as a class name and then promoting if it's a .gd file */
                             if (!base_qn) {
                                 cbm_resolution_t res = cbm_registry_resolve(
                                     rc->registry, def->base_classes[b], module_qn,
                                     imp_keys, imp_vals, imp_count);
-                                fprintf(stderr, "  registry_resolve -> %s\n", res.qualified_name ? res.qualified_name : "(null)");
                                 if (res.qualified_name && res.qualified_name[0]) {
                                     base_qn = promote_gdscript_target_to_class(
                                         rc->registry, rc->main_gbuf, rc->project_name,
-                                        res.qualified_name, def->base_classes[b]);
-                                    fprintf(stderr, "  promote(resolved) -> %s\n", base_qn ? base_qn : "(null)");
+                                        res.qualified_name, def->base_classes[b], gdscript_source);
                                 }
+                            }
+                            /* Fallback: try promote directly with raw base_classes[b].
+                             * Handles quoted path strings like `"res://actors/base.gd"`
+                             * via gdscript_extract_module_path inside promote. */
+                            if (!base_qn) {
+                                base_qn = promote_gdscript_target_to_class(
+                                    rc->registry, rc->main_gbuf, rc->project_name,
+                                    NULL, def->base_classes[b], gdscript_source);
                             }
                         }
                     } else {
@@ -1512,21 +1924,18 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                                          "{}");
                     ws->semantic_resolved++;
                 }
-            } else if (rc->files[file_idx].language == CBM_LANG_GDSCRIPT && node->label &&
-                       strcmp(node->label, "Class") == 0 && node->qualified_name &&
+            } else if (rc->files[file_idx].language == CBM_LANG_GDSCRIPT && node->qualified_name &&
                        gdscript_anchor_matches_module(node->qualified_name, module_qn)) {
-                /* Fallback: read source file for extends preload("...") patterns
+                /* Fallback: use already-loaded source for extends preload("...") patterns
                  * that the extractor didn't capture as base_classes */
-                char *fallback_source = NULL;
-                int fallback_len = 0;
-                const char *full_path = rc->files[file_idx].path;
-                fallback_source = read_file(full_path, &fallback_len);
-                if (fallback_source) {
+                if (gdscript_source) {
                     char module_path[512];
-                    if (gdscript_preload_extends_base_from_source(fallback_source, module_path,
-                                                                   sizeof(module_path))) {
+                    bool extracted = gdscript_preload_extends_base_from_source(gdscript_source, module_path,
+                                                                    sizeof(module_path));
+                    if (extracted) {
                         const char *base_qn = promote_gdscript_target_to_class(
-                            rc->registry, rc->main_gbuf, rc->project_name, NULL, module_path);
+                            rc->registry, rc->main_gbuf, rc->project_name, NULL, module_path,
+                            gdscript_source);
                         if (base_qn) {
                             const cbm_gbuf_node_t *base_node =
                                 cbm_gbuf_find_by_qn(rc->main_gbuf, base_qn);
@@ -1537,7 +1946,6 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                             }
                         }
                     }
-                    free(fallback_source);
                 }
             }
 
@@ -1602,6 +2010,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         free(module_qn);
         free_import_map(imp_keys, imp_vals, imp_count);
+        free(gdscript_source);
     }
 }
 

@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.DeusData/codebase-memory-mcp",
   "title": "Codebase Memory",
-  "description": "Persistent codebase knowledge graph — 66 languages, sub-ms queries, 99% fewer tokens than grep. Survives session restarts and context compaction.",
+  "description": "Persistent codebase knowledge graph — 67 languages, sub-ms queries, 99% fewer tokens than grep. Survives session restarts and context compaction.",
   "repository": {
     "url": "https://github.com/DeusData/codebase-memory-mcp",
     "source": "github"

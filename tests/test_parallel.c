@@ -350,7 +350,10 @@ static int setup_gdscript_repo(void) {
         "    helper()\n"
         "\n"
         "func helper():\n"
-        "    pass\n");
+        "    pass\n"
+        "\n"
+        "func shadow_param(hit):\n"
+        "    hit.connect(_on_hit)\n");
     fclose(f);
 
     /* player_path_extends.gd */
