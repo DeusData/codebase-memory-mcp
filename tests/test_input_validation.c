@@ -191,6 +191,126 @@ TEST(f9_valid_regex_succeeds) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  F6: sort_by 'calls' and 'linkrank' must be accepted (Bug 1)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(f6_sort_by_calls_accepted) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"sort_by\":\"calls\",\"limit\":3}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "invalid sort_by"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(f6_sort_by_linkrank_accepted) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"sort_by\":\"linkrank\",\"limit\":3}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "invalid sort_by"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  F9: Glob wildcard patterns auto-converted to regex (Bug 2)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(f9_glob_star_autoconverted) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"name_pattern\":\"*tool*\",\"limit\":3}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "invalid regex"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(f9_glob_question_autoconverted) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"name_pattern\":\"*foo?\",\"limit\":3}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "invalid regex"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(f9_valid_regex_still_works) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"name_pattern\":\".*tool.*\",\"limit\":3}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "error"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(f9_truly_invalid_pattern_still_errors) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"name_pattern\":\"(\",\"limit\":3}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "error"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(f9_qn_pattern_glob_autoconverted) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"qn_pattern\":\"*Handler*\",\"limit\":3}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "invalid regex"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  F10: Negative depth clamped to 1
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -209,6 +329,71 @@ TEST(f10_negative_depth_returns_results) {
     /* At minimum should have function name in response */
     ASSERT_NOT_NULL(strstr(resp, "foo"));
 
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Bug 3: trace_call_path fuzzy fallback on case mismatch
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(trace_case_mismatch_finds_via_fallback) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* "Foo" does not exist — only "foo" does. Fallback search should find it.
+     * No project passed: resolve_store returns in-memory store, fallback search
+     * has no project filter, finds "foo", re-queries with result's project. */
+    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+        "{\"function_name\":\"Foo\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    /* Must NOT contain "function not found" — fallback should resolve */
+    ASSERT_NULL(strstr(resp, "function not found"));
+    /* Response should contain "function" key (BFS result) and direction */
+    ASSERT_NOT_NULL(strstr(resp, "\"function\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"direction\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(trace_exact_match_still_works) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* Exact name "foo" should work directly without fallback.
+     * No project: resolve_store returns in-memory store, find_nodes_by_name
+     * uses project=NULL which binds NULL (won't match). Falls to fallback
+     * which finds "foo" via search (no project filter). */
+    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+        "{\"function_name\":\"foo\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "function not found"));
+    ASSERT_NOT_NULL(strstr(resp, "foo"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(trace_truly_missing_still_errors) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* "nonexistent_xyz" doesn't match anything — should still error */
+    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+        "{\"function_name\":\"nonexistent_xyz\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "function not found"));
     free(resp);
     cbm_mcp_server_free(srv);
     cleanup_validation_dir(tmp);
@@ -346,7 +531,17 @@ void suite_input_validation(void) {
     RUN_TEST(f6_sort_by_typo_errors);
     RUN_TEST(f9_invalid_regex_errors);
     RUN_TEST(f9_valid_regex_succeeds);
+    RUN_TEST(f6_sort_by_calls_accepted);
+    RUN_TEST(f6_sort_by_linkrank_accepted);
+    RUN_TEST(f9_glob_star_autoconverted);
+    RUN_TEST(f9_glob_question_autoconverted);
+    RUN_TEST(f9_valid_regex_still_works);
+    RUN_TEST(f9_truly_invalid_pattern_still_errors);
+    RUN_TEST(f9_qn_pattern_glob_autoconverted);
     RUN_TEST(f10_negative_depth_returns_results);
+    RUN_TEST(trace_case_mismatch_finds_via_fallback);
+    RUN_TEST(trace_exact_match_still_works);
+    RUN_TEST(trace_truly_missing_still_errors);
     RUN_TEST(f15_invalid_direction_errors);
     RUN_TEST(f15_valid_direction_succeeds);
     RUN_TEST(g1_summary_mode_has_results_key);
