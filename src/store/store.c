@@ -1915,6 +1915,21 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         ADD_WHERE(bind_buf);
         BIND_TEXT(params->qn_pattern);
     }
+    if (params->pattern) {
+        /* OR-search: matches name OR qualified_name — single param for quick symbol lookup */
+        if (params->case_sensitive) {
+            snprintf(bind_buf, sizeof(bind_buf),
+                "(n.name REGEXP ?%d OR n.qualified_name REGEXP ?%d)",
+                bind_idx + 1, bind_idx + 2);
+        } else {
+            snprintf(bind_buf, sizeof(bind_buf),
+                "(iregexp(?%d, n.name) OR iregexp(?%d, n.qualified_name))",
+                bind_idx + 1, bind_idx + 2);
+        }
+        ADD_WHERE(bind_buf);
+        BIND_TEXT(params->pattern);
+        BIND_TEXT(params->pattern);
+    }
     if (params->file_pattern) {
         like_pattern = cbm_glob_to_like(params->file_pattern);
         snprintf(bind_buf, sizeof(bind_buf), "n.file_path LIKE ?%d", bind_idx + 1);

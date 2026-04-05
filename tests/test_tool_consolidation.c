@@ -709,7 +709,7 @@ TEST(error_missing_required_param_has_hint) {
     /* trace_call_path missing function_name */
     char *r2 = cbm_mcp_handle_tool(srv, "trace_call_path", "{}");
     ASSERT_NOT_NULL(r2);
-    ASSERT_NOT_NULL(strstr(r2, "function_name is required"));
+    ASSERT_NOT_NULL(strstr(r2, "function_name or qualified_name is required"));
     ASSERT_NOT_NULL(strstr(r2, "hint"));
     free(r2);
 
