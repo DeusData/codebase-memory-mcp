@@ -1,4 +1,3 @@
-# Weekly soak test: 4h sustained load + ASan leak detection
 name: Nightly Soak
 
 on:
@@ -10,13 +9,111 @@ on:
         description: 'Soak duration in minutes (default: 240 = 4h)'
         type: number
         default: 240
+      platforms:
+        description: 'Platforms to test'
+        type: choice
+        options: ['all', 'linux-only', 'macos-only']
+        default: 'all'
 
 permissions:
   contents: read
 
 jobs:
-  soak:
-    uses: ./.github/workflows/_soak.yml
-    with:
-      duration_minutes: ${{ inputs.duration_minutes || 240 }}
-      run_asan: true
+  soak-nightly:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 330 # 5.5h safety cap (4h soak + build + analysis)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            cc: gcc
+            cxx: g++
+            filter: all linux-only
+          - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            cc: gcc
+            cxx: g++
+            filter: all linux-only
+          - os: macos-14
+            goos: darwin
+            goarch: arm64
+            cc: cc
+            cxx: c++
+            filter: all macos-only
+    steps:
+      - name: Check platform filter
+        if: ${{ !contains(matrix.filter, inputs.platforms || 'all') }}
+        run: |
+          echo "Skipping ${{ matrix.goos }}-${{ matrix.goarch }} (filter: ${{ inputs.platforms }})"
+          exit 0
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Install deps (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 git
+
+      - name: Build (release mode)
+        run: scripts/build.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+
+      - name: Nightly soak (${{ inputs.duration_minutes || 240 }} min)
+        run: scripts/soak-test.sh build/c/codebase-memory-mcp ${{ inputs.duration_minutes || 240 }}
+
+      - name: Upload soak metrics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nightly-soak-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: soak-results/
+          retention-days: 30
+
+  soak-nightly-asan:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120 # ASan runs shorter (60 min) due to 2-3x overhead
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            cc: gcc
+            cxx: g++
+            filter: all linux-only
+          - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            cc: gcc
+            cxx: g++
+            filter: all linux-only
+    steps:
+      - name: Check platform filter
+        if: ${{ !contains(matrix.filter, inputs.platforms || 'all') }}
+        run: exit 0
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 git
+
+      - name: Build (ASan + LeakSanitizer)
+        run: |
+          SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          scripts/build.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} EXTRA_CFLAGS="$SANITIZE" EXTRA_LDFLAGS="$SANITIZE"
+
+      - name: ASan soak (60 min)
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:halt_on_error=0:log_path=soak-results/asan"
+        run: scripts/soak-test.sh build/c/codebase-memory-mcp 60
+
+      - name: Upload ASan soak metrics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nightly-asan-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: soak-results/
+          retention-days: 30

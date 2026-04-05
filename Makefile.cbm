@@ -145,7 +145,7 @@ PREPROCESSOR_SRC = $(CBM_DIR)/preprocessor.cpp
 SQLITE_WRITER_SRC = $(CBM_DIR)/sqlite_writer.c
 
 # Store module (new)
-STORE_SRCS = src/store/store.c
+STORE_SRCS = src/store/store.c src/store/cross_repo.c
 
 # Cypher module (new)
 CYPHER_SRCS = src/cypher/cypher.c
@@ -186,7 +186,8 @@ PIPELINE_SRCS = \
     src/pipeline/pass_compile_commands.c \
     src/pipeline/pass_infrascan.c \
     src/pipeline/pass_k8s.c \
-    src/pipeline/pass_similarity.c
+    src/pipeline/pass_similarity.c \
+    src/pipeline/embedding.c
 
 # SimHash / MinHash module
 SIMHASH_SRCS = src/simhash/minhash.c
@@ -226,8 +227,8 @@ MIMALLOC_CFLAGS_TEST = -std=c11 -g -O1 -w \
 
 # sqlite3 (vendored amalgamation — compiled ourselves for ASan instrumentation)
 SQLITE3_SRC = vendored/sqlite3/sqlite3.c
-SQLITE3_CFLAGS = -std=c11 -O2 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1
-SQLITE3_CFLAGS_TEST = -std=c11 -g -O1 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1
+SQLITE3_CFLAGS = -std=c11 -O2 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5
+SQLITE3_CFLAGS_TEST = -std=c11 -g -O1 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5
 
 # TRE regex (vendored, Windows only — POSIX uses system <regex.h>)
 TRE_SRC = vendored/tre/tre_all.c

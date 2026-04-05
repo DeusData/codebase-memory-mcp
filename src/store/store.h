@@ -608,4 +608,33 @@ void cbm_store_free_projects(cbm_project_t *projects, int count);
 /* Free an array of file hashes. */
 void cbm_store_free_file_hashes(cbm_file_hash_t *hashes, int count);
 
+/* Execute raw SQL. */
+int cbm_store_exec(cbm_store_t *s, const char *sql);
+
+/* ── Embeddings (semantic vector search) ─────────────────────────── */
+
+typedef struct {
+    int64_t node_id;
+    const char *name;
+    const char *label;
+    const char *qualified_name;
+    const char *file_path;
+    int start_line;
+    int end_line;
+    const char *properties_json;
+    double similarity;
+} cbm_vector_result_t;
+
+int cbm_store_upsert_embedding(cbm_store_t *s, int64_t node_id, const char *project,
+                               const float *embedding, int dims);
+int cbm_store_upsert_embedding_batch(cbm_store_t *s, const int64_t *node_ids,
+                                     const char *project, const float *embeddings,
+                                     int dims, int count);
+int cbm_store_count_embeddings(cbm_store_t *s, const char *project);
+int cbm_store_delete_embeddings(cbm_store_t *s, const char *project);
+int cbm_store_vector_search(cbm_store_t *s, const char *project,
+                            const float *query_vec, int dims, int limit,
+                            cbm_vector_result_t **out, int *out_count);
+void cbm_store_free_vector_results(cbm_vector_result_t *results, int count);
+
 #endif /* CBM_STORE_H */

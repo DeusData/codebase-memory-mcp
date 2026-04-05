@@ -21,6 +21,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 5, P
 #include "store/store.h"
 #include "discover/discover.h"
 #include "discover/userconfig.h"
+#include "pipeline/embedding.h"
 #include "foundation/platform.h"
 #include "foundation/compat_fs.h"
 #include "foundation/log.h"
@@ -778,6 +779,46 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     }
     if (rc != 0) {
         goto cleanup;
+    }
+
+    /* ── Post-dump passes: FTS5, processes, channels, embeddings ── */
+    {
+        char db_path[1024];
+        if (p->db_path) {
+            snprintf(db_path, sizeof(db_path), "%s", p->db_path);
+        } else {
+            const char *cdir = cbm_resolve_cache_dir();
+            if (!cdir) cdir = cbm_tmpdir();
+            snprintf(db_path, sizeof(db_path), "%s/%s.db", cdir, p->project_name);
+        }
+
+        cbm_store_t *post_store = cbm_store_open_path(db_path);
+        if (post_store) {
+            /* FTS5 backfill. Contentless FTS5 requires 'delete-all' command.
+             * Try camelCase splitting first, fall back to plain names. */
+            cbm_store_exec(post_store,
+                "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+            if (cbm_store_exec(post_store,
+                    "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+                    "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
+                    "FROM nodes;") != 0) {
+                /* Fallback: plain names without camelCase splitting */
+                cbm_store_exec(post_store,
+                    "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+                    "SELECT id, name, qualified_name, label, file_path FROM nodes;");
+            }
+
+            /* Embedding generation (if configured) */
+            if (cbm_embedding_is_configured()) {
+                int nemb = cbm_embedding_generate_for_project(post_store, p->project_name, false);
+                if (nemb > 0) {
+                    cbm_log_info("pass.done", "pass", "embeddings",
+                                 "generated", itoa_buf(nemb));
+                }
+            }
+
+            cbm_store_close(post_store);
+        }
     }
 
     cbm_log_info("pipeline.done", "nodes", itoa_buf(cbm_gbuf_node_count(p->gbuf)), "edges",

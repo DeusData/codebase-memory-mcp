@@ -9,6 +9,7 @@
 // for ISO timestamp
 
 #include <stdint.h>
+#include <math.h>
 #include "foundation/constants.h"
 
 enum {
@@ -246,9 +247,35 @@ static int init_schema(cbm_store_t *s) {
                       "  source_hash TEXT NOT NULL,"
                       "  created_at TEXT NOT NULL,"
                       "  updated_at TEXT NOT NULL"
-                      ");";
+                      ");"
+                      "CREATE TABLE IF NOT EXISTS embeddings ("
+                      "  node_id INTEGER PRIMARY KEY,"
+                      "  project TEXT NOT NULL,"
+                      "  embedding BLOB NOT NULL,"
+                      "  dimensions INTEGER NOT NULL DEFAULT 0"
+                      ");"
+                      "CREATE INDEX IF NOT EXISTS idx_embeddings_project "
+                      "ON embeddings(project);";
 
-    return exec_sql(s, ddl);
+    int rc = exec_sql(s, ddl);
+    if (rc != CBM_STORE_OK) return rc;
+
+    /* FTS5 contentless index for BM25 search with camelCase splitting */
+    {
+        char *fts_err = NULL;
+        int fts_rc = sqlite3_exec(s->db,
+            "CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5("
+            "name, qualified_name, label, file_path,"
+            "content='', content_rowid='id',"
+            "tokenize='unicode61 remove_diacritics 2'"
+            ");",
+            NULL, NULL, &fts_err);
+        if (fts_rc != SQLITE_OK) {
+            sqlite3_free(fts_err);
+        }
+    }
+
+    return CBM_STORE_OK;
 }
 
 static int create_user_indexes(cbm_store_t *s) {
@@ -296,6 +323,56 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory) {
 }
 
 /* ── REGEXP function for SQLite ──────────────────────────────────── */
+
+/* CamelCase token splitter for FTS5.
+ * "updateCloudClient" → "updateCloudClient update Cloud Client" */
+static void sqlite_camel_split(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc;
+    const char *input = (const char *)sqlite3_value_text(argv[0]);
+    if (!input || !input[0]) {
+        sqlite3_result_text(ctx, input ? input : "", -1, SQLITE_TRANSIENT);
+        return;
+    }
+    char buf[2048];
+    int len = snprintf(buf, sizeof(buf), "%s ", input);
+    for (int i = 0; input[i] && len < (int)sizeof(buf) - 2; i++) {
+        if (i > 0) {
+            bool split = false;
+            if (input[i] >= 'A' && input[i] <= 'Z' &&
+                input[i - 1] >= 'a' && input[i - 1] <= 'z') split = true;
+            if (input[i] >= 'A' && input[i] <= 'Z' &&
+                input[i - 1] >= 'A' && input[i - 1] <= 'Z' &&
+                input[i + 1] >= 'a' && input[i + 1] <= 'z') split = true;
+            if (split) buf[len++] = ' ';
+        }
+        buf[len++] = input[i];
+    }
+    buf[len] = '\0';
+    sqlite3_result_text(ctx, buf, len, SQLITE_TRANSIENT);
+}
+
+/* Cosine similarity for vector search. */
+static void sqlite_cosine_sim(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc;
+    if (sqlite3_value_type(argv[0]) != SQLITE_BLOB ||
+        sqlite3_value_type(argv[1]) != SQLITE_BLOB) {
+        sqlite3_result_null(ctx); return;
+    }
+    const float *a = (const float *)sqlite3_value_blob(argv[0]);
+    const float *b = (const float *)sqlite3_value_blob(argv[1]);
+    int a_bytes = sqlite3_value_bytes(argv[0]);
+    int b_bytes = sqlite3_value_bytes(argv[1]);
+    if (a_bytes != b_bytes || a_bytes == 0 || (a_bytes % (int)sizeof(float)) != 0) {
+        sqlite3_result_null(ctx); return;
+    }
+    int dims = a_bytes / (int)sizeof(float);
+    float dot = 0.0f, na = 0.0f, nb = 0.0f;
+    for (int i = 0; i < dims; i++) {
+        dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i];
+    }
+    if (na == 0.0f || nb == 0.0f) { sqlite3_result_double(ctx, 0.0); return; }
+    sqlite3_result_double(ctx, (double)dot / (sqrt((double)na) * sqrt((double)nb)));
+}
 
 static void sqlite_regexp(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     (void)argc;
@@ -388,9 +465,12 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
     /* Register REGEXP function (SQLite doesn't have one built-in) */
     sqlite3_create_function(s->db, "regexp", ST_COL_2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
                             sqlite_regexp, NULL, NULL);
-    /* Case-insensitive variant for search with case_sensitive=false */
     sqlite3_create_function(s->db, "iregexp", ST_COL_2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
                             sqlite_iregexp, NULL, NULL);
+    sqlite3_create_function(s->db, "cbm_camel_split", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+                            NULL, sqlite_camel_split, NULL, NULL);
+    sqlite3_create_function(s->db, "cbm_cosine_sim", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+                            NULL, sqlite_cosine_sim, NULL, NULL);
 
     if (configure_pragmas(s, in_memory) != CBM_STORE_OK || init_schema(s) != CBM_STORE_OK ||
         create_user_indexes(s) != CBM_STORE_OK) {
@@ -443,6 +523,10 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
                             sqlite_regexp, NULL, NULL);
     sqlite3_create_function(s->db, "iregexp", ST_COL_2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
                             sqlite_iregexp, NULL, NULL);
+    sqlite3_create_function(s->db, "cbm_camel_split", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+                            NULL, sqlite_camel_split, NULL, NULL);
+    sqlite3_create_function(s->db, "cbm_cosine_sim", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+                            NULL, sqlite_cosine_sim, NULL, NULL);
 
     if (configure_pragmas(s, false) != CBM_STORE_OK) {
         sqlite3_close(s->db);
@@ -4524,4 +4608,159 @@ void cbm_store_free_file_hashes(cbm_file_hash_t *hashes, int count) {
         free((void *)hashes[i].sha256);
     }
     free(hashes);
+}
+
+/* ── cbm_store_exec (utility) ─────────────────────────────────── */
+int cbm_store_exec(cbm_store_t *s, const char *sql) {
+    return exec_sql(s, sql);
+}
+
+/* ── Embeddings (vector search) ─────────────────────────────────── */
+
+int cbm_store_upsert_embedding(cbm_store_t *s, int64_t node_id, const char *project,
+                               const float *embedding, int dims) {
+    if (!s || !s->db || !embedding || dims <= 0) return CBM_STORE_ERR;
+
+    const char *sql =
+        "INSERT OR REPLACE INTO embeddings(node_id, project, embedding, dimensions) "
+        "VALUES(?1, ?2, ?3, ?4)";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_bind_int64(stmt, 1, node_id);
+    bind_text(stmt, 2, project);
+    sqlite3_bind_blob(stmt, 3, embedding, dims * (int)sizeof(float), SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 4, dims);
+    int rc = (sqlite3_step(stmt) == SQLITE_DONE) ? CBM_STORE_OK : CBM_STORE_ERR;
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+int cbm_store_upsert_embedding_batch(cbm_store_t *s, const int64_t *node_ids,
+                                     const char *project, const float *embeddings,
+                                     int dims, int count) {
+    if (!s || !s->db || !embeddings || dims <= 0 || count <= 0) return CBM_STORE_ERR;
+
+    const char *sql =
+        "INSERT OR REPLACE INTO embeddings(node_id, project, embedding, dimensions) "
+        "VALUES(?1, ?2, ?3, ?4)";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+
+    int blob_size = dims * (int)sizeof(float);
+    for (int i = 0; i < count; i++) {
+        sqlite3_reset(stmt);
+        sqlite3_bind_int64(stmt, 1, node_ids[i]);
+        bind_text(stmt, 2, project);
+        sqlite3_bind_blob(stmt, 3, &embeddings[i * dims], blob_size, SQLITE_STATIC);
+        sqlite3_bind_int(stmt, 4, dims);
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return CBM_STORE_OK;
+}
+
+int cbm_store_count_embeddings(cbm_store_t *s, const char *project) {
+    if (!s || !s->db) return 0;
+    const char *sql = project
+        ? "SELECT COUNT(*) FROM embeddings WHERE project = ?1"
+        : "SELECT COUNT(*) FROM embeddings";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    if (project) bind_text(stmt, 1, project);
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+int cbm_store_delete_embeddings(cbm_store_t *s, const char *project) {
+    if (!s || !s->db || !project) return CBM_STORE_ERR;
+    char sql[256];
+    snprintf(sql, sizeof(sql), "DELETE FROM embeddings WHERE project = '%s'", project);
+    return exec_sql(s, sql);
+}
+
+/* Semantic search: find top-k nodes by cosine similarity to query vector.
+ * Returns node IDs and similarity scores, ordered by similarity descending.
+ * Only searches nodes with embeddings in the given project.
+ * Filters to embeddable labels (Function, Method, Class, Interface, Route). */
+int cbm_store_vector_search(cbm_store_t *s, const char *project,
+                            const float *query_vec, int dims, int limit,
+                            cbm_vector_result_t **out, int *out_count) {
+    if (!s || !s->db || !query_vec || dims <= 0 || !out || !out_count) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *out_count = 0;
+
+    /* Brute-force cosine similarity scan using registered cbm_cosine_sim() */
+    const char *sql =
+        "SELECT e.node_id, n.name, n.label, n.qualified_name, n.file_path, "
+        "n.start_line, n.end_line, n.properties, "
+        "cbm_cosine_sim(?1, e.embedding) AS similarity "
+        "FROM embeddings e "
+        "JOIN nodes n ON n.id = e.node_id "
+        "WHERE e.project = ?2 "
+        "AND n.label IN ('Function','Method','Class','Interface','Route') "
+        "AND similarity > 0.3 "
+        "ORDER BY similarity DESC "
+        "LIMIT ?3";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+
+    int blob_size = dims * (int)sizeof(float);
+    sqlite3_bind_blob(stmt, 1, query_vec, blob_size, SQLITE_STATIC);
+    bind_text(stmt, 2, project);
+    sqlite3_bind_int(stmt, 3, limit > 0 ? limit : 50);
+
+    int cap = limit > 0 ? limit : 50;
+    cbm_vector_result_t *results = calloc((size_t)cap, sizeof(cbm_vector_result_t));
+    if (!results) {
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < cap) {
+        cbm_vector_result_t *r = &results[count];
+        r->node_id = sqlite3_column_int64(stmt, 0);
+        r->name = heap_strdup((const char *)sqlite3_column_text(stmt, 1));
+        r->label = heap_strdup((const char *)sqlite3_column_text(stmt, 2));
+        r->qualified_name = heap_strdup((const char *)sqlite3_column_text(stmt, 3));
+        r->file_path = heap_strdup((const char *)sqlite3_column_text(stmt, 4));
+        r->start_line = sqlite3_column_int(stmt, 5);
+        r->end_line = sqlite3_column_int(stmt, 6);
+        r->properties_json = heap_strdup((const char *)sqlite3_column_text(stmt, 7));
+        r->similarity = sqlite3_column_double(stmt, 8);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+
+    *out = results;
+    *out_count = count;
+    return CBM_STORE_OK;
+}
+
+void cbm_store_free_vector_results(cbm_vector_result_t *results, int count) {
+    if (!results) return;
+    for (int i = 0; i < count; i++) {
+        free((void *)results[i].name);
+        free((void *)results[i].label);
+        free((void *)results[i].qualified_name);
+        free((void *)results[i].file_path);
+        free((void *)results[i].properties_json);
+    }
+    free(results);
 }

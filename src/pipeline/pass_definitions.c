@@ -216,9 +216,10 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     int64_t node_id = cbm_gbuf_upsert_node(
         ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
         def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
+    /* Register callable symbols + Interface (for C#/Java INHERITS resolution) */
     if (node_id > 0 && def->label &&
         (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
-         strcmp(def->label, "Class") == 0)) {
+         strcmp(def->label, "Class") == 0 || strcmp(def->label, "Interface") == 0)) {
         cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
