@@ -40,8 +40,11 @@ enum {
 #define SLEN(s) (sizeof(s) - 1)
 #include "mcp/mcp.h"
 #include "store/store.h"
+#include <sqlite3/sqlite3.h>
 #include "cypher/cypher.h"
 #include "pipeline/pipeline.h"
+#include "pipeline/embedding.h"
+#include "store/cross_repo.h"
 #include "cli/cli.h"
 #include "watcher/watcher.h"
 #include "foundation/mem.h"
@@ -264,13 +267,24 @@ static const tool_def_t TOOLS[] = {
     {"search_graph",
      "Search the code knowledge graph for functions, classes, routes, and variables. Use INSTEAD "
      "OF grep/glob when finding code definitions, implementations, or relationships. Returns "
-     "precise results in one call.",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"label\":{\"type\":"
-     "\"string\"},\"name_pattern\":{\"type\":\"string\"},\"qn_pattern\":{\"type\":\"string\"},"
-     "\"file_pattern\":{\"type\":\"string\"},\"relationship\":{\"type\":\"string\"},\"min_degree\":"
-     "{\"type\":\"integer\"},\"max_degree\":{\"type\":\"integer\"},\"exclude_entry_points\":{"
-     "\"type\":\"boolean\"},\"include_connected\":{\"type\":\"boolean\"},\"limit\":{\"type\":"
-     "\"integer\",\"description\":\"Max results. Default: "
+     "precise results in one call. Two modes: (1) query='search terms' for BM25 ranked full-text "
+     "search with structural boosting (recommended for discovery and conceptual search), "
+     "(2) name_pattern='regex' for exact pattern matching.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "\"query\":{\"type\":\"string\",\"description\":\"Natural language or keyword search using "
+     "BM25 full-text ranking. Searches function names, class names, qualified names, and file "
+     "paths. Results ranked by relevance with structural boosting (Functions/Methods +10, "
+     "Routes +8, Classes +5). Filters out noise nodes (File/Folder/Module/Variable). "
+     "Example: 'session management' or 'error handling'. When provided, name_pattern is ignored.\"},"
+     "\"label\":{\"type\":\"string\"},\"name_pattern\":{\"type\":\"string\"},"
+     "\"qn_pattern\":{\"type\":\"string\"},"
+     "\"file_pattern\":{\"type\":\"string\"},\"relationship\":{\"type\":\"string\"},"
+     "\"min_degree\":{\"type\":\"integer\"},\"max_degree\":{\"type\":\"integer\"},"
+     "\"exclude_entry_points\":{\"type\":\"boolean\"},\"include_connected\":{\"type\":"
+     "\"boolean\"},"
+     "\"sort_by\":{\"type\":\"string\",\"description\":\"Sort by: relevance (default with "
+     "query), name, file_path\"},"
+     "\"limit\":{\"type\":\"integer\",\"description\":\"Max results. Default: "
      "unlimited\"},\"offset\":{\"type\":\"integer\",\"default\":0}},\"required\":[\"project\"]}"},
 
     {"query_graph",
@@ -363,6 +377,28 @@ static const tool_def_t TOOLS[] = {
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\",\"items\":{\"type\":"
      "\"object\"}},\"project\":{\"type\":"
      "\"string\"}},\"required\":[\"traces\",\"project\"]}"},
+
+    {"generate_embeddings",
+     "Generate semantic embeddings for code symbols via external embedding server. "
+     "Requires CBM_EMBEDDING_URL environment variable (e.g., http://localhost:11434/v1 for Ollama). "
+     "Embeddings enable hybrid BM25+vector search in search_graph.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "\"force\":{\"type\":\"boolean\",\"default\":false,\"description\":"
+     "\"Re-generate all embeddings even if they already exist\"}},\"required\":[\"project\"]}"},
+
+    {"build_cross_repo_index",
+     "Build unified cross-repo index for cross-repository search, channel matching, and flow tracing. "
+     "Scans all indexed project databases and builds a _cross_repo.db with node stubs, channels, "
+     "and embeddings from all repos.",
+     "{\"type\":\"object\",\"properties\":{}}"},
+
+    {"trace_cross_repo",
+     "Trace message/event channels across repositories. Shows which services produce and consume "
+     "a specific channel, with file-level and function-level detail.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"channel\":{\"type\":\"string\",\"description\":\"Channel name to trace (partial match). "
+     "Omit to list all cross-repo channels.\"},"
+     "\"repo\":{\"type\":\"string\",\"description\":\"Filter to channels involving a specific repo.\"}}}"},
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
@@ -1031,6 +1067,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         return not_indexed;
     }
 
+    char *query = cbm_mcp_get_string_arg(args, "query");
+    char *sort_by = cbm_mcp_get_string_arg(args, "sort_by");
     char *label = cbm_mcp_get_string_arg(args, "label");
     char *name_pattern = cbm_mcp_get_string_arg(args, "name_pattern");
     char *qn_pattern = cbm_mcp_get_string_arg(args, "qn_pattern");
@@ -1043,6 +1081,110 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     int min_degree = cbm_mcp_get_int_arg(args, "min_degree", CBM_NOT_FOUND);
     int max_degree = cbm_mcp_get_int_arg(args, "max_degree", CBM_NOT_FOUND);
 
+    /* BM25 FTS5 search path: when query is provided, use ranked full-text search
+     * instead of SQL LIKE patterns. camelCase splitting is done at index time. */
+    if (query && query[0]) {
+        struct sqlite3 *db = cbm_store_get_db(store);
+        if (!db) goto fallback_search;
+
+        /* Tokenize query: split on whitespace, join with OR */
+        char fts_query[1024];
+        {
+            char tmp[1024];
+            snprintf(tmp, sizeof(tmp), "%s", query);
+            int fq_len = 0;
+            char *tok = strtok(tmp, " \t\n");
+            while (tok && fq_len < (int)sizeof(fts_query) - 20) {
+                if (fq_len > 0) fq_len += snprintf(fts_query + fq_len,
+                    sizeof(fts_query) - (size_t)fq_len, " OR ");
+                fq_len += snprintf(fts_query + fq_len,
+                    sizeof(fts_query) - (size_t)fq_len, "%s", tok);
+                tok = strtok(NULL, " \t\n");
+            }
+            fts_query[fq_len] = '\0';
+        }
+
+        /* BM25 query with label-type structural boosting */
+        char sql[4096];
+        snprintf(sql, sizeof(sql),
+            "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+            "n.file_path, n.start_line, n.end_line, n.properties, "
+            "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.type = 'CALLS') AS in_deg, "
+            "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND e.type = 'CALLS') AS out_deg, "
+            "(bm25(nodes_fts) "
+            " - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
+            "        WHEN n.label IN ('Class','Interface','Type') THEN 5.0 "
+            "        WHEN n.label = 'Route' THEN 8.0 "
+            "        ELSE 0.0 END) AS rank "
+            "FROM nodes_fts "
+            "JOIN nodes n ON n.id = nodes_fts.rowid "
+            "WHERE nodes_fts MATCH ?1"
+            " AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project')"
+            " AND n.project = ?2"
+            " ORDER BY rank LIMIT ?3 OFFSET ?4");
+
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) goto fallback_search;
+
+        sqlite3_bind_text(stmt, 1, fts_query, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, project, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 3, limit > 0 ? limit : 100);
+        sqlite3_bind_int(stmt, 4, offset);
+
+        /* Count total matches */
+        int total = 0;
+        {
+            char count_sql[1024];
+            snprintf(count_sql, sizeof(count_sql),
+                "SELECT COUNT(*) FROM nodes_fts JOIN nodes n ON n.id = nodes_fts.rowid "
+                "WHERE nodes_fts MATCH ?1 AND n.project = ?2 "
+                "AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project')");
+            sqlite3_stmt *cs = NULL;
+            if (sqlite3_prepare_v2(db, count_sql, -1, &cs, NULL) == SQLITE_OK) {
+                sqlite3_bind_text(cs, 1, fts_query, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(cs, 2, project, -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(cs) == SQLITE_ROW) total = sqlite3_column_int(cs, 0);
+                sqlite3_finalize(cs);
+            }
+        }
+
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+        yyjson_mut_obj_add_int(doc, root, "total", total);
+        yyjson_mut_obj_add_str(doc, root, "search_mode", "bm25");
+
+        yyjson_mut_val *results = yyjson_mut_arr(doc);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, item, "name",
+                (const char *)sqlite3_column_text(stmt, 3));
+            yyjson_mut_obj_add_strcpy(doc, item, "qualified_name",
+                (const char *)sqlite3_column_text(stmt, 4));
+            yyjson_mut_obj_add_strcpy(doc, item, "label",
+                (const char *)sqlite3_column_text(stmt, 2));
+            yyjson_mut_obj_add_strcpy(doc, item, "file_path",
+                (const char *)sqlite3_column_text(stmt, 5));
+            yyjson_mut_obj_add_int(doc, item, "start_line", sqlite3_column_int(stmt, 6));
+            yyjson_mut_obj_add_int(doc, item, "end_line", sqlite3_column_int(stmt, 7));
+            yyjson_mut_obj_add_int(doc, item, "in_degree", sqlite3_column_int(stmt, 9));
+            yyjson_mut_obj_add_int(doc, item, "out_degree", sqlite3_column_int(stmt, 10));
+            yyjson_mut_arr_add_val(results, item);
+        }
+        sqlite3_finalize(stmt);
+
+        yyjson_mut_obj_add_val(doc, root, "results", results);
+        char *json = yy_doc_to_str(doc);
+        yyjson_mut_doc_free(doc);
+        free(project); free(label); free(name_pattern); free(qn_pattern);
+        free(file_pattern); free(query); free(sort_by); free(relationship);
+        char *result = cbm_mcp_text_result(json, false);
+        free(json);
+        return result;
+    }
+fallback_search:
+    (void)sort_by; /* used in BM25 path, suppressed in regex path */
+
     if (relationship && !validate_edge_type(relationship)) {
         free(project);
         free(label);
@@ -1050,6 +1192,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         free(qn_pattern);
         free(file_pattern);
         free(relationship);
+        free(query);
+        free(sort_by);
         return cbm_mcp_text_result("relationship must be uppercase letters and underscores", true);
     }
 
@@ -1109,6 +1253,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     free(qn_pattern);
     free(file_pattern);
     free(relationship);
+    free(query);
+    free(sort_by);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
@@ -3033,6 +3179,126 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
+/* ── generate_embeddings handler ─────────────────────────────── */
+
+static char *handle_generate_embeddings(cbm_mcp_server_t *srv, const char *args) {
+    char *project = cbm_mcp_get_string_arg(args, "project");
+    cbm_store_t *store = resolve_store(srv, project);
+    REQUIRE_STORE(store, project);
+
+    if (!cbm_embedding_is_configured()) {
+        free(project);
+        return cbm_mcp_text_result(
+            "{\"error\":\"CBM_EMBEDDING_URL not set. Set to an OpenAI-compatible endpoint.\"}", true);
+    }
+
+    bool force = cbm_mcp_get_bool_arg(args, "force");
+    int existing = cbm_store_count_embeddings(store, project);
+    int generated = cbm_embedding_generate_for_project(store, project, force);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", generated >= 0 ? "success" : "error");
+    yyjson_mut_obj_add_int(doc, root, "generated", generated >= 0 ? generated : 0);
+    yyjson_mut_obj_add_int(doc, root, "existing_before", existing);
+    yyjson_mut_obj_add_int(doc, root, "total_embeddings", cbm_store_count_embeddings(store, project));
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    free(project);
+    char *result = cbm_mcp_text_result(json, generated < 0);
+    free(json);
+    return result;
+}
+
+/* ── build_cross_repo_index handler ─────────────────────────── */
+
+static char *handle_build_cross_repo_index(cbm_mcp_server_t *srv, const char *args) {
+    (void)srv; (void)args;
+    cbm_cross_repo_stats_t stats = cbm_cross_repo_build();
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", stats.repos_scanned >= 0 ? "success" : "error");
+    yyjson_mut_obj_add_int(doc, root, "repos_scanned", stats.repos_scanned);
+    yyjson_mut_obj_add_int(doc, root, "nodes_copied", stats.nodes_copied);
+    yyjson_mut_obj_add_int(doc, root, "channels_copied", stats.channels_copied);
+    yyjson_mut_obj_add_int(doc, root, "embeddings_copied", stats.embeddings_copied);
+    yyjson_mut_obj_add_int(doc, root, "cross_repo_channel_matches", stats.cross_repo_matches);
+    yyjson_mut_obj_add_real(doc, root, "build_time_ms", stats.build_time_ms);
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    char *result = cbm_mcp_text_result(json, stats.repos_scanned < 0);
+    free(json);
+    return result;
+}
+
+/* ── trace_cross_repo handler ────────────────────────────────── */
+
+static char *handle_trace_cross_repo(cbm_mcp_server_t *srv, const char *args) {
+    (void)srv;
+    char *channel = cbm_mcp_get_string_arg(args, "channel");
+
+    cbm_cross_repo_t *cr = cbm_cross_repo_open();
+    if (!cr) {
+        free(channel);
+        return cbm_mcp_text_result(
+            "{\"error\":\"Cross-repo index not built. Run build_cross_repo_index first.\"}", true);
+    }
+
+    cbm_cross_repo_info_t info = {0};
+    cbm_cross_repo_get_info(cr, &info);
+
+    cbm_cross_channel_match_t *matches = NULL;
+    int match_count = 0;
+    cbm_cross_repo_match_channels(cr, channel, &matches, &match_count);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_int(doc, root, "total_repos", info.total_repos);
+    yyjson_mut_obj_add_int(doc, root, "total_cross_repo_channels", info.cross_repo_channel_count);
+    yyjson_mut_obj_add_int(doc, root, "matches", match_count);
+
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < match_count; i++) {
+        cbm_cross_channel_match_t *m = &matches[i];
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, item, "channel", m->channel_name ? m->channel_name : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "transport", m->transport ? m->transport : "");
+
+        yyjson_mut_val *emit = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, emit, "project", m->emit_project ? m->emit_project : "");
+        yyjson_mut_obj_add_strcpy(doc, emit, "file", m->emit_file ? m->emit_file : "");
+        yyjson_mut_obj_add_strcpy(doc, emit, "function", m->emit_function ? m->emit_function : "");
+        yyjson_mut_obj_add_val(doc, item, "emitter", emit);
+
+        yyjson_mut_val *listen = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, listen, "project", m->listen_project ? m->listen_project : "");
+        yyjson_mut_obj_add_strcpy(doc, listen, "file", m->listen_file ? m->listen_file : "");
+        yyjson_mut_obj_add_strcpy(doc, listen, "function", m->listen_function ? m->listen_function : "");
+        yyjson_mut_obj_add_val(doc, item, "listener", listen);
+
+        yyjson_mut_arr_add_val(arr, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "channel_flows", arr);
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    cbm_cross_channel_free(matches, match_count);
+    cbm_cross_repo_info_free(&info);
+    cbm_cross_repo_close(cr);
+    free(channel);
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
+/* ── Tool dispatch ────────────────────────────────────────────── */
+
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
     if (!tool_name) {
         return cbm_mcp_text_result("missing tool name", true);
@@ -3081,6 +3347,15 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "ingest_traces") == 0) {
         return handle_ingest_traces(srv, args_json);
+    }
+    if (strcmp(tool_name, "generate_embeddings") == 0) {
+        return handle_generate_embeddings(srv, args_json);
+    }
+    if (strcmp(tool_name, "build_cross_repo_index") == 0) {
+        return handle_build_cross_repo_index(srv, args_json);
+    }
+    if (strcmp(tool_name, "trace_cross_repo") == 0) {
+        return handle_trace_cross_repo(srv, args_json);
     }
     char msg[CBM_SZ_256];
     snprintf(msg, sizeof(msg), "unknown tool: %s", tool_name);

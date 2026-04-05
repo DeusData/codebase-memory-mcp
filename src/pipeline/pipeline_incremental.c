@@ -271,10 +271,17 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
         persist_hashes(hash_store, project, files, file_count);
 
         /* Rebuild FTS5 index: btree dump bypasses triggers */
-        cbm_store_exec(hash_store, "DELETE FROM nodes_fts;");
+        /* FTS5 rebuild — contentless requires 'delete-all' */
         cbm_store_exec(hash_store,
-            "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-            "SELECT id, cbm_camel_split(name), qualified_name, label, file_path FROM nodes;");
+            "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+        if (cbm_store_exec(hash_store,
+                "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+                "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
+                "FROM nodes;") != 0) {
+            cbm_store_exec(hash_store,
+                "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+                "SELECT id, name, qualified_name, label, file_path FROM nodes;");
+        }
 
         cbm_store_close(hash_store);
     }

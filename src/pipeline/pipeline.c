@@ -794,11 +794,19 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
 
         cbm_store_t *post_store = cbm_store_open_path(db_path);
         if (post_store) {
-            /* FTS5 backfill with camelCase splitting */
-            cbm_store_exec(post_store, "DELETE FROM nodes_fts;");
+            /* FTS5 backfill. Contentless FTS5 requires 'delete-all' command.
+             * Try camelCase splitting first, fall back to plain names. */
             cbm_store_exec(post_store,
-                "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                "SELECT id, cbm_camel_split(name), qualified_name, label, file_path FROM nodes;");
+                "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+            if (cbm_store_exec(post_store,
+                    "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+                    "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
+                    "FROM nodes;") != 0) {
+                /* Fallback: plain names without camelCase splitting */
+                cbm_store_exec(post_store,
+                    "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+                    "SELECT id, name, qualified_name, label, file_path FROM nodes;");
+            }
 
             /* Embedding generation (if configured) */
             if (cbm_embedding_is_configured()) {
