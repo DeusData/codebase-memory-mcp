@@ -39,6 +39,9 @@ int cbm_thread_create(cbm_thread_t *t, size_t stack_size, void *(*fn)(void *), v
 /* Wait for thread to finish. Returns 0 on success. */
 int cbm_thread_join(cbm_thread_t *t);
 
+/* Detach thread so resources are freed on exit. Returns 0 on success. */
+int cbm_thread_detach(cbm_thread_t *t);
+
 /* ── Mutex ────────────────────────────────────────────────────── */
 
 #ifdef _WIN32

@@ -32,6 +32,9 @@ void cbm_http_server_run(cbm_http_server_t *srv);
 /* Check if the server started successfully (listener bound). */
 bool cbm_http_server_is_running(const cbm_http_server_t *srv);
 
+/* Initialize the log ring buffer mutex. Must be called once before any threads. */
+void cbm_ui_log_init(void);
+
 /* Append a log line to the UI ring buffer (called from log hook). */
 void cbm_ui_log_append(const char *line);
 
