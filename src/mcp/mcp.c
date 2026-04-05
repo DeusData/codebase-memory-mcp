@@ -435,9 +435,12 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "Search the code knowledge graph for functions, classes, routes, variables, "
      "and relationships. Use INSTEAD OF grep/glob for code definitions and structure. "
      "Projects are auto-indexed on first query — no manual setup needed. "
-     "Supports Cypher queries via 'cypher' param for complex multi-hop patterns "
-     "(when cypher is set, label/name_pattern/sort_by filters are ignored — use WHERE instead). "
-     "Results sorted by PageRank (structural importance) by default. "
+     "3 modes via dispatch params: "
+     "(1) cypher=<query>: Cypher multi-hop query. "
+     "(2) search_in='source': grep source files for text patterns. "
+     "(3) default: graph attribute search by label/name_pattern/pattern/sort_by. "
+     "pattern= searches name OR qualified_name (OR-match). "
+     "Results sorted by PageRank by default. "
      "mode=summary returns aggregate counts (results_suppressed=true). "
      "Read codebase://schema for node labels, edge types, and Cypher examples. "
      "Read codebase://architecture for key functions and graph overview.",
@@ -465,7 +468,19 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "\"exclude_entry_points\":{\"type\":\"boolean\"},"
      "\"include_connected\":{\"type\":\"boolean\"},"
      "\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
-     "\"description\":\"Glob patterns for file paths to exclude (e.g. [\\\"tests/**\\\",\\\"scripts/**\\\"])\"}"
+     "\"description\":\"Glob patterns for file paths to exclude (e.g. [\\\"tests/**\\\",\\\"scripts/**\\\"])\"},"
+     "\"search_in\":{\"type\":\"string\",\"enum\":[\"graph\",\"source\"],\"default\":\"graph\","
+     "\"description\":\"'graph' (default): search indexed symbols. 'source': grep raw source files.\"},"
+     "\"pattern\":{\"type\":\"string\",\"description\":\"OR-search: matches symbol name OR qualified name. "
+     "Also used as the grep pattern when search_in='source'. Glob wildcards auto-convert to regex.\"},"
+     "\"case_sensitive\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"Case-sensitive name_pattern/qn_pattern/pattern matching (default: insensitive).\"},"
+     "\"regex\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"When search_in='source': treat pattern as regex (default: literal text).\"},"
+     "\"summary\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"Return aggregate counts by label and file only. Alias for mode='summary'.\"},"
+     "\"max_rows\":{\"type\":\"integer\","
+     "\"description\":\"Max row scan for Cypher queries (cypher mode only).\"}"
      "}}"},
 
     {"trace_call_path",
@@ -479,6 +494,8 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "{\"type\":\"object\",\"properties\":{"
      "\"function_name\":{\"type\":\"string\",\"description\":\"Function name to trace. "
      "Case-insensitive fallback if exact match not found.\"},"
+     "\"qualified_name\":{\"type\":\"string\",\"description\":\"Exact qualified name from search results "
+     "(e.g. 'proj.src.module.func'). Pass instead of function_name for cross-tool chaining.\"},"
      "\"project\":{\"type\":\"string\"},"
      "\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\",\"both\"]},"
      "\"depth\":{\"type\":\"integer\",\"default\":3},"
@@ -487,7 +504,7 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "\"edge_types\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},"
      "\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
      "\"description\":\"Glob patterns for file paths to exclude from trace results\"}"
-     "},\"required\":[\"function_name\"]}"},
+     "},\"description\":\"Pass function_name OR qualified_name (at least one required).\"}"},
 
     {"get_code",
      "Get source code for a function, class, or symbol by qualified name. "
@@ -501,7 +518,9 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"signature\",\"head_tail\"]},"
      "\"max_lines\":{\"type\":\"integer\"},"
      "\"auto_resolve\":{\"type\":\"boolean\"},"
-     "\"include_neighbors\":{\"type\":\"boolean\"}"
+     "\"include_neighbors\":{\"type\":\"boolean\"},"
+     "\"compact\":{\"type\":\"boolean\",\"default\":true,"
+     "\"description\":\"Omit name when it equals last segment of qualified_name (default: compact config).\"}"
      "},\"required\":[\"qualified_name\"]}"},
 };
 static const int STREAMLINED_TOOL_COUNT = sizeof(STREAMLINED_TOOLS) / sizeof(STREAMLINED_TOOLS[0]);
@@ -1085,7 +1104,8 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
                 return cbm_mcp_text_result(                                                       \
                     "{\"error\":\"auto-indexing failed for this project\","                        \
                     "\"detail\":\"The pipeline failed. Check file permissions and project size.\"," \
-                    "\"fix\":\"Run index_repository explicitly with repo_path for detailed errors.\"}", \
+                    "\"fix\":\"Enable classic tools: set env CBM_TOOL_MODE=classic then call index_repository. " \
+                    "Or retry by passing project=\\\"/path/to/repo\\\" explicitly.\"}", \
                     true);                                                                        \
             }                                                                                     \
             free(project);                                                                        \
@@ -1118,9 +1138,16 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_val *ctx = yyjson_mut_obj(doc);
 
     if (!store) {
-        yyjson_mut_obj_add_str(doc, ctx, "status", "not_indexed");
-        yyjson_mut_obj_add_str(doc, ctx, "hint",
-            "Project not yet indexed. Use index_repository or set auto_index=true.");
+        if (srv->session_root[0]) {
+            yyjson_mut_obj_add_str(doc, ctx, "status", "auto_indexing");
+            yyjson_mut_obj_add_str(doc, ctx, "hint",
+                "Auto-indexing your project — retry this query in a moment. "
+                "Pass project='/path/to/repo' explicitly to trigger immediately.");
+        } else {
+            yyjson_mut_obj_add_str(doc, ctx, "status", "not_indexed");
+            yyjson_mut_obj_add_str(doc, ctx, "hint",
+                "No project path detected. Pass project='/path/to/repo' to index and search.");
+        }
         yyjson_mut_obj_add_val(doc, root, "_context", ctx);
         return;
     }
@@ -1652,9 +1679,39 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             cbm_regfree(&re);
         }
     }
+    /* NEW: unified pattern — OR search across name AND qualified_name */
+    char *unified_pattern = cbm_mcp_get_string_arg(args, "pattern");
+    if (unified_pattern) {
+        cbm_regex_t re;
+        if (cbm_regcomp(&re, unified_pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB) != 0) {
+            char *converted = glob_to_regex(unified_pattern);
+            if (converted && cbm_regcomp(&re, converted, CBM_REG_EXTENDED | CBM_REG_NOSUB) == 0) {
+                cbm_regfree(&re);
+                free(unified_pattern);
+                unified_pattern = converted;
+            } else {
+                free(converted);
+                char errbuf[512];
+                snprintf(errbuf, sizeof(errbuf),
+                    "{\"error\":\"invalid regex in pattern: '%s'\","
+                    "\"hint\":\"Use regex syntax: '.*tool.*' instead of '*tool*'\"}", unified_pattern);
+                free(label); free(name_pattern); free(qn_pattern);
+                free(unified_pattern); free(pe.value);
+                return cbm_mcp_text_result(errbuf, true);
+            }
+        } else {
+            cbm_regfree(&re);
+        }
+    }
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
     char *relationship = cbm_mcp_get_string_arg(args, "relationship");
     char *sort_by = cbm_mcp_get_string_arg(args, "sort_by");
+    /* Config default: heap_strdup REQUIRED — cbm_config_get returns cfg->get_buf (internal buffer),
+     * NOT a heap pointer. free(sort_by) at all exits would corrupt config's buffer without strdup. */
+    if (!sort_by && srv && srv->config) {
+        const char *cfg_sort = cbm_config_get(srv->config, "default_sort_by", NULL);
+        if (cfg_sort && cfg_sort[0]) sort_by = heap_strdup(cfg_sort);
+    }
     /* F6: validate sort_by enum — O(1) string comparisons */
     if (sort_by && strcmp(sort_by, "relevance") != 0 && strcmp(sort_by, "name") != 0 &&
         strcmp(sort_by, "degree") != 0 && strcmp(sort_by, "calls") != 0 &&
@@ -1663,8 +1720,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         snprintf(errbuf, sizeof(errbuf),
             "{\"error\":\"invalid sort_by '%s'\","
             "\"hint\":\"Valid values: relevance, name, degree, calls, linkrank\"}", sort_by);
-        free(label); free(name_pattern); free(qn_pattern); free(file_pattern);
-        free(relationship); free(sort_by); free(pe.value);
+        free(label); free(name_pattern); free(qn_pattern); free(unified_pattern);
+        free(file_pattern); free(relationship); free(sort_by); free(pe.value);
         return cbm_mcp_text_result(errbuf, true);
     }
     int cfg_search_limit = cbm_config_get_int(srv->config, CBM_CONFIG_SEARCH_LIMIT,
@@ -1673,25 +1730,34 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     /* F4: treat limit<=0 as default */
     if (limit <= 0) limit = cfg_search_limit;
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
-    bool compact = cbm_mcp_get_bool_arg_default(args, "compact", true);
+    bool cfg_compact = cbm_config_get_bool(srv->config, "compact", true);
+    bool compact = cbm_mcp_get_bool_arg_default(args, "compact", cfg_compact);
     char *search_mode = cbm_mcp_get_string_arg(args, "mode");
+    /* summary=true alias: avoids mode enum collision with get_code (full|sig|head_tail) */
+    if (!search_mode && cbm_mcp_get_bool_arg(args, "summary")) {
+        search_mode = heap_strdup("summary"); /* heap_strdup: freed at mode error and normal exit */
+    }
     /* F7: validate mode enum — O(1) */
     if (search_mode && strcmp(search_mode, "full") != 0 && strcmp(search_mode, "summary") != 0) {
         char errbuf[256];
         snprintf(errbuf, sizeof(errbuf),
             "{\"error\":\"invalid mode '%s'\","
             "\"hint\":\"Valid values: full, summary\"}", search_mode);
-        free(label); free(name_pattern); free(qn_pattern); free(file_pattern);
+        free(label); free(name_pattern); free(qn_pattern); free(unified_pattern);
+ free(file_pattern);
+
         free(relationship); free(sort_by); free(search_mode); free(pe.value);
         return cbm_mcp_text_result(errbuf, true);
     }
+    bool case_sensitive = cbm_mcp_get_bool_arg(args, "case_sensitive");
     int min_degree = cbm_mcp_get_int_arg(args, "min_degree", -1);
     int max_degree = cbm_mcp_get_int_arg(args, "max_degree", -1);
     bool exclude_entry_points = cbm_mcp_get_bool_arg_default(args, "exclude_entry_points", false);
     bool include_connected = cbm_mcp_get_bool_arg_default(args, "include_connected", false);
     /* Default true: prefix match includes myproject.dep.* sub-projects.
      * false: forces exact match (only effective when project set + not glob mode). */
-    bool include_dependencies = cbm_mcp_get_bool_arg_default(args, "include_dependencies", true);
+    bool cfg_inc_deps = cbm_config_get_bool(srv->config, "default_include_dependencies", true);
+    bool include_dependencies = cbm_mcp_get_bool_arg_default(args, "include_dependencies", cfg_inc_deps);
 
     /* Summary mode needs all results for accurate aggregation */
     bool is_summary = search_mode && strcmp(search_mode, "summary") == 0;
@@ -1708,6 +1774,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     params.label = label;
     params.name_pattern = name_pattern;
     params.qn_pattern = qn_pattern;
+    params.pattern = unified_pattern;
+    params.case_sensitive = case_sensitive;
     params.file_pattern = file_pattern;
     params.relationship = relationship;
     params.sort_by = sort_by;
@@ -1903,6 +1971,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     free(label);
     free(name_pattern);
     free(qn_pattern);
+    free(unified_pattern);
     free(file_pattern);
     free(relationship);
     free(search_mode);
@@ -2286,6 +2355,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
 
 static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *func_name = cbm_mcp_get_string_arg(args, "function_name");
+    char *qn_input = cbm_mcp_get_string_arg(args, "qualified_name"); /* cross-tool chaining */
     char *raw_project = cbm_mcp_get_string_arg(args, "project");
     project_expand_t pe = {0};
     cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
@@ -2297,17 +2367,22 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     int cfg_trace_max = cbm_config_get_int(srv->config, CBM_CONFIG_TRACE_MAX_RESULTS,
                                             CBM_DEFAULT_TRACE_MAX_RESULTS);
     int max_results = cbm_mcp_get_int_arg(args, "max_results", cfg_trace_max);
-    bool compact = cbm_mcp_get_bool_arg_default(args, "compact", true);
+    bool cfg_compact_t = cbm_config_get_bool(srv->config, "compact", true);
+    bool compact = cbm_mcp_get_bool_arg_default(args, "compact", cfg_compact_t);
 
-    if (!func_name) {
+
+
+    if (!func_name && !qn_input) {
         free(project);
         free(direction);
+        free(qn_input);
         return cbm_mcp_text_result(
-            "{\"error\":\"function_name is required\","
+            "{\"error\":\"function_name or qualified_name is required\","
             "\"hint\":\"Pass the name of a function to trace, e.g. {\\\"function_name\\\":\\\"main\\\"}\"}", true);
     }
     if (!store) {
         free(func_name);
+        free(qn_input);
         free(project);
         free(direction);
         return cbm_mcp_text_result(
@@ -2322,6 +2397,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             "{\"error\":\"invalid direction '%s'\","
             "\"hint\":\"Valid values: inbound, outbound, both\"}", direction);
         free(func_name);
+        free(qn_input);
         free(project);
         free(direction);
         return cbm_mcp_text_result(errbuf, true);
@@ -2330,10 +2406,27 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         direction = heap_strdup("both");
     }
 
+    /* QN-first lookup: if qualified_name provided, resolve to node directly */
+    cbm_node_t *qn_node = NULL;
+    if (qn_input && store) {
+        cbm_node_t qn_tmp = {0};
+        if (cbm_store_find_node_by_qn(store, project, qn_input, &qn_tmp) == 0 && qn_tmp.id > 0) {
+            qn_node = calloc(1, sizeof(cbm_node_t));
+            if (qn_node) *qn_node = qn_tmp;
+        }
+    }
+
     /* Find the node by name */
     cbm_node_t *nodes = NULL;
     int node_count = 0;
-    cbm_store_find_nodes_by_name(store, project, func_name, &nodes, &node_count);
+    if (qn_node) {
+        /* Use QN-resolved node directly */
+        nodes = qn_node;
+        node_count = 1;
+    } else {
+        cbm_store_find_nodes_by_name(store, project,
+            func_name ? func_name : (qn_input ? qn_input : ""), &nodes, &node_count);
+    }
 
     if (node_count == 0) {
         /* Fallback: case-insensitive substring search via cbm_store_search.
@@ -2358,11 +2451,13 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         char errbuf[512];
         snprintf(errbuf, sizeof(errbuf),
             "{\"error\":\"function not found: '%s'\","
-            "\"hint\":\"Use search_code_graph with name_pattern to find similar symbols.\"}", func_name);
+            "\"hint\":\"Use search_code_graph with name_pattern to find similar symbols.\"}",
+            func_name ? func_name : (qn_input ? qn_input : ""));
         free(func_name);
+        free(qn_input);
         free(project);
         free(direction);
-        cbm_store_free_nodes(nodes, 0);
+        cbm_store_free_nodes(nodes, node_count);
         return cbm_mcp_text_result(errbuf, true);
     }
 
@@ -2524,6 +2619,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_store_free_nodes(nodes, node_count);
     free(func_name);
+    free(qn_input);
     free(project);
     free(direction);
     free_string_array(edge_types_user); /* NULL-safe; reuses existing helper (mcp.c:663) */
@@ -3003,7 +3099,8 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
             eff_project = srv->current_project; /* fallback: last-used project */
         }
     }
-    bool compact = cbm_mcp_get_bool_arg_default(args, "compact", true);
+    bool cfg_compact_g = cbm_config_get_bool(srv->config, "compact", true);
+    bool compact = cbm_mcp_get_bool_arg_default(args, "compact", cfg_compact_g);
     bool auto_resolve = cbm_mcp_get_bool_arg(args, "auto_resolve");
     bool include_neighbors = cbm_mcp_get_bool_arg(args, "include_neighbors");
     int cfg_max_lines = cbm_config_get_int(srv->config, CBM_CONFIG_SNIPPET_MAX_LINES,
@@ -3798,6 +3895,11 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
             free(cypher);
             return handle_query_graph(srv, args_json);
         }
+        /* Check if search_in="source" → route to search_code handler */
+        char *si = cbm_mcp_get_string_arg(args_json, "search_in");
+        bool src = si && strcmp(si, "source") == 0;
+        free(si);
+        if (src) return handle_search_code(srv, args_json);
         return handle_search_graph(srv, args_json);
     }
     if (strcmp(tool_name, "get_code") == 0) {

@@ -1891,6 +1891,21 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "list_projects, detect_changes, manage_adr, etc. "
      "You can also enable individual classic tools without switching modes: "
      "config set tool_index_repository true"},
+    {"compact", "true", "CBM_COMPACT", "Tools",
+     "Default compact output for search_code_graph, trace_call_path, and get_code",
+     "true|false",
+     "true (default): omits name when equal to last qn segment, empty label/file, degree=0. "
+     "Per-call compact= param overrides. false for programmatic output parsing."},
+    {"default_sort_by", "relevance", NULL, "Tools",
+     "Default sort for search_code_graph when sort_by not specified",
+     "relevance|name|degree|calls|linkrank",
+     "relevance = PageRank structural importance. calls = most direct calls. "
+     "Set 'calls' for call-density analysis workflows."},
+    {"default_include_dependencies", "true", NULL, "Tools",
+     "Default include_dependencies for search_code_graph",
+     "true|false",
+     "false = restrict to project code only (exclude dep sub-projects). "
+     "Set false for single-project focus workflows."},
     /* ── PageRank ── */
     {"pagerank_max_iter", "20", NULL, "PageRank",
      "Max iterations for PageRank algorithm before stopping (more = more accurate convergence)",

@@ -105,6 +105,7 @@ typedef struct {
     const char *label;            /* NULL = any label */
     const char *name_pattern;     /* regex on name, NULL = any */
     const char *qn_pattern;       /* regex on qualified_name, NULL = any */
+    const char *pattern;          /* OR-search: matches name AND qualified_name, NULL = any */
     const char *file_pattern;     /* glob on file_path, NULL = any */
     const char *relationship;     /* edge type filter, NULL = any */
     const char *direction;        /* "inbound" / "outbound" / "any", NULL = any */
