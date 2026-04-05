@@ -471,6 +471,9 @@ static int parse_props(parser_t *p, cbm_prop_filter_t **out, int *count) {
     int cap = CYP_INIT_CAP4;
     int n = 0;
     cbm_prop_filter_t *arr = malloc(cap * sizeof(cbm_prop_filter_t));
+    if (!arr) {
+        return CBM_NOT_FOUND;
+    }
 
     while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
         const cbm_token_t *key = expect(p, TOK_IDENT);
@@ -571,6 +574,9 @@ static int parse_rel_types(parser_t *p, cbm_rel_pattern_t *out) {
     int cap = CYP_INIT_CAP4;
     int n = 0;
     const char **types = malloc(cap * sizeof(const char *));
+    if (!types) {
+        return CBM_NOT_FOUND;
+    }
 
     const cbm_token_t *t = expect(p, TOK_IDENT);
     if (!t) {
@@ -764,6 +770,12 @@ static cbm_expr_t *parse_in_list(parser_t *p, cbm_condition_t *c) {
     int vcap = CYP_INIT_CAP8;
     int vn = 0;
     const char **vals = malloc(vcap * sizeof(const char *));
+    if (!vals) {
+        free((void *)c->variable);
+        free((void *)c->property);
+        free((void *)c->op);
+        return NULL;
+    }
     while (!check(p, TOK_RBRACKET) && !check(p, TOK_EOF)) {
         if (vn > 0) {
             match(p, TOK_COMMA);
@@ -1063,8 +1075,15 @@ static const char *parse_value_literal(parser_t *p) {
 static cbm_case_expr_t *parse_case_expr(parser_t *p) {
     /* CASE already consumed */
     cbm_case_expr_t *kase = calloc(CBM_ALLOC_ONE, sizeof(cbm_case_expr_t));
+    if (!kase) {
+        return NULL;
+    }
     int bcap = CYP_INIT_CAP4;
     kase->branches = malloc(bcap * sizeof(cbm_case_branch_t));
+    if (!kase->branches) {
+        free(kase);
+        return NULL;
+    }
 
     while (check(p, TOK_WHEN)) {
         advance(p);

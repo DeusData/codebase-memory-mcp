@@ -142,14 +142,17 @@ static int g_log_count = 0;
 static cbm_mutex_t g_log_mutex;
 static atomic_int g_log_mutex_init = 0;
 
+/* Must be called once before any threads are created. */
+void cbm_ui_log_init(void) {
+    if (!atomic_exchange(&g_log_mutex_init, 1)) {
+        cbm_mutex_init(&g_log_mutex);
+    }
+}
+
 /* Called from a log hook — appends a line to the ring buffer (thread-safe) */
 void cbm_ui_log_append(const char *line) {
-    if (!line)
+    if (!line || !atomic_load(&g_log_mutex_init))
         return;
-    if (!atomic_load(&g_log_mutex_init)) {
-        cbm_mutex_init(&g_log_mutex);
-        atomic_store(&g_log_mutex_init, 1);
-    }
     cbm_mutex_lock(&g_log_mutex);
     snprintf(g_log_ring[g_log_head], LOG_LINE_MAX, "%s", line);
     g_log_head = (g_log_head + 1) % LOG_RING_SIZE;
@@ -791,6 +794,7 @@ static void handle_index_start(struct mg_connection *c, struct mg_http_message *
         mg_http_reply(c, 500, g_cors_json, "{\"error\":\"thread creation failed\"}");
         return;
     }
+    cbm_thread_detach(&tid); /* Don't leak thread handle */
 
     mg_http_reply(c, 202, g_cors_json, "{\"status\":\"indexing\",\"slot\":%d,\"path\":\"%s\"}",
                   slot, job->root_path);
