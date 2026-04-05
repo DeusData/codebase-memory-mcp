@@ -1261,9 +1261,9 @@ static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws
             char dp[CBM_SZ_256];
             snprintf(dp, sizeof(dp), "{\"decorator\":\"%s\"}", def->decorators[dc]);
             cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, dn->id, "DECORATES", dp);
-            /* Ensure a CALLS edge exists so decorator appears in reference queries.
-             * Use "{}" to avoid clobbering richer metadata from pass_calls. */
-            cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, dn->id, "CALLS", "{}");
+            /* Ensure a reference-style edge exists so the decorator appears in queries
+             * without being misclassified as a real call by downstream passes. */
+            cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, dn->id, "USAGE", "{}");
             ws->semantic_resolved++;
         }
     }
