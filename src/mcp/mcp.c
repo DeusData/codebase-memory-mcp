@@ -470,7 +470,9 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
      "\"description\":\"Glob patterns for file paths to exclude (e.g. [\\\"tests/**\\\",\\\"scripts/**\\\"])\"},"
      "\"search_in\":{\"type\":\"string\",\"enum\":[\"graph\",\"source\"],\"default\":\"graph\","
-     "\"description\":\"'graph' (default): search indexed symbols. 'source': grep raw source files.\"},"
+     "\"description\":\"'graph' (default): search indexed symbols — returns {total,results:[{qualified_name,label,...}]}. "
+     "'source': grep raw source files — returns {matches:[{file,line,content}],count}. "
+     "Use 'source' for string literals, error messages, and text not in the symbol graph.\"},"
      "\"pattern\":{\"type\":\"string\",\"description\":\"OR-search: matches symbol name OR qualified name. "
      "Also used as the grep pattern when search_in='source'. Glob wildcards auto-convert to regex.\"},"
      "\"case_sensitive\":{\"type\":\"boolean\",\"default\":false,"
@@ -1752,9 +1754,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             "{\"error\":\"invalid mode '%s'\","
             "\"hint\":\"Valid values: full, summary\"}", search_mode);
         free(label); free(name_pattern); free(qn_pattern); free(unified_pattern);
- free(file_pattern);
-
-        free(relationship); free(sort_by); free(search_mode); free(pe.value);
+        free(file_pattern); free(relationship); free(sort_by); free(search_mode); free(pe.value);
         return cbm_mcp_text_result(errbuf, true);
     }
     bool case_sensitive = cbm_mcp_get_bool_arg(args, "case_sensitive");
@@ -2361,6 +2361,9 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+/* Forward declaration: defined after handle_trace_call_path */
+static void free_node_contents(cbm_node_t *n);
+
 static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *func_name = cbm_mcp_get_string_arg(args, "function_name");
     char *qn_input = cbm_mcp_get_string_arg(args, "qualified_name"); /* cross-tool chaining */
@@ -2420,7 +2423,11 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         cbm_node_t qn_tmp = {0};
         if (cbm_store_find_node_by_qn(store, project, qn_input, &qn_tmp) == 0 && qn_tmp.id > 0) {
             qn_node = calloc(1, sizeof(cbm_node_t));
-            if (qn_node) *qn_node = qn_tmp;
+            if (qn_node) {
+                *qn_node = qn_tmp;  /* shallow copy; ownership of heap fields transferred */
+            } else {
+                free_node_contents(&qn_tmp);  /* OOM: free fields to avoid leak */
+            }
         }
     }
 
@@ -2459,10 +2466,18 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     }
     if (node_count == 0) {
         char errbuf[512];
-        snprintf(errbuf, sizeof(errbuf),
-            "{\"error\":\"function not found: '%s'\","
-            "\"hint\":\"Use search_code_graph with name_pattern to find similar symbols.\"}",
-            func_name ? func_name : (qn_input ? qn_input : ""));
+        if (qn_input && !func_name) {
+            snprintf(errbuf, sizeof(errbuf),
+                "{\"error\":\"function not found for qualified_name: '%s'\","
+                "\"hint\":\"Use search_code_graph with pattern= to find the correct qualified_name, "
+                "then pass it here.\"}",
+                qn_input);
+        } else {
+            snprintf(errbuf, sizeof(errbuf),
+                "{\"error\":\"function not found: '%s'\","
+                "\"hint\":\"Use search_code_graph with name_pattern to find similar symbols.\"}",
+                func_name ? func_name : "");
+        }
         free(func_name);
         free(qn_input);
         free(project);

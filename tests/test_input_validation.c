@@ -700,6 +700,96 @@ TEST(trace_accepts_qualified_name_param) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  pattern= glob wildcard auto-converts to regex (*foo* → .*foo.*)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(pattern_glob_wildcards_auto_convert) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* "*foo*" is not valid regex but valid glob — should auto-convert and find "foo" node */
+    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph",
+                                    "{\"pattern\":\"*foo*\",\"limit\":5}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"results\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  pattern= invalid regex that can't be salvaged returns error
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(pattern_invalid_regex_returns_error) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* "[invalid" is not valid regex and not a glob — should return error */
+    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph",
+                                    "{\"pattern\":\"[invalid\",\"limit\":5}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "invalid regex"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  trace: when both function_name AND qualified_name given, QN takes
+ *  priority (QN-first lookup runs before name-based lookup)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(trace_qn_takes_priority_over_function_name) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* Pass a valid QN and a non-existent function_name.
+     * QN lookup should find "foo" and succeed; function_name is ignored. */
+    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+        "{\"qualified_name\":\"validation-test.test.foo\","
+        "\"function_name\":\"does_not_exist_anywhere\","
+        "\"project\":\"validation-test\"}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    /* QN lookup finds "foo" → no error, trace succeeds */
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  trace: qualified_name not found returns actionable error hint
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(trace_qn_not_found_returns_specific_hint) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* Pass a QN that doesn't exist — should get specific hint about using pattern= */
+    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+        "{\"qualified_name\":\"no-such.project.func\","
+        "\"project\":\"validation-test\"}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"error\""));
+    /* Should mention qualified_name in error, not generic function_name hint */
+    ASSERT_NOT_NULL(strstr(resp, "qualified_name"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  Regression: classic tool names still work
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -752,5 +842,9 @@ void suite_input_validation(void) {
     RUN_TEST(config_compact_default_false);
     RUN_TEST(config_default_sort_by_calls);
     RUN_TEST(trace_accepts_qualified_name_param);
+    RUN_TEST(pattern_glob_wildcards_auto_convert);
+    RUN_TEST(pattern_invalid_regex_returns_error);
+    RUN_TEST(trace_qn_takes_priority_over_function_name);
+    RUN_TEST(trace_qn_not_found_returns_specific_hint);
     RUN_TEST(regression_trace_call_path_tool_name_still_works);
 }
