@@ -497,12 +497,16 @@ mkdir -p "$FAKE_HOME/.config/opencode"
 if [ "$(uname -s)" = "Darwin" ]; then
   mkdir -p "$FAKE_HOME/Library/Application Support/Zed"
   mkdir -p "$FAKE_HOME/Library/Application Support/Code/User"
+  mkdir -p "$FAKE_HOME/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code/settings"
+elif [[ "${BINARY:-}" == *.exe ]]; then
+  mkdir -p "$FAKE_HOME/AppData/Local/Zed"
+  mkdir -p "$FAKE_HOME/AppData/Roaming/Code/User"
+  mkdir -p "$FAKE_HOME/AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code/settings"
 else
   mkdir -p "$FAKE_HOME/.config/zed"
   mkdir -p "$FAKE_HOME/.config/Code/User"
+  mkdir -p "$FAKE_HOME/.config/Code/User/globalStorage/kilocode.kilo-code/settings"
 fi
-# KiloCode detection always uses ~/.config/ path (even on macOS)
-mkdir -p "$FAKE_HOME/.config/Code/User/globalStorage/kilocode.kilo-code/settings"
 mkdir -p "$FAKE_HOME/.local/bin"
 # Copy binary with correct name for platform
 if [[ "$BINARY" == *.exe ]]; then
@@ -520,8 +524,14 @@ echo '{"existingKey": true}' > "$FAKE_HOME/.claude.json"
 echo '{"existingKey": true}' > "$FAKE_HOME/.gemini/settings.json"
 printf '[existing_section]\nline_from_user = true\n' > "$FAKE_HOME/.codex/config.toml"
 
-# Run install
-HOME="$FAKE_HOME" PATH="$FAKE_HOME/.local/bin:$PATH" "$BINARY" install -y 2>&1 || true
+# Run install — override platform config dirs so cbm_app_config_dir() and
+# cbm_app_local_dir() resolve to FAKE_HOME paths on all platforms.
+HOME="$FAKE_HOME" \
+  XDG_CONFIG_HOME="$FAKE_HOME/.config" \
+  APPDATA="$FAKE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$FAKE_HOME/AppData/Local" \
+  PATH="$FAKE_HOME/.local/bin:$PATH" \
+  "$BINARY" install -y 2>&1 || true
 
 # Helper for JSON validation (pipe file to python — avoids MSYS2 path translation issues)
 json_get() { cat "$1" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print($2)" 2>/dev/null || echo ""; }
@@ -633,6 +643,8 @@ echo "OK 8m: Gemini instructions"
 # 8n: Zed MCP
 if [ "$(uname -s)" = "Darwin" ]; then
   ZED_CFG="$FAKE_HOME/Library/Application Support/Zed/settings.json"
+elif [[ "$BINARY" == *.exe ]]; then
+  ZED_CFG="$FAKE_HOME/AppData/Local/Zed/settings.json"
 else
   ZED_CFG="$FAKE_HOME/.config/zed/settings.json"
 fi
@@ -689,8 +701,14 @@ else
   echo "SKIP 8s: Aider not detected (binary not on PATH)"
 fi
 
-# 8t: KiloCode MCP (detection + install both use ~/.config/ on all platforms)
-KILO_CFG="$FAKE_HOME/.config/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json"
+# 8t: KiloCode MCP
+if [ "$(uname -s)" = "Darwin" ]; then
+  KILO_CFG="$FAKE_HOME/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json"
+elif [[ "$BINARY" == *.exe ]]; then
+  KILO_CFG="$FAKE_HOME/AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json"
+else
+  KILO_CFG="$FAKE_HOME/.config/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json"
+fi
 CMD=$(json_get "$KILO_CFG" "d['mcpServers']['codebase-memory-mcp']['command']")
 if ! path_match "$CMD" "$SELF_PATH"; then
   echo "FAIL 8t: KiloCode command='$CMD'"
@@ -708,6 +726,8 @@ echo "OK 8u: KiloCode instructions"
 # 8v: VS Code MCP
 if [ "$(uname -s)" = "Darwin" ]; then
   VSCODE_CFG="$FAKE_HOME/Library/Application Support/Code/User/mcp.json"
+elif [[ "$BINARY" == *.exe ]]; then
+  VSCODE_CFG="$FAKE_HOME/AppData/Roaming/Code/User/mcp.json"
 else
   VSCODE_CFG="$FAKE_HOME/.config/Code/User/mcp.json"
 fi
@@ -726,21 +746,24 @@ if ! path_match "$CMD" "$SELF_PATH"; then
 fi
 echo "OK 8w: OpenClaw MCP"
 
-# 8x-y: Skills
-for SKILL_NAME in codebase-memory-exploring codebase-memory-tracing codebase-memory-quality codebase-memory-reference; do
-  SKILL_FILE="$FAKE_HOME/.claude/skills/$SKILL_NAME/SKILL.md"
-  if [ ! -s "$SKILL_FILE" ]; then
-    echo "FAIL 8x: skill $SKILL_NAME missing or empty"
-    exit 1
-  fi
-done
-echo "OK 8x-y: all 4 skills installed"
+# 8x: Consolidated skill (old 4-skill dirs cleaned up, replaced by 1)
+SKILL_FILE="$FAKE_HOME/.claude/skills/codebase-memory/SKILL.md"
+if [ ! -s "$SKILL_FILE" ]; then
+  echo "FAIL 8x: skill codebase-memory missing or empty"
+  exit 1
+fi
+echo "OK 8x: skill installed"
 
 echo ""
 echo "=== Phase 9: agent config uninstall E2E ==="
 
 # Run uninstall (same FAKE_HOME with all configs present)
-HOME="$FAKE_HOME" PATH="$FAKE_HOME/.local/bin:$PATH" "$BINARY" uninstall -y -n 2>&1 || true
+HOME="$FAKE_HOME" \
+  XDG_CONFIG_HOME="$FAKE_HOME/.config" \
+  APPDATA="$FAKE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$FAKE_HOME/AppData/Local" \
+  PATH="$FAKE_HOME/.local/bin:$PATH" \
+  "$BINARY" uninstall -y -n 2>&1 || true
 
 # 9a-b: Claude Code MCP removed but existing keys preserved
 if cat "$FAKE_HOME/.claude.json" 2>/dev/null | python3 -c "
@@ -835,8 +858,8 @@ else
   exit 1
 fi
 
-# 9l: Skills removed
-if [ -d "$FAKE_HOME/.claude/skills/codebase-memory-exploring" ]; then
+# 9l: Skills removed (consolidated skill dir)
+if [ -d "$FAKE_HOME/.claude/skills/codebase-memory" ]; then
   echo "FAIL 9l: skills not removed"
   exit 1
 fi

@@ -1,0 +1,68 @@
+# Reusable: security-static + CodeQL gate.
+# Runs independently from lint/test/build — does not block the main pipeline.
+# Affects overall workflow success status.
+name: Security Gate
+
+on:
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+jobs:
+  security-static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: "Layer 1: Static allow-list audit"
+        run: scripts/security-audit.sh
+      - name: "Layer 6: UI security audit"
+        run: scripts/security-ui.sh
+      - name: "Layer 8: Vendored dependency integrity"
+        run: scripts/security-vendored.sh
+
+  codeql-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Wait for CodeQL on current commit (max 45 min)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CURRENT_SHA="${{ github.sha }}"
+          echo "Waiting for CodeQL to complete on $CURRENT_SHA..."
+          for attempt in $(seq 1 90); do
+            LATEST=$(gh api repos/${{ github.repository }}/actions/workflows/codeql.yml/runs?per_page=5 \
+              --jq '.workflow_runs[] | select(.head_sha == "'"$CURRENT_SHA"'") | "\(.conclusion) \(.status)"' 2>/dev/null | head -1 || echo "")
+            if [ -z "$LATEST" ]; then
+              echo "  $attempt/90: no run yet..."; sleep 30; continue
+            fi
+            CONCLUSION=$(echo "$LATEST" | cut -d' ' -f1)
+            STATUS=$(echo "$LATEST" | cut -d' ' -f2)
+            if [ "$STATUS" = "completed" ] && [ "$CONCLUSION" = "success" ]; then
+              echo "=== CodeQL passed ==="; exit 0
+            elif [ "$STATUS" = "completed" ]; then
+              echo "BLOCKED: CodeQL $CONCLUSION"; exit 1
+            fi
+            echo "  $attempt/90: $STATUS..."; sleep 30
+          done
+          echo "BLOCKED: CodeQL timeout"; exit 1
+
+      - name: Check for open code scanning alerts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Waiting 60s for alert API to settle..."
+          sleep 60
+          ALERTS=$(gh api 'repos/${{ github.repository }}/code-scanning/alerts?state=open' --jq 'length' 2>/dev/null || echo "0")
+          sleep 15
+          ALERTS2=$(gh api 'repos/${{ github.repository }}/code-scanning/alerts?state=open' --jq 'length' 2>/dev/null || echo "0")
+          [ "$ALERTS" -lt "$ALERTS2" ] && ALERTS=$ALERTS2
+          if [ "$ALERTS" -gt 0 ]; then
+            echo "BLOCKED: $ALERTS open alert(s)"
+            gh api 'repos/${{ github.repository }}/code-scanning/alerts?state=open' \
+              --jq '.[] | "  #\(.number) [\(.rule.security_severity_level // .rule.severity)] \(.rule.id) — \(.most_recent_instance.location.path):\(.most_recent_instance.location.start_line)"' 2>/dev/null || true
+            exit 1
+          fi
+          echo "=== CodeQL gate passed (0 alerts) ==="

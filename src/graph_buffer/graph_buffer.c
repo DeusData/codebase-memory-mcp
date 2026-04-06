@@ -11,6 +11,7 @@
 #include "foundation/constants.h"
 
 enum {
+    GB_ERR = -1,
     GB_COL_2 = 2,
     GB_COL_3 = 3,
     GB_COL_4 = 4,
@@ -18,6 +19,8 @@ enum {
     GB_COL_6 = 6,
     GB_COL_7 = 7,
     GB_URL_PATH_PREFIX = 12, /* strlen(""url_path":"") */
+    GB_MIN_FOR_DEDUP = 2,    /* need at least 2 vectors to sort+dedup */
+    GB_DEDUP_LOOKAHEAD = 1,  /* compare current with next element */
 };
 #include "graph_buffer/graph_buffer.h"
 #include "store/store.h"
@@ -26,6 +29,7 @@ enum {
 #include "foundation/compat.h"
 #include "foundation/log.h"
 #include "foundation/dyn_array.h"
+#include "foundation/profile.h"
 #include <sqlite3.h>
 
 #include <stdatomic.h>
@@ -82,6 +86,17 @@ struct cbm_gbuf {
     CBMHashTable *edges_by_source_type; /* "srcID:type" → edge_ptr_array_t* */
     CBMHashTable *edges_by_target_type; /* "tgtID:type" → edge_ptr_array_t* */
     CBMHashTable *edges_by_type;        /* "type" → edge_ptr_array_t* */
+
+    /* Vector storage for semantic embeddings (filled by pass_semantic_edges,
+     * consumed by cbm_write_db during dump). */
+    CBMDumpVector *dump_vectors;
+    int dump_vector_count;
+    int dump_vector_cap;
+
+    /* Token vector storage for enriched RI vectors (query-time lookup). */
+    CBMDumpTokenVec *dump_token_vecs;
+    int dump_token_vec_count;
+    int dump_token_vec_cap;
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
@@ -419,9 +434,91 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
         cbm_ht_free(gb->edges_by_type);
     }
 
+    /* Free vector storage */
+    for (int i = 0; i < gb->dump_vector_count; i++) {
+        free((void *)gb->dump_vectors[i].vector);
+    }
+    free(gb->dump_vectors);
+
+    /* Free token vector storage */
+    for (int i = 0; i < gb->dump_token_vec_count; i++) {
+        free((void *)gb->dump_token_vecs[i].token);
+        free((void *)gb->dump_token_vecs[i].vector);
+    }
+    free(gb->dump_token_vecs);
+
     free(gb->project);
     free(gb->root_path);
     free(gb);
+}
+
+/* ── Vector storage ──────────────────────────────────────────────── */
+
+int cbm_gbuf_store_vector(cbm_gbuf_t *gb, int64_t node_id, const uint8_t *vector, int vector_len) {
+    if (!gb || !vector || vector_len <= 0) {
+        return GB_ERR;
+    }
+    enum { VEC_INIT_CAP = 1024, VEC_GROW = 2 };
+    if (gb->dump_vector_count >= gb->dump_vector_cap) {
+        int new_cap =
+            gb->dump_vector_cap < VEC_INIT_CAP ? VEC_INIT_CAP : gb->dump_vector_cap * VEC_GROW;
+        CBMDumpVector *grown = realloc(gb->dump_vectors, (size_t)new_cap * sizeof(CBMDumpVector));
+        if (!grown) {
+            return GB_ERR;
+        }
+        gb->dump_vectors = grown;
+        gb->dump_vector_cap = new_cap;
+    }
+    /* Copy vector data */
+    uint8_t *vec_copy = malloc((size_t)vector_len);
+    if (!vec_copy) {
+        return GB_ERR;
+    }
+    memcpy(vec_copy, vector, (size_t)vector_len);
+
+    gb->dump_vectors[gb->dump_vector_count++] = (CBMDumpVector){
+        .node_id = node_id,
+        .project = gb->project, /* borrowed — valid until gbuf_free */
+        .vector = vec_copy,
+        .vector_len = vector_len,
+    };
+    return 0;
+}
+
+int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t *vector,
+                                int vector_len, float idf) {
+    if (!gb || !token || !vector || vector_len <= 0) {
+        return GB_ERR;
+    }
+    enum { TV_INIT_CAP = 256, TV_GROW = 2 };
+    if (gb->dump_token_vec_count >= gb->dump_token_vec_cap) {
+        int new_cap =
+            gb->dump_token_vec_cap < TV_INIT_CAP ? TV_INIT_CAP : gb->dump_token_vec_cap * TV_GROW;
+        CBMDumpTokenVec *grown =
+            realloc(gb->dump_token_vecs, (size_t)new_cap * sizeof(CBMDumpTokenVec));
+        if (!grown) {
+            return GB_ERR;
+        }
+        gb->dump_token_vecs = grown;
+        gb->dump_token_vec_cap = new_cap;
+    }
+    uint8_t *vec_copy = malloc((size_t)vector_len);
+    if (!vec_copy) {
+        return GB_ERR;
+    }
+    memcpy(vec_copy, vector, (size_t)vector_len);
+
+    int idx = gb->dump_token_vec_count;
+    gb->dump_token_vecs[idx] = (CBMDumpTokenVec){
+        .id = idx + SKIP_ONE, /* 1-based sequential ID */
+        .project = gb->project,
+        .token = strdup(token),
+        .vector = vec_copy,
+        .vector_len = vector_len,
+        .idf = idf,
+    };
+    gb->dump_token_vec_count++;
+    return 0;
 }
 
 /* ── ID accessors ────────────────────────────────────────────────── */
@@ -1065,6 +1162,12 @@ static int64_t remap_id(const int64_t *temp_to_final, int64_t max_temp_id, int64
 }
 
 /* Build dump-ready node array with sequential IDs. Populates temp_to_final mapping. */
+static int cmp_dump_vectors_by_id(const void *a, const void *b) {
+    int64_t da = ((const CBMDumpVector *)a)->node_id;
+    int64_t db = ((const CBMDumpVector *)b)->node_id;
+    return (da > db) - (da < db);
+}
+
 static CBMDumpNode *build_dump_nodes(cbm_gbuf_t *gb, int live_count, int64_t *temp_to_final,
                                      int64_t max_temp_id, int *out_count) {
     CBMDumpNode *dump_nodes =
@@ -1149,21 +1252,107 @@ static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_fina
     return dump_edges;
 }
 
+/* Remap vector node IDs through temp_to_final, sort by ID, deduplicate. */
+static void remap_sort_dedup_vectors(cbm_gbuf_t *gb, const int64_t *temp_to_final,
+                                     int64_t max_temp_id) {
+    int remapped = 0;
+    int dropped = 0;
+    for (int i = 0; i < gb->dump_vector_count; i++) {
+        int64_t old_id = gb->dump_vectors[i].node_id;
+        int64_t new_id = (old_id > 0 && old_id < max_temp_id) ? temp_to_final[old_id] : 0;
+        if (new_id > 0) {
+            gb->dump_vectors[remapped] = gb->dump_vectors[i];
+            gb->dump_vectors[remapped].node_id = new_id;
+            remapped++;
+        } else {
+            dropped++;
+        }
+    }
+    if (dropped > 0) {
+        char r_buf[CBM_SZ_16];
+        char d_buf[CBM_SZ_16];
+        snprintf(r_buf, sizeof(r_buf), "%d", remapped);
+        snprintf(d_buf, sizeof(d_buf), "%d", dropped);
+        cbm_log_info("dump.vectors.remap", "remapped", r_buf, "dropped", d_buf);
+    }
+    gb->dump_vector_count = remapped;
+
+    if (gb->dump_vector_count >= GB_MIN_FOR_DEDUP) {
+        qsort(gb->dump_vectors, (size_t)gb->dump_vector_count, sizeof(CBMDumpVector),
+              cmp_dump_vectors_by_id);
+        int deduped = 0;
+        for (int i = 0; i < gb->dump_vector_count; i++) {
+            if (i + GB_DEDUP_LOOKAHEAD < gb->dump_vector_count &&
+                gb->dump_vectors[i].node_id == gb->dump_vectors[i + GB_DEDUP_LOOKAHEAD].node_id) {
+                continue;
+            }
+            gb->dump_vectors[deduped++] = gb->dump_vectors[i];
+        }
+        gb->dump_vector_count = deduped;
+    }
+}
+
+static void log_dump_summary(int node_count, int edge_count) {
+    char b1[CBM_SZ_16];
+    char b2[CBM_SZ_16];
+    snprintf(b1, sizeof(b1), "%d", node_count);
+    snprintf(b2, sizeof(b2), "%d", edge_count);
+    cbm_log_info("gbuf.dump", "nodes", b1, "edges", b2);
+}
+
+static void free_dump_resources(char **url_paths, int edge_count, CBMDumpEdge *dump_edges,
+                                CBMDumpNode *dump_nodes, int64_t *temp_to_final) {
+    for (int i = 0; i < edge_count; i++) {
+        free(url_paths[i]);
+    }
+    free(url_paths);
+    free(dump_edges);
+    free(dump_nodes);
+    free(temp_to_final);
+}
+
+static int count_live_nodes(cbm_gbuf_t *gb) {
+    int count = 0;
+    for (int i = 0; i < gb->nodes.count; i++) {
+        cbm_gbuf_node_t *n = gb->nodes.items[i];
+        if (n->qualified_name && cbm_ht_get(gb->node_by_qn, n->qualified_name)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static void generate_iso_timestamp(char *buf, size_t buf_size) {
+    time_t now = time(NULL);
+    struct tm tm_buf;
+    struct tm *tm_val = cbm_gmtime_r(&now, &tm_buf);
+    if (strftime(buf, buf_size, "%Y-%m-%dT%H:%M:%SZ", tm_val) == 0) {
+        snprintf(buf, buf_size, "1970-01-01T00:00:00Z");
+    }
+}
+
+/* Release lookup indexes then remap+sort+dedup vectors for the B-tree writer. */
+static void release_and_remap_vectors(cbm_gbuf_t *gb, const int64_t *temp_to_final,
+                                      int64_t max_temp_id) {
+    CBM_PROF_START(t_release_idx);
+    release_gbuf_indexes(gb);
+    CBM_PROF_END("dump", "4_release_gbuf_indexes", t_release_idx);
+
+    CBM_PROF_START(t_vec_remap);
+    remap_sort_dedup_vectors(gb, temp_to_final, max_temp_id);
+    CBM_PROF_END_N("dump", "5_vector_remap_sort", t_vec_remap, gb->dump_vector_count);
+}
+
 int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     if (!gb || !path) {
         return CBM_NOT_FOUND;
     }
 
-    /* Count live nodes (not deleted from QN index) */
-    int live_count = 0;
-    for (int i = 0; i < gb->nodes.count; i++) {
-        cbm_gbuf_node_t *n = gb->nodes.items[i];
-        if (n->qualified_name && cbm_ht_get(gb->node_by_qn, n->qualified_name)) {
-            live_count++;
-        }
-    }
+    CBM_PROF_START(t_count);
+    int live_count = count_live_nodes(gb);
+    CBM_PROF_END_N("dump", "1_count_live_nodes", t_count, live_count);
 
-    /* Build temp→final ID mapping */
+    CBM_PROF_START(t_build_nodes);
     int64_t max_temp_id = gb->next_id;
     int64_t *temp_to_final = calloc((size_t)max_temp_id, sizeof(int64_t));
     if (!temp_to_final) {
@@ -1173,49 +1362,29 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     int node_idx = 0;
     CBMDumpNode *dump_nodes =
         build_dump_nodes(gb, live_count, temp_to_final, max_temp_id, &node_idx);
+    CBM_PROF_END_N("dump", "2_build_dump_nodes", t_build_nodes, node_idx);
 
+    CBM_PROF_START(t_build_edges);
     int edge_idx = 0;
     char **url_paths = NULL;
     CBMDumpEdge *dump_edges =
         build_dump_edges(gb, temp_to_final, max_temp_id, &edge_idx, &url_paths);
+    CBM_PROF_END_N("dump", "3_build_dump_edges", t_build_edges, edge_idx);
 
-    /* Generate ISO 8601 timestamp */
-    time_t now = time(NULL);
-    struct tm tm_buf;
-    struct tm *tm_val = cbm_gmtime_r(&now, &tm_buf);
     char indexed_at[CBM_SZ_64];
-    if (strftime(indexed_at, sizeof(indexed_at), "%Y-%m-%dT%H:%M:%SZ", tm_val) == 0) {
-        snprintf(indexed_at, sizeof(indexed_at), "1970-01-01T00:00:00Z");
-    }
+    generate_iso_timestamp(indexed_at, sizeof(indexed_at));
 
-    /* Release lookup tables — no longer needed now that dump arrays are built.
-     * Frees hash tables (~200-400MB on large codebases) while keeping the
-     * raw node/edge data alive for cbm_write_db() to read via dump arrays. */
-    release_gbuf_indexes(gb);
+    release_and_remap_vectors(gb, temp_to_final, max_temp_id);
 
-    /* Write directly to final path — no .tmp + rename.
-     * Callers must delete the old .db before calling this (reindex)
-     * or ensure no file exists (first index). */
+    /* Sub-phase: Write SQLite DB file (B-tree writer) */
+    CBM_PROF_START(t_write_db);
     int rc = cbm_write_db(path, gb->project, gb->root_path, indexed_at, dump_nodes, node_idx,
-                          dump_edges, edge_idx);
+                          dump_edges, edge_idx, gb->dump_vectors, gb->dump_vector_count,
+                          gb->dump_token_vecs, gb->dump_token_vec_count);
+    CBM_PROF_END_N("dump", "6_write_db_btree", t_write_db, node_idx + edge_idx);
 
-    {
-        char b1[CBM_SZ_16];
-        char b2[CBM_SZ_16];
-        snprintf(b1, sizeof(b1), "%d", node_idx);
-        snprintf(b2, sizeof(b2), "%d", edge_idx);
-        cbm_log_info("gbuf.dump", "nodes", b1, "edges", b2);
-    }
-
-    /* Cleanup */
-    for (int i = 0; i < edge_idx; i++) {
-        free(url_paths[i]);
-    }
-    free(url_paths);
-    free(dump_edges);
-    free(dump_nodes);
-    free(temp_to_final);
-
+    log_dump_summary(node_idx, edge_idx);
+    free_dump_resources(url_paths, edge_idx, dump_edges, dump_nodes, temp_to_final);
     return rc;
 }
 

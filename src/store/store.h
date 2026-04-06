@@ -608,4 +608,34 @@ void cbm_store_free_projects(cbm_project_t *projects, int count);
 /* Free an array of file hashes. */
 void cbm_store_free_file_hashes(cbm_file_hash_t *hashes, int count);
 
+/* ── Vector search ───────────────────────────────────────────────── */
+
+/* Result from vector similarity search. */
+typedef struct {
+    int64_t node_id;
+    char *name;
+    char *qualified_name;
+    char *file_path;
+    char *label;
+    double score;
+} cbm_vector_result_t;
+
+/* Search for nodes similar to the given query keywords using stored RI vectors.
+ * Builds a merged query vector from the keywords, then does cosine scan via
+ * the cbm_cosine_i8 SQL function joined with the nodes table.
+ * Returns results sorted by score DESC. Caller must free with cbm_store_free_vector_results. */
+int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
+                            int keyword_count, int limit, cbm_vector_result_t **out,
+                            int *out_count);
+
+/* Free vector search results. */
+void cbm_store_free_vector_results(cbm_vector_result_t *results, int count);
+
+/* Count vectors for a project. */
+int cbm_store_count_vectors(cbm_store_t *s, const char *project);
+
+/* Execute an arbitrary SQL statement (pragmas, FTS5 maintenance, etc).
+ * Returns CBM_STORE_OK on success. */
+int cbm_store_exec(cbm_store_t *s, const char *sql);
+
 #endif /* CBM_STORE_H */

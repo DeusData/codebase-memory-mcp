@@ -1438,6 +1438,8 @@ TEST(cli_detect_agents_finds_zed) {
     char dir[512];
 #ifdef __APPLE__
     snprintf(dir, sizeof(dir), "%s/Library/Application Support/Zed", tmpdir);
+#elif defined(_WIN32)
+    snprintf(dir, sizeof(dir), "%s/AppData/Local/Zed", tmpdir);
 #else
     snprintf(dir, sizeof(dir), "%s/.config/zed", tmpdir);
 #endif
@@ -1478,6 +1480,9 @@ TEST(cli_detect_agents_finds_kilocode) {
 #ifdef __APPLE__
     snprintf(dir, sizeof(dir),
              "%s/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code", tmpdir);
+#elif defined(_WIN32)
+    snprintf(dir, sizeof(dir),
+             "%s/AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code", tmpdir);
 #else
     snprintf(dir, sizeof(dir), "%s/.config/Code/User/globalStorage/kilocode.kilo-code", tmpdir);
 #endif

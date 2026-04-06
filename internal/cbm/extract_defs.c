@@ -4,6 +4,7 @@
 #include "lang_specs.h"
 #include "foundation/constants.h"
 #include "simhash/minhash.h"
+#include "semantic/ast_profile.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include <stdint.h>          // uint32_t
 #include <string.h>
@@ -27,7 +28,89 @@ enum {
     C_RETURN_WALK_DEPTH = 5,
     VAR_RECURSION_LIMIT = 8,
     NESTED_CLASS_STACK_CAP = 128,
+    FP_HASH_MUL = 31,    /* FNV-like hash multiplier for identifier dedup */
+    FP_HASH_NONZERO = 1, /* OR mask to ensure hash is never zero (sentinel) */
+    FP_SPACE_SEP = 1,    /* one byte for space separator between tokens */
 };
+
+/* Hash a span of source text. */
+static uint32_t hash_source_span(const char *source, uint32_t start, int len) {
+    uint32_t h = 0;
+    for (int x = 0; x < len; x++) {
+        h = (h * FP_HASH_MUL) + (uint32_t)(unsigned char)source[start + (uint32_t)x];
+    }
+    return h;
+}
+
+/* Try to append a unique identifier to the buffer. Returns true if appended. */
+static bool try_append_ident(const char *source, uint32_t s, int len, uint32_t *seen, int seen_size,
+                             uint32_t seen_mask, char *buf, int buf_size, int *pos, int *count) {
+    uint32_t h = hash_source_span(source, s, len);
+    uint32_t key = h | FP_HASH_NONZERO;
+    uint32_t slot = h & seen_mask;
+    bool dup = false;
+    for (int p = 0; p < seen_size; p++) {
+        uint32_t idx = (slot + (uint32_t)p) & seen_mask;
+        if (seen[idx] == 0) {
+            seen[idx] = key;
+            break;
+        }
+        if (seen[idx] == key) {
+            dup = true;
+            break;
+        }
+    }
+    if (dup || *pos + len + FP_SPACE_SEP >= buf_size) {
+        return false;
+    }
+    if (*pos > 0) {
+        buf[(*pos)++] = ' ';
+    }
+    memcpy(buf + *pos, source + s, (size_t)len);
+    *pos += len;
+    (*count)++;
+    return true;
+}
+
+/* Walk AST body, collect unique identifier text as space-separated string.
+ * Returns arena-allocated string or NULL. */
+static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
+    enum { BT_STACK = 512, BT_BUF = 512, BT_MAX_IDENTS = 40, BT_SEEN = 128, BT_SEEN_MASK = 127 };
+    TSNode bt_stack[BT_STACK];
+    int bt_top = 0;
+    bt_stack[bt_top++] = body;
+    char bt_buf[BT_BUF];
+    int bt_pos = 0;
+    uint32_t bt_seen[BT_SEEN];
+    memset(bt_seen, 0, sizeof(bt_seen));
+    int bt_count = 0;
+
+    while (bt_top > 0 && bt_count < BT_MAX_IDENTS) {
+        TSNode nd = bt_stack[--bt_top];
+        uint32_t nc = ts_node_child_count(nd);
+        if (nc == 0) {
+            const char *k = ts_node_type(nd);
+            if (strcmp(k, "identifier") == 0 || strcmp(k, "field_identifier") == 0 ||
+                strcmp(k, "property_identifier") == 0) {
+                uint32_t s = ts_node_start_byte(nd);
+                int len = (int)(ts_node_end_byte(nd) - s);
+                if (len > 0 && len < CBM_SZ_64 && s < (uint32_t)ctx->source_len) {
+                    try_append_ident(ctx->source, s, len, bt_seen, BT_SEEN, BT_SEEN_MASK, bt_buf,
+                                     BT_BUF, &bt_pos, &bt_count);
+                }
+            }
+        } else {
+            for (int i = (int)nc - SKIP_ONE; i >= 0 && bt_top < BT_STACK; i--) {
+                bt_stack[bt_top++] = ts_node_child(nd, (uint32_t)i);
+            }
+        }
+    }
+    if (bt_pos > 0) {
+        bt_buf[bt_pos] = '\0';
+        return cbm_arena_strdup(ctx->arena, bt_buf);
+    }
+    return NULL;
+}
 
 /* Compute MinHash fingerprint for a function body node and store in def.
  * Sets def->fingerprint (arena-allocated) and def->fingerprint_k on success,
@@ -50,6 +133,24 @@ static void compute_fingerprint(CBMExtractCtx *ctx, CBMDefinition *def, TSNode f
     memcpy(fp, result.values, CBM_MINHASH_K * sizeof(uint32_t));
     def->fingerprint = fp;
     def->fingerprint_k = CBM_MINHASH_K;
+
+    /* AST structural profile (signals 8, 9, 11) — rides the same body node */
+    cbm_ast_profile_t profile;
+    int pc = 0;
+    if (def->param_names) {
+        while (def->param_names[pc]) {
+            pc++;
+        }
+    }
+    if (cbm_ast_profile_compute(body, ctx->source, def->param_names, pc, &profile)) {
+        profile.body_lines = (uint16_t)def->lines;
+        char sp_buf[CBM_AST_PROFILE_BUF];
+        cbm_ast_profile_to_str(&profile, sp_buf, sizeof(sp_buf));
+        def->structural_profile = cbm_arena_strdup(ctx->arena, sp_buf);
+    }
+
+    /* Extract raw identifier tokens from body for semantic search */
+    def->body_tokens = extract_body_ident_tokens(ctx, body);
 }
 
 // Tree-sitter row is 0-based; lines are 1-based.
@@ -909,6 +1010,72 @@ static const char **find_base_from_children(CBMArena *a, TSNode node, const char
     return NULL;
 }
 
+/* Extract text from a single C# base_list named child, stripping generic args. */
+static const char *extract_csharp_base_child_text(CBMArena *a, TSNode bc, const char *source) {
+    const char *bk = ts_node_type(bc);
+    char *text = NULL;
+    if (strcmp(bk, "identifier") == 0 || strcmp(bk, "generic_name") == 0 ||
+        strcmp(bk, "qualified_name") == 0) {
+        text = cbm_node_text(a, bc, source);
+    } else {
+        TSNode inner = ts_node_named_child(bc, 0);
+        if (!ts_node_is_null(inner)) {
+            text = cbm_node_text(a, inner, source);
+        }
+    }
+    if (text && text[0]) {
+        char *angle = strchr(text, '<');
+        if (angle) {
+            *angle = '\0';
+        }
+        return text;
+    }
+    return NULL;
+}
+
+/* Collect bases from a single base_list node into an arena-allocated array. */
+static const char **collect_csharp_bases(CBMArena *a, TSNode base_list, const char *source) {
+    const char *bases[MAX_BASES];
+    int base_count = 0;
+    uint32_t bnc = ts_node_named_child_count(base_list);
+    for (uint32_t bi = 0; bi < bnc && base_count < MAX_BASES_MINUS_1; bi++) {
+        const char *text =
+            extract_csharp_base_child_text(a, ts_node_named_child(base_list, bi), source);
+        if (text) {
+            bases[base_count++] = text;
+        }
+    }
+    if (base_count == 0) {
+        return NULL;
+    }
+    const char **result =
+        (const char **)cbm_arena_alloc(a, (base_count + NULL_TERM) * sizeof(const char *));
+    if (!result) {
+        return NULL;
+    }
+    for (int j = 0; j < base_count; j++) {
+        result[j] = bases[j];
+    }
+    result[base_count] = NULL;
+    return result;
+}
+
+/* C# base_list: iterate children, find base_list node, extract bases. */
+static const char **extract_csharp_base_list(CBMArena *a, TSNode node, const char *source,
+                                             uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_child(node, i);
+        if (strcmp(ts_node_type(child), "base_list") != 0) {
+            continue;
+        }
+        const char **result = collect_csharp_bases(a, child, source);
+        if (result) {
+            return result;
+        }
+    }
+    return NULL;
+}
+
 // Extract base class names from a class node.
 static const char **extract_base_classes(CBMArena *a, TSNode node, const char *source,
                                          CBMLanguage lang) {
@@ -941,6 +1108,14 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
             if (result) {
                 return result;
             }
+        }
+    }
+
+    // C#: explicit base_list handler
+    {
+        const char **csharp_result = extract_csharp_base_list(a, node, source, count);
+        if (csharp_result) {
+            return csharp_result;
         }
     }
 

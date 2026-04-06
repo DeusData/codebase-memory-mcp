@@ -39,6 +39,7 @@ typedef struct {
     cbm_gbuf_t *gbuf;         /* owned by pipeline */
     cbm_registry_t *registry; /* owned by pipeline */
     atomic_int *cancelled;    /* pointer to pipeline's cancelled flag */
+    int mode;                 /* cbm_index_mode_t (0=full, 1=moderate, 2=fast) */
 
     /* Extraction result cache (sequential pipeline optimization).
      * When non-NULL, pass_definitions stores results here instead of freeing,
@@ -352,6 +353,10 @@ int cbm_pipeline_pass_configlink(cbm_pipeline_ctx_t *ctx);
 
 /* Pre-dump pass: SIMILAR_TO edges via MinHash fingerprinting. */
 int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx);
+
+/* Pre-dump pass: SEMANTICALLY_RELATED edges via algorithmic embeddings.
+ * Opt-in: only runs when CBM_SEMANTIC_ENABLED=1. */
+int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx);
 
 /* ── Env URL scanner (pass_envscan.c) ────────────────────────────── */
 

@@ -139,7 +139,8 @@ bool cbm_should_skip_dir(const char *dirname, cbm_index_mode_t mode) {
         return true;
     }
 
-    if (mode == CBM_MODE_FAST) {
+    /* Fast discovery applies to both MODERATE and FAST — only FULL keeps everything. */
+    if (mode != CBM_MODE_FULL) {
         if (str_in_list(dirname, FAST_SKIP_DIRS)) {
             return true;
         }
@@ -159,7 +160,7 @@ bool cbm_has_ignored_suffix(const char *filename, cbm_index_mode_t mode) {
         }
     }
 
-    if (mode == CBM_MODE_FAST) {
+    if (mode != CBM_MODE_FULL) {
         for (int i = 0; FAST_IGNORED_SUFFIXES[i]; i++) {
             if (ends_with(filename, FAST_IGNORED_SUFFIXES[i])) {
                 return true;
@@ -175,7 +176,7 @@ bool cbm_should_skip_filename(const char *filename, cbm_index_mode_t mode) {
         return false;
     }
 
-    if (mode == CBM_MODE_FAST) {
+    if (mode != CBM_MODE_FULL) {
         if (str_in_list(filename, FAST_SKIP_FILENAMES)) {
             return true;
         }
@@ -185,7 +186,7 @@ bool cbm_should_skip_filename(const char *filename, cbm_index_mode_t mode) {
 }
 
 bool cbm_matches_fast_pattern(const char *filename, cbm_index_mode_t mode) {
-    if (!filename || mode != CBM_MODE_FAST) {
+    if (!filename || mode == CBM_MODE_FULL) {
         return false;
     }
 
