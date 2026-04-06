@@ -97,7 +97,10 @@ echo ""
 echo "--- Dangerous command detection ---"
 
 DANGEROUS_CMDS='wget|netcat|ncat|/dev/tcp|telnet'
-if grep -wE "$DANGEROUS_CMDS" "$STRINGS_FILE" > "$SEC_CMDS" 2>/dev/null; then
+# Filter out bare single-word matches from the embedded token vocabulary
+# (vendored/nomic/code_tokens.h contains 40K code tokens including "wget").
+# Real dangerous strings would appear in a command context, not as standalone words.
+if grep -wE "$DANGEROUS_CMDS" "$STRINGS_FILE" | grep -vxE '[a-z]{2,10}' > "$SEC_CMDS" 2>/dev/null && [ -s "$SEC_CMDS" ]; then
     echo "BLOCKED: Dangerous commands found in binary:"
     cat "$SEC_CMDS"
     FAIL=1
