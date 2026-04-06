@@ -973,6 +973,66 @@ TEST(regression_trace_call_path_tool_name_still_works) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  Config: context_injection=false disables _context header
+ *
+ *  context_injection (default true) / CBM_CONTEXT_INJECTION controls
+ *  whether inject_context_once embeds the _context header in the first
+ *  tool response. Disabling saves tokens in scripted/programmatic use.
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(config_context_injection_disabled) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_config_t *cfg = cbm_config_open(tmp);
+    ASSERT_NOT_NULL(cfg);
+    cbm_config_set(cfg, "context_injection", "false");
+    cbm_mcp_server_set_config(srv, cfg);
+
+    /* With context_injection=false, _context must NOT appear in any call */
+    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph", "{\"limit\":3}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"_context\":"));
+    free(resp);
+
+    /* Second call also no _context */
+    raw = cbm_mcp_handle_tool(srv, "search_code_graph", "{\"limit\":3}");
+    resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"_context\":"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(config_context_injection_enabled_by_default) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* No config set → default is true → _context present on first call */
+    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph", "{\"limit\":3}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"_context\":"));
+    free(resp);
+
+    /* Second call: _context deduped (context_injected=true) */
+    raw = cbm_mcp_handle_tool(srv, "search_code_graph", "{\"limit\":3}");
+    resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"_context\":"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  Suite registration
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -1016,4 +1076,6 @@ void suite_input_validation(void) {
     RUN_TEST(source_search_tilde_project_expands);
     RUN_TEST(source_search_no_project_falls_back_to_session);
     RUN_TEST(regression_trace_call_path_tool_name_still_works);
+    RUN_TEST(config_context_injection_disabled);
+    RUN_TEST(config_context_injection_enabled_by_default);
 }
