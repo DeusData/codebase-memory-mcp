@@ -2712,21 +2712,45 @@ static char *read_file_lines(const char *path, int start, int end) {
 /* ── Helper: get project root_path from store ─────────────────── */
 
 static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
-    if (!project) {
-        return NULL;
+    /* Resolve the project slug: accept either a slug or a filesystem path.
+     * Also fall back to session_project when project is NULL. */
+    const char *slug = NULL;
+    char *slug_owned = NULL; /* heap copy we must free */
+
+    if (!project || project[0] == '\0') {
+        /* No project arg — use session_project (set by cold-start detect_session) */
+        if (srv->session_project[0])
+            slug = srv->session_project;
+        else
+            return NULL;
+    } else if (project[0] == '/' || project[0] == '~' ||
+               (project[0] == '.' && project[1] == '/') ||
+               strchr(project, '/') != NULL) {
+        /* Path-based arg: convert to slug the same way expand_project_param Rule 0 does */
+        char *resolved = realpath(project, NULL);
+        const char *path = resolved ? resolved : project;
+        slug_owned = cbm_project_name_from_path(path);
+        free(resolved);
+        slug = slug_owned;
+    } else {
+        slug = project;
     }
-    cbm_store_t *store = resolve_store(srv, project);
+
+    cbm_store_t *store = resolve_store(srv, slug);
     if (!store) {
+        free(slug_owned);
         return NULL;
     }
     cbm_project_t proj = {0};
-    if (cbm_store_get_project(store, project, &proj) != CBM_STORE_OK) {
+    if (cbm_store_get_project(store, slug, &proj) != CBM_STORE_OK) {
+        free(slug_owned);
         return NULL;
     }
     char *root = heap_strdup(proj.root_path);
     free((void *)proj.name);
     free((void *)proj.indexed_at);
     free((void *)proj.root_path);
+    free(slug_owned);
     return root;
 }
 
