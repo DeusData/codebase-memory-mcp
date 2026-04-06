@@ -881,6 +881,49 @@ TEST(manage_adr_slug_project_finds_root) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  Tilde expansion: project="~/relpath" expands correctly
+ *  (get_project_root uses expand_tilde before realpath)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(source_search_tilde_project_expands) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* Build a project path relative to $HOME (e.g. ~/... pointing to tmp) */
+    const char *home = getenv("HOME");
+    if (!home || strncmp(tmp, home, strlen(home)) != 0) {
+        /* tmp is not under $HOME — skip this test on this machine */
+        cbm_mcp_server_free(srv); cleanup_validation_dir(tmp);
+        PASS();
+    }
+    /* Compute tilde path: replace $HOME prefix with ~ */
+    char tilde_path[320];
+    snprintf(tilde_path, sizeof(tilde_path), "~%s", tmp + strlen(home));
+
+    char src_path[320];
+    snprintf(src_path, sizeof(src_path), "%s/tilde.c", tmp);
+    FILE *f = fopen(src_path, "w");
+    if (f) { fputs("/* tilde_expand_token */\n", f); fclose(f); }
+
+    /* Pass project as tilde path — should expand to absolute and find root */
+    char args[512];
+    snprintf(args, sizeof(args),
+        "{\"pattern\":\"tilde_expand_token\","
+        "\"search_in\":\"source\","
+        "\"project\":\"%s\"}", tilde_path);
+    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph", args);
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"matches\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  project_is_path: path-format project arg routes through slug
  *  conversion in get_project_root (regression for path-based project)
  * ══════════════════════════════════════════════════════════════════ */
@@ -970,6 +1013,7 @@ void suite_input_validation(void) {
     RUN_TEST(trace_qn_not_found_returns_specific_hint);
     RUN_TEST(detect_changes_slug_project_finds_root);
     RUN_TEST(manage_adr_slug_project_finds_root);
+    RUN_TEST(source_search_tilde_project_expands);
     RUN_TEST(source_search_no_project_falls_back_to_session);
     RUN_TEST(regression_trace_call_path_tool_name_still_works);
 }

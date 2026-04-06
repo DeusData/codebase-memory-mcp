@@ -1242,30 +1242,48 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
 
 /* Returns true if s looks like a filesystem path rather than a project slug.
  * Project slugs are dot-separated identifiers (e.g. "Users-foo-bar"); they
- * never start with / ~ or ./ and don't contain / (unless they're a glob
- * starting with *).
- *
- * Known limitations (pre-existing, not introduced by this helper):
- *   "."  — bare dot is NOT detected; use "./" or absolute path instead.
- *   "~"  — tilde is detected but realpath(3) does NOT expand it (that is
- *          a shell feature); the slug is derived from the literal ~ string.
- *          Pass the expanded absolute path for reliable results. */
+ * never contain / (except globs starting with *) and don't start with / ~ . */
 static bool project_is_path(const char *s) {
     if (!s || !s[0]) return false;
+    if (s[0] == '.') {
+        return s[1] == '\0' || s[1] == '/'; /* "." or "./" — relative paths */
+    }
     return s[0] == '/' || s[0] == '~' ||
-           (s[0] == '.' && s[1] == '/') ||
            (strchr(s, '/') != NULL && s[0] != '*');
 }
 
-/* Convert a filesystem path to a heap-allocated project slug via realpath +
- * cbm_project_name_from_path. Returns NULL if s is not a path.
- * Caller must free the result. */
+/* Expand a leading ~ to $HOME (~/... or ~ alone).
+ * ~user/... is left unexpanded (requires getpwnam — not worth the complexity).
+ * Returns a heap-allocated expanded string, or NULL when no expansion is needed
+ * or $HOME is unset. Caller must free the result. */
+static char *expand_tilde(const char *s) {
+    if (s[0] != '~') return NULL;
+    if (s[1] != '\0' && s[1] != '/') return NULL; /* "~user/..." — leave as-is */
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return NULL;
+    /* Build: home + rest  ("~" → home, "~/rest" → home + "/rest") */
+    size_t hlen = strlen(home);
+    const char *rest = s + 1; /* "" or "/rest" */
+    char *result = malloc(hlen + strlen(rest) + 1);
+    if (!result) return NULL;
+    memcpy(result, home, hlen);
+    strcpy(result + hlen, rest); /* copies rest incl. NUL */
+    return result;
+}
+
+/* Convert a filesystem path to a heap-allocated project slug.
+ * Handles ~/ tilde expansion, resolves symlinks and relative components
+ * via realpath(3), then derives the slug from the canonical absolute path.
+ * Returns NULL if s is not a path. Caller must free the result. */
 static char *project_slug_from_path(const char *s) {
     if (!project_is_path(s)) return NULL;
-    char *resolved = realpath(s, NULL);
-    const char *path = resolved ? resolved : s;
-    char *slug = cbm_project_name_from_path(path);
+    char *expanded = expand_tilde(s);          /* non-NULL only for ~ paths */
+    const char *to_resolve = expanded ? expanded : s;
+    char *resolved = realpath(to_resolve, NULL); /* NULL if path doesn't exist */
+    const char *canonical = resolved ? resolved : to_resolve;
+    char *slug = cbm_project_name_from_path(canonical);
     free(resolved);
+    free(expanded);
     return slug;
 }
 
