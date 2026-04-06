@@ -1124,16 +1124,36 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
 /* Inject _context header into the FIRST tool response after session starts.
  * Contains architecture, schema, status — eliminates the need for separate
  * get_architecture / get_graph_schema / index_status / list_projects calls.
- * Subsequent responses include only session_project (lightweight). */
+ * Subsequent responses include only session_project (lightweight).
+ *
+ * WHY we inject for ALL clients, including those that declare MCP resources:
+ *
+ * MCP resources are "application-controlled" (pull-only). When a client
+ * declares capabilities.resources:{}, it means the client CAN fetch resources
+ * via resources/read — it does NOT mean the client will automatically read
+ * codebase://schema or codebase://architecture. The spec defines no push path:
+ *   - notifications/resources/updated signals that a resource changed but
+ *     sends NO content; the client must explicitly call resources/read to get it
+ *   - resources/read requires an explicit model action (or user @-mention)
+ *   - In Claude Code, resources are only fetched on user @-mention or explicit
+ *     system-prompt instruction — never spontaneously
+ * References:
+ *   https://modelcontextprotocol.io/specification/2025-06-18/server/resources
+ *   https://modelcontextprotocol.io/docs/concepts/resources
+ *   https://workos.com/blog/mcp-features-guide  ("resources = application-controlled")
+ *
+ * Embedding _context in the first tool response is therefore the ONLY reliable
+ * delivery channel that reaches the model without requiring explicit user action.
+ * The context_injected flag already prevents duplicate injection on subsequent
+ * calls, so the one-shot delivery is both sufficient and non-repetitive.
+ *
+ * Resources remain available for explicit access (e.g. codebase://schema via
+ * @-mention) — the two mechanisms are complementary, not mutually exclusive. */
 static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                 cbm_mcp_server_t *srv, cbm_store_t *store) {
     /* Always include session_project */
     if (srv->session_project[0])
         yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
-
-    /* If client supports MCP resources, skip _context injection — client reads
-     * codebase://schema, codebase://architecture, codebase://status instead. */
-    if (srv->client_has_resources) return;
 
     if (srv->context_injected) return;
     srv->context_injected = true;
