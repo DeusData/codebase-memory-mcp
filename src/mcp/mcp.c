@@ -1547,7 +1547,15 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
 static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
                                            char *raw_project,
                                            project_expand_t *out_pe) {
-    project_expand_t pe = expand_project_param(srv, raw_project);
+    /* Cold-start: when no project param given, use session_project so
+     * auto-index fires on the correct DB instead of returning NULL. */
+    project_expand_t pe;
+    if (!raw_project && srv->session_project[0]) {
+        pe.value = heap_strdup(srv->session_project);
+        pe.mode = MATCH_PREFIX;
+    } else {
+        pe = expand_project_param(srv, raw_project);
+    }
 
     /* DB selection: if expanded value IS the session project or a dep of it
      * (session.dep.X), use session store. The check requires the char after
@@ -2428,9 +2436,11 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             func_name ? func_name : (qn_input ? qn_input : ""), &nodes, &node_count);
     }
 
-    if (node_count == 0) {
+    if (node_count == 0 && func_name) {
         /* Fallback: case-insensitive substring search via cbm_store_search.
-         * Only fires when exact match misses — zero overhead on hit. */
+         * Only fires when exact match misses — zero overhead on hit.
+         * Skipped when func_name is NULL (only qualified_name given): QN lookup already ran
+         * and returned nothing; falling back with name_pattern=NULL would return random nodes. */
         cbm_search_params_t sp = {0};
         fill_project_params(&pe, &sp);
         sp.name_pattern = func_name;
@@ -2465,7 +2475,9 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
-    yyjson_mut_obj_add_str(doc, root, "function", func_name);
+    /* func_name may be NULL when only qualified_name was passed — use qn_input as fallback */
+    yyjson_mut_obj_add_str(doc, root, "function",
+        func_name ? func_name : (qn_input ? qn_input : ""));
     yyjson_mut_obj_add_str(doc, root, "direction", direction);
 
     /* Report ambiguity when multiple nodes match the function name */
