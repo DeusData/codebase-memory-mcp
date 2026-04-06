@@ -1236,14 +1236,46 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
  * Returns expanded result. Caller must free(result.value).
  * Runtime: O(1) — fixed number of string comparisons + one snprintf + strdup.
  * Memory: one heap allocation for result.value. */
+/* ── Project path helpers ─────────────────────────────────────────
+ * Shared by expand_project_param (Rule 0) and get_project_root so the
+ * detection condition and slug computation are defined exactly once. */
+
+/* Returns true if s looks like a filesystem path rather than a project slug.
+ * Project slugs are dot-separated identifiers (e.g. "Users-foo-bar"); they
+ * never start with / ~ or ./ and don't contain / (unless they're a glob
+ * starting with *).
+ *
+ * Known limitations (pre-existing, not introduced by this helper):
+ *   "."  — bare dot is NOT detected; use "./" or absolute path instead.
+ *   "~"  — tilde is detected but realpath(3) does NOT expand it (that is
+ *          a shell feature); the slug is derived from the literal ~ string.
+ *          Pass the expanded absolute path for reliable results. */
+static bool project_is_path(const char *s) {
+    if (!s || !s[0]) return false;
+    return s[0] == '/' || s[0] == '~' ||
+           (s[0] == '.' && s[1] == '/') ||
+           (strchr(s, '/') != NULL && s[0] != '*');
+}
+
+/* Convert a filesystem path to a heap-allocated project slug via realpath +
+ * cbm_project_name_from_path. Returns NULL if s is not a path.
+ * Caller must free the result. */
+static char *project_slug_from_path(const char *s) {
+    if (!project_is_path(s)) return NULL;
+    char *resolved = realpath(s, NULL);
+    const char *path = resolved ? resolved : s;
+    char *slug = cbm_project_name_from_path(path);
+    free(resolved);
+    return slug;
+}
+
 static project_expand_t expand_project_param(cbm_mcp_server_t *srv, char *raw) {
     project_expand_t r = {.value = NULL, .mode = MATCH_NONE};
     if (!raw) return r;
 
     /* Rule 0: Path detection — convert paths to project names.
      * Enables: search_code_graph(project="/path/to/repo") */
-    if (raw[0] == '/' || raw[0] == '~' || (raw[0] == '.' && raw[1] == '/') ||
-        (strchr(raw, '/') != NULL && raw[0] != '*')) {
+    if (project_is_path(raw)) {
         char *resolved = realpath(raw, NULL);
         const char *path = resolved ? resolved : raw;
         char *name = cbm_project_name_from_path(path);
@@ -2715,7 +2747,7 @@ static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
     /* Resolve the project slug: accept either a slug or a filesystem path.
      * Also fall back to session_project when project is NULL. */
     const char *slug = NULL;
-    char *slug_owned = NULL; /* heap copy we must free */
+    char *slug_owned = NULL; /* heap-allocated slug, must free before return */
 
     if (!project || project[0] == '\0') {
         /* No project arg — use session_project (set by cold-start detect_session) */
@@ -2723,14 +2755,10 @@ static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
             slug = srv->session_project;
         else
             return NULL;
-    } else if (project[0] == '/' || project[0] == '~' ||
-               (project[0] == '.' && project[1] == '/') ||
-               strchr(project, '/') != NULL) {
-        /* Path-based arg: convert to slug the same way expand_project_param Rule 0 does */
-        char *resolved = realpath(project, NULL);
-        const char *path = resolved ? resolved : project;
-        slug_owned = cbm_project_name_from_path(path);
-        free(resolved);
+    } else if (project_is_path(project)) {
+        /* Path-based arg: convert to slug (shared helper, same logic as expand_project_param Rule 0) */
+        slug_owned = project_slug_from_path(project);
+        if (!slug_owned) return NULL;
         slug = slug_owned;
     } else {
         slug = project;
