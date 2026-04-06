@@ -838,6 +838,79 @@ TEST(trace_qn_not_found_returns_specific_hint) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  detect_changes: slug project doesn't return "project not found"
+ *  (Tests that get_project_root handles slug args correctly after
+ *  the path-normalization refactor.)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(detect_changes_slug_project_finds_root) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "detect_changes",
+        "{\"project\":\"validation-test\"}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    /* Should find the project root (not "project not found" error) */
+    ASSERT_NULL(strstr(resp, "\"error\":\"project not found\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  manage_adr: slug project doesn't return "project not found"
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(manage_adr_slug_project_finds_root) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "manage_adr",
+        "{\"project\":\"validation-test\",\"mode\":\"get\"}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    /* Should find the project root — either returns ADR content or "not found" for the file,
+     * but NOT "project not found" (the store lookup error). */
+    ASSERT_NULL(strstr(resp, "\"error\":\"project not found\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  project_is_path: path-format project arg routes through slug
+ *  conversion in get_project_root (regression for path-based project)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(source_search_no_project_falls_back_to_session) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* Simulate session_project being set (as detect_session would do after initialize) */
+    cbm_mcp_server_set_session_project(srv, "validation-test");
+
+    char src_path[320];
+    snprintf(src_path, sizeof(src_path), "%s/session.c", tmp);
+    FILE *f = fopen(src_path, "w");
+    if (f) { fputs("/* session_fallback_token */\n", f); fclose(f); }
+
+    /* No project= arg — get_project_root falls back to session_project */
+    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph",
+        "{\"pattern\":\"session_fallback_token\",\"search_in\":\"source\"}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"matches\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  Regression: classic tool names still work
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -895,5 +968,8 @@ void suite_input_validation(void) {
     RUN_TEST(pattern_invalid_regex_returns_error);
     RUN_TEST(trace_qn_takes_priority_over_function_name);
     RUN_TEST(trace_qn_not_found_returns_specific_hint);
+    RUN_TEST(detect_changes_slug_project_finds_root);
+    RUN_TEST(manage_adr_slug_project_finds_root);
+    RUN_TEST(source_search_no_project_falls_back_to_session);
     RUN_TEST(regression_trace_call_path_tool_name_still_works);
 }
