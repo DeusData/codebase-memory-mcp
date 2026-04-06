@@ -124,7 +124,7 @@ jobs:
           "
 
       - name: Attest SBOM
-        uses: actions/attest-sbom@10926c72720ffc3f7b666661c8e55b1344e2a365 # v2
+        uses: actions/attest-sbom@bd218ad0dbcb3e146bd073d1d9c6d78e08aa8a0b # v2
         with:
           subject-path: '*.tar.gz'
           sbom-path: 'sbom.json'
