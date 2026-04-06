@@ -289,7 +289,7 @@ while [ "$(date +%s)" -lt "$END_TIME" ]; do
 
     # Queries every 2 seconds
     mcp_call search_graph "{\"project\":\"$PROJ_NAME\",\"name_pattern\":\".*compute.*\"}"
-    mcp_call trace_call_path "{\"project\":\"$PROJ_NAME\",\"function_name\":\"compute\",\"direction\":\"both\"}"
+    mcp_call trace_path "{\"project\":\"$PROJ_NAME\",\"function_name\":\"compute\",\"direction\":\"both\"}"
 
     # File mutation every 2 minutes
     if [ $((NOW - LAST_MUTATE)) -ge 120 ]; then

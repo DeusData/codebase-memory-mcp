@@ -1,0 +1,186 @@
+# Reusable: soak tests (quick + ASan, all platforms)
+name: Soak
+
+on:
+  workflow_call:
+    inputs:
+      duration_minutes:
+        description: 'Soak duration in minutes'
+        type: number
+        default: 10
+      run_asan:
+        description: 'Run ASan soak in addition to quick soak'
+        type: boolean
+        default: false
+      version:
+        description: 'Version string for build'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  soak-quick:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            cc: gcc
+            cxx: g++
+          - os: macos-14
+            goos: darwin
+            goarch: arm64
+            cc: cc
+            cxx: c++
+          - os: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            cc: cc
+            cxx: c++
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install deps (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 git
+      - name: Build
+        run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+      - name: Soak (${{ inputs.duration_minutes }} min)
+        run: scripts/soak-test.sh build/c/codebase-memory-mcp ${{ inputs.duration_minutes }}
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: soak-quick-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: soak-results/
+          retention-days: 14
+
+  soak-quick-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-python3
+            make
+            git
+            coreutils
+      - name: Build
+        shell: msys2 {0}
+        run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=clang CXX=clang++
+      - name: Soak (${{ inputs.duration_minutes }} min)
+        shell: msys2 {0}
+        run: |
+          BIN=build/c/codebase-memory-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          scripts/soak-test.sh "$BIN" ${{ inputs.duration_minutes }}
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: soak-quick-windows-amd64
+          path: soak-results/
+          retention-days: 14
+
+  soak-asan:
+    if: ${{ inputs.run_asan }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            cc: gcc
+            cxx: g++
+          - os: macos-14
+            goos: darwin
+            goarch: arm64
+            cc: cc
+            cxx: c++
+          - os: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            cc: cc
+            cxx: c++
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install deps (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 git
+      - name: Build (ASan)
+        run: |
+          SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} EXTRA_CFLAGS="$SANITIZE" EXTRA_LDFLAGS="$SANITIZE"
+      - name: ASan soak (15 min)
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:halt_on_error=0:log_path=soak-results/asan"
+        run: scripts/soak-test.sh build/c/codebase-memory-mcp 15
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: soak-asan-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: soak-results/
+          retention-days: 14
+
+  soak-asan-windows:
+    if: ${{ inputs.run_asan }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-python3
+            make
+            git
+            coreutils
+      - name: Build (ASan)
+        shell: msys2 {0}
+        run: |
+          SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=clang CXX=clang++ EXTRA_CFLAGS="$SANITIZE" EXTRA_LDFLAGS="$SANITIZE"
+      - name: ASan soak (15 min, no leak detection)
+        shell: msys2 {0}
+        env:
+          ASAN_OPTIONS: "detect_leaks=0:halt_on_error=0:log_path=soak-results/asan"
+        run: |
+          BIN=build/c/codebase-memory-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          scripts/soak-test.sh "$BIN" 15
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: soak-asan-windows-amd64
+          path: soak-results/
+          retention-days: 14

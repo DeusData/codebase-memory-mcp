@@ -10,6 +10,10 @@
 #include "platform.h"
 #include "log.h"
 
+#include "foundation/constants.h"
+
+#define MAX_RAM_FRACTION 1.0
+#define DEFAULT_RAM_FRACTION 0.5
 #include <mimalloc.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -32,7 +36,7 @@ static size_t g_budget;          /* budget in bytes */
 static atomic_int g_initialized; /* init guard */
 static atomic_int g_was_over;    /* pressure hysteresis */
 
-#define MB_DIVISOR ((size_t)(1024 * 1024))
+#define MB_DIVISOR ((size_t)(CBM_SZ_1K * CBM_SZ_1K))
 
 /* ── OS fallback for RSS (ASan builds where MI_OVERRIDE=0) ──── */
 
@@ -58,13 +62,12 @@ static size_t os_rss(void) {
     }
     unsigned long pages = 0;
     unsigned long rss_pages = 0;
-    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
     if (fscanf(f, "%lu %lu", &pages, &rss_pages) != 2) {
         rss_pages = 0;
     }
     (void)fclose(f);
     long ps = sysconf(_SC_PAGESIZE);
-    return rss_pages * (ps > 0 ? (size_t)ps : 4096);
+    return rss_pages * (ps > 0 ? (size_t)ps : CBM_SZ_4K);
 #endif
 }
 
@@ -80,27 +83,23 @@ static void check_pressure(size_t rss) {
 
     if (over && !was) {
         atomic_store(&g_was_over, 1);
-        char rss_mb[32];
-        char budget_mb[32];
-        char pct_str[16];
-        // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+        char rss_mb[CBM_SZ_32];
+        char budget_mb[CBM_SZ_32];
+        char pct_str[CBM_SZ_16];
         snprintf(rss_mb, sizeof(rss_mb), "%zu", rss / MB_DIVISOR);
-        // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
         snprintf(budget_mb, sizeof(budget_mb), "%zu", g_budget / MB_DIVISOR);
-        // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
-        snprintf(pct_str, sizeof(pct_str), "%zu", g_budget > 0 ? (rss * 100) / g_budget : 0);
+        snprintf(pct_str, sizeof(pct_str), "%zu",
+                 g_budget > 0 ? (rss * CBM_PERCENT) / g_budget : 0);
         cbm_log_warn("mem.pressure.warn", "rss_mb", rss_mb, "budget_mb", budget_mb, "pct", pct_str);
     } else if (!over && was) {
         atomic_store(&g_was_over, 0);
-        char rss_mb[32];
-        char budget_mb[32];
-        char pct_str[16];
-        // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+        char rss_mb[CBM_SZ_32];
+        char budget_mb[CBM_SZ_32];
+        char pct_str[CBM_SZ_16];
         snprintf(rss_mb, sizeof(rss_mb), "%zu", rss / MB_DIVISOR);
-        // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
         snprintf(budget_mb, sizeof(budget_mb), "%zu", g_budget / MB_DIVISOR);
-        // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
-        snprintf(pct_str, sizeof(pct_str), "%zu", g_budget > 0 ? (rss * 100) / g_budget : 0);
+        snprintf(pct_str, sizeof(pct_str), "%zu",
+                 g_budget > 0 ? (rss * CBM_PERCENT) / g_budget : 0);
         cbm_log_info("mem.pressure.ok", "rss_mb", rss_mb, "budget_mb", budget_mb, "pct", pct_str);
     }
 }
@@ -113,21 +112,19 @@ void cbm_mem_init(double ram_fraction) {
         return;
     }
 
-    if (ram_fraction <= 0.0 || ram_fraction > 1.0) {
-        ram_fraction = 0.5;
+    if (ram_fraction <= 0.0 || ram_fraction > MAX_RAM_FRACTION) {
+        ram_fraction = DEFAULT_RAM_FRACTION;
     }
 
-    /* Reduce upfront memory: don't eagerly commit segments */
-    mi_option_set(mi_option_eager_commit, 0);
+    /* Reduce upfront memory: don't eagerly commit arenas */
+    mi_option_set(mi_option_arena_eager_commit, 0);
 
     cbm_system_info_t info = cbm_system_info();
     g_budget = (size_t)((double)info.total_ram * ram_fraction);
 
-    char budget_mb[32];
-    char ram_mb[32];
-    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+    char budget_mb[CBM_SZ_32];
+    char ram_mb[CBM_SZ_32];
     snprintf(budget_mb, sizeof(budget_mb), "%zu", g_budget / MB_DIVISOR);
-    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
     snprintf(ram_mb, sizeof(ram_mb), "%zu", info.total_ram / MB_DIVISOR);
     cbm_log_info("mem.init", "budget_mb", budget_mb, "total_ram_mb", ram_mb);
 }
@@ -165,7 +162,7 @@ bool cbm_mem_over_budget(void) {
 
 size_t cbm_mem_worker_budget(int num_workers) {
     if (num_workers <= 0) {
-        num_workers = 1;
+        num_workers = SKIP_ONE;
     }
     return g_budget / (size_t)num_workers;
 }

@@ -7,7 +7,6 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
 #include "mimalloc/prim.h"    // _mi_prim_random_buf
-#include <string.h>       // memset
 
 /* ----------------------------------------------------------------------------
 We use our own PRNG to keep predictable performance of random number generation
@@ -33,15 +32,11 @@ The implementation uses regular C code which compiles very well on modern compil
 (gcc x64 has no register spills, and clang 6+ uses SSE instructions)
 -----------------------------------------------------------------------------*/
 
-static inline uint32_t rotl(uint32_t x, uint32_t shift) {
-  return (x << shift) | (x >> (32 - shift));
-}
-
 static inline void qround(uint32_t x[16], size_t a, size_t b, size_t c, size_t d) {
-  x[a] += x[b]; x[d] = rotl(x[d] ^ x[a], 16);
-  x[c] += x[d]; x[b] = rotl(x[b] ^ x[c], 12);
-  x[a] += x[b]; x[d] = rotl(x[d] ^ x[a], 8);
-  x[c] += x[d]; x[b] = rotl(x[b] ^ x[c], 7);
+  x[a] += x[b]; x[d] = mi_rotl32(x[d] ^ x[a], 16);
+  x[c] += x[d]; x[b] = mi_rotl32(x[b] ^ x[c], 12);
+  x[a] += x[b]; x[d] = mi_rotl32(x[d] ^ x[a], 8);
+  x[c] += x[d]; x[b] = mi_rotl32(x[b] ^ x[c], 7);
 }
 
 static void chacha_block(mi_random_ctx_t* ctx)
@@ -99,7 +94,7 @@ static void chacha_init(mi_random_ctx_t* ctx, const uint8_t key[32], uint64_t no
   // since we only use chacha for randomness (and not encryption) we
   // do not _need_ to read 32-bit values as little endian but we do anyways
   // just for being compatible :-)
-  memset(ctx, 0, sizeof(*ctx));
+  _mi_memzero(ctx, sizeof(*ctx));
   for (size_t i = 0; i < 4; i++) {
     const uint8_t* sigma = (uint8_t*)"expand 32-byte k";
     ctx->input[i] = read32(sigma,i);
@@ -114,7 +109,7 @@ static void chacha_init(mi_random_ctx_t* ctx, const uint8_t key[32], uint64_t no
 }
 
 static void chacha_split(mi_random_ctx_t* ctx, uint64_t nonce, mi_random_ctx_t* ctx_new) {
-  memset(ctx_new, 0, sizeof(*ctx_new));
+  _mi_memzero(ctx_new, sizeof(*ctx_new));
   _mi_memcpy(ctx_new->input, ctx->input, sizeof(ctx_new->input));
   ctx_new->input[12] = 0;
   ctx_new->input[13] = 0;
@@ -143,13 +138,17 @@ void _mi_random_split(mi_random_ctx_t* ctx, mi_random_ctx_t* ctx_new) {
 
 uintptr_t _mi_random_next(mi_random_ctx_t* ctx) {
   mi_assert_internal(mi_random_is_initialized(ctx));
-  #if MI_INTPTR_SIZE <= 4
-    return chacha_next32(ctx);
-  #elif MI_INTPTR_SIZE == 8
-    return (((uintptr_t)chacha_next32(ctx) << 32) | chacha_next32(ctx));
-  #else
-  # error "define mi_random_next for this platform"
-  #endif
+  uintptr_t r;
+  do {
+    #if MI_INTPTR_SIZE <= 4
+    r = chacha_next32(ctx);
+    #elif MI_INTPTR_SIZE == 8
+    r = (((uintptr_t)chacha_next32(ctx) << 32) | chacha_next32(ctx));
+    #else
+    # error "define mi_random_next for this platform"
+    #endif
+  } while (r==0);
+  return r;
 }
 
 
@@ -160,10 +159,10 @@ If we cannot get good randomness, we fall back to weak randomness based on a tim
 
 uintptr_t _mi_os_random_weak(uintptr_t extra_seed) {
   uintptr_t x = (uintptr_t)&_mi_os_random_weak ^ extra_seed; // ASLR makes the address random
-  x ^= _mi_prim_clock_now();  
+  x ^= _mi_prim_clock_now();
   // and do a few randomization steps
   uintptr_t max = ((x ^ (x >> 17)) & 0x0F) + 1;
-  for (uintptr_t i = 0; i < max; i++) {
+  for (uintptr_t i = 0; i < max || x==0; i++, x++) {
     x = _mi_random_shuffle(x);
   }
   mi_assert_internal(x != 0);
@@ -179,7 +178,7 @@ static void mi_random_init_ex(mi_random_ctx_t* ctx, bool use_weak) {
     if (!use_weak) { _mi_warning_message("unable to use secure randomness\n"); }
     #endif
     uintptr_t x = _mi_os_random_weak(0);
-    for (size_t i = 0; i < 8; i++) {  // key is eight 32-bit words.
+    for (size_t i = 0; i < 8; i++, x++) {  // key is eight 32-bit words.
       x = _mi_random_shuffle(x);
       ((uint32_t*)key)[i] = (uint32_t)x;
     }

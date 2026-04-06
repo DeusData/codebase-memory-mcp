@@ -51,9 +51,14 @@ static int __attribute__((unused)) has_import(CBMFileResult *r, const char *path
 static int has_import_exact(CBMFileResult *r, const char *local_name, const char *module_path) {
     for (int i = 0; i < r->imports.count; i++) {
         CBMImport *imp = &r->imports.items[i];
-        if (imp->local_name && imp->module_path && strcmp(imp->local_name, local_name) == 0 &&
-            strcmp(imp->module_path, module_path) == 0) {
-            return 1;
+        if (imp->module_path && strcmp(imp->module_path, module_path) == 0) {
+            if (local_name == NULL) {
+                if (!imp->local_name) {
+                    return 1;
+                }
+            } else if (imp->local_name && strcmp(imp->local_name, local_name) == 0) {
+                return 1;
+            }
         }
     }
     return 0;
@@ -2030,6 +2035,61 @@ TEST(gdscript_signal_calls_and_import_alias) {
     PASS();
 }
 
+TEST(gdscript_nested_preload_call_chain_emits_import) {
+    const char *src = "extends EditorPlugin\n"
+                      "func _enter_tree():\n"
+                      "    add_child(preload(\"res://addons/simple_import_plugin/import.gd\").new())\n"
+                      "\n"
+                      "func _process(_delta):\n"
+                      "    preload(\"res://addons/simple_import_plugin/cleanup.gd\")._cleanup()\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "addons/simple_import_plugin/plugin.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_import_exact(r, NULL, "addons/simple_import_plugin/import.gd"));
+    ASSERT(has_import_exact(r, NULL, "addons/simple_import_plugin/cleanup.gd"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_nested_preload_argument_emits_import) {
+    const char *src = "extends EditorPlugin\n"
+                      "func handles(object):\n"
+                      "    return is_instance_of(object, preload(\"res://addons/main_screen/handled_by_main_screen.gd\"))\n";
+
+    CBMFileResult *r =
+        extract(src, CBM_LANG_GDSCRIPT, "t", "addons/main_screen/main_screen_plugin.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_import(r, "addons/main_screen/handled_by_main_screen.gd"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(gdscript_extends_nested_preload_emits_import) {
+    const char *src = "extends preload(\"res://actors/base.gd\")\n"
+                      "func _ready():\n"
+                      "    pass\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "addons/special/gdscript_base.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT(has_import(r, "actors/base.gd"));
+    int saw_aliasless_import = 0;
+    for (int i = 0; i < r->imports.count; i++) {
+        CBMImport *imp = &r->imports.items[i];
+        if (imp->module_path && strcmp(imp->module_path, "actors/base.gd") == 0) {
+            ASSERT_TRUE(imp->local_name == NULL);
+            saw_aliasless_import = 1;
+        }
+    }
+    ASSERT_TRUE(saw_aliasless_import);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(gdscript_top_level_string_ref_uses_script_anchor_scope) {
     const char *src = "class_name Player\n"
                       "const API_URL = \"https://example.com/api\"\n";
@@ -3160,6 +3220,9 @@ SUITE(extraction) {
     RUN_TEST(gdscript_defs_script_fallback_anchor);
     RUN_TEST(gdscript_defs_static_func_var_and_class_stmt);
     RUN_TEST(gdscript_signal_calls_and_import_alias);
+    RUN_TEST(gdscript_nested_preload_call_chain_emits_import);
+    RUN_TEST(gdscript_nested_preload_argument_emits_import);
+    RUN_TEST(gdscript_extends_nested_preload_emits_import);
     RUN_TEST(gdscript_top_level_string_ref_uses_script_anchor_scope);
     RUN_TEST(gdscript_signal_metadata_dotted_receivers);
     RUN_TEST(gdscript_signal_metadata_receiver_emit_prefers_receiver_name_over_payload);

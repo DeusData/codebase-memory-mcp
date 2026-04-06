@@ -1,12 +1,12 @@
 #!/bin/bash
-# lint.sh — Run all CI linters (clang-format + cppcheck).
+# lint.sh — Run all linters (clang-tidy + cppcheck + clang-format).
 #
 # Usage:
-#   scripts/lint.sh                                    # Default tools
+#   scripts/lint.sh                                    # All 3 linters
 #   scripts/lint.sh CLANG_FORMAT=clang-format-20       # Override formatter
+#   scripts/lint.sh --ci                               # CI mode (skip clang-tidy)
 #
-# This script is the SINGLE source of truth for CI linting.
-# clang-tidy is intentionally excluded (platform-dependent, pre-commit only).
+# This script is the SINGLE source of truth for linting.
 
 set -euo pipefail
 
@@ -16,15 +16,26 @@ cd "$ROOT"
 # shellcheck source=env.sh
 source "$ROOT/scripts/env.sh"
 
-# Forward overrides from args
+# Check for --ci flag (skip clang-tidy for platforms without it)
+CI_ONLY=false
 MAKE_ARGS=()
 for arg in "$@"; do
-    MAKE_ARGS+=("$arg")
+    if [ "$arg" = "--ci" ]; then
+        CI_ONLY=true
+    else
+        MAKE_ARGS+=("$arg")
+    fi
 done
 
 print_env "lint.sh"
 
-# Run format and cppcheck in parallel
-make -j2 -f Makefile.cbm lint-ci "${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}"
+if $CI_ONLY; then
+    echo "=== CI mode: cppcheck + clang-format ==="
+    $ARCH_PREFIX make -j2 -f Makefile.cbm lint-ci "${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}"
+    echo "=== CI linters passed ==="
+else
+    echo "=== Full lint: clang-tidy + cppcheck + clang-format ==="
+    $ARCH_PREFIX make -j3 -f Makefile.cbm lint "${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}"
+fi
 
 echo "=== All linters passed ==="

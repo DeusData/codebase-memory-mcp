@@ -9,9 +9,11 @@
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
+#include <foundation/platform.h>
 #include <foundation/log.h>
 
 #include <string.h>
@@ -26,6 +28,60 @@ static char g_tmpdir[256];
 static char g_dbpath[512];
 static cbm_mcp_server_t *g_srv = NULL;
 static char *g_project = NULL;
+
+static int count_in_response(const char *resp, const char *key) {
+    if (!resp)
+        return -1;
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char *p = strstr(resp, pattern);
+    if (p)
+        return atoi(p + strlen(pattern));
+    snprintf(pattern, sizeof(pattern), "\\\"%s\\\":", key);
+    p = strstr(resp, pattern);
+    if (p)
+        return atoi(p + strlen(pattern));
+    return -1;
+}
+
+static char *string_in_response(const char *resp, const char *key) {
+    if (!resp)
+        return NULL;
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+    const char *p = strstr(resp, pattern);
+    size_t advance = strlen(pattern);
+    bool escaped = false;
+    if (!p) {
+        snprintf(pattern, sizeof(pattern), "\\\"%s\\\":\\\"", key);
+        p = strstr(resp, pattern);
+        advance = strlen(pattern);
+        escaped = true;
+    }
+    if (!p)
+        return NULL;
+    p += advance;
+    const char *end = escaped ? strstr(p, "\\\"") : strchr(p, '"');
+    if (!end || end <= p)
+        return NULL;
+    size_t len = (size_t)(end - p);
+    char *out = malloc(len + 1);
+    if (!out)
+        return NULL;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return out;
+}
+
+static bool indexed_db_ready(const char *dbpath, const char *project) {
+    cbm_store_t *store = cbm_store_open_path_query(dbpath);
+    if (!store)
+        return false;
+    int nodes = cbm_store_count_nodes(store, project);
+    int edges = cbm_store_count_edges(store, project);
+    cbm_store_close(store);
+    return nodes > 0 && edges > 0;
+}
 
 /* Create source files in temp directory */
 static int create_test_project(void) {
@@ -99,21 +155,19 @@ static int integration_setup(void) {
     if (create_test_project() != 0)
         return -1;
 
-    /* Derive project name (same logic the pipeline uses) */
+    /* Derive fallback project name (same logic the pipeline uses) */
     g_project = cbm_project_name_from_path(g_tmpdir);
     if (!g_project)
         return -1;
 
     /* Build db path for direct store queries (pipeline writes here) */
-    const char *home = getenv("HOME");
-    if (!home)
-        home = "/tmp";
-    snprintf(g_dbpath, sizeof(g_dbpath), "%s/.cache/codebase-memory-mcp/%s.db", home, g_project);
+    const char *cache = cbm_resolve_cache_dir();
+    if (!cache)
+        cache = "/tmp";
+    snprintf(g_dbpath, sizeof(g_dbpath), "%s/%s.db", cache, g_project);
 
     /* Ensure cache dir exists */
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
-    cbm_mkdir(cache_dir);
+    cbm_mkdir(cache);
 
     /* Remove stale db from previous test runs */
     unlink(g_dbpath);
@@ -135,10 +189,24 @@ static int integration_setup(void) {
     if (!resp)
         return -1;
 
-    /* Verify indexing succeeded */
+    /* Verify indexing succeeded and use the actual returned project/db path. */
     bool ok = strstr(resp, "indexed") != NULL;
+    char *resp_project = string_in_response(resp, "project");
+    if (resp_project && resp_project[0]) {
+        free(g_project);
+        g_project = resp_project;
+        snprintf(g_dbpath, sizeof(g_dbpath), "%s/%s.db", cache, g_project);
+    } else {
+        free(resp_project);
+    }
+    int nodes = count_in_response(resp, "nodes");
+    int edges = count_in_response(resp, "edges");
     free(resp);
-    return ok ? 0 : -1;
+    if (!ok)
+        return -1;
+    if (nodes <= 0 || edges <= 0)
+        return -1;
+    return indexed_db_ready(g_dbpath, g_project) ? 0 : -1;
 }
 
 static void integration_teardown(void) {
@@ -150,9 +218,7 @@ static void integration_teardown(void) {
     g_project = NULL;
 
     /* Clean up temp project */
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_tmpdir);
-    system(cmd);
+    th_rmtree(g_tmpdir);
 
     /* Clean up cache db */
     unlink(g_dbpath);
@@ -687,14 +753,12 @@ static int gdscript_integration_setup(void) {
     if (!g_gd_project)
         return -1;
 
-    const char *home = getenv("HOME");
-    if (!home)
-        home = "/tmp";
-    snprintf(g_gd_dbpath, sizeof(g_gd_dbpath), "%s/.cache/codebase-memory-mcp/%s.db", home, g_gd_project);
+    const char *cache = cbm_resolve_cache_dir();
+    if (!cache)
+        cache = "/tmp";
+    snprintf(g_gd_dbpath, sizeof(g_gd_dbpath), "%s/%s.db", cache, g_gd_project);
 
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
-    cbm_mkdir(cache_dir);
+    cbm_mkdir(cache);
 
     unlink(g_gd_dbpath);
 
@@ -709,8 +773,22 @@ static int gdscript_integration_setup(void) {
         return -1;
 
     bool ok = strstr(resp, "indexed") != NULL;
+    char *resp_project = string_in_response(resp, "project");
+    if (resp_project && resp_project[0]) {
+        free(g_gd_project);
+        g_gd_project = resp_project;
+        snprintf(g_gd_dbpath, sizeof(g_gd_dbpath), "%s/%s.db", cache, g_gd_project);
+    } else {
+        free(resp_project);
+    }
+    int nodes = count_in_response(resp, "nodes");
+    int edges = count_in_response(resp, "edges");
     free(resp);
-    return ok ? 0 : -1;
+    if (!ok)
+        return -1;
+    if (nodes <= 0 || edges <= 0)
+        return -1;
+    return indexed_db_ready(g_gd_dbpath, g_gd_project) ? 0 : -1;
 }
 
 static void gdscript_integration_teardown(void) {

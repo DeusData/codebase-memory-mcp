@@ -6,7 +6,6 @@
  */
 #include "test_framework.h"
 #include "pipeline/pipeline.h"
-#include "pipeline/httplink.h"
 
 #include <stdlib.h>
 #include <string.h>

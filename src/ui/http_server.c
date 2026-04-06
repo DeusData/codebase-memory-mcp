@@ -72,8 +72,7 @@ static void update_cors(struct mg_http_message *hm) {
                  "Access-Control-Allow-Methods: POST, GET, DELETE, OPTIONS\r\n"
                  "Access-Control-Allow-Headers: Content-Type\r\n");
     }
-    snprintf(g_cors_json, sizeof(g_cors_json),
-             "%sContent-Type: application/json\r\n", g_cors);
+    snprintf(g_cors_json, sizeof(g_cors_json), "%sContent-Type: application/json\r\n", g_cors);
 }
 
 /* ── Server state ─────────────────────────────────────────────── */
@@ -122,6 +121,15 @@ static bool serve_embedded(struct mg_connection *c, const char *path) {
 
 /* Forward declaration */
 static bool get_query_param(struct mg_str query, const char *name, char *buf, int bufsz);
+
+/* Build DB path for a project: <cache_dir>/<project>.db */
+static void db_path_for_project(const char *project, char *buf, size_t bufsz) {
+    const char *dir = cbm_resolve_cache_dir();
+    if (!dir) {
+        dir = cbm_tmpdir();
+    }
+    snprintf(buf, bufsz, "%s/%s.db", dir, project);
+}
 
 /* ── Log ring buffer ──────────────────────────────────────────── */
 
@@ -291,8 +299,7 @@ static void handle_processes(struct mg_connection *c) {
 /* POST /api/process-kill — kill a process by PID */
 static void handle_process_kill(struct mg_connection *c, struct mg_http_message *hm) {
     if (hm->body.len == 0 || hm->body.len > 256) {
-        mg_http_reply(c, 400, g_cors_json,
-                      "{\"error\":\"invalid body\"}");
+        mg_http_reply(c, 400, g_cors_json, "{\"error\":\"invalid body\"}");
         return;
     }
 
@@ -302,16 +309,14 @@ static void handle_process_kill(struct mg_connection *c, struct mg_http_message 
 
     yyjson_doc *doc = yyjson_read(body, hm->body.len, 0);
     if (!doc) {
-        mg_http_reply(c, 400, g_cors_json,
-                      "{\"error\":\"invalid json\"}");
+        mg_http_reply(c, 400, g_cors_json, "{\"error\":\"invalid json\"}");
         return;
     }
     yyjson_val *root = yyjson_doc_get_root(doc);
     yyjson_val *v_pid = yyjson_obj_get(root, "pid");
     if (!v_pid || !yyjson_is_int(v_pid)) {
         yyjson_doc_free(doc);
-        mg_http_reply(c, 400, g_cors_json,
-                      "{\"error\":\"missing pid\"}");
+        mg_http_reply(c, 400, g_cors_json, "{\"error\":\"missing pid\"}");
         return;
     }
     int target_pid = (int)yyjson_get_int(v_pid);
@@ -351,21 +356,18 @@ static void handle_process_kill(struct mg_connection *c, struct mg_http_message 
     if (!hproc || !TerminateProcess(hproc, 1)) {
         if (hproc)
             CloseHandle(hproc);
-        mg_http_reply(c, 500, g_cors_json,
-                      "{\"error\":\"kill failed\"}");
+        mg_http_reply(c, 500, g_cors_json, "{\"error\":\"kill failed\"}");
         return;
     }
     CloseHandle(hproc);
 #else
     if (kill(target_pid, SIGTERM) != 0) {
-        mg_http_reply(c, 500, g_cors_json,
-                      "{\"error\":\"kill failed\"}");
+        mg_http_reply(c, 500, g_cors_json, "{\"error\":\"kill failed\"}");
         return;
     }
 #endif
 
-    mg_http_reply(c, 200, g_cors_json, "{\"killed\":%d}",
-                  target_pid);
+    mg_http_reply(c, 200, g_cors_json, "{\"killed\":%d}", target_pid);
 }
 
 /* ── Directory browser ────────────────────────────────────────── */
@@ -375,9 +377,9 @@ static void handle_process_kill(struct mg_connection *c, struct mg_http_message 
 /* GET /api/browse?path=/some/dir — list subdirectories for file picker */
 static void handle_browse(struct mg_connection *c, struct mg_http_message *hm) {
     char path[1024] = {0};
+    const char *home = cbm_get_home_dir();
     if (!get_query_param(hm->query, "path", path, (int)sizeof(path)) || path[0] == '\0') {
         /* Default to home directory */
-        const char *home = cbm_get_home_dir();
         if (home)
             snprintf(path, sizeof(path), "%s", home);
         else
@@ -385,15 +387,13 @@ static void handle_browse(struct mg_connection *c, struct mg_http_message *hm) {
     }
 
     if (!cbm_is_dir(path)) {
-        mg_http_reply(c, 400, g_cors_json,
-                      "{\"error\":\"not a directory\"}");
+        mg_http_reply(c, 400, g_cors_json, "{\"error\":\"not a directory\"}");
         return;
     }
 
     DIR *dir = opendir(path);
     if (!dir) {
-        mg_http_reply(c, 403, g_cors_json,
-                      "{\"error\":\"cannot open directory\"}");
+        mg_http_reply(c, 403, g_cors_json, "{\"error\":\"cannot open directory\"}");
         return;
     }
 
@@ -447,21 +447,16 @@ static void handle_browse(struct mg_connection *c, struct mg_http_message *hm) {
 static void handle_adr_get(struct mg_connection *c, struct mg_http_message *hm) {
     char name[256] = {0};
     if (!get_query_param(hm->query, "project", name, (int)sizeof(name)) || name[0] == '\0') {
-        mg_http_reply(c, 400, g_cors_json,
-                      "{\"error\":\"missing project\"}");
+        mg_http_reply(c, 400, g_cors_json, "{\"error\":\"missing project\"}");
         return;
     }
 
-    const char *home = cbm_get_home_dir();
-    if (!home)
-        home = cbm_tmpdir();
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home, name);
+    db_path_for_project(name, db_path, sizeof(db_path));
 
     cbm_store_t *store = cbm_store_open_path(db_path);
     if (!store) {
-        mg_http_reply(c, 200, g_cors_json,
-                      "{\"has_adr\":false}");
+        mg_http_reply(c, 200, g_cors_json, "{\"has_adr\":false}");
         return;
     }
 
@@ -502,8 +497,7 @@ static void handle_adr_get(struct mg_connection *c, struct mg_http_message *hm) 
         }
         cbm_store_adr_free(&adr);
     } else {
-        mg_http_reply(c, 200, g_cors_json,
-                      "{\"has_adr\":false}");
+        mg_http_reply(c, 200, g_cors_json, "{\"has_adr\":false}");
     }
     cbm_store_close(store);
 }
@@ -511,8 +505,7 @@ static void handle_adr_get(struct mg_connection *c, struct mg_http_message *hm) 
 /* POST /api/adr — save ADR content. Body: {"project":"...","content":"..."} */
 static void handle_adr_save(struct mg_connection *c, struct mg_http_message *hm) {
     if (hm->body.len == 0 || hm->body.len > 16384) {
-        mg_http_reply(c, 400, g_cors_json,
-                      "{\"error\":\"invalid body\"}");
+        mg_http_reply(c, 400, g_cors_json, "{\"error\":\"invalid body\"}");
         return;
     }
 
@@ -527,8 +520,7 @@ static void handle_adr_save(struct mg_connection *c, struct mg_http_message *hm)
     yyjson_doc *doc = yyjson_read(body, hm->body.len, 0);
     free(body);
     if (!doc) {
-        mg_http_reply(c, 400, g_cors_json,
-                      "{\"error\":\"invalid json\"}");
+        mg_http_reply(c, 400, g_cors_json, "{\"error\":\"invalid json\"}");
         return;
     }
 
@@ -537,25 +529,20 @@ static void handle_adr_save(struct mg_connection *c, struct mg_http_message *hm)
     yyjson_val *v_content = yyjson_obj_get(root, "content");
     if (!v_proj || !yyjson_is_str(v_proj) || !v_content || !yyjson_is_str(v_content)) {
         yyjson_doc_free(doc);
-        mg_http_reply(c, 400, g_cors_json,
-                      "{\"error\":\"missing project or content\"}");
+        mg_http_reply(c, 400, g_cors_json, "{\"error\":\"missing project or content\"}");
         return;
     }
 
     const char *proj = yyjson_get_str(v_proj);
     const char *content = yyjson_get_str(v_content);
 
-    const char *home = cbm_get_home_dir();
-    if (!home)
-        home = cbm_tmpdir();
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home, proj);
+    db_path_for_project(proj, db_path, sizeof(db_path));
 
     cbm_store_t *store = cbm_store_open_path(db_path);
     yyjson_doc_free(doc);
     if (!store) {
-        mg_http_reply(c, 500, g_cors_json,
-                      "{\"error\":\"cannot open store\"}");
+        mg_http_reply(c, 500, g_cors_json, "{\"error\":\"cannot open store\"}");
         return;
     }
 
@@ -563,11 +550,9 @@ static void handle_adr_save(struct mg_connection *c, struct mg_http_message *hm)
     cbm_store_close(store);
 
     if (rc == CBM_STORE_OK) {
-        mg_http_reply(c, 200, g_cors_json,
-                      "{\"saved\":true}");
+        mg_http_reply(c, 200, g_cors_json, "{\"saved\":true}");
     } else {
-        mg_http_reply(c, 500, g_cors_json,
-                      "{\"error\":\"save failed\"}");
+        mg_http_reply(c, 500, g_cors_json, "{\"error\":\"save failed\"}");
     }
 }
 
@@ -748,8 +733,7 @@ static void *index_thread_fn(void *arg) {
 /* POST /api/index — body: {"root_path": "/abs/path"} → starts background indexing */
 static void handle_index_start(struct mg_connection *c, struct mg_http_message *hm) {
     if (hm->body.len == 0 || hm->body.len > 4096) {
-        mg_http_reply(c, 400, g_cors_json,
-                      "{\"error\":\"invalid body\"}");
+        mg_http_reply(c, 400, g_cors_json, "{\"error\":\"invalid body\"}");
         return;
     }
 
@@ -759,16 +743,14 @@ static void handle_index_start(struct mg_connection *c, struct mg_http_message *
 
     yyjson_doc *doc = yyjson_read(body_buf, hm->body.len, 0);
     if (!doc) {
-        mg_http_reply(c, 400, g_cors_json,
-                      "{\"error\":\"invalid json\"}");
+        mg_http_reply(c, 400, g_cors_json, "{\"error\":\"invalid json\"}");
         return;
     }
     yyjson_val *root = yyjson_doc_get_root(doc);
     yyjson_val *v_path = yyjson_obj_get(root, "root_path");
     if (!v_path || !yyjson_is_str(v_path)) {
         yyjson_doc_free(doc);
-        mg_http_reply(c, 400, g_cors_json,
-                      "{\"error\":\"missing root_path\"}");
+        mg_http_reply(c, 400, g_cors_json, "{\"error\":\"missing root_path\"}");
         return;
     }
     const char *rpath = yyjson_get_str(v_path);
@@ -776,8 +758,7 @@ static void handle_index_start(struct mg_connection *c, struct mg_http_message *
     /* Check path exists */
     if (!cbm_is_dir(rpath)) {
         yyjson_doc_free(doc);
-        mg_http_reply(c, 400, g_cors_json,
-                      "{\"error\":\"directory not found\"}");
+        mg_http_reply(c, 400, g_cors_json, "{\"error\":\"directory not found\"}");
         return;
     }
 
@@ -792,8 +773,7 @@ static void handle_index_start(struct mg_connection *c, struct mg_http_message *
     }
     if (slot < 0) {
         yyjson_doc_free(doc);
-        mg_http_reply(c, 429, g_cors_json,
-                      "{\"error\":\"all index slots busy\"}");
+        mg_http_reply(c, 429, g_cors_json, "{\"error\":\"all index slots busy\"}");
         return;
     }
 
@@ -808,13 +788,12 @@ static void handle_index_start(struct mg_connection *c, struct mg_http_message *
     if (cbm_thread_create(&tid, 0, index_thread_fn, job) != 0) {
         atomic_store(&job->status, 3);
         snprintf(job->error_msg, sizeof(job->error_msg), "thread creation failed");
-        mg_http_reply(c, 500, g_cors_json,
-                      "{\"error\":\"thread creation failed\"}");
+        mg_http_reply(c, 500, g_cors_json, "{\"error\":\"thread creation failed\"}");
         return;
     }
 
-    mg_http_reply(c, 202, g_cors_json,
-                  "{\"status\":\"indexing\",\"slot\":%d,\"path\":\"%s\"}", slot, job->root_path);
+    mg_http_reply(c, 202, g_cors_json, "{\"status\":\"indexing\",\"slot\":%d,\"path\":\"%s\"}",
+                  slot, job->root_path);
 }
 
 /* GET /api/index-status — returns status of all index jobs */
@@ -841,26 +820,20 @@ static void handle_index_status(struct mg_connection *c) {
 static void handle_delete_project(struct mg_connection *c, struct mg_http_message *hm) {
     char name[256] = {0};
     if (!get_query_param(hm->query, "name", name, (int)sizeof(name)) || name[0] == '\0') {
-        mg_http_reply(c, 400, g_cors_json,
-                      "{\"error\":\"missing name\"}");
+        mg_http_reply(c, 400, g_cors_json, "{\"error\":\"missing name\"}");
         return;
     }
 
-    const char *home = cbm_get_home_dir();
-    if (!home)
-        home = cbm_tmpdir();
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home, name);
+    db_path_for_project(name, db_path, sizeof(db_path));
 
     if (!cbm_file_exists(db_path)) {
-        mg_http_reply(c, 404, g_cors_json,
-                      "{\"error\":\"project not found\"}");
+        mg_http_reply(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
         return;
     }
 
     if (unlink(db_path) != 0) {
-        mg_http_reply(c, 500, g_cors_json,
-                      "{\"error\":\"failed to delete\"}");
+        mg_http_reply(c, 500, g_cors_json, "{\"error\":\"failed to delete\"}");
         return;
     }
 
@@ -879,27 +852,21 @@ static void handle_delete_project(struct mg_connection *c, struct mg_http_messag
 static void handle_project_health(struct mg_connection *c, struct mg_http_message *hm) {
     char name[256] = {0};
     if (!get_query_param(hm->query, "name", name, (int)sizeof(name)) || name[0] == '\0') {
-        mg_http_reply(c, 400, g_cors_json,
-                      "{\"error\":\"missing name\"}");
+        mg_http_reply(c, 400, g_cors_json, "{\"error\":\"missing name\"}");
         return;
     }
 
-    const char *home = cbm_get_home_dir();
-    if (!home)
-        home = cbm_tmpdir();
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home, name);
+    db_path_for_project(name, db_path, sizeof(db_path));
 
     if (!cbm_file_exists(db_path)) {
-        mg_http_reply(c, 200, g_cors_json,
-                      "{\"status\":\"missing\"}");
+        mg_http_reply(c, 200, g_cors_json, "{\"status\":\"missing\"}");
         return;
     }
 
     cbm_store_t *store = cbm_store_open_path(db_path);
     if (!store) {
-        mg_http_reply(c, 200, g_cors_json,
-                      "{\"status\":\"corrupt\",\"reason\":\"cannot open\"}");
+        mg_http_reply(c, 200, g_cors_json, "{\"status\":\"corrupt\",\"reason\":\"cannot open\"}");
         return;
     }
 
@@ -929,8 +896,7 @@ static void handle_layout(struct mg_connection *c, struct mg_http_message *hm) {
 
     if (!get_query_param(hm->query, "project", project, (int)sizeof(project)) ||
         project[0] == '\0') {
-        mg_http_reply(c, 400, g_cors_json,
-                      "{\"error\":\"missing project parameter\"}");
+        mg_http_reply(c, 400, g_cors_json, "{\"error\":\"missing project parameter\"}");
         return;
     }
 
@@ -942,22 +908,17 @@ static void handle_layout(struct mg_connection *c, struct mg_http_message *hm) {
     }
 
     /* Open a read-only store for this project */
-    const char *home = cbm_get_home_dir();
-    if (!home)
-        home = cbm_tmpdir();
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home, project);
+    db_path_for_project(project, db_path, sizeof(db_path));
 
     if (!cbm_file_exists(db_path)) {
-        mg_http_reply(c, 404, g_cors_json,
-                      "{\"error\":\"project not found\"}");
+        mg_http_reply(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
         return;
     }
 
     cbm_store_t *store = cbm_store_open_path(db_path);
     if (!store) {
-        mg_http_reply(c, 500, g_cors_json,
-                      "{\"error\":\"cannot open store\"}");
+        mg_http_reply(c, 500, g_cors_json, "{\"error\":\"cannot open store\"}");
         return;
     }
 
@@ -966,8 +927,7 @@ static void handle_layout(struct mg_connection *c, struct mg_http_message *hm) {
     cbm_store_close(store);
 
     if (!layout) {
-        mg_http_reply(c, 500, g_cors_json,
-                      "{\"error\":\"layout computation failed\"}");
+        mg_http_reply(c, 500, g_cors_json, "{\"error\":\"layout computation failed\"}");
         return;
     }
 
@@ -975,8 +935,7 @@ static void handle_layout(struct mg_connection *c, struct mg_http_message *hm) {
     cbm_layout_free(layout);
 
     if (!json) {
-        mg_http_reply(c, 500, g_cors_json,
-                      "{\"error\":\"JSON serialization failed\"}");
+        mg_http_reply(c, 500, g_cors_json, "{\"error\":\"JSON serialization failed\"}");
         return;
     }
 
@@ -1028,7 +987,7 @@ static void http_handler(struct mg_connection *c, int ev, void *ev_data) {
 
     /* OPTIONS preflight for CORS */
     if (mg_strcmp(hm->method, mg_str("OPTIONS")) == 0) {
-                char opt_hdrs[512];
+        char opt_hdrs[512];
         snprintf(opt_hdrs, sizeof(opt_hdrs), "%sContent-Length: 0\r\n", g_cors);
         mg_http_reply(c, 204, opt_hdrs, "");
         return;

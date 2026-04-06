@@ -138,14 +138,14 @@ if [ "$TOTAL" -lt 1 ]; then
 fi
 echo "OK: search_graph found $TOTAL result(s) for 'compute'"
 
-# 3b: trace_call_path — verify compute has callers
-TRACE=$(cli trace_call_path "{\"project\":\"$PROJECT\",\"function_name\":\"compute\",\"direction\":\"inbound\",\"depth\":1}")
+# 3b: trace_path — verify compute has callers
+TRACE=$(cli trace_path "{\"project\":\"$PROJECT\",\"function_name\":\"compute\",\"direction\":\"inbound\",\"depth\":1}")
 CALLERS=$(echo "$TRACE" | python3 -c "import json,sys; d=json.loads(json.loads(sys.stdin.read())['content'][0]['text']); print(len(d.get('callers',[])))" 2>/dev/null || echo "0")
 if [ "$CALLERS" -lt 1 ]; then
-  echo "FAIL: trace_call_path found 0 callers for 'compute'"
+  echo "FAIL: trace_path found 0 callers for 'compute'"
   exit 1
 fi
-echo "OK: trace_call_path found $CALLERS caller(s) for 'compute'"
+echo "OK: trace_path found $CALLERS caller(s) for 'compute'"
 
 # 3c: get_graph_schema — verify labels exist
 SCHEMA=$(cli get_graph_schema "{\"project\":\"$PROJECT\"}")
@@ -271,7 +271,7 @@ fi
 echo "OK: tools/list response received (id:2)"
 
 # 5c: Verify expected tools are present
-for TOOL in index_repository search_graph trace_call_path get_code_snippet search_code; do
+for TOOL in index_repository search_graph trace_path get_code_snippet search_code; do
   if ! grep -q "\"$TOOL\"" "$MCP_OUTPUT"; then
     echo "FAIL: tool '$TOOL' not found in tools/list response"
     rm -f "$MCP_INPUT" "$MCP_OUTPUT"

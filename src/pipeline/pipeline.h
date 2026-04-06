@@ -149,4 +149,6 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
                                               const char *module_qn, const char **import_map_keys,
                                               const char **import_map_vals, int import_map_count);
 
+const char *cbm_confidence_band(double score);
+
 #endif /* CBM_PIPELINE_H */

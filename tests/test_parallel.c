@@ -8,6 +8,7 @@
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/worker_pool.h"
@@ -71,9 +72,7 @@ static int setup_parallel_repo(void) {
 }
 
 static void rm_rf(const char *path) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
-    (void)system(cmd);
+    th_rmtree(path);
 }
 
 static void teardown_parallel_repo(void) {
@@ -405,6 +404,27 @@ static int setup_gdscript_repo(void) {
     fprintf(f, "[gd_scene load_steps=2 format=3]\n");
     fclose(f);
 
+    /* addon fixture for nested relative preload regression */
+    snprintf(path, sizeof(path), "%s/addons/simple_import_plugin", g_gd_tmpdir);
+    cbm_mkdir(path);
+
+    snprintf(path, sizeof(path), "%s/addons/simple_import_plugin/plugin.gd", g_gd_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f,
+            "extends EditorPlugin\n"
+            "func _enter_tree():\n"
+            "    add_child(preload(\"import.gd\").new())\n");
+    fclose(f);
+
+    snprintf(path, sizeof(path), "%s/addons/simple_import_plugin/import.gd", g_gd_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "class_name ImportScript\nfunc hello():\n    pass\n");
+    fclose(f);
+
     return 0;
 }
 
@@ -465,6 +485,36 @@ static int assert_gd_edge_type_parity(const char *type) {
     return 0;
 }
 
+static int count_import_edge(const cbm_gbuf_t *gbuf, const char *source_rel, const char *target_rel) {
+    char source_qn[512];
+    char target_qn[512];
+
+    snprintf(source_qn, sizeof(source_qn), "%s.%s__file__", "gd-par-test", source_rel);
+    snprintf(target_qn, sizeof(target_qn), "%s.%s", "gd-par-test",
+             target_rel);
+
+    const cbm_gbuf_node_t *source = cbm_gbuf_find_by_qn(gbuf, source_qn);
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(gbuf, target_qn);
+    if (!source || !target) {
+        return -1;
+    }
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(gbuf, source->id, "IMPORTS", &edges, &edge_count) != 0) {
+        return -1;
+    }
+
+    int count = 0;
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i] && edges[i]->target_id == target->id) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
 TEST(gdscript_parallel_calls_parity) {
     int rc = assert_gd_edge_type_parity("CALLS");
     if (rc == -1)
@@ -502,6 +552,20 @@ TEST(gdscript_parallel_defines_parity) {
     if (rc == -1)
         SKIP("setup failed");
     ASSERT_EQ(rc, 0);
+    PASS();
+}
+
+TEST(gdscript_parallel_imports_nested_preload_relative_path_regression) {
+    if (ensure_gd_parity_setup() != 0)
+        SKIP("setup failed");
+
+    int seq = count_import_edge(g_gd_seq_gbuf, "addons/simple_import_plugin/plugin.gd",
+                               "addons.simple_import_plugin.import");
+    int par = count_import_edge(g_gd_par_gbuf, "addons/simple_import_plugin/plugin.gd",
+                               "addons.simple_import_plugin.import");
+
+    ASSERT_GT(seq, 0);
+    ASSERT_EQ(seq, par);
     PASS();
 }
 
@@ -694,6 +758,7 @@ SUITE(parallel) {
     RUN_TEST(gdscript_parallel_calls_parity);
     RUN_TEST(gdscript_parallel_inherits_parity);
     RUN_TEST(gdscript_parallel_imports_parity);
+    RUN_TEST(gdscript_parallel_imports_nested_preload_relative_path_regression);
     RUN_TEST(gdscript_parallel_defines_method_parity);
     RUN_TEST(gdscript_parallel_defines_parity);
     RUN_TEST(gdscript_parallel_total_edges);

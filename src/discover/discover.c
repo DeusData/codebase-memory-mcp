@@ -11,6 +11,7 @@
 #include "discover/discover.h"
 #include "cbm.h" // CBMLanguage, CBM_LANG_COUNT, CBM_LANG_JSON
 
+#include "foundation/constants.h"
 #include "foundation/compat_fs.h"
 #include <stdint.h> // int64_t
 #include <stdio.h>
@@ -205,11 +206,10 @@ typedef struct {
     int capacity;
 } file_list_t;
 
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 static void fl_add(file_list_t *fl, const char *abs_path, const char *rel_path, CBMLanguage lang,
                    int64_t size) {
     if (fl->count >= fl->capacity) {
-        int new_cap = fl->capacity ? fl->capacity * 2 : 256;
+        int new_cap = fl->capacity ? fl->capacity * PAIR_LEN : CBM_SZ_256;
         cbm_file_info_t *new_files = realloc(fl->files, new_cap * sizeof(cbm_file_info_t));
         if (!new_files) {
             return;
@@ -219,7 +219,6 @@ static void fl_add(file_list_t *fl, const char *abs_path, const char *rel_path, 
     }
 
     cbm_file_info_t *fi = &fl->files[fl->count++];
-    // NOLINTNEXTLINE(misc-include-cleaner) — strdup provided by standard header
     fi->path = strdup(abs_path);
     fi->rel_path = strdup(rel_path);
     fi->language = lang;
@@ -228,116 +227,162 @@ static void fl_add(file_list_t *fl, const char *abs_path, const char *rel_path, 
 
 /* ── Recursive walk ──────────────────────────────────────────────── */
 
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters,misc-no-recursion)
-static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_discover_opts_t *opts,
-                     const cbm_gitignore_t *gitignore, const cbm_gitignore_t *cbmignore,
-                     file_list_t *out) {
-    cbm_dir_t *d = cbm_opendir(dir_path);
-    if (!d) {
+/* Check if a directory entry should be skipped (hardcoded dirs + gitignore). */
+static bool should_skip_directory(const char *entry_name, const char *rel_path,
+                                  const cbm_discover_opts_t *opts, const cbm_gitignore_t *gitignore,
+                                  const cbm_gitignore_t *cbmignore) {
+    if (cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL)) {
+        return true;
+    }
+    if (gitignore && cbm_gitignore_matches(gitignore, rel_path, true)) {
+        return true;
+    }
+    if (cbmignore && cbm_gitignore_matches(cbmignore, rel_path, true)) {
+        return true;
+    }
+    return false;
+}
+
+/* Check if a regular file should be skipped (filters + gitignore + size). */
+static bool should_skip_file(const char *entry_name, const char *rel_path,
+                             const cbm_discover_opts_t *opts, const cbm_gitignore_t *gitignore,
+                             const cbm_gitignore_t *cbmignore, off_t file_size) {
+    cbm_index_mode_t mode = opts ? opts->mode : CBM_MODE_FULL;
+    if (cbm_has_ignored_suffix(entry_name, mode)) {
+        return true;
+    }
+    if (cbm_should_skip_filename(entry_name, mode)) {
+        return true;
+    }
+    if (cbm_matches_fast_pattern(entry_name, mode)) {
+        return true;
+    }
+    if (gitignore && cbm_gitignore_matches(gitignore, rel_path, false)) {
+        return true;
+    }
+    if (cbmignore && cbm_gitignore_matches(cbmignore, rel_path, false)) {
+        return true;
+    }
+    if (opts && opts->max_file_size > 0 && file_size > opts->max_file_size) {
+        return true;
+    }
+    return false;
+}
+
+/* Detect language for a file, handling .m disambiguation and JSON filtering. */
+static CBMLanguage detect_file_language(const char *entry_name, const char *abs_path) {
+    CBMLanguage lang = cbm_language_for_filename(entry_name);
+    if (lang == CBM_LANG_COUNT) {
+        return CBM_LANG_COUNT;
+    }
+    /* Special: .m files need content-based disambiguation */
+    const char *dot = strrchr(entry_name, '.');
+    if (dot && strcmp(dot, ".m") == 0) {
+        lang = cbm_disambiguate_m(abs_path);
+    }
+    /* Check ignored JSON files */
+    if (lang == CBM_LANG_JSON && str_in_list(entry_name, IGNORED_JSON_FILES)) {
+        return CBM_LANG_COUNT;
+    }
+    return lang;
+}
+
+/* Stat a path, skipping symlinks. Returns 0 on success, -1 to skip. */
+static int safe_stat(const char *abs_path, struct stat *st) {
+#ifdef _WIN32
+    if (stat(abs_path, st) != 0) {
+        return CBM_NOT_FOUND;
+    }
+#else
+    if (lstat(abs_path, st) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (S_ISLNK(st->st_mode)) {
+        return CBM_NOT_FOUND;
+    }
+#endif
+    return 0;
+}
+
+/* Process a single regular file entry during directory walk. */
+static void walk_dir_process_file(const char *abs_path, const char *rel_path, const char *name,
+                                  const cbm_discover_opts_t *opts, const cbm_gitignore_t *gitignore,
+                                  const cbm_gitignore_t *cbmignore, off_t size, file_list_t *out) {
+    if (should_skip_file(name, rel_path, opts, gitignore, cbmignore, size)) {
+        return;
+    }
+    CBMLanguage lang = detect_file_language(name, abs_path);
+    if (lang == CBM_LANG_COUNT) {
+        return;
+    }
+    fl_add(out, abs_path, rel_path, lang, size);
+}
+
+typedef struct {
+    char dir[CBM_SZ_4K];
+    char prefix[CBM_SZ_4K];
+} walk_frame_t;
+#define WALK_STACK_CAP 512
+/* Build abs/rel paths and process one directory entry. */
+static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *frame,
+                                   const cbm_discover_opts_t *opts,
+                                   const cbm_gitignore_t *gitignore,
+                                   const cbm_gitignore_t *cbmignore, walk_frame_t *stack, int *top,
+                                   file_list_t *out) {
+    char abs_path[CBM_SZ_4K];
+    char rel_path[CBM_SZ_4K];
+    snprintf(abs_path, sizeof(abs_path), "%s/%s", frame->dir, entry->name);
+    if (frame->prefix[0] != '\0') {
+        snprintf(rel_path, sizeof(rel_path), "%s/%s", frame->prefix, entry->name);
+    } else {
+        snprintf(rel_path, sizeof(rel_path), "%s", entry->name);
+    }
+
+    struct stat st;
+    if (safe_stat(abs_path, &st) != 0) {
         return;
     }
 
-    cbm_dirent_t *entry;
-    while ((entry = cbm_readdir(d)) != NULL) {
-
-        /* Build full and relative paths */
-        char abs_path[4096];
-        char rel_path[4096];
-        snprintf(abs_path, sizeof(abs_path), "%s/%s", dir_path, entry->name);
-        if (rel_prefix[0]) {
-            snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_prefix, entry->name);
-        } else {
-            snprintf(rel_path, sizeof(rel_path), "%s", entry->name);
+    if (S_ISDIR(st.st_mode)) {
+        if (!should_skip_directory(entry->name, rel_path, opts, gitignore, cbmignore)) {
+            if (*top < WALK_STACK_CAP) {
+                snprintf(stack[*top].dir, CBM_SZ_4K, "%s", abs_path);
+                snprintf(stack[*top].prefix, CBM_SZ_4K, "%s", rel_path);
+                (*top)++;
+            }
         }
-
-        struct stat st;
-#ifdef _WIN32
-        if (stat(abs_path, &st) != 0) {
-            continue;
-        }
-        /* Windows: no symlink detection via stat */
-#else
-        if (lstat(abs_path, &st) != 0) {
-            continue;
-        }
-        /* Skip symlinks */
-        if (S_ISLNK(st.st_mode)) {
-            continue;
-        }
-#endif
-
-        if (S_ISDIR(st.st_mode)) {
-            /* Check hardcoded directory skip */
-            if (cbm_should_skip_dir(entry->name, opts ? opts->mode : CBM_MODE_FULL)) {
-                continue;
-            }
-
-            /* Check gitignore */
-            if (gitignore && cbm_gitignore_matches(gitignore, rel_path, true)) {
-                continue;
-            }
-            if (cbmignore && cbm_gitignore_matches(cbmignore, rel_path, true)) {
-                continue;
-            }
-
-            /* Recurse */
-            walk_dir(abs_path, rel_path, opts, gitignore, cbmignore, out);
-        } else if (S_ISREG(st.st_mode)) {
-            cbm_index_mode_t mode = opts ? opts->mode : CBM_MODE_FULL;
-
-            /* Check suffix filter */
-            if (cbm_has_ignored_suffix(entry->name, mode)) {
-                continue;
-            }
-
-            /* Check fast-mode filename skip */
-            if (cbm_should_skip_filename(entry->name, mode)) {
-                continue;
-            }
-
-            /* Check fast-mode patterns */
-            if (cbm_matches_fast_pattern(entry->name, mode)) {
-                continue;
-            }
-
-            /* Check gitignore */
-            if (gitignore && cbm_gitignore_matches(gitignore, rel_path, false)) {
-                continue;
-            }
-            if (cbmignore && cbm_gitignore_matches(cbmignore, rel_path, false)) {
-                continue;
-            }
-
-            /* Check max file size */
-            if (opts && opts->max_file_size > 0 && st.st_size > opts->max_file_size) {
-                continue;
-            }
-
-            /* Detect language */
-            CBMLanguage lang = cbm_language_for_filename(entry->name);
-
-            /* Handle .m disambiguation */
-            if (lang == CBM_LANG_COUNT) {
-                /* No language detected — skip */
-                continue;
-            }
-
-            /* Special: .m files need content-based disambiguation */
-            const char *dot = strrchr(entry->name, '.');
-            if (dot && strcmp(dot, ".m") == 0) {
-                lang = cbm_disambiguate_m(abs_path);
-            }
-
-            /* Check ignored JSON files */
-            if (lang == CBM_LANG_JSON && str_in_list(entry->name, IGNORED_JSON_FILES)) {
-                continue;
-            }
-
-            fl_add(out, abs_path, rel_path, lang, st.st_size);
-        }
+    } else if (S_ISREG(st.st_mode)) {
+        walk_dir_process_file(abs_path, rel_path, entry->name, opts, gitignore, cbmignore,
+                              st.st_size, out);
     }
+}
 
-    cbm_closedir(d);
+static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_discover_opts_t *opts,
+                     const cbm_gitignore_t *gitignore, const cbm_gitignore_t *cbmignore,
+                     file_list_t *out) {
+    walk_frame_t *stack = calloc(WALK_STACK_CAP, sizeof(walk_frame_t));
+    if (!stack) {
+        return;
+    }
+    int top = 0;
+    snprintf(stack[top].dir, CBM_SZ_4K, "%s", dir_path);
+    snprintf(stack[top].prefix, CBM_SZ_4K, "%s", rel_prefix);
+    top++;
+
+    while (top > 0) {
+        walk_frame_t frame = stack[--top];
+        cbm_dir_t *d = cbm_opendir(frame.dir);
+        if (!d) {
+            continue;
+        }
+
+        cbm_dirent_t *entry;
+        while ((entry = cbm_readdir(d)) != NULL) {
+            walk_dir_process_entry(entry, &frame, opts, gitignore, cbmignore, stack, &top, out);
+        }
+        cbm_closedir(d);
+    }
+    free(stack);
 }
 
 /* ── Public API ──────────────────────────────────────────────────── */
@@ -345,7 +390,7 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
 int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
                  int *count) {
     if (!repo_path || !out || !count) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
 
     *out = NULL;
@@ -354,12 +399,12 @@ int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_fil
     /* Verify directory exists */
     struct stat st;
     if (stat(repo_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
 
     /* Load gitignore if .git directory exists */
     cbm_gitignore_t *gitignore = NULL;
-    char gi_path[4096];
+    char gi_path[CBM_SZ_4K];
     snprintf(gi_path, sizeof(gi_path), "%s/.git", repo_path);
     struct stat gi_stat;
     if (stat(gi_path, &gi_stat) == 0 && S_ISDIR(gi_stat.st_mode)) {

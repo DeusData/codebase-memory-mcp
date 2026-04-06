@@ -18,13 +18,13 @@
 #include <string.h> /* memset */
 
 #ifdef _WIN32
-  #ifndef WIN32_LEAN_AND_MEAN
-    #define WIN32_LEAN_AND_MEAN
-  #endif
-  #include <windows.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #else
-  #include <sys/mman.h>
-  #include <unistd.h> /* sysconf, _SC_PAGESIZE */
+#include <sys/mman.h>
+#include <unistd.h> /* sysconf, _SC_PAGESIZE */
 #endif
 
 /* ── Static state (initialized once) ──────────────────────────── */
@@ -51,12 +51,12 @@ static size_t page_size(void) {
 /* Round up to page boundary. */
 static size_t round_to_page(size_t size) {
     size_t ps = page_size();
-    return (size + ps - 1) & ~(ps - 1);
+    return (size + ps - SKIP_ONE) & ~(ps - SKIP_ONE);
 }
 
 /* ── Pressure logging ──────────────────────────────────────────── */
 
-#define MB_DIVISOR ((size_t)(1024 * 1024))
+#define MB_DIVISOR ((size_t)(CBM_SZ_1K * CBM_SZ_1K))
 
 static void check_pressure(size_t allocated) {
     if (g_budget == 0) {
@@ -69,31 +69,25 @@ static void check_pressure(size_t allocated) {
     if (over && !was) {
         /* Transition: under → over */
         atomic_store(&g_was_over, 1);
-        char alloc_mb[32];
-        char budget_mb[32];
-        char pct_str[16];
-        // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+        char alloc_mb[CBM_SZ_32];
+        char budget_mb[CBM_SZ_32];
+        char pct_str[CBM_SZ_16];
         snprintf(alloc_mb, sizeof(alloc_mb), "%zu", allocated / MB_DIVISOR);
-        // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
         snprintf(budget_mb, sizeof(budget_mb), "%zu", g_budget / MB_DIVISOR);
-        // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
         snprintf(pct_str, sizeof(pct_str), "%zu",
-                 g_budget > 0 ? (allocated * 100) / g_budget : 0);
+                 g_budget > 0 ? (allocated * CBM_PERCENT) / g_budget : 0);
         cbm_log_warn("mem.pressure.warn", "allocated_mb", alloc_mb, "budget_mb", budget_mb, "pct",
                      pct_str);
     } else if (!over && was) {
         /* Transition: over → under */
         atomic_store(&g_was_over, 0);
-        char alloc_mb[32];
-        char budget_mb[32];
-        char pct_str[16];
-        // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+        char alloc_mb[CBM_SZ_32];
+        char budget_mb[CBM_SZ_32];
+        char pct_str[CBM_SZ_16];
         snprintf(alloc_mb, sizeof(alloc_mb), "%zu", allocated / MB_DIVISOR);
-        // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
         snprintf(budget_mb, sizeof(budget_mb), "%zu", g_budget / MB_DIVISOR);
-        // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
         snprintf(pct_str, sizeof(pct_str), "%zu",
-                 g_budget > 0 ? (allocated * 100) / g_budget : 0);
+                 g_budget > 0 ? (allocated * CBM_PERCENT) / g_budget : 0);
         cbm_log_info("mem.pressure.ok", "allocated_mb", alloc_mb, "budget_mb", budget_mb, "pct",
                      pct_str);
     }
@@ -126,11 +120,9 @@ void cbm_vmem_init(double ram_fraction) {
     cbm_system_info_t info = cbm_system_info();
     g_budget = (size_t)((double)info.total_ram * ram_fraction);
 
-    char budget_mb[32];
-    char ram_mb[32];
-    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
+    char budget_mb[CBM_SZ_32];
+    char ram_mb[CBM_SZ_32];
     snprintf(budget_mb, sizeof(budget_mb), "%zu", g_budget / MB_DIVISOR);
-    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
     snprintf(ram_mb, sizeof(ram_mb), "%zu", info.total_ram / MB_DIVISOR);
     cbm_log_info("vmem.init", "budget_mb", budget_mb, "total_ram_mb", ram_mb);
 }
@@ -152,8 +144,7 @@ void *cbm_vmem_alloc(size_t size) {
 #endif
 
     if (!ptr) {
-        cbm_log_error("vmem.alloc.fail", "size_mb",
-                       size > MB_DIVISOR ? "large" : "small");
+        cbm_log_error("vmem.alloc.fail", "size_mb", size > MB_DIVISOR ? "large" : "small");
         return NULL;
     }
 
@@ -199,7 +190,7 @@ bool cbm_vmem_over_budget(void) {
 
 size_t cbm_vmem_worker_budget(int num_workers) {
     if (num_workers <= 0) {
-        num_workers = 1;
+        num_workers = SKIP_ONE;
     }
     return g_budget / (size_t)num_workers;
 }

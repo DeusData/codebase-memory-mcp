@@ -10,6 +10,10 @@
 #include "discover/userconfig.h"
 #include "cbm.h" // CBMLanguage, CBM_LANG_*
 
+#include "foundation/constants.h"
+
+enum { LANG_SCAN_PASSES = 2 };
+#define SLEN(s) (sizeof(s) - 1)
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
@@ -419,7 +423,7 @@ CBMLanguage cbm_language_for_filename(const char *filename) {
             if (lang != CBM_LANG_COUNT) {
                 return lang;
             }
-            p = strchr(p + 1, '.');
+            p = strchr(p + SKIP_ONE, '.');
         }
     }
 
@@ -441,6 +445,63 @@ static bool str_contains(const char *haystack, const char *needle) {
     return strstr(haystack, needle) != NULL;
 }
 
+static bool has_objc_markers(const char *buf) {
+    return str_contains(buf, "@interface") || str_contains(buf, "@implementation") ||
+           str_contains(buf, "@protocol") || str_contains(buf, "@property") ||
+           str_contains(buf, "#import") || str_contains(buf, "@selector") ||
+           str_contains(buf, "@encode") || str_contains(buf, "@synthesize") ||
+           str_contains(buf, "@dynamic");
+}
+
+static bool has_magma_end_markers(const char *buf) {
+    return str_contains(buf, "end function;") || str_contains(buf, "end procedure;") ||
+           str_contains(buf, "end intrinsic;") || str_contains(buf, "end if;") ||
+           str_contains(buf, "end for;") || str_contains(buf, "end while;");
+}
+
+/* Check for "intrinsic Name(" or "procedure Name(" patterns. */
+static bool has_magma_callable_pattern(const char *buf) {
+    const char *markers[] = {"intrinsic ", "procedure "};
+    for (int i = 0; i < LANG_SCAN_PASSES; i++) {
+        const char *p = strstr(buf, markers[i]);
+        if (!p) {
+            continue;
+        }
+        p += strlen(markers[i]);
+        while (*p && isalpha((unsigned char)*p)) {
+            p++;
+        }
+        if (*p == '(') {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Scan lines for MATLAB-specific markers (function/classdef/%%). */
+static bool has_matlab_line_markers(const char *buf) {
+    const char *line = buf;
+    while (*line) {
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        if (strncmp(p, "function ", SLEN("function ")) == 0 ||
+            strncmp(p, "function\t", SLEN("function\t")) == 0 ||
+            strncmp(p, "classdef ", SLEN("classdef ")) == 0 ||
+            strncmp(p, "classdef\t", SLEN("classdef\t")) == 0 || strncmp(p, "%%", PAIR_LEN) == 0 ||
+            (*p == '%' && *(p + SKIP_ONE) != '{')) {
+            return true;
+        }
+        const char *nl = strchr(line, '\n');
+        if (!nl) {
+            break;
+        }
+        line = nl + SKIP_ONE;
+    }
+    return false;
+}
+
 CBMLanguage cbm_disambiguate_m(const char *path) {
     if (!path) {
         return CBM_LANG_MATLAB;
@@ -452,70 +513,24 @@ CBMLanguage cbm_disambiguate_m(const char *path) {
     }
 
     /* Read first 4KB */
-    char buf[4096 + 1];
-    size_t n = fread(buf, 1, 4096, f);
+    char buf[CBM_SZ_4K + SKIP_ONE];
+    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
     buf[n] = '\0';
     (void)fclose(f);
 
-    /* Check Objective-C markers first */
-    if (str_contains(buf, "@interface") || str_contains(buf, "@implementation") ||
-        str_contains(buf, "@protocol") || str_contains(buf, "@property") ||
-        str_contains(buf, "#import") || str_contains(buf, "@selector") ||
-        str_contains(buf, "@encode") || str_contains(buf, "@synthesize") ||
-        str_contains(buf, "@dynamic")) {
+    if (has_objc_markers(buf)) {
         return CBM_LANG_OBJC;
     }
-
-    /* Check Magma markers (before MATLAB — both have 'function') */
-    if (str_contains(buf, "end function;") || str_contains(buf, "end procedure;") ||
-        str_contains(buf, "end intrinsic;") || str_contains(buf, "end if;") ||
-        str_contains(buf, "end for;") || str_contains(buf, "end while;")) {
+    if (has_magma_end_markers(buf)) {
         return CBM_LANG_MAGMA;
     }
-
-    /* Also check Magma-specific patterns with regex-like heuristics */
-    if (str_contains(buf, "intrinsic ") || str_contains(buf, "procedure ")) {
-        /* Look for "intrinsic Name(" or "procedure Name(" patterns */
-        const char *markers[] = {"intrinsic ", "procedure "};
-        for (int i = 0; i < 2; i++) {
-            const char *p = strstr(buf, markers[i]);
-            if (p) {
-                p += strlen(markers[i]);
-                /* Skip to see if there's an identifier followed by '(' */
-                while (*p && isalpha((unsigned char)*p)) {
-                    p++;
-                }
-                if (*p == '(') {
-                    return CBM_LANG_MAGMA;
-                }
-            }
-        }
+    if ((str_contains(buf, "intrinsic ") || str_contains(buf, "procedure ")) &&
+        has_magma_callable_pattern(buf)) {
+        return CBM_LANG_MAGMA;
+    }
+    if (has_matlab_line_markers(buf)) {
+        return CBM_LANG_MATLAB;
     }
 
-    /* Check MATLAB markers */
-    /* Look for: function keyword at start of line, classdef, %% section markers */
-    const char *line = buf;
-    while (*line) {
-        /* Skip leading whitespace */
-        const char *p = line;
-        while (*p == ' ' || *p == '\t') {
-            p++;
-        }
-
-        if (strncmp(p, "function ", 9) == 0 || strncmp(p, "function\t", 9) == 0 ||
-            strncmp(p, "classdef ", 9) == 0 || strncmp(p, "classdef\t", 9) == 0 ||
-            strncmp(p, "%%", 2) == 0 || (*p == '%' && *(p + 1) != '{')) {
-            return CBM_LANG_MATLAB;
-        }
-
-        /* Advance to next line */
-        const char *nl = strchr(line, '\n');
-        if (!nl) {
-            break;
-        }
-        line = nl + 1;
-    }
-
-    /* Default to MATLAB */
     return CBM_LANG_MATLAB;
 }

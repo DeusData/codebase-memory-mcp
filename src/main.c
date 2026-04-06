@@ -18,6 +18,19 @@
 #include "pipeline/pipeline.h"
 #include "store/store.h"
 #include "cli/cli.h"
+#include "cli/progress_sink.h"
+#include "foundation/constants.h"
+
+enum {
+    MAIN_MIN_ARGC = 1,
+    MAIN_CLI_ARGC = 2,
+    MAIN_FLAG_OFF = 5, /* strlen("--ui=") */
+    MAIN_PORT_OFF = 7, /* strlen("--port=") */
+    MAIN_MAX_PORT = 65536,
+};
+#define MAIN_RAM_FRACTION 0.5
+
+#define SLEN(s) (sizeof(s) - 1)
 #include "foundation/log.h"
 #include "foundation/diagnostics.h"
 #include "foundation/platform.h"
@@ -62,6 +75,7 @@ static void signal_handler(int sig) {
 static void *watcher_thread(void *arg) {
     cbm_watcher_t *w = arg;
 #define WATCHER_BASE_INTERVAL_MS 5000
+
     cbm_watcher_run(w, WATCHER_BASE_INTERVAL_MS);
     return NULL;
 }
@@ -91,7 +105,7 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
     cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
     if (!p) {
         cbm_pipeline_unlock();
-        return -1;
+        return CBM_NOT_FOUND;
     }
 
     int rc = cbm_pipeline_run(p);
@@ -103,20 +117,45 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
 /* ── CLI mode ───────────────────────────────────────────────────── */
 
 static int run_cli(int argc, char **argv) {
-    if (argc < 1) {
-        // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
-        (void)fprintf(stderr, "Usage: codebase-memory-mcp cli <tool_name> [json_args]\n");
-        return 1;
+    if (argc < MAIN_MIN_ARGC) {
+        (void)fprintf(stderr,
+                      "Usage: codebase-memory-mcp cli [--progress] <tool_name> [json_args]\n");
+        return SKIP_ONE;
+    }
+
+    /* Strip --progress flag from argv. */
+    bool progress = false;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--progress") == 0) {
+            progress = true;
+            for (int j = i; j < argc - SKIP_ONE; j++) {
+                argv[j] = argv[j + SKIP_ONE];
+            }
+            argc--;
+            break;
+        }
+    }
+
+    if (argc < MAIN_MIN_ARGC) {
+        (void)fprintf(stderr,
+                      "Usage: codebase-memory-mcp cli [--progress] <tool_name> [json_args]\n");
+        return SKIP_ONE;
     }
 
     const char *tool_name = argv[0];
-    const char *args_json = argc >= 2 ? argv[1] : "{}";
+    const char *args_json = argc >= MAIN_CLI_ARGC ? argv[SKIP_ONE] : "{}";
+
+    if (progress) {
+        cbm_progress_sink_init(stderr);
+    }
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     if (!srv) {
-        // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
         (void)fprintf(stderr, "Failed to create server\n");
-        return 1;
+        if (progress) {
+            cbm_progress_sink_fini();
+        }
+        return SKIP_ONE;
     }
 
     char *result = cbm_mcp_handle_tool(srv, tool_name, args_json);
@@ -126,6 +165,9 @@ static int run_cli(int argc, char **argv) {
     }
 
     cbm_mcp_server_free(srv);
+    if (progress) {
+        cbm_progress_sink_fini();
+    }
     return 0;
 }
 
@@ -156,9 +198,10 @@ static void print_help(void) {
 
 /* ── Main ───────────────────────────────────────────────────────── */
 
-int main(int argc, char **argv) {
-    /* Parse arguments */
-    for (int i = 1; i < argc; i++) {
+/* Try to handle a subcommand (cli/install/uninstall/update/config/--version/--help).
+ * Returns -1 if no subcommand matched, otherwise the exit code. */
+static int handle_subcommand(int argc, char **argv) {
+    for (int i = SKIP_ONE; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0) {
             printf("codebase-memory-mcp %s\n", CBM_VERSION);
             return 0;
@@ -168,27 +211,69 @@ int main(int argc, char **argv) {
             return 0;
         }
         if (strcmp(argv[i], "cli") == 0) {
-            cbm_mem_init(0.5);
-            return run_cli(argc - i - 1, argv + i + 1);
+            cbm_mem_init(MAIN_RAM_FRACTION);
+            return run_cli(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "install") == 0) {
-            return cbm_cmd_install(argc - i - 1, argv + i + 1);
+            return cbm_cmd_install(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "uninstall") == 0) {
-            return cbm_cmd_uninstall(argc - i - 1, argv + i + 1);
+            return cbm_cmd_uninstall(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "update") == 0) {
-            return cbm_cmd_update(argc - i - 1, argv + i + 1);
+            return cbm_cmd_update(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "config") == 0) {
-            return cbm_cmd_config(argc - i - 1, argv + i + 1);
+            return cbm_cmd_config(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
+    }
+    return CBM_NOT_FOUND;
+}
+
+/* Parse --ui= and --port= flags. Returns true if config was modified. */
+static bool parse_ui_flags(int argc, char **argv, cbm_ui_config_t *cfg) {
+    bool changed = false;
+    for (int i = SKIP_ONE; i < argc; i++) {
+        if (strncmp(argv[i], "--ui=", SLEN("--ui=")) == 0) {
+            cfg->ui_enabled = (strcmp(argv[i] + MAIN_FLAG_OFF, "true") == 0);
+            changed = true;
+        }
+        if (strncmp(argv[i], "--port=", SLEN("--port=")) == 0) {
+            int p = (int)strtol(argv[i] + MAIN_PORT_OFF, NULL, CBM_DECIMAL_BASE);
+            if (p > 0 && p < MAIN_MAX_PORT) {
+                cfg->ui_port = p;
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
+/* Install platform-specific signal handlers. */
+static void setup_signal_handlers(void) {
+#ifdef _WIN32
+    signal(SIGTERM, signal_handler);
+    signal(SIGINT, signal_handler);
+#else
+    struct sigaction sa = {0};
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+#endif
+}
+
+int main(int argc, char **argv) {
+    int subcmd = handle_subcommand(argc, argv);
+    if (subcmd >= 0) {
+        return subcmd;
     }
 
     /* Default: MCP server on stdio */
-    cbm_mem_init(0.5); /* 50% of RAM — safe now because mimalloc tracks ALL
-                        * memory (C + C++ allocations) via global override.
-                        * No more untracked heap blind spots. */
+    cbm_mem_init(MAIN_RAM_FRACTION); /* 50% of RAM — safe now because mimalloc tracks ALL
+                                      * memory (C + C++ allocations) via global override.
+                                      * No more untracked heap blind spots. */
     /* Store binary path for subprocess spawning + hook log sink */
     cbm_http_server_set_binary_path(argv[0]);
     cbm_log_set_sink(cbm_ui_log_append);
@@ -198,46 +283,18 @@ int main(int argc, char **argv) {
     /* Parse --ui and --port flags (persisted config) */
     cbm_ui_config_t ui_cfg;
     cbm_ui_config_load(&ui_cfg);
-
-    bool config_changed = false;
-    for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--ui=", 5) == 0) {
-            ui_cfg.ui_enabled = (strcmp(argv[i] + 5, "true") == 0);
-            config_changed = true;
-        }
-        if (strncmp(argv[i], "--port=", 7) == 0) {
-            int p = (int)strtol(argv[i] + 7, NULL, 10);
-            if (p > 0 && p < 65536) {
-                ui_cfg.ui_port = p;
-                config_changed = true;
-            }
-        }
-    }
-    if (config_changed) {
+    if (parse_ui_flags(argc, argv, &ui_cfg)) {
         cbm_ui_config_save(&ui_cfg);
     }
 
-    /* Install signal handlers */
-#ifdef _WIN32
-    signal(SIGTERM, signal_handler);
-    signal(SIGINT, signal_handler);
-#else
-    // NOLINTNEXTLINE(misc-include-cleaner) — sigaction provided by standard header
-    struct sigaction sa = {0};
-    // NOLINTNEXTLINE(misc-include-cleaner) — sa_handler provided by standard header
-    sa.sa_handler = signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGINT, &sa, NULL);
-#endif
+    setup_signal_handlers();
 
     /* Open config store for runtime settings */
-    char config_dir[1024];
+    char config_dir[CBM_SZ_1K];
     const char *cfg_home = cbm_get_home_dir();
     cbm_config_t *runtime_config = NULL;
     if (cfg_home) {
-        snprintf(config_dir, sizeof(config_dir), "%s/.cache/codebase-memory-mcp", cfg_home);
+        snprintf(config_dir, sizeof(config_dir), "%s", cbm_resolve_cache_dir());
         runtime_config = cbm_config_open(config_dir);
     }
 
@@ -246,7 +303,7 @@ int main(int argc, char **argv) {
     if (!g_server) {
         cbm_log_error("server.err", "msg", "failed to create server");
         cbm_config_close(runtime_config);
-        return 1;
+        return SKIP_ONE;
     }
 
     /* Create and start watcher in background thread */

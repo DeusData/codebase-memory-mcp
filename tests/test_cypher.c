@@ -1183,6 +1183,56 @@ TEST(cypher_apply_limit) {
     PASS();
 }
 
+/* Regression: low max_rows with unlabeled pattern should still find late sorted IMPORTS source node. */
+TEST(cypher_exec_count_imports_low_max_rows_unlabeled_source) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "bug_repro", "/tmp/bug_repro");
+
+    int64_t target_id = cbm_store_upsert_node(s, &(cbm_node_t){
+        .project = "bug_repro",
+        .label = "Module",
+        .name = "target_module",
+        .qualified_name = "bug_repro.target_module",
+        .file_path = "target.py"});
+
+    for (int i = 0; i < 60; i++) {
+        char name[32], qn[64];
+        snprintf(name, sizeof(name), "node_%02d", i);
+        snprintf(qn, sizeof(qn), "bug_repro.%s", name);
+        cbm_store_upsert_node(s, &(cbm_node_t){.project = "bug_repro",
+                                              .label = NULL,
+                                              .name = name,
+                                              .qualified_name = qn,
+                                              .file_path = "misc.py"});
+    }
+
+    /* Sorts late and is the only IMPORTS source. */
+    int64_t source_id = cbm_store_upsert_node(s, &(cbm_node_t){.project = "bug_repro",
+                                                             .label = "File",
+                                                             .name = "zz_source.py",
+                                                             .qualified_name = "bug_repro.zz_source",
+                                                             .file_path = "zz_source.py"});
+
+    cbm_edge_t e = {
+        .project = "bug_repro",
+        .source_id = source_id,
+        .target_id = target_id,
+        .type = "IMPORTS",
+    };
+    cbm_store_insert_edge(s, &e);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (a)-[r:IMPORTS]->(b) RETURN COUNT(r) AS c", "bug_repro", 5,
+                               &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "1");
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  PHASE 1: SIMPLE OPERATORS
  * ══════════════════════════════════════════════════════════════════ */
@@ -2124,6 +2174,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_edge_filter_regex);
     RUN_TEST(cypher_edge_builtin_type_filter);
     RUN_TEST(cypher_apply_limit);
+    RUN_TEST(cypher_exec_count_imports_low_max_rows_unlabeled_source);
     /* Phase 1: Simple operators */
     RUN_TEST(cypher_lex_neq_operators);
     RUN_TEST(cypher_lex_ends_keyword);
