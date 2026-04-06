@@ -688,7 +688,7 @@ TEST(trace_accepts_qualified_name_param) {
     /* Passing full qualified_name should not error (even if BFS finds 0 callers on test store).
      * Must NOT return "function not found" — QN lookup path fires first. */
     char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
-        "{\"qualified_name\":\"validation-test.test.foo\",\"direction\":\"outbound\"}");
+        "{\"qualified_name\":\"validation-test.test.foo\",\"project\":\"validation-test\",\"direction\":\"outbound\"}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
     /* Should find "foo" node via QN and return trace output, not "function not found" */

@@ -531,12 +531,16 @@ TEST(resource_client_never_gets_context_across_multiple_calls) {
     ASSERT_NOT_NULL(resp);
     free(resp);
 
-    /* 3 consecutive tool calls — none should have _context */
+    /* 3 consecutive tool calls — none should have _context (as JSON key) */
     for (int i = 0; i < 3; i++) {
         char *r = cbm_mcp_handle_tool(srv, "search_graph",
             "{\"name_pattern\":\"test\"}");
         ASSERT_NOT_NULL(r);
-        ASSERT_NULL(strstr(r, "_context"));
+        /* Check for the JSON key "_context": (quoted key + colon), not bare substring.
+         * Node names/qualified_names in results can contain "_context" as a substring
+         * (e.g. "inject_context_once", "gets_context_across_multiple_calls") and would
+         * cause false positives if we check the unquoted form. */
+        ASSERT_NULL(strstr(r, "\"_context\":"));
         /* But session_project should always be present */
         ASSERT_NOT_NULL(strstr(r, "session_project"));
         free(r);
@@ -568,7 +572,7 @@ TEST(legacy_client_gets_context_only_on_first_call) {
     char *r2 = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"name_pattern\":\"test2\"}");
     ASSERT_NOT_NULL(r2);
-    ASSERT_NULL(strstr(r2, "_context"));
+    ASSERT_NULL(strstr(r2, "\"_context\":"));
     ASSERT_NOT_NULL(strstr(r2, "session_project"));
     free(r2);
 
