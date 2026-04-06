@@ -50,6 +50,10 @@ ALLOWED_URLS=(
     # SQLite internal URLs (part of vendored sqlite3 strings)
     "https://sqlite.org"
     "https://www.sqlite.org"
+    # Toolchain URLs embedded by compiler/linker in static builds
+    "https://bugs.launchpad.net"
+    "https://gcc.gnu.org"
+    "https://sourceware.org"
 )
 
 while IFS= read -r url; do
