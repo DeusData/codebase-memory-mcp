@@ -446,8 +446,9 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "Read codebase://architecture for key functions and graph overview.",
      "{\"type\":\"object\",\"properties\":{"
      "\"project\":{\"type\":\"string\",\"description\":\"Project name, path, or filter. "
-     "Accepts: project name, directory path (/path/to/repo), 'self' (project only), "
-     "'dep'/'deps' (dependencies only), 'dep.pandas' (specific dep), glob patterns.\"},"
+     "Accepts: project name, directory path (/path/to/repo), tilde path (~/path/to/repo), "
+     "'self' (project only), 'dep'/'deps' (dependencies only), 'dep.pandas' (specific dep), "
+     "glob patterns. Omit to use the auto-detected session project.\"},"
      "\"cypher\":{\"type\":\"string\",\"description\":\"Cypher query for complex multi-hop "
      "patterns. When provided, other filter params are ignored. Add LIMIT.\"},"
      "\"label\":{\"type\":\"string\"},"
@@ -1107,7 +1108,7 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
                     "{\"error\":\"auto-indexing failed for this project\","                        \
                     "\"detail\":\"The pipeline failed. Check file permissions and project size.\"," \
                     "\"fix\":\"Enable classic tools: set env CBM_TOOL_MODE=classic then call index_repository. " \
-                    "Or retry by passing project=\\\"/path/to/repo\\\" explicitly.\"}", \
+                    "Or retry by passing project=\\\"/path/to/repo\\\" or project=\\\"~/path\\\" explicitly.\"}", \
                     true);                                                                        \
             }                                                                                     \
             free(project);                                                                        \
@@ -1144,11 +1145,11 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
             yyjson_mut_obj_add_str(doc, ctx, "status", "auto_indexing");
             yyjson_mut_obj_add_str(doc, ctx, "hint",
                 "Auto-indexing your project — retry this query in a moment. "
-                "Pass project='/path/to/repo' explicitly to trigger immediately.");
+                "Pass project='/path/to/repo' or project='~/path/to/repo' explicitly to trigger immediately.");
         } else {
             yyjson_mut_obj_add_str(doc, ctx, "status", "not_indexed");
             yyjson_mut_obj_add_str(doc, ctx, "hint",
-                "No project path detected. Pass project='/path/to/repo' to index and search.");
+                "No project path detected. Pass project='/path/to/repo' or project='~/path/to/repo' to index and search.");
         }
         yyjson_mut_obj_add_val(doc, root, "_context", ctx);
         return;
@@ -3469,7 +3470,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         free(file_pattern);
         return cbm_mcp_text_result(
             "{\"error\":\"project not found or not indexed\","
-            "\"hint\":\"Run index_repository with repo_path to index the project first, "
+            "\"hint\":\"Pass project='/path/to/repo' or project='~/path/to/repo' to specify the project. "
+            "Run index_repository with repo_path to index it first, "
             "or use list_projects to see available projects.\"}", true);
     }
 
@@ -3614,7 +3616,8 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         free(base_branch);
         return cbm_mcp_text_result(
             "{\"error\":\"project not found\","
-            "\"hint\":\"Run index_repository with repo_path to index the project first, "
+            "\"hint\":\"Pass project='/path/to/repo' or project='~/path/to/repo' to specify the project. "
+            "Run index_repository with repo_path to index it first, "
             "or use list_projects to see available projects.\"}", true);
     }
 
@@ -3715,7 +3718,8 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
         free(content);
         return cbm_mcp_text_result(
             "{\"error\":\"project not found\","
-            "\"hint\":\"Run index_repository with repo_path to index the project first, "
+            "\"hint\":\"Pass project='/path/to/repo' or project='~/path/to/repo' to specify the project. "
+            "Run index_repository with repo_path to index it first, "
             "or use list_projects to see available projects.\"}", true);
     }
 
