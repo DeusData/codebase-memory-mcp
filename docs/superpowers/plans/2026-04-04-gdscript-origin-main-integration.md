@@ -8,6 +8,8 @@
 
 **Tech Stack:** git worktrees, git merge, C source/build/test flow via `Makefile.cbm`, existing GDScript extractor/pipeline code, bash proof workflow, Markdown docs.
 
+> **Status backfill (2026-04-05):** This checklist was retroactively marked complete from the final merged `gdscript-support` state to avoid repeating already-landed work. The final merge commit is `58b67e4`; fresh verification was re-run from the current worktree (`make -f Makefile.cbm cbm`, `make -f Makefile.cbm test`, one non-GDScript smoke index, and a proof rerun rooted at `.artifacts/gdscript-proof/20260406T065651Z-23813-BZT9ZY`). Transient pre-commit checkpoints were backfilled from the landed merge/result history rather than a still-open merge state.
+
 ---
 
 ## Source Context
@@ -108,7 +110,7 @@
 **Files:**
 - Verify only: `.worktrees/gdscript-support-main-sync/`
 
-- [ ] **Step 1: Create the integration worktree from the current branch**
+- [x] **Step 1: Create the integration worktree from the current branch**
 
 Run from the repository root (not from inside `.worktrees/gdscript-support`):
 
@@ -120,7 +122,7 @@ Expected:
 - new worktree exists at `.worktrees/gdscript-support-main-sync`
 - branch `gdscript-support-main-sync` starts from the current `gdscript-support` tip
 
-- [ ] **Step 2: Fetch the newest upstream state**
+- [x] **Step 2: Fetch the newest upstream state**
 
 Run:
 
@@ -130,7 +132,7 @@ git fetch origin main
 
 Expected: `origin/main` is current.
 
-- [ ] **Step 3: Capture the baseline divergence inside the integration worktree**
+- [x] **Step 3: Capture the baseline divergence inside the integration worktree**
 
 Run in `.worktrees/gdscript-support-main-sync`:
 
@@ -145,7 +147,7 @@ git diff --name-only "$(git merge-base HEAD origin/main)"..origin/main
 
 Expected: the commands confirm the same overlap class called out in this plan before any merge resolution starts.
 
-- [ ] **Step 4: Verify the clean setup checkpoint**
+- [x] **Step 4: Verify the clean setup checkpoint**
 
 ```bash
 git status --short
@@ -158,7 +160,7 @@ Expected: clean before starting the merge.
 **Files:**
 - Modify: overlap files listed in this plan
 
-- [ ] **Step 1: Merge upstream into the integration branch**
+- [x] **Step 1: Merge upstream into the integration branch**
 
 Run in `.worktrees/gdscript-support-main-sync`:
 
@@ -171,7 +173,7 @@ Expected:
 - no attempt to rebase the 46 branch commits at this stage
 - no final merge commit is created yet
 
-- [ ] **Step 2: Record the pending merge file set before editing**
+- [x] **Step 2: Record the pending merge file set before editing**
 
 Run:
 
@@ -181,7 +183,7 @@ git status --short
 
 Expected: any conflicts or pending merge edits fall mostly into low-risk text/config, extractor core, pipeline, and tests.
 
-- [ ] **Step 3: Resolve the low-risk overlap group first**
+- [x] **Step 3: Resolve the low-risk overlap group first**
 
 Resolve these files together:
 
@@ -201,7 +203,7 @@ Preserve from upstream:
 - any doc corrections needed to match new upstream CLI behavior
 - any non-GDScript fixes already landed on `origin/main`
 
-- [ ] **Step 4: Verify the low-risk group compiles at least to parser stage**
+- [x] **Step 4: Verify the low-risk group compiles at least to parser stage**
 
 Run:
 
@@ -211,7 +213,7 @@ make -f Makefile.cbm cbm
 
 Expected: if it still fails, the failure should now point at extractor or pipeline conflicts rather than trivial text/config conflicts.
 
-- [ ] **Step 5: Stage and checkpoint the low-risk resolution group**
+- [x] **Step 5: Stage and checkpoint the low-risk resolution group**
 
 ```bash
 git add .gitignore README.md internal/cbm/cbm.h src/discover/language.c src/discover/userconfig.c
@@ -238,7 +240,7 @@ Expected: those files are staged as resolved while the overall merge remains unc
 - Verify: `internal/cbm/vendored/grammars/gdscript/*`
 - Test: `tests/test_extraction.c`
 
-- [ ] **Step 1: Add a failing extractor build check**
+- [x] **Step 1: Add a failing extractor build check**
 
 Run:
 
@@ -248,7 +250,7 @@ make -f Makefile.cbm cbm
 
 Expected: FAIL before extractor conflicts are fully resolved.
 
-- [ ] **Step 2: Merge upstream refactors into the extractor core**
+- [x] **Step 2: Merge upstream refactors into the extractor core**
 
 For each file, preserve these branch requirements while adopting upstream structure changes:
 
@@ -259,7 +261,7 @@ For each file, preserve these branch requirements while adopting upstream struct
 
 Do not hand-wave this as “take ours” or “take theirs”; port the GDScript behavior into the upstream refactor shape.
 
-- [ ] **Step 3: Verify the extractor build now passes**
+- [x] **Step 3: Verify the extractor build now passes**
 
 Run:
 
@@ -269,7 +271,7 @@ make -f Makefile.cbm cbm
 
 Expected: PASS.
 
-- [ ] **Step 4: Run a progress-check full suite after extractor reconciliation**
+- [x] **Step 4: Run a progress-check full suite after extractor reconciliation**
 
 Run:
 
@@ -279,7 +281,7 @@ make -f Makefile.cbm test
 
 Expected: if failures remain, they should now be in later merge layers such as pipeline/test reconciliation rather than extractor compile failures.
 
-- [ ] **Step 5: Stage and checkpoint the extractor-core resolution**
+- [x] **Step 5: Stage and checkpoint the extractor-core resolution**
 
 ```bash
 git add internal/cbm/extract_calls.c internal/cbm/extract_defs.c internal/cbm/extract_imports.c internal/cbm/extract_type_assigns.c internal/cbm/extract_unified.c internal/cbm/helpers.c internal/cbm/helpers.h internal/cbm/grammar_gdscript.c internal/cbm/vendored/grammars/gdscript/parser.c internal/cbm/vendored/grammars/gdscript/scanner.c internal/cbm/vendored/grammars/gdscript/tree_sitter/parser.h tests/test_extraction.c
@@ -300,7 +302,7 @@ Expected: extractor-core files are staged as resolved while the merge is still i
 - Test: `tests/test_pipeline.c`
 - Test: `tests/test_registry.c`
 
-- [ ] **Step 1: Add the failing pipeline/parity progress check**
+- [x] **Step 1: Add the failing pipeline/parity progress check**
 
 Run:
 
@@ -310,7 +312,7 @@ make -f Makefile.cbm test
 
 Expected: FAIL before the pipeline conflicts are fully restitched.
 
-- [ ] **Step 2: Reconcile sequential and parallel GDScript behavior on top of upstream**
+- [x] **Step 2: Reconcile sequential and parallel GDScript behavior on top of upstream**
 
 Preserve these branch guarantees:
 
@@ -324,7 +326,7 @@ Preserve from upstream:
 
 `src/pipeline/pass_parallel.c` is the highest-risk file in the merge. Treat it as the primary integration checkpoint, not a routine conflict cleanup.
 
-- [ ] **Step 3: Re-run the pipeline/parity progress check**
+- [x] **Step 3: Re-run the pipeline/parity progress check**
 
 Run:
 
@@ -334,7 +336,7 @@ make -f Makefile.cbm test
 
 Expected: if failures remain, they should now be limited to the integration/test restitching work called out in Task 5, not unresolved pipeline compile/link problems.
 
-- [ ] **Step 4: Stage and checkpoint the pipeline and registry resolution**
+- [x] **Step 4: Stage and checkpoint the pipeline and registry resolution**
 
 ```bash
 git add src/pipeline/pass_calls.c src/pipeline/pass_definitions.c src/pipeline/pass_parallel.c src/pipeline/pass_semantic.c src/pipeline/registry.c tests/test_parallel.c tests/test_pipeline.c tests/test_registry.c
@@ -355,7 +357,7 @@ Expected: pipeline and registry files are staged as resolved while the merge is 
 - Verify: `tests/test_userconfig.c`
 - Verify: `tests/fixtures/gdscript/min_project/actors/*`
 
-- [ ] **Step 1: Add the failing full-suite gate before final test restitching**
+- [x] **Step 1: Add the failing full-suite gate before final test restitching**
 
 Run:
 
@@ -365,7 +367,7 @@ make -f Makefile.cbm test
 
 Expected: FAIL until the merged behavior and tests agree.
 
-- [ ] **Step 2: Update the integration tests to match the merged pipeline behavior**
+- [x] **Step 2: Update the integration tests to match the merged pipeline behavior**
 
 Preserve these expectations:
 
@@ -376,7 +378,7 @@ Preserve these expectations:
 - built-in base classes do not create incorrect inherits edges
 - nameless script anchor behavior still works
 
-- [ ] **Step 3: Re-run the full-suite gate after test restitching**
+- [x] **Step 3: Re-run the full-suite gate after test restitching**
 
 Run:
 
@@ -386,7 +388,7 @@ make -f Makefile.cbm test
 
 Expected: PASS.
 
-- [ ] **Step 4: Stage and checkpoint the test restitching**
+- [x] **Step 4: Stage and checkpoint the test restitching**
 
 ```bash
 git add tests/test_integration.c tests/test_language.c tests/test_userconfig.c tests/fixtures/gdscript/min_project/actors
@@ -401,7 +403,7 @@ Expected: test updates are staged as resolved while the merge is still uncommitt
 - Modify if needed: `scripts/gdscript-proof.sh`
 - Modify if needed: `docs/superpowers/proofs/gdscript-real-project-validation.md`
 
-- [ ] **Step 1: Add the failing proof-workflow check**
+- [x] **Step 1: Add the failing proof-workflow check**
 
 Run:
 
@@ -413,7 +415,7 @@ bash scripts/gdscript-proof.sh \
 
 Expected: if upstream CLI/MCP behavior drifted, this reveals it now.
 
-- [ ] **Step 2: Reconcile the proof script with merged CLI/MCP behavior**
+- [x] **Step 2: Reconcile the proof script with merged CLI/MCP behavior**
 
 Check specifically:
 
@@ -425,7 +427,7 @@ Check specifically:
 
 If the merged CLI still requires fallback, keep the fallback transparent in artifacts and docs.
 
-- [ ] **Step 3: Re-run the documented proof examples**
+- [x] **Step 3: Re-run the documented proof examples**
 
 Run:
 
@@ -441,7 +443,7 @@ Expected:
 - `aggregate-summary.md` exists
 - final run exits `0` once the chosen repos cover indexing, signal, imports, and inherits
 
-- [ ] **Step 4: Stage proof workflow follow-up changes only if needed**
+- [x] **Step 4: Stage proof workflow follow-up changes only if needed**
 
 ```bash
 git add scripts/gdscript-proof.sh docs/superpowers/proofs/gdscript-real-project-validation.md
@@ -455,7 +457,7 @@ Expected: proof workflow changes are staged only if upstream CLI/MCP behavior fo
 **Files:**
 - Verify only: entire merged worktree
 
-- [ ] **Step 1: Run the full repository test suite**
+- [x] **Step 1: Run the full repository test suite**
 
 Run:
 
@@ -465,7 +467,7 @@ make -f Makefile.cbm test
 
 Expected: PASS.
 
-- [ ] **Step 2: Run one non-GDScript smoke index**
+- [x] **Step 2: Run one non-GDScript smoke index**
 
 Run:
 
@@ -475,7 +477,7 @@ Run:
 
 Expected: PASS. This guards against accidentally fixing GDScript while breaking broader indexing.
 
-- [ ] **Step 3: Verify the worktree is clean except intended merge results**
+- [x] **Step 3: Verify the worktree is clean except intended merge results**
 
 Run:
 
@@ -485,14 +487,14 @@ git status --short
 
 Expected: no stray proof artifacts and no unresolved merge state.
 
-- [ ] **Step 4: Commit the final merge result**
+- [x] **Step 4: Commit the final merge result**
 
 ```bash
 git add .
 git commit -m "merge: integrate origin/main into gdscript support"
 ```
 
-- [ ] **Step 5: Land the validated result back onto `gdscript-support`**
+- [x] **Step 5: Land the validated result back onto `gdscript-support`**
 
 Run from the original `gdscript-support` worktree after the integration branch has a final merge commit:
 
@@ -502,7 +504,7 @@ git merge --ff-only gdscript-support-main-sync
 
 Expected: `gdscript-support` now points at the validated integration commit without replaying the merge work a second time.
 
-- [ ] **Step 6: Record the final evidence**
+- [x] **Step 6: Record the final evidence**
 
 Write down for the eventual PR/update:
 
