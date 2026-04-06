@@ -1891,6 +1891,25 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "list_projects, detect_changes, manage_adr, etc. "
      "You can also enable individual classic tools without switching modes: "
      "config set tool_index_repository true"},
+    {"context_injection", "true", "CBM_CONTEXT_INJECTION", "Tools",
+     "Inject _context (schema/architecture) into the first tool response — enable for AI, disable for scripting",
+     "true|false",
+     "WHAT IT DOES: On the first search_code_graph/search_graph call of a session, "
+     "embeds a _context object containing node/edge counts, all node labels with counts, "
+     "all edge types with counts, PageRank stats, and detected ecosystem (Go/Python/Rust/etc.). "
+     "This gives the AI model automatic situational awareness without requiring it to call "
+     "get_architecture or get_graph_schema first. Subsequent calls omit _context (one-shot "
+     "delivery, controlled by the context_injected session flag). "
+     "WHEN TO DISABLE (context_injection=false or CBM_CONTEXT_INJECTION=false): "
+     "(1) Scripted/programmatic use where you parse tool output and the extra JSON adds noise. "
+     "(2) CI pipelines where token cost is metered and the model does not need schema context. "
+     "(3) When the AI is given explicit codebase instructions via system prompt instead. "
+     "(4) Benchmarking raw tool latency without the schema query overhead. "
+     "WHEN TO KEEP ENABLED (default): Interactive AI sessions where the model benefits from "
+     "knowing the codebase structure before it starts querying. Saves 2-3 round-trips that "
+     "would otherwise be needed to fetch schema and architecture separately. "
+     "Per-session override: set CBM_CONTEXT_INJECTION=false in the environment. "
+     "Per-install default: codebase-memory-mcp config set context_injection false"},
     {"compact", "true", "CBM_COMPACT", "Tools",
      "Default compact output for search_code_graph, trace_call_path, and get_code",
      "true|false",

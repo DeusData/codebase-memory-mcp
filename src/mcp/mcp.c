@@ -1156,6 +1156,18 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
         yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
 
     if (srv->context_injected) return;
+
+    /* Configurable via config key "context_injection" (default true) or env
+     * CBM_CONTEXT_INJECTION=false.  Disable to suppress the _context header
+     * when token cost matters more than automatic situational awareness:
+     *   - scripted / programmatic tool use (output parsed, extra JSON is noise)
+     *   - CI pipelines (token cost is metered, model doesn't need schema context)
+     *   - model given explicit system-prompt codebase instructions instead
+     *   - benchmarking (removes schema-query overhead from latency measurements)
+     * Checked before setting context_injected so toggling mid-session works. */
+    bool inject_enabled = cbm_config_get_bool(srv->config, "context_injection", true);
+    if (!inject_enabled) return;
+
     srv->context_injected = true;
 
     yyjson_mut_val *ctx = yyjson_mut_obj(doc);
