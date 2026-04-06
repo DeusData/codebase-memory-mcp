@@ -326,6 +326,13 @@ static bool lex_skip_whitespace_comments(const char *input, int len, int *i) {
         }
         return true;
     }
+    /* SQL-style -- single-line comment */
+    if (*i + SKIP_ONE < len && input[*i] == '-' && input[*i + SKIP_ONE] == '-') {
+        while (*i < len && input[*i] != '\n') {
+            (*i)++;
+        }
+        return true;
+    }
     if (*i + SKIP_ONE < len && input[*i] == '/' && input[*i + SKIP_ONE] == '*') {
         *i += PAIR_LEN;
         while (*i + SKIP_ONE < len && !(input[*i] == '*' && input[*i + SKIP_ONE] == '/')) {
@@ -1641,6 +1648,10 @@ typedef struct {
     int edge_var_count;
 } binding_t;
 
+/* File-static store for degree queries in node_prop.
+ * Set at the start of execute_single(), cleared after. */
+static cbm_store_t *_cyp_exec_store = NULL;
+
 /* Get node property by name */
 static const char *node_prop(const cbm_node_t *n, const char *prop) {
     if (!n || !prop) {
@@ -1668,6 +1679,16 @@ static const char *node_prop(const cbm_node_t *n, const char *prop) {
         static char buf[CBM_SZ_32];
         snprintf(buf, sizeof(buf), "%d", n->end_line);
         return buf;
+    }
+    /* Virtual computed properties: in_degree, out_degree (CALLS edges).
+     * Enables Cypher: WHERE n.in_degree = 0 (dead code detection). */
+    if ((strcmp(prop, "in_degree") == 0 || strcmp(prop, "out_degree") == 0) && _cyp_exec_store) {
+        int in_deg = 0, out_deg = 0;
+        cbm_store_node_degree(_cyp_exec_store, n->id, &in_deg, &out_deg);
+        static char deg_buf[CBM_SZ_32];
+        snprintf(deg_buf, sizeof(deg_buf), "%d",
+                 strcmp(prop, "in_degree") == 0 ? in_deg : out_deg);
+        return deg_buf;
     }
     return "";
 }
@@ -1992,11 +2013,30 @@ static bool eval_where(const cbm_where_clause_t *w, binding_t *b) {
 }
 
 /* Check inline property filters */
+/* Check if a string value looks like a regex pattern. */
+static bool looks_like_regex(const char *s) {
+    return s && (strchr(s, '*') || strchr(s, '?') || strchr(s, '[') ||
+                 strchr(s, '(') || strchr(s, '|') || strchr(s, '^') ||
+                 strchr(s, '$') || strstr(s, ".*") || strstr(s, ".+"));
+}
+
 static bool check_inline_props(const cbm_node_t *n, const cbm_prop_filter_t *props, int count) {
     for (int i = 0; i < count; i++) {
         const char *actual = node_prop(n, props[i].key);
-        if (strcmp(actual, props[i].value) != 0) {
-            return false;
+        /* If the value looks like a regex, use regex matching */
+        if (looks_like_regex(props[i].value)) {
+            cbm_regex_t re;
+            if (cbm_regcomp(&re, props[i].value,
+                            CBM_REG_EXTENDED | CBM_REG_NOSUB) == 0) {
+                bool match = cbm_regexec(&re, actual, 0, NULL, 0) == 0;
+                cbm_regfree(&re);
+                if (!match) return false;
+            } else {
+                /* Regex compile failed — fall back to exact match */
+                if (strcmp(actual, props[i].value) != 0) return false;
+            }
+        } else {
+            if (strcmp(actual, props[i].value) != 0) return false;
         }
     }
     return true;
@@ -3272,6 +3312,7 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
 
 static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *project, int max_rows,
                           result_builder_t *rb) {
+    _cyp_exec_store = store; /* enable in_degree/out_degree in node_prop */
     cbm_pattern_t *pat0 = &q->patterns[0];
 
     /* Step 1: Scan initial nodes */

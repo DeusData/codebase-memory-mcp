@@ -728,6 +728,44 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     char path[CBM_SZ_1K];
     project_db_path(project, path, sizeof(path));
     srv->store = cbm_store_open_path_query(path);
+
+    /* Short-name resolution: if exact match fails, scan cache dir for a
+     * .db file whose name ends with "-{project}.db". This allows callers
+     * to use a short name instead of the full slugified path key.
+     * Only resolves when exactly one candidate matches (no ambiguity). */
+    if (!srv->store) {
+        char suffix[CBM_SZ_512];
+        snprintf(suffix, sizeof(suffix), "-%s.db", project);
+        size_t suffix_len = strlen(suffix);
+
+        char dir_path[CBM_SZ_1K];
+        cache_dir(dir_path, sizeof(dir_path));
+        cbm_dir_t *d = cbm_opendir(dir_path);
+        if (d) {
+            char resolved[CBM_SZ_1K] = "";
+            int matches = 0;
+            cbm_dirent_t *ent;
+            while ((ent = cbm_readdir(d)) != NULL) {
+                size_t name_len = strlen(ent->name);
+                if (name_len > suffix_len &&
+                    strcmp(ent->name + name_len - suffix_len, suffix) == 0) {
+                    /* Strip .db extension to get the project name */
+                    snprintf(resolved, sizeof(resolved), "%.*s",
+                             (int)(name_len - 3), ent->name);
+                    matches++;
+                }
+            }
+            cbm_closedir(d);
+
+            if (matches == 1 && resolved[0]) {
+                /* Retry with the resolved full project name.
+                 * Recursive call ensures integrity check and project
+                 * verification use the correct (resolved) project name. */
+                return resolve_store(srv, resolved);
+            }
+        }
+    }
+
     if (srv->store) {
         /* Check DB integrity — auto-clean corrupt databases */
         if (!cbm_store_check_integrity(srv->store)) {
@@ -763,6 +801,13 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     }
 
     return srv->store;
+}
+
+/* After resolve_store, the resolved project name may differ from the input
+ * (e.g., "myrepo" resolved to "path-to-myrepo").
+ * This helper returns the resolved name, or the original if no resolution. */
+static const char *resolved_project(cbm_mcp_server_t *srv, const char *project) {
+    return (srv && srv->current_project) ? srv->current_project : project;
 }
 
 /* Scan cache dir for .db files, writing comma-separated quoted names into out.
@@ -941,6 +986,26 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
 static char *verify_project_indexed(cbm_store_t *store, const char *project) {
     cbm_project_t proj_check = {0};
     if (cbm_store_get_project(store, project, &proj_check) != CBM_STORE_OK) {
+        /* Short-name fallback: scan projects table for suffix match.
+         * This handles the case where resolve_store resolved a short name to
+         * the full project key, but the caller still passes the short name here. */
+        struct sqlite3 *db = cbm_store_get_db(store);
+        if (db) {
+            char like_pattern[CBM_SZ_512];
+            snprintf(like_pattern, sizeof(like_pattern), "%%-%s", project);
+            sqlite3_stmt *s = NULL;
+            if (sqlite3_prepare_v2(db,
+                    "SELECT name FROM projects WHERE name LIKE ?1 LIMIT 1",
+                    -1, &s, NULL) == SQLITE_OK) {
+                sqlite3_bind_text(s, 1, like_pattern, -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(s) == SQLITE_ROW) {
+                    /* Found via suffix match — project is indexed */
+                    sqlite3_finalize(s);
+                    return NULL;
+                }
+                sqlite3_finalize(s);
+            }
+        }
         return cbm_mcp_text_result(
             "{\"error\":\"project not indexed — run index_repository first\"}", true);
     }
@@ -1127,7 +1192,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) goto fallback_search;
 
         sqlite3_bind_text(stmt, 1, fts_query, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, project, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, resolved_project(srv, project), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(stmt, 3, limit > 0 ? limit : 100);
         sqlite3_bind_int(stmt, 4, offset);
 
@@ -1142,7 +1207,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             sqlite3_stmt *cs = NULL;
             if (sqlite3_prepare_v2(db, count_sql, -1, &cs, NULL) == SQLITE_OK) {
                 sqlite3_bind_text(cs, 1, fts_query, -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(cs, 2, project, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(cs, 2, resolved_project(srv, project), -1, SQLITE_TRANSIENT);
                 if (sqlite3_step(cs) == SQLITE_ROW) total = sqlite3_column_int(cs, 0);
                 sqlite3_finalize(cs);
             }
@@ -1288,7 +1353,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     }
 
     cbm_cypher_result_t result = {0};
-    int rc = cbm_cypher_execute(store, query, project, max_rows, &result);
+    int rc = cbm_cypher_execute(store, query, resolved_project(srv, project), max_rows, &result);
 
     if (rc < 0) {
         char *err_msg = result.error ? result.error : "query execution failed";
