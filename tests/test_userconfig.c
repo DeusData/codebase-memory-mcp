@@ -6,6 +6,7 @@
  */
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/platform.h"
 #include "test_framework.h"
 #include "discover/discover.h"
 #include "discover/userconfig.h"
