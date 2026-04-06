@@ -197,6 +197,14 @@ jobs:
           cp install.ps1 binaries/ 2>/dev/null || true
           ls -la binaries/
 
+      - name: Security audits on all release binaries
+        run: |
+          for bin in binaries/codebase-memory-mcp*; do
+            [ -f "$bin" ] || continue
+            echo "--- Auditing: $(basename "$bin") ---"
+            scripts/security-strings.sh "$bin"
+          done
+
       - name: VirusTotal scan
         uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0
         id: virustotal
