@@ -191,3 +191,10 @@ jobs:
           tar -xzf codebase-memory-mcp${SUFFIX}-linux-${{ matrix.arch }}-portable.tar.gz
           chmod +x codebase-memory-mcp
           scripts/smoke-test.sh ./codebase-memory-mcp
+
+      - name: Security audits (standard only)
+        if: matrix.variant == 'standard'
+        run: |
+          scripts/security-strings.sh ./codebase-memory-mcp
+          scripts/security-install.sh ./codebase-memory-mcp
+          scripts/security-network.sh ./codebase-memory-mcp
