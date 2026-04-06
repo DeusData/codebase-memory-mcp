@@ -148,6 +148,19 @@ int cbm_gbuf_edge_count_by_type(const cbm_gbuf_t *gb, const char *type);
 /* Delete all edges of a type. */
 int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type);
 
+/* ── Vector storage (for semantic embeddings) ───────────────────── */
+
+/* Store an int8-quantized vector for a node. The vector data is copied.
+ * Called by pass_semantic_edges after computing RI vectors.
+ * Vectors are carried through to cbm_write_db during the dump phase. */
+int cbm_gbuf_store_vector(cbm_gbuf_t *gb, int64_t node_id, const uint8_t *vector, int vector_len);
+
+/* Store an enriched token vector for query-time lookup.
+ * Called by pass_semantic_edges after corpus finalization.
+ * Token string and vector data are copied. */
+int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t *vector,
+                                int vector_len, float idf);
+
 /* ── Dump to SQLite ──────────────────────────────────────────────── */
 
 /* Dump the entire buffer to a SQLite file using the direct page writer.

@@ -71,4 +71,9 @@ bool cbm_validate_shell_arg(const char *s);
         }                                                                            \
     } while (0)
 
+/* Escape a string for safe embedding in JSON: escapes " \ and control chars.
+ * Writes into buf (including NUL). Returns number of chars written (excl NUL).
+ * If buf is too small, output is truncated but always NUL-terminated. */
+int cbm_json_escape(char *buf, int bufsize, const char *src);
+
 #endif /* CBM_STR_UTIL_H */

@@ -60,12 +60,18 @@ void cbm_gitignore_free(cbm_gitignore_t *gi);
 
 /* ── Directory skip / suffix filters ─────────────────────────────── */
 
-/* Index mode controls filtering aggressiveness. */
+/* Index mode controls filtering aggressiveness.
+ * IMPORTANT: these values MUST match pipeline.h exactly.  A previous
+ * mismatch (this header had FAST=1, pipeline.h has FAST=2) caused
+ * fast-mode filtering to silently no-op depending on include order —
+ * the pipeline passed value 2, discover.c compared against 1, and no
+ * files got filtered. */
 #ifndef CBM_INDEX_MODE_T_DEFINED
 #define CBM_INDEX_MODE_T_DEFINED
 typedef enum {
-    CBM_MODE_FULL = 0, /* parse everything supported */
-    CBM_MODE_FAST = 1, /* aggressive filtering for speed */
+    CBM_MODE_FULL = 0,     /* parse everything supported */
+    CBM_MODE_MODERATE = 1, /* aggressive filtering + similarity/semantic edges */
+    CBM_MODE_FAST = 2,     /* aggressive filtering + no similarity/semantic edges */
 } cbm_index_mode_t;
 #endif
 
