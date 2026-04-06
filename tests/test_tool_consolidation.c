@@ -254,16 +254,18 @@ TEST(first_response_has_context_header) {
     char *result = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"name_pattern\":\"test\"}");
     ASSERT_NOT_NULL(result);
-    /* First response should have _context */
-    ASSERT_NOT_NULL(strstr(result, "_context"));
+    /* First response should have _context (escaped: inner JSON is JSON-encoded in outer) */
+    ASSERT_NOT_NULL(strstr(result, "\\\"_context\\\":"));
     ASSERT_NOT_NULL(strstr(result, "status"));
     free(result);
 
-    /* Second call should NOT have _context (already injected) */
+    /* Second call should NOT have _context (already injected).
+     * Use escaped pattern "\\\"_context\\\":" to avoid false-positives from node
+     * names like "inject_context_once" that contain "_context" as a substring. */
     char *result2 = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"name_pattern\":\"test2\"}");
     ASSERT_NOT_NULL(result2);
-    ASSERT_NULL(strstr(result2, "_context"));
+    ASSERT_NULL(strstr(result2, "\\\"_context\\\":"));
     /* But session_project should still be present */
     ASSERT_NOT_NULL(strstr(result2, "session_project"));
     free(result2);
@@ -279,8 +281,8 @@ TEST(context_has_schema_info) {
     char *result = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"name_pattern\":\"x\"}");
     ASSERT_NOT_NULL(result);
-    /* In-memory store has schema tables → should see these fields */
-    ASSERT_NOT_NULL(strstr(result, "_context"));
+    /* In-memory store has schema tables → should see these fields (escaped JSON key) */
+    ASSERT_NOT_NULL(strstr(result, "\\\"_context\\\":"));
     ASSERT_NOT_NULL(strstr(result, "node_labels"));
     ASSERT_NOT_NULL(strstr(result, "edge_types"));
     free(result);
@@ -390,16 +392,20 @@ TEST(initialize_parses_client_resources_capability) {
     ASSERT_NOT_NULL(resp);
     free(resp);
 
-    /* After initialize with resources capability, context injection should be skipped.
-     * Call a tool — should have session_project but NOT _context. */
+    /* MCP resources are pull-only — declaring resources capability does NOT mean
+     * the client auto-reads codebase://schema or codebase://architecture.
+     * inject_context_once must still fire on the first tool call so the model
+     * receives architectural context without requiring explicit user action.
+     * Ref: https://modelcontextprotocol.io/specification/2025-06-18/server/resources */
     char *result = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"name_pattern\":\"x\"}");
     ASSERT_NOT_NULL(result);
     /* session_project should still appear */
-    ASSERT_NOT_NULL(strstr(result, "session_project") != NULL ?
-        strstr(result, "session_project") : result);
-    /* _context should NOT appear (client uses resources/read instead) */
-    ASSERT_NULL(strstr(result, "_context"));
+    ASSERT_NOT_NULL(strstr(result, "session_project"));
+    /* _context MUST appear on first call regardless of resources capability.
+     * cbm_mcp_text_result embeds inner JSON as a JSON-encoded string value, so
+     * "\"_context\":" in the inner JSON appears as "\\\"_context\\\":" in raw bytes. */
+    ASSERT_NOT_NULL(strstr(result, "\\\"_context\\\":"));
     free(result);
 
     cbm_mcp_server_free(srv);
@@ -422,7 +428,7 @@ TEST(no_resources_capability_gets_context_injection) {
     char *result = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"name_pattern\":\"x\"}");
     ASSERT_NOT_NULL(result);
-    ASSERT_NOT_NULL(strstr(result, "_context"));
+    ASSERT_NOT_NULL(strstr(result, "\\\"_context\\\":"));
     free(result);
 
     cbm_mcp_server_free(srv);
@@ -519,8 +525,13 @@ TEST(resources_read_no_params_at_all) {
 
 /* ── 9. Client behavioral difference tests ───────────────── */
 
-TEST(resource_client_never_gets_context_across_multiple_calls) {
-    /* Resource-capable client should NEVER see _context, even across many calls */
+TEST(resource_client_gets_context_only_on_first_call) {
+    /* Resource-capable client gets _context on the FIRST call only.
+     * MCP resources are pull-only (no server push). Declaring resources:{}
+     * does not trigger automatic resource reads — the model must be explicitly
+     * instructed or the user must @-mention a resource URI.
+     * context_injected=true after first injection prevents duplicates.
+     * Ref: https://modelcontextprotocol.io/docs/concepts/resources */
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
     char *resp = cbm_mcp_server_handle(srv,
@@ -531,17 +542,25 @@ TEST(resource_client_never_gets_context_across_multiple_calls) {
     ASSERT_NOT_NULL(resp);
     free(resp);
 
-    /* 3 consecutive tool calls — none should have _context (as JSON key) */
-    for (int i = 0; i < 3; i++) {
+    /* First call MUST have _context (JSON key "_context":).
+     * cbm_mcp_text_result embeds inner JSON as a JSON-encoded string value, so the
+     * literal bytes in the outer response are \"_context\": (backslash-escaped quotes).
+     * Search for "\\\"_context\\\":" which matches \"_context\": in raw bytes. */
+    char *r1 = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"name_pattern\":\"test\"}");
+    ASSERT_NOT_NULL(r1);
+    ASSERT_NOT_NULL(strstr(r1, "\\\"_context\\\":"));
+    ASSERT_NOT_NULL(strstr(r1, "session_project"));
+    free(r1);
+
+    /* Calls 2 and 3: _context must NOT repeat (context_injected dedup guard).
+     * Use the escaped pattern "\\\"_context\\\":" to avoid false positives from
+     * node names like "inject_context_once" matching bare "_context" searches. */
+    for (int i = 0; i < 2; i++) {
         char *r = cbm_mcp_handle_tool(srv, "search_graph",
             "{\"name_pattern\":\"test\"}");
         ASSERT_NOT_NULL(r);
-        /* Check for the JSON key "_context": (quoted key + colon), not bare substring.
-         * Node names/qualified_names in results can contain "_context" as a substring
-         * (e.g. "inject_context_once", "gets_context_across_multiple_calls") and would
-         * cause false positives if we check the unquoted form. */
-        ASSERT_NULL(strstr(r, "\"_context\":"));
-        /* But session_project should always be present */
+        ASSERT_NULL(strstr(r, "\\\"_context\\\":"));
         ASSERT_NOT_NULL(strstr(r, "session_project"));
         free(r);
     }
@@ -561,18 +580,18 @@ TEST(legacy_client_gets_context_only_on_first_call) {
     ASSERT_NOT_NULL(resp);
     free(resp);
 
-    /* First call: MUST have _context */
+    /* First call: MUST have _context (escaped: inner JSON is JSON-encoded in outer) */
     char *r1 = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"name_pattern\":\"test\"}");
     ASSERT_NOT_NULL(r1);
-    ASSERT_NOT_NULL(strstr(r1, "_context"));
+    ASSERT_NOT_NULL(strstr(r1, "\\\"_context\\\":"));
     free(r1);
 
-    /* Second call: must NOT have _context (one-shot) */
+    /* Second call: must NOT have _context (one-shot dedup via context_injected flag) */
     char *r2 = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"name_pattern\":\"test2\"}");
     ASSERT_NOT_NULL(r2);
-    ASSERT_NULL(strstr(r2, "\"_context\":"));
+    ASSERT_NULL(strstr(r2, "\\\"_context\\\":"));
     ASSERT_NOT_NULL(strstr(r2, "session_project"));
     free(r2);
 
@@ -580,9 +599,11 @@ TEST(legacy_client_gets_context_only_on_first_call) {
     PASS();
 }
 
-TEST(empty_resources_capability_counts_as_support) {
+TEST(empty_resources_capability_still_gets_context) {
     /* MCP spec: capabilities.resources:{} means resources supported
-     * (neither subscribe nor listChanged, but resources protocol works) */
+     * (neither subscribe nor listChanged, but resources protocol works).
+     * Even so, resources are pull-only — declaring support does not trigger
+     * automatic reads. _context injection applies to ALL clients. */
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
     char *resp = cbm_mcp_server_handle(srv,
@@ -593,11 +614,12 @@ TEST(empty_resources_capability_counts_as_support) {
     ASSERT_NOT_NULL(resp);
     free(resp);
 
-    /* Empty resources:{} still means client supports resources → no _context */
+    /* Empty resources:{} client still gets _context on first call.
+     * Use escaped pattern: inner JSON is embedded as JSON-encoded string in outer response. */
     char *r = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"name_pattern\":\"x\"}");
     ASSERT_NOT_NULL(r);
-    ASSERT_NULL(strstr(r, "_context"));
+    ASSERT_NOT_NULL(strstr(r, "\\\"_context\\\":"));
     free(r);
 
     cbm_mcp_server_free(srv);
@@ -612,8 +634,94 @@ TEST(no_initialize_defaults_to_legacy_behavior) {
     char *r = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"name_pattern\":\"x\"}");
     ASSERT_NOT_NULL(r);
-    ASSERT_NOT_NULL(strstr(r, "_context"));
+    ASSERT_NOT_NULL(strstr(r, "\\\"_context\\\":"));
     free(r);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── 17. MCP resources pull-only: inject_context_once fires for ALL clients ─
+ *
+ * The MCP spec defines resources as "application-controlled" — there is no
+ * server-push mechanism. When a client declares resources capability, it means
+ * the client CAN fetch resources explicitly (e.g. via @resource-uri in Claude
+ * Code), NOT that it will automatically read them. References:
+ *   https://modelcontextprotocol.io/specification/2025-06-18/server/resources
+ *   https://modelcontextprotocol.io/docs/concepts/resources
+ *   https://workos.com/blog/mcp-features-guide (resources = application-controlled)
+ *
+ * inject_context_once embeds schema/architecture in the FIRST tool response.
+ * This is the only reliable delivery channel that doesn't require explicit
+ * user action:
+ *   - notifications/resources/updated signals changes but sends NO content
+ *   - resources/read requires explicit model action (not automatic)
+ *   - Claude Code resources require user @-mention or explicit instruction
+ *
+ * The context_injected flag already prevents duplicate injection on subsequent
+ * calls, so ALL clients receive context exactly once regardless of whether
+ * they declared resources capability.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+TEST(resource_capable_client_gets_context_on_first_call) {
+    /* Resource-capable client MUST get _context on the first tool call.
+     * Declaring resources:{} does NOT mean automatic resource reads —
+     * the model only reads resources when explicitly instructed (user @-mention
+     * or system prompt directive). Embedding _context in the first response
+     * is the only reliable delivery channel without user intervention. */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+        "\"params\":{\"protocolVersion\":\"2024-11-05\","
+        "\"capabilities\":{\"resources\":{}},"
+        "\"clientInfo\":{\"name\":\"claude-code\",\"version\":\"2.0\"}}}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+
+    /* First tool call MUST include _context regardless of resources capability.
+     * Escaped pattern: cbm_mcp_text_result embeds inner JSON as a JSON-encoded string,
+     * so "\"_context\":" appears as "\\\"_context\\\":" in the outer raw bytes. */
+    char *r = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"name_pattern\":\"test\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "\\\"_context\\\":"));
+    free(r);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(resource_capable_client_no_context_on_second_call) {
+    /* After first-call injection, context_injected=true suppresses duplicates.
+     * This dedup applies to ALL clients equally — resource-capable or not.
+     * Session-project is still included on every call (it's lightweight). */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+        "\"params\":{\"protocolVersion\":\"2024-11-05\","
+        "\"capabilities\":{\"resources\":{\"subscribe\":true}},"
+        "\"clientInfo\":{\"name\":\"claude-code\",\"version\":\"2.0\"}}}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+
+    /* First call: _context present (escaped pattern — inner JSON is JSON-encoded in outer) */
+    char *r1 = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"name_pattern\":\"x\"}");
+    ASSERT_NOT_NULL(r1);
+    ASSERT_NOT_NULL(strstr(r1, "\\\"_context\\\":"));
+    free(r1);
+
+    /* Second call: _context must NOT be repeated (context_injected guard).
+     * "\\\"_context\\\":" searches for \"_context\": in raw bytes — won't false-positive
+     * on node names like "inject_context_once". */
+    char *r2 = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"name_pattern\":\"y\"}");
+    ASSERT_NOT_NULL(r2);
+    ASSERT_NULL(strstr(r2, "\\\"_context\\\":"));
+    /* session_project must still be present on every call */
+    ASSERT_NOT_NULL(strstr(r2, "session_project"));
+    free(r2);
+
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -1713,10 +1821,13 @@ SUITE(tool_consolidation) {
     RUN_TEST(resources_read_missing_uri_param);
     RUN_TEST(resources_read_no_params_at_all);
     /* Client behavioral differences */
-    RUN_TEST(resource_client_never_gets_context_across_multiple_calls);
+    RUN_TEST(resource_client_gets_context_only_on_first_call);
     RUN_TEST(legacy_client_gets_context_only_on_first_call);
-    RUN_TEST(empty_resources_capability_counts_as_support);
+    RUN_TEST(empty_resources_capability_still_gets_context);
     RUN_TEST(no_initialize_defaults_to_legacy_behavior);
+    /* MCP resources pull-only: context injection fires for all clients (§17) */
+    RUN_TEST(resource_capable_client_gets_context_on_first_call);
+    RUN_TEST(resource_capable_client_no_context_on_second_call);
     /* Tool descriptions reference resources */
     RUN_TEST(tool_descriptions_reference_resources);
     RUN_TEST(hidden_tools_hint_mentions_resources);
