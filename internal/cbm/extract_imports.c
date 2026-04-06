@@ -345,6 +345,72 @@ static bool process_es_import_statement(CBMExtractCtx *ctx, TSNode node) {
     return true;
 }
 
+/* Handle CommonJS `require("path")` call_expression nodes.  The local name
+ * is derived from the enclosing variable_declarator / assignment when
+ * possible (so `const foo = require('./foo')` emits local_name="foo"),
+ * otherwise falls back to the last path component. */
+static bool process_commonjs_require(CBMExtractCtx *ctx, TSNode call) {
+    CBMArena *a = ctx->arena;
+    if (ts_node_child_count(call) < MIN_WOLFRAM_CHILDREN) {
+        return false;
+    }
+    /* Callee must be the identifier "require". */
+    TSNode fn = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    if (ts_node_is_null(fn)) {
+        fn = ts_node_child(call, 0);
+    }
+    if (ts_node_is_null(fn)) {
+        return false;
+    }
+    const char *fn_kind = ts_node_type(fn);
+    if (strcmp(fn_kind, "identifier") != 0) {
+        return false;
+    }
+    char *fn_name = cbm_node_text(a, fn, ctx->source);
+    if (!fn_name || strcmp(fn_name, "require") != 0) {
+        return false;
+    }
+
+    /* First string literal child of the argument list is the module path. */
+    TSNode args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    if (ts_node_is_null(args)) {
+        return false;
+    }
+    uint32_t argc = ts_node_named_child_count(args);
+    char *path = NULL;
+    for (uint32_t i = 0; i < argc; i++) {
+        TSNode arg = ts_node_named_child(args, i);
+        const char *ak = ts_node_type(arg);
+        if (strcmp(ak, "string") == 0 || strcmp(ak, "string_literal") == 0 ||
+            strcmp(ak, "template_string") == 0) {
+            path = strip_quotes(a, cbm_node_text(a, arg, ctx->source));
+            break;
+        }
+    }
+    if (!path || !path[0]) {
+        return false;
+    }
+
+    /* Infer local name from enclosing variable_declarator.  Tree-sitter's JS
+     * grammar wraps `const foo = require(..)` as
+     *   lexical_declaration → variable_declarator { name: identifier, value: call } */
+    const char *local_name = NULL;
+    TSNode parent = ts_node_parent(call);
+    if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "variable_declarator") == 0) {
+        TSNode name_node = ts_node_child_by_field_name(parent, TS_FIELD("name"));
+        if (!ts_node_is_null(name_node) && strcmp(ts_node_type(name_node), "identifier") == 0) {
+            local_name = cbm_node_text(a, name_node, ctx->source);
+        }
+    }
+    if (!local_name) {
+        local_name = path_last(a, path);
+    }
+
+    CBMImport imp = {.local_name = local_name, .module_path = path};
+    cbm_imports_push(&ctx->result->imports, a, imp);
+    return true;
+}
+
 #define ES_IMPORT_STACK_CAP CBM_SZ_512
 static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
     TSNode stack[ES_IMPORT_STACK_CAP];
@@ -358,6 +424,12 @@ static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
 
         if (strcmp(kind, "import_statement") == 0) {
             if (process_es_import_statement(ctx, node)) {
+                push_children = false;
+            }
+        } else if (strcmp(kind, "call_expression") == 0) {
+            /* CommonJS require() — only consume the node if we recognized
+             * it as a require call; otherwise keep traversing the children. */
+            if (process_commonjs_require(ctx, node)) {
                 push_children = false;
             }
         }
