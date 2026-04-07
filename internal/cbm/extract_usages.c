@@ -4,6 +4,7 @@
 #include "extract_unified.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
+#include "ts_node_stack.h"
 
 enum { MAX_PARENT_DEPTH = 10, LAST_IDX = 1 };
 #include <stdint.h> // uint32_t
@@ -106,18 +107,17 @@ static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
 }
 
 // Iterative usage walker — explicit stack
-#define USAGES_STACK_CAP 4096
 static void walk_usages(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
-    TSNode stack[USAGES_STACK_CAP];
-    int top = 0;
-    stack[top++] = root;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, 4096);
+    ts_nstack_push(&stack, ctx->arena, root);
 
-    while (top > 0) {
-        TSNode node = stack[--top];
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         try_emit_usage(ctx, node, spec);
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - LAST_IDX; i >= 0 && top < USAGES_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        for (int i = (int)count - LAST_IDX; i >= 0; i--) {
+            ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
         }
     }
 }

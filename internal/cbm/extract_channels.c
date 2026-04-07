@@ -17,13 +17,13 @@
 #include "arena.h"
 #include "helpers.h"
 #include "foundation/constants.h"
+#include "ts_node_stack.h"
 #include "tree_sitter/api.h"
 #include <stdint.h>
 #include <string.h>
 
 enum {
     CHAN_CONST_CAP = 256,  /* max tracked identifiers per file */
-    CHAN_STACK_CAP = 4096, /* tree-walk stack */
     CHAN_IDENT_MAX = 128,  /* max identifier length tracked */
 };
 
@@ -76,12 +76,12 @@ static const char *literal_from_arg(CBMExtractCtx *ctx, TSNode arg) {
  * unresolved.  This is a flat lookup; scope boundaries are ignored (a single
  * const table per file is sufficient for the common Socket.IO pattern). */
 static void scan_string_consts(CBMExtractCtx *ctx, chan_const_table_t *tbl) {
-    TSNode stack[CHAN_STACK_CAP];
-    int top = 0;
-    stack[top++] = ctx->root;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, 4096);
+    ts_nstack_push(&stack, ctx->arena, ctx->root);
 
-    while (top > 0 && tbl->count < CHAN_CONST_CAP) {
-        TSNode node = stack[--top];
+    while (stack.count > 0 && tbl->count < CHAN_CONST_CAP) {
+        TSNode node = ts_nstack_pop(&stack);
         const char *kind = ts_node_type(node);
 
         /* `variable_declarator` is the TS/JS form of `IDENT = value`.
@@ -107,8 +107,8 @@ static void scan_string_consts(CBMExtractCtx *ctx, chan_const_table_t *tbl) {
         }
 
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_ONE; i >= 0 && top < CHAN_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
+            ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
         }
     }
 }
@@ -267,18 +267,18 @@ void cbm_extract_channels(CBMExtractCtx *ctx) {
     scan_string_consts(ctx, &consts);
 
     /* Second pass: walk the tree looking for call_expression nodes. */
-    TSNode stack[CHAN_STACK_CAP];
-    int top = 0;
-    stack[top++] = ctx->root;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, 4096);
+    ts_nstack_push(&stack, ctx->arena, ctx->root);
 
-    while (top > 0) {
-        TSNode node = stack[--top];
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "call_expression") == 0) {
             process_channel_call(ctx, node, &consts);
         }
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_ONE; i >= 0 && top < CHAN_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
+            ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
         }
     }
 }

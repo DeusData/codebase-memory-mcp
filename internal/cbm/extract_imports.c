@@ -3,6 +3,7 @@
 #include "helpers.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
+#include "ts_node_stack.h"
 #include <stdint.h> // uint32_t
 #include <string.h>
 #include <ctype.h>
@@ -411,14 +412,13 @@ static bool process_commonjs_require(CBMExtractCtx *ctx, TSNode call) {
     return true;
 }
 
-#define ES_IMPORT_STACK_CAP CBM_SZ_512
 static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
-    TSNode stack[ES_IMPORT_STACK_CAP];
-    int top = 0;
-    stack[top++] = root;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->arena, root);
 
-    while (top > 0) {
-        TSNode node = stack[--top];
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         const char *kind = ts_node_type(node);
         bool push_children = true;
 
@@ -436,8 +436,8 @@ static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
 
         if (push_children) {
             uint32_t count = ts_node_child_count(node);
-            for (int i = (int)count - SKIP_ONE; i >= 0 && top < ES_IMPORT_STACK_CAP; i--) {
-                stack[top++] = ts_node_child(node, (uint32_t)i);
+            for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
+                ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
             }
         }
     }
@@ -820,14 +820,13 @@ static void process_wolfram_needs(CBMExtractCtx *ctx, TSNode node) {
     }
 }
 
-#define WOLFRAM_IMPORT_STACK_CAP CBM_SZ_512
 static void walk_wolfram_imports(CBMExtractCtx *ctx, TSNode root) {
-    TSNode stack[WOLFRAM_IMPORT_STACK_CAP];
-    int top = 0;
-    stack[top++] = root;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->arena, root);
 
-    while (top > 0) {
-        TSNode node = stack[--top];
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         const char *kind = ts_node_type(node);
 
         if (strcmp(kind, "get_top") == 0) {
@@ -837,8 +836,8 @@ static void walk_wolfram_imports(CBMExtractCtx *ctx, TSNode root) {
         }
 
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_ONE; i >= 0 && top < WOLFRAM_IMPORT_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
+            ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
         }
     }
 }

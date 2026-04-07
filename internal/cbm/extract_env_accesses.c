@@ -4,6 +4,7 @@
 #include "lang_specs.h"
 #include "extract_unified.h"
 #include "foundation/constants.h"
+#include "ts_node_stack.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include <stdint.h>          // uint32_t
 #include <string.h>
@@ -137,14 +138,13 @@ static bool is_env_var_name(const char *s) {
 }
 
 // Iterative env access walker — explicit stack
-#define ENV_STACK_CAP 4096
 static void walk_env_accesses(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
-    TSNode stack[ENV_STACK_CAP];
-    int top = 0;
-    stack[top++] = root;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, 4096);
+    ts_nstack_push(&stack, ctx->arena, root);
 
-    while (top > 0) {
-        TSNode node = stack[--top];
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         const char *kind = ts_node_type(node);
         const char *env_key = NULL;
 
@@ -165,8 +165,8 @@ static void walk_env_accesses(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec
 
         uint32_t count = ts_node_child_count(node);
         enum { LAST_IDX = 1 };
-        for (int i = (int)count - LAST_IDX; i >= 0 && top < ENV_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        for (int i = (int)count - LAST_IDX; i >= 0; i--) {
+            ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
         }
     }
 }
