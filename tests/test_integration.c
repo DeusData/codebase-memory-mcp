@@ -997,6 +997,26 @@ TEST(integ_gdscript_script_anchor_methods) {
     ASSERT_TRUE(gd_node_has_parent_class(store, on_receiver_qn, player_qn));
     ASSERT_TRUE(gd_node_has_parent_class(store, ghost_attack_qn, nameless_qn));
 
+    int64_t player_id = gd_find_node_id_by_qn(store, player_qn);
+    ASSERT_TRUE(player_id >= 0);
+    cbm_edge_t *player_edges = NULL;
+    int player_edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(store, player_id, "DEFINES_METHOD", &player_edges,
+                                                  &player_edge_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(player_edge_count, 5);
+    cbm_store_free_edges(player_edges, player_edge_count);
+
+    int64_t nameless_id = gd_find_node_id_by_qn(store, nameless_qn);
+    ASSERT_TRUE(nameless_id >= 0);
+    cbm_edge_t *nameless_edges = NULL;
+    int nameless_edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(store, nameless_id, "DEFINES_METHOD", &nameless_edges,
+                                                  &nameless_edge_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(nameless_edge_count, 1);
+    cbm_store_free_edges(nameless_edges, nameless_edge_count);
+
     cbm_store_close(store);
     PASS();
 }
@@ -1105,6 +1125,9 @@ TEST(integ_gdscript_builtin_base_no_inherits) {
         if (nodes[i].label && strcmp(nodes[i].label, "Class") == 0 &&
             nodes[i].name && strcmp(nodes[i].name, "BuiltinBaseCase") == 0) {
             class_id = nodes[i].id;
+            ASSERT_TRUE(nodes[i].properties_json != NULL);
+            ASSERT_TRUE(strstr(nodes[i].properties_json, "\"base_classes\"") != NULL);
+            ASSERT_TRUE(strstr(nodes[i].properties_json, "Node2D") != NULL);
             break;
         }
     }

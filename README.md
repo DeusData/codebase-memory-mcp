@@ -130,6 +130,7 @@ Removes all agent configs, skills, hooks, and instructions. Does not remove the 
 - **Route nodes**: REST endpoints are first-class graph entities
 - **CLI mode**: `codebase-memory-mcp cli search_graph '{"name_pattern": ".*Handler.*"}'`
 - **Single binary, zero infrastructure**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
+- **GDScript/Godot support**: indexes signals, inheritance chains, and `preload`/`load` dependency edges for real GDScript/Godot projects
 
 ## How It Works
 
@@ -396,6 +397,8 @@ SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across rest
 | **Functional** (< 75%) | | OCaml, Haskell |
 
 Plus: Clojure, F#, GDScript, Julia, Vim Script, Nix, Common Lisp, Elm, Fortran, CUDA, COBOL, Verilog, Emacs Lisp, MATLAB, Lean 4, FORM, Magma, Wolfram, JSON, XML, Markdown, Makefile, CMake, Protobuf, GraphQL, Vue, Svelte, Meson, GLSL, INI.
+
+GDScript support is exercised in the project’s real-repo validation runbook: see [`docs/superpowers/proofs/gdscript-real-project-validation.md`](docs/superpowers/proofs/gdscript-real-project-validation.md).
 
 ## Architecture
 

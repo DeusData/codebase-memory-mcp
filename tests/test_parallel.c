@@ -23,6 +23,8 @@
 #include <stdatomic.h>
 #include <sys/stat.h>
 
+#define GD_PARITY_PROJECT "gd-par-test"
+
 /* ── Helper: create temp test repo ───────────────────────────────── */
 
 static char g_par_tmpdir[256];
@@ -83,9 +85,32 @@ static void teardown_parallel_repo(void) {
 
 /* ── Run sequential pipeline on files, returning gbuf ─────────────── */
 
+static void seed_gbuf_file_nodes(cbm_gbuf_t *gbuf, const cbm_file_info_t *files, int file_count,
+                                const char *project_name) {
+    for (int i = 0; i < file_count; i++) {
+        const char *rel = files[i].rel_path;
+        if (!rel)
+            continue;
+
+        char *file_qn = cbm_pipeline_fqn_compute(project_name, rel, "__file__");
+        if (!file_qn)
+            continue;
+
+        const char *slash = strrchr(rel, '/');
+        const char *basename = slash ? slash + SKIP_ONE : rel;
+        const char *ext = strrchr(basename, '.');
+
+        char props[CBM_SZ_128];
+        snprintf(props, sizeof(props), "{\"extension\":\"%s\"}", ext ? ext : "");
+        cbm_gbuf_upsert_node(gbuf, "File", basename, file_qn, rel, 0, 0, props);
+        free(file_qn);
+    }
+}
+
 static cbm_gbuf_t *run_sequential(const char *project, const char *repo_path,
                                   cbm_file_info_t *files, int file_count) {
     cbm_gbuf_t *gbuf = cbm_gbuf_new(project, repo_path);
+    seed_gbuf_file_nodes(gbuf, files, file_count, project);
     cbm_registry_t *reg = cbm_registry_new();
     atomic_int cancelled;
     atomic_init(&cancelled, 0);
@@ -113,6 +138,7 @@ static cbm_gbuf_t *run_sequential(const char *project, const char *repo_path,
 static cbm_gbuf_t *run_parallel(const char *project, const char *repo_path, cbm_file_info_t *files,
                                 int file_count, int worker_count) {
     cbm_gbuf_t *gbuf = cbm_gbuf_new(project, repo_path);
+    seed_gbuf_file_nodes(gbuf, files, file_count, project);
     cbm_registry_t *reg = cbm_registry_new();
     atomic_int cancelled;
     atomic_init(&cancelled, 0);
@@ -352,7 +378,13 @@ static int setup_gdscript_repo(void) {
         "    pass\n"
         "\n"
         "func shadow_param(hit):\n"
-        "    hit.connect(_on_hit)\n");
+        "    hit.connect(_on_hit)\n"
+        "\n"
+        "func _on_hit():\n"
+        "    pass\n"
+        "\n"
+        "func _on_receiver_hit():\n"
+        "    pass\n");
     fclose(f);
 
     /* player_path_extends.gd */
@@ -405,6 +437,9 @@ static int setup_gdscript_repo(void) {
     fclose(f);
 
     /* addon fixture for nested relative preload regression */
+    snprintf(path, sizeof(path), "%s/addons", g_gd_tmpdir);
+    cbm_mkdir(path);
+
     snprintf(path, sizeof(path), "%s/addons/simple_import_plugin", g_gd_tmpdir);
     cbm_mkdir(path);
 
@@ -473,29 +508,131 @@ static void gd_parity_teardown(void) {
     g_gd_parity_setup_done = 0;
 }
 
-static int assert_gd_edge_type_parity(const char *type) {
-    if (ensure_gd_parity_setup() != 0)
+static int gdbuf_edge_signature(const cbm_gbuf_t *gbuf, const cbm_gbuf_edge_t *edge, int target_file_key,
+                               char *out, size_t out_size) {
+    const cbm_gbuf_node_t *source = cbm_gbuf_find_by_id(gbuf, edge->source_id);
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, edge->target_id);
+    if (!source || !target)
         return -1;
-    int seq = cbm_gbuf_edge_count_by_type(g_gd_seq_gbuf, type);
-    int par = cbm_gbuf_edge_count_by_type(g_gd_par_gbuf, type);
-    if (seq != par) {
-        printf("  FAIL: GDScript %s edges: seq=%d par=%d\n", type, seq, par);
-        return 1;
+
+    const char *source_key = source->qualified_name && source->qualified_name[0]
+                                 ? source->qualified_name
+                                 : (source->file_path ? source->file_path : "");
+
+    const char *target_key = NULL;
+    if (target_file_key) {
+        target_key = target->file_path && target->file_path[0] ? target->file_path : target->qualified_name;
+    } else {
+        target_key = target->qualified_name;
+    }
+
+    if (!target_key)
+        target_key = "";
+
+    snprintf(out, out_size, "%s|%s", source_key, target_key);
+    return 0;
+}
+
+static int gdbuf_count_matching_signatures(const cbm_gbuf_t *gbuf, const cbm_gbuf_edge_t **edges,
+                                          int edge_count, int target_file_key,
+                                          const char *signature) {
+    int matches = 0;
+    char edge_sig[1024];
+    for (int i = 0; i < edge_count; i++) {
+        if (!edges[i])
+            continue;
+        if (gdbuf_edge_signature(gbuf, edges[i], target_file_key, edge_sig, sizeof(edge_sig)) != 0)
+            continue;
+        if (strcmp(edge_sig, signature) == 0)
+            matches++;
+    }
+    return matches;
+}
+
+static int signature_seen(const char **seen, int seen_count, const char *signature) {
+    for (int i = 0; i < seen_count; i++) {
+        if (seen[i] && strcmp(seen[i], signature) == 0)
+            return 1;
     }
     return 0;
 }
 
+static int assert_gd_edge_signature_parity(const char *type, int target_file_key) {
+    if (ensure_gd_parity_setup() != 0)
+        return -1;
+
+    const cbm_gbuf_edge_t **seq_edges = NULL;
+    const cbm_gbuf_edge_t **par_edges = NULL;
+    int seq_count = 0;
+    int par_count = 0;
+
+    if (cbm_gbuf_find_edges_by_type(g_gd_seq_gbuf, type, &seq_edges, &seq_count) != 0)
+        return -1;
+    if (cbm_gbuf_find_edges_by_type(g_gd_par_gbuf, type, &par_edges, &par_count) != 0)
+        return -1;
+
+    if (seq_count != par_count) {
+        printf("  FAIL: GDScript %s edges: seq=%d par=%d\n", type, seq_count, par_count);
+        return 1;
+    }
+
+    char **seen = calloc((size_t)(seq_count > 0 ? seq_count : 1), sizeof(char *));
+    if (!seen && seq_count > 0)
+        return -1;
+    int seen_count = 0;
+
+    for (int i = 0; i < seq_count; i++) {
+        if (!seq_edges[i])
+            continue;
+
+        char sig[1024];
+        if (gdbuf_edge_signature(g_gd_seq_gbuf, seq_edges[i], target_file_key, sig, sizeof(sig)) != 0) {
+            for (int j = 0; j < seen_count; j++)
+                free(seen[j]);
+            free(seen);
+            return 1;
+        }
+
+        if (signature_seen((const char **)seen, seen_count, sig))
+            continue;
+
+        int seq_seen = gdbuf_count_matching_signatures(g_gd_seq_gbuf, seq_edges, seq_count,
+                                                     target_file_key, sig);
+        int par_seen = gdbuf_count_matching_signatures(g_gd_par_gbuf, par_edges, par_count,
+                                                     target_file_key, sig);
+        if (seq_seen != par_seen) {
+            printf("  FAIL: GDScript %s signature mismatch: %s seq=%d par=%d\n", type, sig,
+                   seq_seen, par_seen);
+            for (int j = 0; j < seen_count; j++)
+                free(seen[j]);
+            free(seen);
+            return 1;
+        }
+
+        seen[seen_count++] = strdup(sig);
+    }
+
+    for (int i = 0; i < seen_count; i++)
+        free(seen[i]);
+    free(seen);
+    return 0;
+}
+
+static int assert_gd_edge_type_parity(const char *type) {
+    return assert_gd_edge_signature_parity(type, 0);
+}
+
 static int count_import_edge(const cbm_gbuf_t *gbuf, const char *source_rel, const char *target_rel) {
     char source_qn[512];
-    char target_qn[512];
+    char *computed_source_qn = cbm_pipeline_fqn_compute(GD_PARITY_PROJECT, source_rel, "__file__");
+    if (!computed_source_qn)
+        return -1;
 
-    snprintf(source_qn, sizeof(source_qn), "%s.%s__file__", "gd-par-test", source_rel);
-    snprintf(target_qn, sizeof(target_qn), "%s.%s", "gd-par-test",
-             target_rel);
+    snprintf(source_qn, sizeof(source_qn), "%s", computed_source_qn);
+    free(computed_source_qn);
 
     const cbm_gbuf_node_t *source = cbm_gbuf_find_by_qn(gbuf, source_qn);
-    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(gbuf, target_qn);
-    if (!source || !target) {
+    if (!source) {
         return -1;
     }
 
@@ -507,13 +644,57 @@ static int count_import_edge(const cbm_gbuf_t *gbuf, const char *source_rel, con
 
     int count = 0;
     for (int i = 0; i < edge_count; i++) {
-        if (edges[i] && edges[i]->target_id == target->id) {
+        if (!edges[i])
+            continue;
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, edges[i]->target_id);
+        if (target && target->file_path && strcmp(target->file_path, target_rel) == 0) {
             count++;
         }
     }
 
     return count;
 }
+
+static int gdbuf_count_edges_to_target_qn(const cbm_gbuf_t *gbuf, const char *source_qn,
+                                         const char *type, const char *target_qn) {
+    const cbm_gbuf_node_t *source = cbm_gbuf_find_by_qn(gbuf, source_qn);
+    if (!source)
+        return -1;
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(gbuf, source->id, type, &edges, &edge_count) != 0) {
+        return -1;
+    }
+
+    int count = 0;
+    for (int i = 0; i < edge_count; i++) {
+        if (!edges[i])
+            continue;
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, edges[i]->target_id);
+        if (target && target->qualified_name && strcmp(target->qualified_name, target_qn) == 0) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+static int gdbuf_count_edges_of_type(const cbm_gbuf_t *gbuf, const char *source_qn,
+                                    const char *type) {
+    const cbm_gbuf_node_t *source = cbm_gbuf_find_by_qn(gbuf, source_qn);
+    if (!source)
+        return -1;
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(gbuf, source->id, type, &edges, &edge_count) != 0) {
+        return -1;
+    }
+
+    return edge_count;
+}
+
 
 TEST(gdscript_parallel_calls_parity) {
     int rc = assert_gd_edge_type_parity("CALLS");
@@ -532,7 +713,7 @@ TEST(gdscript_parallel_inherits_parity) {
 }
 
 TEST(gdscript_parallel_imports_parity) {
-    int rc = assert_gd_edge_type_parity("IMPORTS");
+    int rc = assert_gd_edge_signature_parity("IMPORTS", 1);
     if (rc == -1)
         SKIP("setup failed");
     ASSERT_EQ(rc, 0);
@@ -560,12 +741,187 @@ TEST(gdscript_parallel_imports_nested_preload_relative_path_regression) {
         SKIP("setup failed");
 
     int seq = count_import_edge(g_gd_seq_gbuf, "addons/simple_import_plugin/plugin.gd",
-                               "addons.simple_import_plugin.import");
+                               "addons/simple_import_plugin/import.gd");
     int par = count_import_edge(g_gd_par_gbuf, "addons/simple_import_plugin/plugin.gd",
-                               "addons.simple_import_plugin.import");
+                               "addons/simple_import_plugin/import.gd");
 
     ASSERT_GT(seq, 0);
     ASSERT_EQ(seq, par);
+    PASS();
+}
+
+TEST(gdscript_parallel_calls_same_script_helper) {
+    if (ensure_gd_parity_setup() != 0)
+        SKIP("setup failed");
+
+    char player_qn[512], attack_qn[512], helper_qn[512];
+    snprintf(player_qn, sizeof(player_qn), "%s.actors.player.Player", GD_PARITY_PROJECT);
+    snprintf(attack_qn, sizeof(attack_qn), "%s.attack", player_qn);
+    snprintf(helper_qn, sizeof(helper_qn), "%s.helper", player_qn);
+
+    int seq = gdbuf_count_edges_to_target_qn(g_gd_seq_gbuf, attack_qn, "CALLS", helper_qn);
+    int par = gdbuf_count_edges_to_target_qn(g_gd_par_gbuf, attack_qn, "CALLS", helper_qn);
+
+    ASSERT_GTE(seq, 0);
+    ASSERT_GTE(par, 0);
+    ASSERT_EQ(seq, 1);
+    ASSERT_EQ(seq, par);
+    PASS();
+}
+
+TEST(gdscript_parallel_calls_signal_targets_player_receiver) {
+    if (ensure_gd_parity_setup() != 0)
+        SKIP("setup failed");
+
+    char player_qn[512], attack_qn[512], shadow_qn[512], helper_qn[512], player_signal_qn[512],
+        receiver_signal_qn[512];
+    char nameless_qn[512], ghost_attack_qn[512], ghost_signal_qn[512];
+
+    snprintf(player_qn, sizeof(player_qn), "%s.actors.player.Player", GD_PARITY_PROJECT);
+    snprintf(attack_qn, sizeof(attack_qn), "%s.attack", player_qn);
+    snprintf(shadow_qn, sizeof(shadow_qn), "%s.shadow_param", player_qn);
+    snprintf(helper_qn, sizeof(helper_qn), "%s.helper", player_qn);
+    snprintf(player_signal_qn, sizeof(player_signal_qn), "%s.signal.hit", player_qn);
+    snprintf(receiver_signal_qn, sizeof(receiver_signal_qn), "%s.actors.receiver.Receiver.signal.hit",
+             GD_PARITY_PROJECT);
+    snprintf(nameless_qn, sizeof(nameless_qn), "%s.actors.nameless_script.__script__",
+             GD_PARITY_PROJECT);
+    snprintf(ghost_attack_qn, sizeof(ghost_attack_qn), "%s.ghost_attack", nameless_qn);
+    snprintf(ghost_signal_qn, sizeof(ghost_signal_qn), "%s.signal.ghost_hit", nameless_qn);
+
+    int seq_attack_player_signal = gdbuf_count_edges_to_target_qn(g_gd_seq_gbuf, attack_qn, "CALLS",
+                                                                 player_signal_qn);
+    int par_attack_player_signal = gdbuf_count_edges_to_target_qn(g_gd_par_gbuf, attack_qn, "CALLS",
+                                                                player_signal_qn);
+    int seq_attack_receiver_signal = gdbuf_count_edges_to_target_qn(g_gd_seq_gbuf, attack_qn, "CALLS",
+                                                                  receiver_signal_qn);
+    int par_attack_receiver_signal = gdbuf_count_edges_to_target_qn(g_gd_par_gbuf, attack_qn, "CALLS",
+                                                                 receiver_signal_qn);
+    int seq_attack_helper = gdbuf_count_edges_to_target_qn(g_gd_seq_gbuf, attack_qn, "CALLS", helper_qn);
+    int par_attack_helper = gdbuf_count_edges_to_target_qn(g_gd_par_gbuf, attack_qn, "CALLS", helper_qn);
+    int seq_shadow_player_signal = gdbuf_count_edges_to_target_qn(g_gd_seq_gbuf, shadow_qn, "CALLS",
+                                                                player_signal_qn);
+    int par_shadow_player_signal = gdbuf_count_edges_to_target_qn(g_gd_par_gbuf, shadow_qn, "CALLS",
+                                                                player_signal_qn);
+    int seq_ghost_attack_signal = gdbuf_count_edges_to_target_qn(g_gd_seq_gbuf, ghost_attack_qn, "CALLS",
+                                                                ghost_signal_qn);
+    int par_ghost_attack_signal = gdbuf_count_edges_to_target_qn(g_gd_par_gbuf, ghost_attack_qn, "CALLS",
+                                                                ghost_signal_qn);
+
+    ASSERT_GTE(seq_attack_player_signal, 0);
+    ASSERT_GTE(par_attack_player_signal, 0);
+    ASSERT_GTE(seq_attack_receiver_signal, 0);
+    ASSERT_GTE(par_attack_receiver_signal, 0);
+    ASSERT_GTE(seq_attack_helper, 0);
+    ASSERT_GTE(par_attack_helper, 0);
+    ASSERT_GTE(seq_shadow_player_signal, 0);
+    ASSERT_GTE(par_shadow_player_signal, 0);
+    ASSERT_GTE(seq_ghost_attack_signal, 0);
+    ASSERT_GTE(par_ghost_attack_signal, 0);
+
+    ASSERT_EQ(seq_attack_player_signal, 1);
+    ASSERT_EQ(seq_attack_receiver_signal, 1);
+    ASSERT_EQ(seq_attack_helper, 1);
+    ASSERT_EQ(seq_ghost_attack_signal, 1);
+    ASSERT_EQ(seq_shadow_player_signal, 0);
+
+    ASSERT_EQ(seq_attack_player_signal, par_attack_player_signal);
+    ASSERT_EQ(seq_attack_receiver_signal, par_attack_receiver_signal);
+    ASSERT_EQ(seq_attack_helper, par_attack_helper);
+    ASSERT_EQ(seq_ghost_attack_signal, par_ghost_attack_signal);
+    ASSERT_EQ(seq_shadow_player_signal, par_shadow_player_signal);
+
+    PASS();
+}
+
+TEST(gdscript_parallel_nameless_script_anchor_parity) {
+    if (ensure_gd_parity_setup() != 0)
+        SKIP("setup failed");
+
+    char nameless_qn[512];
+    snprintf(nameless_qn, sizeof(nameless_qn), "%s.actors.nameless_script.__script__",
+             GD_PARITY_PROJECT);
+    const cbm_gbuf_node_t *nameless_seq = cbm_gbuf_find_by_qn(g_gd_seq_gbuf, nameless_qn);
+    const cbm_gbuf_node_t *nameless_par = cbm_gbuf_find_by_qn(g_gd_par_gbuf, nameless_qn);
+
+    ASSERT_NOT_NULL(nameless_seq);
+    ASSERT_NOT_NULL(nameless_par);
+
+    ASSERT_TRUE(strstr(nameless_qn, "__script__") != NULL);
+
+    char ghost_attack_qn[512], ghost_signal_qn[512];
+    snprintf(ghost_attack_qn, sizeof(ghost_attack_qn), "%s.ghost_attack", nameless_qn);
+    snprintf(ghost_signal_qn, sizeof(ghost_signal_qn), "%s.signal.ghost_hit", nameless_qn);
+
+    int seq = gdbuf_count_edges_to_target_qn(g_gd_seq_gbuf, ghost_attack_qn, "CALLS",
+                                            ghost_signal_qn);
+    int par = gdbuf_count_edges_to_target_qn(g_gd_par_gbuf, ghost_attack_qn, "CALLS",
+                                            ghost_signal_qn);
+
+    ASSERT_GTE(seq, 0);
+    ASSERT_GTE(par, 0);
+    int seq_defines_method = gdbuf_count_edges_to_target_qn(g_gd_seq_gbuf, nameless_qn, "DEFINES_METHOD",
+                                                          ghost_attack_qn);
+    int par_defines_method = gdbuf_count_edges_to_target_qn(g_gd_par_gbuf, nameless_qn, "DEFINES_METHOD",
+                                                          ghost_attack_qn);
+
+    ASSERT_GTE(seq_defines_method, 0);
+    ASSERT_GTE(par_defines_method, 0);
+    ASSERT_EQ(seq_defines_method, 1);
+    ASSERT_EQ(par_defines_method, 1);
+    ASSERT_EQ(seq_defines_method, par_defines_method);
+    ASSERT_EQ(seq, 1);
+    ASSERT_EQ(par, 1);
+    ASSERT_EQ(seq, par);
+    PASS();
+}
+
+TEST(gdscript_parallel_dynamic_receiver_unresolved_parity) {
+    if (ensure_gd_parity_setup() != 0)
+        SKIP("setup failed");
+
+    char dynamic_qn[512], attack_dynamic_qn[512];
+    snprintf(dynamic_qn, sizeof(dynamic_qn), "%s.actors.dynamic_receiver.DynamicReceiverCase",
+             GD_PARITY_PROJECT);
+    snprintf(attack_dynamic_qn, sizeof(attack_dynamic_qn), "%s.attack_dynamic", dynamic_qn);
+
+    int seq = gdbuf_count_edges_of_type(g_gd_seq_gbuf, attack_dynamic_qn, "CALLS");
+    int par = gdbuf_count_edges_of_type(g_gd_par_gbuf, attack_dynamic_qn, "CALLS");
+
+    ASSERT_GTE(seq, 0);
+    ASSERT_GTE(par, 0);
+    ASSERT_EQ(seq, 0);
+    ASSERT_EQ(par, 0);
+    ASSERT_EQ(seq, par);
+    PASS();
+}
+
+TEST(gdscript_parallel_builtin_base_no_inherits_metadata) {
+    if (ensure_gd_parity_setup() != 0)
+        SKIP("setup failed");
+
+    char builtin_qn[512];
+    snprintf(builtin_qn, sizeof(builtin_qn), "%s.actors.builtin_base.BuiltinBaseCase",
+             GD_PARITY_PROJECT);
+    const cbm_gbuf_node_t *seq_builtin = cbm_gbuf_find_by_qn(g_gd_seq_gbuf, builtin_qn);
+    const cbm_gbuf_node_t *par_builtin = cbm_gbuf_find_by_qn(g_gd_par_gbuf, builtin_qn);
+
+    ASSERT_NOT_NULL(seq_builtin);
+    ASSERT_NOT_NULL(par_builtin);
+    ASSERT_NOT_NULL(seq_builtin->properties_json);
+    ASSERT_NOT_NULL(par_builtin->properties_json);
+    ASSERT_TRUE(strstr(seq_builtin->properties_json, "\"base_classes\"") != NULL);
+    ASSERT_TRUE(strstr(par_builtin->properties_json, "\"base_classes\"") != NULL);
+    ASSERT_TRUE(strstr(seq_builtin->properties_json, "\"Node2D\"") != NULL);
+    ASSERT_TRUE(strstr(par_builtin->properties_json, "\"Node2D\"") != NULL);
+
+    int seq_inherits = gdbuf_count_edges_of_type(g_gd_seq_gbuf, builtin_qn, "INHERITS");
+    int par_inherits = gdbuf_count_edges_of_type(g_gd_par_gbuf, builtin_qn, "INHERITS");
+    ASSERT_GTE(seq_inherits, 0);
+    ASSERT_GTE(par_inherits, 0);
+    ASSERT_EQ(seq_inherits, 0);
+    ASSERT_EQ(par_inherits, 0);
+    ASSERT_EQ(seq_inherits, par_inherits);
     PASS();
 }
 
@@ -759,6 +1115,11 @@ SUITE(parallel) {
     RUN_TEST(gdscript_parallel_inherits_parity);
     RUN_TEST(gdscript_parallel_imports_parity);
     RUN_TEST(gdscript_parallel_imports_nested_preload_relative_path_regression);
+    RUN_TEST(gdscript_parallel_calls_same_script_helper);
+    RUN_TEST(gdscript_parallel_calls_signal_targets_player_receiver);
+    RUN_TEST(gdscript_parallel_nameless_script_anchor_parity);
+    RUN_TEST(gdscript_parallel_dynamic_receiver_unresolved_parity);
+    RUN_TEST(gdscript_parallel_builtin_base_no_inherits_metadata);
     RUN_TEST(gdscript_parallel_defines_method_parity);
     RUN_TEST(gdscript_parallel_defines_parity);
     RUN_TEST(gdscript_parallel_total_edges);

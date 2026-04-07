@@ -17,11 +17,11 @@ ARTIFACT_ROOT="$WORKTREE_PATH/.artifacts/gdscript-proof"
 RUN_TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
 RUN_ROOT=""
 STATE_ROOT=""
-STATE_HOME=""
-STATE_CONFIG=""
-STATE_CACHE=""
-STATE_STORE=""
-EFFECTIVE_STORE_ROOT=""
+REPO_STATE_ROOT=""
+REPO_STATE_HOME=""
+REPO_STATE_CONFIG=""
+REPO_STATE_CACHE=""
+REPO_STATE_CACHE_STORE=""
 TMP_ROOT=""
 ENV_FILE=""
 COMMANDS_LOG=""
@@ -206,24 +206,26 @@ initialize_workspace_root() {
   fi
 
   STATE_ROOT="$RUN_ROOT/state"
-  STATE_HOME="$STATE_ROOT/home"
-  STATE_CONFIG="$STATE_ROOT/config"
-  STATE_CACHE="$STATE_ROOT/cache"
-  STATE_STORE="$STATE_ROOT/store"
-  EFFECTIVE_STORE_ROOT="$STATE_CACHE/codebase-memory-mcp"
   TMP_ROOT="$RUN_ROOT/tmp"
 
   ENV_FILE="$RUN_ROOT/env.txt"
   COMMANDS_LOG="$RUN_ROOT/commands.log"
-  BINARY_PATH="$WORKTREE_PATH/build/codebase-memory-mcp"
+  BINARY_PATH="$WORKTREE_PATH/build/c/codebase-memory-mcp"
   BUILD_LOG="$RUN_ROOT/build.log"
   AGGREGATE_SUMMARY="$RUN_ROOT/aggregate-summary.md"
 }
 
-apply_isolated_runtime_env() {
-  export HOME="$STATE_HOME"
-  export XDG_CONFIG_HOME="$STATE_CONFIG"
-  export XDG_CACHE_HOME="$STATE_CACHE"
+configure_repo_runtime_state() {
+  local repo_slug="$1"
+
+  REPO_STATE_ROOT="$STATE_ROOT/$repo_slug"
+  REPO_STATE_HOME="$REPO_STATE_ROOT/home"
+  REPO_STATE_CONFIG="$REPO_STATE_ROOT/config"
+  REPO_STATE_CACHE="$REPO_STATE_ROOT/cache"
+  REPO_STATE_CACHE_STORE="$REPO_STATE_CACHE/codebase-memory-mcp"
+
+  mkdir -p "$REPO_STATE_HOME" "$REPO_STATE_CONFIG" "$REPO_STATE_CACHE" "$REPO_STATE_CACHE_STORE"
+  ln -sfn "$REPO_STATE_CACHE" "$REPO_STATE_HOME/.cache"
 }
 
 parse_metadata_assignment() {
@@ -265,17 +267,35 @@ PY
 
 derive_repo_artifact_slug() {
   local repo_path="$1"
-  local short_commit="$2"
+  local preferred_name="$2"
+  local short_commit="$3"
   local repo_name
   local path_hash
   local base_slug
+  local commit_id
 
-  # Recipe: <repo basename slug>-<12-char commit prefix or unavailable>-<40-char canonical path hash>
-  repo_name=$(sanitize_repo_name "$(basename -- "$repo_path")")
-  short_commit=${short_commit:-"unavailable"}
+  if [ -n "$preferred_name" ]; then
+    repo_name=$(sanitize_repo_name "$preferred_name")
+  else
+    repo_name=$(sanitize_repo_name "$(basename -- "$repo_path")")
+  fi
+
+  if [ -z "$repo_name" ]; then
+    repo_name="repo"
+  fi
+
+  # Deterministic, human-readable slugs stay unique per repository by adding
+  # a stable path hash prefix after the commit/ref identifier.
+  if [ -n "${short_commit:-}" ] && [ "$short_commit" != "unavailable" ]; then
+    commit_id="$short_commit"
+  else
+    commit_id="unavailable"
+  fi
+
   path_hash=$(repo_path_hash "$repo_path")
+  path_hash=${path_hash:0:12}
 
-  base_slug="${repo_name}-${short_commit}-${path_hash}"
+  base_slug="${repo_name}-${commit_id}-${path_hash}"
   printf '%s\n' "$base_slug"
 }
 
@@ -300,7 +320,8 @@ collect_repo_git_metadata() {
 
 collect_repo_metadata_fields() {
   local repo_path="$1"
-  local godot_version="$2"
+  local repo_label="$2"
+  local godot_version="$3"
 
   local git_ref
   local git_commit
@@ -316,7 +337,7 @@ collect_repo_metadata_fields() {
   } < <(collect_repo_git_metadata "$repo_path")
 
   short_commit=$git_ref
-  slug=$(derive_repo_artifact_slug "$repo_path" "$short_commit")
+  slug=$(derive_repo_artifact_slug "$repo_path" "$repo_label" "$short_commit")
 
   if godot_version_is_4x "$godot_version"; then
     qualifies="true"
@@ -682,7 +703,11 @@ run_cbm_cli_json() {
   CBM_LAST_ERROR=""
   CBM_LAST_CAPTURE_MODE=""
 
-  command=("$BINARY_PATH" cli --raw "$tool_name")
+  command=(env)
+  [ -n "$REPO_STATE_HOME" ] && command+=("HOME=$REPO_STATE_HOME")
+  [ -n "$REPO_STATE_CONFIG" ] && command+=("XDG_CONFIG_HOME=$REPO_STATE_CONFIG")
+  [ -n "$REPO_STATE_CACHE" ] && command+=("XDG_CACHE_HOME=$REPO_STATE_CACHE")
+  command+=("$BINARY_PATH" cli --raw "$tool_name")
   if [ -n "$args_json" ]; then
     command+=("$args_json")
   fi
@@ -717,7 +742,11 @@ PY
   fi
 
   if [ "$mode" = "wrapped_error" ] && [[ "$normalized_text" == "unknown tool: --raw" ]]; then
-    command=("$BINARY_PATH" cli "$tool_name")
+    command=(env)
+    [ -n "$REPO_STATE_HOME" ] && command+=("HOME=$REPO_STATE_HOME")
+    [ -n "$REPO_STATE_CONFIG" ] && command+=("XDG_CONFIG_HOME=$REPO_STATE_CONFIG")
+    [ -n "$REPO_STATE_CACHE" ] && command+=("XDG_CACHE_HOME=$REPO_STATE_CACHE")
+    command+=("$BINARY_PATH" cli "$tool_name")
     if [ -n "$args_json" ]; then
       command+=("$args_json")
     fi
@@ -894,7 +923,6 @@ build_local_binary() {
   local stderr_tmp
   local command_line
   local rc=0
-  local built_binary_path="$WORKTREE_PATH/build/c/codebase-memory-mcp"
 
   stdout_tmp=$(make_run_temp build-stdout)
   stderr_tmp=$(make_run_temp build-stderr)
@@ -907,10 +935,6 @@ build_local_binary() {
     rc=$?
   fi
   append_command_capture "$BUILD_LOG" "$command_line" "$stdout_tmp" "$stderr_tmp"
-
-  if [ "$rc" -eq 0 ] && [ ! -x "$BINARY_PATH" ] && [ -x "$built_binary_path" ]; then
-    ln -sfn "c/codebase-memory-mcp" "$BINARY_PATH"
-  fi
 
   if [ "$rc" -ne 0 ] || [ ! -x "$BINARY_PATH" ]; then
     BUILD_STATUS="failed"
@@ -951,6 +975,14 @@ process_repo_indexing() {
     queries_dir="$repo_dir/queries"
 
     : > "$index_log"
+    configure_repo_runtime_state "$slug"
+    {
+      printf '%s\n' "repo_state_root=$REPO_STATE_ROOT"
+      printf '%s\n' "repo_home=$REPO_STATE_HOME"
+      printf '%s\n' "repo_xdg_config_home=$REPO_STATE_CONFIG"
+      printf '%s\n' "repo_xdg_cache_home=$REPO_STATE_CACHE"
+      printf '%s\n' "repo_store_root=$REPO_STATE_CACHE_STORE"
+    } > "$index_log"
     cli_capture_mode="raw"
     cli_capture_note=""
     fallback_tools=()
@@ -1421,18 +1453,23 @@ lines.extend(
     [
         f"- codebase-memory-mcp worktree under test: {markdown_code(worktree_path)}",
         f"- codebase-memory-mcp branch under test: {markdown_code(worktree_branch)}",
-        f"- codebase-memory-mcp commit under test: {markdown_code(worktree_commit)}",
-        f"- Final acceptance: {markdown_code('passed' if aggregate_pass else 'failed')}",
-        f"- Missing coverage categories: {markdown_code(', '.join(missing_categories) if missing_categories else 'none', empty='none')}",
-        "",
-        "## Coverage results",
-        f"- indexing_coverage: {markdown_code('pass' if indexing_coverage else 'fail')} — {contributor_text(indexing_contributors)}",
-        f"- signal_coverage: {markdown_code('pass' if signal_coverage else 'fail')} — {contributor_text(signal_contributors)}",
-        f"- imports_coverage: {markdown_code('pass' if imports_coverage else 'fail')} — {contributor_text(imports_contributors)}",
-        f"- inherits_coverage: {markdown_code('pass' if inherits_coverage else 'fail')} — {contributor_text(inherits_contributors)}",
-        "",
-        "## Repos processed",
-    ]
+    f"- codebase-memory-mcp commit under test: {markdown_code(worktree_commit)}",
+    f"- Final acceptance: {markdown_code('passed' if aggregate_pass else 'failed')}",
+    f"- aggregate_pass: {markdown_code('true' if aggregate_pass else 'false')}",
+    f"- Missing coverage categories: {markdown_code(', '.join(missing_categories) if missing_categories else 'none', empty='none')}",
+    "",
+    "## Coverage results",
+    f"- indexing_coverage: {markdown_code('true' if indexing_coverage else 'false')}",
+    f"- indexing_contributors: {contributor_text(indexing_contributors)}",
+    f"- signal_coverage: {markdown_code('true' if signal_coverage else 'false')}",
+    f"- signal_contributors: {contributor_text(signal_contributors)}",
+    f"- imports_coverage: {markdown_code('true' if imports_coverage else 'false')}",
+    f"- imports_contributors: {contributor_text(imports_contributors)}",
+    f"- inherits_coverage: {markdown_code('true' if inherits_coverage else 'false')}",
+    f"- inherits_contributors: {contributor_text(inherits_contributors)}",
+    "",
+    "## Repos processed",
+]
 )
 
 for repo in repo_summaries:
@@ -1511,7 +1548,7 @@ prepare_repo_metadata() {
       IFS= read -r git_commit
       IFS= read -r git_branch
       IFS= read -r qualifies
-    } < <(collect_repo_metadata_fields "$repo_path" "$repo_godot_version")
+    } < <(collect_repo_metadata_fields "$repo_path" "$repo_label" "$repo_godot_version")
 
     REPO_SLUGS[$i]="$slug"
 
@@ -1639,26 +1676,13 @@ ensure_workspace_root() {
   mkdir -p "$RUN_ROOT"
 }
 
-ensure_workspace_state_dirs() {
-  mkdir -p "$STATE_HOME" "$STATE_CONFIG" "$STATE_CACHE"
-  mkdir -p "$EFFECTIVE_STORE_ROOT"
-  mkdir -p "$TMP_ROOT"
-}
-
-ensure_workspace_compat_links() {
-  ln -sfn "$STATE_CACHE" "$STATE_HOME/.cache"
-  ln -sfn "$EFFECTIVE_STORE_ROOT" "$STATE_STORE"
+ensure_workspace_state_root() {
+  mkdir -p "$STATE_ROOT" "$TMP_ROOT"
 }
 
 initialize_workspace_logs() {
   : > "$ENV_FILE"
   : > "$COMMANDS_LOG"
-
-  log_command "export HOME=\"$STATE_HOME\""
-  log_command "export XDG_CONFIG_HOME=\"$STATE_CONFIG\""
-  log_command "export XDG_CACHE_HOME=\"$STATE_CACHE\""
-  log_command "ln -sfn \"$STATE_CACHE\" \"$STATE_HOME/.cache\""
-  log_command "ln -sfn \"$EFFECTIVE_STORE_ROOT\" \"$STATE_STORE\""
 }
 
 record_workspace_env() {
@@ -1681,11 +1705,8 @@ record_workspace_env() {
     printf '%s\n' "worktree_path=$worktree_path"
     printf '%s\n' "worktree_branch=$worktree_branch"
     printf '%s\n' "worktree_commit_sha=$worktree_sha"
-    printf '%s\n' "binary_path=$WORKTREE_PATH/build/codebase-memory-mcp"
-    printf '%s\n' "home=$STATE_HOME"
-    printf '%s\n' "xdg_config_home=$STATE_CONFIG"
-    printf '%s\n' "xdg_cache_home=$STATE_CACHE"
-    printf '%s\n' "store_root=$EFFECTIVE_STORE_ROOT"
+    printf '%s\n' "binary_path=$BINARY_PATH"
+    printf '%s\n' "state_root=$STATE_ROOT"
   } > "$ENV_FILE"
 
   record_repo_metadata_env
@@ -1693,8 +1714,7 @@ record_workspace_env() {
 
 setup_workspace() {
   ensure_workspace_root
-  ensure_workspace_state_dirs
-  ensure_workspace_compat_links
+  ensure_workspace_state_root
   initialize_workspace_logs
 }
 
@@ -1706,7 +1726,6 @@ fi
 parse_args "$@"
 initialize_workspace_root
 setup_workspace
-apply_isolated_runtime_env
 record_workspace_env "$WORKTREE_PATH"
 prepare_repo_metadata
 build_local_binary || true

@@ -24,9 +24,11 @@ Do not commit generated proof artifacts.
 
 The script builds the binary automatically at run start and uses:
 
-- `build/codebase-memory-mcp`
+- `build/c/codebase-memory-mcp`
 
-If the build only produces `build/c/codebase-memory-mcp`, the script creates the compatibility link needed so `build/codebase-memory-mcp` remains the path actually used for proof commands.
+Runtime state is separated per artifact slug under the run root (`HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`).
+
+Artifact slugs are derived from a sanitized repo label/basename, short commit/ref (or `unavailable`), and a stable path-hash suffix, so separate repos cannot collide even when names/refs match.
 
 ## Accepted arguments
 
@@ -111,10 +113,11 @@ Each run creates a unique local artifact root:
   build.log
   aggregate-summary.md
   state/
-    home/
-    config/
-    cache/
-    store/
+    <artifact-slug>/
+      home/
+      config/
+      cache/
+      cache/codebase-memory-mcp/
   <artifact-slug>/
     repo-meta.json
     index.log
@@ -134,7 +137,11 @@ Each run creates a unique local artifact root:
 
 All runtime state for the proof run lives under this artifact root.
 
-Note: `state/store` is a compatibility symlink to the effective store root under `state/cache/codebase-memory-mcp`.
+Per repo, command execution uses:
+
+- `HOME=<run>/state/<artifact-slug>/home`
+- `XDG_CONFIG_HOME=<run>/state/<artifact-slug>/config`
+- `XDG_CACHE_HOME=<run>/state/<artifact-slug>/cache`
 
 ## Query suite and output files
 
