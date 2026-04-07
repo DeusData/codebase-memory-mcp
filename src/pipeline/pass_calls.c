@@ -18,6 +18,7 @@ enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
+#include "foundation/str_util.h"
 #include "cbm.h"
 #include "service_patterns.h"
 
@@ -238,10 +239,12 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     bool is_topic = (url_or_topic && url_or_topic[0] != '\0' && svc == CBM_SVC_ASYNC &&
                      strlen(url_or_topic) > PAIR_LEN);
     if (!is_url && !is_topic) {
+        char esc_callee[CBM_SZ_256];
+        cbm_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
         char props[CBM_SZ_512];
         snprintf(props, sizeof(props),
                  "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
-                 call->callee_name, res->confidence, res->strategy ? res->strategy : "unknown",
+                 esc_callee, res->confidence, res->strategy ? res->strategy : "unknown",
                  res->candidate_count);
         cbm_gbuf_insert_edge(ctx->gbuf, source->id, target->id, "CALLS", props);
         return;
@@ -252,10 +255,14 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     const char *broker =
         (svc == CBM_SVC_ASYNC) ? cbm_service_pattern_broker(res->qualified_name) : NULL;
     int64_t route_id = create_svc_route_node(ctx, url_or_topic, svc, method, broker);
+    char esc_callee[CBM_SZ_256];
+    char esc_url[CBM_SZ_256];
+    cbm_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
+    cbm_json_escape(esc_url, sizeof(esc_url), url_or_topic);
     char props[CBM_SZ_512];
-    snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"%s%s%s%s%s}",
-             call->callee_name, url_or_topic, method ? ",\"method\":\"" : "", method ? method : "",
-             method ? "\"" : "", broker ? ",\"broker\":\"" : "", broker ? broker : "");
+    snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"%s%s%s%s%s}", esc_callee,
+             esc_url, method ? ",\"method\":\"" : "", method ? method : "", method ? "\"" : "",
+             broker ? ",\"broker\":\"" : "", broker ? broker : "");
     if (broker) {
         size_t plen = strlen(props);
         if (plen > 0 && props[plen - SKIP_ONE] != '}') {
@@ -280,17 +287,22 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         return;
     }
     if (svc == CBM_SVC_CONFIG) {
+        char esc_c[CBM_SZ_256];
+        char esc_k[CBM_SZ_256];
+        cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
+        cbm_json_escape(esc_k, sizeof(esc_k), call->first_string_arg ? call->first_string_arg : "");
         char props[CBM_SZ_512];
         snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"key\":\"%s\",\"confidence\":%.2f}",
-                 call->callee_name, call->first_string_arg ? call->first_string_arg : "",
-                 res->confidence);
+                 esc_c, esc_k, res->confidence);
         cbm_gbuf_insert_edge(ctx->gbuf, source->id, target->id, "CONFIGURES", props);
         return;
     }
+    char esc_c2[CBM_SZ_256];
+    cbm_json_escape(esc_c2, sizeof(esc_c2), call->callee_name);
     char props[CBM_SZ_512];
     snprintf(props, sizeof(props),
              "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
-             call->callee_name, res->confidence, res->strategy ? res->strategy : "unknown",
+             esc_c2, res->confidence, res->strategy ? res->strategy : "unknown",
              res->candidate_count);
     cbm_gbuf_insert_edge(ctx->gbuf, source->id, target->id, "CALLS", props);
 }

@@ -97,7 +97,7 @@ echo ""
 echo "--- Dangerous command detection ---"
 
 DANGEROUS_CMDS='wget|netcat|ncat|/dev/tcp|telnet'
-if grep -wE "$DANGEROUS_CMDS" "$STRINGS_FILE" > "$SEC_CMDS" 2>/dev/null; then
+if grep -wE "$DANGEROUS_CMDS" "$STRINGS_FILE" > "$SEC_CMDS" 2>/dev/null && [ -s "$SEC_CMDS" ]; then
     echo "BLOCKED: Dangerous commands found in binary:"
     cat "$SEC_CMDS"
     FAIL=1

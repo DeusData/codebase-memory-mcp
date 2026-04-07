@@ -152,6 +152,11 @@ void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCa
     arr->items[arr->count++] = rc;
 }
 
+void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch) {
+    GROW_ARRAY(arr, a);
+    arr->items[arr->count++] = ch;
+}
+
 // --- String input reader (for parse_with_options) ---
 
 typedef struct {
@@ -335,6 +340,9 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
     cbm_extract_definitions(&ctx);
     cbm_extract_imports(&ctx);
     cbm_extract_unified(&ctx);
+
+    // Channel detection (Socket.IO / EventEmitter) — JS/TS only.
+    cbm_extract_channels(&ctx);
 
     // K8s / Kustomize semantic pass (additional structured extraction for YAML-based infra files).
     if (ctx.language == CBM_LANG_KUSTOMIZE || ctx.language == CBM_LANG_K8S) {

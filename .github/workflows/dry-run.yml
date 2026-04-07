@@ -1,12 +1,18 @@
 # Manual trigger: test everything before pushing a release.
 # Each step can be skipped for faster iteration.
+#
+# Pipeline:  lint → test → build → smoke/soak   (sequential chain)
+# Security:  security-static + codeql-gate       (independent island)
+#
+# Security does NOT block lint/test/build/smoke/soak. All jobs must pass
+# for the overall workflow to be green.
 name: Dry Run
 
 on:
   workflow_dispatch:
     inputs:
       skip_lint:
-        description: 'Skip lint + security + CodeQL'
+        description: 'Skip lint (cppcheck + clang-format)'
         type: boolean
         default: false
       skip_tests:
@@ -27,13 +33,17 @@ permissions:
   contents: read
 
 jobs:
-  # ── Lint + Security ──────────────────────────────────────────
+  # ── Security (independent island — does not block main pipeline) ──
+  security:
+    uses: ./.github/workflows/_security.yml
+    secrets: inherit
+
+  # ── Lint (cppcheck + clang-format) ────────────────────────────
   lint:
     if: ${{ inputs.skip_lint != true }}
     uses: ./.github/workflows/_lint.yml
-    secrets: inherit
 
-  # ── Tests (all platforms, perf tests skipped on CI) ──────────
+  # ── Tests (all platforms, perf tests skipped on CI) ────────────
   test:
     needs: [lint]
     if: ${{ inputs.skip_tests != true && !cancelled() && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
@@ -41,19 +51,19 @@ jobs:
     with:
       skip_perf: true
 
-  # ── Build all platforms ──────────────────────────────────────
+  # ── Build all platforms ────────────────────────────────────────
   build:
     if: ${{ inputs.skip_builds != true && !cancelled() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
     needs: [test]
     uses: ./.github/workflows/_build.yml
 
-  # ── Smoke test every binary ─────────────────────────────────
+  # ── Smoke test every binary ────────────────────────────────────
   smoke:
     if: ${{ inputs.skip_builds != true && !cancelled() && needs.build.result == 'success' }}
     needs: [build]
     uses: ./.github/workflows/_smoke.yml
 
-  # ── Soak tests (optional, parallel with smoke) ──────────────
+  # ── Soak tests (optional, parallel with smoke) ────────────────
   soak:
     if: ${{ inputs.soak_level != 'none' && !cancelled() && needs.build.result == 'success' }}
     needs: [build]

@@ -61,7 +61,7 @@ TEST(sw_minimal_data) {
          .url_path = ""},
     };
 
-    int rc = cbm_write_db(path, "test", "/tmp/test", "2026-03-14T00:00:00Z", nodes, 2, edges, 1);
+    int rc = cbm_write_db(path, "test", "/tmp/test", "2026-03-14T00:00:00Z", nodes, 2, edges, 1, NULL, 0, NULL, 0);
     ASSERT_EQ(rc, 0);
 
     /* Verify via SQLite */
@@ -196,7 +196,7 @@ TEST(sw_scale_and_indexes) {
     }
 
     int rc =
-        cbm_write_db(path, "proj", "/repo", "2026-03-14T12:00:00Z", nodes, 100, edges, edge_count);
+        cbm_write_db(path, "proj", "/repo", "2026-03-14T12:00:00Z", nodes, 100, edges, edge_count, NULL, 0, NULL, 0);
     ASSERT_EQ(rc, 0);
 
     sqlite3 *db = NULL;
@@ -278,7 +278,8 @@ TEST(sw_empty) {
     char path[256];
     ASSERT_EQ(make_temp_db(path, sizeof(path)), 0);
 
-    int rc = cbm_write_db(path, "test", "/tmp/test", "2026-03-14T00:00:00Z", NULL, 0, NULL, 0);
+    int rc = cbm_write_db(path, "test", "/tmp/test", "2026-03-14T00:00:00Z", NULL, 0, NULL, 0,
+                          NULL, 0, NULL, 0);
     ASSERT_EQ(rc, 0);
 
     sqlite3 *db = NULL;
@@ -325,7 +326,8 @@ TEST(sw_multi_page) {
         };
     }
 
-    int rc = cbm_write_db(path, "p", "/r", "2026-01-01T00:00:00Z", nodes, N, NULL, 0);
+    int rc = cbm_write_db(path, "p", "/r", "2026-01-01T00:00:00Z", nodes, N, NULL, 0, NULL, 0,
+                          NULL, 0);
     ASSERT_EQ(rc, 0);
 
     sqlite3 *db = NULL;

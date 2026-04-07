@@ -100,9 +100,16 @@ void cbm_lsh_insert(cbm_lsh_index_t *idx, const cbm_lsh_entry_t *entry);
 
 /* Query candidates similar to the given fingerprint.
  * Returns candidate entries via `out` (caller does NOT free the array
- * — it is owned by the index).  Sets `count`. */
+ * — it is owned by the index).  Sets `count`.
+ * NOT thread-safe: uses index-internal result buffer. */
 void cbm_lsh_query(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
                    const cbm_lsh_entry_t ***out, int *count);
+
+/* Thread-safe variant: writes candidates into caller-provided buffer.
+ * `out_buf` must have room for at least `out_cap` pointers.
+ * Returns the actual candidate count (may exceed out_cap — result is truncated). */
+int cbm_lsh_query_into(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
+                       const cbm_lsh_entry_t **out_buf, int out_cap);
 
 /* Free the LSH index and all internal storage. */
 void cbm_lsh_free(cbm_lsh_index_t *idx);

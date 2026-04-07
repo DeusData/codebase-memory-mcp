@@ -21,6 +21,7 @@ enum { PD_RING = 4, PD_RING_MASK = 3, PD_JSON_MARGIN = 10, PD_ESC_MARGIN = 3, PD
 #include "foundation/compat.h"
 #include "cbm.h"
 #include "simhash/minhash.h"
+#include "semantic/ast_profile.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -200,6 +201,16 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
         append_json_string(buf, bufsize, &pos, "fp", fp_hex);
     }
 
+    /* AST structural profile */
+    if (def->structural_profile && pos + CBM_AST_PROFILE_BUF < bufsize) {
+        append_json_string(buf, bufsize, &pos, "sp", def->structural_profile);
+    }
+
+    /* Body tokens */
+    if (def->body_tokens && pos + CBM_SZ_512 < bufsize) {
+        append_json_string(buf, bufsize, &pos, "bt", def->body_tokens);
+    }
+
     if (pos < bufsize - SKIP_ONE) {
         buf[pos] = '}';
         buf[pos + SKIP_ONE] = '\0';
@@ -216,9 +227,12 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     int64_t node_id = cbm_gbuf_upsert_node(
         ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
         def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
+    /* Register callable symbols + Interface.  Interface must be in the registry
+     * so C#/Java `class Foo : IBar` / `class Foo implements IBar` can resolve
+     * `IBar` to an INHERITS edge target during the enrichment phase. */
     if (node_id > 0 && def->label &&
         (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
-         strcmp(def->label, "Class") == 0)) {
+         strcmp(def->label, "Class") == 0 || strcmp(def->label, "Interface") == 0)) {
         cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -235,7 +249,52 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     }
 }
 
-/* Create IMPORTS edges for one file's imports. */
+/* Create Channel nodes + EMITS / LISTENS_ON edges for one file's channels.
+ * Mirrors the parallel path in cbm_build_registry_from_cache — keep in sync. */
+/* Find the source node for a channel edge: enclosing function or file node. */
+static const cbm_gbuf_node_t *find_channel_source(cbm_pipeline_ctx_t *ctx, const CBMChannel *ch,
+                                                  const char *rel) {
+    const cbm_gbuf_node_t *node = NULL;
+    if (ch->enclosing_func_qn && ch->enclosing_func_qn[0]) {
+        node = cbm_gbuf_find_by_qn(ctx->gbuf, ch->enclosing_func_qn);
+    }
+    if (!node) {
+        char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+        node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
+        free(file_qn);
+    }
+    return node;
+}
+
+static void create_channel_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
+                                          const char *rel) {
+    for (int j = 0; j < result->channels.count; j++) {
+        const CBMChannel *ch = &result->channels.items[j];
+        if (!ch->channel_name || !ch->channel_name[0]) {
+            continue;
+        }
+        char channel_qn[CBM_SZ_512];
+        snprintf(channel_qn, sizeof(channel_qn), "__channel__%s__%s",
+                 ch->transport ? ch->transport : "unknown", ch->channel_name);
+        char channel_props[CBM_SZ_512];
+        snprintf(channel_props, sizeof(channel_props), "{\"transport\":\"%s\",\"name\":\"%s\"}",
+                 ch->transport ? ch->transport : "unknown", ch->channel_name);
+        int64_t channel_id = cbm_gbuf_upsert_node(ctx->gbuf, "Channel", ch->channel_name,
+                                                  channel_qn, "", 0, 0, channel_props);
+
+        const cbm_gbuf_node_t *src_node = find_channel_source(ctx, ch, rel);
+        if (src_node && channel_id > 0) {
+            const char *edge_type = ch->direction == CBM_CHANNEL_EMIT ? "EMITS" : "LISTENS_ON";
+            char edge_props[CBM_SZ_128];
+            snprintf(edge_props, sizeof(edge_props), "{\"transport\":\"%s\"}",
+                     ch->transport ? ch->transport : "unknown");
+            cbm_gbuf_insert_edge(ctx->gbuf, src_node->id, channel_id, edge_type, edge_props);
+        }
+    }
+}
+
+/* Create IMPORTS edges for one file's imports.  Mirrors the resolution
+ * logic in pass_parallel.c register_and_link_def — keep the two in sync. */
 static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                         const char *rel) {
     int count = 0;
@@ -244,7 +303,14 @@ static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileRe
         if (!imp->module_path) {
             continue;
         }
-        char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
+        char *target_qn = NULL;
+        char *resolved = cbm_pipeline_resolve_relative_import(rel, imp->module_path);
+        if (resolved) {
+            target_qn = cbm_pipeline_fqn_module(ctx->project_name, resolved);
+            free(resolved);
+        } else {
+            target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
+        }
         const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
         char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
         const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
@@ -312,6 +378,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
          * for now — a future optimization would batch these) */
         total_calls += result->calls.count;
         total_imports += create_import_edges_for_file(ctx, result, rel);
+        create_channel_edges_for_file(ctx, result, rel);
 
         /* Cache or free the extraction result */
         if (ctx->result_cache) {

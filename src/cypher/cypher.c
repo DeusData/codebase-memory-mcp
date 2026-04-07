@@ -97,22 +97,26 @@ static void lex_string_literal(const char *input, int len, int *pos, char quote,
         if (blen >= max_blen) { (*pos)++; continue; }
         if (input[*pos] == '\\' && *pos + SKIP_ONE < len) {
             (*pos)++;
-            switch (input[*pos]) {
-            case 'n':
-                buf[blen++] = '\n';
-                break;
-            case 't':
-                buf[blen++] = '\t';
-                break;
-            case '\\':
-                buf[blen++] = '\\';
-                break;
-            default:
-                buf[blen++] = input[*pos];
-                break;
+            if (blen < max_blen) {
+                switch (input[*pos]) {
+                case 'n':
+                    buf[blen++] = '\n';
+                    break;
+                case 't':
+                    buf[blen++] = '\t';
+                    break;
+                case '\\':
+                    buf[blen++] = '\\';
+                    break;
+                default:
+                    buf[blen++] = input[*pos];
+                    break;
+                }
             }
         } else {
-            buf[blen++] = input[*pos];
+            if (blen < max_blen) {
+                buf[blen++] = input[*pos];
+            }
         }
         (*pos)++;
     }
@@ -492,8 +496,18 @@ static int parse_props(parser_t *p, cbm_prop_filter_t **out, int *count) {
         }
 
         if (n >= cap) {
-            cap *= PAIR_LEN;
-            arr = safe_realloc(arr, cap * sizeof(cbm_prop_filter_t));
+            int new_cap = cap * PAIR_LEN;
+            void *tmp = realloc(arr, new_cap * sizeof(cbm_prop_filter_t));
+            if (!tmp) {
+                for (int i = 0; i < n; i++) {
+                    free((void *)arr[i].key);
+                    free((void *)arr[i].value);
+                }
+                free(arr);
+                return CBM_NOT_FOUND;
+            }
+            arr = tmp;
+            cap = new_cap;
         }
         arr[n].key = heap_strdup(key->text);
         arr[n].value = heap_strdup(val->text);
@@ -595,8 +609,17 @@ static int parse_rel_types(parser_t *p, cbm_rel_pattern_t *out) {
             return CBM_NOT_FOUND;
         }
         if (n >= cap) {
-            cap *= PAIR_LEN;
-            types = safe_realloc(types, cap * sizeof(const char *));
+            int new_cap = cap * PAIR_LEN;
+            void *tmp = realloc(types, new_cap * sizeof(const char *));
+            if (!tmp) {
+                for (int i = 0; i < n; i++) {
+                    free((void *)types[i]);
+                }
+                free(types);
+                return CBM_NOT_FOUND;
+            }
+            types = (const char **)tmp;
+            cap = new_cap;
         }
         types[n++] = heap_strdup(t->text);
     }
@@ -782,8 +805,20 @@ static cbm_expr_t *parse_in_list(parser_t *p, cbm_condition_t *c) {
         }
         if (check(p, TOK_STRING) || check(p, TOK_NUMBER)) {
             if (vn >= vcap) {
-                vcap *= PAIR_LEN;
-                vals = safe_realloc(vals, vcap * sizeof(const char *));
+                int new_vcap = vcap * PAIR_LEN;
+                void *tmp = realloc((void *)vals, new_vcap * sizeof(const char *));
+                if (!tmp) {
+                    for (int i = 0; i < vn; i++) {
+                        free((void *)vals[i]);
+                    }
+                    free((void *)vals);
+                    free((void *)c->variable);
+                    free((void *)c->property);
+                    free((void *)c->op);
+                    return NULL;
+                }
+                vals = (const char **)tmp;
+                vcap = new_vcap;
             }
             vals[vn++] = heap_strdup(advance(p)->text);
         } else {
@@ -1094,8 +1129,19 @@ static cbm_case_expr_t *parse_case_expr(parser_t *p) {
         }
         const char *then_val = parse_value_literal(p);
         if (kase->branch_count >= bcap) {
-            bcap *= PAIR_LEN;
-            kase->branches = safe_realloc(kase->branches, bcap * sizeof(cbm_case_branch_t));
+            int new_bcap = bcap * PAIR_LEN;
+            void *tmp = realloc(kase->branches, new_bcap * sizeof(cbm_case_branch_t));
+            if (!tmp) {
+                expr_free(when);
+                for (int i = 0; i < kase->branch_count; i++) {
+                    expr_free(kase->branches[i].when_expr);
+                }
+                free(kase->branches);
+                free(kase);
+                return NULL;
+            }
+            kase->branches = tmp;
+            bcap = new_bcap;
         }
         kase->branches[kase->branch_count++] =
             (cbm_case_branch_t){.when_expr = when, .then_val = then_val};

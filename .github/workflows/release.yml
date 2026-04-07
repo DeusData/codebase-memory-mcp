@@ -1,4 +1,8 @@
-# Release pipeline: lint → test → build → smoke → soak → draft → verify → publish
+# Release pipeline: lint → test → build → smoke/soak → draft → verify → publish
+#
+# Security (security-static + codeql-gate) starts immediately and runs in
+# parallel with lint/test/build/smoke/soak. It only blocks the final verify
+# step — everything else proceeds independently.
 name: Release
 
 on:
@@ -27,31 +31,35 @@ permissions:
   contents: read
 
 jobs:
-  # ── 1. Lint + Security + CodeQL ────────────────────────────────
-  lint:
-    uses: ./.github/workflows/_lint.yml
+  # ── Security (starts immediately, blocks only verify) ───────────
+  security:
+    uses: ./.github/workflows/_security.yml
     secrets: inherit
 
-  # ── 2. Tests (all platforms, full suite for release) ───────────
+  # ── 1. Lint (cppcheck + clang-format) ───────────────────────────
+  lint:
+    uses: ./.github/workflows/_lint.yml
+
+  # ── 2. Tests (all platforms, full suite for release) ────────────
   test:
     needs: [lint]
     uses: ./.github/workflows/_test.yml
     with:
       skip_perf: false
 
-  # ── 3. Build all platforms ─────────────────────────────────────
+  # ── 3. Build all platforms ──────────────────────────────────────
   build:
     needs: [test]
     uses: ./.github/workflows/_build.yml
     with:
       version: ${{ inputs.version }}
 
-  # ── 4. Smoke test every binary ─────────────────────────────────
+  # ── 4. Smoke test every binary ──────────────────────────────────
   smoke:
     needs: [build]
     uses: ./.github/workflows/_smoke.yml
 
-  # ── 5. Soak tests ─────────────────────────────────────────────
+  # ── 5. Soak tests ──────────────────────────────────────────────
   soak:
     if: ${{ inputs.soak_level != 'none' }}
     needs: [build]
@@ -61,9 +69,9 @@ jobs:
       run_asan: ${{ inputs.soak_level == 'full' }}
       version: ${{ inputs.version }}
 
-  # ── 6. Create DRAFT release ───────────────────────────────────
+  # ── 6. Create DRAFT release ────────────────────────────────────
   release-draft:
-    needs: [smoke, soak, lint]
+    needs: [smoke, soak]
     if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
     permissions:
@@ -73,7 +81,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           merge-multiple: true
 
@@ -116,13 +124,13 @@ jobs:
           "
 
       - name: Attest SBOM
-        uses: actions/attest-sbom@10926c72720ffc3f7b666661c8e55b1344e2a365 # v2
+        uses: actions/attest-sbom@bd218ad0dbcb3e146bd073d1d9c6d78e08aa8a0b # v2
         with:
           subject-path: '*.tar.gz'
           sbom-path: 'sbom.json'
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
 
       - name: Sign artifacts
         run: |
@@ -157,9 +165,9 @@ jobs:
           body: ${{ inputs.release_notes || '' }}
           generate_release_notes: ${{ inputs.release_notes == '' }}
 
-  # ── 7. Verify + Publish ────────────────────────────────────────
+  # ── 7. Verify + Publish (requires security gate) ───────────────
   verify:
-    needs: [release-draft]
+    needs: [release-draft, security]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -188,6 +196,14 @@ jobs:
           cp install.sh binaries/ 2>/dev/null || true
           cp install.ps1 binaries/ 2>/dev/null || true
           ls -la binaries/
+
+      - name: Security audits on all release binaries
+        run: |
+          for bin in binaries/codebase-memory-mcp*; do
+            [ -f "$bin" ] || continue
+            echo "--- Auditing: $(basename "$bin") ---"
+            scripts/security-strings.sh "$bin"
+          done
 
       - name: VirusTotal scan
         uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0

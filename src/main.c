@@ -36,6 +36,7 @@ enum {
 #include "foundation/platform.h"
 #include "foundation/compat_thread.h"
 #include "foundation/mem.h"
+#include "foundation/profile.h"
 #include "ui/config.h"
 #include "ui/http_server.h"
 #include "ui/embedded_assets.h"
@@ -201,6 +202,12 @@ static void print_help(void) {
 /* Try to handle a subcommand (cli/install/uninstall/update/config/--version/--help).
  * Returns -1 if no subcommand matched, otherwise the exit code. */
 static int handle_subcommand(int argc, char **argv) {
+    /* First scan: global flags */
+    for (int i = SKIP_ONE; i < argc; i++) {
+        if (strcmp(argv[i], "--profile") == 0) {
+            cbm_profile_enable();
+        }
+    }
     for (int i = SKIP_ONE; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0) {
             printf("codebase-memory-mcp %s\n", CBM_VERSION);
@@ -265,6 +272,7 @@ static void setup_signal_handlers(void) {
 }
 
 int main(int argc, char **argv) {
+    cbm_profile_init(); /* reads CBM_PROFILE env var, gates all prof macros */
     int subcmd = handle_subcommand(argc, argv);
     if (subcmd >= 0) {
         return subcmd;

@@ -31,8 +31,9 @@ typedef struct cbm_pipeline cbm_pipeline_t;
 #ifndef CBM_INDEX_MODE_T_DEFINED
 #define CBM_INDEX_MODE_T_DEFINED
 typedef enum {
-    CBM_MODE_FULL = 0, /* Full index: read everything, build from scratch */
-    CBM_MODE_FAST = 1, /* Fast: skip non-essential files (media, docs, etc.) */
+    CBM_MODE_FULL = 0,     /* Full: everything including SIMILAR_TO + SEMANTICALLY_RELATED */
+    CBM_MODE_MODERATE = 1, /* Moderate: fast discovery + SIMILAR_TO + SEMANTICALLY_RELATED */
+    CBM_MODE_FAST = 2,     /* Fast: skip non-essential files, no similarity/semantic edges */
 } cbm_index_mode_t;
 #endif
 
@@ -54,6 +55,9 @@ void cbm_pipeline_cancel(cbm_pipeline_t *p);
 /* Get the project name derived from repo_path. Returned string is
  * owned by the pipeline. Valid until cbm_pipeline_free(). */
 const char *cbm_pipeline_project_name(const cbm_pipeline_t *p);
+
+/* Get the index mode (CBM_MODE_FULL, CBM_MODE_MODERATE, CBM_MODE_FAST). */
+int cbm_pipeline_get_mode(const cbm_pipeline_t *p);
 
 /* ── Index lock (prevents concurrent pipeline runs on same DB) ──── */
 
@@ -81,6 +85,16 @@ char *cbm_pipeline_fqn_module(const char *project, const char *rel_path);
 
 /* Folder QN: project.dir.parts. Caller must free(). */
 char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir);
+
+/* Resolve an import specifier that uses a relative path (./foo, ../bar, .foo,
+ * or an unqualified local name like "foo.h") against the importing file's
+ * path.  Returns a malloc'd normalized relative path without extension
+ * (e.g. "src/api/helpers") suitable for passing to cbm_pipeline_fqn_module,
+ * or NULL if the specifier is not a relative path (bare module names like
+ * "lodash", "django", "github.com/foo/bar" return NULL — the caller should
+ * treat those as external/unresolvable). Handles ".", "..", and leading
+ * dot-only segments used by Python relative imports. */
+char *cbm_pipeline_resolve_relative_import(const char *source_rel, const char *module_path);
 
 /* Derive project name from an absolute path.
  * Replaces / and : with -, collapses --, trims leading -.
