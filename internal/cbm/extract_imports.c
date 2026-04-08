@@ -7,6 +7,11 @@
 #include <string.h>
 #include <ctype.h>
 
+/* Forward declaration: JS grammar used for re-parsing <script> blocks in
+ * Svelte and Vue files.  The symbol is provided by grammar_javascript.c which
+ * is always compiled into the same link unit. */
+extern const TSLanguage *tree_sitter_javascript(void);
+
 /* Local constants for magic number elimination. */
 enum {
     USE_PREFIX_LEN = 4, /* strlen("use ") */
@@ -28,6 +33,8 @@ static void parse_ruby_imports(CBMExtractCtx *ctx);
 static void parse_lua_imports(CBMExtractCtx *ctx);
 static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type);
 static void parse_wolfram_imports(CBMExtractCtx *ctx);
+static void walk_es_imports(CBMExtractCtx *ctx, TSNode root);
+static void parse_svelte_vue_imports(CBMExtractCtx *ctx);
 
 // Helper: strip quotes from a string literal
 static char *strip_quotes(CBMArena *a, const char *s) {
@@ -847,6 +854,67 @@ static void parse_wolfram_imports(CBMExtractCtx *ctx) {
     walk_wolfram_imports(ctx, ctx->root);
 }
 
+// --- Svelte / Vue imports ---
+// Both grammars produce:  document → script_element → raw_text
+// where raw_text contains the verbatim JS/TS inside <script>...</script>.
+// Strategy: locate the first script_element's raw_text child, re-parse it
+// with the JavaScript grammar, then run the normal ES import walker.
+
+static void parse_svelte_vue_imports(CBMExtractCtx *ctx) {
+    /* Walk top-level children of the document node looking for script_element. */
+    uint32_t top_count = ts_node_child_count(ctx->root);
+    for (uint32_t i = 0; i < top_count; i++) {
+        TSNode top = ts_node_child(ctx->root, i);
+        if (strcmp(ts_node_type(top), "script_element") != 0) {
+            continue;
+        }
+
+        /* Inside script_element, find the raw_text child. */
+        uint32_t sc = ts_node_child_count(top);
+        for (uint32_t j = 0; j < sc; j++) {
+            TSNode child = ts_node_child(top, j);
+            if (strcmp(ts_node_type(child), "raw_text") != 0) {
+                continue;
+            }
+
+            uint32_t start_byte = ts_node_start_byte(child);
+            uint32_t end_byte   = ts_node_end_byte(child);
+            if (end_byte <= start_byte) {
+                continue;
+            }
+
+            /* The raw_text slice is a substring of ctx->source.  Re-parse it
+             * with the JS grammar so that walk_es_imports sees standard
+             * import_statement nodes. */
+            const char *js_src = ctx->source + start_byte;
+            uint32_t    js_len = end_byte - start_byte;
+
+            TSParser *js_parser = ts_parser_new();
+            if (!js_parser) {
+                continue;
+            }
+            if (!ts_parser_set_language(js_parser, tree_sitter_javascript())) {
+                ts_parser_delete(js_parser);
+                continue;
+            }
+
+            TSTree *js_tree = ts_parser_parse_string(js_parser, NULL, js_src, js_len);
+            if (js_tree) {
+                /* Build a temporary context that points at the JS sub-source. */
+                CBMExtractCtx js_ctx = *ctx;
+                js_ctx.source = js_src;
+                js_ctx.root   = ts_tree_root_node(js_tree);
+                walk_es_imports(&js_ctx, js_ctx.root);
+                ts_tree_delete(js_tree);
+            }
+            ts_parser_delete(js_parser);
+
+            /* Only process the first <script> block. */
+            return;
+        }
+    }
+}
+
 // --- Main dispatch ---
 
 void cbm_extract_imports(CBMExtractCtx *ctx) {
@@ -937,6 +1005,10 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         break;
     case CBM_LANG_WOLFRAM:
         parse_wolfram_imports(ctx);
+        break;
+    case CBM_LANG_SVELTE:
+    case CBM_LANG_VUE:
+        parse_svelte_vue_imports(ctx);
         break;
     default:
         break;
