@@ -629,6 +629,19 @@ static const char *decorator_method_name(const char *attr_text) {
     if (strcmp(method, "route") == 0 || strcmp(method, "api_route") == 0) {
         return "ANY";
     }
+    /* Java Spring annotations: @GetMapping, @PostMapping, @RequestMapping, etc. */
+    if (strcmp(method, "GetMapping") == 0) return "GET";
+    if (strcmp(method, "PostMapping") == 0) return "POST";
+    if (strcmp(method, "PutMapping") == 0) return "PUT";
+    if (strcmp(method, "DeleteMapping") == 0) return "DELETE";
+    if (strcmp(method, "PatchMapping") == 0) return "PATCH";
+    if (strcmp(method, "RequestMapping") == 0) return "ANY";
+    /* Vert.x: @Route.Method.GET, router.get(), etc. */
+    if (strcmp(method, "GET") == 0 || strcmp(method, "POST") == 0 ||
+        strcmp(method, "PUT") == 0 || strcmp(method, "DELETE") == 0 ||
+        strcmp(method, "PATCH") == 0) {
+        return method;
+    }
     return NULL;
 }
 
@@ -1699,7 +1712,26 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     if (ctx->enclosing_class_qn) {
         class_qn = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, name);
     } else {
-        class_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+        /* For C#: use directory path instead of file path for class QN.
+         * This merges partial class definitions (split across multiple .cs files
+         * in the same directory) into a single Class node in the graph.
+         * e.g., Controller.cs and ControllerMessaging.cs both get
+         * "project.src.Dir.Controller" instead of separate QNs per file. */
+        if (ctx->language == CBM_LANG_CSHARP && ctx->rel_path) {
+            const char *last_slash = strrchr(ctx->rel_path, '/');
+            if (last_slash) {
+                char dir_path[512];
+                int dlen = (int)(last_slash - ctx->rel_path);
+                if (dlen >= (int)sizeof(dir_path)) dlen = (int)sizeof(dir_path) - 1;
+                memcpy(dir_path, ctx->rel_path, (size_t)dlen);
+                dir_path[dlen] = '\0';
+                class_qn = cbm_fqn_compute(a, ctx->project, dir_path, name);
+            } else {
+                class_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+            }
+        } else {
+            class_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+        }
     }
     const char *label = class_label_for_kind(kind);
 

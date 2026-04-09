@@ -112,7 +112,6 @@ static int common_prefix_len(const char *a, const char *b) {
 /* Check if a qualified name looks like a test/mock path. */
 static bool is_test_qn(const char *qn) {
     if (!qn) return false;
-    /* Common test directory/file patterns in qualified names */
     return (strstr(qn, "Test") != NULL || strstr(qn, "test") != NULL ||
             strstr(qn, "Mock") != NULL || strstr(qn, "mock") != NULL ||
             strstr(qn, "Stub") != NULL || strstr(qn, "stub") != NULL ||
@@ -120,13 +119,29 @@ static bool is_test_qn(const char *qn) {
             strstr(qn, "Fixture") != NULL || strstr(qn, "spec") != NULL);
 }
 
+/* Check if a method name looks like generated ORM/record accessor code.
+ * jOOQ: componentN(), valueN(); Kotlin data: componentN() */
+static bool is_generated_accessor(const char *qn) {
+    if (!qn) return false;
+    /* Simple name is the last segment after the last dot */
+    const char *name = strrchr(qn, '.');
+    name = name ? name + 1 : qn;
+    if ((name[0] == 'c' && strncmp(name, "component", 9) == 0 && name[9] >= '0' && name[9] <= '9') ||
+        (name[0] == 'v' && strncmp(name, "value", 5) == 0 && name[5] >= '0' && name[5] <= '9')) {
+        return true;
+    }
+    /* Also check if the containing class is a *Record (jOOQ generated records) */
+    if (strstr(qn, "Record.component") || strstr(qn, "Record.value")) return true;
+    return false;
+}
+
 /* Score a candidate for tiebreaking. Higher = better.
- * Layer 1: Non-test code preferred over test code (+1000)
+ * Layer 1: Non-test/non-generated code preferred (+1000)
  * Layer 2: Namespace proximity via common prefix length (+plen) */
 static int candidate_score(const char *candidate_qn, const char *module_qn) {
     int score = 0;
-    /* Layer 1: deprioritize test/mock candidates */
-    if (!is_test_qn(candidate_qn)) {
+    /* Layer 1: deprioritize test/mock and generated ORM candidates */
+    if (!is_test_qn(candidate_qn) && !is_generated_accessor(candidate_qn)) {
         score += 1000;
     }
     /* Layer 2: namespace proximity */
