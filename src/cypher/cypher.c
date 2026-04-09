@@ -1872,7 +1872,11 @@ static void binding_set(binding_t *b, const char *var, const cbm_node_t *node) {
 static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *b) {
     cbm_edge_t *e = binding_get_edge(b, c->variable);
     if (e) {
-        return edge_prop(e, c->property);
+        if (c->property) {
+            return edge_prop(e, c->property);
+        }
+        /* Bare edge variable (RETURN r) — return edge type as display value */
+        return e->type ? e->type : "";
     }
     cbm_node_t *n = binding_get(b, c->variable);
     if (!n) {
@@ -2103,7 +2107,7 @@ static const char *binding_get_virtual(binding_t *b, const char *var, const char
     /* Fall through to normal lookup */
     cbm_edge_t *e = binding_get_edge(b, var);
     if (e) {
-        return prop ? edge_prop(e, prop) : "";
+        return prop ? edge_prop(e, prop) : (e->type ? e->type : "");
     }
     cbm_node_t *n = binding_get(b, var);
     if (n) {

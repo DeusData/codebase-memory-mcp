@@ -1,0 +1,13 @@
+# Exclude all C/C++ files - the C tree-sitter parser segfaults on this repo
+*.c
+*.h
+*.cc
+*.cpp
+*.hpp
+
+# Vendored everything
+internal/cbm/vendored/
+vendored/
+internal/cbm/lsp/generated/
+tools/tree-sitter-form/
+tools/tree-sitter-magma/
