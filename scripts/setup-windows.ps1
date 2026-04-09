@@ -9,7 +9,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$Repo = "DeusData/codebase-memory-mcp"
+$Repo = "hodizoda/codebase-memory-mcp"
 $BinaryName = "codebase-memory-mcp"
 $InstallDir = Join-Path $env:LOCALAPPDATA "codebase-memory-mcp"
 

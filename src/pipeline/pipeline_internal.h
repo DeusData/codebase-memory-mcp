@@ -15,6 +15,9 @@
 #include "cbm.h"
 #include <stdatomic.h>
 
+/* Forward declaration for cross-repo endpoint registry (full type in servicelink.h) */
+struct cbm_sl_endpoint_list_t;
+
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
 /* Maximum byte budget for tree-sitter extraction per file */
@@ -46,6 +49,8 @@ typedef struct {
      * and pass_calls/usages/semantic reuse cached results instead of re-extracting.
      * Indexed by file position in the files[] array. Owned by pipeline.c. */
     CBMFileResult **result_cache;
+
+    struct cbm_sl_endpoint_list_t *endpoints; /* collected across all linkers, owned by pipeline */
 } cbm_pipeline_ctx_t;
 
 /* Check cancellation. Returns non-zero if cancelled. */
@@ -344,6 +349,11 @@ int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result
 
 /* Apply pre-computed couplings to the graph buffer (main thread only). */
 int cbm_pipeline_githistory_apply(cbm_pipeline_ctx_t *ctx, const cbm_githistory_result_t *result);
+
+int cbm_pipeline_pass_servicelinks(cbm_pipeline_ctx_t *ctx);
+
+/* Community detection pass: Louvain clustering on service-link edges. */
+int cbm_pipeline_pass_communities(cbm_pipeline_ctx_t *ctx);
 
 /* Pre-dump pass: decorator tags enrichment (operates on gbuf). */
 int cbm_pipeline_pass_decorator_tags(cbm_gbuf_t *gbuf, const char *project);

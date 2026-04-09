@@ -138,7 +138,7 @@ if [[ -d "$SKILLS_DIR" ]]; then
         done
 
         # Check for unexpected URLs
-        if grep -oE 'https?://[^\s"'"'"']+' "$skill_file" 2>/dev/null | grep -v 'github.com/DeusData' | grep -v 'localhost' | grep -v '127.0.0.1' > /tmp/sec_skill_urls 2>/dev/null; then
+        if grep -oE 'https?://[^\s"'"'"']+' "$skill_file" 2>/dev/null | grep -v 'github.com/hodizoda' | grep -v 'localhost' | grep -v '127.0.0.1' > /tmp/sec_skill_urls 2>/dev/null; then
             while IFS= read -r url; do
                 echo "REVIEW: Skill '$basename' contains URL: $url"
             done < /tmp/sec_skill_urls
