@@ -1,6 +1,6 @@
 # codebase-memory-mcp
 
-[![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
+[![GitHub Release](https://img.shields.io/github/v/release/hodizoda/codebase-memory-mcp?style=flat&color=blue)](https://github.com/hodizoda/codebase-memory-mcp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/dry-run.yml?label=CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/dry-run.yml)
 [![Tests](https://img.shields.io/badge/tests-2586_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
@@ -15,7 +15,7 @@
 
 **The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a single static binary for macOS, Linux, and Windows — download, run `install`, done.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 66 languages, enhanced with LSP-style hybrid type resolution for Go, C, and C++ (more languages coming soon) — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 14 MCP tools. Zero dependencies. Plug and play across 10 coding agents.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 64 languages, enhanced with LSP-style hybrid type resolution for Go, C, and C++ (more languages coming soon) — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 14 MCP tools. Zero dependencies. Plug and play across 10 coding agents.
 
 > **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.
 
@@ -31,19 +31,17 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 
 - **Extreme indexing speed** — Linux kernel (28M LOC, 75K files) in 3 minutes. RAM-first pipeline: LZ4 compression, in-memory SQLite, fused Aho-Corasick pattern matching. Memory released after indexing.
 - **Plug and play** — single static binary for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (amd64). No Docker, no runtime dependencies, no API keys. Download → `install` → restart agent → done.
-- **66 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
+- **64 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search. One graph query replaces dozens of grep/read cycles.
 - **11 agents, one command** — `install` auto-detects Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, OpenClaw, and Kiro — configures MCP entries, instruction files, and pre-tool hooks for each.
 - **Built-in graph visualization** — 3D interactive UI at `localhost:9749` (optional UI binary variant).
-- **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
 - **14 MCP tools** — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
 
 ## Quick Start
 
-**One-line install** (macOS / Linux):
-```bash
-curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash
-```
+1. **Download** the binary for your platform from the [latest release](https://github.com/hodizoda/codebase-memory-mcp/releases/latest):
+   - `codebase-memory-mcp-<os>-<arch>.tar.gz` — standard (MCP server only)
+   - `codebase-memory-mcp-ui-<os>-<arch>.tar.gz` — with embedded graph visualization
 
 With graph visualization UI:
 ```bash
@@ -79,19 +77,11 @@ Restart your coding agent. Say **"Index this project"** — done.
    macOS / Linux:
    ```bash
    tar xzf codebase-memory-mcp-*.tar.gz
-   ./install.sh
+   mv codebase-memory-mcp ~/.local/bin/
+   codebase-memory-mcp install
    ```
 
-   Windows (PowerShell):
-   ```powershell
-   Expand-Archive codebase-memory-mcp-windows-amd64.zip -DestinationPath .
-   .\install.ps1
-   ```
-
-3. **Restart** your coding agent.
-
-The `install` command automatically strips macOS quarantine attributes and ad-hoc signs the binary — no manual `xattr`/`codesign` needed.
-</details>
+3. **Restart** your coding agent. Say **"Index this project"** — done.
 
 The `install` command auto-detects all installed coding agents and configures MCP server entries, instruction files, skills, and pre-tool hooks for each.
 
@@ -204,13 +194,13 @@ Every release includes `checksums.txt` with SHA-256 hashes. All binaries are sta
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/scripts/setup.sh | bash
+curl -fsSL https://raw.githubusercontent.com/hodizoda/codebase-memory-mcp/main/scripts/setup.sh | bash
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/scripts/setup-windows.ps1 | iex
+irm https://raw.githubusercontent.com/hodizoda/codebase-memory-mcp/main/scripts/setup-windows.ps1 | iex
 ```
 
 </details>
@@ -218,7 +208,7 @@ irm https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/scripts/
 ### Install via Claude Code
 
 ```
-You: "Install this MCP server: https://github.com/DeusData/codebase-memory-mcp"
+You: "Install this MCP server: https://github.com/hodizoda/codebase-memory-mcp"
 ```
 
 ### Build from Source
@@ -236,7 +226,7 @@ You: "Install this MCP server: https://github.com/DeusData/codebase-memory-mcp"
 </details>
 
 ```bash
-git clone https://github.com/DeusData/codebase-memory-mcp.git
+git clone https://github.com/hodizoda/codebase-memory-mcp.git
 cd codebase-memory-mcp
 scripts/build.sh                    # standard binary
 scripts/build.sh --with-ui          # with graph visualization
@@ -328,7 +318,7 @@ codebase-memory-mcp cli --raw search_graph '{"label": "Function"}' | jq '.result
 
 ### Node Labels
 
-`Project`, `Package`, `Folder`, `File`, `Module`, `Class`, `Function`, `Method`, `Interface`, `Enum`, `Type`, `Route`, `Resource`
+`Project`, `Package`, `Folder`, `File`, `Module`, `Class`, `Function`, `Method`, `Interface`, `Enum`, `Type`, `Route`
 
 ### Edge Types
 
@@ -355,37 +345,6 @@ codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-in
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
 
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the database storage directory. All project indexes and config are stored here. |
-| `CBM_DIAGNOSTICS` | `false` | Set to `1` or `true` to enable periodic diagnostics output to `/tmp/cbm-diagnostics-<pid>.json`. |
-| `CBM_DOWNLOAD_URL` | *(GitHub releases)* | Override the download URL for updates. Used for testing or self-hosted deployments. |
-
-```bash
-# Store indexes in a custom directory
-export CBM_CACHE_DIR=~/my-projects/cbm-data
-```
-
-## Custom File Extensions
-
-Map additional file extensions to supported languages via JSON config files. Useful for framework-specific extensions like `.blade.php` (Laravel) or `.mjs` (ES modules).
-
-**Per-project** (in your repo root):
-```json
-// .codebase-memory.json
-{"extra_extensions": {".blade.php": "php", ".mjs": "javascript"}}
-```
-
-**Global** (applies to all projects):
-```json
-// ~/.config/codebase-memory-mcp/config.json  (or $XDG_CONFIG_HOME/...)
-{"extra_extensions": {".twig": "html", ".phtml": "php"}}
-```
-
-Project config overrides global for conflicting extensions. Unknown language values are silently skipped. Missing config files are ignored.
-
 ## Persistence
 
 SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across restarts (WAL mode, ACID-safe). To reset: `rm -rf ~/.cache/codebase-memory-mcp/`.
@@ -403,7 +362,7 @@ SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across rest
 
 ## Language Support
 
-66 languages. Benchmarked against 64 real open-source repositories (78 to 49K nodes):
+64 languages. Benchmarked against 64 real open-source repositories (78 to 49K nodes):
 
 | Tier | Score | Languages |
 |------|-------|-----------|
@@ -428,7 +387,7 @@ src/
   traces/             Runtime trace ingestion
   ui/                 Embedded HTTP server + 3D graph visualization
   foundation/         Platform abstractions (threads, filesystem, logging, memory)
-internal/cbm/         Vendored tree-sitter grammars (66 languages) + AST extraction engine
+internal/cbm/         Vendored tree-sitter grammars (64 languages) + AST extraction engine
 ```
 
 ## Security

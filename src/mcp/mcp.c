@@ -398,6 +398,13 @@ static const tool_def_t TOOLS[] = {
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\",\"items\":{\"type\":"
      "\"object\"}},\"project\":{\"type\":"
      "\"string\"}},\"required\":[\"traces\",\"project\"]}"},
+
+    {"cross_project_links", "Discover cross-project protocol communication links between indexed projects",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"protocol\":{\"type\":\"string\",\"description\":\"Filter by protocol (graphql, grpc, kafka, etc.)\"},"
+     "\"project\":{\"type\":\"string\",\"description\":\"Filter by project name (matches producer or consumer)\"},"
+     "\"identifier\":{\"type\":\"string\",\"description\":\"Filter by identifier (topic name, operation, etc.)\"}"
+     "}}"},
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
@@ -3588,6 +3595,174 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+/* ── Cross-project links tool ────────────────────────────────── */
+
+static char *handle_cross_project_links(cbm_mcp_server_t *srv, const char *args) {
+    (void)srv;
+
+    /* Parse optional filters */
+    char protocol[64] = {0};
+    char project[256] = {0};
+    char identifier[256] = {0};
+
+    if (args) {
+        yyjson_doc *doc = yyjson_read(args, strlen(args), 0);
+        if (doc) {
+            yyjson_val *root = yyjson_doc_get_root(doc);
+            yyjson_val *v;
+            v = yyjson_obj_get(root, "protocol");
+            if (v && yyjson_is_str(v))
+                snprintf(protocol, sizeof(protocol), "%s", yyjson_get_str(v));
+            v = yyjson_obj_get(root, "project");
+            if (v && yyjson_is_str(v))
+                snprintf(project, sizeof(project), "%s", yyjson_get_str(v));
+            v = yyjson_obj_get(root, "identifier");
+            if (v && yyjson_is_str(v))
+                snprintf(identifier, sizeof(identifier), "%s", yyjson_get_str(v));
+            yyjson_doc_free(doc);
+        }
+    }
+
+    /* Open _crosslinks.db */
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) {
+        return cbm_mcp_text_result("Cache directory not found.", true);
+    }
+
+    char db_path[1024];
+    snprintf(db_path, sizeof(db_path), "%s/_crosslinks.db", cache_dir);
+
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return cbm_mcp_text_result(
+            "No cross-project links found. Index at least 2 projects first.", false);
+    }
+
+    /* Build query with optional filters (using parameterized queries for safety) */
+    char sql[1024];
+    char where[512] = {0};
+    int wlen = 0;
+
+    if (protocol[0]) {
+        wlen += snprintf(where + wlen, sizeof(where) - (size_t)wlen,
+                         "%sprotocol = ?", wlen ? " AND " : "");
+    }
+    if (project[0]) {
+        wlen += snprintf(where + wlen, sizeof(where) - (size_t)wlen,
+                         "%s(producer_project = ? OR consumer_project = ?)",
+                         wlen ? " AND " : "");
+    }
+    if (identifier[0]) {
+        wlen += snprintf(where + wlen, sizeof(where) - (size_t)wlen,
+                         "%sidentifier = ?", wlen ? " AND " : "");
+    }
+
+    if (wlen > 0) {
+        snprintf(sql, sizeof(sql),
+            "SELECT protocol, identifier, producer_project, producer_qn, producer_file, "
+            "consumer_project, consumer_qn, consumer_file, confidence "
+            "FROM cross_links WHERE %s ORDER BY protocol, identifier, confidence DESC;", where);
+    } else {
+        snprintf(sql, sizeof(sql),
+            "SELECT protocol, identifier, producer_project, producer_qn, producer_file, "
+            "consumer_project, consumer_qn, consumer_file, confidence "
+            "FROM cross_links ORDER BY protocol, identifier, confidence DESC;");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return cbm_mcp_text_result("Failed to query cross-project links.", true);
+    }
+
+    /* Bind parameters */
+    int bind_idx = 1;
+    if (protocol[0]) {
+        sqlite3_bind_text(stmt, bind_idx++, protocol, -1, SQLITE_STATIC);
+    }
+    if (project[0]) {
+        sqlite3_bind_text(stmt, bind_idx++, project, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, bind_idx++, project, -1, SQLITE_STATIC);
+    }
+    if (identifier[0]) {
+        sqlite3_bind_text(stmt, bind_idx++, identifier, -1, SQLITE_STATIC);
+    }
+
+    /* Format output — reserve 128 bytes at start for header (filled after loop) */
+    enum { XL_HDR_RESERVE = 128 };
+    int buf_cap = 65536;
+    char *buf = malloc((size_t)buf_cap);
+    if (!buf) { sqlite3_finalize(stmt); sqlite3_close(db);
+                 return cbm_mcp_text_result("alloc failed", true); }
+    int pos = XL_HDR_RESERVE;  /* start writing after header reservation */
+    int total = 0;
+    char cur_protocol[64] = {0};
+    int proto_count = 0;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *proto = (const char *)sqlite3_column_text(stmt, 0);
+        const char *ident = (const char *)sqlite3_column_text(stmt, 1);
+        const char *pprod = (const char *)sqlite3_column_text(stmt, MCP_COL_2);
+        const char *qprod = (const char *)sqlite3_column_text(stmt, MCP_COL_3);
+        const char *fprod = (const char *)sqlite3_column_text(stmt, MCP_COL_4);
+        const char *pcons = (const char *)sqlite3_column_text(stmt, 5);
+        const char *qcons = (const char *)sqlite3_column_text(stmt, 6);
+        const char *fcons = (const char *)sqlite3_column_text(stmt, MCP_COL_7);
+        double conf = sqlite3_column_double(stmt, 8);
+
+        /* Grow buffer if needed (each entry is ~300 bytes max) */
+        if (pos + 512 > buf_cap) {
+            int new_cap = buf_cap * 2;
+            char *new_buf = realloc(buf, (size_t)new_cap);
+            if (!new_buf) break;  /* return what we have so far */
+            buf = new_buf;
+            buf_cap = new_cap;
+        }
+
+        /* Protocol header */
+        if (strcmp(cur_protocol, proto ? proto : "") != 0) {
+            if (proto_count > 0) {
+                pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "\n");
+            }
+            snprintf(cur_protocol, sizeof(cur_protocol), "%s", proto ? proto : "");
+            pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "## %s\n\n", proto);
+            proto_count++;
+        }
+
+        pos += snprintf(buf + pos, (size_t)(buf_cap - pos),
+            "%s (confidence: %.2f)\n"
+            "  producer: %s :: %s (%s)\n"
+            "  consumer: %s :: %s (%s)\n\n",
+            ident ? ident : "", conf,
+            pprod ? pprod : "", qprod ? qprod : "", fprod ? fprod : "",
+            pcons ? pcons : "", qcons ? qcons : "", fcons ? fcons : "");
+        total++;
+    }
+
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    if (total == 0) {
+        free(buf);
+        return cbm_mcp_text_result(
+            "No cross-project links found. Index at least 2 projects first.", false);
+    }
+
+    /* Fill header in the reserved space, then shift content to close the gap */
+    char header[XL_HDR_RESERVE];
+    int hlen = snprintf(header, sizeof(header), "# Cross-Project Links (%d total)\n\n", total);
+    int gap = XL_HDR_RESERVE - hlen;
+    memmove(buf + hlen, buf + XL_HDR_RESERVE, (size_t)(pos - XL_HDR_RESERVE) + 1);
+    memcpy(buf, header, (size_t)hlen);
+    pos -= gap;
+    buf[pos] = '\0';
+
+    char *result = cbm_mcp_text_result(buf, false);
+    free(buf);
+    return result;
+}
+
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
@@ -3638,6 +3813,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "ingest_traces") == 0) {
         return handle_ingest_traces(srv, args_json);
+    }
+    if (strcmp(tool_name, "cross_project_links") == 0) {
+        return handle_cross_project_links(srv, args_json);
     }
     char msg[CBM_SZ_256];
     snprintf(msg, sizeof(msg), "unknown tool: %s", tool_name);
@@ -3780,7 +3958,7 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
 
 /* ── Background update check ──────────────────────────────────── */
 
-#define UPDATE_CHECK_URL "https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest"
+#define UPDATE_CHECK_URL "https://api.github.com/repos/hodizoda/codebase-memory-mcp/releases/latest"
 
 static void *update_check_thread(void *arg) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;

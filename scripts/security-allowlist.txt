@@ -11,8 +11,8 @@ src/foundation/compat_fs.c:fork:cbm_exec_no_shell — fork+execvp for shell-free
 src/foundation/compat_fs.c:execvp:cbm_exec_no_shell — direct exec without shell interpretation
 
 # ── CLI: update command (user-initiated, interactive) ──────────────────────
+src/cli/cli.c:system:curl download of release binary (update cmd)
 src/cli/cli.c:cbm_popen:sha256 checksum verification (update cmd)
-src/cli/cli.c:cbm_popen:pgrep for kill_other_instances (hardcoded process name)
 src/cli/cli.c:popen:sha256 checksum computation via shasum
 
 # ── Watcher: git status polling (repo paths validated via cbm_validate_shell_arg) ──
@@ -45,7 +45,6 @@ src/ui/http_server.c:execl:exec indexing binary in child process
 
 # ── Allowed URLs ───────────────────────────────────────────────────────────
 # Format: URL:justification
-URL:https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest:update check
-URL:https://github.com/DeusData/codebase-memory-mcp/releases/latest/download:binary download + checksums
-URL:https://github.com/DeusData/codebase-memory-mcp/releases/latest:version check via redirect header
+URL:https://api.github.com/repos/hodizoda/codebase-memory-mcp/releases/latest:update check
+URL:https://github.com/hodizoda/codebase-memory-mcp/releases/latest/download/:binary download + checksums
 URL:http://127.0.0.1:UI server binding (localhost only)
