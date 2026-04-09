@@ -1113,6 +1113,56 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
 
         cbm_resolution_t res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn,
                                                     imp_keys, imp_vals, imp_count);
+
+        /* Layer 3: For obj.Method() calls with multiple candidates, try to
+         * resolve through the enclosing class's field types.
+         * If callee is "_service.DoWork" and the enclosing class has a
+         * field/property typed as "IService", prefer IService.Clear.
+         * Simplified heuristic: strip common prefixes (_,m_) from the obj name
+         * and check if a matching class/interface exists in the registry. */
+        if (res.qualified_name && res.candidate_count > 1) {
+            const char *dot = strchr(call->callee_name, '.');
+            if (dot) {
+                size_t plen = (size_t)(dot - call->callee_name);
+                char obj_name[256];
+                if (plen < sizeof(obj_name)) {
+                    memcpy(obj_name, call->callee_name, plen);
+                    obj_name[plen] = '\0';
+                    /* Strip C# field prefixes: _ or m_ */
+                    const char *type_hint = obj_name;
+                    if (type_hint[0] == '_') type_hint++;
+                    if (type_hint[0] == 'm' && type_hint[1] == '_') type_hint += 2;
+                    /* Capitalize first letter to match type name: service → Service */
+                    char type_name[256];
+                    snprintf(type_name, sizeof(type_name), "%s", type_hint);
+                    if (type_name[0] >= 'a' && type_name[0] <= 'z') {
+                        type_name[0] -= ('a' - 'A');
+                    }
+                    /* Also try with I prefix: Service → IService */
+                    char iface_name[256];
+                    snprintf(iface_name, sizeof(iface_name), "I%s", type_name);
+                    const char *method = dot + 1;
+
+                    /* Check if TypeName.Method or ITypeName.Method exists as a registered QN */
+                    const char **cands = NULL;
+                    int cand_count = 0;
+                    cbm_registry_find_by_name(rc->registry, method, &cands, &cand_count);
+                    for (int ci = 0; ci < cand_count; ci++) {
+                        /* Check if this candidate's QN contains the type or interface name */
+                        if (strstr(cands[ci], type_name) || strstr(cands[ci], iface_name)) {
+                            const cbm_gbuf_node_t *better = cbm_gbuf_find_by_qn(rc->main_gbuf, cands[ci]);
+                            if (better && better->id != source_node->id) {
+                                res.qualified_name = cands[ci];
+                                res.confidence = 0.85;
+                                res.strategy = "field_type_hint";
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,

@@ -109,14 +109,39 @@ static int common_prefix_len(const char *a, const char *b) {
 }
 
 /* Pick candidate with longest common prefix with caller module. */
+/* Check if a qualified name looks like a test/mock path. */
+static bool is_test_qn(const char *qn) {
+    if (!qn) return false;
+    /* Common test directory/file patterns in qualified names */
+    return (strstr(qn, "Test") != NULL || strstr(qn, "test") != NULL ||
+            strstr(qn, "Mock") != NULL || strstr(qn, "mock") != NULL ||
+            strstr(qn, "Stub") != NULL || strstr(qn, "stub") != NULL ||
+            strstr(qn, "Fake") != NULL || strstr(qn, "fake") != NULL ||
+            strstr(qn, "Fixture") != NULL || strstr(qn, "spec") != NULL);
+}
+
+/* Score a candidate for tiebreaking. Higher = better.
+ * Layer 1: Non-test code preferred over test code (+1000)
+ * Layer 2: Namespace proximity via common prefix length (+plen) */
+static int candidate_score(const char *candidate_qn, const char *module_qn) {
+    int score = 0;
+    /* Layer 1: deprioritize test/mock candidates */
+    if (!is_test_qn(candidate_qn)) {
+        score += 1000;
+    }
+    /* Layer 2: namespace proximity */
+    score += common_prefix_len(candidate_qn, module_qn);
+    return score;
+}
+
 static const char *best_by_import_distance(const char **candidates, int count,
                                            const char *module_qn) {
     const char *best = NULL;
-    int best_len = CBM_NOT_FOUND;
+    int best_score = CBM_NOT_FOUND;
     for (int i = 0; i < count; i++) {
-        int plen = common_prefix_len(candidates[i], module_qn);
-        if (plen > best_len) {
-            best_len = plen;
+        int score = candidate_score(candidates[i], module_qn);
+        if (score > best_score) {
+            best_score = score;
             best = candidates[i];
         }
     }
