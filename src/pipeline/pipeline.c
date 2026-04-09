@@ -30,6 +30,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #include "foundation/compat.h"
 #include "foundation/compat_thread.h"
 #include "foundation/profile.h"
+#include "pipeline/servicelink.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -795,6 +796,18 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         return rc;
     }
 
+    /* Cross-service protocol linking (GraphQL, gRPC, Kafka, etc.) */
+    if (!check_cancel(p)) {
+        struct timespec t;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        int sl_rc = cbm_pipeline_pass_servicelinks(ctx);
+        if (sl_rc < 0) {
+            cbm_log_warn("pass.servicelinks.error", "rc", itoa_buf(sl_rc));
+        }
+        cbm_log_info("pass.timing", "pass", "servicelinks", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t)));
+    }
+
     CBM_PROF_START(t_predump);
     run_predump_passes(p, ctx);
     CBM_PROF_END("pipeline", "3_predump_passes_total", t_predump);
@@ -805,6 +818,7 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         rc = dump_and_persist_hashes(p, files, file_count, &t);
         CBM_PROF_END("pipeline", "4_dump_and_persist", t_dump);
     }
+
     return rc;
 }
 
@@ -908,6 +922,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (rc != 0) {
         goto cleanup;
     }
+
 
     cbm_log_info("pipeline.done", "nodes", itoa_buf(cbm_gbuf_node_count(p->gbuf)), "edges",
                  itoa_buf(cbm_gbuf_edge_count(p->gbuf)), "elapsed_ms",

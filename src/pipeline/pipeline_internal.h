@@ -16,6 +16,9 @@
 #include "cbm.h"
 #include <stdatomic.h>
 
+/* Forward declaration for cross-repo endpoint registry (full type in servicelink.h) */
+struct cbm_sl_endpoint_list_t;
+
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
 /* Maximum byte budget for tree-sitter extraction per file */
@@ -68,6 +71,8 @@ typedef struct {
      * configs are an easy follow-on). NULL when no usable configs were found.
      * Owned by pipeline.c / pipeline_incremental.c. */
     const cbm_path_alias_collection_t *path_aliases;
+
+    struct cbm_sl_endpoint_list_t *endpoints; /* collected across all linkers, owned by pipeline */
 } cbm_pipeline_ctx_t;
 
 /* Get the current pipeline's package map (NULL if none). */
@@ -419,6 +424,8 @@ int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result
 
 /* Apply pre-computed couplings to the graph buffer (main thread only). */
 int cbm_pipeline_githistory_apply(cbm_pipeline_ctx_t *ctx, const cbm_githistory_result_t *result);
+
+int cbm_pipeline_pass_servicelinks(cbm_pipeline_ctx_t *ctx);
 
 /* Pre-dump pass: decorator tags enrichment (operates on gbuf). */
 int cbm_pipeline_pass_decorator_tags(cbm_gbuf_t *gbuf, const char *project);

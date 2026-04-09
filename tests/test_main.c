@@ -71,6 +71,7 @@ extern void suite_integration(void);
 extern void suite_incremental(void);
 extern void suite_simhash(void);
 extern void suite_stack_overflow(void);
+extern void suite_endpoint_registry(void);
 
 int main(void) {
     printf("\n  codebase-memory-mcp  C test suite\n");
@@ -187,6 +188,9 @@ int main(void) {
     /* Integration (end-to-end) */
     RUN_SUITE(integration);
     RUN_SUITE(incremental);
+
+    /* Cross-repo endpoint registry */
+    RUN_SUITE(endpoint_registry);
 
     /* Release sqlite3 internal caches so ASan doesn't report them as leaks */
     sqlite3_shutdown();
