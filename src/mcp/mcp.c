@@ -1024,10 +1024,21 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
         srv->store = NULL;
     }
 
-    /* Open project's .db file */
+    /* Open project's .db file — use query-only open (no SQLITE_OPEN_CREATE)
+     * to prevent ghost .db files for projects that haven't been indexed yet.
+     * Port of origin/main commit a109e97. */
     char path[1024];
     project_db_path(db_project, path, sizeof(path));
-    srv->store = cbm_store_open_path(path);
+    srv->store = cbm_store_open_path_query(path);
+    /* Auto-detect corrupt DB: if open succeeds but integrity check fails,
+     * close and delete the file so auto-index can rebuild it cleanly.
+     * Port of origin/main commit 68cc19e. */
+    if (srv->store && !cbm_store_check_integrity(srv->store)) {
+        cbm_store_close(srv->store);
+        srv->store = NULL;
+        (void)remove(path); /* delete corrupt file; auto-index will recreate */
+        fprintf(stderr, "[cbm] corrupt index deleted: %s\n", path);
+    }
     srv->owns_store = true;
     free(srv->current_project);
     srv->current_project = heap_strdup(db_project);
@@ -3738,6 +3749,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     char *content = cbm_mcp_get_string_arg(args, "content");
+    char *adr_buf = NULL; /* freed after yy_doc_to_str — yyjson holds pointer, not copy */
 
     if (!mode_str) {
         mode_str = heap_strdup("get");
@@ -3800,12 +3812,12 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
             (void)fseek(fp, 0, SEEK_END);
             long sz = ftell(fp);
             (void)fseek(fp, 0, SEEK_SET);
-            char *buf = malloc(sz + 1);
-            size_t n = fread(buf, 1, sz, fp);
-            buf[n] = '\0';
+            adr_buf = malloc(sz + 1);
+            size_t n = fread(adr_buf, 1, sz, fp);
+            adr_buf[n] = '\0';
             (void)fclose(fp);
-            yyjson_mut_obj_add_str(doc, root_obj, "content", buf);
-            free(buf);
+            yyjson_mut_obj_add_str(doc, root_obj, "content", adr_buf);
+            /* do NOT free adr_buf here: yyjson stores the pointer, not a copy */
         } else {
             yyjson_mut_obj_add_str(doc, root_obj, "content", "");
             yyjson_mut_obj_add_str(doc, root_obj, "status", "no_adr");
@@ -3814,6 +3826,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+    free(adr_buf); /* safe to free now — doc has been serialized */
     free(root_path);
     free(project);
     free(mode_str);
@@ -4955,8 +4968,19 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
 
     for (;;) {
         /* Poll with idle timeout so we can evict unused stores between requests.
-         * MCP is request-response (one line at a time), so mixing poll() on the
-         * raw fd with getline() on the buffered FILE* is safe in practice. */
+         *
+         * IMPORTANT: poll() operates on the raw fd, but getline() reads from a
+         * buffered FILE*. When a client sends multiple messages in rapid
+         * succession, the first getline() call may drain ALL kernel data into
+         * libc's internal FILE* buffer. Subsequent poll() calls then see an
+         * empty kernel fd and block for STORE_IDLE_TIMEOUT_S seconds even
+         * though the next messages are already in the FILE* buffer.
+         *
+         * Fix (Unix): use a two-phase approach —
+         *   Phase 1: non-blocking poll (timeout=0) to check the kernel fd.
+         *   Phase 2: if Phase 1 returns 0, peek the FILE* buffer via fgetc/
+         *            ungetc to detect data buffered by a prior getline() call.
+         *   Phase 3: only if both phases confirm no data, do blocking poll. */
 #ifdef _WIN32
         /* Windows: WaitForSingleObject on stdin handle */
         HANDLE hStdin = (HANDLE)_get_osfhandle(fd);
@@ -4970,15 +4994,33 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
         }
 #else
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int pr = poll(&pfd, 1, STORE_IDLE_TIMEOUT_S * 1000);
+        /* Phase 1: non-blocking poll — catches data in the kernel fd. */
+        int pr = poll(&pfd, 1, 0);
 
         if (pr < 0) {
             break; /* error or signal */
         }
         if (pr == 0) {
-            /* Timeout — evict idle store to free resources */
-            cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
-            continue;
+            /* Raw fd appears empty. Phase 2: peek the FILE* buffer to detect
+             * data already drained from the kernel fd by a prior getline(). */
+            int c = fgetc(in);
+            if (c == EOF) {
+                if (feof(in)) {
+                    break; /* true EOF */
+                }
+                /* No buffered data — Phase 3: blocking poll with idle timeout. */
+                pr = poll(&pfd, 1, STORE_IDLE_TIMEOUT_S * 1000);
+                if (pr < 0) {
+                    break;
+                }
+                if (pr == 0) {
+                    cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
+                    continue;
+                }
+            } else {
+                /* Buffered data found — push back and fall through to getline. */
+                (void)ungetc(c, in);
+            }
         }
 #endif
 

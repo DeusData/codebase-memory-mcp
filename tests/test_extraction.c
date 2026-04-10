@@ -1995,6 +1995,39 @@ TEST(python_regular_module_qn_unchanged) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ * O(N) import extractor stress test
+ * TDD for B8: origin/main commit 178bea2 rewrote 7 import extractors
+ * to use TSTreeCursor iteration instead of O(N²) indexed loops.
+ * This test verifies O(N) behaviour: would hang indefinitely with
+ * the O(N²) loop on 5,000 imports.
+ * Ported from [origin/main] tests/test_extraction.c:1748-1773.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+TEST(import_stress_go) {
+    /* Stress test: 5,000 single-line Go imports.
+     * Verifies O(N) behaviour — would hang indefinitely with the O(N²) loop. */
+    const int N = 5000;
+    /* Each line: import "pkg/NNNNN"\n  = ~20 chars; total ~100KB */
+    int buf_size = N * 24 + 64;
+    char *src = malloc((size_t)buf_size);
+    ASSERT_NOT_NULL(src);
+
+    int pos = 0;
+    pos += snprintf(src + pos, (size_t)(buf_size - pos), "package stress\n");
+    for (int k = 0; k < N; k++) {
+        pos += snprintf(src + pos, (size_t)(buf_size - pos), "import \"pkg/%05d\"\n", k);
+    }
+
+    CBMFileResult *r = extract(src, CBM_LANG_GO, "t", "stress.go");
+    free(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(r->imports.count, N);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * Suite
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -2180,6 +2213,10 @@ SUITE(extraction) {
     RUN_TEST(python_init_nested_module_qn);
     RUN_TEST(js_index_module_qn_not_collide_with_folder);
     RUN_TEST(python_regular_module_qn_unchanged);
+
+    /* B8: O(N) import extractor stress test
+     * Ported from [origin/main] tests/test_extraction.c:1748-1773 (commit 178bea2) */
+    RUN_TEST(import_stress_go);
 
     cbm_shutdown();
 }

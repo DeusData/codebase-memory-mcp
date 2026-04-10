@@ -262,15 +262,18 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory) {
     if (in_memory) {
         rc = exec_sql(s, "PRAGMA synchronous = OFF;");
     } else {
+        /* busy_timeout must be set BEFORE journal_mode=WAL so that lock
+         * contention during WAL mode activation is handled with a timeout
+         * rather than an immediate SQLITE_BUSY error. */
+        rc = exec_sql(s, "PRAGMA busy_timeout = 10000;");
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
         rc = exec_sql(s, "PRAGMA journal_mode = WAL;");
         if (rc != CBM_STORE_OK) {
             return rc;
         }
         rc = exec_sql(s, "PRAGMA synchronous = NORMAL;");
-        if (rc != CBM_STORE_OK) {
-            return rc;
-        }
-        rc = exec_sql(s, "PRAGMA busy_timeout = 10000;");
         if (rc != CBM_STORE_OK) {
             return rc;
         }
@@ -376,6 +379,71 @@ cbm_store_t *cbm_store_open_path(const char *db_path) {
     return store_open_internal(db_path, false);
 }
 
+/* Open a DB read-write but without SQLITE_OPEN_CREATE, so no ghost .db file
+ * is created for unknown/unindexed projects. Returns NULL if file absent. */
+cbm_store_t *cbm_store_open_path_query(const char *db_path) {
+    if (!db_path) {
+        return NULL;
+    }
+
+    cbm_store_t *s = calloc(1, sizeof(cbm_store_t));
+    if (!s) {
+        return NULL;
+    }
+
+    /* No SQLITE_OPEN_CREATE — returns SQLITE_CANTOPEN if file absent. */
+    int rc = sqlite3_open_v2(db_path, &s->db, SQLITE_OPEN_READWRITE, NULL);
+    if (rc != SQLITE_OK) {
+        free(s);
+        return NULL;
+    }
+
+    s->db_path = heap_strdup(db_path);
+
+    /* Register REGEXP functions (same as store_open_internal). */
+    sqlite3_create_function(s->db, "regexp", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
+                            sqlite_regexp, NULL, NULL);
+    sqlite3_create_function(s->db, "iregexp", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
+                            sqlite_iregexp, NULL, NULL);
+
+    if (configure_pragmas(s, false) != CBM_STORE_OK) {
+        sqlite3_close(s->db);
+        free((void *)s->db_path);
+        free(s);
+        return NULL;
+    }
+
+    return s;
+}
+
+bool cbm_store_check_integrity(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return false;
+    }
+
+    /* Each project gets its own .db file, so the projects table should have
+     * exactly 1 row. More than 5 rows indicates a corrupt/merged database. */
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(s->db, "SELECT count(*) FROM projects;", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        return false;
+    }
+
+    bool ok = true;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        int row_count = sqlite3_column_int(stmt, 0);
+        if (row_count > 5) {
+            fprintf(stderr, "ERROR store.corrupt table=projects rows=%d (expected 1)\n",
+                    row_count);
+            ok = false;
+        }
+    } else {
+        ok = false;
+    }
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
 cbm_store_t *cbm_store_open(const char *project) {
     if (!project) {
         return NULL;
@@ -462,11 +530,13 @@ int cbm_store_rollback(cbm_store_t *s) {
 /* ── Bulk write ─────────────────────────────────────────────────── */
 
 int cbm_store_begin_bulk(cbm_store_t *s) {
-    int rc = exec_sql(s, "PRAGMA journal_mode = MEMORY;");
-    if (rc != CBM_STORE_OK) {
-        return rc;
-    }
-    rc = exec_sql(s, "PRAGMA synchronous = OFF;");
+    /* Stay in WAL mode throughout bulk writes. Switching to MEMORY journal
+     * mode would make the database unrecoverable if the process crashes
+     * mid-write because the in-memory rollback journal is lost on crash.
+     * WAL mode is inherently crash-safe: uncommitted WAL entries are simply
+     * discarded on the next open. Performance is preserved via
+     * synchronous=OFF and a larger cache, which are safe with WAL. */
+    int rc = exec_sql(s, "PRAGMA synchronous = OFF;");
     if (rc != CBM_STORE_OK) {
         return rc;
     }
@@ -474,11 +544,8 @@ int cbm_store_begin_bulk(cbm_store_t *s) {
 }
 
 int cbm_store_end_bulk(cbm_store_t *s) {
-    int rc = exec_sql(s, "PRAGMA journal_mode = WAL;");
-    if (rc != CBM_STORE_OK) {
-        return rc;
-    }
-    rc = exec_sql(s, "PRAGMA synchronous = NORMAL;");
+    /* Restore normal durability settings; WAL mode was preserved throughout. */
+    int rc = exec_sql(s, "PRAGMA synchronous = NORMAL;");
     if (rc != CBM_STORE_OK) {
         return rc;
     }
@@ -1937,16 +2004,20 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         BIND_TEXT(like_pattern);
     }
 
-    /* Exclude labels: add NOT IN clause directly (no bind params — values are code-provided) */
+    /* Exclude labels: use ?N parameterized placeholders to prevent SQL injection.
+     * Values come from MCP tool call args (user-controlled JSON), so direct
+     * snprintf interpolation is a SQL injection vector.
+     * Port of origin/main commit 6a6127c. */
     if (params->exclude_labels) {
         char excl_clause[512] = "n.label NOT IN (";
         int elen = (int)strlen(excl_clause);
-        for (int i = 0; params->exclude_labels[i]; i++) {
+        for (int i = 0; params->exclude_labels[i] && bind_idx < 31; i++) {
             if (i > 0) {
                 elen += snprintf(excl_clause + elen, sizeof(excl_clause) - elen, ",");
             }
-            elen += snprintf(excl_clause + elen, sizeof(excl_clause) - elen, "'%s'",
-                             params->exclude_labels[i]);
+            elen += snprintf(excl_clause + elen, sizeof(excl_clause) - elen, "?%d",
+                             bind_idx + 1);
+            BIND_TEXT(params->exclude_labels[i]);
         }
         snprintf(excl_clause + elen, sizeof(excl_clause) - (size_t)elen, ")");
         ADD_WHERE(excl_clause);
@@ -2187,17 +2258,21 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
     }
     out->root = root;
 
-    /* Build edge type IN clause */
-    char types_clause[512] = "'CALLS'";
+    /* Build edge type IN clause using ?N parameterized placeholders.
+     * edge_types[] values come from MCP tool call args (user-controlled JSON),
+     * so direct snprintf interpolation is a SQL injection vector.
+     * Port of origin/main commit 6a6127c. */
+    char types_clause[512] = "?1"; /* default: single placeholder for "CALLS" */
+    int bfs_et_count = edge_type_count > 0 ? edge_type_count : 1;
     if (edge_type_count > 0) {
         int tlen = 0;
-        for (int i = 0; i < edge_type_count; i++) {
+        for (int i = 0; i < edge_type_count && i < 16; i++) {
             if (i > 0) {
                 tlen += snprintf(types_clause + tlen, sizeof(types_clause) - tlen, ",");
             }
-            tlen +=
-                snprintf(types_clause + tlen, sizeof(types_clause) - tlen, "'%s'", edge_types[i]);
+            tlen += snprintf(types_clause + tlen, sizeof(types_clause) - tlen, "?%d", i + 1);
         }
+        bfs_et_count = edge_type_count < 16 ? edge_type_count : 16;
     }
 
     /* Build recursive CTE for BFS */
@@ -2242,6 +2317,16 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         return CBM_STORE_ERR;
     }
 
+    /* Bind edge type values as parameters — prevents SQL injection */
+    if (edge_type_count > 0) {
+        for (int i = 0; i < bfs_et_count; i++) {
+            sqlite3_bind_text(stmt, i + 1, edge_types[i], -1, SQLITE_STATIC);
+        }
+    } else {
+        /* Default: only "CALLS" edges */
+        sqlite3_bind_text(stmt, 1, "CALLS", -1, SQLITE_STATIC);
+    }
+
     int cap = 16;
     int n = 0;
     cbm_node_hop_t *visited = malloc(cap * sizeof(cbm_node_hop_t));
@@ -2271,6 +2356,8 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
                              (long long)out->visited[i].node.id);
         }
 
+        /* Build edge query using the same ?N placeholders for edge types.
+         * types_clause already contains "?1,?2,..." — safe placeholder string. */
         char edge_sql[8192];
         snprintf(edge_sql, sizeof(edge_sql),
                  "SELECT n1.name, n2.name, e.type, "
@@ -2287,6 +2374,14 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         sqlite3_stmt *estmt = NULL;
         rc = sqlite3_prepare_v2(s->db, edge_sql, -1, &estmt, NULL);
         if (rc == SQLITE_OK) {
+            /* Bind edge type values as parameters — prevents SQL injection */
+            if (edge_type_count > 0) {
+                for (int i = 0; i < bfs_et_count; i++) {
+                    sqlite3_bind_text(estmt, i + 1, edge_types[i], -1, SQLITE_STATIC);
+                }
+            } else {
+                sqlite3_bind_text(estmt, 1, "CALLS", -1, SQLITE_STATIC);
+            }
             int ecap = 8;
             int en = 0;
             cbm_edge_info_t *edges = malloc(ecap * sizeof(cbm_edge_info_t));
