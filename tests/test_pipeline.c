@@ -3340,6 +3340,135 @@ TEST(infra_is_env_file) {
     PASS();
 }
 
+/* ── Infrascan: K8s / Kustomize detection ───────────────────────── */
+
+TEST(infra_is_kustomize_file) {
+    ASSERT(cbm_is_kustomize_file("kustomization.yaml"));
+    ASSERT(cbm_is_kustomize_file("kustomization.yml"));
+    ASSERT(cbm_is_kustomize_file("KUSTOMIZATION.YAML")); /* case-insensitive */
+    ASSERT(!cbm_is_kustomize_file("deployment.yaml"));
+    ASSERT(!cbm_is_kustomize_file("kustomize.yaml"));
+    ASSERT(!cbm_is_kustomize_file(NULL));
+    PASS();
+}
+
+TEST(infra_is_k8s_manifest) {
+    const char *deploy = "apiVersion: apps/v1\nkind: Deployment\n";
+    const char *plain  = "name: foo\nvalue: bar\n";
+    const char *kust   = "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n";
+
+    ASSERT(cbm_is_k8s_manifest("deployment.yaml", deploy));
+    ASSERT(!cbm_is_k8s_manifest("deployment.yaml", plain));
+    /* kustomize file should return false even if it has apiVersion */
+    ASSERT(!cbm_is_k8s_manifest("kustomization.yaml", kust));
+    ASSERT(!cbm_is_k8s_manifest(NULL, deploy));
+    ASSERT(!cbm_is_k8s_manifest("deployment.yaml", NULL));
+    PASS();
+}
+
+/* ── K8s extraction tests ───────────────────────────────────────── */
+
+TEST(k8s_extract_kustomize) {
+    const char *src =
+        "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+        "kind: Kustomization\n"
+        "resources:\n"
+        "  - deployment.yaml\n"
+        "  - service.yaml\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_KUSTOMIZE,
+                                        "myproj", "base/kustomization.yaml",
+                                        0, NULL, NULL);
+    ASSERT(r != NULL);
+    ASSERT_GTE(r->imports.count, 2);
+
+    bool found_deploy = false, found_svc = false;
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].module_path &&
+            strcmp(r->imports.items[i].module_path, "deployment.yaml") == 0)
+            found_deploy = true;
+        if (r->imports.items[i].module_path &&
+            strcmp(r->imports.items[i].module_path, "service.yaml") == 0)
+            found_svc = true;
+    }
+    ASSERT_TRUE(found_deploy);
+    ASSERT_TRUE(found_svc);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(k8s_extract_manifest) {
+    const char *src =
+        "apiVersion: apps/v1\n"
+        "kind: Deployment\n"
+        "metadata:\n"
+        "  name: my-app\n"
+        "  namespace: production\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S,
+                                        "myproj", "k8s/deployment.yaml",
+                                        0, NULL, NULL);
+    ASSERT(r != NULL);
+    ASSERT_GTE(r->defs.count, 1);
+
+    bool found_resource = false;
+    for (int d = 0; d < r->defs.count; d++) {
+        if (r->defs.items[d].label &&
+            strcmp(r->defs.items[d].label, "Resource") == 0 &&
+            r->defs.items[d].name &&
+            strstr(r->defs.items[d].name, "Deployment") != NULL)
+            found_resource = true;
+    }
+    ASSERT_TRUE(found_resource);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(k8s_extract_manifest_no_name) {
+    const char *src = "apiVersion: apps/v1\nkind: Deployment\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S,
+                                        "myproj", "k8s/deploy.yaml", 0, NULL, NULL);
+    ASSERT(r != NULL);
+    /* No crash — defs count may be 0 because metadata.name is absent */
+    ASSERT(!r->has_error);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(k8s_extract_manifest_multidoc) {
+    /* Two-document YAML separated by "---".
+     * extract_k8s_manifest contains a "break" after the first successful push,
+     * so it processes only the first document that has both kind and
+     * metadata.name.  This test pins that behaviour: the first document's
+     * resource must be present and no crash must occur. */
+    const char *src =
+        "apiVersion: apps/v1\n"
+        "kind: Deployment\n"
+        "metadata:\n"
+        "  name: my-app\n"
+        "---\n"
+        "apiVersion: v1\n"
+        "kind: Service\n"
+        "metadata:\n"
+        "  name: my-svc\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S,
+                                        "myproj", "k8s/multi.yaml", 0, NULL, NULL);
+    ASSERT(r != NULL);
+    ASSERT(!r->has_error);
+    /* First document's resource must be present */
+    int found = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].label && strcmp(r->defs.items[i].label, "Resource") == 0 &&
+            r->defs.items[i].name && strcmp(r->defs.items[i].name, "Deployment/my-app") == 0) {
+            found = 1;
+        }
+    }
+    ASSERT(found);
+    ASSERT(r->defs.count >= 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Infrascan: cleanJSONBrackets ───────────────────────────────── */
 
 TEST(infra_clean_json_brackets) {
@@ -4809,7 +4938,14 @@ SUITE(pipeline) {
     RUN_TEST(infra_is_shell_script);
     RUN_TEST(infra_is_dockerfile);
     RUN_TEST(infra_is_env_file);
+    RUN_TEST(infra_is_kustomize_file);
+    RUN_TEST(infra_is_k8s_manifest);
     RUN_TEST(infra_clean_json_brackets);
+    /* K8s extraction tests */
+    RUN_TEST(k8s_extract_kustomize);
+    RUN_TEST(k8s_extract_manifest);
+    RUN_TEST(k8s_extract_manifest_no_name);
+    RUN_TEST(k8s_extract_manifest_multidoc);
     RUN_TEST(infra_secret_detection);
     /* Infrascan: Dockerfile parser */
     RUN_TEST(infra_parse_dockerfile_multistage);

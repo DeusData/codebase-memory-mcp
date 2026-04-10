@@ -544,6 +544,14 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     }
 
     /* Post-extraction passes (shared by both parallel and sequential) */
+    if (!check_cancel(p)) {
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        rc = cbm_pipeline_pass_k8s(&ctx, files, file_count);
+        if (rc != 0) { /* log warning, continue */
+        }
+        cbm_log_info("pass.timing", "pass", "k8s", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+    }
+
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     rc = cbm_pipeline_pass_tests(&ctx, files, file_count);
     if (rc != 0) {

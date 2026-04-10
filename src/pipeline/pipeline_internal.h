@@ -218,6 +218,8 @@ bool cbm_is_compose_file(const char *name);
 bool cbm_is_cloudbuild_file(const char *name);
 bool cbm_is_env_file(const char *name);
 bool cbm_is_shell_script(const char *name, const char *ext);
+bool cbm_is_kustomize_file(const char *name);
+bool cbm_is_k8s_manifest(const char *name, const char *content);
 
 /* Secret detection */
 bool cbm_is_secret_binding(const char *key, const char *value);
@@ -386,6 +388,10 @@ int cbm_pipeline_pass_decorator_tags(cbm_gbuf_t *gbuf, const char *project);
 /* Pre-dump pass: config ↔ code linking.
  * Uses prescan cache when available, falls back to disk reads. */
 int cbm_pipeline_pass_configlink(cbm_pipeline_ctx_t *ctx);
+
+/* K8s / Kustomize pass: emits Module nodes for kustomization.yaml overlays and
+ * Resource nodes for generic Kubernetes manifests. */
+int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
 
 /* Pre-dump pass: structural invariant enforcement (Method→Class, Field→Class edges). */
 void cbm_pipeline_pass_normalize(cbm_gbuf_t *gb);

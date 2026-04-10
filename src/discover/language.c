@@ -348,6 +348,8 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_FORM] = "FORM",
     [CBM_LANG_MAGMA] = "Magma",
     [CBM_LANG_WOLFRAM] = "Wolfram",
+    [CBM_LANG_KUSTOMIZE] = "Kustomize",
+    [CBM_LANG_K8S] = "Kubernetes",
 };
 
 /* ── Public API ──────────────────────────────────────────────────── */
