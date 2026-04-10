@@ -80,6 +80,7 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
 static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
                                  const CBMLangSpec *spec);
 static TSNode find_class_body(TSNode class_node, CBMLanguage lang);
+static void push_var_def(CBMExtractCtx *ctx, const char *name, TSNode node);
 static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 
 // --- Helpers ---
@@ -1712,26 +1713,7 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     if (ctx->enclosing_class_qn) {
         class_qn = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, name);
     } else {
-        /* For C#: use directory path instead of file path for class QN.
-         * This merges partial class definitions (split across multiple .cs files
-         * in the same directory) into a single Class node in the graph.
-         * e.g., Controller.cs and ControllerMessaging.cs both get
-         * "project.src.Dir.Controller" instead of separate QNs per file. */
-        if (ctx->language == CBM_LANG_CSHARP && ctx->rel_path) {
-            const char *last_slash = strrchr(ctx->rel_path, '/');
-            if (last_slash) {
-                char dir_path[512];
-                int dlen = (int)(last_slash - ctx->rel_path);
-                if (dlen >= (int)sizeof(dir_path)) dlen = (int)sizeof(dir_path) - 1;
-                memcpy(dir_path, ctx->rel_path, (size_t)dlen);
-                dir_path[dlen] = '\0';
-                class_qn = cbm_fqn_compute(a, ctx->project, dir_path, name);
-            } else {
-                class_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
-            }
-        } else {
-            class_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
-        }
+        class_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
     }
     const char *label = class_label_for_kind(kind);
 
@@ -1764,8 +1746,11 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     cbm_defs_push(&ctx->result->defs, a, def);
 
     /* Extract enum members as Variable nodes (C#, Java, TypeScript).
-     * Enum bodies contain enum_member_declaration / enum_assignment / enum_member nodes. */
+     * Push as class-context vars so DEFINES edges are created from Enum → member.
+     * Save/restore enclosing_class_qn to get proper parent attribution. */
     if (strcmp(label, "Enum") == 0) {
+        const char *saved_class_qn = ctx->enclosing_class_qn;
+        ctx->enclosing_class_qn = class_qn;
         TSNode body = find_class_body(node, ctx->language);
         if (!ts_node_is_null(body)) {
             uint32_t mc = ts_node_named_child_count(body);
@@ -1784,20 +1769,13 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
                     if (!ts_node_is_null(mname)) {
                         char *member_name = cbm_node_text(a, mname, ctx->source);
                         if (member_name && member_name[0]) {
-                            CBMDefinition mdef;
-                            memset(&mdef, 0, sizeof(mdef));
-                            mdef.name = member_name;
-                            mdef.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, member_name);
-                            mdef.label = "Variable";
-                            mdef.file_path = ctx->rel_path;
-                            mdef.start_line = ts_node_start_point(member).row + TS_LINE_OFFSET;
-                            mdef.end_line = ts_node_end_point(member).row + TS_LINE_OFFSET;
-                            cbm_defs_push(&ctx->result->defs, a, mdef);
+                            push_var_def(ctx, member_name, member);
                         }
                     }
                 }
             }
         }
+        ctx->enclosing_class_qn = saved_class_qn;
     }
 
     // Extract methods inside the class
@@ -2266,7 +2244,13 @@ static void push_var_def(CBMExtractCtx *ctx, const char *name, TSNode node) {
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    /* If inside a class/enum context, use the class QN as prefix.
+     * This creates proper parent→child DEFINES edges (Enum→member). */
+    if (ctx->enclosing_class_qn) {
+        def.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, name);
+    } else {
+        def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    }
     def.label = "Variable";
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;

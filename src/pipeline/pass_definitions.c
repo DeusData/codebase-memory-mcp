@@ -234,6 +234,25 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
             cbm_gbuf_insert_edge(ctx->gbuf, parent->id, node_id, "DEFINES_METHOD", "{}");
         }
     }
+
+    /* Enum→member DEFINES: if a Variable's QN contains a parent Enum QN,
+     * create a DEFINES edge from the Enum to the member.
+     * The enum member QN is "EnumQN.MemberName" — strip last segment to find parent. */
+    if (node_id > 0 && def->label && strcmp(def->label, "Variable") == 0 && def->qualified_name) {
+        const char *last_dot = strrchr(def->qualified_name, '.');
+        if (last_dot && last_dot > def->qualified_name) {
+            char parent_qn[1024];
+            int plen = (int)(last_dot - def->qualified_name);
+            if (plen < (int)sizeof(parent_qn)) {
+                memcpy(parent_qn, def->qualified_name, (size_t)plen);
+                parent_qn[plen] = '\0';
+                const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(ctx->gbuf, parent_qn);
+                if (parent && parent->label && strcmp(parent->label, "Enum") == 0) {
+                    cbm_gbuf_insert_edge(ctx->gbuf, parent->id, node_id, "DEFINES", "{}");
+                }
+            }
+        }
+    }
 }
 
 /* Create IMPORTS edges for one file's imports. */

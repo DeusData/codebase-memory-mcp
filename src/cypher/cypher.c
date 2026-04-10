@@ -167,6 +167,8 @@ static const kw_entry_t keywords[] = {
     {"tolower", TOK_TOLOWER},
     {"toupper", TOK_TOUPPER},
     {"tostring", TOK_TOSTRING},
+    {"type", TOK_TYPE_FUNC},
+    {"labels", TOK_LABELS_FUNC},
     {"CASE", TOK_CASE},
     {"WHEN", TOK_WHEN},
     {"THEN", TOK_THEN},
@@ -1001,7 +1003,8 @@ static bool is_aggregate_tok(cbm_token_type_t t) {
 
 /* Helper: is token a string function? */
 static bool is_string_func_tok(cbm_token_type_t t) {
-    return (t == TOK_TOLOWER || t == TOK_TOUPPER || t == TOK_TOSTRING) != 0;
+    return (t == TOK_TOLOWER || t == TOK_TOUPPER || t == TOK_TOSTRING ||
+            t == TOK_TYPE_FUNC || t == TOK_LABELS_FUNC) != 0;
 }
 
 /* Token type to function name */
@@ -1032,6 +1035,10 @@ static const char *str_func_name(cbm_token_type_t t) {
         return "toUpper";
     case TOK_TOSTRING:
         return "toString";
+    case TOK_TYPE_FUNC:
+        return "type";
+    case TOK_LABELS_FUNC:
+        return "labels";
     default:
         return "";
     }
@@ -2529,9 +2536,21 @@ static const char *project_item(binding_t *b, cbm_return_item_t *item, char *fun
         return eval_case_expr(item->kase, b);
     }
     const char *raw = binding_get_virtual(b, item->variable, item->property);
-    if (item->func && (strcmp(item->func, "toLower") == 0 || strcmp(item->func, "toUpper") == 0 ||
-                       strcmp(item->func, "toString") == 0)) {
-        return apply_string_func(item->func, raw, func_buf, buf_sz);
+    if (item->func) {
+        if (strcmp(item->func, "toLower") == 0 || strcmp(item->func, "toUpper") == 0 ||
+            strcmp(item->func, "toString") == 0) {
+            return apply_string_func(item->func, raw, func_buf, buf_sz);
+        }
+        /* type(r) — return edge type for a relationship variable */
+        if (strcmp(item->func, "type") == 0) {
+            cbm_edge_t *e = binding_get_edge(b, item->variable);
+            return e && e->type ? e->type : "";
+        }
+        /* labels(n) — return node label for a node variable */
+        if (strcmp(item->func, "labels") == 0) {
+            cbm_node_t *n = binding_get(b, item->variable);
+            return n && n->label ? n->label : "";
+        }
     }
     return raw;
 }

@@ -59,6 +59,10 @@ typedef enum {
     TOK_TOUPPER,
     TOK_TOSTRING,
 
+    /* Introspection functions */
+    TOK_TYPE_FUNC,   /* type(r) → edge type */
+    TOK_LABELS_FUNC, /* labels(n) → node label */
+
     /* CASE expression */
     TOK_CASE,
     TOK_WHEN,

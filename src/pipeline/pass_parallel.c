@@ -650,6 +650,24 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
             cbm_gbuf_insert_edge(ctx->gbuf, parent->id, def_node->id, "DEFINES_METHOD", "{}");
         }
     }
+    /* Enum→member DEFINES: if this Variable's parent (QN prefix) is an Enum,
+     * create a DEFINES edge from Enum to member. */
+    if (def_node && strcmp(def->label, "Variable") == 0 && def->qualified_name) {
+        const char *last_dot = strrchr(def->qualified_name, '.');
+        if (last_dot && last_dot > def->qualified_name) {
+            char parent_qn[1024];
+            int plen = (int)(last_dot - def->qualified_name);
+            if (plen < (int)sizeof(parent_qn)) {
+                memcpy(parent_qn, def->qualified_name, (size_t)plen);
+                parent_qn[plen] = '\0';
+                const cbm_gbuf_node_t *enum_parent = cbm_gbuf_find_by_qn(ctx->gbuf, parent_qn);
+                if (enum_parent && enum_parent->label && strcmp(enum_parent->label, "Enum") == 0) {
+                    cbm_gbuf_insert_edge(ctx->gbuf, enum_parent->id, def_node->id, "DEFINES", "{}");
+                    edges++;
+                }
+            }
+        }
+    }
     return edges;
 }
 
