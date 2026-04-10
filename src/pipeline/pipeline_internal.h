@@ -396,6 +396,12 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
 /* Pre-dump pass: structural invariant enforcement (Method→Class, Field→Class edges). */
 void cbm_pipeline_pass_normalize(cbm_gbuf_t *gb);
 
+/* Incremental re-index: compare discovered files against stored hashes,
+ * re-parse only changed files, merge new nodes/edges into the open store,
+ * and persist updated file hashes. Returns 0 on success. */
+int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path,
+                                 cbm_file_info_t *files, int file_count);
+
 /* ── Env URL scanner (pass_envscan.c) ────────────────────────────── */
 
 typedef struct {
