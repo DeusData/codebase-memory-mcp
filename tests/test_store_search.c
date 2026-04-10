@@ -948,6 +948,113 @@ TEST(store_batch_count_degrees) {
     PASS();
 }
 
+/* ── SQL injection resistance for exclude_labels ─────────────────── */
+/* TDD test for C3: origin/main commit 6a6127c switched exclude_labels
+ * and edge_types filter clauses to sqlite3_bind_text() parameterized
+ * binding.  This test verifies that a SQL injection payload in an
+ * exclude_labels value cannot corrupt or destroy the database.
+ *
+ * With the old snprintf approach [api-consolidation store.c:2008-2019]
+ * a value like "') DROP TABLE nodes; --" would be interpolated directly
+ * into the SQL string and could be executed.  With bind params the value
+ * is treated as a literal string and cannot break out of the IN clause.
+ */
+TEST(store_search_exclude_labels_sqli) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t n1 = {.project = "test",
+                     .label = "Function",
+                     .name = "safe_fn",
+                     .qualified_name = "test.safe_fn",
+                     .file_path = "a.go"};
+    cbm_node_t n2 = {.project = "test",
+                     .label = "Class",
+                     .name = "SafeClass",
+                     .qualified_name = "test.SafeClass",
+                     .file_path = "b.go"};
+    cbm_store_upsert_node(s, &n1);
+    cbm_store_upsert_node(s, &n2);
+
+    /* SQL injection payload in the exclude_labels array. With snprintf
+     * interpolation [api-consolidation store.c:2015] this would produce:
+     *   n.label NOT IN ('') DROP TABLE nodes; --')
+     * which breaks out of the literal and executes a DROP TABLE.
+     * With bind params the payload is a literal string comparison and
+     * cannot execute arbitrary SQL. */
+    const char *excl[] = {"') DROP TABLE nodes; --", NULL};
+    cbm_search_params_t params = {.project = "test",
+                                  .limit = 100,
+                                  .min_degree = -1,
+                                  .max_degree = -1,
+                                  .exclude_labels = excl};
+    cbm_search_output_t out = {0};
+    int rc = cbm_store_search(s, &params, &out);
+
+    /* The search must not fail — parameterized binding ensures the
+     * injection payload is treated as a literal string, not SQL. */
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    /* Both nodes (Function, Class) should still be present — nodes
+     * table must NOT have been dropped by the injection attempt. */
+    ASSERT_EQ(out.total, 2);
+    cbm_store_search_free(&out);
+
+    /* Double-check: search again with no exclusions to confirm table intact */
+    cbm_search_params_t params2 = {
+        .project = "test", .limit = 100, .min_degree = -1, .max_degree = -1};
+    cbm_search_output_t out2 = {0};
+    rc = cbm_store_search(s, &params2, &out2);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(out2.total, 2);
+    cbm_store_search_free(&out2);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── SQL injection resistance for BFS edge_types ─────────────────── */
+/* Same principle: verify that a SQL injection payload in an edge_types
+ * value passed to cbm_store_bfs() cannot corrupt the database.
+ *
+ * The types_clause in [api-consolidation store.c:2258-2268] builds
+ *   'CALLS','IMPORTS'
+ * with snprintf.  A payload like "','') DROP TABLE edges; --" would
+ * break out of the IN clause with the old approach.  With bind params
+ * it is treated as a literal and causes no harm. */
+TEST(store_bfs_edge_types_sqli) {
+    int64_t ids[3];
+    cbm_store_t *s = setup_search_store(ids);
+
+    /* SQL injection payload as an edge type.
+     * cbm_store_bfs signature [api-consolidation src/store/store.h:365]:
+     *   int cbm_store_bfs(cbm_store_t *s, int64_t start_id,
+     *                     const char *direction, const char **edge_types,
+     *                     int edge_type_count, int max_depth,
+     *                     int max_results, cbm_traverse_result_t *out); */
+    const char *edge_types_sqli[] = {"','') DROP TABLE edges; --"};
+    cbm_traverse_result_t result = {0};
+    int rc = cbm_store_bfs(s, ids[0], "outbound",
+                           edge_types_sqli, 1, 3, 50, &result);
+
+    /* Must not crash or corrupt the database.  The injection payload
+     * matches no real edge type, so we expect 0 visited but CBM_STORE_OK. */
+    ASSERT_TRUE(rc == CBM_STORE_OK || rc == CBM_STORE_NOT_FOUND);
+
+    /* Verify edges table still intact: BFS with a real edge type must work */
+    cbm_store_traverse_free(&result);
+    cbm_traverse_result_t result2 = {0};
+    const char *real_types[] = {"CALLS"};
+    rc = cbm_store_bfs(s, ids[0], "outbound",
+                       real_types, 1, 3, 50, &result2);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    /* Should find ids[1] (ProcessOrder) */
+    ASSERT_GTE(result2.visited_count, 1);
+    cbm_store_traverse_free(&result2);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 SUITE(store_search) {
     RUN_TEST(store_search_by_label);
     RUN_TEST(store_search_by_name_pattern);
@@ -977,4 +1084,7 @@ SUITE(store_search) {
     RUN_TEST(store_ensure_case_insensitive);
     RUN_TEST(store_strip_case_flag);
     RUN_TEST(store_batch_count_degrees);
+    /* C3: SQL injection resistance tests (TDD for parameterized bind port) */
+    RUN_TEST(store_search_exclude_labels_sqli);
+    RUN_TEST(store_bfs_edge_types_sqli);
 }

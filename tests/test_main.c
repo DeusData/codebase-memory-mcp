@@ -23,6 +23,7 @@ extern void suite_ac(void);
 extern void suite_store_nodes(void);
 extern void suite_store_edges(void);
 extern void suite_store_search(void);
+extern void suite_store_bulk(void);
 extern void suite_cypher(void);
 extern void suite_mcp(void);
 extern void suite_language(void);
@@ -74,6 +75,7 @@ int main(void) {
     RUN_SUITE(store_nodes);
     RUN_SUITE(store_edges);
     RUN_SUITE(store_search);
+    RUN_SUITE(store_bulk);
 
     /* Cypher (M6) */
     RUN_SUITE(cypher);
