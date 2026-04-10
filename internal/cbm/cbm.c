@@ -316,6 +316,11 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
     cbm_extract_imports(&ctx);
     cbm_extract_unified(&ctx);
 
+    // K8s / Kustomize semantic pass (additional structured extraction for YAML-based infra files).
+    if (ctx.language == CBM_LANG_KUSTOMIZE || ctx.language == CBM_LANG_K8S) {
+        cbm_extract_k8s(&ctx);
+    }
+
     // LSP type-aware call resolution
     uint64_t lsp_start = now_ns();
     if (language == CBM_LANG_GO) {

@@ -152,6 +152,7 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_type_refs.c \
     $(CBM_DIR)/extract_type_assigns.c \
     $(CBM_DIR)/extract_env_accesses.c \
+    $(CBM_DIR)/extract_k8s.c \
     $(CBM_DIR)/helpers.c \
     $(CBM_DIR)/lang_specs.c
 
@@ -214,6 +215,7 @@ PIPELINE_SRCS = \
     src/pipeline/pass_envscan.c \
     src/pipeline/pass_compile_commands.c \
     src/pipeline/pass_infrascan.c \
+    src/pipeline/pass_k8s.c \
     src/pipeline/httplink.c
 
 # Depindex module (dependency/reference API indexing)

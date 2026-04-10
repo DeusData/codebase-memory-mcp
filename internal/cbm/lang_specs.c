@@ -1041,6 +1041,16 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
     {CBM_LANG_WOLFRAM, wolfram_func_types, empty_types, empty_types, wolfram_module_types,
      wolfram_call_types, wolfram_import_types, empty_types, empty_types, empty_types, empty_types,
      empty_types, NULL, empty_types, NULL, NULL, NULL},
+
+    // CBM_LANG_KUSTOMIZE (index 78) — reuses YAML grammar; semantic extraction via cbm_extract_k8s()
+    {CBM_LANG_KUSTOMIZE, empty_types, empty_types, empty_types, yaml_module_types, empty_types,
+     empty_types, empty_types, empty_types, empty_types, empty_types, empty_types, NULL,
+     empty_types, NULL, NULL, NULL},
+
+    // CBM_LANG_K8S (index 79) — reuses YAML grammar; semantic extraction via cbm_extract_k8s()
+    {CBM_LANG_K8S, empty_types, empty_types, empty_types, yaml_module_types, empty_types,
+     empty_types, empty_types, empty_types, empty_types, empty_types, empty_types, NULL,
+     empty_types, NULL, NULL, NULL},
 };
 
 const CBMLangSpec *cbm_lang_spec(CBMLanguage lang) {
@@ -1113,6 +1123,9 @@ const TSLanguage *cbm_ts_language(CBMLanguage lang) {
     case CBM_LANG_SCSS:
         return tree_sitter_scss();
     case CBM_LANG_YAML:
+        return tree_sitter_yaml();
+    case CBM_LANG_KUSTOMIZE:
+    case CBM_LANG_K8S:
         return tree_sitter_yaml();
     case CBM_LANG_TOML:
         return tree_sitter_toml();
