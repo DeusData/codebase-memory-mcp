@@ -16,6 +16,7 @@
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
+#include "discover/userconfig.h"
 #include "foundation/platform.h"
 #include "foundation/compat_fs.h"
 #include "foundation/log.h"
@@ -43,6 +44,9 @@ struct cbm_pipeline {
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
     cbm_registry_t *registry;
+
+    /* User-defined extension overrides (loaded once per run) */
+    cbm_userconfig_t *userconfig;
 };
 
 /* ── Timing helper ──────────────────────────────────────────────── */
@@ -107,6 +111,12 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     free(p->db_path);
     free(p->project_name);
     /* gbuf, store, registry freed during/after run. flush_store NOT owned by pipeline. */
+    /* Defensively free userconfig in case run() was never called or panicked */
+    if (p->userconfig) {
+        cbm_set_user_lang_config(NULL);
+        cbm_userconfig_free(p->userconfig);
+        p->userconfig = NULL;
+    }
     free(p);
 }
 
@@ -293,6 +303,10 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
 
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    /* Load user-defined extension overrides (fail-open: NULL on error) */
+    p->userconfig = cbm_userconfig_load(p->repo_path);
+    cbm_set_user_lang_config(p->userconfig);
 
     /* Phase 1: Discover files */
     cbm_discover_opts_t opts = {
@@ -709,5 +723,9 @@ cleanup:
     p->gbuf = NULL;
     cbm_registry_free(p->registry);
     p->registry = NULL;
+    /* Clear and free user extension config */
+    cbm_set_user_lang_config(NULL);
+    cbm_userconfig_free(p->userconfig);
+    p->userconfig = NULL;
     return rc;
 }
