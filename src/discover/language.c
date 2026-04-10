@@ -3,8 +3,11 @@
  *
  * Maps file extensions and special filenames to CBMLanguage enum values.
  * Handles .m disambiguation (Objective-C vs Magma vs MATLAB).
+ * Consults the process-global user config (set via cbm_set_user_lang_config)
+ * before the built-in tables, allowing custom extension→language mappings.
  */
 #include "discover/discover.h"
+#include "discover/userconfig.h"
 #include "cbm.h" // CBMLanguage, CBM_LANG_*
 
 #include <ctype.h>
@@ -354,6 +357,15 @@ CBMLanguage cbm_language_for_extension(const char *ext) {
         return CBM_LANG_COUNT;
     }
 
+    /* Check user-defined overrides first */
+    const cbm_userconfig_t *ucfg = cbm_get_user_lang_config();
+    if (ucfg) {
+        CBMLanguage ulang = cbm_userconfig_lookup(ucfg, ext);
+        if (ulang != CBM_LANG_COUNT) {
+            return ulang;
+        }
+    }
+
     for (size_t i = 0; i < EXT_TABLE_SIZE; i++) {
         if (strcmp(EXT_TABLE[i].ext, ext) == 0) {
             return EXT_TABLE[i].language;
@@ -374,13 +386,30 @@ CBMLanguage cbm_language_for_filename(const char *filename) {
         }
     }
 
-    /* Fall back to extension-based lookup */
-    const char *dot = strrchr(filename, '.');
-    if (dot) {
-        return cbm_language_for_extension(dot);
+    /* Fall back to extension-based lookup.
+     * For compound extensions (e.g. ".blade.php") defined in the user config,
+     * scan from the first dot in the basename toward the last, checking user
+     * config at each position.  Built-in extensions use the last dot only. */
+    const char *last_dot = strrchr(filename, '.');
+    if (!last_dot) {
+        return CBM_LANG_COUNT;
     }
 
-    return CBM_LANG_COUNT;
+    /* Probe user config for compound extensions (e.g. ".blade.php"). */
+    const cbm_userconfig_t *ucfg = cbm_get_user_lang_config();
+    if (ucfg) {
+        const char *p = strchr(filename, '.');
+        while (p && p < last_dot) {
+            CBMLanguage lang = cbm_userconfig_lookup(ucfg, p);
+            if (lang != CBM_LANG_COUNT) {
+                return lang;
+            }
+            p = strchr(p + 1, '.');
+        }
+    }
+
+    /* Standard single-extension lookup (built-ins + user overrides). */
+    return cbm_language_for_extension(last_dot);
 }
 
 const char *cbm_language_name(CBMLanguage lang) {

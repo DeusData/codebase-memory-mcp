@@ -29,6 +29,7 @@ extern void suite_mcp(void);
 extern void suite_language(void);
 extern void suite_gitignore(void);
 extern void suite_discover(void);
+extern void suite_userconfig(void);
 extern void suite_graph_buffer(void);
 extern void suite_registry(void);
 extern void suite_pipeline(void);
@@ -87,6 +88,7 @@ int main(void) {
     RUN_SUITE(language);
     RUN_SUITE(gitignore);
     RUN_SUITE(discover);
+    RUN_SUITE(userconfig);
 
     /* Graph Buffer (M7) */
     RUN_SUITE(graph_buffer);

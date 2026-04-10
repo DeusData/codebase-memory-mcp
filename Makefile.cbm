@@ -186,7 +186,8 @@ MCP_SRCS = src/mcp/mcp.c
 DISCOVER_SRCS = \
     src/discover/language.c \
     src/discover/gitignore.c \
-    src/discover/discover.c
+    src/discover/discover.c \
+    src/discover/userconfig.c
 
 # Graph buffer module (new)
 GRAPH_BUFFER_SRCS = src/graph_buffer/graph_buffer.c
@@ -304,7 +305,8 @@ TEST_MCP_SRCS = \
 TEST_DISCOVER_SRCS = \
     tests/test_language.c \
     tests/test_gitignore.c \
-    tests/test_discover.c
+    tests/test_discover.c \
+    tests/test_userconfig.c
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
