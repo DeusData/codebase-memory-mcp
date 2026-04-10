@@ -150,4 +150,10 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path);
  * Used for incremental indexing. Returns 0 on success. */
 int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store);
 
+/* Merge nodes and edges from gb into an already-open store WITHOUT wiping
+ * the project first. Used by incremental reindex to insert changed-file
+ * symbols into the live DB alongside unchanged-file nodes.
+ * Returns 0 on success, -1 on error. */
+int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store);
+
 #endif /* CBM_GRAPH_BUFFER_H */

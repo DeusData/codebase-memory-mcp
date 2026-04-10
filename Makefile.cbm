@@ -216,6 +216,7 @@ PIPELINE_SRCS = \
     src/pipeline/pass_compile_commands.c \
     src/pipeline/pass_infrascan.c \
     src/pipeline/pass_k8s.c \
+    src/pipeline/pipeline_incremental.c \
     src/pipeline/httplink.c
 
 # Depindex module (dependency/reference API indexing)

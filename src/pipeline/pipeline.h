@@ -16,6 +16,7 @@
 #define CBM_PIPELINE_H
 
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 /* Forward declarations */
@@ -70,6 +71,13 @@ void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store);
 /* Get the project name derived from repo_path. Returned string is
  * owned by the pipeline. Valid until cbm_pipeline_free(). */
 const char *cbm_pipeline_project_name(const cbm_pipeline_t *p);
+
+/* Get the repo path. Returned string is owned by the pipeline. */
+const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
+
+/* Get a pointer to the pipeline's cancellation flag. Used by incremental
+ * pipeline to propagate cancellation into the sub-pipeline context. */
+atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 
 /* ── FQN helpers (used by passes and external callers) ──────────── */
 
