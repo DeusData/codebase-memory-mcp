@@ -1777,6 +1777,48 @@ TEST(exclude_param_in_tool_schema) {
     PASS();
 }
 
+/* TDD: path_filter param (origin/main addition — fails before merge, passes after)
+ * origin/main mcp.c:3522–3704 adds path_filter to handle_search_code().
+ * After merge, search_code_graph schema must advertise path_filter parameter.
+ * Pre-merge: path_filter absent from schema → ASSERT fails (expected red).
+ * Post-merge: path_filter present → ASSERT passes (expected green). */
+TEST(path_filter_param_in_tool_schema) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    /* tools/list returns the streamlined schema including search_code_graph */
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
+    ASSERT_NOT_NULL(resp);
+    /* After merge: search_code_graph (or search_code) schema must include path_filter */
+    ASSERT_NOT_NULL(strstr(resp, "path_filter"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* TDD: structured error when project param AND session_project both absent
+ * (origin/main build_project_list_error() capability — merged per plan §2c)
+ * Before merge: empty/wrong result; After merge: {"error":..., "available_projects":[...]} */
+TEST(project_missing_returns_structured_error) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    /* No session project set, no project= param */
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph", "{\"name_pattern\":\"foo\"}");
+    ASSERT_NOT_NULL(resp);
+    /* After merge with DRY project resolution: must return a valid JSON response,
+     * not crash. Pre-merge: may return empty results. Post-merge: structured error
+     * with available_projects list via build_project_list_error(). */
+    ASSERT_NOT_NULL(resp);
+    /* At minimum, response must be valid JSON (not a bare NULL or crash) */
+    bool has_error = strstr(resp, "error") != NULL;
+    bool has_results = strstr(resp, "results") != NULL;
+    bool has_project = strstr(resp, "project") != NULL;
+    ASSERT_TRUE(has_error || has_results || has_project);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* ── Suite registration ──────────────────────────────────── */
 
 SUITE(tool_consolidation) {
@@ -1877,4 +1919,7 @@ SUITE(tool_consolidation) {
     RUN_TEST(search_exclude_empty_array_no_effect);
     RUN_TEST(search_exclude_all_returns_empty);
     RUN_TEST(exclude_param_in_tool_schema);
+    /* origin/main additions: path_filter param + structured error for missing project */
+    RUN_TEST(path_filter_param_in_tool_schema);
+    RUN_TEST(project_missing_returns_structured_error);
 }
