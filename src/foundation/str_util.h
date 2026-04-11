@@ -48,4 +48,9 @@ char *cbm_str_strip_ext(CBMArena *a, const char *path);
  * The array itself and all substrings are arena-allocated. */
 char **cbm_str_split(CBMArena *a, const char *s, char delim, int *out_count);
 
+/* Validate that a string is safe to pass as a shell argument.
+ * Returns false if s contains shell-injection characters: ' ; | & $ ` \n \r
+ * (and \ on non-Windows). Returns false for NULL. */
+bool cbm_validate_shell_arg(const char *s);
+
 #endif /* CBM_STR_UTIL_H */
