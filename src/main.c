@@ -21,6 +21,8 @@
 #include "pagerank/pagerank.h"
 #include "cli/cli.h"
 #include "foundation/log.h"
+#include "foundation/diagnostics.h"
+#include "foundation/platform.h"
 #include "foundation/compat_thread.h"
 #include "foundation/mem.h"
 #include "ui/config.h"
@@ -85,10 +87,19 @@ static void *http_thread(void *arg) {
 
 static int watcher_index_fn(const char *project_name, const char *root_path, void *user_data) {
     (void)user_data;
+
+    /* Non-blocking: skip if another pipeline is already running.
+     * Watcher will retry on next poll cycle (5-60s). */
+    if (!cbm_pipeline_try_lock()) {
+        cbm_log_info("watcher.skip", "project", project_name, "reason", "pipeline_busy");
+        return 0;
+    }
+
     cbm_log_info("watcher.reindex", "project", project_name, "path", root_path);
 
     cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
     if (!p) {
+        cbm_pipeline_unlock();
         return -1;
     }
 
@@ -108,6 +119,7 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
         free(pname);
     }
     cbm_mem_collect();
+    cbm_pipeline_unlock();
     return rc;
 }
 
@@ -206,6 +218,7 @@ int main(int argc, char **argv) {
     cbm_http_server_set_binary_path(argv[0]);
     cbm_log_set_sink(cbm_ui_log_append);
     cbm_log_info("server.start", "version", CBM_VERSION);
+    cbm_diag_start(); /* starts if CBM_DIAGNOSTICS=1 */
 
     /* Parse --ui and --port flags (persisted config) */
     cbm_ui_config_t ui_cfg;
@@ -246,7 +259,7 @@ int main(int argc, char **argv) {
 
     /* Open config store for runtime settings */
     char config_dir[1024];
-    const char *cfg_home = getenv("HOME");
+    const char *cfg_home = cbm_get_home_dir();
     cbm_config_t *runtime_config = NULL;
     if (cfg_home) {
         snprintf(config_dir, sizeof(config_dir), "%s/.cache/codebase-memory-mcp", cfg_home);
@@ -338,6 +351,7 @@ int main(int argc, char **argv) {
 
     g_watcher = NULL;
     g_server = NULL;
+    cbm_diag_stop();
 
     return rc;
 }

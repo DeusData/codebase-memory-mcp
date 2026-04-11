@@ -64,6 +64,12 @@ cbm_system_info_t cbm_system_info(void);
  * initial=false: max(1, perf_cores-1) (leave headroom for user apps) */
 int cbm_default_worker_count(bool initial);
 
+/* ── Home directory ─────────────────────────────────────────────── */
+
+/* Cross-platform home directory: tries HOME first, then USERPROFILE (Windows).
+ * Returns NULL when neither is set. */
+const char *cbm_get_home_dir(void);
+
 /* ── File system ───────────────────────────────────────────────── */
 
 /* Check if a path exists. */

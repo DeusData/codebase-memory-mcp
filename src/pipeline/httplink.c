@@ -1422,6 +1422,14 @@ int cbm_extract_laravel_routes(const char *name, const char *qn, const char *sou
         memcpy(r->path, p + match[2].rm_so, (size_t)plen);
         r->path[plen] = '\0';
 
+        /* Skip non-route strings that match the regex but contain characters
+         * invalid in URL paths (e.g., cache keys, interpolated expressions).
+         * Laravel route parameters use {param} syntax, so valid routes pass. */
+        if (strchr(r->path, '$') || strchr(r->path, ':')) {
+            p += match[0].rm_eo;
+            continue;
+        }
+
         strncpy(r->function_name, name ? name : "", sizeof(r->function_name) - 1);
         strncpy(r->qualified_name, qn ? qn : "", sizeof(r->qualified_name) - 1);
         count++;

@@ -377,7 +377,7 @@ static const char *swift_class_types[] = {"class_declaration", "protocol_declara
                                           "struct_declaration", "enum_declaration", NULL};
 static const char *swift_field_types[] = {"property_declaration", NULL};
 static const char *swift_module_types[] = {"source_file", NULL};
-static const char *swift_call_types[] = {"call_expression", NULL};
+static const char *swift_call_types[] = {"call_expression", "constructor_expression", NULL};
 static const char *swift_import_types[] = {"import_declaration", NULL};
 static const char *swift_branch_types[] = {"if_statement",    "guard_statement",  "for_statement",
                                            "while_statement", "switch_statement", NULL};
@@ -1124,9 +1124,6 @@ const TSLanguage *cbm_ts_language(CBMLanguage lang) {
         return tree_sitter_scss();
     case CBM_LANG_YAML:
         return tree_sitter_yaml();
-    case CBM_LANG_KUSTOMIZE:
-    case CBM_LANG_K8S:
-        return tree_sitter_yaml();
     case CBM_LANG_TOML:
         return tree_sitter_toml();
     case CBM_LANG_HCL:
@@ -1193,6 +1190,9 @@ const TSLanguage *cbm_ts_language(CBMLanguage lang) {
         return tree_sitter_magma();
     case CBM_LANG_WOLFRAM:
         return tree_sitter_wolfram();
+    case CBM_LANG_KUSTOMIZE:
+    case CBM_LANG_K8S:
+        return tree_sitter_yaml();
     default:
         return NULL;
     }

@@ -76,6 +76,22 @@ bool cbm_is_test_path(const char *path) {
         return true;
     }
 
+    /* Directory-based: __tests__/, tests/, test/, spec/ */
+    if (strstr(path, "__tests__/") || strstr(path, "/tests/") || strstr(path, "/test/") ||
+        strstr(path, "/spec/")) {
+        return true;
+    }
+    /* Also match if path STARTS with these directories */
+    if (strncmp(path, "tests/", 6) == 0 || strncmp(path, "test/", 5) == 0 ||
+        strncmp(path, "spec/", 5) == 0 || strncmp(path, "__tests__/", 10) == 0) {
+        return true;
+    }
+
+    /* Ruby: _spec.rb suffix */
+    if (str_ends_with(path, len, "_spec.rb")) {
+        return true;
+    }
+
     return false;
 }
 
@@ -84,9 +100,17 @@ bool cbm_is_test_func_name(const char *name) {
     if (!name) {
         return false;
     }
-    /* Go: Test*, Benchmark*, Example* */
-    if (strncmp(name, "Test", 4) == 0 || strncmp(name, "Benchmark", 9) == 0 ||
-        strncmp(name, "Example", 7) == 0) {
+    /* Go: Test/Benchmark/Example + uppercase letter or end-of-string.
+     * "TestFoo" = test, "Testable" = not test (lowercase after prefix). */
+    if (strncmp(name, "Test", 4) == 0 && (name[4] == '\0' || (name[4] >= 'A' && name[4] <= 'Z'))) {
+        return true;
+    }
+    if (strncmp(name, "Benchmark", 9) == 0 &&
+        (name[9] == '\0' || (name[9] >= 'A' && name[9] <= 'Z'))) {
+        return true;
+    }
+    if (strncmp(name, "Example", 7) == 0 &&
+        (name[7] == '\0' || (name[7] >= 'A' && name[7] <= 'Z'))) {
         return true;
     }
     /* Python/Rust/C++/Lua/Java: test_ or test prefix (lowercase) */

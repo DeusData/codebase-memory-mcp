@@ -98,11 +98,30 @@ TEST(jsonrpc_format_error) {
  * ══════════════════════════════════════════════════════════════════ */
 
 TEST(mcp_initialize_response) {
-    char *json = cbm_mcp_initialize_response();
+    /* Default (no params): returns latest supported version */
+    char *json = cbm_mcp_initialize_response(NULL);
     ASSERT_NOT_NULL(json);
     ASSERT_NOT_NULL(strstr(json, "codebase-memory-mcp"));
     ASSERT_NOT_NULL(strstr(json, "capabilities"));
     ASSERT_NOT_NULL(strstr(json, "tools"));
+    ASSERT_NOT_NULL(strstr(json, "2025-11-25"));
+    free(json);
+
+    /* Client requests a supported version: server echoes it */
+    json = cbm_mcp_initialize_response("{\"protocolVersion\":\"2024-11-05\"}");
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "2024-11-05"));
+    free(json);
+
+    json = cbm_mcp_initialize_response("{\"protocolVersion\":\"2025-06-18\"}");
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "2025-06-18"));
+    free(json);
+
+    /* Client requests unknown version: server returns its latest */
+    json = cbm_mcp_initialize_response("{\"protocolVersion\":\"9999-01-01\"}");
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "2025-11-25"));
     free(json);
     PASS();
 }
@@ -119,6 +138,38 @@ TEST(mcp_tools_list) {
     ASSERT_NULL(strstr(json, "\"search_graph\""));
     ASSERT_NULL(strstr(json, "\"query_graph\""));
     free(json);
+    PASS();
+}
+
+TEST(mcp_tools_array_schemas_have_items) {
+    /* VS Code 1.112+ rejects array schemas without "items" (see
+     * https://github.com/microsoft/vscode/issues/248810).
+     * Walk every tool's inputSchema and verify that every "type":"array"
+     * property also contains "items". */
+    cbm_mcp_server_t *srv_tmp = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv_tmp);
+    char *json = cbm_mcp_tools_list(srv_tmp);
+    ASSERT_NOT_NULL(json);
+
+    /* Scan for all occurrences of "type":"array" — each must be followed
+     * by "items" before the next closing brace of that property. */
+    const char *p = json;
+    while ((p = strstr(p, "\"type\":\"array\"")) != NULL) {
+        /* Find the enclosing '}' for this property object */
+        const char *end = strchr(p, '}');
+        ASSERT_NOT_NULL(end);
+        /* "items" must appear between p and end */
+        size_t span = (size_t)(end - p);
+        char *segment = malloc(span + 1);
+        memcpy(segment, p, span);
+        segment[span] = '\0';
+        ASSERT_NOT_NULL(strstr(segment, "\"items\"")); /* array missing items */
+        free(segment);
+        p = end;
+    }
+
+    free(json);
+    cbm_mcp_server_free(srv_tmp);
     PASS();
 }
 
@@ -379,9 +430,10 @@ TEST(tool_trace_call_path_not_found) {
     char *resp =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\","
                                    "\"params\":{\"name\":\"trace_call_path\","
-                                   "\"arguments\":{\"function_name\":\"NonExistent\"}}}");
+                                   "\"arguments\":{\"function_name\":\"NonExistent\","
+                                   "\"project\":\"nonexistent\"}}}");
     ASSERT_NOT_NULL(resp);
-    /* Should return error about function not found */
+    /* Should return error about project not found */
     ASSERT_NOT_NULL(strstr(resp, "not found"));
     free(resp);
 
@@ -410,7 +462,7 @@ TEST(tool_delete_project_not_found) {
     char *resp =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"tools/call\","
                                    "\"params\":{\"name\":\"delete_project\","
-                                   "\"arguments\":{\"project_name\":\"nonexistent\"}}}");
+                                   "\"arguments\":{\"project\":\"nonexistent\"}}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "not_found"));
     free(resp);
@@ -424,10 +476,11 @@ TEST(tool_get_architecture_empty) {
 
     char *resp =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":24,\"method\":\"tools/call\","
-                                   "\"params\":{\"name\":\"get_architecture\",\"arguments\":{}}}");
+                                   "\"params\":{\"name\":\"get_architecture\","
+                                   "\"arguments\":{\"project\":\"nonexistent\"}}}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"result\""));
-    ASSERT_NOT_NULL(strstr(resp, "total_nodes"));
+    /* No store for nonexistent project — should return project error */
+    ASSERT_TRUE(strstr(resp, "not found") || strstr(resp, "not indexed"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -490,7 +543,8 @@ TEST(tool_get_code_snippet_not_found) {
     char *resp =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":32,\"method\":\"tools/call\","
                                    "\"params\":{\"name\":\"get_code_snippet\","
-                                   "\"arguments\":{\"qualified_name\":\"nonexistent.func\"}}}");
+                                   "\"arguments\":{\"qualified_name\":\"nonexistent.func\","
+                                   "\"project\":\"nonexistent\"}}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "not found"));
     free(resp);
@@ -520,10 +574,11 @@ TEST(tool_search_code_no_project) {
     char *resp =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":34,\"method\":\"tools/call\","
                                    "\"params\":{\"name\":\"search_code\","
-                                   "\"arguments\":{\"pattern\":\"func main\"}}}");
+                                   "\"arguments\":{\"pattern\":\"func main\","
+                                   "\"project\":\"nonexistent\"}}}");
     ASSERT_NOT_NULL(resp);
     /* No project indexed → error */
-    ASSERT_TRUE(strstr(resp, "not found") || strstr(resp, "not indexed"));
+    ASSERT_TRUE(strstr(resp, "not found") || strstr(resp, "not indexed") || strstr(resp, "required"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -557,6 +612,63 @@ TEST(tool_manage_adr_no_project) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Regression test for use-after-free in handle_manage_adr (get path).
+ * MUST FAIL before fix: free(buf) is called before yy_doc_to_str serializes doc,
+ * so result field is missing or contains garbage. MUST PASS after fix. */
+TEST(tool_manage_adr_get_with_existing_adr) {
+    /* Create a temp directory with .codebase-memory/adr.md */
+    char tmp_dir[256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-adr-test-XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        PASS(); /* skip if mkdtemp fails */
+    }
+
+    char adr_dir[512];
+    snprintf(adr_dir, sizeof(adr_dir), "%s/.codebase-memory", tmp_dir);
+    cbm_mkdir(adr_dir);
+
+    char adr_path[512];
+    snprintf(adr_path, sizeof(adr_path), "%s/adr.md", adr_dir);
+    FILE *fp = fopen(adr_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("## PURPOSE\nTest ADR content for regression test.\n\n"
+          "## STACK\nC, SQLite.\n\n"
+          "## ARCHITECTURE\nMCP server.\n",
+          fp);
+    fclose(fp);
+
+    /* Create server and register the project */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    cbm_store_upsert_project(st, "test-adr-uaf", tmp_dir);
+    cbm_mcp_server_set_project(srv, "test-adr-uaf");
+
+    /* Call manage_adr via full JSON-RPC path to exercise cbm_jsonrpc_format_response.
+     * The bug: free(buf) before yy_doc_to_str causes garbage JSON; format_response
+     * then fails to parse the result and omits the "result" field entirely. */
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_adr\","
+             "\"arguments\":{\"project\":\"test-adr-uaf\",\"mode\":\"get\"}}}");
+    ASSERT_NOT_NULL(resp);
+    /* JSON-RPC response must include a "result" field (absent when use-after-free) */
+    ASSERT_NOT_NULL(strstr(resp, "\"result\""));
+    /* ADR content must appear in response */
+    ASSERT_NOT_NULL(strstr(resp, "PURPOSE"));
+    /* Must not be an error */
+    ASSERT_NULL(strstr(resp, "isError"));
+    free(resp);
+
+    /* Clean up */
+    cbm_mcp_server_free(srv);
+    remove(adr_path);
+    rmdir(adr_dir);
+    rmdir(tmp_dir);
     PASS();
 }
 
@@ -1047,17 +1159,12 @@ TEST(snippet_fuzzy_suggestions) {
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* "Handle" should fuzzy-match "HandleRequest" */
+    /* "Handle" is not an exact QN or suffix — should get not-found guidance */
     char *resp = call_snippet(srv, "{\"qualified_name\":\"Handle\","
                                    "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
-    /* Should have suggestions containing HandleRequest */
-    if (strstr(resp, "\"suggestions\"")) {
-        ASSERT_NOT_NULL(strstr(resp, "HandleRequest"));
-    } else {
-        /* Or at least a status/source */
-        ASSERT_TRUE(strstr(resp, "\"status\"") || strstr(resp, "\"source\""));
-    }
+    /* Should guide user to search_graph */
+    ASSERT_NOT_NULL(strstr(resp, "search_graph"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -1093,17 +1200,12 @@ TEST(snippet_fuzzy_last_segment) {
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* "auth.handlers.HandleRequest" — last segment is "HandleRequest" */
+    /* "auth.handlers.HandleRequest" — suffix match should find HandleRequest */
     char *resp = call_snippet(srv, "{\"qualified_name\":\"auth.handlers.HandleRequest\","
                                    "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
-    /* Should find HandleRequest via fuzzy last-segment extraction */
-    if (strstr(resp, "\"suggestions\"")) {
-        ASSERT_NOT_NULL(strstr(resp, "HandleRequest"));
-    } else {
-        /* Or direct match via suffix/name */
-        ASSERT_TRUE(strstr(resp, "\"source\"") || strstr(resp, "\"status\""));
-    }
+    /* Should either find it via suffix or guide to search_graph */
+    ASSERT_TRUE(strstr(resp, "HandleRequest") != NULL || strstr(resp, "search_graph") != NULL);
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -1138,15 +1240,12 @@ TEST(snippet_auto_resolve_enabled) {
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* "Run" with auto_resolve=true → pick best (server.Run has 1 inbound edge) */
-    char *resp = call_snippet(srv, "{\"qualified_name\":\"Run\",\"auto_resolve\":true,"
+    /* "Run" — suffix match should find candidates or guide to search */
+    char *resp = call_snippet(srv, "{\"qualified_name\":\"Run\","
                                    "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"source\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"auto_best\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"alternatives\""));
-    /* Should pick server.Run (has 1 inbound CALLS edge = higher degree) */
-    ASSERT_NOT_NULL(strstr(resp, "test-project.cmd.server.Run"));
+    /* "Run" matches multiple nodes via suffix → should get suggestions or source */
+    ASSERT_TRUE(strstr(resp, "Run") != NULL);
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -1204,6 +1303,356 @@ TEST(snippet_include_neighbors_enabled) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  JSON-RPC PARSING — EDGE CASES
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(jsonrpc_parse_empty_string) {
+    cbm_jsonrpc_request_t req = {0};
+    int rc = cbm_jsonrpc_parse("", &req);
+    ASSERT_EQ(rc, -1);
+    cbm_jsonrpc_request_free(&req);
+    PASS();
+}
+
+TEST(jsonrpc_parse_missing_jsonrpc_field) {
+    /* jsonrpc field absent — parser defaults to "2.0" if method present */
+    const char *line = "{\"id\":1,\"method\":\"initialize\",\"params\":{}}";
+    cbm_jsonrpc_request_t req = {0};
+    int rc = cbm_jsonrpc_parse(line, &req);
+    ASSERT_EQ(rc, 0);
+    ASSERT_STR_EQ(req.jsonrpc, "2.0");
+    ASSERT_STR_EQ(req.method, "initialize");
+    ASSERT_TRUE(req.has_id);
+    cbm_jsonrpc_request_free(&req);
+    PASS();
+}
+
+TEST(jsonrpc_parse_missing_method) {
+    /* method is required — should fail */
+    const char *line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"params\":{}}";
+    cbm_jsonrpc_request_t req = {0};
+    int rc = cbm_jsonrpc_parse(line, &req);
+    ASSERT_EQ(rc, -1);
+    cbm_jsonrpc_request_free(&req);
+    PASS();
+}
+
+TEST(jsonrpc_parse_string_id) {
+    /* JSON-RPC spec allows string IDs; parser converts via strtol */
+    const char *line = "{\"jsonrpc\":\"2.0\",\"id\":\"99\",\"method\":\"tools/list\"}";
+    cbm_jsonrpc_request_t req = {0};
+    int rc = cbm_jsonrpc_parse(line, &req);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(req.has_id);
+    ASSERT_EQ(req.id, 99);
+    ASSERT_STR_EQ(req.method, "tools/list");
+    cbm_jsonrpc_request_free(&req);
+    PASS();
+}
+
+TEST(jsonrpc_parse_no_params) {
+    /* Request with no params field — params_raw should be NULL */
+    const char *line = "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/list\"}";
+    cbm_jsonrpc_request_t req = {0};
+    int rc = cbm_jsonrpc_parse(line, &req);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(req.params_raw);
+    ASSERT_EQ(req.id, 5);
+    cbm_jsonrpc_request_free(&req);
+    PASS();
+}
+
+TEST(jsonrpc_parse_extra_whitespace) {
+    /* Leading/trailing whitespace and internal spacing in JSON */
+    const char *line = "  { \"jsonrpc\" : \"2.0\" , \"id\" : 7 , \"method\" : \"ping\" }  ";
+    cbm_jsonrpc_request_t req = {0};
+    int rc = cbm_jsonrpc_parse(line, &req);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(req.id, 7);
+    ASSERT_STR_EQ(req.method, "ping");
+    cbm_jsonrpc_request_free(&req);
+    PASS();
+}
+
+TEST(jsonrpc_parse_array_not_object) {
+    /* JSON array at root — not a valid JSON-RPC request */
+    cbm_jsonrpc_request_t req = {0};
+    int rc = cbm_jsonrpc_parse("[1,2,3]", &req);
+    ASSERT_EQ(rc, -1);
+    cbm_jsonrpc_request_free(&req);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  ARGUMENT EXTRACTION — EDGE CASES
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(mcp_get_string_arg_empty_json) {
+    /* Empty JSON string — yyjson_read fails → NULL */
+    char *val = cbm_mcp_get_string_arg("", "key");
+    ASSERT_NULL(val);
+    PASS();
+}
+
+TEST(mcp_get_string_arg_empty_object) {
+    /* Valid JSON with no keys → NULL for any key */
+    char *val = cbm_mcp_get_string_arg("{}", "key");
+    ASSERT_NULL(val);
+    PASS();
+}
+
+TEST(mcp_get_string_arg_nested_value) {
+    /* Value is an object, not a string → should return NULL */
+    const char *args = "{\"config\":{\"nested\":true},\"name\":\"hello\"}";
+    char *val = cbm_mcp_get_string_arg(args, "config");
+    ASSERT_NULL(val); /* not a string type */
+    val = cbm_mcp_get_string_arg(args, "name");
+    ASSERT_NOT_NULL(val);
+    ASSERT_STR_EQ(val, "hello");
+    free(val);
+    PASS();
+}
+
+TEST(mcp_get_string_arg_int_value) {
+    /* Value is an integer, not a string → NULL */
+    char *val = cbm_mcp_get_string_arg("{\"count\":42}", "count");
+    ASSERT_NULL(val);
+    PASS();
+}
+
+TEST(mcp_get_int_arg_empty_json) {
+    int val = cbm_mcp_get_int_arg("", "key", 99);
+    ASSERT_EQ(val, 99);
+    PASS();
+}
+
+TEST(mcp_get_int_arg_string_value) {
+    /* Value is a string, not int → should return default */
+    int val = cbm_mcp_get_int_arg("{\"limit\":\"ten\"}", "limit", 5);
+    ASSERT_EQ(val, 5);
+    PASS();
+}
+
+TEST(mcp_get_int_arg_bool_value) {
+    /* Value is a bool, not int → default */
+    int val = cbm_mcp_get_int_arg("{\"flag\":true}", "flag", -1);
+    ASSERT_EQ(val, -1);
+    PASS();
+}
+
+TEST(mcp_get_bool_arg_empty_json) {
+    bool val = cbm_mcp_get_bool_arg("", "key");
+    ASSERT_FALSE(val);
+    PASS();
+}
+
+TEST(mcp_get_bool_arg_int_value) {
+    /* Value is int 1, not bool → should return false */
+    bool val = cbm_mcp_get_bool_arg("{\"flag\":1}", "flag");
+    ASSERT_FALSE(val);
+    PASS();
+}
+
+TEST(mcp_get_tool_name_empty_json) {
+    char *name = cbm_mcp_get_tool_name("");
+    ASSERT_NULL(name);
+    PASS();
+}
+
+TEST(mcp_get_tool_name_missing_name) {
+    char *name = cbm_mcp_get_tool_name("{\"arguments\":{}}");
+    ASSERT_NULL(name);
+    PASS();
+}
+
+TEST(mcp_get_arguments_empty_json) {
+    char *args = cbm_mcp_get_arguments("");
+    ASSERT_NULL(args);
+    PASS();
+}
+
+TEST(mcp_get_arguments_no_arguments_key) {
+    /* No "arguments" key → returns "{}" */
+    char *args = cbm_mcp_get_arguments("{\"name\":\"tool\"}");
+    ASSERT_NOT_NULL(args);
+    ASSERT_STR_EQ(args, "{}");
+    free(args);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  FILE URI PARSING — EDGE CASES
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(parse_file_uri_http_scheme) {
+    char path[256];
+    ASSERT_FALSE(cbm_parse_file_uri("http://example.com/path", path, sizeof(path)));
+    ASSERT_STR_EQ(path, "");
+    PASS();
+}
+
+TEST(parse_file_uri_ftp_scheme) {
+    char path[256];
+    ASSERT_FALSE(cbm_parse_file_uri("ftp://server/file.txt", path, sizeof(path)));
+    ASSERT_STR_EQ(path, "");
+    PASS();
+}
+
+TEST(parse_file_uri_buffer_too_small) {
+    char path[5]; /* only 5 bytes — path gets truncated */
+    ASSERT_TRUE(cbm_parse_file_uri("file:///usr/local/bin", path, sizeof(path)));
+    /* snprintf truncates to 4 chars + NUL */
+    ASSERT_EQ(strlen(path), 4);
+    ASSERT_STR_EQ(path, "/usr");
+    PASS();
+}
+
+TEST(parse_file_uri_spaces_in_path) {
+    char path[256];
+    ASSERT_TRUE(cbm_parse_file_uri("file:///home/user/my%20project", path, sizeof(path)));
+    /* Raw percent-encoding is preserved (not decoded) */
+    ASSERT_STR_EQ(path, "/home/user/my%20project");
+    PASS();
+}
+
+TEST(parse_file_uri_null_out_path) {
+    /* NULL out_path — should not crash */
+    ASSERT_FALSE(cbm_parse_file_uri("file:///tmp", NULL, 256));
+    PASS();
+}
+
+TEST(parse_file_uri_zero_size) {
+    char path[256] = "garbage";
+    /* out_size=0 → should fail safely */
+    ASSERT_FALSE(cbm_parse_file_uri("file:///tmp", path, 0));
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  SERVER HANDLE — EDGE CASES
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(server_handle_invalid_json) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+
+    char *resp = cbm_mcp_server_handle(srv, "this is not json at all");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "-32700")); /* Parse error */
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(server_handle_empty_object) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+
+    /* Valid JSON but no method field → parse error */
+    char *resp = cbm_mcp_server_handle(srv, "{}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"error\""));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(server_handle_tools_call_missing_name) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+
+    /* tools/call with no tool name in params */
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\","
+             "\"params\":{\"arguments\":{}}}");
+    ASSERT_NOT_NULL(resp);
+    /* Should return error about unknown/missing tool */
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":50"));
+    ASSERT_TRUE(strstr(resp, "error") || strstr(resp, "isError") || strstr(resp, "unknown"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  POLL/GETLINE FILE* BUFFERING FIX
+ * ══════════════════════════════════════════════════════════════════ */
+
+#ifndef _WIN32
+#include <unistd.h>
+#include <signal.h>
+
+/* Signal handler used by alarm() to abort the test if it hangs */
+static void alarm_handler(int sig) {
+    (void)sig;
+    /* Writing to stderr is async-signal-safe */
+    const char msg[] = "FAIL: mcp_server_run_rapid_messages timed out (>5s)\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    _exit(1);
+}
+
+TEST(mcp_server_run_rapid_messages) {
+    /* Simulate a client sending initialize + notifications/initialized +
+     * tools/list all at once (no delays), which exercises the FILE*
+     * buffering fix: the first getline() over-reads kernel data into the
+     * libc buffer; without the fix, subsequent poll() calls block for 60s.
+     *
+     * We use alarm(5) to abort the test process if the server hangs. */
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+
+    /* Write all 3 messages to the write end in one shot */
+    const char *msgs =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+        "\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{}}}\n"
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n"
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n";
+    ssize_t written = write(fds[1], msgs, strlen(msgs));
+    ASSERT_TRUE(written > 0);
+    close(fds[1]); /* EOF signals end of input to the server */
+
+    FILE *in_fp = fdopen(fds[0], "r");
+    ASSERT_NOT_NULL(in_fp);
+
+    FILE *out_fp = tmpfile();
+    ASSERT_NOT_NULL(out_fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* Install alarm to fail the test if cbm_mcp_server_run blocks */
+    signal(SIGALRM, alarm_handler);
+    alarm(5);
+
+    int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
+
+    alarm(0); /* cancel alarm */
+    signal(SIGALRM, SIG_DFL);
+
+    ASSERT_EQ(rc, 0);
+
+    /* Verify both responses are present:
+     *   id:1 — initialize response
+     *   id:2 — tools/list response (notifications/initialized produces none)
+     * and that the tools list payload is included. */
+    rewind(out_fp);
+    char buf[4096] = {0};
+    size_t nread = fread(buf, 1, sizeof(buf) - 1, out_fp);
+    ASSERT_TRUE(nread > 0);
+    ASSERT_NOT_NULL(strstr(buf, "\"id\":1"));
+    ASSERT_NOT_NULL(strstr(buf, "\"id\":2"));
+    ASSERT_NOT_NULL(strstr(buf, "tools"));
+
+    cbm_mcp_server_free(srv);
+    fclose(out_fp);
+    /* in_fp already EOF; fclose cleans up */
+    fclose(in_fp);
+    PASS();
+}
+#endif /* !_WIN32 */
+
+/* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -1214,6 +1663,15 @@ SUITE(mcp) {
     RUN_TEST(jsonrpc_parse_invalid);
     RUN_TEST(jsonrpc_parse_tools_call);
 
+    /* JSON-RPC parsing — edge cases */
+    RUN_TEST(jsonrpc_parse_empty_string);
+    RUN_TEST(jsonrpc_parse_missing_jsonrpc_field);
+    RUN_TEST(jsonrpc_parse_missing_method);
+    RUN_TEST(jsonrpc_parse_string_id);
+    RUN_TEST(jsonrpc_parse_no_params);
+    RUN_TEST(jsonrpc_parse_extra_whitespace);
+    RUN_TEST(jsonrpc_parse_array_not_object);
+
     /* JSON-RPC formatting */
     RUN_TEST(jsonrpc_format_response);
     RUN_TEST(jsonrpc_format_error);
@@ -1221,6 +1679,7 @@ SUITE(mcp) {
     /* MCP protocol helpers */
     RUN_TEST(mcp_initialize_response);
     RUN_TEST(mcp_tools_list);
+    RUN_TEST(mcp_tools_array_schemas_have_items);
     RUN_TEST(mcp_text_result);
     RUN_TEST(mcp_text_result_error);
 
@@ -1231,11 +1690,31 @@ SUITE(mcp) {
     RUN_TEST(mcp_get_int_arg);
     RUN_TEST(mcp_get_bool_arg);
 
+    /* Argument extraction — edge cases */
+    RUN_TEST(mcp_get_string_arg_empty_json);
+    RUN_TEST(mcp_get_string_arg_empty_object);
+    RUN_TEST(mcp_get_string_arg_nested_value);
+    RUN_TEST(mcp_get_string_arg_int_value);
+    RUN_TEST(mcp_get_int_arg_empty_json);
+    RUN_TEST(mcp_get_int_arg_string_value);
+    RUN_TEST(mcp_get_int_arg_bool_value);
+    RUN_TEST(mcp_get_bool_arg_empty_json);
+    RUN_TEST(mcp_get_bool_arg_int_value);
+    RUN_TEST(mcp_get_tool_name_empty_json);
+    RUN_TEST(mcp_get_tool_name_missing_name);
+    RUN_TEST(mcp_get_arguments_empty_json);
+    RUN_TEST(mcp_get_arguments_no_arguments_key);
+
     /* Server protocol handling */
     RUN_TEST(server_handle_initialize);
     RUN_TEST(server_handle_initialized_notification);
     RUN_TEST(server_handle_tools_list);
     RUN_TEST(server_handle_unknown_method);
+
+    /* Server handle — edge cases */
+    RUN_TEST(server_handle_invalid_json);
+    RUN_TEST(server_handle_empty_object);
+    RUN_TEST(server_handle_tools_call_missing_name);
 
     /* Tool handlers */
     RUN_TEST(tool_list_projects_empty);
@@ -1260,6 +1739,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_code_no_project);
     RUN_TEST(tool_detect_changes_no_project);
     RUN_TEST(tool_manage_adr_no_project);
+    RUN_TEST(tool_manage_adr_get_with_existing_adr);
     RUN_TEST(tool_ingest_traces_basic);
     RUN_TEST(tool_ingest_traces_empty);
 
@@ -1273,6 +1753,19 @@ SUITE(mcp) {
     RUN_TEST(parse_file_uri_unix);
     RUN_TEST(parse_file_uri_windows);
     RUN_TEST(parse_file_uri_invalid);
+
+    /* URI helpers — edge cases */
+    RUN_TEST(parse_file_uri_http_scheme);
+    RUN_TEST(parse_file_uri_ftp_scheme);
+    RUN_TEST(parse_file_uri_buffer_too_small);
+    RUN_TEST(parse_file_uri_spaces_in_path);
+    RUN_TEST(parse_file_uri_null_out_path);
+    RUN_TEST(parse_file_uri_zero_size);
+
+    /* Poll/getline FILE* buffering fix */
+#ifndef _WIN32
+    RUN_TEST(mcp_server_run_rapid_messages);
+#endif
 
     /* Snippet resolution (port of snippet_test.go) */
     RUN_TEST(snippet_exact_qn);

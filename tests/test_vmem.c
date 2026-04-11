@@ -129,6 +129,170 @@ TEST(vmem_worker_budget) {
     PASS();
 }
 
+/* ── vmem edge-case and resource management tests ────────────── */
+
+TEST(vmem_alloc_zero_returns_null) {
+    cbm_vmem_init(0.5);
+    /* alloc(0) must return NULL per the API contract */
+    void *p = cbm_vmem_alloc(0);
+    ASSERT_NULL(p);
+    PASS();
+}
+
+TEST(vmem_free_null_zero_no_crash) {
+    cbm_vmem_init(0.5);
+    /* free(NULL, 0) must be a no-op */
+    cbm_vmem_free(NULL, 0);
+    PASS();
+}
+
+TEST(vmem_free_null_nonzero_no_crash) {
+    cbm_vmem_init(0.5);
+    /* free(NULL, 100) must be a no-op — ptr==NULL short-circuits */
+    cbm_vmem_free(NULL, 100);
+    PASS();
+}
+
+TEST(vmem_alloc_very_large) {
+    cbm_vmem_init(0.5);
+    /* Attempt 1 GB allocation — may succeed or fail depending on system.
+     * Either way it must not crash. */
+    size_t sz = (size_t)1024 * 1024 * 1024;
+    void *p = cbm_vmem_alloc(sz);
+    if (p) {
+        /* If it succeeded, verify we can touch the first and last page */
+        ((unsigned char *)p)[0] = 0xAA;
+        ((unsigned char *)p)[sz - 1] = 0xBB;
+        cbm_vmem_free(p, sz);
+    }
+    /* Success or graceful NULL — either is fine */
+    PASS();
+}
+
+TEST(vmem_sequential_alloc_free_no_leak) {
+    cbm_vmem_init(0.5);
+    size_t before = cbm_vmem_allocated();
+
+    /* 20 alloc/free cycles — allocated must return to baseline */
+    size_t sz = 64 * 1024; /* 64 KB */
+    for (int i = 0; i < 20; i++) {
+        void *p = cbm_vmem_alloc(sz);
+        ASSERT_NOT_NULL(p);
+        memset(p, (unsigned char)(i & 0xFF), sz);
+        cbm_vmem_free(p, sz);
+    }
+
+    size_t after = cbm_vmem_allocated();
+    ASSERT_EQ(after, before);
+    PASS();
+}
+
+TEST(vmem_worker_budget_negative_workers) {
+    cbm_vmem_init(0.5);
+    size_t budget = cbm_vmem_budget();
+    if (budget == 0) {
+        /* Not initialized in this process — skip */
+        PASS();
+    }
+    /* Negative workers clamps to 1 → worker_budget == full budget */
+    size_t wb = cbm_vmem_worker_budget(-3);
+    ASSERT_EQ(wb, budget);
+    PASS();
+}
+
+TEST(vmem_over_budget_when_nothing_allocated) {
+    cbm_vmem_init(0.5);
+    /* With nothing (or near-nothing) allocated, should not be over budget */
+    bool over = cbm_vmem_over_budget();
+    ASSERT_FALSE(over);
+    PASS();
+}
+
+TEST(vmem_allocated_tracks_alloc_free_cycle) {
+    cbm_vmem_init(0.5);
+    size_t base = cbm_vmem_allocated();
+
+    size_t sz = 128 * 1024; /* 128 KB */
+    void *p = cbm_vmem_alloc(sz);
+    ASSERT_NOT_NULL(p);
+
+    size_t after_alloc = cbm_vmem_allocated();
+    ASSERT_GT(after_alloc, base);
+
+    cbm_vmem_free(p, sz);
+
+    size_t after_free = cbm_vmem_allocated();
+    /* Must be back at or near baseline */
+    ASSERT_LTE(after_free, base + 4096);
+    PASS();
+}
+
+TEST(vmem_multiple_alloc_tracks_cumulative) {
+    cbm_vmem_init(0.5);
+    size_t base = cbm_vmem_allocated();
+
+    size_t sz = 64 * 1024; /* 64 KB */
+    void *p1 = cbm_vmem_alloc(sz);
+    ASSERT_NOT_NULL(p1);
+    size_t after_one = cbm_vmem_allocated();
+
+    void *p2 = cbm_vmem_alloc(sz);
+    ASSERT_NOT_NULL(p2);
+    size_t after_two = cbm_vmem_allocated();
+
+    /* Two allocs should be roughly double one alloc above base */
+    ASSERT_GT(after_two, after_one);
+    ASSERT_GT(after_one, base);
+
+    cbm_vmem_free(p2, sz);
+    cbm_vmem_free(p1, sz);
+
+    size_t after_free = cbm_vmem_allocated();
+    ASSERT_LTE(after_free, base + 4096);
+    PASS();
+}
+
+TEST(vmem_peak_never_decreases) {
+    cbm_vmem_init(0.5);
+
+    size_t sz = 256 * 1024;
+    void *p = cbm_vmem_alloc(sz);
+    ASSERT_NOT_NULL(p);
+    size_t peak_with_alloc = cbm_vmem_peak();
+
+    cbm_vmem_free(p, sz);
+    size_t peak_after_free = cbm_vmem_peak();
+
+    /* Peak must never decrease */
+    ASSERT_GTE(peak_after_free, peak_with_alloc);
+    PASS();
+}
+
+TEST(vmem_worker_budget_one_worker) {
+    cbm_vmem_init(0.5);
+    size_t budget = cbm_vmem_budget();
+    if (budget == 0) {
+        PASS();
+    }
+    /* 1 worker → equals full budget */
+    size_t wb = cbm_vmem_worker_budget(1);
+    ASSERT_EQ(wb, budget);
+    PASS();
+}
+
+TEST(vmem_worker_budget_many_workers) {
+    cbm_vmem_init(0.5);
+    size_t budget = cbm_vmem_budget();
+    if (budget == 0) {
+        PASS();
+    }
+    /* 1000 workers → must still be non-zero (budget is huge) */
+    size_t wb = cbm_vmem_worker_budget(1000);
+    ASSERT_GT(wb, 0);
+    ASSERT_EQ(wb, budget / 1000);
+    PASS();
+}
+
 /* ── Arena-vmem integration tests ─────────────────────────────── */
 
 TEST(arena_vmem_alloc_and_destroy) {
@@ -613,6 +777,20 @@ SUITE(vmem) {
     RUN_TEST(vmem_budget_tracking);
     RUN_TEST(vmem_peak_tracks);
     RUN_TEST(vmem_worker_budget);
+    /* Edge cases and resource management */
+    RUN_TEST(vmem_alloc_zero_returns_null);
+    RUN_TEST(vmem_free_null_zero_no_crash);
+    RUN_TEST(vmem_free_null_nonzero_no_crash);
+    RUN_TEST(vmem_alloc_very_large);
+    RUN_TEST(vmem_sequential_alloc_free_no_leak);
+    RUN_TEST(vmem_worker_budget_negative_workers);
+    RUN_TEST(vmem_over_budget_when_nothing_allocated);
+    RUN_TEST(vmem_allocated_tracks_alloc_free_cycle);
+    RUN_TEST(vmem_multiple_alloc_tracks_cumulative);
+    RUN_TEST(vmem_peak_never_decreases);
+    RUN_TEST(vmem_worker_budget_one_worker);
+    RUN_TEST(vmem_worker_budget_many_workers);
+    /* Arena-vmem integration */
     RUN_TEST(arena_vmem_alloc_and_destroy);
     RUN_TEST(arena_vmem_grow_tracks_sizes);
     RUN_TEST(arena_vmem_large_alloc);

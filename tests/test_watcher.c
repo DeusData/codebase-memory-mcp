@@ -1491,6 +1491,304 @@ TEST(watcher_watch_idempotent) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  RESOURCE MANAGEMENT & AUTO-INDEXING BEHAVIOR
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(watcher_null_store_handling) {
+    /* watcher_new with NULL store — verify behavior */
+    cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
+    /* Implementation may return NULL or a valid watcher.
+     * Either is acceptable — key is no crash. */
+    if (w) {
+        ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+        cbm_watcher_free(w);
+    }
+    PASS();
+}
+
+TEST(watcher_free_null_safe) {
+    /* Explicit test: free(NULL) must not crash */
+    cbm_watcher_free(NULL);
+    cbm_watcher_free(NULL);
+    PASS();
+}
+
+TEST(watcher_empty_count) {
+    /* Fresh watcher with no projects → count 0 */
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, NULL, NULL);
+    ASSERT_NOT_NULL(w);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(watcher_watch_multiple_verify_count) {
+    /* Watch 5 projects, verify count at each step */
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, NULL, NULL);
+
+    for (int i = 0; i < 5; i++) {
+        char name[32], path[64];
+        snprintf(name, sizeof(name), "proj-%d", i);
+        snprintf(path, sizeof(path), "/tmp/proj-%d", i);
+        cbm_watcher_watch(w, name, path);
+        ASSERT_EQ(cbm_watcher_watch_count(w), i + 1);
+    }
+
+    /* Unwatch all */
+    for (int i = 0; i < 5; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "proj-%d", i);
+        cbm_watcher_unwatch(w, name);
+    }
+    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(watcher_watch_same_project_idempotent) {
+    /* Watching the same project twice updates the path, count stays 1 */
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, NULL, NULL);
+
+    cbm_watcher_watch(w, "proj", "/tmp/path-a");
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+    cbm_watcher_watch(w, "proj", "/tmp/path-b");
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+    cbm_watcher_watch(w, "proj", "/tmp/path-c");
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(watcher_unwatch_nonexistent_safe) {
+    /* Unwatch a project that was never watched — no crash */
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, NULL, NULL);
+
+    cbm_watcher_unwatch(w, "never-existed");
+    cbm_watcher_unwatch(w, "also-never-existed");
+    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(watcher_touch_nonexistent_project) {
+    /* touch() on a project not in the watch list — no crash */
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, NULL, NULL);
+
+    cbm_watcher_touch(w, "nonexistent-project");
+    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(watcher_poll_interval_zero_files) {
+    /* 0 files → base interval (5000ms) */
+    int ms = cbm_watcher_poll_interval_ms(0, 0, 0);
+    ASSERT_EQ(ms, 5000);
+    PASS();
+}
+
+TEST(watcher_poll_interval_small_files) {
+    /* 100 files → should be close to base (5000ms) */
+    int ms = cbm_watcher_poll_interval_ms(100, 0, 0);
+    ASSERT_GTE(ms, 5000);
+    /* 100 files / 500 = 0 extra seconds of scaling → 5000ms */
+    ASSERT_EQ(ms, 5000);
+    PASS();
+}
+
+TEST(watcher_poll_interval_medium_files) {
+    /* 10000 files → 5000 + 20*1000 = 25000ms */
+    int ms = cbm_watcher_poll_interval_ms(10000, 0, 0);
+    ASSERT_EQ(ms, 25000);
+    PASS();
+}
+
+TEST(watcher_poll_interval_capped) {
+    /* 100000 files → capped at 60000ms */
+    int ms = cbm_watcher_poll_interval_ms(100000, 0, 0);
+    ASSERT_EQ(ms, 60000);
+    /* Even larger → still capped */
+    ms = cbm_watcher_poll_interval_ms(500000, 0, 0);
+    ASSERT_EQ(ms, 60000);
+    PASS();
+}
+
+TEST(watcher_poll_interval_negative) {
+    /* Negative file count → should handle gracefully (no crash) */
+    int ms = cbm_watcher_poll_interval_ms(-1, 0, 0);
+    /* Result should be at least the base interval or 0 — just no crash */
+    ASSERT_GTE(ms, 0);
+    PASS();
+}
+
+TEST(watcher_poll_empty_returns_zero) {
+    /* poll_once with empty watch list → 0 reindexed */
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    index_call_count = 0;
+
+    int reindexed = cbm_watcher_poll_once(w);
+    ASSERT_EQ(reindexed, 0);
+    ASSERT_EQ(index_call_count, 0);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(watcher_poll_non_git_dir) {
+    /* poll_once with a non-git directory → 0 changes detected */
+    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_ng2_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    /* Create a regular file so directory is not empty */
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "echo 'hello' > '%s/file.txt'", tmpdir);
+    system(cmd);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "nongit2", tmpdir);
+    index_call_count = 0;
+
+    /* Baseline */
+    cbm_watcher_poll_once(w);
+
+    /* Modify file */
+    snprintf(cmd, sizeof(cmd), "echo 'world' >> '%s/file.txt'", tmpdir);
+    system(cmd);
+
+    /* Poll — non-git directory, should not trigger reindex */
+    cbm_watcher_touch(w, "nongit2");
+    int reindexed = cbm_watcher_poll_once(w);
+    ASSERT_EQ(reindexed, 0);
+    ASSERT_EQ(index_call_count, 0);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
+    system(cmd);
+    PASS();
+}
+
+TEST(watcher_stop_prevents_run) {
+    /* Setting stop before run → run returns immediately */
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, NULL, NULL);
+
+    cbm_watcher_stop(w);
+    int rc = cbm_watcher_run(w, 60000, 0);
+    ASSERT_EQ(rc, 0);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(watcher_watch_unwatch_rapid_cycle) {
+    /* Rapid watch/unwatch cycles — stress lifecycle management */
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, NULL, NULL);
+
+    for (int i = 0; i < 20; i++) {
+        cbm_watcher_watch(w, "rapid", "/tmp/rapid");
+        ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+        cbm_watcher_unwatch(w, "rapid");
+        ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+    }
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    PASS();
+}
+
+/* Callback and state for watcher_callback_data_passed test */
+static int g_cbdata_value = 42;
+static int *g_cbdata_received = NULL;
+
+static int capture_data_callback(const char *name, const char *path, void *ud) {
+    (void)name; (void)path;
+    g_cbdata_received = (int *)ud;
+    return 0;
+}
+
+TEST(watcher_callback_data_passed) {
+    /* Verify that user_data pointer is accessible in the callback */
+    g_cbdata_received = NULL;
+
+    /* Create a temp git repo */
+    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_cbdata_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "cd '%s' && git init -q && git config user.email test@test && "
+             "git config user.name test && echo 'hello' > file.txt && "
+             "git add file.txt && git commit -q -m 'init'",
+             tmpdir);
+    if (system(cmd) != 0) {
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
+        system(cmd);
+        SKIP("git not available");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, capture_data_callback, &g_cbdata_value);
+    cbm_watcher_watch(w, "cbdata-repo", tmpdir);
+
+    /* Baseline */
+    cbm_watcher_poll_once(w);
+
+    /* Make dirty to trigger callback */
+    snprintf(cmd, sizeof(cmd), "echo 'dirty' >> '%s/file.txt'", tmpdir);
+    system(cmd);
+
+    cbm_watcher_touch(w, "cbdata-repo");
+    cbm_watcher_poll_once(w);
+
+    /* If callback was invoked, g_cbdata_received should point to g_cbdata_value */
+    if (g_cbdata_received) {
+        ASSERT_EQ(*g_cbdata_received, 42);
+    }
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
+    system(cmd);
+    PASS();
+}
+
+TEST(watcher_null_poll_once) {
+    /* poll_once(NULL) → 0 */
+    int reindexed = cbm_watcher_poll_once(NULL);
+    ASSERT_EQ(reindexed, 0);
+    PASS();
+}
+
+TEST(watcher_null_watch_count) {
+    /* watch_count(NULL) → 0 */
+    int count = cbm_watcher_watch_count(NULL);
+    ASSERT_EQ(count, 0);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -1548,4 +1846,27 @@ SUITE(watcher) {
     RUN_TEST(watcher_poll_only_watched_projects);
     RUN_TEST(watcher_touch_resets_immediate);
     RUN_TEST(watcher_modify_tracked_file);
+
+    /* Resource management & auto-indexing behavior */
+    RUN_TEST(watcher_null_store_handling);
+    RUN_TEST(watcher_free_null_safe);
+    RUN_TEST(watcher_empty_count);
+    RUN_TEST(watcher_watch_multiple_verify_count);
+    RUN_TEST(watcher_watch_same_project_idempotent);
+    RUN_TEST(watcher_unwatch_nonexistent_safe);
+    RUN_TEST(watcher_touch_nonexistent_project);
+    /* Poll interval edge cases */
+    RUN_TEST(watcher_poll_interval_zero_files);
+    RUN_TEST(watcher_poll_interval_small_files);
+    RUN_TEST(watcher_poll_interval_medium_files);
+    RUN_TEST(watcher_poll_interval_capped);
+    RUN_TEST(watcher_poll_interval_negative);
+    /* Poll edge cases */
+    RUN_TEST(watcher_poll_empty_returns_zero);
+    RUN_TEST(watcher_poll_non_git_dir);
+    RUN_TEST(watcher_stop_prevents_run);
+    RUN_TEST(watcher_watch_unwatch_rapid_cycle);
+    RUN_TEST(watcher_callback_data_passed);
+    RUN_TEST(watcher_null_poll_once);
+    RUN_TEST(watcher_null_watch_count);
 }

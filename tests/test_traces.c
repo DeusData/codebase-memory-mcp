@@ -105,6 +105,28 @@ TEST(traces_extract_http_info_url_full) {
     PASS();
 }
 
+/* ── TestExtractServiceName — edge cases ───────────────────────── */
+
+TEST(traces_extract_service_name_empty_attrs) {
+    cbm_trace_resource_t r = {.attributes = NULL, .attr_count = 0};
+    const char *name = cbm_extract_service_name(&r);
+    ASSERT_STR_EQ(name, "");
+    PASS();
+}
+
+TEST(traces_extract_service_name_multiple_attrs) {
+    /* service.name is present but not the first attribute */
+    cbm_trace_attr_t attrs[] = {
+        {.key = "deployment.environment", .string_value = "production"},
+        {.key = "telemetry.sdk.language", .string_value = "go"},
+        {.key = "service.name", .string_value = "payment-gateway"},
+    };
+    cbm_trace_resource_t r = {.attributes = attrs, .attr_count = 3};
+    const char *name = cbm_extract_service_name(&r);
+    ASSERT_STR_EQ(name, "payment-gateway");
+    PASS();
+}
+
 /* ── TestExtractPathFromURL ─────────────────────────────────────── */
 
 TEST(traces_extract_path_from_url) {
@@ -122,6 +144,54 @@ TEST(traces_extract_path_from_url) {
     cbm_extract_path_from_url("https://example.com/", buf, sizeof(buf));
     ASSERT_STR_EQ(buf, "/");
 
+    PASS();
+}
+
+/* ── TestExtractPathFromURL — edge cases ──────────────────────── */
+
+TEST(traces_extract_path_null_url) {
+    char buf[256] = "untouched";
+    const char *result = cbm_extract_path_from_url(NULL, buf, sizeof(buf));
+    ASSERT_STR_EQ(result, "");
+    PASS();
+}
+
+TEST(traces_extract_path_empty_url) {
+    char buf[256];
+    cbm_extract_path_from_url("", buf, sizeof(buf));
+    ASSERT_STR_EQ(buf, "");
+    PASS();
+}
+
+TEST(traces_extract_path_with_port) {
+    char buf[256];
+    cbm_extract_path_from_url("https://api.example.com:8443/v2/users", buf, sizeof(buf));
+    ASSERT_STR_EQ(buf, "/v2/users");
+    PASS();
+}
+
+TEST(traces_extract_path_with_query_and_fragment) {
+    char buf[256];
+    /* Query params should be stripped (stops at '?') */
+    cbm_extract_path_from_url("https://example.com/search?q=test&page=2", buf, sizeof(buf));
+    ASSERT_STR_EQ(buf, "/search");
+    PASS();
+}
+
+TEST(traces_extract_path_buffer_too_small) {
+    char buf[4]; /* only 4 bytes — path "/api/orders" gets truncated */
+    cbm_extract_path_from_url("https://example.com/api/orders", buf, sizeof(buf));
+    /* Should truncate safely to 3 chars + NUL */
+    ASSERT_EQ(strlen(buf), 3);
+    ASSERT_STR_EQ(buf, "/ap");
+    PASS();
+}
+
+TEST(traces_extract_path_relative_path) {
+    /* No scheme — "relative/path" has fewer than 3 slashes → empty */
+    char buf[256];
+    cbm_extract_path_from_url("/api/orders", buf, sizeof(buf));
+    ASSERT_STR_EQ(buf, "");
     PASS();
 }
 
@@ -161,17 +231,114 @@ TEST(traces_parse_duration_zero) {
     PASS();
 }
 
+/* ── TestParseDuration — edge cases ──────────────────────────────── */
+
+TEST(traces_parse_duration_null_start) {
+    int64_t d = cbm_parse_duration(NULL, "1000");
+    ASSERT_EQ(d, 0);
+    PASS();
+}
+
+TEST(traces_parse_duration_null_end) {
+    int64_t d = cbm_parse_duration("1000", NULL);
+    ASSERT_EQ(d, 0);
+    PASS();
+}
+
+TEST(traces_parse_duration_both_null) {
+    int64_t d = cbm_parse_duration(NULL, NULL);
+    ASSERT_EQ(d, 0);
+    PASS();
+}
+
+TEST(traces_parse_duration_equal) {
+    /* Same start and end → 0 */
+    int64_t d = cbm_parse_duration("5000000000", "5000000000");
+    ASSERT_EQ(d, 0);
+    PASS();
+}
+
+TEST(traces_parse_duration_large_values) {
+    /* Realistic nanosecond timestamps (epoch ~2024) */
+    int64_t d = cbm_parse_duration("1700000000000000000", "1700000000050000000");
+    ASSERT_EQ(d, 50000000); /* 50ms */
+    PASS();
+}
+
+/* ── TestCalculateP99 — edge cases ────────────────────────────────── */
+
+TEST(traces_calculate_p99_100_values) {
+    int64_t values[100];
+    for (int i = 0; i < 100; i++) {
+        values[i] = (int64_t)(i + 1); /* 1..100 */
+    }
+    int64_t p99 = cbm_calculate_p99(values, 100);
+    /* idx = (int)(100 * 0.99) = 99, values[99] = 100 */
+    ASSERT_EQ(p99, 100);
+    PASS();
+}
+
+TEST(traces_calculate_p99_reversed) {
+    /* Reversed array — qsort should sort first */
+    int64_t values[10] = {100, 90, 80, 70, 60, 50, 40, 30, 20, 10};
+    int64_t p99 = cbm_calculate_p99(values, 10);
+    /* After sort: 10..100, idx = (int)(10 * 0.99) = 9, values[9] = 100 */
+    ASSERT_EQ(p99, 100);
+    PASS();
+}
+
+TEST(traces_calculate_p99_two_values) {
+    int64_t values[2] = {5, 500};
+    int64_t p99 = cbm_calculate_p99(values, 2);
+    /* idx = (int)(2 * 0.99) = 1, values[1] = 500 */
+    ASSERT_EQ(p99, 500);
+    PASS();
+}
+
+TEST(traces_calculate_p99_all_same) {
+    int64_t values[5] = {42, 42, 42, 42, 42};
+    int64_t p99 = cbm_calculate_p99(values, 5);
+    ASSERT_EQ(p99, 42);
+    PASS();
+}
+
+TEST(traces_calculate_p99_negative_count) {
+    /* Negative count → treated like empty → 0 */
+    int64_t values[3] = {10, 20, 30};
+    int64_t p99 = cbm_calculate_p99(values, -1);
+    ASSERT_EQ(p99, 0);
+    PASS();
+}
+
 SUITE(traces) {
     RUN_TEST(traces_extract_service_name);
     RUN_TEST(traces_extract_service_name_missing);
     RUN_TEST(traces_extract_service_name_null);
+    RUN_TEST(traces_extract_service_name_empty_attrs);
+    RUN_TEST(traces_extract_service_name_multiple_attrs);
     RUN_TEST(traces_extract_http_info);
     RUN_TEST(traces_extract_http_info_non_http);
     RUN_TEST(traces_extract_http_info_url_full);
     RUN_TEST(traces_extract_path_from_url);
+    RUN_TEST(traces_extract_path_null_url);
+    RUN_TEST(traces_extract_path_empty_url);
+    RUN_TEST(traces_extract_path_with_port);
+    RUN_TEST(traces_extract_path_with_query_and_fragment);
+    RUN_TEST(traces_extract_path_buffer_too_small);
+    RUN_TEST(traces_extract_path_relative_path);
     RUN_TEST(traces_calculate_p99);
     RUN_TEST(traces_calculate_p99_single);
     RUN_TEST(traces_calculate_p99_empty);
+    RUN_TEST(traces_calculate_p99_100_values);
+    RUN_TEST(traces_calculate_p99_reversed);
+    RUN_TEST(traces_calculate_p99_two_values);
+    RUN_TEST(traces_calculate_p99_all_same);
+    RUN_TEST(traces_calculate_p99_negative_count);
     RUN_TEST(traces_parse_duration);
     RUN_TEST(traces_parse_duration_zero);
+    RUN_TEST(traces_parse_duration_null_start);
+    RUN_TEST(traces_parse_duration_null_end);
+    RUN_TEST(traces_parse_duration_both_null);
+    RUN_TEST(traces_parse_duration_equal);
+    RUN_TEST(traces_parse_duration_large_values);
 }

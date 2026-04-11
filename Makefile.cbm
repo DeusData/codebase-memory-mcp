@@ -79,7 +79,7 @@ GCC_ONLY_FLAGS := -Wno-format-truncation -Wno-unused-result \
                   -Wno-stringop-truncation -Wno-alloc-size-larger-than
 endif
 
-CFLAGS_COMMON = -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror \
+CFLAGS_COMMON = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror \
                 -Wno-unused-parameter -Wno-sign-compare \
                 $(GCC_ONLY_FLAGS) \
                 -Isrc -Ivendored -Ivendored/sqlite3 \
@@ -187,9 +187,9 @@ MCP_SRCS = src/mcp/mcp.c
 # Discover module (new)
 DISCOVER_SRCS = \
     src/discover/language.c \
+    src/discover/userconfig.c \
     src/discover/gitignore.c \
-    src/discover/discover.c \
-    src/discover/userconfig.c
+    src/discover/discover.c
 
 # Graph buffer module (new)
 GRAPH_BUFFER_SRCS = src/graph_buffer/graph_buffer.c
@@ -199,6 +199,7 @@ PIPELINE_SRCS = \
     src/pipeline/fqn.c \
     src/pipeline/registry.c \
     src/pipeline/pipeline.c \
+    src/pipeline/pipeline_incremental.c \
     src/pipeline/worker_pool.c \
     src/pipeline/pass_parallel.c \
     src/pipeline/pass_definitions.c \
@@ -217,7 +218,6 @@ PIPELINE_SRCS = \
     src/pipeline/pass_compile_commands.c \
     src/pipeline/pass_infrascan.c \
     src/pipeline/pass_k8s.c \
-    src/pipeline/pipeline_incremental.c \
     src/pipeline/httplink.c
 
 # Depindex module (dependency/reference API indexing)
@@ -308,9 +308,9 @@ TEST_MCP_SRCS = \
 
 TEST_DISCOVER_SRCS = \
     tests/test_language.c \
+    tests/test_userconfig.c \
     tests/test_gitignore.c \
-    tests/test_discover.c \
-    tests/test_userconfig.c
+    tests/test_discover.c
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
@@ -374,7 +374,7 @@ PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-foundation test-tsan test-leak test-analyze cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format install test-runner-nosan
+.PHONY: test test-foundation test-tsan test-leak test-analyze cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format install test-runner-nosan security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -687,3 +687,18 @@ lint: lint-tidy lint-cppcheck lint-format
 # CI linters (no clang-tidy — platform-dependent, enforced locally via pre-commit)
 lint-ci: lint-cppcheck lint-format
 	@echo "=== CI linters passed ==="
+
+# ── Security audit (6 layers) ────────────────────────────────────
+
+# Run all security checks: static audit, binary strings, UI, install, network
+# Requires: production binary already built (make cbm)
+security: cbm
+	@echo "=== Running security audit suite ==="
+	scripts/security-audit.sh
+	scripts/security-strings.sh $(BUILD_DIR)/codebase-memory-mcp
+	scripts/security-ui.sh
+	scripts/security-install.sh $(BUILD_DIR)/codebase-memory-mcp
+	scripts/security-network.sh $(BUILD_DIR)/codebase-memory-mcp
+	scripts/security-fuzz.sh $(BUILD_DIR)/codebase-memory-mcp
+	scripts/security-vendored.sh
+	@echo "=== All security checks passed ==="

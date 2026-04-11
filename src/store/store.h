@@ -73,6 +73,10 @@ int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const
 /* Get CALLS degree of a node (inbound and outbound). */
 void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *out_deg);
 
+/* Get distinct file paths for a project. Caller must free each out[i] and out itself.
+ * Returns CBM_STORE_OK or CBM_STORE_ERR. */
+int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *count);
+
 /* Get caller/callee names for a node (CALLS/HTTP_CALLS/ASYNC_CALLS edges).
  * Returns 0 on success. Caller must free each out_callers[i]/out_callees[i]
  * and the arrays themselves. */
@@ -196,11 +200,13 @@ cbm_store_t *cbm_store_open_memory(void);
 /* Open a file-backed database at the given path. Creates if needed. */
 cbm_store_t *cbm_store_open_path(const char *db_path);
 
-/* Open an existing file-backed database read-write without creating it.
- * Returns NULL if the file does not exist (no ghost .db creation). */
+/* Open an existing file-backed database for querying only (no SQLITE_OPEN_CREATE).
+ * Returns NULL if the file does not exist — never creates a new .db file. */
 cbm_store_t *cbm_store_open_path_query(const char *db_path);
 
-/* Returns true if the store passes a basic sanity/integrity check. */
+/* Check database integrity. Returns true if the DB passes basic sanity checks
+ * (projects table has correct types, no corruption indicators).
+ * Returns false if corruption is detected — caller should delete and re-index. */
 bool cbm_store_check_integrity(cbm_store_t *s);
 
 /* Open database for a named project in the default cache dir. */
@@ -208,6 +214,9 @@ cbm_store_t *cbm_store_open(const char *project);
 
 /* Close the store and free all resources. NULL-safe. */
 void cbm_store_close(cbm_store_t *s);
+
+/* Get the underlying sqlite3 handle (for testing only). */
+struct sqlite3 *cbm_store_get_db(cbm_store_t *s);
 
 /* Get the last error message (static string, valid until next call). */
 const char *cbm_store_error(cbm_store_t *s);
@@ -229,10 +238,11 @@ int cbm_store_rollback(cbm_store_t *s);
 
 /* ── Bulk write optimization ────────────────────────────────────── */
 
-/* Switch to MEMORY journal for maximum write throughput. */
+/* Tune pragmas for bulk write throughput (synchronous=OFF, large cache).
+ * WAL journal mode is preserved throughout for crash safety. */
 int cbm_store_begin_bulk(cbm_store_t *s);
 
-/* Restore WAL journal mode after bulk writes. */
+/* Restore normal pragmas (synchronous=NORMAL, default cache) after bulk writes. */
 int cbm_store_end_bulk(cbm_store_t *s);
 
 /* Drop user indexes for faster bulk inserts. */
@@ -273,9 +283,16 @@ int cbm_store_find_node_by_id(cbm_store_t *s, int64_t id, cbm_node_t *out);
 /* Find node by project + qualified_name. */
 int cbm_store_find_node_by_qn(cbm_store_t *s, const char *project, const char *qn, cbm_node_t *out);
 
+/* Find node by qualified_name only (no project filter — QNs are globally unique). */
+int cbm_store_find_node_by_qn_any(cbm_store_t *s, const char *qn, cbm_node_t *out);
+
 /* Find nodes by name (exact match). Returns allocated array, caller frees. */
 int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char *name,
                                  cbm_node_t **out, int *count);
+
+/* Find nodes by name across all projects. Returns allocated array, caller frees. */
+int cbm_store_find_nodes_by_name_any(cbm_store_t *s, const char *name, cbm_node_t **out,
+                                     int *count);
 
 /* Find nodes by label. */
 int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const char *label,

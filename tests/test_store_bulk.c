@@ -12,12 +12,10 @@
  *   bulk_pragma_wal_invariant     — journal_mode stays "wal" after begin_bulk
  *   bulk_pragma_end_wal_invariant — journal_mode stays "wal" after end_bulk
  *   bulk_crash_recovery           — DB is readable after simulated crash mid-bulk
- *
- * Ported from origin/main (commit dbd543a area) to api-consolidation.
  */
-#include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include <store/store.h>
+#include <foundation/compat.h>
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,7 +78,7 @@ TEST(bulk_pragma_wal_invariant) {
 
     char *after = get_journal_mode(db_path);
     ASSERT_NOT_NULL(after);
-    ASSERT_STR_EQ(after, "wal"); /* FAILS with old code that switches to MEMORY */
+    ASSERT_STR_EQ(after, "wal"); /* FAILS if bulk mode switches away from WAL */
     free(after);
 
     cbm_store_end_bulk(s);

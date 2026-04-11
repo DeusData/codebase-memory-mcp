@@ -45,6 +45,11 @@ const char *cbm_find_cli(const char *name, const char *home_dir);
 /* Copy a file from src to dst. Returns 0 on success, -1 on error. */
 int cbm_copy_file(const char *src, const char *dst);
 
+/* Replace a binary file: unlinks the existing file first (handles read-only),
+ * then creates a new file with the given data and permissions.
+ * Returns 0 on success, -1 on error. */
+int cbm_replace_binary(const char *path, const unsigned char *data, int len, int mode);
+
 /* ── Skill file management ────────────────────────────────────── */
 
 /* Number of skill files. */
@@ -113,6 +118,8 @@ typedef struct {
     bool antigravity; /* ~/.gemini/antigravity/ exists */
     bool aider;       /* aider on PATH */
     bool kilocode;    /* KiloCode globalStorage dir exists */
+    bool vscode;      /* VS Code User config dir exists */
+    bool openclaw;    /* ~/.openclaw/ exists */
 } cbm_detected_agents_t;
 
 /* Detect which coding agents are installed.
@@ -191,6 +198,11 @@ const char *cbm_get_codex_instructions(void);
  * Returns malloc'd binary content and sets *out_len.
  * Returns NULL on error. Caller must free. */
 unsigned char *cbm_extract_binary_from_targz(const unsigned char *data, int data_len, int *out_len);
+
+/* Extract the codebase-memory-mcp binary from a zip archive in memory.
+ * Returns malloc'd binary content and sets *out_len.
+ * Returns NULL on error. Caller must free. */
+unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_len, int *out_len);
 
 /* ── Index management ─────────────────────────────────────────── */
 

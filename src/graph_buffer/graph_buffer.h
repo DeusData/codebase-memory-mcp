@@ -147,7 +147,7 @@ const cbm_gbuf_node_t *cbm_gbuf_resolve_by_name_in_file(
 int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path);
 
 /* Flush the buffer to an existing store via the store API.
- * Used for incremental indexing. Returns 0 on success. */
+ * Deletes existing project data first. Returns 0 on success. */
 int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store);
 
 /* Merge nodes and edges from gb into an already-open store WITHOUT wiping

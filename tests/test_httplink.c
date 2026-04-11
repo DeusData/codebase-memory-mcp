@@ -780,6 +780,37 @@ TEST(httplink_linker_same_service_skip) {
     PASS();
 }
 
+/* ── Laravel path filter: reject $ and : in matched paths ──────── */
+
+TEST(httplink_laravel_path_filter) {
+    cbm_route_handler_t routes[8];
+    int n;
+
+    /* Cache key patterns should be filtered (contain $ or :) */
+    n = cbm_extract_laravel_routes("fn", "proj.fn",
+                                   "Cache::get('article:{$this->id}:image')", routes, 8);
+    ASSERT_EQ(n, 0);
+
+    n = cbm_extract_laravel_routes("fn", "proj.fn",
+                                   "Route::get(\"cache:$key\", fn() => null)", routes, 8);
+    ASSERT_EQ(n, 0);
+
+    /* Valid routes should still pass (Laravel uses {param} not $param) */
+    n = cbm_extract_laravel_routes("fn", "proj.fn",
+                                   "Route::get('/api/users/{id}', 'UserController@show')", routes,
+                                   8);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(routes[0].path, "/api/users/{id}");
+
+    /* Route with no special chars also passes */
+    n = cbm_extract_laravel_routes("fn", "proj.fn",
+                                   "Route::post('/api/login', 'AuthController@login')", routes, 8);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(routes[0].path, "/api/login");
+
+    PASS();
+}
+
 /* ── Laravel module-level route extraction ─────────────────────── */
 
 TEST(httplink_laravel_module_level_routes) {
@@ -862,6 +893,9 @@ SUITE(httplink) {
     /* Source lines (2 tests) */
     RUN_TEST(httplink_read_source_lines);
     RUN_TEST(httplink_read_source_lines_missing_file);
+
+    /* Laravel path filter (1 test) */
+    RUN_TEST(httplink_laravel_path_filter);
 
     /* Integration (3 tests) */
     RUN_TEST(httplink_linker_route_nodes);

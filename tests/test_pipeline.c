@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include "foundation/compat_thread.h"
 #include <sys/stat.h>
 #include <unistd.h>
 #include "graph_buffer/graph_buffer.h"
@@ -3331,17 +3332,6 @@ TEST(infra_is_dockerfile) {
     PASS();
 }
 
-TEST(infra_is_env_file) {
-    ASSERT(cbm_is_env_file(".env"));
-    ASSERT(cbm_is_env_file(".env.local"));
-    ASSERT(cbm_is_env_file("prod.env"));
-    ASSERT(!cbm_is_env_file("main.go"));
-    ASSERT(!cbm_is_env_file("env.txt"));
-    PASS();
-}
-
-/* ── Infrascan: K8s / Kustomize detection ───────────────────────── */
-
 TEST(infra_is_kustomize_file) {
     ASSERT(cbm_is_kustomize_file("kustomization.yaml"));
     ASSERT(cbm_is_kustomize_file("kustomization.yml"));
@@ -3353,7 +3343,7 @@ TEST(infra_is_kustomize_file) {
 }
 
 TEST(infra_is_k8s_manifest) {
-    const char *deploy = "apiVersion: apps/v1\nkind: Deployment\n";
+    const char *deploy = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: my-app\n";
     const char *plain  = "name: foo\nvalue: bar\n";
     const char *kust   = "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n";
 
@@ -3363,6 +3353,15 @@ TEST(infra_is_k8s_manifest) {
     ASSERT(!cbm_is_k8s_manifest("kustomization.yaml", kust));
     ASSERT(!cbm_is_k8s_manifest(NULL, deploy));
     ASSERT(!cbm_is_k8s_manifest("deployment.yaml", NULL));
+    PASS();
+}
+
+TEST(infra_is_env_file) {
+    ASSERT(cbm_is_env_file(".env"));
+    ASSERT(cbm_is_env_file(".env.local"));
+    ASSERT(cbm_is_env_file("prod.env"));
+    ASSERT(!cbm_is_env_file("main.go"));
+    ASSERT(!cbm_is_env_file("env.txt"));
     PASS();
 }
 
@@ -4268,6 +4267,8 @@ TEST(infra_pipeline_idempotent) {
     PASS();
 }
 
+/* (K8s extraction tests already defined above from origin/main) */
+
 /* ── Envscan tests (port of envscan_test.go) ───────────────────── */
 
 /* Helper: write a file inside a temp dir */
@@ -4870,6 +4871,67 @@ static void cleanup_incremental_repo(void) {
     (void)system(cmd);
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ *  FastAPI Depends() edge tracking (PR #66, fix #27)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+TEST(pipeline_fastapi_depends_edges) {
+    /* Depends(get_current_user) should produce a CALLS edge from the
+     * endpoint to the dependency function. */
+    const char *files[] = {"auth.py", "routes.py"};
+    const char *contents[] = {
+        /* auth.py: defines get_current_user */
+        "def get_current_user(token: str):\n"
+        "    return decode_token(token)\n",
+        /* routes.py: endpoint depends on get_current_user */
+        "from fastapi import Depends\n"
+        "from auth import get_current_user\n\n"
+        "def get_profile(user = Depends(get_current_user)):\n"
+        "    return {\"user\": user}\n"};
+    if (setup_lang_repo(files, contents, 2) != 0) {
+        SKIP("tmpdir");
+    }
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    /* Check CALLS edges for fastapi_depends strategy */
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_type(s, proj, "CALLS", &edges, &edge_count);
+
+    bool found_depends_edge = false;
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].properties_json &&
+            strstr(edges[i].properties_json, "fastapi_depends")) {
+            found_depends_edge = true;
+            break;
+        }
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    ASSERT_TRUE(found_depends_edge);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* DLL resolve test removed — feature removed due to Windows Defender
+ * false positive (Wacatac.B!ml). See issue #89. */
+
+/* ═══════════════════════════════════════════════════════════════════
+ *  Incremental reindex
+ * ═══════════════════════════════════════════════════════════════════ */
+
 TEST(incremental_full_then_noop) {
     /* Full index, then re-run → should detect no changes and skip */
     if (setup_incremental_repo() != 0) { SKIP("setup failed"); }
@@ -5149,7 +5211,520 @@ TEST(incremental_kustomize_module_indexed) {
     PASS();
 }
 
+/* ── Index lock tests ───────────────────────────────────────────── */
+
+TEST(pipeline_lock_try_acquire) {
+    /* First try-lock should succeed */
+    ASSERT_TRUE(cbm_pipeline_try_lock());
+    /* Second try-lock should fail (already held) */
+    ASSERT_FALSE(cbm_pipeline_try_lock());
+    /* Release, then re-acquire should succeed */
+    cbm_pipeline_unlock();
+    ASSERT_TRUE(cbm_pipeline_try_lock());
+    cbm_pipeline_unlock();
+    PASS();
+}
+
+TEST(pipeline_lock_blocking) {
+    /* Lock, then unlock — basic sanity */
+    cbm_pipeline_lock();
+    cbm_pipeline_unlock();
+    /* Should be immediately re-acquirable */
+    cbm_pipeline_lock();
+    cbm_pipeline_unlock();
+    PASS();
+}
+
+/* Thread function that tries to acquire the lock and records result */
+static atomic_int g_thread_acquired = 0;
+static atomic_int g_thread_done = 0;
+
+static void *try_lock_thread(void *arg) {
+    (void)arg;
+    if (cbm_pipeline_try_lock()) {
+        atomic_store(&g_thread_acquired, 1);
+        cbm_pipeline_unlock();
+    } else {
+        atomic_store(&g_thread_acquired, 0);
+    }
+    atomic_store(&g_thread_done, 1);
+    return NULL;
+}
+
+TEST(pipeline_lock_contention) {
+    /* Main thread holds lock, spawned thread should fail try_lock */
+    cbm_pipeline_lock();
+    atomic_store(&g_thread_acquired, -1);
+    atomic_store(&g_thread_done, 0);
+
+    cbm_thread_t tid;
+    int rc = cbm_thread_create(&tid, 0, try_lock_thread, NULL);
+    ASSERT_EQ(rc, 0);
+
+    /* Wait for thread to finish */
+    cbm_thread_join(&tid);
+
+    /* Thread should NOT have acquired the lock */
+    ASSERT_EQ(atomic_load(&g_thread_acquired), 0);
+    cbm_pipeline_unlock();
+    PASS();
+}
+
+TEST(pipeline_lock_release_allows_contender) {
+    /* Main thread acquires and releases, then spawned thread should succeed */
+    cbm_pipeline_lock();
+    cbm_pipeline_unlock();
+
+    atomic_store(&g_thread_acquired, -1);
+    atomic_store(&g_thread_done, 0);
+
+    cbm_thread_t tid;
+    int rc = cbm_thread_create(&tid, 0, try_lock_thread, NULL);
+    ASSERT_EQ(rc, 0);
+    cbm_thread_join(&tid);
+
+    /* Thread SHOULD have acquired the lock */
+    ASSERT_EQ(atomic_load(&g_thread_acquired), 1);
+    PASS();
+}
+
+/* ── Resource management & internal helper tests ─────────────────── */
+
+TEST(pipeline_empty_path) {
+    /* Empty string repo path — should handle gracefully */
+    cbm_pipeline_t *p = cbm_pipeline_new("", NULL, CBM_MODE_FULL);
+    /* Implementation may return NULL or a valid pipeline with empty project name.
+     * Either behavior is acceptable — the key is no crash. */
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    PASS();
+}
+
+TEST(pipeline_project_name_content) {
+    /* Verify project name is derived from the repo_path */
+    cbm_pipeline_t *p = cbm_pipeline_new("/home/user/my-project", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    const char *name = cbm_pipeline_project_name(p);
+    ASSERT_NOT_NULL(name);
+    ASSERT_TRUE(strlen(name) > 0);
+    /* Should contain "my-project" as part of the derived name */
+    ASSERT_TRUE(strstr(name, "my-project") != NULL);
+    cbm_pipeline_free(p);
+    PASS();
+}
+
+TEST(pipeline_cancel_sets_flag) {
+    /* Verify cancel sets the flag so subsequent run exits early */
+    cbm_pipeline_t *p = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    /* Cancel before run */
+    cbm_pipeline_cancel(p);
+    /* Cancelled pipeline should return quickly (either -1 from cancel or from
+     * missing path — both are acceptable; key is no hang) */
+    int rc = cbm_pipeline_run(p);
+    ASSERT_EQ(rc, -1);
+    cbm_pipeline_free(p);
+    PASS();
+}
+
+TEST(pipeline_double_cancel) {
+    /* Calling cancel twice should not crash */
+    cbm_pipeline_t *p = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_cancel(p);
+    cbm_pipeline_cancel(p);
+    cbm_pipeline_free(p);
+    PASS();
+}
+
+TEST(pipeline_double_free_prevention) {
+    /* free(NULL) after free should not crash. We can't truly double-free
+     * the same pointer, but we verify NULL is safe as documented. */
+    cbm_pipeline_free(NULL);
+    cbm_pipeline_free(NULL);
+    PASS();
+}
+
+TEST(trackable_source_files) {
+    /* Common source extensions are trackable */
+    ASSERT_TRUE(cbm_is_trackable_file("main.go"));
+    ASSERT_TRUE(cbm_is_trackable_file("src/handler.py"));
+    ASSERT_TRUE(cbm_is_trackable_file("lib/server.js"));
+    ASSERT_TRUE(cbm_is_trackable_file("components/App.tsx"));
+    ASSERT_TRUE(cbm_is_trackable_file("pkg/svc.rs"));
+    ASSERT_TRUE(cbm_is_trackable_file("config.yaml"));
+    PASS();
+}
+
+TEST(trackable_rejects_images) {
+    /* Image and binary files are not trackable */
+    ASSERT_FALSE(cbm_is_trackable_file("logo.png"));
+    ASSERT_FALSE(cbm_is_trackable_file("photo.jpg"));
+    ASSERT_FALSE(cbm_is_trackable_file("icon.gif"));
+    ASSERT_FALSE(cbm_is_trackable_file("diagram.svg"));
+    PASS();
+}
+
+TEST(trackable_rejects_minified) {
+    /* Minified files are not trackable */
+    ASSERT_FALSE(cbm_is_trackable_file("bundle.min.js"));
+    ASSERT_FALSE(cbm_is_trackable_file("style.min.css"));
+    PASS();
+}
+
+TEST(trackable_rejects_vendor_dirs) {
+    /* Files in vendor/node_modules/__pycache__ are not trackable */
+    ASSERT_FALSE(cbm_is_trackable_file("vendor/github.com/lib/dep.go"));
+    ASSERT_FALSE(cbm_is_trackable_file("node_modules/lodash/index.js"));
+    ASSERT_FALSE(cbm_is_trackable_file("__pycache__/module.pyc"));
+    ASSERT_FALSE(cbm_is_trackable_file(".git/objects/pack/data"));
+    PASS();
+}
+
+TEST(trackable_rejects_lock_files) {
+    /* Lock files are not trackable */
+    ASSERT_FALSE(cbm_is_trackable_file("package-lock.json"));
+    ASSERT_FALSE(cbm_is_trackable_file("go.sum"));
+    ASSERT_FALSE(cbm_is_trackable_file("yarn.lock"));
+    PASS();
+}
+
+TEST(test_path_directory_patterns) {
+    /* Test directory patterns: __tests__, test/, tests/, spec/ */
+    ASSERT_TRUE(cbm_is_test_path("__tests__/Component.js"));
+    ASSERT_TRUE(cbm_is_test_path("tests/test_main.py"));
+    ASSERT_TRUE(cbm_is_test_path("spec/handler_spec.rb"));
+    PASS();
+}
+
+TEST(test_path_suffix_patterns) {
+    /* Various language-specific test suffix patterns */
+    ASSERT_TRUE(cbm_is_test_path("handler.spec.ts"));
+    ASSERT_TRUE(cbm_is_test_path("handler.test.tsx"));
+    ASSERT_TRUE(cbm_is_test_path("handler_test.go"));
+    ASSERT_TRUE(cbm_is_test_path("test_handler.py"));
+    /* Non-test files */
+    ASSERT_FALSE(cbm_is_test_path("handler.ts"));
+    ASSERT_FALSE(cbm_is_test_path("contest.go"));
+    ASSERT_FALSE(cbm_is_test_path("latest.py"));
+    PASS();
+}
+
+TEST(test_func_name_go_patterns) {
+    /* Go test function names: Test + uppercase char */
+    ASSERT_TRUE(cbm_is_test_func_name("TestFoo"));
+    ASSERT_TRUE(cbm_is_test_func_name("TestHTTPHandler"));
+    /* Non-test: "Test" alone or Test + lowercase */
+    ASSERT_FALSE(cbm_is_test_func_name("Testable")); /* lowercase 'a' after Test */
+    PASS();
+}
+
+TEST(test_func_name_js_helpers) {
+    /* JS/TS test helper function names */
+    ASSERT_TRUE(cbm_is_test_func_name("it"));
+    ASSERT_TRUE(cbm_is_test_func_name("describe"));
+    ASSERT_TRUE(cbm_is_test_func_name("test"));
+    ASSERT_TRUE(cbm_is_test_func_name("beforeEach"));
+    ASSERT_TRUE(cbm_is_test_func_name("afterEach"));
+    PASS();
+}
+
+TEST(env_var_name_valid) {
+    /* Valid env var names: uppercase + underscores, at least 2 chars with uppercase */
+    ASSERT_TRUE(cbm_is_env_var_name("DATABASE_URL"));
+    ASSERT_TRUE(cbm_is_env_var_name("API_KEY"));
+    ASSERT_TRUE(cbm_is_env_var_name("PORT"));
+    ASSERT_TRUE(cbm_is_env_var_name("DB_2"));
+    ASSERT_TRUE(cbm_is_env_var_name("MY_VAR_123"));
+    PASS();
+}
+
+TEST(env_var_name_invalid) {
+    /* Invalid: too short, lowercase, mixed case, empty */
+    ASSERT_FALSE(cbm_is_env_var_name("A"));       /* single char */
+    ASSERT_FALSE(cbm_is_env_var_name("port"));    /* lowercase */
+    ASSERT_FALSE(cbm_is_env_var_name("apiKey"));  /* camelCase */
+    ASSERT_FALSE(cbm_is_env_var_name("__"));      /* no uppercase */
+    ASSERT_FALSE(cbm_is_env_var_name(""));        /* empty */
+    ASSERT_FALSE(cbm_is_env_var_name("123"));     /* digits only */
+    PASS();
+}
+
+TEST(config_ext_positive) {
+    /* Config file extensions recognized */
+    ASSERT_TRUE(cbm_has_config_extension(".env"));
+    ASSERT_TRUE(cbm_has_config_extension("config.yaml"));
+    ASSERT_TRUE(cbm_has_config_extension("config.yml"));
+    ASSERT_TRUE(cbm_has_config_extension("settings.toml"));
+    ASSERT_TRUE(cbm_has_config_extension("app.ini"));
+    ASSERT_TRUE(cbm_has_config_extension("data.json"));
+    ASSERT_TRUE(cbm_has_config_extension("app.properties"));
+    PASS();
+}
+
+TEST(config_ext_negative) {
+    /* Non-config extensions rejected */
+    ASSERT_FALSE(cbm_has_config_extension("main.go"));
+    ASSERT_FALSE(cbm_has_config_extension("app.py"));
+    ASSERT_FALSE(cbm_has_config_extension("handler.rs"));
+    ASSERT_FALSE(cbm_has_config_extension("data.csv"));
+    ASSERT_FALSE(cbm_has_config_extension("README.md"));
+    PASS();
+}
+
+TEST(split_camel_basic) {
+    /* Basic camelCase splitting */
+    char *parts[16];
+    int n;
+
+    n = cbm_split_camel_case("getCamelCase", parts, 16);
+    ASSERT_EQ(n, 3);
+    ASSERT_STR_EQ(parts[0], "get");
+    ASSERT_STR_EQ(parts[1], "Camel");
+    ASSERT_STR_EQ(parts[2], "Case");
+    for (int i = 0; i < n; i++) free(parts[i]);
+
+    PASS();
+}
+
+TEST(split_camel_single_word) {
+    /* Single lowercase word — no splits */
+    char *parts[16];
+    int n = cbm_split_camel_case("hello", parts, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(parts[0], "hello");
+    for (int i = 0; i < n; i++) free(parts[i]);
+    PASS();
+}
+
+TEST(split_camel_empty) {
+    /* Empty string — should return 0 or 1 empty part */
+    char *parts[16];
+    int n = cbm_split_camel_case("", parts, 16);
+    for (int i = 0; i < n; i++) free(parts[i]);
+    /* Either 0 parts or 1 empty part is acceptable */
+    ASSERT_TRUE(n >= 0 && n <= 1);
+    PASS();
+}
+
+TEST(tokenize_decorator_login_required) {
+    /* @login_required → ["login", "required"] */
+    char *tokens[16];
+    int n = cbm_tokenize_decorator("@login_required", tokens, 16);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(tokens[0], "login");
+    ASSERT_STR_EQ(tokens[1], "required");
+    for (int i = 0; i < n; i++) free(tokens[i]);
+    PASS();
+}
+
+TEST(tokenize_decorator_single) {
+    /* @Override → ["override"] */
+    char *tokens[16];
+    int n = cbm_tokenize_decorator("@Override", tokens, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(tokens[0], "override");
+    for (int i = 0; i < n; i++) free(tokens[i]);
+    PASS();
+}
+
+TEST(split_command_basic) {
+    /* Basic command splitting with spaces */
+    char *args[16];
+    int n = cbm_split_command("gcc -c main.c -o main.o", args, 16);
+    ASSERT_EQ(n, 5);
+    ASSERT_STR_EQ(args[0], "gcc");
+    ASSERT_STR_EQ(args[1], "-c");
+    ASSERT_STR_EQ(args[2], "main.c");
+    ASSERT_STR_EQ(args[3], "-o");
+    ASSERT_STR_EQ(args[4], "main.o");
+    for (int i = 0; i < n; i++) free(args[i]);
+    PASS();
+}
+
+TEST(split_command_quoted) {
+    /* Command with quoted arguments */
+    char *args[16];
+    int n = cbm_split_command("gcc -DFOO=\"bar baz\" main.c", args, 16);
+    ASSERT_GTE(n, 3);
+    ASSERT_STR_EQ(args[0], "gcc");
+    for (int i = 0; i < n; i++) free(args[i]);
+    PASS();
+}
+
+TEST(split_command_empty) {
+    /* Empty command string */
+    char *args[16];
+    int n = cbm_split_command("", args, 16);
+    ASSERT_EQ(n, 0);
+    PASS();
+}
+
+TEST(parse_range_with_count) {
+    /* "10,5" → start=10, count=5 */
+    int start, count;
+    cbm_parse_range("10,5", &start, &count);
+    ASSERT_EQ(start, 10);
+    ASSERT_EQ(count, 5);
+    PASS();
+}
+
+TEST(parse_range_single) {
+    /* "42" → start=42, count=1 */
+    int start, count;
+    cbm_parse_range("42", &start, &count);
+    ASSERT_EQ(start, 42);
+    ASSERT_EQ(count, 1);
+    PASS();
+}
+
+TEST(parse_range_zero_count) {
+    /* "100,0" → start=100, count=0 */
+    int start, count;
+    cbm_parse_range("100,0", &start, &count);
+    ASSERT_EQ(start, 100);
+    ASSERT_EQ(count, 0);
+    PASS();
+}
+
+TEST(parse_name_status_basic) {
+    /* Parse standard git diff --name-status output */
+    const char *input = "M\tsrc/main.go\n"
+                        "A\tsrc/new.go\n"
+                        "D\tsrc/old.go\n";
+    cbm_changed_file_t files[16];
+    int n = cbm_parse_name_status(input, files, 16);
+    /* Exact count depends on which files pass cbm_is_trackable_file */
+    ASSERT_GTE(n, 0);
+    ASSERT_LTE(n, 3);
+    PASS();
+}
+
+TEST(parse_name_status_empty) {
+    /* Empty input */
+    cbm_changed_file_t files[16];
+    int n = cbm_parse_name_status("", files, 16);
+    ASSERT_EQ(n, 0);
+    PASS();
+}
+
+TEST(parse_hunks_empty) {
+    /* Empty input */
+    cbm_changed_hunk_t hunks[16];
+    int n = cbm_parse_hunks("", hunks, 16);
+    ASSERT_EQ(n, 0);
+    PASS();
+}
+
+TEST(coupling_empty_commits) {
+    /* Zero commits → zero couplings */
+    cbm_change_coupling_t results[16];
+    int n = cbm_compute_change_coupling(NULL, 0, results, 16);
+    ASSERT_EQ(n, 0);
+    PASS();
+}
+
+TEST(coupling_single_file_commit) {
+    /* Commits with single files → no pairs → zero couplings */
+    char *f1[] = {"a.go"};
+    char *f2[] = {"b.go"};
+    cbm_commit_files_t commits[] = {{f1, 1}, {f2, 1}};
+    cbm_change_coupling_t results[16];
+    int n = cbm_compute_change_coupling(commits, 2, results, 16);
+    ASSERT_EQ(n, 0);
+    PASS();
+}
+
+TEST(clean_json_brackets_array) {
+    /* JSON array → space-joined */
+    char out[256];
+    cbm_clean_json_brackets("[\"./app\", \"--flag\"]", out, sizeof(out));
+    ASSERT_TRUE(strstr(out, "./app") != NULL);
+    ASSERT_TRUE(strstr(out, "--flag") != NULL);
+    PASS();
+}
+
+TEST(clean_json_brackets_plain) {
+    /* Plain string → unchanged */
+    char out[256];
+    cbm_clean_json_brackets("./app --flag", out, sizeof(out));
+    ASSERT_STR_EQ(out, "./app --flag");
+    PASS();
+}
+
+TEST(clean_json_brackets_empty) {
+    /* Empty string → empty output */
+    char out[256];
+    cbm_clean_json_brackets("", out, sizeof(out));
+    ASSERT_STR_EQ(out, "");
+    PASS();
+}
+
+TEST(fqn_compute_basic) {
+    /* Basic FQN: project.dir.name */
+    char *fqn = cbm_pipeline_fqn_compute("proj", "pkg/handler.go", "Serve");
+    ASSERT_NOT_NULL(fqn);
+    ASSERT_TRUE(strstr(fqn, "proj") != NULL);
+    ASSERT_TRUE(strstr(fqn, "Serve") != NULL);
+    free(fqn);
+    PASS();
+}
+
+TEST(fqn_compute_strips_ext) {
+    /* FQN should strip file extension */
+    char *fqn = cbm_pipeline_fqn_compute("proj", "main.go", "main");
+    ASSERT_NOT_NULL(fqn);
+    /* Should not contain ".go" */
+    ASSERT_TRUE(strstr(fqn, ".go") == NULL);
+    ASSERT_TRUE(strstr(fqn, "main") != NULL);
+    free(fqn);
+    PASS();
+}
+
+TEST(fqn_module_basic) {
+    /* Module QN: project.dir.parts */
+    char *mod = cbm_pipeline_fqn_module("proj", "pkg/util/helper.go");
+    ASSERT_NOT_NULL(mod);
+    ASSERT_TRUE(strstr(mod, "proj") != NULL);
+    free(mod);
+    PASS();
+}
+
+TEST(fqn_folder_basic) {
+    /* Folder QN from directory path */
+    char *folder = cbm_pipeline_fqn_folder("proj", "pkg/util");
+    ASSERT_NOT_NULL(folder);
+    ASSERT_TRUE(strstr(folder, "proj") != NULL);
+    free(folder);
+    PASS();
+}
+
+TEST(project_name_special_chars) {
+    /* Project name with colons, slashes — should be normalized */
+    char *name = cbm_project_name_from_path("/home/user/my:project");
+    ASSERT_NOT_NULL(name);
+    /* Colons should be converted to dashes */
+    ASSERT_TRUE(strchr(name, ':') == NULL);
+    ASSERT_TRUE(strchr(name, '/') == NULL);
+    free(name);
+    PASS();
+}
+
+TEST(project_name_trailing_slash) {
+    /* Trailing slash should not affect result */
+    char *a = cbm_project_name_from_path("/home/user/project");
+    ASSERT_NOT_NULL(a);
+    free(a);
+    PASS();
+}
+
 SUITE(pipeline) {
+    /* Index lock */
+    RUN_TEST(pipeline_lock_try_acquire);
+    RUN_TEST(pipeline_lock_blocking);
+    RUN_TEST(pipeline_lock_contention);
+    RUN_TEST(pipeline_lock_release_allows_contender);
     /* Lifecycle */
     RUN_TEST(pipeline_create_free);
     RUN_TEST(pipeline_null_repo);
@@ -5257,9 +5832,9 @@ SUITE(pipeline) {
     RUN_TEST(infra_is_cloudbuild_file);
     RUN_TEST(infra_is_shell_script);
     RUN_TEST(infra_is_dockerfile);
-    RUN_TEST(infra_is_env_file);
     RUN_TEST(infra_is_kustomize_file);
     RUN_TEST(infra_is_k8s_manifest);
+    RUN_TEST(infra_is_env_file);
     RUN_TEST(infra_clean_json_brackets);
     /* K8s extraction tests */
     RUN_TEST(k8s_extract_kustomize);
@@ -5332,12 +5907,74 @@ SUITE(pipeline) {
     RUN_TEST(githistory_coupling_skips_large_commits);
     RUN_TEST(githistory_coupling_limits_output);
     /* Incremental reindex */
+    /* FastAPI Depends edge tracking */
+    RUN_TEST(pipeline_fastapi_depends_edges);
+    /* Incremental */
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_detects_changed_file);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
     RUN_TEST(incremental_k8s_manifest_indexed);
     RUN_TEST(incremental_kustomize_module_indexed);
+    /* Resource management & internal helper tests */
+    RUN_TEST(pipeline_empty_path);
+    RUN_TEST(pipeline_project_name_content);
+    RUN_TEST(pipeline_cancel_sets_flag);
+    RUN_TEST(pipeline_double_cancel);
+    RUN_TEST(pipeline_double_free_prevention);
+    /* Trackable file tests */
+    RUN_TEST(trackable_source_files);
+    RUN_TEST(trackable_rejects_images);
+    RUN_TEST(trackable_rejects_minified);
+    RUN_TEST(trackable_rejects_vendor_dirs);
+    RUN_TEST(trackable_rejects_lock_files);
+    /* Test path detection */
+    RUN_TEST(test_path_directory_patterns);
+    RUN_TEST(test_path_suffix_patterns);
+    /* Test function name detection */
+    RUN_TEST(test_func_name_go_patterns);
+    RUN_TEST(test_func_name_js_helpers);
+    /* Env var name detection */
+    RUN_TEST(env_var_name_valid);
+    RUN_TEST(env_var_name_invalid);
+    /* Config extension detection */
+    RUN_TEST(config_ext_positive);
+    RUN_TEST(config_ext_negative);
+    /* Camel case splitting */
+    RUN_TEST(split_camel_basic);
+    RUN_TEST(split_camel_single_word);
+    RUN_TEST(split_camel_empty);
+    /* Decorator tokenization */
+    RUN_TEST(tokenize_decorator_login_required);
+    RUN_TEST(tokenize_decorator_single);
+    /* Command splitting */
+    RUN_TEST(split_command_basic);
+    RUN_TEST(split_command_quoted);
+    RUN_TEST(split_command_empty);
+    /* Range parsing */
+    RUN_TEST(parse_range_with_count);
+    RUN_TEST(parse_range_single);
+    RUN_TEST(parse_range_zero_count);
+    /* Name status parsing */
+    RUN_TEST(parse_name_status_basic);
+    RUN_TEST(parse_name_status_empty);
+    /* Hunk parsing */
+    RUN_TEST(parse_hunks_empty);
+    /* Change coupling */
+    RUN_TEST(coupling_empty_commits);
+    RUN_TEST(coupling_single_file_commit);
+    /* JSON bracket cleaning */
+    RUN_TEST(clean_json_brackets_array);
+    RUN_TEST(clean_json_brackets_plain);
+    RUN_TEST(clean_json_brackets_empty);
+    /* FQN computation */
+    RUN_TEST(fqn_compute_basic);
+    RUN_TEST(fqn_compute_strips_ext);
+    RUN_TEST(fqn_module_basic);
+    RUN_TEST(fqn_folder_basic);
+    /* Project name edge cases */
+    RUN_TEST(project_name_special_chars);
+    RUN_TEST(project_name_trailing_slash);
     /* Release pipeline-level global state (compiled regex patterns etc.).
      * Patterns are compiled on first use and cached; free once at suite end. */
     cbm_pipeline_global_cleanup();

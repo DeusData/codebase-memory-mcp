@@ -9,6 +9,7 @@ int tf_fail_count = 0;
 int tf_skip_count = 0;
 
 #include "test_framework.h"
+#include <sqlite3.h>
 
 /* Forward declarations of suite functions */
 extern void suite_arena(void);
@@ -27,12 +28,13 @@ extern void suite_store_bulk(void);
 extern void suite_cypher(void);
 extern void suite_mcp(void);
 extern void suite_language(void);
+extern void suite_userconfig(void);
 extern void suite_gitignore(void);
 extern void suite_discover(void);
-extern void suite_userconfig(void);
 extern void suite_graph_buffer(void);
 extern void suite_registry(void);
 extern void suite_pipeline(void);
+extern void suite_fqn(void);
 extern void suite_watcher(void);
 extern void suite_lz4(void);
 extern void suite_sqlite_writer(void);
@@ -54,6 +56,8 @@ extern void suite_depindex(void);
 extern void suite_pagerank(void);
 extern void suite_tool_consolidation(void);
 extern void suite_input_validation(void);
+extern void suite_security(void);
+extern void suite_yaml(void);
 extern void suite_integration(void);
 
 int main(void) {
@@ -86,6 +90,7 @@ int main(void) {
 
     /* Discover (M2) */
     RUN_SUITE(language);
+    RUN_SUITE(userconfig);
     RUN_SUITE(gitignore);
     RUN_SUITE(discover);
     RUN_SUITE(userconfig);
@@ -96,6 +101,7 @@ int main(void) {
     /* Pipeline (M8) */
     RUN_SUITE(registry);
     RUN_SUITE(pipeline);
+    RUN_SUITE(fqn);
 
     /* Watcher (M10) */
     RUN_SUITE(watcher);
@@ -154,8 +160,19 @@ int main(void) {
     /* Input validation (fuzz-derived) */
     RUN_SUITE(input_validation);
 
+    /* Security defenses */
+    RUN_SUITE(security);
+
+    /* YAML parser */
+    RUN_SUITE(yaml);
+
+    /* FQN computation */
+    RUN_SUITE(fqn);
+
     /* Integration (end-to-end) */
     RUN_SUITE(integration);
 
+    /* Release sqlite3 internal caches so ASan doesn't report them as leaks */
+    sqlite3_shutdown();
     TEST_SUMMARY();
 }

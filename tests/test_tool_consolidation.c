@@ -372,7 +372,7 @@ TEST(resources_read_unknown_uri) {
 }
 
 TEST(initialize_advertises_resources_capability) {
-    char *resp = cbm_mcp_initialize_response();
+    char *resp = cbm_mcp_initialize_response(NULL);
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "resources"));
     ASSERT_NOT_NULL(strstr(resp, "listChanged"));
@@ -438,7 +438,7 @@ TEST(no_resources_capability_gets_context_injection) {
 /* ── 8. MCP spec compliance tests ─────────────────────────── */
 
 TEST(initialize_response_has_protocol_version) {
-    char *resp = cbm_mcp_initialize_response();
+    char *resp = cbm_mcp_initialize_response(NULL);
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "protocolVersion"));
     ASSERT_NOT_NULL(strstr(resp, "2024-11-05"));
@@ -450,7 +450,7 @@ TEST(initialize_response_has_protocol_version) {
 
 TEST(initialize_resources_cap_subscribe_false) {
     /* Server must advertise subscribe:false (we don't support per-resource subscriptions) */
-    char *resp = cbm_mcp_initialize_response();
+    char *resp = cbm_mcp_initialize_response(NULL);
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"subscribe\":false"));
     ASSERT_NOT_NULL(strstr(resp, "\"listChanged\":true"));

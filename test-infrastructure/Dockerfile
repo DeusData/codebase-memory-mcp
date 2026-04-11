@@ -13,6 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ make \
     zlib1g-dev \
     pkg-config \
+    python3 \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src

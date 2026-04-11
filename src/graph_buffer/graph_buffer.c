@@ -335,7 +335,14 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
 
     char id_buf[32];
     make_id_key(id_buf, sizeof(id_buf), id);
-    cbm_ht_set(gb->node_by_id, strdup(id_buf), node);
+    /* Check if key exists — if so, reuse old heap key to avoid leak.
+     * cbm_ht_set replaces key pointer, leaking old strdup'd key. */
+    const char *existing_key = cbm_ht_get_key(gb->node_by_id, id_buf);
+    if (existing_key) {
+        cbm_ht_set(gb->node_by_id, existing_key, node);
+    } else {
+        cbm_ht_set(gb->node_by_id, strdup(id_buf), node);
+    }
 
     /* Secondary indexes */
     node_ptr_array_t *by_label = get_or_create_node_array(gb->nodes_by_label, label ? label : "");
@@ -799,7 +806,12 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src) {
             cbm_ht_set(dst->node_by_qn, node->qualified_name, node);
             char id_buf[32];
             make_id_key(id_buf, sizeof(id_buf), node->id);
-            cbm_ht_set(dst->node_by_id, strdup(id_buf), node);
+            const char *old_id_key = cbm_ht_get_key(dst->node_by_id, id_buf);
+            if (old_id_key) {
+                cbm_ht_set(dst->node_by_id, old_id_key, node);
+            } else {
+                cbm_ht_set(dst->node_by_id, strdup(id_buf), node);
+            }
 
             /* Secondary indexes */
             node_ptr_array_t *by_label =
@@ -999,22 +1011,11 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     cbm_ht_free(gb->edges_by_type);
     gb->edges_by_type = NULL;
 
-    /* Write to .tmp first, then atomic rename */
-    char tmp_path[1040];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
-
-    int rc = cbm_write_db(tmp_path, gb->project, gb->root_path, indexed_at, dump_nodes, node_idx,
+    /* Write directly to final path — no .tmp + rename.
+     * Callers must delete the old .db before calling this (reindex)
+     * or ensure no file exists (first index). */
+    int rc = cbm_write_db(path, gb->project, gb->root_path, indexed_at, dump_nodes, node_idx,
                           dump_edges, edge_idx);
-
-    if (rc == 0) {
-        rc = rename(tmp_path, path);
-        if (rc != 0) {
-            cbm_log_error("gbuf.dump", "op", "rename", "path", path);
-        }
-    } else {
-        // NOLINTNEXTLINE(cert-err33-c) — best-effort cleanup
-        remove(tmp_path);
-    }
 
     {
         char b1[16];

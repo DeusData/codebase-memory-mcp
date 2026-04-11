@@ -266,6 +266,7 @@ int cbm_exec_no_shell(const char *const *argv) {
     }
     if (pid == 0) {
         /* Child: exec directly — no shell interpretation */
+        /* 127 = standard "command not found" exit code (POSIX convention) */
         enum { EXEC_NOT_FOUND = 127 };
         execvp(argv[0], (char *const *)argv);
         _exit(EXEC_NOT_FOUND);

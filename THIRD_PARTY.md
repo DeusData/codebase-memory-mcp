@@ -15,7 +15,7 @@ The tree-sitter C runtime is vendored in `internal/cbm/vendored/ts_runtime/`.
 
 Pre-generated parser sources are vendored in `internal/cbm/vendored/grammars/<lang>/`.
 Each grammar is the work of its upstream authors; we vendor only the generated
-`parser.c` (and `scanner.c` where applicable) for CGo compilation.
+`parser.c` (and `scanner.c` where applicable) for static compilation.
 
 | Grammar | Upstream Repository | License | Copyright |
 |---------|-------------------|---------|-----------|
@@ -84,16 +84,18 @@ Each grammar is the work of its upstream authors; we vendor only the generated
 | yaml | [tree-sitter/tree-sitter-yaml](https://github.com/tree-sitter/tree-sitter-yaml) | MIT | (c) Max Brunsfeld |
 | zig | [tree-sitter/tree-sitter-zig](https://github.com/tree-sitter/tree-sitter-zig) | MIT | (c) Max Brunsfeld |
 
-## Go Module Dependencies
+## Vendored C Libraries
 
-| Module | License | Project |
-|--------|---------|---------|
-| github.com/mattn/go-sqlite3 | MIT | [mattn/go-sqlite3](https://github.com/mattn/go-sqlite3) |
-| github.com/modelcontextprotocol/go-sdk | MIT | [modelcontextprotocol/go-sdk](https://github.com/modelcontextprotocol/go-sdk) |
-| github.com/zeebo/xxh3 | BSD-2-Clause | [zeebo/xxh3](https://github.com/zeebo/xxh3) |
-| golang.org/x/sync | BSD-3-Clause | [golang.org/x/sync](https://pkg.go.dev/golang.org/x/sync) |
-| golang.org/x/sys | BSD-3-Clause | [golang.org/x/sys](https://pkg.go.dev/golang.org/x/sys) |
-| gopkg.in/yaml.v3 | MIT + Apache-2.0 | [go-yaml/yaml](https://github.com/go-yaml/yaml) |
+All C dependencies are vendored in `vendored/` — zero system library dependencies required.
+
+| Library | License | Project |
+|---------|---------|---------|
+| SQLite 3 | Public Domain | [sqlite.org](https://www.sqlite.org/) |
+| mimalloc | MIT | [microsoft/mimalloc](https://github.com/microsoft/mimalloc) |
+| Mongoose | Dual GPLv2 / Commercial | [cesanta/mongoose](https://github.com/cesanta/mongoose) |
+| yyjson | MIT | [ibireme/yyjson](https://github.com/ibireme/yyjson) |
+| xxHash | BSD-2-Clause | [Cyan4973/xxHash](https://github.com/Cyan4973/xxHash) |
+| TRE | BSD-2-Clause | [laurikari/tre](https://github.com/laurikari/tre) |
 
 ## Notes
 
