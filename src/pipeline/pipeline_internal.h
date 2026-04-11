@@ -47,9 +47,9 @@ typedef struct {
     char *base_url; /* compilerOptions.baseUrl (NULL if not set) */
 } cbm_path_alias_map_t;
 
-/* Load path aliases from tsconfig.json in repo_path.
+/* Load path aliases from a single tsconfig.json file.
  * Returns heap-allocated map (caller frees via cbm_path_alias_map_free).
- * Returns NULL if no tsconfig.json or no paths configured. */
+ * Returns NULL if file doesn't exist or has no paths configured. */
 cbm_path_alias_map_t *cbm_load_tsconfig_paths(const char *repo_path);
 
 /* Free a path alias map. NULL-safe. */
@@ -59,6 +59,33 @@ void cbm_path_alias_map_free(cbm_path_alias_map_t *map);
  * Returns heap-allocated resolved path, or NULL if no alias matches.
  * The returned path is relative to repo root (e.g. "src/lib/auth"). */
 char *cbm_resolve_path_alias(const cbm_path_alias_map_t *map, const char *module_path);
+
+/* ── Monorepo tsconfig collection ──────────────────────────────── */
+
+/* A tsconfig entry scoped to a directory within the repo. */
+typedef struct {
+    char *dir_prefix;           /* relative dir (e.g. "apps/manager"), "" for root */
+    cbm_path_alias_map_t *map;  /* the parsed alias map for this tsconfig */
+} cbm_tsconfig_entry_t;
+
+typedef struct {
+    cbm_tsconfig_entry_t *entries;
+    int count;
+} cbm_tsconfig_collection_t;
+
+/* Walk a repository for tsconfig.json/jsconfig.json files, parse each,
+ * and return a collection of alias maps scoped by directory.
+ * Entries are sorted by dir_prefix length descending (most specific first).
+ * Returns NULL if no tsconfigs with paths found. */
+cbm_tsconfig_collection_t *cbm_load_all_tsconfig_paths(const char *repo_path);
+
+/* Free a tsconfig collection. NULL-safe. */
+void cbm_tsconfig_collection_free(cbm_tsconfig_collection_t *coll);
+
+/* Find the alias map for a file by walking up from its directory.
+ * Returns the nearest ancestor tsconfig's alias map, or NULL. */
+const cbm_path_alias_map_t *cbm_find_path_aliases(const cbm_tsconfig_collection_t *coll,
+                                                   const char *rel_path);
 
 /* ── Pipeline context (internal) ─────────────────────────────────── */
 
@@ -78,9 +105,9 @@ typedef struct {
      * Indexed by file position in the files[] array. Owned by pipeline.c. */
     CBMFileResult **result_cache;
 
-    /* Path alias map from tsconfig.json (NULL if no aliases configured).
-     * Owned by pipeline.c — freed after all passes complete. */
-    const cbm_path_alias_map_t *path_aliases;
+    /* Path alias collection from tsconfig.json files across the repo.
+     * NULL if no tsconfigs with paths found. Owned by pipeline.c. */
+    const cbm_tsconfig_collection_t *path_aliases;
 } cbm_pipeline_ctx_t;
 
 /* Check cancellation. Returns non-zero if cancelled. */

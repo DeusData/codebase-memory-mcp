@@ -788,7 +788,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     CBM_PROF_START(t_pipeline_total);
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
-    cbm_path_alias_map_t *path_aliases = NULL;
+    cbm_tsconfig_collection_t *path_aliases = NULL;
 
     /* Load user-defined extension overrides (fail-open: NULL on error) */
     CBM_PROF_START(t_userconfig);
@@ -829,8 +829,8 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     p->gbuf = cbm_gbuf_new(p->project_name, p->repo_path);
     p->registry = cbm_registry_new();
 
-    /* Load tsconfig.json path aliases (if present) */
-    path_aliases = cbm_load_tsconfig_paths(p->repo_path);
+    /* Load tsconfig.json path aliases from all tsconfigs in the repo */
+    path_aliases = cbm_load_all_tsconfig_paths(p->repo_path);
 
     /* Build shared context for pass functions */
     cbm_pipeline_ctx_t ctx = {
@@ -864,7 +864,7 @@ cleanup:
     p->gbuf = NULL;
     cbm_registry_free(p->registry);
     p->registry = NULL;
-    cbm_path_alias_map_free(path_aliases);
+    cbm_tsconfig_collection_free(path_aliases);
     /* Clear and free user extension config */
     cbm_set_user_lang_config(NULL);
     cbm_userconfig_free(p->userconfig);

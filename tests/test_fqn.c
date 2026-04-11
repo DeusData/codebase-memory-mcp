@@ -706,9 +706,110 @@ TEST(path_alias_null_path) {
 /* ── tsconfig file loading ──────────────────────────────────── */
 
 TEST(tsconfig_load_nonexistent) {
-    /* Should return NULL for a directory with no tsconfig.json */
     cbm_path_alias_map_t *map = cbm_load_tsconfig_paths("/tmp/nonexistent-dir-xyz-12345");
     ASSERT_NULL(map);
+    PASS();
+}
+
+/* ── Monorepo collection: cbm_find_path_aliases ─────────────── */
+
+/* Helper: build a collection manually for testing */
+static cbm_tsconfig_collection_t *make_collection(int count, ...) {
+    cbm_tsconfig_collection_t *coll = calloc(1, sizeof(cbm_tsconfig_collection_t));
+    coll->entries = calloc((size_t)count, sizeof(cbm_tsconfig_entry_t));
+    coll->count = count;
+
+    va_list args;
+    va_start(args, count);
+    for (int i = 0; i < count; i++) {
+        const char *dir = va_arg(args, const char *);
+        const char *alias = va_arg(args, const char *);
+        const char *target = va_arg(args, const char *);
+        coll->entries[i].dir_prefix = strdup(dir);
+        coll->entries[i].map = make_alias_map(NULL, 1, alias, target);
+    }
+    va_end(args);
+
+    /* Sort by dir_prefix length descending (same as real loader) */
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = i + 1; j < count; j++) {
+            size_t li = strlen(coll->entries[i].dir_prefix);
+            size_t lj = strlen(coll->entries[j].dir_prefix);
+            if (lj > li) {
+                cbm_tsconfig_entry_t tmp = coll->entries[i];
+                coll->entries[i] = coll->entries[j];
+                coll->entries[j] = tmp;
+            }
+        }
+    }
+
+    return coll;
+}
+
+TEST(find_aliases_nearest_ancestor) {
+    /* apps/manager has its own tsconfig, root has a different one */
+    cbm_tsconfig_collection_t *coll = make_collection(2,
+        "", "@/*", "src/*",
+        "apps/manager", "@/*", "apps/manager/src/*");
+
+    /* File in apps/manager should use the manager tsconfig */
+    const cbm_path_alias_map_t *map =
+        cbm_find_path_aliases(coll, "apps/manager/src/lib/auth.ts");
+    ASSERT_NOT_NULL(map);
+    char *r = cbm_resolve_path_alias(map, "@/lib/auth");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(r, "apps/manager/src/lib/auth");
+    free(r);
+
+    /* File at root should use the root tsconfig */
+    const cbm_path_alias_map_t *root_map =
+        cbm_find_path_aliases(coll, "src/utils.ts");
+    ASSERT_NOT_NULL(root_map);
+    char *r2 = cbm_resolve_path_alias(root_map, "@/utils");
+    ASSERT_NOT_NULL(r2);
+    ASSERT_STR_EQ(r2, "src/utils");
+    free(r2);
+
+    cbm_tsconfig_collection_free(coll);
+    PASS();
+}
+
+TEST(find_aliases_no_match) {
+    /* Only apps/manager has a tsconfig — file in packages/ has no match */
+    cbm_tsconfig_collection_t *coll = make_collection(1,
+        "apps/manager", "@/*", "apps/manager/src/*");
+
+    const cbm_path_alias_map_t *map =
+        cbm_find_path_aliases(coll, "packages/shared/src/types.ts");
+    ASSERT_NULL(map);
+
+    cbm_tsconfig_collection_free(coll);
+    PASS();
+}
+
+TEST(find_aliases_null_collection) {
+    const cbm_path_alias_map_t *map = cbm_find_path_aliases(NULL, "src/foo.ts");
+    ASSERT_NULL(map);
+    PASS();
+}
+
+TEST(find_aliases_root_only) {
+    /* Single root tsconfig — should match any file */
+    cbm_tsconfig_collection_t *coll = make_collection(1,
+        "", "@/*", "src/*");
+
+    const cbm_path_alias_map_t *map =
+        cbm_find_path_aliases(coll, "deep/nested/file.ts");
+    ASSERT_NOT_NULL(map);
+
+    cbm_tsconfig_collection_free(coll);
+    PASS();
+}
+
+TEST(collection_load_nonexistent) {
+    cbm_tsconfig_collection_t *coll =
+        cbm_load_all_tsconfig_paths("/tmp/nonexistent-dir-xyz-12345");
+    ASSERT_NULL(coll);
     PASS();
 }
 
@@ -831,4 +932,11 @@ SUITE(fqn) {
     RUN_TEST(path_alias_null_map);
     RUN_TEST(path_alias_null_path);
     RUN_TEST(tsconfig_load_nonexistent);
+
+    /* monorepo collection */
+    RUN_TEST(find_aliases_nearest_ancestor);
+    RUN_TEST(find_aliases_no_match);
+    RUN_TEST(find_aliases_null_collection);
+    RUN_TEST(find_aliases_root_only);
+    RUN_TEST(collection_load_nonexistent);
 }
