@@ -1706,28 +1706,12 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
  * nodes (e.g., an empty or half-initialised project).
  * Callers that receive a non-NULL return value must free(project) themselves
  * before returning the error string. */
-static char *verify_project_indexed(cbm_store_t *store, const char *project) {
-    cbm_project_t proj_check = {0};
-    if (cbm_store_get_project(store, project, &proj_check) != CBM_STORE_OK) {
-        return cbm_mcp_text_result(
-            "{\"error\":\"project not indexed — run index_repository first\"}", true);
-    }
-    cbm_project_free_fields(&proj_check);
-    return NULL;
-}
-
 static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     char *raw_project = cbm_mcp_get_string_arg(args, "project");
     project_expand_t pe = {0};
     cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
     char *project = pe.value;
     REQUIRE_STORE(store, project);
-
-    char *not_indexed = verify_project_indexed(store, project);
-    if (not_indexed) {
-        free(project);
-        return not_indexed;
-    }
 
     cbm_schema_info_t schema = {0};
     cbm_store_get_schema(store, project, &schema);
@@ -2505,12 +2489,6 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
     char *project = pe.value;
     REQUIRE_STORE(store, project);
-
-    char *not_indexed = verify_project_indexed(store, project);
-    if (not_indexed) {
-        free(project);
-        return not_indexed;
-    }
 
     cbm_schema_info_t schema = {0};
     cbm_store_get_schema(store, project, &schema);
