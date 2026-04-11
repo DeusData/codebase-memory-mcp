@@ -954,6 +954,72 @@ TEST(source_search_no_project_falls_back_to_session) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  Path-based auto-index: project= is a full directory path that is
+ *  NOT under session_root (Bug #4 — .gitignore-excluded separate repo)
+ *
+ *  When project= is an absolute path to an accessible directory that
+ *  hasn't been indexed yet and differs from session_root, codebase-memory
+ *  must auto-index that path directly (not session_root).
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(path_project_auto_indexes_separate_directory) {
+    /* Create two separate temp dirs:
+     *   session_tmp = first project queried (establishes session_root via public API)
+     *   target_tmp  = second project queried (separate path, simulates .gitignore subdir)
+     *
+     * Workflow mirrors Bug #4: user queries upstream repo that lives in .gitignore
+     * of the main project, after the main project session is already active. */
+    char session_tmp[256];
+    snprintf(session_tmp, sizeof(session_tmp), "/tmp/cbm_path_ai_sess_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(session_tmp));
+
+    char session_src[320];
+    snprintf(session_src, sizeof(session_src), "%s/main.c", session_tmp);
+    FILE *fp = fopen(session_src, "w");
+    if (fp) { fputs("void session_fn(void) {}\n", fp); fclose(fp); }
+
+    char target_tmp[256];
+    snprintf(target_tmp, sizeof(target_tmp), "/tmp/cbm_path_ai_tgt_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(target_tmp));
+
+    char target_src[320];
+    snprintf(target_src, sizeof(target_src), "%s/upstream.c", target_tmp);
+    fp = fopen(target_src, "w");
+    if (fp) { fputs("void path_autoindex_sentinel(void) {}\n", fp); fclose(fp); }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* First query: session project path → establishes session_root internally */
+    char args1[512];
+    snprintf(args1, sizeof(args1),
+             "{\"project\":\"%s\",\"pattern\":\"session_fn\",\"search_in\":\"source\"}",
+             session_tmp);
+    char *raw1 = cbm_mcp_handle_tool(srv, "search_code_graph", args1);
+    free(raw1); /* result not checked — just establishing session_root */
+
+    /* Second query: DIFFERENT path — resolve_project_store must auto-index it.
+     * Use graph search (not source grep) so resolve_project_store runs the
+     * path-based auto-index and the indexed nodes are searchable. */
+    char args2[512];
+    snprintf(args2, sizeof(args2),
+             "{\"project\":\"%s\",\"pattern\":\"path_autoindex_sentinel\"}", target_tmp);
+    char *raw2 = cbm_mcp_handle_tool(srv, "search_code_graph", args2);
+    char *resp = extract_text(raw2); free(raw2);
+    ASSERT_NOT_NULL(resp);
+
+    bool has_match = strstr(resp, "path_autoindex_sentinel") != NULL;
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    unlink(target_src); rmdir(target_tmp);
+    unlink(session_src); rmdir(session_tmp);
+
+    ASSERT_TRUE(has_match);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  Regression: classic tool names still work
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -1075,6 +1141,7 @@ void suite_input_validation(void) {
     RUN_TEST(manage_adr_slug_project_finds_root);
     RUN_TEST(source_search_tilde_project_expands);
     RUN_TEST(source_search_no_project_falls_back_to_session);
+    RUN_TEST(path_project_auto_indexes_separate_directory);
     RUN_TEST(regression_trace_call_path_tool_name_still_works);
     RUN_TEST(config_context_injection_disabled);
     RUN_TEST(config_context_injection_enabled_by_default);
