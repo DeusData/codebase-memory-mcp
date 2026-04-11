@@ -8,6 +8,10 @@
 
 #include <pthread.h>
 #include <stdlib.h>
+
+/* Default 8MB stack for all threads. macOS ARM64 default is only 512KB,
+ * which is too small for deep pipeline passes (configlink, etc.). */
+#define CBM_DEFAULT_STACK_SIZE (8 * 1024 * 1024)
 #include <string.h>
 
 /* ── Thread ───────────────────────────────────────────────────── */
@@ -29,6 +33,9 @@ static DWORD WINAPI win_thread_wrapper(LPVOID lpParam) {
 }
 
 int cbm_thread_create(cbm_thread_t *t, size_t stack_size, void *(*fn)(void *), void *arg) {
+    if (stack_size == 0) {
+        stack_size = CBM_DEFAULT_STACK_SIZE;
+    }
     win_thread_arg_t *a = (win_thread_arg_t *)malloc(sizeof(win_thread_arg_t));
     if (!a) {
         return -1;
@@ -54,11 +61,12 @@ int cbm_thread_join(cbm_thread_t *t) {
 #else /* POSIX */
 
 int cbm_thread_create(cbm_thread_t *t, size_t stack_size, void *(*fn)(void *), void *arg) {
+    if (stack_size == 0) {
+        stack_size = CBM_DEFAULT_STACK_SIZE;
+    }
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    if (stack_size > 0) {
-        pthread_attr_setstacksize(&attr, stack_size);
-    }
+    pthread_attr_setstacksize(&attr, stack_size);
     int rc = pthread_create(&t->handle, &attr, fn, arg);
     pthread_attr_destroy(&attr);
     return rc;

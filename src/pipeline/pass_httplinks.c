@@ -260,25 +260,34 @@ static int discover_node_routes(const cbm_gbuf_node_t *n, const cbm_pipeline_ctx
     }
     free_decorators(decs);
 
-    /* 2. Source-based routes (Go gin/chi, Express, Laravel, Ktor) */
+    /* 2. Source-based routes — scoped by file extension to avoid
+     * cross-framework false positives (e.g. Ktor regex matching PHP Cache::get) */
     if (n->file_path && n->start_line > 0 && n->end_line > 0 && total < max_out) {
         char *source = read_source_lines(ctx, n->file_path, n->start_line, n->end_line);
         if (source) {
-            int nr = cbm_extract_go_routes(n->name, n->qualified_name, source, out + total,
+            const char *fp = n->file_path;
+            int nr;
+
+            if (has_suffix(fp, ".go")) {
+                nr = cbm_extract_go_routes(n->name, n->qualified_name, source, out + total,
                                            max_out - total);
-            total += nr;
-
-            nr = cbm_extract_express_routes(n->name, n->qualified_name, source, out + total,
-                                            max_out - total);
-            total += nr;
-
-            nr = cbm_extract_laravel_routes(n->name, n->qualified_name, source, out + total,
-                                            max_out - total);
-            total += nr;
-
-            nr = cbm_extract_ktor_routes(n->name, n->qualified_name, source, out + total,
-                                         max_out - total);
-            total += nr;
+                total += nr;
+            }
+            if (is_jsts_file(fp)) {
+                nr = cbm_extract_express_routes(n->name, n->qualified_name, source, out + total,
+                                                max_out - total);
+                total += nr;
+            }
+            if (has_suffix(fp, ".php")) {
+                nr = cbm_extract_laravel_routes(n->name, n->qualified_name, source, out + total,
+                                                max_out - total);
+                total += nr;
+            }
+            if (has_suffix(fp, ".kt") || has_suffix(fp, ".kts")) {
+                nr = cbm_extract_ktor_routes(n->name, n->qualified_name, source, out + total,
+                                             max_out - total);
+                total += nr;
+            }
 
             free(source);
         }

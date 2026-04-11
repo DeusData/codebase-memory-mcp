@@ -136,6 +136,11 @@ void cbm_arena_reset(CBMArena *a) {
     }
     a->used = 0;
     a->total_alloc = 0;
+    /* Reset block_size to match surviving block — prevents overflow if
+     * block_size grew during previous allocations (e.g., 128 → 256). */
+    if (a->nblocks == 1) {
+        a->block_size = a->block_sizes[0];
+    }
 }
 
 void cbm_arena_destroy(CBMArena *a) {

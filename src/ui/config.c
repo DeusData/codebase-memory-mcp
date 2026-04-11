@@ -6,7 +6,9 @@
  */
 #include "ui/config.h"
 #include "foundation/log.h"
+#include "foundation/platform.h"
 #include "foundation/compat_fs.h"
+#include "foundation/compat.h"
 
 #include <yyjson/yyjson.h>
 
@@ -17,9 +19,9 @@
 /* ── Path ────────────────────────────────────────────────────── */
 
 void cbm_ui_config_path(char *buf, int bufsz) {
-    const char *home = getenv("HOME"); // NOLINT(concurrency-mt-unsafe)
+    const char *home = cbm_get_home_dir();
     if (!home) {
-        home = "/tmp";
+        home = cbm_tmpdir();
     }
     snprintf(buf, (size_t)bufsz, "%s/.cache/codebase-memory-mcp/config.json", home);
 }

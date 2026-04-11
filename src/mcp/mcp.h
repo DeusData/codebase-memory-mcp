@@ -57,8 +57,9 @@ char *cbm_mcp_text_result(const char *text, bool is_error);
  * srv may be NULL (returns all tools). Uses the typedef declared below. */
 char *cbm_mcp_tools_list(cbm_mcp_server_t *srv);
 
-/* Format the initialize response. Returns heap-allocated JSON. */
-char *cbm_mcp_initialize_response(void);
+/* Format the initialize response. params_json is the raw initialize params
+ * (used for protocol version negotiation). Returns heap-allocated JSON. */
+char *cbm_mcp_initialize_response(const char *params_json);
 
 /* ── Tool argument helpers ────────────────────────────────────── */
 

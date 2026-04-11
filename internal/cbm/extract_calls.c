@@ -215,6 +215,23 @@ static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, C
         return NULL;
     }
 
+    // Swift: call_expression has no "function" field — callee is first named child.
+    // Also handle constructor_expression for MyClass() syntax.
+    if (lang == CBM_LANG_SWIFT) {
+        const char *nk = ts_node_type(node);
+        if (strcmp(nk, "call_expression") == 0 || strcmp(nk, "constructor_expression") == 0) {
+            if (ts_node_named_child_count(node) > 0) {
+                TSNode callee = ts_node_named_child(node, 0);
+                const char *ck = ts_node_type(callee);
+                if (strcmp(ck, "simple_identifier") == 0 ||
+                    strcmp(ck, "navigation_expression") == 0) {
+                    return cbm_node_text(a, callee, source);
+                }
+            }
+        }
+        return NULL;
+    }
+
     // Generic fallback: first child
     if (ts_node_child_count(node) > 0) {
         TSNode first = ts_node_child(node, 0);

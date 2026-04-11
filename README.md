@@ -1,8 +1,18 @@
 # codebase-memory-mcp
 
+[![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/dry-run.yml?label=CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/dry-run.yml)
+[![Tests](https://img.shields.io/badge/tests-2042_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
+[![Languages](https://img.shields.io/badge/languages-66-orange)](https://github.com/DeusData/codebase-memory-mcp)
+[![Agents](https://img.shields.io/badge/agents-10-purple)](https://github.com/DeusData/codebase-memory-mcp)
+[![Pure C](https://img.shields.io/badge/pure_C-zero_dependencies-blue)](https://github.com/DeusData/codebase-memory-mcp)
+[![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/DeusData/codebase-memory-mcp/badge)](https://scorecard.dev/viewer/?uri=github.com/DeusData/codebase-memory-mcp)
+
 **The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a single static binary for macOS, Linux, and Windows — download, run `install`, done.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 64 languages, enhanced with LSP-style hybrid type resolution for Go, C, and C++ (more languages coming soon) — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 14 MCP tools. Zero dependencies. Plug and play across 8 coding agents.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 66 languages, enhanced with LSP-style hybrid type resolution for Go, C, and C++ (more languages coming soon) — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 14 MCP tools. Zero dependencies. Plug and play across 10 coding agents.
 
 <p align="center">
   <img src="docs/graph-ui-screenshot.png" alt="Graph visualization UI showing the codebase-memory-mcp knowledge graph" width="800">
@@ -14,13 +24,34 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 
 - **Extreme indexing speed** — Linux kernel (28M LOC, 75K files) in 3 minutes. RAM-first pipeline: LZ4 compression, in-memory SQLite, fused Aho-Corasick pattern matching. Memory released after indexing.
 - **Plug and play** — single static binary for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (amd64). No Docker, no runtime dependencies, no API keys. Download → `install` → restart agent → done.
-- **64 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
+- **66 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search. One graph query replaces dozens of grep/read cycles.
-- **8 agents, one command** — `install` auto-detects Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode and configures MCP entries, instruction files, and pre-tool hooks for each.
+- **10 agents, one command** — `install` auto-detects Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, and OpenClaw — configures MCP entries, instruction files, and pre-tool hooks for each.
 - **Built-in graph visualization** — 3D interactive UI at `localhost:9749` (optional UI binary variant).
+- **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
 - **14 MCP tools** — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
 
 ## Quick Start
+
+**One-line install** (macOS / Linux):
+```bash
+curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash
+```
+
+With graph visualization UI:
+```bash
+curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui
+```
+
+**Windows** (PowerShell):
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.ps1 | iex"
+```
+
+Restart your coding agent. Say **"Index this project"** — done.
+
+<details>
+<summary>Manual install</summary>
 
 1. **Download** the binary for your platform from the [latest release](https://github.com/DeusData/codebase-memory-mcp/releases/latest):
    - `codebase-memory-mcp-<os>-<arch>.tar.gz` — standard (MCP server only)
@@ -33,7 +64,14 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
    codebase-memory-mcp install
    ```
 
-3. **Restart** your coding agent. Say **"Index this project"** — done.
+3. **Restart** your coding agent.
+
+On macOS, if the binary is killed on launch, fix code signing:
+```bash
+xattr -d com.apple.quarantine ~/.local/bin/codebase-memory-mcp
+codesign --sign - --force ~/.local/bin/codebase-memory-mcp
+```
+</details>
 
 The `install` command auto-detects all installed coding agents and configures MCP server entries, instruction files, skills, and pre-tool hooks for each.
 
@@ -221,6 +259,8 @@ Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` 
 | Antigravity | `mcp_config.json` | `AGENTS.md` | — |
 | Aider | — | `CONVENTIONS.md` | — |
 | KiloCode | `mcp_settings.json` | `~/.kilocode/rules/` | — |
+| VS Code | `Code/User/mcp.json` | — | — |
+| OpenClaw | `openclaw.json` | — | — |
 
 **Hooks** are advisory (exit code 0) — they remind agents to prefer MCP graph tools when they reach for grep/glob/read, without blocking the tool call.
 
@@ -267,7 +307,7 @@ codebase-memory-mcp cli --raw search_graph '{"label": "Function"}' | jq '.result
 
 ### Node Labels
 
-`Project`, `Package`, `Folder`, `File`, `Module`, `Class`, `Function`, `Method`, `Interface`, `Enum`, `Type`, `Route`
+`Project`, `Package`, `Folder`, `File`, `Module`, `Class`, `Function`, `Method`, `Interface`, `Enum`, `Type`, `Route`, `Resource`
 
 ### Edge Types
 
@@ -294,6 +334,24 @@ codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-in
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
 
+## Custom File Extensions
+
+Map additional file extensions to supported languages via JSON config files. Useful for framework-specific extensions like `.blade.php` (Laravel) or `.mjs` (ES modules).
+
+**Per-project** (in your repo root):
+```json
+// .codebase-memory.json
+{"extra_extensions": {".blade.php": "php", ".mjs": "javascript"}}
+```
+
+**Global** (applies to all projects):
+```json
+// ~/.config/codebase-memory-mcp/config.json  (or $XDG_CONFIG_HOME/...)
+{"extra_extensions": {".twig": "html", ".phtml": "php"}}
+```
+
+Project config overrides global for conflicting extensions. Unknown language values are silently skipped. Missing config files are ignored.
+
 ## Persistence
 
 SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across restarts (WAL mode, ACID-safe). To reset: `rm -rf ~/.cache/codebase-memory-mcp/`.
@@ -311,7 +369,7 @@ SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across rest
 
 ## Language Support
 
-64 languages. Benchmarked against 64 real open-source repositories (78 to 49K nodes):
+66 languages. Benchmarked against 64 real open-source repositories (78 to 49K nodes):
 
 | Tier | Score | Languages |
 |------|-------|-----------|
@@ -327,7 +385,7 @@ Plus: Clojure, F#, Julia, Vim Script, Nix, Common Lisp, Elm, Fortran, CUDA, COBO
 src/
   main.c              Entry point (MCP stdio server + CLI + install/update/config)
   mcp/                MCP server (14 tools, JSON-RPC 2.0, session detection, auto-index)
-  cli/                Install/uninstall/update/config (8 agents, hooks, instructions)
+  cli/                Install/uninstall/update/config (10 agents, hooks, instructions)
   store/              SQLite graph storage (nodes, edges, traversal, search, Louvain)
   pipeline/           Multi-pass indexing (structure → definitions → calls → HTTP links → config → tests)
   cypher/             Cypher query lexer, parser, planner, executor
@@ -336,7 +394,7 @@ src/
   traces/             Runtime trace ingestion
   ui/                 Embedded HTTP server + 3D graph visualization
   foundation/         Platform abstractions (threads, filesystem, logging, memory)
-internal/cbm/         Vendored tree-sitter grammars (64 languages) + AST extraction engine
+internal/cbm/         Vendored tree-sitter grammars (66 languages) + AST extraction engine
 ```
 
 ## License

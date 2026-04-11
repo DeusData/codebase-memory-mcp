@@ -1,0 +1,45 @@
+# Security allow-list for dangerous function calls.
+# Format: file:function:justification
+# Lines starting with # are comments. Empty lines are ignored.
+# Any call to a listed function in a .c file under src/ that is NOT on this
+# list causes the security audit (scripts/security-audit.sh) to fail.
+
+# ── Foundation: platform abstraction (defines cbm_popen wrapper + shell-free exec) ──
+src/foundation/compat_fs.c:popen:cbm_popen wrapper definition (POSIX)
+src/foundation/compat_fs.c:cbm_popen:cbm_popen function definition
+src/foundation/compat_fs.c:fork:cbm_exec_no_shell — fork+execvp for shell-free subprocess execution
+src/foundation/compat_fs.c:execvp:cbm_exec_no_shell — direct exec without shell interpretation
+
+# ── CLI: update command (user-initiated, interactive) ──────────────────────
+src/cli/cli.c:cbm_popen:sha256 checksum verification (update cmd)
+src/cli/cli.c:cbm_popen:pgrep for kill_other_instances (hardcoded process name)
+src/cli/cli.c:popen:sha256 checksum computation via shasum
+
+# ── Watcher: git status polling (repo paths validated via cbm_validate_shell_arg) ──
+src/watcher/watcher.c:system:git repo detection (is_git_repo)
+src/watcher/watcher.c:cbm_popen:git HEAD hash (git_head)
+src/watcher/watcher.c:cbm_popen:git working tree status (git_is_dirty)
+src/watcher/watcher.c:cbm_popen:git file count (git_file_count)
+src/watcher/watcher.c:popen:via cbm_popen wrapper calls
+
+# ── MCP server: search and change detection ────────────────────────────────
+src/mcp/mcp.c:cbm_popen:search_code via grep (pattern in temp file, path validated)
+src/mcp/mcp.c:cbm_popen:detect_changes via git diff (args validated)
+src/mcp/mcp.c:cbm_popen:git ls-files count for auto-index (session_root validated)
+src/mcp/mcp.c:cbm_popen:update check to api.github.com (hardcoded URL)
+src/mcp/mcp.c:popen:via cbm_popen wrapper calls
+
+# ── Pipeline: git history parsing (fallback when libgit2 not available) ────
+src/pipeline/pass_githistory.c:cbm_popen:git log for file history (path validated)
+src/pipeline/pass_githistory.c:popen:via cbm_popen wrapper call
+
+# ── UI: HTTP server process management ─────────────────────────────────────
+src/ui/http_server.c:popen:ps process listing for metrics endpoint
+src/ui/http_server.c:fork:spawn indexing subprocess
+src/ui/http_server.c:execl:exec indexing binary in child process
+
+# ── Allowed URLs ───────────────────────────────────────────────────────────
+# Format: URL:justification
+URL:https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest:update check
+URL:https://github.com/DeusData/codebase-memory-mcp/releases/latest/download:binary download + checksums
+URL:http://127.0.0.1:UI server binding (localhost only)

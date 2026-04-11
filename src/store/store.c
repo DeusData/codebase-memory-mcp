@@ -43,7 +43,9 @@ struct cbm_store {
     sqlite3_stmt *stmt_upsert_node;
     sqlite3_stmt *stmt_find_node_by_id;
     sqlite3_stmt *stmt_find_node_by_qn;
+    sqlite3_stmt *stmt_find_node_by_qn_any; /* QN lookup without project filter */
     sqlite3_stmt *stmt_find_nodes_by_name;
+    sqlite3_stmt *stmt_find_nodes_by_name_any; /* name lookup without project filter */
     sqlite3_stmt *stmt_find_nodes_by_label;
     sqlite3_stmt *stmt_find_nodes_by_file;
     sqlite3_stmt *stmt_count_nodes;
@@ -329,6 +331,24 @@ static void sqlite_iregexp(sqlite3_context *ctx, int argc, sqlite3_value **argv)
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
+/* SQLite authorizer: deny dangerous operations that could be exploited via
+ * SQL injection through the Cypher→SQL translation layer. */
+static int store_authorizer(void *user_data, int action, const char *p3, const char *p4,
+                            const char *p5, const char *p6) {
+    (void)user_data;
+    (void)p3;
+    (void)p4;
+    (void)p5;
+    (void)p6;
+    switch (action) {
+    case SQLITE_ATTACH: /* ATTACH DATABASE — could create/read arbitrary files */
+    case SQLITE_DETACH: /* DETACH DATABASE */
+        return SQLITE_DENY;
+    default:
+        return SQLITE_OK;
+    }
+}
+
 static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
     cbm_store_t *s = calloc(1, sizeof(cbm_store_t));
     if (!s) {
@@ -349,6 +369,10 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
     if (path && !in_memory) {
         s->db_path = heap_strdup(path);
     }
+
+    /* Security: block ATTACH/DETACH to prevent file creation via SQL injection.
+     * The authorizer runs inside SQLite's query planner — no string-level bypass. */
+    sqlite3_set_authorizer(s->db, store_authorizer, NULL);
 
     /* Register REGEXP function (SQLite doesn't have one built-in) */
     sqlite3_create_function(s->db, "regexp", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
@@ -394,11 +418,16 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     /* No SQLITE_OPEN_CREATE — returns SQLITE_CANTOPEN if file absent. */
     int rc = sqlite3_open_v2(db_path, &s->db, SQLITE_OPEN_READWRITE, NULL);
     if (rc != SQLITE_OK) {
+        /* sqlite3_open_v2 allocates a handle even on failure — must close it. */
+        sqlite3_close(s->db);
         free(s);
         return NULL;
     }
 
     s->db_path = heap_strdup(db_path);
+
+    /* Security: block ATTACH/DETACH to prevent file creation via SQL injection. */
+    sqlite3_set_authorizer(s->db, store_authorizer, NULL);
 
     /* Register REGEXP functions (same as store_open_internal). */
     sqlite3_create_function(s->db, "regexp", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
@@ -416,13 +445,16 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     return s;
 }
 
+/* ── Integrity check ───────────────────────────────────────────── */
+
 bool cbm_store_check_integrity(cbm_store_t *s) {
     if (!s || !s->db) {
         return false;
     }
 
     /* Each project gets its own .db file, so the projects table should have
-     * exactly 1 row. More than 5 rows indicates a corrupt/merged database. */
+     * exactly 1 row. More than 5 rows is definitely corrupt (allows some slack
+     * for edge cases). Also check that root_path looks like a real path. */
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(s->db, "SELECT count(*) FROM projects;", -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
@@ -433,14 +465,31 @@ bool cbm_store_check_integrity(cbm_store_t *s) {
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         int row_count = sqlite3_column_int(stmt, 0);
         if (row_count > 5) {
-            fprintf(stderr, "ERROR store.corrupt table=projects rows=%d (expected 1)\n",
-                    row_count);
+            fprintf(stderr, "ERROR store.corrupt table=projects rows=%d (expected 1)\n", row_count);
             ok = false;
         }
-    } else {
-        ok = false;
     }
     sqlite3_finalize(stmt);
+
+    if (ok) {
+        /* Check that root_path in projects table starts with '/' or a drive letter.
+         * Corrupt DBs often have numeric strings like "826" in root_path. */
+        rc = sqlite3_prepare_v2(
+            s->db,
+            "SELECT root_path FROM projects WHERE root_path != '' "
+            "AND substr(root_path, 1, 1) NOT IN ('/', 'A','B','C','D','E','F','G','H') LIMIT 1;",
+            -1, &stmt, NULL);
+        if (rc == SQLITE_OK) {
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                const char *bad_path = (const char *)sqlite3_column_text(stmt, 0);
+                fprintf(stderr, "ERROR store.corrupt table=projects bad_root_path=%s\n",
+                        bad_path ? bad_path : "(null)");
+                ok = false;
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
     return ok;
 }
 
@@ -449,10 +498,9 @@ cbm_store_t *cbm_store_open(const char *project) {
         return NULL;
     }
     /* Build path: ~/.cache/codebase-memory-mcp/<project>.db */
-    const char *home = getenv("HOME"); // NOLINT(concurrency-mt-unsafe) — called once during
-                                       // single-threaded store open, never concurrently
+    const char *home = cbm_get_home_dir();
     if (!home) {
-        home = "/tmp";
+        home = cbm_tmpdir();
     }
     char path[1024];
     snprintf(path, sizeof(path), "%s/.cache/codebase-memory-mcp/%s.db", home, project);
@@ -475,7 +523,9 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_upsert_node);
     finalize_stmt(&s->stmt_find_node_by_id);
     finalize_stmt(&s->stmt_find_node_by_qn);
+    finalize_stmt(&s->stmt_find_node_by_qn_any);
     finalize_stmt(&s->stmt_find_nodes_by_name);
+    finalize_stmt(&s->stmt_find_nodes_by_name_any);
     finalize_stmt(&s->stmt_find_nodes_by_label);
     finalize_stmt(&s->stmt_find_nodes_by_file);
     finalize_stmt(&s->stmt_count_nodes);
@@ -504,7 +554,9 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_delete_file_hash);
     finalize_stmt(&s->stmt_delete_file_hashes);
 
-    sqlite3_close(s->db);
+    /* Use sqlite3_close_v2 — auto-deallocates when last statement finalizes.
+     * Prevents ASan false-positive leaks from sqlite3 internal state. */
+    sqlite3_close_v2(s->db);
     free((void *)s->db_path);
     free(s);
 }
@@ -530,12 +582,12 @@ int cbm_store_rollback(cbm_store_t *s) {
 /* ── Bulk write ─────────────────────────────────────────────────── */
 
 int cbm_store_begin_bulk(cbm_store_t *s) {
-    /* Stay in WAL mode throughout bulk writes. Switching to MEMORY journal
-     * mode would make the database unrecoverable if the process crashes
-     * mid-write because the in-memory rollback journal is lost on crash.
-     * WAL mode is inherently crash-safe: uncommitted WAL entries are simply
-     * discarded on the next open. Performance is preserved via
-     * synchronous=OFF and a larger cache, which are safe with WAL. */
+    /* Stay in WAL mode throughout. Switching to MEMORY journal mode would
+     * make the database unrecoverable if the process crashes mid-write,
+     * because the in-memory rollback journal is lost on crash.
+     * WAL mode is crash-safe: uncommitted WAL entries are simply discarded
+     * on the next open. Performance is preserved via synchronous=OFF and a
+     * larger cache, which are safe with WAL. */
     int rc = exec_sql(s, "PRAGMA synchronous = OFF;");
     if (rc != CBM_STORE_OK) {
         return rc;
@@ -825,6 +877,64 @@ int cbm_store_find_node_by_qn(cbm_store_t *s, const char *project, const char *q
     return CBM_STORE_NOT_FOUND;
 }
 
+int cbm_store_find_node_by_qn_any(cbm_store_t *s, const char *qn, cbm_node_t *out) {
+    if (!s || !s->db) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_find_node_by_qn_any,
+                       "SELECT id, project, label, name, qualified_name, file_path, "
+                       "start_line, end_line, properties FROM nodes "
+                       "WHERE qualified_name = ?1 LIMIT 1;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, 1, qn);
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        scan_node(stmt, out);
+        return CBM_STORE_OK;
+    }
+    return CBM_STORE_NOT_FOUND;
+}
+
+int cbm_store_find_nodes_by_name_any(cbm_store_t *s, const char *name, cbm_node_t **out,
+                                     int *count) {
+    if (!s || !s->db) {
+        *out = NULL;
+        *count = 0;
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_find_nodes_by_name_any,
+                       "SELECT id, project, label, name, qualified_name, file_path, "
+                       "start_line, end_line, properties FROM nodes "
+                       "WHERE name = ?1;");
+    if (!stmt) {
+        *out = NULL;
+        *count = 0;
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, 1, name);
+
+    int cap = 16;
+    int n = 0;
+    cbm_node_t *arr = malloc(cap * sizeof(cbm_node_t));
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (n >= cap) {
+            cap *= 2;
+            arr = safe_realloc(arr, cap * sizeof(cbm_node_t));
+        }
+        scan_node(stmt, &arr[n]);
+        n++;
+    }
+    *out = arr;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
 int cbm_store_find_node_ids_by_qns(cbm_store_t *s, const char *project, const char **qns,
                                    int qn_count, int64_t *out_ids) {
     if (!s || !project || !qns || !out_ids || qn_count <= 0) {
@@ -985,7 +1095,7 @@ int cbm_store_upsert_node_batch(cbm_store_t *s, const cbm_node_t *nodes, int cou
         return CBM_STORE_OK;
     }
 
-    exec_sql(s, "BEGIN;");
+    exec_sql(s, "BEGIN IMMEDIATE;");
     for (int i = 0; i < count; i++) {
         int64_t id = cbm_store_upsert_node(s, &nodes[i]);
         if (id == CBM_STORE_ERR) {
@@ -1221,7 +1331,7 @@ int cbm_store_insert_edge_batch(cbm_store_t *s, const cbm_edge_t *edges, int cou
         return CBM_STORE_OK;
     }
 
-    exec_sql(s, "BEGIN;");
+    exec_sql(s, "BEGIN IMMEDIATE;");
     for (int i = 0; i < count; i++) {
         int64_t id = cbm_store_insert_edge(s, &edges[i]);
         if (id == CBM_STORE_ERR) {
@@ -1382,20 +1492,29 @@ int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const
     char like_pattern[512];
     snprintf(like_pattern, sizeof(like_pattern), "%%.%s", suffix);
 
-    const char *sql = "SELECT id, project, label, name, qualified_name, file_path, "
-                      "start_line, end_line, properties FROM nodes "
-                      "WHERE project = ?1 AND (qualified_name LIKE ?2 OR qualified_name = ?3)";
+    const char *sql_with_project =
+        "SELECT id, project, label, name, qualified_name, file_path, "
+        "start_line, end_line, properties FROM nodes "
+        "WHERE project = ?1 AND (qualified_name LIKE ?2 OR qualified_name = ?3)";
+    const char *sql_any = "SELECT id, project, label, name, qualified_name, file_path, "
+                          "start_line, end_line, properties FROM nodes "
+                          "WHERE (qualified_name LIKE ?1 OR qualified_name = ?2)";
 
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL);
+    int rc = sqlite3_prepare_v2(s->db, project ? sql_with_project : sql_any, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         store_set_error_sqlite(s, "qn_suffix prepare");
         return CBM_STORE_ERR;
     }
 
-    bind_text(stmt, 1, project);
-    bind_text(stmt, 2, like_pattern);
-    bind_text(stmt, 3, suffix);
+    if (project) {
+        bind_text(stmt, 1, project);
+        bind_text(stmt, 2, like_pattern);
+        bind_text(stmt, 3, suffix);
+    } else {
+        bind_text(stmt, 1, like_pattern);
+        bind_text(stmt, 2, suffix);
+    }
 
     int cap = 8;
     int n = 0;
@@ -1450,6 +1569,43 @@ void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *ou
         if (sqlite3_step(stmt) == SQLITE_ROW) *out_deg = sqlite3_column_int(stmt, 0);
         sqlite3_finalize(stmt);
     }
+}
+
+/* ── List distinct file paths ────────────────────────────────── */
+
+int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *count) {
+    *out = NULL;
+    *count = 0;
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+
+    const char *sql = "SELECT DISTINCT file_path FROM nodes "
+                      "WHERE project = ?1 AND file_path IS NOT NULL AND file_path != ''";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_STATIC);
+
+    int cap = 64;
+    int n = 0;
+    char **files = malloc(cap * sizeof(char *));
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *fp = (const char *)sqlite3_column_text(stmt, 0);
+        if (!fp) {
+            continue;
+        }
+        if (n >= cap) {
+            cap *= 2;
+            files = safe_realloc(files, cap * sizeof(char *));
+        }
+        files[n++] = heap_strdup(fp);
+    }
+    sqlite3_finalize(stmt);
+    *out = files;
+    *count = n;
+    return CBM_STORE_OK;
 }
 
 /* ── Node neighbor names ──────────────────────────────────────── */
@@ -2005,18 +2161,22 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     }
 
     /* Exclude labels: use ?N parameterized placeholders to prevent SQL injection.
-     * Values come from MCP tool call args (user-controlled JSON), so direct
-     * snprintf interpolation is a SQL injection vector.
-     * Port of origin/main commit 6a6127c. */
+     * Values come from MCP tool call args (user-controlled JSON). */
     if (params->exclude_labels) {
         char excl_clause[512] = "n.label NOT IN (";
         int elen = (int)strlen(excl_clause);
         for (int i = 0; params->exclude_labels[i] && bind_idx < 31; i++) {
             if (i > 0) {
-                elen += snprintf(excl_clause + elen, sizeof(excl_clause) - elen, ",");
+                elen += snprintf(excl_clause + elen, sizeof(excl_clause) - (size_t)elen, ",");
+                if (elen >= (int)sizeof(excl_clause)) {
+                    elen = (int)sizeof(excl_clause) - 1;
+                }
             }
-            elen += snprintf(excl_clause + elen, sizeof(excl_clause) - elen, "?%d",
+            elen += snprintf(excl_clause + elen, sizeof(excl_clause) - (size_t)elen, "?%d",
                              bind_idx + 1);
+            if (elen >= (int)sizeof(excl_clause)) {
+                elen = (int)sizeof(excl_clause) - 1;
+            }
             BIND_TEXT(params->exclude_labels[i]);
         }
         snprintf(excl_clause + elen, sizeof(excl_clause) - (size_t)elen, ")");
@@ -2259,18 +2419,24 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
     out->root = root;
 
     /* Build edge type IN clause using ?N parameterized placeholders.
-     * edge_types[] values come from MCP tool call args (user-controlled JSON),
-     * so direct snprintf interpolation is a SQL injection vector.
-     * Port of origin/main commit 6a6127c. */
+     * edge_types[] values come from MCP tool call args (user-controlled JSON). */
     char types_clause[512] = "?1"; /* default: single placeholder for "CALLS" */
+    const char *default_edge_type = "CALLS";
     int bfs_et_count = edge_type_count > 0 ? edge_type_count : 1;
     if (edge_type_count > 0) {
         int tlen = 0;
         for (int i = 0; i < edge_type_count && i < 16; i++) {
             if (i > 0) {
-                tlen += snprintf(types_clause + tlen, sizeof(types_clause) - tlen, ",");
+                tlen += snprintf(types_clause + tlen, sizeof(types_clause) - (size_t)tlen, ",");
+                if (tlen >= (int)sizeof(types_clause)) {
+                    tlen = (int)sizeof(types_clause) - 1;
+                }
             }
-            tlen += snprintf(types_clause + tlen, sizeof(types_clause) - tlen, "?%d", i + 1);
+            tlen +=
+                snprintf(types_clause + tlen, sizeof(types_clause) - (size_t)tlen, "?%d", i + 1);
+            if (tlen >= (int)sizeof(types_clause)) {
+                tlen = (int)sizeof(types_clause) - 1;
+            }
         }
         bfs_et_count = edge_type_count < 16 ? edge_type_count : 16;
     }
@@ -2317,14 +2483,14 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         return CBM_STORE_ERR;
     }
 
-    /* Bind edge type values as parameters — prevents SQL injection */
+    /* Bind edge type parameters */
     if (edge_type_count > 0) {
         for (int i = 0; i < bfs_et_count; i++) {
-            sqlite3_bind_text(stmt, i + 1, edge_types[i], -1, SQLITE_STATIC);
+            bind_text(stmt, i + 1, edge_types[i]);
         }
     } else {
         /* Default: only "CALLS" edges */
-        sqlite3_bind_text(stmt, 1, "CALLS", -1, SQLITE_STATIC);
+        bind_text(stmt, 1, default_edge_type);
     }
 
     int cap = 16;
@@ -2351,9 +2517,15 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         /* Build ID set: root + all visited */
         char id_set[4096];
         int ilen = snprintf(id_set, sizeof(id_set), "%lld", (long long)start_id);
+        if (ilen >= (int)sizeof(id_set)) {
+            ilen = (int)sizeof(id_set) - 1;
+        }
         for (int i = 0; i < n; i++) {
-            ilen += snprintf(id_set + ilen, sizeof(id_set) - ilen, ",%lld",
+            ilen += snprintf(id_set + ilen, sizeof(id_set) - (size_t)ilen, ",%lld",
                              (long long)out->visited[i].node.id);
+            if (ilen >= (int)sizeof(id_set)) {
+                ilen = (int)sizeof(id_set) - 1;
+            }
         }
 
         /* Build edge query using the same ?N placeholders for edge types.
@@ -2374,14 +2546,15 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         sqlite3_stmt *estmt = NULL;
         rc = sqlite3_prepare_v2(s->db, edge_sql, -1, &estmt, NULL);
         if (rc == SQLITE_OK) {
-            /* Bind edge type values as parameters — prevents SQL injection */
+            /* Bind edge type parameters for the edge query */
             if (edge_type_count > 0) {
                 for (int i = 0; i < bfs_et_count; i++) {
-                    sqlite3_bind_text(estmt, i + 1, edge_types[i], -1, SQLITE_STATIC);
+                    bind_text(estmt, i + 1, edge_types[i]);
                 }
             } else {
-                sqlite3_bind_text(estmt, 1, "CALLS", -1, SQLITE_STATIC);
+                bind_text(estmt, 1, default_edge_type);
             }
+
             int ecap = 8;
             int en = 0;
             cbm_edge_info_t *edges = malloc(ecap * sizeof(cbm_edge_info_t));

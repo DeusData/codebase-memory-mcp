@@ -355,7 +355,13 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                   int file_count);
 
+int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
+
 int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
+
+/* Sub-passes called from pass_calls: pattern-based edge extraction */
+void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                       int file_count);
 
 int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
 
@@ -420,5 +426,13 @@ int cbm_scan_project_env_urls(const char *root_path, cbm_env_binding_t *out, int
  * Patterns are compiled lazily on first use and cached for the process lifetime.
  * Call this in test teardown to release ~26KB of regex memory cleanly. */
 void cbm_envscan_free_patterns(void);
+
+/* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
+
+/* Run incremental re-index on an existing disk DB.
+ * Classifies files by mtime+size, deletes changed nodes, re-parses changed
+ * files, merges into disk DB. Returns 0 on success. */
+int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
+                                 int file_count);
 
 #endif /* CBM_PIPELINE_INTERNAL_H */

@@ -21,6 +21,7 @@
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/str_util.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -234,6 +235,13 @@ void cbm_watcher_free(cbm_watcher_t *w) {
 
 void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *root_path) {
     if (!w || !project_name || !root_path) {
+        return;
+    }
+
+    /* Reject paths with shell metacharacters — all git helpers use popen/system */
+    if (!cbm_validate_shell_arg(root_path)) {
+        cbm_log_warn("watcher.watch.reject", "project", project_name, "reason",
+                     "path contains shell metacharacters");
         return;
     }
 

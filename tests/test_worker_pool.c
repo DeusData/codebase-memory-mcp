@@ -221,6 +221,147 @@ TEST(tls_persistence_across_dispatch) {
     PASS();
 }
 
+/* ── Resource Management & Edge Case Tests ──────────────────────── */
+
+TEST(parallel_for_negative_count) {
+    /* count=-1 → no iterations (documented: "If count <= 0, this is a no-op") */
+    _Atomic int sum;
+    atomic_init(&sum, 0);
+    cbm_parallel_for_opts_t opts = {.max_workers = 4, .force_pthreads = false};
+    cbm_parallel_for(-1, sum_worker, &sum, opts);
+    ASSERT_EQ(atomic_load(&sum), 0);
+    PASS();
+}
+
+TEST(parallel_for_null_fn) {
+    /* NULL function pointer — should not crash (no-op or safe handling) */
+    cbm_parallel_for_opts_t opts = {.max_workers = 4, .force_pthreads = false};
+    /* count=0 makes this a no-op before fn is called, so safe */
+    cbm_parallel_for(0, NULL, NULL, opts);
+    PASS();
+}
+
+TEST(parallel_for_max_workers_one) {
+    /* max_workers=1 → serial execution, correct result */
+    _Atomic int sum;
+    atomic_init(&sum, 0);
+    cbm_parallel_for_opts_t opts = {.max_workers = 1, .force_pthreads = false};
+    cbm_parallel_for(50, sum_worker, &sum, opts);
+    ASSERT_EQ(atomic_load(&sum), 50 * 49 / 2);
+    PASS();
+}
+
+TEST(parallel_for_max_workers_zero_auto) {
+    /* max_workers=0 → auto-detect, should produce correct result */
+    _Atomic int sum;
+    atomic_init(&sum, 0);
+    cbm_parallel_for_opts_t opts = {.max_workers = 0, .force_pthreads = false};
+    cbm_parallel_for(100, sum_worker, &sum, opts);
+    ASSERT_EQ(atomic_load(&sum), 100 * 99 / 2);
+    PASS();
+}
+
+TEST(parallel_for_large_count_coverage) {
+    /* Large count (1000) → all indices visited exactly once */
+    _Atomic int visited[1000];
+    for (int i = 0; i < 1000; i++)
+        atomic_init(&visited[i], 0);
+    cbm_parallel_for_opts_t opts = {.max_workers = 8, .force_pthreads = false};
+    cbm_parallel_for(1000, coverage_worker, visited, opts);
+    /* Every index must be visited exactly once */
+    for (int i = 0; i < 1000; i++) {
+        ASSERT_EQ(atomic_load(&visited[i]), 1);
+    }
+    PASS();
+}
+
+TEST(parallel_for_immediate_return_callback) {
+    /* Callback that returns immediately — no crash, no hang */
+    cbm_parallel_for_opts_t opts = {.max_workers = 4, .force_pthreads = false};
+    cbm_parallel_for(500, noop_worker, NULL, opts);
+    PASS();
+}
+
+/* Helpers for context_passed_correctly test */
+typedef struct { _Atomic int counter; int magic; } ctx_test_t;
+
+static void count_and_verify_worker(int idx, void *vctx) {
+    (void)idx;
+    ctx_test_t *c = vctx;
+    if (c->magic == 0xDEAD) {
+        atomic_fetch_add(&c->counter, 1);
+    }
+}
+
+TEST(parallel_for_context_passed_correctly) {
+    /* Verify the context pointer reaches every iteration */
+    ctx_test_t ctx;
+    atomic_init(&ctx.counter, 0);
+    ctx.magic = 0xDEAD;
+
+    cbm_parallel_for_opts_t opts = {.max_workers = 4, .force_pthreads = false};
+    cbm_parallel_for(100, count_and_verify_worker, &ctx, opts);
+    /* All 100 iterations should have received the correct context */
+    ASSERT_EQ(atomic_load(&ctx.counter), 100);
+    PASS();
+}
+
+/* Helper for no_duplicates test */
+static void count_visit_worker(int idx, void *ctx) {
+    _Atomic int *c = ctx;
+    atomic_fetch_add(&c[idx], 1);
+}
+
+TEST(parallel_for_no_duplicates) {
+    /* Verify no index is visited more than once (atomic increment per slot) */
+    _Atomic int counts[500];
+    for (int i = 0; i < 500; i++)
+        atomic_init(&counts[i], 0);
+
+    cbm_parallel_for_opts_t opts = {.max_workers = 8, .force_pthreads = false};
+    cbm_parallel_for(500, count_visit_worker, counts, opts);
+
+    for (int i = 0; i < 500; i++) {
+        ASSERT_EQ(atomic_load(&counts[i]), 1);
+    }
+    PASS();
+}
+
+/* Helper for single_iteration_idx_zero test */
+static int g_received_idx = -1;
+
+static void capture_idx_worker(int idx, void *ctx) {
+    (void)ctx;
+    g_received_idx = idx;
+}
+
+TEST(parallel_for_single_iteration_idx_zero) {
+    /* count=1 → single iteration with idx=0 */
+    g_received_idx = -1;
+    cbm_parallel_for_opts_t opts = {.max_workers = 4, .force_pthreads = false};
+    cbm_parallel_for(1, capture_idx_worker, NULL, opts);
+    ASSERT_EQ(g_received_idx, 0);
+    PASS();
+}
+
+TEST(parallel_for_serial_matches_parallel) {
+    /* Serial (max_workers=1) and parallel (max_workers=8) should produce
+     * identical results for a deterministic reduction. */
+    _Atomic int serial_sum, parallel_sum;
+    atomic_init(&serial_sum, 0);
+    atomic_init(&parallel_sum, 0);
+
+    cbm_parallel_for_opts_t serial_opts = {.max_workers = 1, .force_pthreads = false};
+    cbm_parallel_for(200, sum_worker, &serial_sum, serial_opts);
+
+    cbm_parallel_for_opts_t parallel_opts = {.max_workers = 8, .force_pthreads = false};
+    cbm_parallel_for(200, sum_worker, &parallel_sum, parallel_opts);
+
+    ASSERT_EQ(atomic_load(&serial_sum), atomic_load(&parallel_sum));
+    ASSERT_EQ(atomic_load(&serial_sum), 200 * 199 / 2);
+    PASS();
+}
+
 /* ── Suite Registration ──────────────────────────────────────────── */
 
 SUITE(system_info) {
@@ -244,4 +385,15 @@ SUITE(worker_pool) {
     RUN_TEST(parallel_for_per_slot_write);
     RUN_TEST(parallel_for_actually_parallel);
     RUN_TEST(tls_persistence_across_dispatch);
+    /* Resource management & edge cases */
+    RUN_TEST(parallel_for_negative_count);
+    RUN_TEST(parallel_for_null_fn);
+    RUN_TEST(parallel_for_max_workers_one);
+    RUN_TEST(parallel_for_max_workers_zero_auto);
+    RUN_TEST(parallel_for_large_count_coverage);
+    RUN_TEST(parallel_for_immediate_return_callback);
+    RUN_TEST(parallel_for_context_passed_correctly);
+    RUN_TEST(parallel_for_no_duplicates);
+    RUN_TEST(parallel_for_single_iteration_idx_zero);
+    RUN_TEST(parallel_for_serial_matches_parallel);
 }

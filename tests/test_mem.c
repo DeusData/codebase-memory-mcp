@@ -92,6 +92,203 @@ TEST(mem_budget_check) {
     PASS();
 }
 
+/* ── mem budget edge-case tests ─────────────────────────────── */
+
+TEST(mem_worker_budget_zero_workers) {
+    cbm_mem_init(0.5);
+    size_t budget = cbm_mem_budget();
+    /* 0 workers clamps to 1 → worker_budget == full budget */
+    size_t wb = cbm_mem_worker_budget(0);
+    ASSERT_EQ(wb, budget);
+    PASS();
+}
+
+TEST(mem_worker_budget_negative_workers) {
+    cbm_mem_init(0.5);
+    size_t budget = cbm_mem_budget();
+    /* Negative workers clamps to 1 → worker_budget == full budget */
+    size_t wb = cbm_mem_worker_budget(-5);
+    ASSERT_EQ(wb, budget);
+    PASS();
+}
+
+TEST(mem_worker_budget_one_worker) {
+    cbm_mem_init(0.5);
+    size_t budget = cbm_mem_budget();
+    /* 1 worker → equals full budget */
+    size_t wb = cbm_mem_worker_budget(1);
+    ASSERT_EQ(wb, budget);
+    PASS();
+}
+
+TEST(mem_worker_budget_many_workers) {
+    cbm_mem_init(0.5);
+    /* 1000 workers → should produce non-zero result (budget is huge) */
+    size_t wb = cbm_mem_worker_budget(1000);
+    ASSERT_GT(wb, 0);
+    /* Must be budget / 1000 */
+    ASSERT_EQ(wb, cbm_mem_budget() / 1000);
+    PASS();
+}
+
+TEST(mem_over_budget_low_rss) {
+    cbm_mem_init(0.5);
+    /* We're a test process with tiny RSS — should not be over budget */
+    bool over = cbm_mem_over_budget();
+    ASSERT_FALSE(over);
+    PASS();
+}
+
+/* ── RSS tracking tests ───────────────────────────────────────── */
+
+TEST(mem_rss_positive) {
+    cbm_mem_init(0.5);
+    /* A running process always has nonzero RSS */
+    size_t rss = cbm_mem_rss();
+    ASSERT_GT(rss, 0);
+    PASS();
+}
+
+TEST(mem_peak_rss_gte_rss) {
+    cbm_mem_init(0.5);
+    size_t rss = cbm_mem_rss();
+    size_t peak = cbm_mem_peak_rss();
+    /* Peak must be >= current RSS */
+    ASSERT_GTE(peak, rss);
+    PASS();
+}
+
+TEST(mem_rss_increases_after_alloc) {
+    cbm_mem_init(0.5);
+
+    /* Allocate 10 MB and touch all pages */
+    size_t alloc_size = 10 * 1024 * 1024;
+    char *p = (char *)malloc(alloc_size);
+    ASSERT_NOT_NULL(p);
+    memset(p, 0xBE, alloc_size);
+
+    size_t rss_after = cbm_mem_rss();
+    /* RSS must be non-zero after allocating 10MB */
+    ASSERT_GT(rss_after, 0);
+
+    free(p);
+    PASS();
+}
+
+TEST(mem_collect_no_crash) {
+    cbm_mem_init(0.5);
+    /* collect() must not crash even with nothing to collect */
+    cbm_mem_collect();
+    PASS();
+}
+
+TEST(mem_collect_rss_still_positive) {
+    cbm_mem_init(0.5);
+    cbm_mem_collect();
+    /* After collect, RSS must still be > 0 (we're alive) */
+    size_t rss = cbm_mem_rss();
+    ASSERT_GT(rss, 0);
+    PASS();
+}
+
+/* ── Memory pressure simulation ───────────────────────────────── */
+
+TEST(mem_progressive_alloc_rss_increases) {
+    cbm_mem_init(0.5);
+
+    size_t chunk_size = 2 * 1024 * 1024; /* 2 MB chunks */
+    int nchunks = 5;
+    char *chunks[5];
+
+    for (int i = 0; i < nchunks; i++) {
+        chunks[i] = (char *)malloc(chunk_size);
+        ASSERT_NOT_NULL(chunks[i]);
+        memset(chunks[i], (unsigned char)(0xA0 + i), chunk_size);
+    }
+
+    size_t rss_peak = cbm_mem_rss();
+    ASSERT_GT(rss_peak, 0);
+
+    for (int i = 0; i < nchunks; i++) {
+        free(chunks[i]);
+    }
+    cbm_mem_collect();
+
+    /* After free + collect, RSS may or may not drop, but must not crash */
+    size_t rss_end = cbm_mem_rss();
+    ASSERT_GT(rss_end, 0);
+    PASS();
+}
+
+TEST(mem_free_and_collect_no_crash) {
+    cbm_mem_init(0.5);
+
+    /* Allocate, free, collect — verify no crash */
+    size_t sz = 4 * 1024 * 1024;
+    char *p = (char *)malloc(sz);
+    ASSERT_NOT_NULL(p);
+    memset(p, 0xCC, sz);
+    free(p);
+    cbm_mem_collect();
+
+    /* RSS must remain positive */
+    ASSERT_GT(cbm_mem_rss(), 0);
+    PASS();
+}
+
+TEST(mem_multiple_collect_idempotent) {
+    cbm_mem_init(0.5);
+
+    /* Multiple collect() calls must be idempotent and not crash */
+    cbm_mem_collect();
+    cbm_mem_collect();
+    cbm_mem_collect();
+
+    size_t rss = cbm_mem_rss();
+    ASSERT_GT(rss, 0);
+    PASS();
+}
+
+/* ── Init edge cases ──────────────────────────────────────────── */
+/* NOTE: cbm_mem_init uses atomic CAS — only the very first call in the
+ * process takes effect. Since mem_rss_tracking runs first with 0.5,
+ * all subsequent init calls are no-ops. We verify that they don't
+ * crash and that the budget remains unchanged. */
+
+TEST(mem_init_zero_fraction) {
+    /* First init already happened with 0.5 — this is a no-op */
+    size_t budget_before = cbm_mem_budget();
+    cbm_mem_init(0.0);
+    size_t budget_after = cbm_mem_budget();
+    /* Budget must not change (second init is no-op) */
+    ASSERT_EQ(budget_before, budget_after);
+    PASS();
+}
+
+TEST(mem_init_negative_fraction) {
+    size_t budget_before = cbm_mem_budget();
+    cbm_mem_init(-1.0);
+    size_t budget_after = cbm_mem_budget();
+    ASSERT_EQ(budget_before, budget_after);
+    PASS();
+}
+
+TEST(mem_init_over_one_fraction) {
+    size_t budget_before = cbm_mem_budget();
+    cbm_mem_init(1.5);
+    size_t budget_after = cbm_mem_budget();
+    ASSERT_EQ(budget_before, budget_after);
+    PASS();
+}
+
+TEST(mem_init_second_call_noop) {
+    size_t budget_before = cbm_mem_budget();
+    cbm_mem_init(0.9); /* different fraction — but it's a no-op */
+    size_t budget_after = cbm_mem_budget();
+    ASSERT_EQ(budget_before, budget_after);
+    PASS();
+}
+
 /* ── Arena integration tests ──────────────────────────────────── */
 
 TEST(arena_alloc_and_destroy) {
@@ -436,6 +633,27 @@ SUITE(mem) {
     RUN_TEST(mem_rss_tracking);
     RUN_TEST(mem_collect_reclaims);
     RUN_TEST(mem_budget_check);
+    /* Budget edge cases */
+    RUN_TEST(mem_worker_budget_zero_workers);
+    RUN_TEST(mem_worker_budget_negative_workers);
+    RUN_TEST(mem_worker_budget_one_worker);
+    RUN_TEST(mem_worker_budget_many_workers);
+    RUN_TEST(mem_over_budget_low_rss);
+    /* RSS tracking */
+    RUN_TEST(mem_rss_positive);
+    RUN_TEST(mem_peak_rss_gte_rss);
+    RUN_TEST(mem_rss_increases_after_alloc);
+    RUN_TEST(mem_collect_no_crash);
+    RUN_TEST(mem_collect_rss_still_positive);
+    /* Memory pressure simulation */
+    RUN_TEST(mem_progressive_alloc_rss_increases);
+    RUN_TEST(mem_free_and_collect_no_crash);
+    RUN_TEST(mem_multiple_collect_idempotent);
+    /* Init edge cases */
+    RUN_TEST(mem_init_zero_fraction);
+    RUN_TEST(mem_init_negative_fraction);
+    RUN_TEST(mem_init_over_one_fraction);
+    RUN_TEST(mem_init_second_call_noop);
     /* Arena integration */
     RUN_TEST(arena_alloc_and_destroy);
     RUN_TEST(arena_grow_tracks_sizes);

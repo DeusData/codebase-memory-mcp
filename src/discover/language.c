@@ -272,10 +272,21 @@ typedef struct {
 } filename_entry_t;
 
 static const filename_entry_t FILENAME_TABLE[] = {
-    {"CMakeLists.txt", CBM_LANG_CMAKE}, {"Dockerfile", CBM_LANG_DOCKERFILE},
-    {"GNUmakefile", CBM_LANG_MAKEFILE}, {"Makefile", CBM_LANG_MAKEFILE},
-    {"makefile", CBM_LANG_MAKEFILE},    {"meson.build", CBM_LANG_MESON},
-    {"meson.options", CBM_LANG_MESON},  {"meson_options.txt", CBM_LANG_MESON},
+    {"CMakeLists.txt", CBM_LANG_CMAKE},
+    {"Dockerfile", CBM_LANG_DOCKERFILE},
+    {"GNUmakefile", CBM_LANG_MAKEFILE},
+    {"Makefile", CBM_LANG_MAKEFILE},
+    {"makefile", CBM_LANG_MAKEFILE},
+    {"meson.build", CBM_LANG_MESON},
+    {"meson.options", CBM_LANG_MESON},
+    {"meson_options.txt", CBM_LANG_MESON},
+    {"kustomization.yaml", CBM_LANG_KUSTOMIZE},
+    {"kustomization.yml", CBM_LANG_KUSTOMIZE},
+    /* Note: FILENAME_TABLE uses case-sensitive strcmp, so mixed-case variants
+     * (e.g. "Kustomization.yaml") are not matched here.  They fall through to
+     * CBM_LANG_YAML and are re-classified by cbm_is_kustomize_file() in
+     * pass_k8s.c, which performs a case-insensitive comparison.  This is the
+     * intended behaviour — no additional entries are needed. */
     {".vimrc", CBM_LANG_VIMSCRIPT},
 };
 

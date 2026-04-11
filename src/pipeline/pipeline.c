@@ -30,7 +30,30 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <sys/stat.h>
 #include <time.h>
+
+/* ── Global index lock ─────────────────────────────────────────── */
+/* Prevents concurrent pipeline runs on the same DB file.
+ * Atomic spinlock: 0 = free, 1 = locked. */
+static atomic_int g_pipeline_busy = 0;
+
+bool cbm_pipeline_try_lock(void) {
+    return atomic_exchange(&g_pipeline_busy, 1) == 0;
+}
+
+#define LOCK_SPIN_NS 100000000 /* 100ms between lock retries */
+
+void cbm_pipeline_lock(void) {
+    while (atomic_exchange(&g_pipeline_busy, 1) != 0) {
+        struct timespec ts = {0, LOCK_SPIN_NS};
+        cbm_nanosleep(&ts, NULL);
+    }
+}
+
+void cbm_pipeline_unlock(void) {
+    atomic_store(&g_pipeline_busy, 0);
+}
 
 /* ── Internal state ──────────────────────────────────────────────── */
 
@@ -145,6 +168,24 @@ const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p) {
 
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p) {
     return p ? &p->cancelled : NULL;
+}
+
+/* Resolve the DB path for this pipeline. Caller must free(). */
+static char *resolve_db_path(const cbm_pipeline_t *p) {
+    char *path = malloc(1024);
+    if (!path) {
+        return NULL;
+    }
+    if (p->db_path) {
+        snprintf(path, 1024, "%s", p->db_path);
+    } else {
+        const char *home = cbm_get_home_dir();
+        if (!home) {
+            home = cbm_tmpdir();
+        }
+        snprintf(path, 1024, "%s/.cache/codebase-memory-mcp/%s.db", home, p->project_name);
+    }
+    return path;
 }
 
 static int check_cancel(const cbm_pipeline_t *p) {
@@ -328,6 +369,10 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     int rc = cbm_discover(p->repo_path, &opts, &files, &file_count);
     if (rc != 0) {
         cbm_log_error("pipeline.err", "phase", "discover", "rc", itoa_buf(rc));
+        cbm_discover_free(files, file_count);
+        cbm_set_user_lang_config(NULL);
+        cbm_userconfig_free(p->userconfig);
+        p->userconfig = NULL;
         return -1;
     }
     cbm_log_info("pipeline.discover", "files", itoa_buf(file_count), "elapsed_ms",
@@ -335,29 +380,21 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
 
     if (check_cancel(p)) {
         cbm_discover_free(files, file_count);
+        cbm_set_user_lang_config(NULL);
+        cbm_userconfig_free(p->userconfig);
+        p->userconfig = NULL;
         return -1;
     }
 
-    /* Check for existing DB → route to incremental or delete for full reindex */
-    {
-        // NOLINTNEXTLINE(concurrency-mt-unsafe) — called once during single-threaded setup
-        const char *home = getenv("HOME");
-        char db_path_buf[1024];
-        const char *db_path_ptr;
-        if (p->db_path) {
-            db_path_ptr = p->db_path;
-        } else {
-            if (!home) { home = "/tmp"; }
-            snprintf(db_path_buf, sizeof(db_path_buf),
-                     "%s/.cache/codebase-memory-mcp/%s.db", home, p->project_name);
-            db_path_ptr = db_path_buf;
-        }
-
-        if (!p->flush_store) { /* incremental only applies to disk-DB path */
+    /* Check for existing DB → route to incremental or delete for full reindex.
+     * Skip incremental when flush_store is set (dep indexing path uses in-memory store). */
+    if (!p->flush_store) {
+        char *db_path = resolve_db_path(p);
+        if (db_path) {
             struct stat db_st;
-            if (stat(db_path_ptr, &db_st) == 0) {
+            if (stat(db_path, &db_st) == 0) {
                 /* DB exists — check if it has stored hashes (enables incremental) */
-                cbm_store_t *check_store = cbm_store_open_path(db_path_ptr);
+                cbm_store_t *check_store = cbm_store_open_path(db_path);
                 if (check_store && cbm_store_check_integrity(check_store)) {
                     cbm_file_hash_t *hashes = NULL;
                     int hash_count = 0;
@@ -368,24 +405,28 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
                     if (hash_count > 0) {
                         cbm_log_info("pipeline.route", "path", "incremental", "stored_hashes",
                                      itoa_buf(hash_count));
-                        int rc2 = cbm_pipeline_run_incremental(p, db_path_ptr, files, file_count);
+                        rc = cbm_pipeline_run_incremental(p, db_path, files, file_count);
                         cbm_discover_free(files, file_count);
-                        return rc2;
+                        free(db_path);
+                        return rc;
                     }
                 } else if (check_store) {
                     cbm_store_close(check_store);
                 }
 
-                /* Not eligible for incremental → reindex: delete old DB files */
+                /* Not eligible for incremental → reindex: delete old DB first.
+                 * cbm_write_db writes directly to the final path (no rename),
+                 * so the old file must be gone before the pipeline dumps. */
                 cbm_log_info("pipeline.route", "path", "reindex", "action", "deleting old db");
-                cbm_unlink(db_path_ptr);
+                cbm_unlink(db_path);
                 char wal[1040];
                 char shm[1040];
-                snprintf(wal, sizeof(wal), "%s-wal", db_path_ptr);
-                snprintf(shm, sizeof(shm), "%s-shm", db_path_ptr);
+                snprintf(wal, sizeof(wal), "%s-wal", db_path);
+                snprintf(shm, sizeof(shm), "%s-shm", db_path);
                 cbm_unlink(wal);
                 cbm_unlink(shm);
             }
+            free(db_path);
         }
     }
     cbm_log_info("pipeline.route", "path", "full");
@@ -530,6 +571,16 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
             rc = -1;
             goto cleanup;
         }
+
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        rc = cbm_pipeline_pass_k8s(&ctx, files, file_count);
+        if (rc != 0) { /* log warning, continue */
+        }
+        cbm_log_info("pass.timing", "pass", "k8s", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+        if (check_cancel(p)) {
+            rc = -1;
+            goto cleanup;
+        }
     } else {
         cbm_log_info("pipeline.mode", "mode", "sequential", "files", itoa_buf(file_count));
 
@@ -549,6 +600,16 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         }
         cbm_log_info("pass.timing", "pass", "definitions", "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
+        if (check_cancel(p)) {
+            rc = -1;
+            goto seq_cleanup;
+        }
+
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        rc = cbm_pipeline_pass_k8s(&ctx, files, file_count);
+        if (rc != 0) { /* log warning, continue */
+        }
+        cbm_log_info("pass.timing", "pass", "k8s", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
         if (check_cancel(p)) {
             rc = -1;
             goto seq_cleanup;
@@ -734,14 +795,13 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!check_cancel(p)) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
-        // NOLINTNEXTLINE(concurrency-mt-unsafe) — called once during single-threaded dump
-        const char *home = getenv("HOME");
+        const char *home = cbm_get_home_dir();
         char db_path[1024];
         if (p->db_path) {
             snprintf(db_path, sizeof(db_path), "%s", p->db_path);
         } else {
             if (!home) {
-                home = "/tmp";
+                home = cbm_tmpdir();
             }
             snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home,
                      p->project_name);
@@ -768,21 +828,22 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         cbm_log_info("pass.timing", "pass", "dump", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
         /* Persist file hashes so next run can use incremental path */
-        if (!p->flush_store) {
+        if (!p->flush_store) { /* Skip hash persistence for dep indexing (in-memory store) */
             cbm_store_t *hash_store = cbm_store_open_path(db_path);
             if (hash_store) {
                 cbm_store_delete_file_hashes(hash_store, p->project_name);
                 for (int i = 0; i < file_count; i++) {
                     struct stat fst;
                     if (stat(files[i].path, &fst) == 0) {
+                        int64_t mtime_ns;
 #ifdef __APPLE__
-                        int64_t mtime_ns = ((int64_t)fst.st_mtimespec.tv_sec * 1000000000LL)
-                                           + (int64_t)fst.st_mtimespec.tv_nsec;
+                        mtime_ns = ((int64_t)fst.st_mtimespec.tv_sec * 1000000000LL) +
+                                   (int64_t)fst.st_mtimespec.tv_nsec;
 #elif defined(_WIN32)
-                        int64_t mtime_ns = (int64_t)fst.st_mtime * 1000000000LL;
+                        mtime_ns = (int64_t)fst.st_mtime * 1000000000LL;
 #else
-                        int64_t mtime_ns = ((int64_t)fst.st_mtim.tv_sec * 1000000000LL)
-                                           + (int64_t)fst.st_mtim.tv_nsec;
+                        mtime_ns = ((int64_t)fst.st_mtim.tv_sec * 1000000000LL) +
+                                   (int64_t)fst.st_mtim.tv_nsec;
 #endif
                         cbm_store_upsert_file_hash(hash_store, p->project_name,
                                                    files[i].rel_path, "", mtime_ns, fst.st_size);

@@ -55,9 +55,6 @@ static const char *path_last(CBMArena *a, const char *path) {
 static void parse_go_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
 
-    /* O(N) TSTreeCursor traversal for root children.
-     * Replaces O(N²) ts_node_child(root, i) indexed loop.
-     * Port of origin/main commit 178bea2. */
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
         ts_tree_cursor_delete(&cursor);
@@ -139,9 +136,6 @@ static void parse_go_imports(CBMExtractCtx *ctx) {
 static void parse_python_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
 
-    /* O(N) TSTreeCursor traversal for root children.
-     * Replaces O(N²) ts_node_child(root, i) indexed loop.
-     * Port of origin/main commit 178bea2. */
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
         ts_tree_cursor_delete(&cursor);
@@ -363,9 +357,13 @@ static void parse_es_imports(CBMExtractCtx *ctx) {
 static void parse_java_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
 
-    uint32_t count = ts_node_child_count(ctx->root);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode node = ts_node_child(ctx->root, i);
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
         if (strcmp(ts_node_type(node), "import_declaration") != 0) {
             continue;
         }
@@ -384,7 +382,8 @@ static void parse_java_imports(CBMExtractCtx *ctx) {
                 break;
             }
         }
-    }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
 }
 
 // --- Rust imports ---
@@ -393,9 +392,6 @@ static void parse_java_imports(CBMExtractCtx *ctx) {
 static void parse_rust_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
 
-    /* O(N) TSTreeCursor traversal for root children.
-     * Replaces O(N²) ts_node_child(root, i) indexed loop.
-     * Port of origin/main commit 178bea2. */
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
         ts_tree_cursor_delete(&cursor);
@@ -432,9 +428,6 @@ static void parse_rust_imports(CBMExtractCtx *ctx) {
 static void parse_c_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
 
-    /* O(N) TSTreeCursor traversal for root children.
-     * Replaces O(N²) ts_node_child(root, i) indexed loop.
-     * Port of origin/main commit 178bea2. */
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
         ts_tree_cursor_delete(&cursor);
@@ -489,9 +482,7 @@ static void parse_ruby_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
 
     // Walk for call nodes with "require" or "require_relative"
-    /* O(N) TSTreeCursor traversal for root children.
-     * Replaces O(N²) ts_node_child(root, i) indexed loop.
-     * Port of origin/main commit 178bea2. */
+    // Walk top-level children via O(N) TSTreeCursor traversal
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
         ts_tree_cursor_delete(&cursor);
@@ -559,9 +550,6 @@ static void parse_ruby_imports(CBMExtractCtx *ctx) {
 static void parse_lua_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
 
-    /* O(N) TSTreeCursor traversal for root children.
-     * Replaces O(N²) ts_node_child(root, i) indexed loop.
-     * Port of origin/main commit 178bea2. */
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
         ts_tree_cursor_delete(&cursor);
@@ -622,9 +610,18 @@ static void parse_lua_imports(CBMExtractCtx *ctx) {
 static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type) {
     CBMArena *a = ctx->arena;
 
-    uint32_t count = ts_node_child_count(ctx->root);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode node = ts_node_child(ctx->root, i);
+    /* Use TSTreeCursor for O(1)-per-step sibling traversal.
+     * ts_node_child(root, i) and ts_node_next_sibling() both call
+     * ts_node_child_with_descendant() internally, making naive iteration
+     * O(N²) on roots with thousands of children (e.g. generated .d.ts files).
+     * ts_tree_cursor_goto_next_sibling() maintains cursor state and is O(1). */
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
         if (strcmp(ts_node_type(node), node_type) != 0) {
             continue;
         }
@@ -663,7 +660,8 @@ static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type) {
                 }
             }
         }
-    }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
 }
 
 // --- Wolfram imports ---

@@ -1055,6 +1055,266 @@ TEST(store_bfs_edge_types_sqli) {
     PASS();
 }
 
+/* ── GlobToLike edge cases ──────────────────────────────────────── */
+
+TEST(store_glob_to_like_empty) {
+    char *got = cbm_glob_to_like("");
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "");
+    free(got);
+    PASS();
+}
+
+TEST(store_glob_to_like_only_star) {
+    char *got = cbm_glob_to_like("*");
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "%");
+    free(got);
+    PASS();
+}
+
+TEST(store_glob_to_like_consecutive_doublestar) {
+    /* double-star slash double-star should collapse to %% */
+    char *got = cbm_glob_to_like("**/**");
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "%%");
+    free(got);
+    PASS();
+}
+
+TEST(store_glob_to_like_dot_and_brackets) {
+    /* Dots and brackets are literal in glob-to-LIKE — passed through */
+    char *got = cbm_glob_to_like("src/[abc]/*.ts");
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "src/[abc]/%.ts");
+    free(got);
+    PASS();
+}
+
+TEST(store_glob_to_like_question_marks) {
+    /* Multiple ? should produce multiple _ */
+    char *got = cbm_glob_to_like("f???.txt");
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "f___.txt");
+    free(got);
+    PASS();
+}
+
+/* ── ExtractLikeHints edge cases ───────────────────────────────── */
+
+TEST(store_extract_like_hints_null_out) {
+    /* NULL out array */
+    int n = cbm_extract_like_hints(".*handler.*", NULL, 16);
+    ASSERT_EQ(n, 0);
+    PASS();
+}
+
+TEST(store_extract_like_hints_zero_max) {
+    char *hints[4];
+    int n = cbm_extract_like_hints(".*handler.*", hints, 0);
+    ASSERT_EQ(n, 0);
+    PASS();
+}
+
+TEST(store_extract_like_hints_alternation_complex) {
+    char *hints[16];
+    /* Alternation with multiple segments on each side */
+    int n = cbm_extract_like_hints("(foo|bar)baz", hints, 16);
+    ASSERT_EQ(n, 0);
+    PASS();
+}
+
+TEST(store_extract_like_hints_short_segments) {
+    char *hints[16];
+    /* All segments < 3 chars — no hints */
+    int n = cbm_extract_like_hints(".*ab.*cd.*", hints, 16);
+    ASSERT_EQ(n, 0);
+    PASS();
+}
+
+TEST(store_extract_like_hints_complex_multi_segment) {
+    char *hints[16];
+    /* .*Foo.*Bar.* should extract both */
+    int n = cbm_extract_like_hints(".*Foo.*Bar.*", hints, 16);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(hints[0], "Foo");
+    ASSERT_STR_EQ(hints[1], "Bar");
+    free(hints[0]);
+    free(hints[1]);
+    PASS();
+}
+
+TEST(store_extract_like_hints_max_out_limit) {
+    char *hints[2];
+    /* More segments than max_out — should stop at max */
+    int n = cbm_extract_like_hints(".*aaa.*bbb.*ccc.*ddd.*", hints, 2);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(hints[0], "aaa");
+    ASSERT_STR_EQ(hints[1], "bbb");
+    free(hints[0]);
+    free(hints[1]);
+    PASS();
+}
+
+TEST(store_extract_like_hints_escaped_chars) {
+    char *hints[16];
+    /* Backslash escaping: \. makes the dot literal, so it becomes part of the
+     * accumulated literal string. ".handler" is the extracted hint. */
+    int n = cbm_extract_like_hints("\\.handler", hints, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(hints[0], ".handler");
+    free(hints[0]);
+    PASS();
+}
+
+/* ── Case helper edge cases ────────────────────────────────────── */
+
+TEST(store_ensure_case_insensitive_null) {
+    const char *result = cbm_ensure_case_insensitive(NULL);
+    ASSERT_STR_EQ(result, "");
+    PASS();
+}
+
+TEST(store_ensure_case_insensitive_already_ci) {
+    /* Already case-insensitive — should NOT double-prefix */
+    ASSERT_STR_EQ(cbm_ensure_case_insensitive("(?i).*Order.*"), "(?i).*Order.*");
+    PASS();
+}
+
+TEST(store_ensure_case_insensitive_plain) {
+    ASSERT_STR_EQ(cbm_ensure_case_insensitive("FooBar"), "(?i)FooBar");
+    PASS();
+}
+
+TEST(store_strip_case_flag_null) {
+    const char *result = cbm_strip_case_flag(NULL);
+    ASSERT_STR_EQ(result, "");
+    PASS();
+}
+
+TEST(store_strip_case_flag_no_flag) {
+    ASSERT_STR_EQ(cbm_strip_case_flag("plain_pattern"), "plain_pattern");
+    PASS();
+}
+
+TEST(store_strip_case_flag_empty) {
+    ASSERT_STR_EQ(cbm_strip_case_flag(""), "");
+    PASS();
+}
+
+/* ── Architecture helper edge cases ────────────────────────────── */
+
+TEST(store_qn_to_package_single_segment) {
+    /* No dots — returns empty string */
+    ASSERT_STR_EQ(cbm_qn_to_package("nodots"), "");
+    PASS();
+}
+
+TEST(store_qn_to_package_two_segments) {
+    /* project.name — returns segment[1] */
+    ASSERT_STR_EQ(cbm_qn_to_package("proj.name"), "name");
+    PASS();
+}
+
+TEST(store_qn_to_package_many_segments) {
+    /* project.dir.pkg.Func — 4+ segments returns segment[2] */
+    ASSERT_STR_EQ(cbm_qn_to_package("myproj.dir.pkg.Func"), "pkg");
+    PASS();
+}
+
+TEST(store_qn_to_package_null) {
+    ASSERT_STR_EQ(cbm_qn_to_package(NULL), "");
+    PASS();
+}
+
+TEST(store_qn_to_package_empty) {
+    ASSERT_STR_EQ(cbm_qn_to_package(""), "");
+    PASS();
+}
+
+TEST(store_qn_to_top_package_single_segment) {
+    ASSERT_STR_EQ(cbm_qn_to_top_package("nodots"), "");
+    PASS();
+}
+
+TEST(store_qn_to_top_package_two_segments) {
+    /* project.dir — returns "dir" */
+    ASSERT_STR_EQ(cbm_qn_to_top_package("proj.dir"), "dir");
+    PASS();
+}
+
+TEST(store_qn_to_top_package_many_segments) {
+    /* Always returns segment[1] regardless of depth */
+    ASSERT_STR_EQ(cbm_qn_to_top_package("proj.dir.sub.Func"), "dir");
+    PASS();
+}
+
+TEST(store_qn_to_top_package_null) {
+    ASSERT_STR_EQ(cbm_qn_to_top_package(NULL), "");
+    PASS();
+}
+
+TEST(store_is_test_file_various) {
+    /* Positive cases */
+    ASSERT_TRUE(cbm_is_test_file_path("test_handler.py"));
+    ASSERT_TRUE(cbm_is_test_file_path("handler_test.go"));
+    ASSERT_TRUE(cbm_is_test_file_path("handler.test.ts"));
+    ASSERT_FALSE(cbm_is_test_file_path("handler.spec.ts")); /* "spec" not "test" — no match */
+    ASSERT_TRUE(cbm_is_test_file_path("src/__tests__/handler.js"));
+    ASSERT_TRUE(cbm_is_test_file_path("tests/unit/handler.py"));
+
+    /* Negative cases */
+    ASSERT_FALSE(cbm_is_test_file_path("handler.go"));
+    ASSERT_FALSE(cbm_is_test_file_path("main.py"));
+    ASSERT_FALSE(cbm_is_test_file_path("service.ts"));
+
+    /* Edge: NULL and empty */
+    ASSERT_FALSE(cbm_is_test_file_path(NULL));
+    ASSERT_FALSE(cbm_is_test_file_path(""));
+    PASS();
+}
+
+/* ── Risk/impact edge cases ────────────────────────────────────── */
+
+TEST(store_hop_to_risk_all_levels) {
+    /* hop 0 hits the default case → LOW */
+    ASSERT_EQ(cbm_hop_to_risk(0), CBM_RISK_LOW);
+    /* hop 1 → CRITICAL */
+    ASSERT_EQ(cbm_hop_to_risk(1), CBM_RISK_CRITICAL);
+    /* hop 2 → HIGH */
+    ASSERT_EQ(cbm_hop_to_risk(2), CBM_RISK_HIGH);
+    /* hop 3 → MEDIUM */
+    ASSERT_EQ(cbm_hop_to_risk(3), CBM_RISK_MEDIUM);
+    /* hop 4+ → LOW */
+    ASSERT_EQ(cbm_hop_to_risk(4), CBM_RISK_LOW);
+    ASSERT_EQ(cbm_hop_to_risk(100), CBM_RISK_LOW);
+    /* negative → LOW (default) */
+    ASSERT_EQ(cbm_hop_to_risk(-1), CBM_RISK_LOW);
+    PASS();
+}
+
+TEST(store_risk_label_all_levels) {
+    ASSERT_STR_EQ(cbm_risk_label(CBM_RISK_CRITICAL), "CRITICAL");
+    ASSERT_STR_EQ(cbm_risk_label(CBM_RISK_HIGH), "HIGH");
+    ASSERT_STR_EQ(cbm_risk_label(CBM_RISK_MEDIUM), "MEDIUM");
+    ASSERT_STR_EQ(cbm_risk_label(CBM_RISK_LOW), "LOW");
+    /* Out-of-range enum value falls to default → LOW */
+    ASSERT_STR_EQ(cbm_risk_label((cbm_risk_level_t)99), "LOW");
+    PASS();
+}
+
+TEST(store_impact_summary_empty) {
+    /* Zero hops and edges */
+    cbm_impact_summary_t s = cbm_build_impact_summary(NULL, 0, NULL, 0);
+    ASSERT_EQ(s.total, 0);
+    ASSERT_EQ(s.critical, 0);
+    ASSERT_EQ(s.high, 0);
+    ASSERT_EQ(s.medium, 0);
+    ASSERT_EQ(s.low, 0);
+    ASSERT_FALSE(s.has_cross_service);
+    PASS();
+}
+
 SUITE(store_search) {
     RUN_TEST(store_search_by_label);
     RUN_TEST(store_search_by_name_pattern);
@@ -1084,7 +1344,39 @@ SUITE(store_search) {
     RUN_TEST(store_ensure_case_insensitive);
     RUN_TEST(store_strip_case_flag);
     RUN_TEST(store_batch_count_degrees);
-    /* C3: SQL injection resistance tests (TDD for parameterized bind port) */
+    /* SQL injection resistance tests (parameterized bind) */
     RUN_TEST(store_search_exclude_labels_sqli);
     RUN_TEST(store_bfs_edge_types_sqli);
+    /* Edge case tests */
+    RUN_TEST(store_glob_to_like_empty);
+    RUN_TEST(store_glob_to_like_only_star);
+    RUN_TEST(store_glob_to_like_consecutive_doublestar);
+    RUN_TEST(store_glob_to_like_dot_and_brackets);
+    RUN_TEST(store_glob_to_like_question_marks);
+    RUN_TEST(store_extract_like_hints_null_out);
+    RUN_TEST(store_extract_like_hints_zero_max);
+    RUN_TEST(store_extract_like_hints_alternation_complex);
+    RUN_TEST(store_extract_like_hints_short_segments);
+    RUN_TEST(store_extract_like_hints_complex_multi_segment);
+    RUN_TEST(store_extract_like_hints_max_out_limit);
+    RUN_TEST(store_extract_like_hints_escaped_chars);
+    RUN_TEST(store_ensure_case_insensitive_null);
+    RUN_TEST(store_ensure_case_insensitive_already_ci);
+    RUN_TEST(store_ensure_case_insensitive_plain);
+    RUN_TEST(store_strip_case_flag_null);
+    RUN_TEST(store_strip_case_flag_no_flag);
+    RUN_TEST(store_strip_case_flag_empty);
+    RUN_TEST(store_qn_to_package_single_segment);
+    RUN_TEST(store_qn_to_package_two_segments);
+    RUN_TEST(store_qn_to_package_many_segments);
+    RUN_TEST(store_qn_to_package_null);
+    RUN_TEST(store_qn_to_package_empty);
+    RUN_TEST(store_qn_to_top_package_single_segment);
+    RUN_TEST(store_qn_to_top_package_two_segments);
+    RUN_TEST(store_qn_to_top_package_many_segments);
+    RUN_TEST(store_qn_to_top_package_null);
+    RUN_TEST(store_is_test_file_various);
+    RUN_TEST(store_hop_to_risk_all_levels);
+    RUN_TEST(store_risk_label_all_levels);
+    RUN_TEST(store_impact_summary_empty);
 }

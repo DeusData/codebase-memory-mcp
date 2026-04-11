@@ -50,9 +50,10 @@ int cbm_unlink(const char *path);
 /* Delete an empty directory. Returns 0 on success. */
 int cbm_rmdir(const char *path);
 
-/* Execute argv[0] with argv args directly (no shell interpretation).
- * Returns exit code, or -1 on fork/exec/wait failure.
- * NULL argv or argv[0] returns -1 immediately. */
+/* Execute a command without shell interpretation.
+ * argv is a NULL-terminated array: {"cmd", "arg1", "arg2", NULL}.
+ * Returns the process exit code, or -1 on fork/exec failure.
+ * POSIX: fork() + execvp(). Windows: _spawnvp(). */
 int cbm_exec_no_shell(const char *const *argv);
 
 #endif /* CBM_COMPAT_FS_H */

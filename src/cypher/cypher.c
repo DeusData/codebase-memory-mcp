@@ -2561,7 +2561,10 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
                     }
                     const char *v = binding_get_virtual(&bindings[bi], wc->items[ci].variable,
                                                         wc->items[ci].property);
-                    kl += snprintf(key + kl, sizeof(key) - kl, "%s|", v);
+                    kl += snprintf(key + kl, sizeof(key) - (size_t)kl, "%s|", v);
+                    if (kl >= (int)sizeof(key)) {
+                        kl = (int)sizeof(key) - 1;
+                    }
                 }
                 int found = -1;
                 for (int a = 0; a < agg_cnt; a++) {
@@ -2918,7 +2921,10 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
                     }
                     char func_buf[512];
                     vals[ci] = project_item(&bindings[bi], item, func_buf, sizeof(func_buf));
-                    klen += snprintf(key + klen, sizeof(key) - klen, "%s|", vals[ci]);
+                    klen += snprintf(key + klen, sizeof(key) - (size_t)klen, "%s|", vals[ci]);
+                    if (klen >= (int)sizeof(key)) {
+                        klen = (int)sizeof(key) - 1;
+                    }
                 }
 
                 int found = -1;
@@ -3005,10 +3011,15 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
                             if (ci2 > 0) {
                                 cbuf[bl++] = ',';
                             }
-                            bl += snprintf(cbuf + bl, sizeof(cbuf) - bl, "\"%s\"",
+                            bl += snprintf(cbuf + bl, sizeof(cbuf) - (size_t)bl, "\"%s\"",
                                            aggs[a].collect_lists[ci][ci2]);
+                            if (bl >= (int)sizeof(cbuf)) {
+                                bl = (int)sizeof(cbuf) - 1;
+                            }
                         }
-                        cbuf[bl++] = ']';
+                        if (bl < (int)sizeof(cbuf) - 1) {
+                            cbuf[bl++] = ']';
+                        }
                         cbuf[bl] = '\0';
                         snprintf(bufs[ci], sizeof(bufs[ci]), "%s", cbuf);
                     } else {

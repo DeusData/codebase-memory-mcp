@@ -6,6 +6,7 @@
  */
 #include "test_framework.h"
 #include <store/store.h>
+#include <sqlite3.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -897,10 +898,618 @@ TEST(store_find_node_ids_by_qns) {
     PASS();
 }
 
+/* ── Integrity check tests ──────────────────────────────────────── */
+
+TEST(store_integrity_clean) {
+    /* A fresh store with correct data should pass integrity check */
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "test-proj", "/tmp/test");
+    ASSERT_TRUE(cbm_store_check_integrity(s));
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_integrity_empty) {
+    /* An empty store (no project rows) should pass — 0 rows is fine */
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(cbm_store_check_integrity(s));
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_integrity_corrupt_bad_path) {
+    /* Simulate corruption: root_path is a numeric string (not a real path).
+     * This matches the real corruption where node IDs ended up in root_path. */
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_exec(db,
+                 "INSERT INTO projects (name, indexed_at, root_path) "
+                 "VALUES ('some-project', '2024-01-01', '826');",
+                 NULL, NULL, NULL);
+    ASSERT_FALSE(cbm_store_check_integrity(s));
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_integrity_corrupt_too_many_rows) {
+    /* Simulate corruption: >5 rows in projects table */
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    sqlite3 *db = cbm_store_get_db(s);
+    for (int i = 0; i < 10; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO projects (name, indexed_at, root_path) "
+                 "VALUES ('proj-%d', '2024-01-01', '/tmp/%d');",
+                 i, i);
+        sqlite3_exec(db, sql, NULL, NULL, NULL);
+    }
+    ASSERT_FALSE(cbm_store_check_integrity(s));
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_integrity_null_check) {
+    /* NULL store should return false (not crash) */
+    ASSERT_FALSE(cbm_store_check_integrity(NULL));
+    PASS();
+}
+
+/* ── Edge case: NULL / empty field handling ────────────────────── */
+
+TEST(store_node_null_project) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+
+    /* Upsert with NULL project — should fail gracefully */
+    cbm_node_t n = {.project = NULL,
+                    .label = "Function",
+                    .name = "Foo",
+                    .qualified_name = "null.Foo"};
+    int64_t id = cbm_store_upsert_node(s, &n);
+    /* Either returns error or silently succeeds; must not crash */
+    (void)id;
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_node_null_qn) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* Upsert with NULL qualified_name */
+    cbm_node_t n = {.project = "test",
+                    .label = "Function",
+                    .name = "Bar",
+                    .qualified_name = NULL};
+    int64_t id = cbm_store_upsert_node(s, &n);
+    /* Must not crash regardless of return value */
+    (void)id;
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_node_empty_strings) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* Upsert with all fields as empty strings */
+    cbm_node_t n = {.project = "test",
+                    .label = "",
+                    .name = "",
+                    .qualified_name = "",
+                    .file_path = "",
+                    .start_line = 0,
+                    .end_line = 0,
+                    .properties_json = ""};
+    int64_t id = cbm_store_upsert_node(s, &n);
+    /* Should succeed — empty strings are valid */
+    ASSERT_GT(id, 0);
+
+    cbm_node_t found = {0};
+    int rc = cbm_store_find_node_by_qn(s, "test", "", &found);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_STR_EQ(found.name, "");
+    ASSERT_STR_EQ(found.label, "");
+    cbm_node_free_fields(&found);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── Edge case: not-found lookups ──────────────────────────────── */
+
+TEST(store_find_by_id_not_found) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t found = {0};
+    int rc = cbm_store_find_node_by_id(s, 999999, &found);
+    ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
+
+    /* Negative ID should also be not found */
+    rc = cbm_store_find_node_by_id(s, -1, &found);
+    ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_find_by_qn_not_found) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* Insert a node so the store is non-empty */
+    cbm_node_t n = {.project = "test",
+                    .label = "Function",
+                    .name = "Exists",
+                    .qualified_name = "test.Exists"};
+    cbm_store_upsert_node(s, &n);
+
+    /* Search for a non-existent QN */
+    cbm_node_t found = {0};
+    int rc = cbm_store_find_node_by_qn(s, "test", "test.DoesNotExist", &found);
+    ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
+
+    /* Wrong project */
+    rc = cbm_store_find_node_by_qn(s, "other-project", "test.Exists", &found);
+    ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── Edge case: cross-project lookups ──────────────────────────── */
+
+TEST(store_find_by_qn_any_cross_project) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "proj-a", "/tmp/a");
+    cbm_store_upsert_project(s, "proj-b", "/tmp/b");
+
+    cbm_node_t na = {.project = "proj-a",
+                     .label = "Function",
+                     .name = "SharedFunc",
+                     .qualified_name = "proj-a.main.SharedFunc"};
+    cbm_node_t nb = {.project = "proj-b",
+                     .label = "Class",
+                     .name = "Widget",
+                     .qualified_name = "proj-b.pkg.Widget"};
+    cbm_store_upsert_node(s, &na);
+    cbm_store_upsert_node(s, &nb);
+
+    /* find_node_by_qn_any finds without project filter */
+    cbm_node_t found = {0};
+    int rc = cbm_store_find_node_by_qn_any(s, "proj-a.main.SharedFunc", &found);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_STR_EQ(found.name, "SharedFunc");
+    ASSERT_STR_EQ(found.project, "proj-a");
+    cbm_node_free_fields(&found);
+
+    rc = cbm_store_find_node_by_qn_any(s, "proj-b.pkg.Widget", &found);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_STR_EQ(found.name, "Widget");
+    ASSERT_STR_EQ(found.project, "proj-b");
+    cbm_node_free_fields(&found);
+
+    /* Non-existent QN */
+    rc = cbm_store_find_node_by_qn_any(s, "nonexistent.Nope", &found);
+    ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_find_by_name_any_cross_project) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "proj-a", "/tmp/a");
+    cbm_store_upsert_project(s, "proj-b", "/tmp/b");
+
+    /* Same name in two projects */
+    cbm_node_t na = {.project = "proj-a",
+                     .label = "Function",
+                     .name = "Init",
+                     .qualified_name = "proj-a.main.Init"};
+    cbm_node_t nb = {.project = "proj-b",
+                     .label = "Function",
+                     .name = "Init",
+                     .qualified_name = "proj-b.main.Init"};
+    cbm_node_t nc = {.project = "proj-b",
+                     .label = "Function",
+                     .name = "Other",
+                     .qualified_name = "proj-b.main.Other"};
+    cbm_store_upsert_node(s, &na);
+    cbm_store_upsert_node(s, &nb);
+    cbm_store_upsert_node(s, &nc);
+
+    /* find_nodes_by_name_any should find both "Init" across projects */
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    int rc = cbm_store_find_nodes_by_name_any(s, "Init", &nodes, &count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    cbm_store_free_nodes(nodes, count);
+
+    /* Name that doesn't exist */
+    rc = cbm_store_find_nodes_by_name_any(s, "Nonexistent", &nodes, &count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_nodes(nodes, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── Edge case: empty result sets ──────────────────────────────── */
+
+TEST(store_find_by_file_no_match) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t n = {.project = "test",
+                    .label = "Function",
+                    .name = "Foo",
+                    .qualified_name = "test.Foo",
+                    .file_path = "main.go"};
+    cbm_store_upsert_node(s, &n);
+
+    /* Search for a file that has no nodes */
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    int rc = cbm_store_find_nodes_by_file(s, "test", "nonexistent.go", &nodes, &count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_nodes(nodes, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── Edge case: batch upsert boundary ─────────────────────────── */
+
+TEST(store_node_batch_upsert_zero) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* Batch upsert with count=0 should succeed, do nothing */
+    int rc = cbm_store_upsert_node_batch(s, NULL, 0, NULL);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+
+    int cnt = cbm_store_count_nodes(s, "test");
+    ASSERT_EQ(cnt, 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_node_batch_upsert_100) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t nodes[100];
+    int64_t ids[100];
+    char names[100][32];
+    char qns[100][64];
+
+    for (int i = 0; i < 100; i++) {
+        snprintf(names[i], sizeof(names[i]), "stress_%d", i);
+        snprintf(qns[i], sizeof(qns[i]), "test.stress.stress_%d", i);
+        nodes[i] = (cbm_node_t){.project = "test",
+                                .label = "Function",
+                                .name = names[i],
+                                .qualified_name = qns[i],
+                                .file_path = "stress.go",
+                                .start_line = i,
+                                .end_line = i + 1};
+    }
+
+    int rc = cbm_store_upsert_node_batch(s, nodes, 100, ids);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+
+    /* All IDs should be positive */
+    for (int i = 0; i < 100; i++)
+        ASSERT_GT(ids[i], 0);
+
+    /* IDs should all be unique */
+    for (int i = 0; i < 100; i++)
+        for (int j = i + 1; j < 100; j++)
+            ASSERT_NEQ(ids[i], ids[j]);
+
+    int cnt = cbm_store_count_nodes(s, "test");
+    ASSERT_EQ(cnt, 100);
+
+    /* Verify a few random lookups */
+    cbm_node_t found = {0};
+    rc = cbm_store_find_node_by_qn(s, "test", "test.stress.stress_0", &found);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_STR_EQ(found.name, "stress_0");
+    cbm_node_free_fields(&found);
+
+    rc = cbm_store_find_node_by_qn(s, "test", "test.stress.stress_99", &found);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_STR_EQ(found.name, "stress_99");
+    cbm_node_free_fields(&found);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── Edge case: delete then verify remaining ──────────────────── */
+
+TEST(store_delete_by_label_verify_remaining) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t n1 = {.project = "test",
+                     .label = "Function",
+                     .name = "FuncA",
+                     .qualified_name = "test.FuncA"};
+    cbm_node_t n2 = {.project = "test",
+                     .label = "Class",
+                     .name = "ClassB",
+                     .qualified_name = "test.ClassB"};
+    cbm_node_t n3 = {.project = "test",
+                     .label = "Function",
+                     .name = "FuncC",
+                     .qualified_name = "test.FuncC"};
+    cbm_node_t n4 = {.project = "test",
+                     .label = "Method",
+                     .name = "MethodD",
+                     .qualified_name = "test.MethodD"};
+    cbm_store_upsert_node(s, &n1);
+    cbm_store_upsert_node(s, &n2);
+    cbm_store_upsert_node(s, &n3);
+    cbm_store_upsert_node(s, &n4);
+
+    /* Delete all Functions */
+    int rc = cbm_store_delete_nodes_by_label(s, "test", "Function");
+    ASSERT_EQ(rc, CBM_STORE_OK);
+
+    int cnt = cbm_store_count_nodes(s, "test");
+    ASSERT_EQ(cnt, 2);
+
+    /* Class and Method should remain */
+    cbm_node_t found = {0};
+    rc = cbm_store_find_node_by_qn(s, "test", "test.ClassB", &found);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_STR_EQ(found.label, "Class");
+    cbm_node_free_fields(&found);
+
+    rc = cbm_store_find_node_by_qn(s, "test", "test.MethodD", &found);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_STR_EQ(found.label, "Method");
+    cbm_node_free_fields(&found);
+
+    /* Deleted ones should be gone */
+    rc = cbm_store_find_node_by_qn(s, "test", "test.FuncA", &found);
+    ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
+    rc = cbm_store_find_node_by_qn(s, "test", "test.FuncC", &found);
+    ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_delete_by_file_verify_remaining) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t n1 = {.project = "test",
+                     .label = "Function",
+                     .name = "A",
+                     .qualified_name = "test.A",
+                     .file_path = "delete_me.go"};
+    cbm_node_t n2 = {.project = "test",
+                     .label = "Function",
+                     .name = "B",
+                     .qualified_name = "test.B",
+                     .file_path = "keep_me.go"};
+    cbm_node_t n3 = {.project = "test",
+                     .label = "Function",
+                     .name = "C",
+                     .qualified_name = "test.C",
+                     .file_path = "delete_me.go"};
+    cbm_store_upsert_node(s, &n1);
+    cbm_store_upsert_node(s, &n2);
+    cbm_store_upsert_node(s, &n3);
+
+    int rc = cbm_store_delete_nodes_by_file(s, "test", "delete_me.go");
+    ASSERT_EQ(rc, CBM_STORE_OK);
+
+    int cnt = cbm_store_count_nodes(s, "test");
+    ASSERT_EQ(cnt, 1);
+
+    /* Only keep_me.go node should remain */
+    cbm_node_t found = {0};
+    rc = cbm_store_find_node_by_qn(s, "test", "test.B", &found);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_STR_EQ(found.file_path, "keep_me.go");
+    cbm_node_free_fields(&found);
+
+    /* Deleted nodes should be gone */
+    rc = cbm_store_find_node_by_qn(s, "test", "test.A", &found);
+    ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
+    rc = cbm_store_find_node_by_qn(s, "test", "test.C", &found);
+    ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── Edge case: upsert dedup with field changes ───────────────── */
+
+TEST(store_node_upsert_updates_fields) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* Insert initial node */
+    cbm_node_t n1 = {.project = "test",
+                     .label = "Function",
+                     .name = "MyFunc",
+                     .qualified_name = "test.MyFunc",
+                     .file_path = "old.go",
+                     .start_line = 1,
+                     .end_line = 10,
+                     .properties_json = "{\"version\":1}"};
+    int64_t id1 = cbm_store_upsert_node(s, &n1);
+    ASSERT_GT(id1, 0);
+
+    /* Upsert same QN with changed fields */
+    cbm_node_t n2 = {.project = "test",
+                     .label = "Method",
+                     .name = "MyFunc",
+                     .qualified_name = "test.MyFunc",
+                     .file_path = "new.go",
+                     .start_line = 50,
+                     .end_line = 60,
+                     .properties_json = "{\"version\":2}"};
+    int64_t id2 = cbm_store_upsert_node(s, &n2);
+    ASSERT_EQ(id1, id2); /* Same ID — updated, not duplicated */
+
+    /* Count should still be 1 */
+    int cnt = cbm_store_count_nodes(s, "test");
+    ASSERT_EQ(cnt, 1);
+
+    /* Verify fields were updated */
+    cbm_node_t found = {0};
+    int rc = cbm_store_find_node_by_id(s, id1, &found);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_STR_EQ(found.label, "Method");
+    ASSERT_STR_EQ(found.file_path, "new.go");
+    ASSERT_EQ(found.start_line, 50);
+    ASSERT_EQ(found.end_line, 60);
+    ASSERT(strstr(found.properties_json, "version") != NULL);
+    ASSERT(strstr(found.properties_json, "2") != NULL);
+    cbm_node_free_fields(&found);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── Edge case: long qualified name ───────────────────────────── */
+
+TEST(store_node_long_qn) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* Build a 1200-char qualified name */
+    char long_qn[1201];
+    memset(long_qn, 'a', 1200);
+    long_qn[0] = 't'; /* make it look like a dotted path */
+    for (int i = 50; i < 1200; i += 50)
+        long_qn[i] = '.';
+    long_qn[1200] = '\0';
+
+    cbm_node_t n = {.project = "test",
+                    .label = "Function",
+                    .name = "LongName",
+                    .qualified_name = long_qn,
+                    .file_path = "big.go"};
+    int64_t id = cbm_store_upsert_node(s, &n);
+    ASSERT_GT(id, 0);
+
+    /* Should be retrievable by QN */
+    cbm_node_t found = {0};
+    int rc = cbm_store_find_node_by_qn(s, "test", long_qn, &found);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_STR_EQ(found.qualified_name, long_qn);
+    ASSERT_STR_EQ(found.name, "LongName");
+    cbm_node_free_fields(&found);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── Edge case: properties JSON with special characters ────────── */
+
+TEST(store_node_properties_special_chars) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* JSON with quotes, backslashes, unicode, newlines */
+    const char *props =
+        "{\"desc\":\"line1\\nline2\","
+        "\"path\":\"C:\\\\Users\\\\test\","
+        "\"emoji\":\"\\u2603\","
+        "\"nested\":{\"key\":\"val with \\\"quotes\\\"\"}}";
+
+    cbm_node_t n = {.project = "test",
+                    .label = "Function",
+                    .name = "SpecialFunc",
+                    .qualified_name = "test.SpecialFunc",
+                    .properties_json = props};
+    int64_t id = cbm_store_upsert_node(s, &n);
+    ASSERT_GT(id, 0);
+
+    cbm_node_t found = {0};
+    int rc = cbm_store_find_node_by_id(s, id, &found);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_NOT_NULL(found.properties_json);
+    /* Round-trip should preserve the JSON exactly */
+    ASSERT_STR_EQ(found.properties_json, props);
+    cbm_node_free_fields(&found);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── Edge case: delete from non-existent project/file ─────────── */
+
+TEST(store_delete_nodes_nonexistent) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* Insert one node */
+    cbm_node_t n = {.project = "test",
+                    .label = "Function",
+                    .name = "Survivor",
+                    .qualified_name = "test.Survivor",
+                    .file_path = "main.go"};
+    cbm_store_upsert_node(s, &n);
+
+    /* Delete by non-existent file — should succeed but delete nothing */
+    int rc = cbm_store_delete_nodes_by_file(s, "test", "ghost.go");
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_count_nodes(s, "test"), 1);
+
+    /* Delete by non-existent label */
+    rc = cbm_store_delete_nodes_by_label(s, "test", "Interface");
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_count_nodes(s, "test"), 1);
+
+    /* Delete by non-existent project */
+    rc = cbm_store_delete_nodes_by_project(s, "no-such-project");
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_count_nodes(s, "test"), 1);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── Edge case: count nodes for unknown project ───────────────── */
+
+TEST(store_count_nodes_unknown_project) {
+    cbm_store_t *s = cbm_store_open_memory();
+    /* No project created — count should be 0 */
+    int cnt = cbm_store_count_nodes(s, "ghost-project");
+    ASSERT_EQ(cnt, 0);
+    cbm_store_close(s);
+    PASS();
+}
+
 SUITE(store_nodes) {
     RUN_TEST(store_open_memory);
     RUN_TEST(store_close_null);
     RUN_TEST(store_open_memory_twice);
+    RUN_TEST(store_integrity_clean);
+    RUN_TEST(store_integrity_empty);
+    RUN_TEST(store_integrity_corrupt_bad_path);
+    RUN_TEST(store_integrity_corrupt_too_many_rows);
+    RUN_TEST(store_integrity_null_check);
     RUN_TEST(store_project_crud);
     RUN_TEST(store_project_update);
     RUN_TEST(store_project_delete);
@@ -929,4 +1538,21 @@ SUITE(store_nodes) {
     RUN_TEST(store_restore_from);
     RUN_TEST(store_pragma_settings);
     RUN_TEST(store_find_node_ids_by_qns);
+    RUN_TEST(store_node_null_project);
+    RUN_TEST(store_node_null_qn);
+    RUN_TEST(store_node_empty_strings);
+    RUN_TEST(store_find_by_id_not_found);
+    RUN_TEST(store_find_by_qn_not_found);
+    RUN_TEST(store_find_by_qn_any_cross_project);
+    RUN_TEST(store_find_by_name_any_cross_project);
+    RUN_TEST(store_find_by_file_no_match);
+    RUN_TEST(store_node_batch_upsert_zero);
+    RUN_TEST(store_node_batch_upsert_100);
+    RUN_TEST(store_delete_by_label_verify_remaining);
+    RUN_TEST(store_delete_by_file_verify_remaining);
+    RUN_TEST(store_node_upsert_updates_fields);
+    RUN_TEST(store_node_long_qn);
+    RUN_TEST(store_node_properties_special_chars);
+    RUN_TEST(store_delete_nodes_nonexistent);
+    RUN_TEST(store_count_nodes_unknown_project);
 }

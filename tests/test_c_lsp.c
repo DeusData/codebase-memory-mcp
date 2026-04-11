@@ -16,7 +16,7 @@
  *   - Lambda captures, struct fields, trailing returns
  *   - STL containers, C idioms (func ptrs, opaque handles)
  *   - C11 _Generic, bitfields, unions, varargs
- *   - DLL/dlsym patterns, SFINAE, placement new
+ *   - DLL patterns, SFINAE, placement new
  */
 #include "test_framework.h"
 #include "cbm.h"
@@ -7050,8 +7050,12 @@ TEST(clsp_nocrash_extremely_large_function) {
     int off = 0;
     off += snprintf(src + off, sizeof(src) - off, "struct W { void m() {} };\n");
     off += snprintf(src + off, sizeof(src) - off, "void test() {\n");
-    for (int i = 0; i < 50; i++)
-        off += snprintf(src + off, sizeof(src) - off, "    W w%d;\n", i);
+    for (int i = 0; i < 50; i++) {
+        off += snprintf(src + off, sizeof(src) - (size_t)off, "    W w%d;\n", i);
+        if (off >= (int)sizeof(src)) {
+            off = (int)sizeof(src) - 1;
+        }
+    }
     off += snprintf(src + off, sizeof(src) - off, "    W w0;\n");
     off += snprintf(src + off, sizeof(src) - off, "    w0.m();\n");
     off += snprintf(src + off, sizeof(src) - off, "}\n");
@@ -14928,55 +14932,8 @@ TEST(clsp_easy_win_sfinaevoid_t) {
     PASS();
 }
 
-TEST(clsp_dll_get_proc_address) {
-    CBMFileResult *r =
-        extract_c("\n"
-                  "typedef void* HMODULE;\n"
-                  "typedef void (*HandleFunc)(int);\n"
-                  "\n"
-                  "void* LoadLibrary(const char* name);\n"
-                  "void* GetProcAddress(void* module, const char* name);\n"
-                  "\n"
-                  "void test() {\n"
-                  "    HMODULE dll = LoadLibrary(\"mylib.dll\");\n"
-                  "    HandleFunc handle = (HandleFunc)GetProcAddress(dll, \"HandleMyGarbage\");\n"
-                  "    handle(42);\n"
-                  "}\n"
-                  "");
-    ASSERT_NOT_NULL(r);
-    ASSERT_GTE(find_resolved(r, "test", "external.HandleMyGarbage"), 0);
-    {
-        int idx = find_resolved(r, "test", "external.HandleMyGarbage");
-        if (idx >= 0)
-            ASSERT_STR_EQ(r->resolved_calls.items[idx].strategy, "lsp_dll_resolve");
-    }
-    cbm_free_result(r);
-    PASS();
-}
-
-TEST(clsp_dll_dlsym) {
-    CBMFileResult *r = extract_c("\n"
-                                 "typedef void (*init_fn)(void);\n"
-                                 "\n"
-                                 "void* dlopen(const char* filename, int flags);\n"
-                                 "void* dlsym(void* handle, const char* symbol);\n"
-                                 "\n"
-                                 "void test() {\n"
-                                 "    void* h = dlopen(\"libfoo.so\", 1);\n"
-                                 "    init_fn init = (init_fn)dlsym(h, \"initialize\");\n"
-                                 "    init();\n"
-                                 "}\n"
-                                 "");
-    ASSERT_NOT_NULL(r);
-    ASSERT_GTE(find_resolved(r, "test", "external.initialize"), 0);
-    {
-        int idx = find_resolved(r, "test", "external.initialize");
-        if (idx >= 0)
-            ASSERT_STR_EQ(r->resolved_calls.items[idx].strategy, "lsp_dll_resolve");
-    }
-    cbm_free_result(r);
-    PASS();
-}
+/* DLL resolve LSP tests removed — string literals triggered
+ * Windows Defender false positive. See issue #89. */
 
 TEST(clsp_dll_custom_resolver) {
     CBMFileResult *r = extract_c("\n"
@@ -15848,8 +15805,6 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_easy_win_overload_rvalue_ref);
     RUN_TEST(clsp_easy_win_sfinaeenable_if);
     RUN_TEST(clsp_easy_win_sfinaevoid_t);
-    RUN_TEST(clsp_dll_get_proc_address);
-    RUN_TEST(clsp_dll_dlsym);
     RUN_TEST(clsp_dll_custom_resolver);
     RUN_TEST(clsp_dll_cpp_static_cast);
     RUN_TEST(clsp_dll_reinterpret_cast);
