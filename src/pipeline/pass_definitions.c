@@ -305,6 +305,9 @@ static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileRe
         }
         char *target_qn = NULL;
         char *resolved = cbm_pipeline_resolve_relative_import(rel, imp->module_path);
+        if (!resolved && ctx->path_aliases) {
+            resolved = cbm_resolve_path_alias(ctx->path_aliases, imp->module_path);
+        }
         if (resolved) {
             target_qn = cbm_pipeline_fqn_module(ctx->project_name, resolved);
             free(resolved);

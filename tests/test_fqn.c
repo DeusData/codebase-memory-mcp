@@ -2,11 +2,14 @@
  * test_fqn.c -- Tests for FQN (Fully Qualified Name) computation.
  *
  * Covers: cbm_pipeline_fqn_compute, cbm_pipeline_fqn_module,
- *         cbm_pipeline_fqn_folder, cbm_project_name_from_path.
+ *         cbm_pipeline_fqn_folder, cbm_project_name_from_path,
+ *         cbm_load_tsconfig_paths, cbm_resolve_path_alias.
  */
 #include "test_framework.h"
 #include "../src/pipeline/pipeline.h"
+#include "../src/pipeline/pipeline_internal.h"
 
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -487,6 +490,193 @@ TEST(project_name_consecutive_colons) {
 }
 
 /* ================================================================
+ * cbm_resolve_path_alias
+ * ================================================================ */
+
+/* Helper: build a path alias map with given entries (no file I/O) */
+static cbm_path_alias_map_t *make_alias_map(const char *base_url, int count, ...) {
+    cbm_path_alias_map_t *map = calloc(1, sizeof(cbm_path_alias_map_t));
+    map->base_url = base_url ? strdup(base_url) : NULL;
+    map->entries = calloc((size_t)count, sizeof(cbm_path_alias_t));
+    map->count = count;
+
+    va_list args;
+    va_start(args, count);
+    for (int i = 0; i < count; i++) {
+        const char *alias_pattern = va_arg(args, const char *);
+        const char *target_pattern = va_arg(args, const char *);
+
+        const char *star = strchr(alias_pattern, '*');
+        if (star) {
+            map->entries[i].has_wildcard = true;
+            map->entries[i].alias_prefix = strndup(alias_pattern, (size_t)(star - alias_pattern));
+            map->entries[i].alias_suffix = strdup(star + 1);
+        } else {
+            map->entries[i].has_wildcard = false;
+            map->entries[i].alias_prefix = strdup(alias_pattern);
+            map->entries[i].alias_suffix = strdup("");
+        }
+
+        const char *tstar = strchr(target_pattern, '*');
+        if (tstar) {
+            map->entries[i].target_prefix = strndup(target_pattern, (size_t)(tstar - target_pattern));
+            map->entries[i].target_suffix = strdup(tstar + 1);
+        } else {
+            map->entries[i].target_prefix = strdup(target_pattern);
+            map->entries[i].target_suffix = strdup("");
+        }
+    }
+    va_end(args);
+    return map;
+}
+
+/* ── Wildcard alias: @/ prefix ─────────────────────────────────── */
+
+TEST(path_alias_at_wildcard) {
+    cbm_path_alias_map_t *map = make_alias_map(NULL, 1, "@/*", "src/*");
+    char *r = cbm_resolve_path_alias(map, "@/lib/authorization");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(r, "src/lib/authorization");
+    free(r);
+    cbm_path_alias_map_free(map);
+    PASS();
+}
+
+TEST(path_alias_at_nested) {
+    cbm_path_alias_map_t *map = make_alias_map(NULL, 1, "@/*", "src/*");
+    char *r = cbm_resolve_path_alias(map, "@/components/Button");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(r, "src/components/Button");
+    free(r);
+    cbm_path_alias_map_free(map);
+    PASS();
+}
+
+/* ── Multiple alias prefixes ──────────────────────────────────── */
+
+TEST(path_alias_multiple_prefixes) {
+    cbm_path_alias_map_t *map = make_alias_map(NULL, 3,
+        "@/*", "src/*",
+        "~/*", "app/*",
+        "@components/*", "src/components/*");
+    char *r1 = cbm_resolve_path_alias(map, "@/lib/auth");
+    ASSERT_NOT_NULL(r1);
+    ASSERT_STR_EQ(r1, "src/lib/auth");
+    free(r1);
+
+    char *r2 = cbm_resolve_path_alias(map, "~/utils/format");
+    ASSERT_NOT_NULL(r2);
+    ASSERT_STR_EQ(r2, "app/utils/format");
+    free(r2);
+
+    char *r3 = cbm_resolve_path_alias(map, "@components/Button");
+    ASSERT_NOT_NULL(r3);
+    ASSERT_STR_EQ(r3, "src/components/Button");
+    free(r3);
+
+    cbm_path_alias_map_free(map);
+    PASS();
+}
+
+/* ── Relative imports are NOT resolved by alias ─────────────── */
+
+TEST(path_alias_relative_import_ignored) {
+    cbm_path_alias_map_t *map = make_alias_map(NULL, 1, "@/*", "src/*");
+    char *r = cbm_resolve_path_alias(map, "./foo");
+    ASSERT_NULL(r);
+    cbm_path_alias_map_free(map);
+    PASS();
+}
+
+TEST(path_alias_dotdot_import_ignored) {
+    cbm_path_alias_map_t *map = make_alias_map(NULL, 1, "@/*", "src/*");
+    char *r = cbm_resolve_path_alias(map, "../bar");
+    ASSERT_NULL(r);
+    cbm_path_alias_map_free(map);
+    PASS();
+}
+
+/* ── Bare package names don't match aliases ──────────────────── */
+
+TEST(path_alias_bare_package_no_match) {
+    cbm_path_alias_map_t *map = make_alias_map(NULL, 1, "@/*", "src/*");
+    char *r = cbm_resolve_path_alias(map, "lodash");
+    ASSERT_NULL(r);
+    cbm_path_alias_map_free(map);
+    PASS();
+}
+
+/* ── baseUrl resolution ─────────────────────────────────────── */
+
+TEST(path_alias_base_url) {
+    cbm_path_alias_map_t *map = make_alias_map("src", 0);
+    char *r = cbm_resolve_path_alias(map, "lib/auth");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(r, "src/lib/auth");
+    free(r);
+    cbm_path_alias_map_free(map);
+    PASS();
+}
+
+TEST(path_alias_base_url_bare_package_ignored) {
+    /* bare packages (no slash) should NOT be resolved via baseUrl */
+    cbm_path_alias_map_t *map = make_alias_map("src", 0);
+    char *r = cbm_resolve_path_alias(map, "react");
+    ASSERT_NULL(r);
+    cbm_path_alias_map_free(map);
+    PASS();
+}
+
+/* ── Exact match (no wildcard) ──────────────────────────────── */
+
+TEST(path_alias_exact_match) {
+    cbm_path_alias_map_t *map = make_alias_map(NULL, 1, "@config", "src/config/index");
+    char *r = cbm_resolve_path_alias(map, "@config");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(r, "src/config/index");
+    free(r);
+    cbm_path_alias_map_free(map);
+    PASS();
+}
+
+/* ── Extension stripping ────────────────────────────────────── */
+
+TEST(path_alias_strips_ts_ext) {
+    cbm_path_alias_map_t *map = make_alias_map(NULL, 1, "@/*", "src/*");
+    char *r = cbm_resolve_path_alias(map, "@/lib/auth.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(r, "src/lib/auth");
+    free(r);
+    cbm_path_alias_map_free(map);
+    PASS();
+}
+
+/* ── NULL map is safe ───────────────────────────────────────── */
+
+TEST(path_alias_null_map) {
+    char *r = cbm_resolve_path_alias(NULL, "@/foo");
+    ASSERT_NULL(r);
+    PASS();
+}
+
+TEST(path_alias_null_path) {
+    cbm_path_alias_map_t *map = make_alias_map(NULL, 1, "@/*", "src/*");
+    char *r = cbm_resolve_path_alias(map, NULL);
+    ASSERT_NULL(r);
+    cbm_path_alias_map_free(map);
+    PASS();
+}
+
+/* ── tsconfig file loading ──────────────────────────────────── */
+
+TEST(tsconfig_load_nonexistent) {
+    /* Should return NULL for a directory with no tsconfig.json */
+    cbm_path_alias_map_t *map = cbm_load_tsconfig_paths("/tmp/nonexistent-dir-xyz-12345");
+    ASSERT_NULL(map);
+    PASS();
+}
+
+/* ================================================================
  * Suite
  * ================================================================ */
 
@@ -589,4 +779,19 @@ SUITE(fqn) {
     RUN_TEST(project_name_colon_only);
     RUN_TEST(project_name_backslash_only);
     RUN_TEST(project_name_consecutive_colons);
+
+    /* path alias resolution */
+    RUN_TEST(path_alias_at_wildcard);
+    RUN_TEST(path_alias_at_nested);
+    RUN_TEST(path_alias_multiple_prefixes);
+    RUN_TEST(path_alias_relative_import_ignored);
+    RUN_TEST(path_alias_dotdot_import_ignored);
+    RUN_TEST(path_alias_bare_package_no_match);
+    RUN_TEST(path_alias_base_url);
+    RUN_TEST(path_alias_base_url_bare_package_ignored);
+    RUN_TEST(path_alias_exact_match);
+    RUN_TEST(path_alias_strips_ts_ext);
+    RUN_TEST(path_alias_null_map);
+    RUN_TEST(path_alias_null_path);
+    RUN_TEST(tsconfig_load_nonexistent);
 }

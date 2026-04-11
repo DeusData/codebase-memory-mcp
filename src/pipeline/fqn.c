@@ -3,8 +3,10 @@
  *
  * Implements the FQN scheme: project.dir.parts.name
  * Handles Python __init__.py, JS/TS index.{js,ts}, path separators.
+ * Also handles tsconfig.json path alias resolution for TypeScript projects.
  */
 #include "pipeline/pipeline.h"
+#include "pipeline/pipeline_internal.h"
 #include "foundation/constants.h"
 #include "foundation/platform.h"
 
@@ -13,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h> // strdup
+#include <yyjson/yyjson.h>
 
 /* Maximum path segments in a FQN (CBM_SZ_256 slots total, -2 for project + name) */
 #define FQN_MAX_PATH_SEGS 254
@@ -370,4 +373,254 @@ char *cbm_project_name_from_path(const char *abs_path) {
     char *result = strdup(start);
     free(path);
     return result;
+}
+
+/* ── tsconfig.json path alias resolution ────────────────────────── */
+
+/* Maximum number of path alias entries we'll parse */
+#define MAX_PATH_ALIASES 64
+
+/* Maximum tsconfig.json file size (64 KB — tsconfigs are small) */
+#define MAX_TSCONFIG_SIZE (64 * 1024)
+
+/* Strip a trailing file extension from a resolved path (in-place).
+ * Returns the string for convenience. Only strips common JS/TS extensions. */
+static char *strip_resolved_ext(char *path) {
+    if (!path) {
+        return path;
+    }
+    size_t len = strlen(path);
+    /* .ts, .js */
+    if (len > 3 && path[len - 3] == '.' &&
+        ((path[len - 2] == 't' || path[len - 2] == 'j') && path[len - 1] == 's')) {
+        path[len - 3] = '\0';
+        return path;
+    }
+    /* .tsx, .jsx */
+    if (len > 4 && path[len - 4] == '.' &&
+        ((path[len - 3] == 't' || path[len - 3] == 'j') && path[len - 2] == 's' &&
+         path[len - 1] == 'x')) {
+        path[len - 4] = '\0';
+        return path;
+    }
+    return path;
+}
+
+cbm_path_alias_map_t *cbm_load_tsconfig_paths(const char *repo_path) {
+    if (!repo_path) {
+        return NULL;
+    }
+
+    /* Try tsconfig.json, then jsconfig.json */
+    static const char *config_names[] = {"tsconfig.json", "jsconfig.json"};
+    FILE *f = NULL;
+    char path_buf[CBM_SZ_512];
+    for (int i = 0; i < 2 && !f; i++) {
+        snprintf(path_buf, sizeof(path_buf), "%s/%s", repo_path, config_names[i]);
+        f = fopen(path_buf, "r");
+    }
+    if (!f) {
+        return NULL;
+    }
+
+    /* Read the file */
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len <= 0 || len > MAX_TSCONFIG_SIZE) {
+        fclose(f);
+        return NULL;
+    }
+
+    char *buf = malloc((size_t)len + 1);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    size_t nread = fread(buf, 1, (size_t)len, f);
+    fclose(f);
+    buf[nread] = '\0';
+
+    /* Parse JSON (allow comments + trailing commas — tsconfig uses JSONC) */
+    yyjson_read_flag flg = YYJSON_READ_ALLOW_COMMENTS | YYJSON_READ_ALLOW_TRAILING_COMMAS;
+    yyjson_doc *doc = yyjson_read(buf, nread, flg);
+    free(buf);
+    if (!doc) {
+        return NULL;
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *compiler_opts = yyjson_obj_get(root, "compilerOptions");
+    if (!compiler_opts) {
+        yyjson_doc_free(doc);
+        return NULL;
+    }
+
+    /* Read baseUrl */
+    yyjson_val *base_url_val = yyjson_obj_get(compiler_opts, "baseUrl");
+    const char *base_url_str = base_url_val ? yyjson_get_str(base_url_val) : NULL;
+
+    /* Read paths */
+    yyjson_val *paths_obj = yyjson_obj_get(compiler_opts, "paths");
+    if (!paths_obj && !base_url_str) {
+        yyjson_doc_free(doc);
+        return NULL;
+    }
+
+    cbm_path_alias_map_t *map = calloc(1, sizeof(cbm_path_alias_map_t));
+    if (!map) {
+        yyjson_doc_free(doc);
+        return NULL;
+    }
+
+    if (base_url_str && base_url_str[0] != '\0' && strcmp(base_url_str, ".") != 0) {
+        map->base_url = strdup(base_url_str);
+    }
+
+    if (paths_obj && yyjson_is_obj(paths_obj)) {
+        size_t obj_size = yyjson_obj_size(paths_obj);
+        int capacity = (int)(obj_size < MAX_PATH_ALIASES ? obj_size : MAX_PATH_ALIASES);
+        map->entries = calloc((size_t)capacity, sizeof(cbm_path_alias_t));
+        if (!map->entries) {
+            free(map->base_url);
+            free(map);
+            yyjson_doc_free(doc);
+            return NULL;
+        }
+
+        yyjson_val *key, *val;
+        yyjson_obj_iter iter = yyjson_obj_iter_with(paths_obj);
+        while ((key = yyjson_obj_iter_next(&iter)) != NULL && map->count < capacity) {
+            val = yyjson_obj_iter_get_val(key);
+            const char *alias_pattern = yyjson_get_str(key);
+            if (!alias_pattern || !yyjson_is_arr(val) || yyjson_arr_size(val) == 0) {
+                continue;
+            }
+            /* Use the first target path */
+            yyjson_val *first_target = yyjson_arr_get_first(val);
+            const char *target_pattern = yyjson_get_str(first_target);
+            if (!target_pattern) {
+                continue;
+            }
+
+            cbm_path_alias_t *entry = &map->entries[map->count];
+
+            /* Split alias pattern at '*' */
+            const char *star = strchr(alias_pattern, '*');
+            if (star) {
+                entry->has_wildcard = true;
+                entry->alias_prefix = strndup(alias_pattern, (size_t)(star - alias_pattern));
+                entry->alias_suffix = strdup(star + 1);
+            } else {
+                entry->has_wildcard = false;
+                entry->alias_prefix = strdup(alias_pattern);
+                entry->alias_suffix = strdup("");
+            }
+
+            /* Split target pattern at '*' */
+            const char *tstar = strchr(target_pattern, '*');
+            if (tstar) {
+                entry->target_prefix = strndup(target_pattern, (size_t)(tstar - target_pattern));
+                entry->target_suffix = strdup(tstar + 1);
+            } else {
+                entry->target_prefix = strdup(target_pattern);
+                entry->target_suffix = strdup("");
+            }
+
+            map->count++;
+        }
+    }
+
+    (void)map->count; /* silence unused warning if logging disabled */
+    yyjson_doc_free(doc);
+    return map;
+}
+
+void cbm_path_alias_map_free(cbm_path_alias_map_t *map) {
+    if (!map) {
+        return;
+    }
+    for (int i = 0; i < map->count; i++) {
+        free(map->entries[i].alias_prefix);
+        free(map->entries[i].alias_suffix);
+        free(map->entries[i].target_prefix);
+        free(map->entries[i].target_suffix);
+    }
+    free(map->entries);
+    free(map->base_url);
+    free(map);
+}
+
+char *cbm_resolve_path_alias(const cbm_path_alias_map_t *map, const char *module_path) {
+    if (!map || !module_path) {
+        return NULL;
+    }
+
+    size_t mod_len = strlen(module_path);
+
+    /* Try each alias entry */
+    for (int i = 0; i < map->count; i++) {
+        const cbm_path_alias_t *e = &map->entries[i];
+        size_t prefix_len = strlen(e->alias_prefix);
+        size_t suffix_len = strlen(e->alias_suffix);
+
+        if (e->has_wildcard) {
+            /* Wildcard match: check prefix and suffix, extract the * part */
+            if (mod_len < prefix_len + suffix_len) {
+                continue;
+            }
+            if (strncmp(module_path, e->alias_prefix, prefix_len) != 0) {
+                continue;
+            }
+            if (suffix_len > 0 &&
+                strcmp(module_path + mod_len - suffix_len, e->alias_suffix) != 0) {
+                continue;
+            }
+            /* Extract the wildcard portion */
+            size_t wild_len = mod_len - prefix_len - suffix_len;
+            const char *wild_start = module_path + prefix_len;
+
+            /* Build result: target_prefix + wildcard + target_suffix */
+            size_t tp_len = strlen(e->target_prefix);
+            size_t ts_len = strlen(e->target_suffix);
+            char *result = malloc(tp_len + wild_len + ts_len + 1);
+            if (!result) {
+                return NULL;
+            }
+            memcpy(result, e->target_prefix, tp_len);
+            memcpy(result + tp_len, wild_start, wild_len);
+            memcpy(result + tp_len + wild_len, e->target_suffix, ts_len);
+            result[tp_len + wild_len + ts_len] = '\0';
+
+            return strip_resolved_ext(result);
+        }
+
+        /* Exact match (no wildcard) */
+        if (strcmp(module_path, e->alias_prefix) == 0) {
+            char *result = strdup(e->target_prefix);
+            return strip_resolved_ext(result);
+        }
+    }
+
+    /* No alias matched — try baseUrl fallback.
+     * If baseUrl is set, non-relative imports resolve relative to it.
+     * E.g. baseUrl="src", import "lib/auth" → "src/lib/auth" */
+    if (map->base_url) {
+        /* Only apply to non-relative, non-package imports.
+         * A simple heuristic: if it contains '/' and doesn't start with '.',
+         * it might be a baseUrl-relative import. Also skip obvious packages
+         * (no '/' at all, like "react" or "lodash"). */
+        if (module_path[0] != '.' && strchr(module_path, '/') != NULL) {
+            size_t bu_len = strlen(map->base_url);
+            size_t needed = bu_len + 1 + mod_len + 1;
+            char *result = malloc(needed);
+            if (!result) {
+                return NULL;
+            }
+            snprintf(result, needed, "%s/%s", map->base_url, module_path);
+            return strip_resolved_ext(result);
+        }
+    }
+
+    return NULL;
 }

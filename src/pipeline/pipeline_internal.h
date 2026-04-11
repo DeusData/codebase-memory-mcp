@@ -29,6 +29,37 @@
 #define CBM_MS_PER_SEC 1000.0
 #define CBM_US_PER_SEC_F 1e6
 
+/* ── tsconfig path alias map ────────────────────────────────────── */
+
+/* A single path alias entry: prefix pattern to target pattern.
+ * E.g. "@/[star]" maps to "src/[star]". Split at the wildcard. */
+typedef struct {
+    char *alias_prefix;  /* part before '*' in the key   (e.g. "@/")   */
+    char *alias_suffix;  /* part after  '*' in the key   (usually "")  */
+    char *target_prefix; /* part before '*' in the value  (e.g. "src/") */
+    char *target_suffix; /* part after  '*' in the value  (usually "")  */
+    bool has_wildcard;   /* true if the pattern contained '*'           */
+} cbm_path_alias_t;
+
+typedef struct {
+    cbm_path_alias_t *entries;
+    int count;
+    char *base_url; /* compilerOptions.baseUrl (NULL if not set) */
+} cbm_path_alias_map_t;
+
+/* Load path aliases from tsconfig.json in repo_path.
+ * Returns heap-allocated map (caller frees via cbm_path_alias_map_free).
+ * Returns NULL if no tsconfig.json or no paths configured. */
+cbm_path_alias_map_t *cbm_load_tsconfig_paths(const char *repo_path);
+
+/* Free a path alias map. NULL-safe. */
+void cbm_path_alias_map_free(cbm_path_alias_map_t *map);
+
+/* Resolve a module path using path aliases.
+ * Returns heap-allocated resolved path, or NULL if no alias matches.
+ * The returned path is relative to repo root (e.g. "src/lib/auth"). */
+char *cbm_resolve_path_alias(const cbm_path_alias_map_t *map, const char *module_path);
+
 /* ── Pipeline context (internal) ─────────────────────────────────── */
 
 /* Shared context passed to each pass function.
@@ -46,6 +77,10 @@ typedef struct {
      * and pass_calls/usages/semantic reuse cached results instead of re-extracting.
      * Indexed by file position in the files[] array. Owned by pipeline.c. */
     CBMFileResult **result_cache;
+
+    /* Path alias map from tsconfig.json (NULL if no aliases configured).
+     * Owned by pipeline.c — freed after all passes complete. */
+    const cbm_path_alias_map_t *path_aliases;
 } cbm_pipeline_ctx_t;
 
 /* Check cancellation. Returns non-zero if cancelled. */
