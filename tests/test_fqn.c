@@ -527,6 +527,20 @@ static cbm_path_alias_map_t *make_alias_map(const char *base_url, int count, ...
         }
     }
     va_end(args);
+
+    /* Sort by alias_prefix length descending (same as cbm_load_tsconfig_paths) */
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = i + 1; j < count; j++) {
+            size_t li = strlen(map->entries[i].alias_prefix);
+            size_t lj = strlen(map->entries[j].alias_prefix);
+            if (lj > li) {
+                cbm_path_alias_t tmp = map->entries[i];
+                map->entries[i] = map->entries[j];
+                map->entries[j] = tmp;
+            }
+        }
+    }
+
     return map;
 }
 
@@ -635,6 +649,28 @@ TEST(path_alias_exact_match) {
     ASSERT_NOT_NULL(r);
     ASSERT_STR_EQ(r, "src/config/index");
     free(r);
+    cbm_path_alias_map_free(map);
+    PASS();
+}
+
+/* ── Overlapping prefixes: most specific wins ───────────────── */
+
+TEST(path_alias_most_specific_wins) {
+    /* Both @/star and @/lib/star match @/lib/auth — more specific wins */
+    cbm_path_alias_map_t *map = make_alias_map(NULL, 2,
+        "@/*", "src/*",
+        "@/lib/*", "lib/*");
+    char *r = cbm_resolve_path_alias(map, "@/lib/auth");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(r, "lib/auth");
+    free(r);
+
+    /* @/components/Button should still match the @/star alias */
+    char *r2 = cbm_resolve_path_alias(map, "@/components/Button");
+    ASSERT_NOT_NULL(r2);
+    ASSERT_STR_EQ(r2, "src/components/Button");
+    free(r2);
+
     cbm_path_alias_map_free(map);
     PASS();
 }
@@ -790,6 +826,7 @@ SUITE(fqn) {
     RUN_TEST(path_alias_base_url);
     RUN_TEST(path_alias_base_url_bare_package_ignored);
     RUN_TEST(path_alias_exact_match);
+    RUN_TEST(path_alias_most_specific_wins);
     RUN_TEST(path_alias_strips_ts_ext);
     RUN_TEST(path_alias_null_map);
     RUN_TEST(path_alias_null_path);

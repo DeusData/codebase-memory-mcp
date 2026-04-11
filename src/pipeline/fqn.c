@@ -529,9 +529,23 @@ cbm_path_alias_map_t *cbm_load_tsconfig_paths(const char *repo_path) {
 
             map->count++;
         }
+
+        /* Sort by alias_prefix length descending so the most specific
+         * alias matches first (TypeScript semantics). E.g. "@/lib/[star]"
+         * should match before "@/[star]" for import "@/lib/auth". */
+        for (int i = 0; i < map->count - 1; i++) {
+            for (int j = i + 1; j < map->count; j++) {
+                size_t li = strlen(map->entries[i].alias_prefix);
+                size_t lj = strlen(map->entries[j].alias_prefix);
+                if (lj > li) {
+                    cbm_path_alias_t tmp = map->entries[i];
+                    map->entries[i] = map->entries[j];
+                    map->entries[j] = tmp;
+                }
+            }
+        }
     }
 
-    (void)map->count; /* silence unused warning if logging disabled */
     yyjson_doc_free(doc);
     return map;
 }
