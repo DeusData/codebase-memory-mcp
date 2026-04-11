@@ -491,6 +491,8 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "\"description\":\"Case-sensitive name_pattern/qn_pattern/pattern matching (default: insensitive).\"},"
      "\"regex\":{\"type\":\"boolean\",\"default\":false,"
      "\"description\":\"When search_in='source': treat pattern as regex (default: literal text).\"},"
+     "\"path_filter\":{\"type\":\"string\","
+     "\"description\":\"When search_in='source': regex/glob pattern to restrict grep to matching file paths (e.g. '*.py', 'src/.*\\\\.go$').\"},"
      "\"summary\":{\"type\":\"boolean\",\"default\":false,"
      "\"description\":\"Return aggregate counts by label and file only. Alias for mode='summary'.\"},"
      "\"max_rows\":{\"type\":\"integer\","
@@ -571,7 +573,7 @@ static const int SUPPORTED_VERSION_COUNT =
 char *cbm_mcp_initialize_response(const char *params_json) {
     /* Determine protocol version: if client requests a version we support,
      * echo it back; otherwise respond with our latest. */
-    const char *version = SUPPORTED_PROTOCOL_VERSIONS[0]; /* default: latest */
+    const char *version = SUPPORTED_PROTOCOL_VERSIONS[0]; /* default: latest supported version */
     if (params_json) {
         yyjson_doc *pdoc = yyjson_read(params_json, strlen(params_json), 0);
         if (pdoc) {
@@ -1043,8 +1045,11 @@ static const char *parent_project_for_db(const char *project, char *buf, size_t 
 }
 
 static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
-    if (!project) {
-        return NULL; /* project is required — no implicit fallback */
+    if (!project || project[0] == '\0') {
+        /* No project name: return the current in-memory/default store if available.
+         * This enables cbm_mcp_server_new(NULL) in-memory stores for tests and
+         * embedded use without requiring an explicit project name. */
+        return srv->store;
     }
 
     srv->store_last_used = time(NULL);
@@ -1112,7 +1117,7 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
 }
 
 /* Build a helpful error listing available projects. Caller must free() result. */
-static char *build_project_list_error(const char *reason) {
+static char *build_project_list_error_srv(cbm_mcp_server_t *srv, const char *reason) {
     char dir_path[1024];
     cache_dir(dir_path, sizeof(dir_path));
 
@@ -1145,20 +1150,40 @@ static char *build_project_list_error(const char *reason) {
         cbm_closedir(d);
     }
 
-    enum { ERR_BUF_SZ = 5120 };
+    /* Optional: session_project and _context fields for richer error context */
+    char session_frag[256] = "";
+    char context_frag[512] = "";
+    if (srv && srv->session_project[0]) {
+        snprintf(session_frag, sizeof(session_frag),
+                 ",\"session_project\":\"%s\"", srv->session_project);
+        /* Include a minimal _context so clients can identify session state */
+        bool ctx_enabled = cbm_config_get_bool(srv->config, "context_injection", true);
+        if (ctx_enabled && !srv->context_injected) {
+            snprintf(context_frag, sizeof(context_frag),
+                     ",\"_context\":{\"status\":\"not_indexed\","
+                     "\"hint\":\"No project indexed yet. Pass project='/path/to/repo' to index.\"}");
+            srv->context_injected = true;  /* one-shot: suppress from future successful responses */
+        }
+    }
+
+    enum { ERR_BUF_SZ = 6144 };
     char buf[ERR_BUF_SZ];
     if (count > 0) {
         snprintf(buf, sizeof(buf),
                  "{\"error\":\"%s\",\"hint\":\"Use list_projects to see all indexed projects, "
-                 "then pass the project name.\",\"available_projects\":[%s],\"count\":%d}",
-                 reason, projects, count);
+                 "then pass the project name.\",\"available_projects\":[%s],\"count\":%d%s%s}",
+                 reason, projects, count, session_frag, context_frag);
     } else {
         snprintf(buf, sizeof(buf),
                  "{\"error\":\"%s\",\"hint\":\"No projects indexed yet. "
-                 "Call index_repository first.\"}",
-                 reason);
+                 "Call index_repository first.\"%s%s}",
+                 reason, session_frag, context_frag);
     }
     return heap_strdup(buf);
+}
+
+static char *build_project_list_error(const char *reason) {
+    return build_project_list_error_srv(NULL, reason);
 }
 
 /* Auto-index on first use: when store is NULL, session_root is set, and
@@ -1228,7 +1253,7 @@ static char *build_project_list_error(const char *reason) {
             }                                                                                     \
             free(project);                                                                        \
             {                                                                                     \
-                char *_err = build_project_list_error("no project loaded");                        \
+                char *_err = build_project_list_error_srv(srv, "project not found or not indexed");              \
                 char *_res = cbm_mcp_text_result(_err, true);                                     \
                 free(_err);                                                                       \
                 return _res;                                                                      \
@@ -3601,62 +3626,12 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_free_nodes(suffix_nodes, suffix_count);
     cbm_store_free_nodes(name_nodes, name_count);
 
-    /* Tier 4: Fuzzy — try last segment for name-based search */
-    const char *dot = strrchr(qn, '.');
-    const char *search_name = dot ? dot + 1 : qn;
-
-    /* Use search with name pattern for fuzzy matching */
-    cbm_search_params_t params = {0};
-    params.project = eff_project;
-    params.name_pattern = search_name;
-    params.limit = 5;
-    params.min_degree = -1;
-    params.max_degree = -1;
-    const char *excl[] = {"Community", NULL};
-    params.exclude_labels = excl;
-
-    cbm_search_output_t search_out = {0};
-    if (cbm_store_search(store, &params, &search_out) == CBM_STORE_OK && search_out.count > 0) {
-        /* Build suggestions from search results */
-        cbm_node_t *fuzzy = calloc((size_t)search_out.count, sizeof(cbm_node_t));
-        for (int i = 0; i < search_out.count; i++) {
-            copy_node(&search_out.results[i].node, &fuzzy[i]);
-        }
-        int fuzzy_count = search_out.count;
-        cbm_store_search_free(&search_out);
-
-        /* Single fuzzy result — resolve immediately rather than reporting ambiguous */
-        if (fuzzy_count == 1) {
-            copy_node(&fuzzy[0], &node);
-            free_node_contents(&fuzzy[0]);
-            free(fuzzy);
-            char *result = build_snippet_response(srv, &node, "fuzzy", include_neighbors, NULL, 0,
-                                                         max_lines, snippet_mode, compact);
-            free_node_contents(&node);
-            free(qn);
-            free(project);
-            free(snippet_mode);
-            return result;
-        }
-
-        char *result = snippet_suggestions(qn, fuzzy, fuzzy_count);
-        for (int i = 0; i < fuzzy_count; i++) {
-            free_node_contents(&fuzzy[i]);
-        }
-        free(fuzzy);
-        free(qn);
-        free(project);
-        free(snippet_mode);
-        return result;
-    }
-    cbm_store_search_free(&search_out);
-
     /* Nothing found */
     {
         char errbuf[512];
         snprintf(errbuf, sizeof(errbuf),
             "{\"error\":\"symbol not found: '%s'\","
-            "\"hint\":\"Use search_code_graph with name_pattern to find the correct qualified_name.\"}", qn);
+            "\"hint\":\"Use search_graph (or search_code_graph in streamlined mode) with name_pattern to find the correct qualified_name.\"}", qn);
         free(qn);
         free(project);
         free(snippet_mode);
@@ -3859,7 +3834,7 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
             yyjson_mut_obj_add_str(doc, item, "content", raw[ri].content);
             yyjson_mut_arr_add_val(raw_arr, item);
         }
-        yyjson_mut_obj_add_val(doc, root_obj, "raw_matches", raw_arr);
+        yyjson_mut_obj_add_val(doc, root_obj, "matches", raw_arr);
     }
 
     /* Directory distribution */
@@ -3971,7 +3946,10 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
             "\"hint\":\"Pass a text pattern or regex (with regex:true) to search source code.\"}", true);
     }
 
-    /* Project is required */
+    /* Project: explicit param > session_project fallback > error */
+    if (!project && srv->session_project[0]) {
+        project = heap_strdup(srv->session_project);
+    }
     if (!project) {
         free(pattern);
         free(file_pattern);
@@ -4035,35 +4013,13 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     enum { GREP_MAX_MATCHES = 500 };
     int grep_limit = GREP_MAX_MATCHES;
 
-    /* Scope grep to indexed files only — avoids scanning vendored/generated code.
-     * Query the graph for distinct file paths, write them to a temp file,
-     * then use xargs to pass them to grep. Falls back to recursive grep if
-     * no indexed files found (project not fully indexed). */
+    /* Always grep the full project root — scoping to indexed files only would
+     * miss files written or modified after the last index run (e.g. in tests
+     * and in active development workflows where new files aren't yet indexed).
+     * Vendored/generated code can be excluded via .gitignore or path_filter. */
     char filelist[256];
     snprintf(filelist, sizeof(filelist), "%s.files", tmpfile);
     bool scoped = false;
-
-    cbm_store_t *pre_store = resolve_store(srv, project);
-    if (pre_store) {
-        char **indexed_files = NULL;
-        int indexed_count = 0;
-        if (cbm_store_list_files(pre_store, project, &indexed_files, &indexed_count) ==
-                CBM_STORE_OK &&
-            indexed_count > 0) {
-            FILE *fl = fopen(filelist, "w");
-            if (fl) {
-                for (int fi = 0; fi < indexed_count; fi++) {
-                    fprintf(fl, "%s/%s\n", root_path, indexed_files[fi]);
-                }
-                fclose(fl);
-                scoped = true;
-            }
-            for (int fi = 0; fi < indexed_count; fi++) {
-                free(indexed_files[fi]);
-            }
-            free(indexed_files);
-        }
-    }
 
     char cmd[4096];
     build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist, root_path);

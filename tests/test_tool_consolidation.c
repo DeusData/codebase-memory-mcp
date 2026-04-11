@@ -441,7 +441,8 @@ TEST(initialize_response_has_protocol_version) {
     char *resp = cbm_mcp_initialize_response(NULL);
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "protocolVersion"));
-    ASSERT_NOT_NULL(strstr(resp, "2024-11-05"));
+    /* Default (no params): returns latest supported version */
+    ASSERT_NOT_NULL(strstr(resp, "2025-11-25"));
     ASSERT_NOT_NULL(strstr(resp, "serverInfo"));
     ASSERT_NOT_NULL(strstr(resp, "codebase-memory-mcp"));
     free(resp);
