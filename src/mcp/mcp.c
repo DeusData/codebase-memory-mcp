@@ -1191,7 +1191,10 @@ static char *build_project_list_error(const char *reason) {
  * This eliminates the need for an explicit index_repository call.
  * MCP is strict request-response — synchronous blocking is safe here
  * (same pattern used by handle_index_repository at line ~1959). */
-#define REQUIRE_STORE(store, project)                                                             \
+/* REQUIRE_STORE_EX: like REQUIRE_STORE but runs _pre_free_cleanup before freeing
+ * project and returning.  Use this in handlers that allocate extra heap locals
+ * (e.g. qn, snippet_mode) that must also be freed on the early-return paths. */
+#define REQUIRE_STORE_EX(store, project, _pre_free_cleanup)                                       \
     do {                                                                                          \
         if (!(store) && srv->session_root[0] && access(srv->session_root, F_OK) == 0) {              \
             /* Try auto-index on first use (only if session_root is a real directory) */           \
@@ -1242,6 +1245,7 @@ static char *build_project_list_error(const char *reason) {
             }                                                                                     \
         }                                                                                         \
         if (!(store)) {                                                                           \
+            _pre_free_cleanup;                                                                    \
             if (srv->autoindex_failed) {                                                          \
                 free(project);                                                                    \
                 return cbm_mcp_text_result(                                                       \
@@ -1260,6 +1264,9 @@ static char *build_project_list_error(const char *reason) {
             }                                                                                     \
         }                                                                                         \
     } while (0)
+
+/* Convenience alias for handlers with no extra locals to free. */
+#define REQUIRE_STORE(store, project) REQUIRE_STORE_EX(store, project, (void)0)
 
 /* ── Auto-context injection (Phase 9) ─────────────────────────── */
 
@@ -2754,6 +2761,11 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         cbm_search_output_t sout = {0};
         if (cbm_store_search(store, &sp, &sout) == 0 && sout.count > 0) {
             const char *found_project = sout.results[0].node.project;
+            /* Free the empty allocation from the first exact-name lookup before
+             * overwriting nodes/node_count with the fallback result. */
+            cbm_store_free_nodes(nodes, node_count);
+            nodes = NULL;
+            node_count = 0;
             cbm_store_find_nodes_by_name(store,
                                          found_project ? found_project : project,
                                          sout.results[0].node.name, &nodes, &node_count);
@@ -3504,7 +3516,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
             "Use search_code_graph to find qualified names.\"}", true);
     }
 
-    REQUIRE_STORE(store, project);
+    REQUIRE_STORE_EX(store, project, (free(qn), free(snippet_mode), qn = NULL, snippet_mode = NULL));
 
     /* eff_project already set via resolve_project_store + QN extraction fallback */
 

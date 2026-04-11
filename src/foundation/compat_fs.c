@@ -158,6 +158,7 @@ int cbm_exec_no_shell(const char *const *argv) {
 #include <dirent.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -271,10 +272,19 @@ int cbm_exec_no_shell(const char *const *argv) {
         execvp(argv[0], (char *const *)argv);
         _exit(EXEC_NOT_FOUND);
     }
-    /* Parent: wait for child */
+    /* Parent: wait for child.
+     * WUNTRACED: detect if leaks --atExit (macOS) SIGSTOPs the child during
+     * heap inspection; send SIGCONT so it can proceed to exit. */
     int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        return -1;
+    for (;;) {
+        if (waitpid(pid, &status, WUNTRACED) < 0) {
+            return -1;
+        }
+        if (WIFSTOPPED(status)) {
+            kill(pid, SIGCONT);
+            continue;
+        }
+        break;
     }
     if (WIFEXITED(status)) {
         return WEXITSTATUS(status);
