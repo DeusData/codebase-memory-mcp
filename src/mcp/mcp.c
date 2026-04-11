@@ -1802,12 +1802,26 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
                                            project_expand_t *out_pe) {
     /* Cold-start: when no project param given, use session_project so
      * auto-index fires on the correct DB instead of returning NULL. */
+
+    /* Save the resolved filesystem path BEFORE expand_project_param consumes
+     * raw_project.  Used below to auto-index paths that aren't under session_root
+     * (e.g. .gitignore-excluded subdirs that are separate git repos). */
+    char *_raw_path = NULL;
+    if (raw_project && project_is_path(raw_project)) {
+        char *_exp = expand_tilde(raw_project);
+        _raw_path = realpath(_exp ? _exp : raw_project, NULL);
+        if (!_raw_path && (_exp || raw_project[0] == '/')) {
+            _raw_path = heap_strdup(_exp ? _exp : raw_project);
+        }
+        free(_exp);
+    }
+
     project_expand_t pe;
     if (!raw_project && srv->session_project[0]) {
         pe.value = heap_strdup(srv->session_project);
         pe.mode = MATCH_PREFIX;
     } else {
-        pe = expand_project_param(srv, raw_project);
+        pe = expand_project_param(srv, raw_project); /* raw_project freed inside */
     }
 
     /* DB selection: if expanded value IS the session project or a dep of it
@@ -1850,6 +1864,33 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
             }
         }
     }
+
+    /* Path-based auto-index: fires when project= is a full path to a directory
+     * that is NOT under session_root (e.g. a .gitignore-excluded subdirectory
+     * that is a separate git repo).  The session_root block above only indexes
+     * srv->session_root; if the requested path differs, store is still NULL here.
+     *
+     * Example: main project at ~/myapp, queried with
+     *   project="/path/to/react-grid-layout" (in ~/myapp/.gitignore)
+     * session_root stays ~/myapp; react-grid-layout is never indexed by the block
+     * above.  This block catches that case and indexes the exact requested path. */
+    if (!store && _raw_path) {
+        struct stat _st;
+        if (stat(_raw_path, &_st) == 0 && S_ISDIR(_st.st_mode)) {
+            cbm_pipeline_t *_p = cbm_pipeline_new(_raw_path, NULL, CBM_MODE_FULL);
+            if (_p) {
+                cbm_log_info("autoindex.path", "path", _raw_path);
+                cbm_pipeline_run(_p);
+                cbm_pipeline_free(_p);
+                store = resolve_store(srv, db_project);
+                if (store) {
+                    cbm_pagerank_compute_with_config(store, db_project, srv->config);
+                }
+                cbm_mem_collect();
+            }
+        }
+    }
+    free(_raw_path);
 
     *out_pe = pe; /* caller takes ownership of pe.value */
     return store;
