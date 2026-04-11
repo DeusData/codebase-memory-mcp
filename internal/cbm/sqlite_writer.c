@@ -606,6 +606,13 @@ static uint32_t pb_build_interior(PageBuilder *pb, bool is_index) {
 
     uint32_t root = children ? children[0].page_num : 0;
     if (children != pb->leaves) {
+        /* Free sep_cell of each final-level interior page before freeing the array.
+         * Intermediate levels are freed inside the while loop above; the final level
+         * (the root) was skipped because the while condition fails before we re-enter
+         * the cleanup block. */
+        for (int j = 0; j < child_count; j++) {
+            free(children[j].sep_cell);
+        }
         free(children);
     }
     return root;

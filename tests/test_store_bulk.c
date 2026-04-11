@@ -22,6 +22,7 @@
 #include <string.h>
 #ifndef _WIN32
 #include <unistd.h>
+#include <signal.h>
 #include <sys/wait.h>
 #endif
 
@@ -142,7 +143,18 @@ TEST(bulk_crash_recovery) {
     }
     ASSERT_GT(pid, 0);
     int status;
-    waitpid(pid, &status, 0);
+    /* Robust wait: leaks --atExit on macOS temporarily SIGSTOPs forked children
+     * during heap inspection. WUNTRACED lets us detect the stop and send SIGCONT
+     * so the child can proceed to _exit(). */
+    for (;;) {
+        pid_t r = waitpid(pid, &status, WUNTRACED);
+        ASSERT_GT((int)r, 0);
+        if (WIFSTOPPED(status)) {
+            kill(pid, SIGCONT);
+            continue;
+        }
+        break;
+    }
     /* Confirm child exited normally so the write actually occurred. */
     ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 
