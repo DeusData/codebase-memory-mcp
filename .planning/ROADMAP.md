@@ -61,8 +61,8 @@ Plans:
 **Plans**: 3 plans
 
 Plans:
-- [ ] 03-01-PLAN.md — Add deterministic sequential/parallel mode selection in the native pipeline and cover it with native parity regressions.
-- [ ] 03-02-PLAN.md — Extend the canonical proof harness to capture dual-mode evidence and emit additive semantic parity summaries across all four manifest repos.
+- [x] 03-01-PLAN.md — Add deterministic sequential/parallel mode selection in the native pipeline and cover it with native parity regressions.
+- [x] 03-02-PLAN.md — Extend the canonical proof harness to capture dual-mode evidence and emit additive semantic parity summaries across all four manifest repos.
 - [x] 03-03-PLAN.md — Add proof-harness regressions plus runbook/checklist updates for the Phase 03 semantic review bar. (completed 2026-04-12)
 
 ### Phase 4: Verdicts & Acceptance Summaries
