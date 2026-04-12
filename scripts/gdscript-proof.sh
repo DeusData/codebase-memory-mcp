@@ -4,9 +4,10 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/gdscript-proof.sh --repo /abs/path/to/repo [--repo /abs/path/to/repo2 ...] [--godot-version REPO=4.x] [--label REPO=name]
+  scripts/gdscript-proof.sh [--manifest path/to/manifest.json] --repo /abs/path/to/repo [--repo /abs/path/to/repo2 ...] [--godot-version REPO=4.x] [--label REPO=name]
 
 The command stores paths after canonicalizing to absolute real paths.
+In manifest mode, every repo should have a label declared in the manifest and missing Godot versions are filled from manifest metadata when available.
 EOF
 }
 
@@ -33,10 +34,13 @@ AGG_SIGNAL_COVERAGE="false"
 AGG_IMPORTS_COVERAGE="false"
 AGG_INHERITS_COVERAGE="false"
 AGGREGATE_PASS="false"
+AGGREGATE_OUTCOME="fail"
 AGGREGATE_MISSING_CATEGORIES=""
+AGGREGATE_NOTE=""
 
 BUILD_STATUS="pending"
 BUILD_MESSAGE=""
+MANIFEST_PATH=""
 
 REPO_PATHS=()
 REPO_GODOT_VERSIONS=()
@@ -68,6 +72,10 @@ GDSCRIPT_QUERY_NAMES=(
   "signal-calls"
   "gd-inherits"
   "gd-imports"
+  "signal-call-edges"
+  "gd-inherits-edges"
+  "gd-import-edges"
+  "gd-same-script-calls"
 )
 
 GDSCRIPT_QUERY_FILES=(
@@ -79,6 +87,10 @@ GDSCRIPT_QUERY_FILES=(
   "signal-calls.json"
   "gd-inherits.json"
   "gd-imports.json"
+  "signal-call-edges.json"
+  "gd-inherits-edges.json"
+  "gd-import-edges.json"
+  "gd-same-script-calls.json"
 )
 
 GDSCRIPT_QUERIES=(
@@ -90,6 +102,10 @@ GDSCRIPT_QUERIES=(
   'MATCH (caller)-[c:CALLS]->(t:Function) WHERE t.qualified_name CONTAINS ".signal." RETURN count(c) AS signal_calls'
   'MATCH (a)-[r:INHERITS]->(b) WHERE (a.file_path ENDS WITH ".gd") OR (b.file_path ENDS WITH ".gd") RETURN count(r) AS gd_inherits_edges'
   'MATCH (m)-[r:IMPORTS]->(n) WHERE n.file_path ENDS WITH ".gd" RETURN count(r) AS gd_deps'
+  'MATCH (caller)-[:CALLS]->(t:Function) WHERE caller.file_path ENDS WITH ".gd" AND t.file_path ENDS WITH ".gd" AND t.qualified_name CONTAINS ".signal." RETURN caller.file_path, caller.name, caller.qualified_name, t.file_path, t.name, t.qualified_name ORDER BY caller.file_path, caller.name, t.file_path, t.name'
+  'MATCH (a)-[:INHERITS]->(b) WHERE (a.file_path ENDS WITH ".gd") OR (b.file_path ENDS WITH ".gd") RETURN a.file_path, a.name, a.qualified_name, b.file_path, b.name, b.qualified_name ORDER BY a.file_path, a.name, b.file_path, b.name'
+  'MATCH (m)-[:IMPORTS]->(n) WHERE m.file_path ENDS WITH ".gd" AND n.file_path ENDS WITH ".gd" RETURN m.file_path, m.name, m.qualified_name, n.file_path, n.name, n.qualified_name ORDER BY m.file_path, n.file_path'
+  'MATCH (caller)-[:CALLS]->(t) WHERE caller.file_path ENDS WITH ".gd" AND t.file_path ENDS WITH ".gd" RETURN caller.file_path, caller.name, caller.qualified_name, t.file_path, t.name, t.qualified_name ORDER BY caller.file_path, caller.name, t.file_path, t.name'
 )
 
 GDSCRIPT_INVALID_QUERY_FRAGMENT='RETURN THIS_WILL_NOT_PARSE'
@@ -124,6 +140,76 @@ PY
   fi
 
   printf '%s\n' "$repo_path"
+}
+
+parse_manifest_path() {
+  local manifest_path="$1"
+
+  if ! manifest_path=$(python3 - "$manifest_path" <<'PY'
+import os
+import sys
+
+path = sys.argv[1]
+if os.path.exists(path):
+    print(os.path.realpath(path))
+else:
+    print(os.path.abspath(os.path.normpath(path)))
+PY
+  ); then
+    echo "error: unable to resolve manifest path: $manifest_path" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$manifest_path"
+}
+
+manifest_repo_godot_version() {
+  local repo_label="$1"
+
+  if [ -z "$MANIFEST_PATH" ] || [ ! -f "$MANIFEST_PATH" ] || [ -z "$repo_label" ]; then
+    return 1
+  fi
+
+  python3 - "$MANIFEST_PATH" "$repo_label" <<'PY'
+import json
+import sys
+
+manifest_path, repo_label = sys.argv[1:3]
+
+with open(manifest_path, "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+for repo in payload.get("repos", []):
+    if isinstance(repo, dict) and repo.get("label") == repo_label:
+        value = repo.get("godot_version")
+        if isinstance(value, str) and value.strip():
+            print(value)
+            raise SystemExit(0)
+        raise SystemExit(1)
+
+raise SystemExit(1)
+PY
+}
+
+apply_manifest_defaults() {
+  local i
+  local repo_label
+  local manifest_version
+
+  if [ -z "$MANIFEST_PATH" ] || [ ! -f "$MANIFEST_PATH" ]; then
+    return 0
+  fi
+
+  for i in "${!REPO_PATHS[@]}"; do
+    repo_label="${REPO_LABELS[$i]}"
+    if [ -z "$repo_label" ] || [ -n "${REPO_GODOT_VERSIONS[$i]}" ]; then
+      continue
+    fi
+
+    if manifest_version=$(manifest_repo_godot_version "$repo_label" 2>/dev/null); then
+      REPO_GODOT_VERSIONS[$i]="$manifest_version"
+    fi
+  done
 }
 
 assert_repo_declared() {
@@ -379,13 +465,14 @@ write_repo_meta_json() {
   local git_branch="${10}"
   local godot_version="${11}"
   local qualifies_4x="${12}"
+  local manifest_path="${13}"
 
   local output_file="$repo_dir/repo-meta.json"
   local worktree_path="$WORKTREE_PATH"
   local worktree_branch="$WORKTREE_BRANCH"
   local worktree_commit="$WORKTREE_COMMIT"
 
-  python3 - "$output_file" "$repo_path" "$repo_label" "$repo_name" "$slug" "$project_id" "$proof_timestamp" "$git_ref" "$git_commit" "$git_branch" "$godot_version" "$qualifies_4x" "$worktree_path" "$worktree_branch" "$worktree_commit" <<'PY'
+  python3 - "$output_file" "$repo_path" "$repo_label" "$repo_name" "$slug" "$project_id" "$proof_timestamp" "$git_ref" "$git_commit" "$git_branch" "$godot_version" "$qualifies_4x" "$manifest_path" "$worktree_path" "$worktree_branch" "$worktree_commit" <<'PY'
 import json
 import sys
 
@@ -402,10 +489,49 @@ import sys
     git_branch,
     godot_version,
     qualifies_4x,
+    manifest_path,
     worktree_path,
     worktree_branch,
     worktree_commit,
 ) = sys.argv[1:]
+
+
+def load_manifest_entry(path_text, label_text):
+    if not path_text or not label_text:
+        return None
+    try:
+        with open(path_text, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return None
+    for repo in payload.get("repos", []):
+        if isinstance(repo, dict) and repo.get("label") == label_text:
+            return repo
+    return None
+
+
+manifest_entry = load_manifest_entry(manifest_path, repo_label)
+manifest_mode = bool(manifest_path)
+canonical_identity = {
+    "remote": None,
+    "pinned_commit": git_commit,
+    "project_subpath": None,
+    "godot_version": None if godot_version == "" else godot_version,
+}
+approval_status = "non-canonical-debug-only"
+qualification_status = "non-qualifying"
+
+if manifest_entry is not None:
+    canonical_identity = {
+        "remote": manifest_entry.get("remote"),
+        "pinned_commit": manifest_entry.get("pinned_commit") or git_commit,
+        "project_subpath": manifest_entry.get("project_subpath"),
+        "godot_version": manifest_entry.get("godot_version") or (None if godot_version == "" else godot_version),
+    }
+    approval_status = "canonical-approval-bearing"
+    qualification_status = (
+        "godot-4.x-qualifying" if qualifies_4x == "true" else "non-qualifying"
+    )
 
 payload = {
     "repo_path": repo_path,
@@ -418,6 +544,12 @@ payload = {
     "git_branch": git_branch,
     "godot_version": None if godot_version == "" else godot_version,
     "qualifies_godot4x": True if qualifies_4x == "true" else False,
+    "approval_status": approval_status,
+    "qualification_status": qualification_status,
+    "canonical_identity": canonical_identity,
+    "label_role": "readability-only",
+    "local_checkout_path_role": "run-evidence-only",
+    "manifest_mode": manifest_mode,
     "codebase_memory_mcp": {
         "worktree": worktree_path,
         "branch": worktree_branch,
@@ -578,7 +710,7 @@ import sys
 payload = {
     "project": sys.argv[1],
     "query": sys.argv[2],
-    "max_rows": 5,
+    "max_rows": 500,
 }
 
 print(json.dumps(payload, separators=(",", ":")))
@@ -1104,14 +1236,10 @@ process_repo_indexing() {
 }
 
 write_repo_and_aggregate_summaries() {
-  {
-    IFS= read -r AGG_INDEXING_COVERAGE
-    IFS= read -r AGG_SIGNAL_COVERAGE
-    IFS= read -r AGG_IMPORTS_COVERAGE
-    IFS= read -r AGG_INHERITS_COVERAGE
-    IFS= read -r AGGREGATE_PASS
-    IFS= read -r AGGREGATE_MISSING_CATEGORIES
-  } < <(python3 - "$RUN_ROOT" "$AGGREGATE_SUMMARY" "$BINARY_PATH" "$BUILD_STATUS" "$BUILD_MESSAGE" "$WORKTREE_PATH" "$WORKTREE_BRANCH" "$WORKTREE_COMMIT" "${REPO_SLUGS[@]}" <<'PY'
+  local summary_fields_file
+
+  summary_fields_file=$(make_run_temp summary-fields)
+  if ! python3 - "$RUN_ROOT" "$AGGREGATE_SUMMARY" "$BINARY_PATH" "$BUILD_STATUS" "$BUILD_MESSAGE" "$WORKTREE_PATH" "$WORKTREE_BRANCH" "$WORKTREE_COMMIT" "$MANIFEST_PATH" "${REPO_SLUGS[@]}" > "$summary_fields_file" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1125,43 +1253,47 @@ from pathlib import Path
     worktree_path,
     worktree_branch,
     worktree_commit,
+    manifest_path,
     *slugs,
 ) = sys.argv[1:]
 
 run_root_path = Path(run_root)
 aggregate_summary_file = Path(aggregate_summary_path)
+manifest_mode = bool(manifest_path)
 
-QUERY_SPECS = [
-    ("gd-files.json", "gd-files", "gd_files"),
-    ("gd-classes.json", "gd-classes", "gd_classes"),
-    ("gd-methods.json", "gd-methods", "gd_methods"),
-    ("gd-class-sample.json", "gd-class-sample", None),
-    ("gd-method-sample.json", "gd-method-sample", None),
-    ("signal-calls.json", "signal-calls", "signal_calls"),
-    ("gd-inherits.json", "gd-inherits", "gd_inherits_edges"),
-    ("gd-imports.json", "gd-imports", "gd_deps"),
-]
+VALID_CLASSIFICATIONS = {"gating", "informational"}
+VALID_EXPECTED_KEYS = {"count", "contains", "contains_edges"}
 
+QUERY_FILE_TO_NAME = {
+    "gd-files.json": "gd-files",
+    "gd-classes.json": "gd-classes",
+    "gd-methods.json": "gd-methods",
+    "gd-class-sample.json": "gd-class-sample",
+    "gd-method-sample.json": "gd-method-sample",
+    "signal-calls.json": "signal-calls",
+    "gd-inherits.json": "gd-inherits",
+    "gd-imports.json": "gd-imports",
+    "signal-call-edges.json": "signal-call-edges",
+    "gd-inherits-edges.json": "gd-inherits-edges",
+    "gd-import-edges.json": "gd-import-edges",
+    "gd-same-script-calls.json": "gd-same-script-calls",
+}
 
-def version_major(version):
-    if version in (None, ""):
-        return None
-    text = str(version).strip().lower()
-    if text.startswith("godot "):
-        text = text[6:].strip()
-    if text.startswith("v"):
-        text = text[1:]
-    major = text.split(".", 1)[0]
-    return major if major.isdigit() else None
+COUNT_QUERY_KEYS = {
+    "gd-files": "gd_files",
+    "gd-classes": "gd_classes",
+    "gd-methods": "gd_methods",
+    "signal-calls": "signal_calls",
+    "gd-inherits": "gd_inherits_edges",
+    "gd-imports": "gd_deps",
+}
 
-
-def version_label(version):
-    if version in (None, ""):
-        return "unknown"
-    text = str(version).strip()
-    if text.lower().startswith("godot "):
-        return text
-    return f"Godot {text}"
+EDGE_DETAIL_QUERY = {
+    "signal-calls": "signal-call-edges",
+    "gd-imports": "gd-import-edges",
+    "gd-inherits": "gd-inherits-edges",
+    "gd-same-script-calls": "gd-same-script-calls",
+}
 
 
 def escape_cell(text):
@@ -1170,20 +1302,62 @@ def escape_cell(text):
 
 def markdown_code(value, empty="unknown"):
     text = empty if value in (None, "") else str(value)
-    return f"`{text.replace('`', '\\`')}`"
+    return "`" + text.replace("`", "\\`") + "`"
 
 
-def extract_count(wrapper, key):
-    if not isinstance(wrapper, dict):
+def json_compact(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def load_wrapper(path):
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
         raise ValueError("wrapper payload is not an object")
+    query_name = payload.get("query_name")
+    if not isinstance(query_name, str) or not query_name:
+        raise ValueError("wrapper query_name missing")
+    return query_name, payload
+
+
+def load_query_wrappers(repo_dir):
+    queries_dir = repo_dir / "queries"
+    wrappers = {}
+    issues = []
+    if not queries_dir.exists():
+        return wrappers, ["missing queries directory"]
+
+    for filename, expected_name in QUERY_FILE_TO_NAME.items():
+        query_file = queries_dir / filename
+        if not query_file.exists():
+            continue
+        try:
+            query_name, payload = load_wrapper(query_file)
+        except Exception as exc:  # noqa: BLE001
+            issues.append(f"unparseable {filename}: {exc}")
+            continue
+        if query_name != expected_name:
+            issues.append(f"invalid {filename}: expected query_name {expected_name!r}, got {query_name!r}")
+            continue
+        wrappers[query_name] = payload
+    return wrappers, issues
+
+
+def extract_rows(wrapper):
     result = wrapper.get("result")
     if not isinstance(result, dict):
         raise ValueError("wrapper result is not an object")
     rows = result.get("rows")
     if rows in (None, []):
-        return 0
-    if not isinstance(rows, list) or not rows:
+        return []
+    if not isinstance(rows, list):
         raise ValueError("wrapper rows missing")
+    return rows
+
+
+def extract_count_from_wrapper(wrapper):
+    rows = extract_rows(wrapper)
+    if not rows:
+        return 0
     first_row = rows[0]
     if not isinstance(first_row, list) or not first_row:
         raise ValueError("wrapper first row missing")
@@ -1195,72 +1369,366 @@ def extract_count(wrapper, key):
     return int(value)
 
 
-def load_query_data(repo_dir):
-    queries_dir = repo_dir / "queries"
-    counts = {
-        "gd_files": None,
-        "gd_classes": None,
-        "gd_methods": None,
-        "signal_calls": None,
-        "gd_inherits_edges": None,
-        "gd_deps": None,
+def count_value(query_name, wrappers):
+    if query_name == "gd-same-script-calls":
+        return len(edge_values(query_name, wrappers))
+    wrapper = wrappers.get(query_name)
+    if wrapper is None:
+        raise ValueError(f"missing wrapper for {query_name}")
+    return extract_count_from_wrapper(wrapper)
+
+
+def sample_values(query_name, wrappers):
+    wrapper = wrappers.get(query_name)
+    if wrapper is None:
+        raise ValueError(f"missing wrapper for {query_name}")
+    values = []
+    for row in extract_rows(wrapper):
+        if not isinstance(row, list) or len(row) < 2:
+            raise ValueError(f"invalid row for {query_name}: {row!r}")
+        values.append(f"{row[1]}:{row[0]}")
+    return sorted(set(values))
+
+
+def edge_values(query_name, wrappers):
+    detail_query = EDGE_DETAIL_QUERY.get(query_name, query_name)
+    wrapper = wrappers.get(detail_query)
+    if wrapper is None:
+        raise ValueError(f"missing wrapper for {detail_query}")
+
+    values = []
+    for row in extract_rows(wrapper):
+        if not isinstance(row, list) or len(row) < 6:
+            raise ValueError(f"invalid row for {detail_query}: {row!r}")
+        src_file, src_name, _src_qn, dst_file, dst_name, _dst_qn = row[:6]
+        if query_name == "gd-imports":
+            values.append(f"{src_file}->{dst_file}")
+        elif query_name == "gd-same-script-calls":
+            if src_file != dst_file:
+                continue
+            if _dst_qn and ".signal." in str(_dst_qn):
+                continue
+            values.append(f"{src_file}:{src_name}->{dst_name}")
+        else:
+            values.append(f"{src_file}:{src_name}->{dst_file}:{dst_name}")
+    return sorted(set(values))
+
+
+def compare_assertion(assertion, wrappers):
+    assertion_id = assertion.get("id", "<unknown>")
+    classification = assertion.get("classification")
+    query_name = assertion.get("query")
+    expected = assertion.get("expected")
+
+    validation_notes = []
+    if classification not in VALID_CLASSIFICATIONS:
+        validation_notes.append(f"invalid classification: {classification!r}")
+    if not isinstance(query_name, str) or not query_name:
+        validation_notes.append("missing query name")
+    elif query_name not in QUERY_FILE_TO_NAME.values():
+        validation_notes.append(f"unknown query: {query_name}")
+    if not isinstance(expected, dict) or not expected:
+        validation_notes.append("expected must be a non-empty object")
+        expected = expected if isinstance(expected, dict) else {}
+    unsupported_expected = sorted(set(expected.keys()) - VALID_EXPECTED_KEYS)
+    if unsupported_expected:
+        validation_notes.append("unsupported expected keys: " + ", ".join(unsupported_expected))
+
+    if validation_notes:
+        return {
+            "id": assertion_id,
+            "query": query_name or "",
+            "classification": classification if classification in VALID_CLASSIFICATIONS else "gating",
+            "outcome": "incomplete",
+            "expected": expected,
+            "actual": {},
+            "notes": validation_notes,
+        }
+
+    actual = {}
+    notes = []
+    outcome = "pass"
+
+    if "count" in expected:
+        try:
+            actual["count"] = count_value(query_name, wrappers)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "id": assertion_id,
+                "query": query_name,
+                "classification": classification,
+                "outcome": "incomplete",
+                "expected": expected,
+                "actual": {"error": str(exc)},
+                "notes": [f"count unavailable: {exc}"],
+            }
+        if actual["count"] != expected["count"]:
+            outcome = "fail"
+            notes.append(f"expected count {expected['count']}, got {actual['count']}")
+
+    if "contains_edges" in expected:
+        try:
+            actual["contains_edges"] = edge_values(query_name, wrappers)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "id": assertion_id,
+                "query": query_name,
+                "classification": classification,
+                "outcome": "incomplete",
+                "expected": expected,
+                "actual": {"error": str(exc)},
+                "notes": [f"edge comparison unavailable: {exc}"],
+            }
+        missing_edges = [edge for edge in expected["contains_edges"] if edge not in set(actual["contains_edges"])]
+        if missing_edges:
+            outcome = "fail"
+            notes.append("missing expected edges: " + ", ".join(missing_edges))
+
+    if "contains" in expected:
+        try:
+            actual["contains"] = sample_values(query_name, wrappers)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "id": assertion_id,
+                "query": query_name,
+                "classification": classification,
+                "outcome": "incomplete",
+                "expected": expected,
+                "actual": {"error": str(exc)},
+                "notes": [f"sample comparison unavailable: {exc}"],
+            }
+        missing_items = [item for item in expected["contains"] if item not in set(actual["contains"])]
+        if missing_items:
+            outcome = "fail"
+            notes.append("missing expected sample values: " + ", ".join(missing_items))
+
+    return {
+        "id": assertion_id,
+        "query": query_name,
+        "classification": classification,
+        "outcome": outcome,
+        "expected": expected,
+        "actual": actual,
+        "notes": notes,
     }
-    issues = []
-    present = []
-
-    for filename, expected_query_name, count_key in QUERY_SPECS:
-      query_file = queries_dir / filename
-      if not query_file.exists():
-          issues.append(f"missing {filename}")
-          continue
-
-      try:
-          payload = json.loads(query_file.read_text(encoding="utf-8"))
-      except Exception as exc:  # noqa: BLE001
-          issues.append(f"unparseable {filename}: {exc}")
-          continue
-
-      if not isinstance(payload, dict):
-          issues.append(f"invalid {filename}: wrapper is not an object")
-          continue
-      if payload.get("query_name") != expected_query_name:
-          issues.append(
-              f"invalid {filename}: expected query_name {expected_query_name!r}, got {payload.get('query_name')!r}"
-          )
-          continue
-
-      present.append(filename)
-      if count_key is None:
-          continue
-
-      try:
-          counts[count_key] = extract_count(payload, count_key)
-      except Exception as exc:  # noqa: BLE001
-          issues.append(f"invalid {filename}: {exc}")
-
-    return counts, issues, present
 
 
-def repo_summary_data(run_root_path, slug):
-    repo_dir = run_root_path / slug
-    repo_meta_file = repo_dir / "repo-meta.json"
-    meta = json.loads(repo_meta_file.read_text(encoding="utf-8"))
+def load_manifest(path_text):
+    if not path_text:
+        return None, None
+    manifest_file = Path(path_text)
+    if not manifest_file.exists():
+        return None, f"manifest file not found: {manifest_file}"
+    try:
+        payload = json.loads(manifest_file.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return None, f"unable to read manifest: {exc}"
+    if not isinstance(payload, dict):
+        return None, "manifest root must be an object"
+    version = payload.get("version")
+    if version != 1:
+        return None, "manifest version must be 1"
+    language = payload.get("language")
+    if language != "gdscript":
+        return None, "manifest language must be 'gdscript'"
+    promotion_target = payload.get("promotion_target")
+    if promotion_target != "good":
+        return None, "manifest promotion_target must be 'good'"
+    minimum_repo_count = payload.get("minimum_repo_count")
+    if not isinstance(minimum_repo_count, int) or minimum_repo_count < 1:
+        return None, "manifest minimum_repo_count must be a positive integer"
+    repos = payload.get("repos")
+    if not isinstance(repos, list):
+        return None, "manifest repos must be a list"
+
+    def validate_string_list(values, field_name, repo_label):
+        if not isinstance(values, list) or not values:
+            return f"manifest repo {repo_label!r} field {field_name} must be a non-empty list"
+        for item in values:
+            if not isinstance(item, str) or not item:
+                return f"manifest repo {repo_label!r} field {field_name} must contain non-empty strings"
+        return None
+
+    repo_by_label = {}
+    for repo in repos:
+        if not isinstance(repo, dict):
+            return None, "manifest repo entries must be objects"
+        label = repo.get("label")
+        if not isinstance(label, str) or not label:
+            return None, "manifest repo missing label"
+        if label in repo_by_label:
+            return None, f"duplicate manifest label: {label}"
+
+        for field_name in ("remote", "pinned_commit", "godot_version"):
+            value = repo.get(field_name)
+            if not isinstance(value, str) or not value:
+                return None, f"manifest repo {label!r} missing {field_name}"
+
+        project_subpath = repo.get("project_subpath")
+        if project_subpath is not None and (not isinstance(project_subpath, str) or not project_subpath):
+            return None, f"manifest repo {label!r} has invalid project_subpath"
+
+        required_for_error = validate_string_list(repo.get("required_for"), "required_for", label)
+        if required_for_error:
+            return None, required_for_error
+
+        assertions = repo.get("assertions")
+        if not isinstance(assertions, list) or not assertions:
+            return None, f"manifest repo {label!r} must declare at least one assertion"
+        seen_assertion_ids = set()
+        for assertion in assertions:
+            if not isinstance(assertion, dict):
+                return None, f"manifest repo {label!r} assertions must be objects"
+            assertion_id = assertion.get("id")
+            if not isinstance(assertion_id, str) or not assertion_id:
+                return None, f"manifest repo {label!r} has assertion without id"
+            if assertion_id in seen_assertion_ids:
+                return None, f"manifest repo {label!r} has duplicate assertion id {assertion_id!r}"
+            seen_assertion_ids.add(assertion_id)
+
+            query_name = assertion.get("query")
+            if not isinstance(query_name, str) or query_name not in QUERY_FILE_TO_NAME.values():
+                return None, f"manifest repo {label!r} assertion {assertion_id!r} has invalid query"
+
+            classification = assertion.get("classification")
+            if classification not in VALID_CLASSIFICATIONS:
+                return None, f"manifest repo {label!r} assertion {assertion_id!r} has invalid classification"
+
+            expected = assertion.get("expected")
+            if not isinstance(expected, dict) or not expected:
+                return None, f"manifest repo {label!r} assertion {assertion_id!r} must have a non-empty expected object"
+
+            unsupported_expected = sorted(set(expected.keys()) - VALID_EXPECTED_KEYS)
+            if unsupported_expected:
+                return None, f"manifest repo {label!r} assertion {assertion_id!r} has unsupported expected keys: {', '.join(unsupported_expected)}"
+
+            if "count" in expected and (not isinstance(expected["count"], int) or expected["count"] < 0):
+                return None, f"manifest repo {label!r} assertion {assertion_id!r} count must be a non-negative integer"
+
+            for key_name in ("contains", "contains_edges"):
+                if key_name in expected:
+                    value = expected[key_name]
+                    if not isinstance(value, list) or not value:
+                        return None, f"manifest repo {label!r} assertion {assertion_id!r} field {key_name} must be a non-empty list"
+                    for item in value:
+                        if not isinstance(item, str) or not item:
+                            return None, f"manifest repo {label!r} assertion {assertion_id!r} field {key_name} must contain non-empty strings"
+
+        repo_by_label[label] = repo
+    payload["repo_by_label"] = repo_by_label
+    return payload, None
+
+
+def load_repo_meta(repo_dir):
+    return json.loads((repo_dir / "repo-meta.json").read_text(encoding="utf-8"))
+
+
+def repo_task_state(meta):
     task_state = meta.get("task5") or {}
     indexing_state = (task_state.get("indexing") or {}).get("status", "pending")
     project_resolution_state = (task_state.get("project_resolution") or {}).get("status", "pending")
     overall_status = task_state.get("status", "pending")
-    overall_message = task_state.get("message")
+    overall_message = task_state.get("message") or ""
     cli_capture = task_state.get("cli_capture") or {}
     cli_mode = cli_capture.get("mode", "unknown")
     cli_note = cli_capture.get("note")
-    counts, query_issues, _present = load_query_data(repo_dir)
+    return indexing_state, project_resolution_state, overall_status, overall_message, cli_mode, cli_note
 
+
+def summarize_repo_without_manifest(slug):
+    repo_dir = run_root_path / slug
+    meta = load_repo_meta(repo_dir)
+    indexing_state, project_resolution_state, overall_status, overall_message, cli_mode, cli_note = repo_task_state(meta)
+    wrappers, query_issues = load_query_wrappers(repo_dir)
     project_id = meta.get("project_id")
     godot_version = meta.get("godot_version")
-    godot_label = version_label(godot_version)
-    major = version_major(godot_version)
     qualifies_godot4x = bool(meta.get("qualifies_godot4x"))
-    confirmed_3x = major == "3"
+
+    def safe_count(name):
+        try:
+            return count_value(name, wrappers)
+        except Exception:
+            return None
+
+    gd_files = safe_count("gd-files")
+    gd_classes = safe_count("gd-classes")
+    gd_methods = safe_count("gd-methods")
+    signal_calls = safe_count("signal-calls")
+    gd_inherits_edges = safe_count("gd-inherits")
+    gd_deps = safe_count("gd-imports")
+
+    repo_complete = (
+        indexing_state == "succeeded"
+        and project_resolution_state == "resolved"
+        and overall_status == "complete"
+        and project_id not in (None, "")
+        and not query_issues
+    )
+    indexing_coverage = bool(repo_complete and qualifies_godot4x and (gd_files or 0) > 0 and (gd_classes or 0) > 0 and (gd_methods or 0) > 0)
+    signal_coverage = bool(repo_complete and (signal_calls or 0) > 0)
+    imports_coverage = bool(repo_complete and (gd_deps or 0) > 0)
+    inherits_coverage = bool(repo_complete and (gd_inherits_edges or 0) > 0)
+    notes = [overall_message or "repo complete"]
+    notes.extend(query_issues)
+
+    summary_lines = [
+        "# GDScript Proof Summary",
+        "",
+        f"- Repo path: {markdown_code(meta.get('repo_path'))}",
+        f"- Artifact slug: {markdown_code(meta.get('artifact_slug'))}",
+        f"- Resolved project ID: {markdown_code(project_id)}",
+        f"- Git commit: {markdown_code(meta.get('git_commit'))}",
+        f"- Godot version: {markdown_code(godot_version)}",
+        f"- Approval status: {markdown_code(meta.get('approval_status'))}",
+        f"- Qualification status: {markdown_code(meta.get('qualification_status'))}",
+        f"- Canonical identity tuple: {escape_cell(json_compact(meta.get('canonical_identity') or {}))}",
+        f"- Repo complete: {markdown_code(str(repo_complete).lower())}",
+        f"- Overall status: {markdown_code(overall_status)}",
+        f"- CLI capture: {cli_mode + (f' — {cli_note}' if cli_note else '')}",
+        "",
+        "## Coverage contributions",
+        f"- Indexing coverage: {markdown_code('yes' if indexing_coverage else 'no')}",
+        f"- Signal coverage: {markdown_code('yes' if signal_coverage else 'no')}",
+        f"- Imports coverage: {markdown_code('yes' if imports_coverage else 'no')}",
+        f"- Inherits coverage: {markdown_code('yes' if inherits_coverage else 'no')}",
+    ]
+    (repo_dir / "summary.md").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+
+    return {
+        "repo_path": meta.get("repo_path", ""),
+        "artifact_slug": meta.get("artifact_slug", slug),
+        "summary_relpath": f"{slug}/summary.md",
+        "indexing_coverage": indexing_coverage,
+        "signal_coverage": signal_coverage,
+        "imports_coverage": imports_coverage,
+        "inherits_coverage": inherits_coverage,
+    }
+
+
+manifest, manifest_error = load_manifest(manifest_path)
+
+
+def detect_git_root_and_subpath(repo_path_text):
+    repo_path = Path(repo_path_text)
+    for candidate in (repo_path, *repo_path.parents):
+        git_marker = candidate / ".git"
+        if git_marker.exists():
+            try:
+                relative = repo_path.relative_to(candidate)
+            except ValueError as exc:  # noqa: BLE001
+                raise ValueError(f"unable to compute repo subpath: {exc}") from exc
+            rel_text = relative.as_posix()
+            return candidate, "." if rel_text == "" else rel_text
+    raise ValueError("unable to detect git root for repo path")
+
+
+def summarize_repo_with_manifest(slug):
+    repo_dir = run_root_path / slug
+    meta = load_repo_meta(repo_dir)
+    indexing_state, project_resolution_state, overall_status, overall_message, cli_mode, cli_note = repo_task_state(meta)
+    wrappers, query_issues = load_query_wrappers(repo_dir)
+    label = meta.get("repo_label") or ""
+    project_id = meta.get("project_id")
     repo_complete = (
         indexing_state == "succeeded"
         and project_resolution_state == "resolved"
@@ -1269,260 +1737,272 @@ def repo_summary_data(run_root_path, slug):
         and not query_issues
     )
 
-    gd_files = counts["gd_files"]
-    gd_classes = counts["gd_classes"]
-    gd_methods = counts["gd_methods"]
-    signal_calls = counts["signal_calls"]
-    gd_inherits_edges = counts["gd_inherits_edges"]
-    gd_deps = counts["gd_deps"]
-
-    indexing_coverage = bool(
-        repo_complete
-        and qualifies_godot4x
-        and (gd_files or 0) > 0
-        and (gd_classes or 0) > 0
-        and (gd_methods or 0) > 0
-    )
-    category_eligible = repo_complete and not confirmed_3x
-    signal_coverage = bool(category_eligible and (signal_calls or 0) > 0)
-    imports_coverage = bool(category_eligible and (gd_deps or 0) > 0)
-    inherits_coverage = bool(category_eligible and (gd_inherits_edges or 0) > 0)
-
-    if qualifies_godot4x:
-        qualification_status = f"confirmed {godot_label}; eligible for indexing coverage"
-    elif confirmed_3x:
-        qualification_status = f"confirmed {godot_label}; excluded from all acceptance categories"
-    elif godot_version in (None, ""):
-        qualification_status = "unknown Godot version; non-qualifying for the Godot 4.x indexing requirement"
+    issues = []
+    manifest_repo = None
+    if manifest_error:
+        issues.append(manifest_error)
+    elif not label:
+        issues.append("missing repo label in manifest mode")
     else:
-        qualification_status = f"{godot_label}; non-qualifying for the Godot 4.x indexing requirement"
+        manifest_repo = manifest["repo_by_label"].get(label)
+        if manifest_repo is None:
+            issues.append(f"label not present in manifest: {label}")
 
-    proof_points = []
-    if (gd_files or 0) > 0 and (gd_classes or 0) > 0 and (gd_methods or 0) > 0:
-        if qualifies_godot4x:
-            proof_points.append("non-zero .gd file/class/method indexing on a confirmed Godot 4.x repo")
-        else:
-            proof_points.append("non-zero .gd file/class/method indexing")
-    if (signal_calls or 0) > 0:
-        proof_points.append("signal CALLS coverage")
-    if (gd_deps or 0) > 0:
-        proof_points.append(".gd IMPORTS coverage")
-    if (gd_inherits_edges or 0) > 0:
-        proof_points.append(".gd INHERITS coverage")
-
-    notes = []
-    if proof_points:
-        notes.append("Proves " + ", ".join(proof_points) + ".")
-    else:
-        notes.append("Does not currently satisfy any aggregate acceptance category.")
     if not repo_complete:
-        if overall_message:
-            notes.append(f"Incomplete: {overall_message}.")
-        if query_issues:
-            notes.append("Missing or invalid query artifacts: " + "; ".join(query_issues) + ".")
-    if confirmed_3x:
-        notes.append("Confirmed Godot 3.x repos cannot contribute to aggregate acceptance.")
-    elif not qualifies_godot4x:
-        notes.append("This repo cannot satisfy the Godot 4.x indexing requirement.")
+        issues.append(overall_message or "repo indexing/query stage incomplete")
+    issues.extend(query_issues)
 
-    counts_display = {
-        "gd_files": "n/a" if gd_files is None else str(gd_files),
-        "gd_classes": "n/a" if gd_classes is None else str(gd_classes),
-        "gd_methods": "n/a" if gd_methods is None else str(gd_methods),
-        "signal_calls": "n/a" if signal_calls is None else str(signal_calls),
-        "gd_inherits_edges": "n/a" if gd_inherits_edges is None else str(gd_inherits_edges),
-        "gd_deps": "n/a" if gd_deps is None else str(gd_deps),
-    }
+    pinned_match = None
+    actual_project_subpath = None
+    if manifest_repo is not None:
+        pinned_commit = manifest_repo.get("pinned_commit")
+        actual_commit = meta.get("git_commit")
+        pinned_match = bool(pinned_commit and actual_commit and pinned_commit == actual_commit)
+        if not pinned_match:
+            issues.append(f"pinned commit mismatch: expected {pinned_commit}, got {actual_commit or '<unknown>'}")
+        expected_project_subpath = manifest_repo.get("project_subpath")
+        if expected_project_subpath:
+            try:
+                _git_root, actual_project_subpath = detect_git_root_and_subpath(meta.get("repo_path") or "")
+            except Exception as exc:  # noqa: BLE001
+                issues.append(f"unable to determine project_subpath: {exc}")
+            else:
+                if actual_project_subpath != expected_project_subpath:
+                    issues.append(
+                        f"project_subpath mismatch: expected {expected_project_subpath}, got {actual_project_subpath}"
+                    )
 
-    cli_summary = cli_mode
-    if cli_note:
-        cli_summary += f" — {cli_note}"
+    results = []
+    if manifest_repo is not None and not issues:
+        for assertion in manifest_repo.get("assertions", []):
+            results.append(compare_assertion(assertion, wrappers))
+
+    gating = [item for item in results if item["classification"] == "gating"]
+    informational = [item for item in results if item["classification"] != "gating"]
+    if issues or any(item["outcome"] == "incomplete" for item in gating):
+        outcome = "incomplete"
+    elif any(item["outcome"] == "fail" for item in gating):
+        outcome = "fail"
+    else:
+        outcome = "pass"
+
+    def section_lines(title, items):
+        lines = ["", f"## {title}"]
+        if not items:
+            lines.append("- none")
+            return lines
+        lines.extend([
+            "| Assertion ID | Query | Outcome | Expected | Actual | Notes |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ])
+        for item in items:
+            lines.append(
+                "| {assertion_id} | {query} | {outcome} | {expected} | {actual} | {notes} |".format(
+                    assertion_id=escape_cell(item["id"]),
+                    query=escape_cell(item["query"]),
+                    outcome=markdown_code(item["outcome"]),
+                    expected=escape_cell(json_compact(item["expected"])),
+                    actual=escape_cell(json_compact(item["actual"])),
+                    notes=escape_cell("; ".join(item["notes"]) if item["notes"] else ""),
+                )
+            )
+        return lines
 
     summary_lines = [
         "# GDScript Proof Summary",
         "",
         f"- Repo path: {markdown_code(meta.get('repo_path'))}",
-        f"- Repo name: {markdown_code(meta.get('repo_name'))}",
         f"- Artifact slug: {markdown_code(meta.get('artifact_slug'))}",
+        f"- Manifest label: {markdown_code(label)}",
         f"- Resolved project ID: {markdown_code(project_id)}",
-        f"- Git ref: {markdown_code(meta.get('git_ref'))}",
         f"- Git commit: {markdown_code(meta.get('git_commit'))}",
-        f"- Git branch: {markdown_code(meta.get('git_branch'))}",
-        f"- Godot version: {markdown_code(godot_version)}",
-        f"- Qualification status: {qualification_status}",
+        f"- Manifest pinned commit: {markdown_code((manifest_repo or {}).get('pinned_commit'))}",
+        f"- Manifest project_subpath: {markdown_code((manifest_repo or {}).get('project_subpath'))}",
+        f"- Detected project_subpath: {markdown_code(actual_project_subpath)}",
+        f"- Pinned commit match: {markdown_code('yes' if pinned_match else 'no' if pinned_match is not None else 'unknown')}",
+        f"- Godot version: {markdown_code((manifest_repo or {}).get('godot_version') or meta.get('godot_version'))}",
+        f"- Approval status: {markdown_code(meta.get('approval_status'))}",
+        f"- Qualification status: {markdown_code(meta.get('qualification_status'))}",
+        f"- Canonical identity tuple: {escape_cell(json_compact(meta.get('canonical_identity') or {}))}",
         f"- Repo complete: {markdown_code(str(repo_complete).lower())}",
-        f"- Indexing status: {markdown_code(indexing_state)}",
-        f"- Project resolution status: {markdown_code(project_resolution_state)}",
-        f"- Overall status: {markdown_code(overall_status)}",
-        f"- CLI capture: {cli_summary}",
-        f"- `.gd` files: {markdown_code(counts_display['gd_files'], empty='n/a')}",
-        f"- `.gd` classes: {markdown_code(counts_display['gd_classes'], empty='n/a')}",
-        f"- `.gd` methods: {markdown_code(counts_display['gd_methods'], empty='n/a')}",
-        f"- Signal calls: {markdown_code(counts_display['signal_calls'], empty='n/a')}",
-        f"- `.gd` inherits: {markdown_code(counts_display['gd_inherits_edges'], empty='n/a')}",
-        f"- `.gd` imports: {markdown_code(counts_display['gd_deps'], empty='n/a')}",
-        "",
-        "## Coverage contributions",
-        f"- Indexing coverage: {markdown_code('yes' if indexing_coverage else 'no')}",
-        f"- Signal coverage: {markdown_code('yes' if signal_coverage else 'no')}",
-        f"- Imports coverage: {markdown_code('yes' if imports_coverage else 'no')}",
-        f"- Inherits coverage: {markdown_code('yes' if inherits_coverage else 'no')}",
-        "",
-        "## What this repo proves",
+        f"- Outcome: {markdown_code(outcome)}",
+        f"- CLI capture: {cli_mode + (f' — {cli_note}' if cli_note else '')}",
+        f"- Required for: {escape_cell(', '.join((manifest_repo or {}).get('required_for') or []))}",
     ]
-    for note in notes:
-        summary_lines.append(f"- {note}")
-    if not repo_complete:
-        summary_lines.extend(["", "## Incomplete or failed status"])
-        if overall_message:
-            summary_lines.append(f"- {overall_message}")
-        if query_issues:
-            for issue in query_issues:
-                summary_lines.append(f"- {issue}")
-
-    summary_file = repo_dir / "summary.md"
-    summary_file.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+    if issues:
+        summary_lines.extend(["", "## Comparability issues"])
+        for issue in issues:
+            summary_lines.append(f"- {issue}")
+    summary_lines.extend(section_lines("Gating assertions", gating))
+    summary_lines.extend(section_lines("Informational assertions", informational))
+    (repo_dir / "summary.md").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
 
     return {
-        "repo_path": meta.get("repo_path", ""),
-        "repo_name": meta.get("repo_name", ""),
+        "repo_label": label,
         "artifact_slug": meta.get("artifact_slug", slug),
-        "summary_relpath": f"{slug}/summary.md",
-        "qualification_status": qualification_status,
-        "repo_complete": repo_complete,
-        "indexing_status": indexing_state,
-        "project_resolution_status": project_resolution_state,
-        "overall_status": overall_status,
-        "overall_message": overall_message or "",
-        "cli_summary": cli_summary,
-        "godot_version": "unknown" if godot_version in (None, "") else str(godot_version),
-        "gd_files": counts_display["gd_files"],
-        "gd_classes": counts_display["gd_classes"],
-        "gd_methods": counts_display["gd_methods"],
-        "signal_calls": counts_display["signal_calls"],
-        "gd_inherits_edges": counts_display["gd_inherits_edges"],
-        "gd_deps": counts_display["gd_deps"],
-        "indexing_coverage": indexing_coverage,
-        "signal_coverage": signal_coverage,
-        "imports_coverage": imports_coverage,
-        "inherits_coverage": inherits_coverage,
-        "note": " ".join(notes),
+        "git_commit": meta.get("git_commit", ""),
+        "manifest_pinned_commit": (manifest_repo or {}).get("pinned_commit", ""),
+        "required_for": ", ".join((manifest_repo or {}).get("required_for") or []),
+        "outcome": outcome,
+        "issues": issues,
+        "gating": gating,
+        "informational": informational,
     }
 
 
-repo_summaries = [repo_summary_data(run_root_path, slug) for slug in slugs]
+if manifest_mode:
+    repo_summaries = [summarize_repo_with_manifest(slug) for slug in slugs]
+    run_labels = [repo["repo_label"] for repo in repo_summaries if repo["repo_label"]]
+    duplicate_run_labels = sorted({label for label in run_labels if run_labels.count(label) > 1})
+    missing_manifest_labels = []
+    minimum_repo_count = None
+    if manifest is not None:
+        minimum_repo_count = manifest.get("minimum_repo_count")
+        missing_manifest_labels = sorted(label for label in manifest["repo_by_label"] if label not in set(run_labels))
 
-indexing_contributors = [repo for repo in repo_summaries if repo["indexing_coverage"]]
-signal_contributors = [repo for repo in repo_summaries if repo["signal_coverage"]]
-imports_contributors = [repo for repo in repo_summaries if repo["imports_coverage"]]
-inherits_contributors = [repo for repo in repo_summaries if repo["inherits_coverage"]]
+    gating_pass = sum(1 for repo in repo_summaries for item in repo["gating"] if item["outcome"] == "pass")
+    gating_fail = sum(1 for repo in repo_summaries for item in repo["gating"] if item["outcome"] == "fail")
+    gating_incomplete = sum(1 for repo in repo_summaries for item in repo["gating"] if item["outcome"] == "incomplete")
+    gating_total = gating_pass + gating_fail + gating_incomplete
+    informational_total = sum(len(repo["informational"]) for repo in repo_summaries)
+    informational_fail = sum(1 for repo in repo_summaries for item in repo["informational"] if item["outcome"] == "fail")
+    aggregate_issues = []
+    if manifest_error:
+        aggregate_issues.append(manifest_error)
+    if duplicate_run_labels:
+        aggregate_issues.append("duplicate repo labels in run: " + ", ".join(duplicate_run_labels))
+    if missing_manifest_labels:
+        aggregate_issues.append("missing manifest repos: " + ", ".join(missing_manifest_labels))
+    unlabeled = [repo["artifact_slug"] for repo in repo_summaries if not repo["repo_label"]]
+    if unlabeled:
+        aggregate_issues.append("unlabeled repos in manifest mode: " + ", ".join(unlabeled))
+    if isinstance(minimum_repo_count, int) and len(run_labels) < minimum_repo_count:
+        aggregate_issues.append(f"run provided {len(run_labels)} labeled repos but manifest requires at least {minimum_repo_count}")
+    if any(repo["outcome"] == "incomplete" for repo in repo_summaries):
+        aggregate_issues.append("one or more repos are incomplete")
 
-indexing_coverage = bool(indexing_contributors)
-signal_coverage = bool(signal_contributors)
-imports_coverage = bool(imports_contributors)
-inherits_coverage = bool(inherits_contributors)
-aggregate_pass = indexing_coverage and signal_coverage and imports_coverage and inherits_coverage
+    if aggregate_issues or gating_incomplete > 0:
+        aggregate_outcome = "incomplete"
+    elif gating_fail > 0:
+        aggregate_outcome = "fail"
+    else:
+        aggregate_outcome = "pass"
 
-missing_categories = []
-if not indexing_coverage:
-    missing_categories.append("indexing_coverage")
-if not signal_coverage:
-    missing_categories.append("signal_coverage")
-if not imports_coverage:
-    missing_categories.append("imports_coverage")
-if not inherits_coverage:
-    missing_categories.append("inherits_coverage")
+    aggregate_pass = aggregate_outcome == "pass"
+    aggregate_note = "; ".join(aggregate_issues) if aggregate_issues else ("all gating assertions passed" if aggregate_pass else "one or more gating assertions failed")
 
-
-def contributor_text(items):
-    if not items:
-        return "none"
-    return ", ".join(f"{item['artifact_slug']} ({item['repo_path']})" for item in items)
-
-
-lines = [
-    "# GDScript Proof Aggregate Summary",
-    "",
-    f"- Run root: {markdown_code(run_root)}",
-    f"- Binary: {markdown_code(binary_path)}",
-    f"- Build status: {markdown_code(build_status)}",
-]
-if build_message:
-    lines.append(f"- Build note: {build_message}")
-lines.extend(
-    [
+    lines = [
+        "# GDScript Proof Aggregate Summary",
+        "",
+        f"- Run root: {markdown_code(run_root)}",
+        f"- Binary: {markdown_code(binary_path)}",
+        f"- Build status: {markdown_code(build_status)}",
+        f"- Manifest: {markdown_code(manifest_path)}",
         f"- codebase-memory-mcp worktree under test: {markdown_code(worktree_path)}",
         f"- codebase-memory-mcp branch under test: {markdown_code(worktree_branch)}",
-    f"- codebase-memory-mcp commit under test: {markdown_code(worktree_commit)}",
-    f"- Final acceptance: {markdown_code('passed' if aggregate_pass else 'failed')}",
-    f"- aggregate_pass: {markdown_code('true' if aggregate_pass else 'false')}",
-    f"- Missing coverage categories: {markdown_code(', '.join(missing_categories) if missing_categories else 'none', empty='none')}",
-    "",
-    "## Coverage results",
-    f"- indexing_coverage: {markdown_code('true' if indexing_coverage else 'false')}",
-    f"- indexing_contributors: {contributor_text(indexing_contributors)}",
-    f"- signal_coverage: {markdown_code('true' if signal_coverage else 'false')}",
-    f"- signal_contributors: {contributor_text(signal_contributors)}",
-    f"- imports_coverage: {markdown_code('true' if imports_coverage else 'false')}",
-    f"- imports_contributors: {contributor_text(imports_contributors)}",
-    f"- inherits_coverage: {markdown_code('true' if inherits_coverage else 'false')}",
-    f"- inherits_contributors: {contributor_text(inherits_contributors)}",
-    "",
-    "## Repos processed",
-]
-)
-
-for repo in repo_summaries:
-    lines.append(
-        f"- {markdown_code(repo['repo_path'])} → {markdown_code(repo['artifact_slug'])} ({markdown_code(repo['summary_relpath'], empty='summary.md')})"
-    )
-
-lines.extend(
-    [
+        f"- codebase-memory-mcp commit under test: {markdown_code(worktree_commit)}",
+        f"- Final outcome: {markdown_code(aggregate_outcome)}",
+        f"- aggregate_pass: {markdown_code('true' if aggregate_pass else 'false')}",
+        f"- Aggregate note: {escape_cell(aggregate_note)}",
         "",
-        "## Per-repo results",
-        "| Repo | Artifact slug | Godot version | Qualification | Complete | .gd files | .gd classes | .gd methods | Signal calls | .gd inherits | .gd imports | Indexing | Signal | Imports | Inherits | Overall | Note |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "## Assertion totals",
+        f"- gating_total: {markdown_code(gating_total)}",
+        f"- gating_pass: {markdown_code(gating_pass)}",
+        f"- gating_fail: {markdown_code(gating_fail)}",
+        f"- gating_incomplete: {markdown_code(gating_incomplete)}",
+        f"- informational_total: {markdown_code(informational_total)}",
+        f"- informational_fail: {markdown_code(informational_fail)}",
+        "",
+        "## Repos processed",
+        "| Repo label | Artifact slug | Outcome | Required for | Pinned commit | Actual commit | Notes |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
-)
-
-for repo in repo_summaries:
-    lines.append(
-        "| {repo} | {slug} | {godot} | {qualification} | {complete} | {gd_files} | {gd_classes} | {gd_methods} | {signal_calls} | {gd_inherits} | {gd_imports} | {indexing} | {signal} | {imports} | {inherits} | {overall} | {note} |".format(
-            repo=markdown_code(repo["repo_path"]),
-            slug=markdown_code(repo["artifact_slug"]),
-            godot=markdown_code(repo["godot_version"]),
-            qualification=escape_cell(repo["qualification_status"]),
-            complete=markdown_code("true" if repo["repo_complete"] else "false"),
-            gd_files=markdown_code(repo["gd_files"], empty="n/a"),
-            gd_classes=markdown_code(repo["gd_classes"], empty="n/a"),
-            gd_methods=markdown_code(repo["gd_methods"], empty="n/a"),
-            signal_calls=markdown_code(repo["signal_calls"], empty="n/a"),
-            gd_inherits=markdown_code(repo["gd_inherits_edges"], empty="n/a"),
-            gd_imports=markdown_code(repo["gd_deps"], empty="n/a"),
-            indexing=markdown_code("yes" if repo["indexing_coverage"] else "no"),
-            signal=markdown_code("yes" if repo["signal_coverage"] else "no"),
-            imports=markdown_code("yes" if repo["imports_coverage"] else "no"),
-            inherits=markdown_code("yes" if repo["inherits_coverage"] else "no"),
-            overall=markdown_code(repo["overall_status"]),
-            note=escape_cell(repo["note"]),
+    for repo in repo_summaries:
+        lines.append(
+            "| {label} | {slug} | {outcome} | {required_for} | {pinned} | {actual} | {notes} |".format(
+                label=markdown_code(repo["repo_label"], empty="missing"),
+                slug=markdown_code(repo["artifact_slug"]),
+                outcome=markdown_code(repo["outcome"]),
+                required_for=escape_cell(repo["required_for"]),
+                pinned=markdown_code(repo["manifest_pinned_commit"], empty="unknown"),
+                actual=markdown_code(repo["git_commit"], empty="unknown"),
+                notes=escape_cell("; ".join(repo["issues"]) if repo["issues"] else "ok"),
+            )
         )
-    )
+else:
+    repo_summaries = [summarize_repo_without_manifest(slug) for slug in slugs]
+    indexing_coverage = any(repo["indexing_coverage"] for repo in repo_summaries)
+    signal_coverage = any(repo["signal_coverage"] for repo in repo_summaries)
+    imports_coverage = any(repo["imports_coverage"] for repo in repo_summaries)
+    inherits_coverage = any(repo["inherits_coverage"] for repo in repo_summaries)
+    aggregate_pass = indexing_coverage and signal_coverage and imports_coverage and inherits_coverage
+    aggregate_outcome = "pass" if aggregate_pass else "fail"
+    missing_categories = []
+    if not indexing_coverage:
+        missing_categories.append("indexing_coverage")
+    if not signal_coverage:
+        missing_categories.append("signal_coverage")
+    if not imports_coverage:
+        missing_categories.append("imports_coverage")
+    if not inherits_coverage:
+        missing_categories.append("inherits_coverage")
+    aggregate_note = ", ".join(missing_categories) if missing_categories else "none"
+    lines = [
+        "# GDScript Proof Aggregate Summary",
+        "",
+        f"- Run root: {markdown_code(run_root)}",
+        f"- Binary: {markdown_code(binary_path)}",
+        f"- Build status: {markdown_code(build_status)}",
+        f"- codebase-memory-mcp worktree under test: {markdown_code(worktree_path)}",
+        f"- codebase-memory-mcp branch under test: {markdown_code(worktree_branch)}",
+        f"- codebase-memory-mcp commit under test: {markdown_code(worktree_commit)}",
+        f"- Final outcome: {markdown_code(aggregate_outcome)}",
+        f"- aggregate_pass: {markdown_code('true' if aggregate_pass else 'false')}",
+        f"- Missing coverage categories: {markdown_code(aggregate_note, empty='none')}",
+    ]
 
 aggregate_summary_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-print("true" if indexing_coverage else "false")
-print("true" if signal_coverage else "false")
-print("true" if imports_coverage else "false")
-print("true" if inherits_coverage else "false")
-print("true" if aggregate_pass else "false")
-print(",".join(missing_categories))
+if manifest_mode:
+    print("false")
+    print("false")
+    print("false")
+    print("false")
+    print("true" if aggregate_pass else "false")
+    print(aggregate_outcome)
+    print(",".join(missing_manifest_labels) if 'missing_manifest_labels' in locals() and missing_manifest_labels else "")
+    print(aggregate_note)
+else:
+    print("true" if indexing_coverage else "false")
+    print("true" if signal_coverage else "false")
+    print("true" if imports_coverage else "false")
+    print("true" if inherits_coverage else "false")
+    print("true" if aggregate_pass else "false")
+    print(aggregate_outcome)
+    print(",".join(missing_categories))
+    print(aggregate_note)
 PY
-  )
+  then
+    rm -f "$summary_fields_file"
+    return 1
+  fi
+
+  {
+    IFS= read -r AGG_INDEXING_COVERAGE
+    IFS= read -r AGG_SIGNAL_COVERAGE
+    IFS= read -r AGG_IMPORTS_COVERAGE
+    IFS= read -r AGG_INHERITS_COVERAGE
+    IFS= read -r AGGREGATE_PASS
+    IFS= read -r AGGREGATE_OUTCOME
+    IFS= read -r AGGREGATE_MISSING_CATEGORIES
+    IFS= read -r AGGREGATE_NOTE
+  } < "$summary_fields_file"
+
+  rm -f "$summary_fields_file"
 }
 
 final_exit_code() {
-  [ "$AGGREGATE_PASS" = "true" ]
+  [ "$AGGREGATE_OUTCOME" = "pass" ]
 }
 
 prepare_repo_metadata() {
@@ -1557,18 +2037,33 @@ prepare_repo_metadata() {
     REPO_GIT_BRANCHES[$i]="$git_branch"
 
     mkdir -p "$RUN_ROOT/$slug"
-    write_repo_meta_json "$RUN_ROOT/$slug" "$repo_path" "$repo_label" "$repo_name" "$slug" "null" "$RUN_TIMESTAMP" "$git_ref" "$git_commit" "$git_branch" "$repo_godot_version" "$qualifies"
+    write_repo_meta_json "$RUN_ROOT/$slug" "$repo_path" "$repo_label" "$repo_name" "$slug" "null" "$RUN_TIMESTAMP" "$git_ref" "$git_commit" "$git_branch" "$repo_godot_version" "$qualifies" "$MANIFEST_PATH"
   done
 }
 
 parse_args() {
   local repo_path
+  local manifest_path
   local raw_value
   local label
   local version
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --manifest)
+        if [[ $# -lt 2 ]]; then
+          echo "error: --manifest requires a path" >&2
+          usage >&2
+          exit 2
+        fi
+
+        if ! manifest_path=$(parse_manifest_path "$2"); then
+          exit 2
+        fi
+
+        MANIFEST_PATH="$manifest_path"
+        shift 2
+        ;;
       --repo)
         if [[ $# -lt 2 ]]; then
           echo "error: --repo requires a repository path" >&2
@@ -1707,6 +2202,7 @@ record_workspace_env() {
     printf '%s\n' "worktree_commit_sha=$worktree_sha"
     printf '%s\n' "binary_path=$BINARY_PATH"
     printf '%s\n' "state_root=$STATE_ROOT"
+    printf '%s\n' "manifest_path=${MANIFEST_PATH:-}"
   } > "$ENV_FILE"
 
   record_repo_metadata_env
@@ -1726,6 +2222,7 @@ fi
 parse_args "$@"
 initialize_workspace_root
 setup_workspace
+apply_manifest_defaults
 record_workspace_env "$WORKTREE_PATH"
 prepare_repo_metadata
 build_local_binary || true
