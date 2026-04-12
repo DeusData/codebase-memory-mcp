@@ -1059,6 +1059,16 @@ def maybe_rel(path: Path):
     return rel_text(path) if path.exists() else None
 
 
+def extract_failed_query(message):
+    if not isinstance(message, str):
+        return None
+    prefix = "query '"
+    marker = "' failed:"
+    if not message.startswith(prefix) or marker not in message:
+        return None
+    return message[len(prefix):message.index(marker)]
+
+
 repos = {}
 for repo_meta_path in sorted(run_root_path.glob("*/repo-meta.json")):
     repo_dir = repo_meta_path.parent
@@ -1068,17 +1078,41 @@ for repo_meta_path in sorted(run_root_path.glob("*/repo-meta.json")):
     indexing = task5.get("indexing") or {}
     resolution = task5.get("project_resolution") or {}
     cli_capture = task5.get("cli_capture") or {}
+    failed_query = extract_failed_query(task5.get("message"))
 
     queries = {}
     present = []
     missing = []
+    failure_triggered = False
     for query_name in query_names:
         query_path = repo_dir / "queries" / f"{query_name}.json"
         if query_path.exists():
-            queries[query_name] = rel_text(query_path)
+            queries[query_name] = {
+                "path": rel_text(query_path),
+                "status": "present",
+            }
             present.append(query_name)
+            continue
+
+        if failed_query == query_name:
+            queries[query_name] = {
+                "path": None,
+                "status": "failed",
+            }
+            missing.append(query_name)
+            failure_triggered = True
+            continue
+
+        if failure_triggered:
+            queries[query_name] = {
+                "path": None,
+                "status": "not_run",
+            }
         else:
-            queries[query_name] = None
+            queries[query_name] = {
+                "path": None,
+                "status": "missing",
+            }
             missing.append(query_name)
 
     repos[slug] = {
@@ -1092,6 +1126,7 @@ for repo_meta_path in sorted(run_root_path.glob("*/repo-meta.json")):
         },
         "failure_context": {
             "message": task5.get("message"),
+            "failed_query": failed_query,
             "cli_capture_mode": cli_capture.get("mode", "unknown"),
             "cli_capture_note": cli_capture.get("note"),
         },
