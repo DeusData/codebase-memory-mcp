@@ -1,0 +1,280 @@
+{
+  "version": 1,
+  "language": "gdscript",
+  "promotion_target": "good",
+  "approval_contract": {
+    "approval_mode": "manifest-only",
+    "canonical_identity_fields": [
+      "remote",
+      "pinned_commit",
+      "project_subpath",
+      "godot_version"
+    ],
+    "label_role": "readability-only",
+    "local_checkout_path_role": "run-evidence-only",
+    "ad_hoc_repo_runs": {
+      "allowed": true,
+      "canonical": false,
+      "qualifies_for_v1": false,
+      "purpose": "debugging-or-investigation"
+    },
+    "qualification_rule": {
+      "requires_recorded_godot_4x": true,
+      "non_4x_or_unknown_status": "non-qualifying"
+    }
+  },
+  "minimum_repo_count": 3,
+  "repos": [
+    {
+      "label": "squash-the-creeps",
+      "remote": "https://github.com/godotengine/godot-demo-projects.git",
+      "project_subpath": "3d/squash_the_creeps",
+      "pinned_commit": "87c1fb6dafa5ceaedf97a2ce5d00ce7bf83a5b76",
+      "godot_version": "4.2",
+      "canonicality": "canonical-approved-v1-target",
+      "qualification": {
+        "status": "godot-4.x-qualified",
+        "qualifies_for_v1": true,
+        "basis": "recorded-godot-version"
+      },
+      "required_for": ["indexing", "signals"],
+      "assertions": [
+        {
+          "id": "indexing.gd-files",
+          "query": "gd-files",
+          "classification": "gating",
+          "expected": {"count": 4}
+        },
+        {
+          "id": "indexing.gd-classes",
+          "query": "gd-classes",
+          "classification": "gating",
+          "expected": {"count": 4}
+        },
+        {
+          "id": "indexing.gd-methods",
+          "query": "gd-methods",
+          "classification": "gating",
+          "expected": {"count": 12}
+        },
+        {
+          "id": "signals.calls",
+          "query": "signal-calls",
+          "classification": "gating",
+          "expected": {
+            "count": 2,
+            "contains_edges": [
+              "Player.gd:die->Player.gd:hit",
+              "Mob.gd:squash->Mob.gd:squashed"
+            ]
+          }
+        },
+        {
+          "id": "methods.sample",
+          "query": "gd-method-sample",
+          "classification": "informational",
+          "expected": {
+            "contains": [
+              "Main.gd:_ready",
+              "Player.gd:die"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "label": "webrtc-signaling",
+      "remote": "https://github.com/godotengine/godot-demo-projects.git",
+      "project_subpath": "networking/webrtc_signaling",
+      "pinned_commit": "87c1fb6dafa5ceaedf97a2ce5d00ce7bf83a5b76",
+      "godot_version": "4.2",
+      "canonicality": "canonical-approved-v1-target",
+      "qualification": {
+        "status": "godot-4.x-qualified",
+        "qualifies_for_v1": true,
+        "basis": "recorded-godot-version"
+      },
+      "required_for": ["signals", "imports", "inherits"],
+      "assertions": [
+        {
+          "id": "indexing.gd-files",
+          "query": "gd-files",
+          "classification": "gating",
+          "expected": {"count": 5}
+        },
+        {
+          "id": "indexing.gd-classes",
+          "query": "gd-classes",
+          "classification": "gating",
+          "expected": {"count": 7}
+        },
+        {
+          "id": "indexing.gd-methods",
+          "query": "gd-methods",
+          "classification": "gating",
+          "expected": {"count": 58}
+        },
+        {
+          "id": "signals.calls",
+          "query": "signal-calls",
+          "classification": "gating",
+          "expected": {
+            "count": 18,
+            "contains_edges": [
+              "client/multiplayer_client.gd:_init->client/ws_webrtc_client.gd:connected",
+              "client/multiplayer_client.gd:_init->client/ws_webrtc_client.gd:peer_connected",
+              "client/ws_webrtc_client.gd:_parse_msg->client/ws_webrtc_client.gd:offer_received"
+            ]
+          }
+        },
+        {
+          "id": "imports.preload_edges",
+          "query": "gd-imports",
+          "classification": "gating",
+          "expected": {
+            "count": 1,
+            "contains_edges": [
+              "client/multiplayer_client.gd->client/ws_webrtc_client.gd"
+            ]
+          }
+        },
+        {
+          "id": "inherits.edges",
+          "query": "gd-inherits",
+          "classification": "gating",
+          "expected": {
+            "count": 1,
+            "contains_edges": [
+              "client/multiplayer_client.gd:__script__->client/ws_webrtc_client.gd:__script__"
+            ]
+          }
+        },
+        {
+          "id": "methods.sample",
+          "query": "gd-method-sample",
+          "classification": "informational",
+          "expected": {
+            "contains": [
+              "client/multiplayer_client.gd:_create_peer",
+              "client/ws_webrtc_client.gd:_parse_msg"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "label": "webrtc-minimal",
+      "remote": "https://github.com/godotengine/godot-demo-projects.git",
+      "project_subpath": "networking/webrtc_minimal",
+      "pinned_commit": "87c1fb6dafa5ceaedf97a2ce5d00ce7bf83a5b76",
+      "godot_version": "4.2",
+      "canonicality": "canonical-approved-v1-target",
+      "qualification": {
+        "status": "godot-4.x-qualified",
+        "qualifies_for_v1": true,
+        "basis": "recorded-godot-version"
+      },
+      "required_for": ["imports"],
+      "assertions": [
+        {
+          "id": "indexing.gd-files",
+          "query": "gd-files",
+          "classification": "gating",
+          "expected": {"count": 5}
+        },
+        {
+          "id": "indexing.gd-classes",
+          "query": "gd-classes",
+          "classification": "gating",
+          "expected": {"count": 5}
+        },
+        {
+          "id": "indexing.gd-methods",
+          "query": "gd-methods",
+          "classification": "gating",
+          "expected": {"count": 13}
+        },
+        {
+          "id": "imports.preload_edges",
+          "query": "gd-imports",
+          "classification": "gating",
+          "expected": {
+            "count": 1,
+            "contains_edges": [
+              "main.gd->chat.gd"
+            ]
+          }
+        },
+        {
+          "id": "methods.sample",
+          "query": "gd-method-sample",
+          "classification": "informational",
+          "expected": {
+            "contains": [
+              "chat.gd:_ready",
+              "minimal.gd:_process"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "label": "topdown-starter",
+      "remote": "https://github.com/ForlornU/TopdownStarter.git",
+      "pinned_commit": "62fe950b0ea246b628a6e6f089fc1d346fd6540c",
+      "godot_version": "4.3",
+      "canonicality": "canonical-approved-v1-target",
+      "qualification": {
+        "status": "godot-4.x-qualified",
+        "qualifies_for_v1": true,
+        "basis": "recorded-godot-version"
+      },
+      "required_for": ["same-script-calls"],
+      "assertions": [
+        {
+          "id": "indexing.gd-files",
+          "query": "gd-files",
+          "classification": "gating",
+          "expected": {"count": 25}
+        },
+        {
+          "id": "indexing.gd-classes",
+          "query": "gd-classes",
+          "classification": "gating",
+          "expected": {"count": 25}
+        },
+        {
+          "id": "indexing.gd-methods",
+          "query": "gd-methods",
+          "classification": "gating",
+          "expected": {"count": 77}
+        },
+        {
+          "id": "calls.same_script_edges",
+          "query": "gd-same-script-calls",
+          "classification": "gating",
+          "expected": {
+            "count": 27,
+            "contains_edges": [
+              "Scripts/Managers/AudioManager.gd:_ready->initiate_audio_stream",
+              "Scripts/QuestGeneral/QuestTracker.gd:start_new_quest->announce_quest",
+              "Scenes/Player/Scripts/States/PlayerWalkState.gd:Update->Move",
+              "Scenes/Player/Scripts/States/PlayerWalkState.gd:Move->Transition"
+            ]
+          }
+        },
+        {
+          "id": "methods.sample",
+          "query": "gd-method-sample",
+          "classification": "informational",
+          "expected": {
+            "contains": [
+              "Scripts/Managers/AudioManager.gd:_ready",
+              "Scenes/Player/Scripts/States/PlayerWalkState.gd:Move"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
