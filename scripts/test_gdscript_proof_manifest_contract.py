@@ -40,6 +40,13 @@ def extract_run_root(output: str) -> Path:
     return Path(match.group(1).strip())
 
 
+def load_run_index(run_root: Path) -> dict:
+    run_index_path = run_root / "run-index.json"
+    if not run_index_path.is_file():
+        fail(f"run index missing at {run_index_path}")
+    return json.loads(run_index_path.read_text(encoding="utf-8"))
+
+
 def build_fixture_repo(temp_root: Path) -> tuple[Path, str]:
     fixture_repo = temp_root / "fixture-repo"
     fixture_repo.mkdir()
@@ -160,6 +167,7 @@ def main() -> None:
             (repo_dirs[0] / "repo-meta.json").read_text(encoding="utf-8")
         )
         manifest_summary = (repo_dirs[0] / "summary.md").read_text(encoding="utf-8")
+        run_index = load_run_index(manifest_root)
 
         identity = manifest_meta.get("canonical_identity") or {}
         if identity.get("remote") != "https://example.invalid/fixture-repo.git":
@@ -181,6 +189,39 @@ def main() -> None:
             fail(
                 f"manifest summary missing canonical/qualifying labels:\n{manifest_summary}"
             )
+
+        query_suite = run_index.get("query_suite") or []
+        if "gd-same-script-calls" not in query_suite:
+            fail(f"run index query suite missing gd-same-script-calls: {run_index}")
+
+        repo_index = (run_index.get("repos") or {}).get(
+            manifest_meta.get("artifact_slug")
+        )
+        if not isinstance(repo_index, dict):
+            fail(
+                f"run index missing repo entry for {manifest_meta.get('artifact_slug')}: {run_index}"
+            )
+
+        if (
+            repo_index.get("artifacts", {}).get("repo_meta")
+            != f"{manifest_meta['artifact_slug']}/repo-meta.json"
+        ):
+            fail(f"run index repo_meta path incorrect: {repo_index}")
+        if (
+            repo_index.get("artifacts", {}).get("summary")
+            != f"{manifest_meta['artifact_slug']}/summary.md"
+        ):
+            fail(f"run index summary path incorrect: {repo_index}")
+
+        query_artifacts = repo_index.get("artifacts", {}).get("queries") or {}
+        same_script_wrapper = query_artifacts.get("gd-same-script-calls") or {}
+        if same_script_wrapper.get("status") != "present":
+            fail(f"run index wrapper status should be present: {same_script_wrapper}")
+        if (
+            same_script_wrapper.get("path")
+            != f"{manifest_meta['artifact_slug']}/queries/gd-same-script-calls.json"
+        ):
+            fail(f"run index wrapper path incorrect: {same_script_wrapper}")
 
         ad_hoc_result = subprocess.run(
             [
