@@ -10,6 +10,7 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
+#include "foundation/platform.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -5463,6 +5464,59 @@ TEST(incremental_new_file_added) {
     PASS();
 }
 
+TEST(incremental_new_file_added_forced_parallel) {
+    /* Full index, add a new file, re-index in forced parallel mode. */
+    if (cbm_default_worker_count(true) <= 1) {
+        SKIP("forced parallel requires more than one worker");
+    }
+    if (setup_incremental_repo() != 0) {
+        SKIP("setup failed");
+    }
+
+    const char *raw_force_mode = getenv("CBM_FORCE_PIPELINE_MODE");
+    char *saved_force_mode = raw_force_mode ? strdup(raw_force_mode) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_FORCE_PIPELINE_MODE", "parallel", 1), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/extra.go", g_incr_tmpdir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package main\n\nfunc Extra() bool {\n\treturn true\n}\n");
+    fclose(f);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t *extra_nodes = NULL;
+    int extra_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(s, project, "Extra", &extra_nodes, &extra_count),
+              CBM_STORE_OK);
+    ASSERT_GT(extra_count, 0);
+    cbm_store_free_nodes(extra_nodes, extra_count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+
+    if (saved_force_mode) {
+        ASSERT_EQ(cbm_setenv("CBM_FORCE_PIPELINE_MODE", saved_force_mode, 1), 0);
+        free(saved_force_mode);
+    } else {
+        ASSERT_EQ(cbm_unsetenv("CBM_FORCE_PIPELINE_MODE"), 0);
+    }
+
+    free(project);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_k8s_manifest_indexed) {
     /* Full index with a k8s manifest, then add a new manifest via incremental.
      * Verifies that cbm_pipeline_pass_k8s() runs during incremental re-index. */
@@ -6304,6 +6358,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_detects_changed_file);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
+    RUN_TEST(incremental_new_file_added_forced_parallel);
     RUN_TEST(incremental_k8s_manifest_indexed);
     RUN_TEST(incremental_kustomize_module_indexed);
     /* Resource management & internal helper tests */
