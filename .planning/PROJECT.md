@@ -17,7 +17,7 @@ A real Godot demo project indexes cleanly and yields useful GDScript answers thr
 - ✓ Brownfield documentation already describes architecture, stack, and testing patterns for GDScript-oriented work — existing brownfield capability
 - ✓ Maintainer can run validation against pinned real Godot 4.x demo targets with recorded repo identity and project subpath when needed — Validated in Phase 1: Proof Contract & Corpus
 - ✓ Maintainer has a reproducible, isolated proof path with machine-readable raw MCP evidence and incomplete-run diagnostics — Validated in Phase 2: Isolated Proof Harness
-- ✓ Maintainer can verify real-repo GDScript definitions, relationships, and sequential-versus-parallel parity through approval-bearing proof artifacts and regressions — Validated in Phase 3: Real-Repo Semantic Verification
+- ✓ Maintainer can verify real-repo GDScript definitions, relationships, and sequential-versus-parallel parity through approval-bearing proof artifacts, regressions, and a forced-parallel lifetime fix — Validated in Phase 3: Real-Repo Semantic Verification
 
 ### Active
 
@@ -38,7 +38,7 @@ Brownfield planning docs already exist under `.planning/codebase/`, and the repo
 
 ## Current State
 
-Phase 3 complete — the proof harness now runs approved real repos in both sequential and parallel modes, emits additive `semantic-parity.json` and `semantic-parity.md`, and locks the review bar in with proof regressions plus operator checklists.
+Phase 3 complete — the proof harness now runs approved real repos in both sequential and parallel modes, emits additive `semantic-parity.json` and `semantic-parity.md`, locks the review bar in with proof regressions plus operator checklists, and keeps forced-parallel incremental runs stable after the worker-lifetime cleanup fix.
 
 ## Constraints
 
