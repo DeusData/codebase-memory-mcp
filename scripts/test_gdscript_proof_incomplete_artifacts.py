@@ -40,6 +40,13 @@ def extract_run_root(output: str) -> Path:
     return Path(match.group(1).strip())
 
 
+def load_run_index(run_root: Path) -> dict:
+    run_index_path = run_root / "run-index.json"
+    if not run_index_path.is_file():
+        fail(f"run index missing at {run_index_path}")
+    return json.loads(run_index_path.read_text(encoding="utf-8"))
+
+
 def build_fixture_repo(temp_root: Path) -> tuple[Path, str]:
     fixture_repo = temp_root / "fixture-repo"
     fixture_repo.mkdir()
@@ -142,62 +149,70 @@ def main() -> None:
         if result.returncode == 0:
             fail(f"incomplete proof run unexpectedly passed:\n{output}")
 
-        repo_dirs = [
-            path
-            for path in run_root.iterdir()
-            if path.is_dir() and (path / "repo-meta.json").is_file()
-        ]
-        if len(repo_dirs) != 1:
-            fail(f"expected 1 repo artifact dir, found {len(repo_dirs)} in {run_root}")
+        run_index = load_run_index(run_root)
+        semantic_pairs = run_index.get("semantic_pairs") or {}
+        fixture_pair = semantic_pairs.get("fixture-repo") or {}
+        requested_modes = fixture_pair.get("requested_modes") or {}
+        if sorted(requested_modes) != ["parallel", "sequential"]:
+            fail(f"semantic_pairs missing sequential/parallel entries: {fixture_pair}")
 
-        repo_dir = repo_dirs[0]
-        repo_meta = json.loads(
-            (repo_dir / "repo-meta.json").read_text(encoding="utf-8")
-        )
-        run_index = json.loads(
-            (run_root / "run-index.json").read_text(encoding="utf-8")
-        )
-
-        if repo_meta.get("task5", {}).get("status") != "incomplete":
-            fail(f"repo-meta task5 status should be incomplete: {repo_meta}")
-        if (repo_meta.get("task5", {}).get("message") or "").find("gd-classes") == -1:
-            fail(f"repo-meta missing failed query details: {repo_meta}")
-
-        gd_files_wrapper = repo_dir / "queries" / "gd-files.json"
-        if not gd_files_wrapper.is_file():
-            fail(f"expected partial wrapper evidence at {gd_files_wrapper}")
-
-        repo_index = (run_index.get("repos") or {}).get(repo_meta.get("artifact_slug"))
-        if not isinstance(repo_index, dict):
-            fail(f"run index missing repo entry: {run_index}")
-
-        if (
-            repo_index.get("artifacts", {}).get("repo_meta")
-            != f"{repo_meta['artifact_slug']}/repo-meta.json"
-        ):
-            fail(f"run index repo_meta path incorrect: {repo_index}")
-
-        query_artifacts = repo_index.get("artifacts", {}).get("queries") or {}
-        gd_files_entry = query_artifacts.get("gd-files") or {}
-        if gd_files_entry.get("status") != "present":
-            fail(f"gd-files wrapper should be marked present: {gd_files_entry}")
-        if (
-            gd_files_entry.get("path")
-            != f"{repo_meta['artifact_slug']}/queries/gd-files.json"
-        ):
-            fail(f"gd-files wrapper path incorrect: {gd_files_entry}")
-
-        gd_classes_entry = query_artifacts.get("gd-classes") or {}
-        if gd_classes_entry.get("status") != "failed":
-            fail(f"gd-classes wrapper should be marked failed: {gd_classes_entry}")
-        if gd_classes_entry.get("path") is not None:
-            fail(
-                f"failed gd-classes wrapper should not have a path: {gd_classes_entry}"
+        for requested_mode in ("sequential", "parallel"):
+            artifact_slug = (requested_modes.get(requested_mode) or {}).get(
+                "artifact_slug"
             )
+            if not artifact_slug:
+                fail(
+                    f"artifact slug missing for requested mode {requested_mode}: {fixture_pair}"
+                )
 
-        missing_queries = repo_index.get("query_wrappers_missing") or []
-        if "gd-classes" not in missing_queries:
-            fail(f"run index missing query_wrappers_missing metadata: {repo_index}")
+            repo_dir = run_root / artifact_slug
+            repo_meta = json.loads(
+                (repo_dir / "repo-meta.json").read_text(encoding="utf-8")
+            )
+            if repo_meta.get("task5", {}).get("status") != "incomplete":
+                fail(f"repo-meta task5 status should be incomplete: {repo_meta}")
+            if (repo_meta.get("task5", {}).get("message") or "").find(
+                "gd-classes"
+            ) == -1:
+                fail(f"repo-meta missing failed query details: {repo_meta}")
+
+            gd_files_wrapper = repo_dir / "queries" / "gd-files.json"
+            if not gd_files_wrapper.is_file():
+                fail(f"expected partial wrapper evidence at {gd_files_wrapper}")
+
+            repo_index = (run_index.get("repos") or {}).get(
+                repo_meta.get("artifact_slug")
+            )
+            if not isinstance(repo_index, dict):
+                fail(f"run index missing repo entry: {run_index}")
+
+            if (
+                repo_index.get("artifacts", {}).get("repo_meta")
+                != f"{repo_meta['artifact_slug']}/repo-meta.json"
+            ):
+                fail(f"run index repo_meta path incorrect: {repo_index}")
+
+            query_artifacts = repo_index.get("artifacts", {}).get("queries") or {}
+            gd_files_entry = query_artifacts.get("gd-files") or {}
+            if gd_files_entry.get("status") != "present":
+                fail(f"gd-files wrapper should be marked present: {gd_files_entry}")
+            if (
+                gd_files_entry.get("path")
+                != f"{repo_meta['artifact_slug']}/queries/gd-files.json"
+            ):
+                fail(f"gd-files wrapper path incorrect: {gd_files_entry}")
+
+            gd_classes_entry = query_artifacts.get("gd-classes") or {}
+            if gd_classes_entry.get("status") != "failed":
+                fail(f"gd-classes wrapper should be marked failed: {gd_classes_entry}")
+            if gd_classes_entry.get("path") is not None:
+                fail(
+                    f"failed gd-classes wrapper should not have a path: {gd_classes_entry}"
+                )
+
+            missing_queries = repo_index.get("query_wrappers_missing") or []
+            if "gd-classes" not in missing_queries:
+                fail(f"run index missing query_wrappers_missing metadata: {repo_index}")
 
         shutil.rmtree(run_root, ignore_errors=True)
         print("PASS")
