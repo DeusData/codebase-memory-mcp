@@ -15,10 +15,10 @@ A real Godot demo project indexes cleanly and yields useful GDScript answers thr
 - ✓ The native C pipeline can discover source files, extract language-aware symbols, persist graph data, and serve it through MCP and the local UI — existing brownfield capability
 - ✓ The codebase already contains GDScript-specific language registration, grammar integration, resolution logic, and fixture/proof infrastructure — existing brownfield capability
 - ✓ Brownfield documentation already describes architecture, stack, and testing patterns for GDScript-oriented work — existing brownfield capability
+- ✓ Maintainer can run validation against pinned real Godot 4.x demo targets with recorded repo identity and project subpath when needed — Validated in Phase 1: Proof Contract & Corpus
 
 ### Active
 
-- [ ] Verify parser-through-MCP GDScript support against real Godot demo projects under `/Users/shaunmcmanus/Downloads/ShitsAndGiggles/godot-demo-projects/`
 - [ ] Confirm that indexing results for GDScript are useful in practice through key MCP workflows such as project indexing, graph discovery, and query/tracing operations
 - [ ] Identify and close the highest-impact gaps that prevent a real Godot project from passing end-to-end validation
 - [ ] Leave behind a reproducible proof path so future GDScript regressions can be rechecked quickly
@@ -35,6 +35,10 @@ This repository is a layered native application with a Tree-sitter-backed extrac
 
 Brownfield planning docs already exist under `.planning/codebase/`, and the repo contains GDScript-oriented proof assets such as `scripts/gdscript-proof.sh`, `scripts/test_gdscript_proof_same_script_calls.py`, and `docs/superpowers/proofs/gdscript-real-project-validation.md`. The user also provided a larger external Godot demo corpus at `/Users/shaunmcmanus/Downloads/ShitsAndGiggles/godot-demo-projects/` to use as the real-world validation target.
 
+## Current State
+
+Phase 1 complete — the approved proof corpus is now pinned in the committed manifest, and the proof harness marks manifest runs as canonical approval-bearing evidence while keeping ad hoc runs debug-only.
+
 ## Constraints
 
 - **Tech stack**: Stay within the existing native C, Tree-sitter, SQLite, and MCP architecture — the goal is to verify and tighten current behavior, not re-platform it
@@ -46,9 +50,10 @@ Brownfield planning docs already exist under `.planning/codebase/`, and the repo
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Treat this as brownfield verification work | The repository already has GDScript-specific implementation and proof artifacts | — Pending |
-| Use real Godot demo repositories as the success benchmark | The user wants end-to-end proof on realistic projects, not a fixture-only pass | — Pending |
-| Define done as useful parser-through-MCP behavior on a real project | The first milestone is validation that real indexing and MCP querying work in practice | — Pending |
+| Treat this as brownfield verification work | The repository already has GDScript-specific implementation and proof artifacts | Confirmed |
+| Use real Godot demo repositories as the success benchmark | The user wants end-to-end proof on realistic projects, not a fixture-only pass | Confirmed |
+| Define done as useful parser-through-MCP behavior on a real project | The first milestone is validation that real indexing and MCP querying work in practice | Confirmed |
+| Manifest mode is the only approval-bearing v1 workflow | Approval evidence must come from the committed four-target corpus instead of operator choice | Confirmed in Phase 1 |
 
 ## Evolution
 
@@ -68,4 +73,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-11 after initialization*
+*Last updated: 2026-04-12 after Phase 1 completion*
