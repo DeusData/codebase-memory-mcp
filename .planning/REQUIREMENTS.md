@@ -58,24 +58,24 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| PROOF-01 | TBD | Pending |
-| PROOF-02 | TBD | Pending |
-| PROOF-03 | TBD | Pending |
-| SEM-01 | TBD | Pending |
-| SEM-02 | TBD | Pending |
-| SEM-03 | TBD | Pending |
-| SEM-04 | TBD | Pending |
-| SEM-05 | TBD | Pending |
-| SEM-06 | TBD | Pending |
-| EVID-01 | TBD | Pending |
-| EVID-02 | TBD | Pending |
-| EVID-03 | TBD | Pending |
+| PROOF-01 | Phase 1 - Proof Contract & Corpus | Pending |
+| PROOF-02 | Phase 2 - Isolated Proof Harness | Pending |
+| PROOF-03 | Phase 4 - Verdicts & Acceptance Summaries | Pending |
+| SEM-01 | Phase 3 - Real-Repo Semantic Verification | Pending |
+| SEM-02 | Phase 3 - Real-Repo Semantic Verification | Pending |
+| SEM-03 | Phase 3 - Real-Repo Semantic Verification | Pending |
+| SEM-04 | Phase 3 - Real-Repo Semantic Verification | Pending |
+| SEM-05 | Phase 3 - Real-Repo Semantic Verification | Pending |
+| SEM-06 | Phase 3 - Real-Repo Semantic Verification | Pending |
+| EVID-01 | Phase 2 - Isolated Proof Harness | Pending |
+| EVID-02 | Phase 2 - Isolated Proof Harness | Pending |
+| EVID-03 | Phase 4 - Verdicts & Acceptance Summaries | Pending |
 
 **Coverage:**
 - v1 requirements: 12 total
-- Mapped to phases: 0
-- Unmapped: 12 ⚠️
+- Mapped to phases: 12
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-04-11*
-*Last updated: 2026-04-11 after initial definition*
+*Last updated: 2026-04-11 after roadmap creation*
