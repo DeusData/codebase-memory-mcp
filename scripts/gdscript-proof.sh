@@ -29,6 +29,7 @@ COMMANDS_LOG=""
 BINARY_PATH=""
 BUILD_LOG=""
 AGGREGATE_SUMMARY=""
+RUN_INDEX_FILE=""
 AGG_INDEXING_COVERAGE="false"
 AGG_SIGNAL_COVERAGE="false"
 AGG_IMPORTS_COVERAGE="false"
@@ -299,6 +300,7 @@ initialize_workspace_root() {
   BINARY_PATH="$WORKTREE_PATH/build/c/codebase-memory-mcp"
   BUILD_LOG="$RUN_ROOT/build.log"
   AGGREGATE_SUMMARY="$RUN_ROOT/aggregate-summary.md"
+  RUN_INDEX_FILE="$RUN_ROOT/run-index.json"
 }
 
 configure_repo_runtime_state() {
@@ -1020,6 +1022,103 @@ set_repo_task5_status() {
   REPO_CLI_CAPTURE_NOTES[$repo_index]="$cli_capture_note"
 
   update_repo_meta_json_task5 "$repo_meta_file" "$project_id" "$index_status" "$resolution_status" "$overall_status" "$status_message" "$cli_capture_mode" "$cli_capture_note"
+}
+
+write_run_index_json() {
+  python3 - "$RUN_ROOT" "$RUN_INDEX_FILE" "$RUN_TIMESTAMP" "$ENV_FILE" "$COMMANDS_LOG" "$BUILD_LOG" "$AGGREGATE_SUMMARY" "$BINARY_PATH" "$BUILD_STATUS" "$BUILD_MESSAGE" "$WORKTREE_PATH" "$WORKTREE_BRANCH" "$WORKTREE_COMMIT" "$MANIFEST_PATH" "${GDSCRIPT_QUERY_NAMES[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+(
+    run_root,
+    output_file,
+    run_timestamp,
+    env_file,
+    commands_log,
+    build_log,
+    aggregate_summary,
+    binary_path,
+    build_status,
+    build_message,
+    worktree_path,
+    worktree_branch,
+    worktree_commit,
+    manifest_path,
+    *query_names,
+) = sys.argv[1:]
+
+run_root_path = Path(run_root)
+
+
+def rel_text(path: Path) -> str:
+    return str(path.relative_to(run_root_path))
+
+
+def maybe_rel(path: Path):
+    return rel_text(path) if path.exists() else None
+
+
+repos = {}
+for repo_meta_path in sorted(run_root_path.glob("*/repo-meta.json")):
+    repo_dir = repo_meta_path.parent
+    payload = json.loads(repo_meta_path.read_text(encoding="utf-8"))
+    slug = payload.get("artifact_slug") or repo_dir.name
+
+    queries = {}
+    for query_name in query_names:
+        query_path = repo_dir / "queries" / f"{query_name}.json"
+        if query_path.exists():
+            queries[query_name] = rel_text(query_path)
+
+    repos[slug] = {
+        "repo_path": payload.get("repo_path"),
+        "repo_label": payload.get("repo_label"),
+        "project_id": payload.get("project_id"),
+        "artifacts": {
+            "repo_meta": rel_text(repo_meta_path),
+            "index": maybe_rel(repo_dir / "index.json"),
+            "list_projects": maybe_rel(repo_dir / "list-projects.json"),
+            "summary": maybe_rel(repo_dir / "summary.md"),
+            "queries": queries,
+        },
+        "runtime": {
+            "state_root": maybe_rel(run_root_path / "state" / slug),
+            "home": maybe_rel(run_root_path / "state" / slug / "home"),
+            "xdg_config_home": maybe_rel(run_root_path / "state" / slug / "config"),
+            "xdg_cache_home": maybe_rel(run_root_path / "state" / slug / "cache"),
+            "store_root": maybe_rel(run_root_path / "state" / slug / "cache" / "codebase-memory-mcp"),
+        },
+    }
+
+payload = {
+    "schema_version": 1,
+    "run": {
+        "proof_run_utc": run_timestamp,
+        "run_root": str(run_root_path),
+        "env_file": maybe_rel(Path(env_file)),
+        "commands_log": maybe_rel(Path(commands_log)),
+        "build_log": maybe_rel(Path(build_log)),
+        "aggregate_summary": maybe_rel(Path(aggregate_summary)),
+        "state_root": maybe_rel(run_root_path / "state"),
+        "manifest_path": manifest_path or None,
+        "binary": {
+            "path": binary_path,
+            "status": build_status,
+            "message": build_message or None,
+        },
+        "worktree": {
+            "path": worktree_path,
+            "branch": worktree_branch,
+            "commit": worktree_commit,
+        },
+    },
+    "query_suite": list(query_names),
+    "repos": repos,
+}
+
+Path(output_file).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
 }
 
 validate_index_output() {
@@ -2228,6 +2327,7 @@ prepare_repo_metadata
 build_local_binary || true
 process_repo_indexing
 write_repo_and_aggregate_summaries
+write_run_index_json
 
 printf 'Proof run root: %s\n' "$RUN_ROOT"
 
