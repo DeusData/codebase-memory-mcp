@@ -1223,10 +1223,13 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             }
         }
 
-        /* Free TSTree immediately — arena strings survive for registry+resolve.
-         * This makes slab reset safe: tree-sitter's internal nodes (in slab)
-         * are released before the slab is bulk-reclaimed. */
+        /* Free TSTree immediately — arena strings survive for registry+resolve. */
         cbm_free_tree(result);
+
+        /* Reset parser state between files, but keep parser/slab allocations
+         * owned by this worker alive until thread exit. This avoids freeing
+         * parser-owned buffers while tree-sitter may still reference them. */
+        cbm_reset_thread_parser();
 
         /* Free source buffer — extraction captured everything needed. */
         free_source(source);
@@ -1240,24 +1243,11 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                          "total", itoa_log(ec->file_count));
         }
 
-        /* Reclaim all slab + tier2 memory between files.
-         *
-         * After cbm_free_tree(result), all tree nodes are on free lists.
-         * We then destroy the parser (frees its internal allocations too),
-         * leaving ZERO live slab/tier2 pointers. At that point, we can
-         * safely munmap/free every page, bounding peak memory per-file
-         * instead of accumulating across all 644 files.
-         *
-         * get_thread_parser() in cbm_extract_file will create a fresh
-         * parser for the next file — cost is microseconds vs seconds
-         * for parsing. This prevents unbounded memory accumulation and works
-         * identically on macOS, Linux, and Windows. */
-        cbm_destroy_thread_parser();
-        cbm_slab_reclaim();
         cbm_mem_collect();
     }
 
-    /* Final cleanup (parser already destroyed in loop, just slab state) */
+    /* Final cleanup: destroy parser before tearing down thread-local slabs. */
+    cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
 }
 
@@ -1284,8 +1274,8 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     cbm_init();
 
     /* Slab allocator for tree-sitter (thread-safe via TLS).
-     * Safe: extract_worker frees TSTree via cbm_free_tree() before
-     * cbm_slab_reset_thread(), so no live tree pointers cross slab boundaries. */
+     * Worker threads keep parser/slab state for their full lifetime and tear it
+     * down in parser-before-slab order at thread exit. */
     cbm_slab_install();
 
     /* Sort files by descending size for tail-latency reduction */
