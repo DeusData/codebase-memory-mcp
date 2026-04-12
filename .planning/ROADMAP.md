@@ -12,9 +12,9 @@ This roadmap turns the existing brownfield GDScript implementation and proof ass
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Proof Contract & Corpus** - Lock the pinned Godot demo targets and the target-identity rules the proof must use.
-- [ ] **Phase 2: Isolated Proof Harness** - Make proof runs reproducible, isolated, and backed by a fixed raw MCP query evidence set.
-- [ ] **Phase 3: Real-Repo Semantic Verification** - Prove the required GDScript extraction and resolution behaviors on real projects across both indexing paths.
+- [x] **Phase 1: Proof Contract & Corpus** - Lock the pinned Godot demo targets and the target-identity rules the proof must use. (completed 2026-04-12)
+- [x] **Phase 2: Isolated Proof Harness** - Make proof runs reproducible, isolated, and backed by a fixed raw MCP query evidence set. (completed 2026-04-12)
+- [x] **Phase 3: Real-Repo Semantic Verification** - Prove the required GDScript extraction and resolution behaviors on real projects across both indexing paths. (completed 2026-04-12)
 - [ ] **Phase 4: Verdicts & Acceptance Summaries** - Turn raw proof evidence into explicit per-target outcomes and maintainable promotion summaries.
 
 ## Phase Details
@@ -30,8 +30,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Plans**: 2 plans
 
 Plans:
-- [ ] 01-01-PLAN.md — Lock the written approved corpus contract in the manifest, runbook, and checklist.
-- [ ] 01-02-PLAN.md — Enforce canonical approval metadata in the proof harness and add contract regression coverage.
+- [x] 01-01-PLAN.md — Lock the written approved corpus contract in the manifest, runbook, and checklist.
+- [x] 01-02-PLAN.md — Enforce canonical approval metadata in the proof harness and add contract regression coverage.
 
 ### Phase 2: Isolated Proof Harness
 **Goal**: Maintainers can run a reproducible proof command that indexes real targets in isolated local state and captures a fixed MCP query suite as machine-readable evidence.
@@ -45,8 +45,8 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 02-01-PLAN.md — Add a run-level machine-readable evidence index and preserve incomplete-path artifact status in the existing proof harness.
-- [ ] 02-02-PLAN.md — Document the additive evidence contract and add regressions for successful and incomplete proof runs.
+- [x] 02-01-PLAN.md — Add a run-level machine-readable evidence index and preserve incomplete-path artifact status in the existing proof harness.
+- [x] 02-02-PLAN.md — Document the additive evidence contract and add regressions for successful and incomplete proof runs.
 
 ### Phase 3: Real-Repo Semantic Verification
 **Goal**: Maintainers can verify that real Godot demo projects expose the required GDScript definitions and relationships through the parser-to-MCP path in both sequential and parallel indexing modes.
@@ -82,7 +82,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Proof Contract & Corpus | 0/TBD | Not started | - |
-| 2. Isolated Proof Harness | 0/TBD | Not started | - |
-| 3. Real-Repo Semantic Verification | 2/3 | In Progress | - |
+| 1. Proof Contract & Corpus | 2/2 | Complete | 2026-04-12 |
+| 2. Isolated Proof Harness | 2/2 | Complete | 2026-04-12 |
+| 3. Real-Repo Semantic Verification | 3/3 | Complete | 2026-04-12 |
 | 4. Verdicts & Acceptance Summaries | 0/TBD | Not started | - |
