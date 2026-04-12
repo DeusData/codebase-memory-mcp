@@ -14,6 +14,7 @@
 
 enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 5, PL_WAL_BUF = 1040 };
 #define PL_NSEC_PER_SEC 1000000000LL
+#define MIN_FILES_FOR_PARALLEL 50
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/worker_pool.h"
@@ -98,6 +99,61 @@ static const char *itoa_buf(int val) {
     idx = (idx + SKIP_ONE) & PL_RING_MASK;
     snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
     return bufs[i];
+}
+
+const char *cbm_pipeline_mode_label(cbm_pipeline_mode mode) {
+    switch (mode) {
+    case CBM_PIPELINE_MODE_AUTO:
+        return "auto";
+    case CBM_PIPELINE_MODE_SEQUENTIAL:
+        return "sequential";
+    case CBM_PIPELINE_MODE_PARALLEL:
+        return "parallel";
+    case CBM_PIPELINE_MODE_NONE:
+    default:
+        return "none";
+    }
+}
+
+int cbm_pipeline_select_mode(const char *requested_mode, int worker_count, int file_count,
+                             cbm_pipeline_mode_selection_t *selection) {
+    cbm_pipeline_mode_selection_t local = {0};
+    cbm_pipeline_mode_selection_t *out = selection ? selection : &local;
+
+    out->requested_mode = CBM_PIPELINE_MODE_AUTO;
+    out->selected_mode = CBM_PIPELINE_MODE_SEQUENTIAL;
+    out->worker_count = worker_count;
+    out->file_count = file_count;
+    out->forced = false;
+    out->invalid_override = false;
+
+    bool auto_parallel = worker_count > SKIP_ONE && file_count > MIN_FILES_FOR_PARALLEL;
+    if (!requested_mode || requested_mode[0] == '\0' || strcmp(requested_mode, "auto") == 0) {
+        out->selected_mode = auto_parallel ? CBM_PIPELINE_MODE_PARALLEL : CBM_PIPELINE_MODE_SEQUENTIAL;
+        return 0;
+    }
+
+    if (strcmp(requested_mode, "sequential") == 0) {
+        out->requested_mode = CBM_PIPELINE_MODE_SEQUENTIAL;
+        out->selected_mode = CBM_PIPELINE_MODE_SEQUENTIAL;
+        out->forced = true;
+        return 0;
+    }
+
+    if (strcmp(requested_mode, "parallel") == 0) {
+        out->requested_mode = CBM_PIPELINE_MODE_PARALLEL;
+        out->forced = true;
+        if (worker_count <= SKIP_ONE) {
+            out->selected_mode = CBM_PIPELINE_MODE_NONE;
+            return CBM_PIPELINE_FORCE_PARALLEL_UNAVAILABLE;
+        }
+        out->selected_mode = CBM_PIPELINE_MODE_PARALLEL;
+        return 0;
+    }
+
+    out->invalid_override = true;
+    out->selected_mode = auto_parallel ? CBM_PIPELINE_MODE_PARALLEL : CBM_PIPELINE_MODE_SEQUENTIAL;
+    return 0;
 }
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
@@ -744,8 +800,37 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
 
     /* Run extraction passes (parallel or sequential) */
     int worker_count = cbm_default_worker_count(true);
-#define MIN_FILES_FOR_PARALLEL 50
-    rc = (worker_count > SKIP_ONE && file_count > MIN_FILES_FOR_PARALLEL)
+    char requested_mode_buf[CBM_SZ_32] = "";
+    const char *requested_mode =
+        cbm_safe_getenv("CBM_FORCE_PIPELINE_MODE", requested_mode_buf, sizeof(requested_mode_buf), NULL);
+    cbm_pipeline_mode_selection_t mode_selection = {0};
+    rc = cbm_pipeline_select_mode(requested_mode, worker_count, file_count, &mode_selection);
+    if (mode_selection.invalid_override) {
+        cbm_log_warn("pipeline.mode_selection", "requested_mode",
+                     cbm_pipeline_mode_label(mode_selection.requested_mode), "selected_mode",
+                     cbm_pipeline_mode_label(mode_selection.selected_mode), "worker_count",
+                     itoa_buf(worker_count), "file_count", itoa_buf(file_count), "forced",
+                     mode_selection.forced ? "true" : "false", "invalid_override",
+                     requested_mode ? requested_mode : "");
+    } else if (rc != 0) {
+        cbm_log_error("pipeline.mode_selection", "requested_mode",
+                      cbm_pipeline_mode_label(mode_selection.requested_mode), "selected_mode",
+                      cbm_pipeline_mode_label(mode_selection.selected_mode), "worker_count",
+                      itoa_buf(worker_count), "file_count", itoa_buf(file_count), "forced",
+                      mode_selection.forced ? "true" : "false", "reason",
+                      "parallel_requires_multiple_workers");
+    } else {
+        cbm_log_info("pipeline.mode_selection", "requested_mode",
+                     cbm_pipeline_mode_label(mode_selection.requested_mode), "selected_mode",
+                     cbm_pipeline_mode_label(mode_selection.selected_mode), "worker_count",
+                     itoa_buf(worker_count), "file_count", itoa_buf(file_count), "forced",
+                     mode_selection.forced ? "true" : "false");
+    }
+    if (rc != 0) {
+        goto cleanup;
+    }
+
+    rc = mode_selection.selected_mode == CBM_PIPELINE_MODE_PARALLEL
              ? run_parallel_pipeline(p, &ctx, files, file_count, worker_count, &t)
              : run_sequential_pipeline(p, &ctx, files, file_count, &t);
     if (check_cancel(p)) {

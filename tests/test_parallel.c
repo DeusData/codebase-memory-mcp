@@ -25,29 +25,6 @@
 
 #define GD_PARITY_PROJECT "gd-par-test"
 
-typedef enum {
-    CBM_PIPELINE_MODE_NONE = 0,
-    CBM_PIPELINE_MODE_AUTO,
-    CBM_PIPELINE_MODE_SEQUENTIAL,
-    CBM_PIPELINE_MODE_PARALLEL,
-} cbm_pipeline_mode;
-
-enum {
-    CBM_PIPELINE_FORCE_PARALLEL_UNAVAILABLE = 2,
-};
-
-typedef struct {
-    cbm_pipeline_mode requested_mode;
-    cbm_pipeline_mode selected_mode;
-    int worker_count;
-    int file_count;
-    bool forced;
-    bool invalid_override;
-} cbm_pipeline_mode_selection_t;
-
-int cbm_pipeline_select_mode(const char *requested_mode, int worker_count, int file_count,
-                             cbm_pipeline_mode_selection_t *selection);
-
 /* ── Helper: create temp test repo ───────────────────────────────── */
 
 static char g_par_tmpdir[256];
