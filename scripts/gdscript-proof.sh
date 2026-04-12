@@ -2532,6 +2532,30 @@ json_payload = {
 }
 Path(json_path).write_text(json.dumps(json_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+
+def render_scalar(label, payload, lines):
+    count = payload.get("count") or {}
+    lines.append(f"  - {label} count (`{count.get('query', 'unknown')}`): sequential={count.get('sequential', 'n/a')}, parallel={count.get('parallel', 'n/a')}, matched={count.get('matched', 'n/a')}")
+
+
+def render_samples(label, payload, lines):
+    samples = payload.get("representative_samples") or {}
+    lines.append(f"  - {label} samples (`{samples.get('query', 'unknown')}`):")
+    lines.append(f"    - sequential: {', '.join(samples.get('sequential') or ['none'])}")
+    lines.append(f"    - parallel: {', '.join(samples.get('parallel') or ['none'])}")
+    lines.append(f"    - matched: {samples.get('matched', 'n/a')}")
+
+
+def render_edges(requirement, lines):
+    count = requirement.get("count") or {}
+    edges = requirement.get("representative_edges") or {}
+    lines.append(f"  - Count (`{count.get('query', 'unknown')}`): sequential={count.get('sequential', 'n/a')}, parallel={count.get('parallel', 'n/a')}, matched={count.get('matched', 'n/a')}")
+    lines.append(f"  - Representative edges (`{edges.get('query', 'unknown')}`):")
+    lines.append(f"    - sequential: {', '.join(edges.get('sequential') or ['none'])}")
+    lines.append(f"    - parallel: {', '.join(edges.get('parallel') or ['none'])}")
+    lines.append(f"    - matched: {edges.get('matched', 'n/a')}")
+
+
 lines = [
     "# Sequential vs parallel semantic parity",
     "",
@@ -2554,6 +2578,28 @@ for label in manifest_labels:
         requirement = report["requirements"][requirement_id]
         lines.append(f"| {requirement_id} | `{requirement['outcome']}` | {'; '.join(requirement.get('notes') or [])} |")
     lines.append("")
+    sem01 = report["requirements"]["SEM-01"]
+    lines.extend([
+        "### SEM-01 counts and representative samples",
+        "",
+    ])
+    render_scalar("Class", sem01.get("class_count") or {}, lines)
+    render_scalar("Method", sem01.get("method_count") or {}, lines)
+    render_samples("Class representative", sem01.get("class_sample") or {}, lines)
+    render_samples("Method representative", sem01.get("method_sample") or {}, lines)
+    lines.append("")
+    for requirement_id, title in (
+        ("SEM-02", "same-script calls"),
+        ("SEM-03", "inherits relationships"),
+        ("SEM-04", "imports relationships"),
+        ("SEM-05", "signal calls"),
+    ):
+        lines.extend([
+            f"### {requirement_id} semantic comparison ({title})",
+            "",
+        ])
+        render_edges(report["requirements"][requirement_id], lines)
+        lines.append("")
 Path(md_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 PY
 }

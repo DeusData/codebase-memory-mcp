@@ -420,8 +420,11 @@ $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_
 		$(OBJS_VENDORED_TEST) \
 		$(LDFLAGS_TEST)
 
-test: $(BUILD_DIR)/test-runner
+test: $(BUILD_DIR)/test-runner $(BUILD_DIR)/codebase-memory-mcp
 	cd $(CURDIR) && $(BUILD_DIR)/test-runner
+	python3 -B scripts/test_gdscript_proof_manifest_contract.py
+	python3 -B scripts/test_gdscript_proof_same_script_calls.py
+	python3 -B scripts/test_gdscript_proof_semantic_parity.py
 
 # ── TSan full test ───────────────────────────────────────────────
 

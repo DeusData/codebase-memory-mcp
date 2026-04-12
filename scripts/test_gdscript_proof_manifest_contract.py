@@ -193,8 +193,14 @@ def main() -> None:
             fail(f"manifest qualification status incorrect: {manifest_meta}")
         if manifest_meta.get("comparison_label") != "fixture-repo":
             fail(f"comparison label missing from repo meta: {manifest_meta}")
+        if manifest_meta.get("requested_mode") != "sequential":
+            fail(f"requested mode missing from repo meta: {manifest_meta}")
         if manifest_meta.get("actual_mode") != "sequential":
             fail(f"actual mode missing from repo meta: {manifest_meta}")
+        if manifest_metas["parallel"].get("requested_mode") != "parallel":
+            fail(
+                f"parallel requested mode missing from repo meta: {manifest_metas['parallel']}"
+            )
         if manifest_metas["parallel"].get("actual_mode") != "parallel":
             fail(
                 f"parallel actual mode missing from repo meta: {manifest_metas['parallel']}"
@@ -254,6 +260,8 @@ def main() -> None:
             != manifest_meta["artifact_slug"]
         ):
             fail(f"semantic_pairs sequential artifact mismatch: {fixture_pair}")
+        if requested_modes["parallel"].get("actual_mode") != "parallel":
+            fail(f"semantic_pairs parallel actual mode mismatch: {fixture_pair}")
         if not (manifest_root / "semantic-parity.json").is_file():
             fail("semantic-parity.json missing from manifest run")
         if not (manifest_root / "semantic-parity.md").is_file():
