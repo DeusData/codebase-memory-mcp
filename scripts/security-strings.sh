@@ -50,6 +50,26 @@ ALLOWED_URLS=(
     # SQLite internal URLs (part of vendored sqlite3 strings)
     "https://sqlite.org"
     "https://www.sqlite.org"
+    # Toolchain URLs embedded by compiler/linker in static builds
+    "https://bugs.launchpad.net"
+    "https://gcc.gnu.org"
+    "https://sourceware.org"
+    # W3C XML namespace URIs (SVG, MathML, XLink — used in UI bundle)
+    "http://www.w3.org/"
+    # UI bundle: React, Three.js, Tailwind, Google Fonts, bundled libraries
+    "https://react.dev"
+    "https://fonts.googleapis.com"
+    "https://fonts.gstatic.com"
+    "https://tailwindcss.com"
+    "https://cdn.jsdelivr.net"
+    "https://docs.pmnd.rs"
+    "https://jcgt.org"
+    "https://github.com/pmndrs"
+    "https://github.com/react-spring"
+    "https://github.com/101arrowz"
+    "https://github.com/arty-name"
+    "https://github.com/fredli74"
+    "https://github.com/lojjic"
 )
 
 while IFS= read -r url; do

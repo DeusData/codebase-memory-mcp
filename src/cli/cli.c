@@ -3395,8 +3395,8 @@ int cbm_cmd_update(int argc, char **argv) {
 
     printf("codebase-memory-mcp update (current: %s)\n\n", CBM_VERSION);
 
-    /* Version check — skip download if already on latest. */
-    if (!force && check_already_latest()) {
+    /* Version check — skip download if already on latest (not in dry-run). */
+    if (!force && !dry_run && check_already_latest()) {
         return 0;
     }
 

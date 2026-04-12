@@ -62,8 +62,7 @@ jobs:
         env:
           SMOKE_DOWNLOAD_URL: http://localhost:18080
 
-      - name: Security audits (standard only)
-        if: matrix.variant == 'standard'
+      - name: Security audits
         run: |
           scripts/security-strings.sh ./codebase-memory-mcp
           scripts/security-install.sh ./codebase-memory-mcp
@@ -76,7 +75,7 @@ jobs:
           scripts/security-fuzz-random.sh ./codebase-memory-mcp 60
 
       - name: ClamAV scan (Linux)
-        if: matrix.variant == 'standard' && startsWith(matrix.os, 'ubuntu')
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq clamav > /dev/null 2>&1
           sudo sed -i 's/^Example/#Example/' /etc/clamav/freshclam.conf 2>/dev/null || true
@@ -86,7 +85,7 @@ jobs:
           clamscan --no-summary ./codebase-memory-mcp
 
       - name: ClamAV scan (macOS)
-        if: matrix.variant == 'standard' && startsWith(matrix.os, 'macos')
+        if: startsWith(matrix.os, 'macos')
         run: |
           brew install clamav > /dev/null 2>&1
           CLAMAV_ETC=$(brew --prefix)/etc/clamav
@@ -149,15 +148,13 @@ jobs:
         env:
           SMOKE_DOWNLOAD_URL: http://localhost:18080
 
-      - name: Security audits (standard only)
-        if: matrix.variant == 'standard'
+      - name: Security audits
         shell: msys2 {0}
         run: |
           scripts/security-strings.sh ./codebase-memory-mcp.exe
           scripts/security-install.sh ./codebase-memory-mcp.exe
 
-      - name: Windows Defender scan (standard only)
-        if: matrix.variant == 'standard'
+      - name: Windows Defender scan
         shell: pwsh
         run: |
           & "C:\Program Files\Windows Defender\MpCmdRun.exe" -SignatureUpdate 2>$null
@@ -192,8 +189,7 @@ jobs:
           chmod +x codebase-memory-mcp
           scripts/smoke-test.sh ./codebase-memory-mcp
 
-      - name: Security audits (standard only)
-        if: matrix.variant == 'standard'
+      - name: Security audits
         run: |
           scripts/security-strings.sh ./codebase-memory-mcp
           scripts/security-install.sh ./codebase-memory-mcp
