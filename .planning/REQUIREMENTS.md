@@ -9,7 +9,7 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Proof Contract
 
-- [ ] **PROOF-01**: Maintainer can run validation against pinned real Godot 4.x demo targets with recorded repo identity and project subpath when needed
+- [x] **PROOF-01**: Maintainer can run validation against pinned real Godot 4.x demo targets with recorded repo identity and project subpath when needed
 - [ ] **PROOF-02**: Maintainer can execute a fixed MCP query suite for each proof target after indexing completes
 - [ ] **PROOF-03**: Each proof target produces an explicit `pass`, `fail`, or `incomplete` outcome instead of informal notes
 
@@ -58,7 +58,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| PROOF-01 | Phase 1 - Proof Contract & Corpus | Pending |
+| PROOF-01 | Phase 1 - Proof Contract & Corpus | Complete |
 | PROOF-02 | Phase 2 - Isolated Proof Harness | Pending |
 | PROOF-03 | Phase 4 - Verdicts & Acceptance Summaries | Pending |
 | SEM-01 | Phase 3 - Real-Repo Semantic Verification | Pending |

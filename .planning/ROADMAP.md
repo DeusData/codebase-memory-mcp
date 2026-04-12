@@ -27,7 +27,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   1. Maintainer can select approved real proof targets from `/Users/shaunmcmanus/Downloads/ShitsAndGiggles/godot-demo-projects/` without relying on ad hoc repo choices.
   2. Each proof target records enough identity metadata for reruns to target the same repo and project subpath again.
   3. Proof targets that count toward v1 acceptance are explicitly qualified as Godot 4.x instead of being assumed valid by default.
-**Plans**: TBD
+**Plans**: 2 plans
+
+Plans:
+- [ ] 01-01-PLAN.md — Lock the written approved corpus contract in the manifest, runbook, and checklist.
+- [ ] 01-02-PLAN.md — Enforce canonical approval metadata in the proof harness and add contract regression coverage.
 
 ### Phase 2: Isolated Proof Harness
 **Goal**: Maintainers can run a reproducible proof command that indexes real targets in isolated local state and captures a fixed MCP query suite as machine-readable evidence.
