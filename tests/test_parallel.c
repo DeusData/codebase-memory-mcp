@@ -673,6 +673,16 @@ static int assert_gd_edge_type_parity(const char *type) {
     return assert_gd_edge_signature_parity(type, 0);
 }
 
+static int discover_repo_file_count(const char *repo_path) {
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    if (cbm_discover(repo_path, &opts, &files, &file_count) != 0)
+        return -1;
+    cbm_discover_free(files, file_count);
+    return file_count;
+}
+
 static int count_import_edge(const cbm_gbuf_t *gbuf, const char *source_rel, const char *target_rel) {
     char source_qn[512];
     char *computed_source_qn = cbm_pipeline_fqn_compute(GD_PARITY_PROJECT, source_rel, "__file__");
@@ -784,6 +794,58 @@ TEST(gdscript_parallel_defines_parity) {
     if (rc == -1)
         SKIP("setup failed");
     ASSERT_EQ(rc, 0);
+    PASS();
+}
+
+TEST(forced_pipeline_mode_auto_keeps_threshold_rule) {
+    cbm_pipeline_mode_selection_t selection = {0};
+
+    ASSERT_EQ(cbm_pipeline_select_mode("auto", 2, 50, &selection), 0);
+    ASSERT_EQ(selection.selected_mode, CBM_PIPELINE_MODE_SEQUENTIAL);
+    ASSERT_FALSE(selection.forced);
+
+    ASSERT_EQ(cbm_pipeline_select_mode("auto", 2, 51, &selection), 0);
+    ASSERT_EQ(selection.selected_mode, CBM_PIPELINE_MODE_PARALLEL);
+    ASSERT_FALSE(selection.forced);
+    PASS();
+}
+
+TEST(forced_pipeline_mode_sequential_overrides_parallel_eligible_repo) {
+    cbm_pipeline_mode_selection_t selection = {0};
+
+    ASSERT_EQ(cbm_pipeline_select_mode("sequential", 2, 51, &selection), 0);
+    ASSERT_EQ(selection.requested_mode, CBM_PIPELINE_MODE_SEQUENTIAL);
+    ASSERT_EQ(selection.selected_mode, CBM_PIPELINE_MODE_SEQUENTIAL);
+    ASSERT_TRUE(selection.forced);
+    PASS();
+}
+
+TEST(forced_pipeline_mode_parallel_selects_gdscript_fixture) {
+    if (ensure_gd_parity_setup() != 0)
+        SKIP("setup failed");
+
+    int file_count = discover_repo_file_count(g_gd_tmpdir);
+    ASSERT_GT(file_count, 0);
+    ASSERT_LT(file_count, 51);
+
+    cbm_pipeline_mode_selection_t selection = {0};
+    ASSERT_EQ(cbm_pipeline_select_mode("parallel", 2, file_count, &selection), 0);
+    ASSERT_EQ(selection.requested_mode, CBM_PIPELINE_MODE_PARALLEL);
+    ASSERT_EQ(selection.selected_mode, CBM_PIPELINE_MODE_PARALLEL);
+    ASSERT_TRUE(selection.forced);
+
+    ASSERT_GT(cbm_gbuf_node_count(g_gd_seq_gbuf), 0);
+    ASSERT_GT(cbm_gbuf_node_count(g_gd_par_gbuf), 0);
+
+    char player_qn[512], attack_qn[512], helper_qn[512];
+    snprintf(player_qn, sizeof(player_qn), "%s.actors.player.Player", GD_PARITY_PROJECT);
+    snprintf(attack_qn, sizeof(attack_qn), "%s.attack", player_qn);
+    snprintf(helper_qn, sizeof(helper_qn), "%s.helper", player_qn);
+
+    int seq = gdbuf_count_edges_to_target_qn(g_gd_seq_gbuf, attack_qn, "CALLS", helper_qn);
+    int par = gdbuf_count_edges_to_target_qn(g_gd_par_gbuf, attack_qn, "CALLS", helper_qn);
+    ASSERT_EQ(seq, 1);
+    ASSERT_EQ(par, 1);
     PASS();
 }
 
@@ -1170,6 +1232,9 @@ SUITE(parallel) {
     RUN_TEST(gdscript_parallel_calls_parity);
     RUN_TEST(gdscript_parallel_inherits_parity);
     RUN_TEST(gdscript_parallel_imports_parity);
+    RUN_TEST(forced_pipeline_mode_auto_keeps_threshold_rule);
+    RUN_TEST(forced_pipeline_mode_sequential_overrides_parallel_eligible_repo);
+    RUN_TEST(forced_pipeline_mode_parallel_selects_gdscript_fixture);
     RUN_TEST(gdscript_parallel_imports_nested_preload_relative_path_regression);
     RUN_TEST(gdscript_parallel_calls_same_script_helper);
     RUN_TEST(gdscript_parallel_calls_signal_targets_player_receiver);
