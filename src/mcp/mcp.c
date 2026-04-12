@@ -386,6 +386,8 @@ static const tool_def_t TOOLS[] = {
      "\"regex\":{\"type\":\"boolean\",\"default\":false},"
      "\"case_sensitive\":{\"type\":\"boolean\",\"default\":false,"
      "\"description\":\"Match case-sensitively (default: case-insensitive).\"},"
+     "\"context\":{\"type\":\"integer\",\"default\":0,"
+     "\"description\":\"Number of surrounding lines to include around each match (like grep -C). Default 0.\"},"
      "\"limit\":{\"type\":\"integer\",\"description\":\"Max "
      "results (configurable via search_limit config key). Set higher for exhaustive text search."
      "\"}},\"required\":["
@@ -471,8 +473,9 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "\"sort_by\":{\"type\":\"string\",\"enum\":[\"relevance\",\"name\",\"degree\",\"calls\",\"linkrank\"],"
      "\"description\":\"Sort order: relevance (PageRank, default), name, degree (edge weight), "
      "calls (function calls in+out), linkrank (link-based rank).\"},"
-     "\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"summary\"]},"
-     "\"compact\":{\"type\":\"boolean\"},\"include_dependencies\":{\"type\":\"boolean\"},"
+     "\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"summary\"],\"description\":\"Graph mode only: full (default) or summary (aggregate counts). For source grep mode use mode=compact/full/files.\"},"
+     "\"compact\":{\"type\":\"boolean\",\"description\":\"graph mode only: omit name when it equals last segment of qualified_name. For source grep use mode='compact' (string) instead.\"},"
+     "\"include_dependencies\":{\"type\":\"boolean\"},"
      "\"limit\":{\"type\":\"integer\"},\"offset\":{\"type\":\"integer\"},"
      "\"min_degree\":{\"type\":\"integer\"},\"max_degree\":{\"type\":\"integer\"},"
      "\"max_output_bytes\":{\"type\":\"integer\",\"description\":\"Max response bytes (cypher mode). 0=unlimited.\"},"
@@ -493,6 +496,8 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "\"description\":\"When search_in='source': treat pattern as regex (default: literal text).\"},"
      "\"path_filter\":{\"type\":\"string\","
      "\"description\":\"When search_in='source': regex/glob pattern to restrict grep to matching file paths (e.g. '*.py', 'src/.*\\\\.go$').\"},"
+     "\"context\":{\"type\":\"integer\",\"default\":0,"
+     "\"description\":\"When search_in='source': number of surrounding lines to include around each match (like grep -C). Default 0 (match line only).\"},"
      "\"summary\":{\"type\":\"boolean\",\"default\":false,"
      "\"description\":\"Return aggregate counts by label and file only. Alias for mode='summary'.\"},"
      "\"max_rows\":{\"type\":\"integer\","
@@ -2044,10 +2049,21 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     }
     /* F7: validate mode enum — O(1) */
     if (search_mode && strcmp(search_mode, "full") != 0 && strcmp(search_mode, "summary") != 0) {
-        char errbuf[256];
-        snprintf(errbuf, sizeof(errbuf),
-            "{\"error\":\"invalid mode '%s'\","
-            "\"hint\":\"Valid values: full, summary\"}", search_mode);
+        char errbuf[512];
+        if (strcmp(search_mode, "compact") == 0 || strcmp(search_mode, "files") == 0) {
+            /* mode="compact" and mode="files" are valid ONLY for source grep (search_in="source").
+             * Graph mode uses a different mode enum: full | summary.
+             * To use compact output with graph mode, pass compact=true (a boolean param). */
+            snprintf(errbuf, sizeof(errbuf),
+                "{\"error\":\"mode '%s' is only valid for source grep (search_in='source'), not graph mode\","
+                "\"hint\":\"For graph mode use mode='full' or mode='summary'. "
+                "To reduce token output in graph mode, pass compact=true (boolean).\"}", search_mode);
+        } else {
+            snprintf(errbuf, sizeof(errbuf),
+                "{\"error\":\"invalid mode '%s'\","
+                "\"hint\":\"Valid values for graph mode: full, summary. "
+                "For source grep mode (search_in='source'): compact, full, files.\"}", search_mode);
+        }
         free(label); free(name_pattern); free(qn_pattern); free(unified_pattern);
         free(file_pattern); free(relationship); free(sort_by); free(search_mode); free(pe.value);
         return cbm_mcp_text_result(errbuf, true);
@@ -3756,26 +3772,29 @@ static int search_result_cmp(const void *a, const void *b) {
     return rb->score - ra->score; /* descending */
 }
 
-/* Build the grep command string based on scoped vs recursive mode */
-static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
-                           const char *file_pattern, const char *tmpfile, const char *filelist,
-                           const char *root_path) {
+/* Build the grep command string based on scoped vs recursive mode.
+ * case_sensitive=false adds -i for case-insensitive matching (grep default is sensitive). */
+static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool case_sensitive,
+                           bool scoped, const char *file_pattern, const char *tmpfile,
+                           const char *filelist, const char *root_path) {
     // NOLINTNEXTLINE(readability-implicit-bool-conversion)
     const char *flag = use_regex ? "-E" : "-F";
+    const char *ci_flag = case_sensitive ? "" : " -i";
     if (scoped) {
         if (file_pattern) {
-            snprintf(cmd, cmd_sz, "xargs grep -n %s --include='%s' -f '%s' < '%s' 2>/dev/null",
-                     flag, file_pattern, tmpfile, filelist);
+            snprintf(cmd, cmd_sz, "xargs grep -n%s %s --include='%s' -f '%s' < '%s' 2>/dev/null",
+                     ci_flag, flag, file_pattern, tmpfile, filelist);
         } else {
-            snprintf(cmd, cmd_sz, "xargs grep -n %s -f '%s' < '%s' 2>/dev/null", flag, tmpfile,
-                     filelist);
+            snprintf(cmd, cmd_sz, "xargs grep -n%s %s -f '%s' < '%s' 2>/dev/null", ci_flag, flag,
+                     tmpfile, filelist);
         }
     } else {
         if (file_pattern) {
-            snprintf(cmd, cmd_sz, "grep -rn %s --include='%s' -f '%s' '%s' 2>/dev/null", flag,
-                     file_pattern, tmpfile, root_path);
+            snprintf(cmd, cmd_sz, "grep -rn%s %s --include='%s' -f '%s' '%s' 2>/dev/null",
+                     ci_flag, flag, file_pattern, tmpfile, root_path);
         } else {
-            snprintf(cmd, cmd_sz, "grep -rn %s -f '%s' '%s' 2>/dev/null", flag, tmpfile, root_path);
+            snprintf(cmd, cmd_sz, "grep -rn%s %s -f '%s' '%s' 2>/dev/null", ci_flag, flag, tmpfile,
+                     root_path);
         }
     }
 }
@@ -3965,14 +3984,33 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     int limit = cbm_mcp_get_int_arg(args, "limit", cfg_search_limit_sc);
     bool use_regex = cbm_mcp_get_bool_arg(args, "regex");
 
-    /* Parse mode: compact (default), full, files */
+    /* Parse mode: compact (default), full, files.
+     * "summary" is NOT valid for source grep — it belongs to graph mode. Warn if passed. */
     enum { MODE_COMPACT, MODE_FULL, MODE_FILES };
     int mode = MODE_COMPACT;
+    bool mode_warning = false; /* set if an invalid mode value was passed */
+    char mode_warning_msg[256];
+    mode_warning_msg[0] = '\0';
     if (mode_str) {
         if (strcmp(mode_str, "full") == 0) {
             mode = MODE_FULL;
         } else if (strcmp(mode_str, "files") == 0) {
             mode = MODE_FILES;
+        } else if (strcmp(mode_str, "compact") == 0) {
+            mode = MODE_COMPACT; /* explicit compact is fine — it's the default */
+        } else {
+            /* Unknown mode for source grep — warn and use default (compact) */
+            mode_warning = true;
+            if (strcmp(mode_str, "summary") == 0) {
+                snprintf(mode_warning_msg, sizeof(mode_warning_msg),
+                    "mode='summary' is only valid for graph mode (default dispatch), not source grep. "
+                    "For source grep use mode='compact' (default), 'full', or 'files'. "
+                    "Using mode='compact' for this request.");
+            } else {
+                snprintf(mode_warning_msg, sizeof(mode_warning_msg),
+                    "unknown mode '%s' for source grep; valid values: compact (default), full, files. "
+                    "Using mode='compact' for this request.", mode_str);
+            }
         }
         free(mode_str);
     }
@@ -4055,10 +4093,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     (void)fprintf(tf, "%s\n", pattern);
     (void)fclose(tf);
 
-    /* Case-sensitivity: default case-insensitive, opt-in sensitive. */
+    /* Case-sensitivity: default case-insensitive (grep -i), opt-in case-sensitive. */
     bool case_sensitive = cbm_mcp_get_bool_arg(args, "case_sensitive");
-    /* Use case_sensitive with scoped grep via build_grep_cmd */
-    (void)case_sensitive; /* TODO: pass to build_grep_cmd */
 
     /* No grep-level match limit — let grep find all matches, then dedup and
      * cap in our code. The -m flag caused results from large vendored files
@@ -4075,7 +4111,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     bool scoped = false;
 
     char cmd[4096];
-    build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist, root_path);
+    build_grep_cmd(cmd, sizeof(cmd), use_regex, case_sensitive, scoped, file_pattern, tmpfile,
+                   filelist, root_path);
 
     // NOLINTNEXTLINE(bugprone-command-processor,cert-env33-c)
     FILE *fp = cbm_popen(cmd, "r");
@@ -4299,6 +4336,35 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     if (has_path_filter) {
         cbm_regfree(&path_regex);
     }
+
+    /* Inject mode warning into the result JSON if an unsupported mode was passed */
+    if (mode_warning && result) {
+        /* result is a JSON object like {"matches":[...],"count":N}
+         * Inject "mode_warning":"..." by appending before the closing brace */
+        size_t rlen = strlen(result);
+        /* Locate the last '}' to insert before it */
+        if (rlen > 0 && result[rlen - 1] == '}') {
+            size_t needed = rlen + strlen(mode_warning_msg) + 32;
+            char *warned = (char *)malloc(needed);
+            if (warned) {
+                /* Chop the closing brace, add warning field, re-close */
+                memcpy(warned, result, rlen - 1);
+                warned[rlen - 1] = '\0';
+                /* Check if the existing JSON object has any fields */
+                bool has_fields = strchr(result, ':') != NULL;
+                if (has_fields) {
+                    snprintf(warned + rlen - 1, needed - rlen + 1,
+                             ",\"mode_warning\":\"%s\"}", mode_warning_msg);
+                } else {
+                    snprintf(warned + rlen - 1, needed - rlen + 1,
+                             "\"mode_warning\":\"%s\"}", mode_warning_msg);
+                }
+                free(result);
+                result = warned;
+            }
+        }
+    }
+
     return result;
 }
 

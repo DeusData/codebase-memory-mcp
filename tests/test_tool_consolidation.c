@@ -5,6 +5,7 @@
  * get_code dispatch, project param path support, tool config visibility.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 #include "test_framework.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
@@ -1820,6 +1821,193 @@ TEST(project_missing_returns_structured_error) {
     PASS();
 }
 
+/* ── Bug fixes: search_code_graph mode/param sharp edges ───── */
+
+/* TDD Bug 1: case_sensitive=false must add -i to grep so uppercase patterns match lowercase.
+ * Before fix: build_grep_cmd has no -i flag → HELLO_WORLD misses hello_world → FAIL.
+ * After fix: build_grep_cmd adds -i when case_sensitive=false → match found → PASS. */
+TEST(source_grep_case_insensitive_by_default) {
+    /* Register a project in the store so get_project_root can resolve it */
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_ci_test_.db",
+             getenv("HOME"));
+    char proj_dir[256];
+    snprintf(proj_dir, sizeof(proj_dir), "%s/cbm_ci_test_%d", cbm_tmpdir(), (int)getpid());
+    cbm_mkdir_p(proj_dir, 0755);
+
+    /* Write a file with only lowercase content */
+    char src_path[320];
+    snprintf(src_path, sizeof(src_path), "%s/hello.c", proj_dir);
+    FILE *f = fopen(src_path, "w");
+    if (f) { fprintf(f, "void hello_world(void) {}\n"); fclose(f); }
+
+    /* Register project in store so get_project_root returns proj_dir */
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "_tc_ci_test_", proj_dir);
+    cbm_store_close(s);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* grep for UPPERCASE pattern with case_sensitive=false (default) */
+    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+        "{\"search_in\":\"source\",\"pattern\":\"HELLO_WORLD\","
+        "\"project\":\"_tc_ci_test_\",\"case_sensitive\":false}");
+    ASSERT_NOT_NULL(resp);
+    /* After fix: -i flag → case-insensitive grep finds "hello_world" via HELLO_WORLD */
+    bool found_match = strstr(resp, "hello") != NULL || strstr(resp, "hello_world") != NULL;
+    bool nonzero_count = strstr(resp, "\"count\":0") == NULL;
+    ASSERT_TRUE(found_match && nonzero_count);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    remove(src_path);
+    cbm_rmdir(proj_dir);
+    (void)unlink(db_path);
+    PASS();
+}
+
+/* TDD Bug 1b: case_sensitive=true must NOT add -i → uppercase pattern misses lowercase file.
+ * Pattern "HELLO_WORLD" vs file containing "hello_world" only → 0 matches. */
+TEST(source_grep_case_sensitive_flag_works) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_cs_test_.db",
+             getenv("HOME"));
+    char proj_dir[256];
+    snprintf(proj_dir, sizeof(proj_dir), "%s/cbm_cs_test_%d", cbm_tmpdir(), (int)getpid());
+    cbm_mkdir_p(proj_dir, 0755);
+
+    char src_path[320];
+    snprintf(src_path, sizeof(src_path), "%s/lower.c", proj_dir);
+    FILE *f = fopen(src_path, "w");
+    if (f) { fprintf(f, "void hello_world(void) {}\n"); fclose(f); }
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "_tc_cs_test_", proj_dir);
+    cbm_store_close(s);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+        "{\"search_in\":\"source\",\"pattern\":\"HELLO_WORLD\","
+        "\"project\":\"_tc_cs_test_\",\"case_sensitive\":true}");
+    ASSERT_NOT_NULL(resp);
+    /* After fix: no -i flag → case-sensitive grep must NOT find "hello_world" via "HELLO_WORLD" */
+    /* Response format uses "total_grep_matches" and "total_results" fields */
+    /* The outer wrapper JSON-encodes the inner result, so "key":val becomes \"key\":val in resp.
+     * Search for the escaped form: \\\" in C source == \" in bytes == the escaped JSON quote. */
+    ASSERT_NOT_NULL(strstr(resp, "\\\"total_grep_matches\\\":0"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    remove(src_path);
+    cbm_rmdir(proj_dir);
+    (void)unlink(db_path);
+    PASS();
+}
+
+/* TDD Bug 2: mode="compact" in graph mode returns an unhelpful error.
+ * After fix: error message must mention that "compact" belongs to source grep
+ * mode and explain the two separate mode enums. */
+TEST(graph_mode_compact_error_is_descriptive) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    /* mode="compact" is valid in source grep but invalid in graph mode */
+    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+        "{\"mode\":\"compact\",\"label\":\"Function\"}");
+    ASSERT_NOT_NULL(resp);
+    /* Must return an error (not crash or silent wrong result) */
+    ASSERT_NOT_NULL(strstr(resp, "error"));
+    /* After fix: error should mention source grep context — "source" or "search_in" */
+    bool mentions_source = strstr(resp, "source") != NULL ||
+                           strstr(resp, "search_in") != NULL ||
+                           strstr(resp, "grep") != NULL;
+    ASSERT_TRUE(mentions_source);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* TDD Bug 3: mode="summary" in source grep must produce a warning,
+ * not silently fall through to compact output.
+ * Before fix: response has no "mode_warning" → FAIL.
+ * After fix: response contains "mode_warning" field → PASS. */
+TEST(source_grep_mode_summary_warns) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_sm_test_.db",
+             getenv("HOME"));
+    char proj_dir[256];
+    snprintf(proj_dir, sizeof(proj_dir), "%s/cbm_sm_test_%d", cbm_tmpdir(), (int)getpid());
+    cbm_mkdir_p(proj_dir, 0755);
+
+    char src_path[320];
+    snprintf(src_path, sizeof(src_path), "%s/code.c", proj_dir);
+    FILE *f = fopen(src_path, "w");
+    if (f) { fprintf(f, "void foo(void) {}\n"); fclose(f); }
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "_tc_sm_test_", proj_dir);
+    cbm_store_close(s);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+        "{\"search_in\":\"source\",\"pattern\":\"foo\","
+        "\"project\":\"_tc_sm_test_\",\"mode\":\"summary\"}");
+    ASSERT_NOT_NULL(resp);
+    /* After fix: response must contain "mode_warning" key */
+    ASSERT_NOT_NULL(strstr(resp, "mode_warning"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    remove(src_path);
+    cbm_rmdir(proj_dir);
+    (void)unlink(db_path);
+    PASS();
+}
+
+/* TDD Bug 4: schema must document compact as graph-mode-only.
+ * Before fix: compact description has no mention of graph vs source distinction.
+ * After fix: compact description says "graph mode only". */
+TEST(schema_compact_documented_as_graph_only) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
+    ASSERT_NOT_NULL(resp);
+    /* The compact param description must mention it is graph-mode only */
+    /* Look for "graph" near "compact" in the schema — a substring search is sufficient */
+    bool compact_has_graph_note =
+        strstr(resp, "graph mode only") != NULL ||
+        strstr(resp, "graph-mode only") != NULL ||
+        strstr(resp, "graph mode; use mode") != NULL;
+    ASSERT_TRUE(compact_has_graph_note);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* TDD Bug 5: context param must appear in the search_code_graph schema.
+ * Before fix: schema has no "context" param → ASSERT fails (red).
+ * After fix: schema includes context param with description → ASSERT passes. */
+TEST(schema_has_context_param_for_source_grep) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
+    ASSERT_NOT_NULL(resp);
+    /* search_code_graph schema must include "context" param */
+    ASSERT_NOT_NULL(strstr(resp, "\"context\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* ── Suite registration ──────────────────────────────────── */
 
 SUITE(tool_consolidation) {
@@ -1923,4 +2111,11 @@ SUITE(tool_consolidation) {
     /* origin/main additions: path_filter param + structured error for missing project */
     RUN_TEST(path_filter_param_in_tool_schema);
     RUN_TEST(project_missing_returns_structured_error);
+    /* Bug fixes: search_code_graph mode/param sharp edges (TDD) */
+    RUN_TEST(source_grep_case_insensitive_by_default);
+    RUN_TEST(source_grep_case_sensitive_flag_works);
+    RUN_TEST(graph_mode_compact_error_is_descriptive);
+    RUN_TEST(source_grep_mode_summary_warns);
+    RUN_TEST(schema_compact_documented_as_graph_only);
+    RUN_TEST(schema_has_context_param_for_source_grep);
 }
