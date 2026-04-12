@@ -14,6 +14,13 @@
 - [x] Every resolved proof miss is covered by the narrowest appropriate regression layer.
 - [x] `make -f Makefile.cbm cbm` passes from `.worktrees/gdscript-support/`.
 - [x] `make -f Makefile.cbm test` passes from `.worktrees/gdscript-support/`.
+- [x] `scripts/gdscript-proof.sh` remains the only approval-bearing workflow for Phase 03 review.
+- [x] Approval evidence covers all four manifest repos: `squash-the-creeps`, `webrtc-signaling`, `webrtc-minimal`, and `topdown-starter`.
+- [x] Approval evidence includes both `sequential` and `parallel` runs for every manifest repo.
+- [x] `semantic-parity.json` and `semantic-parity.md` are present and reviewed for every approval-bearing manifest run.
+- [x] `SEM-01` review requires non-zero class and method counts plus representative class and method samples.
+- [x] `SEM-06` review is semantic parity across counts plus representative samples/edges, not byte-for-byte artifact equality.
+- [x] When parity results are `incomplete`, operators inspect `run-index.json`, paired `repo-meta.json`, and wrapper `queries/*.json` before making approval decisions.
 
 ## Current notes
 
@@ -22,6 +29,8 @@
 - Manifest mode now has fresh evidence for `pass`, `fail`, and `incomplete`.
 - Fresh aggregate proof pass for all manifest assertions: `.artifacts/gdscript-proof/20260408T043206Z-14613-9mUP0e`.
 - Dedicated proof-harness regression now covers the closed `calls.same_script_edges` miss: `scripts/test_gdscript_proof_same_script_calls.py` runs under exact `make -f Makefile.cbm test`.
+- Phase 03 semantic review is now counts-plus-samples across the four pinned repos in both sequential and parallel mode.
+- `semantic-parity.json` is the machine-readable parity surface; `semantic-parity.md` is the human-readable rollup; wrapper `queries/*.json` stay canonical raw evidence.
 - GDScript promotion is now justified for manifest-validated README wording, but not as a scored benchmark language in `docs/BENCHMARK.md`.
 
 ## Promotion gate

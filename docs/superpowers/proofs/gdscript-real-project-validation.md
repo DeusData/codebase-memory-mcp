@@ -50,7 +50,7 @@ Rules:
 
 ## Manifest mode contract
 
-Manifest mode is the only approval-bearing workflow for v1 good-tier proof. The manifest defines:
+Manifest mode through `scripts/gdscript-proof.sh` is the only approval-bearing workflow for v1 good-tier proof. The manifest defines:
 - the curated repo labels,
 - the optional `project_subpath` for proof targets that share an upstream repo,
 - pinned commits,
@@ -224,7 +224,10 @@ Manifest mode now produces one sequential artifact and one parallel artifact for
 2. Confirm each paired `repo-meta.json` records `requested_mode`, `actual_mode`, and `comparison_label`.
 3. Use the paired `queries/*.json` files as the canonical raw evidence source.
 4. Open `semantic-parity.json` or `semantic-parity.md` to review additive parity outcomes for `SEM-01` through `SEM-06`.
-5. Treat `semantic-parity.*` as counts-plus-samples review surfaces only; if anything looks wrong, fall back to the paired wrapper files instead of trusting the rollup blindly.
+5. For `SEM-01`, require non-zero class and method counts in both modes plus representative class and method samples from the paired wrappers.
+6. For `SEM-02` through `SEM-05`, review semantic comparison entries from `semantic-parity.json` or `semantic-parity.md` and confirm the representative edge samples remain meaningfully the same in sequential and parallel mode.
+7. Treat `SEM-06` as semantic comparison only: counts plus representative samples and edges must stay consistent across modes. Do not require byte-for-byte artifact equality, and do not accept aggregate manifest pass/fail alone as sufficient evidence.
+8. If any parity result is `incomplete`, inspect `run-index.json`, the paired `repo-meta.json` files, and the wrapper `queries/*.json` evidence before deciding whether the run is reviewable.
 
 ### Per-repo `summary.md`
 
@@ -289,12 +292,16 @@ It also prints `Proof run root: ...` on stdout so you can jump directly to the l
 - Confirm `run-index.json` points to `queries/*.json` wrapper files instead of replacing them; the wrapper JSON files remain the canonical raw evidence set.
 - Confirm `run-index.json` exposes `requested_mode`, `actual_mode`, `comparison_label`, and `semantic_pairs` for every approval-bearing manifest label.
 - Confirm `semantic-parity.*` reports sequential-vs-parallel counts and representative samples for classes, methods, same-script calls, inherits, imports, and signal calls.
+- Confirm `scripts/gdscript-proof.sh` remains the only approval-bearing workflow; do not substitute ad hoc MCP commands or a second verifier.
+- Confirm approval coverage includes all four manifest repos (`squash-the-creeps`, `webrtc-signaling`, `webrtc-minimal`, and `topdown-starter`) in both `sequential` and `parallel` mode.
+- Confirm `SEM-01` review includes non-zero class and method counts plus representative class/method samples, not counts alone.
+- Confirm `SEM-06` is judged by semantic consistency in `semantic-parity.json` / `semantic-parity.md`, not byte-for-byte artifact equality.
 - Confirm approval-bearing evidence came from manifest mode rather than ad hoc `--repo` selection.
 - Confirm every approval-bearing repo summary exposes the canonical identity tuple (`remote`, `pinned_commit`, `project_subpath` when needed, `godot_version`).
 - Confirm labels are presented as readability metadata and local checkout paths as run evidence only.
 - Confirm approved targets are explicitly labeled Godot 4.x qualifying, and non-manifest/debug runs are explicitly labeled non-canonical/non-qualifying.
 - In manifest mode, confirm the aggregate summary clearly distinguishes `pass`, `fail`, and `incomplete`.
-- If a repo or run is `incomplete`, inspect `run-index.json`, `repo-meta.json`, and any already-written `queries/*.json` wrappers for failure context and missing query status before considering manual database inspection.
+- If a repo or run is `incomplete`, inspect `run-index.json`, the paired `repo-meta.json` files, and any already-written `queries/*.json` wrappers for failure context and missing query status before considering manual database inspection.
 - After every manifest run, immediately update:
   - `docs/superpowers/proofs/gdscript-good-tier-misses.md`
   - `docs/superpowers/proofs/gdscript-good-tier-checklist.md`
