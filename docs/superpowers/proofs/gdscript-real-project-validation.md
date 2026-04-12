@@ -4,38 +4,33 @@ Related issue: https://github.com/DeusData/codebase-memory-mcp/issues/186
 
 ## Purpose
 
-Use this runbook to generate reproducible, local-only proof that the GDScript indexing changes work on real Godot repositories.
+Use this runbook to generate reproducible, local-only proof for GDScript support from the `gdscript-support` worktree.
 
-The proof workflow:
-- runs from the `gdscript-support` worktree
-- builds and uses the local `codebase-memory-mcp` binary under test
-- writes all runtime state and proof artifacts under `.artifacts/gdscript-proof/`
-- supports one or more local Godot repos in a single run
-- produces per-repo `summary.md` files plus one `aggregate-summary.md`
+The workflow:
+- builds and uses the local `build/c/codebase-memory-mcp` binary under test,
+- writes all runtime state and proof artifacts under `.artifacts/gdscript-proof/`,
+- supports one or more local Godot repos in a single run,
+- can run in legacy coarse-coverage mode or manifest-driven good-tier mode,
+- produces per-repo `summary.md` files plus one `aggregate-summary.md`.
+
+The committed good-tier manifest currently tracks 4 pinned proof targets across 2 remotes. When a single upstream repo hosts multiple proof targets, the manifest records a `project_subpath` to keep the target reproducible.
 
 Do not commit generated proof artifacts.
 
 ## Prerequisites
 
 - Work from the `gdscript-support` worktree.
-- Have one or more local Godot repositories available by path.
+- Have one or more local Godot repositories available by path. The recommended local checkout root is `.artifacts/gdscript-proof/repos/`.
 - Have the local build prerequisites needed for `make -f Makefile.cbm cbm`.
-- Be ready to provide Godot version metadata for any repo you want to count toward the Godot 4.x indexing requirement.
+- For manifest mode, have a committed manifest such as `docs/superpowers/proofs/gdscript-good-tier-manifest.json`.
 
-The script builds the binary automatically at run start and uses:
-
-- `build/c/codebase-memory-mcp`
-
-Runtime state is separated per artifact slug under the run root (`HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`).
-
-Artifact slugs are derived from a sanitized repo label/basename, short commit/ref (or `unavailable`), and a stable path-hash suffix, so separate repos cannot collide even when names/refs match.
+Runtime state is isolated per repo under the run root with per-repo `HOME`, `XDG_CONFIG_HOME`, and `XDG_CACHE_HOME`.
 
 ## Accepted arguments
 
-Usage:
-
 ```bash
 bash scripts/gdscript-proof.sh \
+  [--manifest docs/superpowers/proofs/gdscript-good-tier-manifest.json] \
   --repo /abs/path/to/repo \
   [--repo /abs/path/to/repo2 ...] \
   [--godot-version REPO=4.x] \
@@ -43,43 +38,91 @@ bash scripts/gdscript-proof.sh \
 ```
 
 Rules:
-
 - `--repo` is required at least once.
 - `--repo` may be repeated.
-- `--godot-version` and `--label` use `REPO=value` form.
-- `--godot-version` and `--label` must reference a repo path already declared with `--repo`.
-- Repo paths are canonicalized to absolute paths.
+- `--label` and `--godot-version` use `REPO=value` form.
+- `--label` and `--godot-version` must reference a repo path already declared with `--repo`.
+- Repo and manifest paths are canonicalized to absolute paths.
+- In manifest mode, every repo should have a label and every label must exist in the manifest.
+- In manifest mode, missing `--godot-version` metadata is filled from the manifest when available.
 
-Examples of accepted Godot version values:
+## Manifest mode contract
 
-- `4.2`
-- `v4.2`
-- `Godot 4.2`
-- `3.5`
+Manifest mode is the only approval-bearing workflow for v1 good-tier proof. The manifest defines:
+- the curated repo labels,
+- the optional `project_subpath` for proof targets that share an upstream repo,
+- pinned commits,
+- canonical approval metadata,
+- per-repo `required_for` categories,
+- gating assertions,
+- informational assertions,
+- minimum repo count.
 
-## Required repo metadata
+For approval-bearing manifest entries, canonical target identity is:
 
-For each repo, capture or provide:
+- `remote`
+- `pinned_commit`
+- `project_subpath` when one upstream repo hosts multiple proof targets
+- recorded `godot_version`
 
-- local repo path
-- repo commit/ref under test
-- Godot version if known
-- optional human-friendly label
+Additional identity rules:
 
-At least one contributing repo must be a confirmed Godot 4.x repo for final issue #186 acceptance.
+- `label` is readability metadata only; it is not canonical identity.
+- Local checkout path is run evidence only; it changes per machine/run and is not part of target identity.
+- Only entries with explicitly recorded Godot `4.x` metadata qualify for v1 approval.
+- Ad hoc `--repo` runs remain allowed for debugging/investigation, but they are non-canonical and non-qualifying unless they are executed through the committed manifest lane.
+
+The script compares actual results to the manifest and classifies:
+- each assertion as `pass`, `fail`, or `incomplete`,
+- each repo as `pass`, `fail`, or `incomplete`,
+- the aggregate run as `pass`, `fail`, or `incomplete`.
+
+Manifest-mode incompleteness includes cases such as:
+- missing required repos,
+- labels missing from the manifest,
+- pinned commit mismatches,
+- indexing or query capture failures,
+- unreadable or missing metadata,
+- unparsable query outputs.
+
+Manifest-mode aggregate rules:
+- `pass` only when all gating assertions pass and no comparability issue exists,
+- `fail` when at least one gating assertion fails and nothing is incomplete,
+- `incomplete` when the run is not comparable.
+
+The script exits `0` only for aggregate `pass`.
 
 ## Example commands
 
-### Single-repo run
+### Single-repo manifest lane
+
+Useful when checking one manifest repo in isolation while debugging:
 
 ```bash
 bash scripts/gdscript-proof.sh \
-  --repo /absolute/path/to/real-godot-repo \
-  --godot-version /absolute/path/to/real-godot-repo=Godot\ 4.2 \
-  --label /absolute/path/to/real-godot-repo=primary
+  --manifest docs/superpowers/proofs/gdscript-good-tier-manifest.json \
+  --repo "$PWD/.artifacts/gdscript-proof/repos/TopdownStarter" \
+  --label "$PWD/.artifacts/gdscript-proof/repos/TopdownStarter=topdown-starter"
 ```
 
-### Multi-repo run
+This normally yields aggregate `incomplete` because required manifest repos are missing from the run.
+
+### Full good-tier manifest run
+
+```bash
+bash scripts/gdscript-proof.sh \
+  --manifest docs/superpowers/proofs/gdscript-good-tier-manifest.json \
+  --repo "$PWD/.artifacts/gdscript-proof/repos/godot-demo-projects/3d/squash_the_creeps" \
+  --label "$PWD/.artifacts/gdscript-proof/repos/godot-demo-projects/3d/squash_the_creeps=squash-the-creeps" \
+  --repo "$PWD/.artifacts/gdscript-proof/repos/godot-demo-projects/networking/webrtc_signaling" \
+  --label "$PWD/.artifacts/gdscript-proof/repos/godot-demo-projects/networking/webrtc_signaling=webrtc-signaling" \
+  --repo "$PWD/.artifacts/gdscript-proof/repos/godot-demo-projects/networking/webrtc_minimal" \
+  --label "$PWD/.artifacts/gdscript-proof/repos/godot-demo-projects/networking/webrtc_minimal=webrtc-minimal" \
+  --repo "$PWD/.artifacts/gdscript-proof/repos/TopdownStarter" \
+  --label "$PWD/.artifacts/gdscript-proof/repos/TopdownStarter=topdown-starter"
+```
+
+### Legacy coarse-coverage run
 
 ```bash
 bash scripts/gdscript-proof.sh \
@@ -88,19 +131,10 @@ bash scripts/gdscript-proof.sh \
   --label /absolute/path/to/repo-a=signals \
   --repo /absolute/path/to/repo-b \
   --godot-version /absolute/path/to/repo-b=4.2 \
-  --label /absolute/path/to/repo-b=inherits \
-  --repo /absolute/path/to/repo-c \
-  --godot-version /absolute/path/to/repo-c=4.2 \
-  --label /absolute/path/to/repo-c=imports
+  --label /absolute/path/to/repo-b=imports
 ```
 
-Use multiple repos when one repo does not provide all required categories.
-
-## What qualifies a repo as Godot 4.x evidence
-
-- A repo with confirmed Godot 4.x metadata may satisfy the indexing requirement.
-- A repo with unknown version may still count for signal/imports/inherits coverage if the repo is complete, but it does not count for the Godot 4.x indexing requirement.
-- A repo confirmed as Godot 3.x does not count toward any acceptance category.
+Without `--manifest`, the script preserves the old coarse category coverage behavior.
 
 ## Local artifact layout
 
@@ -132,32 +166,32 @@ Each run creates a unique local artifact root:
       signal-calls.json
       gd-inherits.json
       gd-imports.json
+      signal-call-edges.json
+      gd-inherits-edges.json
+      gd-import-edges.json
+      gd-same-script-calls.json
     summary.md
 ```
 
-All runtime state for the proof run lives under this artifact root.
+`env.txt` records the run root, worktree under test, binary path, manifest path if present, and the repo metadata passed to the script.
 
-Per repo, command execution uses:
+## Query suite and outputs
 
-- `HOME=<run>/state/<artifact-slug>/home`
-- `XDG_CONFIG_HOME=<run>/state/<artifact-slug>/config`
-- `XDG_CACHE_HOME=<run>/state/<artifact-slug>/cache`
-
-## Query suite and output files
-
-The script always captures these eight query wrapper files per complete repo:
-
-- `gd-files.json` (`gd-files`)
-- `gd-classes.json` (`gd-classes`)
-- `gd-methods.json` (`gd-methods`)
-- `gd-class-sample.json` (`gd-class-sample`)
-- `gd-method-sample.json` (`gd-method-sample`)
-- `signal-calls.json` (`signal-calls`)
-- `gd-inherits.json` (`gd-inherits`)
-- `gd-imports.json` (`gd-imports`)
+The script captures these wrapper files per complete repo:
+- `gd-files.json`
+- `gd-classes.json`
+- `gd-methods.json`
+- `gd-class-sample.json`
+- `gd-method-sample.json`
+- `signal-calls.json`
+- `gd-inherits.json`
+- `gd-imports.json`
+- `signal-call-edges.json`
+- `gd-inherits-edges.json`
+- `gd-import-edges.json`
+- `gd-same-script-calls.json`
 
 Each wrapper file records:
-
 - `query_name`
 - `project_id`
 - `artifact_slug`
@@ -168,86 +202,54 @@ Each wrapper file records:
 
 ### Per-repo `summary.md`
 
-Each repo summary reports:
+Legacy mode reports coarse repo completeness and category contributions.
 
-- repo path, name, slug, and resolved project ID
-- git ref / commit / branch
-- Godot version and qualification status
-- indexing / project-resolution / overall status
-- CLI capture mode and fallback note if applicable
-- `.gd` file / class / method counts
-- signal call / inherits / imports counts
-- whether the repo contributes to indexing, signal, imports, and inherits coverage
-- short proof notes
-- incomplete or failed status details when applicable
-
-`repo_complete=true` means:
-
-- indexing succeeded
-- project resolution succeeded
-- overall repo status is `complete`
-- `project_id` is present
-- all eight query wrapper files were written and parsed successfully
+Manifest mode reports:
+- repo path, slug, manifest label, and resolved project ID,
+- actual and pinned commit,
+- pinned-commit match,
+- Godot version,
+- repo completeness,
+- repo outcome,
+- required-for categories,
+- CLI capture mode and fallback note,
+- a comparability-issues section when the repo is incomplete,
+- a `Gating assertions` table,
+- an `Informational assertions` table.
 
 ### `aggregate-summary.md`
 
-The aggregate summary reports:
+Manifest mode reports:
+- worktree / branch / commit under test,
+- binary path and build status,
+- manifest path,
+- final aggregate outcome,
+- aggregate pass boolean,
+- aggregate note,
+- gating and informational totals,
+- one repo table with label, slug, outcome, required-for, pinned commit, actual commit, and notes.
 
-- codebase-memory-mcp worktree / branch / commit under test
-- binary path and build status
-- all repos processed
-- which repos contributed to each coverage category
-- final acceptance result
-- exact missing coverage categories when the run fails
-
-Coverage rules are:
-
-```text
-indexing_coverage = any repo where repo_complete && godot_version_qualifies && gd_files > 0 && gd_classes > 0 && gd_methods > 0
-signal_coverage = any repo where repo_complete && signal_calls > 0
-imports_coverage = any repo where repo_complete && gd_deps > 0
-inherits_coverage = any repo where repo_complete && gd_inherits_edges > 0
-aggregate_pass = indexing_coverage && signal_coverage && imports_coverage && inherits_coverage
-```
-
-Additional rules:
-
-- only a confirmed Godot 4.x repo may satisfy `indexing_coverage`
-- unknown-version repos may satisfy signal/imports/inherits coverage if complete
-- confirmed Godot 3.x repos never contribute to any category
-- incomplete repos never contribute to any category
+Legacy mode continues to report the older indexing / signal / imports / inherits coverage categories.
 
 ## Exit codes
 
-- Exit `0`: aggregate acceptance passed.
-- Non-zero exit: aggregate acceptance failed, all candidates failed, or at least one required category is still missing.
+- Exit `0`: aggregate outcome is `pass`.
+- Non-zero exit: aggregate outcome is `fail` or `incomplete`.
 
-The script attempts all candidate repos before deciding the final exit code.
+The script still attempts all candidate repos before deciding the final exit code.
 It also prints `Proof run root: ...` on stdout so you can jump directly to the latest artifact directory.
 
-## External reporting checklist
-
-When reporting proof in an issue, PR, or review comment, include:
-
-- artifact root path used for the final run
-- repo path for each contributing repo
-- repo commit/ref for each contributing repo
-- Godot version metadata for each contributing repo
-- `.gd` file / class / method counts for the qualifying Godot 4.x repo
-- signal call count from the repo that satisfied signal coverage
-- `.gd` import count from the repo that satisfied imports coverage
-- `.gd` inheritance count from the repo that satisfied inherits coverage
-- final aggregate pass/fail result
-- path to `aggregate-summary.md`
-
-## Verification checklist for operators
+## Operator checklist
 
 - Confirm `.artifacts/gdscript-proof/` stays ignored by git.
 - Confirm the latest run wrote `aggregate-summary.md`.
-- Confirm each contributing repo has `summary.md` and `repo-meta.json`.
-- Confirm the aggregate summary explicitly shows:
-  - one confirmed Godot 4.x repo satisfying indexing coverage
-  - one or more complete repos satisfying signal coverage
-  - one or more complete repos satisfying imports coverage
-  - one or more complete repos satisfying inherits coverage
-- Confirm the final exit code matches the aggregate result.
+- Confirm each processed repo has `summary.md` and `repo-meta.json`.
+- Confirm approval-bearing evidence came from manifest mode rather than ad hoc `--repo` selection.
+- Confirm every approval-bearing repo summary exposes the canonical identity tuple (`remote`, `pinned_commit`, `project_subpath` when needed, `godot_version`).
+- Confirm labels are presented as readability metadata and local checkout paths as run evidence only.
+- Confirm approved targets are explicitly labeled Godot 4.x qualifying, and non-manifest/debug runs are explicitly labeled non-canonical/non-qualifying.
+- In manifest mode, confirm the aggregate summary clearly distinguishes `pass`, `fail`, and `incomplete`.
+- After every manifest run, immediately update:
+  - `docs/superpowers/proofs/gdscript-good-tier-misses.md`
+  - `docs/superpowers/proofs/gdscript-good-tier-checklist.md`
+- If the aggregate run is not `pass`, do not promote README or benchmark claims.
