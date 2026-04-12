@@ -216,6 +216,16 @@ Use `run-index.json` to locate wrapper files quickly; use the wrapper files them
 
 ## How to read the outputs
 
+For manifest-mode review, read the generated summaries in this order:
+
+1. Open `aggregate-summary.md` and review `## Promotion decision` before totals, repo tables, or assertion counts.
+2. Confirm the summary states one of the exact promotion-safe answers:
+   - `Promotion answer: qualified-support-only`
+   - `Promotion answer: do-not-promote`
+3. Confirm the scope line reads `Claim scope: approved manifest corpus only; current commit only` before treating a `pass` run as approval-bearing evidence.
+4. If the aggregate run is `fail` or `incomplete`, treat `Promotion answer: do-not-promote` as mandatory until the listed blocking issues are resolved.
+5. Then inspect each per-repo `summary.md` plus the linked raw artifacts (`repo-meta.json`, `run-index.json`, and wrapper `queries/*.json`) to understand the evidence behind the verdicts.
+
 ## Sequential vs parallel semantic parity
 
 Manifest mode now produces one sequential artifact and one parallel artifact for every approved manifest label. Review them in this order:
@@ -239,16 +249,25 @@ Manifest mode reports:
 - pinned-commit match,
 - Godot version,
 - repo completeness,
-- repo outcome,
+- `## Verdict`,
+- `Repo verdict: pass|fail|incomplete`,
+- `Approval contribution: counts-toward-qualified-support|does-not-count-toward-promotion`,
 - required-for categories,
 - CLI capture mode and fallback note,
 - a comparability-issues section when the repo is incomplete,
 - a `Gating assertions` table,
 - an `Informational assertions` table.
 
+Use the per-repo `## Verdict` block as the operator-facing summary of whether that repo contributes approval-bearing evidence. A repo can only support promotion when its `Repo verdict` is `pass` and its `Approval contribution` says `counts-toward-qualified-support`. Any `fail` or `incomplete` repo must read as `does-not-count-toward-promotion`.
+
 ### `aggregate-summary.md`
 
 Manifest mode reports:
+- `## Promotion decision`,
+- `Promotion answer: qualified-support-only` only when the aggregate run is `pass`,
+- `Promotion answer: do-not-promote` whenever the aggregate run is `fail` or `incomplete`,
+- `Claim scope: approved manifest corpus only; current commit only`,
+- promotion rationale tied to the current manifest evidence,
 - worktree / branch / commit under test,
 - binary path and build status,
 - manifest path,
@@ -259,6 +278,8 @@ Manifest mode reports:
 - one repo table with label, slug, outcome, required-for, pinned commit, actual commit, and notes.
 
 Legacy mode continues to report the older indexing / signal / imports / inherits coverage categories.
+
+Treat this section as a decision memo, not just a status log. Review `## Promotion decision` first, then use the totals and repo table to validate why the run did or did not justify the stated promotion answer.
 
 ### `run-index.json`
 
@@ -301,6 +322,10 @@ It also prints `Proof run root: ...` on stdout so you can jump directly to the l
 - Confirm labels are presented as readability metadata and local checkout paths as run evidence only.
 - Confirm approved targets are explicitly labeled Godot 4.x qualifying, and non-manifest/debug runs are explicitly labeled non-canonical/non-qualifying.
 - In manifest mode, confirm the aggregate summary clearly distinguishes `pass`, `fail`, and `incomplete`.
+- In manifest mode, confirm `## Promotion decision` appears before the totals and repo table.
+- Confirm aggregate `pass` uses `Promotion answer: qualified-support-only` and includes `Claim scope: approved manifest corpus only; current commit only`.
+- Confirm aggregate `fail` and aggregate `incomplete` both use `Promotion answer: do-not-promote`.
+- Confirm each per-repo summary includes `## Verdict`, `Repo verdict: ...`, and `Approval contribution: ...` before relying on its evidence for promotion review.
 - If a repo or run is `incomplete`, inspect `run-index.json`, the paired `repo-meta.json` files, and any already-written `queries/*.json` wrappers for failure context and missing query status before considering manual database inspection.
 - After every manifest run, immediately update:
   - `docs/superpowers/proofs/gdscript-good-tier-misses.md`

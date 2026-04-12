@@ -31,10 +31,17 @@
 - Dedicated proof-harness regression now covers the closed `calls.same_script_edges` miss: `scripts/test_gdscript_proof_same_script_calls.py` runs under exact `make -f Makefile.cbm test`.
 - Phase 03 semantic review is now counts-plus-samples across the four pinned repos in both sequential and parallel mode.
 - `semantic-parity.json` is the machine-readable parity surface; `semantic-parity.md` is the human-readable rollup; wrapper `queries/*.json` stay canonical raw evidence.
-- GDScript promotion is now justified for manifest-validated README wording, but not as a scored benchmark language in `docs/BENCHMARK.md`.
+- Aggregate `pass` only supports `Promotion answer: qualified-support-only` for the approved manifest corpus on the current commit under test.
+- Aggregate `fail` and aggregate `incomplete` both require `Promotion answer: do-not-promote` until the blocking issues are resolved.
+- GDScript promotion is now justified for manifest-validated README wording only when the summary uses the qualified-support-only contract, not as a scored benchmark language in `docs/BENCHMARK.md`.
 
 ## Promotion gate
 
-- [x] README language-tier wording is backed by the manifest-driven proof.
-- [x] `docs/BENCHMARK.md` is updated only if the scored-tier claim is actually justified.
+- [x] For aggregate `pass`, `aggregate-summary.md` says `Promotion answer: qualified-support-only`.
+- [x] For aggregate `pass`, `aggregate-summary.md` also says `Claim scope: approved manifest corpus only; current commit only`.
+- [x] For aggregate `fail`, `aggregate-summary.md` says `Promotion answer: do-not-promote`.
+- [x] For aggregate `incomplete`, `aggregate-summary.md` says `Promotion answer: do-not-promote`.
+- [x] Each repo `summary.md` includes `## Verdict`, `Repo verdict: ...`, and `Approval contribution: ...` before the evidence is used for promotion review.
+- [x] README language-tier wording is updated only when the manifest-driven proof supports `qualified-support-only`.
+- [x] `docs/BENCHMARK.md` is updated only if the scored-tier claim is actually justified beyond the qualified-support-only contract.
 - [x] Remaining limitations are documented honestly.
