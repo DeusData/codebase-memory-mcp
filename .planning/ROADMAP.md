@@ -76,8 +76,8 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 04-01-PLAN.md — Add regression-backed repo verdict sections and promotion-first aggregate summary wording in the canonical proof harness.
-- [ ] 04-02-PLAN.md — Update the runbook, checklist, and misses tracker for the new verdict and promotion contract.
+- [x] 04-01-PLAN.md — Add regression-backed repo verdict sections and promotion-first aggregate summary wording in the canonical proof harness.
+- [x] 04-02-PLAN.md — Update the runbook, checklist, and misses tracker for the new verdict and promotion contract.
 
 ## Progress
 
@@ -89,4 +89,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | 1. Proof Contract & Corpus | 2/2 | Complete | 2026-04-12 |
 | 2. Isolated Proof Harness | 2/2 | Complete | 2026-04-12 |
 | 3. Real-Repo Semantic Verification | 3/3 | Complete | 2026-04-12 |
-| 4. Verdicts & Acceptance Summaries | 0/TBD | Not started | - |
+| 4. Verdicts & Acceptance Summaries | 0/2 | Planned | - |
