@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 2 context gathered
-last_updated: "2026-04-12T08:01:34.984Z"
+stopped_at: Completed 03-01-PLAN.md
+last_updated: "2026-04-12T16:59:21.167Z"
 last_activity: 2026-04-12
 progress:
   total_phases: 4
   completed_phases: 2
-  total_plans: 4
-  completed_plans: 4
-  percent: 100
+  total_plans: 7
+  completed_plans: 5
+  percent: 71
 ---
 
 # Project State
@@ -21,13 +21,13 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-11)
 
 **Core value:** A real Godot demo project indexes cleanly and yields useful GDScript answers through the parser-to-MCP path.
-**Current focus:** Phase 02 — isolated-proof-harness
+**Current focus:** Phase 03 — real-repo-semantic-verification
 
 ## Current Position
 
-Phase: 03
-Plan: Not started
-Status: Executing Phase 02
+Phase: 03 (real-repo-semantic-verification) — EXECUTING
+Plan: 2 of 3
+Status: Ready to execute
 Last activity: 2026-04-12
 
 Progress: [░░░░░░░░░░] 0%
@@ -54,6 +54,7 @@ Progress: [░░░░░░░░░░] 0%
 
 | Phase 01 P01 | 0 min | 2 tasks | 4 files |
 | Phase 01 P02 | 0 min | 2 tasks | 3 files |
+| Phase 03 P01 | 17 min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -69,6 +70,8 @@ Recent decisions affecting current work:
 - [Phase 01]: Canonical proof identity is remote + pinned_commit + project_subpath when needed + recorded godot_version.
 - [Phase 01]: Manifest-mode proof output emits canonical identity fields directly in repo-meta.json and summaries.
 - [Phase 01]: Ad hoc proof runs remain executable but are labeled non-canonical and non-qualifying.
+- [Phase 03]: Expose cbm_pipeline_select_mode in pipeline_internal.h so runtime selection and native regressions share one contract.
+- [Phase 03]: Treat forced parallel without worker capacity as an explicit error instead of silently falling back to sequential.
 
 ### Pending Todos
 
@@ -76,11 +79,10 @@ None yet.
 
 ### Blockers/Concerns
 
-- Need planning work to confirm the curated Godot demo target set covers all required v1 behaviors.
-- Need planning work to define how much parity evidence is required for sequential vs parallel acceptance.
+- Need planning work to confirm the current four-repo manifest corpus is exercised in a way that cleanly demonstrates all `SEM-01` through `SEM-06` behaviors across both indexing modes.
 
 ## Session Continuity
 
-Last session: 2026-04-12T07:33:25.118Z
-Stopped at: Phase 2 context gathered
-Resume file: .planning/phases/02-isolated-proof-harness/02-CONTEXT.md
+Last session: 2026-04-12T16:59:21.164Z
+Stopped at: Completed 03-01-PLAN.md
+Resume file: None
