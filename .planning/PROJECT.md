@@ -18,6 +18,7 @@ A real Godot demo project indexes cleanly and yields useful GDScript answers thr
 - ✓ Maintainer can run validation against pinned real Godot 4.x demo targets with recorded repo identity and project subpath when needed — Validated in Phase 1: Proof Contract & Corpus
 - ✓ Maintainer has a reproducible, isolated proof path with machine-readable raw MCP evidence and incomplete-run diagnostics — Validated in Phase 2: Isolated Proof Harness
 - ✓ Maintainer can verify real-repo GDScript definitions, relationships, and sequential-versus-parallel parity through approval-bearing proof artifacts, regressions, and a forced-parallel lifetime fix — Validated in Phase 3: Real-Repo Semantic Verification
+- ✓ Each proof target now emits an explicit `pass`, `fail`, or `incomplete` verdict with a per-repo summary and promotion-safe aggregate guidance — Validated in Phase 4: Verdicts & Acceptance Summaries
 
 ### Active
 
@@ -38,7 +39,7 @@ Brownfield planning docs already exist under `.planning/codebase/`, and the repo
 
 ## Current State
 
-Phase 3 complete — the proof harness now runs approved real repos in both sequential and parallel modes, emits additive `semantic-parity.json` and `semantic-parity.md`, locks the review bar in with proof regressions plus operator checklists, and keeps forced-parallel incremental runs stable after the worker-lifetime cleanup fix.
+Phase 4 complete — the proof harness now emits explicit per-repo verdicts and a promotion-first aggregate decision block, while the runbook, checklist, and misses tracker document the exact qualified-support-only versus do-not-promote contract for the approved manifest corpus on the current commit.
 
 ## Constraints
 
@@ -74,4 +75,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-12 after Phase 3 completion*
+*Last updated: 2026-04-12 after Phase 4 completion*
