@@ -42,7 +42,11 @@ Plans:
   2. After indexing a proof target, the workflow automatically runs the fixed MCP query suite needed for v1 validation.
   3. Maintainer can inspect machine-readable raw query artifacts for every proof target without needing to query the database manually.
   4. Re-running the same proof target on the same machine produces comparable artifact structure and evidence locations.
-**Plans**: TBD
+**Plans**: 2 plans
+
+Plans:
+- [ ] 02-01-PLAN.md — Add a run-level machine-readable evidence index and preserve incomplete-path artifact status in the existing proof harness.
+- [ ] 02-02-PLAN.md — Document the additive evidence contract and add regressions for successful and incomplete proof runs.
 
 ### Phase 3: Real-Repo Semantic Verification
 **Goal**: Maintainers can verify that real Godot demo projects expose the required GDScript definitions and relationships through the parser-to-MCP path in both sequential and parallel indexing modes.
