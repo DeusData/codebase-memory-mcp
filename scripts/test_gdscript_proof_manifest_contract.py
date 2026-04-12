@@ -115,8 +115,8 @@ def main() -> None:
                             "expected": {
                                 "count": 2,
                                 "contains_edges": [
-                                    "subproject/PlayerWalking.gd:Update->Move",
-                                    "subproject/PlayerWalking.gd:Move->Transition",
+                                    "PlayerWalking.gd:Update->Move",
+                                    "PlayerWalking.gd:Move->Transition",
                                 ],
                             },
                         }
