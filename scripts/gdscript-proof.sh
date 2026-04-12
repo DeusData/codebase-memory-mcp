@@ -1064,17 +1064,38 @@ for repo_meta_path in sorted(run_root_path.glob("*/repo-meta.json")):
     repo_dir = repo_meta_path.parent
     payload = json.loads(repo_meta_path.read_text(encoding="utf-8"))
     slug = payload.get("artifact_slug") or repo_dir.name
+    task5 = payload.get("task5") or {}
+    indexing = task5.get("indexing") or {}
+    resolution = task5.get("project_resolution") or {}
+    cli_capture = task5.get("cli_capture") or {}
 
     queries = {}
+    present = []
+    missing = []
     for query_name in query_names:
         query_path = repo_dir / "queries" / f"{query_name}.json"
         if query_path.exists():
             queries[query_name] = rel_text(query_path)
+            present.append(query_name)
+        else:
+            queries[query_name] = None
+            missing.append(query_name)
 
     repos[slug] = {
         "repo_path": payload.get("repo_path"),
         "repo_label": payload.get("repo_label"),
         "project_id": payload.get("project_id"),
+        "status": task5.get("status", "pending"),
+        "stages": {
+            "indexing": indexing.get("status", "pending"),
+            "project_resolution": resolution.get("status", "pending"),
+        },
+        "failure_context": {
+            "message": task5.get("message"),
+            "cli_capture_mode": cli_capture.get("mode", "unknown"),
+            "cli_capture_note": cli_capture.get("note"),
+        },
+        "task5": task5,
         "artifacts": {
             "repo_meta": rel_text(repo_meta_path),
             "index": maybe_rel(repo_dir / "index.json"),
@@ -1082,6 +1103,8 @@ for repo_meta_path in sorted(run_root_path.glob("*/repo-meta.json")):
             "summary": maybe_rel(repo_dir / "summary.md"),
             "queries": queries,
         },
+        "query_wrappers_present": present,
+        "query_wrappers_missing": missing,
         "runtime": {
             "state_root": maybe_rel(run_root_path / "state" / slug),
             "home": maybe_rel(run_root_path / "state" / slug / "home"),
