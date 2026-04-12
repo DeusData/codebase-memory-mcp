@@ -16,12 +16,12 @@ A real Godot demo project indexes cleanly and yields useful GDScript answers thr
 - ✓ The codebase already contains GDScript-specific language registration, grammar integration, resolution logic, and fixture/proof infrastructure — existing brownfield capability
 - ✓ Brownfield documentation already describes architecture, stack, and testing patterns for GDScript-oriented work — existing brownfield capability
 - ✓ Maintainer can run validation against pinned real Godot 4.x demo targets with recorded repo identity and project subpath when needed — Validated in Phase 1: Proof Contract & Corpus
+- ✓ Maintainer has a reproducible, isolated proof path with machine-readable raw MCP evidence and incomplete-run diagnostics — Validated in Phase 2: Isolated Proof Harness
 
 ### Active
 
 - [ ] Confirm that indexing results for GDScript are useful in practice through key MCP workflows such as project indexing, graph discovery, and query/tracing operations
 - [ ] Identify and close the highest-impact gaps that prevent a real Godot project from passing end-to-end validation
-- [ ] Leave behind a reproducible proof path so future GDScript regressions can be rechecked quickly
 
 ### Out of Scope
 
@@ -37,7 +37,7 @@ Brownfield planning docs already exist under `.planning/codebase/`, and the repo
 
 ## Current State
 
-Phase 1 complete — the approved proof corpus is now pinned in the committed manifest, and the proof harness marks manifest runs as canonical approval-bearing evidence while keeping ad hoc runs debug-only.
+Phase 2 complete — the proof harness now runs in isolated repo-owned state, emits `run-index.json` for wrapper-first evidence discovery, and preserves incomplete-run diagnostics for later phases.
 
 ## Constraints
 
@@ -73,4 +73,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-12 after Phase 1 completion*
+*Last updated: 2026-04-12 after Phase 2 completion*
