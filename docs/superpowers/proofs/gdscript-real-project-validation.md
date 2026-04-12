@@ -11,8 +11,9 @@ The workflow:
 - writes all runtime state and proof artifacts under `.artifacts/gdscript-proof/`,
 - supports one or more local Godot repos in a single run,
 - can run in legacy coarse-coverage mode or manifest-driven good-tier mode,
+- runs manifest-mode proof targets in both `CBM_FORCE_PIPELINE_MODE=sequential` and `CBM_FORCE_PIPELINE_MODE=parallel`,
 - produces per-repo `summary.md` files plus one `aggregate-summary.md`, and
-- writes an additive run-level `run-index.json` so operators can discover repo metadata, isolated state roots, wrapper paths, and incomplete-query status without manual database inspection.
+- writes additive run-level `run-index.json`, `semantic-parity.json`, and `semantic-parity.md` artifacts so operators can discover repo metadata, isolated state roots, wrapper paths, and sequential-vs-parallel semantic evidence without manual database inspection.
 
 The committed good-tier manifest currently tracks 4 pinned proof targets across 2 remotes. When a single upstream repo hosts multiple proof targets, the manifest records a `project_subpath` to keep the target reproducible.
 
@@ -148,13 +149,15 @@ Each run creates a unique local artifact root:
   build.log
   aggregate-summary.md
   run-index.json
+  semantic-parity.json
+  semantic-parity.md
   state/
     <artifact-slug>/
       home/
       config/
       cache/
       cache/codebase-memory-mcp/
-  <artifact-slug>/
+  <comparison-label>-<mode>-<artifact-id>/
     repo-meta.json
     index.log
     index.json
@@ -179,9 +182,12 @@ Each run creates a unique local artifact root:
 
 `run-index.json` is the additive machine-readable inventory for the run. It keeps the wrapper-first evidence contract intact by pointing to artifacts instead of replacing them. The file records:
 - run-level metadata (`aggregate-summary.md`, build status, worktree metadata, manifest path, and `state/` root),
-- one entry per repo with `repo-meta.json`, `summary.md`, `index.json`, `list-projects.json`, and isolated `state/<slug>/{home,config,cache}` paths,
+- one entry per repo/mode artifact with `repo-meta.json`, `summary.md`, `index.json`, `list-projects.json`, isolated `state/<slug>/{home,config,cache}` paths, and mode metadata under `requested_mode`, `actual_mode`, and `comparison_label`,
+- a run-level `semantic_pairs` map keyed by manifest label so the sequential and parallel artifacts for one proof target are machine-addressable,
 - the fixed query suite names, and
 - per-query artifact metadata under `artifacts.queries.<query_name>` with `path` plus a `status` of `present`, `failed`, `not_run`, or `missing` so incomplete runs stay inspectable from disk evidence alone.
+
+`semantic-parity.json` and `semantic-parity.md` are additive review artifacts. They are derived from the canonical `queries/*.json` wrapper files and do not replace them.
 
 ## Query suite and outputs
 
@@ -209,6 +215,16 @@ Each wrapper file records:
 Use `run-index.json` to locate wrapper files quickly; use the wrapper files themselves as the raw evidence source when reviewing query outputs.
 
 ## How to read the outputs
+
+## Sequential vs parallel semantic parity
+
+Manifest mode now produces one sequential artifact and one parallel artifact for every approved manifest label. Review them in this order:
+
+1. Open `run-index.json` and find `semantic_pairs.<label>.requested_modes.sequential` and `.parallel` to locate the two repo artifact directories.
+2. Confirm each paired `repo-meta.json` records `requested_mode`, `actual_mode`, and `comparison_label`.
+3. Use the paired `queries/*.json` files as the canonical raw evidence source.
+4. Open `semantic-parity.json` or `semantic-parity.md` to review additive parity outcomes for `SEM-01` through `SEM-06`.
+5. Treat `semantic-parity.*` as counts-plus-samples review surfaces only; if anything looks wrong, fall back to the paired wrapper files instead of trusting the rollup blindly.
 
 ### Per-repo `summary.md`
 
@@ -246,9 +262,11 @@ Legacy mode continues to report the older indexing / signal / imports / inherits
 Use the run index when you need a machine-readable map of the entire proof run:
 - `run.aggregate_summary` points to the human-readable top-level summary.
 - `repos.<slug>.artifacts.repo_meta` and `.summary` point to the repo-level status files.
+- `repos.<slug>.requested_mode`, `.actual_mode`, and `.comparison_label` record how that artifact participated in a sequential-vs-parallel pair.
 - `repos.<slug>.runtime.state_root`, `.home`, `.xdg_config_home`, and `.xdg_cache_home` show the isolated state layout under `state/<slug>/...`.
 - `repos.<slug>.artifacts.queries.<query_name>` records both wrapper `path` and `status`.
 - `repos.<slug>.failure_context` records the incomplete-path message and failed query name when a query breaks mid-suite.
+- `semantic_pairs.<label>` maps each manifest label to its sequential and parallel repo artifacts.
 
 This means incomplete runs can be diagnosed from the artifact tree directly instead of re-running manual database queries.
 
@@ -265,9 +283,12 @@ It also prints `Proof run root: ...` on stdout so you can jump directly to the l
 - Confirm `.artifacts/gdscript-proof/` stays ignored by git.
 - Confirm the latest run wrote `aggregate-summary.md`.
 - Confirm the latest run wrote `run-index.json` beside `aggregate-summary.md`.
+- Confirm the latest run wrote `semantic-parity.json` and `semantic-parity.md` beside `aggregate-summary.md`.
 - Confirm each processed repo has `summary.md` and `repo-meta.json`.
 - Confirm `run-index.json` exposes isolated `state/<slug>/home`, `config`, and `cache` paths for every processed repo.
 - Confirm `run-index.json` points to `queries/*.json` wrapper files instead of replacing them; the wrapper JSON files remain the canonical raw evidence set.
+- Confirm `run-index.json` exposes `requested_mode`, `actual_mode`, `comparison_label`, and `semantic_pairs` for every approval-bearing manifest label.
+- Confirm `semantic-parity.*` reports sequential-vs-parallel counts and representative samples for classes, methods, same-script calls, inherits, imports, and signal calls.
 - Confirm approval-bearing evidence came from manifest mode rather than ad hoc `--repo` selection.
 - Confirm every approval-bearing repo summary exposes the canonical identity tuple (`remote`, `pinned_commit`, `project_subpath` when needed, `godot_version`).
 - Confirm labels are presented as readability metadata and local checkout paths as run evidence only.

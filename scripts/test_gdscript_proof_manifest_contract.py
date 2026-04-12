@@ -161,12 +161,21 @@ def main() -> None:
             for p in manifest_root.iterdir()
             if p.is_dir() and (p / "repo-meta.json").is_file()
         ]
-        if len(repo_dirs) != 1:
-            fail(f"expected 1 manifest repo artifact dir, found {len(repo_dirs)}")
-        manifest_meta = json.loads(
-            (repo_dirs[0] / "repo-meta.json").read_text(encoding="utf-8")
-        )
-        manifest_summary = (repo_dirs[0] / "summary.md").read_text(encoding="utf-8")
+        if len(repo_dirs) != 2:
+            fail(f"expected 2 manifest repo artifact dirs, found {len(repo_dirs)}")
+        manifest_metas = {
+            (meta.get("requested_mode") or ""): meta
+            for meta in (
+                json.loads((repo_dir / "repo-meta.json").read_text(encoding="utf-8"))
+                for repo_dir in repo_dirs
+            )
+        }
+        manifest_meta = manifest_metas.get("sequential")
+        if manifest_meta is None or "parallel" not in manifest_metas:
+            fail(f"manifest dual-mode metadata missing: {manifest_metas}")
+        manifest_summary = (
+            manifest_root / f"{manifest_meta['artifact_slug']}" / "summary.md"
+        ).read_text(encoding="utf-8")
         run_index = load_run_index(manifest_root)
 
         identity = manifest_meta.get("canonical_identity") or {}
@@ -182,6 +191,14 @@ def main() -> None:
             fail(f"manifest approval status incorrect: {manifest_meta}")
         if manifest_meta.get("qualification_status") != "godot-4.x-qualifying":
             fail(f"manifest qualification status incorrect: {manifest_meta}")
+        if manifest_meta.get("comparison_label") != "fixture-repo":
+            fail(f"comparison label missing from repo meta: {manifest_meta}")
+        if manifest_meta.get("actual_mode") != "sequential":
+            fail(f"actual mode missing from repo meta: {manifest_meta}")
+        if manifest_metas["parallel"].get("actual_mode") != "parallel":
+            fail(
+                f"parallel actual mode missing from repo meta: {manifest_metas['parallel']}"
+            )
         if (
             "canonical-approval-bearing" not in manifest_summary
             or "godot-4.x-qualifying" not in manifest_summary
@@ -201,6 +218,10 @@ def main() -> None:
             fail(
                 f"run index missing repo entry for {manifest_meta.get('artifact_slug')}: {run_index}"
             )
+        if repo_index.get("requested_mode") != "sequential":
+            fail(f"run index requested_mode incorrect: {repo_index}")
+        if repo_index.get("actual_mode") != "sequential":
+            fail(f"run index actual_mode incorrect: {repo_index}")
 
         if (
             repo_index.get("artifacts", {}).get("repo_meta")
@@ -222,6 +243,28 @@ def main() -> None:
             != f"{manifest_meta['artifact_slug']}/queries/gd-same-script-calls.json"
         ):
             fail(f"run index wrapper path incorrect: {same_script_wrapper}")
+
+        semantic_pairs = run_index.get("semantic_pairs") or {}
+        fixture_pair = semantic_pairs.get("fixture-repo") or {}
+        requested_modes = fixture_pair.get("requested_modes") or {}
+        if sorted(requested_modes) != ["parallel", "sequential"]:
+            fail(f"semantic_pairs missing sequential/parallel entries: {fixture_pair}")
+        if (
+            requested_modes["sequential"].get("artifact_slug")
+            != manifest_meta["artifact_slug"]
+        ):
+            fail(f"semantic_pairs sequential artifact mismatch: {fixture_pair}")
+        if not (manifest_root / "semantic-parity.json").is_file():
+            fail("semantic-parity.json missing from manifest run")
+        if not (manifest_root / "semantic-parity.md").is_file():
+            fail("semantic-parity.md missing from manifest run")
+        semantic_parity = json.loads(
+            (manifest_root / "semantic-parity.json").read_text(encoding="utf-8")
+        )
+        if "semantic_pairs" not in semantic_parity:
+            fail(f"semantic-parity.json missing semantic_pairs: {semantic_parity}")
+        if "fixture-repo" not in (semantic_parity.get("semantic_pairs") or {}):
+            fail(f"semantic-parity.json missing fixture-repo pair: {semantic_parity}")
 
         ad_hoc_result = subprocess.run(
             [
