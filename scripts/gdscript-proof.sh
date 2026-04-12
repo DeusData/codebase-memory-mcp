@@ -30,6 +30,8 @@ BINARY_PATH=""
 BUILD_LOG=""
 AGGREGATE_SUMMARY=""
 RUN_INDEX_FILE=""
+SEMANTIC_PARITY_JSON=""
+SEMANTIC_PARITY_MD=""
 AGG_INDEXING_COVERAGE="false"
 AGG_SIGNAL_COVERAGE="false"
 AGG_IMPORTS_COVERAGE="false"
@@ -57,12 +59,16 @@ REPO_OVERALL_STATUSES=()
 REPO_STATUS_MESSAGES=()
 REPO_CLI_CAPTURE_MODES=()
 REPO_CLI_CAPTURE_NOTES=()
+REPO_REQUESTED_MODES=()
+REPO_ACTUAL_MODES=()
+REPO_COMPARISON_LABELS=()
 WORKTREE_BRANCH=""
 WORKTREE_COMMIT=""
 CBM_LAST_ERROR=""
 CBM_LAST_CAPTURE_MODE=""
 GDSCRIPT_LAST_QUERY_NAME=""
 GDSCRIPT_QUERY_FALLBACK_TOOLS=""
+CBM_ACTIVE_FORCE_PIPELINE_MODE=""
 
 GDSCRIPT_QUERY_NAMES=(
   "gd-files"
@@ -259,6 +265,74 @@ ensure_repo_entry() {
   REPO_STATUS_MESSAGES+=("")
   REPO_CLI_CAPTURE_MODES+=("pending")
   REPO_CLI_CAPTURE_NOTES+=("")
+  REPO_REQUESTED_MODES+=("auto")
+  REPO_ACTUAL_MODES+=("pending")
+  REPO_COMPARISON_LABELS+=("")
+}
+
+append_repo_entry() {
+  local repo_path="$1"
+  local label="$2"
+  local version="$3"
+  local requested_mode="$4"
+  local comparison_label="$5"
+
+  REPO_PATHS+=("$repo_path")
+  REPO_LABELS+=("$label")
+  REPO_GODOT_VERSIONS+=("$version")
+  REPO_SLUGS+=("")
+  REPO_GIT_REFS+=("")
+  REPO_GIT_COMMITS+=("")
+  REPO_GIT_BRANCHES+=("")
+  REPO_PROJECT_IDS+=("")
+  REPO_INDEX_STATUSES+=("pending")
+  REPO_PROJECT_RESOLUTION_STATUSES+=("pending")
+  REPO_OVERALL_STATUSES+=("pending")
+  REPO_STATUS_MESSAGES+=("")
+  REPO_CLI_CAPTURE_MODES+=("pending")
+  REPO_CLI_CAPTURE_NOTES+=("")
+  REPO_REQUESTED_MODES+=("$requested_mode")
+  REPO_ACTUAL_MODES+=("pending")
+  REPO_COMPARISON_LABELS+=("$comparison_label")
+}
+
+expand_manifest_dual_mode_entries() {
+  local -a original_paths=("${REPO_PATHS[@]}")
+  local -a original_labels=("${REPO_LABELS[@]}")
+  local -a original_versions=("${REPO_GODOT_VERSIONS[@]}")
+  local i
+  local comparison_label
+
+  if [ -z "$MANIFEST_PATH" ]; then
+    return 0
+  fi
+
+  REPO_PATHS=()
+  REPO_GODOT_VERSIONS=()
+  REPO_SLUGS=()
+  REPO_GIT_REFS=()
+  REPO_GIT_COMMITS=()
+  REPO_GIT_BRANCHES=()
+  REPO_LABELS=()
+  REPO_PROJECT_IDS=()
+  REPO_INDEX_STATUSES=()
+  REPO_PROJECT_RESOLUTION_STATUSES=()
+  REPO_OVERALL_STATUSES=()
+  REPO_STATUS_MESSAGES=()
+  REPO_CLI_CAPTURE_MODES=()
+  REPO_CLI_CAPTURE_NOTES=()
+  REPO_REQUESTED_MODES=()
+  REPO_ACTUAL_MODES=()
+  REPO_COMPARISON_LABELS=()
+
+  for i in "${!original_paths[@]}"; do
+    comparison_label="${original_labels[$i]}"
+    if [ -z "$comparison_label" ]; then
+      comparison_label=$(basename -- "${original_paths[$i]}")
+    fi
+    append_repo_entry "${original_paths[$i]}" "${original_labels[$i]}" "${original_versions[$i]}" "sequential" "$comparison_label"
+    append_repo_entry "${original_paths[$i]}" "${original_labels[$i]}" "${original_versions[$i]}" "parallel" "$comparison_label"
+  done
 }
 
 set_repo_metadata() {
@@ -301,6 +375,8 @@ initialize_workspace_root() {
   BUILD_LOG="$RUN_ROOT/build.log"
   AGGREGATE_SUMMARY="$RUN_ROOT/aggregate-summary.md"
   RUN_INDEX_FILE="$RUN_ROOT/run-index.json"
+  SEMANTIC_PARITY_JSON="$RUN_ROOT/semantic-parity.json"
+  SEMANTIC_PARITY_MD="$RUN_ROOT/semantic-parity.md"
 }
 
 configure_repo_runtime_state() {
@@ -357,6 +433,7 @@ derive_repo_artifact_slug() {
   local repo_path="$1"
   local preferred_name="$2"
   local short_commit="$3"
+  local requested_mode="$4"
   local repo_name
   local path_hash
   local base_slug
@@ -384,6 +461,9 @@ derive_repo_artifact_slug() {
   path_hash=${path_hash:0:12}
 
   base_slug="${repo_name}-${commit_id}-${path_hash}"
+  if [ -n "$requested_mode" ] && [ "$requested_mode" != "auto" ]; then
+    base_slug="${repo_name}-${requested_mode}-${commit_id}-${path_hash}"
+  fi
   printf '%s\n' "$base_slug"
 }
 
@@ -410,6 +490,7 @@ collect_repo_metadata_fields() {
   local repo_path="$1"
   local repo_label="$2"
   local godot_version="$3"
+  local requested_mode="$4"
 
   local git_ref
   local git_commit
@@ -425,7 +506,7 @@ collect_repo_metadata_fields() {
   } < <(collect_repo_git_metadata "$repo_path")
 
   short_commit=$git_ref
-  slug=$(derive_repo_artifact_slug "$repo_path" "$repo_label" "$short_commit")
+  slug=$(derive_repo_artifact_slug "$repo_path" "$repo_label" "$short_commit" "$requested_mode")
 
   if godot_version_is_4x "$godot_version"; then
     qualifies="true"
@@ -468,13 +549,16 @@ write_repo_meta_json() {
   local godot_version="${11}"
   local qualifies_4x="${12}"
   local manifest_path="${13}"
+  local requested_mode="${14}"
+  local actual_mode="${15}"
+  local comparison_label="${16}"
 
   local output_file="$repo_dir/repo-meta.json"
   local worktree_path="$WORKTREE_PATH"
   local worktree_branch="$WORKTREE_BRANCH"
   local worktree_commit="$WORKTREE_COMMIT"
 
-  python3 - "$output_file" "$repo_path" "$repo_label" "$repo_name" "$slug" "$project_id" "$proof_timestamp" "$git_ref" "$git_commit" "$git_branch" "$godot_version" "$qualifies_4x" "$manifest_path" "$worktree_path" "$worktree_branch" "$worktree_commit" <<'PY'
+  python3 - "$output_file" "$repo_path" "$repo_label" "$repo_name" "$slug" "$project_id" "$proof_timestamp" "$git_ref" "$git_commit" "$git_branch" "$godot_version" "$qualifies_4x" "$manifest_path" "$worktree_path" "$worktree_branch" "$worktree_commit" "$requested_mode" "$actual_mode" "$comparison_label" <<'PY'
 import json
 import sys
 
@@ -495,6 +579,9 @@ import sys
     worktree_path,
     worktree_branch,
     worktree_commit,
+    requested_mode,
+    actual_mode,
+    comparison_label,
 ) = sys.argv[1:]
 
 
@@ -552,6 +639,9 @@ payload = {
     "label_role": "readability-only",
     "local_checkout_path_role": "run-evidence-only",
     "manifest_mode": manifest_mode,
+    "requested_mode": None if requested_mode == "" else requested_mode,
+    "actual_mode": None if actual_mode == "" else actual_mode,
+    "comparison_label": None if comparison_label == "" else comparison_label,
     "codebase_memory_mcp": {
         "worktree": worktree_path,
         "branch": worktree_branch,
@@ -841,6 +931,9 @@ run_cbm_cli_json() {
   [ -n "$REPO_STATE_HOME" ] && command+=("HOME=$REPO_STATE_HOME")
   [ -n "$REPO_STATE_CONFIG" ] && command+=("XDG_CONFIG_HOME=$REPO_STATE_CONFIG")
   [ -n "$REPO_STATE_CACHE" ] && command+=("XDG_CACHE_HOME=$REPO_STATE_CACHE")
+  if [ "$tool_name" = "index_repository" ] && [ -n "$CBM_ACTIVE_FORCE_PIPELINE_MODE" ]; then
+    command+=("CBM_FORCE_PIPELINE_MODE=$CBM_ACTIVE_FORCE_PIPELINE_MODE")
+  fi
   command+=("$BINARY_PATH" cli --raw "$tool_name")
   if [ -n "$args_json" ]; then
     command+=("$args_json")
@@ -968,17 +1061,23 @@ update_repo_meta_json_task5() {
   local status_message="$6"
   local cli_capture_mode="$7"
   local cli_capture_note="$8"
+  local requested_mode="$9"
+  local actual_mode="${10}"
+  local comparison_label="${11}"
 
-  python3 - "$repo_meta_file" "$project_id" "$index_status" "$project_resolution_status" "$overall_status" "$status_message" "$cli_capture_mode" "$cli_capture_note" <<'PY'
+  python3 - "$repo_meta_file" "$project_id" "$index_status" "$project_resolution_status" "$overall_status" "$status_message" "$cli_capture_mode" "$cli_capture_note" "$requested_mode" "$actual_mode" "$comparison_label" <<'PY'
 import json
 import sys
 
-repo_meta_file, project_id, index_status, resolution_status, overall_status, status_message, cli_capture_mode, cli_capture_note = sys.argv[1:9]
+repo_meta_file, project_id, index_status, resolution_status, overall_status, status_message, cli_capture_mode, cli_capture_note, requested_mode, actual_mode, comparison_label = sys.argv[1:12]
 
 with open(repo_meta_file, "r", encoding="utf-8") as handle:
     payload = json.load(handle)
 
 payload["project_id"] = None if project_id in ("", "null") else project_id
+payload["requested_mode"] = None if requested_mode == "" else requested_mode
+payload["actual_mode"] = None if actual_mode == "" else actual_mode
+payload["comparison_label"] = None if comparison_label == "" else comparison_label
 payload["task5"] = {
     "indexing": {
         "status": index_status,
@@ -1010,8 +1109,11 @@ set_repo_task5_status() {
   local status_message="$6"
   local cli_capture_mode="$7"
   local cli_capture_note="$8"
+  local actual_mode="$9"
   local slug="${REPO_SLUGS[$repo_index]}"
   local repo_meta_file="$RUN_ROOT/$slug/repo-meta.json"
+  local requested_mode="${REPO_REQUESTED_MODES[$repo_index]:-auto}"
+  local comparison_label="${REPO_COMPARISON_LABELS[$repo_index]}"
 
   REPO_PROJECT_IDS[$repo_index]="$project_id"
   REPO_INDEX_STATUSES[$repo_index]="$index_status"
@@ -1020,12 +1122,13 @@ set_repo_task5_status() {
   REPO_STATUS_MESSAGES[$repo_index]="$status_message"
   REPO_CLI_CAPTURE_MODES[$repo_index]="$cli_capture_mode"
   REPO_CLI_CAPTURE_NOTES[$repo_index]="$cli_capture_note"
+  REPO_ACTUAL_MODES[$repo_index]="$actual_mode"
 
-  update_repo_meta_json_task5 "$repo_meta_file" "$project_id" "$index_status" "$resolution_status" "$overall_status" "$status_message" "$cli_capture_mode" "$cli_capture_note"
+  update_repo_meta_json_task5 "$repo_meta_file" "$project_id" "$index_status" "$resolution_status" "$overall_status" "$status_message" "$cli_capture_mode" "$cli_capture_note" "$requested_mode" "$actual_mode" "$comparison_label"
 }
 
 write_run_index_json() {
-  python3 - "$RUN_ROOT" "$RUN_INDEX_FILE" "$RUN_TIMESTAMP" "$ENV_FILE" "$COMMANDS_LOG" "$BUILD_LOG" "$AGGREGATE_SUMMARY" "$BINARY_PATH" "$BUILD_STATUS" "$BUILD_MESSAGE" "$WORKTREE_PATH" "$WORKTREE_BRANCH" "$WORKTREE_COMMIT" "$MANIFEST_PATH" "${GDSCRIPT_QUERY_NAMES[@]}" <<'PY'
+  python3 - "$RUN_ROOT" "$RUN_INDEX_FILE" "$RUN_TIMESTAMP" "$ENV_FILE" "$COMMANDS_LOG" "$BUILD_LOG" "$AGGREGATE_SUMMARY" "$SEMANTIC_PARITY_JSON" "$SEMANTIC_PARITY_MD" "$BINARY_PATH" "$BUILD_STATUS" "$BUILD_MESSAGE" "$WORKTREE_PATH" "$WORKTREE_BRANCH" "$WORKTREE_COMMIT" "$MANIFEST_PATH" "${GDSCRIPT_QUERY_NAMES[@]}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1038,6 +1141,8 @@ from pathlib import Path
     commands_log,
     build_log,
     aggregate_summary,
+    semantic_parity_json,
+    semantic_parity_md,
     binary_path,
     build_status,
     build_message,
@@ -1070,6 +1175,7 @@ def extract_failed_query(message):
 
 
 repos = {}
+semantic_pairs = {}
 for repo_meta_path in sorted(run_root_path.glob("*/repo-meta.json")):
     repo_dir = repo_meta_path.parent
     payload = json.loads(repo_meta_path.read_text(encoding="utf-8"))
@@ -1079,6 +1185,9 @@ for repo_meta_path in sorted(run_root_path.glob("*/repo-meta.json")):
     resolution = task5.get("project_resolution") or {}
     cli_capture = task5.get("cli_capture") or {}
     failed_query = extract_failed_query(task5.get("message"))
+    requested_mode = payload.get("requested_mode")
+    actual_mode = payload.get("actual_mode")
+    comparison_label = payload.get("comparison_label") or payload.get("repo_label") or slug
 
     queries = {}
     present = []
@@ -1118,6 +1227,9 @@ for repo_meta_path in sorted(run_root_path.glob("*/repo-meta.json")):
     repos[slug] = {
         "repo_path": payload.get("repo_path"),
         "repo_label": payload.get("repo_label"),
+        "comparison_label": comparison_label,
+        "requested_mode": requested_mode,
+        "actual_mode": actual_mode,
         "project_id": payload.get("project_id"),
         "status": task5.get("status", "pending"),
         "stages": {
@@ -1149,6 +1261,19 @@ for repo_meta_path in sorted(run_root_path.glob("*/repo-meta.json")):
         },
     }
 
+    if comparison_label and requested_mode:
+        pair_entry = semantic_pairs.setdefault(comparison_label, {"comparison_label": comparison_label, "requested_modes": {}})
+        pair_entry["requested_modes"][requested_mode] = {
+            "artifact_slug": slug,
+            "repo_label": payload.get("repo_label"),
+            "requested_mode": requested_mode,
+            "actual_mode": actual_mode,
+            "status": task5.get("status", "pending"),
+            "repo_meta": rel_text(repo_meta_path),
+            "summary": maybe_rel(repo_dir / "summary.md"),
+            "queries_dir": maybe_rel(repo_dir / "queries"),
+        }
+
 payload = {
     "schema_version": 1,
     "run": {
@@ -1158,6 +1283,8 @@ payload = {
         "commands_log": maybe_rel(Path(commands_log)),
         "build_log": maybe_rel(Path(build_log)),
         "aggregate_summary": maybe_rel(Path(aggregate_summary)),
+        "semantic_parity_json": maybe_rel(Path(semantic_parity_json)),
+        "semantic_parity_md": maybe_rel(Path(semantic_parity_md)),
         "state_root": maybe_rel(run_root_path / "state"),
         "manifest_path": manifest_path or None,
         "binary": {
@@ -1172,6 +1299,7 @@ payload = {
         },
     },
     "query_suite": list(query_names),
+    "semantic_pairs": semantic_pairs,
     "repos": repos,
 }
 
@@ -1257,6 +1385,7 @@ process_repo_indexing() {
   for i in "${!REPO_PATHS[@]}"; do
     repo_path="${REPO_PATHS[$i]}"
     slug="${REPO_SLUGS[$i]}"
+    local requested_mode="${REPO_REQUESTED_MODES[$i]:-auto}"
     repo_dir="$RUN_ROOT/$slug"
     index_log="$repo_dir/index.log"
     index_json="$repo_dir/index.json"
@@ -1271,13 +1400,14 @@ process_repo_indexing() {
       printf '%s\n' "repo_xdg_config_home=$REPO_STATE_CONFIG"
       printf '%s\n' "repo_xdg_cache_home=$REPO_STATE_CACHE"
       printf '%s\n' "repo_store_root=$REPO_STATE_CACHE_STORE"
+      printf '%s\n' "requested_mode=$requested_mode"
     } > "$index_log"
     cli_capture_mode="raw"
     cli_capture_note=""
     fallback_tools=()
 
     if [ "$BUILD_STATUS" != "succeeded" ]; then
-      set_repo_task5_status "$i" "" "not_attempted" "not_attempted" "incomplete" "build failed before indexing: $BUILD_MESSAGE" "not_attempted" ""
+      set_repo_task5_status "$i" "" "not_attempted" "not_attempted" "incomplete" "build failed before indexing: $BUILD_MESSAGE" "not_attempted" "" "not-run"
       continue
     fi
 
@@ -1287,10 +1417,11 @@ process_repo_indexing() {
       else
         failure_message="repository path does not exist: $repo_path"
       fi
-      set_repo_task5_status "$i" "" "failed" "skipped" "incomplete" "$failure_message" "not_attempted" ""
+      set_repo_task5_status "$i" "" "failed" "skipped" "incomplete" "$failure_message" "not_attempted" "" "not-run"
       continue
     fi
 
+    CBM_ACTIVE_FORCE_PIPELINE_MODE="$requested_mode"
     args_json=$(build_index_payload "$repo_path")
     if ! run_cbm_cli_json "$index_log" "$index_json" index_repository "$args_json"; then
       failure_message=${CBM_LAST_ERROR:-"index_repository failed"}
@@ -1302,9 +1433,11 @@ process_repo_indexing() {
       if [ "${#fallback_tools[@]}" -gt 0 ]; then
         cli_capture_note="wrapped MCP payload fallback used because binary lacks cli --raw support: ${fallback_tools[*]}"
       fi
-      set_repo_task5_status "$i" "" "failed" "skipped" "incomplete" "$failure_message" "$cli_capture_mode" "$cli_capture_note"
+      set_repo_task5_status "$i" "" "failed" "skipped" "incomplete" "$failure_message" "$cli_capture_mode" "$cli_capture_note" "unknown"
+      CBM_ACTIVE_FORCE_PIPELINE_MODE=""
       continue
     fi
+    CBM_ACTIVE_FORCE_PIPELINE_MODE=""
 
     if [ "$CBM_LAST_CAPTURE_MODE" = "wrapped_fallback" ]; then
       cli_capture_mode="wrapped_fallback"
@@ -1316,7 +1449,7 @@ process_repo_indexing() {
       if [ "${#fallback_tools[@]}" -gt 0 ]; then
         cli_capture_note="wrapped MCP payload fallback used because binary lacks cli --raw support: ${fallback_tools[*]}"
       fi
-      set_repo_task5_status "$i" "" "failed" "skipped" "incomplete" "$failure_message" "$cli_capture_mode" "$cli_capture_note"
+      set_repo_task5_status "$i" "" "failed" "skipped" "incomplete" "$failure_message" "$cli_capture_mode" "$cli_capture_note" "unknown"
       continue
     fi
 
@@ -1330,7 +1463,7 @@ process_repo_indexing() {
       if [ "${#fallback_tools[@]}" -gt 0 ]; then
         cli_capture_note="wrapped MCP payload fallback used because binary lacks cli --raw support: ${fallback_tools[*]}"
       fi
-      set_repo_task5_status "$i" "" "succeeded" "failed" "incomplete" "$failure_message" "$cli_capture_mode" "$cli_capture_note"
+      set_repo_task5_status "$i" "" "succeeded" "failed" "incomplete" "$failure_message" "$cli_capture_mode" "$cli_capture_note" "$requested_mode"
       continue
     fi
 
@@ -1344,7 +1477,7 @@ process_repo_indexing() {
       if [ "${#fallback_tools[@]}" -gt 0 ]; then
         cli_capture_note="wrapped MCP payload fallback used because binary lacks cli --raw support: ${fallback_tools[*]}"
       fi
-      set_repo_task5_status "$i" "" "succeeded" "failed" "incomplete" "unable to resolve project_id from list_projects for $repo_path" "$cli_capture_mode" "$cli_capture_note"
+      set_repo_task5_status "$i" "" "succeeded" "failed" "incomplete" "unable to resolve project_id from list_projects for $repo_path" "$cli_capture_mode" "$cli_capture_note" "$requested_mode"
       continue
     fi
 
@@ -1369,7 +1502,7 @@ process_repo_indexing() {
       if [ "${#fallback_tools[@]}" -gt 0 ]; then
         cli_capture_note="wrapped MCP payload fallback used because binary lacks cli --raw support: ${fallback_tools[*]}"
       fi
-      set_repo_task5_status "$i" "$project_id" "succeeded" "resolved" "incomplete" "$failure_message" "$cli_capture_mode" "$cli_capture_note"
+      set_repo_task5_status "$i" "$project_id" "succeeded" "resolved" "incomplete" "$failure_message" "$cli_capture_mode" "$cli_capture_note" "$requested_mode"
       continue
     fi
 
@@ -1388,7 +1521,7 @@ process_repo_indexing() {
       cli_capture_note="wrapped MCP payload fallback used because binary lacks cli --raw support: ${fallback_tools[*]}"
     fi
 
-    set_repo_task5_status "$i" "$project_id" "succeeded" "resolved" "complete" "" "$cli_capture_mode" "$cli_capture_note"
+    set_repo_task5_status "$i" "$project_id" "succeeded" "resolved" "complete" "" "$cli_capture_mode" "$cli_capture_note" "$requested_mode"
   done
 }
 
@@ -2009,8 +2142,7 @@ def summarize_repo_with_manifest(slug):
 
 if manifest_mode:
     repo_summaries = [summarize_repo_with_manifest(slug) for slug in slugs]
-    run_labels = [repo["repo_label"] for repo in repo_summaries if repo["repo_label"]]
-    duplicate_run_labels = sorted({label for label in run_labels if run_labels.count(label) > 1})
+    run_labels = sorted({repo["repo_label"] for repo in repo_summaries if repo["repo_label"]})
     missing_manifest_labels = []
     minimum_repo_count = None
     if manifest is not None:
@@ -2026,8 +2158,6 @@ if manifest_mode:
     aggregate_issues = []
     if manifest_error:
         aggregate_issues.append(manifest_error)
-    if duplicate_run_labels:
-        aggregate_issues.append("duplicate repo labels in run: " + ", ".join(duplicate_run_labels))
     if missing_manifest_labels:
         aggregate_issues.append("missing manifest repos: " + ", ".join(missing_manifest_labels))
     unlabeled = [repo["artifact_slug"] for repo in repo_summaries if not repo["repo_label"]]
@@ -2158,6 +2288,276 @@ PY
   rm -f "$summary_fields_file"
 }
 
+generate_semantic_parity_reports() {
+  if [ -z "$MANIFEST_PATH" ]; then
+    rm -f "$SEMANTIC_PARITY_JSON" "$SEMANTIC_PARITY_MD"
+    return 0
+  fi
+
+  python3 - "$RUN_ROOT" "$SEMANTIC_PARITY_JSON" "$SEMANTIC_PARITY_MD" "$MANIFEST_PATH" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+run_root, json_path, md_path, manifest_path = sys.argv[1:5]
+run_root_path = Path(run_root)
+
+manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+
+COUNT_QUERY_KEYS = {
+    "gd-classes": "gd_classes",
+    "gd-methods": "gd_methods",
+    "signal-calls": "signal_calls",
+    "gd-inherits": "gd_inherits_edges",
+    "gd-imports": "gd_deps",
+}
+
+EDGE_DETAIL_QUERY = {
+    "signal-calls": "signal-call-edges",
+    "gd-inherits": "gd-inherits-edges",
+    "gd-imports": "gd-import-edges",
+    "gd-same-script-calls": "gd-same-script-calls",
+}
+
+
+def load_wrapper(repo_dir: Path, query_name: str):
+    path = repo_dir / "queries" / f"{query_name}.json"
+    if not path.exists():
+        raise FileNotFoundError(f"missing wrapper: {path.relative_to(run_root_path)}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def rows(wrapper):
+    result = wrapper.get("result")
+    if not isinstance(result, dict):
+        raise ValueError("wrapper result is not an object")
+    payload = result.get("rows") or []
+    if not isinstance(payload, list):
+        raise ValueError("wrapper rows missing")
+    return payload
+
+
+def count_value(repo_dir: Path, query_name: str) -> int:
+    if query_name == "gd-same-script-calls":
+        return len(edge_values(repo_dir, query_name))
+    wrapper = load_wrapper(repo_dir, query_name)
+    payload_rows = rows(wrapper)
+    if not payload_rows:
+        return 0
+    first = payload_rows[0]
+    if not isinstance(first, list) or not first:
+        raise ValueError(f"invalid count row for {query_name}")
+    return int(first[0])
+
+
+def sample_values(repo_dir: Path, query_name: str):
+    payload_rows = rows(load_wrapper(repo_dir, query_name))
+    values = []
+    for row in payload_rows:
+        if not isinstance(row, list) or len(row) < 2:
+            raise ValueError(f"invalid sample row for {query_name}")
+        values.append(f"{row[1]}:{row[0]}")
+    return sorted(set(values))
+
+
+def edge_values(repo_dir: Path, query_name: str):
+    detail_query = EDGE_DETAIL_QUERY.get(query_name, query_name)
+    payload_rows = rows(load_wrapper(repo_dir, detail_query))
+    values = []
+    for row in payload_rows:
+        if not isinstance(row, list) or len(row) < 6:
+            raise ValueError(f"invalid edge row for {detail_query}")
+        src_file, src_name, _src_qn, dst_file, dst_name, dst_qn = row[:6]
+        if query_name == "gd-imports":
+            values.append(f"{src_file}->{dst_file}")
+        elif query_name == "gd-same-script-calls":
+            if src_file != dst_file:
+                continue
+            if dst_qn and ".signal." in str(dst_qn):
+                continue
+            values.append(f"{src_file}:{src_name}->{dst_name}")
+        else:
+            values.append(f"{src_file}:{src_name}->{dst_file}:{dst_name}")
+    return sorted(set(values))
+
+
+def requirement_payload(outcome, notes, **extra):
+    payload = {"outcome": outcome, "notes": notes}
+    payload.update(extra)
+    return payload
+
+
+def compare_pair(label, sequential, parallel):
+    pair = {
+        "comparison_label": label,
+        "description": "Additive evidence derived from canonical queries/*.json wrappers; semantic-parity.json does not replace raw wrapper artifacts.",
+        "repo_artifacts": {},
+        "requirements": {},
+        "overall": "incomplete",
+    }
+    for mode_name, meta in (("sequential", sequential), ("parallel", parallel)):
+        if meta is None:
+            continue
+        pair["repo_artifacts"][mode_name] = {
+            "artifact_slug": meta["artifact_slug"],
+            "requested_mode": meta.get("requested_mode"),
+            "actual_mode": meta.get("actual_mode"),
+            "repo_meta": f"{meta['artifact_slug']}/repo-meta.json",
+            "summary": f"{meta['artifact_slug']}/summary.md",
+            "queries_dir": f"{meta['artifact_slug']}/queries",
+            "status": meta.get("status", "pending"),
+        }
+
+    if sequential is None or parallel is None:
+        note = "both sequential and parallel repo artifacts are required"
+        for requirement_id in ("SEM-01", "SEM-02", "SEM-03", "SEM-04", "SEM-05", "SEM-06"):
+            pair["requirements"][requirement_id] = requirement_payload("incomplete", [note])
+        return pair
+
+    if sequential.get("status") != "complete" or parallel.get("status") != "complete":
+        note = "semantic comparison requires complete sequential and parallel wrapper evidence"
+        for requirement_id in ("SEM-01", "SEM-02", "SEM-03", "SEM-04", "SEM-05", "SEM-06"):
+            pair["requirements"][requirement_id] = requirement_payload("incomplete", [note])
+        return pair
+
+    seq_dir = run_root_path / sequential["artifact_slug"]
+    par_dir = run_root_path / parallel["artifact_slug"]
+
+    def compare(requirement_id, count_query=None, sample_query=None, edge_query=None, require_non_zero=False):
+        notes = []
+        data = {}
+        try:
+            if count_query is not None:
+                seq_count = count_value(seq_dir, count_query)
+                par_count = count_value(par_dir, count_query)
+                data["count"] = {"query": count_query, "sequential": seq_count, "parallel": par_count, "matched": seq_count == par_count}
+                if require_non_zero and (seq_count == 0 or par_count == 0):
+                    notes.append(f"{count_query} must be non-zero in both modes")
+                if seq_count != par_count:
+                    notes.append(f"{count_query} differs between modes")
+            if sample_query is not None:
+                seq_values = sample_values(seq_dir, sample_query)
+                par_values = sample_values(par_dir, sample_query)
+                data["representative_samples"] = {
+                    "query": sample_query,
+                    "sequential": seq_values[:5],
+                    "parallel": par_values[:5],
+                    "matched": seq_values == par_values,
+                }
+                if not seq_values or not par_values:
+                    notes.append(f"{sample_query} must expose representative samples in both modes")
+                if seq_values != par_values:
+                    notes.append(f"{sample_query} representative samples differ between modes")
+            if edge_query is not None:
+                seq_values = edge_values(seq_dir, edge_query)
+                par_values = edge_values(par_dir, edge_query)
+                data["representative_edges"] = {
+                    "query": edge_query,
+                    "sequential": seq_values[:5],
+                    "parallel": par_values[:5],
+                    "matched": seq_values == par_values,
+                }
+                if seq_values != par_values:
+                    notes.append(f"{edge_query} representative edges differ between modes")
+            return requirement_payload("pass" if not notes else "fail", notes, **data)
+        except Exception as exc:  # noqa: BLE001
+            return requirement_payload("incomplete", [f"comparison unavailable: {exc}"])
+
+    sem01 = requirement_payload(
+        "pass",
+        [],
+        class_count=compare("SEM-01.class_count", count_query="gd-classes", require_non_zero=True),
+        method_count=compare("SEM-01.method_count", count_query="gd-methods", require_non_zero=True),
+        class_sample=compare("SEM-01.class_sample", sample_query="gd-class-sample"),
+        method_sample=compare("SEM-01.method_sample", sample_query="gd-method-sample"),
+    )
+    sem01_notes = []
+    sem01_outcomes = []
+    for key in ("class_count", "method_count", "class_sample", "method_sample"):
+        sem01_outcomes.append(sem01[key]["outcome"])
+        sem01_notes.extend(sem01[key].get("notes") or [])
+    sem01["outcome"] = "incomplete" if "incomplete" in sem01_outcomes else ("fail" if sem01_notes else "pass")
+    sem01["notes"] = sem01_notes
+
+    sem02 = compare("SEM-02", count_query="gd-same-script-calls", edge_query="gd-same-script-calls")
+    sem03 = compare("SEM-03", count_query="gd-inherits", edge_query="gd-inherits")
+    sem04 = compare("SEM-04", count_query="gd-imports", edge_query="gd-imports")
+    sem05 = compare("SEM-05", count_query="signal-calls", edge_query="signal-calls")
+    pair["requirements"] = {
+        "SEM-01": sem01,
+        "SEM-02": sem02,
+        "SEM-03": sem03,
+        "SEM-04": sem04,
+        "SEM-05": sem05,
+    }
+
+    outcomes = [pair["requirements"][key]["outcome"] for key in ("SEM-01", "SEM-02", "SEM-03", "SEM-04", "SEM-05")]
+    overall = "pass"
+    if "incomplete" in outcomes:
+        overall = "incomplete"
+    elif "fail" in outcomes:
+        overall = "fail"
+    pair["requirements"]["SEM-06"] = requirement_payload(
+        overall,
+        ["Overall semantic outcome is derived from SEM-01 through SEM-05 counts plus representative samples, not aggregate manifest pass/fail alone."],
+    )
+    pair["overall"] = overall
+    return pair
+
+
+repos = {}
+for repo_meta_path in sorted(run_root_path.glob("*/repo-meta.json")):
+    payload = json.loads(repo_meta_path.read_text(encoding="utf-8"))
+    label = payload.get("comparison_label") or payload.get("repo_label") or repo_meta_path.parent.name
+    requested_mode = payload.get("requested_mode")
+    status = ((payload.get("task5") or {}).get("status")) or "pending"
+    if not requested_mode:
+        continue
+    repos.setdefault(label, {})[requested_mode] = {
+        "artifact_slug": payload.get("artifact_slug") or repo_meta_path.parent.name,
+        "requested_mode": requested_mode,
+        "actual_mode": payload.get("actual_mode"),
+        "status": status,
+    }
+
+reports = {}
+manifest_labels = [repo.get("label") for repo in manifest.get("repos", []) if isinstance(repo, dict) and isinstance(repo.get("label"), str)]
+for label in manifest_labels:
+    pair = repos.get(label, {})
+    reports[label] = compare_pair(label, pair.get("sequential"), pair.get("parallel"))
+
+json_payload = {
+    "description": "Additive evidence derived from canonical queries/*.json wrappers. semantic-parity.json does not replace raw wrapper artifacts.",
+    "semantic_pairs": reports,
+}
+Path(json_path).write_text(json.dumps(json_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+lines = [
+    "# Sequential vs parallel semantic parity",
+    "",
+    "This additive review surface is derived from canonical `queries/*.json` wrappers and does not replace them.",
+    "",
+]
+for label in manifest_labels:
+    report = reports[label]
+    lines.extend([
+        f"## {label}",
+        "",
+        f"- Overall semantic outcome: `{report['overall']}`",
+        f"- Sequential artifact: `{((report.get('repo_artifacts') or {}).get('sequential') or {}).get('artifact_slug', 'missing')}`",
+        f"- Parallel artifact: `{((report.get('repo_artifacts') or {}).get('parallel') or {}).get('artifact_slug', 'missing')}`",
+        "",
+        "| Requirement | Outcome | Notes |",
+        "| --- | --- | --- |",
+    ])
+    for requirement_id in ("SEM-01", "SEM-02", "SEM-03", "SEM-04", "SEM-05", "SEM-06"):
+        requirement = report["requirements"][requirement_id]
+        lines.append(f"| {requirement_id} | `{requirement['outcome']}` | {'; '.join(requirement.get('notes') or [])} |")
+    lines.append("")
+Path(md_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+}
+
 final_exit_code() {
   [ "$AGGREGATE_OUTCOME" = "pass" ]
 }
@@ -2173,10 +2573,16 @@ prepare_repo_metadata() {
   local git_commit
   local git_branch
   local qualifies
+  local requested_mode
+  local actual_mode
+  local comparison_label
   for i in "${!REPO_PATHS[@]}"; do
     repo_path="${REPO_PATHS[$i]}"
     repo_label="${REPO_LABELS[$i]}"
     repo_godot_version="${REPO_GODOT_VERSIONS[$i]}"
+    requested_mode="${REPO_REQUESTED_MODES[$i]:-auto}"
+    actual_mode="${REPO_ACTUAL_MODES[$i]:-pending}"
+    comparison_label="${REPO_COMPARISON_LABELS[$i]}"
 
     repo_name=$(basename -- "$repo_path")
     {
@@ -2185,7 +2591,7 @@ prepare_repo_metadata() {
       IFS= read -r git_commit
       IFS= read -r git_branch
       IFS= read -r qualifies
-    } < <(collect_repo_metadata_fields "$repo_path" "$repo_label" "$repo_godot_version")
+    } < <(collect_repo_metadata_fields "$repo_path" "$repo_label" "$repo_godot_version" "$requested_mode")
 
     REPO_SLUGS[$i]="$slug"
 
@@ -2194,7 +2600,7 @@ prepare_repo_metadata() {
     REPO_GIT_BRANCHES[$i]="$git_branch"
 
     mkdir -p "$RUN_ROOT/$slug"
-    write_repo_meta_json "$RUN_ROOT/$slug" "$repo_path" "$repo_label" "$repo_name" "$slug" "null" "$RUN_TIMESTAMP" "$git_ref" "$git_commit" "$git_branch" "$repo_godot_version" "$qualifies" "$MANIFEST_PATH"
+    write_repo_meta_json "$RUN_ROOT/$slug" "$repo_path" "$repo_label" "$repo_name" "$slug" "null" "$RUN_TIMESTAMP" "$git_ref" "$git_commit" "$git_branch" "$repo_godot_version" "$qualifies" "$MANIFEST_PATH" "$requested_mode" "$actual_mode" "$comparison_label"
   done
 }
 
@@ -2380,11 +2786,13 @@ parse_args "$@"
 initialize_workspace_root
 setup_workspace
 apply_manifest_defaults
+expand_manifest_dual_mode_entries
 record_workspace_env "$WORKTREE_PATH"
 prepare_repo_metadata
 build_local_binary || true
 process_repo_indexing
 write_repo_and_aggregate_summaries
+generate_semantic_parity_reports
 write_run_index_json
 
 printf 'Proof run root: %s\n' "$RUN_ROOT"
