@@ -4,14 +4,14 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Completed 03-03-PLAN.md
-last_updated: "2026-04-12T21:21:09.589Z"
-last_activity: 2026-04-12
+last_updated: "2026-04-12T21:55:06.217Z"
+last_activity: 2026-04-12 -- Phase 04 planning complete
 progress:
   total_phases: 4
   completed_phases: 3
-  total_plans: 8
+  total_plans: 10
   completed_plans: 8
-  percent: 100
+  percent: 80
 ---
 
 # Project State
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-11)
 
 **Core value:** A real Godot demo project indexes cleanly and yields useful GDScript answers through the parser-to-MCP path.
-**Current focus:** Phase 03 — real-repo-semantic-verification
+**Current focus:** Phase 04 — verdicts-and-acceptance-summaries
 
 ## Current Position
 
 Phase: 04
 Plan: Not started
-Status: Executing Phase 03
-Last activity: 2026-04-12
+Status: Ready to execute
+Last activity: 2026-04-12 -- Phase 04 planning complete
 
 Progress: [█████████░] 86%
 
@@ -80,6 +80,9 @@ Recent decisions affecting current work:
 - [Phase 03]: The default make test path now runs manifest-contract, same-script, and semantic-parity proof regressions in sequence.
 - [Phase 03]: semantic-parity.md must expose counts and representative samples from wrapper artifacts so operators can review SEM-01 through SEM-06 without inferring from pass/fail alone.
 - [Phase 03]: scripts/gdscript-proof.sh remains the only approval-bearing workflow, with incomplete parity review falling back to run-index.json and wrapper JSON artifacts.
+- [Phase 04]: aggregate-summary.md should act as a maintainer decision memo that answers promotion status first.
+- [Phase 04]: aggregate incomplete remains distinct from fail but still blocks promotion of support wording.
+- [Phase 04]: aggregate pass only justifies a qualified support claim bounded by the approved manifest corpus and current commit.
 
 ### Pending Todos
 

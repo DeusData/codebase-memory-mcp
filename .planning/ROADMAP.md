@@ -73,7 +73,11 @@ Plans:
   1. Each proof target ends with an explicit `pass`, `fail`, or `incomplete` verdict instead of informal interpretation.
   2. Maintainer can inspect a per-repo summary explaining which checks passed, failed, or remained incomplete.
   3. Aggregate proof output distinguishes verified v1 support from incomplete or out-of-scope behavior so promotion language stays honest.
-**Plans**: TBD
+**Plans**: 2 plans
+
+Plans:
+- [ ] 04-01-PLAN.md — Add regression-backed repo verdict sections and promotion-first aggregate summary wording in the canonical proof harness.
+- [ ] 04-02-PLAN.md — Update the runbook, checklist, and misses tracker for the new verdict and promotion contract.
 
 ## Progress
 
