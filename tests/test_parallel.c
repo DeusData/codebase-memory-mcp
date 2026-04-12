@@ -25,6 +25,29 @@
 
 #define GD_PARITY_PROJECT "gd-par-test"
 
+typedef enum {
+    CBM_PIPELINE_MODE_NONE = 0,
+    CBM_PIPELINE_MODE_AUTO,
+    CBM_PIPELINE_MODE_SEQUENTIAL,
+    CBM_PIPELINE_MODE_PARALLEL,
+} cbm_pipeline_mode;
+
+enum {
+    CBM_PIPELINE_FORCE_PARALLEL_UNAVAILABLE = 2,
+};
+
+typedef struct {
+    cbm_pipeline_mode requested_mode;
+    cbm_pipeline_mode selected_mode;
+    int worker_count;
+    int file_count;
+    bool forced;
+    bool invalid_override;
+} cbm_pipeline_mode_selection_t;
+
+int cbm_pipeline_select_mode(const char *requested_mode, int worker_count, int file_count,
+                             cbm_pipeline_mode_selection_t *selection);
+
 /* ── Helper: create temp test repo ───────────────────────────────── */
 
 static char g_par_tmpdir[256];
@@ -173,6 +196,57 @@ static cbm_gbuf_t *run_parallel(const char *project, const char *repo_path, cbm_
 
     cbm_registry_free(reg);
     return gbuf;
+}
+
+TEST(pipeline_mode_select_auto_rule) {
+    cbm_pipeline_mode_selection_t selection = {0};
+
+    ASSERT_EQ(cbm_pipeline_select_mode(NULL, 2, 51, &selection), 0);
+    ASSERT_EQ(selection.requested_mode, CBM_PIPELINE_MODE_AUTO);
+    ASSERT_EQ(selection.selected_mode, CBM_PIPELINE_MODE_PARALLEL);
+    ASSERT_FALSE(selection.forced);
+    ASSERT_FALSE(selection.invalid_override);
+
+    ASSERT_EQ(cbm_pipeline_select_mode("auto", 2, 50, &selection), 0);
+    ASSERT_EQ(selection.requested_mode, CBM_PIPELINE_MODE_AUTO);
+    ASSERT_EQ(selection.selected_mode, CBM_PIPELINE_MODE_SEQUENTIAL);
+    ASSERT_FALSE(selection.forced);
+    ASSERT_FALSE(selection.invalid_override);
+    PASS();
+}
+
+TEST(pipeline_mode_select_forced_sequential) {
+    cbm_pipeline_mode_selection_t selection = {0};
+
+    ASSERT_EQ(cbm_pipeline_select_mode("sequential", 4, 500, &selection), 0);
+    ASSERT_EQ(selection.requested_mode, CBM_PIPELINE_MODE_SEQUENTIAL);
+    ASSERT_EQ(selection.selected_mode, CBM_PIPELINE_MODE_SEQUENTIAL);
+    ASSERT_TRUE(selection.forced);
+    ASSERT_FALSE(selection.invalid_override);
+    PASS();
+}
+
+TEST(pipeline_mode_select_forced_parallel_requires_workers) {
+    cbm_pipeline_mode_selection_t selection = {0};
+
+    ASSERT_EQ(cbm_pipeline_select_mode("parallel", 1, 5, &selection),
+              CBM_PIPELINE_FORCE_PARALLEL_UNAVAILABLE);
+    ASSERT_EQ(selection.requested_mode, CBM_PIPELINE_MODE_PARALLEL);
+    ASSERT_EQ(selection.selected_mode, CBM_PIPELINE_MODE_NONE);
+    ASSERT_TRUE(selection.forced);
+    ASSERT_FALSE(selection.invalid_override);
+    PASS();
+}
+
+TEST(pipeline_mode_select_invalid_override_defaults_auto) {
+    cbm_pipeline_mode_selection_t selection = {0};
+
+    ASSERT_EQ(cbm_pipeline_select_mode("bogus", 2, 51, &selection), 0);
+    ASSERT_EQ(selection.requested_mode, CBM_PIPELINE_MODE_AUTO);
+    ASSERT_EQ(selection.selected_mode, CBM_PIPELINE_MODE_PARALLEL);
+    ASSERT_FALSE(selection.forced);
+    ASSERT_TRUE(selection.invalid_override);
+    PASS();
 }
 
 /* ── Parity Tests ─────────────────────────────────────────────────── */
@@ -1096,6 +1170,11 @@ SUITE(parallel) {
     RUN_TEST(gbuf_merge_empty_src);
     RUN_TEST(gbuf_merge_src_free_safe);
     RUN_TEST(gbuf_next_id_accessors);
+
+    RUN_TEST(pipeline_mode_select_auto_rule);
+    RUN_TEST(pipeline_mode_select_forced_sequential);
+    RUN_TEST(pipeline_mode_select_forced_parallel_requires_workers);
+    RUN_TEST(pipeline_mode_select_invalid_override_defaults_auto);
 
     /* Parallel pipeline parity tests */
     RUN_TEST(parallel_node_count);
