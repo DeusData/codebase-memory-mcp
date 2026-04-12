@@ -15,11 +15,11 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### GDScript Semantics
 
-- [ ] **SEM-01**: Maintainer can confirm non-zero GDScript class and method extraction from a real proof target with reviewable samples
-- [ ] **SEM-02**: Maintainer can confirm same-script method calls resolve on a real proof target
-- [ ] **SEM-03**: Maintainer can confirm queryable `extends` inheritance relationships on a real proof target
-- [ ] **SEM-04**: Maintainer can confirm queryable `.gd` dependency relationships from `preload` or `load` targets on a real proof target
-- [ ] **SEM-05**: Maintainer can confirm signal declarations and conservative signal-call behavior on a real proof target
+- [x] **SEM-01**: Maintainer can confirm non-zero GDScript class and method extraction from a real proof target with reviewable samples
+- [x] **SEM-02**: Maintainer can confirm same-script method calls resolve on a real proof target
+- [x] **SEM-03**: Maintainer can confirm queryable `extends` inheritance relationships on a real proof target
+- [x] **SEM-04**: Maintainer can confirm queryable `.gd` dependency relationships from `preload` or `load` targets on a real proof target
+- [x] **SEM-05**: Maintainer can confirm signal declarations and conservative signal-call behavior on a real proof target
 - [x] **SEM-06**: Maintainer can confirm the core GDScript behaviors above remain consistent across sequential and parallel indexing paths
 
 ### Proof Evidence
@@ -61,11 +61,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | PROOF-01 | Phase 1 - Proof Contract & Corpus | Complete |
 | PROOF-02 | Phase 2 - Isolated Proof Harness | Pending |
 | PROOF-03 | Phase 4 - Verdicts & Acceptance Summaries | Pending |
-| SEM-01 | Phase 3 - Real-Repo Semantic Verification | Pending |
-| SEM-02 | Phase 3 - Real-Repo Semantic Verification | Pending |
-| SEM-03 | Phase 3 - Real-Repo Semantic Verification | Pending |
-| SEM-04 | Phase 3 - Real-Repo Semantic Verification | Pending |
-| SEM-05 | Phase 3 - Real-Repo Semantic Verification | Pending |
+| SEM-01 | Phase 3 - Real-Repo Semantic Verification | Complete |
+| SEM-02 | Phase 3 - Real-Repo Semantic Verification | Complete |
+| SEM-03 | Phase 3 - Real-Repo Semantic Verification | Complete |
+| SEM-04 | Phase 3 - Real-Repo Semantic Verification | Complete |
+| SEM-05 | Phase 3 - Real-Repo Semantic Verification | Complete |
 | SEM-06 | Phase 3 - Real-Repo Semantic Verification | Complete |
 | EVID-01 | Phase 2 - Isolated Proof Harness | Pending |
 | EVID-02 | Phase 2 - Isolated Proof Harness | Pending |

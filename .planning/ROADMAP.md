@@ -84,5 +84,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 |-------|----------------|--------|-----------|
 | 1. Proof Contract & Corpus | 0/TBD | Not started | - |
 | 2. Isolated Proof Harness | 0/TBD | Not started | - |
-| 3. Real-Repo Semantic Verification | 0/TBD | Not started | - |
+| 3. Real-Repo Semantic Verification | 2/3 | In Progress | - |
 | 4. Verdicts & Acceptance Summaries | 0/TBD | Not started | - |

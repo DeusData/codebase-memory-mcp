@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 03-01-PLAN.md
-last_updated: "2026-04-12T16:59:21.167Z"
+stopped_at: Completed 03-02-PLAN.md
+last_updated: "2026-04-12T17:14:03.395Z"
 last_activity: 2026-04-12
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 7
-  completed_plans: 5
-  percent: 71
+  completed_plans: 6
+  percent: 86
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-04-11)
 ## Current Position
 
 Phase: 03 (real-repo-semantic-verification) — EXECUTING
-Plan: 2 of 3
+Plan: 3 of 3
 Status: Ready to execute
 Last activity: 2026-04-12
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [█████████░] 86%
 
 ## Performance Metrics
 
@@ -55,6 +55,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 01 P01 | 0 min | 2 tasks | 4 files |
 | Phase 01 P02 | 0 min | 2 tasks | 3 files |
 | Phase 03 P01 | 17 min | 2 tasks | 3 files |
+| Phase 03 P02 | 11 min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -72,6 +73,8 @@ Recent decisions affecting current work:
 - [Phase 01]: Ad hoc proof runs remain executable but are labeled non-canonical and non-qualifying.
 - [Phase 03]: Expose cbm_pipeline_select_mode in pipeline_internal.h so runtime selection and native regressions share one contract.
 - [Phase 03]: Treat forced parallel without worker capacity as an explicit error instead of silently falling back to sequential.
+- [Phase 03]: Manifest mode now duplicates every approved proof target into sequential and parallel artifact runs keyed by comparison_label.
+- [Phase 03]: semantic-parity.json and semantic-parity.md stay additive summaries derived from canonical queries/*.json wrappers.
 
 ### Pending Todos
 
@@ -79,10 +82,10 @@ None yet.
 
 ### Blockers/Concerns
 
-- Need planning work to confirm the current four-repo manifest corpus is exercised in a way that cleanly demonstrates all `SEM-01` through `SEM-06` behaviors across both indexing modes.
+None currently.
 
 ## Session Continuity
 
-Last session: 2026-04-12T16:59:21.164Z
-Stopped at: Completed 03-01-PLAN.md
+Last session: 2026-04-12T17:14:03.392Z
+Stopped at: Completed 03-02-PLAN.md
 Resume file: None
