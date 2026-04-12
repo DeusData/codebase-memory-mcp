@@ -208,6 +208,11 @@ def main() -> None:
         for summary in repo_summaries(pass_root):
             require_contains(summary, "## Verdict", "pass repo summary")
             require_contains(summary, "Repo verdict: `pass`", "pass repo summary")
+            require_contains(
+                summary,
+                "Approval contribution: `counts-toward-qualified-support`",
+                "pass repo summary",
+            )
 
         fail_result, fail_root = run_manifest_case(
             repo_root,
@@ -230,6 +235,11 @@ def main() -> None:
         )
         for summary in repo_summaries(fail_root):
             require_contains(summary, "Repo verdict: `fail`", "fail repo summary")
+            require_contains(
+                summary,
+                "Approval contribution: `does-not-count-toward-promotion`",
+                "fail repo summary",
+            )
             require_contains(
                 summary,
                 "| calls.same_script_edges | gd-same-script-calls | `fail` |",
@@ -262,6 +272,11 @@ def main() -> None:
             require_contains(
                 summary,
                 "Repo verdict: `incomplete`",
+                "incomplete repo summary",
+            )
+            require_contains(
+                summary,
+                "Approval contribution: `does-not-count-toward-promotion`",
                 "incomplete repo summary",
             )
             require_contains(

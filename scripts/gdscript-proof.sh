@@ -2076,6 +2076,14 @@ def summarize_repo_with_manifest(slug):
     else:
         outcome = "pass"
 
+    approval_contribution = "does-not-count-toward-promotion"
+    if (
+        outcome == "pass"
+        and meta.get("approval_status") == "canonical-approval-bearing"
+        and meta.get("qualification_status") == "godot-4.x-qualifying"
+    ):
+        approval_contribution = "counts-toward-qualified-support"
+
     def section_lines(title, items):
         lines = ["", f"## {title}"]
         if not items:
@@ -2118,6 +2126,10 @@ def summarize_repo_with_manifest(slug):
         f"- Outcome: {markdown_code(outcome)}",
         f"- CLI capture: {cli_mode + (f' — {cli_note}' if cli_note else '')}",
         f"- Required for: {escape_cell(', '.join((manifest_repo or {}).get('required_for') or []))}",
+        "",
+        "## Verdict",
+        f"- Repo verdict: {markdown_code(outcome)}",
+        f"- Approval contribution: {markdown_code(approval_contribution)}",
     ]
     if issues:
         summary_lines.extend(["", "## Comparability issues"])
@@ -2177,6 +2189,15 @@ if manifest_mode:
 
     aggregate_pass = aggregate_outcome == "pass"
     aggregate_note = "; ".join(aggregate_issues) if aggregate_issues else ("all gating assertions passed" if aggregate_pass else "one or more gating assertions failed")
+    if aggregate_outcome == "pass":
+        promotion_answer = "qualified-support-only"
+        promotion_rationale = "Approved manifest corpus passed for the current commit; keep support claims scoped to this evidence set."
+    elif aggregate_outcome == "fail":
+        promotion_answer = "do-not-promote"
+        promotion_rationale = "Do not promote support wording until the listed gating failures are resolved."
+    else:
+        promotion_answer = "do-not-promote"
+        promotion_rationale = "Do not promote support wording because incomplete evidence means the run is not comparable yet."
 
     lines = [
         "# GDScript Proof Aggregate Summary",
@@ -2191,6 +2212,11 @@ if manifest_mode:
         f"- Final outcome: {markdown_code(aggregate_outcome)}",
         f"- aggregate_pass: {markdown_code('true' if aggregate_pass else 'false')}",
         f"- Aggregate note: {escape_cell(aggregate_note)}",
+        "",
+        "## Promotion decision",
+        f"- Promotion answer: {markdown_code(promotion_answer)}",
+        "- Claim scope: approved manifest corpus only; current commit only",
+        f"- Promotion rationale: {promotion_rationale}",
         "",
         "## Assertion totals",
         f"- gating_total: {markdown_code(gating_total)}",
