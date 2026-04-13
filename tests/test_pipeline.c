@@ -4318,9 +4318,17 @@ static void cleanup_incremental_repo(void) {
  *  FastAPI Depends() edge tracking (PR #66, fix #27)
  * ═══════════════════════════════════════════════════════════════════ */
 
-TEST(pipeline_fastapi_depends_edges) {
-    /* Depends(get_current_user) should produce a CALLS edge from the
-     * endpoint to the dependency function. */
+static int restore_force_pipeline_mode(char *saved_force_mode) {
+    int rc = 0;
+    if (saved_force_mode) {
+        rc = cbm_setenv("CBM_FORCE_PIPELINE_MODE", saved_force_mode, 1);
+        free(saved_force_mode);
+        return rc;
+    }
+    return cbm_unsetenv("CBM_FORCE_PIPELINE_MODE");
+}
+
+static int run_fastapi_depends_edge_case(const char *forced_mode, bool *found_depends_edge) {
     const char *files[] = {"auth.py", "routes.py"};
     const char *contents[] = {/* auth.py: defines get_current_user */
                               "def get_current_user(token: str):\n"
@@ -4330,39 +4338,94 @@ TEST(pipeline_fastapi_depends_edges) {
                               "from auth import get_current_user\n\n"
                               "def get_profile(user = Depends(get_current_user)):\n"
                               "    return {\"user\": user}\n"};
-    if (setup_lang_repo(files, contents, 2) != 0) {
-        SKIP("tmpdir");
-    }
-    char db[512];
-    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
-    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(p);
-    ASSERT_EQ(cbm_pipeline_run(p), 0);
-
-    cbm_store_t *s = cbm_store_open_path(db);
-    ASSERT_NOT_NULL(s);
-    const char *proj = cbm_pipeline_project_name(p);
-
-    /* Check CALLS edges for fastapi_depends strategy */
+    int rc = -1;
+    cbm_pipeline_t *p = NULL;
+    cbm_store_t *s = NULL;
     cbm_edge_t *edges = NULL;
     int edge_count = 0;
-    cbm_store_find_edges_by_type(s, proj, "CALLS", &edges, &edge_count);
+    bool env_changed = false;
+    const char *raw_force_mode = getenv("CBM_FORCE_PIPELINE_MODE");
+    char *saved_force_mode = raw_force_mode ? strdup(raw_force_mode) : NULL;
 
-    bool found_depends_edge = false;
+    *found_depends_edge = false;
+    if (setup_lang_repo(files, contents, 2) != 0) {
+        return -1;
+    }
+
+    if (forced_mode) {
+        if (cbm_setenv("CBM_FORCE_PIPELINE_MODE", forced_mode, 1) != 0) {
+            goto cleanup;
+        }
+        env_changed = true;
+    }
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    if (!p) {
+        goto cleanup;
+    }
+    if (cbm_pipeline_run(p) != 0) {
+        goto cleanup;
+    }
+
+    s = cbm_store_open_path(db);
+    if (!s) {
+        goto cleanup;
+    }
+
+    cbm_store_find_edges_by_type(s, cbm_pipeline_project_name(p), "CALLS", &edges, &edge_count);
     for (int i = 0; i < edge_count; i++) {
         if (edges[i].properties_json && strstr(edges[i].properties_json, "fastapi_depends")) {
-            found_depends_edge = true;
+            *found_depends_edge = true;
             break;
         }
     }
+
+    rc = 0;
+
+cleanup:
     if (edges) {
         cbm_store_free_edges(edges, edge_count);
     }
-    ASSERT_TRUE(found_depends_edge);
-
-    cbm_store_close(s);
-    cbm_pipeline_free(p);
+    if (s) {
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (env_changed && restore_force_pipeline_mode(saved_force_mode) != 0) {
+        rc = -1;
+        saved_force_mode = NULL;
+    } else if (!env_changed) {
+        free(saved_force_mode);
+    }
     teardown_lang_repo();
+    return rc;
+}
+
+TEST(pipeline_fastapi_depends_edges) {
+    /* Depends(get_current_user) should produce a CALLS edge from the
+     * endpoint to the dependency function. */
+    bool found_depends_edge = false;
+    if (run_fastapi_depends_edge_case(NULL, &found_depends_edge) != 0) {
+        SKIP("tmpdir");
+    }
+    ASSERT_TRUE(found_depends_edge);
+    PASS();
+}
+
+TEST(pipeline_fastapi_depends_edges_forced_parallel) {
+    /* Forced parallel must keep the FastAPI Depends() CALLS edge contract. */
+    if (cbm_default_worker_count(true) <= 1) {
+        SKIP("forced parallel requires more than one worker");
+    }
+
+    bool found_depends_edge = false;
+    if (run_fastapi_depends_edge_case("parallel", &found_depends_edge) != 0) {
+        SKIP("tmpdir");
+    }
+    ASSERT_TRUE(found_depends_edge);
     PASS();
 }
 
@@ -6353,6 +6416,7 @@ SUITE(pipeline) {
     /* Incremental reindex */
     /* FastAPI Depends edge tracking (PR #66 port) */
     RUN_TEST(pipeline_fastapi_depends_edges);
+    RUN_TEST(pipeline_fastapi_depends_edges_forced_parallel);
     /* Incremental */
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_detects_changed_file);
