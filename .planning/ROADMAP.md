@@ -16,7 +16,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 2: Isolated Proof Harness** - Make proof runs reproducible, isolated, and backed by a fixed raw MCP query evidence set. (completed 2026-04-12)
 - [x] **Phase 3: Real-Repo Semantic Verification** - Prove the required GDScript extraction and resolution behaviors on real projects across both indexing paths. (completed 2026-04-12)
 - [x] **Phase 4: Verdicts & Acceptance Summaries** - Turn raw proof evidence into explicit per-target outcomes and maintainable promotion summaries. (completed 2026-04-12)
-- [ ] **Phase 5: Web UI Launch Repair** - Restore `--ui=true` so the embedded web UI actually starts again through the supported persisted launch path.
+- [x] **Phase 5: Web UI Launch Repair** - Restore `--ui=true` so the embedded web UI actually starts again through the supported persisted launch path. (completed 2026-04-13)
 
 ## Phase Details
 
@@ -92,7 +92,7 @@ Plans:
 **Plans**: 1 plan
 
 Plans:
-- [ ] 05-01-PLAN.md — Restore the persisted `--ui=true` launch path and add end-to-end regression coverage for enable, relaunch, and disable behavior.
+- [x] 05-01-PLAN.md — Restore the persisted `--ui=true` launch path and add end-to-end regression coverage for enable, relaunch, and disable behavior. (completed 2026-04-13)
 
 ## Progress
 
@@ -105,4 +105,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | 2. Isolated Proof Harness | 2/2 | Complete | 2026-04-12 |
 | 3. Real-Repo Semantic Verification | 4/4 | Complete | 2026-04-12 |
 | 4. Verdicts & Acceptance Summaries | 2/2 | Complete | 2026-04-12 |
-| 5. Web UI Launch Repair | 0/0 | Planned | - |
+| 5. Web UI Launch Repair | 1/1 | Complete | 2026-04-13 |
