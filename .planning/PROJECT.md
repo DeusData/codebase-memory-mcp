@@ -19,6 +19,7 @@ A real Godot demo project indexes cleanly and yields useful GDScript answers thr
 - ✓ Maintainer has a reproducible, isolated proof path with machine-readable raw MCP evidence and incomplete-run diagnostics — Validated in Phase 2: Isolated Proof Harness
 - ✓ Maintainer can verify real-repo GDScript definitions, relationships, and sequential-versus-parallel parity through approval-bearing proof artifacts, regressions, and a forced-parallel lifetime fix — Validated in Phase 3: Real-Repo Semantic Verification
 - ✓ Each proof target now emits an explicit `pass`, `fail`, or `incomplete` verdict with a per-repo summary and promotion-safe aggregate guidance — Validated in Phase 4: Verdicts & Acceptance Summaries
+- ✓ Maintainers can launch the embedded web UI through the persisted `--ui=true` / `--ui=false` contract and keep that path protected by regression coverage — Validated in Phase 5: Web UI Launch Repair
 
 ### Active
 
@@ -39,7 +40,7 @@ Brownfield planning docs already exist under `.planning/codebase/`, and the repo
 
 ## Current State
 
-Phase 4 complete — the proof harness now emits explicit per-repo verdicts and a promotion-first aggregate decision block, while the runbook, checklist, and misses tracker document the exact qualified-support-only versus do-not-promote contract for the approved manifest corpus on the current commit.
+Phase 5 complete — the persisted `--ui=true` launch path now starts the embedded web UI again, `--ui=false` remains explicit, and regression coverage protects enable, relaunch, disable, and help-text behavior.
 
 ## Constraints
 
@@ -75,4 +76,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-12 after Phase 4 completion*
+*Last updated: 2026-04-13 after Phase 5 completion*
