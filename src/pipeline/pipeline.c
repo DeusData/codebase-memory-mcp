@@ -535,6 +535,15 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     return rc;
 }
 
+static void run_fastapi_depends_from_cache(cbm_pipeline_ctx_t *ctx,
+                                           const cbm_file_info_t *files, int file_count,
+                                           CBMFileResult **cache) {
+    CBMFileResult **saved_cache = ctx->result_cache;
+    ctx->result_cache = cache;
+    cbm_pipeline_pass_fastapi_depends(ctx, files, file_count);
+    ctx->result_cache = saved_cache;
+}
+
 /* Run the parallel pipeline path: extract, registry, resolve, infra, k8s. */
 static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                  const cbm_file_info_t *files, int file_count, int worker_count,
@@ -575,6 +584,9 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     cbm_log_info("pass.timing", "pass", "parallel_resolve", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
+    if (rc == 0) {
+        run_fastapi_depends_from_cache(ctx, files, file_count, cache);
+    }
     cbm_pipeline_extract_infra_routes(p->gbuf, files, cache, file_count);
     cbm_pipeline_process_infra_bindings(p->gbuf, files, cache, file_count);
     for (int i = 0; i < file_count; i++) {

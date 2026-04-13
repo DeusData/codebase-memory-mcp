@@ -203,10 +203,18 @@ static void run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *change
                          itoa_buf((int)elapsed_ms(t)));
 
             cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-            cbm_parallel_resolve(ctx, changed_files, ci, cache, &shared_ids, worker_count);
+            int resolve_rc =
+                cbm_parallel_resolve(ctx, changed_files, ci, cache, &shared_ids, worker_count);
             cbm_gbuf_set_next_id(ctx->gbuf, atomic_load(&shared_ids));
             cbm_log_info("pass.timing", "pass", "incr_resolve", "elapsed_ms",
                          itoa_buf((int)elapsed_ms(t)));
+
+            if (resolve_rc == 0) {
+                CBMFileResult **saved_cache = ctx->result_cache;
+                ctx->result_cache = cache;
+                cbm_pipeline_pass_fastapi_depends(ctx, changed_files, ci);
+                ctx->result_cache = saved_cache;
+            }
 
             for (int j = 0; j < ci; j++) {
                 if (cache[j]) {
