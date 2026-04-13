@@ -119,7 +119,7 @@ Plans:
 **Plans**: 1 plan
 
 Plans:
-- [ ] 07-01-PLAN.md — Backfill approved Nyquist validation docs for Phases 01-04 and refresh the milestone audit coverage.
+- [x] 07-01-PLAN.md — Backfill approved Nyquist validation docs for Phases 01-04 and refresh the milestone audit coverage.
 
 ## Progress
 
