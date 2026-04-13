@@ -10,8 +10,8 @@ Requirements for initial release. Each maps to roadmap phases.
 ### Proof Contract
 
 - [x] **PROOF-01**: Maintainer can run validation against pinned real Godot 4.x demo targets with recorded repo identity and project subpath when needed
-- [ ] **PROOF-02**: Maintainer can execute a fixed MCP query suite for each proof target after indexing completes
-- [ ] **PROOF-03**: Each proof target produces an explicit `pass`, `fail`, or `incomplete` outcome instead of informal notes
+- [x] **PROOF-02**: Maintainer can execute a fixed MCP query suite for each proof target after indexing completes
+- [x] **PROOF-03**: Each proof target produces an explicit `pass`, `fail`, or `incomplete` outcome instead of informal notes
 
 ### GDScript Semantics
 
@@ -24,9 +24,13 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Proof Evidence
 
-- [ ] **EVID-01**: Maintainer can run proof validation with isolated local state under repo-owned artifacts so results are reproducible on the same machine
-- [ ] **EVID-02**: Maintainer can inspect machine-readable raw query artifacts for each proof target
-- [ ] **EVID-03**: Maintainer can inspect a per-repo summary that explains what passed, failed, or remained incomplete
+- [x] **EVID-01**: Maintainer can run proof validation with isolated local state under repo-owned artifacts so results are reproducible on the same machine
+- [x] **EVID-02**: Maintainer can inspect machine-readable raw query artifacts for each proof target
+- [x] **EVID-03**: Maintainer can inspect a per-repo summary that explains what passed, failed, or remained incomplete
+
+### Web UI Reliability
+
+- [x] **UI-01**: Maintainer can launch the web UI with `--ui=true` and get the intended embedded UI startup path without launch failure
 
 ## v2 Requirements
 
@@ -59,23 +63,24 @@ Which phases cover which requirements. Updated during roadmap creation.
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | PROOF-01 | Phase 1 - Proof Contract & Corpus | Complete |
-| PROOF-02 | Phase 2 - Isolated Proof Harness | Pending |
-| PROOF-03 | Phase 4 - Verdicts & Acceptance Summaries | Pending |
+| PROOF-02 | Phase 2 - Isolated Proof Harness | Complete |
+| PROOF-03 | Phase 4 - Verdicts & Acceptance Summaries | Complete |
 | SEM-01 | Phase 3 - Real-Repo Semantic Verification | Complete |
 | SEM-02 | Phase 3 - Real-Repo Semantic Verification | Complete |
 | SEM-03 | Phase 3 - Real-Repo Semantic Verification | Complete |
 | SEM-04 | Phase 3 - Real-Repo Semantic Verification | Complete |
 | SEM-05 | Phase 3 - Real-Repo Semantic Verification | Complete |
 | SEM-06 | Phase 3 - Real-Repo Semantic Verification | Complete |
-| EVID-01 | Phase 2 - Isolated Proof Harness | Pending |
-| EVID-02 | Phase 2 - Isolated Proof Harness | Pending |
-| EVID-03 | Phase 4 - Verdicts & Acceptance Summaries | Pending |
+| EVID-01 | Phase 2 - Isolated Proof Harness | Complete |
+| EVID-02 | Phase 2 - Isolated Proof Harness | Complete |
+| EVID-03 | Phase 4 - Verdicts & Acceptance Summaries | Complete |
+| UI-01 | Phase 5 - Web UI Launch Repair | Complete |
 
 **Coverage:**
-- v1 requirements: 12 total
-- Mapped to phases: 12
+- v1 requirements: 13 total
+- Mapped to phases: 13
 - Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-04-11*
-*Last updated: 2026-04-11 after roadmap creation*
+*Last updated: 2026-04-12 after Phase 5 roadmap insertion and paperwork reconciliation*

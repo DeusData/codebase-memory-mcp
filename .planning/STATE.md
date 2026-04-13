@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Phase 5 context gathered
-last_updated: "2026-04-13T00:17:22.329Z"
-last_activity: 2026-04-13 -- Phase 05 planning complete
+status: completed
+stopped_at: Completed 05-01-PLAN.md
+last_updated: "2026-04-13T00:32:09.235Z"
+last_activity: 2026-04-13 -- Phase 05 plan 01 complete
 progress:
   total_phases: 5
-  completed_phases: 4
+  completed_phases: 5
   total_plans: 11
-  completed_plans: 10
-  percent: 91
+  completed_plans: 11
+  percent: 100
 ---
 
 # Project State
@@ -21,22 +21,22 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-11)
 
 **Core value:** A real Godot demo project indexes cleanly and yields useful GDScript answers through the parser-to-MCP path.
-**Current focus:** Phase 05 — web-ui-launch-repair
+**Current focus:** Phase 05 complete — web-ui-launch-repair
 
 ## Current Position
 
 Phase: 05
-Plan: Context complete
-Status: Ready to execute
-Last activity: 2026-04-13 -- Phase 05 planning complete
+Plan: 01 complete
+Status: Completed
+Last activity: 2026-04-13 -- Phase 05 plan 01 complete
 
-Progress: [████████░░] 80%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 10
+- Total plans completed: 11
 - Average duration: -
 - Total execution time: 0 hours
 
@@ -51,7 +51,7 @@ Progress: [████████░░] 80%
 
 **Recent Trend:**
 
-- Last 5 plans: 03-02, 03-03, 03-04, 04-01, 04-02
+- Last 5 plans: 03-03, 03-04, 04-01, 04-02, 05-01
 - Trend: Completed
 
 | Phase 03 P02 | 11 min | 2 tasks | 3 files |
@@ -59,6 +59,7 @@ Progress: [████████░░] 80%
 | Phase 03 P04 | 30 min | 2 tasks | 2 files |
 | Phase 04 P01 | 17 min | 2 tasks | 3 files |
 | Phase 04 P02 | 10 min | 2 tasks | 3 files |
+| Phase 05 P01 | 12 min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -87,6 +88,8 @@ Recent decisions affecting current work:
 - [Phase 04]: aggregate pass only justifies a qualified support claim bounded by the approved manifest corpus and current commit.
 - [Phase 04]: Repo summaries lead with `## Verdict`, and aggregate summaries lead with `## Promotion decision` using exact promotion-safe wording.
 - [Phase 05]: `--ui=true` is a supported persisted launch path that must keep starting the embedded web UI and stay regression-protected.
+- [Phase 05]: Wrapped UI config load/parse/save in load_runtime_ui_config() so startup gating uses the same updated ui_cfg instance.
+- [Phase 05]: Seed the persisted UI regression from a disabled state so --ui=true is verified as a real persisted state transition.
 
 ### Pending Todos
 
@@ -98,6 +101,6 @@ None currently.
 
 ## Session Continuity
 
-Last session: 2026-04-13T00:11:43.104Z
-Stopped at: Phase 5 context gathered
-Resume file: .planning/phases/05-web-ui-launch-repair/05-CONTEXT.md
+Last session: 2026-04-13T00:32:09.231Z
+Stopped at: Completed 05-01-PLAN.md
+Resume file: None
