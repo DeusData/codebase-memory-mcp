@@ -4,6 +4,7 @@
  * Config file: ~/.cache/codebase-memory-mcp/config.json
  * Format: {"ui_enabled": false, "ui_port": 9749}
  */
+#include "foundation/constants.h"
 #include "ui/config.h"
 #include "ui/embedded_assets.h"
 #include "foundation/log.h"
@@ -20,11 +21,11 @@
 /* ── Path ────────────────────────────────────────────────────── */
 
 void cbm_ui_config_path(char *buf, int bufsz) {
-    const char *home = cbm_get_home_dir();
-    if (!home) {
-        home = cbm_tmpdir();
+    const char *dir = cbm_resolve_cache_dir();
+    if (!dir) {
+        dir = cbm_tmpdir();
     }
-    snprintf(buf, (size_t)bufsz, "%s/.cache/codebase-memory-mcp/config.json", home);
+    snprintf(buf, (size_t)bufsz, "%s/config.json", dir);
 }
 
 /* ── Load ────────────────────────────────────────────────────── */
@@ -33,7 +34,7 @@ void cbm_ui_config_load(cbm_ui_config_t *cfg) {
     cfg->ui_enabled = CBM_UI_DEFAULT_ENABLED;
     cfg->ui_port = CBM_UI_DEFAULT_PORT;
 
-    char path[1024];
+    char path[CBM_SZ_1K];
     cbm_ui_config_path(path, (int)sizeof(path));
 
     FILE *f = fopen(path, "rb");
@@ -54,13 +55,13 @@ void cbm_ui_config_load(cbm_ui_config_t *cfg) {
         return; /* empty or suspiciously large → defaults */
     }
 
-    char *buf = malloc((size_t)len + 1);
+    char *buf = malloc((size_t)len + SKIP_ONE);
     if (!buf) {
         fclose(f);
         return;
     }
 
-    size_t nread = fread(buf, 1, (size_t)len, f);
+    size_t nread = fread(buf, SKIP_ONE, (size_t)len, f);
     fclose(f);
     buf[nread] = '\0';
 
@@ -93,11 +94,11 @@ void cbm_ui_config_load(cbm_ui_config_t *cfg) {
 /* ── Save ────────────────────────────────────────────────────── */
 
 void cbm_ui_config_save(const cbm_ui_config_t *cfg) {
-    char path[1024];
+    char path[CBM_SZ_1K];
     cbm_ui_config_path(path, (int)sizeof(path));
 
     /* Ensure directory exists (recursive) */
-    char dir[1024];
+    char dir[CBM_SZ_1K];
     snprintf(dir, sizeof(dir), "%s", path);
     char *slash = strrchr(dir, '/');
     if (slash) {
@@ -128,7 +129,7 @@ void cbm_ui_config_save(const cbm_ui_config_t *cfg) {
         return;
     }
 
-    fwrite(json, 1, json_len, f);
+    fwrite(json, SKIP_ONE, json_len, f);
     fclose(f);
     free(json);
 

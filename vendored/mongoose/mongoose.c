@@ -408,6 +408,7 @@ void mg_resolve(struct mg_connection *c, const char *url) {
   }
 }
 
+// Response header length is 10 bytes
 static const uint8_t mdns_answer[] = {
     0, 1,          // 2 bytes - record type, A
     0, 1,          // 2 bytes - address class, INET
@@ -415,6 +416,7 @@ static const uint8_t mdns_answer[] = {
     0, 4           // 2 bytes - address length
 };
 
+// A name length is name->len + '.local' + 2 = name->len + 8
 static uint8_t *build_name(struct mg_str *name, uint8_t *p) {
   *p++ = (uint8_t) name->len;  // label 1
   memcpy(p, name->buf, name->len), p += name->len;
@@ -426,6 +428,7 @@ static uint8_t *build_name(struct mg_str *name, uint8_t *p) {
 
 void mg_getlocaddr(struct mg_connection *, struct mg_addr *, struct mg_addr *);
 
+// An A record length is 10 + 4 = 14 bytes
 static uint8_t *build_a_record(struct mg_connection *c, uint8_t *p,
                                struct mg_addr *addr) {
   memcpy(p, mdns_answer, sizeof(mdns_answer)), p += sizeof(mdns_answer);
@@ -447,6 +450,7 @@ static uint8_t *build_a_record(struct mg_connection *c, uint8_t *p,
   return p;
 }
 
+// A srv name length is r->srvcproto.len + '.local' + 2 = r->srvcproto.len + 8
 static uint8_t *build_srv_name(uint8_t *p, struct mg_dnssd_record *r) {
   *p++ = (uint8_t) r->srvcproto.len - 5;  // label 1, up to '._tcp'
   memcpy(p, r->srvcproto.buf, r->srvcproto.len), p += r->srvcproto.len;
@@ -467,6 +471,7 @@ static uint8_t *build_mysrv_name(struct mg_str *name, uint8_t *p,
 }
 #endif
 
+// A PTR record length is 10 + name->len + 3 = name->len + 13
 static uint8_t *build_ptr_record(struct mg_str *name, uint8_t *p, uint16_t o) {
   uint16_t offset = mg_htons(o);
   memcpy(p, mdns_answer, sizeof(mdns_answer));
@@ -481,6 +486,7 @@ static uint8_t *build_ptr_record(struct mg_str *name, uint8_t *p, uint16_t o) {
   return p;
 }
 
+// An SRV record length is 10 + name->len + 9 = name->len + 19
 static uint8_t *build_srv_record(struct mg_str *name, uint8_t *p,
                                  struct mg_dnssd_record *r, uint16_t o) {
   uint16_t port = mg_htons(r->port);
@@ -501,6 +507,7 @@ static uint8_t *build_srv_record(struct mg_str *name, uint8_t *p,
   return p;
 }
 
+// A TXT record length is r->txt.len (txt contents) + 10
 static uint8_t *build_txt_record(uint8_t *p, struct mg_dnssd_record *r) {
   uint16_t len = mg_htons((uint16_t) r->txt.len);
   memcpy(p, mdns_answer, sizeof(mdns_answer));
@@ -510,6 +517,8 @@ static uint8_t *build_txt_record(uint8_t *p, struct mg_dnssd_record *r) {
   memcpy(p, r->txt.buf, r->txt.len), p += r->txt.len;  // copy record verbatim
   return p;
 }
+
+// Each additional record has a 2-byte field pointing to the name label
 
 // RFC-6762 16: case-insensitivity --> RFC-1034, 1035
 
@@ -599,6 +608,10 @@ static void handle_mdns_query(struct mg_connection *c) {
       uint8_t *o = p, *aux;
       uint16_t offset;
       if (respname->buf == NULL || respname->len == 0) return;
+      if ((sizeof(*h) + req.r->srvcproto.len + 8 + respname->len + 13 + 2 +
+           respname->len + 19 + 2 + req.r->txt.len + 10 + 2 + 14) >
+          sizeof(buf))  // srv name + PTR + 2 + SRV + 2 + TXT + 2 + A
+        return;
       h->num_other_prs = mg_htons(3);  // 3 additional records
       p = build_srv_name(p, req.r);
       aux = build_ptr_record(respname, p, (uint16_t) (o - buf));
@@ -619,12 +632,18 @@ static void handle_mdns_query(struct mg_connection *c) {
       *p |= 0xC0, p += 2;
       p = build_a_record(c, p, req.addr);
     } else if (rr.atype == MG_DNS_RTYPE_TXT) {
+      if ((sizeof(*h) + req.r->srvcproto.len + 8 + req.r->txt.len + 10) >
+          sizeof(buf))  // srv name + TXT
+        return;
       p = build_srv_name(p, req.r);
       p = build_txt_record(p, req.r);
     } else if (rr.atype == MG_DNS_RTYPE_SRV) {  // serve SRV + A
       uint8_t *o, *aux;
       uint16_t offset;
       if (respname->buf == NULL || respname->len == 0) return;
+      if ((sizeof(*h) + req.r->srvcproto.len + 8 + respname->len + 19 + 2 +
+           14) > sizeof(buf))  // srv name + SRV + 2 + A
+        return;
       h->num_other_prs = mg_htons(1);  // 1 additional record
       p = build_srv_name(p, req.r);
       o = p - 7;  // point to '.local' label (\x05local\x00)
@@ -638,6 +657,8 @@ static void handle_mdns_query(struct mg_connection *c) {
     } else {  // A requested
       // RFC-6762 6: 0 Auth, 0 Additional RRs
       if (respname->buf == NULL || respname->len == 0) return;
+      if ((sizeof(*h) + respname->len + 8 + 14) > sizeof(buf))  // name + A
+        return;
       p = build_name(respname, p);
       p = build_a_record(c, p, req.addr);
     }
@@ -1941,6 +1962,8 @@ static const char *skiptorn(const char *s, const char *end, struct mg_str *v) {
 static bool mg_http_parse_headers(const char *s, const char *end,
                                   struct mg_http_header *h, size_t max_hdrs) {
   size_t i, n;
+  int cl_count = 0, te_count = 0, auth_count = 0;
+  int conn_count = 0, cookie_count = 0;
   for (i = 0; i < max_hdrs; i++) {
     struct mg_str k = {NULL, 0}, v = {NULL, 0};
     if (s >= end) return false;
@@ -1956,6 +1979,13 @@ static bool mg_http_parse_headers(const char *s, const char *end,
     while (v.len > 0 && (v.buf[v.len - 1] == ' ' || v.buf[v.len - 1] == '\t')) {
       v.len--;  // Trim spaces
     }
+    // detect duplicated headers -> discard
+    if (((mg_strcasecmp(k, mg_str("Content-Length")) == 0) && (++cl_count > 1)) ||
+      ((mg_strcasecmp(k, mg_str("Transfer-Encoding")) == 0) && (++te_count > 1)) ||
+      ((mg_strcasecmp(k, mg_str("Authorization")) == 0) && (++auth_count > 1)) ||
+      ((mg_strcasecmp(k, mg_str("Cookie")) == 0) && (++cookie_count > 1)) ||
+      ((mg_strcasecmp(k, mg_str("Connection")) == 0) && (++conn_count > 1)))
+      return false;
     // MG_INFO(("--HH [%.*s] [%.*s]", (int) k.len, k.buf, (int) v.len, v.buf));
     h[i].name = k, h[i].value = v;  // Success. Assign values
   }
@@ -1990,6 +2020,8 @@ int mg_http_parse(const char *s, size_t len, struct mg_http_message *hm) {
   // If we're given a version, check that it is HTTP/x.x
   version_prefix_valid =
       hm->proto.len > 5 && (mg_ncasecmp(hm->proto.buf, "HTTP/", 5) == 0);
+  if (!is_response && !version_prefix_valid)
+    return -1; // no version detected in request
   if (!is_response && hm->proto.len > 0 &&
       (!version_prefix_valid || hm->proto.len != 8 ||
        (hm->proto.buf[5] < '0' || hm->proto.buf[5] > '9') ||
@@ -2716,7 +2748,7 @@ static void http_cb(struct mg_connection *c, int ev, void *ev_data) {
       const char *buf = (char *) c->recv.buf + ofs;
       int n = mg_http_parse(buf, c->recv.len - ofs, &hm);
       struct mg_str *te;  // Transfer - encoding header
-      bool is_chunked = false;
+      bool is_chunked = false, is_http_1_0 = false;
       size_t old_len = c->recv.len;
       if (n < 0) {
         // We don't use mg_error() here, to avoid closing pipelined requests
@@ -2739,7 +2771,11 @@ static void http_cb(struct mg_connection *c, int ev, void *ev_data) {
         hm.message.len = c->recv.len - ofs;  // and closes now, deliver MSG
         hm.body.len = hm.message.len - (size_t) (hm.body.buf - hm.message.buf);
       }
-      if ((te = mg_http_get_header(&hm, "Transfer-Encoding")) != NULL) {
+      is_http_1_0 =
+          hm.proto.len > 8 && mg_ncasecmp(hm.proto.buf, "HTTP/1.0", 8) == 0;
+      // HTTP/1.0 does not use "Transfer-Encoding: chunked"
+      if (!is_http_1_0 &&
+          (te = mg_http_get_header(&hm, "Transfer-Encoding")) != NULL) {
         if (mg_strcasecmp(*te, mg_str("chunked")) == 0) {
           is_chunked = true;
         } else {
@@ -2963,15 +2999,28 @@ static double mg_atod(const char *p, int len, int *numlen) {
 
   // Exponential
   if (i < len && (p[i] == 'e' || p[i] == 'E')) {
-    int j, exp = 0, minus = 0;
+    int exp = 0, minus = 0;
     i++;
     if (i < len && p[i] == '-') minus = 1, i++;
     if (i < len && p[i] == '+') i++;
     while (i < len && p[i] >= '0' && p[i] <= '9' && exp < 308)
       exp = exp * 10 + (p[i++] - '0');
-    if (minus) exp = -exp;
-    for (j = 0; j < exp; j++) d *= 10.0;
-    for (j = 0; j < -exp; j++) d /= 10.0;
+    // use fast exponentiation
+    // https://en.wikipedia.org/wiki/Exponentiation_by_squaring
+    if (exp != 0) {
+      double x = 10, y = 1;
+      if (exp > 308) exp = 308;
+      if (minus) x = 0.1;
+      while (exp > 1) {
+        if (exp & 1) {
+          y *= x;
+          --exp;
+        }
+        x *= x;
+        exp >>= 1;
+      }
+      d *= x * y;
+    }
   }
 
   if (numlen != NULL) *numlen = i;
@@ -5462,9 +5511,13 @@ static struct mg_connection *getpeer(struct mg_mgr *mgr, struct pkt *pkt,
         !(c->loc.is_ip6 ^ (pkt->ip6 != NULL)))  // IP or IPv6 to same dest
       break;
     if (!c->is_udp && pkt->tcp && c->loc.port == pkt->tcp->dport &&
-        !(c->loc.is_ip6 ^ (pkt->ip6 != NULL)) &&
-        lsn == (bool) c->is_listening &&
-        (lsn || c->rem.port == pkt->tcp->sport))
+        ((lsn && c->is_listening && !(c->loc.is_ip6 ^ (pkt->ip6 != NULL))) ||
+         (!lsn && !c->is_listening && c->rem.port == pkt->tcp->sport &&
+          ((!c->loc.is_ip6 && c->rem.addr.ip4 == pkt->ip->src)
+#if MG_ENABLE_IPV6
+           || (c->loc.is_ip6 && MG_IP6MATCH(c->rem.addr.ip6, pkt->ip6->src))
+#endif
+               )))) // validate addr for established (not listening) conns
       break;
   }
   return c;
@@ -6408,7 +6461,7 @@ static void backlog_poll(struct mg_mgr *mgr) {
 }
 
 // process options (MSS)
-static void handle_opt(struct connstate *s, struct tcp *tcp, bool ip6) {
+static bool handle_opt(struct connstate *s, struct tcp *tcp, bool ip6) {
   uint8_t *opts = (uint8_t *) (tcp + 1);
   int len = 4 * ((int) (tcp->off >> 4) - ((int) sizeof(*tcp) / 4));
   s->dmss = ip6 ? 1220 : 536;  // assume default, RFC-9293 3.7.1
@@ -6416,6 +6469,7 @@ static void handle_opt(struct connstate *s, struct tcp *tcp, bool ip6) {
     uint8_t kind = opts[0], optlen = 1;
     if (kind != 1) {         // No-Operation
       if (kind == 0) break;  // End of Option List
+      if (len < 2 || opts[1] == 0) return false; // Malformed options
       optlen = opts[1];
       if (kind == 2 && optlen == 4)  // set received MSS
         s->dmss = (uint16_t) (((uint16_t) opts[2] << 8) + opts[3]);
@@ -6424,6 +6478,7 @@ static void handle_opt(struct connstate *s, struct tcp *tcp, bool ip6) {
     opts += optlen;
     len -= optlen;
   }
+  return true;
 }
 
 static void rx_tcp(struct mg_tcpip_if *ifp, struct pkt *pkt) {
@@ -6438,7 +6493,7 @@ static void rx_tcp(struct mg_tcpip_if *ifp, struct pkt *pkt) {
   // - check clients (Group 1) and established connections (Group 3)
   if (c != NULL && c->is_connecting && pkt->tcp->flags == (TH_SYN | TH_ACK)) {
     // client got a server connection accept
-    handle_opt(s, pkt->tcp, pkt->ip6 != NULL);  // process options (MSS)
+    if (!handle_opt(s, pkt->tcp, pkt->ip6 != NULL)) return;  // process options (MSS)
     s->seq = mg_ntohl(pkt->tcp->ack), s->ack = mg_ntohl(pkt->tcp->seq) + 1;
     tx_tcp_ctrlresp(ifp, pkt, TH_ACK, pkt->tcp->ack);
     c->is_connecting = 0;  // Client connected
@@ -6449,8 +6504,9 @@ static void rx_tcp(struct mg_tcpip_if *ifp, struct pkt *pkt) {
   } else if (c != NULL && c->is_connecting && pkt->tcp->flags != TH_ACK) {
     mg_error(c, "connection refused");
   } else if (c != NULL && pkt->tcp->flags & TH_RST) {
-    // TODO(): validate RST is within window (and optional with proper ACK)
-    mg_error(c, "peer RST");  // RFC-1122 4.2.2.13
+    uint32_t seqno = mg_ntohl(pkt->tcp->seq);
+    if (seqno >= s->ack && seqno < (s->ack + MG_TCPIP_WIN))  // RFC-9293 3.5.3
+      mg_error(c, "peer RST");  // RFC-1122 4.2.2.13
   } else if (c != NULL) {
     // process segment
     s->tmiss = 0;                         // Reset missed keep-alive counter
@@ -6472,7 +6528,7 @@ static void rx_tcp(struct mg_tcpip_if *ifp, struct pkt *pkt) {
       int key;
       uint32_t isn;
       if (pkt->tcp->sport != 0) {
-        handle_opt(&cs, pkt->tcp, pkt->ip6 != NULL);  // process options (MSS)
+        if (!handle_opt(&cs, pkt->tcp, pkt->ip6 != NULL)) return;  // process options (MSS)
         key = backlog_insert(c, pkt->tcp->sport,
                              cs.dmss);  // backlog options (MSS)
         if (key < 0) return;  // no room in backlog, discard SYN, client retries
@@ -11365,7 +11421,9 @@ bool mg_match(struct mg_str s, struct mg_str p, struct mg_str *caps) {
     } else if (i < p.len && (p.buf[i] == '*' || p.buf[i] == '#')) {
       if (caps && !caps->buf) caps->len = 0, caps->buf = &s.buf[j];  // Init cap
       ni = i++, nj = j + 1;
-    } else if (nj > 0 && nj <= s.len && ((ni < p.len && p.buf[ni] == '#') || s.buf[j] != '/')) {
+    } else if (nj > 0 && nj <= s.len &&
+               ((ni < p.len && p.buf[ni] == '#') ||
+                (j < s.len && s.buf[j] != '/'))) {
       i = ni, j = nj;
       if (caps && caps->buf == NULL && caps->len == 0) {
         caps--, caps->len = 0;  // Restart previous cap
@@ -11446,8 +11504,7 @@ bool mg_str_to_num(struct mg_str str, int base, void *val, size_t val_len) {
         i++, ndigits++;
       }
       break;
-    default:
-      return false;
+    default: return false;
   }
   if (ndigits == 0) return false;
   if (i != str.len) return false;
@@ -11557,45 +11614,47 @@ static void aes_init_keygen_tables(void);
 /******************************************************************************
  *  AES_SETKEY : called to expand the key for encryption or decryption
  ******************************************************************************/
-static int aes_setkey(aes_context *ctx,  // pointer to context
-                      int mode,          // 1 or 0 for Encrypt/Decrypt
-                      const unsigned char *key,  // AES input key
-                      unsigned int keysize);  // size in bytes (must be 16, 24, 32 for
-                                      // 128, 192 or 256-bit keys respectively)
-                                      // returns 0 for success
+static int aes_setkey(
+    aes_context *ctx,          // pointer to context
+    int mode,                  // 1 or 0 for Encrypt/Decrypt
+    const unsigned char *key,  // AES input key
+    unsigned int keysize);     // size in bytes (must be 16, 24, 32 for
+                               // 128, 192 or 256-bit keys respectively)
+                               // returns 0 for success
 
 /******************************************************************************
  *  AES_CIPHER : called to encrypt or decrypt ONE 128-bit block of data
  ******************************************************************************/
-static int aes_cipher(aes_context *ctx,       // pointer to context
-                      const unsigned char input[16],  // 128-bit block to en/decipher
-                      unsigned char output[16]);      // 128-bit output result block
-                                              // returns 0 for success
+static int aes_cipher(
+    aes_context *ctx,               // pointer to context
+    const unsigned char input[16],  // 128-bit block to en/decipher
+    unsigned char output[16]);      // 128-bit output result block
+                                    // returns 0 for success
 
 /******************************************************************************
  *  GCM_CONTEXT : GCM context / holds keytables, instance data, and AES ctx
  ******************************************************************************/
 typedef struct {
-  int mode;             // cipher direction: encrypt/decrypt
-  uint64_t len;         // cipher data length processed so far
-  uint64_t add_len;     // total add data length
-  uint64_t HL[16];      // precalculated lo-half HTable
-  uint64_t HH[16];      // precalculated hi-half HTable
+  int mode;                     // cipher direction: encrypt/decrypt
+  uint64_t len;                 // cipher data length processed so far
+  uint64_t add_len;             // total add data length
+  uint64_t HL[16];              // precalculated lo-half HTable
+  uint64_t HH[16];              // precalculated hi-half HTable
   unsigned char base_ectr[16];  // first counter-mode cipher output for tag
   unsigned char y[16];          // the current cipher-input IV|Counter value
   unsigned char buf[16];        // buf working value
-  aes_context aes_ctx;  // cipher context used
+  aes_context aes_ctx;          // cipher context used
 } gcm_context;
 
 /******************************************************************************
  *  GCM_SETKEY : sets the GCM (and AES) keying material for use
  ******************************************************************************/
 static int gcm_setkey(
-    gcm_context *ctx,   // caller-provided context ptr
+    gcm_context *ctx,           // caller-provided context ptr
     const unsigned char *key,   // pointer to cipher key
     const unsigned int keysize  // size in bytes (must be 16, 24, 32 for
-                        // 128, 192 or 256-bit keys respectively)
-);                      // returns 0 for success
+                                // 128, 192 or 256-bit keys respectively)
+);                              // returns 0 for success
 
 /******************************************************************************
  *
@@ -11615,17 +11674,17 @@ static int gcm_setkey(
  *
  ******************************************************************************/
 static int gcm_crypt_and_tag(
-    gcm_context *ctx,    // gcm context with key already setup
-    int mode,            // cipher direction: MG_ENCRYPT (1) or MG_DECRYPT (0)
+    gcm_context *ctx,  // gcm context with key already setup
+    int mode,          // cipher direction: MG_ENCRYPT (1) or MG_DECRYPT (0)
     const unsigned char *iv,     // pointer to the 12-byte initialization vector
-    size_t iv_len,       // byte length if the IV. should always be 12
+    size_t iv_len,               // byte length if the IV. should always be 12
     const unsigned char *add,    // pointer to the non-ciphered additional data
-    size_t add_len,      // byte length of the additional AEAD data
+    size_t add_len,              // byte length of the additional AEAD data
     const unsigned char *input,  // pointer to the cipher data source
     unsigned char *output,       // pointer to the cipher data destination
-    size_t length,       // byte length of the cipher data
+    size_t length,               // byte length of the cipher data
     unsigned char *tag,          // pointer to the tag to be generated
-    size_t tag_len);     // byte length of the tag to be generated
+    size_t tag_len);             // byte length of the tag to be generated
 
 /******************************************************************************
  *
@@ -11636,12 +11695,12 @@ static int gcm_crypt_and_tag(
  *
  ******************************************************************************/
 static int gcm_start(
-    gcm_context *ctx,  // pointer to user-provided GCM context
-    int mode,          // MG_ENCRYPT (1) or MG_DECRYPT (0)
+    gcm_context *ctx,          // pointer to user-provided GCM context
+    int mode,                  // MG_ENCRYPT (1) or MG_DECRYPT (0)
     const unsigned char *iv,   // pointer to initialization vector
-    size_t iv_len,     // IV length in bytes (should == 12)
+    size_t iv_len,             // IV length in bytes (should == 12)
     const unsigned char *add,  // pointer to additional AEAD data (NULL if none)
-    size_t add_len);   // length of additional AEAD data (bytes)
+    size_t add_len);           // length of additional AEAD data (bytes)
 
 /******************************************************************************
  *
@@ -11657,7 +11716,7 @@ static int gcm_start(
 static int gcm_update(gcm_context *ctx,  // pointer to user-provided GCM context
                       size_t length,     // length, in bytes, of data to process
                       const unsigned char *input,  // pointer to source data
-                      unsigned char *output);      // pointer to destination data
+                      unsigned char *output);  // pointer to destination data
 
 /******************************************************************************
  *
@@ -11668,9 +11727,9 @@ static int gcm_update(gcm_context *ctx,  // pointer to user-provided GCM context
  *
  ******************************************************************************/
 static int gcm_finish(
-    gcm_context *ctx,  // pointer to user-provided GCM context
-    unsigned char *tag,        // ptr to tag buffer - NULL if tag_len = 0
-    size_t tag_len);   // length, in bytes, of the tag-receiving buf
+    gcm_context *ctx,    // pointer to user-provided GCM context
+    unsigned char *tag,  // ptr to tag buffer - NULL if tag_len = 0
+    size_t tag_len);     // length, in bytes, of the tag-receiving buf
 
 /******************************************************************************
  *
@@ -11721,15 +11780,15 @@ static int aes_tables_inited = 0;  // run-once flag for performing key
  *  decryption is typically disabled by setting AES_DECRYPTION to 0 in aes.h.
  */
 // We always need our forward tables
-static unsigned char FSb[256];     // Forward substitution box (FSb)
-static uint32_t FT0[256];  // Forward key schedule assembly tables
+static unsigned char FSb[256];  // Forward substitution box (FSb)
+static uint32_t FT0[256];       // Forward key schedule assembly tables
 static uint32_t FT1[256];
 static uint32_t FT2[256];
 static uint32_t FT3[256];
 
-#if AES_DECRYPTION         // We ONLY need reverse for decryption
-static unsigned char RSb[256];     // Reverse substitution box (RSb)
-static uint32_t RT0[256];  // Reverse key schedule assembly tables
+#if AES_DECRYPTION              // We ONLY need reverse for decryption
+static unsigned char RSb[256];  // Reverse substitution box (RSb)
+static uint32_t RT0[256];       // Reverse key schedule assembly tables
 static uint32_t RT1[256];
 static uint32_t RT2[256];
 static uint32_t RT3[256];
@@ -11747,8 +11806,8 @@ static uint32_t RCON[10];  // AES round constants
           ((uint32_t) (b)[(i) + 2] << 16) | ((uint32_t) (b)[(i) + 3] << 24); \
   }
 
-#define PUT_UINT32_LE(n, b, i)          \
-  {                                     \
+#define PUT_UINT32_LE(n, b, i)                  \
+  {                                             \
     (b)[(i)] = (unsigned char) ((n));           \
     (b)[(i) + 1] = (unsigned char) ((n) >> 8);  \
     (b)[(i) + 2] = (unsigned char) ((n) >> 16); \
@@ -11893,7 +11952,7 @@ void aes_init_keygen_tables(void) {
  ******************************************************************************/
 static int aes_set_encryption_key(aes_context *ctx, const unsigned char *key,
                                   unsigned int keysize) {
-  unsigned int i;                  // general purpose iteration local
+  unsigned int i;          // general purpose iteration local
   uint32_t *RK = ctx->rk;  // initialize our RoundKey buffer pointer
 
   for (i = 0; i < (keysize >> 2); i++) {
@@ -12228,8 +12287,8 @@ static const uint64_t last4[16] = {
           ((uint32_t) (b)[(i) + 2] << 8) | ((uint32_t) (b)[(i) + 3]);     \
   }
 
-#define PUT_UINT32_BE(n, b, i)          \
-  {                                     \
+#define PUT_UINT32_BE(n, b, i)                  \
+  {                                             \
     (b)[(i)] = (unsigned char) ((n) >> 24);     \
     (b)[(i) + 1] = (unsigned char) ((n) >> 16); \
     (b)[(i) + 2] = (unsigned char) ((n) >> 8);  \
@@ -12262,9 +12321,10 @@ int mg_gcm_initialize(void) {
  *  'x' and 'output' are seen as elements of GCM's GF(2^128) Galois field.
  *
  ******************************************************************************/
-static void gcm_mult(gcm_context *ctx,   // pointer to established context
-                     const unsigned char x[16],  // pointer to 128-bit input vector
-                     unsigned char output[16])   // pointer to 128-bit output vector
+static void gcm_mult(
+    gcm_context *ctx,           // pointer to established context
+    const unsigned char x[16],  // pointer to 128-bit input vector
+    unsigned char output[16])   // pointer to 128-bit output vector
 {
   int i;
   unsigned char lo, hi, rem;
@@ -12309,10 +12369,10 @@ static void gcm_mult(gcm_context *ctx,   // pointer to established context
  *
  ******************************************************************************/
 static int gcm_setkey(
-    gcm_context *ctx,    // pointer to caller-provided gcm context
+    gcm_context *ctx,            // pointer to caller-provided gcm context
     const unsigned char *key,    // pointer to the AES encryption key
     const unsigned int keysize)  // size in bytes (must be 16, 24, 32 for
-                         // 128, 192 or 256-bit keys respectively)
+                                 // 128, 192 or 256-bit keys respectively)
 {
   int ret, i, j;
   uint64_t hi, lo;
@@ -12381,18 +12441,19 @@ static int gcm_setkey(
  *  mode, and preprocesses the initialization vector and additional AEAD data.
  *
  ******************************************************************************/
-int gcm_start(gcm_context *ctx,  // pointer to user-provided GCM context
-              int mode,          // GCM_ENCRYPT or GCM_DECRYPT
-              const unsigned char *iv,   // pointer to initialization vector
-              size_t iv_len,     // IV length in bytes (should == 12)
-              const unsigned char *add,  // ptr to additional AEAD data (NULL if none)
-              size_t add_len)    // length of additional AEAD data (bytes)
+int gcm_start(
+    gcm_context *ctx,          // pointer to user-provided GCM context
+    int mode,                  // GCM_ENCRYPT or GCM_DECRYPT
+    const unsigned char *iv,   // pointer to initialization vector
+    size_t iv_len,             // IV length in bytes (should == 12)
+    const unsigned char *add,  // ptr to additional AEAD data (NULL if none)
+    size_t add_len)            // length of additional AEAD data (bytes)
 {
-  int ret;             // our error return if the AES encrypt fails
+  int ret;                     // our error return if the AES encrypt fails
   unsigned char work_buf[16];  // XOR source built from provided IV if len != 16
   const unsigned char *p;      // general purpose array pointer
-  size_t use_len;      // byte count to process, up to 16 bytes
-  size_t i;            // local loop iterator
+  size_t use_len;              // byte count to process, up to 16 bytes
+  size_t i;                    // local loop iterator
 
   // since the context might be reused under the same key
   // we zero the working buffers for this next new process
@@ -12449,15 +12510,15 @@ int gcm_start(gcm_context *ctx,  // pointer to user-provided GCM context
  *  have a partial block length of < 128 bits.)
  *
  ******************************************************************************/
-int gcm_update(gcm_context *ctx,    // pointer to user-provided GCM context
-               size_t length,       // length, in bytes, of data to process
+int gcm_update(gcm_context *ctx,  // pointer to user-provided GCM context
+               size_t length,     // length, in bytes, of data to process
                const unsigned char *input,  // pointer to source data
                unsigned char *output)       // pointer to destination data
 {
-  int ret;         // our error return if the AES encrypt fails
+  int ret;                 // our error return if the AES encrypt fails
   unsigned char ectr[16];  // counter-mode cipher output for XORing
-  size_t use_len;  // byte count to process, up to 16 bytes
-  size_t i;        // local loop iterator
+  size_t use_len;          // byte count to process, up to 16 bytes
+  size_t i;                // local loop iterator
 
   ctx->len += length;  // bump the GCM context's running length count
 
@@ -12513,9 +12574,9 @@ int gcm_update(gcm_context *ctx,    // pointer to user-provided GCM context
  *  It performs the final GHASH to produce the resulting authentication TAG.
  *
  ******************************************************************************/
-int gcm_finish(gcm_context *ctx,  // pointer to user-provided GCM context
-               unsigned char *tag,        // pointer to buffer which receives the tag
-               size_t tag_len)    // length, in bytes, of the tag-receiving buf
+int gcm_finish(gcm_context *ctx,    // pointer to user-provided GCM context
+               unsigned char *tag,  // pointer to buffer which receives the tag
+               size_t tag_len)  // length, in bytes, of the tag-receiving buf
 {
   unsigned char work_buf[16];
   uint64_t orig_len = ctx->len * 8;
@@ -12557,22 +12618,22 @@ int gcm_finish(gcm_context *ctx,  // pointer to user-provided GCM context
  *
  ******************************************************************************/
 int gcm_crypt_and_tag(
-    gcm_context *ctx,    // gcm context with key already setup
-    int mode,            // cipher direction: GCM_ENCRYPT or GCM_DECRYPT
+    gcm_context *ctx,            // gcm context with key already setup
+    int mode,                    // cipher direction: GCM_ENCRYPT or GCM_DECRYPT
     const unsigned char *iv,     // pointer to the 12-byte initialization vector
-    size_t iv_len,       // byte length if the IV. should always be 12
+    size_t iv_len,               // byte length if the IV. should always be 12
     const unsigned char *add,    // pointer to the non-ciphered additional data
-    size_t add_len,      // byte length of the additional AEAD data
+    size_t add_len,              // byte length of the additional AEAD data
     const unsigned char *input,  // pointer to the cipher data source
     unsigned char *output,       // pointer to the cipher data destination
-    size_t length,       // byte length of the cipher data
+    size_t length,               // byte length of the cipher data
     unsigned char *tag,          // pointer to the tag to be generated
-    size_t tag_len)      // byte length of the tag to be generated
-{                        /*
-                            assuming that the caller has already invoked gcm_setkey to
-                            prepare the gcm context with the keying material, we simply
-                            invoke each of the three GCM sub-functions in turn...
-                         */
+    size_t tag_len)              // byte length of the tag to be generated
+{                                /*
+                                    assuming that the caller has already invoked gcm_setkey to
+                                    prepare the gcm context with the keying material, we simply
+                                    invoke each of the three GCM sub-functions in turn...
+                                 */
   gcm_start(ctx, mode, iv, iv_len, add, add_len);
   gcm_update(ctx, length, input, output);
   gcm_finish(ctx, tag, tag_len);
@@ -12622,19 +12683,27 @@ int mg_aes_gcm_encrypt(unsigned char *output,  //
 int mg_aes_gcm_decrypt(unsigned char *output, const unsigned char *input,
                        size_t input_length, const unsigned char *key,
                        const size_t key_len, const unsigned char *iv,
-                       const size_t iv_len) {
+                       const size_t iv_len, unsigned char *aead,
+                       size_t aead_len, const unsigned char *tag,
+                       const size_t tag_len) {
   int ret = 0;      // our return value
   gcm_context ctx;  // includes the AES context structure
+  unsigned char computed_tag[16];
+  size_t i;
+  int diff = 0;
 
-  size_t tag_len = 0;
-  unsigned char *tag_buf = NULL;
+  if (tag_len > sizeof(computed_tag)) return -1;
 
   gcm_setkey(&ctx, key, (unsigned int) key_len);
 
-  ret = gcm_crypt_and_tag(&ctx, MG_DECRYPT, iv, iv_len, NULL, 0, input, output,
-                          input_length, tag_buf, tag_len);
+  ret = gcm_crypt_and_tag(&ctx, MG_DECRYPT, iv, iv_len, aead, aead_len, input,
+                          output, input_length, computed_tag, tag_len);
 
   gcm_zero_ctx(&ctx);
+
+  // compare tags
+  for (i = 0; i < tag_len; i++) diff |= computed_tag[i] ^ tag[i];
+  if (diff != 0) ret = -1;
 
   return (ret);
 }
@@ -13201,14 +13270,19 @@ static int mg_tls_recv_record(struct mg_connection *c) {
   nonce[11] ^= (uint8_t) ((seq) & 255U);
 #if MG_ENABLE_CHACHA20
   {
+    uint8_t associated_data[5] = {MG_TLS_APP_DATA, 0x03, 0x03,
+                                  (uint8_t) ((msgsz >> 8) & 0xff),
+                                  (uint8_t) (msgsz & 0xff)};
     uint8_t *dec = (uint8_t *) mg_calloc(1, msgsz);
     size_t n;
     if (dec == NULL) {
       mg_error(c, "TLS OOM");
       return -1;
     }
-    n = mg_chacha20_poly1305_decrypt(dec, key, nonce, msg, msgsz);
+    n = mg_chacha20_poly1305_decrypt(dec, key, nonce, associated_data,
+                                     sizeof(associated_data), msg, msgsz);
     if (n == (size_t) -1) {
+      mg_free(dec);
       mg_error(c, "decryption error");
       return -1;
     }
@@ -13216,8 +13290,18 @@ static int mg_tls_recv_record(struct mg_connection *c) {
     mg_free(dec);
   }
 #else
-  mg_gcm_initialize();
-  mg_aes_gcm_decrypt(msg, msg, msgsz - 16, key, 16, nonce, sizeof(nonce));
+  {
+    uint8_t associated_data[5] = {MG_TLS_APP_DATA, 0x03, 0x03,
+                                  (uint8_t) ((msgsz >> 8) & 0xff),
+                                  (uint8_t) (msgsz & 0xff)};
+    mg_gcm_initialize();
+    if (mg_aes_gcm_decrypt(msg, msg, msgsz - 16, key, 16, nonce, sizeof(nonce),
+                           associated_data, sizeof(associated_data),
+                           msg + msgsz - 16, 16) != 0) {
+      mg_error(c, "GCM tag verify failed");
+      return -1;
+    }
+  }
 #endif
 
   r = msgsz - 16 - 1;
@@ -14143,7 +14227,7 @@ static int mg_tls_verify_cert_san(const uint8_t *der, size_t dersz,
       if (mg_match(mg_str(server_name), mg_str_n((char *) name.value, name.len),
                    NULL))
         return 1;  // and matches the host name
-    }              // TODO(): add IPv6 comparison, more items ?
+    }  // TODO(): add IPv6 comparison, more items ?
   }
   return -1;
 }
@@ -14170,8 +14254,8 @@ static int mg_tls_verify_cert_signature(const struct mg_tls_cert *cert,
                             (unsigned) cert->tbshashsz, sig,
                             mg_uecc_secp256r1());
     } else if (issuer->pubkey.len == 96) {
-      MG_VERBOSE(("ignore secp386 for now"));
-      return 1;
+      MG_ERROR(("reject secp386 for now"));
+      return 0;
     } else {
       MG_ERROR(("unsupported public key length: %d", issuer->pubkey.len));
       return 0;
@@ -14286,6 +14370,14 @@ static int mg_tls_recv_cert(struct mg_connection *c, bool is_client) {
             mg_tls_verify_cert_san(cert, certsz, tls->hostname, &c->rem) <= 0 &&
             mg_tls_verify_cert_cn(&ci->subj, tls->hostname) <= 0) {
           mg_error(c, "failed to verify hostname");
+          return -1;
+        }
+        if (ci->pubkey.len > sizeof(tls->pubkey)) {
+          mg_error(c, "invalid certificate length");
+          return -1;
+        }
+        if (ci->pubkey.len > sizeof(tls->pubkey)) {
+          mg_error(c, "peer public key too large");
           return -1;
         }
         memmove(tls->pubkey, ci->pubkey.buf, ci->pubkey.len);
@@ -14635,7 +14727,7 @@ static int mg_rsa_parse_der_int(const uint8_t **p, const uint8_t *end,
   *p = value_end;
 
   MG_VERBOSE(("DER INT: parsed %u bytes (skipped zero=%d)", len,
-              (size_t)(value_end - value_start) != (size_t) len ? 1 : 0));
+              (size_t) (value_end - value_start) != (size_t) len ? 1 : 0));
   return 0;
 }
 
@@ -15145,7 +15237,7 @@ long mg_tls_send(struct mg_connection *c, const void *buf, size_t len) {
     if (!mg_tls_encrypt(c, (const uint8_t *) buf, len, MG_TLS_APP_DATA))
       return 0;  // returning 0 means an OOM condition (iobuf couldn't resize),
                  // yet this is so far recoverable, let the caller decide
-  }              // else, resend outstanding encrypted data in tls->send
+  }  // else, resend outstanding encrypted data in tls->send
   while (tls->send.len > 0 &&
          (n = mg_io_send(c, tls->send.buf, tls->send.len)) > 0) {
     mg_iobuf_del(&tls->send, 0, (size_t) n);
@@ -15292,7 +15384,8 @@ static PORTABLE_8439_DECL void poly1305_finish(poly1305_context *ctx,
     defined(__AVR__)
 #define __HAVE_LITTLE_ENDIAN 1
 #endif
-// DO NOT test for LITTLE_ENDIAN, as it is defined as 1234 when including sys/types.h in GCC
+// DO NOT test for LITTLE_ENDIAN, as it is defined as 1234 when including
+// sys/types.h in GCC
 
 #ifndef TEST_SLOW_PATH
 #if defined(__HAVE_LITTLE_ENDIAN)
@@ -15388,7 +15481,7 @@ static void core_block(const uint32_t *restrict start,
   TIMES16(__FIN)
 }
 
-#define U8(x) ((uint8_t) ((x) &0xFF))
+#define U8(x) ((uint8_t) ((x) & 0xFF))
 
 #ifdef FAST_PATH
 #define xor32_le(dst, src, pad)            \
@@ -15713,7 +15806,7 @@ static unsigned short U8TO16(const unsigned char *p) {
 /* store a 16 bit unsigned integer as two 8 bit unsigned integers in little
  * endian */
 static void U16TO8(unsigned char *p, unsigned short v) {
-  p[0] = (v) &0xff;
+  p[0] = (v) & 0xff;
   p[1] = (v >> 8) & 0xff;
 }
 
@@ -15724,7 +15817,7 @@ static void poly1305_init(poly1305_context *ctx, const unsigned char key[32]) {
 
   /* r &= 0xffffffc0ffffffc0ffffffc0fffffff */
   t0 = U8TO16(&key[0]);
-  st->r[0] = (t0) &0x1fff;
+  st->r[0] = (t0) & 0x1fff;
   t1 = U8TO16(&key[2]);
   st->r[1] = ((t0 >> 13) | (t1 << 3)) & 0x1fff;
   t2 = U8TO16(&key[4]);
@@ -15764,7 +15857,7 @@ static void poly1305_blocks(poly1305_state_internal_t *st,
 
     /* h += m[i] */
     t0 = U8TO16(&m[0]);
-    st->h[0] += (t0) &0x1fff;
+    st->h[0] += (t0) & 0x1fff;
     t1 = U8TO16(&m[2]);
     st->h[1] += ((t0 >> 13) | (t1 << 3)) & 0x1fff;
     t2 = U8TO16(&m[4]);
@@ -15926,7 +16019,7 @@ static unsigned long U8TO32(const unsigned char *p) {
 /* store a 32 bit unsigned integer as four 8 bit unsigned integers in little
  * endian */
 static void U32TO8(unsigned char *p, unsigned long v) {
-  p[0] = (unsigned char) ((v) &0xff);
+  p[0] = (unsigned char) ((v) & 0xff);
   p[1] = (unsigned char) ((v >> 8) & 0xff);
   p[2] = (unsigned char) ((v >> 16) & 0xff);
   p[3] = (unsigned char) ((v >> 24) & 0xff);
@@ -16190,8 +16283,8 @@ typedef unsigned uint128_t __attribute__((mode(TI)));
 #define MUL128(out, x, y) out = ((uint128_t) x * y)
 #define ADD(out, in) out += in
 #define ADDLO(out, in) out += in
-#define SHR(in, shift) (uint64_t)(in >> (shift))
-#define LO(in) (uint64_t)(in)
+#define SHR(in, shift) (uint64_t) (in >> (shift))
+#define LO(in) (uint64_t) (in)
 
 #define POLY1305_NOINLINE __attribute__((noinline))
 #endif
@@ -16220,7 +16313,7 @@ static uint64_t U8TO64(const unsigned char *p) {
 /* store a 64 bit unsigned integer as eight 8 bit unsigned integers in little
  * endian */
 static void U64TO8(unsigned char *p, uint64_t v) {
-  p[0] = (unsigned char) ((v) &0xff);
+  p[0] = (unsigned char) ((v) & 0xff);
   p[1] = (unsigned char) ((v >> 8) & 0xff);
   p[2] = (unsigned char) ((v >> 16) & 0xff);
   p[3] = (unsigned char) ((v >> 24) & 0xff);
@@ -16238,7 +16331,7 @@ static void poly1305_init(poly1305_context *ctx, const unsigned char key[32]) {
   t0 = U8TO64(&key[0]);
   t1 = U8TO64(&key[8]);
 
-  st->r[0] = (t0) &0xffc0fffffff;
+  st->r[0] = (t0) & 0xffc0fffffff;
   st->r[1] = ((t0 >> 44) | (t1 << 20)) & 0xfffffc0ffff;
   st->r[2] = ((t1 >> 24)) & 0x00ffffffc0f;
 
@@ -16282,7 +16375,7 @@ static void poly1305_blocks(poly1305_state_internal_t *st,
     t0 = U8TO64(&m[0]);
     t1 = U8TO64(&m[8]);
 
-    h0 += ((t0) &0xfffffffffff);
+    h0 += ((t0) & 0xfffffffffff);
     h1 += (((t0 >> 44) | (t1 << 20)) & 0xfffffffffff);
     h2 += (((t1 >> 24)) & 0x3ffffffffff) | hibit;
 
@@ -16389,7 +16482,7 @@ static POLY1305_NOINLINE void poly1305_finish(poly1305_context *ctx,
   t0 = st->pad[0];
   t1 = st->pad[1];
 
-  h0 += ((t0) &0xfffffffffff);
+  h0 += ((t0) & 0xfffffffffff);
   c = (h0 >> 44);
   h0 &= 0xfffffffffff;
   h1 += (((t0 >> 44) | (t1 << 20)) & 0xfffffffffff) + c;
@@ -16466,7 +16559,7 @@ static PORTABLE_8439_DECL void pad_if_needed(poly1305_context *ctx,
   }
 }
 
-#define __u8(v) ((uint8_t) ((v) &0xFF))
+#define __u8(v) ((uint8_t) ((v) & 0xFF))
 
 // TODO: make this depending on the unaligned/native read size possible
 static PORTABLE_8439_DECL void write_64bit_int(poly1305_context *ctx,
@@ -16539,13 +16632,25 @@ PORTABLE_8439_DECL size_t mg_chacha20_poly1305_encrypt(
 
 PORTABLE_8439_DECL size_t mg_chacha20_poly1305_decrypt(
     uint8_t *restrict plain_text, const uint8_t key[RFC_8439_KEY_SIZE],
-    const uint8_t nonce[RFC_8439_NONCE_SIZE],
-    const uint8_t *restrict cipher_text, size_t cipher_text_size) {
+    const uint8_t nonce[RFC_8439_NONCE_SIZE], const uint8_t *restrict ad,
+    size_t ad_size, const uint8_t *restrict cipher_text,
+    size_t cipher_text_size) {
   // first we calculate the mac and see if it lines up, only then do we decrypt
   size_t actual_size = cipher_text_size - RFC_8439_TAG_SIZE;
+  uint8_t computed_mac[RFC_8439_TAG_SIZE];
+  int diff = 0;
+  size_t i;
   if (MG_OVERLAPPING(plain_text, actual_size, cipher_text, cipher_text_size)) {
     return (size_t) -1;
   }
+
+  poly1305_calculate_mac(computed_mac, cipher_text, actual_size, key, nonce, ad,
+                         ad_size);
+
+  // compare tags
+  for (i = 0; i < RFC_8439_TAG_SIZE; i++)
+    diff |= computed_mac[i] ^ cipher_text[actual_size + i];
+  if (diff != 0) return (size_t) -1;
 
   chacha20_xor_stream(plain_text, cipher_text, actual_size, key, nonce, 1);
   return actual_size;
@@ -26733,14 +26838,11 @@ static void st67w6_handle_scan_result(char *data, size_t len) {
       !mg_str_to_num(fields[0], 10, &val, 1))
     return;
   bss.security =
-      (val == 0)
-          ? MG_WIFI_SECURITY_OPEN
-          : MG_WIFI_SECURITY_WEP |
-                ((val == 2 || val == 4 || val == 5) ? MG_WIFI_SECURITY_WPA
-                                                    : 0) |
-                ((val == 3 || val == 4 || val == 7) ? MG_WIFI_SECURITY_WPA2
-                                                    : 0) |
-                ((val == 6 || val == 7) ? MG_WIFI_SECURITY_WPA3 : 0);
+      (val == 0) ? MG_WIFI_SECURITY_OPEN : (uint8_t) MG_WIFI_SECURITY_WEP;
+  if (val == 2 || val == 4) bss.security |= MG_WIFI_SECURITY_WPA;
+  if (val == 3 || val == 4 || val == 7) bss.security |= MG_WIFI_SECURITY_WPA2;
+  if (val == 6 || val == 7) bss.security |= MG_WIFI_SECURITY_WPA3;
+  if (val == 5) bss.security |= MG_WIFI_SECURITY_WPA_ENTERPRISE;
   if (!mg_span(fields[1], &fields[0], &fields[1], ',')) return;
   bss.SSID.buf = fields[0].buf + 1, bss.SSID.len = fields[0].len - 2;
   if (!mg_span(fields[1], &fields[0], &fields[1], ',')) return;
@@ -26770,7 +26872,7 @@ static void st67w6_handle_scan_result(char *data, size_t len) {
       !mg_str_to_num(fields[0], 10, &val, 1))
     return;
   bss.has_n = (val & 4) != 0;
-  // bss.has_ax = (val & 8) != 0;
+  bss.has_ax = (val & 8) != 0;
   bss.band = MG_WIFI_BAND_2G;  // NOT INFORMED with default options, no docs
   MG_VERBOSE(("BSS: %.*s (%u) (%M) %d dBm %u", bss.SSID.len, bss.SSID.buf,
               bss.channel, mg_print_mac, bss.BSSID, (int) bss.RSSI,

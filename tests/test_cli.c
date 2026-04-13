@@ -11,6 +11,7 @@
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <cli/cli.h>
 #include <foundation/yaml.h>
 #include <string.h>
@@ -59,9 +60,7 @@ static int test_mkdirp(const char *path) {
 
 /* Helper: recursive remove */
 static void test_rmdir_r(const char *path) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
-    system(cmd);
+    th_rmtree(path);
 }
 
 /* Helper: create tar.gz with a single file */
@@ -321,9 +320,6 @@ TEST(cli_find_cli_not_found) {
 }
 
 TEST(cli_find_cli_on_path) {
-#ifdef _WIN32
-    SKIP("PATH search differs on Windows");
-#endif
     /* Port of TestFindCLI_FoundOnPATH */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-find-XXXXXX");
@@ -333,8 +329,12 @@ TEST(cli_find_cli_on_path) {
     char fakecli[512];
     snprintf(fakecli, sizeof(fakecli), "%s/fakecli", tmpdir);
     write_test_file(fakecli, "#!/bin/sh\n");
-    chmod(fakecli, 0500);
+    th_make_executable(fakecli);
 
+#ifdef _WIN32
+    rmdir(tmpdir);
+    SKIP("PATH-based CLI lookup uses POSIX semantics");
+#endif
     const char *raw = getenv("PATH");
     char *old_path = raw ? strdup(raw) : NULL;
     cbm_setenv("PATH", tmpdir, 1);
@@ -353,15 +353,16 @@ TEST(cli_find_cli_on_path) {
 }
 
 TEST(cli_find_cli_fallback_paths) {
-#ifdef _WIN32
-    SKIP("shell scripts + chmod not available on Windows");
-#endif
     /* Port of TestFindCLI_FallbackPaths */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-find-XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
+#ifdef _WIN32
+    rmdir(tmpdir);
+    SKIP("fallback path lookup uses POSIX semantics");
+#endif
     char localbin[512];
     snprintf(localbin, sizeof(localbin), "%s/.local/bin", tmpdir);
     test_mkdirp(localbin);
@@ -369,7 +370,7 @@ TEST(cli_find_cli_fallback_paths) {
     char fakecli[512];
     snprintf(fakecli, sizeof(fakecli), "%s/testcli", localbin);
     write_test_file(fakecli, "#!/bin/sh\n");
-    chmod(fakecli, 0500);
+    th_make_executable(fakecli);
 
     const char *raw = getenv("PATH");
     char *old_path = raw ? strdup(raw) : NULL;
@@ -546,41 +547,32 @@ TEST(cli_remove_old_monolithic_skill) {
 }
 
 TEST(cli_skill_files_content) {
-    /* Port of TestSkillFilesContent */
+    /* Consolidated skill: all 4 former skills merged into one. */
     const cbm_skill_t *sk = cbm_get_skills();
-    ASSERT_EQ(CBM_SKILL_COUNT, 4);
+    ASSERT_EQ(CBM_SKILL_COUNT, 1);
+    ASSERT(strcmp(sk[0].name, "codebase-memory") == 0);
 
-    /* Check exploring skill */
-    bool found_exploring = false, found_tracing = false;
-    bool found_quality = false, found_reference = false;
-    for (int i = 0; i < CBM_SKILL_COUNT; i++) {
-        if (strcmp(sk[i].name, "codebase-memory-exploring") == 0) {
-            found_exploring = true;
-            ASSERT(strstr(sk[i].content, "search_graph") != NULL);
-            ASSERT(strstr(sk[i].content, "get_graph_schema") != NULL);
-        }
-        if (strcmp(sk[i].name, "codebase-memory-tracing") == 0) {
-            found_tracing = true;
-            ASSERT(strstr(sk[i].content, "trace_path") != NULL);
-            ASSERT(strstr(sk[i].content, "direction") != NULL);
-            ASSERT(strstr(sk[i].content, "detect_changes") != NULL);
-        }
-        if (strcmp(sk[i].name, "codebase-memory-quality") == 0) {
-            found_quality = true;
-            ASSERT(strstr(sk[i].content, "max_degree=0") != NULL);
-            ASSERT(strstr(sk[i].content, "exclude_entry_points") != NULL);
-        }
-        if (strcmp(sk[i].name, "codebase-memory-reference") == 0) {
-            found_reference = true;
-            ASSERT(strstr(sk[i].content, "query_graph") != NULL);
-            ASSERT(strstr(sk[i].content, "Cypher") != NULL);
-            ASSERT(strstr(sk[i].content, "14 total") != NULL);
-        }
-    }
-    ASSERT_TRUE(found_exploring);
-    ASSERT_TRUE(found_tracing);
-    ASSERT_TRUE(found_quality);
-    ASSERT_TRUE(found_reference);
+    /* Exploring capabilities */
+    ASSERT(strstr(sk[0].content, "search_graph") != NULL);
+    ASSERT(strstr(sk[0].content, "get_graph_schema") != NULL);
+
+    /* Tracing capabilities */
+    ASSERT(strstr(sk[0].content, "trace_path") != NULL);
+    ASSERT(strstr(sk[0].content, "direction") != NULL);
+    ASSERT(strstr(sk[0].content, "detect_changes") != NULL);
+
+    /* Quality capabilities */
+    ASSERT(strstr(sk[0].content, "max_degree=0") != NULL);
+    ASSERT(strstr(sk[0].content, "exclude_entry_points") != NULL);
+
+    /* Reference capabilities */
+    ASSERT(strstr(sk[0].content, "query_graph") != NULL);
+    ASSERT(strstr(sk[0].content, "Cypher") != NULL);
+    ASSERT(strstr(sk[0].content, "14 MCP Tools") != NULL);
+
+    /* Gotchas section */
+    ASSERT(strstr(sk[0].content, "Gotchas") != NULL);
+
     PASS();
 }
 
@@ -1446,6 +1438,8 @@ TEST(cli_detect_agents_finds_zed) {
     char dir[512];
 #ifdef __APPLE__
     snprintf(dir, sizeof(dir), "%s/Library/Application Support/Zed", tmpdir);
+#elif defined(_WIN32)
+    snprintf(dir, sizeof(dir), "%s/AppData/Local/Zed", tmpdir);
 #else
     snprintf(dir, sizeof(dir), "%s/.config/zed", tmpdir);
 #endif
@@ -1483,7 +1477,15 @@ TEST(cli_detect_agents_finds_kilocode) {
         SKIP("cbm_mkdtemp failed");
 
     char dir[512];
+#ifdef __APPLE__
+    snprintf(dir, sizeof(dir),
+             "%s/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code", tmpdir);
+#elif defined(_WIN32)
+    snprintf(dir, sizeof(dir),
+             "%s/AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code", tmpdir);
+#else
     snprintf(dir, sizeof(dir), "%s/.config/Code/User/globalStorage/kilocode.kilo-code", tmpdir);
+#endif
     test_mkdirp(dir);
 
     cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
@@ -2100,11 +2102,11 @@ TEST(cli_remove_gemini_hooks) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 TEST(cli_skill_descriptions_directive) {
-    /* Verify all skill descriptions use directive pattern (ALWAYS invoke) */
+    /* Verify skill description has trigger phrases for agent matching */
     const cbm_skill_t *sk = cbm_get_skills();
     for (int i = 0; i < CBM_SKILL_COUNT; i++) {
-        ASSERT(strstr(sk[i].content, "ALWAYS") != NULL);
-        ASSERT(strstr(sk[i].content, "Do not") != NULL);
+        ASSERT(strstr(sk[i].content, "Triggers on:") != NULL);
+        ASSERT(strstr(sk[i].content, "search_graph") != NULL);
     }
     PASS();
 }
@@ -2278,7 +2280,7 @@ TEST(replace_binary_overwrites_readonly) {
     ASSERT_NOT_NULL(f);
     fputs("old-content", f);
     fclose(f);
-    chmod(path, 0500); /* r-x------ */
+    th_make_executable(path); /* r-x------ */
 
     /* Replace it with new content */
     const unsigned char new_data[] = "new-content-replaced";

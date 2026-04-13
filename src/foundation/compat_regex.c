@@ -4,6 +4,7 @@
  * POSIX: direct wrappers around <regex.h>.
  * Windows: vendored TRE regex library (BSD-licensed).
  */
+#include "foundation/constants.h"
 #include "foundation/compat_regex.h"
 
 #include <string.h>
@@ -13,7 +14,8 @@
 /* ── Windows: use vendored TRE regex ─────────────────────────── */
 #include "../../vendored/tre/regex.h"
 
-_Static_assert(sizeof(regex_t) <= 256, "cbm_regex_t opaque buffer too small for TRE regex_t");
+_Static_assert(sizeof(regex_t) <= CBM_SZ_256,
+               "cbm_regex_t opaque buffer too small for TRE regex_t");
 
 static int translate_flags_tre(int flags) {
     int tre_flags = 0;
@@ -41,8 +43,8 @@ int cbm_regexec(const cbm_regex_t *r, const char *str, int nmatch, cbm_regmatch_
         int rc = tre_regexec(re, str, 0, NULL, eflags);
         return rc == 0 ? CBM_REG_OK : CBM_REG_NOMATCH;
     }
-    regmatch_t pmatch[32];
-    int n = nmatch > 32 ? 32 : nmatch;
+    regmatch_t pmatch[CBM_SZ_32];
+    int n = nmatch > CBM_SZ_32 ? CBM_SZ_32 : nmatch;
     int rc = tre_regexec(re, str, (size_t)n, pmatch, eflags);
     if (rc != 0)
         return CBM_REG_NOMATCH;
@@ -66,7 +68,7 @@ void cbm_regfree(cbm_regex_t *r) {
 
 /* Static assert: our opaque buffer is large enough for regex_t.
  * If this fires, increase cbm_regex_t.opaque size. */
-_Static_assert(sizeof(regex_t) <= 256, "cbm_regex_t opaque buffer too small for regex_t");
+_Static_assert(sizeof(regex_t) <= CBM_SZ_256, "cbm_regex_t opaque buffer too small for regex_t");
 
 static int translate_flags(int flags) {
     int posix_flags = 0;
@@ -101,8 +103,8 @@ int cbm_regexec(const cbm_regex_t *r, const char *str, int nmatch, cbm_regmatch_
     }
 
     /* Map through POSIX regmatch_t */
-    regmatch_t pmatch[32];
-    int n = nmatch > 32 ? 32 : nmatch;
+    regmatch_t pmatch[CBM_SZ_32];
+    int n = nmatch > CBM_SZ_32 ? CBM_SZ_32 : nmatch;
     int rc = regexec(re, str, (size_t)n, pmatch, eflags);
     if (rc != 0) {
         return CBM_REG_NOMATCH;

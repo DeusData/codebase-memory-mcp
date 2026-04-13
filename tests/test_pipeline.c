@@ -6,9 +6,9 @@
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
-#include "pipeline/httplink.h"
 #include "store/store.h"
 
 #include <stdlib.h>
@@ -84,9 +84,7 @@ static int setup_test_repo(void) {
 
 /* Recursive remove (simple, not production-grade) */
 static void rm_rf(const char *path) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
-    (void)system(cmd);
+    th_rmtree(path);
 }
 
 static void teardown_test_repo(void) {
@@ -834,9 +832,7 @@ static int setup_usages_repo(const char *filename, const char *content, const ch
     char *last_slash = strrchr(dir_path, '/');
     if (last_slash) {
         *last_slash = '\0';
-        char cmd[1024];
-        snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", dir_path);
-        (void)system(cmd);
+        th_mkdir_p(dir_path);
     }
 
     FILE *f = fopen(path, "w");
@@ -1121,9 +1117,7 @@ static int setup_lang_repo(const char **filenames, const char **contents, int co
         char *slash = strrchr(dir, '/');
         if (slash) {
             *slash = '\0';
-            char cmd[1024];
-            snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", dir);
-            (void)system(cmd);
+            th_mkdir_p(dir);
         }
 
         FILE *f = fopen(path, "wb");
@@ -2298,544 +2292,6 @@ TEST(configures_full_pipeline_integration) {
     teardown_lang_repo();
     PASS();
 }
-
-/* ── HTTP link pipeline integration (httplink_test.go ports) ──── */
-
-TEST(pipeline_httplink_route_and_caller) {
-    /* Port of TestLinkerRun + TestRouteNodesCreated:
-     * Python handler with route decorator + Go caller with URL constant.
-     * Pipeline should create Route nodes, HANDLES edges, and HTTP_CALLS edges. */
-    const char *files[] = {"handler/routes.py", "caller/client.go"};
-    const char *contents[] = {"from flask import Flask\n\n"
-                              "app = Flask(__name__)\n\n"
-                              "@app.post(\"/api/orders\")\n"
-                              "def create_order():\n"
-                              "    return {\"status\": \"ok\"}\n\n"
-                              "@app.get(\"/api/orders\")\n"
-                              "def list_orders():\n"
-                              "    return []\n",
-
-                              "package caller\n\n"
-                              "const OrderURL = \"https://api.example.com/api/orders\"\n\n"
-                              "func FetchOrders() {\n"
-                              "\t// makes HTTP call to OrderURL\n"
-                              "}\n"};
-    if (setup_lang_repo(files, contents, 2) != 0)
-        SKIP("tmpdir");
-    char db[512];
-    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
-    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(p);
-    ASSERT_EQ(cbm_pipeline_run(p), 0);
-
-    cbm_store_t *s = cbm_store_open_path(db);
-    ASSERT_NOT_NULL(s);
-    const char *proj = cbm_pipeline_project_name(p);
-
-    /* Should have Route nodes from Python decorators */
-    cbm_node_t *routes = NULL;
-    int rc = 0;
-    cbm_store_find_nodes_by_label(s, proj, "Route", &routes, &rc);
-    ASSERT_GTE(rc, 2); /* @app.post + @app.get */
-    if (routes)
-        cbm_store_free_nodes(routes, rc);
-
-    /* Should have Function nodes for Python handlers */
-    cbm_node_t *funcs = NULL;
-    int fc = 0;
-    cbm_store_find_nodes_by_name(s, proj, "create_order", &funcs, &fc);
-    ASSERT_GT(fc, 0);
-
-    /* Handler should be marked as entry point */
-    ASSERT_TRUE(strstr(funcs[0].properties_json, "\"is_entry_point\":true") != NULL);
-
-    /* Handler should have a HANDLES edge */
-    cbm_edge_t *handles = NULL;
-    int hc = 0;
-    cbm_store_find_edges_by_source_type(s, funcs[0].id, "HANDLES", &handles, &hc);
-    ASSERT_GTE(hc, 1);
-    if (handles)
-        cbm_store_free_edges(handles, hc);
-    if (funcs)
-        cbm_store_free_nodes(funcs, fc);
-
-    cbm_store_close(s);
-    cbm_pipeline_free(p);
-    teardown_lang_repo();
-    PASS();
-}
-
-TEST(pipeline_httplink_cross_file_prefix) {
-    /* Port of TestCrossFileGroupPrefix:
-     * Go router with prefix + handler → routes have correct full paths. */
-    const char *files[] = {"routes.go"};
-    const char *contents[] = {"package main\n\n"
-                              "func RegisterRoutes() {\n"
-                              "\tr := gin.Default()\n"
-                              "\tv1 := r.Group(\"/api/v1\")\n"
-                              "\tv1.POST(\"/orders\", CreateOrder)\n"
-                              "\tv1.GET(\"/orders/:id\", GetOrder)\n"
-                              "}\n\n"
-                              "func CreateOrder() {}\n"
-                              "func GetOrder() {}\n"};
-    if (setup_lang_repo(files, contents, 1) != 0)
-        SKIP("tmpdir");
-    char db[512];
-    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
-    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(p);
-    ASSERT_EQ(cbm_pipeline_run(p), 0);
-
-    cbm_store_t *s = cbm_store_open_path(db);
-    ASSERT_NOT_NULL(s);
-    const char *proj = cbm_pipeline_project_name(p);
-
-    /* Should have Route nodes with group-prefixed paths */
-    cbm_node_t *routes = NULL;
-    int rc = 0;
-    cbm_store_find_nodes_by_label(s, proj, "Route", &routes, &rc);
-    ASSERT_GTE(rc, 2); /* POST /orders + GET /orders/:id */
-    /* Verify routes have /api/v1 prefix from Group() */
-    bool found_prefix = false;
-    for (int i = 0; i < rc; i++) {
-        if (strstr(routes[i].properties_json, "/api/v1/orders"))
-            found_prefix = true;
-    }
-    ASSERT_TRUE(found_prefix);
-    if (routes)
-        cbm_store_free_nodes(routes, rc);
-
-    cbm_store_close(s);
-    cbm_pipeline_free(p);
-    teardown_lang_repo();
-    PASS();
-}
-
-TEST(pipeline_httplink_websocket_routes) {
-    /* Port of TestExtractPythonWSRoutes + TestExtractSpringWSRoutes:
-     * WebSocket route annotations should produce Route nodes. */
-    const char *files[] = {"ws.py"};
-    const char *contents[] = {"from fastapi import WebSocket\n\n"
-                              "@app.websocket(\"/ws/chat\")\n"
-                              "async def websocket_chat(ws: WebSocket):\n"
-                              "    pass\n\n"
-                              "@app.websocket(\"/ws/events\")\n"
-                              "async def websocket_events(ws: WebSocket):\n"
-                              "    pass\n"};
-    if (setup_lang_repo(files, contents, 1) != 0)
-        SKIP("tmpdir");
-    char db[512];
-    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
-    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(p);
-    ASSERT_EQ(cbm_pipeline_run(p), 0);
-
-    cbm_store_t *s = cbm_store_open_path(db);
-    ASSERT_NOT_NULL(s);
-    const char *proj = cbm_pipeline_project_name(p);
-
-    /* WebSocket routes produce Route nodes with ws protocol */
-    cbm_node_t *routes = NULL;
-    int rc = 0;
-    cbm_store_find_nodes_by_label(s, proj, "Route", &routes, &rc);
-    ASSERT_GTE(rc, 2); /* /ws/chat + /ws/events */
-    bool found_ws = false;
-    for (int i = 0; i < rc; i++) {
-        if (strstr(routes[i].properties_json, "\"protocol\":\"ws\""))
-            found_ws = true;
-    }
-    ASSERT_TRUE(found_ws);
-    if (routes)
-        cbm_store_free_nodes(routes, rc);
-
-    cbm_store_close(s);
-    cbm_pipeline_free(p);
-    teardown_lang_repo();
-    PASS();
-}
-
-/* ── HTTP link linker integration tests (httplink_test.go ports) ── */
-
-TEST(httplink_linker_cross_file_group_variable) {
-    /* Port of TestCrossFileGroupPrefixVariable:
-     * v1 := r.Group("/api"); RegisterRoutes(v1)
-     * Routes in RegisterRoutes should get /api prefix. */
-    const char *files[] = {"cmd/main.go", "routes/routes.go"};
-    const char *contents[] = {"package main\n\n"
-                              "func setup(r interface{}) {\n"
-                              "\tv1 := r.Group(\"/api\")\n"
-                              "\tRegisterRoutes(v1)\n"
-                              "}\n",
-
-                              "package routes\n\n"
-                              "func RegisterRoutes(rg interface{}) {\n"
-                              "\trg.GET(\"/items\", ListItems)\n"
-                              "}\n"};
-    if (setup_lang_repo(files, contents, 2) != 0)
-        SKIP("tmpdir");
-    char db[512];
-    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
-    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(p);
-    ASSERT_EQ(cbm_pipeline_run(p), 0);
-
-    cbm_store_t *s = cbm_store_open_path(db);
-    ASSERT_NOT_NULL(s);
-    const char *proj = cbm_pipeline_project_name(p);
-
-    cbm_node_t *routes = NULL;
-    int rc = 0;
-    cbm_store_find_nodes_by_label(s, proj, "Route", &routes, &rc);
-    ASSERT_GTE(rc, 1);
-
-    /* Route path should have /api prefix from cross-file variable resolution */
-    bool found = false;
-    for (int i = 0; i < rc; i++) {
-        if (strstr(routes[i].properties_json, "/api/items"))
-            found = true;
-    }
-    ASSERT_TRUE(found);
-    if (routes)
-        cbm_store_free_nodes(routes, rc);
-
-    cbm_store_close(s);
-    cbm_pipeline_free(p);
-    teardown_lang_repo();
-    PASS();
-}
-
-TEST(httplink_linker_registration_call_edges) {
-    /* Port of TestRouteRegistrationCallEdges:
-     * RegisterRoutes has .POST("/orders", h.CreateOrder) → CALLS edge to CreateOrder
-     * with via=route_registration property. */
-    const char *files[] = {"routes/routes.go", "handlers/handler.go"};
-    const char *contents[] = {"package routes\n\n"
-                              "func RegisterRoutes(rg interface{}) {\n"
-                              "\trg.POST(\"/orders\", h.CreateOrder)\n"
-                              "\trg.GET(\"/orders/:id\", h.GetOrder)\n"
-                              "}\n",
-
-                              "package handlers\n\n"
-                              "func (h *Handler) CreateOrder() {}\n"
-                              "func (h *Handler) GetOrder() {}\n"};
-    if (setup_lang_repo(files, contents, 2) != 0)
-        SKIP("tmpdir");
-    char db[512];
-    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
-    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(p);
-    ASSERT_EQ(cbm_pipeline_run(p), 0);
-
-    cbm_store_t *s = cbm_store_open_path(db);
-    ASSERT_NOT_NULL(s);
-    const char *proj = cbm_pipeline_project_name(p);
-
-    /* Find RegisterRoutes function */
-    cbm_node_t *regs = NULL;
-    int regc = 0;
-    cbm_store_find_nodes_by_name(s, proj, "RegisterRoutes", &regs, &regc);
-    ASSERT_GTE(regc, 1);
-
-    /* Should have CALLS edges with via=route_registration */
-    cbm_edge_t *edges = NULL;
-    int ec = 0;
-    cbm_store_find_edges_by_source_type(s, regs[0].id, "CALLS", &edges, &ec);
-    ASSERT_GTE(ec, 2); /* CreateOrder + GetOrder */
-
-    bool found_reg = false;
-    for (int i = 0; i < ec; i++) {
-        if (strstr(edges[i].properties_json, "route_registration"))
-            found_reg = true;
-    }
-    ASSERT_TRUE(found_reg);
-
-    if (edges)
-        cbm_store_free_edges(edges, ec);
-    if (regs)
-        cbm_store_free_nodes(regs, regc);
-
-    cbm_store_close(s);
-    cbm_pipeline_free(p);
-    teardown_lang_repo();
-    PASS();
-}
-
-TEST(httplink_linker_async_dispatch) {
-    /* Port of TestAsyncDispatchKeywords:
-     * CreateTask → ASYNC_CALLS, requests.post → HTTP_CALLS. */
-    const char *files[] = {"handler/routes.py", "taskworker/dispatch.go", "synccaller/caller.go"};
-    const char *contents[] = {"from flask import Flask\n\n"
-                              "app = Flask(__name__)\n\n"
-                              "@app.post(\"/api/orders\")\n"
-                              "def create_order():\n"
-                              "    return {\"status\": \"ok\"}\n",
-
-                              "package taskworker\n\n"
-                              "func DispatchOrder(orderID string) {\n"
-                              "\turl := \"https://api.internal.com/api/orders\"\n"
-                              "\tclient.CreateTask(ctx, url, payload)\n"
-                              "}\n",
-
-                              "package synccaller\n\n"
-                              "func CallOrder() {\n"
-                              "\turl := \"https://api.internal.com/api/orders\"\n"
-                              "\trequests.post(url, data)\n"
-                              "}\n"};
-    if (setup_lang_repo(files, contents, 3) != 0)
-        SKIP("tmpdir");
-    char db[512];
-    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
-    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(p);
-    ASSERT_EQ(cbm_pipeline_run(p), 0);
-
-    cbm_store_t *s = cbm_store_open_path(db);
-    ASSERT_NOT_NULL(s);
-    const char *proj = cbm_pipeline_project_name(p);
-
-    /* DispatchOrder should have ASYNC_CALLS edge (CreateTask keyword) */
-    cbm_node_t *dispatch = NULL;
-    int dc = 0;
-    cbm_store_find_nodes_by_name(s, proj, "DispatchOrder", &dispatch, &dc);
-    ASSERT_GTE(dc, 1);
-    cbm_edge_t *async_edges = NULL;
-    int aec = 0;
-    cbm_store_find_edges_by_source_type(s, dispatch[0].id, "ASYNC_CALLS", &async_edges, &aec);
-    ASSERT_GTE(aec, 1);
-    if (async_edges)
-        cbm_store_free_edges(async_edges, aec);
-    if (dispatch)
-        cbm_store_free_nodes(dispatch, dc);
-
-    /* CallOrder should have HTTP_CALLS edge (requests.post keyword) */
-    cbm_node_t *caller = NULL;
-    int cc = 0;
-    cbm_store_find_nodes_by_name(s, proj, "CallOrder", &caller, &cc);
-    ASSERT_GTE(cc, 1);
-    cbm_edge_t *http_edges = NULL;
-    int hec = 0;
-    cbm_store_find_edges_by_source_type(s, caller[0].id, "HTTP_CALLS", &http_edges, &hec);
-    ASSERT_GTE(hec, 1);
-    if (http_edges)
-        cbm_store_free_edges(http_edges, hec);
-    if (caller)
-        cbm_store_free_nodes(caller, cc);
-
-    cbm_store_close(s);
-    cbm_pipeline_free(p);
-    teardown_lang_repo();
-    PASS();
-}
-
-TEST(httplink_linker_extract_async_call_sites) {
-    /* Port of TestExtractFunctionCallSitesAsync:
-     * CreateTask + URL → IsAsync=true call site.
-     * requests.post + URL → IsAsync=false call site. */
-    const char *all_files[] = {"worker/task.go", "worker/sync.go", "handler/process.py"};
-    const char *all_contents[] = {"package worker\n\n"
-                                  "func EnqueueJob() {\n"
-                                  "\turl := \"https://backend.internal.com/api/process\"\n"
-                                  "\tclient.CreateTask(ctx, url)\n"
-                                  "}\n",
-
-                                  "package worker\n\n"
-                                  "func SyncCall() {\n"
-                                  "\turl := \"https://backend.internal.com/api/process\"\n"
-                                  "\trequests.post(url, data)\n"
-                                  "}\n",
-
-                                  "from flask import Flask\n\n"
-                                  "app = Flask(__name__)\n\n"
-                                  "@app.post(\"/api/process\")\n"
-                                  "def process_task():\n"
-                                  "    return {\"ok\": True}\n"};
-    if (setup_lang_repo(all_files, all_contents, 3) != 0)
-        SKIP("tmpdir");
-    char db[512];
-    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
-    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(p);
-    ASSERT_EQ(cbm_pipeline_run(p), 0);
-
-    cbm_store_t *s = cbm_store_open_path(db);
-    ASSERT_NOT_NULL(s);
-    const char *proj = cbm_pipeline_project_name(p);
-
-    /* EnqueueJob: async dispatch (CreateTask without HTTP client) → ASYNC_CALLS */
-    cbm_node_t *enqueue = NULL;
-    int enc = 0;
-    cbm_store_find_nodes_by_name(s, proj, "EnqueueJob", &enqueue, &enc);
-    ASSERT_GTE(enc, 1);
-    cbm_edge_t *ae = NULL;
-    int aec = 0;
-    cbm_store_find_edges_by_source_type(s, enqueue[0].id, "ASYNC_CALLS", &ae, &aec);
-    ASSERT_GTE(aec, 1);
-    if (ae)
-        cbm_store_free_edges(ae, aec);
-    if (enqueue)
-        cbm_store_free_nodes(enqueue, enc);
-
-    /* SyncCall: HTTP client (requests.post) → HTTP_CALLS */
-    cbm_node_t *sync_fn = NULL;
-    int sc = 0;
-    cbm_store_find_nodes_by_name(s, proj, "SyncCall", &sync_fn, &sc);
-    ASSERT_GTE(sc, 1);
-    cbm_edge_t *he = NULL;
-    int hec = 0;
-    cbm_store_find_edges_by_source_type(s, sync_fn[0].id, "HTTP_CALLS", &he, &hec);
-    ASSERT_GTE(hec, 1);
-    if (he)
-        cbm_store_free_edges(he, hec);
-    if (sync_fn)
-        cbm_store_free_nodes(sync_fn, sc);
-
-    cbm_store_close(s);
-    cbm_pipeline_free(p);
-    teardown_lang_repo();
-    PASS();
-}
-
-TEST(httplink_linker_fastapi_prefix) {
-    /* Port of TestFastAPIPrefix:
-     * app.include_router(order_router, prefix="/api/v1/orders")
-     * Route from orders/routes.py should get prefix prepended. */
-    const char *files[] = {"main.py", "orders/routes.py"};
-    const char *contents[] = {"from orders.routes import order_router\n\n"
-                              "app = None  # FastAPI()\n"
-                              "app.include_router(order_router, prefix=\"/api/v1/orders\")\n",
-
-                              "from flask import Flask\n\n"
-                              "order_router = Flask(__name__)\n\n"
-                              "@order_router.get(\"/\")\n"
-                              "def list_orders():\n"
-                              "    return []\n"};
-    if (setup_lang_repo(files, contents, 2) != 0)
-        SKIP("tmpdir");
-    char db[512];
-    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
-    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(p);
-    ASSERT_EQ(cbm_pipeline_run(p), 0);
-
-    cbm_store_t *s = cbm_store_open_path(db);
-    ASSERT_NOT_NULL(s);
-    const char *proj = cbm_pipeline_project_name(p);
-
-    cbm_node_t *routes = NULL;
-    int rc = 0;
-    cbm_store_find_nodes_by_label(s, proj, "Route", &routes, &rc);
-    ASSERT_GTE(rc, 1);
-
-    /* Route path should have the FastAPI prefix */
-    bool found = false;
-    for (int i = 0; i < rc; i++) {
-        if (strstr(routes[i].properties_json, "/api/v1/orders/"))
-            found = true;
-    }
-    ASSERT_TRUE(found);
-    if (routes)
-        cbm_store_free_nodes(routes, rc);
-
-    cbm_store_close(s);
-    cbm_pipeline_free(p);
-    teardown_lang_repo();
-    PASS();
-}
-
-TEST(httplink_linker_express_prefix) {
-    /* Port of TestExpressPrefix:
-     * app.use("/api/orders", orderRouter)
-     * Route from routes/orders.js should get prefix prepended. */
-    const char *files[] = {"app.js", "routes/orders.js"};
-    const char *contents[] = {"const orderRouter = require('./routes/orders');\n"
-                              "app.use(\"/api/orders\", orderRouter);\n",
-
-                              "router.get(\"/:id\", function(req, res) {\n"
-                              "    res.json({id: req.params.id});\n"
-                              "});\n"};
-    if (setup_lang_repo(files, contents, 2) != 0)
-        SKIP("tmpdir");
-    char db[512];
-    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
-    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(p);
-    ASSERT_EQ(cbm_pipeline_run(p), 0);
-
-    cbm_store_t *s = cbm_store_open_path(db);
-    ASSERT_NOT_NULL(s);
-    const char *proj = cbm_pipeline_project_name(p);
-
-    cbm_node_t *routes = NULL;
-    int rc = 0;
-    cbm_store_find_nodes_by_label(s, proj, "Route", &routes, &rc);
-    ASSERT_GTE(rc, 1);
-
-    /* Route path should have Express prefix: /api/orders/:id */
-    bool found = false;
-    for (int i = 0; i < rc; i++) {
-        if (strstr(routes[i].properties_json, "/api/orders"))
-            found = true;
-    }
-    ASSERT_TRUE(found);
-    if (routes)
-        cbm_store_free_nodes(routes, rc);
-
-    cbm_store_close(s);
-    cbm_pipeline_free(p);
-    teardown_lang_repo();
-    PASS();
-}
-
-TEST(httplink_linker_same_service_skip) {
-    /* Port of TestLinkerSkipsSameService:
-     * Caller and handler in same service dir should NOT create HTTP_CALLS edge. */
-    const char *files[] = {"svcA/client.py", "svcA/routes.py"};
-    const char *contents[] = {"import requests\n\n"
-                              "URL = \"https://localhost/api/orders\"\n\n"
-                              "def call_api():\n"
-                              "    requests.get(URL)\n",
-
-                              "from flask import Flask\n\n"
-                              "app = Flask(__name__)\n\n"
-                              "@app.get(\"/api/orders\")\n"
-                              "def handle_orders():\n"
-                              "    return []\n"};
-    if (setup_lang_repo(files, contents, 2) != 0)
-        SKIP("tmpdir");
-    char db[512];
-    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
-    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(p);
-    ASSERT_EQ(cbm_pipeline_run(p), 0);
-
-    cbm_store_t *s = cbm_store_open_path(db);
-    ASSERT_NOT_NULL(s);
-    const char *proj = cbm_pipeline_project_name(p);
-
-    /* Should have Route node from Python decorator */
-    cbm_node_t *routes = NULL;
-    int rc = 0;
-    cbm_store_find_nodes_by_label(s, proj, "Route", &routes, &rc);
-    ASSERT_GTE(rc, 1);
-    if (routes)
-        cbm_store_free_nodes(routes, rc);
-
-    /* Should NOT have HTTP_CALLS edges (same service) */
-    cbm_edge_t *edges = NULL;
-    int ec = 0;
-    cbm_store_find_edges_by_type(s, proj, "HTTP_CALLS", &edges, &ec);
-    ASSERT_EQ(ec, 0);
-    if (edges)
-        cbm_store_free_edges(edges, ec);
-
-    cbm_store_close(s);
-    cbm_pipeline_free(p);
-    teardown_lang_repo();
-    PASS();
-}
-
-/* ── Enrichment helpers (pass_enrichment.c) ───────────────────── */
-
 TEST(enrichment_split_camel_case) {
     char *parts[8];
     int n;
@@ -3344,8 +2800,8 @@ TEST(infra_is_kustomize_file) {
 
 TEST(infra_is_k8s_manifest) {
     const char *deploy = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: my-app\n";
-    const char *plain  = "name: foo\nvalue: bar\n";
-    const char *kust   = "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n";
+    const char *plain = "name: foo\nvalue: bar\n";
+    const char *kust = "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n";
 
     ASSERT(cbm_is_k8s_manifest("deployment.yaml", deploy));
     ASSERT(!cbm_is_k8s_manifest("deployment.yaml", plain));
@@ -4167,15 +3623,13 @@ TEST(infra_pipeline_idempotent) {
 /* ── K8s / Kustomize extraction tests ──────────────────────────── */
 
 TEST(k8s_extract_kustomize) {
-    const char *src =
-        "apiVersion: kustomize.config.k8s.io/v1beta1\n"
-        "kind: Kustomization\n"
-        "resources:\n"
-        "  - deployment.yaml\n"
-        "  - service.yaml\n";
-    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_KUSTOMIZE,
-                                        "myproj", "base/kustomization.yaml",
-                                        0, NULL, NULL);
+    const char *src = "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                      "kind: Kustomization\n"
+                      "resources:\n"
+                      "  - deployment.yaml\n"
+                      "  - service.yaml\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_KUSTOMIZE, "myproj",
+                                        "base/kustomization.yaml", 0, NULL, NULL);
     ASSERT(r != NULL);
     ASSERT_GTE(r->imports.count, 2);
 
@@ -4196,24 +3650,20 @@ TEST(k8s_extract_kustomize) {
 }
 
 TEST(k8s_extract_manifest) {
-    const char *src =
-        "apiVersion: apps/v1\n"
-        "kind: Deployment\n"
-        "metadata:\n"
-        "  name: my-app\n"
-        "  namespace: production\n";
-    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S,
-                                        "myproj", "k8s/deployment.yaml",
-                                        0, NULL, NULL);
+    const char *src = "apiVersion: apps/v1\n"
+                      "kind: Deployment\n"
+                      "metadata:\n"
+                      "  name: my-app\n"
+                      "  namespace: production\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S, "myproj",
+                                        "k8s/deployment.yaml", 0, NULL, NULL);
     ASSERT(r != NULL);
     ASSERT_GTE(r->defs.count, 1);
 
     bool found_resource = false;
     for (int d = 0; d < r->defs.count; d++) {
-        if (r->defs.items[d].label &&
-            strcmp(r->defs.items[d].label, "Resource") == 0 &&
-            r->defs.items[d].name &&
-            strstr(r->defs.items[d].name, "Deployment") != NULL)
+        if (r->defs.items[d].label && strcmp(r->defs.items[d].label, "Resource") == 0 &&
+            r->defs.items[d].name && strstr(r->defs.items[d].name, "Deployment") != NULL)
             found_resource = true;
     }
     ASSERT_TRUE(found_resource);
@@ -4224,8 +3674,8 @@ TEST(k8s_extract_manifest) {
 
 TEST(k8s_extract_manifest_no_name) {
     const char *src = "apiVersion: apps/v1\nkind: Deployment\n";
-    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S,
-                                        "myproj", "k8s/deploy.yaml", 0, NULL, NULL);
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S, "myproj",
+                                        "k8s/deploy.yaml", 0, NULL, NULL);
     ASSERT(r != NULL);
     /* No crash — defs count may be 0 because metadata.name is absent */
     ASSERT(!r->has_error);
@@ -4243,18 +3693,17 @@ TEST(k8s_extract_manifest_multidoc) {
      * Note: with some tree-sitter YAML grammar versions the root stream may
      * expose both documents as siblings; the break still fires after the first
      * successful def push, so defs.count must be exactly 1. */
-    const char *src =
-        "apiVersion: apps/v1\n"
-        "kind: Deployment\n"
-        "metadata:\n"
-        "  name: my-app\n"
-        "---\n"
-        "apiVersion: v1\n"
-        "kind: Service\n"
-        "metadata:\n"
-        "  name: my-svc\n";
-    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S,
-                                        "myproj", "k8s/multi.yaml", 0, NULL, NULL);
+    const char *src = "apiVersion: apps/v1\n"
+                      "kind: Deployment\n"
+                      "metadata:\n"
+                      "  name: my-app\n"
+                      "---\n"
+                      "apiVersion: v1\n"
+                      "kind: Service\n"
+                      "metadata:\n"
+                      "  name: my-svc\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S, "myproj",
+                                        "k8s/multi.yaml", 0, NULL, NULL);
     ASSERT(r != NULL);
     ASSERT(!r->has_error);
     /* First document's resource must be present */
@@ -4315,7 +3764,8 @@ static int has_binding_value(const cbm_env_binding_t *bindings, int count, const
 }
 
 TEST(envscan_dockerfile_env_urls) {
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_dock_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_dock_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("tmpdir");
 
@@ -4337,14 +3787,13 @@ TEST(envscan_dockerfile_env_urls) {
     /* DB_HOST=localhost is NOT a URL → should be absent */
     ASSERT_TRUE(find_binding_by_key(bindings, count, "DB_HOST") == NULL);
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-    system(cmd);
+    th_rmtree(tmpdir);
     PASS();
 }
 
 TEST(envscan_shell_env_urls) {
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_sh_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_sh_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("tmpdir");
 
@@ -4364,14 +3813,13 @@ TEST(envscan_shell_env_urls) {
     /* APP_NAME is NOT a URL → absent */
     ASSERT_TRUE(find_binding_by_key(bindings, count, "APP_NAME") == NULL);
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-    system(cmd);
+    th_rmtree(tmpdir);
     PASS();
 }
 
 TEST(envscan_env_file_urls) {
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_env_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_env_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("tmpdir");
 
@@ -4390,14 +3838,13 @@ TEST(envscan_env_file_urls) {
     /* DEBUG=true is NOT a URL */
     ASSERT_TRUE(find_binding_by_key(bindings, count, "DEBUG") == NULL);
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-    system(cmd);
+    th_rmtree(tmpdir);
     PASS();
 }
 
 TEST(envscan_toml_urls) {
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_toml_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_toml_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("tmpdir");
 
@@ -4417,14 +3864,13 @@ TEST(envscan_toml_urls) {
     /* name="my-service" is NOT a URL */
     ASSERT_TRUE(find_binding_by_key(bindings, count, "name") == NULL);
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-    system(cmd);
+    th_rmtree(tmpdir);
     PASS();
 }
 
 TEST(envscan_yaml_urls) {
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_yaml_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_yaml_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("tmpdir");
 
@@ -4442,14 +3888,13 @@ TEST(envscan_yaml_urls) {
                   "https://api.internal.com/api/process");
     ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "callback_url"));
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-    system(cmd);
+    th_rmtree(tmpdir);
     PASS();
 }
 
 TEST(envscan_terraform_urls) {
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_tf_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_tf_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("tmpdir");
 
@@ -4468,14 +3913,13 @@ TEST(envscan_terraform_urls) {
     ASSERT_GTE(count, 1);
     ASSERT_TRUE(has_binding_value(bindings, count, "https://api.example.com/webhook"));
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-    system(cmd);
+    th_rmtree(tmpdir);
     PASS();
 }
 
 TEST(envscan_properties_urls) {
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_prop_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_prop_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("tmpdir");
 
@@ -4490,14 +3934,13 @@ TEST(envscan_properties_urls) {
     ASSERT_TRUE(has_binding_value(bindings, count, "https://api.example.com/health"));
     ASSERT_TRUE(has_binding_value(bindings, count, "https://service.example.com/api"));
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-    system(cmd);
+    th_rmtree(tmpdir);
     PASS();
 }
 
 TEST(envscan_secret_key_exclusion) {
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_skey_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_skey_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("tmpdir");
 
@@ -4518,14 +3961,13 @@ TEST(envscan_secret_key_exclusion) {
     /* Normal key should be present */
     ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "NORMAL_URL"));
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-    system(cmd);
+    th_rmtree(tmpdir);
     PASS();
 }
 
 TEST(envscan_secret_value_exclusion) {
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_sval_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_sval_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("tmpdir");
 
@@ -4543,14 +3985,13 @@ TEST(envscan_secret_value_exclusion) {
     /* Normal URL should be present */
     ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "NORMAL_ENDPOINT"));
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-    system(cmd);
+    th_rmtree(tmpdir);
     PASS();
 }
 
 TEST(envscan_secret_file_exclusion) {
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_sfile_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_sfile_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("tmpdir");
 
@@ -4576,14 +4017,13 @@ TEST(envscan_secret_file_exclusion) {
     ASSERT_EQ(from_credentials, 0);
     ASSERT_EQ(from_setup, 1);
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-    system(cmd);
+    th_rmtree(tmpdir);
     PASS();
 }
 
 TEST(envscan_skips_ignored_dirs) {
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_ign_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_ign_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("tmpdir");
 
@@ -4624,14 +4064,13 @@ TEST(envscan_skips_ignored_dirs) {
     ASSERT_EQ(from_nm, 0);
     ASSERT_EQ(from_root, 1);
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-    system(cmd);
+    th_rmtree(tmpdir);
     PASS();
 }
 
 TEST(envscan_non_url_values_skipped) {
-    char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_nurl_XXXXXX");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_nurl_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         SKIP("tmpdir");
 
@@ -4651,9 +4090,7 @@ TEST(envscan_non_url_values_skipped) {
 
     ASSERT_EQ(count, 0);
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-    system(cmd);
+    th_rmtree(tmpdir);
     PASS();
 }
 
@@ -4854,14 +4291,18 @@ static int setup_incremental_repo(void) {
     /* main.go — calls Helper() */
     snprintf(path, sizeof(path), "%s/main.go", g_incr_tmpdir);
     f = fopen(path, "w");
-    if (!f) { return -1; }
+    if (!f) {
+        return -1;
+    }
     fprintf(f, "package main\n\nfunc main() {\n\tHelper()\n}\n");
     fclose(f);
 
     /* helper.go — defines Helper() */
     snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
     f = fopen(path, "w");
-    if (!f) { return -1; }
+    if (!f) {
+        return -1;
+    }
     fprintf(f, "package main\n\nfunc Helper() string {\n\treturn \"hello\"\n}\n");
     fclose(f);
 
@@ -4869,9 +4310,7 @@ static int setup_incremental_repo(void) {
 }
 
 static void cleanup_incremental_repo(void) {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_incr_tmpdir);
-    (void)system(cmd);
+    th_rmtree(g_incr_tmpdir);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -4882,15 +4321,14 @@ TEST(pipeline_fastapi_depends_edges) {
     /* Depends(get_current_user) should produce a CALLS edge from the
      * endpoint to the dependency function. */
     const char *files[] = {"auth.py", "routes.py"};
-    const char *contents[] = {
-        /* auth.py: defines get_current_user */
-        "def get_current_user(token: str):\n"
-        "    return decode_token(token)\n",
-        /* routes.py: endpoint depends on get_current_user */
-        "from fastapi import Depends\n"
-        "from auth import get_current_user\n\n"
-        "def get_profile(user = Depends(get_current_user)):\n"
-        "    return {\"user\": user}\n"};
+    const char *contents[] = {/* auth.py: defines get_current_user */
+                              "def get_current_user(token: str):\n"
+                              "    return decode_token(token)\n",
+                              /* routes.py: endpoint depends on get_current_user */
+                              "from fastapi import Depends\n"
+                              "from auth import get_current_user\n\n"
+                              "def get_profile(user = Depends(get_current_user)):\n"
+                              "    return {\"user\": user}\n"};
     if (setup_lang_repo(files, contents, 2) != 0) {
         SKIP("tmpdir");
     }
@@ -4911,8 +4349,7 @@ TEST(pipeline_fastapi_depends_edges) {
 
     bool found_depends_edge = false;
     for (int i = 0; i < edge_count; i++) {
-        if (edges[i].properties_json &&
-            strstr(edges[i].properties_json, "fastapi_depends")) {
+        if (edges[i].properties_json && strstr(edges[i].properties_json, "fastapi_depends")) {
             found_depends_edge = true;
             break;
         }
@@ -4937,7 +4374,9 @@ TEST(pipeline_fastapi_depends_edges) {
 
 TEST(incremental_full_then_noop) {
     /* Full index, then re-run → should detect no changes and skip */
-    if (setup_incremental_repo() != 0) { SKIP("setup failed"); }
+    if (setup_incremental_repo() != 0) {
+        SKIP("setup failed");
+    }
 
     /* First: full index */
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
@@ -4973,7 +4412,9 @@ TEST(incremental_full_then_noop) {
 
 TEST(incremental_detects_changed_file) {
     /* Full index, modify one file, re-index → changed file re-parsed */
-    if (setup_incremental_repo() != 0) { SKIP("setup failed"); }
+    if (setup_incremental_repo() != 0) {
+        SKIP("setup failed");
+    }
 
     /* First: full index */
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
@@ -5012,7 +4453,9 @@ TEST(incremental_detects_changed_file) {
 
 TEST(incremental_detects_deleted_file) {
     /* Full index, delete a file, re-index → deleted file's nodes removed */
-    if (setup_incremental_repo() != 0) { SKIP("setup failed"); }
+    if (setup_incremental_repo() != 0) {
+        SKIP("setup failed");
+    }
 
     /* First: full index */
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
@@ -5046,7 +4489,9 @@ TEST(incremental_detects_deleted_file) {
 
 TEST(incremental_new_file_added) {
     /* Full index, add a new file, re-index → new file's nodes appear */
-    if (setup_incremental_repo() != 0) { SKIP("setup failed"); }
+    if (setup_incremental_repo() != 0) {
+        SKIP("setup failed");
+    }
 
     /* First: full index */
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
@@ -5141,9 +4586,7 @@ TEST(incremental_k8s_manifest_indexed) {
     cbm_store_close(s);
 
     free(project);
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-    (void)system(cmd);
+    th_rmtree(tmpdir);
     PASS();
 }
 
@@ -5208,9 +4651,7 @@ TEST(incremental_kustomize_module_indexed) {
     ASSERT_TRUE(found_kust);
 
     free(project);
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-    (void)system(cmd);
+    th_rmtree(tmpdir);
     PASS();
 }
 
@@ -5445,12 +4886,12 @@ TEST(env_var_name_valid) {
 
 TEST(env_var_name_invalid) {
     /* Invalid: too short, lowercase, mixed case, empty */
-    ASSERT_FALSE(cbm_is_env_var_name("A"));       /* single char */
-    ASSERT_FALSE(cbm_is_env_var_name("port"));    /* lowercase */
-    ASSERT_FALSE(cbm_is_env_var_name("apiKey"));  /* camelCase */
-    ASSERT_FALSE(cbm_is_env_var_name("__"));      /* no uppercase */
-    ASSERT_FALSE(cbm_is_env_var_name(""));        /* empty */
-    ASSERT_FALSE(cbm_is_env_var_name("123"));     /* digits only */
+    ASSERT_FALSE(cbm_is_env_var_name("A"));      /* single char */
+    ASSERT_FALSE(cbm_is_env_var_name("port"));   /* lowercase */
+    ASSERT_FALSE(cbm_is_env_var_name("apiKey")); /* camelCase */
+    ASSERT_FALSE(cbm_is_env_var_name("__"));     /* no uppercase */
+    ASSERT_FALSE(cbm_is_env_var_name(""));       /* empty */
+    ASSERT_FALSE(cbm_is_env_var_name("123"));    /* digits only */
     PASS();
 }
 
@@ -5486,7 +4927,8 @@ TEST(split_camel_basic) {
     ASSERT_STR_EQ(parts[0], "get");
     ASSERT_STR_EQ(parts[1], "Camel");
     ASSERT_STR_EQ(parts[2], "Case");
-    for (int i = 0; i < n; i++) free(parts[i]);
+    for (int i = 0; i < n; i++)
+        free(parts[i]);
 
     PASS();
 }
@@ -5497,7 +4939,8 @@ TEST(split_camel_single_word) {
     int n = cbm_split_camel_case("hello", parts, 16);
     ASSERT_EQ(n, 1);
     ASSERT_STR_EQ(parts[0], "hello");
-    for (int i = 0; i < n; i++) free(parts[i]);
+    for (int i = 0; i < n; i++)
+        free(parts[i]);
     PASS();
 }
 
@@ -5505,7 +4948,8 @@ TEST(split_camel_empty) {
     /* Empty string — should return 0 or 1 empty part */
     char *parts[16];
     int n = cbm_split_camel_case("", parts, 16);
-    for (int i = 0; i < n; i++) free(parts[i]);
+    for (int i = 0; i < n; i++)
+        free(parts[i]);
     /* Either 0 parts or 1 empty part is acceptable */
     ASSERT_TRUE(n >= 0 && n <= 1);
     PASS();
@@ -5518,7 +4962,8 @@ TEST(tokenize_decorator_login_required) {
     ASSERT_EQ(n, 2);
     ASSERT_STR_EQ(tokens[0], "login");
     ASSERT_STR_EQ(tokens[1], "required");
-    for (int i = 0; i < n; i++) free(tokens[i]);
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
     PASS();
 }
 
@@ -5528,7 +4973,8 @@ TEST(tokenize_decorator_single) {
     int n = cbm_tokenize_decorator("@Override", tokens, 16);
     ASSERT_EQ(n, 1);
     ASSERT_STR_EQ(tokens[0], "override");
-    for (int i = 0; i < n; i++) free(tokens[i]);
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
     PASS();
 }
 
@@ -5542,7 +4988,8 @@ TEST(split_command_basic) {
     ASSERT_STR_EQ(args[2], "main.c");
     ASSERT_STR_EQ(args[3], "-o");
     ASSERT_STR_EQ(args[4], "main.o");
-    for (int i = 0; i < n; i++) free(args[i]);
+    for (int i = 0; i < n; i++)
+        free(args[i]);
     PASS();
 }
 
@@ -5552,7 +4999,8 @@ TEST(split_command_quoted) {
     int n = cbm_split_command("gcc -DFOO=\"bar baz\" main.c", args, 16);
     ASSERT_GTE(n, 3);
     ASSERT_STR_EQ(args[0], "gcc");
-    for (int i = 0; i < n; i++) free(args[i]);
+    for (int i = 0; i < n; i++)
+        free(args[i]);
     PASS();
 }
 
@@ -5807,17 +5255,6 @@ SUITE(pipeline) {
     RUN_TEST(configures_non_config_file_skipped);
     RUN_TEST(configures_full_pipeline_integration);
     /* HTTP link pipeline integration */
-    RUN_TEST(pipeline_httplink_route_and_caller);
-    RUN_TEST(pipeline_httplink_cross_file_prefix);
-    RUN_TEST(pipeline_httplink_websocket_routes);
-    /* HTTP link linker integration (ported from httplink_test.go) */
-    RUN_TEST(httplink_linker_cross_file_group_variable);
-    RUN_TEST(httplink_linker_registration_call_edges);
-    RUN_TEST(httplink_linker_async_dispatch);
-    RUN_TEST(httplink_linker_extract_async_call_sites);
-    RUN_TEST(httplink_linker_fastapi_prefix);
-    RUN_TEST(httplink_linker_express_prefix);
-    RUN_TEST(httplink_linker_same_service_skip);
     /* Enrichment helpers */
     RUN_TEST(enrichment_split_camel_case);
     RUN_TEST(enrichment_tokenize_decorator);

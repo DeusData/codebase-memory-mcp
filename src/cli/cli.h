@@ -53,11 +53,11 @@ int cbm_replace_binary(const char *path, const unsigned char *data, int len, int
 /* ── Skill file management ────────────────────────────────────── */
 
 /* Number of skill files. */
-#define CBM_SKILL_COUNT 4
+#define CBM_SKILL_COUNT 1
 
 /* Skill name/content pair. */
 typedef struct {
-    const char *name;    /* e.g. "codebase-memory-exploring" */
+    const char *name;    /* e.g. "codebase-memory" */
     const char *content; /* full SKILL.md content */
 } cbm_skill_t;
 

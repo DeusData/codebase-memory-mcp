@@ -99,12 +99,18 @@ typedef struct {
     const char **param_names;  // NULL-terminated array (NULL if none)
     const char **param_types;  // NULL-terminated array (NULL if none)
     const char **return_types; // NULL-terminated array (NULL if none)
+    const char *route_path;    // HTTP route path from decorator (e.g., "/api/users") or NULL
+    const char *route_method;  // HTTP method from decorator (e.g., "POST") or NULL
     int complexity;            // cyclomatic complexity
     int lines;                 // body line count
+    uint32_t *fingerprint;     // MinHash fingerprint (arena-allocated, K values) or NULL
+    int fingerprint_k;         // number of hash values (CBM_MINHASH_K or 0)
     bool is_exported;
     bool is_abstract;
     bool is_test;
     bool is_entry_point;
+    const char *structural_profile; // AST structural profile (arena-allocated) or NULL
+    const char *body_tokens; // space-separated raw identifier tokens from body (arena) or NULL
 } CBMDefinition;
 
 /* Argument captured from a call expression */
@@ -185,6 +191,24 @@ typedef struct {
     const char *target_url;  // push_endpoint, uri, or http_target URL
     const char *broker;      // "pubsub", "cloud_tasks", "cloud_scheduler", "sqs", "kafka"
 } CBMInfraBinding;
+
+/* Pub/sub channel participation.  One record per emit() or on()/addListener()
+ * call detected in source — the receiver (e.g. Socket.IO client, EventEmitter
+ * instance) is intentionally NOT identified; matching is by channel_name
+ * across files, which captures the common pattern of one logical bus per
+ * service.  Transport disambiguates Socket.IO vs EventEmitter vs future
+ * detectors (Kafka, Cloud Pub/Sub, etc.). */
+typedef enum {
+    CBM_CHANNEL_EMIT = 0,
+    CBM_CHANNEL_LISTEN = 1,
+} CBMChannelDirection;
+
+typedef struct {
+    const char *channel_name;      // literal channel name (e.g. "user.created")
+    const char *transport;         // "socketio", "event_emitter", ...
+    const char *enclosing_func_qn; // QN of the function containing the emit/on call
+    CBMChannelDirection direction;
+} CBMChannel;
 
 // Rust: impl Trait for Struct
 typedef struct {
@@ -280,6 +304,12 @@ typedef struct {
     int cap;
 } CBMImplTraitArray;
 
+typedef struct {
+    CBMChannel *items;
+    int count;
+    int cap;
+} CBMChannelArray;
+
 // Full extraction result for one file.
 typedef struct {
     CBMArena arena; // owns all string memory
@@ -297,6 +327,7 @@ typedef struct {
     CBMResolvedCallArray resolved_calls; // LSP-resolved calls (high confidence)
     CBMStringRefArray string_refs;       // URL/config string literals from AST
     CBMInfraBindingArray infra_bindings; // topic→URL pairs from IaC configs
+    CBMChannelArray channels;            // Socket.IO / EventEmitter pub/sub participation
 
     const char *module_qn;    // module qualified name
     const char **exports;     // NULL-terminated (NULL if none)
@@ -388,7 +419,12 @@ void cbm_destroy_thread_parser(void);
 void cbm_shutdown(void);
 
 // Profiling: get accumulated parse/extraction times and file count.
-void cbm_get_profile(uint64_t *parse_ns, uint64_t *extract_ns, uint64_t *files);
+typedef struct {
+    uint64_t *parse_ns;
+    uint64_t *extract_ns;
+    uint64_t *files;
+} cbm_profile_out_t;
+void cbm_get_profile(cbm_profile_out_t out);
 uint64_t cbm_get_lsp_ns(void);
 uint64_t cbm_get_preprocess_ns(void);
 uint64_t cbm_get_files_preprocessed(void);
@@ -410,6 +446,7 @@ void cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr);
 void cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBinding ib);
 void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
 void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
+void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
 
 // --- Sub-extractor entry points ---
 
@@ -421,6 +458,7 @@ void cbm_extract_semantic(CBMExtractCtx *ctx);
 void cbm_extract_type_refs(CBMExtractCtx *ctx);
 void cbm_extract_env_accesses(CBMExtractCtx *ctx);
 void cbm_extract_type_assigns(CBMExtractCtx *ctx);
+void cbm_extract_channels(CBMExtractCtx *ctx);
 
 // Single-pass unified extraction (replaces the 7 calls above except defs+imports).
 void cbm_extract_unified(CBMExtractCtx *ctx);

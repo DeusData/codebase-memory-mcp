@@ -1,5 +1,5 @@
 /* ----------------------------------------------------------------------------
-Copyright (c) 2018-2023, Microsoft Research, Daan Leijen
+Copyright (c) 2018-2024, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
@@ -7,7 +7,7 @@ terms of the MIT license. A copy of the license can be found in the file
 
 // --------------------------------------------------------
 // This module defines various std libc functions to reduce
-// the dependency on libc, and also prevent errors caused 
+// the dependency on libc, and also prevent errors caused
 // by some libc implementations when called before `main`
 // executes (due to malloc redirection)
 // --------------------------------------------------------
@@ -65,6 +65,21 @@ size_t _mi_strnlen(const char* s, size_t max_len) {
   return len;
 }
 
+char* _mi_strnstr(char* s, size_t max_len, const char* pat) {
+  if (s==NULL) return NULL;
+  if (pat==NULL) return s;
+  const size_t m = _mi_strnlen(s, max_len);
+  const size_t n = _mi_strlen(pat);  
+  for (size_t start = 0; start + n <= m; start++) {
+    size_t i = 0;
+    while (i<n && pat[i]==s[start+i]) {
+      i++;
+    }
+    if (i==n) return &s[start];
+  }
+  return NULL;
+}
+
 #ifdef MI_NO_GETENV
 bool _mi_getenv(const char* name, char* result, size_t result_size) {
   MI_UNUSED(name);
@@ -83,7 +98,7 @@ bool _mi_getenv(const char* name, char* result, size_t result_size) {
 // Define our own limited `_mi_vsnprintf` and `_mi_snprintf`
 // This is mostly to avoid calling these when libc is not yet
 // initialized (and to reduce dependencies)
-// 
+//
 // format:      d i, p x u, s
 // prec:        z l ll L
 // width:       10
@@ -130,7 +145,7 @@ static void mi_out_alignright(char fill, char* start, size_t len, size_t extra, 
 }
 
 
-static void mi_out_num(uintmax_t x, size_t base, char prefix, char** out, char* end) 
+static void mi_out_num(uintmax_t x, size_t base, char prefix, char** out, char* end)
 {
   if (x == 0 || base == 0 || base > 16) {
     if (prefix != 0) { mi_outc(prefix, out, end); }
@@ -144,8 +159,8 @@ static void mi_out_num(uintmax_t x, size_t base, char prefix, char** out, char* 
       mi_outc((digit <= 9 ? '0' + digit : 'A' + digit - 10),out,end);
       x = x / base;
     }
-    if (prefix != 0) { 
-      mi_outc(prefix, out, end); 
+    if (prefix != 0) {
+      mi_outc(prefix, out, end);
     }
     size_t len = *out - start;
     // and reverse in-place
@@ -160,8 +175,8 @@ static void mi_out_num(uintmax_t x, size_t base, char prefix, char** out, char* 
 
 #define MI_NEXTC()  c = *in; if (c==0) break; in++;
 
-void _mi_vsnprintf(char* buf, size_t bufsize, const char* fmt, va_list args) {
-  if (buf == NULL || bufsize == 0 || fmt == NULL) return;
+int _mi_vsnprintf(char* buf, size_t bufsize, const char* fmt, va_list args) {
+  if (buf == NULL || bufsize == 0 || fmt == NULL) return 0;
   buf[bufsize - 1] = 0;
   char* const end = buf + (bufsize - 1);
   const char* in = fmt;
@@ -171,7 +186,18 @@ void _mi_vsnprintf(char* buf, size_t bufsize, const char* fmt, va_list args) {
     char c;
     MI_NEXTC();
     if (c != '%') {
-      if ((c >= ' ' && c <= '~') || c=='\n' || c=='\r' || c=='\t') { // output visible ascii or standard control only
+      if (c == '\\') {
+        MI_NEXTC();
+        switch (c) {
+        case 'e': mi_outc('\x1B', &out, end); break;
+        case 't': mi_outc('\t', &out, end); break;
+        case 'n': mi_outc('\n', &out, end); break;
+        case 'r': mi_outc('\r', &out, end); break;
+        case '\\': mi_outc('\\', &out, end); break;
+        default: /* ignore */ break;
+        }
+      }
+      else if ((c >= ' ' && c <= '~') || c=='\n' || c=='\r' || c=='\t' || c=='\x1b') { // output visible ascii or standard control only
         mi_outc(c, &out, end);
       }
     }
@@ -181,7 +207,7 @@ void _mi_vsnprintf(char* buf, size_t bufsize, const char* fmt, va_list args) {
       size_t width = 0;
       char   numtype = 'd';
       char   numplus = 0;
-      bool   alignright = true; 
+      bool   alignright = true;
       if (c == '+' || c == ' ') { numplus = c; MI_NEXTC(); }
       if (c == '-') { alignright = false; MI_NEXTC(); }
       if (c == '0') { fill = '0'; MI_NEXTC(); }
@@ -191,7 +217,7 @@ void _mi_vsnprintf(char* buf, size_t bufsize, const char* fmt, va_list args) {
           width = (10 * width) + (c - '0'); MI_NEXTC();
         }
         if (c == 0) break;  // extra check due to while
-      }      
+      }
       if (c == 'z' || c == 't' || c == 'L') { numtype = c; MI_NEXTC(); }
       else if (c == 'l') {
         numtype = c; MI_NEXTC();
@@ -199,7 +225,10 @@ void _mi_vsnprintf(char* buf, size_t bufsize, const char* fmt, va_list args) {
       }
 
       char* start = out;
-      if (c == 's') {
+      if (c == '%') {
+        mi_outc('%', &out, end);
+      }
+      else if (c == 's') {
         // string
         const char* s = va_arg(args, const char*);
         mi_outs(s, &out, end);
@@ -265,11 +294,139 @@ void _mi_vsnprintf(char* buf, size_t bufsize, const char* fmt, va_list args) {
   }
   mi_assert_internal(out <= end);
   *out = 0;
+  return (int)(out - buf);
 }
 
-void _mi_snprintf(char* buf, size_t buflen, const char* fmt, ...) {
+int _mi_snprintf(char* buf, size_t buflen, const char* fmt, ...) {
   va_list args;
   va_start(args, fmt);
-  _mi_vsnprintf(buf, buflen, fmt, args);
+  const int written = _mi_vsnprintf(buf, buflen, fmt, args);
   va_end(args);
+  return written;
 }
+
+
+
+// --------------------------------------------------------
+// generic trailing and leading zero count, and popcount
+// --------------------------------------------------------
+
+#if !MI_HAS_FAST_BITSCAN
+
+static size_t mi_ctz_generic32(uint32_t x) {
+  // de Bruijn multiplication, see <http://keithandkatie.com/keith/papers/debruijn.html>
+  static const uint8_t debruijn[32] = {
+    0, 1, 28, 2, 29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4, 8,
+    31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9
+  };
+  if (x==0) return 32;
+  return debruijn[(uint32_t)((x & -(int32_t)x) * (uint32_t)(0x077CB531U)) >> 27];
+}
+
+static size_t mi_clz_generic32(uint32_t x) {
+  // de Bruijn multiplication, see <http://keithandkatie.com/keith/papers/debruijn.html>
+  static const uint8_t debruijn[32] = {
+    31, 22, 30, 21, 18, 10, 29, 2, 20, 17, 15, 13, 9, 6, 28, 1,
+    23, 19, 11, 3, 16, 14, 7, 24, 12, 4, 8, 25, 5, 26, 27, 0
+  };
+  if (x==0) return 32;
+  x |= x >> 1;
+  x |= x >> 2;
+  x |= x >> 4;
+  x |= x >> 8;
+  x |= x >> 16;
+  return debruijn[(uint32_t)(x * (uint32_t)(0x07C4ACDDU)) >> 27];
+}
+
+size_t _mi_ctz_generic(size_t x) {
+  if (x==0) return MI_SIZE_BITS;
+  #if (MI_SIZE_BITS <= 32)
+    return mi_ctz_generic32((uint32_t)x);
+  #else
+    const uint32_t lo = (uint32_t)x;
+    if (lo != 0) {
+      return mi_ctz_generic32(lo);
+    }
+    else {
+      return (32 + mi_ctz_generic32((uint32_t)(x>>32)));
+    }
+  #endif
+}
+
+size_t _mi_clz_generic(size_t x) {
+  if (x==0) return MI_SIZE_BITS;
+  #if (MI_SIZE_BITS <= 32)
+    return mi_clz_generic32((uint32_t)x);
+  #else
+    const uint32_t hi = (uint32_t)(x>>32);
+    if (hi != 0) {
+      return mi_clz_generic32(hi);
+    }
+    else {
+      return 32 + mi_clz_generic32((uint32_t)x);
+    }
+  #endif
+}
+
+#endif // bit scan
+
+
+#if MI_SIZE_SIZE == 4
+#define mi_mask_even_bits32      (0x55555555)
+#define mi_mask_even_pairs32     (0x33333333)
+#define mi_mask_even_nibbles32   (0x0F0F0F0F)
+
+// sum of all the bytes in `x` if it is guaranteed that the sum < 256!
+static size_t mi_byte_sum32(uint32_t x) {
+  // perform `x * 0x01010101`: the highest byte contains the sum of all bytes.
+  x += (x << 8);
+  x += (x << 16);
+  return (size_t)(x >> 24);
+}
+
+static size_t mi_popcount_generic32(uint32_t x) {
+  // first count each 2-bit group `a`, where: a==0b00 -> 00, a==0b01 -> 01, a==0b10 -> 01, a==0b11 -> 10
+  // in other words, `a - (a>>1)`; to do this in parallel, we need to mask to prevent spilling a bit pair
+  // into the lower bit-pair:
+  x = x - ((x >> 1) & mi_mask_even_bits32);
+  // add the 2-bit pair results
+  x = (x & mi_mask_even_pairs32) + ((x >> 2) & mi_mask_even_pairs32);
+  // add the 4-bit nibble results
+  x = (x + (x >> 4)) & mi_mask_even_nibbles32;
+  // each byte now has a count of its bits, we can sum them now:
+  return mi_byte_sum32(x);
+}
+
+mi_decl_noinline size_t _mi_popcount_generic(size_t x) {
+  if (x<=1) return x;
+  if (~x==0) return MI_SIZE_BITS;
+  return mi_popcount_generic32(x);
+}
+
+#else
+#define mi_mask_even_bits64      (0x5555555555555555)
+#define mi_mask_even_pairs64     (0x3333333333333333)
+#define mi_mask_even_nibbles64   (0x0F0F0F0F0F0F0F0F)
+
+// sum of all the bytes in `x` if it is guaranteed that the sum < 256!
+static size_t mi_byte_sum64(uint64_t x) {
+  x += (x << 8);
+  x += (x << 16);
+  x += (x << 32);
+  return (size_t)(x >> 56);
+}
+
+static size_t mi_popcount_generic64(uint64_t x) {
+  x = x - ((x >> 1) & mi_mask_even_bits64);
+  x = (x & mi_mask_even_pairs64) + ((x >> 2) & mi_mask_even_pairs64);
+  x = (x + (x >> 4)) & mi_mask_even_nibbles64;
+  return mi_byte_sum64(x);
+}
+
+mi_decl_noinline size_t _mi_popcount_generic(size_t x) {
+  if (x<=1) return x;
+  if (~x==0) return MI_SIZE_BITS;
+  return mi_popcount_generic64(x);
+}
+#endif
+

@@ -16,6 +16,7 @@
  * On slab_destroy_thread: free all slab pages.
  * realloc handles slab-to-heap promotion with minimal copying.
  */
+#include "foundation/constants.h"
 #include "foundation/slab_alloc.h"
 #include "foundation/compat.h"
 
@@ -42,8 +43,8 @@ typedef struct slab_free_node {
 
 /* One slab page — a contiguous block of SLAB_PAGE_CHUNKS chunks. */
 typedef struct slab_page {
-    struct slab_page *next;    /* linked list of pages */
-    char data[SLAB_PAGE_SIZE]; /* NOLINT(modernize-avoid-c-arrays) */
+    struct slab_page *next; /* linked list of pages */
+    char data[SLAB_PAGE_SIZE];
 } slab_page_t;
 
 /* Per-thread Tier 1 state. */
@@ -94,7 +95,7 @@ static bool slab_owns(const slab_state_t *s, const void *ptr) {
     uintptr_t p = (uintptr_t)ptr;
     for (const slab_page_t *page = s->pages; page; page = page->next) {
         uintptr_t lo = (uintptr_t)page->data;
-        if (p >= lo && p < lo + SLAB_PAGE_SIZE) {
+        if (p >= lo && p < lo + (uintptr_t)SLAB_PAGE_SIZE) {
             return true;
         }
     }
@@ -104,6 +105,9 @@ static bool slab_owns(const slab_state_t *s, const void *ptr) {
 /* ── Allocator functions (installed as tree-sitter callbacks) ───── */
 
 static void *slab_malloc(size_t size) {
+    if (size == 0) {
+        size = SKIP_ONE;
+    }
     /* Tier 1: ≤64B → slab free list */
     if (size <= SLAB_CHUNK_SIZE) {
         slab_state_t *s = &tls_slab;

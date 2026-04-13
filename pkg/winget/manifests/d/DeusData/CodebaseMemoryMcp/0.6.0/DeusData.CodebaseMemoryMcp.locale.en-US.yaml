@@ -1,0 +1,29 @@
+PackageIdentifier: DeusData.CodebaseMemoryMcp
+PackageVersion: 0.6.0
+PackageLocale: en-US
+Publisher: DeusData
+PublisherUrl: https://github.com/DeusData
+PublisherSupportUrl: https://github.com/DeusData/codebase-memory-mcp/issues
+PackageName: codebase-memory-mcp
+PackageUrl: https://github.com/DeusData/codebase-memory-mcp
+License: MIT
+LicenseUrl: https://github.com/DeusData/codebase-memory-mcp/blob/main/LICENSE
+ShortDescription: Fast code intelligence engine for AI coding agents
+Description: |-
+  codebase-memory-mcp is a single static binary MCP server that indexes codebases
+  at extreme speed and exposes 14 MCP tools for AI coding agents. Full indexes an
+  average repository in milliseconds, the Linux kernel (28M LOC) in 3 minutes.
+  Supports 66 languages via vendored tree-sitter grammars. Zero dependencies.
+  Plug and play across 10 coding agents including Claude Code, Codex CLI, and Zed.
+Moniker: codebase-memory-mcp
+Tags:
+  - mcp
+  - ai
+  - claude
+  - code-intelligence
+  - codebase
+  - developer-tools
+  - tree-sitter
+ReleaseNotesUrl: https://github.com/DeusData/codebase-memory-mcp/releases/tag/v0.6.0
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

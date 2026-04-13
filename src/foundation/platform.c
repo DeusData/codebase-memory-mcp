@@ -4,9 +4,12 @@
  * macOS, Linux, and Windows. Platform-specific code behind #ifdef guards.
  */
 #include "platform.h"
-#include "compat.h"
 
-#include <stdint.h> // uint64_t, int64_t
+#include "foundation/constants.h"
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 
 #ifdef _WIN32
 
@@ -89,7 +92,7 @@ bool cbm_is_dir(const char *path) {
 int64_t cbm_file_size(const char *path) {
     WIN32_FILE_ATTRIBUTE_DATA fad;
     if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
     LARGE_INTEGER sz;
     sz.HighPart = (LONG)fad.nFileSizeHigh; // cppcheck-suppress unreadVariable
@@ -112,7 +115,6 @@ char *cbm_normalize_path_sep(char *path) {
 
 /* ── POSIX implementation ─────────────────────────────────────── */
 
-#include <fcntl.h> // open, O_RDONLY
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -133,7 +135,6 @@ void *cbm_mmap_read(const char *path, size_t *out_size) {
     }
     *out_size = 0;
 
-    // NOLINTNEXTLINE(misc-include-cleaner) — open provided by standard header
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         return NULL;
@@ -170,7 +171,7 @@ static int timebase_init = 0;
 uint64_t cbm_now_ns(void) {
     if (!timebase_init) {
         mach_timebase_info(&timebase_info);
-        timebase_init = 1;
+        timebase_init = SKIP_ONE;
     }
     uint64_t ticks = mach_absolute_time();
     return ticks * timebase_info.numer / timebase_info.denom;
@@ -178,7 +179,7 @@ uint64_t cbm_now_ns(void) {
 #else
 uint64_t cbm_now_ns(void) {
     struct timespec ts;
-    cbm_clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 #endif
@@ -198,7 +199,8 @@ int cbm_nprocs(void) {
     if (sysctlbyname("hw.ncpu", &ncpu, &len, NULL, 0) == 0 && ncpu > 0) {
         return ncpu;
     }
-    return 1;
+    enum { FILE_EXISTS = 1 };
+    return FILE_EXISTS;
 #else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? (int)n : 1;
@@ -214,14 +216,13 @@ bool cbm_file_exists(const char *path) {
 
 bool cbm_is_dir(const char *path) {
     struct stat st;
-    // NOLINTNEXTLINE(readability-implicit-bool-conversion)
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 int64_t cbm_file_size(const char *path) {
     struct stat st;
     if (stat(path, &st) != 0) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
     return (int64_t)st.st_size;
 }
@@ -241,23 +242,134 @@ char *cbm_normalize_path_sep(char *path) {
 
 #endif /* _WIN32 */
 
+/* ── Environment variables ────────────────────────────────────── */
+
+/* Thread-safe getenv: iterates environ directly instead of calling getenv().
+ * getenv() is flagged by concurrency-mt-unsafe because the returned pointer
+ * can be invalidated by setenv/putenv in another thread. We copy to a
+ * caller-owned buffer immediately. */
+#ifdef _WIN32
+#include <stdlib.h>
+#define CBM_ENVIRON _environ
+#elif defined(__APPLE__)
+#include <crt_externs.h>
+#define CBM_ENVIRON (*_NSGetEnviron())
+#else
+extern char **environ;
+#define CBM_ENVIRON environ
+#endif
+
+const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback) {
+    char **env = CBM_ENVIRON;
+    if (env) {
+        size_t nlen = strlen(name);
+        for (; *env; env++) {
+            if (strncmp(*env, name, nlen) == 0 && (*env)[nlen] == '=') {
+                snprintf(buf, buf_sz, "%s", *env + nlen + SKIP_ONE);
+                return buf;
+            }
+        }
+    }
+    if (fallback) {
+        snprintf(buf, buf_sz, "%s", fallback);
+        return buf;
+    }
+    buf[0] = '\0';
+    return NULL;
+}
+
 /* ── Home directory (cross-platform) ──────────────────────────── */
 
 const char *cbm_get_home_dir(void) {
-    static char buf[1024];
-    // NOLINTNEXTLINE(concurrency-mt-unsafe)
-    const char *h = getenv("HOME");
-    if (h && h[0]) {
-        snprintf(buf, sizeof(buf), "%s", h);
+    static char buf[CBM_SZ_1K];
+    char tmp[CBM_SZ_256] = "";
+
+    cbm_safe_getenv("HOME", tmp, sizeof(tmp), NULL);
+    if (tmp[0]) {
+        snprintf(buf, sizeof(buf), "%s", tmp);
         cbm_normalize_path_sep(buf);
         return buf;
     }
-    // NOLINTNEXTLINE(concurrency-mt-unsafe)
-    h = getenv("USERPROFILE");
-    if (h && h[0]) {
-        snprintf(buf, sizeof(buf), "%s", h);
+
+    cbm_safe_getenv("USERPROFILE", tmp, sizeof(tmp), NULL);
+    if (tmp[0]) {
+        snprintf(buf, sizeof(buf), "%s", tmp);
         cbm_normalize_path_sep(buf);
         return buf;
     }
     return NULL;
+}
+
+/* ── App config directories (cross-platform) ─────────────────── */
+
+const char *cbm_app_config_dir(void) {
+    static char buf[CBM_SZ_1K];
+    char tmp[CBM_SZ_256] = "";
+#ifdef _WIN32
+    cbm_safe_getenv("APPDATA", tmp, sizeof(tmp), NULL);
+    if (tmp[0]) {
+        snprintf(buf, sizeof(buf), "%s", tmp);
+        cbm_normalize_path_sep(buf);
+        return buf;
+    }
+    const char *home = cbm_get_home_dir();
+    if (home) {
+        snprintf(buf, sizeof(buf), "%s/AppData/Roaming", home);
+        return buf;
+    }
+    return NULL;
+#else
+    /* Linux: XDG_CONFIG_HOME or ~/.config */
+    cbm_safe_getenv("XDG_CONFIG_HOME", tmp, sizeof(tmp), NULL);
+    if (tmp[0]) {
+        snprintf(buf, sizeof(buf), "%s", tmp);
+        return buf;
+    }
+    const char *home = cbm_get_home_dir();
+    if (home) {
+        snprintf(buf, sizeof(buf), "%s/.config", home);
+        return buf;
+    }
+    return NULL;
+#endif /* _WIN32 */
+}
+
+const char *cbm_app_local_dir(void) {
+#ifdef _WIN32
+    static char buf[CBM_SZ_1K];
+    char tmp[CBM_SZ_256] = "";
+    cbm_safe_getenv("LOCALAPPDATA", tmp, sizeof(tmp), NULL);
+    if (tmp[0]) {
+        snprintf(buf, sizeof(buf), "%s", tmp);
+        cbm_normalize_path_sep(buf);
+        return buf;
+    }
+    const char *home = cbm_get_home_dir();
+    if (home) {
+        snprintf(buf, sizeof(buf), "%s/AppData/Local", home);
+        return buf;
+    }
+    return NULL;
+#else
+    return cbm_app_config_dir();
+#endif
+}
+
+/* ── Cache directory ─────────────────────────────────────────── */
+
+const char *cbm_resolve_cache_dir(void) {
+    static char buf[CBM_SZ_1K];
+    char tmp[CBM_SZ_256] = "";
+    cbm_safe_getenv("CBM_CACHE_DIR", tmp, sizeof(tmp), NULL);
+    if (tmp[0]) {
+        snprintf(buf, sizeof(buf), "%s", tmp);
+        cbm_normalize_path_sep(buf);
+        return buf;
+    }
+    const char *home = cbm_get_home_dir();
+    if (!home) {
+        return NULL;
+    }
+    snprintf(buf, sizeof(buf), "%s/.cache/codebase-memory-mcp", home);
+    return buf;
 }

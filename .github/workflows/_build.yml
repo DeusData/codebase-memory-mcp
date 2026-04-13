@@ -1,0 +1,187 @@
+# Reusable: build binaries (standard + UI) on all platforms
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version string (e.g. v0.8.0)'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            cc: gcc
+            cxx: g++
+          - os: macos-14
+            goos: darwin
+            goarch: arm64
+            cc: cc
+            cxx: c++
+          - os: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            cc: cc
+            cxx: c++
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install deps (Ubuntu)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: "22"
+
+      - name: Build standard binary
+        run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+
+      - name: Ad-hoc sign macOS binary
+        if: startsWith(matrix.os, 'macos')
+        run: codesign --sign - --force build/c/codebase-memory-mcp
+
+      - name: Archive standard binary
+        run: |
+          cp LICENSE install.sh build/c/
+          tar -czf codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
+            -C build/c codebase-memory-mcp LICENSE install.sh
+
+      - name: Build UI binary
+        run: scripts/build.sh --with-ui ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+
+      - name: Ad-hoc sign macOS UI binary
+        if: startsWith(matrix.os, 'macos')
+        run: codesign --sign - --force build/c/codebase-memory-mcp
+
+      - name: Frontend integrity scan
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: scripts/security-ui.sh
+
+      - name: Archive UI binary
+        run: |
+          cp LICENSE install.sh build/c/
+          tar -czf codebase-memory-mcp-ui-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
+            -C build/c codebase-memory-mcp LICENSE install.sh
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: "*.tar.gz"
+
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: msys2/setup-msys2@cafece8e6baf9247cf9b1bf95097b0b983cc558d # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-zlib
+            make
+            zip
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: "22"
+
+      - name: Build standard binary
+        shell: msys2 {0}
+        run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=clang CXX=clang++
+
+      - name: Archive standard binary
+        shell: msys2 {0}
+        run: |
+          BIN=build/c/codebase-memory-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          cp "$BIN" codebase-memory-mcp.exe
+          zip codebase-memory-mcp-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1
+
+      - name: Build UI binary
+        shell: msys2 {0}
+        run: scripts/build.sh --with-ui ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=clang CXX=clang++
+
+      - name: Archive UI binary
+        shell: msys2 {0}
+        run: |
+          BIN=build/c/codebase-memory-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          cp "$BIN" codebase-memory-mcp.exe
+          zip codebase-memory-mcp-ui-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: binaries-windows-amd64
+          path: "*.zip"
+
+  build-linux-portable:
+    # Fully static Linux binaries (gcc -static on Ubuntu).
+    # Runs on any Linux distro without shared library dependencies.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: "22"
+
+      - name: Build standard binary (static)
+        run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=gcc CXX=g++ STATIC=1
+
+      - name: Verify static linking
+        run: |
+          file build/c/codebase-memory-mcp
+          ldd build/c/codebase-memory-mcp 2>&1 | grep -q "not a dynamic executable" || ldd build/c/codebase-memory-mcp 2>&1 | grep -q "statically linked"
+
+      - name: Archive standard binary
+        run: |
+          cp LICENSE install.sh build/c/
+          tar -czf codebase-memory-mcp-linux-${{ matrix.arch }}-portable.tar.gz \
+            -C build/c codebase-memory-mcp LICENSE install.sh
+
+      - name: Build UI binary (static)
+        run: scripts/build.sh --with-ui ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=gcc CXX=g++ STATIC=1
+
+      - name: Archive UI binary
+        run: |
+          cp LICENSE install.sh build/c/
+          tar -czf codebase-memory-mcp-ui-linux-${{ matrix.arch }}-portable.tar.gz \
+            -C build/c codebase-memory-mcp LICENSE install.sh
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: binaries-linux-${{ matrix.arch }}-portable
+          path: "*.tar.gz"

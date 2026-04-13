@@ -1,0 +1,46 @@
+# Reusable: lint only (cppcheck + clang-format).
+# Security-static and CodeQL gate are separate — see _security.yml.
+name: Lint & Security
+
+on:
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev cmake
+
+      - name: Install LLVM 20
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" | sudo tee /etc/apt/sources.list.d/llvm-20.list
+          sudo apt-get update
+          sudo apt-get install -y clang-format-20
+
+      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        id: cppcheck-cache
+        with:
+          path: /opt/cppcheck
+          key: cppcheck-2.20.0-ubuntu-amd64
+
+      - name: Build cppcheck 2.20.0
+        if: steps.cppcheck-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch 2.20.0 https://github.com/danmar/cppcheck.git /tmp/cppcheck
+          cmake -S /tmp/cppcheck -B /tmp/cppcheck/build -DCMAKE_BUILD_TYPE=Release -DHAVE_RULES=OFF -DCMAKE_INSTALL_PREFIX=/opt/cppcheck
+          cmake --build /tmp/cppcheck/build -j$(nproc)
+          cmake --install /tmp/cppcheck/build
+
+      - name: Add cppcheck to PATH
+        run: echo "/opt/cppcheck/bin" >> "$GITHUB_PATH"
+
+      - name: Lint (cppcheck + clang-format, no clang-tidy — enforced locally)
+        run: scripts/lint.sh --ci CLANG_FORMAT=clang-format-20

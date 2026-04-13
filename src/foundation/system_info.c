@@ -7,6 +7,9 @@
  *
  * Results are cached after first call (immutable hardware properties).
  */
+#include "foundation/constants.h"
+
+enum { DEFAULT_CORES = 1, MIN_WORKERS = 1 };
 #include "foundation/platform.h"
 #include <stdint.h> // uint64_t
 #include <string.h>
@@ -21,6 +24,7 @@
 #elif !defined(_WIN32) /* Linux */
 #include <unistd.h>
 #include <sys/sysinfo.h>
+
 #endif
 
 /* ── macOS detection ─────────────────────────────────────────────── */
@@ -42,7 +46,7 @@ static size_t sysctl_size(const char *name, size_t fallback) {
     if (sysctlbyname(name, &val, &len, NULL, 0) == 0 && val > 0) {
         return val;
     }
-    /* Try 64-bit variant */
+    /* Try CBM_SZ_64-bit variant */
     uint64_t val64 = 0;
     len = sizeof(val64);
     if (sysctlbyname(name, &val64, &len, NULL, 0) == 0 && val64 > 0) {
@@ -55,7 +59,7 @@ static cbm_system_info_t detect_system_macos(void) {
     cbm_system_info_t info;
     memset(&info, 0, sizeof(info));
 
-    info.total_cores = sysctl_int("hw.ncpu", 1);
+    info.total_cores = sysctl_int("hw.ncpu", DEFAULT_CORES);
     info.perf_cores = sysctl_int("hw.perflevel0.physicalcpu", info.total_cores);
 
     /* If perflevel sysctls fail (Intel Mac), perf = total */
@@ -99,7 +103,7 @@ static cbm_system_info_t detect_system_windows(void) {
     GetSystemInfo(&si);
     info.total_cores = (int)si.dwNumberOfProcessors;
     if (info.total_cores < 1) {
-        info.total_cores = 1;
+        info.total_cores = SKIP_ONE;
     }
     info.perf_cores = info.total_cores;
 
@@ -127,7 +131,7 @@ cbm_system_info_t cbm_system_info(void) {
 #else
         cached_info = detect_system_linux();
 #endif
-        info_cached = 1;
+        info_cached = SKIP_ONE;
     }
     return cached_info;
 }
@@ -139,6 +143,6 @@ int cbm_default_worker_count(bool initial) {
         return info.total_cores;
     }
     /* Incremental: leave headroom for user's apps */
-    int workers = info.perf_cores - 1;
-    return workers > 0 ? workers : 1;
+    int workers = info.perf_cores - SKIP_ONE;
+    return workers > 0 ? workers : MIN_WORKERS;
 }

@@ -20,7 +20,7 @@
 #ifndef MONGOOSE_H
 #define MONGOOSE_H
 
-#define MG_VERSION "7.20"
+#define MG_VERSION "7.21"
 
 #ifdef __cplusplus
 extern "C" {
@@ -1961,7 +1961,9 @@ int mg_aes_gcm_encrypt(unsigned char *output, const unsigned char *input,
 int mg_aes_gcm_decrypt(unsigned char *output, const unsigned char *input,
                        size_t input_length, const unsigned char *key,
                        const size_t key_len, const unsigned char *iv,
-                       const size_t iv_len);
+                       const size_t iv_len, unsigned char *aead,
+                       size_t aead_len, const unsigned char *tag,
+                       const size_t tag_len);
 
 #endif /* TLS_AES128_H */
 
@@ -2727,6 +2729,7 @@ PORTABLE_8439_DECL size_t mg_chacha20_poly1305_encrypt(
 PORTABLE_8439_DECL size_t mg_chacha20_poly1305_decrypt(
     uint8_t *restrict plain_text, const uint8_t key[RFC_8439_KEY_SIZE],
     const uint8_t nonce[RFC_8439_NONCE_SIZE],
+    const uint8_t *restrict ad, size_t ad_size,
     const uint8_t *restrict cipher_text, size_t cipher_text_size);
 #if defined(__cplusplus)
 }
@@ -3164,11 +3167,16 @@ struct mg_wifi_scan_bss_data {
 #define MG_WIFI_SECURITY_WPA MG_BIT(1)
 #define MG_WIFI_SECURITY_WPA2 MG_BIT(2)
 #define MG_WIFI_SECURITY_WPA3 MG_BIT(3)
+#define MG_WIFI_SECURITY_WPA_ENTERPRISE MG_BIT(4)
+#define MG_WIFI_SECURITY_WPA2_ENTERPRISE MG_BIT(5)
+#define MG_WIFI_SECURITY_WPA3_ENTERPRISE MG_BIT(6)
   uint8_t channel;
   unsigned band : 2;
 #define MG_WIFI_BAND_2G 0
 #define MG_WIFI_BAND_5G 1
   unsigned has_n : 1;
+  unsigned has_ac : 1;
+  unsigned has_ax : 1;
 };
 
 bool mg_wifi_scan(void);

@@ -49,8 +49,6 @@ try {
     exit 1
 }
 
-# Remove MOTW (prevents SmartScreen popup)
-Unblock-File -Path "$TmpDir\$Archive" -ErrorAction SilentlyContinue
 
 # Checksum verification
 $ChecksumUrl = "$BaseUrl/checksums.txt"

@@ -8,10 +8,11 @@
 #include "preprocessor.h"
 #include "foundation/compat.h"
 #include "tree_sitter/api.h" // TSParser, TSNode, TSTree, TSInput, TSLanguage, TSPoint, TSParseOptions, TSParseState
+#include "foundation/constants.h"
 #include <stdint.h> // uint32_t, uint64_t, int64_t
 #include <stdlib.h>
 #include <string.h>
-#include <time.h> // clock_gettime, CLOCK_MONOTONIC
+#include <time.h> // struct timespec, CLOCK_MONOTONIC
 
 // Atomic counters for profiling parse vs extraction time (nanoseconds).
 // Accessed from multiple threads; using _Atomic for safe accumulation.
@@ -24,20 +25,27 @@ static _Atomic uint64_t total_files_preprocessed = 0;
 static _Atomic uint64_t total_files = 0;
 
 #define NSEC_PER_SEC 1000000000ULL
+#define USEC_TO_NSEC 1000ULL
+/* Use compat.h's cbm_clock_gettime which accepts CLOCK_MONOTONIC (value
+ * varies by platform: 1 on Linux/Windows, 6 on macOS). We pass the
+ * platform value via the compat.h fallback. */
+#ifdef __APPLE__
+#define CBM_CLOCK_MONO 6
+#else
+#define CBM_CLOCK_MONO 1
+#endif
 
 static uint64_t now_ns(void) {
     struct timespec ts;
-    // NOLINTNEXTLINE(misc-include-cleaner) — clock_gettime provided by standard header
-    cbm_clock_gettime(CLOCK_MONOTONIC, &ts);
+    cbm_clock_gettime(CBM_CLOCK_MONO, &ts);
     return ((uint64_t)ts.tv_sec * NSEC_PER_SEC) + (uint64_t)ts.tv_nsec;
 }
 
 // cbm_get_profile returns accumulated parse/extract times and file count.
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-void cbm_get_profile(uint64_t *parse_ns, uint64_t *extract_ns, uint64_t *files) {
-    *parse_ns = atomic_load(&total_parse_ns);
-    *extract_ns = atomic_load(&total_extract_ns);
-    *files = atomic_load(&total_files);
+void cbm_get_profile(cbm_profile_out_t out) {
+    *out.parse_ns = atomic_load(&total_parse_ns);
+    *out.extract_ns = atomic_load(&total_extract_ns);
+    *out.files = atomic_load(&total_files);
 }
 
 uint64_t cbm_get_lsp_ns(void) {
@@ -67,7 +75,7 @@ void cbm_reset_profile(void) {
 #define GROW_ARRAY(arr, arena)                                                                   \
     do {                                                                                         \
         if ((arr)->count >= (arr)->cap) {                                                        \
-            int new_cap = (arr)->cap == 0 ? 32 : (arr)->cap * 2;                                 \
+            int new_cap = (arr)->cap == 0 ? CBM_SZ_32 : (arr)->cap * PAIR_LEN;                   \
             void *new_items = cbm_arena_alloc((arena), (size_t)new_cap * sizeof(*(arr)->items)); \
             if (!new_items)                                                                      \
                 return;                                                                          \
@@ -144,6 +152,11 @@ void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCa
     arr->items[arr->count++] = rc;
 }
 
+void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch) {
+    GROW_ARRAY(arr, a);
+    arr->items[arr->count++] = ch;
+}
+
 // --- String input reader (for parse_with_options) ---
 
 typedef struct {
@@ -202,7 +215,8 @@ int cbm_init(void) {
     if (cbm_initialized) {
         return 0;
     }
-    cbm_initialized = 1;
+    enum { CBM_INIT_DONE = 1 };
+    cbm_initialized = CBM_INIT_DONE;
     return 0;
 }
 
@@ -237,7 +251,8 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, const char **include_paths) {
     // Allocate result on heap (arena inside for all string data)
-    CBMFileResult *result = (CBMFileResult *)calloc(1, sizeof(CBMFileResult));
+    enum { SINGLE = 1 };
+    CBMFileResult *result = (CBMFileResult *)calloc(SINGLE, sizeof(CBMFileResult));
     if (!result) {
         return NULL;
     }
@@ -286,7 +301,7 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
     TSParseOptions opts = {0};
     uint64_t deadline_ns = 0; // cppcheck-suppress unreadVariable
     if (timeout_micros > 0) {
-        deadline_ns = t0 + ((uint64_t)timeout_micros * 1000ULL);
+        deadline_ns = t0 + ((uint64_t)timeout_micros * USEC_TO_NSEC);
         opts.payload = &deadline_ns;
         opts.progress_callback = cbm_timeout_cb;
     }
@@ -325,6 +340,9 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
     cbm_extract_definitions(&ctx);
     cbm_extract_imports(&ctx);
     cbm_extract_unified(&ctx);
+
+    // Channel detection (Socket.IO / EventEmitter) — JS/TS only.
+    cbm_extract_channels(&ctx);
 
     // K8s / Kustomize semantic pass (additional structured extraction for YAML-based infra files).
     if (ctx.language == CBM_LANG_KUSTOMIZE || ctx.language == CBM_LANG_K8S) {

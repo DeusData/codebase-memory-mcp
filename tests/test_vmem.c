@@ -3,6 +3,7 @@
  *               arena-vmem integration, and slab+vmem parallel extraction.
  */
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "../src/foundation/vmem.h"
 #include "../src/foundation/arena.h"
 #include "../src/foundation/slab_alloc.h"
@@ -664,8 +665,10 @@ static int setup_vmem_test_repo(void) {
         if (!f) {
             return -1;
         }
-        fprintf(f, "package main\n\nfunc F%d() {\n\tprintln(\"hello\")\n}\n\n"
-                   "func G%d() int {\n\treturn F%d() + %d\n}\n", i, i, i, i);
+        fprintf(f,
+                "package main\n\nfunc F%d() {\n\tprintln(\"hello\")\n}\n\n"
+                "func G%d() int {\n\treturn F%d() + %d\n}\n",
+                i, i, i, i);
         fclose(f);
     }
 
@@ -684,9 +687,7 @@ static int setup_vmem_test_repo(void) {
 
 static void teardown_vmem_test_repo(void) {
     if (g_vmem_tmpdir[0]) {
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_vmem_tmpdir);
-        (void)system(cmd);
+        th_rmtree(g_vmem_tmpdir);
         g_vmem_tmpdir[0] = '\0';
     }
 }
@@ -740,8 +741,7 @@ TEST(vmem_parallel_extract_with_slab) {
 
     /* Run parallel extraction with 2 workers — enough to trigger
      * multi-file slab reuse on at least one worker. */
-    int rc = cbm_parallel_extract(&ctx, files, file_count, result_cache,
-                                  &shared_ids, 2);
+    int rc = cbm_parallel_extract(&ctx, files, file_count, result_cache, &shared_ids, 2);
     ASSERT_EQ(rc, 0);
 
     /* Verify extraction produced results */
