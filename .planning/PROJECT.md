@@ -40,7 +40,7 @@ Brownfield planning docs already exist under `.planning/codebase/`, and the repo
 
 ## Current State
 
-Phase 6 complete — the forced-parallel native suite now preserves FastAPI `Depends()` CALLS edges on both full and incremental parallel pipeline paths, and dedicated regression coverage keeps the deferred Phase 03 gap closed.
+Phase 7 complete — Nyquist validation coverage is now explicit for Phases 01-04 through approved backfilled `*-VALIDATION.md` contracts, and the milestone audit now reports complete validation-doc coverage for Phases 01-05.
 
 ## Constraints
 
@@ -76,4 +76,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-13 after Phase 6 completion*
+*Last updated: 2026-04-13 after Phase 7 completion*
