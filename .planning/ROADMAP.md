@@ -17,6 +17,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 3: Real-Repo Semantic Verification** - Prove the required GDScript extraction and resolution behaviors on real projects across both indexing paths. (completed 2026-04-12)
 - [x] **Phase 4: Verdicts & Acceptance Summaries** - Turn raw proof evidence into explicit per-target outcomes and maintainable promotion summaries. (completed 2026-04-12)
 - [x] **Phase 5: Web UI Launch Repair** - Restore `--ui=true` so the embedded web UI actually starts again through the supported persisted launch path. (completed 2026-04-13)
+- [ ] **Phase 6: Parallel Native Suite Repair** - Resolve the deferred forced-parallel native-suite failure so the remaining Phase 03 parallel-mode debt is closed.
+- [ ] **Phase 7: Nyquist Validation Backfill** - Add the missing per-phase Nyquist validation docs for Phases 01-04 so milestone validation coverage is complete.
 
 ## Phase Details
 
@@ -94,10 +96,32 @@ Plans:
 Plans:
 - [x] 05-01-PLAN.md — Restore the persisted `--ui=true` launch path and add end-to-end regression coverage for enable, relaunch, and disable behavior. (completed 2026-04-13)
 
+### Phase 6: Parallel Native Suite Repair
+**Goal**: Maintainers can run the full native suite with `CBM_FORCE_PIPELINE_MODE=parallel` without the deferred `pipeline_fastapi_depends_edges` failure that remained after Phase 03.
+**Depends on**: Phase 5
+**Requirements**: None (audit tech debt closure)
+**Gap Closure**: Closes the deferred Phase 03 native-suite debt recorded by the milestone audit.
+**Success Criteria** (what must be TRUE):
+  1. `tests/test_pipeline.c:4361` `pipeline_fastapi_depends_edges` passes when the full native suite is run with `CBM_FORCE_PIPELINE_MODE=parallel`.
+  2. The fix preserves the targeted sequential and parallel proof behaviors already verified in Phase 03.
+  3. Regression coverage or equivalent verification protects the forced-parallel full-suite path from silently regressing again.
+**Plans**: 0 plans
+
+### Phase 7: Nyquist Validation Backfill
+**Goal**: Maintainers can audit the milestone with complete Nyquist validation coverage because Phases 01-04 each have an explicit `*-VALIDATION.md` contract.
+**Depends on**: Phase 5
+**Requirements**: None (audit tech debt closure)
+**Gap Closure**: Closes the milestone audit's missing Nyquist validation-doc debt for Phases 01-04.
+**Success Criteria** (what must be TRUE):
+  1. Phases 01-04 each have a `*-VALIDATION.md` file in the expected location.
+  2. Each new validation doc records an explicit per-phase sampling and verification contract compatible with Nyquist discovery.
+  3. A follow-up milestone audit no longer reports partial Nyquist coverage for Phases 01-04.
+**Plans**: 0 plans
+
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
+Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
@@ -106,3 +130,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | 3. Real-Repo Semantic Verification | 4/4 | Complete | 2026-04-12 |
 | 4. Verdicts & Acceptance Summaries | 2/2 | Complete | 2026-04-12 |
 | 5. Web UI Launch Repair | 1/1 | Complete | 2026-04-13 |
+| 6. Parallel Native Suite Repair | 0/0 | Planned | — |
+| 7. Nyquist Validation Backfill | 0/0 | Planned | — |
