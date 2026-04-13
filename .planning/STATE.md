@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 03-03-PLAN.md
-last_updated: "2026-04-12T22:21:41.667Z"
-last_activity: 2026-04-12
+stopped_at: Phase 5 context gathered
+last_updated: "2026-04-13T00:17:22.329Z"
+last_activity: 2026-04-13 -- Phase 05 planning complete
 progress:
-  total_phases: 4
+  total_phases: 5
   completed_phases: 4
-  total_plans: 10
+  total_plans: 11
   completed_plans: 10
-  percent: 100
+  percent: 91
 ---
 
 # Project State
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-11)
 
 **Core value:** A real Godot demo project indexes cleanly and yields useful GDScript answers through the parser-to-MCP path.
-**Current focus:** Phase 04 — verdicts-and-acceptance-summaries
+**Current focus:** Phase 05 — web-ui-launch-repair
 
 ## Current Position
 
-Phase: 04
-Plan: Not started
-Status: Executing Phase 04
-Last activity: 2026-04-12
+Phase: 05
+Plan: Context complete
+Status: Ready to execute
+Last activity: 2026-04-13 -- Phase 05 planning complete
 
 Progress: [████████░░] 80%
 
@@ -51,14 +51,14 @@ Progress: [████████░░] 80%
 
 **Recent Trend:**
 
-- Last 5 plans: none
-- Trend: Stable
+- Last 5 plans: 03-02, 03-03, 03-04, 04-01, 04-02
+- Trend: Completed
 
-| Phase 01 P01 | 0 min | 2 tasks | 4 files |
-| Phase 01 P02 | 0 min | 2 tasks | 3 files |
-| Phase 03 P01 | 17 min | 2 tasks | 3 files |
 | Phase 03 P02 | 11 min | 2 tasks | 3 files |
 | Phase 03 P03 | 14 min | 2 tasks | 6 files |
+| Phase 03 P04 | 30 min | 2 tasks | 2 files |
+| Phase 04 P01 | 17 min | 2 tasks | 3 files |
+| Phase 04 P02 | 10 min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -81,9 +81,12 @@ Recent decisions affecting current work:
 - [Phase 03]: The default make test path now runs manifest-contract, same-script, and semantic-parity proof regressions in sequence.
 - [Phase 03]: semantic-parity.md must expose counts and representative samples from wrapper artifacts so operators can review SEM-01 through SEM-06 without inferring from pass/fail alone.
 - [Phase 03]: scripts/gdscript-proof.sh remains the only approval-bearing workflow, with incomplete parity review falling back to run-index.json and wrapper JSON artifacts.
+- [Phase 03]: Parallel workers keep parser/slab state alive across files and destroy parser state before thread slab teardown at worker exit.
 - [Phase 04]: aggregate-summary.md should act as a maintainer decision memo that answers promotion status first.
 - [Phase 04]: aggregate incomplete remains distinct from fail but still blocks promotion of support wording.
 - [Phase 04]: aggregate pass only justifies a qualified support claim bounded by the approved manifest corpus and current commit.
+- [Phase 04]: Repo summaries lead with `## Verdict`, and aggregate summaries lead with `## Promotion decision` using exact promotion-safe wording.
+- [Phase 05]: `--ui=true` is a supported persisted launch path that must keep starting the embedded web UI and stay regression-protected.
 
 ### Pending Todos
 
@@ -95,6 +98,6 @@ None currently.
 
 ## Session Continuity
 
-Last session: 2026-04-12T17:33:02.008Z
-Stopped at: Completed 03-03-PLAN.md
-Resume file: None
+Last session: 2026-04-13T00:11:43.104Z
+Stopped at: Phase 5 context gathered
+Resume file: .planning/phases/05-web-ui-launch-repair/05-CONTEXT.md

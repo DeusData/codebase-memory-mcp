@@ -15,7 +15,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 1: Proof Contract & Corpus** - Lock the pinned Godot demo targets and the target-identity rules the proof must use. (completed 2026-04-12)
 - [x] **Phase 2: Isolated Proof Harness** - Make proof runs reproducible, isolated, and backed by a fixed raw MCP query evidence set. (completed 2026-04-12)
 - [x] **Phase 3: Real-Repo Semantic Verification** - Prove the required GDScript extraction and resolution behaviors on real projects across both indexing paths. (completed 2026-04-12)
-- [ ] **Phase 4: Verdicts & Acceptance Summaries** - Turn raw proof evidence into explicit per-target outcomes and maintainable promotion summaries.
+- [x] **Phase 4: Verdicts & Acceptance Summaries** - Turn raw proof evidence into explicit per-target outcomes and maintainable promotion summaries. (completed 2026-04-12)
+- [ ] **Phase 5: Web UI Launch Repair** - Restore `--ui=true` so the embedded web UI actually starts again through the supported persisted launch path.
 
 ## Phase Details
 
@@ -58,12 +59,13 @@ Plans:
   3. Maintainer can confirm queryable `extends` inheritance and `.gd` `preload`/`load` dependency relationships on real proof targets.
   4. Maintainer can confirm signal declarations and conservative signal-call behavior on real proof targets.
   5. Maintainer can compare sequential and parallel indexing runs and see the core GDScript behaviors remain consistent across both paths.
-**Plans**: 3 plans
+**Plans**: 4 plans
 
 Plans:
 - [x] 03-01-PLAN.md — Add deterministic sequential/parallel mode selection in the native pipeline and cover it with native parity regressions.
 - [x] 03-02-PLAN.md — Extend the canonical proof harness to capture dual-mode evidence and emit additive semantic parity summaries across all four manifest repos.
 - [x] 03-03-PLAN.md — Add proof-harness regressions plus runbook/checklist updates for the Phase 03 semantic review bar. (completed 2026-04-12)
+- [x] 03-04-PLAN.md — Close the forced-parallel UAT gap by fixing worker-lifetime cleanup and adding a regression for the incremental new-file path. (completed 2026-04-12)
 
 ### Phase 4: Verdicts & Acceptance Summaries
 **Goal**: Maintainers can review each proof target through explicit pass/fail/incomplete outcomes and concise summaries that support honest promotion decisions.
@@ -79,14 +81,28 @@ Plans:
 - [x] 04-01-PLAN.md — Add regression-backed repo verdict sections and promotion-first aggregate summary wording in the canonical proof harness.
 - [x] 04-02-PLAN.md — Update the runbook, checklist, and misses tracker for the new verdict and promotion contract.
 
+### Phase 5: Web UI Launch Repair
+**Goal**: Maintainers can launch the web UI with `--ui=true` and get the intended embedded UI startup path instead of a broken or ignored enable flag.
+**Depends on**: Phase 4
+**Requirements**: UI-01
+**Success Criteria** (what must be TRUE):
+  1. Running the repo's normal web UI entrypoint with `--ui=true` starts the UI again instead of silently leaving it down.
+  2. The `--ui=true` and `--ui=false` persisted contract remains explicit in code and help text.
+  3. Regression coverage or equivalent verification protects the `--ui=true` startup path from breaking again.
+**Plans**: 1 plan
+
+Plans:
+- [ ] 05-01-PLAN.md — Restore the persisted `--ui=true` launch path and add end-to-end regression coverage for enable, relaunch, and disable behavior.
+
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 1 → 2 → 3 → 4
+Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Proof Contract & Corpus | 2/2 | Complete | 2026-04-12 |
 | 2. Isolated Proof Harness | 2/2 | Complete | 2026-04-12 |
-| 3. Real-Repo Semantic Verification | 3/3 | Complete | 2026-04-12 |
-| 4. Verdicts & Acceptance Summaries | 0/2 | Planned | - |
+| 3. Real-Repo Semantic Verification | 4/4 | Complete | 2026-04-12 |
+| 4. Verdicts & Acceptance Summaries | 2/2 | Complete | 2026-04-12 |
+| 5. Web UI Launch Repair | 0/0 | Planned | - |
