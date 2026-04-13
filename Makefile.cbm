@@ -422,6 +422,7 @@ $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_
 
 test: $(BUILD_DIR)/test-runner $(BUILD_DIR)/codebase-memory-mcp
 	cd $(CURDIR) && $(BUILD_DIR)/test-runner
+	python3 -B scripts/test_ui_launch_persisted_flag.py
 	python3 -B scripts/test_gdscript_proof_manifest_contract.py
 	python3 -B scripts/test_gdscript_proof_incomplete_artifacts.py
 	python3 -B scripts/test_gdscript_proof_same_script_calls.py
