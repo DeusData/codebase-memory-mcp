@@ -321,9 +321,6 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
         char props[CBM_SZ_256];
         snprintf(props, sizeof(props), "{\"decorator\":\"%s\"}", decorator);
         cbm_gbuf_insert_edge(ctx->gbuf, node->id, dec->id, "DECORATES", props);
-        /* Also emit CALLS edge so decorator appears in "find all references" queries */
-        cbm_gbuf_insert_edge(ctx->gbuf, node->id, dec->id, "CALLS",
-                             "{\"kind\":\"decorator\"}");
         (*count)++;
     }
 }
