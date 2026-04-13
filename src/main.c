@@ -249,6 +249,17 @@ static bool parse_ui_flags(int argc, char **argv, cbm_ui_config_t *cfg) {
     return changed;
 }
 
+static cbm_ui_config_t load_runtime_ui_config(int argc, char **argv) {
+    cbm_ui_config_t ui_cfg;
+
+    cbm_ui_config_load(&ui_cfg);
+    if (parse_ui_flags(argc, argv, &ui_cfg)) {
+        cbm_ui_config_save(&ui_cfg);
+    }
+
+    return ui_cfg;
+}
+
 /* Install platform-specific signal handlers. */
 static void setup_signal_handlers(void) {
 #ifdef _WIN32
@@ -281,11 +292,7 @@ int main(int argc, char **argv) {
     cbm_diag_start(); /* starts if CBM_DIAGNOSTICS=1 */
 
     /* Parse --ui and --port flags (persisted config) */
-    cbm_ui_config_t ui_cfg;
-    cbm_ui_config_load(&ui_cfg);
-    if (parse_ui_flags(argc, argv, &ui_cfg)) {
-        cbm_ui_config_save(&ui_cfg);
-    }
+    cbm_ui_config_t ui_cfg = load_runtime_ui_config(argc, argv);
 
     setup_signal_handlers();
 

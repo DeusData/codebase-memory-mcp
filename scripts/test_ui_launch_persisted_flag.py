@@ -9,7 +9,6 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from urllib.error import URLError
 from urllib.request import urlopen
 
 
@@ -65,6 +64,23 @@ def read_config(home_dir: Path) -> dict:
     return data
 
 
+def wait_for_config(
+    home_dir: Path, expected: dict | None = None, timeout: float = 5.0
+) -> dict:
+    deadline = time.time() + timeout
+    last_error = None
+    while time.time() < deadline:
+        try:
+            cfg = read_config(home_dir)
+            if expected is None or cfg == expected:
+                return cfg
+            last_error = AssertionError(f"Expected config {expected}, got {cfg}")
+        except AssertionError as exc:
+            last_error = exc
+        time.sleep(0.1)
+    fail(str(last_error) if last_error else "UI config was not persisted")
+
+
 def launch(home_dir: Path, *args: str) -> subprocess.Popen:
     env = os.environ.copy()
     env["HOME"] = str(home_dir)
@@ -115,10 +131,8 @@ def main() -> int:
 
         proc = launch(home_dir, f"--ui=false", f"--port={port}")
         try:
-            time.sleep(0.5)
-            if proc.poll() is None:
-                wait_for_closed_port(port)
-            cfg = read_config(home_dir)
+            cfg = wait_for_config(home_dir, {"ui_enabled": False, "ui_port": port})
+            wait_for_closed_port(port)
             if cfg != {"ui_enabled": False, "ui_port": port}:
                 fail(f"Unexpected initial disabled config: {cfg}")
         finally:
@@ -137,7 +151,7 @@ def main() -> int:
         proc = launch(home_dir, f"--ui=true", f"--port={port}")
         try:
             wait_for_http(port)
-            cfg = read_config(home_dir)
+            cfg = wait_for_config(home_dir, {"ui_enabled": True, "ui_port": port})
             if cfg != {"ui_enabled": True, "ui_port": port}:
                 fail(f"Unexpected enabled config: {cfg}")
         finally:
@@ -155,10 +169,8 @@ def main() -> int:
 
         proc = launch(home_dir, f"--ui=false", f"--port={port}")
         try:
-            time.sleep(0.5)
-            if proc.poll() is None:
-                wait_for_closed_port(port)
-            cfg = read_config(home_dir)
+            cfg = wait_for_config(home_dir, {"ui_enabled": False, "ui_port": port})
+            wait_for_closed_port(port)
             if cfg != {"ui_enabled": False, "ui_port": port}:
                 fail(f"Unexpected disabled config: {cfg}")
         finally:
