@@ -461,6 +461,48 @@ TEST(store_file_hash_crud) {
     PASS();
 }
 
+TEST(store_file_hash_upsert_rejects_null_required_fields) {
+    /* Pins the API contract that `cbm_store_upsert_file_hash` returns
+     * CBM_STORE_ERR (not silent OK) when a NOT NULL column would receive
+     * SQL NULL. This is the failure mode that
+     * `pipeline_incremental.c:persist_hashes` checks for and logs as
+     * `incremental.persist_hash_failed`. If this contract ever changes
+     * (e.g. the schema relaxes NOT NULL on rel_path or sha256), the
+     * downstream warning becomes silent and the orphaned-node bug class
+     * can re-emerge. Track that change here, not just in the consumer. */
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* Sanity: a fully-valid upsert returns OK. */
+    int rc = cbm_store_upsert_file_hash(s, "test", "main.go", "abc123", 1000000, 512);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+
+    /* NULL sha256 violates NOT NULL on file_hashes.sha256 → must return ERR. */
+    rc = cbm_store_upsert_file_hash(s, "test", "other.go", NULL, 2000000, 1024);
+    ASSERT_EQ(rc, CBM_STORE_ERR);
+
+    /* NULL rel_path violates NOT NULL on file_hashes.rel_path → must return ERR. */
+    rc = cbm_store_upsert_file_hash(s, "test", NULL, "deadbeef", 3000000, 2048);
+    ASSERT_EQ(rc, CBM_STORE_ERR);
+
+    /* NULL project violates NOT NULL on file_hashes.project → must return ERR. */
+    rc = cbm_store_upsert_file_hash(s, NULL, "third.go", "cafebabe", 4000000, 4096);
+    ASSERT_EQ(rc, CBM_STORE_ERR);
+
+    /* The valid row from earlier must still be present — partial-failure
+     * policy: a single bad upsert does not corrupt or remove other rows. */
+    cbm_file_hash_t *hashes = NULL;
+    int count = 0;
+    cbm_store_get_file_hashes(s, "test", &hashes, &count);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(hashes[0].rel_path, "main.go");
+    cbm_store_free_file_hashes(hashes, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Properties JSON round-trip ─────────────────────────────────── */
 
 TEST(store_node_properties_json) {
@@ -1523,6 +1565,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_batch_empty);
     RUN_TEST(store_cascade_delete);
     RUN_TEST(store_file_hash_crud);
+    RUN_TEST(store_file_hash_upsert_rejects_null_required_fields);
     RUN_TEST(store_node_properties_json);
     RUN_TEST(store_node_null_properties);
     RUN_TEST(store_find_by_file_overlap);

@@ -298,9 +298,24 @@ static void free_mode_skipped(cbm_file_hash_t *ms, int count) {
 
 /* ── Persist file hashes ─────────────────────────────────────────── */
 
+/* Persist file hash rows for the current discovery and any mode-skipped
+ * files preserved from the previous DB.
+ *
+ * Partial-failure policy: an `upsert` failure on any single row is logged
+ * as a warning and the loop continues. We deliberately do NOT abort the
+ * whole reindex on a single bad row — partial preservation is better than
+ * total loss, and a transient failure on one file should not invalidate
+ * the entire incremental update. The trade-off is that a silently-failed
+ * row produces the same downstream effect as if the file were never
+ * indexed at all (forced re-parse on the next run for current-files,
+ * potential orphaned-node revival for mode_skipped). The warning surface
+ * is the only signal that something went wrong. */
 static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_info_t *files,
                            int file_count, const cbm_file_hash_t *mode_skipped,
                            int mode_skipped_count) {
+    int current_failed = 0;
+    int ms_failed = 0;
+
     /* Current discovery: re-stat to capture any mtime/size that changed
      * during the run, and write fresh hash rows for visited files. */
     for (int i = 0; i < file_count; i++) {
@@ -308,9 +323,15 @@ static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_inf
         if (stat(files[i].path, &st) != 0) {
             continue;
         }
-        cbm_store_upsert_file_hash(store, project, files[i].rel_path, "", stat_mtime_ns(&st),
-                                   st.st_size);
+        int rc = cbm_store_upsert_file_hash(store, project, files[i].rel_path, "",
+                                            stat_mtime_ns(&st), st.st_size);
+        if (rc != CBM_STORE_OK) {
+            cbm_log_warn("incremental.persist_hash_failed", "scope", "current", "rel_path",
+                         files[i].rel_path, "rc", itoa_buf(rc));
+            current_failed++;
+        }
     }
+
     /* Mode-skipped (preserved): re-upsert hash rows from the previous DB
      * so the next reindex can still classify these files correctly. Without
      * this, an orphaned-node bug emerges where:
@@ -319,13 +340,28 @@ static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_inf
      *   - file is then deleted on disk
      *   - next reindex's stored hashes don't include the file → noop or
      *     can't detect the deletion → graph nodes for the deleted file
-     *     remain forever (or until a destructive rebuild). */
+     *     remain forever (or until a destructive rebuild).
+     *
+     * A failure here is more serious than a current-files failure because
+     * it can revive the orphaned-node bug for that specific file. Logged
+     * with scope=mode_skipped so the warning is searchable. */
     if (mode_skipped) {
         for (int i = 0; i < mode_skipped_count; i++) {
-            cbm_store_upsert_file_hash(store, project, mode_skipped[i].rel_path,
-                                       mode_skipped[i].sha256 ? mode_skipped[i].sha256 : "",
-                                       mode_skipped[i].mtime_ns, mode_skipped[i].size);
+            int rc = cbm_store_upsert_file_hash(store, project, mode_skipped[i].rel_path,
+                                                mode_skipped[i].sha256 ? mode_skipped[i].sha256
+                                                                       : "",
+                                                mode_skipped[i].mtime_ns, mode_skipped[i].size);
+            if (rc != CBM_STORE_OK) {
+                cbm_log_warn("incremental.persist_hash_failed", "scope", "mode_skipped",
+                             "rel_path", mode_skipped[i].rel_path, "rc", itoa_buf(rc));
+                ms_failed++;
+            }
         }
+    }
+
+    if (current_failed > 0 || ms_failed > 0) {
+        cbm_log_warn("incremental.persist_summary", "current_failed", itoa_buf(current_failed),
+                     "mode_skipped_failed", itoa_buf(ms_failed));
     }
 }
 
