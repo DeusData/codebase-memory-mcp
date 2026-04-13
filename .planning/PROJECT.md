@@ -40,7 +40,7 @@ Brownfield planning docs already exist under `.planning/codebase/`, and the repo
 
 ## Current State
 
-Phase 5 complete — the persisted `--ui=true` launch path now starts the embedded web UI again, `--ui=false` remains explicit, and regression coverage protects enable, relaunch, disable, and help-text behavior.
+Phase 6 complete — the forced-parallel native suite now preserves FastAPI `Depends()` CALLS edges on both full and incremental parallel pipeline paths, and dedicated regression coverage keeps the deferred Phase 03 gap closed.
 
 ## Constraints
 
@@ -76,4 +76,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-13 after Phase 5 completion*
+*Last updated: 2026-04-13 after Phase 6 completion*
