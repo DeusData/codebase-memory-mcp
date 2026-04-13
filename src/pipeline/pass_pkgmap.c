@@ -227,19 +227,23 @@ static void process_package_json(const char *pkg_dir, const char *repo_root,
     entry->pkg_dir = cbm_strdup(pkg_rel_dir);
 
     /* Check for existing entry before inserting to manage memory correctly.
-     * cbm_ht_set borrows the key pointer — must strdup for new keys only. */
+     * cbm_ht_set stores the key pointer directly (slot->key = supplied key), so
+     * each key must be a separate heap allocation owned by the table.
+     * On eviction we reuse the existing strdup'd key rather than allocating a new
+     * one — this avoids orphaning the old key, which would be a leak. */
     cbm_pkg_entry_t *prev = (cbm_pkg_entry_t *)cbm_ht_get(pkg_map, pkg_name);
     if (prev) {
-        /* Duplicate package name: overwrite value, keep existing key in table.
-         * Free the old entry fields before replacing. */
+        /* Duplicate package name: free old entry fields, then overwrite value.
+         * The key allocation in the slot remains valid and is intentionally reused;
+         * allocating a fresh strdup here would orphan it (cbm_ht_set does not free
+         * the displaced key pointer). */
         free(prev->module_qn);
         free(prev->pkg_dir);
         free(prev);
-        /* Reuse the strdup'd key already stored in table */
         const char *existing_key = cbm_ht_get_key(pkg_map, pkg_name);
         cbm_ht_set(pkg_map, existing_key, entry);
     } else {
-        /* New package: strdup the key for table ownership */
+        /* New package: strdup the key so the table owns a stable heap allocation. */
         // NOLINTNEXTLINE(misc-include-cleaner) — strdup provided by standard header
         char *key = cbm_strdup(pkg_name);
         cbm_ht_set(pkg_map, key, entry);
