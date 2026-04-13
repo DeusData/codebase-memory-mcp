@@ -116,7 +116,10 @@ Plans:
   1. Phases 01-04 each have a `*-VALIDATION.md` file in the expected location.
   2. Each new validation doc records an explicit per-phase sampling and verification contract compatible with Nyquist discovery.
   3. A follow-up milestone audit no longer reports partial Nyquist coverage for Phases 01-04.
-**Plans**: 0 plans
+**Plans**: 1 plan
+
+Plans:
+- [ ] 07-01-PLAN.md — Backfill approved Nyquist validation docs for Phases 01-04 and refresh the milestone audit coverage.
 
 ## Progress
 
