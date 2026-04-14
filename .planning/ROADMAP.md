@@ -135,3 +135,13 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | 5. Web UI Launch Repair | 1/1 | Complete | 2026-04-13 |
 | 6. Parallel Native Suite Repair | 0/0 | Planned | — |
 | 7. Nyquist Validation Backfill | 0/0 | Planned | — |
+
+### Phase 07.1: Add support for parsing, indexing, and linking '@export' in GDScript files (INSERTED)
+
+**Goal:** Maintainers can index real GDScript files where `@export` variables are parsed correctly, persisted with accurate exported metadata, and linked consistently with existing GDScript anchor/class naming.
+**Requirements**: TBD
+**Depends on:** Phase 7
+**Plans:** 1 plan
+
+Plans:
+- [ ] 07.1-01-PLAN.md — Add regression-backed `@export` parsing/indexing/linking support in the GDScript extraction and pipeline paths.
