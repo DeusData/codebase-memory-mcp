@@ -1,0 +1,743 @@
+# GHL Fleet Manifest — all repositories indexed by codebase-memory-mcp
+# Format: name, github_url, team, type, tags
+# Maintained by: platform-infra | Auto-indexed every 6h (incremental), every Sunday 2am (full)
+
+repos:
+  # ── Platform Core ─────────────────────────────────────────────
+  - name: platform-backend
+    github_url: https://github.com/GoHighLevel/platform-backend.git
+    team: platform
+    type: service
+    tags: [core, backend, nestjs]
+
+  - name: platform-frontend
+    github_url: https://github.com/GoHighLevel/platform-frontend.git
+    team: platform
+    type: frontend
+    tags: [core, frontend, vue3, mfa]
+
+  - name: platform-ui
+    github_url: https://github.com/GoHighLevel/platform-ui.git
+    team: platform
+    type: library
+    tags: [core, ui, design-system]
+
+  - name: platform-core
+    github_url: https://github.com/GoHighLevel/platform-core.git
+    team: platform
+    type: library
+    tags: [core, shared]
+
+  - name: base-service
+    github_url: https://github.com/GoHighLevel/base-service.git
+    team: platform
+    type: library
+    tags: [core, nestjs, base]
+
+  - name: base-worker
+    github_url: https://github.com/GoHighLevel/base-worker.git
+    team: platform
+    type: library
+    tags: [core, worker, base]
+
+  # ── CRM & Contacts ────────────────────────────────────────────
+  - name: contacts-backend
+    github_url: https://github.com/GoHighLevel/contacts-backend.git
+    team: crm
+    type: service
+    tags: [crm, contacts, nestjs]
+
+  - name: contacts-frontend
+    github_url: https://github.com/GoHighLevel/contacts-frontend.git
+    team: crm
+    type: frontend
+    tags: [crm, contacts, vue3]
+
+  - name: crm-backend
+    github_url: https://github.com/GoHighLevel/crm-backend.git
+    team: crm
+    type: service
+    tags: [crm, nestjs]
+
+  - name: smart-lists-backend
+    github_url: https://github.com/GoHighLevel/smart-lists-backend.git
+    team: crm
+    type: service
+    tags: [crm, smart-lists, elasticsearch]
+
+  # ── Conversations & Messaging ─────────────────────────────────
+  - name: conversations-backend
+    github_url: https://github.com/GoHighLevel/conversations-backend.git
+    team: conversations
+    type: service
+    tags: [conversations, messaging, nestjs]
+
+  - name: conversations-frontend
+    github_url: https://github.com/GoHighLevel/conversations-frontend.git
+    team: conversations
+    type: frontend
+    tags: [conversations, messaging, vue3]
+
+  - name: messaging-backend
+    github_url: https://github.com/GoHighLevel/messaging-backend.git
+    team: conversations
+    type: service
+    tags: [conversations, sms, email, nestjs]
+
+  - name: email-backend
+    github_url: https://github.com/GoHighLevel/email-backend.git
+    team: conversations
+    type: service
+    tags: [conversations, email, nestjs]
+
+  - name: sms-backend
+    github_url: https://github.com/GoHighLevel/sms-backend.git
+    team: conversations
+    type: service
+    tags: [conversations, sms, nestjs]
+
+  - name: chat-widget-backend
+    github_url: https://github.com/GoHighLevel/chat-widget-backend.git
+    team: conversations
+    type: service
+    tags: [conversations, chat, nestjs]
+
+  - name: chat-widget-frontend
+    github_url: https://github.com/GoHighLevel/chat-widget-frontend.git
+    team: conversations
+    type: frontend
+    tags: [conversations, chat, vue3]
+
+  # ── Funnels & Websites ────────────────────────────────────────
+  - name: funnels-backend
+    github_url: https://github.com/GoHighLevel/funnels-backend.git
+    team: funnels
+    type: service
+    tags: [funnels, builder, nestjs]
+
+  - name: funnels-frontend
+    github_url: https://github.com/GoHighLevel/funnels-frontend.git
+    team: funnels
+    type: frontend
+    tags: [funnels, builder, vue3]
+
+  - name: websites-backend
+    github_url: https://github.com/GoHighLevel/websites-backend.git
+    team: funnels
+    type: service
+    tags: [funnels, websites, nestjs]
+
+  - name: websites-frontend
+    github_url: https://github.com/GoHighLevel/websites-frontend.git
+    team: funnels
+    type: frontend
+    tags: [funnels, websites, vue3]
+
+  - name: page-builder-backend
+    github_url: https://github.com/GoHighLevel/page-builder-backend.git
+    team: funnels
+    type: service
+    tags: [funnels, page-builder, nestjs]
+
+  # ── Calendars & Appointments ──────────────────────────────────
+  - name: calendars-backend
+    github_url: https://github.com/GoHighLevel/calendars-backend.git
+    team: calendars
+    type: service
+    tags: [calendars, appointments, nestjs]
+
+  - name: calendars-frontend
+    github_url: https://github.com/GoHighLevel/calendars-frontend.git
+    team: calendars
+    type: frontend
+    tags: [calendars, appointments, vue3]
+
+  - name: appointments-backend
+    github_url: https://github.com/GoHighLevel/appointments-backend.git
+    team: calendars
+    type: service
+    tags: [calendars, appointments, nestjs]
+
+  # ── Opportunities & Pipeline ──────────────────────────────────
+  - name: opportunities-backend
+    github_url: https://github.com/GoHighLevel/opportunities-backend.git
+    team: opportunities
+    type: service
+    tags: [opportunities, pipeline, nestjs]
+
+  - name: opportunities-frontend
+    github_url: https://github.com/GoHighLevel/opportunities-frontend.git
+    team: opportunities
+    type: frontend
+    tags: [opportunities, pipeline, vue3]
+
+  - name: pipeline-backend
+    github_url: https://github.com/GoHighLevel/pipeline-backend.git
+    team: opportunities
+    type: service
+    tags: [opportunities, pipeline, nestjs]
+
+  # ── Payments & Billing ────────────────────────────────────────
+  - name: payments-backend
+    github_url: https://github.com/GoHighLevel/payments-backend.git
+    team: payments
+    type: service
+    tags: [payments, billing, nestjs, stripe]
+
+  - name: payments-frontend
+    github_url: https://github.com/GoHighLevel/payments-frontend.git
+    team: payments
+    type: frontend
+    tags: [payments, billing, vue3]
+
+  - name: invoices-backend
+    github_url: https://github.com/GoHighLevel/invoices-backend.git
+    team: payments
+    type: service
+    tags: [payments, invoices, nestjs]
+
+  - name: subscriptions-backend
+    github_url: https://github.com/GoHighLevel/subscriptions-backend.git
+    team: payments
+    type: service
+    tags: [payments, subscriptions, nestjs]
+
+  # ── Marketing & Campaigns ─────────────────────────────────────
+  - name: campaigns-backend
+    github_url: https://github.com/GoHighLevel/campaigns-backend.git
+    team: marketing
+    type: service
+    tags: [marketing, campaigns, nestjs]
+
+  - name: campaigns-frontend
+    github_url: https://github.com/GoHighLevel/campaigns-frontend.git
+    team: marketing
+    type: frontend
+    tags: [marketing, campaigns, vue3]
+
+  - name: automations-backend
+    github_url: https://github.com/GoHighLevel/automations-backend.git
+    team: marketing
+    type: service
+    tags: [marketing, automations, nestjs]
+
+  - name: automations-frontend
+    github_url: https://github.com/GoHighLevel/automations-frontend.git
+    team: marketing
+    type: frontend
+    tags: [marketing, automations, vue3]
+
+  - name: workflows-backend
+    github_url: https://github.com/GoHighLevel/workflows-backend.git
+    team: marketing
+    type: service
+    tags: [marketing, workflows, nestjs]
+
+  - name: workflows-frontend
+    github_url: https://github.com/GoHighLevel/workflows-frontend.git
+    team: marketing
+    type: frontend
+    tags: [marketing, workflows, vue3]
+
+  - name: email-marketing-backend
+    github_url: https://github.com/GoHighLevel/email-marketing-backend.git
+    team: marketing
+    type: service
+    tags: [marketing, email, campaigns, nestjs]
+
+  # ── Forms & Surveys ───────────────────────────────────────────
+  - name: forms-backend
+    github_url: https://github.com/GoHighLevel/forms-backend.git
+    team: forms
+    type: service
+    tags: [forms, surveys, nestjs]
+
+  - name: forms-frontend
+    github_url: https://github.com/GoHighLevel/forms-frontend.git
+    team: forms
+    type: frontend
+    tags: [forms, surveys, vue3]
+
+  - name: surveys-backend
+    github_url: https://github.com/GoHighLevel/surveys-backend.git
+    team: forms
+    type: service
+    tags: [forms, surveys, nestjs]
+
+  # ── Reporting & Analytics ─────────────────────────────────────
+  - name: reporting-backend
+    github_url: https://github.com/GoHighLevel/reporting-backend.git
+    team: reporting
+    type: service
+    tags: [reporting, analytics, nestjs]
+
+  - name: reporting-frontend
+    github_url: https://github.com/GoHighLevel/reporting-frontend.git
+    team: reporting
+    type: frontend
+    tags: [reporting, analytics, vue3]
+
+  - name: attribution-backend
+    github_url: https://github.com/GoHighLevel/attribution-backend.git
+    team: reporting
+    type: service
+    tags: [reporting, attribution, nestjs]
+
+  # ── Membership & Courses ─────────────────────────────────────
+  - name: membership-backend
+    github_url: https://github.com/GoHighLevel/membership-backend.git
+    team: revex
+    type: service
+    tags: [revex, membership, courses, nestjs]
+
+  - name: membership-frontend
+    github_url: https://github.com/GoHighLevel/membership-frontend.git
+    team: revex
+    type: frontend
+    tags: [revex, membership, courses, vue3]
+
+  - name: ghl-revex-frontend
+    github_url: https://github.com/GoHighLevel/ghl-revex-frontend.git
+    team: revex
+    type: frontend
+    tags: [revex, courses, communities, vue3, nuxt3]
+
+  - name: ghl-revex-backend
+    github_url: https://github.com/GoHighLevel/ghl-revex-backend.git
+    team: revex
+    type: service
+    tags: [revex, courses, communities, nestjs]
+
+  - name: communities-backend
+    github_url: https://github.com/GoHighLevel/communities-backend.git
+    team: revex
+    type: service
+    tags: [revex, communities, nestjs]
+
+  - name: communities-frontend
+    github_url: https://github.com/GoHighLevel/communities-frontend.git
+    team: revex
+    type: frontend
+    tags: [revex, communities, vue3]
+
+  - name: courses-backend
+    github_url: https://github.com/GoHighLevel/courses-backend.git
+    team: revex
+    type: service
+    tags: [revex, courses, nestjs]
+
+  - name: courses-frontend
+    github_url: https://github.com/GoHighLevel/courses-frontend.git
+    team: revex
+    type: frontend
+    tags: [revex, courses, vue3]
+
+  # ── SaaS & Agency ────────────────────────────────────────────
+  - name: saas-backend
+    github_url: https://github.com/GoHighLevel/saas-backend.git
+    team: saas
+    type: service
+    tags: [saas, agency, nestjs]
+
+  - name: saas-frontend
+    github_url: https://github.com/GoHighLevel/saas-frontend.git
+    team: saas
+    type: frontend
+    tags: [saas, agency, vue3]
+
+  - name: agency-backend
+    github_url: https://github.com/GoHighLevel/agency-backend.git
+    team: saas
+    type: service
+    tags: [saas, agency, nestjs]
+
+  - name: white-label-backend
+    github_url: https://github.com/GoHighLevel/white-label-backend.git
+    team: saas
+    type: service
+    tags: [saas, white-label, nestjs]
+
+  # ── Auth & Identity ──────────────────────────────────────────
+  - name: auth-backend
+    github_url: https://github.com/GoHighLevel/auth-backend.git
+    team: platform
+    type: service
+    tags: [auth, identity, nestjs, jwt]
+
+  - name: auth-frontend
+    github_url: https://github.com/GoHighLevel/auth-frontend.git
+    team: platform
+    type: frontend
+    tags: [auth, identity, vue3]
+
+  - name: iam-backend
+    github_url: https://github.com/GoHighLevel/iam-backend.git
+    team: platform
+    type: service
+    tags: [auth, iam, rbac, nestjs]
+
+  - name: sso-backend
+    github_url: https://github.com/GoHighLevel/sso-backend.git
+    team: platform
+    type: service
+    tags: [auth, sso, oauth, nestjs]
+
+  # ── Social & Reviews ──────────────────────────────────────────
+  - name: social-planner-backend
+    github_url: https://github.com/GoHighLevel/social-planner-backend.git
+    team: social
+    type: service
+    tags: [social, planner, nestjs]
+
+  - name: social-planner-frontend
+    github_url: https://github.com/GoHighLevel/social-planner-frontend.git
+    team: social
+    type: frontend
+    tags: [social, planner, vue3]
+
+  - name: reviews-backend
+    github_url: https://github.com/GoHighLevel/reviews-backend.git
+    team: social
+    type: service
+    tags: [social, reviews, nestjs]
+
+  - name: reviews-frontend
+    github_url: https://github.com/GoHighLevel/reviews-frontend.git
+    team: social
+    type: frontend
+    tags: [social, reviews, vue3]
+
+  - name: reputation-backend
+    github_url: https://github.com/GoHighLevel/reputation-backend.git
+    team: social
+    type: service
+    tags: [social, reputation, nestjs]
+
+  # ── Phone & VoIP ─────────────────────────────────────────────
+  - name: phone-backend
+    github_url: https://github.com/GoHighLevel/phone-backend.git
+    team: phone
+    type: service
+    tags: [phone, voip, twilio, nestjs]
+
+  - name: phone-frontend
+    github_url: https://github.com/GoHighLevel/phone-frontend.git
+    team: phone
+    type: frontend
+    tags: [phone, voip, vue3]
+
+  - name: dialer-backend
+    github_url: https://github.com/GoHighLevel/dialer-backend.git
+    team: phone
+    type: service
+    tags: [phone, dialer, nestjs]
+
+  - name: call-tracking-backend
+    github_url: https://github.com/GoHighLevel/call-tracking-backend.git
+    team: phone
+    type: service
+    tags: [phone, call-tracking, nestjs]
+
+  # ── Integrations ──────────────────────────────────────────────
+  - name: integrations-backend
+    github_url: https://github.com/GoHighLevel/integrations-backend.git
+    team: integrations
+    type: service
+    tags: [integrations, oauth, nestjs]
+
+  - name: integrations-frontend
+    github_url: https://github.com/GoHighLevel/integrations-frontend.git
+    team: integrations
+    type: frontend
+    tags: [integrations, oauth, vue3]
+
+  - name: zapier-integration
+    github_url: https://github.com/GoHighLevel/zapier-integration.git
+    team: integrations
+    type: integration
+    tags: [integrations, zapier]
+
+  - name: google-integration-backend
+    github_url: https://github.com/GoHighLevel/google-integration-backend.git
+    team: integrations
+    type: service
+    tags: [integrations, google, nestjs]
+
+  - name: facebook-integration-backend
+    github_url: https://github.com/GoHighLevel/facebook-integration-backend.git
+    team: integrations
+    type: service
+    tags: [integrations, facebook, nestjs]
+
+  - name: stripe-integration-backend
+    github_url: https://github.com/GoHighLevel/stripe-integration-backend.git
+    team: integrations
+    type: service
+    tags: [integrations, stripe, payments, nestjs]
+
+  - name: webhook-delivery-backend
+    github_url: https://github.com/GoHighLevel/webhook-delivery-backend.git
+    team: integrations
+    type: service
+    tags: [integrations, webhooks, nestjs]
+
+  # ── AI & Automation ───────────────────────────────────────────
+  - name: ai-backend
+    github_url: https://github.com/GoHighLevel/ai-backend.git
+    team: ai
+    type: service
+    tags: [ai, llm, nestjs]
+
+  - name: ai-frontend
+    github_url: https://github.com/GoHighLevel/ai-frontend.git
+    team: ai
+    type: frontend
+    tags: [ai, llm, vue3]
+
+  - name: ai-employee-backend
+    github_url: https://github.com/GoHighLevel/ai-employee-backend.git
+    team: ai
+    type: service
+    tags: [ai, employee, automation, nestjs]
+
+  - name: conversation-ai-backend
+    github_url: https://github.com/GoHighLevel/conversation-ai-backend.git
+    team: ai
+    type: service
+    tags: [ai, conversation, nestjs]
+
+  - name: content-ai-backend
+    github_url: https://github.com/GoHighLevel/content-ai-backend.git
+    team: ai
+    type: service
+    tags: [ai, content, nestjs]
+
+  - name: ghl-agentic-workspace
+    github_url: https://github.com/GoHighLevel/ghl-agentic-workspace.git
+    team: platform
+    type: tooling
+    tags: [ai, agentic, mcp, platform]
+
+  - name: codebase-memory-mcp
+    github_url: https://github.com/GoHighLevel/codebase-memory-mcp.git
+    team: platform
+    type: tooling
+    tags: [ai, mcp, code-intelligence, platform]
+
+  # ── Locations & Businesses ────────────────────────────────────
+  - name: locations-backend
+    github_url: https://github.com/GoHighLevel/locations-backend.git
+    team: platform
+    type: service
+    tags: [locations, businesses, nestjs]
+
+  - name: locations-frontend
+    github_url: https://github.com/GoHighLevel/locations-frontend.git
+    team: platform
+    type: frontend
+    tags: [locations, businesses, vue3]
+
+  - name: businesses-backend
+    github_url: https://github.com/GoHighLevel/businesses-backend.git
+    team: platform
+    type: service
+    tags: [locations, businesses, nestjs]
+
+  # ── Media & Files ────────────────────────────────────────────
+  - name: media-backend
+    github_url: https://github.com/GoHighLevel/media-backend.git
+    team: platform
+    type: service
+    tags: [media, files, gcs, nestjs]
+
+  - name: media-frontend
+    github_url: https://github.com/GoHighLevel/media-frontend.git
+    team: platform
+    type: frontend
+    tags: [media, files, vue3]
+
+  - name: documents-backend
+    github_url: https://github.com/GoHighLevel/documents-backend.git
+    team: platform
+    type: service
+    tags: [documents, files, nestjs]
+
+  # ── Notifications ────────────────────────────────────────────
+  - name: notifications-backend
+    github_url: https://github.com/GoHighLevel/notifications-backend.git
+    team: platform
+    type: service
+    tags: [notifications, pubsub, nestjs]
+
+  - name: in-app-notifications-backend
+    github_url: https://github.com/GoHighLevel/in-app-notifications-backend.git
+    team: platform
+    type: service
+    tags: [notifications, in-app, nestjs]
+
+  # ── Affiliate & Referrals ────────────────────────────────────
+  - name: affiliates-backend
+    github_url: https://github.com/GoHighLevel/affiliates-backend.git
+    team: payments
+    type: service
+    tags: [affiliates, referrals, nestjs]
+
+  - name: affiliates-frontend
+    github_url: https://github.com/GoHighLevel/affiliates-frontend.git
+    team: payments
+    type: frontend
+    tags: [affiliates, referrals, vue3]
+
+  # ── Blog & Content ───────────────────────────────────────────
+  - name: blog-backend
+    github_url: https://github.com/GoHighLevel/blog-backend.git
+    team: funnels
+    type: service
+    tags: [blog, cms, nestjs]
+
+  - name: blog-frontend
+    github_url: https://github.com/GoHighLevel/blog-frontend.git
+    team: funnels
+    type: frontend
+    tags: [blog, cms, vue3]
+
+  # ── LC Email & Deliverability ────────────────────────────────
+  - name: lc-email-backend
+    github_url: https://github.com/GoHighLevel/lc-email-backend.git
+    team: conversations
+    type: service
+    tags: [email, deliverability, nestjs, lc]
+
+  - name: lc-phone-backend
+    github_url: https://github.com/GoHighLevel/lc-phone-backend.git
+    team: phone
+    type: service
+    tags: [phone, lc, twilio, nestjs]
+
+  # ── Snapshots & Marketplace ──────────────────────────────────
+  - name: snapshots-backend
+    github_url: https://github.com/GoHighLevel/snapshots-backend.git
+    team: saas
+    type: service
+    tags: [snapshots, marketplace, nestjs]
+
+  - name: marketplace-backend
+    github_url: https://github.com/GoHighLevel/marketplace-backend.git
+    team: saas
+    type: service
+    tags: [marketplace, nestjs]
+
+  - name: marketplace-frontend
+    github_url: https://github.com/GoHighLevel/marketplace-frontend.git
+    team: saas
+    type: frontend
+    tags: [marketplace, vue3]
+
+  # ── Settings & Configuration ─────────────────────────────────
+  - name: settings-backend
+    github_url: https://github.com/GoHighLevel/settings-backend.git
+    team: platform
+    type: service
+    tags: [settings, configuration, nestjs]
+
+  - name: settings-frontend
+    github_url: https://github.com/GoHighLevel/settings-frontend.git
+    team: platform
+    type: frontend
+    tags: [settings, configuration, vue3]
+
+  # ── Tags & Custom Fields ─────────────────────────────────────
+  - name: custom-fields-backend
+    github_url: https://github.com/GoHighLevel/custom-fields-backend.git
+    team: crm
+    type: service
+    tags: [crm, custom-fields, nestjs]
+
+  - name: tags-backend
+    github_url: https://github.com/GoHighLevel/tags-backend.git
+    team: crm
+    type: service
+    tags: [crm, tags, nestjs]
+
+  # ── Triggers & Conditions ────────────────────────────────────
+  - name: triggers-backend
+    github_url: https://github.com/GoHighLevel/triggers-backend.git
+    team: marketing
+    type: service
+    tags: [marketing, triggers, nestjs]
+
+  # ── Search ──────────────────────────────────────────────────
+  - name: search-backend
+    github_url: https://github.com/GoHighLevel/search-backend.git
+    team: platform
+    type: service
+    tags: [search, elasticsearch, nestjs]
+
+  # ── Tasks ──────────────────────────────────────────────────
+  - name: tasks-backend
+    github_url: https://github.com/GoHighLevel/tasks-backend.git
+    team: crm
+    type: service
+    tags: [crm, tasks, nestjs]
+
+  - name: tasks-frontend
+    github_url: https://github.com/GoHighLevel/tasks-frontend.git
+    team: crm
+    type: frontend
+    tags: [crm, tasks, vue3]
+
+  # ── Mobile ──────────────────────────────────────────────────
+  - name: mobile-app-backend
+    github_url: https://github.com/GoHighLevel/mobile-app-backend.git
+    team: platform
+    type: service
+    tags: [mobile, backend, nestjs]
+
+  # ── Infrastructure / Tooling ─────────────────────────────────
+  - name: infrastructure
+    github_url: https://github.com/GoHighLevel/infrastructure.git
+    team: platform
+    type: infra
+    tags: [infra, terraform, helm, gke]
+
+  - name: helm-charts
+    github_url: https://github.com/GoHighLevel/helm-charts.git
+    team: platform
+    type: infra
+    tags: [infra, helm, kubernetes]
+
+  - name: jenkins-pipelines
+    github_url: https://github.com/GoHighLevel/jenkins-pipelines.git
+    team: platform
+    type: tooling
+    tags: [ci-cd, jenkins, pipelines]
+
+  - name: project-orion
+    github_url: https://github.com/GoHighLevel/project-orion.git
+    team: platform
+    type: service
+    tags: [platform, mcp, embeddings, code-intelligence]
+
+  - name: platform-libs
+    github_url: https://github.com/GoHighLevel/platform-libs.git
+    team: platform
+    type: library
+    tags: [platform, shared, libraries]
+
+  - name: frontend-core
+    github_url: https://github.com/GoHighLevel/frontend-core.git
+    team: platform
+    type: library
+    tags: [platform, frontend, shared]
+
+  - name: highrise
+    github_url: https://github.com/GoHighLevel/highrise.git
+    team: platform
+    type: library
+    tags: [platform, design-system, ui]
+
+  - name: ghl-design
+    github_url: https://github.com/GoHighLevel/ghl-design.git
+    team: platform
+    type: library
+    tags: [platform, design-tokens, ui]

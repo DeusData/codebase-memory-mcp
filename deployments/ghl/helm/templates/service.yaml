@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "codebase-memory-mcp.fullname" . }}
+  labels:
+    {{- include "codebase-memory-mcp.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "codebase-memory-mcp.selectorLabels" . | nindent 4 }}

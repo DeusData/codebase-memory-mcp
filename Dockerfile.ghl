@@ -1,0 +1,63 @@
+# Dockerfile.ghl — GHL fleet server
+#
+# Multi-stage build:
+#   stage 1 (cbm):    download pre-built codebase-memory-mcp binary for linux/amd64
+#   stage 2 (build):  compile the Go fleet server
+#   stage 3 (run):    minimal runtime image
+
+# ── Stage 1: codebase-memory-mcp binary ──────────────────────────
+FROM alpine:3.20 AS cbm
+
+ARG CBM_VERSION=1.2.0
+ARG CBM_ARCH=x86_64
+
+RUN apk add --no-cache curl ca-certificates && \
+    curl -fsSL \
+      "https://github.com/DeusData/codebase-memory-mcp/releases/download/v${CBM_VERSION}/codebase-memory-mcp-Linux-${CBM_ARCH}.tar.gz" \
+      -o /tmp/cbm.tar.gz && \
+    tar -xzf /tmp/cbm.tar.gz -C /tmp && \
+    install -m 0755 /tmp/codebase-memory-mcp /usr/local/bin/codebase-memory-mcp
+
+# ── Stage 2: Go fleet server ──────────────────────────────────────
+FROM golang:1.23-alpine AS build
+
+WORKDIR /src
+
+# Cache dependencies first
+COPY ghl/go.mod ghl/go.sum ./
+RUN go mod download
+
+# Copy source
+COPY ghl/ ./
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags="-s -w" \
+    -o /app/ghl-fleet ./cmd/server
+
+# ── Stage 3: Runtime ──────────────────────────────────────────────
+FROM gcr.io/distroless/static-debian12:nonroot
+
+# Copy binaries
+COPY --from=cbm  /usr/local/bin/codebase-memory-mcp /app/codebase-memory-mcp
+COPY --from=build /app/ghl-fleet                     /app/ghl-fleet
+
+# Copy default manifest (can be overridden via ConfigMap volume mount)
+COPY REPOS.yaml /app/REPOS.yaml
+
+WORKDIR /app
+
+# ── Defaults (all overridable via env) ───────────────────────────
+ENV PORT=8080 \
+    CBM_BINARY=/app/codebase-memory-mcp \
+    FLEET_CACHE_DIR=/data/fleet-cache \
+    REPOS_MANIFEST=/app/REPOS.yaml \
+    FLEET_CONCURRENCY=5 \
+    CRON_INCREMENTAL="0 */6 * * *" \
+    CRON_FULL="0 2 * * 0"
+
+EXPOSE 8080
+
+# Cache volume — SQLite DBs live here, should be a PVC in GKE
+VOLUME ["/data/fleet-cache"]
+
+ENTRYPOINT ["/app/ghl-fleet"]

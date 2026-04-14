@@ -1,0 +1,116 @@
+# values.yaml — codebase-memory-mcp GHL fleet
+# Override these in values-staging.yaml / values-production.yaml
+
+replicaCount: 1
+
+image:
+  repository: gcr.io/highlevel-common-layer/codebase-memory-mcp-ghl
+  pullPolicy: IfNotPresent
+  tag: ""  # defaults to .Chart.AppVersion
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  fsGroup: 65532  # nonroot
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false  # SQLite writes to /data
+  runAsNonRoot: true
+  runAsUser: 65532
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 8080
+
+# Expose via Istio VirtualService (GHL standard)
+virtualService:
+  enabled: true
+  host: "codebase-memory-mcp.internal.svc.cluster.local"
+  gateway: ""  # uses mesh by default
+
+ingress:
+  enabled: false
+
+resources:
+  limits:
+    cpu: "2"
+    memory: "4Gi"
+  requests:
+    cpu: "500m"
+    memory: "1Gi"
+
+autoscaling:
+  enabled: false  # fleet server is stateful (PVC); don't autoscale by default
+
+# Persistent volume for SQLite fleet cache (~200 repos)
+persistence:
+  enabled: true
+  storageClass: "standard-rwo"
+  size: "50Gi"
+  accessMode: ReadWriteOnce
+  mountPath: /data/fleet-cache
+
+# Environment — secrets injected from GCP Secret Manager via GHL secret-manager pattern
+env:
+  PORT: "8080"
+  FLEET_CONCURRENCY: "5"
+  CRON_INCREMENTAL: "0 */6 * * *"
+  CRON_FULL: "0 2 * * 0"
+  FLEET_CACHE_DIR: "/data/fleet-cache"
+  REPOS_MANIFEST: "/app/REPOS.yaml"
+
+# Secrets — reference GCP Secret Manager secrets
+# These are injected as env vars at runtime
+secrets:
+  bearerToken:
+    secretName: "codebase-memory-mcp-bearer-token"
+    key: "token"
+  webhookSecret:
+    secretName: "codebase-memory-mcp-webhook-secret"
+    key: "secret"
+
+# Optional: override REPOS.yaml via ConfigMap instead of baked image
+reposManifest:
+  configMap:
+    enabled: false
+    name: ""
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# GitHub deploy key for private repo cloning
+githubDeployKey:
+  enabled: false
+  secretName: "github-deploy-key"  # SSH private key

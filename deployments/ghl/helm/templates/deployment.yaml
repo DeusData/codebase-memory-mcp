@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "codebase-memory-mcp.fullname" . }}
+  labels:
+    {{- include "codebase-memory-mcp.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  # StatefulSet-like: only 1 replica writing to the PVC; Recreate avoids two pods fighting over the volume
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "codebase-memory-mcp.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        # Restart pods when the ConfigMap changes
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+      labels:
+        {{- include "codebase-memory-mcp.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "codebase-memory-mcp.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: fleet
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ include "codebase-memory-mcp.imageTag" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            {{- range $key, $value := .Values.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            # Secrets from GCP Secret Manager
+            - name: BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.bearerToken.secretName }}
+                  key: {{ .Values.secrets.bearerToken.key }}
+                  optional: true
+            - name: GITHUB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.webhookSecret.secretName }}
+                  key: {{ .Values.secrets.webhookSecret.key }}
+                  optional: true
+          {{- if .Values.reposManifest.configMap.enabled }}
+            - name: REPOS_MANIFEST
+              value: /config/REPOS.yaml
+          {{- end }}
+          volumeMounts:
+            - name: fleet-cache
+              mountPath: {{ .Values.persistence.mountPath }}
+            {{- if .Values.reposManifest.configMap.enabled }}
+            - name: repos-manifest
+              mountPath: /config
+              readOnly: true
+            {{- end }}
+            {{- if .Values.githubDeployKey.enabled }}
+            - name: github-deploy-key
+              mountPath: /root/.ssh
+              readOnly: true
+            {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: fleet-cache
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "codebase-memory-mcp.fullname" . }}-cache
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if .Values.reposManifest.configMap.enabled }}
+        - name: repos-manifest
+          configMap:
+            name: {{ .Values.reposManifest.configMap.name | default (printf "%s-repos" (include "codebase-memory-mcp.fullname" .)) }}
+        {{- end }}
+        {{- if .Values.githubDeployKey.enabled }}
+        - name: github-deploy-key
+          secret:
+            secretName: {{ .Values.githubDeployKey.secretName }}
+            defaultMode: 0400
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

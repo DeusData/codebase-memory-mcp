@@ -1,0 +1,9 @@
+# values-staging.yaml — staging overrides
+image:
+  tag: "latest"
+
+env:
+  FLEET_CONCURRENCY: "3"
+
+persistence:
+  size: "20Gi"
