@@ -144,4 +144,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 **Plans:** 1/1 plans complete
 
 Plans:
-- [ ] 07.1-01-PLAN.md — Add regression-backed `@export` parsing/indexing/linking support in the GDScript extraction and pipeline paths.
+- [x] 07.1-01-PLAN.md — Add regression-backed `@export` parsing/indexing/linking support in the GDScript extraction and pipeline paths.
