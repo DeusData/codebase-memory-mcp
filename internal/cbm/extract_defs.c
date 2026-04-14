@@ -2265,12 +2265,28 @@ static void push_var_def(CBMExtractCtx *ctx, const char *name, TSNode node) {
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
     def.label = "Variable";
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
-    def.is_exported = cbm_is_exported(name, ctx->language);
+
+    if (ctx->language == CBM_LANG_GDSCRIPT) {
+        const char *parent_qn = ctx->enclosing_class_qn;
+        if (!parent_qn || !parent_qn[0]) {
+            parent_qn = cbm_gdscript_anchor_qn(a, ctx->root, ctx->source, ctx->project, ctx->rel_path);
+        }
+        if (parent_qn && parent_qn[0]) {
+            def.parent_class = parent_qn;
+            def.qualified_name = cbm_arena_sprintf(a, "%s.%s", parent_qn, name);
+        } else {
+            def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+        }
+        def.is_exported = cbm_gdscript_variable_is_exported(node, ctx->source);
+    } else {
+        def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+        def.is_exported = cbm_is_exported(name, ctx->language);
+    }
+
     cbm_defs_push(&ctx->result->defs, a, def);
 }
 

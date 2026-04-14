@@ -169,6 +169,83 @@ bool cbm_is_exported(const char *name, CBMLanguage lang) {
     }
 }
 
+static bool source_span_contains_export_token(const char *source, uint32_t start, uint32_t end) {
+    if (!source || end <= start) {
+        return false;
+    }
+
+    const char *s = source + start;
+    size_t len = (size_t)(end - start);
+    const size_t needle_len = 6; // strlen("export")
+
+    if (len < needle_len) {
+        return false;
+    }
+
+    for (size_t i = 0; i + needle_len <= len; i++) {
+        if (memcmp(s + i, "export", needle_len) != 0) {
+            continue;
+        }
+        char prev = (i == 0) ? '\0' : s[i - 1];
+        char next = (i + needle_len < len) ? s[i + needle_len] : '\0';
+        bool prev_ok = !isalnum((unsigned char)prev) && prev != '_';
+        bool next_ok = !isalnum((unsigned char)next) && next != '_';
+        if (prev_ok && next_ok) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool gdscript_annotation_node_with_export(TSNode node, const char *source) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "annotation") != 0 && strcmp(kind, "annotations") != 0) {
+        return false;
+    }
+    return source_span_contains_export_token(source, ts_node_start_byte(node),
+                                             ts_node_end_byte(node));
+}
+
+bool cbm_gdscript_variable_is_exported(TSNode node, const char *source) {
+    enum {
+        GDSCRIPT_EXPORT_DEPTH_LIMIT = 4,
+        GDSCRIPT_EXPORT_CHILD_SCAN_LIMIT = 32,
+        GDSCRIPT_EXPORT_PREV_SIBLINGS = 2,
+    };
+
+    TSNode cur = node;
+    for (int depth = 0; depth < GDSCRIPT_EXPORT_DEPTH_LIMIT && !ts_node_is_null(cur); depth++) {
+        const char *kind = ts_node_type(cur);
+        if (strcmp(kind, "export_variable_statement") == 0) {
+            return true;
+        }
+        if (gdscript_annotation_node_with_export(cur, source)) {
+            return true;
+        }
+
+        uint32_t nc = ts_node_named_child_count(cur);
+        for (uint32_t i = 0; i < nc && i < GDSCRIPT_EXPORT_CHILD_SCAN_LIMIT; i++) {
+            TSNode child = ts_node_named_child(cur, i);
+            if (gdscript_annotation_node_with_export(child, source)) {
+                return true;
+            }
+        }
+
+        TSNode prev = ts_node_prev_sibling(cur);
+        for (int i = 0; i < GDSCRIPT_EXPORT_PREV_SIBLINGS && !ts_node_is_null(prev); i++) {
+            if (gdscript_annotation_node_with_export(prev, source)) {
+                return true;
+            }
+            prev = ts_node_prev_sibling(prev);
+        }
+
+        cur = ts_node_parent(cur);
+    }
+
+    return false;
+}
+
 // --- Test file detection ---
 
 static bool has_suffix(const char *str, const char *suffix) {

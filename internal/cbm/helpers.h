@@ -16,6 +16,9 @@ int cbm_classify_string(const char *str, int len);
 // Check if a name is exported per language convention.
 bool cbm_is_exported(const char *name, CBMLanguage lang);
 
+// GDScript-specific export detection for variable nodes.
+bool cbm_gdscript_variable_is_exported(TSNode node, const char *source);
+
 // Check if a file is a test file based on path and language.
 bool cbm_is_test_file(const char *rel_path, CBMLanguage lang);
 
