@@ -20,12 +20,16 @@ A real Godot demo project indexes cleanly and yields useful GDScript answers thr
 - ✓ Maintainer can verify real-repo GDScript definitions, relationships, and sequential-versus-parallel parity through approval-bearing proof artifacts, regressions, and a forced-parallel lifetime fix — Validated in Phase 3: Real-Repo Semantic Verification
 - ✓ Each proof target now emits an explicit `pass`, `fail`, or `incomplete` verdict with a per-repo summary and promotion-safe aggregate guidance — Validated in Phase 4: Verdicts & Acceptance Summaries
 - ✓ Maintainers can launch the embedded web UI through the persisted `--ui=true` / `--ui=false` contract and keep that path protected by regression coverage — Validated in Phase 5: Web UI Launch Repair
+- ✓ Forced-parallel full and incremental native-suite behavior now preserves the FastAPI Depends CALLS edge extraction contract — Validated in Phase 6: Parallel Native Suite Repair
+- ✓ Nyquist validation documentation coverage is complete across milestone phases, so audit discovery no longer reports missing phase validation contracts — Validated in Phase 7: Nyquist Validation Backfill
 - ✓ GDScript `@export` variables persist accurate exported metadata and anchor-linked qualified names through extraction and pipeline indexing — Validated in Phase 07.1: Add support for parsing, indexing, and linking `@export` in GDScript files
 
 ### Active
 
-- [ ] Confirm that indexing results for GDScript are useful in practice through key MCP workflows such as project indexing, graph discovery, and query/tracing operations
-- [ ] Identify and close the highest-impact gaps that prevent a real Godot project from passing end-to-end validation
+- [ ] Define v1.1 milestone requirements and roadmap scope with fresh milestone-scoped planning docs
+- [ ] Close the Phase 07.1 traceability debt by mapping exported-variable support to an explicit requirement ID in the next requirement set
+- [ ] Triage and resolve dependency hygiene findings surfaced during milestone audit (`npm audit` warning path)
+- [ ] Expand proof-management capabilities (`PMGT-01`, `PMGT-02`, `PMGT-03`) after v1.1 scope is set
 
 ### Out of Scope
 
@@ -41,7 +45,17 @@ Brownfield planning docs already exist under `.planning/codebase/`, and the repo
 
 ## Current State
 
-Phase 07.1 complete — GDScript `@export` variables are now parsed/indexed with explicit exported metadata and anchor-linked variable naming, with extraction and pipeline regressions verifying the behavior. Phase 7 Nyquist validation coverage remains explicit for Phases 01-04 with complete validation-doc coverage reported for Phases 01-05.
+- **Shipped version:** v1.0 (2026-04-14)
+- **Milestone delivery:** 8 phases, 14 plans, 29 tasks completed
+- **Acceptance status:** All 13 v1 requirements are complete in traceability, and all in-scope verification, integration, and end-to-end flows pass
+- **Known post-ship debt:** Phase 07.1 requirement traceability mapping gap and dependency hygiene follow-up
+
+## Next Milestone Goals
+
+- Define v1.1 scope and success criteria with `/gsd-new-milestone`
+- Create a fresh `.planning/REQUIREMENTS.md` for next-milestone requirements and traceability
+- Resolve shipped-tech-debt follow-ups (07.1 traceability mapping and dependency hygiene)
+- Prioritize proof management enhancements for multi-repo lanes and CI smoke validation
 
 ## Constraints
 
@@ -58,6 +72,9 @@ Phase 07.1 complete — GDScript `@export` variables are now parsed/indexed with
 | Use real Godot demo repositories as the success benchmark | The user wants end-to-end proof on realistic projects, not a fixture-only pass | Confirmed |
 | Define done as useful parser-through-MCP behavior on a real project | The first milestone is validation that real indexing and MCP querying work in practice | Confirmed |
 | Manifest mode is the only approval-bearing v1 workflow | Approval evidence must come from the committed four-target corpus instead of operator choice | Confirmed in Phase 1 |
+| Keep promotion language verdict-gated (`pass`/`fail`/`incomplete`) | Support claims must be bounded to reproducible evidence and explicit repo outcomes | Confirmed in Phase 4 |
+| Preserve persisted UI launch toggles as first-class behavior (`--ui=true` / `--ui=false`) | Web UI startup path is part of maintainers' supported runtime contract and must be regression protected | Confirmed in Phase 5 |
+| Treat GDScript `@export` metadata and anchor-linked variable naming as required indexing behavior | Real-world Godot projects rely on exported properties and stable variable identity through parser-to-pipeline flow | Confirmed in Phase 07.1 |
 
 ## Evolution
 
@@ -77,4 +94,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-14 after Phase 07.1 completion*
+*Last updated: 2026-04-14 after v1.0 milestone completion*

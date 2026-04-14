@@ -1,10 +1,10 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.0
-milestone_name: milestone
-status: executing
-stopped_at: Phase 07 context gathered
-last_updated: "2026-04-14T03:52:01.170Z"
+milestone_name: GDScript Support Verification
+status: milestone_completed
+stopped_at: v1.0 milestone archived and tagged
+last_updated: "2026-04-14T15:14:31.165Z"
 last_activity: 2026-04-14
 progress:
   total_phases: 8
@@ -18,16 +18,16 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-04-13)
+See: .planning/PROJECT.md (updated 2026-04-14)
 
 **Core value:** A real Godot demo project indexes cleanly and yields useful GDScript answers through the parser-to-MCP path.
-**Current focus:** Phase 07.1 — add-support-for-parsing-indexing-and-linking-export-in-gdscr
+**Current focus:** Planning next milestone scope and requirements
 
 ## Current Position
 
-Phase: 07.1
-Plan: Not started
-Status: Executing Phase 07.1
+Phase: Milestone complete
+Plan: N/A
+Status: v1.0 archived; ready for /gsd-new-milestone
 Last activity: 2026-04-14
 
 Progress: [██████████] 100%
