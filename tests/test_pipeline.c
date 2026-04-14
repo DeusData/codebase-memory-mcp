@@ -5367,6 +5367,68 @@ TEST(pipeline_gdscript_import_edge_skips_missing_preload_target) {
     PASS();
 }
 
+TEST(pipeline_gdscript_export_variables_persist_metadata_and_anchor_qn) {
+    const char *files[] = {"player.gd"};
+    const char *contents[] = {
+        "class_name Player\n"
+        "@export var speed = 10\n"
+        "var hp = 100\n"
+        "func _ready():\n"
+        "    pass\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0) {
+        SKIP("tmpdir");
+    }
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *vars = NULL;
+    int var_count = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Variable", &vars, &var_count);
+    ASSERT_GT(var_count, 0);
+
+    char speed_qn[512];
+    char hp_qn[512];
+    snprintf(speed_qn, sizeof(speed_qn), "%s.player.Player.speed", proj);
+    snprintf(hp_qn, sizeof(hp_qn), "%s.player.Player.hp", proj);
+
+    bool found_speed = false;
+    bool found_hp = false;
+    for (int i = 0; i < var_count; i++) {
+        if (strcmp(vars[i].name, "speed") == 0) {
+            found_speed = true;
+            ASSERT_STR_EQ(vars[i].qualified_name, speed_qn);
+            ASSERT_NOT_NULL(vars[i].properties_json);
+            ASSERT_TRUE(strstr(vars[i].properties_json, "\"is_exported\":true") != NULL);
+        }
+        if (strcmp(vars[i].name, "hp") == 0) {
+            found_hp = true;
+            ASSERT_STR_EQ(vars[i].qualified_name, hp_qn);
+            ASSERT_NOT_NULL(vars[i].properties_json);
+            ASSERT_TRUE(strstr(vars[i].properties_json, "\"is_exported\":false") != NULL);
+        }
+    }
+
+    ASSERT_TRUE(found_speed);
+    ASSERT_TRUE(found_hp);
+
+    if (vars) {
+        cbm_store_free_nodes(vars, var_count);
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
 /* DLL resolve test removed — feature removed due to Windows Defender
  * false positive (Wacatac.B!ml). See issue #89. */
 
@@ -6292,6 +6354,7 @@ SUITE(pipeline) {
      RUN_TEST(pipeline_gdscript_import_edge_persists_for_resolvable_preload_target);
      RUN_TEST(pipeline_gdscript_import_edge_persists_for_nested_preload_relative_path);
      RUN_TEST(pipeline_gdscript_import_edge_skips_missing_preload_target);
+     RUN_TEST(pipeline_gdscript_export_variables_persist_metadata_and_anchor_qn);
     /* Docstring integration (port of TestDocstringIntegration) */
     RUN_TEST(pipeline_docstring_go_function);
     RUN_TEST(pipeline_docstring_python_function);

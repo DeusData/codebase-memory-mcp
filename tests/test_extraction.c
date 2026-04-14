@@ -1976,6 +1976,45 @@ TEST(gdscript_defs_static_func_var_and_class_stmt) {
     PASS();
 }
 
+TEST(gdscript_export_variable_flags_and_anchor_linkage) {
+    const char *src = "class_name Player\n"
+                      "@export var speed = 10\n"
+                      "var hp = 100\n"
+                      "func _ready():\n"
+                      "    pass\n";
+
+    CBMFileResult *r = extract(src, CBM_LANG_GDSCRIPT, "t", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int saw_speed = 0;
+    int saw_hp = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Variable") != 0) {
+            continue;
+        }
+        if (strcmp(d->name, "speed") == 0) {
+            saw_speed = 1;
+            ASSERT_TRUE(d->is_exported);
+            ASSERT_STR_EQ(d->qualified_name, "t.player.Player.speed");
+            ASSERT_STR_EQ(d->parent_class, "t.player.Player");
+        }
+        if (strcmp(d->name, "hp") == 0) {
+            saw_hp = 1;
+            ASSERT_FALSE(d->is_exported);
+            ASSERT_STR_EQ(d->qualified_name, "t.player.Player.hp");
+            ASSERT_STR_EQ(d->parent_class, "t.player.Player");
+        }
+    }
+
+    ASSERT_TRUE(saw_speed);
+    ASSERT_TRUE(saw_hp);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(gdscript_signal_calls_and_import_alias) {
     const char *src = "class_name Player\n"
                       "const Enemy = preload(\"res://actors/enemy.gd\")\n"
@@ -3219,6 +3258,7 @@ SUITE(extraction) {
     RUN_TEST(gdscript_defs_anchor_and_methods);
     RUN_TEST(gdscript_defs_script_fallback_anchor);
     RUN_TEST(gdscript_defs_static_func_var_and_class_stmt);
+    RUN_TEST(gdscript_export_variable_flags_and_anchor_linkage);
     RUN_TEST(gdscript_signal_calls_and_import_alias);
     RUN_TEST(gdscript_nested_preload_call_chain_emits_import);
     RUN_TEST(gdscript_nested_preload_argument_emits_import);
