@@ -49,4 +49,4 @@ blocked: 0
 
 ## Gaps
 
-[none yet]
+[none]

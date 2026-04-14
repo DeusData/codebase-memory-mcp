@@ -16,7 +16,7 @@
     "research": true,
     "plan_check": true,
     "verifier": true,
-    "nyquist_validation": false,
+    "nyquist_validation": true,
     "auto_advance": false,
     "node_repair": true,
     "node_repair_budget": 2,
@@ -25,7 +25,8 @@
     "text_mode": false,
     "research_before_questions": false,
     "discuss_mode": "discuss",
-    "skip_discuss": false
+    "skip_discuss": false,
+    "_auto_chain_active": false
   },
   "hooks": {
     "context_warnings": true
