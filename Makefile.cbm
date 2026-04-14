@@ -428,6 +428,7 @@ test: $(BUILD_DIR)/test-runner $(BUILD_DIR)/codebase-memory-mcp
 	python3 -B scripts/test_gdscript_proof_same_script_calls.py
 	python3 -B scripts/test_gdscript_proof_verdict_summaries.py
 	python3 -B scripts/test_gdscript_proof_semantic_parity.py
+	python3 -B scripts/test_gdscript_partial_mcp_tools.py
 
 # ── TSan full test ───────────────────────────────────────────────
 
