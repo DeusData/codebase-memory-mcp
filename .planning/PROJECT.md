@@ -20,6 +20,7 @@ A real Godot demo project indexes cleanly and yields useful GDScript answers thr
 - ✓ Maintainer can verify real-repo GDScript definitions, relationships, and sequential-versus-parallel parity through approval-bearing proof artifacts, regressions, and a forced-parallel lifetime fix — Validated in Phase 3: Real-Repo Semantic Verification
 - ✓ Each proof target now emits an explicit `pass`, `fail`, or `incomplete` verdict with a per-repo summary and promotion-safe aggregate guidance — Validated in Phase 4: Verdicts & Acceptance Summaries
 - ✓ Maintainers can launch the embedded web UI through the persisted `--ui=true` / `--ui=false` contract and keep that path protected by regression coverage — Validated in Phase 5: Web UI Launch Repair
+- ✓ GDScript `@export` variables persist accurate exported metadata and anchor-linked qualified names through extraction and pipeline indexing — Validated in Phase 07.1: Add support for parsing, indexing, and linking `@export` in GDScript files
 
 ### Active
 
@@ -40,7 +41,7 @@ Brownfield planning docs already exist under `.planning/codebase/`, and the repo
 
 ## Current State
 
-Phase 7 complete — Nyquist validation coverage is now explicit for Phases 01-04 through approved backfilled `*-VALIDATION.md` contracts, and the milestone audit now reports complete validation-doc coverage for Phases 01-05.
+Phase 07.1 complete — GDScript `@export` variables are now parsed/indexed with explicit exported metadata and anchor-linked variable naming, with extraction and pipeline regressions verifying the behavior. Phase 7 Nyquist validation coverage remains explicit for Phases 01-04 with complete validation-doc coverage reported for Phases 01-05.
 
 ## Constraints
 
@@ -76,4 +77,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-13 after Phase 7 completion*
+*Last updated: 2026-04-14 after Phase 07.1 completion*
