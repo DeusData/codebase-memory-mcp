@@ -43,7 +43,7 @@ type Config struct {
 
 	// Optional callbacks for observability / testing.
 	OnRepoStart func(repoSlug string)
-	OnRepoDone  func(repoSlug string)
+	OnRepoDone  func(repoSlug string, err error)
 	OnClone     func(githubURL, localPath string)
 }
 
@@ -101,7 +101,7 @@ func (i *Indexer) IndexAll(ctx context.Context, repos []manifest.Repo, force boo
 			}
 			err := i.IndexRepo(ctx, r, force)
 			if i.cfg.OnRepoDone != nil {
-				i.cfg.OnRepoDone(r.Name)
+				i.cfg.OnRepoDone(r.Name, err)
 			}
 			errs <- repoErr{slug: r.Name, err: err}
 		}(repo)

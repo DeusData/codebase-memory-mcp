@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/bridge"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/mcp"
@@ -121,5 +124,113 @@ func TestMCPBridgeBackendRejectsUnknownMethod(t *testing.T) {
 	}
 	if err != bridge.ErrMethodNotFound {
 		t.Fatalf("want ErrMethodNotFound, got %v", err)
+	}
+}
+
+type fakeIndexToolClient struct {
+	inFlight  *atomic.Int64
+	maxFlight *atomic.Int64
+	delay     time.Duration
+	toolErr   error
+	result    *mcp.ToolResult
+}
+
+func (f *fakeIndexToolClient) CallTool(ctx context.Context, name string, params map[string]interface{}) (*mcp.ToolResult, error) {
+	if name != "index_repository" {
+		return nil, errors.New("unexpected tool")
+	}
+	current := f.inFlight.Add(1)
+	for {
+		old := f.maxFlight.Load()
+		if current <= old || f.maxFlight.CompareAndSwap(old, current) {
+			break
+		}
+	}
+	defer f.inFlight.Add(-1)
+
+	if f.delay > 0 {
+		select {
+		case <-time.After(f.delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if f.toolErr != nil {
+		return nil, f.toolErr
+	}
+	if f.result != nil {
+		return f.result, nil
+	}
+	return &mcp.ToolResult{}, nil
+}
+
+func (f *fakeIndexToolClient) Close() {}
+
+func TestMCPIndexClientPoolRunsConcurrentIndexing(t *testing.T) {
+	var inFlight atomic.Int64
+	var maxFlight atomic.Int64
+
+	prevFactory := newIndexToolClient
+	newIndexToolClient = func(ctx context.Context, binPath string) (indexToolClient, error) {
+		return &fakeIndexToolClient{
+			inFlight:  &inFlight,
+			maxFlight: &maxFlight,
+			delay:     20 * time.Millisecond,
+		}, nil
+	}
+	defer func() { newIndexToolClient = prevFactory }()
+
+	pool, err := newMCPIndexClientPool(context.Background(), "/tmp/cbm", 3)
+	if err != nil {
+		t.Fatalf("newMCPIndexClientPool: %v", err)
+	}
+	defer pool.Close()
+
+	errCh := make(chan error, 6)
+	for i := 0; i < 6; i++ {
+		go func() {
+			errCh <- pool.IndexRepository(context.Background(), "/tmp/repo", "moderate")
+		}()
+	}
+	for i := 0; i < 6; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("IndexRepository: %v", err)
+		}
+	}
+
+	if got := maxFlight.Load(); got < 2 {
+		t.Fatalf("max concurrent workers: want >= 2, got %d", got)
+	}
+	if got := maxFlight.Load(); got > 3 {
+		t.Fatalf("max concurrent workers: want <= 3, got %d", got)
+	}
+}
+
+func TestMCPIndexClientPoolPropagatesToolErrors(t *testing.T) {
+	prevFactory := newIndexToolClient
+	newIndexToolClient = func(ctx context.Context, binPath string) (indexToolClient, error) {
+		return &fakeIndexToolClient{
+			inFlight:  &atomic.Int64{},
+			maxFlight: &atomic.Int64{},
+			result: &mcp.ToolResult{
+				IsError: true,
+				Content: []mcp.Content{{Type: "text", Text: "bad repo"}},
+			},
+		}, nil
+	}
+	defer func() { newIndexToolClient = prevFactory }()
+
+	pool, err := newMCPIndexClientPool(context.Background(), "/tmp/cbm", 1)
+	if err != nil {
+		t.Fatalf("newMCPIndexClientPool: %v", err)
+	}
+	defer pool.Close()
+
+	err = pool.IndexRepository(context.Background(), "/tmp/repo", "full")
+	if err == nil {
+		t.Fatal("expected tool error")
+	}
+	if got := err.Error(); got != "index_repository: bad repo" {
+		t.Fatalf("unexpected error: %s", got)
 	}
 }

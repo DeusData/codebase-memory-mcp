@@ -1,0 +1,229 @@
+# REPOS.local.yaml — generated local fleet manifest
+# workspace_root: /Users/himanshuranjan/Documents/highlevel
+# source_manifest: ../REPOS.yaml
+# Regenerate from ./ghl with: go run ./cmd/genlocalmanifest
+repos:
+    - name: clientportal-core
+      github_url: https://github.com/GoHighLevel/clientportal-core.git
+      team: platform
+      type: library
+      tags:
+        - vue
+        - vue3
+        - platform
+    - name: ghl-agentic-workspace
+      github_url: https://github.com/GoHighLevel/ghl-agentic-workspace.git
+      team: platform
+      type: service
+      tags:
+        - typescript
+        - nestjs
+        - platform
+    - name: ghl-awesome-studio
+      github_url: https://github.com/GoHighLevel/ghl-awesome-studio.git
+      team: platform
+      type: frontend
+      tags:
+        - vue
+        - vue3
+        - platform
+    - name: ghls-pr
+      github_url: https://github.com/GoHighLevel/ghls-pr.git
+      team: platform
+      type: service
+      tags:
+        - typescript
+        - nestjs
+        - platform
+    - name: i18n-analysis
+      github_url: https://github.com/GoHighLevel/i18n-analysis.git
+      team: platform
+      type: service
+      tags:
+        - javascript
+        - nestjs
+        - platform
+    - name: image-processing-service
+      github_url: https://github.com/GoHighLevel/image-processing-service.git
+      team: platform
+      type: service
+      tags:
+        - go
+        - platform
+    - name: infrastructure-as-a-code
+      github_url: https://github.com/GoHighLevel/infrastructure-as-a-code.git
+      team: platform
+      type: infra
+      tags:
+        - hcl
+        - platform
+    - name: MoltClaw-by-HighLevel
+      github_url: https://github.com/GoHighLevel/MoltClaw-by-HighLevel.git
+      team: platform
+      type: service
+      tags:
+        - typescript
+        - nestjs
+        - platform
+    - name: platform-backend
+      github_url: https://github.com/GoHighLevel/platform-backend.git
+      team: platform
+      type: service
+      tags:
+        - typescript
+        - nestjs
+        - platform
+    - name: platform-devtools-backend
+      github_url: https://github.com/GoHighLevel/platform-devtools-backend.git
+      team: platform
+      type: service
+      tags:
+        - typescript
+        - nestjs
+        - platform
+    - name: platform-devtools-frontend
+      github_url: https://github.com/GoHighLevel/platform-devtools-frontend.git
+      team: platform
+      type: frontend
+      tags:
+        - typescript
+        - platform
+    - name: platform-docs
+      github_url: https://github.com/GoHighLevel/platform-docs.git
+      team: platform
+      type: docs
+      tags:
+        - html
+        - platform
+    - name: platform-jenkins-shared-library
+      github_url: https://github.com/GoHighLevel/platform-jenkins-shared-library.git
+      team: platform
+      type: library
+      tags:
+        - groovy
+        - platform
+    - name: project-orion
+      github_url: https://github.com/GoHighLevel/project-orion.git
+      team: platform
+      type: other
+      tags:
+        - html
+        - platform
+    - name: quality-gates
+      github_url: https://github.com/GoHighLevel/quality-gates.git
+      team: platform
+      type: service
+      tags:
+        - typescript
+        - nestjs
+        - platform
+    - name: automation-am-client-portal
+      github_url: https://github.com/GoHighLevel/automation-am-client-portal.git
+      team: revex
+      type: frontend
+      tags:
+        - vue
+        - vue3
+        - revex
+    - name: ghl-membership-frontend
+      github_url: https://github.com/GoHighLevel/ghl-membership-frontend.git
+      team: revex
+      type: frontend
+      tags:
+        - typescript
+        - revex
+    - name: ghl-revex-backend
+      github_url: https://github.com/GoHighLevel/ghl-revex-backend.git
+      team: revex
+      type: service
+      tags:
+        - typescript
+        - nestjs
+        - revex
+    - name: ghl-revex-frontend
+      github_url: https://github.com/GoHighLevel/ghl-revex-frontend.git
+      team: revex
+      type: frontend
+      tags:
+        - vue
+        - vue3
+        - revex
+    - name: membership-backend
+      github_url: https://github.com/GoHighLevel/membership-backend.git
+      team: revex
+      type: service
+      tags:
+        - typescript
+        - nestjs
+        - revex
+    - name: membership-hmi-app
+      github_url: https://github.com/GoHighLevel/membership-hmi-app.git
+      team: revex
+      type: frontend
+      tags:
+        - vue
+        - vue3
+        - revex
+    - name: membership-hmi-preview
+      github_url: https://github.com/GoHighLevel/membership-hmi-preview.git
+      team: revex
+      type: frontend
+      tags:
+        - vue
+        - vue3
+        - revex
+    - name: ghl-crm-frontend
+      github_url: https://github.com/GoHighLevel/ghl-crm-frontend.git
+      team: crm
+      type: frontend
+      tags:
+        - vue
+        - vue3
+        - crm
+    - name: ghl-email-builder
+      github_url: https://github.com/GoHighLevel/ghl-email-builder.git
+      team: conversations
+      type: frontend
+      tags:
+        - vue
+        - vue3
+        - conversations
+    - name: spm-ts
+      github_url: https://github.com/GoHighLevel/spm-ts.git
+      team: funnels
+      type: frontend
+      tags:
+        - vue
+        - vue3
+        - funnels
+    - name: automation-workflows-frontend
+      github_url: https://github.com/GoHighLevel/automation-workflows-frontend.git
+      team: marketing
+      type: frontend
+      tags:
+        - typescript
+        - marketing
+    - name: marketplace-backend
+      github_url: https://github.com/GoHighLevel/marketplace-backend.git
+      team: saas
+      type: service
+      tags:
+        - typescript
+        - nestjs
+        - saas
+    - name: ai-backend
+      github_url: https://github.com/GoHighLevel/ai-backend.git
+      team: ai
+      type: service
+      tags:
+        - typescript
+        - nestjs
+        - ai
+    - name: ai-frontend
+      github_url: https://github.com/GoHighLevel/ai-frontend.git
+      team: ai
+      type: frontend
+      tags:
+        - vue
+        - vue3
+        - ai

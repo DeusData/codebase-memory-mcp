@@ -49,6 +49,7 @@ COPY --from=build /app/ghl-fleet                      /app/ghl-fleet
 
 # Copy default manifest
 COPY REPOS.yaml /app/REPOS.yaml
+COPY REPOS.local.yaml /app/REPOS.local.yaml
 
 # Git: trust all dirs (needed when running as non-root in containers)
 RUN git config --global --add safe.directory '*'
@@ -58,9 +59,11 @@ WORKDIR /app
 # ── Defaults (all overridable via env) ───────────────────────────
 ENV PORT=8080 \
     CBM_BINARY=/app/codebase-memory-mcp \
+    CBM_CACHE_DIR=/data/fleet-cache \
     FLEET_CACHE_DIR=/data/fleet-cache \
-    REPOS_MANIFEST=/app/REPOS.yaml \
-    FLEET_CONCURRENCY=3 \
+    REPOS_MANIFEST=/app/REPOS.local.yaml \
+    FLEET_CONCURRENCY=8 \
+    INDEXER_CLIENTS=8 \
     CRON_INCREMENTAL="0 */6 * * *" \
     CRON_FULL="0 2 * * 0"
 

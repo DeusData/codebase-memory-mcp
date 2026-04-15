@@ -66,11 +66,13 @@ persistence:
 # Environment — secrets injected from GCP Secret Manager via GHL secret-manager pattern
 env:
   PORT: "8080"
-  FLEET_CONCURRENCY: "5"
+  FLEET_CONCURRENCY: "8"
+  INDEXER_CLIENTS: "8"
   CRON_INCREMENTAL: "0 */6 * * *"
   CRON_FULL: "0 2 * * 0"
+  CBM_CACHE_DIR: "/data/fleet-cache"
   FLEET_CACHE_DIR: "/data/fleet-cache"
-  REPOS_MANIFEST: "/app/REPOS.yaml"
+  REPOS_MANIFEST: "/app/REPOS.local.yaml"
 
 # Secrets — reference GCP Secret Manager secrets
 # These are injected as env vars at runtime

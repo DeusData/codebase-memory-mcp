@@ -151,7 +151,7 @@ func TestIndexer_IndexAll_ConcurrencyLimit(t *testing.T) {
 				}
 			}
 		},
-		OnRepoDone: func(_ string) {
+		OnRepoDone: func(_ string, _ error) {
 			inFlight.Add(-1)
 		},
 	})

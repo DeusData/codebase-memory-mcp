@@ -67,18 +67,31 @@ func main() {
 	defer mcpClient.Close()
 	slog.Info("codebase-memory-mcp started", "name", mcpClient.ServerInfo().Name, "version", mcpClient.ServerInfo().Version)
 
+	indexPool, err := newMCPIndexClientPool(ctx, cfg.BinaryPath, cfg.IndexerClients)
+	if err != nil {
+		slog.Error("failed to start indexer client pool", "clients", cfg.IndexerClients, "err", err)
+		os.Exit(1)
+	}
+	defer indexPool.Close()
+	slog.Info("indexer client pool started", "clients", cfg.IndexerClients)
+
 	// ── Build indexer ────────────────────────────────────────
 
 	cloner := &gitCloner{logger: logger}
-	mcpIndexClient := &mcpIndexClient{client: mcpClient, logger: logger}
 
 	idx := indexer.New(indexer.Config{
-		Client:      mcpIndexClient,
+		Client:      indexPool,
 		Cloner:      cloner,
 		CacheDir:    cfg.CacheDir,
 		Concurrency: cfg.Concurrency,
 		OnRepoStart: func(slug string) { slog.Info("indexing repo", "repo", slug) },
-		OnRepoDone:  func(slug string) { slog.Info("repo indexed", "repo", slug) },
+		OnRepoDone: func(slug string, err error) {
+			if err != nil {
+				slog.Error("repo indexing failed", "repo", slug, "err", err)
+				return
+			}
+			slog.Info("repo indexed", "repo", slug)
+		},
 	})
 
 	// ── Fleet scheduler ──────────────────────────────────────
@@ -153,10 +166,13 @@ func main() {
 	r.Get("/status", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"repos":   len(m.Repos),
-			"version": mcpClient.ServerInfo().Version,
-			"binary":  cfg.BinaryPath,
-			"cache":   cfg.CacheDir,
+			"repos":           len(m.Repos),
+			"version":         mcpClient.ServerInfo().Version,
+			"binary":          cfg.BinaryPath,
+			"cache":           cfg.CacheDir,
+			"manifest":        cfg.ReposManifest,
+			"concurrency":     cfg.Concurrency,
+			"indexer_clients": cfg.IndexerClients,
 		})
 	})
 
@@ -207,6 +223,7 @@ type config struct {
 	BearerToken     string
 	WebhookSecret   string
 	Concurrency     int
+	IndexerClients  int
 	IncrementalCron string
 	FullCron        string
 }
@@ -224,17 +241,44 @@ func loadConfig() config {
 		fmt.Sscanf(v, "%d", &n)
 		return n
 	}
+	getIndexerClients := func(concurrency int) int {
+		v := getEnv("INDEXER_CLIENTS", "")
+		if v == "" {
+			return concurrency
+		}
+		n := concurrency
+		fmt.Sscanf(v, "%d", &n)
+		if n <= 0 {
+			return concurrency
+		}
+		return n
+	}
+	concurrency := getConcurrency()
 	return config{
 		Port:            getEnv("PORT", "8080"),
 		BinaryPath:      getEnv("CBM_BINARY", defaultBinaryPath()),
 		CacheDir:        getEnv("FLEET_CACHE_DIR", "/app/fleet-cache"),
-		ReposManifest:   getEnv("REPOS_MANIFEST", "/app/REPOS.yaml"),
+		ReposManifest:   getEnv("REPOS_MANIFEST", defaultManifestPath()),
 		BearerToken:     getEnv("BEARER_TOKEN", ""),
 		WebhookSecret:   getEnv("GITHUB_WEBHOOK_SECRET", ""),
-		Concurrency:     getConcurrency(),
+		Concurrency:     concurrency,
+		IndexerClients:  getIndexerClients(concurrency),
 		IncrementalCron: getEnv("CRON_INCREMENTAL", "0 */6 * * *"),
 		FullCron:        getEnv("CRON_FULL", "0 2 * * 0"),
 	}
+}
+
+func defaultManifestPath() string {
+	candidates := []string{
+		"/app/REPOS.local.yaml",
+		"/app/REPOS.yaml",
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return "/app/REPOS.yaml"
 }
 
 func defaultBinaryPath() string {
@@ -294,14 +338,70 @@ func (g *gitCloner) EnsureClone(ctx context.Context, githubURL, localPath string
 	return nil
 }
 
-// mcpIndexClient implements indexer.Client by calling the MCP binary.
-type mcpIndexClient struct {
-	client *mcp.Client
-	logger *slog.Logger
+type indexToolClient interface {
+	CallTool(ctx context.Context, name string, params map[string]interface{}) (*mcp.ToolResult, error)
+	Close()
 }
 
-func (m *mcpIndexClient) IndexRepository(ctx context.Context, repoPath, mode string) error {
-	result, err := m.client.CallTool(ctx, "index_repository", map[string]interface{}{
+var newIndexToolClient = func(ctx context.Context, binPath string) (indexToolClient, error) {
+	return mcp.NewClient(ctx, binPath)
+}
+
+type mcpIndexClientPool struct {
+	clients chan indexToolClient
+	all     []indexToolClient
+}
+
+func newMCPIndexClientPool(ctx context.Context, binPath string, size int) (*mcpIndexClientPool, error) {
+	if size <= 0 {
+		size = 1
+	}
+	pool := &mcpIndexClientPool{
+		clients: make(chan indexToolClient, size),
+		all:     make([]indexToolClient, 0, size),
+	}
+	for i := 0; i < size; i++ {
+		client, err := newIndexToolClient(ctx, binPath)
+		if err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("start indexer client %d/%d: %w", i+1, size, err)
+		}
+		pool.all = append(pool.all, client)
+		pool.clients <- client
+	}
+	return pool, nil
+}
+
+func (p *mcpIndexClientPool) Close() {
+	for _, client := range p.all {
+		client.Close()
+	}
+}
+
+func (p *mcpIndexClientPool) borrow(ctx context.Context) (indexToolClient, error) {
+	select {
+	case client := <-p.clients:
+		return client, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (p *mcpIndexClientPool) release(client indexToolClient) {
+	if client == nil {
+		return
+	}
+	p.clients <- client
+}
+
+func (p *mcpIndexClientPool) IndexRepository(ctx context.Context, repoPath, mode string) error {
+	client, err := p.borrow(ctx)
+	if err != nil {
+		return err
+	}
+	defer p.release(client)
+
+	result, err := client.CallTool(ctx, "index_repository", map[string]interface{}{
 		"repo_path": repoPath,
 		"mode":      mode,
 	})
