@@ -124,7 +124,7 @@ jobs:
           "
 
       - name: Attest SBOM
-        uses: actions/attest-sbom@bd218ad0dbcb3e146bd073d1d9c6d78e08aa8a0b # v2
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-path: '*.tar.gz'
           sbom-path: 'sbom.json'
@@ -152,7 +152,7 @@ jobs:
           git tag -f "$VERSION"
           git push origin "$VERSION" --force
 
-      - uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+      - uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
         with:
           tag_name: ${{ inputs.version }}
           draft: true

@@ -185,10 +185,7 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
             }
 
             if (current.count > 0) {
-                if (count >= cap) {
-                    cap *= PAIR_LEN;
-                    commits = safe_realloc(commits, cap * sizeof(commit_t));
-                }
+                safe_grow(commits, count, cap, PAIR_LEN);
                 commits[count++] = current;
             } else {
                 commit_free(&current);
@@ -250,10 +247,7 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
 
         if (strncmp(line, "COMMIT:", SLEN("COMMIT:")) == 0) {
             if (current.count > 0) {
-                if (count >= cap) {
-                    cap *= PAIR_LEN;
-                    commits = safe_realloc(commits, cap * sizeof(commit_t));
-                }
+                safe_grow(commits, count, cap, PAIR_LEN);
                 commits[count++] = current;
                 memset(&current, 0, sizeof(current));
             }
@@ -265,10 +259,7 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
         }
     }
     if (current.count > 0) {
-        if (count >= cap) {
-            cap *= PAIR_LEN;
-            commits = safe_realloc(commits, cap * sizeof(commit_t));
-        }
+        safe_grow(commits, count, cap, PAIR_LEN);
         commits[count++] = current;
     } else {
         commit_free(&current);
