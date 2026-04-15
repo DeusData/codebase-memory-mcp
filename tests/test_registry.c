@@ -283,6 +283,30 @@ TEST(resolve_import_map) {
     PASS();
 }
 
+/* Layer 2 fix: bare function call (no dot) with import map.
+ * "requireAdmin" imported from "authorization" → module_qn = "proj.lib.authorization"
+ * Should resolve to "proj.lib.authorization.requireAdmin", NOT "proj.lib.authorization" */
+TEST(resolve_import_map_bare_function) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "requireAdmin", "proj.lib.authorization.requireAdmin", "Function");
+    /* Also register an unrelated requireAdmin in another module */
+    cbm_registry_add(r, "requireAdmin", "proj.lib.users.requireAdmin", "Function");
+
+    /* Import map: "requireAdmin" → "proj.lib.authorization" */
+    const char *keys[] = {"requireAdmin"};
+    const char *vals[] = {"proj.lib.authorization"};
+
+    /* Call "requireAdmin" (bare, no dot) */
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "requireAdmin", "proj.actions.settings", keys, vals, 1);
+    ASSERT_STR_EQ(res.qualified_name, "proj.lib.authorization.requireAdmin");
+    ASSERT_STR_EQ(res.strategy, "import_map");
+    ASSERT_TRUE(res.confidence >= 0.90);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(resolve_unique_name) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "UniqueFunc", "proj.deep.path.UniqueFunc", "Function");
@@ -610,6 +634,7 @@ SUITE(registry) {
     /* Resolution */
     RUN_TEST(resolve_same_module);
     RUN_TEST(resolve_import_map);
+    RUN_TEST(resolve_import_map_bare_function);
     RUN_TEST(resolve_unique_name);
     RUN_TEST(resolve_unresolved);
     RUN_TEST(resolve_many_nodes);

@@ -311,12 +311,16 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
         return empty_result();
     }
 
-    /* Build candidate: resolved.suffix or just resolved */
+    /* Build candidate: resolved.suffix or resolved.prefix
+     * When callee has a dot (e.g. "pkg.Func"), prefix="pkg" and suffix="Func",
+     * so the target QN is module_qn.Func. When callee has no dot (e.g.
+     * "requireAdmin"), prefix IS the function name and suffix is NULL, so the
+     * target QN is module_qn.requireAdmin — not just module_qn. */
     char candidate[CBM_SZ_512];
     if (suffix && suffix[0]) {
         snprintf(candidate, sizeof(candidate), "%s.%s", resolved, suffix);
     } else {
-        snprintf(candidate, sizeof(candidate), "%s", resolved);
+        snprintf(candidate, sizeof(candidate), "%s.%s", resolved, prefix);
     }
     /* Use cbm_ht_get_key to get the persistent heap-owned key string */
     const char *stored_key = cbm_ht_get_key(r->exact, candidate);
