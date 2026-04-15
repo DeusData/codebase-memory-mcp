@@ -59,7 +59,7 @@ WORKDIR /app
 # ── Defaults (all overridable via env) ───────────────────────────
 ENV PORT=8080 \
     CBM_BINARY=/app/codebase-memory-mcp \
-    CBM_CACHE_DIR=/data/fleet-cache \
+    CBM_CACHE_DIR=/tmp/codebase-memory-mcp \
     FLEET_CACHE_DIR=/data/fleet-cache \
     REPOS_MANIFEST=/app/REPOS.local.yaml \
     FLEET_CONCURRENCY=8 \
