@@ -22,7 +22,6 @@ The correct non-biased conclusion is:
 
 - If the goal is **deep structural code intelligence at scale**, CBM is the stronger foundation.
 - If the goal is **fast local developer enablement and a simple MCP-hosted UX**, Orion is ahead on the serving/control-plane side.
-- The strongest end-state would combine **CBM's indexing/graph engine** with **Orion's simpler retrieval/server ergonomics**.
 
 ---
 
