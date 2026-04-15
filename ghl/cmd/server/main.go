@@ -570,20 +570,19 @@ func (p *mcpToolClientPool) CallTool(ctx context.Context, name string, params ma
 		return out.result, out.err
 	case <-ctx.Done():
 		client.Close()
-		if err := p.replaceClient(client); err != nil {
-			return nil, fmt.Errorf("%w (and failed to replace timed out MCP client: %v)", ctx.Err(), err)
-		}
+		go p.replaceClientAsync(client)
 		return nil, ctx.Err()
 	}
 }
 
-func (p *mcpToolClientPool) replaceClient(dead indexToolClient) error {
+func (p *mcpToolClientPool) replaceClientAsync(dead indexToolClient) {
 	replacementCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	replacement, err := newIndexToolClient(replacementCtx, p.binPath)
 	if err != nil {
-		return err
+		slog.Error("failed to replace timed out MCP client", "err", err)
+		return
 	}
 
 	p.mu.Lock()
@@ -596,7 +595,6 @@ func (p *mcpToolClientPool) replaceClient(dead indexToolClient) error {
 	p.mu.Unlock()
 
 	p.release(replacement)
-	return nil
 }
 
 type mcpIndexClientPool struct {
