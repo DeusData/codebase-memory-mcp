@@ -4,6 +4,7 @@
 #include "lang_specs.h"
 #include "extract_unified.h"
 #include "foundation/constants.h"
+#include "ts_node_stack.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include <stdint.h>          // uint32_t
 #include <string.h>
@@ -349,14 +350,13 @@ static const char *extract_first_string_arg(CBMExtractCtx *ctx, TSNode args) {
 }
 
 // Walk AST for call nodes (iterative)
-#define CALLS_STACK_CAP CBM_SZ_512
 static void walk_calls(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
-    TSNode stack[CALLS_STACK_CAP];
-    int top = 0;
-    stack[top++] = root;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->arena, root);
 
-    while (top > 0) {
-        TSNode node = stack[--top];
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         const char *kind = ts_node_type(node);
 
         if (cbm_kind_in_set(node, spec->call_node_types)) {
@@ -383,8 +383,8 @@ static void walk_calls(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec)
 
         uint32_t count = ts_node_child_count(node);
         enum { LAST_IDX_OFFSET = 1 };
-        for (int i = (int)(count - LAST_IDX_OFFSET); i >= 0 && top < CALLS_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        for (int i = (int)(count - LAST_IDX_OFFSET); i >= 0; i--) {
+            ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
         }
     }
 }

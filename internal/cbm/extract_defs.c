@@ -3,6 +3,7 @@
 #include "helpers.h"
 #include "lang_specs.h"
 #include "foundation/constants.h"
+#include "ts_node_stack.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
@@ -2278,15 +2279,14 @@ static TSNode emit_elixir_module_class(CBMExtractCtx *ctx, TSNode cur) {
 
 // Process Elixir call nodes iteratively — handles defmodule/def/defp/defmacro
 // without recursion between extract_elixir_call ↔ extract_elixir_module_def.
-#define ELIXIR_STACK_CAP CBM_SZ_64
 static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     (void)spec;
-    TSNode stack[ELIXIR_STACK_CAP];
-    int top = 0;
-    stack[top++] = node;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, CBM_SZ_64);
+    ts_nstack_push(&stack, ctx->arena, node);
 
-    while (top > 0) {
-        TSNode cur = stack[--top];
+    while (stack.count > 0) {
+        TSNode cur = ts_nstack_pop(&stack);
         CBMArena *a = ctx->arena;
 
         if (ts_node_child_count(cur) == 0) {
@@ -2308,10 +2308,10 @@ static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
             TSNode do_block = emit_elixir_module_class(ctx, cur);
             if (!ts_node_is_null(do_block)) {
                 uint32_t dbc = ts_node_child_count(do_block);
-                for (int di = (int)dbc - SKIP_CHAR; di >= 0 && top < ELIXIR_STACK_CAP; di--) {
+                for (int di = (int)dbc - SKIP_CHAR; di >= 0; di--) {
                     TSNode dchild = ts_node_child(do_block, (uint32_t)di);
                     if (!ts_node_is_null(dchild) && strcmp(ts_node_type(dchild), "call") == 0) {
-                        stack[top++] = dchild;
+                        ts_nstack_push(&stack, ctx->arena, dchild);
                     }
                 }
             }
@@ -2949,14 +2949,13 @@ static void extract_var_names(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
 
 // Iterative variable walker for config languages with nested structure.
 // Used by YAML, TOML, INI, JSON.
-#define VAR_WALK_STACK_CAP CBM_SZ_256
 static void walk_variables_iter(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
-    TSNode stack[VAR_WALK_STACK_CAP];
-    int top = 0;
-    stack[top++] = root;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, CBM_SZ_256);
+    ts_nstack_push(&stack, ctx->arena, root);
 
-    while (top > 0) {
-        TSNode node = stack[--top];
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         uint32_t count = ts_node_child_count(node);
         for (int i = (int)count - SKIP_CHAR; i >= 0; i--) {
             TSNode child = ts_node_child(node, (uint32_t)i);
@@ -2975,9 +2974,7 @@ static void walk_variables_iter(CBMExtractCtx *ctx, TSNode root, const CBMLangSp
                 strcmp(ck, "section") == 0 || strcmp(ck, "object") == 0 ||
                 strcmp(ck, "array") == 0 || strcmp(ck, "pair") == 0 || strcmp(ck, "element") == 0 ||
                 strcmp(ck, "content") == 0) {
-                if (top < VAR_WALK_STACK_CAP) {
-                    stack[top++] = child;
-                }
+                ts_nstack_push(&stack, ctx->arena, child);
             }
         }
     }
@@ -3173,13 +3170,13 @@ typedef struct {
 // Push nested class nodes from a class body container onto the defs stack.
 // Iteratively walks into wrapper nodes (field_declaration, template_declaration).
 static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, walk_defs_frame_t *stack,
-                                    int *top, const char *enclosing_qn) {
-    TSNode nc_stack[NESTED_CLASS_STACK_CAP];
-    int nc_top = 0;
-    nc_stack[nc_top++] = body;
+                                    int *top, const char *enclosing_qn, CBMArena *arena) {
+    TSNodeStack nc_stack;
+    ts_nstack_init(&nc_stack, arena, NESTED_CLASS_STACK_CAP);
+    ts_nstack_push(&nc_stack, arena, body);
 
-    while (nc_top > 0) {
-        TSNode cur = nc_stack[--nc_top];
+    while (nc_stack.count > 0) {
+        TSNode cur = ts_nstack_pop(&nc_stack);
         uint32_t nc = ts_node_child_count(cur);
         for (int i = (int)nc - SKIP_CHAR; i >= 0; i--) {
             TSNode child = ts_node_child(cur, (uint32_t)i);
@@ -3191,9 +3188,7 @@ static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, walk_d
                 const char *ck = ts_node_type(child);
                 if (strcmp(ck, "field_declaration") == 0 ||
                     strcmp(ck, "template_declaration") == 0 || strcmp(ck, "declaration") == 0) {
-                    if (nc_top < NESTED_CLASS_STACK_CAP) {
-                        nc_stack[nc_top++] = child;
-                    }
+                    ts_nstack_push(&nc_stack, arena, child);
                 }
             }
         }
@@ -3240,7 +3235,7 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const char 
 
 // Push nested class children from a class body container onto the walk stack.
 static void push_class_body_children(TSNode node, const CBMLangSpec *spec, walk_defs_frame_t *stack,
-                                     int *top, const char *new_enclosing) {
+                                     int *top, const char *new_enclosing, CBMArena *arena) {
     uint32_t nc = ts_node_child_count(node);
     for (uint32_t ci = 0; ci < nc; ci++) {
         TSNode child = ts_node_child(node, ci);
@@ -3248,7 +3243,7 @@ static void push_class_body_children(TSNode node, const CBMLangSpec *spec, walk_
         if (strcmp(ck, "field_declaration_list") == 0 || strcmp(ck, "class_body") == 0 ||
             strcmp(ck, "declaration_list") == 0 || strcmp(ck, "body") == 0 ||
             strcmp(ck, "block") == 0 || strcmp(ck, "suite") == 0) {
-            push_nested_class_nodes(child, spec, stack, top, new_enclosing);
+            push_nested_class_nodes(child, spec, stack, top, new_enclosing, arena);
             return;
         }
     }
@@ -3292,7 +3287,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
         if (cbm_kind_in_set(node, spec->class_node_types)) {
             extract_class_def(ctx, node, spec);
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
-            push_class_body_children(node, spec, stack, &top, new_enclosing);
+            push_class_body_children(node, spec, stack, &top, new_enclosing, ctx->arena);
             continue;
         }
 

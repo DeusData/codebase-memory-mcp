@@ -5,6 +5,7 @@
 #include "extract_unified.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
+#include "ts_node_stack.h"
 
 enum { MAX_EXCEPTION_NAME_LEN = 100, LAST_IDX = 1 };
 #include <stdint.h> // uint32_t
@@ -102,17 +103,16 @@ static void process_throw_node(CBMExtractCtx *ctx, TSNode node, const CBMLangSpe
 }
 
 // Iterative throw walker
-#define THROWS_STACK_CAP CBM_SZ_512
 static void walk_throws(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
-    TSNode stack[THROWS_STACK_CAP];
-    int top = 0;
-    stack[top++] = root;
-    while (top > 0) {
-        TSNode node = stack[--top];
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->arena, root);
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         process_throw_node(ctx, node, spec);
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - LAST_IDX; i >= 0 && top < THROWS_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        for (int i = (int)count - LAST_IDX; i >= 0; i--) {
+            ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
         }
     }
 }
@@ -144,19 +144,18 @@ static void try_emit_assignment_write(CBMExtractCtx *ctx, TSNode node, const cha
     }
 }
 
-#define READWRITE_STACK_CAP CBM_SZ_512
 static void walk_readwrites(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
-    TSNode stack[READWRITE_STACK_CAP];
-    int top = 0;
-    stack[top++] = root;
-    while (top > 0) {
-        TSNode node = stack[--top];
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->arena, root);
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         if (cbm_kind_in_set(node, spec->assignment_node_types)) {
             try_emit_assignment_write(ctx, node, cbm_enclosing_func_qn_cached(ctx, node));
         }
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - LAST_IDX; i >= 0 && top < READWRITE_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        for (int i = (int)count - LAST_IDX; i >= 0; i--) {
+            ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
         }
     }
 }
