@@ -73,6 +73,13 @@ repos:
         - typescript
         - nestjs
         - platform
+    - name: platform-core
+      github_url: https://github.com/GoHighLevel/platform-core.git
+      team: platform
+      type: library
+      tags:
+        - typescript
+        - platform
     - name: platform-devtools-backend
       github_url: https://github.com/GoHighLevel/platform-devtools-backend.git
       team: platform
