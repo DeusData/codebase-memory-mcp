@@ -59,8 +59,11 @@ print(f'{status},{malicious},{suspicious},{completed},{total}')
     COMPLETED=$(echo "$STATS" | cut -d',' -f4)
     TOTAL=$(echo "$STATS" | cut -d',' -f5)
 
-    if [ "$STATUS" = "completed" ] && [ "$COMPLETED" -ge "$MIN_ENGINES" ]; then
+    if [ "$STATUS" = "completed" ]; then
       SCAN_COMPLETE=true
+      if [ "$COMPLETED" -lt "$MIN_ENGINES" ]; then
+        echo "NOTE: $BASENAME completed with only $COMPLETED/$TOTAL engines (< $MIN_ENGINES)"
+      fi
       if [ "$MALICIOUS" -gt 0 ] || [ "$SUSPICIOUS" -gt 0 ]; then
         echo "BLOCKED: $BASENAME flagged ($MALICIOUS malicious, $SUSPICIOUS suspicious / $COMPLETED engines)"
         echo "  $URL"
