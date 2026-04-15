@@ -25,6 +25,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24, INCR_WAL_BUF = 1
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -120,48 +121,247 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
     return changed;
 }
 
-/* Find stored files that no longer exist on disk. Returns count. */
-static int find_deleted_files(cbm_file_info_t *files, int file_count, cbm_file_hash_t *stored,
-                              int stored_count, char ***out_deleted) {
+/* Classify stored files that are absent from current discovery. Returns the
+ * count of truly-deleted files (output via out_deleted) and ALSO collects
+ * mode-skipped files into out_mode_skipped (caller frees both).
+ *
+ * A stored file is classified as:
+ *   - "deleted"      — `stat()` returns ENOENT or ENOTDIR. Its nodes will
+ *                       be purged and its hash row dropped.
+ *   - "mode-skipped" — `stat()` succeeds. The file exists on disk but the
+ *                       current discovery pass didn't visit it (e.g. excluded
+ *                       by FAST_SKIP_DIRS in fast/moderate mode). Its nodes
+ *                       must be preserved AND its hash row must be carried
+ *                       forward into the new DB so subsequent reindexes can
+ *                       still see it as "known" rather than treating it as
+ *                       new-or-deleted.
+ *
+ * Without this distinction, a fast-mode reindex after a full-mode index
+ * would silently purge every file under `tools/`, `scripts/`, `bin/`,
+ * `build/`, `docs/`, `__tests__/`, etc. — see task
+ * claude-connectors/codebase-memory-index-repository-is-destructive-...
+ * and the 2026-04-13 Skyline incident (packages/mcp/src/tools/ vanished
+ * from a live graph mid-session).
+ *
+ * Mode-skipped hash preservation is the second half of the additive-merge
+ * contract: dump_and_persist re-upserts these hash rows so the next reindex
+ * can correctly detect a real on-disk deletion of a mode-skipped file (as
+ * opposed to seeing it as "never existed" → noop → orphaned graph nodes).
+ *
+ * Fail-safe rules (preserve nodes on uncertainty):
+ *   - repo_path NULL → log error and preserve everything (return 0
+ *     deletions, empty mode_skipped). The caller contract is that
+ *     repo_path is required; a NULL means a misconfigured pipeline,
+ *     not a deletion signal.
+ *   - snprintf truncation (combined path ≥ CBM_SZ_4K) → preserve. We can't
+ *     reliably stat a truncated path. Treat as mode-skipped.
+ *   - stat() errno != ENOENT/ENOTDIR (EACCES, EIO, ELOOP, transient NFS,
+ *     etc.) → preserve. The file may exist; we just can't see it right now.
+ *     Treat as mode-skipped.
+ *
+ * Note: we use stat() (not lstat()) on purpose. A symlink whose target was
+ * deleted should be classified as deleted from the indexer's perspective
+ * because the indexer follows symlinks during discovery — a stale symlink
+ * has no source to parse. */
+static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int file_count,
+                              cbm_file_hash_t *stored, int stored_count, char ***out_deleted,
+                              cbm_file_hash_t **out_mode_skipped, int *out_mode_skipped_count) {
+    *out_deleted = NULL;
+    *out_mode_skipped = NULL;
+    *out_mode_skipped_count = 0;
+
+    if (!repo_path) {
+        /* Misconfigured pipeline. Preserve everything rather than risk
+         * silently re-introducing the destructive overwrite this function
+         * was rewritten to prevent. */
+        cbm_log_error("incremental.err", "msg", "find_deleted_files_null_repo_path");
+        return 0;
+    }
+
     CBMHashTable *current = cbm_ht_create((size_t)file_count * PAIR_LEN);
     for (int i = 0; i < file_count; i++) {
         cbm_ht_set(current, files[i].rel_path, &files[i]);
     }
 
-    int count = 0;
-    int cap = CBM_SZ_64;
-    char **deleted = malloc((size_t)cap * sizeof(char *));
+    int del_count = 0;
+    int del_cap = CBM_SZ_64;
+    char **deleted = malloc((size_t)del_cap * sizeof(char *));
+    if (!deleted) {
+        cbm_log_error("incremental.err", "msg", "find_deleted_files_oom");
+        cbm_ht_free(current);
+        return 0;
+    }
+
+    int ms_count = 0;
+    int ms_cap = CBM_SZ_64;
+    cbm_file_hash_t *mode_skipped = malloc((size_t)ms_cap * sizeof(cbm_file_hash_t));
+    if (!mode_skipped) {
+        cbm_log_error("incremental.err", "msg", "find_deleted_files_oom_ms");
+        free(deleted);
+        cbm_ht_free(current);
+        return 0;
+    }
 
     for (int i = 0; i < stored_count; i++) {
-        if (!cbm_ht_get(current, stored[i].rel_path)) {
-            if (count >= cap) {
-                cap *= PAIR_LEN;
-                char **tmp = realloc(deleted, (size_t)cap * sizeof(char *));
+        if (cbm_ht_get(current, stored[i].rel_path)) {
+            continue; /* still visited by current pass */
+        }
+        /* Not in current discovery — check if it's truly deleted or just
+         * mode-skipped (excluded by FAST_SKIP_DIRS etc.). */
+        bool preserve = false;
+        char abs_path[CBM_SZ_4K];
+        int n = snprintf(abs_path, sizeof(abs_path), "%s/%s", repo_path, stored[i].rel_path);
+        if (n < 0 || n >= (int)sizeof(abs_path)) {
+            /* Truncation or encoding error — can't reliably stat. Preserve. */
+            cbm_log_warn("incremental.path_truncated", "rel_path", stored[i].rel_path);
+            preserve = true;
+        } else {
+            struct stat st;
+            if (stat(abs_path, &st) == 0) {
+                /* File exists on disk — mode-skipped, not deleted. */
+                preserve = true;
+            } else if (errno != ENOENT && errno != ENOTDIR) {
+                /* Transient or permission error — fail safe by preserving.
+                 * EACCES, EIO, ELOOP, ENAMETOOLONG, etc. */
+                cbm_log_warn("incremental.stat_uncertain", "rel_path", stored[i].rel_path, "errno",
+                             itoa_buf(errno));
+                preserve = true;
+            }
+        }
+
+        if (preserve) {
+            /* Carry forward the existing hash row so subsequent reindexes
+             * can correctly classify this file. */
+            if (ms_count >= ms_cap) {
+                ms_cap *= PAIR_LEN;
+                cbm_file_hash_t *tmp = realloc(mode_skipped, (size_t)ms_cap * sizeof(*tmp));
                 if (!tmp) {
+                    cbm_log_error("incremental.err", "msg",
+                                  "find_deleted_files_realloc_oom_ms");
                     break;
                 }
-                deleted = tmp;
+                mode_skipped = tmp;
             }
-            deleted[count++] = strdup(stored[i].rel_path);
+            char *rp = strdup(stored[i].rel_path);
+            char *sh = stored[i].sha256 ? strdup(stored[i].sha256) : NULL;
+            if (!rp || (stored[i].sha256 && !sh)) {
+                /* OOM mid-record. Drop this entry rather than persist a
+                 * row with a NULL rel_path that would silently fail the
+                 * NOT NULL constraint in upsert and reintroduce the
+                 * orphaned-node bug. */
+                cbm_log_error("incremental.err", "msg", "find_deleted_files_strdup_oom",
+                              "rel_path", stored[i].rel_path);
+                free(rp);
+                free(sh);
+                break;
+            }
+            mode_skipped[ms_count].project = NULL; /* unused by upsert API */
+            mode_skipped[ms_count].rel_path = rp;
+            mode_skipped[ms_count].sha256 = sh;
+            mode_skipped[ms_count].mtime_ns = stored[i].mtime_ns;
+            mode_skipped[ms_count].size = stored[i].size;
+            ms_count++;
+            continue;
         }
+
+        /* File is truly gone — record for purge. */
+        if (del_count >= del_cap) {
+            del_cap *= PAIR_LEN;
+            char **tmp = realloc(deleted, (size_t)del_cap * sizeof(char *));
+            if (!tmp) {
+                cbm_log_error("incremental.err", "msg", "find_deleted_files_realloc_oom");
+                break;
+            }
+            deleted = tmp;
+        }
+        deleted[del_count++] = strdup(stored[i].rel_path);
     }
 
     cbm_ht_free(current);
     *out_deleted = deleted;
-    return count;
+    *out_mode_skipped = mode_skipped;
+    *out_mode_skipped_count = ms_count;
+    return del_count;
+}
+
+/* Free a mode_skipped array allocated by find_deleted_files. */
+static void free_mode_skipped(cbm_file_hash_t *ms, int count) {
+    if (!ms) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free((void *)ms[i].rel_path);
+        free((void *)ms[i].sha256);
+    }
+    free(ms);
 }
 
 /* ── Persist file hashes ─────────────────────────────────────────── */
 
+/* Persist file hash rows for the current discovery and any mode-skipped
+ * files preserved from the previous DB.
+ *
+ * Partial-failure policy: an `upsert` failure on any single row is logged
+ * as a warning and the loop continues. We deliberately do NOT abort the
+ * whole reindex on a single bad row — partial preservation is better than
+ * total loss, and a transient failure on one file should not invalidate
+ * the entire incremental update. The trade-off is that a silently-failed
+ * row produces the same downstream effect as if the file were never
+ * indexed at all (forced re-parse on the next run for current-files,
+ * potential orphaned-node revival for mode_skipped). The warning surface
+ * is the only signal that something went wrong. */
 static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_info_t *files,
-                           int file_count) {
+                           int file_count, const cbm_file_hash_t *mode_skipped,
+                           int mode_skipped_count) {
+    int current_failed = 0;
+    int ms_failed = 0;
+
+    /* Current discovery: re-stat to capture any mtime/size that changed
+     * during the run, and write fresh hash rows for visited files. */
     for (int i = 0; i < file_count; i++) {
         struct stat st;
         if (stat(files[i].path, &st) != 0) {
             continue;
         }
-        cbm_store_upsert_file_hash(store, project, files[i].rel_path, "", stat_mtime_ns(&st),
-                                   st.st_size);
+        int rc = cbm_store_upsert_file_hash(store, project, files[i].rel_path, "",
+                                            stat_mtime_ns(&st), st.st_size);
+        if (rc != CBM_STORE_OK) {
+            cbm_log_warn("incremental.persist_hash_failed", "scope", "current", "rel_path",
+                         files[i].rel_path, "rc", itoa_buf(rc));
+            current_failed++;
+        }
+    }
+
+    /* Mode-skipped (preserved): re-upsert hash rows from the previous DB
+     * so the next reindex can still classify these files correctly. Without
+     * this, an orphaned-node bug emerges where:
+     *   - full mode indexes everything
+     *   - fast mode runs and drops mode-skipped hash rows
+     *   - file is then deleted on disk
+     *   - next reindex's stored hashes don't include the file → noop or
+     *     can't detect the deletion → graph nodes for the deleted file
+     *     remain forever (or until a destructive rebuild).
+     *
+     * A failure here is more serious than a current-files failure because
+     * it can revive the orphaned-node bug for that specific file. Logged
+     * with scope=mode_skipped so the warning is searchable. */
+    if (mode_skipped) {
+        for (int i = 0; i < mode_skipped_count; i++) {
+            int rc = cbm_store_upsert_file_hash(store, project, mode_skipped[i].rel_path,
+                                                mode_skipped[i].sha256 ? mode_skipped[i].sha256
+                                                                       : "",
+                                                mode_skipped[i].mtime_ns, mode_skipped[i].size);
+            if (rc != CBM_STORE_OK) {
+                cbm_log_warn("incremental.persist_hash_failed", "scope", "mode_skipped",
+                             "rel_path", mode_skipped[i].rel_path, "rc", itoa_buf(rc));
+                ms_failed++;
+            }
+        }
+    }
+
+    if (current_failed > 0 || ms_failed > 0) {
+        cbm_log_warn("incremental.persist_summary", "current_failed", itoa_buf(current_failed),
+                     "mode_skipped_failed", itoa_buf(ms_failed));
     }
 }
 
@@ -256,9 +456,13 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
                      itoa_buf((int)elapsed_ms(t)));
     }
 }
-/* Delete old DB and dump merged graph + hashes to disk. */
+/* Delete old DB and dump merged graph + hashes to disk.
+ * Mode-skipped hash rows are preserved across the rebuild so subsequent
+ * reindexes can correctly distinguish "never indexed" from "indexed but
+ * not visited this pass". */
 static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
-                             cbm_file_info_t *files, int file_count) {
+                             cbm_file_info_t *files, int file_count,
+                             const cbm_file_hash_t *mode_skipped, int mode_skipped_count) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
@@ -276,7 +480,7 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
 
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {
-        persist_hashes(hash_store, project, files, file_count);
+        persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
 
         /* FTS5 rebuild after incremental dump.  The btree dump path bypasses
          * any triggers that could have kept nodes_fts synchronized, so we
@@ -323,18 +527,27 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     bool *is_changed =
         classify_files(files, file_count, stored, stored_count, &n_changed, &n_unchanged);
 
-    /* Find deleted files */
+    /* Classify stored files absent from current discovery: truly-deleted
+     * (purge) vs mode-skipped (preserve nodes AND hash rows). */
     char **deleted = NULL;
-    int deleted_count = find_deleted_files(files, file_count, stored, stored_count, &deleted);
+    cbm_file_hash_t *mode_skipped = NULL;
+    int mode_skipped_count = 0;
+    int deleted_count =
+        find_deleted_files(cbm_pipeline_repo_path(p), files, file_count, stored, stored_count,
+                           &deleted, &mode_skipped, &mode_skipped_count);
 
     cbm_log_info("incremental.classify", "changed", itoa_buf(n_changed), "unchanged",
-                 itoa_buf(n_unchanged), "deleted", itoa_buf(deleted_count));
+                 itoa_buf(n_unchanged), "deleted", itoa_buf(deleted_count), "mode_skipped",
+                 itoa_buf(mode_skipped_count));
 
-    /* Fast path: nothing changed → skip */
+    /* Fast path: nothing changed → skip. The on-disk DB is left untouched,
+     * which means existing hash rows (including for any mode-skipped files
+     * that were already preserved by an earlier run) remain intact. */
     if (n_changed == 0 && deleted_count == 0) {
         cbm_log_info("incremental.noop", "reason", "no_changes");
         free(is_changed);
         free(deleted);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
         cbm_store_free_file_hashes(stored, stored_count);
         cbm_store_close(store);
         return 0;
@@ -374,6 +587,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             free(deleted[i]);
         }
         free(deleted);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
         cbm_store_close(store);
         return CBM_NOT_FOUND;
     }
@@ -424,8 +638,12 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     free(changed_files);
     cbm_registry_free(registry);
 
-    /* Step 7: Dump to disk */
-    dump_and_persist(existing, db_path, project, files, file_count);
+    /* Step 7: Dump to disk (preserves mode-skipped hash rows so the next
+     * reindex can correctly classify those files instead of seeing them
+     * as never-existed). */
+    dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
+                     mode_skipped_count);
+    free_mode_skipped(mode_skipped, mode_skipped_count);
     cbm_gbuf_free(existing);
 
     cbm_log_info("incremental.done", "elapsed_ms", itoa_buf((int)elapsed_ms(t0)));

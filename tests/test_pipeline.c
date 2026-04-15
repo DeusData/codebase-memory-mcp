@@ -15,6 +15,7 @@
 #include <string.h>
 #include <stdatomic.h>
 #include "foundation/compat_thread.h"
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "graph_buffer/graph_buffer.h"
@@ -4525,6 +4526,154 @@ TEST(incremental_new_file_added) {
     PASS();
 }
 
+TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
+    /* Regression: 2026-04-13. A fast-mode reindex after a full-mode index
+     * was silently destroying every file under FAST_SKIP_DIRS directories
+     * (`tools`, `scripts`, `bin`, `build`, `docs`, ...) by classifying them
+     * as deleted in find_deleted_files even though they still existed on
+     * disk. The Skyline graph lost packages/mcp/src/tools/ (18 files / ~500
+     * nodes) mid-session when a concurrent /develop run obediently called
+     * mode='fast'. This test pins the additive semantics: lesser-mode
+     * reindexes must NOT delete files that are merely outside the current
+     * pass's discovery scope. Fix: find_deleted_files now stat()s each
+     * stored-but-missing file and only purges it if it is truly absent
+     * from disk. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_modeskip_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        SKIP("tmpdir");
+    }
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/test.db", tmpdir);
+
+    char path[512];
+    FILE *f;
+
+    /* main.go — root-level production code (visible in fast and full) */
+    snprintf(path, sizeof(path), "%s/main.go", tmpdir);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package main\n\nfunc main() {\n}\n");
+    fclose(f);
+
+    /* tools/util.go — production code under a FAST_SKIP_DIRS directory.
+     * Full mode indexes it; fast mode skips it via the discover.c heuristic. */
+    char tools_dir[512];
+    snprintf(tools_dir, sizeof(tools_dir), "%s/tools", tmpdir);
+    cbm_mkdir_p(tools_dir, 0755);
+    snprintf(path, sizeof(path), "%s/tools/util.go", tmpdir);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package tools\n\nfunc Util() string {\n\treturn \"u\"\n}\n");
+    fclose(f);
+
+    /* Step 1: full-mode index — both files should be present */
+    cbm_pipeline_t *p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t *tools_nodes_before = NULL;
+    int tools_count_before = 0;
+    cbm_store_find_nodes_by_file(s, project, "tools/util.go", &tools_nodes_before,
+                                 &tools_count_before);
+    ASSERT_GT(tools_count_before, 0); /* full mode must see tools/util.go */
+    cbm_store_free_nodes(tools_nodes_before, tools_count_before);
+    int total_before = cbm_store_count_nodes(s, project);
+    cbm_store_close(s);
+
+    /* Step 2: fast-mode reindex — tools/util.go MUST survive (additive semantics) */
+    p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    s = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t *tools_nodes_after = NULL;
+    int tools_count_after = 0;
+    cbm_store_find_nodes_by_file(s, project, "tools/util.go", &tools_nodes_after,
+                                 &tools_count_after);
+    /* The critical assertion: tools/util.go nodes must still be present after
+     * a fast-mode reindex that skipped the tools/ directory. Before the fix,
+     * this was 0. */
+    ASSERT_GT(tools_count_after, 0);
+    ASSERT_EQ(tools_count_after, tools_count_before); /* same nodes, untouched */
+    cbm_store_free_nodes(tools_nodes_after, tools_count_after);
+
+    /* Sanity: total node count should not have collapsed by ~the size of tools/ */
+    int total_after = cbm_store_count_nodes(s, project);
+    ASSERT_GTE(total_after, total_before); /* additive — never less */
+    cbm_store_close(s);
+
+    /* Step 3: mutate main.go and fast reindex — forces dump_and_persist to
+     * run (instead of the noop early-return path that step 2 hit). This is
+     * the real dangerous path: the gbuf gets loaded, mutated for main.go,
+     * dumped back to disk. tools/util.go must survive THAT cycle, not just
+     * the trivial noop path. Audit finding from 2026-04-13. */
+    snprintf(path, sizeof(path), "%s/main.go", tmpdir);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package main\n\nfunc main() {\n\tprintln(\"changed\")\n}\n");
+    fclose(f);
+    /* Bump mtime explicitly — some filesystems have coarse mtime resolution
+     * and the rewrite could land in the same tick as the original write. */
+    struct stat mst;
+    if (stat(path, &mst) == 0) {
+        struct timespec times[2];
+        times[0].tv_sec = mst.st_atime;
+        times[0].tv_nsec = 0;
+        times[1].tv_sec = mst.st_mtime + 5;
+        times[1].tv_nsec = 0;
+        utimensat(AT_FDCWD, path, times, 0);
+    }
+
+    p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    s = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t *tools_nodes_run3 = NULL;
+    int tools_count_run3 = 0;
+    cbm_store_find_nodes_by_file(s, project, "tools/util.go", &tools_nodes_run3, &tools_count_run3);
+    /* tools/util.go nodes must STILL be present after a fast reindex that
+     * actually ran the full dump_and_persist cycle (not the noop fast-path). */
+    ASSERT_EQ(tools_count_run3, tools_count_before);
+    cbm_store_free_nodes(tools_nodes_run3, tools_count_run3);
+    cbm_store_close(s);
+
+    /* Step 4: actually delete tools/util.go from disk and full-reindex.
+     * Now it really is gone, so its nodes should be purged. This pins the
+     * other half of the contract: the stat-based check correctly identifies
+     * truly-deleted files as deleted. */
+    snprintf(path, sizeof(path), "%s/tools/util.go", tmpdir);
+    unlink(path);
+
+    p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    s = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t *tools_nodes_deleted = NULL;
+    int tools_count_deleted = 0;
+    cbm_store_find_nodes_by_file(s, project, "tools/util.go", &tools_nodes_deleted,
+                                 &tools_count_deleted);
+    ASSERT_EQ(tools_count_deleted, 0); /* truly deleted → purged */
+    cbm_store_free_nodes(tools_nodes_deleted, tools_count_deleted);
+    cbm_store_close(s);
+
+    free(project);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 TEST(incremental_k8s_manifest_indexed) {
     /* Full index with a k8s manifest, then add a new manifest via incremental.
      * Verifies that cbm_pipeline_pass_k8s() runs during incremental re-index. */
@@ -5354,6 +5503,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_detects_changed_file);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
+    RUN_TEST(incremental_fast_preserves_mode_skipped_tools_dir);
     RUN_TEST(incremental_k8s_manifest_indexed);
     RUN_TEST(incremental_kustomize_module_indexed);
     /* Resource management & internal helper tests */
