@@ -1,0 +1,7 @@
+**
+!Dockerfile.ghl
+!cloudbuild.ghl.yaml
+!REPOS.yaml
+!REPOS.local.yaml
+!ghl
+!ghl/**
