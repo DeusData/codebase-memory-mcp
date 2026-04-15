@@ -1,17 +1,25 @@
 # install.ps1 — One-line installer for codebase-memory-mcp (Windows).
 #
-# Usage:
-#   powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.ps1 | iex"
+# Usage: see README.md for install instructions.
 #
 # Environment:
 #   CBM_DOWNLOAD_URL  Override base URL for downloads (for testing)
 
 $ErrorActionPreference = "Stop"
 
+# Enforce TLS 1.2+ (older PowerShell defaults to TLS 1.0 which GitHub rejects)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+
 $Repo = "DeusData/codebase-memory-mcp"
 $InstallDir = "$env:LOCALAPPDATA\Programs\codebase-memory-mcp"
 $BinName = "codebase-memory-mcp.exe"
 $BaseUrl = if ($env:CBM_DOWNLOAD_URL) { $env:CBM_DOWNLOAD_URL } else { "https://github.com/$Repo/releases/latest/download" }
+
+# Security: reject non-HTTPS download URLs (defense-in-depth)
+if (-not $BaseUrl.StartsWith("https://") -and -not $BaseUrl.StartsWith("http://localhost") -and -not $BaseUrl.StartsWith("http://127.0.0.1")) {
+    Write-Host "error: refusing non-HTTPS download URL: $BaseUrl" -ForegroundColor Red
+    exit 1
+}
 
 # Detect variant from args (--ui or --standard)
 $Variant = "standard"
@@ -49,8 +57,6 @@ try {
     exit 1
 }
 
-# Remove MOTW (prevents SmartScreen popup)
-Unblock-File -Path "$TmpDir\$Archive" -ErrorAction SilentlyContinue
 
 # Checksum verification
 $ChecksumUrl = "$BaseUrl/checksums.txt"
@@ -91,9 +97,6 @@ if (-not (Test-Path $DlBin)) {
     }
 }
 
-# Remove MOTW from extracted binary
-Unblock-File -Path $DlBin -ErrorAction SilentlyContinue
-
 # Install
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 $Dest = Join-Path $InstallDir $BinName
@@ -110,7 +113,6 @@ if (Test-Path $Dest) {
 }
 
 Copy-Item $DlBin $Dest -Force
-Unblock-File -Path $Dest -ErrorAction SilentlyContinue
 
 # Verify
 try {

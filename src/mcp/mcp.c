@@ -259,8 +259,10 @@ static const tool_def_t TOOLS[] = {
     {"index_repository", "Index a repository into the knowledge graph",
      "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\",\"description\":"
      "\"Path to the "
-     "repository\"},\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"fast\"],\"default\":"
-     "\"full\"}},\"required\":[\"repo_path\"]}"},
+     "repository\"},\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"moderate\",\"fast\"],"
+     "\"default\":\"full\",\"description\":\"full: all passes including semantic edges. "
+     "moderate: fast discovery + SIMILAR_TO + SEMANTICALLY_RELATED. fast: structure only."
+     "\"}},\"required\":[\"repo_path\"]}"},
 
     {"search_graph",
      "Search the code knowledge graph for functions, classes, routes, and variables. Use INSTEAD "
@@ -368,7 +370,9 @@ static const tool_def_t TOOLS[] = {
     {"detect_changes", "Detect code changes and their impact",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"scope\":{\"type\":"
      "\"string\"},\"depth\":{\"type\":\"integer\",\"default\":2},\"base_branch\":{\"type\":"
-     "\"string\",\"default\":\"main\"}},\"required\":[\"project\"]}"},
+     "\"string\",\"default\":\"main\"},\"since\":{\"type\":\"string\",\"description\":"
+     "\"Git ref or date to compare from (e.g. HEAD~5, v0.5.0, 2026-01-01)\"}},\"required\":"
+     "[\"project\"]}"},
 
     {"manage_adr", "Create or update Architecture Decision Records",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
@@ -1550,6 +1554,7 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     }
 
     cbm_pipeline_unlock();
+    cbm_mem_collect(); /* return freed pages to OS after closing database */
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);

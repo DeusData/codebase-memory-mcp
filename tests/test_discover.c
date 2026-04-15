@@ -593,6 +593,82 @@ TEST(discover_cbmignore_no_git) {
     PASS();
 }
 
+/* ── Nested .gitignore tests (issue #178) ──────────────────────── */
+
+TEST(discover_nested_gitignore) {
+    char *base = th_mktempdir("cbm_disc_ngi");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "webapp/.gitignore"), "generated/\n");
+    th_write_file(TH_PATH(base, "webapp/src/routes.js"), "export default []\n");
+    th_write_file(TH_PATH(base, "webapp/generated/types.js"), "export {}\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+
+    bool found_generated = false;
+    bool found_routes = false;
+    for (int i = 0; i < count; i++) {
+        if (strstr(files[i].rel_path, "generated"))
+            found_generated = true;
+        if (strstr(files[i].rel_path, "routes.js"))
+            found_routes = true;
+    }
+    ASSERT_FALSE(found_generated);
+    ASSERT_TRUE(found_routes);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_nested_gitignore_stacks_with_root) {
+    char *base = th_mktempdir("cbm_disc_ngi_stack");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "*.log\n");
+    th_write_file(TH_PATH(base, "webapp/.gitignore"), ".output/\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "error.log"), "error log\n");
+    th_write_file(TH_PATH(base, "webapp/src/app.js"), "const x = 1\n");
+    th_write_file(TH_PATH(base, "webapp/.output/data.js"), "output data\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+
+    bool found_log = false;
+    bool found_output = false;
+    bool found_main = false;
+    bool found_app = false;
+    for (int i = 0; i < count; i++) {
+        if (strstr(files[i].rel_path, ".log"))
+            found_log = true;
+        if (strstr(files[i].rel_path, ".output"))
+            found_output = true;
+        if (strstr(files[i].rel_path, "main.go"))
+            found_main = true;
+        if (strstr(files[i].rel_path, "app.js"))
+            found_app = true;
+    }
+    ASSERT_FALSE(found_log);
+    ASSERT_FALSE(found_output);
+    ASSERT_TRUE(found_main);
+    ASSERT_TRUE(found_app);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(discover) {
@@ -681,4 +757,8 @@ SUITE(discover) {
     RUN_TEST(discover_generic_dirs_full_mode);
     RUN_TEST(discover_generic_dirs_fast_mode);
     RUN_TEST(discover_cbmignore_no_git);
+
+    /* Nested .gitignore tests (issue #178) */
+    RUN_TEST(discover_nested_gitignore);
+    RUN_TEST(discover_nested_gitignore_stacks_with_root);
 }
