@@ -26,6 +26,8 @@ enum {
 #define PP_NSEC_PER_SEC 1000000000ULL
 #define PP_USEC_PER_MS 1000000ULL
 #define PP_HALF_CONF 0.5
+#define PP_FIELD_HINT_CONF 0.85
+enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/worker_pool.h"
@@ -1193,6 +1195,60 @@ static const cbm_gbuf_node_t *find_source_node(const cbm_gbuf_t *gbuf, const cha
     return src;
 }
 
+/* Field type hint resolution for obj.Method() with multiple candidates.
+ * Strips C# field prefixes (_ / m_), capitalizes to get type name, and
+ * checks if TypeName.Method or ITypeName.Method exists among candidates. */
+static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const char *callee_name,
+                                int64_t source_id) {
+    if (!res->qualified_name || res->candidate_count <= SKIP_ONE) {
+        return;
+    }
+    const char *dot = strchr(callee_name, '.');
+    if (!dot) {
+        return;
+    }
+    size_t plen = (size_t)(dot - callee_name);
+    char obj_name[CBM_SZ_256];
+    if (plen >= sizeof(obj_name)) {
+        return;
+    }
+    memcpy(obj_name, callee_name, plen);
+    obj_name[plen] = '\0';
+
+    const char *type_hint = obj_name;
+    if (type_hint[0] == '_') {
+        type_hint++;
+    }
+    if (type_hint[0] == 'm' && type_hint[SKIP_ONE] == '_') {
+        type_hint += PP_CSHARP_M_PREFIX_LEN;
+    }
+
+    char type_name[CBM_SZ_256];
+    snprintf(type_name, sizeof(type_name), "%s", type_hint);
+    if (type_name[0] >= 'a' && type_name[0] <= 'z') {
+        type_name[0] -= ('a' - 'A');
+    }
+
+    char iface_name[CBM_SZ_256];
+    snprintf(iface_name, sizeof(iface_name), "I%s", type_name);
+
+    const char *method = dot + SKIP_ONE;
+    const char **cands = NULL;
+    int cand_count = 0;
+    cbm_registry_find_by_name(rc->registry, method, &cands, &cand_count);
+    for (int ci = 0; ci < cand_count; ci++) {
+        if (strstr(cands[ci], type_name) || strstr(cands[ci], iface_name)) {
+            const cbm_gbuf_node_t *better = cbm_gbuf_find_by_qn(rc->main_gbuf, cands[ci]);
+            if (better && better->id != source_id) {
+                res->qualified_name = cands[ci];
+                res->confidence = PP_FIELD_HINT_CONF;
+                res->strategy = "field_type_hint";
+                return;
+            }
+        }
+    }
+}
+
 /* Resolve calls for one file and emit CALLS/HTTP_CALLS/ASYNC_CALLS edges. */
 static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
@@ -1210,6 +1266,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
 
         cbm_resolution_t res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn,
                                                     imp_keys, imp_vals, imp_count);
+
+        try_field_type_hint(rc, &res, call->callee_name, source_node->id);
+
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,

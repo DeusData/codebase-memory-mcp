@@ -180,6 +180,8 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
                                   const CBMLangSpec *spec);
 static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
                                  const CBMLangSpec *spec);
+static TSNode find_class_body(TSNode class_node, CBMLanguage lang);
+static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *class_qn);
 static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 
 // --- Helpers ---
@@ -1864,6 +1866,10 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
 
     cbm_defs_push(&ctx->result->defs, a, def);
 
+    if (strcmp(label, "Enum") == 0) {
+        extract_enum_members(ctx, node, class_qn);
+    }
+
     // Extract methods inside the class
     extract_class_methods(ctx, node, class_qn, spec);
 
@@ -2426,6 +2432,80 @@ static void extract_csharp_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
     }
 }
 
+/* Check if a tree-sitter node type is an enum member declaration. */
+static bool is_enum_member_kind(const char *kind) {
+    return strcmp(kind, "enum_member_declaration") == 0 || strcmp(kind, "enum_constant") == 0 ||
+           strcmp(kind, "enum_member") == 0 || strcmp(kind, "enum_assignment") == 0 ||
+           strcmp(kind, "enumerator") == 0;
+}
+
+/* Extract enum members as Variable nodes (C#, Java, TypeScript, C++). */
+static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *class_qn) {
+    CBMArena *a = ctx->arena;
+    TSNode body = find_class_body(node, ctx->language);
+    if (ts_node_is_null(body)) {
+        return;
+    }
+    uint32_t mc = ts_node_named_child_count(body);
+    for (uint32_t mi = 0; mi < mc; mi++) {
+        TSNode member = ts_node_named_child(body, mi);
+        if (!is_enum_member_kind(ts_node_type(member))) {
+            continue;
+        }
+        TSNode mname = ts_node_child_by_field_name(member, TS_FIELD("name"));
+        if (ts_node_is_null(mname)) {
+            mname = cbm_find_child_by_kind(member, "identifier");
+        }
+        if (ts_node_is_null(mname)) {
+            continue;
+        }
+        char *member_name = cbm_node_text(a, mname, ctx->source);
+        if (!member_name || !member_name[0]) {
+            continue;
+        }
+        CBMDefinition mdef;
+        memset(&mdef, 0, sizeof(mdef));
+        mdef.name = member_name;
+        mdef.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, member_name);
+        mdef.label = "Variable";
+        mdef.file_path = ctx->rel_path;
+        mdef.start_line = ts_node_start_point(member).row + TS_LINE_OFFSET;
+        mdef.end_line = ts_node_end_point(member).row + TS_LINE_OFFSET;
+        cbm_defs_push(&ctx->result->defs, a, mdef);
+    }
+}
+
+/* Resolve the identifier node from a destructure pattern child.
+ * pair_pattern → value field; shorthand/identifier → itself; others → first named child. */
+static TSNode destructure_ident(TSNode pat_child) {
+    const char *pk = ts_node_type(pat_child);
+    if (strcmp(pk, "shorthand_property_identifier_pattern") == 0 || strcmp(pk, "identifier") == 0) {
+        return pat_child;
+    }
+    if (strcmp(pk, "pair_pattern") == 0) {
+        return ts_node_child_by_field_name(pat_child, TS_FIELD("value"));
+    }
+    /* rest_pattern, assignment_pattern, etc. — first named child. */
+    return ts_node_named_child(pat_child, 0);
+}
+
+/* Emit individual Variable nodes for each destructured binding. */
+static void extract_destructured_vars(CBMExtractCtx *ctx, TSNode pattern, TSNode decl,
+                                      CBMArena *a) {
+    uint32_t pc = ts_node_named_child_count(pattern);
+    for (uint32_t pi = 0; pi < pc; pi++) {
+        TSNode pat_child = ts_node_named_child(pattern, pi);
+        TSNode ident = destructure_ident(pat_child);
+        if (ts_node_is_null(ident)) {
+            continue;
+        }
+        char *id_text = cbm_node_text(a, ident, ctx->source);
+        if (id_text && id_text[0]) {
+            push_var_def(ctx, id_text, decl);
+        }
+    }
+}
+
 // JS/TS variable extraction: skip function-assigned declarators.
 static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
     uint32_t n = ts_node_named_child_count(node);
@@ -2444,7 +2524,14 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
         }
         TSNode vname = ts_node_child_by_field_name(child, TS_FIELD("name"));
         if (!ts_node_is_null(vname)) {
-            push_var_def(ctx, cbm_node_text(a, vname, ctx->source), child);
+            const char *nk = ts_node_type(vname);
+            /* Destructured patterns: emit individual identifiers instead of
+             * the raw "{A, B, C}" text as a single Variable node. */
+            if (strcmp(nk, "object_pattern") == 0 || strcmp(nk, "array_pattern") == 0) {
+                extract_destructured_vars(ctx, vname, child, a);
+            } else {
+                push_var_def(ctx, cbm_node_text(a, vname, ctx->source), child);
+            }
         }
     }
 }

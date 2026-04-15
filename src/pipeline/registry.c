@@ -108,15 +108,41 @@ static int common_prefix_len(const char *a, const char *b) {
     return count;
 }
 
-/* Pick candidate with longest common prefix with caller module. */
+enum { REG_TEST_PENALTY = 1000 };
+
+/* Check if a qualified name looks like a test/mock path. */
+static bool is_test_qn(const char *qn) {
+    if (!qn) {
+        return false;
+    }
+    return (strstr(qn, "Test") != NULL || strstr(qn, "test") != NULL ||
+            strstr(qn, "Mock") != NULL || strstr(qn, "mock") != NULL ||
+            strstr(qn, "Stub") != NULL || strstr(qn, "stub") != NULL ||
+            strstr(qn, "Fake") != NULL || strstr(qn, "fake") != NULL ||
+            strstr(qn, "Fixture") != NULL || strstr(qn, "spec") != NULL);
+}
+
+/* Score a candidate for tiebreaking. Higher = better.
+ * Layer 1: Non-test code preferred over test code (+1000)
+ * Layer 2: Namespace proximity via common prefix length (+plen) */
+static int candidate_score(const char *candidate_qn, const char *module_qn) {
+    int score = 0;
+    if (!is_test_qn(candidate_qn)) {
+        score += REG_TEST_PENALTY;
+    }
+    score += common_prefix_len(candidate_qn, module_qn);
+    return score;
+}
+
+/* Pick candidate with highest composite score (test-deprioritization + namespace proximity). */
 static const char *best_by_import_distance(const char **candidates, int count,
                                            const char *module_qn) {
     const char *best = NULL;
-    int best_len = CBM_NOT_FOUND;
+    int best_score = CBM_NOT_FOUND;
     for (int i = 0; i < count; i++) {
-        int plen = common_prefix_len(candidates[i], module_qn);
-        if (plen > best_len) {
-            best_len = plen;
+        int score = candidate_score(candidates[i], module_qn);
+        if (score > best_score) {
+            best_score = score;
             best = candidates[i];
         }
     }
