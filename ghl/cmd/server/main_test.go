@@ -234,3 +234,12 @@ func TestMCPIndexClientPoolPropagatesToolErrors(t *testing.T) {
 		t.Fatalf("unexpected error: %s", got)
 	}
 }
+
+func TestIsGitHubHTTPSAuthError(t *testing.T) {
+	if !isGitHubHTTPSAuthError("fatal: could not read Username for 'https://github.com': No such device or address") {
+		t.Fatal("expected GitHub HTTPS auth error to be detected")
+	}
+	if isGitHubHTTPSAuthError("fatal: some other git failure") {
+		t.Fatal("unexpected auth error match")
+	}
+}

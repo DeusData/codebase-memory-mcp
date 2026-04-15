@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -313,6 +314,10 @@ func (g *gitCloner) EnsureClone(ctx context.Context, githubURL, localPath string
 		cmd := exec.CommandContext(ctx, "git", "fetch", "--depth=1", "origin", "HEAD")
 		cmd.Dir = localPath
 		if out, err := cmd.CombinedOutput(); err != nil {
+			if isGitHubHTTPSAuthError(string(out)) {
+				g.logger.Warn("git fetch auth failed, using existing clone", "path", localPath)
+				return nil
+			}
 			return fmt.Errorf("git fetch: %w\n%s", err, out)
 		}
 		cmd = exec.CommandContext(ctx, "git", "reset", "--hard", "FETCH_HEAD")
@@ -336,6 +341,10 @@ func (g *gitCloner) EnsureClone(ctx context.Context, githubURL, localPath string
 		return fmt.Errorf("git clone %q: %w\n%s", githubURL, err, out)
 	}
 	return nil
+}
+
+func isGitHubHTTPSAuthError(output string) bool {
+	return strings.Contains(output, "could not read Username for 'https://github.com'")
 }
 
 type indexToolClient interface {
