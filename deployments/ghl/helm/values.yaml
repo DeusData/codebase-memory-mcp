@@ -71,7 +71,7 @@ env:
   CRON_INCREMENTAL: "0 */6 * * *"
   CRON_FULL: "0 2 * * 0"
   CBM_CACHE_DIR: "/tmp/codebase-memory-mcp"
-  FLEET_CACHE_DIR: "/data/fleet-cache"
+  FLEET_CACHE_DIR: "/tmp/fleet-cache"
   REPOS_MANIFEST: "/app/REPOS.local.yaml"
 
 # Secrets — reference GCP Secret Manager secrets
@@ -83,6 +83,9 @@ secrets:
   webhookSecret:
     secretName: "codebase-memory-mcp-webhook-secret"
     key: "secret"
+  githubToken:
+    secretName: "codebase-memory-mcp-github-token"
+    key: "token"
 
 # Optional: override REPOS.yaml via ConfigMap instead of baked image
 reposManifest:

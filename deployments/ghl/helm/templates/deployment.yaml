@@ -58,6 +58,12 @@ spec:
                   name: {{ .Values.secrets.webhookSecret.secretName }}
                   key: {{ .Values.secrets.webhookSecret.key }}
                   optional: true
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.githubToken.secretName }}
+                  key: {{ .Values.secrets.githubToken.key }}
+                  optional: true
           {{- if .Values.reposManifest.configMap.enabled }}
             - name: REPOS_MANIFEST
               value: /config/REPOS.yaml

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -241,5 +243,38 @@ func TestIsGitHubHTTPSAuthError(t *testing.T) {
 	}
 	if isGitHubHTTPSAuthError("fatal: some other git failure") {
 		t.Fatal("unexpected auth error match")
+	}
+}
+
+func TestHasWorkingTreeFilesRejectsGitOnlyClone(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+
+	ok, err := hasWorkingTreeFiles(root)
+	if err != nil {
+		t.Fatalf("hasWorkingTreeFiles: %v", err)
+	}
+	if ok {
+		t.Fatal("expected git-only directory to be rejected")
+	}
+}
+
+func TestHasWorkingTreeFilesAcceptsCheckedOutFile(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write package.json: %v", err)
+	}
+
+	ok, err := hasWorkingTreeFiles(root)
+	if err != nil {
+		t.Fatalf("hasWorkingTreeFiles: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected checked out file to be accepted")
 	}
 }

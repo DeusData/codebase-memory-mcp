@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -78,7 +79,10 @@ func main() {
 
 	// ── Build indexer ────────────────────────────────────────
 
-	cloner := &gitCloner{logger: logger}
+	cloner := &gitCloner{
+		logger:      logger,
+		githubToken: cfg.GitHubToken,
+	}
 
 	idx := indexer.New(indexer.Config{
 		Client:      indexPool,
@@ -222,6 +226,7 @@ type config struct {
 	CacheDir        string
 	ReposManifest   string
 	BearerToken     string
+	GitHubToken     string
 	WebhookSecret   string
 	Concurrency     int
 	IndexerClients  int
@@ -261,6 +266,7 @@ func loadConfig() config {
 		CacheDir:        getEnv("FLEET_CACHE_DIR", "/app/fleet-cache"),
 		ReposManifest:   getEnv("REPOS_MANIFEST", defaultManifestPath()),
 		BearerToken:     getEnv("BEARER_TOKEN", ""),
+		GitHubToken:     getEnv("GITHUB_TOKEN", ""),
 		WebhookSecret:   getEnv("GITHUB_WEBHOOK_SECRET", ""),
 		Concurrency:     concurrency,
 		IndexerClients:  getIndexerClients(concurrency),
@@ -304,28 +310,29 @@ func defaultBinaryPath() string {
 
 // gitCloner implements indexer.Cloner using git CLI.
 type gitCloner struct {
-	logger *slog.Logger
+	logger      *slog.Logger
+	githubToken string
 }
 
 func (g *gitCloner) EnsureClone(ctx context.Context, githubURL, localPath string) error {
 	if _, err := os.Stat(filepath.Join(localPath, ".git")); err == nil {
 		// Already cloned — fetch latest
 		g.logger.Debug("updating clone", "path", localPath)
-		cmd := exec.CommandContext(ctx, "git", "fetch", "--depth=1", "origin", "HEAD")
-		cmd.Dir = localPath
+		cmd := g.gitCommand(ctx, localPath, githubURL, "fetch", "--depth=1", "origin", "HEAD")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			if isGitHubHTTPSAuthError(string(out)) {
 				g.logger.Warn("git fetch auth failed, using existing clone", "path", localPath)
-				return nil
+				if err := g.restoreWorkingTree(ctx, githubURL, localPath, "HEAD"); err != nil {
+					return err
+				}
+				return g.validateClone(localPath)
 			}
 			return fmt.Errorf("git fetch: %w\n%s", err, out)
 		}
-		cmd = exec.CommandContext(ctx, "git", "reset", "--hard", "FETCH_HEAD")
-		cmd.Dir = localPath
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("git reset: %w\n%s", err, out)
+		if err := g.restoreWorkingTree(ctx, githubURL, localPath, "FETCH_HEAD"); err != nil {
+			return err
 		}
-		return nil
+		return g.validateClone(localPath)
 	}
 	// Fresh clone
 	if err := os.MkdirAll(localPath, 0750); err != nil {
@@ -336,15 +343,80 @@ func (g *gitCloner) EnsureClone(ctx context.Context, githubURL, localPath string
 	g.logger.Info("cloning repo", "url", githubURL, "path", localPath)
 	cloneCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(cloneCtx, "git", "clone", "--depth=1", githubURL, localPath)
+	cmd := g.gitCommand(cloneCtx, "", githubURL, "clone", "--depth=1", githubURL, localPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git clone %q: %w\n%s", githubURL, err, out)
 	}
-	return nil
+	return g.validateClone(localPath)
 }
 
 func isGitHubHTTPSAuthError(output string) bool {
 	return strings.Contains(output, "could not read Username for 'https://github.com'")
+}
+
+func (g *gitCloner) gitCommand(ctx context.Context, dir, githubURL string, args ...string) *exec.Cmd {
+	gitArgs := make([]string, 0, len(args)+4)
+	if g.githubToken != "" && strings.HasPrefix(githubURL, "https://github.com/") {
+		auth := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + g.githubToken))
+		gitArgs = append(gitArgs,
+			"-c", "credential.helper=",
+			"-c", "http.https://github.com/.extraheader=AUTHORIZATION: basic "+auth,
+		)
+	}
+	gitArgs = append(gitArgs, args...)
+	cmd := exec.CommandContext(ctx, "git", gitArgs...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	return cmd
+}
+
+func (g *gitCloner) restoreWorkingTree(ctx context.Context, githubURL, localPath, ref string) error {
+	cmd := g.gitCommand(ctx, localPath, githubURL, "reset", "--hard", ref)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git reset --hard %s: %w\n%s", ref, err, out)
+	}
+	cmd = g.gitCommand(ctx, localPath, githubURL, "clean", "-fd")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git clean -fd: %w\n%s", err, out)
+	}
+	return nil
+}
+
+func (g *gitCloner) validateClone(localPath string) error {
+	ok, err := hasWorkingTreeFiles(localPath)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("clone at %q has no checked out files", localPath)
+	}
+	return nil
+}
+
+func hasWorkingTreeFiles(root string) (bool, error) {
+	var found bool
+	stop := errors.New("found working tree file")
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == root {
+			return nil
+		}
+		if info.IsDir() {
+			if info.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		found = true
+		return stop
+	})
+	if err != nil && !errors.Is(err, stop) {
+		return false, err
+	}
+	return found, nil
 }
 
 type indexToolClient interface {
