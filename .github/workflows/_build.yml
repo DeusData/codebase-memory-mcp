@@ -81,7 +81,7 @@ jobs:
           tar -czf codebase-memory-mcp-ui-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
             -C build/c codebase-memory-mcp LICENSE install.sh
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
           path: "*.tar.gz"
@@ -130,7 +130,7 @@ jobs:
           cp "$BIN" codebase-memory-mcp.exe
           zip codebase-memory-mcp-ui-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binaries-windows-amd64
           path: "*.zip"
@@ -181,7 +181,7 @@ jobs:
           tar -czf codebase-memory-mcp-ui-linux-${{ matrix.arch }}-portable.tar.gz \
             -C build/c codebase-memory-mcp LICENSE install.sh
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binaries-linux-${{ matrix.arch }}-portable
           path: "*.tar.gz"

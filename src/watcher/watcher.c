@@ -20,6 +20,7 @@
 #include "foundation/log.h"
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
+#include "foundation/compat_thread.h"
 #include "foundation/compat_fs.h"
 #include "foundation/str_util.h"
 
@@ -50,6 +51,7 @@ struct cbm_watcher {
     cbm_index_fn index_fn;
     void *user_data;
     CBMHashTable *projects; /* name → project_state_t* */
+    cbm_mutex_t projects_lock;
     atomic_int stopped;
 };
 
@@ -236,6 +238,7 @@ cbm_watcher_t *cbm_watcher_new(cbm_store_t *store, cbm_index_fn index_fn, void *
     w->index_fn = index_fn;
     w->user_data = user_data;
     w->projects = cbm_ht_create(CBM_SZ_32);
+    cbm_mutex_init(&w->projects_lock);
     atomic_init(&w->stopped, 0);
     return w;
 }
@@ -244,8 +247,11 @@ void cbm_watcher_free(cbm_watcher_t *w) {
     if (!w) {
         return;
     }
+    cbm_mutex_lock(&w->projects_lock);
     cbm_ht_foreach(w->projects, free_state_entry, NULL);
     cbm_ht_free(w->projects);
+    cbm_mutex_unlock(&w->projects_lock);
+    cbm_mutex_destroy(&w->projects_lock);
     free(w);
 }
 
@@ -264,6 +270,7 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
     }
 
     /* Remove old entry first (key points to state's project_name) */
+    cbm_mutex_lock(&w->projects_lock);
     project_state_t *old = cbm_ht_get(w->projects, project_name);
     if (old) {
         cbm_ht_delete(w->projects, project_name);
@@ -271,7 +278,13 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
     }
 
     project_state_t *s = state_new(project_name, root_path);
+    if (!s) {
+        cbm_mutex_unlock(&w->projects_lock);
+        cbm_log_warn("watcher.watch.oom", "project", project_name, "path", root_path);
+        return;
+    }
     cbm_ht_set(w->projects, s->project_name, s);
+    cbm_mutex_unlock(&w->projects_lock);
     cbm_log_info("watcher.watch", "project", project_name, "path", root_path);
 }
 
@@ -279,10 +292,16 @@ void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name) {
     if (!w || !project_name) {
         return;
     }
+    bool removed = false;
+    cbm_mutex_lock(&w->projects_lock);
     project_state_t *s = cbm_ht_get(w->projects, project_name);
     if (s) {
         cbm_ht_delete(w->projects, project_name);
         state_free(s);
+        removed = true;
+    }
+    cbm_mutex_unlock(&w->projects_lock);
+    if (removed) {
         cbm_log_info("watcher.unwatch", "project", project_name);
     }
 }
@@ -291,18 +310,23 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name) {
     if (!w || !project_name) {
         return;
     }
+    cbm_mutex_lock(&w->projects_lock);
     project_state_t *s = cbm_ht_get(w->projects, project_name);
     if (s) {
         /* Reset backoff — poll immediately on next cycle */
         s->next_poll_ns = 0;
     }
+    cbm_mutex_unlock(&w->projects_lock);
 }
 
 int cbm_watcher_watch_count(const cbm_watcher_t *w) {
     if (!w) {
         return 0;
     }
-    return (int)cbm_ht_count(w->projects);
+    cbm_mutex_lock(&((cbm_watcher_t *)w)->projects_lock);
+    int count = (int)cbm_ht_count(w->projects);
+    cbm_mutex_unlock(&((cbm_watcher_t *)w)->projects_lock);
+    return count;
 }
 
 /* ── Single poll cycle ──────────────────────────────────────────── */
@@ -411,17 +435,53 @@ static void poll_project(const char *key, void *val, void *ud) {
     s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
 }
 
+/* Callback to snapshot project state pointers into an array. */
+typedef struct {
+    project_state_t **items;
+    int count;
+    int cap;
+} snapshot_ctx_t;
+
+static void snapshot_project(const char *key, void *val, void *ud) {
+    (void)key;
+    snapshot_ctx_t *sc = ud;
+    if (val && sc->count < sc->cap) {
+        sc->items[sc->count++] = val;
+    }
+}
+
 int cbm_watcher_poll_once(cbm_watcher_t *w) {
     if (!w) {
         return 0;
     }
+
+    /* Snapshot project pointers under lock, then poll without holding it.
+     * This keeps the critical section small — poll_project does git I/O
+     * and may invoke index_fn which runs the full pipeline. */
+    cbm_mutex_lock(&w->projects_lock);
+    int n = cbm_ht_count(w->projects);
+    if (n == 0) {
+        cbm_mutex_unlock(&w->projects_lock);
+        return 0;
+    }
+    project_state_t **snap = malloc(n * sizeof(project_state_t *));
+    if (!snap) {
+        cbm_mutex_unlock(&w->projects_lock);
+        return 0;
+    }
+    snapshot_ctx_t sc = {.items = snap, .count = 0, .cap = n};
+    cbm_ht_foreach(w->projects, snapshot_project, &sc);
+    cbm_mutex_unlock(&w->projects_lock);
 
     poll_ctx_t ctx = {
         .w = w,
         .now = now_ns(),
         .reindexed = 0,
     };
-    cbm_ht_foreach(w->projects, poll_project, &ctx);
+    for (int i = 0; i < sc.count; i++) {
+        poll_project(NULL, snap[i], &ctx);
+    }
+    free(snap);
     return ctx.reindexed;
 }
 
