@@ -2118,7 +2118,7 @@ static const char *binding_get_virtual(binding_t *b, const char *var, const char
     /* Fall through to normal lookup */
     cbm_edge_t *e = binding_get_edge(b, var);
     if (e) {
-        return prop ? edge_prop(e, prop) : "";
+        return prop ? edge_prop(e, prop) : (e->properties_json ? e->properties_json : "{}");
     }
     cbm_node_t *n = binding_get(b, var);
     if (n) {

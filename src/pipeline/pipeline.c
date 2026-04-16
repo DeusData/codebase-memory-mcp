@@ -733,12 +733,13 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     }
 
     int gh_edges = 0;
-    if (gh_result.count > 0) {
+    if (gh_result.count > 0 || gh_result.file_temporal_count > 0) {
         gh_edges = cbm_pipeline_githistory_apply(ctx, &gh_result);
     }
     cbm_log_info("pass.done", "pass", "githistory", "commits", itoa_buf(gh_result.commit_count),
                  "edges", itoa_buf(gh_edges));
     free(gh_result.couplings);
+    free(gh_result.file_temporal);
     return 0;
 }
 

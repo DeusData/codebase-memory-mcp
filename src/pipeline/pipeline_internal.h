@@ -14,6 +14,7 @@
 #include "foundation/hash_table.h"
 #include "cbm.h"
 #include <stdatomic.h>
+#include <time.h>
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
@@ -111,12 +112,14 @@ typedef struct {
     char file_b[CBM_SZ_512];
     int co_change_count;
     double coupling_score;
+    time_t last_co_change;   /* unix epoch of most recent co-change commit */
 } cbm_change_coupling_t;
 
 /* Commit data for coupling analysis */
 typedef struct {
     char **files;
     int count;
+    time_t timestamp;        /* unix epoch of this commit */
 } cbm_commit_files_t;
 
 /* Compute change coupling from commit history.
@@ -372,11 +375,23 @@ int cbm_pipeline_pass_tests(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
 int cbm_pipeline_pass_githistory(cbm_pipeline_ctx_t *ctx);
 
+/* Per-file temporal data produced by the git history pass. */
+typedef struct {
+    char file_path[CBM_SZ_512];
+    int  change_count;
+    time_t last_modified;    /* unix epoch of most recent commit touching this file */
+} cbm_file_temporal_t;
+
+/* Maximum number of files tracked for temporal metadata. */
+#define MAX_FILE_TEMPORAL 16384
+
 /* Pre-computed git history result for fused post-pass parallelism. */
 typedef struct {
     cbm_change_coupling_t *couplings;
     int count;
     int commit_count;
+    cbm_file_temporal_t *file_temporal;  /* heap-alloc'd array of per-file temporal data */
+    int file_temporal_count;
 } cbm_githistory_result_t;
 
 /* Compute change couplings without touching the graph buffer.
