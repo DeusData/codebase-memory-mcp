@@ -332,6 +332,8 @@ static cbm_mcp_server_t *setup_mcp_with_data(void) {
     return srv;
 }
 
+static char *extract_text_content(const char *mcp_result);
+
 TEST(tool_list_projects_empty) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
 
@@ -345,6 +347,82 @@ TEST(tool_list_projects_empty) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_list_projects_uses_indexed_project_metadata) {
+    char tmp_dir[256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm_projects_test_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp_dir));
+
+    const char *old_cache_dir = getenv("CBM_CACHE_DIR");
+    char old_cache_dir_buf[512] = "";
+    if (old_cache_dir) {
+        snprintf(old_cache_dir_buf, sizeof(old_cache_dir_buf), "%s", old_cache_dir);
+    }
+    cbm_setenv("CBM_CACHE_DIR", tmp_dir, 1);
+
+    cbm_store_t *store = cbm_store_open("artifact-platform-backend");
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "platform-backend", "/workspace/platform-backend"), 0);
+
+    cbm_node_t node_a = {0};
+    node_a.project = "platform-backend";
+    node_a.label = "Function";
+    node_a.name = "HandleRequest";
+    node_a.qualified_name = "platform-backend.HandleRequest";
+    node_a.file_path = "main.go";
+    node_a.start_line = 3;
+    node_a.end_line = 5;
+    int64_t node_a_id = cbm_store_upsert_node(store, &node_a);
+
+    cbm_node_t node_b = {0};
+    node_b.project = "platform-backend";
+    node_b.label = "Function";
+    node_b.name = "ProcessOrder";
+    node_b.qualified_name = "platform-backend.ProcessOrder";
+    node_b.file_path = "main.go";
+    node_b.start_line = 7;
+    node_b.end_line = 9;
+    int64_t node_b_id = cbm_store_upsert_node(store, &node_b);
+
+    cbm_edge_t edge = {0};
+    edge.project = "platform-backend";
+    edge.source_id = node_a_id;
+    edge.target_id = node_b_id;
+    edge.type = "CALLS";
+    ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+    cbm_store_close(store);
+
+    cbm_mcp_server_t *srv = setup_mcp_with_data();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(srv, "list_projects", "{}");
+    char *resp = extract_text_content(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"platform-backend\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"root_path\":\"/workspace/platform-backend\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"nodes\":2"));
+    ASSERT_NOT_NULL(strstr(resp, "\"edges\":1"));
+    free(resp);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/artifact-platform-backend.db", tmp_dir);
+    unlink(db_path);
+    snprintf(db_path, sizeof(db_path), "%s/artifact-platform-backend.db-wal", tmp_dir);
+    unlink(db_path);
+    snprintf(db_path, sizeof(db_path), "%s/artifact-platform-backend.db-shm", tmp_dir);
+    unlink(db_path);
+    rmdir(tmp_dir);
+
+    if (old_cache_dir) {
+        cbm_setenv("CBM_CACHE_DIR", old_cache_dir_buf, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
     PASS();
 }
 
@@ -1060,6 +1138,42 @@ TEST(snippet_unique_short_name) {
     PASS();
 }
 
+TEST(snippet_absolute_file_path_returns_source) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char abs_path[512];
+    snprintf(abs_path, sizeof(abs_path), "%s/project/main.go", tmp);
+
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    cbm_node_t abs_node = {0};
+    abs_node.project = "test-project";
+    abs_node.label = "Function";
+    abs_node.name = "HandleAbsolute";
+    abs_node.qualified_name = "test-project.cmd.server.main.HandleAbsolute";
+    abs_node.file_path = abs_path;
+    abs_node.start_line = 3;
+    abs_node.end_line = 5;
+    abs_node.properties_json = "{\"signature\":\"func HandleAbsolute() error\"}";
+    ASSERT_GT(cbm_store_upsert_node(st, &abs_node), 0);
+
+    char *resp =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleAbsolute\","
+                          "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"HandleAbsolute\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"source\""));
+    ASSERT_NULL(strstr(resp, "source not available"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 /* ── TestSnippet_NameTier ─────────────────────────────────────── */
 
 TEST(snippet_name_tier) {
@@ -1692,6 +1806,7 @@ SUITE(mcp) {
 
     /* Tool handlers */
     RUN_TEST(tool_list_projects_empty);
+    RUN_TEST(tool_list_projects_uses_indexed_project_metadata);
     RUN_TEST(tool_get_graph_schema_empty);
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);
@@ -1745,6 +1860,7 @@ SUITE(mcp) {
     RUN_TEST(snippet_exact_qn);
     RUN_TEST(snippet_qn_suffix);
     RUN_TEST(snippet_unique_short_name);
+    RUN_TEST(snippet_absolute_file_path_returns_source);
     RUN_TEST(snippet_name_tier);
     RUN_TEST(snippet_ambiguous_short_name);
     RUN_TEST(snippet_not_found);
