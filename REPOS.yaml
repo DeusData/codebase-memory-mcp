@@ -1,0 +1,2897 @@
+# GHL Fleet Manifest — auto-generated from GoHighLevel GitHub org
+# DO NOT EDIT MANUALLY — regenerate with: scripts/generate-repos-manifest.sh
+# Total active repos: 480 (archived repos excluded)
+
+repos:
+  # ──────────────────── PLATFORM ──────────────────────
+  - name: a11y-injector
+    github_url: https://github.com/GoHighLevel/a11y-injector.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: api-documentation
+    github_url: https://github.com/GoHighLevel/api-documentation.git
+    team: platform
+    type: docs
+    tags: [typescript, platform]
+
+  - name: api-framework
+    github_url: https://github.com/GoHighLevel/api-framework.git
+    team: platform
+    type: library
+    tags: [typescript, platform]
+
+  - name: api-gateway
+    github_url: https://github.com/GoHighLevel/api-gateway.git
+    team: platform
+    type: service
+    tags: [csharp, platform]
+
+  - name: ARTS
+    github_url: https://github.com/GoHighLevel/ARTS.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: backstage
+    github_url: https://github.com/GoHighLevel/backstage.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: branch-test-repo
+    github_url: https://github.com/GoHighLevel/branch-test-repo.git
+    team: platform
+    type: tests
+    tags: [testing, platform]
+
+  - name: bugzy-lab
+    github_url: https://github.com/GoHighLevel/bugzy-lab.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: Build-settings
+    github_url: https://github.com/GoHighLevel/Build-settings.git
+    team: platform
+    type: other
+    tags: [lua, platform]
+
+  - name: canary-flow
+    github_url: https://github.com/GoHighLevel/canary-flow.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: cbr
+    github_url: https://github.com/GoHighLevel/cbr.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: clientportal-core
+    github_url: https://github.com/GoHighLevel/clientportal-core.git
+    team: platform
+    type: library
+    tags: [vue, vue3, platform]
+
+  - name: cloud-functions
+    github_url: https://github.com/GoHighLevel/cloud-functions.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: code-coverage
+    github_url: https://github.com/GoHighLevel/code-coverage.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: colorcounter
+    github_url: https://github.com/GoHighLevel/colorcounter.git
+    team: platform
+    type: other
+    tags: [dart, platform]
+
+  - name: context-layer
+    github_url: https://github.com/GoHighLevel/context-layer.git
+    team: platform
+    type: service
+    tags: [python, platform]
+
+  - name: Continuum
+    github_url: https://github.com/GoHighLevel/Continuum.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: critical-endpoints-servers
+    github_url: https://github.com/GoHighLevel/critical-endpoints-servers.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: crud-test
+    github_url: https://github.com/GoHighLevel/crud-test.git
+    team: platform
+    type: tests
+    tags: [typescript, testing, platform]
+
+  - name: csv-xls-exporter
+    github_url: https://github.com/GoHighLevel/csv-xls-exporter.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: custom-widgets-price-banner
+    github_url: https://github.com/GoHighLevel/custom-widgets-price-banner.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: Customer_Success_Transcription_App_V2
+    github_url: https://github.com/GoHighLevel/Customer_Success_Transcription_App_V2.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: Customer_Support_Transcription_App_V2
+    github_url: https://github.com/GoHighLevel/Customer_Support_Transcription_App_V2.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: debounce-service
+    github_url: https://github.com/GoHighLevel/debounce-service.git
+    team: platform
+    type: service
+    tags: [python, platform]
+
+  - name: deployment-bot
+    github_url: https://github.com/GoHighLevel/deployment-bot.git
+    team: platform
+    type: infra
+    tags: [shell, platform]
+
+  - name: dev-charon
+    github_url: https://github.com/GoHighLevel/dev-charon.git
+    team: platform
+    type: service
+    tags: [go, platform]
+
+  - name: dev-charon-assets-viewer
+    github_url: https://github.com/GoHighLevel/dev-charon-assets-viewer.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: dev-commerce-applications
+    github_url: https://github.com/GoHighLevel/dev-commerce-applications.git
+    team: platform
+    type: frontend
+    tags: [go, platform]
+
+  - name: dev-commerce-documentx
+    github_url: https://github.com/GoHighLevel/dev-commerce-documentx.git
+    team: platform
+    type: service
+    tags: [go, platform]
+
+  - name: dev-commerce-engine
+    github_url: https://github.com/GoHighLevel/dev-commerce-engine.git
+    team: platform
+    type: service
+    tags: [go, platform]
+
+  - name: dev-commerce-frontend
+    github_url: https://github.com/GoHighLevel/dev-commerce-frontend.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: dev-commerce-img-optimiser
+    github_url: https://github.com/GoHighLevel/dev-commerce-img-optimiser.git
+    team: platform
+    type: other
+    tags: [c, platform]
+
+  - name: dev-commerce-ledgerx
+    github_url: https://github.com/GoHighLevel/dev-commerce-ledgerx.git
+    team: platform
+    type: service
+    tags: [go, platform]
+
+  - name: dev-commerce-merchantx
+    github_url: https://github.com/GoHighLevel/dev-commerce-merchantx.git
+    team: platform
+    type: service
+    tags: [go, platform]
+
+  - name: dev-commerce-ppc
+    github_url: https://github.com/GoHighLevel/dev-commerce-ppc.git
+    team: platform
+    type: service
+    tags: [go, platform]
+
+  - name: dev-commerce-proto
+    github_url: https://github.com/GoHighLevel/dev-commerce-proto.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: dev-commerce-transaction-forensics
+    github_url: https://github.com/GoHighLevel/dev-commerce-transaction-forensics.git
+    team: platform
+    type: service
+    tags: [go, platform]
+
+  - name: dev-conventions
+    github_url: https://github.com/GoHighLevel/dev-conventions.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: dev-cursor-agents-manager
+    github_url: https://github.com/GoHighLevel/dev-cursor-agents-manager.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: dev-docs
+    github_url: https://github.com/GoHighLevel/dev-docs.git
+    team: platform
+    type: docs
+    tags: [platform]
+
+  - name: dev-mobcom-fsb-dashboard
+    github_url: https://github.com/GoHighLevel/dev-mobcom-fsb-dashboard.git
+    team: platform
+    type: frontend
+    tags: [go, platform]
+
+  - name: DevCapture
+    github_url: https://github.com/GoHighLevel/DevCapture.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: devlab-internal
+    github_url: https://github.com/GoHighLevel/devlab-internal.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: disassemble-batch
+    github_url: https://github.com/GoHighLevel/disassemble-batch.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: docker-nginx-auto-ssl
+    github_url: https://github.com/GoHighLevel/docker-nginx-auto-ssl.git
+    team: platform
+    type: infra
+    tags: [shell, platform]
+
+  - name: document-chrome-extension
+    github_url: https://github.com/GoHighLevel/document-chrome-extension.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: documents-contracts-rich-text-mvp
+    github_url: https://github.com/GoHighLevel/documents-contracts-rich-text-mvp.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: electron-push-receiver
+    github_url: https://github.com/GoHighLevel/electron-push-receiver.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: email-builder-service
+    github_url: https://github.com/GoHighLevel/email-builder-service.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: email-builder-tools
+    github_url: https://github.com/GoHighLevel/email-builder-tools.git
+    team: platform
+    type: tooling
+    tags: [javascript, platform]
+
+  - name: engram
+    github_url: https://github.com/GoHighLevel/engram.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ent-reports
+    github_url: https://github.com/GoHighLevel/ent-reports.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: events-backend
+    github_url: https://github.com/GoHighLevel/events-backend.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: events-frontend
+    github_url: https://github.com/GoHighLevel/events-frontend.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: fd-test
+    github_url: https://github.com/GoHighLevel/fd-test.git
+    team: platform
+    type: tests
+    tags: [vue, vue3, testing, platform]
+
+  - name: figma-importer-plugin
+    github_url: https://github.com/GoHighLevel/figma-importer-plugin.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: FigmaJSONtoComponent
+    github_url: https://github.com/GoHighLevel/FigmaJSONtoComponent.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: firestore-rules
+    github_url: https://github.com/GoHighLevel/firestore-rules.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: flutter-ffmpeg-kit
+    github_url: https://github.com/GoHighLevel/flutter-ffmpeg-kit.git
+    team: platform
+    type: other
+    tags: [c, platform]
+
+  - name: flutter-layrkit
+    github_url: https://github.com/GoHighLevel/flutter-layrkit.git
+    team: platform
+    type: other
+    tags: [dart, platform]
+
+  - name: flutter-official-packages
+    github_url: https://github.com/GoHighLevel/flutter-official-packages.git
+    team: platform
+    type: library
+    tags: [platform]
+
+  - name: flutter_html
+    github_url: https://github.com/GoHighLevel/flutter_html.git
+    team: platform
+    type: other
+    tags: [dart, platform]
+
+  - name: flutter_icon54
+    github_url: https://github.com/GoHighLevel/flutter_icon54.git
+    team: platform
+    type: other
+    tags: [dart, platform]
+
+  - name: flutter_launcher_icons
+    github_url: https://github.com/GoHighLevel/flutter_launcher_icons.git
+    team: platform
+    type: other
+    tags: [dart, platform]
+
+  - name: flutter_native_splash
+    github_url: https://github.com/GoHighLevel/flutter_native_splash.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: flutter_untitled_ui_icons
+    github_url: https://github.com/GoHighLevel/flutter_untitled_ui_icons.git
+    team: platform
+    type: other
+    tags: [dart, platform]
+
+  - name: freshdesk-indexer-ts
+    github_url: https://github.com/GoHighLevel/freshdesk-indexer-ts.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: freshdesk-indexer-ts-v2
+    github_url: https://github.com/GoHighLevel/freshdesk-indexer-ts-v2.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: frontend-codemods
+    github_url: https://github.com/GoHighLevel/frontend-codemods.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: frontend-debugger
+    github_url: https://github.com/GoHighLevel/frontend-debugger.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: frontend-memory-leaks
+    github_url: https://github.com/GoHighLevel/frontend-memory-leaks.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: frontend-performance-utils
+    github_url: https://github.com/GoHighLevel/frontend-performance-utils.git
+    team: platform
+    type: library
+    tags: [typescript, platform]
+
+  - name: frontend-utils
+    github_url: https://github.com/GoHighLevel/frontend-utils.git
+    team: platform
+    type: library
+    tags: [platform]
+
+  - name: ghl-agentic-workspace
+    github_url: https://github.com/GoHighLevel/ghl-agentic-workspace.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ghl-api-collection
+    github_url: https://github.com/GoHighLevel/ghl-api-collection.git
+    team: platform
+    type: service
+    tags: [platform]
+
+  - name: ghl-auth3
+    github_url: https://github.com/GoHighLevel/ghl-auth3.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ghl-awesome-onboarding
+    github_url: https://github.com/GoHighLevel/ghl-awesome-onboarding.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: ghl-awesome-studio
+    github_url: https://github.com/GoHighLevel/ghl-awesome-studio.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: ghl-backend-repo-template
+    github_url: https://github.com/GoHighLevel/ghl-backend-repo-template.git
+    team: platform
+    type: service
+    tags: [dockerfile, platform]
+
+  - name: ghl-brand-boards
+    github_url: https://github.com/GoHighLevel/ghl-brand-boards.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: ghl-browser-mcp
+    github_url: https://github.com/GoHighLevel/ghl-browser-mcp.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, mcp, platform]
+
+  - name: ghl-bulk-request
+    github_url: https://github.com/GoHighLevel/ghl-bulk-request.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ghl-codebase-mcp
+    github_url: https://github.com/GoHighLevel/ghl-codebase-mcp.git
+    team: platform
+    type: library
+    tags: [go, mcp, platform]
+
+  - name: ghl-context-builder
+    github_url: https://github.com/GoHighLevel/ghl-context-builder.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: ghl-ctk-date-time-picker
+    github_url: https://github.com/GoHighLevel/ghl-ctk-date-time-picker.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: ghl-cursor-rules
+    github_url: https://github.com/GoHighLevel/ghl-cursor-rules.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: ghl-cursor-skills
+    github_url: https://github.com/GoHighLevel/ghl-cursor-skills.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: ghl-cursor-skills-mcp
+    github_url: https://github.com/GoHighLevel/ghl-cursor-skills-mcp.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, mcp, platform]
+
+  - name: GHL-Design-Memory
+    github_url: https://github.com/GoHighLevel/GHL-Design-Memory.git
+    team: platform
+    type: service
+    tags: [python, platform]
+
+  - name: ghl-desktop-app
+    github_url: https://github.com/GoHighLevel/ghl-desktop-app.git
+    team: platform
+    type: frontend
+    tags: [typescript, platform]
+
+  - name: ghl-docs-hub
+    github_url: https://github.com/GoHighLevel/ghl-docs-hub.git
+    team: platform
+    type: docs
+    tags: [typescript, platform]
+
+  - name: ghl-electron-desktop-apps-test
+    github_url: https://github.com/GoHighLevel/ghl-electron-desktop-apps-test.git
+    team: platform
+    type: frontend
+    tags: [testing, platform]
+
+  - name: ghl-external-tracking
+    github_url: https://github.com/GoHighLevel/ghl-external-tracking.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ghl-federation-dashboard
+    github_url: https://github.com/GoHighLevel/ghl-federation-dashboard.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: ghl-github-pr-dashboard
+    github_url: https://github.com/GoHighLevel/ghl-github-pr-dashboard.git
+    team: platform
+    type: frontend
+    tags: [javascript, platform]
+
+  - name: ghl-helm-charts
+    github_url: https://github.com/GoHighLevel/ghl-helm-charts.git
+    team: platform
+    type: infra
+    tags: [smarty, platform]
+
+  - name: ghl-i18n-feedback
+    github_url: https://github.com/GoHighLevel/ghl-i18n-feedback.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: ghl-icons
+    github_url: https://github.com/GoHighLevel/ghl-icons.git
+    team: platform
+    type: other
+    tags: [shell, platform]
+
+  - name: ghl-image-py
+    github_url: https://github.com/GoHighLevel/ghl-image-py.git
+    team: platform
+    type: service
+    tags: [python, platform]
+
+  - name: ghl-isv-app
+    github_url: https://github.com/GoHighLevel/ghl-isv-app.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: ghl-kollab-ci-certificates
+    github_url: https://github.com/GoHighLevel/ghl-kollab-ci-certificates.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: ghl-leadgen-countdowntimer
+    github_url: https://github.com/GoHighLevel/ghl-leadgen-countdowntimer.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: ghl-leadgen-frontend
+    github_url: https://github.com/GoHighLevel/ghl-leadgen-frontend.git
+    team: platform
+    type: frontend
+    tags: [platform]
+
+  - name: ghl-liquibase
+    github_url: https://github.com/GoHighLevel/ghl-liquibase.git
+    team: platform
+    type: other
+    tags: [shell, platform]
+
+  - name: ghl-localisation-v2
+    github_url: https://github.com/GoHighLevel/ghl-localisation-v2.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ghl-localization
+    github_url: https://github.com/GoHighLevel/ghl-localization.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ghl-magic-studio
+    github_url: https://github.com/GoHighLevel/ghl-magic-studio.git
+    team: platform
+    type: other
+    tags: [dockerfile, platform]
+
+  - name: ghl-manifest-viewer
+    github_url: https://github.com/GoHighLevel/ghl-manifest-viewer.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: ghl-mcp-server
+    github_url: https://github.com/GoHighLevel/ghl-mcp-server.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, mcp, platform]
+
+  - name: ghl-media-center
+    github_url: https://github.com/GoHighLevel/ghl-media-center.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ghl-mobile-app-customiser
+    github_url: https://github.com/GoHighLevel/ghl-mobile-app-customiser.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: ghl-mobile-ci-certificates
+    github_url: https://github.com/GoHighLevel/ghl-mobile-ci-certificates.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: ghl-module-federation-plugin
+    github_url: https://github.com/GoHighLevel/ghl-module-federation-plugin.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ghl-monorepo-boilerplate
+    github_url: https://github.com/GoHighLevel/ghl-monorepo-boilerplate.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ghl-moz-header
+    github_url: https://github.com/GoHighLevel/ghl-moz-header.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: ghl-nestjs-boilerplate
+    github_url: https://github.com/GoHighLevel/ghl-nestjs-boilerplate.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: ghl-ofa
+    github_url: https://github.com/GoHighLevel/ghl-ofa.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ghl-operations
+    github_url: https://github.com/GoHighLevel/ghl-operations.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: ghl-pam-logging
+    github_url: https://github.com/GoHighLevel/ghl-pam-logging.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: ghl-pdf-compliance
+    github_url: https://github.com/GoHighLevel/ghl-pdf-compliance.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ghl-plugins
+    github_url: https://github.com/GoHighLevel/ghl-plugins.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: ghl-poc
+    github_url: https://github.com/GoHighLevel/ghl-poc.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: ghl-pr-ops
+    github_url: https://github.com/GoHighLevel/ghl-pr-ops.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: ghl-pr-tracker
+    github_url: https://github.com/GoHighLevel/ghl-pr-tracker.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ghl-proposals
+    github_url: https://github.com/GoHighLevel/ghl-proposals.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: ghl-public-apis
+    github_url: https://github.com/GoHighLevel/ghl-public-apis.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ghl-public-library-ssr
+    github_url: https://github.com/GoHighLevel/ghl-public-library-ssr.git
+    team: platform
+    type: library
+    tags: [vue, vue3, platform]
+
+  - name: ghl-qr-code
+    github_url: https://github.com/GoHighLevel/ghl-qr-code.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: ghl-qr-server
+    github_url: https://github.com/GoHighLevel/ghl-qr-server.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ghl-rbac-test-suite
+    github_url: https://github.com/GoHighLevel/ghl-rbac-test-suite.git
+    team: platform
+    type: tests
+    tags: [typescript, testing, platform]
+
+  - name: ghl-repoatlas
+    github_url: https://github.com/GoHighLevel/ghl-repoatlas.git
+    team: platform
+    type: service
+    tags: [python, platform]
+
+  - name: ghl-route-registry
+    github_url: https://github.com/GoHighLevel/ghl-route-registry.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ghl-sdk-examples
+    github_url: https://github.com/GoHighLevel/ghl-sdk-examples.git
+    team: platform
+    type: library
+    tags: [html, platform]
+
+  - name: ghl-sdk-generator
+    github_url: https://github.com/GoHighLevel/ghl-sdk-generator.git
+    team: platform
+    type: library
+    tags: [handlebars, platform]
+
+  - name: ghl-seo-app
+    github_url: https://github.com/GoHighLevel/ghl-seo-app.git
+    team: platform
+    type: frontend
+    tags: [typescript, platform]
+
+  - name: ghl-ssr-boilerplate
+    github_url: https://github.com/GoHighLevel/ghl-ssr-boilerplate.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ghl-template-library
+    github_url: https://github.com/GoHighLevel/ghl-template-library.git
+    team: platform
+    type: library
+    tags: [typescript, platform]
+
+  - name: ghl-test-management
+    github_url: https://github.com/GoHighLevel/ghl-test-management.git
+    team: platform
+    type: tests
+    tags: [testing, platform]
+
+  - name: ghl-test-platform
+    github_url: https://github.com/GoHighLevel/ghl-test-platform.git
+    team: platform
+    type: tests
+    tags: [vue, vue3, testing, platform]
+
+  - name: ghl-text-editor
+    github_url: https://github.com/GoHighLevel/ghl-text-editor.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ghl-tourguide
+    github_url: https://github.com/GoHighLevel/ghl-tourguide.git
+    team: platform
+    type: docs
+    tags: [typescript, platform]
+
+  - name: ghl-ui
+    github_url: https://github.com/GoHighLevel/ghl-ui.git
+    team: platform
+    type: frontend
+    tags: [typescript, platform]
+
+  - name: ghl-v2-api-docs
+    github_url: https://github.com/GoHighLevel/ghl-v2-api-docs.git
+    team: platform
+    type: service
+    tags: [platform]
+
+  - name: ghl-widgets
+    github_url: https://github.com/GoHighLevel/ghl-widgets.git
+    team: platform
+    type: frontend
+    tags: [typescript, platform]
+
+  - name: ghl_evalcore
+    github_url: https://github.com/GoHighLevel/ghl_evalcore.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, testing, platform]
+
+  - name: ghl_vision_flutter
+    github_url: https://github.com/GoHighLevel/ghl_vision_flutter.git
+    team: platform
+    type: other
+    tags: [dart, platform]
+
+  - name: ghls-pr
+    github_url: https://github.com/GoHighLevel/ghls-pr.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: giscus-ghl
+    github_url: https://github.com/GoHighLevel/giscus-ghl.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: git-jenkins-mcp
+    github_url: https://github.com/GoHighLevel/git-jenkins-mcp.git
+    team: platform
+    type: infra
+    tags: [typescript, mcp, platform]
+
+  - name: github-actions
+    github_url: https://github.com/GoHighLevel/github-actions.git
+    team: platform
+    type: other
+    tags: [dockerfile, platform]
+
+  - name: github-digest
+    github_url: https://github.com/GoHighLevel/github-digest.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: go-platform
+    github_url: https://github.com/GoHighLevel/go-platform.git
+    team: platform
+    type: service
+    tags: [go, platform]
+
+  - name: go-platform-core
+    github_url: https://github.com/GoHighLevel/go-platform-core.git
+    team: platform
+    type: library
+    tags: [go, platform]
+
+  - name: GoHighLevel
+    github_url: https://github.com/GoHighLevel/GoHighLevel.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: grafana-report-generator
+    github_url: https://github.com/GoHighLevel/grafana-report-generator.git
+    team: platform
+    type: tooling
+    tags: [platform]
+
+  - name: gsd-ghl
+    github_url: https://github.com/GoHighLevel/gsd-ghl.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: high-rise-flutter-colors
+    github_url: https://github.com/GoHighLevel/high-rise-flutter-colors.git
+    team: platform
+    type: other
+    tags: [dart, platform]
+
+  - name: high_canopy
+    github_url: https://github.com/GoHighLevel/high_canopy.git
+    team: platform
+    type: other
+    tags: [dart, platform]
+
+  - name: highlevel-api-docs
+    github_url: https://github.com/GoHighLevel/highlevel-api-docs.git
+    team: platform
+    type: service
+    tags: [platform]
+
+  - name: highlevel-api-php
+    github_url: https://github.com/GoHighLevel/highlevel-api-php.git
+    team: platform
+    type: service
+    tags: [php, platform]
+
+  - name: highlevel-api-python
+    github_url: https://github.com/GoHighLevel/highlevel-api-python.git
+    team: platform
+    type: service
+    tags: [python, platform]
+
+  - name: highlevel-api-sdk
+    github_url: https://github.com/GoHighLevel/highlevel-api-sdk.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: highlevel-api-sdk-private
+    github_url: https://github.com/GoHighLevel/highlevel-api-sdk-private.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: highlevel-flutter
+    github_url: https://github.com/GoHighLevel/highlevel-flutter.git
+    team: platform
+    type: other
+    tags: [dart, platform]
+
+  - name: highlevel-functions
+    github_url: https://github.com/GoHighLevel/highlevel-functions.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: highlevel-functions-temp
+    github_url: https://github.com/GoHighLevel/highlevel-functions-temp.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: highlevel-functions-utils
+    github_url: https://github.com/GoHighLevel/highlevel-functions-utils.git
+    team: platform
+    type: library
+    tags: [platform]
+
+  - name: highlevel-functions-v2
+    github_url: https://github.com/GoHighLevel/highlevel-functions-v2.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: highlevel-functions-v3
+    github_url: https://github.com/GoHighLevel/highlevel-functions-v3.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: highlevel-html
+    github_url: https://github.com/GoHighLevel/highlevel-html.git
+    team: platform
+    type: other
+    tags: [html, platform]
+
+  - name: highlevel-infrastructure
+    github_url: https://github.com/GoHighLevel/highlevel-infrastructure.git
+    team: platform
+    type: infra
+    tags: [lua, platform]
+
+  - name: highlevel-jenkins-shared-libs
+    github_url: https://github.com/GoHighLevel/highlevel-jenkins-shared-libs.git
+    team: platform
+    type: library
+    tags: [platform]
+
+  - name: highlevel-scraper
+    github_url: https://github.com/GoHighLevel/highlevel-scraper.git
+    team: platform
+    type: service
+    tags: [python, platform]
+
+  - name: highlevel.handbook.github.io
+    github_url: https://github.com/GoHighLevel/highlevel.handbook.github.io.git
+    team: platform
+    type: other
+    tags: [html, platform]
+
+  - name: highrise-figmagic
+    github_url: https://github.com/GoHighLevel/highrise-figmagic.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: highrise-flutter
+    github_url: https://github.com/GoHighLevel/highrise-flutter.git
+    team: platform
+    type: other
+    tags: [dart, platform]
+
+  - name: highrise-next
+    github_url: https://github.com/GoHighLevel/highrise-next.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: highrise-nuxt-v3-v4
+    github_url: https://github.com/GoHighLevel/highrise-nuxt-v3-v4.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, nuxt3, platform]
+
+  - name: HighRise-Tokens
+    github_url: https://github.com/GoHighLevel/HighRise-Tokens.git
+    team: platform
+    type: service
+    tags: [python, platform]
+
+  - name: HighSupply
+    github_url: https://github.com/GoHighLevel/HighSupply.git
+    team: platform
+    type: other
+    tags: [dart, platform]
+
+  - name: hist
+    github_url: https://github.com/GoHighLevel/hist.git
+    team: platform
+    type: other
+    tags: [dockerfile, platform]
+
+  - name: hl-base-utils
+    github_url: https://github.com/GoHighLevel/hl-base-utils.git
+    team: platform
+    type: library
+    tags: [typescript, platform]
+
+  - name: hl-test-manager
+    github_url: https://github.com/GoHighLevel/hl-test-manager.git
+    team: platform
+    type: tests
+    tags: [vue, vue3, testing, platform]
+
+  - name: hl-utils
+    github_url: https://github.com/GoHighLevel/hl-utils.git
+    team: platform
+    type: library
+    tags: [typescript, platform]
+
+  - name: hubspot-importer
+    github_url: https://github.com/GoHighLevel/hubspot-importer.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: hubspot-importer-poc
+    github_url: https://github.com/GoHighLevel/hubspot-importer-poc.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: hugo-book
+    github_url: https://github.com/GoHighLevel/hugo-book.git
+    team: platform
+    type: other
+    tags: [html, platform]
+
+  - name: I18_Translations_Detection_Plugin
+    github_url: https://github.com/GoHighLevel/I18_Translations_Detection_Plugin.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: i18n-analysis
+    github_url: https://github.com/GoHighLevel/i18n-analysis.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: i18n-as-a-service
+    github_url: https://github.com/GoHighLevel/i18n-as-a-service.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: i18n-test
+    github_url: https://github.com/GoHighLevel/i18n-test.git
+    team: platform
+    type: tests
+    tags: [vue, vue3, testing, platform]
+
+  - name: i18n-validator
+    github_url: https://github.com/GoHighLevel/i18n-validator.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: ideas-board-vis-frontend
+    github_url: https://github.com/GoHighLevel/ideas-board-vis-frontend.git
+    team: platform
+    type: frontend
+    tags: [html, platform]
+
+  - name: image-processing-service
+    github_url: https://github.com/GoHighLevel/image-processing-service.git
+    team: platform
+    type: service
+    tags: [go, platform]
+
+  - name: infra-q2
+    github_url: https://github.com/GoHighLevel/infra-q2.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: infrastructure-as-a-code
+    github_url: https://github.com/GoHighLevel/infrastructure-as-a-code.git
+    team: platform
+    type: infra
+    tags: [hcl, platform]
+
+  - name: instagram-webhook-native-posts
+    github_url: https://github.com/GoHighLevel/instagram-webhook-native-posts.git
+    team: platform
+    type: frontend
+    tags: [javascript, platform]
+
+  - name: internal-api-documentation
+    github_url: https://github.com/GoHighLevel/internal-api-documentation.git
+    team: platform
+    type: service
+    tags: [platform]
+
+  - name: internaltools-migrations
+    github_url: https://github.com/GoHighLevel/internaltools-migrations.git
+    team: platform
+    type: tooling
+    tags: [typescript, platform]
+
+  - name: isv-monitoring-service
+    github_url: https://github.com/GoHighLevel/isv-monitoring-service.git
+    team: platform
+    type: service
+    tags: [platform]
+
+  - name: Jobber-App-React
+    github_url: https://github.com/GoHighLevel/Jobber-App-React.git
+    team: platform
+    type: frontend
+    tags: [platform]
+
+  - name: kubernetes-mixin
+    github_url: https://github.com/GoHighLevel/kubernetes-mixin.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: langflow
+    github_url: https://github.com/GoHighLevel/langflow.git
+    team: platform
+    type: service
+    tags: [python, platform]
+
+  - name: langfuse
+    github_url: https://github.com/GoHighLevel/langfuse.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: langfuse-region-migration
+    github_url: https://github.com/GoHighLevel/langfuse-region-migration.git
+    team: platform
+    type: tooling
+    tags: [python, platform]
+
+  - name: lead-tracker
+    github_url: https://github.com/GoHighLevel/lead-tracker.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: leadgen-ad-publishing-frontend
+    github_url: https://github.com/GoHighLevel/leadgen-ad-publishing-frontend.git
+    team: platform
+    type: frontend
+    tags: [typescript, platform]
+
+  - name: leadgen-admin
+    github_url: https://github.com/GoHighLevel/leadgen-admin.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: leadgen-backend
+    github_url: https://github.com/GoHighLevel/leadgen-backend.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: leadgen-backend-python
+    github_url: https://github.com/GoHighLevel/leadgen-backend-python.git
+    team: platform
+    type: service
+    tags: [python, platform]
+
+  - name: leadgen-cache-server
+    github_url: https://github.com/GoHighLevel/leadgen-cache-server.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: leadgen-customer-access-center
+    github_url: https://github.com/GoHighLevel/leadgen-customer-access-center.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: leadgen-fastpaydirect-static
+    github_url: https://github.com/GoHighLevel/leadgen-fastpaydirect-static.git
+    team: platform
+    type: other
+    tags: [html, platform]
+
+  - name: leadgen-ipinfo
+    github_url: https://github.com/GoHighLevel/leadgen-ipinfo.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: leadgen-kaizen-backend
+    github_url: https://github.com/GoHighLevel/leadgen-kaizen-backend.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: leadgen-loyalty-frontend
+    github_url: https://github.com/GoHighLevel/leadgen-loyalty-frontend.git
+    team: platform
+    type: frontend
+    tags: [typescript, platform]
+
+  - name: leadgen-store-frontend
+    github_url: https://github.com/GoHighLevel/leadgen-store-frontend.git
+    team: platform
+    type: frontend
+    tags: [typescript, platform]
+
+  - name: leadgen-tests
+    github_url: https://github.com/GoHighLevel/leadgen-tests.git
+    team: platform
+    type: tests
+    tags: [typescript, testing, platform]
+
+  - name: lighthouse-worker
+    github_url: https://github.com/GoHighLevel/lighthouse-worker.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, worker, platform]
+
+  - name: localization-lib
+    github_url: https://github.com/GoHighLevel/localization-lib.git
+    team: platform
+    type: library
+    tags: [javascript, platform]
+
+  - name: location-prospect
+    github_url: https://github.com/GoHighLevel/location-prospect.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: logger-rust
+    github_url: https://github.com/GoHighLevel/logger-rust.git
+    team: platform
+    type: service
+    tags: [rust, platform]
+
+  - name: mail_beam
+    github_url: https://github.com/GoHighLevel/mail_beam.git
+    team: platform
+    type: other
+    tags: [php, platform]
+
+  - name: manifest
+    github_url: https://github.com/GoHighLevel/manifest.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: mcpserver-rules
+    github_url: https://github.com/GoHighLevel/mcpserver-rules.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: mimt-proxy
+    github_url: https://github.com/GoHighLevel/mimt-proxy.git
+    team: platform
+    type: service
+    tags: [python, platform]
+
+  - name: mobile-backend
+    github_url: https://github.com/GoHighLevel/mobile-backend.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: mobile-patch-release-dispatch
+    github_url: https://github.com/GoHighLevel/mobile-patch-release-dispatch.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: mobile-pipeline-auditor
+    github_url: https://github.com/GoHighLevel/mobile-pipeline-auditor.git
+    team: platform
+    type: infra
+    tags: [go, platform]
+
+  - name: mobile-prds
+    github_url: https://github.com/GoHighLevel/mobile-prds.git
+    team: platform
+    type: other
+    tags: [css, platform]
+
+  - name: mobile-whitelabelcustomizer-dasboard
+    github_url: https://github.com/GoHighLevel/mobile-whitelabelcustomizer-dasboard.git
+    team: platform
+    type: other
+    tags: [dart, platform]
+
+  - name: mobile_native_app_theme
+    github_url: https://github.com/GoHighLevel/mobile_native_app_theme.git
+    team: platform
+    type: other
+    tags: [dart, platform]
+
+  - name: Module-Federated-Code-generator
+    github_url: https://github.com/GoHighLevel/Module-Federated-Code-generator.git
+    team: platform
+    type: tooling
+    tags: [javascript, platform]
+
+  - name: MoltClaw-by-HighLevel
+    github_url: https://github.com/GoHighLevel/MoltClaw-by-HighLevel.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: naive-ui
+    github_url: https://github.com/GoHighLevel/naive-ui.git
+    team: platform
+    type: frontend
+    tags: [typescript, platform]
+
+  - name: nginx-vod-module
+    github_url: https://github.com/GoHighLevel/nginx-vod-module.git
+    team: platform
+    type: service
+    tags: [go, platform]
+
+  - name: nik-shivam
+    github_url: https://github.com/GoHighLevel/nik-shivam.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: nodejs-logging
+    github_url: https://github.com/GoHighLevel/nodejs-logging.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: nodejs-logging-bunyan
+    github_url: https://github.com/GoHighLevel/nodejs-logging-bunyan.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: nuxt-highrise-module
+    github_url: https://github.com/GoHighLevel/nuxt-highrise-module.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, nuxt3, platform]
+
+  - name: nuxt-highrise-ssr
+    github_url: https://github.com/GoHighLevel/nuxt-highrise-ssr.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, nuxt3, platform]
+
+  - name: objective-builder-ui
+    github_url: https://github.com/GoHighLevel/objective-builder-ui.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: outscrapper-ghl
+    github_url: https://github.com/GoHighLevel/outscrapper-ghl.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: pdf-core-engine
+    github_url: https://github.com/GoHighLevel/pdf-core-engine.git
+    team: platform
+    type: library
+    tags: [typescript, platform]
+
+  - name: platform-backend
+    github_url: https://github.com/GoHighLevel/platform-backend.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: platform-backend-demo
+    github_url: https://github.com/GoHighLevel/platform-backend-demo.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: platform-common-argo-apps
+    github_url: https://github.com/GoHighLevel/platform-common-argo-apps.git
+    team: platform
+    type: frontend
+    tags: [platform]
+
+  - name: platform-common-helm-charts
+    github_url: https://github.com/GoHighLevel/platform-common-helm-charts.git
+    team: platform
+    type: library
+    tags: [go-template, platform]
+
+  - name: platform-core
+    github_url: https://github.com/GoHighLevel/platform-core.git
+    team: platform
+    type: library
+    tags: [typescript, platform]
+
+  - name: platform-devtools-backend
+    github_url: https://github.com/GoHighLevel/platform-devtools-backend.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: platform-devtools-frontend
+    github_url: https://github.com/GoHighLevel/platform-devtools-frontend.git
+    team: platform
+    type: frontend
+    tags: [typescript, platform]
+
+  - name: platform-docs
+    github_url: https://github.com/GoHighLevel/platform-docs.git
+    team: platform
+    type: docs
+    tags: [html, platform]
+
+  - name: platform-experiments
+    github_url: https://github.com/GoHighLevel/platform-experiments.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: platform-frontend-backend
+    github_url: https://github.com/GoHighLevel/platform-frontend-backend.git
+    team: platform
+    type: service
+    tags: [platform]
+
+  - name: platform-frontend-docs
+    github_url: https://github.com/GoHighLevel/platform-frontend-docs.git
+    team: platform
+    type: frontend
+    tags: [platform]
+
+  - name: platform-frontend-playground
+    github_url: https://github.com/GoHighLevel/platform-frontend-playground.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: platform-infra-argo-apps
+    github_url: https://github.com/GoHighLevel/platform-infra-argo-apps.git
+    team: platform
+    type: frontend
+    tags: [platform]
+
+  - name: platform-infra-helm-charts
+    github_url: https://github.com/GoHighLevel/platform-infra-helm-charts.git
+    team: platform
+    type: infra
+    tags: [mustache, platform]
+
+  - name: platform-jenkins-shared-library
+    github_url: https://github.com/GoHighLevel/platform-jenkins-shared-library.git
+    team: platform
+    type: library
+    tags: [groovy, platform]
+
+  - name: platform-planning-internal
+    github_url: https://github.com/GoHighLevel/platform-planning-internal.git
+    team: platform
+    type: other
+    tags: [shell, platform]
+
+  - name: platform-pocs
+    github_url: https://github.com/GoHighLevel/platform-pocs.git
+    team: platform
+    type: service
+    tags: [python, platform]
+
+  - name: platform-sample-java-app
+    github_url: https://github.com/GoHighLevel/platform-sample-java-app.git
+    team: platform
+    type: frontend
+    tags: [java, platform]
+
+  - name: platform-sample-nodejs-app
+    github_url: https://github.com/GoHighLevel/platform-sample-nodejs-app.git
+    team: platform
+    type: frontend
+    tags: [typescript, platform]
+
+  - name: platform-shared-changes
+    github_url: https://github.com/GoHighLevel/platform-shared-changes.git
+    team: platform
+    type: library
+    tags: [go-template, platform]
+
+  - name: platform-templates
+    github_url: https://github.com/GoHighLevel/platform-templates.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: platform-terraform-gcp-infra
+    github_url: https://github.com/GoHighLevel/platform-terraform-gcp-infra.git
+    team: platform
+    type: infra
+    tags: [hcl, platform]
+
+  - name: platform-terraform-gcp-modules
+    github_url: https://github.com/GoHighLevel/platform-terraform-gcp-modules.git
+    team: platform
+    type: infra
+    tags: [hcl, platform]
+
+  - name: platform-ui
+    github_url: https://github.com/GoHighLevel/platform-ui.git
+    team: platform
+    type: frontend
+    tags: [typescript, platform]
+
+  - name: pocketpub
+    github_url: https://github.com/GoHighLevel/pocketpub.git
+    team: platform
+    type: other
+    tags: [dart, platform]
+
+  - name: pr-buddy
+    github_url: https://github.com/GoHighLevel/pr-buddy.git
+    team: platform
+    type: other
+    tags: [dockerfile, platform]
+
+  - name: preference-management-frontend
+    github_url: https://github.com/GoHighLevel/preference-management-frontend.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: product-central
+    github_url: https://github.com/GoHighLevel/product-central.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: project-orion
+    github_url: https://github.com/GoHighLevel/project-orion.git
+    team: platform
+    type: other
+    tags: [html, platform]
+
+  - name: pulse
+    github_url: https://github.com/GoHighLevel/pulse.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: push-docker-gcr
+    github_url: https://github.com/GoHighLevel/push-docker-gcr.git
+    team: platform
+    type: infra
+    tags: [shell, platform]
+
+  - name: quality-gates
+    github_url: https://github.com/GoHighLevel/quality-gates.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: quickchart
+    github_url: https://github.com/GoHighLevel/quickchart.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: rca-analysis
+    github_url: https://github.com/GoHighLevel/rca-analysis.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: rdialr
+    github_url: https://github.com/GoHighLevel/rdialr.git
+    team: platform
+    type: service
+    tags: [go, platform]
+
+  - name: redis-backup-cloud-function-gcp
+    github_url: https://github.com/GoHighLevel/redis-backup-cloud-function-gcp.git
+    team: platform
+    type: service
+    tags: [python, platform]
+
+  - name: revops-mozart-transforms
+    github_url: https://github.com/GoHighLevel/revops-mozart-transforms.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: revops-transcription-app
+    github_url: https://github.com/GoHighLevel/revops-transcription-app.git
+    team: platform
+    type: frontend
+    tags: [javascript, platform]
+
+  - name: revops-transcription-app-ooh
+    github_url: https://github.com/GoHighLevel/revops-transcription-app-ooh.git
+    team: platform
+    type: frontend
+    tags: [javascript, platform]
+
+  - name: Sandbox
+    github_url: https://github.com/GoHighLevel/Sandbox.git
+    team: platform
+    type: tooling
+    tags: [javascript, platform]
+
+  - name: screenshot-service
+    github_url: https://github.com/GoHighLevel/screenshot-service.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: sdet-performance-test
+    github_url: https://github.com/GoHighLevel/sdet-performance-test.git
+    team: platform
+    type: tests
+    tags: [typescript, testing, platform]
+
+  - name: sdet-platform
+    github_url: https://github.com/GoHighLevel/sdet-platform.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: sdet-platform-backend
+    github_url: https://github.com/GoHighLevel/sdet-platform-backend.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: sdet-platform-frontend
+    github_url: https://github.com/GoHighLevel/sdet-platform-frontend.git
+    team: platform
+    type: frontend
+    tags: [vue, vue3, platform]
+
+  - name: sdet-platform-performance-test
+    github_url: https://github.com/GoHighLevel/sdet-platform-performance-test.git
+    team: platform
+    type: tests
+    tags: [typescript, testing, platform]
+
+  - name: seed-module
+    github_url: https://github.com/GoHighLevel/seed-module.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: sentry
+    github_url: https://github.com/GoHighLevel/sentry.git
+    team: platform
+    type: other
+    tags: [shell, platform]
+
+  - name: single-endpoint-get-by-id-servers
+    github_url: https://github.com/GoHighLevel/single-endpoint-get-by-id-servers.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: single-endpoint-servers
+    github_url: https://github.com/GoHighLevel/single-endpoint-servers.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: sonarcloud-test-repo-public
+    github_url: https://github.com/GoHighLevel/sonarcloud-test-repo-public.git
+    team: platform
+    type: tests
+    tags: [testing, platform]
+
+  - name: sonarqube-jenkins-test
+    github_url: https://github.com/GoHighLevel/sonarqube-jenkins-test.git
+    team: platform
+    type: tests
+    tags: [typescript, testing, platform]
+
+  - name: sonarqube-jenkins-test-2
+    github_url: https://github.com/GoHighLevel/sonarqube-jenkins-test-2.git
+    team: platform
+    type: tests
+    tags: [typescript, testing, platform]
+
+  - name: Squire
+    github_url: https://github.com/GoHighLevel/Squire.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: sravanth-docs
+    github_url: https://github.com/GoHighLevel/sravanth-docs.git
+    team: platform
+    type: docs
+    tags: [html, platform]
+
+  - name: ssl-clerk
+    github_url: https://github.com/GoHighLevel/ssl-clerk.git
+    team: platform
+    type: service
+    tags: [python, platform]
+
+  - name: supportAILabs
+    github_url: https://github.com/GoHighLevel/supportAILabs.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: test-repo
+    github_url: https://github.com/GoHighLevel/test-repo.git
+    team: platform
+    type: tests
+    tags: [testing, platform]
+
+  - name: TPRA
+    github_url: https://github.com/GoHighLevel/TPRA.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: traffic-cop
+    github_url: https://github.com/GoHighLevel/traffic-cop.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: ui-ux-gap-analysis
+    github_url: https://github.com/GoHighLevel/ui-ux-gap-analysis.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: update-recent-message-service
+    github_url: https://github.com/GoHighLevel/update-recent-message-service.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: utils
+    github_url: https://github.com/GoHighLevel/utils.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: vibe-builder
+    github_url: https://github.com/GoHighLevel/vibe-builder.git
+    team: platform
+    type: service
+    tags: [python, platform]
+
+  - name: vibe-creator
+    github_url: https://github.com/GoHighLevel/vibe-creator.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: vibe-platform
+    github_url: https://github.com/GoHighLevel/vibe-platform.git
+    team: platform
+    type: service
+    tags: [go, platform]
+
+  - name: video-transcoding-service
+    github_url: https://github.com/GoHighLevel/video-transcoding-service.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: vue-ssr-demo
+    github_url: https://github.com/GoHighLevel/vue-ssr-demo.git
+    team: platform
+    type: tooling
+    tags: [typescript, platform]
+
+  - name: webstore-extensions
+    github_url: https://github.com/GoHighLevel/webstore-extensions.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: whitelabel-customizer-frontend
+    github_url: https://github.com/GoHighLevel/whitelabel-customizer-frontend.git
+    team: platform
+    type: frontend
+    tags: [dart, platform]
+
+  - name: wordpress-core
+    github_url: https://github.com/GoHighLevel/wordpress-core.git
+    team: platform
+    type: library
+    tags: [platform]
+
+  - name: wordpress-uptime-monitor
+    github_url: https://github.com/GoHighLevel/wordpress-uptime-monitor.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: Wordpress-V2-Support
+    github_url: https://github.com/GoHighLevel/Wordpress-V2-Support.git
+    team: platform
+    type: service
+    tags: [javascript, nestjs, platform]
+
+  - name: wordpress-widget
+    github_url: https://github.com/GoHighLevel/wordpress-widget.git
+    team: platform
+    type: frontend
+    tags: [javascript, platform]
+
+  - name: wordpress_plugins
+    github_url: https://github.com/GoHighLevel/wordpress_plugins.git
+    team: platform
+    type: other
+    tags: [php, platform]
+
+  - name: yarn-poc
+    github_url: https://github.com/GoHighLevel/yarn-poc.git
+    team: platform
+    type: other
+    tags: [platform]
+
+  - name: yarn-v4-nest-poc
+    github_url: https://github.com/GoHighLevel/yarn-v4-nest-poc.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  - name: zoom-scribe
+    github_url: https://github.com/GoHighLevel/zoom-scribe.git
+    team: platform
+    type: service
+    tags: [typescript, nestjs, platform]
+
+  # ──────────────────── REVEX ─────────────────────────
+  - name: assets-drm-client
+    github_url: https://github.com/GoHighLevel/assets-drm-client.git
+    team: revex
+    type: library
+    tags: [vue, vue3, revex]
+
+  - name: automation-am-client-portal
+    github_url: https://github.com/GoHighLevel/automation-am-client-portal.git
+    team: revex
+    type: frontend
+    tags: [vue, vue3, revex]
+
+  - name: communities-flutter-poc
+    github_url: https://github.com/GoHighLevel/communities-flutter-poc.git
+    team: revex
+    type: other
+    tags: [dart, revex]
+
+  - name: ghl-membership-frontend
+    github_url: https://github.com/GoHighLevel/ghl-membership-frontend.git
+    team: revex
+    type: frontend
+    tags: [typescript, revex]
+
+  - name: ghl-revex-backend
+    github_url: https://github.com/GoHighLevel/ghl-revex-backend.git
+    team: revex
+    type: service
+    tags: [typescript, nestjs, revex]
+
+  - name: ghl-revex-clientportal-apps
+    github_url: https://github.com/GoHighLevel/ghl-revex-clientportal-apps.git
+    team: revex
+    type: frontend
+    tags: [revex]
+
+  - name: ghl-revex-frontend
+    github_url: https://github.com/GoHighLevel/ghl-revex-frontend.git
+    team: revex
+    type: frontend
+    tags: [vue, vue3, revex]
+
+  - name: ghl-revex-interviews
+    github_url: https://github.com/GoHighLevel/ghl-revex-interviews.git
+    team: revex
+    type: service
+    tags: [typescript, nestjs, revex]
+
+  - name: ghl-revex-membership-frontend
+    github_url: https://github.com/GoHighLevel/ghl-revex-membership-frontend.git
+    team: revex
+    type: frontend
+    tags: [javascript, revex]
+
+  - name: membership-backend
+    github_url: https://github.com/GoHighLevel/membership-backend.git
+    team: revex
+    type: service
+    tags: [typescript, nestjs, revex]
+
+  - name: membership-flutter-app
+    github_url: https://github.com/GoHighLevel/membership-flutter-app.git
+    team: revex
+    type: frontend
+    tags: [dart, revex]
+
+  - name: membership-highline
+    github_url: https://github.com/GoHighLevel/membership-highline.git
+    team: revex
+    type: other
+    tags: [dart, revex]
+
+  - name: membership-hmi-app
+    github_url: https://github.com/GoHighLevel/membership-hmi-app.git
+    team: revex
+    type: frontend
+    tags: [vue, vue3, revex]
+
+  - name: membership-hmi-preview
+    github_url: https://github.com/GoHighLevel/membership-hmi-preview.git
+    team: revex
+    type: frontend
+    tags: [vue, vue3, revex]
+
+  - name: membership-ui-core
+    github_url: https://github.com/GoHighLevel/membership-ui-core.git
+    team: revex
+    type: frontend
+    tags: [typescript, revex]
+
+  - name: revex-pyrw-dev-helper-chrome-ext
+    github_url: https://github.com/GoHighLevel/revex-pyrw-dev-helper-chrome-ext.git
+    team: revex
+    type: service
+    tags: [javascript, nestjs, revex]
+
+  - name: revex-tests
+    github_url: https://github.com/GoHighLevel/revex-tests.git
+    team: revex
+    type: tests
+    tags: [typescript, testing, revex]
+
+  - name: revex-tools-pyrw-audit-and-automation
+    github_url: https://github.com/GoHighLevel/revex-tools-pyrw-audit-and-automation.git
+    team: revex
+    type: tooling
+    tags: [javascript, revex]
+
+  - name: revex-wordpress-internal-tools
+    github_url: https://github.com/GoHighLevel/revex-wordpress-internal-tools.git
+    team: revex
+    type: tooling
+    tags: [javascript, revex]
+
+  - name: revex-wordpress-lc-easy-migrator
+    github_url: https://github.com/GoHighLevel/revex-wordpress-lc-easy-migrator.git
+    team: revex
+    type: service
+    tags: [javascript, nestjs, revex]
+
+  - name: revex-wordpress-lc-easy-migrator-front-end
+    github_url: https://github.com/GoHighLevel/revex-wordpress-lc-easy-migrator-front-end.git
+    team: revex
+    type: frontend
+    tags: [vue, vue3, revex]
+
+  - name: revex-wordpress-leadconnector-plugin
+    github_url: https://github.com/GoHighLevel/revex-wordpress-leadconnector-plugin.git
+    team: revex
+    type: service
+    tags: [javascript, nestjs, revex]
+
+  - name: revex-wordpress-leadconnector-plugin-frontend
+    github_url: https://github.com/GoHighLevel/revex-wordpress-leadconnector-plugin-frontend.git
+    team: revex
+    type: frontend
+    tags: [vue, vue3, revex]
+
+  - name: revex-wordpress-threatlens
+    github_url: https://github.com/GoHighLevel/revex-wordpress-threatlens.git
+    team: revex
+    type: service
+    tags: [python, revex]
+
+  - name: RevexMobileTestAutomation
+    github_url: https://github.com/GoHighLevel/RevexMobileTestAutomation.git
+    team: revex
+    type: tests
+    tags: [javascript, testing, revex]
+
+  # ──────────────────── CRM ───────────────────────────
+  - name: appengine-local-taskqueue
+    github_url: https://github.com/GoHighLevel/appengine-local-taskqueue.git
+    team: crm
+    type: service
+    tags: [javascript, nestjs, worker, crm]
+
+  - name: chrome-ext-crm
+    github_url: https://github.com/GoHighLevel/chrome-ext-crm.git
+    team: crm
+    type: service
+    tags: [javascript, nestjs, crm]
+
+  - name: core-crm-tests
+    github_url: https://github.com/GoHighLevel/core-crm-tests.git
+    team: crm
+    type: tests
+    tags: [typescript, testing, crm]
+
+  - name: crm-common-libs
+    github_url: https://github.com/GoHighLevel/crm-common-libs.git
+    team: crm
+    type: library
+    tags: [typescript, crm]
+
+  - name: crm-extension-privacy-policy
+    github_url: https://github.com/GoHighLevel/crm-extension-privacy-policy.git
+    team: crm
+    type: other
+    tags: [crm]
+
+  - name: flutter_contacts
+    github_url: https://github.com/GoHighLevel/flutter_contacts.git
+    team: crm
+    type: other
+    tags: [dart, crm]
+
+  - name: ghl-crm-frontend
+    github_url: https://github.com/GoHighLevel/ghl-crm-frontend.git
+    team: crm
+    type: frontend
+    tags: [vue, vue3, crm]
+
+  - name: vibe-tagger
+    github_url: https://github.com/GoHighLevel/vibe-tagger.git
+    team: crm
+    type: service
+    tags: [typescript, nestjs, crm]
+
+  # ──────────────────── CONVERSATIONS ─────────────────
+  - name: ghl-chat-widget
+    github_url: https://github.com/GoHighLevel/ghl-chat-widget.git
+    team: conversations
+    type: frontend
+    tags: [vue, vue3, conversations]
+
+  - name: ghl-email-builder
+    github_url: https://github.com/GoHighLevel/ghl-email-builder.git
+    team: conversations
+    type: frontend
+    tags: [vue, vue3, conversations]
+
+  - name: ghl-smtp-service
+    github_url: https://github.com/GoHighLevel/ghl-smtp-service.git
+    team: conversations
+    type: service
+    tags: [javascript, nestjs, conversations]
+
+  - name: py-chatbot
+    github_url: https://github.com/GoHighLevel/py-chatbot.git
+    team: conversations
+    type: service
+    tags: [python, conversations]
+
+  - name: revops-chatgpt-mcp-snowflake-server
+    github_url: https://github.com/GoHighLevel/revops-chatgpt-mcp-snowflake-server.git
+    team: conversations
+    type: service
+    tags: [javascript, nestjs, mcp, conversations]
+
+  - name: whatsapp-analytics-backup-scipts
+    github_url: https://github.com/GoHighLevel/whatsapp-analytics-backup-scipts.git
+    team: conversations
+    type: service
+    tags: [python, conversations]
+
+  # ──────────────────── CALENDARS ─────────────────────
+  - name: abhi_collective_calendar
+    github_url: https://github.com/GoHighLevel/abhi_collective_calendar.git
+    team: calendars
+    type: other
+    tags: [calendars]
+
+  - name: assignment_calendar
+    github_url: https://github.com/GoHighLevel/assignment_calendar.git
+    team: calendars
+    type: service
+    tags: [typescript, nestjs, calendars]
+
+  - name: automation-calendars-deep-links
+    github_url: https://github.com/GoHighLevel/automation-calendars-deep-links.git
+    team: calendars
+    type: service
+    tags: [java, calendars]
+
+  - name: automation-calendars-frontend
+    github_url: https://github.com/GoHighLevel/automation-calendars-frontend.git
+    team: calendars
+    type: frontend
+    tags: [vue, vue3, calendars]
+
+  - name: automation-calendars-frontend-monorepo
+    github_url: https://github.com/GoHighLevel/automation-calendars-frontend-monorepo.git
+    team: calendars
+    type: frontend
+    tags: [vue, vue3, calendars]
+
+  - name: automation-calendars-preview
+    github_url: https://github.com/GoHighLevel/automation-calendars-preview.git
+    team: calendars
+    type: frontend
+    tags: [typescript, calendars]
+
+  - name: automation-calendars-reserve-backend
+    github_url: https://github.com/GoHighLevel/automation-calendars-reserve-backend.git
+    team: calendars
+    type: service
+    tags: [typescript, nestjs, calendars]
+
+  - name: calendars-learning-go
+    github_url: https://github.com/GoHighLevel/calendars-learning-go.git
+    team: calendars
+    type: other
+    tags: [calendars]
+
+  - name: ghl-calendars-ai-skills
+    github_url: https://github.com/GoHighLevel/ghl-calendars-ai-skills.git
+    team: calendars
+    type: service
+    tags: [go, calendars]
+
+  - name: ghl-calendars-platform
+    github_url: https://github.com/GoHighLevel/ghl-calendars-platform.git
+    team: calendars
+    type: service
+    tags: [go, calendars]
+
+  - name: schedulers_dart
+    github_url: https://github.com/GoHighLevel/schedulers_dart.git
+    team: calendars
+    type: other
+    tags: [dart, calendars]
+
+  - name: vue-tuicalendar
+    github_url: https://github.com/GoHighLevel/vue-tuicalendar.git
+    team: calendars
+    type: service
+    tags: [javascript, nestjs, calendars]
+
+  # ──────────────────── FUNNELS ───────────────────────
+  - name: builder-preview
+    github_url: https://github.com/GoHighLevel/builder-preview.git
+    team: funnels
+    type: frontend
+    tags: [vue, vue3, funnels]
+
+  - name: funnel-preview-cache
+    github_url: https://github.com/GoHighLevel/funnel-preview-cache.git
+    team: funnels
+    type: frontend
+    tags: [typescript, funnels]
+
+  - name: ghl-blogging
+    github_url: https://github.com/GoHighLevel/ghl-blogging.git
+    team: funnels
+    type: frontend
+    tags: [vue, vue3, funnels]
+
+  - name: ghl-form-ai-studio
+    github_url: https://github.com/GoHighLevel/ghl-form-ai-studio.git
+    team: funnels
+    type: service
+    tags: [typescript, nestjs, funnels]
+
+  - name: ghl-form-element
+    github_url: https://github.com/GoHighLevel/ghl-form-element.git
+    team: funnels
+    type: frontend
+    tags: [vue, vue3, funnels]
+
+  - name: ghl-form-embed
+    github_url: https://github.com/GoHighLevel/ghl-form-embed.git
+    team: funnels
+    type: service
+    tags: [typescript, nestjs, funnels]
+
+  - name: ghl-form-survey
+    github_url: https://github.com/GoHighLevel/ghl-form-survey.git
+    team: funnels
+    type: frontend
+    tags: [vue, vue3, funnels]
+
+  - name: ghl-funnel-website
+    github_url: https://github.com/GoHighLevel/ghl-funnel-website.git
+    team: funnels
+    type: frontend
+    tags: [vue, vue3, funnels]
+
+  - name: leadgen-funnels-backend
+    github_url: https://github.com/GoHighLevel/leadgen-funnels-backend.git
+    team: funnels
+    type: service
+    tags: [funnels]
+
+  - name: page-builder
+    github_url: https://github.com/GoHighLevel/page-builder.git
+    team: funnels
+    type: frontend
+    tags: [vue, vue3, funnels]
+
+  - name: spm-appengine
+    github_url: https://github.com/GoHighLevel/spm-appengine.git
+    team: funnels
+    type: frontend
+    tags: [typescript, funnels]
+
+  - name: spm-proxy-server
+    github_url: https://github.com/GoHighLevel/spm-proxy-server.git
+    team: funnels
+    type: service
+    tags: [javascript, nestjs, funnels]
+
+  - name: spm-ts
+    github_url: https://github.com/GoHighLevel/spm-ts.git
+    team: funnels
+    type: frontend
+    tags: [vue, vue3, funnels]
+
+  # ──────────────────── PAYMENTS ──────────────────────
+  - name: affiliate-signup-page
+    github_url: https://github.com/GoHighLevel/affiliate-signup-page.git
+    team: payments
+    type: frontend
+    tags: [vue, vue3, payments]
+
+  - name: authorize-net-playground
+    github_url: https://github.com/GoHighLevel/authorize-net-playground.git
+    team: payments
+    type: tooling
+    tags: [typescript, payments]
+
+  - name: dev-commerce-subscriptionsx
+    github_url: https://github.com/GoHighLevel/dev-commerce-subscriptionsx.git
+    team: payments
+    type: other
+    tags: [payments]
+
+  - name: ghl-invoice-preview
+    github_url: https://github.com/GoHighLevel/ghl-invoice-preview.git
+    team: payments
+    type: frontend
+    tags: [vue, vue3, payments]
+
+  - name: ghl-leadgen-payments
+    github_url: https://github.com/GoHighLevel/ghl-leadgen-payments.git
+    team: payments
+    type: frontend
+    tags: [vue, vue3, payments]
+
+  - name: ghl-payment-element
+    github_url: https://github.com/GoHighLevel/ghl-payment-element.git
+    team: payments
+    type: frontend
+    tags: [vue, vue3, payments]
+
+  - name: ghl-payments-flutter
+    github_url: https://github.com/GoHighLevel/ghl-payments-flutter.git
+    team: payments
+    type: other
+    tags: [swift, payments]
+
+  - name: leadgen-payment-products-backend
+    github_url: https://github.com/GoHighLevel/leadgen-payment-products-backend.git
+    team: payments
+    type: service
+    tags: [payments]
+
+  - name: mobile-square-in-app-payments
+    github_url: https://github.com/GoHighLevel/mobile-square-in-app-payments.git
+    team: payments
+    type: frontend
+    tags: [payments]
+
+  - name: module-stripe
+    github_url: https://github.com/GoHighLevel/module-stripe.git
+    team: payments
+    type: service
+    tags: [typescript, nestjs, payments]
+
+  - name: payment-products-preview
+    github_url: https://github.com/GoHighLevel/payment-products-preview.git
+    team: payments
+    type: frontend
+    tags: [vue, vue3, payments]
+
+  - name: payment-service
+    github_url: https://github.com/GoHighLevel/payment-service.git
+    team: payments
+    type: service
+    tags: [typescript, nestjs, payments]
+
+  # ──────────────────── MARKETING ─────────────────────
+  - name: automation-am-external-script
+    github_url: https://github.com/GoHighLevel/automation-am-external-script.git
+    team: marketing
+    type: tooling
+    tags: [typescript, marketing]
+
+  - name: automation-am-frontend
+    github_url: https://github.com/GoHighLevel/automation-am-frontend.git
+    team: marketing
+    type: frontend
+    tags: [vue, vue3, marketing]
+
+  - name: automation-am-reward-fronted
+    github_url: https://github.com/GoHighLevel/automation-am-reward-fronted.git
+    team: marketing
+    type: service
+    tags: [typescript, nestjs, marketing]
+
+  - name: automation-apps-backend
+    github_url: https://github.com/GoHighLevel/automation-apps-backend.git
+    team: marketing
+    type: service
+    tags: [typescript, nestjs, marketing]
+
+  - name: automation-data-bi-platform
+    github_url: https://github.com/GoHighLevel/automation-data-bi-platform.git
+    team: marketing
+    type: service
+    tags: [python, marketing]
+
+  - name: automation-eliza-backend
+    github_url: https://github.com/GoHighLevel/automation-eliza-backend.git
+    team: marketing
+    type: service
+    tags: [typescript, nestjs, marketing]
+
+  - name: automation-eliza-frontend
+    github_url: https://github.com/GoHighLevel/automation-eliza-frontend.git
+    team: marketing
+    type: frontend
+    tags: [vue, vue3, marketing]
+
+  - name: automation-migration
+    github_url: https://github.com/GoHighLevel/automation-migration.git
+    team: marketing
+    type: tooling
+    tags: [typescript, marketing]
+
+  - name: automation-next-apps-backend
+    github_url: https://github.com/GoHighLevel/automation-next-apps-backend.git
+    team: marketing
+    type: service
+    tags: [go, marketing]
+
+  - name: automation-sync-engine
+    github_url: https://github.com/GoHighLevel/automation-sync-engine.git
+    team: marketing
+    type: other
+    tags: [marketing]
+
+  - name: automation-workflows-ai
+    github_url: https://github.com/GoHighLevel/automation-workflows-ai.git
+    team: marketing
+    type: service
+    tags: [typescript, nestjs, marketing]
+
+  - name: automation-workflows-ai-pilot
+    github_url: https://github.com/GoHighLevel/automation-workflows-ai-pilot.git
+    team: marketing
+    type: service
+    tags: [typescript, nestjs, marketing]
+
+  - name: automation-workflows-backend
+    github_url: https://github.com/GoHighLevel/automation-workflows-backend.git
+    team: marketing
+    type: service
+    tags: [typescript, nestjs, marketing]
+
+  - name: automation-workflows-frontend
+    github_url: https://github.com/GoHighLevel/automation-workflows-frontend.git
+    team: marketing
+    type: frontend
+    tags: [typescript, marketing]
+
+  - name: automation-workflows-iatf-ai-agent
+    github_url: https://github.com/GoHighLevel/automation-workflows-iatf-ai-agent.git
+    team: marketing
+    type: service
+    tags: [typescript, nestjs, marketing]
+
+  - name: automation-workflows-iatf-frontend
+    github_url: https://github.com/GoHighLevel/automation-workflows-iatf-frontend.git
+    team: marketing
+    type: frontend
+    tags: [vue, vue3, marketing]
+
+  - name: automation-workflows-ui-mcp
+    github_url: https://github.com/GoHighLevel/automation-workflows-ui-mcp.git
+    team: marketing
+    type: frontend
+    tags: [typescript, mcp, marketing]
+
+  - name: automation-workflows-validators
+    github_url: https://github.com/GoHighLevel/automation-workflows-validators.git
+    team: marketing
+    type: service
+    tags: [typescript, nestjs, marketing]
+
+  - name: Calender_Automation_Assignment_Daksh
+    github_url: https://github.com/GoHighLevel/Calender_Automation_Assignment_Daksh.git
+    team: marketing
+    type: service
+    tags: [typescript, nestjs, marketing]
+
+  - name: clickup-automation
+    github_url: https://github.com/GoHighLevel/clickup-automation.git
+    team: marketing
+    type: other
+    tags: [marketing]
+
+  - name: doc-preview
+    github_url: https://github.com/GoHighLevel/doc-preview.git
+    team: marketing
+    type: frontend
+    tags: [vue, vue3, marketing]
+
+  - name: domain-reputation
+    github_url: https://github.com/GoHighLevel/domain-reputation.git
+    team: marketing
+    type: service
+    tags: [python, marketing]
+
+  - name: email-preview
+    github_url: https://github.com/GoHighLevel/email-preview.git
+    team: marketing
+    type: frontend
+    tags: [vue, vue3, marketing]
+
+  - name: ghl-mobileAutomation
+    github_url: https://github.com/GoHighLevel/ghl-mobileAutomation.git
+    team: marketing
+    type: service
+    tags: [java, marketing]
+
+  - name: ghl-social-media-external
+    github_url: https://github.com/GoHighLevel/ghl-social-media-external.git
+    team: marketing
+    type: service
+    tags: [typescript, nestjs, marketing]
+
+  - name: ghl-social-media-posting
+    github_url: https://github.com/GoHighLevel/ghl-social-media-posting.git
+    team: marketing
+    type: service
+    tags: [typescript, nestjs, marketing]
+
+  - name: Gokollab-Native-Automation
+    github_url: https://github.com/GoHighLevel/Gokollab-Native-Automation.git
+    team: marketing
+    type: service
+    tags: [javascript, nestjs, marketing]
+
+  - name: hiring-live-ai-workflows
+    github_url: https://github.com/GoHighLevel/hiring-live-ai-workflows.git
+    team: marketing
+    type: other
+    tags: [marketing]
+
+  - name: hl-automation-project-template
+    github_url: https://github.com/GoHighLevel/hl-automation-project-template.git
+    team: marketing
+    type: service
+    tags: [typescript, nestjs, marketing]
+
+  - name: leadgen-store-preview
+    github_url: https://github.com/GoHighLevel/leadgen-store-preview.git
+    team: marketing
+    type: frontend
+    tags: [marketing]
+
+  - name: marketplace-app-review-agents
+    github_url: https://github.com/GoHighLevel/marketplace-app-review-agents.git
+    team: marketing
+    type: frontend
+    tags: [javascript, marketing]
+
+  - name: private-github-workflows
+    github_url: https://github.com/GoHighLevel/private-github-workflows.git
+    team: marketing
+    type: service
+    tags: [javascript, nestjs, marketing]
+
+  - name: revops-automation
+    github_url: https://github.com/GoHighLevel/revops-automation.git
+    team: marketing
+    type: service
+    tags: [python, marketing]
+
+  - name: WhiteLabel_Automation
+    github_url: https://github.com/GoHighLevel/WhiteLabel_Automation.git
+    team: marketing
+    type: other
+    tags: [shell, marketing]
+
+  - name: workflow-importers-IR-model
+    github_url: https://github.com/GoHighLevel/workflow-importers-IR-model.git
+    team: marketing
+    type: service
+    tags: [typescript, nestjs, marketing]
+
+  - name: workflow-mcp-server
+    github_url: https://github.com/GoHighLevel/workflow-mcp-server.git
+    team: marketing
+    type: service
+    tags: [javascript, nestjs, mcp, marketing]
+
+  # ──────────────────── PHONE ─────────────────────────
+  - name: flutter_libphonenumber
+    github_url: https://github.com/GoHighLevel/flutter_libphonenumber.git
+    team: phone
+    type: other
+    tags: [dart, phone]
+
+  - name: twilio_voice_federated
+    github_url: https://github.com/GoHighLevel/twilio_voice_federated.git
+    team: phone
+    type: service
+    tags: [kotlin, phone]
+
+  - name: voice-ai-mindcast
+    github_url: https://github.com/GoHighLevel/voice-ai-mindcast.git
+    team: phone
+    type: service
+    tags: [go, phone]
+
+  # ──────────────────── REPORTING ─────────────────────
+  - name: data-dbt-analytics
+    github_url: https://github.com/GoHighLevel/data-dbt-analytics.git
+    team: reporting
+    type: other
+    tags: [reporting]
+
+  - name: data-dbt-data-foundation
+    github_url: https://github.com/GoHighLevel/data-dbt-data-foundation.git
+    team: reporting
+    type: other
+    tags: [jupyter-notebook, reporting]
+
+  - name: data-dbt-starburst
+    github_url: https://github.com/GoHighLevel/data-dbt-starburst.git
+    team: reporting
+    type: other
+    tags: [reporting]
+
+  - name: data-platform-core
+    github_url: https://github.com/GoHighLevel/data-platform-core.git
+    team: reporting
+    type: library
+    tags: [java, reporting]
+
+  - name: ghl-attribution-external-script
+    github_url: https://github.com/GoHighLevel/ghl-attribution-external-script.git
+    team: reporting
+    type: tooling
+    tags: [typescript, reporting]
+
+  - name: leadgen-reporting-ads-backend
+    github_url: https://github.com/GoHighLevel/leadgen-reporting-ads-backend.git
+    team: reporting
+    type: service
+    tags: [python, reporting]
+
+  - name: leadgen-reporting-ai
+    github_url: https://github.com/GoHighLevel/leadgen-reporting-ai.git
+    team: reporting
+    type: other
+    tags: [reporting]
+
+  - name: leadgen-reporting-attribution-backend
+    github_url: https://github.com/GoHighLevel/leadgen-reporting-attribution-backend.git
+    team: reporting
+    type: service
+    tags: [typescript, nestjs, reporting]
+
+  - name: leadgen-reporting-frontend
+    github_url: https://github.com/GoHighLevel/leadgen-reporting-frontend.git
+    team: reporting
+    type: frontend
+    tags: [vue, vue3, reporting]
+
+  - name: leadgen-reporting-messages-backend
+    github_url: https://github.com/GoHighLevel/leadgen-reporting-messages-backend.git
+    team: reporting
+    type: service
+    tags: [typescript, nestjs, reporting]
+
+  - name: marketplace-reporting-scripts
+    github_url: https://github.com/GoHighLevel/marketplace-reporting-scripts.git
+    team: reporting
+    type: tooling
+    tags: [javascript, reporting]
+
+  # ──────────────────── SAAS ──────────────────────────
+  - name: AgencyUX
+    github_url: https://github.com/GoHighLevel/AgencyUX.git
+    team: saas
+    type: frontend
+    tags: [vue, vue3, saas]
+
+  - name: ai-marketplace-tests
+    github_url: https://github.com/GoHighLevel/ai-marketplace-tests.git
+    team: saas
+    type: tests
+    tags: [typescript, testing, saas]
+
+  - name: ghl-marketplace-app-template
+    github_url: https://github.com/GoHighLevel/ghl-marketplace-app-template.git
+    team: saas
+    type: frontend
+    tags: [typescript, saas]
+
+  - name: leadgen-marketplace-backend
+    github_url: https://github.com/GoHighLevel/leadgen-marketplace-backend.git
+    team: saas
+    type: service
+    tags: [typescript, nestjs, saas]
+
+  - name: marketplace-backend
+    github_url: https://github.com/GoHighLevel/marketplace-backend.git
+    team: saas
+    type: service
+    tags: [typescript, nestjs, saas]
+
+  - name: marketplace-backend-demo
+    github_url: https://github.com/GoHighLevel/marketplace-backend-demo.git
+    team: saas
+    type: service
+    tags: [typescript, nestjs, saas]
+
+  - name: marketplace-frontend
+    github_url: https://github.com/GoHighLevel/marketplace-frontend.git
+    team: saas
+    type: frontend
+    tags: [vue, vue3, saas]
+
+  - name: saas-service
+    github_url: https://github.com/GoHighLevel/saas-service.git
+    team: saas
+    type: service
+    tags: [typescript, nestjs, saas]
+
+  # ──────────────────── INTEGRATIONS ──────────────────
+  - name: highlevel-zapier
+    github_url: https://github.com/GoHighLevel/highlevel-zapier.git
+    team: integrations
+    type: service
+    tags: [javascript, nestjs, integrations]
+
+  - name: hr-integration
+    github_url: https://github.com/GoHighLevel/hr-integration.git
+    team: integrations
+    type: frontend
+    tags: [vue, vue3, integrations]
+
+  - name: integration-core
+    github_url: https://github.com/GoHighLevel/integration-core.git
+    team: integrations
+    type: library
+    tags: [dockerfile, integrations]
+
+  - name: leadconnector
+    github_url: https://github.com/GoHighLevel/leadconnector.git
+    team: integrations
+    type: service
+    tags: [typescript, nestjs, integrations]
+
+  - name: leadconnector-plugin-wordpress
+    github_url: https://github.com/GoHighLevel/leadconnector-plugin-wordpress.git
+    team: integrations
+    type: other
+    tags: [php, integrations]
+
+  - name: oauth-demo
+    github_url: https://github.com/GoHighLevel/oauth-demo.git
+    team: integrations
+    type: tooling
+    tags: [javascript, integrations]
+
+  # ──────────────────── AI ────────────────────────────
+  - name: ai-backend
+    github_url: https://github.com/GoHighLevel/ai-backend.git
+    team: ai
+    type: service
+    tags: [typescript, nestjs, ai]
+
+  - name: ai-employees-evals
+    github_url: https://github.com/GoHighLevel/ai-employees-evals.git
+    team: ai
+    type: tests
+    tags: [javascript, testing, ai]
+
+  - name: ai-frontend
+    github_url: https://github.com/GoHighLevel/ai-frontend.git
+    team: ai
+    type: frontend
+    tags: [vue, vue3, ai]
+
+  - name: ai-partners-frontend
+    github_url: https://github.com/GoHighLevel/ai-partners-frontend.git
+    team: ai
+    type: frontend
+    tags: [ai]
+
+  - name: ai-supervisor-prototype
+    github_url: https://github.com/GoHighLevel/ai-supervisor-prototype.git
+    team: ai
+    type: tooling
+    tags: [vue, vue3, ai]
+
+  - name: evaluations-ai-frontend
+    github_url: https://github.com/GoHighLevel/evaluations-ai-frontend.git
+    team: ai
+    type: frontend
+    tags: [vue, vue3, testing, ai]
+
+  - name: ghl-ai-skills
+    github_url: https://github.com/GoHighLevel/ghl-ai-skills.git
+    team: ai
+    type: other
+    tags: [shell, ai]
+
+  - name: ghl-ai-test-generator
+    github_url: https://github.com/GoHighLevel/ghl-ai-test-generator.git
+    team: ai
+    type: tests
+    tags: [javascript, testing, ai]
+
+  - name: ghl-aip
+    github_url: https://github.com/GoHighLevel/ghl-aip.git
+    team: ai
+    type: other
+    tags: [ai]
+
+  - name: ghl-content-ai
+    github_url: https://github.com/GoHighLevel/ghl-content-ai.git
+    team: ai
+    type: frontend
+    tags: [vue, vue3, ai]
+
+  - name: ghl-rag-framework
+    github_url: https://github.com/GoHighLevel/ghl-rag-framework.git
+    team: ai
+    type: library
+    tags: [javascript, ai]
+
+  - name: highlevel-employee-portal
+    github_url: https://github.com/GoHighLevel/highlevel-employee-portal.git
+    team: ai
+    type: frontend
+    tags: [vue, vue3, ai]
+
+  - name: onboarding-fuzzy-inference
+    github_url: https://github.com/GoHighLevel/onboarding-fuzzy-inference.git
+    team: ai
+    type: service
+    tags: [typescript, nestjs, ai]
+
+  - name: onboarding-fuzzy-inference-system
+    github_url: https://github.com/GoHighLevel/onboarding-fuzzy-inference-system.git
+    team: ai
+    type: other
+    tags: [ai]
+
+  - name: platform-ai
+    github_url: https://github.com/GoHighLevel/platform-ai.git
+    team: ai
+    type: service
+    tags: [python, ai]
+
+  - name: vertical-ai
+    github_url: https://github.com/GoHighLevel/vertical-ai.git
+    team: ai
+    type: service
+    tags: [typescript, nestjs, ai]
+
+  - name: visibility-ai
+    github_url: https://github.com/GoHighLevel/visibility-ai.git
+    team: ai
+    type: other
+    tags: [ai]
+
+  - name: zai-demo
+    github_url: https://github.com/GoHighLevel/zai-demo.git
+    team: ai
+    type: tooling
+    tags: [ai]

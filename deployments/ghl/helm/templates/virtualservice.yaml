@@ -1,0 +1,29 @@
+{{- if .Values.virtualService.enabled -}}
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: {{ include "codebase-memory-mcp.fullname" . }}
+  labels:
+    {{- include "codebase-memory-mcp.labels" . | nindent 4 }}
+spec:
+  hosts:
+    - {{ .Values.virtualService.host }}
+  {{- if .Values.virtualService.gateway }}
+  gateways:
+    - {{ .Values.virtualService.gateway }}
+  {{- end }}
+  http:
+    - match:
+        - uri:
+            prefix: /
+      route:
+        - destination:
+            host: {{ include "codebase-memory-mcp.fullname" . }}
+            port:
+              number: {{ .Values.service.port }}
+      timeout: 300s  # fleet indexing can take a while
+      retries:
+        attempts: 3
+        perTryTimeout: 10s
+        retryOn: connect-failure,refused-stream,unavailable,retriable-4xx
+{{- end }}

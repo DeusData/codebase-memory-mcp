@@ -1,0 +1,76 @@
+# Dockerfile.ghl — GHL fleet server
+#
+# Multi-stage build:
+#   stage 1 (cbm):    download pre-built codebase-memory-mcp binary for linux/amd64
+#   stage 2 (build):  compile the Go fleet server
+#   stage 3 (run):    minimal runtime image
+
+# ── Stage 1: codebase-memory-mcp binary ──────────────────────────
+FROM alpine:3.20 AS cbm
+
+ARG CBM_VERSION=0.6.0
+
+RUN apk add --no-cache curl ca-certificates && \
+    curl -fsSL \
+      "https://github.com/DeusData/codebase-memory-mcp/releases/download/v${CBM_VERSION}/codebase-memory-mcp-linux-amd64-portable.tar.gz" \
+      -o /tmp/cbm.tar.gz && \
+    tar -xzf /tmp/cbm.tar.gz -C /tmp && \
+    install -m 0755 /tmp/codebase-memory-mcp /usr/local/bin/codebase-memory-mcp
+
+# ── Stage 2: Go fleet server ──────────────────────────────────────
+FROM golang:1.23-alpine AS build
+
+WORKDIR /src
+
+# Cache dependencies first
+COPY ghl/go.mod ghl/go.sum ./
+RUN go mod download
+
+# Copy source
+COPY ghl/ ./
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags="-s -w" \
+    -o /app/ghl-fleet ./cmd/server
+
+# ── Stage 3: Runtime ──────────────────────────────────────────────
+# Use debian-slim (not distroless) so git is available for repo cloning
+FROM debian:12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git \
+      ca-certificates \
+      openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy binaries
+COPY --from=cbm   /usr/local/bin/codebase-memory-mcp /app/codebase-memory-mcp
+COPY --from=build /app/ghl-fleet                      /app/ghl-fleet
+
+# Copy default manifest
+COPY REPOS.yaml /app/REPOS.yaml
+COPY REPOS.local.yaml /app/REPOS.local.yaml
+
+# Git: trust all dirs (needed when running as non-root in containers)
+RUN git config --global --add safe.directory '*'
+
+WORKDIR /app
+
+# ── Defaults (all overridable via env) ───────────────────────────
+ENV PORT=8080 \
+    CBM_BINARY=/app/codebase-memory-mcp \
+    CBM_CACHE_DIR=/tmp/codebase-memory-mcp \
+    FLEET_CACHE_DIR=/app/fleet-cache \
+    REPOS_MANIFEST=/app/REPOS.local.yaml \
+    BRIDGE_CLIENTS=4 \
+    BRIDGE_ACQUIRE_TIMEOUT_MS=1500 \
+    FLEET_CONCURRENCY=8 \
+    INDEXER_CLIENTS=8 \
+    CRON_INCREMENTAL="0 */6 * * *" \
+    CRON_FULL="0 2 * * 0"
+
+EXPOSE 8080
+
+VOLUME ["/data/fleet-cache"]
+
+ENTRYPOINT ["/app/ghl-fleet"]
