@@ -1,0 +1,17 @@
+apiVersion: v2
+name: codebase-memory-mcp
+description: GHL fleet server for codebase-memory-mcp — indexes all 200 GHL repos and exposes them via an HTTP MCP endpoint
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - mcp
+  - code-intelligence
+  - ai
+  - ghl
+home: https://github.com/GoHighLevel/codebase-memory-mcp
+sources:
+  - https://github.com/GoHighLevel/codebase-memory-mcp
+maintainers:
+  - name: platform-infra
+    email: platform@gohighlevel.com

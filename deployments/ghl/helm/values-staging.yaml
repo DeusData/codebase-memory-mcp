@@ -1,0 +1,12 @@
+# values-staging.yaml — staging overrides
+image:
+  tag: "latest"
+
+env:
+  FLEET_CONCURRENCY: "8"
+  INDEXER_CLIENTS: "8"
+  GITHUB_AUTH_ENABLED: "true"
+  GITHUB_ALLOWED_ORGS: "GoHighLevel"
+
+persistence:
+  size: "20Gi"
