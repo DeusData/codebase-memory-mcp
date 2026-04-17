@@ -1770,6 +1770,64 @@ TEST(import_stress_go) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ * Svelte / Vue import extraction (regression: zero IMPORTS edges for
+ * .svelte/.vue files — <script> block was not re-parsed with JS grammar)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+TEST(svelte_imports_basic) {
+    /* Default import + named imports + namespace import */
+    CBMFileResult *r = extract(
+        "<script>\n"
+        "import Foo from './Foo.svelte';\n"
+        "import { bar, baz } from '../lib/utils';\n"
+        "import * as helpers from './helpers';\n"
+        "export let value = 42;\n"
+        "</script>\n"
+        "<h1>Hello {value}</h1>\n",
+        CBM_LANG_SVELTE, "t", "Comp.svelte");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_GTE(r->imports.count, 3);
+    ASSERT(has_import(r, "Foo.svelte"));
+    ASSERT(has_import(r, "lib/utils"));
+    ASSERT(has_import(r, "helpers"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(svelte_imports_no_script) {
+    /* .svelte with no <script> block must not crash, 0 imports */
+    CBMFileResult *r = extract(
+        "<h1>Static page</h1>\n"
+        "<p>No script here.</p>\n",
+        CBM_LANG_SVELTE, "t", "Static.svelte");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(r->imports.count, 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vue_imports_basic) {
+    /* Vue SFC: same document→script_element→raw_text AST structure */
+    CBMFileResult *r = extract(
+        "<template><div>{{ msg }}</div></template>\n"
+        "<script>\n"
+        "import MyComp from './MyComp.vue';\n"
+        "import { ref } from 'vue';\n"
+        "export default { name: 'App' };\n"
+        "</script>\n",
+        CBM_LANG_VUE, "t", "App.vue");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_GTE(r->imports.count, 2);
+    ASSERT(has_import(r, "MyComp.vue"));
+    ASSERT(has_import(r, "vue"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * config_extraction_test.go ports (25 tests)
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -2297,6 +2355,9 @@ SUITE(extraction) {
     RUN_TEST(ruby_imports);
     RUN_TEST(lua_imports);
     RUN_TEST(import_stress_go);
+    RUN_TEST(svelte_imports_basic);
+    RUN_TEST(svelte_imports_no_script);
+    RUN_TEST(vue_imports_basic);
 
     /* config_extraction_test.go ports */
     RUN_TEST(toml_basic_table_and_pair);
