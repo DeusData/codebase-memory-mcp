@@ -36,6 +36,9 @@ import (
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/indexer"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/manifest"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/mcp"
+	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/orgdb"
+	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/orgtools"
+	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/pipeline"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/webhook"
 )
 
@@ -93,6 +96,38 @@ func main() {
 		}
 	}
 
+	// ── Org graph (optional) ─────────────────────────────────
+
+	var orgDB *orgdb.DB
+	if cfg.OrgGraphEnabled {
+		orgDBPath := cfg.OrgDBPath
+		if orgDBPath == "" {
+			orgDBPath = filepath.Join(cfg.CBMCacheDir, "org", "org.db")
+		}
+		if err := os.MkdirAll(filepath.Dir(orgDBPath), 0o750); err != nil {
+			slog.Error("failed to create org db dir", "path", orgDBPath, "err", err)
+			os.Exit(1)
+		}
+		var dbErr error
+		orgDB, dbErr = orgdb.Open(orgDBPath)
+		if dbErr != nil {
+			slog.Error("failed to open org db", "path", orgDBPath, "err", dbErr)
+			os.Exit(1)
+		}
+		defer orgDB.Close()
+		slog.Info("org graph enabled", "path", orgDBPath)
+
+		// Hydrate org.db from artifacts if available
+		if artifactSync != nil && !cfg.ArtifactsSkipHydrate {
+			hydrated, err := artifactSync.HydrateOrgGraph()
+			if err != nil {
+				slog.Warn("failed to hydrate org graph", "err", err)
+			} else if hydrated > 0 {
+				slog.Info("hydrated org graph", "count", hydrated)
+			}
+		}
+	}
+
 	// ── Load fleet manifest ──────────────────────────────────
 
 	m, err := manifest.Load(cfg.ReposManifest)
@@ -128,10 +163,42 @@ func main() {
 						slog.Info("persisted project index", "repo", slug, "project", projectName, "files", persisted)
 					}
 				}
+				// ── Org graph enrichment ──
+				if orgDB != nil {
+					repo, ok := m.FindByName(slug)
+					if ok {
+						if enrichErr := pipeline.PopulateRepoData(orgDB, repo, cfg.CloneCacheDir); enrichErr != nil {
+							slog.Warn("org enrichment failed", "repo", slug, "err", enrichErr)
+						} else {
+							slog.Info("org enrichment complete", "repo", slug)
+						}
+					}
+				}
 				if discoverySvc != nil {
 					discoverySvc.Invalidate()
 				}
 				slog.Info("repo indexed", "repo", slug)
+			},
+			OnAllComplete: func(result indexer.IndexResult) {
+				slog.Info("fleet indexing complete", "total", result.Total, "ok", result.Succeeded, "failed", result.Failed)
+				// ── Cross-reference org contracts ──
+				if orgDB != nil {
+					matched, err := orgDB.CrossReferenceContracts()
+					if err != nil {
+						slog.Warn("cross-reference contracts failed", "err", err)
+					} else {
+						slog.Info("cross-referenced API contracts", "matched", matched)
+					}
+					// Persist org.db to artifacts
+					if artifactSync != nil {
+						persisted, err := artifactSync.PersistOrgGraph()
+						if err != nil {
+							slog.Warn("failed to persist org graph", "err", err)
+						} else {
+							slog.Info("persisted org graph", "files", persisted)
+						}
+					}
+				}
 			},
 		})
 	}
@@ -251,9 +318,22 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(5 * time.Minute))
 
+	// Wire org graph into discovery scoring
+	if orgDB != nil {
+		discoverySvc.SetOrgDB(orgDB)
+		slog.Info("org graph wired into discovery scoring")
+	}
+
+	// Build org tool service
+	var orgToolSvc *orgtools.OrgService
+	if orgDB != nil {
+		orgToolSvc = orgtools.New(orgDB)
+		slog.Info("org tools enabled", "tools", len(orgToolSvc.Definitions()))
+	}
+
 	// Bridge: forward MCP calls to the binary
 	bridgeHandler := bridge.NewHandler(
-		&mcpBridgeBackend{client: bridgePool, discovery: discoverySvc},
+		&mcpBridgeBackend{client: bridgePool, discovery: discoverySvc, orgTools: orgToolSvc},
 		bridge.Config{BearerToken: cfg.BearerToken, Authenticator: requestAuthenticator},
 	)
 	r.Mount("/mcp", bridgeHandler)
@@ -438,6 +518,8 @@ type config struct {
 	ScheduledIndexingEnabled bool
 	RunMode                  string
 	RunForce                 bool
+	OrgGraphEnabled          bool
+	OrgDBPath                string
 }
 
 func loadConfig() config {
@@ -610,6 +692,8 @@ func loadConfig() config {
 		ScheduledIndexingEnabled: getBool("SCHEDULED_INDEXING_ENABLED", false),
 		RunMode:                  strings.TrimSpace(getEnv("RUN_MODE", "serve")),
 		RunForce:                 getBool("RUN_FORCE", false),
+		OrgGraphEnabled:          getBool("ORG_GRAPH_ENABLED", false),
+		OrgDBPath:                getEnv("ORG_DB_PATH", ""),
 	}
 }
 
