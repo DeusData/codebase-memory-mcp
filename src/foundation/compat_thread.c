@@ -56,6 +56,15 @@ int cbm_thread_join(cbm_thread_t *t) {
         return CBM_NOT_FOUND;
     }
     CloseHandle(t->handle);
+    t->handle = NULL;
+    return 0;
+}
+
+int cbm_thread_detach(cbm_thread_t *t) {
+    if (t->handle) {
+        CloseHandle(t->handle);
+        t->handle = NULL;
+    }
     return 0;
 }
 
@@ -74,7 +83,19 @@ int cbm_thread_create(cbm_thread_t *t, size_t stack_size, void *(*fn)(void *), v
 }
 
 int cbm_thread_join(cbm_thread_t *t) {
-    return pthread_join(t->handle, NULL);
+    int rc = pthread_join(t->handle, NULL);
+    if (rc == 0) {
+        memset(&t->handle, 0, sizeof(t->handle));
+    }
+    return rc;
+}
+
+int cbm_thread_detach(cbm_thread_t *t) {
+    int rc = pthread_detach(t->handle);
+    if (rc == 0) {
+        memset(&t->handle, 0, sizeof(t->handle));
+    }
+    return rc;
 }
 
 #endif

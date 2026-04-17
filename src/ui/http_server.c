@@ -142,16 +142,41 @@ static char g_log_ring[LOG_RING_SIZE][LOG_LINE_MAX];
 static int g_log_head = 0;
 static int g_log_count = 0;
 static cbm_mutex_t g_log_mutex;
-static atomic_int g_log_mutex_init = 0;
+
+enum {
+    CBM_LOG_MUTEX_UNINIT = 0,
+    CBM_LOG_MUTEX_INITING = 1,
+    CBM_LOG_MUTEX_INITED = 2
+};
+static atomic_int g_log_mutex_init = CBM_LOG_MUTEX_UNINIT;
+
+/* Safe for concurrent callers: only publishes INITED after cbm_mutex_init()
+ * has completed. Callers that lose the CAS race spin until init finishes. */
+void cbm_ui_log_init(void) {
+    int state = atomic_load(&g_log_mutex_init);
+    if (state == CBM_LOG_MUTEX_INITED)
+        return;
+
+    state = CBM_LOG_MUTEX_UNINIT;
+    if (atomic_compare_exchange_strong(&g_log_mutex_init, &state, CBM_LOG_MUTEX_INITING)) {
+        cbm_mutex_init(&g_log_mutex);
+        atomic_store(&g_log_mutex_init, CBM_LOG_MUTEX_INITED);
+        return;
+    }
+
+    /* Another thread is initializing — spin until done */
+    while (atomic_load(&g_log_mutex_init) != CBM_LOG_MUTEX_INITED) {
+        cbm_usleep(1000); /* 1ms */
+    }
+}
 
 /* Called from a log hook — appends a line to the ring buffer (thread-safe) */
 void cbm_ui_log_append(const char *line) {
     if (!line)
         return;
-    if (!atomic_load(&g_log_mutex_init)) {
-        cbm_mutex_init(&g_log_mutex);
-        atomic_store(&g_log_mutex_init, 1);
-    }
+    /* Ensure mutex is initialized (safe for early single-threaded logging
+     * and concurrent calls via atomic_exchange once-init pattern). */
+    cbm_ui_log_init();
     cbm_mutex_lock(&g_log_mutex);
     snprintf(g_log_ring[g_log_head], LOG_LINE_MAX, "%s", line);
     g_log_head = (g_log_head + 1) % LOG_RING_SIZE;
@@ -793,6 +818,7 @@ static void handle_index_start(struct mg_connection *c, struct mg_http_message *
         mg_http_reply(c, 500, g_cors_json, "{\"error\":\"thread creation failed\"}");
         return;
     }
+    cbm_thread_detach(&tid); /* Don't leak thread handle */
 
     mg_http_reply(c, 202, g_cors_json, "{\"status\":\"indexing\",\"slot\":%d,\"path\":\"%s\"}",
                   slot, job->root_path);
