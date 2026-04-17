@@ -750,6 +750,8 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     return srv->store;
 }
 
+static bool is_project_db_file(const char *name, size_t len);
+
 /* Scan cache dir for .db files, writing comma-separated quoted names into out.
  * Returns the number of projects found. */
 static int collect_db_project_names(const char *dir_path, char *out, size_t out_sz) {
@@ -763,10 +765,7 @@ static int collect_db_project_names(const char *dir_path, char *out, size_t out_
     while ((entry = cbm_readdir(d)) != NULL) {
         const char *n = entry->name;
         size_t len = strlen(n);
-        if (len < MCP_MIN_DB_NAME || strcmp(n + len - MCP_DB_EXT, ".db") != 0) {
-            continue;
-        }
-        if (strncmp(n, "tmp-", SLEN("tmp-")) == 0 || strncmp(n, "_", SLEN("_")) == 0) {
+        if (!is_project_db_file(n, len)) {
             continue;
         }
         if (count > 0 && offset < (int)out_sz - MCP_SEPARATOR) {
@@ -825,8 +824,7 @@ static bool is_project_db_file(const char *name, size_t len) {
     if (len < MCP_MIN_DB_NAME || strcmp(name + len - MCP_DB_EXT, ".db") != 0) {
         return false;
     }
-    if (strncmp(name, "tmp-", SLEN("tmp-")) == 0 || strncmp(name, "_", SLEN("_")) == 0 ||
-        strncmp(name, ":memory:", SLEN(":memory:")) == 0) {
+    if (strncmp(name, "_", SLEN("_")) == 0 || strncmp(name, ":memory:", SLEN(":memory:")) == 0) {
         return false;
     }
     return true;
@@ -846,23 +844,29 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
     int nodes = 0;
     int edges = 0;
     char root_path_buf[CBM_SZ_1K] = "";
+    char indexed_name_buf[CBM_SZ_1K];
+    snprintf(indexed_name_buf, sizeof(indexed_name_buf), "%s", project_name);
     if (pstore) {
-        nodes = cbm_store_count_nodes(pstore, project_name);
-        edges = cbm_store_count_edges(pstore, project_name);
-        cbm_project_t proj = {0};
-        if (cbm_store_get_project(pstore, project_name, &proj) == CBM_STORE_OK) {
-            if (proj.root_path) {
-                snprintf(root_path_buf, sizeof(root_path_buf), "%s", proj.root_path);
+        cbm_project_t *projects = NULL;
+        int project_count = 0;
+        if (cbm_store_list_projects(pstore, &projects, &project_count) == CBM_STORE_OK &&
+            project_count > 0) {
+            const cbm_project_t *proj = &projects[0];
+            if (proj->name && proj->name[0] != '\0') {
+                snprintf(indexed_name_buf, sizeof(indexed_name_buf), "%s", proj->name);
             }
-            free((void *)proj.name);
-            free((void *)proj.indexed_at);
-            free((void *)proj.root_path);
+            if (proj->root_path && proj->root_path[0] != '\0') {
+                snprintf(root_path_buf, sizeof(root_path_buf), "%s", proj->root_path);
+            }
+            cbm_store_free_projects(projects, project_count);
         }
+        nodes = cbm_store_count_nodes(pstore, indexed_name_buf);
+        edges = cbm_store_count_edges(pstore, indexed_name_buf);
         cbm_store_close(pstore);
     }
 
     yyjson_mut_val *p = yyjson_mut_obj(doc);
-    yyjson_mut_obj_add_strcpy(doc, p, "name", project_name);
+    yyjson_mut_obj_add_strcpy(doc, p, "name", indexed_name_buf);
     yyjson_mut_obj_add_strcpy(doc, p, "root_path", root_path_buf);
     yyjson_mut_obj_add_int(doc, p, "nodes", nodes);
     yyjson_mut_obj_add_int(doc, p, "edges", edges);
@@ -2043,11 +2047,25 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
                     "explore the codebase with get_architecture(aspects=['all']), then use "
                     "manage_adr(mode='store') to persist architectural insights across sessions.");
             }
+
+            /* Flush WAL pages into the main database before the fleet layer
+             * snapshots the project artifact. */
+            (void)cbm_store_checkpoint(store);
         }
     }
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+
+    /* Release the indexed store so follow-up requests reopen from the fresh
+     * checkpointed database file instead of a long-lived write connection. */
+    if (srv->owns_store && srv->store) {
+        cbm_store_close(srv->store);
+        srv->store = NULL;
+    }
+    free(srv->current_project);
+    srv->current_project = NULL;
+
     free(project_name);
     free(repo_path);
 
@@ -2147,15 +2165,34 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
 /* Resolve an absolute path from root_path + file_path, verify containment,
  * and read source lines. Sets *out_abs_path (caller frees). Returns source
  * string (caller frees) or NULL if path is invalid/unreadable. */
+static bool cbm_path_is_absolute(const char *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+#ifdef _WIN32
+    return path[0] == '/' || path[0] == '\\' ||
+           ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+               path[1] == ':';
+#else
+    return path[0] == '/';
+#endif
+}
+
 static char *resolve_snippet_source(const char *root_path, const char *file_path, int start,
                                     int end, char **out_abs_path) {
     *out_abs_path = NULL;
     if (!root_path || !file_path) {
         return NULL;
     }
-    size_t apsz = strlen(root_path) + strlen(file_path) + MCP_SEPARATOR;
+    size_t apsz = cbm_path_is_absolute(file_path)
+                      ? strlen(file_path) + SKIP_ONE
+                      : strlen(root_path) + strlen(file_path) + MCP_SEPARATOR;
     char *abs_path = malloc(apsz);
-    snprintf(abs_path, apsz, "%s/%s", root_path, file_path);
+    if (cbm_path_is_absolute(file_path)) {
+        snprintf(abs_path, apsz, "%s", file_path);
+    } else {
+        snprintf(abs_path, apsz, "%s/%s", root_path, file_path);
+    }
 
     char real_root[CBM_SZ_4K];
     char real_file[CBM_SZ_4K];

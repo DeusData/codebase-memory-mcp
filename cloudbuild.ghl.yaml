@@ -1,0 +1,17 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - build
+      - -f
+      - Dockerfile.ghl
+      - -t
+      - gcr.io/$PROJECT_ID/codebase-memory-mcp-ghl:latest
+      - .
+    timeout: 1200s
+
+images:
+  - gcr.io/$PROJECT_ID/codebase-memory-mcp-ghl:latest
+
+options:
+  machineType: E2_HIGHCPU_32
+  logging: CLOUD_LOGGING_ONLY

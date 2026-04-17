@@ -1,0 +1,14 @@
+{{- if .Values.reposManifest.configMap.enabled -}}
+# Optional: override REPOS.yaml from a ConfigMap instead of baking it into the image.
+# Set reposManifest.configMap.enabled=true and supply the full REPOS.yaml content
+# in a values override or via --set-file.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.reposManifest.configMap.name | default (printf "%s-repos" (include "codebase-memory-mcp.fullname" .)) }}
+  labels:
+    {{- include "codebase-memory-mcp.labels" . | nindent 4 }}
+data:
+  REPOS.yaml: |
+    # Populated at deploy time via --set-file or Helm values
+{{- end }}
