@@ -52,20 +52,41 @@ jobs:
           node-version: "22"
 
       - name: Build standard binary
-        run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+        env:
+          VERSION: ${{ inputs.version }}
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            scripts/build.sh --version "$VERSION" "CC=$CC" "CXX=$CXX"
+          else
+            scripts/build.sh "CC=$CC" "CXX=$CXX"
+          fi
 
       - name: Ad-hoc sign macOS binary
         if: startsWith(matrix.os, 'macos')
         run: codesign --sign - --force build/c/codebase-memory-mcp
 
       - name: Archive standard binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
           cp LICENSE install.sh build/c/
-          tar -czf codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
+          tar -czf "codebase-memory-mcp-${GOOS}-${GOARCH}.tar.gz" \
             -C build/c codebase-memory-mcp LICENSE install.sh
 
       - name: Build UI binary
-        run: scripts/build.sh --with-ui ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+        env:
+          VERSION: ${{ inputs.version }}
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            scripts/build.sh --with-ui --version "$VERSION" "CC=$CC" "CXX=$CXX"
+          else
+            scripts/build.sh --with-ui "CC=$CC" "CXX=$CXX"
+          fi
 
       - name: Ad-hoc sign macOS UI binary
         if: startsWith(matrix.os, 'macos')
@@ -76,9 +97,12 @@ jobs:
         run: scripts/security-ui.sh
 
       - name: Archive UI binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
           cp LICENSE install.sh build/c/
-          tar -czf codebase-memory-mcp-ui-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
+          tar -czf "codebase-memory-mcp-ui-${GOOS}-${GOARCH}.tar.gz" \
             -C build/c codebase-memory-mcp LICENSE install.sh
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -108,7 +132,14 @@ jobs:
 
       - name: Build standard binary
         shell: msys2 {0}
-        run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=clang CXX=clang++
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            scripts/build.sh --version "$VERSION" CC=clang CXX=clang++
+          else
+            scripts/build.sh CC=clang CXX=clang++
+          fi
 
       - name: Archive standard binary
         shell: msys2 {0}
@@ -120,7 +151,14 @@ jobs:
 
       - name: Build UI binary
         shell: msys2 {0}
-        run: scripts/build.sh --with-ui ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=clang CXX=clang++
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            scripts/build.sh --with-ui --version "$VERSION" CC=clang CXX=clang++
+          else
+            scripts/build.sh --with-ui CC=clang CXX=clang++
+          fi
 
       - name: Archive UI binary
         shell: msys2 {0}
@@ -159,7 +197,14 @@ jobs:
           node-version: "22"
 
       - name: Build standard binary (static)
-        run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=gcc CXX=g++ STATIC=1
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            scripts/build.sh --version "$VERSION" CC=gcc CXX=g++ STATIC=1
+          else
+            scripts/build.sh CC=gcc CXX=g++ STATIC=1
+          fi
 
       - name: Verify static linking
         run: |
@@ -167,18 +212,29 @@ jobs:
           ldd build/c/codebase-memory-mcp 2>&1 | grep -q "not a dynamic executable" || ldd build/c/codebase-memory-mcp 2>&1 | grep -q "statically linked"
 
       - name: Archive standard binary
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           cp LICENSE install.sh build/c/
-          tar -czf codebase-memory-mcp-linux-${{ matrix.arch }}-portable.tar.gz \
+          tar -czf "codebase-memory-mcp-linux-${ARCH}-portable.tar.gz" \
             -C build/c codebase-memory-mcp LICENSE install.sh
 
       - name: Build UI binary (static)
-        run: scripts/build.sh --with-ui ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=gcc CXX=g++ STATIC=1
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            scripts/build.sh --with-ui --version "$VERSION" CC=gcc CXX=g++ STATIC=1
+          else
+            scripts/build.sh --with-ui CC=gcc CXX=g++ STATIC=1
+          fi
 
       - name: Archive UI binary
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           cp LICENSE install.sh build/c/
-          tar -czf codebase-memory-mcp-ui-linux-${{ matrix.arch }}-portable.tar.gz \
+          tar -czf "codebase-memory-mcp-ui-linux-${ARCH}-portable.tar.gz" \
             -C build/c codebase-memory-mcp LICENSE install.sh
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
