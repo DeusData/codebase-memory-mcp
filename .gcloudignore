@@ -1,7 +1,14 @@
 **
 !Dockerfile.ghl
 !cloudbuild.ghl.yaml
+!Makefile.cbm
 !REPOS.yaml
 !REPOS.local.yaml
+!src
+!src/**
+!internal
+!internal/**
+!vendored
+!vendored/**
 !ghl
 !ghl/**

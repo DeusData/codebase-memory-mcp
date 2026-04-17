@@ -750,6 +750,8 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     return srv->store;
 }
 
+static bool is_project_db_file(const char *name, size_t len);
+
 /* Scan cache dir for .db files, writing comma-separated quoted names into out.
  * Returns the number of projects found. */
 static int collect_db_project_names(const char *dir_path, char *out, size_t out_sz) {
@@ -763,10 +765,7 @@ static int collect_db_project_names(const char *dir_path, char *out, size_t out_
     while ((entry = cbm_readdir(d)) != NULL) {
         const char *n = entry->name;
         size_t len = strlen(n);
-        if (len < MCP_MIN_DB_NAME || strcmp(n + len - MCP_DB_EXT, ".db") != 0) {
-            continue;
-        }
-        if (strncmp(n, "tmp-", SLEN("tmp-")) == 0 || strncmp(n, "_", SLEN("_")) == 0) {
+        if (!is_project_db_file(n, len)) {
             continue;
         }
         if (count > 0 && offset < (int)out_sz - MCP_SEPARATOR) {
@@ -825,8 +824,7 @@ static bool is_project_db_file(const char *name, size_t len) {
     if (len < MCP_MIN_DB_NAME || strcmp(name + len - MCP_DB_EXT, ".db") != 0) {
         return false;
     }
-    if (strncmp(name, "tmp-", SLEN("tmp-")) == 0 || strncmp(name, "_", SLEN("_")) == 0 ||
-        strncmp(name, ":memory:", SLEN(":memory:")) == 0) {
+    if (strncmp(name, "_", SLEN("_")) == 0 || strncmp(name, ":memory:", SLEN(":memory:")) == 0) {
         return false;
     }
     return true;
@@ -2049,11 +2047,25 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
                     "explore the codebase with get_architecture(aspects=['all']), then use "
                     "manage_adr(mode='store') to persist architectural insights across sessions.");
             }
+
+            /* Flush WAL pages into the main database before the fleet layer
+             * snapshots the project artifact. */
+            (void)cbm_store_checkpoint(store);
         }
     }
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+
+    /* Release the indexed store so follow-up requests reopen from the fresh
+     * checkpointed database file instead of a long-lived write connection. */
+    if (srv->owns_store && srv->store) {
+        cbm_store_close(srv->store);
+        srv->store = NULL;
+    }
+    free(srv->current_project);
+    srv->current_project = NULL;
+
     free(project_name);
     free(repo_path);
 

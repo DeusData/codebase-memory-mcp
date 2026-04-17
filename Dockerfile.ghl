@@ -6,19 +6,28 @@
 #   stage 3 (run):    minimal runtime image
 
 # ── Stage 1: codebase-memory-mcp binary ──────────────────────────
-FROM alpine:3.20 AS cbm
+FROM debian:12-slim AS cbm
 
-ARG CBM_VERSION=0.6.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      git \
+      pkg-config \
+      zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN apk add --no-cache curl ca-certificates && \
-    curl -fsSL \
-      "https://github.com/DeusData/codebase-memory-mcp/releases/download/v${CBM_VERSION}/codebase-memory-mcp-linux-amd64-portable.tar.gz" \
-      -o /tmp/cbm.tar.gz && \
-    tar -xzf /tmp/cbm.tar.gz -C /tmp && \
-    install -m 0755 /tmp/codebase-memory-mcp /usr/local/bin/codebase-memory-mcp
+WORKDIR /src
+
+COPY Makefile.cbm ./
+COPY src/ ./src/
+COPY internal/ ./internal/
+COPY vendored/ ./vendored/
+
+RUN make -f Makefile.cbm cbm && \
+    install -m 0755 build/c/codebase-memory-mcp /usr/local/bin/codebase-memory-mcp
 
 # ── Stage 2: Go fleet server ──────────────────────────────────────
-FROM golang:1.23-alpine AS build
+FROM golang:1.25-alpine AS build
 
 WORKDIR /src
 
@@ -60,12 +69,15 @@ WORKDIR /app
 ENV PORT=8080 \
     CBM_BINARY=/app/codebase-memory-mcp \
     CBM_CACHE_DIR=/tmp/codebase-memory-mcp \
-    FLEET_CACHE_DIR=/app/fleet-cache \
+    CBM_ARTIFACT_DIR=/data/fleet-cache/indexes \
+    FLEET_CACHE_DIR=/data/fleet-cache/repos \
     REPOS_MANIFEST=/app/REPOS.local.yaml \
     BRIDGE_CLIENTS=4 \
     BRIDGE_ACQUIRE_TIMEOUT_MS=1500 \
     FLEET_CONCURRENCY=8 \
     INDEXER_CLIENTS=8 \
+    STARTUP_INDEX_ENABLED=false \
+    SCHEDULED_INDEXING_ENABLED=false \
     CRON_INCREMENTAL="0 */6 * * *" \
     CRON_FULL="0 2 * * 0"
 

@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -30,6 +31,7 @@ import (
 
 	ghlauth "github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/auth"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/bridge"
+	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/cachepersist"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/discovery"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/indexer"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/manifest"
@@ -49,6 +51,47 @@ func main() {
 	slog.SetDefault(logger)
 
 	cfg := loadConfig()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := os.MkdirAll(cfg.CloneCacheDir, 0o750); err != nil {
+		slog.Error("failed to create clone cache dir", "path", cfg.CloneCacheDir, "err", err)
+		os.Exit(1)
+	}
+	if err := os.MkdirAll(cfg.CBMCacheDir, 0o750); err != nil {
+		slog.Error("failed to create cbm cache dir", "path", cfg.CBMCacheDir, "err", err)
+		os.Exit(1)
+	}
+
+	var artifactSync *cachepersist.Syncer
+	if cfg.ArtifactsEnabled {
+		var err error
+		switch strings.ToLower(strings.TrimSpace(cfg.ArtifactsBackend)) {
+		case "gcs":
+			artifactSync, err = cachepersist.NewGCS(ctx, cfg.CBMCacheDir, cfg.ArtifactsBucket, cfg.ArtifactsPrefix)
+		default:
+			artifactSync, err = cachepersist.New(cfg.CBMCacheDir, cfg.ArtifactDir)
+		}
+		if err != nil {
+			slog.Error("failed to initialize artifact sync", "runtime_dir", cfg.CBMCacheDir, "artifact_dir", cfg.ArtifactDir, "err", err)
+			os.Exit(1)
+		}
+		defer func() {
+			if err := artifactSync.Close(); err != nil {
+				slog.Warn("failed to close artifact sync", "err", err)
+			}
+		}()
+		if cfg.ArtifactsSkipHydrate {
+			slog.Info("skipping persisted index hydrate", "artifact_dir", cfg.ArtifactDir, "cache_dir", cfg.CBMCacheDir)
+		} else {
+			hydrated, err := artifactSync.Hydrate()
+			if err != nil {
+				slog.Error("failed to hydrate persisted indexes", "artifact_dir", cfg.ArtifactDir, "cache_dir", cfg.CBMCacheDir, "err", err)
+				os.Exit(1)
+			}
+			slog.Info("hydrated persisted indexes", "count", hydrated, "artifact_dir", cfg.ArtifactDir, "cache_dir", cfg.CBMCacheDir)
+		}
+	}
 
 	// ── Load fleet manifest ──────────────────────────────────
 
@@ -59,10 +102,60 @@ func main() {
 	}
 	slog.Info("fleet manifest loaded", "repos", len(m.Repos))
 
-	// ── Start MCP binary clients ─────────────────────────────
+	cloner := &gitCloner{
+		logger:      logger,
+		githubToken: cfg.GitHubToken,
+	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	newFleetIndexer := func(client indexer.Client, discoverySvc *discovery.Discoverer) *indexer.Indexer {
+		return indexer.New(indexer.Config{
+			Client:      client,
+			Cloner:      cloner,
+			CacheDir:    cfg.CloneCacheDir,
+			Concurrency: cfg.Concurrency,
+			OnRepoStart: func(slug string) { slog.Info("indexing repo", "repo", slug) },
+			OnRepoDone: func(slug string, err error) {
+				if err != nil {
+					slog.Error("repo indexing failed", "repo", slug, "err", err)
+					return
+				}
+				if artifactSync != nil {
+					projectName := projectNameFromPath(filepath.Join(cfg.CloneCacheDir, slug))
+					persisted, persistErr := artifactSync.PersistProject(projectName)
+					if persistErr != nil {
+						slog.Error("failed to persist project index", "repo", slug, "project", projectName, "err", persistErr)
+					} else {
+						slog.Info("persisted project index", "repo", slug, "project", projectName, "files", persisted)
+					}
+				}
+				if discoverySvc != nil {
+					discoverySvc.Invalidate()
+				}
+				slog.Info("repo indexed", "repo", slug)
+			},
+		})
+	}
+
+	if cfg.RunMode == "index-all" {
+		indexPool, err := newMCPIndexClientPool(ctx, cfg.BinaryPath, cfg.IndexerClients, cfg.IndexerClientMaxUses)
+		if err != nil {
+			slog.Error("failed to start indexer client pool", "clients", cfg.IndexerClients, "err", err)
+			os.Exit(1)
+		}
+		defer indexPool.Close()
+		slog.Info("indexer client pool started", "clients", cfg.IndexerClients, "max_uses", cfg.IndexerClientMaxUses)
+
+		idx := newFleetIndexer(indexPool, nil)
+		slog.Info("running one-shot fleet indexing job", "force", cfg.RunForce)
+		result := idx.IndexAll(context.Background(), m.Repos, cfg.RunForce)
+		slog.Info("one-shot fleet indexing complete", "total", result.Total, "ok", result.Succeeded, "failed", result.Failed)
+		if result.Failed > 0 {
+			os.Exit(1)
+		}
+		return
+	}
+
+	// ── Start MCP binary clients ─────────────────────────────
 
 	bridgePool, err := newMCPBridgeClientPool(ctx, cfg.BinaryPath, cfg.BridgeClients, cfg.BridgeAcquireTimeout)
 	if err != nil {
@@ -78,13 +171,13 @@ func main() {
 		"acquire_timeout_ms", cfg.BridgeAcquireTimeout.Milliseconds(),
 	)
 
-	indexPool, err := newMCPIndexClientPool(ctx, cfg.BinaryPath, cfg.IndexerClients)
+	indexPool, err := newMCPIndexClientPool(ctx, cfg.BinaryPath, cfg.IndexerClients, cfg.IndexerClientMaxUses)
 	if err != nil {
 		slog.Error("failed to start indexer client pool", "clients", cfg.IndexerClients, "err", err)
 		os.Exit(1)
 	}
 	defer indexPool.Close()
-	slog.Info("indexer client pool started", "clients", cfg.IndexerClients)
+	slog.Info("indexer client pool started", "clients", cfg.IndexerClients, "max_uses", cfg.IndexerClientMaxUses)
 
 	discoveryPool, err := newMCPDiscoveryClientPool(ctx, cfg.BinaryPath, cfg.DiscoveryClients)
 	if err != nil {
@@ -107,29 +200,6 @@ func main() {
 	// ── Build indexer ────────────────────────────────────────
 
 	var discoverySvc *discovery.Discoverer
-	cloner := &gitCloner{
-		logger:      logger,
-		githubToken: cfg.GitHubToken,
-	}
-
-	idx := indexer.New(indexer.Config{
-		Client:      indexPool,
-		Cloner:      cloner,
-		CacheDir:    cfg.CacheDir,
-		Concurrency: cfg.Concurrency,
-		OnRepoStart: func(slug string) { slog.Info("indexing repo", "repo", slug) },
-		OnRepoDone: func(slug string, err error) {
-			if err != nil {
-				slog.Error("repo indexing failed", "repo", slug, "err", err)
-				return
-			}
-			if discoverySvc != nil {
-				discoverySvc.Invalidate()
-			}
-			slog.Info("repo indexed", "repo", slug)
-		},
-	})
-
 	maxGraphCandidates := 3
 	if cfg.DiscoveryMaxCandidates > 0 && cfg.DiscoveryMaxCandidates < maxGraphCandidates {
 		maxGraphCandidates = cfg.DiscoveryMaxCandidates
@@ -139,24 +209,39 @@ func main() {
 		MaxGraphCandidates: maxGraphCandidates,
 		RequestTimeout:     cfg.DiscoveryTimeout,
 	})
+	idx := newFleetIndexer(indexPool, discoverySvc)
+
+	var fleetIndexing atomic.Bool
+	startFleetIndex := func(reason string, force bool) bool {
+		if !fleetIndexing.CompareAndSwap(false, true) {
+			slog.Warn("fleet index already running", "reason", reason, "force", force)
+			return false
+		}
+		go func() {
+			defer fleetIndexing.Store(false)
+			slog.Info("fleet index starting", "reason", reason, "force", force)
+			result := idx.IndexAll(context.Background(), m.Repos, force)
+			slog.Info("fleet index complete", "reason", reason, "force", force, "total", result.Total, "ok", result.Succeeded, "failed", result.Failed)
+		}()
+		return true
+	}
 
 	// ── Fleet scheduler ──────────────────────────────────────
 
 	c := cron.New()
-	c.AddFunc(cfg.IncrementalCron, func() {
-		slog.Info("fleet index (incremental) starting")
-		result := idx.IndexAll(context.Background(), m.Repos, false)
-		slog.Info("fleet index (incremental) complete",
-			"total", result.Total, "ok", result.Succeeded, "failed", result.Failed)
-	})
-	c.AddFunc(cfg.FullCron, func() {
-		slog.Info("fleet index (full) starting")
-		result := idx.IndexAll(context.Background(), m.Repos, true)
-		slog.Info("fleet index (full) complete",
-			"total", result.Total, "ok", result.Succeeded, "failed", result.Failed)
-	})
-	c.Start()
-	defer c.Stop()
+	if cfg.ScheduledIndexingEnabled {
+		c.AddFunc(cfg.IncrementalCron, func() {
+			startFleetIndex("cron-incremental", false)
+		})
+		c.AddFunc(cfg.FullCron, func() {
+			startFleetIndex("cron-full", true)
+		})
+		c.Start()
+		defer c.Stop()
+		slog.Info("scheduled indexing enabled", "incremental_cron", cfg.IncrementalCron, "full_cron", cfg.FullCron)
+	} else {
+		slog.Info("scheduled indexing disabled")
+	}
 
 	// ── HTTP router ──────────────────────────────────────────
 
@@ -210,14 +295,39 @@ func main() {
 		fmt.Fprintf(w, `{"accepted":true,"repo":%q}`, slug)
 	}))
 
+	r.Post("/index-all", requireAuth(func(w http.ResponseWriter, req *http.Request) {
+		force := req.URL.Query().Get("force") == "1" || strings.EqualFold(req.URL.Query().Get("force"), "true")
+		if !startFleetIndex("manual", force) {
+			http.Error(w, "fleet index already running", http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprintf(w, `{"accepted":true,"force":%t}`, force)
+	}))
+
 	// Fleet status endpoint
 	r.Get("/status", requireAuth(func(w http.ResponseWriter, req *http.Request) {
+		artifactCount := 0
+		artifactLocation := cfg.ArtifactDir
+		if artifactSync != nil {
+			count, err := artifactSync.CountArtifacts()
+			if err != nil {
+				slog.Warn("failed to count persisted indexes", "err", err)
+			} else {
+				artifactCount = count
+			}
+			artifactLocation = artifactSync.ArtifactDir
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"repos":                    len(m.Repos),
 			"version":                  bridgePool.ServerInfo().Version,
 			"binary":                   cfg.BinaryPath,
-			"cache":                    cfg.CacheDir,
+			"clone_cache":              cfg.CloneCacheDir,
+			"cbm_cache":                cfg.CBMCacheDir,
+			"artifact_dir":             artifactLocation,
+			"artifact_files":           artifactCount,
+			"artifacts_enabled":        cfg.ArtifactsEnabled,
 			"manifest":                 cfg.ReposManifest,
 			"concurrency":              cfg.Concurrency,
 			"bridge_clients":           cfg.BridgeClients,
@@ -226,6 +336,9 @@ func main() {
 			"discovery_clients":        cfg.DiscoveryClients,
 			"discovery_max_candidates": cfg.DiscoveryMaxCandidates,
 			"discovery_timeout_ms":     cfg.DiscoveryTimeout.Milliseconds(),
+			"startup_index_enabled":    cfg.StartupIndexEnabled,
+			"scheduled_index_enabled":  cfg.ScheduledIndexingEnabled,
+			"fleet_index_running":      fleetIndexing.Load(),
 			"github_auth_enabled":      cfg.GitHubAuthEnabled,
 		})
 	}))
@@ -240,12 +353,11 @@ func main() {
 
 	// ── Startup indexing pass ────────────────────────────────
 
-	go func() {
-		slog.Info("startup: running initial fleet index")
-		result := idx.IndexAll(context.Background(), m.Repos, false)
-		slog.Info("startup: initial fleet index complete",
-			"total", result.Total, "ok", result.Succeeded, "failed", result.Failed)
-	}()
+	if cfg.StartupIndexEnabled {
+		startFleetIndex("startup", false)
+	} else {
+		slog.Info("startup indexing disabled")
+	}
 
 	// ── Serve ────────────────────────────────────────────────
 
@@ -294,26 +406,38 @@ func makeAuthMiddleware(staticToken string, auth bridge.Authenticator) func(http
 // ── Config ─────────────────────────────────────────────────────
 
 type config struct {
-	Port                   string
-	BinaryPath             string
-	CacheDir               string
-	ReposManifest          string
-	BearerToken            string
-	GitHubToken            string
-	GitHubAuthEnabled      bool
-	GitHubAllowedOrgs      []string
-	GitHubAPIBaseURL       string
-	GitHubAuthCacheTTL     time.Duration
-	WebhookSecret          string
-	Concurrency            int
-	BridgeClients          int
-	BridgeAcquireTimeout   time.Duration
-	IndexerClients         int
-	DiscoveryClients       int
-	DiscoveryMaxCandidates int
-	DiscoveryTimeout       time.Duration
-	IncrementalCron        string
-	FullCron               string
+	Port                     string
+	BinaryPath               string
+	CloneCacheDir            string
+	CBMCacheDir              string
+	ArtifactDir              string
+	ArtifactsEnabled         bool
+	ArtifactsBackend         string
+	ArtifactsBucket          string
+	ArtifactsPrefix          string
+	ArtifactsSkipHydrate     bool
+	ReposManifest            string
+	BearerToken              string
+	GitHubToken              string
+	GitHubAuthEnabled        bool
+	GitHubAllowedOrgs        []string
+	GitHubAPIBaseURL         string
+	GitHubAuthCacheTTL       time.Duration
+	WebhookSecret            string
+	Concurrency              int
+	BridgeClients            int
+	BridgeAcquireTimeout     time.Duration
+	IndexerClients           int
+	IndexerClientMaxUses     int
+	DiscoveryClients         int
+	DiscoveryMaxCandidates   int
+	DiscoveryTimeout         time.Duration
+	IncrementalCron          string
+	FullCron                 string
+	StartupIndexEnabled      bool
+	ScheduledIndexingEnabled bool
+	RunMode                  string
+	RunForce                 bool
 }
 
 func loadConfig() config {
@@ -398,6 +522,15 @@ func loadConfig() config {
 		}
 		return n
 	}
+	getIndexerClientMaxUses := func() int {
+		v := getEnv("INDEXER_CLIENT_MAX_USES", "1")
+		n := 1
+		fmt.Sscanf(v, "%d", &n)
+		if n <= 0 {
+			return 1
+		}
+		return n
+	}
 	getDiscoveryClients := func(concurrency int) int {
 		v := getEnv("DISCOVERY_CLIENTS", "")
 		if v == "" {
@@ -445,26 +578,38 @@ func loadConfig() config {
 	}
 	concurrency := getConcurrency()
 	return config{
-		Port:                   getEnv("PORT", "8080"),
-		BinaryPath:             getEnv("CBM_BINARY", defaultBinaryPath()),
-		CacheDir:               getEnv("FLEET_CACHE_DIR", "/app/fleet-cache"),
-		ReposManifest:          getEnv("REPOS_MANIFEST", defaultManifestPath()),
-		BearerToken:            getEnv("BEARER_TOKEN", ""),
-		GitHubToken:            getEnv("GITHUB_TOKEN", ""),
-		GitHubAuthEnabled:      getBool("GITHUB_AUTH_ENABLED", false),
-		GitHubAllowedOrgs:      getStringList("GITHUB_ALLOWED_ORGS"),
-		GitHubAPIBaseURL:       getEnv("GITHUB_API_BASE_URL", "https://api.github.com"),
-		GitHubAuthCacheTTL:     getGitHubAuthCacheTTL(),
-		WebhookSecret:          getEnv("GITHUB_WEBHOOK_SECRET", ""),
-		Concurrency:            concurrency,
-		BridgeClients:          getBridgeClients(),
-		BridgeAcquireTimeout:   getBridgeAcquireTimeout(),
-		IndexerClients:         getIndexerClients(concurrency),
-		DiscoveryClients:       getDiscoveryClients(concurrency),
-		DiscoveryMaxCandidates: getDiscoveryMaxCandidates(),
-		DiscoveryTimeout:       getDiscoveryTimeout(),
-		IncrementalCron:        getEnv("CRON_INCREMENTAL", "0 */6 * * *"),
-		FullCron:               getEnv("CRON_FULL", "0 2 * * 0"),
+		Port:                     getEnv("PORT", "8080"),
+		BinaryPath:               getEnv("CBM_BINARY", defaultBinaryPath()),
+		CloneCacheDir:            getEnv("FLEET_CACHE_DIR", "/data/fleet-cache/repos"),
+		CBMCacheDir:              getEnv("CBM_CACHE_DIR", "/tmp/codebase-memory-mcp"),
+		ArtifactDir:              getEnv("CBM_ARTIFACT_DIR", "/data/fleet-cache/indexes"),
+		ArtifactsEnabled:         getBool("ARTIFACTS_ENABLED", true),
+		ArtifactsBackend:         getEnv("ARTIFACTS_BACKEND", "filesystem"),
+		ArtifactsBucket:          getEnv("ARTIFACTS_BUCKET", ""),
+		ArtifactsPrefix:          getEnv("ARTIFACTS_PREFIX", ""),
+		ArtifactsSkipHydrate:     getBool("ARTIFACTS_SKIP_HYDRATE", false),
+		ReposManifest:            getEnv("REPOS_MANIFEST", defaultManifestPath()),
+		BearerToken:              getEnv("BEARER_TOKEN", ""),
+		GitHubToken:              getEnv("GITHUB_TOKEN", ""),
+		GitHubAuthEnabled:        getBool("GITHUB_AUTH_ENABLED", false),
+		GitHubAllowedOrgs:        getStringList("GITHUB_ALLOWED_ORGS"),
+		GitHubAPIBaseURL:         getEnv("GITHUB_API_BASE_URL", "https://api.github.com"),
+		GitHubAuthCacheTTL:       getGitHubAuthCacheTTL(),
+		WebhookSecret:            getEnv("GITHUB_WEBHOOK_SECRET", ""),
+		Concurrency:              concurrency,
+		BridgeClients:            getBridgeClients(),
+		BridgeAcquireTimeout:     getBridgeAcquireTimeout(),
+		IndexerClients:           getIndexerClients(concurrency),
+		IndexerClientMaxUses:     getIndexerClientMaxUses(),
+		DiscoveryClients:         getDiscoveryClients(concurrency),
+		DiscoveryMaxCandidates:   getDiscoveryMaxCandidates(),
+		DiscoveryTimeout:         getDiscoveryTimeout(),
+		IncrementalCron:          getEnv("CRON_INCREMENTAL", "0 */6 * * *"),
+		FullCron:                 getEnv("CRON_FULL", "0 2 * * 0"),
+		StartupIndexEnabled:      getBool("STARTUP_INDEX_ENABLED", false),
+		ScheduledIndexingEnabled: getBool("SCHEDULED_INDEXING_ENABLED", false),
+		RunMode:                  strings.TrimSpace(getEnv("RUN_MODE", "serve")),
+		RunForce:                 getBool("RUN_FORCE", false),
 	}
 }
 
@@ -479,6 +624,35 @@ func defaultManifestPath() string {
 		}
 	}
 	return "/app/REPOS.yaml"
+}
+
+func projectNameFromPath(absPath string) string {
+	path := filepath.ToSlash(strings.TrimSpace(absPath))
+	if path == "" {
+		return "root"
+	}
+
+	var b strings.Builder
+	b.Grow(len(path))
+	prevDash := false
+	for _, r := range path {
+		if r == '/' || r == ':' {
+			if prevDash {
+				continue
+			}
+			b.WriteByte('-')
+			prevDash = true
+			continue
+		}
+		b.WriteRune(r)
+		prevDash = r == '-'
+	}
+
+	project := strings.Trim(b.String(), "-")
+	if project == "" {
+		return "root"
+	}
+	return project
 }
 
 func defaultBinaryPath() string {
@@ -787,19 +961,23 @@ var newIndexToolClient = func(ctx context.Context, binPath string) (indexToolCli
 
 type mcpToolClientPool struct {
 	binPath string
+	maxUses int
 	mu      sync.Mutex
 	clients chan indexToolClient
 	all     []indexToolClient
+	uses    map[indexToolClient]int
 }
 
-func newMCPToolClientPool(ctx context.Context, binPath string, size int) (*mcpToolClientPool, error) {
+func newMCPToolClientPool(ctx context.Context, binPath string, size int, maxUses int) (*mcpToolClientPool, error) {
 	if size <= 0 {
 		size = 1
 	}
 	pool := &mcpToolClientPool{
 		binPath: binPath,
+		maxUses: maxUses,
 		clients: make(chan indexToolClient, size),
 		all:     make([]indexToolClient, 0, size),
+		uses:    make(map[indexToolClient]int, size),
 	}
 	for i := 0; i < size; i++ {
 		client, err := newIndexToolClient(ctx, binPath)
@@ -808,6 +986,7 @@ func newMCPToolClientPool(ctx context.Context, binPath string, size int) (*mcpTo
 			return nil, fmt.Errorf("start indexer client %d/%d: %w", i+1, size, err)
 		}
 		pool.all = append(pool.all, client)
+		pool.uses[client] = 0
 		pool.clients <- client
 	}
 	return pool, nil
@@ -835,6 +1014,27 @@ func (p *mcpToolClientPool) release(client indexToolClient) {
 	p.clients <- client
 }
 
+func (p *mcpToolClientPool) retire(client indexToolClient) {
+	if client == nil {
+		return
+	}
+	client.Close()
+	go p.replaceClientAsync(client)
+}
+
+func (p *mcpToolClientPool) shouldRecycle(client indexToolClient) bool {
+	if p.maxUses <= 0 || client == nil {
+		return false
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	next := p.uses[client] + 1
+	p.uses[client] = next
+	return next >= p.maxUses
+}
+
 func (p *mcpToolClientPool) CallTool(ctx context.Context, name string, params map[string]interface{}) (*mcp.ToolResult, error) {
 	client, err := p.borrow(ctx)
 	if err != nil {
@@ -854,11 +1054,18 @@ func (p *mcpToolClientPool) CallTool(ctx context.Context, name string, params ma
 
 	select {
 	case out := <-resultCh:
-		p.release(client)
+		if out.err != nil {
+			p.retire(client)
+			return nil, out.err
+		}
+		if p.shouldRecycle(client) {
+			p.retire(client)
+		} else {
+			p.release(client)
+		}
 		return out.result, out.err
 	case <-ctx.Done():
-		client.Close()
-		go p.replaceClientAsync(client)
+		p.retire(client)
 		return nil, ctx.Err()
 	}
 }
@@ -874,12 +1081,14 @@ func (p *mcpToolClientPool) replaceClientAsync(dead indexToolClient) {
 	}
 
 	p.mu.Lock()
+	delete(p.uses, dead)
 	for i, client := range p.all {
 		if client == dead {
 			p.all[i] = replacement
 			break
 		}
 	}
+	p.uses[replacement] = 0
 	p.mu.Unlock()
 
 	p.release(replacement)
@@ -889,8 +1098,8 @@ type mcpIndexClientPool struct {
 	*mcpToolClientPool
 }
 
-func newMCPIndexClientPool(ctx context.Context, binPath string, size int) (*mcpIndexClientPool, error) {
-	pool, err := newMCPToolClientPool(ctx, binPath, size)
+func newMCPIndexClientPool(ctx context.Context, binPath string, size int, maxUses int) (*mcpIndexClientPool, error) {
+	pool, err := newMCPToolClientPool(ctx, binPath, size, maxUses)
 	if err != nil {
 		return nil, err
 	}
@@ -920,7 +1129,7 @@ type mcpDiscoveryClientPool struct {
 }
 
 func newMCPDiscoveryClientPool(ctx context.Context, binPath string, size int) (*mcpDiscoveryClientPool, error) {
-	pool, err := newMCPToolClientPool(ctx, binPath, size)
+	pool, err := newMCPToolClientPool(ctx, binPath, size, 0)
 	if err != nil {
 		return nil, err
 	}

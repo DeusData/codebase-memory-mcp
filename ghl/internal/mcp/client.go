@@ -82,7 +82,13 @@ type toolCallResult struct {
 // returns a ready-to-use Client. It blocks until initialization succeeds or ctx
 // is cancelled.
 func NewClient(ctx context.Context, binPath string) (*Client, error) {
-	cmd := exec.CommandContext(ctx, binPath)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// The startup context should bound initialization, not the subprocess lifetime.
+	// Pool replacement creates clients with short-lived bootstrap contexts.
+	cmd := exec.Command(binPath)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -107,6 +113,7 @@ func NewClient(ctx context.Context, binPath string) (*Client, error) {
 
 	if err := c.initialize(ctx); err != nil {
 		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return nil, fmt.Errorf("mcp: initialize: %w", err)
 	}
 

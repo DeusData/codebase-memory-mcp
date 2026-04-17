@@ -426,6 +426,55 @@ TEST(tool_list_projects_uses_indexed_project_metadata) {
     PASS();
 }
 
+TEST(tool_list_projects_includes_tmp_prefixed_runtime_dbs) {
+    char tmp_dir[256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm_projects_tmp_runtime_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp_dir));
+
+    const char *old_cache_dir = getenv("CBM_CACHE_DIR");
+    char old_cache_dir_buf[512] = "";
+    if (old_cache_dir) {
+        snprintf(old_cache_dir_buf, sizeof(old_cache_dir_buf), "%s", old_cache_dir);
+    }
+    cbm_setenv("CBM_CACHE_DIR", tmp_dir, 1);
+
+    cbm_store_t *store = cbm_store_open("tmp-fleet-cache-platform-backend");
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "tmp-fleet-cache-platform-backend",
+                                       "/tmp/fleet-cache/platform-backend"),
+              0);
+    cbm_store_close(store);
+
+    cbm_mcp_server_t *srv = setup_mcp_with_data();
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(srv, "list_projects", "{}");
+    char *resp = extract_text_content(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"tmp-fleet-cache-platform-backend\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"root_path\":\"/tmp/fleet-cache/platform-backend\""));
+    free(resp);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/tmp-fleet-cache-platform-backend.db", tmp_dir);
+    unlink(db_path);
+    snprintf(db_path, sizeof(db_path), "%s/tmp-fleet-cache-platform-backend.db-wal", tmp_dir);
+    unlink(db_path);
+    snprintf(db_path, sizeof(db_path), "%s/tmp-fleet-cache-platform-backend.db-shm", tmp_dir);
+    unlink(db_path);
+    rmdir(tmp_dir);
+
+    if (old_cache_dir) {
+        cbm_setenv("CBM_CACHE_DIR", old_cache_dir_buf, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    PASS();
+}
+
 TEST(tool_get_graph_schema_empty) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
 
@@ -1807,6 +1856,7 @@ SUITE(mcp) {
     /* Tool handlers */
     RUN_TEST(tool_list_projects_empty);
     RUN_TEST(tool_list_projects_uses_indexed_project_metadata);
+    RUN_TEST(tool_list_projects_includes_tmp_prefixed_runtime_dbs);
     RUN_TEST(tool_get_graph_schema_empty);
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);

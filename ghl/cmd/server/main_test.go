@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -393,6 +394,16 @@ func (f *fastToolClient) CallTool(ctx context.Context, name string, params map[s
 
 func (f *fastToolClient) Close() {}
 
+type failingToolClient struct {
+	err error
+}
+
+func (f *failingToolClient) CallTool(ctx context.Context, name string, params map[string]interface{}) (*mcp.ToolResult, error) {
+	return nil, f.err
+}
+
+func (f *failingToolClient) Close() {}
+
 type blockingBridgeClient struct {
 	info    mcp.ServerInfo
 	started chan struct{}
@@ -460,7 +471,7 @@ func TestMCPIndexClientPoolRunsConcurrentIndexing(t *testing.T) {
 	}
 	defer func() { newIndexToolClient = prevFactory }()
 
-	pool, err := newMCPIndexClientPool(context.Background(), "/tmp/cbm", 3)
+	pool, err := newMCPIndexClientPool(context.Background(), "/tmp/cbm", 3, 0)
 	if err != nil {
 		t.Fatalf("newMCPIndexClientPool: %v", err)
 	}
@@ -500,7 +511,7 @@ func TestMCPIndexClientPoolPropagatesToolErrors(t *testing.T) {
 	}
 	defer func() { newIndexToolClient = prevFactory }()
 
-	pool, err := newMCPIndexClientPool(context.Background(), "/tmp/cbm", 1)
+	pool, err := newMCPIndexClientPool(context.Background(), "/tmp/cbm", 1, 0)
 	if err != nil {
 		t.Fatalf("newMCPIndexClientPool: %v", err)
 	}
@@ -537,7 +548,7 @@ func TestMCPToolClientPoolReplacesTimedOutClient(t *testing.T) {
 	}
 	defer func() { newIndexToolClient = prevFactory }()
 
-	pool, err := newMCPToolClientPool(context.Background(), "/tmp/cbm", 1)
+	pool, err := newMCPToolClientPool(context.Background(), "/tmp/cbm", 1, 0)
 	if err != nil {
 		t.Fatalf("newMCPToolClientPool: %v", err)
 	}
@@ -568,6 +579,110 @@ func TestMCPToolClientPoolReplacesTimedOutClient(t *testing.T) {
 	}
 	if got := factoryCalls.Load(); got < 2 {
 		t.Fatalf("expected replacement factory call, got %d", got)
+	}
+}
+
+func TestMCPToolClientPoolReplacesErroredClient(t *testing.T) {
+	failing := &failingToolClient{err: errors.New("write |1: broken pipe")}
+	replacement := &fastToolClient{
+		result: &mcp.ToolResult{Content: []mcp.Content{{Type: "text", Text: "ok"}}},
+	}
+
+	var factoryCalls atomic.Int64
+	prevFactory := newIndexToolClient
+	newIndexToolClient = func(ctx context.Context, binPath string) (indexToolClient, error) {
+		switch factoryCalls.Add(1) {
+		case 1:
+			return failing, nil
+		case 2:
+			return replacement, nil
+		default:
+			return &fastToolClient{
+				result: &mcp.ToolResult{Content: []mcp.Content{{Type: "text", Text: "ok"}}},
+			}, nil
+		}
+	}
+	defer func() { newIndexToolClient = prevFactory }()
+
+	pool, err := newMCPToolClientPool(context.Background(), "/tmp/cbm", 1, 0)
+	if err != nil {
+		t.Fatalf("newMCPToolClientPool: %v", err)
+	}
+	defer pool.Close()
+
+	_, err = pool.CallTool(context.Background(), "index_repository", map[string]interface{}{"repo_path": "/tmp/repo"})
+	if err == nil || !strings.Contains(err.Error(), "broken pipe") {
+		t.Fatalf("expected broken pipe error, got %v", err)
+	}
+
+	result, err := pool.CallTool(context.Background(), "index_repository", map[string]interface{}{"repo_path": "/tmp/repo"})
+	if err != nil {
+		t.Fatalf("replacement client call failed: %v", err)
+	}
+	if len(result.Content) != 1 || result.Content[0].Text != "ok" {
+		t.Fatalf("unexpected replacement result: %+v", result)
+	}
+	if got := factoryCalls.Load(); got < 2 {
+		t.Fatalf("expected replacement factory call, got %d", got)
+	}
+}
+
+func TestMCPToolClientPoolRecyclesClientAfterMaxUses(t *testing.T) {
+	var factoryCalls atomic.Int64
+	prevFactory := newIndexToolClient
+	newIndexToolClient = func(ctx context.Context, binPath string) (indexToolClient, error) {
+		switch factoryCalls.Add(1) {
+		case 1:
+			return &fastToolClient{
+				result: &mcp.ToolResult{Content: []mcp.Content{{Type: "text", Text: "first"}}},
+			}, nil
+		default:
+			return &fastToolClient{
+				result: &mcp.ToolResult{Content: []mcp.Content{{Type: "text", Text: "second"}}},
+			}, nil
+		}
+	}
+	defer func() { newIndexToolClient = prevFactory }()
+
+	pool, err := newMCPToolClientPool(context.Background(), "/tmp/cbm", 1, 1)
+	if err != nil {
+		t.Fatalf("newMCPToolClientPool: %v", err)
+	}
+	defer pool.Close()
+
+	first, err := pool.CallTool(context.Background(), "index_repository", map[string]interface{}{"repo_path": "/tmp/repo"})
+	if err != nil {
+		t.Fatalf("first CallTool: %v", err)
+	}
+	if len(first.Content) != 1 || first.Content[0].Text != "first" {
+		t.Fatalf("unexpected first result: %+v", first)
+	}
+
+	second, err := pool.CallTool(context.Background(), "index_repository", map[string]interface{}{"repo_path": "/tmp/repo"})
+	if err != nil {
+		t.Fatalf("second CallTool: %v", err)
+	}
+	if len(second.Content) != 1 || second.Content[0].Text != "second" {
+		t.Fatalf("unexpected second result: %+v", second)
+	}
+	if got := factoryCalls.Load(); got < 2 {
+		t.Fatalf("expected recycled client, factory calls=%d", got)
+	}
+}
+
+func TestProjectNameFromPath(t *testing.T) {
+	cases := map[string]string{
+		"/tmp/fleet-cache/platform-backend":    "tmp-fleet-cache-platform-backend",
+		"/tmp//fleet-cache//platform-backend/": "tmp-fleet-cache-platform-backend",
+		"C:/tmp/fleet-cache/platform-backend":  "C-tmp-fleet-cache-platform-backend",
+		"":                                     "root",
+		"/":                                    "root",
+	}
+
+	for input, want := range cases {
+		if got := projectNameFromPath(input); got != want {
+			t.Fatalf("projectNameFromPath(%q): want %q, got %q", input, want, got)
+		}
 	}
 }
 

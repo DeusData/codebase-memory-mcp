@@ -225,3 +225,28 @@ func TestClient_Close_Idempotent(t *testing.T) {
 	c.Close()
 	c.Close() // should not panic
 }
+
+func TestClient_RemainsUsableAfterInitContextCancel(t *testing.T) {
+	bin := buildEchoServer(t)
+	startCtx, cancel := context.WithCancel(context.Background())
+
+	c, err := mcp.NewClient(startCtx, bin)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer c.Close()
+
+	cancel()
+	time.Sleep(100 * time.Millisecond)
+
+	callCtx, callCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer callCancel()
+
+	result, err := c.CallTool(callCtx, "list_projects", nil)
+	if err != nil {
+		t.Fatalf("CallTool after init context cancel: %v", err)
+	}
+	if len(result.Content) == 0 {
+		t.Fatal("CallTool after init context cancel: expected content, got empty")
+	}
+}
