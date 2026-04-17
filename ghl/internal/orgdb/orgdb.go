@@ -40,6 +40,52 @@ func (d *DB) Close() error {
 	return d.db.Close()
 }
 
+// RepoRecord is the data for a single repo in the org graph.
+type RepoRecord struct {
+	Name      string
+	GitHubURL string
+	Team      string
+	Type      string
+	Languages string // JSON array
+	NodeCount int
+	EdgeCount int
+}
+
+// UpsertRepo inserts or updates a repo in the org graph.
+func (d *DB) UpsertRepo(r RepoRecord) error {
+	_, err := d.db.Exec(`
+		INSERT INTO repos (name, github_url, team, type, languages, node_count, edge_count, indexed_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
+		ON CONFLICT(name) DO UPDATE SET
+			github_url = excluded.github_url,
+			team       = excluded.team,
+			type       = excluded.type,
+			languages  = excluded.languages,
+			node_count = excluded.node_count,
+			edge_count = excluded.edge_count,
+			indexed_at = excluded.indexed_at
+	`, r.Name, r.GitHubURL, r.Team, r.Type, r.Languages, r.NodeCount, r.EdgeCount)
+	if err != nil {
+		return fmt.Errorf("orgdb: upsert repo %q: %w", r.Name, err)
+	}
+	return nil
+}
+
+// UpsertTeamOwnership inserts or updates team ownership for a repo.
+func (d *DB) UpsertTeamOwnership(repoName, team, subTeam string) error {
+	_, err := d.db.Exec(`
+		INSERT INTO team_ownership (repo_name, team, sub_team)
+		VALUES (?, ?, ?)
+		ON CONFLICT(repo_name) DO UPDATE SET
+			team     = excluded.team,
+			sub_team = excluded.sub_team
+	`, repoName, team, subTeam)
+	if err != nil {
+		return fmt.Errorf("orgdb: upsert team ownership %q: %w", repoName, err)
+	}
+	return nil
+}
+
 func (d *DB) ensureSchema() error {
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS repos (
