@@ -20,6 +20,7 @@
 #include "foundation/log.h"
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
+#include "foundation/compat_thread.h"
 #include "foundation/compat_fs.h"
 #include "foundation/str_util.h"
 
@@ -50,6 +51,7 @@ struct cbm_watcher {
     cbm_index_fn index_fn;
     void *user_data;
     CBMHashTable *projects; /* name → project_state_t* */
+    cbm_mutex_t projects_lock;
     atomic_int stopped;
 };
 
@@ -236,6 +238,7 @@ cbm_watcher_t *cbm_watcher_new(cbm_store_t *store, cbm_index_fn index_fn, void *
     w->index_fn = index_fn;
     w->user_data = user_data;
     w->projects = cbm_ht_create(CBM_SZ_32);
+    cbm_mutex_init(&w->projects_lock);
     atomic_init(&w->stopped, 0);
     return w;
 }
@@ -244,8 +247,11 @@ void cbm_watcher_free(cbm_watcher_t *w) {
     if (!w) {
         return;
     }
+    cbm_mutex_lock(&w->projects_lock);
     cbm_ht_foreach(w->projects, free_state_entry, NULL);
     cbm_ht_free(w->projects);
+    cbm_mutex_unlock(&w->projects_lock);
+    cbm_mutex_destroy(&w->projects_lock);
     free(w);
 }
 
@@ -264,6 +270,7 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
     }
 
     /* Remove old entry first (key points to state's project_name) */
+    cbm_mutex_lock(&w->projects_lock);
     project_state_t *old = cbm_ht_get(w->projects, project_name);
     if (old) {
         cbm_ht_delete(w->projects, project_name);
@@ -272,6 +279,7 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
 
     project_state_t *s = state_new(project_name, root_path);
     cbm_ht_set(w->projects, s->project_name, s);
+    cbm_mutex_unlock(&w->projects_lock);
     cbm_log_info("watcher.watch", "project", project_name, "path", root_path);
 }
 
@@ -279,10 +287,14 @@ void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name) {
     if (!w || !project_name) {
         return;
     }
+    cbm_mutex_lock(&w->projects_lock);
     project_state_t *s = cbm_ht_get(w->projects, project_name);
     if (s) {
         cbm_ht_delete(w->projects, project_name);
         state_free(s);
+    }
+    cbm_mutex_unlock(&w->projects_lock);
+    if (s) {
         cbm_log_info("watcher.unwatch", "project", project_name);
     }
 }
@@ -421,7 +433,9 @@ int cbm_watcher_poll_once(cbm_watcher_t *w) {
         .now = now_ns(),
         .reindexed = 0,
     };
+    cbm_mutex_lock(&w->projects_lock);
     cbm_ht_foreach(w->projects, poll_project, &ctx);
+    cbm_mutex_unlock(&w->projects_lock);
     return ctx.reindexed;
 }
 

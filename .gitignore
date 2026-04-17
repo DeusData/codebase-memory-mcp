@@ -40,6 +40,10 @@ Thumbs.db
 # Local project memory (Claude Code auto-memory)
 memory/
 reference/
+.remember/
+
+CLAUDE.md
+docs/superpowers/
 
 # Build artifacts
 build/

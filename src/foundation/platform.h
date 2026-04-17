@@ -31,6 +31,48 @@ static inline void *safe_realloc(void *ptr, size_t size) {
     return tmp;
 }
 
+/* Safe free: frees and NULLs a pointer to prevent double-free / use-after-free.
+ * Accepts void** so it works with any pointer type via the macro. */
+static inline void safe_free_impl(void **pp) {
+    if (pp && *pp) {
+        free(*pp);
+        *pp = NULL;
+    }
+}
+#define safe_free(ptr) safe_free_impl((void **)(void *)&(ptr))
+
+/* Safe string free: frees a const char* and NULLs it.
+ * Casts away const so callers don't need the (void*) dance. */
+static inline void safe_str_free(const char **sp) {
+    if (sp && *sp) {
+        free((void *)*sp);
+        *sp = NULL;
+    }
+}
+
+/* Safe buffer free: frees a heap array and zeros its element count.
+ * Use for dynamic arrays paired with a size_t count. */
+static inline void safe_buf_free_impl(void **buf, size_t *count) {
+    if (buf && *buf) {
+        free(*buf);
+        *buf = NULL;
+    }
+    if (count) {
+        *count = 0;
+    }
+}
+#define safe_buf_free(buf, countp) safe_buf_free_impl((void **)(void *)&(buf), (countp))
+
+/* Safe grow: doubles capacity and reallocs when count reaches cap.
+ * Usage: safe_grow(arr, count, cap, growth_factor)
+ * Evaluates to the new arr (NULL on OOM — old memory freed by safe_realloc). */
+#define safe_grow(arr, n, cap, factor) do { \
+    if ((size_t)(n) >= (size_t)(cap)) { \
+        (cap) *= (factor); \
+        (arr) = safe_realloc((arr), (size_t)(cap) * sizeof(*(arr))); \
+    } \
+} while (0)
+
 /* ── Memory mapping ────────────────────────────────────────────── */
 
 /* Map a file read-only into memory. Returns NULL on error.

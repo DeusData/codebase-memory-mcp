@@ -375,6 +375,9 @@ int main(int argc, char **argv) {
     }
 
     /* Create and start watcher in background thread */
+    /* Initialize log mutex before any threads are created */
+    cbm_ui_log_init();
+
     cbm_store_t *watch_store = cbm_store_open_memory();
     g_watcher = cbm_watcher_new(watch_store, watcher_index_fn, NULL);
 
