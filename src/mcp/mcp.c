@@ -304,7 +304,7 @@ static const tool_def_t TOOLS[] = {
      "that score well on ALL keywords. Requires moderate/full index mode. Results appear in the "
      "'semantic_results' field (separate from 'results').\"},\"limit\":{\"type\":"
      "\"integer\",\"description\":\"Max results. Default: "
-     "unlimited\"},\"offset\":{\"type\":\"integer\",\"default\":0}},\"required\":[\"project\"]}"},
+     "200\"},\"offset\":{\"type\":\"integer\",\"default\":0}},\"required\":[\"project\"]}"},
 
     {"query_graph",
      "Execute a Cypher query against the knowledge graph for complex multi-hop patterns, "
@@ -1389,7 +1389,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     char *relationship = cbm_mcp_get_string_arg(args, "relationship");
     bool exclude_entry_points = cbm_mcp_get_bool_arg(args, "exclude_entry_points");
     bool include_connected = cbm_mcp_get_bool_arg(args, "include_connected");
-    int limit = cbm_mcp_get_int_arg(args, "limit", MCP_HALF_SEC_US);
+    enum { SEARCH_DEFAULT_LIMIT = 200 };
+    int limit = cbm_mcp_get_int_arg(args, "limit", SEARCH_DEFAULT_LIMIT);
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
     int min_degree = cbm_mcp_get_int_arg(args, "min_degree", CBM_NOT_FOUND);
     int max_degree = cbm_mcp_get_int_arg(args, "max_degree", CBM_NOT_FOUND);
