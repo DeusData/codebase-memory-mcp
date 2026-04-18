@@ -56,11 +56,6 @@ func PopulateOrgFromProjectDBs(ctx context.Context, db *orgdb.DB, caller MCPCall
 		repoByName[r.Name] = r
 	}
 
-	// Map project name → stripped repo name for Phase 2
-	type projEntry struct {
-		projectName string // original project name (for MCP calls)
-		repoName    string // stripped name (for org.db)
-	}
 	var entries []projEntry
 
 	for _, proj := range projects {
@@ -84,6 +79,14 @@ func PopulateOrgFromProjectDBs(ctx context.Context, db *orgdb.DB, caller MCPCall
 	}
 
 	slog.Info("phase 1 complete", "repos", len(entries))
+
+	// If Phase 1 found too few projects, GCS data likely hasn't loaded yet.
+	// Wait up to 3 minutes, polling list_projects every 30s.
+	if len(entries) < 50 {
+		slog.Info("phase 1 found few projects — waiting for GCS data to load", "found", len(entries))
+		entries = waitForProjects(ctx, caller, db, repoByName, repos, 50, 3*time.Minute)
+		slog.Info("after waiting", "projects", len(entries))
+	}
 
 	// ── Phase 2: Extract routes + packages via get_architecture ──
 	// Circuit breaker: if first 3 calls all fail, skip phase 2 entirely
@@ -187,6 +190,11 @@ func PopulateOrgFromProjectDBs(ctx context.Context, db *orgdb.DB, caller MCPCall
 	return nil
 }
 
+type projEntry struct {
+	projectName string // original project name (for MCP calls)
+	repoName    string // stripped name (for org.db)
+}
+
 // architectureResponse is the parsed get_architecture response.
 type architectureResponse struct {
 	Routes   []archRoute   `json:"routes"`
@@ -241,6 +249,89 @@ func splitPackage(name string) (string, string) {
 		return "", name
 	}
 	return name[:idx], name[idx+1:]
+}
+
+// waitForProjects polls list_projects until minCount projects are available or timeout.
+// Returns updated entries with repo metadata populated in org.db.
+func waitForProjects(ctx context.Context, caller MCPCaller, db *orgdb.DB,
+	repoByName map[string]manifest.Repo, repos []manifest.Repo,
+	minCount int, timeout time.Duration) []projEntry {
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		time.Sleep(30 * time.Second)
+
+		result, err := caller.CallTool(ctx, "list_projects", nil)
+		if err != nil {
+			continue
+		}
+		text := extractText(result)
+		if text == "" || text == "null" {
+			continue
+		}
+
+		var projects []projectInfo
+		if err := json.Unmarshal([]byte(text), &projects); err != nil {
+			var wrapped struct{ Projects []projectInfo }
+			if err2 := json.Unmarshal([]byte(text), &wrapped); err2 != nil {
+				continue
+			}
+			projects = wrapped.Projects
+		}
+
+		slog.Info("waitForProjects: poll", "found", len(projects), "need", minCount)
+
+		if len(projects) >= minCount {
+			// Re-populate org.db with full project list
+			var entries []projEntry
+			for _, proj := range projects {
+				repoName := stripProjectPrefix(proj.Name)
+				repo, ok := repoByName[repoName]
+				if !ok {
+					repo = manifest.Repo{Name: repoName}
+				}
+				db.UpsertRepo(orgdb.RepoRecord{
+					Name:      repoName,
+					GitHubURL: repo.GitHubURL,
+					Team:      repo.Team,
+					Type:      repo.Type,
+					NodeCount: proj.Nodes,
+					EdgeCount: proj.Edges,
+				})
+				db.UpsertTeamOwnership(repoName, repo.Team, "")
+				entries = append(entries, projEntry{projectName: proj.Name, repoName: repoName})
+			}
+			return entries
+		}
+	}
+
+	slog.Warn("waitForProjects: timeout — proceeding with available projects")
+	// Return whatever we got last time (re-enumerate)
+	result, err := caller.CallTool(ctx, "list_projects", nil)
+	if err != nil {
+		return nil
+	}
+	text := extractText(result)
+	var projects []projectInfo
+	if err := json.Unmarshal([]byte(text), &projects); err != nil {
+		return nil
+	}
+	var entries []projEntry
+	for _, proj := range projects {
+		repoName := stripProjectPrefix(proj.Name)
+		repo := repoByName[repoName]
+		db.UpsertRepo(orgdb.RepoRecord{
+			Name:      repoName,
+			GitHubURL: repo.GitHubURL,
+			Team:      repo.Team,
+			Type:      repo.Type,
+			NodeCount: proj.Nodes,
+			EdgeCount: proj.Edges,
+		})
+		db.UpsertTeamOwnership(repoName, repo.Team, "")
+		entries = append(entries, projEntry{projectName: proj.Name, repoName: repoName})
+	}
+	return entries
 }
 
 func extractText(result *mcp.ToolResult) string {
