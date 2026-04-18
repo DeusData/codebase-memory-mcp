@@ -171,34 +171,50 @@ func (s *Scanner) fetchTeamRepos(ctx context.Context) (map[string]string, error)
 		return nil, fmt.Errorf("list teams: %w", err)
 	}
 
-	// map[repoName] -> {teamSlug, priority}
+	// Only consider dev teams (team-*-devs) — these are the actual owning teams.
+	// Broad teams (platform-services, copilot-access) have admin on everything.
+	devTeams := make([]ghTeam, 0)
+	for _, t := range teams {
+		if strings.HasPrefix(t.Slug, "team-") && strings.HasSuffix(t.Slug, "-devs") {
+			devTeams = append(devTeams, t)
+		}
+	}
+	log.Printf("orgdiscovery: found %d dev teams (from %d total)", len(devTeams), len(teams))
+
+	// map[repoName] -> {domain, teamSlug, repoCount}
 	type ownership struct {
-		team     string
-		priority int // admin=3, maintain=2, push=1
+		domain    string
+		teamSlug  string
+		repoCount int // fewer repos = more specific team = better signal
 	}
 	best := make(map[string]ownership)
 
-	for _, team := range teams {
+	for _, team := range devTeams {
+		domain := normalizeTeamSlug(team.Slug)
+		if domain == "" {
+			continue
+		}
 		repos, err := s.listTeamRepos(ctx, team.Slug)
 		if err != nil {
 			log.Printf("orgdiscovery: list repos for team %s: %v", team.Slug, err)
 			continue
 		}
 		for _, repo := range repos {
-			p := permissionPriority(repo.Permissions)
-			if p == 0 {
-				continue
+			if !repo.Permissions["push"] && !repo.Permissions["admin"] {
+				continue // read-only access = not an owner
 			}
-			if cur, ok := best[repo.Name]; !ok || p > cur.priority {
-				best[repo.Name] = ownership{team: team.Slug, priority: p}
+			// Prefer the most specific team (fewest repos)
+			if cur, ok := best[repo.Name]; !ok || len(repos) < cur.repoCount {
+				best[repo.Name] = ownership{domain: domain, teamSlug: team.Slug, repoCount: len(repos)}
 			}
 		}
 	}
 
 	result := make(map[string]string, len(best))
 	for name, o := range best {
-		result[name] = o.team
+		result[name] = o.domain
 	}
+	log.Printf("orgdiscovery: mapped %d repos to teams via GitHub Teams API", len(result))
 	return result, nil
 }
 
@@ -296,30 +312,112 @@ func (s *Scanner) listTeamRepos(ctx context.Context, teamSlug string) ([]ghTeamR
 	return allRepos, nil
 }
 
-// inferTeamFromName guesses team from common GHL repo name prefixes.
+// normalizeTeamSlug extracts a domain name from a GitHub team slug.
+// e.g., "team-revex-memberships-devs" → "revex"
+//       "team-automation-workflows-devs" → "automation"
+//       "team-leadgen-funnels-devs" → "leadgen"
+//       "team-crm-contacts-devs" → "crm"
+//       "team-payments-dev" → "payments"
+//       "team-ai-devs" → "ai"
+func normalizeTeamSlug(slug string) string {
+	// Strip "team-" prefix and "-devs"/"-dev" suffix
+	s := strings.TrimPrefix(slug, "team-")
+	s = strings.TrimSuffix(s, "-devs")
+	s = strings.TrimSuffix(s, "-dev")
+
+	// Map known multi-part domains to their primary domain
+	domainMap := map[string]string{
+		"revex-memberships":       "revex",
+		"revex-blade-platform":    "revex",
+		"revex-internal-tools":    "revex",
+		"revex-isv":               "revex",
+		"revex-pyrw":              "revex",
+		"revex-saas":              "revex",
+		"automation-am":           "automation",
+		"automation-calendar":     "automation",
+		"automation-eliza":        "automation",
+		"automation-workflows":    "automation",
+		"leadgen-adpublishing":    "leadgen",
+		"leadgen-affiliate-manager": "leadgen",
+		"leadgen-ecom-store":      "leadgen",
+		"leadgen-emails-templates": "leadgen",
+		"leadgen-forms-survey":    "leadgen",
+		"leadgen-funnels":         "leadgen",
+		"leadgen-onboarding":      "leadgen",
+		"leadgen-reporting":       "leadgen",
+		"leadgen-social-planner":  "leadgen",
+		"crm-contacts":            "crm",
+		"crm-conversations":       "crm",
+		"crm-integrations":        "crm",
+		"lc-email":                "leadgen",
+		"platform-front-end":      "platform",
+		"proposals":               "leadgen",
+		"payments":                "payments",
+		"ai":                      "ai",
+	}
+
+	if domain, ok := domainMap[s]; ok {
+		return domain
+	}
+
+	// Fall back to first segment: "revex-foo-bar" → "revex"
+	parts := strings.SplitN(s, "-", 2)
+	return parts[0]
+}
+
+// inferTeamFromName guesses team from common GHL repo name prefixes and patterns.
 func inferTeamFromName(name string) string {
-	// Order matters: longer prefixes first to avoid false matches
+	// Order matters: longer/more specific prefixes first
 	prefixes := []struct {
 		prefix string
 		team   string
 	}{
+		// Specific GHL product prefixes
 		{"ghl-revex-", "revex"},
 		{"ghl-crm-", "crm"},
+		{"ghl-membership-", "revex"},
+		{"ghl-leadgen-", "leadgen"},
+		{"ghl-funnel-", "leadgen"},
+		{"ghl-calendars-", "automation"},
+		{"ghl-ai-", "ai"},
+		{"ghl-agentic-", "ai"},
+		// Domain prefixes
 		{"automation-", "automation"},
 		{"leadgen-", "leadgen"},
 		{"revex-", "revex"},
+		{"membership-", "revex"},
+		{"dev-commerce-", "commerce"},
+		{"dev-mobcom-", "mobile"},
+		{"dev-mobile-", "mobile"},
 		{"dev-", "commerce"},
 		{"ai-", "ai"},
 		{"mobile-", "mobile"},
 		{"marketplace-", "marketplace"},
 		{"sdet-", "sdet"},
 		{"i18n-", "i18n"},
+		{"highlevel-", "platform"},
+		{"highrise-", "platform"},
 		{"platform-", "platform"},
+		// Contains patterns (checked after prefix)
+		{"vibe-", "platform"},
 	}
 	for _, p := range prefixes {
 		if strings.HasPrefix(name, p.prefix) {
 			return p.team
 		}
 	}
-	return "platform" // default for GHL
+	// Contains-based matching for repos that don't follow prefix convention
+	if strings.Contains(name, "membership") || strings.Contains(name, "communities") || strings.Contains(name, "courses") {
+		return "revex"
+	}
+	if strings.Contains(name, "calendar") || strings.Contains(name, "workflow") {
+		return "automation"
+	}
+	if strings.Contains(name, "funnel") || strings.Contains(name, "form") || strings.Contains(name, "survey") {
+		return "leadgen"
+	}
+	if strings.Contains(name, "contact") || strings.Contains(name, "conversation") {
+		return "crm"
+	}
+	return "" // empty = unknown, will show up in org tools as unassigned
 }

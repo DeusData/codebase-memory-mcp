@@ -61,8 +61,8 @@ func TestEnrichOwnership_TeamsAPIFallback(t *testing.T) {
 		case r.URL.Path == "/repos/TestOrg/backend-svc/contents/.github/CODEOWNERS":
 			http.NotFound(w, r) // No CODEOWNERS
 		case r.URL.Path == "/orgs/TestOrg/teams":
-			json.NewEncoder(w).Encode([]ghTeam{{Slug: "payments-team"}})
-		case r.URL.Path == "/orgs/TestOrg/teams/payments-team/repos":
+			json.NewEncoder(w).Encode([]ghTeam{{Slug: "team-payments-devs"}})
+		case r.URL.Path == "/orgs/TestOrg/teams/team-payments-devs/repos":
 			json.NewEncoder(w).Encode([]ghTeamRepo{
 				{Name: "backend-svc", Permissions: map[string]bool{"admin": true, "push": true}},
 			})
@@ -82,8 +82,8 @@ func TestEnrichOwnership_TeamsAPIFallback(t *testing.T) {
 		t.Fatalf("EnrichOwnership: %v", err)
 	}
 
-	if repos[0].Team != "payments-team" {
-		t.Errorf("Team: got %q, want %q", repos[0].Team, "payments-team")
+	if repos[0].Team != "payments" {
+		t.Errorf("Team: got %q, want %q", repos[0].Team, "payments")
 	}
 }
 
@@ -175,21 +175,23 @@ func TestFetchCodeowners_NotFound(t *testing.T) {
 	}
 }
 
-func TestFetchTeamRepos_AdminPreferred(t *testing.T) {
+func TestFetchTeamRepos_MostSpecificTeamPreferred(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/orgs/TestOrg/teams":
 			json.NewEncoder(w).Encode([]ghTeam{
-				{Slug: "admin-team"},
-				{Slug: "push-team"},
+				{Slug: "team-revex-memberships-devs"},  // specific team (1 repo)
+				{Slug: "team-revex-saas-devs"},          // broad team (3 repos)
 			})
-		case "/orgs/TestOrg/teams/admin-team/repos":
+		case "/orgs/TestOrg/teams/team-revex-memberships-devs/repos":
 			json.NewEncoder(w).Encode([]ghTeamRepo{
-				{Name: "shared-repo", Permissions: map[string]bool{"admin": true, "push": true}},
+				{Name: "membership-backend", Permissions: map[string]bool{"push": true}},
 			})
-		case "/orgs/TestOrg/teams/push-team/repos":
+		case "/orgs/TestOrg/teams/team-revex-saas-devs/repos":
 			json.NewEncoder(w).Encode([]ghTeamRepo{
-				{Name: "shared-repo", Permissions: map[string]bool{"push": true}},
+				{Name: "membership-backend", Permissions: map[string]bool{"push": true}},
+				{Name: "other-service", Permissions: map[string]bool{"push": true}},
+				{Name: "yet-another", Permissions: map[string]bool{"push": true}},
 			})
 		default:
 			http.NotFound(w, r)
@@ -203,8 +205,9 @@ func TestFetchTeamRepos_AdminPreferred(t *testing.T) {
 		t.Fatalf("fetchTeamRepos: %v", err)
 	}
 
-	if teamsMap["shared-repo"] != "admin-team" {
-		t.Errorf("shared-repo team: got %q, want %q", teamsMap["shared-repo"], "admin-team")
+	// Most specific team (fewer repos) should win
+	if teamsMap["membership-backend"] != "revex" {
+		t.Errorf("membership-backend team: got %q, want %q", teamsMap["membership-backend"], "revex")
 	}
 }
 
@@ -225,7 +228,7 @@ func TestInferTeamFromName(t *testing.T) {
 		{"ghl-revex-payments", "revex"},
 		{"ghl-crm-contacts", "crm"},
 		{"platform-core", "platform"},
-		{"unknown-service", "platform"}, // default
+		{"unknown-service", ""}, // unknown = empty
 	}
 	for _, tt := range tests {
 		got := inferTeamFromName(tt.name)
