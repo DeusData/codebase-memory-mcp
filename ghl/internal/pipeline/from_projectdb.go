@@ -424,22 +424,45 @@ func parseRouteQualifiedName(qn string) (string, string) {
 	return strings.ToUpper(method), path
 }
 
-// InternalRequest.get/post/put/delete({ serviceName: ..., route: ... })
-var internalRequestRe = regexp.MustCompile(
-	`InternalRequest\.(get|post|put|delete|patch)\(\{[^}]*serviceName:\s*(?:SERVICE_NAME\.)?["']?([A-Z_]+)["']?[^}]*route:\s*` + "`?" + `[^` + "`" + `'"]*?([a-zA-Z][a-zA-Z0-9/\-_:]+)`,
+// Regexes for extracting InternalRequest call components from source code.
+var (
+	irMethodRe      = regexp.MustCompile(`InternalRequest\.(get|post|put|delete|patch)\(`)
+	irServiceNameRe = regexp.MustCompile(`serviceName:\s*(?:SERVICE_NAME\.)?['"]?([A-Z][A-Z0-9_]+)`)
+	irRouteRe       = regexp.MustCompile("route:\\s*[`'\"]([^`'\"]+)")
 )
 
 // parseInternalRequestCalls extracts service calls from source code.
+// Uses separate regexes for method, serviceName, and route since the object
+// literal can span multiple lines with template literals.
 func parseInternalRequestCalls(source string) []internalCall {
-	matches := internalRequestRe.FindAllStringSubmatch(source, -1)
+	methodMatches := irMethodRe.FindAllStringSubmatchIndex(source, -1)
 	var calls []internalCall
-	for _, m := range matches {
-		if len(m) >= 4 {
-			calls = append(calls, internalCall{
-				method:      m[1],
-				serviceName: m[2],
-				route:       strings.TrimPrefix(m[3], "/"),
-			})
+
+	for _, loc := range methodMatches {
+		method := source[loc[2]:loc[3]]
+
+		// Look for serviceName and route within the next 500 chars
+		end := loc[1] + 500
+		if end > len(source) {
+			end = len(source)
+		}
+		block := source[loc[1]:end]
+
+		snMatch := irServiceNameRe.FindStringSubmatch(block)
+		routeMatch := irRouteRe.FindStringSubmatch(block)
+
+		if snMatch != nil && routeMatch != nil {
+			route := routeMatch[1]
+			// Strip template expressions like ${locationId}
+			route = regexp.MustCompile(`\$\{[^}]+\}`).ReplaceAllString(route, "*")
+			route = strings.TrimPrefix(route, "/")
+			if route != "" {
+				calls = append(calls, internalCall{
+					method:      method,
+					serviceName: snMatch[1],
+					route:       route,
+				})
+			}
 		}
 	}
 	return calls
