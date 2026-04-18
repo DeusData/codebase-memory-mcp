@@ -1078,6 +1078,19 @@ func (p *mcpBridgeClientPool) release(client bridgePoolClient) {
 	p.clients <- client
 }
 
+// isDeadClientError returns true if the error indicates the C binary subprocess is dead
+// (broken pipe, closed stdout). These clients must be retired, not reused.
+func isDeadClientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "subprocess closed stdout") ||
+		strings.Contains(msg, "mcp: read:") ||
+		strings.Contains(msg, "mcp: send")
+}
+
 func (p *mcpBridgeClientPool) Call(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
 	client, err := p.borrow(ctx)
 	if err != nil {
@@ -1097,7 +1110,12 @@ func (p *mcpBridgeClientPool) Call(ctx context.Context, method string, params in
 
 	select {
 	case out := <-resultCh:
-		p.release(client)
+		if isDeadClientError(out.err) {
+			client.Close()
+			go p.replaceClientAsync(client)
+		} else {
+			p.release(client)
+		}
 		return out.result, out.err
 	case <-ctx.Done():
 		client.Close()
@@ -1125,7 +1143,12 @@ func (p *mcpBridgeClientPool) CallTool(ctx context.Context, name string, params 
 
 	select {
 	case out := <-resultCh:
-		p.release(client)
+		if isDeadClientError(out.err) {
+			client.Close()
+			go p.replaceClientAsync(client)
+		} else {
+			p.release(client)
+		}
 		return out.result, out.err
 	case <-ctx.Done():
 		client.Close()

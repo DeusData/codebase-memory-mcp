@@ -86,16 +86,20 @@ func PopulateOrgFromProjectDBs(ctx context.Context, db *orgdb.DB, caller MCPCall
 	slog.Info("phase 1 complete", "repos", len(entries))
 
 	// ── Phase 2: Extract routes + packages via get_architecture ──
+	// Circuit breaker: if first 3 calls all fail, skip phase 2 entirely
+	// (C binary may not support get_architecture or project .db files not ready)
 	slog.Info("phase 2: extracting routes and packages from project DBs", "projects", len(entries))
 
 	routeCount := 0
 	packageCount := 0
 	errorCount := 0
+	consecutiveErrors := 0
+	const maxConsecutiveErrors = 3 // circuit breaker threshold
 
 	for i, entry := range entries {
-		// Rate limit: 2 calls/sec to avoid pool exhaustion
-		if i > 0 && i%2 == 0 {
-			time.Sleep(500 * time.Millisecond)
+		// Rate limit: 1 call/sec to avoid pool exhaustion
+		if i > 0 {
+			time.Sleep(1 * time.Second)
 		}
 
 		archResult, err := caller.CallTool(ctx, "get_architecture", map[string]interface{}{
@@ -103,11 +107,20 @@ func PopulateOrgFromProjectDBs(ctx context.Context, db *orgdb.DB, caller MCPCall
 		})
 		if err != nil {
 			errorCount++
-			if errorCount <= 5 {
-				slog.Debug("get_architecture failed", "project", entry.projectName, "err", err)
+			consecutiveErrors++
+			if consecutiveErrors <= 3 {
+				slog.Warn("get_architecture failed", "project", entry.projectName, "err", err,
+					"consecutive_errors", consecutiveErrors)
 			}
-			continue // skip failed projects
+			// Circuit breaker: stop if first N calls all fail
+			if consecutiveErrors >= maxConsecutiveErrors && routeCount == 0 && packageCount == 0 {
+				slog.Warn("phase 2: circuit breaker tripped — C binary get_architecture not available, skipping",
+					"errors", errorCount, "threshold", maxConsecutiveErrors)
+				break
+			}
+			continue
 		}
+		consecutiveErrors = 0 // reset on success
 
 		archText := extractText(archResult)
 		if archText == "" || archText == "null" {
@@ -158,18 +171,19 @@ func PopulateOrgFromProjectDBs(ctx context.Context, db *orgdb.DB, caller MCPCall
 
 	slog.Info("phase 2 complete", "routes", routeCount, "packages", packageCount, "errors", errorCount)
 
-	// ── Phase 3: Cross-reference contracts ──
-	slog.Info("phase 3: cross-referencing API contracts")
-	matched, err := db.CrossReferenceContracts()
-	if err != nil {
-		slog.Warn("cross-reference failed", "err", err)
-	} else {
-		slog.Info("phase 3 complete", "matched", matched)
+	// ── Phase 3: Cross-reference contracts (only if phase 2 found data) ──
+	if routeCount > 0 {
+		slog.Info("phase 3: cross-referencing API contracts")
+		matched, err := db.CrossReferenceContracts()
+		if err != nil {
+			slog.Warn("cross-reference failed", "err", err)
+		} else {
+			slog.Info("phase 3 complete", "matched", matched)
+		}
 	}
 
-	slog.Info("org.db fully populated",
-		"repos", len(entries), "routes", routeCount, "packages", packageCount,
-		"cross_referenced", matched, "errors", errorCount)
+	slog.Info("org.db populated",
+		"repos", len(entries), "routes", routeCount, "packages", packageCount, "errors", errorCount)
 	return nil
 }
 
