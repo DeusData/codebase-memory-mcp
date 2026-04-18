@@ -159,6 +159,76 @@ func inferTypeFromLanguage(lang string, topics []string) string {
 	}
 }
 
+// ScanUpdatedSince returns repos that were pushed to since the given time.
+// Uses the GitHub API sort=pushed parameter to efficiently find recently-changed repos.
+// Stops paginating when it reaches repos older than since.
+func (s *Scanner) ScanUpdatedSince(ctx context.Context, since time.Time) ([]manifest.Repo, error) {
+	var updated []manifest.Repo
+	page := 1
+
+	for {
+		url := fmt.Sprintf("%s/orgs/%s/repos?type=all&per_page=100&page=%d&sort=pushed&direction=desc",
+			s.apiBaseURL, s.org, page)
+
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+s.token)
+		req.Header.Set("Accept", "application/vnd.github+json")
+
+		resp, err := s.client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			body, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("github API %d: %s", resp.StatusCode, string(body))
+		}
+
+		var ghRepos []ghRepo
+		if err := json.NewDecoder(resp.Body).Decode(&ghRepos); err != nil {
+			return nil, err
+		}
+
+		if len(ghRepos) == 0 {
+			break
+		}
+
+		reachedOld := false
+		for _, gh := range ghRepos {
+			if gh.Archived || gh.Fork {
+				continue
+			}
+			pushedAt, err := time.Parse(time.RFC3339, gh.PushedAt)
+			if err != nil {
+				continue
+			}
+			if pushedAt.Before(since) {
+				reachedOld = true
+				break
+			}
+			repo := manifest.Repo{
+				Name:      gh.Name,
+				GitHubURL: gh.CloneURL,
+				Team:      inferTeamFromTopics(gh.Topics),
+				Type:      inferTypeFromLanguage(gh.Language, gh.Topics),
+				Tags:      buildTags(gh.Language, gh.Topics),
+			}
+			updated = append(updated, repo)
+		}
+
+		if reachedOld || len(ghRepos) < 100 {
+			break
+		}
+		page++
+	}
+
+	return updated, nil
+}
+
 // buildTags combines language and topics into tags.
 func buildTags(lang string, topics []string) []string {
 	tags := make([]string, 0, len(topics)+1)

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestScanOrg_BasicDiscovery(t *testing.T) {
@@ -130,6 +131,143 @@ func TestScanOrg_APIError(t *testing.T) {
 	_, err := scanner.ScanOrg(context.Background())
 	if err == nil {
 		t.Fatal("expected error for 403 response")
+	}
+}
+
+func TestScanUpdatedSince_ReturnsOnlyRecent(t *testing.T) {
+	now := time.Now()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("sort") != "pushed" {
+			t.Error("expected sort=pushed")
+		}
+		if r.URL.Query().Get("direction") != "desc" {
+			t.Error("expected direction=desc")
+		}
+
+		repos := []ghRepo{
+			{Name: "just-pushed", CloneURL: "https://github.com/T/just-pushed.git", Language: "TypeScript", PushedAt: now.Add(-1 * time.Hour).Format(time.RFC3339)},
+			{Name: "pushed-today", CloneURL: "https://github.com/T/pushed-today.git", Language: "Go", PushedAt: now.Add(-5 * time.Hour).Format(time.RFC3339)},
+			{Name: "old-repo", CloneURL: "https://github.com/T/old-repo.git", Language: "Python", PushedAt: now.Add(-48 * time.Hour).Format(time.RFC3339)},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(repos)
+	}))
+	defer server.Close()
+
+	scanner := NewScanner("T", "tok")
+	scanner.SetAPIBaseURL(server.URL)
+
+	since := now.Add(-24 * time.Hour)
+	repos, err := scanner.ScanUpdatedSince(context.Background(), since)
+	if err != nil {
+		t.Fatalf("ScanUpdatedSince: %v", err)
+	}
+	if len(repos) != 2 {
+		t.Fatalf("repos: got %d, want 2", len(repos))
+	}
+	if repos[0].Name != "just-pushed" {
+		t.Errorf("repos[0]: got %q, want %q", repos[0].Name, "just-pushed")
+	}
+	if repos[1].Name != "pushed-today" {
+		t.Errorf("repos[1]: got %q, want %q", repos[1].Name, "pushed-today")
+	}
+}
+
+func TestScanUpdatedSince_StopsEarly(t *testing.T) {
+	now := time.Now()
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		// First page: 100 repos, last one is old — should not fetch page 2
+		repos := make([]ghRepo, 100)
+		for i := range repos {
+			pushedAt := now.Add(-1 * time.Hour) // recent
+			if i == 99 {
+				pushedAt = now.Add(-48 * time.Hour) // old — triggers early stop
+			}
+			repos[i] = ghRepo{
+				Name:     fmt.Sprintf("repo-%03d", i),
+				CloneURL: fmt.Sprintf("https://github.com/T/repo-%03d.git", i),
+				Language: "Go",
+				PushedAt: pushedAt.Format(time.RFC3339),
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(repos)
+	}))
+	defer server.Close()
+
+	scanner := NewScanner("T", "tok")
+	scanner.SetAPIBaseURL(server.URL)
+
+	since := now.Add(-24 * time.Hour)
+	repos, err := scanner.ScanUpdatedSince(context.Background(), since)
+	if err != nil {
+		t.Fatalf("ScanUpdatedSince: %v", err)
+	}
+	if callCount != 1 {
+		t.Errorf("API calls: got %d, want 1 (should stop early)", callCount)
+	}
+	if len(repos) != 99 {
+		t.Errorf("repos: got %d, want 99", len(repos))
+	}
+}
+
+func TestScanUpdatedSince_EmptyWhenNoChanges(t *testing.T) {
+	now := time.Now()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		repos := []ghRepo{
+			{Name: "stale-1", CloneURL: "https://github.com/T/stale-1.git", Language: "Go", PushedAt: now.Add(-72 * time.Hour).Format(time.RFC3339)},
+			{Name: "stale-2", CloneURL: "https://github.com/T/stale-2.git", Language: "Go", PushedAt: now.Add(-96 * time.Hour).Format(time.RFC3339)},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(repos)
+	}))
+	defer server.Close()
+
+	scanner := NewScanner("T", "tok")
+	scanner.SetAPIBaseURL(server.URL)
+
+	since := now.Add(-24 * time.Hour)
+	repos, err := scanner.ScanUpdatedSince(context.Background(), since)
+	if err != nil {
+		t.Fatalf("ScanUpdatedSince: %v", err)
+	}
+	if len(repos) != 0 {
+		t.Errorf("repos: got %d, want 0", len(repos))
+	}
+}
+
+func TestScanUpdatedSince_SkipsArchivedAndForks(t *testing.T) {
+	now := time.Now()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		repos := []ghRepo{
+			{Name: "active-repo", CloneURL: "https://github.com/T/active-repo.git", Language: "Go", PushedAt: now.Add(-1 * time.Hour).Format(time.RFC3339)},
+			{Name: "archived-repo", CloneURL: "https://github.com/T/archived-repo.git", Language: "Go", PushedAt: now.Add(-1 * time.Hour).Format(time.RFC3339), Archived: true},
+			{Name: "forked-repo", CloneURL: "https://github.com/T/forked-repo.git", Language: "Go", PushedAt: now.Add(-1 * time.Hour).Format(time.RFC3339), Fork: true},
+			{Name: "another-active", CloneURL: "https://github.com/T/another-active.git", Language: "TypeScript", PushedAt: now.Add(-2 * time.Hour).Format(time.RFC3339)},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(repos)
+	}))
+	defer server.Close()
+
+	scanner := NewScanner("T", "tok")
+	scanner.SetAPIBaseURL(server.URL)
+
+	since := now.Add(-24 * time.Hour)
+	repos, err := scanner.ScanUpdatedSince(context.Background(), since)
+	if err != nil {
+		t.Fatalf("ScanUpdatedSince: %v", err)
+	}
+	if len(repos) != 2 {
+		t.Fatalf("repos: got %d, want 2 (archived and forked should be skipped)", len(repos))
+	}
+	if repos[0].Name != "active-repo" {
+		t.Errorf("repos[0]: got %q, want %q", repos[0].Name, "active-repo")
+	}
+	if repos[1].Name != "another-active" {
+		t.Errorf("repos[1]: got %q, want %q", repos[1].Name, "another-active")
 	}
 }
 
