@@ -140,10 +140,14 @@ func main() {
 
 	// Background: enrich manifest with GitHub API data (ownership, frameworks)
 	// This runs AFTER the HTTP server starts, so it doesn't block health checks.
-	if cfg.GitHubToken != "" && cfg.GitHubAllowedOrgs != nil && len(cfg.GitHubAllowedOrgs) > 0 {
+	orgScanToken := cfg.GitHubOrgScanToken
+	if orgScanToken == "" {
+		orgScanToken = cfg.GitHubToken
+	}
+	if orgScanToken != "" && cfg.GitHubAllowedOrgs != nil && len(cfg.GitHubAllowedOrgs) > 0 {
 		go func() {
 			orgName := cfg.GitHubAllowedOrgs[0]
-			scanner := orgdiscovery.NewScanner(orgName, cfg.GitHubToken)
+			scanner := orgdiscovery.NewScanner(orgName, orgScanToken)
 			slog.Info("background: scanning GitHub org for repo metadata", "org", orgName)
 
 			apiRepos, scanErr := scanner.ScanOrg(context.Background())
@@ -163,34 +167,40 @@ func main() {
 				slog.Warn("background: framework detection failed", "err", fwErr)
 			}
 
-			// Merge API data into manifest: update Team, Type, Tags for repos that exist
-			apiByName := make(map[string]manifest.Repo, len(apiRepos))
-			for _, r := range apiRepos {
-				apiByName[r.Name] = r
-			}
-			for i, repo := range m.Repos {
-				if apiRepo, ok := apiByName[repo.Name]; ok {
-					if apiRepo.Team != "" {
-						m.Repos[i].Team = apiRepo.Team
-					}
-					if apiRepo.Type != "" && apiRepo.Type != "other" {
-						m.Repos[i].Type = apiRepo.Type
-					}
-					if len(apiRepo.Tags) > 0 {
-						m.Repos[i].Tags = apiRepo.Tags
+			// If API found more repos than YAML, use API as primary source
+			// (YAML is a stale fallback; API is the source of truth)
+			if len(apiRepos) > len(m.Repos) {
+				slog.Info("background: API discovered more repos than YAML, replacing manifest",
+					"api_repos", len(apiRepos), "yaml_repos", len(m.Repos))
+				m.Repos = apiRepos
+			} else {
+				// Merge: update existing repos with API data, add missing ones
+				apiByName := make(map[string]manifest.Repo, len(apiRepos))
+				for _, r := range apiRepos {
+					apiByName[r.Name] = r
+				}
+				for i, repo := range m.Repos {
+					if apiRepo, ok := apiByName[repo.Name]; ok {
+						if apiRepo.Team != "" {
+							m.Repos[i].Team = apiRepo.Team
+						}
+						if apiRepo.Type != "" && apiRepo.Type != "other" {
+							m.Repos[i].Type = apiRepo.Type
+						}
+						if len(apiRepo.Tags) > 0 {
+							m.Repos[i].Tags = apiRepo.Tags
+						}
 					}
 				}
-			}
-
-			// Add repos found via API but missing from REPOS.yaml
-			for _, apiRepo := range apiRepos {
-				if _, ok := m.FindByName(apiRepo.Name); !ok {
-					m.Repos = append(m.Repos, apiRepo)
+				for _, apiRepo := range apiRepos {
+					if _, ok := m.FindByName(apiRepo.Name); !ok {
+						m.Repos = append(m.Repos, apiRepo)
+					}
 				}
 			}
 
 			slog.Info("background: manifest enriched with GitHub API data",
-				"enriched_repos", len(apiByName),
+				"api_repos", len(apiRepos),
 				"total_repos", len(m.Repos),
 			)
 
@@ -593,6 +603,7 @@ type config struct {
 	RunForce                 bool
 	OrgGraphEnabled          bool
 	OrgDBPath                string
+	GitHubOrgScanToken       string // separate token for org scanning (falls back to GitHubToken)
 }
 
 func loadConfig() config {
@@ -767,6 +778,7 @@ func loadConfig() config {
 		RunForce:                 getBool("RUN_FORCE", false),
 		OrgGraphEnabled:          getBool("ORG_GRAPH_ENABLED", false),
 		OrgDBPath:                getEnv("ORG_DB_PATH", ""),
+		GitHubOrgScanToken:      getEnv("GITHUB_ORG_SCAN_TOKEN", getEnv("GITHUB_TOKEN", "")),
 	}
 }
 
