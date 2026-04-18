@@ -37,6 +37,7 @@ import (
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/manifest"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/mcp"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/orgdb"
+	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/orgdiscovery"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/orgtools"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/pipeline"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/webhook"
@@ -128,14 +129,48 @@ func main() {
 		}
 	}
 
-	// ── Load fleet manifest ──────────────────────────────────
+	// ── Discover repos (API-first, YAML fallback) ───────────
 
-	m, err := manifest.Load(cfg.ReposManifest)
-	if err != nil {
-		slog.Error("failed to load repos manifest", "path", cfg.ReposManifest, "err", err)
-		os.Exit(1)
+	var m *manifest.Manifest
+	if cfg.GitHubToken != "" && cfg.GitHubAllowedOrgs != nil && len(cfg.GitHubAllowedOrgs) > 0 {
+		orgName := cfg.GitHubAllowedOrgs[0]
+		scanner := orgdiscovery.NewScanner(orgName, cfg.GitHubToken)
+		slog.Info("scanning GitHub org for repos", "org", orgName)
+
+		repos, scanErr := scanner.ScanOrg(ctx)
+		if scanErr != nil {
+			slog.Warn("github org scan failed, falling back to manifest", "org", orgName, "err", scanErr)
+		} else {
+			slog.Info("discovered repos via GitHub API", "count", len(repos))
+
+			// Enrich with ownership (CODEOWNERS + Teams API)
+			if ownerErr := scanner.EnrichOwnership(ctx, repos); ownerErr != nil {
+				slog.Warn("ownership enrichment failed (continuing)", "err", ownerErr)
+			} else {
+				slog.Info("enriched repo ownership", "repos", len(repos))
+			}
+
+			// Enrich with framework detection
+			if fwErr := scanner.EnrichFrameworks(ctx, repos); fwErr != nil {
+				slog.Warn("framework detection failed (continuing)", "err", fwErr)
+			} else {
+				slog.Info("enriched repo frameworks", "repos", len(repos))
+			}
+
+			m = &manifest.Manifest{Repos: repos}
+		}
 	}
-	slog.Info("fleet manifest loaded", "repos", len(m.Repos))
+
+	// Fallback to REPOS.yaml if API scan didn't work
+	if m == nil {
+		var err error
+		m, err = manifest.Load(cfg.ReposManifest)
+		if err != nil {
+			slog.Error("failed to load repos manifest", "path", cfg.ReposManifest, "err", err)
+			os.Exit(1)
+		}
+		slog.Info("fleet manifest loaded from YAML", "repos", len(m.Repos))
+	}
 
 	cloner := &gitCloner{
 		logger:      logger,
