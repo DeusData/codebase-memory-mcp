@@ -129,47 +129,85 @@ func main() {
 		}
 	}
 
-	// ── Discover repos (API-first, YAML fallback) ───────────
+	// ── Load fleet manifest (YAML first for fast startup) ────
 
-	var m *manifest.Manifest
-	if cfg.GitHubToken != "" && cfg.GitHubAllowedOrgs != nil && len(cfg.GitHubAllowedOrgs) > 0 {
-		orgName := cfg.GitHubAllowedOrgs[0]
-		scanner := orgdiscovery.NewScanner(orgName, cfg.GitHubToken)
-		slog.Info("scanning GitHub org for repos", "org", orgName)
-
-		repos, scanErr := scanner.ScanOrg(ctx)
-		if scanErr != nil {
-			slog.Warn("github org scan failed, falling back to manifest", "org", orgName, "err", scanErr)
-		} else {
-			slog.Info("discovered repos via GitHub API", "count", len(repos))
-
-			// Enrich with ownership (CODEOWNERS + Teams API)
-			if ownerErr := scanner.EnrichOwnership(ctx, repos); ownerErr != nil {
-				slog.Warn("ownership enrichment failed (continuing)", "err", ownerErr)
-			} else {
-				slog.Info("enriched repo ownership", "repos", len(repos))
-			}
-
-			// Enrich with framework detection
-			if fwErr := scanner.EnrichFrameworks(ctx, repos); fwErr != nil {
-				slog.Warn("framework detection failed (continuing)", "err", fwErr)
-			} else {
-				slog.Info("enriched repo frameworks", "repos", len(repos))
-			}
-
-			m = &manifest.Manifest{Repos: repos}
-		}
+	m, err := manifest.Load(cfg.ReposManifest)
+	if err != nil {
+		slog.Error("failed to load repos manifest", "path", cfg.ReposManifest, "err", err)
+		os.Exit(1)
 	}
+	slog.Info("fleet manifest loaded", "repos", len(m.Repos))
 
-	// Fallback to REPOS.yaml if API scan didn't work
-	if m == nil {
-		var err error
-		m, err = manifest.Load(cfg.ReposManifest)
-		if err != nil {
-			slog.Error("failed to load repos manifest", "path", cfg.ReposManifest, "err", err)
-			os.Exit(1)
-		}
-		slog.Info("fleet manifest loaded from YAML", "repos", len(m.Repos))
+	// Background: enrich manifest with GitHub API data (ownership, frameworks)
+	// This runs AFTER the HTTP server starts, so it doesn't block health checks.
+	if cfg.GitHubToken != "" && cfg.GitHubAllowedOrgs != nil && len(cfg.GitHubAllowedOrgs) > 0 {
+		go func() {
+			orgName := cfg.GitHubAllowedOrgs[0]
+			scanner := orgdiscovery.NewScanner(orgName, cfg.GitHubToken)
+			slog.Info("background: scanning GitHub org for repo metadata", "org", orgName)
+
+			apiRepos, scanErr := scanner.ScanOrg(context.Background())
+			if scanErr != nil {
+				slog.Warn("background: github org scan failed", "org", orgName, "err", scanErr)
+				return
+			}
+			slog.Info("background: discovered repos via GitHub API", "count", len(apiRepos))
+
+			// Enrich ownership (CODEOWNERS + Teams API)
+			if ownerErr := scanner.EnrichOwnership(context.Background(), apiRepos); ownerErr != nil {
+				slog.Warn("background: ownership enrichment failed", "err", ownerErr)
+			}
+
+			// Enrich frameworks
+			if fwErr := scanner.EnrichFrameworks(context.Background(), apiRepos); fwErr != nil {
+				slog.Warn("background: framework detection failed", "err", fwErr)
+			}
+
+			// Merge API data into manifest: update Team, Type, Tags for repos that exist
+			apiByName := make(map[string]manifest.Repo, len(apiRepos))
+			for _, r := range apiRepos {
+				apiByName[r.Name] = r
+			}
+			for i, repo := range m.Repos {
+				if apiRepo, ok := apiByName[repo.Name]; ok {
+					if apiRepo.Team != "" {
+						m.Repos[i].Team = apiRepo.Team
+					}
+					if apiRepo.Type != "" && apiRepo.Type != "other" {
+						m.Repos[i].Type = apiRepo.Type
+					}
+					if len(apiRepo.Tags) > 0 {
+						m.Repos[i].Tags = apiRepo.Tags
+					}
+				}
+			}
+
+			// Add repos found via API but missing from REPOS.yaml
+			for _, apiRepo := range apiRepos {
+				if _, ok := m.FindByName(apiRepo.Name); !ok {
+					m.Repos = append(m.Repos, apiRepo)
+				}
+			}
+
+			slog.Info("background: manifest enriched with GitHub API data",
+				"enriched_repos", len(apiByName),
+				"total_repos", len(m.Repos),
+			)
+
+			// Update org.db with enriched data
+			if orgDB != nil {
+				for _, repo := range m.Repos {
+					orgDB.UpsertRepo(orgdb.RepoRecord{
+						Name:      repo.Name,
+						GitHubURL: repo.GitHubURL,
+						Team:      repo.Team,
+						Type:      repo.Type,
+					})
+					orgDB.UpsertTeamOwnership(repo.Name, repo.Team, "")
+				}
+				slog.Info("background: org.db updated with enriched manifest data")
+			}
+		}()
 	}
 
 	cloner := &gitCloner{
