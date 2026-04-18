@@ -1,6 +1,7 @@
 // Package pipeline — PopulateFromProjectDB builds org.db using MCP tools only.
 // Phase 1: list_projects → repo metadata + team ownership
-// Phase 2: get_architecture per project → routes + packages → api_contracts + repo_dependencies
+// Phase 2: search_graph(label=Route) per project → routes → api_contracts
+//          get_architecture per project → node/edge stats (packages via Module nodes)
 // Phase 3: CrossReferenceContracts → match consumers to providers
 //
 // IMPORTANT: Do NOT open project .db files from Go — this conflicts with the C binary
@@ -27,7 +28,7 @@ type MCPCaller interface {
 
 // PopulateOrgFromProjectDBs builds org.db in 3 phases using MCP tools.
 // Phase 1: list_projects → repo metadata (single call)
-// Phase 2: get_architecture per project → routes + packages (rate-limited, ~3 min)
+// Phase 2: search_graph(label=Route) per project → routes → api_contracts
 // Phase 3: CrossReferenceContracts → match consumers to providers
 func PopulateOrgFromProjectDBs(ctx context.Context, db *orgdb.DB, caller MCPCaller, repos []manifest.Repo, cbmCacheDir string) error {
 	// ── Phase 1: Repo metadata from list_projects ──
@@ -88,16 +89,15 @@ func PopulateOrgFromProjectDBs(ctx context.Context, db *orgdb.DB, caller MCPCall
 		slog.Info("after waiting", "projects", len(entries))
 	}
 
-	// ── Phase 2: Extract routes + packages via get_architecture ──
-	// Circuit breaker: if first 3 calls all fail, skip phase 2 entirely
-	// (C binary may not support get_architecture or project .db files not ready)
-	slog.Info("phase 2: extracting routes and packages from project DBs", "projects", len(entries))
+	// ── Phase 2: Extract routes via search_graph(label=Route) ──
+	// Each project's graph has Route nodes with qualified_name = "__route__METHOD__path"
+	// Circuit breaker: stop after 5 consecutive errors (C binary unstable)
+	slog.Info("phase 2: extracting routes from project graphs", "projects", len(entries))
 
 	routeCount := 0
-	packageCount := 0
 	errorCount := 0
 	consecutiveErrors := 0
-	const maxConsecutiveErrors = 3 // circuit breaker threshold
+	const maxConsecutiveErrors = 5
 
 	for i, entry := range entries {
 		// Rate limit: 1 call/sec to avoid pool exhaustion
@@ -105,74 +105,60 @@ func PopulateOrgFromProjectDBs(ctx context.Context, db *orgdb.DB, caller MCPCall
 			time.Sleep(1 * time.Second)
 		}
 
-		archResult, err := caller.CallTool(ctx, "get_architecture", map[string]interface{}{
+		// search_graph returns Route-label nodes for this project
+		searchResult, err := caller.CallTool(ctx, "search_graph", map[string]interface{}{
 			"project": entry.projectName,
+			"label":   "Route",
+			"limit":   200, // max routes per project
 		})
 		if err != nil {
 			errorCount++
 			consecutiveErrors++
-			if consecutiveErrors <= 3 {
-				slog.Warn("get_architecture failed", "project", entry.projectName, "err", err,
-					"consecutive_errors", consecutiveErrors)
+			if consecutiveErrors <= 5 {
+				slog.Warn("search_graph(Route) failed", "project", entry.projectName, "err", err)
 			}
-			// Circuit breaker: stop if first N calls all fail
-			if consecutiveErrors >= maxConsecutiveErrors && routeCount == 0 && packageCount == 0 {
-				slog.Warn("phase 2: circuit breaker tripped — C binary get_architecture not available, skipping",
-					"errors", errorCount, "threshold", maxConsecutiveErrors)
+			if consecutiveErrors >= maxConsecutiveErrors && routeCount == 0 {
+				slog.Warn("phase 2: circuit breaker — search_graph not working, skipping",
+					"errors", errorCount)
 				break
 			}
 			continue
 		}
-		consecutiveErrors = 0 // reset on success
+		consecutiveErrors = 0
 
-		archText := extractText(archResult)
-		if archText == "" || archText == "null" {
+		searchText := extractText(searchResult)
+		if searchText == "" || searchText == "null" {
 			continue
 		}
 
-		// Parse architecture response
-		var arch architectureResponse
-		if err := json.Unmarshal([]byte(archText), &arch); err != nil {
+		var searchResp searchGraphResponse
+		if err := json.Unmarshal([]byte(searchText), &searchResp); err != nil {
 			continue
 		}
 
-		// Extract routes → api_contracts
-		for _, route := range arch.Routes {
-			if route.Path == "" {
+		// Parse routes from qualified_name: "__route__METHOD__path"
+		for _, node := range searchResp.Results {
+			method, path := parseRouteQualifiedName(node.QualifiedName)
+			if path == "" {
 				continue
 			}
 			db.InsertAPIContract(orgdb.APIContract{
 				ProviderRepo:   entry.repoName,
-				Method:         strings.ToUpper(route.Method),
-				Path:           route.Path,
-				ProviderSymbol: route.Handler,
+				Method:         method,
+				Path:           path,
+				ProviderSymbol: node.Name,
 				Confidence:     0.3,
 			})
 			routeCount++
 		}
 
-		// Extract GHL-internal packages → repo_dependencies
-		for _, pkg := range arch.Packages {
-			if isGHLPackage(pkg.Name) {
-				scope, name := splitPackage(pkg.Name)
-				if scope != "" {
-					db.UpsertPackageDep(entry.repoName, orgdb.Dep{
-						Scope:   scope,
-						Name:    name,
-						DepType: "dependencies",
-					})
-					packageCount++
-				}
-			}
-		}
-
 		if (i+1)%50 == 0 {
 			slog.Info("phase 2 progress", "processed", i+1, "total", len(entries),
-				"routes", routeCount, "packages", packageCount, "errors", errorCount)
+				"routes", routeCount, "errors", errorCount)
 		}
 	}
 
-	slog.Info("phase 2 complete", "routes", routeCount, "packages", packageCount, "errors", errorCount)
+	slog.Info("phase 2 complete", "routes", routeCount, "errors", errorCount)
 
 	// ── Phase 3: Cross-reference contracts (only if phase 2 found data) ──
 	if routeCount > 0 {
@@ -185,8 +171,7 @@ func PopulateOrgFromProjectDBs(ctx context.Context, db *orgdb.DB, caller MCPCall
 		}
 	}
 
-	slog.Info("org.db populated",
-		"repos", len(entries), "routes", routeCount, "packages", packageCount, "errors", errorCount)
+	slog.Info("org.db populated", "repos", len(entries), "routes", routeCount, "errors", errorCount)
 	return nil
 }
 
@@ -195,27 +180,44 @@ type projEntry struct {
 	repoName    string // stripped name (for org.db)
 }
 
-// architectureResponse is the parsed get_architecture response.
-type architectureResponse struct {
-	Routes   []archRoute   `json:"routes"`
-	Packages []archPackage `json:"packages"`
+type searchGraphResponse struct {
+	Total   int              `json:"total"`
+	Results []searchGraphNode `json:"results"`
+	HasMore bool             `json:"has_more"`
 }
 
-type archRoute struct {
-	Method  string `json:"method"`
-	Path    string `json:"path"`
-	Handler string `json:"handler"`
-}
-
-type archPackage struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
+type searchGraphNode struct {
+	Name          string `json:"name"`
+	QualifiedName string `json:"qualified_name"`
+	Label         string `json:"label"`
+	FilePath      string `json:"file_path"`
 }
 
 type projectInfo struct {
 	Name  string `json:"name"`
 	Nodes int    `json:"nodes"`
 	Edges int    `json:"edges"`
+}
+
+// parseRouteQualifiedName extracts method and path from "__route__METHOD__path".
+// Example: "__route__POST__/api/orders" → ("POST", "/api/orders")
+// Example: "__route__ANY__/health" → ("ANY", "/health")
+func parseRouteQualifiedName(qn string) (string, string) {
+	const prefix = "__route__"
+	if !strings.HasPrefix(qn, prefix) {
+		return "", ""
+	}
+	rest := qn[len(prefix):] // "POST__/api/orders"
+	idx := strings.Index(rest, "__")
+	if idx < 0 {
+		return "", ""
+	}
+	method := rest[:idx]
+	path := rest[idx+2:] // skip "__"
+	if path == "" {
+		return "", ""
+	}
+	return strings.ToUpper(method), path
 }
 
 func stripProjectPrefix(name string) string {
@@ -232,27 +234,7 @@ func stripProjectPrefix(name string) string {
 	return name
 }
 
-func isGHLPackage(name string) bool {
-	return strings.HasPrefix(name, "@platform-core/") ||
-		strings.HasPrefix(name, "@platform-ui/") ||
-		strings.HasPrefix(name, "@gohighlevel/") ||
-		strings.HasPrefix(name, "@ghl/") ||
-		strings.HasPrefix(name, "@frontend-core/")
-}
-
-func splitPackage(name string) (string, string) {
-	if !strings.HasPrefix(name, "@") {
-		return "", name
-	}
-	idx := strings.Index(name, "/")
-	if idx < 0 {
-		return "", name
-	}
-	return name[:idx], name[idx+1:]
-}
-
 // waitForProjects polls list_projects until minCount projects are available or timeout.
-// Returns updated entries with repo metadata populated in org.db.
 func waitForProjects(ctx context.Context, caller MCPCaller, db *orgdb.DB,
 	repoByName map[string]manifest.Repo, repos []manifest.Repo,
 	minCount int, timeout time.Duration) []projEntry {
@@ -282,7 +264,6 @@ func waitForProjects(ctx context.Context, caller MCPCaller, db *orgdb.DB,
 		slog.Info("waitForProjects: poll", "found", len(projects), "need", minCount)
 
 		if len(projects) >= minCount {
-			// Re-populate org.db with full project list
 			var entries []projEntry
 			for _, proj := range projects {
 				repoName := stripProjectPrefix(proj.Name)
@@ -306,7 +287,6 @@ func waitForProjects(ctx context.Context, caller MCPCaller, db *orgdb.DB,
 	}
 
 	slog.Warn("waitForProjects: timeout — proceeding with available projects")
-	// Return whatever we got last time (re-enumerate)
 	result, err := caller.CallTool(ctx, "list_projects", nil)
 	if err != nil {
 		return nil
