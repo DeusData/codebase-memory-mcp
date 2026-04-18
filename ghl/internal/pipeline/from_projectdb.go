@@ -44,14 +44,21 @@ func PopulateOrgFromProjectDBs(ctx context.Context, db *orgdb.DB, caller MCPCall
 		// Try to match project name to manifest repo
 		repo, ok := repoByName[repoName]
 		if !ok {
-			// Try common prefixes that the C binary adds
-			for _, prefix := range []string{"tmp-fleet-cache-", "app-fleet-cache-"} {
+			// Try common prefixes that the C binary adds (path-based project names)
+			for _, prefix := range []string{
+				"data-fleet-cache-repos-",
+				"tmp-fleet-cache-repos-",
+				"tmp-fleet-cache-",
+				"app-fleet-cache-",
+			} {
 				stripped := strings.TrimPrefix(repoName, prefix)
-				if r, found := repoByName[stripped]; found {
-					repo = r
-					repoName = stripped
-					ok = true
-					break
+				if stripped != repoName {
+					if r, found := repoByName[stripped]; found {
+						repo = r
+						repoName = stripped
+						ok = true
+						break
+					}
 				}
 			}
 		}
@@ -126,7 +133,7 @@ func PopulateOrgFromProjectDBs(ctx context.Context, db *orgdb.DB, caller MCPCall
 
 // projectInfo holds basic info from list_projects.
 type projectInfo struct {
-	Project string `json:"project"`
+	Project string `json:"name"`
 	Nodes   int    `json:"nodes"`
 	Edges   int    `json:"edges"`
 }
