@@ -2,6 +2,7 @@ package orgdb
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 )
 
@@ -202,7 +203,7 @@ func (d *DB) CountRepoContracts(repoName string) int {
 func (d *DB) FixRoutePaths() (int, error) {
 	result, err := d.db.Exec(`
 		UPDATE api_contracts SET path = REPLACE(path, '__', '/')
-		WHERE path LIKE '%__%' AND provider_repo != '' AND (consumer_repo IS NULL OR consumer_repo = '')
+		WHERE INSTR(path, '__') > 0 AND provider_repo != '' AND (consumer_repo IS NULL OR consumer_repo = '')
 	`)
 	if err != nil {
 		return 0, fmt.Errorf("orgdb: fix route paths: %w", err)
@@ -278,6 +279,20 @@ func (d *DB) CrossReferenceContracts() (int, error) {
 		c.route = lastSegment(c.path)
 		c.prefix = extractServiceIdentifier(c.path)
 		consumers = append(consumers, c)
+	}
+
+	// Debug: log counts and sample data
+	slog.Info("cross-ref: loaded contracts",
+		"providers", len(providers), "consumers", len(consumers))
+	if len(providers) > 0 {
+		p := providers[0]
+		slog.Info("cross-ref: sample provider",
+			"repo", p.providerRepo, "method", p.method, "path", p.path, "route", p.route, "prefix", p.prefix)
+	}
+	if len(consumers) > 0 {
+		c := consumers[0]
+		slog.Info("cross-ref: sample consumer",
+			"repo", c.consumerRepo, "method", c.method, "path", c.path, "route", c.route, "prefix", c.prefix)
 	}
 
 	// Match by method + route (last path segment) + normalized service prefix
