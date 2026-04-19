@@ -9,9 +9,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/storage"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/iterator"
 )
 
@@ -67,22 +69,45 @@ func (b *gcsBackend) Hydrate(runtimeDir string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-
-	copied := 0
-	for _, attrs := range files {
-		name := path.Base(attrs.Name)
-		reader, err := b.client.Bucket(b.bucket).Object(attrs.Name).NewReader(ctx)
-		if err != nil {
-			return copied, fmt.Errorf("cachepersist: open gcs object %s: %w", attrs.Name, err)
-		}
-		err = copyReaderAtomic(reader, filepath.Join(runtimeDir, name), 0o640)
-		_ = reader.Close()
-		if err != nil {
-			return copied, fmt.Errorf("cachepersist: hydrate %s: %w", name, err)
-		}
-		copied++
+	if len(files) == 0 {
+		return 0, nil
 	}
-	return copied, nil
+
+	// Parallel download with up to 32 concurrent workers.
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(32)
+	var copied atomic.Int64
+
+	for _, attrs := range files {
+		attrs := attrs
+		g.Go(func() error {
+			name := path.Base(attrs.Name)
+			dst := filepath.Join(runtimeDir, name)
+
+			// Skip if already exists and same size.
+			if info, statErr := os.Stat(dst); statErr == nil && info.Size() == attrs.Size {
+				copied.Add(1)
+				return nil
+			}
+
+			reader, rErr := b.client.Bucket(b.bucket).Object(attrs.Name).NewReader(gctx)
+			if rErr != nil {
+				return fmt.Errorf("cachepersist: open %s: %w", attrs.Name, rErr)
+			}
+			wErr := copyReaderAtomic(reader, dst, 0o640)
+			_ = reader.Close()
+			if wErr != nil {
+				return fmt.Errorf("cachepersist: hydrate %s: %w", name, wErr)
+			}
+			copied.Add(1)
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return int(copied.Load()), err
+	}
+	return int(copied.Load()), nil
 }
 
 func (b *gcsBackend) PersistProject(runtimeDir, project string) (int, error) {
@@ -181,17 +206,18 @@ func (b *gcsBackend) HydrateOrgDB(runtimeDir string) (int, error) {
 		os.Remove(walPath) // ignore error if file doesn't exist
 	}
 
+	// List all org .db objects first.
 	query := &storage.Query{Prefix: prefix}
 	iter := b.client.Bucket(b.bucket).Objects(ctx, query)
 
-	copied := 0
+	var objects []*storage.ObjectAttrs
 	for {
 		attrs, err := iter.Next()
 		if err == iterator.Done {
 			break
 		}
 		if err != nil {
-			return copied, fmt.Errorf("cachepersist: list gcs org objects: %w", err)
+			return 0, fmt.Errorf("cachepersist: list gcs org objects: %w", err)
 		}
 		if attrs == nil || strings.HasSuffix(attrs.Name, "/") {
 			continue
@@ -203,19 +229,48 @@ func (b *gcsBackend) HydrateOrgDB(runtimeDir string) (int, error) {
 			strings.HasSuffix(name, ".db-shm") {
 			continue
 		}
-
-		reader, err := b.client.Bucket(b.bucket).Object(attrs.Name).NewReader(ctx)
-		if err != nil {
-			return copied, fmt.Errorf("cachepersist: open gcs org object %s: %w", attrs.Name, err)
-		}
-		err = copyReaderAtomic(reader, filepath.Join(dstDir, name), 0o640)
-		_ = reader.Close()
-		if err != nil {
-			return copied, fmt.Errorf("cachepersist: hydrate org %s: %w", name, err)
-		}
-		copied++
+		objects = append(objects, attrs)
 	}
-	return copied, nil
+
+	if len(objects) == 0 {
+		return 0, nil
+	}
+
+	// Parallel download with up to 32 concurrent workers.
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(32)
+	var copied atomic.Int64
+
+	for _, attrs := range objects {
+		attrs := attrs
+		g.Go(func() error {
+			name := path.Base(attrs.Name)
+			dst := filepath.Join(dstDir, name)
+
+			// Skip if already exists and same size.
+			if info, statErr := os.Stat(dst); statErr == nil && info.Size() == attrs.Size {
+				copied.Add(1)
+				return nil
+			}
+
+			reader, rErr := b.client.Bucket(b.bucket).Object(attrs.Name).NewReader(gctx)
+			if rErr != nil {
+				return fmt.Errorf("cachepersist: open gcs org object %s: %w", attrs.Name, rErr)
+			}
+			wErr := copyReaderAtomic(reader, dst, 0o640)
+			_ = reader.Close()
+			if wErr != nil {
+				return fmt.Errorf("cachepersist: hydrate org %s: %w", name, wErr)
+			}
+			copied.Add(1)
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return int(copied.Load()), err
+	}
+	return int(copied.Load()), nil
 }
 
 func (b *gcsBackend) uploadFileToObject(ctx context.Context, srcPath, objName string) error {

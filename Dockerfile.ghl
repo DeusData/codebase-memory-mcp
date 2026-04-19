@@ -68,6 +68,7 @@ WORKDIR /app
 
 # ── Defaults (all overridable via env) ───────────────────────────
 ENV PORT=8080 \
+    CBM_MMAP_SIZE=0 \
     CBM_BINARY=/app/codebase-memory-mcp \
     CBM_CACHE_DIR=/tmp/codebase-memory-mcp \
     CBM_ARTIFACT_DIR=/data/fleet-cache/indexes \

@@ -88,11 +88,12 @@ func main() {
 		if cfg.ArtifactsSkipHydrate {
 			slog.Info("skipping persisted index hydrate", "artifact_dir", cfg.ArtifactDir, "cache_dir", cfg.CBMCacheDir)
 		} else {
+			hydrateStart := time.Now()
 			hydrated, err := artifactSync.Hydrate()
 			if err != nil {
-				slog.Warn("failed to hydrate persisted indexes (continuing with empty cache)", "err", err)
+				slog.Warn("failed to hydrate persisted indexes (continuing with empty cache)", "err", err, "duration", time.Since(hydrateStart))
 			} else {
-				slog.Info("hydrated persisted indexes", "count", hydrated, "artifact_dir", cfg.ArtifactDir, "cache_dir", cfg.CBMCacheDir)
+				slog.Info("hydration complete", "files", hydrated, "duration", time.Since(hydrateStart), "artifact_dir", cfg.ArtifactDir, "cache_dir", cfg.CBMCacheDir)
 			}
 		}
 	}
@@ -120,11 +121,12 @@ func main() {
 
 		// Hydrate org.db from artifacts if available
 		if artifactSync != nil && !cfg.ArtifactsSkipHydrate {
+			orgHydrateStart := time.Now()
 			hydrated, err := artifactSync.HydrateOrgGraph()
 			if err != nil {
-				slog.Warn("failed to hydrate org graph", "err", err)
+				slog.Warn("failed to hydrate org graph", "err", err, "duration", time.Since(orgHydrateStart))
 			} else if hydrated > 0 {
-				slog.Info("hydrated org graph", "count", hydrated)
+				slog.Info("org hydration complete", "files", hydrated, "duration", time.Since(orgHydrateStart))
 				// Re-open the DB after hydration: the hydrated files may have
 				// overwritten the freshly created db, so we need to re-apply schema.
 				orgDB.Close()

@@ -320,7 +320,16 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory) {
         if (rc != CBM_STORE_OK) {
             return rc;
         }
-        rc = exec_sql(s, "PRAGMA mmap_size = 67108864;"); /* CBM_SZ_64 MB */
+        {
+            const char *mmap_val = getenv("CBM_MMAP_SIZE");
+            if (mmap_val && mmap_val[0] != '\0') {
+                char pragma_buf[80];
+                snprintf(pragma_buf, sizeof(pragma_buf), "PRAGMA mmap_size = %s;", mmap_val);
+                rc = exec_sql(s, pragma_buf);
+            } else {
+                rc = exec_sql(s, "PRAGMA mmap_size = 67108864;"); /* CBM_SZ_64 MB */
+            }
+        }
     }
     return rc;
 }
