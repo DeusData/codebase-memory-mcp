@@ -329,43 +329,74 @@ func (d *DB) CrossReferenceContracts() (int, error) {
 		}
 	}
 
-	// Build provider index: key = "prefix:route" → list of providers
+	// Build two indexes:
+	// 1. Exact: key = "prefix:route" for precise endpoint matching
+	// 2. Prefix-only: key = "prefix" for service-level matching (fallback)
 	type provKey struct{ prefix, route string }
-	provIndex := make(map[provKey][]contract)
+	exactIndex := make(map[provKey][]contract)
+	prefixIndex := make(map[string][]contract) // prefix → first provider per repo
+	seenPrefixRepo := make(map[string]bool)
 	for _, prov := range providers {
-		if prov.route == "" || prov.prefix == "" {
+		if prov.prefix == "" {
 			continue
 		}
-		key := provKey{prov.prefix, prov.route}
-		provIndex[key] = append(provIndex[key], prov)
+		if prov.route != "" {
+			key := provKey{prov.prefix, prov.route}
+			exactIndex[key] = append(exactIndex[key], prov)
+		}
+		prKey := prov.prefix + ":" + prov.providerRepo
+		if !seenPrefixRepo[prKey] {
+			seenPrefixRepo[prKey] = true
+			prefixIndex[prov.prefix] = append(prefixIndex[prov.prefix], prov)
+		}
 	}
 
-	// Match by route (last path segment) + normalized service prefix.
-	// Method matching: ANY matches any method, otherwise exact match.
+	// Two-pass matching:
+	// Pass 1: exact match on prefix+route (high confidence 0.8)
+	// Pass 2: prefix-only match as fallback (lower confidence 0.5)
 	matched := 0
+	matchedConsIDs := make(map[int64]bool)
+
+	updateConsumer := func(consID int64, provRepo, provSymbol string, confidence float64) error {
+		_, err := d.db.Exec(`
+			UPDATE api_contracts SET
+				provider_repo = ?, provider_symbol = ?, confidence = ?
+			WHERE id = ?
+		`, provRepo, provSymbol, confidence, consID)
+		return err
+	}
+
+	// Pass 1: exact match on prefix + route
 	for _, cons := range consumers {
-		if cons.route == "" || cons.prefix == "" {
+		if cons.prefix == "" || cons.route == "" {
 			continue
 		}
 		key := provKey{cons.prefix, cons.route}
-		candidates := provIndex[key]
-		for _, prov := range candidates {
-			methodMatch := cons.method == prov.method ||
-				prov.method == "ANY" || cons.method == "ANY"
-			if methodMatch {
-				_, err := d.db.Exec(`
-					UPDATE api_contracts SET
-						provider_repo   = ?,
-						provider_symbol = ?,
-						confidence      = 0.7
-					WHERE id = ?
-				`, prov.providerRepo, prov.providerSymbol, cons.id)
-				if err != nil {
-					return matched, fmt.Errorf("orgdb: cross-ref update consumer %d: %w", cons.id, err)
+		for _, prov := range exactIndex[key] {
+			if cons.method == prov.method || prov.method == "ANY" || cons.method == "ANY" {
+				if err := updateConsumer(cons.id, prov.providerRepo, prov.providerSymbol, 0.8); err != nil {
+					return matched, fmt.Errorf("orgdb: cross-ref update %d: %w", cons.id, err)
 				}
+				matchedConsIDs[cons.id] = true
 				matched++
-				break // first match wins
+				break
 			}
+		}
+	}
+
+	// Pass 2: prefix-only fallback for unmatched consumers
+	for _, cons := range consumers {
+		if matchedConsIDs[cons.id] || cons.prefix == "" {
+			continue
+		}
+		candidates := prefixIndex[cons.prefix]
+		if len(candidates) > 0 {
+			prov := candidates[0] // first provider repo for this service prefix
+			if err := updateConsumer(cons.id, prov.providerRepo, prov.providerSymbol, 0.5); err != nil {
+				return matched, fmt.Errorf("orgdb: cross-ref update %d: %w", cons.id, err)
+			}
+			matchedConsIDs[cons.id] = true
+			matched++
 		}
 	}
 
