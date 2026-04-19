@@ -4,19 +4,35 @@ package orgtools
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/discovery"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/orgdb"
 )
 
 // OrgService dispatches org tool calls to the appropriate orgdb query.
+// The DB can be swapped at runtime via SetDB (e.g., after re-hydration).
 type OrgService struct {
 	db *orgdb.DB
+	mu sync.RWMutex
 }
 
 // New creates an OrgService backed by the given org database.
 func New(db *orgdb.DB) *OrgService {
 	return &OrgService{db: db}
+}
+
+// SetDB atomically swaps the underlying database (used after re-hydration).
+func (s *OrgService) SetDB(db *orgdb.DB) {
+	s.mu.Lock()
+	s.db = db
+	s.mu.Unlock()
+}
+
+func (s *OrgService) getDB() *orgdb.DB {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.db
 }
 
 // Definitions returns the MCP tool definitions for all 5 org tools.
@@ -121,7 +137,7 @@ func (s *OrgService) dependencyGraph(args map[string]interface{}) (interface{}, 
 	if scope == "" || name == "" {
 		return nil, fmt.Errorf("package_scope and package_name are required")
 	}
-	return s.db.QueryDependents(scope, name)
+	return s.getDB().QueryDependents(scope, name)
 }
 
 func (s *OrgService) blastRadius(args map[string]interface{}) (interface{}, error) {
@@ -129,7 +145,7 @@ func (s *OrgService) blastRadius(args map[string]interface{}) (interface{}, erro
 	if repo == "" {
 		return nil, fmt.Errorf("repo is required")
 	}
-	return s.db.QueryBlastRadius(repo)
+	return s.getDB().QueryBlastRadius(repo)
 }
 
 func (s *OrgService) traceFlow(args map[string]interface{}) (interface{}, error) {
@@ -145,7 +161,7 @@ func (s *OrgService) traceFlow(args map[string]interface{}) (interface{}, error)
 	if trigger == "" {
 		return nil, fmt.Errorf("trigger is required")
 	}
-	return s.db.TraceFlow(trigger, direction, maxHops)
+	return s.getDB().TraceFlow(trigger, direction, maxHops)
 }
 
 func (s *OrgService) teamTopology(args map[string]interface{}) (interface{}, error) {
@@ -153,7 +169,7 @@ func (s *OrgService) teamTopology(args map[string]interface{}) (interface{}, err
 	if team == "" {
 		return nil, fmt.Errorf("team is required")
 	}
-	return s.db.TeamTopology(team)
+	return s.getDB().TeamTopology(team)
 }
 
 func (s *OrgService) search(args map[string]interface{}) (interface{}, error) {
@@ -170,5 +186,5 @@ func (s *OrgService) search(args map[string]interface{}) (interface{}, error) {
 	if query == "" {
 		return nil, fmt.Errorf("query is required")
 	}
-	return s.db.SearchRepos(query, scope, team, limit)
+	return s.getDB().SearchRepos(query, scope, team, limit)
 }

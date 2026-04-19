@@ -470,6 +470,9 @@ func main() {
 		slog.Info("scheduled indexing disabled")
 	}
 
+	// orgSyncCallback is set after orgToolSvc is created to update its DB on re-hydration.
+	var orgSyncCallback func(db *orgdb.DB)
+
 	// ── Periodic org.db sync (cross-instance consistency) ────
 	// Every 5 minutes, re-hydrate org.db from GCS if another instance updated it.
 	if orgDB != nil && artifactSync != nil {
@@ -491,13 +494,16 @@ func main() {
 			}
 			// Re-open to pick up hydrated data + ensure schema
 			orgDB.Close()
-			var dbErr error
-			newDB, dbErr := orgdb.Open(orgDBPath)
-			if dbErr != nil {
-				slog.Error("periodic org sync: re-open failed", "err", dbErr)
+			newDB, openErr := orgdb.Open(orgDBPath)
+			if openErr != nil {
+				slog.Error("periodic org sync: re-open failed", "err", openErr)
 				return
 			}
 			orgDB = newDB
+			// Update OrgService via the callback (set after orgToolSvc is created)
+			if orgSyncCallback != nil {
+				orgSyncCallback(newDB)
+			}
 			slog.Info("periodic org sync: re-hydrated from GCS", "files", hydrated,
 				"repos", orgDB.RepoCount())
 		})
@@ -526,6 +532,7 @@ func main() {
 	var orgToolSvc *orgtools.OrgService
 	if orgDB != nil {
 		orgToolSvc = orgtools.New(orgDB)
+		orgSyncCallback = func(db *orgdb.DB) { orgToolSvc.SetDB(db) }
 		slog.Info("org tools enabled", "tools", len(orgToolSvc.Definitions()))
 	}
 
