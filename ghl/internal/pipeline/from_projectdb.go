@@ -125,6 +125,18 @@ func PopulateOrgFromProjectDBs(ctx context.Context, db *orgdb.DB, caller MCPCall
 	}
 
 	// ── Phase 3: Cross-reference contracts ──
+	// Fix __ path separators from C binary route qualified names before matching.
+	// Provider paths arrive as "contacts__list" but consumers use "/CONTACTS_API/list",
+	// so we must convert __ → / first for lastSegment/extractServiceIdentifier to work.
+	if rc > 0 {
+		fixCount, fixErr := db.FixRoutePaths()
+		if fixErr != nil {
+			slog.Warn("fix route paths failed", "err", fixErr)
+		} else if fixCount > 0 {
+			slog.Info("phase 3: fixed route paths", "count", fixCount)
+		}
+	}
+
 	matched := 0
 	if rc > 0 && cc > 0 {
 		slog.Info("phase 3: cross-referencing API contracts")
@@ -500,8 +512,6 @@ func parseRouteQualifiedName(qn string) (string, string) {
 	if path == "" {
 		return "", ""
 	}
-	// C binary uses __ as path separator: "contacts__list" → "/contacts/list"
-	path = strings.ReplaceAll(path, "__", "/")
 	return strings.ToUpper(method), path
 }
 
