@@ -125,6 +125,14 @@ func main() {
 				slog.Warn("failed to hydrate org graph", "err", err)
 			} else if hydrated > 0 {
 				slog.Info("hydrated org graph", "count", hydrated)
+				// Re-open the DB after hydration: the hydrated files may have
+				// overwritten the freshly created db, so we need to re-apply schema.
+				orgDB.Close()
+				orgDB, dbErr = orgdb.Open(orgDBPath)
+				if dbErr != nil {
+					slog.Error("failed to re-open org db after hydration", "err", dbErr)
+					os.Exit(1)
+				}
 			}
 		}
 	}
