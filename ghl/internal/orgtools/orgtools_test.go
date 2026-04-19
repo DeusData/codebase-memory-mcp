@@ -2,9 +2,11 @@ package orgtools
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 
+	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/mcp"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/orgdb"
 )
 
@@ -49,8 +51,8 @@ func newService(t *testing.T) (*OrgService, *orgdb.DB) {
 func TestDefinitions_Returns5Tools(t *testing.T) {
 	svc, _ := newService(t)
 	defs := svc.Definitions()
-	if len(defs) != 5 {
-		t.Fatalf("want 5 definitions, got %d", len(defs))
+	if len(defs) != 6 {
+		t.Fatalf("want 6 definitions, got %d", len(defs))
 	}
 
 	expected := map[string]bool{
@@ -59,6 +61,7 @@ func TestDefinitions_Returns5Tools(t *testing.T) {
 		"org_trace_flow":      false,
 		"org_team_topology":   false,
 		"org_search":          false,
+		"org_code_search":     false,
 	}
 	for _, d := range defs {
 		if _, ok := expected[d.Name]; !ok {

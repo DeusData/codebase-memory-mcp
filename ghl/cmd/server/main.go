@@ -532,6 +532,7 @@ func main() {
 	var orgToolSvc *orgtools.OrgService
 	if orgDB != nil {
 		orgToolSvc = orgtools.New(orgDB)
+		orgToolSvc.SetBridge(bridgePool)
 		orgSyncCallback = func(db *orgdb.DB) { orgToolSvc.SetDB(db) }
 		slog.Info("org tools enabled", "tools", len(orgToolSvc.Definitions()))
 	}

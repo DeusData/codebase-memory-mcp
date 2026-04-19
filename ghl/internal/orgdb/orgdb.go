@@ -138,6 +138,28 @@ func (d *DB) ContractCount() (apiContracts, eventContracts int) {
 	return
 }
 
+// TopReposByNodeCount returns the top N repo names ordered by node_count descending.
+// Repos with zero or NULL node_count are excluded.
+func (d *DB) TopReposByNodeCount(limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := d.db.Query(`SELECT name FROM repos WHERE COALESCE(node_count, 0) > 0 ORDER BY node_count DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("orgdb: top repos by node count: %w", err)
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("orgdb: scan repo name: %w", err)
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
 func (d *DB) ensureSchema() error {
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS repos (
