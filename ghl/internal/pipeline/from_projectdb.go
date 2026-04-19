@@ -500,6 +500,8 @@ func parseRouteQualifiedName(qn string) (string, string) {
 	if path == "" {
 		return "", ""
 	}
+	// C binary uses __ as path separator: "contacts__list" → "/contacts/list"
+	path = strings.ReplaceAll(path, "__", "/")
 	return strings.ToUpper(method), path
 }
 

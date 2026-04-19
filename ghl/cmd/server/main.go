@@ -293,6 +293,7 @@ func main() {
 				slog.Info("fleet indexing complete", "total", result.Total, "ok", result.Succeeded, "failed", result.Failed)
 				// ── Cross-reference org contracts ──
 				if orgDB != nil && !orgPipelineRunning.Load() {
+					orgDB.FixRoutePaths() // fix __ path separators from C binary
 					// Infer package providers from repo names
 					provCount, provErr := orgDB.InferPackageProviders()
 					if provErr != nil {
@@ -543,6 +544,13 @@ func main() {
 		}
 		go func() {
 			slog.Info("rebuild-org: starting SQL post-processing")
+			// Fix __ path separators from C binary route names
+			fixCount, fixErr := orgDB.FixRoutePaths()
+			if fixErr != nil {
+				slog.Error("rebuild-org: fix route paths failed", "err", fixErr)
+			} else if fixCount > 0 {
+				slog.Info("rebuild-org: fixed route paths", "count", fixCount)
+			}
 			provCount, err := orgDB.InferPackageProviders()
 			if err != nil {
 				slog.Error("rebuild-org: infer providers failed", "err", err)

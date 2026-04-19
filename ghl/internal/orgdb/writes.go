@@ -196,6 +196,21 @@ func (d *DB) CountRepoContracts(repoName string) int {
 	return count
 }
 
+// FixRoutePaths converts __ path separators to / in api_contracts paths.
+// The C binary's route qualified names use __ (e.g. "contacts__list"),
+// but cross-referencing needs / (e.g. "contacts/list") to match consumer paths.
+func (d *DB) FixRoutePaths() (int, error) {
+	result, err := d.db.Exec(`
+		UPDATE api_contracts SET path = REPLACE(path, '__', '/')
+		WHERE path LIKE '%__%' AND provider_repo != '' AND (consumer_repo IS NULL OR consumer_repo = '')
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("orgdb: fix route paths: %w", err)
+	}
+	n, _ := result.RowsAffected()
+	return int(n), nil
+}
+
 // CrossReferenceContracts matches consumer-only API contracts (from InternalRequest
 // calls) with provider-only contracts (from @Controller routes) by method and
 // route (last path segment). The serviceName in InternalRequest (e.g. CONTACTS_API)
