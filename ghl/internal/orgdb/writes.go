@@ -281,26 +281,78 @@ func (d *DB) CrossReferenceContracts() (int, error) {
 		consumers = append(consumers, c)
 	}
 
-	// Debug: log counts and sample data
-	slog.Info("cross-ref: loaded contracts",
-		"providers", len(providers), "consumers", len(consumers))
-	if len(providers) > 0 {
-		p := providers[0]
-		slog.Info("cross-ref: sample provider",
-			"repo", p.providerRepo, "method", p.method, "path", p.path, "route", p.route, "prefix", p.prefix)
+	// Debug: log counts and prefix overlap analysis
+	provPrefixes := make(map[string]int)
+	for _, p := range providers {
+		if p.prefix != "" {
+			provPrefixes[p.prefix]++
+		}
 	}
-	if len(consumers) > 0 {
-		c := consumers[0]
-		slog.Info("cross-ref: sample consumer",
-			"repo", c.consumerRepo, "method", c.method, "path", c.path, "route", c.route, "prefix", c.prefix)
+	consPrefixes := make(map[string]int)
+	consOverlap := 0
+	for _, c := range consumers {
+		if c.prefix != "" {
+			consPrefixes[c.prefix]++
+			if provPrefixes[c.prefix] > 0 {
+				consOverlap++
+			}
+		}
+	}
+	// Log up to 10 consumer prefixes
+	consKeys := make([]string, 0, len(consPrefixes))
+	for k := range consPrefixes {
+		consKeys = append(consKeys, k)
+	}
+	if len(consKeys) > 10 {
+		consKeys = consKeys[:10]
+	}
+	slog.Info("cross-ref: loaded contracts",
+		"providers", len(providers), "consumers", len(consumers),
+		"prov_prefixes", len(provPrefixes), "cons_prefixes", len(consPrefixes),
+		"prefix_overlap", consOverlap, "sample_cons_prefixes", strings.Join(consKeys, ","))
+	// Log first consumer that overlaps
+	for _, c := range consumers {
+		if c.prefix != "" && provPrefixes[c.prefix] > 0 {
+			slog.Info("cross-ref: overlapping consumer",
+				"repo", c.consumerRepo, "method", c.method, "path", c.path,
+				"route", c.route, "prefix", c.prefix)
+			// Find matching provider
+			for _, p := range providers {
+				if p.prefix == c.prefix {
+					slog.Info("cross-ref: matching provider candidate",
+						"repo", p.providerRepo, "method", p.method, "path", p.path,
+						"route", p.route, "prefix", p.prefix)
+					break
+				}
+			}
+			break
+		}
 	}
 
-	// Match by method + route (last path segment) + normalized service prefix
+	// Build provider index: key = "prefix:route" → list of providers
+	type provKey struct{ prefix, route string }
+	provIndex := make(map[provKey][]contract)
+	for _, prov := range providers {
+		if prov.route == "" || prov.prefix == "" {
+			continue
+		}
+		key := provKey{prov.prefix, prov.route}
+		provIndex[key] = append(provIndex[key], prov)
+	}
+
+	// Match by route (last path segment) + normalized service prefix.
+	// Method matching: ANY matches any method, otherwise exact match.
 	matched := 0
 	for _, cons := range consumers {
-		for _, prov := range providers {
-			if cons.method == prov.method && cons.route == prov.route && cons.route != "" &&
-				cons.prefix == prov.prefix && cons.prefix != "" {
+		if cons.route == "" || cons.prefix == "" {
+			continue
+		}
+		key := provKey{cons.prefix, cons.route}
+		candidates := provIndex[key]
+		for _, prov := range candidates {
+			methodMatch := cons.method == prov.method ||
+				prov.method == "ANY" || cons.method == "ANY"
+			if methodMatch {
 				_, err := d.db.Exec(`
 					UPDATE api_contracts SET
 						provider_repo   = ?,
