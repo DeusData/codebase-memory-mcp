@@ -257,7 +257,17 @@ func main() {
 					return
 				}
 				if artifactSync != nil {
-					projectName := projectNameFromPath(filepath.Join(cfg.CloneCacheDir, slug))
+					clonePath := filepath.Join(cfg.CloneCacheDir, slug)
+					projectName := projectNameFromPath(clonePath)
+					rawName := rawProjectNameFromPath(clonePath)
+					// If prefix override changes the name, rename the .db so PersistProject finds it
+					if rawName != projectName {
+						src := filepath.Join(cfg.CBMCacheDir, rawName+".db")
+						dst := filepath.Join(cfg.CBMCacheDir, projectName+".db")
+						if _, statErr := os.Stat(src); statErr == nil {
+							os.Rename(src, dst)
+						}
+					}
 					persisted, persistErr := artifactSync.PersistProject(projectName)
 					if persistErr != nil {
 						slog.Error("failed to persist project index", "repo", slug, "project", projectName, "err", persistErr)
@@ -565,7 +575,16 @@ func main() {
 			}
 			// Persist .db to GCS (same as fleet OnRepoDone)
 			if artifactSync != nil {
-				projectName := projectNameFromPath(filepath.Join(cfg.CloneCacheDir, repoSlug))
+				clonePath := filepath.Join(cfg.CloneCacheDir, repoSlug)
+				projectName := projectNameFromPath(clonePath)
+				rawName := rawProjectNameFromPath(clonePath)
+				if rawName != projectName {
+					src := filepath.Join(cfg.CBMCacheDir, rawName+".db")
+					dst := filepath.Join(cfg.CBMCacheDir, projectName+".db")
+					if _, statErr := os.Stat(src); statErr == nil {
+						os.Rename(src, dst)
+					}
+				}
 				if _, persistErr := artifactSync.PersistProject(projectName); persistErr != nil {
 					slog.Error("webhook: persist failed", "repo", repoSlug, "err", persistErr)
 				} else {
@@ -604,7 +623,16 @@ func main() {
 			}
 			// Persist .db to GCS (same as fleet OnRepoDone)
 			if artifactSync != nil {
-				projectName := projectNameFromPath(filepath.Join(cfg.CloneCacheDir, slug))
+				clonePath := filepath.Join(cfg.CloneCacheDir, slug)
+				projectName := projectNameFromPath(clonePath)
+				rawName := rawProjectNameFromPath(clonePath)
+				if rawName != projectName {
+					src := filepath.Join(cfg.CBMCacheDir, rawName+".db")
+					dst := filepath.Join(cfg.CBMCacheDir, projectName+".db")
+					if _, statErr := os.Stat(src); statErr == nil {
+						os.Rename(src, dst)
+					}
+				}
 				persisted, persistErr := artifactSync.PersistProject(projectName)
 				if persistErr != nil {
 					slog.Error("manual index: persist failed", "repo", slug, "project", projectName, "err", persistErr)
@@ -1025,14 +1053,24 @@ func defaultManifestPath() string {
 // This ensures consistent project names regardless of where repos are cloned.
 var projectNamePrefix = os.Getenv("PROJECT_NAME_PREFIX")
 
+// rawProjectNameFromPath returns the project name the C binary actually uses
+// (derived purely from the filesystem path, no prefix override).
+func rawProjectNameFromPath(absPath string) string {
+	return projectNameFromPathInternal(absPath, false)
+}
+
 func projectNameFromPath(absPath string) string {
+	return projectNameFromPathInternal(absPath, true)
+}
+
+func projectNameFromPathInternal(absPath string, usePrefix bool) string {
 	path := filepath.ToSlash(strings.TrimSpace(absPath))
 	if path == "" {
 		return "root"
 	}
 
-	// If a prefix override is set, use it + the last path segment (repo slug).
-	if projectNamePrefix != "" {
+	// If a prefix override is set and allowed, use it + the last path segment.
+	if usePrefix && projectNamePrefix != "" {
 		slug := filepath.Base(path)
 		if slug == "" || slug == "." || slug == "/" {
 			return "root"
