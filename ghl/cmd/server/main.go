@@ -593,7 +593,10 @@ func main() {
 			return
 		}
 		go func() {
-			if err := idx.IndexRepo(context.Background(), repo, true); err != nil {
+			slog.Info("manual index: starting", "repo", slug)
+			indexCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+			if err := idx.IndexRepo(indexCtx, repo, true); err != nil {
 				slog.Error("manual index failed", "repo", slug, "err", err)
 				return
 			}
