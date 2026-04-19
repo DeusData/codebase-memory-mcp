@@ -80,3 +80,30 @@ func isInternalScope(scope string) bool {
 	}
 	return false
 }
+
+// ParsePackageName reads the "name" field from a package.json file and splits it
+// into scope and name. For example, "@platform-core/base-service" → ("@platform-core", "base-service").
+// Returns empty strings if the name is not a scoped GHL-internal package.
+func ParsePackageName(path string) (scope, name string, err error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", fmt.Errorf("orgdb: read %s: %w", path, err)
+	}
+
+	var pkg struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(data, &pkg); err != nil {
+		return "", "", fmt.Errorf("orgdb: parse %s: %w", path, err)
+	}
+
+	if pkg.Name == "" {
+		return "", "", nil
+	}
+
+	s, n := splitScoped(pkg.Name)
+	if s == "" || !isInternalScope(s) {
+		return "", "", nil
+	}
+	return s, n, nil
+}

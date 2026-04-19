@@ -285,6 +285,293 @@ func TestInsertAPIContract_StoresContract(t *testing.T) {
 
 // ---------- InsertEventContract ----------
 
+// ---------- InferPackageProviders ----------
+
+func TestInferPackageProviders_MatchesByRepoName(t *testing.T) {
+	db := openTestDB(t)
+
+	// Create repos
+	seedRepo(t, db, "platform-core-base-service")
+	seedRepo(t, db, "platform-core-logger")
+	seedRepo(t, db, "some-unrelated-repo")
+
+	// Create packages WITHOUT provider_repo
+	db.UpsertPackageDep("some-unrelated-repo", Dep{
+		Scope: "@platform-core", Name: "base-service",
+		DepType: "dependencies", VersionSpec: "^3.0.0",
+	})
+	db.UpsertPackageDep("some-unrelated-repo", Dep{
+		Scope: "@platform-core", Name: "logger",
+		DepType: "dependencies", VersionSpec: "^1.0.0",
+	})
+
+	// Infer providers
+	count, err := db.InferPackageProviders()
+	if err != nil {
+		t.Fatalf("InferPackageProviders: %v", err)
+	}
+	if count < 2 {
+		t.Errorf("expected at least 2 providers inferred, got %d", count)
+	}
+
+	// Verify base-service got the right provider
+	var providerRepo string
+	err = db.db.QueryRow(`SELECT provider_repo FROM packages WHERE scope = ? AND name = ?`,
+		"@platform-core", "base-service").Scan(&providerRepo)
+	if err != nil {
+		t.Fatalf("query base-service provider: %v", err)
+	}
+	if providerRepo != "platform-core-base-service" {
+		t.Errorf("base-service provider: got %q, want %q", providerRepo, "platform-core-base-service")
+	}
+
+	// Verify logger got the right provider
+	err = db.db.QueryRow(`SELECT provider_repo FROM packages WHERE scope = ? AND name = ?`,
+		"@platform-core", "logger").Scan(&providerRepo)
+	if err != nil {
+		t.Fatalf("query logger provider: %v", err)
+	}
+	if providerRepo != "platform-core-logger" {
+		t.Errorf("logger provider: got %q, want %q", providerRepo, "platform-core-logger")
+	}
+}
+
+func TestInferPackageProviders_DoesNotOverwriteExisting(t *testing.T) {
+	db := openTestDB(t)
+
+	seedRepo(t, db, "wrong-repo")
+	seedRepo(t, db, "correct-repo")
+
+	// Create package with existing provider_repo
+	db.SetPackageProvider("@platform-core", "base-service", "correct-repo")
+
+	// Create a repo that could also match
+	seedRepo(t, db, "base-service")
+
+	count, err := db.InferPackageProviders()
+	if err != nil {
+		t.Fatalf("InferPackageProviders: %v", err)
+	}
+	_ = count
+
+	// Should NOT have overwritten the existing provider
+	var providerRepo string
+	db.db.QueryRow(`SELECT provider_repo FROM packages WHERE scope = ? AND name = ?`,
+		"@platform-core", "base-service").Scan(&providerRepo)
+	if providerRepo != "correct-repo" {
+		t.Errorf("provider should remain %q, got %q", "correct-repo", providerRepo)
+	}
+}
+
+// ---------- extractServiceIdentifier ----------
+
+func TestExtractServiceIdentifier(t *testing.T) {
+	tests := []struct {
+		path string
+		want string
+	}{
+		// Provider paths (from @Controller)
+		{"/contacts/list", "contacts"},
+		{"/api/v1/contacts/list", "contacts"},
+		{"/api/v2/users/create", "users"},
+		{"/api/contacts/list", "contacts"},
+		// Consumer paths (from InternalRequest)
+		{"/CONTACTS_API/list", "contacts"},
+		{"/PAYMENTS_SERVICE/charge", "payments"},
+		{"/USERS_WORKER/process", "users"},
+		// Edge cases
+		{"/api/v1", "api"},       // only has api/version, fallback
+		{"/health", "health"},    // single segment
+		{"", ""},                 // empty
+		{"/", ""},                // just slash
+	}
+
+	for _, tt := range tests {
+		got := extractServiceIdentifier(tt.path)
+		if got != tt.want {
+			t.Errorf("extractServiceIdentifier(%q) = %q, want %q", tt.path, got, tt.want)
+		}
+	}
+}
+
+// ---------- CrossReferenceContracts false positives ----------
+
+func TestCrossReferenceContracts_NoFalsePositive(t *testing.T) {
+	db := openTestDB(t)
+
+	// Provider: contacts-service exposes GET /contacts/list (simple path)
+	db.InsertAPIContract(APIContract{
+		ProviderRepo:   "contacts-service",
+		Method:         "GET",
+		Path:           "/contacts/list",
+		ProviderSymbol: "ContactsController.list",
+		Confidence:     0.3,
+	})
+
+	// Provider: users-service exposes GET /users/list
+	db.InsertAPIContract(APIContract{
+		ProviderRepo:   "users-service",
+		Method:         "GET",
+		Path:           "/users/list",
+		ProviderSymbol: "UsersController.list",
+		Confidence:     0.3,
+	})
+
+	// Consumer: workflow calls CONTACTS_API/list — should only match contacts, not users
+	db.InsertAPIContract(APIContract{
+		ConsumerRepo:   "workflow-service",
+		Method:         "GET",
+		Path:           "/CONTACTS_API/list",
+		ConsumerSymbol: "WorkflowService.fetch",
+		Confidence:     0.5,
+	})
+
+	matched, err := db.CrossReferenceContracts()
+	if err != nil {
+		t.Fatalf("CrossReferenceContracts: %v", err)
+	}
+
+	if matched != 1 {
+		t.Errorf("expected exactly 1 match, got %d", matched)
+	}
+
+	// Verify the matched consumer got contacts-service, not users-service
+	var providerRepo string
+	err = db.db.QueryRow(`
+		SELECT provider_repo FROM api_contracts
+		WHERE consumer_repo = 'workflow-service' AND provider_repo != ''
+	`).Scan(&providerRepo)
+	if err != nil {
+		t.Fatalf("query matched contract: %v", err)
+	}
+	if providerRepo != "contacts-service" {
+		t.Errorf("expected provider contacts-service, got %q", providerRepo)
+	}
+}
+
+func TestCrossReferenceContracts_APIVersionedPaths(t *testing.T) {
+	db := openTestDB(t)
+
+	// Provider: contacts-service exposes GET /api/v1/contacts/list (versioned API path)
+	db.InsertAPIContract(APIContract{
+		ProviderRepo:   "contacts-service",
+		Method:         "GET",
+		Path:           "/api/v1/contacts/list",
+		ProviderSymbol: "ContactsController.list",
+		Confidence:     0.3,
+	})
+
+	// Consumer: workflow calls CONTACTS_API/list
+	db.InsertAPIContract(APIContract{
+		ConsumerRepo:   "workflow-service",
+		Method:         "GET",
+		Path:           "/CONTACTS_API/list",
+		ConsumerSymbol: "WorkflowService.fetch",
+		Confidence:     0.5,
+	})
+
+	matched, err := db.CrossReferenceContracts()
+	if err != nil {
+		t.Fatalf("CrossReferenceContracts: %v", err)
+	}
+
+	if matched != 1 {
+		t.Errorf("expected 1 match (api/v1/contacts/list ↔ CONTACTS_API/list), got %d", matched)
+	}
+}
+
+// ---------- SetPackageProvider ----------
+
+func TestSetPackageProvider_SetsAndUpdates(t *testing.T) {
+	db := openTestDB(t)
+
+	// First set
+	if err := db.SetPackageProvider("@platform-core", "base-service", "platform-core-repo"); err != nil {
+		t.Fatalf("SetPackageProvider: %v", err)
+	}
+
+	var providerRepo string
+	err := db.db.QueryRow(`SELECT provider_repo FROM packages WHERE scope = ? AND name = ?`,
+		"@platform-core", "base-service").Scan(&providerRepo)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if providerRepo != "platform-core-repo" {
+		t.Errorf("provider_repo: got %q, want %q", providerRepo, "platform-core-repo")
+	}
+
+	// Update
+	if err := db.SetPackageProvider("@platform-core", "base-service", "new-repo"); err != nil {
+		t.Fatalf("SetPackageProvider update: %v", err)
+	}
+	err = db.db.QueryRow(`SELECT provider_repo FROM packages WHERE scope = ? AND name = ?`,
+		"@platform-core", "base-service").Scan(&providerRepo)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if providerRepo != "new-repo" {
+		t.Errorf("provider_repo after update: got %q, want %q", providerRepo, "new-repo")
+	}
+}
+
+// ---------- CrossReferenceEventContracts ----------
+
+func TestCrossReferenceEventContracts_MatchesByTopic(t *testing.T) {
+	db := openTestDB(t)
+
+	// Producer-only
+	db.InsertEventContract(EventContract{
+		Topic: "user.created", EventType: "pubsub",
+		ProducerRepo: "auth-service", ProducerSymbol: "AuthService.emit",
+	})
+
+	// Consumer-only
+	db.InsertEventContract(EventContract{
+		Topic: "user.created", EventType: "pubsub",
+		ConsumerRepo: "notification-service", ConsumerSymbol: "NotifyWorker.handle",
+	})
+
+	// Unrelated consumer (different topic, should NOT match)
+	db.InsertEventContract(EventContract{
+		Topic: "order.placed", EventType: "pubsub",
+		ConsumerRepo: "billing-service", ConsumerSymbol: "BillingWorker.handle",
+	})
+
+	matched, err := db.CrossReferenceEventContracts()
+	if err != nil {
+		t.Fatalf("CrossReferenceEventContracts: %v", err)
+	}
+
+	if matched != 1 {
+		t.Errorf("expected 1 match, got %d", matched)
+	}
+
+	// Verify the consumer got the producer info
+	var producerRepo string
+	err = db.db.QueryRow(`
+		SELECT producer_repo FROM event_contracts
+		WHERE consumer_repo = 'notification-service' AND topic = 'user.created'
+	`).Scan(&producerRepo)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if producerRepo != "auth-service" {
+		t.Errorf("producer_repo: got %q, want %q", producerRepo, "auth-service")
+	}
+
+	// Verify unmatched consumer still has empty producer
+	var unmatchedProducer *string
+	db.db.QueryRow(`
+		SELECT producer_repo FROM event_contracts
+		WHERE consumer_repo = 'billing-service'
+	`).Scan(&unmatchedProducer)
+	if unmatchedProducer != nil && *unmatchedProducer != "" {
+		t.Errorf("unmatched consumer should have no producer, got %q", *unmatchedProducer)
+	}
+}
+
+// ---------- InsertEventContract ----------
+
 func TestInsertEventContract_StoresContract(t *testing.T) {
 	db := openTestDB(t)
 

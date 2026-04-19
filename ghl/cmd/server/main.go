@@ -231,7 +231,8 @@ func main() {
 		githubToken: cfg.GitHubToken,
 	}
 
-	var orgRepoCount atomic.Int64 // tracks repos enriched for periodic GCS sync
+	var orgRepoCount atomic.Int64    // tracks repos enriched for periodic GCS sync
+	var orgPipelineRunning atomic.Bool // true while startup pipeline is populating org.db
 
 	newFleetIndexer := func(client indexer.Client, discoverySvc *discovery.Discoverer) *indexer.Indexer {
 		return indexer.New(indexer.Config{
@@ -255,7 +256,7 @@ func main() {
 					}
 				}
 				// ── Org graph enrichment ──
-				if orgDB != nil {
+				if orgDB != nil && !orgPipelineRunning.Load() {
 					repo, ok := m.FindByName(slug)
 					if ok {
 						if enrichErr := pipeline.PopulateRepoData(orgDB, repo, cfg.CloneCacheDir); enrichErr != nil {
@@ -267,6 +268,7 @@ func main() {
 					// Persist org.db to GCS every 10 repos (survive Cloud Run container restarts)
 					count := orgRepoCount.Add(1)
 					if count%10 == 0 && artifactSync != nil {
+						orgDB.Checkpoint() // flush WAL before copying
 						if _, persistErr := artifactSync.PersistOrgGraph(); persistErr != nil {
 							slog.Warn("periodic org.db persist failed", "count", count, "err", persistErr)
 						} else {
@@ -282,15 +284,29 @@ func main() {
 			OnAllComplete: func(result indexer.IndexResult) {
 				slog.Info("fleet indexing complete", "total", result.Total, "ok", result.Succeeded, "failed", result.Failed)
 				// ── Cross-reference org contracts ──
-				if orgDB != nil {
+				if orgDB != nil && !orgPipelineRunning.Load() {
+					// Infer package providers from repo names
+					provCount, provErr := orgDB.InferPackageProviders()
+					if provErr != nil {
+						slog.Warn("infer package providers failed", "err", provErr)
+					} else {
+						slog.Info("inferred package providers", "count", provCount)
+					}
 					matched, err := orgDB.CrossReferenceContracts()
 					if err != nil {
 						slog.Warn("cross-reference contracts failed", "err", err)
 					} else {
 						slog.Info("cross-referenced API contracts", "matched", matched)
 					}
+					eventMatched, err := orgDB.CrossReferenceEventContracts()
+					if err != nil {
+						slog.Warn("cross-reference event contracts failed", "err", err)
+					} else {
+						slog.Info("cross-referenced event contracts", "matched", eventMatched)
+					}
 					// Persist org.db to artifacts
 					if artifactSync != nil {
+						orgDB.Checkpoint() // flush WAL before copying
 						persisted, err := artifactSync.PersistOrgGraph()
 						if err != nil {
 							slog.Warn("failed to persist org graph", "err", err)
@@ -378,24 +394,39 @@ func main() {
 	})
 	idx := newFleetIndexer(indexPool, discoverySvc)
 
-	// ── Populate org.db from hydrated project .db files (runs once on startup) ──
+	// ── Populate org.db from hydrated project .db files (only if empty) ──
 	if orgDB != nil {
-		go func() {
-			slog.Info("startup: populating org.db from hydrated project DBs")
-			if err := pipeline.PopulateOrgFromProjectDBs(context.Background(), orgDB, discoveryPool, m.Repos, cfg.CBMCacheDir); err != nil {
-				slog.Error("startup: org.db population failed", "err", err)
-			} else {
-				slog.Info("startup: org.db populated successfully")
-				// Persist to GCS immediately
-				if artifactSync != nil {
-					if n, err := artifactSync.PersistOrgGraph(); err != nil {
-						slog.Warn("startup: org.db GCS persist failed", "err", err)
-					} else {
-						slog.Info("startup: org.db persisted to GCS", "files", n)
+		repoCount := orgDB.RepoCount()
+		apiContracts, eventContracts := orgDB.ContractCount()
+		slog.Info("startup: org.db state after hydration",
+			"repos", repoCount, "api_contracts", apiContracts, "event_contracts", eventContracts)
+
+		if repoCount > 50 {
+			// org.db was successfully hydrated from GCS — skip expensive re-population
+			slog.Info("startup: org.db already populated, skipping re-population",
+				"repos", repoCount)
+		} else {
+			// org.db is empty or too small — populate from project DBs
+			go func() {
+				orgPipelineRunning.Store(true)
+				defer orgPipelineRunning.Store(false)
+				slog.Info("startup: populating org.db from hydrated project DBs")
+				if err := pipeline.PopulateOrgFromProjectDBs(context.Background(), orgDB, discoveryPool, m.Repos, cfg.CBMCacheDir); err != nil {
+					slog.Error("startup: org.db population failed", "err", err)
+				} else {
+					slog.Info("startup: org.db populated successfully")
+					// Persist to GCS immediately
+					if artifactSync != nil {
+						orgDB.Checkpoint() // flush WAL before copying
+						if n, err := artifactSync.PersistOrgGraph(); err != nil {
+							slog.Warn("startup: org.db GCS persist failed", "err", err)
+						} else {
+							slog.Info("startup: org.db persisted to GCS", "files", n)
+						}
 					}
 				}
-			}
-		}()
+			}()
+		}
 	}
 
 	var fleetIndexing atomic.Bool
@@ -493,6 +524,49 @@ func main() {
 		}()
 		w.WriteHeader(http.StatusAccepted)
 		fmt.Fprintf(w, `{"accepted":true,"repo":%q}`, slug)
+	}))
+
+	// Rebuild org.db post-processing: infer providers, cross-reference contracts.
+	// This is fast (SQL-only, no MCP calls) and can be run after any partial population.
+	r.Post("/rebuild-org", requireAuth(func(w http.ResponseWriter, req *http.Request) {
+		if orgDB == nil {
+			http.Error(w, "org graph not enabled", http.StatusServiceUnavailable)
+			return
+		}
+		go func() {
+			slog.Info("rebuild-org: starting SQL post-processing")
+			provCount, err := orgDB.InferPackageProviders()
+			if err != nil {
+				slog.Error("rebuild-org: infer providers failed", "err", err)
+			} else {
+				slog.Info("rebuild-org: inferred providers", "count", provCount)
+			}
+			matched, err := orgDB.CrossReferenceContracts()
+			if err != nil {
+				slog.Error("rebuild-org: cross-ref API failed", "err", err)
+			} else {
+				slog.Info("rebuild-org: cross-referenced API contracts", "matched", matched)
+			}
+			eventMatched, err := orgDB.CrossReferenceEventContracts()
+			if err != nil {
+				slog.Error("rebuild-org: cross-ref events failed", "err", err)
+			} else {
+				slog.Info("rebuild-org: cross-referenced events", "matched", eventMatched)
+			}
+			// Persist
+			if artifactSync != nil {
+				orgDB.Checkpoint()
+				if n, err := artifactSync.PersistOrgGraph(); err != nil {
+					slog.Warn("rebuild-org: persist failed", "err", err)
+				} else {
+					slog.Info("rebuild-org: persisted to GCS", "files", n)
+				}
+			}
+			slog.Info("rebuild-org: complete",
+				"providers", provCount, "api_matched", matched, "event_matched", eventMatched)
+		}()
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprint(w, `{"accepted":true}`)
 	}))
 
 	r.Post("/index-all", requireAuth(func(w http.ResponseWriter, req *http.Request) {

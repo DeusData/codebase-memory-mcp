@@ -84,6 +84,44 @@ async function call() {
 	}
 }
 
+func TestEnrichRepo_ExtractsEventPatterns(t *testing.T) {
+	dir := t.TempDir()
+
+	writeTestFile(t, dir, "src/order/order.worker.ts", `
+import { EventPattern } from '@nestjs/microservices';
+
+export class OrderWorker {
+  @EventPattern('order.created')
+  handleOrderCreated(data: any) {}
+
+  async processOrder() {
+    await this.pubSub.publish('order.processed', { id: 1 });
+  }
+}
+`)
+
+	result, err := EnrichRepo(dir)
+	if err != nil {
+		t.Fatalf("EnrichRepo: %v", err)
+	}
+
+	if len(result.EventPatterns) != 2 {
+		t.Fatalf("EventPatterns count: got %d, want 2", len(result.EventPatterns))
+	}
+
+	// Verify consumer
+	if result.EventPatterns[0].Topic != "order.created" || result.EventPatterns[0].Role != "consumer" {
+		t.Errorf("EventPatterns[0] = {%q, %q}, want {order.created, consumer}",
+			result.EventPatterns[0].Topic, result.EventPatterns[0].Role)
+	}
+
+	// Verify producer
+	if result.EventPatterns[1].Topic != "order.processed" || result.EventPatterns[1].Role != "producer" {
+		t.Errorf("EventPatterns[1] = {%q, %q}, want {order.processed, producer}",
+			result.EventPatterns[1].Topic, result.EventPatterns[1].Role)
+	}
+}
+
 func TestEnrichRepo_EmptyDir(t *testing.T) {
 	dir := t.TempDir()
 	result, err := EnrichRepo(dir)

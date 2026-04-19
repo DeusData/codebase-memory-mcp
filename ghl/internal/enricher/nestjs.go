@@ -35,17 +35,29 @@ type InternalRequestCall struct {
 	Route       string // e.g., "upsert"
 }
 
+// EventPatternCall describes a detected event publisher or subscriber.
+type EventPatternCall struct {
+	Topic    string // e.g., "contact.created"
+	Role     string // "producer" or "consumer"
+	Symbol   string // function/class name
+	FilePath string
+}
+
 var (
-	reController   = regexp.MustCompile(`@Controller\(\s*['"]([^'"]*)['"]\s*\)`)
-	reClassName    = regexp.MustCompile(`export\s+class\s+(\w+)`)
-	reInjectable   = regexp.MustCompile(`@Injectable\(\)`)
-	reRoute        = regexp.MustCompile(`@(Get|Post|Put|Delete|Patch)\(\s*['"]?([^'")]*?)['"]?\s*\)`)
-	reUseGuards    = regexp.MustCompile(`@UseGuards\(([^)]+)\)`)
-	reConstructor  = regexp.MustCompile(`constructor\s*\(([\s\S]*?)\)`)
-	reDIParam      = regexp.MustCompile(`(?:private|protected|public)\s+(?:readonly\s+)?(\w+)\s*:\s*(\w+)`)
-	reInternalReq  = regexp.MustCompile(`InternalRequest\.(get|post|put|delete|patch)\(\s*\{([\s\S]*?)\}\s*\)`)
-	reServiceName  = regexp.MustCompile(`serviceName\s*:\s*SERVICE_NAME\.(\w+)`)
-	reRouteField   = regexp.MustCompile(`route\s*:\s*['"]([^'"]+)['"]`)
+	reController     = regexp.MustCompile(`@Controller\(\s*['"]([^'"]*)['"]\s*\)`)
+	reClassName      = regexp.MustCompile(`export\s+class\s+(\w+)`)
+	reInjectable     = regexp.MustCompile(`@Injectable\(\)`)
+	reRoute          = regexp.MustCompile(`@(Get|Post|Put|Delete|Patch)\(\s*['"]?([^'")]*?)['"]?\s*\)`)
+	reUseGuards      = regexp.MustCompile(`@UseGuards\(([^)]+)\)`)
+	reConstructor    = regexp.MustCompile(`constructor\s*\(([\s\S]*?)\)`)
+	reDIParam        = regexp.MustCompile(`(?:private|protected|public)\s+(?:readonly\s+)?(\w+)\s*:\s*(\w+)`)
+	reInternalReq    = regexp.MustCompile(`InternalRequest\.(get|post|put|delete|patch)\(\s*\{([\s\S]*?)\}\s*\)`)
+	reServiceName    = regexp.MustCompile(`serviceName\s*:\s*SERVICE_NAME\.(\w+)`)
+	reRouteField     = regexp.MustCompile(`route\s*:\s*['"]([^'"]+)['"]`)
+	reEventPattern   = regexp.MustCompile(`@EventPattern\(\s*['"]([^'"]+)['"]`)
+	reMessagePattern = regexp.MustCompile(`@MessagePattern\(\s*['"]([^'"]+)['"]`)
+	rePubSubPublish  = regexp.MustCompile(`pubSub\.publish\(\s*['"]([^'"]+)['"]`)
+	rePubSubEmit     = regexp.MustCompile(`\.emit\(\s*['"]([^'"]+)['"]`)
 )
 
 // ExtractNestJSMetadata extracts NestJS decorator metadata from TypeScript source.
@@ -139,4 +151,54 @@ func ExtractInternalRequests(source string) ([]InternalRequestCall, error) {
 		})
 	}
 	return calls, nil
+}
+
+// ExtractEventPatterns finds @EventPattern, @MessagePattern, pubSub.publish,
+// and .emit() calls in source code, returning producer/consumer event pattern calls.
+func ExtractEventPatterns(source, filePath string) []EventPatternCall {
+	var patterns []EventPatternCall
+
+	// Find class name for symbol attribution
+	className := ""
+	if m := reClassName.FindStringSubmatch(source); m != nil {
+		className = m[1]
+	}
+
+	// Consumers: @EventPattern('topic') and @MessagePattern('topic')
+	for _, m := range reEventPattern.FindAllStringSubmatch(source, -1) {
+		patterns = append(patterns, EventPatternCall{
+			Topic:    m[1],
+			Role:     "consumer",
+			Symbol:   className,
+			FilePath: filePath,
+		})
+	}
+	for _, m := range reMessagePattern.FindAllStringSubmatch(source, -1) {
+		patterns = append(patterns, EventPatternCall{
+			Topic:    m[1],
+			Role:     "consumer",
+			Symbol:   className,
+			FilePath: filePath,
+		})
+	}
+
+	// Producers: pubSub.publish('topic', ...) and .emit('topic', ...)
+	for _, m := range rePubSubPublish.FindAllStringSubmatch(source, -1) {
+		patterns = append(patterns, EventPatternCall{
+			Topic:    m[1],
+			Role:     "producer",
+			Symbol:   className,
+			FilePath: filePath,
+		})
+	}
+	for _, m := range rePubSubEmit.FindAllStringSubmatch(source, -1) {
+		patterns = append(patterns, EventPatternCall{
+			Topic:    m[1],
+			Role:     "producer",
+			Symbol:   className,
+			FilePath: filePath,
+		})
+	}
+
+	return patterns
 }

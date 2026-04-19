@@ -182,13 +182,21 @@ func (b *fsBackend) PersistOrgDB(runtimeDir string) (int, error) {
 	}
 	copied := 0
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".db") {
+		if entry.IsDir() {
 			continue
 		}
-		src := filepath.Join(srcDir, entry.Name())
-		dst := filepath.Join(b.artifactDir, "org", entry.Name())
+		name := entry.Name()
+		// Copy .db files AND WAL journal files (.db-wal, .db-shm)
+		// Without the WAL, the persisted .db file is empty when using WAL mode.
+		if !strings.HasSuffix(name, ".db") &&
+			!strings.HasSuffix(name, ".db-wal") &&
+			!strings.HasSuffix(name, ".db-shm") {
+			continue
+		}
+		src := filepath.Join(srcDir, name)
+		dst := filepath.Join(b.artifactDir, "org", name)
 		if err := copyFileAtomic(src, dst); err != nil {
-			return copied, fmt.Errorf("cachepersist: persist org %s: %w", entry.Name(), err)
+			return copied, fmt.Errorf("cachepersist: persist org %s: %w", name, err)
 		}
 		copied++
 	}
@@ -206,13 +214,20 @@ func (b *fsBackend) HydrateOrgDB(runtimeDir string) (int, error) {
 	}
 	copied := 0
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".db") {
+		if entry.IsDir() {
 			continue
 		}
-		src := filepath.Join(srcDir, entry.Name())
-		dst := filepath.Join(runtimeDir, "org", entry.Name())
+		name := entry.Name()
+		// Restore .db files AND WAL journal files (.db-wal, .db-shm)
+		if !strings.HasSuffix(name, ".db") &&
+			!strings.HasSuffix(name, ".db-wal") &&
+			!strings.HasSuffix(name, ".db-shm") {
+			continue
+		}
+		src := filepath.Join(srcDir, name)
+		dst := filepath.Join(runtimeDir, "org", name)
 		if err := copyFileAtomic(src, dst); err != nil {
-			return copied, fmt.Errorf("cachepersist: hydrate org %s: %w", entry.Name(), err)
+			return copied, fmt.Errorf("cachepersist: hydrate org %s: %w", name, err)
 		}
 		copied++
 	}

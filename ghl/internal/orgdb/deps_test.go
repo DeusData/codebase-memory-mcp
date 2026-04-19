@@ -58,6 +58,56 @@ func TestParsePackageJSON_ExtractsGHLDeps(t *testing.T) {
 	}
 }
 
+// ---------- ParsePackageName ----------
+
+func TestParsePackageName_InternalScope(t *testing.T) {
+	dir := t.TempDir()
+	pkgJSON := `{"name": "@platform-core/base-service", "version": "3.2.0"}`
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(pkgJSON), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	scope, name, err := ParsePackageName(filepath.Join(dir, "package.json"))
+	if err != nil {
+		t.Fatalf("ParsePackageName: %v", err)
+	}
+	if scope != "@platform-core" || name != "base-service" {
+		t.Errorf("got (%q, %q), want (@platform-core, base-service)", scope, name)
+	}
+}
+
+func TestParsePackageName_ExternalScope(t *testing.T) {
+	dir := t.TempDir()
+	pkgJSON := `{"name": "@nestjs/common"}`
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(pkgJSON), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	scope, name, err := ParsePackageName(filepath.Join(dir, "package.json"))
+	if err != nil {
+		t.Fatalf("ParsePackageName: %v", err)
+	}
+	if scope != "" || name != "" {
+		t.Errorf("expected empty for external scope, got (%q, %q)", scope, name)
+	}
+}
+
+func TestParsePackageName_UnscopedName(t *testing.T) {
+	dir := t.TempDir()
+	pkgJSON := `{"name": "simple-app"}`
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(pkgJSON), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	scope, name, err := ParsePackageName(filepath.Join(dir, "package.json"))
+	if err != nil {
+		t.Fatalf("ParsePackageName: %v", err)
+	}
+	if scope != "" || name != "" {
+		t.Errorf("expected empty for unscoped name, got (%q, %q)", scope, name)
+	}
+}
+
 func TestParsePackageJSON_MissingFile(t *testing.T) {
 	_, err := ParsePackageJSON("/nonexistent/package.json")
 	if err == nil {

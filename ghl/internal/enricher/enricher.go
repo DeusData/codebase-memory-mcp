@@ -11,6 +11,7 @@ type RepoEnrichResult struct {
 	Controllers   []NestJSMetadata
 	Injectables   []NestJSMetadata
 	InternalCalls []InternalRequestCall
+	EventPatterns []EventPatternCall
 	RepoPath      string
 }
 
@@ -48,7 +49,11 @@ func EnrichRepo(repoPath string) (RepoEnrichResult, error) {
 		hasNest := strings.Contains(source, "@Controller") ||
 			strings.Contains(source, "@Injectable") ||
 			strings.Contains(source, "InternalRequest.")
-		if !hasNest {
+		hasEvents := strings.Contains(source, "@EventPattern") ||
+			strings.Contains(source, "@MessagePattern") ||
+			strings.Contains(source, "pubSub.publish") ||
+			strings.Contains(source, ".emit(")
+		if !hasNest && !hasEvents {
 			return nil
 		}
 
@@ -70,6 +75,10 @@ func EnrichRepo(repoPath string) (RepoEnrichResult, error) {
 			return nil
 		}
 		result.InternalCalls = append(result.InternalCalls, calls...)
+
+		// Extract event patterns
+		eventPatterns := ExtractEventPatterns(source, relPath)
+		result.EventPatterns = append(result.EventPatterns, eventPatterns...)
 
 		return nil
 	})

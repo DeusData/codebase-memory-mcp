@@ -294,6 +294,86 @@ func TestTraceFlow_Upstream(t *testing.T) {
 	}
 }
 
+func TestTraceFlow_EventPropagation(t *testing.T) {
+	db := openTestDB(t)
+
+	// A → B via API, B → C via event, C → D via event
+	seedRepo(t, db, "svc-a")
+	seedRepo(t, db, "svc-b")
+	seedRepo(t, db, "svc-c")
+	seedRepo(t, db, "svc-d")
+
+	db.InsertAPIContract(APIContract{
+		ProviderRepo: "svc-a", ConsumerRepo: "svc-b",
+		Method: "POST", Path: "/api/trigger", Confidence: 0.9,
+	})
+	db.InsertEventContract(EventContract{
+		Topic: "order.created", EventType: "pubsub",
+		ProducerRepo: "svc-b", ConsumerRepo: "svc-c",
+	})
+	db.InsertEventContract(EventContract{
+		Topic: "order.processed", EventType: "pubsub",
+		ProducerRepo: "svc-c", ConsumerRepo: "svc-d",
+	})
+
+	steps, err := db.TraceFlow("svc-a", "downstream", 4)
+	if err != nil {
+		t.Fatalf("TraceFlow: %v", err)
+	}
+
+	// Should reach svc-d through the event chain
+	reachedD := false
+	for _, s := range steps {
+		if s.ToRepo == "svc-d" {
+			reachedD = true
+			break
+		}
+	}
+	if !reachedD {
+		t.Errorf("expected to reach svc-d through event propagation, got steps: %v", steps)
+	}
+
+	// Verify at least 3 steps: A→B, B→C, C→D
+	if len(steps) < 3 {
+		t.Errorf("expected at least 3 steps, got %d", len(steps))
+	}
+}
+
+func TestTraceFlow_UpstreamEventPropagation(t *testing.T) {
+	db := openTestDB(t)
+
+	seedRepo(t, db, "svc-a")
+	seedRepo(t, db, "svc-b")
+	seedRepo(t, db, "svc-c")
+
+	// A produces event → B consumes, B produces event → C consumes
+	db.InsertEventContract(EventContract{
+		Topic: "user.created", EventType: "pubsub",
+		ProducerRepo: "svc-a", ConsumerRepo: "svc-b",
+	})
+	db.InsertEventContract(EventContract{
+		Topic: "user.enriched", EventType: "pubsub",
+		ProducerRepo: "svc-b", ConsumerRepo: "svc-c",
+	})
+
+	// Upstream from svc-c should reach svc-a
+	steps, err := db.TraceFlow("svc-c", "upstream", 4)
+	if err != nil {
+		t.Fatalf("TraceFlow upstream: %v", err)
+	}
+
+	reachedA := false
+	for _, s := range steps {
+		if s.FromRepo == "svc-a" {
+			reachedA = true
+			break
+		}
+	}
+	if !reachedA {
+		t.Errorf("expected to reach svc-a through upstream event propagation, got steps: %v", steps)
+	}
+}
+
 // ---------- TeamTopology ----------
 
 func TestTeamTopology_ReposAndDepTeams(t *testing.T) {

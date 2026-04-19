@@ -76,7 +76,7 @@ func (s *OrgService) Definitions() []discovery.ToolDefinition {
 				"type": "object",
 				"properties": map[string]interface{}{
 					"query": map[string]interface{}{"type": "string", "description": "Search query"},
-					"scope": map[string]interface{}{"type": "string", "enum": []string{"all", "backend", "frontend", "infra", "library"}, "default": "all"},
+					"scope": map[string]interface{}{"type": "string", "enum": []string{"all", "service", "frontend", "worker", "library", "tests", "other"}, "default": "all"},
 					"team":  map[string]interface{}{"type": "string", "description": "Filter by team"},
 					"limit": map[string]interface{}{"type": "integer", "default": 10},
 				},

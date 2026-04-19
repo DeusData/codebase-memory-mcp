@@ -86,6 +86,31 @@ func (d *DB) UpsertTeamOwnership(repoName, team, subTeam string) error {
 	return nil
 }
 
+// Checkpoint forces a WAL checkpoint, flushing all WAL data into the main database file.
+// This must be called before copying/persisting the .db file to ensure all data is
+// written to the main file (not stuck in the WAL journal).
+func (d *DB) Checkpoint() error {
+	_, err := d.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	if err != nil {
+		return fmt.Errorf("orgdb: wal checkpoint: %w", err)
+	}
+	return nil
+}
+
+// RepoCount returns the number of repos in the org graph.
+func (d *DB) RepoCount() int {
+	var count int
+	d.db.QueryRow(`SELECT COUNT(*) FROM repos`).Scan(&count)
+	return count
+}
+
+// ContractCount returns the total number of API and event contracts.
+func (d *DB) ContractCount() (apiContracts, eventContracts int) {
+	d.db.QueryRow(`SELECT COUNT(*) FROM api_contracts`).Scan(&apiContracts)
+	d.db.QueryRow(`SELECT COUNT(*) FROM event_contracts`).Scan(&eventContracts)
+	return
+}
+
 func (d *DB) ensureSchema() error {
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS repos (

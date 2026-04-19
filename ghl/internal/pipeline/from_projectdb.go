@@ -94,6 +94,17 @@ func PopulateOrgFromProjectDBs(ctx context.Context, db *orgdb.DB, caller MCPCall
 	// ── Phase 2c: Extract @platform-core package deps ──
 	packageCount := extractPackageDeps(ctx, db, caller, entries)
 
+	// ── Phase 2d: Extract event contracts ──
+	eventCount := extractEventContracts(ctx, db, caller, entries)
+
+	// ── Phase 2e: Infer package providers from repo names ──
+	providerCount, provErr := db.InferPackageProviders()
+	if provErr != nil {
+		slog.Warn("infer package providers failed", "err", provErr)
+	} else {
+		slog.Info("phase 2e: inferred package providers", "count", providerCount)
+	}
+
 	// ── Phase 3: Cross-reference contracts ──
 	matched := 0
 	if routeCount > 0 && consumerCount > 0 {
@@ -103,13 +114,23 @@ func PopulateOrgFromProjectDBs(ctx context.Context, db *orgdb.DB, caller MCPCall
 		if err != nil {
 			slog.Warn("cross-reference failed", "err", err)
 		} else {
-			slog.Info("phase 3 complete", "matched", matched)
+			slog.Info("phase 3 complete", "api_matched", matched)
+		}
+	}
+
+	// Cross-reference event contracts
+	if eventCount > 0 {
+		eventMatched, err := db.CrossReferenceEventContracts()
+		if err != nil {
+			slog.Warn("cross-reference event contracts failed", "err", err)
+		} else {
+			slog.Info("event cross-reference complete", "matched", eventMatched)
 		}
 	}
 
 	slog.Info("org.db fully populated",
 		"repos", len(entries), "routes", routeCount, "consumers", consumerCount,
-		"packages", packageCount, "cross_referenced", matched)
+		"events", eventCount, "packages", packageCount, "cross_referenced", matched)
 	return nil
 }
 
@@ -576,6 +597,108 @@ func waitForProjects(ctx context.Context, caller MCPCaller, db *orgdb.DB,
 		entries = append(entries, projEntry{projectName: proj.Name, repoName: repoName})
 	}
 	return entries
+}
+
+// extractEventContracts scans each project for event patterns using two approaches:
+// 1. search_graph(query="EventPattern") — finds nodes whose names contain event patterns
+// 2. search_code + get_code_snippet fallback — finds decorator source code
+// Then extracts topics from the source code.
+func extractEventContracts(ctx context.Context, db *orgdb.DB, caller MCPCaller, entries []projEntry) int {
+	slog.Info("phase 2d: extracting event contracts", "projects", len(entries))
+	eventCount, errorCount := 0, 0
+
+	// Regexes to extract topics from source code
+	consumerTopicRe := regexp.MustCompile(`@(?:Event|Message)Pattern\(\s*['"]([^'"]+)['"]`)
+	producerTopicRe := regexp.MustCompile(`(?:pubSub|this\.(?:pubSub|client|eventBus))\.(?:publish|emit|send)\(\s*['"]([^'"]+)['"]`)
+
+	for i, entry := range entries {
+		if i > 0 {
+			time.Sleep(300 * time.Millisecond)
+		}
+
+		// Approach 1: search_graph with query text to find event-related nodes
+		for _, search := range []struct {
+			query string
+			role  string
+			re    *regexp.Regexp
+		}{
+			{"EventPattern", "consumer", consumerTopicRe},
+			{"MessagePattern", "consumer", consumerTopicRe},
+			{"publish", "producer", producerTopicRe},
+			{"emit", "producer", producerTopicRe},
+		} {
+			result, err := caller.CallTool(ctx, "search_graph", map[string]interface{}{
+				"project": entry.projectName,
+				"query":   search.query,
+				"limit":   20,
+			})
+			if err != nil {
+				errorCount++
+				continue
+			}
+
+			text := extractText(result)
+			if text == "" || text == "null" {
+				continue
+			}
+
+			var resp searchGraphResponse
+			if err := json.Unmarshal([]byte(text), &resp); err != nil {
+				continue
+			}
+
+			for j, node := range resp.Results {
+				if j >= 5 {
+					break
+				}
+				if node.QualifiedName == "" {
+					continue
+				}
+
+				time.Sleep(150 * time.Millisecond)
+
+				snippetResult, err := caller.CallTool(ctx, "get_code_snippet", map[string]interface{}{
+					"project":        entry.projectName,
+					"qualified_name": node.QualifiedName,
+				})
+				if err != nil {
+					continue
+				}
+				snippetText := extractText(snippetResult)
+				if snippetText == "" {
+					continue
+				}
+
+				var snippet codeSnippetResponse
+				if err := json.Unmarshal([]byte(snippetText), &snippet); err != nil {
+					continue
+				}
+
+				topics := search.re.FindAllStringSubmatch(snippet.Source, -1)
+				for _, tm := range topics {
+					contract := orgdb.EventContract{
+						Topic:     tm[1],
+						EventType: "pubsub",
+					}
+					if search.role == "producer" {
+						contract.ProducerRepo = entry.repoName
+						contract.ProducerSymbol = node.Name
+					} else {
+						contract.ConsumerRepo = entry.repoName
+						contract.ConsumerSymbol = node.Name
+					}
+					db.InsertEventContract(contract)
+					eventCount++
+				}
+			}
+		}
+
+		if (i+1)%100 == 0 {
+			slog.Info("phase 2d progress", "processed", i+1, "events", eventCount)
+		}
+	}
+	slog.Info("phase 2d complete", "events", eventCount, "errors", errorCount)
+	return eventCount
 }
 
 func extractText(result *mcp.ToolResult) string {

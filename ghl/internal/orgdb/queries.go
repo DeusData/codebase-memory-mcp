@@ -156,6 +156,11 @@ func (d *DB) TraceFlow(trigger string, direction string, maxHops int) ([]FlowSte
 				FROM flow f
 				JOIN api_contracts ac ON ac.consumer_repo = f.from_repo
 				WHERE f.depth < ? AND ac.provider_repo != '' AND ac.provider_repo != f.to_repo
+				UNION ALL
+				SELECT ec.producer_repo, f.from_repo, 'event_contract', ec.topic, 1.0, f.depth + 1
+				FROM flow f
+				JOIN event_contracts ec ON ec.consumer_repo = f.from_repo
+				WHERE f.depth < ? AND ec.producer_repo != '' AND ec.producer_repo != f.to_repo
 			)
 			SELECT DISTINCT from_repo, to_repo, edge_type, detail, confidence FROM flow
 		`
@@ -172,12 +177,17 @@ func (d *DB) TraceFlow(trigger string, direction string, maxHops int) ([]FlowSte
 				FROM flow f
 				JOIN api_contracts ac ON ac.provider_repo = f.to_repo
 				WHERE f.depth < ? AND ac.consumer_repo != '' AND ac.consumer_repo != f.from_repo
+				UNION ALL
+				SELECT f.to_repo, ec.consumer_repo, 'event_contract', ec.topic, 1.0, f.depth + 1
+				FROM flow f
+				JOIN event_contracts ec ON ec.producer_repo = f.to_repo
+				WHERE f.depth < ? AND ec.consumer_repo != '' AND ec.consumer_repo != f.from_repo
 			)
 			SELECT DISTINCT from_repo, to_repo, edge_type, detail, confidence FROM flow
 		`
 	}
 
-	rows, err := d.db.Query(query, trigger, trigger, maxHops)
+	rows, err := d.db.Query(query, trigger, trigger, maxHops, maxHops)
 	if err != nil {
 		return nil, fmt.Errorf("orgdb: trace flow %q %s: %w", trigger, direction, err)
 	}

@@ -170,6 +170,62 @@ export function helper(x: number): number {
 	}
 }
 
+// ---------- ExtractEventPatterns ----------
+
+func TestExtractEventPatterns_ConsumerAndProducer(t *testing.T) {
+	source := `
+import { EventPattern, MessagePattern } from '@nestjs/microservices';
+
+export class OrderWorker {
+  @EventPattern('order.created')
+  handleOrderCreated(data: any) {}
+
+  @MessagePattern('order.query')
+  handleQuery(data: any) {}
+
+  async processOrder() {
+    await this.pubSub.publish('order.processed', { id: 1 });
+  }
+}
+`
+	patterns := ExtractEventPatterns(source, "src/order.worker.ts")
+	if len(patterns) != 3 {
+		t.Fatalf("len(patterns) = %d, want 3", len(patterns))
+	}
+
+	// @EventPattern consumer
+	if patterns[0].Topic != "order.created" || patterns[0].Role != "consumer" {
+		t.Errorf("patterns[0] = {%q, %q}, want {order.created, consumer}", patterns[0].Topic, patterns[0].Role)
+	}
+	// @MessagePattern consumer
+	if patterns[1].Topic != "order.query" || patterns[1].Role != "consumer" {
+		t.Errorf("patterns[1] = {%q, %q}, want {order.query, consumer}", patterns[1].Topic, patterns[1].Role)
+	}
+	// pubSub.publish producer
+	if patterns[2].Topic != "order.processed" || patterns[2].Role != "producer" {
+		t.Errorf("patterns[2] = {%q, %q}, want {order.processed, producer}", patterns[2].Topic, patterns[2].Role)
+	}
+
+	// All should have the class name
+	for i, p := range patterns {
+		if p.Symbol != "OrderWorker" {
+			t.Errorf("patterns[%d].Symbol = %q, want %q", i, p.Symbol, "OrderWorker")
+		}
+	}
+}
+
+func TestExtractEventPatterns_NoPatterns(t *testing.T) {
+	source := `
+export class Helper {
+  doSomething() { return 42; }
+}
+`
+	patterns := ExtractEventPatterns(source, "helper.ts")
+	if len(patterns) != 0 {
+		t.Errorf("len(patterns) = %d, want 0", len(patterns))
+	}
+}
+
 func TestExtractInternalRequests_PostAndGet(t *testing.T) {
 	source := `
 const result = await InternalRequest.post({

@@ -133,18 +133,26 @@ func (b *gcsBackend) PersistOrgDB(runtimeDir string) (int, error) {
 	}
 	copied := 0
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".db") {
+		name := entry.Name()
+		if entry.IsDir() {
 			continue
 		}
-		src := filepath.Join(srcDir, entry.Name())
-		objName := "org/" + entry.Name()
+		// Persist .db files AND WAL journal files (.db-wal, .db-shm).
+		// Without the WAL, the .db may be empty when using WAL journal mode.
+		if !strings.HasSuffix(name, ".db") &&
+			!strings.HasSuffix(name, ".db-wal") &&
+			!strings.HasSuffix(name, ".db-shm") {
+			continue
+		}
+		src := filepath.Join(srcDir, name)
+		objName := "org/" + name
 		if b.prefix != "" {
-			objName = b.prefix + "/org/" + entry.Name()
+			objName = b.prefix + "/org/" + name
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), gcsOperationTimeout)
 		if err := b.uploadFileToObject(ctx, src, objName); err != nil {
 			cancel()
-			return copied, fmt.Errorf("cachepersist: persist org %s to gcs: %w", entry.Name(), err)
+			return copied, fmt.Errorf("cachepersist: persist org %s to gcs: %w", name, err)
 		}
 		cancel()
 		copied++
@@ -176,7 +184,10 @@ func (b *gcsBackend) HydrateOrgDB(runtimeDir string) (int, error) {
 			continue
 		}
 		name := path.Base(attrs.Name)
-		if !strings.HasSuffix(name, ".db") {
+		// Restore .db files AND WAL journal files (.db-wal, .db-shm)
+		if !strings.HasSuffix(name, ".db") &&
+			!strings.HasSuffix(name, ".db-wal") &&
+			!strings.HasSuffix(name, ".db-shm") {
 			continue
 		}
 
