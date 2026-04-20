@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -99,7 +98,7 @@ func (a *GitHubAuthenticator) authenticateUncached(ctx context.Context, token st
 		return nil
 	}
 	for _, org := range a.allowedOrgs {
-		ok, err := a.isActiveOrgMember(ctx, token, org)
+		ok, err := a.isActiveOrgMember(ctx, token, org, user.Login)
 		if err == nil && ok {
 			return nil
 		}
@@ -134,12 +133,15 @@ func (a *GitHubAuthenticator) fetchUser(ctx context.Context, token string) (*git
 	return &user, nil
 }
 
-func (a *GitHubAuthenticator) isActiveOrgMember(ctx context.Context, token, org string) (bool, error) {
+func (a *GitHubAuthenticator) isActiveOrgMember(ctx context.Context, token, org, _ string) (bool, error) {
 	org = strings.TrimSpace(org)
 	if org == "" {
 		return false, nil
 	}
-	reqURL := a.baseURL + "/user/memberships/orgs/" + url.PathEscape(org)
+
+	// Use /user/orgs — lists all orgs the authenticated user belongs to.
+	// Works with any token scope. Check if the target org is in the list.
+	reqURL := a.baseURL + "/user/orgs?per_page=100"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return false, err
@@ -148,19 +150,26 @@ func (a *GitHubAuthenticator) isActiveOrgMember(ctx context.Context, token, org 
 
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return false, fmt.Errorf("github org membership request failed: %w", err)
+		return false, fmt.Errorf("github /user/orgs request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("github org membership returned %d", resp.StatusCode)
+		return false, fmt.Errorf("github /user/orgs returned %d", resp.StatusCode)
 	}
 
-	var membership githubMembership
-	if err := json.NewDecoder(resp.Body).Decode(&membership); err != nil {
-		return false, fmt.Errorf("decode github org membership: %w", err)
+	var orgs []struct {
+		Login string `json:"login"`
 	}
-	return strings.EqualFold(membership.State, "active"), nil
+	if err := json.NewDecoder(resp.Body).Decode(&orgs); err != nil {
+		return false, fmt.Errorf("decode github /user/orgs: %w", err)
+	}
+	for _, o := range orgs {
+		if strings.EqualFold(o.Login, org) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func addGitHubHeaders(req *http.Request, token string) {
