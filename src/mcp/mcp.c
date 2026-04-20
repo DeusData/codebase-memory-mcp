@@ -1982,10 +1982,12 @@ static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
+    char *project_override = cbm_mcp_get_string_arg(args, "project");
     cbm_normalize_path_sep(repo_path);
 
     if (!repo_path) {
         free(mode_str);
+        free(project_override);
         return cbm_mcp_text_result("repo_path is required", true);
     }
 
@@ -1997,7 +1999,8 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     }
     free(mode_str);
 
-    cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
+    cbm_pipeline_t *p = cbm_pipeline_new(repo_path, project_override, mode);
+    free(project_override);
     if (!p) {
         free(repo_path);
         return cbm_mcp_text_result("failed to create pipeline", true);
