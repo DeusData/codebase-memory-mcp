@@ -1213,9 +1213,9 @@ func (g *gitCloner) EnsureClone(ctx context.Context, githubURL, localPath string
 	// Remove empty dir to allow clone into it
 	os.Remove(localPath)
 	g.logger.Info("cloning repo", "url", githubURL, "path", localPath)
-	cloneCtx, cancel := context.WithTimeout(ctx, 15*time.Minute) // large monorepos need time on GCS Fuse
-	defer cancel()
-	cmd := g.gitCommand(cloneCtx, "", githubURL, "clone", "--depth=1", githubURL, localPath)
+	// No timeout — large monorepos can take 20+ minutes to clone and index.
+	// The fleet indexer uses context.Background() which has no deadline.
+	cmd := g.gitCommand(ctx, "", githubURL, "clone", "--depth=1", githubURL, localPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git clone %q: %w\n%s", githubURL, err, out)
 	}
