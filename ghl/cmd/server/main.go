@@ -474,7 +474,7 @@ func main() {
 	// ── Fleet scheduler ──────────────────────────────────────
 
 	c := cron.New()
-	if cfg.ScheduledIndexingEnabled {
+	{ // Scheduled indexing — always on
 		c.AddFunc(cfg.IncrementalCron, func() {
 			startFleetIndex("cron-incremental", false)
 		})
@@ -484,8 +484,6 @@ func main() {
 		c.Start()
 		defer c.Stop()
 		slog.Info("scheduled indexing enabled", "incremental_cron", cfg.IncrementalCron, "full_cron", cfg.FullCron)
-	} else {
-		slog.Info("scheduled indexing disabled")
 	}
 
 	// orgSyncCallback is set after orgToolSvc is created to update its DB on re-hydration.
@@ -525,10 +523,7 @@ func main() {
 			slog.Info("periodic org sync: re-hydrated from GCS", "files", hydrated,
 				"repos", orgDB.RepoCount())
 		})
-		if !cfg.ScheduledIndexingEnabled {
-			c.Start()
-			defer c.Stop()
-		}
+		// cron already started above
 		slog.Info("org.db periodic sync enabled (every 5m)")
 	}
 
@@ -741,8 +736,8 @@ func main() {
 			"discovery_clients":        cfg.DiscoveryClients,
 			"discovery_max_candidates": cfg.DiscoveryMaxCandidates,
 			"discovery_timeout_ms":     cfg.DiscoveryTimeout.Milliseconds(),
-			"startup_index_enabled":    cfg.StartupIndexEnabled,
-			"scheduled_index_enabled":  cfg.ScheduledIndexingEnabled,
+			"startup_index_enabled":    false,
+			"scheduled_index_enabled":  true,
 			"fleet_index_running":      fleetIndexing.Load(),
 			"github_auth_enabled":      true,
 		})
@@ -758,11 +753,8 @@ func main() {
 
 	// ── Startup indexing pass ────────────────────────────────
 
-	if cfg.StartupIndexEnabled {
-		startFleetIndex("startup", false)
-	} else {
-		slog.Info("startup indexing disabled")
-	}
+	// Startup indexing disabled — hydration from GCS is sufficient.
+	// Scheduled cron handles ongoing indexing.
 
 	// ── Serve ────────────────────────────────────────────────
 
