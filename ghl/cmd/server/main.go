@@ -540,10 +540,8 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(5 * time.Minute))
 
-	// Wire org graph into discovery scoring
 	if orgDB != nil {
-		discoverySvc.SetOrgDB(orgDB)
-		slog.Info("org graph wired into discovery scoring")
+		slog.Info("org graph initialized")
 	}
 
 	// Build org tool service
