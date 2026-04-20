@@ -330,6 +330,9 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory) {
                 rc = exec_sql(s, "PRAGMA mmap_size = 67108864;"); /* CBM_SZ_64 MB */
             }
         }
+        /* Keep temp tables on disk to avoid memory spikes on large queries */
+        exec_sql(s, "PRAGMA temp_store = FILE;");
+        exec_sql(s, "PRAGMA cache_size = -2000;"); /* 2MB page cache */
     }
     return rc;
 }
@@ -508,6 +511,14 @@ static int store_authorizer(void *user_data, int action, const char *p3, const c
 }
 
 static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
+    /* Hard heap limit: SQLite returns SQLITE_NOMEM instead of OOM crash */
+    static int limits_set = 0;
+    if (!limits_set) {
+        sqlite3_soft_heap_limit64(256LL * 1024 * 1024);
+        sqlite3_hard_heap_limit64(512LL * 1024 * 1024);
+        limits_set = 1;
+    }
+
     cbm_store_t *s = calloc(CBM_ALLOC_ONE, sizeof(cbm_store_t));
     if (!s) {
         return NULL;

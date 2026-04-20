@@ -2988,11 +2988,12 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("search failed: temp file", true);
     }
 
-    /* No grep-level match limit — let grep find all matches, then dedup and
-     * cap in our code. The -m flag caused results from large vendored files
-     * to exhaust the quota before reaching project source files. */
-    enum { GREP_MAX_MATCHES = 500 };
-    int grep_limit = GREP_MAX_MATCHES;
+    /* Cap grep matches to 5x the requested limit to allow for dedup and
+     * ranking, but prevent unbounded memory on large repos. */
+    enum { GREP_MIN_MATCHES = 50, GREP_MAX_MATCHES = 500 };
+    int grep_limit = limit * 5;
+    if (grep_limit < GREP_MIN_MATCHES) grep_limit = GREP_MIN_MATCHES;
+    if (grep_limit > GREP_MAX_MATCHES) grep_limit = GREP_MAX_MATCHES;
 
     /* Scope grep to indexed files only — avoids scanning vendored/generated code.
      * Query the graph for distinct file paths, write them to a temp file,
@@ -3188,6 +3189,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
 
     char line[CBM_SZ_1K];
     int file_count = 0;
+    enum { MAX_CHANGED_FILES = 200, MAX_SYMBOL_FILES = 50 };
 
     while (fgets(line, sizeof(line), fp)) {
         size_t len = strlen(line);
@@ -3198,10 +3200,12 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
             continue;
         }
 
-        yyjson_mut_arr_add_strcpy(doc, changed, line);
+        if (file_count < MAX_CHANGED_FILES) {
+            yyjson_mut_arr_add_strcpy(doc, changed, line);
+        }
         file_count++;
 
-        if (want_symbols) {
+        if (want_symbols && file_count <= MAX_SYMBOL_FILES) {
             detect_add_impacted_symbols(store, project, line, doc, impacted);
         }
     }
@@ -3211,6 +3215,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_int(doc, root_obj, "changed_count", file_count);
     yyjson_mut_obj_add_val(doc, root_obj, "impacted_symbols", impacted);
     yyjson_mut_obj_add_int(doc, root_obj, "depth", depth);
+    yyjson_mut_obj_add_bool(doc, root_obj, "has_more", file_count > MAX_CHANGED_FILES);
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
