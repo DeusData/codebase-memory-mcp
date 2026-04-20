@@ -433,23 +433,26 @@ func main() {
 			slog.Info("startup: org.db already populated, skipping re-population",
 				"repos", repoCount)
 		} else {
-			// org.db is empty or too small — populate from project DBs
+			// org.db is empty or too small — populate directly from project .db files (fast path)
 			go func() {
 				orgPipelineRunning.Store(true)
 				defer orgPipelineRunning.Store(false)
-				slog.Info("startup: populating org.db from hydrated project DBs")
-				if err := pipeline.PopulateOrgFromProjectDBs(context.Background(), orgDB, discoveryPool, m.Repos, cfg.CBMCacheDir); err != nil {
-					slog.Error("startup: org.db population failed", "err", err)
-				} else {
-					slog.Info("startup: org.db populated successfully")
-					// Persist to GCS immediately
-					if artifactSync != nil {
-						orgDB.Checkpoint() // flush WAL before copying
-						if n, err := artifactSync.PersistOrgGraph(); err != nil {
-							slog.Warn("startup: org.db GCS persist failed", "err", err)
-						} else {
-							slog.Info("startup: org.db persisted to GCS", "files", n)
-						}
+				slog.Info("startup: populating org.db from project .db files (direct SQL)")
+				if err := pipeline.PopulateOrgFromProjectDBsDirect(context.Background(), orgDB, m.Repos, cfg.CBMCacheDir); err != nil {
+					slog.Warn("startup: direct SQL population failed, falling back to MCP bridge", "err", err)
+					if err2 := pipeline.PopulateOrgFromProjectDBs(context.Background(), orgDB, discoveryPool, m.Repos, cfg.CBMCacheDir); err2 != nil {
+						slog.Error("startup: org.db population failed (both paths)", "err", err2)
+						return
+					}
+				}
+				slog.Info("startup: org.db populated successfully")
+				// Persist to GCS immediately
+				if artifactSync != nil {
+					orgDB.Checkpoint()
+					if n, err := artifactSync.PersistOrgGraph(); err != nil {
+						slog.Warn("startup: org.db GCS persist failed", "err", err)
+					} else {
+						slog.Info("startup: org.db persisted to GCS", "files", n)
 					}
 				}
 			}()
