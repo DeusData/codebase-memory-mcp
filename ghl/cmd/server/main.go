@@ -98,10 +98,10 @@ func main() {
 		}
 	}
 
-	// ── Org graph (optional) ─────────────────────────────────
+	// ── Org graph (always on) ─────────────────────────────────
 
 	var orgDB *orgdb.DB
-	if cfg.OrgGraphEnabled {
+	{
 		orgDBPath := cfg.OrgDBPath
 		if orgDBPath == "" {
 			orgDBPath = filepath.Join(cfg.CBMCacheDir, "org", "org.db")
