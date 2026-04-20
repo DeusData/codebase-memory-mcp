@@ -2912,6 +2912,65 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
     return ok;
 }
 
+/* Write label-filtered indexed file list for scoped grep.
+ * If label_filter is NULL, behaves identically to write_scoped_filelist.
+ * If label_filter is set, only files containing nodes with that label are written,
+ * dramatically reducing the grep file set for decorator pattern searches.
+ * Returns true if scoped. */
+static bool write_scoped_filelist_filtered(cbm_mcp_server_t *srv, const char *project,
+                                           const char *root_path, const char *filelist,
+                                           const char *label_filter) {
+    if (!label_filter) {
+        return write_scoped_filelist(srv, project, root_path, filelist);
+    }
+
+    cbm_store_t *pre_store = resolve_store(srv, project);
+    if (!pre_store) {
+        return false;
+    }
+    char **indexed_files = NULL;
+    int indexed_count = 0;
+    if (cbm_store_list_files_by_label(pre_store, project, label_filter, &indexed_files,
+                                       &indexed_count) != CBM_STORE_OK ||
+        indexed_count == 0) {
+        /* No files matched the label filter — fall back to full scan */
+        return write_scoped_filelist(srv, project, root_path, filelist);
+    }
+    FILE *fl = fopen(filelist, "w");
+    bool ok = false;
+    if (fl) {
+        for (int fi = 0; fi < indexed_count; fi++) {
+            (void)fprintf(fl, "%s/%s\n", root_path, indexed_files[fi]);
+        }
+        (void)fclose(fl);
+        ok = true;
+    }
+    for (int fi = 0; fi < indexed_count; fi++) {
+        free(indexed_files[fi]);
+    }
+    free(indexed_files);
+    return ok;
+}
+
+/* Map a decorator pattern prefix to a node label for label-aware file pre-filtering.
+ * Returns the label string if the pattern starts with a known decorator, NULL otherwise. */
+static const char *decorator_label_filter(const char *pattern) {
+    if (!pattern || pattern[0] != '@') {
+        return NULL;
+    }
+    /* Skip the leading '@' */
+    const char *dec = pattern + 1;
+    if (strncmp(dec, "Controller", 10) == 0) return "Class";
+    if (strncmp(dec, "Injectable", 10) == 0) return "Class";
+    if (strncmp(dec, "Module", 6) == 0) return "Module";
+    if (strncmp(dec, "Get", 3) == 0) return "Route";
+    if (strncmp(dec, "Post", 4) == 0) return "Route";
+    if (strncmp(dec, "Put", 3) == 0) return "Route";
+    if (strncmp(dec, "Delete", 6) == 0) return "Route";
+    if (strncmp(dec, "Patch", 5) == 0) return "Route";
+    return NULL;
+}
+
 /* Parse search mode string (0=compact, 1=full, 2=files). */
 static int parse_search_mode(const char *mode_str) {
     if (!mode_str) {
@@ -3039,7 +3098,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     snprintf(filelist, sizeof(filelist), "%s.files", tmpfile);
     bool scoped = false;
 
-    scoped = write_scoped_filelist(srv, project, root_path, filelist);
+    const char *label_filter = decorator_label_filter(pattern);
+    scoped = write_scoped_filelist_filtered(srv, project, root_path, filelist, label_filter);
 
     char cmd[CBM_SZ_4K];
     build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist, root_path);

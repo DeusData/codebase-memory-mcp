@@ -1781,6 +1781,46 @@ int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *
     return CBM_STORE_OK;
 }
 
+/* ── List distinct file paths filtered by label ───────────────── */
+
+int cbm_store_list_files_by_label(cbm_store_t *s, const char *project, const char *label,
+                                   char ***out, int *count) {
+    *out = NULL;
+    *count = 0;
+    if (!s || !s->db || !project || !label) {
+        return CBM_STORE_ERR;
+    }
+
+    const char *sql = "SELECT DISTINCT file_path FROM nodes "
+                      "WHERE project = ?1 AND label = ?2 "
+                      "AND file_path IS NOT NULL AND file_path != ''";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_bind_text(stmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, ST_COL_2, label, CBM_NOT_FOUND, SQLITE_STATIC);
+
+    int cap = CBM_SZ_64;
+    int n = 0;
+    char **files = malloc(cap * sizeof(char *));
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *fp = (const char *)sqlite3_column_text(stmt, 0);
+        if (!fp) {
+            continue;
+        }
+        if (n >= cap) {
+            cap *= ST_GROWTH;
+            files = safe_realloc(files, cap * sizeof(char *));
+        }
+        files[n++] = heap_strdup(fp);
+    }
+    sqlite3_finalize(stmt);
+    *out = files;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
 /* ── Node neighbor names ──────────────────────────────────────── */
 
 static int query_neighbor_names(sqlite3 *db, const char *sql, int64_t node_id, int limit,
