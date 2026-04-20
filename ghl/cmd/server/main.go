@@ -1037,10 +1037,8 @@ func defaultManifestPath() string {
 	return "/app/REPOS.yaml"
 }
 
-// projectNamePrefix overrides the prefix derived from the clone directory path.
-// When set (e.g. "data-fleet-cache-repos"), only the repo slug is appended.
-// This ensures consistent project names regardless of where repos are cloned.
-var projectNamePrefix = os.Getenv("PROJECT_NAME_PREFIX")
+// projectNamePrefix is hardcoded — always use this prefix for consistent naming.
+var projectNamePrefix = "data-fleet-cache-repos"
 
 // projectNameFromPath returns the canonical project name for a clone path.
 // When PROJECT_NAME_PREFIX is set, it uses prefix + slug (e.g.
