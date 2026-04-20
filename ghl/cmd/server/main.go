@@ -1010,7 +1010,7 @@ func loadConfig() config {
 		ScheduledIndexingEnabled: getBool("SCHEDULED_INDEXING_ENABLED", false),
 		RunMode:                  strings.TrimSpace(getEnv("RUN_MODE", "serve")),
 		RunForce:                 getBool("RUN_FORCE", false),
-		OrgGraphEnabled:          getBool("ORG_GRAPH_ENABLED", false),
+		OrgGraphEnabled:          true,
 		OrgDBPath:                getEnv("ORG_DB_PATH", ""),
 		GitHubOrgScanToken:      getEnv("GITHUB_ORG_SCAN_TOKEN", getEnv("GITHUB_TOKEN", "")),
 	}
