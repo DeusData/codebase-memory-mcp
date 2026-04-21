@@ -1738,11 +1738,11 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     const char *aspects_strs[MCP_COL_16];
     int aspects_strs_count = 0;
     if (aspects_arr) {
-        size_t aidx;
-        size_t amax;
-        yyjson_val *aval2;
-        yyjson_arr_foreach(aspects_arr, aidx, amax, aval2) {
-            const char *s = yyjson_get_str(aval2);
+        size_t aspect_idx;
+        size_t aspect_max;
+        yyjson_val *aspect_val;
+        yyjson_arr_foreach(aspects_arr, aspect_idx, aspect_max, aspect_val) {
+            const char *s = yyjson_get_str(aspect_val);
             if (s && aspects_strs_count < MCP_COL_16) {
                 aspects_strs[aspects_strs_count++] = s;
             }
