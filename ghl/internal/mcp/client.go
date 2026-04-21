@@ -223,6 +223,8 @@ func (c *Client) initialize(ctx context.Context) error {
 
 // roundtrip sends a request and reads the matching response.
 // Requests are serialized via the mutex so only one is in-flight at a time.
+// The read runs in a goroutine so context cancellation is respected even
+// when bufio.Scanner.Scan() is blocked waiting for the C binary.
 func (c *Client) roundtrip(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -239,48 +241,56 @@ func (c *Client) roundtrip(ctx context.Context, method string, params interface{
 		return nil, fmt.Errorf("mcp: send %q: %w", method, err)
 	}
 
-	// Read lines until we get a response with our ID
-	for {
-		// Check context before blocking read
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
+	type readResult struct {
+		result json.RawMessage
+		err    error
+	}
 
-		if !c.reader.Scan() {
-			if err := c.reader.Err(); err != nil {
-				return nil, fmt.Errorf("mcp: read: %w", err)
+	ch := make(chan readResult, 1)
+	go func() {
+		for {
+			if !c.reader.Scan() {
+				if err := c.reader.Err(); err != nil {
+					ch <- readResult{err: fmt.Errorf("mcp: read: %w", err)}
+				} else {
+					ch <- readResult{err: fmt.Errorf("mcp: subprocess closed stdout unexpectedly")}
+				}
+				return
 			}
-			return nil, fmt.Errorf("mcp: subprocess closed stdout unexpectedly")
-		}
 
-		line := c.reader.Text()
-		if line == "" {
-			continue
-		}
+			line := c.reader.Text()
+			if line == "" {
+				continue
+			}
 
-		var resp jsonrpcResponse
-		if err := json.Unmarshal([]byte(line), &resp); err != nil {
-			// Not valid JSON-RPC — might be a progress notification, skip
-			continue
-		}
+			var resp jsonrpcResponse
+			if err := json.Unmarshal([]byte(line), &resp); err != nil {
+				continue
+			}
 
-		// Skip notifications (no ID)
-		if resp.ID == 0 && resp.JSONRPC == "2.0" {
-			continue
-		}
+			if resp.ID == 0 && resp.JSONRPC == "2.0" {
+				continue
+			}
 
-		if resp.ID != id {
-			// Response for a different request (shouldn't happen with serialization)
-			continue
-		}
+			if resp.ID != id {
+				continue
+			}
 
-		if resp.Error != nil {
-			return nil, fmt.Errorf("mcp: %q error %d: %s", method, resp.Error.Code, resp.Error.Message)
-		}
+			if resp.Error != nil {
+				ch <- readResult{err: fmt.Errorf("mcp: %q error %d: %s", method, resp.Error.Code, resp.Error.Message)}
+				return
+			}
 
-		return resp.Result, nil
+			ch <- readResult{result: resp.Result}
+			return
+		}
+	}()
+
+	select {
+	case out := <-ch:
+		return out.result, out.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 

@@ -1708,7 +1708,10 @@ func (b *mcpBridgeBackend) Call(ctx context.Context, method string, params json.
 	case "ping":
 		return json.RawMessage(`{}`), nil
 	case "tools/list":
-		raw, err := b.client.Call(ctx, "tools/list", nil)
+		// Hard timeout: tools/list should be fast
+		listCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		raw, err := b.client.Call(listCtx, "tools/list", nil)
 		if err != nil {
 			return nil, err
 		}
@@ -1748,7 +1751,14 @@ func (b *mcpBridgeBackend) Call(ctx context.Context, method string, params json.
 			}
 		}
 
-		result, err := b.client.CallTool(ctx, name, args)
+		// Hard 20s timeout on every C binary tool call.
+		// The C binary has a 15s grep timeout, so 20s gives it margin.
+		// Without this, hung C binaries block the bridge client forever
+		// because bufio.Scanner.Scan() doesn't respect context cancellation.
+		toolCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+
+		result, err := b.client.CallTool(toolCtx, name, args)
 		if err != nil {
 			return nil, err
 		}
