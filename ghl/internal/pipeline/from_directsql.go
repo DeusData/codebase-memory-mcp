@@ -6,11 +6,11 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -245,7 +245,7 @@ func directExtractRoutes(ctx context.Context, orgDB *orgdb.DB, entries []directE
 	return n
 }
 
-// ── Phase 2b: InternalRequest consumers (direct SQL) ──
+// ── Phase 2b: InternalRequest consumers (direct SQL via edges) ──
 
 func directExtractConsumers(ctx context.Context, orgDB *orgdb.DB, entries []directEntry, cacheDir string) int {
 	slog.Info("direct-sql: phase 2b: extracting consumers", "projects", len(entries))
@@ -258,50 +258,38 @@ func directExtractConsumers(ctx context.Context, orgDB *orgdb.DB, entries []dire
 		}
 		defer db.Close()
 
-		// Find nodes containing "InternalRequest" in name or qualified_name
+		// Extract HTTP_CALLS edges — these represent InternalRequest calls
+		// The C binary indexes these during the initial repo indexing pass.
+		// Edge properties contain url_path and method info.
 		rows, err := db.QueryContext(ctx,
-			`SELECT qualified_name, name, file_path, start_line, end_line
-			 FROM nodes
-			 WHERE (name LIKE '%InternalRequest%' OR qualified_name LIKE '%InternalRequest%')
-			 LIMIT 50`)
+			`SELECT src.name, e.properties
+			 FROM edges e
+			 JOIN nodes src ON e.source_id = src.id
+			 WHERE e.type IN ('HTTP_CALLS', 'ASYNC_CALLS')
+			 LIMIT 200`)
 		if err != nil {
 			return
 		}
 		defer rows.Close()
 
-		type match struct {
-			qn, name, filePath string
-			startLine, endLine int
-		}
-		var matches []match
 		for rows.Next() {
-			var m match
-			if err := rows.Scan(&m.qn, &m.name, &m.filePath, &m.startLine, &m.endLine); err != nil {
+			var srcName, propsJSON string
+			if err := rows.Scan(&srcName, &propsJSON); err != nil {
 				continue
 			}
-			matches = append(matches, m)
-		}
-
-		// For each match, read the source file and parse InternalRequest calls
-		for i, m := range matches {
-			if i >= 10 {
-				break
-			}
-			source := readSourceFromFile(cacheDir, e.dbPath, m.filePath, m.startLine, m.endLine)
-			if source == "" {
+			// Parse edge properties for url_path and method
+			method, path := parseEdgeHTTPProps(propsJSON)
+			if path == "" {
 				continue
 			}
-			calls := parseInternalRequestCalls(source)
-			for _, call := range calls {
-				orgDB.InsertAPIContract(orgdb.APIContract{
-					ConsumerRepo:   e.repoName,
-					Method:         strings.ToUpper(call.method),
-					Path:           "/" + call.serviceName + "/" + call.route,
-					ConsumerSymbol: m.name,
-					Confidence:     0.5,
-				})
-				count.Add(1)
-			}
+			orgDB.InsertAPIContract(orgdb.APIContract{
+				ConsumerRepo:   e.repoName,
+				Method:         method,
+				Path:           path,
+				ConsumerSymbol: srcName,
+				Confidence:     0.5,
+			})
+			count.Add(1)
 		}
 	})
 
@@ -310,7 +298,7 @@ func directExtractConsumers(ctx context.Context, orgDB *orgdb.DB, entries []dire
 	return n
 }
 
-// ── Phase 2c: Package dependencies (direct SQL) ──
+// ── Phase 2c: Package dependencies (direct SQL via IMPORTS edges) ──
 
 func directExtractPackageDeps(ctx context.Context, orgDB *orgdb.DB, entries []directEntry, cacheDir string) int {
 	slog.Info("direct-sql: phase 2c: extracting package deps", "projects", len(entries))
@@ -325,48 +313,62 @@ func directExtractPackageDeps(ctx context.Context, orgDB *orgdb.DB, entries []di
 		}
 		defer db.Close()
 
+		// Extract IMPORTS edges — the C binary indexes import statements.
+		// Target node names contain the package path.
+		rows, err := db.QueryContext(ctx,
+			`SELECT DISTINCT tgt.name, tgt.qualified_name
+			 FROM edges e
+			 JOIN nodes tgt ON e.target_id = tgt.id
+			 WHERE e.type = 'IMPORTS'
+			 LIMIT 500`)
+		if err != nil {
+			return
+		}
+
+		seen := make(map[string]bool)
+		for rows.Next() {
+			var name, qn string
+			if err := rows.Scan(&name, &qn); err != nil {
+				continue
+			}
+			// Check if the import matches any GHL internal scope
+			for _, scope := range scopes {
+				scopePart := strings.TrimSuffix(scope, "/")
+				if strings.Contains(name, scope) || strings.Contains(qn, scope) {
+					// Extract package name from the import
+					pkg := extractPackageFromImport(name, qn, scope)
+					if pkg != "" && !seen[scopePart+"/"+pkg] {
+						seen[scopePart+"/"+pkg] = true
+						orgDB.UpsertPackageDep(e.repoName, orgdb.Dep{
+							Scope:   scopePart,
+							Name:    pkg,
+							DepType: "dependencies",
+						})
+						count.Add(1)
+					}
+				}
+			}
+		}
+		rows.Close()
+
+		// Fallback: also check node names for package references
 		for _, scope := range scopes {
-			// Search nodes whose name or qualified_name contains the scope
-			rows, err := db.QueryContext(ctx,
-				`SELECT qualified_name, name, file_path, start_line, end_line
-				 FROM nodes
-				 WHERE (name LIKE ? OR qualified_name LIKE ?)
-				 LIMIT 20`,
-				"%"+scope+"%", "%"+scope+"%")
+			rows2, err := db.QueryContext(ctx,
+				`SELECT DISTINCT name FROM nodes
+				 WHERE name LIKE ? AND label = 'Package'
+				 LIMIT 50`, "%"+scope+"%")
 			if err != nil {
 				continue
 			}
-
-			type match struct {
-				qn, name, filePath string
-				startLine, endLine int
-			}
-			var matches []match
-			for rows.Next() {
-				var m match
-				if err := rows.Scan(&m.qn, &m.name, &m.filePath, &m.startLine, &m.endLine); err != nil {
+			scopePart := strings.TrimSuffix(scope, "/")
+			for rows2.Next() {
+				var name string
+				if err := rows2.Scan(&name); err != nil {
 					continue
 				}
-				matches = append(matches, m)
-			}
-			rows.Close()
-
-			seen := make(map[string]bool)
-			for i, m := range matches {
-				if i >= 3 {
-					break
-				}
-				source := readSourceFromFile(cacheDir, e.dbPath, m.filePath, m.startLine, m.endLine)
-				if source == "" {
-					continue
-				}
-				pkgs := parsePackageImports(source, scope)
-				for _, pkg := range pkgs {
-					if seen[pkg] {
-						continue
-					}
-					seen[pkg] = true
-					scopePart := strings.TrimSuffix(scope, "/")
+				pkg := extractPackageFromImport(name, "", scope)
+				if pkg != "" && !seen[scopePart+"/"+pkg] {
+					seen[scopePart+"/"+pkg] = true
 					orgDB.UpsertPackageDep(e.repoName, orgdb.Dep{
 						Scope:   scopePart,
 						Name:    pkg,
@@ -375,6 +377,7 @@ func directExtractPackageDeps(ctx context.Context, orgDB *orgdb.DB, entries []di
 					count.Add(1)
 				}
 			}
+			rows2.Close()
 		}
 	})
 
@@ -383,27 +386,11 @@ func directExtractPackageDeps(ctx context.Context, orgDB *orgdb.DB, entries []di
 	return n
 }
 
-// ── Phase 2d: Event contracts (direct SQL) ──
-
-var (
-	directConsumerTopicRe = regexp.MustCompile(`@(?:Event|Message)Pattern\(\s*['"]([^'"]+)['"]`)
-	directProducerTopicRe = regexp.MustCompile(`(?:pubSub|this\.(?:pubSub|client|eventBus))\.(?:publish|emit|send)\(\s*['"]([^'"]+)['"]`)
-)
+// ── Phase 2d: Event contracts (direct SQL via edges + node properties) ──
 
 func directExtractEventContracts(ctx context.Context, orgDB *orgdb.DB, entries []directEntry, cacheDir string) int {
 	slog.Info("direct-sql: phase 2d: extracting events", "projects", len(entries))
 	var count atomic.Int64
-
-	searches := []struct {
-		query string
-		role  string
-		re    *regexp.Regexp
-	}{
-		{"EventPattern", "consumer", directConsumerTopicRe},
-		{"MessagePattern", "consumer", directConsumerTopicRe},
-		{"publish", "producer", directProducerTopicRe},
-		{"emit", "producer", directProducerTopicRe},
-	}
 
 	parallelScanDirect(entries, directWorkers, func(e directEntry) {
 		db, err := openReadOnly(e.dbPath)
@@ -412,56 +399,67 @@ func directExtractEventContracts(ctx context.Context, orgDB *orgdb.DB, entries [
 		}
 		defer db.Close()
 
-		for _, search := range searches {
-			rows, err := db.QueryContext(ctx,
-				`SELECT qualified_name, name, file_path, start_line, end_line
-				 FROM nodes
-				 WHERE (name LIKE ? OR qualified_name LIKE ?)
-				 LIMIT 20`,
-				"%"+search.query+"%", "%"+search.query+"%")
-			if err != nil {
-				continue
-			}
-
-			type match struct {
-				qn, name, filePath string
-				startLine, endLine int
-			}
-			var matches []match
+		// Extract PUBLISHES/SUBSCRIBES edges — the C binary creates these for event patterns
+		rows, err := db.QueryContext(ctx,
+			`SELECT src.name, tgt.name, e.type, e.properties
+			 FROM edges e
+			 JOIN nodes src ON e.source_id = src.id
+			 JOIN nodes tgt ON e.target_id = tgt.id
+			 WHERE e.type IN ('PUBLISHES', 'SUBSCRIBES', 'EMITS', 'LISTENS')
+			 LIMIT 200`)
+		if err == nil {
 			for rows.Next() {
-				var m match
-				if err := rows.Scan(&m.qn, &m.name, &m.filePath, &m.startLine, &m.endLine); err != nil {
+				var srcName, tgtName, edgeType, propsJSON string
+				if err := rows.Scan(&srcName, &tgtName, &edgeType, &propsJSON); err != nil {
 					continue
 				}
-				matches = append(matches, m)
+				topic := extractTopicFromEdge(tgtName, propsJSON)
+				if topic == "" {
+					topic = tgtName // fallback: use target node name as topic
+				}
+				contract := orgdb.EventContract{
+					Topic:     topic,
+					EventType: "pubsub",
+				}
+				if edgeType == "PUBLISHES" || edgeType == "EMITS" {
+					contract.ProducerRepo = e.repoName
+					contract.ProducerSymbol = srcName
+				} else {
+					contract.ConsumerRepo = e.repoName
+					contract.ConsumerSymbol = srcName
+				}
+				orgDB.InsertEventContract(contract)
+				count.Add(1)
 			}
 			rows.Close()
+		}
 
-			for i, m := range matches {
-				if i >= 5 {
-					break
-				}
-				source := readSourceFromFile(cacheDir, e.dbPath, m.filePath, m.startLine, m.endLine)
-				if source == "" {
+		// Fallback: scan nodes with EventPattern/MessagePattern in their name
+		// These are decorator-annotated methods that the C binary may index as plain nodes
+		patternRows, err := db.QueryContext(ctx,
+			`SELECT name, qualified_name, properties FROM nodes
+			 WHERE name LIKE '%EventPattern%' OR name LIKE '%MessagePattern%'
+			    OR qualified_name LIKE '%EventPattern%' OR qualified_name LIKE '%MessagePattern%'
+			 LIMIT 50`)
+		if err == nil {
+			for patternRows.Next() {
+				var name, qn, props string
+				if err := patternRows.Scan(&name, &qn, &props); err != nil {
 					continue
 				}
-				topics := search.re.FindAllStringSubmatch(source, -1)
-				for _, tm := range topics {
-					contract := orgdb.EventContract{
-						Topic:     tm[1],
-						EventType: "pubsub",
-					}
-					if search.role == "producer" {
-						contract.ProducerRepo = e.repoName
-						contract.ProducerSymbol = m.name
-					} else {
-						contract.ConsumerRepo = e.repoName
-						contract.ConsumerSymbol = m.name
-					}
-					orgDB.InsertEventContract(contract)
-					count.Add(1)
+				topic := extractTopicFromProps(props, name)
+				if topic == "" {
+					continue
 				}
+				orgDB.InsertEventContract(orgdb.EventContract{
+					Topic:         topic,
+					EventType:     "pubsub",
+					ConsumerRepo:   e.repoName,
+					ConsumerSymbol: name,
+				})
+				count.Add(1)
 			}
+			patternRows.Close()
 		}
 	})
 
@@ -492,39 +490,84 @@ func parallelScanDirect(entries []directEntry, workers int, fn func(e directEntr
 	wg.Wait()
 }
 
-// readSourceFromFile reads source code lines from the repo clone.
-// Falls back to empty string if file doesn't exist (no git clone available).
-func readSourceFromFile(cacheDir, dbPath, relFilePath string, startLine, endLine int) string {
-	if relFilePath == "" || startLine <= 0 {
-		return ""
+// parseEdgeHTTPProps extracts method and path from edge properties JSON.
+// Properties look like: {"url_path": "/api/v1/users", "method": "GET"}
+func parseEdgeHTTPProps(propsJSON string) (method, path string) {
+	if propsJSON == "" || propsJSON == "{}" {
+		return "", ""
 	}
-
-	// Derive clone dir from project name: cbmCacheDir/../fleet-repos/<repoName>
-	// Or try common patterns
-	projectName := strings.TrimSuffix(filepath.Base(dbPath), ".db")
-	repoName := stripProjectPrefix(projectName)
-
-	// Try common clone locations
-	candidates := []string{
-		filepath.Join(filepath.Dir(cacheDir), "fleet-repos", repoName, relFilePath),
-		filepath.Join("/tmp/fleet-repos", repoName, relFilePath),
-		filepath.Join("/data/fleet-cache/repos", repoName, relFilePath),
+	var props map[string]interface{}
+	if err := json.Unmarshal([]byte(propsJSON), &props); err != nil {
+		return "", ""
 	}
+	if p, ok := props["url_path"].(string); ok && p != "" {
+		path = p
+	} else if p, ok := props["route"].(string); ok && p != "" {
+		path = p
+	} else if p, ok := props["path"].(string); ok && p != "" {
+		path = p
+	}
+	if m, ok := props["method"].(string); ok && m != "" {
+		method = strings.ToUpper(m)
+	} else {
+		method = "GET" // default
+	}
+	return
+}
 
-	for _, path := range candidates {
-		data, err := os.ReadFile(path)
-		if err != nil {
+// extractPackageFromImport extracts the package name from an import path.
+// e.g., "@platform-core/base-service" → "base-service"
+func extractPackageFromImport(name, qn, scope string) string {
+	for _, s := range []string{name, qn} {
+		idx := strings.Index(s, scope)
+		if idx < 0 {
 			continue
 		}
-		lines := strings.Split(string(data), "\n")
-		if startLine > len(lines) {
-			return string(data) // return all if range is invalid
+		rest := s[idx+len(scope):]
+		// Take until next / or end
+		if slashIdx := strings.Index(rest, "/"); slashIdx >= 0 {
+			rest = rest[:slashIdx]
 		}
-		end := endLine
-		if end > len(lines) || end <= 0 {
-			end = len(lines)
+		// Clean up non-alphanumeric suffixes
+		rest = strings.TrimRight(rest, "\"'`;,) ")
+		if rest != "" {
+			return rest
 		}
-		return strings.Join(lines[startLine-1:end], "\n")
+	}
+	return ""
+}
+
+// extractTopicFromEdge extracts a topic name from edge properties or target name.
+func extractTopicFromEdge(targetName, propsJSON string) string {
+	if propsJSON != "" && propsJSON != "{}" {
+		var props map[string]interface{}
+		if err := json.Unmarshal([]byte(propsJSON), &props); err == nil {
+			if t, ok := props["topic"].(string); ok && t != "" {
+				return t
+			}
+			if t, ok := props["event"].(string); ok && t != "" {
+				return t
+			}
+			if t, ok := props["channel"].(string); ok && t != "" {
+				return t
+			}
+		}
+	}
+	return ""
+}
+
+// extractTopicFromProps extracts a topic from node properties JSON.
+func extractTopicFromProps(propsJSON, nodeName string) string {
+	if propsJSON != "" && propsJSON != "{}" {
+		var props map[string]interface{}
+		if err := json.Unmarshal([]byte(propsJSON), &props); err == nil {
+			if t, ok := props["topic"].(string); ok && t != "" {
+				return t
+			}
+			if t, ok := props["pattern"].(string); ok && t != "" {
+				return t
+			}
+		}
 	}
 	return ""
 }
