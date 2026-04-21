@@ -1733,8 +1733,29 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
+    /* Build a C string array from aspects for cbm_store_get_architecture.
+     * Strings point into aspects_doc memory so aspects_doc must outlive this array. */
+    const char *aspects_strs[MCP_COL_16];
+    int aspects_strs_count = 0;
+    if (aspects_arr) {
+        size_t aidx;
+        size_t amax;
+        yyjson_val *aval2;
+        yyjson_arr_foreach(aspects_arr, aidx, amax, aval2) {
+            const char *s = yyjson_get_str(aval2);
+            if (s && aspects_strs_count < MCP_COL_16) {
+                aspects_strs[aspects_strs_count++] = s;
+            }
+        }
+    }
+
     cbm_schema_info_t schema = {0};
     cbm_store_get_schema(store, project, &schema);
+
+    cbm_architecture_info_t arch = {0};
+    cbm_store_get_architecture(store, project,
+                               aspects_strs_count > 0 ? aspects_strs : NULL,
+                               aspects_strs_count, &arch);
 
     int node_count = cbm_store_count_nodes(store, project);
     int edge_count = cbm_store_count_edges(store, project);
@@ -1782,10 +1803,117 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_val(doc, root, "relationship_patterns", pats);
     }
 
+    /* Languages */
+    if (arch.language_count > 0) {
+        yyjson_mut_val *langs = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.language_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, item, "language", arch.languages[i].language);
+            yyjson_mut_obj_add_int(doc, item, "file_count", arch.languages[i].file_count);
+            yyjson_mut_arr_add_val(langs, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "languages", langs);
+    }
+
+    /* Packages */
+    if (arch.package_count > 0) {
+        yyjson_mut_val *pkgs = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.package_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, item, "name", arch.packages[i].name);
+            yyjson_mut_obj_add_int(doc, item, "node_count", arch.packages[i].node_count);
+            yyjson_mut_obj_add_int(doc, item, "fan_in", arch.packages[i].fan_in);
+            yyjson_mut_obj_add_int(doc, item, "fan_out", arch.packages[i].fan_out);
+            yyjson_mut_arr_add_val(pkgs, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "packages", pkgs);
+    }
+
+    /* Entry points */
+    if (arch.entry_point_count > 0) {
+        yyjson_mut_val *eps = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.entry_point_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, item, "name", arch.entry_points[i].name);
+            yyjson_mut_obj_add_str(doc, item, "qualified_name",
+                                   arch.entry_points[i].qualified_name);
+            yyjson_mut_obj_add_str(doc, item, "file", arch.entry_points[i].file);
+            yyjson_mut_arr_add_val(eps, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "entry_points", eps);
+    }
+
+    /* HTTP routes */
+    if (arch.route_count > 0) {
+        yyjson_mut_val *routes = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.route_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, item, "method", arch.routes[i].method);
+            yyjson_mut_obj_add_str(doc, item, "path", arch.routes[i].path);
+            yyjson_mut_obj_add_str(doc, item, "handler", arch.routes[i].handler);
+            yyjson_mut_arr_add_val(routes, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "routes", routes);
+    }
+
+    /* Hotspots */
+    if (arch.hotspot_count > 0) {
+        yyjson_mut_val *hotspots = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.hotspot_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, item, "name", arch.hotspots[i].name);
+            yyjson_mut_obj_add_str(doc, item, "qualified_name",
+                                   arch.hotspots[i].qualified_name);
+            yyjson_mut_obj_add_int(doc, item, "fan_in", arch.hotspots[i].fan_in);
+            yyjson_mut_arr_add_val(hotspots, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "hotspots", hotspots);
+    }
+
+    /* Cross-package boundaries */
+    if (arch.boundary_count > 0) {
+        yyjson_mut_val *boundaries = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.boundary_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, item, "from", arch.boundaries[i].from);
+            yyjson_mut_obj_add_str(doc, item, "to", arch.boundaries[i].to);
+            yyjson_mut_obj_add_int(doc, item, "call_count", arch.boundaries[i].call_count);
+            yyjson_mut_arr_add_val(boundaries, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "boundaries", boundaries);
+    }
+
+    /* Package layers */
+    if (arch.layer_count > 0) {
+        yyjson_mut_val *layers = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.layer_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, item, "name", arch.layers[i].name);
+            yyjson_mut_obj_add_str(doc, item, "layer", arch.layers[i].layer);
+            yyjson_mut_obj_add_str(doc, item, "reason", arch.layers[i].reason);
+            yyjson_mut_arr_add_val(layers, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "layers", layers);
+    }
+
+    /* File tree */
+    if (arch.file_tree_count > 0) {
+        yyjson_mut_val *file_tree = yyjson_mut_arr(doc);
+        for (int i = 0; i < arch.file_tree_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, item, "path", arch.file_tree[i].path);
+            yyjson_mut_obj_add_str(doc, item, "type", arch.file_tree[i].type);
+            yyjson_mut_obj_add_int(doc, item, "children", arch.file_tree[i].children);
+            yyjson_mut_arr_add_val(file_tree, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "file_tree", file_tree);
+    }
+
     append_cross_repo_summary(doc, root, &schema);
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+    cbm_store_architecture_free(&arch);
     cbm_store_schema_free(&schema);
     if (aspects_doc) {
         yyjson_doc_free(aspects_doc);
