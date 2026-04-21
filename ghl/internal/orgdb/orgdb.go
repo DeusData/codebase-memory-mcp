@@ -138,6 +138,15 @@ func (d *DB) ContractCount() (apiContracts, eventContracts int) {
 	return
 }
 
+// PackageDepCount returns the number of repo → package dependency edges.
+// Used to detect stale org.db files that were persisted before the
+// package.json-based Phase 2c population was added.
+func (d *DB) PackageDepCount() int {
+	var count int
+	d.db.QueryRow(`SELECT COUNT(*) FROM repo_dependencies`).Scan(&count)
+	return count
+}
+
 // TopReposByNodeCount returns the top N repo names ordered by node_count descending.
 // Falls back to all repos if none have node_count populated.
 func (d *DB) TopReposByNodeCount(limit int) ([]string, error) {

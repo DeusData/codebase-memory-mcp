@@ -298,6 +298,34 @@ func directExtractConsumers(ctx context.Context, orgDB *orgdb.DB, entries []dire
 	return n
 }
 
+// PopulatePackageDepsOnly runs ONLY Phase 2c (package dependencies) against
+// an existing org.db. Used to repair hydrated org.db files that were
+// persisted before the package.json-based population was added.
+//
+// Safe to call when the other phases are already populated — it only touches
+// the packages and repo_dependencies tables via UpsertPackageDep which
+// handles deduplication.
+func PopulatePackageDepsOnly(ctx context.Context, orgDB *orgdb.DB, repos []manifest.Repo, cbmCacheDir string) error {
+	entries, err := discoverProjectDBs(cbmCacheDir, repos)
+	if err != nil {
+		return fmt.Errorf("discover project dbs: %w", err)
+	}
+	if len(entries) == 0 {
+		return fmt.Errorf("no project .db files found in %s", cbmCacheDir)
+	}
+	slog.Info("direct-sql: backfilling package deps on hydrated org.db", "projects", len(entries))
+	n := directExtractPackageDeps(ctx, orgDB, entries, cbmCacheDir)
+	// Phase 2e: infer providers from repo names.
+	providerCount, provErr := orgDB.InferPackageProviders()
+	if provErr != nil {
+		slog.Warn("direct-sql: infer package providers failed", "err", provErr)
+	} else {
+		slog.Info("direct-sql: providers backfilled", "providers", providerCount)
+	}
+	slog.Info("direct-sql: package deps backfill complete", "packages", n)
+	return nil
+}
+
 // ── Phase 2c: Package dependencies (direct SQL via IMPORTS edges) ──
 
 func directExtractPackageDeps(ctx context.Context, orgDB *orgdb.DB, entries []directEntry, cacheDir string) int {

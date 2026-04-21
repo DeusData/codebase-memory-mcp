@@ -426,13 +426,38 @@ func main() {
 	if orgDB != nil {
 		repoCount := orgDB.RepoCount()
 		apiContracts, eventContracts := orgDB.ContractCount()
+		packageDeps := orgDB.PackageDepCount()
 		slog.Info("startup: org.db state after hydration",
-			"repos", repoCount, "api_contracts", apiContracts, "event_contracts", eventContracts)
+			"repos", repoCount, "api_contracts", apiContracts,
+			"event_contracts", eventContracts, "package_deps", packageDeps)
 
 		if repoCount > 50 {
 			// org.db was successfully hydrated from GCS — skip expensive re-population
 			slog.Info("startup: org.db already populated, skipping re-population",
 				"repos", repoCount)
+
+			// Backfill packages if the hydrated org.db is stale (pre-package.json fix).
+			// repo_dependencies table will be empty if org.db was persisted by an
+			// older revision that couldn't read package.json. This is idempotent
+			// and runs in the background — does not block HTTP server.
+			if packageDeps == 0 {
+				go func() {
+					slog.Info("startup: package_deps=0 in hydrated org.db — running package backfill")
+					if err := pipeline.PopulatePackageDepsOnly(context.Background(), orgDB, m.Repos, cfg.CBMCacheDir); err != nil {
+						slog.Warn("startup: package dep backfill failed", "err", err)
+						return
+					}
+					// Persist the repaired org.db to GCS so future instances don't re-run backfill.
+					if artifactSync != nil {
+						orgDB.Checkpoint()
+						if n, err := artifactSync.PersistOrgGraph(); err != nil {
+							slog.Warn("startup: org.db GCS persist after backfill failed", "err", err)
+						} else {
+							slog.Info("startup: org.db persisted to GCS after backfill", "files", n)
+						}
+					}
+				}()
+			}
 		} else {
 			// org.db is empty or too small — populate directly from project .db files (fast path)
 			go func() {

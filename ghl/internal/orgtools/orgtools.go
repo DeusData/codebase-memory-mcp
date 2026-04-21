@@ -305,13 +305,16 @@ func (s *OrgService) codeSearch(ctx context.Context, args map[string]interface{}
 		return []CodeSearchResult{}, nil
 	}
 
-	slog.Info("org_code_search: FTS5 query", "repos", len(repos), "pattern", pattern)
+	slog.Info("org_code_search: query", "repos", len(repos), "pattern", pattern)
 
-	// Query each project's FTS5 index concurrently
-	const maxConcurrency = 20 // SQL queries are fast, can run many in parallel
+	// Query each project concurrently. FTS5 first (fast), LIKE fallback for
+	// camelCase patterns that FTS5's unicode61 tokenizer splits apart.
+	const maxConcurrency = 20
 	sem := make(chan struct{}, maxConcurrency)
 	var mu sync.Mutex
-	var results []CodeSearchResult
+	// Initialize as empty slice (not nil) so JSON marshals as [] instead of null
+	// when no repos match.
+	results := []CodeSearchResult{}
 
 	var wg sync.WaitGroup
 	for _, repo := range repos {
@@ -321,14 +324,24 @@ func (s *OrgService) codeSearch(ctx context.Context, args map[string]interface{}
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			// Build project name and .db path
 			projectName := "data-fleet-cache-repos-" + repoName
 			dbPath := filepath.Join(cacheDir, projectName+".db")
 
+			// Try FTS5 first (fast — inverted index lookup).
 			matches, queryErr := queryFTS5(ctx, dbPath, projectName, pattern, limitPerRepo)
 			if queryErr != nil {
-				slog.Debug("org_code_search: FTS5 error", "repo", repoName, "err", queryErr)
-				return // skip repos with errors silently
+				slog.Debug("org_code_search: FTS5 error, trying LIKE", "repo", repoName, "err", queryErr)
+			}
+
+			// Fallback: if FTS5 returns nothing, try substring LIKE on nodes
+			// table. This catches camelCase identifiers like "InternalRequest"
+			// that FTS5's unicode61 tokenizer splits into separate tokens.
+			if len(matches) == 0 {
+				matches, queryErr = queryLike(ctx, dbPath, projectName, pattern, limitPerRepo)
+				if queryErr != nil {
+					slog.Debug("org_code_search: LIKE error", "repo", repoName, "err", queryErr)
+					return
+				}
 			}
 			if len(matches) == 0 {
 				return
@@ -337,7 +350,6 @@ func (s *OrgService) codeSearch(ctx context.Context, args map[string]interface{}
 			mu.Lock()
 			defer mu.Unlock()
 
-			// Format matches as JSON content
 			matchJSON, _ := json.Marshal(map[string]interface{}{
 				"repo":    repoName,
 				"matches": matches,
@@ -351,7 +363,6 @@ func (s *OrgService) codeSearch(ctx context.Context, args map[string]interface{}
 	}
 	wg.Wait()
 
-	// Sort by project name
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].Project < results[j].Project
 	})
@@ -361,6 +372,7 @@ func (s *OrgService) codeSearch(ctx context.Context, args map[string]interface{}
 }
 
 // queryFTS5 opens a per-project .db and queries its nodes_fts index.
+// Works well for whole-word queries that match FTS5 token boundaries.
 func queryFTS5(ctx context.Context, dbPath, project, pattern string, limit int) ([]FTSMatch, error) {
 	db, err := sql.Open("sqlite", dbPath+"?_pragma=busy_timeout(2000)&mode=ro")
 	if err != nil {
@@ -368,11 +380,44 @@ func queryFTS5(ctx context.Context, dbPath, project, pattern string, limit int) 
 	}
 	defer db.Close()
 
-	// FTS5 MATCH query — searches node names, qualified names, labels, file paths
 	rows, err := db.QueryContext(ctx,
 		`SELECT name, qualified_name, label, file_path
 		 FROM nodes_fts WHERE nodes_fts MATCH ? LIMIT ?`,
 		pattern, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var matches []FTSMatch
+	for rows.Next() {
+		var m FTSMatch
+		if err := rows.Scan(&m.Name, &m.QualifiedName, &m.Label, &m.FilePath); err != nil {
+			continue
+		}
+		matches = append(matches, m)
+	}
+	return matches, rows.Err()
+}
+
+// queryLike falls back to substring matching on the nodes table.
+// Catches camelCase identifiers that FTS5 tokenizes into separate tokens
+// (e.g., "InternalRequest" indexed as "Internal"+"Request").
+// Slower than FTS5 but always correct for substring semantics.
+func queryLike(ctx context.Context, dbPath, project, pattern string, limit int) ([]FTSMatch, error) {
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=busy_timeout(2000)&mode=ro")
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	like := "%" + pattern + "%"
+	rows, err := db.QueryContext(ctx,
+		`SELECT name, qualified_name, label, file_path
+		 FROM nodes
+		 WHERE (name LIKE ? OR qualified_name LIKE ? OR file_path LIKE ?)
+		 LIMIT ?`,
+		like, like, like, limit)
 	if err != nil {
 		return nil, err
 	}
