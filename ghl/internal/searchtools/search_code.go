@@ -303,14 +303,20 @@ func HandleSearchCode(ctx context.Context, cacheDir string, args SearchCodeArgs)
 // loadProjectNodes loads all non-test nodes with file paths from the project DB.
 // Returns the node list and a set of unique file paths (filtered by file_pattern).
 func loadProjectNodes(ctx context.Context, db *sql.DB, project, filePattern string) ([]nodeInfo, map[string]struct{}, error) {
-	// Exclude nodes without a file_path, exclude test files when possible via label/name hints.
+	// Exclude nodes without a file_path. We avoid json_extract(properties, ...)
+	// because some rows may contain malformed JSON in the properties column
+	// (which causes SQLite to error out the entire query). We filter test files
+	// cheaply via file_path patterns instead.
 	query := `SELECT id, name, qualified_name, label, file_path, start_line, end_line
 	          FROM nodes
 	          WHERE project = ?
 	            AND file_path IS NOT NULL
 	            AND file_path != ''
-	            AND (json_extract(properties, '$.is_test') IS NULL
-	                 OR json_extract(properties, '$.is_test') != 1)`
+	            AND file_path NOT LIKE '%__tests__%'
+	            AND file_path NOT LIKE '%.test.%'
+	            AND file_path NOT LIKE '%.spec.%'
+	            AND file_path NOT LIKE '%/tests/%'
+	            AND file_path NOT LIKE '%/test/%'`
 	rows, err := db.QueryContext(ctx, query, project)
 	if err != nil {
 		return nil, nil, err
