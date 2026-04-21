@@ -60,6 +60,8 @@ type RepoSearchResult struct {
 }
 
 // QueryDependents finds all repos that depend on a specific package.
+// Returns an empty slice (not nil) when no repos match, so JSON marshals
+// as [] instead of null.
 func (d *DB) QueryDependents(packageScope, packageName string) ([]DependencyResult, error) {
 	rows, err := d.db.Query(`
 		SELECT r.name, p.scope, p.name, rd.dep_type, rd.version_spec
@@ -74,7 +76,7 @@ func (d *DB) QueryDependents(packageScope, packageName string) ([]DependencyResu
 	}
 	defer rows.Close()
 
-	var results []DependencyResult
+	results := []DependencyResult{}
 	for rows.Next() {
 		var r DependencyResult
 		if err := rows.Scan(&r.RepoName, &r.Scope, &r.PackageName, &r.DepType, &r.VersionSpec); err != nil {
@@ -193,7 +195,7 @@ func (d *DB) TraceFlow(trigger string, direction string, maxHops int) ([]FlowSte
 	}
 	defer rows.Close()
 
-	var steps []FlowStep
+	steps := []FlowStep{}
 	for rows.Next() {
 		var s FlowStep
 		if err := rows.Scan(&s.FromRepo, &s.ToRepo, &s.EdgeType, &s.Detail, &s.Confidence); err != nil {
@@ -285,7 +287,7 @@ func (d *DB) SearchRepos(query string, scope string, team string, limit int) ([]
 	}
 	defer rows.Close()
 
-	var results []RepoSearchResult
+	results := []RepoSearchResult{}
 	for rows.Next() {
 		var r RepoSearchResult
 		var languages *string
