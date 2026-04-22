@@ -129,8 +129,25 @@ func TestMCPBridgeBackendForwardsToolsList(t *testing.T) {
 	if client.callCtx == nil {
 		t.Error("call ctx: expected non-nil context")
 	}
-	if string(raw) != `{"tools":[{"name":"list_projects"}]}` {
-		t.Errorf("raw result: got %s", raw)
+	// The bridge always appends the wrapper-owned customer_surface tool even
+	// when no discovery service is configured. Confirm the upstream tool is
+	// still present and the injected tool is appended after it.
+	var result struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("parse tools/list result: %v", err)
+	}
+	if len(result.Tools) != 2 {
+		t.Fatalf("tools count: want 2 (list_projects + customer_surface), got %d — raw=%s", len(result.Tools), raw)
+	}
+	if result.Tools[0].Name != "list_projects" {
+		t.Errorf("first tool: want list_projects, got %q", result.Tools[0].Name)
+	}
+	if result.Tools[1].Name != "customer_surface" {
+		t.Errorf("second tool: want customer_surface, got %q", result.Tools[1].Name)
 	}
 }
 
@@ -163,14 +180,19 @@ func TestMCPBridgeBackendToolsListIncludesDiscoverProjects(t *testing.T) {
 		t.Fatalf("parse tools/list result: %v", err)
 	}
 
-	if len(result.Tools) != 2 {
-		t.Fatalf("tools count: want 2, got %d", len(result.Tools))
+	// Expected order: upstream tools, then wrapper-owned discover_projects,
+	// then wrapper-owned customer_surface.
+	if len(result.Tools) != 3 {
+		t.Fatalf("tools count: want 3 (list_projects + discover_projects + customer_surface), got %d", len(result.Tools))
 	}
 	if result.Tools[0].Name != "list_projects" {
 		t.Fatalf("first tool: want list_projects, got %q", result.Tools[0].Name)
 	}
 	if result.Tools[1].Name != "discover_projects" {
 		t.Fatalf("second tool: want discover_projects, got %q", result.Tools[1].Name)
+	}
+	if result.Tools[2].Name != "customer_surface" {
+		t.Fatalf("third tool: want customer_surface, got %q", result.Tools[2].Name)
 	}
 }
 

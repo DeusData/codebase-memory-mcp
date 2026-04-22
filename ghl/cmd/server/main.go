@@ -1352,7 +1352,11 @@ func (b *mcpBridgeBackend) Call(ctx context.Context, method string, params json.
 		if err != nil {
 			return nil, err
 		}
-		return b.appendDiscoveryTool(raw)
+		raw, err = b.appendDiscoveryTool(raw)
+		if err != nil {
+			return nil, err
+		}
+		return b.appendCustomerSurfaceTool(raw)
 	case "tools/call":
 		var paramMap map[string]interface{}
 		if len(params) > 0 {
@@ -1402,6 +1406,17 @@ func (b *mcpBridgeBackend) Call(ctx context.Context, method string, params json.
 			}
 			// Log and fall through to C binary as safety net.
 			slog.Warn("go-native search_code failed, falling back to C binary", "err", goErr)
+		}
+
+		// ── Go-native customer_surface ──
+		// Composite enricher: fuses product-area + Vue metadata + FE fetch-call
+		// extraction into one record per file. No C-binary fallback — this tool
+		// is Go-only by design (the C binary has no concept of product areas
+		// or Vue SFC structure).
+		if name == "customer_surface" {
+			goCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			return b.runGoCustomerSurface(goCtx, args)
 		}
 
 		// Hard timeout on every C binary tool call. Without this, hung C
@@ -1525,6 +1540,88 @@ func (b *mcpBridgeBackend) runGoSearchCode(ctx context.Context, args map[string]
 		Content: []mcp.Content{{Type: "text", Text: string(body)}},
 		IsError: false,
 	})
+}
+
+// runGoCustomerSurface executes the customer-surface composite enricher.
+// Pure compute path — sources are passed inline by the caller, so no SQLite,
+// no GCS Fuse, no filesystem walk. Hot path latency is dominated by regex
+// work across the batched files (single-digit ms per file on typical SFCs).
+func (b *mcpBridgeBackend) runGoCustomerSurface(ctx context.Context, args map[string]interface{}) (json.RawMessage, error) {
+	raw, err := json.Marshal(args)
+	if err != nil {
+		return nil, fmt.Errorf("marshal args: %w", err)
+	}
+	var sargs searchtools.CustomerSurfaceArgs
+	if err := json.Unmarshal(raw, &sargs); err != nil {
+		return nil, fmt.Errorf("parse args: %w", err)
+	}
+
+	result, err := searchtools.HandleCustomerSurface(ctx, sargs)
+	if err != nil {
+		return nil, err
+	}
+
+	body, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("marshal customer-surface result: %w", err)
+	}
+	return json.Marshal(mcp.ToolResult{
+		Content: []mcp.Content{{Type: "text", Text: string(body)}},
+		IsError: false,
+	})
+}
+
+// appendCustomerSurfaceTool advertises the customer_surface wrapper-owned
+// tool on `tools/list`. The C binary knows nothing about it, so we have to
+// inject the definition into the list response before returning to the client.
+func (b *mcpBridgeBackend) appendCustomerSurfaceTool(raw json.RawMessage) (json.RawMessage, error) {
+	var payload struct {
+		Tools []map[string]interface{} `json:"tools"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("parse tools/list response: %w", err)
+	}
+	payload.Tools = append(payload.Tools, customerSurfaceToolDefinition())
+	return json.Marshal(payload)
+}
+
+// customerSurfaceToolDefinition is the MCP JSON-Schema for the customer_surface
+// tool. Kept here (not in the searchtools package) to avoid circular imports
+// and to mirror the discovery tool registration pattern.
+func customerSurfaceToolDefinition() map[string]interface{} {
+	return map[string]interface{}{
+		"name": "customer_surface",
+		"description": "Fuse product area + Vue component metadata + frontend fetch calls into a " +
+			"per-file customer-surface record. Used by PR-impact analysis to map changed files " +
+			"to product areas, pages, and UI components. Pass the repo slug and a list of " +
+			"(path, source) pairs; returns one surface record per file in input order.",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"repo": map[string]interface{}{
+					"type":        "string",
+					"description": "Short repo slug used for product-map lookup (e.g. 'ghl-crm-frontend', 'platform-backend').",
+				},
+				"files": map[string]interface{}{
+					"type":        "array",
+					"description": "Files to analyze. Each entry carries a repo-root-relative path and the full source.",
+					"items": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"path":   map[string]interface{}{"type": "string"},
+							"source": map[string]interface{}{"type": "string"},
+						},
+						"required": []string{"path", "source"},
+					},
+				},
+				"product_map_path": map[string]interface{}{
+					"type":        "string",
+					"description": "Optional filesystem override of the embedded product map (local dev / tests only).",
+				},
+			},
+			"required": []string{"repo", "files"},
+		},
+	}
 }
 
 func (b *mcpBridgeBackend) initialize(params json.RawMessage) (json.RawMessage, error) {
