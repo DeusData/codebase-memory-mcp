@@ -71,6 +71,7 @@ extern void suite_servicelink_mqtt(void);
 extern void suite_servicelink_nats(void);
 extern void suite_servicelink_redis_pubsub(void);
 extern void suite_servicelink_trpc(void);
+extern void suite_servicelink_http(void);
 extern void suite_communities(void);
 extern void suite_endpoint_registry(void);
 extern void suite_endpoint_persistence(void);
@@ -191,6 +192,7 @@ int main(void) {
     RUN_SUITE(servicelink_nats);
     RUN_SUITE(servicelink_redis_pubsub);
     RUN_SUITE(servicelink_trpc);
+    RUN_SUITE(servicelink_http);
 
     /* Community detection */
     RUN_SUITE(communities);
