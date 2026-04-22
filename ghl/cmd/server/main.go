@@ -36,10 +36,6 @@ import (
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/indexer"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/manifest"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/mcp"
-	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/orgdb"
-	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/orgdiscovery"
-	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/orgtools"
-	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/pipeline"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/searchtools"
 	"github.com/GoHighLevel/codebase-memory-mcp/ghl/internal/webhook"
 )
@@ -99,47 +95,6 @@ func main() {
 		}
 	}
 
-	// ── Org graph (always on) ─────────────────────────────────
-
-	var orgDB *orgdb.DB
-	{
-		orgDBPath := cfg.OrgDBPath
-		if orgDBPath == "" {
-			orgDBPath = filepath.Join(cfg.CBMCacheDir, "org", "org.db")
-		}
-		if err := os.MkdirAll(filepath.Dir(orgDBPath), 0o750); err != nil {
-			slog.Error("failed to create org db dir", "path", orgDBPath, "err", err)
-			os.Exit(1)
-		}
-		var dbErr error
-		orgDB, dbErr = orgdb.Open(orgDBPath)
-		if dbErr != nil {
-			slog.Error("failed to open org db", "path", orgDBPath, "err", dbErr)
-			os.Exit(1)
-		}
-		defer orgDB.Close()
-		slog.Info("org graph enabled", "path", orgDBPath)
-
-		// Hydrate org.db from artifacts if available
-		if artifactSync != nil && !cfg.ArtifactsSkipHydrate {
-			orgHydrateStart := time.Now()
-			hydrated, err := artifactSync.HydrateOrgGraph()
-			if err != nil {
-				slog.Warn("failed to hydrate org graph", "err", err, "duration", time.Since(orgHydrateStart))
-			} else if hydrated > 0 {
-				slog.Info("org hydration complete", "files", hydrated, "duration", time.Since(orgHydrateStart))
-				// Re-open the DB after hydration: the hydrated files may have
-				// overwritten the freshly created db, so we need to re-apply schema.
-				orgDB.Close()
-				orgDB, dbErr = orgdb.Open(orgDBPath)
-				if dbErr != nil {
-					slog.Error("failed to re-open org db after hydration", "err", dbErr)
-					os.Exit(1)
-				}
-			}
-		}
-	}
-
 	// ── Load fleet manifest (YAML first for fast startup) ────
 
 	m, err := manifest.Load(cfg.ReposManifest)
@@ -149,101 +104,10 @@ func main() {
 	}
 	slog.Info("fleet manifest loaded", "repos", len(m.Repos))
 
-	// Background: enrich manifest with GitHub API data (ownership, frameworks)
-	// This runs AFTER the HTTP server starts, so it doesn't block health checks.
-	orgScanToken := cfg.GitHubOrgScanToken
-	if orgScanToken == "" {
-		orgScanToken = cfg.GitHubToken
-	}
-	if orgScanToken != "" && cfg.GitHubAllowedOrgs != nil && len(cfg.GitHubAllowedOrgs) > 0 {
-		go func() {
-			orgName := cfg.GitHubAllowedOrgs[0]
-			scanner := orgdiscovery.NewScanner(orgName, orgScanToken)
-			// Load team overrides from file (if exists)
-			overrides := orgdiscovery.LoadTeamOverrides("/app/team-overrides.json")
-			if len(overrides) > 0 {
-				scanner.SetTeamOverrides(overrides)
-				slog.Info("background: loaded team overrides", "count", len(overrides))
-			}
-			slog.Info("background: scanning GitHub org for repo metadata", "org", orgName)
-
-			apiRepos, scanErr := scanner.ScanOrg(context.Background())
-			if scanErr != nil {
-				slog.Warn("background: github org scan failed", "org", orgName, "err", scanErr)
-				return
-			}
-			slog.Info("background: discovered repos via GitHub API", "count", len(apiRepos))
-
-			// Enrich ownership (CODEOWNERS + Teams API)
-			if ownerErr := scanner.EnrichOwnership(context.Background(), apiRepos); ownerErr != nil {
-				slog.Warn("background: ownership enrichment failed", "err", ownerErr)
-			}
-
-			// Enrich frameworks
-			if fwErr := scanner.EnrichFrameworks(context.Background(), apiRepos); fwErr != nil {
-				slog.Warn("background: framework detection failed", "err", fwErr)
-			}
-
-			// If API found more repos than YAML, use API as primary source
-			// (YAML is a stale fallback; API is the source of truth)
-			if len(apiRepos) > len(m.Repos) {
-				slog.Info("background: API discovered more repos than YAML, replacing manifest",
-					"api_repos", len(apiRepos), "yaml_repos", len(m.Repos))
-				m.Repos = apiRepos
-			} else {
-				// Merge: update existing repos with API data, add missing ones
-				apiByName := make(map[string]manifest.Repo, len(apiRepos))
-				for _, r := range apiRepos {
-					apiByName[r.Name] = r
-				}
-				for i, repo := range m.Repos {
-					if apiRepo, ok := apiByName[repo.Name]; ok {
-						if apiRepo.Team != "" {
-							m.Repos[i].Team = apiRepo.Team
-						}
-						if apiRepo.Type != "" && apiRepo.Type != "other" {
-							m.Repos[i].Type = apiRepo.Type
-						}
-						if len(apiRepo.Tags) > 0 {
-							m.Repos[i].Tags = apiRepo.Tags
-						}
-					}
-				}
-				for _, apiRepo := range apiRepos {
-					if _, ok := m.FindByName(apiRepo.Name); !ok {
-						m.Repos = append(m.Repos, apiRepo)
-					}
-				}
-			}
-
-			slog.Info("background: manifest enriched with GitHub API data",
-				"api_repos", len(apiRepos),
-				"total_repos", len(m.Repos),
-			)
-
-			// Update org.db with enriched data
-			if orgDB != nil {
-				for _, repo := range m.Repos {
-					orgDB.UpsertRepo(orgdb.RepoRecord{
-						Name:      repo.Name,
-						GitHubURL: repo.GitHubURL,
-						Team:      repo.Team,
-						Type:      repo.Type,
-					})
-					orgDB.UpsertTeamOwnership(repo.Name, repo.Team, "")
-				}
-				slog.Info("background: org.db updated with enriched manifest data")
-			}
-		}()
-	}
-
 	cloner := &gitCloner{
 		logger:      logger,
 		githubToken: cfg.GitHubToken,
 	}
-
-	var orgRepoCount atomic.Int64    // tracks repos enriched for periodic GCS sync
-	var orgPipelineRunning atomic.Bool // true while startup pipeline is populating org.db
 
 	// activityChecker filters stale repos during fleet runs.
 	var actChecker indexer.ActivityChecker
@@ -282,27 +146,6 @@ func main() {
 						slog.Info("persisted project index", "repo", slug, "project", projectName, "files", persisted)
 					}
 				}
-				// ── Org graph enrichment ──
-				if orgDB != nil && !orgPipelineRunning.Load() {
-					repo, ok := m.FindByName(slug)
-					if ok {
-						if enrichErr := pipeline.PopulateRepoData(orgDB, repo, cfg.CloneCacheDir); enrichErr != nil {
-							slog.Warn("org enrichment failed", "repo", slug, "err", enrichErr)
-						} else {
-							slog.Info("org enrichment complete", "repo", slug)
-						}
-					}
-					// Persist org.db to GCS every 10 repos (survive Cloud Run container restarts)
-					count := orgRepoCount.Add(1)
-					if count%10 == 0 && artifactSync != nil {
-						orgDB.Checkpoint() // flush WAL before copying
-						if _, persistErr := artifactSync.PersistOrgGraph(); persistErr != nil {
-							slog.Warn("periodic org.db persist failed", "count", count, "err", persistErr)
-						} else {
-							slog.Info("periodic org.db persisted to GCS", "repos_enriched", count)
-						}
-					}
-				}
 				if discoverySvc != nil {
 					discoverySvc.Invalidate()
 				}
@@ -310,39 +153,6 @@ func main() {
 			},
 			OnAllComplete: func(result indexer.IndexResult) {
 				slog.Info("fleet indexing complete", "total", result.Total, "ok", result.Succeeded, "failed", result.Failed, "skipped", result.Skipped)
-				// ── Cross-reference org contracts ──
-				if orgDB != nil && !orgPipelineRunning.Load() {
-					orgDB.FixRoutePaths() // fix __ path separators from C binary
-					// Infer package providers from repo names
-					provCount, provErr := orgDB.InferPackageProviders()
-					if provErr != nil {
-						slog.Warn("infer package providers failed", "err", provErr)
-					} else {
-						slog.Info("inferred package providers", "count", provCount)
-					}
-					matched, err := orgDB.CrossReferenceContracts()
-					if err != nil {
-						slog.Warn("cross-reference contracts failed", "err", err)
-					} else {
-						slog.Info("cross-referenced API contracts", "matched", matched)
-					}
-					eventMatched, err := orgDB.CrossReferenceEventContracts()
-					if err != nil {
-						slog.Warn("cross-reference event contracts failed", "err", err)
-					} else {
-						slog.Info("cross-referenced event contracts", "matched", eventMatched)
-					}
-					// Persist org.db to artifacts
-					if artifactSync != nil {
-						orgDB.Checkpoint() // flush WAL before copying
-						persisted, err := artifactSync.PersistOrgGraph()
-						if err != nil {
-							slog.Warn("failed to persist org graph", "err", err)
-						} else {
-							slog.Info("persisted org graph", "files", persisted)
-						}
-					}
-				}
 			},
 		})
 	}
@@ -422,69 +232,6 @@ func main() {
 	})
 	idx := newFleetIndexer(indexPool, discoverySvc)
 
-	// ── Populate org.db from hydrated project .db files (only if empty) ──
-	if orgDB != nil {
-		repoCount := orgDB.RepoCount()
-		apiContracts, eventContracts := orgDB.ContractCount()
-		packageDeps := orgDB.PackageDepCount()
-		slog.Info("startup: org.db state after hydration",
-			"repos", repoCount, "api_contracts", apiContracts,
-			"event_contracts", eventContracts, "package_deps", packageDeps)
-
-		if repoCount > 50 {
-			// org.db was successfully hydrated from GCS — skip expensive re-population
-			slog.Info("startup: org.db already populated, skipping re-population",
-				"repos", repoCount)
-
-			// Backfill packages if the hydrated org.db is stale (pre-package.json fix).
-			// repo_dependencies table will be empty if org.db was persisted by an
-			// older revision that couldn't read package.json. This is idempotent
-			// and runs in the background — does not block HTTP server.
-			if packageDeps == 0 {
-				go func() {
-					slog.Info("startup: package_deps=0 in hydrated org.db — running package backfill")
-					if err := pipeline.PopulatePackageDepsOnly(context.Background(), orgDB, m.Repos, cfg.CBMCacheDir); err != nil {
-						slog.Warn("startup: package dep backfill failed", "err", err)
-						return
-					}
-					// Persist the repaired org.db to GCS so future instances don't re-run backfill.
-					if artifactSync != nil {
-						orgDB.Checkpoint()
-						if n, err := artifactSync.PersistOrgGraph(); err != nil {
-							slog.Warn("startup: org.db GCS persist after backfill failed", "err", err)
-						} else {
-							slog.Info("startup: org.db persisted to GCS after backfill", "files", n)
-						}
-					}
-				}()
-			}
-		} else {
-			// org.db is empty or too small — populate directly from project .db files (fast path)
-			go func() {
-				orgPipelineRunning.Store(true)
-				defer orgPipelineRunning.Store(false)
-				slog.Info("startup: populating org.db from project .db files (direct SQL)")
-				if err := pipeline.PopulateOrgFromProjectDBsDirect(context.Background(), orgDB, m.Repos, cfg.CBMCacheDir); err != nil {
-					slog.Warn("startup: direct SQL population failed, falling back to MCP bridge", "err", err)
-					if err2 := pipeline.PopulateOrgFromProjectDBs(context.Background(), orgDB, discoveryPool, m.Repos, cfg.CBMCacheDir); err2 != nil {
-						slog.Error("startup: org.db population failed (both paths)", "err", err2)
-						return
-					}
-				}
-				slog.Info("startup: org.db populated successfully")
-				// Persist to GCS immediately
-				if artifactSync != nil {
-					orgDB.Checkpoint()
-					if n, err := artifactSync.PersistOrgGraph(); err != nil {
-						slog.Warn("startup: org.db GCS persist failed", "err", err)
-					} else {
-						slog.Info("startup: org.db persisted to GCS", "files", n)
-					}
-				}
-			}()
-		}
-	}
-
 	var fleetIndexing atomic.Bool
 	startFleetIndex := func(reason string, force bool) bool {
 		if !fleetIndexing.CompareAndSwap(false, true) {
@@ -515,47 +262,6 @@ func main() {
 		slog.Info("scheduled indexing enabled", "incremental_cron", cfg.IncrementalCron, "full_cron", cfg.FullCron)
 	}
 
-	// orgSyncCallback is set after orgToolSvc is created to update its DB on re-hydration.
-	var orgSyncCallback func(db *orgdb.DB)
-
-	// ── Periodic org.db sync (cross-instance consistency) ────
-	// Every 5 minutes, re-hydrate org.db from GCS if another instance updated it.
-	if orgDB != nil && artifactSync != nil {
-		orgDBPath := cfg.OrgDBPath
-		if orgDBPath == "" {
-			orgDBPath = filepath.Join(cfg.CBMCacheDir, "org", "org.db")
-		}
-		c.AddFunc("@every 5m", func() {
-			if orgPipelineRunning.Load() {
-				return // don't sync while pipeline is populating
-			}
-			hydrated, err := artifactSync.HydrateOrgGraph()
-			if err != nil {
-				slog.Warn("periodic org sync: hydration failed", "err", err)
-				return
-			}
-			if hydrated == 0 {
-				return
-			}
-			// Re-open to pick up hydrated data + ensure schema
-			orgDB.Close()
-			newDB, openErr := orgdb.Open(orgDBPath)
-			if openErr != nil {
-				slog.Error("periodic org sync: re-open failed", "err", openErr)
-				return
-			}
-			orgDB = newDB
-			// Update OrgService via the callback (set after orgToolSvc is created)
-			if orgSyncCallback != nil {
-				orgSyncCallback(newDB)
-			}
-			slog.Info("periodic org sync: re-hydrated from GCS", "files", hydrated,
-				"repos", orgDB.RepoCount())
-		})
-		// cron already started above
-		slog.Info("org.db periodic sync enabled (every 5m)")
-	}
-
 	// ── HTTP router ──────────────────────────────────────────
 
 	r := chi.NewRouter()
@@ -564,27 +270,13 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(5 * time.Minute))
 
-	if orgDB != nil {
-		slog.Info("org graph initialized")
-	}
-
-	// Build org tool service
-	var orgToolSvc *orgtools.OrgService
-	if orgDB != nil {
-		orgToolSvc = orgtools.New(orgDB)
-		orgToolSvc.SetBridge(bridgePool)
-		orgToolSvc.SetCacheDir(cfg.CBMCacheDir)
-		orgSyncCallback = func(db *orgdb.DB) { orgToolSvc.SetDB(db) }
-		slog.Info("org tools enabled", "tools", len(orgToolSvc.Definitions()))
-	}
-
 	// Search result cache — per-instance, 60 s TTL, 1000 entry max.
 	searchCache := bridge.NewSearchCache(1000, 60*time.Second)
 	slog.Info("search result cache enabled", "max_size", 1000, "ttl_s", 60)
 
 	// Bridge: forward MCP calls to the binary
 	bridgeHandler := bridge.NewHandler(
-		&mcpBridgeBackend{client: bridgePool, discovery: discoverySvc, orgTools: orgToolSvc, cache: searchCache, cacheDir: cfg.CBMCacheDir},
+		&mcpBridgeBackend{client: bridgePool, discovery: discoverySvc, cache: searchCache, cacheDir: cfg.CBMCacheDir},
 		bridge.Config{BearerToken: cfg.BearerToken, Authenticator: requestAuthenticator},
 	)
 	r.Mount("/mcp", bridgeHandler)
@@ -616,12 +308,6 @@ func main() {
 					slog.Info("webhook: persisted", "repo", repoSlug)
 				}
 			}
-			// Org enrichment
-			if orgDB != nil && !orgPipelineRunning.Load() {
-				if enrichErr := pipeline.PopulateRepoData(orgDB, repo, cfg.CloneCacheDir); enrichErr != nil {
-					slog.Warn("webhook: org enrichment failed", "repo", repoSlug, "err", enrichErr)
-				}
-			}
 			if discoverySvc != nil {
 				discoverySvc.Invalidate()
 			}
@@ -630,7 +316,7 @@ func main() {
 	r.Post("/webhooks/github", wh.ServeHTTP)
 
 	// Manual trigger: index a single repo by slug.
-	// Runs the same persist + org enrichment as the fleet OnRepoDone callback.
+	// Runs the same persist as the fleet OnRepoDone callback.
 	r.Post("/index/{repoSlug}", requireAuth(func(w http.ResponseWriter, req *http.Request) {
 		slug := chi.URLParam(req, "repoSlug")
 		repo, ok := m.FindByName(slug)
@@ -657,18 +343,6 @@ func main() {
 					slog.Info("manual index: persisted", "repo", slug, "project", projectName, "files", persisted)
 				}
 			}
-			// Org enrichment
-			if orgDB != nil && !orgPipelineRunning.Load() {
-				if enrichErr := pipeline.PopulateRepoData(orgDB, repo, cfg.CloneCacheDir); enrichErr != nil {
-					slog.Warn("manual index: org enrichment failed", "repo", slug, "err", enrichErr)
-				} else {
-					slog.Info("manual index: org enrichment complete", "repo", slug)
-				}
-				if artifactSync != nil {
-					orgDB.Checkpoint()
-					artifactSync.PersistOrgGraph()
-				}
-			}
 			if discoverySvc != nil {
 				discoverySvc.Invalidate()
 			}
@@ -676,56 +350,6 @@ func main() {
 		}()
 		w.WriteHeader(http.StatusAccepted)
 		fmt.Fprintf(w, `{"accepted":true,"repo":%q}`, slug)
-	}))
-
-	// Rebuild org.db post-processing: infer providers, cross-reference contracts.
-	// This is fast (SQL-only, no MCP calls) and can be run after any partial population.
-	r.Post("/rebuild-org", requireAuth(func(w http.ResponseWriter, req *http.Request) {
-		if orgDB == nil {
-			http.Error(w, "org graph not enabled", http.StatusServiceUnavailable)
-			return
-		}
-		go func() {
-			slog.Info("rebuild-org: starting SQL post-processing")
-			// Fix __ path separators from C binary route names
-			fixCount, fixErr := orgDB.FixRoutePaths()
-			if fixErr != nil {
-				slog.Error("rebuild-org: fix route paths failed", "err", fixErr)
-			} else if fixCount > 0 {
-				slog.Info("rebuild-org: fixed route paths", "count", fixCount)
-			}
-			provCount, err := orgDB.InferPackageProviders()
-			if err != nil {
-				slog.Error("rebuild-org: infer providers failed", "err", err)
-			} else {
-				slog.Info("rebuild-org: inferred providers", "count", provCount)
-			}
-			matched, err := orgDB.CrossReferenceContracts()
-			if err != nil {
-				slog.Error("rebuild-org: cross-ref API failed", "err", err)
-			} else {
-				slog.Info("rebuild-org: cross-referenced API contracts", "matched", matched)
-			}
-			eventMatched, err := orgDB.CrossReferenceEventContracts()
-			if err != nil {
-				slog.Error("rebuild-org: cross-ref events failed", "err", err)
-			} else {
-				slog.Info("rebuild-org: cross-referenced events", "matched", eventMatched)
-			}
-			// Persist
-			if artifactSync != nil {
-				orgDB.Checkpoint()
-				if n, err := artifactSync.PersistOrgGraph(); err != nil {
-					slog.Warn("rebuild-org: persist failed", "err", err)
-				} else {
-					slog.Info("rebuild-org: persisted to GCS", "files", n)
-				}
-			}
-			slog.Info("rebuild-org: complete",
-				"providers", provCount, "api_matched", matched, "event_matched", eventMatched)
-		}()
-		w.WriteHeader(http.StatusAccepted)
-		fmt.Fprint(w, `{"accepted":true}`)
 	}))
 
 	r.Post("/index-all", requireAuth(func(w http.ResponseWriter, req *http.Request) {
@@ -868,9 +492,6 @@ type config struct {
 	ScheduledIndexingEnabled bool
 	RunMode                  string
 	RunForce                 bool
-	OrgGraphEnabled          bool
-	OrgDBPath                string
-	GitHubOrgScanToken       string // separate token for org scanning (falls back to GitHubToken)
 }
 
 func loadConfig() config {
@@ -1043,9 +664,6 @@ func loadConfig() config {
 		ScheduledIndexingEnabled: getBool("SCHEDULED_INDEXING_ENABLED", false),
 		RunMode:                  strings.TrimSpace(getEnv("RUN_MODE", "serve")),
 		RunForce:                 getBool("RUN_FORCE", false),
-		OrgGraphEnabled:          true,
-		OrgDBPath:                getEnv("ORG_DB_PATH", ""),
-		GitHubOrgScanToken:      getEnv("GITHUB_ORG_SCAN_TOKEN", getEnv("GITHUB_TOKEN", "")),
 	}
 }
 
@@ -1708,18 +1326,10 @@ type bridgeClient interface {
 	CallTool(ctx context.Context, name string, params map[string]interface{}) (*mcp.ToolResult, error)
 }
 
-// orgToolService is the subset of orgtools.OrgService used by the bridge backend.
-type orgToolService interface {
-	Definitions() []discovery.ToolDefinition
-	IsOrgTool(name string) bool
-	CallTool(ctx context.Context, name string, args map[string]interface{}) (interface{}, error)
-}
-
 // mcpBridgeBackend implements bridge.Backend by forwarding to the MCP client.
 type mcpBridgeBackend struct {
 	client    bridgeClient
 	discovery discovery.Service
-	orgTools  orgToolService
 	cache     *bridge.SearchCache
 	cacheDir  string // CBM cache dir where per-project .db files live
 }
@@ -1742,11 +1352,7 @@ func (b *mcpBridgeBackend) Call(ctx context.Context, method string, params json.
 		if err != nil {
 			return nil, err
 		}
-		raw, err = b.appendDiscoveryTool(raw)
-		if err != nil {
-			return nil, err
-		}
-		return b.appendOrgTools(raw)
+		return b.appendDiscoveryTool(raw)
 	case "tools/call":
 		var paramMap map[string]interface{}
 		if len(params) > 0 {
@@ -1762,9 +1368,6 @@ func (b *mcpBridgeBackend) Call(ctx context.Context, method string, params json.
 		args, _ := paramMap["arguments"].(map[string]interface{})
 		if name == discovery.NewDefinition().Name {
 			return b.callDiscoveryTool(ctx, args)
-		}
-		if b.orgTools != nil && b.orgTools.IsOrgTool(name) {
-			return b.callOrgTool(ctx, name, args)
 		}
 
 		// Cache check: return instantly for repeated identical queries.
@@ -1885,45 +1488,6 @@ func (b *mcpBridgeBackend) callDiscoveryTool(ctx context.Context, args map[strin
 		return nil, fmt.Errorf("marshal discover_projects response: %w", err)
 	}
 
-	return json.Marshal(mcp.ToolResult{
-		Content: []mcp.Content{{Type: "text", Text: string(text)}},
-		IsError: false,
-	})
-}
-
-func (b *mcpBridgeBackend) appendOrgTools(raw json.RawMessage) (json.RawMessage, error) {
-	if b.orgTools == nil {
-		return raw, nil
-	}
-	var payload struct {
-		Tools []map[string]interface{} `json:"tools"`
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return nil, fmt.Errorf("parse tools/list response: %w", err)
-	}
-	for _, def := range b.orgTools.Definitions() {
-		tool := map[string]interface{}{
-			"name":        def.Name,
-			"description": def.Description,
-			"inputSchema": def.InputSchema,
-		}
-		payload.Tools = append(payload.Tools, tool)
-	}
-	return json.Marshal(payload)
-}
-
-func (b *mcpBridgeBackend) callOrgTool(ctx context.Context, name string, args map[string]interface{}) (json.RawMessage, error) {
-	if b.orgTools == nil {
-		return nil, errors.New("org tools unavailable")
-	}
-	result, err := b.orgTools.CallTool(ctx, name, args)
-	if err != nil {
-		return nil, err
-	}
-	text, err := json.Marshal(result)
-	if err != nil {
-		return nil, fmt.Errorf("marshal org tool response: %w", err)
-	}
 	return json.Marshal(mcp.ToolResult{
 		Content: []mcp.Content{{Type: "text", Text: string(text)}},
 		IsError: false,
