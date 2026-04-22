@@ -253,6 +253,283 @@ TEST(cross_link_missing_table_skipped) {
     PASS();
 }
 
+/* ── HTTP cross-project matching helpers ───────────────────────── */
+
+/* Get (confidence, extra_json) for the single row matching producer+consumer.
+ * Copies extra into extra_buf. Returns confidence or -1.0 if not found. */
+static double get_http_crosslink(const char *cache_dir,
+                                  const char *producer_project,
+                                  const char *consumer_project,
+                                  char *extra_buf, int extra_bufsz) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/_crosslinks.db", cache_dir);
+
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        return -1.0;
+    }
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+        "SELECT confidence, extra_json FROM cross_links "
+        "WHERE producer_project='%s' AND consumer_project='%s' LIMIT 1;",
+        producer_project, consumer_project);
+    sqlite3_stmt *stmt = NULL;
+    double conf = -1.0;
+    if (extra_buf && extra_bufsz > 0) extra_buf[0] = '\0';
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            conf = sqlite3_column_double(stmt, 0);
+            const unsigned char *ex = sqlite3_column_text(stmt, 1);
+            if (extra_buf && extra_bufsz > 0 && ex) {
+                snprintf(extra_buf, (size_t)extra_bufsz, "%s", (const char *)ex);
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+    sqlite3_close(db);
+    return conf;
+}
+
+/* ── HTTP tests ────────────────────────────────────────────────── */
+
+TEST(cross_link_http_route_exact_match) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/xl-http-exact-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) { SKIP("cbm_mkdtemp failed"); }
+
+    const char *a_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projA','http','producer','POST /v1/score','c.postScore','c.js','{}');"
+    };
+    const char *b_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projB','http','consumer','POST /v1/score','r.score','r.js',"
+        "'{\"service_name\":\"projB\"}');"
+    };
+
+    create_project_db(tmpdir, "projA", a_inserts, 1);
+    create_project_db(tmpdir, "projB", b_inserts, 1);
+
+    int links = cbm_cross_project_link(tmpdir);
+    ASSERT_EQ(links, 1);
+
+    char extra[256];
+    double conf = get_http_crosslink(tmpdir, "projA", "projB", extra, sizeof(extra));
+    ASSERT_FLOAT_EQ(conf, 0.95, 0.01);
+
+    rm_rf(tmpdir);
+    PASS();
+}
+
+TEST(cross_link_http_route_fuzzy_match) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/xl-http-fuzzy-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) { SKIP("cbm_mkdtemp failed"); }
+
+    const char *a_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projA','http','producer','GET /v1/users/:id','c.get','c.js','{}');"
+    };
+    const char *b_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projB','http','consumer','GET /v1/users/me','r.me','r.js',"
+        "'{\"service_name\":\"projB\"}');"
+    };
+
+    create_project_db(tmpdir, "projA", a_inserts, 1);
+    create_project_db(tmpdir, "projB", b_inserts, 1);
+
+    int links = cbm_cross_project_link(tmpdir);
+    ASSERT_EQ(links, 1);
+
+    double conf = get_http_crosslink(tmpdir, "projA", "projB", NULL, 0);
+    ASSERT_TRUE(conf > 0.0);
+    ASSERT_TRUE(conf < 0.95);
+
+    rm_rf(tmpdir);
+    PASS();
+}
+
+TEST(cross_link_http_service_level_fallback) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/xl-http-svc-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) { SKIP("cbm_mkdtemp failed"); }
+
+    const char *a_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projA','http','producer','http://user-service','c.call','c.js','{}');"
+    };
+    const char *b_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projB','http','consumer','POST /v1/x','r.x','r.js',"
+        "'{\"service_name\":\"user-service\"}');"
+    };
+
+    create_project_db(tmpdir, "projA", a_inserts, 1);
+    create_project_db(tmpdir, "projB", b_inserts, 1);
+
+    int links = cbm_cross_project_link(tmpdir);
+    ASSERT_EQ(links, 1);
+
+    double conf = get_http_crosslink(tmpdir, "projA", "projB", NULL, 0);
+    ASSERT_FLOAT_EQ(conf, 0.60, 0.01);
+
+    rm_rf(tmpdir);
+    PASS();
+}
+
+TEST(cross_link_http_env_level_with_s3_cosignal) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/xl-http-env-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) { SKIP("cbm_mkdtemp failed"); }
+
+    /* Producer identifier is env-level. */
+    const char *a_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projA','http','producer','env:USER_SVC_URL','c.call','c.js','{}');"
+    };
+    /* Consumer declares matching env_var, has S3 co-signal (signals bit 0x04),
+     * generic=false. */
+    const char *b_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projB','http','consumer','POST /v1/x','r.x','r.js',"
+        "'{\"env_var\":\"USER_SVC_URL\",\"signals\":4,\"generic\":false}');"
+    };
+
+    create_project_db(tmpdir, "projA", a_inserts, 1);
+    create_project_db(tmpdir, "projB", b_inserts, 1);
+
+    int links = cbm_cross_project_link(tmpdir);
+    ASSERT_EQ(links, 1);
+
+    double conf = get_http_crosslink(tmpdir, "projA", "projB", NULL, 0);
+    ASSERT_FLOAT_EQ(conf, 0.50, 0.01);
+
+    rm_rf(tmpdir);
+    PASS();
+}
+
+TEST(cross_link_http_env_level_alone_no_edge) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/xl-http-envn-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) { SKIP("cbm_mkdtemp failed"); }
+
+    const char *a_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projA','http','producer','env:USER_SVC_URL','c.call','c.js','{}');"
+    };
+    /* Consumer signals 0 — no S3/S4 co-signal. */
+    const char *b_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projB','http','consumer','POST /v1/x','r.x','r.js',"
+        "'{\"env_var\":\"USER_SVC_URL\",\"signals\":0,\"generic\":false}');"
+    };
+
+    create_project_db(tmpdir, "projA", a_inserts, 1);
+    create_project_db(tmpdir, "projB", b_inserts, 1);
+
+    int links = cbm_cross_project_link(tmpdir);
+    ASSERT_EQ(links, 0);
+
+    rm_rf(tmpdir);
+    PASS();
+}
+
+TEST(cross_link_http_ambiguity_three_candidates) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/xl-http-amb3-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) { SKIP("cbm_mkdtemp failed"); }
+
+    const char *a_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projA','http','producer','POST /v1/score','c.call','c.js','{}');"
+    };
+    const char *b_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projB','http','consumer','POST /v1/score','r.b','r.js',"
+        "'{\"service_name\":\"projB\"}');"
+    };
+    const char *c_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projC','http','consumer','POST /v1/score','r.c','r.js',"
+        "'{\"service_name\":\"projC\"}');"
+    };
+    const char *d_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projD','http','consumer','POST /v1/score','r.d','r.js',"
+        "'{\"service_name\":\"projD\"}');"
+    };
+
+    create_project_db(tmpdir, "projA", a_inserts, 1);
+    create_project_db(tmpdir, "projB", b_inserts, 1);
+    create_project_db(tmpdir, "projC", c_inserts, 1);
+    create_project_db(tmpdir, "projD", d_inserts, 1);
+
+    int links = cbm_cross_project_link(tmpdir);
+    ASSERT_EQ(links, 3);
+
+    /* Each row should have confidence = 0.95/3 and ambiguous_with
+     * listing the OTHER two consumer projects. */
+    char extraB[256];
+    double confB = get_http_crosslink(tmpdir, "projA", "projB", extraB, sizeof(extraB));
+    ASSERT_FLOAT_EQ(confB, 0.95 / 3.0, 0.01);
+    ASSERT_TRUE(strstr(extraB, "ambiguous_with") != NULL);
+    ASSERT_TRUE(strstr(extraB, "projC") != NULL);
+    ASSERT_TRUE(strstr(extraB, "projD") != NULL);
+    ASSERT_TRUE(strstr(extraB, "projB") == NULL);
+
+    rm_rf(tmpdir);
+    PASS();
+}
+
+TEST(cross_link_http_ambiguity_four_dropped) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/xl-http-amb4-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) { SKIP("cbm_mkdtemp failed"); }
+
+    const char *a_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projA','http','producer','POST /v1/score','c.call','c.js','{}');"
+    };
+    const char *b_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projB','http','consumer','POST /v1/score','r.b','r.js',"
+        "'{\"service_name\":\"projB\"}');"
+    };
+    const char *c_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projC','http','consumer','POST /v1/score','r.c','r.js',"
+        "'{\"service_name\":\"projC\"}');"
+    };
+    const char *d_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projD','http','consumer','POST /v1/score','r.d','r.js',"
+        "'{\"service_name\":\"projD\"}');"
+    };
+    const char *e_inserts[] = {
+        "INSERT INTO protocol_endpoints (project,protocol,role,identifier,node_qn,file_path,extra) "
+        "VALUES ('projE','http','consumer','POST /v1/score','r.e','r.js',"
+        "'{\"service_name\":\"projE\"}');"
+    };
+
+    create_project_db(tmpdir, "projA", a_inserts, 1);
+    create_project_db(tmpdir, "projB", b_inserts, 1);
+    create_project_db(tmpdir, "projC", c_inserts, 1);
+    create_project_db(tmpdir, "projD", d_inserts, 1);
+    create_project_db(tmpdir, "projE", e_inserts, 1);
+
+    int links = cbm_cross_project_link(tmpdir);
+    /* 4 candidates → drop to top-3 by raw conf; since all are 0.95
+     * the tie-break yields whichever 3 the selection sort picks.  */
+    ASSERT_EQ(links, 3);
+
+    /* Every kept link's confidence is 0.95 / 3. */
+    ASSERT_EQ(count_crosslinks(tmpdir, NULL), 3);
+
+    rm_rf(tmpdir);
+    PASS();
+}
+
 SUITE(cross_project_links) {
     RUN_TEST(cross_link_exact_match);
     RUN_TEST(cross_link_normalized_match);
@@ -260,4 +537,11 @@ SUITE(cross_project_links) {
     RUN_TEST(cross_link_no_match);
     RUN_TEST(cross_link_multiple_protocols);
     RUN_TEST(cross_link_missing_table_skipped);
+    RUN_TEST(cross_link_http_route_exact_match);
+    RUN_TEST(cross_link_http_route_fuzzy_match);
+    RUN_TEST(cross_link_http_service_level_fallback);
+    RUN_TEST(cross_link_http_env_level_with_s3_cosignal);
+    RUN_TEST(cross_link_http_env_level_alone_no_edge);
+    RUN_TEST(cross_link_http_ambiguity_three_candidates);
+    RUN_TEST(cross_link_http_ambiguity_four_dropped);
 }
