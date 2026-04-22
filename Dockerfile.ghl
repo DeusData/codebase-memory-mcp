@@ -56,10 +56,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=cbm   /usr/local/bin/codebase-memory-mcp /app/codebase-memory-mcp
 COPY --from=build /app/ghl-fleet                      /app/ghl-fleet
 
-# Copy default manifest and team overrides
+# Copy default manifest
 COPY REPOS.yaml /app/REPOS.yaml
 COPY REPOS.local.yaml /app/REPOS.local.yaml
-COPY ghl/team-overrides.json /app/team-overrides.json
 
 # Git: trust all dirs (needed when running as non-root in containers)
 RUN git config --global --add safe.directory '*'

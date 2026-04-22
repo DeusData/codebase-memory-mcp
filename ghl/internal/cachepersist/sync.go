@@ -12,8 +12,6 @@ import (
 type backend interface {
 	Hydrate(runtimeDir string) (int, error)
 	PersistProject(runtimeDir, project string) (int, error)
-	PersistOrgDB(runtimeDir string) (int, error)
-	HydrateOrgDB(runtimeDir string) (int, error)
 	CountArtifacts() (int, error)
 	Close() error
 }
@@ -64,22 +62,6 @@ func (s *Syncer) PersistProject(project string) (int, error) {
 		return 0, nil
 	}
 	return s.backend.PersistProject(s.RuntimeDir, project)
-}
-
-// PersistOrgGraph persists org.db from runtime org/ subdir to durable storage.
-func (s *Syncer) PersistOrgGraph() (int, error) {
-	if s == nil || s.backend == nil {
-		return 0, nil
-	}
-	return s.backend.PersistOrgDB(s.RuntimeDir)
-}
-
-// HydrateOrgGraph restores org.db from durable storage to runtime org/ subdir.
-func (s *Syncer) HydrateOrgGraph() (int, error) {
-	if s == nil || s.backend == nil {
-		return 0, nil
-	}
-	return s.backend.HydrateOrgDB(s.RuntimeDir)
 }
 
 // CountArtifacts returns the number of persisted DB artifact files.
@@ -165,69 +147,6 @@ func (b *fsBackend) PersistProject(runtimeDir, project string) (int, error) {
 		dst := filepath.Join(b.artifactDir, info.Name())
 		if err := copyFileAtomic(src, dst); err != nil {
 			return copied, fmt.Errorf("cachepersist: persist %s: %w", info.Name(), err)
-		}
-		copied++
-	}
-	return copied, nil
-}
-
-func (b *fsBackend) PersistOrgDB(runtimeDir string) (int, error) {
-	srcDir := filepath.Join(runtimeDir, "org")
-	entries, err := os.ReadDir(srcDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("cachepersist: read org dir: %w", err)
-	}
-	copied := 0
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		// Copy .db files AND WAL journal files (.db-wal, .db-shm)
-		// Without the WAL, the persisted .db file is empty when using WAL mode.
-		if !strings.HasSuffix(name, ".db") &&
-			!strings.HasSuffix(name, ".db-wal") &&
-			!strings.HasSuffix(name, ".db-shm") {
-			continue
-		}
-		src := filepath.Join(srcDir, name)
-		dst := filepath.Join(b.artifactDir, "org", name)
-		if err := copyFileAtomic(src, dst); err != nil {
-			return copied, fmt.Errorf("cachepersist: persist org %s: %w", name, err)
-		}
-		copied++
-	}
-	return copied, nil
-}
-
-func (b *fsBackend) HydrateOrgDB(runtimeDir string) (int, error) {
-	srcDir := filepath.Join(b.artifactDir, "org")
-	entries, err := os.ReadDir(srcDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("cachepersist: read org artifact dir: %w", err)
-	}
-	copied := 0
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		// Restore .db files AND WAL journal files (.db-wal, .db-shm)
-		if !strings.HasSuffix(name, ".db") &&
-			!strings.HasSuffix(name, ".db-wal") &&
-			!strings.HasSuffix(name, ".db-shm") {
-			continue
-		}
-		src := filepath.Join(srcDir, name)
-		dst := filepath.Join(runtimeDir, "org", name)
-		if err := copyFileAtomic(src, dst); err != nil {
-			return copied, fmt.Errorf("cachepersist: hydrate org %s: %w", name, err)
 		}
 		copied++
 	}
