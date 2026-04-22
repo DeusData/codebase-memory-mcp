@@ -23,7 +23,7 @@
 /* ── Constants ─────────────────────────────────────────────────── */
 
 #define HTTP_CONF_S1    0.55  /* literal path / method */
-#define HTTP_CONF_S2    0.20  /* env-var enrichment */
+#define HTTP_CONF_S2    0.30  /* env-var enrichment (raised from 0.20 so S2-alone crosses SL_MIN_CONFIDENCE=0.25) */
 #define HTTP_CONF_S3    0.25  /* k8s service host match */
 #define HTTP_PATH_MAX   256
 #define HTTP_IDENT_MAX  256
@@ -252,28 +252,16 @@ static bool is_loopback_host(const char *host) {
         || strcmp(host, "0.0.0.0") == 0;
 }
 
-/* Returns true if the endpoint resolves to the current project itself. */
+/* Returns true if the endpoint resolves to the current project itself.
+ * Only loopback addresses are treated as unambiguous self-calls here.
+ * Service-name matches with local Resource nodes do NOT suppress registration —
+ * pass_crossrepolinks.c filters same-project matches at match time. Suppressing
+ * at the linker would prevent cross-project service-level matches from ever firing. */
 static bool is_self_call(const http_endpoint_t *ep,
                          const cbm_pipeline_ctx_t *ctx) {
+    (void)ctx;
     if (!ep) return false;
-    if (is_loopback_host(ep->host)) return true;
-
-    /* If the host matches a Resource/Service node in this project, treat as self. */
-    if (ep->host[0] && ctx && ctx->gbuf) {
-        const cbm_gbuf_node_t **resources = NULL;
-        int nres = 0;
-        cbm_gbuf_find_by_label(ctx->gbuf, "Resource", &resources, &nres);
-        for (int i = 0; i < nres; i++) {
-            const cbm_gbuf_node_t *r = resources[i];
-            if (!r || !r->name) continue;
-            if (strncmp(r->name, "Service/", 8) != 0) continue;
-            const char *svc = resource_tail(r->name);
-            if (svc && strcmp(svc, ep->host) == 0) {
-                return true;
-            }
-        }
-    }
-    return false;
+    return is_loopback_host(ep->host);
 }
 
 /* ── Confidence scoring ─────────────────────────────────────────── */

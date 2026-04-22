@@ -501,13 +501,16 @@ TEST(http_config_disabled) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- *  Test 10: Self-call suppression
+ *  Test 10: Self-call suppression (loopback only)
  *
- *    The call target host is "my-service" and a Resource/Service/my-service
- *    exists in the same gbuf → treated as self-call, not registered.
+ *    Self-call suppression now only fires for loopback hosts
+ *    (localhost / 127.0.0.1 / 0.0.0.0). Service-name matches are handled
+ *    by the cross-repo matcher's same-project filter, not by the linker —
+ *    suppressing here would prevent cross-project service-level matches
+ *    from ever firing.
  * ═══════════════════════════════════════════════════════════════════ */
 
-TEST(http_self_call_suppressed) {
+TEST(http_self_call_loopback_suppressed) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_http_self_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
@@ -515,8 +518,6 @@ TEST(http_self_call_suppressed) {
     write_file(tmpdir, "client.js", "function f() { /* */ }\n");
 
     cbm_gbuf_t *gb = cbm_gbuf_new("my-service", tmpdir);
-    cbm_gbuf_upsert_node(gb, "Resource", "Service/my-service",
-        "k8s.Service.my-service", "k8s.yaml", 1, 1, NULL);
 
     int64_t caller = cbm_gbuf_upsert_node(gb, "Function", "f",
         "my-service.f", "client.js", 1, 1, NULL);
@@ -524,14 +525,14 @@ TEST(http_self_call_suppressed) {
         "__route__POST__/x", "s.js", 1, 1, NULL);
 
     cbm_gbuf_insert_edge(gb, caller, dummy, "HTTP_CALLS",
-        "{\"method\":\"POST\",\"url_path\":\"http://my-service/v1/x\"}");
+        "{\"method\":\"POST\",\"url_path\":\"http://localhost/v1/x\"}");
 
     cbm_sl_endpoint_list_t *eps = cbm_sl_endpoint_list_new();
     cbm_pipeline_ctx_t ctx = make_ctx(gb, tmpdir, eps);
     ctx.project_name = "my-service";
     (void)cbm_servicelink_http(&ctx);
 
-    /* The self-call must not register a producer. */
+    /* The loopback self-call must not register a producer. */
     ASSERT_EQ(count_endpoints(eps, "producer"), 0);
 
     cbm_sl_endpoint_list_free(eps);
@@ -554,5 +555,5 @@ SUITE(servicelink_http) {
     RUN_TEST(http_generic_env_var_registered_but_flagged);
     RUN_TEST(http_unresolved_counter);
     RUN_TEST(http_config_disabled);
-    RUN_TEST(http_self_call_suppressed);
+    RUN_TEST(http_self_call_loopback_suppressed);
 }
