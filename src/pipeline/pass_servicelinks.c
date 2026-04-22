@@ -36,7 +36,7 @@ const char *SL_ALL_EDGE_TYPES[] = {
 const char *SL_PROTOCOL_KEYS[] = {
     "graphql", "grpc", "kafka", "sqs", "sns", "pubsub",
     "ws", "sse", "rabbitmq", "mqtt", "nats", "redis_pubsub",
-    "trpc", "eventbridge"
+    "trpc", "eventbridge", "http"
 };
 
 /* ── Config functions ──────────────────────────────────────────── */
@@ -122,7 +122,12 @@ double cbm_sl_effective_min_confidence(const cbm_sl_config_t *cfg, int protocol_
 /* ── Cleanup stale edges from previous runs ─────────────────── */
 
 static void cleanup_stale_edges(cbm_pipeline_ctx_t *ctx) {
-    for (int i = 0; i < SL_EDGE_TYPE_COUNT; i++) {
+    /* NOTE: use the array's own size here, not SL_EDGE_TYPE_COUNT.
+     * SL_ALL_EDGE_TYPES deliberately excludes HTTP_CALLS — those edges are
+     * emitted by pass_calls.c before this pass runs, and servicelink_http
+     * enriches them in place. Deleting them here would destroy that input. */
+    const int n = (int)(sizeof(SL_ALL_EDGE_TYPES) / sizeof(*SL_ALL_EDGE_TYPES));
+    for (int i = 0; i < n; i++) {
         cbm_gbuf_delete_edges_by_type(ctx->gbuf, SL_ALL_EDGE_TYPES[i]);
     }
 }
@@ -151,6 +156,7 @@ static const cbm_sl_linker_entry_t LINKERS[] = {
     { "Redis Pub/Sub", cbm_servicelink_redis_pubsub },
     { "tRPC",         cbm_servicelink_trpc },
     { "EventBridge",  cbm_servicelink_eventbridge },
+    { "HTTP",         cbm_servicelink_http },
 };
 #define LINKER_COUNT (int)(sizeof(LINKERS) / sizeof(LINKERS[0]))
 

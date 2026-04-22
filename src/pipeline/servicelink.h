@@ -40,10 +40,11 @@
 #define SL_EDGE_REDIS_PS  "REDIS_PUBSUB_CALLS"
 #define SL_EDGE_TRPC      "TRPC_CALLS"
 #define SL_EDGE_EVBRIDGE  "EVENTBRIDGE_CALLS"
+#define SL_EDGE_HTTP      "HTTP_CALLS"
 
 /* ── All edge types for cleanup (defined in pass_servicelinks.c) ── */
 extern const char *SL_ALL_EDGE_TYPES[];
-#define SL_EDGE_TYPE_COUNT 14
+#define SL_EDGE_TYPE_COUNT 15
 
 /* ── Generic producer/consumer structs ──────────────────────── */
 
@@ -70,6 +71,8 @@ typedef struct {
     int links_created;
     int producers_found;
     int consumers_found;
+    int unresolved_items;
+    int ambiguous_dropped;
 } cbm_sl_result_t;
 
 /* ── Helper: read source lines from disk ───────────────────── */
@@ -272,6 +275,7 @@ int cbm_servicelink_nats(cbm_pipeline_ctx_t *ctx);
 int cbm_servicelink_redis_pubsub(cbm_pipeline_ctx_t *ctx);
 int cbm_servicelink_trpc(cbm_pipeline_ctx_t *ctx);
 int cbm_servicelink_eventbridge(cbm_pipeline_ctx_t *ctx);
+int cbm_servicelink_http(cbm_pipeline_ctx_t *ctx);
 
 /* ── Service linker configuration ──────────────────────────────── */
 
