@@ -399,8 +399,11 @@ static int write_crosslinks(const char *cache_dir,
         const xl_endpoint_t *prod = &endpoints[pi];
         const bool is_http = (strcmp(prod->protocol, "http") == 0);
 
-        /* Collect candidate consumers for this producer. */
+        /* HTTP uses a candidate buffer for ambiguity handling (capped).
+         * Non-HTTP emits directly — no cap, preserves pre-refactor behavior. */
         int n_cands = 0;
+        int cap_truncated = 0;
+
         for (int ci = 0; ci < count; ci++) {
             if (strcmp(endpoints[ci].role, "consumer") != 0) continue;
             const xl_endpoint_t *cons = &endpoints[ci];
@@ -420,19 +423,8 @@ static int write_crosslinks(const char *cache_dir,
             if (conf <= 0.0) continue;
             if (is_http && conf < SL_MIN_CONFIDENCE) continue;
 
-            if (n_cands < MAX_CANDIDATES) {
-                cands[n_cands].consumer_idx = ci;
-                cands[n_cands].raw_conf = conf;
-                n_cands++;
-            }
-        }
-
-        if (n_cands == 0) continue;
-
-        /* Non-HTTP: emit one row per candidate, raw confidence, no ambiguity. */
-        if (!is_http) {
-            for (int k = 0; k < n_cands; k++) {
-                const xl_endpoint_t *cons = &endpoints[cands[k].consumer_idx];
+            if (!is_http) {
+                /* Emit inline: no buffer, no cap. */
                 sqlite3_bind_text(ins, 1, prod->protocol, -1, SQLITE_STATIC);
                 sqlite3_bind_text(ins, 2, prod->identifier, -1, SQLITE_STATIC);
                 sqlite3_bind_text(ins, 3, prod->project, -1, SQLITE_STATIC);
@@ -441,15 +433,34 @@ static int write_crosslinks(const char *cache_dir,
                 sqlite3_bind_text(ins, 6, cons->project, -1, SQLITE_STATIC);
                 sqlite3_bind_text(ins, 7, cons->node_qn, -1, SQLITE_STATIC);
                 sqlite3_bind_text(ins, 8, cons->file_path, -1, SQLITE_STATIC);
-                sqlite3_bind_double(ins, 9, cands[k].raw_conf);
+                sqlite3_bind_double(ins, 9, conf);
                 sqlite3_bind_text(ins, 10, "{}", -1, SQLITE_STATIC);
                 sqlite3_bind_text(ins, 11, timestamp, -1, SQLITE_STATIC);
                 sqlite3_step(ins);
                 sqlite3_reset(ins);
                 link_count++;
+                continue;
             }
-            continue;
+
+            if (n_cands < MAX_CANDIDATES) {
+                cands[n_cands].consumer_idx = ci;
+                cands[n_cands].raw_conf = conf;
+                n_cands++;
+            } else {
+                cap_truncated++;
+            }
         }
+
+        if (!is_http) continue;
+
+        if (cap_truncated > 0) {
+            cbm_log_info("http.candidate_truncated",
+                         "producer", prod->identifier,
+                         "kept", itoa_buf(MAX_CANDIDATES),
+                         "dropped", itoa_buf(cap_truncated));
+        }
+
+        if (n_cands == 0) continue;
 
         /* HTTP: apply ambiguity handling. */
         int emit_count = n_cands;
