@@ -291,6 +291,8 @@ Every MCP tool can be invoked from the command line:
 
 ```bash
 codebase-memory-mcp cli index_repository '{"repo_path": "/path/to/repo"}'
+codebase-memory-mcp cli sync_git_range '{"repo_path": "/path/to/repo", "old_ref": "abc", "new_ref": "def"}'
+codebase-memory-mcp cli sync_files '{"repo_path": "/path/to/repo", "changed_files": ["src/app.go"], "deleted_files": []}'
 codebase-memory-mcp cli search_graph '{"name_pattern": ".*Handler.*", "label": "Function"}'
 codebase-memory-mcp cli trace_call_path '{"function_name": "Search", "direction": "both"}'
 codebase-memory-mcp cli query_graph '{"query": "MATCH (f:Function) RETURN f.name LIMIT 5"}'
@@ -305,6 +307,8 @@ codebase-memory-mcp cli --raw search_graph '{"label": "Function"}' | jq '.result
 | Tool | Description |
 |------|-------------|
 | `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh after that. |
+| `sync_git_range` | Incrementally sync files changed between two git refs, suitable for post-checkout hooks. |
+| `sync_files` | Incrementally sync explicit changed/deleted file lists, respecting `.cbmignore`. |
 | `list_projects` | List all indexed projects with node/edge counts. |
 | `delete_project` | Remove a project and all its graph data. |
 | `index_status` | Check indexing status of a project. |

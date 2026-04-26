@@ -421,6 +421,15 @@ int cbm_scan_project_env_urls(const char *root_path, cbm_env_binding_t *out, int
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
                                  int file_count);
 
+/* Run incremental re-index for an explicit file set.
+ * changed_files contains current discovered file infos to re-parse.
+ * deleted_files contains relative paths that should be removed from the index.
+ * all_files is the current discovered file set used to refresh file_hashes. */
+int cbm_pipeline_run_incremental_files(cbm_pipeline_t *p, const char *db_path,
+                                       cbm_file_info_t *changed_files, int changed_count,
+                                       char **deleted_files, int deleted_count,
+                                       cbm_file_info_t *all_files, int all_file_count);
+
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);

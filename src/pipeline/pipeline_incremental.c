@@ -302,10 +302,11 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
     }
 }
 
-/* ── Incremental pipeline entry point ────────────────────────────── */
-
-int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
-                                 int file_count) {
+/* Apply an already-classified incremental file set. */
+static int run_incremental_file_set(cbm_pipeline_t *p, const char *db_path,
+                                    cbm_file_info_t *changed_files, int changed_count,
+                                    char **deleted_files, int deleted_count,
+                                    cbm_file_info_t *hash_files, int hash_file_count) {
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -318,48 +319,14 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         return CBM_NOT_FOUND;
     }
 
-    /* Load stored file hashes */
-    cbm_file_hash_t *stored = NULL;
-    int stored_count = 0;
-    cbm_store_get_file_hashes(store, project, &stored, &stored_count);
-
-    /* Classify files */
-    int n_changed = 0;
-    int n_unchanged = 0;
-    bool *is_changed =
-        classify_files(files, file_count, stored, stored_count, &n_changed, &n_unchanged);
-
-    /* Find deleted files */
-    char **deleted = NULL;
-    int deleted_count = find_deleted_files(files, file_count, stored, stored_count, &deleted);
-
-    cbm_log_info("incremental.classify", "changed", itoa_buf(n_changed), "unchanged",
-                 itoa_buf(n_unchanged), "deleted", itoa_buf(deleted_count));
-
     /* Fast path: nothing changed → skip */
-    if (n_changed == 0 && deleted_count == 0) {
+    if (changed_count == 0 && deleted_count == 0) {
         cbm_log_info("incremental.noop", "reason", "no_changes");
-        free(is_changed);
-        free(deleted);
-        cbm_store_free_file_hashes(stored, stored_count);
         cbm_store_close(store);
         return 0;
     }
 
-    cbm_store_free_file_hashes(stored, stored_count);
-
-    /* Build list of changed files */
-    cbm_file_info_t *changed_files =
-        (n_changed > 0) ? malloc((size_t)n_changed * sizeof(cbm_file_info_t)) : NULL;
-    int ci = 0;
-    for (int i = 0; i < file_count; i++) {
-        if (is_changed[i]) {
-            changed_files[ci++] = files[i];
-        }
-    }
-    free(is_changed);
-
-    cbm_log_info("incremental.reparse", "files", itoa_buf(ci));
+    cbm_log_info("incremental.reparse", "files", itoa_buf(changed_count));
 
     struct timespec t;
 
@@ -375,11 +342,6 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     if (load_rc != 0) {
         cbm_log_error("incremental.err", "msg", "load_db_failed");
         cbm_gbuf_free(existing);
-        free(changed_files);
-        for (int i = 0; i < deleted_count; i++) {
-            free(deleted[i]);
-        }
-        free(deleted);
         cbm_store_close(store);
         return CBM_NOT_FOUND;
     }
@@ -388,14 +350,12 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     /* Step 2: Purge stale nodes */
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    for (int i = 0; i < ci; i++) {
+    for (int i = 0; i < changed_count; i++) {
         cbm_gbuf_delete_by_file(existing, changed_files[i].rel_path);
     }
     for (int i = 0; i < deleted_count; i++) {
-        cbm_gbuf_delete_by_file(existing, deleted[i]);
-        free(deleted[i]);
+        cbm_gbuf_delete_by_file(existing, deleted_files[i]);
     }
-    free(deleted);
     cbm_log_info("incremental.purge", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
     /* Step 3-5: Registry + extract + resolve */
@@ -414,7 +374,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .mode = cbm_pipeline_get_mode(p),
     };
 
-    for (int i = 0; i < ci; i++) {
+    for (int i = 0; i < changed_count; i++) {
         char *file_qn = cbm_pipeline_fqn_compute(project, changed_files[i].rel_path, "__file__");
         if (file_qn) {
             cbm_gbuf_upsert_node(existing, "File", changed_files[i].rel_path, file_qn,
@@ -423,17 +383,98 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         }
     }
 
-    run_extract_resolve(&ctx, changed_files, ci);
-    cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
-    run_postpasses(&ctx, changed_files, ci, project);
+    run_extract_resolve(&ctx, changed_files, changed_count);
+    cbm_pipeline_pass_k8s(&ctx, changed_files, changed_count);
+    run_postpasses(&ctx, changed_files, changed_count, project);
 
-    free(changed_files);
     cbm_registry_free(registry);
 
     /* Step 7: Dump to disk */
-    dump_and_persist(existing, db_path, project, files, file_count, cbm_pipeline_repo_path(p));
+    dump_and_persist(existing, db_path, project, hash_files, hash_file_count,
+                     cbm_pipeline_repo_path(p));
     cbm_gbuf_free(existing);
 
     cbm_log_info("incremental.done", "elapsed_ms", itoa_buf((int)elapsed_ms(t0)));
     return 0;
+}
+
+/* ── Incremental pipeline entry points ───────────────────────────── */
+
+int cbm_pipeline_run_incremental_files(cbm_pipeline_t *p, const char *db_path,
+                                       cbm_file_info_t *changed_files, int changed_count,
+                                       char **deleted_files, int deleted_count,
+                                       cbm_file_info_t *all_files, int all_file_count) {
+    if (!p || !db_path || changed_count < 0 || deleted_count < 0 || all_file_count < 0) {
+        return CBM_NOT_FOUND;
+    }
+    if ((changed_count > 0 && !changed_files) || (deleted_count > 0 && !deleted_files) ||
+        (all_file_count > 0 && !all_files)) {
+        return CBM_NOT_FOUND;
+    }
+    cbm_log_info("incremental.explicit", "changed", itoa_buf(changed_count), "deleted",
+                 itoa_buf(deleted_count), "current_files", itoa_buf(all_file_count));
+    return run_incremental_file_set(p, db_path, changed_files, changed_count, deleted_files,
+                                    deleted_count, all_files, all_file_count);
+}
+
+int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
+                                 int file_count) {
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* Open existing disk DB */
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        cbm_log_error("incremental.err", "msg", "open_db_failed", "path", db_path);
+        return CBM_NOT_FOUND;
+    }
+
+    /* Load stored file hashes */
+    cbm_file_hash_t *stored = NULL;
+    int stored_count = 0;
+    cbm_store_get_file_hashes(store, project, &stored, &stored_count);
+    cbm_store_close(store);
+
+    /* Classify files */
+    int n_changed = 0;
+    int n_unchanged = 0;
+    bool *is_changed =
+        classify_files(files, file_count, stored, stored_count, &n_changed, &n_unchanged);
+
+    /* Find deleted files */
+    char **deleted = NULL;
+    int deleted_count = find_deleted_files(files, file_count, stored, stored_count, &deleted);
+
+    cbm_log_info("incremental.classify", "changed", itoa_buf(n_changed), "unchanged",
+                 itoa_buf(n_unchanged), "deleted", itoa_buf(deleted_count));
+
+    cbm_store_free_file_hashes(stored, stored_count);
+
+    if (!is_changed) {
+        for (int i = 0; i < deleted_count; i++) {
+            free(deleted[i]);
+        }
+        free(deleted);
+        return CBM_NOT_FOUND;
+    }
+
+    /* Build list of changed files */
+    cbm_file_info_t *changed_files =
+        (n_changed > 0) ? malloc((size_t)n_changed * sizeof(cbm_file_info_t)) : NULL;
+    int ci = 0;
+    for (int i = 0; i < file_count; i++) {
+        if (is_changed[i]) {
+            changed_files[ci++] = files[i];
+        }
+    }
+    free(is_changed);
+
+    int rc = run_incremental_file_set(p, db_path, changed_files, ci, deleted, deleted_count, files,
+                                      file_count);
+
+    free(changed_files);
+    for (int i = 0; i < deleted_count; i++) {
+        free(deleted[i]);
+    }
+    free(deleted);
+    return rc;
 }

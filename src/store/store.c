@@ -124,6 +124,7 @@ struct cbm_store {
     sqlite3_stmt *stmt_delete_edges_by_type;
 
     sqlite3_stmt *stmt_upsert_project;
+    sqlite3_stmt *stmt_set_project_indexed_head;
     sqlite3_stmt *stmt_get_project;
     sqlite3_stmt *stmt_list_projects;
     sqlite3_stmt *stmt_delete_project;
@@ -216,7 +217,8 @@ static int init_schema(cbm_store_t *s) {
         "CREATE TABLE IF NOT EXISTS projects ("
         "  name TEXT PRIMARY KEY,"
         "  indexed_at TEXT NOT NULL,"
-        "  root_path TEXT NOT NULL"
+        "  root_path TEXT NOT NULL,"
+        "  indexed_head TEXT DEFAULT ''"
         ");"
         "CREATE TABLE IF NOT EXISTS file_hashes ("
         "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
@@ -259,6 +261,26 @@ static int init_schema(cbm_store_t *s) {
     int rc = exec_sql(s, ddl);
     if (rc != CBM_STORE_OK) {
         return rc;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    bool has_indexed_head = false;
+    if (sqlite3_prepare_v2(s->db, "PRAGMA table_info(projects);", CBM_NOT_FOUND, &stmt, NULL) ==
+        SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *col = (const char *)sqlite3_column_text(stmt, 1);
+            if (col && strcmp(col, "indexed_head") == 0) {
+                has_indexed_head = true;
+                break;
+            }
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (!has_indexed_head) {
+        rc = exec_sql(s, "ALTER TABLE projects ADD COLUMN indexed_head TEXT DEFAULT '';");
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
     }
 
     /* FTS5 contentless virtual table for BM25 full-text search.
@@ -706,6 +728,7 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_delete_edges_by_type);
 
     finalize_stmt(&s->stmt_upsert_project);
+    finalize_stmt(&s->stmt_set_project_indexed_head);
     finalize_stmt(&s->stmt_get_project);
     finalize_stmt(&s->stmt_list_projects);
     finalize_stmt(&s->stmt_delete_project);
@@ -889,10 +912,35 @@ int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_
     return CBM_STORE_OK;
 }
 
+int cbm_store_set_project_indexed_head(cbm_store_t *s, const char *name,
+                                       const char *indexed_head) {
+    sqlite3_stmt *stmt = prepare_cached(
+        s, &s->stmt_set_project_indexed_head,
+        "UPDATE projects SET indexed_head = ?2, indexed_at = ?3 WHERE name = ?1;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    char ts[CBM_SZ_64];
+    iso_now(ts, sizeof(ts));
+
+    bind_text(stmt, SKIP_ONE, name);
+    bind_text(stmt, ST_COL_2, indexed_head ? indexed_head : "");
+    bind_text(stmt, ST_COL_3, ts);
+
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "set_project_indexed_head");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
 int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_get_project,
-                       "SELECT name, indexed_at, root_path FROM projects WHERE name = ?1;");
+                       "SELECT name, indexed_at, root_path, indexed_head FROM projects WHERE "
+                       "name = ?1;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -903,6 +951,7 @@ int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) 
         out->name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
         out->indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
         out->root_path = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
+        out->indexed_head = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_3));
         return CBM_STORE_OK;
     }
     return CBM_STORE_NOT_FOUND;
@@ -911,7 +960,8 @@ int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) 
 int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_list_projects,
-                       "SELECT name, indexed_at, root_path FROM projects ORDER BY name;");
+                       "SELECT name, indexed_at, root_path, indexed_head FROM projects ORDER BY "
+                       "name;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -929,6 +979,7 @@ int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
         arr[n].name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
         arr[n].indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
         arr[n].root_path = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
+        arr[n].indexed_head = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_3));
         n++;
     }
 
@@ -4736,6 +4787,7 @@ void cbm_project_free_fields(cbm_project_t *p) {
     free((void *)p->name);
     free((void *)p->indexed_at);
     free((void *)p->root_path);
+    free((void *)p->indexed_head);
 }
 
 void cbm_store_free_projects(cbm_project_t *projects, int count) {

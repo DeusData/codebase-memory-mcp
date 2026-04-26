@@ -254,7 +254,7 @@ static void print_help(void) {
     printf("\nTools: index_repository, search_graph, query_graph, trace_path,\n");
     printf("  get_code_snippet, get_graph_schema, get_architecture, search_code,\n");
     printf("  list_projects, delete_project, index_status, detect_changes,\n");
-    printf("  manage_adr, ingest_traces\n");
+    printf("  sync_files, sync_git_range, manage_adr, ingest_traces\n");
 }
 
 /* ── Main ───────────────────────────────────────────────────────── */

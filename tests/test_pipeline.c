@@ -10,6 +10,7 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
+#include "discover/discover.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -4525,6 +4526,68 @@ TEST(incremental_new_file_added) {
     PASS();
 }
 
+TEST(incremental_explicit_files_handles_rename) {
+    /* Full index, rename a file, explicit incremental should delete old path
+     * nodes and index the new path without relying on working-tree dirtiness. */
+    if (setup_incremental_repo() != 0) {
+        SKIP("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    char old_path[512];
+    char new_path[512];
+    snprintf(old_path, sizeof(old_path), "%s/helper.go", g_incr_tmpdir);
+    snprintf(new_path, sizeof(new_path), "%s/renamed.go", g_incr_tmpdir);
+    ASSERT_EQ(rename(old_path, new_path), 0);
+
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL, .ignore_file = NULL, .max_file_size = 0};
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    ASSERT_EQ(cbm_discover(g_incr_tmpdir, &opts, &files, &file_count), 0);
+
+    cbm_file_info_t changed = {0};
+    for (int i = 0; i < file_count; i++) {
+        if (strcmp(files[i].rel_path, "renamed.go") == 0) {
+            changed = files[i];
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(changed.rel_path);
+
+    char *deleted[] = {"helper.go"};
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run_incremental_files(p, g_incr_dbpath, &changed, 1, deleted, 1, files,
+                                                 file_count),
+              0);
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    cbm_store_find_nodes_by_file(s, project, "helper.go", &nodes, &node_count);
+    ASSERT_EQ(node_count, 0);
+    cbm_store_free_nodes(nodes, node_count);
+
+    nodes = NULL;
+    node_count = 0;
+    cbm_store_find_nodes_by_file(s, project, "renamed.go", &nodes, &node_count);
+    ASSERT_GT(node_count, 0);
+    cbm_store_free_nodes(nodes, node_count);
+    cbm_store_close(s);
+
+    cbm_discover_free(files, file_count);
+    free(project);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_k8s_manifest_indexed) {
     /* Full index with a k8s manifest, then add a new manifest via incremental.
      * Verifies that cbm_pipeline_pass_k8s() runs during incremental re-index. */
@@ -5354,6 +5417,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_detects_changed_file);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
+    RUN_TEST(incremental_explicit_files_handles_rename);
     RUN_TEST(incremental_k8s_manifest_indexed);
     RUN_TEST(incremental_kustomize_module_indexed);
     /* Resource management & internal helper tests */

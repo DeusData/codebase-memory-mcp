@@ -51,6 +51,7 @@ typedef struct {
     const char *name;
     const char *indexed_at; /* ISO 8601 */
     const char *root_path;
+    const char *indexed_head; /* git commit indexed by branch-sync, empty if unknown */
 } cbm_project_t;
 
 typedef struct {
@@ -258,6 +259,7 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path);
 /* ── Project CRUD ───────────────────────────────────────────────── */
 
 int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_path);
+int cbm_store_set_project_indexed_head(cbm_store_t *s, const char *name, const char *indexed_head);
 int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out);
 int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count);
 int cbm_store_delete_project(cbm_store_t *s, const char *name);

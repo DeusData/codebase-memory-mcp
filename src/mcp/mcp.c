@@ -43,6 +43,7 @@ enum {
 #include <sqlite3.h>
 #include "cypher/cypher.h"
 #include "pipeline/pipeline.h"
+#include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_cross_repo.h"
 #include "cli/cli.h"
 #include "watcher/watcher.h"
@@ -56,6 +57,7 @@ enum {
 #include "foundation/str_util.h"
 #include "foundation/compat_regex.h"
 #include "pipeline/artifact.h"
+#include "discover/discover.h"
 
 #ifdef _WIN32
 #include <process.h> /* _getpid */
@@ -387,6 +389,28 @@ static const tool_def_t TOOLS[] = {
      "\"string\",\"default\":\"main\"},\"since\":{\"type\":\"string\",\"description\":"
      "\"Git ref or date to compare from (e.g. HEAD~5, v0.5.0, 2026-01-01)\"}},\"required\":"
      "[\"project\"]}"},
+
+    {"sync_files",
+     "Incrementally sync an indexed project from explicit changed/deleted file lists. Respects "
+     ".cbmignore by discovering the current repository and only re-indexing changed files that "
+     "are still indexable.",
+     "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\",\"description\":"
+     "\"Path to the repository\"},\"changed_files\":{\"type\":\"array\",\"items\":{\"type\":"
+     "\"string\"},\"description\":\"Relative paths to re-index\"},\"deleted_files\":{\"type\":"
+     "\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Relative paths to delete from "
+     "the index\"},\"indexed_head\":{\"type\":\"string\",\"description\":\"Optional git commit "
+     "SHA recorded as the indexed head\"},\"mode\":{\"type\":\"string\",\"enum\":[\"full\","
+     "\"moderate\",\"fast\"],\"default\":\"full\"}},\"required\":[\"repo_path\"]}"},
+
+    {"sync_git_range",
+     "Incrementally sync an indexed project from a git range. Uses git diff --name-status -M "
+     "old_ref new_ref, re-indexes A/M/R new paths, and deletes D/R old paths.",
+     "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\",\"description\":"
+     "\"Path to the repository\"},\"old_ref\":{\"type\":\"string\",\"description\":\"Old git "
+     "ref passed by post-checkout\"},\"new_ref\":{\"type\":\"string\",\"description\":\"New git "
+     "ref passed by post-checkout\"},\"mode\":{\"type\":\"string\",\"enum\":[\"full\","
+     "\"moderate\",\"fast\"],\"default\":\"full\"}},\"required\":[\"repo_path\",\"old_ref\","
+     "\"new_ref\"]}"},
 
     {"manage_adr", "Create or update Architecture Decision Records",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
@@ -1576,6 +1600,12 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
         yyjson_mut_obj_add_int(doc, root, "edges", edges);
         yyjson_mut_obj_add_str(doc, root, "status", nodes > 0 ? "ready" : "empty");
+        cbm_project_t proj = {0};
+        if (cbm_store_get_project(store, project, &proj) == CBM_STORE_OK) {
+            yyjson_mut_obj_add_strcpy(doc, root, "indexed_head",
+                                      proj.indexed_head ? proj.indexed_head : "");
+            cbm_project_free_fields(&proj);
+        }
         if (nodes == 0) {
             yyjson_mut_obj_add_str(
                 doc, root, "hint",
@@ -2089,6 +2119,291 @@ static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
     return root;
 }
 
+/* ── sync helpers ──────────────────────────────────────────────── */
+
+typedef struct {
+    char **items;
+    int count;
+    int cap;
+} sync_path_list_t;
+
+static void sync_path_list_free(sync_path_list_t *list) {
+    if (!list) {
+        return;
+    }
+    for (int i = 0; i < list->count; i++) {
+        free(list->items[i]);
+    }
+    free(list->items);
+    memset(list, 0, sizeof(*list));
+}
+
+static bool sync_path_list_contains(const sync_path_list_t *list, const char *path) {
+    for (int i = 0; list && i < list->count; i++) {
+        if (strcmp(list->items[i], path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool sync_rel_path_valid(const char *path) {
+    if (!path || !path[0] || path[0] == '/' || strstr(path, "\\")) {
+        return false;
+    }
+    const char *p = path;
+    while (*p) {
+        if ((p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == '\0')) ||
+            (p[0] == '/' && p[1] == '.' && p[2] == '.' &&
+             (p[3] == '/' || p[3] == '\0'))) {
+            return false;
+        }
+        p++;
+    }
+    return true;
+}
+
+static bool sync_path_list_add(sync_path_list_t *list, const char *path) {
+    if (!sync_rel_path_valid(path) || sync_path_list_contains(list, path)) {
+        return false;
+    }
+    if (list->count >= list->cap) {
+        int new_cap = list->cap ? list->cap * PAIR_LEN : MCP_N_DEFAULTS_4;
+        char **new_items = realloc(list->items, (size_t)new_cap * sizeof(char *));
+        if (!new_items) {
+            return false;
+        }
+        list->items = new_items;
+        list->cap = new_cap;
+    }
+    list->items[list->count] = heap_strdup(path);
+    if (!list->items[list->count]) {
+        return false;
+    }
+    list->count++;
+    return true;
+}
+
+static void sync_parse_path_array(const char *args, const char *key, sync_path_list_t *out) {
+    yyjson_doc *doc = yyjson_read(args, strlen(args), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *arr = root ? yyjson_obj_get(root, key) : NULL;
+    if (arr && yyjson_is_arr(arr)) {
+        size_t idx;
+        size_t max;
+        yyjson_val *val;
+        yyjson_arr_foreach(arr, idx, max, val) {
+            if (yyjson_is_str(val)) {
+                sync_path_list_add(out, yyjson_get_str(val));
+            }
+        }
+    }
+    yyjson_doc_free(doc);
+}
+
+static cbm_index_mode_t parse_index_mode_arg(const char *mode_str) {
+    if (mode_str && strcmp(mode_str, "fast") == 0) {
+        return CBM_MODE_FAST;
+    }
+    if (mode_str && strcmp(mode_str, "moderate") == 0) {
+        return CBM_MODE_MODERATE;
+    }
+    return CBM_MODE_FULL;
+}
+
+static char *git_single_line(const char *repo_path, const char *fmt_ref, const char *ref) {
+    if (!cbm_validate_shell_arg(repo_path) || (ref && !cbm_validate_shell_arg(ref))) {
+        return NULL;
+    }
+    char cmd[CBM_SZ_2K];
+#ifdef _WIN32
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" %s \"%s\" 2>NUL", repo_path, fmt_ref,
+             ref ? ref : "");
+#else
+    snprintf(cmd, sizeof(cmd), "git -C '%s' %s '%s' 2>/dev/null", repo_path, fmt_ref,
+             ref ? ref : "");
+#endif
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return NULL;
+    }
+    char line[CBM_SZ_256];
+    char *out = NULL;
+    if (fgets(line, sizeof(line), fp)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len > 0) {
+            out = heap_strdup(line);
+        }
+    }
+    (void)cbm_pclose(fp);
+    return out;
+}
+
+static char *resolve_git_head(const char *repo_path, const char *ref) {
+    return git_single_line(repo_path, "rev-parse", ref ? ref : "HEAD");
+}
+
+static void update_project_indexed_head(const char *project, const char *repo_path,
+                                        const char *indexed_head) {
+    char *head = indexed_head && indexed_head[0] ? heap_strdup(indexed_head)
+                                                : resolve_git_head(repo_path, "HEAD");
+    if (!head) {
+        return;
+    }
+    char db_path[CBM_SZ_1K];
+    project_db_path(project, db_path, sizeof(db_path));
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (store) {
+        cbm_store_set_project_indexed_head(store, project, head);
+        cbm_store_close(store);
+    }
+    free(head);
+}
+
+static int collect_changed_file_infos(const sync_path_list_t *requested, cbm_file_info_t *all_files,
+                                      int all_file_count, cbm_file_info_t **out) {
+    cbm_file_info_t *changed =
+        requested->count > 0 ? calloc((size_t)requested->count, sizeof(cbm_file_info_t)) : NULL;
+    int count = 0;
+    for (int i = 0; i < requested->count; i++) {
+        for (int j = 0; j < all_file_count; j++) {
+            if (strcmp(requested->items[i], all_files[j].rel_path) == 0) {
+                changed[count++] = all_files[j];
+                break;
+            }
+        }
+    }
+    *out = changed;
+    return count;
+}
+
+static int collect_deleted_paths(const char *repo_path, const sync_path_list_t *requested,
+                                 char ***out) {
+    char **deleted =
+        requested->count > 0 ? calloc((size_t)requested->count, sizeof(char *)) : NULL;
+    char ignore_path[CBM_SZ_1K];
+    snprintf(ignore_path, sizeof(ignore_path), "%s/.cbmignore", repo_path);
+    cbm_gitignore_t *ignore = cbm_gitignore_load(ignore_path);
+    int count = 0;
+    for (int i = 0; i < requested->count; i++) {
+        if (ignore && cbm_gitignore_matches(ignore, requested->items[i], false)) {
+            continue;
+        }
+        deleted[count++] = requested->items[i];
+    }
+    cbm_gitignore_free(ignore);
+    *out = deleted;
+    return count;
+}
+
+static void invalidate_cached_store(cbm_mcp_server_t *srv) {
+    if (srv->owns_store && srv->store) {
+        cbm_store_close(srv->store);
+        srv->store = NULL;
+    }
+    free(srv->current_project);
+    srv->current_project = NULL;
+}
+
+static int run_full_index_fallback(cbm_mcp_server_t *srv, const char *repo_path,
+                                   cbm_index_mode_t mode) {
+    cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
+    if (!p) {
+        return CBM_NOT_FOUND;
+    }
+    invalidate_cached_store(srv);
+    srv->active_pipeline = p;
+    int rc = cbm_pipeline_run(p);
+    srv->active_pipeline = NULL;
+    cbm_pipeline_free(p);
+    cbm_mem_collect();
+    invalidate_cached_store(srv);
+    return rc;
+}
+
+static char *run_sync_file_lists(cbm_mcp_server_t *srv, const char *repo_path,
+                                 sync_path_list_t *changed_paths,
+                                 sync_path_list_t *deleted_paths, const char *indexed_head,
+                                 cbm_index_mode_t mode) {
+    char *project_name = cbm_project_name_from_path(repo_path);
+    if (!project_name) {
+        return cbm_mcp_text_result("cannot derive project name", true);
+    }
+
+    cbm_discover_opts_t opts = {.mode = mode, .ignore_file = NULL, .max_file_size = 0};
+    cbm_file_info_t *all_files = NULL;
+    int all_file_count = 0;
+    int discover_rc = cbm_discover(repo_path, &opts, &all_files, &all_file_count);
+    if (discover_rc != 0) {
+        free(project_name);
+        return cbm_mcp_text_result("failed to discover repository files", true);
+    }
+
+    cbm_file_info_t *changed_files = NULL;
+    int changed_count =
+        collect_changed_file_infos(changed_paths, all_files, all_file_count, &changed_files);
+    char **deleted_files = NULL;
+    int deleted_count = collect_deleted_paths(repo_path, deleted_paths, &deleted_files);
+
+    char db_path[CBM_SZ_1K];
+    project_db_path(project_name, db_path, sizeof(db_path));
+
+    cbm_pipeline_lock();
+    cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
+    if (p) {
+        srv->active_pipeline = p;
+    }
+    int rc = p ? cbm_pipeline_run_incremental_files(p, db_path, changed_files, changed_count,
+                                                    deleted_files, deleted_count, all_files,
+                                                    all_file_count)
+               : CBM_NOT_FOUND;
+    srv->active_pipeline = NULL;
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+
+    bool fallback = false;
+    if (rc != 0) {
+        fallback = true;
+        rc = run_full_index_fallback(srv, repo_path, mode);
+    } else {
+        invalidate_cached_store(srv);
+    }
+    cbm_pipeline_unlock();
+
+    if (rc == 0) {
+        update_project_indexed_head(project_name, repo_path, indexed_head);
+    }
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "project", project_name);
+    yyjson_mut_obj_add_str(doc, root, "status", rc == 0 ? "synced" : "error");
+    yyjson_mut_obj_add_int(doc, root, "changed_count", changed_count);
+    yyjson_mut_obj_add_int(doc, root, "deleted_count", deleted_count);
+    yyjson_mut_obj_add_int(doc, root, "ignored_changed_count", changed_paths->count - changed_count);
+    yyjson_mut_obj_add_bool(doc, root, "fallback_full_index", fallback);
+    if (indexed_head && indexed_head[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "indexed_head", indexed_head);
+    }
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+
+    free(deleted_files);
+    free(changed_files);
+    cbm_discover_free(all_files, all_file_count);
+    free(project_name);
+
+    char *result = cbm_mcp_text_result(json, rc != 0);
+    free(json);
+    return result;
+}
+
 /* ── index_repository ─────────────────────────────────────────── */
 
 /* Handle mode="cross-repo-intelligence" — extract to reduce complexity. */
@@ -2278,6 +2593,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     }
 
     if (rc == 0) {
+        update_project_indexed_head(project_name, repo_path, NULL);
         build_index_success_response(srv, doc, root, project_name, repo_path, persistence);
     }
 
@@ -3439,6 +3755,140 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+/* ── sync_files / sync_git_range ───────────────────────────────── */
+
+static char *handle_sync_files(cbm_mcp_server_t *srv, const char *args) {
+    char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+    char *indexed_head = cbm_mcp_get_string_arg(args, "indexed_head");
+    char *mode_str = cbm_mcp_get_string_arg(args, "mode");
+    cbm_normalize_path_sep(repo_path);
+
+    if (!repo_path) {
+        free(indexed_head);
+        free(mode_str);
+        return cbm_mcp_text_result("repo_path is required", true);
+    }
+
+    sync_path_list_t changed = {0};
+    sync_path_list_t deleted = {0};
+    sync_parse_path_array(args, "changed_files", &changed);
+    sync_parse_path_array(args, "deleted_files", &deleted);
+
+    char *result = run_sync_file_lists(srv, repo_path, &changed, &deleted, indexed_head,
+                                       parse_index_mode_arg(mode_str));
+
+    sync_path_list_free(&changed);
+    sync_path_list_free(&deleted);
+    free(repo_path);
+    free(indexed_head);
+    free(mode_str);
+    return result;
+}
+
+static char *handle_sync_git_range(cbm_mcp_server_t *srv, const char *args) {
+    char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+    char *old_ref = cbm_mcp_get_string_arg(args, "old_ref");
+    char *new_ref = cbm_mcp_get_string_arg(args, "new_ref");
+    char *mode_str = cbm_mcp_get_string_arg(args, "mode");
+    cbm_normalize_path_sep(repo_path);
+
+    if (!repo_path || !old_ref || !new_ref) {
+        free(repo_path);
+        free(old_ref);
+        free(new_ref);
+        free(mode_str);
+        return cbm_mcp_text_result("repo_path, old_ref, and new_ref are required", true);
+    }
+    if (!cbm_validate_shell_arg(repo_path) || !cbm_validate_shell_arg(old_ref) ||
+        !cbm_validate_shell_arg(new_ref)) {
+        free(repo_path);
+        free(old_ref);
+        free(new_ref);
+        free(mode_str);
+        return cbm_mcp_text_result("repo_path or refs contain invalid characters", true);
+    }
+
+    char cmd[CBM_SZ_2K];
+#ifdef _WIN32
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" diff --name-status -M \"%s\" \"%s\" 2>NUL",
+             repo_path, old_ref, new_ref);
+#else
+    snprintf(cmd, sizeof(cmd), "git -C '%s' diff --name-status -M '%s' '%s' 2>/dev/null",
+             repo_path, old_ref, new_ref);
+#endif
+
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        free(repo_path);
+        free(old_ref);
+        free(new_ref);
+        free(mode_str);
+        return cbm_mcp_text_result("git diff failed: cannot execute git", true);
+    }
+
+    sync_path_list_t changed = {0};
+    sync_path_list_t deleted = {0};
+    char line[CBM_SZ_1K];
+    int diff_rows = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len == 0) {
+            continue;
+        }
+        char *status = line;
+        char *path1 = strchr(line, '\t');
+        if (!path1) {
+            continue;
+        }
+        *path1++ = '\0';
+        char *path2 = strchr(path1, '\t');
+        if (path2) {
+            *path2++ = '\0';
+        }
+
+        diff_rows++;
+        if (status[0] == 'R') {
+            if (path2) {
+                sync_path_list_add(&deleted, path1);
+                sync_path_list_add(&changed, path2);
+            }
+        } else if (status[0] == 'D') {
+            sync_path_list_add(&deleted, path1);
+        } else if (status[0] == 'C') {
+            sync_path_list_add(&changed, path2 ? path2 : path1);
+        } else if (status[0] == 'A' || status[0] == 'M' || status[0] == 'T') {
+            sync_path_list_add(&changed, path1);
+        }
+    }
+    int git_status = cbm_pclose(fp);
+    if (git_status != 0 && diff_rows == 0) {
+        sync_path_list_free(&changed);
+        sync_path_list_free(&deleted);
+        free(repo_path);
+        free(old_ref);
+        free(new_ref);
+        free(mode_str);
+        return cbm_mcp_text_result("git diff failed: check old_ref/new_ref", true);
+    }
+
+    char *resolved_head = resolve_git_head(repo_path, new_ref);
+    const char *head_for_status = resolved_head ? resolved_head : new_ref;
+    char *result = run_sync_file_lists(srv, repo_path, &changed, &deleted, head_for_status,
+                                       parse_index_mode_arg(mode_str));
+
+    free(resolved_head);
+    sync_path_list_free(&changed);
+    sync_path_list_free(&deleted);
+    free(repo_path);
+    free(old_ref);
+    free(new_ref);
+    free(mode_str);
+    return result;
+}
+
 /* ── manage_adr ───────────────────────────────────────────────── */
 
 /* ADR "sections" mode: list markdown headers from file. */
@@ -3632,6 +4082,12 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "detect_changes") == 0) {
         return handle_detect_changes(srv, args_json);
+    }
+    if (strcmp(tool_name, "sync_files") == 0) {
+        return handle_sync_files(srv, args_json);
+    }
+    if (strcmp(tool_name, "sync_git_range") == 0) {
+        return handle_sync_git_range(srv, args_json);
     }
     if (strcmp(tool_name, "manage_adr") == 0) {
         return handle_manage_adr(srv, args_json);
