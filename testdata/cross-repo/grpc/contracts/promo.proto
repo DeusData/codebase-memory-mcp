@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package promo;
+
+option csharp_namespace = "Promo.V1";
+option go_package = "example.com/promo/promov1";
+option java_package = "com.example.promo";
+
+service PromoCodeService {
+    rpc GetVoucher(GetVoucherRequest) returns (GetVoucherResponse);
+    rpc RedeemVoucher(RedeemVoucherRequest) returns (RedeemVoucherResponse);
+}
+
+message GetVoucherRequest {
+    string voucher_id = 1;
+}
+
+message GetVoucherResponse {
+    string voucher_id = 1;
+    int32 discount_percent = 2;
+    bool is_valid = 3;
+}
+
+message RedeemVoucherRequest {
+    string voucher_id = 1;
+    string user_id = 2;
+}
+
+message RedeemVoucherResponse {
+    bool success = 1;
+    string error_message = 2;
+}
