@@ -5528,9 +5528,9 @@ TEST(idl_scan_emits_grpc_calls_for_java_blocking_stub) {
     PASS();
 }
 
-TEST(idl_scan_skips_unknown_service_for_producer_call) {
-    /* HttpClient looks like a stub-suffix but isn't a known proto service —
-     * pass should not emit a GRPC_CALLS edge for it. */
+TEST(idl_scan_denylist_skips_httpclient) {
+    /* System.Net.Http.HttpClient ends in "Client" but is on the deny prefix
+     * list — pass should not emit a GRPC_CALLS edge or stray Route. */
     cbm_gbuf_t *gb = cbm_gbuf_new("test-proj", "/tmp/test");
     ASSERT_NOT_NULL(gb);
 
@@ -5568,6 +5568,115 @@ TEST(idl_scan_skips_unknown_service_for_producer_call) {
     int grpc_count = 0;
     cbm_gbuf_find_edges_by_source_type(gb, caller_id, "GRPC_CALLS", &grpc, &grpc_count);
     ASSERT_EQ(grpc_count, 0);
+
+    /* Also assert no stray Route was emitted for "Http" (HttpClient minus Client). */
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "__route__grpc__Http/GetAsync"));
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(idl_scan_emits_grpc_calls_without_local_proto) {
+    /* NuGet/Maven/PyPI-distributed contracts pattern: producer repo has the
+     * generated client class assignment + call but NO local .proto file.
+     * Phase D in pass_cross_repo.c handles the actual cross-repo match
+     * against the consumer's Routes. Pass should still emit the GRPC_CALLS
+     * edge so Phase D has something to match. */
+    cbm_gbuf_t *gb = cbm_gbuf_new("gateway", "/tmp/gateway");
+    ASSERT_NOT_NULL(gb);
+
+    /* Note: NO Class node from a .proto file — gateway consumes via NuGet. */
+    int64_t caller_id =
+        cbm_gbuf_upsert_node(gb, "Method", "FetchVoucher",
+                             "gateway.Promo.PromoController.FetchVoucher",
+                             "Controllers/PromoController.cs", 20, 35, "{}");
+
+    CBMTypeAssign ta[] = {{
+        .var_name = "_promoClient",
+        .type_name = "Snoonu.Promo.V1.PromoCodeServiceClient",
+        .enclosing_func_qn = "gateway.Promo.PromoController.FetchVoucher",
+    }};
+    CBMCall calls[] = {{
+        .callee_name = "_promoClient.GetVoucherAsync",
+        .enclosing_func_qn = "gateway.Promo.PromoController.FetchVoucher",
+    }};
+    CBMFileResult result;
+    mk_synthetic_result(&result, ta, 1, calls, 1);
+
+    CBMFileResult *cache[1] = {&result};
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "gateway",
+        .repo_path = "/tmp/gateway",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+        .result_cache = cache,
+    };
+    cbm_file_info_t fi = {.rel_path = "Controllers/PromoController.cs"};
+
+    int rc = cbm_pipeline_pass_idl_scan(&ctx, &fi, 1);
+    ASSERT_EQ(rc, 0);
+
+    /* Route is created locally even without a .proto — Phase D matches it
+     * against the consumer repo's Route by QN. */
+    const cbm_gbuf_node_t *route =
+        cbm_gbuf_find_by_qn(gb, "__route__grpc__PromoCodeService/GetVoucher");
+    ASSERT_NOT_NULL(route);
+
+    const cbm_gbuf_edge_t **grpc = NULL;
+    int grpc_count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, caller_id, "GRPC_CALLS", &grpc, &grpc_count);
+    ASSERT_EQ(grpc_count, 1);
+    ASSERT_EQ(grpc[0]->target_id, route->id);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(idl_scan_resolves_class_field_assigned_in_constructor) {
+    /* C# pattern: `_client = new XClient(channel)` in the constructor,
+     * `_client.Method(...)` in another method on the same class. The
+     * assignment's enclosing_func_qn (ctor) differs from the call site's
+     * enclosing_func_qn (method). File-scope fallback should bridge them. */
+    cbm_gbuf_t *gb = cbm_gbuf_new("svc", "/tmp/svc");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t method_id =
+        cbm_gbuf_upsert_node(gb, "Method", "DoWork", "svc.Svc.MyClass.DoWork",
+                             "Svc/MyClass.cs", 30, 40, "{}");
+
+    CBMTypeAssign ta[] = {{
+        .var_name = "_client",
+        .type_name = "Promo.V1.PromoCodeServiceClient",
+        .enclosing_func_qn = "svc.Svc.MyClass.ctor", /* assigned in ctor */
+    }};
+    CBMCall calls[] = {{
+        .callee_name = "_client.GetVoucherAsync",
+        .enclosing_func_qn = "svc.Svc.MyClass.DoWork", /* called from method */
+    }};
+    CBMFileResult result;
+    mk_synthetic_result(&result, ta, 1, calls, 1);
+
+    CBMFileResult *cache[1] = {&result};
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "svc",
+        .repo_path = "/tmp/svc",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+        .result_cache = cache,
+    };
+    cbm_file_info_t fi = {.rel_path = "Svc/MyClass.cs"};
+
+    int rc = cbm_pipeline_pass_idl_scan(&ctx, &fi, 1);
+    ASSERT_EQ(rc, 0);
+
+    const cbm_gbuf_edge_t **grpc = NULL;
+    int grpc_count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, method_id, "GRPC_CALLS", &grpc, &grpc_count);
+    ASSERT_EQ(grpc_count, 1);
 
     cbm_gbuf_free(gb);
     PASS();
@@ -5856,5 +5965,7 @@ SUITE(pipeline) {
     RUN_TEST(idl_scan_emits_grpc_calls_for_python_stub);
     RUN_TEST(idl_scan_emits_grpc_calls_for_csharp_client_with_async);
     RUN_TEST(idl_scan_emits_grpc_calls_for_java_blocking_stub);
-    RUN_TEST(idl_scan_skips_unknown_service_for_producer_call);
+    RUN_TEST(idl_scan_denylist_skips_httpclient);
+    RUN_TEST(idl_scan_emits_grpc_calls_without_local_proto);
+    RUN_TEST(idl_scan_resolves_class_field_assigned_in_constructor);
 }

@@ -48,7 +48,6 @@ enum {
     IDL_NAME_BUF = 256,
     IDL_LOG_BUF = 16,
     IDL_VAR_INIT_CAP = 16,
-    IDL_SVC_INIT_CAP = 8,
 };
 
 #include "pipeline/pipeline.h"
@@ -308,73 +307,56 @@ static int idl_bind_consumer_handlers(cbm_gbuf_t *gbuf) {
  * Go grpc-go uses pointer types like *PromoCodeClient produced by NewPromoCodeClient(conn);
  * extracting the type from the call expression rather than a typed assignment is feasible
  * but needs more plumbing — left as a follow-up.
+ *
+ * Note: producer-side detection runs WITHOUT requiring a local .proto file.
+ * In real microservice fleets, contracts are commonly distributed via
+ * NuGet/Maven/PyPI packages (e.g. `Snoonu.PromoCodeService.Contracts`) so the
+ * consumer never has the .proto in source. pass_cross_repo's Phase D matches
+ * GRPC_CALLS edges against Route nodes in TARGET stores, so consumer-side
+ * indexing of the contracts repo (or wherever the .proto lives) is what
+ * actually closes the loop. False-positive surface is limited by:
+ *   1. Suffix shape (BlockingStub/FutureStub/Stub are gRPC-conventional)
+ *   2. Type-name denylist (System.Net.*, Microsoft.Extensions.Http, Refit, ...)
+ *   3. Phase D filter — non-matching GRPC_CALLS produce no CROSS_GRPC_CALLS
  */
 static const char *const k_grpc_client_suffixes[] = {
     "BlockingStub", "FutureStub", "AsyncStub", "AsyncClient", "Stub", "Client", NULL,
 };
 
-/* In-pass index of proto-derived service names (Class nodes from .proto files).
- * Built once during route emission so producer-side detection can validate the
- * derived service name actually corresponds to an indexed gRPC service. */
-typedef struct {
-    char **names;
-    int count;
-    int cap;
-} idl_service_set_t;
+/* Type-name prefixes that look like client/stub suffixes but are definitively
+ * NOT gRPC. Matched as substring against the (possibly qualified) type_name.
+ * Keep the list short; Phase D filters anything that slips through. */
+static const char *const k_non_grpc_type_markers[] = {
+    "System.Net.",          /* HttpClient, WebClient, TcpClient, etc. */
+    "System.Web.",          /* legacy WebForms / WebClient */
+    "Microsoft.Extensions.Http", /* IHttpClientFactory, HttpClient DI */
+    "RestSharp",            /* REST client, not gRPC */
+    "Refit",                /* attribute-routed REST client */
+    "Flurl",                /* fluent HTTP client */
+    "java.net.http",        /* JDK HttpClient */
+    "okhttp3",              /* OkHttp */
+    "reqwest",              /* Rust HTTP */
+    "urllib",               /* Python HTTP */
+    "httpx",                /* Python HTTP */
+    NULL,
+};
 
-static void idl_service_set_init(idl_service_set_t *s) {
-    s->names = NULL;
-    s->count = 0;
-    s->cap = 0;
-}
-
-static void idl_service_set_add(idl_service_set_t *s, const char *name) {
-    if (!name || !name[0]) {
-        return;
-    }
-    for (int i = 0; i < s->count; i++) {
-        if (strcmp(s->names[i], name) == 0) {
-            return;
-        }
-    }
-    if (s->count >= s->cap) {
-        int new_cap = s->cap == 0 ? IDL_SVC_INIT_CAP : s->cap * 2;
-        char **grow = realloc(s->names, (size_t)new_cap * sizeof(char *));
-        if (!grow) {
-            return;
-        }
-        s->names = grow;
-        s->cap = new_cap;
-    }
-    s->names[s->count] = strdup(name);
-    if (s->names[s->count]) {
-        s->count++;
-    }
-}
-
-static bool idl_service_set_contains(const idl_service_set_t *s, const char *name) {
-    if (!name) {
+static bool idl_type_is_denylisted(const char *type_name) {
+    if (!type_name) {
         return false;
     }
-    for (int i = 0; i < s->count; i++) {
-        if (strcmp(s->names[i], name) == 0) {
+    for (int i = 0; k_non_grpc_type_markers[i]; i++) {
+        if (strstr(type_name, k_non_grpc_type_markers[i]) != NULL) {
             return true;
         }
     }
     return false;
 }
 
-static void idl_service_set_free(idl_service_set_t *s) {
-    for (int i = 0; i < s->count; i++) {
-        free(s->names[i]);
-    }
-    free(s->names);
-    s->names = NULL;
-    s->count = 0;
-    s->cap = 0;
-}
-
-/* Per-function scoped record: var name → derived service name. */
+/* Per-file scoped record: var name → derived service name. enclosing_qn is
+ * preferred for matching but lookup falls back to file-scope when call-site
+ * and assignment-site scopes differ (e.g., C# class field assigned in ctor,
+ * accessed in a method). */
 typedef struct {
     char *enclosing_qn;
     char *var_name;
@@ -422,17 +404,23 @@ static const idl_stub_var_t *idl_stub_var_arr_find(const idl_stub_var_arr_t *a,
     if (!var_name) {
         return NULL;
     }
+    /* Pass 1: prefer same-function scope match. */
+    if (enclosing_qn && enclosing_qn[0]) {
+        for (int i = 0; i < a->count; i++) {
+            const idl_stub_var_t *e = &a->items[i];
+            if (strcmp(e->var_name, var_name) == 0 && e->enclosing_qn &&
+                strcmp(enclosing_qn, e->enclosing_qn) == 0) {
+                return e;
+            }
+        }
+    }
+    /* Pass 2: file-scope fallback. Covers class fields (assigned in ctor,
+     * called in methods) and module-scope vars accessed from inner functions. */
     for (int i = 0; i < a->count; i++) {
         const idl_stub_var_t *e = &a->items[i];
-        if (strcmp(e->var_name, var_name) != 0) {
-            continue;
+        if (strcmp(e->var_name, var_name) == 0) {
+            return e;
         }
-        /* Require enclosing QN match when both sides specify one; allow a NULL
-         * call-site enclosing to match any (module-scope variables). */
-        if (enclosing_qn && e->enclosing_qn && strcmp(enclosing_qn, e->enclosing_qn) != 0) {
-            continue;
-        }
-        return e;
     }
     return NULL;
 }
@@ -460,10 +448,17 @@ static const char *idl_type_basename(const char *qualified) {
 }
 
 /* Scan one CBMFileResult's type_assigns; for each assignment whose RHS type
- * matches a stub/client suffix AND the suffix-stripped base name matches a
- * known proto service, record (enclosing_qn, var_name, service_name). */
+ * matches a stub/client suffix and is not denylisted, record
+ * (enclosing_qn, var_name, service_name).
+ *
+ * Detection runs WITHOUT requiring a local Route in the gbuf: in real
+ * microservice fleets contracts ship via NuGet/Maven/PyPI and the producer
+ * repo never has the .proto in source. Phase D in pass_cross_repo.c handles
+ * the actual cross-repo match; non-matching GRPC_CALLS edges produced here
+ * are inert (no CROSS_GRPC_CALLS) and cost is one stray local Route per
+ * unique stub type. The denylist (k_non_grpc_type_markers) cuts off the
+ * obvious false positives like System.Net.Http.HttpClient. */
 static void idl_collect_stub_vars_for_file(const CBMFileResult *result,
-                                           const idl_service_set_t *known_services,
                                            idl_stub_var_arr_t *out) {
     if (!result) {
         return;
@@ -473,13 +468,12 @@ static void idl_collect_stub_vars_for_file(const CBMFileResult *result,
         if (!ta->var_name || !ta->type_name) {
             continue;
         }
+        if (idl_type_is_denylisted(ta->type_name)) {
+            continue;
+        }
         const char *base = idl_type_basename(ta->type_name);
         char *service = idl_strip_suffix(base, k_grpc_client_suffixes);
         if (!service || !service[0]) {
-            free(service);
-            continue;
-        }
-        if (!idl_service_set_contains(known_services, service)) {
             free(service);
             continue;
         }
@@ -578,38 +572,13 @@ static int idl_emit_producer_edges_for_file(cbm_pipeline_ctx_t *ctx, const cbm_f
     return emitted;
 }
 
-/* Build the proto-service set by scanning Class nodes with .proto file_path. */
-typedef struct {
-    idl_service_set_t *set;
-} idl_svc_collect_ctx_t;
-
-static void idl_svc_collect_visitor(const cbm_gbuf_node_t *node, void *userdata) {
-    idl_svc_collect_ctx_t *c = (idl_svc_collect_ctx_t *)userdata;
-    if (!node || !node->label || !node->file_path || !node->name) {
-        return;
-    }
-    if (strcmp(node->label, "Class") == 0 && idl_is_proto_file(node->file_path)) {
-        idl_service_set_add(c->set, node->name);
-    }
-}
-
 static int idl_emit_producer_edges(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                    int file_count) {
     if (!ctx->result_cache || file_count <= 0) {
         return 0;
     }
 
-    idl_service_set_t known_services;
-    idl_service_set_init(&known_services);
-    idl_svc_collect_ctx_t collect = {.set = &known_services};
-    cbm_gbuf_foreach_node(ctx->gbuf, idl_svc_collect_visitor, &collect);
-
     int total_emitted = 0;
-    if (known_services.count == 0) {
-        idl_service_set_free(&known_services);
-        return 0;
-    }
-
     for (int i = 0; i < file_count; i++) {
         const CBMFileResult *result = ctx->result_cache[i];
         if (!result) {
@@ -617,14 +586,13 @@ static int idl_emit_producer_edges(cbm_pipeline_ctx_t *ctx, const cbm_file_info_
         }
         idl_stub_var_arr_t stub_vars;
         idl_stub_var_arr_init(&stub_vars);
-        idl_collect_stub_vars_for_file(result, &known_services, &stub_vars);
+        idl_collect_stub_vars_for_file(result, &stub_vars);
         if (stub_vars.count > 0) {
             total_emitted += idl_emit_producer_edges_for_file(ctx, &files[i], result, &stub_vars);
         }
         idl_stub_var_arr_free(&stub_vars);
     }
 
-    idl_service_set_free(&known_services);
     return total_emitted;
 }
 
