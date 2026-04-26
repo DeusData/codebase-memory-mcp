@@ -186,6 +186,7 @@ PIPELINE_SRCS = \
     src/pipeline/pass_configures.c \
     src/pipeline/pass_configlink.c \
     src/pipeline/pass_route_nodes.c \
+    src/pipeline/pass_idl_scan.c \
     src/pipeline/pass_enrichment.c \
     src/pipeline/pass_envscan.c \
     src/pipeline/pass_compile_commands.c \

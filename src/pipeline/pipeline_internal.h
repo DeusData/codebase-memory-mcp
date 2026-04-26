@@ -363,6 +363,12 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                        int file_count);
 
+/* IDL-driven cross-repo binding for gRPC: emits Route nodes from .proto-derived
+ * service/rpc Class+Function definitions and HANDLES edges from server-stub
+ * subclasses. Runs after pass_calls. Idempotent. */
+int cbm_pipeline_pass_idl_scan(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                               int file_count);
+
 int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
 
 int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,

@@ -220,6 +220,7 @@ static void run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *change
         cbm_log_info("incremental.mode", "mode", "sequential", "changed", itoa_buf(ci));
         cbm_pipeline_pass_definitions(ctx, changed_files, ci);
         cbm_pipeline_pass_calls(ctx, changed_files, ci);
+        cbm_pipeline_pass_idl_scan(ctx, changed_files, ci);
         cbm_pipeline_pass_usages(ctx, changed_files, ci);
         cbm_pipeline_pass_semantic(ctx, changed_files, ci);
     }
