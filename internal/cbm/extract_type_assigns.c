@@ -55,6 +55,26 @@ static const char *extract_constructor_type(CBMArena *a, TSNode rhs, const char 
             if (fname && fname[0] >= 'A' && fname[0] <= 'Z') {
                 return fname;
             }
+            /* Lower-cased package prefix: Go-style `pb.NewFooClient(...)` and
+             * Java-style `fooGrpc.newBlockingStub(...)`. Accept the qualified
+             * name when the last segment matches a typed-stub factory pattern.
+             * Downstream pass_idl_scan handles factory→service inference; we
+             * just pass enough information through type_assigns. */
+            if (fname && fname[0]) {
+                const char *last = strrchr(fname, '.');
+                last = last ? last + 1 : fname;
+                bool is_factory = false;
+                if ((strncmp(last, "New", 3) == 0 || strncmp(last, "new", 3) == 0) && last[3]) {
+                    size_t llen = strlen(last);
+                    if ((llen > 6 && strcmp(last + llen - 6, "Client") == 0) ||
+                        (llen > 4 && strcmp(last + llen - 4, "Stub") == 0)) {
+                        is_factory = true;
+                    }
+                }
+                if (is_factory) {
+                    return fname;
+                }
+            }
         }
     }
 
