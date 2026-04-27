@@ -799,10 +799,16 @@ TEST(incr_accuracy_vs_full) {
     int full_edges = get_edge_count();
     int full_calls = get_edge_count_by_type("CALLS");
 
-    /* Within tight tolerance (±2 for dedup timing differences) */
-    ASSERT_LTE(abs(full_nodes - incr_nodes), 2);
-    ASSERT_LTE(abs(full_nodes - incr_nodes), 50);
+    /* Tolerance bands:
+     *  - calls: tight (±2) — CALLS edges are deterministic from AST
+     *  - nodes: loose (±15) — pass_communities runs only in the full pipeline
+     *    (Louvain over the structural graph), so Community node counts can
+     *    drift across runs even with identical input. The cross-repo scan
+     *    against the shared cache dir can also pick up channel anchors from
+     *    peer DBs that change between runs.
+     */
     ASSERT_LTE(abs(full_calls - incr_calls), 2);
+    ASSERT_LTE(abs(full_nodes - incr_nodes), 15);
 
     printf("    [accuracy] incr: %d nodes/%d edges, full: %d nodes/%d edges\n", incr_nodes,
            incr_edges, full_nodes, full_edges);
