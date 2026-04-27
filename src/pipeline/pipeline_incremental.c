@@ -14,6 +14,7 @@
 enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24, INCR_WAL_BUF = 1040 };
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
+#include "pipeline/servicelink.h"
 #include <stdio.h>
 #include <time.h>
 #include "pipeline/pipeline_internal.h"
@@ -433,6 +434,18 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     /* Step 7: Dump to disk */
     dump_and_persist(existing, db_path, project, files, file_count, cbm_pipeline_repo_path(p));
     cbm_gbuf_free(existing);
+
+    /* Cross-project endpoint matching — parity with run_post_extraction
+     * in pipeline.c. Must run after dump_and_persist so the just-updated
+     * DB is visible on disk. */
+    const char *cdir = cbm_resolve_cache_dir();
+    if (cdir) {
+        struct timespec t_xl;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t_xl);
+        cbm_cross_project_link(cdir);
+        cbm_log_info("pass.timing", "pass", "incr_crossrepolinks", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t_xl)));
+    }
 
     cbm_log_info("incremental.done", "elapsed_ms", itoa_buf((int)elapsed_ms(t0)));
     return 0;
