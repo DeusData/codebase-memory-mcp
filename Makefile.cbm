@@ -504,6 +504,20 @@ $(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(
 cbm: $(BUILD_DIR)/codebase-memory-mcp
 	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp"
 
+# Standalone debug tool: dump C# extraction results for one file.
+$(BUILD_DIR)/dump_csharp: $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_PROD) -o $@ \
+		tests/dump_csharp.c \
+		$(FOUNDATION_SRCS) \
+		$(SIMHASH_SRCS) $(SEMANTIC_SRCS) \
+		src/pipeline/worker_pool.c \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) \
+		$(OBJS_VENDORED_PROD) \
+		$(LDFLAGS)
+
+dump-csharp: $(BUILD_DIR)/dump_csharp
+	@echo "Built: $(BUILD_DIR)/dump_csharp"
+
 # ── Build with embedded UI (requires Node.js) ───────────────────
 
 # Swap embedded_stub.c for the generated embedded_assets.c
