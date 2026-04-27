@@ -48,6 +48,11 @@ export function GraphTab({ project }: GraphTabProps) {
     if (!data) return;
     const labels = new Set(data.nodes.map((n) => n.label));
     const types = new Set(data.edges.map((e) => e.type));
+    for (const lp of data.linked_projects ?? []) {
+      for (const n of lp.nodes) labels.add(n.label);
+      for (const e of lp.edges) types.add(e.type);
+      for (const e of lp.cross_edges) types.add(e.type);
+    }
     setEnabledLabels(labels);
     setEnabledEdgeTypes(types);
   }, [data]);
@@ -65,7 +70,21 @@ export function GraphTab({ project }: GraphTabProps) {
         nodeIds.has(e.target),
     );
 
-    return { nodes, edges, total_nodes: data.total_nodes };
+    const linked_projects = data.linked_projects?.map((lp) => {
+      const lpNodes = lp.nodes.filter((n) => enabledLabels.has(n.label));
+      const lpIds = new Set(lpNodes.map((n) => n.id));
+      const lpEdges = lp.edges.filter(
+        (e) =>
+          enabledEdgeTypes.has(e.type) && lpIds.has(e.source) && lpIds.has(e.target),
+      );
+      const crossEdges = lp.cross_edges.filter(
+        (e) =>
+          enabledEdgeTypes.has(e.type) && nodeIds.has(e.source) && lpIds.has(e.target),
+      );
+      return { ...lp, nodes: lpNodes, edges: lpEdges, cross_edges: crossEdges };
+    });
+
+    return { nodes, edges, total_nodes: data.total_nodes, linked_projects };
   }, [data, enabledLabels, enabledEdgeTypes]);
 
   useEffect(() => {
@@ -136,8 +155,15 @@ export function GraphTab({ project }: GraphTabProps) {
 
   const enableAll = useCallback(() => {
     if (!data) return;
-    setEnabledLabels(new Set(data.nodes.map((n) => n.label)));
-    setEnabledEdgeTypes(new Set(data.edges.map((e) => e.type)));
+    const labels = new Set(data.nodes.map((n) => n.label));
+    const types = new Set(data.edges.map((e) => e.type));
+    for (const lp of data.linked_projects ?? []) {
+      for (const n of lp.nodes) labels.add(n.label);
+      for (const e of lp.edges) types.add(e.type);
+      for (const e of lp.cross_edges) types.add(e.type);
+    }
+    setEnabledLabels(labels);
+    setEnabledEdgeTypes(types);
   }, [data]);
 
   const disableAll = useCallback(() => {
