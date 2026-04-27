@@ -39,6 +39,42 @@ enum {
 #define CR_MS_PER_SEC 1000.0
 #define CR_NS_PER_MS 1000000.0
 
+/* ── Messaging protocol → CROSS_* edge type mapping ──────────────
+ *
+ * Upstream owns HTTP/gRPC/GraphQL/tRPC via Route-QN matching, so those
+ * protocols are intentionally absent from this mapping: the messaging
+ * matcher in pass_crossrepolinks.c skips them via
+ * cbm_messaging_protocol_to_cross_edge() returning NULL, leaving upstream
+ * as the sole source of their CROSS_* edges.
+ */
+const char *const CBM_MESSAGING_CROSS_EDGE_TYPES[CBM_MESSAGING_CROSS_EDGE_TYPE_COUNT] = {
+    CBM_EDGE_CROSS_KAFKA_CALLS,        CBM_EDGE_CROSS_SQS_CALLS,
+    CBM_EDGE_CROSS_SNS_CALLS,          CBM_EDGE_CROSS_EVENTBRIDGE_CALLS,
+    CBM_EDGE_CROSS_PUBSUB_CALLS,       CBM_EDGE_CROSS_AMQP_CALLS,
+    CBM_EDGE_CROSS_MQTT_CALLS,         CBM_EDGE_CROSS_NATS_CALLS,
+    CBM_EDGE_CROSS_REDIS_PUBSUB_CALLS, CBM_EDGE_CROSS_WS_CALLS,
+    CBM_EDGE_CROSS_SSE_CALLS,
+};
+
+const char *cbm_messaging_protocol_to_cross_edge(const char *protocol) {
+    if (!protocol) {
+        return NULL;
+    }
+    if (strcmp(protocol, "kafka") == 0)        return CBM_EDGE_CROSS_KAFKA_CALLS;
+    if (strcmp(protocol, "sqs") == 0)          return CBM_EDGE_CROSS_SQS_CALLS;
+    if (strcmp(protocol, "sns") == 0)          return CBM_EDGE_CROSS_SNS_CALLS;
+    if (strcmp(protocol, "eventbridge") == 0)  return CBM_EDGE_CROSS_EVENTBRIDGE_CALLS;
+    if (strcmp(protocol, "pubsub") == 0)       return CBM_EDGE_CROSS_PUBSUB_CALLS;
+    if (strcmp(protocol, "rabbitmq") == 0)     return CBM_EDGE_CROSS_AMQP_CALLS;
+    if (strcmp(protocol, "amqp") == 0)         return CBM_EDGE_CROSS_AMQP_CALLS;
+    if (strcmp(protocol, "mqtt") == 0)         return CBM_EDGE_CROSS_MQTT_CALLS;
+    if (strcmp(protocol, "nats") == 0)         return CBM_EDGE_CROSS_NATS_CALLS;
+    if (strcmp(protocol, "redis_pubsub") == 0) return CBM_EDGE_CROSS_REDIS_PUBSUB_CALLS;
+    if (strcmp(protocol, "ws") == 0)           return CBM_EDGE_CROSS_WS_CALLS;
+    if (strcmp(protocol, "sse") == 0)          return CBM_EDGE_CROSS_SSE_CALLS;
+    return NULL;
+}
+
 /* TLS buffer for integer-to-string in log calls. */
 static CBM_TLS char cr_ibuf[CBM_SZ_32];
 static const char *cr_itoa(int v) {

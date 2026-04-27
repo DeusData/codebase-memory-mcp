@@ -1,12 +1,17 @@
 /*
- * pass_crossrepolinks.c — Cross-project protocol endpoint matching.
+ * pass_crossrepolinks.c — Cross-project messaging endpoint matching.
  *
  * Two entry points:
  *   1. cbm_persist_endpoints() — write discovered endpoints to a project's .db
  *   2. cbm_cross_project_link() — scan all project DBs, match producers to
- *      consumers across project boundaries, write to _crosslinks.db
+ *      consumers across project boundaries for messaging protocols, write
+ *      bidirectional CROSS_* edges into each project's edges table.
+ *
+ * HTTP/gRPC/GraphQL/tRPC are owned by the upstream Route-QN matcher in
+ * pass_cross_repo.c and are intentionally skipped here.
  */
 #include "servicelink.h"
+#include "pass_cross_repo.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
@@ -111,6 +116,7 @@ typedef struct {
     char file_path[256];
     char extra[256];            /* protocol-specific metadata (JSON) */
     char identifier_norm[256];  /* lowercased, separators stripped */
+    const char *edge_type;      /* CROSS_* edge type for this protocol */
 } xl_endpoint_t;
 
 /* Normalize identifier for matching: lowercase, strip -, _, . */
@@ -124,59 +130,7 @@ static void normalize_identifier(const char *src, char *dst, int dst_sz) {
     dst[j] = '\0';
 }
 
-/* Extract a JSON string value by key (simple strstr-based, no full parse). */
-static const char *xl_json_str(const char *json, const char *key,
-                               char *buf, int bufsize) {
-    if (!json || !key || bufsize <= 0) return NULL;
-    char search[64];
-    snprintf(search, sizeof(search), "\"%s\":\"", key);
-    const char *start = strstr(json, search);
-    if (!start) return NULL;
-    start += strlen(search);
-    const char *end = strchr(start, '"');
-    if (!end) return NULL;
-    int len = (int)(end - start);
-    if (len >= bufsize) len = bufsize - 1;
-    memcpy(buf, start, (size_t)len);
-    buf[len] = '\0';
-    return buf;
-}
-
-/* Extract a JSON integer value by key. Returns true if found. */
-static bool xl_json_int(const char *json, const char *key, long *out) {
-    if (!json || !key || !out) return false;
-    char search[64];
-    snprintf(search, sizeof(search), "\"%s\":", key);
-    const char *start = strstr(json, search);
-    if (!start) return false;
-    start += strlen(search);
-    while (*start == ' ') start++;
-    /* Must be numeric (not a quoted string) */
-    if (*start == '"') return false;
-    char *endp = NULL;
-    long v = strtol(start, &endp, 10);
-    if (endp == start) return false;
-    *out = v;
-    return true;
-}
-
-/* Extract a JSON boolean value by key. Returns true if found, sets *out. */
-static bool xl_json_bool(const char *json, const char *key, bool *out) {
-    if (!json || !key || !out) return false;
-    char search[64];
-    snprintf(search, sizeof(search), "\"%s\":", key);
-    const char *start = strstr(json, search);
-    if (!start) return false;
-    start += strlen(search);
-    while (*start == ' ') start++;
-    if (strncmp(start, "true", 4) == 0)  { *out = true;  return true; }
-    if (strncmp(start, "false", 5) == 0) { *out = false; return true; }
-    return false;
-}
-
-/* ── Per-protocol match functions ───────────────────────────────── */
-
-/* Generic matcher: preserves pre-HTTP behavior (0.95 exact, 0.85 normalized). */
+/* Generic matcher: 0.95 exact, 0.85 normalized. */
 static double match_generic(const xl_endpoint_t *prod, const xl_endpoint_t *cons) {
     if (strcmp(prod->identifier, cons->identifier) == 0) return 0.95;
     if (prod->identifier_norm[0] != '\0' &&
@@ -186,77 +140,9 @@ static double match_generic(const xl_endpoint_t *prod, const xl_endpoint_t *cons
     return 0.0;
 }
 
-/* HTTP matcher: dispatches on producer identifier shape (route / service / env). */
-static double match_http(const xl_endpoint_t *prod, const xl_endpoint_t *cons,
-                         uint32_t *signals_used) {
-    if (signals_used) *signals_used = 0;
-    const char *pid = prod->identifier;
-    const char *cid = cons->identifier;
-
-    /* Env-level: "env:<VAR>" */
-    if (strncmp(pid, "env:", 4) == 0) {
-        /* Require consumer signals bitmask includes S3 (bit 4) OR S4 (bit 8). */
-        long signals = 0;
-        if (!xl_json_int(cons->extra, "signals", &signals)) return 0.0;
-        if ((signals & 0x04) == 0 && (signals & 0x08) == 0) return 0.0;
-
-        /* Suppress generic env-var consumers. */
-        bool generic = false;
-        if (xl_json_bool(cons->extra, "generic", &generic) && generic) return 0.0;
-
-        /* Match producer VAR against consumer's declared env_var. */
-        char env_var[128];
-        if (!xl_json_str(cons->extra, "env_var", env_var, sizeof(env_var))) return 0.0;
-        const char *prod_var = pid + 4;
-        if (strcmp(prod_var, env_var) == 0) {
-            if (signals_used) *signals_used = (uint32_t)(signals & 0x0C);
-            return 0.50;
-        }
-        return 0.0;
-    }
-
-    /* Service-level: "http://<host>" */
-    if (strncmp(pid, "http://", 7) == 0) {
-        const char *prod_host = pid + 7;
-        char svc_name[128];
-        if (!xl_json_str(cons->extra, "service_name", svc_name, sizeof(svc_name))) {
-            return 0.0;
-        }
-        if (strcmp(prod_host, svc_name) == 0) {
-            if (signals_used) *signals_used = 0x01;
-            return 0.60;
-        }
-        return 0.0;
-    }
-
-    /* Route-level: "<METHOD> <path>" — has a space, no env:/http:// prefix. */
-    const char *prod_sp = strchr(pid, ' ');
-    if (!prod_sp) return 0.0;
-
-    /* Consumer must also be route-level (has a space, no env:/http:// prefix). */
-    if (strncmp(cid, "env:", 4) == 0) return 0.0;
-    if (strncmp(cid, "http://", 7) == 0) return 0.0;
-    const char *cons_sp = strchr(cid, ' ');
-    if (!cons_sp) return 0.0;
-
-    /* Exact route-level match. */
-    if (strcmp(pid, cid) == 0) {
-        if (signals_used) *signals_used = 0x02;
-        return 0.95;
-    }
-
-    /* Path-only fuzzy via cbm_path_match_score. */
-    const char *prod_path = prod_sp + 1;
-    const char *cons_path = cons_sp + 1;
-    double score = cbm_path_match_score(prod_path, cons_path);
-    if (score > 0.0) {
-        if (signals_used) *signals_used = 0x02;
-        return score;
-    }
-    return 0.0;
-}
-
-/* Load endpoints from a single project DB */
+/* Load endpoints from a single project DB. Skips endpoints whose protocol is
+ * owned by upstream's Route-QN matcher (http/grpc/graphql/trpc) — those
+ * return NULL from cbm_messaging_protocol_to_cross_edge(). */
 static int load_endpoints_from_db(const char *db_path,
                                   xl_endpoint_t **out, int *out_count,
                                   int *out_cap) {
@@ -277,7 +163,7 @@ static int load_endpoints_from_db(const char *db_path,
     sqlite3_finalize(check);
     if (!has_table) {
         sqlite3_close(db);
-        return 0;  /* no table — old DB, skip silently */
+        return 0;
     }
 
     sqlite3_stmt *stmt = NULL;
@@ -290,6 +176,13 @@ static int load_endpoints_from_db(const char *db_path,
 
     int added = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *protocol_col = (const char *)sqlite3_column_text(stmt, 1);
+        const char *edge_type = cbm_messaging_protocol_to_cross_edge(protocol_col);
+        if (!edge_type) {
+            /* http/grpc/graphql/trpc — owned by upstream matcher */
+            continue;
+        }
+
         if (*out_count >= *out_cap) {
             int new_cap = (*out_cap == 0) ? 1024 : *out_cap * 2;
             xl_endpoint_t *new_buf = realloc(*out, (size_t)new_cap * sizeof(xl_endpoint_t));
@@ -302,8 +195,7 @@ static int load_endpoints_from_db(const char *db_path,
         const char *col;
         col = (const char *)sqlite3_column_text(stmt, 0);
         if (col) snprintf(ep->project, sizeof(ep->project), "%s", col);
-        col = (const char *)sqlite3_column_text(stmt, 1);
-        if (col) snprintf(ep->protocol, sizeof(ep->protocol), "%s", col);
+        snprintf(ep->protocol, sizeof(ep->protocol), "%s", protocol_col);
         col = (const char *)sqlite3_column_text(stmt, 2);
         if (col) snprintf(ep->role, sizeof(ep->role), "%s", col);
         col = (const char *)sqlite3_column_text(stmt, 3);
@@ -314,6 +206,7 @@ static int load_endpoints_from_db(const char *db_path,
         if (col) snprintf(ep->file_path, sizeof(ep->file_path), "%s", col);
         col = (const char *)sqlite3_column_text(stmt, 6);
         if (col) snprintf(ep->extra, sizeof(ep->extra), "%s", col);
+        ep->edge_type = edge_type;
 
         normalize_identifier(ep->identifier, ep->identifier_norm,
                              (int)sizeof(ep->identifier_norm));
@@ -325,222 +218,331 @@ static int load_endpoints_from_db(const char *db_path,
     return added;
 }
 
-/* Write cross-links to _crosslinks.db */
-static int write_crosslinks(const char *cache_dir,
-                            const xl_endpoint_t *endpoints, int count) {
-    char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/_crosslinks.db", cache_dir);
+/* ── Edge emission ────────────────────────────────────────────────── */
 
-    sqlite3 *db = NULL;
-    if (sqlite3_open(db_path, &db) != SQLITE_OK) {
-        cbm_log_error("crosslink.open_failed", "path", db_path);
-        return -1;
+/* Store cache keyed by project name. We open each DB lazily and keep it open
+ * until the run completes. */
+typedef struct {
+    char project[256];
+    cbm_store_t *store;
+} xl_store_cache_entry_t;
+
+typedef struct {
+    xl_store_cache_entry_t *items;
+    int count;
+    int cap;
+    char cache_dir[1024];
+} xl_store_cache_t;
+
+static cbm_store_t *xl_store_for(xl_store_cache_t *cache, const char *project) {
+    for (int i = 0; i < cache->count; i++) {
+        if (strcmp(cache->items[i].project, project) == 0) {
+            return cache->items[i].store;
+        }
+    }
+    if (cache->count >= cache->cap) {
+        int new_cap = cache->cap == 0 ? 16 : cache->cap * 2;
+        xl_store_cache_entry_t *new_items = realloc(
+            cache->items, (size_t)new_cap * sizeof(xl_store_cache_entry_t));
+        if (!new_items) return NULL;
+        cache->items = new_items;
+        cache->cap = new_cap;
+    }
+    char db_path[1280];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache->cache_dir, project);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        cbm_log_warn("crosslink.store_open_failed", "project", project);
+        return NULL;
+    }
+    xl_store_cache_entry_t *e = &cache->items[cache->count++];
+    snprintf(e->project, sizeof(e->project), "%s", project);
+    e->store = store;
+    return store;
+}
+
+static void xl_store_cache_close_all(xl_store_cache_t *cache) {
+    for (int i = 0; i < cache->count; i++) {
+        cbm_store_close(cache->items[i].store);
+    }
+    free(cache->items);
+    cache->items = NULL;
+    cache->count = 0;
+    cache->cap = 0;
+}
+
+/* Resolve a node_qn in `project`'s DB to a node id. Returns 0 if not found. */
+static int64_t resolve_node_id(cbm_store_t *store, const char *project, const char *qn) {
+    if (!store || !qn || !qn[0]) return 0;
+    cbm_node_t n = {0};
+    if (cbm_store_find_node_by_qn(store, project, qn, &n) != 0) {
+        return 0;
+    }
+    int64_t id = n.id;
+    /* scan_node heap_strdup's strings — free them */
+    free((void *)n.project);
+    free((void *)n.label);
+    free((void *)n.name);
+    free((void *)n.qualified_name);
+    free((void *)n.file_path);
+    free((void *)n.properties_json);
+    return id;
+}
+
+/* JSON string escaping for identifier/qn embedded in edge properties. Simple:
+ * escape '"' and '\'. Messaging identifiers are alphanumeric-plus-dots/slashes
+ * in practice, so we don't need full RFC 8259 escaping. */
+static void json_escape(const char *src, char *dst, size_t dst_sz) {
+    size_t j = 0;
+    for (size_t i = 0; src[i] && j + 2 < dst_sz; i++) {
+        if (src[i] == '"' || src[i] == '\\') {
+            if (j + 3 >= dst_sz) break;
+            dst[j++] = '\\';
+        }
+        dst[j++] = src[i];
+    }
+    if (j < dst_sz) dst[j] = '\0'; else dst[dst_sz - 1] = '\0';
+}
+
+/* MessagingChannel synthetic-anchor label and QN prefix. Mirrors upstream's
+ * Route-QN anchor pattern (`__route__<method>__<path>`). The channel node is
+ * a per-project local anchor that lets cross-project edges stay within one DB
+ * (FK-safe) while still encoding the protocol+identifier the match is about. */
+#define CBM_MESSAGING_CHANNEL_LABEL "MessagingChannel"
+#define CBM_MESSAGING_CHANNEL_FILE  "<cross-repo-link>"
+
+/* Build the QN for a channel anchor node: __channel__<protocol>__<identifier>. */
+static void build_channel_qn(char *buf, size_t bufsz,
+                             const char *protocol, const char *identifier) {
+    snprintf(buf, bufsz, "__channel__%s__%s",
+             protocol ? protocol : "", identifier ? identifier : "");
+}
+
+/* Build properties JSON for a MessagingChannel anchor node. */
+static void build_channel_props(char *buf, size_t bufsz,
+                                const char *protocol, const char *identifier) {
+    char p[64], id[300];
+    json_escape(protocol ? protocol : "", p, sizeof(p));
+    json_escape(identifier ? identifier : "", id, sizeof(id));
+    snprintf(buf, bufsz, "{\"protocol\":\"%s\",\"identifier\":\"%s\"}", p, id);
+}
+
+/* Find or create a MessagingChannel anchor node in `store` for the given
+ * project/protocol/identifier. Returns the local node id, or 0 on failure. */
+static int64_t find_or_create_channel(cbm_store_t *store, const char *project,
+                                      const char *protocol, const char *identifier) {
+    char qn[512];
+    build_channel_qn(qn, sizeof(qn), protocol, identifier);
+
+    cbm_node_t existing = {0};
+    if (cbm_store_find_node_by_qn(store, project, qn, &existing) == 0) {
+        int64_t id = existing.id;
+        cbm_node_free_fields(&existing);
+        return id;
     }
 
-    /* Create schema */
-    sqlite3_exec(db,
-        "CREATE TABLE IF NOT EXISTS cross_links ("
-        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "  protocol TEXT NOT NULL,"
-        "  identifier TEXT NOT NULL,"
-        "  producer_project TEXT NOT NULL,"
-        "  producer_qn TEXT NOT NULL,"
-        "  producer_file TEXT NOT NULL,"
-        "  consumer_project TEXT NOT NULL,"
-        "  consumer_qn TEXT NOT NULL,"
-        "  consumer_file TEXT NOT NULL,"
-        "  confidence REAL NOT NULL,"
-        "  extra_json TEXT DEFAULT '{}',"
-        "  updated_at TEXT NOT NULL,"
-        "  UNIQUE(protocol, identifier, producer_qn, consumer_qn)"
-        ");", NULL, NULL, NULL);
+    char props[640];
+    build_channel_props(props, sizeof(props), protocol, identifier);
+    cbm_node_t channel = {
+        .project = project,
+        .label = CBM_MESSAGING_CHANNEL_LABEL,
+        .name = identifier,
+        .qualified_name = qn,
+        .file_path = CBM_MESSAGING_CHANNEL_FILE,
+        .properties_json = props,
+    };
+    int64_t id = cbm_store_upsert_node(store, &channel);
+    return id > 0 ? id : 0;
+}
 
-    /* Migrate older DBs that may be missing extra_json */
-    sqlite3_exec(db, "ALTER TABLE cross_links ADD COLUMN extra_json TEXT DEFAULT '{}';",
-                 NULL, NULL, NULL);
+/* Build the properties JSON for a producer-side CROSS_* edge. */
+static void build_producer_props(char *buf, size_t bufsz,
+                                 const char *target_project,
+                                 const char *target_function,
+                                 const char *target_file,
+                                 const char *identifier,
+                                 double confidence,
+                                 const char *protocol) {
+    char tp[300], tf[600], tfile[300], id[300];
+    json_escape(target_project ? target_project : "", tp, sizeof(tp));
+    json_escape(target_function ? target_function : "", tf, sizeof(tf));
+    json_escape(target_file ? target_file : "", tfile, sizeof(tfile));
+    json_escape(identifier ? identifier : "", id, sizeof(id));
 
-    /* Full rebuild */
-    sqlite3_exec(db, "DELETE FROM cross_links;", NULL, NULL, NULL);
+    snprintf(buf, bufsz,
+        "{\"target_project\":\"%s\",\"target_function\":\"%s\","
+        "\"target_file\":\"%s\",\"identifier\":\"%s\","
+        "\"protocol\":\"%s\",\"confidence\":%.3f}",
+        tp, tf, tfile, id, protocol ? protocol : "", confidence);
+}
 
-    /* Get current timestamp */
-    char timestamp[64];
-    time_t now = time(NULL);
-    struct tm *tm = gmtime(&now);
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", tm);
+/* Build the properties JSON for a consumer-side CROSS_* edge. */
+static void build_consumer_props(char *buf, size_t bufsz,
+                                 const char *source_project,
+                                 const char *source_function,
+                                 const char *source_file,
+                                 const char *identifier,
+                                 double confidence,
+                                 const char *protocol) {
+    char sp[300], sf[600], sfile[300], id[300];
+    json_escape(source_project ? source_project : "", sp, sizeof(sp));
+    json_escape(source_function ? source_function : "", sf, sizeof(sf));
+    json_escape(source_file ? source_file : "", sfile, sizeof(sfile));
+    json_escape(identifier ? identifier : "", id, sizeof(id));
 
-    sqlite3_stmt *ins = NULL;
-    sqlite3_prepare_v2(db,
-        "INSERT OR IGNORE INTO cross_links "
-        "(protocol, identifier, producer_project, producer_qn, producer_file, "
-        " consumer_project, consumer_qn, consumer_file, confidence, extra_json, updated_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?);", -1, &ins, NULL);
-    if (!ins) {
-        cbm_log_warn("crosslink.prepare_failed", "path", db_path);
-        sqlite3_close(db);
-        return -1;
+    snprintf(buf, bufsz,
+        "{\"source_project\":\"%s\",\"source_function\":\"%s\","
+        "\"source_file\":\"%s\",\"identifier\":\"%s\","
+        "\"protocol\":\"%s\",\"confidence\":%.3f}",
+        sp, sf, sfile, id, protocol ? protocol : "", confidence);
+}
+
+/* Emit a bidirectional CROSS_* edge pair for a producer→consumer match.
+ *
+ * Each side's edge is intra-DB and anchored on a local MessagingChannel
+ * node (created on demand, mirrored across DBs by sharing the same QN
+ * `__channel__<proto>__<id>`):
+ *   producer DB:  function → channel  (CROSS_<PROTO>_CALLS)
+ *   consumer DB:  channel  → function (CROSS_<PROTO>_CALLS)
+ *
+ * This keeps target_id within the local nodes table (FK-safe) and lets
+ * fanout (one producer, many consumers) record distinct edges per match
+ * via the channel anchor. */
+static int emit_cross_edge_pair(xl_store_cache_t *cache,
+                                const xl_endpoint_t *prod,
+                                const xl_endpoint_t *cons,
+                                double confidence) {
+    cbm_store_t *prod_store = xl_store_for(cache, prod->project);
+    cbm_store_t *cons_store = xl_store_for(cache, cons->project);
+    if (!prod_store || !cons_store) return 0;
+
+    int64_t prod_id = resolve_node_id(prod_store, prod->project, prod->node_qn);
+    int64_t cons_id = resolve_node_id(cons_store, cons->project, cons->node_qn);
+    if (prod_id == 0) {
+        cbm_log_warn("crosslink.unresolved_qn", "project", prod->project,
+                     "qn", prod->node_qn);
+        return 0;
+    }
+    if (cons_id == 0) {
+        cbm_log_warn("crosslink.unresolved_qn", "project", cons->project,
+                     "qn", cons->node_qn);
+        return 0;
     }
 
-    sqlite3_exec(db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
+    int64_t prod_channel = find_or_create_channel(prod_store, prod->project,
+                                                  prod->protocol, prod->identifier);
+    int64_t cons_channel = find_or_create_channel(cons_store, cons->project,
+                                                  cons->protocol, cons->identifier);
+    if (prod_channel == 0 || cons_channel == 0) {
+        cbm_log_warn("crosslink.channel_create_failed", "prod", prod->project,
+                     "cons", cons->project);
+        return 0;
+    }
+
+    /* Forward: function → channel in producer's DB. */
+    char fwd[1536];
+    build_producer_props(fwd, sizeof(fwd), cons->project, cons->node_qn, cons->file_path,
+                         prod->identifier, confidence, prod->protocol);
+    cbm_edge_t fwd_edge = {
+        .project = prod->project,
+        .source_id = prod_id,
+        .target_id = prod_channel,
+        .type = prod->edge_type,
+        .properties_json = fwd,
+    };
+    int64_t fwd_rc = cbm_store_insert_edge(prod_store, &fwd_edge);
+
+    /* Reverse: channel → function in consumer's DB. */
+    char rev[1536];
+    build_consumer_props(rev, sizeof(rev), prod->project, prod->node_qn, prod->file_path,
+                         prod->identifier, confidence, prod->protocol);
+    cbm_edge_t rev_edge = {
+        .project = cons->project,
+        .source_id = cons_channel,
+        .target_id = cons_id,
+        .type = cons->edge_type,
+        .properties_json = rev,
+    };
+    int64_t rev_rc = cbm_store_insert_edge(cons_store, &rev_edge);
+
+    if (fwd_rc <= 0 || rev_rc <= 0) {
+        cbm_log_warn("crosslink.insert_failed", "prod", prod->project,
+                     "cons", cons->project);
+        return 0;
+    }
+    return 1;
+}
+
+/* Wipe existing messaging CROSS_* edges for a project's DB. Called once per
+ * project per run to keep output idempotent. */
+static void wipe_messaging_cross_edges(cbm_store_t *store, const char *project) {
+    for (int t = 0; t < CBM_MESSAGING_CROSS_EDGE_TYPE_COUNT; t++) {
+        cbm_store_delete_edges_by_type(store, project, CBM_MESSAGING_CROSS_EDGE_TYPES[t]);
+    }
+}
+
+/* Track which projects have been wiped this run. */
+typedef struct {
+    char names[256][256];
+    int count;
+} xl_wiped_set_t;
+
+static bool xl_wiped_contains(const xl_wiped_set_t *set, const char *project) {
+    for (int i = 0; i < set->count; i++) {
+        if (strcmp(set->names[i], project) == 0) return true;
+    }
+    return false;
+}
+
+static void xl_wiped_add(xl_wiped_set_t *set, const char *project) {
+    if (set->count >= 256) return;
+    snprintf(set->names[set->count++], sizeof(set->names[0]), "%s", project);
+}
+
+/* Ensure a project's messaging CROSS_* edges have been wiped exactly once. */
+static void ensure_wiped(xl_store_cache_t *cache, xl_wiped_set_t *wiped,
+                         const char *project) {
+    if (xl_wiped_contains(wiped, project)) return;
+    cbm_store_t *store = xl_store_for(cache, project);
+    if (!store) return;
+    wipe_messaging_cross_edges(store, project);
+    xl_wiped_add(wiped, project);
+}
+
+/* Match producers to consumers and emit CROSS_* edges. */
+static int match_and_emit(xl_store_cache_t *cache,
+                          const xl_endpoint_t *endpoints, int count) {
+    xl_wiped_set_t wiped = {0};
+
+    /* Wipe every project that owns an endpoint (even ones that will produce
+     * no matches this run) so stale messaging CROSS_* edges don't linger. */
+    for (int i = 0; i < count; i++) {
+        ensure_wiped(cache, &wiped, endpoints[i].project);
+    }
 
     int link_count = 0;
-    int ambiguous_dropped = 0;
-
-    /* Candidate buffer for HTTP ambiguity handling. */
-    typedef struct {
-        int consumer_idx;
-        double raw_conf;
-    } http_candidate_t;
-    const int MAX_CANDIDATES = 64;
-    http_candidate_t cands[MAX_CANDIDATES];
-
-    /* O(n^2) matching — acceptable for expected sizes (few thousand endpoints) */
     for (int pi = 0; pi < count; pi++) {
         if (strcmp(endpoints[pi].role, "producer") != 0) continue;
         const xl_endpoint_t *prod = &endpoints[pi];
-        const bool is_http = (strcmp(prod->protocol, "http") == 0);
-
-        /* HTTP uses a candidate buffer for ambiguity handling (capped).
-         * Non-HTTP emits directly — no cap, preserves pre-refactor behavior. */
-        int n_cands = 0;
-        int cap_truncated = 0;
 
         for (int ci = 0; ci < count; ci++) {
             if (strcmp(endpoints[ci].role, "consumer") != 0) continue;
             const xl_endpoint_t *cons = &endpoints[ci];
 
-            /* Skip same project */
             if (strcmp(prod->project, cons->project) == 0) continue;
-            /* Must be same protocol */
             if (strcmp(prod->protocol, cons->protocol) != 0) continue;
 
-            double conf;
-            uint32_t signals_used = 0;
-            if (is_http) {
-                conf = match_http(prod, cons, &signals_used);
-            } else {
-                conf = match_generic(prod, cons);
-            }
+            double conf = match_generic(prod, cons);
             if (conf <= 0.0) continue;
-            if (is_http && conf < SL_MIN_CONFIDENCE) continue;
 
-            if (!is_http) {
-                /* Emit inline: no buffer, no cap. */
-                sqlite3_bind_text(ins, 1, prod->protocol, -1, SQLITE_STATIC);
-                sqlite3_bind_text(ins, 2, prod->identifier, -1, SQLITE_STATIC);
-                sqlite3_bind_text(ins, 3, prod->project, -1, SQLITE_STATIC);
-                sqlite3_bind_text(ins, 4, prod->node_qn, -1, SQLITE_STATIC);
-                sqlite3_bind_text(ins, 5, prod->file_path, -1, SQLITE_STATIC);
-                sqlite3_bind_text(ins, 6, cons->project, -1, SQLITE_STATIC);
-                sqlite3_bind_text(ins, 7, cons->node_qn, -1, SQLITE_STATIC);
-                sqlite3_bind_text(ins, 8, cons->file_path, -1, SQLITE_STATIC);
-                sqlite3_bind_double(ins, 9, conf);
-                sqlite3_bind_text(ins, 10, "{}", -1, SQLITE_STATIC);
-                sqlite3_bind_text(ins, 11, timestamp, -1, SQLITE_STATIC);
-                sqlite3_step(ins);
-                sqlite3_reset(ins);
-                link_count++;
-                continue;
-            }
-
-            if (n_cands < MAX_CANDIDATES) {
-                cands[n_cands].consumer_idx = ci;
-                cands[n_cands].raw_conf = conf;
-                n_cands++;
-            } else {
-                cap_truncated++;
-            }
+            link_count += emit_cross_edge_pair(cache, prod, cons, conf);
         }
-
-        if (!is_http) continue;
-
-        if (cap_truncated > 0) {
-            cbm_log_info("http.candidate_truncated",
-                         "producer", prod->identifier,
-                         "kept", itoa_buf(MAX_CANDIDATES),
-                         "dropped", itoa_buf(cap_truncated));
-        }
-
-        if (n_cands == 0) continue;
-
-        /* HTTP: apply ambiguity handling. */
-        int emit_count = n_cands;
-        if (emit_count > 3) {
-            /* Pick top-3 by raw_conf (simple partial selection sort). */
-            for (int a = 0; a < 3; a++) {
-                int best = a;
-                for (int b = a + 1; b < n_cands; b++) {
-                    if (cands[b].raw_conf > cands[best].raw_conf) best = b;
-                }
-                if (best != a) {
-                    http_candidate_t tmp = cands[a];
-                    cands[a] = cands[best];
-                    cands[best] = tmp;
-                }
-            }
-            ambiguous_dropped++;
-            cbm_log_info("http.ambiguous_dropped",
-                         "producer", prod->identifier,
-                         "candidates", itoa_buf(n_cands));
-            emit_count = 3;
-        }
-
-        double divisor = (double)emit_count;
-        for (int k = 0; k < emit_count; k++) {
-            const xl_endpoint_t *cons = &endpoints[cands[k].consumer_idx];
-
-            /* Build ambiguous_with JSON array of other consumer projects. */
-            char extra_json[512];
-            if (emit_count > 1) {
-                char list[400];
-                list[0] = '\0';
-                int off = 0;
-                for (int j = 0; j < emit_count; j++) {
-                    if (j == k) continue;
-                    const xl_endpoint_t *other = &endpoints[cands[j].consumer_idx];
-                    int written = snprintf(list + off, sizeof(list) - (size_t)off,
-                                           "%s\"%s\"",
-                                           off == 0 ? "" : ",",
-                                           other->project);
-                    if (written < 0 || written >= (int)(sizeof(list) - (size_t)off)) break;
-                    off += written;
-                }
-                snprintf(extra_json, sizeof(extra_json),
-                         "{\"ambiguous_with\":[%s]}", list);
-            } else {
-                snprintf(extra_json, sizeof(extra_json), "{}");
-            }
-
-            double emit_conf = cands[k].raw_conf / divisor;
-
-            sqlite3_bind_text(ins, 1, prod->protocol, -1, SQLITE_STATIC);
-            sqlite3_bind_text(ins, 2, prod->identifier, -1, SQLITE_STATIC);
-            sqlite3_bind_text(ins, 3, prod->project, -1, SQLITE_STATIC);
-            sqlite3_bind_text(ins, 4, prod->node_qn, -1, SQLITE_STATIC);
-            sqlite3_bind_text(ins, 5, prod->file_path, -1, SQLITE_STATIC);
-            sqlite3_bind_text(ins, 6, cons->project, -1, SQLITE_STATIC);
-            sqlite3_bind_text(ins, 7, cons->node_qn, -1, SQLITE_STATIC);
-            sqlite3_bind_text(ins, 8, cons->file_path, -1, SQLITE_STATIC);
-            sqlite3_bind_double(ins, 9, emit_conf);
-            sqlite3_bind_text(ins, 10, extra_json, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(ins, 11, timestamp, -1, SQLITE_STATIC);
-            sqlite3_step(ins);
-            sqlite3_reset(ins);
-            link_count++;
-        }
-    }
-
-    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
-    if (ins) sqlite3_finalize(ins);
-    sqlite3_close(db);
-
-    if (ambiguous_dropped > 0) {
-        cbm_log_info("crosslink.http_ambiguous_total",
-                     "count", itoa_buf(ambiguous_dropped));
     }
     return link_count;
 }
 
-/* Main entry point: scan cache_dir for *.db, load endpoints, match across projects */
+/* Main entry point: scan cache_dir for *.db, load messaging endpoints, match
+ * across projects, emit bidirectional CROSS_* edges. */
 int cbm_cross_project_link(const char *cache_dir) {
     if (!cache_dir) return -1;
 
@@ -552,7 +554,7 @@ int cbm_cross_project_link(const char *cache_dir) {
         return -1;
     }
 
-    /* Collect all endpoints from all project DBs */
+    /* Collect messaging endpoints from all project DBs */
     xl_endpoint_t *all_endpoints = NULL;
     int total = 0, cap = 0;
 
@@ -561,12 +563,11 @@ int cbm_cross_project_link(const char *cache_dir) {
         const char *name = ent->d_name;
         int len = (int)strlen(name);
 
-        /* Skip non-.db files */
         if (len < 4 || strcmp(name + len - 3, ".db") != 0) continue;
-        /* Skip _crosslinks.db, tmp-*, _* */
+        /* Skip leading-underscore (catches legacy _crosslinks.db) and tmp-*. */
         if (name[0] == '_' || strncmp(name, "tmp-", 4) == 0) continue;
 
-        char db_path[1024];
+        char db_path[1280];
         snprintf(db_path, sizeof(db_path), "%s/%s", cache_dir, name);
 
         int loaded = load_endpoints_from_db(db_path, &all_endpoints, &total, &cap);
@@ -583,12 +584,15 @@ int cbm_cross_project_link(const char *cache_dir) {
         return 0;
     }
 
-    /* Match across projects and write to _crosslinks.db */
-    int links = write_crosslinks(cache_dir, all_endpoints, total);
+    xl_store_cache_t cache = {0};
+    snprintf(cache.cache_dir, sizeof(cache.cache_dir), "%s", cache_dir);
+
+    int links = match_and_emit(&cache, all_endpoints, total);
+
+    xl_store_cache_close_all(&cache);
+    free(all_endpoints);
 
     cbm_log_info("crosslink.done", "total_endpoints", itoa_buf(total),
                  "cross_links", itoa_buf(links));
-
-    free(all_endpoints);
     return links;
 }
