@@ -209,6 +209,16 @@ static void run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *change
             cbm_log_info("pass.timing", "pass", "incr_resolve", "elapsed_ms",
                          itoa_buf((int)elapsed_ms(t)));
 
+            /* Producer-side IDL scan needs result_cache to read calls/usages
+             * out of the freshly extracted CBMFileResult. Mirrors the
+             * full-pipeline parallel path in pipeline.c. */
+            cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+            ctx->result_cache = cache;
+            cbm_pipeline_pass_idl_scan(ctx, changed_files, ci);
+            ctx->result_cache = NULL;
+            cbm_log_info("pass.timing", "pass", "incr_idl_scan", "elapsed_ms",
+                         itoa_buf((int)elapsed_ms(t)));
+
             for (int j = 0; j < ci; j++) {
                 if (cache[j]) {
                     cbm_free_result(cache[j]);
@@ -218,11 +228,27 @@ static void run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *change
         }
     } else {
         cbm_log_info("incremental.mode", "mode", "sequential", "changed", itoa_buf(ci));
+        /* Attach a result cache so pass_definitions stores CBMFileResult per file
+         * and pass_idl_scan can read calls/imports out of it. Mirrors
+         * run_sequential_pipeline in pipeline.c. */
+        CBMFileResult **seq_cache = (CBMFileResult **)calloc(ci, sizeof(CBMFileResult *));
+        if (seq_cache) {
+            ctx->result_cache = seq_cache;
+        }
         cbm_pipeline_pass_definitions(ctx, changed_files, ci);
         cbm_pipeline_pass_calls(ctx, changed_files, ci);
         cbm_pipeline_pass_idl_scan(ctx, changed_files, ci);
         cbm_pipeline_pass_usages(ctx, changed_files, ci);
         cbm_pipeline_pass_semantic(ctx, changed_files, ci);
+        if (seq_cache) {
+            for (int i = 0; i < ci; i++) {
+                if (seq_cache[i]) {
+                    cbm_free_result(seq_cache[i]);
+                }
+            }
+            free(seq_cache);
+            ctx->result_cache = NULL;
+        }
     }
 }
 
