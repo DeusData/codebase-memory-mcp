@@ -772,6 +772,9 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     return srv->store;
 }
 
+/* Forward decl — definition lives below alongside list_projects. */
+static bool is_project_db_file(const char *name, size_t len);
+
 /* Scan cache dir for .db files, writing comma-separated quoted names into out.
  * Returns the number of projects found. */
 static int collect_db_project_names(const char *dir_path, char *out, size_t out_sz) {
@@ -785,10 +788,7 @@ static int collect_db_project_names(const char *dir_path, char *out, size_t out_
     while ((entry = cbm_readdir(d)) != NULL) {
         const char *n = entry->name;
         size_t len = strlen(n);
-        if (len < MCP_MIN_DB_NAME || strcmp(n + len - MCP_DB_EXT, ".db") != 0) {
-            continue;
-        }
-        if (strncmp(n, "tmp-", SLEN("tmp-")) == 0 || strncmp(n, "_", SLEN("_")) == 0) {
+        if (!is_project_db_file(n, len)) {
             continue;
         }
         if (count > 0 && offset < (int)out_sz - MCP_SEPARATOR) {
@@ -842,12 +842,18 @@ static char *build_project_list_error(const char *reason) {
 
 /* ── Tool handler implementations ─────────────────────────────── */
 
-/* Return true if filename is a valid project .db file (not temp/internal). */
+/* Return true if filename is a valid project .db file (not temp/internal).
+ *
+ * NOTE: project names derived from `/tmp/...` source roots legitimately
+ * begin with `tmp-` (see cbm_project_name_from_path: "/tmp/bench/..." →
+ * "tmp-bench-..."), so we must NOT exclude the entire `tmp-` prefix.  The
+ * `_` prefix is reserved for internal/hidden DBs, and `:memory:` is the
+ * SQLite in-memory marker (defensive — never appears as a real file). */
 static bool is_project_db_file(const char *name, size_t len) {
     if (len < MCP_MIN_DB_NAME || strcmp(name + len - MCP_DB_EXT, ".db") != 0) {
         return false;
     }
-    if (strncmp(name, "tmp-", SLEN("tmp-")) == 0 || strncmp(name, "_", SLEN("_")) == 0 ||
+    if (strncmp(name, "_", SLEN("_")) == 0 ||
         strncmp(name, ":memory:", SLEN(":memory:")) == 0) {
         return false;
     }
@@ -1928,10 +1934,21 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         direction = heap_strdup("both");
     }
 
-    /* Find the node by name */
+    /* Find the node by name. If that misses (caller passed a fully-qualified
+     * name like "module.func"), fall back to qualified_name lookup so the
+     * documented "fully qualify for precise match" UX actually works. */
     cbm_node_t *nodes = NULL;
     int node_count = 0;
     cbm_store_find_nodes_by_name(store, project, func_name, &nodes, &node_count);
+
+    if (node_count == 0) {
+        cbm_node_t qn_node = {0};
+        if (cbm_store_find_node_by_qn(store, project, func_name, &qn_node) == CBM_STORE_OK) {
+            nodes = malloc(sizeof(cbm_node_t));
+            nodes[0] = qn_node;
+            node_count = 1;
+        }
+    }
 
     if (node_count == 0) {
         enum { HINT_BUF_SZ = 512 };
