@@ -1111,7 +1111,15 @@ enum {
     BM25_BIND_PROJECT = 2,
     BM25_BIND_LIMIT = 3,
     BM25_BIND_OFFSET = 4,
+    BM25_BIND_INNER = 5,
     BM25_SQL_AUTO_LEN = -1,
+    /* Inner FTS5 candidate cap.  SQLite can early-terminate a plain FTS5 query
+     * (no JOIN/WHERE on outer table) of the form:
+     *   SELECT rowid, bm25() FROM nodes_fts WHERE MATCH ? ORDER BY bm25() LIMIT N
+     * By fetching only the top BM25_INNER_LIMIT candidates from the FTS5 index
+     * and then joining/filtering/re-ranking those, we bound all work to O(N) where
+     * N = BM25_INNER_LIMIT rather than the full match set size. */
+    BM25_INNER_LIMIT = 2000,
 };
 
 /* Module-local SQLITE_TRANSIENT wrapper to dodge performance-no-int-to-ptr.
@@ -1178,21 +1186,34 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         return NULL;
     }
 
-    /* BM25 ranked query with structural label boosting.  bm25() returns a
-     * NEGATIVE score (lower = more relevant), so we subtract the boost to
-     * make high-value labels sort first.  File/Folder/Module/Variable are
-     * excluded entirely — agents rarely want those as discovery results. */
+    /* BM25 ranked query using a two-step approach to enable FTS5 early termination.
+     *
+     * Flat queries of the form:
+     *   SELECT ... FROM nodes_fts JOIN nodes WHERE MATCH ? AND n.project=? ORDER BY rank LIMIT N
+     * block FTS5's WAND/MaxScore early-exit because the outer JOIN+WHERE conditions
+     * are invisible to the FTS5 planner — it must score every matching document before
+     * the project/label filter can discard any of them.  On a large codebase with 100K+
+     * matches, this causes multi-minute queries.
+     *
+     * The fix: let FTS5 drive the inner subquery alone.  SQLite CAN early-terminate
+     *   SELECT rowid, bm25(nodes_fts) FROM nodes_fts WHERE MATCH ? ORDER BY bm25() LIMIT N
+     * because no outer predicate blocks it.  We fetch BM25_INNER_LIMIT top candidates
+     * from the FTS5 index, then join/filter/boost only those rows.  bm25() returns a
+     * NEGATIVE score (lower = more relevant). */
     const char *sql =
         "SELECT n.id, n.label, n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, "
-        "       (bm25(nodes_fts) "
+        "       (fts.base_rank "
         "        - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
         "               WHEN n.label = 'Route' THEN 8.0 "
         "               WHEN n.label IN ('Class','Interface','Type','Enum') THEN 5.0 "
         "               ELSE 0.0 END) AS rank "
-        "FROM nodes_fts "
-        "JOIN nodes n ON n.id = nodes_fts.rowid "
-        "WHERE nodes_fts MATCH ?1 "
-        "  AND n.project = ?2 "
+        "FROM ("
+        "    SELECT rowid, bm25(nodes_fts) AS base_rank"
+        "    FROM nodes_fts WHERE nodes_fts MATCH ?1"
+        "    ORDER BY base_rank LIMIT ?5"
+        ") fts "
+        "JOIN nodes n ON n.id = fts.rowid "
+        "WHERE n.project = ?2 "
         "  AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
         "ORDER BY rank "
         "LIMIT ?3 OFFSET ?4";
@@ -1201,24 +1222,33 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     if (sqlite3_prepare_v2(db, sql, BM25_SQL_AUTO_LEN, &stmt, NULL) != SQLITE_OK) {
         return NULL;
     }
-    sqlite3_bind_text(stmt, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, BM25_BIND_PROJECT, project, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, BM25_BIND_LIMIT, limit > 0 ? limit : BM25_DEFAULT_LIMIT);
+    sqlite3_bind_text(stmt, BM25_BIND_QUERY,   fts_query, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, BM25_BIND_PROJECT, project,   BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, BM25_BIND_LIMIT,  limit > 0 ? limit : BM25_DEFAULT_LIMIT);
     sqlite3_bind_int(stmt, BM25_BIND_OFFSET, offset > 0 ? offset : 0);
+    sqlite3_bind_int(stmt, BM25_BIND_INNER,  BM25_INNER_LIMIT);
 
-    /* Count total hits (for pagination) in a separate cheap query. */
+    /* Count hits within the same inner-limit window — capped at BM25_INNER_LIMIT.
+     * Uses the identical subquery structure so the FTS5 early-exit applies here too. */
     int total = 0;
     {
         const char *count_sql =
-            "SELECT COUNT(*) FROM nodes_fts JOIN nodes n ON n.id = nodes_fts.rowid "
-            "WHERE nodes_fts MATCH ?1 AND n.project = ?2 "
-            "  AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project')";
+            "SELECT COUNT(*) FROM ("
+            "    SELECT fts.rowid FROM ("
+            "        SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?1"
+            "        ORDER BY bm25(nodes_fts) LIMIT ?3"
+            "    ) fts "
+            "    JOIN nodes n ON n.id = fts.rowid "
+            "    WHERE n.project = ?2 "
+            "      AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project')"
+            ")";
         sqlite3_stmt *cs = NULL;
         if (sqlite3_prepare_v2(db, count_sql, BM25_SQL_AUTO_LEN, &cs, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(cs, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN,
+            sqlite3_bind_text(cs, BM25_BIND_QUERY,   fts_query, BM25_SQL_AUTO_LEN,
                               MCP_SQLITE_TRANSIENT);
-            sqlite3_bind_text(cs, BM25_BIND_PROJECT, project, BM25_SQL_AUTO_LEN,
+            sqlite3_bind_text(cs, BM25_BIND_PROJECT, project,   BM25_SQL_AUTO_LEN,
                               MCP_SQLITE_TRANSIENT);
+            sqlite3_bind_int(cs, BM25_BIND_LIMIT, BM25_INNER_LIMIT);
             if (sqlite3_step(cs) == SQLITE_ROW) {
                 total = sqlite3_column_int(cs, 0);
             }

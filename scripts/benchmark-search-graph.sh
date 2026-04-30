@@ -57,6 +57,7 @@ run_case "name_pattern=specificFunctionName"   "$(sg "$PROJECT" '"name_pattern":
 run_case "label=Method + name_pattern=.*get.*" "$(sg "$PROJECT" '"label":"Method","name_pattern":".*get.*","limit":20')"
 
 echo ""
-echo "=== search_graph query= benchmarks (BM25 path — for reference) ==="
-run_case "query=controller service handler"    "$(sg "$PROJECT" '"query":"controller service handler","limit":20')"
-run_case "query=repository database query"     "$(sg "$PROJECT" '"query":"repository database query","limit":20')"
+echo "=== search_graph query= benchmarks (BM25 path) ==="
+run_case "query=controller service handler"                   "$(sg "$PROJECT" '"query":"controller service handler","limit":20')"
+run_case "query=user authentication permission role"          "$(sg "$PROJECT" '"query":"user authentication permission role","limit":20')"
+run_case "query=create update delete manage list view admin"  "$(sg "$PROJECT" '"query":"create update delete manage list view admin","limit":20')"
