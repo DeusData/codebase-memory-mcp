@@ -75,7 +75,95 @@ typedef enum {
     CBM_LANG_FORM,
     CBM_LANG_MAGMA,
     CBM_LANG_WOLFRAM,
+    CBM_LANG_SOLIDITY,
+    CBM_LANG_TYPST,
     CBM_LANG_GDSCRIPT,
+    CBM_LANG_GLEAM,
+    CBM_LANG_POWERSHELL,
+    CBM_LANG_PASCAL,
+    CBM_LANG_DLANG,
+    CBM_LANG_NIM,
+    CBM_LANG_SCHEME,
+    CBM_LANG_FENNEL,
+    CBM_LANG_FISH,
+    CBM_LANG_AWK,
+    CBM_LANG_ZSH,
+    CBM_LANG_TCL,
+    CBM_LANG_ADA,
+    CBM_LANG_AGDA,
+    CBM_LANG_RACKET,
+    CBM_LANG_ODIN,
+    CBM_LANG_RESCRIPT,
+    CBM_LANG_PURESCRIPT,
+    CBM_LANG_NICKEL,
+    CBM_LANG_CRYSTAL,
+    CBM_LANG_TEAL,
+    CBM_LANG_HARE,
+    CBM_LANG_PONY,
+    CBM_LANG_LUAU,
+    CBM_LANG_JANET,
+    CBM_LANG_SWAY,
+    CBM_LANG_NASM,
+    CBM_LANG_ASSEMBLY,
+    CBM_LANG_ASTRO,
+    CBM_LANG_BLADE,
+    CBM_LANG_JUST,
+    CBM_LANG_GOTEMPLATE,
+    CBM_LANG_TEMPL,
+    CBM_LANG_LIQUID,
+    CBM_LANG_JINJA2,
+    CBM_LANG_PRISMA,
+    CBM_LANG_HYPRLANG,
+    CBM_LANG_DOTENV,
+    CBM_LANG_DIFF,
+    CBM_LANG_WGSL,
+    CBM_LANG_KDL,
+    CBM_LANG_JSON5,
+    CBM_LANG_JSONNET,
+    CBM_LANG_RON,
+    CBM_LANG_THRIFT,
+    CBM_LANG_CAPNP,
+    CBM_LANG_PROPERTIES,
+    CBM_LANG_SSHCONFIG,
+    CBM_LANG_BIBTEX,
+    CBM_LANG_STARLARK,
+    CBM_LANG_BICEP,
+    CBM_LANG_CSV,
+    CBM_LANG_REQUIREMENTS,
+    CBM_LANG_HLSL,
+    CBM_LANG_VHDL,
+    CBM_LANG_SYSTEMVERILOG,
+    CBM_LANG_DEVICETREE,
+    CBM_LANG_LINKERSCRIPT,
+    CBM_LANG_GN,
+    CBM_LANG_KCONFIG,
+    CBM_LANG_BITBAKE,
+    CBM_LANG_SMALI,
+    CBM_LANG_TABLEGEN,
+    CBM_LANG_ISPC,
+    CBM_LANG_CAIRO,
+    CBM_LANG_MOVE,
+    CBM_LANG_SQUIRREL,
+    CBM_LANG_FUNC,
+    CBM_LANG_REGEX,
+    CBM_LANG_JSDOC,
+    CBM_LANG_RST,
+    CBM_LANG_BEANCOUNT,
+    CBM_LANG_MERMAID,
+    CBM_LANG_PUPPET,
+    CBM_LANG_PO,
+    CBM_LANG_GITATTRIBUTES,
+    CBM_LANG_GITIGNORE,
+    CBM_LANG_SLANG,
+    CBM_LANG_LLVM_IR,
+    CBM_LANG_SMITHY,
+    CBM_LANG_WIT,
+    CBM_LANG_TLAPLUS,
+    CBM_LANG_PKL,
+    CBM_LANG_GOMOD,
+    CBM_LANG_APEX,
+    CBM_LANG_SOQL,
+    CBM_LANG_SOSL,
     CBM_LANG_KUSTOMIZE, // kustomization.yaml — Kubernetes overlay tool
     CBM_LANG_K8S,       // Generic Kubernetes manifest (apiVersion: detected)
     CBM_LANG_COUNT
@@ -110,6 +198,8 @@ typedef struct {
     bool is_abstract;
     bool is_test;
     bool is_entry_point;
+    const char *structural_profile; // AST structural profile (arena-allocated) or NULL
+    const char *body_tokens; // space-separated raw identifier tokens from body (arena) or NULL
 } CBMDefinition;
 
 /* Argument captured from a call expression */
@@ -190,6 +280,24 @@ typedef struct {
     const char *target_url;  // push_endpoint, uri, or http_target URL
     const char *broker;      // "pubsub", "cloud_tasks", "cloud_scheduler", "sqs", "kafka"
 } CBMInfraBinding;
+
+/* Pub/sub channel participation.  One record per emit() or on()/addListener()
+ * call detected in source — the receiver (e.g. Socket.IO client, EventEmitter
+ * instance) is intentionally NOT identified; matching is by channel_name
+ * across files, which captures the common pattern of one logical bus per
+ * service.  Transport disambiguates Socket.IO vs EventEmitter vs future
+ * detectors (Kafka, Cloud Pub/Sub, etc.). */
+typedef enum {
+    CBM_CHANNEL_EMIT = 0,
+    CBM_CHANNEL_LISTEN = 1,
+} CBMChannelDirection;
+
+typedef struct {
+    const char *channel_name;      // literal channel name (e.g. "user.created")
+    const char *transport;         // "socketio", "event_emitter", ...
+    const char *enclosing_func_qn; // QN of the function containing the emit/on call
+    CBMChannelDirection direction;
+} CBMChannel;
 
 // Rust: impl Trait for Struct
 typedef struct {
@@ -285,6 +393,12 @@ typedef struct {
     int cap;
 } CBMImplTraitArray;
 
+typedef struct {
+    CBMChannel *items;
+    int count;
+    int cap;
+} CBMChannelArray;
+
 // Full extraction result for one file.
 typedef struct {
     CBMArena arena; // owns all string memory
@@ -302,6 +416,7 @@ typedef struct {
     CBMResolvedCallArray resolved_calls; // LSP-resolved calls (high confidence)
     CBMStringRefArray string_refs;       // URL/config string literals from AST
     CBMInfraBindingArray infra_bindings; // topic→URL pairs from IaC configs
+    CBMChannelArray channels;            // Socket.IO / EventEmitter pub/sub participation
 
     const char *module_qn;    // module qualified name
     const char **exports;     // NULL-terminated (NULL if none)
@@ -420,6 +535,7 @@ void cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr);
 void cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBinding ib);
 void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
 void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
+void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
 
 // --- Sub-extractor entry points ---
 
@@ -431,6 +547,7 @@ void cbm_extract_semantic(CBMExtractCtx *ctx);
 void cbm_extract_type_refs(CBMExtractCtx *ctx);
 void cbm_extract_env_accesses(CBMExtractCtx *ctx);
 void cbm_extract_type_assigns(CBMExtractCtx *ctx);
+void cbm_extract_channels(CBMExtractCtx *ctx);
 
 // Single-pass unified extraction (replaces the 7 calls above except defs+imports).
 void cbm_extract_unified(CBMExtractCtx *ctx);

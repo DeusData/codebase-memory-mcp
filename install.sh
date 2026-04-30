@@ -11,11 +11,23 @@ set -euo pipefail
 # Environment:
 #   CBM_DOWNLOAD_URL  Override base URL for downloads (for testing)
 
+# Wrap in main() to prevent partial execution from piped downloads.
+# If curl|bash is interrupted mid-transfer, bash would execute the partial
+# script. With this wrapper, the function is defined but main() is never
+# called because the final line hasn't arrived yet.
+main() {
+
 REPO="DeusData/codebase-memory-mcp"
 INSTALL_DIR="$HOME/.local/bin"
 VARIANT="standard"
 SKIP_CONFIG=false
 CBM_DOWNLOAD_URL="${CBM_DOWNLOAD_URL:-https://github.com/${REPO}/releases/latest/download}"
+
+# Security: reject non-HTTPS download URLs (defense-in-depth)
+case "$CBM_DOWNLOAD_URL" in
+    https://*|http://localhost*|http://127.0.0.1*) ;;
+    *) echo "error: refusing non-HTTPS download URL: $CBM_DOWNLOAD_URL" >&2; exit 1 ;;
+esac
 
 for arg in "$@"; do
     case "$arg" in
@@ -196,3 +208,7 @@ fi
 
 echo ""
 echo "Done! Restart your coding agent to start using codebase-memory-mcp."
+
+} # end main()
+
+main "$@"

@@ -36,6 +36,8 @@ extern void suite_pipeline(void);
 extern void suite_fqn(void);
 extern void suite_watcher(void);
 extern void suite_lz4(void);
+extern void suite_zstd(void);
+extern void suite_artifact(void);
 extern void suite_sqlite_writer(void);
 extern void suite_go_lsp(void);
 extern void suite_c_lsp(void);
@@ -101,9 +103,13 @@ int main(void) {
     /* Watcher (M10) */
     RUN_SUITE(watcher);
 
-    /* LZ4 + SQLite writer */
+    /* LZ4 + zstd + SQLite writer */
     RUN_SUITE(lz4);
+    RUN_SUITE(zstd);
     RUN_SUITE(sqlite_writer);
+
+    /* Persistent artifact export/import */
+    RUN_SUITE(artifact);
 
     /* LSP resolvers */
     RUN_SUITE(go_lsp);

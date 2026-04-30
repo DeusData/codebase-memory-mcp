@@ -1,0 +1,16 @@
+pkgbase = codebase-memory-mcp
+	pkgdesc = Fast code intelligence engine for AI coding agents — single static binary MCP server
+	pkgver = 0.6.0
+	pkgrel = 1
+	url = https://github.com/DeusData/codebase-memory-mcp
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	provides = codebase-memory-mcp
+	conflicts = codebase-memory-mcp
+	source_x86_64 = codebase-memory-mcp-0.6.0-linux-amd64.tar.gz::https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.6.0/codebase-memory-mcp-linux-amd64.tar.gz
+	sha256sums_x86_64 = 0dfd70f73337219925f3ec6a572fe776dbbe1c4c8c6ab546ab214fe16e56a426
+	source_aarch64 = codebase-memory-mcp-0.6.0-linux-arm64.tar.gz::https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.6.0/codebase-memory-mcp-linux-arm64.tar.gz
+	sha256sums_aarch64 = f1fad27262fe7af4a356af128e43942355cb2189491079b6790ecc5ae3af069c
+
+pkgname = codebase-memory-mcp

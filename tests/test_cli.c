@@ -1438,6 +1438,8 @@ TEST(cli_detect_agents_finds_zed) {
     char dir[512];
 #ifdef __APPLE__
     snprintf(dir, sizeof(dir), "%s/Library/Application Support/Zed", tmpdir);
+#elif defined(_WIN32)
+    snprintf(dir, sizeof(dir), "%s/AppData/Local/Zed", tmpdir);
 #else
     snprintf(dir, sizeof(dir), "%s/.config/zed", tmpdir);
 #endif
@@ -1478,6 +1480,9 @@ TEST(cli_detect_agents_finds_kilocode) {
 #ifdef __APPLE__
     snprintf(dir, sizeof(dir),
              "%s/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code", tmpdir);
+#elif defined(_WIN32)
+    snprintf(dir, sizeof(dir),
+             "%s/AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code", tmpdir);
 #else
     snprintf(dir, sizeof(dir), "%s/.config/Code/User/globalStorage/kilocode.kilo-code", tmpdir);
 #endif
@@ -1485,6 +1490,23 @@ TEST(cli_detect_agents_finds_kilocode) {
 
     cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
     ASSERT_TRUE(agents.kilocode);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_detect_agents_finds_kiro) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-detect-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.kiro", tmpdir);
+    test_mkdirp(dir);
+
+    cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+    ASSERT_TRUE(agents.kiro);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -1506,6 +1528,7 @@ TEST(cli_detect_agents_none_found) {
     ASSERT_FALSE(agents.zed);
     ASSERT_FALSE(agents.antigravity);
     ASSERT_FALSE(agents.kilocode);
+    ASSERT_FALSE(agents.kiro);
 
     rmdir(tmpdir);
     PASS();
@@ -2420,6 +2443,7 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_zed);
     RUN_TEST(cli_detect_agents_finds_antigravity);
     RUN_TEST(cli_detect_agents_finds_kilocode);
+    RUN_TEST(cli_detect_agents_finds_kiro);
     RUN_TEST(cli_detect_agents_none_found);
 
     /* Codex MCP config upsert (3 tests — group B) */

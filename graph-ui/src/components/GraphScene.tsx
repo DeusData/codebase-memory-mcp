@@ -8,7 +8,7 @@ import { NodeCloud } from "./NodeCloud";
 import { EdgeLines } from "./EdgeLines";
 import { NodeLabels } from "./NodeLabels";
 import { NodeTooltip } from "./NodeTooltip";
-import type { GraphData, GraphNode } from "../lib/types";
+import type { GraphData, GraphNode, LinkedProject } from "../lib/types";
 
 /* ── Camera fly-to animation ────────────────────────────── */
 
@@ -132,6 +132,33 @@ export function GraphScene({
         onClick={onNodeClick}
       />
       {showLabels && <NodeLabels nodes={data.nodes} highlightedIds={highlightedIds} />}
+
+      {/* Satellite galaxies for cross-repo linked projects */}
+      {data.linked_projects?.map((lp: LinkedProject) => {
+        const offsetNodes = lp.nodes.map((n) => ({
+          ...n,
+          x: n.x + lp.offset.x,
+          y: n.y + lp.offset.y,
+          z: n.z + lp.offset.z,
+        }));
+        return (
+          <group key={lp.project}>
+            <EdgeLines
+              nodes={offsetNodes}
+              edges={lp.edges}
+              highlightedIds={null}
+              opacity={0.3}
+            />
+            <NodeCloud
+              nodes={offsetNodes}
+              highlightedIds={null}
+              onHover={setHovered}
+              onClick={onNodeClick}
+              opacity={0.5}
+            />
+          </group>
+        );
+      })}
 
       {hovered && <NodeTooltip node={hovered} />}
 

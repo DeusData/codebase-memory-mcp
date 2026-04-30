@@ -26,6 +26,8 @@ enum {
 #define PP_NSEC_PER_SEC 1000000000ULL
 #define PP_USEC_PER_MS 1000000ULL
 #define PP_HALF_CONF 0.5
+#define PP_FIELD_HINT_CONF 0.85
+enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/worker_pool.h"
@@ -37,9 +39,12 @@ enum {
 #include "foundation/log.h"
 #include "foundation/slab_alloc.h"
 #include "foundation/mem.h"
+#include "foundation/str_util.h"
+#include "foundation/profile.h"
 #include "foundation/compat_regex.h"
 #include "cbm.h"
 #include "simhash/minhash.h"
+#include "semantic/ast_profile.h"
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -221,6 +226,16 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
         char fp_hex[CBM_MINHASH_HEX_BUF];
         cbm_minhash_to_hex((const cbm_minhash_t *)def->fingerprint, fp_hex, sizeof(fp_hex));
         append_json_string(buf, bufsize, &pos, "fp", fp_hex);
+    }
+
+    /* AST structural profile — append if present and buffer has room. */
+    if (def->structural_profile && pos + CBM_AST_PROFILE_BUF < bufsize) {
+        append_json_string(buf, bufsize, &pos, "sp", def->structural_profile);
+    }
+
+    /* Body tokens — raw identifiers from function body AST for semantic search. */
+    if (def->body_tokens && pos + CBM_SZ_512 < bufsize) {
+        append_json_string(buf, bufsize, &pos, "bt", def->body_tokens);
     }
 
     if (pos < bufsize - SKIP_ONE) {
@@ -1121,6 +1136,8 @@ typedef struct {
     _Atomic int64_t *shared_ids;
     _Atomic int *cancelled;
     _Atomic int next_file_idx;
+
+    cbm_pkg_entries_t *pkg_entries; /* per-worker manifest arrays (separate allocation) */
 } extract_ctx_t;
 
 /* Insert one definition node (and its route if present) into the local gbuf. */
@@ -1226,6 +1243,13 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         /* Free TSTree immediately — arena strings survive for registry+resolve. */
         cbm_free_tree(result);
 
+        /* Detect and parse manifest files for package map */
+        {
+            const char *bn = strrchr(fi->rel_path, '/');
+            cbm_pkgmap_try_parse(bn ? bn + SKIP_ONE : fi->rel_path, fi->rel_path, source,
+                                 source_len, &ec->pkg_entries[worker_id]);
+        }
+
         /* Reset parser state between files, but keep parser/slab allocations
          * owned by this worker alive until thread exit. This avoids freeing
          * parser-owned buffers while tree-sitter may still reference them. */
@@ -1251,6 +1275,28 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
     cbm_slab_destroy_thread();
 }
 
+static void merge_pkg_entries(cbm_pipeline_ctx_t *ctx, cbm_pkg_entries_t *pkg_entries,
+                              int worker_count) {
+    if (!pkg_entries) {
+        return;
+    }
+    cbm_pipeline_set_pkgmap(cbm_pkgmap_build(pkg_entries, worker_count, ctx->project_name));
+    for (int i = 0; i < worker_count; i++) {
+        cbm_pkg_entries_free(&pkg_entries[i]);
+    }
+    free(pkg_entries);
+}
+
+static void log_extract_mem_stats(int worker_count) {
+    if (cbm_mem_budget() > 0) {
+        size_t mb = (size_t)CBM_SZ_1K * CBM_SZ_1K;
+        cbm_log_info("parallel.extract.mem", "rss_mb", itoa_log((int)(cbm_mem_rss() / mb)),
+                     "peak_mb", itoa_log((int)(cbm_mem_peak_rss() / mb)), "budget_mb",
+                     itoa_log((int)(cbm_mem_budget() / mb)), "per_worker_mb",
+                     itoa_log((int)(cbm_mem_worker_budget(worker_count) / mb)));
+    }
+}
+
 int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                          CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                          int worker_count) {
@@ -1270,21 +1316,25 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
                      itoa_log((int)(worker_budget / ((size_t)CBM_SZ_1K * CBM_SZ_1K))));
     }
 
-    /* Ensure extraction library is initialized */
+    /* Sub-phase: Ensure extraction library is initialized */
+    CBM_PROF_START(t_init);
     cbm_init();
 
     /* Slab allocator for tree-sitter (thread-safe via TLS).
      * Worker threads keep parser/slab state for their full lifetime and tear it
      * down in parser-before-slab order at thread exit. */
     cbm_slab_install();
+    CBM_PROF_END("parallel_extract", "1_init_libs", t_init);
 
-    /* Sort files by descending size for tail-latency reduction */
+    /* Sub-phase: Sort files by descending size for tail-latency reduction */
+    CBM_PROF_START(t_sort);
     file_sort_entry_t *sorted = malloc(file_count * sizeof(file_sort_entry_t));
     for (int i = 0; i < file_count; i++) {
         sorted[i].idx = i;
         sorted[i].size = files[i].size;
     }
     qsort(sorted, file_count, sizeof(file_sort_entry_t), compare_by_size_desc);
+    CBM_PROF_END_N("parallel_extract", "2_sort_files", t_sort, file_count);
 
     /* Allocate per-worker state (cache-line aligned via posix_memalign) */
     extract_worker_state_t *workers = NULL;
@@ -1294,6 +1344,9 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         return CBM_NOT_FOUND;
     }
     memset(workers, 0, (size_t)worker_count * sizeof(extract_worker_state_t));
+
+    /* Per-worker manifest entry arrays (separate from cache-line-aligned worker state) */
+    cbm_pkg_entries_t *pkg_entries = calloc(worker_count, sizeof(cbm_pkg_entries_t));
 
     extract_ctx_t ec = {
         .files = files,
@@ -1306,15 +1359,19 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .result_cache = result_cache,
         .shared_ids = shared_ids,
         .cancelled = ctx->cancelled,
+        .pkg_entries = pkg_entries,
     };
     atomic_init(&ec.next_worker_id, 0);
     atomic_init(&ec.next_file_idx, 0);
 
-    /* Dispatch workers */
+    /* Sub-phase: Dispatch workers (parse + extract per file, PARALLEL) */
+    CBM_PROF_START(t_dispatch);
     cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
     cbm_parallel_for(worker_count, extract_worker, &ec, opts);
+    CBM_PROF_END_N("parallel_extract", "3_dispatch_workers_parallel", t_dispatch, file_count);
 
-    /* Merge all local gbufs into main gbuf */
+    /* Sub-phase: Merge all local gbufs into main gbuf (SEQUENTIAL, gbuf not thread-safe) */
+    CBM_PROF_START(t_merge);
     int total_nodes = 0;
     int total_errors = 0;
     for (int i = 0; i < worker_count; i++) {
@@ -1325,6 +1382,9 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
             cbm_gbuf_free(workers[i].local_gbuf);
         }
     }
+    CBM_PROF_END_N("parallel_extract", "4_merge_gbufs_seq", t_merge, total_nodes);
+
+    merge_pkg_entries(ctx, pkg_entries, worker_count);
 
     cbm_aligned_free(workers);
     free(sorted);
@@ -1333,16 +1393,7 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         return CBM_NOT_FOUND;
     }
 
-    /* RSS-based memory stats after extraction */
-    if (cbm_mem_budget() > 0) {
-        size_t rss_mb = cbm_mem_rss() / ((size_t)CBM_SZ_1K * CBM_SZ_1K);
-        size_t peak_mb = cbm_mem_peak_rss() / ((size_t)CBM_SZ_1K * CBM_SZ_1K);
-        size_t budget_mb = cbm_mem_budget() / ((size_t)CBM_SZ_1K * CBM_SZ_1K);
-        size_t worker_mb = cbm_mem_worker_budget(worker_count) / ((size_t)CBM_SZ_1K * CBM_SZ_1K);
-        cbm_log_info("parallel.extract.mem", "rss_mb", itoa_log((int)rss_mb), "peak_mb",
-                     itoa_log((int)peak_mb), "budget_mb", itoa_log((int)budget_mb), "per_worker_mb",
-                     itoa_log((int)worker_mb));
-    }
+    log_extract_mem_stats(worker_count);
 
     cbm_log_info("parallel.extract.done", "nodes", itoa_log(total_nodes), "errors",
                  itoa_log(total_errors));
@@ -1358,8 +1409,9 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     if (!def->name || !def->qualified_name || !def->label) {
         return 0;
     }
+    /* Register callable symbols + Interface — see pass_definitions.c for rationale. */
     if (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
-        strcmp(def->label, "Class") == 0) {
+        strcmp(def->label, "Class") == 0 || strcmp(def->label, "Interface") == 0) {
         cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
         (*reg_entries)++;
     }
@@ -1378,6 +1430,115 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
         }
     }
     return edges;
+}
+
+/* Create IMPORTS edges for one file's imports (parallel path). */
+static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
+                                const char *rel) {
+    int count = 0;
+    for (int j = 0; j < result->imports.count; j++) {
+        CBMImport *imp = &result->imports.items[j];
+        if (!imp->module_path) {
+            continue;
+        }
+        char normalized_path[CBM_SZ_1K] = {0};
+        bool has_normalized = gdscript_normalize_module_path(imp->module_path, normalized_path,
+                                                            sizeof(normalized_path));
+        bool is_gdscript_import = has_normalized && gdscript_fp_ends_with(normalized_path, ".gd");
+        bool exists = false;
+
+        if (is_gdscript_import) {
+            exists = gdscript_repo_file_exists(ctx, normalized_path);
+        }
+        if (is_gdscript_import && !exists) {
+            char resolved_path[CBM_SZ_1K] = {0};
+            if (gdscript_resolve_relative_module_path(rel, normalized_path, resolved_path,
+                                                     sizeof(resolved_path)) &&
+                gdscript_repo_file_exists(ctx, resolved_path)) {
+                memcpy(normalized_path, resolved_path, sizeof(normalized_path));
+                exists = true;
+            }
+        }
+
+        char *target_qn = cbm_pipeline_resolve_module(ctx, rel, imp->module_path);
+        if (is_gdscript_import) {
+            free(target_qn);
+            target_qn = cbm_pipeline_fqn_module(ctx->project_name, normalized_path);
+        }
+        if (!target_qn) {
+            continue;
+        }
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
+
+        if (is_gdscript_import && !exists) {
+            target = NULL;
+        } else if (!target && is_gdscript_import) {
+            int64_t target_id = cbm_gbuf_upsert_node(
+                ctx->gbuf, "Module", gdscript_module_name_from_path(normalized_path), target_qn,
+                normalized_path, 0, 0, "{}");
+            if (target_id > 0) {
+                target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
+            }
+        }
+
+        char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+        const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
+        if (source_node && target) {
+            char esc_ln[CBM_SZ_128];
+            cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
+            char imp_props[CBM_SZ_256];
+            snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
+            cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
+            count++;
+        }
+        free(target_qn);
+        free(file_qn);
+    }
+    return count;
+}
+
+/* Find channel source node (enclosing function or file). */
+static const cbm_gbuf_node_t *find_channel_src(cbm_pipeline_ctx_t *ctx, const CBMChannel *ch,
+                                               const char *rel) {
+    const cbm_gbuf_node_t *node = NULL;
+    if (ch->enclosing_func_qn && ch->enclosing_func_qn[0]) {
+        node = cbm_gbuf_find_by_qn(ctx->gbuf, ch->enclosing_func_qn);
+    }
+    if (!node) {
+        char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+        node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
+        free(file_qn);
+    }
+    return node;
+}
+
+/* Create Channel nodes + EMITS/LISTENS_ON edges for one file. */
+static void create_channel_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
+                                 const char *rel) {
+    for (int j = 0; j < result->channels.count; j++) {
+        CBMChannel *ch = &result->channels.items[j];
+        if (!ch->channel_name || !ch->channel_name[0]) {
+            continue;
+        }
+        char channel_qn[CBM_SZ_512];
+        snprintf(channel_qn, sizeof(channel_qn), "__channel__%s__%s",
+                 ch->transport ? ch->transport : "unknown", ch->channel_name);
+        char esc_cn[CBM_SZ_256];
+        cbm_json_escape(esc_cn, sizeof(esc_cn), ch->channel_name);
+        char channel_props[CBM_SZ_512];
+        snprintf(channel_props, sizeof(channel_props), "{\"transport\":\"%s\",\"name\":\"%s\"}",
+                 ch->transport ? ch->transport : "unknown", esc_cn);
+        int64_t channel_id = cbm_gbuf_upsert_node(ctx->gbuf, "Channel", ch->channel_name,
+                                                  channel_qn, "", 0, 0, channel_props);
+        const cbm_gbuf_node_t *src_node = find_channel_src(ctx, ch, rel);
+        if (src_node && channel_id > 0) {
+            const char *edge_type = ch->direction == CBM_CHANNEL_EMIT ? "EMITS" : "LISTENS_ON";
+            char edge_props[CBM_SZ_128];
+            snprintf(edge_props, sizeof(edge_props), "{\"transport\":\"%s\"}",
+                     ch->transport ? ch->transport : "unknown");
+            cbm_gbuf_insert_edge(ctx->gbuf, src_node->id, channel_id, edge_type, edge_props);
+        }
+    }
 }
 
 int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
@@ -1405,60 +1566,8 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             defines_edges += register_and_link_def(ctx, &result->defs.items[d], rel, &reg_entries);
         }
 
-        /* IMPORTS edges */
-        for (int j = 0; j < result->imports.count; j++) {
-            CBMImport *imp = &result->imports.items[j];
-            if (!imp->module_path) {
-                continue;
-            }
-
-            char normalized_path[CBM_SZ_1K] = {0};
-            if (!gdscript_normalize_module_path(imp->module_path, normalized_path,
-                                               sizeof(normalized_path))) {
-                continue;
-            }
-
-            bool exists = gdscript_repo_file_exists(ctx, normalized_path);
-            if (!exists && gdscript_fp_ends_with(normalized_path, ".gd")) {
-                char resolved_path[CBM_SZ_1K] = {0};
-                if (gdscript_resolve_relative_module_path(rel, normalized_path, resolved_path,
-                                                         sizeof(resolved_path)) &&
-                    gdscript_repo_file_exists(ctx, resolved_path)) {
-                    memcpy(normalized_path, resolved_path, sizeof(normalized_path));
-                    exists = true;
-                }
-            }
-
-            char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, normalized_path);
-            const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
-
-            /* GDScript: create Module node for .gd imports if missing
-             * (matches pass_definitions.c lines 351-354) */
-            if (gdscript_fp_ends_with(normalized_path, ".gd") && !exists) {
-                target = NULL;
-            } else if (!target && gdscript_fp_ends_with(normalized_path, ".gd")) {
-                int64_t target_id =
-                    cbm_gbuf_upsert_node(ctx->gbuf, "Module",
-                                         gdscript_module_name_from_path(normalized_path),
-                                         target_qn, normalized_path, 0, 0, "{}");
-                if (target_id > 0) {
-                    target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
-                }
-            }
-
-            char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
-            const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-
-            if (source_node && target) {
-                char imp_props[CBM_SZ_256];
-                snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}",
-                         imp->local_name ? imp->local_name : "");
-                cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
-                imports_edges++;
-            }
-            free(target_qn);
-            free(file_qn);
-        }
+        imports_edges += create_imports_edges(ctx, result, rel);
+        create_channel_edges(ctx, result, rel);
     }
 
     cbm_log_info("parallel.registry.done", "entries", itoa_log(reg_entries), "defines",
@@ -1518,19 +1627,27 @@ static void sanitize_expr(char *expr_buf, const char *expr) {
 
 /* Format one call arg as JSON. Returns snprintf result. */
 static int format_call_arg(char *buf, size_t bufsize, const CBMCallArg *a, const char *expr) {
+    char esc_k[CBM_SZ_128];
+    char esc_e[CBM_SZ_128];
+    char esc_v[CBM_SZ_128];
+    cbm_json_escape(esc_e, sizeof(esc_e), expr);
     if (a->keyword && a->value) {
+        cbm_json_escape(esc_k, sizeof(esc_k), a->keyword);
+        cbm_json_escape(esc_v, sizeof(esc_v), a->value);
         return snprintf(buf, bufsize, "{\"i\":%d,\"k\":\"%s\",\"e\":\"%s\",\"v\":\"%s\"}", a->index,
-                        a->keyword, expr, a->value);
+                        esc_k, esc_e, esc_v);
     }
     if (a->keyword) {
-        return snprintf(buf, bufsize, "{\"i\":%d,\"k\":\"%s\",\"e\":\"%s\"}", a->index, a->keyword,
-                        expr);
+        cbm_json_escape(esc_k, sizeof(esc_k), a->keyword);
+        return snprintf(buf, bufsize, "{\"i\":%d,\"k\":\"%s\",\"e\":\"%s\"}", a->index, esc_k,
+                        esc_e);
     }
     if (a->value) {
-        return snprintf(buf, bufsize, "{\"i\":%d,\"e\":\"%s\",\"v\":\"%s\"}", a->index, expr,
-                        a->value);
+        cbm_json_escape(esc_v, sizeof(esc_v), a->value);
+        return snprintf(buf, bufsize, "{\"i\":%d,\"e\":\"%s\",\"v\":\"%s\"}", a->index, esc_e,
+                        esc_v);
     }
-    return snprintf(buf, bufsize, "{\"i\":%d,\"e\":\"%s\"}", a->index, expr);
+    return snprintf(buf, bufsize, "{\"i\":%d,\"e\":\"%s\"}", a->index, esc_e);
 }
 
 static size_t append_args_json(char *buf, size_t bufsize, size_t pos, const CBMCall *call) {
@@ -1615,9 +1732,9 @@ static const char *find_route_path_in_args(const CBMCall *call, const char **out
 /* Build props JSON, append args, close brace, emit edge. */
 static void finalize_and_emit(cbm_gbuf_t *gbuf, int64_t src_id, int64_t tgt_id,
                               const char *edge_type, char *props, int n, const CBMCall *call) {
-    if (n > 0 && (size_t)n < sizeof(props) - PP_ESC_SPACE) {
+    if (n > 0 && (size_t)n < CBM_SZ_2K - PP_ESC_SPACE) {
         size_t pos = append_args_json(props, CBM_SZ_2K, (size_t)n, call);
-        if (pos < sizeof(props) - SKIP_ONE) {
+        if (pos < CBM_SZ_2K - SKIP_ONE) {
             props[pos] = '}';
             props[pos + SKIP_ONE] = '\0';
         }
@@ -1659,9 +1776,12 @@ static void emit_http_async_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t
 
     int64_t route_id = build_service_route(gbuf, arg, method, broker, svc);
 
+    char esc_c[CBM_SZ_256];
+    char esc_a[CBM_SZ_256];
+    cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
+    cbm_json_escape(esc_a, sizeof(esc_a), arg);
     char props[CBM_SZ_2K];
-    int n = snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"",
-                     call->callee_name, arg);
+    int n = snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"", esc_c, esc_a);
     if (method) {
         n += snprintf(props + n, sizeof(props) - (size_t)n, ",\"method\":\"%s\"", method);
     }
@@ -1675,9 +1795,13 @@ static void emit_http_async_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t
 static void emit_config_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                              const cbm_gbuf_node_t *target, const CBMCall *call,
                              const cbm_resolution_t *res, const char *arg) {
+    char esc_c[CBM_SZ_256];
+    char esc_k[CBM_SZ_256];
+    cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
+    cbm_json_escape(esc_k, sizeof(esc_k), arg ? arg : "");
     char props[CBM_SZ_2K];
     int n = snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"key\":\"%s\",\"confidence\":%.2f",
-                     call->callee_name, arg ? arg : "", res->confidence);
+                     esc_c, esc_k, res->confidence);
     finalize_and_emit(gbuf, source->id, target->id, "CONFIGURES", props, n, call);
 }
 
@@ -1685,10 +1809,12 @@ static void emit_config_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
 static void emit_normal_calls_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                                    const cbm_gbuf_node_t *target, const CBMCall *call,
                                    const cbm_resolution_t *res) {
+    char esc_c[CBM_SZ_256];
+    cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
     char props[CBM_SZ_2K];
     int n = snprintf(props, sizeof(props),
                      "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d",
-                     call->callee_name, res->confidence, res->strategy ? res->strategy : "unknown",
+                     esc_c, res->confidence, res->strategy ? res->strategy : "unknown",
                      res->candidate_count);
     finalize_and_emit(gbuf, source->id, target->id, "CALLS", props, n, call);
 }
@@ -1791,13 +1917,175 @@ static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         snprintf(route_qn, sizeof(route_qn), "__route__ANY__%s", norm);
         int64_t route_id = cbm_gbuf_upsert_node(gbuf, "Route", norm, route_qn, "", 0, 0,
                                                 "{\"source\":\"arg_url\"}");
+        char esc_c[CBM_SZ_256];
+        char esc_n[CBM_SZ_256];
+        cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
+        cbm_json_escape(esc_n, sizeof(esc_n), norm);
         char eprops[CBM_SZ_512];
         snprintf(eprops, sizeof(eprops),
-                 "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"arg_url\"}", call->callee_name,
-                 norm);
+                 "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"arg_url\"}", esc_c, esc_n);
         cbm_gbuf_insert_edge(gbuf, source->id, route_id, "HTTP_CALLS", eprops);
         break;
     }
+}
+
+/* Extract gRPC service and method from a callee name.
+ * Handles patterns like: pb.NewFooServiceClient(conn).GetBar → Foo/GetBar
+ * Also: FooServiceGrpc.newBlockingStub(ch).getBar → FooService/getBar */
+static bool extract_grpc_service_method(const char *callee, char *service, size_t srv_sz,
+                                        char *method, size_t meth_sz) {
+    service[0] = '\0';
+    method[0] = '\0';
+    if (!callee) {
+        return false;
+    }
+    /* Find last dot to split service.Method */
+    const char *last_dot = strrchr(callee, '.');
+    if (!last_dot || !last_dot[SKIP_ONE]) {
+        return false;
+    }
+    snprintf(method, meth_sz, "%s", last_dot + SKIP_ONE);
+
+    /* Extract service name: everything before the last dot, stripped of prefixes/suffixes */
+    size_t prefix_len = (size_t)(last_dot - callee);
+    char raw[CBM_SZ_256];
+    if (prefix_len >= sizeof(raw)) {
+        prefix_len = sizeof(raw) - SKIP_ONE;
+    }
+    memcpy(raw, callee, prefix_len);
+    raw[prefix_len] = '\0';
+
+    /* Strip common prefixes: pb.New, New, pb. */
+    const char *s = raw;
+    if (strncmp(s, "pb.New", CBM_SZ_6) == 0) {
+        s += CBM_SZ_6;
+    } else if (strncmp(s, "pb.", CBM_SZ_3) == 0 || strncmp(s, "New", CBM_SZ_3) == 0) {
+        s += CBM_SZ_3;
+    }
+
+    /* Strip common suffixes: Client, ServiceClient, ServiceGrpc, Stub */
+    snprintf(service, srv_sz, "%s", s);
+    size_t slen = strlen(service);
+    static const char *suffixes[] = {"ServiceClient", "Client", "ServiceGrpc", "BlockingStub",
+                                     "FutureStub",    "Stub",   "Servicer",    NULL};
+    for (const char **sfx = suffixes; *sfx; sfx++) {
+        size_t flen = strlen(*sfx);
+        if (slen > flen && strcmp(service + slen - flen, *sfx) == 0) {
+            service[slen - flen] = '\0';
+            break;
+        }
+    }
+
+    return service[0] && method[0];
+}
+
+/* Emit GRPC_CALLS edge via gRPC Route node. */
+static void emit_grpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
+                           const cbm_resolution_t *res) {
+    char service[CBM_SZ_256];
+    char method[CBM_SZ_256];
+    /* Try callee_name first (e.g., "pb.NewCartServiceClient.GetCart") */
+    if (!extract_grpc_service_method(call->callee_name, service, sizeof(service), method,
+                                     sizeof(method))) {
+        /* Fallback: try the resolved QN for Go chained calls.
+         * Go pattern: pb.NewCartServiceClient(conn).GetCart(ctx, req)
+         * callee_name = "GetCart", QN = "...CartServiceClient.GetCart"
+         * The QN contains the full ServiceClient.Method pattern. */
+        if (!res->qualified_name ||
+            !extract_grpc_service_method(res->qualified_name, service, sizeof(service), method,
+                                         sizeof(method))) {
+            return;
+        }
+    }
+
+    char route_qn[CBM_SZ_512];
+    snprintf(route_qn, sizeof(route_qn), "__grpc__%s/%s", service, method);
+
+    char route_name[CBM_SZ_256];
+    snprintf(route_name, sizeof(route_name), "%s/%s", service, method);
+
+    int64_t route_id = cbm_gbuf_upsert_node(gbuf, "Route", route_name, route_qn, "", 0, 0,
+                                            "{\"source\":\"grpc\"}");
+
+    char esc_c[CBM_SZ_256];
+    cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
+    char props[CBM_SZ_1K];
+    snprintf(props, sizeof(props),
+             "{\"callee\":\"%s\",\"service\":\"%s\",\"method\":\"%s\",\"confidence\":%.2f}", esc_c,
+             service, method, res->confidence);
+    cbm_gbuf_insert_edge(gbuf, source->id, route_id, "GRPC_CALLS", props);
+}
+
+/* Emit GRAPHQL_CALLS edge. Extract operation from first string arg if available. */
+static void emit_graphql_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
+                              const cbm_resolution_t *res) {
+    const char *op = call->first_string_arg;
+    if (!op || !op[0]) {
+        op = call->callee_name;
+    }
+    /* Try to extract a query/mutation name from the operation string */
+    char op_name[CBM_SZ_256];
+    snprintf(op_name, sizeof(op_name), "%s", op);
+    /* Trim leading whitespace and "query "/"mutation " prefix */
+    const char *p = op_name;
+    while (*p == ' ' || *p == '\t' || *p == '\n') {
+        p++;
+    }
+    if (strncmp(p, "query ", CBM_SZ_6) == 0) {
+        p += CBM_SZ_6;
+    } else if (strncmp(p, "mutation ", CBM_SZ_8) == 0) {
+        p += CBM_SZ_8;
+    }
+
+    char route_qn[CBM_SZ_512];
+    snprintf(route_qn, sizeof(route_qn), "__graphql__%s", p);
+
+    int64_t route_id =
+        cbm_gbuf_upsert_node(gbuf, "Route", p, route_qn, "", 0, 0, "{\"source\":\"graphql\"}");
+
+    char esc_c[CBM_SZ_256];
+    cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
+    char props[CBM_SZ_1K];
+    snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"operation\":\"%s\",\"confidence\":%.2f}",
+             esc_c, p, res->confidence);
+    cbm_gbuf_insert_edge(gbuf, source->id, route_id, "GRAPHQL_CALLS", props);
+}
+
+/* Emit TRPC_CALLS edge. Extract procedure path from callee chain. */
+static void emit_trpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
+                           const cbm_resolution_t *res) {
+    /* tRPC calls: trpc.user.getById.query() → extract "user.getById" */
+    const char *callee = call->callee_name;
+    if (!callee) {
+        return;
+    }
+    /* Strip trailing .query/.mutate/.subscribe */
+    char proc[CBM_SZ_256];
+    snprintf(proc, sizeof(proc), "%s", callee);
+    char *last_dot = strrchr(proc, '.');
+    if (last_dot && (strcmp(last_dot, ".query") == 0 || strcmp(last_dot, ".mutate") == 0 ||
+                     strcmp(last_dot, ".subscribe") == 0 || strcmp(last_dot, ".useQuery") == 0 ||
+                     strcmp(last_dot, ".useMutation") == 0)) {
+        *last_dot = '\0';
+    }
+    /* Strip leading trpc. */
+    const char *p = proc;
+    if (strncmp(p, "trpc.", CBM_SZ_5) == 0) {
+        p += CBM_SZ_5;
+    }
+
+    char route_qn[CBM_SZ_512];
+    snprintf(route_qn, sizeof(route_qn), "__trpc__%s", p);
+
+    int64_t route_id =
+        cbm_gbuf_upsert_node(gbuf, "Route", p, route_qn, "", 0, 0, "{\"source\":\"trpc\"}");
+
+    char esc_c[CBM_SZ_256];
+    cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
+    char props[CBM_SZ_1K];
+    snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"procedure\":\"%s\",\"confidence\":%.2f}",
+             esc_c, p, res->confidence);
+    cbm_gbuf_insert_edge(gbuf, source->id, route_id, "TRPC_CALLS", props);
 }
 
 static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
@@ -1812,6 +2100,18 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
      * local variables like app.include_router where QN resolution fails). */
     if (svc == CBM_SVC_NONE && cbm_service_pattern_route_method(call->callee_name) != NULL) {
         svc = CBM_SVC_ROUTE_REG;
+    }
+
+    /* Detect gRPC stub method calls by resolved QN.
+     * Go pattern: pb.NewCartServiceClient(conn).GetCart(ctx, req)
+     * Tree-sitter extracts GetCart as the callee, which resolves to the
+     * generated pb interface method (QN contains "ServiceClient"). */
+    if (svc == CBM_SVC_NONE && res->qualified_name) {
+        if (strstr(res->qualified_name, "ServiceClient") != NULL ||
+            strstr(res->qualified_name, "ServiceGrpc") != NULL ||
+            strstr(res->qualified_name, "Servicer") != NULL) {
+            svc = CBM_SVC_GRPC;
+        }
     }
 
     if (svc == CBM_SVC_ROUTE_REG) {
@@ -1830,6 +2130,12 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
 
     if ((svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) && (has_url || has_topic)) {
         emit_http_async_service_edge(gbuf, source, call, res, svc, arg);
+    } else if (svc == CBM_SVC_GRPC) {
+        emit_grpc_edge(gbuf, source, call, res);
+    } else if (svc == CBM_SVC_GRAPHQL) {
+        emit_graphql_edge(gbuf, source, call, res);
+    } else if (svc == CBM_SVC_TRPC) {
+        emit_trpc_edge(gbuf, source, call, res);
     } else if (svc == CBM_SVC_CONFIG) {
         emit_config_edge(gbuf, source, target, call, res, arg);
     } else {
@@ -1852,6 +2158,60 @@ static const cbm_gbuf_node_t *find_source_node(const cbm_gbuf_t *gbuf, const cha
         free(file_qn);
     }
     return src;
+}
+
+/* Field type hint resolution for obj.Method() with multiple candidates.
+ * Strips C# field prefixes (_ / m_), capitalizes to get type name, and
+ * checks if TypeName.Method or ITypeName.Method exists among candidates. */
+static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const char *callee_name,
+                                int64_t source_id) {
+    if (!res->qualified_name || res->candidate_count <= SKIP_ONE) {
+        return;
+    }
+    const char *dot = strchr(callee_name, '.');
+    if (!dot) {
+        return;
+    }
+    size_t plen = (size_t)(dot - callee_name);
+    char obj_name[CBM_SZ_256];
+    if (plen >= sizeof(obj_name)) {
+        return;
+    }
+    memcpy(obj_name, callee_name, plen);
+    obj_name[plen] = '\0';
+
+    const char *type_hint = obj_name;
+    if (type_hint[0] == '_') {
+        type_hint++;
+    }
+    if (type_hint[0] == 'm' && type_hint[SKIP_ONE] == '_') {
+        type_hint += PP_CSHARP_M_PREFIX_LEN;
+    }
+
+    char type_name[CBM_SZ_256];
+    snprintf(type_name, sizeof(type_name), "%s", type_hint);
+    if (type_name[0] >= 'a' && type_name[0] <= 'z') {
+        type_name[0] -= ('a' - 'A');
+    }
+
+    char iface_name[CBM_SZ_256];
+    snprintf(iface_name, sizeof(iface_name), "I%s", type_name);
+
+    const char *method = dot + SKIP_ONE;
+    const char **cands = NULL;
+    int cand_count = 0;
+    cbm_registry_find_by_name(rc->registry, method, &cands, &cand_count);
+    for (int ci = 0; ci < cand_count; ci++) {
+        if (strstr(cands[ci], type_name) || strstr(cands[ci], iface_name)) {
+            const cbm_gbuf_node_t *better = cbm_gbuf_find_by_qn(rc->main_gbuf, cands[ci]);
+            if (better && better->id != source_id) {
+                res->qualified_name = cands[ci];
+                res->confidence = PP_FIELD_HINT_CONF;
+                res->strategy = "field_type_hint";
+                return;
+            }
+        }
+    }
 }
 
 /* Resolve calls for one file and emit CALLS/HTTP_CALLS/ASYNC_CALLS edges. */
@@ -1908,6 +2268,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys,
                                        imp_vals, imp_count);
         }
+        try_field_type_hint(rc, &res, call->callee_name, source_node->id);
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
@@ -2243,10 +2604,15 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     };
     atomic_init(&rc.next_file_idx, 0);
 
+    /* Sub-phase: Dispatch resolve workers (per-file call/usage resolution, PARALLEL) */
+    CBM_PROF_START(t_resolve_dispatch);
     cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
     cbm_parallel_for(worker_count, resolve_worker, &rc, opts);
+    CBM_PROF_END_N("parallel_resolve", "1_dispatch_workers_parallel", t_resolve_dispatch,
+                   file_count);
 
-    /* Merge all local edge bufs into main gbuf */
+    /* Sub-phase: Merge all local edge bufs into main gbuf (SEQUENTIAL) */
+    CBM_PROF_START(t_resolve_merge);
     int total_calls = 0;
     int total_usages = 0;
     int total_semantic = 0;
@@ -2259,6 +2625,8 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
             cbm_gbuf_free(workers[i].local_edge_buf);
         }
     }
+    CBM_PROF_END_N("parallel_resolve", "2_merge_edge_bufs_seq", t_resolve_merge,
+                   total_calls + total_usages);
 
     cbm_aligned_free(workers);
 

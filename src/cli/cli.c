@@ -990,19 +990,9 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
 #ifdef __APPLE__
     snprintf(path, sizeof(path), "%s/Library/Application Support/Zed", home_dir);
 #elif defined(_WIN32)
-    {
-        const char *zed_local = cbm_app_local_dir();
-        if (zed_local) {
-            snprintf(path, sizeof(path), "%s/Zed", zed_local);
-        }
-    }
+    snprintf(path, sizeof(path), "%s/AppData/Local/Zed", home_dir);
 #else
-    {
-        const char *zed_cfg = cbm_app_config_dir();
-        if (zed_cfg) {
-            snprintf(path, sizeof(path), "%s/zed", zed_cfg);
-        }
-    }
+    snprintf(path, sizeof(path), "%s/.config/zed", home_dir);
 #endif
     agents.zed = dir_exists(path);
 
@@ -1019,30 +1009,29 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
 #ifdef __APPLE__
     snprintf(path, sizeof(path),
              "%s/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code", home_dir);
+#elif defined(_WIN32)
+    snprintf(path, sizeof(path), "%s/AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code",
+             home_dir);
 #else
-    {
-        const char *kc_cfg = cbm_app_config_dir();
-        if (kc_cfg) {
-            snprintf(path, sizeof(path), "%s/Code/User/globalStorage/kilocode.kilo-code", kc_cfg);
-        }
-    }
+    snprintf(path, sizeof(path), "%s/.config/Code/User/globalStorage/kilocode.kilo-code", home_dir);
 #endif
     agents.kilocode = dir_exists(path);
 
 #ifdef __APPLE__
     snprintf(path, sizeof(path), "%s/Library/Application Support/Code/User", home_dir);
+#elif defined(_WIN32)
+    snprintf(path, sizeof(path), "%s/AppData/Roaming/Code/User", home_dir);
 #else
-    {
-        const char *vs_cfg = cbm_app_config_dir();
-        if (vs_cfg) {
-            snprintf(path, sizeof(path), "%s/Code/User", vs_cfg);
-        }
-    }
+    snprintf(path, sizeof(path), "%s/.config/Code/User", home_dir);
 #endif
     agents.vscode = dir_exists(path);
 
     snprintf(path, sizeof(path), "%s/.openclaw", home_dir);
     agents.openclaw = dir_exists(path);
+
+    /* Kiro: ~/.kiro/ */
+    snprintf(path, sizeof(path), "%s/.kiro", home_dir);
+    agents.kiro = dir_exists(path);
 
     return agents;
 }
@@ -2617,6 +2606,7 @@ static void print_detected_agents(const cbm_detected_agents_t *a) {
         {a->kilocode, "KiloCode"},
         {a->vscode, "VS-Code"},
         {a->openclaw, "OpenClaw"},
+        {a->kiro, "Kiro"},
     };
     printf("Detected agents:");
     bool any = false;
@@ -2790,6 +2780,17 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
         char cp[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.openclaw/openclaw.json", home);
         install_generic_agent_config("OpenClaw", binary_path, cp, NULL, dry_run,
+                                     cbm_install_editor_mcp);
+    }
+    if (agents->kiro) {
+        char cp[CLI_BUF_1K];
+        char sd[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.kiro/settings/mcp.json", home);
+        snprintf(sd, sizeof(sd), "%s/.kiro/settings", home);
+        if (!dry_run) {
+            cbm_mkdir_p(sd, CLI_OCTAL_PERM);
+        }
+        install_generic_agent_config("Kiro", binary_path, cp, NULL, dry_run,
                                      cbm_install_editor_mcp);
     }
 }
@@ -3094,6 +3095,12 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
         char cp[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.openclaw/openclaw.json", home);
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"OpenClaw", cp, NULL}, dry_run,
+                                  cbm_remove_editor_mcp);
+    }
+    if (agents->kiro) {
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.kiro/settings/mcp.json", home);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Kiro", cp, NULL}, dry_run,
                                   cbm_remove_editor_mcp);
     }
 }
@@ -3410,8 +3417,8 @@ int cbm_cmd_update(int argc, char **argv) {
 
     printf("codebase-memory-mcp update (current: %s)\n\n", CBM_VERSION);
 
-    /* Version check — skip download if already on latest. */
-    if (!force && check_already_latest()) {
+    /* Version check — skip download if already on latest (not in dry-run). */
+    if (!force && !dry_run && check_already_latest()) {
         return 0;
     }
 

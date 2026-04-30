@@ -592,6 +592,420 @@ TEST(lang_m_default_on_read_fail) {
     PASS();
 }
 
+/* --- New languages (auto-generated) --- */
+TEST(lang_ext_solidity) {
+    ASSERT_EQ(cbm_language_for_extension(".sol"), CBM_LANG_SOLIDITY);
+    PASS();
+}
+
+TEST(lang_ext_typst) {
+    ASSERT_EQ(cbm_language_for_extension(".typ"), CBM_LANG_TYPST);
+    PASS();
+}
+
+TEST(lang_ext_gdscript) {
+    ASSERT_EQ(cbm_language_for_extension(".gd"), CBM_LANG_GDSCRIPT);
+    PASS();
+}
+
+TEST(lang_ext_gleam) {
+    ASSERT_EQ(cbm_language_for_extension(".gleam"), CBM_LANG_GLEAM);
+    PASS();
+}
+
+TEST(lang_ext_powershell) {
+    ASSERT_EQ(cbm_language_for_extension(".ps1"), CBM_LANG_POWERSHELL);
+    ASSERT_EQ(cbm_language_for_extension(".psm1"), CBM_LANG_POWERSHELL);
+    ASSERT_EQ(cbm_language_for_extension(".psd1"), CBM_LANG_POWERSHELL);
+    PASS();
+}
+
+TEST(lang_ext_pascal) {
+    ASSERT_EQ(cbm_language_for_extension(".pas"), CBM_LANG_PASCAL);
+    ASSERT_EQ(cbm_language_for_extension(".lpr"), CBM_LANG_PASCAL);
+    ASSERT_EQ(cbm_language_for_extension(".dpr"), CBM_LANG_PASCAL);
+    PASS();
+}
+
+TEST(lang_ext_d) {
+    ASSERT_EQ(cbm_language_for_extension(".d"), CBM_LANG_DLANG);
+    PASS();
+}
+
+TEST(lang_ext_nim) {
+    ASSERT_EQ(cbm_language_for_extension(".nim"), CBM_LANG_NIM);
+    ASSERT_EQ(cbm_language_for_extension(".nims"), CBM_LANG_NIM);
+    PASS();
+}
+
+TEST(lang_ext_scheme) {
+    ASSERT_EQ(cbm_language_for_extension(".scm"), CBM_LANG_SCHEME);
+    ASSERT_EQ(cbm_language_for_extension(".ss"), CBM_LANG_SCHEME);
+    PASS();
+}
+
+TEST(lang_ext_fennel) {
+    ASSERT_EQ(cbm_language_for_extension(".fnl"), CBM_LANG_FENNEL);
+    PASS();
+}
+
+TEST(lang_ext_fish) {
+    ASSERT_EQ(cbm_language_for_extension(".fish"), CBM_LANG_FISH);
+    PASS();
+}
+
+TEST(lang_ext_awk) {
+    ASSERT_EQ(cbm_language_for_extension(".awk"), CBM_LANG_AWK);
+    PASS();
+}
+
+TEST(lang_ext_zsh) {
+    ASSERT_EQ(cbm_language_for_extension(".zsh"), CBM_LANG_ZSH);
+    PASS();
+}
+
+TEST(lang_ext_tcl) {
+    ASSERT_EQ(cbm_language_for_extension(".tcl"), CBM_LANG_TCL);
+    PASS();
+}
+
+TEST(lang_ext_ada) {
+    ASSERT_EQ(cbm_language_for_extension(".adb"), CBM_LANG_ADA);
+    ASSERT_EQ(cbm_language_for_extension(".ads"), CBM_LANG_ADA);
+    PASS();
+}
+
+TEST(lang_ext_agda) {
+    ASSERT_EQ(cbm_language_for_extension(".agda"), CBM_LANG_AGDA);
+    PASS();
+}
+
+TEST(lang_ext_racket) {
+    ASSERT_EQ(cbm_language_for_extension(".rkt"), CBM_LANG_RACKET);
+    PASS();
+}
+
+TEST(lang_ext_odin) {
+    ASSERT_EQ(cbm_language_for_extension(".odin"), CBM_LANG_ODIN);
+    PASS();
+}
+
+TEST(lang_ext_rescript) {
+    ASSERT_EQ(cbm_language_for_extension(".res"), CBM_LANG_RESCRIPT);
+    ASSERT_EQ(cbm_language_for_extension(".resi"), CBM_LANG_RESCRIPT);
+    PASS();
+}
+
+TEST(lang_ext_purescript) {
+    ASSERT_EQ(cbm_language_for_extension(".purs"), CBM_LANG_PURESCRIPT);
+    PASS();
+}
+
+TEST(lang_ext_nickel) {
+    ASSERT_EQ(cbm_language_for_extension(".ncl"), CBM_LANG_NICKEL);
+    PASS();
+}
+
+TEST(lang_ext_crystal) {
+    ASSERT_EQ(cbm_language_for_extension(".cr"), CBM_LANG_CRYSTAL);
+    PASS();
+}
+
+TEST(lang_ext_teal) {
+    ASSERT_EQ(cbm_language_for_extension(".tl"), CBM_LANG_TEAL);
+    PASS();
+}
+
+TEST(lang_ext_hare) {
+    ASSERT_EQ(cbm_language_for_extension(".ha"), CBM_LANG_HARE);
+    PASS();
+}
+
+TEST(lang_ext_pony) {
+    ASSERT_EQ(cbm_language_for_extension(".pony"), CBM_LANG_PONY);
+    PASS();
+}
+
+TEST(lang_ext_luau) {
+    ASSERT_EQ(cbm_language_for_extension(".luau"), CBM_LANG_LUAU);
+    PASS();
+}
+
+TEST(lang_ext_janet) {
+    ASSERT_EQ(cbm_language_for_extension(".janet"), CBM_LANG_JANET);
+    PASS();
+}
+
+TEST(lang_ext_sway) {
+    ASSERT_EQ(cbm_language_for_extension(".sw"), CBM_LANG_SWAY);
+    PASS();
+}
+
+TEST(lang_ext_nasm) {
+    ASSERT_EQ(cbm_language_for_extension(".nasm"), CBM_LANG_NASM);
+    PASS();
+}
+
+TEST(lang_ext_assembly) {
+    ASSERT_EQ(cbm_language_for_extension(".s"), CBM_LANG_ASSEMBLY);
+    ASSERT_EQ(cbm_language_for_extension(".S"), CBM_LANG_ASSEMBLY);
+    PASS();
+}
+
+TEST(lang_ext_astro) {
+    ASSERT_EQ(cbm_language_for_extension(".astro"), CBM_LANG_ASTRO);
+    PASS();
+}
+
+TEST(lang_ext_gotemplate) {
+    ASSERT_EQ(cbm_language_for_extension(".tmpl"), CBM_LANG_GOTEMPLATE);
+    ASSERT_EQ(cbm_language_for_extension(".gotmpl"), CBM_LANG_GOTEMPLATE);
+    PASS();
+}
+
+TEST(lang_ext_templ) {
+    ASSERT_EQ(cbm_language_for_extension(".templ"), CBM_LANG_TEMPL);
+    PASS();
+}
+
+TEST(lang_ext_liquid) {
+    ASSERT_EQ(cbm_language_for_extension(".liquid"), CBM_LANG_LIQUID);
+    PASS();
+}
+
+TEST(lang_ext_jinja2) {
+    ASSERT_EQ(cbm_language_for_extension(".j2"), CBM_LANG_JINJA2);
+    ASSERT_EQ(cbm_language_for_extension(".jinja2"), CBM_LANG_JINJA2);
+    ASSERT_EQ(cbm_language_for_extension(".jinja"), CBM_LANG_JINJA2);
+    PASS();
+}
+
+TEST(lang_ext_prisma) {
+    ASSERT_EQ(cbm_language_for_extension(".prisma"), CBM_LANG_PRISMA);
+    PASS();
+}
+
+TEST(lang_ext_hyprlang) {
+    ASSERT_EQ(cbm_language_for_extension(".hl"), CBM_LANG_HYPRLANG);
+    PASS();
+}
+
+TEST(lang_ext_diff) {
+    ASSERT_EQ(cbm_language_for_extension(".diff"), CBM_LANG_DIFF);
+    ASSERT_EQ(cbm_language_for_extension(".patch"), CBM_LANG_DIFF);
+    PASS();
+}
+
+TEST(lang_ext_wgsl) {
+    ASSERT_EQ(cbm_language_for_extension(".wgsl"), CBM_LANG_WGSL);
+    PASS();
+}
+
+TEST(lang_ext_kdl) {
+    ASSERT_EQ(cbm_language_for_extension(".kdl"), CBM_LANG_KDL);
+    PASS();
+}
+
+TEST(lang_ext_json5) {
+    ASSERT_EQ(cbm_language_for_extension(".json5"), CBM_LANG_JSON5);
+    PASS();
+}
+
+TEST(lang_ext_jsonnet) {
+    ASSERT_EQ(cbm_language_for_extension(".jsonnet"), CBM_LANG_JSONNET);
+    ASSERT_EQ(cbm_language_for_extension(".libsonnet"), CBM_LANG_JSONNET);
+    PASS();
+}
+
+TEST(lang_ext_ron) {
+    ASSERT_EQ(cbm_language_for_extension(".ron"), CBM_LANG_RON);
+    PASS();
+}
+
+TEST(lang_ext_thrift) {
+    ASSERT_EQ(cbm_language_for_extension(".thrift"), CBM_LANG_THRIFT);
+    PASS();
+}
+
+TEST(lang_ext_capnp) {
+    ASSERT_EQ(cbm_language_for_extension(".capnp"), CBM_LANG_CAPNP);
+    PASS();
+}
+
+TEST(lang_ext_properties) {
+    ASSERT_EQ(cbm_language_for_extension(".properties"), CBM_LANG_PROPERTIES);
+    PASS();
+}
+
+TEST(lang_ext_bibtex) {
+    ASSERT_EQ(cbm_language_for_extension(".bib"), CBM_LANG_BIBTEX);
+    PASS();
+}
+
+TEST(lang_ext_starlark) {
+    ASSERT_EQ(cbm_language_for_extension(".star"), CBM_LANG_STARLARK);
+    ASSERT_EQ(cbm_language_for_extension(".bzl"), CBM_LANG_STARLARK);
+    PASS();
+}
+
+TEST(lang_ext_bicep) {
+    ASSERT_EQ(cbm_language_for_extension(".bicep"), CBM_LANG_BICEP);
+    PASS();
+}
+
+TEST(lang_ext_csv) {
+    ASSERT_EQ(cbm_language_for_extension(".csv"), CBM_LANG_CSV);
+    PASS();
+}
+
+TEST(lang_ext_hlsl) {
+    ASSERT_EQ(cbm_language_for_extension(".hlsl"), CBM_LANG_HLSL);
+    ASSERT_EQ(cbm_language_for_extension(".hlsli"), CBM_LANG_HLSL);
+    ASSERT_EQ(cbm_language_for_extension(".fx"), CBM_LANG_HLSL);
+    PASS();
+}
+
+TEST(lang_ext_vhdl) {
+    ASSERT_EQ(cbm_language_for_extension(".vhd"), CBM_LANG_VHDL);
+    ASSERT_EQ(cbm_language_for_extension(".vhdl"), CBM_LANG_VHDL);
+    PASS();
+}
+
+TEST(lang_ext_devicetree) {
+    ASSERT_EQ(cbm_language_for_extension(".dts"), CBM_LANG_DEVICETREE);
+    ASSERT_EQ(cbm_language_for_extension(".dtsi"), CBM_LANG_DEVICETREE);
+    ASSERT_EQ(cbm_language_for_extension(".overlay"), CBM_LANG_DEVICETREE);
+    PASS();
+}
+
+TEST(lang_ext_linkerscript) {
+    ASSERT_EQ(cbm_language_for_extension(".ld"), CBM_LANG_LINKERSCRIPT);
+    ASSERT_EQ(cbm_language_for_extension(".lds"), CBM_LANG_LINKERSCRIPT);
+    PASS();
+}
+
+TEST(lang_ext_gn) {
+    ASSERT_EQ(cbm_language_for_extension(".gn"), CBM_LANG_GN);
+    ASSERT_EQ(cbm_language_for_extension(".gni"), CBM_LANG_GN);
+    PASS();
+}
+
+TEST(lang_ext_bitbake) {
+    ASSERT_EQ(cbm_language_for_extension(".bb"), CBM_LANG_BITBAKE);
+    ASSERT_EQ(cbm_language_for_extension(".bbclass"), CBM_LANG_BITBAKE);
+    ASSERT_EQ(cbm_language_for_extension(".bbappend"), CBM_LANG_BITBAKE);
+    PASS();
+}
+
+TEST(lang_ext_smali) {
+    ASSERT_EQ(cbm_language_for_extension(".smali"), CBM_LANG_SMALI);
+    PASS();
+}
+
+TEST(lang_ext_tablegen) {
+    ASSERT_EQ(cbm_language_for_extension(".td"), CBM_LANG_TABLEGEN);
+    PASS();
+}
+
+TEST(lang_ext_ispc) {
+    ASSERT_EQ(cbm_language_for_extension(".ispc"), CBM_LANG_ISPC);
+    PASS();
+}
+
+TEST(lang_ext_cairo) {
+    ASSERT_EQ(cbm_language_for_extension(".cairo"), CBM_LANG_CAIRO);
+    PASS();
+}
+
+TEST(lang_ext_move) {
+    ASSERT_EQ(cbm_language_for_extension(".move"), CBM_LANG_MOVE);
+    PASS();
+}
+
+TEST(lang_ext_squirrel) {
+    ASSERT_EQ(cbm_language_for_extension(".nut"), CBM_LANG_SQUIRREL);
+    PASS();
+}
+
+TEST(lang_ext_func) {
+    ASSERT_EQ(cbm_language_for_extension(".fc"), CBM_LANG_FUNC);
+    PASS();
+}
+
+TEST(lang_ext_rst) {
+    ASSERT_EQ(cbm_language_for_extension(".rst"), CBM_LANG_RST);
+    PASS();
+}
+
+TEST(lang_ext_beancount) {
+    ASSERT_EQ(cbm_language_for_extension(".beancount"), CBM_LANG_BEANCOUNT);
+    PASS();
+}
+
+TEST(lang_ext_mermaid) {
+    ASSERT_EQ(cbm_language_for_extension(".mmd"), CBM_LANG_MERMAID);
+    ASSERT_EQ(cbm_language_for_extension(".mermaid"), CBM_LANG_MERMAID);
+    PASS();
+}
+
+TEST(lang_ext_puppet) {
+    ASSERT_EQ(cbm_language_for_extension(".pp"), CBM_LANG_PUPPET);
+    PASS();
+}
+
+TEST(lang_ext_po) {
+    ASSERT_EQ(cbm_language_for_extension(".po"), CBM_LANG_PO);
+    ASSERT_EQ(cbm_language_for_extension(".pot"), CBM_LANG_PO);
+    PASS();
+}
+
+TEST(lang_ext_slang) {
+    ASSERT_EQ(cbm_language_for_extension(".slang"), CBM_LANG_SLANG);
+    PASS();
+}
+
+TEST(lang_ext_llvm) {
+    ASSERT_EQ(cbm_language_for_extension(".ll"), CBM_LANG_LLVM_IR);
+    PASS();
+}
+
+TEST(lang_ext_smithy) {
+    ASSERT_EQ(cbm_language_for_extension(".smithy"), CBM_LANG_SMITHY);
+    PASS();
+}
+
+TEST(lang_ext_wit) {
+    ASSERT_EQ(cbm_language_for_extension(".wit"), CBM_LANG_WIT);
+    PASS();
+}
+
+TEST(lang_ext_tlaplus) {
+    ASSERT_EQ(cbm_language_for_extension(".tla"), CBM_LANG_TLAPLUS);
+    PASS();
+}
+
+TEST(lang_ext_pkl) {
+    ASSERT_EQ(cbm_language_for_extension(".pkl"), CBM_LANG_PKL);
+    PASS();
+}
+
+TEST(lang_ext_apex) {
+    ASSERT_EQ(cbm_language_for_extension(".cls"), CBM_LANG_APEX);
+    ASSERT_EQ(cbm_language_for_extension(".trigger"), CBM_LANG_APEX);
+    PASS();
+}
+
+TEST(lang_ext_soql) {
+    ASSERT_EQ(cbm_language_for_extension(".soql"), CBM_LANG_SOQL);
+    PASS();
+}
+
+TEST(lang_ext_sosl) {
+    ASSERT_EQ(cbm_language_for_extension(".sosl"), CBM_LANG_SOSL);
+    PASS();
+}
+
+
 /* --- Ported from lang_test.go: TestForLanguage --- */
 TEST(lang_all_have_names) {
     /* Every language enum value from 0 to CBM_LANG_COUNT-1
@@ -758,5 +1172,84 @@ SUITE(language) {
     RUN_TEST(lang_m_default_on_read_fail);
 
     /* Go test ports */
+    /* New languages */
+    RUN_TEST(lang_ext_solidity);
+    RUN_TEST(lang_ext_typst);
+    RUN_TEST(lang_ext_gdscript);
+    RUN_TEST(lang_ext_gleam);
+    RUN_TEST(lang_ext_powershell);
+    RUN_TEST(lang_ext_pascal);
+    RUN_TEST(lang_ext_d);
+    RUN_TEST(lang_ext_nim);
+    RUN_TEST(lang_ext_scheme);
+    RUN_TEST(lang_ext_fennel);
+    RUN_TEST(lang_ext_fish);
+    RUN_TEST(lang_ext_awk);
+    RUN_TEST(lang_ext_zsh);
+    RUN_TEST(lang_ext_tcl);
+    RUN_TEST(lang_ext_ada);
+    RUN_TEST(lang_ext_agda);
+    RUN_TEST(lang_ext_racket);
+    RUN_TEST(lang_ext_odin);
+    RUN_TEST(lang_ext_rescript);
+    RUN_TEST(lang_ext_purescript);
+    RUN_TEST(lang_ext_nickel);
+    RUN_TEST(lang_ext_crystal);
+    RUN_TEST(lang_ext_teal);
+    RUN_TEST(lang_ext_hare);
+    RUN_TEST(lang_ext_pony);
+    RUN_TEST(lang_ext_luau);
+    RUN_TEST(lang_ext_janet);
+    RUN_TEST(lang_ext_sway);
+    RUN_TEST(lang_ext_nasm);
+    RUN_TEST(lang_ext_assembly);
+    RUN_TEST(lang_ext_astro);
+    RUN_TEST(lang_ext_gotemplate);
+    RUN_TEST(lang_ext_templ);
+    RUN_TEST(lang_ext_liquid);
+    RUN_TEST(lang_ext_jinja2);
+    RUN_TEST(lang_ext_prisma);
+    RUN_TEST(lang_ext_hyprlang);
+    RUN_TEST(lang_ext_diff);
+    RUN_TEST(lang_ext_wgsl);
+    RUN_TEST(lang_ext_kdl);
+    RUN_TEST(lang_ext_json5);
+    RUN_TEST(lang_ext_jsonnet);
+    RUN_TEST(lang_ext_ron);
+    RUN_TEST(lang_ext_thrift);
+    RUN_TEST(lang_ext_capnp);
+    RUN_TEST(lang_ext_properties);
+    RUN_TEST(lang_ext_bibtex);
+    RUN_TEST(lang_ext_starlark);
+    RUN_TEST(lang_ext_bicep);
+    RUN_TEST(lang_ext_csv);
+    RUN_TEST(lang_ext_hlsl);
+    RUN_TEST(lang_ext_vhdl);
+    RUN_TEST(lang_ext_devicetree);
+    RUN_TEST(lang_ext_linkerscript);
+    RUN_TEST(lang_ext_gn);
+    RUN_TEST(lang_ext_bitbake);
+    RUN_TEST(lang_ext_smali);
+    RUN_TEST(lang_ext_tablegen);
+    RUN_TEST(lang_ext_ispc);
+    RUN_TEST(lang_ext_cairo);
+    RUN_TEST(lang_ext_move);
+    RUN_TEST(lang_ext_squirrel);
+    RUN_TEST(lang_ext_func);
+    RUN_TEST(lang_ext_rst);
+    RUN_TEST(lang_ext_beancount);
+    RUN_TEST(lang_ext_mermaid);
+    RUN_TEST(lang_ext_puppet);
+    RUN_TEST(lang_ext_po);
+    RUN_TEST(lang_ext_slang);
+    RUN_TEST(lang_ext_llvm);
+    RUN_TEST(lang_ext_smithy);
+    RUN_TEST(lang_ext_wit);
+    RUN_TEST(lang_ext_tlaplus);
+    RUN_TEST(lang_ext_pkl);
+    RUN_TEST(lang_ext_apex);
+    RUN_TEST(lang_ext_soql);
+    RUN_TEST(lang_ext_sosl);
+
     RUN_TEST(lang_all_have_names);
 }

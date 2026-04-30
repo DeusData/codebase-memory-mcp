@@ -35,6 +35,7 @@ enum {
 
 #include <ctype.h>
 #include "foundation/compat_regex.h"
+#include <stddef.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -321,6 +322,13 @@ static bool lex_skip_whitespace_comments(const char *input, int len, int *i) {
         return true;
     }
     if (*i + SKIP_ONE < len && input[*i] == '/' && input[*i + SKIP_ONE] == '/') {
+        while (*i < len && input[*i] != '\n') {
+            (*i)++;
+        }
+        return true;
+    }
+    /* SQL-style -- single-line comment */
+    if (*i + SKIP_ONE < len && input[*i] == '-' && input[*i + SKIP_ONE] == '-') {
         while (*i < len && input[*i] != '\n') {
             (*i)++;
         }
@@ -1639,35 +1647,58 @@ typedef struct {
     const char *edge_var_names[CYP_MAX_EDGE_VARS]; /* variable names (edges) */
     cbm_edge_t edge_vars[CYP_MAX_EDGE_VARS];       /* edge data */
     int edge_var_count;
+    cbm_store_t *store; /* for computing in_degree/out_degree on demand */
 } binding_t;
 
-/* Get node property by name */
-static const char *node_prop(const cbm_node_t *n, const char *prop) {
+/* Return a string field from a node by property name.  NULL-safe. */
+static const char *node_string_field(const cbm_node_t *n, const char *prop) {
+    static const struct {
+        const char *key;
+        size_t offset;
+    } fields[] = {
+        {"name", offsetof(cbm_node_t, name)},
+        {"qualified_name", offsetof(cbm_node_t, qualified_name)},
+        {"label", offsetof(cbm_node_t, label)},
+        {"file_path", offsetof(cbm_node_t, file_path)},
+    };
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        if (strcmp(prop, fields[i].key) == 0) {
+            const char *val = *(const char **)((const char *)n + fields[i].offset);
+            return val ? val : "";
+        }
+    }
+    return NULL;
+}
+
+/* Get node property by name.
+ * store may be NULL; only needed for virtual degree properties. */
+static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t *store) {
     if (!n || !prop) {
         return "";
     }
-    if (strcmp(prop, "name") == 0) {
-        return n->name ? n->name : "";
+    const char *str = node_string_field(n, prop);
+    if (str) {
+        return str;
     }
-    if (strcmp(prop, "qualified_name") == 0) {
-        return n->qualified_name ? n->qualified_name : "";
-    }
-    if (strcmp(prop, "label") == 0) {
-        return n->label ? n->label : "";
-    }
-    if (strcmp(prop, "file_path") == 0) {
-        return n->file_path ? n->file_path : "";
-    }
+    /* Integer properties returned as strings. */
+    static _Thread_local char int_buf[CBM_SZ_32];
     if (strcmp(prop, "start_line") == 0) {
-        /* Return as string */
-        static char buf[CBM_SZ_32];
-        snprintf(buf, sizeof(buf), "%d", n->start_line);
-        return buf;
+        snprintf(int_buf, sizeof(int_buf), "%d", n->start_line);
+        return int_buf;
     }
     if (strcmp(prop, "end_line") == 0) {
-        static char buf[CBM_SZ_32];
-        snprintf(buf, sizeof(buf), "%d", n->end_line);
-        return buf;
+        snprintf(int_buf, sizeof(int_buf), "%d", n->end_line);
+        return int_buf;
+    }
+    /* Virtual computed properties: in_degree/out_degree via CALLS edges.
+     * Enables Cypher dead-code detection: WHERE n.in_degree = '0'. */
+    if (store && (strcmp(prop, "in_degree") == 0 || strcmp(prop, "out_degree") == 0)) {
+        int in_deg = 0;
+        int out_deg = 0;
+        cbm_store_node_degree(store, n->id, &in_deg, &out_deg);
+        int val = (strcmp(prop, "in_degree") == 0) ? in_deg : out_deg;
+        snprintf(int_buf, sizeof(int_buf), "%d", val);
+        return int_buf;
     }
     return "";
 }
@@ -1827,6 +1858,7 @@ static void binding_copy(binding_t *dst, const binding_t *src) {
         dst->edge_var_names[i] = src->edge_var_names[i]; /* AST-owned */
         edge_deep_copy(&dst->edge_vars[i], &src->edge_vars[i]);
     }
+    dst->store = src->store;
 }
 
 /* Deep-copy a node into a binding (binding owns the strings) */
@@ -1858,7 +1890,7 @@ static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *
         return NULL; /* unbound variable */
     }
     if (c->property) {
-        return node_prop(n, c->property);
+        return node_prop(n, c->property, b->store);
     }
     /* Bare alias (e.g. post-WITH virtual var) — use node name directly */
     return n->name ? n->name : "";
@@ -1991,11 +2023,34 @@ static bool eval_where(const cbm_where_clause_t *w, binding_t *b) {
     return is_and;
 }
 
-/* Check inline property filters */
-static bool check_inline_props(const cbm_node_t *n, const cbm_prop_filter_t *props, int count) {
+/* Check if a string value looks like a regex pattern. */
+static bool looks_like_regex(const char *s) {
+    if (!s) {
+        return false;
+    }
+    return strstr(s, ".*") || strstr(s, ".+") || strchr(s, '[') || strchr(s, '(') ||
+           strchr(s, '|') || strchr(s, '^') || strchr(s, '$');
+}
+
+/* Check inline property filters.
+ * Values that look like regex patterns are matched with POSIX ERE;
+ * plain values use exact strcmp. */
+static bool check_inline_props(const cbm_node_t *n, const cbm_prop_filter_t *props, int count,
+                               cbm_store_t *store) {
     for (int i = 0; i < count; i++) {
-        const char *actual = node_prop(n, props[i].key);
-        if (strcmp(actual, props[i].value) != 0) {
+        const char *actual = node_prop(n, props[i].key, store);
+        if (looks_like_regex(props[i].value)) {
+            cbm_regex_t re;
+            if (cbm_regcomp(&re, props[i].value, CBM_REG_EXTENDED | CBM_REG_NOSUB) == 0) {
+                bool matched = cbm_regexec(&re, actual, 0, NULL, 0) == 0;
+                cbm_regfree(&re);
+                if (!matched) {
+                    return false;
+                }
+            } else if (strcmp(actual, props[i].value) != 0) {
+                return false;
+            }
+        } else if (strcmp(actual, props[i].value) != 0) {
             return false;
         }
     }
@@ -2068,7 +2123,7 @@ static const char *binding_get_virtual(binding_t *b, const char *var, const char
     cbm_node_t *n = binding_get(b, var);
     if (n) {
         if (prop) {
-            return node_prop(n, prop);
+            return node_prop(n, prop, b->store);
         }
         return n->name ? n->name : "";
     }
@@ -2155,7 +2210,7 @@ static void scan_pattern_nodes(cbm_store_t *store, const char *project, int max_
     if (first->prop_count > 0) {
         int kept = 0;
         for (int i = 0; i < *out_count; i++) {
-            if (check_inline_props(&(*out_nodes)[i], first->props, first->prop_count)) {
+            if (check_inline_props(&(*out_nodes)[i], first->props, first->prop_count, store)) {
                 if (kept != i) {
                     (*out_nodes)[kept] = (*out_nodes)[i];
                 }
@@ -2186,7 +2241,7 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
             node_fields_free(&found);
             continue;
         }
-        if (!check_inline_props(&found, target_node->props, target_node->prop_count)) {
+        if (!check_inline_props(&found, target_node->props, target_node->prop_count, store)) {
             node_fields_free(&found);
             continue;
         }
@@ -2219,7 +2274,7 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
         if (target_node->label && strcmp(hop->node.label, target_node->label) != 0) {
             continue;
         }
-        if (!check_inline_props(&hop->node, target_node->props, target_node->prop_count)) {
+        if (!check_inline_props(&hop->node, target_node->props, target_node->prop_count, store)) {
             continue;
         }
         binding_t nb = {0};
@@ -3296,6 +3351,7 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
 
     for (int i = 0; i < scan_count && bind_count < bind_cap; i++) {
         binding_t b = {0};
+        b.store = store;
         binding_set(&b, var_name, &scanned[i]);
         bool pass = !q->where || eval_where(q->where, &b);
         if (pass) {

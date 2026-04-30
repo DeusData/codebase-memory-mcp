@@ -6,6 +6,7 @@ interface EdgeLinesProps {
   nodes: GraphNode[];
   edges: GraphEdge[];
   highlightedIds: Set<number> | null;
+  opacity?: number;
 }
 
 function getClusterKey(fp?: string): string {
@@ -33,7 +34,7 @@ const EDGE_TYPE_COLORS: Record<string, string> = {
 
 const DEFAULT_EDGE_COLOR = "#1C8585";
 
-export function EdgeLines({ nodes, edges, highlightedIds }: EdgeLinesProps) {
+export function EdgeLines({ nodes, edges, highlightedIds, opacity = 1.0 }: EdgeLinesProps) {
   const geometry = useMemo(() => {
     const idMap = new Map<number, number>();
     for (let i = 0; i < nodes.length; i++) {
@@ -105,7 +106,7 @@ export function EdgeLines({ nodes, edges, highlightedIds }: EdgeLinesProps) {
       <lineBasicMaterial
         vertexColors
         transparent
-        opacity={1}
+        opacity={opacity}
         blending={THREE.AdditiveBlending}
         depthWrite={false}
         toneMapped={false}

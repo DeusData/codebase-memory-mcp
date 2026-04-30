@@ -18,6 +18,9 @@ typedef enum {
     CBM_SVC_ASYNC = 2,     /* Async dispatch (message broker, task queue) */
     CBM_SVC_CONFIG = 3,    /* Config/env accessor */
     CBM_SVC_ROUTE_REG = 4, /* Route registration (router.GET, app.get, Route::post) */
+    CBM_SVC_GRPC = 5,      /* gRPC client call (protobuf stub invocation) */
+    CBM_SVC_GRAPHQL = 6,   /* GraphQL client query/mutation */
+    CBM_SVC_TRPC = 7,      /* tRPC client procedure call */
 } cbm_svc_kind_t;
 
 /* Initialize the pattern lookup tables. Call once at startup. Thread-safe after init. */

@@ -4,6 +4,7 @@
 #include "lang_specs.h"
 #include "foundation/constants.h"
 #include "simhash/minhash.h"
+#include "semantic/ast_profile.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include <stdint.h>          // uint32_t
 #include <string.h>
@@ -27,7 +28,89 @@ enum {
     C_RETURN_WALK_DEPTH = 5,
     VAR_RECURSION_LIMIT = 8,
     NESTED_CLASS_STACK_CAP = 128,
+    FP_HASH_MUL = 31,    /* FNV-like hash multiplier for identifier dedup */
+    FP_HASH_NONZERO = 1, /* OR mask to ensure hash is never zero (sentinel) */
+    FP_SPACE_SEP = 1,    /* one byte for space separator between tokens */
 };
+
+/* Hash a span of source text. */
+static uint32_t hash_source_span(const char *source, uint32_t start, int len) {
+    uint32_t h = 0;
+    for (int x = 0; x < len; x++) {
+        h = (h * FP_HASH_MUL) + (uint32_t)(unsigned char)source[start + (uint32_t)x];
+    }
+    return h;
+}
+
+/* Try to append a unique identifier to the buffer. Returns true if appended. */
+static bool try_append_ident(const char *source, uint32_t s, int len, uint32_t *seen, int seen_size,
+                             uint32_t seen_mask, char *buf, int buf_size, int *pos, int *count) {
+    uint32_t h = hash_source_span(source, s, len);
+    uint32_t key = h | FP_HASH_NONZERO;
+    uint32_t slot = h & seen_mask;
+    bool dup = false;
+    for (int p = 0; p < seen_size; p++) {
+        uint32_t idx = (slot + (uint32_t)p) & seen_mask;
+        if (seen[idx] == 0) {
+            seen[idx] = key;
+            break;
+        }
+        if (seen[idx] == key) {
+            dup = true;
+            break;
+        }
+    }
+    if (dup || *pos + len + FP_SPACE_SEP >= buf_size) {
+        return false;
+    }
+    if (*pos > 0) {
+        buf[(*pos)++] = ' ';
+    }
+    memcpy(buf + *pos, source + s, (size_t)len);
+    *pos += len;
+    (*count)++;
+    return true;
+}
+
+/* Walk AST body, collect unique identifier text as space-separated string.
+ * Returns arena-allocated string or NULL. */
+static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
+    enum { BT_STACK = 512, BT_BUF = 512, BT_MAX_IDENTS = 40, BT_SEEN = 128, BT_SEEN_MASK = 127 };
+    TSNode bt_stack[BT_STACK];
+    int bt_top = 0;
+    bt_stack[bt_top++] = body;
+    char bt_buf[BT_BUF];
+    int bt_pos = 0;
+    uint32_t bt_seen[BT_SEEN];
+    memset(bt_seen, 0, sizeof(bt_seen));
+    int bt_count = 0;
+
+    while (bt_top > 0 && bt_count < BT_MAX_IDENTS) {
+        TSNode nd = bt_stack[--bt_top];
+        uint32_t nc = ts_node_child_count(nd);
+        if (nc == 0) {
+            const char *k = ts_node_type(nd);
+            if (strcmp(k, "identifier") == 0 || strcmp(k, "field_identifier") == 0 ||
+                strcmp(k, "property_identifier") == 0) {
+                uint32_t s = ts_node_start_byte(nd);
+                int len = (int)(ts_node_end_byte(nd) - s);
+                if (len > 0 && len < CBM_SZ_64 && s < (uint32_t)ctx->source_len) {
+                    try_append_ident(ctx->source, s, len, bt_seen, BT_SEEN, BT_SEEN_MASK, bt_buf,
+                                     BT_BUF, &bt_pos, &bt_count);
+                }
+            }
+        } else {
+            for (int i = (int)nc - SKIP_ONE; i >= 0 && bt_top < BT_STACK; i--) {
+                bt_stack[bt_top++] = ts_node_child(nd, (uint32_t)i);
+            }
+        }
+    }
+    if (bt_pos > 0) {
+        bt_buf[bt_pos] = '\0';
+        return cbm_arena_strdup(ctx->arena, bt_buf);
+    }
+    return NULL;
+}
 
 /* Compute MinHash fingerprint for a function body node and store in def.
  * Sets def->fingerprint (arena-allocated) and def->fingerprint_k on success,
@@ -50,6 +133,24 @@ static void compute_fingerprint(CBMExtractCtx *ctx, CBMDefinition *def, TSNode f
     memcpy(fp, result.values, CBM_MINHASH_K * sizeof(uint32_t));
     def->fingerprint = fp;
     def->fingerprint_k = CBM_MINHASH_K;
+
+    /* AST structural profile (signals 8, 9, 11) — rides the same body node */
+    cbm_ast_profile_t profile;
+    int pc = 0;
+    if (def->param_names) {
+        while (def->param_names[pc]) {
+            pc++;
+        }
+    }
+    if (cbm_ast_profile_compute(body, ctx->source, def->param_names, pc, &profile)) {
+        profile.body_lines = (uint16_t)def->lines;
+        char sp_buf[CBM_AST_PROFILE_BUF];
+        cbm_ast_profile_to_str(&profile, sp_buf, sizeof(sp_buf));
+        def->structural_profile = cbm_arena_strdup(ctx->arena, sp_buf);
+    }
+
+    /* Extract raw identifier tokens from body for semantic search */
+    def->body_tokens = extract_body_ident_tokens(ctx, body);
 }
 
 // Tree-sitter row is 0-based; lines are 1-based.
@@ -79,6 +180,8 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
                                   const CBMLangSpec *spec);
 static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
                                  const CBMLangSpec *spec);
+static TSNode find_class_body(TSNode class_node, CBMLanguage lang);
+static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *class_qn);
 static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void emit_gdscript_anchor_def(CBMExtractCtx *ctx);
 static void extract_gdscript_signal_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
@@ -87,7 +190,12 @@ static void extract_gdscript_signal_def(CBMExtractCtx *ctx, TSNode node, const C
 
 // Get "name" field from a node
 static TSNode func_name_node(TSNode node) {
-    return ts_node_child_by_field_name(node, TS_FIELD("name"));
+    TSNode name = ts_node_child_by_field_name(node, TS_FIELD("name"));
+    if (ts_node_is_null(name)) {
+        /* Protobuf rpc: name is in rpc_name child, not "name" field */
+        name = cbm_find_child_by_kind(node, "rpc_name");
+    }
+    return name;
 }
 
 static TSNode gdscript_name_node(TSNode node) {
@@ -929,6 +1037,72 @@ static const char **find_base_from_children(CBMArena *a, TSNode node, const char
     return NULL;
 }
 
+/* Extract text from a single C# base_list named child, stripping generic args. */
+static const char *extract_csharp_base_child_text(CBMArena *a, TSNode bc, const char *source) {
+    const char *bk = ts_node_type(bc);
+    char *text = NULL;
+    if (strcmp(bk, "identifier") == 0 || strcmp(bk, "generic_name") == 0 ||
+        strcmp(bk, "qualified_name") == 0) {
+        text = cbm_node_text(a, bc, source);
+    } else {
+        TSNode inner = ts_node_named_child(bc, 0);
+        if (!ts_node_is_null(inner)) {
+            text = cbm_node_text(a, inner, source);
+        }
+    }
+    if (text && text[0]) {
+        char *angle = strchr(text, '<');
+        if (angle) {
+            *angle = '\0';
+        }
+        return text;
+    }
+    return NULL;
+}
+
+/* Collect bases from a single base_list node into an arena-allocated array. */
+static const char **collect_csharp_bases(CBMArena *a, TSNode base_list, const char *source) {
+    const char *bases[MAX_BASES];
+    int base_count = 0;
+    uint32_t bnc = ts_node_named_child_count(base_list);
+    for (uint32_t bi = 0; bi < bnc && base_count < MAX_BASES_MINUS_1; bi++) {
+        const char *text =
+            extract_csharp_base_child_text(a, ts_node_named_child(base_list, bi), source);
+        if (text) {
+            bases[base_count++] = text;
+        }
+    }
+    if (base_count == 0) {
+        return NULL;
+    }
+    const char **result =
+        (const char **)cbm_arena_alloc(a, (base_count + NULL_TERM) * sizeof(const char *));
+    if (!result) {
+        return NULL;
+    }
+    for (int j = 0; j < base_count; j++) {
+        result[j] = bases[j];
+    }
+    result[base_count] = NULL;
+    return result;
+}
+
+/* C# base_list: iterate children, find base_list node, extract bases. */
+static const char **extract_csharp_base_list(CBMArena *a, TSNode node, const char *source,
+                                             uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_child(node, i);
+        if (strcmp(ts_node_type(child), "base_list") != 0) {
+            continue;
+        }
+        const char **result = collect_csharp_bases(a, child, source);
+        if (result) {
+            return result;
+        }
+    }
+    return NULL;
+}
+
 // Extract base class names from a class node.
 static const char **extract_base_classes(CBMArena *a, TSNode node, const char *source,
                                          CBMLanguage lang) {
@@ -961,6 +1135,14 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
             if (result) {
                 return result;
             }
+        }
+    }
+
+    // C#: explicit base_list handler
+    {
+        const char **csharp_result = extract_csharp_base_list(a, node, source, count);
+        if (csharp_result) {
+            return csharp_result;
         }
     }
 
@@ -1731,6 +1913,16 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_SWIFT) {
         name_node = cbm_find_child_by_kind(node, "type_identifier");
     }
+    // Protobuf: service_name / message_name / enum_name children
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_PROTOBUF) {
+        name_node = cbm_find_child_by_kind(node, "service_name");
+        if (ts_node_is_null(name_node)) {
+            name_node = cbm_find_child_by_kind(node, "message_name");
+        }
+        if (ts_node_is_null(name_node)) {
+            name_node = cbm_find_child_by_kind(node, "enum_name");
+        }
+    }
     if (ts_node_is_null(name_node)) {
         return;
     }
@@ -1781,6 +1973,10 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
 
     cbm_defs_push(&ctx->result->defs, a, def);
+
+    if (strcmp(label, "Enum") == 0) {
+        extract_enum_members(ctx, node, class_qn);
+    }
 
     // Extract methods inside the class
     extract_class_methods(ctx, node, class_qn, spec);
@@ -2377,6 +2573,80 @@ static void extract_csharp_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
     }
 }
 
+/* Check if a tree-sitter node type is an enum member declaration. */
+static bool is_enum_member_kind(const char *kind) {
+    return strcmp(kind, "enum_member_declaration") == 0 || strcmp(kind, "enum_constant") == 0 ||
+           strcmp(kind, "enum_member") == 0 || strcmp(kind, "enum_assignment") == 0 ||
+           strcmp(kind, "enumerator") == 0;
+}
+
+/* Extract enum members as Variable nodes (C#, Java, TypeScript, C++). */
+static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *class_qn) {
+    CBMArena *a = ctx->arena;
+    TSNode body = find_class_body(node, ctx->language);
+    if (ts_node_is_null(body)) {
+        return;
+    }
+    uint32_t mc = ts_node_named_child_count(body);
+    for (uint32_t mi = 0; mi < mc; mi++) {
+        TSNode member = ts_node_named_child(body, mi);
+        if (!is_enum_member_kind(ts_node_type(member))) {
+            continue;
+        }
+        TSNode mname = ts_node_child_by_field_name(member, TS_FIELD("name"));
+        if (ts_node_is_null(mname)) {
+            mname = cbm_find_child_by_kind(member, "identifier");
+        }
+        if (ts_node_is_null(mname)) {
+            continue;
+        }
+        char *member_name = cbm_node_text(a, mname, ctx->source);
+        if (!member_name || !member_name[0]) {
+            continue;
+        }
+        CBMDefinition mdef;
+        memset(&mdef, 0, sizeof(mdef));
+        mdef.name = member_name;
+        mdef.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, member_name);
+        mdef.label = "Variable";
+        mdef.file_path = ctx->rel_path;
+        mdef.start_line = ts_node_start_point(member).row + TS_LINE_OFFSET;
+        mdef.end_line = ts_node_end_point(member).row + TS_LINE_OFFSET;
+        cbm_defs_push(&ctx->result->defs, a, mdef);
+    }
+}
+
+/* Resolve the identifier node from a destructure pattern child.
+ * pair_pattern → value field; shorthand/identifier → itself; others → first named child. */
+static TSNode destructure_ident(TSNode pat_child) {
+    const char *pk = ts_node_type(pat_child);
+    if (strcmp(pk, "shorthand_property_identifier_pattern") == 0 || strcmp(pk, "identifier") == 0) {
+        return pat_child;
+    }
+    if (strcmp(pk, "pair_pattern") == 0) {
+        return ts_node_child_by_field_name(pat_child, TS_FIELD("value"));
+    }
+    /* rest_pattern, assignment_pattern, etc. — first named child. */
+    return ts_node_named_child(pat_child, 0);
+}
+
+/* Emit individual Variable nodes for each destructured binding. */
+static void extract_destructured_vars(CBMExtractCtx *ctx, TSNode pattern, TSNode decl,
+                                      CBMArena *a) {
+    uint32_t pc = ts_node_named_child_count(pattern);
+    for (uint32_t pi = 0; pi < pc; pi++) {
+        TSNode pat_child = ts_node_named_child(pattern, pi);
+        TSNode ident = destructure_ident(pat_child);
+        if (ts_node_is_null(ident)) {
+            continue;
+        }
+        char *id_text = cbm_node_text(a, ident, ctx->source);
+        if (id_text && id_text[0]) {
+            push_var_def(ctx, id_text, decl);
+        }
+    }
+}
+
 // JS/TS variable extraction: skip function-assigned declarators.
 static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
     uint32_t n = ts_node_named_child_count(node);
@@ -2395,7 +2665,14 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
         }
         TSNode vname = ts_node_child_by_field_name(child, TS_FIELD("name"));
         if (!ts_node_is_null(vname)) {
-            push_var_def(ctx, cbm_node_text(a, vname, ctx->source), child);
+            const char *nk = ts_node_type(vname);
+            /* Destructured patterns: emit individual identifiers instead of
+             * the raw "{A, B, C}" text as a single Variable node. */
+            if (strcmp(nk, "object_pattern") == 0 || strcmp(nk, "array_pattern") == 0) {
+                extract_destructured_vars(ctx, vname, child, a);
+            } else {
+                push_var_def(ctx, cbm_node_text(a, vname, ctx->source), child);
+            }
         }
     }
 }

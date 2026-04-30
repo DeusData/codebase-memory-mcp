@@ -237,8 +237,8 @@ TEST(watcher_detects_git_commit) {
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
              "git add file.txt && git commit -q -m 'init'",
              tmpdir);
     if (system(cmd) != 0) {
@@ -258,7 +258,8 @@ TEST(watcher_detects_git_commit) {
 
     /* Make a change: new commit */
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && echo 'world' >> file.txt && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&echo 'world' >> file.txt && "
              "git add file.txt && git commit -q -m 'add world'",
              tmpdir);
     system(cmd);
@@ -289,8 +290,8 @@ TEST(watcher_detects_dirty_worktree) {
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
              "git add file.txt && git commit -q -m 'init'",
              tmpdir);
     if (system(cmd) != 0) {
@@ -335,8 +336,8 @@ TEST(watcher_detects_new_file) {
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
              "git add file.txt && git commit -q -m 'init'",
              tmpdir);
     if (system(cmd) != 0) {
@@ -382,8 +383,8 @@ TEST(watcher_no_change_no_reindex) {
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
              "git add file.txt && git commit -q -m 'init'",
              tmpdir);
     if (system(cmd) != 0) {
@@ -426,8 +427,8 @@ TEST(watcher_multiple_projects) {
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'a' > a.txt && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'a' > a.txt && "
              "git add a.txt && git commit -q -m 'init'",
              tmpdirA);
     if (system(cmd) != 0) {
@@ -435,8 +436,8 @@ TEST(watcher_multiple_projects) {
     }
 
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'b' > b.txt && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'b' > b.txt && "
              "git add b.txt && git commit -q -m 'init'",
              tmpdirB);
     if (system(cmd) != 0) {
@@ -547,8 +548,8 @@ TEST(watcher_interval_blocks_repoll) {
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
              "git add file.txt && git commit -q -m 'init'",
              tmpdir);
     if (system(cmd) != 0) {
@@ -623,8 +624,8 @@ TEST(watcher_git_removed_no_crash) {
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
              "git add file.txt && git commit -q -m 'init'",
              tmpdir);
     if (system(cmd) != 0) {
@@ -670,8 +671,8 @@ TEST(watcher_continued_dirty) {
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
              "git add file.txt && git commit -q -m 'init'",
              tmpdir);
     if (system(cmd) != 0) {
@@ -706,7 +707,8 @@ TEST(watcher_continued_dirty) {
     ASSERT_EQ(index_call_count, 2);
 
     /* Commit to clean up, then poll — should not trigger */
-    snprintf(cmd, sizeof(cmd), "cd '%s' && git add file.txt && git commit -q -m 'clean'", tmpdir);
+    snprintf(cmd, sizeof(cmd), "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git add file.txt && git commit -q -m 'clean'", tmpdir);
     system(cmd);
 
     /* HEAD changed → will trigger one more reindex */
@@ -740,8 +742,8 @@ TEST(watcher_baseline_dirty_repo) {
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
              "git add file.txt && git commit -q -m 'init'",
              tmpdir);
     if (system(cmd) != 0) {
@@ -786,8 +788,8 @@ TEST(watcher_unwatch_prunes_state) {
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
              "git add file.txt && git commit -q -m 'init'",
              tmpdir);
     if (system(cmd) != 0) {
@@ -834,8 +836,8 @@ TEST(watcher_watch_after_unwatch) {
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
              "git add file.txt && git commit -q -m 'init'",
              tmpdir);
     if (system(cmd) != 0) {
@@ -897,8 +899,8 @@ TEST(watcher_detects_file_delete) {
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
              "echo 'todelete' > todelete.go && "
              "git add -A && git commit -q -m 'init'",
              tmpdir);
@@ -944,8 +946,8 @@ TEST(watcher_detects_subdir_file) {
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > main.go && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > main.go && "
              "git add main.go && git commit -q -m 'init'",
              tmpdir);
     if (system(cmd) != 0) {
@@ -1016,8 +1018,8 @@ TEST(watcher_full_flow_new_file) {
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'package main' > main.go && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'package main' > main.go && "
              "git add main.go && git commit -q -m 'init'",
              tmpdir);
     if (system(cmd) != 0) {
@@ -1068,8 +1070,8 @@ TEST(watcher_fallback_still_detects) {
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > main.go && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > main.go && "
              "git add main.go && git commit -q -m 'init'",
              tmpdir);
     if (system(cmd) != 0) {
@@ -1131,8 +1133,8 @@ TEST(watcher_poll_only_watched_projects) {
     char cmd[512];
     /* Init both repos */
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'a' > a.txt && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'a' > a.txt && "
              "git add a.txt && git commit -q -m 'init'",
              tmpdirA);
     if (system(cmd) != 0) {
@@ -1140,8 +1142,8 @@ TEST(watcher_poll_only_watched_projects) {
     }
 
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'b' > b.txt && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'b' > b.txt && "
              "git add b.txt && git commit -q -m 'init'",
              tmpdirB);
     if (system(cmd) != 0) {
@@ -1195,8 +1197,8 @@ TEST(watcher_touch_resets_immediate) {
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
              "git add file.txt && git commit -q -m 'init'",
              tmpdir);
     if (system(cmd) != 0) {
@@ -1247,8 +1249,8 @@ TEST(watcher_modify_tracked_file) {
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'package main' > main.go && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'package main' > main.go && "
              "git add main.go && git commit -q -m 'init'",
              tmpdir);
     if (system(cmd) != 0) {
@@ -1543,8 +1545,8 @@ TEST(watcher_callback_data_passed) {
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
+             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
+             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
              "git add file.txt && git commit -q -m 'init'",
              tmpdir);
     if (system(cmd) != 0) {

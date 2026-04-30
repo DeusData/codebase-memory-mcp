@@ -489,6 +489,39 @@ void cbm_lsh_query(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
     *count = mut_idx->result_count;
 }
 
+int cbm_lsh_query_into(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
+                       const cbm_lsh_entry_t **out_buf, int out_cap) {
+    if (!idx || !fp || !out_buf || out_cap <= 0) {
+        return 0;
+    }
+
+    /* Thread-local dedup — no shared state touched. */
+    seen_set_t seen;
+    seen_set_init(&seen);
+
+    int count = 0;
+    for (int b = 0; b < CBM_LSH_BANDS; b++) {
+        uint32_t h = band_hash(fp, b);
+        const lsh_bucket_t *bucket = &idx->bands[b][h];
+        if (bucket->count > MAX_BUCKET_SIZE) {
+            continue;
+        }
+        for (int i = 0; i < bucket->count && count < out_cap; i++) {
+            const cbm_lsh_entry_t *candidate = &idx->entries[bucket->items[i]];
+            if (!seen_set_insert(&seen, candidate->node_id)) {
+                continue;
+            }
+            out_buf[count++] = candidate;
+        }
+        if (count >= out_cap) {
+            break;
+        }
+    }
+
+    seen_set_free(&seen);
+    return count;
+}
+
 void cbm_lsh_free(cbm_lsh_index_t *idx) {
     if (!idx) {
         return;

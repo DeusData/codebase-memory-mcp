@@ -125,6 +125,14 @@ cbm_store_t *cbm_mcp_server_store(cbm_mcp_server_t *srv);
  * This prevents resolve_store() from trying to open a .db file when tools specify a project. */
 void cbm_mcp_server_set_project(cbm_mcp_server_t *srv, const char *project);
 
+/* ── Cancellation support ─────────────────────────────────────── */
+
+struct cbm_pipeline; /* forward decl */
+
+/* Get the currently active pipeline (for signal handler cancellation).
+ * Returns NULL if no pipeline is running. */
+struct cbm_pipeline *cbm_mcp_server_active_pipeline(cbm_mcp_server_t *srv);
+
 /* ── URI helpers ───────────────────────────────────────────────── */
 
 /* Parse a file:// URI and extract the filesystem path.

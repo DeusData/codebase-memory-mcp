@@ -9,10 +9,17 @@
 [![Pure C](https://img.shields.io/badge/pure_C-zero_dependencies-blue)](https://github.com/DeusData/codebase-memory-mcp)
 [![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/DeusData/codebase-memory-mcp/badge)](https://scorecard.dev/viewer/?uri=github.com/DeusData/codebase-memory-mcp)
+[![SLSA 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev)
+[![VirusTotal](https://img.shields.io/badge/VirusTotal-0%2F72_engines-brightgreen?logo=virustotal)](https://www.virustotal.com/gui/file/dcbe9a951a2b1f7ec6d003edce2f38b586f74bf8cf98faeedec36f1dd3444b06/detection)
+[![arXiv](https://img.shields.io/badge/arXiv-2603.27277-b31b1b?logo=arxiv)](https://arxiv.org/abs/2603.27277)
 
 **The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a single static binary for macOS, Linux, and Windows — download, run `install`, done.
 
 High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 67 languages, enhanced with LSP-style hybrid type resolution for Go, C, and C++ (more languages coming soon) — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 14 MCP tools. Zero dependencies. Plug and play across 10 coding agents.
+
+> **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.
+
+> **Security & Trust** — This tool reads your codebase and writes to your agent configuration files. That is what it is designed to do. If you prefer to audit before running, the [full source is here](https://github.com/DeusData/codebase-memory-mcp) — every release binary is signed, checksummed, and scanned by 70+ antivirus engines. All processing happens 100% locally; your code never leaves your machine. Found a security issue? We want to know — see [SECURITY.md](SECURITY.md). Security is Priority #1 for us.
 
 <p align="center">
   <img src="docs/graph-ui-screenshot.png" alt="Graph visualization UI showing the codebase-memory-mcp knowledge graph" width="800">
@@ -26,7 +33,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **Plug and play** — single static binary for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (amd64). No Docker, no runtime dependencies, no API keys. Download → `install` → restart agent → done.
 - **67 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search. One graph query replaces dozens of grep/read cycles.
-- **10 agents, one command** — `install` auto-detects Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, and OpenClaw — configures MCP entries, instruction files, and pre-tool hooks for each.
+- **11 agents, one command** — `install` auto-detects Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, OpenClaw, and Kiro — configures MCP entries, instruction files, and pre-tool hooks for each.
 - **Built-in graph visualization** — 3D interactive UI at `localhost:9749` (optional UI binary variant).
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
 - **14 MCP tools** — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
@@ -45,7 +52,15 @@ curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/i
 
 **Windows** (PowerShell):
 ```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.ps1 | iex"
+# 1. Download the installer
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.ps1 -OutFile install.ps1
+
+# 2. (Optional but recommended) Inspect the script
+notepad install.ps1
+
+# 3. Run it
+.\install.ps1
+
 ```
 
 Options: `--ui` (graph visualization), `--skip-config` (binary only, no agent setup), `--dir=<path>` (custom location).
@@ -267,6 +282,7 @@ Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` 
 | KiloCode | `mcp_settings.json` | `~/.kilocode/rules/` | — |
 | VS Code | `Code/User/mcp.json` | — | — |
 | OpenClaw | `openclaw.json` | — | — |
+| Kiro | `.kiro/settings/mcp.json` | — | — |
 
 **Hooks** are advisory (exit code 0) — they remind agents to prefer MCP graph tools when they reach for grep/glob/read, without blocking the tool call.
 
@@ -302,7 +318,7 @@ codebase-memory-mcp cli --raw search_graph '{"label": "Function"}' | jq '.result
 | `trace_call_path` | BFS traversal — who calls a function and what it calls. Depth 1-5. |
 | `detect_changes` | Map git diff to affected symbols + blast radius with risk classification. |
 | `query_graph` | Execute Cypher-like graph queries (read-only). |
-| `get_graph_schema` | Node/edge counts, relationship patterns. Run this first. |
+| `get_graph_schema` | Node/edge counts, relationship patterns, property definitions per label. Run this first. |
 | `get_code_snippet` | Read source code for a function by qualified name. |
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `search_code` | Grep-like text search within indexed project files. |
@@ -417,6 +433,29 @@ src/
   foundation/         Platform abstractions (threads, filesystem, logging, memory)
 internal/cbm/         Vendored tree-sitter grammars (67 languages) + AST extraction engine
 ```
+
+## Security
+
+Every release binary is verified through a multi-layer pipeline before publication:
+
+- **VirusTotal** — all binaries scanned by 70+ antivirus engines (zero detections required to publish)
+- **SLSA Level 3** — cryptographic build provenance generated by GitHub Actions; verify with `gh attestation verify <file> --repo DeusData/codebase-memory-mcp`
+- **Sigstore cosign** — keyless signatures on all artifacts; bundles included in every release
+- **SHA-256 checksums** — `checksums.txt` published with every release; verified by both install scripts before extraction
+- **CodeQL SAST** — blocks release pipeline if any open alerts remain
+- **Zero runtime dependencies** — no transitive supply chain; all libraries vendored at compile time
+
+### v0.6.0 VirusTotal scans
+
+| Binary | SHA-256 | VirusTotal |
+|--------|---------|-----------|
+| `linux-amd64` | `dcbe9a951a2b1f7ec6d0...` | [0/72 ✅](https://www.virustotal.com/gui/file/dcbe9a951a2b1f7ec6d003edce2f38b586f74bf8cf98faeedec36f1dd3444b06/detection) |
+| `linux-arm64` | `3dc702d2ff2b5a7e9094...` | [0/72 ✅](https://www.virustotal.com/gui/file/3dc702d2ff2b5a7e909409337a8a24ba3f724e7e47d6b159b3c9dedf70117fe2/detection) |
+| `darwin-arm64` | `61d543c9c795471702...` | [0/72 ✅](https://www.virustotal.com/gui/file/61d543c9c79547170296badddcdfe117b145471361d86606c7094d41aea2644f/detection) |
+| `darwin-amd64` | `eea862d705ac9b44a7bd...` | [0/72 ✅](https://www.virustotal.com/gui/file/eea862d705ac9b44a7bd595bfcd1c5c36aa3409ae6e7f0a2454308024c205e40/detection) |
+| `windows-amd64` | `dd828ee0d790f9d81c9b...` | [0/72 ✅](https://www.virustotal.com/gui/file/dd828ee0d790f9d81c9bde348db8d5681d624f786bba0e1b5e6c9409534c7a28/detection) |
+
+Scan links for every release are also included in the GitHub Release notes automatically.
 
 ## License
 

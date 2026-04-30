@@ -118,7 +118,6 @@ static const ext_entry_t EXT_TABLE[] = {
     /* GraphQL */
     {".gql", CBM_LANG_GRAPHQL},
     {".graphql", CBM_LANG_GRAPHQL},
-    {".gd", CBM_LANG_GDSCRIPT},
 
     /* Groovy */
     {".gradle", CBM_LANG_GROOVY},
@@ -245,6 +244,16 @@ static const ext_entry_t EXT_TABLE[] = {
     /* VimScript */
     {".vim", CBM_LANG_VIMSCRIPT},
     {".vimrc", CBM_LANG_VIMSCRIPT},
+    {"justfile", CBM_LANG_JUST},
+    {"Justfile", CBM_LANG_JUST},
+    {".justfile", CBM_LANG_JUST},
+    {"hyprland.conf", CBM_LANG_HYPRLANG},
+    {"ssh_config", CBM_LANG_SSHCONFIG},
+    {"sshd_config", CBM_LANG_SSHCONFIG},
+    {"BUILD", CBM_LANG_STARLARK},
+    {"BUILD.bazel", CBM_LANG_STARLARK},
+    {"WORKSPACE", CBM_LANG_STARLARK},
+    {"WORKSPACE.bazel", CBM_LANG_STARLARK},
 
     /* Vue */
     {".vue", CBM_LANG_VUE},
@@ -262,6 +271,325 @@ static const ext_entry_t EXT_TABLE[] = {
     /* YAML */
     {".yaml", CBM_LANG_YAML},
     {".yml", CBM_LANG_YAML},
+
+    /* Ada */
+    {".adb", CBM_LANG_ADA},
+
+    /* Ada */
+    {".ads", CBM_LANG_ADA},
+
+    /* Agda */
+    {".agda", CBM_LANG_AGDA},
+
+    /* Astro */
+    {".astro", CBM_LANG_ASTRO},
+
+    /* AWK */
+    {".awk", CBM_LANG_AWK},
+
+    /* BitBake */
+    {".bb", CBM_LANG_BITBAKE},
+
+    /* BitBake */
+    {".bbappend", CBM_LANG_BITBAKE},
+
+    /* BitBake */
+    {".bbclass", CBM_LANG_BITBAKE},
+
+    /* Beancount */
+    {".beancount", CBM_LANG_BEANCOUNT},
+
+    /* BibTeX */
+    {".bib", CBM_LANG_BIBTEX},
+
+    /* Bicep */
+    {".bicep", CBM_LANG_BICEP},
+
+    /* Blade */
+    /* .blade.php handled by userconfig compound extensions, not EXT_TABLE */
+
+    /* Starlark */
+    {".bzl", CBM_LANG_STARLARK},
+
+    /* Cairo */
+    {".cairo", CBM_LANG_CAIRO},
+
+    /* Cap'n Proto */
+    {".capnp", CBM_LANG_CAPNP},
+
+    /* Apex */
+    {".cls", CBM_LANG_APEX},
+
+    /* Crystal */
+    {".cr", CBM_LANG_CRYSTAL},
+
+    /* CSV */
+    {".csv", CBM_LANG_CSV},
+
+    /* D */
+    {".d", CBM_LANG_DLANG},
+
+    /* Diff */
+    {".diff", CBM_LANG_DIFF},
+
+    /* Pascal */
+    {".dpr", CBM_LANG_PASCAL},
+
+    /* DeviceTree */
+    {".dts", CBM_LANG_DEVICETREE},
+
+    /* DeviceTree */
+    {".dtsi", CBM_LANG_DEVICETREE},
+
+    /* FunC */
+    {".fc", CBM_LANG_FUNC},
+
+    /* Fish */
+    {".fish", CBM_LANG_FISH},
+
+    /* Fennel */
+    {".fnl", CBM_LANG_FENNEL},
+
+    /* HLSL */
+    {".fx", CBM_LANG_HLSL},
+
+    /* GDScript */
+    {".gd", CBM_LANG_GDSCRIPT},
+
+    /* Gleam */
+    {".gleam", CBM_LANG_GLEAM},
+
+    /* GN */
+    {".gn", CBM_LANG_GN},
+
+    /* GN */
+    {".gni", CBM_LANG_GN},
+
+    /* Go Template */
+    {".gotmpl", CBM_LANG_GOTEMPLATE},
+
+    /* Hare */
+    {".ha", CBM_LANG_HARE},
+
+    /* Hyprlang */
+    {".hl", CBM_LANG_HYPRLANG},
+
+    /* HLSL */
+    {".hlsl", CBM_LANG_HLSL},
+
+    /* HLSL */
+    {".hlsli", CBM_LANG_HLSL},
+
+    /* ISPC */
+    {".ispc", CBM_LANG_ISPC},
+
+    /* Jinja2 */
+    {".j2", CBM_LANG_JINJA2},
+
+    /* Janet */
+    {".janet", CBM_LANG_JANET},
+
+    /* Jinja2 */
+    {".jinja", CBM_LANG_JINJA2},
+
+    /* Jinja2 */
+    {".jinja2", CBM_LANG_JINJA2},
+
+    /* JSON5 */
+    {".json5", CBM_LANG_JSON5},
+
+    /* Jsonnet */
+    {".jsonnet", CBM_LANG_JSONNET},
+
+    /* KDL */
+    {".kdl", CBM_LANG_KDL},
+
+    /* Linker Script */
+    {".ld", CBM_LANG_LINKERSCRIPT},
+
+    /* Linker Script */
+    {".lds", CBM_LANG_LINKERSCRIPT},
+
+    /* Jsonnet */
+    {".libsonnet", CBM_LANG_JSONNET},
+
+    /* Liquid */
+    {".liquid", CBM_LANG_LIQUID},
+
+    /* LLVM IR */
+    {".ll", CBM_LANG_LLVM_IR},
+
+    /* Pascal */
+    {".lpr", CBM_LANG_PASCAL},
+
+    /* Luau */
+    {".luau", CBM_LANG_LUAU},
+
+    /* Mermaid */
+    {".mermaid", CBM_LANG_MERMAID},
+
+    /* Mermaid */
+    {".mmd", CBM_LANG_MERMAID},
+
+    /* Move */
+    {".move", CBM_LANG_MOVE},
+
+    /* NASM */
+    {".nasm", CBM_LANG_NASM},
+
+    /* Nickel */
+    {".ncl", CBM_LANG_NICKEL},
+
+    /* Nim */
+    {".nim", CBM_LANG_NIM},
+
+    /* Nim */
+    {".nims", CBM_LANG_NIM},
+
+    /* Squirrel */
+    {".nut", CBM_LANG_SQUIRREL},
+
+    /* Odin */
+    {".odin", CBM_LANG_ODIN},
+
+    /* DeviceTree */
+    {".overlay", CBM_LANG_DEVICETREE},
+
+    /* Pascal */
+    {".pas", CBM_LANG_PASCAL},
+
+    /* Diff */
+    {".patch", CBM_LANG_DIFF},
+
+    /* Pkl */
+    {".pkl", CBM_LANG_PKL},
+
+    /* PO */
+    {".po", CBM_LANG_PO},
+
+    /* Pony */
+    {".pony", CBM_LANG_PONY},
+
+    /* PO */
+    {".pot", CBM_LANG_PO},
+
+    /* Puppet */
+    {".pp", CBM_LANG_PUPPET},
+
+    /* Prisma */
+    {".prisma", CBM_LANG_PRISMA},
+
+    /* Properties */
+    {".properties", CBM_LANG_PROPERTIES},
+
+    /* PowerShell */
+    {".ps1", CBM_LANG_POWERSHELL},
+
+    /* PowerShell */
+    {".psd1", CBM_LANG_POWERSHELL},
+
+    /* PowerShell */
+    {".psm1", CBM_LANG_POWERSHELL},
+
+    /* PureScript */
+    {".purs", CBM_LANG_PURESCRIPT},
+
+    /* ReScript */
+    {".res", CBM_LANG_RESCRIPT},
+
+    /* ReScript */
+    {".resi", CBM_LANG_RESCRIPT},
+
+    /* Racket */
+    {".rkt", CBM_LANG_RACKET},
+
+    /* RON */
+    {".ron", CBM_LANG_RON},
+
+    /* reStructuredText */
+    {".rst", CBM_LANG_RST},
+
+    /* Assembly */
+    {".s", CBM_LANG_ASSEMBLY},
+
+    /* Assembly */
+    {".S", CBM_LANG_ASSEMBLY},
+
+    /* Scheme */
+    {".scm", CBM_LANG_SCHEME},
+
+    /* Slang */
+    {".slang", CBM_LANG_SLANG},
+
+    /* Smali */
+    {".smali", CBM_LANG_SMALI},
+
+    /* Smithy */
+    {".smithy", CBM_LANG_SMITHY},
+
+    /* Solidity */
+    {".sol", CBM_LANG_SOLIDITY},
+
+    /* SOQL */
+    {".soql", CBM_LANG_SOQL},
+
+    /* SOSL */
+    {".sosl", CBM_LANG_SOSL},
+
+    /* Scheme */
+    {".ss", CBM_LANG_SCHEME},
+
+    /* Starlark */
+    {".star", CBM_LANG_STARLARK},
+
+    /* SystemVerilog */
+
+    /* SystemVerilog */
+
+    /* Sway */
+    {".sw", CBM_LANG_SWAY},
+
+    /* Tcl */
+    {".tcl", CBM_LANG_TCL},
+
+    /* TableGen */
+    {".td", CBM_LANG_TABLEGEN},
+
+    /* Templ */
+    {".templ", CBM_LANG_TEMPL},
+
+    /* Thrift */
+    {".thrift", CBM_LANG_THRIFT},
+
+    /* Teal */
+    {".tl", CBM_LANG_TEAL},
+
+    /* TLA+ */
+    {".tla", CBM_LANG_TLAPLUS},
+
+    /* Go Template */
+    {".tmpl", CBM_LANG_GOTEMPLATE},
+
+    /* Apex */
+    {".trigger", CBM_LANG_APEX},
+
+    /* Typst */
+    {".typ", CBM_LANG_TYPST},
+
+    /* VHDL */
+    {".vhd", CBM_LANG_VHDL},
+
+    /* VHDL */
+    {".vhdl", CBM_LANG_VHDL},
+
+    /* WGSL */
+    {".wgsl", CBM_LANG_WGSL},
+
+    /* WIT */
+    {".wit", CBM_LANG_WIT},
+
+    /* Zsh */
+    {".zsh", CBM_LANG_ZSH},
 
     /* Zig */
     {".zig", CBM_LANG_ZIG},
@@ -293,6 +621,26 @@ static const filename_entry_t FILENAME_TABLE[] = {
      * pass_k8s.c, which performs a case-insensitive comparison.  This is the
      * intended behaviour — no additional entries are needed. */
     {".vimrc", CBM_LANG_VIMSCRIPT},
+    {".zshrc", CBM_LANG_ZSH},
+    {".zshenv", CBM_LANG_ZSH},
+    {".zprofile", CBM_LANG_ZSH},
+    {"justfile", CBM_LANG_JUST},
+    {"Justfile", CBM_LANG_JUST},
+    {".justfile", CBM_LANG_JUST},
+    {"hyprland.conf", CBM_LANG_HYPRLANG},
+    {"ssh_config", CBM_LANG_SSHCONFIG},
+    {"sshd_config", CBM_LANG_SSHCONFIG},
+    {".ssh/config", CBM_LANG_SSHCONFIG},
+    {"BUILD", CBM_LANG_STARLARK},
+    {"BUILD.bazel", CBM_LANG_STARLARK},
+    {"WORKSPACE", CBM_LANG_STARLARK},
+    {"WORKSPACE.bazel", CBM_LANG_STARLARK},
+    {"requirements.txt", CBM_LANG_REQUIREMENTS},
+    {"requirements-dev.txt", CBM_LANG_REQUIREMENTS},
+    {"requirements-test.txt", CBM_LANG_REQUIREMENTS},
+    {"Kconfig", CBM_LANG_KCONFIG},
+    {"go.mod", CBM_LANG_GOMOD},
+
 };
 
 #define FILENAME_TABLE_SIZE (sizeof(FILENAME_TABLE) / sizeof(FILENAME_TABLE[0]))
@@ -364,9 +712,98 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_FORM] = "FORM",
     [CBM_LANG_MAGMA] = "Magma",
     [CBM_LANG_WOLFRAM] = "Wolfram",
-    [CBM_LANG_GDSCRIPT] = "GDScript",
     [CBM_LANG_KUSTOMIZE] = "Kustomize",
     [CBM_LANG_K8S] = "Kubernetes",
+    [CBM_LANG_SOLIDITY] = "Solidity",
+    [CBM_LANG_TYPST] = "Typst",
+    [CBM_LANG_GDSCRIPT] = "GDScript",
+    [CBM_LANG_GLEAM] = "Gleam",
+    [CBM_LANG_POWERSHELL] = "PowerShell",
+    [CBM_LANG_PASCAL] = "Pascal",
+    [CBM_LANG_DLANG] = "D",
+    [CBM_LANG_NIM] = "Nim",
+    [CBM_LANG_SCHEME] = "Scheme",
+    [CBM_LANG_FENNEL] = "Fennel",
+    [CBM_LANG_FISH] = "Fish",
+    [CBM_LANG_AWK] = "AWK",
+    [CBM_LANG_ZSH] = "Zsh",
+    [CBM_LANG_TCL] = "Tcl",
+    [CBM_LANG_ADA] = "Ada",
+    [CBM_LANG_AGDA] = "Agda",
+    [CBM_LANG_RACKET] = "Racket",
+    [CBM_LANG_ODIN] = "Odin",
+    [CBM_LANG_RESCRIPT] = "ReScript",
+    [CBM_LANG_PURESCRIPT] = "PureScript",
+    [CBM_LANG_NICKEL] = "Nickel",
+    [CBM_LANG_CRYSTAL] = "Crystal",
+    [CBM_LANG_TEAL] = "Teal",
+    [CBM_LANG_HARE] = "Hare",
+    [CBM_LANG_PONY] = "Pony",
+    [CBM_LANG_LUAU] = "Luau",
+    [CBM_LANG_JANET] = "Janet",
+    [CBM_LANG_SWAY] = "Sway",
+    [CBM_LANG_NASM] = "NASM",
+    [CBM_LANG_ASSEMBLY] = "Assembly",
+    [CBM_LANG_ASTRO] = "Astro",
+    [CBM_LANG_BLADE] = "Blade",
+    [CBM_LANG_JUST] = "Just",
+    [CBM_LANG_GOTEMPLATE] = "Go Template",
+    [CBM_LANG_TEMPL] = "Templ",
+    [CBM_LANG_LIQUID] = "Liquid",
+    [CBM_LANG_JINJA2] = "Jinja2",
+    [CBM_LANG_PRISMA] = "Prisma",
+    [CBM_LANG_HYPRLANG] = "Hyprlang",
+    [CBM_LANG_DOTENV] = "DotEnv",
+    [CBM_LANG_SYSTEMVERILOG] = "SystemVerilog",
+    [CBM_LANG_DIFF] = "Diff",
+    [CBM_LANG_WGSL] = "WGSL",
+    [CBM_LANG_KDL] = "KDL",
+    [CBM_LANG_JSON5] = "JSON5",
+    [CBM_LANG_JSONNET] = "Jsonnet",
+    [CBM_LANG_RON] = "RON",
+    [CBM_LANG_THRIFT] = "Thrift",
+    [CBM_LANG_CAPNP] = "Cap'n Proto",
+    [CBM_LANG_PROPERTIES] = "Properties",
+    [CBM_LANG_SSHCONFIG] = "SSH Config",
+    [CBM_LANG_BIBTEX] = "BibTeX",
+    [CBM_LANG_STARLARK] = "Starlark",
+    [CBM_LANG_BICEP] = "Bicep",
+    [CBM_LANG_CSV] = "CSV",
+    [CBM_LANG_REQUIREMENTS] = "Requirements",
+    [CBM_LANG_HLSL] = "HLSL",
+    [CBM_LANG_VHDL] = "VHDL",
+    [CBM_LANG_DEVICETREE] = "DeviceTree",
+    [CBM_LANG_LINKERSCRIPT] = "Linker Script",
+    [CBM_LANG_GN] = "GN",
+    [CBM_LANG_KCONFIG] = "Kconfig",
+    [CBM_LANG_BITBAKE] = "BitBake",
+    [CBM_LANG_SMALI] = "Smali",
+    [CBM_LANG_TABLEGEN] = "TableGen",
+    [CBM_LANG_ISPC] = "ISPC",
+    [CBM_LANG_CAIRO] = "Cairo",
+    [CBM_LANG_MOVE] = "Move",
+    [CBM_LANG_SQUIRREL] = "Squirrel",
+    [CBM_LANG_FUNC] = "FunC",
+    [CBM_LANG_REGEX] = "Regex",
+    [CBM_LANG_JSDOC] = "JSDoc",
+    [CBM_LANG_RST] = "reStructuredText",
+    [CBM_LANG_BEANCOUNT] = "Beancount",
+    [CBM_LANG_MERMAID] = "Mermaid",
+    [CBM_LANG_PUPPET] = "Puppet",
+    [CBM_LANG_PO] = "PO",
+    [CBM_LANG_GITATTRIBUTES] = "gitattributes",
+    [CBM_LANG_GITIGNORE] = "gitignore",
+    [CBM_LANG_SLANG] = "Slang",
+    [CBM_LANG_LLVM_IR] = "LLVM IR",
+    [CBM_LANG_SMITHY] = "Smithy",
+    [CBM_LANG_WIT] = "WIT",
+    [CBM_LANG_TLAPLUS] = "TLA+",
+    [CBM_LANG_PKL] = "Pkl",
+    [CBM_LANG_GOMOD] = "Go Mod",
+    [CBM_LANG_APEX] = "Apex",
+    [CBM_LANG_SOQL] = "SOQL",
+    [CBM_LANG_SOSL] = "SOSL",
+
 };
 
 /* ── Public API ──────────────────────────────────────────────────── */

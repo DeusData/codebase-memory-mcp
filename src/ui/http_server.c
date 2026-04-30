@@ -23,8 +23,10 @@
 #include "foundation/compat_thread.h"
 
 #include <mongoose/mongoose.h>
+#include <sqlite3/sqlite3.h>
 #include <yyjson/yyjson.h>
 
+#include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -890,6 +892,41 @@ static bool get_query_param(struct mg_str query, const char *name, char *buf, in
 
 /* ── Handle GET /api/layout ───────────────────────────────────── */
 
+/* Find distinct target_project values from CROSS_* edges in a store.
+ * Writes up to max_out project names (heap-allocated). Returns count. */
+static int find_cross_repo_targets(cbm_store_t *store, const char *project, char **out,
+                                   int max_out) {
+    struct sqlite3 *db = cbm_store_get_db(store);
+    if (!db) {
+        return 0;
+    }
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(
+            db,
+            "SELECT DISTINCT json_extract(properties, '$.target_project') FROM edges "
+            "WHERE project = ?1 AND type LIKE 'CROSS_%' "
+            "AND json_extract(properties, '$.target_project') IS NOT NULL",
+            -1, &s, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_text(s, 1, project, -1, SQLITE_STATIC);
+    int count = 0;
+    while (sqlite3_step(s) == SQLITE_ROW && count < max_out) {
+        const char *tp = (const char *)sqlite3_column_text(s, 0);
+        if (tp && tp[0]) {
+            size_t len = strlen(tp);
+            out[count] = malloc(len + 1);
+            memcpy(out[count], tp, len + 1);
+            count++;
+        }
+    }
+    sqlite3_finalize(s);
+    return count;
+}
+
+enum { LAYOUT_MAX_LINKED = 16 };
+#define LAYOUT_GALAXY_SPACING 600.0
+
 static void handle_layout(struct mg_connection *c, struct mg_http_message *hm) {
     char project[256] = {0};
     char max_str[32] = {0};
@@ -907,7 +944,6 @@ static void handle_layout(struct mg_connection *c, struct mg_http_message *hm) {
             max_nodes = v;
     }
 
-    /* Open a read-only store for this project */
     char db_path[1024];
     db_path_for_project(project, db_path, sizeof(db_path));
 
@@ -924,6 +960,11 @@ static void handle_layout(struct mg_connection *c, struct mg_http_message *hm) {
 
     cbm_layout_result_t *layout =
         cbm_layout_compute(store, project, CBM_LAYOUT_OVERVIEW, NULL, 0, max_nodes);
+
+    /* Find linked projects from CROSS_* edges */
+    char *linked[LAYOUT_MAX_LINKED];
+    int linked_count = find_cross_repo_targets(store, project, linked, LAYOUT_MAX_LINKED);
+
     cbm_store_close(store);
 
     if (!layout) {
@@ -931,16 +972,118 @@ static void handle_layout(struct mg_connection *c, struct mg_http_message *hm) {
         return;
     }
 
-    char *json = cbm_layout_to_json(layout);
+    /* Build JSON: primary layout + linked_projects */
+    char *primary_json = cbm_layout_to_json(layout);
     cbm_layout_free(layout);
-
-    if (!json) {
+    if (!primary_json) {
         mg_http_reply(c, 500, g_cors_json, "{\"error\":\"JSON serialization failed\"}");
         return;
     }
 
-    mg_http_reply(c, 200, g_cors_json, "%s", json);
-    free(json);
+    if (linked_count == 0) {
+        mg_http_reply(c, 200, g_cors_json, "%s", primary_json);
+        free(primary_json);
+        return;
+    }
+
+    /* Parse primary JSON and append linked_projects array */
+    yyjson_doc *pdoc = yyjson_read(primary_json, strlen(primary_json), 0);
+    free(primary_json);
+    if (!pdoc) {
+        mg_http_reply(c, 500, g_cors_json, "{\"error\":\"JSON parse failed\"}");
+        return;
+    }
+
+    yyjson_mut_doc *mdoc = yyjson_doc_mut_copy(pdoc, NULL);
+    yyjson_doc_free(pdoc);
+    yyjson_mut_val *mroot = yyjson_mut_doc_get_root(mdoc);
+
+    yyjson_mut_val *lp_arr = yyjson_mut_arr(mdoc);
+
+    for (int li = 0; li < linked_count; li++) {
+        char lp_path[1024];
+        db_path_for_project(linked[li], lp_path, sizeof(lp_path));
+        if (!cbm_file_exists(lp_path)) {
+            free(linked[li]);
+            continue;
+        }
+
+        cbm_store_t *lp_store = cbm_store_open_path(lp_path);
+        if (!lp_store) {
+            free(linked[li]);
+            continue;
+        }
+
+        cbm_layout_result_t *lp_layout =
+            cbm_layout_compute(lp_store, linked[li], CBM_LAYOUT_OVERVIEW, NULL, 0, max_nodes);
+        cbm_store_close(lp_store);
+
+        if (!lp_layout) {
+            free(linked[li]);
+            continue;
+        }
+
+        char *lp_json = cbm_layout_to_json(lp_layout);
+        cbm_layout_free(lp_layout);
+        if (!lp_json) {
+            free(linked[li]);
+            continue;
+        }
+
+        /* Parse linked project layout */
+        yyjson_doc *lpdoc = yyjson_read(lp_json, strlen(lp_json), 0);
+        free(lp_json);
+        if (!lpdoc) {
+            free(linked[li]);
+            continue;
+        }
+
+        yyjson_mut_doc *lm = yyjson_doc_mut_copy(lpdoc, NULL);
+        yyjson_doc_free(lpdoc);
+        yyjson_mut_val *lmroot = yyjson_mut_doc_get_root(lm);
+
+        /* Build linked project entry */
+        yyjson_mut_val *entry = yyjson_mut_obj(mdoc);
+        yyjson_mut_obj_add_strcpy(mdoc, entry, "project", linked[li]);
+
+        /* Copy nodes and edges from linked layout */
+        yyjson_mut_val *ln = yyjson_mut_obj_get(lmroot, "nodes");
+        yyjson_mut_val *le = yyjson_mut_obj_get(lmroot, "edges");
+        if (ln) {
+            yyjson_mut_obj_add_val(mdoc, entry, "nodes", yyjson_mut_val_mut_copy(mdoc, ln));
+        }
+        if (le) {
+            yyjson_mut_obj_add_val(mdoc, entry, "edges", yyjson_mut_val_mut_copy(mdoc, le));
+        }
+
+        /* Compute galaxy offset: evenly spaced around primary */
+        double angle = (2.0 * 3.14159265358979) * (double)li / (double)linked_count;
+        yyjson_mut_val *offset = yyjson_mut_obj(mdoc);
+        yyjson_mut_obj_add_real(mdoc, offset, "x", cos(angle) * LAYOUT_GALAXY_SPACING);
+        yyjson_mut_obj_add_real(mdoc, offset, "y", sin(angle) * LAYOUT_GALAXY_SPACING);
+        yyjson_mut_obj_add_real(mdoc, offset, "z", 0.0);
+        yyjson_mut_obj_add_val(mdoc, entry, "offset", offset);
+
+        /* TODO: cross_edges array with CROSS_* edges connecting the galaxies */
+        yyjson_mut_obj_add_val(mdoc, entry, "cross_edges", yyjson_mut_arr(mdoc));
+
+        yyjson_mut_arr_append(lp_arr, entry);
+        yyjson_mut_doc_free(lm);
+        free(linked[li]);
+    }
+
+    yyjson_mut_obj_add_val(mdoc, mroot, "linked_projects", lp_arr);
+
+    size_t len = 0;
+    char *final_json = yyjson_mut_write(mdoc, 0, &len);
+    yyjson_mut_doc_free(mdoc);
+
+    if (final_json) {
+        mg_http_reply(c, 200, g_cors_json, "%s", final_json);
+        free(final_json);
+    } else {
+        mg_http_reply(c, 500, g_cors_json, "{\"error\":\"JSON write failed\"}");
+    }
 }
 
 /* ── Handle JSON-RPC request ──────────────────────────────────── */

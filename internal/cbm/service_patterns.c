@@ -234,6 +234,28 @@ static const lib_pattern_t async_libraries[] = {
     /* Scala */
     {"Alpakka", CBM_SVC_ASYNC, "alpakka"},
 
+    /* MQTT */
+    {"mqtt", CBM_SVC_ASYNC, "mqtt"},
+    {"paho.mqtt", CBM_SVC_ASYNC, "mqtt"},
+    {"MQTTClient", CBM_SVC_ASYNC, "mqtt"},
+    {"mosquitto", CBM_SVC_ASYNC, "mqtt"},
+    {"asyncio_mqtt", CBM_SVC_ASYNC, "mqtt"},
+    {"gmqtt", CBM_SVC_ASYNC, "mqtt"},
+    {"rumqttc", CBM_SVC_ASYNC, "mqtt"},
+
+    /* NATS */
+    {"nats.go", CBM_SVC_ASYNC, "nats"},
+    {"nats-py", CBM_SVC_ASYNC, "nats"},
+    {"nats.ws", CBM_SVC_ASYNC, "nats"},
+    {"nats.java", CBM_SVC_ASYNC, "nats"},
+    {"nats.net", CBM_SVC_ASYNC, "nats"},
+    {"async-nats", CBM_SVC_ASYNC, "nats"},
+    {"nats.rs", CBM_SVC_ASYNC, "nats"},
+
+    /* Dapr pub/sub */
+    {"dapr.clients.grpc", CBM_SVC_ASYNC, "dapr"},
+    {"DaprClient", CBM_SVC_ASYNC, "dapr"},
+
     {NULL, CBM_SVC_NONE, NULL},
 };
 
@@ -347,6 +369,88 @@ static const lib_pattern_t route_reg_libraries[] = {
     /* Scala */
     {"akka.http.scaladsl.server", CBM_SVC_ROUTE_REG, NULL},
     {"play.api.routing", CBM_SVC_ROUTE_REG, NULL},
+
+    {NULL, CBM_SVC_NONE, NULL},
+};
+
+/* gRPC client libraries — protobuf stub invocations */
+static const lib_pattern_t grpc_libraries[] = {
+    /* Go */
+    {"google.golang.org/grpc", CBM_SVC_GRPC, NULL},
+    {"grpc.Dial", CBM_SVC_GRPC, NULL},
+    {"grpc.NewClient", CBM_SVC_GRPC, NULL},
+    {"grpc.DialContext", CBM_SVC_GRPC, NULL},
+
+    /* Python */
+    {"grpc.insecure_channel", CBM_SVC_GRPC, NULL},
+    {"grpc.secure_channel", CBM_SVC_GRPC, NULL},
+    {"grpcio", CBM_SVC_GRPC, NULL},
+    {"grpc.aio", CBM_SVC_GRPC, NULL},
+
+    /* Java/Kotlin */
+    {"io.grpc", CBM_SVC_GRPC, NULL},
+    {"ManagedChannelBuilder", CBM_SVC_GRPC, NULL},
+    {"ManagedChannel", CBM_SVC_GRPC, NULL},
+    {"newBlockingStub", CBM_SVC_GRPC, NULL},
+    {"newFutureStub", CBM_SVC_GRPC, NULL},
+
+    /* C# */
+    {"Grpc.Net.Client", CBM_SVC_GRPC, NULL},
+    {"GrpcChannel", CBM_SVC_GRPC, NULL},
+    {"Grpc.Core", CBM_SVC_GRPC, NULL},
+
+    /* JS/TS */
+    {"@grpc/grpc-js", CBM_SVC_GRPC, NULL},
+    {"grpc-web", CBM_SVC_GRPC, NULL},
+
+    /* Rust */
+    {"tonic", CBM_SVC_GRPC, NULL},
+
+    /* Dart/Flutter */
+    {"package:grpc", CBM_SVC_GRPC, NULL},
+
+    {NULL, CBM_SVC_NONE, NULL},
+};
+
+/* GraphQL client libraries */
+static const lib_pattern_t graphql_libraries[] = {
+    /* JS/TS */
+    {"graphql-request", CBM_SVC_GRAPHQL, NULL},
+    {"@apollo/client", CBM_SVC_GRAPHQL, NULL},
+    {"apollo-client", CBM_SVC_GRAPHQL, NULL},
+    {"urql", CBM_SVC_GRAPHQL, NULL},
+    {"graphql-tag", CBM_SVC_GRAPHQL, NULL},
+
+    /* Python */
+    {"gql", CBM_SVC_GRAPHQL, NULL},
+    {"sgqlc", CBM_SVC_GRAPHQL, NULL},
+    {"graphene", CBM_SVC_GRAPHQL, NULL},
+
+    /* Java */
+    {"graphql-java", CBM_SVC_GRAPHQL, NULL},
+    {"DgsQueryExecutor", CBM_SVC_GRAPHQL, NULL},
+
+    /* Go */
+    {"graphql-go", CBM_SVC_GRAPHQL, NULL},
+    {"gqlgen", CBM_SVC_GRAPHQL, NULL},
+
+    /* Ruby */
+    {"graphql-ruby", CBM_SVC_GRAPHQL, NULL},
+
+    /* Rust */
+    {"async-graphql", CBM_SVC_GRAPHQL, NULL},
+    {"juniper", CBM_SVC_GRAPHQL, NULL},
+
+    {NULL, CBM_SVC_NONE, NULL},
+};
+
+/* tRPC libraries (TypeScript only) */
+static const lib_pattern_t trpc_libraries[] = {
+    {"@trpc/server", CBM_SVC_TRPC, NULL},
+    {"@trpc/client", CBM_SVC_TRPC, NULL},
+    {"@trpc/react-query", CBM_SVC_TRPC, NULL},
+    {"createTRPCRouter", CBM_SVC_TRPC, NULL},
+    {"createTRPCProxyClient", CBM_SVC_TRPC, NULL},
 
     {NULL, CBM_SVC_NONE, NULL},
 };
@@ -468,6 +572,21 @@ cbm_svc_kind_t cbm_service_pattern_match(const char *resolved_qn) {
     }
 
     p = match_qn(resolved_qn, config_libraries);
+    if (p) {
+        return p->kind;
+    }
+
+    p = match_qn(resolved_qn, grpc_libraries);
+    if (p) {
+        return p->kind;
+    }
+
+    p = match_qn(resolved_qn, graphql_libraries);
+    if (p) {
+        return p->kind;
+    }
+
+    p = match_qn(resolved_qn, trpc_libraries);
     if (p) {
         return p->kind;
     }

@@ -31,6 +31,22 @@
 
 /* ── Pipeline context (internal) ─────────────────────────────────── */
 
+/* Per-worker manifest collection entry. */
+typedef struct {
+    char *pkg_name;  /* heap: "@myorg/pkg", "github.com/foo/bar" */
+    char *entry_rel; /* heap: "packages/pkg/src/index" (no extension) */
+} cbm_pkg_entry_t;
+
+/* Growable array of package entries (per-worker, no thread contention). */
+typedef struct {
+    cbm_pkg_entry_t *items;
+    int count;
+    int cap;
+} cbm_pkg_entries_t;
+
+void cbm_pkg_entries_init(cbm_pkg_entries_t *e);
+void cbm_pkg_entries_free(cbm_pkg_entries_t *e);
+
 /* Shared context passed to each pass function.
  * Derived from cbm_pipeline_t fields during run. */
 typedef struct {
@@ -39,6 +55,7 @@ typedef struct {
     cbm_gbuf_t *gbuf;         /* owned by pipeline */
     cbm_registry_t *registry; /* owned by pipeline */
     atomic_int *cancelled;    /* pointer to pipeline's cancelled flag */
+    int mode;                 /* cbm_index_mode_t (0=full, 1=moderate, 2=fast) */
 
     /* Extraction result cache (sequential pipeline optimization).
      * When non-NULL, pass_definitions stores results here instead of freeing,
@@ -46,6 +63,31 @@ typedef struct {
      * Indexed by file position in the files[] array. Owned by pipeline.c. */
     CBMFileResult **result_cache;
 } cbm_pipeline_ctx_t;
+
+/* Get the current pipeline's package map (NULL if none). */
+CBMHashTable *cbm_pipeline_get_pkgmap(void);
+void cbm_pipeline_set_pkgmap(CBMHashTable *map);
+
+/* Unified module resolver: relative → pkgmap → fqn_module fallback.
+ * Handles bare specifiers via pkgmap lookup with prefix matching.
+ * Caller must free() the returned string. */
+char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                  const char *module_path);
+
+/* Parse a manifest file and collect pkg entries. Returns true if basename matched. */
+bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
+                          int source_len, cbm_pkg_entries_t *entries);
+
+/* Merge per-worker entries into a hash table. Returns NULL if no entries. */
+CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count,
+                               const char *project_name);
+
+/* Build pkgmap by reading manifest files from the files array (sequential path). */
+CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file_count,
+                                          const char *project_name);
+
+/* Free pkgmap and all owned strings. */
+void cbm_pkgmap_free(CBMHashTable *pkgmap);
 
 /* Check cancellation. Returns non-zero if cancelled. */
 static inline int cbm_pipeline_check_cancel(const cbm_pipeline_ctx_t *ctx) {
@@ -376,6 +418,10 @@ int cbm_pipeline_pass_configlink(cbm_pipeline_ctx_t *ctx);
 
 /* Pre-dump pass: SIMILAR_TO edges via MinHash fingerprinting. */
 int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx);
+
+/* Pre-dump pass: SEMANTICALLY_RELATED edges via algorithmic embeddings.
+ * Opt-in: only runs when CBM_SEMANTIC_ENABLED=1. */
+int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx);
 
 /* ── Env URL scanner (pass_envscan.c) ────────────────────────────── */
 

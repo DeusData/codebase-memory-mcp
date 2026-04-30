@@ -116,8 +116,12 @@ void cbm_mem_init(double ram_fraction) {
         ram_fraction = DEFAULT_RAM_FRACTION;
     }
 
-    /* Reduce upfront memory: don't eagerly commit arenas */
+    /* Reduce upfront memory: don't eagerly commit arenas.
+     * Force decommit on purge (MADV_FREE_REUSABLE on macOS) so RSS
+     * drops immediately instead of staying high until memory pressure. */
     mi_option_set(mi_option_arena_eager_commit, 0);
+    mi_option_set(mi_option_purge_decommits, SKIP_ONE);
+    mi_option_set(mi_option_purge_delay, 0); /* immediate purge, no 1s delay */
 
     cbm_system_info_t info = cbm_system_info();
     g_budget = (size_t)((double)info.total_ram * ram_fraction);

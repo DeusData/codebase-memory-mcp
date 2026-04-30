@@ -33,6 +33,11 @@ src/mcp/mcp.c:popen:via cbm_popen wrapper calls
 src/pipeline/pass_githistory.c:cbm_popen:git log for file history (path validated)
 src/pipeline/pass_githistory.c:popen:via cbm_popen wrapper call
 
+# ── Pipeline: artifact persistence (git HEAD hash, merge driver config) ────
+src/pipeline/artifact.c:cbm_popen:git rev-parse HEAD for artifact metadata (hardcoded cmd)
+src/pipeline/artifact.c:cbm_popen:git config merge.ours.driver for gitattributes (hardcoded cmd)
+src/pipeline/artifact.c:popen:via cbm_popen wrapper calls
+
 # ── UI: HTTP server process management ─────────────────────────────────────
 src/ui/http_server.c:popen:ps process listing for metrics endpoint
 src/ui/http_server.c:fork:spawn indexing subprocess

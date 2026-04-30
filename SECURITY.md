@@ -1,5 +1,29 @@
 # Security Policy
 
+## Transparency & Disclaimer
+
+codebase-memory-mcp interacts deeply with your filesystem. It reads source files across your entire codebase, writes to agent configuration files, and spawns background processes. This is inherent to what it does — not a bug.
+
+**If you are uncomfortable with these access patterns**, please audit the source code before running. The full source is available in this repository. Every release binary is reproducibly built from this source and can be independently verified via SLSA provenance, Sigstore signatures, and SHA-256 checksums (see [Verification](#verification) below).
+
+We are humans and can make mistakes. We take security seriously — it is Priority #1 for this project — but we cannot guarantee perfection. By using this software you accept responsibility for evaluating whether it meets your own security requirements.
+
+## Help Us Stay Secure
+
+**We actively invite security researchers to try to break this project.**
+
+If you find a vulnerability — anything from a logic bug to a remote code execution — we want to know. You will receive a fast response, public credit (if you want it), and the knowledge that you helped make a tool used by developers worldwide more secure.
+
+What we consider in scope:
+
+- Arbitrary code execution via MCP tool inputs or CLI arguments
+- File reads or writes outside the indexed project root
+- Shell injection through any code path
+- Binary tampering or supply chain attacks
+- Privilege escalation or sandbox escapes
+
+Please report **privately** rather than as a public issue so we can fix before public disclosure. See below for how.
+
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability, please report it responsibly:

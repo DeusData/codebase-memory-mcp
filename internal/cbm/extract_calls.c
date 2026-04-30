@@ -319,18 +319,65 @@ static bool lean_is_in_type_position(TSNode node) {
     return false;
 }
 
+/* Resolve a selector_expression that may chain through call_expressions.
+ * Go pattern: pb.NewFooClient(conn).GetBar → "pb.NewFooClient.GetBar"
+ * Without this, cbm_node_text returns full text including args/parens.
+ * Iteratively walks the chain: selector → operand(call) → function(selector) → ... */
+static char *resolve_chained_selector(CBMArena *a, TSNode sel, const char *source) {
+    TSNode operand = ts_node_child_by_field_name(sel, TS_FIELD("operand"));
+    TSNode field = ts_node_child_by_field_name(sel, TS_FIELD("field"));
+    if (ts_node_is_null(operand) || ts_node_is_null(field) ||
+        strcmp(ts_node_type(operand), "call_expression") != 0) {
+        return cbm_node_text(a, sel, source);
+    }
+
+    /* Operand is a call_expression — extract its callee iteratively.
+     * Walk: call_expression → function field → if selector_expression, repeat. */
+    char *method = cbm_node_text(a, field, source);
+    TSNode inner = operand;
+    enum { MAX_CHAIN_DEPTH = 4 };
+    for (int depth = 0; depth < MAX_CHAIN_DEPTH; depth++) {
+        TSNode fn = ts_node_child_by_field_name(inner, TS_FIELD("function"));
+        if (ts_node_is_null(fn)) {
+            break;
+        }
+        const char *fnk = ts_node_type(fn);
+        if (strcmp(fnk, "selector_expression") == 0) {
+            /* Check if this selector also chains through a call */
+            TSNode inner_op = ts_node_child_by_field_name(fn, TS_FIELD("operand"));
+            if (!ts_node_is_null(inner_op) &&
+                strcmp(ts_node_type(inner_op), "call_expression") == 0) {
+                inner = inner_op;
+                continue;
+            }
+        }
+        /* Reached a non-chained callee — extract its text */
+        char *base = cbm_node_text(a, fn, source);
+        if (base && method) {
+            return cbm_arena_sprintf(a, "%s.%s", base, method);
+        }
+        return method;
+    }
+
+    /* Fallback: just return the method name */
+    return method;
+}
+
 // Try common field-based callee resolution (function, name, method fields).
 static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *source) {
     // Try "function" field
     TSNode func_node = ts_node_child_by_field_name(node, TS_FIELD("function"));
     if (!ts_node_is_null(func_node)) {
         const char *fk = ts_node_type(func_node);
+        if (strcmp(fk, "selector_expression") == 0) {
+            return resolve_chained_selector(a, func_node, source);
+        }
         if (strcmp(fk, "identifier") == 0 || strcmp(fk, "simple_identifier") == 0 ||
-            strcmp(fk, "selector_expression") == 0 || strcmp(fk, "attribute") == 0 ||
-            strcmp(fk, "member_expression") == 0 || strcmp(fk, "field_expression") == 0 ||
-            strcmp(fk, "dot") == 0 || strcmp(fk, "function") == 0 ||
-            strcmp(fk, "dotted_identifier") == 0 || strcmp(fk, "member_access_expression") == 0 ||
-            strcmp(fk, "scoped_identifier") == 0 || strcmp(fk, "qualified_identifier") == 0) {
+            strcmp(fk, "attribute") == 0 || strcmp(fk, "member_expression") == 0 ||
+            strcmp(fk, "field_expression") == 0 || strcmp(fk, "dot") == 0 ||
+            strcmp(fk, "function") == 0 || strcmp(fk, "dotted_identifier") == 0 ||
+            strcmp(fk, "member_access_expression") == 0 || strcmp(fk, "scoped_identifier") == 0 ||
+            strcmp(fk, "qualified_identifier") == 0) {
             return cbm_node_text(a, func_node, source);
         }
     }

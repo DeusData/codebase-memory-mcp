@@ -138,7 +138,7 @@ fi
 # Known with exceptions: mongoose (network), sqlite3 (dlopen), mimalloc (LoadLibrary)
 # If a new library appears, the scan above already checks it — but this ensures
 # we've consciously evaluated each library.
-KNOWN_VENDORED="mimalloc mongoose sqlite3 tre xxhash yyjson"
+KNOWN_VENDORED="mimalloc mongoose nomic sqlite3 tre xxhash yyjson"
 while IFS= read -r libdir; do
     libname=$(basename "$libdir")
     found=false

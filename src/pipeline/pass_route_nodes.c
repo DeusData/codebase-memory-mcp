@@ -685,6 +685,74 @@ static void create_route_data_flows(cbm_gbuf_t *gb, const cbm_gbuf_node_t *route
     }
 }
 
+/* Find the enclosing proto service for a function by file + line range. */
+static const cbm_gbuf_node_t *find_enclosing_service(const cbm_gbuf_node_t *fn,
+                                                     const cbm_gbuf_node_t **services,
+                                                     int svc_count) {
+    for (int s = 0; s < svc_count; s++) {
+        if (strcmp(fn->file_path, services[s]->file_path) != 0) {
+            continue;
+        }
+        if (fn->start_line >= services[s]->start_line && fn->end_line <= services[s]->end_line) {
+            return services[s];
+        }
+    }
+    return NULL;
+}
+
+/* Phase 4: Create __grpc__ Route nodes from protobuf service definitions. */
+static void create_grpc_routes(cbm_gbuf_t *gb) {
+    const cbm_gbuf_node_t **classes = NULL;
+    int class_count = 0;
+    if (cbm_gbuf_find_by_label(gb, "Class", &classes, &class_count) != 0 || class_count == 0) {
+        return;
+    }
+
+    const cbm_gbuf_node_t *services[CBM_SZ_64];
+    int svc_count = 0;
+    for (int i = 0; i < class_count && svc_count < CBM_SZ_64; i++) {
+        if (classes[i]->file_path && strstr(classes[i]->file_path, ".proto")) {
+            services[svc_count++] = classes[i];
+        }
+    }
+    if (svc_count == 0) {
+        return;
+    }
+
+    const cbm_gbuf_node_t **funcs = NULL;
+    int func_count = 0;
+    if (cbm_gbuf_find_by_label(gb, "Function", &funcs, &func_count) != 0 || func_count == 0) {
+        return;
+    }
+
+    int grpc_routes = 0;
+    for (int f = 0; f < func_count; f++) {
+        const cbm_gbuf_node_t *fn = funcs[f];
+        if (!fn->file_path || !strstr(fn->file_path, ".proto") || !fn->name) {
+            continue;
+        }
+        const cbm_gbuf_node_t *svc = find_enclosing_service(fn, services, svc_count);
+        if (!svc) {
+            continue;
+        }
+        char route_qn[CBM_ROUTE_QN_SIZE];
+        snprintf(route_qn, sizeof(route_qn), "__grpc__%s/%s", svc->name, fn->name);
+
+        char props[CBM_SZ_128];
+        snprintf(props, sizeof(props), "{\"source\":\"proto\",\"service\":\"%s\"}", svc->name);
+
+        int64_t route_id = cbm_gbuf_upsert_node(gb, "Route", fn->name, route_qn, fn->file_path,
+                                                fn->start_line, fn->end_line, props);
+        cbm_gbuf_insert_edge(gb, fn->id, route_id, "HANDLES", "{\"via\":\"proto_rpc\"}");
+        grpc_routes++;
+    }
+    if (grpc_routes > 0) {
+        char buf[CBM_SZ_16];
+        snprintf(buf, sizeof(buf), "%d", grpc_routes);
+        cbm_log_info("pass.route_nodes.grpc", "routes", buf);
+    }
+}
+
 /* Phase 3: Create DATA_FLOWS edges by linking callers through Route to handlers. */
 static void create_data_flows(cbm_gbuf_t *gb) {
     const cbm_gbuf_node_t **routes = NULL;
@@ -739,4 +807,9 @@ void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb) {
 
     /* Phase 3: create DATA_FLOWS edges through Routes */
     create_data_flows(gb);
+
+    /* Phase 4: create gRPC Route nodes from protobuf service definitions.
+     * Scans Class nodes from .proto files, follows DEFINES_METHOD edges
+     * to find rpc methods, creates __grpc__ServiceName/MethodName Route nodes. */
+    create_grpc_routes(gb);
 }

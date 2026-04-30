@@ -13,6 +13,7 @@
 
 enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24, INCR_WAL_BUF = 1040 };
 #include "pipeline/pipeline.h"
+#include "pipeline/artifact.h"
 #include <stdio.h>
 #include <time.h>
 #include "pipeline/pipeline_internal.h"
@@ -251,14 +252,22 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
     cbm_log_info("pass.timing", "pass", "incr_configlink", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
 
-    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    cbm_pipeline_pass_similarity(ctx);
-    cbm_log_info("pass.timing", "pass", "incr_similarity", "elapsed_ms",
-                 itoa_buf((int)elapsed_ms(t)));
+    /* SIMILAR_TO + SEMANTICALLY_RELATED edges only in moderate/full modes */
+    if (ctx->mode <= CBM_MODE_MODERATE) {
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        cbm_pipeline_pass_similarity(ctx);
+        cbm_log_info("pass.timing", "pass", "incr_similarity", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t)));
+
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        cbm_pipeline_pass_semantic_edges(ctx);
+        cbm_log_info("pass.timing", "pass", "incr_semantic_edges", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t)));
+    }
 }
 /* Delete old DB and dump merged graph + hashes to disk. */
 static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
-                             cbm_file_info_t *files, int file_count) {
+                             cbm_file_info_t *files, int file_count, const char *repo_path) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
@@ -277,7 +286,27 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {
         persist_hashes(hash_store, project, files, file_count);
+
+        /* FTS5 rebuild after incremental dump.  The btree dump path bypasses
+         * any triggers that could have kept nodes_fts synchronized, so we
+         * rebuild from the nodes table here.  See the full-dump path in
+         * pipeline.c for the matching logic. */
+        cbm_store_exec(hash_store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+        if (cbm_store_exec(hash_store,
+                           "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+                           "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
+                           "FROM nodes;") != CBM_STORE_OK) {
+            cbm_store_exec(hash_store,
+                           "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+                           "SELECT id, name, qualified_name, label, file_path FROM nodes;");
+        }
+
         cbm_store_close(hash_store);
+    }
+
+    /* Auto-update artifact if one already exists (persistence was enabled previously) */
+    if (repo_path && cbm_artifact_exists(repo_path)) {
+        cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST);
     }
 }
 
@@ -390,6 +419,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .gbuf = existing,
         .registry = registry,
         .cancelled = cbm_pipeline_cancelled_ptr(p),
+        .mode = cbm_pipeline_get_mode(p),
     };
 
     for (int i = 0; i < ci; i++) {
@@ -409,7 +439,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_registry_free(registry);
 
     /* Step 7: Dump to disk */
-    dump_and_persist(existing, db_path, project, files, file_count);
+    dump_and_persist(existing, db_path, project, files, file_count, cbm_pipeline_repo_path(p));
     cbm_gbuf_free(existing);
 
     cbm_log_info("incremental.done", "elapsed_ms", itoa_buf((int)elapsed_ms(t0)));

@@ -50,6 +50,26 @@ ALLOWED_URLS=(
     # SQLite internal URLs (part of vendored sqlite3 strings)
     "https://sqlite.org"
     "https://www.sqlite.org"
+    # Toolchain URLs embedded by compiler/linker in static builds
+    "https://bugs.launchpad.net"
+    "https://gcc.gnu.org"
+    "https://sourceware.org"
+    # W3C XML namespace URIs (SVG, MathML, XLink — used in UI bundle)
+    "http://www.w3.org/"
+    # UI bundle: React, Three.js, Tailwind, Google Fonts, bundled libraries
+    "https://react.dev"
+    "https://fonts.googleapis.com"
+    "https://fonts.gstatic.com"
+    "https://tailwindcss.com"
+    "https://cdn.jsdelivr.net"
+    "https://docs.pmnd.rs"
+    "https://jcgt.org"
+    "https://github.com/pmndrs"
+    "https://github.com/react-spring"
+    "https://github.com/101arrowz"
+    "https://github.com/arty-name"
+    "https://github.com/fredli74"
+    "https://github.com/lojjic"
 )
 
 while IFS= read -r url; do
@@ -97,7 +117,7 @@ echo ""
 echo "--- Dangerous command detection ---"
 
 DANGEROUS_CMDS='wget|netcat|ncat|/dev/tcp|telnet'
-if grep -wE "$DANGEROUS_CMDS" "$STRINGS_FILE" > "$SEC_CMDS" 2>/dev/null; then
+if grep -wE "$DANGEROUS_CMDS" "$STRINGS_FILE" > "$SEC_CMDS" 2>/dev/null && [ -s "$SEC_CMDS" ]; then
     echo "BLOCKED: Dangerous commands found in binary:"
     cat "$SEC_CMDS"
     FAIL=1
