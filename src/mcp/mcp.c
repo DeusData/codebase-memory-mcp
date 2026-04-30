@@ -3176,6 +3176,42 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("path or file_pattern contains invalid characters", true);
     }
 
+    /* ── Phase 0.5: Multi-word → regex conversion ───────────── */
+    /* If pattern contains whitespace and is not already a regex, convert to a
+     * regex that matches all words in order: "foo bar baz" → "foo.*bar.*baz".
+     * This avoids requiring the exact phrase as a contiguous substring. */
+    if (!use_regex && strchr(pattern, ' ')) {
+        size_t plen = strlen(pattern);
+        /* Worst case: every char is a space → ".*" between each char */
+        char *regex_pat = malloc(plen * 3 + 1);
+        if (regex_pat) {
+            char *dst = regex_pat;
+            const char *src = pattern;
+            bool in_space = false;
+            while (*src) {
+                if (*src == ' ' || *src == '\t') {
+                    if (!in_space) {
+                        *dst++ = '.';
+                        *dst++ = '*';
+                        in_space = true;
+                    }
+                } else {
+                    /* Escape regex metacharacters from user input */
+                    if (strchr("\\^$.|?*+()[]{}", *src)) {
+                        *dst++ = '\\';
+                    }
+                    *dst++ = *src;
+                    in_space = false;
+                }
+                src++;
+            }
+            *dst = '\0';
+            free(pattern);
+            pattern = regex_pat;
+            use_regex = true;
+        }
+    }
+
     /* ── Phase 1: Grep scan ──────────────────────────────────── */
     char tmpfile[CBM_SZ_256];
     if (!write_pattern_file(tmpfile, sizeof(tmpfile), pattern)) {

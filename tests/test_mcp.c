@@ -589,6 +589,33 @@ TEST(tool_search_code_no_project) {
     PASS();
 }
 
+TEST(search_code_multi_word) {
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* Multi-word query "HandleRequest error" — should find the line
+     * "func HandleRequest() error {" via regex conversion. */
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":90,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest error\","
+             "\"project\":\"test-project\"}}}");
+
+    char *resp = cbm_mcp_server_handle(srv, req);
+    ASSERT_NOT_NULL(resp);
+    /* Should find at least one result (not zero) */
+    ASSERT_TRUE(strstr(resp, "HandleRequest") != NULL);
+    /* Should NOT contain an error about "not found" */
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    free(resp);
+
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_detect_changes_no_project) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -1711,6 +1738,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_code_snippet_not_found);
     RUN_TEST(tool_search_code_missing_pattern);
     RUN_TEST(tool_search_code_no_project);
+    RUN_TEST(search_code_multi_word);
     RUN_TEST(tool_detect_changes_no_project);
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
