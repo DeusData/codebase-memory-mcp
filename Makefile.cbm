@@ -279,7 +279,8 @@ TEST_STORE_SRCS = \
     tests/test_store_edges.c \
     tests/test_store_search.c \
     tests/test_store_arch.c \
-    tests/test_store_bulk.c
+    tests/test_store_bulk.c \
+    tests/test_store_checkpoint.c
 
 TEST_CYPHER_SRCS = \
     tests/test_cypher.c

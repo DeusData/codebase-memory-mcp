@@ -790,7 +790,13 @@ int cbm_store_create_indexes(cbm_store_t *s) {
 /* ── Checkpoint ─────────────────────────────────────────────────── */
 
 int cbm_store_checkpoint(cbm_store_t *s) {
-    int rc = sqlite3_wal_checkpoint_v2(s->db, NULL, SQLITE_CHECKPOINT_TRUNCATE, NULL, NULL);
+    /* PASSIVE never blocks readers and never ftruncate()s either file.
+     * SQLite recommends PASSIVE for shared databases — TRUNCATE shrinks
+     * the WAL via ftruncate(fd, 0) on success, which on macOS can raise
+     * SIGBUS in a sibling process that has the DB mmap'd through SQLite
+     * when it next faults a page in the now-shorter region.
+     * See https://www.sqlite.org/c3ref/c_checkpoint_full.html */
+    int rc = sqlite3_wal_checkpoint_v2(s->db, NULL, SQLITE_CHECKPOINT_PASSIVE, NULL, NULL);
     if (rc != SQLITE_OK) {
         store_set_error_sqlite(s, "checkpoint");
         return CBM_STORE_ERR;
