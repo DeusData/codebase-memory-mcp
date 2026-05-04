@@ -516,7 +516,7 @@ frontend:
 	cd graph-ui && npm ci && npm run build
 
 embed: frontend
-	scripts/embed-frontend.sh graph-ui/dist $(BUILD_DIR)/embedded
+	sh scripts/embed-frontend.sh graph-ui/dist $(BUILD_DIR)/embedded
 
 cbm-with-ui: embed $(OBJS_VENDORED_PROD)
 	$(CC) $(CFLAGS_PROD) -o $(BUILD_DIR)/codebase-memory-mcp \

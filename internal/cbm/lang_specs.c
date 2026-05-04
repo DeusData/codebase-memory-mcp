@@ -161,6 +161,7 @@ extern const TSLanguage *tree_sitter_gomod(void);
 extern const TSLanguage *tree_sitter_apex(void);
 extern const TSLanguage *tree_sitter_soql(void);
 extern const TSLanguage *tree_sitter_sosl(void);
+extern const TSLanguage *tree_sitter_pine(void);
 
 // -- Empty sentinel --
 static const char *empty_types[] = {NULL};
@@ -1478,6 +1479,16 @@ static const char *sosl_module_types[] = {"source_file", NULL};
 
 static const char *make_func_types[] = {"recipe", NULL};
 static const char *make_import_types[] = {"include", "include_directive", NULL};
+
+// ==================== PINE SCRIPT ====================
+static const char *pine_func_types[] = {"function_declaration_statement", NULL};
+static const char *pine_class_types[] = {"type_definition_statement", NULL};
+static const char *pine_module_types[] = {"source_file", NULL};
+static const char *pine_call_types[] = {"call", NULL};
+static const char *pine_var_types[] = {"variable_definition_statement", "tuple_declaration_statement", NULL};
+static const char *pine_branch_types[] = {"if_statement", "switch_statement", "for_statement", "for_in_statement", "while_statement", NULL};
+static const char *pine_assign_types[] = {"reassignment_statement", NULL};
+
 // ==================== SPEC TABLE ====================
 
 static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
@@ -2401,6 +2412,11 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
     [CBM_LANG_K8S] = {CBM_LANG_K8S, yaml_var_types, empty_types, empty_types, yaml_module_types,
                       empty_types, empty_types, empty_types, empty_types, empty_types, empty_types,
                       empty_types, NULL, empty_types, NULL, NULL, tree_sitter_yaml},
+
+    // CBM_LANG_PINE
+    [CBM_LANG_PINE] = {CBM_LANG_PINE, pine_func_types, pine_class_types, empty_types, pine_module_types,
+                       pine_call_types, empty_types, empty_types, pine_branch_types, pine_var_types,
+                       pine_assign_types, empty_types, NULL, empty_types, NULL, NULL, tree_sitter_pine},
 
 };
 
