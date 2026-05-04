@@ -297,6 +297,24 @@ static int create_user_indexes(cbm_store_t *s) {
     return exec_sql(s, sql);
 }
 
+int64_t cbm_store_resolve_mmap_size(void) {
+    enum { MMAP_DEFAULT = 67108864, BASE_10 = 10 }; /* default 64 MB; decimal radix */
+    char buf[ST_BUF_64];
+    if (cbm_safe_getenv("CBM_SQLITE_MMAP_SIZE", buf, sizeof(buf), NULL) == NULL) {
+        return (int64_t)MMAP_DEFAULT;
+    }
+    char *end = NULL;
+    long long parsed = strtoll(buf, &end, BASE_10);
+    if (end == buf || *end != '\0') {
+        /* Malformed — fall back to default rather than fail the store open. */
+        return (int64_t)MMAP_DEFAULT;
+    }
+    if (parsed < 0) {
+        return 0;
+    }
+    return (int64_t)parsed;
+}
+
 static int configure_pragmas(cbm_store_t *s, bool in_memory) {
     int rc;
     rc = exec_sql(s, "PRAGMA foreign_keys = ON;");
@@ -323,7 +341,10 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory) {
         if (rc != CBM_STORE_OK) {
             return rc;
         }
-        rc = exec_sql(s, "PRAGMA mmap_size = 67108864;"); /* CBM_SZ_64 MB */
+        char mmap_sql[ST_BUF_64];
+        snprintf(mmap_sql, sizeof(mmap_sql), "PRAGMA mmap_size = %lld;",
+                 (long long)cbm_store_resolve_mmap_size());
+        rc = exec_sql(s, mmap_sql);
     }
     return rc;
 }
