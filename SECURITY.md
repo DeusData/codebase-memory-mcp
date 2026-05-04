@@ -87,7 +87,7 @@ Users can independently verify any release binary:
 
 ```bash
 # SLSA provenance (proves binary came from this repo's CI)
-gh attestation verify <downloaded-file> --repo DeusData/codebase-memory-mcp
+gh attestation verify <downloaded-file> --repo hodizoda/codebase-memory-mcp
 
 # Sigstore cosign (keyless signature)
 cosign verify-blob --bundle <file>.bundle <file>

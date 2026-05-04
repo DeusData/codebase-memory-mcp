@@ -254,6 +254,17 @@ static int init_schema(cbm_store_t *s) {
         "  source_hash TEXT NOT NULL,"
         "  created_at TEXT NOT NULL,"
         "  updated_at TEXT NOT NULL"
+        ");"
+        "CREATE TABLE IF NOT EXISTS protocol_endpoints ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  project TEXT NOT NULL,"
+        "  protocol TEXT NOT NULL,"
+        "  role TEXT NOT NULL,"
+        "  identifier TEXT NOT NULL,"
+        "  node_qn TEXT NOT NULL,"
+        "  file_path TEXT NOT NULL,"
+        "  extra TEXT DEFAULT '{}',"
+        "  UNIQUE(project, protocol, role, identifier, node_qn)"
         ");";
 
     int rc = exec_sql(s, ddl);

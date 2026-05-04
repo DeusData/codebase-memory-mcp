@@ -195,7 +195,25 @@ PIPELINE_SRCS = \
     src/pipeline/pass_semantic_edges.c \
     src/pipeline/pass_cross_repo.c \
     src/pipeline/artifact.c \
-    src/pipeline/pass_pkgmap.c
+    src/pipeline/pass_pkgmap.c \
+    src/pipeline/pass_servicelinks.c \
+    src/pipeline/servicelink_graphql.c \
+    src/pipeline/servicelink_grpc.c \
+    src/pipeline/servicelink_kafka.c \
+    src/pipeline/servicelink_sqs.c \
+    src/pipeline/servicelink_sns.c \
+    src/pipeline/servicelink_ws.c \
+    src/pipeline/servicelink_sse.c \
+    src/pipeline/servicelink_pubsub.c \
+    src/pipeline/servicelink_rabbitmq.c \
+    src/pipeline/servicelink_eventbridge.c \
+    src/pipeline/servicelink_mqtt.c \
+    src/pipeline/servicelink_nats.c \
+    src/pipeline/servicelink_redis_pubsub.c \
+    src/pipeline/servicelink_trpc.c \
+    src/pipeline/servicelink_http.c \
+    src/pipeline/pass_communities.c \
+    src/pipeline/pass_crossrepolinks.c
 
 # SimHash / MinHash module
 SIMHASH_SRCS = src/simhash/minhash.c
@@ -314,6 +332,36 @@ TEST_INTEGRATION_SRCS = tests/test_integration.c tests/test_incremental.c
 TEST_TRACES_SRCS = tests/test_traces.c
 
 
+TEST_SERVICELINK_GRAPHQL_SRCS = tests/test_servicelink_graphql.c
+
+TEST_SERVICELINK_GRPC_SRCS = tests/test_servicelink_grpc.c
+
+TEST_SERVICELINK_KAFKA_SRCS = tests/test_servicelink_kafka.c
+
+TEST_SERVICELINK_SQS_SRCS = tests/test_servicelink_sqs.c
+
+TEST_SERVICELINK_SNS_SRCS = tests/test_servicelink_sns.c
+
+TEST_SERVICELINK_WS_SRCS = tests/test_servicelink_ws.c
+
+TEST_SERVICELINK_SSE_SRCS = tests/test_servicelink_sse.c
+
+TEST_SERVICELINK_PUBSUB_SRCS = tests/test_servicelink_pubsub.c
+
+TEST_SERVICELINK_RABBITMQ_SRCS = tests/test_servicelink_rabbitmq.c
+
+TEST_SERVICELINK_EVENTBRIDGE_SRCS = tests/test_servicelink_eventbridge.c
+
+TEST_SERVICELINK_MQTT_SRCS = tests/test_servicelink_mqtt.c
+
+TEST_SERVICELINK_NATS_SRCS = tests/test_servicelink_nats.c
+
+TEST_SERVICELINK_REDIS_PUBSUB_SRCS = tests/test_servicelink_redis_pubsub.c
+
+TEST_SERVICELINK_TRPC_SRCS = tests/test_servicelink_trpc.c
+
+TEST_SERVICELINK_HTTP_SRCS = tests/test_servicelink_http.c
+
 TEST_CLI_SRCS = tests/test_cli.c
 
 TEST_MEM_SRCS = tests/test_mem.c
@@ -326,8 +374,27 @@ TEST_YAML_SRCS = tests/test_yaml.c
 
 TEST_SIMHASH_SRCS = tests/test_simhash.c
 
-ALL_TEST_SRCS = $(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_INTEGRATION_SRCS)
+TEST_SERVICELINK_GRAPHQL_SRCS = tests/test_servicelink_graphql.c
+TEST_SERVICELINK_GRPC_SRCS = tests/test_servicelink_grpc.c
+TEST_SERVICELINK_KAFKA_SRCS = tests/test_servicelink_kafka.c
+TEST_SERVICELINK_SQS_SRCS = tests/test_servicelink_sqs.c
+TEST_SERVICELINK_SNS_SRCS = tests/test_servicelink_sns.c
+TEST_SERVICELINK_WS_SRCS = tests/test_servicelink_ws.c
+TEST_SERVICELINK_SSE_SRCS = tests/test_servicelink_sse.c
+TEST_SERVICELINK_PUBSUB_SRCS = tests/test_servicelink_pubsub.c
+TEST_SERVICELINK_RABBITMQ_SRCS = tests/test_servicelink_rabbitmq.c
+TEST_SERVICELINK_EVENTBRIDGE_SRCS = tests/test_servicelink_eventbridge.c
+TEST_SERVICELINK_MQTT_SRCS = tests/test_servicelink_mqtt.c
+TEST_SERVICELINK_NATS_SRCS = tests/test_servicelink_nats.c
+TEST_SERVICELINK_REDIS_PUBSUB_SRCS = tests/test_servicelink_redis_pubsub.c
+TEST_SERVICELINK_TRPC_SRCS = tests/test_servicelink_trpc.c
+TEST_SERVICELINK_HTTP_SRCS = tests/test_servicelink_http.c
+TEST_COMMUNITIES_SRCS = tests/test_communities.c
+TEST_ENDPOINT_REGISTRY_SRCS = tests/test_endpoint_registry.c
+TEST_ENDPOINT_PERSISTENCE_SRCS = tests/test_endpoint_persistence.c
+TEST_CROSS_PROJECT_LINKS_SRCS = tests/test_cross_project_links.c
 
+ALL_TEST_SRCS = $(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_INTEGRATION_SRCS) $(TEST_SERVICELINK_GRAPHQL_SRCS) $(TEST_SERVICELINK_GRPC_SRCS) $(TEST_SERVICELINK_KAFKA_SRCS) $(TEST_SERVICELINK_SQS_SRCS) $(TEST_SERVICELINK_SNS_SRCS) $(TEST_SERVICELINK_WS_SRCS) $(TEST_SERVICELINK_SSE_SRCS) $(TEST_SERVICELINK_PUBSUB_SRCS) $(TEST_SERVICELINK_RABBITMQ_SRCS) $(TEST_SERVICELINK_EVENTBRIDGE_SRCS) $(TEST_SERVICELINK_MQTT_SRCS) $(TEST_SERVICELINK_NATS_SRCS) $(TEST_SERVICELINK_REDIS_PUBSUB_SRCS) $(TEST_SERVICELINK_TRPC_SRCS) $(TEST_SERVICELINK_HTTP_SRCS) $(TEST_COMMUNITIES_SRCS) $(TEST_ENDPOINT_REGISTRY_SRCS) $(TEST_ENDPOINT_PERSISTENCE_SRCS) $(TEST_CROSS_PROJECT_LINKS_SRCS)
 
 # ── Build directories ────────────────────────────────────────────
 

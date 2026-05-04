@@ -7,6 +7,41 @@
 
 #include "store/store.h"
 
+/* ── CROSS_* edge type names ─────────────────────────────────────
+ *
+ * Upstream Route-QN matcher emits the first six. The messaging matcher
+ * (pass_crossrepolinks.c) emits the remaining eleven.
+ */
+#define CBM_EDGE_CROSS_HTTP_CALLS    "CROSS_HTTP_CALLS"
+#define CBM_EDGE_CROSS_ASYNC_CALLS   "CROSS_ASYNC_CALLS"
+#define CBM_EDGE_CROSS_CHANNEL       "CROSS_CHANNEL"
+#define CBM_EDGE_CROSS_GRPC_CALLS    "CROSS_GRPC_CALLS"
+#define CBM_EDGE_CROSS_GRAPHQL_CALLS "CROSS_GRAPHQL_CALLS"
+#define CBM_EDGE_CROSS_TRPC_CALLS    "CROSS_TRPC_CALLS"
+
+#define CBM_EDGE_CROSS_KAFKA_CALLS        "CROSS_KAFKA_CALLS"
+#define CBM_EDGE_CROSS_SQS_CALLS          "CROSS_SQS_CALLS"
+#define CBM_EDGE_CROSS_SNS_CALLS          "CROSS_SNS_CALLS"
+#define CBM_EDGE_CROSS_EVENTBRIDGE_CALLS  "CROSS_EVENTBRIDGE_CALLS"
+#define CBM_EDGE_CROSS_PUBSUB_CALLS       "CROSS_PUBSUB_CALLS"
+#define CBM_EDGE_CROSS_AMQP_CALLS         "CROSS_AMQP_CALLS"
+#define CBM_EDGE_CROSS_MQTT_CALLS         "CROSS_MQTT_CALLS"
+#define CBM_EDGE_CROSS_NATS_CALLS         "CROSS_NATS_CALLS"
+#define CBM_EDGE_CROSS_REDIS_PUBSUB_CALLS "CROSS_REDIS_PUBSUB_CALLS"
+#define CBM_EDGE_CROSS_WS_CALLS           "CROSS_WS_CALLS"
+#define CBM_EDGE_CROSS_SSE_CALLS          "CROSS_SSE_CALLS"
+
+/* All messaging CROSS_* edge types produced by pass_crossrepolinks.c.
+ * Used for idempotent cleanup before re-emission and for MCP queries. */
+extern const char *const CBM_MESSAGING_CROSS_EDGE_TYPES[];
+#define CBM_MESSAGING_CROSS_EDGE_TYPE_COUNT 11
+
+/* Map a messaging protocol name (e.g. "kafka") to its CROSS_* edge type
+ * constant (e.g. "CROSS_KAFKA_CALLS"). Returns NULL for unknown/skipped
+ * protocols ("http", "grpc", "graphql", "trpc" are owned by the upstream
+ * Route-QN matcher and intentionally return NULL here). */
+const char *cbm_messaging_protocol_to_cross_edge(const char *protocol);
+
 /* Result of a cross-repo matching run. */
 typedef struct {
     int http_edges;    /* CROSS_HTTP_CALLS edges created */

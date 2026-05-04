@@ -29,6 +29,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 5, P
 #include "foundation/compat.h"
 #include "foundation/compat_thread.h"
 #include "foundation/profile.h"
+#include "pipeline/servicelink.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -772,6 +773,27 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         return rc;
     }
 
+    /* Cross-service protocol linking (GraphQL, gRPC, Kafka, etc.) */
+    if (!check_cancel(p)) {
+        struct timespec t;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        int sl_rc = cbm_pipeline_pass_servicelinks(ctx);
+        if (sl_rc < 0) {
+            cbm_log_warn("pass.servicelinks.error", "rc", itoa_buf(sl_rc));
+        }
+        cbm_log_info("pass.timing", "pass", "servicelinks", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t)));
+    }
+
+    /* Communities pass (Louvain clustering on service-link edges) */
+    if (!check_cancel(p)) {
+        struct timespec t;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        cbm_pipeline_pass_communities(ctx);
+        cbm_log_info("pass.timing", "pass", "communities", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t)));
+    }
+
     CBM_PROF_START(t_predump);
     run_predump_passes(p, ctx);
     CBM_PROF_END("pipeline", "3_predump_passes_total", t_predump);
@@ -782,6 +804,34 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         rc = dump_and_persist_hashes(p, files, file_count, &t);
         CBM_PROF_END("pipeline", "4_dump_and_persist", t_dump);
     }
+
+    /* Persist protocol endpoints for cross-repo matching */
+    if (!check_cancel(p) && ctx->endpoints) {
+        cbm_sl_endpoint_list_t *ep_list = (cbm_sl_endpoint_list_t *)ctx->endpoints;
+        if (ep_list->count > 0) {
+            char db_path[CBM_SZ_1K];
+            if (p->db_path) {
+                snprintf(db_path, sizeof(db_path), "%s", p->db_path);
+            } else {
+                snprintf(db_path, sizeof(db_path), "%s/%s.db",
+                         cbm_resolve_cache_dir(), p->project_name);
+            }
+            cbm_persist_endpoints(db_path, p->project_name, ep_list);
+        }
+    }
+
+    /* Cross-project endpoint matching */
+    if (!check_cancel(p)) {
+        struct timespec t_xl;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t_xl);
+        const char *cdir = cbm_resolve_cache_dir();
+        if (cdir) {
+            cbm_cross_project_link(cdir);
+        }
+        cbm_log_info("pass.timing", "pass", "crossrepolinks", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t_xl)));
+    }
+
     return rc;
 }
 
@@ -869,6 +919,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         .cancelled = &p->cancelled,
         .mode = (int)p->mode,
     };
+    ctx.endpoints = cbm_sl_endpoint_list_new();
 
     rc = run_extraction_phase(p, &ctx, files, file_count);
     if (rc != 0) {
@@ -880,6 +931,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         goto cleanup;
     }
 
+
     cbm_log_info("pipeline.done", "nodes", itoa_buf(cbm_gbuf_node_count(p->gbuf)), "edges",
                  itoa_buf(cbm_gbuf_edge_count(p->gbuf)), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t0)));
@@ -888,6 +940,8 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
 cleanup:
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
     cbm_pipeline_set_pkgmap(NULL);
+    cbm_sl_endpoint_list_free((cbm_sl_endpoint_list_t *)ctx.endpoints);
+    ctx.endpoints = NULL;
     cbm_discover_free(files, file_count);
     cbm_gbuf_free(p->gbuf);
     p->gbuf = NULL;

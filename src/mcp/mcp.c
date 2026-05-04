@@ -398,6 +398,16 @@ static const tool_def_t TOOLS[] = {
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\",\"items\":{\"type\":"
      "\"object\"}},\"project\":{\"type\":"
      "\"string\"}},\"required\":[\"traces\",\"project\"]}"},
+
+    {"cross_project_links", "Discover cross-project protocol communication links between indexed projects. Returns a summary header (total matching, by-protocol breakdown, top project pairs) plus paginated rows. Default 100 rows per call; use limit/offset to paginate, or summary_only=true for header only. Prefer narrowing with protocol/project/identifier before paging.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"protocol\":{\"type\":\"string\",\"description\":\"Filter by protocol (graphql, grpc, kafka, http, pubsub, etc.)\"},"
+     "\"project\":{\"type\":\"string\",\"description\":\"Filter by project name (matches producer or consumer)\"},"
+     "\"identifier\":{\"type\":\"string\",\"description\":\"Filter by identifier (topic name, operation, etc.)\"},"
+     "\"limit\":{\"type\":\"integer\",\"description\":\"Max rows to return (default 100, max 1000).\"},"
+     "\"offset\":{\"type\":\"integer\",\"description\":\"Rows to skip (default 0). Paginate with offset+=limit.\"},"
+     "\"summary_only\":{\"type\":\"boolean\",\"description\":\"If true, return summary header only (no rows).\"}"
+     "}}"},
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
@@ -3588,6 +3598,322 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+/* ── Cross-project links tool ────────────────────────────────── */
+
+/* Bind the (protocol, project, identifier) filter params onto a prepared stmt.
+ * Starting at bind_idx=1. Returns the next free bind index. */
+static int xl_bind_filters(sqlite3_stmt *stmt, int bind_idx,
+                           const char *protocol, const char *project,
+                           const char *identifier) {
+    if (protocol && protocol[0]) {
+        sqlite3_bind_text(stmt, bind_idx++, protocol, -1, SQLITE_STATIC);
+    }
+    if (project && project[0]) {
+        sqlite3_bind_text(stmt, bind_idx++, project, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, bind_idx++, project, -1, SQLITE_STATIC);
+    }
+    if (identifier && identifier[0]) {
+        sqlite3_bind_text(stmt, bind_idx++, identifier, -1, SQLITE_STATIC);
+    }
+    return bind_idx;
+}
+
+static char *handle_cross_project_links(cbm_mcp_server_t *srv, const char *args) {
+    (void)srv;
+
+    /* Parse optional filters + pagination */
+    char protocol[64] = {0};
+    char project[256] = {0};
+    char identifier[256] = {0};
+    int limit = 100;           /* default page size — matches Grep's byte budget */
+    int offset = 0;
+    int summary_only = 0;
+
+    if (args) {
+        yyjson_doc *doc = yyjson_read(args, strlen(args), 0);
+        if (doc) {
+            yyjson_val *root = yyjson_doc_get_root(doc);
+            yyjson_val *v;
+            v = yyjson_obj_get(root, "protocol");
+            if (v && yyjson_is_str(v))
+                snprintf(protocol, sizeof(protocol), "%s", yyjson_get_str(v));
+            v = yyjson_obj_get(root, "project");
+            if (v && yyjson_is_str(v))
+                snprintf(project, sizeof(project), "%s", yyjson_get_str(v));
+            v = yyjson_obj_get(root, "identifier");
+            if (v && yyjson_is_str(v))
+                snprintf(identifier, sizeof(identifier), "%s", yyjson_get_str(v));
+            v = yyjson_obj_get(root, "limit");
+            if (v && yyjson_is_int(v)) limit = (int)yyjson_get_int(v);
+            v = yyjson_obj_get(root, "offset");
+            if (v && yyjson_is_int(v)) offset = (int)yyjson_get_int(v);
+            v = yyjson_obj_get(root, "summary_only");
+            if (v && yyjson_is_bool(v)) summary_only = yyjson_get_bool(v) ? 1 : 0;
+            yyjson_doc_free(doc);
+        }
+    }
+
+    /* Clamp pagination params */
+    if (limit < 1) limit = 100;
+    if (limit > 1000) limit = 1000;
+    if (offset < 0) offset = 0;
+
+    /* Open _crosslinks.db */
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) {
+        return cbm_mcp_text_result("Cache directory not found.", true);
+    }
+
+    char db_path[1024];
+    snprintf(db_path, sizeof(db_path), "%s/_crosslinks.db", cache_dir);
+
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return cbm_mcp_text_result(
+            "No cross-project links found. Index at least 2 projects first.", false);
+    }
+
+    /* Build shared WHERE clause */
+    char where[512] = {0};
+    int wlen = 0;
+    if (protocol[0]) {
+        wlen += snprintf(where + wlen, sizeof(where) - (size_t)wlen,
+                         "%sprotocol = ?", wlen ? " AND " : "");
+    }
+    if (project[0]) {
+        wlen += snprintf(where + wlen, sizeof(where) - (size_t)wlen,
+                         "%s(producer_project = ? OR consumer_project = ?)",
+                         wlen ? " AND " : "");
+    }
+    if (identifier[0]) {
+        wlen += snprintf(where + wlen, sizeof(where) - (size_t)wlen,
+                         "%sidentifier = ?", wlen ? " AND " : "");
+    }
+
+    /* Total count (cheap — drives summary + pagination) */
+    char count_sql[640];
+    if (wlen > 0) {
+        snprintf(count_sql, sizeof(count_sql),
+                 "SELECT COUNT(*) FROM cross_links WHERE %s;", where);
+    } else {
+        snprintf(count_sql, sizeof(count_sql),
+                 "SELECT COUNT(*) FROM cross_links;");
+    }
+    int total_count = 0;
+    sqlite3_stmt *cstmt = NULL;
+    if (sqlite3_prepare_v2(db, count_sql, -1, &cstmt, NULL) == SQLITE_OK) {
+        xl_bind_filters(cstmt, 1, protocol, project, identifier);
+        if (sqlite3_step(cstmt) == SQLITE_ROW) {
+            total_count = sqlite3_column_int(cstmt, 0);
+        }
+        sqlite3_finalize(cstmt);
+    }
+
+    if (total_count == 0) {
+        sqlite3_close(db);
+        return cbm_mcp_text_result(
+            wlen > 0 ? "No cross-project links found matching filters."
+                     : "No cross-project links found. Index at least 2 projects first.",
+            false);
+    }
+
+    int buf_cap = 65536;
+    char *buf = malloc((size_t)buf_cap);
+    if (!buf) { sqlite3_close(db);
+                return cbm_mcp_text_result("alloc failed", true); }
+    int pos = 0;
+
+    /* Row range this call will show */
+    int show_start = offset;
+    int show_end = offset + limit;
+    if (show_end > total_count) show_end = total_count;
+    int rows_to_show = summary_only ? 0 : (show_end > show_start ? show_end - show_start : 0);
+
+    /* Header */
+    pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "# Cross-Project Links\n\n");
+    if (summary_only) {
+        pos += snprintf(buf + pos, (size_t)(buf_cap - pos),
+                        "Total matching: %d (summary only)\n\n", total_count);
+    } else if (rows_to_show > 0) {
+        pos += snprintf(buf + pos, (size_t)(buf_cap - pos),
+                        "Total matching: %d (rows %d-%d shown)\n\n",
+                        total_count, show_start, show_end - 1);
+    } else {
+        pos += snprintf(buf + pos, (size_t)(buf_cap - pos),
+                        "Total matching: %d (offset %d is past end)\n\n",
+                        total_count, offset);
+    }
+
+    /* By-protocol breakdown (cheap aggregate) */
+    char agg_sql[800];
+    if (wlen > 0) {
+        snprintf(agg_sql, sizeof(agg_sql),
+                 "SELECT protocol, COUNT(*) FROM cross_links WHERE %s "
+                 "GROUP BY protocol ORDER BY 2 DESC;", where);
+    } else {
+        snprintf(agg_sql, sizeof(agg_sql),
+                 "SELECT protocol, COUNT(*) FROM cross_links "
+                 "GROUP BY protocol ORDER BY 2 DESC;");
+    }
+    sqlite3_stmt *astmt = NULL;
+    if (sqlite3_prepare_v2(db, agg_sql, -1, &astmt, NULL) == SQLITE_OK) {
+        xl_bind_filters(astmt, 1, protocol, project, identifier);
+        pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "By protocol:\n");
+        while (sqlite3_step(astmt) == SQLITE_ROW) {
+            pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "  %-12s %d\n",
+                            (const char *)sqlite3_column_text(astmt, 0),
+                            sqlite3_column_int(astmt, 1));
+        }
+        pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "\n");
+        sqlite3_finalize(astmt);
+    }
+
+    /* Top project pairs — include when summary_only OR when result wasn't
+     * already narrowed to a single identifier (pair view isn't useful then). */
+    if (summary_only || (!identifier[0] && total_count > 20)) {
+        char pair_sql[900];
+        if (wlen > 0) {
+            snprintf(pair_sql, sizeof(pair_sql),
+                     "SELECT producer_project, consumer_project, protocol, COUNT(*) "
+                     "FROM cross_links WHERE %s "
+                     "GROUP BY producer_project, consumer_project, protocol "
+                     "ORDER BY 4 DESC LIMIT 10;", where);
+        } else {
+            snprintf(pair_sql, sizeof(pair_sql),
+                     "SELECT producer_project, consumer_project, protocol, COUNT(*) "
+                     "FROM cross_links "
+                     "GROUP BY producer_project, consumer_project, protocol "
+                     "ORDER BY 4 DESC LIMIT 10;");
+        }
+        sqlite3_stmt *pstmt = NULL;
+        if (sqlite3_prepare_v2(db, pair_sql, -1, &pstmt, NULL) == SQLITE_OK) {
+            xl_bind_filters(pstmt, 1, protocol, project, identifier);
+            pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "Top project pairs:\n");
+            while (sqlite3_step(pstmt) == SQLITE_ROW) {
+                pos += snprintf(buf + pos, (size_t)(buf_cap - pos),
+                                "  %s -> %s (%s): %d\n",
+                                (const char *)sqlite3_column_text(pstmt, 0),
+                                (const char *)sqlite3_column_text(pstmt, 1),
+                                (const char *)sqlite3_column_text(pstmt, 2),
+                                sqlite3_column_int(pstmt, 3));
+            }
+            pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "\n");
+            sqlite3_finalize(pstmt);
+        }
+    }
+
+    /* Pagination / hint footer */
+    if (!summary_only) {
+        if (show_end < total_count) {
+            pos += snprintf(buf + pos, (size_t)(buf_cap - pos),
+                            "Pagination: showing %d of %d. Next page: offset=%d limit=%d.\n",
+                            rows_to_show, total_count, show_end, limit);
+        } else if (rows_to_show > 0) {
+            pos += snprintf(buf + pos, (size_t)(buf_cap - pos),
+                            "Pagination: showing all %d matching rows.\n", total_count);
+        }
+    }
+    if (wlen == 0 && total_count > 100) {
+        pos += snprintf(buf + pos, (size_t)(buf_cap - pos),
+            "Tip: narrow with protocol=, project=, or identifier=. "
+            "Pass summary_only=true to skip row detail.\n");
+    }
+
+    /* If summary-only, we are done */
+    if (summary_only) {
+        sqlite3_close(db);
+        char *result = cbm_mcp_text_result(buf, false);
+        free(buf);
+        return result;
+    }
+
+    if (rows_to_show == 0) {
+        /* Offset is past end — return summary without rows */
+        sqlite3_close(db);
+        char *result = cbm_mcp_text_result(buf, false);
+        free(buf);
+        return result;
+    }
+
+    pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "\n---\n\n");
+
+    /* Paginated row query */
+    char sql[1200];
+    if (wlen > 0) {
+        snprintf(sql, sizeof(sql),
+            "SELECT protocol, identifier, producer_project, producer_qn, producer_file, "
+            "consumer_project, consumer_qn, consumer_file, confidence "
+            "FROM cross_links WHERE %s "
+            "ORDER BY protocol, identifier, confidence DESC "
+            "LIMIT ? OFFSET ?;", where);
+    } else {
+        snprintf(sql, sizeof(sql),
+            "SELECT protocol, identifier, producer_project, producer_qn, producer_file, "
+            "consumer_project, consumer_qn, consumer_file, confidence "
+            "FROM cross_links "
+            "ORDER BY protocol, identifier, confidence DESC "
+            "LIMIT ? OFFSET ?;");
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        free(buf);
+        return cbm_mcp_text_result("Failed to query cross-project links.", true);
+    }
+    int bi = xl_bind_filters(stmt, 1, protocol, project, identifier);
+    sqlite3_bind_int(stmt, bi++, limit);
+    sqlite3_bind_int(stmt, bi++, offset);
+
+    char cur_protocol[64] = {0};
+    int proto_count = 0;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *proto = (const char *)sqlite3_column_text(stmt, 0);
+        const char *ident = (const char *)sqlite3_column_text(stmt, 1);
+        const char *pprod = (const char *)sqlite3_column_text(stmt, MCP_COL_2);
+        const char *qprod = (const char *)sqlite3_column_text(stmt, MCP_COL_3);
+        const char *fprod = (const char *)sqlite3_column_text(stmt, MCP_COL_4);
+        const char *pcons = (const char *)sqlite3_column_text(stmt, 5);
+        const char *qcons = (const char *)sqlite3_column_text(stmt, 6);
+        const char *fcons = (const char *)sqlite3_column_text(stmt, MCP_COL_7);
+        double conf = sqlite3_column_double(stmt, 8);
+
+        if (pos + 512 > buf_cap) {
+            int new_cap = buf_cap * 2;
+            char *new_buf = realloc(buf, (size_t)new_cap);
+            if (!new_buf) break;
+            buf = new_buf;
+            buf_cap = new_cap;
+        }
+
+        if (strcmp(cur_protocol, proto ? proto : "") != 0) {
+            if (proto_count > 0) {
+                pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "\n");
+            }
+            snprintf(cur_protocol, sizeof(cur_protocol), "%s", proto ? proto : "");
+            pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "## %s\n\n", proto);
+            proto_count++;
+        }
+
+        pos += snprintf(buf + pos, (size_t)(buf_cap - pos),
+            "%s (confidence: %.2f)\n"
+            "  producer: %s :: %s (%s)\n"
+            "  consumer: %s :: %s (%s)\n\n",
+            ident ? ident : "", conf,
+            pprod ? pprod : "", qprod ? qprod : "", fprod ? fprod : "",
+            pcons ? pcons : "", qcons ? qcons : "", fcons ? fcons : "");
+    }
+
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    buf[pos] = '\0';
+    char *result = cbm_mcp_text_result(buf, false);
+    free(buf);
+    return result;
+}
+
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
@@ -3638,6 +3964,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "ingest_traces") == 0) {
         return handle_ingest_traces(srv, args_json);
+    }
+    if (strcmp(tool_name, "cross_project_links") == 0) {
+        return handle_cross_project_links(srv, args_json);
     }
     char msg[CBM_SZ_256];
     snprintf(msg, sizeof(msg), "unknown tool: %s", tool_name);
@@ -3780,7 +4109,7 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
 
 /* ── Background update check ──────────────────────────────────── */
 
-#define UPDATE_CHECK_URL "https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest"
+#define UPDATE_CHECK_URL "https://api.github.com/repos/hodizoda/codebase-memory-mcp/releases/latest"
 
 static void *update_check_thread(void *arg) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
