@@ -40,7 +40,9 @@ enum {
     ST_GLOB_MIN_LEN = 3,
     ST_GLOB_SKIP = 2,
     ST_MAX_LANG = 10,
-    ST_SEARCH_MAX_BINDS = 16,
+    ST_SEARCH_MAX_BINDS = 32, /* increased: LIKE pre-filter adds binds per pattern */
+    ST_LIKE_POOL_MAX = 12,    /* max malloc'd LIKE strings alive during one search */
+    ST_LIKE_HINT_MAX = 2,     /* max LIKE hints extracted per regex pattern */
     ST_MAX_PKGS = 64,
     ST_INIT_CAP_4 = 4,
     ST_HEADER_PREFIX = 3,
@@ -409,47 +411,63 @@ static void sqlite_camel_split(sqlite3_context *ctx, int argc, sqlite3_value **a
 
 /* ── REGEXP function for SQLite ──────────────────────────────────── */
 
+/* Destructor passed to sqlite3_set_auxdata — frees the cached compiled regex. */
+static void regex_free_cb(void *p) {
+    cbm_regex_t *re = (cbm_regex_t *)p;
+    cbm_regfree(re);
+    free(re);
+}
+
+/* Cache the compiled regex on argument slot 0 for the lifetime of the statement.
+ * sqlite3_get_auxdata returns the cached pointer on subsequent rows (same parameter
+ * value), so cbm_regcomp is called exactly once per statement instead of once per row. */
 static void sqlite_regexp(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     (void)argc;
     const char *pattern = (const char *)sqlite3_value_text(argv[0]);
-    const char *text = (const char *)sqlite3_value_text(argv[SKIP_ONE]);
+    const char *text    = (const char *)sqlite3_value_text(argv[SKIP_ONE]);
     if (!pattern || !text) {
         sqlite3_result_int(ctx, 0);
         return;
     }
 
-    cbm_regex_t re;
-    int rc = cbm_regcomp(&re, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB);
-    if (rc != 0) {
-        sqlite3_result_error(ctx, "invalid regex", CBM_NOT_FOUND);
-        return;
+    cbm_regex_t *re = (cbm_regex_t *)sqlite3_get_auxdata(ctx, 0);
+    if (!re) {
+        re = malloc(sizeof(cbm_regex_t));
+        if (!re) { sqlite3_result_error_nomem(ctx); return; }
+        if (cbm_regcomp(re, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB) != 0) {
+            free(re);
+            sqlite3_result_error(ctx, "invalid regex", CBM_NOT_FOUND);
+            return;
+        }
+        sqlite3_set_auxdata(ctx, 0, re, regex_free_cb);
     }
 
-    rc = cbm_regexec(&re, text, 0, NULL, 0);
-    cbm_regfree(&re);
-    sqlite3_result_int(ctx, rc == 0 ? SKIP_ONE : 0);
+    sqlite3_result_int(ctx, cbm_regexec(re, text, 0, NULL, 0) == 0 ? SKIP_ONE : 0);
 }
 
-/* Case-insensitive REGEXP variant */
+/* Case-insensitive REGEXP variant — same auxdata caching strategy. */
 static void sqlite_iregexp(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     (void)argc;
     const char *pattern = (const char *)sqlite3_value_text(argv[0]);
-    const char *text = (const char *)sqlite3_value_text(argv[SKIP_ONE]);
+    const char *text    = (const char *)sqlite3_value_text(argv[SKIP_ONE]);
     if (!pattern || !text) {
         sqlite3_result_int(ctx, 0);
         return;
     }
 
-    cbm_regex_t re;
-    int rc = cbm_regcomp(&re, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB | CBM_REG_ICASE);
-    if (rc != 0) {
-        sqlite3_result_error(ctx, "invalid regex", CBM_NOT_FOUND);
-        return;
+    cbm_regex_t *re = (cbm_regex_t *)sqlite3_get_auxdata(ctx, 0);
+    if (!re) {
+        re = malloc(sizeof(cbm_regex_t));
+        if (!re) { sqlite3_result_error_nomem(ctx); return; }
+        if (cbm_regcomp(re, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB | CBM_REG_ICASE) != 0) {
+            free(re);
+            sqlite3_result_error(ctx, "invalid regex", CBM_NOT_FOUND);
+            return;
+        }
+        sqlite3_set_auxdata(ctx, 0, re, regex_free_cb);
     }
 
-    rc = cbm_regexec(&re, text, 0, NULL, 0);
-    cbm_regfree(&re);
-    sqlite3_result_int(ctx, rc == 0 ? SKIP_ONE : 0);
+    sqlite3_result_int(ctx, cbm_regexec(re, text, 0, NULL, 0) == 0 ? SKIP_ONE : 0);
 }
 
 /* Cosine similarity between two int8 BLOB vectors.
@@ -2121,6 +2139,41 @@ typedef struct {
     const char *text;
 } search_bind_t;
 
+/* Pool of malloc'd strings that must outlive statement execution.
+ * Freed in one shot after both statements are finalized. */
+typedef struct {
+    char *ptrs[ST_LIKE_POOL_MAX];
+    int   count;
+} search_like_pool_t;
+
+static void like_pool_add(search_like_pool_t *pool, char *ptr) {
+    if (ptr && pool->count < ST_LIKE_POOL_MAX) {
+        pool->ptrs[pool->count++] = ptr;
+    } else {
+        free(ptr); /* pool full — don't leak */
+    }
+}
+
+static void like_pool_free(search_like_pool_t *pool) {
+    for (int i = 0; i < pool->count; i++) {
+        free(pool->ptrs[i]);
+    }
+    pool->count = 0;
+}
+
+/* Wrap a literal string in % for use as a LIKE pattern (%literal%). */
+static char *make_like_hint(const char *literal) {
+    size_t len = strlen(literal);
+    char *buf = malloc(len + 3); /* % + literal + % + NUL */
+    if (buf) {
+        buf[0] = '%';
+        memcpy(buf + SKIP_ONE, literal, len);
+        buf[len + SKIP_ONE] = '%';
+        buf[len + 2] = '\0';
+    }
+    return buf;
+}
+
 static void search_apply_degree_filter(char *sql, size_t sql_sz, const cbm_search_params_t *p) {
     bool has_degree_filter = (p->min_degree >= 0 || p->max_degree >= 0);
     if (!has_degree_filter) {
@@ -2191,10 +2244,31 @@ static void where_add_regex(char *where, int where_sz, int *wlen, int *nparams,
     where_bind_text(binds, bind_idx, pattern);
 }
 
+/* Prepend LIKE pre-filter conditions for literal segments of a regex pattern.
+ * The idx_nodes_name index satisfies LIKE '%literal%', cutting the rows that
+ * reach the (more expensive) iregexp call to only those containing the literal.
+ * cbm_extract_like_hints bails on alternation, so no false negatives. */
+static void where_add_like_hints(const char *column, const char *pattern, char *where,
+                                  int where_sz, int *wlen, int *nparams, search_bind_t *binds,
+                                  int *bind_idx, search_like_pool_t *pool) {
+    char *hints[ST_LIKE_HINT_MAX];
+    int nhints = cbm_extract_like_hints(pattern, hints, ST_LIKE_HINT_MAX);
+    char bind_buf[CBM_SZ_64];
+    for (int i = 0; i < nhints; i++) {
+        char *lp = make_like_hint(hints[i]);
+        free(hints[i]);
+        if (!lp) continue;
+        like_pool_add(pool, lp);
+        snprintf(bind_buf, sizeof(bind_buf), "%s LIKE ?%d", column, *bind_idx + SKIP_ONE);
+        *wlen = where_append(where, where_sz, *wlen, nparams, bind_buf);
+        where_bind_text(binds, bind_idx, lp);
+    }
+}
+
 /* Build basic WHERE clauses: project, label, name, file, qn patterns. */
 static int search_where_basic(const cbm_search_params_t *params, char *where, int where_sz,
                               int *wlen, int *nparams, search_bind_t *binds, int *bind_idx,
-                              char **like_pattern_out) {
+                              search_like_pool_t *pool) {
     char bind_buf[CBM_SZ_64];
 
     if (params->project) {
@@ -2208,18 +2282,23 @@ static int search_where_basic(const cbm_search_params_t *params, char *where, in
         where_bind_text(binds, bind_idx, params->label);
     }
     if (params->name_pattern) {
+        where_add_like_hints("n.name", params->name_pattern, where, where_sz, wlen, nparams,
+                             binds, bind_idx, pool);
         where_add_regex(where, where_sz, wlen, nparams, binds, bind_idx, "n.name",
                         params->name_pattern, params->case_sensitive);
     }
     if (params->qn_pattern) {
+        where_add_like_hints("n.qualified_name", params->qn_pattern, where, where_sz, wlen,
+                             nparams, binds, bind_idx, pool);
         where_add_regex(where, where_sz, wlen, nparams, binds, bind_idx, "n.qualified_name",
                         params->qn_pattern, params->case_sensitive);
     }
     if (params->file_pattern) {
-        *like_pattern_out = cbm_glob_to_like(params->file_pattern);
+        char *lp = cbm_glob_to_like(params->file_pattern);
+        like_pool_add(pool, lp);
         snprintf(bind_buf, sizeof(bind_buf), "n.file_path LIKE ?%d", *bind_idx + SKIP_ONE);
         *wlen = where_append(where, where_sz, *wlen, nparams, bind_buf);
-        where_bind_text(binds, bind_idx, *like_pattern_out);
+        where_bind_text(binds, bind_idx, lp);
     }
     return *nparams;
 }
@@ -2254,12 +2333,11 @@ static void search_where_advanced(const cbm_search_params_t *params, char *where
 }
 
 static int search_build_where(const cbm_search_params_t *params, char *where, int where_sz,
-                              search_bind_t *binds, int *bind_idx, char **like_pattern_out) {
+                              search_bind_t *binds, int *bind_idx, search_like_pool_t *pool) {
     int wlen = 0;
     int nparams = 0;
-    *like_pattern_out = NULL;
 
-    search_where_basic(params, where, where_sz, &wlen, &nparams, binds, bind_idx, like_pattern_out);
+    search_where_basic(params, where, where_sz, &wlen, &nparams, binds, bind_idx, pool);
     search_where_advanced(params, where, where_sz, &wlen, &nparams, binds, bind_idx);
 
     return nparams;
@@ -2284,10 +2362,10 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
 
     char where[CBM_SZ_2K] = "";
     search_bind_t binds[ST_SEARCH_MAX_BINDS];
-    char *like_pattern = NULL;
+    search_like_pool_t like_pool = {0};
 
     int nparams =
-        search_build_where(params, where, (int)sizeof(where), binds, &bind_idx, &like_pattern);
+        search_build_where(params, where, (int)sizeof(where), binds, &bind_idx, &like_pool);
 
     /* Build full SQL */
     if (nparams > 0) {
@@ -2300,8 +2378,16 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     bool has_degree_filter = (params->min_degree >= 0 || params->max_degree >= 0);
     search_apply_degree_filter(sql, sizeof(sql), params);
 
-    /* Count query (wrap the full query) */
-    snprintf(count_sql, sizeof(count_sql), "SELECT COUNT(*) FROM (%s)", sql);
+    /* Count query — stripped of per-row edge subqueries for the common (no-degree-filter)
+     * case, since we only need the row count, not in_deg/out_deg.  The degree-filter
+     * case must wrap the full query because the filter references those columns. */
+    if (has_degree_filter) {
+        snprintf(count_sql, sizeof(count_sql), "SELECT COUNT(*) FROM (%s)", sql);
+    } else if (nparams > 0) {
+        snprintf(count_sql, sizeof(count_sql), "SELECT COUNT(*) FROM nodes n WHERE %s", where);
+    } else {
+        snprintf(count_sql, sizeof(count_sql), "SELECT COUNT(*) FROM nodes n");
+    }
 
     /* Add ORDER BY + LIMIT */
     int limit = params->limit > 0 ? params->limit : ST_HALF_SEC;
@@ -2330,7 +2416,7 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &main_stmt, NULL);
     if (rc != SQLITE_OK) {
         store_set_error_sqlite(s, "search prepare");
-        free(like_pattern);
+        like_pool_free(&like_pool);
         return CBM_STORE_ERR;
     }
 
@@ -2355,7 +2441,7 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     }
 
     sqlite3_finalize(main_stmt);
-    free(like_pattern);
+    like_pool_free(&like_pool);
 
     out->results = results;
     out->count = n;
