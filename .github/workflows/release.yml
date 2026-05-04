@@ -251,16 +251,13 @@ jobs:
           gh release edit "$VERSION" \
             --notes-file /tmp/release_notes.md --repo "$GITHUB_REPOSITORY"
 
-      - name: Publish release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ inputs.version }}
-        run: gh release edit "$VERSION" --draft=false --repo "$GITHUB_REPOSITORY"
-
   # ── 8. Publish package wrappers (npm + PyPI) ──────────────────
   # Wrappers in pkg/npm and pkg/pypi download the released binary at
   # install time, so they only need a version bump (already in the repo
   # at this point) — no per-release sha256 substitution.
+  #
+  # Runs against the still-DRAFT GitHub release. If publish fails, the
+  # release stays in draft so we can re-run without a half-shipped state.
   publish-registries:
     needs: [verify]
     runs-on: ubuntu-latest
@@ -301,3 +298,19 @@ jobs:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
         run: twine upload --non-interactive dist/*
+
+  # ── 9. Atomic un-draft (only after npm + PyPI succeed) ────────
+  # The GitHub release stays in DRAFT until both registries publish.
+  # If anything upstream fails, the draft can be deleted and the run
+  # re-tried with replace=true — no half-shipped state visible to users.
+  publish-final:
+    needs: [verify, publish-registries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Un-draft GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: gh release edit "$VERSION" --draft=false --repo "$GITHUB_REPOSITORY"
