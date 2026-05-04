@@ -215,6 +215,18 @@ irm https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/scripts/
 
 </details>
 
+### AUR (Arch Linux)
+
+```bash
+yay -S codebase-memory-mcp-bin
+```
+
+```bash
+paru -S codebase-memory-mcp-bin
+```
+
+The `codebase-memory-mcp-bin` package is available at: https://aur.archlinux.org/packages/codebase-memory-mcp-bin
+
 ### Install via Claude Code
 
 ```
