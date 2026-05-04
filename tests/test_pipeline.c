@@ -5170,6 +5170,547 @@ TEST(project_name_trailing_slash) {
     PASS();
 }
 
+/* ── pass_idl_scan tests ──────────────────────────────────────────── */
+
+/* Minimal harness: create a gbuf, populate it with the nodes/edges that the
+ * upstream extractor would emit for a proto file plus a consumer-side Python
+ * servicer class, run cbm_pipeline_pass_idl_scan, and check the resulting
+ * Route + HANDLES topology. */
+
+TEST(idl_scan_emits_route_from_proto_class) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test-proj", "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t svc_id = cbm_gbuf_upsert_node(gb, "Class", "PromoCodeService",
+                                          "test-proj.contracts.promo.PromoCodeService",
+                                          "contracts/promo.proto", 1, 5, "{}");
+    ASSERT_GT(svc_id, 0);
+
+    int64_t rpc_id = cbm_gbuf_upsert_node(gb, "Function", "GetVoucher",
+                                          "test-proj.contracts.promo.PromoCodeService.GetVoucher",
+                                          "contracts/promo.proto", 2, 2, "{}");
+    ASSERT_GT(rpc_id, 0);
+
+    cbm_gbuf_insert_edge(gb, svc_id, rpc_id, "DEFINES_METHOD", "{}");
+
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "test-proj",
+        .repo_path = "/tmp/test",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+    };
+    int rc = cbm_pipeline_pass_idl_scan(&ctx, NULL, 0);
+    ASSERT_EQ(rc, 0);
+
+    const cbm_gbuf_node_t *route =
+        cbm_gbuf_find_by_qn(gb, "__route__grpc__PromoCodeService/GetVoucher");
+    ASSERT_NOT_NULL(route);
+    ASSERT_STR_EQ(route->label, "Route");
+
+    const cbm_gbuf_edge_t **handles = NULL;
+    int handles_count = 0;
+    rc = cbm_gbuf_find_edges_by_source_type(gb, rpc_id, "HANDLES", &handles, &handles_count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(handles_count, 1);
+    ASSERT_EQ(handles[0]->target_id, route->id);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(idl_scan_binds_python_servicer_subclass) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test-proj", "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+
+    /* Proto-derived service + rpc */
+    int64_t svc_id = cbm_gbuf_upsert_node(gb, "Class", "PromoCodeService",
+                                          "test-proj.contracts.promo.PromoCodeService",
+                                          "contracts/promo.proto", 1, 5, "{}");
+    int64_t rpc_id = cbm_gbuf_upsert_node(gb, "Function", "GetVoucher",
+                                          "test-proj.contracts.promo.PromoCodeService.GetVoucher",
+                                          "contracts/promo.proto", 2, 2, "{}");
+    cbm_gbuf_insert_edge(gb, svc_id, rpc_id, "DEFINES_METHOD", "{}");
+
+    /* Generated Python base (e.g., promo_pb2_grpc.PromoCodeServiceServicer) */
+    int64_t base_id = cbm_gbuf_upsert_node(
+        gb, "Class", "PromoCodeServiceServicer",
+        "test-proj.gen.promo_pb2_grpc.PromoCodeServiceServicer", "gen/promo_pb2_grpc.py", 1, 1,
+        "{}");
+
+    /* User-written impl */
+    int64_t impl_id = cbm_gbuf_upsert_node(gb, "Class", "PromoServicer",
+                                           "test-proj.server.promo.PromoServicer",
+                                           "server/promo.py", 10, 30, "{}");
+    cbm_gbuf_insert_edge(gb, impl_id, base_id, "INHERITS", "{}");
+
+    /* Impl method using snake_case (Python convention): get_voucher */
+    int64_t impl_method_id = cbm_gbuf_upsert_node(
+        gb, "Method", "GetVoucher", "test-proj.server.promo.PromoServicer.GetVoucher",
+        "server/promo.py", 11, 15, "{}");
+    cbm_gbuf_insert_edge(gb, impl_id, impl_method_id, "DEFINES_METHOD", "{}");
+
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "test-proj",
+        .repo_path = "/tmp/test",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+    };
+    int rc = cbm_pipeline_pass_idl_scan(&ctx, NULL, 0);
+    ASSERT_EQ(rc, 0);
+
+    const cbm_gbuf_node_t *route =
+        cbm_gbuf_find_by_qn(gb, "__route__grpc__PromoCodeService/GetVoucher");
+    ASSERT_NOT_NULL(route);
+
+    /* HANDLES edges expected: rpc → Route, impl method → Route. */
+    const cbm_gbuf_edge_t **rpc_handles = NULL;
+    int rpc_count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, rpc_id, "HANDLES", &rpc_handles, &rpc_count);
+    ASSERT_EQ(rpc_count, 1);
+
+    const cbm_gbuf_edge_t **impl_handles = NULL;
+    int impl_count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, impl_method_id, "HANDLES", &impl_handles, &impl_count);
+    ASSERT_EQ(impl_count, 1);
+    ASSERT_EQ(impl_handles[0]->target_id, route->id);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(idl_scan_binds_csharp_servicebase_subclass) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test-proj", "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t svc_id = cbm_gbuf_upsert_node(gb, "Class", "Greeter",
+                                          "test-proj.contracts.greet.Greeter",
+                                          "contracts/greet.proto", 1, 3, "{}");
+    int64_t rpc_id = cbm_gbuf_upsert_node(gb, "Function", "SayHello",
+                                          "test-proj.contracts.greet.Greeter.SayHello",
+                                          "contracts/greet.proto", 2, 2, "{}");
+    cbm_gbuf_insert_edge(gb, svc_id, rpc_id, "DEFINES_METHOD", "{}");
+
+    /* Generated C# base from Grpc.Tools: Greeter.GreeterBase */
+    int64_t base_id =
+        cbm_gbuf_upsert_node(gb, "Class", "GreeterBase", "test-proj.gen.GreetGrpc.GreeterBase",
+                             "gen/GreetGrpc.cs", 1, 1, "{}");
+
+    int64_t impl_id =
+        cbm_gbuf_upsert_node(gb, "Class", "GreeterService", "test-proj.server.GreeterService",
+                             "server/GreeterService.cs", 5, 20, "{}");
+    cbm_gbuf_insert_edge(gb, impl_id, base_id, "INHERITS", "{}");
+
+    /* C# stubs use *Async suffix; v1 strips it before route lookup. */
+    int64_t impl_method_id = cbm_gbuf_upsert_node(
+        gb, "Method", "SayHelloAsync", "test-proj.server.GreeterService.SayHelloAsync",
+        "server/GreeterService.cs", 6, 12, "{}");
+    cbm_gbuf_insert_edge(gb, impl_id, impl_method_id, "DEFINES_METHOD", "{}");
+
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "test-proj",
+        .repo_path = "/tmp/test",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+    };
+    int rc = cbm_pipeline_pass_idl_scan(&ctx, NULL, 0);
+    ASSERT_EQ(rc, 0);
+
+    const cbm_gbuf_node_t *route = cbm_gbuf_find_by_qn(gb, "__route__grpc__Greeter/SayHello");
+    ASSERT_NOT_NULL(route);
+
+    const cbm_gbuf_edge_t **handles = NULL;
+    int hcount = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, impl_method_id, "HANDLES", &handles, &hcount);
+    ASSERT_EQ(hcount, 1);
+    ASSERT_EQ(handles[0]->target_id, route->id);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* Helper: zero-initialized synthetic CBMFileResult with caller-provided
+ * type_assigns / calls arrays. The arrays must outlive the test scope. */
+static void mk_synthetic_result(CBMFileResult *r, CBMTypeAssign *ta_items, int ta_count,
+                                CBMCall *call_items, int call_count) {
+    memset(r, 0, sizeof(*r));
+    r->type_assigns.items = ta_items;
+    r->type_assigns.count = ta_count;
+    r->type_assigns.cap = ta_count;
+    r->calls.items = call_items;
+    r->calls.count = call_count;
+    r->calls.cap = call_count;
+}
+
+TEST(idl_scan_emits_grpc_calls_for_python_stub) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test-proj", "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+
+    /* Proto-derived service. */
+    int64_t svc_id = cbm_gbuf_upsert_node(gb, "Class", "PromoCodeService",
+                                          "test-proj.contracts.promo.PromoCodeService",
+                                          "contracts/promo.proto", 1, 5, "{}");
+    int64_t rpc_id = cbm_gbuf_upsert_node(gb, "Function", "GetVoucher",
+                                          "test-proj.contracts.promo.PromoCodeService.GetVoucher",
+                                          "contracts/promo.proto", 2, 2, "{}");
+    cbm_gbuf_insert_edge(gb, svc_id, rpc_id, "DEFINES_METHOD", "{}");
+
+    /* Caller function on producer side. */
+    int64_t caller_id =
+        cbm_gbuf_upsert_node(gb, "Function", "fetch_voucher", "test-proj.client.main.fetch_voucher",
+                             "client/main.py", 10, 20, "{}");
+
+    CBMTypeAssign ta[] = {{
+        .var_name = "stub",
+        .type_name = "promo_pb2_grpc.PromoCodeServiceStub",
+        .enclosing_func_qn = "test-proj.client.main.fetch_voucher",
+    }};
+    CBMCall calls[] = {{
+        .callee_name = "stub.GetVoucher",
+        .enclosing_func_qn = "test-proj.client.main.fetch_voucher",
+    }};
+    CBMFileResult result;
+    mk_synthetic_result(&result, ta, 1, calls, 1);
+
+    CBMFileResult *cache[1] = {&result};
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "test-proj",
+        .repo_path = "/tmp/test",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+        .result_cache = cache,
+    };
+    cbm_file_info_t fi = {.rel_path = "client/main.py"};
+
+    int rc = cbm_pipeline_pass_idl_scan(&ctx, &fi, 1);
+    ASSERT_EQ(rc, 0);
+
+    const cbm_gbuf_node_t *route =
+        cbm_gbuf_find_by_qn(gb, "__route__grpc__PromoCodeService/GetVoucher");
+    ASSERT_NOT_NULL(route);
+
+    const cbm_gbuf_edge_t **grpc = NULL;
+    int grpc_count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, caller_id, "GRPC_CALLS", &grpc, &grpc_count);
+    ASSERT_EQ(grpc_count, 1);
+    ASSERT_EQ(grpc[0]->target_id, route->id);
+    ASSERT_NOT_NULL(strstr(grpc[0]->properties_json, "\"service\":\"PromoCodeService\""));
+    ASSERT_NOT_NULL(strstr(grpc[0]->properties_json, "\"method\":\"GetVoucher\""));
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(idl_scan_emits_grpc_calls_for_csharp_client_with_async) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test-proj", "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t svc_id = cbm_gbuf_upsert_node(gb, "Class", "Greeter",
+                                          "test-proj.contracts.greet.Greeter",
+                                          "contracts/greet.proto", 1, 3, "{}");
+    int64_t rpc_id = cbm_gbuf_upsert_node(gb, "Function", "SayHello",
+                                          "test-proj.contracts.greet.Greeter.SayHello",
+                                          "contracts/greet.proto", 2, 2, "{}");
+    cbm_gbuf_insert_edge(gb, svc_id, rpc_id, "DEFINES_METHOD", "{}");
+
+    int64_t caller_id = cbm_gbuf_upsert_node(gb, "Method", "FetchGreeting",
+                                             "test-proj.client.GreetingService.FetchGreeting",
+                                             "client/GreetingService.cs", 15, 25, "{}");
+
+    /* C# `var client = new Greeter.GreeterClient(channel);` */
+    CBMTypeAssign ta[] = {{
+        .var_name = "client",
+        .type_name = "Greeter.GreeterClient",
+        .enclosing_func_qn = "test-proj.client.GreetingService.FetchGreeting",
+    }};
+    /* `client.SayHelloAsync(req)` — Async suffix should be stripped before lookup. */
+    CBMCall calls[] = {{
+        .callee_name = "client.SayHelloAsync",
+        .enclosing_func_qn = "test-proj.client.GreetingService.FetchGreeting",
+    }};
+    CBMFileResult result;
+    mk_synthetic_result(&result, ta, 1, calls, 1);
+
+    CBMFileResult *cache[1] = {&result};
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "test-proj",
+        .repo_path = "/tmp/test",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+        .result_cache = cache,
+    };
+    cbm_file_info_t fi = {.rel_path = "client/GreetingService.cs"};
+
+    int rc = cbm_pipeline_pass_idl_scan(&ctx, &fi, 1);
+    ASSERT_EQ(rc, 0);
+
+    /* Route should match the bare rpc name (Async stripped). */
+    const cbm_gbuf_node_t *route = cbm_gbuf_find_by_qn(gb, "__route__grpc__Greeter/SayHello");
+    ASSERT_NOT_NULL(route);
+
+    const cbm_gbuf_edge_t **grpc = NULL;
+    int grpc_count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, caller_id, "GRPC_CALLS", &grpc, &grpc_count);
+    ASSERT_EQ(grpc_count, 1);
+    ASSERT_EQ(grpc[0]->target_id, route->id);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(idl_scan_emits_grpc_calls_for_java_blocking_stub) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test-proj", "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t svc_id = cbm_gbuf_upsert_node(gb, "Class", "OrderService",
+                                          "test-proj.contracts.order.OrderService",
+                                          "contracts/order.proto", 1, 5, "{}");
+    int64_t rpc_id = cbm_gbuf_upsert_node(gb, "Function", "PlaceOrder",
+                                          "test-proj.contracts.order.OrderService.PlaceOrder",
+                                          "contracts/order.proto", 2, 2, "{}");
+    cbm_gbuf_insert_edge(gb, svc_id, rpc_id, "DEFINES_METHOD", "{}");
+
+    int64_t caller_id =
+        cbm_gbuf_upsert_node(gb, "Method", "submitOrder",
+                             "test-proj.client.OrderClient.submitOrder",
+                             "client/OrderClient.java", 30, 40, "{}");
+
+    /* Java `OrderServiceGrpc.OrderServiceBlockingStub stub = OrderServiceGrpc.newBlockingStub(ch);`
+     * — extractor records type as the BlockingStub class. */
+    CBMTypeAssign ta[] = {{
+        .var_name = "stub",
+        .type_name = "OrderServiceGrpc.OrderServiceBlockingStub",
+        .enclosing_func_qn = "test-proj.client.OrderClient.submitOrder",
+    }};
+    /* Java convention: rpc method `PlaceOrder` is invoked as `placeOrder` (lowerCamelCase).
+     * Pass should capitalize before route lookup. */
+    CBMCall calls[] = {{
+        .callee_name = "stub.placeOrder",
+        .enclosing_func_qn = "test-proj.client.OrderClient.submitOrder",
+    }};
+    CBMFileResult result;
+    mk_synthetic_result(&result, ta, 1, calls, 1);
+
+    CBMFileResult *cache[1] = {&result};
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "test-proj",
+        .repo_path = "/tmp/test",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+        .result_cache = cache,
+    };
+    cbm_file_info_t fi = {.rel_path = "client/OrderClient.java"};
+
+    int rc = cbm_pipeline_pass_idl_scan(&ctx, &fi, 1);
+    ASSERT_EQ(rc, 0);
+
+    const cbm_gbuf_node_t *route =
+        cbm_gbuf_find_by_qn(gb, "__route__grpc__OrderService/PlaceOrder");
+    ASSERT_NOT_NULL(route);
+
+    const cbm_gbuf_edge_t **grpc = NULL;
+    int grpc_count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, caller_id, "GRPC_CALLS", &grpc, &grpc_count);
+    ASSERT_EQ(grpc_count, 1);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(idl_scan_denylist_skips_httpclient) {
+    /* System.Net.Http.HttpClient ends in "Client" but is on the deny prefix
+     * list — pass should not emit a GRPC_CALLS edge or stray Route. */
+    cbm_gbuf_t *gb = cbm_gbuf_new("test-proj", "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t caller_id = cbm_gbuf_upsert_node(gb, "Function", "fetch", "test-proj.client.fetch",
+                                             "client/fetch.cs", 5, 10, "{}");
+
+    CBMTypeAssign ta[] = {{
+        .var_name = "http",
+        .type_name = "System.Net.Http.HttpClient",
+        .enclosing_func_qn = "test-proj.client.fetch",
+    }};
+    CBMCall calls[] = {{
+        .callee_name = "http.GetAsync",
+        .enclosing_func_qn = "test-proj.client.fetch",
+    }};
+    CBMFileResult result;
+    mk_synthetic_result(&result, ta, 1, calls, 1);
+
+    CBMFileResult *cache[1] = {&result};
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "test-proj",
+        .repo_path = "/tmp/test",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+        .result_cache = cache,
+    };
+    cbm_file_info_t fi = {.rel_path = "client/fetch.cs"};
+
+    int rc = cbm_pipeline_pass_idl_scan(&ctx, &fi, 1);
+    ASSERT_EQ(rc, 0);
+
+    const cbm_gbuf_edge_t **grpc = NULL;
+    int grpc_count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, caller_id, "GRPC_CALLS", &grpc, &grpc_count);
+    ASSERT_EQ(grpc_count, 0);
+
+    /* Also assert no stray Route was emitted for "Http" (HttpClient minus Client). */
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "__route__grpc__Http/GetAsync"));
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(idl_scan_emits_grpc_calls_without_local_proto) {
+    /* NuGet/Maven/PyPI-distributed contracts pattern: producer repo has the
+     * generated client class assignment + call but NO local .proto file.
+     * Phase D in pass_cross_repo.c handles the actual cross-repo match
+     * against the consumer's Routes. Pass should still emit the GRPC_CALLS
+     * edge so Phase D has something to match. */
+    cbm_gbuf_t *gb = cbm_gbuf_new("gateway", "/tmp/gateway");
+    ASSERT_NOT_NULL(gb);
+
+    /* Note: NO Class node from a .proto file — gateway consumes via NuGet. */
+    int64_t caller_id =
+        cbm_gbuf_upsert_node(gb, "Method", "FetchVoucher",
+                             "gateway.Promo.PromoController.FetchVoucher",
+                             "Controllers/PromoController.cs", 20, 35, "{}");
+
+    CBMTypeAssign ta[] = {{
+        .var_name = "_promoClient",
+        .type_name = "Snoonu.Promo.V1.PromoCodeServiceClient",
+        .enclosing_func_qn = "gateway.Promo.PromoController.FetchVoucher",
+    }};
+    CBMCall calls[] = {{
+        .callee_name = "_promoClient.GetVoucherAsync",
+        .enclosing_func_qn = "gateway.Promo.PromoController.FetchVoucher",
+    }};
+    CBMFileResult result;
+    mk_synthetic_result(&result, ta, 1, calls, 1);
+
+    CBMFileResult *cache[1] = {&result};
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "gateway",
+        .repo_path = "/tmp/gateway",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+        .result_cache = cache,
+    };
+    cbm_file_info_t fi = {.rel_path = "Controllers/PromoController.cs"};
+
+    int rc = cbm_pipeline_pass_idl_scan(&ctx, &fi, 1);
+    ASSERT_EQ(rc, 0);
+
+    /* Route is created locally even without a .proto — Phase D matches it
+     * against the consumer repo's Route by QN. */
+    const cbm_gbuf_node_t *route =
+        cbm_gbuf_find_by_qn(gb, "__route__grpc__PromoCodeService/GetVoucher");
+    ASSERT_NOT_NULL(route);
+
+    const cbm_gbuf_edge_t **grpc = NULL;
+    int grpc_count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, caller_id, "GRPC_CALLS", &grpc, &grpc_count);
+    ASSERT_EQ(grpc_count, 1);
+    ASSERT_EQ(grpc[0]->target_id, route->id);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(idl_scan_resolves_class_field_assigned_in_constructor) {
+    /* C# pattern: `_client = new XClient(channel)` in the constructor,
+     * `_client.Method(...)` in another method on the same class. The
+     * assignment's enclosing_func_qn (ctor) differs from the call site's
+     * enclosing_func_qn (method). File-scope fallback should bridge them. */
+    cbm_gbuf_t *gb = cbm_gbuf_new("svc", "/tmp/svc");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t method_id =
+        cbm_gbuf_upsert_node(gb, "Method", "DoWork", "svc.Svc.MyClass.DoWork",
+                             "Svc/MyClass.cs", 30, 40, "{}");
+
+    CBMTypeAssign ta[] = {{
+        .var_name = "_client",
+        .type_name = "Promo.V1.PromoCodeServiceClient",
+        .enclosing_func_qn = "svc.Svc.MyClass.ctor", /* assigned in ctor */
+    }};
+    CBMCall calls[] = {{
+        .callee_name = "_client.GetVoucherAsync",
+        .enclosing_func_qn = "svc.Svc.MyClass.DoWork", /* called from method */
+    }};
+    CBMFileResult result;
+    mk_synthetic_result(&result, ta, 1, calls, 1);
+
+    CBMFileResult *cache[1] = {&result};
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "svc",
+        .repo_path = "/tmp/svc",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+        .result_cache = cache,
+    };
+    cbm_file_info_t fi = {.rel_path = "Svc/MyClass.cs"};
+
+    int rc = cbm_pipeline_pass_idl_scan(&ctx, &fi, 1);
+    ASSERT_EQ(rc, 0);
+
+    const cbm_gbuf_edge_t **grpc = NULL;
+    int grpc_count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, method_id, "GRPC_CALLS", &grpc, &grpc_count);
+    ASSERT_EQ(grpc_count, 1);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(idl_scan_skips_non_proto_class) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test-proj", "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+
+    /* Class in a regular .py file — not a proto-derived service. */
+    int64_t cid = cbm_gbuf_upsert_node(gb, "Class", "Helper", "test-proj.lib.Helper",
+                                       "lib/helper.py", 1, 5, "{}");
+    int64_t mid = cbm_gbuf_upsert_node(gb, "Method", "Run", "test-proj.lib.Helper.Run",
+                                       "lib/helper.py", 2, 2, "{}");
+    cbm_gbuf_insert_edge(gb, cid, mid, "DEFINES_METHOD", "{}");
+
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "test-proj",
+        .repo_path = "/tmp/test",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+    };
+    int rc = cbm_pipeline_pass_idl_scan(&ctx, NULL, 0);
+    ASSERT_EQ(rc, 0);
+
+    /* No Route should have been created. */
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "__route__grpc__Helper/Run"));
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 SUITE(pipeline) {
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
@@ -5415,4 +5956,16 @@ SUITE(pipeline) {
     /* Project name edge cases */
     RUN_TEST(project_name_special_chars);
     RUN_TEST(project_name_trailing_slash);
+    /* IDL scan (gRPC cross-repo) — consumer side */
+    RUN_TEST(idl_scan_emits_route_from_proto_class);
+    RUN_TEST(idl_scan_binds_python_servicer_subclass);
+    RUN_TEST(idl_scan_binds_csharp_servicebase_subclass);
+    RUN_TEST(idl_scan_skips_non_proto_class);
+    /* IDL scan — producer side (typed-client GRPC_CALLS) */
+    RUN_TEST(idl_scan_emits_grpc_calls_for_python_stub);
+    RUN_TEST(idl_scan_emits_grpc_calls_for_csharp_client_with_async);
+    RUN_TEST(idl_scan_emits_grpc_calls_for_java_blocking_stub);
+    RUN_TEST(idl_scan_denylist_skips_httpclient);
+    RUN_TEST(idl_scan_emits_grpc_calls_without_local_proto);
+    RUN_TEST(idl_scan_resolves_class_field_assigned_in_constructor);
 }

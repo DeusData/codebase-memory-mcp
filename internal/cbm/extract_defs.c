@@ -1893,6 +1893,55 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
 
     // Extract class-level variables (field declarations)
     extract_class_variables(ctx, node, spec);
+
+    // C# 12 primary-constructor parameters: declared on the class line
+    // (`class Foo(IBar bar, IBaz baz) : Base { ... }`) and bound to implicit
+    // captured fields accessible from any instance member. Tree-sitter c-sharp
+    // wraps them inside the hidden _class_declaration_initializer node, so the
+    // `parameters` field on class_declaration may not always resolve directly;
+    // iterate top-level children for parameter_list as a robust fallback.
+    if (ctx->language == CBM_LANG_CSHARP) {
+        TSNode primary_params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));
+        if (ts_node_is_null(primary_params)) {
+            uint32_t total = ts_node_child_count(node);
+            for (uint32_t i = 0; i < total; i++) {
+                TSNode c = ts_node_child(node, i);
+                if (!ts_node_is_null(c) && strcmp(ts_node_type(c), "parameter_list") == 0) {
+                    primary_params = c;
+                    break;
+                }
+            }
+        }
+        if (!ts_node_is_null(primary_params)) {
+            uint32_t pcount = ts_node_child_count(primary_params);
+            for (uint32_t k = 0; k < pcount; k++) {
+                TSNode p = ts_node_child(primary_params, k);
+                if (ts_node_is_null(p) || !ts_node_is_named(p)) {
+                    continue;
+                }
+                char *pname = resolve_param_name(a, p, ctx->source);
+                if (!pname || !pname[0]) {
+                    continue;
+                }
+                char *ptype = resolve_param_type_text(a, p, ctx->source, ctx->language);
+                if (!ptype || !ptype[0]) {
+                    continue;
+                }
+                CBMDefinition pdef;
+                memset(&pdef, 0, sizeof(pdef));
+                pdef.name = pname;
+                pdef.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, pname);
+                pdef.label = "Field";
+                pdef.file_path = ctx->rel_path;
+                pdef.parent_class = class_qn;
+                pdef.return_type = ptype;
+                pdef.start_line = ts_node_start_point(p).row + TS_LINE_OFFSET;
+                pdef.end_line = ts_node_end_point(p).row + TS_LINE_OFFSET;
+                pdef.is_exported = false;
+                cbm_defs_push(&ctx->result->defs, a, pdef);
+            }
+        }
+    }
 }
 
 // Find the body/members node inside a class node
@@ -2049,6 +2098,7 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, const char *class_
     TSNode params = ts_node_child_by_field_name(child, TS_FIELD("parameters"));
     if (!ts_node_is_null(params)) {
         def.signature = cbm_node_text(a, params, ctx->source);
+        def.param_names = extract_param_names(a, params, ctx->source, ctx->language);
         def.param_types = extract_param_types(a, params, ctx->source, ctx->language);
     }
 
@@ -2207,6 +2257,7 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         TSNode params = ts_node_child_by_field_name(child, TS_FIELD("parameters"));
         if (!ts_node_is_null(params)) {
             def.signature = cbm_node_text(a, params, ctx->source);
+            def.param_names = extract_param_names(a, params, ctx->source, ctx->language);
             def.param_types = extract_param_types(a, params, ctx->source, ctx->language);
         }
 
@@ -3203,8 +3254,41 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
             continue;
         }
 
-        // Extract type from "type" field
+        /* Locate the field's "type" + name node. Two shapes:
+         *   - direct (Java/Go/Rust/C/C++):
+         *       field_declaration .type=identifier .declarator=variable_declarator(.name)
+         *   - nested (C#):
+         *       field_declaration > variable_declaration(.type=identifier,
+         *                                               variable_declarator(.name))
+         * For the nested case, the child has no "type" field directly. Detect by
+         * walking named children for a variable_declaration. */
         TSNode type_node = ts_node_child_by_field_name(child, TS_FIELD("type"));
+        TSNode name_node = ts_node_is_null(type_node) ? (TSNode){0} : resolve_field_name_node(child);
+
+        if (ts_node_is_null(type_node)) {
+            uint32_t cnc = ts_node_named_child_count(child);
+            for (uint32_t k = 0; k < cnc; k++) {
+                TSNode inner = ts_node_named_child(child, k);
+                if (strcmp(ts_node_type(inner), "variable_declaration") != 0) {
+                    continue;
+                }
+                type_node = ts_node_child_by_field_name(inner, TS_FIELD("type"));
+                /* Find first variable_declarator child for the name. */
+                uint32_t nc = ts_node_named_child_count(inner);
+                for (uint32_t j = 0; j < nc; j++) {
+                    TSNode vd = ts_node_named_child(inner, j);
+                    if (strcmp(ts_node_type(vd), "variable_declarator") == 0) {
+                        TSNode nm = ts_node_child_by_field_name(vd, TS_FIELD("name"));
+                        if (!ts_node_is_null(nm)) {
+                            name_node = nm;
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
         if (ts_node_is_null(type_node)) {
             continue;
         }
@@ -3213,7 +3297,6 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
             continue;
         }
 
-        TSNode name_node = resolve_field_name_node(child);
         if (ts_node_is_null(name_node)) {
             continue;
         }

@@ -332,6 +332,7 @@ static const char *cs_branch_types[] = {"if_statement",    "for_statement",    "
                                         "while_statement", "switch_statement", "case_switch_label",
                                         "try_statement",   "catch_clause",     NULL};
 static const char *cs_var_types[] = {"field_declaration", "local_declaration_statement", NULL};
+static const char *cs_field_types[] = {"field_declaration", "property_declaration", NULL};
 static const char *cs_assign_types[] = {"assignment_expression", NULL};
 static const char *cs_throw_types[] = {"throw_statement", "throw_expression", NULL};
 static const char *cs_decorator_types[] = {"attribute", NULL};
@@ -1534,7 +1535,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                       empty_types, cpp_env_funcs, NULL, tree_sitter_cpp},
 
     // CBM_LANG_CSHARP
-    [CBM_LANG_CSHARP] = {CBM_LANG_CSHARP, cs_func_types, cs_class_types, empty_types,
+    [CBM_LANG_CSHARP] = {CBM_LANG_CSHARP, cs_func_types, cs_class_types, cs_field_types,
                          cs_module_types, cs_call_types, cs_import_types, cs_import_types,
                          cs_branch_types, cs_var_types, cs_assign_types, cs_throw_types, NULL,
                          cs_decorator_types, cs_env_funcs, NULL, tree_sitter_c_sharp},

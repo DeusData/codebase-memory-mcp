@@ -12,7 +12,7 @@
  */
 #include "foundation/constants.h"
 
-enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 5, PL_WAL_BUF = 1040 };
+enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, PL_WAL_BUF = 1040 };
 #define PL_NSEC_PER_SEC 1000000000LL
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
@@ -494,6 +494,7 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         {cbm_pipeline_pass_definitions, "definitions", false},
         {cbm_pipeline_pass_k8s, "k8s", true},
         {cbm_pipeline_pass_calls, "calls", false},
+        {cbm_pipeline_pass_idl_scan, "idl_scan", true},
         {cbm_pipeline_pass_usages, "usages", false},
         {cbm_pipeline_pass_semantic, "semantic", false},
     };
@@ -564,6 +565,17 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
     cbm_pipeline_extract_infra_routes(p->gbuf, files, cache, file_count);
     cbm_pipeline_process_infra_bindings(p->gbuf, files, cache, file_count);
+
+    /* Run idl_scan while result_cache is still populated. Mirrors the
+     * sequential pipeline at pipeline.c:497. Without this, pass_idl_scan is
+     * silently skipped for any repo large enough to take the parallel path —
+     * meaning every real-world .NET / Java service fleet. */
+    ctx->result_cache = cache;
+    cbm_clock_gettime(CLOCK_MONOTONIC, t);
+    cbm_pipeline_pass_idl_scan(ctx, files, file_count);
+    cbm_log_info("pass.timing", "pass", "idl_scan", "elapsed_ms", itoa_buf((int)elapsed_ms(*t)));
+    ctx->result_cache = NULL;
+
     for (int i = 0; i < file_count; i++) {
         if (cache[i]) {
             cbm_free_result(cache[i]);

@@ -156,6 +156,17 @@ export function GraphScene({
               onClick={onNodeClick}
               opacity={0.5}
             />
+            {/* Inter-galaxy CROSS_* edges: source is in primary, target in
+             * this linked project's offset nodes. */}
+            {lp.cross_edges && lp.cross_edges.length > 0 && (
+              <EdgeLines
+                nodes={data.nodes}
+                targetNodes={offsetNodes}
+                edges={lp.cross_edges}
+                highlightedIds={highlightedIds}
+                opacity={0.85}
+              />
+            )}
           </group>
         );
       })}
