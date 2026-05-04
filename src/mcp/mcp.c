@@ -1260,10 +1260,19 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     return json;
 }
 
-/* Emit the cbm_store_search results as a JSON "results" array on the doc. */
+/* Forward declaration — defined later in this file. */
+static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *obj,
+                                          const char *properties_json);
+
+/* Emit the cbm_store_search results as a JSON "results" array on the doc.
+ * Populates *out_pdocs with parsed property docs that must be freed by the
+ * caller AFTER serializing doc (zero-copy strings point into these docs). */
 static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                 const cbm_search_output_t *out, cbm_store_t *store,
-                                const char *relationship, bool include_connected, int offset) {
+                                const char *relationship, bool include_connected, int offset,
+                                yyjson_doc ***out_pdocs, int *out_pdoc_count) {
+    yyjson_doc **pdocs = out->count > 0 ? malloc((size_t)out->count * sizeof(yyjson_doc *)) : NULL;
+    int pdoc_count = 0;
     yyjson_mut_obj_add_int(doc, root, "total", out->total);
     yyjson_mut_val *results = yyjson_mut_arr(doc);
     for (int i = 0; i < out->count; i++) {
@@ -1280,10 +1289,14 @@ static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
         if (include_connected && sr->node.id > 0) {
             enrich_connected(doc, item, store, sr->node.id, relationship);
         }
+        yyjson_doc *pdoc = enrich_node_properties(doc, item, sr->node.properties_json);
+        if (pdoc && pdocs) pdocs[pdoc_count++] = pdoc;
         yyjson_mut_arr_add_val(results, item);
     }
     yyjson_mut_obj_add_val(doc, root, "results", results);
     yyjson_mut_obj_add_bool(doc, root, "has_more", out->total > offset + out->count);
+    *out_pdocs = pdocs;
+    *out_pdoc_count = pdoc_count;
 }
 
 /* Extract keyword strings from a yyjson array into `keywords`.  Returns the
@@ -1426,7 +1439,10 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
-    emit_search_results(doc, root, &out, store, relationship, include_connected, offset);
+    yyjson_doc **props_docs = NULL;
+    int props_doc_count = 0;
+    emit_search_results(doc, root, &out, store, relationship, include_connected, offset,
+                        &props_docs, &props_doc_count);
 
     /* Add diagnostic hint when zero results */
     if (out.total == 0) {
@@ -1449,6 +1465,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     bool sq_type_error = run_semantic_query(doc, root, args, store, project, limit);
 
     if (sq_type_error) {
+        for (int pi = 0; pi < props_doc_count; pi++) yyjson_doc_free(props_docs[pi]);
+        free(props_docs);
         yyjson_mut_doc_free(doc);
         cbm_store_search_free(&out);
         free(project);
@@ -1466,6 +1484,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     }
 
     char *json = yy_doc_to_str(doc);
+    for (int pi = 0; pi < props_doc_count; pi++) yyjson_doc_free(props_docs[pi]);
+    free(props_docs);
     yyjson_mut_doc_free(doc);
     cbm_store_search_free(&out);
 

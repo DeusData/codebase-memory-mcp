@@ -528,7 +528,7 @@ TEST(githistory_compute_coupling) {
     char *files_4[] = {"d.go", "e.go"};
 
     cbm_commit_files_t commits[] = {
-        {files_0, 3}, {files_1, 2}, {files_2, 2}, {files_3, 2}, {files_4, 2},
+        {files_0, 3, 0}, {files_1, 2, 0}, {files_2, 2, 0}, {files_3, 2, 0}, {files_4, 2, 0},
     };
 
     cbm_change_coupling_t results[100];
@@ -564,7 +564,7 @@ TEST(githistory_skip_large_commits) {
         files[i] = bufs[i];
     }
 
-    cbm_commit_files_t commits[] = {{files, 25}};
+    cbm_commit_files_t commits[] = {{files, 25, 0}};
 
     cbm_change_coupling_t results[100];
     int n = cbm_compute_change_coupling(commits, 1, results, 100);
@@ -4137,7 +4137,8 @@ TEST(githistory_compute_change_coupling) {
     char *files_eee[] = {"d.go", "e.go"};
 
     cbm_commit_files_t commits[5] = {
-        {files_aaa, 3}, {files_bbb, 2}, {files_ccc, 2}, {files_ddd, 2}, {files_eee, 2},
+        {files_aaa, 3, 0}, {files_bbb, 2, 0}, {files_ccc, 2, 0}, {files_ddd, 2, 0},
+        {files_eee, 2, 0},
     };
 
     cbm_change_coupling_t out[100];
@@ -4173,7 +4174,7 @@ TEST(githistory_coupling_skips_large_commits) {
         snprintf(bufs[i], sizeof(bufs[i]), "file%d.go", i);
         files[i] = bufs[i];
     }
-    cbm_commit_files_t commits[1] = {{files, 25}};
+    cbm_commit_files_t commits[1] = {{files, 25, 0}};
 
     cbm_change_coupling_t out[100];
     int count = cbm_compute_change_coupling(commits, 1, out, 100);
@@ -5080,7 +5081,7 @@ TEST(coupling_single_file_commit) {
     /* Commits with single files → no pairs → zero couplings */
     char *f1[] = {"a.go"};
     char *f2[] = {"b.go"};
-    cbm_commit_files_t commits[] = {{f1, 1}, {f2, 1}};
+    cbm_commit_files_t commits[] = {{f1, 1, 0}, {f2, 1, 0}};
     cbm_change_coupling_t results[16];
     int n = cbm_compute_change_coupling(commits, 2, results, 16);
     ASSERT_EQ(n, 0);
