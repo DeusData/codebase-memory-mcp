@@ -133,18 +133,68 @@ Removes all agent configs, skills, hooks, and instructions. Does not remove the 
 
 ## Features
 
+### Graph & analysis
 - **Architecture overview**: `get_architecture` returns languages, packages, entry points, routes, hotspots, boundaries, layers, and clusters in a single call
 - **Architecture Decision Records**: `manage_adr` persists architectural decisions across sessions
 - **Louvain community detection**: Discovers functional modules by clustering call edges
 - **Git diff impact mapping**: `detect_changes` maps uncommitted changes to affected symbols with risk classification
 - **Call graph**: Resolves function calls across files and packages (import-aware, type-inferred)
-- **Cross-service HTTP linking**: Discovers REST routes and matches them to HTTP call sites with confidence scoring
-- **Auto-sync**: Background watcher detects file changes and re-indexes automatically
-- **Cypher-like queries**: `MATCH (f:Function)-[:CALLS]->(g) WHERE f.name = 'main' RETURN g.name`
 - **Dead code detection**: Finds functions with zero callers, excluding entry points
+- **Cypher-like queries**: `MATCH (f:Function)-[:CALLS]->(g) WHERE f.name = 'main' RETURN g.name`
+
+### Search
+- **Semantic search** (`semantic_query`): vector search across the entire graph, powered by bundled Nomic `nomic-embed-code` embeddings (40K tokens, 768d int8) compiled into the binary — no API key, no Ollama, no Docker. 11-signal combined scoring (TF-IDF, RRI, API/Type/Decorator signatures, AST profiles, data flow, Halstead-lite, MinHash, module proximity, graph diffusion).
+- **BM25 full-text search** via SQLite FTS5 with `cbm_camel_split` tokenizer (camelCase / snake_case aware)
+- **Structural search** (`search_graph`): regex name patterns, label filters, min/max degree, file scoping
+- **Code search** (`search_code`): graph-augmented grep over indexed files only
+
+### Cross-service linking
+- **HTTP** route ↔ call-site matching with confidence scoring
+- **gRPC, GraphQL, tRPC** service detection with protobuf Route extraction
+- **Channel detection** (`EMITS` / `LISTENS_ON`) for Socket.IO, EventEmitter, and generic pub-sub patterns across 8 languages with constant resolution
+
+### Cross-repo intelligence
+- **`CROSS_*` edges** link nodes across multiple repos indexed under the same store
+- **Multi-galaxy 3D UI layout** for cross-repo architecture visualization
+- **Cross-repo architecture summary** combining services, routes, and dependencies across the indexed fleet
+
+### Edge types (selected)
+- `CALLS`, `IMPORTS`, `DEFINES`, `IMPLEMENTS`, `INHERITS`
+- `HTTP_CALLS`, `ASYNC_CALLS` (cross-service)
+- `EMITS`, `LISTENS_ON` (channels)
+- `DATA_FLOWS` with arg-to-param mapping + field access chains
+- `SIMILAR_TO` (MinHash + LSH near-clone detection, Jaccard scored)
+- `SEMANTICALLY_RELATED` (vocabulary-mismatch, same-language, score ≥ 0.80)
+
+### Indexing pipeline
+- **155 vendored tree-sitter grammars** compiled into the binary
+- **Generic package / module resolution** — bare specifiers like `@myorg/pkg`, `github.com/foo/bar`, `use my_crate::foo` resolved via manifest scanning (`package.json`, `go.mod`, `Cargo.toml`, `pyproject.toml`, `composer.json`, `pubspec.yaml`, `pom.xml`, `build.gradle`, `mix.exs`, `*.gemspec`)
+- **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, Kustomize overlays as graph nodes
+- **LSP-style hybrid type resolution** for Go, C, C++ (more languages coming)
+- **RAM-first pipeline**: LZ4 compression, in-memory SQLite, single dump at end. Memory released after.
+
+### Distribution & operation
+- **Single static binary, zero infrastructure**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
+- **Auto-sync**: Background watcher detects file changes and re-indexes automatically
 - **Route nodes**: REST endpoints are first-class graph entities
 - **CLI mode**: `codebase-memory-mcp cli search_graph '{"name_pattern": ".*Handler.*"}'`
-- **Single binary, zero infrastructure**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
+- **Available on**: npm, PyPI, Homebrew, Scoop, Winget, Chocolatey, AUR, `go install`
+
+## Team-Shared Graph Artifact
+
+Commit a single compressed file to your repo and your teammates skip the reindex.
+
+`.codebase-memory/graph.db.zst` is a zstd-compressed snapshot of the knowledge graph that lives next to your source. When you index, the artifact is written or refreshed; when a teammate clones the repo and runs `codebase-memory-mcp` for the first time, the artifact is decompressed and incremental indexing fills in their local diff.
+
+- **Format**: SQLite database, indexes stripped, `VACUUM INTO` compacted, then zstd 1.5.7 compressed (8–13:1 ratio typical)
+- **Two tiers**:
+  - **Best** (`zstd -9` + index strip + `VACUUM INTO`) — written on explicit `index_repository`
+  - **Fast** (`zstd -3`) — written by the watcher for low-latency incremental updates
+- **Bootstrap**: when no local DB exists but the artifact is present, `index_repository` imports the artifact first, then runs incremental indexing — avoiding the full reindex cost
+- **No merge pain**: a `.gitattributes` line with `merge=ours` is auto-created on first export, so concurrent edits don't produce conflicts on the binary artifact
+- **Optional**: never committed unless you want it. Add `.codebase-memory/` to `.gitignore` if you prefer everyone to reindex from scratch.
+
+The result is similar in spirit to graphify's `graphify-out/` directory, but as a single compressed file with explicit two-tier export, integrity-checked import, and zero merge friction.
 
 ## How It Works
 
