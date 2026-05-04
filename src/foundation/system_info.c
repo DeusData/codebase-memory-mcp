@@ -2,6 +2,7 @@
  * system_info.c — CPU core count and RAM detection.
  *
  * macOS: sysctlbyname for core counts, hw.memsize for RAM.
+ * BSD: sysconf + sysctl(HW_PHYSMEM64 / HW_PHYSMEM).
  * Linux: sysconf + sysinfo().
  * Windows: GetSystemInfo + GlobalMemoryStatusEx.
  *
@@ -21,7 +22,11 @@ enum { DEFAULT_CORES = 1, MIN_WORKERS = 1 };
 #include <windows.h>
 #elif defined(__APPLE__)
 #include <sys/sysctl.h>
-#elif !defined(_WIN32) /* Linux */
+#elif defined(__NetBSD__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#else /* Linux */
 #include <unistd.h>
 #include <sys/sysinfo.h>
 
@@ -72,7 +77,31 @@ static cbm_system_info_t detect_system_macos(void) {
     return info;
 }
 
-#elif !defined(_WIN32) /* Linux */
+#elif defined(__NetBSD__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+
+static cbm_system_info_t detect_system_bsd(void) {
+    cbm_system_info_t info;
+    memset(&info, 0, sizeof(info));
+
+    long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+    info.total_cores = nprocs > 0 ? (int)nprocs : 1;
+    info.perf_cores = info.total_cores;
+
+#if defined(__OpenBSD__)
+    int mib[2] = { CTL_HW, HW_PHYSMEM };
+#else
+    int mib[2] = { CTL_HW, HW_PHYSMEM64 };
+#endif
+    uint64_t physmem = 0;
+    size_t len = sizeof(physmem);
+    if (sysctl(mib, 2, &physmem, &len, NULL, 0) == 0 && physmem > 0) {
+        info.total_ram = (size_t)physmem;
+    }
+
+    return info;
+}
+
+#else /* Linux */
 
 static cbm_system_info_t detect_system_linux(void) {
     cbm_system_info_t info;
@@ -90,7 +119,7 @@ static cbm_system_info_t detect_system_linux(void) {
     return info;
 }
 
-#endif /* __APPLE__ / Linux */
+#endif /* __APPLE__ / BSD / Linux */
 
 /* ── Windows detection ───────────────────────────────────────────── */
 
@@ -128,6 +157,8 @@ cbm_system_info_t cbm_system_info(void) {
         cached_info = detect_system_windows();
 #elif defined(__APPLE__)
         cached_info = detect_system_macos();
+#elif defined(__NetBSD__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+        cached_info = detect_system_bsd();
 #else
         cached_info = detect_system_linux();
 #endif
