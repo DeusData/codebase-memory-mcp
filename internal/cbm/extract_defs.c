@@ -1083,6 +1083,83 @@ static const char **extract_csharp_base_list(CBMArena *a, TSNode node, const cha
     return NULL;
 }
 
+// Walk a field node and collect type identifier names into out[].
+// Handles: direct type_identifier/generic_type/qualified_name, type_list children
+// (Java interfaces list), and raw text fallback (other languages).
+static int collect_bases_from_field(CBMArena *a, TSNode field_node, const char *source,
+                                    const char **out, int out_cap) {
+    int count = 0;
+    const char *fk = ts_node_type(field_node);
+
+    // If the field node itself is a type node, extract directly.
+    if (strcmp(fk, "type_identifier") == 0 || strcmp(fk, "generic_type") == 0 ||
+        strcmp(fk, "qualified_name") == 0 || strcmp(fk, "scoped_type_identifier") == 0 ||
+        strcmp(fk, "user_type") == 0) {
+        char *t = cbm_node_text(a, field_node, source);
+        if (t) {
+            char *angle = strchr(t, '<');
+            if (angle) {
+                *angle = '\0';
+            }
+            if (t[0] && count < out_cap) {
+                out[count++] = t;
+            }
+        }
+        return count;
+    }
+
+    // Walk named children: look for type identifiers or type_list/interface_type_list.
+    uint32_t nc = ts_node_named_child_count(field_node);
+    for (uint32_t i = 0; i < nc && count < out_cap; i++) {
+        TSNode child = ts_node_named_child(field_node, i);
+        const char *ck = ts_node_type(child);
+        if (strcmp(ck, "type_identifier") == 0 || strcmp(ck, "generic_type") == 0 ||
+            strcmp(ck, "qualified_name") == 0 || strcmp(ck, "scoped_type_identifier") == 0 ||
+            strcmp(ck, "user_type") == 0) {
+            char *t = cbm_node_text(a, child, source);
+            if (t) {
+                char *angle = strchr(t, '<');
+                if (angle) {
+                    *angle = '\0';
+                }
+                if (t[0]) {
+                    out[count++] = t;
+                }
+            }
+        } else if (strcmp(ck, "type_list") == 0 || strcmp(ck, "interface_type_list") == 0) {
+            // Java: super_interfaces contains type_list with multiple type_identifiers.
+            uint32_t tlnc = ts_node_named_child_count(child);
+            for (uint32_t ti = 0; ti < tlnc && count < out_cap; ti++) {
+                TSNode tl_child = ts_node_named_child(child, ti);
+                const char *tlk = ts_node_type(tl_child);
+                if (strcmp(tlk, "type_identifier") == 0 || strcmp(tlk, "generic_type") == 0 ||
+                    strcmp(tlk, "qualified_name") == 0) {
+                    char *t = cbm_node_text(a, tl_child, source);
+                    if (t) {
+                        char *angle = strchr(t, '<');
+                        if (angle) {
+                            *angle = '\0';
+                        }
+                        if (t[0]) {
+                            out[count++] = t;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: raw node text (for languages where the field node is the type name directly).
+    if (count == 0) {
+        char *t = cbm_node_text(a, field_node, source);
+        if (t && t[0] && count < out_cap) {
+            out[count++] = t;
+        }
+    }
+
+    return count;
+}
+
 // Extract base class names from a class node.
 static const char **extract_base_classes(CBMArena *a, TSNode node, const char *source,
                                          CBMLanguage lang) {
@@ -1096,13 +1173,28 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
                                    "delegation_specifiers",
                                    NULL};
 
+    // Collect all bases from all matching fields (fixes early-return bug and keyword-text bug).
+    const char *bases[MAX_BASES];
+    int base_count = 0;
+
     for (const char **f = fields; *f; f++) {
         TSNode super = ts_node_child_by_field_name(node, *f, (uint32_t)strlen(*f));
         if (!ts_node_is_null(super)) {
-            const char **r = make_single_base(a, cbm_node_text(a, super, source));
-            if (r) {
-                return r;
+            base_count += collect_bases_from_field(a, super, source,
+                                                   bases + base_count,
+                                                   MAX_BASES_MINUS_1 - base_count);
+        }
+    }
+
+    if (base_count > 0) {
+        const char **result =
+            (const char **)cbm_arena_alloc(a, (base_count + NULL_TERM) * sizeof(const char *));
+        if (result) {
+            for (int i = 0; i < base_count; i++) {
+                result[i] = bases[i];
             }
+            result[base_count] = NULL;
+            return result;
         }
     }
 
