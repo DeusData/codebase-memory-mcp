@@ -174,6 +174,7 @@ static const ext_entry_t EXT_TABLE[] = {
     {".mdx", CBM_LANG_MARKDOWN},
 
     /* MATLAB */
+    {".m", CBM_LANG_MATLAB},
     {".matlab", CBM_LANG_MATLAB},
     {".mlx", CBM_LANG_MATLAB},
 
