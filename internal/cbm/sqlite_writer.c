@@ -1213,9 +1213,16 @@ static uint32_t write_index_btree(FILE *fp, uint32_t *next_page, uint8_t **cells
     pb_init(&pb, fp, *next_page, true);
 
     for (int i = 0; i < count; i++) {
-        if (!pb_cell_fits(&pb, cell_lens[i]) && pb.cell_count > 0) {
-            if (!pb_promote_and_flush(&pb, cells, cell_lens, i - SKIP_ONE)) {
-                return 0;
+        if (!pb_cell_fits(&pb, cell_lens[i])) {
+            if (pb.cell_count > 0) {
+                if (!pb_promote_and_flush(&pb, cells, cell_lens, i - SKIP_ONE)) {
+                    return 0;
+                }
+            }
+            // After flush, check if the cell still doesn't fit on an empty page.
+            // Index cells larger than a full page can never be stored; skip them.
+            if (!pb_cell_fits(&pb, cell_lens[i])) {
+                continue;
             }
         }
         pb_add_cell(&pb, cells[i], cell_lens[i]);
