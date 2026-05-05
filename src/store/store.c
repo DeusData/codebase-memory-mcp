@@ -639,7 +639,8 @@ bool cbm_store_check_integrity(cbm_store_t *s) {
         rc = sqlite3_prepare_v2(
             s->db,
             "SELECT root_path FROM projects WHERE root_path != '' "
-            "AND substr(root_path, 1, 1) NOT IN ('/', 'A','B','C','D','E','F','G','H') LIMIT 1;",
+            "AND NOT (substr(root_path, 1, 1) = '/' "
+            "OR (substr(root_path, 1, 1) BETWEEN 'A' AND 'Z')) LIMIT 1;",
             CBM_NOT_FOUND, &stmt, NULL);
         if (rc == SQLITE_OK) {
             if (sqlite3_step(stmt) == SQLITE_ROW) {
