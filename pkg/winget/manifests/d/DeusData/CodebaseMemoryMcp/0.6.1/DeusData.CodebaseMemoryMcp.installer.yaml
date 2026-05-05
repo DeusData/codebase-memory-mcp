@@ -1,0 +1,17 @@
+PackageIdentifier: DeusData.CodebaseMemoryMcp
+PackageVersion: 0.6.1
+InstallerLocale: en-US
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: codebase-memory-mcp.exe
+    PortableCommandAlias: codebase-memory-mcp
+Platform:
+  - Windows.Desktop
+  - Windows.Universal
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.6.1/codebase-memory-mcp-windows-amd64.zip
+    InstallerSha256: e331f84f2ec760d179025b16b440b0f14282e83f2432318969dc69dde8ffffd0
+ManifestType: installer
+ManifestVersion: 1.6.0

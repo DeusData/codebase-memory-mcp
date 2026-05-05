@@ -1,9 +1,9 @@
 $ErrorActionPreference = 'Stop'
 
 $packageName = 'codebase-memory-mcp'
-$version     = '0.6.0'
+$version     = '0.6.1'
 $url64       = "https://github.com/DeusData/codebase-memory-mcp/releases/download/v${version}/codebase-memory-mcp-windows-amd64.zip"
-$checksum64  = 'da3d7d7bd6f687b697145457ff9d113ecf6daffe173d236457a43223e89a5e9c'
+$checksum64  = 'e331f84f2ec760d179025b16b440b0f14282e83f2432318969dc69dde8ffffd0'
 $installDir  = Join-Path $env:ChocolateyBinRoot $packageName
 
 Install-ChocolateyZipPackage `
