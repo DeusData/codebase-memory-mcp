@@ -12,6 +12,7 @@
  */
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "foundation/compat.h"
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
@@ -132,7 +133,7 @@ static char *path_dirname(const char *rel_path) {
     if (!last) {
         return strdup("");
     }
-    return strndup(rel_path, (size_t)(last - rel_path));
+    return cbm_strndup(rel_path, (size_t)(last - rel_path));
 }
 
 /* Strip file extension from a path. Returns heap-allocated string.
@@ -141,7 +142,7 @@ static char *strip_extension(const char *path) {
     size_t len = strlen(path);
     for (size_t i = len; i > 0; i--) {
         if (path[i - SKIP_ONE] == '.') {
-            return strndup(path, i - SKIP_ONE);
+            return cbm_strndup(path, i - SKIP_ONE);
         }
         if (path[i - SKIP_ONE] == '/') {
             break;
@@ -226,7 +227,7 @@ static char *extract_quoted(const char *p, const char *end) {
     if (p >= end || *p != quote) {
         return NULL;
     }
-    return strndup(start, (size_t)(p - start));
+    return cbm_strndup(start, (size_t)(p - start));
 }
 
 /* ── Language-specific manifest parsers ────────────────────────── */
@@ -324,7 +325,7 @@ static void parse_go_mod(const char *source, int source_len, const char *rel_pat
     if (val <= start) {
         return;
     }
-    char *module_path = strndup(start, (size_t)(val - start));
+    char *module_path = cbm_strndup(start, (size_t)(val - start));
     char *dir = path_dirname(rel_path);
 
     /* The module path maps to the directory containing go.mod.
@@ -515,7 +516,7 @@ static char *xml_tag_content(const char *p, const char *end) {
     if (p <= s) {
         return NULL;
     }
-    return strndup(s, (size_t)(p - s));
+    return cbm_strndup(s, (size_t)(p - s));
 }
 
 /* Java: pom.xml — <groupId> + <artifactId> */
@@ -609,7 +610,7 @@ static void parse_mix_exs(const char *source, int source_len, const char *rel_pa
     if (val <= start) {
         return;
     }
-    char *app_name = strndup(start, (size_t)(val - start));
+    char *app_name = cbm_strndup(start, (size_t)(val - start));
     char *dir = path_dirname(rel_path);
     char entry[PKGMAP_PATH_BUF];
     snprintf(entry, sizeof(entry), "%s%slib/%s", dir[0] ? dir : "", dir[0] ? "/" : "", app_name);

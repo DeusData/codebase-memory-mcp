@@ -2,7 +2,7 @@
 <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
   <metadata>
     <id>codebase-memory-mcp</id>
-    <version>0.6.0</version>
+    <version>0.6.1</version>
     <title>codebase-memory-mcp</title>
     <authors>DeusData</authors>
     <projectUrl>https://github.com/DeusData/codebase-memory-mcp</projectUrl>
@@ -17,8 +17,8 @@ codebase-memory-mcp is a single static binary MCP server that indexes codebases 
 extreme speed and exposes 14 MCP tools for AI coding agents.
 
 Full indexes an average repository in milliseconds, the Linux kernel (28M LOC) in
-3 minutes. Answers structural queries in under 1ms. Supports 66 languages via
-vendored tree-sitter grammars. Zero dependencies. Plug and play across 10 coding
+3 minutes. Answers structural queries in under 1ms. Supports 155 languages via
+vendored tree-sitter grammars. Zero dependencies. Plug and play across 11 coding
 agents including Claude Code, Codex CLI, Gemini CLI, and Zed.
 
 After installation, run:
@@ -27,7 +27,7 @@ After installation, run:
 
 to configure your coding agents automatically.
     </description>
-    <releaseNotes>https://github.com/DeusData/codebase-memory-mcp/releases/tag/v0.6.0</releaseNotes>
+    <releaseNotes>https://github.com/DeusData/codebase-memory-mcp/releases/tag/v0.6.1</releaseNotes>
   </metadata>
   <files>
     <file src="tools\**" target="tools" />

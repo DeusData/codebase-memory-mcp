@@ -197,12 +197,18 @@ jobs:
           cp install.ps1 binaries/ 2>/dev/null || true
           ls -la binaries/
 
-      - name: Security audits on all release binaries
+      - name: Security audits on all release files
         run: |
-          for bin in binaries/codebase-memory-mcp*; do
-            [ -f "$bin" ] || continue
-            echo "--- Auditing: $(basename "$bin") ---"
-            scripts/security-strings.sh "$bin"
+          # Audit every file that ships in the release archives — binaries,
+          # install scripts, LICENSE, and any future companion files.
+          # security-strings.sh detects file type and applies binary-only
+          # rules (URL allowlist, dangerous-command detection) only to real
+          # binaries; for shell scripts it still runs credential and base64
+          # pattern audits.
+          for f in binaries/*; do
+            [ -f "$f" ] || continue
+            echo "--- Auditing: $(basename "$f") ---"
+            scripts/security-strings.sh "$f"
           done
 
       - name: VirusTotal scan
@@ -251,7 +257,68 @@ jobs:
           gh release edit "$VERSION" \
             --notes-file /tmp/release_notes.md --repo "$GITHUB_REPOSITORY"
 
-      - name: Publish release
+  # ── 8. Publish package wrappers (npm + PyPI) ──────────────────
+  # Wrappers in pkg/npm and pkg/pypi download the released binary at
+  # install time, so they only need a version bump (already in the repo
+  # at this point) — no per-release sha256 substitution.
+  #
+  # Runs against the still-DRAFT GitHub release. If publish fails, the
+  # release stays in draft so we can re-run without a half-shipped state.
+  publish-registries:
+    needs: [verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # for npm provenance
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # ── npm ──────────────────────────────────────────────────
+      - name: Setup Node
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v6.4.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish to npm
+        working-directory: pkg/npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
+
+      # ── PyPI ─────────────────────────────────────────────────
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Build PyPI distribution
+        working-directory: pkg/pypi
+        run: |
+          # Pin to specific versions (typosquatting / supply-chain mitigation).
+          # OSSF scorecard prefers --require-hashes, but that needs full
+          # transitive deps; version pinning is the practical compromise.
+          python -m pip install --upgrade 'build==1.3.0' 'twine==6.2.0'
+          python -m build
+
+      - name: Publish to PyPI
+        working-directory: pkg/pypi
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: twine upload --non-interactive dist/*
+
+  # ── 9. Atomic un-draft (only after npm + PyPI succeed) ────────
+  # The GitHub release stays in DRAFT until both registries publish.
+  # If anything upstream fails, the draft can be deleted and the run
+  # re-tried with replace=true — no half-shipped state visible to users.
+  publish-final:
+    needs: [verify, publish-registries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Un-draft GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version }}

@@ -20,8 +20,32 @@ fi
 
 FAIL=0
 
-echo "=== Layer 2: Binary String Audit ==="
-echo "Binary: $BINARY"
+# Detect file type. Shell scripts and other text files extract poorly via
+# `strings` (the entire content becomes the "strings"), and rules tuned for
+# compiled binaries (URL allowlist, wget/telnet detection) produce false
+# positives — install.sh legitimately uses `wget` as a curl fallback, and
+# `case` glob patterns like `https://*` look like unauthorized URLs.
+#
+# Strategy: for non-binary files we still run credential and base64 audits
+# (those are universally meaningful), but skip the URL and dangerous-command
+# audits which are designed for compiled artifacts. Script content is
+# reviewed in PRs and scanned end-to-end by VirusTotal in the same pipeline.
+IS_SCRIPT=false
+if command -v file &>/dev/null; then
+    FILE_TYPE=$(file -b "$BINARY" 2>/dev/null || echo "")
+    case "$FILE_TYPE" in
+        *"shell script"*|*"ASCII text"*|*"UTF-8 Unicode text"*|*"Unicode text"*|*"a /usr/bin/env"*)
+            IS_SCRIPT=true
+            ;;
+    esac
+fi
+
+if $IS_SCRIPT; then
+    echo "=== Layer 2: Script Content Audit ==="
+else
+    echo "=== Layer 2: Binary String Audit ==="
+fi
+echo "File: $BINARY"
 echo ""
 
 # Check for strings command (needs binutils on some MSYS2 setups)
@@ -37,8 +61,11 @@ SEC_CREDS=$(mktemp)
 trap 'rm -f "$STRINGS_FILE" "$SEC_CMDS" "$SEC_CREDS"' EXIT
 strings -n 4 "$BINARY" | sort -u > "$STRINGS_FILE"
 
-# ── 1. URL audit ─────────────────────────────────────────────────
+# ── 1. URL audit (binary only — scripts handled via VT + PR review) ────
 
+if $IS_SCRIPT; then
+    echo "--- URL audit (skipped — script file) ---"
+else
 echo "--- URL audit ---"
 
 # Allowed URL prefixes
@@ -93,6 +120,7 @@ done < <(grep -oE 'https?://[a-zA-Z0-9._/~:@!$&()*+,;=?#%[-]+' "$STRINGS_FILE" |
 if [[ $FAIL -eq 0 ]]; then
     echo "OK: All URLs are authorized."
 fi
+fi  # end !IS_SCRIPT URL audit
 
 # ── 2. Base64 payload detection ──────────────────────────────────
 
@@ -111,19 +139,36 @@ else
     echo "OK: No suspicious base64 payloads found."
 fi
 
-# ── 3. Dangerous command detection ───────────────────────────────
+# ── 3. Dangerous command detection (binary only) ─────────────────
 
 echo ""
+if $IS_SCRIPT; then
+    echo "--- Dangerous command detection (skipped — script file) ---"
+    DANGEROUS_CMDS=''
+else
 echo "--- Dangerous command detection ---"
 
 DANGEROUS_CMDS='wget|netcat|ncat|/dev/tcp|telnet'
+# Known-benign matches (vendored grammar URI scheme tables, etc.). Each entry
+# is a regex matched against the full line; matches are stripped before
+# evaluation. Document the source so reviewers can verify the false positive.
+ALLOWED_DANGEROUS=(
+    '^telnet$'  # rst tree-sitter grammar: valid_schemas[] in vendored/grammars/rst/tree_sitter_rst/chars.c
+)
 if grep -wE "$DANGEROUS_CMDS" "$STRINGS_FILE" > "$SEC_CMDS" 2>/dev/null && [ -s "$SEC_CMDS" ]; then
+    for allow in "${ALLOWED_DANGEROUS[@]}"; do
+        grep -vE "$allow" "$SEC_CMDS" > "${SEC_CMDS}.tmp" || true
+        mv "${SEC_CMDS}.tmp" "$SEC_CMDS"
+    done
+fi
+if [ -s "$SEC_CMDS" ]; then
     echo "BLOCKED: Dangerous commands found in binary:"
     cat "$SEC_CMDS"
     FAIL=1
 else
     echo "OK: No dangerous commands found."
 fi
+fi  # end !IS_SCRIPT dangerous-cmd audit
 
 # ── 4. Credential pattern detection ──────────────────────────────
 
