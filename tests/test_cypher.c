@@ -78,6 +78,32 @@ TEST(cypher_lex_single_quote_string) {
     PASS();
 }
 
+TEST(cypher_lex_string_overflow) {
+    /* Build a string literal longer than 4096 bytes to verify we don't
+     * overflow the stack buffer in lex_string_literal. */
+    const int big = 5000;
+    /* query: "AAAA...A"  (quotes included) */
+    char *query = malloc(big + 3); /* quote + big chars + quote + NUL */
+    ASSERT_NOT_NULL(query);
+    query[0] = '"';
+    memset(query + 1, 'A', big);
+    query[big + 1] = '"';
+    query[big + 2] = '\0';
+
+    cbm_lex_result_t r = {0};
+    int rc = cbm_lex(query, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_GTE(r.count, 1);
+    ASSERT_EQ(r.tokens[0].type, TOK_STRING);
+    /* The string should be truncated to CBM_SZ_4K - 1 (4095) characters. */
+    ASSERT_EQ((int)strlen(r.tokens[0].text), 4095);
+
+    cbm_lex_free(&r);
+    free(query);
+    PASS();
+}
+
 TEST(cypher_lex_number) {
     cbm_lex_result_t r = {0};
     int rc = cbm_lex("42 3.14", &r);
@@ -2064,6 +2090,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_lex_relationship);
     RUN_TEST(cypher_lex_string_literal);
     RUN_TEST(cypher_lex_single_quote_string);
+    RUN_TEST(cypher_lex_string_overflow);
     RUN_TEST(cypher_lex_number);
     RUN_TEST(cypher_lex_operators);
     RUN_TEST(cypher_lex_keywords_case_insensitive);

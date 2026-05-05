@@ -2737,7 +2737,12 @@ int cbm_store_get_schema(cbm_store_t *s, const char *project, cbm_schema_info_t 
         const char *sql = "SELECT label, COUNT(*) FROM nodes WHERE project = ?1 GROUP BY label "
                           "ORDER BY COUNT(*) DESC;";
         sqlite3_stmt *stmt = NULL;
-        sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL);
+        if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
+            if (stmt) {
+                sqlite3_finalize(stmt);
+            }
+            return CBM_NOT_FOUND;
+        }
         bind_text(stmt, SKIP_ONE, project);
 
         int cap = ST_INIT_CAP_8;
@@ -2783,7 +2788,13 @@ int cbm_store_get_schema(cbm_store_t *s, const char *project, cbm_schema_info_t 
         const char *sql = "SELECT type, COUNT(*) FROM edges WHERE project = ?1 GROUP BY type ORDER "
                           "BY COUNT(*) DESC;";
         sqlite3_stmt *stmt = NULL;
-        sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL);
+        if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
+            if (stmt) {
+                sqlite3_finalize(stmt);
+            }
+            cbm_store_schema_free(out);
+            return CBM_NOT_FOUND;
+        }
         bind_text(stmt, SKIP_ONE, project);
 
         int cap = ST_INIT_CAP_8;
@@ -3517,7 +3528,12 @@ static bool pkg_in_list(const char *pkg, char **list, int count) {
 static int collect_pkg_names(cbm_store_t *s, const char *sql, const char *project, char **pkgs,
                              int max_pkgs) {
     sqlite3_stmt *stmt = NULL;
-    sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL);
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        return CBM_NOT_FOUND;
+    }
     bind_text(stmt, SKIP_ONE, project);
     int count = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW && count < max_pkgs) {
