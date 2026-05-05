@@ -58,7 +58,8 @@ enum {
 #include "pipeline/artifact.h"
 
 #ifdef _WIN32
-#include <process.h> /* _getpid */
+#include <process.h>
+#define getpid _getpid
 #else
 #include <unistd.h>
 #include <poll.h>
@@ -2667,10 +2668,45 @@ static int search_result_cmp(const void *a, const void *b) {
     return rb->score - ra->score; /* descending */
 }
 
-/* Build the grep command string based on scoped vs recursive mode */
+/* Build the grep/search command string based on scoped vs recursive mode.
+ * On Windows, uses PowerShell Select-String with tab-delimited output.
+ * On POSIX, uses grep with colon-delimited output. */
 static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
                            const char *file_pattern, const char *tmpfile, const char *filelist,
                            const char *root_path) {
+#ifdef _WIN32
+    const char *sm = use_regex ? "" : " -SimpleMatch";
+    if (scoped) {
+        if (file_pattern) {
+            snprintf(cmd, cmd_sz,
+                "powershell -Command \"$pat = Get-Content '%s'; "
+                "Get-Content '%s' | ForEach-Object { Select-String -LiteralPath $_ -Pattern $pat%s -ErrorAction SilentlyContinue }"
+                " | Where-Object { $_.Path -like '*%s' }"
+                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
+                tmpfile, filelist, sm, file_pattern);
+        } else {
+            snprintf(cmd, cmd_sz,
+                "powershell -Command \"$pat = Get-Content '%s'; "
+                "Get-Content '%s' | ForEach-Object { Select-String -LiteralPath $_ -Pattern $pat%s -ErrorAction SilentlyContinue }"
+                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
+                tmpfile, filelist, sm);
+        }
+    } else {
+        if (file_pattern) {
+            snprintf(cmd, cmd_sz,
+                "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -Include '%s' -File -ErrorAction SilentlyContinue"
+                " | Select-String -Pattern (Get-Content '%s')%s -ErrorAction SilentlyContinue"
+                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
+                root_path, file_pattern, tmpfile, sm);
+        } else {
+            snprintf(cmd, cmd_sz,
+                "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -File -ErrorAction SilentlyContinue"
+                " | Select-String -Pattern (Get-Content '%s')%s -ErrorAction SilentlyContinue"
+                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
+                root_path, tmpfile, sm);
+        }
+    }
+#else
     const char *flag = use_regex ? "-E" : "-F";
     if (scoped) {
         if (file_pattern) {
@@ -2688,6 +2724,7 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
             snprintf(cmd, cmd_sz, "grep -rn %s -f '%s' '%s' 2>/dev/null", flag, tmpfile, root_path);
         }
     }
+#endif
 }
 
 /* Build deduplicated file list from search results + raw matches. */
@@ -2908,19 +2945,27 @@ static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_
             continue;
         }
 
-        char *colon1 = strchr(line, ':');
-        if (!colon1) {
+        /* PowerShell output uses tab as delimiter (paths may contain colons
+         * on Windows, e.g. C:\dir\file). Unix grep uses colon. */
+#ifdef _WIN32
+        char sep = '\t';
+#else
+        char sep = ':';
+#endif
+        char *sep1 = strchr(line, (unsigned char)sep);
+        if (!sep1) {
             continue;
         }
-        char *colon2 = strchr(colon1 + SKIP_ONE, ':');
-        if (!colon2) {
+        char *sep2 = strchr(sep1 + SKIP_ONE, (unsigned char)sep);
+        if (!sep2) {
             continue;
         }
+        *sep1 = '\0';
+        *sep2 = '\0';
 
-        *colon1 = '\0';
-        *colon2 = '\0';
-
-        /* After colon1 truncation, line contains only the file path portion. */
+#ifdef _WIN32
+        cbm_normalize_path_sep(line);
+#endif
         const char *path = line;
         const char *file = strip_root_prefix(path, root_path, root_len);
 
@@ -2933,8 +2978,8 @@ static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_
             gm = safe_realloc(gm, gm_cap * sizeof(grep_match_t));
         }
         snprintf(gm[gm_count].file, sizeof(gm[0].file), "%s", file);
-        gm[gm_count].line = (int)strtol(colon1 + SKIP_ONE, NULL, CBM_DECIMAL_BASE);
-        snprintf(gm[gm_count].content, sizeof(gm[0].content), "%s", colon2 + SKIP_ONE);
+        gm[gm_count].line = (int)strtol(sep1 + SKIP_ONE, NULL, CBM_DECIMAL_BASE);
+        snprintf(gm[gm_count].content, sizeof(gm[0].content), "%s", sep2 + SKIP_ONE);
         sanitize_ascii(gm[gm_count].content);
         gm_count++;
     }
@@ -3058,10 +3103,13 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
         indexed_count == 0) {
         return false;
     }
-    FILE *fl = fopen(filelist, "w");
+    FILE *fl = fopen(filelist, "wb");
     bool ok = false;
     if (fl) {
         for (int fi = 0; fi < indexed_count; fi++) {
+            /* Use forward slashes so xargs doesn't interpret Windows
+             * backslashes as escape sequences (e.g. \n becomes newline).
+             * Binary mode to prevent CRLF (xargs would see trailing \r). */
             (void)fprintf(fl, "%s/%s\n", root_path, indexed_files[fi]);
         }
         (void)fclose(fl);
@@ -3101,11 +3149,7 @@ static bool validate_search_args(const char *root_path, const char *file_pattern
 
 /* Write pattern to a temp file for grep -f. Returns true on success. */
 static bool write_pattern_file(char *tmpfile, int tmpfile_sz, const char *pattern) {
-#ifdef _WIN32
-    snprintf(tmpfile, tmpfile_sz, "/tmp/cbm_search_%d.pat", (int)_getpid());
-#else
-    snprintf(tmpfile, tmpfile_sz, "/tmp/cbm_search_%d.pat", getpid());
-#endif
+    snprintf(tmpfile, tmpfile_sz, "%s/cbm_search_%d.pat", cbm_tmpdir(), (int)getpid());
     FILE *tf = fopen(tmpfile, "w");
     if (!tf) {
         return false;
