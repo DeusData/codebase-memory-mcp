@@ -46,30 +46,32 @@ ingress:
 
 resources:
   limits:
-    cpu: "2"
-    memory: "4Gi"
+    cpu: "1"
+    memory: "2Gi"
   requests:
-    cpu: "500m"
-    memory: "1Gi"
+    cpu: "250m"
+    memory: "512Mi"
 
 autoscaling:
   enabled: false  # fleet server is stateful (PVC); don't autoscale by default
 
-# Persistent volume for SQLite fleet cache (~200 repos)
+# Persistent volume for SQLite fleet cache (~50 curated repos)
 persistence:
   enabled: true
   storageClass: "standard-rwo"
-  size: "50Gi"
+  size: "20Gi"
   accessMode: ReadWriteOnce
   mountPath: /data/fleet-cache
 
 # Environment — secrets injected from GCP Secret Manager via GHL secret-manager pattern
 env:
   PORT: "8080"
-  FLEET_CONCURRENCY: "8"
-  INDEXER_CLIENTS: "8"
-  CRON_INCREMENTAL: "0 */6 * * *"
+  FLEET_CONCURRENCY: "3"
+  INDEXER_CLIENTS: "3"
+  INDEXER_CLIENT_MAX_USES: "20"
+  CRON_INCREMENTAL: "0 3 * * *"
   CRON_FULL: "0 2 * * 0"
+  SCHEDULED_INDEXING_ENABLED: "true"
   CBM_CACHE_DIR: "/tmp/codebase-memory-mcp"
   FLEET_CACHE_DIR: "/data/fleet-cache"
   REPOS_MANIFEST: "/app/REPOS.local.yaml"

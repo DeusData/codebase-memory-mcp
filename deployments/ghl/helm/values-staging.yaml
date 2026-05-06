@@ -3,10 +3,13 @@ image:
   tag: "latest"
 
 env:
-  FLEET_CONCURRENCY: "8"
-  INDEXER_CLIENTS: "8"
+  FLEET_CONCURRENCY: "2"
+  INDEXER_CLIENTS: "2"
+  INDEXER_CLIENT_MAX_USES: "20"
   GITHUB_AUTH_ENABLED: "true"
   GITHUB_ALLOWED_ORGS: "GoHighLevel"
+  SCHEDULED_INDEXING_ENABLED: "true"
+  CRON_INCREMENTAL: "0 3 * * *"
 
 persistence:
-  size: "20Gi"
+  size: "10Gi"

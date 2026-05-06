@@ -170,7 +170,9 @@ func (i *Indexer) IndexRepo(ctx context.Context, repo manifest.Repo, force bool)
 	}
 
 	// Step 2: Index via MCP binary
-	mode := "moderate" // fast enough for incremental; use "full" for weekly force run
+	// "fast" skips similarity/semantic edge passes — 2-3x cheaper per repo.
+	// "full" only on forced weekly runs where graph completeness matters.
+	mode := "fast"
 	if force {
 		mode = "full"
 	}

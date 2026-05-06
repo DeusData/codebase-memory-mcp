@@ -250,7 +250,7 @@ func main() {
 	// ── Fleet scheduler ──────────────────────────────────────
 
 	c := cron.New()
-	{ // Scheduled indexing — always on
+	if cfg.ScheduledIndexingEnabled {
 		c.AddFunc(cfg.IncrementalCron, func() {
 			startFleetIndex("cron-incremental", false)
 		})
@@ -260,6 +260,8 @@ func main() {
 		c.Start()
 		defer c.Stop()
 		slog.Info("scheduled indexing enabled", "incremental_cron", cfg.IncrementalCron, "full_cron", cfg.FullCron)
+	} else {
+		slog.Info("scheduled indexing disabled — webhook-only mode")
 	}
 
 	// ── HTTP router ──────────────────────────────────────────
@@ -531,8 +533,8 @@ func loadConfig() config {
 		return out
 	}
 	getConcurrency := func() int {
-		v := getEnv("FLEET_CONCURRENCY", "5")
-		n := 5
+		v := getEnv("FLEET_CONCURRENCY", "3")
+		n := 3
 		fmt.Sscanf(v, "%d", &n)
 		return n
 	}
@@ -577,11 +579,11 @@ func loadConfig() config {
 		return n
 	}
 	getIndexerClientMaxUses := func() int {
-		v := getEnv("INDEXER_CLIENT_MAX_USES", "1")
-		n := 1
+		v := getEnv("INDEXER_CLIENT_MAX_USES", "20")
+		n := 20
 		fmt.Sscanf(v, "%d", &n)
 		if n <= 0 {
-			return 1
+			return 20
 		}
 		return n
 	}
@@ -658,10 +660,10 @@ func loadConfig() config {
 		DiscoveryClients:         getDiscoveryClients(concurrency),
 		DiscoveryMaxCandidates:   getDiscoveryMaxCandidates(),
 		DiscoveryTimeout:         getDiscoveryTimeout(),
-		IncrementalCron:          getEnv("CRON_INCREMENTAL", "0 */6 * * *"),
+		IncrementalCron:          getEnv("CRON_INCREMENTAL", "0 3 * * *"),
 		FullCron:                 getEnv("CRON_FULL", "0 2 * * 0"),
 		StartupIndexEnabled:      getBool("STARTUP_INDEX_ENABLED", false),
-		ScheduledIndexingEnabled: getBool("SCHEDULED_INDEXING_ENABLED", false),
+		ScheduledIndexingEnabled: getBool("SCHEDULED_INDEXING_ENABLED", true),
 		RunMode:                  strings.TrimSpace(getEnv("RUN_MODE", "serve")),
 		RunForce:                 getBool("RUN_FORCE", false),
 	}
@@ -887,7 +889,6 @@ func (g *gitCloner) gitCommand(ctx context.Context, dir, githubURL string, args 
 }
 
 func (g *gitCloner) restoreWorkingTree(ctx context.Context, githubURL, localPath, ref string) error {
-	// Remove stale index.lock left by crashed git processes — prevents permanent failure
 	// Remove stale lock files left by crashed git processes
 	for _, lockFile := range []string{"index.lock", "HEAD.lock", "config.lock"} {
 		lockPath := filepath.Join(localPath, ".git", lockFile)
@@ -896,9 +897,18 @@ func (g *gitCloner) restoreWorkingTree(ctx context.Context, githubURL, localPath
 			g.logger.Info("removed stale git lock", "file", lockFile, "path", lockPath)
 		}
 	}
-	cmd := g.gitCommand(ctx, localPath, githubURL, "reset", "--hard", ref)
+	// Use checkout instead of reset --hard to preserve mtimes on unchanged files.
+	// The C binary's incremental indexer compares mtime+size to skip unchanged
+	// files. reset --hard rewrites every file (resetting all mtimes), which
+	// defeats incremental indexing and forces a full re-parse every run.
+	cmd := g.gitCommand(ctx, localPath, githubURL, "checkout", "-f", ref, "--", ".")
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git reset --hard %s: %w\n%s", ref, err, out)
+		// Fallback to reset --hard if checkout fails (e.g. detached HEAD edge cases)
+		g.logger.Warn("git checkout failed, falling back to reset --hard", "ref", ref, "err", string(out))
+		cmd = g.gitCommand(ctx, localPath, githubURL, "reset", "--hard", ref)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git reset --hard %s: %w\n%s", ref, err, out)
+		}
 	}
 	cmd = g.gitCommand(ctx, localPath, githubURL, "clean", "-fd")
 	if out, err := cmd.CombinedOutput(); err != nil {
