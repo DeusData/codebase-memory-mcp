@@ -279,10 +279,15 @@ static void c_add_pending_template_call(CLSPContext* ctx, const char* func_qn,
         ctx->pending_template_calls = new_arr;
         ctx->pending_tc_cap = new_cap;
     }
+    const char* func_qn_copy = cbm_arena_strdup(ctx->arena, func_qn);
+    const char* type_param_copy = cbm_arena_strdup(ctx->arena, type_param);
+    const char* method_name_copy = cbm_arena_strdup(ctx->arena, method_name);
+    if (!func_qn_copy || !type_param_copy || !method_name_copy) return;
+
     int i = ctx->pending_tc_count++;
-    ctx->pending_template_calls[i].func_qn = cbm_arena_strdup(ctx->arena, func_qn);
-    ctx->pending_template_calls[i].type_param = cbm_arena_strdup(ctx->arena, type_param);
-    ctx->pending_template_calls[i].method_name = cbm_arena_strdup(ctx->arena, method_name);
+    ctx->pending_template_calls[i].func_qn = func_qn_copy;
+    ctx->pending_template_calls[i].type_param = type_param_copy;
+    ctx->pending_template_calls[i].method_name = method_name_copy;
     ctx->pending_template_calls[i].arg_count = arg_count;
 }
 
@@ -298,10 +303,16 @@ static void c_resolve_pending_template_calls(CLSPContext* ctx,
     int tpn_count = 0;
     while (tpn[tpn_count] && tpn_count < 8) tpn_count++;
 
-    // Match call arg types against function param types to deduce type params
+    // Match call arg types against function param types to deduce type params.
+    // The call site may contain more arguments than the parsed function signature
+    // knows about (invalid code, macros, variadic calls, or parser recovery).  The
+    // signature arrays are NULL-terminated, so never index past the sentinel.
     if (callee->signature && callee->signature->kind == CBM_TYPE_FUNC &&
         callee->signature->data.func.param_types) {
-        for (int i = 0; i < call_arg_count; i++) {
+        int formal_count = 0;
+        while (callee->signature->data.func.param_types[formal_count]) formal_count++;
+        int limit = call_arg_count < formal_count ? call_arg_count : formal_count;
+        for (int i = 0; i < limit; i++) {
             const CBMType* formal = callee->signature->data.func.param_types[i];
             if (!formal || !call_arg_types[i]) continue;
             // Unwrap references/pointers
@@ -327,6 +338,10 @@ static void c_resolve_pending_template_calls(CLSPContext* ctx,
     const char* saved_func_qn = ctx->enclosing_func_qn;
     ctx->enclosing_func_qn = callee->qualified_name;
     for (int i = 0; i < ctx->pending_tc_count; i++) {
+        if (!ctx->pending_template_calls[i].func_qn ||
+            !ctx->pending_template_calls[i].type_param ||
+            !ctx->pending_template_calls[i].method_name)
+            continue;
         if (strcmp(ctx->pending_template_calls[i].func_qn, callee->qualified_name) != 0)
             continue;
         const char* tp = ctx->pending_template_calls[i].type_param;

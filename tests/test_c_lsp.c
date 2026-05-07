@@ -540,6 +540,28 @@ TEST(clsp_nocrash_template_expression) {
     PASS();
 }
 
+TEST(clsp_nocrash_template_extra_call_args) {
+    CBMFileResult *r = extract_cpp("\n"
+                                   "class Widget {\n"
+                                   "public:\n"
+                                   "    void render() {}\n"
+                                   "};\n"
+                                   "\n"
+                                   "template<class T>\n"
+                                   "void invoke(T item) {\n"
+                                   "    item.render();\n"
+                                   "}\n"
+                                   "\n"
+                                   "void test() {\n"
+                                   "    Widget w;\n"
+                                   "    invoke(w, 1, 2);\n"
+                                   "}\n"
+                                   "");
+    ASSERT_NOT_NULL(r);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(clsp_nocrash_lambda) {
     CBMFileResult *r = extract_cpp("\n"
                                    "void test() {\n"
@@ -15101,6 +15123,7 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_operator_stream);
     RUN_TEST(clsp_cross_file);
     RUN_TEST(clsp_nocrash_template_expression);
+    RUN_TEST(clsp_nocrash_template_extra_call_args);
     RUN_TEST(clsp_nocrash_lambda);
     RUN_TEST(clsp_nocrash_nested_namespace);
     RUN_TEST(clsp_nocrash_empty_source);
