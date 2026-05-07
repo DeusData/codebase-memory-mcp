@@ -75,6 +75,7 @@ typedef struct {
     bool in_template;       // currently inside template declaration
     bool debug;
     int eval_depth;         // recursion depth for c_eval_expr_type (crash guard)
+    int eval_steps;         // total expression eval calls for current file (hang guard)
 } CLSPContext;
 
 // --- API ---
