@@ -1204,11 +1204,20 @@ static const char* type_to_qn(const CBMType* t) {
 
 static const CBMType* c_eval_expr_type_inner(CLSPContext* ctx, TSNode node);
 
+#define C_EVAL_DEPTH_LIMIT 256
+#define C_EVAL_MAX_STEPS_PER_FILE 10000
+
 const CBMType* c_eval_expr_type(CLSPContext* ctx, TSNode node) {
     if (ts_node_is_null(node)) return cbm_type_unknown();
-    /* Guard against unbounded recursion on deeply nested C++ templates.
-     * Prevents stack overflow and NULL-deref from unusual AST shapes. */
-    if (ctx->eval_depth > 256) {
+    /* Expression type evaluation is best-effort. Some recovery-mode C++ ASTs
+     * can repeatedly drive member/type lookup without increasing recursion
+     * depth. Keep a generous per-file work budget so pathological expressions
+     * degrade to unknown instead of hanging repository indexing. */
+    if (ctx->eval_depth > C_EVAL_DEPTH_LIMIT ||
+        ctx->eval_steps++ > C_EVAL_MAX_STEPS_PER_FILE) {
+        if (ctx->debug && ctx->eval_steps == C_EVAL_MAX_STEPS_PER_FILE + 2) {
+            fprintf(stderr, "  [clsp] expression eval step budget exhausted; returning unknown\n");
+        }
         return cbm_type_unknown();
     }
     ctx->eval_depth++;
