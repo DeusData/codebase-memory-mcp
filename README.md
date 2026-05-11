@@ -196,6 +196,26 @@ Commit a single compressed file to your repo and your teammates skip the reindex
 
 The result is similar in spirit to graphify's `graphify-out/` directory, but as a single compressed file with explicit two-tier export, integrity-checked import, and zero merge friction.
 
+## Publish to understand-quickly (opt-in)
+
+[`looptech-ai/understand-quickly`](https://github.com/looptech-ai/understand-quickly) is a public registry of code-knowledge graphs that ships its own MCP server. `scripts/uq-publish.py` calls the codebase-memory-mcp binary's existing MCP tools (no new C code, no rebuild needed), projects the result to a `gitnexus@1`-shaped JSON graph at `.codebase-memory/graph.json`, stamps `metadata.{tool, tool_version, generated_at, commit}`, and — when `UNDERSTAND_QUICKLY_TOKEN` is set — fires a `repository_dispatch` event so the registry resyncs the entry.
+
+```bash
+python3 scripts/uq-publish.py
+```
+
+Without the token, only the local file is written. The recommended CI step is the [`looptech-ai/uq-publish-action`](https://github.com/looptech-ai/uq-publish-action) Marketplace Action:
+
+```yaml
+- uses: looptech-ai/uq-publish-action@v0.1.0
+  with:
+    graph-path: '.codebase-memory/graph.json'
+    format: 'gitnexus@1'
+    token: ${{ secrets.UNDERSTAND_QUICKLY_TOKEN }}
+```
+
+Submitting via the publish path is governed by the [Understand-Quickly Data License 1.0](https://github.com/looptech-ai/understand-quickly/blob/main/DATA-LICENSE.md). It is opt-in and gated on the user explicitly setting the token.
+
 ## How It Works
 
 codebase-memory-mcp is a **structural analysis backend** — it builds and queries the knowledge graph. It does **not** include an LLM. Instead, it relies on your MCP client (Claude Code, or any MCP-compatible agent) to be the intelligence layer.
