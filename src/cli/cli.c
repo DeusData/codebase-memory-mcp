@@ -969,6 +969,55 @@ static bool dir_exists(const char *path) {
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+/* Resolve the Claude Code config dir.
+ * Honors $CLAUDE_CONFIG_DIR; falls back to "$home_dir/.claude". */
+static void cbm_claude_config_dir(const char *home_dir, char *out, size_t out_sz) {
+    if (out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    char env_buf[CLI_BUF_1K];
+    const char *env = cbm_safe_getenv("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
+    if (env && env[0]) {
+        snprintf(out, out_sz, "%s", env);
+    } else if (home_dir && home_dir[0]) {
+        snprintf(out, out_sz, "%s/.claude", home_dir);
+    }
+}
+
+/* Resolve the parent dir containing `.claude.json` (Claude Code's user config file).
+ * Honors $CLAUDE_CONFIG_DIR; falls back to "$home_dir". */
+static void cbm_claude_user_root(const char *home_dir, char *out, size_t out_sz) {
+    if (out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    char env_buf[CLI_BUF_1K];
+    const char *env = cbm_safe_getenv("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
+    if (env && env[0]) {
+        snprintf(out, out_sz, "%s", env);
+    } else if (home_dir && home_dir[0]) {
+        snprintf(out, out_sz, "%s", home_dir);
+    }
+}
+
+/* Build the hook command string written into Claude Code's settings.json.
+ * Honors $CLAUDE_CONFIG_DIR. When CLAUDE_CONFIG_DIR is unset, preserves the
+ * legacy tilde-expanded form so settings.json stays portable across HOME values. */
+static void cbm_resolve_hook_command(const char *script_name, char *out, size_t out_sz) {
+    if (out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    char env_buf[CLI_BUF_1K];
+    const char *env = cbm_safe_getenv("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
+    if (env && env[0]) {
+        snprintf(out, out_sz, "%s/hooks/%s", env, script_name);
+    } else {
+        snprintf(out, out_sz, "~/.claude/hooks/%s", script_name);
+    }
+}
+
 cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     cbm_detected_agents_t agents;
     memset(&agents, 0, sizeof(agents));
@@ -978,8 +1027,8 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
 
     char path[CLI_BUF_1K];
 
-    snprintf(path, sizeof(path), "%s/.claude", home_dir);
-    agents.claude_code = dir_exists(path);
+    cbm_claude_config_dir(home_dir, path, sizeof(path));
+    agents.claude_code = path[0] != '\0' && dir_exists(path);
 
     snprintf(path, sizeof(path), "%s/.codex", home_dir);
     agents.codex = dir_exists(path);
@@ -1463,7 +1512,7 @@ int cbm_remove_antigravity_mcp(const char *config_path) {
 /* ── Claude Code pre-tool hooks ───────────────────────────────── */
 
 #define CMM_HOOK_MATCHER "Grep|Glob|Read|Search"
-#define CMM_HOOK_COMMAND "~/.claude/hooks/cbm-code-discovery-gate"
+#define CMM_HOOK_GATE_SCRIPT "cbm-code-discovery-gate"
 
 /* Old matcher values from previous versions — recognized during upgrade so
  * upsert_hooks_json can remove them before inserting the current matcher. */
@@ -1630,8 +1679,10 @@ static int remove_hooks_json(hooks_remove_args_t args) {
 }
 
 int cbm_upsert_claude_hooks(const char *settings_path) {
+    char command[CLI_BUF_1K];
+    cbm_resolve_hook_command(CMM_HOOK_GATE_SCRIPT, command, sizeof(command));
     return upsert_hooks_json(
-        (hooks_upsert_args_t){settings_path, "PreToolUse", CMM_HOOK_MATCHER, CMM_HOOK_COMMAND});
+        (hooks_upsert_args_t){settings_path, "PreToolUse", CMM_HOOK_MATCHER, command});
 }
 
 int cbm_remove_claude_hooks(const char *settings_path) {
@@ -1646,12 +1697,17 @@ static void cbm_install_hook_gate_script(const char *home) {
     if (!home) {
         return;
     }
+    char config_dir[CLI_BUF_1K];
+    cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
+    if (!config_dir[0]) {
+        return;
+    }
     char hooks_dir[CLI_BUF_1K];
-    snprintf(hooks_dir, sizeof(hooks_dir), "%s/.claude/hooks", home);
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
     cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM);
 
     char script_path[CLI_BUF_1K];
-    snprintf(script_path, sizeof(script_path), "%s/cbm-code-discovery-gate", hooks_dir);
+    snprintf(script_path, sizeof(script_path), "%s/" CMM_HOOK_GATE_SCRIPT, hooks_dir);
 
     FILE *f = fopen(script_path, "w");
     if (!f) {
@@ -1684,18 +1740,23 @@ static void cbm_install_hook_gate_script(const char *home) {
 }
 
 /* SessionStart hook: remind agent to use MCP tools on every context reset. */
-#define CMM_SESSION_COMMAND "~/.claude/hooks/cbm-session-reminder"
+#define CMM_SESSION_REMINDER_SCRIPT "cbm-session-reminder"
 
 static void cbm_install_session_reminder_script(const char *home) {
     if (!home) {
         return;
     }
+    char config_dir[CLI_BUF_1K];
+    cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
+    if (!config_dir[0]) {
+        return;
+    }
     char hooks_dir[CLI_BUF_1K];
-    snprintf(hooks_dir, sizeof(hooks_dir), "%s/.claude/hooks", home);
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
     cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM);
 
     char script_path[CLI_BUF_1K];
-    snprintf(script_path, sizeof(script_path), "%s/cbm-session-reminder", hooks_dir);
+    snprintf(script_path, sizeof(script_path), "%s/" CMM_SESSION_REMINDER_SCRIPT, hooks_dir);
 
     FILE *f = fopen(script_path, "w");
     if (!f) {
@@ -1728,10 +1789,12 @@ static void cbm_install_session_reminder_script(const char *home) {
 
 static int cbm_upsert_session_hooks(const char *settings_path) {
     static const char *matchers[] = {"startup", "resume", "clear", "compact"};
+    char command[CLI_BUF_1K];
+    cbm_resolve_hook_command(CMM_SESSION_REMINDER_SCRIPT, command, sizeof(command));
     int rc = 0;
     for (int i = 0; i < NUM_DIRS; i++) {
-        if (upsert_hooks_json((hooks_upsert_args_t){settings_path, "SessionStart", matchers[i],
-                                                    CMM_SESSION_COMMAND}) != 0) {
+        if (upsert_hooks_json(
+                (hooks_upsert_args_t){settings_path, "SessionStart", matchers[i], command}) != 0) {
             rc = CLI_ERR;
         }
     }
@@ -2625,8 +2688,13 @@ static void print_detected_agents(const cbm_detected_agents_t *a) {
 /* Install Claude Code-specific configs (skills, MCP, hooks). */
 static void install_claude_code_config(const char *home, const char *binary_path, bool force,
                                        bool dry_run) {
+    char config_dir[CLI_BUF_1K];
+    cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
+    char user_root[CLI_BUF_1K];
+    cbm_claude_user_root(home, user_root, sizeof(user_root));
+
     char skills_dir[CLI_BUF_1K];
-    snprintf(skills_dir, sizeof(skills_dir), "%s/.claude/skills", home);
+    snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
     printf("Claude Code:\n");
 
     int skill_count = cbm_install_skills(skills_dir, force, dry_run);
@@ -2637,21 +2705,21 @@ static void install_claude_code_config(const char *home, const char *binary_path
     }
 
     char mcp_path[CLI_BUF_1K];
-    snprintf(mcp_path, sizeof(mcp_path), "%s/.claude/.mcp.json", home);
+    snprintf(mcp_path, sizeof(mcp_path), "%s/.mcp.json", config_dir);
     if (!dry_run) {
         cbm_install_editor_mcp(binary_path, mcp_path);
     }
     printf("  mcp: %s\n", mcp_path);
 
     char mcp_path2[CLI_BUF_1K];
-    snprintf(mcp_path2, sizeof(mcp_path2), "%s/.claude.json", home);
+    snprintf(mcp_path2, sizeof(mcp_path2), "%s/.claude.json", user_root);
     if (!dry_run) {
         cbm_install_editor_mcp(binary_path, mcp_path2);
     }
     printf("  mcp: %s\n", mcp_path2);
 
     char settings_path[CLI_BUF_1K];
-    snprintf(settings_path, sizeof(settings_path), "%s/.claude/settings.json", home);
+    snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
     if (!dry_run) {
         cbm_upsert_claude_hooks(settings_path);
         cbm_install_hook_gate_script(home);
@@ -2660,6 +2728,20 @@ static void install_claude_code_config(const char *home, const char *binary_path
     }
     printf("  hooks: PreToolUse (code discovery gate)\n");
     printf("  hooks: SessionStart (MCP usage reminder on startup/resume/clear/compact)\n");
+
+    /* Migration nudge: when CLAUDE_CONFIG_DIR is set and a legacy ~/.claude tree
+     * still exists, mention it so users can clean up stale artifacts. */
+    if (home && home[0]) {
+        char legacy_dir[CLI_BUF_1K];
+        snprintf(legacy_dir, sizeof(legacy_dir), "%s/.claude", home);
+        if (strcmp(legacy_dir, config_dir) != 0 && dir_exists(legacy_dir)) {
+            (void)fprintf(stderr,
+                          "  note: $CLAUDE_CONFIG_DIR=%s used; legacy %s still exists.\n"
+                          "        Remove stale {skills,hooks,settings.json,.mcp.json} there if "
+                          "no longer needed.\n",
+                          config_dir, legacy_dir);
+        }
+    }
 }
 
 /* Install MCP config + optional instructions for a generic agent. */
@@ -2945,26 +3027,31 @@ int cbm_cmd_install(int argc, char **argv) {
 
 /* Remove Claude Code agent configs. */
 static void uninstall_claude_code(const char *home, bool dry_run) {
+    char config_dir[CLI_BUF_1K];
+    cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
+    char user_root[CLI_BUF_1K];
+    cbm_claude_user_root(home, user_root, sizeof(user_root));
+
     char skills_dir[CLI_BUF_1K];
-    snprintf(skills_dir, sizeof(skills_dir), "%s/.claude/skills", home);
+    snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
     int removed = cbm_remove_skills(skills_dir, dry_run);
     printf("Claude Code: removed %d skill(s)\n", removed);
 
     char mcp_path[CLI_BUF_1K];
-    snprintf(mcp_path, sizeof(mcp_path), "%s/.claude/.mcp.json", home);
+    snprintf(mcp_path, sizeof(mcp_path), "%s/.mcp.json", config_dir);
     if (!dry_run) {
         cbm_remove_editor_mcp(mcp_path);
     }
     printf("  removed MCP config entry\n");
 
     char mcp_path2[CLI_BUF_1K];
-    snprintf(mcp_path2, sizeof(mcp_path2), "%s/.claude.json", home);
+    snprintf(mcp_path2, sizeof(mcp_path2), "%s/.claude.json", user_root);
     if (!dry_run) {
         cbm_remove_editor_mcp(mcp_path2);
     }
 
     char settings_path[CLI_BUF_1K];
-    snprintf(settings_path, sizeof(settings_path), "%s/.claude/settings.json", home);
+    snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
     if (!dry_run) {
         cbm_remove_claude_hooks(settings_path);
         cbm_remove_session_hooks(settings_path);

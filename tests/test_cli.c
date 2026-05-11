@@ -1388,9 +1388,48 @@ TEST(cli_detect_agents_finds_claude) {
     snprintf(dir, sizeof(dir), "%s/.claude", tmpdir);
     test_mkdirp(dir);
 
+    /* Unset CLAUDE_CONFIG_DIR so detection is exercised against home_dir/.claude. */
+    const char *saved_ccd = getenv("CLAUDE_CONFIG_DIR");
+    char *saved_ccd_copy = saved_ccd ? strdup(saved_ccd) : NULL;
+    cbm_unsetenv("CLAUDE_CONFIG_DIR");
+
     cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
     ASSERT_TRUE(agents.claude_code);
 
+    if (saved_ccd_copy) {
+        cbm_setenv("CLAUDE_CONFIG_DIR", saved_ccd_copy, 1);
+        free(saved_ccd_copy);
+    }
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_detect_agents_finds_claude_via_env) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-detect-env-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    /* Set CLAUDE_CONFIG_DIR to a path outside tmpdir/.claude.
+     * cbm_detect_agents must report claude_code based on the env-pointed dir,
+     * even when tmpdir/.claude does not exist. */
+    char ccd[512];
+    snprintf(ccd, sizeof(ccd), "%s/custom-claude", tmpdir);
+    test_mkdirp(ccd);
+
+    const char *saved_ccd = getenv("CLAUDE_CONFIG_DIR");
+    char *saved_ccd_copy = saved_ccd ? strdup(saved_ccd) : NULL;
+    cbm_setenv("CLAUDE_CONFIG_DIR", ccd, 1);
+
+    cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+    ASSERT_TRUE(agents.claude_code);
+
+    if (saved_ccd_copy) {
+        cbm_setenv("CLAUDE_CONFIG_DIR", saved_ccd_copy, 1);
+        free(saved_ccd_copy);
+    } else {
+        cbm_unsetenv("CLAUDE_CONFIG_DIR");
+    }
     test_rmdir_r(tmpdir);
     PASS();
 }
@@ -1481,8 +1520,8 @@ TEST(cli_detect_agents_finds_kilocode) {
     snprintf(dir, sizeof(dir),
              "%s/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code", tmpdir);
 #elif defined(_WIN32)
-    snprintf(dir, sizeof(dir),
-             "%s/AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code", tmpdir);
+    snprintf(dir, sizeof(dir), "%s/AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code",
+             tmpdir);
 #else
     snprintf(dir, sizeof(dir), "%s/.config/Code/User/globalStorage/kilocode.kilo-code", tmpdir);
 #endif
@@ -1520,7 +1559,13 @@ TEST(cli_detect_agents_none_found) {
 
     /* Empty home dir → no config dirs → no directory-based agents detected.
      * Note: opencode/aider may still be detected via system fallback paths
-     * (e.g. /usr/local/bin) so we only assert on directory-based agents. */
+     * (e.g. /usr/local/bin) so we only assert on directory-based agents.
+     * Also unset CLAUDE_CONFIG_DIR so the test runner's real env doesn't
+     * leak into agent detection. */
+    const char *saved_ccd = getenv("CLAUDE_CONFIG_DIR");
+    char *saved_ccd_copy = saved_ccd ? strdup(saved_ccd) : NULL;
+    cbm_unsetenv("CLAUDE_CONFIG_DIR");
+
     cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
     ASSERT_FALSE(agents.claude_code);
     ASSERT_FALSE(agents.codex);
@@ -1530,6 +1575,10 @@ TEST(cli_detect_agents_none_found) {
     ASSERT_FALSE(agents.kilocode);
     ASSERT_FALSE(agents.kiro);
 
+    if (saved_ccd_copy) {
+        cbm_setenv("CLAUDE_CONFIG_DIR", saved_ccd_copy, 1);
+        free(saved_ccd_copy);
+    }
     rmdir(tmpdir);
     PASS();
 }
@@ -2438,6 +2487,7 @@ SUITE(cli) {
 
     /* Agent detection (6 tests — group A) */
     RUN_TEST(cli_detect_agents_finds_claude);
+    RUN_TEST(cli_detect_agents_finds_claude_via_env);
     RUN_TEST(cli_detect_agents_finds_codex);
     RUN_TEST(cli_detect_agents_finds_gemini);
     RUN_TEST(cli_detect_agents_finds_zed);

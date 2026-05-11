@@ -209,13 +209,14 @@ build_from_source() {
 configure_claude() {
     echo ""
     local binary_path="${INSTALL_DIR}/${BINARY_NAME}"
-    local settings_file="$HOME/.claude/settings.json"
+    local claude_config_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    local settings_file="${claude_config_dir}/settings.json"
 
     printf "%s" "${BOLD}Configure Claude Code to use codebase-memory-mcp? [y/N] ${RESET}"
     read -r answer
     if [[ ! "$answer" =~ ^[Yy]$ ]]; then
         echo ""
-        info "Add this to your .mcp.json or ~/.claude/settings.json:"
+        info "Add this to your .mcp.json or ${claude_config_dir}/settings.json:"
         echo ""
         echo '  {'
         echo '    "mcpServers": {'

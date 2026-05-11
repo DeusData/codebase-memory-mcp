@@ -942,6 +942,154 @@ fi
 rm -rf "$FAKE_HOME" "$EMPTY_HOME"
 
 echo ""
+echo "=== Phase 9c: CLAUDE_CONFIG_DIR honored by install/uninstall ==="
+
+# Verify install/uninstall write to $CLAUDE_CONFIG_DIR (not $HOME/.claude)
+# when the env var is set. Mirrors Phase 8/9 but with CLAUDE_CONFIG_DIR
+# pointing at a non-default location.
+CCD_HOME=$(mktemp -d)
+CCD_DIR="$CCD_HOME/custom-claude"
+mkdir -p "$CCD_HOME/.local/bin"
+mkdir -p "$CCD_DIR"
+
+# A pre-existing $HOME/.claude must NOT receive new writes from this install,
+# but it must still be detected so the migration nudge can fire.
+mkdir -p "$CCD_HOME/.claude"
+
+if [[ "$BINARY" == *.exe ]]; then
+  cp "$BINARY" "$CCD_HOME/.local/bin/codebase-memory-mcp.exe"
+  CCD_SELF="$CCD_HOME/.local/bin/codebase-memory-mcp.exe"
+else
+  cp "$BINARY" "$CCD_HOME/.local/bin/codebase-memory-mcp"
+  CCD_SELF="$CCD_HOME/.local/bin/codebase-memory-mcp"
+fi
+
+CCD_INSTALL_OUT=$(HOME="$CCD_HOME" \
+  CLAUDE_CONFIG_DIR="$CCD_DIR" \
+  XDG_CONFIG_HOME="$CCD_HOME/.config" \
+  PATH="$CCD_HOME/.local/bin:$PATH" \
+  "$BINARY" install -y 2>&1 || true)
+
+# 9c-1: skills landed in $CLAUDE_CONFIG_DIR/skills, not $HOME/.claude/skills
+if [ ! -s "$CCD_DIR/skills/codebase-memory/SKILL.md" ]; then
+  echo "FAIL 9c-1: SKILL.md missing from \$CLAUDE_CONFIG_DIR/skills"
+  echo "$CCD_INSTALL_OUT" | head -30
+  exit 1
+fi
+if [ -e "$CCD_HOME/.claude/skills/codebase-memory/SKILL.md" ]; then
+  echo "FAIL 9c-1b: install wrote SKILL.md to \$HOME/.claude/skills (should have been \$CLAUDE_CONFIG_DIR)"
+  exit 1
+fi
+echo "OK 9c-1: skills under \$CLAUDE_CONFIG_DIR (not \$HOME/.claude)"
+
+# 9c-2: settings.json landed in $CLAUDE_CONFIG_DIR
+if [ ! -f "$CCD_DIR/settings.json" ]; then
+  echo "FAIL 9c-2: settings.json missing from \$CLAUDE_CONFIG_DIR"
+  exit 1
+fi
+if [ -f "$CCD_HOME/.claude/settings.json" ]; then
+  echo "FAIL 9c-2b: install wrote settings.json to \$HOME/.claude (should have been \$CLAUDE_CONFIG_DIR)"
+  exit 1
+fi
+echo "OK 9c-2: settings.json under \$CLAUDE_CONFIG_DIR"
+
+# 9c-3: .mcp.json landed in $CLAUDE_CONFIG_DIR
+CMD=$(json_get "$CCD_DIR/.mcp.json" "d['mcpServers']['codebase-memory-mcp']['command']")
+if ! path_match "$CMD" "$CCD_SELF"; then
+  echo "FAIL 9c-3: \$CLAUDE_CONFIG_DIR/.mcp.json command='$CMD'"
+  exit 1
+fi
+echo "OK 9c-3: .mcp.json under \$CLAUDE_CONFIG_DIR"
+
+# 9c-4: .claude.json landed alongside $CLAUDE_CONFIG_DIR (Claude Code's user config)
+CMD=$(json_get "$CCD_DIR/.claude.json" "d.get('mcpServers',{}).get('codebase-memory-mcp',{}).get('command','')")
+if [ -z "$CMD" ] || ! path_match "$CMD" "$CCD_SELF"; then
+  echo "FAIL 9c-4: \$CLAUDE_CONFIG_DIR/.claude.json command='$CMD'"
+  exit 1
+fi
+if [ -f "$CCD_HOME/.claude.json" ]; then
+  echo "FAIL 9c-4b: install wrote .claude.json to \$HOME (should have been \$CLAUDE_CONFIG_DIR)"
+  exit 1
+fi
+echo "OK 9c-4: .claude.json under \$CLAUDE_CONFIG_DIR"
+
+# 9c-5: hook gate script landed in $CLAUDE_CONFIG_DIR/hooks
+if [ "$(uname -s)" != "MINGW64_NT" ] 2>/dev/null; then
+  if [ ! -x "$CCD_DIR/hooks/cbm-code-discovery-gate" ]; then
+    echo "FAIL 9c-5: gate script missing or not executable in \$CLAUDE_CONFIG_DIR/hooks"
+    exit 1
+  fi
+  if [ -e "$CCD_HOME/.claude/hooks/cbm-code-discovery-gate" ]; then
+    echo "FAIL 9c-5b: install wrote gate script to \$HOME/.claude/hooks"
+    exit 1
+  fi
+  echo "OK 9c-5: gate script under \$CLAUDE_CONFIG_DIR/hooks"
+fi
+
+# 9c-6: hook command in settings.json points at $CLAUDE_CONFIG_DIR (not ~)
+HOOK_CMD=$(json_get "$CCD_DIR/settings.json" \
+  "d.get('hooks',{}).get('PreToolUse',[{}])[0].get('hooks',[{}])[0].get('command','')")
+case "$HOOK_CMD" in
+  "$CCD_DIR/hooks/cbm-code-discovery-gate") echo "OK 9c-6: settings.json hook command points at \$CLAUDE_CONFIG_DIR" ;;
+  "~/.claude/hooks/"*)
+    echo "FAIL 9c-6: settings.json still has tilde-form command='$HOOK_CMD' under \$CLAUDE_CONFIG_DIR"
+    exit 1
+    ;;
+  *)
+    echo "FAIL 9c-6: unexpected hook command='$HOOK_CMD'"
+    exit 1
+    ;;
+esac
+
+# 9c-7: migration nudge fires (legacy ~/.claude exists, $CLAUDE_CONFIG_DIR differs)
+if ! echo "$CCD_INSTALL_OUT" | grep -q 'CLAUDE_CONFIG_DIR'; then
+  echo "FAIL 9c-7: migration nudge missing from install output"
+  exit 1
+fi
+echo "OK 9c-7: migration nudge surfaced legacy \$HOME/.claude"
+
+# 9c-8: uninstall removes from $CLAUDE_CONFIG_DIR
+HOME="$CCD_HOME" \
+  CLAUDE_CONFIG_DIR="$CCD_DIR" \
+  XDG_CONFIG_HOME="$CCD_HOME/.config" \
+  PATH="$CCD_HOME/.local/bin:$PATH" \
+  "$BINARY" uninstall -y -n 2>&1 >/dev/null || true
+
+if [ -d "$CCD_DIR/skills/codebase-memory" ]; then
+  echo "FAIL 9c-8: uninstall left skill behind in \$CLAUDE_CONFIG_DIR"
+  exit 1
+fi
+echo "OK 9c-8: uninstall removed skill from \$CLAUDE_CONFIG_DIR"
+
+# 9c-9: uninstall does NOT touch the legacy $HOME/.claude (it stays as we found it)
+if [ ! -d "$CCD_HOME/.claude" ]; then
+  echo "FAIL 9c-9: uninstall removed pre-existing \$HOME/.claude (must leave it alone)"
+  exit 1
+fi
+echo "OK 9c-9: uninstall left legacy \$HOME/.claude alone"
+
+# 9c-10: with CLAUDE_CONFIG_DIR unset, the legacy tilde-form is preserved in settings.json
+LEGACY_HOME=$(mktemp -d)
+mkdir -p "$LEGACY_HOME/.local/bin" "$LEGACY_HOME/.claude"
+cp "$BINARY" "$LEGACY_HOME/.local/bin/codebase-memory-mcp"
+HOME="$LEGACY_HOME" \
+  XDG_CONFIG_HOME="$LEGACY_HOME/.config" \
+  PATH="$LEGACY_HOME/.local/bin:$PATH" \
+  "$BINARY" install -y 2>&1 >/dev/null || true
+LEGACY_HOOK_CMD=$(json_get "$LEGACY_HOME/.claude/settings.json" \
+  "d.get('hooks',{}).get('PreToolUse',[{}])[0].get('hooks',[{}])[0].get('command','')")
+case "$LEGACY_HOOK_CMD" in
+  "~/.claude/hooks/cbm-code-discovery-gate") echo "OK 9c-10: legacy default preserves ~/.claude/hooks/... in settings.json" ;;
+  *)
+    echo "FAIL 9c-10: legacy default lost tilde-form, command='$LEGACY_HOOK_CMD'"
+    exit 1
+    ;;
+esac
+rm -rf "$LEGACY_HOME"
+
+rm -rf "$CCD_HOME"
+
+echo ""
 echo "=== Phase 10: binary security E2E ==="
 
 SECURITY_DIR=$(mktemp -d)
