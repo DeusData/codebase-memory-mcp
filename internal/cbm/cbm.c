@@ -32,7 +32,9 @@ static _Atomic uint64_t total_files = 0;
 /* Use compat.h's cbm_clock_gettime which accepts CLOCK_MONOTONIC (value
  * varies by platform: 1 on Linux/Windows, 6 on macOS). We pass the
  * platform value via the compat.h fallback. */
-#ifdef __APPLE__
+#if defined(CLOCK_MONOTONIC)
+#define CBM_CLOCK_MONO CLOCK_MONOTONIC
+#elif defined(__APPLE__)
 #define CBM_CLOCK_MONO 6
 #else
 #define CBM_CLOCK_MONO 1
