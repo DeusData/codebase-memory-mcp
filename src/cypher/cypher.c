@@ -742,11 +742,19 @@ static void expr_free(cbm_expr_t *e) {
             }
             free(cur->cond.in_values);
         }
-        if (cur->right && top < EXPR_FREE_STACK) {
-            stack[top++] = cur->right;
+        if (cur->right) {
+            if (top < EXPR_FREE_STACK) {
+                stack[top++] = cur->right;
+            } else {
+                expr_free(cur->right); /* recurse when stack overflows */
+            }
         }
-        if (cur->left && top < EXPR_FREE_STACK) {
-            stack[top++] = cur->left;
+        if (cur->left) {
+            if (top < EXPR_FREE_STACK) {
+                stack[top++] = cur->left;
+            } else {
+                expr_free(cur->left); /* recurse when stack overflows */
+            }
         }
         free(cur);
     }

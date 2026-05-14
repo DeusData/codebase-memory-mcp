@@ -57,6 +57,12 @@ char **cbm_str_split(CBMArena *a, const char *s, char delim, int *out_count);
  * Returns true if safe, false if the string contains shell metacharacters. */
 bool cbm_validate_shell_arg(const char *s);
 
+/* Validate a project name is safe for file path construction.
+ * Allows: alphanumeric, dash, underscore, dot (but not leading dot or dot-dot).
+ * Rejects: path separators (/ \), directory traversal (..), and control chars.
+ * Returns true if safe, false if the name could escape the cache directory. */
+bool cbm_validate_project_name(const char *name);
+
 /* Safe snprintf append: clamps offset to prevent buffer overflow on truncation.
  * When snprintf truncates, it returns what it WOULD have written, which can make
  * offset > bufsize. Next call: bufsize - offset wraps unsigned → huge → overflow.

@@ -20,6 +20,7 @@
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
+#include "foundation/str_util.h"
 #include "foundation/compat_thread.h"
 
 #include <mongoose/mongoose.h>
@@ -126,6 +127,10 @@ static bool get_query_param(struct mg_str query, const char *name, char *buf, in
 
 /* Build DB path for a project: <cache_dir>/<project>.db */
 static void db_path_for_project(const char *project, char *buf, size_t bufsz) {
+    if (!cbm_validate_project_name(project)) {
+        buf[0] = '\0';
+        return;
+    }
     const char *dir = cbm_resolve_cache_dir();
     if (!dir) {
         dir = cbm_tmpdir();
@@ -444,7 +449,12 @@ static void handle_browse(struct mg_connection *c, struct mg_http_message *hm) {
 
         if (count > 0)
             buf[pos++] = ',';
-        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "\"%s\"", ent->d_name);
+        /* Escape directory name to prevent XSS (e.g., names with quotes/angle brackets) */
+        {
+            char esc[512];
+            cbm_json_escape(esc, (int)sizeof(esc), ent->d_name);
+            pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "\"%s\"", esc);
+        }
         if (pos >= (int)sizeof(buf)) {
             pos = (int)sizeof(buf) - 1;
         }
@@ -455,7 +465,7 @@ static void handle_browse(struct mg_connection *c, struct mg_http_message *hm) {
     }
     closedir(dir);
 
-    /* Parent path */
+    /* Parent path — escape to prevent injection */
     char parent[1024];
     snprintf(parent, sizeof(parent), "%s", path);
     char *last_slash = strrchr(parent, '/');
@@ -464,7 +474,11 @@ static void handle_browse(struct mg_connection *c, struct mg_http_message *hm) {
     else
         snprintf(parent, sizeof(parent), "/");
 
-    pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "],\"parent\":\"%s\"}", parent);
+    {
+        char esc_parent[2048];
+        cbm_json_escape(esc_parent, (int)sizeof(esc_parent), parent);
+        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "],\"parent\":\"%s\"}", esc_parent);
+    }
     mg_http_reply(c, 200, g_cors_json, "%s", buf);
 }
 
