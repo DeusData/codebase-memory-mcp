@@ -4294,6 +4294,8 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         start_update_check(srv);
         detect_session(srv);
         maybe_auto_index(srv);
+    } else if (strcmp(req.method, "ping") == 0) {
+        result_json = heap_strdup("{}");
     } else if (strcmp(req.method, "tools/list") == 0) {
         result_json = cbm_mcp_tools_list();
     } else if (strcmp(req.method, "tools/call") == 0) {
