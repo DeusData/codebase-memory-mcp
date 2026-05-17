@@ -515,15 +515,31 @@ static TSNode resolve_r_func_name(TSNode node) {
 // Forward declaration for mutual recursion.
 static TSNode resolve_func_name(TSNode node, CBMLanguage lang);
 
+static bool is_cpp_template_inner_kind(const char *kind) {
+    return strcmp(kind, "function_definition") == 0 || strcmp(kind, "declaration") == 0 ||
+           strcmp(kind, "field_declaration") == 0;
+}
+
 // C++/CUDA: find inner function/declaration inside template_declaration.
 // Returns the inner node (not the resolved name) to break the recursive cycle.
-static TSNode resolve_template_inner_node(TSNode node) {
+static TSNode find_cpp_template_inner_node(TSNode node, CBMLanguage lang) {
+    if ((lang != CBM_LANG_CPP && lang != CBM_LANG_CUDA) ||
+        strcmp(ts_node_type(node), "template_declaration") != 0) {
+        return node;
+    }
+
     uint32_t nc = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < nc; i++) {
         TSNode ch = ts_node_named_child(node, i);
         const char *ck = ts_node_type(ch);
-        if (strcmp(ck, "function_definition") == 0 || strcmp(ck, "declaration") == 0) {
+        if (is_cpp_template_inner_kind(ck)) {
             return ch;
+        }
+        if (strcmp(ck, "template_declaration") == 0) {
+            TSNode nested = find_cpp_template_inner_node(ch, lang);
+            if (!ts_node_is_null(nested) && !ts_node_eq(nested, ch)) {
+                return nested;
+            }
         }
     }
     TSNode null_node = {0};
@@ -548,7 +564,7 @@ static TSNode resolve_toplevel_arrow_name(TSNode node, const char *kind) {
 static TSNode resolve_func_name_c_family(TSNode *node_ptr, CBMLanguage lang, const char *kind) {
     if ((lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) &&
         strcmp(kind, "template_declaration") == 0) {
-        TSNode inner = resolve_template_inner_node(*node_ptr);
+        TSNode inner = find_cpp_template_inner_node(*node_ptr, lang);
         if (!ts_node_is_null(inner)) {
             *node_ptr = inner; /* signal caller to retry */
         }
@@ -1588,16 +1604,9 @@ static const char **extract_param_types(CBMArena *a, TSNode params, const char *
 
 // For C++/CUDA template_declaration, find the inner function_definition or declaration.
 static TSNode unwrap_template_inner(TSNode node, CBMLanguage lang) {
-    if ((lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) &&
-        strcmp(ts_node_type(node), "template_declaration") == 0) {
-        uint32_t nc = ts_node_named_child_count(node);
-        for (uint32_t i = 0; i < nc; i++) {
-            TSNode ch = ts_node_named_child(node, i);
-            const char *ck = ts_node_type(ch);
-            if (strcmp(ck, "function_definition") == 0 || strcmp(ck, "declaration") == 0) {
-                return ch;
-            }
-        }
+    TSNode inner = find_cpp_template_inner_node(node, lang);
+    if (!ts_node_is_null(inner)) {
+        return inner;
     }
     return node;
 }

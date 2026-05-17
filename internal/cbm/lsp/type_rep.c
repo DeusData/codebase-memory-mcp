@@ -666,7 +666,7 @@ const CBMType* cbm_type_substitute(CBMArena* a, const CBMType* t,
     case CBM_TYPE_TYPE_PARAM: {
         for (int i = 0; type_params[i]; i++) {
             if (strcmp(t->data.type_param.name, type_params[i]) == 0) {
-                return type_args[i];
+                return type_args[i] ? type_args[i] : t;
             }
         }
         return t; // unmatched param stays as-is
@@ -682,7 +682,7 @@ const CBMType* cbm_type_substitute(CBMArena* a, const CBMType* t,
             for (int i = 0; type_params[i]; i++) {
                 if (strcmp(qn, type_params[i]) == 0 ||
                     strcmp(short_name, type_params[i]) == 0) {
-                    return type_args[i];
+                    return type_args[i] ? type_args[i] : t;
                 }
             }
         }

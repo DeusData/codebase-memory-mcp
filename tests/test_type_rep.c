@@ -230,6 +230,20 @@ TEST(typerep_callable_equality) {
     PASS();
 }
 
+/* ── SUBSTITUTION ──────────────────────────────────────────────── */
+
+TEST(typerep_substitute_unbound_param_preserved) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    const CBMType *t = cbm_type_type_param(&a, "T");
+    const char *params[] = {"T", NULL};
+    const CBMType *args[] = {NULL, NULL};
+    const CBMType *sub = cbm_type_substitute(&a, t, params, args);
+    ASSERT(sub == t);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(type_rep) {
@@ -254,4 +268,6 @@ SUITE(type_rep) {
     RUN_TEST(typerep_callable_with_args_and_return);
     RUN_TEST(typerep_callable_elliptic_arity_minus_one);
     RUN_TEST(typerep_callable_equality);
+    /* SUBSTITUTION */
+    RUN_TEST(typerep_substitute_unbound_param_preserved);
 }

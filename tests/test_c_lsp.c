@@ -540,6 +540,25 @@ TEST(clsp_nocrash_template_expression) {
     PASS();
 }
 
+TEST(clsp_nocrash_template_function_multi_param_nested_call) {
+    CBMFileResult *r = extract_cpp("\n"
+                                   "void right_aligned_text(int color, int width, const char* fmt, float value) {}\n"
+                                   "\n"
+                                   "template<typename T, typename R = float>\n"
+                                   "R format_units(T value, const char*& unit) { return value; }\n"
+                                   "\n"
+                                   "void f() {\n"
+                                   "    const char* unit = nullptr;\n"
+                                   "    right_aligned_text(0, 0, \"%.1f\", format_units(1, unit));\n"
+                                   "}\n"
+                                   "");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_resolved(r, "f", "right_aligned_text"), 0);
+    ASSERT_GTE(find_resolved(r, "f", "format_units"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(clsp_nocrash_lambda) {
     CBMFileResult *r = extract_cpp("\n"
                                    "void test() {\n"
@@ -15101,6 +15120,7 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_operator_stream);
     RUN_TEST(clsp_cross_file);
     RUN_TEST(clsp_nocrash_template_expression);
+    RUN_TEST(clsp_nocrash_template_function_multi_param_nested_call);
     RUN_TEST(clsp_nocrash_lambda);
     RUN_TEST(clsp_nocrash_nested_namespace);
     RUN_TEST(clsp_nocrash_empty_source);
