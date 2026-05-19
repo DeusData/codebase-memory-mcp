@@ -10,9 +10,11 @@
  */
 #include "foundation/constants.h"
 
-enum { DEFAULT_CORES = 1, MIN_WORKERS = 1 };
+enum { DEFAULT_CORES = 1, MIN_WORKERS = 1, CBM_WORKERS_MAX = 256 };
+#include "foundation/log.h"
 #include "foundation/platform.h"
 #include <stdint.h> // uint64_t
+#include <stdlib.h> // strtol
 #include <string.h>
 
 #ifdef _WIN32
@@ -168,6 +170,21 @@ cbm_system_info_t cbm_system_info(void) {
 }
 
 int cbm_default_worker_count(bool initial) {
+    /* CBM_WORKERS env override (clamped to [1, CBM_WORKERS_MAX]).
+     * Useful inside containers where sysconf(_SC_NPROCESSORS_ONLN)
+     * reports host CPUs rather than the cgroup's effective CPU quota.
+     * Same precedence shape as other CBM_* env overrides:
+     * explicit override > implicit detection. */
+    char buf[CBM_SZ_32];
+    if (cbm_safe_getenv("CBM_WORKERS", buf, sizeof(buf), NULL) != NULL) {
+        long n = strtol(buf, NULL, CBM_DECIMAL_BASE);
+        if (n >= MIN_WORKERS && n <= CBM_WORKERS_MAX) {
+            return (int)n;
+        }
+        cbm_log_warn("workers.env.invalid", "value", buf,
+                     "fallback", "sysconf");
+    }
+
     cbm_system_info_t info = cbm_system_info();
     if (initial) {
         /* Use all cores for initial indexing — user is waiting */
