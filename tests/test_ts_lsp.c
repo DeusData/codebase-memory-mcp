@@ -687,6 +687,28 @@ TEST(tslsp_nocrash_megasource) {
     PASS();
 }
 
+TEST(tslsp_nocrash_crossfile_multi_return_call) {
+    const char *src = "function go() { const value = pair(); }\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+
+    CBMLSPDef defs[1];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.main.pair";
+    defs[0].short_name = "pair";
+    defs[0].label = "Function";
+    defs[0].def_module_qn = "test.main";
+    defs[0].return_types = "Box|number";
+
+    CBMResolvedCallArray out = {0};
+    cbm_run_ts_lsp_cross(&arena, src, (int)strlen(src), "test.main",
+                         false, false, false,
+                         defs, 1, NULL, NULL, 0, NULL, &out);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── Category 11: generics (deeper) ─────────────────────────────────────────── */
 
 TEST(tslsp_generic_identity_inference) {
@@ -4013,6 +4035,7 @@ SUITE(ts_lsp) {
     RUN_TEST(tslsp_nocrash_eval_value);
     RUN_TEST(tslsp_nocrash_using_decl);
     RUN_TEST(tslsp_nocrash_megasource);
+    RUN_TEST(tslsp_nocrash_crossfile_multi_return_call);
 
     /* Category 11: generics deeper */
     RUN_TEST(tslsp_generic_identity_inference);

@@ -1318,13 +1318,14 @@ static const CBMRegisteredFunc* lookup_method(TSLSPContext* ctx, const CBMType* 
 
 // Pull the underlying return type out of a FUNC signature, collapsing single-element
 // return arrays to that element.
-static const CBMType* return_type_of(const CBMType* sig) {
+static const CBMType* return_type_of(CBMArena* arena, const CBMType* sig) {
     if (!sig || sig->kind != CBM_TYPE_FUNC) return cbm_type_unknown();
     if (!sig->data.func.return_types || !sig->data.func.return_types[0]) return cbm_type_unknown();
     if (!sig->data.func.return_types[1]) return sig->data.func.return_types[0];
+    if (!arena) return cbm_type_unknown();
     int count = 0;
     while (sig->data.func.return_types[count]) count++;
-    return cbm_type_tuple(NULL, sig->data.func.return_types, count);
+    return cbm_type_tuple(arena, sig->data.func.return_types, count);
 }
 
 const CBMType* ts_eval_expr_type(TSLSPContext* ctx, TSNode node) {
@@ -1409,7 +1410,7 @@ const CBMType* ts_eval_expr_type(TSLSPContext* ctx, TSNode node) {
                         ts_node_type(fn), fn_type ? (int)fn_type->kind : -1);
             }
             if (fn_type && fn_type->kind == CBM_TYPE_FUNC) {
-                result = return_type_of(fn_type);
+                result = return_type_of(ctx->arena, fn_type);
 
                 // Polymorphic `this` return type: when the registered signature uses
                 // `this` (TYPE_PARAM "this"), substitute the actual receiver type
