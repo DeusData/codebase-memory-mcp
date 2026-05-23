@@ -554,6 +554,11 @@ static void merge_pkg_entries(cbm_pipeline_ctx_t *ctx, cbm_pkg_entries_t *pkg_en
     if (!pkg_entries) {
         return;
     }
+    /* Supplement with a repo-wide filesystem walk so manifests filtered
+     * by the main discoverer (package.json, composer.json — in
+     * IGNORED_JSON_FILES) still feed pkgmap. Append into worker 0's
+     * array so the existing merge below sees them. */
+    cbm_pkgmap_scan_repo(ctx->repo_path, &pkg_entries[0]);
     cbm_pipeline_set_pkgmap(cbm_pkgmap_build(pkg_entries, worker_count, ctx->project_name));
     for (int i = 0; i < worker_count; i++) {
         cbm_pkg_entries_free(&pkg_entries[i]);

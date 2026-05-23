@@ -89,6 +89,9 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
                                const char *project_name);
 
 /* Build pkgmap by reading manifest files from the files array (sequential path). */
+int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries);
+CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
+                                         int file_count, const char *project_name);
 CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file_count,
                                           const char *project_name);
 

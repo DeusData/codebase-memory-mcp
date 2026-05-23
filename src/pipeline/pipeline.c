@@ -491,9 +491,12 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                    struct timespec *t) {
     cbm_log_info("pipeline.mode", "mode", "sequential", "files", itoa_buf(file_count));
 
-    /* Build package map from manifest files (sequential: read manifests directly) */
-    /* Build package map from manifest files (sequential: read manifests directly) */
-    cbm_pipeline_set_pkgmap(cbm_pkgmap_build_from_files(files, file_count, ctx->project_name));
+    /* Build package map from manifest files (sequential: read manifests directly).
+     * Use the repo-walking variant so manifests filtered out by the main
+     * discoverer (package.json, composer.json) still feed pkgmap and let
+     * workspace imports like `@my/pkg` resolve to their target Module. */
+    cbm_pipeline_set_pkgmap(
+        cbm_pkgmap_build_from_repo(ctx->repo_path, files, file_count, ctx->project_name));
 
     CBMFileResult **seq_cache = (CBMFileResult **)calloc(file_count, sizeof(CBMFileResult *));
     if (seq_cache) {
@@ -574,9 +577,16 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     }
     /* Cross-file LSP: augments per-file resolved_calls with cross-file
      * type-aware resolutions before parallel_resolve emits CALLS edges.
-     * Soft-failures only — log and continue. */
+     * Soft-failures only — log and continue.
+     * NOTE: CBM_DISABLE_LSP_CROSS=1 env opts out of the cross-file LSP
+     * (which can SIGSEGV on large TS projects — separate upstream bug,
+     * unrelated to pkgmap / SvelteKit fixes). */
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
-    (void)cbm_pipeline_pass_lsp_cross(ctx, files, file_count, cache);
+    if (getenv("CBM_DISABLE_LSP_CROSS") == NULL) {
+        (void)cbm_pipeline_pass_lsp_cross(ctx, files, file_count, cache);
+    } else {
+        cbm_log_info("lsp_cross.skipped", "reason", "CBM_DISABLE_LSP_CROSS env set");
+    }
     cbm_log_info("pass.timing", "pass", "lsp_cross", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     cbm_clock_gettime(CLOCK_MONOTONIC, t);

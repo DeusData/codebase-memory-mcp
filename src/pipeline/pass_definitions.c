@@ -333,6 +333,21 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     int total_imports = 0;
     int errors = 0;
 
+    /* Sequential pass must extract all defs (which create Module/Function/...
+     * nodes) BEFORE resolving imports — otherwise a workspace import in the
+     * first file processed can't find the target Module node, because the
+     * target file's defs haven't been extracted yet. Result cache is
+     * required for this two-phase ordering. */
+    CBMFileResult **local_cache = ctx->result_cache;
+    bool owns_local_cache = false;
+    if (!local_cache) {
+        local_cache = (CBMFileResult **)calloc((size_t)file_count, sizeof(CBMFileResult *));
+        owns_local_cache = (local_cache != NULL);
+    }
+
+    /* Phase 1: extract every file and create def-derived nodes (Modules,
+     * Functions, ...) so any file's IMPORTS can resolve against the
+     * complete in-memory graph in Phase 2. */
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
             return CBM_NOT_FOUND;
@@ -371,14 +386,42 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         /* Store calls for pass_calls (we save them in the extraction results
          * for now — a future optimization would batch these) */
         total_calls += result->calls.count;
-        total_imports += create_import_edges_for_file(ctx, result, rel);
-        create_channel_edges_for_file(ctx, result, rel);
 
-        /* Cache or free the extraction result */
-        if (ctx->result_cache) {
-            ctx->result_cache[i] = result;
+        if (local_cache) {
+            local_cache[i] = result;
         } else {
+            /* Cache unavailable: imports for this file can still only
+             * resolve to defs already in the graph, but the file's
+             * own defs are now persisted before the lookup. */
+            total_imports += create_import_edges_for_file(ctx, result, rel);
+            create_channel_edges_for_file(ctx, result, rel);
             cbm_free_result(result);
+        }
+    }
+
+    /* Phase 2: now that all extraction results are cached and Module
+     * nodes for every file are in the graph, walk the cache again to
+     * create IMPORTS / channel edges. Imports resolve against the full
+     * project graph. */
+    if (local_cache) {
+        for (int i = 0; i < file_count; i++) {
+            if (cbm_pipeline_check_cancel(ctx)) {
+                break;
+            }
+            CBMFileResult *result = local_cache[i];
+            if (!result) {
+                continue;
+            }
+            total_imports += create_import_edges_for_file(ctx, result, files[i].rel_path);
+            create_channel_edges_for_file(ctx, result, files[i].rel_path);
+        }
+        if (owns_local_cache) {
+            for (int i = 0; i < file_count; i++) {
+                if (local_cache[i]) {
+                    cbm_free_result(local_cache[i]);
+                }
+            }
+            free(local_cache);
         }
     }
 
