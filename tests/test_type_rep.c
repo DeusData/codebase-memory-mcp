@@ -230,6 +230,34 @@ TEST(typerep_callable_equality) {
     PASS();
 }
 
+TEST(typerep_substitute_missing_arg_keeps_type_param) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    const CBMType *param = cbm_type_type_param(&a, "U");
+    const char *params[] = {"T", "U", NULL};
+    const CBMType *args[] = {cbm_type_builtin(&a, "int"), NULL};
+    const CBMType *subst = cbm_type_substitute(&a, param, params, args);
+    ASSERT_NOT_NULL(subst);
+    ASSERT_EQ(subst->kind, CBM_TYPE_TYPE_PARAM);
+    ASSERT_STR_EQ(subst->data.type_param.name, "U");
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(typerep_substitute_missing_arg_keeps_named_param) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    const CBMType *named = cbm_type_named(&a, "test.main.U");
+    const char *params[] = {"T", "U", NULL};
+    const CBMType *args[] = {cbm_type_builtin(&a, "int"), NULL};
+    const CBMType *subst = cbm_type_substitute(&a, named, params, args);
+    ASSERT_NOT_NULL(subst);
+    ASSERT_EQ(subst->kind, CBM_TYPE_NAMED);
+    ASSERT_STR_EQ(subst->data.named.qualified_name, "test.main.U");
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(type_rep) {
@@ -254,4 +282,6 @@ SUITE(type_rep) {
     RUN_TEST(typerep_callable_with_args_and_return);
     RUN_TEST(typerep_callable_elliptic_arity_minus_one);
     RUN_TEST(typerep_callable_equality);
+    RUN_TEST(typerep_substitute_missing_arg_keeps_type_param);
+    RUN_TEST(typerep_substitute_missing_arg_keeps_named_param);
 }

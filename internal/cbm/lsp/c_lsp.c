@@ -4,6 +4,37 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <time.h>
+
+#define CLSP_DEFAULT_BUDGET_MS 500
+#define CLSP_NSEC_PER_MSEC 1000000ULL
+#define CLSP_CHECK_INTERVAL_MASK 1023
+
+static uint64_t c_lsp_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec * 1000000000ULL) + (uint64_t)ts.tv_nsec;
+}
+
+static int c_lsp_budget_ms(void) {
+    const char *env = getenv("CBM_C_LSP_BUDGET_MS");
+    if (!env || !env[0]) return CLSP_DEFAULT_BUDGET_MS;
+    char *end = NULL;
+    long v = strtol(env, &end, 10);
+    if (end == env || v < 0 || v > 60000) return CLSP_DEFAULT_BUDGET_MS;
+    return (int)v;
+}
+
+static bool c_lsp_should_abort(CLSPContext *ctx) {
+    if (!ctx) return true;
+    if (ctx->timed_out) return true;
+    if (!ctx->deadline_ns) return false;
+    ctx->visit_count++;
+    if ((ctx->visit_count & CLSP_CHECK_INTERVAL_MASK) != 0) return false;
+    if (c_lsp_now_ns() <= ctx->deadline_ns) return false;
+    ctx->timed_out = true;
+    return true;
+}
 
 /* Safe kind accessor — returns CBM_TYPE_UNKNOWN for NULL types.
  * Prevents SEGV in c_eval_expr_type_inner on unusual C++ AST shapes. */
@@ -51,6 +82,19 @@ static char* c_node_text(CLSPContext* ctx, TSNode node) {
     return cbm_node_text(ctx->arena, node, ctx->source);
 }
 
+static bool c_has_module_prefix(CLSPContext* ctx, const char* qn) {
+    if (!ctx || !ctx->module_qn || !ctx->module_qn[0] || !qn) return false;
+    size_t ml = strlen(ctx->module_qn);
+    return strncmp(qn, ctx->module_qn, ml) == 0 && qn[ml] == '.';
+}
+
+static const char* c_module_prefixed_qn(CLSPContext* ctx, const char* qn) {
+    if (!ctx || !ctx->module_qn || !ctx->module_qn[0] || !qn || c_has_module_prefix(ctx, qn)) {
+        return qn;
+    }
+    return cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, qn);
+}
+
 // --- Initialization ---
 
 void c_lsp_init(CLSPContext* ctx, CBMArena* arena, const char* source, int source_len,
@@ -68,6 +112,11 @@ void c_lsp_init(CLSPContext* ctx, CBMArena* arena, const char* source, int sourc
 
     const char* debug_env = getenv("CBM_LSP_DEBUG");
     ctx->debug = (debug_env && debug_env[0]);
+
+    int budget_ms = c_lsp_budget_ms();
+    ctx->deadline_ns = budget_ms > 0
+                           ? c_lsp_now_ns() + ((uint64_t)budget_ms * CLSP_NSEC_PER_MSEC)
+                           : 0;
 }
 
 void c_lsp_add_include(CLSPContext* ctx, const char* header_path, const char* ns_qn) {
@@ -290,7 +339,7 @@ static void c_add_pending_template_call(CLSPContext* ctx, const char* func_qn,
 // Deduces type params from call-site args and resolves stored method calls.
 static void c_resolve_pending_template_calls(CLSPContext* ctx,
     const CBMRegisteredFunc* callee, const CBMType** call_arg_types, int call_arg_count) {
-    if (!callee || !callee->type_param_names || !call_arg_types) return;
+    if (c_lsp_should_abort(ctx) || !callee || !callee->type_param_names || !call_arg_types) return;
 
     // Build type param → concrete type mapping from call-site arguments
     const char** tpn = callee->type_param_names;
@@ -298,10 +347,18 @@ static void c_resolve_pending_template_calls(CLSPContext* ctx,
     int tpn_count = 0;
     while (tpn[tpn_count] && tpn_count < 8) tpn_count++;
 
-    // Match call arg types against function param types to deduce type params
+    // Match call arg types against function param types to deduce type params.
+    // The call can have more arguments than the registered signature knows about
+    // (variadics, defaulted stubs, or partial extraction). Count the formal
+    // array first so we never read past its NULL terminator.
     if (callee->signature && callee->signature->kind == CBM_TYPE_FUNC &&
         callee->signature->data.func.param_types) {
-        for (int i = 0; i < call_arg_count; i++) {
+        int formal_count = 0;
+        while (callee->signature->data.func.param_types[formal_count]) {
+            formal_count++;
+        }
+        int limit = call_arg_count < formal_count ? call_arg_count : formal_count;
+        for (int i = 0; i < limit; i++) {
             const CBMType* formal = callee->signature->data.func.param_types[i];
             if (!formal || !call_arg_types[i]) continue;
             // Unwrap references/pointers
@@ -327,14 +384,16 @@ static void c_resolve_pending_template_calls(CLSPContext* ctx,
     const char* saved_func_qn = ctx->enclosing_func_qn;
     ctx->enclosing_func_qn = callee->qualified_name;
     for (int i = 0; i < ctx->pending_tc_count; i++) {
-        if (strcmp(ctx->pending_template_calls[i].func_qn, callee->qualified_name) != 0)
+        const char *pending_func = ctx->pending_template_calls[i].func_qn;
+        if (!pending_func || !callee->qualified_name || strcmp(pending_func, callee->qualified_name) != 0)
             continue;
         const char* tp = ctx->pending_template_calls[i].type_param;
         const char* method = ctx->pending_template_calls[i].method_name;
+        if (!tp || !method) continue;
 
         // Find which type param this is
         for (int j = 0; j < tpn_count; j++) {
-            if (strcmp(tpn[j], tp) != 0 || !param_map[j]) continue;
+            if (!tpn[j] || strcmp(tpn[j], tp) != 0 || !param_map[j]) continue;
             const char* concrete_qn = type_to_qn(param_map[j]);
             if (!concrete_qn) continue;
             // Look up the method on the concrete type
@@ -1155,8 +1214,9 @@ const CBMType* c_simplify_type(CLSPContext* ctx, const CBMType* t, bool unwrap_p
                     ret->kind == CBM_TYPE_REFERENCE) {
                     const CBMRegisteredType* rt = cbm_registry_lookup_type(ctx->registry, tqn);
                     if (!rt && ctx->module_qn) {
-                        rt = cbm_registry_lookup_type(ctx->registry,
-                            cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, tqn));
+                        const char *prefixed_tqn = c_module_prefixed_qn(ctx, tqn);
+                        if (prefixed_tqn != tqn)
+                            rt = cbm_registry_lookup_type(ctx->registry, prefixed_tqn);
                     }
                     if (rt && rt->type_param_names) {
                         ret = cbm_type_substitute(ctx->arena, ret,
@@ -1205,7 +1265,7 @@ static const char* type_to_qn(const CBMType* t) {
 static const CBMType* c_eval_expr_type_inner(CLSPContext* ctx, TSNode node);
 
 const CBMType* c_eval_expr_type(CLSPContext* ctx, TSNode node) {
-    if (ts_node_is_null(node)) return cbm_type_unknown();
+    if (ts_node_is_null(node) || c_lsp_should_abort(ctx)) return cbm_type_unknown();
     /* Guard against unbounded recursion on deeply nested C++ templates.
      * Prevents stack overflow and NULL-deref from unusual AST shapes. */
     if (ctx->eval_depth > 256) {
@@ -1310,8 +1370,9 @@ static const CBMType* c_eval_expr_type_inner(CLSPContext* ctx, TSNode node) {
                 base->kind == CBM_TYPE_TEMPLATE) {
                 const CBMRegisteredType* trt = cbm_registry_lookup_type(ctx->registry, type_qn);
                 if (!trt && ctx->module_qn) {
-                    trt = cbm_registry_lookup_type(ctx->registry,
-                        cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, type_qn));
+                    const char *prefixed_type_qn = c_module_prefixed_qn(ctx, type_qn);
+                    if (prefixed_type_qn != type_qn)
+                        trt = cbm_registry_lookup_type(ctx->registry, prefixed_type_qn);
                 }
                 if (trt && trt->type_param_names) {
                     const char* fname_qn = field_type->data.named.qualified_name;
@@ -1332,8 +1393,9 @@ static const CBMType* c_eval_expr_type_inner(CLSPContext* ctx, TSNode node) {
                 base->data.template_type.template_args) {
                 const CBMRegisteredType* rt = cbm_registry_lookup_type(ctx->registry, type_qn);
                 if (!rt && ctx->module_qn) {
-                    rt = cbm_registry_lookup_type(ctx->registry,
-                        cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, type_qn));
+                    const char *prefixed_type_qn = c_module_prefixed_qn(ctx, type_qn);
+                    if (prefixed_type_qn != type_qn)
+                        rt = cbm_registry_lookup_type(ctx->registry, prefixed_type_qn);
                 }
                 if (rt && rt->type_param_names) {
                     field_type = cbm_type_substitute(ctx->arena, field_type,
@@ -2222,11 +2284,16 @@ static const CBMRegisteredFunc* c_lookup_member_depth(CLSPContext* ctx,
     const CBMRegisteredFunc* f = cbm_registry_lookup_method(ctx->registry, type_qn, member_name);
     if (f) return f;
 
-    // Try module-prefixed QN (e.g., "Container" -> "test.main.Container")
+    // Try module-prefixed QN (e.g., "Container" -> "test.main.Container").
+    // Avoid repeatedly prefixing values that are already module-qualified; on
+    // generated C++ this can otherwise create enormous QNs while traversing
+    // member/base lookup fallbacks.
     if (ctx->module_qn) {
-        const char* prefixed = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, type_qn);
-        f = cbm_registry_lookup_method(ctx->registry, prefixed, member_name);
-        if (f) return f;
+        const char* prefixed = c_module_prefixed_qn(ctx, type_qn);
+        if (prefixed != type_qn) {
+            f = cbm_registry_lookup_method(ctx->registry, prefixed, member_name);
+            if (f) return f;
+        }
     }
 
     // Scope-based alias: using Vec = std::vector<T>;
@@ -2248,8 +2315,8 @@ static const CBMRegisteredFunc* c_lookup_member_depth(CLSPContext* ctx,
     // Check registered type for alias and base classes
     const CBMRegisteredType* rt = cbm_registry_lookup_type(ctx->registry, type_qn);
     if (!rt && ctx->module_qn) {
-        rt = cbm_registry_lookup_type(ctx->registry,
-            cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, type_qn));
+        const char* prefixed = c_module_prefixed_qn(ctx, type_qn);
+        if (prefixed != type_qn) rt = cbm_registry_lookup_type(ctx->registry, prefixed);
     }
     if (rt) {
         // Alias chain
@@ -2281,8 +2348,8 @@ static const CBMType* c_lookup_field_type(CLSPContext* ctx, const char* type_qn,
 
     const CBMRegisteredType* rt = cbm_registry_lookup_type(ctx->registry, type_qn);
     if (!rt && ctx->module_qn) {
-        rt = cbm_registry_lookup_type(ctx->registry,
-            cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, type_qn));
+        const char* prefixed = c_module_prefixed_qn(ctx, type_qn);
+        if (prefixed != type_qn) rt = cbm_registry_lookup_type(ctx->registry, prefixed);
     }
     if (!rt) return NULL;
 
@@ -2335,7 +2402,7 @@ static const CBMType* c_parse_declaration_type(CLSPContext* ctx, TSNode decl_nod
 }
 
 void c_process_statement(CLSPContext* ctx, TSNode node) {
-    if (ts_node_is_null(node)) return;
+    if (ts_node_is_null(node) || c_lsp_should_abort(ctx)) return;
     const char* kind = ts_node_type(node);
 
     // declaration: Type var = expr; or Type var1, var2;
@@ -2975,7 +3042,7 @@ static void c_emit_unresolved_call(CLSPContext* ctx, const char* expr_text, cons
 // ============================================================================
 
 static void c_resolve_calls_in_node(CLSPContext* ctx, TSNode node) {
-    if (ts_node_is_null(node)) return;
+    if (ts_node_is_null(node) || c_lsp_should_abort(ctx)) return;
     const char* kind = ts_node_type(node);
 
     // Process statements for scope building
@@ -3663,6 +3730,7 @@ recurse:;
 // ============================================================================
 
 static void c_process_function(CLSPContext* ctx, TSNode func_node) {
+    if (ts_node_is_null(func_node) || c_lsp_should_abort(ctx)) return;
     TSNode decl = ts_node_child_by_field_name(func_node, "declarator", 10);
     if (ts_node_is_null(decl)) return;
 
@@ -3810,7 +3878,7 @@ static void c_process_function(CLSPContext* ctx, TSNode func_node) {
 // Process a top-level or nested declaration within a namespace/class body,
 // handling template_declaration wrapping.
 static void c_process_body_child(CLSPContext* ctx, TSNode child) {
-    if (ts_node_is_null(child)) return;
+    if (ts_node_is_null(child) || c_lsp_should_abort(ctx)) return;
     const char* ck = ts_node_type(child);
 
     if (strcmp(ck, "function_definition") == 0) {
@@ -3941,6 +4009,7 @@ static void c_process_body_child(CLSPContext* ctx, TSNode child) {
 }
 
 static void c_process_namespace(CLSPContext* ctx, TSNode ns_node) {
+    if (ts_node_is_null(ns_node) || c_lsp_should_abort(ctx)) return;
     const char* saved_ns = ctx->current_namespace;
 
     TSNode name_node = ts_node_child_by_field_name(ns_node, "name", 4);
@@ -3973,6 +4042,7 @@ static void c_process_namespace(CLSPContext* ctx, TSNode ns_node) {
 // ============================================================================
 
 static void c_process_class(CLSPContext* ctx, TSNode class_node) {
+    if (ts_node_is_null(class_node) || c_lsp_should_abort(ctx)) return;
     const char* saved_class = ctx->enclosing_class_qn;
     const char** saved_tpn = ctx->template_param_names;
     const CBMType** saved_tpd = ctx->template_param_defaults;
@@ -4223,7 +4293,7 @@ static void c_process_class(CLSPContext* ctx, TSNode class_node) {
 
 __attribute__((no_sanitize("address")))
 void c_lsp_process_file(CLSPContext* ctx, TSNode root) {
-    if (ts_node_is_null(root)) return;
+    if (ts_node_is_null(root) || c_lsp_should_abort(ctx)) return;
 
     uint32_t nc = ts_node_child_count(root);
     TSNode child;   // Hoisted: prevents ASan stack-use-after-scope between passes

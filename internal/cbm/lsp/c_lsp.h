@@ -6,6 +6,7 @@
 #include "type_registry.h"
 #include "../cbm.h"
 #include "go_lsp.h"  // for CBMLSPDef, CBMResolvedCallArray
+#include <stdint.h>
 
 // CLSPContext holds state for C/C++ expression type evaluation within a file.
 typedef struct {
@@ -74,7 +75,10 @@ typedef struct {
     bool cpp_mode;          // C++ features enabled
     bool in_template;       // currently inside template declaration
     bool debug;
+    bool timed_out;         // fail-soft: C/C++ LSP budget exhausted
     int eval_depth;         // recursion depth for c_eval_expr_type (crash guard)
+    int visit_count;        // periodic time-budget checks
+    uint64_t deadline_ns;   // 0 disables the per-file LSP budget
 } CLSPContext;
 
 // --- API ---

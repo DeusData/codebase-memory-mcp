@@ -666,7 +666,11 @@ const CBMType* cbm_type_substitute(CBMArena* a, const CBMType* t,
     case CBM_TYPE_TYPE_PARAM: {
         for (int i = 0; type_params[i]; i++) {
             if (strcmp(t->data.type_param.name, type_params[i]) == 0) {
-                return type_args[i];
+                /* A template parameter can be listed without a deduced value
+                 * (for example TAD only resolves some parameters). Keep the
+                 * original TYPE_PARAM instead of returning NULL; callers expect
+                 * substitution to always yield a valid CBMType pointer. */
+                return type_args[i] ? type_args[i] : t;
             }
         }
         return t; // unmatched param stays as-is
@@ -682,7 +686,10 @@ const CBMType* cbm_type_substitute(CBMArena* a, const CBMType* t,
             for (int i = 0; type_params[i]; i++) {
                 if (strcmp(qn, type_params[i]) == 0 ||
                     strcmp(short_name, type_params[i]) == 0) {
-                    return type_args[i];
+                    /* See TYPE_PARAM handling above: missing deductions leave
+                     * the original symbolic type intact instead of producing a
+                     * NULL type that downstream LSP code may dereference. */
+                    return type_args[i] ? type_args[i] : t;
                 }
             }
         }
