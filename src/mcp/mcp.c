@@ -3980,22 +3980,179 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── Cross-project links tool ────────────────────────────────── */
 
-/* Bind the (protocol, project, identifier) filter params onto a prepared stmt.
- * Starting at bind_idx=1. Returns the next free bind index. */
-static int xl_bind_filters(sqlite3_stmt *stmt, int bind_idx,
-                           const char *protocol, const char *project,
-                           const char *identifier) {
-    if (protocol && protocol[0]) {
-        sqlite3_bind_text(stmt, bind_idx++, protocol, -1, SQLITE_STATIC);
+/* One materialized cross-project link row, reconstructed from a producer-side
+ * CROSS_<PROTO>_CALLS edge in a project's edges table. */
+typedef struct {
+    char protocol[32];
+    char identifier[256];
+    char producer_project[256];
+    char producer_qn[512];
+    char producer_file[256];
+    char consumer_project[256];
+    char consumer_qn[512];
+    char consumer_file[256];
+    double confidence;
+} xl_row_t;
+
+typedef struct {
+    xl_row_t *items;
+    int count;
+    int capacity;
+} xl_row_list_t;
+
+static int xl_row_list_push(xl_row_list_t *list, const xl_row_t *row) {
+    if (list->count >= list->capacity) {
+        int new_cap = list->capacity == 0 ? 256 : list->capacity * 2;
+        xl_row_t *new_items = realloc(list->items, (size_t)new_cap * sizeof(xl_row_t));
+        if (!new_items) return -1;
+        list->items = new_items;
+        list->capacity = new_cap;
     }
-    if (project && project[0]) {
-        sqlite3_bind_text(stmt, bind_idx++, project, -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, bind_idx++, project, -1, SQLITE_STATIC);
+    list->items[list->count++] = *row;
+    return 0;
+}
+
+/* Derive a lowercase protocol name from an edge type "CROSS_<PROTO>_CALLS".
+ * Falls back to the type itself if the prefix/suffix is missing. */
+static void xl_protocol_from_edge_type(const char *edge_type, char *out, size_t out_sz) {
+    if (out_sz == 0) return;
+    if (!edge_type || strncmp(edge_type, "CROSS_", 6) != 0) {
+        snprintf(out, out_sz, "%s", edge_type ? edge_type : "");
+        return;
     }
-    if (identifier && identifier[0]) {
-        sqlite3_bind_text(stmt, bind_idx++, identifier, -1, SQLITE_STATIC);
+    const char *start = edge_type + 6;
+    const char *suffix = strstr(start, "_CALLS");
+    size_t len = suffix ? (size_t)(suffix - start) : strlen(start);
+    if (len >= out_sz) len = out_sz - 1;
+    for (size_t i = 0; i < len; i++) {
+        char c = start[i];
+        out[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
     }
-    return bind_idx;
+    out[len] = '\0';
+}
+
+/* Load producer-side CROSS_* rows from a single project DB into `list`.
+ * Producer-side edges are those whose properties JSON carries a
+ * "target_project" field (consumer-side edges carry "source_project"
+ * instead). Returns the number of rows appended. */
+static int xl_load_rows_from_db(const char *db_path, const char *project,
+                                xl_row_list_t *list) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return 0;
+    }
+    const char *sql =
+        "SELECT e.type, e.properties, n.qualified_name, n.file_path "
+        "FROM edges e JOIN nodes n ON e.source_id = n.id "
+        "WHERE e.type LIKE 'CROSS\\_%' ESCAPE '\\' "
+        "  AND e.properties LIKE '%\"target_project\"%';";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return 0;
+    }
+    int loaded = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *etype = (const char *)sqlite3_column_text(stmt, 0);
+        const char *props = (const char *)sqlite3_column_text(stmt, 1);
+        const char *qn    = (const char *)sqlite3_column_text(stmt, 2);
+        const char *file  = (const char *)sqlite3_column_text(stmt, 3);
+        if (!etype || !props) continue;
+
+        xl_row_t row = {0};
+        xl_protocol_from_edge_type(etype, row.protocol, sizeof(row.protocol));
+        snprintf(row.producer_project, sizeof(row.producer_project), "%s", project);
+        snprintf(row.producer_qn, sizeof(row.producer_qn), "%s", qn ? qn : "");
+        snprintf(row.producer_file, sizeof(row.producer_file), "%s", file ? file : "");
+        row.confidence = 1.0;  /* default for upstream's deterministic HTTP/route edges */
+
+        yyjson_doc *doc = yyjson_read(props, strlen(props), 0);
+        if (!doc) continue;
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        if (root && yyjson_is_obj(root)) {
+            yyjson_val *v;
+            v = yyjson_obj_get(root, "target_project");
+            if (v && yyjson_is_str(v))
+                snprintf(row.consumer_project, sizeof(row.consumer_project), "%s", yyjson_get_str(v));
+            v = yyjson_obj_get(root, "target_function");
+            if (v && yyjson_is_str(v))
+                snprintf(row.consumer_qn, sizeof(row.consumer_qn), "%s", yyjson_get_str(v));
+            v = yyjson_obj_get(root, "target_file");
+            if (v && yyjson_is_str(v))
+                snprintf(row.consumer_file, sizeof(row.consumer_file), "%s", yyjson_get_str(v));
+            /* identifier: messaging linker emits "identifier"; upstream's
+             * HTTP/async matcher emits "url_path" instead. Either is fine. */
+            v = yyjson_obj_get(root, "identifier");
+            if (v && yyjson_is_str(v))
+                snprintf(row.identifier, sizeof(row.identifier), "%s", yyjson_get_str(v));
+            if (!row.identifier[0]) {
+                v = yyjson_obj_get(root, "url_path");
+                if (v && yyjson_is_str(v))
+                    snprintf(row.identifier, sizeof(row.identifier), "%s", yyjson_get_str(v));
+            }
+            v = yyjson_obj_get(root, "confidence");
+            if (v && yyjson_is_num(v))
+                row.confidence = yyjson_get_num(v);
+            /* Prefer properties.protocol if the writer set it explicitly */
+            v = yyjson_obj_get(root, "protocol");
+            if (v && yyjson_is_str(v))
+                snprintf(row.protocol, sizeof(row.protocol), "%s", yyjson_get_str(v));
+        }
+        yyjson_doc_free(doc);
+
+        if (row.consumer_project[0] && row.identifier[0]) {
+            if (xl_row_list_push(list, &row) < 0) break;
+            loaded++;
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return loaded;
+}
+
+/* Walk cache_dir and load CROSS_* rows from every project DB. */
+static int xl_enumerate_project_dbs(const char *cache_dir, xl_row_list_t *list) {
+    cbm_dir_t *d = cbm_opendir(cache_dir);
+    if (!d) return 0;
+    int total = 0;
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        const char *name = ent->name;
+        size_t nlen = strlen(name);
+        if (!is_project_db_file(name, nlen)) continue;
+        char project[256];
+        size_t proj_len = nlen - 3;  /* strip ".db" */
+        if (proj_len >= sizeof(project)) proj_len = sizeof(project) - 1;
+        memcpy(project, name, proj_len);
+        project[proj_len] = '\0';
+        char db_path[1024];
+        snprintf(db_path, sizeof(db_path), "%s/%s", cache_dir, name);
+        total += xl_load_rows_from_db(db_path, project, list);
+    }
+    cbm_closedir(d);
+    return total;
+}
+
+static int xl_row_matches(const xl_row_t *r, const char *protocol,
+                          const char *project, const char *identifier) {
+    if (protocol[0] && strcmp(r->protocol, protocol) != 0) return 0;
+    if (project[0] && strcmp(r->producer_project, project) != 0
+                   && strcmp(r->consumer_project, project) != 0) return 0;
+    if (identifier[0] && strcmp(r->identifier, identifier) != 0) return 0;
+    return 1;
+}
+
+static int xl_row_cmp(const void *a, const void *b) {
+    const xl_row_t *ra = (const xl_row_t *)a;
+    const xl_row_t *rb = (const xl_row_t *)b;
+    int c = strcmp(ra->protocol, rb->protocol);
+    if (c != 0) return c;
+    c = strcmp(ra->identifier, rb->identifier);
+    if (c != 0) return c;
+    if (ra->confidence > rb->confidence) return -1;
+    if (ra->confidence < rb->confidence) return 1;
+    return 0;
 }
 
 static char *handle_cross_project_links(cbm_mcp_server_t *srv, const char *args) {
@@ -4033,78 +4190,53 @@ static char *handle_cross_project_links(cbm_mcp_server_t *srv, const char *args)
         }
     }
 
-    /* Clamp pagination params */
     if (limit < 1) limit = 100;
     if (limit > 1000) limit = 1000;
     if (offset < 0) offset = 0;
 
-    /* Open _crosslinks.db */
     const char *cache_dir = cbm_resolve_cache_dir();
     if (!cache_dir) {
         return cbm_mcp_text_result("Cache directory not found.", true);
     }
 
-    char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/_crosslinks.db", cache_dir);
+    /* Load every producer-side CROSS_* edge across all project DBs.
+     * Storage unification put cross-project links into each project's
+     * own edges table, so the reader fans out instead of reading a
+     * single shared _crosslinks.db. */
+    xl_row_list_t all = {0};
+    xl_enumerate_project_dbs(cache_dir, &all);
 
-    sqlite3 *db = NULL;
-    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
-        if (db) sqlite3_close(db);
-        return cbm_mcp_text_result(
-            "No cross-project links found. Index at least 2 projects first.", false);
-    }
+    int has_filter = (protocol[0] || project[0] || identifier[0]);
 
-    /* Build shared WHERE clause */
-    char where[512] = {0};
-    int wlen = 0;
-    if (protocol[0]) {
-        wlen += snprintf(where + wlen, sizeof(where) - (size_t)wlen,
-                         "%sprotocol = ?", wlen ? " AND " : "");
-    }
-    if (project[0]) {
-        wlen += snprintf(where + wlen, sizeof(where) - (size_t)wlen,
-                         "%s(producer_project = ? OR consumer_project = ?)",
-                         wlen ? " AND " : "");
-    }
-    if (identifier[0]) {
-        wlen += snprintf(where + wlen, sizeof(where) - (size_t)wlen,
-                         "%sidentifier = ?", wlen ? " AND " : "");
-    }
-
-    /* Total count (cheap — drives summary + pagination) */
-    char count_sql[640];
-    if (wlen > 0) {
-        snprintf(count_sql, sizeof(count_sql),
-                 "SELECT COUNT(*) FROM cross_links WHERE %s;", where);
-    } else {
-        snprintf(count_sql, sizeof(count_sql),
-                 "SELECT COUNT(*) FROM cross_links;");
-    }
-    int total_count = 0;
-    sqlite3_stmt *cstmt = NULL;
-    if (sqlite3_prepare_v2(db, count_sql, -1, &cstmt, NULL) == SQLITE_OK) {
-        xl_bind_filters(cstmt, 1, protocol, project, identifier);
-        if (sqlite3_step(cstmt) == SQLITE_ROW) {
-            total_count = sqlite3_column_int(cstmt, 0);
+    /* Filter in-memory. */
+    xl_row_list_t filtered = {0};
+    for (int i = 0; i < all.count; i++) {
+        if (xl_row_matches(&all.items[i], protocol, project, identifier)) {
+            if (xl_row_list_push(&filtered, &all.items[i]) < 0) break;
         }
-        sqlite3_finalize(cstmt);
     }
+    free(all.items);
+    int total_count = filtered.count;
 
     if (total_count == 0) {
-        sqlite3_close(db);
+        free(filtered.items);
         return cbm_mcp_text_result(
-            wlen > 0 ? "No cross-project links found matching filters."
-                     : "No cross-project links found. Index at least 2 projects first.",
+            has_filter ? "No cross-project links found matching filters."
+                       : "No cross-project links found. Index at least 2 projects first.",
             false);
     }
 
+    /* Sort: (protocol asc, identifier asc, confidence desc). */
+    qsort(filtered.items, (size_t)filtered.count, sizeof(xl_row_t), xl_row_cmp);
+
     int buf_cap = 65536;
     char *buf = malloc((size_t)buf_cap);
-    if (!buf) { sqlite3_close(db);
-                return cbm_mcp_text_result("alloc failed", true); }
+    if (!buf) {
+        free(filtered.items);
+        return cbm_mcp_text_result("alloc failed", true);
+    }
     int pos = 0;
 
-    /* Row range this call will show */
     int show_start = offset;
     int show_end = offset + limit;
     if (show_end > total_count) show_end = total_count;
@@ -4125,62 +4257,84 @@ static char *handle_cross_project_links(cbm_mcp_server_t *srv, const char *args)
                         total_count, offset);
     }
 
-    /* By-protocol breakdown (cheap aggregate) */
-    char agg_sql[800];
-    if (wlen > 0) {
-        snprintf(agg_sql, sizeof(agg_sql),
-                 "SELECT protocol, COUNT(*) FROM cross_links WHERE %s "
-                 "GROUP BY protocol ORDER BY 2 DESC;", where);
-    } else {
-        snprintf(agg_sql, sizeof(agg_sql),
-                 "SELECT protocol, COUNT(*) FROM cross_links "
-                 "GROUP BY protocol ORDER BY 2 DESC;");
-    }
-    sqlite3_stmt *astmt = NULL;
-    if (sqlite3_prepare_v2(db, agg_sql, -1, &astmt, NULL) == SQLITE_OK) {
-        xl_bind_filters(astmt, 1, protocol, project, identifier);
-        pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "By protocol:\n");
-        while (sqlite3_step(astmt) == SQLITE_ROW) {
-            pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "  %-12s %d\n",
-                            (const char *)sqlite3_column_text(astmt, 0),
-                            sqlite3_column_int(astmt, 1));
+    /* By-protocol breakdown. Since the sort key starts with protocol,
+     * we can just walk and count contiguous runs. */
+    pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "By protocol:\n");
+    for (int i = 0; i < filtered.count; ) {
+        int j = i + 1;
+        while (j < filtered.count
+               && strcmp(filtered.items[j].protocol, filtered.items[i].protocol) == 0) {
+            j++;
         }
-        pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "\n");
-        sqlite3_finalize(astmt);
+        pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "  %-12s %d\n",
+                        filtered.items[i].protocol, j - i);
+        i = j;
     }
+    pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "\n");
 
-    /* Top project pairs — include when summary_only OR when result wasn't
-     * already narrowed to a single identifier (pair view isn't useful then). */
+    /* Top project pairs (producer→consumer × protocol). Linear scan over the
+     * filtered list, accumulating into a small dynamic table. */
     if (summary_only || (!identifier[0] && total_count > 20)) {
-        char pair_sql[900];
-        if (wlen > 0) {
-            snprintf(pair_sql, sizeof(pair_sql),
-                     "SELECT producer_project, consumer_project, protocol, COUNT(*) "
-                     "FROM cross_links WHERE %s "
-                     "GROUP BY producer_project, consumer_project, protocol "
-                     "ORDER BY 4 DESC LIMIT 10;", where);
-        } else {
-            snprintf(pair_sql, sizeof(pair_sql),
-                     "SELECT producer_project, consumer_project, protocol, COUNT(*) "
-                     "FROM cross_links "
-                     "GROUP BY producer_project, consumer_project, protocol "
-                     "ORDER BY 4 DESC LIMIT 10;");
-        }
-        sqlite3_stmt *pstmt = NULL;
-        if (sqlite3_prepare_v2(db, pair_sql, -1, &pstmt, NULL) == SQLITE_OK) {
-            xl_bind_filters(pstmt, 1, protocol, project, identifier);
-            pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "Top project pairs:\n");
-            while (sqlite3_step(pstmt) == SQLITE_ROW) {
-                pos += snprintf(buf + pos, (size_t)(buf_cap - pos),
-                                "  %s -> %s (%s): %d\n",
-                                (const char *)sqlite3_column_text(pstmt, 0),
-                                (const char *)sqlite3_column_text(pstmt, 1),
-                                (const char *)sqlite3_column_text(pstmt, 2),
-                                sqlite3_column_int(pstmt, 3));
+        typedef struct {
+            const char *producer;
+            const char *consumer;
+            const char *protocol;
+            int count;
+        } pair_entry_t;
+        pair_entry_t *pairs = NULL;
+        int pair_count = 0, pair_cap = 0;
+        for (int i = 0; i < filtered.count; i++) {
+            const xl_row_t *r = &filtered.items[i];
+            int matched = -1;
+            for (int k = 0; k < pair_count; k++) {
+                if (strcmp(pairs[k].producer, r->producer_project) == 0
+                    && strcmp(pairs[k].consumer, r->consumer_project) == 0
+                    && strcmp(pairs[k].protocol, r->protocol) == 0) {
+                    matched = k;
+                    break;
+                }
             }
-            pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "\n");
-            sqlite3_finalize(pstmt);
+            if (matched >= 0) {
+                pairs[matched].count++;
+            } else {
+                if (pair_count >= pair_cap) {
+                    int new_cap = pair_cap == 0 ? 32 : pair_cap * 2;
+                    pair_entry_t *grown = realloc(pairs, (size_t)new_cap * sizeof(pair_entry_t));
+                    if (!grown) break;
+                    pairs = grown;
+                    pair_cap = new_cap;
+                }
+                pairs[pair_count].producer = r->producer_project;
+                pairs[pair_count].consumer = r->consumer_project;
+                pairs[pair_count].protocol = r->protocol;
+                pairs[pair_count].count = 1;
+                pair_count++;
+            }
         }
+        /* Selection sort top 10 (linear scan, small N). */
+        int top_n = pair_count < 10 ? pair_count : 10;
+        if (top_n > 0) {
+            pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "Top project pairs:\n");
+        }
+        for (int n = 0; n < top_n; n++) {
+            int best = n;
+            for (int k = n + 1; k < pair_count; k++) {
+                if (pairs[k].count > pairs[best].count) best = k;
+            }
+            if (best != n) {
+                pair_entry_t tmp = pairs[n];
+                pairs[n] = pairs[best];
+                pairs[best] = tmp;
+            }
+            pos += snprintf(buf + pos, (size_t)(buf_cap - pos),
+                            "  %s -> %s (%s): %d\n",
+                            pairs[n].producer, pairs[n].consumer,
+                            pairs[n].protocol, pairs[n].count);
+        }
+        if (top_n > 0) {
+            pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "\n");
+        }
+        free(pairs);
     }
 
     /* Pagination / hint footer */
@@ -4194,23 +4348,15 @@ static char *handle_cross_project_links(cbm_mcp_server_t *srv, const char *args)
                             "Pagination: showing all %d matching rows.\n", total_count);
         }
     }
-    if (wlen == 0 && total_count > 100) {
+    if (!has_filter && total_count > 100) {
         pos += snprintf(buf + pos, (size_t)(buf_cap - pos),
             "Tip: narrow with protocol=, project=, or identifier=. "
             "Pass summary_only=true to skip row detail.\n");
     }
 
-    /* If summary-only, we are done */
-    if (summary_only) {
-        sqlite3_close(db);
-        char *result = cbm_mcp_text_result(buf, false);
-        free(buf);
-        return result;
-    }
-
-    if (rows_to_show == 0) {
-        /* Offset is past end — return summary without rows */
-        sqlite3_close(db);
+    if (summary_only || rows_to_show == 0) {
+        free(filtered.items);
+        buf[pos] = '\0';
         char *result = cbm_mcp_text_result(buf, false);
         free(buf);
         return result;
@@ -4218,48 +4364,12 @@ static char *handle_cross_project_links(cbm_mcp_server_t *srv, const char *args)
 
     pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "\n---\n\n");
 
-    /* Paginated row query */
-    char sql[1200];
-    if (wlen > 0) {
-        snprintf(sql, sizeof(sql),
-            "SELECT protocol, identifier, producer_project, producer_qn, producer_file, "
-            "consumer_project, consumer_qn, consumer_file, confidence "
-            "FROM cross_links WHERE %s "
-            "ORDER BY protocol, identifier, confidence DESC "
-            "LIMIT ? OFFSET ?;", where);
-    } else {
-        snprintf(sql, sizeof(sql),
-            "SELECT protocol, identifier, producer_project, producer_qn, producer_file, "
-            "consumer_project, consumer_qn, consumer_file, confidence "
-            "FROM cross_links "
-            "ORDER BY protocol, identifier, confidence DESC "
-            "LIMIT ? OFFSET ?;");
-    }
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        sqlite3_close(db);
-        free(buf);
-        return cbm_mcp_text_result("Failed to query cross-project links.", true);
-    }
-    int bi = xl_bind_filters(stmt, 1, protocol, project, identifier);
-    sqlite3_bind_int(stmt, bi++, limit);
-    sqlite3_bind_int(stmt, bi++, offset);
-
     char cur_protocol[64] = {0};
     int proto_count = 0;
+    for (int i = show_start; i < show_end; i++) {
+        const xl_row_t *r = &filtered.items[i];
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        const char *proto = (const char *)sqlite3_column_text(stmt, 0);
-        const char *ident = (const char *)sqlite3_column_text(stmt, 1);
-        const char *pprod = (const char *)sqlite3_column_text(stmt, MCP_COL_2);
-        const char *qprod = (const char *)sqlite3_column_text(stmt, MCP_COL_3);
-        const char *fprod = (const char *)sqlite3_column_text(stmt, MCP_COL_4);
-        const char *pcons = (const char *)sqlite3_column_text(stmt, 5);
-        const char *qcons = (const char *)sqlite3_column_text(stmt, 6);
-        const char *fcons = (const char *)sqlite3_column_text(stmt, MCP_COL_7);
-        double conf = sqlite3_column_double(stmt, 8);
-
-        if (pos + 512 > buf_cap) {
+        if (pos + 1024 > buf_cap) {
             int new_cap = buf_cap * 2;
             char *new_buf = realloc(buf, (size_t)new_cap);
             if (!new_buf) break;
@@ -4267,12 +4377,12 @@ static char *handle_cross_project_links(cbm_mcp_server_t *srv, const char *args)
             buf_cap = new_cap;
         }
 
-        if (strcmp(cur_protocol, proto ? proto : "") != 0) {
+        if (strcmp(cur_protocol, r->protocol) != 0) {
             if (proto_count > 0) {
                 pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "\n");
             }
-            snprintf(cur_protocol, sizeof(cur_protocol), "%s", proto ? proto : "");
-            pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "## %s\n\n", proto);
+            snprintf(cur_protocol, sizeof(cur_protocol), "%s", r->protocol);
+            pos += snprintf(buf + pos, (size_t)(buf_cap - pos), "## %s\n\n", r->protocol);
             proto_count++;
         }
 
@@ -4280,14 +4390,12 @@ static char *handle_cross_project_links(cbm_mcp_server_t *srv, const char *args)
             "%s (confidence: %.2f)\n"
             "  producer: %s :: %s (%s)\n"
             "  consumer: %s :: %s (%s)\n\n",
-            ident ? ident : "", conf,
-            pprod ? pprod : "", qprod ? qprod : "", fprod ? fprod : "",
-            pcons ? pcons : "", qcons ? qcons : "", fcons ? fcons : "");
+            r->identifier, r->confidence,
+            r->producer_project, r->producer_qn, r->producer_file,
+            r->consumer_project, r->consumer_qn, r->consumer_file);
     }
 
-    sqlite3_finalize(stmt);
-    sqlite3_close(db);
-
+    free(filtered.items);
     buf[pos] = '\0';
     char *result = cbm_mcp_text_result(buf, false);
     free(buf);
