@@ -37,6 +37,10 @@ TEST(skip_vendor) {
     ASSERT_TRUE(cbm_should_skip_dir("vendor", CBM_MODE_FULL));
     PASS();
 }
+TEST(skip_vendored) {
+    ASSERT_TRUE(cbm_should_skip_dir("vendored", CBM_MODE_FULL));
+    PASS();
+}
 TEST(skip_terraform) {
     ASSERT_TRUE(cbm_should_skip_dir(".terraform", CBM_MODE_FULL));
     PASS();
@@ -680,6 +684,7 @@ SUITE(discover) {
     RUN_TEST(skip_dist);
     RUN_TEST(skip_target);
     RUN_TEST(skip_vendor);
+    RUN_TEST(skip_vendored);
     RUN_TEST(skip_terraform);
     RUN_TEST(skip_coverage);
     RUN_TEST(skip_idea);
