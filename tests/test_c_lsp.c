@@ -7006,6 +7006,44 @@ TEST(clsp_nocrash_template_in_template) {
     PASS();
 }
 
+TEST(clsp_nocrash_template_derived_brace_init_call) {
+    /* Regression: SIGSEGV in c_resolve_pending_template_calls during the per-file
+     * C LSP pass. Trigger (from a real C++ monorepo): a CRTP templated class
+     * deriving from a templated base — the `static_cast<Derived*>(this)->handle()`
+     * is a member call on a type param, which populates pending_template_calls —
+     * followed by a trailing function whose body is a single helper call with
+     * nested brace-initializer lists. The resolution loop must not deref NULL
+     * type_param / method_name / unnamed type-param-name fields. */
+    CBMFileResult *r = extract_cpp("\n"
+        "namespace apex { namespace executor {\n"
+        "    struct apex_node_base { void spin() {} };\n"
+        "} }\n"
+        "\n"
+        "template <typename Derived, typename InputType>\n"
+        "class SubscriberBase : public ::apex::executor::apex_node_base {\n"
+        "public:\n"
+        "    void on_input(const InputType& in) { static_cast<Derived*>(this)->handle(in); }\n"
+        "    InputType make() { return InputType{}; }\n"
+        "};\n"
+        "\n"
+        "struct Msg { int a; double b; };\n"
+        "\n"
+        "class MySub : public SubscriberBase<MySub, Msg> {\n"
+        "public:\n"
+        "    void handle(const Msg& m) {}\n"
+        "};\n"
+        "\n"
+        "static void RunValidationTest(void* self, Msg a, Msg b, Msg c, bool flag, double tol) {}\n"
+        "\n"
+        "void final_test() {\n"
+        "    RunValidationTest(nullptr, {1, 2.0}, {3, 4.0}, {5, 6.0}, false, -10.0);\n"
+        "}\n"
+        "");
+    ASSERT_NOT_NULL(r);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(clsp_nocrash_very_long_chain) {
     CBMFileResult *r = extract_cpp("\n"
                                    "struct Builder {\n"
@@ -15413,6 +15451,7 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_nocrash_empty_lambda);
     RUN_TEST(clsp_nocrash_nested_lambdas);
     RUN_TEST(clsp_nocrash_template_in_template);
+    RUN_TEST(clsp_nocrash_template_derived_brace_init_call);
     RUN_TEST(clsp_nocrash_very_long_chain);
     RUN_TEST(clsp_nocrash_mixedcand_cpp_cast);
     RUN_TEST(clsp_nocrash_extremely_large_function);

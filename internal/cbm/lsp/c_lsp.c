@@ -296,7 +296,7 @@ static void c_resolve_pending_template_calls(CLSPContext* ctx,
     const char** tpn = callee->type_param_names;
     const CBMType* param_map[8] = {0};
     int tpn_count = 0;
-    while (tpn[tpn_count] && tpn_count < 8) tpn_count++;
+    while (tpn_count < 8 && tpn[tpn_count]) tpn_count++;
 
     // Match call arg types against function param types to deduce type params
     if (callee->signature && callee->signature->kind == CBM_TYPE_FUNC &&
@@ -313,7 +313,8 @@ static void c_resolve_pending_template_calls(CLSPContext* ctx,
             }
             if (formal && formal->kind == CBM_TYPE_TYPE_PARAM) {
                 for (int j = 0; j < tpn_count; j++) {
-                    if (strcmp(tpn[j], formal->data.type_param.name) == 0) {
+                    if (formal->data.type_param.name &&
+                        strcmp(tpn[j], formal->data.type_param.name) == 0) {
                         const CBMType* arg = call_arg_types[i];
                         arg = c_simplify_type(ctx, arg, false);
                         param_map[j] = arg;
@@ -327,10 +328,12 @@ static void c_resolve_pending_template_calls(CLSPContext* ctx,
     const char* saved_func_qn = ctx->enclosing_func_qn;
     ctx->enclosing_func_qn = callee->qualified_name;
     for (int i = 0; i < ctx->pending_tc_count; i++) {
-        if (strcmp(ctx->pending_template_calls[i].func_qn, callee->qualified_name) != 0)
+        const char* fqn = ctx->pending_template_calls[i].func_qn;
+        if (!fqn || strcmp(fqn, callee->qualified_name) != 0)
             continue;
         const char* tp = ctx->pending_template_calls[i].type_param;
         const char* method = ctx->pending_template_calls[i].method_name;
+        if (!tp || !method) continue;
 
         // Find which type param this is
         for (int j = 0; j < tpn_count; j++) {
