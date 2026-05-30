@@ -2,9 +2,10 @@
  * test_platform.c — RED phase tests for foundation/platform.
  */
 #include "test_framework.h"
+#include "../src/foundation/compat.h" /* cbm_setenv / cbm_unsetenv (Windows-portable) */
 #include "../src/foundation/platform.h"
 #include "../src/foundation/system_info_internal.h"
-#include <stdlib.h> /* setenv, unsetenv */
+#include <stdlib.h>
 #include <unistd.h>
 
 #ifdef __linux__
@@ -90,13 +91,13 @@ TEST(platform_mmap_nonexistent) {
  * explicit-override path that ships independently.
  */
 TEST(platform_default_workers_env_override) {
-    setenv("CBM_WORKERS", "4", 1);
+    cbm_setenv("CBM_WORKERS", "4", 1);
     int n = cbm_default_worker_count(true);
     ASSERT_EQ(n, 4);
     /* initial=false should also honor the explicit override. */
     int m = cbm_default_worker_count(false);
     ASSERT_EQ(m, 4);
-    unsetenv("CBM_WORKERS");
+    cbm_unsetenv("CBM_WORKERS");
     PASS();
 }
 
@@ -106,26 +107,26 @@ TEST(platform_default_workers_env_invalid) {
     int baseline = cbm_default_worker_count(true);
     ASSERT_GT(baseline, 0);
 
-    setenv("CBM_WORKERS", "0", 1);
+    cbm_setenv("CBM_WORKERS", "0", 1);
     ASSERT_EQ(cbm_default_worker_count(true), baseline);
 
-    setenv("CBM_WORKERS", "-1", 1);
+    cbm_setenv("CBM_WORKERS", "-1", 1);
     ASSERT_EQ(cbm_default_worker_count(true), baseline);
 
-    setenv("CBM_WORKERS", "9999", 1);
+    cbm_setenv("CBM_WORKERS", "9999", 1);
     ASSERT_EQ(cbm_default_worker_count(true), baseline);
 
-    setenv("CBM_WORKERS", "not-a-number", 1);
+    cbm_setenv("CBM_WORKERS", "not-a-number", 1);
     ASSERT_EQ(cbm_default_worker_count(true), baseline);
 
-    unsetenv("CBM_WORKERS");
+    cbm_unsetenv("CBM_WORKERS");
     PASS();
 }
 
 TEST(platform_default_workers_env_unset) {
     /* When CBM_WORKERS is unset the result matches today's behaviour
      * (info.total_cores for initial=true, perf_cores-1 for false). */
-    unsetenv("CBM_WORKERS");
+    cbm_unsetenv("CBM_WORKERS");
     cbm_system_info_t info = cbm_system_info();
     ASSERT_EQ(cbm_default_worker_count(true), info.total_cores);
     PASS();
@@ -287,9 +288,7 @@ TEST(cgroup_v1_mem_unlimited_sentinel) {
     /* cgroup v1 reports a huge near-ULLONG_MAX value when unlimited
      * (PAGE_COUNTER_MAX). Our parser treats anything >= ULLONG_MAX/2
      * as effectively unlimited. */
-    ASSERT_EQ(cgroup_test_write(root, "memory/memory.limit_in_bytes",
-                                "9223372036854775807"),
-              0);
+    ASSERT_EQ(cgroup_test_write(root, "memory/memory.limit_in_bytes", "9223372036854775807"), 0);
     ASSERT_EQ(cbm_detect_cgroup_mem(root), (size_t)0);
     cgroup_test_teardown(root);
     PASS();
