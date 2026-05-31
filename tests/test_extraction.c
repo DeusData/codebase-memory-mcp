@@ -99,6 +99,27 @@ TEST(extract_r_dollar_call_issue219) {
     PASS();
 }
 
+/* --- TS: object-literal arrow methods from a factory (Zustand, #341) --- */
+TEST(extract_ts_factory_object_methods_issue341) {
+    CBMFileResult *r = extract("export function createItemActions(set, get) {\n"
+                               "  return {\n"
+                               "    addItem: (type, id) => { return 1; },\n"
+                               "    moveItem: (id, target) => { return 2; },\n"
+                               "    deleteItem: (id) => { return 3; },\n"
+                               "  };\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "item-actions.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* The factory itself + each returned arrow method are Function nodes. */
+    ASSERT(has_def_any(r, "createItemActions"));
+    ASSERT(has_def_any(r, "addItem"));
+    ASSERT(has_def_any(r, "moveItem"));
+    ASSERT(has_def_any(r, "deleteItem"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Java --- */
 TEST(java_class) {
     CBMFileResult *r = extract(
@@ -2363,6 +2384,7 @@ SUITE(extraction) {
     /* R box-module imports + member calls */
     RUN_TEST(extract_r_box_use_imports_issue218);
     RUN_TEST(extract_r_dollar_call_issue219);
+    RUN_TEST(extract_ts_factory_object_methods_issue341);
 
     /* OOP */
     RUN_TEST(java_class);

@@ -546,15 +546,25 @@ static TSNode find_cpp_template_inner_node(TSNode node, CBMLanguage lang) {
     return null_node;
 }
 
-// Try arrow_function name via parent variable_declarator (top-level resolution).
+// Try arrow_function name via parent variable_declarator (top-level resolution)
+// or object-literal property (`pair` key) — the latter covers factory functions
+// that return an object of arrow methods (the Zustand actions-slice pattern, #341).
 static TSNode resolve_toplevel_arrow_name(TSNode node, const char *kind) {
     if (strcmp(kind, "arrow_function") != 0) {
         TSNode null_node = {0};
         return null_node;
     }
     TSNode parent = ts_node_parent(node);
-    if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "variable_declarator") == 0) {
+    if (ts_node_is_null(parent)) {
+        TSNode null_node = {0};
+        return null_node;
+    }
+    const char *pk = ts_node_type(parent);
+    if (strcmp(pk, "variable_declarator") == 0) {
         return ts_node_child_by_field_name(parent, TS_FIELD("name"));
+    }
+    if (strcmp(pk, "pair") == 0) {
+        return ts_node_child_by_field_name(parent, TS_FIELD("key"));
     }
     TSNode null_node = {0};
     return null_node;
@@ -2113,7 +2123,9 @@ static TSNode resolve_dart_method_name(TSNode child, const char *ck) {
     return null_node;
 }
 
-// Arrow function: name on parent variable_declarator/field_definition.
+// Arrow function: name on parent variable_declarator/field_definition, or the
+// key of an object-literal property — the Zustand "actions returned from a
+// factory" pattern, `{ addItem: (...) => {...} }` (#341).
 static TSNode resolve_arrow_func_name(TSNode child) {
     TSNode parent = ts_node_parent(child);
     if (!ts_node_is_null(parent)) {
@@ -2123,6 +2135,10 @@ static TSNode resolve_arrow_func_name(TSNode child) {
         }
         if (strcmp(pk, "public_field_definition") == 0 || strcmp(pk, "variable_declarator") == 0) {
             return ts_node_child_by_field_name(parent, TS_FIELD("name"));
+        }
+        if (strcmp(pk, "pair") == 0) {
+            // Object-literal property `key: () => {...}` → name is the key.
+            return ts_node_child_by_field_name(parent, TS_FIELD("key"));
         }
     }
     TSNode null_node = {0};
@@ -3581,7 +3597,15 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
         if (cbm_kind_in_set(node, spec->function_node_types)) {
             if (!is_template_class_node(node, ctx->language)) {
                 extract_func_def(ctx, node, spec);
-                if (ctx->language != CBM_LANG_WOLFRAM) {
+                // Most languages stop here. JS/TS (and Wolfram) descend into the
+                // function body so NESTED named definitions are also captured —
+                // e.g. arrow methods of an object literal returned from a factory
+                // (the Zustand actions-slice pattern, #341). Anonymous nested
+                // arrows have no resolvable name and are skipped.
+                bool descend_into_func =
+                    (ctx->language == CBM_LANG_WOLFRAM || ctx->language == CBM_LANG_TYPESCRIPT ||
+                     ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TSX);
+                if (!descend_into_func) {
                     continue;
                 }
             }
