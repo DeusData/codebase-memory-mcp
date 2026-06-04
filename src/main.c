@@ -340,6 +340,7 @@ static void setup_signal_handlers(void) {
 
 int main(int argc, char **argv) {
     cbm_profile_init(); /* reads CBM_PROFILE env var, gates all prof macros */
+    cbm_log_init_from_env(); /* apply CBM_LOG_LEVEL before any output */
     int subcmd = handle_subcommand(argc, argv);
     if (subcmd >= 0) {
         return subcmd;

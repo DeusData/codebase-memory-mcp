@@ -5,7 +5,7 @@
  *   - All output goes to stderr (stdout is reserved for MCP JSON-RPC)
  *   - Structured format: "level=info msg=pass.timing pass=defs elapsed_ms=42"
  *   - Levels: DEBUG, INFO, WARN, ERROR
- *   - Level filtering at compile time (CBM_LOG_MIN_LEVEL) and runtime
+ *   - Level filtering at runtime via CBM_LOG_LEVEL env var, or cbm_log_set_level()
  *   - Thread-safe (each fprintf is atomic on POSIX for lines < PIPE_BUF)
  */
 #ifndef CBM_LOG_H
@@ -21,12 +21,17 @@ typedef enum {
     CBM_LOG_NONE = 4 /* disable all logging */
 } CBMLogLevel;
 
+/* Initialise log level from the CBM_LOG_LEVEL environment variable.
+ * Accepted values (case-insensitive): debug, info, warn, error, none.
+ * Unknown values are silently ignored and the level stays at its current
+ * value. Call once at startup, before the first log statement. */
+void cbm_log_init_from_env(void);
+
 /* Set minimum log level (default: INFO). */
 void cbm_log_set_level(CBMLogLevel level);
 
 /* Get current log level. */
 CBMLogLevel cbm_log_get_level(void);
-
 /* Core logging function. msg is a short semantic tag.
  * Variadic args are key-value pairs: (const char *key, const char *value)...
  * Terminated by NULL key.
