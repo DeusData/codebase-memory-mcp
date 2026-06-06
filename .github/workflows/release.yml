@@ -308,6 +308,44 @@ jobs:
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
         run: twine upload --non-interactive dist/*
 
+  # ── 8b. Publish server.json to the official MCP Registry ──────
+  # Runs after npm + PyPI so the registry can verify package ownership
+  # (npm: `mcpName` field in package.json; PyPI: `mcp-name:` marker in
+  # the package README). Authenticates with GitHub Actions OIDC — no
+  # token, no interactive device flow. server.json's version is synced
+  # from the just-published npm package so it always matches the release.
+  #
+  # Intentionally does NOT gate publish-final: the binary release is the
+  # product, the registry entry is metadata. A registry-preview outage
+  # must never block shipping. Re-run this job alone to retry — it does
+  # not touch npm/PyPI, so retries are safe.
+  publish-mcp-registry:
+    needs: [publish-registries]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # GitHub OIDC auth to the MCP Registry
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Sync server.json version to the released package
+        run: |
+          VERSION=$(jq -r '.version' pkg/npm/package.json)
+          jq --arg v "$VERSION" '.version = $v | (.packages[].version) = $v' \
+            server.json > server.tmp && mv server.tmp server.json
+          echo "server.json pinned to $VERSION"
+          cat server.json
+
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Authenticate to MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server.json to MCP Registry
+        run: ./mcp-publisher publish
+
   # ── 9. Atomic un-draft (only after npm + PyPI succeed) ────────
   # The GitHub release stays in DRAFT until both registries publish.
   # If anything upstream fails, the draft can be deleted and the run
