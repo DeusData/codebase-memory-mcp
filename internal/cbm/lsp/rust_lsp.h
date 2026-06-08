@@ -45,6 +45,7 @@ struct CBMCargoManifest;
 #define CBM_RUST_CONF_UFCS        0.93f  /* T::method() / Self::new()    */
 #define CBM_RUST_CONF_PROMOTED    0.90f  /* through Deref / blanket impl */
 #define CBM_RUST_CONF_MACRO_KNOWN 0.85f  /* known std macro mapped to fn */
+#define CBM_RUST_CONF_OPERATOR    0.88f  /* a+b → T::add (operator trait) */
 
 /* Rust-flavoured LSP context: one per file, lifetime tied to a single
  * `cbm_extract_file()` invocation (or the cross-file caller's arena). */
@@ -144,6 +145,24 @@ typedef struct {
 
     /* Output: resolved (and unresolved-with-reason) calls accumulate here. */
     CBMResolvedCallArray* resolved_calls;
+
+    /* Syntactic-call list (result->calls), borrowed from the per-file
+     * extraction result. The downstream pipeline only turns a resolved_call
+     * into a CALLS edge when a *syntactic* CBMCall with the same
+     * (enclosing_func_qn, callee short-name) exists here. Some calls the Rust
+     * resolver recovers — operator-trait desugaring (`a + b`) and method
+     * calls hidden inside macro token-trees (`format!("{}", d.label())`) —
+     * never appear in result->calls because the syntactic extractor cannot
+     * see them. When this is non-NULL the resolver injects matching synthetic
+     * CBMCall entries so those recovered calls become real edges. NULL in the
+     * cross-file path (no result available). */
+    CBMCallArray* syn_calls;
+
+    /* While >0, rust_emit_resolved_call also injects a matching synthetic
+     * CBMCall into `syn_calls` so the recovered call becomes an edge. Set
+     * around the macro-argument re-parse where the syntactic extractor never
+     * produced a call node. */
+    int inject_syn_calls;
 
     /* CBM_LSP_DEBUG=1 in env enables verbose stderr trace. */
     bool debug;

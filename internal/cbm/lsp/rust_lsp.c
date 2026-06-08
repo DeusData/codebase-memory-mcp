@@ -41,6 +41,7 @@
 static void rust_resolve_calls_in_node(RustLSPContext* ctx, TSNode node);
 static void rust_emit_resolved_call(RustLSPContext* ctx, const char* callee_qn,
     const char* strategy, float confidence);
+static void rust_inject_syn_call(RustLSPContext* ctx, const char* callee_qn);
 static void rust_emit_unresolved_call(RustLSPContext* ctx, const char* expr_text,
     const char* reason);
 static const CBMType* rust_lookup_field(RustLSPContext* ctx,
@@ -2312,6 +2313,56 @@ static void rust_walk_macro_tokens(RustLSPContext* ctx, TSNode node) {
     }
 }
 
+/* Map a Rust infix/index operator token to the std::ops trait method that
+ * the compiler desugars it to. `a + b` calls `Add::add`, `a[i]` calls
+ * `Index::index`, etc. Returns NULL for operators with no overloadable
+ * trait method (comparison/logical operators route through PartialEq /
+ * PartialOrd whose methods we don't model here — sound to skip). */
+static const char* rust_binop_trait_method(const char* op_text) {
+    if (!op_text) return NULL;
+    if (strcmp(op_text, "+") == 0) return "add";
+    if (strcmp(op_text, "-") == 0) return "sub";
+    if (strcmp(op_text, "*") == 0) return "mul";
+    if (strcmp(op_text, "/") == 0) return "div";
+    if (strcmp(op_text, "%") == 0) return "rem";
+    if (strcmp(op_text, "&") == 0) return "bitand";
+    if (strcmp(op_text, "|") == 0) return "bitor";
+    if (strcmp(op_text, "^") == 0) return "bitxor";
+    if (strcmp(op_text, "<<") == 0) return "shl";
+    if (strcmp(op_text, ">>") == 0) return "shr";
+    return NULL;
+}
+
+/* If `recv` is a user-defined NAMED type that defines operator method
+ * `method` (via inherent impl or `impl <trait> for T`), emit a CALLS edge to
+ * it. Models Rust operator-overload desugaring (`a + b` → T::add, `a[i]` →
+ * T::index). Sound-only: we emit nothing when the operand type is unknown,
+ * primitive, or the type has no such method registered — so we never guess on
+ * built-in arithmetic. */
+static void rust_emit_operator_call(RustLSPContext* ctx, const CBMType* recv,
+    const char* method) {
+    if (!recv || !method) return;
+    const CBMType* base = recv;
+    while (base && (base->kind == CBM_TYPE_REFERENCE || base->kind == CBM_TYPE_POINTER)) {
+        base = (base->kind == CBM_TYPE_REFERENCE)
+            ? base->data.reference.elem : base->data.pointer.elem;
+    }
+    /* Only user-defined named types — built-in arithmetic must not emit. */
+    if (!base || base->kind != CBM_TYPE_NAMED) return;
+    const char* type_qn = base->data.named.qualified_name;
+    if (!type_qn || is_rust_primitive(type_qn)) return;
+    int impl_count = 0;
+    const CBMRegisteredFunc* m = rust_resolve_trait_method(ctx, type_qn, method, &impl_count);
+    if (m && m->qualified_name) {
+        rust_emit_resolved_call(ctx, m->qualified_name, "lsp_operator_trait",
+                                CBM_RUST_CONF_OPERATOR);
+        /* `a + b` is a binary_expression, never a syntactic call node, so the
+         * extractor produced no CBMCall to pair with the resolved_call above.
+         * Inject one so the pipeline emits the CALLS edge. */
+        rust_inject_syn_call(ctx, m->qualified_name);
+    }
+}
+
 /* ── User-defined macro_rules! support ────────────────────────────
  *
  * Strategy: collect every `macro_rules!` definition in the file
@@ -2878,6 +2929,88 @@ static void rust_expand_user_macro(RustLSPContext* ctx, const char* mname,
     ts_parser_delete(parser);
 }
 
+/* Re-parse the argument list of a built-in expression-macro (format!,
+ * println!, assert!, …) as ordinary Rust expressions and walk them for
+ * calls. The tree-sitter-rust grammar tokenises macro arguments rather than
+ * parsing them as expression AST, so a method call like `format!("{}",
+ * d.label())` never appears as a call_expression/field_expression node and
+ * rust_walk_macro_tokens cannot recover it. Because these macros DO evaluate
+ * their arguments as normal expressions, re-parsing the argument text and
+ * resolving calls in it is sound — it recovers exactly the calls the program
+ * makes. We wrap the args in a block so each comma-separated argument parses
+ * as its own statement; the current scope (params/locals) is preserved so
+ * typed receivers still resolve. */
+static void rust_resolve_macro_arg_exprs(RustLSPContext* ctx, TSNode invocation) {
+    if (!ctx || ts_node_is_null(invocation)) return;
+    if (ctx->macro_expand_depth >= 8) return;
+
+    /* The grammar exposes the argument list as a `token_tree` child rather
+     * than via an `arguments` field, so locate it by node type. */
+    TSNode args_tt = {0};
+    uint32_t inc = ts_node_child_count(invocation);
+    for (uint32_t i = 0; i < inc; i++) {
+        TSNode c = ts_node_child(invocation, i);
+        if (!ts_node_is_null(c) && strcmp(ts_node_type(c), "token_tree") == 0) {
+            args_tt = c;
+            break;
+        }
+    }
+    if (ts_node_is_null(args_tt)) return;
+    char* at = cbm_node_text(ctx->arena, args_tt, ctx->source);
+    if (!at) return;
+    const char* inner; int inner_len;
+    rust_macro_strip_outer(at, (int)strlen(at), &inner, &inner_len);
+    if (inner_len <= 0) return;
+    char* arg_text = cbm_arena_strndup(ctx->arena, inner, (size_t)inner_len);
+    if (!arg_text) return;
+
+    /* Wrap the comma-separated arguments in a tuple expression so the whole
+     * thing parses as one valid expression (a trailing format-spec arg like
+     * `width = w` would otherwise break statement parsing). Calls inside any
+     * element are still walked. */
+    char* wrapped = cbm_arena_sprintf(ctx->arena,
+        "fn __cbm_macro_args() { let _ = (%s); }\n", arg_text);
+    if (!wrapped) return;
+
+    TSParser* parser = ts_parser_new();
+    if (!parser) return;
+    ts_parser_set_language(parser, tree_sitter_rust());
+    TSTree* tree = ts_parser_parse_string(parser, NULL, wrapped,
+        (uint32_t)strlen(wrapped));
+    if (tree) {
+        TSNode root = ts_tree_root_node(tree);
+        /* Bail out if the synthetic source failed to parse cleanly — a
+         * format-string-only arg, named args, or other non-expression token
+         * soup must not produce bogus edges. */
+        if (!ts_node_has_error(root)) {
+            ctx->macro_expand_depth++;
+            uint32_t rnc = ts_node_child_count(root);
+            for (uint32_t i = 0; i < rnc; i++) {
+                TSNode top = ts_node_child(root, i);
+                if (ts_node_is_null(top)) continue;
+                if (strcmp(ts_node_type(top), "function_item") != 0) continue;
+                TSNode body = ts_node_child_by_field_name(top, "body", 4);
+                if (ts_node_is_null(body)) continue;
+                const char* saved_source = ctx->source;
+                int saved_len = ctx->source_len;
+                ctx->source = wrapped;
+                ctx->source_len = (int)strlen(wrapped);
+                /* The syntactic extractor never produced call nodes for these
+                 * macro-hidden expressions, so resolved_calls emitted here have
+                 * no CBMCall to pair with. Inject matching synthetic calls. */
+                ctx->inject_syn_calls++;
+                rust_resolve_calls_in_node(ctx, body);
+                ctx->inject_syn_calls--;
+                ctx->source = saved_source;
+                ctx->source_len = saved_len;
+            }
+            ctx->macro_expand_depth--;
+        }
+        ts_tree_delete(tree);
+    }
+    ts_parser_delete(parser);
+}
+
 /* ════════════════════════════════════════════════════════════════════
  * 9. Statement / pattern binding
  * ════════════════════════════════════════════════════════════════════ */
@@ -3040,6 +3173,23 @@ void rust_process_statement(RustLSPContext* ctx, TSNode node) {
  * 10. Function & file walk
  * ════════════════════════════════════════════════════════════════════ */
 
+/* Inject a synthetic CBMCall into result->calls so the downstream pipeline
+ * (cbm_pipeline_find_lsp_resolution) can pair it with the resolved_call and
+ * emit a CALLS edge. `callee_qn`'s last dot segment is used as the textual
+ * callee_name, matching how the resolver's short-name comparison works. Only
+ * used for calls the syntactic extractor cannot see (operator desugaring,
+ * macro-hidden method calls). */
+static void rust_inject_syn_call(RustLSPContext* ctx, const char* callee_qn) {
+    if (!ctx || !ctx->syn_calls || !callee_qn || !ctx->enclosing_func_qn) return;
+    const char* dot = strrchr(callee_qn, '.');
+    const char* short_name = dot ? dot + 1 : callee_qn;
+    if (!short_name || !short_name[0]) return;
+    CBMCall call = {0};
+    call.callee_name = cbm_arena_strdup(ctx->arena, short_name);
+    call.enclosing_func_qn = ctx->enclosing_func_qn;
+    cbm_calls_push(ctx->syn_calls, ctx->arena, call);
+}
+
 static void rust_emit_resolved_call(RustLSPContext* ctx, const char* callee_qn,
     const char* strategy, float confidence) {
     if (!ctx || !ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn) return;
@@ -3051,6 +3201,9 @@ static void rust_emit_resolved_call(RustLSPContext* ctx, const char* callee_qn,
         .reason = NULL,
     };
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+    if (ctx->inject_syn_calls > 0) {
+        rust_inject_syn_call(ctx, callee_qn);
+    }
 }
 
 static void rust_emit_unresolved_call(RustLSPContext* ctx, const char* expr_text,
@@ -3387,6 +3540,37 @@ static void rust_resolve_calls_in_node(RustLSPContext* ctx, TSNode node) {
         /* Continue recursion so calls inside arguments are also seen. */
     }
 
+    /* Operator-overload desugaring: `a + b` calls <T as Add>::add when the
+     * left operand is a user-defined type T with that operator method;
+     * `a[i]` calls T::index. The tree-sitter-rust grammar models these as
+     * binary_expression / index_expression rather than call_expression, so
+     * lang_specs.c's call-type whitelist never sees them — we recover the
+     * call edge here. Sound-only via rust_emit_operator_call (no edge unless
+     * the operand type actually defines the method). */
+    if (strcmp(kind, "binary_expression") == 0) {
+        TSNode left = ts_node_child_by_field_name(node, "left", 4);
+        if (!ts_node_is_null(left)) {
+            for (uint32_t i = 0; i < ts_node_child_count(node); i++) {
+                TSNode c = ts_node_child(node, i);
+                if (ts_node_is_named(c)) continue;
+                char* op = rust_node_text(ctx, c);
+                const char* method = rust_binop_trait_method(op);
+                if (method) {
+                    rust_emit_operator_call(ctx, rust_eval_expr_type(ctx, left), method);
+                }
+                break; /* operator is the sole anonymous child */
+            }
+        }
+    } else if (strcmp(kind, "index_expression") == 0) {
+        TSNode value = ts_node_child_by_field_name(node, "value", 5);
+        if (ts_node_is_null(value) && ts_node_named_child_count(node) > 0) {
+            value = ts_node_named_child(node, 0);
+        }
+        if (!ts_node_is_null(value)) {
+            rust_emit_operator_call(ctx, rust_eval_expr_type(ctx, value), "index");
+        }
+    }
+
     /* Macro invocation: walk inner tokens for nested calls and try the
      * macro-as-function mapping. */
     if (strcmp(kind, "macro_invocation") == 0) {
@@ -3397,6 +3581,23 @@ static void rust_resolve_calls_in_node(RustLSPContext* ctx, TSNode node) {
                 /* For known std macros emit a synthetic call under their
                  * canonical paths so trace tools can see the dependency. */
                 const char* path = NULL;
+                /* Macros whose arguments are ordinary Rust expressions — their
+                 * call sites are lost to tree-sitter's macro tokenisation, so
+                 * re-parse the args to recover calls like `format!("{}",
+                 * d.label())`. */
+                bool expr_arg_macro =
+                    strcmp(mname, "println") == 0 || strcmp(mname, "eprintln") == 0 ||
+                    strcmp(mname, "print") == 0 || strcmp(mname, "eprint") == 0 ||
+                    strcmp(mname, "format") == 0 || strcmp(mname, "write") == 0 ||
+                    strcmp(mname, "writeln") == 0 || strcmp(mname, "panic") == 0 ||
+                    strcmp(mname, "assert") == 0 || strcmp(mname, "assert_eq") == 0 ||
+                    strcmp(mname, "assert_ne") == 0 || strcmp(mname, "debug_assert") == 0 ||
+                    strcmp(mname, "debug_assert_eq") == 0 ||
+                    strcmp(mname, "debug_assert_ne") == 0 ||
+                    strcmp(mname, "dbg") == 0;
+                if (expr_arg_macro) {
+                    rust_resolve_macro_arg_exprs(ctx, node);
+                }
                 if (strcmp(mname, "println") == 0 || strcmp(mname, "eprintln") == 0 ||
                     strcmp(mname, "print") == 0 || strcmp(mname, "eprint") == 0 ||
                     strcmp(mname, "format") == 0 || strcmp(mname, "write") == 0 ||
@@ -4600,6 +4801,9 @@ void cbm_run_rust_lsp_with_manifest(CBMArena* arena, CBMFileResult* result,
     RustLSPContext ctx;
     rust_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, &result->resolved_calls);
     ctx.cargo_manifest = manifest;
+    /* Let the resolver inject synthetic syntactic calls for operator/macro
+     * desugaring so those recovered calls reach the CALLS-edge pipeline. */
+    ctx.syn_calls = &result->calls;
 
     rust_collect_uses(&ctx, root);
     /* Bridge any extracted CBMImports the unified extractor saw. */
