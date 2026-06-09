@@ -3761,8 +3761,13 @@ static void build_update_url(char *url, int url_sz, const char *os, const char *
     if (!base_url || !base_url[0]) {
         base_url = "https://github.com/DeusData/codebase-memory-mcp/releases/latest/download";
     }
-    snprintf(url, url_sz, "%s/codebase-memory-mcp-%s%s-%s.%s", base_url, want_ui ? "ui-" : "", os,
-             arch, ext);
+    /* Linux ships a fully-static "-portable" build; the standard linux binary
+     * dynamically links glibc 2.38+ and fails on older distros. macOS/Windows
+     * have no such variant. Keep in sync with install.sh / install.js / pypi
+     * _cli.py. */
+    const char *portable = (strcmp(os, "linux") == 0) ? "-portable" : "";
+    snprintf(url, url_sz, "%s/codebase-memory-mcp-%s%s-%s%s.%s", base_url, want_ui ? "ui-" : "", os,
+             arch, portable, ext);
 }
 
 /* Prompt to delete existing indexes. Returns 0 to continue, 1 to abort. */
@@ -3801,8 +3806,10 @@ static int download_verify_install(const char *url, const char *ext, const char 
     }
 
     char archive_name[CLI_BUF_256];
-    snprintf(archive_name, sizeof(archive_name), "codebase-memory-mcp-%s%s-%s.%s",
-             want_ui ? "ui-" : "", os, arch, ext);
+    /* Must match build_update_url: linux uses the static "-portable" asset. */
+    const char *portable = (strcmp(os, "linux") == 0) ? "-portable" : "";
+    snprintf(archive_name, sizeof(archive_name), "codebase-memory-mcp-%s%s-%s%s.%s",
+             want_ui ? "ui-" : "", os, arch, portable, ext);
     int crc = verify_download_checksum(tmp_archive, archive_name);
     if (crc == CLI_TRUE) {
         cbm_unlink(tmp_archive);

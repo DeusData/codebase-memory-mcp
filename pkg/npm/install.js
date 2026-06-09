@@ -105,7 +105,11 @@ async function main() {
 
   fs.mkdirSync(BIN_DIR, { recursive: true });
 
-  const archive = `codebase-memory-mcp-${platform}-${arch}.${ext}`;
+  // Linux ships a fully-static "-portable" build; the standard linux binary
+  // dynamically links glibc 2.38+ and fails on older distros. macOS/Windows
+  // have no such variant. Keep in sync with install.sh / pypi _cli.py / cli.c.
+  const variant = platform === 'linux' ? '-portable' : '';
+  const archive = `codebase-memory-mcp-${platform}-${arch}${variant}.${ext}`;
   const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${archive}`;
 
   process.stdout.write(`codebase-memory-mcp: downloading v${VERSION} for ${platform}/${arch}...\n`);

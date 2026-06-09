@@ -584,6 +584,17 @@ if ! echo "$UPDATE_OUT" | grep -qi 'standard'; then
   echo "FAIL: update --dry-run did not respect --standard flag"
   exit 1
 fi
+# On Linux the binary must self-update from the static "-portable" asset: the
+# standard linux asset dynamically links glibc 2.38+ and breaks on older distros
+# (Debian 11, RHEL 8, Ubuntu 20.04). Guards build_update_url in src/cli/cli.c.
+if [ "$(uname -s)" = "Linux" ]; then
+  if ! echo "$UPDATE_OUT" | grep -q -- '-portable'; then
+    echo "FAIL: linux update --dry-run does not target the -portable asset"
+    echo "$UPDATE_OUT"
+    exit 1
+  fi
+  echo "OK: linux update targets the -portable (static) asset"
+fi
 echo "OK: update --dry-run --standard completed"
 
 # 6d: config set/get/reset round-trip

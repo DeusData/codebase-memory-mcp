@@ -153,7 +153,11 @@ def _download(version: str) -> Path:
     os_name = _os_name()
     arch = _arch()
     ext = "zip" if os_name == "windows" else "tar.gz"
-    archive = f"codebase-memory-mcp-{os_name}-{arch}.{ext}"
+    # Linux ships a fully-static "-portable" build; the standard linux binary
+    # dynamically links glibc 2.38+ and fails on older distros. macOS/Windows
+    # have no such variant. Keep in sync with install.sh / install.js / cli.c.
+    variant = "-portable" if os_name == "linux" else ""
+    archive = f"codebase-memory-mcp-{os_name}-{arch}{variant}.{ext}"
     url = f"https://github.com/{REPO}/releases/download/v{version}/{archive}"
     _validate_url_scheme(url)
 

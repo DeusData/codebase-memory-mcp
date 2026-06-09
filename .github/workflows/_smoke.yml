@@ -189,6 +189,13 @@ jobs:
           chmod +x codebase-memory-mcp
           scripts/smoke-test.sh ./codebase-memory-mcp
 
+      # The -portable binary is what all linux install/update paths now deliver;
+      # it MUST start on old glibc (Debian 11 / RHEL 8 / Ubuntu 20.04). Runs it
+      # in debian:bullseye (glibc 2.31) — the standard dynamic binary would fail
+      # here with `GLIBC_2.38 not found`.
+      - name: Old-glibc compatibility
+        run: scripts/ci/check-glibc-compat.sh ./codebase-memory-mcp
+
       - name: Security audits
         run: |
           scripts/security-strings.sh ./codebase-memory-mcp
