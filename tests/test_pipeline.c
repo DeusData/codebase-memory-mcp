@@ -1134,13 +1134,43 @@ static int node_exists_by_qn(cbm_store_t *s, const char *project, const char *qn
     return count > 0;
 }
 
+static int count_nodes_by_label(cbm_store_t *s, const char *project, const char *label) {
+    sqlite3_stmt *stmt = NULL;
+    struct sqlite3 *db = cbm_store_get_db(s);
+    if (!db) {
+        return -1;
+    }
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM nodes WHERE project=?1 AND label=?2", -1,
+                           &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, label, -1, SQLITE_STATIC);
+    int count = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
 typedef struct {
     char cache[256];
     char provider_root[256];
     char consumer_root[256];
     char provider_db[512];
     char consumer_db[512];
+    char previous_cache[512];
+    int had_previous_cache;
 } cross_maven_fixture_t;
+
+static void restore_cross_maven_cache_env(cross_maven_fixture_t *fx) {
+    if (fx->had_previous_cache) {
+        cbm_setenv("CBM_CACHE_DIR", fx->previous_cache, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+}
 
 static int setup_cross_maven_fixture(cross_maven_fixture_t *fx, const char *provider_pom,
                                      const char *consumer_pom) {
@@ -1169,6 +1199,11 @@ static int setup_cross_maven_fixture(cross_maven_fixture_t *fx, const char *prov
         return -1;
     }
 
+    const char *previous_cache = getenv("CBM_CACHE_DIR");
+    if (previous_cache) {
+        fx->had_previous_cache = 1;
+        snprintf(fx->previous_cache, sizeof(fx->previous_cache), "%s", previous_cache);
+    }
     cbm_setenv("CBM_CACHE_DIR", fx->cache, 1);
     snprintf(fx->provider_db, sizeof(fx->provider_db), "%s/provider.db", fx->cache);
     snprintf(fx->consumer_db, sizeof(fx->consumer_db), "%s/consumer.db", fx->cache);
@@ -1185,6 +1220,7 @@ static int setup_cross_maven_fixture(cross_maven_fixture_t *fx, const char *prov
         th_cleanup(fx->consumer_root);
         th_cleanup(fx->provider_root);
         th_cleanup(fx->cache);
+        restore_cross_maven_cache_env(fx);
         return -1;
     }
     int ok = cbm_store_upsert_project(provider, "provider", fx->provider_root) == CBM_STORE_OK &&
@@ -1233,6 +1269,7 @@ static int setup_cross_maven_fixture(cross_maven_fixture_t *fx, const char *prov
         th_cleanup(fx->consumer_root);
         th_cleanup(fx->provider_root);
         th_cleanup(fx->cache);
+        restore_cross_maven_cache_env(fx);
         return -1;
     }
     return 0;
@@ -1242,6 +1279,7 @@ static void cleanup_cross_maven_fixture(cross_maven_fixture_t *fx) {
     th_cleanup(fx->consumer_root);
     th_cleanup(fx->provider_root);
     th_cleanup(fx->cache);
+    restore_cross_maven_cache_env(fx);
 }
 
 TEST(cross_repo_maven_dependency_creates_library_edges) {
@@ -1447,6 +1485,108 @@ TEST(cross_repo_maven_removed_dependency_clears_provider_used_by) {
     ASSERT_EQ(count_edges_by_type(provider, "provider", "CROSS_LIBRARY_USED_BY"), 0);
     cbm_store_close(consumer);
     cbm_store_close(provider);
+
+    cleanup_cross_maven_fixture(&fx);
+    PASS();
+}
+
+TEST(cross_repo_maven_fixture_restores_cache_dir) {
+    const char *provider_pom = "<project><modelVersion>4.0.0</modelVersion>"
+                               "<groupId>com.example.platform</groupId>"
+                               "<artifactId>shared-library</artifactId>"
+                               "<version>1.0.0</version></project>";
+    const char *consumer_pom =
+        "<project><modelVersion>4.0.0</modelVersion>"
+        "<groupId>app</groupId><artifactId>consumer</artifactId></project>";
+    const char *original = getenv("CBM_CACHE_DIR");
+    char original_copy[512] = {0};
+    if (original) {
+        snprintf(original_copy, sizeof(original_copy), "%s", original);
+    }
+
+    cross_maven_fixture_t fx;
+    ASSERT_EQ(setup_cross_maven_fixture(&fx, provider_pom, consumer_pom), 0);
+    ASSERT_STR_EQ(getenv("CBM_CACHE_DIR"), fx.cache);
+    cleanup_cross_maven_fixture(&fx);
+
+    if (original) {
+        ASSERT_STR_EQ(getenv("CBM_CACHE_DIR"), original_copy);
+    } else {
+        ASSERT_EQ(getenv("CBM_CACHE_DIR") == NULL, 1);
+    }
+    PASS();
+}
+
+TEST(cross_repo_maven_long_references_do_not_collide) {
+    char group[128];
+    char artifact[128];
+    memset(group, 'g', sizeof(group) - 1);
+    group[sizeof(group) - 1] = '\0';
+    memset(artifact, 'a', sizeof(artifact) - 1);
+    artifact[sizeof(artifact) - 1] = '\0';
+
+    char provider_pom[512];
+    snprintf(provider_pom, sizeof(provider_pom),
+             "<project><modelVersion>4.0.0</modelVersion><groupId>%s</groupId>"
+             "<artifactId>%s</artifactId><version>1.0.0</version></project>",
+             group, artifact);
+    const char *consumer_pom =
+        "<project><modelVersion>4.0.0</modelVersion>"
+        "<groupId>app</groupId><artifactId>consumer</artifactId></project>";
+    cross_maven_fixture_t fx;
+    ASSERT_EQ(setup_cross_maven_fixture(&fx, provider_pom, consumer_pom), 0);
+
+    char common_path[360];
+    memset(common_path, 0, sizeof(common_path));
+    snprintf(common_path, sizeof(common_path),
+             "modules/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"
+             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/"
+             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/");
+    char dep_path_a[420];
+    char dep_path_b[420];
+    snprintf(dep_path_a, sizeof(dep_path_a), "%sdep-a/pom.xml", common_path);
+    snprintf(dep_path_b, sizeof(dep_path_b), "%sdep-b/pom.xml", common_path);
+
+    char dep_pom[512];
+    snprintf(dep_pom, sizeof(dep_pom),
+             "<project><modelVersion>4.0.0</modelVersion>"
+             "<groupId>app</groupId><artifactId>consumer-module</artifactId>"
+             "<dependencies><dependency><groupId>%s</groupId><artifactId>%s</artifactId>"
+             "<version>1.0.0</version></dependency></dependencies></project>",
+             group, artifact);
+    ASSERT_EQ(th_write_file(TH_PATH(fx.consumer_root, dep_path_a), dep_pom), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(fx.consumer_root, dep_path_b), dep_pom), 0);
+
+    cbm_store_t *consumer = cbm_store_open_path(fx.consumer_db);
+    ASSERT_NOT_NULL(consumer);
+    cbm_node_t dep_pom_a = {.project = "consumer",
+                            .label = "File",
+                            .name = "pom.xml",
+                            .qualified_name = "consumer.long.a.pom",
+                            .file_path = dep_path_a,
+                            .start_line = 1,
+                            .end_line = 1,
+                            .properties_json = "{}"};
+    cbm_node_t dep_pom_b = {.project = "consumer",
+                            .label = "File",
+                            .name = "pom.xml",
+                            .qualified_name = "consumer.long.b.pom",
+                            .file_path = dep_path_b,
+                            .start_line = 1,
+                            .end_line = 1,
+                            .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(consumer, &dep_pom_a), 0);
+    ASSERT_GT(cbm_store_upsert_node(consumer, &dep_pom_b), 0);
+    cbm_store_close(consumer);
+
+    const char *targets[] = {"provider"};
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("consumer", targets, 1);
+    ASSERT_EQ(result.library_edges, 2);
+
+    consumer = cbm_store_open_path(fx.consumer_db);
+    ASSERT_NOT_NULL(consumer);
+    ASSERT_EQ(count_nodes_by_label(consumer, "consumer", "Library"), 2);
+    cbm_store_close(consumer);
 
     cleanup_cross_maven_fixture(&fx);
     PASS();
@@ -6251,6 +6391,8 @@ SUITE(pipeline) {
     RUN_TEST(cross_repo_maven_commented_dependency_does_not_create_library_edge);
     RUN_TEST(cross_repo_maven_cleanup_preserves_unrelated_nodes);
     RUN_TEST(cross_repo_maven_removed_dependency_clears_provider_used_by);
+    RUN_TEST(cross_repo_maven_fixture_restores_cache_dir);
+    RUN_TEST(cross_repo_maven_long_references_do_not_collide);
     /* Incremental */
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_detects_changed_file);

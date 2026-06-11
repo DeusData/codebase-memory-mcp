@@ -587,6 +587,27 @@ static void build_library_props(char *buf, size_t bufsz, const char *other_proje
     yyjson_mut_doc_free(doc);
 }
 
+static char *format_library_qn(const char *prefix, const char *project, const mcr_dependency_t *dep) {
+    if (!prefix || !project || !dep) {
+        return NULL;
+    }
+    int needed =
+        snprintf(NULL, 0, "%s%s__%s__%s:%s__via__%s:%s__%s", prefix, project, dep->relation,
+                 dep->group_id, dep->artifact_id, dep->context_group_id, dep->context_artifact_id,
+                 dep->pom_path);
+    if (needed < 0) {
+        return NULL;
+    }
+    char *qn = malloc((size_t)needed + SKIP_ONE);
+    if (!qn) {
+        return NULL;
+    }
+    snprintf(qn, (size_t)needed + SKIP_ONE, "%s%s__%s__%s:%s__via__%s:%s__%s", prefix, project,
+             dep->relation, dep->group_id, dep->artifact_id, dep->context_group_id,
+             dep->context_artifact_id, dep->pom_path);
+    return qn;
+}
+
 static int emit_library_match(cbm_store_t *src_store, const char *src_project,
                               cbm_store_t *tgt_store, const char *tgt_project,
                               const mcr_dependency_t *dep) {
@@ -596,10 +617,16 @@ static int emit_library_match(cbm_store_t *src_store, const char *src_project,
         return 0;
     }
 
-    char lib_qn[MCR_QN_BUF];
-    snprintf(lib_qn, sizeof(lib_qn), "__library__%s__%s__%s:%s__via__%s:%s__%s", tgt_project,
-             dep->relation, dep->group_id, dep->artifact_id, dep->context_group_id,
-             dep->context_artifact_id, dep->pom_path);
+    char *lib_qn = format_library_qn("__library__", tgt_project, dep);
+    if (!lib_qn) {
+        return 0;
+    }
+    char *consumer_qn = format_library_qn("__library_consumer__", src_project, dep);
+    if (!consumer_qn) {
+        free(lib_qn);
+        return 0;
+    }
+
     char props[MCR_PROPS_BUF];
     build_library_props(props, sizeof(props), tgt_project, dep);
     cbm_node_t lib = {
@@ -614,15 +641,11 @@ static int emit_library_match(cbm_store_t *src_store, const char *src_project,
     };
     int64_t lib_id = cbm_store_upsert_node(src_store, &lib);
     if (lib_id <= 0) {
+        free(consumer_qn);
+        free(lib_qn);
         return 0;
     }
-    insert_cross_edge(src_store, src_project, src_project_id, lib_id, "CROSS_LIBRARY_DEPENDS_ON",
-                      props);
 
-    char consumer_qn[MCR_QN_BUF];
-    snprintf(consumer_qn, sizeof(consumer_qn), "__library_consumer__%s__%s__%s:%s__via__%s:%s__%s",
-             src_project, dep->relation, dep->group_id, dep->artifact_id, dep->context_group_id,
-             dep->context_artifact_id, dep->pom_path);
     char reverse_props[MCR_PROPS_BUF];
     build_library_props(reverse_props, sizeof(reverse_props), src_project, dep);
     cbm_node_t consumer = {
@@ -637,10 +660,16 @@ static int emit_library_match(cbm_store_t *src_store, const char *src_project,
     };
     int64_t consumer_id = cbm_store_upsert_node(tgt_store, &consumer);
     if (consumer_id <= 0) {
+        free(consumer_qn);
+        free(lib_qn);
         return 0;
     }
+    insert_cross_edge(src_store, src_project, src_project_id, lib_id, "CROSS_LIBRARY_DEPENDS_ON",
+                      props);
     insert_cross_edge(tgt_store, tgt_project, tgt_project_id, consumer_id, "CROSS_LIBRARY_USED_BY",
                       reverse_props);
+    free(consumer_qn);
+    free(lib_qn);
     return 1;
 }
 
