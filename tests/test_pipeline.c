@@ -1592,6 +1592,78 @@ TEST(cross_repo_maven_long_references_do_not_collide) {
     PASS();
 }
 
+TEST(cross_repo_maven_very_long_pom_paths_do_not_truncate) {
+    const char *provider_pom = "<project><modelVersion>4.0.0</modelVersion>"
+                               "<groupId>com.example.platform</groupId>"
+                               "<artifactId>shared-library</artifactId>"
+                               "<version>1.0.0</version></project>";
+    const char *consumer_pom =
+        "<project><modelVersion>4.0.0</modelVersion>"
+        "<groupId>app</groupId><artifactId>consumer</artifactId></project>";
+    const char *dep_pom =
+        "<project><modelVersion>4.0.0</modelVersion>"
+        "<groupId>app</groupId><artifactId>consumer-module</artifactId>"
+        "<dependencies><dependency><groupId>com.example.platform</groupId>"
+        "<artifactId>shared-library</artifactId><version>1.0.0</version>"
+        "</dependency></dependencies></project>";
+    cross_maven_fixture_t fx;
+    ASSERT_EQ(setup_cross_maven_fixture(&fx, provider_pom, consumer_pom), 0);
+
+    const char *common_path =
+        "modules/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/"
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/"
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/"
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/"
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff/"
+        "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg/"
+        "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh/";
+    char dep_path_a[640];
+    char dep_path_b[640];
+    snprintf(dep_path_a, sizeof(dep_path_a), "%sdep-a/pom.xml", common_path);
+    snprintf(dep_path_b, sizeof(dep_path_b), "%sdep-b/pom.xml", common_path);
+    ASSERT_GT((int)strlen(dep_path_a), 512);
+    ASSERT_EQ(strncmp(dep_path_a, dep_path_b, 512), 0);
+
+    ASSERT_EQ(th_write_file(TH_PATH(fx.consumer_root, dep_path_a), dep_pom), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(fx.consumer_root, dep_path_b), dep_pom), 0);
+
+    cbm_store_t *consumer = cbm_store_open_path(fx.consumer_db);
+    ASSERT_NOT_NULL(consumer);
+    cbm_node_t dep_pom_a = {.project = "consumer",
+                            .label = "File",
+                            .name = "pom.xml",
+                            .qualified_name = "consumer.very.long.a.pom",
+                            .file_path = dep_path_a,
+                            .start_line = 1,
+                            .end_line = 1,
+                            .properties_json = "{}"};
+    cbm_node_t dep_pom_b = {.project = "consumer",
+                            .label = "File",
+                            .name = "pom.xml",
+                            .qualified_name = "consumer.very.long.b.pom",
+                            .file_path = dep_path_b,
+                            .start_line = 1,
+                            .end_line = 1,
+                            .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(consumer, &dep_pom_a), 0);
+    ASSERT_GT(cbm_store_upsert_node(consumer, &dep_pom_b), 0);
+    cbm_store_close(consumer);
+
+    const char *targets[] = {"provider"};
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("consumer", targets, 1);
+    ASSERT_EQ(result.library_edges, 2);
+
+    consumer = cbm_store_open_path(fx.consumer_db);
+    ASSERT_NOT_NULL(consumer);
+    ASSERT_EQ(count_nodes_by_label(consumer, "consumer", "Library"), 2);
+    ASSERT_TRUE(edge_props_are_valid_json(consumer, "consumer", "CROSS_LIBRARY_DEPENDS_ON"));
+    cbm_store_close(consumer);
+
+    cleanup_cross_maven_fixture(&fx);
+    PASS();
+}
+
 TEST(usages_creates_edges) {
     /* Port of TestPassUsagesCreatesEdges.
      * Go source with callback reference → USAGE edge. */
@@ -6393,6 +6465,7 @@ SUITE(pipeline) {
     RUN_TEST(cross_repo_maven_removed_dependency_clears_provider_used_by);
     RUN_TEST(cross_repo_maven_fixture_restores_cache_dir);
     RUN_TEST(cross_repo_maven_long_references_do_not_collide);
+    RUN_TEST(cross_repo_maven_very_long_pom_paths_do_not_truncate);
     /* Incremental */
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_detects_changed_file);

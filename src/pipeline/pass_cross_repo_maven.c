@@ -12,9 +12,6 @@
 #include <string.h>
 
 enum {
-    MCR_PATH_BUF = 1024,
-    MCR_QN_BUF = 512,
-    MCR_PROPS_BUF = 2048,
     MCR_MAX_EDGES = 4096,
     MCR_MAX_POM_SIZE = 2 * 1024 * 1024,
     MCR_INIT_CAP = 32,
@@ -23,7 +20,7 @@ enum {
 typedef struct {
     char group_id[CBM_SZ_128];
     char artifact_id[CBM_SZ_128];
-    char pom_path[CBM_SZ_512];
+    char *pom_path;
 } mcr_artifact_t;
 
 typedef struct {
@@ -34,8 +31,71 @@ typedef struct {
     char relation[CBM_SZ_32];
     char context_group_id[CBM_SZ_128];
     char context_artifact_id[CBM_SZ_128];
-    char pom_path[CBM_SZ_512];
+    char *pom_path;
 } mcr_dependency_t;
+
+static char *dup_cstr(const char *s) {
+    const char *value = s ? s : "";
+    char *copy = malloc(strlen(value) + SKIP_ONE);
+    if (copy) {
+        strcpy(copy, value);
+    }
+    return copy;
+}
+
+static char *join_root_path(const char *root, const char *rel) {
+    if (!root || !rel) {
+        return NULL;
+    }
+    size_t root_len = strlen(root);
+    size_t rel_len = strlen(rel);
+    if (root_len > SIZE_MAX - rel_len - PAIR_LEN) {
+        return NULL;
+    }
+    size_t len = root_len + SKIP_ONE + rel_len;
+    char *path = malloc(len + SKIP_ONE);
+    if (!path) {
+        return NULL;
+    }
+    snprintf(path, len + SKIP_ONE, "%s/%s", root, rel);
+    return path;
+}
+
+static char *format_prefixed_qn(const char *prefix, const char *value) {
+    if (!prefix || !value) {
+        return NULL;
+    }
+    int needed = snprintf(NULL, 0, "%s%s", prefix, value);
+    if (needed < 0) {
+        return NULL;
+    }
+    char *qn = malloc((size_t)needed + SKIP_ONE);
+    if (!qn) {
+        return NULL;
+    }
+    snprintf(qn, (size_t)needed + SKIP_ONE, "%s%s", prefix, value);
+    return qn;
+}
+
+static void free_artifacts(mcr_artifact_t *items, int count) {
+    if (!items) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(items[i].pom_path);
+    }
+    free(items);
+}
+
+static void free_dependencies(mcr_dependency_t *items, int count) {
+    if (!items) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(items[i].pom_path);
+    }
+    free(items);
+}
 
 static bool text_has_suffix(const char *s, const char *suffix) {
     if (!s || !suffix) {
@@ -310,9 +370,12 @@ static int collect_artifacts(cbm_store_t *store, const char *project, mcr_artifa
     }
 
     for (int i = 0; i < path_count; i++) {
-        char full[MCR_PATH_BUF];
-        snprintf(full, sizeof(full), "%s/%s", root, paths[i]);
+        char *full = join_root_path(root, paths[i]);
+        if (!full) {
+            continue;
+        }
         char *xml = read_text_file_cap(full);
+        free(full);
         if (!xml) {
             continue;
         }
@@ -344,7 +407,11 @@ static int collect_artifacts(cbm_store_t *store, const char *project, mcr_artifa
             memset(&items[count], 0, sizeof(items[count]));
             snprintf(items[count].group_id, sizeof(items[count].group_id), "%s", group);
             snprintf(items[count].artifact_id, sizeof(items[count].artifact_id), "%s", artifact);
-            snprintf(items[count].pom_path, sizeof(items[count].pom_path), "%s", paths[i]);
+            items[count].pom_path = dup_cstr(paths[i]);
+            if (!items[count].pom_path) {
+                free(xml);
+                break;
+            }
             count++;
         }
         free(xml);
@@ -383,7 +450,10 @@ static bool add_dependency(mcr_dependency_t **items, int *count, int *cap, const
              context_group ? context_group : "");
     snprintf(dep->context_artifact_id, sizeof(dep->context_artifact_id), "%s",
              context_artifact ? context_artifact : "");
-    snprintf(dep->pom_path, sizeof(dep->pom_path), "%s", pom_path ? pom_path : "");
+    dep->pom_path = dup_cstr(pom_path);
+    if (!dep->pom_path) {
+        return false;
+    }
     (*count)++;
     return true;
 }
@@ -407,9 +477,12 @@ static int collect_dependencies(cbm_store_t *store, const char *project, mcr_dep
     }
 
     for (int i = 0; i < path_count; i++) {
-        char full[MCR_PATH_BUF];
-        snprintf(full, sizeof(full), "%s/%s", root, paths[i]);
+        char *full = join_root_path(root, paths[i]);
+        if (!full) {
+            continue;
+        }
         char *xml = read_text_file_cap(full);
+        free(full);
         if (!xml) {
             continue;
         }
@@ -497,8 +570,10 @@ static int64_t project_node_id(cbm_store_t *store, const char *project) {
         return id;
     }
 
-    char qn[MCR_QN_BUF];
-    snprintf(qn, sizeof(qn), "__project__%s", project);
+    char *qn = format_prefixed_qn("__project__", project);
+    if (!qn) {
+        return 0;
+    }
     cbm_node_t node = {
         .project = project,
         .label = "Project",
@@ -509,7 +584,9 @@ static int64_t project_node_id(cbm_store_t *store, const char *project) {
         .end_line = 0,
         .properties_json = "{}",
     };
-    return cbm_store_upsert_node(store, &node);
+    id = cbm_store_upsert_node(store, &node);
+    free(qn);
+    return id;
 }
 
 static void insert_cross_edge(cbm_store_t *store, const char *project, int64_t from_id,
@@ -556,15 +633,10 @@ static void cleanup_reverse_library_edges(cbm_store_t *store, const char *projec
     }
 }
 
-static void build_library_props(char *buf, size_t bufsz, const char *other_project,
-                                const mcr_dependency_t *dep) {
-    if (!buf || bufsz == 0) {
-        return;
-    }
-    snprintf(buf, bufsz, "{}");
+static char *build_library_props(const char *other_project, const mcr_dependency_t *dep) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
-        return;
+        return dup_cstr("{}");
     }
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
@@ -576,25 +648,26 @@ static void build_library_props(char *buf, size_t bufsz, const char *other_proje
     yyjson_mut_obj_add_strcpy(doc, root, "relation", dep->relation);
     yyjson_mut_obj_add_strcpy(doc, root, "context_group_id", dep->context_group_id);
     yyjson_mut_obj_add_strcpy(doc, root, "context_artifact_id", dep->context_artifact_id);
-    yyjson_mut_obj_add_strcpy(doc, root, "source_pom", dep->pom_path);
+    yyjson_mut_obj_add_strcpy(doc, root, "source_pom", dep->pom_path ? dep->pom_path : "");
 
     size_t len = 0;
     char *json = yyjson_mut_write(doc, 0, &len);
-    if (json && len < bufsz) {
-        memcpy(buf, json, len + SKIP_ONE);
+    if (!json) {
+        json = dup_cstr("{}");
     }
-    free(json);
     yyjson_mut_doc_free(doc);
+    return json;
 }
 
 static char *format_library_qn(const char *prefix, const char *project, const mcr_dependency_t *dep) {
     if (!prefix || !project || !dep) {
         return NULL;
     }
+    const char *pom_path = dep->pom_path ? dep->pom_path : "";
     int needed =
         snprintf(NULL, 0, "%s%s__%s__%s:%s__via__%s:%s__%s", prefix, project, dep->relation,
                  dep->group_id, dep->artifact_id, dep->context_group_id, dep->context_artifact_id,
-                 dep->pom_path);
+                 pom_path);
     if (needed < 0) {
         return NULL;
     }
@@ -604,7 +677,7 @@ static char *format_library_qn(const char *prefix, const char *project, const mc
     }
     snprintf(qn, (size_t)needed + SKIP_ONE, "%s%s__%s__%s:%s__via__%s:%s__%s", prefix, project,
              dep->relation, dep->group_id, dep->artifact_id, dep->context_group_id,
-             dep->context_artifact_id, dep->pom_path);
+             dep->context_artifact_id, pom_path);
     return qn;
 }
 
@@ -627,27 +700,37 @@ static int emit_library_match(cbm_store_t *src_store, const char *src_project,
         return 0;
     }
 
-    char props[MCR_PROPS_BUF];
-    build_library_props(props, sizeof(props), tgt_project, dep);
+    char *props = build_library_props(tgt_project, dep);
+    if (!props) {
+        free(consumer_qn);
+        free(lib_qn);
+        return 0;
+    }
     cbm_node_t lib = {
         .project = src_project,
         .label = "Library",
         .name = dep->artifact_id,
         .qualified_name = lib_qn,
-        .file_path = dep->pom_path,
+        .file_path = dep->pom_path ? dep->pom_path : "",
         .start_line = 0,
         .end_line = 0,
         .properties_json = props,
     };
     int64_t lib_id = cbm_store_upsert_node(src_store, &lib);
     if (lib_id <= 0) {
+        free(props);
         free(consumer_qn);
         free(lib_qn);
         return 0;
     }
 
-    char reverse_props[MCR_PROPS_BUF];
-    build_library_props(reverse_props, sizeof(reverse_props), src_project, dep);
+    char *reverse_props = build_library_props(src_project, dep);
+    if (!reverse_props) {
+        free(props);
+        free(consumer_qn);
+        free(lib_qn);
+        return 0;
+    }
     cbm_node_t consumer = {
         .project = tgt_project,
         .label = "LibraryConsumer",
@@ -660,6 +743,8 @@ static int emit_library_match(cbm_store_t *src_store, const char *src_project,
     };
     int64_t consumer_id = cbm_store_upsert_node(tgt_store, &consumer);
     if (consumer_id <= 0) {
+        free(reverse_props);
+        free(props);
         free(consumer_qn);
         free(lib_qn);
         return 0;
@@ -668,6 +753,8 @@ static int emit_library_match(cbm_store_t *src_store, const char *src_project,
                       props);
     insert_cross_edge(tgt_store, tgt_project, tgt_project_id, consumer_id, "CROSS_LIBRARY_USED_BY",
                       reverse_props);
+    free(reverse_props);
+    free(props);
     free(consumer_qn);
     free(lib_qn);
     return 1;
@@ -686,8 +773,8 @@ int cbm_cross_repo_match_maven_libraries(cbm_store_t *src_store, const char *src
     int dep_count = collect_dependencies(src_store, src_project, &deps);
     int artifact_count = collect_artifacts(tgt_store, tgt_project, &artifacts);
     if (dep_count == 0 || artifact_count == 0) {
-        free(deps);
-        free(artifacts);
+        free_dependencies(deps, dep_count);
+        free_artifacts(artifacts, artifact_count);
         return 0;
     }
 
@@ -702,7 +789,7 @@ int cbm_cross_repo_match_maven_libraries(cbm_store_t *src_store, const char *src
         }
     }
 
-    free(deps);
-    free(artifacts);
+    free_dependencies(deps, dep_count);
+    free_artifacts(artifacts, artifact_count);
     return count;
 }
