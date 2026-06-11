@@ -18,19 +18,19 @@ enum {
 };
 
 typedef struct {
-    char group_id[CBM_SZ_128];
-    char artifact_id[CBM_SZ_128];
+    char *group_id;
+    char *artifact_id;
     char *pom_path;
 } mcr_artifact_t;
 
 typedef struct {
-    char group_id[CBM_SZ_128];
-    char artifact_id[CBM_SZ_128];
-    char version[CBM_SZ_128];
-    char scope[CBM_SZ_64];
-    char relation[CBM_SZ_32];
-    char context_group_id[CBM_SZ_128];
-    char context_artifact_id[CBM_SZ_128];
+    char *group_id;
+    char *artifact_id;
+    char *version;
+    char *scope;
+    char *relation;
+    char *context_group_id;
+    char *context_artifact_id;
     char *pom_path;
 } mcr_dependency_t;
 
@@ -82,9 +82,26 @@ static void free_artifacts(mcr_artifact_t *items, int count) {
         return;
     }
     for (int i = 0; i < count; i++) {
+        free(items[i].group_id);
+        free(items[i].artifact_id);
         free(items[i].pom_path);
     }
     free(items);
+}
+
+static void free_dependency_fields(mcr_dependency_t *dep) {
+    if (!dep) {
+        return;
+    }
+    free(dep->group_id);
+    free(dep->artifact_id);
+    free(dep->version);
+    free(dep->scope);
+    free(dep->relation);
+    free(dep->context_group_id);
+    free(dep->context_artifact_id);
+    free(dep->pom_path);
+    memset(dep, 0, sizeof(*dep));
 }
 
 static void free_dependencies(mcr_dependency_t *items, int count) {
@@ -92,7 +109,7 @@ static void free_dependencies(mcr_dependency_t *items, int count) {
         return;
     }
     for (int i = 0; i < count; i++) {
-        free(items[i].pom_path);
+        free_dependency_fields(&items[i]);
     }
     free(items);
 }
@@ -106,13 +123,9 @@ static bool text_has_suffix(const char *s, const char *suffix) {
     return sl >= tl && strcmp(s + sl - tl, suffix) == 0;
 }
 
-static void trim_copy(const char *start, size_t len, char *out, size_t out_sz) {
-    if (!out || out_sz == 0) {
-        return;
-    }
-    out[0] = '\0';
+static char *trim_dup(const char *start, size_t len) {
     if (!start) {
-        return;
+        return NULL;
     }
     while (len > 0 && (*start == ' ' || *start == '\n' || *start == '\r' || *start == '\t')) {
         start++;
@@ -125,11 +138,13 @@ static void trim_copy(const char *start, size_t len, char *out, size_t out_sz) {
         }
         len--;
     }
-    if (len >= out_sz) {
-        len = out_sz - SKIP_ONE;
+    char *out = malloc(len + SKIP_ONE);
+    if (!out) {
+        return NULL;
     }
     memcpy(out, start, len);
     out[len] = '\0';
+    return out;
 }
 
 static bool ptr_in_span(const char *p, const char *start, const char *end) {
@@ -177,6 +192,11 @@ static bool ptr_in_xml_block_named(const char *xml, const char *tag, const char 
     return false;
 }
 
+static bool ptr_in_non_usage_dependency_block(const char *xml, const char *p) {
+    return ptr_in_xml_block_named(xml, "dependencyManagement", p) ||
+           ptr_in_xml_block_named(xml, "plugin", p);
+}
+
 static bool find_xml_block(const char *xml, const char *tag, const char **block_start,
                            const char **block_end) {
     char open_pat[CBM_SZ_64];
@@ -200,8 +220,7 @@ static bool find_xml_block(const char *xml, const char *tag, const char **block_
     return true;
 }
 
-static bool xml_tag_text(const char *start, const char *end, const char *tag, char *out,
-                         size_t out_sz) {
+static char *xml_tag_text_dup(const char *start, const char *end, const char *tag) {
     char open_pat[CBM_SZ_64];
     char close_pat[CBM_SZ_64];
     snprintf(open_pat, sizeof(open_pat), "<%s", tag);
@@ -211,20 +230,23 @@ static bool xml_tag_text(const char *start, const char *end, const char *tag, ch
     while ((p = strstr(p, open_pat)) != NULL && (!end || p < end)) {
         const char *open_end = strchr(p, '>');
         if (!open_end || (end && open_end >= end)) {
-            return false;
+            return NULL;
         }
         const char *close = strstr(open_end + SKIP_ONE, close_pat);
         if (!close || (end && close > end)) {
-            return false;
+            return NULL;
         }
-        trim_copy(open_end + SKIP_ONE, (size_t)(close - open_end - SKIP_ONE), out, out_sz);
-        return out[0] != '\0';
+        char *text = trim_dup(open_end + SKIP_ONE, (size_t)(close - open_end - SKIP_ONE));
+        if (text && text[0]) {
+            return text;
+        }
+        free(text);
+        return NULL;
     }
-    return false;
+    return NULL;
 }
 
-static bool xml_tag_text_outside_project_blocks(const char *xml, const char *tag, char *out,
-                                                size_t out_sz) {
+static char *xml_tag_text_outside_project_blocks_dup(const char *xml, const char *tag) {
     const char *parent_start = NULL;
     const char *parent_end = NULL;
     const char *deps_start = NULL;
@@ -245,16 +267,20 @@ static bool xml_tag_text_outside_project_blocks(const char *xml, const char *tag
         }
         const char *open_end = strchr(p, '>');
         if (!open_end) {
-            return false;
+            return NULL;
         }
         const char *close = strstr(open_end + SKIP_ONE, close_pat);
         if (!close) {
-            return false;
+            return NULL;
         }
-        trim_copy(open_end + SKIP_ONE, (size_t)(close - open_end - SKIP_ONE), out, out_sz);
-        return out[0] != '\0';
+        char *text = trim_dup(open_end + SKIP_ONE, (size_t)(close - open_end - SKIP_ONE));
+        if (text && text[0]) {
+            return text;
+        }
+        free(text);
+        return NULL;
     }
-    return false;
+    return NULL;
 }
 
 static char *read_text_file_cap(const char *path) {
@@ -380,40 +406,50 @@ static int collect_artifacts(cbm_store_t *store, const char *project, mcr_artifa
             continue;
         }
 
-        char parent_group[CBM_SZ_128] = {0};
         const char *parent_start = NULL;
         const char *parent_end = NULL;
+        char *parent_group = NULL;
         if (find_xml_block(xml, "parent", &parent_start, &parent_end)) {
-            xml_tag_text(parent_start, parent_end, "groupId", parent_group, sizeof(parent_group));
+            parent_group = xml_tag_text_dup(parent_start, parent_end, "groupId");
         }
 
-        char group[CBM_SZ_128] = {0};
-        char artifact[CBM_SZ_128] = {0};
-        xml_tag_text_outside_project_blocks(xml, "groupId", group, sizeof(group));
-        xml_tag_text_outside_project_blocks(xml, "artifactId", artifact, sizeof(artifact));
-        if (!group[0] && parent_group[0]) {
-            snprintf(group, sizeof(group), "%s", parent_group);
+        char *group = xml_tag_text_outside_project_blocks_dup(xml, "groupId");
+        char *artifact = xml_tag_text_outside_project_blocks_dup(xml, "artifactId");
+        if (!group && parent_group) {
+            group = dup_cstr(parent_group);
         }
-        if (group[0] && artifact[0]) {
+        if (group && group[0] && artifact && artifact[0]) {
             if (count >= cap) {
                 cap *= PAIR_LEN;
                 mcr_artifact_t *tmp = realloc(items, (size_t)cap * sizeof(*items));
                 if (!tmp) {
+                    free(parent_group);
+                    free(group);
+                    free(artifact);
                     free(xml);
                     break;
                 }
                 items = tmp;
             }
             memset(&items[count], 0, sizeof(items[count]));
-            snprintf(items[count].group_id, sizeof(items[count].group_id), "%s", group);
-            snprintf(items[count].artifact_id, sizeof(items[count].artifact_id), "%s", artifact);
+            items[count].group_id = group;
+            items[count].artifact_id = artifact;
             items[count].pom_path = dup_cstr(paths[i]);
             if (!items[count].pom_path) {
+                free(items[count].group_id);
+                free(items[count].artifact_id);
+                free(parent_group);
+                memset(&items[count], 0, sizeof(items[count]));
                 free(xml);
                 break;
             }
+            group = NULL;
+            artifact = NULL;
             count++;
         }
+        free(parent_group);
+        free(group);
+        free(artifact);
         free(xml);
     }
 
@@ -441,17 +477,17 @@ static bool add_dependency(mcr_dependency_t **items, int *count, int *cap, const
     }
     mcr_dependency_t *dep = &(*items)[*count];
     memset(dep, 0, sizeof(*dep));
-    snprintf(dep->group_id, sizeof(dep->group_id), "%s", group);
-    snprintf(dep->artifact_id, sizeof(dep->artifact_id), "%s", artifact);
-    snprintf(dep->version, sizeof(dep->version), "%s", version ? version : "");
-    snprintf(dep->scope, sizeof(dep->scope), "%s", scope ? scope : "");
-    snprintf(dep->relation, sizeof(dep->relation), "%s", relation ? relation : "dependency");
-    snprintf(dep->context_group_id, sizeof(dep->context_group_id), "%s",
-             context_group ? context_group : "");
-    snprintf(dep->context_artifact_id, sizeof(dep->context_artifact_id), "%s",
-             context_artifact ? context_artifact : "");
+    dep->group_id = dup_cstr(group);
+    dep->artifact_id = dup_cstr(artifact);
+    dep->version = dup_cstr(version);
+    dep->scope = dup_cstr(scope);
+    dep->relation = dup_cstr(relation ? relation : "dependency");
+    dep->context_group_id = dup_cstr(context_group);
+    dep->context_artifact_id = dup_cstr(context_artifact);
     dep->pom_path = dup_cstr(pom_path);
-    if (!dep->pom_path) {
+    if (!dep->group_id || !dep->artifact_id || !dep->version || !dep->scope || !dep->relation ||
+        !dep->context_group_id || !dep->context_artifact_id || !dep->pom_path) {
+        free_dependency_fields(dep);
         return false;
     }
     (*count)++;
@@ -493,7 +529,7 @@ static int collect_dependencies(cbm_store_t *store, const char *project, mcr_dep
                 p += strlen("<dependency");
                 continue;
             }
-            if (ptr_in_xml_block_named(xml, "dependencyManagement", p)) {
+            if (ptr_in_non_usage_dependency_block(xml, p)) {
                 p += strlen("<dependency");
                 continue;
             }
@@ -506,14 +542,10 @@ static int collect_dependencies(cbm_store_t *store, const char *project, mcr_dep
                 break;
             }
 
-            char group[CBM_SZ_128] = {0};
-            char artifact[CBM_SZ_128] = {0};
-            char version[CBM_SZ_128] = {0};
-            char scope[CBM_SZ_64] = {0};
-            xml_tag_text(open_end + SKIP_ONE, end, "groupId", group, sizeof(group));
-            xml_tag_text(open_end + SKIP_ONE, end, "artifactId", artifact, sizeof(artifact));
-            xml_tag_text(open_end + SKIP_ONE, end, "version", version, sizeof(version));
-            xml_tag_text(open_end + SKIP_ONE, end, "scope", scope, sizeof(scope));
+            char *group = xml_tag_text_dup(open_end + SKIP_ONE, end, "groupId");
+            char *artifact = xml_tag_text_dup(open_end + SKIP_ONE, end, "artifactId");
+            char *version = xml_tag_text_dup(open_end + SKIP_ONE, end, "version");
+            char *scope = xml_tag_text_dup(open_end + SKIP_ONE, end, "scope");
 
             add_dependency(&items, &count, &cap, group, artifact, version, scope, "dependency",
                            group, artifact, paths[i]);
@@ -528,16 +560,19 @@ static int collect_dependencies(cbm_store_t *store, const char *project, mcr_dep
                 if (!ex_end || ex_end > end) {
                     break;
                 }
-                char ex_group[CBM_SZ_128] = {0};
-                char ex_artifact[CBM_SZ_128] = {0};
-                xml_tag_text(ex_open_end + SKIP_ONE, ex_end, "groupId", ex_group,
-                             sizeof(ex_group));
-                xml_tag_text(ex_open_end + SKIP_ONE, ex_end, "artifactId", ex_artifact,
-                             sizeof(ex_artifact));
+                char *ex_group = xml_tag_text_dup(ex_open_end + SKIP_ONE, ex_end, "groupId");
+                char *ex_artifact =
+                    xml_tag_text_dup(ex_open_end + SKIP_ONE, ex_end, "artifactId");
                 add_dependency(&items, &count, &cap, ex_group, ex_artifact, version, scope,
                                "exclusion", group, artifact, paths[i]);
+                free(ex_group);
+                free(ex_artifact);
                 ex = ex_end + strlen("</exclusion>");
             }
+            free(group);
+            free(artifact);
+            free(version);
+            free(scope);
             p = end + strlen("</dependency>");
         }
         free(xml);

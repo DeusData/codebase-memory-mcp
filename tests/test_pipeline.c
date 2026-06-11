@@ -1411,6 +1411,39 @@ TEST(cross_repo_maven_commented_dependency_does_not_create_library_edge) {
     PASS();
 }
 
+TEST(cross_repo_maven_plugin_dependency_does_not_create_library_edge) {
+    const char *provider_pom = "<project><modelVersion>4.0.0</modelVersion>"
+                               "<groupId>com.example.platform</groupId>"
+                               "<artifactId>shared-library</artifactId>"
+                               "<version>1.0.0</version></project>";
+    const char *consumer_pom =
+        "<project><modelVersion>4.0.0</modelVersion>"
+        "<groupId>app</groupId><artifactId>consumer</artifactId>"
+        "<build><plugins><plugin><groupId>org.apache.maven.plugins</groupId>"
+        "<artifactId>maven-plugin</artifactId><version>1.0.0</version>"
+        "<dependencies><dependency><groupId>com.example.platform</groupId>"
+        "<artifactId>shared-library</artifactId><version>1.0.0</version>"
+        "</dependency></dependencies></plugin></plugins></build></project>";
+    cross_maven_fixture_t fx;
+    ASSERT_EQ(setup_cross_maven_fixture(&fx, provider_pom, consumer_pom), 0);
+
+    const char *targets[] = {"provider"};
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("consumer", targets, 1);
+    ASSERT_EQ(result.library_edges, 0);
+
+    cbm_store_t *consumer = cbm_store_open_path(fx.consumer_db);
+    cbm_store_t *provider = cbm_store_open_path(fx.provider_db);
+    ASSERT_NOT_NULL(consumer);
+    ASSERT_NOT_NULL(provider);
+    ASSERT_EQ(count_edges_by_type(consumer, "consumer", "CROSS_LIBRARY_DEPENDS_ON"), 0);
+    ASSERT_EQ(count_edges_by_type(provider, "provider", "CROSS_LIBRARY_USED_BY"), 0);
+    cbm_store_close(consumer);
+    cbm_store_close(provider);
+
+    cleanup_cross_maven_fixture(&fx);
+    PASS();
+}
+
 TEST(cross_repo_maven_cleanup_preserves_unrelated_nodes) {
     const char *provider_pom = "<project><modelVersion>4.0.0</modelVersion>"
                                "<groupId>com.example.platform</groupId>"
@@ -1485,6 +1518,82 @@ TEST(cross_repo_maven_removed_dependency_clears_provider_used_by) {
     ASSERT_EQ(count_edges_by_type(provider, "provider", "CROSS_LIBRARY_USED_BY"), 0);
     cbm_store_close(consumer);
     cbm_store_close(provider);
+
+    cleanup_cross_maven_fixture(&fx);
+    PASS();
+}
+
+TEST(cross_repo_maven_long_coordinates_do_not_collide) {
+    char group_a[180];
+    char group_b[180];
+    memset(group_a, 'g', 150);
+    memset(group_b, 'g', 150);
+    group_a[150] = 'a';
+    group_b[150] = 'b';
+    group_a[151] = '\0';
+    group_b[151] = '\0';
+
+    const char *provider_pom = "<project><modelVersion>4.0.0</modelVersion>"
+                               "<groupId>provider</groupId><artifactId>root</artifactId>"
+                               "<version>1.0.0</version></project>";
+    char consumer_pom[2048];
+    snprintf(consumer_pom, sizeof(consumer_pom),
+             "<project><modelVersion>4.0.0</modelVersion>"
+             "<groupId>app</groupId><artifactId>consumer</artifactId>"
+             "<dependencies><dependency><groupId>%s</groupId>"
+             "<artifactId>shared-library</artifactId><version>1.0.0</version></dependency>"
+             "<dependency><groupId>%s</groupId><artifactId>shared-library</artifactId>"
+             "<version>1.0.0</version></dependency></dependencies></project>",
+             group_a, group_b);
+    cross_maven_fixture_t fx;
+    ASSERT_EQ(setup_cross_maven_fixture(&fx, provider_pom, consumer_pom), 0);
+
+    char provider_a[512];
+    char provider_b[512];
+    snprintf(provider_a, sizeof(provider_a),
+             "<project><modelVersion>4.0.0</modelVersion><groupId>%s</groupId>"
+             "<artifactId>shared-library</artifactId><version>1.0.0</version></project>",
+             group_a);
+    snprintf(provider_b, sizeof(provider_b),
+             "<project><modelVersion>4.0.0</modelVersion><groupId>%s</groupId>"
+             "<artifactId>shared-library</artifactId><version>1.0.0</version></project>",
+             group_b);
+    const char *provider_path_a = "modules/a/pom.xml";
+    const char *provider_path_b = "modules/b/pom.xml";
+    ASSERT_EQ(th_write_file(TH_PATH(fx.provider_root, provider_path_a), provider_a), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(fx.provider_root, provider_path_b), provider_b), 0);
+
+    cbm_store_t *provider = cbm_store_open_path(fx.provider_db);
+    ASSERT_NOT_NULL(provider);
+    cbm_node_t provider_pom_a = {.project = "provider",
+                                 .label = "File",
+                                 .name = "pom.xml",
+                                 .qualified_name = "provider.long.a.pom",
+                                 .file_path = provider_path_a,
+                                 .start_line = 1,
+                                 .end_line = 1,
+                                 .properties_json = "{}"};
+    cbm_node_t provider_pom_b = {.project = "provider",
+                                 .label = "File",
+                                 .name = "pom.xml",
+                                 .qualified_name = "provider.long.b.pom",
+                                 .file_path = provider_path_b,
+                                 .start_line = 1,
+                                 .end_line = 1,
+                                 .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(provider, &provider_pom_a), 0);
+    ASSERT_GT(cbm_store_upsert_node(provider, &provider_pom_b), 0);
+    cbm_store_close(provider);
+
+    const char *targets[] = {"provider"};
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("consumer", targets, 1);
+    ASSERT_EQ(result.library_edges, 2);
+
+    cbm_store_t *consumer = cbm_store_open_path(fx.consumer_db);
+    ASSERT_NOT_NULL(consumer);
+    ASSERT_EQ(count_edges_by_type(consumer, "consumer", "CROSS_LIBRARY_DEPENDS_ON"), 2);
+    ASSERT_EQ(count_nodes_by_label(consumer, "consumer", "Library"), 2);
+    cbm_store_close(consumer);
 
     cleanup_cross_maven_fixture(&fx);
     PASS();
@@ -6461,8 +6570,10 @@ SUITE(pipeline) {
     RUN_TEST(cross_repo_maven_dependency_escapes_library_edge_props);
     RUN_TEST(cross_repo_maven_dependency_management_does_not_create_library_edge);
     RUN_TEST(cross_repo_maven_commented_dependency_does_not_create_library_edge);
+    RUN_TEST(cross_repo_maven_plugin_dependency_does_not_create_library_edge);
     RUN_TEST(cross_repo_maven_cleanup_preserves_unrelated_nodes);
     RUN_TEST(cross_repo_maven_removed_dependency_clears_provider_used_by);
+    RUN_TEST(cross_repo_maven_long_coordinates_do_not_collide);
     RUN_TEST(cross_repo_maven_fixture_restores_cache_dir);
     RUN_TEST(cross_repo_maven_long_references_do_not_collide);
     RUN_TEST(cross_repo_maven_very_long_pom_paths_do_not_truncate);
