@@ -1,7 +1,7 @@
-# PR validation: the security gates only — static audit, the license gates
-# (structural + ScanCode + npm tree + provenance), and the CodeQL gate.
-# The full dry-run chain (lint/test/build/smoke/soak) stays maintainer-driven
-# via workflow_dispatch. Branch protection requires `dco` + `ci-ok`.
+# PR validation: security gates + lint + full test suite. Builds, smoke and
+# soak stay maintainer-driven via the dry-run workflow_dispatch. Branch
+# protection requires `dco` + `ci-ok` — a single stable summary context that
+# fails unless every PR stage succeeded.
 name: PR
 
 on:
@@ -16,20 +16,36 @@ jobs:
     uses: ./.github/workflows/_security.yml
     secrets: inherit
 
+  lint:
+    uses: ./.github/workflows/_lint.yml
+
+  test:
+    needs: [lint]
+    if: ${{ !cancelled() && needs.lint.result == 'success' }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      # Perf assertions are timing-sensitive on shared runners; they stay in
+      # dry runs and releases where a flaky red does not block a merge.
+      skip_perf: true
+
   ci-ok:
-    # The one required context (besides dco) — a stable name that fails
-    # unless the security gates succeeded.
-    needs: [security]
+    # The one required context (besides dco) — fails unless every PR stage
+    # succeeded, so matrix renames can never silently deadlock merges.
+    needs: [security, lint, test]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Security gates must have succeeded
+      - name: All PR stages must have succeeded
         env:
-          RESULT: ${{ needs.security.result }}
+          RESULTS: ${{ toJSON(needs) }}
         run: |
-          if [ "$RESULT" != "success" ]; then
-            echo "CI NOT OK: security=$RESULT"
-            exit 1
-          fi
-          echo "CI OK: security gates green"
+          echo "$RESULTS" | python3 -c "
+          import json, sys
+          needs = json.load(sys.stdin)
+          bad = {k: v['result'] for k, v in needs.items() if v['result'] != 'success'}
+          if bad:
+              print('CI NOT OK:', bad)
+              sys.exit(1)
+          print('CI OK:', ', '.join(needs))
+          "
