@@ -3,6 +3,8 @@ name: CodeQL SAST
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
 
 permissions:
   security-events: write
