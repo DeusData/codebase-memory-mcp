@@ -174,8 +174,18 @@ matching the commit author.**
 git commit -s             # adds: Signed-off-by: Your Name <you@example.com>
 ```
 
-By signing off you certify (per the [DCO](DCO)) that you wrote the change
-or otherwise have the right to submit it under the MIT license.
+**Adding a `Signed-off-by` line to a commit constitutes your certification
+of the [Developer Certificate of Origin 1.1](DCO) — in full, all four
+clauses — for that contribution.** The sign-off must match the commit's
+author name and email (enforced by CI). In short: you certify that you
+wrote the change or otherwise have the right to submit it under the MIT
+license, and that you understand the contribution and your sign-off are
+public and permanent.
+
+(Independently of the DCO, submitting a contribution to this repository is
+also subject to GitHub's Terms of Service §D.6, under which contributions
+are licensed inbound = outbound — i.e., under this repository's MIT
+license.)
 
 Enforcement is strict and automated:
 
