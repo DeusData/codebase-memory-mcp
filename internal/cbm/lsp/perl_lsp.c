@@ -996,12 +996,33 @@ static void perl_collect_isa_assignment(PerlLSPContext *ctx, TSNode assign) {
     const char *child_pkg =
         ctx->current_package_qn && ctx->current_package_qn[0] ? ctx->current_package_qn : "main";
 
-    TSNode right = ts_node_child_by_field_name(assign, "right", 5);
-    if (ts_node_is_null(right))
-        return;
     /* Parents may be a quoted_word_list, a list_expression of string literals,
-     * or a bare string literal. The recursive collector handles all forms. */
-    perl_collect_parents(ctx, right, child_pkg, 0);
+     * or a bare string literal — perl_collect_parents handles all of these.
+     *
+     * tree-sitter-perl flattens a parenthesized RHS (e.g. `= ('Base')`) so the
+     * assignment's `right` field points at the `(` token while the parent
+     * string literals are *sibling* children of the assignment. Relying on the
+     * `right` field alone therefore misses `@ISA = ('Base')`. Instead, scan
+     * every named child after the `=`, which covers both `@ISA = 'Base'` and
+     * `@ISA = ('Base', 'Other')`. perl_collect_parents ignores the LHS
+     * variable_declaration and the `parent`/`base`/`-norequire` barewords, so
+     * scanning the RHS children is safe. */
+    bool seen_eq = false;
+    uint32_t nc = ts_node_child_count(assign);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_child(assign, i);
+        if (ts_node_is_null(c))
+            continue;
+        if (!ts_node_is_named(c)) {
+            if (strcmp(ts_node_type(c), "=") == 0)
+                seen_eq = true;
+            continue;
+        }
+        /* Only collect from RHS children (after `=`); skip the LHS @ISA decl. */
+        if (!seen_eq)
+            continue;
+        perl_collect_parents(ctx, c, child_pkg, 0);
+    }
 }
 
 /* Recursively scan (PASS 1) for package context, @ISA assignments, and `use`
