@@ -97,4 +97,44 @@ void cbm_perl_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena) {
     REG_BUILTIN("keys", MIXED);
     REG_BUILTIN("values", MIXED);
     REG_BUILTIN("each", MIXED);
+
+    /* ── Scalar::Util ───────────────────────────────────────────────
+     * Source: RESEARCH.md L366. Exported subs; module QN "Scalar.Util". */
+    REG_FUNC("Scalar.Util", "blessed", MIXED);
+    REG_FUNC("Scalar.Util", "reftype", cbm_type_builtin(arena, "string"));
+    REG_FUNC("Scalar.Util", "weaken", MIXED);
+
+    /* ── List::Util ─────────────────────────────────────────────────
+     * Source: RESEARCH.md L366. Module QN "List.Util". */
+    REG_FUNC("List.Util", "sum", MIXED);
+    REG_FUNC("List.Util", "max", MIXED);
+    REG_FUNC("List.Util", "min", MIXED);
+    REG_FUNC("List.Util", "first", MIXED);
+    REG_FUNC("List.Util", "reduce", MIXED);
+
+    /* ── Carp ───────────────────────────────────────────────────────
+     * Source: RESEARCH.md L367. Module QN "Carp". */
+    REG_FUNC("Carp", "croak", MIXED);
+    REG_FUNC("Carp", "carp", MIXED);
+    REG_FUNC("Carp", "confess", MIXED);
+    REG_FUNC("Carp", "cluck", MIXED);
+
+    /* ── POSIX (commonly-imported entry points) ─────────────────────
+     * Source: RESEARCH.md L367. Module QN "POSIX". */
+    REG_FUNC("POSIX", "floor", MIXED);
+    REG_FUNC("POSIX", "ceil", MIXED);
+    REG_FUNC("POSIX", "strftime", cbm_type_builtin(arena, "string"));
+    REG_FUNC("POSIX", "INT_MAX", cbm_type_builtin(arena, "int"));
+
+    /* ── Storable ───────────────────────────────────────────────────
+     * Source: RESEARCH.md L367. Module QN "Storable". */
+    REG_FUNC("Storable", "dclone", MIXED);
+    REG_FUNC("Storable", "freeze", cbm_type_builtin(arena, "string"));
+    REG_FUNC("Storable", "thaw", MIXED);
+    REG_FUNC("Storable", "nstore", MIXED);
+    REG_FUNC("Storable", "retrieve", MIXED);
+
+    /* ── Data::Dumper ───────────────────────────────────────────────
+     * Source: RESEARCH.md L367. Module QN "Data.Dumper". */
+    REG_FUNC("Data.Dumper", "Dumper", cbm_type_builtin(arena, "string"));
 }
