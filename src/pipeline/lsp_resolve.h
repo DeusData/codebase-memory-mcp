@@ -71,7 +71,9 @@ static inline const char *cbm_lsp_bare_segment(const char *name) {
  *
  * Match rule: the LSP emits CBMResolvedCall entries whose caller_qn
  * matches the call's enclosing function and whose callee_qn ends with
- * the textual callee_name as the last dot-separated segment. The
+ * the textual callee_name as the last dot-separated segment. A qualified
+ * static callee (e.g. Perl `Pkg::sub`) is first reduced to its last
+ * "::"-separated segment so it matches the resolved sub's short name. The
  * pointer returned aliases into `arr` and stays valid as long as the
  * underlying CBMFileResult is alive. */
 static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
