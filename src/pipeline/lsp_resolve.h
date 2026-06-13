@@ -124,6 +124,9 @@ static inline int cbm_pipeline_qn_class_method_tail_eq(const char *qn, const cha
  *   3. ambiguous tails return NULL so the registry fallback stays in
  *      control.
  *
+ * Qualified static callees (e.g. Perl `Pkg::sub`) are reduced to their
+ * bare last segment by cbm_lsp_bare_segment before matching.
+ *
  * The pointer returned aliases into `arr` and stays valid as long as the
  * underlying CBMFileResult is alive. */
 static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
