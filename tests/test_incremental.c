@@ -1795,6 +1795,34 @@ TEST(tool_detect_changes_custom_branch) {
     PASS();
 }
 
+/* Regression: `since` was advertised in the schema but ignored by the handler;
+ * it must be honored as the diff base. Fixture is a --depth=1 shallow clone, so
+ * HEAD~N won't resolve — use HEAD for a valid (empty) diff. */
+TEST(tool_detect_changes_since) {
+    double ms;
+    char *r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\",\"since\":\"HEAD\"}",
+                              g_project);
+    TOOL_OK(r, ms);
+    ASSERT(resp_has_key(r, "changed_files"));
+    free(r);
+    PASS();
+}
+
+/* Regression: `since` must take precedence over base_branch. A valid since plus a
+ * bogus base_branch must still succeed (proving since won) and must not reference
+ * the bogus branch. */
+TEST(tool_detect_changes_since_precedence) {
+    double ms;
+    char *r = call_tool_timed(
+        "detect_changes", &ms,
+        "{\"project\":\"%s\",\"since\":\"HEAD\",\"base_branch\":\"no-such-branch-xyz\"}",
+        g_project);
+    TOOL_OK(r, ms);
+    ASSERT(strstr(r, "no-such-branch-xyz") == NULL);
+    free(r);
+    PASS();
+}
+
 TEST(tool_detect_changes_depth) {
     double ms;
     char *r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\",\"depth\":5}", g_project);
@@ -2988,6 +3016,8 @@ SUITE(incremental) {
     /* Phase 15: detect_changes */
     RUN_TEST(tool_detect_changes_default);
     RUN_TEST(tool_detect_changes_custom_branch);
+    RUN_TEST(tool_detect_changes_since);
+    RUN_TEST(tool_detect_changes_since_precedence);
     RUN_TEST(tool_detect_changes_depth);
 
     /* Phase 16: manage_adr */
