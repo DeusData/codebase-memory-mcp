@@ -831,6 +831,19 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
     run_postpasses(&ctx, changed_files, ci, project);
 
+    /* Free ObjectScript tables built by pass_calls during run_extract_resolve. */
+    if (ctx.return_type_table) {
+        for (int i = 0; i < ctx.return_type_table->count; i++) {
+            free((void *)ctx.return_type_table->entries[i].return_type);
+        }
+        free((void *)ctx.return_type_table);
+        ctx.return_type_table = NULL;
+    }
+    if (ctx.macro_table) {
+        free((void *)ctx.macro_table);
+        ctx.macro_table = NULL;
+    }
+
     free(changed_files);
     cbm_registry_free(registry);
     cbm_path_alias_collection_free(path_aliases);

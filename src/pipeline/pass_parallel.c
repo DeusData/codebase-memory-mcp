@@ -68,6 +68,9 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "foundation/profile.h"
 #include "foundation/compat_regex.h"
 #include "cbm.h"
+#include "arena.h"
+#include "macro_table.h"
+#include "iris_export_xml.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
 
@@ -495,6 +498,9 @@ typedef struct {
 
     cbm_pkg_entries_t *pkg_entries; /* per-worker manifest arrays (separate allocation) */
     _Atomic int64_t retained_bytes; /* total source bytes copied into result arenas */
+
+    const CBMMacroTable *macro_table;            /* ObjectScript $$$macros (NULL if none) */
+    const CBMReturnTypeTable *return_type_table; /* ObjectScript return types (NULL if none) */
 } extract_ctx_t;
 
 /* Insert one definition node (and its route if present) into the local gbuf. */
@@ -598,8 +604,38 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
 
         uint64_t file_t0 = extract_now_ns();
 
-        CBMFileResult *result = cbm_extract_file(source, source_len, fi->language, ec->project_name,
-                                                 fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL);
+        /* ObjectScript Studio Export XML: transcode each <Class> to UDL and
+         * extract directly into the local gbuf (the per-file cache holds a single
+         * result, so multi-class Export files are processed inline here). */
+        if (fi->language == CBM_LANG_OBJECTSCRIPT_EXPORT) {
+            CBMArena ea;
+            cbm_arena_init(&ea);
+            int cc = 0;
+            char **udls = cbm_iris_export_to_udl(&ea, source, source_len, &cc);
+            for (int ci = 0; ci < cc; ci++) {
+                CBMFileResult *xr =
+                    cbm_extract_file_ex(udls[ci], (int)strlen(udls[ci]), CBM_LANG_OBJECTSCRIPT_UDL,
+                                        ec->project_name, fi->rel_path, CBM_EXTRACT_BUDGET, NULL,
+                                        NULL, ec->macro_table, ec->return_type_table);
+                if (!xr) {
+                    continue;
+                }
+                for (int d = 0; d < xr->defs.count; d++) {
+                    CBMDefinition *def = &xr->defs.items[d];
+                    if (def->qualified_name && def->name) {
+                        insert_def_into_gbuf(ws, fi, def);
+                    }
+                }
+                cbm_free_result(xr);
+            }
+            cbm_arena_destroy(&ea);
+            free_source(source);
+            continue;
+        }
+
+        CBMFileResult *result = cbm_extract_file_ex(
+            source, source_len, fi->language, ec->project_name, fi->rel_path, CBM_EXTRACT_BUDGET,
+            NULL, NULL, ec->macro_table, ec->return_type_table);
 
         uint64_t file_elapsed_ms = (extract_now_ns() - file_t0) / PP_USEC_PER_MS;
 
@@ -719,6 +755,55 @@ static void log_extract_mem_stats(int worker_count) {
     }
 }
 
+/* ObjectScript: build the $$$macro table from .inc files (parallel path).
+ * Returns NULL when no ObjectScript include files exist. Caller owns it. */
+static CBMMacroTable *pp_build_macro_table(const cbm_file_info_t *files, int count) {
+    bool has_inc = false;
+    for (int i = 0; i < count; i++) {
+        if (files[i].language == CBM_LANG_OBJECTSCRIPT_ROUTINE && files[i].path &&
+            strstr(files[i].path, ".inc")) {
+            has_inc = true;
+            break;
+        }
+    }
+    if (!has_inc) {
+        return NULL;
+    }
+    CBMMacroTable *mt = (CBMMacroTable *)calloc(1, sizeof(CBMMacroTable));
+    if (!mt) {
+        return NULL;
+    }
+    CBMArena mt_arena;
+    cbm_arena_init(&mt_arena);
+    cbm_macro_table_init_system(mt);
+    for (int i = 0; i < count; i++) {
+        if (files[i].language != CBM_LANG_OBJECTSCRIPT_ROUTINE) {
+            continue;
+        }
+        if (!files[i].path || !strstr(files[i].path, ".inc")) {
+            continue;
+        }
+        FILE *f = fopen(files[i].path, "rb");
+        if (!f) {
+            continue;
+        }
+        fseek(f, 0, SEEK_END);
+        long fsize = ftell(f);
+        rewind(f);
+        if (fsize > 0) {
+            char *src = (char *)malloc((size_t)fsize + 1);
+            if (src) {
+                size_t nread = fread(src, 1, (size_t)fsize, f);
+                src[nread] = '\0';
+                cbm_parse_inc_file(mt, &mt_arena, src);
+                free(src);
+            }
+        }
+        (void)fclose(f);
+    }
+    return mt;
+}
+
 int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                          CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                          int worker_count) {
@@ -768,6 +853,9 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     /* Per-worker manifest entry arrays (separate from cache-line-aligned worker state) */
     cbm_pkg_entries_t *pkg_entries = calloc(worker_count, sizeof(cbm_pkg_entries_t));
 
+    /* ObjectScript macro table (NULL when no .inc include files present). */
+    CBMMacroTable *pp_macro_table = pp_build_macro_table(files, file_count);
+
     extract_ctx_t ec = {
         .files = files,
         .sorted = sorted,
@@ -780,6 +868,8 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .shared_ids = shared_ids,
         .cancelled = ctx->cancelled,
         .pkg_entries = pkg_entries,
+        .macro_table = pp_macro_table,
+        .return_type_table = ctx->return_type_table,
     };
     atomic_init(&ec.next_worker_id, 0);
     atomic_init(&ec.next_file_idx, 0);
@@ -809,6 +899,7 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 
     cbm_aligned_free(workers);
     free(sorted);
+    free(pp_macro_table); /* ObjectScript macro table (NULL-safe) */
 
     if (atomic_load(ctx->cancelled)) {
         return CBM_NOT_FOUND;
