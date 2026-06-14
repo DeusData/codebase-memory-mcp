@@ -65,6 +65,10 @@ typedef struct {
     /* Recursion guard for perl_eval_expr_type. */
     int eval_depth;
 
+    /* Recursion guard for the AST-walk passes (perl_resolve_calls_in_node /
+     * perl_pass1_scan). Bounds stack depth on pathologically nested input. */
+    int walk_depth;
+
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;
 } PerlLSPContext;

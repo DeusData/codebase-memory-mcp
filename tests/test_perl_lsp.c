@@ -238,6 +238,31 @@ TEST(perllsp_exported_function) {
     PASS();
 }
 
+/* ── 8b. Seeded CPAN Exporter import (use Scalar::Util qw(blessed)) ─
+ *
+ * Regression for the import-map "::" vs "." mismatch (QA round 1, F1):
+ * perl_collect_qw_imports used to build the colon-form target
+ * "Scalar::Util::blessed", but the stdlib registry keys curated CPAN subs in
+ * dotted form ("Scalar.Util.blessed") and lookup is exact-match — so the
+ * import never resolved. The import target must be dotted to match. */
+TEST(perllsp_cpan_exported_function) {
+    /* blessed is a curated CPAN export (Scalar::Util) seeded by
+     * cbm_perl_stdlib_register as "Scalar.Util.blessed". The bare call must
+     * resolve to that seeded registry symbol via the Exporter import map. */
+    const char *src = "package main;\n"
+                      "use Scalar::Util qw(blessed);\n"
+                      "sub run {\n"
+                      "    my $x = bless {}, 'Foo';\n"
+                      "    blessed($x);\n"
+                      "}\n";
+    CBMFileResult *r = extract_perl(src);
+    ASSERT(r);
+    /* Resolves to the dotted registry QN Scalar.Util.blessed. */
+    ASSERT(require_resolved(r, "main.run", "Scalar.Util.blessed") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── 9. require fallback (require Foo; Foo->bar()) ─────────────── */
 
 TEST(perllsp_require_fallback) {
@@ -251,6 +276,51 @@ TEST(perllsp_require_fallback) {
     CBMFileResult *r = extract_perl(src);
     ASSERT(r);
     ASSERT(require_resolved(r, "main.run", "main.bar") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── 9b. SUPER:: dispatch ($self->SUPER::method) ──────────────────
+ *
+ * Regression for the dead enclosing_parent_qn field (QA round 1, F4). The
+ * header advertised SUPER:: support but the field was never populated/read, so
+ * $self->SUPER::method() resolved to nothing. Now process_package_decl records
+ * the package's first @ISA parent and perl_resolve_method_call routes a
+ * SUPER:: call to that parent's method. */
+TEST(perllsp_super_dispatch) {
+    /* Child overrides greet and calls $self->SUPER::greet(); the SUPER call
+     * must resolve to Base::greet (the parent), tagged perl_method_super. */
+    const char *src = "package Base;\n"
+                      "sub new { return bless {}, shift; }\n"
+                      "sub greet { return 'base'; }\n"
+                      "package Child;\n"
+                      "our @ISA = ('Base');\n"
+                      "sub greet {\n"
+                      "    my $self = shift;\n"
+                      "    return $self->SUPER::greet();\n"
+                      "}\n";
+    CBMFileResult *r = extract_perl(src);
+    ASSERT(r);
+    /* The SUPER:: call resolves to a greet sub via the dedicated strategy. */
+    const CBMResolvedCall *rc =
+        find_resolved_with_strategy(r, "main.greet", "main.greet", "perl_method_super");
+    ASSERT(rc != NULL);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── 9c. SUPER:: with no known parent emits NO edge (zero-edge) ─── */
+TEST(perllsp_super_no_parent_no_edge) {
+    /* Orphan has no @ISA parent; SUPER::greet() must resolve to nothing rather
+     * than guessing an edge. */
+    const char *src = "package Orphan;\n"
+                      "sub greet {\n"
+                      "    my $self = shift;\n"
+                      "    return $self->SUPER::greet();\n"
+                      "}\n";
+    CBMFileResult *r = extract_perl(src);
+    ASSERT(r);
+    ASSERT(find_resolved_with_strategy(r, "main.greet", "greet", "perl_method_super") == NULL);
     cbm_free_result(r);
     PASS();
 }
@@ -288,6 +358,9 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_use_parent_inheritance);
     RUN_TEST(perllsp_use_base_inheritance);
     RUN_TEST(perllsp_exported_function);
+    RUN_TEST(perllsp_cpan_exported_function);
     RUN_TEST(perllsp_require_fallback);
+    RUN_TEST(perllsp_super_dispatch);
+    RUN_TEST(perllsp_super_no_parent_no_edge);
     RUN_TEST(perllsp_unindexed_receiver_emits_block);
 }

@@ -63,12 +63,24 @@
 #define PERL_CONF_LITERAL 0.95f  /* bless($r, 'Literal'); resolved call */
 #define PERL_CONF_INFERRED 0.75f /* ref($class)||$class idiom */
 
+/* Maximum AST-walk recursion depth for the resolution/scan passes. Mirrors
+ * java_lsp's JAVA_LSP_MAX_WALK_DEPTH: the per-child recursion of
+ * perl_resolve_calls_in_node / perl_pass1_scan can stack-overflow on
+ * pathologically nested real-world sources, the same failure mode that
+ * produced documented SIGSEGVs in the Java/C++ walkers. Past the cap the
+ * subtree is skipped — its calls stay unresolved (graceful degradation, not a
+ * crash). The zero-edge guarantee is preserved: a skipped subtree emits no
+ * edges, never a wrong one. */
+#define CBM_LSP_PERL_MAX_WALK_DEPTH 512
+
 /* ── forward declarations ───────────────────────────────────────── */
 
 static void perl_resolve_calls_in_node(PerlLSPContext *ctx, TSNode node);
+static void perl_resolve_calls_in_node_inner(PerlLSPContext *ctx, TSNode node);
 static void process_subroutine(PerlLSPContext *ctx, TSNode node);
 static void process_package_decl(PerlLSPContext *ctx, TSNode node);
 static void perl_pass1_scan(PerlLSPContext *ctx, TSNode node);
+static void perl_pass1_scan_inner(PerlLSPContext *ctx, TSNode node);
 static const CBMType *perl_eval_function_call_type(PerlLSPContext *ctx, TSNode node);
 static const CBMType *perl_eval_method_call_type(PerlLSPContext *ctx, TSNode node);
 static const CBMType *perl_eval_new_type(PerlLSPContext *ctx, TSNode node);
@@ -643,6 +655,23 @@ static void perl_resolve_method_call(PerlLSPContext *ctx, TSNode call) {
     if (!mname || !mname[0])
         return;
 
+    /* $self->SUPER::method() — dispatch to the enclosing package's parent
+     * (MRO root recorded in process_package_decl). Resolve `method` starting
+     * at the parent so an overridden method in the child is skipped. No known
+     * parent or unresolved method → no edge (zero-edge guarantee). */
+    if (strncmp(mname, "SUPER::", 7) == 0) {
+        const char *super_method = mname + 7;
+        if (!super_method[0])
+            return;
+        const char *parent_qn = ctx->enclosing_parent_qn;
+        if (!parent_qn || !parent_qn[0])
+            return;
+        const CBMRegisteredFunc *sf = perl_lookup_method(ctx, parent_qn, super_method);
+        if (sf)
+            perl_emit_resolved(ctx, sf->qualified_name, "perl_method_super", PERL_CONF_LITERAL);
+        return;
+    }
+
     const char *class_qn = NULL;
     const char *strategy = "perl_method_typed";
     if (!ts_node_is_null(inv)) {
@@ -704,7 +733,19 @@ static void perl_process_assignment(PerlLSPContext *ctx, TSNode assign) {
 
 /* ── body walk ──────────────────────────────────────────────────── */
 
+/* Depth-guarded entry: the AST walk recurses per nesting level and can stack-
+ * overflow on pathologically nested sources (the same failure mode documented
+ * for the Java/C++ walkers). Past CBM_LSP_PERL_MAX_WALK_DEPTH the subtree is
+ * skipped — graceful degradation, never a wrong edge. */
 static void perl_resolve_calls_in_node(PerlLSPContext *ctx, TSNode node) {
+    if (ctx->walk_depth >= CBM_LSP_PERL_MAX_WALK_DEPTH)
+        return;
+    ctx->walk_depth++;
+    perl_resolve_calls_in_node_inner(ctx, node);
+    ctx->walk_depth--;
+}
+
+static void perl_resolve_calls_in_node_inner(PerlLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return;
     const char *k = ts_node_type(node);
@@ -860,6 +901,18 @@ static void process_package_decl(PerlLSPContext *ctx, TSNode node) {
         return;
     ctx->current_package_qn = cbm_arena_strdup(ctx->arena, pkg);
     ctx->enclosing_package_qn = ctx->current_package_qn;
+
+    /* Record the package's first @ISA parent for SUPER:: dispatch. The ISA
+     * table is fully populated by PASS 1 before this runs in PASS 2, so the
+     * MRO root is available here. NULL when the package has no known parent —
+     * SUPER:: then resolves to nothing (zero-edge guarantee). */
+    ctx->enclosing_parent_qn = NULL;
+    for (int i = 0; i < ctx->isa_count; i++) {
+        if (ctx->isa_pkg_qns[i] && strcmp(ctx->isa_pkg_qns[i], pkg) == 0) {
+            ctx->enclosing_parent_qn = ctx->isa_parent_qns[i];
+            break;
+        }
+    }
 }
 
 /* Parse the `qw(a b c)` list inside a node into the import map for module
@@ -880,7 +933,13 @@ static void perl_collect_qw_imports(PerlLSPContext *ctx, TSNode container,
         const char *fn = perl_strip_sigil(word); /* allow &func imports */
         if (!fn || !fn[0] || !(isalpha((unsigned char)fn[0]) || fn[0] == '_'))
             continue;
-        char *target = cbm_arena_sprintf(ctx->arena, "%s::%s", module_name, fn);
+        /* Registry QNs are fully dotted (e.g. "Scalar.Util.blessed"): the
+         * module portion uses "." not "::". Dot the module so the import
+         * target matches the registry key for exact-match lookup. */
+        const char *module_dot = perl_pkg_to_dot(ctx->arena, module_name);
+        if (!module_dot)
+            module_dot = module_name;
+        char *target = cbm_arena_sprintf(ctx->arena, "%s.%s", module_dot, fn);
         perl_lsp_add_use(ctx, fn, target);
     }
 }
@@ -1027,7 +1086,16 @@ static void perl_collect_isa_assignment(PerlLSPContext *ctx, TSNode assign) {
 
 /* Recursively scan (PASS 1) for package context, @ISA assignments, and `use`
  * statements. */
+/* Depth-guarded entry (see perl_resolve_calls_in_node for the rationale). */
 static void perl_pass1_scan(PerlLSPContext *ctx, TSNode node) {
+    if (ctx->walk_depth >= CBM_LSP_PERL_MAX_WALK_DEPTH)
+        return;
+    ctx->walk_depth++;
+    perl_pass1_scan_inner(ctx, node);
+    ctx->walk_depth--;
+}
+
+static void perl_pass1_scan_inner(PerlLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return;
     const char *k = ts_node_type(node);
@@ -1302,8 +1370,4 @@ void cbm_run_perl_lsp(CBMArena *arena, CBMFileResult *result, const char *source
                     r->strategy, r->confidence);
         }
     }
-
-    /* Silence unused-helper warnings for API symbols kept for the header /
-     * future cross-file plan. */
-    (void)perl_pkg_to_dot;
 }
