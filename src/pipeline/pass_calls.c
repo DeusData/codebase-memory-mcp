@@ -615,6 +615,83 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     return SKIP_ONE;
 }
 
+/* ObjectScript: build a method-QN -> return-type table from the Method nodes
+ * already in the graph buffer (definitions pass ran first). Scalar return types
+ * (%String, %Integer, ...) are skipped since they cannot host method dispatch.
+ * Returns NULL when no usable entries exist. Caller owns the heap table. */
+static CBMReturnTypeTable *build_return_type_table(const cbm_gbuf_t *gbuf) {
+    if (!gbuf) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t **method_nodes = NULL;
+    int method_count = 0;
+    if (cbm_gbuf_find_by_label(gbuf, "Method", &method_nodes, &method_count) != 0 ||
+        method_count <= 0 || !method_nodes) {
+        return NULL;
+    }
+
+    CBMReturnTypeTable *rtt = (CBMReturnTypeTable *)calloc(1, sizeof(CBMReturnTypeTable));
+    if (!rtt) {
+        return NULL;
+    }
+
+    static const char *scalar_types[] = {"%String",    "%Integer", "%Float", "%Boolean",
+                                         "%Status",    "%Numeric", "%Date",  "%Time",
+                                         "%TimeStamp", "%Binary",  NULL};
+
+    for (int i = 0; i < method_count && rtt->count < CBM_RETURN_TYPE_TABLE_CAP; i++) {
+        const cbm_gbuf_node_t *n = method_nodes[i];
+        if (!n->qualified_name || !n->properties_json) {
+            continue;
+        }
+
+        const char *p = strstr(n->properties_json, "\"return_type\":");
+        if (!p) {
+            continue;
+        }
+        p += 14; /* strlen("\"return_type\":") */
+        while (*p == ' ') {
+            p++;
+        }
+        if (*p != '"') {
+            continue;
+        }
+        p++;
+        const char *end = strchr(p, '"');
+        if (!end) {
+            continue;
+        }
+        int rtlen = (int)(end - p);
+        if (rtlen <= 0 || rtlen > 255) {
+            continue;
+        }
+
+        char rt_buf[256];
+        memcpy(rt_buf, p, (size_t)rtlen);
+        rt_buf[rtlen] = '\0';
+
+        bool is_scalar = false;
+        for (int si = 0; scalar_types[si]; si++) {
+            if (strcmp(rt_buf, scalar_types[si]) == 0) {
+                is_scalar = true;
+                break;
+            }
+        }
+        if (is_scalar) {
+            continue;
+        }
+
+        rtt->entries[rtt->count].method_qn = n->qualified_name;
+        rtt->entries[rtt->count].return_type = strdup(rt_buf);
+        rtt->count++;
+    }
+    if (rtt->count == 0) {
+        free(rtt);
+        return NULL;
+    }
+    return rtt;
+}
+
 static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
                                            const cbm_file_info_t *fi, bool *owned) {
     *owned = false;
@@ -626,8 +703,9 @@ static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
     if (!src) {
         return NULL;
     }
-    CBMFileResult *r = cbm_extract_file(src, slen, fi->language, ctx->project_name, fi->rel_path,
-                                        CBM_EXTRACT_BUDGET, NULL, NULL);
+    CBMFileResult *r = cbm_extract_file_ex(src, slen, fi->language, ctx->project_name, fi->rel_path,
+                                           CBM_EXTRACT_BUDGET, NULL, NULL, ctx->macro_table,
+                                           ctx->return_type_table);
     free(src);
     if (r) {
         *owned = true;
@@ -637,6 +715,16 @@ static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
 
 int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count) {
     cbm_log_info("pass.start", "pass", "calls", "files", itoa_log(file_count));
+
+    /* ObjectScript: build the method-return-type table from the definitions
+     * already in the graph buffer so `Set x = obj.Method()` can resolve x's
+     * class for subsequent x.Method() dispatch. NULL if no Method nodes. */
+    if (!ctx->return_type_table) {
+        CBMReturnTypeTable *rtt = build_return_type_table(ctx->gbuf);
+        if (rtt) {
+            ctx->return_type_table = rtt;
+        }
+    }
 
     int total_calls = 0;
     int resolved = 0;

@@ -721,11 +721,6 @@ static bool cbm_source_nesting_exceeds(const char *source, int source_len, int c
     return false;
 }
 
-static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
-                                            CBMLanguage language, const char *project,
-                                            const char *rel_path, int64_t timeout_micros,
-                                            const char **extra_defines, const char **include_paths);
-
 /* Best-effort parse-coverage collection (#963). Walks only the has_error paths
  * of the tree and records the 1-based line ranges of the TOP-MOST ERROR/MISSING
  * nodes (does not descend into an error subtree — one range per failed region).
@@ -886,17 +881,17 @@ static const char *cbm_error_ranges_str(CBMArena *a, const cbm_error_regions_t *
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, const char **include_paths) {
-    CBMFileResult *r = cbm_extract_file_impl(source, source_len, language, project, rel_path,
-                                             timeout_micros, extra_defines, include_paths);
-    cbm_index_mark_done(rel_path);
+    CBMFileResult *r =
+        cbm_extract_file_ex(source, source_len, language, project, rel_path, timeout_micros,
+                            extra_defines, include_paths, NULL, NULL);
     return r;
 }
 
-static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
-                                            CBMLanguage language, const char *project,
-                                            const char *rel_path, int64_t timeout_micros,
-                                            const char **extra_defines,
-                                            const char **include_paths) {
+CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLanguage language,
+                                   const char *project, const char *rel_path,
+                                   int64_t timeout_micros, const char **extra_defines,
+                                   const char **include_paths, const CBMMacroTable *macro_table,
+                                   const CBMReturnTypeTable *return_type_table) {
     // Allocate result on heap (arena inside for all string data)
     enum { SINGLE = 1 };
     CBMFileResult *result = (CBMFileResult *)calloc(SINGLE, sizeof(CBMFileResult));
@@ -926,6 +921,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     if (!spec) {
         result->has_error = true;
         result->error_msg = cbm_arena_strdup(a, "unsupported language");
+        cbm_index_mark_done(rel_path);
         return result;
     }
 
@@ -934,6 +930,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     if (!ts_lang) {
         result->has_error = true;
         result->error_msg = cbm_arena_strdup(a, "no tree-sitter grammar");
+        cbm_index_mark_done(rel_path);
         return result;
     }
 
@@ -953,6 +950,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     if (!parser) {
         result->has_error = true;
         result->error_msg = cbm_arena_strdup(a, "parser alloc failed");
+        cbm_index_mark_done(rel_path);
         return result;
     }
 
@@ -985,6 +983,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         result->has_error = true;
         result->error_msg =
             cbm_arena_strdup(a, timeout_micros > 0 ? "parse timeout" : "parse failed");
+        cbm_index_mark_done(rel_path);
         return result;
     }
 
@@ -1009,6 +1008,8 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         .rel_path = rel_path,
         .module_qn = result->module_qn,
         .root = root,
+        .macro_table = macro_table,
+        .return_type_table = return_type_table,
     };
 
     // Run extractors: defs + imports use separate walks (unique recursion patterns),
@@ -1318,6 +1319,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     // Retain tree for cross-file LSP reuse (caller frees via cbm_free_tree)
     result->cached_tree = tree;
     result->cached_lang = language;
+    cbm_index_mark_done(rel_path);
     return result;
 }
 

@@ -48,6 +48,15 @@ License summary:
   original upstream authors' licenses — see the manifest for per-grammar
   provenance.
 
+### tree-sitter-objectscript (UDL + routine)
+
+- **Project:** [intersystems/tree-sitter-objectscript](https://github.com/intersystems/tree-sitter-objectscript)
+- **License:** MIT
+- **Copyright:** (c) 2025 InterSystems Corporation
+- **Vendored at:** `internal/cbm/vendored/grammars/objectscript_udl/`, `internal/cbm/vendored/grammars/objectscript_routine/`
+- **Pinned commit:** `a7ffcdf`
+- **Notes:** InterSystems-maintained grammar for the ObjectScript language (InterSystems IRIS / Caché). Vendor-maintained; not in nvim-treesitter or Helix registries. Each `scanner.c`'s upstream `#include "../../common/scanner.h"` is repointed to a per-directory `objectscript_common.h` (verbatim copy of upstream `common/scanner.h`).
+
 ## Vendored C/C++ Libraries
 
 | Library | Path | License | Project |

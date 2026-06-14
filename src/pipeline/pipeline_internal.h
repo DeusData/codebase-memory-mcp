@@ -115,6 +115,14 @@ typedef struct {
      * resolve. */
     CBMArena seq_cross_arena;
     bool seq_cross_arena_live;
+
+    /* ObjectScript $$$macro table built from .inc files in the repo (NULL if
+     * no ObjectScript include files were found). Owned by pipeline.c. */
+    const CBMMacroTable *macro_table;
+
+    /* ObjectScript method-return-type table built from extracted definitions
+     * (NULL until pass_calls builds it). Owned by pipeline.c. */
+    const CBMReturnTypeTable *return_type_table;
 } cbm_pipeline_ctx_t;
 
 static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *const *excluded_dirs,

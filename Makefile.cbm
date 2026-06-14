@@ -135,6 +135,8 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_k8s.c \
     $(CBM_DIR)/helpers.c \
     $(CBM_DIR)/lang_specs.c \
+    $(CBM_DIR)/macro_table.c \
+    $(CBM_DIR)/iris_export_xml.c \
     $(CBM_DIR)/service_patterns.c
 
 # LSP resolvers (compiled as one unit via lsp_all.c)
