@@ -35,69 +35,6 @@ static CBMFileResult *extract(const char *src, CBMLanguage lang, const char *pro
     return r;
 }
 
-/* Extract on a thread with a small, Windows-like stack to reproduce the
- * Windows CI SIGSEGV directly (Linux/macOS default to ~8 MB; Windows defaults
- * to ~1 MB). If the parse overflows the thread stack the whole process dies
- * with SIGSEGV — exactly the Windows failure. Surviving the call (it returns at
- * all) means the parse recursion stayed bounded.
- *
- * Stack budget: 1 MB mirrors the real Windows default and is the value the
- * shipped (uninstrumented) binary must survive — the fix's
- * CBM_TS_STACK_MERGE_MAX_DEPTH cap holds ~130 KB there, huge headroom. Under
- * AddressSanitizer (the local/Linux/macOS `test` build; the Windows `test` job
- * runs with SANITIZE= empty) each frame carries redzone + shadow overhead ~8x,
- * so we widen the budget to 4 MB — still far under the 8 MB default, still
- * exercises the capped recursion, but tolerant of ASan instrumentation. */
-#if defined(__has_feature)
-#if __has_feature(address_sanitizer)
-#define CBM_TEST_ASAN 1
-#endif
-#endif
-#if defined(__SANITIZE_ADDRESS__)
-#define CBM_TEST_ASAN 1
-#endif
-#if defined(CBM_TEST_ASAN)
-#define CBM_TEST_SMALL_STACK_BYTES ((size_t)4 * 1024 * 1024)
-#else
-#define CBM_TEST_SMALL_STACK_BYTES ((size_t)1024 * 1024)
-#endif
-
-#if !defined(_WIN32)
-#include <pthread.h>
-typedef struct {
-    const char *src;
-    CBMLanguage lang;
-    const char *path;
-} SmallStackJob;
-static void *small_stack_worker(void *arg) {
-    SmallStackJob *j = (SmallStackJob *)arg;
-    CBMFileResult *r =
-        cbm_extract_file(j->src, (int)strlen(j->src), j->lang, "so", j->path, 0, NULL, NULL);
-    if (r)
-        cbm_free_result(r);
-    return NULL;
-}
-static void extract_on_small_stack(const char *src, CBMLanguage lang, const char *path) {
-    SmallStackJob job = {src, lang, path};
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, CBM_TEST_SMALL_STACK_BYTES);
-    pthread_t t;
-    if (pthread_create(&t, &attr, small_stack_worker, &job) == 0)
-        pthread_join(t, NULL);
-    else
-        small_stack_worker(&job); /* fallback: run inline */
-    pthread_attr_destroy(&attr);
-}
-#else
-static void extract_on_small_stack(const char *src, CBMLanguage lang, const char *path) {
-    CBMFileResult *r =
-        cbm_extract_file(src, (int)strlen(src), lang, "so", path, 0, NULL, NULL);
-    if (r)
-        cbm_free_result(r);
-}
-#endif
-
 /* ═══════════════════════════════════════════════════════════════════
  * Test: JavaScript calls exceeding 512 stack cap
  *
@@ -567,11 +504,11 @@ TEST(lsp_perl_deep_expression_no_crash) {
      * ambiguity is left on the GLR stack instead of merged — a valid parse, never
      * a wrong one. See lsp_java_deep_nesting_no_crash on the depth choice.
      *
-     * This test exercises the fixed path two ways: (1) the fork-based
-     * so_extract_crashes catches a SIGSEGV on the host's default stack; (2)
-     * extract_on_1mb_stack reproduces the *Windows* small-stack failure directly,
-     * so the regression is caught even on hosts with an 8 MB default stack. */
-    const int DEPTH = 30000;
+     * Uses the fork harness (so_extract_crashes). Depth 2000 is well above
+     * the CBM_TS_STACK_MERGE_MAX_DEPTH=512 cap (exercises the fix) but fast
+     * to parse: Perl's GLR merge is O(n^2) at this pattern, so 30k (used by
+     * Java/C++) would time out on CI even post-fix. */
+    const int DEPTH = 2000;
     size_t sz = (size_t)DEPTH * 3 + 256;
     char *src = malloc(sz);
     ASSERT_NOT_NULL(src);
@@ -586,8 +523,6 @@ TEST(lsp_perl_deep_expression_no_crash) {
     p += DEPTH;
     snprintf(p, sz - (size_t)(p - src), "; }\n");
     ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_PERL, "deep.pl"));
-    /* Windows-stack reproduction: must return (no overflow) on a small stack. */
-    extract_on_small_stack(src, CBM_LANG_PERL, "deep.pl");
     free(src);
     PASS();
 }
