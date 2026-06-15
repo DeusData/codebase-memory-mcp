@@ -1047,9 +1047,13 @@ TEST(cli_install_copies_binary_to_target_issue472) {
     const char *data = read_test_file(dst);
     ASSERT_STR_EQ(data, "fresh build bytes");
 
+#ifndef _WIN32
+    /* The exec bit is set via chmod, which is POSIX-only; on Windows it is not
+     * meaningful and MinGW stat() derives it from the file extension. */
     struct stat st;
     ASSERT_EQ(stat(dst, &st), 0);
     ASSERT((st.st_mode & S_IXUSR) != 0); /* executable bit set */
+#endif
 
     /* Overwrite an existing (stale) target with new content. */
     write_test_file(dst, "STALE");
