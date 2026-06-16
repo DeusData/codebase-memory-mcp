@@ -585,7 +585,7 @@ static const char *perl_func_types[] = {"subroutine_declaration_statement", NULL
 static const char *perl_module_types[] = {"source_file", NULL};
 static const char *perl_call_types[] = {"ambiguous_function_call_expression",
                                         "function_call_expression", "func1op_call_expression",
-                                        NULL};
+                                        "method_call_expression", NULL};
 static const char *perl_import_types[] = {"use_statement", "require_statement", "require", NULL};
 static const char *perl_branch_types[] = {"if_statement",      "unless_statement", "for_statement",
                                           "foreach_statement", "while_statement",  NULL};

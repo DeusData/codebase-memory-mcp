@@ -361,12 +361,14 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         }
     }
 
-    /* Perl builtin guard (#459 follow-up). Applied only after LSP resolution
-     * declined, so a real LSP-resolved call is never suppressed. A Perl builtin
-     * (push/shift/keys/...) resolved by the generic short-name matcher to a
-     * project sub sharing the name is almost always a false positive. Gated to
-     * Perl — other languages reach cbm_registry_resolve unchanged. */
-    if (lang == CBM_LANG_PERL && cbm_perl_is_builtin(call->callee_name)) {
+    /* Perl call-graph noise guards (#459 follow-up). Applied only after LSP
+     * resolution declined, so a real LSP-resolved call is never suppressed.
+     * Gated to Perl — other languages reach cbm_registry_resolve unchanged.
+     *   1. Builtins (push/shift/keys/...): a generic short-name match to a
+     *      project sub sharing the name is almost always a false positive.
+     *   2. Method calls ($obj->m): without a resolved receiver type the bare
+     *      short-name match is wrong; that resolution is the LSP's job. */
+    if (lang == CBM_LANG_PERL && (call->is_method || cbm_perl_is_builtin(call->callee_name))) {
         return 0;
     }
 

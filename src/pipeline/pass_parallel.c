@@ -1791,11 +1791,13 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 res.candidate_count = 1;
                 ws->lsp_overrides++;
             }
-        } else if (lang == CBM_LANG_PERL && cbm_perl_is_builtin(call->callee_name)) {
-            /* Perl builtin guard (#459 follow-up), mirroring the sequential
-             * pass (pass_calls.c). LSP resolution already declined above
-             * (lsp == NULL here), so suppress the generic short-name match for
-             * Perl builtins (push/shift/keys/...). Leaves res empty → no edge.
+        } else if (lang == CBM_LANG_PERL &&
+                   (call->is_method || cbm_perl_is_builtin(call->callee_name))) {
+            /* Perl call-graph noise guards (#459 follow-up), mirroring the
+             * sequential pass (pass_calls.c). LSP resolution already declined
+             * above (lsp == NULL here), so suppress the generic short-name
+             * match for Perl builtins (push/shift/keys/...) and for method
+             * calls with an unknown receiver. Leaves res empty → no edge.
              * Gated to Perl; every other language resolves unchanged. */
             atomic_fetch_add_explicit(&rc->time_ns_rc_resolve, extract_now_ns() - _rc_t0,
                                       memory_order_relaxed);
