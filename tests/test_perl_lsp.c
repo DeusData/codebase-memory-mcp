@@ -142,6 +142,31 @@ TEST(perllsp_static_package_call) {
     PASS();
 }
 
+/* ── 3b. Multi-level static package call (Foo::Bar::sub()) ──────── */
+/* Regression: the resolver split the qualified name on the FIRST "::", so a
+ * call to Foo::Bar::sub() was mis-parsed as pkg "Foo" / sub "Bar::sub" and
+ * never resolved — falling through to the bare-name fallback, which collapsed
+ * distinct packages' same-named subs onto one winner. Splitting on the LAST
+ * "::" keeps the full package name so perl_lookup_method resolves correctly. */
+TEST(perllsp_static_multilevel_package_call) {
+    const char *src = "package Acme::Widget;\n"
+                      "sub render { return 1; }\n"
+                      "package main;\n"
+                      "sub caller_sub {\n"
+                      "    Acme::Widget::render();\n"
+                      "}\n";
+    CBMFileResult *r = extract_perl(src);
+    ASSERT(r);
+    /* Before the fix this edge was absent (LSP emitted nothing for the
+     * multi-level qualified call). */
+    const CBMResolvedCall *rc =
+        find_resolved_with_strategy(r, "main.caller_sub", "main.render", "perl_static_call");
+    ASSERT(rc != NULL);
+    ASSERT(rc->strategy != NULL);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── 4. $self method dispatch ($self = shift) ──────────────────── */
 
 TEST(perllsp_self_method) {
@@ -353,6 +378,7 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_method_via_bless_assignment);
     RUN_TEST(perllsp_constructor_class_method);
     RUN_TEST(perllsp_static_package_call);
+    RUN_TEST(perllsp_static_multilevel_package_call);
     RUN_TEST(perllsp_self_method);
     RUN_TEST(perllsp_isa_inheritance);
     RUN_TEST(perllsp_use_parent_inheritance);

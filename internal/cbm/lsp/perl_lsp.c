@@ -610,7 +610,14 @@ static void perl_resolve_function_call(PerlLSPContext *ctx, TSNode call) {
         return;
 
     const CBMRegisteredFunc *f = NULL;
-    char *colons = strstr(name, "::");
+    /* Split on the LAST "::" so multi-level packages keep their full name
+     * (Foo::Bar::sub -> pkg "Foo::Bar", sub "sub"). strstr would stop at the
+     * first "::", yielding pkg "Foo" and a sub name that still contains "::" —
+     * that never resolves, so the call falls through to the bare-name fallback,
+     * which collapses distinct packages' same-named subs onto one winner. */
+    char *colons = NULL;
+    for (char *p = strstr(name, "::"); p; p = strstr(p + 2, "::"))
+        colons = p;
     if (colons) {
         size_t plen = (size_t)(colons - name);
         char *pkg = cbm_arena_strndup(ctx->arena, name, plen);
