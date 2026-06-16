@@ -665,6 +665,9 @@ TEST(perl_suppress_keeps_high_confidence_and_genuine_calls) {
      * call to a builtin-named sub still resolves (criterion d). */
     ASSERT_FALSE(cbm_perl_suppress_generic_match(true, false, "log", "same_module"));
     ASSERT_FALSE(cbm_perl_suppress_generic_match(true, false, "open", "import_map"));
+    /* import_map_suffix is a genuine import resolution (conf 0.85), not a weak
+     * short-name guess — a '::'-qualified call resolved this way must be kept. */
+    ASSERT_FALSE(cbm_perl_suppress_generic_match(true, true, "Foo::Bar::m", "import_map_suffix"));
     ASSERT_FALSE(cbm_perl_suppress_generic_match(true, true, "commit", "same_module"));
     /* A genuine non-builtin function call is never suppressed (edge survives). */
     ASSERT_FALSE(cbm_perl_suppress_generic_match(true, false, "helper", "suffix_match"));
