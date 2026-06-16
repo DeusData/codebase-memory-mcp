@@ -288,10 +288,39 @@ TEST(resolve_qualified_disambiguates_same_name) {
         cbm_registry_resolve(r, "App::Gamma::save", "proj.lib.App.Caller", NULL, NULL, 0);
     ASSERT_STR_EQ(g.qualified_name, "proj.lib.App.Gamma.save");
 
+    /* The dotted callee form (Go/Python/C#) disambiguates identically. */
+    cbm_resolution_t dotted =
+        cbm_registry_resolve(r, "App.Beta.save", "proj.lib.App.Caller", NULL, NULL, 0);
+    ASSERT_STR_EQ(dotted.qualified_name, "proj.lib.App.Beta.save");
+    ASSERT_STR_EQ(dotted.strategy, "qualified_suffix");
+
+    /* A qualified callee whose tail matches NO candidate falls through to the
+     * existing bare-name scoring (never a qualified_suffix result). */
+    cbm_resolution_t nomatch =
+        cbm_registry_resolve(r, "Other::Pkg::save", "proj.lib.App.Caller", NULL, NULL, 0);
+    ASSERT_TRUE(!nomatch.strategy || strcmp(nomatch.strategy, "qualified_suffix") != 0);
+
     /* A bare call stays ambiguous (no qualifier → no disambiguation signal). */
     cbm_resolution_t bare =
         cbm_registry_resolve(r, "save", "proj.lib.App.Caller", NULL, NULL, 0);
     ASSERT_TRUE(!bare.strategy || strcmp(bare.strategy, "qualified_suffix") != 0);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* When two candidates share the same qualified tail, a qualified callee is
+ * genuinely ambiguous and must fall through to bare-name scoring rather than
+ * pick arbitrarily under the high-confidence qualified_suffix strategy. */
+TEST(resolve_qualified_ambiguous_tail_falls_through) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "run", "proj.svcA.Foo.Bar.run", "Function");
+    cbm_registry_add(r, "run", "proj.svcB.Foo.Bar.run", "Function");
+
+    /* "Foo::Bar::run" tail matches BOTH candidates → not unique → fall through. */
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "Foo::Bar::run", "proj.svcA.Caller", NULL, NULL, 0);
+    ASSERT_TRUE(!res.strategy || strcmp(res.strategy, "qualified_suffix") != 0);
 
     cbm_registry_free(r);
     PASS();
@@ -690,6 +719,7 @@ SUITE(registry) {
     /* Resolution */
     RUN_TEST(resolve_same_module);
     RUN_TEST(resolve_qualified_disambiguates_same_name);
+    RUN_TEST(resolve_qualified_ambiguous_tail_falls_through);
     RUN_TEST(resolve_import_map);
     RUN_TEST(resolve_import_map_bare_function);
     RUN_TEST(resolve_unique_name);
