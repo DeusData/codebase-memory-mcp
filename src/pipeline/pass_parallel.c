@@ -1108,15 +1108,22 @@ static size_t append_args_json(char *buf, size_t bufsize, size_t pos, const CBMC
     pos += (size_t)n;
     for (int i = 0; i < call->arg_count && pos < bufsize - CBM_ARG_JSON_GUARD; i++) {
         const CBMCallArg *a = &call->args[i];
+        size_t mark = pos; /* rollback point (before the separator) */
         if (i > 0 && pos < bufsize - SKIP_ONE) {
             buf[pos++] = ',';
         }
         char expr_buf[CBM_SZ_128];
         sanitize_expr(expr_buf, a->expr);
         n = format_call_arg(buf + pos, bufsize - pos, a, expr_buf);
-        if (n > 0) {
-            pos += (size_t)n;
+        /* snprintf returns the UNtruncated length: if the arg did not fully
+         * fit, advancing pos by n would push it past buf and the buf[pos]
+         * writes below would overflow. Drop the arg whole (atomic field —
+         * keeps the array valid) and stop appending. */
+        if (n <= 0 || (size_t)n >= bufsize - pos) {
+            pos = mark;
+            break;
         }
+        pos += (size_t)n;
     }
     if (pos < bufsize - SKIP_ONE) {
         buf[pos++] = ']';

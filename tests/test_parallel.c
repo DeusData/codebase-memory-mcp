@@ -341,6 +341,54 @@ TEST(parallel_empty_files) {
     PASS();
 }
 
+/* ── Regression: args JSON must not overflow the props buffer ──────── */
+
+/* A call with many long string arguments makes append_args_json()'s running
+ * position exceed the fixed CBM_SZ_2K `props` stack buffer in
+ * emit_normal_calls_edge(): format_call_arg() returns snprintf's UNtruncated
+ * length, so pos += n could run past the buffer and the trailing
+ * buf[pos]='\0' wrote out of bounds (stack-buffer-overflow; caught by the
+ * stack canary as a SIGABRT on real repos). This indexes a fixture whose
+ * single call carries enough long args to drive pos past 2 KB; under the
+ * ASan test build a regression aborts here. */
+TEST(parallel_args_json_no_overflow) {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "/tmp/cbm_argov_XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(dir) != NULL);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/app.ts", dir);
+    FILE *f = fopen(path, "w");
+    ASSERT_TRUE(f != NULL);
+    fputs("function sink(...xs: string[]) { return xs; }\n", f);
+    fputs("function caller() {\n  sink(\n", f);
+    for (int i = 0; i < 60; i++) {
+        /* 100-char string literal per arg; 60 args => args JSON well past the
+         * 2 KB props buffer, forcing the pre-fix overshoot. */
+        fputs("    \"", f);
+        for (int j = 0; j < 100; j++)
+            fputc('a' + (i % 26), f);
+        fputs(i < 59 ? "\",\n" : "\"\n", f);
+    }
+    fputs("  );\n}\n", f);
+    fclose(f);
+
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    ASSERT_EQ(cbm_discover(dir, &opts, &files, &file_count), 0);
+    ASSERT_GT(file_count, 0);
+
+    cbm_gbuf_t *gbuf = run_parallel("argov-test", dir, files, file_count, 4);
+    ASSERT_TRUE(gbuf != NULL);
+    ASSERT_GT(cbm_gbuf_edge_count(gbuf), 0);
+
+    cbm_gbuf_free(gbuf);
+    cbm_discover_free(files, file_count);
+    th_rmtree(dir);
+    PASS();
+}
+
 /* ── Graph buffer merge tests ─────────────────────────────────────── */
 
 TEST(gbuf_shared_ids_unique) {
@@ -680,6 +728,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_implements_parity);
     RUN_TEST(parallel_total_edges);
     RUN_TEST(parallel_empty_files);
+    RUN_TEST(parallel_args_json_no_overflow);
 
     /* Cleanup shared state */
     parity_teardown();
