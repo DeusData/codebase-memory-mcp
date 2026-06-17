@@ -37,6 +37,8 @@ enum {
 #include <stdio.h>
 #include <string.h>
 
+bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *callee_name);
+
 /* Extract a JSON string value by key from properties.
  * Returns pointer into buf (caller provides buffer). NULL if not found. */
 static const char *json_extract(const char *json, const char *key, char *buf, int bufsz) {
@@ -82,6 +84,13 @@ static void route_edge_visitor(const cbm_gbuf_edge_t *edge, void *userdata) {
     char url_buf[CBM_SZ_512];
     const char *url = json_extract(edge->properties_json, "url_path", url_buf, sizeof(url_buf));
     if (!url || !url[0]) {
+        return;
+    }
+    char callee_buf[CBM_SZ_256];
+    const char *callee =
+        json_extract(edge->properties_json, "callee", callee_buf, sizeof(callee_buf));
+    if (strcmp(edge->type, "HTTP_CALLS") == 0 &&
+        !cbm_service_pattern_is_http_route_literal(url, callee)) {
         return;
     }
 
@@ -573,6 +582,15 @@ typedef struct {
     const char *edge_type;
 } caller_edge_ref_t;
 
+static bool http_call_edge_has_valid_route(const cbm_gbuf_edge_t *edge) {
+    char url_buf[CBM_SZ_512];
+    const char *url = json_extract(edge->properties_json, "url_path", url_buf, sizeof(url_buf));
+    char callee_buf[CBM_SZ_256];
+    const char *callee =
+        json_extract(edge->properties_json, "callee", callee_buf, sizeof(callee_buf));
+    return cbm_service_pattern_is_http_route_literal(url, callee);
+}
+
 /* Try to create a DATA_FLOWS edge between caller and handler via a route.
  * Returns: 1=created, 0=skipped (self/duplicate), -1=skipped (has direct call). */
 static int try_create_data_flow(cbm_gbuf_t *gb, int64_t caller_id, int64_t handler_id,
@@ -655,6 +673,9 @@ static int collect_caller_edges(cbm_gbuf_t *gb, int64_t route_id, caller_edge_re
     int http_count = 0;
     cbm_gbuf_find_edges_by_target_type(gb, route_id, "HTTP_CALLS", &http_edges, &http_count);
     for (int i = 0; i < http_count && n < max_out; i++) {
+        if (!http_call_edge_has_valid_route(http_edges[i])) {
+            continue;
+        }
         out[n].source_id = http_edges[i]->source_id;
         out[n].props = http_edges[i]->properties_json;
         out[n].edge_type = "HTTP_CALLS";

@@ -550,6 +550,191 @@ static const lib_pattern_t *match_qn(const char *qn, const lib_pattern_t *patter
     return NULL;
 }
 
+static bool starts_with_segment(const char *path, const char *segment) {
+    if (!path || path[0] != '/' || !segment) {
+        return false;
+    }
+    size_t seg_len = strlen(segment);
+    const char *p = path + 1;
+    return strncmp(p, segment, seg_len) == 0 && (p[seg_len] == '\0' || p[seg_len] == '/');
+}
+
+static bool contains_segment(const char *path, const char *segment) {
+    if (!path || !segment) {
+        return false;
+    }
+    size_t seg_len = strlen(segment);
+    const char *p = path;
+    while ((p = strchr(p, '/')) != NULL) {
+        p++;
+        if (strncmp(p, segment, seg_len) == 0 && (p[seg_len] == '\0' || p[seg_len] == '/')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool is_digit_char(char ch) {
+    return ch >= '0' && ch <= '9';
+}
+
+static bool has_http_route_marker(const char *path) {
+    if (starts_with_segment(path, "api") || starts_with_segment(path, "apis") ||
+        starts_with_segment(path, "graphql") || starts_with_segment(path, "health") ||
+        starts_with_segment(path, "metrics")) {
+        return true;
+    }
+    return path && path[0] == '/' && path[1] == 'v' && is_digit_char(path[2]) &&
+           (path[3] == '\0' || path[3] == '/');
+}
+
+static bool has_filesystem_root(const char *path) {
+    static const char *const roots[] = {"etc",     "root", "var",   "usr",     "home", "tmp",
+                                        "private", "opt",  "bin",   "sbin",    "dev",  "proc",
+                                        "sys",     "run",  "lib",   "lib64",   "mnt",  "media",
+                                        "boot",    "srv",  "Users", "Volumes", NULL};
+    for (int i = 0; roots[i]; i++) {
+        if (starts_with_segment(path, roots[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool has_hidden_config_segment(const char *path) {
+    static const char *const segments[] = {".aws", ".azure", ".config", ".docker", ".env",
+                                           ".git", ".gnupg", ".kube",   ".ssh",    NULL};
+    for (int i = 0; segments[i]; i++) {
+        if (contains_segment(path, segments[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool path_ext_matches(const char *ext, const char *wanted) {
+    return ext && wanted && strcmp(ext, wanted) == 0;
+}
+
+static bool has_filesystem_extension(const char *path) {
+    if (!path) {
+        return false;
+    }
+    const char *end = strpbrk(path, "?#");
+    if (!end) {
+        end = path + strlen(path);
+    }
+    const char *last_slash = path;
+    for (const char *p = path; p < end; p++) {
+        if (*p == '/') {
+            last_slash = p;
+        }
+    }
+    const char *dot = NULL;
+    for (const char *p = last_slash + 1; p < end; p++) {
+        if (*p == '.') {
+            dot = p;
+        }
+    }
+    if (!dot || dot == end - 1) {
+        return false;
+    }
+    char ext[32];
+    size_t ext_len = (size_t)(end - dot);
+    if (ext_len >= sizeof(ext)) {
+        return false;
+    }
+    memcpy(ext, dot, ext_len);
+    ext[ext_len] = '\0';
+
+    static const char *const hard_file_exts[] = {
+        ".cfg",  ".conf",   ".credentials", ".crt",  ".db",         ".env",
+        ".ini",  ".key",    ".pem",         ".pid",  ".properties", ".service",
+        ".sock", ".socket", ".sqlite",      ".toml", NULL};
+    for (int i = 0; hard_file_exts[i]; i++) {
+        if (path_ext_matches(ext, hard_file_exts[i])) {
+            return true;
+        }
+    }
+    if ((path_ext_matches(ext, ".json") || path_ext_matches(ext, ".yaml") ||
+         path_ext_matches(ext, ".yml") || path_ext_matches(ext, ".xml")) &&
+        !has_http_route_marker(path)) {
+        return true;
+    }
+    return false;
+}
+
+static bool callee_is_delimiter_or_filesystem_builder(const char *callee_name) {
+    if (!callee_name) {
+        return false;
+    }
+    const char *last_dot = strrchr(callee_name, '.');
+    const char *last_colon = strstr(callee_name, "::");
+    const char *method = callee_name;
+    if (last_dot && last_dot[1]) {
+        method = last_dot + 1;
+    }
+    if (last_colon && last_colon[2]) {
+        method = last_colon + 2;
+    }
+    if (strcmp(method, "split") == 0 || strcmp(method, "rsplit") == 0 ||
+        strcmp(method, "partition") == 0 || strcmp(method, "join") == 0) {
+        return true;
+    }
+    return strstr(callee_name, "os.path.join") != NULL || strstr(callee_name, "path.join") != NULL;
+}
+
+static const char *strip_string_delimiters(const char *literal, char *buf, size_t buf_sz) {
+    if (!literal || !literal[0]) {
+        return NULL;
+    }
+    const char *start = literal;
+    while (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r') {
+        start++;
+    }
+    size_t len = strlen(start);
+    while (len > 0 && (start[len - 1] == ' ' || start[len - 1] == '\t' || start[len - 1] == '\n' ||
+                       start[len - 1] == '\r')) {
+        len--;
+    }
+    if (len >= 2 && (start[0] == '"' || start[0] == '\'' || start[0] == '`') &&
+        start[len - 1] == start[0]) {
+        start++;
+        len -= 2;
+    }
+    if (len == 0 || len >= buf_sz) {
+        return NULL;
+    }
+    memcpy(buf, start, len);
+    buf[len] = '\0';
+    return buf;
+}
+
+bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *callee_name) {
+    char path_buf[1024];
+    const char *path = strip_string_delimiters(literal, path_buf, sizeof(path_buf));
+    if (!path || !path[0]) {
+        return false;
+    }
+    if (strncmp(path, "http://", 7) == 0 || strncmp(path, "https://", 8) == 0) {
+        return true;
+    }
+    if (strstr(path, "://") != NULL) {
+        return false;
+    }
+    if (path[0] != '/') {
+        return false;
+    }
+    if (callee_is_delimiter_or_filesystem_builder(callee_name)) {
+        return false;
+    }
+    if (has_filesystem_root(path) || has_hidden_config_segment(path) ||
+        has_filesystem_extension(path)) {
+        return false;
+    }
+    return true;
+}
+
 /* ── Public API ────────────────────────────────────────────────── */
 
 /* Per-worker TLS cache of cbm_service_pattern_match results.
