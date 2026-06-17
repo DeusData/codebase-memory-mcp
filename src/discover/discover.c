@@ -541,7 +541,13 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
         return CBM_NOT_FOUND;
     }
 
-    /* Load gitignore if .git directory exists */
+    /* Load gitignore sources when a .git directory is present.
+     * Sources merged in order (later patterns win on conflict):
+     *   1. <repo>/.gitignore        — committed exclusions
+     *   2. <repo>/.git/info/exclude — per-clone exclusions, not committed
+     * Both are folded into a single matcher so all downstream call paths
+     * remain unchanged.  Fixes issue #489: OOM on repos whose worktrees
+     * are excluded only via .git/info/exclude (e.g. Sandcastle). */
     cbm_gitignore_t *gitignore = NULL;
     char gi_path[CBM_SZ_4K];
     snprintf(gi_path, sizeof(gi_path), "%s/.git", repo_path);
@@ -549,6 +555,18 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
     if (wide_stat(gi_path, &gi_stat) == 0 && S_ISDIR(gi_stat.st_mode)) {
         snprintf(gi_path, sizeof(gi_path), "%s/.gitignore", repo_path);
         gitignore = cbm_gitignore_load(gi_path);
+
+        char exc_path[CBM_SZ_4K];
+        snprintf(exc_path, sizeof(exc_path), "%s/.git/info/exclude", repo_path);
+        cbm_gitignore_t *git_exclude = cbm_gitignore_load(exc_path);
+        if (git_exclude) {
+            if (!gitignore) {
+                gitignore = git_exclude;
+            } else {
+                cbm_gitignore_merge(gitignore, git_exclude);
+                cbm_gitignore_free(git_exclude);
+            }
+        }
     }
 
     /* Load cbmignore if specified or exists at repo root */

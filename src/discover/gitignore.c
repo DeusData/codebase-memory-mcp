@@ -379,3 +379,29 @@ void cbm_gitignore_free(cbm_gitignore_t *gi) {
     free(gi->patterns);
     free(gi);
 }
+
+void cbm_gitignore_merge(cbm_gitignore_t *dst, const cbm_gitignore_t *src) {
+    if (!dst || !src || src->count == 0) {
+        return;
+    }
+    int needed = dst->count + src->count;
+    if (needed > dst->capacity) {
+        gi_pattern_t *grown = realloc(dst->patterns, (size_t)needed * sizeof(gi_pattern_t));
+        if (!grown) {
+            return;
+        }
+        dst->patterns = grown;
+        dst->capacity = needed;
+    }
+    for (int i = 0; i < src->count; i++) {
+        char *pat = strdup(src->patterns[i].pattern);
+        if (!pat) {
+            return;
+        }
+        dst->patterns[dst->count].pattern  = pat;
+        dst->patterns[dst->count].negated  = src->patterns[i].negated;
+        dst->patterns[dst->count].dir_only = src->patterns[i].dir_only;
+        dst->patterns[dst->count].rooted   = src->patterns[i].rooted;
+        dst->count++;
+    }
+}

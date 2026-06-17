@@ -627,6 +627,66 @@ TEST(discover_cbmignore_no_git) {
     PASS();
 }
 
+/* ── .git/info/exclude tests (issue #489) ─────────────────────── */
+
+/* Per-clone excludes written to .git/info/exclude (not committed) must be
+ * honored the same as .gitignore.  Without this, repos that keep worktrees
+ * under a path excluded only via info/exclude hit OOM during indexing. */
+TEST(discover_git_info_exclude) {
+    char *base = th_mktempdir("cbm_disc_exc");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git/info"));
+    th_write_file(TH_PATH(base, ".git/info/exclude"), "worktrees/\n");
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "worktrees/feature/app.go"), "package app\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strstr(files[0].rel_path, "main.go") != NULL);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_git_info_exclude_stacks_with_gitignore) {
+    char *base = th_mktempdir("cbm_disc_exc_stack");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git/info"));
+    th_write_file(TH_PATH(base, ".gitignore"), "*.log\n");
+    th_write_file(TH_PATH(base, ".git/info/exclude"), "scratch/\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "debug.log"), "log\n");
+    th_write_file(TH_PATH(base, "scratch/tmp.go"), "package scratch\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 1);
+
+    bool found_log = false;
+    bool found_scratch = false;
+    for (int i = 0; i < count; i++) {
+        if (strstr(files[i].rel_path, ".log"))    found_log     = true;
+        if (strstr(files[i].rel_path, "scratch")) found_scratch = true;
+    }
+    ASSERT_FALSE(found_log);
+    ASSERT_FALSE(found_scratch);
+    ASSERT_TRUE(strstr(files[0].rel_path, "main.go") != NULL);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 /* ── Nested .gitignore tests (issue #178) ──────────────────────── */
 
 TEST(discover_nested_gitignore) {
@@ -793,6 +853,10 @@ SUITE(discover) {
     RUN_TEST(discover_generic_dirs_full_mode);
     RUN_TEST(discover_generic_dirs_fast_mode);
     RUN_TEST(discover_cbmignore_no_git);
+
+    /* .git/info/exclude support (issue #489) */
+    RUN_TEST(discover_git_info_exclude);
+    RUN_TEST(discover_git_info_exclude_stacks_with_gitignore);
 
     /* Nested .gitignore tests (issue #178) */
     RUN_TEST(discover_nested_gitignore);

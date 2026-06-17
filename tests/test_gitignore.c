@@ -186,6 +186,50 @@ TEST(gi_load_nonexistent) {
     PASS();
 }
 
+/* ── Merge ─────────────────────────────────────────────────────── */
+
+TEST(gi_merge_patterns) {
+    cbm_gitignore_t *base_gi = cbm_gitignore_parse("*.log\n");
+    cbm_gitignore_t *extra   = cbm_gitignore_parse("tmp/\nbuild/\n");
+    ASSERT_NOT_NULL(base_gi);
+    ASSERT_NOT_NULL(extra);
+
+    cbm_gitignore_merge(base_gi, extra);
+    cbm_gitignore_free(extra);
+
+    ASSERT_TRUE(cbm_gitignore_matches(base_gi, "error.log", false));
+    ASSERT_TRUE(cbm_gitignore_matches(base_gi, "tmp", true));
+    ASSERT_TRUE(cbm_gitignore_matches(base_gi, "build", true));
+    ASSERT_FALSE(cbm_gitignore_matches(base_gi, "main.go", false));
+
+    cbm_gitignore_free(base_gi);
+    PASS();
+}
+
+TEST(gi_merge_into_empty) {
+    cbm_gitignore_t *dst = cbm_gitignore_parse("");
+    cbm_gitignore_t *src = cbm_gitignore_parse("*.o\n");
+    ASSERT_NOT_NULL(dst);
+    ASSERT_NOT_NULL(src);
+
+    cbm_gitignore_merge(dst, src);
+    cbm_gitignore_free(src);
+
+    ASSERT_TRUE(cbm_gitignore_matches(dst, "main.o", false));
+    ASSERT_FALSE(cbm_gitignore_matches(dst, "main.c", false));
+
+    cbm_gitignore_free(dst);
+    PASS();
+}
+
+TEST(gi_merge_null_safe) {
+    cbm_gitignore_t *gi = cbm_gitignore_parse("*.log\n");
+    cbm_gitignore_merge(gi, NULL);  /* should not crash */
+    cbm_gitignore_merge(NULL, gi);  /* should not crash */
+    cbm_gitignore_free(gi);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(gitignore) {
@@ -206,4 +250,7 @@ SUITE(gitignore) {
     RUN_TEST(gi_null_safe_free);
     RUN_TEST(gi_load_file);
     RUN_TEST(gi_load_nonexistent);
+    RUN_TEST(gi_merge_patterns);
+    RUN_TEST(gi_merge_into_empty);
+    RUN_TEST(gi_merge_null_safe);
 }
