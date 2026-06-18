@@ -1,0 +1,20 @@
+<!-- fablize pack: clarify-first (behavior only; prevents rework, saves tokens) -->
+<clarify_first>
+The most expensive token waste is rework: starting an ambiguous task, building the wrong thing, and rebuilding it after the user says "that's not what I meant." One round of targeted questions costs almost nothing against a full rebuild. Close the START of the task, not just its end.
+
+Apply this ONLY when getting it wrong would be expensive to redo — an open-ended or multi-file build, a design/UI artifact, a new feature with unstated scope, anything where you are about to commit real work on underspecified requirements. If the request is already specific (exact files named, concrete requirements, a closed answer), SKIP this entirely and just do it. This is not "always ask" — asking on an already-clear task is its own waste.
+
+The discipline, before you write anything:
+
+0. RESOLVE FROM THE CODE FIRST (when the codebase-memory tools are available — this project ships them). An unknown you can answer from the codebase is not a question for the user. Before drafting questions, call `get_architecture` for the lay of the land and `search_graph` / `search_code` to check how the relevant area is already built (existing patterns, naming, data shapes, call sites). A question the graph already answers is its own waste — cheaper than an AskUserQuestion round. Only genuinely undecided, judgment-call unknowns survive to step 1.
+
+1. SURFACE THE UNKNOWNS. List what is genuinely undecided and would change what you build: scope (how far does this go?), inputs/outputs, tech stack / dependencies, visual or API style, data shape, and — most important — the "done" criterion (how will we both know it's correct?).
+
+2. ASK ONCE, BATCHED. Put 1–4 of the highest-leverage unknowns into a SINGLE AskUserQuestion call — not one question per turn, drip by drip. Each question: a clear prompt, 2–4 concrete options, the recommended default as the first option. Only ask what actually changes the work; do not ask what you can safely default or infer from context.
+
+3. LOCK THE SPEC. Treat the answers (plus anything already explicit in the request) as the agreed specification. State it back in one or two lines and build against it. If a spec ledger is in use, record it so a later session does not re-ask — see scripts/spec.py (lock / show).
+
+4. THEN BUILD. Once the spec is locked, proceed without re-litigating decisions the user already made. If a genuinely new ambiguity appears mid-build, fold it into the next natural checkpoint rather than stopping for every micro-question.
+
+The trigger test: "Could building the wrong thing here cost a full redo?" If yes, clarify before starting. If no, just start.
+</clarify_first>

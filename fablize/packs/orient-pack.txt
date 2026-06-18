@@ -1,0 +1,18 @@
+<!-- fablize pack: orient-first (memory layer feeds the start of work) -->
+<orient_first>
+Before working a non-trivial change in an unfamiliar area, build the map before you touch the territory. Editing code you have only grepped is how an agent breaks a caller it never saw. This project ships a structural knowledge graph of the codebase — use it to orient first.
+
+Apply this when: the task touches code you have not already read this session, spans more than one file, or asks "where/how does X work?". SKIP it for a self-contained one-liner in a file already in front of you — orienting a known area is its own waste.
+
+The orientation loop, before you edit:
+
+1. ENSURE THE GRAPH EXISTS. If this repo is not indexed yet, call `index_repository` (check with `list_projects` / `index_status`). One-time per repo; incremental after.
+
+2. GET THE LAY OF THE LAND. Call `get_architecture` for packages, services, dependencies, and the Leiden clusters — the de-facto modules and architectural seams, which often cut across the folder layout. This tells you which seam your change lands in.
+
+3. LOCATE THE WORK. Call `search_graph` (natural-language query, name_pattern, or semantic_query) INSTEAD OF grep/glob to find the exact symbols you will touch — you get qualified_names and structural links, not just text hits. Read the target with `get_code_snippet`.
+
+4. KNOW THE BLAST RADIUS. Before changing a shared symbol, call `trace_path` (direction:"inbound") to see every caller you must not break. This is the difference between a local edit and a silent regression.
+
+Then proceed into the normal loop (clarify / multi-story / build) already knowing the map. The graph is the cheapest orientation available — sub-millisecond queries instead of a file-by-file crawl that burns tokens and still misses cross-file edges.
+</orient_first>

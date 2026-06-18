@@ -18,6 +18,22 @@
 
 High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 158 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, and Rust — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 14 MCP tools. Zero dependencies. Plug and play across 11 coding agents.
 
+> ### 🧭 This distribution: codebase-memory-mcp **+ fablize**
+>
+> This fork pairs the memory engine with **[fablize](fablize/)** — a procedure layer that
+> makes an agent *work* well, not just *see* well. The memory layer answers **what the code
+> is**; fablize answers **how to work on it**: clarify before building, complete with
+> evidence, investigate systematically (using `trace_path` as the literal causal chain),
+> verify the structural effect of a change, and escalate honestly at the model's ceiling.
+> Two complementary layers, one install — see **[INTEGRATION.md](INTEGRATION.md)**.
+>
+> ```bash
+> bash install-combined.sh        # builds the engine, registers MCP, applies the disciplines
+> ```
+>
+> The C core below is **unmodified upstream** — fablize lives entirely in `fablize/` (pure
+> stdlib Python + plain-text packs), so updates from [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) merge cleanly.
+
 > **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.
 
 > **Security & Trust** — This tool reads your codebase and writes to your agent configuration files. That is what it is designed to do. If you prefer to audit before running, the [full source is here](https://github.com/DeusData/codebase-memory-mcp) — every release binary is signed, checksummed, and scanned by 70+ antivirus engines. All processing happens 100% locally; your code never leaves your machine. Found a security issue? We want to know — see [SECURITY.md](SECURITY.md). Security is Priority #1 for us.

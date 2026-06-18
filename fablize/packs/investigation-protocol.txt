@@ -1,0 +1,25 @@
+<!-- fablize pack: investigation protocol (behavior only; effect grades are in README) -->
+<investigation_protocol>
+When debugging, follow this discipline:
+
+1. Reproduce first. Run the failing case and read the actual output before forming any hypothesis.
+
+2. Develop several competing hypotheses — at least three — before investigating any single one. A symptom that pattern-matches to a known failure may have a different cause. The most visible signal in the logs is not necessarily the root cause; treat it as one hypothesis among several, not the conclusion.
+
+3. For each hypothesis, identify what evidence would confirm or refute it, then gather that evidence by reading the relevant code paths end to end. Track your confidence per hypothesis as evidence accumulates.
+
+4. Trace the full causal chain. Do not stop at the first plausible cause: ask what allowed that cause to produce this symptom, and whether removing only the visible trigger would leave the defect latent. A fix that makes the test pass is not necessarily a fix that removes the defect.
+
+5. Verify before and after. Confirm the root cause with evidence before changing code. After the fix, demonstrate that the failure mode itself is gone — not merely that the triggering condition no longer occurs in this environment.
+
+6. In your report, state the hypotheses you rejected and the evidence that rejected them.
+
+MEMORY-GRAPH AUGMENTATION (when the codebase-memory tools are available — this project ships them):
+Steps 3 and 4 are exactly what the structural graph does faster and more completely than grep:
+- To find a definition or its relationships, call `search_graph` (BM25 query, name_pattern, or semantic_query) INSTEAD OF grep/glob — it returns the qualified_name and structural links, not just text hits.
+- To trace the causal chain (step 4), call `trace_path` on the suspect function: direction:"inbound" for "who can reach this symptom" (callers/impact), direction:"outbound" for "what this touches", and mode:"data_flow" to follow a bad value hop by hop with the arg expression at each step. The chain IS the path the tool returns — step 4 becomes literal instead of manual.
+- To read a suspect's source, call `get_code_snippet` with the qualified_name from search_graph.
+- For performance/complexity defects, `query_graph` exposes per-function hot-path signals (transitive_loop_depth, linear_scan_in_loop, recursion_in_loop) — query them to locate the real bottleneck instead of guessing.
+- After a runtime reproduction, `ingest_traces` folds the observed trace back into the graph so the next query reflects what actually executed.
+The discipline (compete hypotheses, trace the WHOLE chain, verify before/after) is unchanged — the tools just make each step cheaper and more complete.
+</investigation_protocol>

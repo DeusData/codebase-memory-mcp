@@ -1,0 +1,19 @@
+codebase-memory-mcp + fablize
+==============================
+
+This distribution combines two independently MIT-licensed components.
+
+1. codebase-memory-mcp (the memory layer — C core, src/, internal/, vendored/, …)
+   Copyright (c) 2025 DeusData
+   Upstream: https://github.com/DeusData/codebase-memory-mcp
+   Licensed under the MIT License (see LICENSE).
+   The C core in this fork is unmodified upstream.
+
+2. fablize (the procedure layer — the fablize/ directory, plus INTEGRATION.md and
+   install-combined.sh at the repo root)
+   Copyright (c) 2025 fivetaku
+   Upstream: https://github.com/fivetaku/fablize
+   Licensed under the MIT License.
+
+Both components are distributed under the MIT License. See LICENSE for the full text.
+Each component retains its own copyright; this NOTICE documents their combination.

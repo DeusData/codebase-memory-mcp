@@ -1,0 +1,27 @@
+name: fablize-ci
+# Procedure-layer CI. Independent of the upstream C workflows (separate filename, scoped
+# paths) so it never clashes on `git pull upstream`.
+on:
+  push:
+    paths:
+      - 'fablize/**'
+      - '.github/workflows/fablize-ci.yml'
+  pull_request:
+    paths:
+      - 'fablize/**'
+      - '.github/workflows/fablize-ci.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: fablize test suite (stdlib only, no deps)
+        working-directory: fablize
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
