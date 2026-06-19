@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/quota_guard.py\"",
+            "timeout": 10,
+            "statusMessage": "Checking quota window..."
+          }
+        ]
+      }
+    ]
+  }
+}

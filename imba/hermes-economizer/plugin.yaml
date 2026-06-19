@@ -1,0 +1,11 @@
+name: hermes-economizer
+version: "0.1.0"
+description: "Cost economizer + fablize work-disciplines for Hermes. Tracks an estimated spend ledger and enforces a budget cap (blocks new tool calls when exceeded), and injects the matching fablize discipline (clarify / investigate / verify) into each turn's context based on the task signal. Non-blocking observers + one budget guardrail."
+author: "uzum (Hermes economizer + fablize port)"
+kind: standalone
+# Declared for `hermes plugins` listing; actual registration is in register(ctx).
+provides_hooks:
+  - pre_llm_call
+  - post_llm_call
+  - pre_tool_call
+  - on_session_end

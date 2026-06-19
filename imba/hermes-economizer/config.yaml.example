@@ -1,0 +1,18 @@
+# hermes-economizer config. Copy to config.yaml (here or in
+# $HERMES_HOME/economizer/config.yaml — the latter overrides).
+
+cap_usd: 5.0          # hard daily/session budget cap (estimate-based)
+window: day           # day | session
+warn_ratio: 0.8       # warn in context once this fraction of the cap is spent
+terse: true           # inject token-economy baseline (concise + narrow reads) once per session
+advise_routing: true  # nudge a cheaper model when a simple task runs on an expensive one
+cheap_hint: haiku     # alias suggested in the nudge (`hermes model <hint>`)
+
+# Estimated prices, USD per 1M tokens, matched by substring of the model id
+# (e.g. "anthropic/claude-sonnet-4.6" matches "sonnet").
+prices:
+  haiku:       { in: 1.0,  out: 5.0 }
+  sonnet:      { in: 3.0,  out: 15.0 }
+  opus:        { in: 15.0, out: 75.0 }
+  gpt-4o-mini: { in: 0.15, out: 0.6 }
+  gpt-4o:      { in: 2.5,  out: 10.0 }

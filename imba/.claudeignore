@@ -1,0 +1,37 @@
+# autoclaude .claudeignore — keep bulky / low-signal paths out of context.
+# Copy to a project root as .claudeignore. Tune per project.
+
+# deps & builds
+node_modules/
+dist/
+build/
+.next/
+target/
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# lockfiles & generated
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+poetry.lock
+*.min.js
+*.map
+
+# logs, data, media (huge, low signal)
+*.log
+logs/
+*.csv
+*.parquet
+*.sqlite
+*.db
+coverage/
+.cache/
+
+# secrets (also: never read these)
+.env
+.env.*
+*.pem
+*.key

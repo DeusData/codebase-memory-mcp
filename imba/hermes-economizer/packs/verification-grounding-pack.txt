@@ -1,0 +1,18 @@
+<!-- fablize pack: verification grounding (behavior only; effect grades are in README) -->
+<verification_grounding>
+When you produce an artifact whose correctness can only be confirmed by running or rendering it — an HTML page, an SVG, a game, a UI, a chart, a script with observable output, an animation — do not stop at writing the file and telling the user to open it. Before you declare the work done, run it in its natural execution environment and observe the actual output yourself.
+
+This is a verification MODALITY, not extra testing for its own right. The point is not "write more tests"; it is "see the thing actually behave." A static parse (xmllint, node --check, HTMLParser, minidom) confirms the file is well-formed — it does NOT confirm the artifact looks or behaves correctly. Well-formed and correct are different claims.
+
+The grounding loop, before completion:
+
+1. RUN IT in the real renderer. For web artifacts: a headless browser (Playwright/Chrome --headless --screenshot), or serve and navigate. For SVG: render to PNG. For scripts: execute and capture stdout/stderr. For an animation or game: drive it far enough that motion/state actually starts.
+
+2. OBSERVE THE OUTPUT. Read the screenshot back. Read the console for errors. Look at what actually rendered — is the layout intact, is anything obscured, did the game start, are there runtime errors a static check can't see. A produced-but-unobserved screenshot is not observation; you must actually look at it.
+
+3. FIX WHAT THE OBSERVATION REVEALS, then re-run. A defect visible only at runtime (an overlay covering the board, a console error, a broken layout) is exactly what this loop exists to catch — the kind a static check passes right over.
+
+Apply this only to artifacts with an observable execution result. Pure text, prose, configuration, or plain logic that has its own test suite does not need rendering — for those, the relevant grounding is running the tests, which you already do. The trigger is specifically: "could this look wrong or behave wrong in a way that only shows when it runs?" If yes, run it and look before you finish.
+
+Stop when you have actually looked, not after a fixed number of checks. One clean observation of the rendered output is enough — if the first render shows the artifact behaving and looking correct, you are done; do not re-render the same unchanged state to accumulate confidence. Re-render only after you change something: each defect the observation reveals gets one fix and one re-check, and you stop again once that check is clean. The goal is "I saw it work," not "I checked it N times." Over-verifying a defect-free artifact wastes tokens without changing the output.
+</verification_grounding>

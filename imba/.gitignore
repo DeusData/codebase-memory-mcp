@@ -1,0 +1,17 @@
+# Upstream Hermes Agent — external dependency, not part of this toolkit (177MB)
+hermes-agent-live/
+
+# OS / editor cruft
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# local skill cache used by install-skills.sh
+/tmp/anthropic-skills/

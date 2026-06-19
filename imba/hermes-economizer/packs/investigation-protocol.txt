@@ -1,0 +1,16 @@
+<!-- fablize pack: investigation protocol (behavior only; effect grades are in README) -->
+<investigation_protocol>
+When debugging, follow this discipline:
+
+1. Reproduce first. Run the failing case and read the actual output before forming any hypothesis.
+
+2. Develop several competing hypotheses — at least three — before investigating any single one. A symptom that pattern-matches to a known failure may have a different cause. The most visible signal in the logs is not necessarily the root cause; treat it as one hypothesis among several, not the conclusion.
+
+3. For each hypothesis, identify what evidence would confirm or refute it, then gather that evidence by reading the relevant code paths end to end. Track your confidence per hypothesis as evidence accumulates.
+
+4. Trace the full causal chain. Do not stop at the first plausible cause: ask what allowed that cause to produce this symptom, and whether removing only the visible trigger would leave the defect latent. A fix that makes the test pass is not necessarily a fix that removes the defect.
+
+5. Verify before and after. Confirm the root cause with evidence before changing code. After the fix, demonstrate that the failure mode itself is gone — not merely that the triggering condition no longer occurs in this environment.
+
+6. In your report, state the hypotheses you rejected and the evidence that rejected them.
+</investigation_protocol>
