@@ -1187,6 +1187,63 @@ TEST(usages_no_duplicate_calls) {
     PASS();
 }
 
+TEST(calls_edge_carries_call_site_line) {
+    /* Regression guard for #503: a CALLS edge must persist the source line of
+     * the call site in its JSON props as "line":N. Helper() is invoked on
+     * line 8 (1-based) of the source below. */
+    const char *go_source = "package mypkg\n"
+                            "\n"
+                            "func Helper() string {\n"
+                            "\treturn \"ok\"\n"
+                            "}\n"
+                            "\n"
+                            "func Main() {\n"
+                            "\tHelper()\n"
+                            "}\n";
+
+    if (setup_usages_repo("mypkg/main.go", go_source, "go.mod", "module testmod\ngo 1.21\n") != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_call_line.db", g_usages_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_edge_t *call_edges = NULL;
+    int call_count = 0;
+    cbm_store_find_edges_by_type(s, project, "CALLS", &call_edges, &call_count);
+
+    bool found_line = false;
+    for (int i = 0; i < call_count; i++) {
+        cbm_node_t src = {0}, tgt = {0};
+        if (cbm_store_find_node_by_id(s, call_edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, call_edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            if (strcmp(src.name, "Main") == 0 && strcmp(tgt.name, "Helper") == 0) {
+                ASSERT_NOT_NULL(call_edges[i].properties_json);
+                ASSERT_TRUE(strstr(call_edges[i].properties_json, "\"line\":8}") != NULL);
+                found_line = true;
+            }
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (call_edges)
+        cbm_store_free_edges(call_edges, call_count);
+    ASSERT_TRUE(found_line);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_usages_repo();
+    PASS();
+}
+
 TEST(usages_kotlin_creates_edges) {
     /* Port of TestPassUsagesKotlinCreatesEdges.
      * Kotlin source with callback reference → USAGE edge. */
@@ -5712,6 +5769,7 @@ SUITE(pipeline) {
     /* Usages pass (full pipeline integration) */
     RUN_TEST(usages_creates_edges);
     RUN_TEST(usages_no_duplicate_calls);
+    RUN_TEST(calls_edge_carries_call_site_line);
     RUN_TEST(usages_kotlin_creates_edges);
     RUN_TEST(usages_kotlin_no_duplicate_calls);
     /* Language integration tests */
