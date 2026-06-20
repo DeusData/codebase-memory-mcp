@@ -383,6 +383,62 @@ TEST(integ_mcp_trace_path) {
     PASS();
 }
 
+/* #522: trace_path mode=cross_service must follow CROSS_* cross-repo edges.
+ * Seed a CROSS_HTTP_CALLS edge between two indexed functions that have no CALLS
+ * relationship, then confirm cross_service surfaces the hop while the default
+ * calls mode does not (proving the cross edge specifically is what's followed).
+ *
+ * The trace goes through a fresh server so it opens the db after the edge is
+ * committed — exactly what a new MCP session sees after a cross-repo pass writes
+ * CROSS_* edges (g_srv's cached connection predates this write). */
+TEST(integ_mcp_trace_path_cross_service) {
+    cbm_store_t *store = cbm_store_open_path(g_dbpath);
+    ASSERT_NOT_NULL(store);
+
+    cbm_node_t *src = NULL;
+    cbm_node_t *dst = NULL;
+    int src_count = 0;
+    int dst_count = 0;
+    cbm_store_find_nodes_by_name(store, g_project, "greet", &src, &src_count);
+    cbm_store_find_nodes_by_name(store, g_project, "farewell", &dst, &dst_count);
+    ASSERT_TRUE(src_count > 0 && dst_count > 0);
+
+    cbm_edge_t edge = {.project = g_project,
+                       .source_id = src[0].id,
+                       .target_id = dst[0].id,
+                       .type = "CROSS_HTTP_CALLS"};
+    ASSERT_TRUE(cbm_store_insert_edge(store, &edge) > 0);
+
+    cbm_store_free_nodes(src, src_count);
+    cbm_store_free_nodes(dst, dst_count);
+    cbm_store_close(store);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char args[256];
+    snprintf(args, sizeof(args),
+             "{\"function_name\":\"greet\",\"project\":\"%s\","
+             "\"direction\":\"outbound\",\"mode\":\"cross_service\"}",
+             g_project);
+    char *resp = cbm_mcp_handle_tool(srv, "trace_path", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "farewell"));
+    free(resp);
+
+    snprintf(args, sizeof(args),
+             "{\"function_name\":\"greet\",\"project\":\"%s\","
+             "\"direction\":\"outbound\",\"mode\":\"calls\"}",
+             g_project);
+    resp = cbm_mcp_handle_tool(srv, "trace_path", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "farewell") == NULL);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(integ_mcp_index_status) {
     char args[128];
     snprintf(args, sizeof(args), "{\"project\":\"%s\"}", g_project);
@@ -604,6 +660,7 @@ SUITE(integration) {
     RUN_TEST(integ_mcp_get_graph_schema);
     RUN_TEST(integ_mcp_get_architecture);
     RUN_TEST(integ_mcp_trace_path);
+    RUN_TEST(integ_mcp_trace_path_cross_service);
     RUN_TEST(integ_mcp_index_status);
 
     /* Store query validation */
