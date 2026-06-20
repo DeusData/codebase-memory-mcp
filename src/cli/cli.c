@@ -799,7 +799,7 @@ static const char pi_extension_content[] =
 static const char pi_skill_content[] =
     "---\n"
     "name: codebase-memory\n"
-    "description: Graph-first code navigation via codebase-memory-mcp. Use BEFORE grep/file-by-file reading when you need to find where code is defined or used, trace call paths, understand an unfamiliar repo's architecture, or assess the blast radius of a change. Triggers on: \"where is X defined\", \"what calls X\", \"what does X call\", \"how is this codebase structured\", \"what does this diff affect\", \"find the function that\u2026\".\n"
+    "description: \"Graph-first code navigation via codebase-memory-mcp. Use BEFORE grep/file-by-file reading when you need to find where code is defined or used, trace call paths, understand an unfamiliar repo's architecture, or assess the blast radius of a change. Triggers on: 'where is X defined', 'what calls X', 'what does X call', 'how is this codebase structured', 'what does this diff affect', 'find the function that\u2026'.\"\n"
     "---\n"
     "\n"
     "# codebase-memory \u2014 see the graph before you grep\n"
