@@ -93,6 +93,10 @@ struct cbm_pipeline {
 
     /* User-defined extension overrides (loaded once per run) */
     cbm_userconfig_t *userconfig;
+
+    /* ADR (project_summaries) captured before a full-reindex DB delete, so it
+     * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
+    char *saved_adr;
 };
 
 /* ── Global pkgmap (one active pipeline at a time) ─────────────── */
@@ -788,6 +792,22 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         cbm_store_close(check_store);
     }
     cbm_log_info("pipeline.route", "path", "reindex", "action", "deleting old db");
+    /* Capture any ADR before deleting the DB so the full-reindex rebuild can
+     * restore it (project_summaries is otherwise lost). Issue #516. */
+    {
+        cbm_store_t *adr_store = cbm_store_open_path(db_path);
+        if (adr_store) {
+            cbm_adr_t existing;
+            if (cbm_store_adr_get(adr_store, p->project_name, &existing) == CBM_STORE_OK) {
+                if (existing.content) {
+                    free(p->saved_adr);
+                    p->saved_adr = strdup(existing.content);
+                }
+                cbm_store_adr_free(&existing);
+            }
+            cbm_store_close(adr_store);
+        }
+    }
     cbm_unlink(db_path);
     char wal[PL_WAL_BUF];
     char shm[PL_WAL_BUF];
@@ -841,6 +861,11 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {
         cbm_store_delete_file_hashes(hash_store, p->project_name);
+
+        /* Restore the ADR captured before the dump. Issue #516. */
+        if (p->saved_adr) {
+            cbm_store_adr_store(hash_store, p->project_name, p->saved_adr);
+        }
         for (int i = 0; i < file_count; i++) {
             struct stat fst;
             if (stat(files[i].path, &fst) == 0) {
@@ -867,6 +892,8 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         cbm_store_close(hash_store);
         cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
     }
+    free(p->saved_adr);
+    p->saved_adr = NULL;
 
     /* Export persistent artifact if enabled */
     if (p->persistence) {
