@@ -345,6 +345,7 @@ Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` 
 | VS Code | `Code/User/mcp.json` | — | — |
 | OpenClaw | `openclaw.json` | — | — |
 | Kiro | `.kiro/settings/mcp.json` | — | — |
+| pi | (no MCP — extension) | extension `cbmem.ts` + skill | AGENTS.md block |
 
 **Hooks are structurally non-blocking** (exit code 0, every failure path).
 For Claude Code, the `PreToolUse` hook intercepts `Grep`/`Glob` (never `Read` —

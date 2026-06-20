@@ -10,6 +10,7 @@
 #define CBM_CLI_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 /* ── Version ──────────────────────────────────────────────────── */
 
@@ -122,11 +123,19 @@ typedef struct {
     bool cursor;      /* ~/.cursor/ exists */
     bool openclaw;    /* ~/.openclaw/ exists */
     bool kiro;        /* ~/.kiro/ exists */
+    bool pi;          /* $PI_CODING_AGENT_DIR or ~/.pi/agent exists */
 } cbm_detected_agents_t;
 
 /* Detect which coding agents are installed.
  * Checks config dirs and PATH. home_dir is used for config dir checks. */
 cbm_detected_agents_t cbm_detect_agents(const char *home_dir);
+
+/* pi coding agent: no native MCP; installs extension + skill + AGENTS.md. */
+void cbm_pi_config_dir(const char *home_dir, char *out, size_t out_sz);
+int cbm_install_pi_extension(const char *binary_path, const char *pi_dir);
+int cbm_remove_pi_extension(const char *pi_dir);
+int cbm_install_pi_skill(const char *home_dir, bool force);
+const char *cbm_get_pi_extension(void);
 
 /* ── Agent MCP config upsert (per agent) ──────────────────────── */
 
