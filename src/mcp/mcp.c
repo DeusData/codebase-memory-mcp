@@ -2833,6 +2833,82 @@ static char *resolve_snippet_source(const char *root_path, const char *file_path
     return NULL;
 }
 
+/* ── UTF-8 sanitization ──────────────────────────────────────── */
+
+/* Replace invalid UTF-8 byte sequences with U+FFFD (EF BF BD).
+ * Valid multi-byte UTF-8 (CJK, emoji, etc.) is preserved.
+ * Returns a newly allocated string; caller frees.
+ * Returns NULL only if src is NULL or malloc fails.
+ *
+ * Reference: RFC 3629 §3, Unicode §3.9 (U+FFFD Substitution of
+ * Maximal Subparts). Each invalid byte is individually replaced
+ * so that surrounding valid bytes are not consumed. */
+static char *sanitize_utf8(const char *src) {
+    if (!src) {
+        return NULL;
+    }
+
+    const unsigned char *s = (const unsigned char *)src;
+    size_t src_len = strlen(src);
+
+    /* Worst case: every byte is invalid → each becomes 3 bytes (U+FFFD). */
+    char *out = malloc(src_len * 3 + 1);
+    if (!out) {
+        return NULL;
+    }
+    size_t olen = 0;
+
+    for (size_t i = 0; i < src_len;) {
+        unsigned char c = s[i];
+        int seq_len = 0; /* 0 = invalid */
+
+        if (c <= 0x7F) {
+            /* ASCII */
+            seq_len = 1;
+        } else if (c >= 0xC2 && c <= 0xDF) {
+            /* 2-byte: 110xxxxx 10xxxxxx  (0xC0/0xC1 are overlong) */
+            if (i + 1 < src_len && (s[i + 1] & 0xC0) == 0x80) {
+                seq_len = 2;
+            }
+        } else if ((c & 0xF0) == 0xE0) {
+            /* 3-byte: 1110xxxx 10xxxxxx 10xxxxxx */
+            if (i + 2 < src_len && (s[i + 1] & 0xC0) == 0x80 &&
+                (s[i + 2] & 0xC0) == 0x80) {
+                /* Reject overlong (E0 + < A0) and surrogates (ED + >= A0). */
+                if (!(c == 0xE0 && s[i + 1] < 0xA0) &&
+                    !(c == 0xED && s[i + 1] >= 0xA0)) {
+                    seq_len = 3;
+                }
+            }
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            /* 4-byte: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx */
+            if (i + 3 < src_len && (s[i + 1] & 0xC0) == 0x80 &&
+                (s[i + 2] & 0xC0) == 0x80 && (s[i + 3] & 0xC0) == 0x80) {
+                /* Reject overlong (F0 + < 90) and > U+10FFFF (F4 + > 8F). */
+                if (!(c == 0xF0 && s[i + 1] < 0x90) &&
+                    !(c == 0xF4 && s[i + 1] > 0x8F)) {
+                    seq_len = 4;
+                }
+            }
+        }
+
+        if (seq_len > 0) {
+            memcpy(out + olen, s + i, (size_t)seq_len);
+            olen += (size_t)seq_len;
+            i += (size_t)seq_len;
+        } else {
+            /* Invalid byte → U+FFFD replacement character */
+            out[olen++] = '\xEF';
+            out[olen++] = '\xBF';
+            out[olen++] = '\xBD';
+            i++;
+        }
+    }
+
+    out[olen] = '\0';
+    return out;
+}
+
 /* Build an enriched snippet response for a resolved node. */
 /* Add a string array to a JSON object (no-op if count == 0). */
 static void add_string_array(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
@@ -2856,6 +2932,15 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     int end = node->end_line > start ? node->end_line : start + SNIPPET_DEFAULT_LINES;
     char *abs_path = NULL;
     char *source = resolve_snippet_source(root_path, node->file_path, start, end, &abs_path);
+
+    /* Guarantee valid UTF-8 for JSON-RPC / MCP stdio transport (#511).
+     * Non-UTF-8 source files (CP949, EUC-KR, Shift_JIS, GBK, …) would
+     * otherwise produce invalid JSON that hangs MCP clients. */
+    if (source) {
+        char *safe = sanitize_utf8(source);
+        free(source);
+        source = safe;
+    }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
