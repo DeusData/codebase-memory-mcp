@@ -2872,21 +2872,18 @@ static char *sanitize_utf8(const char *src) {
             }
         } else if ((c & 0xF0) == 0xE0) {
             /* 3-byte: 1110xxxx 10xxxxxx 10xxxxxx */
-            if (i + 2 < src_len && (s[i + 1] & 0xC0) == 0x80 &&
-                (s[i + 2] & 0xC0) == 0x80) {
+            if (i + 2 < src_len && (s[i + 1] & 0xC0) == 0x80 && (s[i + 2] & 0xC0) == 0x80) {
                 /* Reject overlong (E0 + < A0) and surrogates (ED + >= A0). */
-                if (!(c == 0xE0 && s[i + 1] < 0xA0) &&
-                    !(c == 0xED && s[i + 1] >= 0xA0)) {
+                if (!(c == 0xE0 && s[i + 1] < 0xA0) && !(c == 0xED && s[i + 1] >= 0xA0)) {
                     seq_len = 3;
                 }
             }
         } else if (c >= 0xF0 && c <= 0xF4) {
             /* 4-byte: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx */
-            if (i + 3 < src_len && (s[i + 1] & 0xC0) == 0x80 &&
-                (s[i + 2] & 0xC0) == 0x80 && (s[i + 3] & 0xC0) == 0x80) {
+            if (i + 3 < src_len && (s[i + 1] & 0xC0) == 0x80 && (s[i + 2] & 0xC0) == 0x80 &&
+                (s[i + 3] & 0xC0) == 0x80) {
                 /* Reject overlong (F0 + < 90) and > U+10FFFF (F4 + > 8F). */
-                if (!(c == 0xF0 && s[i + 1] < 0x90) &&
-                    !(c == 0xF4 && s[i + 1] > 0x8F)) {
+                if (!(c == 0xF0 && s[i + 1] < 0x90) && !(c == 0xF4 && s[i + 1] > 0x8F)) {
                     seq_len = 4;
                 }
             }
