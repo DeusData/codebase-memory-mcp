@@ -893,6 +893,83 @@ static void add_git_context_json(yyjson_mut_doc *doc, yyjson_mut_val *obj, const
     cbm_git_context_free(&ctx);
 }
 
+static void add_index_evidence_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                    const cbm_project_t *proj) {
+    yyjson_mut_val *evidence = yyjson_mut_obj(doc);
+    yyjson_mut_val *snap = yyjson_mut_obj(doc);
+    const char *indexed_head =
+        (proj && proj->indexed_git_head && proj->indexed_git_head[0]) ? proj->indexed_git_head : NULL;
+    cbm_git_context_t ctx = {0};
+    int git_rc = cbm_git_context_resolve(proj ? proj->root_path : NULL, &ctx);
+    bool dirty = false;
+    int dirty_rc = (git_rc == 0 && ctx.is_git) ? cbm_git_tracked_dirty(proj->root_path, &dirty)
+                                               : CBM_NOT_FOUND;
+
+    add_git_context_string(doc, snap, "indexed_at", proj ? proj->indexed_at : NULL);
+    add_git_context_string(doc, snap, "indexed_git_head", indexed_head);
+    add_git_context_string(doc, snap, "current_git_head",
+                           (git_rc == 0 && ctx.is_git && ctx.head_sha && ctx.head_sha[0])
+                               ? ctx.head_sha
+                               : NULL);
+    const char *repo_state = "unavailable";
+    if (git_rc == 0 && ctx.root_exists && !ctx.is_git) {
+        repo_state = "not_git";
+    } else if (git_rc == 0 && ctx.is_git && dirty_rc == 0) {
+        repo_state = dirty ? "dirty" : "clean";
+    }
+    yyjson_mut_obj_add_str(doc, snap, "repository_state", repo_state);
+    if (indexed_head && git_rc == 0 && ctx.is_git && ctx.head_sha && ctx.head_sha[0]) {
+        yyjson_mut_obj_add_bool(doc, snap, "snapshot_matches_current_head",
+                                strcmp(indexed_head, ctx.head_sha) == 0);
+    } else {
+        yyjson_mut_obj_add_null(doc, snap, "snapshot_matches_current_head");
+    }
+    if (indexed_head && git_rc == 0 && ctx.is_git && ctx.head_sha && ctx.head_sha[0] &&
+        dirty_rc == 0) {
+        yyjson_mut_obj_add_bool(doc, snap, "snapshot_matches_working_tree",
+                                strcmp(indexed_head, ctx.head_sha) == 0 && !dirty);
+    } else {
+        yyjson_mut_obj_add_null(doc, snap, "snapshot_matches_working_tree");
+    }
+    const char *freshness = "unknown";
+    if (indexed_head && git_rc == 0 && ctx.is_git && ctx.head_sha && ctx.head_sha[0] &&
+        dirty_rc == 0) {
+        if (strcmp(indexed_head, ctx.head_sha) != 0) {
+            freshness = "head_changed";
+        } else {
+            freshness = dirty ? "working_tree_changed" : "current";
+        }
+    } else if (git_rc == 0 && ctx.root_exists && !ctx.is_git) {
+        freshness = "unknown";
+    }
+    yyjson_mut_obj_add_str(doc, snap, "freshness", freshness);
+    yyjson_mut_obj_add_val(doc, evidence, "index_snapshot", snap);
+
+    yyjson_mut_val *cov = yyjson_mut_obj(doc);
+    int discovered = proj ? proj->files_discovered : 0;
+    int indexed = proj ? proj->files_indexed : 0;
+    int excluded = proj ? proj->files_excluded : 0;
+    int failed = proj ? proj->files_failed : 0;
+    yyjson_mut_obj_add_int(doc, cov, "files_discovered", discovered);
+    yyjson_mut_obj_add_int(doc, cov, "files_indexed", indexed);
+    yyjson_mut_obj_add_int(doc, cov, "files_excluded", excluded);
+    yyjson_mut_obj_add_int(doc, cov, "files_failed", failed);
+    yyjson_mut_obj_add_str(doc, cov, "coverage_status",
+                           failed > 0 || excluded > 0 ? "partial"
+                           : discovered > 0 && indexed == discovered ? "complete"
+                                                                      : "unknown");
+    yyjson_mut_obj_add_val(doc, evidence, "coverage", cov);
+    yyjson_mut_val *limits = yyjson_mut_arr(doc);
+    yyjson_mut_val *lim = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, lim, "code", "UNTRACKED_FILES_NOT_COMPARED");
+    yyjson_mut_obj_add_str(doc, lim, "message",
+                           "Working-tree freshness compares current HEAD and tracked modifications; untracked files are not compared.");
+    yyjson_mut_arr_add_val(limits, lim);
+    yyjson_mut_obj_add_val(doc, evidence, "limitations", limits);
+    yyjson_mut_obj_add_val(doc, root, "evidence", evidence);
+    cbm_git_context_free(&ctx);
+}
+
 /* Build a helpful error listing available projects. Caller must free() result. */
 static char *build_project_list_error(const char *reason) {
     char dir_path[CBM_SZ_1K];
@@ -1739,9 +1816,8 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_obj_add_strcpy(doc, root, "root_path",
                                       proj_info.root_path ? proj_info.root_path : "");
             add_git_context_json(doc, root, proj_info.root_path);
-            safe_str_free(&proj_info.name);
-            safe_str_free(&proj_info.indexed_at);
-            safe_str_free(&proj_info.root_path);
+            add_index_evidence_json(doc, root, &proj_info);
+            cbm_project_free_fields(&proj_info);
         }
         if (nodes == 0) {
             yyjson_mut_obj_add_str(
@@ -2244,6 +2320,77 @@ static yyjson_mut_val *bfs_to_json_array(yyjson_mut_doc *doc, cbm_traverse_resul
     return arr;
 }
 
+static const char *edge_evidence_status(const char *strategy, double confidence, int candidates) {
+    if (!strategy || !strategy[0]) {
+        return "unavailable";
+    }
+    if (candidates > 1) {
+        return "ambiguous";
+    }
+    if (strstr(strategy, "heur") || strstr(strategy, "fuzzy") || confidence < 0.8) {
+        return "inferred";
+    }
+    return "verified";
+}
+
+static const char *edge_resolution_strategy(const char *strategy) {
+    if (!strategy || !strategy[0]) {
+        return "unknown";
+    }
+    if (strstr(strategy, "lsp")) {
+        return "hybrid_lsp";
+    }
+    if (strstr(strategy, "import") || strstr(strategy, "same_module") ||
+        strstr(strategy, "receiver")) {
+        return "direct_ast";
+    }
+    if (strstr(strategy, "fuzzy") || strstr(strategy, "heur")) {
+        return "heuristic";
+    }
+    return strategy;
+}
+
+static yyjson_mut_val *trace_edges_to_json_array(yyjson_mut_doc *doc, cbm_traverse_result_t *tr) {
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < tr->edge_count; i++) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, item, "from", tr->edges[i].from_name ? tr->edges[i].from_name : "");
+        yyjson_mut_obj_add_str(doc, item, "to", tr->edges[i].to_name ? tr->edges[i].to_name : "");
+        yyjson_mut_obj_add_str(doc, item, "type", tr->edges[i].type ? tr->edges[i].type : "");
+        yyjson_mut_val *edge = yyjson_mut_obj(doc);
+        const char *props = tr->edges[i].properties_json;
+        yyjson_doc *pdoc = props ? yyjson_read(props, strlen(props), 0) : NULL;
+        yyjson_val *proot = pdoc ? yyjson_doc_get_root(pdoc) : NULL;
+        yyjson_val *v = proot ? yyjson_obj_get(proot, "strategy") : NULL;
+        const char *strategy = yyjson_is_str(v) ? yyjson_get_str(v) : NULL;
+        v = proot ? yyjson_obj_get(proot, "confidence") : NULL;
+        bool has_conf = yyjson_is_num(v);
+        double conf = has_conf ? yyjson_get_num(v) : 0.0;
+        v = proot ? yyjson_obj_get(proot, "candidates") : NULL;
+        int candidates = yyjson_is_int(v) ? (int)yyjson_get_int(v) : 0;
+        yyjson_mut_obj_add_str(doc, edge, "resolution_strategy", edge_resolution_strategy(strategy));
+        if (has_conf) {
+            yyjson_mut_obj_add_real(doc, edge, "confidence", conf);
+        } else {
+            yyjson_mut_obj_add_null(doc, edge, "confidence");
+        }
+        if (candidates > 0) {
+            yyjson_mut_obj_add_int(doc, edge, "candidate_count", candidates);
+        } else {
+            yyjson_mut_obj_add_null(doc, edge, "candidate_count");
+        }
+        yyjson_mut_obj_add_null(doc, edge, "source_location");
+        yyjson_mut_obj_add_str(doc, edge, "evidence_status",
+                               edge_evidence_status(strategy, conf, candidates));
+        yyjson_mut_obj_add_val(doc, item, "edge", edge);
+        yyjson_mut_arr_add_val(arr, item);
+        if (pdoc) {
+            yyjson_doc_free(pdoc);
+        }
+    }
+    return arr;
+}
+
 static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *func_name = cbm_mcp_get_string_arg(args, "function_name");
     char *project = cbm_mcp_get_string_arg(args, "project");
@@ -2365,6 +2512,14 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_val(doc, root, "callers",
                                bfs_to_json_array(doc, &tr_in, risk_labels, include_tests));
     }
+    yyjson_mut_val *edge_evidence = yyjson_mut_obj(doc);
+    if (do_outbound) {
+        yyjson_mut_obj_add_val(doc, edge_evidence, "outbound", trace_edges_to_json_array(doc, &tr_out));
+    }
+    if (do_inbound) {
+        yyjson_mut_obj_add_val(doc, edge_evidence, "inbound", trace_edges_to_json_array(doc, &tr_in));
+    }
+    yyjson_mut_obj_add_val(doc, root, "edge_evidence", edge_evidence);
 
     /* Serialize BEFORE freeing traversal results (yyjson borrows strings) */
     char *json = yy_doc_to_str(doc);

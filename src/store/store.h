@@ -51,6 +51,11 @@ typedef struct {
     const char *name;
     const char *indexed_at; /* ISO 8601 */
     const char *root_path;
+    const char *indexed_git_head; /* NULL/empty when non-git or unavailable */
+    int files_discovered;
+    int files_indexed;
+    int files_excluded;
+    int files_failed;
 } cbm_project_t;
 
 typedef struct {
@@ -147,6 +152,7 @@ typedef struct {
     const char *from_name;
     const char *to_name;
     const char *type;
+    const char *properties_json;
     double confidence;
 } cbm_edge_info_t;
 
@@ -267,6 +273,8 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path);
 /* ── Project CRUD ───────────────────────────────────────────────── */
 
 int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_path);
+int cbm_store_update_project_coverage(cbm_store_t *s, const char *name, int files_discovered,
+                                      int files_indexed, int files_excluded, int files_failed);
 int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out);
 int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count);
 int cbm_store_delete_project(cbm_store_t *s, const char *name);

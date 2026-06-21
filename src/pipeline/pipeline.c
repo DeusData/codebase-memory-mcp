@@ -848,6 +848,8 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
                                            stat_mtime_ns(&fst), fst.st_size);
             }
         }
+        (void)cbm_store_update_project_coverage(hash_store, p->project_name, file_count,
+                                                file_count, p->excluded_count, 0);
 
         /* FTS5 backfill: populate nodes_fts with camelCase-split names.
          * Contentless FTS5 requires the special 'delete-all' command instead of

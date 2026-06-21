@@ -266,6 +266,22 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
     return 0;
 }
 
+int cbm_git_tracked_dirty(const char *path, bool *out_dirty) {
+    if (!out_dirty) {
+        return CBM_NOT_FOUND;
+    }
+    *out_dirty = false;
+    char *status = NULL;
+    int rc = git_capture(path, "status --porcelain --untracked-files=no", &status);
+    if (rc != 0) {
+        free(status);
+        return CBM_NOT_FOUND;
+    }
+    *out_dirty = status && status[0] != '\0';
+    free(status);
+    return 0;
+}
+
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx) {
     const char *project = project_name && project_name[0] ? project_name : "project";
     const char *slug = "working-tree";
