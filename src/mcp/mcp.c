@@ -2851,7 +2851,13 @@ static char *sanitize_utf8(const char *src) {
     const unsigned char *s = (const unsigned char *)src;
     size_t src_len = strlen(src);
 
-    /* Worst case: every byte is invalid → each becomes 3 bytes (U+FFFD). */
+    /* Worst case: every byte is invalid → each becomes 3 bytes (U+FFFD).
+     * Guard against size_t overflow on src_len * 3 + 1 (UB if
+     * src_len > (SIZE_MAX - 1) / 3). Practically unreachable for snippet
+     * sources, but defensive — the same bound is enforced in #526. */
+    if (src_len > (SIZE_MAX - 1) / 3) {
+        return NULL;
+    }
     char *out = malloc(src_len * 3 + 1);
     if (!out) {
         return NULL;

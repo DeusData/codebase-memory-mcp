@@ -11,6 +11,7 @@
 #include <yyjson/yyjson.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING
@@ -1577,6 +1578,93 @@ TEST(snippet_include_neighbors_enabled) {
     PASS();
 }
 
+/* ── TestSnippet_SourceInvalidUtf8 ─────────────────────────────
+ * Regression for #511: non-UTF-8 source bytes (e.g. CP949 in a
+ * legacy CJK Windows codebase) used to emit invalid JSON on the
+ * MCP stdio channel, hanging clients indefinitely. After the
+ * sanitize_utf8() fix, the response must:
+ *   1. parse as strict JSON (envelope + embedded snippet),
+ *   2. not contain the original invalid byte sequence,
+ *   3. preserve surrounding valid bytes (function name, body),
+ *   4. include U+FFFD (EF BF BD) where invalid bytes were.
+ *
+ * Test borrowed from #526 (jstar0) — pairs that contributor's
+ * reproduction with this PR's sanitizer. */
+
+static bool snippet_response_is_valid_json(const char *json) {
+    if (!json)
+        return false;
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc)
+        return false;
+    yyjson_doc_free(doc);
+    return true;
+}
+
+static bool snippet_source_field_has_replacement(const char *json) {
+    if (!json)
+        return false;
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc)
+        return false;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *source = yyjson_obj_get(root, "source");
+    const char *source_str = yyjson_get_str(source);
+    bool found = source_str && strstr(source_str, "\xEF\xBF\xBD") != NULL;
+    yyjson_doc_free(doc);
+    return found;
+}
+
+TEST(snippet_source_invalid_utf8) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* Overwrite main.go with bytes that are valid CP949 but invalid
+     * UTF-8 (0xC0 0xD4 0xB7 0xC2 = "입력" in CP949). Keep the function
+     * signature so HandleRequest still resolves to lines 3–5. */
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    FILE *fp = fopen(src_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    const unsigned char source[] = {
+        'p',  'a',  'c', 'k', 'a', 'g',  'e',  ' ',  'm',  'a',  'i',  'n', '\n', '\n',
+        'f',  'u',  'n', 'c', ' ', 'H',  'a',  'n',  'd',  'l',  'e',  'R', 'e',  'q',
+        'u',  'e',  's', 't', '(', ')',  ' ',  'e',  'r',  'r',  'o',  'r', ' ',  '{',
+        '\n', '\t', '/', '/', ' ', 0xC0, 0xD4, 0xB7, 0xC2, '\n', '\t', 'r', 'e',  't',
+        'u',  'r',  'n', ' ', 'n', 'i',  'l',  '\n', '}',  '\n'};
+    ASSERT_EQ(fwrite(source, 1, sizeof(source), fp), sizeof(source));
+    ASSERT_EQ(fclose(fp), 0);
+
+    char *raw =
+        cbm_mcp_handle_tool(srv, "get_code_snippet",
+                            "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                            "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(raw);
+    /* (1) Outer MCP envelope must be valid JSON — this is what the
+     * stdio JSON-RPC client decodes. Pre-fix, the raw bytes inside
+     * "source" broke the stream. */
+    ASSERT_TRUE(snippet_response_is_valid_json(raw));
+
+    char *inner = extract_text_content(raw);
+    ASSERT_NOT_NULL(inner);
+    /* (2) Embedded snippet JSON must also be strictly parseable. */
+    ASSERT_TRUE(snippet_response_is_valid_json(inner));
+    /* (3) The raw invalid CP949 sequence must not appear verbatim. */
+    ASSERT_NULL(strstr(inner, "\xC0\xD4"));
+    /* (4) Surrounding valid bytes must be preserved. */
+    ASSERT_NOT_NULL(strstr(inner, "HandleRequest"));
+    ASSERT_NOT_NULL(strstr(inner, "return nil"));
+    /* (5) Replacement character must mark where invalid bytes were. */
+    ASSERT_TRUE(snippet_source_field_has_replacement(inner));
+
+    free(inner);
+    free(raw);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING — EDGE CASES
  * ══════════════════════════════════════════════════════════════════ */
@@ -2129,5 +2217,6 @@ SUITE(mcp) {
     RUN_TEST(snippet_auto_resolve_enabled);
     RUN_TEST(snippet_include_neighbors_default);
     RUN_TEST(snippet_include_neighbors_enabled);
+    RUN_TEST(snippet_source_invalid_utf8);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
 }
