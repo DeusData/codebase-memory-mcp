@@ -2077,14 +2077,12 @@ static void cbm_install_codebuddy_session_reminder_script(const char *home) {
 
 int cbm_upsert_codebuddy_session_hooks(const char *settings_path) {
     static const char *matchers[] = {"startup", "resume", "clear", "compact"};
-    char command[CLI_BUF_1K];
-    cbm_resolve_codebuddy_hook_command(CMM_SESSION_REMINDER_SCRIPT, command, sizeof(command));
     int rc = 0;
     for (size_t i = 0; i < sizeof(matchers) / sizeof(matchers[0]); i++) {
         if (upsert_hooks_json((hooks_upsert_args_t){.settings_path = settings_path,
                                                     .hook_event = "SessionStart",
                                                     .matcher_str = matchers[i],
-                                                    .command_str = command}) != 0) {
+                                                    .command_str = CMM_SESSION_REMINDER_CMD}) != 0) {
             rc = CLI_ERR;
         }
     }
