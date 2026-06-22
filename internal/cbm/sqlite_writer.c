@@ -788,7 +788,7 @@ static uint8_t *build_token_vec_record(const CBMDumpTokenVec *tv, int *out_len) 
     return data;
 }
 
-// Build a projects table record: (name, indexed_at, root_path)
+// Build a projects table record.
 static uint8_t *build_project_record(const char *name, const char *indexed_at,
                                      const char *root_path, int *out_len) {
     RecordBuilder r;
@@ -797,6 +797,13 @@ static uint8_t *build_project_record(const char *name, const char *indexed_at,
     rec_add_text(&r, name);
     rec_add_text(&r, indexed_at);
     rec_add_text(&r, root_path);
+    /* indexed_git_head: unavailable in the direct writer path */
+    rec_add_null(&r);
+    /* files_discovered, files_indexed, files_excluded, files_failed */
+    rec_add_int(&r, 0);
+    rec_add_int(&r, 0);
+    rec_add_int(&r, 0);
+    rec_add_int(&r, 0);
 
     uint8_t *data = rec_finalize(&r, out_len);
     rec_free(&r);
@@ -2118,7 +2125,10 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
     MasterEntry master[] = {
         {"table", "projects", "projects", projects_root,
          "CREATE TABLE projects (\n\t\tname TEXT PRIMARY KEY,\n\t\tindexed_at TEXT NOT "
-         "NULL,\n\t\troot_path TEXT NOT NULL\n\t)"},
+         "NULL,\n\t\troot_path TEXT NOT NULL,\n\t\tindexed_git_head TEXT,\n\t\tfiles_discovered "
+         "INTEGER NOT NULL DEFAULT 0,\n\t\tfiles_indexed INTEGER NOT NULL DEFAULT 0,\n\t\t"
+         "files_excluded INTEGER NOT NULL DEFAULT 0,\n\t\tfiles_failed INTEGER NOT NULL DEFAULT "
+         "0\n\t)"},
         {"index", "sqlite_autoindex_projects_1", "projects", autoindex_projects_root, NULL},
         {"table", "file_hashes", "file_hashes", file_hashes_root,
          "CREATE TABLE file_hashes (\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON "

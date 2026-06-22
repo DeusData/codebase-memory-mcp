@@ -319,14 +319,34 @@ int cbm_git_tracked_dirty(const char *path, bool *out_dirty) {
         return CBM_NOT_FOUND;
     }
     *out_dirty = false;
-    char *status = NULL;
-    int rc = git_capture(path, "status --porcelain --untracked-files=no", &status);
-    if (rc != 0) {
-        free(status);
+
+    if (!path || !git_validate_repo_path(path)) {
         return CBM_NOT_FOUND;
     }
-    *out_dirty = status && status[0] != '\0';
-    free(status);
+
+    char cmd[GIT_CMD_MAX];
+#ifdef _WIN32
+    const char *null_dev = "NUL";
+#else
+    const char *null_dev = "/dev/null";
+#endif
+    int n = snprintf(cmd, sizeof(cmd), "git -C \"%s\" status --porcelain --untracked-files=no 2>%s",
+                     path, null_dev);
+    if (n < 0 || n >= (int)sizeof(cmd)) {
+        return CBM_NOT_FOUND;
+    }
+
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return CBM_NOT_FOUND;
+    }
+    char buf[GIT_OUTPUT_MAX];
+    bool has_output = fgets(buf, sizeof(buf), fp) != NULL;
+    int rc = cbm_pclose(fp);
+    if (rc != 0) {
+        return CBM_NOT_FOUND;
+    }
+    *out_dirty = has_output;
     return 0;
 }
 
