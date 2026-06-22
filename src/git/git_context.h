@@ -21,6 +21,9 @@ typedef struct {
 
 int cbm_git_context_resolve(const char *path, cbm_git_context_t *out);
 void cbm_git_context_free(cbm_git_context_t *ctx);
+/* Returns 0 when tracked working-tree dirtiness was determined, non-zero when
+ * unavailable. Untracked files are intentionally not compared. */
+int cbm_git_tracked_dirty(const char *path, bool *out_dirty);
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx);
 int cbm_git_context_props_json(const cbm_git_context_t *ctx, char *buf, int buf_size);
 
