@@ -4554,8 +4554,9 @@ static int64_t dbt_upsert_node(cbm_store_t *store, const char *project, const ch
         mat = yyjson_get_str(yyjson_obj_get(cfg, "materialized"));
     }
     char props[CBM_SZ_512];
-    snprintf(props, sizeof(props), "{\"source\":\"dbt\",\"package\":\"%s\",\"materialized\":\"%s\"}",
-             pkg ? pkg : "", mat ? mat : "");
+    snprintf(props, sizeof(props),
+             "{\"source\":\"dbt\",\"package\":\"%s\",\"materialized\":\"%s\"}", pkg ? pkg : "",
+             mat ? mat : "");
     cbm_node_t n;
     memset(&n, 0, sizeof(n));
     n.project = project;
