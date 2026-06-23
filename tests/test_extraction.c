@@ -1439,6 +1439,27 @@ TEST(sql_view_lineage_usages) {
     PASS();
 }
 
+TEST(sql_schema_qualified_name) {
+    /* schema-qualified DDL (schema.table) is named by the table, not the schema,
+     * and FROM schema.table resolves to that table for lineage. */
+    CBMFileResult *r = extract("CREATE TABLE app.users (id INTEGER);\n"
+                               "CREATE VIEW app.active AS SELECT * FROM app.users;\n",
+                               CBM_LANG_SQL, "t", "schema.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Table", "users"));
+    ASSERT(has_def(r, "View", "active"));
+    int found_users = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strcmp(r->usages.items[i].ref_name, "users") == 0) {
+            found_users = 1;
+        }
+    }
+    ASSERT(found_users);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Meson project --- */
 TEST(meson_project) {
     CBMFileResult *r = extract(
@@ -3095,6 +3116,7 @@ SUITE(extraction) {
     RUN_TEST(sql_function);
     RUN_TEST(sql_ddl_node_labels);
     RUN_TEST(sql_view_lineage_usages);
+    RUN_TEST(sql_schema_qualified_name);
     RUN_TEST(meson_project);
     RUN_TEST(css_rules);
     RUN_TEST(scss_rules);
