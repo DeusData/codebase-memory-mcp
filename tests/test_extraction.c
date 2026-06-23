@@ -1092,6 +1092,33 @@ TEST(swift_struct) {
     PASS();
 }
 
+/* Regression (WS2a / dup-node): a `static func` inside a Swift `enum` namespace
+ * must be emitted exactly ONCE as a Method — not ALSO as a top-level Function.
+ * The enum body node type is `enum_class_body`; push_class_body_children's
+ * body-type list had drifted from extract_class_def's (it lacked enum_class_body),
+ * so enum members were re-walked and double-extracted into spurious Function nodes. */
+TEST(swift_enum_static_func_not_duplicated) {
+    CBMFileResult *r = extract("enum SM2 {\n    static func review(q: Int) -> Int { return q }\n}\n",
+                               CBM_LANG_SWIFT, "t", "SM2.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int method = 0, func = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "review") != 0) {
+            continue;
+        }
+        if (strcmp(r->defs.items[i].label, "Method") == 0) {
+            method++;
+        } else if (strcmp(r->defs.items[i].label, "Function") == 0) {
+            func++;
+        }
+    }
+    ASSERT(method == 1); /* emitted once, as a Method */
+    ASSERT(func == 0);   /* NOT also as a Function (the dup-node bug) */
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Swift calls (port of PR #47 Go tests) --- */
 TEST(swift_simple_call) {
     CBMFileResult *r = extract("func main() { greet() }\nfunc greet() { print(\"hello\") }\n",
@@ -3022,6 +3049,7 @@ SUITE(extraction) {
 
     /* OOP/Systems variants */
     RUN_TEST(swift_struct);
+    RUN_TEST(swift_enum_static_func_not_duplicated);
     RUN_TEST(swift_simple_call);
     RUN_TEST(swift_method_call);
     RUN_TEST(swift_constructor_call);

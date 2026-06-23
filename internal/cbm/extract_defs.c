@@ -4946,6 +4946,12 @@ static void push_class_body_children(TSNode node, const CBMLangSpec *spec, walk_
         TSNode child = ts_node_child(node, ci);
         const char *ck = ts_node_type(child);
         if (strcmp(ck, "field_declaration_list") == 0 || strcmp(ck, "class_body") == 0 ||
+            // Swift enum/protocol bodies (`enum_class_body` / `protocol_body`) are type-body
+            // containers extract_class_def already extracts members from (it finds them via the
+            // "body" field, which this child-type scan doesn't). Route them through the
+            // nested-class path here too, so enum statics / protocol members aren't ALSO
+            // re-walked and emitted as top-level Functions (the Method/Function dup-node bug, WS2a).
+            strcmp(ck, "enum_class_body") == 0 || strcmp(ck, "protocol_body") == 0 ||
             strcmp(ck, "declaration_list") == 0 || strcmp(ck, "body") == 0 ||
             strcmp(ck, "block") == 0 || strcmp(ck, "suite") == 0 ||
             // Groovy class bodies are a `closure` node; routing through the

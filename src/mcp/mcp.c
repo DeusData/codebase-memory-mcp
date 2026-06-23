@@ -69,6 +69,7 @@ enum {
 #include <stdint.h> // int64_t
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -270,6 +271,17 @@ typedef struct {
 } tool_def_t;
 
 static const tool_def_t TOOLS[] = {
+    {"explore",
+     "PRIMARY exploration tool — call FIRST for 'how does X work', 'where is X', or surveying an "
+     "area. In ONE call returns the blast-radius (callers) AND the verbatim line-numbered source "
+     "of the matched symbols grouped by file — Read-equivalent, do NOT re-open the files shown. "
+     "`query` is a space-separated bag of symbol/file names. Flags high-fan-in hotspots inline; "
+     "for a precise sub-query use query_graph (openCypher).",
+     "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":"
+     "\"Space-separated symbol/file names to explore (first 16)\"},\"project\":{\"type\":\"string\"},"
+     "\"max_files\":{\"type\":\"integer\",\"description\":\"max source blocks (default 8)\"},"
+     "\"depth\":{\"type\":\"integer\",\"description\":\"caller depth (default 1)\"}},"
+     "\"required\":[\"query\",\"project\"]}"},
     {"index_repository",
      "Index a repository into the knowledge graph. "
      "Special mode 'cross-repo-intelligence': skip extraction, only match Routes/Channels "
@@ -2953,6 +2965,75 @@ static char *resolve_snippet_source(const char *root_path, const char *file_path
     return NULL;
 }
 
+static bool utf8_is_cont(unsigned char c) {
+    return (c & 0xC0) == 0x80;
+}
+
+static char *sanitize_utf8_lossy(const char *s) {
+    enum {
+        UTF8_REPLACEMENT_LEN = 3,
+        UTF8_THREE_BYTE_LEN = 3,
+        UTF8_FOUR_BYTE_LEN = 4,
+        UTF8_FOURTH_BYTE = 3,
+    };
+    if (!s) {
+        return NULL;
+    }
+    size_t len = strlen(s);
+    if (len > (((size_t)-1) - SKIP_ONE) / UTF8_REPLACEMENT_LEN) {
+        return NULL;
+    }
+    char *out = malloc(len * UTF8_REPLACEMENT_LEN + SKIP_ONE);
+    if (!out) {
+        return NULL;
+    }
+
+    const unsigned char *p = (const unsigned char *)s;
+    const unsigned char *end = p + len;
+    unsigned char *dst = (unsigned char *)out;
+    while (p < end) {
+        unsigned char c = *p;
+        size_t n = 0;
+        if (c < 0x80) {
+            n = 1;
+        } else if (c >= 0xC2 && c <= 0xDF && p + 1 < end && utf8_is_cont(p[1])) {
+            n = 2;
+        } else if (c == 0xE0 && p + 2 < end && p[1] >= 0xA0 && p[1] <= 0xBF && utf8_is_cont(p[2])) {
+            n = UTF8_THREE_BYTE_LEN;
+        } else if (c >= 0xE1 && c <= 0xEC && p + 2 < end && utf8_is_cont(p[1]) &&
+                   utf8_is_cont(p[2])) {
+            n = UTF8_THREE_BYTE_LEN;
+        } else if (c == 0xED && p + 2 < end && p[1] >= 0x80 && p[1] <= 0x9F && utf8_is_cont(p[2])) {
+            n = UTF8_THREE_BYTE_LEN;
+        } else if (c >= 0xEE && c <= 0xEF && p + 2 < end && utf8_is_cont(p[1]) &&
+                   utf8_is_cont(p[2])) {
+            n = UTF8_THREE_BYTE_LEN;
+        } else if (c == 0xF0 && p + UTF8_FOURTH_BYTE < end && p[1] >= 0x90 && p[1] <= 0xBF &&
+                   utf8_is_cont(p[2]) && utf8_is_cont(p[UTF8_FOURTH_BYTE])) {
+            n = UTF8_FOUR_BYTE_LEN;
+        } else if (c >= 0xF1 && c <= 0xF3 && p + UTF8_FOURTH_BYTE < end && utf8_is_cont(p[1]) &&
+                   utf8_is_cont(p[2]) && utf8_is_cont(p[UTF8_FOURTH_BYTE])) {
+            n = UTF8_FOUR_BYTE_LEN;
+        } else if (c == 0xF4 && p + UTF8_FOURTH_BYTE < end && p[1] >= 0x80 && p[1] <= 0x8F &&
+                   utf8_is_cont(p[2]) && utf8_is_cont(p[UTF8_FOURTH_BYTE])) {
+            n = UTF8_FOUR_BYTE_LEN;
+        }
+
+        if (n > 0) {
+            memcpy(dst, p, n);
+            dst += n;
+            p += n;
+        } else {
+            *dst++ = 0xEF;
+            *dst++ = 0xBF;
+            *dst++ = 0xBD;
+            p++;
+        }
+    }
+    *dst = '\0';
+    return out;
+}
+
 /* Build an enriched snippet response for a resolved node. */
 /* Add a string array to a JSON object (no-op if count == 0). */
 static void add_string_array(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
@@ -2997,7 +3078,13 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     yyjson_mut_obj_add_int(doc, root_obj, "end_line", end);
 
     if (source) {
-        yyjson_mut_obj_add_str(doc, root_obj, "source", source);
+        char *safe_source = sanitize_utf8_lossy(source);
+        if (safe_source) {
+            yyjson_mut_obj_add_strcpy(doc, root_obj, "source", safe_source);
+            free(safe_source);
+        } else {
+            yyjson_mut_obj_add_str(doc, root_obj, "source", "(source not available)");
+        }
     } else {
         yyjson_mut_obj_add_str(doc, root_obj, "source", "(source not available)");
     }
@@ -4360,6 +4447,293 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
+/* ════════════════════════════════════════════════════════════════════════════
+ * explore — one-call, agent-ergonomic exploration: blast-radius (callers) +
+ * verbatim line-numbered source of the matched symbols, grouped by file, as
+ * MARKDOWN (read directly by the agent, like a Read). Composes the existing
+ * resolve / cbm_store_bfs / resolve_snippet_source / batch_count_degrees
+ * internals; differentiates via attributed callers, inline hotspot (fan-in)
+ * flags, and a cypher escape-hatch footer.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    char *p;
+    size_t len, cap;
+} expl_buf_t;
+
+/* Append a NUL-terminated string, growing the heap buffer as needed. On OOM the
+ * append is dropped and the buffer stays valid + NUL-terminated (never overflows). */
+static void expl_put(expl_buf_t *b, const char *s) {
+    if (!s || !*s) {
+        return;
+    }
+    size_t n = strlen(s);
+    if (b->len + n + 1 > b->cap) {
+        size_t c = b->cap ? b->cap : 8192;
+        while (c < b->len + n + 1) {
+            c *= 2;
+        }
+        char *np = realloc(b->p, c);
+        if (!np) {
+            return;
+        }
+        b->p = np;
+        b->cap = c;
+    }
+    memcpy(b->p + b->len, s, n);
+    b->len += n;
+    b->p[b->len] = '\0';
+}
+
+/* printf-style append via two-pass vsnprintf (no fixed buffer → no overflow). */
+static void expl_putf(expl_buf_t *b, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    va_list ap2;
+    va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        va_end(ap2);
+        return;
+    }
+    char *tmp = malloc((size_t)n + 1);
+    if (!tmp) {
+        va_end(ap2);
+        return;
+    }
+    vsnprintf(tmp, (size_t)n + 1, fmt, ap2);
+    va_end(ap2);
+    expl_put(b, tmp);
+    free(tmp);
+}
+
+/* Append `src` line-by-line with 1-based line numbers from start_line. A trailing
+ * newline in the slice does NOT emit an extra empty numbered line. */
+static void expl_put_numbered(expl_buf_t *b, const char *src, int start_line) {
+    if (!src) {
+        expl_put(b, "     (source not available)\n");
+        return;
+    }
+    int ln = start_line;
+    for (const char *p = src; *p;) {
+        const char *nl = strchr(p, '\n');
+        size_t linelen = nl ? (size_t)(nl - p) : strlen(p);
+        char *line = strndup(p, linelen);
+        expl_putf(b, "%5d\t%s\n", ln++, line ? line : "");
+        free(line);
+        if (!nl) {
+            break;
+        }
+        p = nl + 1;
+    }
+}
+
+static char *handle_explore(cbm_mcp_server_t *srv, const char *args) {
+    char *query = cbm_mcp_get_string_arg(args, "query");
+    char *project = cbm_mcp_get_string_arg(args, "project");
+    cbm_store_t *store = resolve_store(srv, project);
+    int max_files = cbm_mcp_get_int_arg(args, "max_files", 8);
+    int depth = cbm_mcp_get_int_arg(args, "depth", 1);
+    if (depth < 1) {
+        depth = 1; /* 0/negative would silently yield an empty traversal */
+    }
+
+    if (!query) {
+        free(project);
+        return cbm_mcp_text_result("query is required", true);
+    }
+    if (!store) {
+        char *err = build_project_list_error("project not found or not indexed");
+        char *res = cbm_mcp_text_result(err, true);
+        free(err);
+        free(query);
+        free(project);
+        return res;
+    }
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed) {
+        free(query);
+        free(project);
+        return not_indexed;
+    }
+
+    /* ── resolve query terms (space/comma-separated) to unique seed nodes ── */
+    enum { EXPL_MAX_SEEDS = 16 };
+    typedef struct {
+        int64_t id;
+        char *name, *qn, *label, *file;
+        int start_line, end_line, fan_in;
+    } expl_seed_t;
+    expl_seed_t seeds[EXPL_MAX_SEEDS];
+    int seed_count = 0;
+
+    char *qcopy = heap_strdup(query);
+    char *save = NULL;
+    char *tok = strtok_r(qcopy, " \t,", &save);
+    for (; tok && seed_count < EXPL_MAX_SEEDS; tok = strtok_r(NULL, " \t,", &save)) {
+        cbm_node_t *nodes = NULL;
+        int nc = 0;
+        cbm_store_find_nodes_by_name(store, project, tok, &nodes, &nc);
+        if (nc == 0) { /* fall back to fully-qualified name */
+            cbm_store_free_nodes(nodes, 0);
+            nodes = NULL;
+            cbm_node_t qn_node = {0};
+            if (cbm_store_find_node_by_qn(store, project, tok, &qn_node) == CBM_STORE_OK) {
+                nodes = malloc(sizeof(cbm_node_t));
+                if (nodes) {
+                    nodes[0] = qn_node;
+                    nc = 1;
+                } else {
+                    free_node_contents(&qn_node);
+                }
+            }
+        }
+        if (nc == 0) { /* fall back to QN suffix (partial / bare names) */
+            cbm_store_free_nodes(nodes, 0);
+            nodes = NULL;
+            cbm_store_find_nodes_by_qn_suffix(store, project, tok, &nodes, &nc);
+        }
+        if (nc == 0) {
+            cbm_store_free_nodes(nodes, 0);
+            continue;
+        }
+        bool amb = false;
+        int sel = pick_resolved_node(nodes, nc, &amb);
+        bool dup = false;
+        for (int i = 0; i < seed_count; i++) {
+            if (seeds[i].id == nodes[sel].id) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            expl_seed_t *sd = &seeds[seed_count++];
+            sd->id = nodes[sel].id;
+            sd->name = heap_strdup(nodes[sel].name ? nodes[sel].name : "");
+            sd->qn = heap_strdup(nodes[sel].qualified_name ? nodes[sel].qualified_name : "");
+            sd->label = heap_strdup(nodes[sel].label ? nodes[sel].label : "");
+            sd->file = heap_strdup(nodes[sel].file_path ? nodes[sel].file_path : "");
+            sd->start_line = nodes[sel].start_line;
+            sd->end_line = nodes[sel].end_line;
+            sd->fan_in = 0;
+        }
+        cbm_store_free_nodes(nodes, nc);
+    }
+    bool seeds_capped = (tok != NULL); /* loop exited at EXPL_MAX_SEEDS with terms remaining */
+    free(qcopy);
+
+    if (seed_count == 0) {
+        free(query);
+        free(project);
+        return cbm_mcp_text_result(
+            "explore: no indexed symbols matched the query terms. Use "
+            "search_graph(name_pattern=\"...\") to find exact names, then re-run explore.",
+            true);
+    }
+
+    /* ── fan-in (hotspot signal) for all seeds in one batch ── */
+    {
+        int64_t ids[EXPL_MAX_SEEDS];
+        int in_deg[EXPL_MAX_SEEDS], out_deg[EXPL_MAX_SEEDS];
+        for (int i = 0; i < seed_count; i++) {
+            ids[i] = seeds[i].id;
+        }
+        if (cbm_store_batch_count_degrees(store, ids, seed_count, "CALLS", in_deg, out_deg) ==
+            CBM_STORE_OK) {
+            for (int i = 0; i < seed_count; i++) {
+                seeds[i].fan_in = in_deg[i];
+            }
+        }
+    }
+
+    /* ── render markdown ── */
+    char *root_path = get_project_root(srv, project);
+    expl_buf_t md = {0};
+    expl_putf(&md, "# Exploration: %s\n\n", query);
+    expl_put(&md, "## Blast radius — callers (verify before editing)\n\n");
+    for (int i = 0; i < seed_count; i++) {
+        cbm_traverse_result_t tr = {0};
+        cbm_store_bfs(store, seeds[i].id, "inbound", NULL, 0, depth, MCP_BFS_LIMIT, &tr);
+        expl_putf(&md, "- `%s` (%s:%d) — %d caller%s", seeds[i].name, seeds[i].file,
+                  seeds[i].start_line, tr.visited_count, tr.visited_count == 1 ? "" : "s");
+        if (depth > 1) {
+            expl_putf(&md, " (within %d hops, transitive)", depth);
+        }
+        if (seeds[i].fan_in >= 3) {
+            expl_putf(&md, " ⚠ hotspot(fan_in=%d)", seeds[i].fan_in);
+        }
+        if (tr.visited_count > 0) {
+            expl_put(&md, ": ");
+            int shown = tr.visited_count < 6 ? tr.visited_count : 6;
+            for (int k = 0; k < shown; k++) {
+                const char *cn = tr.visited[k].node.name;
+                expl_putf(&md, "%s`%s`", k ? ", " : "", cn ? cn : "?");
+            }
+            if (tr.visited_count > shown) {
+                expl_putf(&md, ", +%d more", tr.visited_count - shown);
+            }
+        }
+        expl_put(&md, "\n");
+        cbm_store_traverse_free(&tr);
+    }
+    expl_put(&md, "\n## Source\n\n> Verbatim on-disk source, line-numbered — Read-equivalent; "
+                  "do NOT re-open the files shown below.\n\n");
+    int files_shown = 0;
+    for (int i = 0; i < seed_count && files_shown < max_files; i++) {
+        int start = seeds[i].start_line;
+        if (start <= 0) {
+            continue;
+        }
+        int real_end = seeds[i].end_line;
+        int end = real_end < start ? start : real_end;
+        bool elided = false;
+        if (end > start + 160) {
+            end = start + 160; /* elide very long bodies */
+            elided = true;
+        }
+        char *abs = NULL;
+        char *src = resolve_snippet_source(root_path, seeds[i].file, start, end, &abs);
+        char *safe = src ? sanitize_utf8_lossy(src) : NULL;
+        const char *ext = strrchr(seeds[i].file, '.');
+        expl_putf(&md, "### %s — `%s` (%s)\n\n```%s\n", seeds[i].file, seeds[i].name,
+                  seeds[i].label, ext ? ext + 1 : "");
+        expl_put_numbered(&md, safe ? safe : src, start);
+        expl_put(&md, "```\n");
+        if (elided) {
+            /* Honest about the cap — the body was longer than shown (don't claim
+             * Read-equivalent for a truncated symbol). */
+            expl_putf(&md, "> … +%d more lines — Read `%s`:%d-%d for the full body.\n",
+                      real_end - end, seeds[i].file, end + 1, real_end);
+        }
+        expl_put(&md, "\n");
+        free(safe);
+        free(src);
+        free(abs);
+        files_shown++;
+    }
+    if (seeds_capped) {
+        expl_putf(&md, "> Note: explored the first %d symbols only (cap reached) — pass fewer "
+                       "terms or split the query.\n", EXPL_MAX_SEEDS);
+    }
+    expl_put(&md, "---\n> For a precise sub-query (callers of X, call paths, custom filters) use "
+                  "`query_graph` (openCypher). `⚠ hotspot` = high inbound fan-in.\n");
+
+    for (int i = 0; i < seed_count; i++) {
+        free(seeds[i].name);
+        free(seeds[i].qn);
+        free(seeds[i].label);
+        free(seeds[i].file);
+    }
+    free(root_path);
+
+    char *result = cbm_mcp_text_result(md.p ? md.p : "(empty)", false);
+    free(md.p);
+    free(query);
+    free(project);
+    return result;
+}
+
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
     if (!tool_name) {
         return cbm_mcp_text_result("missing tool name", true);
@@ -4408,6 +4782,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "ingest_traces") == 0) {
         return handle_ingest_traces(srv, args_json);
+    }
+    if (strcmp(tool_name, "explore") == 0) {
+        return handle_explore(srv, args_json);
     }
     char msg[CBM_SZ_256];
     snprintf(msg, sizeof(msg), "unknown tool: %s", tool_name);

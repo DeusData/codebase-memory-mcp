@@ -316,7 +316,7 @@ static int json_escaped_len(const char *src) {
         if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t') {
             len += 2;
         } else if (c < 0x20) {
-            continue;
+            len += 6; /* \u00XX */
         } else {
             len++;
         }
