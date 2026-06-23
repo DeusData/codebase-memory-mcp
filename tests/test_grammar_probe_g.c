@@ -157,6 +157,7 @@ typedef struct {
     int modules;
     int classes;
     int variables;
+    int tables;
     int sections;
     int imports; /* IMPORTS edges */
     int depends; /* DEPENDS_ON edges */
@@ -172,6 +173,7 @@ static GpgMetrics gpg_metrics_files(const GpgFile *files, int nfiles) {
         m.modules = gpg_count_label(store, lp.project, "Module");
         m.classes = gpg_count_label(store, lp.project, "Class");
         m.variables = gpg_count_label(store, lp.project, "Variable");
+        m.tables = gpg_count_label(store, lp.project, "Table");
         m.sections = gpg_count_label(store, lp.project, "Section");
         m.imports = cbm_store_count_edges_by_type(store, lp.project, "IMPORTS");
         m.depends = cbm_store_count_edges_by_type(store, lp.project, "DEPENDS_ON");
@@ -605,12 +607,12 @@ TEST(probe_csv_module_only) {
 /* ══════════════════════════════════════════════════════════════════
  * GROUP 13 — SQL (.sql)
  *
- * SQL golden histogram: Module:1, Variable:1
- * Table references (e.g. CREATE TABLE / SELECT FROM) produce Variable nodes.
+ * SQL golden histogram: Module:1, Table:1
+ * CREATE TABLE / CREATE VIEW produce first-class Table / View nodes.
  * ══════════════════════════════════════════════════════════════════ */
 
-/* SQL: CREATE TABLE + SELECT → at least 1 Variable node. */
-TEST(probe_sql_variable_node) {
+/* SQL: CREATE TABLE → a first-class Table node. */
+TEST(probe_sql_table_node) {
     GpgMetrics m = gpg_metrics("schema.sql", "CREATE TABLE users (\n"
                                              "  id INTEGER PRIMARY KEY,\n"
                                              "  name TEXT NOT NULL\n"
@@ -618,8 +620,8 @@ TEST(probe_sql_variable_node) {
                                              "\n"
                                              "SELECT id, name FROM users WHERE id = 1;\n");
     ASSERT_TRUE(m.ok);
-    /* GREEN: SQL table reference produces at least 1 Variable node. */
-    ASSERT_TRUE(m.variables >= 1);
+    /* GREEN: CREATE TABLE produces a first-class Table node (was Variable). */
+    ASSERT_TRUE(m.tables >= 1);
     ASSERT_TRUE(m.modules >= 1);
     PASS();
 }
@@ -1082,7 +1084,7 @@ SUITE(grammar_probe_g) {
     RUN_TEST(probe_csv_module_only);
 
     /* SQL */
-    RUN_TEST(probe_sql_variable_node);
+    RUN_TEST(probe_sql_table_node);
     RUN_TEST(probe_sql_insert_select);
 
     /* SOQL */
