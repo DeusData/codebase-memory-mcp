@@ -1439,7 +1439,6 @@ TEST(sql_view_lineage_usages) {
     PASS();
 }
 
-<<<<<<< HEAD
 TEST(sql_schema_qualified_name) {
     /* schema-qualified DDL (schema.table) is named by the table, not the schema,
      * and FROM schema.table resolves to that table for lineage. */
@@ -1457,7 +1456,10 @@ TEST(sql_schema_qualified_name) {
         }
     }
     ASSERT(found_users);
-=======
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(dbt_jinja_macro_defs) {
     /* {% macro %} blocks are recovered as Macro defs (the jinja2 grammar does
      * not model {% %} statements, so a text scan handles them). */
@@ -1511,7 +1513,6 @@ TEST(dbt_sql_ref_lineage) {
         }
     }
     ASSERT(found);
->>>>>>> 23f81ed (feat(dbt): extract dbt Jinja lineage and macros from raw .sql models)
     cbm_free_result(r);
     PASS();
 }
@@ -3172,13 +3173,10 @@ SUITE(extraction) {
     RUN_TEST(sql_function);
     RUN_TEST(sql_ddl_node_labels);
     RUN_TEST(sql_view_lineage_usages);
-<<<<<<< HEAD
     RUN_TEST(sql_schema_qualified_name);
-=======
     RUN_TEST(dbt_jinja_macro_defs);
     RUN_TEST(dbt_jinja_ref_lineage);
     RUN_TEST(dbt_sql_ref_lineage);
->>>>>>> 23f81ed (feat(dbt): extract dbt Jinja lineage and macros from raw .sql models)
     RUN_TEST(meson_project);
     RUN_TEST(css_rules);
     RUN_TEST(scss_rules);
