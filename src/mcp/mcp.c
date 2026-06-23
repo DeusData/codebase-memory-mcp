@@ -2953,6 +2953,75 @@ static char *resolve_snippet_source(const char *root_path, const char *file_path
     return NULL;
 }
 
+static bool utf8_is_cont(unsigned char c) {
+    return (c & 0xC0) == 0x80;
+}
+
+static char *sanitize_utf8_lossy(const char *s) {
+    enum {
+        UTF8_REPLACEMENT_LEN = 3,
+        UTF8_THREE_BYTE_LEN = 3,
+        UTF8_FOUR_BYTE_LEN = 4,
+        UTF8_FOURTH_BYTE = 3,
+    };
+    if (!s) {
+        return NULL;
+    }
+    size_t len = strlen(s);
+    if (len > (((size_t)-1) - SKIP_ONE) / UTF8_REPLACEMENT_LEN) {
+        return NULL;
+    }
+    char *out = malloc(len * UTF8_REPLACEMENT_LEN + SKIP_ONE);
+    if (!out) {
+        return NULL;
+    }
+
+    const unsigned char *p = (const unsigned char *)s;
+    const unsigned char *end = p + len;
+    unsigned char *dst = (unsigned char *)out;
+    while (p < end) {
+        unsigned char c = *p;
+        size_t n = 0;
+        if (c < 0x80) {
+            n = 1;
+        } else if (c >= 0xC2 && c <= 0xDF && p + 1 < end && utf8_is_cont(p[1])) {
+            n = 2;
+        } else if (c == 0xE0 && p + 2 < end && p[1] >= 0xA0 && p[1] <= 0xBF && utf8_is_cont(p[2])) {
+            n = UTF8_THREE_BYTE_LEN;
+        } else if (c >= 0xE1 && c <= 0xEC && p + 2 < end && utf8_is_cont(p[1]) &&
+                   utf8_is_cont(p[2])) {
+            n = UTF8_THREE_BYTE_LEN;
+        } else if (c == 0xED && p + 2 < end && p[1] >= 0x80 && p[1] <= 0x9F && utf8_is_cont(p[2])) {
+            n = UTF8_THREE_BYTE_LEN;
+        } else if (c >= 0xEE && c <= 0xEF && p + 2 < end && utf8_is_cont(p[1]) &&
+                   utf8_is_cont(p[2])) {
+            n = UTF8_THREE_BYTE_LEN;
+        } else if (c == 0xF0 && p + UTF8_FOURTH_BYTE < end && p[1] >= 0x90 && p[1] <= 0xBF &&
+                   utf8_is_cont(p[2]) && utf8_is_cont(p[UTF8_FOURTH_BYTE])) {
+            n = UTF8_FOUR_BYTE_LEN;
+        } else if (c >= 0xF1 && c <= 0xF3 && p + UTF8_FOURTH_BYTE < end && utf8_is_cont(p[1]) &&
+                   utf8_is_cont(p[2]) && utf8_is_cont(p[UTF8_FOURTH_BYTE])) {
+            n = UTF8_FOUR_BYTE_LEN;
+        } else if (c == 0xF4 && p + UTF8_FOURTH_BYTE < end && p[1] >= 0x80 && p[1] <= 0x8F &&
+                   utf8_is_cont(p[2]) && utf8_is_cont(p[UTF8_FOURTH_BYTE])) {
+            n = UTF8_FOUR_BYTE_LEN;
+        }
+
+        if (n > 0) {
+            memcpy(dst, p, n);
+            dst += n;
+            p += n;
+        } else {
+            *dst++ = 0xEF;
+            *dst++ = 0xBF;
+            *dst++ = 0xBD;
+            p++;
+        }
+    }
+    *dst = '\0';
+    return out;
+}
+
 /* Build an enriched snippet response for a resolved node. */
 /* Add a string array to a JSON object (no-op if count == 0). */
 static void add_string_array(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
@@ -2997,7 +3066,13 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     yyjson_mut_obj_add_int(doc, root_obj, "end_line", end);
 
     if (source) {
-        yyjson_mut_obj_add_str(doc, root_obj, "source", source);
+        char *safe_source = sanitize_utf8_lossy(source);
+        if (safe_source) {
+            yyjson_mut_obj_add_strcpy(doc, root_obj, "source", safe_source);
+            free(safe_source);
+        } else {
+            yyjson_mut_obj_add_str(doc, root_obj, "source", "(source not available)");
+        }
     } else {
         yyjson_mut_obj_add_str(doc, root_obj, "source", "(source not available)");
     }

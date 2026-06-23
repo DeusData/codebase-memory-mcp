@@ -1,4 +1,13 @@
-# codebase-memory-mcp
+# codebase-memory-mcp-pro
+
+> **🔱 Fork notice** — `codebase-memory-mcp-pro` is a community fork of [**DeusData/codebase-memory-mcp**](https://github.com/DeusData/codebase-memory-mcp) (MIT License, © 2025 DeusData), maintained by [@win4r](https://github.com/win4r). It tracks upstream and integrates the following fixes ahead of their upstream merge:
+>
+> - **Incremental-reindex correctness** ([#528](https://github.com/DeusData/codebase-memory-mcp/pull/528)) — preserve inbound cross-file `CALLS` edges on incremental re-index; editing a file no longer orphans calls into its symbols.
+> - **Cypher / `query_graph`** — populate node properties carried through `WITH` aggregation ([#465](https://github.com/DeusData/codebase-memory-mcp/pull/465)); fix label-filtered traversal silently truncating at 10 rows ([#412](https://github.com/DeusData/codebase-memory-mcp/pull/412)).
+> - **MCP tools** — `detect_changes` honors `since` ([#464](https://github.com/DeusData/codebase-memory-mcp/pull/464)); definition-preferred name resolution with ambiguity reporting ([#466](https://github.com/DeusData/codebase-memory-mcp/pull/466)); valid UTF-8 in `get_code_snippet` ([#526](https://github.com/DeusData/codebase-memory-mcp/pull/526)).
+> - **Robustness / build** — stack-buffer-overflow fix in `append_args_json` ([#475](https://github.com/DeusData/codebase-memory-mcp/pull/475)); JSON control-character escaping ([#527](https://github.com/DeusData/codebase-memory-mcp/pull/527)); preserve ADRs across a full re-index ([#539](https://github.com/DeusData/codebase-memory-mcp/pull/539)); libgit2 ≥ 1.8 build fix ([#512](https://github.com/DeusData/codebase-memory-mcp/pull/512)).
+>
+> All credit for the original engine belongs to DeusData. License unchanged — see [LICENSE](LICENSE). The upstream README follows verbatim.
 
 [![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)

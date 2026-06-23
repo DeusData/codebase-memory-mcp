@@ -2061,15 +2061,18 @@ static const char *node_string_field(const cbm_node_t *n, const char *prop) {
 /* Get node property by name.
  * store may be NULL; only needed for virtual degree properties. */
 static const char *json_extract_prop(const char *json, const char *key, char *buf, size_t buf_sz);
+static void node_fields_free(cbm_node_t *n); /* defined below; used by the stub re-fetch */
 
 static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t *store) {
     if (!n || !prop) {
         return "";
     }
     const char *str = node_string_field(n, prop);
-    if (str) {
+    if (str && str[0]) {
         return str;
     }
+    /* Note: a string field that exists but is empty ("") falls through here so a
+     * WITH-aggregation node stub (below) can re-fetch it. */
     /* Computed and JSON-derived values live in rotating thread-local buffers:
      * a single row (or an ORDER-BY comparison) reads several of these before any
      * of them is copied out, so returning one shared static buffer would alias
@@ -2105,6 +2108,40 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
         const char *v = json_extract_prop(n->properties_json, prop, out, CBM_SZ_512);
         if (v && v[0]) {
             return v;
+        }
+    }
+    /* WITH aggregation carries a node group var by id + name only (the group key
+     * is the node name), so every other property is absent on the stub. Detect
+     * the stub (id set, but the full string fields were never populated) and
+     * re-fetch the node so RETURN g.file_path / g.label / g.<metric> project
+     * correctly instead of returning blank. The gate is heuristic, not an exact
+     * stub discriminator: a real bound node with NULL label AND file_path would
+     * also match, but in that case the worst case is one redundant indexed fetch
+     * that returns the same value — never a wrong result. */
+    if (store && n->id > 0 && !n->file_path && !n->label) {
+        cbm_node_t full = {0};
+        if (cbm_store_find_node_by_id(store, n->id, &full) == CBM_STORE_OK) {
+            const char *res = NULL;
+            const char *rv = node_string_field(&full, prop);
+            if (rv && rv[0]) {
+                snprintf(out, CBM_SZ_512, "%s", rv);
+                res = out;
+            } else if (strcmp(prop, "start_line") == 0) {
+                snprintf(out, CBM_SZ_512, "%d", full.start_line);
+                res = out;
+            } else if (strcmp(prop, "end_line") == 0) {
+                snprintf(out, CBM_SZ_512, "%d", full.end_line);
+                res = out;
+            } else if (full.properties_json && full.properties_json[0] == '{') {
+                const char *jv = json_extract_prop(full.properties_json, prop, out, CBM_SZ_512);
+                if (jv && jv[0]) {
+                    res = out;
+                }
+            }
+            node_fields_free(&full);
+            if (res) {
+                return res;
+            }
         }
     }
     return "";
@@ -2550,6 +2587,9 @@ static void rb_add_row(result_builder_t *rb, const char **values) {
 /* ── Binding virtual variables (for WITH clause) ──────────────── */
 
 static const char *binding_get_virtual(binding_t *b, const char *var, const char *prop) {
+    if (!var) {
+        return "";
+    }
     /* Check virtual vars first (from WITH projection) */
     char full[CBM_SZ_256];
     if (prop) {
@@ -3406,8 +3446,9 @@ typedef struct {
     double *sums;
     int *counts;
     double *mins, *maxs;
-    char ***distinct_lists; /* per-item set of seen values for COUNT(DISTINCT) */
-    int *distinct_n;        /* per-item distinct count (#239) */
+    char ***distinct_lists;  /* per-item set of seen values for COUNT(DISTINCT) */
+    int *distinct_n;         /* per-item distinct count (#239) */
+    int64_t *group_node_ids; /* per-item node id when the group var is a node (0 = not) */
 } with_agg_t;
 
 /* Build a group key from non-aggregate WITH items */
@@ -3447,6 +3488,7 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
     (*aggs)[found].maxs = calloc(wc->count, sizeof(double));
     (*aggs)[found].distinct_lists = calloc(wc->count, sizeof(char **));
     (*aggs)[found].distinct_n = calloc(wc->count, sizeof(int));
+    (*aggs)[found].group_node_ids = calloc(wc->count, sizeof(int64_t));
     for (int ci = 0; ci < wc->count; ci++) {
         (*aggs)[found].mins[ci] = CYP_DBL_MAX;
         (*aggs)[found].maxs[ci] = -CYP_DBL_MAX;
@@ -3458,6 +3500,15 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
         }
         const char *v = binding_get_virtual(b, wc->items[ci].variable, wc->items[ci].property);
         (*aggs)[found].group_vals[ci] = heap_strdup(v);
+        /* If this group item is a bare node variable, remember its id so the
+         * carried virtual var can re-fetch any property (group_vals holds only
+         * the name). */
+        if (!wc->items[ci].property && wc->items[ci].variable) {
+            cbm_node_t *gn = binding_get(b, wc->items[ci].variable);
+            if (gn) {
+                (*aggs)[found].group_node_ids[ci] = gn->id;
+            }
+        }
     }
     return found;
 }
@@ -3528,6 +3579,7 @@ static void with_agg_free(with_agg_t *aggs, int agg_cnt, int item_count) {
         free(aggs[a].maxs);
         free(aggs[a].distinct_lists);
         free(aggs[a].distinct_n);
+        free(aggs[a].group_node_ids);
     }
     free(aggs);
 }
@@ -3553,6 +3605,9 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
     }
     for (int a = 0; a < agg_cnt; a++) {
         binding_t vb = {0};
+        /* Carry the store so node_prop can re-fetch a carried node's properties
+         * (and compute in_degree/out_degree) on the projected virtual binding. */
+        vb.store = (bind_count > 0) ? bindings[0].store : NULL;
         for (int ci = 0; ci < wc->count; ci++) {
             char name_buf[CBM_SZ_256];
             const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
@@ -3566,6 +3621,11 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
                 with_add_vbinding_var(&vb, alias, vbuf);
             } else {
                 with_add_vbinding_var(&vb, alias, aggs[a].group_vals[ci]);
+                /* Tag the carried virtual var with the node id (when the group
+                 * var is a node) so node_prop can re-fetch its full properties. */
+                if (aggs[a].group_node_ids[ci] > 0 && vb.var_count > 0) {
+                    vb.var_nodes[vb.var_count - 1].id = aggs[a].group_node_ids[ci];
+                }
             }
         }
         (*vbindings)[(*vcount)++] = vb;
@@ -3578,6 +3638,7 @@ static void execute_with_simple(cbm_return_clause_t *wc, binding_t *bindings, in
                                 binding_t *vbindings, int *vcount) {
     for (int bi = 0; bi < bind_count; bi++) {
         binding_t vb = {0};
+        vb.store = bindings[bi].store; /* so node_prop can re-fetch / compute on the projection */
         for (int ci = 0; ci < wc->count; ci++) {
             char name_buf[CBM_SZ_256];
             const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));

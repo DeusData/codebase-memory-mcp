@@ -11,6 +11,7 @@
 #include <yyjson/yyjson.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING
@@ -1444,6 +1445,31 @@ static char *call_snippet(cbm_mcp_server_t *srv, const char *args_json) {
     return text;
 }
 
+static bool is_valid_json_response(const char *json) {
+    if (!json) {
+        return false;
+    }
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) {
+        return false;
+    }
+    yyjson_doc_free(doc);
+    return true;
+}
+
+static bool snippet_source_has_replacement(const char *json) {
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) {
+        return false;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *source = yyjson_obj_get(root, "source");
+    const char *source_str = yyjson_get_str(source);
+    bool found = source_str && strstr(source_str, "\xEF\xBF\xBD");
+    yyjson_doc_free(doc);
+    return found;
+}
+
 /* ── TestSnippet_ExactQN ──────────────────────────────────────── */
 
 TEST(snippet_exact_qn) {
@@ -1725,6 +1751,46 @@ TEST(snippet_include_neighbors_enabled) {
     ASSERT_NOT_NULL(strstr(resp, "Run"));
     free(resp);
 
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* ── TestSnippet_SourceInvalidUtf8 ────────────────────────────── */
+
+TEST(snippet_source_invalid_utf8) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    FILE *fp = fopen(src_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    const unsigned char source[] = {
+        'p',  'a',  'c', 'k', 'a', 'g',  'e',  ' ',  'm',  'a',  'i',  'n', '\n', '\n',
+        'f',  'u',  'n', 'c', ' ', 'H',  'a',  'n',  'd',  'l',  'e',  'R', 'e',  'q',
+        'u',  'e',  's', 't', '(', ')',  ' ',  'e',  'r',  'r',  'o',  'r', ' ',  '{',
+        '\n', '\t', '/', '/', ' ', 0xC0, 0xD4, 0xB7, 0xC2, '\n', '\t', 'r', 'e',  't',
+        'u',  'r',  'n', ' ', 'n', 'i',  'l',  '\n', '}',  '\n'};
+    ASSERT_EQ(fwrite(source, 1, sizeof(source), fp), sizeof(source));
+    ASSERT_EQ(fclose(fp), 0);
+
+    char *raw =
+        cbm_mcp_handle_tool(srv, "get_code_snippet",
+                            "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                            "\"project\":\"test-project\"}");
+    ASSERT_TRUE(is_valid_json_response(raw));
+    char *resp = extract_text_content(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(is_valid_json_response(resp));
+    ASSERT_NULL(strstr(resp, "\xC0\xD4"));
+    ASSERT_NOT_NULL(strstr(resp, "HandleRequest"));
+    ASSERT_NOT_NULL(strstr(resp, "return nil"));
+    ASSERT_TRUE(snippet_source_has_replacement(resp));
+
+    free(resp);
+    free(raw);
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
     PASS();
@@ -2285,5 +2351,6 @@ SUITE(mcp) {
     RUN_TEST(snippet_auto_resolve_enabled);
     RUN_TEST(snippet_include_neighbors_default);
     RUN_TEST(snippet_include_neighbors_enabled);
+    RUN_TEST(snippet_source_invalid_utf8);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
 }

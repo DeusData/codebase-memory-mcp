@@ -2183,6 +2183,27 @@ TEST(cypher_exec_with_count) {
     PASS();
 }
 
+/* Regression: a bare node group-var carried through WITH aggregation must project
+ * its real properties (not blank). Pre-fix, the carried var held only the node
+ * name, so RETURN g.file_path returned "". */
+TEST(cypher_exec_with_node_groupvar_prop) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function)-[:CALLS]->(g:Function) "
+                                "WHERE g.name = \"ValidateOrder\" "
+                                "WITH g, COUNT(*) AS c "
+                                "RETURN g.file_path, g.name, c",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "validate.go"); /* was "" before the fix */
+    ASSERT_STR_EQ(r.rows[0][1], "ValidateOrder");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_with_where) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -2642,6 +2663,7 @@ SUITE(cypher) {
     /* Phase 6: WITH clause */
     RUN_TEST(cypher_exec_with_rename);
     RUN_TEST(cypher_exec_with_count);
+    RUN_TEST(cypher_exec_with_node_groupvar_prop);
     RUN_TEST(cypher_exec_with_where);
     RUN_TEST(cypher_exec_with_orderby_limit);
     RUN_TEST(cypher_parse_with);
