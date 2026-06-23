@@ -4936,17 +4936,21 @@ static int arch_clusters(cbm_store_t *s, const char *project, cbm_architecture_i
 
 /* ── GetArchitecture dispatch ──────────────────────────────────── */
 
+/* "overview" = compact architecture summary: every aspect EXCEPT the large
+   per-file listing (file_tree), which alone dominates the payload (~275 entries)
+   and pushes the response past MAX_MCP_OUTPUT_TOKENS. */
+static bool aspect_in_overview(const char *name) {
+    return strcmp(name, "file_tree") != 0;
+}
+
 static bool want_aspect(const char **aspects, int aspect_count, const char *name) {
     if (!aspects || aspect_count == 0) {
         return true;
     }
     for (int i = 0; i < aspect_count; i++) {
-        if (strcmp(aspects[i], "all") == 0) {
-            return true;
-        }
-        if (strcmp(aspects[i], name) == 0) {
-            return true;
-        }
+        if (strcmp(aspects[i], "all") == 0) return true;
+        if (strcmp(aspects[i], "overview") == 0 && aspect_in_overview(name)) return true;
+        if (strcmp(aspects[i], name) == 0) return true;
     }
     return false;
 }
