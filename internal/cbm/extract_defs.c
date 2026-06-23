@@ -3045,8 +3045,7 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
 // lineage edge (e.g. a view -> the tables it selects from). Emitting them here
 // (rather than via the generic identifier walker) sets the correct enclosing
 // scope and bypasses the is_definition_name suppression that drops them.
-static void collect_sql_relation_usages(CBMExtractCtx *ctx, TSNode node,
-                                        const char *enclosing_qn) {
+static void collect_sql_relation_usages(CBMExtractCtx *ctx, TSNode node, const char *enclosing_qn) {
     if (strcmp(ts_node_type(node), "relation") == 0) {
         TSNode nm = resolve_sql_func_name(node); // object_reference -> identifier
         if (!ts_node_is_null(nm)) {
@@ -3077,8 +3076,7 @@ static bool extract_sql_ddl_class_def(CBMExtractCtx *ctx, TSNode node, const cha
     const char *label;
     if (strcmp(kind, "create_table") == 0) {
         label = "Table";
-    } else if (strcmp(kind, "create_view") == 0 ||
-               strcmp(kind, "create_materialized_view") == 0) {
+    } else if (strcmp(kind, "create_view") == 0 || strcmp(kind, "create_materialized_view") == 0) {
         label = "View";
     } else {
         return false;
