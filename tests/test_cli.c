@@ -1964,6 +1964,129 @@ TEST(cli_upsert_opencode_mcp_existing) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ *  Group B: OpenCode Plugin + Skills
+ * ═══════════════════════════════════════════════════════════════════ */
+
+TEST(cli_upsert_opencode_plugin_fresh) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-ocode-plug-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    int rc = cbm_upsert_opencode_plugin(tmpdir, "/usr/local/bin/codebase-memory-mcp", false);
+    ASSERT_EQ(rc, 0);
+
+    char plugin_path[512];
+    snprintf(plugin_path, sizeof(plugin_path), "%s/.config/opencode/plugins/cbm-augment.ts",
+             tmpdir);
+    const char *data = read_test_file(plugin_path);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "/usr/local/bin/codebase-memory-mcp") != NULL);
+    ASSERT(strstr(data, "tool.execute.after") != NULL);
+    ASSERT(strstr(data, "experimental.chat.system.transform") != NULL);
+    ASSERT(strstr(data, "hook-augment") != NULL);
+    ASSERT(strstr(data, "satisfies Plugin") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_upsert_opencode_plugin_idempotent) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-ocode-plug2-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    /* First install */
+    int rc = cbm_upsert_opencode_plugin(tmpdir, "/usr/local/bin/codebase-memory-mcp", false);
+    ASSERT_EQ(rc, 0);
+
+    /* Re-install with different path — should overwrite cleanly */
+    rc = cbm_upsert_opencode_plugin(tmpdir, "/opt/cbm/codebase-memory-mcp", false);
+    ASSERT_EQ(rc, 0);
+
+    char plugin_path[512];
+    snprintf(plugin_path, sizeof(plugin_path), "%s/.config/opencode/plugins/cbm-augment.ts",
+             tmpdir);
+    const char *data = read_test_file(plugin_path);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "/opt/cbm/codebase-memory-mcp") != NULL);
+    ASSERT(strstr(data, "/usr/local/bin/codebase-memory-mcp") == NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_upsert_opencode_plugin_rejects_quote) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-ocode-plug3-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    /* Binary path containing a double-quote must be rejected (security). */
+    int rc = cbm_upsert_opencode_plugin(tmpdir, "/usr/local/bin/\"evil\"", false);
+    ASSERT_NEQ(rc, 0);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_remove_opencode_plugin) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-ocode-plug4-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    /* Install then remove */
+    int rc = cbm_upsert_opencode_plugin(tmpdir, "/usr/local/bin/codebase-memory-mcp", false);
+    ASSERT_EQ(rc, 0);
+
+    char plugin_path[512];
+    snprintf(plugin_path, sizeof(plugin_path), "%s/.config/opencode/plugins/cbm-augment.ts",
+             tmpdir);
+    struct stat st;
+    ASSERT(stat(plugin_path, &st) == 0);
+
+    rc = cbm_remove_opencode_plugin(tmpdir, false);
+    ASSERT_EQ(rc, 0);
+    ASSERT(stat(plugin_path, &st) != 0);
+
+    /* Remove again — should succeed (idempotent) */
+    rc = cbm_remove_opencode_plugin(tmpdir, false);
+    ASSERT_EQ(rc, 0);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_opencode_skills_installed) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-ocode-skill-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char skills_dir[512];
+    snprintf(skills_dir, sizeof(skills_dir), "%s/skills", tmpdir);
+
+    int count = cbm_install_skills(skills_dir, true, false);
+    ASSERT_EQ(count, CBM_SKILL_COUNT);
+
+    char skill_file[512];
+    snprintf(skill_file, sizeof(skill_file), "%s/codebase-memory/SKILL.md", skills_dir);
+    const char *data = read_test_file(skill_file);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "codebase-memory") != NULL);
+    ASSERT(strstr(data, "search_graph") != NULL);
+
+    /* Remove skills */
+    int removed = cbm_remove_skills(skills_dir, false);
+    ASSERT_EQ(removed, CBM_SKILL_COUNT);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  *  Group B: MCP Config Upsert — Antigravity
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -2769,6 +2892,13 @@ SUITE(cli) {
     /* OpenCode MCP config upsert (2 tests — group B) */
     RUN_TEST(cli_upsert_opencode_mcp_fresh);
     RUN_TEST(cli_upsert_opencode_mcp_existing);
+
+    /* OpenCode plugin + skills (5 tests — group B) */
+    RUN_TEST(cli_upsert_opencode_plugin_fresh);
+    RUN_TEST(cli_upsert_opencode_plugin_idempotent);
+    RUN_TEST(cli_upsert_opencode_plugin_rejects_quote);
+    RUN_TEST(cli_remove_opencode_plugin);
+    RUN_TEST(cli_opencode_skills_installed);
 
     /* Antigravity MCP config upsert (2 tests — group B) */
     RUN_TEST(cli_upsert_antigravity_mcp_fresh);

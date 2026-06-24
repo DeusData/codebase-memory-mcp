@@ -524,6 +524,58 @@ static const char skill_content[] =
     "`direction=\"both\"`.\n"
     "5. Results default to 10 per page — check `has_more` and use `offset`.\n";
 
+/* ── OpenCode plugin (TypeScript, auto-discovered from ~/.config/opencode/plugins/) ──
+ * Installs a .ts plugin that wires tool.execute.after (grep/glob graph augment)
+ * and experimental.chat.system.transform (session reminder). The binary path is
+ * embedded at install time via fprintf %s — same pattern as the Claude Code
+ * hook gate script. Uses tool.execute.after (NOT .before) because .before output
+ * mutation has no effect on the tool result the model sees (verified against
+ * anomalyco/opencode source: packages/opencode/src/session/tools.ts). */
+static const char opencode_plugin_content[] =
+    "import type { Plugin } from \"@opencode-ai/plugin\"\n"
+    "import { spawn } from \"child_process\"\n"
+    "\n"
+    "const BIN = \"%s\"\n"
+    "\n"
+    "export default (async () => {\n"
+    "  return {\n"
+    "    \"tool.execute.after\": async (input: { tool: string; args: any }, "
+    "output: { output: string }) => {\n"
+    "      if (input.tool !== \"grep\" && input.tool !== \"glob\") return\n"
+    "      const pattern = input.args?.pattern\n"
+    "      if (!pattern) return\n"
+    "      const toolName = input.tool === \"grep\" ? \"Grep\" : \"Glob\"\n"
+    "      try {\n"
+    "        const payload = JSON.stringify({ tool_name: toolName, "
+    "tool_input: { pattern } })\n"
+    "        const child = spawn(BIN, [\"hook-augment\"], "
+    "{ stdio: [\"pipe\", \"pipe\", \"ignore\"] })\n"
+    "        child.stdin.write(payload)\n"
+    "        child.stdin.end()\n"
+    "        let stdout = \"\"\n"
+    "        child.stdout.on(\"data\", (d: Buffer) => { stdout += d.toString() })\n"
+    "        await new Promise<void>((resolve) => {\n"
+    "          child.on(\"close\", () => resolve())\n"
+    "          child.on(\"error\", () => resolve())\n"
+    "        })\n"
+    "        if (!stdout.trim()) return\n"
+    "        const parsed = JSON.parse(stdout)\n"
+    "        const ctx = parsed?.hookSpecificOutput?.additionalContext\n"
+    "        if (typeof ctx === \"string\" && ctx.length > 0) {\n"
+    "          output.output += \"\\n\\n\" + ctx\n"
+    "        }\n"
+    "      } catch (e) {}\n"
+    "    },\n"
+    "    \"experimental.chat.system.transform\": async (_input: any, "
+    "output: { system: string[] }) => {\n"
+    "      output.system.push(\"Code discovery: prefer codebase-memory-mcp "
+    "(search_graph, trace_path, get_code_snippet, query_graph, search_code) "
+    "over grep/file-read; run index_repository first if the project is not "
+    "indexed.\")\n"
+    "    }\n"
+    "  }\n"
+    "}) satisfies Plugin\n";
+
 static const char codex_instructions_content[] =
     "# Codebase Knowledge Graph\n"
     "\n"
@@ -1666,6 +1718,67 @@ int cbm_remove_opencode_mcp(const char *config_path) {
     int rc = write_json_file(config_path, mdoc);
     yyjson_mut_doc_free(mdoc);
     return rc;
+}
+
+/* ── OpenCode plugin install/remove ──────────────────────────────
+ * Writes the TypeScript plugin to ~/.config/opencode/plugins/cbm-augment.ts.
+ * OpenCode auto-discovers .ts files in this directory — no opencode.json entry
+ * needed. The plugin wires tool.execute.after (grep/glob graph augment) and
+ * experimental.chat.system.transform (session reminder). Follows the same
+ * TOCTOU-safe pattern as cbm_install_hook_gate_script: fchmod before fclose. */
+
+#define CMM_OPENCODE_PLUGIN_NAME "cbm-augment.ts"
+
+int cbm_upsert_opencode_plugin(const char *home, const char *binary_path, bool dry_run) {
+    if (!home || !binary_path) {
+        return CLI_ERR;
+    }
+    if (strchr(binary_path, '"') != NULL) {
+        return CLI_ERR;
+    }
+    char plugins_dir[CLI_BUF_1K];
+    snprintf(plugins_dir, sizeof(plugins_dir), "%s/.config/opencode/plugins", home);
+    if (!dry_run) {
+        cbm_mkdir_p(plugins_dir, CLI_OCTAL_PERM);
+    }
+
+    char plugin_path[CLI_BUF_1K];
+    snprintf(plugin_path, sizeof(plugin_path), "%s/%s", plugins_dir, CMM_OPENCODE_PLUGIN_NAME);
+
+    if (dry_run) {
+        return 0;
+    }
+
+    FILE *f = fopen(plugin_path, "w");
+    if (!f) {
+        return CLI_ERR;
+    }
+    (void)fprintf(f, opencode_plugin_content, binary_path);
+#ifndef _WIN32
+    fchmod(fileno(f), CLI_OCTAL_PERM);
+#endif
+    (void)fclose(f);
+#ifdef _WIN32
+    chmod(plugin_path, CLI_OCTAL_PERM);
+#endif
+    return 0;
+}
+
+int cbm_remove_opencode_plugin(const char *home, bool dry_run) {
+    if (!home) {
+        return CLI_ERR;
+    }
+    char plugin_path[CLI_BUF_1K];
+    snprintf(plugin_path, sizeof(plugin_path), "%s/.config/opencode/plugins/%s", home,
+             CMM_OPENCODE_PLUGIN_NAME);
+    if (dry_run) {
+        return 0;
+    }
+    struct stat st;
+    if (stat(plugin_path, &st) == 0) {
+        return cbm_unlink(plugin_path);
+    }
+    return 0;
 }
 
 /* ── Antigravity MCP config (JSON, same mcpServers format) ────── */
@@ -3135,10 +3248,36 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
     if (agents->opencode) {
         char cp[CLI_BUF_1K];
         char ip[CLI_BUF_1K];
+        char skills_dir[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.config/opencode/opencode.json", home);
         snprintf(ip, sizeof(ip), "%s/.config/opencode/AGENTS.md", home);
+        snprintf(skills_dir, sizeof(skills_dir), "%s/.config/opencode/skills", home);
+
+        /* Plan mode: record planned writes for skills + plugin, mutate nothing
+         * (#388). MCP config + instructions are recorded by install_generic_agent_config. */
+        if (g_install_plan) {
+            char plugin_path[CLI_BUF_1K];
+            snprintf(plugin_path, sizeof(plugin_path), "%s/.config/opencode/plugins/%s", home,
+                     CMM_OPENCODE_PLUGIN_NAME);
+            plan_record("OpenCode", "skills", skills_dir);
+            plan_record("OpenCode", "plugin", plugin_path);
+        }
+
         install_generic_agent_config("OpenCode", binary_path, cp, ip, dry_run,
                                      cbm_upsert_opencode_mcp);
+
+        if (!g_install_plan) {
+            /* Install skills (same consolidated skill as Claude Code). */
+            int skill_count = cbm_install_skills(skills_dir, true, dry_run);
+            printf("  skills: %d installed\n", skill_count);
+
+            /* Install TypeScript plugin (tool.execute.after + system.transform). */
+            if (!dry_run) {
+                cbm_upsert_opencode_plugin(home, binary_path, dry_run);
+            }
+            printf("  plugin: tool.execute.after (Grep/Glob graph augment) + "
+                   "experimental.chat.system.transform (session reminder)\n");
+        }
     }
     if (agents->antigravity) {
         char cp[CLI_BUF_1K];
@@ -3632,10 +3771,20 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
     if (agents->opencode) {
         char cp[CLI_BUF_1K];
         char ip[CLI_BUF_1K];
+        char skills_dir[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.config/opencode/opencode.json", home);
         snprintf(ip, sizeof(ip), "%s/.config/opencode/AGENTS.md", home);
+        snprintf(skills_dir, sizeof(skills_dir), "%s/.config/opencode/skills", home);
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"OpenCode", cp, ip}, dry_run,
                                   cbm_remove_opencode_mcp);
+        /* Remove skills. */
+        int removed = cbm_remove_skills(skills_dir, dry_run);
+        printf("OpenCode: removed %d skill(s)\n", removed);
+        /* Remove TypeScript plugin. */
+        if (!dry_run) {
+            cbm_remove_opencode_plugin(home, dry_run);
+        }
+        printf("  removed plugin\n");
     }
     if (agents->antigravity) {
         char cp[CLI_BUF_1K];
