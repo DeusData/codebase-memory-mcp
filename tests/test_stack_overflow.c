@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 
 /* tree-sitter runtime allocator hooks (ts_runtime/src/alloc.h, TS_PUBLIC) and
  * mimalloc (vendored) — for the #424 allocator-binding regression test. */
@@ -435,7 +436,16 @@ static bool so_extract_crashes(const char *content, CBMLanguage lang, const char
         _exit(0);
     }
     int status = 0;
-    (void)waitpid(pid, &status, 0);
+    /* leaks --atExit (macOS) SIGSTOPs the forked child during heap inspection;
+     * WUNTRACED+SIGCONT avoids the hang (mirrors test_store_bulk.c, b336466). */
+    for (;;) {
+        if (waitpid(pid, &status, WUNTRACED) < 0) break;
+        if (WIFSTOPPED(status)) {
+            kill(pid, SIGCONT);
+            continue;
+        }
+        break;
+    }
     return WIFSIGNALED(status);
 #endif
 }
