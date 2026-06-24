@@ -653,17 +653,9 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
 
         /* FTS5 rebuild after incremental dump.  The btree dump path bypasses
          * any triggers that could have kept nodes_fts synchronized, so we
-         * rebuild from the nodes table here.  See the full-dump path in
-         * pipeline.c for the matching logic. */
-        cbm_store_exec(hash_store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
-        if (cbm_store_exec(hash_store,
-                           "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                           "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
-                           "FROM nodes;") != CBM_STORE_OK) {
-            cbm_store_exec(hash_store,
-                           "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                           "SELECT id, name, qualified_name, label, file_path FROM nodes;");
-        }
+         * rebuild from the nodes table here (also indexing prose bodies for
+         * content search — see cbm_store_fts_rebuild and #518/#519). */
+        cbm_store_fts_rebuild(hash_store);
 
         cbm_store_close(hash_store);
     }

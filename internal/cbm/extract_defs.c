@@ -3084,7 +3084,8 @@ static const char *qn_safe_segment(CBMArena *a, const char *name) {
     return out;
 }
 
-static void push_simple_class_def(CBMExtractCtx *ctx, TSNode node, char *name, const char *label) {
+static void push_simple_class_def(CBMExtractCtx *ctx, TSNode node, char *name, const char *label,
+                                  const char *docstring) {
     CBMArena *a = ctx->arena;
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
@@ -3095,6 +3096,7 @@ static void push_simple_class_def(CBMExtractCtx *ctx, TSNode node, char *name, c
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
     def.is_exported = true;
+    def.docstring = docstring; // section body for Markdown (#518); NULL otherwise
     cbm_defs_push(&ctx->result->defs, a, def);
 }
 
@@ -3193,6 +3195,57 @@ static char *extract_markdown_heading_name(CBMArena *a, TSNode node, const char 
     return trim_heading_name(name);
 }
 
+// Max bytes of Markdown section body captured for BM25 content search (#518).
+enum { CBM_MD_SECTION_BODY_MAX = 500 };
+
+// Capture the prose body beneath a Markdown heading so BM25 can search the
+// content, not just the heading text (#518). In the tree-sitter-markdown grammar
+// each heading lives inside a `section` node that also holds the body blocks and
+// any nested subsections; the body is the source span between the heading and
+// either the first nested subsection or the end of the section. Returns NULL when
+// there is no enclosing section or no body text. The result is trimmed and capped
+// at CBM_MD_SECTION_BODY_MAX bytes (without splitting a UTF-8 sequence).
+static char *extract_markdown_section_body(CBMArena *a, TSNode heading, const char *source) {
+    TSNode parent = ts_node_parent(heading);
+    if (ts_node_is_null(parent) || strcmp(ts_node_type(parent), "section") != 0) {
+        return NULL;
+    }
+    uint32_t body_start = ts_node_end_byte(heading);
+    uint32_t body_end = ts_node_end_byte(parent);
+    // Stop at the first nested subsection — it gets its own Section node + body.
+    uint32_t cc = ts_node_child_count(parent);
+    for (uint32_t i = 0; i < cc; i++) {
+        TSNode ch = ts_node_child(parent, i);
+        if (ts_node_start_byte(ch) >= body_start && strcmp(ts_node_type(ch), "section") == 0) {
+            body_end = ts_node_start_byte(ch);
+            break;
+        }
+    }
+    // Trim surrounding whitespace/newlines (UTF-8 lead/continuation bytes are all
+    // >= 0x80, so a byte-wise <= ' ' test never cuts a multi-byte character).
+    while (body_start < body_end && (unsigned char)source[body_start] <= ' ') {
+        body_start++;
+    }
+    while (body_end > body_start && (unsigned char)source[body_end - 1] <= ' ') {
+        body_end--;
+    }
+    if (body_end <= body_start) {
+        return NULL;
+    }
+    size_t len = (size_t)(body_end - body_start);
+    if (len > CBM_MD_SECTION_BODY_MAX) {
+        len = CBM_MD_SECTION_BODY_MAX;
+        // Back off so the cap never splits a UTF-8 multi-byte sequence.
+        while (len > 0 && ((unsigned char)source[body_start + len] & 0xC0) == 0x80) {
+            len--;
+        }
+        if (len == 0) {
+            return NULL;
+        }
+    }
+    return cbm_arena_strndup(a, source + body_start, len);
+}
+
 // INI: extract section name from section node.
 static char *find_ini_section_name(CBMArena *a, TSNode node, const char *source) {
     uint32_t nc = ts_node_child_count(node);
@@ -3256,6 +3309,7 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
     CBMArena *a = ctx->arena;
     char *name = NULL;
     const char *label = "Class";
+    const char *docstring = NULL;
 
     if (ctx->language == CBM_LANG_TOML &&
         (strcmp(kind, "table") == 0 || strcmp(kind, "table_array_element") == 0)) {
@@ -3271,6 +3325,7 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
         // label rather than degrade it to match a test. The markdown repro asserts
         // "Class"; that assertion is the inaccurate side and is flagged for review.
         label = "Section";
+        docstring = extract_markdown_section_body(a, node, ctx->source); // #518
     } else if (ctx->language == CBM_LANG_HCL && strcmp(kind, "block") == 0) {
         name = find_hcl_block_name(a, node, ctx->source);
     } else {
@@ -3278,7 +3333,7 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
     }
 
     if (name && name[0]) {
-        push_simple_class_def(ctx, node, name, label);
+        push_simple_class_def(ctx, node, name, label, docstring);
     }
     return true;
 }
@@ -6058,6 +6113,174 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
     }
 }
 
+// ── Config module description promotion (#519) ──────────────────────────────
+// YAML/JSON metadata files (META.yaml, skill manifests, …) carry their most
+// search-relevant text in a top-level `description`/`summary`/`purpose` value.
+// That value is otherwise dropped — only the key becomes a Variable node — so
+// BM25 can't find a module by its description. We promote the value onto the
+// file's Module node docstring, which the FTS `body` column then indexes.
+
+// Case-insensitive ASCII equality (keys are conventionally lowercase, but accept
+// "Description"/"SUMMARY" too).
+static bool cfg_ci_eq(const char *x, const char *y) {
+    while (*x && *y) {
+        char cx = *x;
+        char cy = *y;
+        if (cx >= 'A' && cx <= 'Z') {
+            cx = (char)(cx + ('a' - 'A'));
+        }
+        if (cy >= 'A' && cy <= 'Z') {
+            cy = (char)(cy + ('a' - 'A'));
+        }
+        if (cx != cy) {
+            return false;
+        }
+        x++;
+        y++;
+    }
+    return *x == '\0' && *y == '\0';
+}
+
+static bool cfg_is_desc_key(const char *key) {
+    return key && (cfg_ci_eq(key, "description") || cfg_ci_eq(key, "summary") ||
+                   cfg_ci_eq(key, "purpose"));
+}
+
+// Trim surrounding whitespace and strip one layer of matching quotes, in place.
+static char *cfg_strip_quotes_trim(char *s) {
+    if (!s) {
+        return NULL;
+    }
+    while (*s && (unsigned char)*s <= ' ') {
+        s++;
+    }
+    size_t len = strlen(s);
+    while (len > 0 && (unsigned char)s[len - 1] <= ' ') {
+        s[--len] = '\0';
+    }
+    if (len >= 2 && ((s[0] == '"' && s[len - 1] == '"') || (s[0] == '\'' && s[len - 1] == '\''))) {
+        s[len - 1] = '\0';
+        s++;
+    }
+    return s;
+}
+
+// Copy at most `cap` bytes of `s`, never splitting a UTF-8 sequence; NULL if empty.
+static char *cfg_arena_capped(CBMArena *a, const char *s, size_t cap) {
+    if (!s || !s[0]) {
+        return NULL;
+    }
+    size_t len = strlen(s);
+    if (len > cap) {
+        len = cap;
+        while (len > 0 && ((unsigned char)s[len] & 0xC0) == 0x80) {
+            len--;
+        }
+        if (len == 0) {
+            return NULL;
+        }
+    }
+    return cbm_arena_strndup(a, s, len);
+}
+
+// Descend stream/document/block_node to the top-level YAML block_mapping.
+static TSNode cfg_find_yaml_mapping(TSNode root) {
+    TSNode none = {0};
+    TSNode cur = root;
+    for (int depth = 0; depth < 8; depth++) {
+        uint32_t n = ts_node_child_count(cur);
+        TSNode next = none;
+        bool have_next = false;
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode ch = ts_node_child(cur, i);
+            const char *ck = ts_node_type(ch);
+            if (strcmp(ck, "block_mapping") == 0) {
+                return ch;
+            }
+            if (!have_next && (strcmp(ck, "stream") == 0 || strcmp(ck, "document") == 0 ||
+                               strcmp(ck, "block_node") == 0)) {
+                next = ch;
+                have_next = true;
+            }
+        }
+        if (!have_next) {
+            break;
+        }
+        cur = next;
+    }
+    return none;
+}
+
+// Descend document wrappers to the top-level JSON object.
+static TSNode cfg_find_json_object(TSNode root) {
+    TSNode none = {0};
+    TSNode cur = root;
+    for (int depth = 0; depth < 6; depth++) {
+        if (strcmp(ts_node_type(cur), "object") == 0) {
+            return cur;
+        }
+        uint32_t n = ts_node_child_count(cur);
+        TSNode next = none;
+        bool have_next = false;
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode ch = ts_node_child(cur, i);
+            const char *ck = ts_node_type(ch);
+            if (strcmp(ck, "object") == 0) {
+                return ch;
+            }
+            if (!have_next && strcmp(ck, "document") == 0) {
+                next = ch;
+                have_next = true;
+            }
+        }
+        if (!have_next) {
+            break;
+        }
+        cur = next;
+    }
+    return none;
+}
+
+// Find a top-level description/summary/purpose value in a YAML or JSON file and
+// return it (trimmed, unquoted, capped) for promotion to the Module docstring.
+static const char *extract_config_module_description(CBMExtractCtx *ctx) {
+    if (ctx->language != CBM_LANG_YAML && ctx->language != CBM_LANG_JSON) {
+        return NULL;
+    }
+    CBMArena *a = ctx->arena;
+    TSNode mapping;
+    const char *pair_kind;
+    if (ctx->language == CBM_LANG_YAML) {
+        mapping = cfg_find_yaml_mapping(ctx->root);
+        pair_kind = "block_mapping_pair";
+    } else {
+        mapping = cfg_find_json_object(ctx->root);
+        pair_kind = "pair";
+    }
+    if (ts_node_is_null(mapping)) {
+        return NULL;
+    }
+    uint32_t n = ts_node_named_child_count(mapping);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode pair = ts_node_named_child(mapping, i);
+        if (strcmp(ts_node_type(pair), pair_kind) != 0) {
+            continue;
+        }
+        TSNode key = ts_node_child_by_field_name(pair, TS_FIELD("key"));
+        TSNode val = ts_node_child_by_field_name(pair, TS_FIELD("value"));
+        if (ts_node_is_null(key) || ts_node_is_null(val)) {
+            continue;
+        }
+        const char *key_txt = cfg_strip_quotes_trim(cbm_node_text(a, key, ctx->source));
+        if (!cfg_is_desc_key(key_txt)) {
+            continue;
+        }
+        char *val_txt = cfg_strip_quotes_trim(cbm_node_text(a, val, ctx->source));
+        return cfg_arena_capped(a, val_txt, CBM_MD_SECTION_BODY_MAX);
+    }
+    return NULL;
+}
+
 void cbm_extract_definitions(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec) {
@@ -6077,6 +6300,8 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
     mod.end_line = ts_node_end_point(ctx->root).row + TS_LINE_OFFSET;
     mod.is_exported = true;
     mod.is_test = ctx->result->is_test_file;
+    // Promote a YAML/JSON top-level description onto the Module for BM25 (#519).
+    mod.docstring = extract_config_module_description(ctx);
     cbm_defs_push(&ctx->result->defs, a, mod);
 
     // Walk AST for function/class definitions
