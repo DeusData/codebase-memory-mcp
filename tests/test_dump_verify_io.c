@@ -16,6 +16,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <signal.h>
 #include <store/store.h>
 #ifndef _WIN32
 #include <sys/wait.h>
@@ -153,7 +154,18 @@ TEST(dump_verify_io_fork_crash_uncommitted_discarded) {
     }
 
     int status = 0;
-    ASSERT_TRUE(waitpid(pid, &status, 0) == pid);
+    /* Robust wait: leaks --atExit on macOS temporarily SIGSTOPs forked children
+     * during heap inspection; WUNTRACED lets us detect the stop and SIGCONT so
+     * the child proceeds to _exit(). Mirrors test_store_bulk.c (see b336466). */
+    for (;;) {
+        pid_t r = waitpid(pid, &status, WUNTRACED);
+        ASSERT_TRUE(r == pid);
+        if (WIFSTOPPED(status)) {
+            kill(pid, SIGCONT);
+            continue;
+        }
+        break;
+    }
 
     /* WAL recovery discards the child's uncommitted frames: only the baseline
      * survives, so persisted (60) falls far short of the dump intent (5060). */
