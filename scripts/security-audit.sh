@@ -59,16 +59,21 @@ while IFS= read -r file; do
 done < <(find "$ROOT/src" -name '*.c' -type f | sort)
 
 # ── 1b. Raw network calls (must not exist) ──────────────────────
+#
+# The graph-UI HTTP server (src/ui/httpd.c) is the one component that owns a
+# listening socket. It is first-party, binds 127.0.0.1 only, and is audited
+# separately by scripts/security-ui.sh (binding + CORS checks), so it is
+# exempt from this scan. No other source file may make raw network calls.
 
 echo ""
 echo "--- Scanning for raw network calls (must not exist) ---"
 
 NETWORK_FUNCS='[^a-z_]connect\(|[^a-z_]socket\(|[^a-z_]sendto\('
-if grep -rn -E "$NETWORK_FUNCS" "$ROOT/src/" --include='*.c' 2>/dev/null | grep -v '^\s*//' | grep -v '^\s*\*' | grep -v 'test'; then
+if grep -rn -E "$NETWORK_FUNCS" "$ROOT/src/" --include='*.c' 2>/dev/null | grep -v '^\s*//' | grep -v '^\s*\*' | grep -v 'test' | grep -v 'src/ui/httpd.c'; then
     echo "BLOCKED: Raw network calls found in src/."
     fail
 else
-    echo "OK: No raw network calls found."
+    echo "OK: No raw network calls outside the graph-UI server."
 fi
 
 # ── 2. Hardcoded URLs in string literals ─────────────────────────
@@ -170,8 +175,8 @@ while IFS= read -r match; do
     file=$(echo "$match" | cut -d: -f1)
     relfile="${file#"$ROOT/"}"
     case "$relfile" in
-        src/cli/cli.c|src/store/store.c|src/pipeline/*.c|src/foundation/log.c|src/ui/http_server.c|src/ui/config.c|src/mcp/mcp.c)
-            ;; # Known safe
+        src/cli/cli.c|src/store/store.c|src/pipeline/*.c|src/foundation/log.c|src/foundation/diagnostics.c|src/ui/http_server.c|src/ui/config.c|src/mcp/mcp.c)
+            ;; # Known safe (diagnostics.c: atomic .tmp+rename metrics dump to configured path)
         *)
             echo "REVIEW: ${match}"
             echo "  -> Unexpected fopen(\"w\") in ${relfile}"
@@ -238,10 +243,14 @@ if [ -f "$MCP_FILE" ]; then
     # - get_code_snippet: reads source via read_file_lines (path-contained)
     # - manage_adr: reads/writes ADR files
     # - detect_changes: reads git diff output
+    # - update check: reads the version-check HTTP response (fixed buffer)
+    # - HTTP transport: reads the incoming request body (content-length bound)
     # Count fopen/fread calls and compare against expected
     FOPEN_COUNT=$(grep -c 'fopen\|fread\|read_file' "$MCP_FILE" 2>/dev/null || echo "0")
-    # Known count as of v0.5.5: update this when legitimate reads are added
-    EXPECTED_MAX=12
+    # Update this when legitimate reads are added. 13 reads audited as of the
+    # search/ADR/Windows-support commits — all path-contained or transport
+    # reads, no new exfiltration surface.
+    EXPECTED_MAX=13
     if [ "$FOPEN_COUNT" -gt "$EXPECTED_MAX" ]; then
         echo "REVIEW: src/mcp/mcp.c has $FOPEN_COUNT file read operations (expected max $EXPECTED_MAX)"
         echo "  New file reads in MCP tool handlers must be reviewed for data exfiltration risk."

@@ -7,6 +7,7 @@
  *   - Path containment (realpath prevents directory traversal)
  */
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <store/store.h>
 #include <cypher/cypher.h>
 #include "../src/foundation/str_util.h"
@@ -71,6 +72,24 @@ TEST(shell_rejects_carriage_return) {
 
 TEST(shell_rejects_null) {
     ASSERT_FALSE(cbm_validate_shell_arg(NULL));
+    PASS();
+}
+
+TEST(shell_rejects_double_quote) {
+    /* On Windows, the search code path wraps args in cmd.exe-level
+     * "powershell -Command \"...'%s'...\"". A " in the input would close
+     * the cmd.exe outer quote. Block unconditionally. */
+    ASSERT_FALSE(cbm_validate_shell_arg("foo\"bar"));
+    PASS();
+}
+
+TEST(shell_rejects_redirect_out) {
+    ASSERT_FALSE(cbm_validate_shell_arg("foo>out.txt"));
+    PASS();
+}
+
+TEST(shell_rejects_redirect_in) {
+    ASSERT_FALSE(cbm_validate_shell_arg("foo<in.txt"));
     PASS();
 }
 
@@ -180,8 +199,8 @@ TEST(sqlite_allows_normal_queries) {
     cbm_store_upsert_node(s, &n);
 
     cbm_cypher_result_t r = {0};
-    int rc =
-        cbm_cypher_execute(s, "MATCH (f:Function) WHERE f.name = \"hello\" RETURN f", "test", 0, &r);
+    int rc = cbm_cypher_execute(s, "MATCH (f:Function) WHERE f.name = \"hello\" RETURN f", "test",
+                                0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 1);
 
@@ -225,8 +244,8 @@ TEST(cypher_rejects_union_injection) {
     cbm_store_upsert_project(s, "test", "/tmp/test");
 
     cbm_cypher_result_t r = {0};
-    int rc = cbm_cypher_execute(
-        s, "MATCH (n) RETURN n UNION SELECT sql FROM sqlite_master", "test", 0, &r);
+    int rc = cbm_cypher_execute(s, "MATCH (n) RETURN n UNION SELECT sql FROM sqlite_master", "test",
+                                0, &r);
     /* Cypher parser should reject UNION — it's not valid Cypher */
     ASSERT_NEQ(rc, 0);
     cbm_cypher_result_free(&r);
@@ -262,9 +281,8 @@ TEST(path_traversal_blocked) {
         if (realpath(traversal, real_file)) {
             /* Verify the resolved path does NOT start with root */
             size_t root_len = strlen(real_root);
-            int contained =
-                (strncmp(real_file, real_root, root_len) == 0 &&
-                 (real_file[root_len] == '/' || real_file[root_len] == '\0'));
+            int contained = (strncmp(real_file, real_root, root_len) == 0 &&
+                             (real_file[root_len] == '/' || real_file[root_len] == '\0'));
             ASSERT_FALSE(contained);
         }
         /* If realpath fails, the file doesn't exist — also safe */
@@ -281,9 +299,8 @@ TEST(path_within_root_allowed) {
     const char *root = "/tmp";
     if (realpath(root, real_root) && realpath("/tmp", real_file)) {
         size_t root_len = strlen(real_root);
-        int contained =
-            (strncmp(real_file, real_root, root_len) == 0 &&
-             (real_file[root_len] == '/' || real_file[root_len] == '\0'));
+        int contained = (strncmp(real_file, real_root, root_len) == 0 &&
+                         (real_file[root_len] == '/' || real_file[root_len] == '\0'));
         ASSERT_TRUE(contained);
     }
     PASS();
@@ -365,6 +382,9 @@ SUITE(security) {
     RUN_TEST(shell_rejects_newline);
     RUN_TEST(shell_rejects_carriage_return);
     RUN_TEST(shell_rejects_null);
+    RUN_TEST(shell_rejects_double_quote);
+    RUN_TEST(shell_rejects_redirect_out);
+    RUN_TEST(shell_rejects_redirect_in);
     RUN_TEST(shell_accepts_clean_path);
     RUN_TEST(shell_accepts_spaces);
     RUN_TEST(shell_accepts_dots_dashes);

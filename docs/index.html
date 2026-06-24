@@ -3,24 +3,190 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>codebase-memory-mcp — High-Performance Code Intelligence for AI Agents</title>
-    <meta name="description" content="MCP server that indexes codebases into a persistent knowledge graph. 64 languages, 120x fewer tokens, 3-minute Linux kernel indexing. Single static binary. Works with Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode.">
-    <meta name="keywords" content="MCP server, code analysis, knowledge graph, tree-sitter, Claude Code, Codex, Cursor, Windsurf, Gemini CLI, VS Code, Zed, OpenCode, KiloCode, developer tools, code exploration, token reduction, code intelligence">
+    <title>codebase-memory-mcp — Code Intelligence Knowledge Graph for AI Coding Agents</title>
+    <meta name="description" content="codebase-memory-mcp is an open-source MCP server that indexes any codebase into a persistent knowledge graph so AI coding agents answer structural questions with ~120x fewer tokens. 158 languages, Hybrid LSP type resolution, local semantic vector search, code-clone detection, sub-1ms queries, Linux kernel indexed in 3 minutes. Single static C binary, zero dependencies. Works with 11 agents including Claude Code, Codex CLI, Gemini CLI, Cursor, and Zed.">
+    <meta name="keywords" content="MCP server, code intelligence, knowledge graph, tree-sitter, Hybrid LSP, semantic code search, code embeddings, code clone detection, cross-repo analysis, data-flow analysis, Claude Code, Codex CLI, Gemini CLI, Cursor, Zed, code exploration, token reduction, call graph, dead code detection">
+    <meta name="author" content="DeusData">
+    <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+    <meta name="theme-color" content="#0d1117">
 
     <!-- Open Graph -->
-    <meta property="og:title" content="codebase-memory-mcp — High-Performance Code Intelligence for AI Agents">
-    <meta property="og:description" content="120x fewer tokens for AI code exploration. 64 languages, sub-ms queries, 3-min Linux kernel indexing. Single static binary.">
+    <meta property="og:title" content="codebase-memory-mcp — Code Intelligence Knowledge Graph for AI Coding Agents">
+    <meta property="og:description" content="Index any codebase into a persistent knowledge graph. AI agents answer structural questions with ~120x fewer tokens. 158 languages, Hybrid LSP, sub-1ms queries, single static C binary.">
     <meta property="og:type" content="website">
-    <meta property="og:url" content="https://deusdata.github.io/codebase-memory-mcp">
+    <meta property="og:url" content="https://deusdata.github.io/codebase-memory-mcp/">
     <meta property="og:image" content="https://deusdata.github.io/codebase-memory-mcp/graph-ui-screenshot.png">
+    <meta property="og:image:width" content="1538">
+    <meta property="og:image:height" content="932">
+    <meta property="og:image:alt" content="3D knowledge-graph visualization of a codebase with thousands of nodes and edges">
+    <meta property="og:site_name" content="codebase-memory-mcp">
 
     <!-- Twitter Card -->
     <meta name="twitter:card" content="summary_large_image">
-    <meta name="twitter:title" content="codebase-memory-mcp — High-Performance Code Intelligence for AI Agents">
-    <meta name="twitter:description" content="120x fewer tokens for AI code exploration. 64 languages, sub-ms queries, 3-min Linux kernel indexing.">
+    <meta name="twitter:title" content="codebase-memory-mcp — Code Intelligence for AI Coding Agents">
+    <meta name="twitter:description" content="Index any codebase into a knowledge graph. ~120x fewer tokens for AI code exploration. 158 languages, Hybrid LSP, sub-1ms queries, single static C binary.">
     <meta name="twitter:image" content="https://deusdata.github.io/codebase-memory-mcp/graph-ui-screenshot.png">
 
-    <link rel="canonical" href="https://deusdata.github.io/codebase-memory-mcp">
+    <link rel="canonical" href="https://deusdata.github.io/codebase-memory-mcp/">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230d1117'/%3E%3Cg stroke='%2358a6ff' stroke-width='2'%3E%3Cline x1='9' y1='9' x2='23' y2='16'/%3E%3Cline x1='23' y1='16' x2='10' y2='24'/%3E%3Cline x1='9' y1='9' x2='10' y2='24'/%3E%3C/g%3E%3Cg fill='%2358a6ff'%3E%3Ccircle cx='9' cy='9' r='3.5'/%3E%3Ccircle cx='23' cy='16' r='3.5'/%3E%3Ccircle cx='10' cy='24' r='3.5'/%3E%3C/g%3E%3C/svg%3E">
+
+    <!-- Structured data: SoftwareApplication (the tool) -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      "name": "codebase-memory-mcp",
+      "alternateName": "Codebase Memory MCP",
+      "applicationCategory": "DeveloperApplication",
+      "applicationSubCategory": "Model Context Protocol (MCP) server",
+      "operatingSystem": "macOS, Linux, Windows",
+      "softwareVersion": "0.8.1",
+      "description": "An open-source MCP server that indexes a codebase into a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links, so AI coding agents answer structural questions with roughly 120x fewer tokens than file-by-file search. Parses 158 languages via tree-sitter with Hybrid LSP semantic type resolution for 9 language families. Ships as a single static C binary with zero runtime dependencies.",
+      "url": "https://deusdata.github.io/codebase-memory-mcp/",
+      "downloadUrl": "https://github.com/DeusData/codebase-memory-mcp/releases/latest",
+      "codeRepository": "https://github.com/DeusData/codebase-memory-mcp",
+      "programmingLanguage": "C",
+      "license": "https://opensource.org/licenses/MIT",
+      "isAccessibleForFree": true,
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "USD"
+      },
+      "featureList": [
+        "Indexes 158 programming languages via vendored tree-sitter grammars",
+        "Hybrid LSP semantic type resolution for Python, TypeScript/JavaScript, PHP, C#, Go, C/C++, Java, Kotlin, and Rust",
+        "14 MCP tools for structural search, call-path tracing, and Cypher graph queries",
+        "Semantic vector code search via bundled nomic-embed-code embeddings (no API key, fully local)",
+        "Semantic graph edges (SEMANTICALLY_RELATED) and near-clone detection (SIMILAR_TO, MinHash + LSH)",
+        "Cross-service linking for HTTP, gRPC, GraphQL, tRPC, and pub/sub channels with confidence scoring",
+        "Cross-repo intelligence with CROSS_* edges across multiple indexed repositories",
+        "Data-flow tracing with argument-to-parameter mapping",
+        "Change-impact analysis mapping git diffs to affected symbols and blast radius",
+        "Architecture Decision Record (ADR) persistence across sessions",
+        "Dead-code detection with entry-point filtering",
+        "Infrastructure-as-code indexing for Dockerfiles, Kubernetes, and Kustomize",
+        "Built-in 3D graph visualization UI",
+        "Auto-sync background watcher for incremental re-indexing",
+        "One-command install for 11 AI coding agents"
+      ],
+      "author": {
+        "@type": "Organization",
+        "name": "DeusData",
+        "url": "https://github.com/DeusData"
+      },
+      "citation": {
+        "@type": "ScholarlyArticle",
+        "name": "Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP",
+        "identifier": "arXiv:2603.27277",
+        "url": "https://arxiv.org/abs/2603.27277"
+      }
+    }
+    </script>
+
+    <!-- Structured data: Organization + WebSite identity -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": "Organization",
+          "@id": "https://deusdata.github.io/codebase-memory-mcp/#org",
+          "name": "DeusData",
+          "url": "https://github.com/DeusData",
+          "sameAs": ["https://github.com/DeusData/codebase-memory-mcp"]
+        },
+        {
+          "@type": "WebSite",
+          "@id": "https://deusdata.github.io/codebase-memory-mcp/#website",
+          "url": "https://deusdata.github.io/codebase-memory-mcp/",
+          "name": "codebase-memory-mcp",
+          "publisher": { "@id": "https://deusdata.github.io/codebase-memory-mcp/#org" }
+        },
+        {
+          "@type": "BreadcrumbList",
+          "itemListElement": [
+            { "@type": "ListItem", "position": 1, "name": "Home", "item": "https://deusdata.github.io/codebase-memory-mcp/" },
+            { "@type": "ListItem", "position": 2, "name": "GitHub", "item": "https://github.com/DeusData/codebase-memory-mcp" }
+          ]
+        }
+      ]
+    }
+    </script>
+
+    <!-- Structured data: FAQPage (machine-readable Q&A for answer engines) -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "What is codebase-memory-mcp?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "codebase-memory-mcp is an open-source Model Context Protocol (MCP) server that indexes a codebase into a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. AI coding agents query that graph instead of reading files one by one, answering structural questions with roughly 120x fewer tokens. It parses 158 languages and ships as a single static C binary with no runtime dependencies."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How does codebase-memory-mcp reduce token usage?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "AI agents normally explore code through repeated grep-then-read cycles, which burn large numbers of tokens. codebase-memory-mcp answers the same structural questions from a precomputed graph. In a five-query benchmark it used about 3,400 tokens versus about 412,000 tokens for file-by-file search — a roughly 120x reduction."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Which programming languages does codebase-memory-mcp support?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It supports 158 languages through vendored tree-sitter grammars compiled into the binary, including Python, Go, JavaScript, TypeScript, Rust, Java, C, C++, C#, PHP, Ruby, Kotlin, Swift, and many more. Nine language families — Python, TypeScript/JavaScript, PHP, C#, Go, C/C++, Java, Kotlin, and Rust — additionally get Hybrid LSP semantic type resolution."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What is Hybrid LSP?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Hybrid LSP is a lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers (tsserver, pyright, gopls, Roslyn), embedded directly into the binary. It runs alongside tree-sitter to resolve imports, generics, inheritance, and stdlib types — so call edges in the graph mirror what an IDE 'Go to Definition' would resolve, with no language-server process or per-project setup."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Which AI coding agents work with codebase-memory-mcp?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "A single install command configures 11 agents: Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, OpenClaw, and Kiro. Any MCP-compatible client can use the server."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does codebase-memory-mcp send my code anywhere?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. All indexing and querying happen 100% locally on your machine. There is no embedded LLM and no API key — your MCP client acts as the intelligence layer. Release binaries are signed, checksummed, and scanned by 70+ antivirus engines."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does codebase-memory-mcp support semantic or natural-language code search?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Yes. Alongside structural and BM25 full-text search, it offers semantic vector search over the whole graph via the search_graph tool's semantic_query parameter. It is powered by nomic-embed-code embeddings compiled directly into the binary (768-dimensional), so it bridges vocabulary gaps — finding 'publish' when you search 'send' — with no API key, no Ollama, and no Docker. The indexer also generates SEMANTICALLY_RELATED edges between conceptually similar functions and SIMILAR_TO edges for near-duplicate and clone detection."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Can codebase-memory-mcp detect duplicate or near-clone code?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Yes. During indexing it builds SIMILAR_TO edges using MinHash plus LSH with Jaccard scoring, surfacing near-duplicate and copy-pasted functions across the codebase. Combined with SEMANTICALLY_RELATED edges, this makes refactoring candidates and redundant implementations queryable through the graph."
+          }
+        }
+      ]
+    }
+    </script>
 
     <style>
         :root {
@@ -41,25 +207,48 @@
             color: var(--text);
             line-height: 1.6;
         }
+        a { color: var(--accent); }
         .container { max-width: 960px; margin: 0 auto; padding: 0 24px; }
+        .muted { color: var(--text-secondary); }
+        cite { color: var(--text-secondary); font-style: normal; font-size: 0.8rem; }
+        cite a { color: var(--text-secondary); }
+
+        /* Nav */
+        nav {
+            border-bottom: 1px solid var(--border);
+            position: sticky;
+            top: 0;
+            background: rgba(13,17,23,0.85);
+            backdrop-filter: blur(8px);
+            z-index: 10;
+        }
+        nav .container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 56px;
+        }
+        nav .links a {
+            text-decoration: none;
+            color: var(--text-secondary);
+            margin-left: 20px;
+            font-size: 0.9rem;
+        }
+        nav .links a:hover { color: var(--text); }
+        nav .links a:first-child { margin-left: 0; }
+        nav .links a.nav-star { color: var(--green); font-weight: 600; }
+        nav .links a.nav-star:hover { color: var(--accent-hover); }
+        @media (max-width: 640px) { nav .links a:not(.nav-cta) { display: none; } }
 
         /* Hero */
-        .hero {
-            padding: 80px 0 40px;
-            text-align: center;
-        }
-        .hero h1 {
-            font-size: 2.5rem;
-            font-weight: 700;
-            margin-bottom: 16px;
-        }
+        .hero { padding: 72px 0 32px; text-align: center; }
+        .hero h1 { font-size: 2.5rem; font-weight: 700; margin-bottom: 4px; }
+        .hero .by-line { color: #6e7681; font-size: 0.95rem; margin-bottom: 24px; }
         .hero .tagline {
-            font-size: 1.25rem;
+            font-size: 1.2rem;
             color: var(--text-secondary);
-            margin-bottom: 32px;
-            max-width: 700px;
-            margin-left: auto;
-            margin-right: auto;
+            margin: 0 auto 32px;
+            max-width: 720px;
         }
         .hero .stat {
             display: inline-block;
@@ -69,18 +258,9 @@
             padding: 16px 24px;
             margin: 8px;
         }
-        .hero .stat .number {
-            font-size: 2rem;
-            font-weight: 700;
-            color: var(--accent);
-        }
-        .hero .stat .label {
-            font-size: 0.875rem;
-            color: var(--text-secondary);
-        }
-        .cta-buttons {
-            margin-top: 32px;
-        }
+        .hero .stat .number { font-size: 2rem; font-weight: 700; color: var(--accent); }
+        .hero .stat .label { font-size: 0.875rem; color: var(--text-secondary); }
+        .cta-buttons { margin-top: 32px; }
         .cta-buttons a {
             display: inline-block;
             padding: 12px 24px;
@@ -89,42 +269,59 @@
             font-weight: 600;
             margin: 4px;
         }
-        .cta-primary {
-            background: var(--accent);
-            color: #0d1117;
-        }
+        .cta-primary { background: var(--accent); color: #0d1117; }
         .cta-primary:hover { background: var(--accent-hover); }
-        .cta-secondary {
-            border: 1px solid var(--border);
-            color: var(--text);
-        }
+        .cta-secondary { border: 1px solid var(--border); color: var(--text); }
         .cta-secondary:hover { border-color: var(--text-secondary); }
 
         /* Screenshot */
-        .screenshot {
-            margin: 40px 0;
-            text-align: center;
-        }
+        .screenshot { margin: 40px 0; text-align: center; }
         .screenshot img {
             max-width: 100%;
+            height: auto;
             border-radius: 12px;
             border: 1px solid var(--border);
             box-shadow: 0 8px 32px rgba(0,0,0,0.4);
         }
-        .screenshot .caption {
-            margin-top: 12px;
-            font-size: 0.875rem;
-            color: var(--text-secondary);
+        .screenshot .caption { margin-top: 12px; font-size: 0.875rem; color: var(--text-secondary); }
+
+        /* Research callout */
+        .research {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            flex-wrap: wrap;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-left: 3px solid var(--accent);
+            border-radius: 8px;
+            padding: 20px 24px;
+            margin: 8px 0 0;
         }
+        .research .arxiv-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            flex-shrink: 0;
+            font-family: 'SF Mono', monospace;
+            font-size: 0.8rem;
+            font-weight: 700;
+            color: #b31b1b;
+            background: #fff;
+            border-radius: 6px;
+            padding: 8px 12px;
+            text-decoration: none;
+        }
+        .research p { font-size: 0.92rem; margin: 0; }
+        .research .label { color: var(--accent); font-weight: 700; }
 
         /* Sections */
-        section { padding: 60px 0; }
-        section h2 {
-            font-size: 1.75rem;
-            margin-bottom: 24px;
-        }
+        section { padding: 56px 0; border-top: 1px solid var(--border); }
+        section h2 { font-size: 1.75rem; margin-bottom: 8px; scroll-margin-top: 72px; }
+        section .lead { font-size: 1.05rem; margin-bottom: 24px; }
+        section h3 { font-size: 1.1rem; margin: 24px 0 8px; }
 
-        /* Install */
+        /* Code / install */
         .install-block {
             background: var(--surface);
             border: 1px solid var(--border);
@@ -137,18 +334,18 @@
         }
         .install-block .comment { color: var(--text-secondary); }
         .install-block .cmd { color: var(--green); }
+        code {
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 1px 6px;
+            font-size: 0.85em;
+        }
 
-        /* Comparison table */
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin: 16px 0;
-        }
-        th, td {
-            padding: 10px 16px;
-            text-align: left;
-            border-bottom: 1px solid var(--border);
-        }
+        /* Tables */
+        table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+        th, td { padding: 10px 16px; text-align: left; border-bottom: 1px solid var(--border); }
         th {
             background: var(--surface);
             font-weight: 600;
@@ -159,7 +356,10 @@
         }
         td { font-size: 0.9rem; }
         .win { color: var(--green); font-weight: 600; }
-        .lose { color: var(--text-secondary); }
+        .benchmark-table td:nth-child(2), .benchmark-table td:nth-child(3), .benchmark-table td:nth-child(4) {
+            text-align: right; font-family: 'SF Mono', monospace; font-size: 0.85rem;
+        }
+        .benchmark-table th:nth-child(2), .benchmark-table th:nth-child(3), .benchmark-table th:nth-child(4) { text-align: right; }
 
         /* Features grid */
         .features {
@@ -174,28 +374,35 @@
             border-radius: 8px;
             padding: 24px;
         }
-        .feature h3 {
-            font-size: 1rem;
-            margin-bottom: 8px;
-        }
-        .feature p {
-            font-size: 0.875rem;
-            color: var(--text-secondary);
-        }
+        .feature h3 { font-size: 1rem; margin: 0 0 8px; }
+        .feature p { font-size: 0.875rem; color: var(--text-secondary); }
 
-        /* Benchmark */
-        .benchmark-table td:nth-child(2),
-        .benchmark-table td:nth-child(3),
-        .benchmark-table td:nth-child(4) {
-            text-align: right;
-            font-family: 'SF Mono', monospace;
-            font-size: 0.85rem;
+        /* Hybrid LSP table */
+        .lsp-table td:first-child { font-weight: 600; white-space: nowrap; }
+        .lsp-table td { vertical-align: top; }
+
+        /* Releases */
+        .release {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px 20px;
+            margin: 12px 0;
         }
-        .benchmark-table th:nth-child(2),
-        .benchmark-table th:nth-child(3),
-        .benchmark-table th:nth-child(4) {
-            text-align: right;
-        }
+        .release-head { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+        .release-tag { font-weight: 700; font-size: 1.05rem; }
+        .release-date { color: var(--text-secondary); font-size: 0.85rem; }
+        .release details { margin-top: 10px; }
+        .release summary { cursor: pointer; color: var(--accent); font-size: 0.9rem; }
+        .release-body { margin-top: 12px; font-size: 0.875rem; color: var(--text-secondary); }
+        .release-body h4, .release-body h5, .release-body h6 { font-size: 0.95rem; color: var(--text); margin: 12px 0 6px; }
+        .release-body ul { margin: 6px 0 6px 20px; }
+        .release-body code { font-size: 0.8em; }
+        .skeleton { color: var(--text-secondary); font-size: 0.9rem; }
+
+        /* FAQ */
+        .faq h3 { font-size: 1.05rem; margin: 24px 0 6px; }
+        .faq p { color: var(--text-secondary); margin-bottom: 8px; }
 
         /* Footer */
         footer {
@@ -207,7 +414,6 @@
         }
         footer a { color: var(--accent); text-decoration: none; }
 
-        /* Responsive */
         @media (max-width: 640px) {
             .hero h1 { font-size: 1.75rem; }
             .hero .stat { display: block; margin: 8px 0; }
@@ -216,210 +422,363 @@
 </head>
 <body>
 
-<div class="container">
-    <section class="hero">
+<nav>
+    <div class="container">
+        <span class="links">
+            <a href="#what-is-it">What is it</a>
+            <a href="#install">Install</a>
+            <a href="#hybrid-lsp">Hybrid LSP</a>
+            <a href="#semantic-search">Semantic search</a>
+            <a href="#releases">Releases</a>
+            <a href="#faq">FAQ</a>
+            <a class="nav-cta nav-star" href="https://github.com/DeusData/codebase-memory-mcp" title="Star codebase-memory-mcp on GitHub" aria-label="Star this project on GitHub">★ Star on GitHub</a>
+        </span>
+    </div>
+</nav>
+
+<main class="container">
+    <header class="hero">
         <h1>codebase-memory-mcp</h1>
+        <p class="by-line">by DeusData</p>
         <p class="tagline">
-            The fastest and most efficient code intelligence engine for AI coding agents. Full-indexes an average repo in seconds,
-            the Linux kernel in 3 minutes. Tree-sitter + LSP hybrid parsing (Go, C, C++ — more coming). Single static binary — download, install, done.
+            The fastest, most efficient code intelligence engine for AI coding agents. It indexes any
+            repository into a persistent knowledge graph — full-indexing an average repo in seconds and the
+            Linux kernel in 3 minutes — so your agent answers structural questions with ~120x fewer tokens.
+            Tree-sitter parsing across 158 languages, Hybrid LSP type resolution, single static C binary.
         </p>
         <div>
-            <div class="stat">
-                <div class="number">120x</div>
-                <div class="label">fewer tokens</div>
-            </div>
-            <div class="stat">
-                <div class="number">64</div>
-                <div class="label">languages</div>
-            </div>
-            <div class="stat">
-                <div class="number">3 min</div>
-                <div class="label">Linux kernel index</div>
-            </div>
-            <div class="stat">
-                <div class="number">8</div>
-                <div class="label">agents supported</div>
-            </div>
+            <div class="stat"><div class="number">~120x</div><div class="label">fewer tokens</div></div>
+            <div class="stat"><div class="number">158</div><div class="label">languages</div></div>
+            <div class="stat"><div class="number">3 min</div><div class="label">Linux kernel index</div></div>
+            <div class="stat"><div class="number">11</div><div class="label">agents supported</div></div>
         </div>
         <div class="cta-buttons">
             <a href="https://github.com/DeusData/codebase-memory-mcp" class="cta-primary">View on GitHub</a>
-            <a href="https://github.com/DeusData/codebase-memory-mcp/releases/latest" class="cta-secondary">Download Latest Release</a>
+            <a href="https://github.com/DeusData/codebase-memory-mcp/releases/latest" class="cta-secondary">Download latest release</a>
         </div>
-    </section>
+    </header>
 
     <div class="screenshot">
-        <img src="graph-ui-screenshot.png" alt="3D graph visualization of the codebase-memory-mcp knowledge graph showing 23,827 nodes and 51,526 edges">
-        <p class="caption">Built-in 3D graph visualization (UI variant) — explore your knowledge graph at localhost:9749</p>
+        <img src="graph-ui-screenshot.png" width="1538" height="932" loading="lazy" decoding="async"
+             alt="3D knowledge-graph visualization of the codebase-memory-mcp graph showing thousands of nodes and edges">
+        <p class="caption">Built-in 3D graph visualization (UI variant) — explore your knowledge graph at <code>localhost:9749</code>.</p>
     </div>
 
-    <section>
-        <h2>Install in 3 steps</h2>
+    <aside class="research" aria-label="Research">
+        <a class="arxiv-badge" href="https://arxiv.org/abs/2603.27277" rel="noopener">arXiv:2603.27277</a>
+        <p>
+            <span class="label">Research preprint.</span>
+            The design and benchmarks are described in the preprint
+            <a href="https://arxiv.org/abs/2603.27277"><em>Codebase-Memory: Tree-Sitter-Based Knowledge Graphs
+            for LLM Code Exploration via MCP</em></a>. Evaluated across 31 real-world repositories:
+            <strong>83% answer quality, 10× fewer tokens, and 2.1× fewer tool calls</strong> versus
+            file-by-file exploration.
+        </p>
+    </aside>
+
+    <section id="what-is-it">
+        <h2>What is codebase-memory-mcp?</h2>
+        <p class="lead">
+            codebase-memory-mcp is an open-source <a href="https://modelcontextprotocol.io/">Model Context
+            Protocol (MCP)</a> server that indexes a codebase into a persistent knowledge graph of functions,
+            classes, call chains, HTTP routes, and cross-service links. Instead of reading files one at a time,
+            an AI coding agent queries the graph — answering structural questions with roughly 120x fewer
+            tokens. It parses 158 languages and ships as a single static C binary with zero runtime dependencies.
+        </p>
+        <p class="muted">
+            It is a structural-analysis backend, not a chatbot: there is no embedded LLM and no API key. Your
+            MCP client (Claude Code, or any MCP-compatible agent) is the intelligence layer; codebase-memory-mcp
+            builds and serves the graph. All processing happens locally — your code never leaves your machine.
+        </p>
+    </section>
+
+    <section id="problem">
+        <h2>Why do AI agents waste tokens exploring code?</h2>
+        <p class="lead">
+            AI coding agents explore codebases by reading files one at a time. Every structural question
+            triggers a cascade of grep → read file → grep again → read more files. The cost compounds fast.
+        </p>
+        <p style="margin-bottom: 16px;">
+            Across five structural questions about a real codebase, file-by-file search consumed
+            <strong style="color: var(--red);">~412,000 tokens</strong>; the same questions answered from the
+            knowledge graph took <strong style="color: var(--green);">~3,400 tokens</strong> — a ~120x reduction.
+        </p>
+        <p class="muted">
+            The win is not about fitting the context window. It is cost (at $3–15 per million tokens, exploration
+            adds up), latency (sub-millisecond graph queries versus seconds of file reading), and accuracy
+            (less noise means better answers and no "lost in the middle" problem).
+        </p>
+        <p><cite>Source: project benchmark, 5 structural queries — see the
+            <a href="https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/BENCHMARK.md">full benchmark report</a>.</cite></p>
+    </section>
+
+    <section id="install">
+        <h2>How do I install codebase-memory-mcp?</h2>
+        <p class="lead">
+            Install with a single command, then tell your agent to index the project. It is a single static C binary for
+            macOS, Linux, and Windows — no Docker, no runtime dependencies, no API key.
+        </p>
         <div class="install-block">
-            <span class="comment"># 1. Download for your platform (standard or ui variant)</span><br>
-            <span class="cmd">tar xzf codebase-memory-mcp-*.tar.gz</span><br>
-            <span class="cmd">mv codebase-memory-mcp ~/.local/bin/</span><br><br>
-            <span class="comment"># 2. Auto-configure all detected agents</span><br>
-            <span class="cmd">codebase-memory-mcp install</span><br><br>
+            <span class="comment"># 1. One-line install (macOS / Linux). Add --ui for the 3D graph UI.</span><br>
+            <span class="cmd">curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash</span><br><br>
+            <span class="comment"># 2. The installer auto-detects and configures every installed agent.</span><br><br>
             <span class="comment"># 3. Restart your agent, then say:</span><br>
             <span class="cmd">"Index this project"</span>
         </div>
-        <p style="color: var(--text-secondary); font-size: 0.9rem;">
-            Static binary for macOS, Linux, and Windows — no Docker, no runtime dependencies. One install command
-            configures all 8 agents: Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode.
+        <p class="muted">
+            One command configures all 11 supported agents: Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,
+            Antigravity, Aider, KiloCode, VS Code, OpenClaw, and Kiro — with MCP entries, instruction files, and
+            pre-tool hooks for each. Windows users run <code>install.ps1</code>. Also available via
+            <code>npm</code>, <code>pip</code>, Homebrew, Scoop, Winget, Chocolatey, AUR, and <code>go install</code>.
         </p>
     </section>
 
-    <section>
-        <h2>The problem</h2>
-        <p style="margin-bottom: 16px;">
-            AI coding agents explore codebases by reading files one at a time. Every structural question
-            triggers a cascade of grep &rarr; read file &rarr; grep again &rarr; read more files.
+    <section id="hybrid-lsp">
+        <h2>What is Hybrid LSP?</h2>
+        <p class="lead">
+            Hybrid LSP is semantic type resolution beyond tree-sitter. Tree-sitter alone produces a syntactic
+            AST — it handles naming, structure, and call sites, but it cannot tell that
+            <code>user.profile.display_name()</code> resolves to <code>Profile.display_name</code> declared
+            three modules away, because it does not track imports, generics, inheritance, or stdlib types.
         </p>
         <p style="margin-bottom: 16px;">
-            Five structural questions about a real codebase:
-            <strong style="color: var(--red);">~412,000 tokens</strong> via file-by-file search.
-            <strong style="color: var(--green);">~3,400 tokens</strong> via knowledge graph queries.
+            codebase-memory-mcp ships a <strong>lightweight C implementation of language type-resolution
+            algorithms, structurally inspired by and compatible with major language servers</strong> —
+            tsserver/typescript-go, pyright, gopls, Roslyn, Eclipse JDT, and rust-analyzer —
+            embedded directly into the single static C binary. There is no language-server process, no
+            per-project setup, and no API key. This layer runs alongside tree-sitter on every parse and refines
+            <code>CALLS</code>, <code>USAGE</code>, and <code>RESOLVED_CALLS</code> edges with type information,
+            so the graph mirrors what an IDE "Go to Definition" would resolve.
         </p>
-        <p style="color: var(--text-secondary);">
-            The 120x reduction isn't about fitting in the context window. It's about cost ($3-15/M tokens adds up),
-            latency (&lt;1ms vs seconds), and accuracy (less noise = better answers, no "lost in the middle" problem).
-        </p>
-    </section>
-
-    <section>
-        <h2>Benchmark results</h2>
-        <table class="benchmark-table">
-            <thead>
-                <tr>
-                    <th>Question Type</th>
-                    <th>Graph</th>
-                    <th>File-by-file</th>
-                    <th>Savings</th>
-                </tr>
-            </thead>
+        <h3>Languages with full Hybrid LSP</h3>
+        <table class="lsp-table">
+            <thead><tr><th>Language</th><th>What it resolves</th></tr></thead>
             <tbody>
-                <tr>
-                    <td>Find function by pattern</td>
-                    <td>~200</td>
-                    <td>~45,000</td>
-                    <td class="win">225x</td>
-                </tr>
-                <tr>
-                    <td>Trace call chain (depth 3)</td>
-                    <td>~800</td>
-                    <td>~120,000</td>
-                    <td class="win">150x</td>
-                </tr>
-                <tr>
-                    <td>Dead code detection</td>
-                    <td>~500</td>
-                    <td>~85,000</td>
-                    <td class="win">170x</td>
-                </tr>
-                <tr>
-                    <td>List all routes</td>
-                    <td>~400</td>
-                    <td>~62,000</td>
-                    <td class="win">155x</td>
-                </tr>
-                <tr>
-                    <td>Architecture overview</td>
-                    <td>~1,500</td>
-                    <td>~100,000</td>
-                    <td class="win">67x</td>
-                </tr>
-                <tr style="font-weight: 700;">
-                    <td>Total</td>
-                    <td>~3,400</td>
-                    <td>~412,000</td>
-                    <td class="win">121x</td>
-                </tr>
+                <tr><td>Python</td><td>Imports and dotted submodule walks, dataclasses, <code>Self</code> return types, generics, <code>@property</code>, <code>match/case</code> patterns, SQLAlchemy 2.0 <code>Mapped[T]</code>, Pydantic models, <code>typing</code> annotations, async/await, isinstance/walrus narrowing, and common stdlib.</td></tr>
+                <tr><td>TypeScript / JavaScript / JSX / TSX</td><td>Generics, JSX component dispatch, JSDoc inference for plain JS, <code>.d.ts</code> declarations, module re-exports, and method chaining via return-type propagation across a shared cross-file registry.</td></tr>
+                <tr><td>PHP</td><td>Namespaces, traits, late-static-binding, PHPDoc inference, parameter binding, and return-type inference.</td></tr>
+                <tr><td>C#</td><td>Global usings, file-scoped namespaces, records (incl. C# 12 primary constructors), LINQ method syntax, <code>async Task&lt;T&gt;</code>/<code>ValueTask&lt;T&gt;</code> unwrap, generic methods, <code>var</code> inference, and common BCL stdlib.</td></tr>
+                <tr><td>Go</td><td>Pre-built per-package cross-file registry, generics, embedded structs, interface satisfaction, and package-aware import resolution.</td></tr>
+                <tr><td>C / C++</td><td>Shared cross-language registry: macros, <code>typedef</code> chains, and header-vs-source linking on the C side; templates, namespaces, <code>auto</code> inference, and class-hierarchy method resolution on the C++ side.</td></tr>
+                <tr><td>Java <em>(new in v0.8.0)</em></td><td>Imports (single-type, on-demand, static), class hierarchies with <code>this</code>/<code>super</code> dispatch, generics, annotations, overload matching by arity and parameter types, lambdas and method references bound to functional interfaces, and common JDK stdlib.</td></tr>
+                <tr><td>Kotlin <em>(new in v0.8.0)</em></td><td>Imports and same-package resolution, classes / objects / companion objects, extension functions, data classes, nullable-type unwrapping, scope functions (<code>let</code>/<code>apply</code>/<code>run</code>/<code>also</code>/<code>with</code>), infix calls, and common stdlib.</td></tr>
+                <tr><td>Rust <em>(new in v0.8.0)</em></td><td><code>use</code> declarations and module paths, <code>impl</code> blocks and trait methods, struct fields, generics with trait bounds, operator-trait desugaring, derive-macro method synthesis, UFCS static paths, and common std prelude.</td></tr>
             </tbody>
         </table>
-        <p style="color: var(--text-secondary); font-size: 0.875rem; margin-top: 8px;">
-            Tested across 31 languages with agent-vs-agent methodology (372 questions).
-            <a href="https://github.com/DeusData/codebase-memory-mcp/blob/main/BENCHMARK_REPORT.md">Full benchmark report &rarr;</a>
+        <p class="muted">
+            The two-layer pipeline runs a fast syntactic tree-sitter pass for every one of the 158 languages,
+            then a type-aware Hybrid LSP pass on top for the families above. Languages without a Hybrid LSP pass
+            yet fall back to textual resolution, so you always get an answer.
         </p>
     </section>
 
-    <section>
+    <section id="semantic-search">
+        <h2>Can it do semantic and natural-language code search?</h2>
+        <p class="lead">
+            Yes. Beyond structural and full-text search, codebase-memory-mcp performs <strong>semantic
+            vector search</strong> across the whole graph — so you can find code by meaning, not just by
+            name. A search for <code>send</code> surfaces functions named <code>publish</code>,
+            <code>emit</code>, or <code>dispatch</code>.
+        </p>
+        <p style="margin-bottom: 16px;">
+            It is powered by <strong>nomic-embed-code embeddings compiled directly into the binary</strong>
+            (768-dimensional, int8). There is no API key, no Ollama, and no Docker — the embeddings run
+            on-device, so semantic search stays 100% local like everything else. Results combine
+            <strong>11 signals</strong> (TF-IDF, API/type/decorator signatures, AST profiles, data flow,
+            Halstead-lite complexity, MinHash, module proximity, and graph diffusion) into one relevance score.
+        </p>
+        <h3>Meaning-aware edges in the graph</h3>
+        <p style="margin-bottom: 16px;">
+            The indexer also writes two kinds of meaning-aware edges, queryable like any other relationship:
+        </p>
+        <table>
+            <thead><tr><th>Edge</th><th>What it captures</th></tr></thead>
+            <tbody>
+                <tr><td><code>SEMANTICALLY_RELATED</code></td><td>Conceptually similar functions whose names and tokens differ — vocabulary-mismatch matches, scored ≥ 0.80, within the same language.</td></tr>
+                <tr><td><code>SIMILAR_TO</code></td><td>Near-duplicate and copy-pasted code, detected with MinHash + LSH and Jaccard scoring — ideal for finding clones and refactor candidates.</td></tr>
+            </tbody>
+        </table>
+        <div class="install-block" style="margin-top:16px;">
+            <span class="comment"># Find code by meaning, not by name — embeddings run locally, no API key.</span><br>
+            <span class="cmd">search_graph(semantic_query=["retry", "backoff", "exponential"])</span>
+        </div>
+        <p class="muted">
+            Semantic and similarity edges are computed in <code>full</code> and <code>moderate</code> index
+            modes; <code>fast</code> mode skips them for the lowest-latency indexing.
+        </p>
+    </section>
+
+    <section id="benchmark">
+        <h2>How much does the knowledge graph save?</h2>
+        <p class="lead">
+            Each common structural question costs hundreds of tokens against the graph versus tens of thousands
+            via file-by-file search. Totals across five queries: ~3,400 vs ~412,000 tokens.
+        </p>
+        <table class="benchmark-table">
+            <thead>
+                <tr><th>Question type</th><th>Graph</th><th>File-by-file</th><th>Savings</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>Find function by pattern</td><td>~200</td><td>~45,000</td><td class="win">225x</td></tr>
+                <tr><td>Trace call chain (depth 3)</td><td>~800</td><td>~120,000</td><td class="win">150x</td></tr>
+                <tr><td>Dead code detection</td><td>~500</td><td>~85,000</td><td class="win">170x</td></tr>
+                <tr><td>List all routes</td><td>~400</td><td>~62,000</td><td class="win">155x</td></tr>
+                <tr><td>Architecture overview</td><td>~1,500</td><td>~100,000</td><td class="win">67x</td></tr>
+                <tr style="font-weight: 700;"><td>Total</td><td>~3,400</td><td>~412,000</td><td class="win">~121x</td></tr>
+            </tbody>
+        </table>
+        <p class="muted" style="font-size: 0.9rem;">
+            A separate evaluation across 31 real-world repositories, described in the preprint, reported 83% answer quality,
+            10x fewer tokens, and 2.1x fewer tool calls versus file-by-file exploration.
+        </p>
+        <p><cite>Source: <a href="https://arxiv.org/abs/2603.27277">“Codebase-Memory: Tree-Sitter-Based Knowledge
+            Graphs for LLM Code Exploration via MCP”</a>, arXiv:2603.27277 — and the
+            <a href="https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/BENCHMARK.md">project benchmark report</a>.</cite></p>
+    </section>
+
+    <section id="performance">
+        <h2>How fast is it?</h2>
+        <p class="lead">
+            Indexing is RAM-first (LZ4 compression, in-memory SQLite, single dump at end) and memory is released
+            to the OS afterward. Queries run in under a millisecond.
+        </p>
+        <table>
+            <thead><tr><th>Operation</th><th>Time</th><th>Notes</th></tr></thead>
+            <tbody>
+                <tr><td>Linux kernel full index</td><td class="win">3 min</td><td>28M LOC, 75K files → 4.81M nodes, 7.72M edges</td></tr>
+                <tr><td>Django full index</td><td class="win">~6 s</td><td>49K nodes, 196K edges</td></tr>
+                <tr><td>Cypher query</td><td class="win">&lt;1 ms</td><td>Relationship traversal</td></tr>
+                <tr><td>Name search (regex)</td><td class="win">&lt;10 ms</td><td>SQL LIKE pre-filtering</td></tr>
+                <tr><td>Trace call path (depth 5)</td><td class="win">&lt;10 ms</td><td>BFS traversal</td></tr>
+            </tbody>
+        </table>
+        <p><cite>Source: project Performance benchmarks, measured on Apple M3 Pro.</cite></p>
+    </section>
+
+    <section id="features">
         <h2>Features</h2>
         <div class="features">
             <div class="feature">
-                <h3>64 Languages</h3>
-                <p>Python, Go, JS, TS, TSX, Rust, Java, C++, C#, C, PHP, Ruby, Kotlin, Scala, Zig, Elixir, Haskell, OCaml, Swift, Dart, MATLAB, Lean 4, Wolfram, and 41 more via vendored tree-sitter grammars.</p>
+                <h3>158 languages</h3>
+                <p>Python, Go, JS, TS, TSX, Rust, Java, C++, C#, C, PHP, Ruby, Kotlin, Scala, Zig, Elixir, Haskell, OCaml, Swift, Dart, Lean 4, and many more via vendored tree-sitter grammars compiled into the binary.</p>
             </div>
             <div class="feature">
-                <h3>Extreme Performance</h3>
-                <p>RAM-first pipeline: LZ4 compression, in-memory SQLite, fused Aho-Corasick pattern matching. Linux kernel (28M LOC) indexed in 3 minutes.</p>
+                <h3>Hybrid LSP type resolution</h3>
+                <p>Language-server-grade type inference for Python, TS/JS, PHP, C#, Go, C/C++, Java, Kotlin, and Rust — embedded in the binary, no server process or per-project setup.</p>
             </div>
             <div class="feature">
-                <h3>Graph Visualization</h3>
-                <p>Built-in 3D graph UI (optional). Explore nodes, edges, and clusters visually at localhost:9749. Ships as a separate binary variant.</p>
+                <h3>Pure C, zero dependencies</h3>
+                <p>A single static C binary for macOS, Linux, and Windows. No Docker, no runtime, no API keys. Download, run <code>install</code>, done.</p>
             </div>
             <div class="feature">
-                <h3>Call Graph Tracing</h3>
-                <p>Trace callers and callees across files and packages. Import-aware, type-inferred resolution. BFS traversal up to depth 5.</p>
+                <h3>Call-graph tracing</h3>
+                <p>Trace callers and callees across files and packages with import-aware, type-inferred resolution. BFS traversal up to depth 5.</p>
             </div>
             <div class="feature">
-                <h3>8-Agent Install</h3>
-                <p>One command configures Claude Code, Codex, Gemini CLI, Zed, OpenCode, Antigravity, Aider, and KiloCode with MCP configs, instructions, and hooks.</p>
+                <h3>Dead-code detection</h3>
+                <p>Find functions with zero callers, with smart filtering that excludes entry points like route handlers, <code>main()</code>, and framework decorators.</p>
             </div>
             <div class="feature">
-                <h3>Dead Code Detection</h3>
-                <p>Find functions with zero callers, with smart filtering that excludes entry points (route handlers, main(), framework decorators).</p>
+                <h3>Cross-service linking</h3>
+                <p>Matches REST routes to HTTP call sites across services with confidence scoring — and detects gRPC, GraphQL, and tRPC services plus pub/sub channels (<code>EMITS</code>/<code>LISTENS_ON</code> for Socket.IO, EventEmitter, and message buses) and async queue dispatch.</p>
             </div>
             <div class="feature">
-                <h3>Cross-Service HTTP Linking</h3>
-                <p>Discovers REST routes and matches them to HTTP call sites across services with confidence scoring.</p>
+                <h3>Infrastructure-as-code indexing</h3>
+                <p>Dockerfiles, Kubernetes manifests, and Kustomize overlays become graph nodes with cross-references to the resources they configure.</p>
             </div>
             <div class="feature">
-                <h3>Auto-Sync + Auto-Index</h3>
-                <p>Background watcher detects git changes. Optional auto-indexing on session start. No manual reindex needed.</p>
+                <h3>Auto-sync</h3>
+                <p>A background watcher detects changes and re-indexes incrementally. No manual reindex after editing files.</p>
             </div>
             <div class="feature">
-                <h3>14 MCP Tools</h3>
-                <p>search_graph, trace_call_path, detect_changes, query_graph, get_architecture, manage_adr, get_code_snippet, and 7 more.</p>
+                <h3>Team-shared graph artifact</h3>
+                <p>Commit one zstd-compressed snapshot (<code>.codebase-memory/graph.db.zst</code>); teammates bootstrap from it and skip the full reindex.</p>
+            </div>
+            <div class="feature">
+                <h3>3D graph visualization</h3>
+                <p>An optional UI binary serves an interactive 3D graph at <code>localhost:9749</code> to explore nodes, edges, and clusters visually.</p>
+            </div>
+            <div class="feature">
+                <h3>14 MCP tools</h3>
+                <p><code>search_graph</code>, <code>trace_path</code>, <code>detect_changes</code>, <code>query_graph</code> (Cypher), <code>get_architecture</code>, <code>get_code_snippet</code>, <code>manage_adr</code>, and 7 more.</p>
+            </div>
+            <div class="feature">
+                <h3>Cypher graph queries</h3>
+                <p>Run read-only Cypher-style queries against the graph for multi-hop patterns that structured search can't express.</p>
+            </div>
+            <div class="feature">
+                <h3>Semantic code search</h3>
+                <p>Find code by meaning, not just name, via <code>semantic_query</code> vector search — powered by nomic-embed-code embeddings baked into the binary. No API key, fully local.</p>
+            </div>
+            <div class="feature">
+                <h3>Clone &amp; similarity detection</h3>
+                <p><code>SIMILAR_TO</code> edges (MinHash + LSH) surface near-duplicate code; <code>SEMANTICALLY_RELATED</code> edges link conceptually similar functions across the graph.</p>
+            </div>
+            <div class="feature">
+                <h3>Cross-repo intelligence</h3>
+                <p>Index multiple repositories in one store and link them with <code>CROSS_*</code> edges. A multi-galaxy 3D layout and cross-repo architecture summary span the whole fleet.</p>
+            </div>
+            <div class="feature">
+                <h3>Data-flow tracing</h3>
+                <p><code>DATA_FLOWS</code> edges follow values from argument to parameter, with field-access chains — trace how data moves, not just who calls whom.</p>
+            </div>
+            <div class="feature">
+                <h3>Change-impact analysis</h3>
+                <p><code>detect_changes</code> maps an uncommitted git diff to affected symbols and their blast radius, with risk classification — see what a change touches before you ship it.</p>
+            </div>
+            <div class="feature">
+                <h3>Architecture Decision Records</h3>
+                <p><code>manage_adr</code> persists architectural decisions alongside the graph, so design rationale survives across sessions and teammates.</p>
             </div>
         </div>
     </section>
 
-    <section>
-        <h2>How it compares</h2>
-        <table>
-            <thead>
-                <tr>
-                    <th>Feature</th>
-                    <th>codebase-memory-mcp</th>
-                    <th>GitNexus</th>
-                </tr>
-            </thead>
-            <tbody>
-                <tr><td>Languages</td><td class="win">64</td><td>8-11</td></tr>
-                <tr><td>Runtime</td><td class="win">Single static binary</td><td>Node.js (npx)</td></tr>
-                <tr><td>Runtime dependency</td><td class="win">None</td><td>Node.js</td></tr>
-                <tr><td>Stress test</td><td class="win">Linux kernel (2.1M nodes, 3 min)</td><td>Not published</td></tr>
-                <tr><td>Embedded LLM</td><td class="win">No (uses your MCP client)</td><td>Yes (extra API key + cost)</td></tr>
-                <tr><td>Published benchmarks</td><td class="win">Yes (31 langs, 372 questions)</td><td>No</td></tr>
-                <tr><td>Auto-sync</td><td class="win">Yes</td><td>No</td></tr>
-                <tr><td>MCP tools</td><td class="win">14</td><td>7</td></tr>
-                <tr><td>Agents supported</td><td class="win">8</td><td>1-2</td></tr>
-                <tr><td>Cross-service HTTP linking</td><td class="win">Yes</td><td>No</td></tr>
-                <tr><td>Cypher queries</td><td class="win">Yes</td><td>No</td></tr>
-                <tr><td>Incremental reindex</td><td class="win">Yes (&lt;1ms no-op)</td><td>No</td></tr>
-                <tr><td>Pre-tool hooks</td><td class="win">Yes (agents prefer graph tools)</td><td>No</td></tr>
-                <tr><td>Visual web UI</td><td class="win">Yes (3D graph)</td><td class="win">Yes</td></tr>
-                <tr><td>Graph RAG / embeddings</td><td>Not needed*</td><td>Yes</td></tr>
-            </tbody>
-        </table>
-        <p style="color: var(--text-secondary); font-size: 0.875rem; margin-top: 12px;">
-            *Graph RAG and semantic embeddings solve a human problem &mdash; fuzzy "find something similar" queries.
-            MCP agents don't need this: they make precise structural queries via tool calls and synthesize results themselves.
-            codebase-memory-mcp is purpose-built for agents &mdash; exact patterns, call chain tracing, and structural search
-            at machine speed.
+    <section id="releases">
+        <h2>What are the recent releases?</h2>
+        <p class="lead">
+            The latest release notes are loaded live from GitHub. Each entry links to its full changelog.
+        </p>
+        <div id="releases-list">
+            <p class="skeleton">Loading recent releases from GitHub…</p>
+        </div>
+        <p style="margin-top: 16px;">
+            <a href="https://github.com/DeusData/codebase-memory-mcp/releases">View all releases on GitHub →</a>
         </p>
     </section>
-</div>
+
+    <section id="faq" class="faq">
+        <h2>Frequently asked questions</h2>
+
+        <h3>Does codebase-memory-mcp send my code anywhere?</h3>
+        <p>No. All indexing and querying happen 100% locally. There is no embedded LLM and no API key. Release
+           binaries are signed, checksummed, and scanned by 70+ antivirus engines.</p>
+
+        <h3>Does it support semantic or natural-language code search?</h3>
+        <p>Yes. Alongside structural and full-text search, <code>search_graph</code>'s <code>semantic_query</code>
+           parameter runs vector search over the whole graph, powered by nomic-embed-code embeddings compiled
+           into the binary — so it finds <code>publish</code> when you search <code>send</code>. No API key, no
+           Ollama, no Docker; the embeddings run on-device. The indexer also builds <code>SEMANTICALLY_RELATED</code>
+           edges between similar functions and <code>SIMILAR_TO</code> edges for near-clone detection.</p>
+
+        <h3>Do I need Docker or a runtime?</h3>
+        <p>No. It is a single static C binary with zero runtime dependencies for macOS (arm64/amd64), Linux
+           (arm64/amd64), and Windows (amd64).</p>
+
+        <h3>How does it stay up to date as I edit code?</h3>
+        <p>A background watcher detects file changes and re-indexes incrementally — typically a sub-millisecond
+           no-op when nothing changed. You only run a manual index for the first build or after a large
+           <code>git pull</code>.</p>
+
+        <h3>Why is there no built-in LLM?</h3>
+        <p>Other code-graph tools embed an LLM to translate natural language into graph queries, which means
+           extra API keys and cost. With MCP, the agent you are already talking to is the query translator —
+           codebase-memory-mcp just builds and serves the graph.</p>
+
+        <h3>Is it free and open source?</h3>
+        <p>Yes. It is MIT licensed. The full source, signed release binaries, and checksums are on
+           <a href="https://github.com/DeusData/codebase-memory-mcp">GitHub</a>.</p>
+    </section>
+</main>
 
 <footer>
     <div class="container">
@@ -427,10 +786,95 @@
             Open source, MIT licensed.
             <a href="https://github.com/DeusData/codebase-memory-mcp">GitHub</a> &middot;
             <a href="https://github.com/DeusData/codebase-memory-mcp/releases/latest">Releases</a> &middot;
-            <a href="https://github.com/DeusData/codebase-memory-mcp/blob/main/BENCHMARK_REPORT.md">Benchmarks</a>
+            <a href="https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/BENCHMARK.md">Benchmarks</a> &middot;
+            <a href="https://arxiv.org/abs/2603.27277">Paper</a>
         </p>
     </div>
 </footer>
+
+<script>
+    (function () {
+        var REPO = 'DeusData/codebase-memory-mcp';
+        var listEl = document.getElementById('releases-list');
+        if (!listEl) return;
+
+        function esc(s) {
+            return String(s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        // Minimal, safe Markdown → HTML for release bodies (escape first, then format).
+        function renderMarkdown(md) {
+            var lines = esc(md || '').split(/\r?\n/);
+            var html = '', inList = false;
+            function inline(t) {
+                return t
+                    .replace(/`([^`]+)`/g, '<code>$1</code>')
+                    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+                    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+                             '<a href="$2" target="_blank" rel="nofollow noopener">$1</a>');
+            }
+            for (var i = 0; i < lines.length; i++) {
+                var ln = lines[i];
+                var h = ln.match(/^(#{1,6})\s+(.*)$/);
+                var li = ln.match(/^\s*[-*]\s+(.*)$/);
+                if (h) {
+                    if (inList) { html += '</ul>'; inList = false; }
+                    // Demote release-note headings to h4-h6 so they never pollute the page outline.
+                    var lvl = Math.min(h[1].length + 3, 6);
+                    html += '<h' + lvl + '>' + inline(h[2]) + '</h' + lvl + '>';
+                } else if (li) {
+                    if (!inList) { html += '<ul>'; inList = true; }
+                    html += '<li>' + inline(li[1]) + '</li>';
+                } else if (ln.trim() === '') {
+                    if (inList) { html += '</ul>'; inList = false; }
+                } else {
+                    if (inList) { html += '</ul>'; inList = false; }
+                    html += '<p>' + inline(ln) + '</p>';
+                }
+            }
+            if (inList) html += '</ul>';
+            return html;
+        }
+
+        function fmtDate(iso) {
+            if (!iso) return '';
+            var d = new Date(iso);
+            if (isNaN(d)) return '';
+            return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+        }
+
+        function renderRelease(r) {
+            var tag = esc(r.tag_name || r.name || 'release');
+            var name = r.name && r.name !== r.tag_name ? ' — ' + esc(r.name) : '';
+            var url = esc(r.html_url || ('https://github.com/' + REPO + '/releases'));
+            var date = fmtDate(r.published_at);
+            var body = (r.body || '').trim();
+            var bodyHtml = body
+                ? '<details><summary>Release notes</summary><div class="release-body">' + renderMarkdown(body) + '</div></details>'
+                : '<p class="release-body"><a href="' + url + '" target="_blank" rel="noopener">View on GitHub →</a></p>';
+            return '<article class="release">'
+                + '<div class="release-head">'
+                + '<span class="release-tag"><a href="' + url + '" target="_blank" rel="noopener">' + tag + '</a>' + name + '</span>'
+                + '<span class="release-date">' + date + '</span>'
+                + '</div>' + bodyHtml + '</article>';
+        }
+
+        fetch('https://api.github.com/repos/' + REPO + '/releases?per_page=5', {
+            headers: { 'Accept': 'application/vnd.github+json' }
+        })
+        .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
+        .then(function (data) {
+            if (!Array.isArray(data) || data.length === 0) throw new Error('no releases');
+            listEl.innerHTML = data.map(renderRelease).join('');
+        })
+        .catch(function () {
+            listEl.innerHTML = '<p class="skeleton">Couldn\'t load releases right now — '
+                + '<a href="https://github.com/' + REPO + '/releases">view them on GitHub →</a></p>';
+        });
+    })();
+</script>
 
 </body>
 </html>

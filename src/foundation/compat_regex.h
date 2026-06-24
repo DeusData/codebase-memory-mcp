@@ -9,6 +9,7 @@
 #ifndef CBM_COMPAT_REGEX_H
 #define CBM_COMPAT_REGEX_H
 
+#include "foundation/constants.h"
 #include <stddef.h>
 
 /* ── Flags ────────────────────────────────────────────────────── */
@@ -27,9 +28,9 @@
 
 /* Opaque regex handle — sized to hold the platform's regex_t. */
 typedef struct {
-    /* 256 bytes should be large enough for any platform's regex_t.
-     * POSIX regex_t is typically 48-64 bytes; TRE is ~80 bytes. */
-    char opaque[256];
+    /* CBM_SZ_256 bytes should be large enough for any platform's regex_t.
+     * POSIX regex_t is typically 48-CBM_SZ_64 bytes; TRE is ~80 bytes. */
+    char opaque[CBM_SZ_256];
 } cbm_regex_t;
 
 typedef struct {

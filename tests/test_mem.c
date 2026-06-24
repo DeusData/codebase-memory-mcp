@@ -4,6 +4,7 @@
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "../src/foundation/mem.h"
 #include "../src/foundation/arena.h"
 #include "../src/foundation/slab_alloc.h"
@@ -559,9 +560,7 @@ static int setup_mem_test_repo(void) {
 
 static void teardown_mem_test_repo(void) {
     if (g_mem_tmpdir[0]) {
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_mem_tmpdir);
-        (void)system(cmd);
+        th_rmtree(g_mem_tmpdir);
         g_mem_tmpdir[0] = '\0';
     }
 }
@@ -570,7 +569,7 @@ TEST(parallel_extract_with_slab) {
     cbm_mem_init(0.5);
 
     if (setup_mem_test_repo() != 0) {
-        SKIP("tmpdir setup failed");
+        FAIL("tmpdir setup failed");
     }
 
     cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
@@ -578,7 +577,7 @@ TEST(parallel_extract_with_slab) {
     int file_count = 0;
     if (cbm_discover(g_mem_tmpdir, &opts, &files, &file_count) != 0) {
         teardown_mem_test_repo();
-        SKIP("discover failed");
+        FAIL("discover failed");
     }
 
     ASSERT_GTE(file_count, 5);

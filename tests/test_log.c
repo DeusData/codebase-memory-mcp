@@ -112,6 +112,78 @@ TEST(log_int_helper) {
     PASS();
 }
 
+/* CBM_LOG_LEVEL parsing — distilled from #414 (closes #413). */
+TEST(log_level_from_env_textual) {
+    cbm_setenv("CBM_LOG_LEVEL", "error", 1);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_ERROR);
+
+    cbm_setenv("CBM_LOG_LEVEL", "debug", 1);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_DEBUG);
+
+    cbm_setenv("CBM_LOG_LEVEL", "none", 1);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_NONE);
+
+    /* Matching is case-insensitive */
+    cbm_setenv("CBM_LOG_LEVEL", "WARN", 1);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_WARN);
+
+    cbm_setenv("CBM_LOG_LEVEL", "Info", 1);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_INFO);
+
+    cbm_unsetenv("CBM_LOG_LEVEL");
+    cbm_log_set_level(CBM_LOG_INFO); /* restore */
+    PASS();
+}
+
+TEST(log_level_from_env_numeric) {
+    /* 0=debug 1=info 2=warn 3=error 4=none — mirrors CBMLogLevel */
+    cbm_setenv("CBM_LOG_LEVEL", "0", 1);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_DEBUG);
+
+    cbm_setenv("CBM_LOG_LEVEL", "3", 1);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_ERROR);
+
+    cbm_setenv("CBM_LOG_LEVEL", "4", 1);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_NONE);
+
+    /* Out-of-range numeric is ignored — level unchanged */
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_setenv("CBM_LOG_LEVEL", "5", 1);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_INFO);
+
+    cbm_unsetenv("CBM_LOG_LEVEL");
+    cbm_log_set_level(CBM_LOG_INFO); /* restore */
+    PASS();
+}
+
+TEST(log_level_from_env_invalid_ignored) {
+    /* Unknown string and empty/unset both leave the level unchanged (fail-open) */
+    cbm_log_set_level(CBM_LOG_WARN);
+    cbm_setenv("CBM_LOG_LEVEL", "verbose", 1);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_WARN);
+
+    cbm_setenv("CBM_LOG_LEVEL", "", 1);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_WARN);
+
+    cbm_unsetenv("CBM_LOG_LEVEL");
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_WARN);
+
+    cbm_log_set_level(CBM_LOG_INFO); /* restore */
+    PASS();
+}
+
 SUITE(log) {
     RUN_TEST(log_level_default);
     RUN_TEST(log_level_set);
@@ -119,4 +191,7 @@ SUITE(log) {
     RUN_TEST(log_filtered_by_level);
     RUN_TEST(log_error_output);
     RUN_TEST(log_int_helper);
+    RUN_TEST(log_level_from_env_textual);
+    RUN_TEST(log_level_from_env_numeric);
+    RUN_TEST(log_level_from_env_invalid_ignored);
 }

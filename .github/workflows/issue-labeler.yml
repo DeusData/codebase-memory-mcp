@@ -1,0 +1,28 @@
+name: Issue area labeler
+
+# Adds area labels to new/edited issues based on keyword regexes in
+# .github/issue-labeler.yml. Additive only (sync-labels off): it never
+# removes a label a maintainer set by hand. Base bug/enhancement labels
+# already come from the issue forms.
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: github/issue-labeler@c1b0f9f52a63158c4adc09425e858e87b32e9685 # v3.4
+        with:
+          configuration-path: .github/issue-labeler.yml
+          enable-versioned-regex: 0
+          include-title: 1
+          include-body: 1
+          sync-labels: 0
+          repo-token: ${{ secrets.GITHUB_TOKEN }}

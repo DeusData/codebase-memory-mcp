@@ -191,6 +191,10 @@ typedef struct {
     bool negated;           /* NOT prefix */
     const char **in_values; /* IN [...] list */
     int in_value_count;
+    /* EXISTS { (var)-[:value]->() } predicate (op=="EXISTS"): `variable` is the
+     * anchor, `value` the edge type (NULL = any), `exists_dir` the direction
+     * (0 = outbound, 1 = inbound, 2 = any). */
+    int exists_dir;
 } cbm_condition_t;
 
 /* Expression tree for WHERE clause */
@@ -230,6 +234,13 @@ typedef struct {
     const char *else_val; /* NULL if no ELSE */
 } cbm_case_expr_t;
 
+/* One argument to a multi-argument scalar function (coalesce, substring, ...). */
+typedef struct {
+    const char *variable; /* variable reference (NULL if a literal) */
+    const char *property; /* property of the variable (NULL if whole var / literal) */
+    const char *literal;  /* literal string/number text (NULL if a variable ref) */
+} cbm_func_arg_t;
+
 /* RETURN item */
 typedef struct {
     const char *variable;
@@ -237,7 +248,10 @@ typedef struct {
     const char *alias;     /* NULL if no alias */
     const char *func;      /* "COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT",
                               "toLower", "toUpper", "toString" or NULL */
+    bool distinct;         /* COUNT(DISTINCT x) — count unique values (#239) */
     cbm_case_expr_t *kase; /* CASE expression (NULL if not CASE) */
+    cbm_func_arg_t *args;  /* args for a multi-argument function (NULL if none) */
+    int arg_count;
 } cbm_return_item_t;
 
 typedef struct {

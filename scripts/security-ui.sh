@@ -132,25 +132,36 @@ fi
 echo ""
 echo "--- B. HTTP server binding check ---"
 
+# The UI server is split across two first-party files:
+#   httpd.c        — socket transport (binding, parsing)
+#   http_server.c  — routing + endpoint handlers (CORS policy)
+# Both MUST exist — a missing file means the audit target moved and the
+# audit would go blind, so that is a hard failure, not a skip.
+HTTPD="$ROOT/src/ui/httpd.c"
 HTTP_SERVER="$ROOT/src/ui/http_server.c"
-if [[ -f "$HTTP_SERVER" ]]; then
+for f in "$HTTPD" "$HTTP_SERVER"; do
+    if [[ ! -f "$f" ]]; then
+        echo "BLOCKED: expected UI server source missing: $f"
+        FAIL=1
+    fi
+done
+
+if [[ -f "$HTTPD" ]]; then
     # Must bind to 127.0.0.1 only
-    if grep -q '127\.0\.0\.1' "$HTTP_SERVER"; then
+    if grep -q '127\.0\.0\.1' "$HTTPD"; then
         echo "OK: Server binds to 127.0.0.1"
     else
-        echo "BLOCKED: No 127.0.0.1 binding found in http_server.c"
+        echo "BLOCKED: No 127.0.0.1 binding found in httpd.c"
         FAIL=1
     fi
 
     # Must NOT bind to 0.0.0.0 or INADDR_ANY
-    if grep -E '0\.0\.0\.0|INADDR_ANY|in6addr_any' "$HTTP_SERVER" | grep -v '^\s*//' | grep -v '^\s*\*' > /dev/null 2>&1; then
+    if cat "$HTTPD" "$HTTP_SERVER" 2>/dev/null | grep -E '0\.0\.0\.0|INADDR_ANY|in6addr_any' | grep -v '^\s*//' | grep -v '^\s*\*' > /dev/null 2>&1; then
         echo "BLOCKED: Server may bind to all interfaces (0.0.0.0/INADDR_ANY found)"
         FAIL=1
     else
         echo "OK: No 0.0.0.0/INADDR_ANY binding"
     fi
-else
-    echo "SKIP: http_server.c not found"
 fi
 
 # ── C. RPC proxy scope check ─────────────────────────────────────
@@ -161,14 +172,12 @@ echo "--- C. RPC proxy scope check ---"
 if [[ -f "$HTTP_SERVER" ]]; then
     # The HTTP handler should not directly call system()/popen()
     # (fork/execl for indexing is allowed as it's tracked)
-    if grep -n 'system(' "$HTTP_SERVER" | grep -v '^\s*//' | grep -v '^\s*\*' > /dev/null 2>&1; then
+    if cat "$HTTPD" "$HTTP_SERVER" 2>/dev/null | grep -n 'system(' | grep -v '^\s*//' | grep -v '^\s*\*' > /dev/null 2>&1; then
         echo "BLOCKED: system() call found in HTTP server (use subprocess instead)"
         FAIL=1
     else
         echo "OK: No system() calls in HTTP handler"
     fi
-else
-    echo "SKIP: http_server.c not found"
 fi
 
 # ── D. CORS check ────────────────────────────────────────────────
@@ -177,7 +186,7 @@ echo ""
 echo "--- D. CORS check ---"
 
 if [[ -f "$HTTP_SERVER" ]]; then
-    if grep -E 'Allow-Origin:\s*\*' "$HTTP_SERVER" | grep -v '^\s*//' | grep -v '^\s*\*' > /dev/null 2>&1; then
+    if cat "$HTTPD" "$HTTP_SERVER" 2>/dev/null | grep -E 'Allow-Origin:\s*\*' | grep -v '^\s*//' | grep -v '^\s*\*' > /dev/null 2>&1; then
         echo "BLOCKED: CORS wildcard (Access-Control-Allow-Origin: *) found"
         echo "  This allows any website to access the local server."
         FAIL=1
@@ -189,8 +198,6 @@ if [[ -f "$HTTP_SERVER" ]]; then
     if grep -q 'localhost' "$HTTP_SERVER" && grep -q 'update_cors\|Access-Control-Allow-Origin' "$HTTP_SERVER"; then
         echo "OK: CORS appears to validate localhost origins"
     fi
-else
-    echo "SKIP: http_server.c not found"
 fi
 
 # ── Summary ──────────────────────────────────────────────────────

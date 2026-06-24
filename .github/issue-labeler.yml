@@ -1,0 +1,17 @@
+# Config for github/issue-labeler (.github/workflows/issue-labeler.yml).
+# Non-versioned format: one regex per label, matched against title + body.
+# Additive only — these never remove a maintainer's manual label.
+
+"windows": '(?i)\b(windows|win\s?1[01]|powershell|\.ps1|mapped drive|smb share|unc path)\b'
+
+"stability/performance": '(?i)(out of memory|\boom\b|memory leak|segfault|sigsegv|sigbus|crash(es|ed|ing)?|core dumped|\bhang(s|ing)?\b|deadlock|freezes?|time(s)?\s?out|timeout|never finishes|cgroup)'
+
+"parsing/quality": '(?i)(trace_path|query_graph|search_graph|calls? edge|missing (edges|nodes)|false positive|zero edges|0 edges|module node|not indexed|extraction|wrong (node|label))'
+
+"editor/integration": '(?i)(cursor|vscode|vs code|opencode|codex|claude code|gemini cli|antigravity|mcp client|\.mcp\.json|installer)'
+
+"ux/behavior": '(?i)(web ui|\bui\b|dashboard|3d graph|visuali[sz]ation|watcher|project name|frontend)'
+
+"cypher": '(?i)\bcypher\b'
+
+"language-request": '(?i)(language support|hybrid lsp|new language support|support for \w+ language)'

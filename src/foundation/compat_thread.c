@@ -4,6 +4,7 @@
  * POSIX: thin wrappers around pthreads and posix_memalign.
  * Windows: CreateThread, CRITICAL_SECTION, _aligned_malloc.
  */
+#include "foundation/constants.h"
 #include "foundation/compat_thread.h"
 
 #include <pthread.h>
@@ -11,7 +12,7 @@
 
 /* Default 8MB stack for all threads. macOS ARM64 default is only 512KB,
  * which is too small for deep pipeline passes (configlink, etc.). */
-#define CBM_DEFAULT_STACK_SIZE (8 * 1024 * 1024)
+#define CBM_DEFAULT_STACK_SIZE ((size_t)8 * CBM_SZ_1K * CBM_SZ_1K)
 #include <string.h>
 
 /* ── Thread ───────────────────────────────────────────────────── */
@@ -38,23 +39,32 @@ int cbm_thread_create(cbm_thread_t *t, size_t stack_size, void *(*fn)(void *), v
     }
     win_thread_arg_t *a = (win_thread_arg_t *)malloc(sizeof(win_thread_arg_t));
     if (!a) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
     a->fn = fn;
     a->arg = arg;
     t->handle = CreateThread(NULL, stack_size, win_thread_wrapper, a, 0, NULL);
     if (!t->handle) {
         free(a);
-        return -1;
+        return CBM_NOT_FOUND;
     }
     return 0;
 }
 
 int cbm_thread_join(cbm_thread_t *t) {
     if (WaitForSingleObject(t->handle, INFINITE) != WAIT_OBJECT_0) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
     CloseHandle(t->handle);
+    t->handle = NULL;
+    return 0;
+}
+
+int cbm_thread_detach(cbm_thread_t *t) {
+    if (t->handle) {
+        CloseHandle(t->handle);
+        t->handle = NULL;
+    }
     return 0;
 }
 
@@ -73,7 +83,19 @@ int cbm_thread_create(cbm_thread_t *t, size_t stack_size, void *(*fn)(void *), v
 }
 
 int cbm_thread_join(cbm_thread_t *t) {
-    return pthread_join(t->handle, NULL);
+    int rc = pthread_join(t->handle, NULL);
+    if (rc == 0) {
+        memset(&t->handle, 0, sizeof(t->handle));
+    }
+    return rc;
+}
+
+int cbm_thread_detach(cbm_thread_t *t) {
+    int rc = pthread_detach(t->handle);
+    if (rc == 0) {
+        memset(&t->handle, 0, sizeof(t->handle));
+    }
+    return rc;
 }
 
 #endif

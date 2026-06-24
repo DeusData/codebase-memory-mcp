@@ -1,4 +1,5 @@
 #include "go_lsp.h"
+#include "lsp_node_iter.h"
 #include "../helpers.h"
 #include <string.h>
 #include <stdio.h>
@@ -879,9 +880,10 @@ static const CBMType* go_lookup_field(GoLSPContext* ctx,
 
 // --- go_lookup_field_or_method: method sets + embedding ---
 
-const CBMRegisteredFunc* go_lookup_field_or_method(GoLSPContext* ctx,
-    const char* type_qn, const char* member_name) {
+static const CBMRegisteredFunc* go_lookup_field_or_method_depth(GoLSPContext* ctx,
+    const char* type_qn, const char* member_name, int depth) {
     if (!type_qn || !member_name) return NULL;
+    if (depth > CBM_LSP_MAX_LOOKUP_DEPTH) return NULL;
 
     // Direct method lookup
     const CBMRegisteredFunc* f = cbm_registry_lookup_method(ctx->registry, type_qn, member_name);
@@ -891,20 +893,25 @@ const CBMRegisteredFunc* go_lookup_field_or_method(GoLSPContext* ctx,
     if (rt) {
         // Follow type alias chain
         if (rt->alias_of) {
-            f = go_lookup_field_or_method(ctx, rt->alias_of, member_name);
+            f = go_lookup_field_or_method_depth(ctx, rt->alias_of, member_name, depth + 1);
             if (f) return f;
         }
 
         // Check embedded types (promoted methods)
         if (rt->embedded_types) {
             for (int i = 0; rt->embedded_types[i]; i++) {
-                f = go_lookup_field_or_method(ctx, rt->embedded_types[i], member_name);
+                f = go_lookup_field_or_method_depth(ctx, rt->embedded_types[i], member_name, depth + 1);
                 if (f) return f;
             }
         }
     }
 
     return NULL;
+}
+
+const CBMRegisteredFunc* go_lookup_field_or_method(GoLSPContext* ctx,
+    const char* type_qn, const char* member_name) {
+    return go_lookup_field_or_method_depth(ctx, type_qn, member_name, 0);
 }
 
 // --- go_process_statement: bind variables from statements ---
@@ -1447,10 +1454,16 @@ recurse:;
         return;
     }
 
-    // Recurse into children
-    uint32_t nc = ts_node_child_count(node);
-    for (uint32_t i = 0; i < nc; i++) {
-        resolve_calls_in_node(ctx, ts_node_child(node, i));
+    // Recurse into children via a cursor (O(n)); ts_node_child(node,i) is O(i)
+    // → O(n²) on a wide node.
+    {
+        TSTreeCursor cursor = ts_tree_cursor_new(node);
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            do {
+                resolve_calls_in_node(ctx, ts_tree_cursor_current_node(&cursor));
+            } while (ts_tree_cursor_goto_next_sibling(&cursor));
+        }
+        ts_tree_cursor_delete(&cursor);
     }
 
     if (push_scope) {
@@ -1584,13 +1597,14 @@ static void process_function(GoLSPContext* ctx, TSNode func_node) {
 void go_lsp_process_file(GoLSPContext* ctx, TSNode root) {
     if (ts_node_is_null(root)) return;
 
-    uint32_t nc = ts_node_child_count(root);
+    // Collect top-level children once (O(n)); ts_node_child(root,i) is O(i) → O(n²).
+    uint32_t kn = 0;
+    TSNode* kids = cbm_lsp_collect_children(ctx->arena, root, &kn);
 
     // Pass 1: Bind package-level var/const declarations into root scope.
     // Must happen before processing functions so all globals are visible.
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode child = ts_node_child(root, i);
-        if (ts_node_is_null(child)) continue;
+    for (uint32_t i = 0; i < kn; i++) {
+        TSNode child = kids[i];
         const char* kind = ts_node_type(child);
 
         if (strcmp(kind, "var_declaration") == 0 || strcmp(kind, "const_declaration") == 0) {
@@ -1604,9 +1618,8 @@ void go_lsp_process_file(GoLSPContext* ctx, TSNode root) {
     }
 
     // Pass 2: Process function/method bodies
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode child = ts_node_child(root, i);
-        if (ts_node_is_null(child)) continue;
+    for (uint32_t i = 0; i < kn; i++) {
+        TSNode child = kids[i];
         const char* kind = ts_node_type(child);
 
         if (strcmp(kind, "function_declaration") == 0 ||
@@ -1772,10 +1785,11 @@ void cbm_run_go_lsp(CBMArena* arena, CBMFileResult* result,
 
     // Phase 1b: Scan AST for struct definitions to populate embedded_types
     {
-        uint32_t root_nc = ts_node_child_count(root);
-        for (uint32_t i = 0; i < root_nc; i++) {
-            TSNode top = ts_node_child(root, i);
-            if (ts_node_is_null(top)) continue;
+        // Collect top-level children once (O(n)); ts_node_child(root,i) is O(i) → O(n²).
+        uint32_t rkn = 0;
+        TSNode* rkids = cbm_lsp_collect_children(arena, root, &rkn);
+        for (uint32_t i = 0; i < rkn; i++) {
+            TSNode top = rkids[i];
             const char* tk = ts_node_type(top);
             // type_declaration contains type_spec children
             if (strcmp(tk, "type_declaration") != 0) continue;
@@ -2278,10 +2292,11 @@ static const CBMType* parse_type_node_with_params(CBMArena* arena, TSNode node,
 static void extract_type_params_from_ast(CBMArena* arena, CBMTypeRegistry* reg,
     TSNode root, const char* source, const char* module_qn) {
 
-    uint32_t root_nc = ts_node_child_count(root);
-    for (uint32_t i = 0; i < root_nc; i++) {
-        TSNode top = ts_node_child(root, i);
-        if (ts_node_is_null(top)) continue;
+    // Collect top-level children once (O(n)); ts_node_child(root,i) is O(i) → O(n²).
+    uint32_t rkn = 0;
+    TSNode* rkids = cbm_lsp_collect_children(arena, root, &rkn);
+    for (uint32_t i = 0; i < rkn; i++) {
+        TSNode top = rkids[i];
         if (strcmp(ts_node_type(top), "function_declaration") != 0) continue;
 
         // Check for type_parameter_list (field name: "type_parameters", 15 chars)
@@ -2473,7 +2488,11 @@ void cbm_run_go_lsp_cross(
     cbm_registry_init(&reg, arena);
     cbm_go_stdlib_register(&reg, arena);
 
-    // Register all defs (file-local + cross-file)
+    // Register all defs (file-local + cross-file).
+    // Perf: borrow strings from defs[] directly — they live in the
+    // caller's arena which outlives this call, so cbm_arena_strdup is
+    // wasted work. On kubernetes (~110k defs × 11k files × 5 strdups
+    // ~= 6B mallocs) this alone saves ~90s of resolve wall time.
     for (int i = 0; i < def_count; i++) {
         CBMLSPDef* d = &defs[i];
         if (!d->qualified_name || !d->short_name || !d->label) continue;
@@ -2485,8 +2504,8 @@ void cbm_run_go_lsp_cross(
             strcmp(d->label, "Interface") == 0) {
             CBMRegisteredType rt;
             memset(&rt, 0, sizeof(rt));
-            rt.qualified_name = cbm_arena_strdup(arena, d->qualified_name);
-            rt.short_name = cbm_arena_strdup(arena, d->short_name);
+            rt.qualified_name = d->qualified_name;  // borrowed
+            rt.short_name = d->short_name;          // borrowed
             rt.is_interface = d->is_interface || strcmp(d->label, "Interface") == 0;
             rt.embedded_types = split_pipe_strings(arena, d->embedded_types);
 
@@ -2507,8 +2526,8 @@ void cbm_run_go_lsp_cross(
         if (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0) {
             CBMRegisteredFunc rf;
             memset(&rf, 0, sizeof(rf));
-            rf.qualified_name = cbm_arena_strdup(arena, d->qualified_name);
-            rf.short_name = cbm_arena_strdup(arena, d->short_name);
+            rf.qualified_name = d->qualified_name;  // borrowed
+            rf.short_name = d->short_name;          // borrowed
 
             // Build FUNC type from return_types text
             const CBMType** ret_types = split_pipe_types(arena, d->return_types, def_mod);
@@ -2516,14 +2535,14 @@ void cbm_run_go_lsp_cross(
 
             // Method receiver
             if (strcmp(d->label, "Method") == 0 && d->receiver_type && d->receiver_type[0]) {
-                rf.receiver_type = cbm_arena_strdup(arena, d->receiver_type);
+                rf.receiver_type = d->receiver_type;  // borrowed
                 // Auto-create type entry if not exists
                 if (!cbm_registry_lookup_type(&reg, rf.receiver_type)) {
                     CBMRegisteredType auto_type;
                     memset(&auto_type, 0, sizeof(auto_type));
                     auto_type.qualified_name = rf.receiver_type;
                     const char* dot = strrchr(d->receiver_type, '.');
-                    auto_type.short_name = dot ? cbm_arena_strdup(arena, dot + 1) : rf.receiver_type;
+                    auto_type.short_name = dot ? dot + 1 : rf.receiver_type;  // borrowed substring
                     cbm_registry_add_type(&reg, auto_type);
                 }
             }
@@ -2534,10 +2553,11 @@ void cbm_run_go_lsp_cross(
 
     // 3. Phase 1b: Scan AST for struct definitions to populate embedded_types
     {
-        uint32_t root_nc = ts_node_child_count(root);
-        for (uint32_t i = 0; i < root_nc; i++) {
-            TSNode top = ts_node_child(root, i);
-            if (ts_node_is_null(top)) continue;
+        // Collect top-level children once (O(n)); ts_node_child(root,i) is O(i) → O(n²).
+        uint32_t rkn = 0;
+        TSNode* rkids = cbm_lsp_collect_children(arena, root, &rkn);
+        for (uint32_t i = 0; i < rkn; i++) {
+            TSNode top = rkids[i];
             if (strcmp(ts_node_type(top), "type_declaration") != 0) continue;
             uint32_t td_nc = ts_node_child_count(top);
             for (uint32_t j = 0; j < td_nc; j++) {
@@ -2672,6 +2692,14 @@ void cbm_run_go_lsp_cross(
     // 3b. Phase 1c: Extract type params from generic function declarations
     extract_type_params_from_ast(arena, &reg, root, source, module_qn);
 
+    // 3c. Finalize registry — builds hash buckets for O(1) lookups in
+    // cbm_registry_lookup_method / lookup_type. Without this, every
+    // lookup falls through to the O(N) linear scan in type_registry.c,
+    // turning the resolution pass below into an O(N·C·F) cost per file
+    // (kubernetes: ~64B strcmps observed = 35min). Must come AFTER all
+    // mutations (Phase 1b/1c above) and BEFORE the LSP context init.
+    cbm_registry_finalize(&reg);
+
     // 4. Build LSP context and run
     GoLSPContext ctx;
     go_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, out);
@@ -2689,6 +2717,223 @@ void cbm_run_go_lsp_cross(
         ts_tree_delete(tree);
         if (parser) ts_parser_delete(parser);
     }
+}
+
+/* ── Tier 2: pre-built per-language registry (gopls package summary pattern) ──
+ *
+ * cbm_go_build_cross_registry runs the registry build ONCE per project (in
+ * pipeline.c, before the parallel resolve workers fire). The returned
+ * registry is finalized (O(1) lookups) and shared READ-ONLY across all
+ * workers in the resolve phase.
+ *
+ * cbm_run_go_lsp_cross_with_registry is the per-file entrypoint used by
+ * the resolve worker. It SKIPS the registry build (uses the pre-built reg)
+ * AND skips Phase 1b/1c AST scans (those mutate the registry, which would
+ * race with other workers reading the shared reg). Accuracy trade-off:
+ * file-local type aliases and struct embeddings discovered ONLY by Phase
+ * 1b (and not already in defs[] embedded_types/field_defs strings) are
+ * missed. In practice the per-file LSP during extract already captures
+ * those via the def strings. */
+CBMTypeRegistry* cbm_go_build_cross_registry(
+    CBMArena* arena, CBMLSPDef* defs, int def_count) {
+    if (!arena) return NULL;
+    CBMTypeRegistry* reg = (CBMTypeRegistry*)cbm_arena_alloc(arena, sizeof(*reg));
+    if (!reg) return NULL;
+    cbm_registry_init(reg, arena);
+    cbm_go_stdlib_register(reg, arena);
+
+    for (int i = 0; i < def_count; i++) {
+        CBMLSPDef* d = &defs[i];
+        if (!d->qualified_name || !d->short_name || !d->label) continue;
+        /* Filter to Go defs only — the all_defs[] array is mixed-language. */
+        if (d->lang != CBM_LANG_GO) continue;
+        /* In the pre-built path every def carries its own def_module_qn
+         * (set by cbm_pxc_collect_all_defs). There is no caller module to
+         * fall back to — this registry is project-wide, not per-file. */
+        const char* def_mod = d->def_module_qn ? d->def_module_qn : "";
+
+        if (strcmp(d->label, "Type") == 0 || strcmp(d->label, "Class") == 0 ||
+            strcmp(d->label, "Interface") == 0) {
+            CBMRegisteredType rt;
+            memset(&rt, 0, sizeof(rt));
+            rt.qualified_name = d->qualified_name; /* borrowed */
+            rt.short_name = d->short_name;
+            rt.is_interface = d->is_interface || strcmp(d->label, "Interface") == 0;
+            rt.embedded_types = split_pipe_strings(arena, d->embedded_types);
+            if (rt.is_interface && d->method_names_str && d->method_names_str[0]) {
+                rt.method_names = split_pipe_strings(arena, d->method_names_str);
+            }
+            cbm_registry_add_type(reg, rt);
+            if (d->field_defs && d->field_defs[0]) {
+                parse_field_defs_into_type(arena, reg, rt.qualified_name,
+                                           d->field_defs, def_mod);
+            }
+        }
+
+        if (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0) {
+            CBMRegisteredFunc rf;
+            memset(&rf, 0, sizeof(rf));
+            rf.qualified_name = d->qualified_name; /* borrowed */
+            rf.short_name = d->short_name;
+            const CBMType** ret_types = split_pipe_types(arena, d->return_types, def_mod);
+            rf.signature = cbm_type_func(arena, NULL, NULL, ret_types);
+            if (strcmp(d->label, "Method") == 0 && d->receiver_type && d->receiver_type[0]) {
+                rf.receiver_type = d->receiver_type;
+                if (!cbm_registry_lookup_type(reg, rf.receiver_type)) {
+                    CBMRegisteredType auto_type;
+                    memset(&auto_type, 0, sizeof(auto_type));
+                    auto_type.qualified_name = rf.receiver_type;
+                    const char* dot = strrchr(d->receiver_type, '.');
+                    auto_type.short_name = dot ? dot + 1 : rf.receiver_type;
+                    cbm_registry_add_type(reg, auto_type);
+                }
+            }
+            cbm_registry_add_func(reg, rf);
+        }
+    }
+
+    cbm_registry_finalize(reg);
+    return reg;
+}
+
+void cbm_run_go_lsp_cross_with_registry(
+    CBMArena* arena,
+    const char* source, int source_len,
+    const char* module_qn,
+    CBMTypeRegistry* reg,
+    const char** import_names, const char** import_qns, int import_count,
+    TSTree* cached_tree,
+    CBMResolvedCallArray* out) {
+    if (!source || source_len <= 0 || !reg) return;
+
+    TSParser* parser = NULL;
+    TSTree* tree = cached_tree;
+    bool owns_tree = false;
+    if (!tree) {
+        parser = ts_parser_new();
+        if (!parser) return;
+        ts_parser_set_language(parser, tree_sitter_go());
+        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        owns_tree = true;
+        if (!tree) { ts_parser_delete(parser); return; }
+    }
+    TSNode root = ts_tree_root_node(tree);
+
+    /* Phase 1b/1c (per-file AST mutations on registry) DELIBERATELY SKIPPED —
+     * shared registry must stay immutable across parallel workers. */
+
+    GoLSPContext ctx;
+    go_lsp_init(&ctx, arena, source, source_len, reg, module_qn, out);
+    for (int i = 0; i < import_count; i++) {
+        if (import_names[i] && import_qns[i]) {
+            go_lsp_add_import(&ctx, import_names[i], import_qns[i]);
+        }
+    }
+    go_lsp_process_file(&ctx, root);
+
+    if (owns_tree) {
+        ts_tree_delete(tree);
+        if (parser) ts_parser_delete(parser);
+    }
+}
+
+/* ── Tier 3: AST-walk-free metadata-driven cross-file resolver ────
+ *
+ * KEY INSIGHT: the per-file LSP during extract ALREADY emits one
+ * CBMResolvedCall per call site, with strategy="lsp_unresolved" for
+ * calls it couldn't resolve. For those unresolved entries:
+ *
+ *   * "symbol_not_in_registry" (go_lsp.c:1142) → callee_qn is
+ *     "pkg_name.field_name" (literal local import alias)
+ *   * "method_not_found" (go_lsp.c:1242) → callee_qn is
+ *     "<FullyQualifiedReceiverTypeQN>.<MethodName>" — receiver type
+ *     was ALREADY inferred by per-file LSP, just the method wasn't
+ *     in the per-file registry (cross-file)
+ *   * "function_not_in_registry" (go_lsp.c:1266) → callee_qn is
+ *     the bare function name (likely a same-package symbol we
+ *     missed, or a cross-file package function used unqualified)
+ *   * "unknown_receiver_type" (go_lsp.c:1248) → per-file LSP
+ *     couldn't infer the receiver type. Cross-LSP can't either
+ *     without re-walking — leave unresolved.
+ *
+ * So cross-LSP work reduces to:
+ *   for each unresolved entry → look up callee_qn (or pkg.x via
+ *   import map) in the global registry → emit resolved version
+ *   on top. NO TREE-SITTER PARSE. NO AST WALK. Just hash lookups.
+ *
+ * This is what the user meant: walk the AST ONCE (during extract),
+ * capture everything cross-LSP needs as metadata, and let cross-LSP
+ * be a pure lookup pass. */
+int cbm_go_fast_resolve_qualified_calls(
+    CBMFileResult* result,
+    CBMTypeRegistry* reg,
+    const char** import_names, const char** import_qns, int import_count) {
+    if (!result || !reg) return 0;
+    /* Snapshot the count: we append to resolved_calls inside the loop,
+     * but only want to scan the original unresolved entries. */
+    int initial_count = result->resolved_calls.count;
+    int newly_resolved = 0;
+
+    for (int i = 0; i < initial_count; i++) {
+        const CBMResolvedCall* uc = &result->resolved_calls.items[i];
+        if (!uc->strategy || !uc->callee_qn || !uc->caller_qn) continue;
+        if (strcmp(uc->strategy, "lsp_unresolved") != 0) continue;
+
+        /* Case 1: callee_qn is already a fully-qualified type/pkg
+         * symbol that per-file LSP couldn't find in its local registry
+         * but the global registry has. (method_not_found with NAMED
+         * receiver, or any other case where callee_qn looks like a
+         * full QN). Direct lookup. */
+        const CBMRegisteredFunc* f = cbm_registry_lookup_func(reg, uc->callee_qn);
+
+        /* Case 2: callee_qn is "local_pkg_alias.suffix" — the alias
+         * needs translating through the file's import map to get the
+         * real module QN. */
+        if (!f) {
+            const char* dot = strchr(uc->callee_qn, '.');
+            if (dot) {
+                size_t prefix_len = (size_t)(dot - uc->callee_qn);
+                if (prefix_len > 0 && prefix_len < 256) {
+                    char prefix[256];
+                    memcpy(prefix, uc->callee_qn, prefix_len);
+                    prefix[prefix_len] = '\0';
+                    const char* suffix = dot + 1;
+                    for (int j = 0; j < import_count; j++) {
+                        if (import_names[j] && import_qns[j] &&
+                            strcmp(prefix, import_names[j]) == 0) {
+                            char fq[1024];
+                            int n = snprintf(fq, sizeof(fq), "%s.%s",
+                                             import_qns[j], suffix);
+                            if (n > 0 && n < (int)sizeof(fq)) {
+                                f = cbm_registry_lookup_func(reg, fq);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!f) continue;
+
+        /* Emit a resolved entry. cbm_pipeline_find_lsp_resolution
+         * picks the highest-confidence match, so the unresolved entry
+         * stays (harmless duplicate) but our resolved entry wins. */
+        CBMResolvedCall rc;
+        rc.caller_qn = uc->caller_qn;
+        rc.callee_qn = f->qualified_name; /* borrowed from pipeline arena */
+        rc.strategy = "lsp_strategy_cross_file";
+        rc.confidence = 0.92f;
+        rc.reason = NULL;
+        cbm_resolvedcall_push(&result->resolved_calls, &result->arena, rc);
+        newly_resolved++;
+    }
+
+    /* Return value mirrors the old contract (count of items still
+     * needing the slow path) but is always 0 now — caller should
+     * unconditionally skip the slow path for Go. */
+    (void)newly_resolved;
+    return 0;
 }
 
 // --- Batch cross-file LSP ---

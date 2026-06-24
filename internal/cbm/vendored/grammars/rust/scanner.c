@@ -5,6 +5,7 @@
 
 enum TokenType {
     STRING_CONTENT,
+    STRING_CLOSE,
     RAW_STRING_LITERAL_START,
     RAW_STRING_LITERAL_CONTENT,
     RAW_STRING_LITERAL_END,
@@ -361,7 +362,16 @@ bool tree_sitter_rust_external_scanner_scan(void *payload, TSLexer *lexer, const
     }
 
     if (valid_symbols[STRING_CONTENT] && !valid_symbols[FLOAT_LITERAL]) {
-        return process_string(lexer);
+        if (process_string(lexer)) return true;
+        // process_string returns false when the next char is '"' or '\' (no
+        // content to emit). Fall through so STRING_CLOSE can consume the '"'.
+    }
+
+    if (valid_symbols[STRING_CLOSE] && lexer->lookahead == '"') {
+        advance(lexer);
+        lexer->result_symbol = STRING_CLOSE;
+        lexer->mark_end(lexer);
+        return true;
     }
 
     if (valid_symbols[LINE_DOC_CONTENT]) {

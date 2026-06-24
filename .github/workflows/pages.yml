@@ -1,0 +1,44 @@
+# Deploy the static site in /docs to GitHub Pages.
+#
+# Replaces the legacy "Deploy from a branch" (Jekyll) build, which ran on
+# EVERY push to main and failed because Jekyll's Liquid parser choked on the
+# planning docs under /docs (e.g. `Unknown tag 'data'` in EVALUATION_PLAN.md).
+# /docs is a hand-written static site (index.html + robots/sitemap/llms.txt),
+# so we upload it as-is — no Jekyll — and only run when the site changes.
+#
+# Requires the repo Pages source to be set to "GitHub Actions"
+# (Settings → Pages → Build and deployment → Source: GitHub Actions).
+name: Deploy Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; never cancel an in-progress publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ./docs
+      - id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

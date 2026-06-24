@@ -9,6 +9,8 @@
 #define SCOPE_CLASS 2
 #define SCOPE_CALL 3
 #define SCOPE_IMPORT 4
+#define SCOPE_LOOP 5
+#define SCOPE_BRANCH 6
 
 #define MAX_SCOPES 64
 
@@ -19,6 +21,8 @@ typedef struct {
     const char *enclosing_class_qn; // current class QN (NULL outside class)
     bool inside_call;               // within a call_node_types subtree
     bool inside_import;             // within an import_node_types subtree
+    int loop_depth;                 // count of enclosing loop scopes (for bottleneck metrics)
+    int branch_depth;               // count of enclosing branch scopes
 
     struct {
         const char *qn;

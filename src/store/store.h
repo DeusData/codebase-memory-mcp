@@ -169,11 +169,15 @@ typedef struct {
 typedef struct {
     const char *label;
     int count;
+    char **properties; /* distinct property keys for this label (base + JSON) */
+    int property_count;
 } cbm_label_count_t;
 
 typedef struct {
     const char *type;
     int count;
+    char **properties; /* distinct property keys for this edge type (base + JSON) */
+    int property_count;
 } cbm_type_count_t;
 
 typedef struct {
@@ -255,6 +259,15 @@ int cbm_store_create_indexes(cbm_store_t *s);
 
 /* Force WAL checkpoint + PRAGMA optimize. */
 int cbm_store_checkpoint(cbm_store_t *s);
+
+/* Resolve the mmap_size pragma value applied to on-disk stores from the
+ * CBM_SQLITE_MMAP_SIZE environment variable. Defaults to 67108864 (64 MB)
+ * when the variable is unset, malformed, or partially numeric. Negative
+ * values clamp to 0 (which disables mmap and reverts to read()/pread()
+ * I/O — recoverable SQLITE_IOERR instead of SIGBUS when concurrent
+ * processes truncate the DB file under live mappings). Exposed for
+ * testability. */
+int64_t cbm_store_resolve_mmap_size(void);
 
 /* ── Dump / Restore ─────────────────────────────────────────────── */
 
@@ -422,6 +435,11 @@ int cbm_deduplicate_hops(const cbm_node_hop_t *hops, int hop_count, cbm_node_hop
 
 int cbm_store_get_schema(cbm_store_t *s, const char *project, cbm_schema_info_t *out);
 
+/* Like cbm_store_get_schema but skips per-label/per-type JSON property-key
+ * discovery (json_each scans over every row) — for callers that only need
+ * label/type counts, e.g. get_architecture. */
+int cbm_store_get_schema_counts(cbm_store_t *s, const char *project, cbm_schema_info_t *out);
+
 /* Free a schema info's allocated memory. */
 void cbm_store_schema_free(cbm_schema_info_t *out);
 
@@ -545,9 +563,11 @@ void cbm_store_adr_free(cbm_adr_t *adr);
 
 /* ADR section parsing/rendering (pure functions, no store needed) */
 
+enum { PROPS_MAX = 16 };
+
 typedef struct {
-    char *keys[16];
-    char *values[16];
+    char *keys[PROPS_MAX];
+    char *values[PROPS_MAX];
     int count;
 } cbm_adr_sections_t;
 
@@ -582,7 +602,7 @@ const char *cbm_qn_to_top_package(const char *qn);
 bool cbm_is_test_file_path(const char *fp);
 int cbm_store_find_architecture_docs(cbm_store_t *s, const char *project, char ***out, int *count);
 
-/* ── Louvain algorithm ─────────────────────────────────────────── */
+/* ── Community detection (Leiden) ──────────────────────────────── */
 
 typedef struct {
     int64_t src;
@@ -594,6 +614,16 @@ typedef struct {
     int community;
 } cbm_louvain_result_t;
 
+/* Multi-level Leiden community detection (Traag, Waltman & van Eck 2019,
+ * arXiv:1810.08473): local moving + refinement + aggregation, repeated until
+ * the partition can no longer be coarsened. Refinement guarantees every
+ * reported community is internally connected. The resolution parameter
+ * controls granularity (higher -> more, smaller communities); 1.0 is standard.
+ * Allocates *out (length *out_count == node_count); the caller frees it. */
+int cbm_leiden(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
+               int edge_count, double resolution, cbm_louvain_result_t **out, int *out_count);
+
+/* Convenience wrapper: cbm_leiden with resolution 1.0. */
 int cbm_louvain(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
                 int edge_count, cbm_louvain_result_t **out, int *out_count);
 
@@ -616,5 +646,35 @@ void cbm_store_free_projects(cbm_project_t *projects, int count);
 
 /* Free an array of file hashes. */
 void cbm_store_free_file_hashes(cbm_file_hash_t *hashes, int count);
+
+/* ── Vector search ───────────────────────────────────────────────── */
+
+/* Result from vector similarity search. */
+typedef struct {
+    int64_t node_id;
+    char *name;
+    char *qualified_name;
+    char *file_path;
+    char *label;
+    double score;
+} cbm_vector_result_t;
+
+/* Search for nodes similar to the given query keywords using stored RI vectors.
+ * Builds a merged query vector from the keywords, then does cosine scan via
+ * the cbm_cosine_i8 SQL function joined with the nodes table.
+ * Returns results sorted by score DESC. Caller must free with cbm_store_free_vector_results. */
+int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
+                            int keyword_count, int limit, cbm_vector_result_t **out,
+                            int *out_count);
+
+/* Free vector search results. */
+void cbm_store_free_vector_results(cbm_vector_result_t *results, int count);
+
+/* Count vectors for a project. */
+int cbm_store_count_vectors(cbm_store_t *s, const char *project);
+
+/* Execute an arbitrary SQL statement (pragmas, FTS5 maintenance, etc).
+ * Returns CBM_STORE_OK on success. */
+int cbm_store_exec(cbm_store_t *s, const char *sql);
 
 #endif /* CBM_STORE_H */

@@ -1,0 +1,28 @@
+{
+  "_comment": "License allow-list for the CI license gate (scripts/license-gate.sh). A single detected SPDX id outside this list fails the pipeline. Additions to this list are deliberate, reviewed changes \u2014 never add copyleft (GPL/LGPL/AGPL/EPL/SSPL) without a maintainer decision.",
+  "allowed_spdx_ids": [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "Unlicense",
+    "CC0-1.0",
+    "blessing",
+    "LLVM-exception",
+    "LicenseRef-scancode-public-domain",
+    "LicenseRef-scancode-public-domain-disclaimer"
+  ],
+  "_ignored_paths_comment": "Path prefixes (relative to the staged scan tree) excluded from the gate. Use ONLY for documented false positives. Justifications: the license tooling itself (gate scripts + this policy file) necessarily names prohibited licenses; gen-third-party-notices.sh echoes license terminology; audit-license-provenance.py names licenses in its verdict maps; src/discover/discover.c contains a license-FILENAME classification list (LICENSE-MIT, LICENSE-APACHE, ...) for file discovery, which ScanCode reads as license references.",
+  "ignored_paths": [
+    "tree/scripts/license-policy.json",
+    "tree/scripts/license-gate-check.py",
+    "tree/scripts/license-gate.sh",
+    "tree/scripts/gen-third-party-notices.sh",
+    "tree/src/discover/discover.c",
+    "tree/scripts/audit-license-provenance.py"
+  ]
+}

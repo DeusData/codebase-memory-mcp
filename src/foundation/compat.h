@@ -88,10 +88,19 @@ static inline int cbm_nanosleep(const struct timespec *req, struct timespec *rem
 #define cbm_nanosleep nanosleep
 #endif
 
+/* ── gmtime_r (Windows lacks it) ─────────────────────────────── */
+#ifdef _WIN32
+static inline struct tm *cbm_gmtime_r(const time_t *timep, struct tm *result) {
+    return gmtime_s(result, timep) == 0 ? result : NULL;
+}
+#else
+#define cbm_gmtime_r gmtime_r
+#endif
+
 /* ── mkdtemp (Windows lacks it) ──────────────────────────────── */
 #ifdef _WIN32
 /* Translates /tmp/ to %TEMP%\ and copies result back to tmpl.
- * Callers MUST use char buf[256] or larger. */
+ * Callers MUST use char buf[CBM_SZ_256] or larger. */
 char *cbm_mkdtemp(char *tmpl);
 #else
 #define cbm_mkdtemp mkdtemp

@@ -21,7 +21,7 @@ typedef struct cbm_store cbm_store_t;
 
 /* ── Constants ─────────────────────────────────────────────────── */
 
-#define CBM_PATH_MAX 4096
+#define CBM_DEP_PATH_MAX 4096 /* renamed: avoids collision with constants.h enum CBM_PATH_MAX (1024) */
 #define CBM_NAME_MAX 512
 #define CBM_DEP_SEPARATOR ".dep."
 #define CBM_DEP_SEPARATOR_LEN 5

@@ -1,4 +1,33 @@
+# codebase-memory-mcp — all crawlers welcome, including AI answer engines.
 User-agent: *
+Allow: /
+
+# Explicitly allow AI / LLM crawlers used by answer engines.
+User-agent: GPTBot
+Allow: /
+
+User-agent: OAI-SearchBot
+Allow: /
+
+User-agent: ChatGPT-User
+Allow: /
+
+User-agent: ClaudeBot
+Allow: /
+
+User-agent: Claude-Web
+Allow: /
+
+User-agent: PerplexityBot
+Allow: /
+
+User-agent: Google-Extended
+Allow: /
+
+User-agent: Applebot-Extended
+Allow: /
+
+User-agent: Bingbot
 Allow: /
 
 Sitemap: https://deusdata.github.io/codebase-memory-mcp/sitemap.xml

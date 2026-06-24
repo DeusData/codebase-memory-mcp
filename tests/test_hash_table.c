@@ -163,13 +163,16 @@ TEST(ht_long_key) {
     PASS();
 }
 
-TEST(ht_power_of_two_capacity) {
-    /* Capacity 7 should be rounded up to 8 */
+TEST(ht_create_small_capacity) {
+    /* Small initial-capacity hints (7, 0, 1) must still produce a
+     * usable table. CBMHashTable is opaque now (Verstable internals)
+     * so we check the API contract, not impl details like power-of-2
+     * sizing. */
     CBMHashTable *ht = cbm_ht_create(7);
     ASSERT_NOT_NULL(ht);
-    /* capacity should be >= 8 and power of 2 */
-    ASSERT_GTE(ht->capacity, 8);
-    ASSERT_EQ(ht->capacity & (ht->capacity - 1), 0); /* power of 2 check */
+    int v = 42;
+    cbm_ht_set(ht, "test", &v);
+    ASSERT_EQ(*(int *)cbm_ht_get(ht, "test"), 42);
     cbm_ht_free(ht);
     PASS();
 }
@@ -312,12 +315,10 @@ TEST(ht_interleaved_insert_delete) {
 }
 
 TEST(ht_create_capacity_zero) {
-    /* Capacity 0 should be rounded up to minimum (8) */
+    /* Capacity hint 0 → library picks default. Must produce a usable
+     * table (no struct-internals checks now that CBMHashTable is opaque). */
     CBMHashTable *ht = cbm_ht_create(0);
     ASSERT_NOT_NULL(ht);
-    ASSERT_GTE(ht->capacity, 8);
-    ASSERT_EQ(ht->capacity & (ht->capacity - 1), 0);
-    /* Should be usable */
     int v = 42;
     cbm_ht_set(ht, "test", &v);
     ASSERT_EQ(*(int *)cbm_ht_get(ht, "test"), 42);
@@ -326,10 +327,9 @@ TEST(ht_create_capacity_zero) {
 }
 
 TEST(ht_create_capacity_one) {
-    /* Capacity 1 should be rounded up to minimum (8) */
+    /* Capacity hint 1 → library picks default. Must produce a usable table. */
     CBMHashTable *ht = cbm_ht_create(1);
     ASSERT_NOT_NULL(ht);
-    ASSERT_GTE(ht->capacity, 8);
     int v = 99;
     cbm_ht_set(ht, "k", &v);
     ASSERT_EQ(*(int *)cbm_ht_get(ht, "k"), 99);
@@ -353,34 +353,15 @@ TEST(ht_stress_10000) {
         ASSERT_NOT_NULL(got);
         ASSERT_EQ(*(int *)got, i);
     }
-    /* Capacity should still be power of 2 */
-    ASSERT_EQ(ht->capacity & (ht->capacity - 1), 0);
     cbm_ht_free(ht);
     PASS();
 }
 
-TEST(ht_robin_hood_bounded_psl) {
-    /* Max PSL should be bounded — Robin Hood keeps probes short.
-     * With 10000 entries and power-of-2 sizing, max PSL should be < 32. */
-    CBMHashTable *ht = cbm_ht_create(16);
-    char key[24];
-    int val = 0;
-    for (int i = 0; i < 10000; i++) {
-        snprintf(key, sizeof(key), "rh_%06d", i);
-        cbm_ht_set(ht, key, &val);
-    }
-    /* Scan entries, find max PSL */
-    uint32_t max_psl = 0;
-    for (uint32_t i = 0; i < ht->capacity; i++) {
-        if (ht->entries[i].psl > max_psl) {
-            max_psl = ht->entries[i].psl;
-        }
-    }
-    /* Robin Hood guarantees bounded PSL — should be well under 32 */
-    ASSERT_LT(max_psl, 32);
-    cbm_ht_free(ht);
-    PASS();
-}
+/* ht_robin_hood_bounded_psl removed — Robin-Hood-specific PSL is no
+ * longer an implementation detail of CBMHashTable (replaced by
+ * Verstable's quadratic-probing + chain metadata). The functional
+ * equivalent (fast lookups under load) is covered by ht_stress_10000
+ * which would TIME OUT or produce wrong results if probing went wild. */
 
 SUITE(hash_table) {
     RUN_TEST(ht_create_free);
@@ -396,7 +377,7 @@ SUITE(hash_table) {
     RUN_TEST(ht_clear);
     RUN_TEST(ht_empty_string_key);
     RUN_TEST(ht_long_key);
-    RUN_TEST(ht_power_of_two_capacity);
+    RUN_TEST(ht_create_small_capacity);
     /* Edge cases */
     RUN_TEST(ht_get_key_returns_stored_pointer);
     RUN_TEST(ht_get_key_missing);
@@ -412,5 +393,5 @@ SUITE(hash_table) {
     RUN_TEST(ht_create_capacity_zero);
     RUN_TEST(ht_create_capacity_one);
     RUN_TEST(ht_stress_10000);
-    RUN_TEST(ht_robin_hood_bounded_psl);
+    /* ht_robin_hood_bounded_psl removed in Verstable swap. */
 }

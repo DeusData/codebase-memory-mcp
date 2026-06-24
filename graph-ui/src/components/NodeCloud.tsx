@@ -8,6 +8,7 @@ interface NodeCloudProps {
   highlightedIds: Set<number> | null;
   onHover: (node: GraphNode | null) => void;
   onClick: (node: GraphNode) => void;
+  opacity?: number;
 }
 
 export function NodeCloud({
@@ -15,6 +16,7 @@ export function NodeCloud({
   highlightedIds,
   onHover,
   onClick,
+  opacity = 1.0,
 }: NodeCloudProps) {
   const meshRef = useRef<THREE.InstancedMesh>(null);
   const tempObj = useMemo(() => new THREE.Object3D(), []);
@@ -36,12 +38,12 @@ export function NodeCloud({
         const boost = 1.2 + brightness * 0.8; /* 1.2x for red, 2.0x for white */
         tempColor.multiplyScalar(boost);
       }
-      arr[i * 3] = tempColor.r;
-      arr[i * 3 + 1] = tempColor.g;
-      arr[i * 3 + 2] = tempColor.b;
+      arr[i * 3] = tempColor.r * opacity;
+      arr[i * 3 + 1] = tempColor.g * opacity;
+      arr[i * 3 + 2] = tempColor.b * opacity;
     }
     return arr;
-  }, [nodes, highlightedIds, tempColor]);
+  }, [nodes, highlightedIds, tempColor, opacity]);
 
   useFrame(() => {
     const mesh = meshRef.current;

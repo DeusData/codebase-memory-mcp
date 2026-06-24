@@ -18,10 +18,19 @@ export interface GraphEdge {
   type: string;
 }
 
+export interface LinkedProject {
+  project: string;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  offset: { x: number; y: number; z: number };
+  cross_edges: GraphEdge[];
+}
+
 export interface GraphData {
   nodes: GraphNode[];
   edges: GraphEdge[];
   total_nodes: number;
+  linked_projects?: LinkedProject[];
 }
 
 export interface Project {

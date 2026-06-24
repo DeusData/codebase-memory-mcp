@@ -13,8 +13,9 @@ extern "C" {
 #define ts_builtin_sym_end 0
 #define TREE_SITTER_SERIALIZATION_BUFFER_SIZE 1024
 
-#ifndef TREE_SITTER_API_H_
 typedef uint16_t TSStateId;
+
+#ifndef TREE_SITTER_API_H_
 typedef uint16_t TSSymbol;
 typedef uint16_t TSFieldId;
 typedef struct TSLanguage TSLanguage;
@@ -101,8 +102,8 @@ struct TSLanguage {
   const uint16_t *small_parse_table;
   const uint32_t *small_parse_table_map;
   const TSParseActionEntry *parse_actions;
-  const char * const *symbol_names;
-  const char * const *field_names;
+  const char **symbol_names;
+  const char **field_names;
   const TSFieldMapSlice *field_map_slices;
   const TSFieldMapEntry *field_map_entries;
   const TSSymbolMetadata *symbol_metadata;
@@ -122,23 +123,15 @@ struct TSLanguage {
     unsigned (*serialize)(void *, char *);
     void (*deserialize)(void *, const char *, unsigned);
   } external_scanner;
-  const TSStateId *primary_state_ids;
 };
 
 /*
  *  Lexer Macros
  */
 
-#ifdef _MSC_VER
-#define UNUSED __pragma(warning(suppress : 4101))
-#else
-#define UNUSED __attribute__((unused))
-#endif
-
 #define START_LEXER()           \
   bool result = false;          \
   bool skip = false;            \
-  UNUSED                        \
   bool eof = false;             \
   int32_t lookahead;            \
   goto start;                   \
@@ -172,7 +165,7 @@ struct TSLanguage {
  *  Parse Table Macros
  */
 
-#define SMALL_STATE(id) ((id) - LARGE_STATE_COUNT)
+#define SMALL_STATE(id) id - LARGE_STATE_COUNT
 
 #define STATE(id) id
 
@@ -182,7 +175,7 @@ struct TSLanguage {
   {{                                  \
     .shift = {                        \
       .type = TSParseActionTypeShift, \
-      .state = (state_value)          \
+      .state = state_value            \
     }                                 \
   }}
 
@@ -190,7 +183,7 @@ struct TSLanguage {
   {{                                  \
     .shift = {                        \
       .type = TSParseActionTypeShift, \
-      .state = (state_value),         \
+      .state = state_value,           \
       .repetition = true              \
     }                                 \
   }}
@@ -203,10 +196,12 @@ struct TSLanguage {
     }                                 \
   }}
 
-#define REDUCE(...) \
+#define REDUCE(symbol_val, child_count_val, ...) \
   {{                                             \
     .reduce = {                                  \
       .type = TSParseActionTypeReduce,           \
+      .symbol = symbol_val,                      \
+      .child_count = child_count_val,            \
       __VA_ARGS__                                \
     },                                           \
   }}

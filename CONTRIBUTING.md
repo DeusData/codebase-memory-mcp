@@ -86,9 +86,9 @@ src/
   discover/         File discovery with gitignore support
   watcher/          Git-based background auto-sync
   cli/              CLI subcommands (install, update, uninstall, config)
-  ui/               Graph visualization HTTP server (mongoose)
+  ui/               Graph visualization HTTP server (first-party httpd)
 internal/cbm/       Tree-sitter AST extraction (64 languages, vendored C grammars)
-vendored/           sqlite3, yyjson, mongoose, mimalloc, xxhash, tre
+vendored/           sqlite3, yyjson, mimalloc, xxhash, tre, nomic
 graph-ui/           React/Three.js frontend for graph visualization
 scripts/            Build, test, lint, security audit scripts
 tests/              All C test files
@@ -142,8 +142,32 @@ Examples: `fix(store): set busy_timeout before WAL`, `feat(cli): add --progress 
 
 ## Pull Request Guidelines
 
-- **One issue per PR.** Each PR must address exactly one bug, one feature, or one refactor. Do not bundle multiple fixes or feature additions into a single PR. If your change touches multiple areas, split it into separate PRs.
-- **Open an issue first.** Every PR should reference a tracking issue (`Fixes #N` or `Closes #N`). This ensures the change is discussed before code is written.
+### Before You Write Code
+
+- **Open an issue first — always.** Every PR must reference a tracking issue (`Fixes #N` or `Closes #N`). Describe what you want to change and why. Wait for maintainer feedback before implementing. PRs without a prior issue discussion will be closed.
+- **Bug fixes and test additions** are the exception — these are welcome without prior discussion, as long as they're focused.
+
+### What Requires Explicit Maintainer Approval
+
+The following changes will not be merged without prior design discussion in an issue:
+
+- **API surface changes** — adding, removing, renaming, or changing defaults of MCP tools
+- **New pipeline passes or indexing algorithms** — anything that changes what gets extracted or how
+- **Build system / Makefile changes** — beyond trivial fixes
+- **Project configuration** — CLAUDE.md, skill files, .mcp.json, CI workflows
+- **New dependencies** — vendored or otherwise
+- **Breaking changes** of any kind
+
+If in doubt, open an issue and ask.
+
+### PR Scope and Size
+
+- **One issue per PR.** Each PR must address exactly one bug, one feature, or one refactor. Do not bundle multiple fixes or feature additions into a single PR. Kitchen-sink PRs will be closed with a request to split.
+- **Keep PRs small.** A good PR is under 500 lines. If your change is larger, split it into reviewable increments that each stand on their own.
+- **Don't mix features with fixes.** If you find a bug while implementing a feature, submit the bug fix as a separate PR.
+
+### Code Requirements
+
 - **C code only** — this project was rewritten from Go to pure C in v0.5.0. Go PRs will be acknowledged and potentially ported, but cannot be merged directly.
 - Include tests for new functionality
 - Run `scripts/test.sh` and `scripts/lint.sh` before submitting
@@ -162,6 +186,40 @@ If you add a new `system()`, `popen()`, `fork()`, or network call, it must be ju
 
 Check [issues labeled `good first issue`](https://github.com/DeusData/codebase-memory-mcp/labels/good%20first%20issue) for beginner-friendly tasks with clear scope and guidance.
 
-## License
+## License and sign-off (DCO) — required on every commit
 
-By contributing, you agree that your contributions will be licensed under the MIT License.
+All contributions are licensed under the project's MIT License
+(inbound = outbound). To make that explicit and permanent, this project
+uses the [Developer Certificate of Origin 1.1](DCO) — the same mechanism
+as the Linux kernel: **every commit must carry a `Signed-off-by` trailer
+matching the commit author.**
+
+```bash
+git commit -s             # adds: Signed-off-by: Your Name <you@example.com>
+```
+
+**Adding a `Signed-off-by` line to a commit constitutes your certification
+of the [Developer Certificate of Origin 1.1](DCO) — in full, all four
+clauses — for that contribution.** The sign-off must match the commit's
+author name and email (enforced by CI). In short: you certify that you
+wrote the change or otherwise have the right to submit it under the MIT
+license, and that you understand the contribution and your sign-off are
+public and permanent.
+
+(Independently of the DCO, submitting a contribution to this repository is
+also subject to GitHub's Terms of Service §D.6, under which contributions
+are licensed inbound = outbound — i.e., under this repository's MIT
+license.)
+
+Enforcement is strict and automated:
+
+- CI rejects every push and pull request containing an unsigned commit
+  (`scripts/check-dco.sh`).
+- Install the local hook so unsigned commits are rejected at commit time:
+
+```bash
+scripts/install-git-hooks.sh
+```
+
+Forgot to sign? `git commit --amend -s` fixes the last commit;
+`git rebase --signoff <base>` fixes a whole branch.

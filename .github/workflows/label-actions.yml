@@ -1,0 +1,21 @@
+name: Label actions
+
+# Posts a templated comment when a maintainer adds certain labels.
+# Behavior is configured in .github/label-actions.yml. Issues only.
+
+on:
+  issues:
+    types: [labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  action:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: dessant/label-actions@65225c179d3b2502f6eda7b3d15101a3f412366b # v5.0.3
+        with:
+          process-only: issues

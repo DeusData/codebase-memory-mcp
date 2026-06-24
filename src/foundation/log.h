@@ -5,7 +5,8 @@
  *   - All output goes to stderr (stdout is reserved for MCP JSON-RPC)
  *   - Structured format: "level=info msg=pass.timing pass=defs elapsed_ms=42"
  *   - Levels: DEBUG, INFO, WARN, ERROR
- *   - Level filtering at compile time (CBM_LOG_MIN_LEVEL) and runtime
+ *   - Level filtering at runtime via cbm_log_set_level() or the
+ *     CBM_LOG_LEVEL env var (see cbm_log_init_from_env)
  *   - Thread-safe (each fprintf is atomic on POSIX for lines < PIPE_BUF)
  */
 #ifndef CBM_LOG_H
@@ -20,6 +21,13 @@ typedef enum {
     CBM_LOG_ERROR = 3,
     CBM_LOG_NONE = 4 /* disable all logging */
 } CBMLogLevel;
+
+/* Apply the CBM_LOG_LEVEL environment variable to the runtime log level.
+ * Accepts (case-insensitive) "debug", "info", "warn", "error", "none", or
+ * the numeric equivalents 0..4 matching CBMLogLevel. Unknown, empty, or
+ * unset values leave the level unchanged (fail-open). Call once at startup,
+ * before any threads or log statements. Distilled from #414 (closes #413). */
+void cbm_log_init_from_env(void);
 
 /* Set minimum log level (default: INFO). */
 void cbm_log_set_level(CBMLogLevel level);

@@ -32,6 +32,15 @@ void cbm_http_server_run(cbm_http_server_t *srv);
 /* Check if the server started successfully (listener bound). */
 bool cbm_http_server_is_running(const cbm_http_server_t *srv);
 
+/* The actually-bound port (useful when constructed with port 0 in tests). */
+int cbm_http_server_port(const cbm_http_server_t *srv);
+
+/* Override the per-connection receive deadline (tests use short values). */
+void cbm_http_server_set_recv_deadline_ms(cbm_http_server_t *srv, int ms);
+
+/* Initialize the log ring buffer mutex. Must be called once before any threads. */
+void cbm_ui_log_init(void);
+
 /* Append a log line to the UI ring buffer (called from log hook). */
 void cbm_ui_log_append(const char *line);
 

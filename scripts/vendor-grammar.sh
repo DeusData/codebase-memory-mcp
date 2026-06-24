@@ -48,6 +48,17 @@ if [ -d "$SRC_DIR/tree_sitter" ]; then
     cp "$SRC_DIR/tree_sitter/"*.h "$GRAMMAR_DIR/tree_sitter/" 2>/dev/null || true
 fi
 
+# Copy any extra headers (.h, .inc files) used by scanners
+# Examples: tag.h (Vue/Svelte/Astro), unicode.h (PureScript/Typst),
+# TokenTree.h/.inc (VHDL)
+for f in "$SRC_DIR"/*.h "$SRC_DIR"/*.inc; do
+    [ -f "$f" ] && cp "$f" "$GRAMMAR_DIR/"
+done
+# Copy common/ subdirectory if present (e.g., F# scanner uses common/scanner.h)
+if [ -d "$SRC_DIR/common" ]; then
+    cp -r "$SRC_DIR/common" "$GRAMMAR_DIR/"
+fi
+
 # Copy LICENSE file from upstream repo
 REPO_ROOT="$TMPDIR/repo"
 if [ -n "$SUBDIR" ]; then
