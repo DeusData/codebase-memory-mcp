@@ -11,6 +11,8 @@ bin/
 *.test
 *.out
 coverage.txt
+# Clang static analyzer (make -f Makefile.cbm test-analyze) per-file reports
+*.plist
 
 # Test fixture temp dirs (created by C test suite in CWD instead of /tmp/)
 cbm_*/
