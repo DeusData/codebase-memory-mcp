@@ -185,6 +185,28 @@ TEST(mcp_tools_list) {
     PASS();
 }
 
+TEST(mcp_tools_list_classic_mode) {
+    /* Classic mode (CBM_TOOL_MODE=classic) emits the original 15 split tools,
+     * not the streamlined consolidated set. The env var is read at call time
+     * (src/mcp/mcp.c:870), so set it, capture the list, then unset it BEFORE any
+     * ASSERT — a failed assert must not leak the classic setting into sibling
+     * tests (which expect the streamlined default). */
+    setenv("CBM_TOOL_MODE", "classic", 1);
+    char *json = cbm_mcp_tools_list(NULL);
+    unsetenv("CBM_TOOL_MODE");
+    ASSERT_NOT_NULL(json);
+    /* Classic split tools are present (TOOLS[] in mcp.c). */
+    ASSERT_NOT_NULL(strstr(json, "\"index_repository\""));
+    ASSERT_NOT_NULL(strstr(json, "\"search_graph\""));
+    ASSERT_NOT_NULL(strstr(json, "\"query_graph\""));
+    /* The streamlined-only consolidated tool + progressive-disclosure hint are
+     * NOT emitted in classic mode. */
+    ASSERT_NULL(strstr(json, "\"search_code_graph\""));
+    ASSERT_NULL(strstr(json, "_hidden_tools"));
+    free(json);
+    PASS();
+}
+
 TEST(mcp_tools_array_schemas_have_items) {
     /* VS Code 1.112+ rejects array schemas without "items" (see
      * https://github.com/microsoft/vscode/issues/248810).
@@ -2269,6 +2291,7 @@ SUITE(mcp) {
     /* MCP protocol helpers */
     RUN_TEST(mcp_initialize_response);
     RUN_TEST(mcp_tools_list);
+    RUN_TEST(mcp_tools_list_classic_mode);
     RUN_TEST(mcp_tools_array_schemas_have_items);
     RUN_TEST(mcp_text_result);
     RUN_TEST(mcp_text_result_error);
