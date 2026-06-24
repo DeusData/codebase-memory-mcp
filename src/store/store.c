@@ -3229,16 +3229,135 @@ static const char *file_ext(const char *path) {
     return buf;
 }
 
+/* ── Architecture path scope (issue #604) ──────────────────────── */
+
+typedef struct {
+    char prefix[CBM_SZ_512];
+    char like[CBM_SZ_512];
+    bool active;
+} cbm_arch_path_scope_t;
+
+static void arch_path_scope_init(cbm_arch_path_scope_t *sc, const char *path) {
+    memset(sc, 0, sizeof(*sc));
+    if (!path || !path[0]) {
+        return;
+    }
+    char buf[CBM_SZ_512];
+    snprintf(buf, sizeof(buf), "%s", path);
+    cbm_normalize_path_sep(buf);
+    const char *p = buf;
+    while (p[0] == '.' && p[1] == '/') {
+        p += 2;
+    }
+    size_t len = strlen(p);
+    while (len > 0 && p[len - 1] == '/') {
+        len--;
+    }
+    if (len == 0 || len >= sizeof(sc->prefix)) {
+        return;
+    }
+    memcpy(sc->prefix, p, len);
+    sc->prefix[len] = '\0';
+    snprintf(sc->like, sizeof(sc->like), "%s/%%", sc->prefix);
+    sc->active = true;
+}
+
+#define ARCH_FILE_SCOPE_SQL " AND (file_path = ?2 OR file_path LIKE ?3)"
+#define ARCH_N_FILE_SCOPE_SQL " AND (n.file_path = ?2 OR n.file_path LIKE ?3)"
+
+static void arch_bind_file_scope(sqlite3_stmt *stmt, const cbm_arch_path_scope_t *sc) {
+    if (sc && sc->active) {
+        bind_text(stmt, ST_COL_2, sc->prefix);
+        bind_text(stmt, ST_COL_3, sc->like);
+    }
+}
+
+static void arch_append_file_scope(char *sqlbuf, size_t cap, const cbm_arch_path_scope_t *sc) {
+    if (sc && sc->active) {
+        size_t n = strlen(sqlbuf);
+        snprintf(sqlbuf + n, cap - n, "%s", ARCH_FILE_SCOPE_SQL);
+    }
+}
+
+static void arch_append_n_file_scope(char *sqlbuf, size_t cap, const cbm_arch_path_scope_t *sc) {
+    if (sc && sc->active) {
+        size_t n = strlen(sqlbuf);
+        snprintf(sqlbuf + n, cap - n, "%s", ARCH_N_FILE_SCOPE_SQL);
+    }
+}
+
+static int arch_count_nodes_scoped(cbm_store_t *s, const char *project, const cbm_arch_path_scope_t *sc) {
+    if (!sc || !sc->active) {
+        return cbm_store_count_nodes(s, project);
+    }
+    const char *sql = "SELECT COUNT(*) FROM nodes WHERE project=?1" ARCH_FILE_SCOPE_SQL;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    arch_bind_file_scope(stmt, sc);
+    int n = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        n = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return n;
+}
+
+static int arch_count_edges_scoped(cbm_store_t *s, const char *project, const cbm_arch_path_scope_t *sc) {
+    if (!sc || !sc->active) {
+        return cbm_store_count_edges(s, project);
+    }
+    const char *sql =
+        "SELECT COUNT(*) FROM edges e WHERE e.project=?1 AND EXISTS (SELECT 1 FROM nodes ns "
+        "WHERE ns.id=e.source_id AND ns.project=?1" ARCH_FILE_SCOPE_SQL
+        ") AND EXISTS (SELECT 1 FROM nodes nt WHERE nt.id=e.target_id AND nt.project=?1"
+        " AND (nt.file_path = ?4 OR nt.file_path LIKE ?5))";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    arch_bind_file_scope(stmt, sc);
+    bind_text(stmt, ST_COL_4, sc->prefix);
+    bind_text(stmt, ST_COL_5, sc->like);
+    int n = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        n = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return n;
+}
+
+int cbm_store_count_nodes_under_path(cbm_store_t *s, const char *project, const char *path) {
+    cbm_arch_path_scope_t sc;
+    arch_path_scope_init(&sc, path);
+    return arch_count_nodes_scoped(s, project, &sc);
+}
+
+int cbm_store_count_edges_under_path(cbm_store_t *s, const char *project, const char *path) {
+    cbm_arch_path_scope_t sc;
+    arch_path_scope_init(&sc, path);
+    return arch_count_edges_scoped(s, project, &sc);
+}
+
 /* ── Architecture aspect implementations ───────────────────────── */
 
-static int arch_languages(cbm_store_t *s, const char *project, cbm_architecture_info_t *out) {
-    const char *sql = "SELECT file_path FROM nodes WHERE project=?1 AND label='File'";
+static int arch_languages(cbm_store_t *s, const char *project, const cbm_arch_path_scope_t *sc,
+                          cbm_architecture_info_t *out) {
+    char sqlbuf[ST_SQL_BUF];
+    snprintf(sqlbuf, sizeof(sqlbuf),
+             "SELECT file_path FROM nodes WHERE project=?1 AND label='File'");
+    arch_append_file_scope(sqlbuf, sizeof(sqlbuf), sc);
+    const char *sql = sqlbuf;
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "arch_languages");
         return CBM_STORE_ERR;
     }
     bind_text(stmt, SKIP_ONE, project);
+    arch_bind_file_scope(stmt, sc);
 
     /* Count per language using a simple parallel array */
     const char *lang_names[CBM_SZ_64];
@@ -3295,18 +3414,24 @@ static int arch_languages(cbm_store_t *s, const char *project, cbm_architecture_
     return CBM_STORE_OK;
 }
 
-static int arch_entry_points(cbm_store_t *s, const char *project, cbm_architecture_info_t *out) {
-    const char *sql = "SELECT name, qualified_name, file_path FROM nodes "
-                      "WHERE project=?1 AND json_extract(properties, '$.is_entry_point') = 1 "
-                      "AND (json_extract(properties, '$.is_test') IS NULL OR "
-                      "json_extract(properties, '$.is_test') != 1) "
-                      "AND file_path NOT LIKE '%test%' LIMIT 20";
+static int arch_entry_points(cbm_store_t *s, const char *project, const cbm_arch_path_scope_t *sc,
+                             cbm_architecture_info_t *out) {
+    char sqlbuf[ST_SQL_BUF];
+    snprintf(sqlbuf, sizeof(sqlbuf),
+             "SELECT name, qualified_name, file_path FROM nodes "
+             "WHERE project=?1 AND json_extract(properties, '$.is_entry_point') = 1 "
+             "AND (json_extract(properties, '$.is_test') IS NULL OR "
+             "json_extract(properties, '$.is_test') != 1) "
+             "AND file_path NOT LIKE '%%test%%' LIMIT 20");
+    arch_append_file_scope(sqlbuf, sizeof(sqlbuf), sc);
+    const char *sql = sqlbuf;
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "arch_entry_points");
         return CBM_STORE_ERR;
     }
     bind_text(stmt, SKIP_ONE, project);
+    arch_bind_file_scope(stmt, sc);
 
     int cap = ST_INIT_CAP_8;
     int n = 0;
@@ -3351,18 +3476,24 @@ static char *extract_json_string_prop(const char *json, const char *key, int key
     return heap_strdup(vbuf);
 }
 
-static int arch_routes(cbm_store_t *s, const char *project, cbm_architecture_info_t *out) {
-    const char *sql = "SELECT name, properties, COALESCE(file_path, '') FROM nodes "
-                      "WHERE project=?1 AND label='Route' "
-                      "AND (json_extract(properties, '$.is_test') IS NULL OR "
-                      "json_extract(properties, '$.is_test') != 1) "
-                      "LIMIT 20";
+static int arch_routes(cbm_store_t *s, const char *project, const cbm_arch_path_scope_t *sc,
+                      cbm_architecture_info_t *out) {
+    char sqlbuf[ST_SQL_BUF];
+    snprintf(sqlbuf, sizeof(sqlbuf),
+             "SELECT name, properties, COALESCE(file_path, '') FROM nodes "
+             "WHERE project=?1 AND label='Route' "
+             "AND (json_extract(properties, '$.is_test') IS NULL OR "
+             "json_extract(properties, '$.is_test') != 1) "
+             "LIMIT 20");
+    arch_append_file_scope(sqlbuf, sizeof(sqlbuf), sc);
+    const char *sql = sqlbuf;
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "arch_routes");
         return CBM_STORE_ERR;
     }
     bind_text(stmt, SKIP_ONE, project);
+    arch_bind_file_scope(stmt, sc);
 
     int cap = ST_INIT_CAP_8;
     int n = 0;
@@ -3407,20 +3538,27 @@ static int arch_routes(cbm_store_t *s, const char *project, cbm_architecture_inf
     return CBM_STORE_OK;
 }
 
-static int arch_hotspots(cbm_store_t *s, const char *project, cbm_architecture_info_t *out) {
-    const char *sql = "SELECT n.name, n.qualified_name, COUNT(*) as fan_in "
-                      "FROM nodes n JOIN edges e ON e.target_id = n.id AND e.type = 'CALLS' "
-                      "WHERE n.project=?1 AND n.label IN ('Function', 'Method') "
-                      "AND (json_extract(n.properties, '$.is_test') IS NULL OR "
-                      "json_extract(n.properties, '$.is_test') != 1) "
-                      "AND n.file_path NOT LIKE '%test%' "
-                      "GROUP BY n.id ORDER BY fan_in DESC LIMIT 10";
+static int arch_hotspots(cbm_store_t *s, const char *project, const cbm_arch_path_scope_t *sc,
+                         cbm_architecture_info_t *out) {
+    char sqlbuf[ST_SQL_BUF];
+    snprintf(sqlbuf, sizeof(sqlbuf),
+             "SELECT n.name, n.qualified_name, COUNT(*) as fan_in "
+             "FROM nodes n JOIN edges e ON e.target_id = n.id AND e.type = 'CALLS' "
+             "WHERE n.project=?1 AND n.label IN ('Function', 'Method') "
+             "AND (json_extract(n.properties, '$.is_test') IS NULL OR "
+             "json_extract(n.properties, '$.is_test') != 1) "
+             "AND n.file_path NOT LIKE '%%test%%' ");
+    arch_append_n_file_scope(sqlbuf, sizeof(sqlbuf), sc);
+    size_t sl = strlen(sqlbuf);
+    snprintf(sqlbuf + sl, sizeof(sqlbuf) - sl, " GROUP BY n.id ORDER BY fan_in DESC LIMIT 10");
+    const char *sql = sqlbuf;
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "arch_hotspots");
         return CBM_STORE_ERR;
     }
     bind_text(stmt, SKIP_ONE, project);
+    arch_bind_file_scope(stmt, sc);
 
     int cap = ST_INIT_CAP_8;
     int n = 0;
@@ -3482,17 +3620,21 @@ static void accum_boundary(const char *src_pkg, const char *tgt_pkg, char **bfro
     }
 }
 
-static int arch_boundaries(cbm_store_t *s, const char *project, cbm_cross_pkg_boundary_t **out_arr,
-                           int *out_count) {
-    /* Build nodeID → package map. ORDER BY id so lookup_pkg can binary-search. */
-    const char *nsql = "SELECT id, qualified_name FROM nodes WHERE project=?1 AND label IN "
-                       "('Function','Method','Class') ORDER BY id";
+static int arch_boundaries(cbm_store_t *s, const char *project, const cbm_arch_path_scope_t *sc,
+                           cbm_cross_pkg_boundary_t **out_arr, int *out_count) {
+    char nsqlbuf[ST_SQL_BUF];
+    snprintf(nsqlbuf, sizeof(nsqlbuf),
+             "SELECT id, qualified_name, file_path FROM nodes WHERE project=?1 AND label IN "
+             "('Function','Method','Class') ORDER BY id");
+    arch_append_file_scope(nsqlbuf, sizeof(nsqlbuf), sc);
+    const char *nsql = nsqlbuf;
     sqlite3_stmt *nstmt = NULL;
     if (sqlite3_prepare_v2(s->db, nsql, CBM_NOT_FOUND, &nstmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "arch_boundaries_nodes");
         return CBM_STORE_ERR;
     }
     bind_text(nstmt, SKIP_ONE, project);
+    arch_bind_file_scope(nstmt, sc);
 
     int ncap = CBM_SZ_256;
     int nn = 0;
@@ -3591,16 +3733,21 @@ static int arch_boundaries(cbm_store_t *s, const char *project, cbm_cross_pkg_bo
 #define MAX_PREVIEW_NAMES 15
 
 /* Fallback: derive packages from QN segments when no Package nodes exist. */
-static int arch_packages_from_qn(cbm_store_t *s, const char *project,
+static int arch_packages_from_qn(cbm_store_t *s, const char *project, const cbm_arch_path_scope_t *sc,
                                  cbm_package_summary_t **out_arr, int *out_count) {
-    const char *qsql = "SELECT qualified_name FROM nodes WHERE project=?1 AND label IN "
-                       "('Function','Method','Class')";
+    char qsqlbuf[ST_SQL_BUF];
+    snprintf(qsqlbuf, sizeof(qsqlbuf),
+             "SELECT qualified_name FROM nodes WHERE project=?1 AND label IN "
+             "('Function','Method','Class')");
+    arch_append_file_scope(qsqlbuf, sizeof(qsqlbuf), sc);
+    const char *qsql = qsqlbuf;
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, qsql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "arch_packages_qn");
         return CBM_STORE_ERR;
     }
     bind_text(stmt, SKIP_ONE, project);
+    arch_bind_file_scope(stmt, sc);
 
     char *pnames[CBM_SZ_64];
     int pcounts[CBM_SZ_64];
@@ -3658,7 +3805,19 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project,
     return CBM_STORE_OK;
 }
 
-static int arch_packages(cbm_store_t *s, const char *project, cbm_architecture_info_t *out) {
+static int arch_packages(cbm_store_t *s, const char *project, const cbm_arch_path_scope_t *sc,
+                         cbm_architecture_info_t *out) {
+    if (sc && sc->active) {
+        cbm_package_summary_t *arr = NULL;
+        int n = 0;
+        int rc = arch_packages_from_qn(s, project, sc, &arr, &n);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+        out->packages = arr;
+        out->package_count = n;
+        return CBM_STORE_OK;
+    }
     /* Try Package nodes first */
     const char *sql =
         "SELECT n.name, COUNT(*) as cnt FROM nodes n "
@@ -3687,7 +3846,7 @@ static int arch_packages(cbm_store_t *s, const char *project, cbm_architecture_i
     /* Fallback: group by QN segment if no Package nodes */
     if (n == 0) {
         free(arr);
-        int rc = arch_packages_from_qn(s, project, &arr, &n);
+        int rc = arch_packages_from_qn(s, project, sc, &arr, &n);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
@@ -3760,16 +3919,20 @@ static bool pkg_in_list(const char *pkg, char **list, int count) {
 }
 
 /* Collect package names from nodes matching a SQL query. */
-static int collect_pkg_names(cbm_store_t *s, const char *sql, const char *project, char **pkgs,
-                             int max_pkgs) {
+static int collect_pkg_names(cbm_store_t *s, const char *sql, const char *project,
+                              const cbm_arch_path_scope_t *sc, char **pkgs, int max_pkgs) {
+    char sqlbuf[ST_SQL_BUF];
+    snprintf(sqlbuf, sizeof(sqlbuf), "%s", sql);
+    arch_append_file_scope(sqlbuf, sizeof(sqlbuf), sc);
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
+    if (sqlite3_prepare_v2(s->db, sqlbuf, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
         if (stmt) {
             sqlite3_finalize(stmt);
         }
         return CBM_NOT_FOUND;
     }
     bind_text(stmt, SKIP_ONE, project);
+    arch_bind_file_scope(stmt, sc);
     int count = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW && count < max_pkgs) {
         const char *qn = (const char *)sqlite3_column_text(stmt, 0);
@@ -3779,11 +3942,12 @@ static int collect_pkg_names(cbm_store_t *s, const char *sql, const char *projec
     return count;
 }
 
-static int arch_layers(cbm_store_t *s, const char *project, cbm_architecture_info_t *out) {
+static int arch_layers(cbm_store_t *s, const char *project, const cbm_arch_path_scope_t *sc,
+                       cbm_architecture_info_t *out) {
     /* Get boundaries for fan analysis */
     cbm_cross_pkg_boundary_t *boundaries = NULL;
     int bcount = 0;
-    int rc = arch_boundaries(s, project, &boundaries, &bcount);
+    int rc = arch_boundaries(s, project, sc, &boundaries, &bcount);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
@@ -3792,13 +3956,13 @@ static int arch_layers(cbm_store_t *s, const char *project, cbm_architecture_inf
     char *route_pkgs[CBM_SZ_32];
     int nrpkgs =
         collect_pkg_names(s, "SELECT qualified_name FROM nodes WHERE project=?1 AND label='Route'",
-                          project, route_pkgs, CBM_SZ_32);
+                          project, sc, route_pkgs, CBM_SZ_32);
 
     char *entry_pkgs[CBM_SZ_32];
     int nepkgs = collect_pkg_names(s,
                                    "SELECT qualified_name FROM nodes WHERE project=?1 AND "
                                    "json_extract(properties, '$.is_entry_point') = 1",
-                                   project, entry_pkgs, CBM_SZ_32);
+                                   project, sc, entry_pkgs, CBM_SZ_32);
 
     /* Compute fan-in/out per package */
     char *all_pkgs[CBM_SZ_64];
@@ -4065,14 +4229,20 @@ static void arch_free_dirs(char **dir_paths, int *dir_child_counts, char ***dir_
     free(files);
 }
 
-static int arch_file_tree(cbm_store_t *s, const char *project, cbm_architecture_info_t *out) {
-    const char *sql = "SELECT file_path FROM nodes WHERE project=?1 AND label='File'";
+static int arch_file_tree(cbm_store_t *s, const char *project, const cbm_arch_path_scope_t *sc,
+                          cbm_architecture_info_t *out) {
+    char sqlbuf[ST_SQL_BUF];
+    snprintf(sqlbuf, sizeof(sqlbuf),
+             "SELECT file_path FROM nodes WHERE project=?1 AND label='File'");
+    arch_append_file_scope(sqlbuf, sizeof(sqlbuf), sc);
+    const char *sql = sqlbuf;
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "arch_file_tree");
         return CBM_STORE_ERR;
     }
     bind_text(stmt, SKIP_ONE, project);
+    arch_bind_file_scope(stmt, sc);
 
     int fcap = CBM_SZ_32;
     int fn = 0;
@@ -4782,17 +4952,22 @@ static int cluster_rank_cmp(const void *a, const void *b) {
     return cb->members - ca->members;
 }
 
-static int arch_clusters(cbm_store_t *s, const char *project, cbm_architecture_info_t *out) {
-    /* 1. Load Function/Method/Class nodes, ordered by id for bsearch. */
-    const char *nsql = "SELECT id, name, qualified_name FROM nodes "
-                       "WHERE project=?1 AND label IN ('Function','Method','Class') "
-                       "ORDER BY id LIMIT ?2";
+static int arch_clusters(cbm_store_t *s, const char *project, const cbm_arch_path_scope_t *sc,
+                         cbm_architecture_info_t *out) {
+    char nsqlbuf[ST_SQL_BUF];
+    snprintf(nsqlbuf, sizeof(nsqlbuf),
+             "SELECT id, name, qualified_name, file_path FROM nodes "
+             "WHERE project=?1 AND label IN ('Function','Method','Class') "
+             "ORDER BY id LIMIT ?2");
+    arch_append_file_scope(nsqlbuf, sizeof(nsqlbuf), sc);
+    const char *nsql = nsqlbuf;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db, nsql, CBM_NOT_FOUND, &st, NULL) != SQLITE_OK) {
         return CBM_STORE_OK; /* clusters are best-effort */
     }
     bind_text(st, SKIP_ONE, project);
-    sqlite3_bind_int(st, CBM_SZ_2, CBM_CLUSTER_NODE_CAP);
+    arch_bind_file_scope(st, sc);
+    sqlite3_bind_int(st, sc && sc->active ? ST_COL_4 : ST_COL_2, CBM_CLUSTER_NODE_CAP);
     int cap = ST_INIT_CAP_8;
     int n = 0;
     int64_t *ids = malloc((size_t)cap * sizeof(int64_t));
@@ -4951,37 +5126,40 @@ static bool want_aspect(const char **aspects, int aspect_count, const char *name
     return false;
 }
 
-int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char **aspects,
-                               int aspect_count, cbm_architecture_info_t *out) {
+int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char *path,
+                               const char **aspects, int aspect_count,
+                               cbm_architecture_info_t *out) {
     memset(out, 0, sizeof(*out));
+    cbm_arch_path_scope_t sc;
+    arch_path_scope_init(&sc, path);
     int rc;
 
     if (want_aspect(aspects, aspect_count, "languages")) {
-        rc = arch_languages(s, project, out);
+        rc = arch_languages(s, project, &sc, out);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
     }
     if (want_aspect(aspects, aspect_count, "packages")) {
-        rc = arch_packages(s, project, out);
+        rc = arch_packages(s, project, &sc, out);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
     }
     if (want_aspect(aspects, aspect_count, "entry_points")) {
-        rc = arch_entry_points(s, project, out);
+        rc = arch_entry_points(s, project, &sc, out);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
     }
     if (want_aspect(aspects, aspect_count, "routes")) {
-        rc = arch_routes(s, project, out);
+        rc = arch_routes(s, project, &sc, out);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
     }
     if (want_aspect(aspects, aspect_count, "hotspots")) {
-        rc = arch_hotspots(s, project, out);
+        rc = arch_hotspots(s, project, &sc, out);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
@@ -4989,7 +5167,7 @@ int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char *
     if (want_aspect(aspects, aspect_count, "boundaries")) {
         cbm_cross_pkg_boundary_t *barr = NULL;
         int bcount = 0;
-        rc = arch_boundaries(s, project, &barr, &bcount);
+        rc = arch_boundaries(s, project, &sc, &barr, &bcount);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
@@ -4997,19 +5175,19 @@ int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char *
         out->boundary_count = bcount;
     }
     if (want_aspect(aspects, aspect_count, "layers")) {
-        rc = arch_layers(s, project, out);
+        rc = arch_layers(s, project, &sc, out);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
     }
     if (want_aspect(aspects, aspect_count, "file_tree")) {
-        rc = arch_file_tree(s, project, out);
+        rc = arch_file_tree(s, project, &sc, out);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
     }
     if (want_aspect(aspects, aspect_count, "clusters")) {
-        rc = arch_clusters(s, project, out);
+        rc = arch_clusters(s, project, &sc, out);
         if (rc != CBM_STORE_OK) {
             return rc;
         }

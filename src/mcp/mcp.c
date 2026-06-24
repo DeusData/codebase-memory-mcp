@@ -392,7 +392,7 @@ static const tool_def_t TOOLS[] = {
      "graph, surfacing the de-facto modules (each with a label, member count, cohesion score, "
      "representative top_nodes, and the packages/edge_types that bind it) — use these to grasp "
      "the real architectural seams, which often cut across the folder layout.",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"aspects\":{\"type\":"
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"path\":{\"type\":\"string\",\"description\":\"Optional subdirectory prefix to scope architecture (e.g. apps/hoa).\"},\"aspects\":{\"type\":"
      "\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]}"},
 
     {"search_code",
@@ -1917,6 +1917,7 @@ static void append_cross_repo_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
 
 static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
+    char *path_arg = cbm_mcp_get_string_arg(args, "path");
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
 
@@ -1965,11 +1966,17 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_get_schema_counts(store, project, &schema);
 
     cbm_architecture_info_t arch = {0};
-    cbm_store_get_architecture(store, project, aspects_strs_count > 0 ? aspects_strs : NULL,
+    cbm_store_get_architecture(store, project, path_arg, aspects_strs_count > 0 ? aspects_strs : NULL,
                                aspects_strs_count, &arch);
 
-    int node_count = cbm_store_count_nodes(store, project);
-    int edge_count = cbm_store_count_edges(store, project);
+    int root_node_count = cbm_store_count_nodes(store, project);
+    int root_edge_count = cbm_store_count_edges(store, project);
+    int scoped_node_count = path_arg && path_arg[0]
+                                ? cbm_store_count_nodes_under_path(store, project, path_arg)
+                                : root_node_count;
+    int scoped_edge_count = path_arg && path_arg[0]
+                                ? cbm_store_count_edges_under_path(store, project, path_arg)
+                                : root_edge_count;
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -1978,8 +1985,15 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     if (project) {
         yyjson_mut_obj_add_str(doc, root, "project", project);
     }
-    yyjson_mut_obj_add_int(doc, root, "total_nodes", node_count);
-    yyjson_mut_obj_add_int(doc, root, "total_edges", edge_count);
+    if (path_arg && path_arg[0]) {
+        yyjson_mut_obj_add_str(doc, root, "path", path_arg);
+    }
+    yyjson_mut_obj_add_int(doc, root, "root_total_nodes", root_node_count);
+    yyjson_mut_obj_add_int(doc, root, "root_total_edges", root_edge_count);
+    yyjson_mut_obj_add_int(doc, root, "scoped_total_nodes", scoped_node_count);
+    yyjson_mut_obj_add_int(doc, root, "scoped_total_edges", scoped_edge_count);
+    yyjson_mut_obj_add_int(doc, root, "total_nodes", scoped_node_count);
+    yyjson_mut_obj_add_int(doc, root, "total_edges", scoped_edge_count);
 
     /* Node label summary */
     if (aspect_wanted(aspects_doc, aspects_arr, "structure")) {
@@ -2192,6 +2206,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     if (aspects_doc) {
         yyjson_doc_free(aspects_doc);
     }
+    free(path_arg);
     free(project);
 
     char *result = cbm_mcp_text_result(json, false);

@@ -791,6 +791,50 @@ TEST(tool_get_architecture_emits_populated_sections) {
     PASS();
 }
 
+TEST(tool_get_architecture_path_scope_issue604) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "arch-path604";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/arch-path604");
+
+    cbm_node_t f1 = {.project = proj, .label = "File", .name = "a.go", .qualified_name = "x.a",
+                     .file_path = "apps/hoa/a.go"};
+    cbm_node_t f2 = {.project = proj, .label = "File", .name = "b.go", .qualified_name = "x.b",
+                     .file_path = "lib/b.go"};
+    ASSERT_GT(cbm_store_upsert_node(st, &f1), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &f2), 0);
+
+    char *resp_root = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"get_architecture\","
+             "\"arguments\":{\"project\":\"arch-path604\"}}}");
+    ASSERT_NOT_NULL(resp_root);
+    char *inner_root = extract_text_content(resp_root);
+    ASSERT_NOT_NULL(inner_root);
+    ASSERT_NOT_NULL(strstr(inner_root, "\"root_total_nodes\""));
+    ASSERT_NOT_NULL(strstr(inner_root, "\"scoped_total_nodes\""));
+
+    char *resp_scoped = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"get_architecture\","
+             "\"arguments\":{\"project\":\"arch-path604\",\"path\":\"apps/hoa\"}}}");
+    ASSERT_NOT_NULL(resp_scoped);
+    char *inner_scoped = extract_text_content(resp_scoped);
+    ASSERT_NOT_NULL(inner_scoped);
+    ASSERT_NOT_NULL(strstr(inner_scoped, "\"path\":\"apps/hoa\""));
+    ASSERT_NOT_NULL(strstr(inner_scoped, "\"scoped_total_nodes\":1"));
+    ASSERT_NOT_NULL(strstr(inner_scoped, "\"root_total_nodes\":2"));
+
+    free(inner_scoped);
+    free(resp_scoped);
+    free(inner_root);
+    free(resp_root);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_query_graph_missing_query) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -2292,6 +2336,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_ambiguous);
     RUN_TEST(tool_trace_call_path_prefers_definition);
     RUN_TEST(tool_delete_project_not_found);
+    RUN_TEST(tool_get_architecture_path_scope_issue604);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
     RUN_TEST(tool_query_graph_missing_query);

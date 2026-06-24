@@ -528,8 +528,14 @@ typedef struct {
     int file_tree_count;
 } cbm_architecture_info_t;
 
-int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char **aspects,
-                               int aspect_count, cbm_architecture_info_t *out);
+/* Optional path: scope architecture to nodes whose file_path is under this
+ * prefix (e.g. "apps/hoa"). NULL or empty string = whole project. */
+int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char *path,
+                               const char **aspects, int aspect_count,
+                               cbm_architecture_info_t *out);
+
+int cbm_store_count_nodes_under_path(cbm_store_t *s, const char *project, const char *path);
+int cbm_store_count_edges_under_path(cbm_store_t *s, const char *project, const char *path);
 void cbm_store_architecture_free(cbm_architecture_info_t *out);
 
 /* ── ADR (Architecture Decision Record) ────────────────────────── */
