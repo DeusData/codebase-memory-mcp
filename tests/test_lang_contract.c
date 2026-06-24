@@ -907,13 +907,18 @@ TEST(contract_edge_defines) {
     PASS();
 }
 
-/* DEFINES_METHOD — Class -> Method when the method's parent_class resolves. */
+/* DEFINES_METHOD — Class -> Method when the method's parent_class resolves.
+ * MEMBER_OF — the reverse Method -> Class edge (fork addition; consumed by
+ * pagerank.c member_rank_factor). Asserting BOTH directions locks in the
+ * function<->class tie (§4c): a class-scoped callable must link to its class
+ * both ways. The reverse edge previously had no test coverage anywhere. */
 TEST(contract_edge_defines_method) {
     static const LangFile f[] = {{"greeter.py",
                                   "class Greeter:\n    def hello(self):\n        return \"hi\"\n\n"
                                   "    def bye(self):\n        return \"bye\"\n\n\n"
                                   "def main():\n    g = Greeter()\n    return g.hello()\n"}};
-    ASSERT_TRUE(edge_present(f, 1, "DEFINES_METHOD", 1)); /* Greeter.hello, Greeter.bye */
+    ASSERT_TRUE(edge_present(f, 1, "DEFINES_METHOD", 1)); /* Class -> Method: Greeter.hello, Greeter.bye */
+    ASSERT_TRUE(edge_present(f, 1, "MEMBER_OF", 1));      /* Method -> Class: reverse edge feeding PageRank */
     PASS();
 }
 
