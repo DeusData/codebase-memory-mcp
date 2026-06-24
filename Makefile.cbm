@@ -588,7 +588,8 @@ $(NOSAN_DIR)/sqlite3.o: $(SQLITE3_SRC) | $(NOSAN_DIR)
 
 OBJS_VENDORED_NOSAN = $(MIMALLOC_OBJ_TEST) $(NOSAN_DIR)/sqlite3.o $(TRE_OBJ_TEST) \
                       $(GRAMMAR_OBJS_NOSAN) $(NOSAN_DIR)/ts_runtime.o \
-                      $(NOSAN_DIR)/lsp_all.o $(NOSAN_DIR)/preprocessor.o
+                      $(NOSAN_DIR)/lsp_all.o $(NOSAN_DIR)/preprocessor.o \
+                      $(NOSAN_LZ4_OBJ) $(NOSAN_ZSTD_OBJ) $(UNIXCODER_OBJ)
 
 # Vendored LZ4 (test build)
 LZ4_OBJ_TEST = $(BUILD_DIR)/test_lz4.o $(BUILD_DIR)/test_lz4hc.o
@@ -601,6 +602,17 @@ $(BUILD_DIR)/test_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
 ZSTD_OBJ_TEST = $(BUILD_DIR)/test_zstd.o
 $(BUILD_DIR)/test_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
 	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
+
+# Vendored LZ4/zstd (NOSAN build — sanitizer-free so `leaks --atExit` can walk the
+# heap on macOS; ASan replaces malloc and is incompatible with the leaks tool).
+NOSAN_LZ4_OBJ  = $(NOSAN_DIR)/lz4.o $(NOSAN_DIR)/lz4hc.o
+NOSAN_ZSTD_OBJ = $(NOSAN_DIR)/zstd.o
+$(NOSAN_DIR)/lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(NOSAN_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -c -o $@ $<
+$(NOSAN_DIR)/lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(NOSAN_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
+$(NOSAN_DIR)/zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(NOSAN_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 
 # nomic-embed-code pretrained vector blob
 UNIXCODER_OBJ = $(BUILD_DIR)/unixcoder_blob.o
@@ -616,10 +628,10 @@ $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_
 		$(OBJS_VENDORED_TEST) \
 		$(LDFLAGS_TEST)
 
-$(BUILD_DIR)/test-runner-nosan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_NOSAN) | $(BUILD_DIR) $(NOSAN_DIR)
+$(BUILD_DIR)/test-runner-nosan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_NOSAN) | $(BUILD_DIR) $(NOSAN_DIR)
 	$(CC) $(CFLAGS_NOSAN) -o $@ \
 		$(ALL_TEST_SRCS) $(PROD_SRCS) \
-		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(SQLITE_WRITER_SRC) \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_NOSAN) \
 		$(LDFLAGS_NOSAN)
 
