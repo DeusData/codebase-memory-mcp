@@ -87,44 +87,6 @@ static const char *compute_wolfram_func_qn(CBMExtractCtx *ctx, TSNode node) {
     return NULL;
 }
 
-/* C/C++/CUDA/GLSL: function_definition has no `name` field — the name is nested
- * in the declarator chain. Descend the `declarator` field to the innermost name
- * node. Without this, the enclosing-function scope for calls made inside a C
- * function resolves to NULL and the call is attributed to the module rather than
- * the function (issue #438). Mirrors resolve_c_declarator_name() in extract_defs.c. */
-#ifndef CBM_DECLARATOR_DEPTH_LIMIT
-#define CBM_DECLARATOR_DEPTH_LIMIT 8 /* matches DECLARATOR_DEPTH_LIMIT in extract_defs.c */
-#endif
-static TSNode resolve_c_declarator_name_node(TSNode node) {
-    TSNode decl = ts_node_child_by_field_name(node, TS_FIELD("declarator"));
-    for (int depth = 0; depth < CBM_DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(decl); depth++) {
-        const char *dk = ts_node_type(decl);
-        if (strcmp(dk, "identifier") == 0 || strcmp(dk, "field_identifier") == 0 ||
-            strcmp(dk, "type_identifier") == 0 || strcmp(dk, "destructor_name") == 0 ||
-            strcmp(dk, "operator_name") == 0 || strcmp(dk, "operator_cast") == 0) {
-            return decl;
-        }
-        if (strcmp(dk, "qualified_identifier") == 0 || strcmp(dk, "scoped_identifier") == 0) {
-            TSNode nm = ts_node_child_by_field_name(decl, TS_FIELD("name"));
-            if (!ts_node_is_null(nm)) {
-                decl = nm;
-                continue;
-            }
-            return decl;
-        }
-        TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
-        if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0) {
-            inner = ts_node_named_child(decl, 0);
-        }
-        if (ts_node_is_null(inner)) {
-            break;
-        }
-        decl = inner;
-    }
-    TSNode null_node = {0};
-    return null_node;
-}
-
 // Resolve the name node for a function, handling arrow functions.
 static TSNode resolve_func_name_node(TSNode node) {
     TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
@@ -141,7 +103,7 @@ static TSNode resolve_func_name_node(TSNode node) {
     }
     /* C/C++/CUDA/GLSL: function_definition name lives in the declarator chain. */
     if (ts_node_is_null(name_node) && strcmp(ts_node_type(node), "function_definition") == 0) {
-        name_node = resolve_c_declarator_name_node(node);
+        name_node = cbm_resolve_c_declarator_name_node(node);
     }
     return name_node;
 }

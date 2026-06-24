@@ -717,33 +717,38 @@ TSNode cbm_find_enclosing_func(TSNode node, CBMLanguage lang) {
     return null_node;
 }
 
-// Get the name of a function node (basic: try "name" field)
-// C/C++/CUDA/GLSL: function_definition has no "name" field — the function name is
-// nested in the declarator chain (pointer/function/parenthesized/array
-// declarators wrap it). Descend the `declarator` field to the innermost name
-// node. Without this, calls made inside C functions are attributed to the module
-// rather than the enclosing function (issue #438). Mirrors resolve_c_declarator_name()
-// in extract_defs.c.
-#ifndef CBM_DECLARATOR_DEPTH_LIMIT
-#define CBM_DECLARATOR_DEPTH_LIMIT 8 /* matches DECLARATOR_DEPTH_LIMIT in extract_defs.c */
-#endif
-static TSNode c_declarator_name_node(TSNode func_node) {
+// Check if a node type is a terminal C declarator name.
+static bool is_c_terminal_name(const char *dk) {
+    return strcmp(dk, "identifier") == 0 || strcmp(dk, "field_identifier") == 0 ||
+           strcmp(dk, "operator_name") == 0 || strcmp(dk, "operator_cast") == 0 ||
+           strcmp(dk, "destructor_name") == 0;
+}
+
+// Resolve name from a C++ qualified_identifier/scoped_identifier.
+static TSNode resolve_qualified_name(TSNode decl) {
+    static const char *name_kinds[] = {"operator_name", "operator_cast",    "destructor_name",
+                                       "identifier",    "field_identifier", NULL};
+    for (const char **k = name_kinds; *k; k++) {
+        TSNode found = cbm_find_child_by_kind(decl, *k);
+        if (!ts_node_is_null(found)) {
+            return found;
+        }
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
+// Resolve function name from C/C++/CUDA/GLSL declarator chain. Shared canonical
+// implementation — see the header for the full rationale (#438).
+TSNode cbm_resolve_c_declarator_name_node(TSNode func_node) {
     TSNode decl = ts_node_child_by_field_name(func_node, TS_FIELD("declarator"));
     for (int depth = 0; depth < CBM_DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(decl); depth++) {
         const char *dk = ts_node_type(decl);
-        if (strcmp(dk, "identifier") == 0 || strcmp(dk, "field_identifier") == 0 ||
-            strcmp(dk, "type_identifier") == 0 || strcmp(dk, "destructor_name") == 0 ||
-            strcmp(dk, "operator_name") == 0 || strcmp(dk, "operator_cast") == 0) {
+        if (is_c_terminal_name(dk)) {
             return decl;
         }
         if (strcmp(dk, "qualified_identifier") == 0 || strcmp(dk, "scoped_identifier") == 0) {
-            // out-of-line method def (Foo::bar): take the rightmost name segment
-            TSNode nm = ts_node_child_by_field_name(decl, TS_FIELD("name"));
-            if (!ts_node_is_null(nm)) {
-                decl = nm;
-                continue;
-            }
-            return decl;
+            return resolve_qualified_name(decl);
         }
         TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
         if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0) {
@@ -794,7 +799,7 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
     }
     // C/C++/CUDA/GLSL: function_definition carries its name in the declarator chain.
     if (strcmp(ts_node_type(func_node), "function_definition") == 0) {
-        TSNode dn = c_declarator_name_node(func_node);
+        TSNode dn = cbm_resolve_c_declarator_name_node(func_node);
         if (!ts_node_is_null(dn)) {
             return cbm_node_text(a, dn, source);
         }
