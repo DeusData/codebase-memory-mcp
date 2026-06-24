@@ -285,6 +285,8 @@ MONGOOSE_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -Ivendored -DMG_ENABLE_LOG=0
 MONGOOSE_CFLAGS_TEST  = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Ivendored -DMG_ENABLE_LOG=0 \
                         $(SANITIZE)
 MONGOOSE_CFLAGS_NOSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Ivendored -DMG_ENABLE_LOG=0
+MONGOOSE_CFLAGS_TSAN  = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Ivendored -DMG_ENABLE_LOG=0 \
+                        -fsanitize=thread -fno-omit-frame-pointer
 # mimalloc (vendored, global allocator override)
 #
 # Override strategy is platform-specific:
@@ -639,9 +641,68 @@ test: $(BUILD_DIR)/test-runner
 	cd $(CURDIR) && $(BUILD_DIR)/test-runner
 
 # ── TSan full test ───────────────────────────────────────────────
+#
+# ThreadSanitizer build for data-race detection in the parallel pipeline.
+# Mirrors test-runner but links vendored objects compiled with
+# -fsanitize=thread and links the test mimalloc object (MI_OVERRIDE=0 —
+# does NOT override malloc, so TSan intercepts the real malloc/free) to
+# satisfy the unconditional mi_* calls in src/foundation/mem.c.
+#
+# Cannot be combined with ASan/UBSan. Uses the system allocator.
 
-test-tsan:
-	@echo "TSan not yet wired for full extraction tests"
+TSAN_DIR            = $(BUILD_DIR)/tsan
+GRAMMAR_OBJS_TSAN   = $(patsubst $(CBM_DIR)/%.c,$(TSAN_DIR)/%.o,$(GRAMMAR_SRCS))
+MIMALLOC_OBJ_TSAN   = $(TSAN_DIR)/mimalloc.o
+
+$(TSAN_DIR):
+	mkdir -p $(TSAN_DIR)
+
+# mimalloc (MI_OVERRIDE=0: no malloc override → TSan intercepts real malloc)
+$(TSAN_DIR)/mimalloc.o: $(MIMALLOC_SRC) | $(TSAN_DIR)
+	$(CC) $(MIMALLOC_CFLAGS_TEST) -fsanitize=thread -fno-omit-frame-pointer -c -o $@ $<
+
+# sqlite3 (TSan-instrumented)
+$(TSAN_DIR)/sqlite3.o: $(SQLITE3_SRC) | $(TSAN_DIR)
+	$(CC) $(SQLITE3_CFLAGS_TEST) -fsanitize=thread -fno-omit-frame-pointer -c -o $@ $<
+
+# Grammar C files (tree-sitter parsers) — recompiled with TSan
+$(TSAN_DIR)/%.o: $(CBM_DIR)/%.c | $(TSAN_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_TSAN) -c -o $@ $<
+
+$(TSAN_DIR)/ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(TSAN_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_TSAN) -c -o $@ $<
+
+$(TSAN_DIR)/lsp_all.o: $(CBM_DIR)/lsp_all.c | $(TSAN_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_TSAN) -fsanitize=thread -fno-omit-frame-pointer -c -o $@ $<
+
+$(TSAN_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(TSAN_DIR)
+	$(CXX) $(CXXFLAGS_COMMON) -g -O1 -fsanitize=thread -fno-omit-frame-pointer -w -I$(CBM_DIR)/vendored -c -o $@ $<
+
+# Vendored LZ4 (TSan build)
+$(TSAN_DIR)/lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(TSAN_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 -fsanitize=thread -fno-omit-frame-pointer -w -I$(CBM_DIR) -c -o $@ $<
+$(TSAN_DIR)/lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(TSAN_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 -fsanitize=thread -fno-omit-frame-pointer -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
+
+# Vendored zstd (TSan build)
+$(TSAN_DIR)/zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(TSAN_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 -fsanitize=thread -fno-omit-frame-pointer -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
+
+OBJS_VENDORED_TSAN = $(MIMALLOC_OBJ_TSAN) $(TSAN_DIR)/sqlite3.o $(TRE_OBJ_TEST) \
+                      $(GRAMMAR_OBJS_TSAN) $(TSAN_DIR)/ts_runtime.o \
+                      $(TSAN_DIR)/lsp_all.o $(TSAN_DIR)/preprocessor.o \
+                      $(TSAN_DIR)/lz4.o $(TSAN_DIR)/lz4hc.o $(TSAN_DIR)/zstd.o $(UNIXCODER_OBJ)
+
+$(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TSAN) | $(BUILD_DIR) $(TSAN_DIR)
+	$(CC) $(CFLAGS_TSAN) -o $@ \
+		$(ALL_TEST_SRCS) $(PROD_SRCS) \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
+		$(OBJS_VENDORED_TSAN) \
+		$(LDFLAGS_TSAN)
+
+test-tsan: $(BUILD_DIR)/test-runner-tsan
+	@echo "Running ThreadSanitizer build (slow). Reports go to stderr."
+	cd $(CURDIR) && TSAN_OPTIONS="halt_on_error=0 second_deadlock_stack=1" $(BUILD_DIR)/test-runner-tsan
 
 # ── Leak detection ───────────────────────────────────────────────
 # macOS: uses `leaks --atExit` (Apple Clang LSan not available on all versions)
