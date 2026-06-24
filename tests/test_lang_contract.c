@@ -27,6 +27,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <signal.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -238,7 +239,16 @@ static bool extract_crashes(const char *content, CBMLanguage lang, const char *r
         _exit(0);
     }
     int status = 0;
-    (void)waitpid(pid, &status, 0);
+    /* leaks --atExit (macOS) SIGSTOPs the forked child during heap inspection;
+     * WUNTRACED+SIGCONT avoids the hang (mirrors test_store_bulk.c, b336466). */
+    for (;;) {
+        if (waitpid(pid, &status, WUNTRACED) < 0) break;
+        if (WIFSTOPPED(status)) {
+            kill(pid, SIGCONT);
+            continue;
+        }
+        break;
+    }
     return WIFSIGNALED(status);
 #endif
 }
