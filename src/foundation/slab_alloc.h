@@ -5,7 +5,7 @@
  * to eliminate ptmalloc2's per-thread arena fragmentation.
  *
  * Tier 1 (≤64B): Fixed-size slab free list — O(1) alloc/free.
- *   Matches tree-sitter SubtreeHeapData (64 bytes). Backed by
+ *   Matches tree-sitter SubtreeHeapData (CBM_SZ_64 bytes). Backed by
  *   64KB slab pages via malloc (= mimalloc in production).
  *
  * All allocations >64B go directly to malloc (= mimalloc in production),

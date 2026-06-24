@@ -107,13 +107,14 @@ static inline unsigned serialize(Scanner *scanner, char *buffer) {
     buffer[size++] = (char)scanner->open_heredocs.size;
     for (uint32_t i = 0; i < scanner->open_heredocs.size; i++) {
         Heredoc *heredoc = array_get(&scanner->open_heredocs, i);
-        if (size + 2 + heredoc->word.size >= TREE_SITTER_SERIALIZATION_BUFFER_SIZE) {
+        if (size + 3 + sizeof(uint32_t) + heredoc->word.size >= TREE_SITTER_SERIALIZATION_BUFFER_SIZE) {
             return 0;
         }
         buffer[size++] = (char)heredoc->end_word_indentation_allowed;
         buffer[size++] = (char)heredoc->allows_interpolation;
         buffer[size++] = (char)heredoc->started;
-        buffer[size++] = (char)heredoc->word.size;
+        memcpy(&buffer[size], &heredoc->word.size, sizeof(uint32_t));
+        size += sizeof(uint32_t);
         memcpy(&buffer[size], heredoc->word.contents, heredoc->word.size);
         size += heredoc->word.size;
     }
@@ -149,7 +150,9 @@ static inline void deserialize(Scanner *scanner, const char *buffer, unsigned le
         heredoc.started = buffer[size++];
 
         heredoc.word = (String)array_new();
-        uint8_t word_length = buffer[size++];
+        uint32_t word_length;
+        memcpy(&word_length, &buffer[size], sizeof(uint32_t));
+        size += sizeof(uint32_t);
         array_reserve(&heredoc.word, word_length);
         memcpy(heredoc.word.contents, &buffer[size], word_length);
         heredoc.word.size = word_length;

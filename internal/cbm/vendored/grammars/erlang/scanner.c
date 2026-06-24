@@ -25,10 +25,7 @@
 #include "tree_sitter/array.h"
 #include "tree_sitter/parser.h"
 
-#include <assert.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <string.h>
 
 enum TokenType {
   /* Triple Quoted String, as per https://www.erlang.org/eeps/eep-0064

@@ -9,6 +9,7 @@
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
@@ -150,9 +151,7 @@ static void integration_teardown(void) {
     g_project = NULL;
 
     /* Clean up temp project */
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_tmpdir);
-    system(cmd);
+    th_rmtree(g_tmpdir);
 
     /* Clean up cache db */
     unlink(g_dbpath);
@@ -367,7 +366,7 @@ TEST(integ_mcp_get_architecture) {
     PASS();
 }
 
-TEST(integ_mcp_trace_call_path) {
+TEST(integ_mcp_trace_path) {
     /* Trace outbound calls from Compute → should reach Add and Multiply */
     char args[256];
     snprintf(args, sizeof(args),
@@ -375,12 +374,68 @@ TEST(integ_mcp_trace_call_path) {
              "\"direction\":\"outbound\",\"max_depth\":3}",
              g_project);
 
-    char *resp = call_tool("trace_call_path", args);
+    char *resp = call_tool("trace_path", args);
     ASSERT_NOT_NULL(resp);
     /* Should find the function and show some path */
     /* Either finds the function, or returns not found if name doesn't match exactly */
     ASSERT_TRUE(strstr(resp, "Compute") || strstr(resp, "Multiply") || strstr(resp, "not found"));
     free(resp);
+    PASS();
+}
+
+/* #522: trace_path mode=cross_service must follow CROSS_* cross-repo edges.
+ * Seed a CROSS_HTTP_CALLS edge between two indexed functions that have no CALLS
+ * relationship, then confirm cross_service surfaces the hop while the default
+ * calls mode does not (proving the cross edge specifically is what's followed).
+ *
+ * The trace goes through a fresh server so it opens the db after the edge is
+ * committed — exactly what a new MCP session sees after a cross-repo pass writes
+ * CROSS_* edges (g_srv's cached connection predates this write). */
+TEST(integ_mcp_trace_path_cross_service) {
+    cbm_store_t *store = cbm_store_open_path(g_dbpath);
+    ASSERT_NOT_NULL(store);
+
+    cbm_node_t *src = NULL;
+    cbm_node_t *dst = NULL;
+    int src_count = 0;
+    int dst_count = 0;
+    cbm_store_find_nodes_by_name(store, g_project, "greet", &src, &src_count);
+    cbm_store_find_nodes_by_name(store, g_project, "farewell", &dst, &dst_count);
+    ASSERT_TRUE(src_count > 0 && dst_count > 0);
+
+    cbm_edge_t edge = {.project = g_project,
+                       .source_id = src[0].id,
+                       .target_id = dst[0].id,
+                       .type = "CROSS_HTTP_CALLS"};
+    ASSERT_TRUE(cbm_store_insert_edge(store, &edge) > 0);
+
+    cbm_store_free_nodes(src, src_count);
+    cbm_store_free_nodes(dst, dst_count);
+    cbm_store_close(store);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char args[256];
+    snprintf(args, sizeof(args),
+             "{\"function_name\":\"greet\",\"project\":\"%s\","
+             "\"direction\":\"outbound\",\"mode\":\"cross_service\"}",
+             g_project);
+    char *resp = cbm_mcp_handle_tool(srv, "trace_path", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "farewell"));
+    free(resp);
+
+    snprintf(args, sizeof(args),
+             "{\"function_name\":\"greet\",\"project\":\"%s\","
+             "\"direction\":\"outbound\",\"mode\":\"calls\"}",
+             g_project);
+    resp = cbm_mcp_handle_tool(srv, "trace_path", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "farewell") == NULL);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
     PASS();
 }
 
@@ -525,16 +580,66 @@ TEST(integ_store_bfs_traversal) {
     PASS();
 }
 
+/* #411: index_repository silently drops entire subtrees with no record.
+ * Moderate/fast mode applies FAST_SKIP_DIRS (tools/scripts/bin/docs/...) and ALL
+ * modes apply ALWAYS_SKIP_DIRS (node_modules/...), so files are excluded from the
+ * graph — but the response only reports nodes/edges/status, giving the user no
+ * way to know which subtrees were dropped (the reporter lost a 47-file tools/).
+ * Desired (maintainer): a COMPACT per-directory summary of excluded files (dir +
+ * count, not a verbose per-file list) surfaced in the index result for any mode.
+ * RED until the index response reports excluded subtrees. Self-contained. */
+TEST(index_reports_excluded_subtrees_issue411) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_excl_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    char path[512];
+    /* one real source file ... */
+    snprintf(path, sizeof(path), "%s/app.py", tmp);
+    FILE *f = fopen(path, "wb");
+    ASSERT_NOT_NULL(f);
+    fputs("def app():\n    return 1\n", f);
+    fclose(f);
+    /* ... and a node_modules subtree that is excluded in EVERY mode. */
+    snprintf(path, sizeof(path), "%s/node_modules", tmp);
+    cbm_mkdir_p(path, 0755);
+    snprintf(path, sizeof(path), "%s/node_modules/dep.js", tmp);
+    f = fopen(path, "wb");
+    ASSERT_NOT_NULL(f);
+    fputs("export function dep() { return 2; }\n", f);
+    fclose(f);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[600];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", tmp);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+
+    /* The dropped node_modules/dep.js must be reported somewhere compact in the
+     * response so the user knows it wasn't indexed. Today the response carries no
+     * excluded/skipped summary at all → this fails (reproduces the silent drop). */
+    bool reports_excluded = strstr(resp, "excluded") != NULL || strstr(resp, "skipped") != NULL;
+    free(resp);
+    cbm_mcp_server_free(srv);
+    th_rmtree(tmp);
+    ASSERT_TRUE(reports_excluded);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
 SUITE(integration) {
+    RUN_TEST(index_reports_excluded_subtrees_issue411);
     /* Set up: create temp project and index it */
     if (integration_setup() != 0) {
-        printf("  %-50s", "integration_setup");
-        printf("SKIP (setup failed)\n");
-        tf_skip_count += 16; /* skip all integration tests */
+        /* A suite that cannot establish its preconditions has FAILED, not
+         * "skipped" — surface it as a single red failure (no-skips policy). */
+        printf("  %sFAIL%s %s:%d: %s\n", tf_red(), tf_reset(), __FILE__, __LINE__,
+               "integration_setup failed");
+        tf_fail_count++;
         integration_teardown();
         return;
     }
@@ -554,7 +659,8 @@ SUITE(integration) {
     RUN_TEST(integ_mcp_query_graph_calls);
     RUN_TEST(integ_mcp_get_graph_schema);
     RUN_TEST(integ_mcp_get_architecture);
-    RUN_TEST(integ_mcp_trace_call_path);
+    RUN_TEST(integ_mcp_trace_path);
+    RUN_TEST(integ_mcp_trace_path_cross_service);
     RUN_TEST(integ_mcp_index_status);
 
     /* Store query validation */

@@ -45,6 +45,12 @@ TEST(arena_alloc_zero) {
     PASS();
 }
 
+TEST(arena_alloc_null_arena) {
+    void *p = cbm_arena_alloc(NULL, 16);
+    ASSERT_NULL(p);
+    PASS();
+}
+
 TEST(arena_alloc_alignment) {
     CBMArena a;
     cbm_arena_init(&a);
@@ -426,6 +432,7 @@ SUITE(arena) {
     RUN_TEST(arena_init_sized);
     RUN_TEST(arena_alloc_basic);
     RUN_TEST(arena_alloc_zero);
+    RUN_TEST(arena_alloc_null_arena);
     RUN_TEST(arena_alloc_alignment);
     RUN_TEST(arena_alloc_grows_blocks);
     RUN_TEST(arena_alloc_large_single);

@@ -6,6 +6,9 @@
  */
 #include "str_intern.h"
 #include "arena.h"
+#include "foundation/constants.h"
+
+enum { INTERN_LOAD_NUM = 7 };
 #include <stdint.h> // uint32_t
 #include <stdlib.h>
 #include <string.h>
@@ -41,13 +44,13 @@ struct CBMInternPool {
 };
 
 CBMInternPool *cbm_intern_create(void) {
-    CBMInternPool *p = (CBMInternPool *)calloc(1, sizeof(*p));
+    CBMInternPool *p = (CBMInternPool *)calloc(CBM_ALLOC_ONE, sizeof(*p));
     if (!p) {
         return NULL;
     }
     cbm_arena_init(&p->arena);
-    p->capacity = 256;
-    p->mask = p->capacity - 1;
+    p->capacity = CBM_SZ_256;
+    p->mask = p->capacity - SKIP_ONE;
     p->buckets = (InternEntry *)calloc(p->capacity, sizeof(InternEntry));
     if (!p->buckets) {
         cbm_arena_destroy(&p->arena);
@@ -67,8 +70,8 @@ void cbm_intern_free(CBMInternPool *pool) {
 }
 
 static void intern_resize(CBMInternPool *p) {
-    uint32_t new_cap = p->capacity * 2;
-    uint32_t new_mask = new_cap - 1;
+    uint32_t new_cap = p->capacity * PAIR_LEN;
+    uint32_t new_mask = new_cap - SKIP_ONE;
     InternEntry *new_buckets = (InternEntry *)calloc(new_cap, sizeof(InternEntry));
     if (!new_buckets) {
         return;
@@ -81,7 +84,7 @@ static void intern_resize(CBMInternPool *p) {
         }
         uint32_t idx = e->hash & new_mask;
         while (new_buckets[idx].str) {
-            idx = (idx + 1) & new_mask;
+            idx = (idx + SKIP_ONE) & new_mask;
         }
         new_buckets[idx] = *e;
     }
@@ -109,16 +112,16 @@ const char *cbm_intern_n(CBMInternPool *pool, const char *s, size_t len) {
         if (e->hash == h && e->len == (uint32_t)len && memcmp(e->str, s, len) == 0) {
             return e->str; /* found — return existing pointer */
         }
-        idx = (idx + 1) & pool->mask;
+        idx = (idx + SKIP_ONE) & pool->mask;
     }
 
     /* Resize at 70% load */
-    if (pool->count * 10 >= pool->capacity * 7) {
+    if (pool->count * CBM_DECIMAL_BASE >= pool->capacity * INTERN_LOAD_NUM) {
         intern_resize(pool);
         /* Re-probe after resize */
         idx = h & pool->mask;
         while (pool->buckets[idx].str) {
-            idx = (idx + 1) & pool->mask;
+            idx = (idx + SKIP_ONE) & pool->mask;
         }
     }
 

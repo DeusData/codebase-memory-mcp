@@ -179,7 +179,7 @@ unsigned tree_sitter_sql_external_scanner_serialize(void *payload, char *buffer)
 
 void tree_sitter_sql_external_scanner_deserialize(void *payload, const char *buffer, unsigned length) {
   LexerState *state = (LexerState *)payload;
-  free(state->start_tag);
+  free(state->start_tag); /* deserialize is called repeatedly; free the prior tag first */
   state->start_tag = NULL;
   // A length of 1 can't exists.
   if (length > 1) {

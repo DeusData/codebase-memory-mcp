@@ -52,6 +52,9 @@ memory/
 reference/
 .claude/
 
+# Local-only scratch / session notes (never pushed)
+private/
+
 # Build artifacts
 build/
 node_modules/
@@ -62,3 +65,9 @@ BENCHMARK_REPORT.md
 TEST_PLAN.md
 scripts/autotune_results.json
 CHANGELOG.md
+
+# Soak test output
+soak-results/
+
+# LSP originality-check reference cache (scripts/check-lsp-originality.sh)
+.lsp-refs/

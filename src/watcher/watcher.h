@@ -65,7 +65,7 @@ void cbm_watcher_stop(cbm_watcher_t *w);
 /* ── Introspection (for testing) ────────────────────────────────── */
 
 /* Return the number of projects in the watch list. */
-int cbm_watcher_watch_count(const cbm_watcher_t *w);
+int cbm_watcher_watch_count(cbm_watcher_t *w);
 
 /* Return the adaptive poll interval (ms) for a given file count.
  * base_ms/max_ms: 0 = use defaults (POLL_BASE_MS=5000, POLL_MAX_MS=60000). */

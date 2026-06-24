@@ -62,7 +62,7 @@ const char *cbm_pkg_manager_str(cbm_pkg_manager_t mgr) {
 
 char *cbm_dep_project_name(const char *project, const char *package_name) {
     if (!project || !package_name) return NULL;
-    char buf[CBM_PATH_MAX];
+    char buf[CBM_DEP_PATH_MAX];
     snprintf(buf, sizeof(buf), "%s" CBM_DEP_SEPARATOR "%s", project, package_name);
     return strdup(buf);
 }
@@ -122,7 +122,7 @@ static bool has_vendored_deps_dir(const char *project_root) {
         "deps", "external", "ext", "contrib", "lib",
         "_vendor", "submodules", NULL
     };
-    char path[CBM_PATH_MAX];
+    char path[CBM_DEP_PATH_MAX];
     for (int i = 0; vendor_dirs[i]; i++) {
         snprintf(path, sizeof(path), "%s/%s", project_root, vendor_dirs[i]);
         cbm_dir_t *d = cbm_opendir(path);
@@ -131,7 +131,7 @@ static bool has_vendored_deps_dir(const char *project_root) {
         bool has_subdir = false;
         while ((ent = cbm_readdir(d)) != NULL) {
             if (ent->name[0] == '.') continue;
-            char sub[CBM_PATH_MAX];
+            char sub[CBM_DEP_PATH_MAX];
             snprintf(sub, sizeof(sub), "%s/%s", path, ent->name);
             struct stat st;
             if (stat(sub, &st) == 0 && S_ISDIR(st.st_mode)) { has_subdir = true; break; }
@@ -144,7 +144,7 @@ static bool has_vendored_deps_dir(const char *project_root) {
 
 cbm_pkg_manager_t cbm_detect_ecosystem(const char *project_root) {
     if (!project_root) return CBM_PKG_COUNT;
-    char path[CBM_PATH_MAX];
+    char path[CBM_DEP_PATH_MAX];
 
 /* Macro: check file exists → return manager */
 #define CHECK(file, mgr) \
@@ -221,7 +221,7 @@ static const char *get_home_dir(void) {
  * Memory: O(1) stack buffers only. */
 static int resolve_uv(const char *package_name, const char *project_root,
                        cbm_dep_resolved_t *out) {
-    char probe[CBM_PATH_MAX];
+    char probe[CBM_DEP_PATH_MAX];
     char underscore_name[CBM_NAME_MAX];
     snprintf(underscore_name, sizeof(underscore_name), "%s", package_name);
     for (char *c = underscore_name; *c; c++) {
@@ -266,7 +266,7 @@ static int resolve_cargo(const char *package_name, const char *project_root,
     (void)project_root;
     const char *home = get_home_dir();
     const char *cargo_home = getenv("CARGO_HOME");
-    char registry_base[CBM_PATH_MAX];
+    char registry_base[CBM_DEP_PATH_MAX];
     if (cargo_home) {
         snprintf(registry_base, sizeof(registry_base), "%s/registry/src", cargo_home);
     } else {
@@ -279,7 +279,7 @@ static int resolve_cargo(const char *package_name, const char *project_root,
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
         if (strncmp(ent->name, "index.crates.io-", 16) != 0) continue;
-        char reg_path[CBM_PATH_MAX];
+        char reg_path[CBM_DEP_PATH_MAX];
         snprintf(reg_path, sizeof(reg_path), "%s/%s", registry_base, ent->name);
         cbm_dir_t *rd = cbm_opendir(reg_path);
         if (!rd) continue;
@@ -288,7 +288,7 @@ static int resolve_cargo(const char *package_name, const char *project_root,
             size_t pkg_len = strlen(package_name);
             if (strncmp(rent->name, package_name, pkg_len) == 0 &&
                 rent->name[pkg_len] == '-') {
-                char full[CBM_PATH_MAX];
+                char full[CBM_DEP_PATH_MAX];
                 snprintf(full, sizeof(full), "%s/%s", reg_path, rent->name);
                 out->path = strdup(full);
                 out->version = strdup(rent->name + pkg_len + 1);
@@ -308,7 +308,7 @@ static int resolve_cargo(const char *package_name, const char *project_root,
  * Memory: O(1) stack buffer. */
 static int resolve_npm(const char *package_name, const char *project_root,
                         cbm_dep_resolved_t *out) {
-    char probe[CBM_PATH_MAX];
+    char probe[CBM_DEP_PATH_MAX];
     snprintf(probe, sizeof(probe), "%s/node_modules/%s", project_root, package_name);
     if (access(probe, F_OK) == 0) {
         out->path = strdup(probe);
@@ -365,7 +365,7 @@ static int discover_vendored_deps(const char *project_root, cbm_dep_discovered_t
     if (!*out) return -1;
     *count = 0;
 
-    char dir_path[CBM_PATH_MAX];
+    char dir_path[CBM_DEP_PATH_MAX];
     for (int vi = 0; vendor_dirs[vi] && *count < max_results; vi++) {
         snprintf(dir_path, sizeof(dir_path), "%s/%s", project_root, vendor_dirs[vi]);
         cbm_dir_t *d = cbm_opendir(dir_path);
@@ -373,7 +373,7 @@ static int discover_vendored_deps(const char *project_root, cbm_dep_discovered_t
         cbm_dirent_t *ent;
         while ((ent = cbm_readdir(d)) != NULL && *count < max_results) {
             if (ent->name[0] == '.') continue;
-            char sub[CBM_PATH_MAX];
+            char sub[CBM_DEP_PATH_MAX];
             snprintf(sub, sizeof(sub), "%s/%s", dir_path, ent->name);
             struct stat st;
             if (stat(sub, &st) != 0 || !S_ISDIR(st.st_mode)) continue;

@@ -129,6 +129,42 @@ services:
         mv build/c/codebase-memory-mcp build/c/codebase-memory-mcp.exe 2>/dev/null || true &&
         CBM_DIAGNOSTICS=1 WINEDEBUG=-all scripts/soak-test.sh ./build/c/codebase-memory-mcp.exe 10
 
+  # ── Linux portable (Alpine musl static) ────────────────────
+  test-portable:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile.alpine
+    platform: linux/arm64
+    volumes:
+      - ..:/src
+    entrypoint: ["bash", "scripts/test.sh"]
+    command: ["CC=gcc", "CXX=g++"]
+
+  build-portable:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile.alpine
+    platform: linux/arm64
+    volumes:
+      - ..:/src
+    entrypoint: ["bash", "scripts/build.sh"]
+    command: ["CC=gcc", "CXX=g++", "STATIC=1"]
+
+  smoke-portable:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile.alpine
+    platform: linux/arm64
+    volumes:
+      - ..:/src
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        scripts/build.sh CC=gcc CXX=g++ STATIC=1 &&
+        file build/c/codebase-memory-mcp | grep -q "statically linked" &&
+        echo "=== Verified: statically linked ===" &&
+        scripts/smoke-test.sh ./build/c/codebase-memory-mcp
+
   # ── Lint ────────────────────────────────────────────────────
   lint:
     build:

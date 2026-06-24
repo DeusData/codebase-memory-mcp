@@ -1,0 +1,121 @@
+name: Bug report
+description: Something is wrong — help us reproduce it exactly.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! The single most valuable thing you can give us
+        is a **reproduction we can run ourselves**.
+
+        **Please do not paste proprietary code or logs.** If the problem
+        shows up on private code, reproduce it with a small dummy snippet or
+        point us at a **public OSS repository** (e.g. zod, django, serilog)
+        plus the file/commit where it happens — that is how we debug here.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `codebase-memory-mcp --version`
+      placeholder: codebase-memory-mcp 0.8.1
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux (x64)
+        - Linux (arm64)
+        - Windows (x64)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: channel
+    attributes:
+      label: Install channel
+      options:
+        - GitHub release archive / install.sh / install.ps1
+        - npm
+        - PyPI
+        - Homebrew
+        - AUR
+        - Scoop / Winget / Chocolatey
+        - go install
+        - Built from source
+    validations:
+      required: true
+
+  - type: dropdown
+    id: variant
+    attributes:
+      label: Binary variant
+      options:
+        - standard
+        - ui
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+      description: Actual vs. expected behavior, in a few sentences.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: |
+        The exact steps so we can reproduce it ourselves:
+        1. The code being indexed — a minimal dummy snippet pasted here, or a
+           public repo + commit + file path (e.g. `colinhacks/zod@a1b2c3d,
+           packages/zod/src/v4/core/parse.ts`).
+        2. The exact command or MCP tool call, including JSON arguments
+           (e.g. `codebase-memory-mcp cli search_graph '{"project":"...",
+           "name_pattern":"..."}'`).
+        3. What the output was vs. what it should have been.
+      placeholder: |
+        1. Code: public repo colinhacks/zod @ <commit>, file packages/...
+           — or dummy snippet:
+           ```ts
+           interface Model<T> { create(doc: Partial<T>): Promise<T>; }
+           ```
+        2. Command: codebase-memory-mcp cli index_repository '{"repo_path":"/tmp/zod"}'
+        3. Result: ... / Expected: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Relevant log output (stderr of the binary; for the UI variant also
+        `GET /api/logs`). Will be auto-formatted as code — no backticks needed.
+        Please check for private paths/strings before pasting.
+      render: text
+
+  - type: input
+    id: scale
+    attributes:
+      label: Project scale (if relevant)
+      description: Approximate nodes/edges/files from the indexing summary
+      placeholder: "5,656 nodes / 14,517 edges / 475 files"
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: My reproduction uses shareable code (a dummy snippet or a public OSS repository), not proprietary code.
+          required: true

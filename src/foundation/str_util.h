@@ -49,9 +49,19 @@ char *cbm_str_strip_ext(CBMArena *a, const char *path);
 char **cbm_str_split(CBMArena *a, const char *s, char delim, int *out_count);
 
 /* Validate a string is safe for shell interpolation inside single quotes.
- * Rejects: ' ; | & $ ` \n \r \0 (embedded NULs via len check).
+ * Rejects: ' " ; | & $ ` < > \n \r \0 (embedded NULs via len check).
+ * The Windows search path wraps shell args in cmd.exe-level "powershell -Command
+ * \"...'%s'...\"", so " can close the cmd.exe outer quote even if PowerShell's
+ * single quotes hold; < > would then become cmd.exe redirection (file-write
+ * primitive). Blocking these unconditionally hardens both POSIX and Windows.
  * Returns true if safe, false if the string contains shell metacharacters. */
 bool cbm_validate_shell_arg(const char *s);
+
+/* Validate a project name is safe for file path construction.
+ * Allows: alphanumeric, dash, underscore, dot (but not leading dot or dot-dot).
+ * Rejects: path separators (/ \), directory traversal (..), and control chars.
+ * Returns true if safe, false if the name could escape the cache directory. */
+bool cbm_validate_project_name(const char *name);
 
 /* Safe snprintf append: clamps offset to prevent buffer overflow on truncation.
  * When snprintf truncates, it returns what it WOULD have written, which can make
@@ -70,5 +80,10 @@ bool cbm_validate_shell_arg(const char *s);
                 (off) = (int)(sz) - 1;                                               \
         }                                                                            \
     } while (0)
+
+/* Escape a string for safe embedding in JSON: escapes " \ and control chars.
+ * Writes into buf (including NUL). Returns number of chars written (excl NUL).
+ * If buf is too small, output is truncated but always NUL-terminated. */
+int cbm_json_escape(char *buf, int bufsize, const char *src);
 
 #endif /* CBM_STR_UTIL_H */

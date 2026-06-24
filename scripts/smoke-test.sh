@@ -96,11 +96,47 @@ database:
   host: localhost
 YAMLEOF
 
+# C++ crash reproduction (#424): a large, templated C++ header. The vendored
+# tree-sitter runtime previously corrupted the heap and SEGV'd mid-parse on
+# large templated C++ in the PRODUCTION build (MI_OVERRIDE=1) — most reliably on
+# Windows static-MinGW, where ts_malloc/ts_free could resolve to different
+# allocators. Generating a header with heavy parse churn exercises that path;
+# the prod binary must index it without crashing (status must be "indexed").
+python3 - "$TMPDIR/src/big_templated.hpp" << 'GENEOF'
+import sys
+with open(sys.argv[1], "w") as f:
+    f.write("#include <cstddef>\nnamespace repro {\n")
+    for i in range(1500):
+        f.write(
+            "template <typename T> struct Box{0} {{\n"
+            "  T value;\n"
+            "  bool operator<(const Box{0} &o) const {{ return value < o.value; }}\n"
+            "  bool operator==(const Box{0} &o) const {{ return value == o.value; }}\n"
+            "  bool operator>(const Box{0} &o) const {{ return o.value < value; }}\n"
+            "  T get() const {{ return value; }}\n"
+            "}};\n".format(i)
+        )
+    f.write("}\n")
+GENEOF
+
 # Index
 RESULT=$(cli index_repository "{\"repo_path\":\"$TMPDIR\"}")
 echo "$RESULT"
 
-STATUS=$(echo "$RESULT" | python3 -c "import json,sys; d=json.loads(json.loads(sys.stdin.read())['content'][0]['text']); print(d.get('status',''))" 2>/dev/null || echo "")
+# Allocator-integrity guard: the prod binary overrides the global allocator with
+# mimalloc. A misconfigured override (e.g. compiling alloc-override.c's
+# forwarding defs on a platform where system libs keep using the system
+# allocator) corrupts free() and mimalloc prints "mimalloc: error: ..." to
+# stderr — often WITHOUT a non-zero exit. Treat any such line as a hard failure.
+if grep -qiE 'mimalloc: error|mi_free: invalid pointer|mi_assert' "$CLI_STDERR"; then
+  echo "FAIL: mimalloc reported an allocator error during indexing"
+  echo "--- stderr ---"
+  cat "$CLI_STDERR"
+  echo "--- end stderr ---"
+  exit 1
+fi
+
+STATUS=$(echo "$RESULT" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('status',''))" 2>/dev/null || echo "")
 if [ "$STATUS" != "indexed" ]; then
   echo "FAIL: index status is '$STATUS', expected 'indexed'"
   echo "--- stderr ---"
@@ -109,8 +145,8 @@ if [ "$STATUS" != "indexed" ]; then
   exit 1
 fi
 
-NODES=$(echo "$RESULT" | python3 -c "import json,sys; d=json.loads(json.loads(sys.stdin.read())['content'][0]['text']); print(d.get('nodes',0))" 2>/dev/null || echo "0")
-EDGES=$(echo "$RESULT" | python3 -c "import json,sys; d=json.loads(json.loads(sys.stdin.read())['content'][0]['text']); print(d.get('edges',0))" 2>/dev/null || echo "0")
+NODES=$(echo "$RESULT" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('nodes',0))" 2>/dev/null || echo "0")
+EDGES=$(echo "$RESULT" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('edges',0))" 2>/dev/null || echo "0")
 
 echo "nodes=$NODES edges=$EDGES"
 
@@ -128,28 +164,28 @@ echo ""
 echo "=== Phase 3: verify queries ==="
 
 # 3a: search_graph — find the compute function
-PROJECT=$(echo "$RESULT" | python3 -c "import json,sys; d=json.loads(json.loads(sys.stdin.read())['content'][0]['text']); print(d.get('project',''))" 2>/dev/null || echo "")
+PROJECT=$(echo "$RESULT" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('project',''))" 2>/dev/null || echo "")
 
 SEARCH=$(cli search_graph "{\"project\":\"$PROJECT\",\"name_pattern\":\"compute\"}")
-TOTAL=$(echo "$SEARCH" | python3 -c "import json,sys; d=json.loads(json.loads(sys.stdin.read())['content'][0]['text']); print(d.get('total',0))" 2>/dev/null || echo "0")
+TOTAL=$(echo "$SEARCH" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('total',0))" 2>/dev/null || echo "0")
 if [ "$TOTAL" -lt 1 ]; then
   echo "FAIL: search_graph for 'compute' returned 0 results"
   exit 1
 fi
 echo "OK: search_graph found $TOTAL result(s) for 'compute'"
 
-# 3b: trace_call_path — verify compute has callers
-TRACE=$(cli trace_call_path "{\"project\":\"$PROJECT\",\"function_name\":\"compute\",\"direction\":\"inbound\",\"depth\":1}")
-CALLERS=$(echo "$TRACE" | python3 -c "import json,sys; d=json.loads(json.loads(sys.stdin.read())['content'][0]['text']); print(len(d.get('callers',[])))" 2>/dev/null || echo "0")
+# 3b: trace_path — verify compute has callers
+TRACE=$(cli trace_path "{\"project\":\"$PROJECT\",\"function_name\":\"compute\",\"direction\":\"inbound\",\"depth\":1}")
+CALLERS=$(echo "$TRACE" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('callers',[])))" 2>/dev/null || echo "0")
 if [ "$CALLERS" -lt 1 ]; then
-  echo "FAIL: trace_call_path found 0 callers for 'compute'"
+  echo "FAIL: trace_path found 0 callers for 'compute'"
   exit 1
 fi
-echo "OK: trace_call_path found $CALLERS caller(s) for 'compute'"
+echo "OK: trace_path found $CALLERS caller(s) for 'compute'"
 
 # 3c: get_graph_schema — verify labels exist
 SCHEMA=$(cli get_graph_schema "{\"project\":\"$PROJECT\"}")
-LABELS=$(echo "$SCHEMA" | python3 -c "import json,sys; d=json.loads(json.loads(sys.stdin.read())['content'][0]['text']); print(len(d.get('node_labels',[])))" 2>/dev/null || echo "0")
+LABELS=$(echo "$SCHEMA" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('node_labels',[])))" 2>/dev/null || echo "0")
 if [ "$LABELS" -lt 3 ]; then
   echo "FAIL: schema has fewer than 3 node labels"
   exit 1
@@ -158,12 +194,188 @@ echo "OK: schema has $LABELS node labels"
 
 # 3d: Verify __init__.py didn't clobber Folder node
 FOLDERS=$(cli search_graph "{\"project\":\"$PROJECT\",\"label\":\"Folder\"}")
-FOLDER_COUNT=$(echo "$FOLDERS" | python3 -c "import json,sys; d=json.loads(json.loads(sys.stdin.read())['content'][0]['text']); print(d.get('total',0))" 2>/dev/null || echo "0")
+FOLDER_COUNT=$(echo "$FOLDERS" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('total',0))" 2>/dev/null || echo "0")
 if [ "$FOLDER_COUNT" -lt 2 ]; then
   echo "FAIL: expected at least 2 Folder nodes (src, src/pkg), got $FOLDER_COUNT"
   exit 1
 fi
 echo "OK: $FOLDER_COUNT Folder nodes (init.py didn't clobber them)"
+
+# 3d-cypher: query_graph Cypher capabilities
+# #238 WITH DISTINCT — all functions share label "Function" → collapses to 1 row.
+CYPHER_WD=$(cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (f:Function) WITH DISTINCT f.label AS lbl RETURN lbl\"}")
+WD_ROWS=$(echo "$CYPHER_WD" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+if [ "$WD_ROWS" -lt 1 ]; then
+  echo "FAIL: query_graph WITH DISTINCT returned 0 rows"
+  echo "$CYPHER_WD"
+  exit 1
+fi
+echo "OK: query_graph WITH DISTINCT returned $WD_ROWS row(s)"
+
+# #241 WHERE label test — f:Function is true for every Function node.
+CYPHER_LBL=$(cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (f:Function) WHERE f:Function RETURN f.name\"}")
+LBL_ROWS=$(echo "$CYPHER_LBL" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+if [ "$LBL_ROWS" -lt 1 ]; then
+  echo "FAIL: query_graph WHERE label-test returned 0 rows"
+  echo "$CYPHER_LBL"
+  exit 1
+fi
+echo "OK: query_graph WHERE f:Function returned $LBL_ROWS row(s)"
+
+# #242 label alternation — (n:Function|Module) seeds either label.
+CYPHER_ALT=$(cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (n:Function|Module) RETURN n.name\"}")
+ALT_ROWS=$(echo "$CYPHER_ALT" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+if [ "$ALT_ROWS" -lt 1 ]; then
+  echo "FAIL: query_graph label alternation returned 0 rows"
+  echo "$CYPHER_ALT"
+  exit 1
+fi
+echo "OK: query_graph (n:Function|Module) returned $ALT_ROWS row(s)"
+
+# #239 count(DISTINCT) — must parse and return a single aggregate row.
+CYPHER_CD=$(cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (f:Function) RETURN count(DISTINCT f.label)\"}")
+CD_ROWS=$(echo "$CYPHER_CD" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+if [ "$CD_ROWS" -ne 1 ]; then
+  echo "FAIL: query_graph count(DISTINCT) expected 1 row, got $CD_ROWS"
+  echo "$CYPHER_CD"
+  exit 1
+fi
+echo "OK: query_graph count(DISTINCT f.label) returned 1 aggregate row"
+
+# 3d-funcs: scalar / introspection functions (full Cypher suite, Tier 1)
+cyp_first_cell() {
+  # $1 = query; echoes rows[0][0] (or empty)
+  # Escape embedded double-quotes so string-literal args (e.g. replace(x,"a","A"))
+  # don't break the JSON we build by interpolation.
+  local q="${1//\"/\\\"}"
+  cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"$q\"}" |
+    python3 -c "import json,sys; d=json.loads(sys.stdin.read()); rows=d.get('rows',[]); print(rows[0][0] if rows and rows[0] else '')" 2>/dev/null || echo ""
+}
+
+# labels(n) → JSON list like ["Function"]
+LBLV=$(cyp_first_cell 'MATCH (f:Function) RETURN labels(f) AS l LIMIT 1')
+case "$LBLV" in
+  '['*) echo "OK: query_graph labels(f) = $LBLV" ;;
+  *) echo "FAIL: query_graph labels(f) returned '$LBLV' (expected a [\"...\"] list)"; exit 1 ;;
+esac
+
+# type(r) → relationship type
+TYPV=$(cyp_first_cell 'MATCH (f:Function)-[r]->(g) RETURN type(r) AS t LIMIT 1')
+if [ -z "$TYPV" ]; then
+  echo "FAIL: query_graph type(r) returned empty"; exit 1
+fi
+echo "OK: query_graph type(r) = $TYPV"
+
+# id(n) → numeric identity
+IDV=$(cyp_first_cell 'MATCH (f:Function) RETURN id(f) AS i LIMIT 1')
+case "$IDV" in
+  ''|*[!0-9]*) echo "FAIL: query_graph id(f) returned non-numeric '$IDV'"; exit 1 ;;
+  *) echo "OK: query_graph id(f) = $IDV" ;;
+esac
+
+# properties(n) → JSON object
+PROPV=$(cyp_first_cell 'MATCH (f:Function) RETURN properties(f) AS p LIMIT 1')
+case "$PROPV" in
+  '{'*) echo "OK: query_graph properties(f) is a JSON object" ;;
+  *) echo "FAIL: query_graph properties(f) returned '$PROPV'"; exit 1 ;;
+esac
+
+# toInteger() cast in projection
+TIV=$(cyp_first_cell 'MATCH (f:Function) RETURN toInteger(f.start_line) AS n LIMIT 1')
+case "$TIV" in
+  ''|*[!0-9-]*) echo "FAIL: query_graph toInteger(f.start_line) returned non-integer '$TIV'"; exit 1 ;;
+  *) echo "OK: query_graph toInteger(f.start_line) = $TIV" ;;
+esac
+
+# size() string-length function in projection
+SZV=$(cyp_first_cell 'MATCH (f:Function) RETURN size(f.name) AS s LIMIT 1')
+case "$SZV" in
+  ''|*[!0-9]*) echo "FAIL: query_graph size(f.name) returned non-integer '$SZV'"; exit 1 ;;
+  *) echo "OK: query_graph size(f.name) = $SZV" ;;
+esac
+
+# multi-arg functions: substring + coalesce
+SUBV=$(cyp_first_cell 'MATCH (f:Function) RETURN substring(f.name, 0, 3) AS s LIMIT 1')
+if [ -z "$SUBV" ]; then echo "FAIL: query_graph substring(...) returned empty"; exit 1; fi
+echo "OK: query_graph substring(f.name,0,3) = $SUBV"
+COALV=$(cyp_first_cell 'MATCH (f:Function) RETURN coalesce(f.nonesuch, f.name) AS c LIMIT 1')
+if [ -z "$COALV" ]; then echo "FAIL: query_graph coalesce(...) returned empty"; exit 1; fi
+echo "OK: query_graph coalesce(f.nonesuch, f.name) = $COALV"
+
+# EXISTS { } pattern predicate (edge-type-specific existence)
+CYPHER_EX=$(cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (f:Function) WHERE EXISTS { (f)-[:CALLS]->() } RETURN f.name\"}")
+EX_ROWS=$(echo "$CYPHER_EX" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+if [ "$EX_ROWS" -lt 1 ]; then
+  echo "FAIL: query_graph EXISTS{} predicate returned 0 rows"; echo "$CYPHER_EX"; exit 1
+fi
+echo "OK: query_graph EXISTS { (f)-[:CALLS]->() } returned $EX_ROWS row(s)"
+
+# =~ regex match in WHERE
+CYPHER_RX=$(cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (f:Function) WHERE f.name =~ \\\".+\\\" RETURN f.name\"}")
+RX_ROWS=$(echo "$CYPHER_RX" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+if [ "$RX_ROWS" -lt 1 ]; then
+  echo "FAIL: query_graph WHERE =~ regex returned 0 rows"; echo "$CYPHER_RX"; exit 1
+fi
+echo "OK: query_graph WHERE f.name =~ regex returned $RX_ROWS row(s)"
+
+# keys(n) → JSON list including "name"
+KEYSV=$(cyp_first_cell 'MATCH (f:Function) RETURN keys(f) AS k LIMIT 1')
+case "$KEYSV" in
+  *'"name"'*) echo "OK: query_graph keys(f) = $KEYSV" ;;
+  *) echo "FAIL: query_graph keys(f) returned '$KEYSV'"; exit 1 ;;
+esac
+
+# reverse() + replace() + left() string functions
+REVV=$(cyp_first_cell 'MATCH (f:Function) RETURN reverse(f.name) AS r LIMIT 1')
+[ -n "$REVV" ] && echo "OK: query_graph reverse(f.name) = $REVV" || { echo "FAIL: reverse empty"; exit 1; }
+REPV=$(cyp_first_cell 'MATCH (f:Function) RETURN replace(f.name, "a", "A") AS r LIMIT 1')
+[ -n "$REPV" ] && echo "OK: query_graph replace(...) = $REPV" || { echo "FAIL: replace empty"; exit 1; }
+LEFTV=$(cyp_first_cell 'MATCH (f:Function) RETURN left(f.name, 3) AS l LIMIT 1')
+[ -n "$LEFTV" ] && echo "OK: query_graph left(f.name,3) = $LEFTV" || { echo "FAIL: left empty"; exit 1; }
+
+# NOT EXISTS dead-code query (functions with no caller)
+CYPHER_NX=$(cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (f:Function) WHERE NOT EXISTS { (f)<-[:CALLS]-() } RETURN f.name\"}")
+NX_OK=$(echo "$CYPHER_NX" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print('rows' in d)" 2>/dev/null || echo "False")
+[ "$NX_OK" = "True" ] && echo "OK: query_graph NOT EXISTS dead-code query executed" || { echo "FAIL: NOT EXISTS query"; echo "$CYPHER_NX" | head -c 300; exit 1; }
+
+# CASE expression in RETURN
+CASEV=$(cyp_first_cell 'MATCH (f:Function) RETURN CASE WHEN f.name =~ ".+" THEN "named" ELSE "anon" END AS c LIMIT 1')
+[ "$CASEV" = "named" ] && echo "OK: query_graph CASE expression = $CASEV" || { echo "FAIL: CASE returned '$CASEV'"; exit 1; }
+
+# unsupported function must FAIL LOUDLY (not silently return empty). The CLI
+# prints the parse error to stderr (captured by cli() into $CLI_STDERR) and exits
+# non-zero, leaving stdout empty — so verify the loud failure on that channel.
+if cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (f:Function) RETURN nosuchfn(f.name)\"}" >/dev/null; then
+  echo "FAIL: unsupported function did not error (exit 0)"; exit 1
+fi
+ERROUT=$(cat "$CLI_STDERR" 2>/dev/null)
+case "$ERROUT" in
+  *unsupported*) echo "OK: unsupported function errors loudly" ;;
+  *) echo "FAIL: unsupported function did not error: $ERROUT" | head -c 300; exit 1 ;;
+esac
+
+# 3f: get_architecture surfaces Leiden community clusters
+ARCH=$(cli get_architecture "{\"project\":\"$PROJECT\",\"aspects\":[\"clusters\"]}")
+NCLUST=$(echo "$ARCH" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('clusters',[])))" 2>/dev/null || echo "0")
+if [ "$NCLUST" -lt 1 ]; then
+  echo "FAIL: get_architecture returned 0 community clusters"; echo "$ARCH" | head -c 400; exit 1
+fi
+echo "OK: get_architecture returned $NCLUST community cluster(s)"
+
+# 3g: search_code — basic search reports elapsed_ms + matches
+SC=$(cli search_code "{\"project\":\"$PROJECT\",\"pattern\":\"cbm_\",\"mode\":\"compact\",\"limit\":5}")
+echo "$SC" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); assert 'elapsed_ms' in d; print('OK: search_code elapsed_ms='+str(d['elapsed_ms'])+' total_grep_matches='+str(d.get('total_grep_matches')))" 2>/dev/null || { echo "FAIL: search_code basic / no elapsed_ms"; echo "$SC" | head -c 400; exit 1; }
+
+# 3g: search_code — literal '|' under regex=false must surface a warning (#282)
+SCW=$(cli search_code "{\"project\":\"$PROJECT\",\"pattern\":\"cbm_init|cbm_nope\",\"regex\":false,\"limit\":5}")
+echo "$SCW" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); w=' '.join(d.get('warnings',[])); assert 'regex=true' in w; print('OK: search_code literal-| warning surfaced')" 2>/dev/null || { echo "FAIL: search_code literal-| warning missing"; echo "$SCW" | head -c 400; exit 1; }
+
+# 3g: search_code — '&' in file_pattern accepted, not rejected as invalid (#272)
+SCA=$(cli search_code "{\"project\":\"$PROJECT\",\"pattern\":\"cbm_\",\"file_pattern\":\"*R&D*.c\",\"limit\":5}")
+case "$SCA" in
+  *"invalid characters"*) echo "FAIL: search_code rejected '&' in file_pattern"; echo "$SCA" | head -c 300; exit 1 ;;
+  *) echo "OK: search_code accepts '&' in file_pattern" ;;
+esac
 
 # 3e: delete_project cleanup
 cli delete_project "{\"project\":\"$PROJECT\"}" > /dev/null
@@ -271,7 +483,7 @@ fi
 echo "OK: tools/list response received (id:2)"
 
 # 5c: Verify expected tools are present
-for TOOL in index_repository search_graph trace_call_path get_code_snippet search_code; do
+for TOOL in index_repository search_graph trace_path get_code_snippet search_code; do
   if ! grep -q "\"$TOOL\"" "$MCP_OUTPUT"; then
     echo "FAIL: tool '$TOOL' not found in tools/list response"
     rm -f "$MCP_INPUT" "$MCP_OUTPUT"
@@ -385,6 +597,17 @@ if ! echo "$UPDATE_OUT" | grep -qi 'standard'; then
   echo "FAIL: update --dry-run did not respect --standard flag"
   exit 1
 fi
+# On Linux the binary must self-update from the static "-portable" asset: the
+# standard linux asset dynamically links glibc 2.38+ and breaks on older distros
+# (Debian 11, RHEL 8, Ubuntu 20.04). Guards build_update_url in src/cli/cli.c.
+if [ "$(uname -s)" = "Linux" ]; then
+  if ! echo "$UPDATE_OUT" | grep -q -- '-portable'; then
+    echo "FAIL: linux update --dry-run does not target the -portable asset"
+    echo "$UPDATE_OUT"
+    exit 1
+  fi
+  echo "OK: linux update targets the -portable (static) asset"
+fi
 echo "OK: update --dry-run --standard completed"
 
 # 6d: config set/get/reset round-trip
@@ -490,19 +713,23 @@ echo "=== Phase 8: agent config install E2E ==="
 FAKE_HOME=$(mktemp -d)
 mkdir -p "$FAKE_HOME/.claude"
 mkdir -p "$FAKE_HOME/.codex"
-mkdir -p "$FAKE_HOME/.gemini/antigravity"
+mkdir -p "$FAKE_HOME/.gemini/antigravity-cli"
 mkdir -p "$FAKE_HOME/.openclaw"
 mkdir -p "$FAKE_HOME/.kilocode/rules"
 mkdir -p "$FAKE_HOME/.config/opencode"
 if [ "$(uname -s)" = "Darwin" ]; then
   mkdir -p "$FAKE_HOME/Library/Application Support/Zed"
   mkdir -p "$FAKE_HOME/Library/Application Support/Code/User"
+  mkdir -p "$FAKE_HOME/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code/settings"
+elif [[ "${BINARY:-}" == *.exe ]]; then
+  mkdir -p "$FAKE_HOME/AppData/Local/Zed"
+  mkdir -p "$FAKE_HOME/AppData/Roaming/Code/User"
+  mkdir -p "$FAKE_HOME/AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code/settings"
 else
   mkdir -p "$FAKE_HOME/.config/zed"
   mkdir -p "$FAKE_HOME/.config/Code/User"
+  mkdir -p "$FAKE_HOME/.config/Code/User/globalStorage/kilocode.kilo-code/settings"
 fi
-# KiloCode detection always uses ~/.config/ path (even on macOS)
-mkdir -p "$FAKE_HOME/.config/Code/User/globalStorage/kilocode.kilo-code/settings"
 mkdir -p "$FAKE_HOME/.local/bin"
 # Copy binary with correct name for platform
 if [[ "$BINARY" == *.exe ]]; then
@@ -520,8 +747,14 @@ echo '{"existingKey": true}' > "$FAKE_HOME/.claude.json"
 echo '{"existingKey": true}' > "$FAKE_HOME/.gemini/settings.json"
 printf '[existing_section]\nline_from_user = true\n' > "$FAKE_HOME/.codex/config.toml"
 
-# Run install
-HOME="$FAKE_HOME" PATH="$FAKE_HOME/.local/bin:$PATH" "$BINARY" install -y 2>&1 || true
+# Run install — override platform config dirs so cbm_app_config_dir() and
+# cbm_app_local_dir() resolve to FAKE_HOME paths on all platforms.
+HOME="$FAKE_HOME" \
+  XDG_CONFIG_HOME="$FAKE_HOME/.config" \
+  APPDATA="$FAKE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$FAKE_HOME/AppData/Local" \
+  PATH="$FAKE_HOME/.local/bin:$PATH" \
+  "$BINARY" install -y 2>&1 || true
 
 # Helper for JSON validation (pipe file to python — avoids MSYS2 path translation issues)
 json_get() { cat "$1" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print($2)" 2>/dev/null || echo ""; }
@@ -559,26 +792,38 @@ if ! path_match "$CMD" "$SELF_PATH"; then
 fi
 echo "OK 8c: Claude Code MCP (.claude/.mcp.json)"
 
-# 8d: Claude Code hooks
+# 8d: Claude Code hooks — matcher must be exactly "Grep|Glob" (no Read, no Search).
+# Gating Read breaks Claude Code's read-before-edit invariant (issue #362), so
+# this assertion locks in the matcher to prevent regressions.
 if ! cat "$FAKE_HOME/.claude/settings.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 hooks = d.get('hooks', {}).get('PreToolUse', [])
-found = any('Grep' in str(h.get('matcher', '')) for h in hooks)
-sys.exit(0 if found else 1)
+ok = any(h.get('matcher') == 'Grep|Glob' for h in hooks)
+bad = any('Read' in str(h.get('matcher', '')) for h in hooks)
+sys.exit(0 if (ok and not bad) else 1)
 " 2>/dev/null; then
-  echo "FAIL 8d: PreToolUse hook not found in settings.json"
+  echo "FAIL 8d: PreToolUse hook matcher is not exactly 'Grep|Glob' (or still contains Read)"
   exit 1
 fi
-echo "OK 8d: Claude Code PreToolUse hook"
+echo "OK 8d: Claude Code PreToolUse hook (matcher=Grep|Glob, Read excluded)"
 
-# 8e: Claude Code gate script
+# 8e: Claude Code shim script — must be non-blocking augmenter, not a gate.
 if [ "$(uname -s)" != "MINGW64_NT" ] 2>/dev/null; then
-  if [ ! -x "$FAKE_HOME/.claude/hooks/cbm-code-discovery-gate" ]; then
-    echo "FAIL 8e: gate script not executable or missing"
+  GATE_SCRIPT="$FAKE_HOME/.claude/hooks/cbm-code-discovery-gate"
+  if [ ! -x "$GATE_SCRIPT" ]; then
+    echo "FAIL 8e: shim script not executable or missing"
     exit 1
   fi
-  echo "OK 8e: gate script installed and executable"
+  if grep -q 'exit 2' "$GATE_SCRIPT"; then
+    echo "FAIL 8e: shim contains 'exit 2' — must never block"
+    exit 1
+  fi
+  if ! grep -q 'hook-augment' "$GATE_SCRIPT"; then
+    echo "FAIL 8e: shim missing 'hook-augment' delegation"
+    exit 1
+  fi
+  echo "OK 8e: shim installed, non-blocking, delegates to hook-augment"
 fi
 
 # 8f-8h: Codex TOML
@@ -616,12 +861,17 @@ if ! cat "$FAKE_HOME/.gemini/settings.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 hooks = d.get('hooks', {}).get('BeforeTool', [])
-sys.exit(0 if len(hooks) > 0 else 1)
+# Matcher must be exactly 'google_search|grep_search' (no read_file). The
+# old matcher gated the agent's read tool — consistent with the Claude fix
+# we remove it here too.
+ok = any(h.get('matcher') == 'google_search|grep_search' for h in hooks)
+bad = any('read_file' in str(h.get('matcher', '')) for h in hooks)
+sys.exit(0 if (ok and not bad) else 1)
 " 2>/dev/null; then
-  echo "FAIL 8l: Gemini BeforeTool hook missing"
+  echo "FAIL 8l: Gemini BeforeTool hook matcher must be 'google_search|grep_search' (no read_file)"
   exit 1
 fi
-echo "OK 8l: Gemini BeforeTool hook"
+echo "OK 8l: Gemini BeforeTool hook (matcher=google_search|grep_search)"
 
 # 8m: Gemini instructions
 if [ ! -f "$FAKE_HOME/.gemini/GEMINI.md" ]; then
@@ -633,6 +883,8 @@ echo "OK 8m: Gemini instructions"
 # 8n: Zed MCP
 if [ "$(uname -s)" = "Darwin" ]; then
   ZED_CFG="$FAKE_HOME/Library/Application Support/Zed/settings.json"
+elif [[ "$BINARY" == *.exe ]]; then
+  ZED_CFG="$FAKE_HOME/AppData/Local/Zed/settings.json"
 else
   ZED_CFG="$FAKE_HOME/.config/zed/settings.json"
 fi
@@ -665,14 +917,15 @@ else
   echo "SKIP 8o-p: OpenCode not detected (binary not on PATH)"
 fi
 
-# 8q-r: Antigravity
-CMD=$(json_get "$FAKE_HOME/.gemini/antigravity/mcp_config.json" "d['mcpServers']['codebase-memory-mcp']['command']")
+# 8q-r: Antigravity (2026 layout: shared ~/.gemini/config/mcp_config.json,
+# instructions under ~/.gemini/antigravity-cli/)
+CMD=$(json_get "$FAKE_HOME/.gemini/config/mcp_config.json" "d['mcpServers']['codebase-memory-mcp']['command']")
 if ! path_match "$CMD" "$SELF_PATH"; then
   echo "FAIL 8q: Antigravity command='$CMD'"
   exit 1
 fi
 echo "OK 8q: Antigravity MCP"
-if [ ! -f "$FAKE_HOME/.gemini/antigravity/AGENTS.md" ]; then
+if [ ! -f "$FAKE_HOME/.gemini/antigravity-cli/AGENTS.md" ]; then
   echo "FAIL 8r: Antigravity AGENTS.md missing"
   exit 1
 fi
@@ -689,8 +942,14 @@ else
   echo "SKIP 8s: Aider not detected (binary not on PATH)"
 fi
 
-# 8t: KiloCode MCP (detection + install both use ~/.config/ on all platforms)
-KILO_CFG="$FAKE_HOME/.config/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json"
+# 8t: KiloCode MCP
+if [ "$(uname -s)" = "Darwin" ]; then
+  KILO_CFG="$FAKE_HOME/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json"
+elif [[ "$BINARY" == *.exe ]]; then
+  KILO_CFG="$FAKE_HOME/AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json"
+else
+  KILO_CFG="$FAKE_HOME/.config/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json"
+fi
 CMD=$(json_get "$KILO_CFG" "d['mcpServers']['codebase-memory-mcp']['command']")
 if ! path_match "$CMD" "$SELF_PATH"; then
   echo "FAIL 8t: KiloCode command='$CMD'"
@@ -708,6 +967,8 @@ echo "OK 8u: KiloCode instructions"
 # 8v: VS Code MCP
 if [ "$(uname -s)" = "Darwin" ]; then
   VSCODE_CFG="$FAKE_HOME/Library/Application Support/Code/User/mcp.json"
+elif [[ "$BINARY" == *.exe ]]; then
+  VSCODE_CFG="$FAKE_HOME/AppData/Roaming/Code/User/mcp.json"
 else
   VSCODE_CFG="$FAKE_HOME/.config/Code/User/mcp.json"
 fi
@@ -726,21 +987,24 @@ if ! path_match "$CMD" "$SELF_PATH"; then
 fi
 echo "OK 8w: OpenClaw MCP"
 
-# 8x-y: Skills
-for SKILL_NAME in codebase-memory-exploring codebase-memory-tracing codebase-memory-quality codebase-memory-reference; do
-  SKILL_FILE="$FAKE_HOME/.claude/skills/$SKILL_NAME/SKILL.md"
-  if [ ! -s "$SKILL_FILE" ]; then
-    echo "FAIL 8x: skill $SKILL_NAME missing or empty"
-    exit 1
-  fi
-done
-echo "OK 8x-y: all 4 skills installed"
+# 8x: Consolidated skill (old 4-skill dirs cleaned up, replaced by 1)
+SKILL_FILE="$FAKE_HOME/.claude/skills/codebase-memory/SKILL.md"
+if [ ! -s "$SKILL_FILE" ]; then
+  echo "FAIL 8x: skill codebase-memory missing or empty"
+  exit 1
+fi
+echo "OK 8x: skill installed"
 
 echo ""
 echo "=== Phase 9: agent config uninstall E2E ==="
 
 # Run uninstall (same FAKE_HOME with all configs present)
-HOME="$FAKE_HOME" PATH="$FAKE_HOME/.local/bin:$PATH" "$BINARY" uninstall -y -n 2>&1 || true
+HOME="$FAKE_HOME" \
+  XDG_CONFIG_HOME="$FAKE_HOME/.config" \
+  APPDATA="$FAKE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$FAKE_HOME/AppData/Local" \
+  PATH="$FAKE_HOME/.local/bin:$PATH" \
+  "$BINARY" uninstall -y -n 2>&1 || true
 
 # 9a-b: Claude Code MCP removed but existing keys preserved
 if cat "$FAKE_HOME/.claude.json" 2>/dev/null | python3 -c "
@@ -835,8 +1099,8 @@ else
   exit 1
 fi
 
-# 9l: Skills removed
-if [ -d "$FAKE_HOME/.claude/skills/codebase-memory-exploring" ]; then
+# 9l: Skills removed (consolidated skill dir)
+if [ -d "$FAKE_HOME/.claude/skills/codebase-memory" ]; then
   echo "FAIL 9l: skills not removed"
   exit 1
 fi
@@ -1024,10 +1288,15 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
   # ── 14a-f: Real update command against local HTTP server ──
   UPDATE_HOME=$(mktemp -d)
   mkdir -p "$UPDATE_HOME/.claude" "$UPDATE_HOME/.local/bin"
-  cp "$BINARY" "$UPDATE_HOME/.local/bin/codebase-memory-mcp"
-  chmod 755 "$UPDATE_HOME/.local/bin/codebase-memory-mcp"
-  if [ "$(uname -s)" = "Darwin" ]; then
-    codesign --sign - --force "$UPDATE_HOME/.local/bin/codebase-memory-mcp" 2>/dev/null || true
+  if [[ "$BINARY" == *.exe ]]; then
+    cp "$BINARY" "$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"
+    chmod 755 "$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"
+  else
+    cp "$BINARY" "$UPDATE_HOME/.local/bin/codebase-memory-mcp"
+    chmod 755 "$UPDATE_HOME/.local/bin/codebase-memory-mcp"
+    if [ "$(uname -s)" = "Darwin" ]; then
+      codesign --sign - --force "$UPDATE_HOME/.local/bin/codebase-memory-mcp" 2>/dev/null || true
+    fi
   fi
 
   # Pre-install agent config with a WRONG binary path (simulates stale config)
@@ -1079,7 +1348,7 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
   HOME="$UPDATE_HOME" "$BINARY" uninstall -y 2>&1 || true
 
   # 14e: Verify binary removed
-  if [ -f "$UPDATE_HOME/.local/bin/codebase-memory-mcp" ]; then
+  if [ -f "$UPDATE_HOME/.local/bin/codebase-memory-mcp" ] || [ -f "$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe" ]; then
     echo "FAIL 14e: binary still exists after uninstall"
     exit 1
   fi
@@ -1134,6 +1403,10 @@ DL_DIR=$(mktemp -d)
 
 # Detect platform for archive name
 DL_OS=$(uname -s | tr 'A-Z' 'a-z')
+# Normalize MSYS2/MinGW to "windows"
+case "$DL_OS" in
+  mingw*|msys*) DL_OS="windows" ;;
+esac
 DL_ARCH=$(uname -m)
 case "$DL_ARCH" in
   aarch64) DL_ARCH="arm64" ;;
@@ -1404,6 +1677,35 @@ else
   echo "SKIP Phase 15: binary exited immediately (no UI assets embedded)"
 fi
 rm -f "$UI_INPUT"
+
+echo ""
+echo "=== Phase 16: stdio server leaves no orphan after shutdown ==="
+# Regression guard for the orphaned-server failure mode behind #406: a stdio MCP
+# server must TERMINATE (not linger as a background process) once its stdin is
+# closed. The shutdown trigger is a closed stdin (`< /dev/null`): the server sees
+# an immediate, regular EOF on its read loop and exits.
+#
+# Why not a FIFO writer-close (the previous mechanism)? Closing a FIFO's last
+# writer surfaces as POLLHUP rather than a clean POLLIN+EOF; the server's
+# poll()-based read loop did not treat that as shutdown, so the FIFO probe left
+# the process alive and Phase 16 failed in CI on every platform. A plain
+# `< /dev/null` EOF is the simplest reliable trigger and is fully portable
+# (POSIX shells and MSYS2 bash alike), so no OS gate is needed here.
+"$BINARY" < /dev/null > /dev/null 2>&1 &
+SHUT_SRV_PID=$!
+SHUT_GONE=0
+for _ in $(seq 1 60); do            # bounded ~6s wait (60 × 0.1s)
+  if ! kill -0 "$SHUT_SRV_PID" 2>/dev/null; then SHUT_GONE=1; break; fi
+  sleep 0.1
+done
+if [ "$SHUT_GONE" -ne 1 ]; then
+  echo "FAIL 16: stdio server still running after stdin closed (orphan process)"
+  kill -9 "$SHUT_SRV_PID" 2>/dev/null || true
+  wait "$SHUT_SRV_PID" 2>/dev/null || true
+  exit 1
+fi
+wait "$SHUT_SRV_PID" 2>/dev/null || true
+echo "OK 16: stdio server terminated after stdin closed, no orphan"
 
 echo ""
 echo "=== smoke-test: ALL PASSED ==="

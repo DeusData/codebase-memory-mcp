@@ -920,7 +920,7 @@ static bool scan(Scanner *scanner, TSLexer *lexer, const bool *valid_symbols) {
     }
 
     if ((valid_symbols[R_DQT_STR_CTN] && is_r && scn_dqt_str_cnt(scanner, lexer, R_DQT_STR_CTN)) ||
-        (valid_symbols[BR_DQT_STR_CTN] && is_br && scn_dqt_str_cnt(scanner, lexer, BR_DQT_STR_CTN))) {
+        (valid_symbols[BR_DQT_STR_CTN] && (is_br || has_nwl) && scn_dqt_str_cnt(scanner, lexer, BR_DQT_STR_CTN))) {
         return true;
     }
 

@@ -121,7 +121,7 @@ fi
 echo ""
 echo "--- Auditing skill file content ---"
 
-SKILLS_DIR="$HOME/.claude/skills"
+SKILLS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
 if [[ -d "$SKILLS_DIR" ]]; then
     SKILL_ISSUES=0
 

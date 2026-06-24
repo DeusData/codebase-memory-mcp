@@ -75,8 +75,101 @@ typedef enum {
     CBM_LANG_FORM,
     CBM_LANG_MAGMA,
     CBM_LANG_WOLFRAM,
+    CBM_LANG_SOLIDITY,
+    CBM_LANG_TYPST,
+    CBM_LANG_GDSCRIPT,
+    CBM_LANG_GLEAM,
+    CBM_LANG_POWERSHELL,
+    CBM_LANG_PASCAL,
+    CBM_LANG_DLANG,
+    CBM_LANG_NIM,
+    CBM_LANG_SCHEME,
+    CBM_LANG_FENNEL,
+    CBM_LANG_FISH,
+    CBM_LANG_AWK,
+    CBM_LANG_ZSH,
+    CBM_LANG_TCL,
+    CBM_LANG_ADA,
+    CBM_LANG_AGDA,
+    CBM_LANG_RACKET,
+    CBM_LANG_ODIN,
+    CBM_LANG_RESCRIPT,
+    CBM_LANG_PURESCRIPT,
+    CBM_LANG_NICKEL,
+    CBM_LANG_CRYSTAL,
+    CBM_LANG_TEAL,
+    CBM_LANG_HARE,
+    CBM_LANG_PONY,
+    CBM_LANG_LUAU,
+    CBM_LANG_JANET,
+    CBM_LANG_SWAY,
+    CBM_LANG_NASM,
+    CBM_LANG_ASSEMBLY,
+    CBM_LANG_ASTRO,
+    CBM_LANG_BLADE,
+    CBM_LANG_JUST,
+    CBM_LANG_GOTEMPLATE,
+    CBM_LANG_TEMPL,
+    CBM_LANG_LIQUID,
+    CBM_LANG_JINJA2,
+    CBM_LANG_PRISMA,
+    CBM_LANG_HYPRLANG,
+    CBM_LANG_DOTENV,
+    CBM_LANG_DIFF,
+    CBM_LANG_WGSL,
+    CBM_LANG_KDL,
+    CBM_LANG_JSON5,
+    CBM_LANG_JSONNET,
+    CBM_LANG_RON,
+    CBM_LANG_THRIFT,
+    CBM_LANG_CAPNP,
+    CBM_LANG_PROPERTIES,
+    CBM_LANG_SSHCONFIG,
+    CBM_LANG_BIBTEX,
+    CBM_LANG_STARLARK,
+    CBM_LANG_BICEP,
+    CBM_LANG_CSV,
+    CBM_LANG_REQUIREMENTS,
+    CBM_LANG_HLSL,
+    CBM_LANG_VHDL,
+    CBM_LANG_SYSTEMVERILOG,
+    CBM_LANG_DEVICETREE,
+    CBM_LANG_LINKERSCRIPT,
+    CBM_LANG_GN,
+    CBM_LANG_KCONFIG,
+    CBM_LANG_BITBAKE,
+    CBM_LANG_SMALI,
+    CBM_LANG_TABLEGEN,
+    CBM_LANG_ISPC,
+    CBM_LANG_CAIRO,
+    CBM_LANG_MOVE,
+    CBM_LANG_SQUIRREL,
+    CBM_LANG_FUNC,
+    CBM_LANG_REGEX,
+    CBM_LANG_JSDOC,
+    CBM_LANG_RST,
+    CBM_LANG_BEANCOUNT,
+    CBM_LANG_MERMAID,
+    CBM_LANG_PUPPET,
+    CBM_LANG_PO,
+    CBM_LANG_GITATTRIBUTES,
+    CBM_LANG_GITIGNORE,
+    CBM_LANG_SLANG,
+    CBM_LANG_LLVM_IR,
+    CBM_LANG_SMITHY,
+    CBM_LANG_WIT,
+    CBM_LANG_TLAPLUS,
+    CBM_LANG_PKL,
+    CBM_LANG_GOMOD,
+    CBM_LANG_APEX,
+    CBM_LANG_SOQL,
+    CBM_LANG_SOSL,
     CBM_LANG_KUSTOMIZE, // kustomization.yaml — Kubernetes overlay tool
     CBM_LANG_K8S,       // Generic Kubernetes manifest (apiVersion: detected)
+    CBM_LANG_PINE,      // Pine Script (TradingView indicator / strategy language)
+    CBM_LANG_QML,       // Qt QML (Qt Modeling Language — declarative UI + embedded JS)
+    CBM_LANG_CFSCRIPT,  // CFML script dialect (.cfc components — Lucee/ColdFusion)
+    CBM_LANG_CFML,      // CFML tag dialect (.cfm templates — Lucee/ColdFusion)
     CBM_LANG_COUNT
 } CBMLanguage;
 
@@ -99,17 +192,51 @@ typedef struct {
     const char **param_names;  // NULL-terminated array (NULL if none)
     const char **param_types;  // NULL-terminated array (NULL if none)
     const char **return_types; // NULL-terminated array (NULL if none)
+    const char *route_path;    // HTTP route path from decorator (e.g., "/api/users") or NULL
+    const char *route_method;  // HTTP method from decorator (e.g., "POST") or NULL
     int complexity;            // cyclomatic complexity
+    int cognitive;             // cognitive complexity (nesting-weighted)
+    int loop_count;            // number of loop constructs in the body
+    int loop_depth;            // max nested-loop depth (bottleneck proxy)
+    bool is_recursive;         // body contains a direct self-call (seed for "recursive")
+    int param_count;           // number of parameters (large = complexity smell)
+    int max_access_depth;      // deepest chained member/subscript access (a.b.c.d)
+    int linear_scan_in_loop;   // count of linear-scan calls (find/contains/indexOf) inside loops
+    int alloc_in_loop;         // count of allocation/append calls inside loops
+    bool recursion_in_loop;    // a self-call occurs inside a loop body
+    bool unguarded_recursion;  // recursive with no self-call guarded by a conditional
     int lines;                 // body line count
+    uint32_t *fingerprint;     // MinHash fingerprint (arena-allocated, K values) or NULL
+    int fingerprint_k;         // number of hash values (CBM_MINHASH_K or 0)
     bool is_exported;
     bool is_abstract;
     bool is_test;
     bool is_entry_point;
+    const char *structural_profile; // AST structural profile (arena-allocated) or NULL
+    const char *body_tokens; // space-separated raw identifier tokens from body (arena) or NULL
 } CBMDefinition;
 
+/* Argument captured from a call expression */
 typedef struct {
-    const char *callee_name;       // raw callee text ("pkg.Func", "foo")
-    const char *enclosing_func_qn; // QN of enclosing function (or module QN)
+    const char *expr;    // raw expression text ("payload.info", "MY_URL", "'hello'")
+    const char *value;   // resolved string value or NULL (constant propagation)
+    const char *keyword; // keyword name if keyword arg ("url", "topic_id"), NULL if positional
+    int index;           // positional index (0-based)
+} CBMCallArg;
+
+#define CBM_MAX_CALL_ARGS 8
+
+typedef struct {
+    const char *callee_name;            // raw callee text ("pkg.Func", "foo")
+    const char *enclosing_func_qn;      // QN of enclosing function (or module QN)
+    const char *first_string_arg;       // first string literal argument (URL, topic, key) or NULL
+    const char *second_arg_name;        // second argument identifier (handler ref) or NULL
+    CBMCallArg args[CBM_MAX_CALL_ARGS]; // first N arguments with expressions
+    int arg_count;                      // number of captured arguments
+    int loop_depth;                     // enclosing loop nesting at the call site
+    int branch_depth;                   // enclosing branch nesting at the call site
+    int start_line;                     // 1-based source line of the call (for def range-match)
+    bool is_method;                     // Perl-only: arrow/method call ($obj->m). Default false.
 } CBMCall;
 
 typedef struct {
@@ -148,6 +275,47 @@ typedef struct {
     const char *type_name;         // class/type name of RHS constructor
     const char *enclosing_func_qn; // QN of enclosing function
 } CBMTypeAssign;
+
+// String reference: URL, config key, or async target found in source.
+// Extracted from string literals during AST walk.
+typedef enum {
+    CBM_STRREF_URL = 0,    // REST path or full URL
+    CBM_STRREF_CONFIG = 1, // config file path or env var key
+} CBMStringRefKind;
+
+typedef struct {
+    const char *value;             // the string literal content
+    const char *enclosing_func_qn; // QN of enclosing function
+    const char *key_path;          // dotted key path from YAML/JSON nesting (NULL if flat)
+    CBMStringRefKind kind;         // URL, CONFIG
+} CBMStringRef;
+
+/* Infrastructure binding: topic/queue → endpoint URL.
+ * Extracted from YAML/HCL/JSON subscription/scheduler configs.
+ * Used by pass_route_nodes to connect async Route nodes to handler services. */
+typedef struct {
+    const char *source_name; // topic, queue, or schedule name
+    const char *target_url;  // push_endpoint, uri, or http_target URL
+    const char *broker;      // "pubsub", "cloud_tasks", "cloud_scheduler", "sqs", "kafka"
+} CBMInfraBinding;
+
+/* Pub/sub channel participation.  One record per emit() or on()/addListener()
+ * call detected in source — the receiver (e.g. Socket.IO client, EventEmitter
+ * instance) is intentionally NOT identified; matching is by channel_name
+ * across files, which captures the common pattern of one logical bus per
+ * service.  Transport disambiguates Socket.IO vs EventEmitter vs future
+ * detectors (Kafka, Cloud Pub/Sub, etc.). */
+typedef enum {
+    CBM_CHANNEL_EMIT = 0,
+    CBM_CHANNEL_LISTEN = 1,
+} CBMChannelDirection;
+
+typedef struct {
+    const char *channel_name;      // literal channel name (e.g. "user.created")
+    const char *transport;         // "socketio", "event_emitter", ...
+    const char *enclosing_func_qn; // QN of the function containing the emit/on call
+    CBMChannelDirection direction;
+} CBMChannel;
 
 // Rust: impl Trait for Struct
 typedef struct {
@@ -226,10 +394,28 @@ typedef struct {
 } CBMTypeAssignArray;
 
 typedef struct {
+    CBMStringRef *items;
+    int count;
+    int cap;
+} CBMStringRefArray;
+
+typedef struct {
+    CBMInfraBinding *items;
+    int count;
+    int cap;
+} CBMInfraBindingArray;
+
+typedef struct {
     CBMImplTrait *items;
     int count;
     int cap;
 } CBMImplTraitArray;
+
+typedef struct {
+    CBMChannel *items;
+    int count;
+    int cap;
+} CBMChannelArray;
 
 // Full extraction result for one file.
 typedef struct {
@@ -246,12 +432,16 @@ typedef struct {
     CBMTypeAssignArray type_assigns;
     CBMImplTraitArray impl_traits;       // Rust: impl Trait for Struct pairs
     CBMResolvedCallArray resolved_calls; // LSP-resolved calls (high confidence)
+    CBMStringRefArray string_refs;       // URL/config string literals from AST
+    CBMInfraBindingArray infra_bindings; // topic→URL pairs from IaC configs
+    CBMChannelArray channels;            // Socket.IO / EventEmitter pub/sub participation
 
-    const char *module_qn;    // module qualified name
-    const char **exports;     // NULL-terminated (NULL if none)
-    const char **constants;   // NULL-terminated (NULL if none)
-    const char **global_vars; // NULL-terminated (NULL if none)
-    const char **macros;      // NULL-terminated, C/C++ only (NULL if none)
+    const char *module_qn;      // module qualified name
+    const char *namespace_name; // declared namespace/package (Java/Kotlin/C#/PHP), NULL if none
+    const char **exports;       // NULL-terminated (NULL if none)
+    const char **constants;     // NULL-terminated (NULL if none)
+    const char **global_vars;   // NULL-terminated (NULL if none)
+    const char **macros;        // NULL-terminated, C/C++ only (NULL if none)
 
     bool has_error;
     const char *error_msg;
@@ -259,6 +449,15 @@ typedef struct {
     int imports_count;
     TSTree *cached_tree;     // retained parse tree (caller frees via cbm_free_tree)
     CBMLanguage cached_lang; // language of cached tree (for parser selection)
+
+    // Retained source bytes — copied into `arena` by the parallel
+    // extract pass so the fused cross-file LSP step in resolve_worker
+    // can run without re-reading the file from disk. NULL when the
+    // file exceeded the per-file (100 MB) or total (2 GB) retention
+    // cap; in that case the cross-file LSP step is skipped for this
+    // file (defs/calls already extracted are unaffected).
+    const char *source;
+    int source_len;
 } CBMFileResult;
 
 // --- Enclosing function cache ---
@@ -279,6 +478,14 @@ typedef struct {
 
 // --- Extraction context passed to sub-extractors ---
 
+// Module-level string constant map (for constant propagation)
+#define CBM_MAX_STRING_CONSTANTS 256
+typedef struct {
+    const char *names[CBM_MAX_STRING_CONSTANTS];
+    const char *values[CBM_MAX_STRING_CONSTANTS];
+    int count;
+} CBMStringConstantMap;
+
 typedef struct {
     CBMArena *arena;
     CBMFileResult *result;
@@ -289,11 +496,22 @@ typedef struct {
     const char *rel_path;
     const char *module_qn;
     TSNode root;
-    EFCache ef_cache;               // enclosing function cache
-    const char *enclosing_class_qn; // for nested class QN computation
+    EFCache ef_cache;                      // enclosing function cache
+    const char *enclosing_class_qn;        // for nested class QN computation
+    CBMStringConstantMap string_constants; // module-level NAME = "value" pairs
 } CBMExtractCtx;
 
 // --- Public API ---
+
+// Bind third-party allocators (tree-sitter, sqlite3, libgit2) to mimalloc as
+// defense-in-depth, so they never depend on the fragile MI_OVERRIDE symbol
+// override (#424). MUST be called as the very first statement of main(), before
+// any sqlite3_open*/sqlite3_initialize (SQLITE_CONFIG_MALLOC returns
+// SQLITE_MISUSE once sqlite has initialized) and before any git_libgit2_init.
+// Idempotent (static guard); intended for single-threaded startup. cbm_init()
+// also calls it so non-main entry points (pipeline passes) still get the binds.
+// In the test build (no CBM_BIND_TS_ALLOCATOR) this is a no-op.
+void cbm_alloc_init(void);
 
 // Initialize the library. Call once at startup. Returns 0 on success.
 int cbm_init(void);
@@ -328,11 +546,22 @@ void cbm_destroy_thread_parser(void);
 void cbm_shutdown(void);
 
 // Profiling: get accumulated parse/extraction times and file count.
-void cbm_get_profile(uint64_t *parse_ns, uint64_t *extract_ns, uint64_t *files);
+typedef struct {
+    uint64_t *parse_ns;
+    uint64_t *extract_ns;
+    uint64_t *files;
+} cbm_profile_out_t;
+void cbm_get_profile(cbm_profile_out_t out);
 uint64_t cbm_get_lsp_ns(void);
 uint64_t cbm_get_preprocess_ns(void);
 uint64_t cbm_get_files_preprocessed(void);
 void cbm_reset_profile(void);
+
+// Toggle C/C++ preprocessor Macro-node extraction (#375). The pipeline enables
+// it only for full/advanced index modes (it dominates extraction on macro-dense
+// codebases). Default ON. Set before extraction; read-only during.
+void cbm_set_macro_extraction(int enabled);
+int cbm_macro_extraction_enabled(void);
 
 // --- Internal helpers used by extractors ---
 
@@ -346,19 +575,22 @@ void cbm_rw_push(CBMRWArray *arr, CBMArena *a, CBMReadWrite rw);
 void cbm_typerefs_push(CBMTypeRefArray *arr, CBMArena *a, CBMTypeRef tr);
 void cbm_envaccess_push(CBMEnvAccessArray *arr, CBMArena *a, CBMEnvAccess ea);
 void cbm_typeassign_push(CBMTypeAssignArray *arr, CBMArena *a, CBMTypeAssign ta);
+void cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr);
+void cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBinding ib);
 void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
 void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
+void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
 
 // --- Sub-extractor entry points ---
 
 void cbm_extract_definitions(CBMExtractCtx *ctx);
-void cbm_extract_calls(CBMExtractCtx *ctx);
 void cbm_extract_imports(CBMExtractCtx *ctx);
 void cbm_extract_usages(CBMExtractCtx *ctx);
 void cbm_extract_semantic(CBMExtractCtx *ctx);
 void cbm_extract_type_refs(CBMExtractCtx *ctx);
 void cbm_extract_env_accesses(CBMExtractCtx *ctx);
 void cbm_extract_type_assigns(CBMExtractCtx *ctx);
+void cbm_extract_channels(CBMExtractCtx *ctx);
 
 // Single-pass unified extraction (replaces the 7 calls above except defs+imports).
 void cbm_extract_unified(CBMExtractCtx *ctx);

@@ -1,0 +1,18 @@
+#!/bin/sh
+# commit-msg hook — STRICT DCO enforcement at commit time.
+# Every commit must carry a Signed-off-by trailer (git commit -s).
+# Install with: scripts/install-git-hooks.sh
+
+if grep -qE '^Signed-off-by: .+ <.+@.+>' "$1"; then
+    exit 0
+fi
+
+echo "" >&2
+echo "COMMIT REJECTED: missing Signed-off-by trailer (Developer Certificate of Origin)." >&2
+echo "" >&2
+echo "  Sign your commit:        git commit -s" >&2
+echo "  Fix the last commit:     git commit --amend -s" >&2
+echo "" >&2
+echo "The sign-off certifies you have the right to submit this code under the" >&2
+echo "project's MIT license — see the DCO file and CONTRIBUTING.md." >&2
+exit 1

@@ -112,7 +112,7 @@ test_payload "index nonexistent path" '{"jsonrpc":"2.0","id":2,"method":"tools/c
 
 # Negative/zero values for numeric params
 test_payload "negative limit" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_graph","arguments":{"name_pattern":"test","limit":-1}}}'
-test_payload "zero max_depth" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"trace_call_path","arguments":{"function_name":"test","max_depth":0}}}'
+test_payload "zero max_depth" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"trace_path","arguments":{"function_name":"test","max_depth":0}}}'
 test_payload "huge max_rows" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query_graph","arguments":{"query":"MATCH (n) RETURN n","max_rows":999999999}}}'
 
 echo ""

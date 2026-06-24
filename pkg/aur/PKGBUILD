@@ -1,0 +1,28 @@
+# Maintainer: DeusData <https://github.com/DeusData>
+pkgname=codebase-memory-mcp
+pkgver=0.8.1
+pkgrel=1
+pkgdesc="Fast code intelligence engine for AI coding agents — single static binary MCP server"
+arch=('x86_64' 'aarch64')
+url="https://github.com/DeusData/codebase-memory-mcp"
+license=('MIT')
+provides=("$pkgname")
+conflicts=("$pkgname")
+
+source_x86_64=("${pkgname}-${pkgver}-linux-amd64.tar.gz::https://github.com/DeusData/codebase-memory-mcp/releases/download/v${pkgver}/codebase-memory-mcp-linux-amd64.tar.gz")
+source_aarch64=("${pkgname}-${pkgver}-linux-arm64.tar.gz::https://github.com/DeusData/codebase-memory-mcp/releases/download/v${pkgver}/codebase-memory-mcp-linux-arm64.tar.gz")
+
+sha256sums_x86_64=('dbd3b92ea870ef240b63059f26bda15015f76ef9978931bebc3a0f9d09470973')
+sha256sums_aarch64=('d2f842d1365da5c35d9c5796f57a821c9745267350994346735e1e6e04d46091')
+
+package() {
+    install -Dm755 "${srcdir}/codebase-memory-mcp" \
+        "${pkgdir}/usr/bin/codebase-memory-mcp"
+    install -Dm644 "${srcdir}/LICENSE" \
+        "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    # Third-party attribution bundle (present in archives since v0.8.1)
+    if [ -f "${srcdir}/THIRD_PARTY_NOTICES.md" ]; then
+        install -Dm644 "${srcdir}/THIRD_PARTY_NOTICES.md" \
+            "${pkgdir}/usr/share/licenses/${pkgname}/THIRD_PARTY_NOTICES.md"
+    fi
+}

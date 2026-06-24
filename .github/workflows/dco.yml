@@ -1,0 +1,46 @@
+# DCO enforcement — every commit on every branch must carry a Signed-off-by
+# trailer matching its author (Developer Certificate of Origin 1.1, see DCO).
+# Runs on all pushes and pull requests; scripts/check-dco.sh holds the rules.
+name: DCO
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dco-${{ github.ref }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  dco:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - name: Check Signed-off-by on all new commits
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # Ranges always cover only the NEW commits of this event, so history
+          # predating DCO adoption is naturally exempt.
+          if [ "$EVENT" = "pull_request" ]; then
+            RANGE="$BASE_SHA..$HEAD_SHA"
+          elif [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            # New branch: check the commits not on the default branch
+            RANGE="origin/$DEFAULT_BRANCH..$PUSH_AFTER"
+          else
+            RANGE="$PUSH_BEFORE..$PUSH_AFTER"
+          fi
+          echo "checking range: $RANGE"
+          scripts/check-dco.sh "$RANGE"

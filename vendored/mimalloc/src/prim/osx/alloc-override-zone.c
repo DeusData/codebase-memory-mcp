@@ -41,10 +41,18 @@ extern malloc_zone_t* malloc_default_purgeable_zone(void) __attribute__((weak_im
    malloc zone members
 ------------------------------------------------------ */
 
+static bool is_mimalloc_zone( malloc_zone_t* zone ); 
+
 static size_t zone_size(malloc_zone_t* zone, const void* p) {
-  MI_UNUSED(zone);
-  if (!mi_is_in_heap_region(p)){ return 0; } // not our pointer, bail out
-  return mi_usable_size(p);
+  if (mi_any_heap_contains(p)) { 
+    return mi_usable_size(p);
+  }
+  else if (!is_mimalloc_zone(zone)) {  // can happen due to interpose
+    return zone->size(zone,p);
+  }
+  else {
+    return 0;
+  }
 }
 
 static void* zone_malloc(malloc_zone_t* zone, size_t size) {
@@ -63,13 +71,24 @@ static void* zone_valloc(malloc_zone_t* zone, size_t size) {
 }
 
 static void zone_free(malloc_zone_t* zone, void* p) {
-  MI_UNUSED(zone);
-  mi_cfree(p);
+  if (mi_any_heap_contains(p)) {
+    mi_free(p); // with the page_map and pagemap_commit=1 we can use the regular free
+  }
+  else if (!is_mimalloc_zone(zone)) {  // can happen due to interpose
+    zone->free(zone,p);
+  }
 }
 
 static void* zone_realloc(malloc_zone_t* zone, void* p, size_t newsize) {
-  MI_UNUSED(zone);
-  return mi_realloc(p, newsize);
+  if (p == NULL || mi_any_heap_contains(p)) {
+    return mi_realloc(p, newsize);
+  }
+  else if (!is_mimalloc_zone(zone)) {  // can happen due to interpose
+    return zone->realloc(zone,p,newsize);
+  }
+  else {
+    return NULL;
+  }
 }
 
 static void* zone_memalign(malloc_zone_t* zone, size_t alignment, size_t size) {
@@ -78,12 +97,13 @@ static void* zone_memalign(malloc_zone_t* zone, size_t alignment, size_t size) {
 }
 
 static void zone_destroy(malloc_zone_t* zone) {
-  MI_UNUSED(zone);
-  // todo: ignore for now?
+  if (!is_mimalloc_zone(zone)) {
+    zone->destroy(zone);
+  }
 }
 
 static unsigned zone_batch_malloc(malloc_zone_t* zone, size_t size, void** ps, unsigned count) {
-  size_t i;
+  unsigned i;
   for (i = 0; i < count; i++) {
     ps[i] = zone_malloc(zone, size);
     if (ps[i] == NULL) break;
@@ -240,6 +260,9 @@ static malloc_zone_t mi_malloc_zone = {
 }
 #endif
 
+static bool is_mimalloc_zone( malloc_zone_t* zone ) {
+  return (zone==NULL || zone==&mi_malloc_zone);
+}
 
 #if defined(MI_OSX_INTERPOSE) && defined(MI_SHARED_LIB_EXPORT)
 
@@ -253,11 +276,8 @@ static malloc_zone_t mi_malloc_zone = {
 // `malloc_zone_calloc` etc. see <https://github.com/aosm/libmalloc/blob/master/man/malloc_zone_malloc.3>
 // ------------------------------------------------------
 
-static inline malloc_zone_t* mi_get_default_zone(void)
-{
-  static bool init;
-  if mi_unlikely(!init) {
-    init = true;
+static inline malloc_zone_t* mi_get_default_zone(void) {
+  mi_atomic_do_once {
     malloc_zone_register(&mi_malloc_zone);  // by calling register we avoid a zone error on free (see <http://eatmyrandom.blogspot.com/2010/03/mallocfree-interception-on-mac-os-x.html>)
   }
   return &mi_malloc_zone;
@@ -328,7 +348,7 @@ static bool zone_check(malloc_zone_t* zone) {
 
 static malloc_zone_t* zone_from_ptr(const void* p) {
   MI_UNUSED(p);
-  return mi_get_default_zone();
+  return (mi_any_heap_contains(p) ? mi_get_default_zone() : NULL);
 }
 
 static void zone_log(malloc_zone_t* zone, void* p) {

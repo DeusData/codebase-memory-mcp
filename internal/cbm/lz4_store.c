@@ -1,17 +1,14 @@
-// lz4_store.c — Thin C wrappers around LZ4 HC for the sourceStore.
-// Linked via CGo from lz4.go.
+// lz4_store.c — Thin C wrappers around LZ4 HC.
+// Include vendored LZ4 source directly — compiled as a single translation unit.
 
-// Include the vendored LZ4 source directly so CGo compiles everything
-// in a single translation unit (avoids separate .c file compilation issues).
-// NOLINTNEXTLINE(bugprone-suspicious-include)
-#include "vendored/lz4/lz4.c"
-// NOLINTNEXTLINE(bugprone-suspicious-include)
-#include "vendored/lz4/lz4hc.c"
+#include "vendored/lz4/lz4.h"
+#include "vendored/lz4/lz4hc.h"
 
 #include "lz4_store.h"
 
 int cbm_lz4_compress_hc(const char *src, int srcLen, char *dst, int dstCap) {
-    return LZ4_compress_HC(src, dst, srcLen, dstCap, 9);
+    enum { LZ4_HC_LEVEL = 9 };
+    return LZ4_compress_HC(src, dst, srcLen, dstCap, LZ4_HC_LEVEL);
 }
 
 int cbm_lz4_decompress(const char *src, int srcLen, char *dst, int originalLen) {

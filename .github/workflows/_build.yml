@@ -1,0 +1,255 @@
+# Reusable: build binaries (standard + UI) on all platforms
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version string (e.g. v0.8.0)'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            cc: gcc
+            cxx: g++
+          - os: macos-14
+            goos: darwin
+            goarch: arm64
+            cc: cc
+            cxx: c++
+          - os: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            cc: cc
+            cxx: c++
+    runs-on: ${{ matrix.os }}
+    # Every leg is BLOCKING — no continue-on-error. The darwin-amd64 binary
+    # built on macos-15-intel must ship with every release; if that runner is
+    # unavailable the build fails loudly rather than silently publishing a
+    # release with no Intel macOS binary (a user-reported gap). macos-15-intel
+    # is GitHub's supported Intel image through Aug 2027 (the last x86_64 macOS
+    # runner); revisit the Intel leg before that retirement.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install deps (Ubuntu)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+
+      - name: Build standard binary
+        env:
+          VERSION: ${{ inputs.version }}
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            scripts/build.sh --version "$VERSION" "CC=$CC" "CXX=$CXX"
+          else
+            scripts/build.sh "CC=$CC" "CXX=$CXX"
+          fi
+
+      - name: Ad-hoc sign macOS binary
+        if: startsWith(matrix.os, 'macos')
+        run: codesign --sign - --force build/c/codebase-memory-mcp
+
+      - name: Archive standard binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          cp LICENSE install.sh build/c/
+          scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
+          tar -czf "codebase-memory-mcp-${GOOS}-${GOARCH}.tar.gz" \
+            -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
+
+      - name: Build UI binary
+        env:
+          VERSION: ${{ inputs.version }}
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            scripts/build.sh --with-ui --version "$VERSION" "CC=$CC" "CXX=$CXX"
+          else
+            scripts/build.sh --with-ui "CC=$CC" "CXX=$CXX"
+          fi
+
+      - name: Ad-hoc sign macOS UI binary
+        if: startsWith(matrix.os, 'macos')
+        run: codesign --sign - --force build/c/codebase-memory-mcp
+
+      - name: Frontend integrity scan
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: scripts/security-ui.sh
+
+      - name: Archive UI binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          cp LICENSE install.sh build/c/
+          scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
+          tar -czf "codebase-memory-mcp-ui-${GOOS}-${GOARCH}.tar.gz" \
+            -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: "*.tar.gz"
+
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-zlib
+            make
+            zip
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+
+      - name: Build standard binary
+        shell: msys2 {0}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            scripts/build.sh --version "$VERSION" CC=clang CXX=clang++
+          else
+            scripts/build.sh CC=clang CXX=clang++
+          fi
+
+      - name: Archive standard binary
+        shell: msys2 {0}
+        run: |
+          BIN=build/c/codebase-memory-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          cp "$BIN" codebase-memory-mcp.exe
+          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
+          zip codebase-memory-mcp-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+
+      - name: Build UI binary
+        shell: msys2 {0}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            scripts/build.sh --with-ui --version "$VERSION" CC=clang CXX=clang++
+          else
+            scripts/build.sh --with-ui CC=clang CXX=clang++
+          fi
+
+      - name: Archive UI binary
+        shell: msys2 {0}
+        run: |
+          BIN=build/c/codebase-memory-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          cp "$BIN" codebase-memory-mcp.exe
+          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
+          zip codebase-memory-mcp-ui-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-windows-amd64
+          path: "*.zip"
+
+  build-linux-portable:
+    # Fully static Linux binaries (gcc -static on Ubuntu).
+    # Runs on any Linux distro without shared library dependencies.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+
+      - name: Build standard binary (static)
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            scripts/build.sh --version "$VERSION" CC=gcc CXX=g++ STATIC=1
+          else
+            scripts/build.sh CC=gcc CXX=g++ STATIC=1
+          fi
+
+      - name: Verify static linking
+        run: |
+          file build/c/codebase-memory-mcp
+          ldd build/c/codebase-memory-mcp 2>&1 | grep -q "not a dynamic executable" || ldd build/c/codebase-memory-mcp 2>&1 | grep -q "statically linked"
+
+      - name: Archive standard binary
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          cp LICENSE install.sh build/c/
+          scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
+          tar -czf "codebase-memory-mcp-linux-${ARCH}-portable.tar.gz" \
+            -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
+
+      - name: Build UI binary (static)
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            scripts/build.sh --with-ui --version "$VERSION" CC=gcc CXX=g++ STATIC=1
+          else
+            scripts/build.sh --with-ui CC=gcc CXX=g++ STATIC=1
+          fi
+
+      - name: Archive UI binary
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          cp LICENSE install.sh build/c/
+          scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
+          tar -czf "codebase-memory-mcp-ui-linux-${ARCH}-portable.tar.gz" \
+            -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-linux-${{ matrix.arch }}-portable
+          path: "*.tar.gz"

@@ -6,6 +6,7 @@
  */
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/platform.h"
 #include "test_framework.h"
 #include "discover/discover.h"
 #include "discover/userconfig.h"
@@ -56,12 +57,13 @@ TEST(userconfig_project_basic) {
 /* ── Tests: global config ────────────────────────────────────────── */
 
 TEST(userconfig_global_via_env) {
-    /* Point XDG_CONFIG_HOME to a temp dir */
-    char xdg_dir[256];
-    snprintf(xdg_dir, sizeof(xdg_dir), "%s/uctest_global_xdg", cbm_tmpdir());
+    /* Point config dir to a temp dir via the platform-appropriate env var:
+     * XDG_CONFIG_HOME on Linux/macOS, APPDATA on Windows. */
+    char cfg_dir[256];
+    snprintf(cfg_dir, sizeof(cfg_dir), "%s/uctest_global_xdg", cbm_tmpdir());
 
     char app_dir[512];
-    snprintf(app_dir, sizeof(app_dir), "%s/codebase-memory-mcp", xdg_dir);
+    snprintf(app_dir, sizeof(app_dir), "%s/codebase-memory-mcp", cfg_dir);
     cbm_mkdir_p(app_dir, 0755);
 
     char global_path[768];
@@ -70,10 +72,23 @@ TEST(userconfig_global_via_env) {
         write_json(global_path, "{\"extra_extensions\":{\".twig\":\"html\"}}"),
         0);
 
-    /* Set env var, load, restore */
-    cbm_setenv("XDG_CONFIG_HOME", xdg_dir, 1);
+#ifdef _WIN32
+    char old_appdata[512] = "";
+    cbm_safe_getenv("APPDATA", old_appdata, sizeof(old_appdata), NULL);
+    cbm_setenv("APPDATA", cfg_dir, 1);
+#else
+    cbm_setenv("XDG_CONFIG_HOME", cfg_dir, 1);
+#endif
     cbm_userconfig_t *cfg = cbm_userconfig_load(NULL); /* no project dir */
+#ifdef _WIN32
+    if (old_appdata[0]) {
+        cbm_setenv("APPDATA", old_appdata, 1);
+    } else {
+        cbm_unsetenv("APPDATA");
+    }
+#else
     cbm_unsetenv("XDG_CONFIG_HOME");
+#endif
 
     ASSERT_NOT_NULL(cfg);
     ASSERT_EQ(cbm_userconfig_lookup(cfg, ".twig"), CBM_LANG_HTML);

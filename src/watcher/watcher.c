@@ -15,11 +15,14 @@
  * Adaptive interval: 5s base + 1s per 500 files, capped at 60s.
  * Matches the Go watcher's `pollInterval()` logic.
  */
+#include <stdint.h>
 #include "watcher/watcher.h"
 #include "store/store.h"
+#include "foundation/constants.h"
 #include "foundation/log.h"
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
+#include "foundation/compat_thread.h"
 #include "foundation/compat_fs.h"
 #include "foundation/str_util.h"
 
@@ -35,14 +38,13 @@
 typedef struct {
     char *project_name;
     char *root_path;
-    char last_head[64];       /* git HEAD hash */
-    char last_dirty_hash[17]; /* djb2 hex of git status --porcelain output */
-    bool is_git;        /* false → skip polling */
-    bool baseline_done; /* true after first poll */
-    int file_count;     /* approximate, for interval calc */
-    int interval_ms;    /* adaptive poll interval */
-    // NOLINTNEXTLINE(misc-include-cleaner) — int64_t provided by standard header
-    int64_t next_poll_ns; /* next poll time (monotonic ns) */
+    char last_head[CBM_SZ_64]; /* git HEAD hash */
+    char last_dirty_hash[17];  /* djb2 hex of git status --porcelain output */
+    bool is_git;               /* false → skip polling */
+    bool baseline_done;        /* true after first poll */
+    int file_count;            /* approximate, for interval calc */
+    int interval_ms;           /* adaptive poll interval */
+    int64_t next_poll_ns;      /* next poll time (monotonic ns) */
 } project_state_t;
 
 /* ── Watcher struct ─────────────────────────────────────────────── */
@@ -52,6 +54,7 @@ struct cbm_watcher {
     cbm_index_fn index_fn;
     void *user_data;
     CBMHashTable *projects; /* name → project_state_t* */
+    cbm_mutex_t projects_lock;
     atomic_int stopped;
     int poll_base_ms;  /* 0 = use POLL_BASE_MS default */
     int poll_max_ms;   /* 0 = use POLL_MAX_MS default */
@@ -75,7 +78,6 @@ struct cbm_watcher {
 
 static int64_t now_ns(void) {
     struct timespec ts;
-    // NOLINTNEXTLINE(misc-include-cleaner) — cbm_clock_gettime provided by standard header
     cbm_clock_gettime(CLOCK_MONOTONIC, &ts);
     return ((int64_t)ts.tv_sec * NS_PER_SEC) + ts.tv_nsec;
 }
@@ -85,7 +87,7 @@ static int64_t now_ns(void) {
 int cbm_watcher_poll_interval_ms(int file_count, int base_ms, int max_ms) {
     if (base_ms <= 0) base_ms = POLL_BASE_MS;
     if (max_ms  <= 0) max_ms  = POLL_MAX_MS;
-    int ms = base_ms + ((file_count / POLL_FILE_STEP) * 1000);
+    int ms = base_ms + ((file_count / POLL_FILE_STEP) * (int)CBM_MSEC_PER_SEC);
     if (ms > max_ms) {
         ms = max_ms;
     }
@@ -94,32 +96,49 @@ int cbm_watcher_poll_interval_ms(int file_count, int base_ms, int max_ms) {
 
 /* ── Git helpers ────────────────────────────────────────────────── */
 
+/* Portable command pieces: cbm_popen runs through cmd.exe on Windows, which does
+ * NOT strip single quotes (git would receive a literal-quoted path → "cannot find
+ * the path") and has no /dev/null. Use double quotes (stripped by both cmd.exe and
+ * POSIX sh) and the platform null device. */
+#if defined(_WIN32)
+#define WATCHER_NULDEV "NUL"
+#else
+#define WATCHER_NULDEV "/dev/null"
+#endif
+
 static bool is_git_repo(const char *root_path) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "git -C '%s' rev-parse --git-dir >/dev/null 2>&1", root_path);
-    // NOLINTNEXTLINE(bugprone-command-processor,cert-env33-c,concurrency-mt-unsafe)
-    return system(cmd) == 0;
+    char cmd[CBM_SZ_1K];
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse --git-dir 2>%s", root_path, WATCHER_NULDEV);
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return false;
+    }
+    /* Drain output so pclose gets a clean exit status. */
+    char drain[CBM_SZ_128];
+    while (fgets(drain, (int)sizeof(drain), fp)) { /* discard */
+    }
+    int rc = cbm_pclose(fp);
+    return rc == 0;
 }
 
 static int git_head(const char *root_path, char *out, size_t out_size) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "git -C '%s' rev-parse HEAD 2>/dev/null", root_path);
-    // NOLINTNEXTLINE(misc-include-cleaner,bugprone-command-processor,cert-env33-c)
+    char cmd[CBM_SZ_1K];
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse HEAD 2>%s", root_path, WATCHER_NULDEV);
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
 
     if (fgets(out, (int)out_size, fp)) {
         size_t len = strlen(out);
-        while (len > 0 && (out[len - 1] == '\n' || out[len - 1] == '\r')) {
+        while (len > 0 && (out[len - SKIP_ONE] == '\n' || out[len - SKIP_ONE] == '\r')) {
             out[--len] = '\0';
         }
         cbm_pclose(fp);
         return 0;
     }
     cbm_pclose(fp);
-    return -1;
+    return CBM_NOT_FOUND;
 }
 
 /* djb2 hash over a string — non-cryptographic, fast, good distribution */
@@ -133,14 +152,20 @@ static uint64_t djb2(const char *s) {
 
 /* Read full git status --porcelain output into a 16-char hex hash.
  * Returns the number of bytes read (>0 means dirty), -1 on popen failure.
- * out_hex17 must be at least 17 bytes. */
+ * out_hex17 must be at least 17 bytes.
+ *
+ * Also folds in submodule status (POSIX only): uncommitted changes inside a
+ * submodule are invisible to the parent repo's `git status`, so we append each
+ * submodule's porcelain output to the hashed buffer. This keeps the dirty-hash
+ * dedup (preventing reindex loops on permanently-dirty trees) while extending
+ * coverage to submodules — a superset of both the fork's hash-based dedup and
+ * upstream's submodule-aware git_is_dirty(). */
 static int git_dirty_hash(const char *root_path, char *out_hex17) {
-    char cmd[1024];
+    char cmd[CBM_SZ_1K];
     snprintf(cmd, sizeof(cmd),
-             "git --no-optional-locks -C '%s' status --porcelain "
-             "--untracked-files=normal 2>/dev/null",
-             root_path);
-    // NOLINTNEXTLINE(bugprone-command-processor,cert-env33-c)
+             "git --no-optional-locks -C \"%s\" status --porcelain "
+             "--untracked-files=normal 2>%s",
+             root_path, WATCHER_NULDEV);
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
         strcpy(out_hex17, "0000000000000000");
@@ -151,6 +176,28 @@ static int git_dirty_hash(const char *root_path, char *out_hex17) {
     size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
     buf[n] = '\0';
     cbm_pclose(fp);
+
+#if !defined(_WIN32)
+    /* Append submodule porcelain output to the hashed buffer so submodule
+     * changes register in the dirty hash. POSIX-only: `git submodule foreach`
+     * takes an inner shell command that cmd.exe cannot pass intact; the
+     * parent-repo status check above already covers the common case on Windows. */
+    if (n + 1 < sizeof(buf)) {
+        snprintf(cmd, sizeof(cmd),
+                 "git --no-optional-locks -C '%s' submodule foreach --quiet --recursive "
+                 "'git status --porcelain --untracked-files=normal 2>/dev/null' "
+                 "2>/dev/null",
+                 root_path);
+        fp = cbm_popen(cmd, "r");
+        if (fp) {
+            size_t remaining = sizeof(buf) - 1 - n;
+            size_t sm = fread(buf + n, 1, remaining, fp);
+            buf[n + sm] = '\0';
+            n += sm;
+            cbm_pclose(fp);
+        }
+    }
+#endif
     uint64_t h = djb2(n > 0 ? buf : "");
     // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
     snprintf(out_hex17, 17, "%016llx", (unsigned long long)h);
@@ -159,18 +206,24 @@ static int git_dirty_hash(const char *root_path, char *out_hex17) {
 
 /* Count tracked files via git ls-files */
 static int git_file_count(const char *root_path) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "git -C '%s' ls-files 2>/dev/null | wc -l", root_path);
-    // NOLINTNEXTLINE(bugprone-command-processor,cert-env33-c)
+    char cmd[CBM_SZ_1K];
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" ls-files 2>%s", root_path, WATCHER_NULDEV);
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
         return 0;
     }
 
+    /* Count newlines (one tracked file per line). `wc -l` is unavailable on
+     * Windows, so count in C, robust to paths longer than the read buffer. */
     int count = 0;
-    char line[64];
-    if (fgets(line, sizeof(line), fp)) {
-        count = (int)strtol(line, NULL, 10);
+    char buf[CBM_SZ_1K];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            if (buf[i] == '\n') {
+                count++;
+            }
+        }
     }
     cbm_pclose(fp);
     return count;
@@ -179,11 +232,10 @@ static int git_file_count(const char *root_path) {
 /* ── Project state lifecycle ────────────────────────────────────── */
 
 static project_state_t *state_new(const char *name, const char *root_path) {
-    project_state_t *s = calloc(1, sizeof(*s));
+    project_state_t *s = calloc(CBM_ALLOC_ONE, sizeof(*s));
     if (!s) {
         return NULL;
     }
-    // NOLINTNEXTLINE(misc-include-cleaner) — strdup provided by standard header
     s->project_name = strdup(name);
     s->root_path = strdup(root_path);
     s->interval_ms = POLL_BASE_MS;
@@ -200,7 +252,6 @@ static void state_free(project_state_t *s) {
 }
 
 /* Hash table foreach callback to free state entries */
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 static void free_state_entry(const char *key, void *val, void *ud) {
     (void)key;
     (void)ud;
@@ -210,14 +261,19 @@ static void free_state_entry(const char *key, void *val, void *ud) {
 /* ── Watcher lifecycle ──────────────────────────────────────────── */
 
 cbm_watcher_t *cbm_watcher_new(cbm_store_t *store, cbm_index_fn index_fn, void *user_data) {
-    cbm_watcher_t *w = calloc(1, sizeof(*w));
+    cbm_watcher_t *w = calloc(CBM_ALLOC_ONE, sizeof(*w));
     if (!w) {
         return NULL;
     }
     w->store = store;
     w->index_fn = index_fn;
     w->user_data = user_data;
-    w->projects = cbm_ht_create(32);
+    w->projects = cbm_ht_create(CBM_SZ_32);
+    if (!w->projects) {
+        free(w);
+        return NULL;
+    }
+    cbm_mutex_init(&w->projects_lock);
     atomic_init(&w->stopped, 0);
     return w;
 }
@@ -226,8 +282,11 @@ void cbm_watcher_free(cbm_watcher_t *w) {
     if (!w) {
         return;
     }
+    cbm_mutex_lock(&w->projects_lock);
     cbm_ht_foreach(w->projects, free_state_entry, NULL);
     cbm_ht_free(w->projects);
+    cbm_mutex_unlock(&w->projects_lock);
+    cbm_mutex_destroy(&w->projects_lock);
     free(w);
 }
 
@@ -245,12 +304,15 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
         return;
     }
 
+    cbm_mutex_lock(&w->projects_lock);
+
     /* If already watching this project at the same path, preserve existing state.
      * This prevents unnecessary baseline resets when resolve_store() calls us on
      * every project switch — which would discard the accumulated HEAD/dirty hashes
      * and trigger redundant git commands on the next poll cycle. */
     project_state_t *existing = cbm_ht_get(w->projects, project_name);
     if (existing && strcmp(existing->root_path, root_path) == 0) {
+        cbm_mutex_unlock(&w->projects_lock);
         return; /* idempotent — state preserved */
     }
 
@@ -261,7 +323,13 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
     }
 
     project_state_t *s = state_new(project_name, root_path);
+    if (!s) {
+        cbm_mutex_unlock(&w->projects_lock);
+        cbm_log_warn("watcher.watch.oom", "project", project_name, "path", root_path);
+        return;
+    }
     cbm_ht_set(w->projects, s->project_name, s);
+    cbm_mutex_unlock(&w->projects_lock);
     cbm_log_info("watcher.watch", "project", project_name, "path", root_path);
 }
 
@@ -269,10 +337,16 @@ void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name) {
     if (!w || !project_name) {
         return;
     }
+    bool removed = false;
+    cbm_mutex_lock(&w->projects_lock);
     project_state_t *s = cbm_ht_get(w->projects, project_name);
     if (s) {
         cbm_ht_delete(w->projects, project_name);
         state_free(s);
+        removed = true;
+    }
+    cbm_mutex_unlock(&w->projects_lock);
+    if (removed) {
         cbm_log_info("watcher.unwatch", "project", project_name);
     }
 }
@@ -281,18 +355,23 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name) {
     if (!w || !project_name) {
         return;
     }
+    cbm_mutex_lock(&w->projects_lock);
     project_state_t *s = cbm_ht_get(w->projects, project_name);
     if (s) {
         /* Reset backoff — poll immediately on next cycle */
         s->next_poll_ns = 0;
     }
+    cbm_mutex_unlock(&w->projects_lock);
 }
 
-int cbm_watcher_watch_count(const cbm_watcher_t *w) {
+int cbm_watcher_watch_count(cbm_watcher_t *w) {
     if (!w) {
         return 0;
     }
-    return (int)cbm_ht_count(w->projects);
+    cbm_mutex_lock(&w->projects_lock);
+    int count = (int)cbm_ht_count(w->projects);
+    cbm_mutex_unlock(&w->projects_lock);
+    return count;
 }
 
 /* ── Single poll cycle ──────────────────────────────────────────── */
@@ -330,7 +409,7 @@ static bool check_changes(project_state_t *s) {
     }
 
     /* Check HEAD movement */
-    char head[64] = {0};
+    char head[CBM_SZ_64] = {0};
     if (git_head(s->root_path, head, sizeof(head)) == 0) {
         if (s->last_head[0] != '\0' && strcmp(head, s->last_head) != 0) {
             /* HEAD moved — commit, checkout, pull */
@@ -363,7 +442,6 @@ typedef struct {
     int reindexed;
 } poll_ctx_t;
 
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 static void poll_project(const char *key, void *val, void *ud) {
     (void)key;
     poll_ctx_t *ctx = ud;
@@ -416,17 +494,53 @@ static void poll_project(const char *key, void *val, void *ud) {
     s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
 }
 
+/* Callback to snapshot project state pointers into an array. */
+typedef struct {
+    project_state_t **items;
+    int count;
+    int cap;
+} snapshot_ctx_t;
+
+static void snapshot_project(const char *key, void *val, void *ud) {
+    (void)key;
+    snapshot_ctx_t *sc = ud;
+    if (val && sc->count < sc->cap) {
+        sc->items[sc->count++] = val;
+    }
+}
+
 int cbm_watcher_poll_once(cbm_watcher_t *w) {
     if (!w) {
         return 0;
     }
+
+    /* Snapshot project pointers under lock, then poll without holding it.
+     * This keeps the critical section small — poll_project does git I/O
+     * and may invoke index_fn which runs the full pipeline. */
+    cbm_mutex_lock(&w->projects_lock);
+    int n = cbm_ht_count(w->projects);
+    if (n == 0) {
+        cbm_mutex_unlock(&w->projects_lock);
+        return 0;
+    }
+    project_state_t **snap = malloc(n * sizeof(project_state_t *));
+    if (!snap) {
+        cbm_mutex_unlock(&w->projects_lock);
+        return 0;
+    }
+    snapshot_ctx_t sc = {.items = snap, .count = 0, .cap = n};
+    cbm_ht_foreach(w->projects, snapshot_project, &sc);
+    cbm_mutex_unlock(&w->projects_lock);
 
     poll_ctx_t ctx = {
         .w = w,
         .now = now_ns(),
         .reindexed = 0,
     };
-    cbm_ht_foreach(w->projects, poll_project, &ctx);
+    for (int i = 0; i < sc.count; i++) {
+        poll_project(NULL, snap[i], &ctx);
+    }
+    free(snap);
     return ctx.reindexed;
 }
 
@@ -440,7 +554,7 @@ void cbm_watcher_stop(cbm_watcher_t *w) {
 
 int cbm_watcher_run(cbm_watcher_t *w, int base_ms, int max_ms) {
     if (!w) {
-        return -1;
+        return CBM_NOT_FOUND;
     }
     int base_interval_ms = (base_ms > 0) ? base_ms : POLL_BASE_MS;
     w->poll_base_ms = base_interval_ms;
@@ -458,7 +572,7 @@ int cbm_watcher_run(cbm_watcher_t *w, int base_ms, int max_ms) {
             if (chunk > SLEEP_CHUNK_MS) {
                 chunk = SLEEP_CHUNK_MS;
             }
-            cbm_usleep((unsigned)chunk * 1000);
+            cbm_usleep((unsigned)chunk * CBM_MSEC_PER_SEC);
             slept += chunk;
         }
     }

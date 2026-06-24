@@ -1,0 +1,35 @@
+# Config for dessant/label-actions (.github/workflows/label-actions.yml).
+# Each top-level key is a label; when that label is added to an issue, the
+# listed actions run. See https://github.com/dessant/label-actions
+
+# When a maintainer marks an issue as a duplicate.
+duplicate:
+  comment: >
+    Thanks for raising this! It looks like a duplicate of an existing issue —
+    the canonical one is linked above. Continuing the discussion there keeps
+    everything in one place. We leave this open for visibility; a maintainer
+    will close it once it's fully covered.
+  # We intentionally do NOT auto-close duplicates (we prefer linking).
+  # To auto-close instead, uncomment the two lines below:
+  # close: true
+  # close-reason: not planned
+
+# When a maintainer marks an issue as waiting on the reporter.
+# (The stale workflow then warns at 21 days and closes at 35.)
+awaiting-reporter:
+  comment: >
+    Thanks for the report! To move this forward we need a bit more so we can
+    reproduce it ourselves:
+
+
+    - the `codebase-memory-mcp --version` you're on
+
+    - the exact steps or command you ran
+
+    - a **public** repo (or a small dummy snippet) that shows the problem —
+    please don't paste proprietary code
+
+
+    Once that's here we'll pick it straight back up. Heads-up: issues left
+    `awaiting-reporter` are automatically closed after a few weeks of silence,
+    but a comment reopens the door anytime.

@@ -66,6 +66,27 @@ static inline const char *tf_reset(void) {
         return -1;                                               \
     } while (0)
 
+/* Hard failure with a message — for setup/environment failures that must NOT be
+ * silently skipped (a test that cannot establish its preconditions has FAILED,
+ * not "skipped"). Mirrors the ASSERT failure path (red FAIL + file:line). */
+#define FAIL(reason)                                                                         \
+    do {                                                                                     \
+        printf("  %sFAIL%s %s:%d: %s\n", tf_red(), tf_reset(), __FILE__, __LINE__, (reason)); \
+        return 1;                                                                            \
+    } while (0)
+
+/* The ONLY tolerable skip: a test that is inherently platform-specific and does
+ * not apply on the current OS (e.g. a Windows-only test running on macOS).
+ * Distinct from SKIP() so the no-skips linter (scripts/check-no-test-skips.sh)
+ * can allow these and reject every other skip. Use sparingly + with a reason
+ * that names the platform. Prefer compile-gating (#ifdef) where practical. */
+#define SKIP_PLATFORM(reason)                                              \
+    do {                                                                   \
+        printf("%sSKIP%s (platform: %s)\n", tf_dim(), tf_reset(), reason); \
+        tf_skip_count++;                                                   \
+        return -1;                                                         \
+    } while (0)
+
 /* ── Assertions ────────────────────────────────────────────────── */
 
 #define ASSERT(cond)                                                                           \

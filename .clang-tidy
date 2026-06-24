@@ -2,6 +2,25 @@
 #
 # ALL checks enabled. WarningsAsErrors: '*'.
 # Check thresholds configured for idiomatic C11 (not C++).
+#
+# Disabled checks (with reasoning):
+#
+# C++ idiom checks (not applicable to C11):
+#   - bugprone-multi-level-implicit-pointer-conversion: void* is implicit in C
+#   - readability-implicit-bool-conversion: if(ptr), if(count) is idiomatic C
+#
+# LLVM analyzer false positives (no fix available):
+#   - DeprecatedOrUnsafeBufferHandling: flags fprintf/snprintf, Annex K not
+#     available on Linux/macOS (LLVM #64027)
+#   - ArrayBound: taint analysis false positives on buf[fread_result] (LLVM #126884)
+#
+# Cosmetic checks whitelisted (no memory safety or performance impact):
+#   - bugprone-easily-swappable-parameters: internal APIs with descriptive
+#     param names; struct wrappers would add churn without safety benefit
+#   - concurrency-mt-unsafe: only readdir() remains, which is safe with
+#     per-directory-handle usage (each thread owns its DIR*)
+#   - bugprone-command-processor: popen() required for git integration;
+#     all inputs are validated internal strings, no injection risk
 
 Checks: >
   -*,
@@ -15,45 +34,28 @@ Checks: >
   portability-*,
   readability-*,
   clang-analyzer-*,
-  -misc-no-recursion,
   -bugprone-multi-level-implicit-pointer-conversion,
-  -bugprone-branch-clone,
-  -bugprone-command-processor,
-  -readability-avoid-nested-conditional-operator,
-  -readability-redundant-casting,
-  -bugprone-implicit-widening-of-multiplication-result,
-  -bugprone-unchecked-string-to-number-conversion,
+  -readability-implicit-bool-conversion,
   -bugprone-easily-swappable-parameters,
-  -clang-analyzer-core.CallAndMessage,
-  -clang-analyzer-security.ArrayBound,
-  -clang-analyzer-unix.Malloc,
-  -clang-analyzer-optin.portability.UnixAPI,
-  -clang-analyzer-core.NullPointerArithm,
-  -performance-no-int-to-ptr,
   -concurrency-mt-unsafe,
-  -cert-err33-c,
+  -bugprone-command-processor,
+  -cert-env33-c,
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
-  -clang-analyzer-security.insecureAPI.strcpy,
-  -misc-include-cleaner,
+  -clang-analyzer-security.ArrayBound,
 
 WarningsAsErrors: '*'
 
 CheckOptions:
-  bugprone-implicit-widening-of-multiplication-result.UseCXXStaticCastsInCppSources: false
-  # C idiom: i, j, k, n, p, s are standard variable names
   readability-identifier-length.MinimumVariableNameLength: 1
   readability-identifier-length.MinimumParameterNameLength: 1
   readability-identifier-length.MinimumLoopCounterNameLength: 1
-  # C idiom: if (!ptr), if (count) are standard
-  readability-implicit-bool-conversion.AllowIntegerConditions: true
-  readability-implicit-bool-conversion.AllowPointerConditions: true
-  # Systems C uses bit shifts, buffer sizes, hash constants, protocol sizes
-  readability-magic-numbers.IgnoredIntegerValues: "1;2;3;4;5;6;7;8;9;10;11;12;14;15;16;20;24;32;48;64;100;128;200;256;493;512;755;1000;1024;1040;2048;4096;8192;16384;32768;65536;500000;1000000;1000000000"
-  readability-magic-numbers.IgnoredFloatingPointValues: "0.0;0.25;0.5;0.7;0.75;0.8;0.85;0.9;0.95;1.0;2.0;100.0;1e308"
-  # Cypher parser + tree-sitter resolver have deeply nested execution logic
-  readability-function-cognitive-complexity.Threshold: 250
-  readability-function-size.StatementThreshold: 400
-  readability-function-size.LineThreshold: 800
+  readability-magic-numbers.IgnoredIntegerValues: ""
+  readability-magic-numbers.IgnoredFloatingPointValues: ""
+  bugprone-easily-swappable-parameters.MinimumLength: 3
+  misc-include-cleaner.IgnoreHeaders: "sys/.*|mach/.*|dispatch/.*|_types/.*|Availability\\.h|secure/.*|_.*\\.h|zconf\\.h"
+  readability-function-cognitive-complexity.Threshold: 25
+  readability-function-size.StatementThreshold: 200
+  readability-function-size.LineThreshold: 400
 
 HeaderFilterRegex: '^(src|tests)/.*\.h$'
 

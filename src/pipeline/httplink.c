@@ -165,18 +165,8 @@ double cbm_ngram_overlap(const char *a, const char *b, int n) {
     return (double)intersection / (double)min_size;
 }
 
-const char *cbm_confidence_band(double score) {
-    if (score >= CONF_BAND_HIGH) {
-        return "high";
-    }
-    if (score >= CONF_BAND_MEDIUM) {
-        return "medium";
-    }
-    if (score >= CONF_BAND_SPECULATIVE) {
-        return "speculative";
-    }
-    return "";
-}
+/* cbm_confidence_band() is defined in registry.c (declared in pipeline.h) —
+ * upstream relocated it there; removed here to avoid a duplicate link symbol. */
 
 /* ── Path matching ─────────────────────────────────────────────── */
 

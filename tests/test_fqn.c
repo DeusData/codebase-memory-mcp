@@ -6,18 +6,19 @@
  */
 #include "test_framework.h"
 #include "../src/pipeline/pipeline.h"
+#include "../src/foundation/str_util.h"
 
 #include <stdlib.h>
 #include <string.h>
 
 /* ── Helper: assert FQN result and free ────────────────────────── */
 
-#define ASSERT_FQN(expr, expected)    \
-    do {                              \
-        char *_r = (expr);            \
-        ASSERT_NOT_NULL(_r);          \
-        ASSERT_STR_EQ(_r, expected);  \
-        free(_r);                     \
+#define ASSERT_FQN(expr, expected)   \
+    do {                             \
+        char *_r = (expr);           \
+        ASSERT_NOT_NULL(_r);         \
+        ASSERT_STR_EQ(_r, expected); \
+        free(_r);                    \
     } while (0)
 
 /* ================================================================
@@ -65,14 +66,12 @@ TEST(fqn_compute_nested_two_levels) {
 }
 
 TEST(fqn_compute_nested_three_levels) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a/b/c/file.py", "Class"),
-               "proj.a.b.c.file.Class");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a/b/c/file.py", "Class"), "proj.a.b.c.file.Class");
     PASS();
 }
 
 TEST(fqn_compute_nested_deep) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a/b/c/d/e/f/g.ts", "fn"),
-               "proj.a.b.c.d.e.f.g.fn");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a/b/c/d/e/f/g.ts", "fn"), "proj.a.b.c.d.e.f.g.fn");
     PASS();
 }
 
@@ -80,86 +79,73 @@ TEST(fqn_compute_nested_deep) {
 
 TEST(fqn_compute_init_py_with_name) {
     /* __init__ stripped when name is provided */
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/__init__.py", "MyClass"),
-               "proj.pkg.MyClass");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/__init__.py", "MyClass"), "proj.pkg.MyClass");
     PASS();
 }
 
 TEST(fqn_compute_init_py_without_name) {
     /* __init__ kept when no name (module QN for the file itself) */
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/__init__.py", NULL),
-               "proj.pkg.__init__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/__init__.py", NULL), "proj.pkg.__init__");
     PASS();
 }
 
 TEST(fqn_compute_init_py_empty_name) {
     /* Empty string name also keeps __init__ */
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/__init__.py", ""),
-               "proj.pkg.__init__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/__init__.py", ""), "proj.pkg.__init__");
     PASS();
 }
 
 TEST(fqn_compute_init_py_nested) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a/b/__init__.py", "Foo"),
-               "proj.a.b.Foo");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a/b/__init__.py", "Foo"), "proj.a.b.Foo");
     PASS();
 }
 
 TEST(fqn_compute_init_py_root) {
     /* __init__.py at root with name */
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "__init__.py", "X"),
-               "proj.X");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "__init__.py", "X"), "proj.X");
     PASS();
 }
 
 TEST(fqn_compute_init_py_root_no_name) {
     /* __init__.py at root without name -- only project + __init__ (seg_count=2 > 1) */
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "__init__.py", NULL),
-               "proj.__init__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "__init__.py", NULL), "proj.__init__");
     PASS();
 }
 
 /* ── JS/TS index files ────────────────────────────────────────── */
 
 TEST(fqn_compute_index_js_with_name) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/index.js", "render"),
-               "proj.pkg.render");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/index.js", "render"), "proj.pkg.render");
     PASS();
 }
 
 TEST(fqn_compute_index_js_without_name) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/index.js", NULL),
-               "proj.pkg.index");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/index.js", NULL), "proj.pkg.index");
     PASS();
 }
 
 TEST(fqn_compute_index_ts_with_name) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src/index.ts", "App"),
-               "proj.src.App");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src/index.ts", "App"), "proj.src.App");
     PASS();
 }
 
 TEST(fqn_compute_index_ts_without_name) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src/index.ts", NULL),
-               "proj.src.index");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src/index.ts", NULL), "proj.src.index");
     PASS();
 }
 
 TEST(fqn_compute_index_ts_empty_name) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "lib/index.ts", ""),
-               "proj.lib.index");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "lib/index.ts", ""), "proj.lib.index");
     PASS();
 }
 
 TEST(fqn_compute_index_root_with_name) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "index.js", "main"),
-               "proj.main");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "index.js", "main"), "proj.main");
     PASS();
 }
 
 TEST(fqn_compute_index_root_no_name) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "index.js", NULL),
-               "proj.index");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "index.js", NULL), "proj.index");
     PASS();
 }
 
@@ -208,20 +194,17 @@ TEST(fqn_compute_null_project_null_path) {
 /* ── Backslash paths (Windows) ────────────────────────────────── */
 
 TEST(fqn_compute_backslash_simple) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src\\main.go", "run"),
-               "proj.src.main.run");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src\\main.go", "run"), "proj.src.main.run");
     PASS();
 }
 
 TEST(fqn_compute_backslash_nested) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a\\b\\c\\file.py", "X"),
-               "proj.a.b.c.file.X");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a\\b\\c\\file.py", "X"), "proj.a.b.c.file.X");
     PASS();
 }
 
 TEST(fqn_compute_backslash_mixed) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a/b\\c/d.ts", "fn"),
-               "proj.a.b.c.d.fn");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a/b\\c/d.ts", "fn"), "proj.a.b.c.d.fn");
     PASS();
 }
 
@@ -229,14 +212,12 @@ TEST(fqn_compute_backslash_mixed) {
 
 TEST(fqn_compute_double_ext) {
     /* Only last extension stripped: foo.test.ts -> foo.test */
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "foo.test.ts", "bar"),
-               "proj.foo.test.bar");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "foo.test.ts", "bar"), "proj.foo.test.bar");
     PASS();
 }
 
 TEST(fqn_compute_spec_ext) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "util.spec.js", "it"),
-               "proj.util.spec.it");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "util.spec.js", "it"), "proj.util.spec.it");
     PASS();
 }
 
@@ -244,29 +225,25 @@ TEST(fqn_compute_spec_ext) {
 
 TEST(fqn_compute_leading_slash) {
     /* Leading slash produces empty segment which is skipped */
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "/src/main.go", "fn"),
-               "proj.src.main.fn");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "/src/main.go", "fn"), "proj.src.main.fn");
     PASS();
 }
 
 TEST(fqn_compute_trailing_slash) {
     /* Trailing slash: path becomes empty after last /, extension strip is no-op */
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src/", "fn"),
-               "proj.src.fn");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src/", "fn"), "proj.src.fn");
     PASS();
 }
 
 TEST(fqn_compute_double_slash) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a//b.go", "fn"),
-               "proj.a.b.fn");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a//b.go", "fn"), "proj.a.b.fn");
     PASS();
 }
 
 /* ── No extension ─────────────────────────────────────────────── */
 
 TEST(fqn_compute_no_ext) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "Makefile", "target"),
-               "proj.Makefile.target");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "Makefile", "target"), "proj.Makefile.target");
     PASS();
 }
 
@@ -288,8 +265,7 @@ TEST(fqn_compute_init_not_stripped) {
 
 TEST(fqn_compute_index2_not_stripped) {
     /* "indexer" is NOT "index", should not be stripped */
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/indexer.ts", "F"),
-               "proj.pkg.indexer.F");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/indexer.ts", "F"), "proj.pkg.indexer.F");
     PASS();
 }
 
@@ -397,35 +373,30 @@ TEST(fqn_folder_double_slash) {
  * ================================================================ */
 
 TEST(project_name_unix_path) {
-    ASSERT_FQN(cbm_project_name_from_path("/Users/dev/my-project"),
-               "Users-dev-my-project");
+    ASSERT_FQN(cbm_project_name_from_path("/Users/dev/my-project"), "Users-dev-my-project");
     PASS();
 }
 
 TEST(project_name_windows_path) {
-    ASSERT_FQN(cbm_project_name_from_path("C:\\Users\\dev\\project"),
-               "C-Users-dev-project");
+    ASSERT_FQN(cbm_project_name_from_path("C:\\Users\\dev\\project"), "C-Users-dev-project");
     PASS();
 }
 
 TEST(project_name_with_colons) {
     /* Colons replaced with dashes (e.g., C: drive) */
-    ASSERT_FQN(cbm_project_name_from_path("C:/dev/proj"),
-               "C-dev-proj");
+    ASSERT_FQN(cbm_project_name_from_path("C:/dev/proj"), "C-dev-proj");
     PASS();
 }
 
 TEST(project_name_multiple_slashes) {
     /* Consecutive slashes become one dash */
-    ASSERT_FQN(cbm_project_name_from_path("/home///user//code"),
-               "home-user-code");
+    ASSERT_FQN(cbm_project_name_from_path("/home///user//code"), "home-user-code");
     PASS();
 }
 
 TEST(project_name_leading_trailing_slashes) {
     /* Leading/trailing dashes trimmed */
-    ASSERT_FQN(cbm_project_name_from_path("/foo/bar/"),
-               "foo-bar");
+    ASSERT_FQN(cbm_project_name_from_path("/foo/bar/"), "foo-bar");
     PASS();
 }
 
@@ -452,21 +423,18 @@ TEST(project_name_single_segment) {
 
 TEST(project_name_mixed_separators) {
     /* Mix of forward slash, backslash, colon */
-    ASSERT_FQN(cbm_project_name_from_path("C:\\Users/dev:proj"),
-               "C-Users-dev-proj");
+    ASSERT_FQN(cbm_project_name_from_path("C:\\Users/dev:proj"), "C-Users-dev-proj");
     PASS();
 }
 
 TEST(project_name_already_dashed) {
     /* Dashes are preserved, not collapsed unless from separator conversion */
-    ASSERT_FQN(cbm_project_name_from_path("/my-great-project"),
-               "my-great-project");
+    ASSERT_FQN(cbm_project_name_from_path("/my-great-project"), "my-great-project");
     PASS();
 }
 
 TEST(project_name_deep_path) {
-    ASSERT_FQN(cbm_project_name_from_path("/a/b/c/d/e/f/g"),
-               "a-b-c-d-e-f-g");
+    ASSERT_FQN(cbm_project_name_from_path("/a/b/c/d/e/f/g"), "a-b-c-d-e-f-g");
     PASS();
 }
 
@@ -483,6 +451,30 @@ TEST(project_name_backslash_only) {
 
 TEST(project_name_consecutive_colons) {
     ASSERT_FQN(cbm_project_name_from_path("a::b"), "a-b");
+    PASS();
+}
+
+/* issue #349: every derived project name must satisfy cbm_validate_project_name,
+ * else the project is indexed + shown by list_projects but resolve_store rejects
+ * the name → index_status/search_graph report project-not-found. */
+TEST(project_name_always_validator_safe_issue349) {
+    static const char *const paths[] = {
+        "/home/u/my project", /* space */
+        "/srv/app@v2",        /* @ */
+        "/data/cxx/proj+1",   /* + */
+        "/x/.hidden/repo",    /* leading-dot segment */
+        "/x/a..b/repo",       /* .. sequence */
+        "/Users/dev/caf\xc3\xa9"
+        "app",                       /* non-ASCII (UTF-8) bytes */
+        "C:\\Work\\Big Repo (2024)", /* space + parens + backslash */
+        NULL,
+    };
+    for (int i = 0; paths[i]; i++) {
+        char *name = cbm_project_name_from_path(paths[i]);
+        ASSERT_NOT_NULL(name);
+        ASSERT_TRUE(cbm_validate_project_name(name));
+        free(name);
+    }
     PASS();
 }
 
@@ -586,6 +578,7 @@ SUITE(fqn) {
     RUN_TEST(project_name_mixed_separators);
     RUN_TEST(project_name_already_dashed);
     RUN_TEST(project_name_deep_path);
+    RUN_TEST(project_name_always_validator_safe_issue349);
     RUN_TEST(project_name_colon_only);
     RUN_TEST(project_name_backslash_only);
     RUN_TEST(project_name_consecutive_colons);

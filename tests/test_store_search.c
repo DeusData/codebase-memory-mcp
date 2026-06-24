@@ -5,6 +5,7 @@
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <store/store.h>
 #include <string.h>
 #include <stdlib.h>
@@ -85,6 +86,62 @@ TEST(store_search_by_name_pattern) {
     PASS();
 }
 
+/* ── Empty-string label is ignored (issue #481) ────────────────── */
+
+/* An empty-string label must behave like an omitted label (no filter), not be
+ * applied as a literal `n.label = ''` that matches nothing. Previously a
+ * name_pattern/qn_pattern search passing label="" returned zero results, while
+ * the BM25 query path ignored the empty label — an inconsistency that made
+ * structural class/service discovery silently fail. */
+TEST(store_search_empty_label_ignored) {
+    int64_t ids[3];
+    cbm_store_t *s = setup_search_store(ids);
+
+    /* name_pattern + label="" must match the same as name_pattern alone. */
+    cbm_search_params_t empty_label = {.project = "test",
+                                       .name_pattern = ".*Submit.*",
+                                       .label = "",
+                                       .min_degree = -1,
+                                       .max_degree = -1};
+    cbm_search_output_t out = {0};
+    int rc = cbm_store_search(s, &empty_label, &out);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(out.count, 1);
+    ASSERT_STR_EQ(out.results[0].node.name, "SubmitOrder");
+    cbm_store_search_free(&out);
+
+    /* A non-empty label still filters: ".*Order.*" matches three names but only
+     * OrderService is a Class. */
+    cbm_search_params_t cls = {.project = "test",
+                               .name_pattern = ".*Order.*",
+                               .label = "Class",
+                               .min_degree = -1,
+                               .max_degree = -1};
+    cbm_search_output_t out2 = {0};
+    rc = cbm_store_search(s, &cls, &out2);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(out2.count, 1);
+    ASSERT_STR_EQ(out2.results[0].node.name, "OrderService");
+    cbm_store_search_free(&out2);
+
+    /* qn_pattern shares the same WHERE builder, so empty label must be ignored
+     * there too. */
+    cbm_search_params_t qn = {.project = "test",
+                              .qn_pattern = ".*SubmitOrder",
+                              .label = "",
+                              .min_degree = -1,
+                              .max_degree = -1};
+    cbm_search_output_t out3 = {0};
+    rc = cbm_store_search(s, &qn, &out3);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(out3.count, 1);
+    ASSERT_STR_EQ(out3.results[0].node.name, "SubmitOrder");
+    cbm_store_search_free(&out3);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Search by file pattern ─────────────────────────────────────── */
 
 TEST(store_search_by_file_pattern) {
@@ -97,6 +154,32 @@ TEST(store_search_by_file_pattern) {
     int rc = cbm_store_search(s, &params, &out);
     ASSERT_EQ(rc, CBM_STORE_OK);
     ASSERT_EQ(out.count, 2);
+    cbm_store_search_free(&out);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Issue #200: a wildcard-free file_pattern must match as a path substring,
+ * not require the path to equal it. "offer-server" should match
+ * "src/offer-server/decision.js". */
+TEST(store_search_file_pattern_substring_issue200) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t n = {.project = "test",
+                    .label = "Function",
+                    .name = "evaluate",
+                    .qualified_name = "test.offer.evaluate",
+                    .file_path = "src/offer-server/decision.js"};
+    cbm_store_upsert_node(s, &n);
+
+    cbm_search_params_t params = {
+        .project = "test", .file_pattern = "offer-server", .min_degree = -1, .max_degree = -1};
+    cbm_search_output_t out = {0};
+    int rc = cbm_store_search(s, &params, &out);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(out.count, 1);
+    ASSERT_STR_EQ(out.results[0].node.name, "evaluate");
     cbm_store_search_free(&out);
 
     cbm_store_close(s);
@@ -141,6 +224,15 @@ TEST(store_search_pagination) {
 
 /* ── Search with degree filter ──────────────────────────────────── */
 
+static int search_result_index_by_name(const cbm_search_output_t *out, const char *name) {
+    for (int i = 0; i < out->count; i++) {
+        if (out->results[i].node.name && strcmp(out->results[i].node.name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 TEST(store_search_degree_filter) {
     int64_t ids[3];
     cbm_store_t *s = setup_search_store(ids);
@@ -156,7 +248,7 @@ TEST(store_search_degree_filter) {
     ASSERT_EQ(out.count, 2);
     cbm_store_search_free(&out);
 
-    /* max_degree = 0 should find nodes with no CALLS edges */
+    /* max_degree = 0 should find nodes with no counted degree edges */
     params.min_degree = -1; /* no min */
     params.max_degree = 0;  /* only zero-degree nodes */
     params.label = "Function";
@@ -164,6 +256,168 @@ TEST(store_search_degree_filter) {
     ASSERT_EQ(rc, CBM_STORE_OK);
     /* Neither function has degree 0, so 0 results */
     ASSERT_EQ(out.count, 0);
+    cbm_store_search_free(&out);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_search_degree_counts_inherits) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t parent = {.project = "test",
+                         .label = "Class",
+                         .name = "AbstractAttachmentDto",
+                         .qualified_name = "test.AbstractAttachmentDto"};
+    int64_t parent_id = cbm_store_upsert_node(s, &parent);
+    ASSERT_GT(parent_id, 0);
+
+    const char *child_names[] = {"AttachmentDtoA", "AttachmentDtoB", "AttachmentDtoC"};
+    const char *child_qns[] = {"test.AttachmentDtoA", "test.AttachmentDtoB", "test.AttachmentDtoC"};
+    for (int i = 0; i < 3; i++) {
+        cbm_node_t child = {.project = "test",
+                            .label = "Class",
+                            .name = child_names[i],
+                            .qualified_name = child_qns[i]};
+        int64_t child_id = cbm_store_upsert_node(s, &child);
+        ASSERT_GT(child_id, 0);
+        cbm_edge_t edge = {
+            .project = "test", .source_id = child_id, .target_id = parent_id, .type = "INHERITS"};
+        ASSERT_GT(cbm_store_insert_edge(s, &edge), 0);
+    }
+
+    int in_deg = 0;
+    int out_deg = 0;
+    cbm_store_node_degree(s, parent_id, &in_deg, &out_deg);
+    ASSERT_EQ(in_deg, 0);
+    ASSERT_EQ(out_deg, 0);
+
+    cbm_search_params_t params = {
+        .project = "test", .label = "Class", .min_degree = -1, .max_degree = -1};
+    cbm_search_output_t out = {0};
+    int rc = cbm_store_search(s, &params, &out);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    int parent_idx = search_result_index_by_name(&out, "AbstractAttachmentDto");
+    ASSERT_GTE(parent_idx, 0);
+    ASSERT_EQ(out.results[parent_idx].in_degree, 3);
+    ASSERT_EQ(out.results[parent_idx].out_degree, 0);
+    cbm_store_search_free(&out);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_search_degree_calls_plus_inherits_no_double_count) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t child = {.project = "test",
+                        .label = "Class",
+                        .name = "AttachmentDto",
+                        .qualified_name = "test.AttachmentDto"};
+    cbm_node_t parent = {.project = "test",
+                         .label = "Class",
+                         .name = "BaseAttachmentDto",
+                         .qualified_name = "test.BaseAttachmentDto"};
+    cbm_node_t fn = {.project = "test",
+                     .label = "Function",
+                     .name = "normalizeAttachment",
+                     .qualified_name = "test.normalizeAttachment"};
+    int64_t child_id = cbm_store_upsert_node(s, &child);
+    int64_t parent_id = cbm_store_upsert_node(s, &parent);
+    int64_t fn_id = cbm_store_upsert_node(s, &fn);
+    ASSERT_GT(child_id, 0);
+    ASSERT_GT(parent_id, 0);
+    ASSERT_GT(fn_id, 0);
+
+    cbm_edge_t calls = {
+        .project = "test", .source_id = child_id, .target_id = fn_id, .type = "CALLS"};
+    cbm_edge_t inherits = {
+        .project = "test", .source_id = child_id, .target_id = parent_id, .type = "INHERITS"};
+    ASSERT_GT(cbm_store_insert_edge(s, &calls), 0);
+    ASSERT_GT(cbm_store_insert_edge(s, &inherits), 0);
+
+    int in_deg = 0;
+    int out_deg = 0;
+    cbm_store_node_degree(s, child_id, &in_deg, &out_deg);
+    ASSERT_EQ(in_deg, 0);
+    ASSERT_EQ(out_deg, 1);
+
+    cbm_search_params_t params = {
+        .project = "test", .label = "Class", .min_degree = -1, .max_degree = -1};
+    cbm_search_output_t out = {0};
+    int rc = cbm_store_search(s, &params, &out);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    int child_idx = search_result_index_by_name(&out, "AttachmentDto");
+    ASSERT_GTE(child_idx, 0);
+    ASSERT_EQ(out.results[child_idx].in_degree, 0);
+    ASSERT_EQ(out.results[child_idx].out_degree, 2);
+    cbm_store_search_free(&out);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_search_min_degree_includes_inherits_only) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t child = {.project = "test",
+                        .label = "Class",
+                        .name = "InheritanceOnlyChild",
+                        .qualified_name = "test.InheritanceOnlyChild"};
+    cbm_node_t parent = {.project = "test",
+                         .label = "Class",
+                         .name = "InheritanceOnlyParent",
+                         .qualified_name = "test.InheritanceOnlyParent"};
+    int64_t child_id = cbm_store_upsert_node(s, &child);
+    int64_t parent_id = cbm_store_upsert_node(s, &parent);
+    ASSERT_GT(child_id, 0);
+    ASSERT_GT(parent_id, 0);
+
+    cbm_edge_t edge = {
+        .project = "test", .source_id = child_id, .target_id = parent_id, .type = "INHERITS"};
+    ASSERT_GT(cbm_store_insert_edge(s, &edge), 0);
+
+    cbm_search_params_t params = {
+        .project = "test", .label = "Class", .min_degree = 1, .max_degree = -1};
+    cbm_search_output_t out = {0};
+    int rc = cbm_store_search(s, &params, &out);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_GTE(search_result_index_by_name(&out, "InheritanceOnlyParent"), 0);
+    cbm_store_search_free(&out);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_search_isolated_node_zero_degree) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t node = {.project = "test",
+                       .label = "Class",
+                       .name = "LonelyClass",
+                       .qualified_name = "test.LonelyClass"};
+    int64_t node_id = cbm_store_upsert_node(s, &node);
+    ASSERT_GT(node_id, 0);
+
+    int in_deg = 0;
+    int out_deg = 0;
+    cbm_store_node_degree(s, node_id, &in_deg, &out_deg);
+    ASSERT_EQ(in_deg, 0);
+    ASSERT_EQ(out_deg, 0);
+
+    cbm_search_params_t params = {
+        .project = "test", .label = "Class", .min_degree = -1, .max_degree = -1};
+    cbm_search_output_t out = {0};
+    int rc = cbm_store_search(s, &params, &out);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    int idx = search_result_index_by_name(&out, "LonelyClass");
+    ASSERT_GTE(idx, 0);
+    ASSERT_EQ(out.results[idx].in_degree, 0);
+    ASSERT_EQ(out.results[idx].out_degree, 0);
     cbm_store_search_free(&out);
 
     cbm_store_close(s);
@@ -420,9 +674,6 @@ TEST(store_search_exclude_labels) {
 /* ── Dump to file ──────────────────────────────────────────────── */
 
 TEST(store_dump_to_file) {
-#ifdef _WIN32
-    SKIP("temp file path handling — Windows port pending");
-#endif
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
 
@@ -438,10 +689,9 @@ TEST(store_dump_to_file) {
     ASSERT_TRUE(id > 0);
 
     /* Dump to temp file */
-    char path[256]; snprintf(path, sizeof(path), "/tmp/cbm_test_dump_XXXXXX");
-    int fd = cbm_mkstemp(path);
-    ASSERT_TRUE(fd >= 0);
-    close(fd);
+    char *td = th_mktempdir("cbm_dump");
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test.db", td);
 
     int rc = cbm_store_dump_to_file(s, path);
     ASSERT_EQ(rc, CBM_STORE_OK);
@@ -1318,9 +1568,15 @@ TEST(store_impact_summary_empty) {
 SUITE(store_search) {
     RUN_TEST(store_search_by_label);
     RUN_TEST(store_search_by_name_pattern);
+    RUN_TEST(store_search_empty_label_ignored);
     RUN_TEST(store_search_by_file_pattern);
+    RUN_TEST(store_search_file_pattern_substring_issue200);
     RUN_TEST(store_search_pagination);
     RUN_TEST(store_search_degree_filter);
+    RUN_TEST(store_search_degree_counts_inherits);
+    RUN_TEST(store_search_degree_calls_plus_inherits_no_double_count);
+    RUN_TEST(store_search_min_degree_includes_inherits_only);
+    RUN_TEST(store_search_isolated_node_zero_degree);
     RUN_TEST(store_search_all);
     RUN_TEST(store_search_exclude_labels);
     RUN_TEST(store_search_case_insensitive);

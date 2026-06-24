@@ -92,7 +92,10 @@ CXXFLAGS_COMMON = -std=c++14 -Wall -Wextra -Werror \
                   -I$(CBM_DIR) -I$(TS_INCLUDE)
 
 # Production flags (CFLAGS_EXTRA allows CI to inject -DCBM_VERSION)
-CFLAGS_PROD = $(CFLAGS_COMMON) -O2 $(CFLAGS_EXTRA)
+# CBM_BIND_TS_ALLOCATOR=1: bind the tree-sitter runtime to mimalloc (#424). Only
+# the prod build uses mimalloc (MI_OVERRIDE=1); the test build is CRT+ASan, where
+# binding would create an alloc/free mismatch, so the guard is prod-only.
+CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(CFLAGS_EXTRA)
 CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2
 
 # Test flags: debug + sanitizers (override SANITIZE= to disable on Windows)
@@ -115,7 +118,12 @@ ifeq ($(IS_MINGW),yes)
 WIN32_LIBS := -lws2_32 -lpsapi -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static
 endif
 
-LDFLAGS = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS)
+# STATIC=1 produces a fully static binary (for Alpine/musl portable builds)
+ifeq ($(STATIC),1)
+STATIC_FLAGS := -static
+endif
+
+LDFLAGS = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS) $(STATIC_FLAGS)
 LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(LIBGIT2_LIBS) $(WIN32_LIBS)
 LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz -fsanitize=thread $(LIBGIT2_LIBS) $(WIN32_LIBS)
 # nosan: no ASan/UBSan — required for macOS 'leaks' tool (incompatible with ASan malloc replacement)
@@ -139,7 +147,9 @@ FOUNDATION_SRCS = \
     src/foundation/compat_fs.c \
     src/foundation/compat_regex.c \
     src/foundation/mem.c \
-    src/foundation/diagnostics.c
+    src/foundation/diagnostics.c \
+    src/foundation/profile.c \
+    src/foundation/dump_verify.c
 
 # Existing extraction C code (compiled from current location)
 EXTRACTION_SRCS = \
@@ -153,9 +163,11 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_type_refs.c \
     $(CBM_DIR)/extract_type_assigns.c \
     $(CBM_DIR)/extract_env_accesses.c \
+    $(CBM_DIR)/extract_channels.c \
     $(CBM_DIR)/extract_k8s.c \
     $(CBM_DIR)/helpers.c \
-    $(CBM_DIR)/lang_specs.c
+    $(CBM_DIR)/lang_specs.c \
+    $(CBM_DIR)/service_patterns.c
 
 # LSP resolvers (compiled as one unit via lsp_all.c)
 LSP_SRCS = $(CBM_DIR)/lsp_all.c
@@ -168,6 +180,9 @@ GRAMMAR_SRCS = $(wildcard $(CBM_DIR)/grammar_*.c)
 
 # LZ4 + Aho-Corasick
 AC_LZ4_SRCS = $(CBM_DIR)/ac.c $(CBM_DIR)/lz4_store.c
+
+# Zstd compression (for persistent artifacts)
+ZSTD_SRCS = $(CBM_DIR)/zstd_store.c
 
 # Preprocessor (C++)
 PREPROCESSOR_SRC = $(CBM_DIR)/preprocessor.cpp
@@ -197,6 +212,7 @@ GRAPH_BUFFER_SRCS = src/graph_buffer/graph_buffer.c
 # Pipeline module (new)
 PIPELINE_SRCS = \
     src/pipeline/fqn.c \
+    src/pipeline/path_alias.c \
     src/pipeline/registry.c \
     src/pipeline/pipeline.c \
     src/pipeline/pipeline_incremental.c \
@@ -204,21 +220,38 @@ PIPELINE_SRCS = \
     src/pipeline/pass_parallel.c \
     src/pipeline/pass_definitions.c \
     src/pipeline/pass_calls.c \
+    src/pipeline/pass_lsp_cross.c \
     src/pipeline/pass_usages.c \
     src/pipeline/pass_semantic.c \
     src/pipeline/pass_tests.c \
     src/pipeline/pass_githistory.c \
-    src/pipeline/pass_httplinks.c \
     src/pipeline/pass_gitdiff.c \
     src/pipeline/pass_configures.c \
     src/pipeline/pass_configlink.c \
     src/pipeline/pass_normalize.c \
+    src/pipeline/httplink.c \
+    src/pipeline/pass_httplinks.c \
+    src/pipeline/pass_route_nodes.c \
     src/pipeline/pass_enrichment.c \
     src/pipeline/pass_envscan.c \
     src/pipeline/pass_compile_commands.c \
     src/pipeline/pass_infrascan.c \
     src/pipeline/pass_k8s.c \
-    src/pipeline/httplink.c
+    src/pipeline/pass_similarity.c \
+    src/pipeline/pass_semantic_edges.c \
+    src/pipeline/pass_complexity.c \
+    src/pipeline/pass_cross_repo.c \
+    src/pipeline/artifact.c \
+    src/pipeline/pass_pkgmap.c
+
+# SimHash / MinHash module
+SIMHASH_SRCS = src/simhash/minhash.c
+
+# Semantic embedding module
+SEMANTIC_SRCS = src/semantic/semantic.c src/semantic/ast_profile.c
+
+# nomic-embed-code pretrained vectors (assembler blob)
+UNIXCODER_BLOB_SRC = vendored/nomic/code_vectors_blob.S
 
 # Depindex module (dependency/reference API indexing)
 DEPINDEX_SRCS = src/depindex/depindex.c
@@ -232,14 +265,18 @@ TRACES_SRCS = src/traces/traces.c
 # Watcher module (new)
 WATCHER_SRCS = src/watcher/watcher.c
 
+# Git context module (new)
+GIT_SRCS = src/git/git_context.c
+
 # CLI module (new)
-CLI_SRCS = src/cli/cli.c
+CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c
 
 # UI module (graph visualization)
 UI_SRCS = \
     src/ui/config.c \
     src/ui/http_server.c \
     src/ui/layout3d.c \
+    src/ui/httpd.c \
     src/ui/embedded_stub.c
 
 # Mongoose HTTP library (vendored, compiled with relaxed warnings)
@@ -248,22 +285,46 @@ MONGOOSE_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -Ivendored -DMG_ENABLE_LOG=0
 MONGOOSE_CFLAGS_TEST  = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Ivendored -DMG_ENABLE_LOG=0 \
                         $(SANITIZE)
 MONGOOSE_CFLAGS_NOSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Ivendored -DMG_ENABLE_LOG=0
-
 # mimalloc (vendored, global allocator override)
+#
+# Override strategy is platform-specific:
+#  * Unix (macOS/Linux): rely on static-link-order override — the prod mimalloc
+#    object is linked first so its strong malloc/free symbols win. We do NOT
+#    define MI_MALLOC_OVERRIDE here: that would compile alloc-override.c's
+#    forwarding definitions (malloc/free/posix_memalign/...) which, on macOS's
+#    two-level namespace, makes the binary's free == mi_free while system
+#    libraries keep allocating via the system allocator — pointers crossing that
+#    boundary hit "mimalloc: error: mi_free: invalid pointer". (Repro:
+#    `codebase-memory-mcp index <dir>` aborted on every run.)
+#  * Windows (MinGW, static CRT): the link-order trick fails (#424's allocator
+#    mismatch), so we define MI_MALLOC_OVERRIDE=1 to compile the static-CRT
+#    override added in mimalloc 3.3.0 (the _MSC_VER / _ACRTIMP /
+#    _CRT_HYBRIDPATCHABLE entry points) which take precedence over the static
+#    CRT's malloc/free.
+# Note: mimalloc's source gates the override body on MI_MALLOC_OVERRIDE (CMake
+# derives it from the MI_OVERRIDE option); MI_OVERRIDE alone is not read by the
+# source — it is kept here only as this project's prod/test marker.
 MIMALLOC_SRC = vendored/mimalloc/src/static.c
+MIMALLOC_OVERRIDE_DEFINE :=
+ifeq ($(IS_MINGW),yes)
+MIMALLOC_OVERRIDE_DEFINE := -DMI_MALLOC_OVERRIDE=1
+endif
 MIMALLOC_CFLAGS = -std=c11 -O2 -w \
                   -Ivendored/mimalloc/include \
                   -Ivendored/mimalloc/src \
-                  -DMI_OVERRIDE=1
+                  -DMI_OVERRIDE=1 \
+                  $(MIMALLOC_OVERRIDE_DEFINE)
 MIMALLOC_CFLAGS_TEST = -std=c11 -g -O1 -w \
                        -Ivendored/mimalloc/include \
                        -Ivendored/mimalloc/src \
                        -DMI_OVERRIDE=0
 
 # sqlite3 (vendored amalgamation — compiled ourselves for ASan instrumentation)
+# SQLITE_ENABLE_FTS5: enables the FTS5 full-text search extension used by the
+# BM25 search path in search_graph (see nodes_fts virtual table in store.c).
 SQLITE3_SRC = vendored/sqlite3/sqlite3.c
-SQLITE3_CFLAGS = -std=c11 -O2 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1
-SQLITE3_CFLAGS_TEST = -std=c11 -g -O1 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1
+SQLITE3_CFLAGS = -std=c11 -O2 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5
+SQLITE3_CFLAGS_TEST = -std=c11 -g -O1 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5
 
 # TRE regex (vendored, Windows only — POSIX uses system <regex.h>)
 TRE_SRC = vendored/tre/tre_all.c
@@ -273,9 +334,9 @@ TRE_CFLAGS = -std=c11 -g -O1 -w -Ivendored/tre
 YYJSON_SRC = vendored/yyjson/yyjson.c
 
 # All production sources
-PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(DEPINDEX_SRCS) $(PAGERANK_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
+PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(DEPINDEX_SRCS) $(PAGERANK_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(GIT_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
-                  $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(SQLITE_WRITER_SRC)
+                  $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
 
 # ── Test sources ─────────────────────────────────────────────────
 
@@ -287,10 +348,16 @@ TEST_FOUNDATION_SRCS = \
     tests/test_str_intern.c \
     tests/test_log.c \
     tests/test_str_util.c \
-    tests/test_platform.c
+    tests/test_platform.c \
+    tests/test_dump_verify.c
 
 TEST_EXTRACTION_SRCS = \
     tests/test_extraction.c \
+    tests/test_extraction_inheritance.c \
+    tests/test_extraction_imports.c \
+    tests/test_grammar_regression.c \
+    tests/test_grammar_labels.c \
+    tests/test_grammar_imports.c \
     tests/test_ac.c
 
 TEST_STORE_SRCS = \
@@ -298,7 +365,10 @@ TEST_STORE_SRCS = \
     tests/test_store_edges.c \
     tests/test_store_search.c \
     tests/test_store_arch.c \
-    tests/test_store_bulk.c
+    tests/test_store_bulk.c \
+    tests/test_store_pragmas.c \
+    tests/test_store_checkpoint.c \
+    tests/test_dump_verify_io.c
 
 TEST_CYPHER_SRCS = \
     tests/test_cypher.c
@@ -314,11 +384,13 @@ TEST_DISCOVER_SRCS = \
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c
+TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 
 TEST_LZ4_SRCS = tests/test_lz4.c
+TEST_ZSTD_SRCS = tests/test_zstd.c
+TEST_ARTIFACT_SRCS = tests/test_artifact.c
 
 TEST_SQLITE_WRITER_SRCS = tests/test_sqlite_writer.c
 
@@ -326,17 +398,40 @@ TEST_GO_LSP_SRCS = tests/test_go_lsp.c
 
 TEST_C_LSP_SRCS = tests/test_c_lsp.c
 
-TEST_INTEGRATION_SRCS = tests/test_integration.c
+TEST_PHP_LSP_SRCS = tests/test_php_lsp.c
+
+TEST_CS_LSP_SRCS = tests/test_cs_lsp.c
+
+TEST_CS_LSP_BENCH_SRCS = tests/test_cs_lsp_bench.c
+
+TEST_SCOPE_SRCS = tests/test_scope.c
+
+TEST_TYPE_REP_SRCS = tests/test_type_rep.c
+
+TEST_PY_LSP_SRCS = tests/test_py_lsp.c
+
+TEST_PY_LSP_BENCH_SRCS = tests/test_py_lsp_bench.c
+
+TEST_PY_LSP_STRESS_SRCS = tests/test_py_lsp_stress.c
+
+TEST_PY_LSP_SCALE_SRCS = tests/test_py_lsp_scale.c
+
+TEST_TS_LSP_SRCS = tests/test_ts_lsp.c
+TEST_JAVA_LSP_SRCS = tests/test_java_lsp.c tests/test_java_lsp_coverage.c
+TEST_KOTLIN_LSP_SRCS = tests/test_kotlin_lsp.c
+TEST_RUST_LSP_SRCS = tests/test_rust_lsp.c
+
+TEST_INTEGRATION_SRCS = tests/test_integration.c tests/test_incremental.c tests/test_lang_contract.c tests/test_edge_imports.c tests/test_edge_structural.c tests/test_lsp_resolution_probe.c tests/test_node_creation_probe.c tests/test_edge_types_probe.c tests/test_convergence_probe.c tests/test_matrix_known_classes.c tests/test_matrix_new_constructs.c tests/test_grammar_probe_a.c tests/test_grammar_probe_b.c tests/test_grammar_probe_c.c tests/test_grammar_probe_d.c tests/test_grammar_probe_e.c tests/test_grammar_probe_f.c tests/test_grammar_probe_g.c
 
 TEST_TRACES_SRCS = tests/test_traces.c
 
-TEST_HTTPLINK_SRCS = tests/test_httplink.c
 
 TEST_CLI_SRCS = tests/test_cli.c
 
 TEST_MEM_SRCS = tests/test_mem.c
 
 TEST_UI_SRCS = tests/test_ui.c
+TEST_HTTPD_SRCS = tests/test_httpd.c
 
 TEST_DEPINDEX_SRCS = tests/test_depindex.c
 
@@ -350,8 +445,13 @@ TEST_INPUT_VALIDATION_SRCS = tests/test_input_validation.c
 TEST_FQN_SRCS = tests/test_fqn.c
 TEST_SECURITY_SRCS = tests/test_security.c
 TEST_YAML_SRCS = tests/test_yaml.c
+TEST_HTTPLINK_SRCS = tests/test_httplink.c
 
-ALL_TEST_SRCS = $(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_HTTPLINK_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_DEPINDEX_SRCS) $(TEST_PAGERANK_SRCS) $(TEST_TOKEN_REDUCTION_SRCS) $(TEST_TOOL_CONSOLIDATION_SRCS) $(TEST_INPUT_VALIDATION_SRCS) $(TEST_FQN_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_INTEGRATION_SRCS)
+TEST_SIMHASH_SRCS = tests/test_simhash.c
+
+TEST_STACK_OVERFLOW_SRCS = tests/test_stack_overflow.c
+
+ALL_TEST_SRCS = $(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_HTTPLINK_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_DEPINDEX_SRCS) $(TEST_PAGERANK_SRCS) $(TEST_TOKEN_REDUCTION_SRCS) $(TEST_TOOL_CONSOLIDATION_SRCS) $(TEST_INPUT_VALIDATION_SRCS) $(TEST_FQN_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
 
 # ── Build directories ────────────────────────────────────────────
 
@@ -403,16 +503,6 @@ $(BUILD_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
 
 # ── Full test binary ─────────────────────────────────────────────
 
-# Mongoose object files (compiled with relaxed warnings, no -Werror)
-MONGOOSE_OBJ_TEST = $(BUILD_DIR)/mongoose.o
-MONGOOSE_OBJ_PROD = $(BUILD_DIR)/prod_mongoose.o
-
-$(BUILD_DIR)/mongoose.o: $(MONGOOSE_SRC) | $(BUILD_DIR)
-	$(CC) $(MONGOOSE_CFLAGS_TEST) -c -o $@ $<
-
-$(BUILD_DIR)/prod_mongoose.o: $(MONGOOSE_SRC) | $(BUILD_DIR)
-	$(CC) $(MONGOOSE_CFLAGS) -c -o $@ $<
-
 # mimalloc object files
 MIMALLOC_OBJ_TEST = $(BUILD_DIR)/mimalloc.o
 MIMALLOC_OBJ_PROD = $(BUILD_DIR)/prod_mimalloc.o
@@ -441,7 +531,7 @@ TRE_OBJ_TEST = $(BUILD_DIR)/tre.o
 TRE_OBJ_PROD = $(BUILD_DIR)/prod_tre.o
 
 $(BUILD_DIR)/tre.o: $(TRE_SRC) | $(BUILD_DIR)
-	$(CC) $(TRE_CFLAGS) $(SANITIZE) -c -o $@ $<
+	$(CC) $(TRE_CFLAGS) $(SANITIZE) -fno-sanitize=alignment -c -o $@ $<
 
 $(BUILD_DIR)/prod_tre.o: $(TRE_SRC) | $(BUILD_DIR)
 	$(CC) $(TRE_CFLAGS) -O2 -c -o $@ $<
@@ -468,7 +558,7 @@ OBJS_VENDORED_TEST  = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $
 #   cat build/c/leak-report.txt   # review complete leak report after run
 #
 # WHICH OBJECTS NEED NOSAN VARIANTS (use SANITIZE in their *_TEST flags):
-#   sqlite3, lsp_all, preprocessor, grammar/*.c, ts_runtime, mongoose
+#   sqlite3, lsp_all, preprocessor, grammar/*.c, ts_runtime
 # WHICH ARE REUSED AS-IS (never use SANITIZE):
 #   mimalloc  (MIMALLOC_CFLAGS_TEST has no -fsanitize)
 #   tre        (only on Windows; TRE_CFLAGS has no -fsanitize)
@@ -496,18 +586,33 @@ $(NOSAN_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(NOSAN_DIR)
 $(NOSAN_DIR)/sqlite3.o: $(SQLITE3_SRC) | $(NOSAN_DIR)
 	$(CC) $(SQLITE3_CFLAGS_TEST) -c -o $@ $<
 
-$(NOSAN_DIR)/mongoose.o: $(MONGOOSE_SRC) | $(NOSAN_DIR)
-	$(CC) $(MONGOOSE_CFLAGS_NOSAN) -c -o $@ $<
-
 OBJS_VENDORED_NOSAN = $(MIMALLOC_OBJ_TEST) $(NOSAN_DIR)/sqlite3.o $(TRE_OBJ_TEST) \
                       $(GRAMMAR_OBJS_NOSAN) $(NOSAN_DIR)/ts_runtime.o \
-                      $(NOSAN_DIR)/lsp_all.o $(NOSAN_DIR)/preprocessor.o \
-                      $(NOSAN_DIR)/mongoose.o
+                      $(NOSAN_DIR)/lsp_all.o $(NOSAN_DIR)/preprocessor.o
 
-$(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
+# Vendored LZ4 (test build)
+LZ4_OBJ_TEST = $(BUILD_DIR)/test_lz4.o $(BUILD_DIR)/test_lz4hc.o
+$(BUILD_DIR)/test_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR) -c -o $@ $<
+$(BUILD_DIR)/test_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
+
+# Vendored zstd (test build)
+ZSTD_OBJ_TEST = $(BUILD_DIR)/test_zstd.o
+$(BUILD_DIR)/test_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
+
+# nomic-embed-code pretrained vector blob
+UNIXCODER_OBJ = $(BUILD_DIR)/unixcoder_blob.o
+$(UNIXCODER_OBJ): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUILD_DIR)
+	$(CC) -c -o $@ $<
+
+OBJS_VENDORED_TEST = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $(GRAMMAR_OBJS_TEST) $(TS_RUNTIME_OBJ_TEST) $(LSP_OBJ_TEST) $(PP_OBJ_TEST) $(LZ4_OBJ_TEST) $(ZSTD_OBJ_TEST) $(UNIXCODER_OBJ)
+
+$(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TEST) -o $@ \
 		$(ALL_TEST_SRCS) $(PROD_SRCS) \
-		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(SQLITE_WRITER_SRC) \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_TEST) \
 		$(LDFLAGS_TEST)
 
@@ -577,14 +682,26 @@ $(BUILD_DIR)/prod_lsp_all.o: $(CBM_DIR)/lsp_all.c | $(BUILD_DIR)
 $(BUILD_DIR)/prod_preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_PROD) -w -I$(CBM_DIR)/vendored -c -o $@ $<
 
-OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(MONGOOSE_OBJ_PROD)
+# Vendored LZ4 (compiled separately, not unity-built via lz4_store.c)
+LZ4_OBJ_PROD = $(BUILD_DIR)/prod_lz4.o $(BUILD_DIR)/prod_lz4hc.o
+$(BUILD_DIR)/prod_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -c -o $@ $<
+$(BUILD_DIR)/prod_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
+
+# Vendored zstd (compiled separately, not unity-built via zstd_store.c)
+ZSTD_OBJ_PROD = $(BUILD_DIR)/prod_zstd.o
+$(BUILD_DIR)/prod_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
+
+OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
 
 MAIN_SRC = src/main.c
 
-$(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
+$(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_PROD) -o $@ \
 		$(MAIN_SRC) $(PROD_SRCS) \
-		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(SQLITE_WRITER_SRC) \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_PROD) \
 		$(LDFLAGS)
 
@@ -620,7 +737,7 @@ embed: frontend
 cbm-with-ui: embed $(OBJS_VENDORED_PROD)
 	$(CC) $(CFLAGS_PROD) -o $(BUILD_DIR)/codebase-memory-mcp \
 		$(MAIN_SRC) $(PROD_SRCS_WITH_ASSETS) \
-		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(SQLITE_WRITER_SRC) \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_PROD) \
 		$(wildcard $(BUILD_DIR)/embedded/embed_*.o) \
 		$(LDFLAGS)
@@ -644,9 +761,9 @@ SYSROOT_FLAG = $(if $(SYSROOT),-isysroot $(SYSROOT),)
 
 # Our source files (excluding vendored, grammars, tree-sitter runtime)
 LINT_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) \
-            $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(TRACES_SRCS) \
-            $(WATCHER_SRCS) $(CLI_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) \
-            $(SQLITE_WRITER_SRC) $(MAIN_SRC)
+            $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) \
+            $(TRACES_SRCS) $(WATCHER_SRCS) $(CLI_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) \
+            $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(MAIN_SRC)
 LINT_HDRS = $(wildcard src/**/*.h src/*.h $(CBM_DIR)/*.h)
 LINT_TEST_SRCS = $(ALL_TEST_SRCS)
 
@@ -680,12 +797,30 @@ lint-format:
 	@echo "=== clang-format ==="
 	@$(CLANG_FORMAT) --dry-run --Werror $(LINT_SRCS) $(LINT_HDRS)
 
+# Ban ALL NOLINT variants EXCEPT whitelisted NOLINT(misc-no-recursion).
+# The whitelist is in src/foundation/recursion_whitelist.h with documented reasoning.
+# Rule: NOLINT(misc-no-recursion) is allowed ONLY on function definitions that are
+# listed in recursion_whitelist.h. All other NOLINT forms are banned.
+lint-no-suppress:
+	@echo "=== NOLINT check ==="
+	@if grep -rn 'NOLINT' src/ internal/cbm/*.c internal/cbm/*.h 2>/dev/null \
+		| grep -v vendored \
+		| grep -v 'NOLINT(misc-no-recursion)' \
+		| grep -v 'recursion_whitelist.h'; then \
+		echo "ERROR: Banned NOLINT comment found in source code."; \
+		echo "Only NOLINT(misc-no-recursion) is allowed, and only for whitelisted functions."; \
+		echo "See src/foundation/recursion_whitelist.h for the whitelist."; \
+		exit 1; \
+	fi
+	@echo "  Checking NOLINT(misc-no-recursion) against whitelist..."
+	@scripts/check-nolint-whitelist.sh
+
 # All linters (run with make -j3 lint for parallel execution)
-lint: lint-tidy lint-cppcheck lint-format
+lint: lint-tidy lint-cppcheck lint-format lint-no-suppress
 	@echo "=== All linters passed ==="
 
 # CI linters (no clang-tidy — platform-dependent, enforced locally via pre-commit)
-lint-ci: lint-cppcheck lint-format
+lint-ci: lint-cppcheck lint-format lint-no-suppress
 	@echo "=== CI linters passed ==="
 
 # ── Security audit (6 layers) ────────────────────────────────────

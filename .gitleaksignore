@@ -1,0 +1,3 @@
+# False positives: AVX-512 intrinsic variable names in vendored zstd (xxhash)
+internal/cbm/vendored/zstd/zstd.c:generic-api-key:13192
+internal/cbm/vendored/zstd/zstd.c:generic-api-key:13241

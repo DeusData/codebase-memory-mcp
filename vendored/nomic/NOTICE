@@ -1,0 +1,17 @@
+nomic-embed-code token embeddings
+=================================
+
+The token vocabulary (code_tokens.h / code_tokens.txt) and the int8-quantized
+token vector blob (code_vectors.bin, embedded via code_vectors_blob.S) are
+derived from the nomic-embed-code embedding model:
+
+  Model:    nomic-ai/nomic-embed-code
+  Source:   https://huggingface.co/nomic-ai/nomic-embed-code
+  License:  Apache License 2.0 (see LICENSE in this directory)
+  (c) Nomic AI
+
+Derivation: per-token static embeddings were produced by running full
+inference of the upstream model over a filtered token vocabulary
+(40,856 tokens x 768 dimensions), followed by int8 unit-vector
+quantization. See scripts/extract_nomic_vectors.py for the exact
+extraction procedure. No other part of the model is redistributed.

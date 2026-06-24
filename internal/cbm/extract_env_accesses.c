@@ -3,10 +3,15 @@
 #include "helpers.h"
 #include "lang_specs.h"
 #include "extract_unified.h"
+#include "foundation/constants.h"
+#include "extract_node_stack.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include <stdint.h>          // uint32_t
 #include <string.h>
 #include <ctype.h>
+
+/* Minimum length for an env var name (e.g., "DB"). */
+enum { MIN_ENV_NAME_LEN = 2 };
 
 // Unquote a string literal: "foo" -> foo, 'foo' -> foo
 static const char *unquote(CBMArena *a, const char *s) {
@@ -18,12 +23,12 @@ static const char *unquote(CBMArena *a, const char *s) {
         s++;
     }
     size_t len = strlen(s);
-    if (len >= 2) {
+    if (len >= CBM_QUOTE_PAIR) {
         char first = s[0];
-        char last = s[len - 1];
+        char last = s[len - CBM_QUOTE_OFFSET];
         if ((first == '"' && last == '"') || (first == '\'' && last == '\'') ||
             (first == '`' && last == '`')) {
-            return cbm_arena_strndup(a, s + 1, len - 2);
+            return cbm_arena_strndup(a, s + CBM_QUOTE_OFFSET, len - CBM_QUOTE_PAIR);
         }
     }
     return s;
@@ -36,7 +41,7 @@ static const char *extract_env_key_from_call(CBMExtractCtx *ctx, TSNode node,
         return NULL;
     }
 
-    TSNode func_node = ts_node_child_by_field_name(node, "function", 8);
+    TSNode func_node = ts_node_child_by_field_name(node, TS_FIELD("function"));
     if (ts_node_is_null(func_node)) {
         return NULL;
     }
@@ -58,7 +63,7 @@ static const char *extract_env_key_from_call(CBMExtractCtx *ctx, TSNode node,
     }
 
     // Get first argument (the env key)
-    TSNode args = ts_node_child_by_field_name(node, "arguments", 9);
+    TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
     if (ts_node_is_null(args)) {
         return NULL;
     }
@@ -92,7 +97,7 @@ static const char *extract_env_key_from_member(CBMExtractCtx *ctx, TSNode node,
 
         // Dot access: pattern.KEY
         if (strncmp(text, *pat, plen) == 0 && text[plen] == '.') {
-            const char *key = text + plen + 1;
+            const char *key = text + plen + CBM_QUOTE_OFFSET;
             // Validate: no further dots/brackets
             if (key[0] && !strchr(key, '.') && !strchr(key, '[')) {
                 return key;
@@ -101,10 +106,11 @@ static const char *extract_env_key_from_member(CBMExtractCtx *ctx, TSNode node,
 
         // Subscript: pattern["KEY"]
         if (strncmp(text, *pat, plen) == 0 && text[plen] == '[') {
-            const char *inner = text + plen + 1;
+            const char *inner = text + plen + CBM_QUOTE_OFFSET;
             size_t ilen = strlen(inner);
-            if (ilen > 0 && inner[ilen - 1] == ']') {
-                char *bracket_content = cbm_arena_strndup(ctx->arena, inner, ilen - 1);
+            if (ilen > 0 && inner[ilen - CBM_QUOTE_OFFSET] == ']') {
+                char *bracket_content =
+                    cbm_arena_strndup(ctx->arena, inner, ilen - CBM_QUOTE_OFFSET);
                 return unquote(ctx->arena, bracket_content);
             }
         }
@@ -114,7 +120,7 @@ static const char *extract_env_key_from_member(CBMExtractCtx *ctx, TSNode node,
 
 // Check if an env key name looks like an environment variable (uppercase + underscores).
 static bool is_env_var_name(const char *s) {
-    if (!s || strlen(s) < 2) {
+    if (!s || strlen(s) < MIN_ENV_NAME_LEN) {
         return false;
     }
     bool has_upper = false;
@@ -131,34 +137,33 @@ static bool is_env_var_name(const char *s) {
     return has_upper;
 }
 
-// NOLINTNEXTLINE(misc-no-recursion) — intentional AST tree walk
-static void walk_env_accesses(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
-    const char *kind = ts_node_type(node);
-    const char *env_key = NULL;
+// Iterative env access walker — explicit stack
+static void walk_env_accesses(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, 4096);
+    ts_nstack_push(&stack, ctx->arena, root);
 
-    // Check call nodes
-    if (cbm_kind_in_set(node, spec->call_node_types)) {
-        env_key = extract_env_key_from_call(ctx, node, spec);
-    }
-    // Check member/subscript access
-    else if (strcmp(kind, "member_expression") == 0 || strcmp(kind, "subscript") == 0 ||
-             strcmp(kind, "attribute") == 0) {
-        env_key = extract_env_key_from_member(ctx, node, spec);
-    }
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
+        const char *kind = ts_node_type(node);
+        const char *env_key = NULL;
 
-    if (env_key && env_key[0] && is_env_var_name(env_key)) {
-        CBMEnvAccess ea;
-        ea.env_key = env_key;
-        ea.enclosing_func_qn = cbm_enclosing_func_qn_cached(ctx, node);
-        cbm_envaccess_push(&ctx->result->env_accesses, ctx->arena, ea);
-        // Don't recurse into this node's children (avoid double-counting)
-        return;
-    }
+        if (cbm_kind_in_set(node, spec->call_node_types)) {
+            env_key = extract_env_key_from_call(ctx, node, spec);
+        } else if (strcmp(kind, "member_expression") == 0 || strcmp(kind, "subscript") == 0 ||
+                   strcmp(kind, "attribute") == 0) {
+            env_key = extract_env_key_from_member(ctx, node, spec);
+        }
 
-    // Recurse
-    uint32_t count = ts_node_child_count(node);
-    for (uint32_t i = 0; i < count; i++) {
-        walk_env_accesses(ctx, ts_node_child(node, i), spec);
+        if (env_key && env_key[0] && is_env_var_name(env_key)) {
+            CBMEnvAccess ea;
+            ea.env_key = env_key;
+            ea.enclosing_func_qn = cbm_enclosing_func_qn_cached(ctx, node);
+            cbm_envaccess_push(&ctx->result->env_accesses, ctx->arena, ea);
+            continue; // don't push children (avoid double-counting)
+        }
+
+        ts_nstack_push_children(&stack, ctx->arena, node);
     }
 }
 
@@ -168,9 +173,7 @@ void cbm_extract_env_accesses(CBMExtractCtx *ctx) {
         return;
     }
 
-    // NOLINTNEXTLINE(readability-implicit-bool-conversion) — pointer-to-bool check for NULL array
     bool has_funcs = spec->env_access_functions && spec->env_access_functions[0];
-    // NOLINTNEXTLINE(readability-implicit-bool-conversion) — pointer-to-bool check for NULL array
     bool has_members = spec->env_access_member_patterns && spec->env_access_member_patterns[0];
     if (!has_funcs && !has_members) {
         return;
@@ -183,9 +186,7 @@ void cbm_extract_env_accesses(CBMExtractCtx *ctx) {
 
 void handle_env_accesses(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                          WalkState *state) {
-    // NOLINTNEXTLINE(readability-implicit-bool-conversion) — pointer-to-bool check for NULL array
     bool has_funcs = spec->env_access_functions && spec->env_access_functions[0];
-    // NOLINTNEXTLINE(readability-implicit-bool-conversion) — pointer-to-bool check for NULL array
     bool has_members = spec->env_access_member_patterns && spec->env_access_member_patterns[0];
     if (!has_funcs && !has_members) {
         return;

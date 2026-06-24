@@ -3,18 +3,22 @@
 #include "lang_specs.h"
 #include "extract_unified.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
-#include <stdint.h>          // uint32_t
+#include "foundation/constants.h"
+#include "extract_node_stack.h"
+
+enum { MAX_PARENT_DEPTH = 10, LAST_IDX = 1 };
+#include <stdint.h> // uint32_t
 #include <string.h>
 #include <ctype.h>
 
 // Forward declaration
-static void walk_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
+static void walk_usages(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec);
 
 // Check if a node is inside a call expression (to avoid double-counting as usage)
 static bool is_inside_call(TSNode node, const CBMLangSpec *spec) {
     TSNode cur = ts_node_parent(node);
     int depth = 0;
-    while (!ts_node_is_null(cur) && depth < 10) {
+    while (!ts_node_is_null(cur) && depth < MAX_PARENT_DEPTH) {
         if (cbm_kind_in_set(cur, spec->call_node_types)) {
             return true;
         }
@@ -31,7 +35,7 @@ static bool is_inside_import(TSNode node, const CBMLangSpec *spec) {
     }
     TSNode cur = ts_node_parent(node);
     int depth = 0;
-    while (!ts_node_is_null(cur) && depth < 10) {
+    while (!ts_node_is_null(cur) && depth < MAX_PARENT_DEPTH) {
         if (cbm_kind_in_set(cur, spec->import_node_types)) {
             return true;
         }
@@ -54,63 +58,67 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
     // Language-specific reference types
     switch (lang) {
     case CBM_LANG_GO:
-        // NOLINTNEXTLINE(readability-implicit-bool-conversion)
         return strcmp(kind, "field_identifier") == 0 || strcmp(kind, "package_identifier") == 0;
     case CBM_LANG_PYTHON:
         return strcmp(kind, "attribute") == 0;
     case CBM_LANG_RUST:
-        // NOLINTNEXTLINE(readability-implicit-bool-conversion)
         return strcmp(kind, "field_identifier") == 0 || strcmp(kind, "scoped_identifier") == 0;
     case CBM_LANG_HASKELL:
-        // NOLINTNEXTLINE(readability-implicit-bool-conversion)
         return strcmp(kind, "variable") == 0 || strcmp(kind, "constructor") == 0;
     case CBM_LANG_OCAML:
-        // NOLINTNEXTLINE(readability-implicit-bool-conversion)
         return strcmp(kind, "value_path") == 0 || strcmp(kind, "constructor_path") == 0;
     case CBM_LANG_ERLANG:
-        // NOLINTNEXTLINE(readability-implicit-bool-conversion)
         return strcmp(kind, "atom") == 0 || strcmp(kind, "var") == 0;
     default:
         return false;
     }
 }
 
-// NOLINTNEXTLINE(misc-no-recursion) — intentional AST tree walk
-static void walk_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
-    if (is_reference_node(node, ctx->language)) {
-        // Skip if inside a call (already counted as CALLS edge)
-        if (is_inside_call(node, spec)) {
-            goto recurse;
-        }
-        // Skip if inside an import
-        if (is_inside_import(node, spec)) {
-            goto recurse;
-        }
-        // Skip if it's a definition name (left side of assignment, function name)
-        TSNode parent = ts_node_parent(node);
-        if (!ts_node_is_null(parent)) {
-            // Check if this is the "name" field of the parent
-            TSNode name_field = ts_node_child_by_field_name(parent, "name", 4);
-            if (!ts_node_is_null(name_field) &&
-                ts_node_start_byte(name_field) == ts_node_start_byte(node) &&
-                ts_node_end_byte(name_field) == ts_node_end_byte(node)) {
-                goto recurse;
-            }
-        }
-
-        char *name = cbm_node_text(ctx->arena, node, ctx->source);
-        if (name && name[0] && !cbm_is_keyword(name, ctx->language)) {
-            CBMUsage usage;
-            usage.ref_name = name;
-            usage.enclosing_func_qn = cbm_enclosing_func_qn_cached(ctx, node);
-            cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
-        }
+// Check if a reference node is a definition name (the "name" field of its parent).
+static bool is_definition_name(TSNode node) {
+    TSNode parent = ts_node_parent(node);
+    if (ts_node_is_null(parent)) {
+        return false;
     }
+    TSNode name_field = ts_node_child_by_field_name(parent, TS_FIELD("name"));
+    return !ts_node_is_null(name_field) &&
+           ts_node_start_byte(name_field) == ts_node_start_byte(node) &&
+           ts_node_end_byte(name_field) == ts_node_end_byte(node);
+}
 
-recurse:;
-    uint32_t count = ts_node_child_count(node);
-    for (uint32_t i = 0; i < count; i++) {
-        walk_usages(ctx, ts_node_child(node, i), spec);
+// Try to emit a usage for a reference node. Returns early if the node should be skipped.
+static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
+    if (!is_reference_node(node, ctx->language)) {
+        return;
+    }
+    if (is_inside_call(node, spec) || is_inside_import(node, spec)) {
+        return;
+    }
+    if (is_definition_name(node)) {
+        return;
+    }
+    char *name = cbm_node_text(ctx->arena, node, ctx->source);
+    if (name && name[0] && !cbm_is_keyword(name, ctx->language)) {
+        CBMUsage usage;
+        usage.ref_name = name;
+        usage.enclosing_func_qn = cbm_enclosing_func_qn_cached(ctx, node);
+        cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
+    }
+}
+
+// Iterative usage walker — explicit stack
+static void walk_usages(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, 4096);
+    ts_nstack_push(&stack, ctx->arena, root);
+
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
+        try_emit_usage(ctx, node, spec);
+        uint32_t count = ts_node_child_count(node);
+        for (int i = (int)count - LAST_IDX; i >= 0; i--) {
+            ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
+        }
     }
 }
 
@@ -144,7 +152,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     // Skip if it's a definition name (left side of assignment, function name)
     TSNode parent = ts_node_parent(node);
     if (!ts_node_is_null(parent)) {
-        TSNode name_field = ts_node_child_by_field_name(parent, "name", 4);
+        TSNode name_field = ts_node_child_by_field_name(parent, TS_FIELD("name"));
         if (!ts_node_is_null(name_field) &&
             ts_node_start_byte(name_field) == ts_node_start_byte(node) &&
             ts_node_end_byte(name_field) == ts_node_end_byte(node)) {

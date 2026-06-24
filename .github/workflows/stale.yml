@@ -1,0 +1,44 @@
+name: Stale awaiting-reporter
+
+# Only touches issues that a maintainer has explicitly marked `awaiting-reporter`.
+# Never touches pull requests, and never touches issues without that label.
+# A reporter comment removes `stale` and resets the clock.
+
+on:
+  schedule:
+    - cron: '17 2 * * *' # daily 02:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/stale@eb5cf3af3ac0a1aa4c9c45633dd1ae542a27a899 # v10.3.0
+        with:
+          only-labels: 'awaiting-reporter'
+          stale-issue-label: 'stale'
+          days-before-issue-stale: 21
+          days-before-issue-close: 14
+          # Never act on pull requests with this workflow.
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+          remove-stale-when-updated: true
+          close-issue-reason: not_planned
+          operations-per-run: 60
+          ascending: true
+          stale-issue-message: >
+            This issue has been waiting on more information for 21 days (a
+            version, exact steps, or a public repro), so it's now marked
+            `stale`. It will be closed in 14 days if there's no update — just
+            add a comment to keep it open. We're happy to pick it back up the
+            moment we can reproduce it.
+          close-issue-message: >
+            Closing because we haven't received the requested details and can't
+            reproduce it as-is. This isn't a "won't fix" — please comment with
+            the info (version + a public repro) and we'll reopen and dig in.
+            Thanks for the report.

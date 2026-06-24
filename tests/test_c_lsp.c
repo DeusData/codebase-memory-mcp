@@ -20,6 +20,8 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 /* ── Helpers (same as test_go_lsp.c) ───────────────────────────── */
 
@@ -535,6 +537,113 @@ TEST(clsp_nocrash_template_expression) {
                                    "    const char* s = \"hello\";\n"
                                    "}\n"
                                    "");
+    ASSERT_NOT_NULL(r);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(clsp_nocrash_template_extra_call_args) {
+    CBMFileResult *r = extract_cpp("\n"
+                                   "class Widget {\n"
+                                   "public:\n"
+                                   "    void render() {}\n"
+                                   "};\n"
+                                   "\n"
+                                   "template<class T>\n"
+                                   "void invoke(T item) {\n"
+                                   "    item.render();\n"
+                                   "}\n"
+                                   "\n"
+                                   "void test() {\n"
+                                   "    Widget w;\n"
+                                   "    invoke(w, 1, 2);\n"
+                                   "}\n"
+                                   "");
+    ASSERT_NOT_NULL(r);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(clsp_nocrash_template_function_multi_param_nested_call) {
+    CBMFileResult *r = extract_cpp("\n"
+                                   "void right_aligned_text(int color, int width, const char* fmt, float value) {}\n"
+                                   "\n"
+                                   "template<typename T, typename R = float>\n"
+                                   "R format_units(T value, const char*& unit) { return value; }\n"
+                                   "\n"
+                                   "void f() {\n"
+                                   "    const char* unit = nullptr;\n"
+                                   "    right_aligned_text(0, 0, \"%.1f\", format_units(1, unit));\n"
+                                   "}\n"
+                                   "");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_resolved(r, "f", "right_aligned_text"), 0);
+    ASSERT_GTE(find_resolved(r, "f", "format_units"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Issue #220: C++ CALLS edges were attributed to the Module (file) node
+ * instead of the enclosing Function/Method, breaking function-level
+ * trace_path. The resolved call's caller_qn must be the enclosing function. */
+TEST(clsp_calls_attributed_to_function_issue220) {
+    CBMFileResult *r = extract_cpp("void helper() {}\n"
+                                   "void doWork() {\n"
+                                   "    helper();\n"
+                                   "}\n");
+    ASSERT_NOT_NULL(r);
+    int idx = find_resolved(r, "doWork", "helper");
+    ASSERT_GTE(idx, 0);
+    ASSERT_NOT_NULL(strstr(r->resolved_calls.items[idx].caller_qn, "doWork"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Issue #355: indexing segfaulted while extracting a heavily-macro'd xxhash
+ * C header (`dhw/xx_hash.h`). The reporter's exact file isn't available, so
+ * this drives the vendored xxhash.h (~7.5k lines, same macro-dense family)
+ * through C extraction as a proxy/regression guard. Runs under ASan. */
+TEST(clsp_nocrash_issue355_xxhash_header) {
+    FILE *fp = fopen("vendored/xxhash/xxhash.h", "rb");
+    if (!fp) {
+        FAIL("vendored/xxhash/xxhash.h not found (run from repo root)");
+    }
+    fseek(fp, 0, SEEK_END);
+    long n = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (n <= 0) {
+        fclose(fp);
+        FAIL("xxhash.h unreadable");
+    }
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (!buf) {
+        fclose(fp);
+        FAIL("oom");
+    }
+    size_t rd = fread(buf, 1, (size_t)n, fp);
+    fclose(fp);
+    buf[rd] = '\0';
+    CBMFileResult *r =
+        cbm_extract_file(buf, (int)rd, CBM_LANG_C, "test", "xxhash.h", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    cbm_free_result(r);
+    free(buf);
+    PASS();
+}
+
+/* Issue #312: indexing segfaulted in pass=definitions on a function template
+ * with a defaulted type param AND an `auto` parameter, called with matching
+ * arg count. The defaulted/unbound template param `U` flowed through type
+ * substitution as NULL and was dereferenced during return-type handling. */
+TEST(clsp_nocrash_issue312_default_template_auto_param) {
+    CBMFileResult *r = extract_cpp("template<typename T, typename U = int>\n"
+                                   "U f(auto, T t) {\n"
+                                   "    return t;\n"
+                                   "}\n"
+                                   "\n"
+                                   "int main() {\n"
+                                   "    if (f(1, 2) != 2) return 1;\n"
+                                   "}\n");
     ASSERT_NOT_NULL(r);
     cbm_free_result(r);
     PASS();
@@ -15101,6 +15210,11 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_operator_stream);
     RUN_TEST(clsp_cross_file);
     RUN_TEST(clsp_nocrash_template_expression);
+    RUN_TEST(clsp_nocrash_template_extra_call_args);
+    RUN_TEST(clsp_nocrash_template_function_multi_param_nested_call);
+    RUN_TEST(clsp_calls_attributed_to_function_issue220);
+    RUN_TEST(clsp_nocrash_issue355_xxhash_header);
+    RUN_TEST(clsp_nocrash_issue312_default_template_auto_param);
     RUN_TEST(clsp_nocrash_lambda);
     RUN_TEST(clsp_nocrash_nested_namespace);
     RUN_TEST(clsp_nocrash_empty_source);

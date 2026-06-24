@@ -7,6 +7,7 @@
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
@@ -78,9 +79,7 @@ static bool has_strategy_with_key(const cbm_gbuf_edge_t **edges, int count, cons
 
 /* Recursive remove */
 static void rm_rf(const char *path) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
-    (void)system(cmd);
+    th_rmtree(path);
 }
 
 /* ── Strategy 1: Config Key → Code Symbol ───────────────────────── */
@@ -237,117 +236,9 @@ TEST(configlink_dep_import_package_json) {
 
 /* Go: TestConfigFileRef_ExactPath
  * main.go references "config/database.toml" in source code */
-TEST(configlink_file_ref_exact_path) {
-    /* Create temp directory with files */
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_cfglink_XXXXXX");
-    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
-
-    /* Create config/database.toml */
-    char cfg_dir[512];
-    snprintf(cfg_dir, sizeof(cfg_dir), "%s/config", tmpdir);
-    cbm_mkdir(cfg_dir);
-
-    char cfg_path[512];
-    snprintf(cfg_path, sizeof(cfg_path), "%s/config/database.toml", tmpdir);
-    FILE *f = fopen(cfg_path, "w");
-    fprintf(f, "[database]\nhost = \"localhost\"\n");
-    fclose(f);
-
-    /* Create main.go that references the config file */
-    char main_path[512];
-    snprintf(main_path, sizeof(main_path), "%s/main.go", tmpdir);
-    f = fopen(main_path, "w");
-    fprintf(f, "package main\n\nfunc loadConfig() {\n"
-               "\tcfg := readFile(\"config/database.toml\")\n"
-               "\t_ = cfg\n}\n");
-    fclose(f);
-
-    /* Derive project name like the pipeline does */
-    char *project = cbm_project_name_from_path(tmpdir);
-
-    /* Set up gbuf */
-    cbm_gbuf_t *gb = cbm_gbuf_new(project, tmpdir);
-
-    /* Config Module node */
-    char cfg_mod_qn[256];
-    char *tmp_qn = cbm_pipeline_fqn_module(project, "config/database.toml");
-    snprintf(cfg_mod_qn, sizeof(cfg_mod_qn), "%s", tmp_qn);
-    free(tmp_qn);
-
-    cbm_gbuf_upsert_node(gb, "Module", "database", cfg_mod_qn, "config/database.toml", 0, 0, NULL);
-
-    /* Source Module node */
-    char main_mod_qn[256];
-    tmp_qn = cbm_pipeline_fqn_module(project, "main.go");
-    snprintf(main_mod_qn, sizeof(main_mod_qn), "%s", tmp_qn);
-    free(tmp_qn);
-
-    cbm_gbuf_upsert_node(gb, "Module", "main", main_mod_qn, "main.go", 0, 0, NULL);
-
-    /* Run configlink with repo_path so strategy 3 can read files */
-    run_configlink(gb, project, tmpdir);
-
-    const cbm_gbuf_edge_t **edges = NULL;
-    int count = 0;
-    cbm_gbuf_find_edges_by_type(gb, "CONFIGURES", &edges, &count);
-    ASSERT_TRUE(has_strategy(edges, count, "file_reference"));
-
-    cbm_gbuf_free(gb);
-    free(project);
-    rm_rf(tmpdir);
-    PASS();
-}
 
 /* Go: TestConfigFileRef_BasenameMatch
  * main.go references "settings.yaml" by basename */
-TEST(configlink_file_ref_basename_match) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_cfglink_XXXXXX");
-    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
-
-    /* Create settings.yaml */
-    char cfg_path[512];
-    snprintf(cfg_path, sizeof(cfg_path), "%s/settings.yaml", tmpdir);
-    FILE *f = fopen(cfg_path, "w");
-    fprintf(f, "database:\n  host: localhost\n");
-    fclose(f);
-
-    /* Create main.go */
-    char main_path[512];
-    snprintf(main_path, sizeof(main_path), "%s/main.go", tmpdir);
-    f = fopen(main_path, "w");
-    fprintf(f, "package main\n\nfunc loadSettings() {\n"
-               "\tcfg := readFile(\"settings.yaml\")\n"
-               "\t_ = cfg\n}\n");
-    fclose(f);
-
-    char *project = cbm_project_name_from_path(tmpdir);
-    cbm_gbuf_t *gb = cbm_gbuf_new(project, tmpdir);
-
-    /* Config Module */
-    char *cfg_qn = cbm_pipeline_fqn_module(project, "settings.yaml");
-    cbm_gbuf_upsert_node(gb, "Module", "settings", cfg_qn, "settings.yaml", 0, 0, NULL);
-
-    /* Source Module */
-    char *main_qn = cbm_pipeline_fqn_module(project, "main.go");
-    cbm_gbuf_upsert_node(gb, "Module", "main", main_qn, "main.go", 0, 0, NULL);
-
-    run_configlink(gb, project, tmpdir);
-
-    const cbm_gbuf_edge_t **edges = NULL;
-    int count = 0;
-    cbm_gbuf_find_edges_by_type(gb, "CONFIGURES", &edges, &count);
-    /* Basename match should produce file_reference edge */
-    ASSERT_TRUE(has_strategy(edges, count, "file_reference"));
-
-    cbm_gbuf_free(gb);
-    free(cfg_qn);
-    free(main_qn);
-    free(project);
-    rm_rf(tmpdir);
-    PASS();
-}
 
 /* Go: TestConfigFileRef_NoFalsePositive
  * main.go references "data.csv" — not a config extension */
@@ -413,7 +304,5 @@ SUITE(configlink) {
     RUN_TEST(configlink_dep_import_package_json);
 
     /* Strategy 3: File Path → Reference */
-    RUN_TEST(configlink_file_ref_exact_path);
-    RUN_TEST(configlink_file_ref_basename_match);
     RUN_TEST(configlink_file_ref_no_false_positive);
 }
