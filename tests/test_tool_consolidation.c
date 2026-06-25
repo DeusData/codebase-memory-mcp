@@ -1,8 +1,11 @@
 /*
- * test_tool_consolidation.c — Tests for Phase 9 API consolidation.
+ * test_tool_consolidation.c — Tests for the streamlined/default tool surface.
  *
- * Covers: streamlined/classic tool modes, search_code_graph dispatch,
- * get_code dispatch, project param path support, tool config visibility.
+ * §4b: the search_code_graph mega-tool was deleted; the default surface is now
+ * 5 focused tools: search_graph, query_graph, search_code (from TOOLS[]) plus
+ * trace_call_path and get_code (from STREAMLINED_TOOLS[]). Covers tool
+ * visibility, split-tool dispatch, get_code alias dispatch, project param path
+ * support, and tool config visibility.
  */
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
@@ -21,18 +24,22 @@
 
 /* ── 1. Tool visibility tests ─────────────────────────────── */
 
-TEST(streamlined_mode_shows_3_tools) {
-    /* NULL srv → streamlined mode (no config available) */
+TEST(streamlined_mode_shows_5_default_tools) {
+    /* NULL srv → streamlined mode (no config available).
+     * §4b: default surface is 5 tools — search_graph, query_graph, search_code,
+     * trace_call_path, get_code. The search_code_graph mega-tool is gone. */
     char *json = cbm_mcp_tools_list(NULL);
     ASSERT_NOT_NULL(json);
-    /* Should have the 3 consolidated tools */
-    ASSERT_NOT_NULL(strstr(json, "search_code_graph"));
+    /* The 5 default-surface tools must be present */
+    ASSERT_NOT_NULL(strstr(json, "search_graph"));
+    ASSERT_NOT_NULL(strstr(json, "query_graph"));
+    ASSERT_NOT_NULL(strstr(json, "search_code"));
     ASSERT_NOT_NULL(strstr(json, "trace_call_path"));
     ASSERT_NOT_NULL(strstr(json, "get_code"));
-    /* Old names should NOT be present */
+    /* The deleted mega-tool must NOT appear */
+    ASSERT_NULL(strstr(json, "search_code_graph"));
+    /* Hidden classic-only tools should NOT be top-level entries */
     ASSERT_NULL(strstr(json, "\"index_repository\""));
-    ASSERT_NULL(strstr(json, "\"query_graph\""));
-    ASSERT_NULL(strstr(json, "\"search_graph\""));
     ASSERT_NULL(strstr(json, "\"get_code_snippet\""));
     ASSERT_NULL(strstr(json, "\"manage_adr\""));
     free(json);
@@ -50,10 +57,14 @@ TEST(classic_mode_shows_all_15_tools) {
     char *resp = cbm_mcp_server_handle(srv,
         "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/list\"}");
     ASSERT_NOT_NULL(resp);
-    /* Default (no config) = streamlined: should have consolidated names */
-    ASSERT_NOT_NULL(strstr(resp, "search_code_graph"));
+    /* Default (no config) = streamlined: §4b surface is the 5 split tools */
+    ASSERT_NOT_NULL(strstr(resp, "search_graph"));
+    ASSERT_NOT_NULL(strstr(resp, "query_graph"));
+    ASSERT_NOT_NULL(strstr(resp, "search_code"));
     ASSERT_NOT_NULL(strstr(resp, "trace_call_path"));
     ASSERT_NOT_NULL(strstr(resp, "get_code"));
+    /* The deleted mega-tool must NOT appear */
+    ASSERT_NULL(strstr(resp, "search_code_graph"));
     free(resp);
     cbm_mcp_server_free(srv);
     PASS();
@@ -61,11 +72,13 @@ TEST(classic_mode_shows_all_15_tools) {
 
 /* ── 2. Dispatch tests ────────────────────────────────────── */
 
-TEST(search_code_graph_structured_dispatch) {
-    /* search_code_graph without cypher → routes to search_graph handler */
+TEST(search_graph_dispatch) {
+    /* §4b: search_graph is now a default-surface tool and dispatches directly
+     * to handle_search_graph (previously reached via the search_code_graph
+     * mega-tool's default branch). */
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
-    char *result = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *result = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"name_pattern\":\"nonexistent_xyz\"}");
     ASSERT_NOT_NULL(result);
     /* Should get a response (may be empty results, not an error about unknown tool) */
@@ -75,12 +88,13 @@ TEST(search_code_graph_structured_dispatch) {
     PASS();
 }
 
-TEST(search_code_graph_cypher_dispatch) {
-    /* search_code_graph with cypher → routes to query_graph handler */
+TEST(query_graph_dispatch) {
+    /* §4b: query_graph is now a default-surface tool and dispatches directly
+     * to handle_query_graph (previously reached via search_code_graph cypher=). */
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
-    char *result = cbm_mcp_handle_tool(srv, "search_code_graph",
-        "{\"cypher\":\"MATCH (n) RETURN n.name LIMIT 1\"}");
+    char *result = cbm_mcp_handle_tool(srv, "query_graph",
+        "{\"query\":\"MATCH (n) RETURN n.name LIMIT 1\"}");
     ASSERT_NOT_NULL(result);
     /* Should get a Cypher response (may be empty), not unknown tool error */
     ASSERT_NULL(strstr(result, "unknown tool"));
@@ -144,11 +158,12 @@ TEST(old_tool_names_still_dispatch) {
 
 TEST(project_param_path_detection) {
     /* expand_project_param should detect paths and convert.
-     * We test indirectly via search_code_graph with a path-like project.
+     * §4b: test indirectly via search_graph (same handler the old
+     * search_code_graph default branch routed to) with a path-like project.
      * Since the path won't exist as a db, we just verify no crash. */
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
-    char *result = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *result = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"project\":\"/tmp/nonexistent_test_project\",\"name_pattern\":\"foo\"}");
     ASSERT_NOT_NULL(result);
     /* Should get an error about project not loaded, not a crash */
@@ -732,14 +747,16 @@ TEST(resource_capable_client_no_context_on_second_call) {
 
 TEST(tool_descriptions_reference_resources) {
     /* Tool descriptions should tell the AI about available resources
-     * so it knows to read codebase://schema before writing Cypher, etc. */
+     * so it knows to read codebase://schema before writing Cypher, etc.
+     * §4b: trace_call_path mentions codebase://architecture; the _hidden_tools
+     * hint mentions all three resource URIs. */
     char *json = cbm_mcp_tools_list(NULL);
     ASSERT_NOT_NULL(json);
-    /* search_code_graph should mention schema and architecture resources */
+    /* Resources are referenced in the default surface / hint */
     ASSERT_NOT_NULL(strstr(json, "codebase://schema"));
     ASSERT_NOT_NULL(strstr(json, "codebase://architecture"));
-    /* get_code should reference search_code_graph for qualified names */
-    ASSERT_NOT_NULL(strstr(json, "search_code_graph"));
+    /* get_code should reference search_graph for qualified names */
+    ASSERT_NOT_NULL(strstr(json, "search_graph"));
     free(json);
     PASS();
 }
@@ -852,7 +869,8 @@ TEST(error_unknown_tool_lists_valid_tools) {
     ASSERT_NOT_NULL(r);
     ASSERT_NOT_NULL(strstr(r, "nonexistent_tool_xyz"));
     ASSERT_NOT_NULL(strstr(r, "hint"));
-    ASSERT_NOT_NULL(strstr(r, "search_code_graph"));
+    /* §4b: hint now lists the split tools, not the deleted mega-tool */
+    ASSERT_NOT_NULL(strstr(r, "search_graph"));
     ASSERT_NOT_NULL(strstr(r, "tools/list"));
     free(r);
     cbm_mcp_server_free(srv);
@@ -1482,7 +1500,7 @@ TEST(watcher_registered_on_resolve_store) {
     ASSERT_NOT_NULL(w);
     cbm_mcp_server_set_watcher(srv, w);
 
-    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"project\":\"_tc_watcher_\",\"name_pattern\":\"watcher_fn\",\"limit\":1}");
     ASSERT_NOT_NULL(resp);
     free(resp);
@@ -1515,7 +1533,7 @@ TEST(watcher_not_registered_for_unknown_path) {
     ASSERT_NOT_NULL(w);
     cbm_mcp_server_set_watcher(srv, w);
 
-    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"project\":\"_tc_watcher_nopath_\",\"name_pattern\":\"nopath_fn\",\"limit\":1}");
     ASSERT_NOT_NULL(resp);
     free(resp);
@@ -1563,7 +1581,7 @@ TEST(compact_defaults_to_true) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
     /* Search WITHOUT compact param — should default to compact=true */
-    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"project\":\"_tc_compact_default_\",\"name_pattern\":\"my_func\",\"limit\":1}");
     ASSERT_NOT_NULL(resp);
     /* In compact mode, "name" should NOT appear as a separate key when
@@ -1609,7 +1627,7 @@ TEST(pagerank_output_has_limited_precision) {
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
-    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"project\":\"_tc_pr_precision_\",\"sort_by\":\"relevance\",\"limit\":2}");
     ASSERT_NOT_NULL(resp);
     /* Pagerank values should NOT have more than ~8 characters (e.g. "4.72e-05")
@@ -1686,7 +1704,7 @@ TEST(search_exclude_filters_file_paths) {
     ASSERT_NOT_NULL(srv);
 
     /* Without exclude: should find all 3 */
-    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"project\":\"_tc_exclude_test_\",\"limit\":10}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "core_fn"));
@@ -1695,7 +1713,7 @@ TEST(search_exclude_filters_file_paths) {
     free(resp);
 
     /* With exclude: should filter out tests and scripts */
-    resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+    resp = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"project\":\"_tc_exclude_test_\",\"limit\":10,"
         "\"exclude\":[\"tests/**\",\"scripts/**\"]}");
     ASSERT_NOT_NULL(resp);
@@ -1725,7 +1743,7 @@ TEST(search_exclude_empty_array_no_effect) {
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
-    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"project\":\"_tc_excl_empty_\",\"limit\":10,\"exclude\":[]}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "fn1"));
@@ -1752,7 +1770,7 @@ TEST(search_exclude_all_returns_empty) {
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
-    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"project\":\"_tc_excl_all_\",\"limit\":10,\"exclude\":[\"**\"]}");
     ASSERT_NOT_NULL(resp);
     /* Should not contain fn1 (it was excluded) and should not be an error */
@@ -1772,7 +1790,7 @@ TEST(exclude_param_in_tool_schema) {
     ASSERT_NOT_NULL(srv);
     char *tools = cbm_mcp_tools_list(srv);
     ASSERT_NOT_NULL(tools);
-    /* search_code_graph should have exclude */
+    /* §4b: search_graph (default surface) should have exclude */
     ASSERT_NOT_NULL(strstr(tools, "\"exclude\""));
     free(tools);
     cbm_mcp_server_free(srv);
@@ -1781,13 +1799,13 @@ TEST(exclude_param_in_tool_schema) {
 
 /* TDD: path_filter param (origin/main addition — fails before merge, passes after)
  * origin/main mcp.c:3522–3704 adds path_filter to handle_search_code().
- * After merge, search_code_graph schema must advertise path_filter parameter.
+ * After merge, search_code schema must advertise path_filter parameter.
  * Pre-merge: path_filter absent from schema → ASSERT fails (expected red).
  * Post-merge: path_filter present → ASSERT passes (expected green). */
 TEST(path_filter_param_in_tool_schema) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
-    /* tools/list returns the streamlined schema including search_code_graph */
+    /* §4b: tools/list returns the default surface including search_code */
     char *resp = cbm_mcp_server_handle(srv,
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
     ASSERT_NOT_NULL(resp);
@@ -1821,7 +1839,7 @@ TEST(project_missing_returns_structured_error) {
     PASS();
 }
 
-/* ── Bug fixes: search_code_graph mode/param sharp edges ───── */
+/* ── Bug fixes: search_code/search_graph mode/param sharp edges ─ */
 
 /* TDD Bug 1: case_sensitive=false must add -i to grep so uppercase patterns match lowercase.
  * Before fix: build_grep_cmd has no -i flag → HELLO_WORLD misses hello_world → FAIL.
@@ -1851,7 +1869,7 @@ TEST(source_grep_case_insensitive_by_default) {
     ASSERT_NOT_NULL(srv);
 
     /* grep for UPPERCASE pattern with case_sensitive=false (default) */
-    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *resp = cbm_mcp_handle_tool(srv, "search_code",
         "{\"search_in\":\"source\",\"pattern\":\"HELLO_WORLD\","
         "\"project\":\"_tc_ci_test_\",\"case_sensitive\":false}");
     ASSERT_NOT_NULL(resp);
@@ -1891,7 +1909,7 @@ TEST(source_grep_case_sensitive_flag_works) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
 
-    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *resp = cbm_mcp_handle_tool(srv, "search_code",
         "{\"search_in\":\"source\",\"pattern\":\"HELLO_WORLD\","
         "\"project\":\"_tc_cs_test_\",\"case_sensitive\":true}");
     ASSERT_NOT_NULL(resp);
@@ -1916,7 +1934,7 @@ TEST(graph_mode_compact_error_is_descriptive) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
     /* mode="compact" is valid in source grep but invalid in graph mode */
-    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph",
         "{\"mode\":\"compact\",\"label\":\"Function\"}");
     ASSERT_NOT_NULL(resp);
     /* Must return an error (not crash or silent wrong result) */
@@ -1956,7 +1974,7 @@ TEST(source_grep_mode_summary_warns) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
 
-    char *resp = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *resp = cbm_mcp_handle_tool(srv, "search_code",
         "{\"search_in\":\"source\",\"pattern\":\"foo\","
         "\"project\":\"_tc_sm_test_\",\"mode\":\"summary\"}");
     ASSERT_NOT_NULL(resp);
@@ -1971,22 +1989,20 @@ TEST(source_grep_mode_summary_warns) {
     PASS();
 }
 
-/* TDD Bug 4: schema must document compact as graph-mode-only.
- * Before fix: compact description has no mention of graph vs source distinction.
- * After fix: compact description says "graph mode only". */
+/* TDD Bug 4 (revised for §4b): the split-tool surface eliminates the graph-vs-source
+ * "compact" mode collision that motivated the original "graph mode only" schema note.
+ * search_graph owns the compact boolean; search_code uses a mode string and has no
+ * compact boolean. Verify that post-§4b the compact param lives only on search_graph. */
 TEST(schema_compact_documented_as_graph_only) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
     char *resp = cbm_mcp_server_handle(srv,
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
     ASSERT_NOT_NULL(resp);
-    /* The compact param description must mention it is graph-mode only */
-    /* Look for "graph" near "compact" in the schema — a substring search is sufficient */
-    bool compact_has_graph_note =
-        strstr(resp, "graph mode only") != NULL ||
-        strstr(resp, "graph-mode only") != NULL ||
-        strstr(resp, "graph mode; use mode") != NULL;
-    ASSERT_TRUE(compact_has_graph_note);
+    /* search_graph schema must include a compact boolean param */
+    ASSERT_NOT_NULL(strstr(resp, "\"compact\""));
+    /* The mega-tool's "graph mode only" warning is gone (no collision after split).
+     * search_code has no compact boolean — it uses mode instead. */
     free(resp);
     cbm_mcp_server_free(srv);
     PASS();
@@ -2014,11 +2030,11 @@ SUITE(tool_consolidation) {
     /* MCP protocol conformance */
     RUN_TEST(all_tools_have_object_inputSchema);
     /* Tool visibility */
-    RUN_TEST(streamlined_mode_shows_3_tools);
+    RUN_TEST(streamlined_mode_shows_5_default_tools);
     RUN_TEST(classic_mode_shows_all_15_tools);
     /* Dispatch */
-    RUN_TEST(search_code_graph_structured_dispatch);
-    RUN_TEST(search_code_graph_cypher_dispatch);
+    RUN_TEST(search_graph_dispatch);
+    RUN_TEST(query_graph_dispatch);
     RUN_TEST(get_code_dispatch);
     RUN_TEST(old_tool_names_still_dispatch);
     /* Path support */

@@ -2646,7 +2646,7 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "0=disabled. 3600=hourly, 86400=daily, 604800=weekly. Runs on startup if stale."},
     /* ── Search ── */
     {"search_limit", "50", NULL, "Search",
-     "Default max results for search_code_graph",
+     "Default max results for search_graph/search_code",
      "1-100000",
      "Higher = more results but more tokens. Overridden by limit param per-query. "
      "50 is good for exploration; 200+ for exhaustive analysis."},
@@ -2675,17 +2675,17 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "important functions may not appear in the first 25. Lower to 10 when tokens are limited."},
     /* ── Tools ── */
     {"tool_mode", "streamlined", "CBM_TOOL_MODE", "Tools",
-     "Which set of tools the MCP server exposes: 3 combined tools or all 15 individual tools",
+     "Which set of tools the MCP server exposes: 5 default tools or all 15 individual tools",
      "streamlined|classic",
-     "'streamlined' (default): exposes search_code_graph (search+Cypher), trace_call_path, get_code. "
-     "'classic': exposes all 15 individual tools including index_repository, query_graph, get_architecture, "
+     "'streamlined' (default): exposes search_graph, query_graph, search_code, trace_call_path, get_code. "
+     "'classic': exposes all 15 individual tools including index_repository, get_code_snippet, get_architecture, "
      "list_projects, detect_changes, manage_adr, etc. "
      "You can also enable individual classic tools without switching modes: "
      "config set tool_index_repository true"},
     {"context_injection", "true", "CBM_CONTEXT_INJECTION", "Tools",
      "Inject codebase schema and stats into the first tool response so the AI starts informed",
      "true|false",
-     "When true (default), the first search_code_graph/search_graph response includes a "
+     "When true (default), the first search_graph response includes a "
      "_context object: node/edge counts, node labels, edge types, PageRank status, and "
      "detected language ecosystem. Delivered once per session; subsequent calls are unaffected. "
      "Why enable: the AI gets codebase structure upfront without needing to call "
@@ -2697,17 +2697,17 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "To disable for a session: export CBM_CONTEXT_INJECTION=false "
      "To disable by default: codebase-memory-mcp config set context_injection false"},
     {"compact", "true", "CBM_COMPACT", "Tools",
-     "Default compact output for search_code_graph, trace_call_path, and get_code",
+     "Default compact output for search_graph, trace_call_path, and get_code",
      "true|false",
      "true (default): omits name when equal to last qn segment, empty label/file, degree=0. "
      "Per-call compact= param overrides. false for programmatic output parsing."},
     {"default_sort_by", "relevance", NULL, "Tools",
-     "Default sort for search_code_graph when sort_by not specified",
+     "Default sort for search_graph when sort_by not specified",
      "relevance|name|degree|calls|linkrank",
      "relevance = PageRank structural importance. calls = most direct calls. "
      "Set 'calls' for call-density analysis workflows."},
     {"default_include_dependencies", "true", NULL, "Tools",
-     "Default include_dependencies for search_code_graph",
+     "Default include_dependencies for search_graph",
      "true|false",
      "false = restrict to project code only (exclude dep sub-projects). "
      "Set false for single-project focus workflows."},
