@@ -115,6 +115,16 @@ extern void cbm_kind_in_set_free_cache(void);
 int main(void) {
     printf("\n  codebase-memory-mcp  C test suite\n");
 
+    const char *only_suite = getenv("CBM_ONLY_SUITE");
+    if (only_suite && only_suite[0]) {
+        if (strstr("incremental", only_suite)) RUN_SUITE(incremental);
+        if (strstr("mcp", only_suite)) RUN_SUITE(mcp);
+        if (strstr("tool_consolidation", only_suite)) RUN_SUITE(tool_consolidation);
+        if (strstr("store_nodes", only_suite)) RUN_SUITE(store_nodes);
+        TEST_SUMMARY();
+        return 0;
+    }
+
     /* Foundation */
     RUN_SUITE(arena);
     RUN_SUITE(hash_table);
