@@ -30,6 +30,7 @@ enum {
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/pipeline.h"
 #include <stdint.h>
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
@@ -887,6 +888,172 @@ static void create_grpc_routes(cbm_gbuf_t *gb) {
     }
 }
 
+static bool route_node_extract_json_string(const char *json, const char *key, char *buf,
+                                           size_t bufsz) {
+    if (!json || !key || !buf || bufsz == 0) {
+        return false;
+    }
+    char pat[CBM_SZ_128];
+    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *start = strstr(json, pat);
+    if (!start) {
+        return false;
+    }
+    start += strlen(pat);
+    const char *end = strchr(start, '"');
+    if (!end || end == start) {
+        return false;
+    }
+    size_t len = (size_t)(end - start);
+    if (len >= bufsz) {
+        len = bufsz - SKIP_ONE;
+    }
+    memcpy(buf, start, len);
+    buf[len] = '\0';
+    return true;
+}
+
+static bool route_node_overpass_service_from_go_mod(const char *root, char *service,
+                                                    size_t service_sz) {
+    if (!root || !service || service_sz == 0) {
+        return false;
+    }
+    char path[CBM_SZ_512];
+    snprintf(path, sizeof(path), "%s/go.mod", root);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    char line[CBM_SZ_512];
+    bool ok = false;
+    while (fgets(line, sizeof(line), f)) {
+        char *p = strstr(line, "module ");
+        if (!p) {
+            continue;
+        }
+        p += strlen("module ");
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        const char *prefix = "code.byted.org/life/";
+        if (strncmp(p, prefix, strlen(prefix)) != 0) {
+            break;
+        }
+        p += strlen(prefix);
+        char *end = p;
+        while (*end && *end != '\n' && *end != '\r' && *end != ' ' && *end != '\t') {
+            end++;
+        }
+        size_t len = (size_t)(end - p);
+        if (len > 0 && len < service_sz) {
+            memcpy(service, p, len);
+            service[len] = '\0';
+            ok = true;
+        }
+        break;
+    }
+    fclose(f);
+    return ok;
+}
+
+static bool route_node_overpass_service_from_handler_import(const char *root, char *service,
+                                                            size_t service_sz) {
+    if (!root || !service || service_sz == 0) {
+        return false;
+    }
+    char path[CBM_SZ_512];
+    snprintf(path, sizeof(path), "%s/handler.go", root);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    char line[CBM_SZ_512];
+    bool ok = false;
+    const char *prefix = "code.byted.org/overpass/";
+    while (fgets(line, sizeof(line), f)) {
+        char *p = strstr(line, prefix);
+        if (!p || !strstr(p, "/kitex_gen/")) {
+            continue;
+        }
+        p += strlen(prefix);
+        char *end = strchr(p, '/');
+        if (!end || end == p) {
+            continue;
+        }
+        size_t len = (size_t)(end - p);
+        if (len > 0 && len < service_sz) {
+            memcpy(service, p, len);
+            service[len] = '\0';
+            ok = true;
+        }
+        break;
+    }
+    fclose(f);
+    return ok;
+}
+
+/* Create gRPC Route nodes for ByteDance Kitex/Overpass handler methods.
+ * Client packages call code.byted.org/overpass/<service>/rpc/<service>.RawCall.Method.
+ * Server repos usually implement methods on *<Service>Impl in handler.go. */
+static void create_overpass_handler_routes(cbm_gbuf_t *gb) {
+    char service[CBM_SZ_256] = {0};
+    if (!route_node_overpass_service_from_handler_import(cbm_gbuf_root_path(gb), service,
+                                                         sizeof(service)) &&
+        !route_node_overpass_service_from_go_mod(cbm_gbuf_root_path(gb), service,
+                                                 sizeof(service))) {
+        return;
+    }
+
+    const cbm_gbuf_node_t **methods = NULL;
+    int method_count = 0;
+    if (cbm_gbuf_find_by_label(gb, "Method", &methods, &method_count) != 0 || method_count == 0) {
+        return;
+    }
+
+    int routes = 0;
+    for (int i = 0; i < method_count; i++) {
+        const cbm_gbuf_node_t *m = methods[i];
+        if (!m->file_path || !m->name || !m->properties_json) {
+            continue;
+        }
+        if (strcmp(m->file_path, "handler.go") != 0 && !strstr(m->file_path, "/handler.go")) {
+            continue;
+        }
+        char parent[CBM_SZ_512];
+        if (!route_node_extract_json_string(m->properties_json, "parent_class", parent,
+                                            sizeof(parent))) {
+            continue;
+        }
+        if (!strstr(parent, "ServiceImpl")) {
+            continue;
+        }
+
+        char route_qn[CBM_ROUTE_QN_SIZE];
+        snprintf(route_qn, sizeof(route_qn), "__grpc__%s/%s", service, m->name);
+
+        char route_name[CBM_SZ_256];
+        snprintf(route_name, sizeof(route_name), "%s/%s", service, m->name);
+
+        char props[CBM_SZ_256];
+        snprintf(props, sizeof(props), "{\"source\":\"overpass\",\"service\":\"%s\"}", service);
+
+        int64_t route_id =
+            cbm_gbuf_upsert_node(gb, "Route", route_name, route_qn, m->file_path, m->start_line,
+                                 m->end_line, props);
+
+        char hprops[CBM_SZ_512];
+        snprintf(hprops, sizeof(hprops), "{\"via\":\"overpass_handler\",\"service\":\"%s\"}",
+                 service);
+        cbm_gbuf_insert_edge(gb, m->id, route_id, "HANDLES", hprops);
+        routes++;
+    }
+    if (routes > 0) {
+        char buf[CBM_SZ_16];
+        snprintf(buf, sizeof(buf), "%d", routes);
+        cbm_log_info("pass.route_nodes.overpass", "routes", buf);
+    }
+}
+
 /* Phase 3: Create DATA_FLOWS edges by linking callers through Route to handlers. */
 static void create_data_flows(cbm_gbuf_t *gb) {
     const cbm_gbuf_node_t **routes = NULL;
@@ -1223,6 +1390,7 @@ void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb) {
      * Scans Class nodes from .proto files, follows DEFINES_METHOD edges
      * to find rpc methods, creates __grpc__ServiceName/MethodName Route nodes. */
     create_grpc_routes(gb);
+    create_overpass_handler_routes(gb);
 
     /* Phase 5: filesystem-based SvelteKit routes (+server / +page.server /
      * +layout.server) — no call-site equivalent for pass_calls.c to pick

@@ -93,6 +93,9 @@ int cbm_gbuf_find_by_name(const cbm_gbuf_t *gb, const char *name, const cbm_gbuf
 /* Count total nodes in buffer. */
 int cbm_gbuf_node_count(const cbm_gbuf_t *gb);
 
+/* Return the root path associated with this graph buffer. Borrowed string. */
+const char *cbm_gbuf_root_path(const cbm_gbuf_t *gb);
+
 /* Get the next ID that would be assigned. Used to initialize shared atomic counters. */
 int64_t cbm_gbuf_next_id(const cbm_gbuf_t *gb);
 

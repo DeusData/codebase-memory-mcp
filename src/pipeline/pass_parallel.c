@@ -1473,6 +1473,138 @@ bool extract_grpc_service_method(const char *callee, char *service, size_t srv_s
     return stripped && service[0] && method[0];
 }
 
+static bool extract_overpass_service_name(const char *import_qn, char *service, size_t srv_sz) {
+    const char *prefix = "code.byted.org/overpass/";
+    const char *p = strstr(import_qn ? import_qn : "", prefix);
+    if (!p) {
+        return false;
+    }
+    p += strlen(prefix);
+    const char *end = strchr(p, '/');
+    if (!end || end == p) {
+        return false;
+    }
+    size_t len = (size_t)(end - p);
+    if (len >= srv_sz) {
+        len = srv_sz - SKIP_ONE;
+    }
+    memcpy(service, p, len);
+    service[len] = '\0';
+    return service[0] != '\0';
+}
+
+static bool extract_overpass_rawcall_method(const char *callee, const char **imp_keys,
+                                            const char **imp_vals, int imp_count, char *service,
+                                            size_t srv_sz, char *method, size_t meth_sz) {
+    service[0] = '\0';
+    method[0] = '\0';
+    const char *rawcall = strstr(callee ? callee : "", ".RawCall.");
+    if (!rawcall || !rawcall[SKIP_ONE + 7]) {
+        return false;
+    }
+    size_t alias_len = (size_t)(rawcall - callee);
+    if (alias_len == 0 || alias_len >= CBM_SZ_128) {
+        return false;
+    }
+    char alias[CBM_SZ_128];
+    memcpy(alias, callee, alias_len);
+    alias[alias_len] = '\0';
+
+    snprintf(method, meth_sz, "%s", rawcall + strlen(".RawCall."));
+    char *dot = strchr(method, '.');
+    if (dot) {
+        *dot = '\0';
+    }
+    if (!method[0]) {
+        return false;
+    }
+
+    for (int i = 0; i < imp_count; i++) {
+        if (!imp_keys[i] || !imp_vals[i] || strcmp(imp_keys[i], alias) != 0) {
+            continue;
+        }
+        if (!strstr(imp_vals[i], "code.byted.org/overpass/") || !strstr(imp_vals[i], "/rpc/")) {
+            continue;
+        }
+        return extract_overpass_service_name(imp_vals[i], service, srv_sz);
+    }
+    return false;
+}
+
+static bool extract_overpass_rawcall_method_from_imports(const char *callee,
+                                                         const CBMImportArray *imports,
+                                                         char *service, size_t srv_sz,
+                                                         char *method, size_t meth_sz) {
+    service[0] = '\0';
+    method[0] = '\0';
+    const char *rawcall = strstr(callee ? callee : "", ".RawCall.");
+    if (!rawcall || !rawcall[SKIP_ONE + 7]) {
+        return false;
+    }
+    size_t alias_len = (size_t)(rawcall - callee);
+    if (alias_len == 0 || alias_len >= CBM_SZ_128) {
+        return false;
+    }
+    char alias[CBM_SZ_128];
+    memcpy(alias, callee, alias_len);
+    alias[alias_len] = '\0';
+
+    snprintf(method, meth_sz, "%s", rawcall + strlen(".RawCall."));
+    char *dot = strchr(method, '.');
+    if (dot) {
+        *dot = '\0';
+    }
+    if (!method[0] || !imports) {
+        return false;
+    }
+
+    for (int i = 0; i < imports->count; i++) {
+        const CBMImport *imp = &imports->items[i];
+        if (!imp->local_name || !imp->module_path || strcmp(imp->local_name, alias) != 0) {
+            continue;
+        }
+        if (!strstr(imp->module_path, "code.byted.org/overpass/") ||
+            !strstr(imp->module_path, "/rpc/")) {
+            continue;
+        }
+        return extract_overpass_service_name(imp->module_path, service, srv_sz);
+    }
+    return false;
+}
+
+static bool emit_overpass_grpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
+                                    const CBMCall *call, const char **imp_keys,
+                                    const char **imp_vals, int imp_count,
+                                    const CBMImportArray *raw_imports) {
+    char service[CBM_SZ_256];
+    char method[CBM_SZ_256];
+    if (!extract_overpass_rawcall_method(call->callee_name, imp_keys, imp_vals, imp_count, service,
+                                         sizeof(service), method, sizeof(method)) &&
+        !extract_overpass_rawcall_method_from_imports(call->callee_name, raw_imports, service,
+                                                      sizeof(service), method, sizeof(method))) {
+        return false;
+    }
+
+    char route_qn[CBM_SZ_512];
+    snprintf(route_qn, sizeof(route_qn), "__grpc__%s/%s", service, method);
+
+    char route_name[CBM_SZ_256];
+    snprintf(route_name, sizeof(route_name), "%s/%s", service, method);
+
+    int64_t route_id = cbm_gbuf_upsert_node(gbuf, "Route", route_name, route_qn, "", 0, 0,
+                                            "{\"source\":\"overpass\"}");
+
+    char esc_c[CBM_SZ_256];
+    cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
+    char props[CBM_SZ_1K];
+    snprintf(props, sizeof(props),
+             "{\"callee\":\"%s\",\"service\":\"%s\",\"method\":\"%s\",\"source\":\"overpass\","
+             "\"confidence\":%.2f}",
+             esc_c, service, method, 0.95);
+    cbm_gbuf_insert_edge(gbuf, source->id, route_id, "GRPC_CALLS", props);
+    return true;
+}
+
 /* Emit GRPC_CALLS edge via gRPC Route node. */
 static void emit_grpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
                            const cbm_resolution_t *res) {
@@ -1838,6 +1970,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * Gated to Perl — other languages are unaffected. */
         if (cbm_perl_suppress_generic_match(lang == CBM_LANG_PERL, call->is_method,
                                             call->callee_name, res.strategy)) {
+            continue;
+        }
+
+        if (emit_overpass_grpc_edge(ws->local_edge_buf, source_node, call, imp_keys, imp_vals,
+                                    imp_count, &result->imports)) {
             continue;
         }
 

@@ -683,6 +683,10 @@ int cbm_gbuf_node_count(const cbm_gbuf_t *gb) {
     return gb ? (int)cbm_ht_count(gb->node_by_qn) : 0;
 }
 
+const char *cbm_gbuf_root_path(const cbm_gbuf_t *gb) {
+    return gb ? gb->root_path : "";
+}
+
 int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label) {
     if (!gb || !label) {
         return CBM_NOT_FOUND;
