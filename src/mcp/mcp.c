@@ -1563,7 +1563,7 @@ static project_expand_t expand_project_param(cbm_mcp_server_t *srv, char *raw) {
     if (!raw) return r;
 
     /* Rule 0: Path detection — convert paths to project names.
-     * Enables: search_code_graph(project="/path/to/repo") */
+     * Enables: search_graph(project="/path/to/repo") */
     if (project_is_path(raw)) {
         char *resolved = realpath(raw, NULL);
         const char *path = resolved ? resolved : raw;
@@ -2660,14 +2660,14 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
              * Graph mode uses a different mode enum: full | summary.
              * To use compact output with graph mode, pass compact=true (a boolean param). */
             snprintf(errbuf, sizeof(errbuf),
-                "{\"error\":\"mode '%s' is only valid for source grep (search_in='source'), not graph mode\","
+                "{\"error\":\"mode '%s' is only valid for the search_code tool (source grep), not search_graph\","
                 "\"hint\":\"For graph mode use mode='full' or mode='summary'. "
                 "To reduce token output in graph mode, pass compact=true (boolean).\"}", search_mode);
         } else {
             snprintf(errbuf, sizeof(errbuf),
                 "{\"error\":\"invalid mode '%s'\","
                 "\"hint\":\"Valid values for graph mode: full, summary. "
-                "For source grep mode (search_in='source'): compact, full, files.\"}", search_mode);
+                "For source grep, use the search_code tool (modes: compact, full, files).\"}", search_mode);
         }
         free(label); free(name_pattern); free(qn_pattern); free(unified_pattern);
         free(file_pattern); free(relationship); free(sort_by); free(search_mode); free(pe.value);
@@ -4722,7 +4722,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     /* When no project param given, try to parse the project prefix from the
      * qualified name by checking for a matching .db file.  This is Option C:
      * the QN is self-describing, so we can always open the right store even on
-     * a cold start (no prior search_code_graph call).
+     * a cold start (no prior search_graph call).
      * Falls back to the currently-open store's project as a secondary option. */
     const char *eff_project = project;
     if (!eff_project && qn) {
@@ -4749,7 +4749,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result(
             "{\"error\":\"qualified_name is required\","
             "\"hint\":\"Pass a symbol qualified name, e.g. {\\\"qualified_name\\\":\\\"myapp.src.main.handle_request\\\"}. "
-            "Use search_code_graph to find qualified names.\"}", true);
+            "Use search_graph to find qualified names.\"}", true);
     }
 
     REQUIRE_STORE_EX(store, project, (free(qn), free(snippet_mode), qn = NULL, snippet_mode = NULL));
@@ -4920,7 +4920,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         char errbuf[512];
         snprintf(errbuf, sizeof(errbuf),
             "{\"error\":\"symbol not found: '%s'\","
-            "\"hint\":\"Use search_graph (or search_code_graph in streamlined mode) with name_pattern to find the correct qualified_name.\"}", qn);
+            "\"hint\":\"Use search_graph with name_pattern to find the correct qualified_name.\"}", qn);
         free(qn);
         free(project);
         free(snippet_mode);
@@ -6362,9 +6362,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     /* _hidden_tools: informational pseudo-tool for progressive disclosure */
     if (strcmp(tool_name, "_hidden_tools") == 0) {
         return cbm_mcp_text_result(
-            "{\"hidden_tools\":[\"index_repository\",\"search_graph\",\"query_graph\","
-            "\"get_code_snippet\",\"get_graph_schema\",\"get_architecture\",\"search_code\","
-            "\"list_projects\",\"delete_project\",\"index_status\",\"detect_changes\","
+            "{\"hidden_tools\":[\"index_repository\",\"get_code_snippet\","
+            "\"get_graph_schema\",\"get_architecture\",\"list_projects\","
+            "\"delete_project\",\"index_status\",\"detect_changes\","
             "\"manage_adr\",\"ingest_traces\",\"index_dependencies\"],"
             "\"enable_all\":\"set env CBM_TOOL_MODE=classic or config set tool_mode classic\","
             "\"enable_one\":\"config set tool_<name> true (e.g. tool_index_repository true)\","
