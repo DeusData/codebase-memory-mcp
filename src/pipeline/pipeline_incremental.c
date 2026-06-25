@@ -455,6 +455,12 @@ static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_inf
     int current_failed = 0;
     int ms_failed = 0;
 
+    /* Batch all hash upserts in one transaction: N files -> 1 COMMIT under
+     * WAL instead of N autocommit fsyncs (a 10k-file reindex did 10k separate
+     * commits). If BEGIN fails (e.g. store busy), fall back to per-row
+     * autocommit. The partial-failure policy below is unchanged. */
+    bool batched = (cbm_store_begin(store) == CBM_STORE_OK);
+
     /* Current discovery: re-stat to capture any mtime/size that changed
      * during the run, and write fresh hash rows for visited files. */
     for (int i = 0; i < file_count; i++) {
@@ -496,6 +502,10 @@ static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_inf
                 ms_failed++;
             }
         }
+    }
+
+    if (batched) {
+        (void)cbm_store_commit(store);
     }
 
     if (current_failed > 0 || ms_failed > 0) {
