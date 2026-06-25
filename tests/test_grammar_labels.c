@@ -183,7 +183,7 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"toml", "Class:1,Module:1,Variable:1"},
     {"ini", "Class:1,Module:1,Variable:1"},
     {"csv", "Module:1"},
-    {"sql", "Module:1,Variable:1"},
+    {"sql", "Module:1,Table:1"},
     {"xml", "Class:2,Module:1"},
     {"html", "Module:1"},
     {"css", "Module:1"},

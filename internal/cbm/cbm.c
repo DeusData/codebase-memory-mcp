@@ -588,6 +588,9 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
     cbm_extract_imports(&ctx);
     cbm_extract_unified(&ctx);
 
+    // dbt Jinja: lineage (ref/source) + macro defs from raw templated .sql models.
+    cbm_extract_dbt_jinja(&ctx);
+
     // Channel detection (Socket.IO / EventEmitter) — JS/TS only.
     cbm_extract_channels(&ctx);
 

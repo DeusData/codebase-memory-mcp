@@ -826,7 +826,9 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
      * Variable/Field defs are registered too so READS/WRITES can resolve. */
     if (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
         strcmp(def->label, "Class") == 0 || strcmp(def->label, "Interface") == 0 ||
-        strcmp(def->label, "Variable") == 0 || strcmp(def->label, "Field") == 0) {
+        strcmp(def->label, "Variable") == 0 || strcmp(def->label, "Field") == 0 ||
+        strcmp(def->label, "Table") == 0 || strcmp(def->label, "View") == 0 ||
+        strcmp(def->label, "Model") == 0) {
         cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
         (*reg_entries)++;
     }

@@ -303,7 +303,9 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     if (node_id > 0 && def->label &&
         (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
          strcmp(def->label, "Class") == 0 || strcmp(def->label, "Interface") == 0 ||
-         strcmp(def->label, "Variable") == 0 || strcmp(def->label, "Field") == 0)) {
+         strcmp(def->label, "Variable") == 0 || strcmp(def->label, "Field") == 0 ||
+         strcmp(def->label, "Table") == 0 || strcmp(def->label, "View") == 0 ||
+         strcmp(def->label, "Model") == 0)) {
         cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");

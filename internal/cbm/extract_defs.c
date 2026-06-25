@@ -257,12 +257,31 @@ static TSNode resolve_ocaml_func_name(TSNode node) {
     return null_node;
 }
 
-// SQL: resolve create_function name from object_reference→identifier or direct identifier.
+// Last identifier (DFS pre-order) under `node`. For a schema-qualified
+// object_reference (schema.table) this is the table name; the schema prefix is
+// ignored. Leaves *found false and returns `best` unchanged if none is present.
+static TSNode sql_last_identifier(TSNode node, TSNode best, bool *found) {
+    if (strcmp(ts_node_type(node), "identifier") == 0) {
+        best = node;
+        *found = true;
+    }
+    uint32_t cc = ts_node_child_count(node);
+    for (uint32_t i = 0; i < cc; i++) {
+        best = sql_last_identifier(ts_node_child(node, i), best, found);
+    }
+    return best;
+}
+
+// SQL: resolve create_function / create_table / create_view name. The name sits
+// on an object_reference; for a schema-qualified name (schema.table) take the
+// last identifier (the table), not the first (the schema).
 static TSNode resolve_sql_func_name(TSNode node) {
     TSNode obj_ref = cbm_find_child_by_kind(node, "object_reference");
     if (!ts_node_is_null(obj_ref)) {
-        TSNode id = cbm_find_child_by_kind(obj_ref, "identifier");
-        if (!ts_node_is_null(id)) {
+        bool found = false;
+        TSNode empty = {0};
+        TSNode id = sql_last_identifier(obj_ref, empty, &found);
+        if (found) {
             return id;
         }
     }
@@ -2976,11 +2995,70 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
     return true;
 }
 
+// Collect FROM/JOIN table references (tree-sitter-sql `relation` nodes) anywhere
+// under `node` and emit them as usages scoped to enclosing_qn. pass_usages then
+// resolves each ref_name to the referenced Table/View def and creates a USAGE
+// lineage edge (e.g. a view -> the tables it selects from). Emitting them here
+// (rather than via the generic identifier walker) sets the correct enclosing
+// scope and bypasses the is_definition_name suppression that drops them.
+static void collect_sql_relation_usages(CBMExtractCtx *ctx, TSNode node, const char *enclosing_qn) {
+    if (strcmp(ts_node_type(node), "relation") == 0) {
+        TSNode nm = resolve_sql_func_name(node); // object_reference -> identifier
+        if (!ts_node_is_null(nm)) {
+            char *tname = cbm_node_text(ctx->arena, nm, ctx->source);
+            if (tname && tname[0]) {
+                CBMUsage usage;
+                usage.ref_name = tname;
+                usage.enclosing_func_qn = enclosing_qn;
+                cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
+            }
+        }
+    }
+    uint32_t n = ts_node_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        collect_sql_relation_usages(ctx, ts_node_child(node, i), enclosing_qn);
+    }
+}
+
+// Handle SQL DDL relation defs: CREATE TABLE / VIEW / MATERIALIZED VIEW become
+// first-class Table/View nodes rather than generic Variable nodes. The relation
+// name sits on an object_reference child (the same shape create_function uses),
+// so resolve_sql_func_name locates it. Also emits FROM/JOIN dependencies as
+// usages so lineage edges form. Returns true if handled.
+static bool extract_sql_ddl_class_def(CBMExtractCtx *ctx, TSNode node, const char *kind) {
+    if (ctx->language != CBM_LANG_SQL) {
+        return false;
+    }
+    const char *label;
+    if (strcmp(kind, "create_table") == 0) {
+        label = "Table";
+    } else if (strcmp(kind, "create_view") == 0 || strcmp(kind, "create_materialized_view") == 0) {
+        label = "View";
+    } else {
+        return false;
+    }
+    TSNode name_node = resolve_sql_func_name(node);
+    if (ts_node_is_null(name_node)) {
+        return false;
+    }
+    char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
+    if (!name || !name[0]) {
+        return false;
+    }
+    push_simple_class_def(ctx, node, name, label);
+    const char *qn = cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+    collect_sql_relation_usages(ctx, node, qn);
+    return true;
+}
+
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
     const char *kind = ts_node_type(node);
 
     if (extract_config_class_def(ctx, node, kind)) {
+        return;
+    }
+    if (extract_sql_ddl_class_def(ctx, node, kind)) {
         return;
     }
 
@@ -5497,4 +5575,245 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
 
     // Extract module-level variables
     extract_variables(ctx, ctx->root, spec);
+}
+
+// ============================ dbt Jinja extraction ============================
+// dbt models/macros are Jinja-templated .sql. The vendored tree-sitter-jinja2
+// grammar parses {{ ... }} expressions but treats {% ... %} statements as opaque
+// text, so the two dbt constructs are recovered differently:
+//   - {{ ref('m') }} / {{ source('s','t') }} are extracted via tree-sitter as
+//     lineage usages (ref_name = the referenced model/table); pass_usages then
+//     resolves each to a matching Model node and emits a lineage edge.
+//   - {% macro name(...) %} defs are recovered with a small text scan, since the
+//     grammar does not model the {% %} statement block.
+// This runs as an additive pass over raw (uncompiled) .sql, complementing the
+// authoritative compiled-manifest path (the ingest_dbt_manifest MCP tool).
+
+// True if the source contains any Jinja delimiter ({{ or {%).
+static bool source_has_jinja(const char *s, int len) {
+    for (int i = 0; i + 1 < len; i++) {
+        if (s[i] == '{' && (s[i + 1] == '{' || s[i + 1] == '%')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Strip a single pair of surrounding ' or " quotes from a jinja lit_string text.
+static char *jinja_unquote(CBMArena *a, char *s) {
+    if (!s) {
+        return NULL;
+    }
+    size_t n = strlen(s);
+    if (n >= 2 && (s[0] == '\'' || s[0] == '"') && s[n - 1] == s[0]) {
+        char *inner = cbm_arena_strdup(a, s + 1);
+        size_t m = strlen(inner);
+        if (m > 0) {
+            inner[m - 1] = '\0';
+        }
+        return inner;
+    }
+    return s;
+}
+
+// Return the last (rightmost) lit_string under `node` in DFS order. For a
+// fn_call this is the final string argument: ref('pkg','model') -> 'model',
+// source('src','tbl') -> 'tbl'. The function name is an identifier, never a
+// lit_string, so it is not picked up.
+static TSNode jinja_last_lit_string(TSNode node, TSNode best, bool *found) {
+    if (strcmp(ts_node_type(node), "lit_string") == 0) {
+        best = node;
+        *found = true;
+    }
+    uint32_t cc = ts_node_child_count(node);
+    for (uint32_t i = 0; i < cc; i++) {
+        best = jinja_last_lit_string(ts_node_child(node, i), best, found);
+    }
+    return best;
+}
+
+// Walk a jinja2 AST; emit ref()/source() calls as usages scoped to enclosing_qn.
+static void collect_jinja_ref_usages(CBMExtractCtx *ctx, TSNode node, const char *enclosing_qn) {
+    if (strcmp(ts_node_type(node), "fn_call") == 0) {
+        TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("fn_name"));
+        if (ts_node_is_null(fn)) {
+            fn = cbm_find_child_by_kind(node, "identifier");
+        }
+        if (!ts_node_is_null(fn)) {
+            char *fname = cbm_node_text(ctx->arena, fn, ctx->source);
+            if (fname && (strcmp(fname, "ref") == 0 || strcmp(fname, "source") == 0)) {
+                bool found = false;
+                TSNode empty = {0};
+                TSNode strn = jinja_last_lit_string(node, empty, &found);
+                if (found) {
+                    char *name =
+                        jinja_unquote(ctx->arena, cbm_node_text(ctx->arena, strn, ctx->source));
+                    if (name && name[0]) {
+                        CBMUsage usage;
+                        usage.ref_name = name;
+                        usage.enclosing_func_qn = enclosing_qn;
+                        cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
+                    }
+                }
+            }
+        }
+    }
+    uint32_t cc = ts_node_child_count(node);
+    for (uint32_t i = 0; i < cc; i++) {
+        collect_jinja_ref_usages(ctx, ts_node_child(node, i), enclosing_qn);
+    }
+}
+
+// Recover {% macro NAME(...) %} definitions via a text scan and push them as
+// Macro defs. Returns the count (used to tell a macro library from a model).
+static int scan_jinja_macro_defs(CBMExtractCtx *ctx) {
+    const char *src = ctx->source;
+    int len = ctx->source_len;
+    int line = FIRST_LINE;
+    int found = 0;
+    for (int i = 0; i < len; i++) {
+        if (src[i] == '\n') {
+            line++;
+            continue;
+        }
+        if (src[i] != '{' || i + 1 >= len || src[i + 1] != '%') {
+            continue;
+        }
+        int j = i + 2;
+        if (j < len && src[j] == '-') { // whitespace-control {%-
+            j++;
+        }
+        while (j < len && (src[j] == ' ' || src[j] == '\t')) {
+            j++;
+        }
+        enum { MACRO_KW = 5 };
+        if (j + MACRO_KW > len || strncmp(src + j, "macro", MACRO_KW) != 0) {
+            continue;
+        }
+        char after = (j + MACRO_KW < len) ? src[j + MACRO_KW] : ' ';
+        if (after != ' ' && after != '\t') {
+            continue; // "macroX" is an identifier, not the macro keyword
+        }
+        j += MACRO_KW;
+        while (j < len && (src[j] == ' ' || src[j] == '\t')) {
+            j++;
+        }
+        int start = j;
+        while (j < len && (isalnum((unsigned char)src[j]) || src[j] == '_')) {
+            j++;
+        }
+        if (j <= start) {
+            continue;
+        }
+        enum { NAME_CAP = 128 };
+        char name[NAME_CAP];
+        int nlen = j - start;
+        if (nlen >= NAME_CAP) {
+            nlen = NAME_CAP - 1;
+        }
+        memcpy(name, src + start, (size_t)nlen);
+        name[nlen] = '\0';
+
+        CBMDefinition def;
+        memset(&def, 0, sizeof(def));
+        def.name = cbm_arena_strdup(ctx->arena, name);
+        def.qualified_name = cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, def.name);
+        def.label = "Macro";
+        def.file_path = ctx->rel_path;
+        def.start_line = (uint32_t)line;
+        def.end_line = (uint32_t)line;
+        def.is_exported = true;
+        cbm_defs_push(&ctx->result->defs, ctx->arena, def);
+        found++;
+    }
+    return found;
+}
+
+// dbt resource name from a file path: basename with the extension removed
+// (dbt model/macro name = filename stem, e.g. models/stg_users.sql -> stg_users).
+static char *dbt_name_from_path(CBMArena *a, const char *rel_path) {
+    if (!rel_path) {
+        return NULL;
+    }
+    const char *base = rel_path;
+    for (const char *p = rel_path; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            base = p + 1;
+        }
+    }
+    const char *dot = NULL;
+    for (const char *p = base; *p; p++) {
+        if (*p == '.') {
+            dot = p;
+        }
+    }
+    size_t n = dot ? (size_t)(dot - base) : strlen(base);
+    if (n == 0) {
+        return NULL;
+    }
+    char *out = cbm_arena_strdup(a, base);
+    out[n] = '\0';
+    return out;
+}
+
+void cbm_extract_dbt_jinja(CBMExtractCtx *ctx) {
+    bool is_jinja = (ctx->language == CBM_LANG_JINJA2);
+    bool is_sql = (ctx->language == CBM_LANG_SQL);
+    if (!is_jinja && !is_sql) {
+        return;
+    }
+    if (is_sql && !source_has_jinja(ctx->source, ctx->source_len)) {
+        return; // plain SQL — nothing dbt-templated to do
+    }
+
+    // {% macro %} defs. A file that defines macros is a macro library, not a model.
+    int macro_count = scan_jinja_macro_defs(ctx);
+
+    // A dbt model is a .sql file (the SQL host path). For such a model (not a
+    // macro library), emit a name-addressable Model node so that
+    // {{ ref('this_model') }} in other files resolves to it. A plain Jinja
+    // template (.jinja/.j2 -> CBM_LANG_JINJA2) is not a dbt model, so no Model
+    // node is emitted there.
+    const char *enclosing_qn = ctx->module_qn;
+    if (is_sql && macro_count == 0) {
+        char *model_name = dbt_name_from_path(ctx->arena, ctx->rel_path);
+        if (model_name && model_name[0]) {
+            CBMDefinition def;
+            memset(&def, 0, sizeof(def));
+            def.name = model_name;
+            def.qualified_name =
+                cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, model_name);
+            def.label = "Model";
+            def.file_path = ctx->rel_path;
+            def.start_line = FIRST_LINE;
+            def.end_line = ts_node_end_point(ctx->root).row + TS_LINE_OFFSET;
+            def.is_exported = true;
+            cbm_defs_push(&ctx->result->defs, ctx->arena, def);
+            enclosing_qn = def.qualified_name;
+        }
+    }
+
+    // {{ ref() }} / {{ source() }} lineage usages (tree-sitter).
+    if (is_jinja) {
+        collect_jinja_ref_usages(ctx, ctx->root, enclosing_qn);
+        return;
+    }
+    // SQL host: re-parse the file with the jinja2 grammar (a fresh parser so the
+    // thread-local SQL parser used for the primary pass is untouched).
+    const TSLanguage *jl = cbm_ts_language(CBM_LANG_JINJA2);
+    if (!jl) {
+        return;
+    }
+    TSParser *parser = ts_parser_new();
+    if (!parser) {
+        return;
+    }
+    if (ts_parser_set_language(parser, jl)) {
+        TSTree *tree = ts_parser_parse_string(parser, NULL, ctx->source, (uint32_t)ctx->source_len);
+        if (tree) {
+            collect_jinja_ref_usages(ctx, ts_tree_root_node(tree), enclosing_qn);
+            ts_tree_delete(tree);
+        }
+    }
+    ts_parser_delete(parser);
 }

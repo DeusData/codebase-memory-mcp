@@ -1408,6 +1408,115 @@ TEST(sql_function) {
     PASS();
 }
 
+TEST(sql_ddl_node_labels) {
+    CBMFileResult *r = extract("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);\n"
+                               "CREATE VIEW active_users AS SELECT * FROM users;\n",
+                               CBM_LANG_SQL, "t", "schema.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Table", "users"));
+    ASSERT(has_def(r, "View", "active_users"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sql_view_lineage_usages) {
+    /* A view's FROM/JOIN relations are emitted as usages (ref_name = table),
+     * which pass_usages later resolves into view -> table USAGE lineage edges. */
+    CBMFileResult *r = extract("CREATE TABLE users (id INTEGER);\n"
+                               "CREATE VIEW active_users AS SELECT * FROM users;\n",
+                               CBM_LANG_SQL, "t", "schema.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int found_users = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strcmp(r->usages.items[i].ref_name, "users") == 0) {
+            found_users = 1;
+        }
+    }
+    ASSERT(found_users);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sql_schema_qualified_name) {
+    /* schema-qualified DDL (schema.table) is named by the table, not the schema,
+     * and FROM schema.table resolves to that table for lineage. */
+    CBMFileResult *r = extract("CREATE TABLE app.users (id INTEGER);\n"
+                               "CREATE VIEW app.active AS SELECT * FROM app.users;\n",
+                               CBM_LANG_SQL, "t", "schema.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Table", "users"));
+    ASSERT(has_def(r, "View", "active"));
+    int found_users = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strcmp(r->usages.items[i].ref_name, "users") == 0) {
+            found_users = 1;
+        }
+    }
+    ASSERT(found_users);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dbt_jinja_macro_defs) {
+    /* {% macro %} blocks are recovered as Macro defs (the jinja2 grammar does
+     * not model {% %} statements, so a text scan handles them). */
+    CBMFileResult *r = extract("{% macro cents_to_dollars(column_name) %}\n"
+                               "  ({{ column_name }} / 100)\n"
+                               "{% endmacro %}\n",
+                               CBM_LANG_JINJA2, "t", "macros/util.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT(has_def(r, "Macro", "cents_to_dollars"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dbt_jinja_ref_lineage) {
+    /* On the JINJA2 path, {{ ref('m') }} / {{ source('s','t') }} become usages
+     * (ref_name = the last string arg). No Model node here: a Model node is a
+     * dbt concept emitted only on the .sql (SQL host) path. */
+    CBMFileResult *r = extract("SELECT * FROM {{ ref('stg_users') }}\n"
+                               "JOIN {{ source('raw', 'events') }} USING (id)\n",
+                               CBM_LANG_JINJA2, "t", "models/dim_users.sql");
+    ASSERT_NOT_NULL(r);
+    int found_stg = 0, found_events = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        if (!r->usages.items[i].ref_name) {
+            continue;
+        }
+        if (strcmp(r->usages.items[i].ref_name, "stg_users") == 0) {
+            found_stg = 1;
+        }
+        if (strcmp(r->usages.items[i].ref_name, "events") == 0) {
+            found_events = 1;
+        }
+    }
+    ASSERT(found_stg);
+    ASSERT(found_events);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dbt_sql_ref_lineage) {
+    /* A .sql file (CBM_LANG_SQL) with Jinja triggers the additive second pass:
+     * the SQL grammar handles DDL while the jinja2 re-parse adds ref lineage. */
+    CBMFileResult *r = extract("SELECT id FROM {{ ref('stg_orders') }}\n", CBM_LANG_SQL, "t",
+                               "models/fct_orders.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT(has_def(r, "Model", "fct_orders"));
+    int found = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strcmp(r->usages.items[i].ref_name, "stg_orders") == 0) {
+            found = 1;
+        }
+    }
+    ASSERT(found);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Meson project --- */
 TEST(meson_project) {
     CBMFileResult *r = extract(
@@ -3143,6 +3252,12 @@ SUITE(extraction) {
     /* Config/Markup */
     RUN_TEST(html_elements);
     RUN_TEST(sql_function);
+    RUN_TEST(sql_ddl_node_labels);
+    RUN_TEST(sql_view_lineage_usages);
+    RUN_TEST(sql_schema_qualified_name);
+    RUN_TEST(dbt_jinja_macro_defs);
+    RUN_TEST(dbt_jinja_ref_lineage);
+    RUN_TEST(dbt_sql_ref_lineage);
     RUN_TEST(meson_project);
     RUN_TEST(css_rules);
     RUN_TEST(scss_rules);
