@@ -788,6 +788,7 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         free(db_path);
         return CBM_NOT_FOUND;
     }
+    bool was_corrupt = false;
     cbm_store_t *check_store = cbm_store_open_path(db_path);
     if (check_store && cbm_store_check_integrity(check_store)) {
         cbm_file_hash_t *hashes = NULL;
@@ -807,16 +808,44 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
                          itoa_buf(hash_count), "discovered", itoa_buf(file_count));
         }
     } else if (check_store) {
+        /* Integrity check failed — this is the data-loss path of #557. */
+        was_corrupt = true;
         cbm_store_close(check_store);
     }
-    cbm_log_info("pipeline.route", "path", "reindex", "action", "deleting old db");
-    cbm_unlink(db_path);
-    char wal[PL_WAL_BUF];
-    char shm[PL_WAL_BUF];
-    snprintf(wal, sizeof(wal), "%s-wal", db_path);
-    snprintf(shm, sizeof(shm), "%s-shm", db_path);
-    cbm_unlink(wal);
-    cbm_unlink(shm);
+    char wal_path[PL_WAL_BUF];
+    char shm_path[PL_WAL_BUF];
+    snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+    snprintf(shm_path, sizeof(shm_path), "%s-shm", db_path);
+    if (was_corrupt) {
+        /* Preserve the corrupt DB as .corrupt.<timestamp> instead of deleting,
+         * so the user can inspect/recover before the full reindex (#557).
+         * Only on real corruption — a healthy DB rebuilt due to a mode change
+         * is expected churn and must not accumulate .corrupt files. */
+        long long now_s = (long long)time(NULL);
+        char corrupt_db[PL_WAL_BUF];
+        char corrupt_wal[PL_WAL_BUF];
+        char corrupt_shm[PL_WAL_BUF];
+        snprintf(corrupt_db, sizeof(corrupt_db), "%s.corrupt.%lld", db_path, now_s);
+        snprintf(corrupt_wal, sizeof(corrupt_wal), "%s-wal.corrupt.%lld", db_path, now_s);
+        snprintf(corrupt_shm, sizeof(corrupt_shm), "%s-shm.corrupt.%lld", db_path, now_s);
+        if (rename(db_path, corrupt_db) != 0) {
+            cbm_unlink(db_path);
+        }
+        if (rename(wal_path, corrupt_wal) != 0) {
+            cbm_unlink(wal_path);
+        }
+        if (rename(shm_path, corrupt_shm) != 0) {
+            cbm_unlink(shm_path);
+        }
+        cbm_log_info("pipeline.route", "path", "reindex", "action", "corrupt db preserved",
+                     "preserved_as", corrupt_db);
+    } else {
+        /* Healthy DB being rebuilt (mode change / file-count drift) — delete. */
+        cbm_log_info("pipeline.route", "path", "reindex", "action", "deleting old db");
+        cbm_unlink(db_path);
+        cbm_unlink(wal_path);
+        cbm_unlink(shm_path);
+    }
     free(db_path);
     return CBM_NOT_FOUND;
 }

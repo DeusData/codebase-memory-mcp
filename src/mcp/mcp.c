@@ -789,20 +789,42 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     project_db_path(project, path, sizeof(path));
     srv->store = cbm_store_open_path_query(path);
     if (srv->store) {
-        /* Check DB integrity — auto-clean corrupt databases */
+        /* Check DB integrity — preserve corrupt databases instead of
+         * silently deleting them so the user can inspect the evidence and
+         * recover or report the issue (#557). Rename to .corrupt.<ts> so
+         * the path is obvious in the cache directory. */
         if (!cbm_store_check_integrity(srv->store)) {
-            cbm_log_error("store.auto_clean", "project", project, "path", path, "action",
-                          "deleting corrupt db — re-index required");
             cbm_store_close(srv->store);
             srv->store = NULL;
-            /* Delete the corrupt DB + WAL/SHM files */
-            cbm_unlink(path);
+            /* Rename the corrupt DB + WAL/SHM to preserve evidence */
             char wal_path[MCP_FIELD_SIZE];
             char shm_path[MCP_FIELD_SIZE];
+            char corrupt_path[MCP_FIELD_SIZE];
+            char corrupt_wal[MCP_FIELD_SIZE];
+            char corrupt_shm[MCP_FIELD_SIZE];
+            long long now_s = (long long)time(NULL);
             snprintf(wal_path, sizeof(wal_path), "%s-wal", path);
             snprintf(shm_path, sizeof(shm_path), "%s-shm", path);
-            cbm_unlink(wal_path);
-            cbm_unlink(shm_path);
+            snprintf(corrupt_path, sizeof(corrupt_path), "%s.corrupt.%lld", path, now_s);
+            snprintf(corrupt_wal, sizeof(corrupt_wal), "%s-wal.corrupt.%lld", path, now_s);
+            snprintf(corrupt_shm, sizeof(corrupt_shm), "%s-shm.corrupt.%lld", path, now_s);
+            if (rename(path, corrupt_path) != 0) {
+                cbm_unlink(path); /* fallback: delete if rename fails */
+            }
+            /* best-effort: sidecars may not exist */
+            if (rename(wal_path, corrupt_wal) != 0) {
+                cbm_unlink(wal_path);
+            }
+            if (rename(shm_path, corrupt_shm) != 0) {
+                cbm_unlink(shm_path);
+            }
+            cbm_log_error("store.auto_clean", "project", project, "path", path, "action",
+                          "corrupt db preserved", "preserved_as", corrupt_path);
+            (void)fprintf(stderr,
+                          "ERROR corrupt project database: %s\n"
+                          "ERROR   preserved as: %s\n"
+                          "ERROR   inspect the .corrupt file, delete it when done, and re-index.\n",
+                          path, corrupt_path);
             return NULL;
         }
 

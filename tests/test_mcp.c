@@ -9,6 +9,9 @@
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <yyjson/yyjson.h>
+#include <sqlite3.h> /* sqlite3_exec — corrupt-DB regression #557 */
+#include <dirent.h>  /* opendir/readdir — corrupt-DB regression #557 */
+#include <sys/stat.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -2209,6 +2212,86 @@ TEST(tool_bad_project_name_no_overflow_issue235) {
 }
 #undef ISSUE235_DBNAME
 
+/* Issue #557: a corrupt project DB must be PRESERVED (renamed to
+ * <name>.db.corrupt.<ts>), not silently unlink()'d. resolve_store()
+ * runs the integrity check on first query; a numeric root_path trips
+ * it (same trigger as store_integrity_corrupt_bad_path). After the
+ * query, the original .db must be gone but a .corrupt sidecar must
+ * exist so the user can inspect/recover. */
+TEST(resolve_store_preserves_corrupt_db_issue557) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-557-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS(); /* skip if mkdtemp fails */
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    /* Build a structurally-valid DB whose projects row is corrupt
+     * (numeric root_path), so cbm_store_check_integrity() returns false. */
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/regr557.db", cache);
+    cbm_store_t *seed = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(seed);
+    sqlite3_exec(cbm_store_get_db(seed),
+                 "INSERT INTO projects (name, indexed_at, root_path) "
+                 "VALUES ('regr557', '2024-01-01', '826');",
+                 NULL, NULL, NULL);
+    cbm_store_close(seed);
+
+    /* A query against the project triggers resolve_store → integrity check. */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":"
+             "\"search_graph\",\"arguments\":{\"label\":\"Function\","
+             "\"project\":\"regr557\"}}}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    /* The original DB must be gone (renamed, not left in place). */
+    struct stat st;
+    ASSERT_TRUE(stat(db_path, &st) != 0);
+
+    /* A <name>.db.corrupt.<ts> sidecar must have been created. */
+    bool found_corrupt = false;
+    DIR *d = opendir(cache);
+    ASSERT_NOT_NULL(d);
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strncmp(ent->d_name, "regr557.db.corrupt.", 19) == 0) {
+            found_corrupt = true;
+        }
+    }
+    closedir(d);
+    ASSERT_TRUE(found_corrupt);
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    /* Clean up any regr557.db* files left in the temp cache dir. */
+    DIR *cd = opendir(cache);
+    if (cd) {
+        struct dirent *e;
+        while ((e = readdir(cd)) != NULL) {
+            if (strncmp(e->d_name, "regr557.db", 10) == 0) {
+                char p[768];
+                snprintf(p, sizeof(p), "%s/%s", cache, e->d_name);
+                cbm_unlink(p);
+            }
+        }
+        closedir(cd);
+    }
+    cbm_rmdir(cache);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
@@ -2353,4 +2436,5 @@ SUITE(mcp) {
     RUN_TEST(snippet_include_neighbors_enabled);
     RUN_TEST(snippet_source_invalid_utf8);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
+    RUN_TEST(resolve_store_preserves_corrupt_db_issue557);
 }
