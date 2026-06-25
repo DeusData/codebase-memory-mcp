@@ -1592,7 +1592,7 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     snprintf(dir, sizeof(dir), "%s/.codex", tmpdir);
     test_mkdirp(dir);
 
-    char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp", false);
     ASSERT_NOT_NULL(json);
     ASSERT(strstr(json, "agent.install.plan.v1") != NULL);
     ASSERT(strstr(json, "writes_started") != NULL);

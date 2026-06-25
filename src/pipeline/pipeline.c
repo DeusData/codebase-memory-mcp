@@ -15,6 +15,7 @@
 enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, PL_WAL_BUF = 1040 };
 #define PL_NSEC_PER_SEC 1000000000LL
 #include "pipeline/pipeline.h"
+#include "pipeline/project_resolve.h"
 #include "pipeline/artifact.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h"
@@ -153,7 +154,8 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
 
     p->repo_path = strdup(repo_path);
     p->db_path = db_path ? strdup(db_path) : NULL;
-    p->project_name = cbm_project_name_from_path(repo_path);
+    char *existing = cbm_find_existing_project_name(repo_path);
+    p->project_name = existing ? existing : cbm_project_name_from_path(repo_path);
     (void)cbm_git_context_resolve(repo_path, &p->git_ctx);
     p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
     p->mode = mode;

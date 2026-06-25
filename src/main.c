@@ -30,7 +30,10 @@ enum {
     MAIN_MAX_PORT = 65536,
     PARENT_WATCHDOG_STACK_SIZE = 64 * CBM_SZ_1K, /* watchdog only polls — tiny stack suffices */
 };
-#define MAIN_RAM_FRACTION 0.5
+#define MAIN_RAM_FRACTION_DEFAULT 0.5
+#define MAIN_RAM_FRACTION_16GB 0.25
+#define MAIN_RAM_FRACTION_32GB 0.35
+#define MAIN_RAM_BYTES_PER_GB (1024ULL * 1024 * 1024)
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "foundation/log.h"
@@ -44,6 +47,17 @@ enum {
 #include "ui/http_server.h"
 #include "ui/embedded_assets.h"
 #include <yyjson/yyjson.h>
+
+static double main_ram_fraction(void) {
+    cbm_system_info_t info = cbm_system_info();
+    if (info.total_ram <= 16ULL * MAIN_RAM_BYTES_PER_GB) {
+        return MAIN_RAM_FRACTION_16GB;
+    }
+    if (info.total_ram <= 32ULL * MAIN_RAM_BYTES_PER_GB) {
+        return MAIN_RAM_FRACTION_32GB;
+    }
+    return MAIN_RAM_FRACTION_DEFAULT;
+}
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -284,7 +298,7 @@ static void print_help(void) {
     printf("Usage:\n");
     printf("  codebase-memory-mcp              Run MCP server on stdio\n");
     printf("  codebase-memory-mcp cli <tool> [json]  Run a single tool\n");
-    printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run]\n");
+    printf("  codebase-memory-mcp install [-y|-n] [--force] [--hooks] [--dry-run]\n");
     printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
     printf("  codebase-memory-mcp update [-y|-n]\n");
     printf("  codebase-memory-mcp config <list|get|set|reset>\n");
@@ -324,11 +338,11 @@ static int handle_subcommand(int argc, char **argv) {
             return 0;
         }
         if (strcmp(argv[i], "cli") == 0) {
-            cbm_mem_init(MAIN_RAM_FRACTION);
+            cbm_mem_init(main_ram_fraction());
             return run_cli(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "hook-augment") == 0) {
-            cbm_mem_init(MAIN_RAM_FRACTION);
+            cbm_mem_init(main_ram_fraction());
             return cbm_cmd_hook_augment();
         }
         if (strcmp(argv[i], "install") == 0) {
@@ -424,9 +438,9 @@ int main(int argc, char **argv) {
 #endif
 
     /* Default: MCP server on stdio */
-    cbm_mem_init(MAIN_RAM_FRACTION); /* 50% of RAM — safe now because mimalloc tracks ALL
-                                      * memory (C + C++ allocations) via global override.
-                                      * No more untracked heap blind spots. */
+    /* tiered RAM budget — mimalloc tracks ALL memory (C + C++ allocations) via global
+     * override. No more untracked heap blind spots. */
+    cbm_mem_init(main_ram_fraction());
     /* Store binary path for subprocess spawning + hook log sink */
     cbm_http_server_set_binary_path(argv[0]);
     cbm_log_set_sink(cbm_ui_log_append);
