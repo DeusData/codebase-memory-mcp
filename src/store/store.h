@@ -213,6 +213,19 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path);
  * Returns false if corruption is detected — caller should delete and re-index. */
 bool cbm_store_check_integrity(cbm_store_t *s);
 
+/* Extended integrity check. Behaves like cbm_store_check_integrity() but, on
+ * failure, reports whether the ONLY detected defect was a malformed project
+ * `root_path` (a cosmetic projects-row defect — node/edge data is intact).
+ *
+ * When the function returns false and *path_only_failure is true, the caller may
+ * KEEP the database instead of deleting it: the indexed nodes/edges are usable,
+ * only the project row's root_path is wrong. This avoids the data loss reported
+ * in #557, where a single bad root_path caused the whole freshly-indexed DB to
+ * be deleted. *path_only_failure is set false in all other cases (including a
+ * clean result). Passing NULL for path_only_failure is equivalent to the plain
+ * check. */
+bool cbm_store_check_integrity_full(cbm_store_t *s, bool *path_only_failure);
+
 /* Open database for a named project in the default cache dir. */
 cbm_store_t *cbm_store_open(const char *project);
 

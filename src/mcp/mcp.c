@@ -1120,21 +1120,33 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     project_db_path(project, path, sizeof(path));
     srv->store = cbm_store_open_path_query(path);
     if (srv->store) {
-        /* Check DB integrity — auto-clean corrupt databases */
-        if (!cbm_store_check_integrity(srv->store)) {
-            cbm_log_error("store.auto_clean", "project", project, "path", path, "action",
-                          "deleting corrupt db — re-index required");
-            cbm_store_close(srv->store);
-            srv->store = NULL;
-            /* Delete the corrupt DB + WAL/SHM files */
-            cbm_unlink(path);
-            char wal_path[MCP_FIELD_SIZE];
-            char shm_path[MCP_FIELD_SIZE];
-            snprintf(wal_path, sizeof(wal_path), "%s-wal", path);
-            snprintf(shm_path, sizeof(shm_path), "%s-shm", path);
-            cbm_unlink(wal_path);
-            cbm_unlink(shm_path);
-            return NULL;
+        /* Check DB integrity — auto-clean corrupt databases. A bad project
+         * root_path (with an otherwise-fine projects table) is cosmetic: the
+         * indexed nodes/edges are intact and queries key off project name, not
+         * root_path. Retain such DBs instead of deleting them, to avoid the
+         * data loss reported in #557. Only genuine corruption (e.g. an
+         * over-accumulated projects table) is auto-deleted. */
+        bool path_only = false;
+        if (!cbm_store_check_integrity_full(srv->store, &path_only)) {
+            if (path_only) {
+                cbm_log_warn("store.integrity_retain", "project", project, "path", path,
+                             "reason", "bad project root_path only; data retained");
+                /* Fall through and keep srv->store open. */
+            } else {
+                cbm_log_error("store.auto_clean", "project", project, "path", path, "action",
+                              "deleting corrupt db — re-index required");
+                cbm_store_close(srv->store);
+                srv->store = NULL;
+                /* Delete the corrupt DB + WAL/SHM files */
+                cbm_unlink(path);
+                char wal_path[MCP_FIELD_SIZE];
+                char shm_path[MCP_FIELD_SIZE];
+                snprintf(wal_path, sizeof(wal_path), "%s-wal", path);
+                snprintf(shm_path, sizeof(shm_path), "%s-shm", path);
+                cbm_unlink(wal_path);
+                cbm_unlink(shm_path);
+                return NULL;
+            }
         }
 
         /* Verify the project actually exists in this database.
@@ -1147,9 +1159,15 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
             srv->store = NULL;
             return NULL;
         }
-        /* Register newly-accessed project with watcher (root_path from DB) */
+        /* Register newly-accessed project with watcher (root_path from DB).
+         * Validate the path looks like a real path (starts with '/' or a drive
+         * letter) before watching — a retained bad-path DB (#557) may store a
+         * numeric/empty root_path that would point the watcher at nothing. */
         if (srv->watcher && proj_verify.root_path && proj_verify.root_path[0]) {
-            cbm_watcher_watch(srv->watcher, project, proj_verify.root_path);
+            char c0 = proj_verify.root_path[0];
+            if (c0 == '/' || (c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z')) {
+                cbm_watcher_watch(srv->watcher, project, proj_verify.root_path);
+            }
         }
         cbm_project_free_fields(&proj_verify);
         srv->owns_store = true;

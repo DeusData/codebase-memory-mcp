@@ -1012,6 +1012,49 @@ TEST(store_integrity_null_check) {
     PASS();
 }
 
+TEST(store_integrity_full_path_only_classification) {
+    /* The _full variant must classify a bad root_path (with an otherwise-fine
+     * projects table) as a path-only defect so callers can retain the DB
+     * (#557), while genuine corruption (too many rows) is NOT path-only. */
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    bool path_only = true;
+
+    /* Clean DB: passes, path_only stays false. */
+    cbm_store_upsert_project(s, "clean-proj", "/tmp/clean");
+    path_only = true;
+    ASSERT_TRUE(cbm_store_check_integrity_full(s, &path_only));
+    ASSERT_FALSE(path_only);
+
+    /* Bad root_path, single row: fails, path_only == true (retain-eligible). */
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_exec(db, "DELETE FROM projects;", NULL, NULL, NULL);
+    sqlite3_exec(db,
+                 "INSERT INTO projects (name, indexed_at, root_path) "
+                 "VALUES ('bad-path-proj', '2024-01-01', '6860');",
+                 NULL, NULL, NULL);
+    path_only = false;
+    ASSERT_FALSE(cbm_store_check_integrity_full(s, &path_only));
+    ASSERT_TRUE(path_only);
+
+    /* Too many rows: fails, path_only == false (genuine corruption). */
+    sqlite3_exec(db, "DELETE FROM projects;", NULL, NULL, NULL);
+    for (int i = 0; i < 10; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO projects (name, indexed_at, root_path) "
+                 "VALUES ('proj-%d', '2024-01-01', '/tmp/%d');",
+                 i, i);
+        sqlite3_exec(db, sql, NULL, NULL, NULL);
+    }
+    path_only = true;
+    ASSERT_FALSE(cbm_store_check_integrity_full(s, &path_only));
+    ASSERT_FALSE(path_only);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Edge case: NULL / empty field handling ────────────────────── */
 
 TEST(store_node_null_project) {
@@ -1549,6 +1592,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_integrity_windows_lowercase_drive_issue367);
     RUN_TEST(store_integrity_corrupt_too_many_rows);
     RUN_TEST(store_integrity_null_check);
+    RUN_TEST(store_integrity_full_path_only_classification);
     RUN_TEST(store_project_crud);
     RUN_TEST(store_project_update);
     RUN_TEST(store_project_delete);

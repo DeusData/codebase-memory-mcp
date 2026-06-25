@@ -703,7 +703,10 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
 
 /* ── Integrity check ───────────────────────────────────────────── */
 
-bool cbm_store_check_integrity(cbm_store_t *s) {
+bool cbm_store_check_integrity_full(cbm_store_t *s, bool *path_only_failure) {
+    if (path_only_failure) {
+        *path_only_failure = false;
+    }
     if (!s || !s->db) {
         return false;
     }
@@ -719,16 +722,19 @@ bool cbm_store_check_integrity(cbm_store_t *s) {
     }
 
     bool ok = true;
+    bool rows_ok = true;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         int row_count = sqlite3_column_int(stmt, 0);
         if (row_count > ST_MAX_ROW_CHECK) {
             (void)fprintf(stderr, "ERROR store.corrupt table=projects rows=%d (expected 1)\n",
                           row_count);
             ok = false;
+            rows_ok = false;
         }
     }
     sqlite3_finalize(stmt);
 
+    bool path_bad = false;
     if (ok) {
         /* Check that root_path in projects table starts with '/' or a drive
          * letter. Corrupt DBs often have numeric strings like "826" in
@@ -747,12 +753,25 @@ bool cbm_store_check_integrity(cbm_store_t *s) {
                 (void)fprintf(stderr, "ERROR store.corrupt table=projects bad_root_path=%s\n",
                               bad_path ? bad_path : "(null)");
                 ok = false;
+                path_bad = true;
             }
             sqlite3_finalize(stmt);
         }
     }
 
+    /* A bad root_path with an otherwise-fine projects table is a cosmetic
+     * project-row defect: the node/edge data is intact and queries (which key
+     * off project name, not root_path) remain correct. Surface this so callers
+     * can retain the DB instead of deleting it (#557 data loss). */
+    if (path_only_failure && !ok && rows_ok && path_bad) {
+        *path_only_failure = true;
+    }
+
     return ok;
+}
+
+bool cbm_store_check_integrity(cbm_store_t *s) {
+    return cbm_store_check_integrity_full(s, NULL);
 }
 
 cbm_store_t *cbm_store_open(const char *project) {
