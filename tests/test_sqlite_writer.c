@@ -517,6 +517,98 @@ TEST(sw_oversized_node) {
 
 /* ── Suite ─────────────────────────────────────────────────────── */
 
+/* B1 (#8) repro probe: the full pipeline intermittently stores a NUMERIC
+ * root_path + wildly varying edge counts (43K vs 275K) on the ~16K-node
+ * fastapi repo, while sw_minimal_data (tiny) round-trips cleanly. This test
+ * writes a comparable-scale DB in ISOLATION (no pipeline/parallelism) and
+ * verifies root_path round-trips exactly + integrity_check stays "ok". If this
+ * fails, the writer itself corrupts at scale (directly debuggable); if it
+ * passes, the B1 corruption is pipeline/parallel-side, not the writer. */
+TEST(sw_scale_root_path_integrity) {
+    char path[256];
+    ASSERT_EQ(make_temp_db(path, sizeof(path)), 0);
+
+    const int N = 20000;
+    const int E = 200000;
+    CBMDumpNode *nodes = (CBMDumpNode *)calloc((size_t)N, sizeof(CBMDumpNode));
+    CBMDumpEdge *edges = (CBMDumpEdge *)calloc((size_t)E, sizeof(CBMDumpEdge));
+    char (*namebuf)[32] = malloc((size_t)N * 32);
+    char (*qnbuf)[64] = malloc((size_t)N * 64);
+    char (*filebuf)[48] = malloc((size_t)N * 48);
+    ASSERT_NOT_NULL(nodes);
+    ASSERT_NOT_NULL(edges);
+    ASSERT_NOT_NULL(namebuf);
+    ASSERT_NOT_NULL(qnbuf);
+    ASSERT_NOT_NULL(filebuf);
+
+    for (int i = 0; i < N; i++) {
+        snprintf(namebuf[i], 32, "fn_%d", i);
+        snprintf(qnbuf[i], 64, "proj.mod.fn_%d", i);
+        snprintf(filebuf[i], 48, "src/file_%d.py", i % 400);
+        nodes[i].id = i + 1;
+        nodes[i].project = "proj";
+        nodes[i].label = "Function";
+        nodes[i].name = namebuf[i];
+        nodes[i].qualified_name = qnbuf[i];
+        nodes[i].file_path = filebuf[i];
+        nodes[i].start_line = i + 1;
+        nodes[i].end_line = i + 2;
+        nodes[i].properties = "{}";
+    }
+    for (int i = 0; i < E; i++) {
+        edges[i].id = i + 1;
+        edges[i].project = "proj";
+        /* edges has UNIQUE(source_id, target_id, type) — generate distinct
+         * (source,target) pairs so the test exercises the writer, not the
+         * constraint: source cycles 1..N, target = block (i/N), giving E unique
+         * pairs for E <= N*N. */
+        edges[i].source_id = (i % N) + 1;
+        edges[i].target_id = ((i / N) % N) + 1;
+        edges[i].type = "CALLS";
+        edges[i].properties = "{}";
+        edges[i].url_path = "";
+    }
+
+    const char *ROOT = "/tmp/scale_root_path_test";
+    int rc = cbm_write_db(path, "proj", ROOT, "2026-06-25T00:00:00Z", nodes, N, edges, E, NULL, 0,
+                          NULL, 0);
+    ASSERT_EQ(rc, 0);
+
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(path, &db), SQLITE_OK);
+    sqlite3_stmt *stmt = NULL;
+
+    sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &stmt, NULL);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "ok");
+    sqlite3_finalize(stmt);
+
+    /* root_path MUST round-trip exactly — B1 reproduces as a numeric value. */
+    sqlite3_prepare_v2(db, "SELECT root_path FROM projects", -1, &stmt, NULL);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), ROOT);
+    sqlite3_finalize(stmt);
+
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM nodes", -1, &stmt, NULL);
+    sqlite3_step(stmt);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), N);
+    sqlite3_finalize(stmt);
+
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM edges", -1, &stmt, NULL);
+    sqlite3_step(stmt);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), E);
+    sqlite3_finalize(stmt);
+
+    sqlite3_close(db);
+    unlink(path);
+    free(nodes);
+    free(edges);
+    free(namebuf);
+    free(qnbuf);
+    free(filebuf);
+    PASS();
+}
+
 SUITE(sqlite_writer) {
     RUN_TEST(sw_minimal_data);
     RUN_TEST(sw_scale_and_indexes);
@@ -524,4 +616,5 @@ SUITE(sqlite_writer) {
     RUN_TEST(sw_empty);
     RUN_TEST(sw_multi_page);
     RUN_TEST(sw_oversized_node);
+    RUN_TEST(sw_scale_root_path_integrity);
 }

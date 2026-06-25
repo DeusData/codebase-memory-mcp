@@ -121,6 +121,7 @@ int main(void) {
         if (strstr("mcp", only_suite)) RUN_SUITE(mcp);
         if (strstr("tool_consolidation", only_suite)) RUN_SUITE(tool_consolidation);
         if (strstr("store_nodes", only_suite)) RUN_SUITE(store_nodes);
+        if (strstr("sqlite_writer", only_suite)) RUN_SUITE(sqlite_writer);
         TEST_SUMMARY();
         return 0;
     }
