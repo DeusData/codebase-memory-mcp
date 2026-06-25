@@ -6,9 +6,11 @@
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h" /* cbm_unlink / cbm_rmdir */
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <yyjson/yyjson.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -438,6 +440,62 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz);
 static void cleanup_snippet_dir(const char *tmp_dir);
 static char *extract_text_content(const char *mcp_result);
 
+static int run_cmd_quiet(const char *cmd) {
+    int rc = system(cmd);
+    return rc == 0 ? 0 : -1;
+}
+
+static int setup_git_repo(char *tmp_dir, size_t tmp_sz) {
+    snprintf(tmp_dir, tmp_sz, "/tmp/cbm_mcp_git_evidence_XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        return -1;
+    }
+
+    char file_path[512];
+    snprintf(file_path, sizeof(file_path), "%s/main.c", tmp_dir);
+    FILE *fp = fopen(file_path, "w");
+    if (!fp) {
+        return -1;
+    }
+    fputs("int main(void) { return 0; }\n", fp);
+    fclose(fp);
+
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" init -q && "
+             "git -C \"%s\" config user.email test@example.com && "
+             "git -C \"%s\" config user.name Test && "
+             "git -C \"%s\" add main.c && "
+             "git -C \"%s\" commit -q -m initial",
+             tmp_dir, tmp_dir, tmp_dir, tmp_dir, tmp_dir);
+    return run_cmd_quiet(cmd);
+}
+
+static char *git_head(const char *repo) {
+    char cmd[1024];
+#ifdef _WIN32
+    const char *null_dev = "NUL";
+#else
+    const char *null_dev = "/dev/null";
+#endif
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse HEAD 2>%s", repo, null_dev);
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return NULL;
+    }
+    char buf[128] = "";
+    if (!fgets(buf, sizeof(buf), fp)) {
+        cbm_pclose(fp);
+        return NULL;
+    }
+    cbm_pclose(fp);
+    char *nl = strchr(buf, '\n');
+    if (nl) {
+        *nl = '\0';
+    }
+    return strdup(buf);
+}
+
 TEST(tool_search_graph_includes_node_properties) {
     /* search_graph results must surface each node's properties_json
      * payload so callers don't have to round-trip through get_code_snippet
@@ -570,6 +628,115 @@ TEST(tool_index_status_includes_git_metadata) {
     ASSERT_NOT_NULL(strstr(inner, "\"git\""));
     ASSERT_NOT_NULL(strstr(inner, "\"is_git\":false"));
     ASSERT_NOT_NULL(strstr(inner, "\"root_exists\":true"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_index_status_evidence_clean_git_repo) {
+    char tmp[256];
+    ASSERT_EQ(setup_git_repo(tmp, sizeof(tmp)), 0);
+    char *head = git_head(tmp);
+    ASSERT_NOT_NULL(head);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    cbm_mcp_server_set_project(srv, "git-clean");
+    ASSERT_EQ(cbm_store_upsert_project(st, "git-clean", tmp), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_update_project_coverage(st, "git-clean", 1, 1, 0, 0), CBM_STORE_OK);
+
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "UPDATE projects SET indexed_git_head='%s' WHERE name='git-clean';", head);
+    ASSERT_EQ(cbm_store_exec(st, sql), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":17,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"index_status\","
+             "\"arguments\":{\"project\":\"git-clean\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"evidence\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"freshness\":\"current\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"repository_state\":\"clean\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"snapshot_matches_working_tree\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"coverage_status\":\"complete\""));
+
+    free(inner);
+    free(resp);
+    free(head);
+    cbm_mcp_server_free(srv);
+    th_cleanup(tmp);
+    PASS();
+}
+
+TEST(tool_index_status_evidence_dirty_git_repo) {
+    char tmp[256];
+    ASSERT_EQ(setup_git_repo(tmp, sizeof(tmp)), 0);
+    char *head = git_head(tmp);
+    ASSERT_NOT_NULL(head);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    cbm_mcp_server_set_project(srv, "git-dirty");
+    ASSERT_EQ(cbm_store_upsert_project(st, "git-dirty", tmp), CBM_STORE_OK);
+
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "UPDATE projects SET indexed_git_head='%s' WHERE name='git-dirty';", head);
+    ASSERT_EQ(cbm_store_exec(st, sql), CBM_STORE_OK);
+
+    char file_path[512];
+    snprintf(file_path, sizeof(file_path), "%s/main.c", tmp);
+    ASSERT_EQ(th_append_file(file_path, "/* changed */\n"), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":18,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"index_status\","
+             "\"arguments\":{\"project\":\"git-dirty\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"freshness\":\"working_tree_changed\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"repository_state\":\"dirty\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"snapshot_matches_current_head\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"snapshot_matches_working_tree\":false"));
+
+    free(inner);
+    free(resp);
+    free(head);
+    cbm_mcp_server_free(srv);
+    th_cleanup(tmp);
+    PASS();
+}
+
+TEST(tool_trace_path_includes_edge_evidence) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":19,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\","
+             "\"arguments\":{\"project\":\"test-project\","
+             "\"function_name\":\"HandleRequest\",\"direction\":\"outbound\","
+             "\"depth\":1}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"edge_evidence\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"resolution_strategy\":\"hybrid_lsp\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"confidence\":0.95"));
+    ASSERT_NOT_NULL(strstr(inner, "\"candidate_count\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "\"evidence_status\":\"verified\""));
 
     free(inner);
     free(resp);
@@ -1367,7 +1534,6 @@ TEST(parse_file_uri_invalid) {
  *  SNIPPET TESTS — Port of internal/tools/snippet_test.go
  * ══════════════════════════════════════════════════════════════════ */
 
-#include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -1467,7 +1633,12 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     cbm_store_upsert_node(st, &n_run2);
 
     /* Create edges: HandleRequest -> ProcessOrder, HandleRequest -> Run1 */
-    cbm_edge_t e1 = {.project = proj_name, .source_id = id_hr, .target_id = id_po, .type = "CALLS"};
+    cbm_edge_t e1 = {.project = proj_name,
+                     .source_id = id_hr,
+                     .target_id = id_po,
+                     .type = "CALLS",
+                     .properties_json =
+                         "{\"strategy\":\"lsp_exact\",\"confidence\":0.95,\"candidates\":1}"};
     cbm_store_insert_edge(st, &e1);
 
     cbm_edge_t e2 = {
@@ -2371,6 +2542,9 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_index_status_includes_git_metadata);
+    RUN_TEST(tool_index_status_evidence_clean_git_repo);
+    RUN_TEST(tool_index_status_evidence_dirty_git_repo);
+    RUN_TEST(tool_trace_path_includes_edge_evidence);
 
     /* Tool handlers with validation */
     RUN_TEST(tool_trace_call_path_not_found);

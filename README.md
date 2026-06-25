@@ -382,6 +382,17 @@ codebase-memory-mcp cli --raw search_graph '{"label": "Function"}' | jq '.result
 | `delete_project` | Remove a project and all its graph data. |
 | `index_status` | Check indexing status of a project. |
 
+`index_status` includes an additive `evidence` object. `evidence.index_snapshot`
+reports the timestamp and Git HEAD captured when the last successful graph
+snapshot was finalized, the current HEAD, tracked working-tree state, and a
+`freshness` value: `current` means the indexed HEAD equals current HEAD and
+tracked files are clean; `head_changed` means a later checkout/commit changed
+HEAD; `working_tree_changed` means HEAD matches but tracked files are modified;
+`unknown` means Git or comparison data is unavailable. Untracked files are not
+compared. `evidence.coverage` reports discovered/indexed/excluded/failed file
+counters when the stored index contains them; older indexes may report
+`unknown` rather than guessing.
+
 ### Querying
 
 | Tool | Description |
@@ -393,6 +404,14 @@ codebase-memory-mcp cli --raw search_graph '{"label": "Function"}' | jq '.result
 | `get_graph_schema` | Node/edge counts, relationship patterns, property definitions per label. Run this first. |
 | `get_code_snippet` | Read source code for a function by qualified name. |
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
+
+`trace_path`/`trace_call_path` preserve their existing `callers`/`callees`
+arrays and add `edge_evidence` for traversed relations when stored edge
+properties contain provenance. Relation `confidence` is source-resolution
+confidence from the indexer, not a probability of runtime correctness and not
+BM25/semantic search relevance. Dynamic behavior such as reflection,
+dependency injection, framework wiring, generated code, configuration, HTTP,
+async messaging, and cross-repo links may remain inferred or unavailable.
 | `search_code` | Grep-like text search within indexed project files. |
 | `manage_adr` | CRUD for Architecture Decision Records. |
 | `ingest_traces` | Ingest runtime traces to validate HTTP_CALLS edges. |
