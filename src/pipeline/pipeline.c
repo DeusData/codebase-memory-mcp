@@ -1128,6 +1128,10 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
             cbm_store_t *hash_store = cbm_store_open_path(db_path);
             if (hash_store) {
                 cbm_store_delete_file_hashes(hash_store, p->project_name);
+                /* Batch upserts in one transaction: N files -> 1 COMMIT under WAL
+                 * instead of N autocommit fsyncs. Falls back to autocommit if
+                 * BEGIN fails. Matches persist_hashes() in pipeline_incremental.c. */
+                bool hash_batched = (cbm_store_begin(hash_store) == CBM_STORE_OK);
                 for (int i = 0; i < file_count; i++) {
                     struct stat fst;
                     if (stat(files[i].path, &fst) == 0) {
@@ -1144,6 +1148,9 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
                         cbm_store_upsert_file_hash(hash_store, p->project_name,
                                                    files[i].rel_path, "", mtime_ns, fst.st_size);
                     }
+                }
+                if (hash_batched) {
+                    (void)cbm_store_commit(hash_store);
                 }
                 cbm_store_close(hash_store);
                 cbm_log_info("pass.timing", "pass", "persist_hashes", "files",
