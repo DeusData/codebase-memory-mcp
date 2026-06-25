@@ -783,14 +783,19 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     if (!db_path) {
         return CBM_NOT_FOUND;
     }
-    struct stat db_st;
-    if (stat(db_path, &db_st) != 0) {
+    /* Open the existing DB directly in query mode (never creates the file).
+     * A NULL result means it is absent or unreadable — nothing to reindex
+     * from, so we return without touching the path. Deriving existence from
+     * the open instead of a prior stat() removes the check-then-use race on
+     * db_path that CodeQL flags as a TOCTOU, and matches resolve_store() in
+     * mcp.c, which already uses this pattern. */
+    bool was_corrupt = false;
+    cbm_store_t *check_store = cbm_store_open_path_query(db_path);
+    if (!check_store) {
         free(db_path);
         return CBM_NOT_FOUND;
     }
-    bool was_corrupt = false;
-    cbm_store_t *check_store = cbm_store_open_path(db_path);
-    if (check_store && cbm_store_check_integrity(check_store)) {
+    if (cbm_store_check_integrity(check_store)) {
         cbm_file_hash_t *hashes = NULL;
         int hash_count = 0;
         cbm_store_get_file_hashes(check_store, p->project_name, &hashes, &hash_count);
@@ -807,7 +812,7 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
             cbm_log_info("pipeline.route", "path", "mode_change_reindex", "stored_hashes",
                          itoa_buf(hash_count), "discovered", itoa_buf(file_count));
         }
-    } else if (check_store) {
+    } else {
         /* Integrity check failed — this is the data-loss path of #557. */
         was_corrupt = true;
         cbm_store_close(check_store);
