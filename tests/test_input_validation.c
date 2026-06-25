@@ -485,7 +485,7 @@ TEST(cq3_cypher_with_label_warns) {
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *raw = cbm_mcp_handle_tool(srv, "query_graph",
         "{\"cypher\":\"MATCH (n:Function) RETURN n.name LIMIT 5\","
         "\"label\":\"Class\"}");
     char *resp = extract_text(raw);
@@ -531,7 +531,7 @@ TEST(pattern_or_search_graph) {
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
     /* pattern="foo" should match node named "foo" (OR across name and qualified_name) */
-    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"pattern\":\"foo\",\"limit\":5}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
@@ -564,7 +564,7 @@ TEST(source_search_via_search_in_param) {
         "{\"pattern\":\"cbm_unique_grep_token\","
         "\"search_in\":\"source\","
         "\"project\":\"validation-test\"}");
-    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph", args);
+    char *raw = cbm_mcp_handle_tool(srv, "search_code", args);
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
     /* Should return matches array, NOT "project not found" */
@@ -603,7 +603,7 @@ TEST(source_search_path_project_normalizes_to_slug) {
         "{\"pattern\":\"path_slug_normalize_token\","
         "\"search_in\":\"source\","
         "\"project\":\"validation-test\"}");
-    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph", args);
+    char *raw = cbm_mcp_handle_tool(srv, "search_code", args);
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_NULL(strstr(resp, "\"error\""));
@@ -623,7 +623,7 @@ TEST(source_search_default_is_graph) {
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
     /* No search_in → defaults to graph search → returns results array */
-    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"pattern\":\"foo\",\"limit\":5}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
@@ -643,7 +643,7 @@ TEST(summary_bool_alias) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
-    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"summary\":true}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
@@ -665,7 +665,7 @@ TEST(case_sensitive_graph_search) {
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
     /* case_sensitive=true: "FOO" should NOT match node named "foo" */
-    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"name_pattern\":\"FOO\",\"case_sensitive\":true,\"limit\":5}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
@@ -691,7 +691,7 @@ TEST(config_compact_default_false) {
     ASSERT_NOT_NULL(cfg);
     cbm_config_set(cfg, "compact", "false");
     cbm_mcp_server_set_config(srv, cfg);
-    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph", "{\"limit\":3}");
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph", "{\"limit\":3}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_NULL(strstr(resp, "\"error\""));
@@ -714,7 +714,7 @@ TEST(config_default_sort_by_calls) {
     ASSERT_NOT_NULL(cfg);
     cbm_config_set(cfg, "default_sort_by", "calls");
     cbm_mcp_server_set_config(srv, cfg);
-    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph", "{\"limit\":3}");
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph", "{\"limit\":3}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_NULL(strstr(resp, "invalid sort_by")); /* valid sort, no error */
@@ -756,7 +756,7 @@ TEST(pattern_glob_wildcards_auto_convert) {
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
     /* "*foo*" is not valid regex but valid glob — should auto-convert and find "foo" node */
-    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"pattern\":\"*foo*\",\"limit\":5}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
@@ -777,7 +777,7 @@ TEST(pattern_invalid_regex_returns_error) {
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
     /* "[invalid" is not valid regex and not a glob — should return error */
-    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"pattern\":\"[invalid\",\"limit\":5}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
@@ -912,7 +912,7 @@ TEST(source_search_tilde_project_expands) {
         "{\"pattern\":\"tilde_expand_token\","
         "\"search_in\":\"source\","
         "\"project\":\"%s\"}", tilde_path);
-    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph", args);
+    char *raw = cbm_mcp_handle_tool(srv, "search_code", args);
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_NULL(strstr(resp, "\"error\""));
@@ -941,7 +941,7 @@ TEST(source_search_no_project_falls_back_to_session) {
     if (f) { fputs("/* session_fallback_token */\n", f); fclose(f); }
 
     /* No project= arg — get_project_root falls back to session_project */
-    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph",
+    char *raw = cbm_mcp_handle_tool(srv, "search_code",
         "{\"pattern\":\"session_fallback_token\",\"search_in\":\"source\"}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
@@ -995,7 +995,7 @@ TEST(path_project_auto_indexes_separate_directory) {
     snprintf(args1, sizeof(args1),
              "{\"project\":\"%s\",\"pattern\":\"session_fn\",\"search_in\":\"source\"}",
              session_tmp);
-    char *raw1 = cbm_mcp_handle_tool(srv, "search_code_graph", args1);
+    char *raw1 = cbm_mcp_handle_tool(srv, "search_code", args1);
     free(raw1); /* result not checked — just establishing session_root */
 
     /* Second query: DIFFERENT path — resolve_project_store must auto-index it.
@@ -1004,7 +1004,7 @@ TEST(path_project_auto_indexes_separate_directory) {
     char args2[512];
     snprintf(args2, sizeof(args2),
              "{\"project\":\"%s\",\"pattern\":\"path_autoindex_sentinel\"}", target_tmp);
-    char *raw2 = cbm_mcp_handle_tool(srv, "search_code_graph", args2);
+    char *raw2 = cbm_mcp_handle_tool(srv, "search_graph", args2);
     char *resp = extract_text(raw2); free(raw2);
     ASSERT_NOT_NULL(resp);
 
@@ -1056,14 +1056,14 @@ TEST(config_context_injection_disabled) {
     cbm_mcp_server_set_config(srv, cfg);
 
     /* With context_injection=false, _context must NOT appear in any call */
-    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph", "{\"limit\":3}");
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph", "{\"limit\":3}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_NULL(strstr(resp, "\"_context\":"));
     free(resp);
 
     /* Second call also no _context */
-    raw = cbm_mcp_handle_tool(srv, "search_code_graph", "{\"limit\":3}");
+    raw = cbm_mcp_handle_tool(srv, "search_graph", "{\"limit\":3}");
     resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_NULL(strstr(resp, "\"_context\":"));
@@ -1080,14 +1080,14 @@ TEST(config_context_injection_enabled_by_default) {
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
     /* No config set → default is true → _context present on first call */
-    char *raw = cbm_mcp_handle_tool(srv, "search_code_graph", "{\"limit\":3}");
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph", "{\"limit\":3}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"_context\":"));
     free(resp);
 
     /* Second call: _context deduped (context_injected=true) */
-    raw = cbm_mcp_handle_tool(srv, "search_code_graph", "{\"limit\":3}");
+    raw = cbm_mcp_handle_tool(srv, "search_graph", "{\"limit\":3}");
     resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_NULL(strstr(resp, "\"_context\":"));

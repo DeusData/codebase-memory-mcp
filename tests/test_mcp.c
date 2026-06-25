@@ -168,19 +168,20 @@ TEST(mcp_initialize_response) {
 TEST(mcp_tools_list) {
     char *json = cbm_mcp_tools_list(NULL);
     ASSERT_NOT_NULL(json);
-    /* When srv=NULL (no config), returns streamlined tools (3 consolidated).
-     * MERGE-TODO: upstream 14-tool assertions dropped — merged
-     * cbm_mcp_tools_list (src/mcp/mcp.c:980) defaults to "streamlined" mode
-     * when srv is NULL (mcp.c:984-986), emitting only search_code_graph,
-     * trace_call_path, get_code (mcp.c:996-1000). The classic-mode 14-tool
-     * path (CBM_TOOL_MODE=classic, mcp.c:1034-1039) has no test here yet. */
-    ASSERT_NOT_NULL(strstr(json, "search_code_graph"));
+    /* §4b: when srv=NULL (no config), cbm_mcp_tools_list defaults to "streamlined"
+     * mode and emits the 5-tool default surface: the 3 focused search tools
+     * (search_graph, query_graph, search_code) drawn from TOOLS[], plus
+     * trace_call_path and get_code from STREAMLINED_TOOLS[]. The old
+     * search_code_graph mega-tool has been deleted. */
+    ASSERT_NOT_NULL(strstr(json, "search_graph"));
+    ASSERT_NOT_NULL(strstr(json, "query_graph"));
+    ASSERT_NOT_NULL(strstr(json, "search_code"));
     ASSERT_NOT_NULL(strstr(json, "trace_call_path"));
     ASSERT_NOT_NULL(strstr(json, "get_code"));
-    /* Old names should NOT appear in streamlined mode */
+    /* The deleted mega-tool must NOT appear */
+    ASSERT_NULL(strstr(json, "search_code_graph"));
+    /* Hidden classic tools should NOT appear as top-level tool entries */
     ASSERT_NULL(strstr(json, "\"index_repository\""));
-    ASSERT_NULL(strstr(json, "\"search_graph\""));
-    ASSERT_NULL(strstr(json, "\"query_graph\""));
     free(json);
     PASS();
 }
@@ -362,8 +363,8 @@ TEST(server_handle_tools_list) {
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"id\":2"));
-    /* Streamlined mode: consolidated tools */
-    ASSERT_NOT_NULL(strstr(resp, "search_code_graph"));
+    /* §4b: streamlined mode default surface — 5 split tools */
+    ASSERT_NOT_NULL(strstr(resp, "search_graph"));
     ASSERT_NOT_NULL(strstr(resp, "trace_call_path"));
     free(resp);
 

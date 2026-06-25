@@ -211,9 +211,9 @@ static cbm_mcp_server_t *setup_dep_query_server(char *tmp_dir, size_t tmp_sz) {
 TEST(tool_index_dependencies_listed) {
     char *json = cbm_mcp_tools_list(NULL);
     ASSERT_NOT_NULL(json);
-    /* In streamlined mode (NULL srv), index_dependencies is hidden.
-     * But search_code_graph (consolidated) should be present. */
-    ASSERT_NOT_NULL(strstr(json, "search_code_graph"));
+    /* §4b: in streamlined mode (NULL srv), index_dependencies is hidden.
+     * The default surface includes search_graph (split tool). */
+    ASSERT_NOT_NULL(strstr(json, "search_graph"));
     free(json);
     PASS();
 }

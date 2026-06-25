@@ -507,69 +507,12 @@ static const tool_def_t TOOLS[] = {
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
 
-/* ── Streamlined tool definitions (Phase 9: 3 visible tools) ─── */
+/* ── Streamlined tool definitions ──────────────────────────────
+ * The 3 search tools (search_graph, query_graph, search_code) are drawn from
+ * TOOLS[] and emitted as the default surface in cbm_mcp_tools_list(). This
+ * array holds the additional default tools whose schemas live only here. */
 
 static const tool_def_t STREAMLINED_TOOLS[] = {
-    {"search_code_graph",
-     "Search the code knowledge graph for functions, classes, routes, variables, "
-     "and relationships. Use INSTEAD OF grep/glob for code definitions and structure. "
-     "Projects are auto-indexed on first query — no manual setup needed. "
-     "3 modes via dispatch params: "
-     "(1) cypher=<query>: Cypher multi-hop query. "
-     "(2) search_in='source': grep source files for text patterns. "
-     "(3) default: graph attribute search by label/name_pattern/pattern/sort_by. "
-     "pattern= searches name OR qualified_name (OR-match). "
-     "Results sorted by PageRank by default. "
-     "mode=summary returns aggregate counts (results_suppressed=true). "
-     "Read codebase://schema for node labels, edge types, and Cypher examples. "
-     "Read codebase://architecture for key functions and graph overview.",
-     "{\"type\":\"object\",\"properties\":{"
-     "\"project\":{\"type\":\"string\",\"description\":\"Project name, path, or filter. "
-     "Accepts: project name, directory path (/path/to/repo), tilde path (~/path/to/repo), "
-     "'self' (project only), 'dep'/'deps' (dependencies only), 'dep.pandas' (specific dep), "
-     "glob patterns. Omit to use the auto-detected session project.\"},"
-     "\"cypher\":{\"type\":\"string\",\"description\":\"Cypher query for complex multi-hop "
-     "patterns. When provided, other filter params are ignored. Add LIMIT.\"},"
-     "\"label\":{\"type\":\"string\"},"
-     "\"name_pattern\":{\"type\":\"string\",\"description\":\"Regex pattern on symbol name. "
-     "Glob wildcards (*tool*, foo?) auto-convert to regex.\"},"
-     "\"qn_pattern\":{\"type\":\"string\",\"description\":\"Regex pattern on qualified name. "
-     "Glob wildcards auto-convert to regex.\"},"
-     "\"file_pattern\":{\"type\":\"string\"},"
-     "\"sort_by\":{\"type\":\"string\",\"enum\":[\"relevance\",\"name\",\"degree\",\"calls\",\"linkrank\"],"
-     "\"description\":\"Sort order: relevance (PageRank, default), name, degree (edge weight), "
-     "calls (function calls in+out), linkrank (link-based rank).\"},"
-     "\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"summary\"],\"description\":\"Graph mode only: full (default) or summary (aggregate counts). For source grep mode use mode=compact/full/files.\"},"
-     "\"compact\":{\"type\":\"boolean\",\"description\":\"graph mode only: omit name when it equals last segment of qualified_name. For source grep use mode='compact' (string) instead.\"},"
-     "\"include_dependencies\":{\"type\":\"boolean\"},"
-     "\"limit\":{\"type\":\"integer\"},\"offset\":{\"type\":\"integer\"},"
-     "\"min_degree\":{\"type\":\"integer\"},\"max_degree\":{\"type\":\"integer\"},"
-     "\"max_output_bytes\":{\"type\":\"integer\",\"description\":\"Max response bytes (cypher mode). 0=unlimited.\"},"
-     "\"relationship\":{\"type\":\"string\"},"
-     "\"exclude_entry_points\":{\"type\":\"boolean\"},"
-     "\"include_connected\":{\"type\":\"boolean\"},"
-     "\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
-     "\"description\":\"Glob patterns for file paths to exclude (e.g. [\\\"tests/**\\\",\\\"scripts/**\\\"])\"},"
-     "\"search_in\":{\"type\":\"string\",\"enum\":[\"graph\",\"source\"],\"default\":\"graph\","
-     "\"description\":\"'graph' (default): search indexed symbols — returns {total,results:[{qualified_name,label,...}]}. "
-     "'source': grep raw source files — returns {matches:[{file,line,content}],count}. "
-     "Use 'source' for string literals, error messages, and text not in the symbol graph.\"},"
-     "\"pattern\":{\"type\":\"string\",\"description\":\"OR-search: matches symbol name OR qualified name. "
-     "Also used as the grep pattern when search_in='source'. Glob wildcards auto-convert to regex.\"},"
-     "\"case_sensitive\":{\"type\":\"boolean\",\"default\":false,"
-     "\"description\":\"Case-sensitive name_pattern/qn_pattern/pattern matching (default: insensitive).\"},"
-     "\"regex\":{\"type\":\"boolean\",\"default\":false,"
-     "\"description\":\"When search_in='source': treat pattern as regex (default: literal text).\"},"
-     "\"path_filter\":{\"type\":\"string\","
-     "\"description\":\"When search_in='source': regex/glob pattern to restrict grep to matching file paths (e.g. '*.py', 'src/.*\\\\.go$').\"},"
-     "\"context\":{\"type\":\"integer\",\"default\":0,"
-     "\"description\":\"When search_in='source': number of surrounding lines to include around each match (like grep -C). Default 0 (match line only).\"},"
-     "\"summary\":{\"type\":\"boolean\",\"default\":false,"
-     "\"description\":\"Return aggregate counts by label and file only. Alias for mode='summary'.\"},"
-     "\"max_rows\":{\"type\":\"integer\","
-     "\"description\":\"Max row scan for Cypher queries (cypher mode only).\"}"
-     "}}"},
-
     {"trace_call_path",
      "Trace function call paths — who calls a function and what it calls. "
      "Use for impact analysis, understanding callers, and finding dependencies. "
@@ -598,7 +541,7 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "Use INSTEAD OF reading entire files. Use mode=signature for API lookup (99%% savings). "
      "Use mode=head_tail for large functions (preserves return code). "
      "Module nodes return metadata only — use auto_resolve=true for file source. "
-     "Get qualified_name values from search_code_graph results.",
+     "Get qualified_name values from search_graph results.",
      "{\"type\":\"object\",\"properties\":{"
      "\"qualified_name\":{\"type\":\"string\",\"description\":\"Qualified name from search results\"},"
      "\"project\":{\"type\":\"string\"},"
@@ -882,12 +825,31 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
     yyjson_mut_val *tools = yyjson_mut_arr(doc);
 
     if (!classic) {
-        /* Streamlined mode: emit 3 consolidated tools */
+        /* Streamlined mode: default surface = the 3 focused search tools (drawn
+         * from TOOLS[] to keep a single schema source) followed by trace_call_path
+         * and get_code (from STREAMLINED_TOOLS[]). The search_code_graph mega-tool
+         * was removed — these 3 split tools replace it. */
+        for (int i = 0; i < TOOL_COUNT; i++) {
+            if (strcmp(TOOLS[i].name, "search_graph") == 0 ||
+                strcmp(TOOLS[i].name, "query_graph") == 0 ||
+                strcmp(TOOLS[i].name, "search_code") == 0) {
+                emit_tool(doc, tools, &TOOLS[i]);
+            }
+        }
         for (int i = 0; i < STREAMLINED_TOOL_COUNT; i++) {
             emit_tool(doc, tools, &STREAMLINED_TOOLS[i]);
         }
-        /* Also emit individually-enabled tools */
+        /* Also emit individually-enabled tools (skip names already emitted as the
+         * default surface to avoid double-emit if someone sets tool_search_graph true).
+         * trace_call_path lives in both TOOLS[] and STREAMLINED_TOOLS[], so skip it too.
+         * (get_code is streamlined-only; get_code_snippet is the TOOLS[] name.) */
         for (int i = 0; i < TOOL_COUNT; i++) {
+            if (strcmp(TOOLS[i].name, "search_graph") == 0 ||
+                strcmp(TOOLS[i].name, "query_graph") == 0 ||
+                strcmp(TOOLS[i].name, "search_code") == 0 ||
+                strcmp(TOOLS[i].name, "trace_call_path") == 0) {
+                continue;
+            }
             char key[64];
             snprintf(key, sizeof(key), "tool_%s", TOOLS[i].name);
             if (srv && srv->config && cbm_config_get_bool(srv->config, key, false)) {
@@ -896,13 +858,15 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
         }
 
         /* Progressive disclosure: list hidden tools so AI knows they exist.
-         * Added as a special tool entry with description explaining how to enable. */
+         * Added as a special tool entry with description explaining how to enable.
+         * The 5 default-surface tools (search_graph, query_graph, search_code,
+         * trace_call_path, get_code) are NOT listed here — only the 11 hidden ones. */
         yyjson_mut_val *hint_tool = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_str(doc, hint_tool, "name", "_hidden_tools");
         yyjson_mut_obj_add_str(doc, hint_tool, "description",
-            "14 additional tools available but hidden in streamlined mode. "
-            "Hidden: index_repository, search_graph, query_graph, get_code_snippet, "
-            "get_graph_schema, get_architecture, search_code, list_projects, "
+            "11 additional tools available but hidden in streamlined mode. "
+            "Hidden: index_repository, get_code_snippet, "
+            "get_graph_schema, get_architecture, list_projects, "
             "delete_project, index_status, detect_changes, manage_adr, "
             "ingest_traces, index_dependencies. "
             "Projects auto-index on first query (no manual setup needed). "
@@ -3794,13 +3758,13 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         if (qn_input && !func_name) {
             snprintf(errbuf, sizeof(errbuf),
                 "{\"error\":\"function not found for qualified_name: '%s'\","
-                "\"hint\":\"Use search_code_graph with pattern= to find the correct qualified_name, "
+                "\"hint\":\"Use search_graph with pattern= to find the correct qualified_name, "
                 "then pass it here.\"}",
                 qn_input);
         } else {
             snprintf(errbuf, sizeof(errbuf),
                 "{\"error\":\"function not found: '%s'\","
-                "\"hint\":\"Use search_code_graph with name_pattern to find similar symbols.\"}",
+                "\"hint\":\"Use search_graph with name_pattern to find similar symbols.\"}",
                 func_name ? func_name : "");
         }
         free(func_name);
@@ -6335,25 +6299,13 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     if (!tool_name) {
         return cbm_mcp_text_result(
             "{\"error\":\"missing tool name\","
-            "\"hint\":\"Available tools: search_code_graph, trace_call_path, get_code. "
+            "\"hint\":\"Available tools: search_graph, query_graph, search_code, "
+            "trace_call_path, get_code. "
             "Use tools/list to see all available tools.\"}", true);
     }
 
-    /* Phase 9: consolidated tool names (streamlined mode) */
-    if (strcmp(tool_name, "search_code_graph") == 0) {
-        /* Check if cypher param is present → route to query_graph handler */
-        char *cypher = cbm_mcp_get_string_arg(args_json, "cypher");
-        if (cypher) {
-            free(cypher);
-            return handle_query_graph(srv, args_json);
-        }
-        /* Check if search_in="source" → route to search_code handler */
-        char *si = cbm_mcp_get_string_arg(args_json, "search_in");
-        bool src = si && strcmp(si, "source") == 0;
-        free(si);
-        if (src) return handle_search_code(srv, args_json);
-        return handle_search_graph(srv, args_json);
-    }
+    /* Streamlined alias: get_code → get_code_snippet handler.
+     * (The 3 search tools dispatch by their real names below.) */
     if (strcmp(tool_name, "get_code") == 0) {
         return handle_get_code_snippet(srv, args_json);
     }
@@ -6422,7 +6374,8 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     char msg[512];
     snprintf(msg, sizeof(msg),
         "{\"error\":\"unknown tool: '%s'\","
-        "\"hint\":\"Available tools: search_code_graph, trace_call_path, get_code. "
+        "\"hint\":\"Available tools: search_graph, query_graph, search_code, "
+        "trace_call_path, get_code. "
         "Use tools/list to see all available tools.\"}", tool_name);
     return cbm_mcp_text_result(msg, true);
 }
