@@ -115,9 +115,25 @@ static void delete_cross_edges(cbm_store_t *store, const char *project) {
     cbm_store_delete_edges_by_type(store, project, "CROSS_TRPC_CALLS");
 }
 
-/* Insert a CROSS_* edge into a store. */
-static void insert_cross_edge(cbm_store_t *store, const char *project, int64_t from_id,
-                              int64_t to_id, const char *edge_type, const char *props) {
+/* Insert a CROSS_* edge, skipping if an identical (source, target, type) edge
+ * already exists. The pass can reach the same caller/route pair from both
+ * directions and emit_cross_route_bidirectional writes both DBs, so this guard
+ * keeps emission idempotent. Returns 1 if a new row was inserted, else 0, so
+ * callers count rows actually added rather than matches found. Issue #523. */
+static int insert_cross_edge(cbm_store_t *store, const char *project, int64_t from_id,
+                             int64_t to_id, const char *edge_type, const char *props) {
+    cbm_edge_t *existing = NULL;
+    int existing_count = 0;
+    if (cbm_store_find_edges_by_source_type(store, from_id, edge_type, &existing,
+                                            &existing_count) == 0) {
+        for (int i = 0; i < existing_count; i++) {
+            if (existing[i].target_id == to_id) {
+                cbm_store_free_edges(existing, existing_count);
+                return 0; /* already present - do not duplicate */
+            }
+        }
+        cbm_store_free_edges(existing, existing_count);
+    }
     cbm_edge_t edge = {
         .project = project,
         .source_id = from_id,
@@ -126,6 +142,22 @@ static void insert_cross_edge(cbm_store_t *store, const char *project, int64_t f
         .properties_json = props,
     };
     cbm_store_insert_edge(store, &edge);
+    return 1;
+}
+
+/* Strip scheme + authority from a URL, returning a pointer to the path.
+ * cbm_route_canon_path handles placeholder syntax but not scheme/host, so a
+ * consumer's full URL needs this before the route-QN lookup. Issue #523. */
+static const char *cr_url_path(const char *url) {
+    if (!url) {
+        return url;
+    }
+    const char *scheme_end = strstr(url, "://");
+    if (!scheme_end) {
+        return url;
+    }
+    const char *path_start = strchr(scheme_end + 3, '/');
+    return path_start ? path_start : url;
 }
 
 /* Look up a node's name and file_path by id. */
@@ -208,29 +240,140 @@ static int64_t find_route_handler(cbm_store_t *target_store, const char *route_q
     return handler_id;
 }
 
+/* Segment-wise match of a concrete path against a route template path, where a
+ * "{...}" segment in the template matches any single concrete segment. Both
+ * inputs are bare paths (no method prefix). Returns true on a full match. */
+static bool cr_path_matches_template(const char *concrete, const char *templ) {
+    const char *c = concrete;
+    const char *t = templ;
+    while (*c && *t) {
+        if (*c == '/') {
+            c++;
+        }
+        if (*t == '/') {
+            t++;
+        }
+        const char *cseg = c;
+        while (*c && *c != '/') {
+            c++;
+        }
+        const char *tseg = t;
+        while (*t && *t != '/') {
+            t++;
+        }
+        size_t clen = (size_t)(c - cseg);
+        size_t tlen = (size_t)(t - tseg);
+        bool t_is_param = (tlen >= 2 && tseg[0] == '{' && tseg[tlen - 1] == '}');
+        if (!t_is_param) {
+            if (clen != tlen || strncmp(cseg, tseg, clen) != 0) {
+                return false;
+            }
+        } else if (clen == 0) {
+            return false;
+        }
+    }
+    while (*c == '/') {
+        c++;
+    }
+    while (*t == '/') {
+        t++;
+    }
+    return *c == '\0' && *t == '\0';
+}
+
+/* Fallback for when an exact route-QN lookup misses: a concrete client path
+ * ("/v2/orders/123") will not exact-match a templated route QN
+ * ("__route__GET__/v2/orders/{}"). Enumerate the target's Route nodes and
+ * segment-match the concrete path against each template. On a match, copy the
+ * route QN into out_qn and return the handler id. Returns 0 on no match.
+ *
+ * Complexity: this only runs when the exact QN lookup misses, but for each such
+ * unmatched call it scans every Route node in the target — O(calls x routes) in
+ * the worst case. Fine at current scale; if it shows up in profiles, a prefix
+ * index on the literal path segments would bound it. #523 */
+static int64_t find_route_handler_fuzzy(cbm_store_t *target_store, const char *concrete_path,
+                                        const char *method, char *out_qn, size_t out_qn_sz,
+                                        char *handler_name, size_t name_sz, char *handler_file,
+                                        size_t file_sz) {
+    struct sqlite3 *db = cbm_store_get_db(target_store);
+    if (!db) {
+        return 0;
+    }
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(
+            db, "SELECT qualified_name FROM nodes WHERE label = 'Route' AND qualified_name LIKE ?1",
+            CBM_NOT_FOUND, &s, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_text(s, SKIP_ONE, "__route__%", CBM_NOT_FOUND, SQLITE_STATIC);
+    int64_t found = 0;
+    char matched_qn[CR_QN_BUF] = {0};
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        const char *qn = (const char *)sqlite3_column_text(s, 0);
+        if (!qn || strncmp(qn, "__route__", 9) != 0) {
+            continue;
+        }
+        const char *rest = qn + 9;
+        const char *sep = strstr(rest, "__");
+        if (!sep) {
+            continue;
+        }
+        size_t mlen = (size_t)(sep - rest);
+        const char *rpath = sep + 2;
+        bool method_ok = true;
+        if (method && method[0]) {
+            method_ok = (strncmp(rest, method, mlen) == 0 && method[mlen] == '\0') ||
+                        (mlen == 3 && strncmp(rest, "ANY", 3) == 0);
+        }
+        if (!method_ok) {
+            continue;
+        }
+        if (cr_path_matches_template(concrete_path, rpath)) {
+            /* A path can match more than one stored template (e.g. both the
+             * raw "{id}" route and its canonical "{}" form). Only accept a
+             * match whose Route node actually has a HANDLES edge — the handler
+             * is attached to the canonical node. Keep scanning otherwise. */
+            int64_t hid =
+                find_route_handler(target_store, qn, handler_name, name_sz, handler_file, file_sz);
+            if (hid != 0) {
+                snprintf(matched_qn, sizeof(matched_qn), "%s", qn);
+                found = hid;
+                break;
+            }
+        }
+    }
+    sqlite3_finalize(s);
+    if (!found) {
+        return 0;
+    }
+    snprintf(out_qn, out_qn_sz, "%s", matched_qn);
+    return found;
+}
+
 /* Emit CROSS_* edge for a route match: forward into source, reverse into target. */
-static void emit_cross_route_bidirectional(cbm_store_t *src_store, const char *src_project,
-                                           struct sqlite3 *src_db, int64_t caller_id,
-                                           int64_t local_route_id, cbm_store_t *tgt_store,
-                                           const char *tgt_project, int64_t handler_id,
-                                           const char *route_qn, const char *handler_name,
-                                           const char *handler_file, const char *url_path,
-                                           const char *method, const char *edge_type) {
+static int emit_cross_route_bidirectional(cbm_store_t *src_store, const char *src_project,
+                                          struct sqlite3 *src_db, int64_t caller_id,
+                                          int64_t local_route_id, cbm_store_t *tgt_store,
+                                          const char *tgt_project, int64_t handler_id,
+                                          const char *route_qn, const char *handler_name,
+                                          const char *handler_file, const char *url_path,
+                                          const char *method, const char *edge_type) {
     /* Forward: caller → local Route in source DB */
     char fwd[CR_PROPS_BUF];
     build_cross_props(fwd, sizeof(fwd), tgt_project, handler_name, handler_file, url_path,
                       "url_path", method);
-    insert_cross_edge(src_store, src_project, caller_id, local_route_id, edge_type, fwd);
+    int inserted =
+        insert_cross_edge(src_store, src_project, caller_id, local_route_id, edge_type, fwd);
 
     /* Reverse: handler → Route in target DB */
     struct sqlite3 *tgt_db = cbm_store_get_db(tgt_store);
     if (!tgt_db) {
-        return;
+        return inserted;
     }
     sqlite3_stmt *rq = NULL;
     if (sqlite3_prepare_v2(tgt_db, "SELECT id FROM nodes WHERE qualified_name = ?1 LIMIT 1",
                            CBM_NOT_FOUND, &rq, NULL) != SQLITE_OK) {
-        return;
+        return inserted;
     }
     sqlite3_bind_text(rq, SKIP_ONE, route_qn, CBM_NOT_FOUND, SQLITE_STATIC);
     int64_t tgt_route_id = 0;
@@ -239,7 +382,7 @@ static void emit_cross_route_bidirectional(cbm_store_t *src_store, const char *s
     }
     sqlite3_finalize(rq);
     if (tgt_route_id == 0) {
-        return;
+        return inserted;
     }
 
     char caller_name[CBM_SZ_256] = {0};
@@ -251,6 +394,7 @@ static void emit_cross_route_bidirectional(cbm_store_t *src_store, const char *s
     build_cross_props(rev, sizeof(rev), src_project, caller_name, caller_file, url_path, "url_path",
                       method);
     insert_cross_edge(tgt_store, tgt_project, handler_id, tgt_route_id, edge_type, rev);
+    return inserted;
 }
 
 static int match_http_routes(cbm_store_t *src_store, const char *src_project,
@@ -289,7 +433,7 @@ static int match_http_routes(cbm_store_t *src_store, const char *src_project,
          * placeholder syntax). */
         char route_qn[CR_QN_BUF];
         char cpath[CBM_SZ_256];
-        const char *curl = cbm_route_canon_path(url_path, cpath, sizeof(cpath));
+        const char *curl = cbm_route_canon_path(cr_url_path(url_path), cpath, sizeof(cpath));
         snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method[0] ? method : "ANY", curl);
 
         char handler_name[CBM_SZ_256] = {0};
@@ -304,14 +448,21 @@ static int match_http_routes(cbm_store_t *src_store, const char *src_project,
                                             handler_file, sizeof(handler_file));
         }
         if (handler_id == 0) {
+            /* Exact QN lookup missed. A concrete client path ("/v2/orders/123")
+             * does not exact-match a templated route ("/v2/orders/{}"), so fall
+             * back to segment-wise template matching. Issue #523. */
+            handler_id = find_route_handler_fuzzy(
+                tgt_store, cr_url_path(url_path), method[0] ? method : NULL, route_qn,
+                sizeof(route_qn), handler_name, sizeof(handler_name), handler_file,
+                sizeof(handler_file));
+        }
+        if (handler_id == 0) {
             continue;
         }
 
-        emit_cross_route_bidirectional(src_store, src_project, src_db, caller_id, route_id,
-                                       tgt_store, tgt_project, handler_id, route_qn, handler_name,
-                                       handler_file, url_path, method, "CROSS_HTTP_CALLS");
-
-        count++;
+        count += emit_cross_route_bidirectional(
+            src_store, src_project, src_db, caller_id, route_id, tgt_store, tgt_project, handler_id,
+            route_qn, handler_name, handler_file, url_path, method, "CROSS_HTTP_CALLS");
     }
     sqlite3_finalize(s);
     return count;
@@ -365,9 +516,8 @@ static int match_async_routes(cbm_store_t *src_store, const char *src_project,
         char edge_props[CR_PROPS_BUF];
         build_cross_props(edge_props, sizeof(edge_props), tgt_project, handler_name, handler_file,
                           url_path, "url_path", broker);
-        insert_cross_edge(src_store, src_project, caller_id, route_id, "CROSS_ASYNC_CALLS",
-                          edge_props);
-        count++;
+        count += insert_cross_edge(src_store, src_project, caller_id, route_id, "CROSS_ASYNC_CALLS",
+                                   edge_props);
     }
     sqlite3_finalize(s);
     return count;
@@ -543,10 +693,9 @@ static int match_typed_routes(cbm_store_t *src_store, const char *src_project,
             continue;
         }
 
-        emit_cross_route_bidirectional(src_store, src_project, src_db, caller_id, route_id,
-                                       tgt_store, tgt_project, handler_id, route_qn, handler_name,
-                                       handler_file, svc_val, svc_key, cross_edge_type);
-        count++;
+        count += emit_cross_route_bidirectional(
+            src_store, src_project, src_db, caller_id, route_id, tgt_store, tgt_project, handler_id,
+            route_qn, handler_name, handler_file, svc_val, svc_key, cross_edge_type);
     }
     sqlite3_finalize(s);
     return count;
@@ -655,6 +804,12 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
         }
 
         result.http_edges += match_http_routes(src_store, project, tgt_store, tgt);
+        /* Reverse direction: when this pass is run from the provider side, the
+         * consumer's HTTP_CALLS live in tgt, not src — the forward pass above
+         * finds nothing because the provider has no outbound calls. The dedup
+         * guard in insert_cross_edge keeps a pair matched both ways from
+         * inflating the count or duplicating rows. Issue #523. */
+        result.http_edges += match_http_routes(tgt_store, tgt, src_store, project);
         result.async_edges += match_async_routes(src_store, project, tgt_store, tgt);
         result.channel_edges += match_channels(src_store, project, tgt_store, tgt);
         result.grpc_edges += match_typed_routes(src_store, project, tgt_store, tgt, "GRPC_CALLS",

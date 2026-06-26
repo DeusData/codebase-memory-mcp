@@ -76,23 +76,21 @@
  *   the call is dropped, and no HTTP_CALLS edge is created.
  */
 static const RFile client_files[] = {
-    {
-        "client/orders.py",
-        "import requests\n"
-        "\n"
-        "\n"
-        "BASE_URL = \"http://order-service:8080\"\n"
-        "\n"
-        "\n"
-        "def fetch_order(order_id):\n"
-        "    \"\"\"Fetch a single order from the order service.\"\"\"\n"
-        "    return requests.get(\"/api/orders/{id}\", params={\"id\": order_id})\n"
-        "\n"
-        "\n"
-        "def list_orders():\n"
-        "    \"\"\"Fetch all orders from the order service.\"\"\"\n"
-        "    return requests.get(\"/api/orders\")\n"
-    },
+    {"client/orders.py",
+     "import requests\n"
+     "\n"
+     "\n"
+     "BASE_URL = \"http://order-service:8080\"\n"
+     "\n"
+     "\n"
+     "def fetch_order(order_id):\n"
+     "    \"\"\"Fetch a single order from the order service.\"\"\"\n"
+     "    return requests.get(\"/api/orders/{id}\", params={\"id\": order_id})\n"
+     "\n"
+     "\n"
+     "def list_orders():\n"
+     "    \"\"\"Fetch all orders from the order service.\"\"\"\n"
+     "    return requests.get(\"/api/orders\")\n"},
 };
 enum { N_CLIENT_FILES = (int)(sizeof(client_files) / sizeof(client_files[0])) };
 
@@ -105,24 +103,21 @@ enum { N_CLIENT_FILES = (int)(sizeof(client_files) / sizeof(client_files[0])) };
  *   via cbm_route_canon_path).  A HANDLES edge links the Route to `get_order`.
  */
 static const RFile server_files[] = {
-    {
-        "server/app.py",
-        "from flask import Flask, jsonify\n"
-        "\n"
-        "app = Flask(__name__)\n"
-        "\n"
-        "\n"
-        "@app.get(\"/api/orders/{id}\")\n"
-        "def get_order(order_id):\n"
-        "    \"\"\"Return a single order by id.\"\"\"\n"
-        "    return jsonify({\"id\": order_id, \"status\": \"ok\"})\n"
-        "\n"
-        "\n"
-        "@app.get(\"/api/orders\")\n"
-        "def list_orders():\n"
-        "    \"\"\"Return all orders.\"\"\"\n"
-        "    return jsonify({\"orders\": []})\n"
-    },
+    {"server/app.py", "from flask import Flask, jsonify\n"
+                      "\n"
+                      "app = Flask(__name__)\n"
+                      "\n"
+                      "\n"
+                      "@app.get(\"/api/orders/{id}\")\n"
+                      "def get_order(order_id):\n"
+                      "    \"\"\"Return a single order by id.\"\"\"\n"
+                      "    return jsonify({\"id\": order_id, \"status\": \"ok\"})\n"
+                      "\n"
+                      "\n"
+                      "@app.get(\"/api/orders\")\n"
+                      "def list_orders():\n"
+                      "    \"\"\"Return all orders.\"\"\"\n"
+                      "    return jsonify({\"orders\": []})\n"},
 };
 enum { N_SERVER_FILES = (int)(sizeof(server_files) / sizeof(server_files[0])) };
 
@@ -147,8 +142,7 @@ enum { N_SERVER_FILES = (int)(sizeof(server_files) / sizeof(server_files[0])) };
 TEST(repro_issue523_crossrepo_http_calls_edge) {
     /* ── Index client service ─────────────────────────────────── */
     RProj client;
-    cbm_store_t *client_store =
-        rh_index_files(&client, client_files, N_CLIENT_FILES);
+    cbm_store_t *client_store = rh_index_files(&client, client_files, N_CLIENT_FILES);
     ASSERT_NOT_NULL(client_store);
 
     int client_http = rh_count_edges(client_store, client.project, "HTTP_CALLS");
@@ -162,13 +156,11 @@ TEST(repro_issue523_crossrepo_http_calls_edge) {
 
     /* ── Index server service ─────────────────────────────────── */
     RProj server;
-    cbm_store_t *server_store =
-        rh_index_files(&server, server_files, N_SERVER_FILES);
+    cbm_store_t *server_store = rh_index_files(&server, server_files, N_SERVER_FILES);
     ASSERT_NOT_NULL(server_store);
 
     int server_routes = rh_count_label(server_store, server.project, "Route");
-    fprintf(stderr,
-            "  [523] server Route nodes=%d  (expected>=2; 0=extractor broken)\n",
+    fprintf(stderr, "  [523] server Route nodes=%d  (expected>=2; 0=extractor broken)\n",
             server_routes);
     /* Server-side extraction is correct — if this fails the test environment is
      * broken, not the cross-repo linker.  Fail fast with a clear message. */
@@ -193,8 +185,7 @@ TEST(repro_issue523_crossrepo_http_calls_edge) {
      * Buggy:   http_edges == 0 (no HTTP_CALLS in client → nothing to match).
      */
     const char *server_project = server.project;
-    cbm_cross_repo_result_t result =
-        cbm_cross_repo_match(client.project, &server_project, 1);
+    cbm_cross_repo_result_t result = cbm_cross_repo_match(client.project, &server_project, 1);
 
     fprintf(stderr,
             "  [523] cross_repo http_edges=%d  "
@@ -225,7 +216,143 @@ TEST(repro_issue523_crossrepo_http_calls_edge) {
     PASS();
 }
 
+/* ── #523 follow-up: cross-repo matcher behaviors ────────────────────────────
+ *
+ * The canonical repro above covers the client-emission root cause. These three
+ * cover the pass_cross_repo.c matching behaviors added alongside it:
+ *   (A) scheme/host-stripped full-URL match,
+ *   (B) concrete-path vs templated-route fuzzy match,
+ *   (C) provider-side reverse run + dedup idempotence.
+ */
+
+/* (A) Client calls a FULL URL (scheme+host+port); server route is a bare path.
+ * cr_url_path() must strip the scheme+authority so the paths match. */
+static const RFile a_client_files[] = {
+    {"client/orders.py", "import requests\n"
+                         "\n"
+                         "\n"
+                         "def list_orders():\n"
+                         "    return requests.get(\"http://order-service:8080/api/orders\")\n"},
+};
+static const RFile a_server_files[] = {
+    {"server/app.py", "from flask import Flask, jsonify\n"
+                      "\n"
+                      "app = Flask(__name__)\n"
+                      "\n"
+                      "\n"
+                      "@app.get(\"/api/orders\")\n"
+                      "def list_orders():\n"
+                      "    return jsonify({\"orders\": []})\n"},
+};
+
+TEST(repro_issue523_crossrepo_scheme_stripped_url_match) {
+    RProj client;
+    cbm_store_t *cs = rh_index_files(&client, a_client_files, 1);
+    ASSERT_NOT_NULL(cs);
+    cbm_store_close(cs);
+
+    RProj server;
+    cbm_store_t *ss = rh_index_files(&server, a_server_files, 1);
+    ASSERT_NOT_NULL(ss);
+    cbm_store_close(ss);
+
+    const char *sp = server.project;
+    cbm_cross_repo_result_t r = cbm_cross_repo_match(client.project, &sp, 1);
+    fprintf(stderr, "  [523-A] scheme-stripped http_edges=%d (expected>=1)\n", r.http_edges);
+
+    rh_cleanup(&client, NULL);
+    rh_cleanup(&server, NULL);
+    ASSERT_GTE(r.http_edges, 1);
+    PASS();
+}
+
+/* (B) Client calls a CONCRETE path ("/api/orders/42"); server registers a
+ * TEMPLATED route ("/api/orders/{id}" -> canonical "{}"). The exact QN lookup
+ * misses; find_route_handler_fuzzy must segment-match concrete vs template. */
+static const RFile b_client_files[] = {
+    {"client/orders.py", "import requests\n"
+                         "\n"
+                         "\n"
+                         "def fetch_order():\n"
+                         "    return requests.get(\"http://order-service:8080/api/orders/42\")\n"},
+};
+static const RFile b_server_files[] = {
+    {"server/app.py", "from flask import Flask, jsonify\n"
+                      "\n"
+                      "app = Flask(__name__)\n"
+                      "\n"
+                      "\n"
+                      "@app.get(\"/api/orders/{id}\")\n"
+                      "def get_order(order_id):\n"
+                      "    return jsonify({\"id\": order_id})\n"},
+};
+
+TEST(repro_issue523_crossrepo_template_fuzzy_match) {
+    RProj client;
+    cbm_store_t *cs = rh_index_files(&client, b_client_files, 1);
+    ASSERT_NOT_NULL(cs);
+    cbm_store_close(cs);
+
+    RProj server;
+    cbm_store_t *ss = rh_index_files(&server, b_server_files, 1);
+    ASSERT_NOT_NULL(ss);
+    cbm_store_close(ss);
+
+    const char *sp = server.project;
+    cbm_cross_repo_result_t r = cbm_cross_repo_match(client.project, &sp, 1);
+    fprintf(stderr, "  [523-B] concrete->template http_edges=%d (expected>=1)\n", r.http_edges);
+
+    rh_cleanup(&client, NULL);
+    rh_cleanup(&server, NULL);
+    ASSERT_GTE(r.http_edges, 1);
+    PASS();
+}
+
+/* (C) Reverse direction + dedup idempotence. Run the match from the PROVIDER
+ * side (server as source): the server has no outbound HTTP_CALLS, so only the
+ * reverse pass can discover the client's call. Running twice must not inflate:
+ * the second run inserts no new rows, and the client DB holds exactly one
+ * CROSS_HTTP_CALLS edge. */
+TEST(repro_issue523_crossrepo_reverse_and_dedup) {
+    RProj client;
+    cbm_store_t *cs = rh_index_files(&client, b_client_files, 1);
+    ASSERT_NOT_NULL(cs);
+    cbm_store_close(cs);
+
+    RProj server;
+    cbm_store_t *ss = rh_index_files(&server, b_server_files, 1);
+    ASSERT_NOT_NULL(ss);
+    cbm_store_close(ss);
+
+    /* Run from the provider side: source = server, target = client. */
+    const char *cp = client.project;
+    cbm_cross_repo_result_t r1 = cbm_cross_repo_match(server.project, &cp, 1);
+    fprintf(stderr, "  [523-C] provider-side run1 http_edges=%d (expected>=1)\n", r1.http_edges);
+    ASSERT_GTE(r1.http_edges, 1);
+
+    /* Second identical run must insert no new rows (dedup idempotence). */
+    cbm_cross_repo_result_t r2 = cbm_cross_repo_match(server.project, &cp, 1);
+    fprintf(stderr, "  [523-C] provider-side run2 http_edges=%d (expected 0, no new rows)\n",
+            r2.http_edges);
+    ASSERT_EQ(r2.http_edges, 0);
+
+    /* Exactly one CROSS_HTTP_CALLS row persists in the client DB. */
+    cbm_store_t *cs2 = cbm_store_open_path(client.dbpath);
+    ASSERT_NOT_NULL(cs2);
+    int rows = rh_count_edges(cs2, client.project, "CROSS_HTTP_CALLS");
+    fprintf(stderr, "  [523-C] client CROSS_HTTP_CALLS rows=%d (expected 1)\n", rows);
+    cbm_store_close(cs2);
+
+    rh_cleanup(&client, NULL);
+    rh_cleanup(&server, NULL);
+    ASSERT_EQ(rows, 1);
+    PASS();
+}
+
 /* ── Suite ───────────────────────────────────────────────────────────────── */
 SUITE(repro_issue523) {
     RUN_TEST(repro_issue523_crossrepo_http_calls_edge);
+    RUN_TEST(repro_issue523_crossrepo_scheme_stripped_url_match);
+    RUN_TEST(repro_issue523_crossrepo_template_fuzzy_match);
+    RUN_TEST(repro_issue523_crossrepo_reverse_and_dedup);
 }
