@@ -264,6 +264,7 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key);
 /* Well-known config keys */
 #define CBM_CONFIG_AUTO_INDEX "auto_index"
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
+#define CBM_CONFIG_AUTO_WATCH "auto_watch"
 
 /* ── Subcommands (wired from main.c) ─────────────────────────── */
 
@@ -291,6 +292,6 @@ int cbm_cmd_hook_augment(void);
  * a machine-readable JSON list of the config/instruction/hook files `install`
  * would write, produced WITHOUT mutating anything. Returns a heap JSON string
  * (caller frees) or NULL on error. Exposed for `install --plan` and testing. */
-char *cbm_build_install_plan_json(const char *home, const char *binary_path);
+char *cbm_build_install_plan_json(const char *home, const char *binary_path, bool install_hooks);
 
 #endif /* CBM_CLI_H */

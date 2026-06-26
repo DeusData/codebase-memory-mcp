@@ -42,6 +42,7 @@ enum {
 #include <sqlite3.h>
 #include "cypher/cypher.h"
 #include "pipeline/pipeline.h"
+#include "pipeline/project_resolve.h"
 #include "pipeline/pass_cross_repo.h"
 #include "git/git_context.h"
 #include "cli/cli.h"
@@ -2800,6 +2801,9 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     return degraded;
 }
 
+static bool auto_watch_enabled(cbm_mcp_server_t *srv);
+static void register_watcher_if_enabled(cbm_mcp_server_t *srv);
+
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
@@ -2883,6 +2887,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         bool degraded = build_index_success_response(srv, doc, root, project_name, repo_path,
                                                      persistence, p, excluded_dirs, excluded_count);
         yyjson_mut_obj_add_str(doc, root, "status", degraded ? "degraded" : "indexed");
+        if (srv->watcher && auto_watch_enabled(srv)) {
+            cbm_watcher_watch(srv->watcher, project_name, repo_path);
+        }
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
         yyjson_mut_obj_add_str(doc, root, "hint",
@@ -4587,15 +4594,41 @@ static void detect_session(cbm_mcp_server_t *srv) {
      * used by the pipeline, otherwise session queries look for a .db file
      * that doesn't match the indexed project name. */
     if (srv->session_root[0]) {
-        char *pname = cbm_project_name_from_path(srv->session_root);
-        if (pname) {
-            snprintf(srv->session_project, sizeof(srv->session_project), "%s", pname);
-            free(pname);
+        char *existing = cbm_find_existing_project_name(srv->session_root);
+        if (existing) {
+            snprintf(srv->session_project, sizeof(srv->session_project), "%s", existing);
+            cbm_log_info("session.project.reuse", "project", existing, "path", srv->session_root);
+            free(existing);
+        } else {
+            char *pname = cbm_project_name_from_path(srv->session_root);
+            if (pname) {
+                snprintf(srv->session_project, sizeof(srv->session_project), "%s", pname);
+                free(pname);
+            }
         }
     }
 }
 
 /* Background auto-index thread function */
+static bool auto_watch_enabled(cbm_mcp_server_t *srv) {
+    if (!srv || !srv->config) {
+        return false;
+    }
+    return cbm_config_get_bool(srv->config, CBM_CONFIG_AUTO_WATCH, false);
+}
+
+static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
+    if (!srv || !srv->watcher || srv->session_project[0] == '\0' || srv->session_root[0] == '\0') {
+        return;
+    }
+    if (!auto_watch_enabled(srv)) {
+        cbm_log_info("watcher.skip", "reason", "auto_watch_disabled", "hint",
+                     "run: codebase-memory-mcp config set auto_watch true");
+        return;
+    }
+    cbm_watcher_watch(srv->watcher, srv->session_project, srv->session_root);
+}
+
 static void *autoindex_thread(void *arg) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
 
@@ -4617,10 +4650,7 @@ static void *autoindex_thread(void *arg) {
 
     if (rc == 0) {
         cbm_log_info("autoindex.done", "project", srv->session_project);
-        /* Register with watcher for ongoing change detection */
-        if (srv->watcher) {
-            cbm_watcher_watch(srv->watcher, srv->session_project, srv->session_root);
-        }
+        register_watcher_if_enabled(srv);
     } else {
         cbm_log_warn("autoindex.err", "msg", "pipeline_run_failed");
     }
@@ -4640,12 +4670,10 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         snprintf(db_check, sizeof(db_check), "%s/%s.db", cbm_resolve_cache_dir(),
                  srv->session_project);
         if (cbm_file_size(db_check) >= 0) {
-            /* Already indexed → register watcher for change detection */
+            /* Already indexed — use existing graph; never auto re-index on connect. */
             cbm_log_info("autoindex.skip", "reason", "already_indexed", "project",
                          srv->session_project);
-            if (srv->watcher) {
-                cbm_watcher_watch(srv->watcher, srv->session_project, srv->session_root);
-            }
+            register_watcher_if_enabled(srv);
             return;
         }
     }
