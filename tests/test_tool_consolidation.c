@@ -1051,6 +1051,95 @@ TEST(store_prefix_match_includes_deps) {
     PASS();
 }
 
+/* #18 RED: project-over-dependency source ranking in the COMMON prefix-match
+ * path (project="myapp", which includes myapp.dep.*). A dependency symbol must
+ * NOT outrank the project's own symbol of the same name — the "Path" concern
+ * (a python-stdlib Path must not be front-of-line over the user's own Path).
+ *
+ * The store already has a dep-last tiebreak, but it ONLY fires for
+ * params->project_pattern (glob). The common prefix path sets params->project,
+ * so today deps are NOT demoted here → a dep inserted first (lower id) wins the
+ * name/id tiebreak and ranks above the project symbol. This test must FAIL until
+ * dep-last is extended to the prefix-match path. */
+TEST(store_prefix_ranks_project_above_dep) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "myapp", "/tmp/myapp");
+    cbm_store_upsert_project(s, "myapp.dep.stdlib", "/tmp/stdlib");
+
+    /* Insert the DEPENDENCY symbol FIRST so it gets the lower id — under the
+     * current (no-dep-last-in-prefix-path) ordering it wins the id tiebreak. */
+    cbm_node_t nd = {.project = "myapp.dep.stdlib", .label = "Class", .name = "Path",
+                     .qualified_name = "myapp.dep.stdlib.Path", .file_path = "stdlib/path.py"};
+    cbm_store_upsert_node(s, &nd);
+    cbm_node_t np = {.project = "myapp", .label = "Class", .name = "Path",
+                     .qualified_name = "myapp.Path", .file_path = "src/path.py"};
+    cbm_store_upsert_node(s, &np);
+
+    cbm_search_params_t params = {0};
+    params.project = "myapp"; /* prefix match: includes myapp.dep.* */
+    params.limit = 10;
+    cbm_search_output_t out = {0};
+    cbm_store_search(s, &params, &out);
+    ASSERT_GTE(out.count, 2);
+
+    /* The PROJECT 'Path' must rank above the DEPENDENCY 'Path'. */
+    int proj_idx = -1, dep_idx = -1;
+    for (int i = 0; i < out.count; i++) {
+        if (strcmp(out.results[i].node.name, "Path") != 0) continue;
+        if (strcmp(out.results[i].node.project, "myapp") == 0) proj_idx = i;
+        if (strcmp(out.results[i].node.project, "myapp.dep.stdlib") == 0) dep_idx = i;
+    }
+    ASSERT_NEQ(proj_idx, -1);
+    ASSERT_NEQ(dep_idx, -1);
+    ASSERT_TRUE(proj_idx < dep_idx); /* project before dependency */
+
+    cbm_store_search_free(&out);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* #38: the dep-last ranking is tunable. With disable_dep_ranking=true the store
+ * applies PURE relevance order — a dep symbol may rank above the project's own.
+ * This makes the ranking a parameter (config key search_disable_dep_ranking)
+ * rather than a hard-coded decision, per the project's meta-param conventions. */
+TEST(store_prefix_disable_dep_ranking_lets_dep_win) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "myapp", "/tmp/myapp");
+    cbm_store_upsert_project(s, "myapp.dep.stdlib", "/tmp/stdlib");
+    cbm_node_t nd = {.project = "myapp.dep.stdlib", .label = "Class", .name = "Path",
+                     .qualified_name = "myapp.dep.stdlib.Path", .file_path = "stdlib/path.py"};
+    cbm_store_upsert_node(s, &nd);
+    cbm_node_t np = {.project = "myapp", .label = "Class", .name = "Path",
+                     .qualified_name = "myapp.Path", .file_path = "src/path.py"};
+    cbm_store_upsert_node(s, &np);
+
+    cbm_search_params_t params = {0};
+    params.project = "myapp";
+    params.disable_dep_ranking = true; /* pure relevance — no dep demotion */
+    params.limit = 10;
+    cbm_search_output_t out = {0};
+    cbm_store_search(s, &params, &out);
+    ASSERT_GTE(out.count, 2);
+
+    /* With dep-ranking disabled and equal relevance, the dep (lower id, inserted
+     * first) wins the id tiebreak → ranks above the project symbol. */
+    int proj_idx = -1, dep_idx = -1;
+    for (int i = 0; i < out.count; i++) {
+        if (strcmp(out.results[i].node.name, "Path") != 0) continue;
+        if (strcmp(out.results[i].node.project, "myapp") == 0) proj_idx = i;
+        if (strcmp(out.results[i].node.project, "myapp.dep.stdlib") == 0) dep_idx = i;
+    }
+    ASSERT_NEQ(proj_idx, -1);
+    ASSERT_NEQ(dep_idx, -1);
+    ASSERT_TRUE(dep_idx < proj_idx); /* dep before project (ranking disabled) */
+
+    cbm_store_search_free(&out);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* Bug 2 complement: exact match should NOT include deps. */
 TEST(store_exact_match_excludes_deps) {
     cbm_store_t *s = cbm_store_open_memory();
@@ -2095,6 +2184,8 @@ SUITE(tool_consolidation) {
     /* Dep search bug regressions */
     RUN_TEST(dep_search_explicit_dep_project_name);
     RUN_TEST(store_prefix_match_includes_deps);
+    RUN_TEST(store_prefix_ranks_project_above_dep);
+    RUN_TEST(store_prefix_disable_dep_ranking_lets_dep_win);
     RUN_TEST(store_exact_match_excludes_deps);
     RUN_TEST(is_dep_project_cross_project_detection);
     RUN_TEST(e2e_dep_search_returns_project_and_dep_results);

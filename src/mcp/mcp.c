@@ -99,6 +99,11 @@ static void add_pagerank_val(yyjson_mut_doc *doc, yyjson_mut_val *obj, double v)
 #define CBM_DEFAULT_SEARCH_LIMIT 50
 #define CBM_CONFIG_SEARCH_LIMIT "search_limit"
 
+/* Default: rank dependency sub-project symbols (proj.dep.*) LAST so a stdlib
+ * symbol like 'Path' never fronts the user's own 'Path'. Tunable off via config
+ * key "search_disable_dep_ranking" (true = pure relevance, deps may rank high). */
+#define CBM_CONFIG_SEARCH_DISABLE_DEP_RANKING "search_disable_dep_ranking"
+
 /* Default max source lines returned by get_code_snippet.
  * Set to 0 for unlimited. Prevents huge functions from consuming tokens.
  * Configurable via config key "snippet_max_lines". */
@@ -371,7 +376,8 @@ static const tool_def_t TOOLS[] = {
      "label/file_path='', degree=0. Saves tokens.\"},"
      "\"include_dependencies\":{\"type\":\"boolean\",\"default\":true,\"description\":\"Include "
      "symbols from dependency sub-projects (marked source=dependency in results). Set false to "
-     "scope to project code only.\"},"
+     "scope to project code only. When true, project symbols rank above dependency symbols by "
+     "default (config key search_disable_dep_ranking=true reverts to pure relevance).\"},"
      "\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Glob "
      "patterns for file paths to exclude from results (e.g. [\\\"tests/**\\\",\\\"scripts/**\\\"])."
      "\"}}}"},
@@ -2724,6 +2730,11 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     params.degree_mode = srv->config
         ? cbm_config_get(srv->config, "degree_mode", NULL)
         : NULL;
+    /* Dep-ranking: default false (deps rank last). Config key
+     * search_disable_dep_ranking=true → pure relevance (deps may rank high). */
+    params.disable_dep_ranking = srv->config
+        ? cbm_config_get_bool(srv->config, CBM_CONFIG_SEARCH_DISABLE_DEP_RANKING, false)
+        : false;
     params.limit = effective_limit;
     params.offset = offset;
     params.min_degree = min_degree;

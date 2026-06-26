@@ -2693,61 +2693,64 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     const char *id_col = has_degree_filter ? "id" : "n.id";
     const char *pr_col = has_degree_filter ? "pr_rank" : "pr_rank";
     char order_limit[CBM_SZ_256];
+
+    /* Dep-last: rank the project's own symbols above dependency sub-project
+     * symbols (proj.dep.*) whenever a search is scoped to a project (prefix
+     * match OR glob). Applied as a tiebreak right after the primary metric
+     * across ALL sort modes, so a stdlib symbol like 'Path' never outranks the
+     * user's own 'Path' on equal merit (#18, the Path concern). Previously this
+     * only fired for glob (project_pattern) searches; the common prefix path
+     * (params->project) omitted it, letting deps win the name/id tiebreak.
+     * Empty string when unscoped (no project) — preserves prior behavior. */
+    const char *proj_col = has_degree_filter ? "project" : "n.project";
+    bool scope_has_project = (params->project != NULL || params->project_pattern != NULL);
+    char dep_last[CBM_SZ_128];
+    if (scope_has_project && !params->disable_dep_ranking) {
+        snprintf(dep_last, sizeof(dep_last),
+                 "CASE WHEN %s LIKE '%%.dep.%%' THEN 1 ELSE 0 END, ", proj_col);
+    } else {
+        dep_last[0] = '\0';
+    }
+
     if (use_pagerank) {
-        /* Relevance sort: PageRank DESC, then dep-last, then name for stability */
-        if (params->project_pattern) {
-            const char *proj_col = has_degree_filter ? "project" : "n.project";
-            snprintf(order_limit, sizeof(order_limit),
-                     " ORDER BY %s DESC, "
-                     "CASE WHEN %s LIKE '%%.dep.%%' THEN 1 ELSE 0 END, %s, %s"
-                     " LIMIT %d OFFSET %d",
-                     pr_col, proj_col, name_col, id_col, limit, offset);
-        } else {
-            snprintf(order_limit, sizeof(order_limit),
-                     " ORDER BY %s DESC, %s, %s LIMIT %d OFFSET %d",
-                     pr_col, name_col, id_col, limit, offset);
-        }
+        /* Relevance sort: PageRank DESC, dep-last, name, id (stable pagination). */
+        snprintf(order_limit, sizeof(order_limit),
+                 " ORDER BY %s DESC, %s%s, %s LIMIT %d OFFSET %d",
+                 pr_col, dep_last, name_col, id_col, limit, offset);
     } else if (params->sort_by && strcmp(params->sort_by, "degree") == 0) {
         snprintf(order_limit, sizeof(order_limit),
-                 " ORDER BY (in_deg + out_deg) DESC, %s, %s LIMIT %d OFFSET %d",
-                 name_col, id_col, limit, offset);
+                 " ORDER BY (in_deg + out_deg) DESC, %s%s, %s LIMIT %d OFFSET %d",
+                 dep_last, name_col, id_col, limit, offset);
     } else if (params->sort_by && strcmp(params->sort_by, "calls") == 0) {
         if (has_degree_table && !has_degree_filter) {
             /* nd.* only accessible when not wrapped by the degree-filter subquery */
             snprintf(order_limit, sizeof(order_limit),
-                     " ORDER BY COALESCE(nd.calls_in + nd.calls_out, 0) DESC, %s, %s"
+                     " ORDER BY COALESCE(nd.calls_in + nd.calls_out, 0) DESC, %s%s, %s"
                      " LIMIT %d OFFSET %d",
-                     name_col, id_col, limit, offset);
+                     dep_last, name_col, id_col, limit, offset);
         } else {
             /* Fallback: no precomputed calls data, or query wrapped by degree
              * filter (nd alias out of scope) — use total degree */
             snprintf(order_limit, sizeof(order_limit),
-                     " ORDER BY (in_deg + out_deg) DESC, %s, %s LIMIT %d OFFSET %d",
-                     name_col, id_col, limit, offset);
+                     " ORDER BY (in_deg + out_deg) DESC, %s%s, %s LIMIT %d OFFSET %d",
+                     dep_last, name_col, id_col, limit, offset);
         }
     } else if (params->sort_by && strcmp(params->sort_by, "linkrank") == 0) {
         if (has_degree_table && !has_degree_filter) {
             snprintf(order_limit, sizeof(order_limit),
-                     " ORDER BY COALESCE(nd.linkrank_in, 0) DESC, %s, %s LIMIT %d OFFSET %d",
-                     name_col, id_col, limit, offset);
+                     " ORDER BY COALESCE(nd.linkrank_in, 0) DESC, %s%s, %s LIMIT %d OFFSET %d",
+                     dep_last, name_col, id_col, limit, offset);
         } else {
             /* Fallback: no precomputed linkrank — use total degree */
             snprintf(order_limit, sizeof(order_limit),
-                     " ORDER BY (in_deg + out_deg) DESC, %s, %s LIMIT %d OFFSET %d",
-                     name_col, id_col, limit, offset);
+                     " ORDER BY (in_deg + out_deg) DESC, %s%s, %s LIMIT %d OFFSET %d",
+                     dep_last, name_col, id_col, limit, offset);
         }
     } else {
-        /* name sort (explicit or fallback) */
-        if (params->project_pattern) {
-            const char *proj_col = has_degree_filter ? "project" : "n.project";
-            snprintf(order_limit, sizeof(order_limit),
-                     " ORDER BY CASE WHEN %s LIKE '%%.dep.%%' THEN 1 ELSE 0 END, %s, %s"
-                     " LIMIT %d OFFSET %d",
-                     proj_col, name_col, id_col, limit, offset);
-        } else {
-            snprintf(order_limit, sizeof(order_limit), " ORDER BY %s, %s LIMIT %d OFFSET %d",
-                     name_col, id_col, limit, offset);
-        }
+        /* name sort (explicit or fallback): dep-last, name, id. */
+        snprintf(order_limit, sizeof(order_limit),
+                 " ORDER BY %s%s, %s LIMIT %d OFFSET %d",
+                 dep_last, name_col, id_col, limit, offset);
     }
     strncat(sql, order_limit, sizeof(sql) - strlen(sql) - 1);
 
