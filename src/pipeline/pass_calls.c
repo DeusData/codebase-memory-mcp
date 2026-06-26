@@ -387,6 +387,32 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     cbm_resolution_t res = cbm_registry_resolve(ctx->registry, call->callee_name, module_qn,
                                                 imp_keys, imp_vals, imp_count);
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
+        /* External HTTP/async client (requests, axios, ...) that resolves to no
+         * QN because its library is not indexed. Classify from the raw callee
+         * name and emit a service edge against the source node so cross-repo
+         * matching has an HTTP_CALLS edge to work with. Issue #523. */
+        cbm_svc_kind_t ext_svc = cbm_service_pattern_match(call->callee_name);
+        /* Only emit when the arg is actually URL- or topic-shaped, mirroring the
+         * predicate in emit_http_async_edge. Without this, a non-URL arg (e.g.
+         * requests.get("orders")) would fall through to that function's CALLS
+         * fallback and emit a meaningless source -> source self-edge. #523 */
+        const char *ext_arg = call->first_string_arg;
+        bool ext_is_url = (ext_arg && ext_arg[0] != '\0' &&
+                           (ext_arg[0] == '/' || strstr(ext_arg, "://") != NULL));
+        bool ext_is_topic = (ext_arg && ext_arg[0] != '\0' && ext_svc == CBM_SVC_ASYNC &&
+                             strlen(ext_arg) > PAIR_LEN);
+        if ((ext_svc == CBM_SVC_HTTP || ext_svc == CBM_SVC_ASYNC) && (ext_is_url || ext_is_topic)) {
+            cbm_resolution_t ext = {0};
+            ext.qualified_name = call->callee_name;
+            ext.strategy = "external_service";
+            /* source_node is passed as both source and target intentionally: the
+             * external client (requests/axios) has no node in the graph, so there
+             * is no distinct target to point at. emit_http_async_edge only uses
+             * the target for the non-URL CALLS fallback; for a real URL/topic it
+             * creates a Route node and links source -> Route, so the duplicated
+             * source arg is never dereferenced as a separate endpoint here. #523 */
+            emit_http_async_edge(ctx, call, source_node, source_node, &ext, ext_svc);
+        }
         return 0;
     }
 
