@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING
@@ -787,6 +788,91 @@ TEST(tool_get_architecture_emits_populated_sections) {
 
     free(inner);
     free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Regression for #604: path scopes architecture totals and content. */
+TEST(tool_get_architecture_path_scoping) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "arch-path";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/arch-path");
+
+    cbm_node_t pkg_global = {.project = proj,
+                             .label = "Package",
+                             .name = "Django",
+                             .qualified_name = "arch-path.Django",
+                             .file_path = "vendor/django/__init__.py"};
+    cbm_store_upsert_node(st, &pkg_global);
+
+    cbm_node_t pkg_local = {.project = proj,
+                            .label = "Package",
+                            .name = "hoa",
+                            .qualified_name = "arch-path.hoa",
+                            .file_path = "apps/hoa/main.go"};
+    cbm_store_upsert_node(st, &pkg_local);
+
+    cbm_node_t f_hoa = {.project = proj,
+                        .label = "File",
+                        .name = "main.go",
+                        .qualified_name = "arch-path.apps.hoa.main.go",
+                        .file_path = "apps/hoa/main.go"};
+    cbm_store_upsert_node(st, &f_hoa);
+
+    cbm_node_t f_other = {.project = proj,
+                          .label = "File",
+                          .name = "other.go",
+                          .qualified_name = "arch-path.other.go",
+                          .file_path = "lib/other.go"};
+    cbm_store_upsert_node(st, &f_other);
+
+    char *resp_root = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":92,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"get_architecture\","
+             "\"arguments\":{\"project\":\"arch-path\",\"aspects\":[\"packages\"]}}}");
+    ASSERT_NOT_NULL(resp_root);
+    char *inner_root = extract_text_content(resp_root);
+    ASSERT_NOT_NULL(inner_root);
+    ASSERT_NOT_NULL(strstr(inner_root, "Django"));
+
+    char *resp_scoped = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":93,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"get_architecture\","
+             "\"arguments\":{\"project\":\"arch-path\",\"path\":\"apps/hoa\","
+             "\"aspects\":[\"packages\"]}}}");
+    ASSERT_NOT_NULL(resp_scoped);
+    char *inner_scoped = extract_text_content(resp_scoped);
+    ASSERT_NOT_NULL(inner_scoped);
+
+    ASSERT_NOT_NULL(strstr(inner_scoped, "root_total_nodes"));
+    ASSERT_NOT_NULL(strstr(inner_scoped, "scoped_total_nodes"));
+    ASSERT_NOT_NULL(strstr(inner_scoped, "\"path\""));
+    ASSERT_NOT_NULL(strstr(inner_scoped, "hoa"));
+    ASSERT_NULL(strstr(inner_scoped, "Django"));
+
+    int root_nodes = 0;
+    int scoped_nodes = 0;
+    const char *rt = strstr(inner_scoped, "\"root_total_nodes\":");
+    const char *stn = strstr(inner_scoped, "\"scoped_total_nodes\":");
+    if (rt) {
+        sscanf(rt, "\"root_total_nodes\":%d", &root_nodes);
+    }
+    if (stn) {
+        sscanf(stn, "\"scoped_total_nodes\":%d", &scoped_nodes);
+    }
+    ASSERT_TRUE(root_nodes > scoped_nodes);
+    ASSERT_TRUE(scoped_nodes > 0);
+
+    free(inner_scoped);
+    free(resp_scoped);
+    free(inner_root);
+    free(resp_root);
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -2294,6 +2380,7 @@ SUITE(mcp) {
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
+    RUN_TEST(tool_get_architecture_path_scoping);
     RUN_TEST(tool_query_graph_missing_query);
 
     /* Pipeline-dependent tool handlers */

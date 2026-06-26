@@ -314,6 +314,16 @@ int cbm_store_find_node_ids_by_qns(cbm_store_t *s, const char *project, const ch
 /* Count nodes in project. Returns count or CBM_STORE_ERR. */
 int cbm_store_count_nodes(cbm_store_t *s, const char *project);
 
+int cbm_store_count_nodes_scoped(cbm_store_t *s, const char *project, const char *path);
+
+int cbm_store_count_edges_scoped(cbm_store_t *s, const char *project, const char *path);
+
+/* True when path is a non-empty scope after normalization (issue #604). */
+bool cbm_store_arch_path_scoped(const char *path);
+
+/* When scoped, writes normalized directory prefix into norm_out. Returns false if unscoped. */
+bool cbm_store_normalize_arch_path(const char *path, char *norm_out, size_t norm_sz);
+
 /* Delete all nodes for a project (cascade deletes edges). */
 int cbm_store_delete_nodes_by_project(cbm_store_t *s, const char *project);
 
@@ -430,6 +440,9 @@ int cbm_store_get_schema(cbm_store_t *s, const char *project, cbm_schema_info_t 
  * label/type counts, e.g. get_architecture. */
 int cbm_store_get_schema_counts(cbm_store_t *s, const char *project, cbm_schema_info_t *out);
 
+int cbm_store_get_schema_counts_scoped(cbm_store_t *s, const char *project, const char *path,
+                                       cbm_schema_info_t *out);
+
 /* Free a schema info's allocated memory. */
 void cbm_store_schema_free(cbm_schema_info_t *out);
 
@@ -528,8 +541,9 @@ typedef struct {
     int file_tree_count;
 } cbm_architecture_info_t;
 
-int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char **aspects,
-                               int aspect_count, cbm_architecture_info_t *out);
+int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char *path,
+                               const char **aspects, int aspect_count,
+                               cbm_architecture_info_t *out);
 void cbm_store_architecture_free(cbm_architecture_info_t *out);
 
 /* ── ADR (Architecture Decision Record) ────────────────────────── */

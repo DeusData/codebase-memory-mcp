@@ -964,6 +964,19 @@ TEST(tool_qg_defines_method_more_than_10) {
     PASS();
 }
 
+TEST(tool_qg_class_lines_nonzero) {
+    double ms;
+    char *r =
+        call_tool_timed("query_graph", &ms,
+                        "{\"project\":\"%s\","
+                        "\"query\":\"MATCH (c:Class) WHERE c.lines > 0 RETURN count(c) AS n\"}",
+                        g_project);
+    TOOL_OK(r, ms);
+    ASSERT(strstr(r, "\"0\"") == NULL);
+    free(r);
+    PASS();
+}
+
 TEST(tool_list_projects_has_current) {
     double ms;
     char *r = call_tool_timed("list_projects", &ms, "{}");
@@ -3105,6 +3118,7 @@ SUITE(incremental) {
     RUN_TEST(tool_qg_handles);
     RUN_TEST(tool_qg_defines_method);
     RUN_TEST(tool_qg_defines_method_more_than_10);
+    RUN_TEST(tool_qg_class_lines_nonzero);
     RUN_TEST(tool_qg_no_limit);
     RUN_TEST(tool_qg_empty_result);
 

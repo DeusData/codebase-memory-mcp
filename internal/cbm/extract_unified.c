@@ -101,6 +101,10 @@ static TSNode resolve_func_name_node(TSNode node) {
     if (ts_node_is_null(name_node) && strcmp(ts_node_type(node), "function_declaration") == 0) {
         name_node = cbm_find_child_by_kind(node, "simple_identifier");
     }
+    /* C/C++/CUDA/GLSL: function_definition name lives in the declarator chain. */
+    if (ts_node_is_null(name_node) && strcmp(ts_node_type(node), "function_definition") == 0) {
+        name_node = cbm_resolve_c_declarator_name_node(node);
+    }
     return name_node;
 }
 

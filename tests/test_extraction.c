@@ -1787,6 +1787,87 @@ TEST(wolfram_caller_attribution) {
     PASS();
 }
 
+/* Issue #438: a C function_definition has no `name` field — the name lives in the
+ * declarator chain. Calls inside a C function must be attributed to the enclosing
+ * function, not the module. Pre-fix, enclosing_func_qn fell back to the module QN. */
+TEST(c_caller_attribution) {
+    CBMFileResult *r = extract("int helper(int x) { return x; }\n"
+                               "int caller(void) { return helper(1); }\n",
+                               CBM_LANG_C, "t", "main.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_GT(r->calls.count, 0);
+    int saw_helper = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (strcmp(r->calls.items[i].callee_name, "helper") == 0) {
+            saw_helper = 1;
+            /* enclosing_func_qn must be the function, NOT empty and NOT the module QN. */
+            ASSERT_NOT_NULL(r->calls.items[i].enclosing_func_qn);
+            ASSERT_FALSE(strcmp(r->calls.items[i].enclosing_func_qn, "") == 0);
+            ASSERT_FALSE(strcmp(r->calls.items[i].enclosing_func_qn, "t.main") == 0);
+        }
+    }
+    ASSERT(saw_helper);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* adc8304 (the dedup refactor bundled into #463) re-pointed the C/C++ enclosing-
+ * function resolver at the canonical declarator walker: qualified names (Foo::bar)
+ * now resolve via resolve_qualified_name(), and `type_identifier` was dropped from
+ * the terminal-name set. These guard that out-of-line C++ method / ctor / dtor
+ * definitions still attribute their inner calls to the enclosing function, not the
+ * module — i.e. that the dedup did not reintroduce the #438 regression on the
+ * qualified-declarator path. Module QN for "m.cpp" under prefix "t" is "t.m". */
+TEST(cpp_out_of_line_method_caller_attribution) {
+    CBMFileResult *r = extract("struct Foo { void bar(); };\n"
+                               "int helper(int x) { return x; }\n"
+                               "void Foo::bar() { helper(1); }\n",
+                               CBM_LANG_CPP, "t", "m.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_GT(r->calls.count, 0);
+    int saw_helper = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (strcmp(r->calls.items[i].callee_name, "helper") == 0) {
+            saw_helper = 1;
+            /* enclosing must be the out-of-line method, NOT empty and NOT the module. */
+            ASSERT_NOT_NULL(r->calls.items[i].enclosing_func_qn);
+            ASSERT_FALSE(strcmp(r->calls.items[i].enclosing_func_qn, "") == 0);
+            ASSERT_FALSE(strcmp(r->calls.items[i].enclosing_func_qn, "t.m") == 0);
+        }
+    }
+    ASSERT(saw_helper);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Out-of-line constructor (Foo::Foo) and destructor (Foo::~Foo) exercise the
+ * identifier and destructor_name branches of resolve_qualified_name(). A call
+ * inside either must attribute to that special member, not the module. */
+TEST(cpp_out_of_line_ctor_dtor_caller_attribution) {
+    CBMFileResult *r = extract("struct Foo { Foo(); ~Foo(); };\n"
+                               "int helper(int x) { return x; }\n"
+                               "Foo::Foo() { helper(1); }\n"
+                               "Foo::~Foo() { helper(2); }\n",
+                               CBM_LANG_CPP, "t", "m.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_GT(r->calls.count, 0);
+    int helper_calls = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (strcmp(r->calls.items[i].callee_name, "helper") == 0) {
+            helper_calls++;
+            ASSERT_NOT_NULL(r->calls.items[i].enclosing_func_qn);
+            ASSERT_FALSE(strcmp(r->calls.items[i].enclosing_func_qn, "") == 0);
+            ASSERT_FALSE(strcmp(r->calls.items[i].enclosing_func_qn, "t.m") == 0);
+        }
+    }
+    ASSERT(helper_calls >= 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Wolfram parse (simple assignment) --- */
 TEST(wolfram_parse) {
     CBMFileResult *r = extract("x = 42;\ny = x + 1;\n", CBM_LANG_WOLFRAM, "t", "simple.wl");
@@ -3091,6 +3172,9 @@ SUITE(extraction) {
     RUN_TEST(wolfram_function_extended);
     RUN_TEST(wolfram_call);
     RUN_TEST(wolfram_caller_attribution);
+    RUN_TEST(c_caller_attribution);
+    RUN_TEST(cpp_out_of_line_method_caller_attribution);
+    RUN_TEST(cpp_out_of_line_ctor_dtor_caller_attribution);
     RUN_TEST(wolfram_parse);
     RUN_TEST(wolfram_import);
     RUN_TEST(wolfram_nested_def);

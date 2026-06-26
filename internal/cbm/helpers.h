@@ -36,6 +36,20 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
 // Cached version: uses ctx->ef_cache to avoid repeated parent-chain walks.
 const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
 
+// Max declarator-chain descent depth for C/C++/CUDA/GLSL function-name
+// resolution. Single source of truth — extract_defs.c's DECLARATOR_DEPTH_LIMIT
+// is derived from this so the three extractors cannot drift.
+#define CBM_DECLARATOR_DEPTH_LIMIT 8
+
+// Resolve the function-name node for a C/C++/CUDA/GLSL `function_definition`.
+// Such nodes have no `name` field — the name is nested in the declarator chain
+// (pointer/function/parenthesized/array declarators wrap it; out-of-line method
+// definitions name it with a qualified_identifier). Descends the `declarator`
+// field to the innermost name node and returns it, or a null node if none is
+// found. Shared by the defs, calls, and unified extractors so all three agree on
+// enclosing-function attribution — drift between private copies caused #438.
+TSNode cbm_resolve_c_declarator_name_node(TSNode func_node);
+
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 
