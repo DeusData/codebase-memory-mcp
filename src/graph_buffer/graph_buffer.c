@@ -1504,6 +1504,30 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
         rc = frc;
     }
 
+    /* Post-write integrity verification (B1 mitigation): the streaming dump can
+     * intermittently emit a structurally-corrupt .db (gbuf-data corruption that
+     * is ASan/TSan-invisible). Detect it with the fast projects-table check
+     * (O(1), not a full integrity_check) and remove the corrupt DB so neither
+     * queries nor tests ever read garbage — the next access re-indexes. */
+    if (rc == 0) {
+        cbm_store_t *verify = cbm_store_open_path((const char *)path);
+        if (verify) {
+            bool intact = cbm_store_check_integrity(verify);
+            cbm_store_close(verify);
+            if (!intact) {
+                char nodes_str[CBM_SZ_16];
+                char edges_str[CBM_SZ_16];
+                snprintf(nodes_str, sizeof(nodes_str), "%d", node_idx);
+                snprintf(edges_str, sizeof(edges_str), "%d", edge_idx);
+                cbm_log_error("dump.verify_corrupt", "path", path, "action",
+                              "deleting corrupt db; re-index required", "nodes", nodes_str, "edges",
+                              edges_str);
+                unlink(path);
+                rc = GB_ERR;
+            }
+        }
+    }
+
     log_dump_summary(node_idx, edge_idx);
     free_dump_resources(url_paths, edge_idx, dump_edges, dump_nodes, temp_to_final);
     free(src_nodes);
