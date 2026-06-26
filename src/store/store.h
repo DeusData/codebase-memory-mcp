@@ -122,6 +122,12 @@ typedef struct {
     const char *sort_by;          /* "relevance" / "name" / "degree" / "calls" / "linkrank", NULL = relevance */
     const char *degree_mode;      /* "weighted" / "unweighted" / "calls_only", NULL = unweighted */
     bool case_sensitive;
+    /* Ranking: when true, dependency sub-project symbols (proj.dep.*) are NOT
+     * demoted below the project's own symbols — pure relevance order applies.
+     * Default false (zero-init): deps rank LAST so a stdlib symbol like 'Path'
+     * never fronts the user's own 'Path'. Tunable via MCP config key
+     * "search_disable_dep_ranking" (search_graph). */
+    bool disable_dep_ranking;
     const char **exclude_labels;  /* NULL-terminated array, or NULL */
     const char **exclude_paths;   /* NULL-terminated array of glob patterns to exclude by file_path */
 } cbm_search_params_t;
