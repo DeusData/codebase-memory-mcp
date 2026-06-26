@@ -15,6 +15,7 @@
 #include <store/store.h>
 #include <pagerank/pagerank.h>
 #include <depindex/depindex.h>
+#include <cli/cli.h> /* cbm_config_open/set/get_double for with_config tuning */
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -793,6 +794,52 @@ TEST(pagerank_config_weight_very_small) {
     PASS();
 }
 
+/* #21: PageRank damping + epsilon are tunable via config keys
+ * (pagerank_damping, pagerank_epsilon) through cbm_pagerank_compute_with_config
+ * — previously only max_iter + edge weights were config-exposed; damping/epsilon
+ * were hard-coded #defines. This test proves the damping knob changes output. */
+TEST(pagerank_damping_epsilon_config_tunable) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "cfg", "/tmp/cfg");
+    int64_t hub = add_node(s, "cfg", "hub");
+    int64_t s1 = add_node(s, "cfg", "s1");
+    int64_t s2 = add_node(s, "cfg", "s2");
+    int64_t s3 = add_node(s, "cfg", "s3");
+    add_edge(s, "cfg", hub, s1, "CALLS");
+    add_edge(s, "cfg", hub, s2, "CALLS");
+    add_edge(s, "cfg", hub, s3, "CALLS");
+    add_edge(s, "cfg", s1, hub, "CALLS");
+
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/pr-cfg-XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(tmpdir) != NULL);
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    /* Low damping (0.5) → hub rank should differ from high damping (0.99).
+     * compute_with_config returns the count of ranked nodes (4) on success. */
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_DAMPING, "0.5"), 0);
+    ASSERT_EQ(cbm_pagerank_compute_with_config(s, "cfg", cfg), 4);
+    double hub_low = get_pr(s, hub);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_DAMPING, "0.99"), 0);
+    ASSERT_EQ(cbm_pagerank_compute_with_config(s, "cfg", cfg), 4);
+    double hub_high = get_pr(s, hub);
+
+    /* The damping knob must materially change the rank value. */
+    ASSERT_TRUE(fabs(hub_low - hub_high) > 1e-6);
+
+    /* Sanity: ranks still sum to ~1 under a custom config. */
+    double total = get_pr(s, hub) + get_pr(s, s1) + get_pr(s, s2) + get_pr(s, s3);
+    ASSERT_TRUE(fabs(total - 1.0) < 0.05);
+
+    cbm_config_close(cfg);
+    /* tmpdir is uniquely-named under /tmp; left for OS cleanup (no shared
+     * recursive-rmdir helper available in the test framework). */
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Suite registration ──────────────────────────────────── */
 
 SUITE(pagerank) {
@@ -804,6 +851,7 @@ SUITE(pagerank) {
     RUN_TEST(pagerank_star_topology);
     RUN_TEST(pagerank_edge_weights);
     RUN_TEST(pagerank_convergence);
+    RUN_TEST(pagerank_damping_epsilon_config_tunable);
     RUN_TEST(pagerank_sum_to_one);
     RUN_TEST(pagerank_stored_in_db);
     RUN_TEST(pagerank_recompute_replaces);

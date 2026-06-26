@@ -23,6 +23,8 @@ struct cbm_config;
 
 /* Config keys for runtime tuning */
 #define CBM_CONFIG_PAGERANK_MAX_ITER "pagerank_max_iter"
+#define CBM_CONFIG_PAGERANK_DAMPING  "pagerank_damping"
+#define CBM_CONFIG_PAGERANK_EPSILON  "pagerank_epsilon"
 #define CBM_CONFIG_RANK_SCOPE        "rank_scope"
 
 /* Config keys for edge type weights (all doubles, override via `config set`) */
