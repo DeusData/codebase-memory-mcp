@@ -68,8 +68,11 @@ extern void suite_repro_invariant_lsp_rescue(void);
 extern void suite_repro_invariant_discovery_fqn(void);
 /* Per-grammar invariant batteries (extract-clean/labels/fqn/ranges/callable-sourcing) */
 extern void suite_repro_grammar_core(void);
+extern void suite_repro_grammar_scripting(void);
+extern void suite_repro_grammar_functional(void);
 /* Per-LSP-pass resolution-strategy invariants */
 extern void suite_repro_lsp_c_cpp(void);
+extern void suite_repro_lsp_go_py(void);
 
 int main(void) {
     /* Unbuffered: a reproduction may crash/_exit (or a sanitizer may _exit on a
@@ -122,7 +125,10 @@ int main(void) {
     RUN_SUITE(repro_invariant_lsp_rescue);
     RUN_SUITE(repro_invariant_discovery_fqn);
     RUN_SUITE(repro_grammar_core);
+    RUN_SUITE(repro_grammar_scripting);
+    RUN_SUITE(repro_grammar_functional);
     RUN_SUITE(repro_lsp_c_cpp);
+    RUN_SUITE(repro_lsp_go_py);
 
     TEST_SUMMARY();
 }
