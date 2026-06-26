@@ -122,6 +122,8 @@ int main(void) {
         if (strstr("tool_consolidation", only_suite)) RUN_SUITE(tool_consolidation);
         if (strstr("store_nodes", only_suite)) RUN_SUITE(store_nodes);
         if (strstr("sqlite_writer", only_suite)) RUN_SUITE(sqlite_writer);
+        if (strstr("graph_buffer", only_suite)) RUN_SUITE(graph_buffer);
+        if (strstr("pagerank", only_suite)) RUN_SUITE(pagerank);
         TEST_SUMMARY();
         return 0;
     }

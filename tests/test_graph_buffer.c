@@ -7,6 +7,19 @@
 #include "test_framework.h"
 #include "graph_buffer/graph_buffer.h"
 #include "store/store.h"
+#include "foundation/compat.h" /* cbm_mkstemp */
+#include "sqlite3.h"           /* vendored/sqlite3/ via -Ivendored/sqlite3 */
+#include <unistd.h>
+
+static int gbuf_make_temp_db(char *path, size_t pathsz) {
+    snprintf(path, pathsz, "/tmp/cbm_gbuf_dump_XXXXXX");
+    int fd = cbm_mkstemp(path);
+    if (fd < 0) {
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
 
 /* ── Node operations ───────────────────────────────────────────── */
 
@@ -929,6 +942,111 @@ TEST(gbuf_flush_skips_orphan_edges) {
 
 /* ── Suite ─────────────────────────────────────────────────────── */
 
+/* B1 pipeline-path isolation probe (#23): cbm_write_db is clean 10/10 even with
+ * variable-length records (decisive negative this session), and the streaming
+ * dump for <65536 nodes is byte-identical to cbm_write_db at the writer level
+ * (DUMP_PARTITION_NODES=1<<16 → one partition = all nodes). So the ONLY hop the
+ * real pipeline runs that the writer test skips is the gbuf→dump handoff:
+ * build_dump_nodes / build_dump_edges / temp_to_final ID remap, fed by a
+ * merge-populated gbuf (parallel workers → cbm_gbuf_merge). This test drives
+ * that exact path with variable-length heap properties_json + a merged worker
+ * gbuf. If it corrupts → root cause isolated in the handoff. If clean → the
+ * bug lives in extraction-population (tree-sitter), which needs the real repo. */
+TEST(gbuf_dump_pipeline_path_integrity) {
+    char path[256];
+    ASSERT_EQ(gbuf_make_temp_db(path, sizeof(path)), 0);
+
+    const int N = 15000;   /* < 65536 → one dump partition, mirrors fastapi scale */
+    const int W = 3000;    /* worker gbuf nodes, merged in (exercises remap) */
+    const int E = 50000;
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/gbuf_pipeline_root");
+    ASSERT_NOT_NULL(gb);
+
+    /* Variable-length heap properties_json, exactly like real extraction emits. */
+    static const int plens[] = {20, 200, 800, 1500, 50, 400, 1000, 100};
+    char name[64], qn[96], props[2048];
+    for (int i = 0; i < N; i++) {
+        snprintf(name, sizeof(name), "fn_%d", i);
+        snprintf(qn, sizeof(qn), "proj.mod.fn_%d", i);
+        int target = plens[i % 8];
+        int padlen = target - 8; /* {"k":""} overhead */
+        if (padlen < 0) padlen = 0;
+        if (padlen > 2040) padlen = 2040;
+        props[0] = '{'; props[1] = '"'; props[2] = 'k'; props[3] = '"'; props[4] = ':';
+        props[5] = '"';
+        memset(props + 6, 'y', (size_t)padlen);
+        props[6 + padlen] = '"';
+        props[6 + padlen + 1] = '}';
+        props[6 + padlen + 2] = '\0';
+        int64_t id = cbm_gbuf_upsert_node(gb, "Function", name, qn,
+                                          (i % 400 == 0) ? "src/base.py" : "src/mod.py",
+                                          i + 1, i + 2, props);
+        ASSERT_GT(id, 0);
+    }
+    for (int i = 0; i < E; i++) {
+        int64_t s = (i % N) + 1;
+        int64_t t = ((i / N) % N) + 1;
+        if (s == t) t = (t % N) + 1;
+        cbm_gbuf_insert_edge(gb, s, t, "CALLS", "{}");
+    }
+
+    /* Worker gbuf: some NEW qns + some colliding qns, then merge (parallel-pipeline
+     * simulation — exercises cbm_gbuf_merge + the QN-collision ID remap). */
+    cbm_gbuf_t *gw = cbm_gbuf_new("proj", "/tmp/gbuf_pipeline_root");
+    ASSERT_NOT_NULL(gw);
+    for (int i = 0; i < W; i++) {
+        if (i % 2 == 0) {
+            /* collide with an existing main qn (merge_update_existing path) */
+            snprintf(qn, sizeof(qn), "proj.mod.fn_%d", i % 1000);
+        } else {
+            /* brand-new qn (merge_copy_new_node path) */
+            snprintf(qn, sizeof(qn), "proj.worker.w_%d", i);
+        }
+        snprintf(name, sizeof(name), "w_%d", i);
+        cbm_gbuf_upsert_node(gw, "Function", name, qn, "src/worker.py", 1, 2,
+                             "{\"w\":true}");
+    }
+    ASSERT_EQ(cbm_gbuf_merge(gb, gw), 0);
+
+    /* The dump path under test. */
+    ASSERT_EQ(cbm_gbuf_dump_to_sqlite(gb, path), 0);
+
+    /* Verify: structural integrity + exact root_path round-trip + counts. */
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(path, &db), SQLITE_OK);
+    sqlite3_stmt *stmt = NULL;
+
+    sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &stmt, NULL);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "ok");
+    sqlite3_finalize(stmt);
+
+    sqlite3_prepare_v2(db, "SELECT root_path FROM projects", -1, &stmt, NULL);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "/tmp/gbuf_pipeline_root");
+    sqlite3_finalize(stmt);
+
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM nodes", -1, &stmt, NULL);
+    sqlite3_step(stmt);
+    int ncount = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    /* N main + (W/2) new worker qns (the colliding half merges into existing). */
+    ASSERT_EQ(ncount, N + (W / 2));
+
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM edges", -1, &stmt, NULL);
+    sqlite3_step(stmt);
+    int ecount = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    ASSERT_GT(ecount, 0);
+
+    sqlite3_close(db);
+    unlink(path);
+    cbm_gbuf_free(gw);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 SUITE(graph_buffer) {
     /* Original tests */
     RUN_TEST(gbuf_create_free);
@@ -989,4 +1107,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_shared_ids_null_fallback);
     RUN_TEST(gbuf_next_id_set_next_id_roundtrip);
     RUN_TEST(gbuf_next_id_null_safe);
+
+    /* B1 pipeline-path isolation (#23) */
+    RUN_TEST(gbuf_dump_pipeline_path_integrity);
 }

@@ -535,11 +535,13 @@ TEST(sw_scale_root_path_integrity) {
     char (*namebuf)[32] = malloc((size_t)N * 32);
     char (*qnbuf)[64] = malloc((size_t)N * 64);
     char (*filebuf)[48] = malloc((size_t)N * 48);
+    char (*propsbuf)[2048] = malloc((size_t)N * 2048);
     ASSERT_NOT_NULL(nodes);
     ASSERT_NOT_NULL(edges);
     ASSERT_NOT_NULL(namebuf);
     ASSERT_NOT_NULL(qnbuf);
     ASSERT_NOT_NULL(filebuf);
+    ASSERT_NOT_NULL(propsbuf);
 
     for (int i = 0; i < N; i++) {
         snprintf(namebuf[i], 32, "fn_%d", i);
@@ -553,7 +555,24 @@ TEST(sw_scale_root_path_integrity) {
         nodes[i].file_path = filebuf[i];
         nodes[i].start_line = i + 1;
         nodes[i].end_line = i + 2;
-        nodes[i].properties = "{}";
+        /* Variable-length properties (mirrors real data) to stress page
+         * boundaries in the writer — the B1 trigger hypothesis (uniform
+         * records never cross boundaries the way real variable records do). */
+        static const int plens[] = {20, 200, 800, 1500, 50, 400, 1000, 100};
+        int padlen = plens[i % 8] - 8; /* {"k":""} overhead */
+        if (padlen < 0) padlen = 0;
+        if (padlen > 2040) padlen = 2040;
+        propsbuf[i][0] = '{';
+        propsbuf[i][1] = '"';
+        propsbuf[i][2] = 'k';
+        propsbuf[i][3] = '"';
+        propsbuf[i][4] = ':';
+        propsbuf[i][5] = '"';
+        memset(propsbuf[i] + 6, 'y', (size_t)padlen);
+        propsbuf[i][6 + padlen] = '"';
+        propsbuf[i][6 + padlen + 1] = '}';
+        propsbuf[i][6 + padlen + 2] = '\0';
+        nodes[i].properties = propsbuf[i];
     }
     for (int i = 0; i < E; i++) {
         edges[i].id = i + 1;
@@ -606,6 +625,7 @@ TEST(sw_scale_root_path_integrity) {
     free(namebuf);
     free(qnbuf);
     free(filebuf);
+    free(propsbuf);
     PASS();
 }
 
