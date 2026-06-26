@@ -130,6 +130,22 @@ int cbm_pclose(FILE *f) {
     return _pclose(f);
 }
 
+/* Open a file with wide-char _wfopen for UTF-8 path support on Windows. */
+FILE *cbm_fopen(const char *path, const char *mode) {
+    wchar_t *wpath = cbm_utf8_to_wide(path);
+    if (!wpath) {
+        return NULL;
+    }
+    wchar_t wmode[8] = {0};
+    if (mbstowcs(wmode, mode, 7) == (size_t)-1) {
+        free(wpath);
+        return NULL;
+    }
+    FILE *f = _wfopen(wpath, wmode);
+    free(wpath);
+    return f;
+}
+
 bool cbm_mkdir_p(const char *path, int mode) {
     (void)mode;
     wchar_t *wpath = cbm_utf8_to_wide(path);
@@ -260,6 +276,10 @@ FILE *cbm_popen(const char *cmd, const char *mode) {
 
 int cbm_pclose(FILE *f) {
     return pclose(f);
+}
+
+FILE *cbm_fopen(const char *path, const char *mode) {
+    return fopen(path, mode);
 }
 
 bool cbm_mkdir_p(const char *path, int mode) {

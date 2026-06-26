@@ -56,4 +56,8 @@ int cbm_rmdir(const char *path);
  * POSIX: fork() + execvp(). Windows: _spawnvp(). */
 int cbm_exec_no_shell(const char *const *argv);
 
+/* Open a file for reading. On Windows, uses wide-char _wfopen to support
+ * non-ASCII (UTF-8) paths. On POSIX, delegates to fopen(). */
+FILE *cbm_fopen(const char *path, const char *mode);
+
 #endif /* CBM_COMPAT_FS_H */

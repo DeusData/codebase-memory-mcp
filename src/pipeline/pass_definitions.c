@@ -22,6 +22,7 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "cbm.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
@@ -33,7 +34,7 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 /* Read entire file into heap-allocated buffer. Returns NULL on error.
  * Caller must free(). Sets *out_len to byte count. */
 static char *read_file(const char *path, int *out_len) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return NULL;
     }
