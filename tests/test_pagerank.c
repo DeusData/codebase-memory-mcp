@@ -840,6 +840,33 @@ TEST(pagerank_damping_epsilon_config_tunable) {
     PASS();
 }
 
+/* Robustness (review finding #44): a NaN damping must NOT corrupt PageRank.
+ * Since #21 made damping/epsilon config-tunable and cbm_config_get_double uses
+ * strtod (which parses "nan"), a user can `config set pagerank_damping nan`.
+ * The range clamp must reject NaN — IEEE-754 makes all NaN comparisons false,
+ * so the naive `damping < 0 || damping > 1` form lets NaN through, poisoning
+ * every rank and preventing convergence. */
+TEST(pagerank_nan_damping_is_clamped) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "nan", "/tmp/nan");
+    int64_t a = add_node(s, "nan", "a");
+    int64_t b = add_node(s, "nan", "b");
+    add_edge(s, "nan", a, b, "CALLS");
+    add_edge(s, "nan", b, a, "CALLS");
+
+    int rc = cbm_pagerank_compute(s, "nan", NAN, CBM_PAGERANK_EPSILON,
+                                  CBM_PAGERANK_MAX_ITER, NULL, CBM_DEFAULT_RANK_SCOPE);
+    ASSERT_EQ(rc, 2);
+    double ra = get_pr(s, a);
+    double rb = get_pr(s, b);
+    ASSERT_TRUE(isfinite(ra)); /* NaN damping must be clamped, not propagated */
+    ASSERT_TRUE(isfinite(rb));
+    ASSERT_TRUE(fabs((ra + rb) - 1.0) < 0.05);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Suite registration ──────────────────────────────────── */
 
 SUITE(pagerank) {
@@ -852,6 +879,7 @@ SUITE(pagerank) {
     RUN_TEST(pagerank_edge_weights);
     RUN_TEST(pagerank_convergence);
     RUN_TEST(pagerank_damping_epsilon_config_tunable);
+    RUN_TEST(pagerank_nan_damping_is_clamped);
     RUN_TEST(pagerank_sum_to_one);
     RUN_TEST(pagerank_stored_in_db);
     RUN_TEST(pagerank_recompute_replaces);

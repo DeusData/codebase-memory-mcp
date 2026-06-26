@@ -150,9 +150,15 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
                          cbm_rank_scope_t scope) {
     if (!store || !project || !project[0]) return -1;
     if (!weights) weights = &CBM_DEFAULT_EDGE_WEIGHTS;
-    if (damping < 0.0 || damping > 1.0) damping = CBM_PAGERANK_DAMPING;
+    /* Reject out-of-range AND NaN. IEEE-754 makes every NaN comparison false,
+     * so the naive `damping < 0 || damping > 1` form lets NaN through (it then
+     * poisons every rank and prevents convergence). The inverted-range form
+     * `!(x >= lo && x <= hi)` rejects NaN because the inner >= is false.
+     * NaN is reachable via config (strtod parses "nan") since damping/epsilon
+     * became user-tunable. */
+    if (!(damping >= 0.0 && damping <= 1.0)) damping = CBM_PAGERANK_DAMPING;
     if (max_iter <= 0) max_iter = CBM_PAGERANK_MAX_ITER;
-    if (epsilon <= 0.0) epsilon = CBM_PAGERANK_EPSILON;
+    if (!(epsilon > 0.0)) epsilon = CBM_PAGERANK_EPSILON;
 
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) return -1;
