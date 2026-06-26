@@ -741,8 +741,20 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         cbm_log_error("pipeline.err", "phase", "cache_alloc");
         return CBM_NOT_FOUND;
     }
+    char cbm_lsp_cross_env[CBM_SZ_16];
+    const bool run_cross_lsp = cbm_safe_getenv("CBM_DISABLE_LSP_CROSS", cbm_lsp_cross_env,
+                                               sizeof(cbm_lsp_cross_env), NULL) == NULL;
+    if (!run_cross_lsp) {
+        cbm_log_info("lsp_cross.skipped", "reason", "CBM_DISABLE_LSP_CROSS env set");
+    }
+    cbm_parallel_extract_opts_t extract_opts = {
+        .retain_sources = run_cross_lsp,
+        .retain_sources_set = true,
+    };
+
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
-    int rc = cbm_parallel_extract(ctx, files, file_count, cache, &shared_ids, worker_count);
+    int rc = cbm_parallel_extract_ex(ctx, files, file_count, cache, &shared_ids, worker_count,
+                                     &extract_opts);
     cbm_log_info("pass.timing", "pass", "parallel_extract", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     if (rc != 0 || check_cancel(p)) {
@@ -783,17 +795,6 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * mean cross-file LSP no-ops; per-file LSP already ran during
      * extract. */
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
-    /* Cross-file LSP (type-aware call/usage resolution across files) — the
-     * most expensive phase. CBM_DISABLE_LSP_CROSS=1 opts out (it can SIGSEGV
-     * on large TS projects — see #340/#344); with cross-LSP off, all_defs
-     * stays NULL and the fused resolver simply no-ops cross-file resolution
-     * (per-file LSP already ran during extract). */
-    char cbm_lsp_cross_env[CBM_SZ_16];
-    const bool run_cross_lsp = cbm_safe_getenv("CBM_DISABLE_LSP_CROSS", cbm_lsp_cross_env,
-                                               sizeof(cbm_lsp_cross_env), NULL) == NULL;
-    if (!run_cross_lsp) {
-        cbm_log_info("lsp_cross.skipped", "reason", "CBM_DISABLE_LSP_CROSS env set");
-    }
     char **def_modules = NULL;
     int def_count = 0;
     CBMLSPDef *all_defs = NULL;

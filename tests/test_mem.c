@@ -565,6 +565,160 @@ static void teardown_mem_test_repo(void) {
     }
 }
 
+static size_t count_retained_source_bytes(CBMFileResult **result_cache, int file_count,
+                                          int *retained_count) {
+    size_t retained_bytes = 0;
+    int count = 0;
+
+    for (int i = 0; i < file_count; i++) {
+        CBMFileResult *result = result_cache[i];
+        if (result && result->source) {
+            retained_bytes += (size_t)result->source_len;
+            count++;
+        }
+    }
+
+    if (retained_count) {
+        *retained_count = count;
+    }
+    return retained_bytes;
+}
+
+TEST(parallel_extract_without_source_retention) {
+    if (setup_mem_test_repo() != 0) {
+        FAIL("tmpdir setup failed");
+    }
+
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    if (cbm_discover(g_mem_tmpdir, &opts, &files, &file_count) != 0) {
+        teardown_mem_test_repo();
+        FAIL("discover failed");
+    }
+
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("mem-test", g_mem_tmpdir);
+    cbm_registry_t *reg = cbm_registry_new();
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "mem-test",
+        .repo_path = g_mem_tmpdir,
+        .gbuf = gbuf,
+        .registry = reg,
+        .cancelled = &cancelled,
+    };
+
+    _Atomic int64_t shared_ids;
+    atomic_init(&shared_ids, cbm_gbuf_next_id(gbuf));
+
+    CBMFileResult **result_cache = calloc((size_t)file_count, sizeof(CBMFileResult *));
+    ASSERT_NOT_NULL(result_cache);
+
+    cbm_parallel_extract_opts_t extract_opts = {
+        .retain_sources = false,
+        .retain_sources_set = true,
+        .retain_total_budget_bytes = 0,
+        .retain_per_file_max_bytes = 0,
+    };
+    int rc = cbm_parallel_extract_ex(&ctx, files, file_count, result_cache, &shared_ids, 2,
+                                     &extract_opts);
+    ASSERT_EQ(rc, 0);
+
+    int defs_seen = 0;
+    for (int i = 0; i < file_count; i++) {
+        if (result_cache[i]) {
+            ASSERT_EQ(result_cache[i]->source, NULL);
+            defs_seen += result_cache[i]->defs.count;
+        }
+    }
+    ASSERT_GT(defs_seen, 0);
+    ASSERT_GT(cbm_gbuf_node_count(gbuf), 0);
+
+    for (int i = 0; i < file_count; i++) {
+        if (result_cache[i]) {
+            cbm_free_result(result_cache[i]);
+        }
+    }
+    free(result_cache);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gbuf);
+    cbm_discover_free(files, file_count);
+    teardown_mem_test_repo();
+    PASS();
+}
+
+TEST(parallel_extract_tiny_source_retention_budget) {
+    if (setup_mem_test_repo() != 0) {
+        FAIL("tmpdir setup failed");
+    }
+
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    if (cbm_discover(g_mem_tmpdir, &opts, &files, &file_count) != 0) {
+        teardown_mem_test_repo();
+        FAIL("discover failed");
+    }
+
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("mem-test", g_mem_tmpdir);
+    cbm_registry_t *reg = cbm_registry_new();
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "mem-test",
+        .repo_path = g_mem_tmpdir,
+        .gbuf = gbuf,
+        .registry = reg,
+        .cancelled = &cancelled,
+    };
+
+    _Atomic int64_t shared_ids;
+    atomic_init(&shared_ids, cbm_gbuf_next_id(gbuf));
+
+    CBMFileResult **result_cache = calloc((size_t)file_count, sizeof(CBMFileResult *));
+    ASSERT_NOT_NULL(result_cache);
+
+    const size_t retain_total_budget_bytes = 256;
+    cbm_parallel_extract_opts_t extract_opts = {
+        .retain_sources = true,
+        .retain_sources_set = true,
+        .retain_total_budget_bytes = retain_total_budget_bytes,
+        .retain_per_file_max_bytes = 100U * 1024U * 1024U,
+    };
+    int rc = cbm_parallel_extract_ex(&ctx, files, file_count, result_cache, &shared_ids, 2,
+                                     &extract_opts);
+    ASSERT_EQ(rc, 0);
+
+    int retained_count = 0;
+    size_t retained_bytes = count_retained_source_bytes(result_cache, file_count, &retained_count);
+    int defs_seen = 0;
+    for (int i = 0; i < file_count; i++) {
+        if (result_cache[i]) {
+            defs_seen += result_cache[i]->defs.count;
+        }
+    }
+
+    ASSERT_GT(defs_seen, 0);
+    ASSERT_GT(retained_count, 0);
+    ASSERT_LTE(retained_bytes, retain_total_budget_bytes);
+    ASSERT_GT(cbm_gbuf_node_count(gbuf), 0);
+
+    for (int i = 0; i < file_count; i++) {
+        if (result_cache[i]) {
+            cbm_free_result(result_cache[i]);
+        }
+    }
+    free(result_cache);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gbuf);
+    cbm_discover_free(files, file_count);
+    teardown_mem_test_repo();
+    PASS();
+}
+
 TEST(parallel_extract_with_slab) {
     cbm_mem_init(0.5);
 
@@ -666,5 +820,7 @@ SUITE(mem) {
     RUN_TEST(slab_calloc_zeroed);
     RUN_TEST(slab_mixed_alloc_free_stress);
     /* Integration */
+    RUN_TEST(parallel_extract_without_source_retention);
+    RUN_TEST(parallel_extract_tiny_source_retention_budget);
     RUN_TEST(parallel_extract_with_slab);
 }
