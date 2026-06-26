@@ -495,9 +495,11 @@ int cbm_pagerank_compute_with_config(cbm_store_t *store, const char *project,
     w.member_rank_factor  = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_MEMBER_OF,    CBM_DEFAULT_EDGE_WEIGHTS.member_rank_factor);
 
     int max_iter = cbm_config_get_int(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, CBM_PAGERANK_MAX_ITER);
+    double damping = cbm_config_get_double(cfg, CBM_CONFIG_PAGERANK_DAMPING, CBM_PAGERANK_DAMPING);
+    double epsilon = cbm_config_get_double(cfg, CBM_CONFIG_PAGERANK_EPSILON, CBM_PAGERANK_EPSILON);
 
     return cbm_pagerank_compute(store, project,
-        CBM_PAGERANK_DAMPING, CBM_PAGERANK_EPSILON,
+        damping, epsilon,
         max_iter, &w, CBM_DEFAULT_RANK_SCOPE);
 }
 
