@@ -476,7 +476,7 @@ PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-foundation test-tsan test-leak test-analyze cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format install test-runner-nosan security
+.PHONY: test test-foundation test-tsan test-leak test-analyze test-memory test-gmalloc cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format install test-runner-nosan security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -721,6 +721,33 @@ else
 test-leak: $(BUILD_DIR)/test-runner
 	@echo "Running heap leak detection via ASan/LSan (Linux). Full report saved to $(LEAK_LOG). Exit 0 = no leaks."
 	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test-runner 2>&1 | tee $(LEAK_LOG); exit $${PIPESTATUS[0]}
+endif
+
+# ── Memory-corruption debug (macOS) ───────────────────────────────
+# Catches uninit reads, use-after-free, and overruns that ASan/TSan can miss
+# (used to investigate the B1 custom-writer non-deterministic corruption).
+# All run the NOSAN binary: ASan replaces malloc, which would defeat these
+# libmalloc knobs. Set CBM_ONLY_SUITE=<suite> to target a slow suite.
+MEM_LOG = $(BUILD_DIR)/mem-report.txt
+ifeq ($(UNAME_S),Darwin)
+# MallocScribble=1     → freed memory filled with 0x55 (catches use-after-free).
+# MallocPreScribble=1  → freshly-allocated memory filled with 0xAA (catches
+#   uninitialized reads — the macOS MSan equivalent; makes uninit deterministic).
+test-memory: $(BUILD_DIR)/test-runner-nosan
+	@echo "Running under MallocScribble+MallocPreScribble (macOS nosan): uninit reads -> 0xAA, use-after-free -> 0x55."
+	@echo "Full report saved to $(MEM_LOG)."
+	MallocScribble=1 MallocPreScribble=1 $(BUILD_DIR)/test-runner-nosan 2>&1 | tee $(MEM_LOG); exit $${PIPESTATUS[0]}
+
+# Guard Malloc (libgmalloc): a guard page around EVERY allocation → crashes at
+# the exact overrun / use-after-free, with a stack trace. Stricter than scribble
+# (which only paints bytes); slower and noisier. The decisive memory tool.
+test-gmalloc: $(BUILD_DIR)/test-runner-nosan
+	@echo "Running under Guard Malloc (libgmalloc). Crashes at the exact overrun/UAF. Slow."
+	@echo "Full report saved to $(MEM_LOG)."
+	DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib $(BUILD_DIR)/test-runner-nosan 2>&1 | tee $(MEM_LOG); exit $${PIPESTATUS[0]}
+else
+test-memory test-gmalloc: $(BUILD_DIR)/test-runner
+	@echo "These targets are macOS-only (MallocScribble/libgmalloc). On Linux use 'make test-leak' (ASan/LSan), or build with -fsanitize=memory (MSan) for uninit detection."
 endif
 
 # ── Static analysis (Clang analyzer only — GCC has no --analyze flag) ──────
