@@ -28,6 +28,20 @@ make -f Makefile.cbm test-leak
 
 Why a separate binary on macOS: `leaks` cannot inspect processes that use a custom malloc (ASan replaces it). The `test-runner-nosan` target rebuilds without `-fsanitize` flags specifically for this purpose.
 
+## Memory-Corruption Debugging (macOS)
+
+For non-deterministic corruption (uninit reads, use-after-free, overruns) that ASan/TSan miss — used to investigate the custom-writer B1 bug. Both run the nosan binary (ASan replaces malloc, which defeats these libmalloc knobs); set `CBM_ONLY_SUITE=<suite>` to target a slow suite.
+
+```bash
+make -f Makefile.cbm test-memory    # MallocScribble=1 + MallocPreScribble=1
+                                    # uninit reads -> 0xAA, use-after-free -> 0x55 (deterministic)
+make -f Makefile.cbm test-gmalloc   # Guard Malloc (libgmalloc): guard page per allocation
+                                    # crashes at the exact overrun/UAF with a stack trace
+# Report saved to build/c/mem-report.txt
+```
+
+`test-memory` is the macOS MSan-equivalent for uninit reads (scribble makes them deterministic). `test-gmalloc` is the strictest — it crashes at the exact bad write, pinpointing the line. (No valgrind/MSan on macOS; on Linux use `-fsanitize=memory`.)
+
 ## Project Structure (C server)
 
 Sources live under `src/`; tests under `tests/`; vendored C libs under `vendored/`.
