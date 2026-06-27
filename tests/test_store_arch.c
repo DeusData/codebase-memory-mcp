@@ -22,6 +22,7 @@
  */
 #include "test_framework.h"
 #include <store/store.h>
+#include <pagerank/pagerank.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -496,6 +497,56 @@ TEST(arch_clusters_resolution_knob) {
                                          (double)(0.0 / 0.0)),
               CBM_STORE_OK);
     cbm_store_architecture_free(&nan_info);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* #36: graph analytics (PageRank + architecture) are LANGUAGE-AGNOSTIC — they
+ * operate on the graph, not source. Contract: a graph built from multiple
+ * "languages" (file extensions) yields non-trivial PageRank ranks AND a
+ * successful architecture computation, confirming the analytics chain works
+ * across the polyglot case (not just single-language). Complements the
+ * language-agnostic pagerank/arch unit tests + the per-language LSP tests. */
+TEST(analytics_work_across_languages) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_EQ(cbm_store_upsert_project(s, "poly", "/tmp/poly"), CBM_STORE_OK);
+    /* Nodes from 3 different "languages" (file extensions). */
+    const char *exts[] = {"py", "ts", "go"};
+    int64_t ids[6];
+    int k = 0;
+    for (int e = 0; e < 3; e++) {
+        for (int i = 0; i < 2; i++) {
+            char name[64], qn[96], fp[96];
+            snprintf(name, sizeof(name), "fn_%s_%d", exts[e], i);
+            snprintf(qn, sizeof(qn), "poly.%s", name);
+            snprintf(fp, sizeof(fp), "src/mod.%s", exts[e]);
+            cbm_node_t n = {.project = "poly", .label = "Function", .name = name,
+                            .qualified_name = qn, .file_path = fp};
+            ids[k] = cbm_store_upsert_node(s, &n);
+            ASSERT_GT(ids[k], 0);
+            k++;
+        }
+    }
+    /* Cross-language call edges so PageRank has structure. */
+    for (int i = 0; i < 5; i++) {
+        cbm_edge_t ed = {.project = "poly", .source_id = ids[i], .target_id = ids[i + 1],
+                         .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(s, &ed), 0);
+    }
+
+    /* PageRank must rank nodes (>0 rows) regardless of source language. */
+    ASSERT_EQ(cbm_pagerank_compute_default(s, "poly"), 6);
+
+    /* Architecture must succeed on the polyglot node set (language metadata is
+     * populated at real-index time, so we don't assert language_count here —
+     * the contract is that the analytics CHAIN runs across a multi-"language"
+     * graph, not the language detector). */
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"languages", "entry_points"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "poly", aspects, 2, &info, 0, 1.0),
+              CBM_STORE_OK);
+    cbm_store_architecture_free(&info);
     cbm_store_close(s);
     PASS();
 }
@@ -1320,6 +1371,7 @@ SUITE(store_arch) {
     RUN_TEST(arch_file_tree);
     RUN_TEST(arch_clusters);
     RUN_TEST(arch_clusters_resolution_knob);
+    RUN_TEST(analytics_work_across_languages);
 
     /* ADR */
     RUN_TEST(adr_store_and_retrieve);
