@@ -385,7 +385,9 @@ static const tool_def_t TOOLS[] = {
     {"query_graph",
      "Execute a Cypher query against the knowledge graph for complex multi-hop patterns, "
      "aggregations, and cross-service analysis. Output is capped by default (configurable via "
-     "query_max_output_bytes config key) — set max_output_bytes=0 for unlimited or add LIMIT.",
+     "query_max_output_bytes config key) — set max_output_bytes=0 for unlimited or add LIMIT. "
+     "Dependency sub-project symbols (proj.dep.*) are tagged source:dependency; to rank your own "
+     "project's symbols above them, ORDER BY CASE WHEN n.project LIKE '%.dep.%' THEN 1 ELSE 0 END.",
      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Cypher "
      "query\"},\"project\":{\"type\":\"string\"},\"max_rows\":{\"type\":\"integer\","
      "\"description\":\"Scan-level row limit (default: unlimited). Note: limits nodes scanned, "
