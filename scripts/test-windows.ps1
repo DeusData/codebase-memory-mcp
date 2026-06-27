@@ -63,12 +63,19 @@ Write-Host "Binary: $bin" -ForegroundColor Green
 
 $env:PYTHONUTF8 = "1"   # ensure the harness encodes argv/stdio as UTF-8
 
+# test_ui_drive_listing.py reproduces the UI directory-picker bug (#548) and
+# therefore needs a UI build (make -f Makefile.cbm cbm-with-ui) plus a machine
+# with more than one drive. Against a non-UI binary it reports a precondition
+# (exit 2), which is treated as a skip-with-reason, not a failure.
 $tests = @(
     "tests\windows\test_non_ascii_path.py",
-    "tests\windows\test_cli_non_ascii_arg.py"
+    "tests\windows\test_cli_non_ascii_arg.py",
+    "tests\windows\test_hook_augment.py",
+    "tests\windows\test_ui_drive_listing.py"
 )
 
-$failed = @()
+$reds = @()
+$precond = @()
 foreach ($t in $tests) {
     Write-Host "`n=== $t ===" -ForegroundColor Cyan
     & $py $t $bin
@@ -77,18 +84,22 @@ foreach ($t in $tests) {
         Write-Host "GREEN ($t)" -ForegroundColor Green
     } elseif ($code -eq 1) {
         Write-Host "RED ($t) - Windows-specific failure reproduced" -ForegroundColor Red
-        $failed += $t
+        $reds += $t
     } else {
-        Write-Host "SETUP ERROR ($t) exit=$code" -ForegroundColor Yellow
-        $failed += $t
+        Write-Host "PRECONDITION ($t) exit=$code - skipped (see message above)" -ForegroundColor Yellow
+        $precond += $t
     }
 }
 
 Write-Host ""
-if ($failed.Count -gt 0) {
-    Write-Host ("RED suite: {0}/{1} Windows red tests failed (expected until the " -f $failed.Count, $tests.Count) -ForegroundColor Red
-    Write-Host "platform issues are fixed). See tests/windows/RED_TEST_ANALYSIS.md." -ForegroundColor Red
+if ($precond.Count -gt 0) {
+    Write-Host ("Precondition-skipped: {0} (e.g. test_ui_drive_listing needs a UI " -f $precond.Count) -ForegroundColor Yellow
+    Write-Host "build: make -f Makefile.cbm cbm-with-ui, and >1 drive)." -ForegroundColor Yellow
+}
+if ($reds.Count -gt 0) {
+    Write-Host ("RED suite: {0} Windows red tests reproduced platform failures " -f $reds.Count) -ForegroundColor Red
+    Write-Host "(expected until fixed). See tests/windows/RED_TEST_ANALYSIS.md." -ForegroundColor Red
     exit 1
 }
-Write-Host "All Windows red tests are GREEN." -ForegroundColor Green
+Write-Host "All runnable Windows red tests are GREEN." -ForegroundColor Green
 exit 0

@@ -121,6 +121,77 @@ flows that shell out to it, not the stdio server path. Holds on Linux/macOS
 
 ---
 
+## windows_hook_augment_emits_context
+
+- Class: integration
+- Test: `tests/windows/test_hook_augment.py`
+- Related issues: #618
+- Environment: Windows 11 26200, `hook-augment` CLI subcommand
+- Fixture: a repo with a known function `someIndexedSymbol`, indexed; a realistic
+  Claude Code PreToolUse Grep payload with a Windows drive-letter `cwd`
+- Expected: `codebase-memory-mcp hook-augment` emits a `hookSpecificOutput` with
+  `additionalContext` listing the matching graph symbol (the control
+  `search_graph` finds the symbol, so the index and project name are fine)
+- Actual: `hook-augment` emits **empty stdout** for every payload
+- Command: `python tests/windows/test_hook_augment.py build\c\codebase-memory-mcp.exe`
+- Minimal failure output:
+
+  ```
+  control: search_graph finds someIndexedSymbol in project C-...-repo
+  hook-augment rc=0 stdout=''
+  ```
+
+- Suspected implementation area: `src/cli/hook_augment.c` has two POSIX-only path
+  guards. `cbm_cmd_hook_augment` (`_WIN32` branch, ~L330):
+  `if (!cwd || cwd[0] != '/') { ...; return 0; }` and the `ha_resolve_and_query`
+  walk-up loop (~L254): `for (...; dir[0] == '/'; ...)`. A Windows `cwd` is a
+  drive-letter path (`C:\...` / `C:/...`), so `cwd[0]` is never `'/'`; the
+  augmenter bails before it queries the graph. The PreToolUse Grep/Glob graph
+  augmentation therefore never fires on Windows. Fix direction: accept
+  drive-letter absolute paths (and climb them in the walk-up loop).
+
+Holds on Linux/macOS (`cwd` starts with `/`).
+
+---
+
+## windows_ui_picker_reaches_all_drives
+
+- Class: integration
+- Test: `tests/windows/test_ui_drive_listing.py`
+- Related issues: #548
+- Environment: Windows 11 26200 with drives `C:\`, `D:\`, `E:\`; UI build
+  (`make -f Makefile.cbm cbm-with-ui`); embedded HTTP server on a local port
+- Fixture: none — exercises the live `GET /api/browse` endpoint
+- Expected: browsing the filesystem root (`/api/browse?path=/`) lets the user
+  reach every fixed drive (`D:\`, `E:\`), so a project on a non-system drive can
+  be selected
+- Actual: the control browse of an explicit directory returns entries (endpoint
+  works), but `browse('/')` returns **0 entries** and no drive letters — `D:\`
+  and `E:\` are unreachable from the picker root
+- Command: `python tests/windows/test_ui_drive_listing.py build\c\codebase-memory-mcp.exe`
+- Minimal failure output:
+
+  ```
+  control browse('C:/Users/jacob') -> dirs(23)
+  browse('/') -> path='/' dirs(0)=[]
+  RED: drives ['D:\\', 'E:\\'] are not reachable from the UI root picker
+  ```
+
+- Suspected implementation area: `handle_browse` in `src/ui/http_server.c` does
+  `opendir(path)` for the requested path. For the root it lists only the current
+  drive's contents and never enumerates the logical drives
+  (`GetLogicalDriveStrings`). Fix direction: when the path is the filesystem root
+  on Windows, return the available drive letters as the directory list so the
+  picker can descend into any drive.
+
+This test requires a UI build because the HTTP server only starts when the
+frontend is embedded (`CBM_EMBEDDED_FILE_COUNT > 0`); against a non-UI binary it
+reports a precondition (exit 2), and on a single-drive machine it is not
+meaningful (exit 2). Holds on Linux/macOS (a single `/` root with no drive
+letters).
+
+---
+
 ## Seed areas revisited and ruled out (green on native Windows)
 
 Each was reproduced as a concrete attempt against the production binary and
@@ -128,8 +199,10 @@ behaved correctly — recorded as green and **not** included as a red test:
 
 | Area | Seed | Result on Windows |
 |---|---|---|
-| stdio `initialize` returns before stdin EOF | #513, #635 | green |
+| stdio `initialize` returns before stdin EOF; stdout flushes before EOF | #513, #530.1, #635 | green |
 | `tools/list` non-empty; all 14 tools return valid JSON-RPC | #530 | green |
+| `get_code_snippet` on a CP949 file emits valid UTF-8 (invalid bytes → U+FFFD) | #530.3 | green |
+| Indexing a mapped (subst) drive `W:\` — no `bad_root_path`/`store.corrupt`, DB kept | #227, #367 | green (subst; real SMB not testable here) |
 | Client exit terminates the server process (no residual `.exe`) | #185, #406 | green |
 | `--help` / `--version` exit 0 in PowerShell, cmd, Git Bash | — | green |
 | `search_code` works without bash/GNU grep (PowerShell `Select-String`) | #422, #348 | green |
@@ -157,6 +230,18 @@ behaved correctly — recorded as green and **not** included as a red test:
   paths over `MAX_PATH` are unreachable by every application, not just CBM.
   CBM could opt in via the `\\?\` prefix + wide APIs, but the failure is gated by
   a machine-wide policy rather than a clean CBM-only defect, so it is excluded.
+- **Cascading nested `.gitignore` (#530.2) and `.git/info/exclude` (#530.5).**
+  `try_load_nested_gitignore` in `src/discover/discover.c` skips nested
+  `.gitignore` files once a parent ignore is loaded, and discovery never reads
+  `.git/info/exclude`. Both are real, but the discovery logic is
+  platform-independent and reproduces identically on Linux, so they are out of
+  scope for a Windows-only PR.
+- **libgit2 1.8+ build break (#530.4).** `git_allocator` moved to
+  `<git2/sys/alloc.h>`; cross-platform compile issue, not a Windows runtime bug.
+- **Memory growth over hours (#581).** Requires a multi-hour soak to surface and
+  is not deterministic in a unit/integration test; the existing
+  `scripts/soak-test.sh` RSS-trend harness is the right vehicle and is not
+  reproduced as a red test here.
 - **C `test-runner` failures on Windows.** The in-process C suite reports many
   extraction-count failures concentrated in `test_grammar_probe_*`,
   `test_node_creation_probe`, `test_edge_*`, `test_matrix_*`, and
