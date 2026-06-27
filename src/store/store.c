@@ -5085,7 +5085,8 @@ static int cluster_rank_cmp(const void *a, const void *b) {
     return cb->members - ca->members;
 }
 
-static int arch_clusters(cbm_store_t *s, const char *project, cbm_architecture_info_t *out) {
+static int arch_clusters(cbm_store_t *s, const char *project, cbm_architecture_info_t *out,
+                         double resolution) {
     /* 1. Load Function/Method/Class nodes, ordered by id for bsearch. */
     const char *nsql = "SELECT id, name, qualified_name FROM nodes "
                        "WHERE project=?1 AND label IN ('Function','Method','Class') "
@@ -5163,7 +5164,7 @@ static int arch_clusters(cbm_store_t *s, const char *project, cbm_architecture_i
     int rn = 0;
     int *comm = NULL;
     int C = 0;
-    if (cbm_leiden(ids, n, edges, ne, 1.0, &res, &rn) == CBM_STORE_OK && res && rn == n) {
+    if (cbm_leiden(ids, n, edges, ne, resolution, &res, &rn) == CBM_STORE_OK && res && rn == n) {
         comm = malloc((size_t)n * sizeof(int));
         for (int i = 0; i < n; i++) {
             comm[i] = res[i].community;
@@ -5256,7 +5257,13 @@ static bool want_aspect(const char **aspects, int aspect_count, const char *name
 
 int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char **aspects,
                                int aspect_count, cbm_architecture_info_t *out,
-                               int hotspot_limit) {
+                               int hotspot_limit, double leiden_resolution) {
+    /* Leiden resolution (gamma): controls cluster granularity. >1 → smaller
+     * clusters; <1 → larger. Reject NaN/non-positive (config-tunable since the
+     * value flows in from CBM_CONFIG_ARCH_RESOLUTION). Default 1.0. */
+    if (!(leiden_resolution > 0.0)) {
+        leiden_resolution = 1.0;
+    }
     memset(out, 0, sizeof(*out));
     int rc;
 
@@ -5314,7 +5321,7 @@ int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char *
         }
     }
     if (want_aspect(aspects, aspect_count, "clusters")) {
-        rc = arch_clusters(s, project, out);
+        rc = arch_clusters(s, project, out, leiden_resolution);
         if (rc != CBM_STORE_OK) {
             return rc;
         }

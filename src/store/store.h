@@ -559,7 +559,7 @@ typedef struct {
 
 int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char **aspects,
                                int aspect_count, cbm_architecture_info_t *out,
-                               int hotspot_limit);
+                               int hotspot_limit, double leiden_resolution);
 void cbm_store_architecture_free(cbm_architecture_info_t *out);
 
 /* ── ADR (Architecture Decision Record) ────────────────────────── */

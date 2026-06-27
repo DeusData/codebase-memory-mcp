@@ -130,6 +130,7 @@ static void add_pagerank_val(yyjson_mut_doc *doc, yyjson_mut_val *obj, double v)
 #define CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE "key_functions_exclude"
 #define CBM_CONFIG_KEY_FUNCTIONS_COUNT   "key_functions_count"
 #define CBM_CONFIG_ARCH_HOTSPOT_LIMIT    "arch_hotspot_limit"
+#define CBM_CONFIG_ARCH_RESOLUTION       "architecture_resolution"
 
 /* Directory permissions: rwxr-xr-x */
 #define ADR_DIR_PERMS 0755
@@ -3304,8 +3305,14 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     int arch_hotspot_limit = srv && srv->config
         ? cbm_config_get_int(srv->config, CBM_CONFIG_ARCH_HOTSPOT_LIMIT, 0)
         : 0;
+    /* Leiden resolution (gamma) — cluster granularity, tunable via config.
+     * Default 1.0; >1 → smaller/more clusters, <1 → larger/fewer. */
+    double arch_leiden_resolution = srv && srv->config
+        ? cbm_config_get_double(srv->config, CBM_CONFIG_ARCH_RESOLUTION, 1.0)
+        : 1.0;
     cbm_store_get_architecture(store, project, aspects_strs_count > 0 ? aspects_strs : NULL,
-                               aspects_strs_count, &arch, arch_hotspot_limit);
+                               aspects_strs_count, &arch, arch_hotspot_limit,
+                               arch_leiden_resolution);
 
     int node_count = cbm_store_count_nodes(store, project);
     int edge_count = cbm_store_count_edges(store, project);
