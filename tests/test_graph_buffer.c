@@ -1047,6 +1047,35 @@ TEST(gbuf_dump_pipeline_path_integrity) {
     PASS();
 }
 
+/* Regression: a RELATIVE root_path (e.g. ".") must not cause the post-dump
+ * verify to delete a valid DB. The integrity check flags non-absolute
+ * root_paths as bad_root_path, but that's a cosmetic project-row defect
+ * (path_only) — the node/edge data is intact. The dump-verify must RETAIN
+ * (path_only) like #557, not delete. Caught by self-indexing the repo with
+ * repo_path="." (which failed with status=error before the fix). */
+TEST(gbuf_dump_relative_root_path_retained) {
+    char path[256];
+    ASSERT_EQ(gbuf_make_temp_db(path, sizeof(path)), 0);
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", ".");
+    ASSERT_NOT_NULL(gb);
+    cbm_gbuf_upsert_node(gb, "Function", "main", "proj.main", "main.c", 1, 2, "{}");
+
+    /* Must succeed (DB retained) despite the relative "." root_path. */
+    ASSERT_EQ(cbm_gbuf_dump_to_sqlite(gb, path), 0);
+
+    /* The DB file must still exist (not deleted by the verify). */
+    FILE *f = fopen(path, "rb");
+    ASSERT_NOT_NULL(f);
+    if (f) {
+        fclose(f);
+    }
+
+    unlink(path);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 SUITE(graph_buffer) {
     /* Original tests */
     RUN_TEST(gbuf_create_free);
@@ -1110,4 +1139,6 @@ SUITE(graph_buffer) {
 
     /* B1 pipeline-path isolation (#23) */
     RUN_TEST(gbuf_dump_pipeline_path_integrity);
+    /* Relative root_path retain regression (#57 self-index finding) */
+    RUN_TEST(gbuf_dump_relative_root_path_retained);
 }

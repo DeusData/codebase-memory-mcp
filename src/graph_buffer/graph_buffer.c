@@ -1534,13 +1534,21 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
      * intermittently emit a structurally-corrupt .db (gbuf-data corruption that
      * is ASan/TSan-invisible). Detect it with the fast projects-table check
      * (O(1), not a full integrity_check) and remove the corrupt DB so neither
-     * queries nor tests ever read garbage — the next access re-indexes. */
+     * queries nor tests ever read garbage — the next access re-indexes.
+     *
+     * Use the _full variant so a path-only defect (root_path the check considers
+     * non-absolute, e.g. a relative repo_path like ".") is RETAINED, not deleted
+     * — the node/edge data is intact and queries key off project name, not
+     * root_path. Deleting on path-only would drop valid DBs whenever a relative
+     * path is indexed (caught by self-indexing the repo with repo_path=".").
+     * Consistent with #557 resolve_store. */
     if (rc == 0) {
         cbm_store_t *verify = cbm_store_open_path((const char *)path);
         if (verify) {
-            bool intact = cbm_store_check_integrity(verify);
+            bool path_only = false;
+            bool intact = cbm_store_check_integrity_full(verify, &path_only);
             cbm_store_close(verify);
-            if (!intact) {
+            if (!intact && !path_only) { /* genuine structural corruption only */
                 char nodes_str[CBM_SZ_16];
                 char edges_str[CBM_SZ_16];
                 snprintf(nodes_str, sizeof(nodes_str), "%d", node_idx);
