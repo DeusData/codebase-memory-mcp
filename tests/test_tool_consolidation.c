@@ -1099,6 +1099,49 @@ TEST(store_prefix_ranks_project_above_dep) {
     PASS();
 }
 
+/* #49: dep-last ranking holds across ALL sort_by modes (relevance/name/degree/
+ * calls/linkrank), not just the default. With equal primary metrics (both
+ * "Path", no edges → tied pagerank/degree/calls/linkrank/name), the dep-last
+ * secondary key must put the project symbol first in every mode. Dep is
+ * inserted first (lower id) so a missing dep-last would let the dep win the id
+ * tiebreak — making this a real per-mode check, not a tautology. */
+TEST(store_prefix_ranks_project_above_dep_all_sort_modes) {
+    static const char *modes[] = {"relevance", "name", "degree", "calls", "linkrank"};
+    for (size_t m = 0; m < sizeof(modes) / sizeof(modes[0]); m++) {
+        cbm_store_t *s = cbm_store_open_memory();
+        cbm_store_upsert_project(s, "myapp", "/tmp/myapp");
+        cbm_store_upsert_project(s, "myapp.dep.stdlib", "/tmp/stdlib");
+        cbm_node_t nd = {.project = "myapp.dep.stdlib", .label = "Class", .name = "Path",
+                         .qualified_name = "myapp.dep.stdlib.Path", .file_path = "stdlib/path.py"};
+        cbm_store_upsert_node(s, &nd); /* dep first → lower id */
+        cbm_node_t np = {.project = "myapp", .label = "Class", .name = "Path",
+                         .qualified_name = "myapp.Path", .file_path = "src/path.py"};
+        cbm_store_upsert_node(s, &np);
+
+        cbm_search_params_t params = {0};
+        params.project = "myapp"; /* prefix: includes deps */
+        params.sort_by = modes[m];
+        params.limit = 10;
+        cbm_search_output_t out = {0};
+        cbm_store_search(s, &params, &out);
+        ASSERT_GTE(out.count, 2);
+
+        int proj_idx = -1, dep_idx = -1;
+        for (int i = 0; i < out.count; i++) {
+            if (strcmp(out.results[i].node.name, "Path") != 0) continue;
+            if (strcmp(out.results[i].node.project, "myapp") == 0) proj_idx = i;
+            if (strcmp(out.results[i].node.project, "myapp.dep.stdlib") == 0) dep_idx = i;
+        }
+        ASSERT_NEQ(proj_idx, -1);
+        ASSERT_NEQ(dep_idx, -1);
+        ASSERT_TRUE(proj_idx < dep_idx); /* project before dep in EVERY mode */
+
+        cbm_store_search_free(&out);
+        cbm_store_close(s);
+    }
+    PASS();
+}
+
 /* #38: the dep-last ranking is tunable. With disable_dep_ranking=true the store
  * applies PURE relevance order — a dep symbol may rank above the project's own.
  * This makes the ranking a parameter (config key search_disable_dep_ranking)
@@ -2185,6 +2228,7 @@ SUITE(tool_consolidation) {
     RUN_TEST(dep_search_explicit_dep_project_name);
     RUN_TEST(store_prefix_match_includes_deps);
     RUN_TEST(store_prefix_ranks_project_above_dep);
+    RUN_TEST(store_prefix_ranks_project_above_dep_all_sort_modes);
     RUN_TEST(store_prefix_disable_dep_ranking_lets_dep_win);
     RUN_TEST(store_exact_match_excludes_deps);
     RUN_TEST(is_dep_project_cross_project_detection);
