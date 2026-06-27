@@ -2202,6 +2202,205 @@ static yyjson_mut_val *bfs_to_json_array(yyjson_mut_doc *doc, cbm_traverse_resul
     return arr;
 }
 
+static bool trace_is_callable_node(const cbm_node_t *n) {
+    return n && n->label && (strcmp(n->label, "Function") == 0 || strcmp(n->label, "Method") == 0);
+}
+
+static bool trace_is_bodyless_declaration(const cbm_node_t *n) {
+    return n && n->start_line == n->end_line;
+}
+
+static int trace_label_rank(const cbm_node_t *n) {
+    if (!n || !n->label) {
+        return 0;
+    }
+    if (strcmp(n->label, "Function") == 0 || strcmp(n->label, "Method") == 0) {
+        return 3;
+    }
+    if (strcmp(n->label, "Route") == 0) {
+        return 2;
+    }
+    if (strcmp(n->label, "Class") == 0 || strcmp(n->label, "Interface") == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static int trace_node_resolution_score(const cbm_node_t *n) {
+    int span = n && n->end_line > n->start_line ? n->end_line - n->start_line : 0;
+    return trace_label_rank(n) * 1000 + span;
+}
+
+static int pick_trace_resolved_node(const cbm_node_t *nodes, int node_count) {
+    int sel = 0;
+    int best = trace_node_resolution_score(&nodes[0]);
+    for (int i = 1; i < node_count; i++) {
+        int score = trace_node_resolution_score(&nodes[i]);
+        if (score > best) {
+            best = score;
+            sel = i;
+        }
+    }
+    return sel;
+}
+
+static int trace_real_callable_count(const cbm_node_t *nodes, int node_count) {
+    int count = 0;
+    for (int i = 0; i < node_count; i++) {
+        if (trace_is_callable_node(&nodes[i]) && !trace_is_bodyless_declaration(&nodes[i])) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static char *trace_node_signature_dup(const cbm_node_t *n) {
+    if (!n || !n->properties_json || n->properties_json[0] == '\0') {
+        return NULL;
+    }
+
+    yyjson_doc *doc = yyjson_read(n->properties_json, strlen(n->properties_json), 0);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *sig = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "signature") : NULL;
+    const char *sig_str = sig && yyjson_is_str(sig) ? yyjson_get_str(sig) : NULL;
+    char *copy = sig_str && sig_str[0] ? heap_strdup(sig_str) : NULL;
+    yyjson_doc_free(doc);
+    return copy;
+}
+
+static bool trace_signatures_compatible(const cbm_node_t *a, const cbm_node_t *b) {
+    char *sig_a = trace_node_signature_dup(a);
+    char *sig_b = trace_node_signature_dup(b);
+    bool compatible = true;
+    if (sig_a && sig_b) {
+        compatible = strcmp(sig_a, sig_b) == 0;
+    }
+    free(sig_a);
+    free(sig_b);
+    return compatible;
+}
+
+static bool trace_same_symbol_declaration(const cbm_node_t *canonical,
+                                          const cbm_node_t *candidate) {
+    return canonical && candidate && candidate->id != canonical->id &&
+           trace_is_callable_node(canonical) && trace_is_callable_node(candidate) &&
+           trace_is_bodyless_declaration(candidate) && canonical->name && candidate->name &&
+           strcmp(canonical->name, candidate->name) == 0 &&
+           trace_signatures_compatible(canonical, candidate);
+}
+
+static int collect_trace_root_ids(const cbm_node_t *nodes, int node_count, int selected,
+                                  int64_t *root_ids) {
+    int root_count = 0;
+    const cbm_node_t *canonical = &nodes[selected];
+    root_ids[root_count++] = canonical->id;
+
+    for (int i = 0; i < node_count; i++) {
+        if (trace_same_symbol_declaration(canonical, &nodes[i])) {
+            root_ids[root_count++] = nodes[i].id;
+        }
+    }
+    return root_count;
+}
+
+static void trace_copy_node(const cbm_node_t *src, cbm_node_t *dst) {
+    dst->id = src->id;
+    dst->project = heap_strdup(src->project);
+    dst->label = heap_strdup(src->label);
+    dst->name = heap_strdup(src->name);
+    dst->qualified_name = heap_strdup(src->qualified_name);
+    dst->file_path = heap_strdup(src->file_path);
+    dst->start_line = src->start_line;
+    dst->end_line = src->end_line;
+    dst->properties_json = src->properties_json ? heap_strdup(src->properties_json) : NULL;
+}
+
+static void trace_merge_visited(cbm_traverse_result_t *dst, int *dst_cap,
+                                const cbm_traverse_result_t *src) {
+    enum { TRACE_INIT_CAP = 16, TRACE_GROWTH = 2 };
+
+    for (int i = 0; i < src->visited_count; i++) {
+        const cbm_node_hop_t *hop = &src->visited[i];
+        bool seen = false;
+        for (int j = 0; j < dst->visited_count; j++) {
+            if (dst->visited[j].node.id == hop->node.id) {
+                if (hop->hop < dst->visited[j].hop) {
+                    dst->visited[j].hop = hop->hop;
+                }
+                seen = true;
+                break;
+            }
+        }
+        if (seen) {
+            continue;
+        }
+
+        if (dst->visited_count >= *dst_cap) {
+            *dst_cap = *dst_cap == 0 ? TRACE_INIT_CAP : *dst_cap * TRACE_GROWTH;
+            dst->visited = safe_realloc(dst->visited, *dst_cap * sizeof(cbm_node_hop_t));
+        }
+        trace_copy_node(&hop->node, &dst->visited[dst->visited_count].node);
+        dst->visited[dst->visited_count].hop = hop->hop;
+        dst->visited_count++;
+    }
+}
+
+static void trace_bfs_from_roots(cbm_store_t *store, const int64_t *root_ids, int root_count,
+                                 const char *direction, const char **edge_types,
+                                 int edge_type_count, int depth, cbm_traverse_result_t *merged) {
+    int merged_cap = 0;
+    for (int i = 0; i < root_count; i++) {
+        cbm_traverse_result_t current = {0};
+        if (cbm_store_bfs(store, root_ids[i], direction, edge_types, edge_type_count, depth,
+                          MCP_BFS_LIMIT, &current) == CBM_STORE_OK) {
+            trace_merge_visited(merged, &merged_cap, &current);
+        }
+        cbm_store_traverse_free(&current);
+    }
+}
+
+static char *trace_ambiguous_suggestions(const char *input, cbm_node_t *nodes, int count) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    yyjson_mut_obj_add_str(doc, root, "status", "ambiguous");
+    yyjson_mut_obj_add_str(doc, root, "error", "trace_ambiguous");
+
+    char msg[CBM_SZ_512];
+    snprintf(msg, sizeof(msg),
+             "%d real callable matches for \"%s\". Pick a qualified_name from suggestions below.",
+             trace_real_callable_count(nodes, count), input);
+    yyjson_mut_obj_add_strcpy(doc, root, "message", msg);
+
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < count; i++) {
+        if (!trace_is_callable_node(&nodes[i]) || trace_is_bodyless_declaration(&nodes[i])) {
+            continue;
+        }
+        yyjson_mut_val *s = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, s, "qualified_name",
+                               nodes[i].qualified_name ? nodes[i].qualified_name : "");
+        yyjson_mut_obj_add_str(doc, s, "name", nodes[i].name ? nodes[i].name : "");
+        yyjson_mut_obj_add_str(doc, s, "label", nodes[i].label ? nodes[i].label : "");
+        yyjson_mut_obj_add_str(doc, s, "file_path", nodes[i].file_path ? nodes[i].file_path : "");
+        yyjson_mut_obj_add_int(doc, s, "start_line", nodes[i].start_line);
+        yyjson_mut_obj_add_int(doc, s, "end_line", nodes[i].end_line);
+        yyjson_mut_arr_append(arr, s);
+    }
+    yyjson_mut_obj_add_val(doc, root, "suggestions", arr);
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
 static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *func_name = cbm_mcp_get_string_arg(args, "function_name");
     char *project = cbm_mcp_get_string_arg(args, "project");
@@ -2286,6 +2485,29 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result(hint, true);
     }
 
+    if (node_count > 1 && trace_real_callable_count(nodes, node_count) > 1) {
+        char *result = trace_ambiguous_suggestions(func_name, nodes, node_count);
+        free(func_name);
+        free(project);
+        free(direction);
+        free(mode);
+        free(param_name);
+        cbm_store_free_nodes(nodes, node_count);
+        return result;
+    }
+
+    int selected = pick_trace_resolved_node(nodes, node_count);
+    int64_t fallback_root_id = nodes[selected].id;
+    bool root_ids_heap = true;
+    int64_t *root_ids = malloc((size_t)node_count * sizeof(int64_t));
+    int root_count = 1;
+    if (root_ids) {
+        root_count = collect_trace_root_ids(nodes, node_count, selected, root_ids);
+    } else {
+        root_ids = &fallback_root_id;
+        root_ids_heap = false;
+    }
+
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
@@ -2294,6 +2516,9 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_str(doc, root, "direction", direction);
     if (mode) {
         yyjson_mut_obj_add_str(doc, root, "mode", mode);
+    }
+    if (root_count > 1) {
+        yyjson_mut_obj_add_bool(doc, root, "fragmented_symbol", true);
     }
 
     /* Edge types: explicit > mode-based > default */
@@ -2311,15 +2536,15 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     cbm_traverse_result_t tr_in = {0};
 
     if (do_outbound) {
-        cbm_store_bfs(store, nodes[0].id, "outbound", edge_types, edge_type_count, depth,
-                      MCP_BFS_LIMIT, &tr_out);
+        trace_bfs_from_roots(store, root_ids, root_count, "outbound", edge_types, edge_type_count,
+                             depth, &tr_out);
         yyjson_mut_obj_add_val(doc, root, "callees",
                                bfs_to_json_array(doc, &tr_out, risk_labels, include_tests));
     }
 
     if (do_inbound) {
-        cbm_store_bfs(store, nodes[0].id, "inbound", edge_types, edge_type_count, depth,
-                      MCP_BFS_LIMIT, &tr_in);
+        trace_bfs_from_roots(store, root_ids, root_count, "inbound", edge_types, edge_type_count,
+                             depth, &tr_in);
         yyjson_mut_obj_add_val(doc, root, "callers",
                                bfs_to_json_array(doc, &tr_in, risk_labels, include_tests));
     }
@@ -2337,6 +2562,9 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     }
 
     cbm_store_free_nodes(nodes, node_count);
+    if (root_ids_heap) {
+        free(root_ids);
+    }
     free(func_name);
     free(project);
     free(direction);

@@ -532,6 +532,199 @@ TEST(tool_trace_missing_function_name) {
     PASS();
 }
 
+static int64_t insert_trace_test_node(cbm_store_t *st, const char *project, const char *label,
+                                      const char *name, const char *qualified_name,
+                                      const char *file_path, int start_line, int end_line,
+                                      const char *properties_json) {
+    cbm_node_t n = {0};
+    n.project = project;
+    n.label = label;
+    n.name = name;
+    n.qualified_name = qualified_name;
+    n.file_path = file_path;
+    n.start_line = start_line;
+    n.end_line = end_line;
+    n.properties_json = properties_json;
+    return cbm_store_upsert_node(st, &n);
+}
+
+static void insert_trace_test_call(cbm_store_t *st, const char *project, int64_t source_id,
+                                   int64_t target_id) {
+    cbm_edge_t e = {
+        .project = project, .source_id = source_id, .target_id = target_id, .type = "CALLS"};
+    cbm_store_insert_edge(st, &e);
+}
+
+static char *call_trace_path(cbm_mcp_server_t *srv, const char *args_json) {
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path", args_json);
+    char *text = extract_text_content(raw);
+    free(raw);
+    return text;
+}
+
+static int count_occurrences(const char *haystack, const char *needle) {
+    int count = 0;
+    const char *p = haystack;
+    size_t needle_len = strlen(needle);
+    while (p && (p = strstr(p, needle)) != NULL) {
+        count++;
+        p += needle_len;
+    }
+    return count;
+}
+
+static cbm_mcp_server_t *setup_trace_fragmented_server(void) {
+    const char *proj = "trace-dts-fragment";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    if (!st) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/trace-dts-fragment");
+
+    const char *sig = "{\"signature\":\"function alignToEdge(edge: Edge): void\"}";
+    int64_t impl = insert_trace_test_node(st, proj, "Function", "alignToEdge",
+                                          "src.scroll.alignToEdge", "src/scroll.ts", 10, 18, sig);
+    int64_t shim =
+        insert_trace_test_node(st, proj, "Function", "alignToEdge", "types.widget-shim.alignToEdge",
+                               "types/widget-shim.d.ts", 3, 3, sig);
+    int64_t internal =
+        insert_trace_test_node(st, proj, "Function", "internalConsumer", "src.internalConsumer",
+                               "src/internalConsumer.ts", 20, 25, NULL);
+    int64_t external =
+        insert_trace_test_node(st, proj, "Function", "externalConsumer", "src.externalConsumer",
+                               "src/externalConsumer.ts", 30, 35, NULL);
+    int64_t dual = insert_trace_test_node(st, proj, "Function", "dualConsumer", "src.dualConsumer",
+                                          "src/dualConsumer.ts", 40, 45, NULL);
+
+    insert_trace_test_call(st, proj, internal, impl);
+    insert_trace_test_call(st, proj, external, shim);
+    insert_trace_test_call(st, proj, dual, impl);
+    insert_trace_test_call(st, proj, dual, shim);
+    return srv;
+}
+
+TEST(tool_trace_path_dts_fragmented_callers_union) {
+    cbm_mcp_server_t *srv = setup_trace_fragmented_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = call_trace_path(srv, "{\"function_name\":\"alignToEdge\","
+                                      "\"project\":\"trace-dts-fragment\","
+                                      "\"mode\":\"calls\",\"direction\":\"inbound\",\"depth\":1}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"callers\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"fragmented_symbol\":true"));
+    ASSERT_EQ(count_occurrences(resp, "\"name\":\"internalConsumer\""), 1);
+    ASSERT_EQ(count_occurrences(resp, "\"name\":\"externalConsumer\""), 1);
+    ASSERT_EQ(count_occurrences(resp, "\"name\":\"dualConsumer\""), 1);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+static cbm_mcp_server_t *setup_trace_ambiguous_server(void) {
+    const char *proj = "trace-ambiguous";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    if (!st) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/trace-ambiguous");
+    insert_trace_test_node(st, proj, "Function", "parse", "src.moduleA.parse", "src/moduleA.ts", 5,
+                           12, "{\"signature\":\"function parse(input: string): A\"}");
+    insert_trace_test_node(st, proj, "Function", "parse", "src.moduleB.parse", "src/moduleB.ts", 20,
+                           29, "{\"signature\":\"function parse(input: string): B\"}");
+    return srv;
+}
+
+TEST(tool_trace_path_same_name_real_functions_stay_ambiguous) {
+    cbm_mcp_server_t *srv = setup_trace_ambiguous_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = call_trace_path(srv, "{\"function_name\":\"parse\","
+                                      "\"project\":\"trace-ambiguous\","
+                                      "\"mode\":\"calls\",\"direction\":\"inbound\",\"depth\":1}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"status\":\"ambiguous\""));
+    ASSERT_NOT_NULL(strstr(resp, "trace_ambiguous"));
+    ASSERT_NOT_NULL(strstr(resp, "src.moduleA.parse"));
+    ASSERT_NOT_NULL(strstr(resp, "src.moduleB.parse"));
+    ASSERT_NULL(strstr(resp, "\"callers\""));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+static cbm_mcp_server_t *setup_trace_single_server(void) {
+    const char *proj = "trace-single";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    if (!st) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/trace-single");
+    int64_t target = insert_trace_test_node(st, proj, "Function", "uniqueTarget",
+                                            "src.uniqueTarget", "src/unique.ts", 8, 15, NULL);
+    int64_t caller =
+        insert_trace_test_node(st, proj, "Function", "singleCaller", "src.singleCaller",
+                               "src/singleCaller.ts", 20, 25, NULL);
+    insert_trace_test_call(st, proj, caller, target);
+    return srv;
+}
+
+TEST(tool_trace_path_single_node_unchanged) {
+    cbm_mcp_server_t *srv = setup_trace_single_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = call_trace_path(srv, "{\"function_name\":\"uniqueTarget\","
+                                      "\"project\":\"trace-single\","
+                                      "\"mode\":\"calls\",\"direction\":\"inbound\",\"depth\":1}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"callers\""));
+    ASSERT_EQ(count_occurrences(resp, "\"name\":\"singleCaller\""), 1);
+    ASSERT_NULL(strstr(resp, "\"fragmented_symbol\""));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_path_unknown_function_still_not_found) {
+    cbm_mcp_server_t *srv = setup_trace_single_server();
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = call_trace_path(srv, "{\"function_name\":\"missingTarget\","
+                                      "\"project\":\"trace-single\","
+                                      "\"mode\":\"calls\",\"direction\":\"inbound\",\"depth\":1}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"error\":\"function not found\""));
+    ASSERT_NOT_NULL(strstr(resp, "search_graph"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_delete_project_not_found) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -2044,6 +2237,10 @@ SUITE(mcp) {
     /* Tool handlers with validation */
     RUN_TEST(tool_trace_call_path_not_found);
     RUN_TEST(tool_trace_missing_function_name);
+    RUN_TEST(tool_trace_path_dts_fragmented_callers_union);
+    RUN_TEST(tool_trace_path_same_name_real_functions_stay_ambiguous);
+    RUN_TEST(tool_trace_path_single_node_unchanged);
+    RUN_TEST(tool_trace_path_unknown_function_still_not_found);
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
