@@ -867,6 +867,39 @@ TEST(pagerank_nan_damping_is_clamped) {
     PASS();
 }
 
+/* #49: out-of-range / nonsensical damping, epsilon, and max_iter must all clamp
+ * to safe defaults and NOT corrupt the computation or hang. Guards the
+ * config-tunable knobs (#21) against bad user-supplied values. */
+TEST(pagerank_invalid_inputs_clamp_cleanly) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "bad", "/tmp/bad");
+    int64_t a = add_node(s, "bad", "a");
+    int64_t b = add_node(s, "bad", "b");
+    add_edge(s, "bad", a, b, "CALLS");
+    add_edge(s, "bad", b, a, "CALLS");
+
+    struct { double damping; double epsilon; int max_iter; const char *label; } cases[] = {
+        {-0.5, CBM_PAGERANK_EPSILON, 20, "negative damping"},   /* clamp to 0.85 */
+        {2.0, CBM_PAGERANK_EPSILON, 20, "damping>1"},           /* clamp to 0.85 */
+        {CBM_PAGERANK_DAMPING, -1.0, 20, "negative epsilon"},   /* clamp to 1e-6 */
+        {CBM_PAGERANK_DAMPING, 0.0, 20, "zero epsilon"},        /* clamp to 1e-6 */
+        {CBM_PAGERANK_DAMPING, CBM_PAGERANK_EPSILON, -5, "neg max_iter"},  /* clamp to 20 */
+        {CBM_PAGERANK_DAMPING, CBM_PAGERANK_EPSILON, 0, "zero max_iter"},  /* clamp to 20 */
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        int rc = cbm_pagerank_compute(s, "bad", cases[i].damping, cases[i].epsilon,
+                                      cases[i].max_iter, NULL, CBM_DEFAULT_RANK_SCOPE);
+        ASSERT_EQ(rc, 2); /* both nodes ranked */
+        double ra = get_pr(s, a), rb = get_pr(s, b);
+        ASSERT_TRUE(isfinite(ra));
+        ASSERT_TRUE(isfinite(rb));
+        ASSERT_TRUE(fabs((ra + rb) - 1.0) < 0.05); /* ranks still sum to ~1 */
+        (void)cases[i].label;
+    }
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Suite registration ──────────────────────────────────── */
 
 SUITE(pagerank) {
@@ -880,6 +913,7 @@ SUITE(pagerank) {
     RUN_TEST(pagerank_convergence);
     RUN_TEST(pagerank_damping_epsilon_config_tunable);
     RUN_TEST(pagerank_nan_damping_is_clamped);
+    RUN_TEST(pagerank_invalid_inputs_clamp_cleanly);
     RUN_TEST(pagerank_sum_to_one);
     RUN_TEST(pagerank_stored_in_db);
     RUN_TEST(pagerank_recompute_replaces);
