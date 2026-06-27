@@ -129,6 +129,10 @@ static void add_pagerank_val(yyjson_mut_doc *doc, yyjson_mut_val *obj, double v)
  * Set via: config set key_functions_exclude "scripts/,tools/,tests/" */
 #define CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE "key_functions_exclude"
 #define CBM_CONFIG_KEY_FUNCTIONS_COUNT   "key_functions_count"
+/* Bound on the key_functions summary PUSHED in the first-response _context
+ * header (closes the codebase://architecture pull-only gap). Smaller than the
+ * get_architecture default (25) to keep first-response token cost modest. */
+#define CBM_CONTEXT_KEY_FUNCTIONS_LIMIT  10
 #define CBM_CONFIG_ARCH_HOTSPOT_LIMIT    "arch_hotspot_limit"
 #define CBM_CONFIG_ARCH_RESOLUTION       "architecture_resolution"
 #define CBM_CONFIG_SIMILARITY_THRESHOLD  "similarity_threshold"
@@ -1501,6 +1505,39 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
                 }
             }
             sqlite3_finalize(stmt);
+        }
+    }
+
+    /* Key functions (top by PageRank): PUSH a bounded summary so the model
+     * knows where to start tracing WITHOUT having to pull codebase://architecture
+     * (an MCP resource — application-controlled/pull-only by spec; the only
+     * reliable delivery channel into the model is this _context header). Honors
+     * key_functions_exclude (config). Bounded by CBM_CONTEXT_KEY_FUNCTIONS_LIMIT
+     * to keep the first-response token cost modest. */
+    if (db && proj) {
+        const char *kf_exclude = srv->config
+            ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "")
+            : "";
+        char *kf_sql = build_key_functions_sql(kf_exclude, NULL,
+                                               CBM_CONTEXT_KEY_FUNCTIONS_LIMIT);
+        if (kf_sql) {
+            sqlite3_stmt *kf_stmt = NULL;
+            if (sqlite3_prepare_v2(db, kf_sql, -1, &kf_stmt, NULL) == SQLITE_OK) {
+                sqlite3_bind_text(kf_stmt, 1, proj, -1, SQLITE_TRANSIENT);
+                yyjson_mut_val *kf_arr = yyjson_mut_arr(doc);
+                while (sqlite3_step(kf_stmt) == SQLITE_ROW) {
+                    yyjson_mut_val *kf = yyjson_mut_obj(doc);
+                    const char *qn = (const char *)sqlite3_column_text(kf_stmt, 1);
+                    if (qn) {
+                        yyjson_mut_obj_add_strcpy(doc, kf, "qualified_name", qn);
+                    }
+                    add_pagerank_val(doc, kf, sqlite3_column_double(kf_stmt, 4));
+                    yyjson_mut_arr_add_val(kf_arr, kf);
+                }
+                sqlite3_finalize(kf_stmt);
+                yyjson_mut_obj_add_val(doc, ctx, "key_functions", kf_arr);
+            }
+            free(kf_sql);
         }
     }
 
