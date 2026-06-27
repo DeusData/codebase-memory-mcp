@@ -4261,11 +4261,24 @@ static void arch_register_file_dirs(const char *fp, char **dir_paths, int *dir_c
 
     for (int depth = 0; depth < nparts - SKIP_ONE && depth < ST_MAX_PATH_DEPTH; depth++) {
         char dir[CBM_SZ_512] = "";
+        size_t dlen = 0;
         for (int k = 0; k <= depth; k++) {
-            if (k > 0) {
-                strcat(dir, "/");
+            const char *seg = parts[k] ? parts[k] : "";
+            size_t seglen = strlen(seg);
+            /* Bounded append: ST_MAX_PATH_DEPTH limits component COUNT, not total
+             * length — a path with >512 chars across components would overflow the
+             * stack buffer via strcat. Stop appending (truncating this dir key) if
+             * the next segment wouldn't fit. (#52 security sweep.) */
+            size_t need = dlen + (k > 0 ? 1 : 0) + seglen;
+            if (need >= sizeof(dir)) {
+                break;
             }
-            strcat(dir, parts[k]);
+            if (k > 0) {
+                dir[dlen++] = '/';
+            }
+            memcpy(dir + dlen, seg, seglen);
+            dlen += seglen;
+            dir[dlen] = '\0';
         }
         const char *child = (depth + SKIP_ONE < nparts) ? parts[depth + SKIP_ONE] : NULL;
         if (!child) {
