@@ -9,6 +9,7 @@
 #include "store/store.h"
 #include "foundation/log.h"
 #include "foundation/compat_fs.h"
+#include "foundation/hash_table.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -501,6 +502,11 @@ int cbm_dep_auto_index(const char *project_name, const char *project_root,
  * the project's import node to the dep's module node.
  *
  * This enables trace_call_path to follow imports across the project/dep boundary. */
+/* Upper bound for the one-shot bulk fetch of dep Module nodes when linking
+ * cross-boundary IMPORTS edges. Named (not magic) — per the no-magic-values
+ * convention. Dep linking is index-time, so a generous fetch is fine. */
+#define CBM_DEP_LINK_MODULE_FETCH 100000
+
 int cbm_dep_link_cross_edges(cbm_store_t *store, const char *project_name) {
     if (!store || !project_name || !project_name[0]) return 0;
 
@@ -518,41 +524,54 @@ int cbm_dep_link_cross_edges(cbm_store_t *store, const char *project_name) {
         return 0;
     }
 
-    int linked = 0;
+    /* Perf #8: was N+1 — one cbm_store_search PER import (up to 500) to find a
+     * matching dep Module. Now ONE bulk fetch of all dep Module nodes + an
+     * in-memory name→id hash, then O(1) per import. Behavior preserved: first
+     * Module matching the name wins (hash set only if absent), matching the old
+     * limit=1 first-result semantics. */
+    char dep_pattern[CBM_NAME_MAX];
+    snprintf(dep_pattern, sizeof(dep_pattern), "%s" CBM_DEP_SEPARATOR "%%",
+             project_name);
 
-    /* For each import, look for a matching Module in dep projects */
+    cbm_search_params_t mod_params = {0};
+    mod_params.project_pattern = dep_pattern;
+    mod_params.label = "Module";
+    mod_params.limit = CBM_DEP_LINK_MODULE_FETCH;
+    cbm_search_output_t mod_out = {0};
+    CBMHashTable *mod_by_name = NULL;
+    /* node ids are >= 1, so (void*)(intptr_t)id is non-NULL for present modules
+     * and cbm_ht_get returns NULL for absent names — a clean presence test. */
+    if (cbm_store_search(store, &mod_params, &mod_out) == 0) {
+        mod_by_name = cbm_ht_create((uint32_t)mod_out.count + 8);
+        for (int i = 0; i < mod_out.count; i++) {
+            const char *mname = mod_out.results[i].node.name;
+            if (!mname || !mname[0]) continue;
+            if (cbm_ht_get(mod_by_name, mname)) continue; /* first-wins */
+            int64_t mid = mod_out.results[i].node.id;
+            cbm_ht_set(mod_by_name, mname, (void *)(intptr_t)mid);
+        }
+    }
+
+    int linked = 0;
     for (int i = 0; i < out.count; i++) {
         const char *import_name = out.results[i].node.name;
         if (!import_name || !import_name[0]) continue;
 
-        /* Build dep project pattern: project_name.dep.% */
-        char dep_pattern[CBM_NAME_MAX];
-        snprintf(dep_pattern, sizeof(dep_pattern), "%s" CBM_DEP_SEPARATOR "%%",
-                 project_name);
+        void *hit = cbm_ht_get(mod_by_name, import_name);
+        if (!hit) continue;
 
-        /* Search for Module with matching name in dep projects */
-        cbm_search_params_t dep_params = {0};
-        dep_params.name_pattern = import_name;
-        dep_params.project_pattern = dep_pattern;
-        dep_params.label = "Module";
-        dep_params.limit = 1;
-
-        cbm_search_output_t dep_out = {0};
-        int drc = cbm_store_search(store, &dep_params, &dep_out);
-        if (drc == 0 && dep_out.count > 0) {
-            /* Create cross-boundary IMPORTS edge */
-            cbm_edge_t edge = {
-                .source_id = out.results[i].node.id,
-                .target_id = dep_out.results[0].node.id,
-                .type = "IMPORTS",
-                .project = project_name,
-            };
-            cbm_store_insert_edge(store, &edge);
-            linked++;
-        }
-        cbm_store_search_free(&dep_out);
+        cbm_edge_t edge = {
+            .source_id = out.results[i].node.id,
+            .target_id = (int64_t)(intptr_t)hit,
+            .type = "IMPORTS",
+            .project = project_name,
+        };
+        cbm_store_insert_edge(store, &edge);
+        linked++;
     }
 
+    if (mod_by_name) cbm_ht_free(mod_by_name); /* keys borrowed from mod_out, not freed */
+    cbm_store_search_free(&mod_out);
     cbm_store_search_free(&out);
 
     if (linked > 0) {

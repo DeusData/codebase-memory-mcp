@@ -797,13 +797,30 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_log_info("incremental.edge_snapshot", "captured", itoa_buf_incr(edge_cap.count), "elapsed_ms",
                  itoa_buf_incr((int)elapsed_ms_incr(t)));
 
-    /* Step 2: Purge stale nodes */
+    /* Step 2: Purge stale nodes — single pass over all changed+deleted paths
+     * (O(N+E) total). Was O(C·(N+E)): one cbm_gbuf_delete_by_file call per file,
+     * each a full nodes+edges scan (perf fork-origin #3). */
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    for (int i = 0; i < ci; i++) {
-        cbm_gbuf_delete_by_file(existing, changed_files[i].rel_path);
+    {
+        int purge_count = ci + deleted_count;
+        if (purge_count > 0) {
+            const char **purge_paths = malloc((size_t)purge_count * sizeof(const char *));
+            if (purge_paths) {
+                int p = 0;
+                for (int i = 0; i < ci; i++) purge_paths[p++] = changed_files[i].rel_path;
+                for (int i = 0; i < deleted_count; i++) purge_paths[p++] = deleted[i];
+                cbm_gbuf_delete_by_paths(existing, purge_paths, purge_count);
+                free(purge_paths);
+            } else {
+                /* OOM fallback: per-file scan (correct, just slower) */
+                for (int i = 0; i < ci; i++)
+                    cbm_gbuf_delete_by_file(existing, changed_files[i].rel_path);
+                for (int i = 0; i < deleted_count; i++)
+                    cbm_gbuf_delete_by_file(existing, deleted[i]);
+            }
+        }
     }
     for (int i = 0; i < deleted_count; i++) {
-        cbm_gbuf_delete_by_file(existing, deleted[i]);
         free(deleted[i]);
     }
     free(deleted);

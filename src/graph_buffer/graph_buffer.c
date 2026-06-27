@@ -749,11 +749,38 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label) {
 }
 
 int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
+    /* Single-file purge delegates to the batch path (paths=[file_path], count=1)
+     * so there is ONE implementation of the node-scan + edge cascade — no
+     * duplicated loop (DRY; the batch version does the same work in O(N+E)
+     * regardless of path count). */
     if (!gb || !file_path) {
         return CBM_NOT_FOUND;
     }
+    return cbm_gbuf_delete_by_paths(gb, &file_path, 1);
+}
 
-    /* Collect IDs of nodes in this file */
+/* Batch purge: delete every node whose file_path is in `paths`, in a SINGLE
+ * pass over gb->nodes + a single edge cascade — O(N+E) total regardless of how
+ * many paths are given. Replaces the old loop of cbm_gbuf_delete_by_file calls
+ * (one full nodes+edges scan PER file = O(C·(N+E))) in the incremental engine
+ * (perf fork-origin #3). Behaviorally identical to calling delete_by_file once
+ * per path; just without the repeated full scans. NULL entries in paths are
+ * skipped. Keys (paths) are borrowed — not freed by the internal path set. */
+int cbm_gbuf_delete_by_paths(cbm_gbuf_t *gb, const char *const *paths, int count) {
+    if (!gb) {
+        return CBM_NOT_FOUND;
+    }
+    if (count <= 0 || !paths) {
+        return 0;
+    }
+
+    CBMHashTable *path_set = cbm_ht_create((size_t)count * 32);
+    for (int i = 0; i < count; i++) {
+        if (paths[i]) {
+            cbm_ht_set(path_set, paths[i], intptr_to_ptr(SKIP_ONE));
+        }
+    }
+
     CBMHashTable *deleted_set = cbm_ht_create(CBM_SZ_64);
     int deleted_count = 0;
     int scanned = 0;
@@ -761,7 +788,7 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
     for (int i = 0; i < gb->nodes.count; i++) {
         cbm_gbuf_node_t *n = gb->nodes.items[i];
         scanned++;
-        if (!n->file_path || strcmp(n->file_path, file_path) != 0) {
+        if (!n->file_path || !cbm_ht_get(path_set, n->file_path)) {
             continue;
         }
         if (!n->qualified_name || !cbm_ht_get(gb->node_by_qn, n->qualified_name)) {
@@ -772,29 +799,26 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
         make_id_key(id_buf, sizeof(id_buf), n->id);
         cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
 
-        /* Remove from secondary indexes */
         remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_label, n->label), n->id);
         remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_name, n->name), n->id);
 
-        /* Remove from primary indexes */
         cbm_ht_delete(gb->node_by_qn, n->qualified_name);
         const char *stored_key = cbm_ht_get_key(gb->node_by_id, id_buf);
         cbm_ht_delete(gb->node_by_id, id_buf);
         free((void *)stored_key);
 
-        /* NULL out QN so dump's liveness check (cbm_ht_get by QN) fails
-         * even if a new node with the same QN is inserted later via merge. */
         free(n->qualified_name);
         n->qualified_name = NULL;
         deleted_count++;
     }
+
+    cbm_ht_free(path_set); /* keys borrowed from caller — not freed here */
 
     if (deleted_count == 0) {
         cbm_ht_free(deleted_set);
         return 0;
     }
 
-    /* Cascade-delete edges referencing deleted nodes */
     cascade_delete_edges(gb, deleted_set);
 
     cbm_ht_foreach(deleted_set, free_key_only, NULL);
@@ -802,9 +826,11 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
     {
         char s_buf[CBM_SZ_16];
         char d_buf[CBM_SZ_16];
+        char p_buf[CBM_SZ_16];
         snprintf(s_buf, sizeof(s_buf), "%d", scanned);
         snprintf(d_buf, sizeof(d_buf), "%d", deleted_count);
-        cbm_log_info("gbuf.delete_by_file", "file", file_path, "scanned", s_buf, "deleted", d_buf);
+        snprintf(p_buf, sizeof(p_buf), "%d", count);
+        cbm_log_info("gbuf.delete_by_paths", "paths", p_buf, "scanned", s_buf, "deleted", d_buf);
     }
     return deleted_count;
 }
