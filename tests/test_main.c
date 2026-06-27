@@ -124,6 +124,8 @@ int main(void) {
         if (strstr("sqlite_writer", only_suite)) RUN_SUITE(sqlite_writer);
         if (strstr("graph_buffer", only_suite)) RUN_SUITE(graph_buffer);
         if (strstr("pagerank", only_suite)) RUN_SUITE(pagerank);
+        if (strstr("depindex", only_suite)) RUN_SUITE(depindex);
+        if (strstr("store_arch", only_suite)) RUN_SUITE(store_arch);
         TEST_SUMMARY();
         return 0;
     }
