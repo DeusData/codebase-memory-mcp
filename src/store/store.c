@@ -2691,7 +2691,9 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
      * not via subquery wrap, so column unqualification keys off has_degree_filter. */
     const char *name_col = has_degree_filter ? "name" : "n.name";
     const char *id_col = has_degree_filter ? "id" : "n.id";
-    const char *pr_col = has_degree_filter ? "pr_rank" : "pr_rank";
+    const char *pr_col = "pr_rank"; /* pagerank JOIN alias is always pr_rank,
+                                     * unlike name_col/proj_col which differ by
+                                     * has_degree_filter (subquery wrap). */
     char order_limit[CBM_SZ_256];
 
     /* Dep-last: rank the project's own symbols above dependency sub-project
