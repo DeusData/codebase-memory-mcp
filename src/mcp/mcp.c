@@ -131,6 +131,7 @@ static void add_pagerank_val(yyjson_mut_doc *doc, yyjson_mut_val *obj, double v)
 #define CBM_CONFIG_KEY_FUNCTIONS_COUNT   "key_functions_count"
 #define CBM_CONFIG_ARCH_HOTSPOT_LIMIT    "arch_hotspot_limit"
 #define CBM_CONFIG_ARCH_RESOLUTION       "architecture_resolution"
+#define CBM_CONFIG_SIMILARITY_THRESHOLD  "similarity_threshold"
 
 /* Directory permissions: rwxr-xr-x */
 #define ADR_DIR_PERMS 0755
@@ -4214,6 +4215,15 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             "\"hint\":\"Check that repo_path exists and is readable. The directory may be empty or inaccessible.\"}", true);
     }
     cbm_pipeline_set_persistence(p, persistence);
+    /* Similarity threshold (#41): tunable Jaccard cutoff for SIMILAR edges.
+     * Default 0.0 = use the built-in CBM_MINHASH_JACCARD_THRESHOLD. */
+    if (srv && srv->config) {
+        double sim_thresh =
+            cbm_config_get_double(srv->config, CBM_CONFIG_SIMILARITY_THRESHOLD, 0.0);
+        if (sim_thresh > 0.0) {
+            cbm_pipeline_set_similarity_threshold(p, sim_thresh);
+        }
+    }
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
 

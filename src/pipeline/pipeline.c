@@ -78,6 +78,7 @@ struct cbm_pipeline {
     cbm_git_context_t git_ctx;
     char *branch_qn;
     cbm_index_mode_t mode;
+    double similarity_threshold; /* Jaccard threshold for SIMILAR edges; <=0 = default (#41) */
     atomic_int cancelled;
     cbm_store_t *flush_store; /* when set, use flush_to_store instead of dump_to_sqlite */
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
@@ -158,6 +159,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     (void)cbm_git_context_resolve(repo_path, &p->git_ctx);
     p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
     p->mode = mode;
+    p->similarity_threshold = 0.0; /* 0 = use CBM_MINHASH_JACCARD_THRESHOLD default */
     p->persistence = false;
     p->committed_nodes = -1;
     p->committed_edges = -1;
@@ -175,6 +177,15 @@ void cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
 void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store) {
     if (!p) return;
     p->flush_store = store;
+}
+
+/* Set the Jaccard similarity threshold for SIMILAR-edge creation (pass_similarity).
+ * Pass <=0 (or don't call) to use the CBM_MINHASH_JACCARD_THRESHOLD default.
+ * Must be called before cbm_pipeline_run(). */
+void cbm_pipeline_set_similarity_threshold(cbm_pipeline_t *p, double threshold) {
+    if (p) {
+        p->similarity_threshold = threshold;
+    }
 }
 
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
@@ -1015,6 +1026,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         .registry = p->registry,
         .cancelled = &p->cancelled,
         .mode = (int)p->mode,
+        .similarity_threshold = p->similarity_threshold,
         .path_aliases = path_aliases,
     };
 

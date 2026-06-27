@@ -76,6 +76,10 @@ void cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name);
  * Must be called before cbm_pipeline_run(). Pipeline does NOT own the store. */
 void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store);
 
+/* Set the Jaccard similarity threshold for SIMILAR-edge creation (pass_similarity).
+ * <=0 (or unset) uses the CBM_MINHASH_JACCARD_THRESHOLD default. Before run(). */
+void cbm_pipeline_set_similarity_threshold(cbm_pipeline_t *p, double threshold);
+
 /* Get the project name derived from repo_path. Returned string is
  * owned by the pipeline. Valid until cbm_pipeline_free(). */
 const char *cbm_pipeline_project_name(const cbm_pipeline_t *p);
