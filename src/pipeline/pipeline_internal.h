@@ -66,6 +66,8 @@ typedef struct {
     cbm_registry_t *registry; /* owned by pipeline */
     atomic_int *cancelled;    /* pointer to pipeline's cancelled flag */
     int mode;                 /* cbm_index_mode_t (0=full, 1=moderate, 2=fast, 3=advanced) */
+    double similarity_threshold; /* Jaccard threshold for SIMILAR edges; <=0 means
+                                  * use the CBM_MINHASH_JACCARD_THRESHOLD default (#41). */
 
     /* Extraction result cache (sequential pipeline optimization).
      * When non-NULL, pass_definitions stores results here instead of freeing,

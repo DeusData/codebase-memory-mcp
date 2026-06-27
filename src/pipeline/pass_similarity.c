@@ -169,6 +169,7 @@ typedef struct {
     sim_edge_buf_t *worker_bufs;
     _Atomic int next_idx;
     _Atomic int *edge_counts; /* shared atomic array, one per entry */
+    double threshold;         /* Jaccard cutoff; <=0 = use CBM_MINHASH_JACCARD_THRESHOLD */
 } sim_query_ctx_t;
 
 enum { SIM_CAND_CAP = 4096 };
@@ -213,7 +214,11 @@ static void sim_query_worker(int worker_id, void *ctx_ptr) {
             }
 
             double jaccard = cbm_minhash_jaccard(&src->fp, cand->fingerprint);
-            if (jaccard < CBM_MINHASH_JACCARD_THRESHOLD) {
+            /* Configurable threshold (#41): sc carries the tunable value from
+             * the pipeline ctx; <=0 (unset) falls back to the default. */
+            double threshold = sc->threshold > 0.0 ? sc->threshold
+                                                   : CBM_MINHASH_JACCARD_THRESHOLD;
+            if (jaccard < threshold) {
                 continue;
             }
 
@@ -304,6 +309,7 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
             .lsh = lsh,
             .worker_bufs = worker_bufs,
             .edge_counts = edge_counts,
+            .threshold = ctx->similarity_threshold, /* #41 tunable; <=0 = default */
         };
         atomic_init(&sc.next_idx, 0);
         cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
