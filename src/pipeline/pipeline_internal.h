@@ -283,6 +283,18 @@ bool cbm_is_k8s_manifest(const char *name, const char *content);
 bool cbm_is_secret_binding(const char *key, const char *value);
 bool cbm_is_secret_value(const char *value);
 
+/* ── Infra Route extraction gating (pipeline.c, issue #521) ───────── */
+
+/* True only for Infrastructure-as-Code files (Terraform / HCL) whose URL string
+ * literals denote real service endpoints. Generic config, compose, dependabot
+ * and Kubernetes / Kustomize manifests are excluded so their URL-like strings
+ * are not harvested into spurious Route nodes. */
+bool cbm_is_infra_route_source_file(const char *fp);
+
+/* True when `value` is a bare URL (no whitespace or shell metacharacters), as
+ * opposed to a command string that merely embeds a URL. */
+bool cbm_is_bare_endpoint_url(const char *value);
+
 /* Clean JSON array brackets from CMD/ENTRYPOINT values.
  * E.g. ["./app", "--flag"] → ./app --flag
  * Writes result to out (up to out_sz). */

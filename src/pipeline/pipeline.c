@@ -485,15 +485,65 @@ static void cbm_pipeline_process_infra_bindings(cbm_gbuf_t *gbuf, const cbm_file
     }
 }
 
-static bool is_infra_file(const char *fp) {
-    return fp != NULL &&
-           (strstr(fp, ".yaml") != NULL || strstr(fp, ".yml") != NULL ||
-            strstr(fp, ".tf") != NULL || strstr(fp, ".hcl") != NULL || strstr(fp, ".toml") != NULL);
+/* Basename of a path: the segment after the final '/' or '\\'. */
+static const char *infra_basename(const char *fp) {
+    const char *base = fp;
+    for (const char *p = fp; *p != '\0'; p++) {
+        if (*p == '/' || *p == '\\') {
+            base = p + 1;
+        }
+    }
+    return base;
+}
+
+/* True when `name` ends with `suffix`. */
+static bool infra_ends_with(const char *name, const char *suffix) {
+    size_t nl = strlen(name);
+    size_t sl = strlen(suffix);
+    return nl >= sl && strcmp(name + nl - sl, suffix) == 0;
+}
+
+/* True for Infrastructure-as-Code files whose URL string literals denote real
+ * service endpoints: Terraform / HCL module sources, backends and provider
+ * endpoints. Generic application config (config.yaml), dependency manifests
+ * (dependabot.yaml), container-orchestration (compose.yaml) and Kubernetes /
+ * Kustomize manifests are NOT route sources — the URL-like strings they hold
+ * (package registries, JWKS discovery endpoints, upstream hosts, healthcheck
+ * shell commands) are not routes the service serves, and harvesting them
+ * inflated the Route set that get_architecture and cross-repo matching rely on
+ * (issue #521). Structured topic->endpoint bindings in config files still flow
+ * through cbm_pipeline_process_infra_bindings(). */
+bool cbm_is_infra_route_source_file(const char *fp) {
+    if (fp == NULL) {
+        return false;
+    }
+    const char *base = infra_basename(fp);
+    return infra_ends_with(base, ".tf") || infra_ends_with(base, ".tf.json") ||
+           infra_ends_with(base, ".hcl");
+}
+
+/* A URL string literal denotes a single network endpoint only when it is a
+ * bare URL: no embedded whitespace. Rejects healthcheck/command strings such as
+ * "curl --fail http://localhost:9000/ || exit 1" that merely contain a URL,
+ * while still accepting query-string URLs (which use '&', ';'). */
+bool cbm_is_bare_endpoint_url(const char *value) {
+    if (value == NULL || value[0] == '\0') {
+        return false;
+    }
+    for (const char *p = value; *p != '\0'; p++) {
+        if ((unsigned char)*p <= ' ') {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* Try to create an infra Route node from one string_ref. */
 static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, const char *fp) {
     if (sr->kind != CBM_STRREF_URL || !sr->value || !strstr(sr->value, "://")) {
+        return;
+    }
+    if (!cbm_is_bare_endpoint_url(sr->value)) {
         return;
     }
     char route_qn[CBM_ROUTE_QN_SIZE];
@@ -511,7 +561,7 @@ static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, con
 static void cbm_pipeline_extract_infra_routes(cbm_gbuf_t *gbuf, const cbm_file_info_t *files,
                                               CBMFileResult **result_cache, int file_count) {
     for (int i = 0; i < file_count; i++) {
-        if (!result_cache[i] || !is_infra_file(files[i].rel_path)) {
+        if (!result_cache[i] || !cbm_is_infra_route_source_file(files[i].rel_path)) {
             continue;
         }
         for (int si = 0; si < result_cache[i]->string_refs.count; si++) {

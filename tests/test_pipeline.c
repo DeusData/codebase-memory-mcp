@@ -3422,6 +3422,41 @@ TEST(infra_is_compose_file) {
     PASS();
 }
 
+/* Issue #521: only Terraform / HCL files are infra-Route sources. Generic
+ * config, dependabot, compose and k8s/kustomize manifests must be excluded so
+ * their URL-like strings do not become spurious Route nodes. */
+TEST(infra_route_source_file_gate) {
+    /* Infrastructure-as-Code: URL literals are real endpoints. */
+    ASSERT(cbm_is_infra_route_source_file("main.tf"));
+    ASSERT(cbm_is_infra_route_source_file("infra/backend.tf"));
+    ASSERT(cbm_is_infra_route_source_file("modules/net/main.tf.json"));
+    ASSERT(cbm_is_infra_route_source_file("config.hcl"));
+    /* Config / orchestration / dependency manifests: NOT route sources. */
+    ASSERT(!cbm_is_infra_route_source_file(".github/dependabot.yaml"));
+    ASSERT(!cbm_is_infra_route_source_file("config.yaml"));
+    ASSERT(!cbm_is_infra_route_source_file("compose.yaml"));
+    ASSERT(!cbm_is_infra_route_source_file("docker-compose.yml"));
+    ASSERT(!cbm_is_infra_route_source_file("k8s/deployment.yaml"));
+    ASSERT(!cbm_is_infra_route_source_file("kustomization.yaml"));
+    ASSERT(!cbm_is_infra_route_source_file("settings.toml"));
+    ASSERT(!cbm_is_infra_route_source_file(NULL));
+    /* Don't false-match Terraform var files. */
+    ASSERT(!cbm_is_infra_route_source_file("prod.tfvars"));
+    PASS();
+}
+
+/* Issue #521: a healthcheck/command string that merely embeds a URL is not a
+ * bare endpoint and must not become a Route node. */
+TEST(infra_bare_endpoint_url_gate) {
+    ASSERT(cbm_is_bare_endpoint_url("https://app.terraform.io"));
+    ASSERT(cbm_is_bare_endpoint_url("http://order-service:8080/v2/orders/{id}"));
+    ASSERT(!cbm_is_bare_endpoint_url("curl --fail http://localhost:9000/ || exit 1"));
+    ASSERT(!cbm_is_bare_endpoint_url("wget http://localhost:8080/health && true"));
+    ASSERT(!cbm_is_bare_endpoint_url(""));
+    ASSERT(!cbm_is_bare_endpoint_url(NULL));
+    PASS();
+}
+
 TEST(infra_is_cloudbuild_file) {
     /* Port of TestIsCloudbuildFile (5 cases) */
     ASSERT(cbm_is_cloudbuild_file("cloudbuild.yaml"));
@@ -6254,6 +6289,8 @@ SUITE(pipeline) {
     RUN_TEST(compile_commands_parse_invalid);
     /* Infrascan helpers */
     RUN_TEST(infra_is_compose_file);
+    RUN_TEST(infra_route_source_file_gate);
+    RUN_TEST(infra_bare_endpoint_url_gate);
     RUN_TEST(infra_is_cloudbuild_file);
     RUN_TEST(infra_is_shell_script);
     RUN_TEST(infra_is_dockerfile);
