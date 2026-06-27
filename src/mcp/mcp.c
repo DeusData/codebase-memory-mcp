@@ -6924,6 +6924,38 @@ static void build_resource_schema(yyjson_mut_doc *doc, yyjson_mut_val *root,
  * exclude_csv: comma-separated globs from config, or NULL.
  * exclude_arr: NULL-terminated array from tool param, or NULL.
  * Returns a heap-allocated SQL string. Caller must free. */
+/* Double single-quotes so a glob→like pattern can be safely interpolated into
+ * a SQL string literal. The search path binds LIKE patterns as ?N parameters
+ * (safe — sqlite3_bind_text handles quoting), but build_key_functions_sql
+ * bakes the NOT LIKE clause into SQL text, so the exclude pattern (which comes
+ * from the MCP `exclude` tool arg + the key_functions_exclude config) must be
+ * quote-escaped here to prevent breaking out of the '...' literal (SQL
+ * injection). Returns a heap string the caller frees; NULL on OOM/NULL input. */
+static char *sql_escape_quotes(const char *s) {
+    if (!s) {
+        return NULL;
+    }
+    size_t n = 0, quotes = 0;
+    for (; s[n]; n++) {
+        if (s[n] == '\'') {
+            quotes++;
+        }
+    }
+    char *out = malloc(n + quotes + 1);
+    if (!out) {
+        return NULL;
+    }
+    size_t j = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] == '\'') {
+            out[j++] = '\''; /* double the quote */
+        }
+        out[j++] = s[i];
+    }
+    out[j] = '\0';
+    return out;
+}
+
 static char *build_key_functions_sql(const char *exclude_csv,
                                      const char **exclude_arr, int limit) {
     char sql[4096];
@@ -6942,9 +6974,13 @@ static char *build_key_functions_sql(const char *exclude_csv,
             while (*tok == ' ') tok++; /* trim leading space */
             char *like = cbm_glob_to_like(tok);
             if (like) {
-                pos += snprintf(sql + pos, sizeof(sql) - pos,
-                    "AND n.file_path NOT LIKE '%s' ", like);
+                char *safe = sql_escape_quotes(like); /* prevent SQL injection */
                 free(like);
+                if (safe) {
+                    pos += snprintf(sql + pos, sizeof(sql) - pos,
+                        "AND n.file_path NOT LIKE '%s' ", safe);
+                    free(safe);
+                }
             }
             tok = strtok(NULL, ",");
         }
@@ -6956,9 +6992,13 @@ static char *build_key_functions_sql(const char *exclude_csv,
         for (int i = 0; exclude_arr[i] && pos < (int)sizeof(sql) - 128; i++) {
             char *like = cbm_glob_to_like(exclude_arr[i]);
             if (like) {
-                pos += snprintf(sql + pos, sizeof(sql) - pos,
-                    "AND n.file_path NOT LIKE '%s' ", like);
+                char *safe = sql_escape_quotes(like); /* prevent SQL injection */
                 free(like);
+                if (safe) {
+                    pos += snprintf(sql + pos, sizeof(sql) - pos,
+                        "AND n.file_path NOT LIKE '%s' ", safe);
+                    free(safe);
+                }
             }
         }
     }
