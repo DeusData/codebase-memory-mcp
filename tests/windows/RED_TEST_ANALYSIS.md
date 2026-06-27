@@ -238,6 +238,11 @@ behaved correctly — recorded as green and **not** included as a red test:
   scope for a Windows-only PR.
 - **libgit2 1.8+ build break (#530.4).** `git_allocator` moved to
   `<git2/sys/alloc.h>`; cross-platform compile issue, not a Windows runtime bug.
+- **Windows umbrella tracker (#394).** This is a meta-issue ("8 bugs"); its
+  remaining open children are the mapped/SMB-drive class (#227, #367), covered in
+  the ruled-out table above (a `subst` mapped drive indexes and keeps its DB; a
+  real SMB share is not available here). Its other children (#221, #266, #274,
+  #331, #347, #348) are already marked fixed upstream, so no new test is shipped.
 - **Memory growth over hours (#581).** Requires a multi-hour soak to surface and
   is not deterministic in a unit/integration test; the existing
   `scripts/soak-test.sh` RSS-trend harness is the right vehicle and is not
