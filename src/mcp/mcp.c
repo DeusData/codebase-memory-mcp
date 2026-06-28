@@ -382,11 +382,13 @@ static const tool_def_t TOOLS[] = {
      "\"qn_pattern\":{\"type\":\"string\",\"description\":\"Regex pattern on qualified name. "
      "Glob wildcards auto-convert to regex.\"},"
      "\"query\":{\"type\":\"string\",\"description\":\"Full-text/BM25 query over indexed symbol "
-     "text. Use when searching by words rather than symbol-name regex. When set, only project, "
-     "file_pattern, limit, and offset apply; graph filters and sort_by are ignored.\"},"
+     "text. Use when searching by words rather than symbol-name regex. When set, normal results "
+     "come from BM25; only project, file_pattern, limit, and offset apply. Graph filters and "
+     "sort_by are ignored. semantic_query still appends separate semantic_results.\"},"
      "\"semantic_query\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":"
      "\"Array of keyword strings for vector search, e.g. [\\\"send\\\",\\\"pubsub\\\"]. "
-     "Appends a separate semantic_results array; pass query/name filters for normal results.\"},"
+     "Appends separate semantic_results when matching vectors exist; query/name filters control "
+     "only normal results.\"},"
      "\"file_pattern\":{\"type\":\"string\",\"description\":\"Glob or substring filter on result "
      "file paths.\"},\"relationship\":{\"type\":\"string\",\"description\":\"Graph edge type to "
      "filter connected results, for example CALLS or IMPORTS.\"},"
@@ -2703,6 +2705,15 @@ static void emit_semantic_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_obj_add_val(doc, root, "semantic_results", sem_results);
 }
 
+static char *semantic_query_type_error_response(void) {
+    return cbm_mcp_text_result(
+        "semantic_query must be an array of keyword strings, e.g. "
+        "[\"send\",\"pubsub\",\"publish\"], not a single string. Split your query "
+        "into individual keywords; each is scored independently via per-keyword "
+        "min-cosine.",
+        true);
+}
+
 /* Append the semantic_query vector-search results onto the doc.  Returns
  * true if semantic_query was provided as a non-array (type error — caller
  * should surface to the user). */
@@ -2732,6 +2743,46 @@ static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const 
         yyjson_doc_free(args_doc);
     }
     return type_error;
+}
+
+static char *append_semantic_query_to_json(const char *base_json, const char *args,
+                                           cbm_store_t *store, const char *project, int limit,
+                                           bool *type_error) {
+    if (type_error) {
+        *type_error = false;
+    }
+    if (!base_json) {
+        return NULL;
+    }
+    yyjson_doc *doc = yyjson_read(base_json, strlen(base_json), 0);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    if (!mdoc) {
+        yyjson_doc_free(doc);
+        return NULL;
+    }
+    yyjson_mut_val *root = yyjson_val_mut_copy(mdoc, yyjson_doc_get_root(doc));
+    yyjson_doc_free(doc);
+    if (!root) {
+        yyjson_mut_doc_free(mdoc);
+        return NULL;
+    }
+    yyjson_mut_doc_set_root(mdoc, root);
+
+    bool sq_type_error = run_semantic_query(mdoc, root, args, store, project, limit);
+    if (sq_type_error) {
+        if (type_error) {
+            *type_error = true;
+        }
+        yyjson_mut_doc_free(mdoc);
+        return NULL;
+    }
+
+    char *out = yy_doc_to_str(mdoc);
+    yyjson_mut_doc_free(mdoc);
+    return out;
 }
 
 /* Convert shell-glob wildcards to POSIX ERE: bare '*' → '.*', bare '?' → '.'
@@ -2777,9 +2828,18 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         char *bm25_json = bm25_search(store, project, query, q_file_pattern, q_limit, q_offset);
         free(q_file_pattern);
         if (bm25_json) {
+            bool sq_type_error = false;
+            char *composed_json =
+                append_semantic_query_to_json(bm25_json, args, store, project, q_limit,
+                                              &sq_type_error);
             free(query);
             free(pe.value);
-            char *result = cbm_mcp_text_result(bm25_json, false);
+            if (sq_type_error) {
+                free(bm25_json);
+                return semantic_query_type_error_response();
+            }
+            char *result = cbm_mcp_text_result(composed_json ? composed_json : bm25_json, false);
+            free(composed_json);
             free(bm25_json);
             return result;
         }
@@ -3117,12 +3177,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         free(label); free(name_pattern); free(qn_pattern); free(unified_pattern);
         free(file_pattern); free(relationship); free(search_mode); free(sort_by);
         free_string_array(exclude);
-        return cbm_mcp_text_result(
-            "semantic_query must be an array of keyword strings, e.g. "
-            "[\"send\",\"pubsub\",\"publish\"], not a single string. Split your query "
-            "into individual keywords; each is scored independently via per-keyword "
-            "min-cosine.",
-            true);
+        return semantic_query_type_error_response();
     }
 
     char *json = yy_doc_to_str(doc);
