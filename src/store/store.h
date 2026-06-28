@@ -216,7 +216,9 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path);
 
 /* Check database integrity. Returns true if the DB passes basic sanity checks
  * (projects table has correct types, no corruption indicators).
- * Returns false if corruption is detected — caller should delete and re-index. */
+ * Returns false if corruption is detected. Callers must not assume ownership of
+ * arbitrary .db files; only managed cache DBs may be moved out of the active
+ * cache path, and the original must be retained if that move fails. */
 bool cbm_store_check_integrity(cbm_store_t *s);
 
 /* Extended integrity check. Behaves like cbm_store_check_integrity() but, on
