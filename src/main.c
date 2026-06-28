@@ -31,6 +31,7 @@ enum {
     MAIN_PORT_OFF = 7, /* strlen("--port=") */
     MAIN_MAX_PORT = 65536,
     PARENT_WATCHDOG_STACK_SIZE = 64 * CBM_SZ_1K, /* watchdog only polls — tiny stack suffices */
+    PARENT_WATCHDOG_POLL_US = CBM_USEC_PER_SEC / 2,
 };
 #define MAIN_RAM_FRACTION 0.5
 
@@ -112,10 +113,9 @@ static void signal_handler(int sig) {
 #ifndef _WIN32
 static void *parent_watchdog_thread(void *arg) {
     pid_t initial_ppid = *(pid_t *)arg;
-    const unsigned int poll_interval_us = 500000; /* 500ms */
 
     while (!atomic_load(&g_shutdown)) {
-        cbm_usleep(poll_interval_us);
+        cbm_usleep(PARENT_WATCHDOG_POLL_US);
         if (atomic_load(&g_shutdown)) {
             break;
         }
@@ -327,10 +327,10 @@ static void print_help(void) {
     printf("\nSupported agents (auto-detected):\n");
     printf("  Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,\n");
     printf("  Antigravity, Aider, KiloCode, Kiro\n");
-    printf("\nTools: index_repository, search_graph, query_graph, trace_path,\n");
+    printf("\nTools: index_repository, search_graph, query_graph, trace_call_path,\n");
     printf("  get_code_snippet, get_graph_schema, get_architecture, search_code,\n");
     printf("  list_projects, delete_project, index_status, detect_changes,\n");
-    printf("  manage_adr, ingest_traces\n");
+    printf("  manage_adr, ingest_traces, index_dependencies\n");
 }
 
 /* ── Main ───────────────────────────────────────────────────────── */

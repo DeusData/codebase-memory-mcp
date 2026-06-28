@@ -1,11 +1,10 @@
 #include "test_framework.h"
 #include "graph_buffer/graph_buffer.h"
 #include "pipeline/pipeline_internal.h"
+#include "service_patterns.h"
 
 #include <stdbool.h>
 #include <stdint.h>
-
-bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *callee_name);
 
 static int has_data_flow(cbm_gbuf_t *gb, int64_t source_id, int64_t target_id) {
     const cbm_gbuf_edge_t **edges = NULL;
@@ -28,7 +27,27 @@ TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths) {
     ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/api", "os.path.join"));
     ASSERT_FALSE(cbm_service_pattern_is_http_route_literal(NULL, "requests.get"));
     ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("", "requests.get"));
+    /* CLI slash-command syntax: ':' mid-segment is not a route param
+     * (autorun's "/ar:allow", "/ar:a" etc. — not HTTP routes). */
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/ar:allow", "app.command"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/ar:a", "app.command"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/gh:pr", "app.command"));
+    /* Filesystem paths with document/source extensions are never routes. */
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/new/file.txt", "open"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/fake/path.pdf", "open"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/Users/test/plans/foo.md", "open"));
+    /* Filesystem roots. */
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/usr/bin/uv", "subprocess"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/home/user/.claude/plans/bar.md", "open"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/tmp/alpha", "requests.get"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/Users/dev/project", "requests.get"));
+    /* Whitespace: command/description strings are not routes. */
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/autorun test task description", "run"));
+    /* Positive controls: real routes must still pass. */
     ASSERT_TRUE(cbm_service_pattern_is_http_route_literal("/api/orders", "requests.get"));
+    ASSERT_TRUE(cbm_service_pattern_is_http_route_literal("/users/:id", "app.route"));
+    ASSERT_TRUE(cbm_service_pattern_is_http_route_literal("/teams/:team/users/:id", "app.route"));
+    ASSERT_TRUE(cbm_service_pattern_is_http_route_literal("/items/{id}", "router.get"));
     ASSERT_TRUE(cbm_service_pattern_is_http_route_literal("https://orders.example/api/orders",
                                                           "requests.get"));
     PASS();

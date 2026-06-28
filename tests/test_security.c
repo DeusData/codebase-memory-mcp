@@ -12,6 +12,7 @@
 #include <cypher/cypher.h>
 #include "../src/foundation/str_util.h"
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/compat_thread.h"
 
 #include <string.h>
 #include <sys/stat.h>
@@ -367,6 +368,136 @@ TEST(exec_no_shell_captures_exit_code) {
 #endif /* _WIN32 */
 
 /* ══════════════════════════════════════════════════════════════════
+ *  PORTABLE FILE REPLACEMENT
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(compat_replace_file_replaces_destination) {
+    char *dir = th_mktempdir("cbm_replace_file");
+    ASSERT_NOT_NULL(dir);
+    char root[256];
+    snprintf(root, sizeof(root), "%s", dir);
+
+    const char *dest = TH_PATH(root, "target.txt");
+    const char *tmp = TH_PATH(root, "target.txt.tmp");
+    ASSERT_EQ(th_write_file(dest, "old"), 0);
+    ASSERT_EQ(th_write_file(tmp, "new"), 0);
+
+    ASSERT_EQ(cbm_replace_file(tmp, dest), 0);
+
+    FILE *fp = fopen(dest, "rb");
+    ASSERT_NOT_NULL(fp);
+    char buf[8] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    ASSERT_EQ((int)n, 3);
+    ASSERT_STR_EQ(buf, "new");
+
+    struct stat st;
+    ASSERT_NEQ(stat(tmp, &st), 0);
+    th_cleanup(root);
+    PASS();
+}
+
+TEST(compat_write_file_atomic_replaces_destination) {
+    char *dir = th_mktempdir("cbm_write_file_atomic");
+    ASSERT_NOT_NULL(dir);
+    char root[256];
+    snprintf(root, sizeof(root), "%s", dir);
+
+    const char *dest = TH_PATH(root, "payload.bin");
+    ASSERT_EQ(th_write_file(dest, "old"), 0);
+
+    cbm_file_error_t err = {0};
+    ASSERT_EQ(cbm_write_file_atomic(dest, "new", 3, &err), 0);
+    ASSERT_NULL(err.stage);
+    ASSERT_EQ(err.code, 0);
+
+    FILE *fp = fopen(dest, "rb");
+    ASSERT_NOT_NULL(fp);
+    char buf[8] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    ASSERT_EQ((int)n, 3);
+    ASSERT_STR_EQ(buf, "new");
+
+    struct stat st;
+    ASSERT_NEQ(stat(TH_PATH(root, "payload.bin.tmp"), &st), 0);
+    th_cleanup(root);
+    PASS();
+}
+
+TEST(compat_write_file_atomic_reports_replace_failure) {
+    char *dir = th_mktempdir("cbm_write_file_atomic_fail");
+    ASSERT_NOT_NULL(dir);
+    char root[256];
+    snprintf(root, sizeof(root), "%s", dir);
+
+    const char *dest = TH_PATH(root, "target.txt");
+    ASSERT_TRUE(cbm_mkdir_p(dest, 0755));
+
+    cbm_file_error_t err = {0};
+    ASSERT_NEQ(cbm_write_file_atomic(dest, "new", 3, &err), 0);
+    ASSERT_NOT_NULL(err.stage);
+    ASSERT_STR_EQ(err.stage, "rename_temp");
+    ASSERT_NEQ(err.code, 0);
+
+    th_cleanup(root);
+    PASS();
+}
+
+enum { ATOMIC_CONCURRENT_WRITES = 64 };
+
+typedef struct {
+    const char *dest;
+    const char *payload;
+    int failures;
+} atomic_writer_arg_t;
+
+static void *atomic_writer_thread(void *arg) {
+    atomic_writer_arg_t *wa = (atomic_writer_arg_t *)arg;
+    size_t len = strlen(wa->payload);
+    for (int i = 0; i < ATOMIC_CONCURRENT_WRITES; i++) {
+        cbm_file_error_t err = {0};
+        if (cbm_write_file_atomic(wa->dest, wa->payload, len, &err) != 0) {
+            wa->failures++;
+        }
+    }
+    return NULL;
+}
+
+TEST(compat_write_file_atomic_concurrent_same_destination) {
+    char *dir = th_mktempdir("cbm_write_file_atomic_concurrent");
+    ASSERT_NOT_NULL(dir);
+    char root[256];
+    snprintf(root, sizeof(root), "%s", dir);
+
+    char dest[512];
+    snprintf(dest, sizeof(dest), "%s", TH_PATH(root, "payload.bin"));
+    ASSERT_EQ(th_write_file(dest, "initial"), 0);
+
+    atomic_writer_arg_t a = {.dest = dest, .payload = "alpha", .failures = 0};
+    atomic_writer_arg_t b = {.dest = dest, .payload = "bravo", .failures = 0};
+    cbm_thread_t ta, tb;
+    ASSERT_EQ(cbm_thread_create(&ta, 0, atomic_writer_thread, &a), 0);
+    ASSERT_EQ(cbm_thread_create(&tb, 0, atomic_writer_thread, &b), 0);
+    ASSERT_EQ(cbm_thread_join(&ta), 0);
+    ASSERT_EQ(cbm_thread_join(&tb), 0);
+    ASSERT_EQ(a.failures, 0);
+    ASSERT_EQ(b.failures, 0);
+
+    FILE *fp = fopen(dest, "rb");
+    ASSERT_NOT_NULL(fp);
+    char buf[16] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    ASSERT_TRUE((n == strlen(a.payload) && strcmp(buf, a.payload) == 0) ||
+                (n == strlen(b.payload) && strcmp(buf, b.payload) == 0));
+
+    th_cleanup(root);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -418,4 +549,9 @@ SUITE(security) {
     RUN_TEST(exec_no_shell_null_argv_returns_error);
     RUN_TEST(exec_no_shell_captures_exit_code);
 #endif
+
+    RUN_TEST(compat_replace_file_replaces_destination);
+    RUN_TEST(compat_write_file_atomic_replaces_destination);
+    RUN_TEST(compat_write_file_atomic_reports_replace_failure);
+    RUN_TEST(compat_write_file_atomic_concurrent_same_destination);
 }

@@ -16,6 +16,7 @@
 #include "foundation/platform.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "service_patterns.h"
 
 #include <sqlite3/sqlite3.h>
 #include <stdint.h>
@@ -281,6 +282,9 @@ static int match_http_routes(cbm_store_t *src_store, const char *src_project,
         json_str_prop(props, "url_path", url_path, sizeof(url_path));
         json_str_prop(props, "method", method, sizeof(method));
         if (!url_path[0]) {
+            continue;
+        }
+        if (!cbm_service_pattern_is_http_route_literal(url_path, NULL)) {
             continue;
         }
 

@@ -33,11 +33,10 @@ enum {
 #include <stdint.h>
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
+#include "service_patterns.h"
 
 #include <stdio.h>
 #include <string.h>
-
-bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *callee_name);
 
 /* True for characters that may appear in a ":name" route parameter. */
 static inline bool is_route_ident_char(char c) {
@@ -444,6 +443,12 @@ static int ensure_one_decorator_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *fun
         return 0;
     }
     if (path[0] != '/') {
+        return 0;
+    }
+    /* Reject CLI slash-command paths (e.g. "/ar:ok") extracted from
+     * command-registry/decorator-like call sites. Same gate as the
+     * HTTP_CALLS path above — a real route's ':' is at segment start. */
+    if (!cbm_service_pattern_is_http_route_literal(path, NULL)) {
         return 0;
     }
 

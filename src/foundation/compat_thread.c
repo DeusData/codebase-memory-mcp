@@ -7,13 +7,16 @@
 #include "foundation/constants.h"
 #include "foundation/compat_thread.h"
 
-#include <pthread.h>
 #include <stdlib.h>
+#include <string.h>
+
+#ifndef _WIN32
+#include <pthread.h>
+#endif
 
 /* Default 8MB stack for all threads. macOS ARM64 default is only 512KB,
  * which is too small for deep pipeline passes (configlink, etc.). */
 #define CBM_DEFAULT_STACK_SIZE ((size_t)8 * CBM_SZ_1K * CBM_SZ_1K)
-#include <string.h>
 
 /* ── Thread ───────────────────────────────────────────────────── */
 

@@ -32,8 +32,12 @@ enum {
     ST_RETRY_WAIT_US = 1000,
     ST_INIT_CAP_8 = 8,
     ST_INIT_CAP_16 = 16,
+    ST_SQLITE_BUSY_TIMEOUT_MS = 10000,
     ST_SQL_BUF = 8192,
-    ST_MAX_ROW_CHECK = 5,
+    ST_ARCH_ROUTE_RESULT_LIMIT = 20,
+    ST_ARCH_ROUTE_SCAN_LIMIT = ST_ARCH_ROUTE_RESULT_LIMIT * 10,
+    ST_ARCH_ENTRY_POINT_LIMIT = 20,
+    ST_ARCH_DOC_LIMIT = 20,
     ST_QN_MAX_DOTS = 5,
     ST_QN_MIN_DOTS = 3,
     ST_IN_CLAUSE_MARGIN = 4,
@@ -57,8 +61,10 @@ enum {
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "store/store.h"
+#include "service_patterns.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "foundation/log.h"
 #include "foundation/compat_regex.h"
 #include "foundation/str_util.h"
@@ -376,7 +382,10 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory) {
         /* busy_timeout must be set BEFORE journal_mode=WAL so that lock
          * contention during WAL mode activation is handled with a timeout
          * rather than an immediate SQLITE_BUSY error. */
-        rc = exec_sql(s, "PRAGMA busy_timeout = 10000;");
+        char busy_sql[ST_BUF_64];
+        snprintf(busy_sql, sizeof(busy_sql), "PRAGMA busy_timeout = %d;",
+                 ST_SQLITE_BUSY_TIMEOUT_MS);
+        rc = exec_sql(s, busy_sql);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
@@ -711,9 +720,10 @@ bool cbm_store_check_integrity_full(cbm_store_t *s, bool *path_only_failure) {
         return false;
     }
 
-    /* Each project gets its own .db file, so the projects table should have
-     * exactly 1 row. More than 5 rows is definitely corrupt (allows some slack
-     * for edge cases). Also check that root_path looks like a real path. */
+    /* The writer creates one projects row initially, then dependency indexing
+     * may add rows for projects stored in the parent DB. Treat the table as
+     * sane if it is readable and non-empty; row count alone is not a corruption
+     * signal. Real B1 corruption is caught below by malformed root_path values. */
     sqlite3_stmt *stmt = NULL;
     int rc =
         sqlite3_prepare_v2(s->db, "SELECT count(*) FROM projects;", CBM_NOT_FOUND, &stmt, NULL);
@@ -725,12 +735,14 @@ bool cbm_store_check_integrity_full(cbm_store_t *s, bool *path_only_failure) {
     bool rows_ok = true;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         int row_count = sqlite3_column_int(stmt, 0);
-        if (row_count > ST_MAX_ROW_CHECK) {
-            (void)fprintf(stderr, "ERROR store.corrupt table=projects rows=%d (expected 1)\n",
-                          row_count);
+        if (row_count < 0) {
+            (void)fprintf(stderr, "ERROR store.corrupt table=projects rows=%d\n", row_count);
             ok = false;
             rows_ok = false;
         }
+    } else {
+        ok = false;
+        rows_ok = false;
     }
     sqlite3_finalize(stmt);
 
@@ -786,7 +798,10 @@ cbm_store_t *cbm_store_open(const char *project) {
         cdir = cbm_tmpdir();
     }
     char path[CBM_SZ_1K];
-    snprintf(path, sizeof(path), "%s/%s.db", cdir, project);
+    int path_len = snprintf(path, sizeof(path), "%s/%s.db", cdir, project);
+    if (path_len <= 0 || (size_t)path_len >= sizeof(path)) {
+        return NULL;
+    }
     return store_open_internal(path, false);
 }
 
@@ -945,22 +960,37 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
 
     /* Ensure parent directory exists */
     char dir[CBM_SZ_1K];
-    snprintf(dir, sizeof(dir), "%s", dest_path);
+    int dir_len = snprintf(dir, sizeof(dir), "%s", dest_path);
+    if (dir_len <= 0 || (size_t)dir_len >= sizeof(dir)) {
+        store_set_error(s, "dump: destination path too long");
+        return CBM_STORE_ERR;
+    }
     char *sl = strrchr(dir, '/');
     if (sl) {
         *sl = '\0';
         (void)cbm_mkdir(dir);
     }
 
-    /* Write to temp file for atomic swap */
+    /* Write to a unique temp file for atomic swap. This avoids deleting or
+     * colliding with a sibling writer's predictable "<dest>.tmp" file. */
     char tmp_path[CBM_SZ_1K];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", dest_path);
-    (void)unlink(tmp_path);
+    int tmp_len = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.XXXXXX", dest_path);
+    if (tmp_len <= 0 || (size_t)tmp_len >= sizeof(tmp_path)) {
+        store_set_error(s, "dump: temp path too long");
+        return CBM_STORE_ERR;
+    }
+    int tmp_fd = cbm_mkstemp_s(tmp_path, sizeof(tmp_path));
+    if (tmp_fd < 0) {
+        store_set_error(s, "dump: cannot create temp file");
+        return CBM_STORE_ERR;
+    }
+    cbm_close_fd(tmp_fd);
 
     sqlite3 *dest_db = NULL;
     int rc = sqlite3_open(tmp_path, &dest_db);
     if (rc != SQLITE_OK) {
         store_set_error(s, "dump: cannot open temp file");
+        (void)cbm_unlink(tmp_path);
         return CBM_STORE_ERR;
     }
 
@@ -968,7 +998,7 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
     if (!bk) {
         store_set_error(s, "dump: backup init failed");
         sqlite3_close(dest_db);
-        (void)unlink(tmp_path);
+        (void)cbm_unlink(tmp_path);
         return CBM_STORE_ERR;
     }
 
@@ -978,7 +1008,7 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
     if (rc != SQLITE_DONE) {
         store_set_error(s, "dump: backup step failed");
         sqlite3_close(dest_db);
-        (void)unlink(tmp_path);
+        (void)cbm_unlink(tmp_path);
         return CBM_STORE_ERR;
     }
 
@@ -988,9 +1018,9 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
 
     /* Atomic rename: old WAL/SHM become stale and get recreated by
      * the next reader's configure_pragmas call. */
-    if (rename(tmp_path, dest_path) != 0) {
+    if (cbm_replace_file(tmp_path, dest_path) != 0) {
         store_set_error(s, "dump: rename failed");
-        (void)unlink(tmp_path);
+        (void)cbm_unlink(tmp_path);
         return CBM_STORE_ERR;
     }
 
@@ -3573,13 +3603,14 @@ static int arch_entry_points(cbm_store_t *s, const char *project, cbm_architectu
                       "WHERE project=?1 AND json_extract(properties, '$.is_entry_point') = 1 "
                       "AND (json_extract(properties, '$.is_test') IS NULL OR "
                       "json_extract(properties, '$.is_test') != 1) "
-                      "AND file_path NOT LIKE '%test%' LIMIT 20";
+                      "AND file_path NOT LIKE '%test%' LIMIT ?2";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "arch_entry_points");
         return CBM_STORE_ERR;
     }
     bind_text(stmt, SKIP_ONE, project);
+    sqlite3_bind_int(stmt, ST_COL_2, ST_ARCH_ENTRY_POINT_LIMIT);
 
     int cap = ST_INIT_CAP_8;
     int n = 0;
@@ -3624,12 +3655,38 @@ static char *extract_json_string_prop(const char *json, const char *key, int key
     return heap_strdup(vbuf);
 }
 
+static bool arch_route_should_include(const char *name, const char *qn) {
+    if (!name || !name[0]) {
+        return false;
+    }
+    bool http_like_name = name[0] == '/' || strstr(name, "://") != NULL;
+    if (!http_like_name) {
+        return true;
+    }
+    /* Absolute URL infra nodes support cross-service matching in the graph, but
+     * __route__infra__ entries are endpoints from config/package metadata rather
+     * than application routes. Keep code-created absolute URL routes visible:
+     * many languages emit HTTP client routes as full URLs. */
+    if (qn && strncmp(qn, "__route__infra__", SLEN("__route__infra__")) == 0) {
+        return false;
+    }
+    if (qn && (strncmp(qn, "__grpc__", SLEN("__grpc__")) == 0 ||
+               strncmp(qn, "__graphql__", SLEN("__graphql__")) == 0 ||
+               strncmp(qn, "__trpc__", SLEN("__trpc__")) == 0)) {
+        return true;
+    }
+    return cbm_service_pattern_is_http_route_literal(name, NULL);
+}
+
 static int arch_routes(cbm_store_t *s, const char *project, cbm_architecture_info_t *out) {
-    const char *sql = "SELECT name, properties, COALESCE(file_path, '') FROM nodes "
-                      "WHERE project=?1 AND label='Route' "
-                      "AND (json_extract(properties, '$.is_test') IS NULL OR "
-                      "json_extract(properties, '$.is_test') != 1) "
-                      "LIMIT 20";
+    char sql[ST_SQL_BUF];
+    snprintf(sql, sizeof(sql),
+             "SELECT name, properties, COALESCE(file_path, ''), qualified_name FROM nodes "
+             "WHERE project=?1 AND label='Route' "
+             "AND (json_extract(properties, '$.is_test') IS NULL OR "
+             "json_extract(properties, '$.is_test') != 1) "
+             "LIMIT %d",
+             ST_ARCH_ROUTE_SCAN_LIMIT);
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "arch_routes");
@@ -3644,8 +3701,18 @@ static int arch_routes(cbm_store_t *s, const char *project, cbm_architecture_inf
         const char *name = (const char *)sqlite3_column_text(stmt, 0);
         const char *props = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
         const char *fp = (const char *)sqlite3_column_text(stmt, CBM_SZ_2);
+        const char *qn = (const char *)sqlite3_column_text(stmt, CBM_SZ_3);
         if (cbm_is_test_file_path(fp)) {
             continue;
+        }
+        /* Output-level safety net for HTTP-like Route names only. Non-HTTP
+         * Route classes (gRPC, GraphQL, tRPC, async topics) are legitimate
+         * architecture signals even when their names are not URL paths. */
+        if (!arch_route_should_include(name, qn)) {
+            continue;
+        }
+        if (n >= ST_ARCH_ROUTE_RESULT_LIMIT) {
+            break;
         }
         if (n >= cap) {
             cap *= ST_GROWTH;
@@ -5010,6 +5077,41 @@ static void cluster_add_pkg(const char **pkgs, int *counts, int *count, int cap,
     }
 }
 
+static bool cluster_label_is_generic(const char *label) {
+    static const char *const generic[] = {"get",  "set",   "run",   "main", "init",
+                                          "new",  "open",  "close", "read", "write",
+                                          "start", "stop", "test",  NULL};
+    if (!label) {
+        return false;
+    }
+    for (int i = 0; generic[i]; i++) {
+        if (strcmp(label, generic[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static char *cluster_make_label(const cbm_cluster_info_t *ci) {
+    if (ci->top_node_count > 0) {
+        const char *primary = ci->top_nodes[0];
+        if (cluster_label_is_generic(primary) && ci->top_node_count > 1) {
+            const char *secondary = ci->top_nodes[1];
+            size_t len = strlen(primary) + strlen(secondary) + 4;
+            char *label = malloc(len);
+            if (label) {
+                snprintf(label, len, "%s/%s", primary, secondary);
+                return label;
+            }
+        }
+        return heap_strdup(primary);
+    }
+    if (ci->package_count > 0) {
+        return heap_strdup(ci->packages[0]);
+    }
+    return heap_strdup("cluster");
+}
+
 /* Build the cluster_info for one community c into *ci. */
 static void cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *comm,
                               const int *degree, const char **names, const char **qns, int members,
@@ -5065,22 +5167,20 @@ static void cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *c
     }
     if (pc > 0) {
         ci->packages = malloc((size_t)pc * sizeof(char *));
-        int best = 0;
         for (int i = 0; i < pc; i++) {
             ci->packages[i] = heap_strdup(pkgs[i]);
-            if (pkg_counts[i] > pkg_counts[best]) {
-                best = i;
-            }
         }
         ci->package_count = pc;
-        ci->label = heap_strdup(pkgs[best]);
         for (int i = 0; i < pc; i++) {
             safe_str_free(&pkgs[i]);
         }
     }
-    if (!ci->label) {
-        ci->label = heap_strdup(ci->top_node_count > 0 ? ci->top_nodes[0] : "cluster");
-    }
+    /* Label: the top hub node is the most informative AND discriminable name
+     * for the community (e.g. "create_task", "install_plugins",
+     * "execute_tmux_command"). Labeling by the dominant package made every
+     * cluster in a single-package repo share one identical, uninformative
+     * label. The package list is preserved separately in `packages`. */
+    ci->label = cluster_make_label(ci);
 
     ci->edge_types = malloc(sizeof(char *));
     ci->edge_types[0] = heap_strdup("CALLS");
@@ -5807,13 +5907,14 @@ int cbm_store_find_architecture_docs(cbm_store_t *s, const char *project, char *
                       "AND (file_path LIKE '%ARCHITECTURE.md' OR file_path LIKE '%ADR.md' "
                       "OR file_path LIKE '%DECISIONS.md' OR file_path LIKE 'docs/adr/%' "
                       "OR file_path LIKE 'doc/adr/%' OR file_path LIKE 'adr/%') "
-                      "ORDER BY file_path LIMIT 20";
+                      "ORDER BY file_path LIMIT ?2";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "find_arch_docs");
         return CBM_STORE_ERR;
     }
     bind_text(stmt, SKIP_ONE, project);
+    sqlite3_bind_int(stmt, ST_COL_2, ST_ARCH_DOC_LIMIT);
 
     int cap = ST_INIT_CAP_8;
     int n = 0;

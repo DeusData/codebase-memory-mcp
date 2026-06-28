@@ -1014,8 +1014,8 @@ TEST(dep_search_explicit_dep_project_name) {
     free(r);
     /* Clean up any DB file that resolve_store may have created */
     char path[1024];
-    snprintf(path, sizeof(path), "%s/.cache/codebase-memory-mcp/_tc_deptest_proj_.db",
-             getenv("HOME"));
+    snprintf(path, sizeof(path), "%s/_tc_deptest_proj_.db",
+             cbm_resolve_cache_dir());
     (void)unlink(path);
     cbm_mcp_server_free(srv);
     PASS();
@@ -1328,8 +1328,8 @@ TEST(cross_project_search_not_confused_by_prefix) {
 
     /* Clean up any spurious DB file created by resolve_store */
     char path[1024];
-    snprintf(path, sizeof(path), "%s/.cache/codebase-memory-mcp/myapp-other-project.db",
-             getenv("HOME"));
+    snprintf(path, sizeof(path), "%s/myapp-other-project.db",
+             cbm_resolve_cache_dir());
     (void)unlink(path);
 
     cbm_mcp_server_free(srv);
@@ -1384,7 +1384,7 @@ TEST(prefix_collision_dash_after_session_name) {
     ASSERT_NOT_NULL(r);
     free(r);
     char path[1024];
-    snprintf(path, sizeof(path), "%s/.cache/codebase-memory-mcp/myapp-v2.db", getenv("HOME"));
+    snprintf(path, sizeof(path), "%s/myapp-v2.db", cbm_resolve_cache_dir());
     (void)unlink(path);
     cbm_mcp_server_free(srv);
     PASS();
@@ -1400,7 +1400,7 @@ TEST(prefix_collision_underscore_after_session_name) {
     ASSERT_NOT_NULL(r);
     free(r);
     char path[1024];
-    snprintf(path, sizeof(path), "%s/.cache/codebase-memory-mcp/myapp_test.db", getenv("HOME"));
+    snprintf(path, sizeof(path), "%s/myapp_test.db", cbm_resolve_cache_dir());
     (void)unlink(path);
     cbm_mcp_server_free(srv);
     PASS();
@@ -1434,7 +1434,7 @@ TEST(prefix_collision_completely_different_project) {
     ASSERT_NOT_NULL(r);
     free(r);
     char path[1024];
-    snprintf(path, sizeof(path), "%s/.cache/codebase-memory-mcp/other-project.db", getenv("HOME"));
+    snprintf(path, sizeof(path), "%s/other-project.db", cbm_resolve_cache_dir());
     (void)unlink(path);
     cbm_mcp_server_free(srv);
     PASS();
@@ -1451,7 +1451,7 @@ TEST(prefix_collision_session_is_substring_of_project) {
     ASSERT_NOT_NULL(r);
     free(r);
     char path[1024];
-    snprintf(path, sizeof(path), "%s/.cache/codebase-memory-mcp/abc.db", getenv("HOME"));
+    snprintf(path, sizeof(path), "%s/abc.db", cbm_resolve_cache_dir());
     (void)unlink(path);
     cbm_mcp_server_free(srv);
     PASS();
@@ -1468,8 +1468,8 @@ TEST(prefix_collision_session_is_substring_of_project) {
 TEST(get_code_no_project_uses_open_store_tier1) {
     /* Create a file DB with one node */
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_gc_proj_.db",
-             getenv("HOME"));
+    snprintf(db_path, sizeof(db_path), "%s/_tc_gc_proj_.db",
+             cbm_resolve_cache_dir());
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
     cbm_store_upsert_project(s, "_tc_gc_proj_", "/tmp");
@@ -1509,8 +1509,8 @@ TEST(get_code_no_project_uses_open_store_tier1) {
 TEST(get_code_single_fuzzy_result_resolves_not_ambiguous) {
     /* Create a file DB with one node */
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_gc_fuzzy_.db",
-             getenv("HOME"));
+    snprintf(db_path, sizeof(db_path), "%s/_tc_gc_fuzzy_.db",
+             cbm_resolve_cache_dir());
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
     cbm_store_upsert_project(s, "_tc_gc_fuzzy_", "/tmp");
@@ -1549,8 +1549,8 @@ TEST(get_code_single_fuzzy_result_resolves_not_ambiguous) {
  * QN, so get_code works even when srv->current_project is unset. */
 TEST(get_code_cold_start_parses_project_from_qn) {
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_gc_cold_.db",
-             getenv("HOME"));
+    snprintf(db_path, sizeof(db_path), "%s/_tc_gc_cold_.db",
+             cbm_resolve_cache_dir());
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
     cbm_store_upsert_project(s, "_tc_gc_cold_", "/tmp");
@@ -1615,8 +1615,8 @@ TEST(watcher_registered_after_index_repository) {
 TEST(watcher_registered_on_resolve_store) {
     /* Pre-populate a DB with a project that has a known root_path */
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_watcher_.db",
-             getenv("HOME"));
+    snprintf(db_path, sizeof(db_path), "%s/_tc_watcher_.db",
+             cbm_resolve_cache_dir());
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
     cbm_store_upsert_project(s, "_tc_watcher_", "/tmp/cbm_watcher_root");
@@ -1648,8 +1648,8 @@ TEST(watcher_registered_on_resolve_store) {
 TEST(watcher_not_registered_for_unknown_path) {
     /* Project entry exists but root_path is empty — watcher must NOT be registered */
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_watcher_nopath_.db",
-             getenv("HOME"));
+    snprintf(db_path, sizeof(db_path), "%s/_tc_watcher_nopath_.db",
+             cbm_resolve_cache_dir());
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
     cbm_store_upsert_project(s, "_tc_watcher_nopath_", "");
@@ -1699,8 +1699,8 @@ TEST(compact_defaults_to_true) {
     /* When compact is not provided, name field should be omitted if it's
      * the last segment of qualified_name */
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_compact_default_.db",
-             getenv("HOME"));
+    snprintf(db_path, sizeof(db_path), "%s/_tc_compact_default_.db",
+             cbm_resolve_cache_dir());
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
     cbm_store_upsert_project(s, "_tc_compact_default_", "/tmp/compact_test");
@@ -1740,8 +1740,8 @@ TEST(pagerank_output_has_limited_precision) {
     /* Pagerank values should be serialized with limited precision (~4 sig figs),
      * not full 17-digit double precision */
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_pr_precision_.db",
-             getenv("HOME"));
+    snprintf(db_path, sizeof(db_path), "%s/_tc_pr_precision_.db",
+             cbm_resolve_cache_dir());
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
     cbm_store_upsert_project(s, "_tc_pr_precision_", "/tmp/pr_test");
@@ -1775,8 +1775,8 @@ TEST(empty_db_not_treated_as_indexed) {
     /* A DB file with schema but 0 nodes should NOT prevent re-indexing.
      * Regression test: previously stat(db_path)==0 was enough to skip. */
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_empty_db_test_.db",
-             getenv("HOME"));
+    snprintf(db_path, sizeof(db_path), "%s/_tc_empty_db_test_.db",
+             cbm_resolve_cache_dir());
     /* Create DB with schema but no data */
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
@@ -1813,8 +1813,8 @@ TEST(empty_db_not_treated_as_indexed) {
 TEST(search_exclude_filters_file_paths) {
     /* exclude param should remove matching results */
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_exclude_test_.db",
-             getenv("HOME"));
+    snprintf(db_path, sizeof(db_path), "%s/_tc_exclude_test_.db",
+             cbm_resolve_cache_dir());
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
     cbm_store_upsert_project(s, "_tc_exclude_test_", "/tmp/exclude_test");
@@ -1862,8 +1862,8 @@ TEST(search_exclude_filters_file_paths) {
 TEST(search_exclude_empty_array_no_effect) {
     /* Empty exclude array should not filter anything */
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_excl_empty_.db",
-             getenv("HOME"));
+    snprintf(db_path, sizeof(db_path), "%s/_tc_excl_empty_.db",
+             cbm_resolve_cache_dir());
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
     cbm_store_upsert_project(s, "_tc_excl_empty_", "/tmp/excl_empty");
@@ -1889,8 +1889,8 @@ TEST(search_exclude_empty_array_no_effect) {
 TEST(search_exclude_all_returns_empty) {
     /* Excluding everything should return 0 results, not error */
     char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_excl_all_.db",
-             getenv("HOME"));
+    snprintf(db_path, sizeof(db_path), "%s/_tc_excl_all_.db",
+             cbm_resolve_cache_dir());
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
     cbm_store_upsert_project(s, "_tc_excl_all_", "/tmp/excl_all");
@@ -1979,8 +1979,8 @@ TEST(project_missing_returns_structured_error) {
 TEST(source_grep_case_insensitive_by_default) {
     /* Register a project in the store so get_project_root can resolve it */
     char db_path[512];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_ci_test_.db",
-             getenv("HOME"));
+    snprintf(db_path, sizeof(db_path), "%s/_tc_ci_test_.db",
+             cbm_resolve_cache_dir());
     char proj_dir[256];
     snprintf(proj_dir, sizeof(proj_dir), "%s/cbm_ci_test_%d", cbm_tmpdir(), (int)getpid());
     cbm_mkdir_p(proj_dir, 0755);
@@ -2022,8 +2022,8 @@ TEST(source_grep_case_insensitive_by_default) {
  * Pattern "HELLO_WORLD" vs file containing "hello_world" only → 0 matches. */
 TEST(source_grep_case_sensitive_flag_works) {
     char db_path[512];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_cs_test_.db",
-             getenv("HOME"));
+    snprintf(db_path, sizeof(db_path), "%s/_tc_cs_test_.db",
+             cbm_resolve_cache_dir());
     char proj_dir[256];
     snprintf(proj_dir, sizeof(proj_dir), "%s/cbm_cs_test_%d", cbm_tmpdir(), (int)getpid());
     cbm_mkdir_p(proj_dir, 0755);
@@ -2087,8 +2087,8 @@ TEST(graph_mode_compact_error_is_descriptive) {
  * After fix: response contains "mode_warning" field → PASS. */
 TEST(source_grep_mode_summary_warns) {
     char db_path[512];
-    snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/_tc_sm_test_.db",
-             getenv("HOME"));
+    snprintf(db_path, sizeof(db_path), "%s/_tc_sm_test_.db",
+             cbm_resolve_cache_dir());
     char proj_dir[256];
     snprintf(proj_dir, sizeof(proj_dir), "%s/cbm_sm_test_%d", cbm_tmpdir(), (int)getpid());
     cbm_mkdir_p(proj_dir, 0755);

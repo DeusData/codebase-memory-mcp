@@ -105,15 +105,16 @@ static int integration_setup(void) {
     if (!g_project)
         return -1;
 
-    /* Build db path for direct store queries (pipeline writes here) */
-    const char *home = getenv("HOME");
-    if (!home)
-        home = "/tmp";
-    snprintf(g_dbpath, sizeof(g_dbpath), "%s/.cache/codebase-memory-mcp/%s.db", home, g_project);
+    /* Build db path for direct store queries (pipeline writes here). Honors
+     * CBM_CACHE_DIR so it matches the pipeline write path (test isolation). */
+    snprintf(g_dbpath, sizeof(g_dbpath), "%s/%s.db",
+             cbm_resolve_cache_dir() ? cbm_resolve_cache_dir() : "/tmp", g_project);
 
     /* Ensure cache dir exists */
     char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
+    /* Honor CBM_CACHE_DIR so this matches the pipeline write path (test isolation). */
+    snprintf(cache_dir, sizeof(cache_dir), "%s",
+             cbm_resolve_cache_dir() ? cbm_resolve_cache_dir() : "/tmp");
     cbm_mkdir(cache_dir);
 
     /* Remove stale db from previous test runs */

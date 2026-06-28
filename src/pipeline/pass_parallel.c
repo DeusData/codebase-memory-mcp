@@ -69,6 +69,7 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "foundation/compat_regex.h"
 #include "cbm.h"
 #include "simhash/minhash.h"
+
 #include "semantic/ast_profile.h"
 
 #include <stdatomic.h>
@@ -499,7 +500,8 @@ static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info
                              def->qualified_name, def->file_path ? def->file_path : fi->rel_path,
                              (int)def->start_line, (int)def->end_line, props);
     ws->nodes_created++;
-    if (def->route_path && def->route_path[0] != '\0') {
+    if (def->route_path && def->route_path[0] != '\0' &&
+        cbm_service_pattern_is_http_route_literal(def->route_path, NULL)) {
         const char *rm = def->route_method ? def->route_method : "ANY";
         char route_qn[CBM_ROUTE_QN_SIZE];
         char cpath[CBM_SZ_256];
@@ -1003,6 +1005,7 @@ typedef struct {
     CBMFileResult **result_cache;
     const cbm_gbuf_t *main_gbuf;    /* READ-ONLY during Phase 4 */
     const cbm_registry_t *registry; /* READ-ONLY during Phase 4 */
+    double lsp_confidence_floor;
     _Atomic int64_t *shared_ids;
     _Atomic int *cancelled;
     _Atomic int next_file_idx;
@@ -1245,6 +1248,11 @@ static void emit_http_async_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t
         (svc == CBM_SVC_HTTP) ? cbm_service_pattern_http_method(call->callee_name) : NULL;
     const char *broker =
         (svc == CBM_SVC_ASYNC) ? cbm_service_pattern_broker(res->qualified_name) : NULL;
+    /* An HTTP call whose URL isn't a valid route path (CLI slash-command syntax
+     * or a filesystem path) must not become a spurious Route node. */
+    if (svc == CBM_SVC_HTTP && !cbm_service_pattern_is_http_route_literal(arg, call->callee_name)) {
+        return;
+    }
 
     int64_t route_id = build_service_route(gbuf, arg, method, broker, svc);
 
@@ -1299,6 +1307,10 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
                                     const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
                                     const char **ik, const char **iv, int ic) {
     const char *method = cbm_service_pattern_route_method(call->callee_name);
+    /* Reject CLI slash-command / filesystem-path args masquerading as routes. */
+    if (!cbm_service_pattern_is_http_route_literal(route_path, call->callee_name)) {
+        return;
+    }
     char rqn[CBM_ROUTE_QN_SIZE];
     char cpath[CBM_SZ_256];
     snprintf(rqn, sizeof(rqn), "__route__%s__%s", method ? method : "ANY",
@@ -1382,8 +1394,12 @@ static bool normalize_url_arg(const char *url, char *norm, int norm_sz) {
 }
 
 /* Detect API paths in call arguments and create HTTP_CALLS edges. */
-static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
-                               const CBMCall *call) {
+static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
+                               const char *rel, CBMLanguage lang) {
+    const char *source_path = source && source->file_path && source->file_path[0] ? source->file_path : rel;
+    if (cbm_is_test_file(source_path, lang)) {
+        return;
+    }
     for (int ai = 0; ai < call->arg_count; ai++) {
         const CBMCallArg *ca = &call->args[ai];
         const char *url = ca->value ? ca->value : ca->expr;
@@ -1394,11 +1410,15 @@ static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         if (!normalize_url_arg(url, norm, (int)sizeof(norm))) {
             continue;
         }
+        if (!cbm_service_pattern_is_http_route_literal(norm, call->callee_name)) {
+            continue;
+        }
         char route_qn[CBM_ROUTE_QN_SIZE];
         char cpath[CBM_SZ_256];
         snprintf(route_qn, sizeof(route_qn), "__route__ANY__%s",
                  cbm_route_canon_path(norm, cpath, sizeof(cpath)));
-        int64_t route_id = cbm_gbuf_upsert_node(gbuf, "Route", norm, route_qn, "", 0, 0,
+        int64_t route_id = cbm_gbuf_upsert_node(gbuf, "Route", norm, route_qn,
+                                                source_path ? source_path : "", 0, 0,
                                                 "{\"source\":\"arg_url\"}");
         char esc_c[CBM_SZ_256];
         char esc_n[CBM_SZ_256];
@@ -1590,7 +1610,8 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                               const cbm_gbuf_node_t *target, const CBMCall *call,
                               const cbm_resolution_t *res, const char *module_qn,
                               const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
-                              const char **imp_keys, const char **imp_vals, int imp_count) {
+                              const char **imp_keys, const char **imp_vals, int imp_count,
+                              const char *rel, CBMLanguage lang) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
     const char *arg = call->first_string_arg;
 
@@ -1640,7 +1661,7 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         emit_normal_calls_edge(gbuf, source, target, call, res);
     }
 
-    detect_url_in_args(gbuf, source, call);
+    detect_url_in_args(gbuf, source, call, rel, lang);
 }
 
 /* Find the source node for an edge: enclosing function or file node. */
@@ -1738,8 +1759,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         if (lsp_idx) {
             for (int i = 0; i < result->resolved_calls.count; i++) {
                 CBMResolvedCall *rc_e = &result->resolved_calls.items[i];
+                double lsp_floor = rc->lsp_confidence_floor > 0.0
+                                       ? rc->lsp_confidence_floor
+                                       : (double)CBM_LSP_CONFIDENCE_FLOOR;
                 if (!rc_e->caller_qn || !rc_e->callee_qn ||
-                    rc_e->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
+                    (double)rc_e->confidence < lsp_floor) {
                     continue;
                 }
                 const char *short_name = strrchr(rc_e->callee_qn, '.');
@@ -1798,7 +1822,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             /* Fallback to the linear scan for edge cases the index may
              * miss (e.g. callee_name that wasn't the registered short
              * name). Keeps semantics identical. */
-            lsp = cbm_pipeline_find_lsp_resolution(&result->resolved_calls, call);
+            lsp = cbm_pipeline_find_lsp_resolution_with_floor(
+                &result->resolved_calls, call, rc->lsp_confidence_floor);
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_lsp_lookup, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
@@ -1852,7 +1877,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                              .strategy = "callee_suffix"};
                 emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
                                   module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                  imp_count);
+                                  imp_count, rel, lang);
             }
             continue;
         }
@@ -1874,7 +1899,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
         _rc_t0 = extract_now_ns();
         emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
-                          rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count);
+                          rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count, rel, lang);
         atomic_fetch_add_explicit(&rc->time_ns_rc_emit, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         ws->calls_resolved++;
@@ -2442,6 +2467,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .result_cache = result_cache,
         .main_gbuf = ctx->gbuf,
         .registry = ctx->registry,
+        .lsp_confidence_floor = ctx->lsp_confidence_floor,
         .shared_ids = shared_ids,
         .cancelled = ctx->cancelled,
         .all_defs = all_defs,

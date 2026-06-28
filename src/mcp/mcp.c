@@ -96,7 +96,7 @@ static void add_pagerank_val(yyjson_mut_doc *doc, yyjson_mut_val *obj, double v)
 /* Default result limit for search_graph and search_code.
  * Prevents unbounded 500K-result responses. Callers can override.
  * Configurable via config key "search_limit". */
-#define CBM_DEFAULT_SEARCH_LIMIT 50
+#define CBM_MCP_DEFAULT_SEARCH_LIMIT 50
 #define CBM_CONFIG_SEARCH_LIMIT "search_limit"
 
 /* Default: rank dependency sub-project symbols (proj.dep.*) LAST so a stdlib
@@ -123,7 +123,16 @@ static void add_pagerank_val(yyjson_mut_doc *doc, yyjson_mut_val *obj, double v)
 
 /* Idle store eviction: close cached project store after this many seconds
  * of inactivity to free SQLite memory during idle periods. */
-#define STORE_IDLE_TIMEOUT_S 60
+#define CBM_MCP_DEFAULT_STORE_IDLE_TIMEOUT_S 60
+#define CBM_CONFIG_STORE_IDLE_TIMEOUT_S "store_idle_timeout_s"
+/* Read-only DB validation should fail promptly when another process holds a
+ * lock; this path is on startup/project discovery and must not hang MCP. */
+#define CBM_DB_VALIDATE_BUSY_TIMEOUT_MS 1000
+#define CBM_CONFIG_DB_VALIDATE_BUSY_TIMEOUT_MS "db_validate_busy_timeout_ms"
+/* Optional background release check. Default preserves the historical 5s curl
+ * bound; config value 0 disables the network probe for offline/locked-down MCP. */
+#define CBM_MCP_UPDATE_CHECK_TIMEOUT_S 5
+#define CBM_CONFIG_UPDATE_CHECK_TIMEOUT_S "update_check_timeout_s"
 
 /* Config key: comma-separated glob patterns to exclude from key_functions.
  * Set via: config set key_functions_exclude "scripts/,tools/,tests/" */
@@ -133,9 +142,16 @@ static void add_pagerank_val(yyjson_mut_doc *doc, yyjson_mut_val *obj, double v)
  * header (closes the codebase://architecture pull-only gap). Smaller than the
  * get_architecture default (25) to keep first-response token cost modest. */
 #define CBM_CONTEXT_KEY_FUNCTIONS_LIMIT  10
+/* Config-tunable override for the _context key_functions push bound.
+ * <=0 falls back to the CBM_CONTEXT_KEY_FUNCTIONS_LIMIT default above. */
+#define CBM_CONFIG_CONTEXT_KEY_FUNCTIONS_LIMIT "context_key_functions_limit"
 #define CBM_CONFIG_ARCH_HOTSPOT_LIMIT    "arch_hotspot_limit"
 #define CBM_CONFIG_ARCH_RESOLUTION       "architecture_resolution"
 #define CBM_CONFIG_SIMILARITY_THRESHOLD  "similarity_threshold"
+#define CBM_CONFIG_HTTPLINK_MIN_CONFIDENCE "httplink_min_confidence"
+#define CBM_CONFIG_SEMANTIC_THRESHOLD    "semantic_threshold"
+#define CBM_CONFIG_GITHISTORY_MIN_COUPLING "githistory_min_coupling"
+#define CBM_CONFIG_LSP_CONFIDENCE_FLOOR  "lsp_confidence_floor"
 
 /* Directory permissions: rwxr-xr-x */
 #define ADR_DIR_PERMS 0755
@@ -797,6 +813,7 @@ struct cbm_mcp_server {
     char *current_project;          /* which project store is open for (heap) */
     time_t store_last_used;         /* last time resolve_store was called for a named project */
     char update_notice[CBM_SZ_256]; /* one-shot update notice, cleared after first injection */
+    cbm_mutex_t update_notice_lock; /* protects update_notice across background check/request thread */
     bool update_checked;            /* true after background check has been launched */
     cbm_thread_t update_tid;        /* background update check thread */
     bool update_thread_active;      /* true if update thread was started and needs joining */
@@ -819,6 +836,36 @@ struct cbm_mcp_server {
     cbm_pipeline_t *active_pipeline; /* non-NULL while index_repository runs */
     int64_t active_request_id;       /* JSON-RPC id of the in-progress tool call */
 };
+
+static int cbm_mcp_config_int_clamped(cbm_mcp_server_t *srv, const char *key, int default_val,
+                                      int min_val, int max_val) {
+    int value = srv && srv->config ? cbm_config_get_int(srv->config, key, default_val) : default_val;
+    if (value < min_val) {
+        value = min_val;
+    }
+    if (value > max_val) {
+        value = max_val;
+    }
+    return value;
+}
+
+static int cbm_mcp_store_idle_timeout_s(cbm_mcp_server_t *srv) {
+    return cbm_mcp_config_int_clamped(srv, CBM_CONFIG_STORE_IDLE_TIMEOUT_S,
+                                      CBM_MCP_DEFAULT_STORE_IDLE_TIMEOUT_S, 1,
+                                      CBM_SZ_64K);
+}
+
+static int cbm_mcp_db_validate_busy_timeout_ms(cbm_mcp_server_t *srv) {
+    return cbm_mcp_config_int_clamped(srv, CBM_CONFIG_DB_VALIDATE_BUSY_TIMEOUT_MS,
+                                      CBM_DB_VALIDATE_BUSY_TIMEOUT_MS, 0,
+                                      CBM_SZ_64K);
+}
+
+static int cbm_mcp_update_check_timeout_s(cbm_mcp_server_t *srv) {
+    return cbm_mcp_config_int_clamped(srv, CBM_CONFIG_UPDATE_CHECK_TIMEOUT_S,
+                                      CBM_MCP_UPDATE_CHECK_TIMEOUT_S, 0,
+                                      CBM_SZ_256);
+}
 
 /* ── Tool list (needs full struct definition above) ──────────── */
 
@@ -916,6 +963,7 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
     if (!srv) {
         return NULL;
     }
+    cbm_mutex_init(&srv->update_notice_lock);
 
     /* If a store_path is given, open that project directly.
      * Otherwise, create an in-memory store for test/embedded use. */
@@ -969,6 +1017,7 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     if (srv->autoindex_active) {
         cbm_thread_join(&srv->autoindex_tid);
     }
+    cbm_mutex_destroy(&srv->update_notice_lock);
     if (srv->owns_store && srv->store) {
         cbm_store_close(srv->store);
     }
@@ -1018,7 +1067,12 @@ static const char *cache_dir(char *buf, size_t bufsz) {
     if (!dir) {
         dir = cbm_tmpdir();
     }
-    snprintf(buf, bufsz, "%s", dir);
+    int len = snprintf(buf, bufsz, "%s", dir);
+    if (len <= 0 || (size_t)len >= bufsz) {
+        if (bufsz > 0) {
+            buf[0] = '\0';
+        }
+    }
     return buf;
 }
 
@@ -1030,7 +1084,12 @@ static const char *project_db_path(const char *project, char *buf, size_t bufsz)
     }
     char dir[CBM_SZ_1K];
     cache_dir(dir, sizeof(dir));
-    snprintf(buf, bufsz, "%s/%s.db", dir, project);
+    int len = snprintf(buf, bufsz, "%s/%s.db", dir, project);
+    if (len <= 0 || (size_t)len >= bufsz) {
+        if (bufsz > 0) {
+            buf[0] = '\0';
+        }
+    }
     return buf;
 }
 
@@ -1042,8 +1101,8 @@ static const char *project_db_path(const char *project, char *buf, size_t bufsz)
  * matching DB is found.  Cost: one access() call per dot in the QN (~5-10). */
 static char *extract_project_from_qn(const char *qn) {
     if (!qn) return NULL;
-    const char *home = getenv("HOME");
-    if (!home) return NULL;
+    const char *cdir = cbm_resolve_cache_dir();
+    if (!cdir) return NULL;
 
     /* Scan each dot-separated prefix of the QN and test if a matching DB file
      * exists.  Walk left-to-right so the last hit is the longest (most
@@ -1056,13 +1115,11 @@ static char *extract_project_from_qn(const char *qn) {
 
     size_t best_end = 0; /* length of the longest matching prefix found */
     char db_path[1024];
-    const char *home_val = home;
 
     for (size_t i = 0; i < qn_len; i++) {
         if (candidate[i] == '.') {
             candidate[i] = '\0';
-            snprintf(db_path, sizeof(db_path),
-                     "%s/.cache/codebase-memory-mcp/%s.db", home_val, candidate);
+            snprintf(db_path, sizeof(db_path), "%s/%s.db", cdir, candidate);
             if (access(db_path, F_OK) == 0) {
                 best_end = i; /* length of this prefix */
             }
@@ -1131,15 +1188,18 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     /* Open project's .db file — query-only open (no SQLITE_OPEN_CREATE) to
      * prevent ghost .db file creation for unknown/unindexed projects. */
     char path[CBM_SZ_1K];
-    project_db_path(project, path, sizeof(path));
+    project_db_path(db_project, path, sizeof(path));
+    if (!path[0]) {
+        return NULL;
+    }
     srv->store = cbm_store_open_path_query(path);
     if (srv->store) {
-        /* Check DB integrity — auto-clean corrupt databases. A bad project
+        /* Check DB integrity — auto-clean corrupt cache databases. A bad project
          * root_path (with an otherwise-fine projects table) is cosmetic: the
          * indexed nodes/edges are intact and queries key off project name, not
          * root_path. Retain such DBs instead of deleting them, to avoid the
-         * data loss reported in #557. Only genuine corruption (e.g. an
-         * over-accumulated projects table) is auto-deleted. */
+         * data loss reported in #557. Only genuine structural corruption is
+         * removed, and only from the derived CBM cache. */
         bool path_only = false;
         if (!cbm_store_check_integrity_full(srv->store, &path_only)) {
             if (path_only) {
@@ -1151,14 +1211,18 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
                               "deleting corrupt db — re-index required");
                 cbm_store_close(srv->store);
                 srv->store = NULL;
-                /* Delete the corrupt DB + WAL/SHM files */
-                cbm_unlink(path);
+                /* Delete the corrupt cache DB + WAL/SHM files. */
+                (void)cbm_unlink(path);
                 char wal_path[MCP_FIELD_SIZE];
                 char shm_path[MCP_FIELD_SIZE];
-                snprintf(wal_path, sizeof(wal_path), "%s-wal", path);
-                snprintf(shm_path, sizeof(shm_path), "%s-shm", path);
-                cbm_unlink(wal_path);
-                cbm_unlink(shm_path);
+                int wal_len = snprintf(wal_path, sizeof(wal_path), "%s-wal", path);
+                int shm_len = snprintf(shm_path, sizeof(shm_path), "%s-shm", path);
+                if (wal_len > 0 && (size_t)wal_len < sizeof(wal_path)) {
+                    (void)cbm_unlink(wal_path);
+                }
+                if (shm_len > 0 && (size_t)shm_len < sizeof(shm_path)) {
+                    (void)cbm_unlink(shm_path);
+                }
                 return NULL;
             }
         }
@@ -1219,7 +1283,8 @@ static int collect_db_project_names(const char *dir_path, char *out, size_t out_
         if (count > 0 && offset < (int)out_sz - MCP_SEPARATOR) {
             out[offset++] = ',';
         }
-        int wrote = snprintf(out + offset, out_sz - (size_t)offset, "\"%.*s\"", (int)(len - 3), n);
+        int wrote = snprintf(out + offset, out_sz - (size_t)offset, "\"%.*s\"",
+                             (int)(len - MCP_DB_EXT), n);
         if (wrote > 0) {
             offset += wrote;
             if ((size_t)offset >= out_sz) {
@@ -1518,8 +1583,14 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
         const char *kf_exclude = srv->config
             ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "")
             : "";
-        char *kf_sql = build_key_functions_sql(kf_exclude, NULL,
-                                               CBM_CONTEXT_KEY_FUNCTIONS_LIMIT);
+        int kf_cfg_limit = srv->config
+            ? cbm_config_get_int(srv->config, CBM_CONFIG_CONTEXT_KEY_FUNCTIONS_LIMIT,
+                                 CBM_CONTEXT_KEY_FUNCTIONS_LIMIT)
+            : CBM_CONTEXT_KEY_FUNCTIONS_LIMIT;
+        if (kf_cfg_limit <= 0) {
+            kf_cfg_limit = CBM_CONTEXT_KEY_FUNCTIONS_LIMIT;
+        }
+        char *kf_sql = build_key_functions_sql(kf_exclude, NULL, kf_cfg_limit);
         if (kf_sql) {
             sqlite3_stmt *kf_stmt = NULL;
             if (sqlite3_prepare_v2(db, kf_sql, -1, &kf_stmt, NULL) == SQLITE_OK) {
@@ -1727,7 +1798,7 @@ static void fill_project_params(const project_expand_t *pe, cbm_search_params_t 
  * On ANY error: returns false, logs actionable warning to stderr,
  * does NOT crash, does NOT hang, does NOT modify the file.
  * Opens read-only with busy_timeout to avoid hanging on locked files. */
-static bool validate_cbm_db(const char *path) {
+static bool validate_cbm_db_with_timeout(const char *path, int busy_timeout_ms) {
     if (!path) return false;
 
     struct stat vst;
@@ -1764,7 +1835,7 @@ static bool validate_cbm_db(const char *path) {
         if (db) sqlite3_close(db);
         return false;
     }
-    sqlite3_busy_timeout(db, 1000); /* 1s max — don't hang on locked files */
+    sqlite3_busy_timeout(db, busy_timeout_ms);
 
     sqlite3_stmt *stmt = NULL;
     rc = sqlite3_prepare_v2(db,
@@ -1808,10 +1879,17 @@ static bool is_project_db_file(const char *name, size_t len) {
 static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, const char *dir_path,
                                      const char *name, size_t name_len, int64_t size_bytes) {
     char project_name[CBM_SZ_1K];
-    snprintf(project_name, sizeof(project_name), "%.*s", (int)(name_len - 3), name);
+    int project_len =
+        snprintf(project_name, sizeof(project_name), "%.*s", (int)(name_len - MCP_DB_EXT), name);
+    if (project_len <= 0 || (size_t)project_len >= sizeof(project_name)) {
+        return;
+    }
 
     char full_path[CBM_SZ_2K];
-    snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name);
+    int full_path_len = snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name);
+    if (full_path_len <= 0 || (size_t)full_path_len >= sizeof(full_path)) {
+        return;
+    }
 
     cbm_store_t *pstore = cbm_store_open_path(full_path);
     int nodes = 0;
@@ -1845,11 +1923,11 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
 /* list_projects: scan cache directory for .db files.
  * Each project is a single .db file — no central registry needed. */
 static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
-    (void)srv;
     (void)args;
 
     char dir_path[CBM_SZ_1K];
     cache_dir(dir_path, sizeof(dir_path));
+    int validate_busy_timeout_ms = cbm_mcp_db_validate_busy_timeout_ms(srv);
 
     cbm_dir_t *d = cbm_opendir(dir_path);
 
@@ -1864,21 +1942,18 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
             const char *name = entry->name;
             size_t len = strlen(name);
 
-            /* Must end with .db and be at least 4 chars (x.db) */
-            if (len < 4 || strcmp(name + len - 3, ".db") != 0) {
-                continue;
-            }
-
-            /* Skip temp/internal files and corrupt project names */
-            if (strncmp(name, "tmp-", 4) == 0 || strncmp(name, "_", 1) == 0 ||
-                strncmp(name, ":memory:", 8) == 0 ||
-                strcmp(name, "..db") == 0 || strcmp(name, ".db") == 0) {
+            if (!is_project_db_file(name, len)) {
                 continue;
             }
 
             /* Extract project name = filename without .db suffix */
-            char project_name[1024];
-            snprintf(project_name, sizeof(project_name), "%.*s", (int)(len - 3), name);
+            char project_name[CBM_SZ_1K];
+            int project_len =
+                snprintf(project_name, sizeof(project_name), "%.*s", (int)(len - MCP_DB_EXT),
+                         name);
+            if (project_len <= 0 || (size_t)project_len >= sizeof(project_name)) {
+                continue;
+            }
 
             /* Skip invalid project names (corrupt entries like ..db) */
             if (project_name[0] == '\0' || strcmp(project_name, ".") == 0 ||
@@ -1887,15 +1962,18 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
             }
 
             /* Get file metadata */
-            char full_path[2048];
-            snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name);
+            char full_path[CBM_SZ_2K];
+            int full_path_len = snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name);
+            if (full_path_len <= 0 || (size_t)full_path_len >= sizeof(full_path)) {
+                continue;
+            }
             struct stat st;
             if (stat(full_path, &st) != 0) {
                 continue;
             }
 
             /* Validate db structure before opening — skip corrupt/non-cbm files */
-            if (!validate_cbm_db(full_path)) {
+            if (!validate_cbm_db_with_timeout(full_path, validate_busy_timeout_ms)) {
                 continue;
             }
 
@@ -2705,7 +2783,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result(errbuf, true);
     }
     int cfg_search_limit = cbm_config_get_int(srv->config, CBM_CONFIG_SEARCH_LIMIT,
-                                               CBM_DEFAULT_SEARCH_LIMIT);
+                                               CBM_MCP_DEFAULT_SEARCH_LIMIT);
     int limit = cbm_mcp_get_int_arg(args, "limit", cfg_search_limit);
     /* F4: treat limit<=0 as default */
     if (limit <= 0) limit = cfg_search_limit;
@@ -3199,11 +3277,17 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     /* Delete the .db file + WAL/SHM */
     char path[CBM_SZ_1K];
     project_db_path(name, path, sizeof(path));
+    if (!path[0]) {
+        cbm_pipeline_unlock();
+        free(name);
+        return cbm_mcp_text_result("{\"status\":\"delete_failed\",\"error\":\"project path too long\"}",
+                                   true);
+    }
 
     char wal[CBM_SZ_1K];
     char shm[CBM_SZ_1K];
-    snprintf(wal, sizeof(wal), "%s-wal", path);
-    snprintf(shm, sizeof(shm), "%s-shm", path);
+    int wal_len = snprintf(wal, sizeof(wal), "%s-wal", path);
+    int shm_len = snprintf(shm, sizeof(shm), "%s-shm", path);
 
     bool exists = (access(path, F_OK) == 0);
     const char *status = "not_found";
@@ -3212,8 +3296,12 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
 
     if (exists) {
         int rc = cbm_unlink(path);
-        (void)cbm_unlink(wal);
-        (void)cbm_unlink(shm);
+        if (wal_len > 0 && (size_t)wal_len < sizeof(wal)) {
+            (void)cbm_unlink(wal);
+        }
+        if (shm_len > 0 && (size_t)shm_len < sizeof(shm)) {
+            (void)cbm_unlink(shm);
+        }
         if (rc == 0) {
             status = "deleted";
         } else {
@@ -4260,6 +4348,26 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         if (sim_thresh > 0.0) {
             cbm_pipeline_set_similarity_threshold(p, sim_thresh);
         }
+        double httplink_min =
+            cbm_config_get_double(srv->config, CBM_CONFIG_HTTPLINK_MIN_CONFIDENCE, 0.0);
+        if (httplink_min > 0.0) {
+            cbm_pipeline_set_httplink_min_confidence(p, httplink_min);
+        }
+        double semantic_thresh =
+            cbm_config_get_double(srv->config, CBM_CONFIG_SEMANTIC_THRESHOLD, 0.0);
+        if (semantic_thresh > 0.0) {
+            cbm_pipeline_set_semantic_threshold(p, semantic_thresh);
+        }
+        double gh_min =
+            cbm_config_get_double(srv->config, CBM_CONFIG_GITHISTORY_MIN_COUPLING, 0.0);
+        if (gh_min > 0.0) {
+            cbm_pipeline_set_githistory_min_coupling(p, gh_min);
+        }
+        double lsp_floor =
+            cbm_config_get_double(srv->config, CBM_CONFIG_LSP_CONFIDENCE_FLOOR, 0.0);
+        if (lsp_floor > 0.0) {
+            cbm_pipeline_set_lsp_confidence_floor(p, lsp_floor);
+        }
     }
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
@@ -4460,6 +4568,12 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
         yyjson_val *val = yyjson_obj_iter_get_val(key);
         const char *k = yyjson_get_str(key);
         if (!k) {
+            continue;
+        }
+        /* Search results flatten node properties into the result object for
+         * token economy, so property keys must not overwrite/collide with
+         * stable result fields such as source:"project" vs source:"infra". */
+        if (yyjson_mut_obj_get(obj, k) != NULL) {
             continue;
         }
         if (yyjson_is_str(val)) {
@@ -5079,29 +5193,32 @@ static int search_result_cmp(const void *a, const void *b) {
 
 /* Build the grep command string based on scoped vs recursive mode.
  * case_sensitive=false adds -i for case-insensitive matching (grep default is sensitive). */
-static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool case_sensitive,
+static bool build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool case_sensitive,
                            bool scoped, const char *file_pattern, const char *tmpfile,
                            const char *filelist, const char *root_path) {
     // NOLINTNEXTLINE(readability-implicit-bool-conversion)
     const char *flag = use_regex ? "-E" : "-F";
     const char *ci_flag = case_sensitive ? "" : " -i";
+    int n;
     if (scoped) {
         if (file_pattern) {
-            snprintf(cmd, cmd_sz, "xargs grep -n%s %s --include='%s' -f '%s' < '%s' 2>/dev/null",
-                     ci_flag, flag, file_pattern, tmpfile, filelist);
+            n = snprintf(cmd, cmd_sz,
+                         "xargs grep -n%s %s --include='%s' -f '%s' < '%s' 2>/dev/null",
+                         ci_flag, flag, file_pattern, tmpfile, filelist);
         } else {
-            snprintf(cmd, cmd_sz, "xargs grep -n%s %s -f '%s' < '%s' 2>/dev/null", ci_flag, flag,
-                     tmpfile, filelist);
+            n = snprintf(cmd, cmd_sz, "xargs grep -n%s %s -f '%s' < '%s' 2>/dev/null", ci_flag,
+                         flag, tmpfile, filelist);
         }
     } else {
         if (file_pattern) {
-            snprintf(cmd, cmd_sz, "grep -rn%s %s --include='%s' -f '%s' '%s' 2>/dev/null",
-                     ci_flag, flag, file_pattern, tmpfile, root_path);
+            n = snprintf(cmd, cmd_sz, "grep -rn%s %s --include='%s' -f '%s' '%s' 2>/dev/null",
+                         ci_flag, flag, file_pattern, tmpfile, root_path);
         } else {
-            snprintf(cmd, cmd_sz, "grep -rn%s %s -f '%s' '%s' 2>/dev/null", ci_flag, flag, tmpfile,
-                     root_path);
+            n = snprintf(cmd, cmd_sz, "grep -rn%s %s -f '%s' '%s' 2>/dev/null", ci_flag, flag,
+                         tmpfile, root_path);
         }
     }
+    return n >= 0 && (size_t)n < cmd_sz;
 }
 
 /* Build deduplicated file list from search results + raw matches. */
@@ -5534,13 +5651,35 @@ static bool validate_search_args(const char *root_path, const char *file_pattern
 
 /* Write pattern to a temp file for grep -f. Returns true on success. */
 static bool write_pattern_file(char *tmpfile, int tmpfile_sz, const char *pattern) {
-    snprintf(tmpfile, tmpfile_sz, "%s/cbm_search_%d.pat", cbm_tmpdir(), (int)getpid());
-    FILE *tf = fopen(tmpfile, "w");
-    if (!tf) {
+    if (!tmpfile || tmpfile_sz <= 0 || !pattern) {
         return false;
     }
-    (void)fprintf(tf, "%s\n", pattern);
-    (void)fclose(tf);
+    int n = snprintf(tmpfile, (size_t)tmpfile_sz, "%s/cbm_search_XXXXXX", cbm_tmpdir());
+    if (n < 0 || n >= tmpfile_sz) {
+        return false;
+    }
+    int fd = cbm_mkstemp_s(tmpfile, (size_t)tmpfile_sz);
+    if (fd < 0) {
+        return false;
+    }
+#ifdef _WIN32
+    FILE *tf = _fdopen(fd, "w");
+#else
+    FILE *tf = fdopen(fd, "w");
+#endif
+    if (!tf) {
+        cbm_close_fd(fd);
+        cbm_unlink(tmpfile);
+        return false;
+    }
+    bool ok = fputs(pattern, tf) >= 0 && fputc('\n', tf) != EOF;
+    if (fclose(tf) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        cbm_unlink(tmpfile);
+        return false;
+    }
     return true;
 }
 
@@ -5560,7 +5699,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     int context_lines = cbm_mcp_get_int_arg(args, "context", 0);
     int cfg_search_limit_sc = cbm_config_get_int(srv->config, CBM_CONFIG_SEARCH_LIMIT,
-                                                CBM_DEFAULT_SEARCH_LIMIT);
+                                                CBM_MCP_DEFAULT_SEARCH_LIMIT);
     int limit = cbm_mcp_get_int_arg(args, "limit", cfg_search_limit_sc);
     bool use_regex = cbm_mcp_get_bool_arg(args, "regex");
     uint64_t search_t0 = cbm_now_ms();
@@ -5705,7 +5844,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* ── Phase 1: Grep scan ──────────────────────────────────── */
-    char tmpfile[CBM_SZ_256];
+    char tmpfile[CBM_PATH_MAX];
     if (!write_pattern_file(tmpfile, sizeof(tmpfile), pattern)) {
         char errmsg[CBM_SZ_256];
         snprintf(errmsg, sizeof(errmsg), "search failed: cannot create temp file (%s)",
@@ -5732,13 +5871,32 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
      * miss files written or modified after the last index run (e.g. in tests
      * and in active development workflows where new files aren't yet indexed).
      * Vendored/generated code can be excluded via .gitignore or path_filter. */
-    char filelist[256];
-    snprintf(filelist, sizeof(filelist), "%s.files", tmpfile);
+    char filelist[CBM_PATH_MAX];
+    int filelist_len = snprintf(filelist, sizeof(filelist), "%s.files", tmpfile);
+    if (filelist_len < 0 || (size_t)filelist_len >= sizeof(filelist)) {
+        cbm_unlink(tmpfile);
+        free(root_path);
+        free(pattern);
+        free(project);
+        free(file_pattern);
+        return cbm_mcp_text_result(
+            "{\"error\":\"search failed: temporary file path too long\","
+            "\"hint\":\"Use a shorter TMPDIR/TEMP path or project path.\"}", true);
+    }
     bool scoped = false;
 
     char cmd[4096];
-    build_grep_cmd(cmd, sizeof(cmd), use_regex, case_sensitive, scoped, file_pattern, tmpfile,
-                   filelist, root_path);
+    if (!build_grep_cmd(cmd, sizeof(cmd), use_regex, case_sensitive, scoped, file_pattern, tmpfile,
+                        filelist, root_path)) {
+        cbm_unlink(tmpfile);
+        free(root_path);
+        free(pattern);
+        free(project);
+        free(file_pattern);
+        return cbm_mcp_text_result(
+            "{\"error\":\"search failed: grep command too long\","
+            "\"hint\":\"Use a shorter project path or file_pattern.\"}", true);
+    }
 
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
@@ -5936,17 +6094,27 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
 
     /* Get changed files via git (-C avoids cd + quoting issues on Windows) */
     char cmd[CBM_SZ_2K];
+    int cmd_len;
 #ifdef _WIN32
-    snprintf(cmd, sizeof(cmd),
-             "git -C \"%s\" diff --name-only \"%s\"...HEAD 2>NUL & "
-             "git -C \"%s\" diff --name-only 2>NUL",
-             root_path, base_branch, root_path);
+    cmd_len = snprintf(cmd, sizeof(cmd),
+                       "git -C \"%s\" diff --name-only \"%s\"...HEAD 2>NUL & "
+                       "git -C \"%s\" diff --name-only 2>NUL",
+                       root_path, base_branch, root_path);
 #else
-    snprintf(cmd, sizeof(cmd),
-             "{ git -C '%s' diff --name-only '%s'...HEAD 2>/dev/null; "
-             "git -C '%s' diff --name-only 2>/dev/null; } | sort -u",
-             root_path, base_branch, root_path);
+    cmd_len = snprintf(cmd, sizeof(cmd),
+                       "{ git -C \"%s\" diff --name-only \"%s\"...HEAD 2>/dev/null; "
+                       "git -C \"%s\" diff --name-only 2>/dev/null; } | sort -u",
+                       root_path, base_branch, root_path);
 #endif
+    if (cmd_len < 0 || (size_t)cmd_len >= sizeof(cmd)) {
+        free(root_path);
+        free(project);
+        free(base_branch);
+        free(scope);
+        return cbm_mcp_text_result(
+            "{\"error\":\"git diff failed: command too long\","
+            "\"hint\":\"Use shorter project paths or branch names.\"}", true);
+    }
 
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
@@ -6585,9 +6753,16 @@ static bool db_is_stale(const char *db_path, const char *repo_path, int max_age_
     }
 
     /* Check git HEAD commit time vs DB mtime */
+    if (!validate_search_path_arg(repo_path)) return false;
     char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-        "git -C '%s' log -1 --format=%%ct HEAD 2>/dev/null", repo_path);
+#ifdef _WIN32
+    const char *null_dev = "NUL";
+#else
+    const char *null_dev = "/dev/null";
+#endif
+    int cmd_len = snprintf(cmd, sizeof(cmd), "git -C \"%s\" log -1 --format=%%ct HEAD 2>%s",
+                           repo_path, null_dev);
+    if (cmd_len < 0 || (size_t)cmd_len >= sizeof(cmd)) return false;
     // NOLINTNEXTLINE(bugprone-command-processor,cert-env33-c)
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) return false;
@@ -6615,11 +6790,8 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     /* Check if project already has a populated DB */
     bool needs_index = true;
     char db_check[1024] = {0};
-    const char *home = cbm_get_home_dir();
-    if (home) {
-        snprintf(db_check, sizeof(db_check), "%s/.cache/codebase-memory-mcp/%s.db", home,
-                 srv->session_project);
-
+    project_db_path(srv->session_project, db_check, sizeof(db_check));
+    if (db_check[0]) {
         if (db_has_content(db_check)) {
             /* DB exists and has nodes — check if stale */
             bool reindex_on_startup = srv->config
@@ -6687,26 +6859,47 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         return;
     }
 
-    /* Quick file count check to avoid OOM on massive repos */
-    if (!cbm_validate_shell_arg(srv->session_root)) {
-        cbm_log_warn("autoindex.skip", "reason", "path contains shell metacharacters");
-        return;
-    }
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C '%s' ls-files 2>/dev/null | wc -l", srv->session_root);
-    FILE *fp = cbm_popen(cmd, "r");
-    if (fp) {
-        char line[CBM_SZ_64];
-        if (fgets(line, sizeof(line), fp)) {
-            int count = (int)strtol(line, NULL, CBM_DECIMAL_BASE);
+    /* Quick file count check to avoid OOM on massive repos. A configured limit
+     * of 0 means "no limit", matching the public config registry. */
+    if (file_limit > 0) {
+        if (!validate_search_path_arg(srv->session_root)) {
+            cbm_log_warn("autoindex.skip", "reason", "path contains shell metacharacters");
+            return;
+        }
+        char cmd[CBM_SZ_1K];
+#ifdef _WIN32
+        const char *null_dev = "NUL";
+#else
+        const char *null_dev = "/dev/null";
+#endif
+        int cmd_len = snprintf(cmd, sizeof(cmd), "git -C \"%s\" ls-files 2>%s",
+                               srv->session_root, null_dev);
+        if (cmd_len < 0 || (size_t)cmd_len >= sizeof(cmd)) {
+            cbm_log_warn("autoindex.skip", "reason", "file_count_command_too_long");
+            return;
+        }
+        FILE *fp = cbm_popen(cmd, "r");
+        if (fp) {
+            char *line = NULL;
+            size_t line_cap = 0;
+            int count = 0;
+            while (cbm_getline(&line, &line_cap, fp) > 0) {
+                count++;
+                if (count > file_limit) {
+                    break;
+                }
+            }
+            free(line);
             if (count > file_limit) {
-                cbm_log_warn("autoindex.skip", "reason", "too_many_files", "files", line, "limit",
+                char count_buf[CBM_SZ_32];
+                snprintf(count_buf, sizeof(count_buf), "%d", count);
+                cbm_log_warn("autoindex.skip", "reason", "too_many_files", "files", count_buf, "limit",
                              CBM_CONFIG_AUTO_INDEX_LIMIT);
                 cbm_pclose(fp);
                 return;
             }
+            cbm_pclose(fp);
         }
-        cbm_pclose(fp);
     }
 
     /* Launch auto-index in background */
@@ -6722,12 +6915,22 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
 static void *update_check_thread(void *arg) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
 
-    /* Use curl with 5s timeout to fetch latest release tag */
-    FILE *fp = cbm_popen("curl -sf --max-time 5 -H 'Accept: application/vnd.github+json' "
-                         "'" UPDATE_CHECK_URL "' 2>/dev/null",
-                         "r");
+    int timeout_s = cbm_mcp_update_check_timeout_s(srv);
+    if (timeout_s <= 0) {
+        return NULL;
+    }
+
+    char cmd[CBM_SZ_512];
+    int cmd_len = snprintf(cmd, sizeof(cmd),
+                           "curl -sf --max-time %d -H 'Accept: application/vnd.github+json' "
+                           "'" UPDATE_CHECK_URL "' 2>/dev/null",
+                           timeout_s);
+    if (cmd_len < 0 || (size_t)cmd_len >= sizeof(cmd)) {
+        return NULL;
+    }
+
+    FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
-        srv->update_checked = true;
         return NULL;
     }
 
@@ -6746,7 +6949,6 @@ static void *update_check_thread(void *arg) {
     /* Parse tag_name from JSON response */
     yyjson_doc *doc = yyjson_read(buf, total, 0);
     if (!doc) {
-        srv->update_checked = true;
         return NULL;
     }
 
@@ -6757,17 +6959,18 @@ static void *update_check_thread(void *arg) {
     if (tag_str) {
         const char *current = cbm_cli_get_version();
         if (cbm_compare_versions(tag_str, current) > 0) {
+            cbm_mutex_lock(&srv->update_notice_lock);
             snprintf(srv->update_notice, sizeof(srv->update_notice),
                      "Update available: %s -> %s -- run: codebase-memory-mcp update  |  "
                      "Enjoying codebase-memory-mcp? Please leave a star: "
                      "https://github.com/DeusData/codebase-memory-mcp",
                      current, tag_str);
+            cbm_mutex_unlock(&srv->update_notice_lock);
             cbm_log_info("update.available", "current", current, "latest", tag_str);
         }
     }
 
     yyjson_doc_free(doc);
-    srv->update_checked = true;
     return NULL;
 }
 
@@ -6783,7 +6986,16 @@ static void start_update_check(cbm_mcp_server_t *srv) {
 
 /* Prepend update notice to a tool result, then clear it (one-shot). */
 static char *inject_update_notice(cbm_mcp_server_t *srv, char *result_json) {
-    if (srv->update_notice[0] == '\0') {
+    if (!srv || !result_json) {
+        return result_json;
+    }
+
+    char notice[sizeof(srv->update_notice)];
+    cbm_mutex_lock(&srv->update_notice_lock);
+    snprintf(notice, sizeof(notice), "%s", srv->update_notice);
+    cbm_mutex_unlock(&srv->update_notice_lock);
+
+    if (notice[0] == '\0') {
         return result_json;
     }
 
@@ -6808,7 +7020,7 @@ static char *inject_update_notice(cbm_mcp_server_t *srv, char *result_json) {
         /* Prepend a text content item with the update notice */
         yyjson_mut_val *notice_item = yyjson_mut_obj(mdoc);
         yyjson_mut_obj_add_str(mdoc, notice_item, "type", "text");
-        yyjson_mut_obj_add_str(mdoc, notice_item, "text", srv->update_notice);
+        yyjson_mut_obj_add_str(mdoc, notice_item, "text", notice);
         yyjson_mut_arr_prepend(content, notice_item);
     }
 
@@ -6818,7 +7030,9 @@ static char *inject_update_notice(cbm_mcp_server_t *srv, char *result_json) {
 
     if (new_json) {
         free(result_json);
-        srv->update_notice[0] = '\0'; /* clear — one-shot */
+        cbm_mutex_lock(&srv->update_notice_lock);
+        srv->update_notice[0] = '\0'; /* clear — one-shot after successful injection */
+        cbm_mutex_unlock(&srv->update_notice_lock);
         return new_json;
     }
     return result_json;
@@ -7404,6 +7618,8 @@ static void handle_content_length_frame(cbm_mcp_server_t *srv, FILE *in, FILE *o
  * Returns: 1 = data ready, 0 = timeout (evicted idle stores), -1 = error/EOF. */
 static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
     struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    int idle_timeout_s = cbm_mcp_store_idle_timeout_s(srv);
+    int poll_timeout_ms = idle_timeout_s * MCP_TIMEOUT_MS;
     int pr = poll(&pfd, SKIP_ONE, 0); /* Phase 1: non-blocking */
 
     if (pr < 0) {
@@ -7417,12 +7633,12 @@ static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
     int saved_flags = fcntl(fd, F_GETFL);
     if (saved_flags < 0) {
         /* fcntl failed — fall through to blocking poll */
-        pr = poll(&pfd, SKIP_ONE, STORE_IDLE_TIMEOUT_S * MCP_TIMEOUT_MS);
+        pr = poll(&pfd, SKIP_ONE, poll_timeout_ms);
         if (pr < 0) {
             return CBM_NOT_FOUND;
         }
         if (pr == 0) {
-            cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
+            cbm_mcp_server_evict_idle(srv, idle_timeout_s);
             return 0;
         }
         return SKIP_ONE;
@@ -7438,12 +7654,12 @@ static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
         }
         clearerr(in);
         /* Phase 3: blocking poll */
-        pr = poll(&pfd, SKIP_ONE, STORE_IDLE_TIMEOUT_S * MCP_TIMEOUT_MS);
+        pr = poll(&pfd, SKIP_ONE, poll_timeout_ms);
         if (pr < 0) {
             return CBM_NOT_FOUND;
         }
         if (pr == 0) {
-            cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
+            cbm_mcp_server_evict_idle(srv, idle_timeout_s);
             return 0;
         }
         return SKIP_ONE;
@@ -7469,7 +7685,7 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
          * buffered FILE*. When a client sends multiple messages in rapid
          * succession, the first getline() call may drain ALL kernel data into
          * libc's internal FILE* buffer. Subsequent poll() calls then see an
-         * empty kernel fd and block for STORE_IDLE_TIMEOUT_S seconds even
+         * empty kernel fd and block for store_idle_timeout_s seconds even
          * though the next messages are already in the FILE* buffer.
          *
          * Fix (Unix): use a three-phase approach —
@@ -7484,12 +7700,13 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
 #ifdef _WIN32
         /* Windows: WaitForSingleObject on stdin handle */
         HANDLE hStdin = (HANDLE)_get_osfhandle(fd);
-        DWORD wr = WaitForSingleObject(hStdin, STORE_IDLE_TIMEOUT_S * MCP_TIMEOUT_MS);
+        int idle_timeout_s = cbm_mcp_store_idle_timeout_s(srv);
+        DWORD wr = WaitForSingleObject(hStdin, (DWORD)(idle_timeout_s * MCP_TIMEOUT_MS));
         if (wr == WAIT_FAILED) {
             break;
         }
         if (wr == WAIT_TIMEOUT) {
-            cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
+            cbm_mcp_server_evict_idle(srv, idle_timeout_s);
             continue;
         }
 #else

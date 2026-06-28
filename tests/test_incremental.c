@@ -18,6 +18,9 @@
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
 #include <foundation/mem.h>
+/* Forward decl (foundation/platform.c): honors CBM_CACHE_DIR so the test reads
+ * the index from the same dir the pipeline writes it (needed for isolation). */
+const char *cbm_resolve_cache_dir(void);
 
 #include <stdarg.h>
 #include <string.h>
@@ -227,13 +230,18 @@ static int incremental_setup(void) {
     if (!g_project)
         return -1;
 
-    const char *home = getenv("HOME");
-    if (!home)
-        home = "/tmp";
-    snprintf(g_dbpath, sizeof(g_dbpath), "%s/.cache/codebase-memory-mcp/%s.db", home, g_project);
+    /* Resolve the cache dir via cbm_resolve_cache_dir() so it honors CBM_CACHE_DIR
+     * and matches the index WRITE path (pipeline.c). Hardcoding ~/.cache here
+     * made get_node_count read from a different dir than the index wrote under
+     * CBM_TEST_ISOLATE, yielding 0-node indexes (and a div-by-zero). */
+    const char *cdir = cbm_resolve_cache_dir();
+    if (!cdir) {
+        cdir = "/tmp";
+    }
+    snprintf(g_dbpath, sizeof(g_dbpath), "%s/%s.db", cdir, g_project);
 
     char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
+    snprintf(cache_dir, sizeof(cache_dir), "%s", cdir);
     cbm_mkdir(cache_dir);
 
     unlink(g_dbpath);

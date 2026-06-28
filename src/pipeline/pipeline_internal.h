@@ -68,6 +68,10 @@ typedef struct {
     int mode;                 /* cbm_index_mode_t (0=full, 1=moderate, 2=fast, 3=advanced) */
     double similarity_threshold; /* Jaccard threshold for SIMILAR edges; <=0 means
                                   * use the CBM_MINHASH_JACCARD_THRESHOLD default (#41). */
+    double httplink_min_confidence;    /* <=0 uses httplink pass default 0.25 */
+    double semantic_threshold;         /* <=0 uses semantic default 0.75 */
+    double githistory_min_coupling;    /* <=0 uses git-history default 0.3 */
+    double lsp_confidence_floor;       /* <=0 uses LSP default 0.6 */
 
     /* Extraction result cache (sequential pipeline optimization).
      * When non-NULL, pass_definitions stores results here instead of freeing,
@@ -189,6 +193,10 @@ typedef struct {
  * Caller owns out[]. */
 int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_count,
                                 cbm_change_coupling_t *out, int max_out);
+int cbm_compute_change_coupling_with_threshold(const cbm_commit_files_t *commits,
+                                               int commit_count,
+                                               cbm_change_coupling_t *out, int max_out,
+                                               double min_coupling_score);
 
 /* Go-style implicit interface satisfaction on graph buffer.
  * Finds Interface nodes, matches method sets against Class nodes,
@@ -494,6 +502,9 @@ typedef struct {
 /* Compute change couplings without touching the graph buffer.
  * Can run on a separate thread while other passes use the gbuf. */
 int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result_t *result);
+int cbm_pipeline_githistory_compute_with_threshold(const char *repo_path,
+                                                   cbm_githistory_result_t *result,
+                                                   double min_coupling_score);
 
 /* Apply pre-computed couplings to the graph buffer (main thread only). */
 int cbm_pipeline_githistory_apply(cbm_pipeline_ctx_t *ctx, const cbm_githistory_result_t *result);

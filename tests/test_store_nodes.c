@@ -988,8 +988,9 @@ TEST(store_integrity_windows_lowercase_drive_issue367) {
     PASS();
 }
 
-TEST(store_integrity_corrupt_too_many_rows) {
-    /* Simulate corruption: >5 rows in projects table */
+TEST(store_integrity_multiple_project_rows_allowed) {
+    /* Dependency projects are stored in the parent DB, so a valid store may
+     * contain more than one projects row. Row count alone is not corruption. */
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
     sqlite3 *db = cbm_store_get_db(s);
@@ -1001,7 +1002,7 @@ TEST(store_integrity_corrupt_too_many_rows) {
                  i, i);
         sqlite3_exec(db, sql, NULL, NULL, NULL);
     }
-    ASSERT_FALSE(cbm_store_check_integrity(s));
+    ASSERT_TRUE(cbm_store_check_integrity(s));
     cbm_store_close(s);
     PASS();
 }
@@ -1037,7 +1038,7 @@ TEST(store_integrity_full_path_only_classification) {
     ASSERT_FALSE(cbm_store_check_integrity_full(s, &path_only));
     ASSERT_TRUE(path_only);
 
-    /* Too many rows: fails, path_only == false (genuine corruption). */
+    /* Many valid project rows are allowed and are not a path-only failure. */
     sqlite3_exec(db, "DELETE FROM projects;", NULL, NULL, NULL);
     for (int i = 0; i < 10; i++) {
         char sql[256];
@@ -1048,7 +1049,7 @@ TEST(store_integrity_full_path_only_classification) {
         sqlite3_exec(db, sql, NULL, NULL, NULL);
     }
     path_only = true;
-    ASSERT_FALSE(cbm_store_check_integrity_full(s, &path_only));
+    ASSERT_TRUE(cbm_store_check_integrity_full(s, &path_only));
     ASSERT_FALSE(path_only);
 
     cbm_store_close(s);
@@ -1590,7 +1591,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_integrity_empty);
     RUN_TEST(store_integrity_corrupt_bad_path);
     RUN_TEST(store_integrity_windows_lowercase_drive_issue367);
-    RUN_TEST(store_integrity_corrupt_too_many_rows);
+    RUN_TEST(store_integrity_multiple_project_rows_allowed);
     RUN_TEST(store_integrity_null_check);
     RUN_TEST(store_integrity_full_path_only_classification);
     RUN_TEST(store_project_crud);

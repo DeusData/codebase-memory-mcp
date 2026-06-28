@@ -8,6 +8,7 @@
 #include "foundation/compat.h"
 #include "foundation/platform.h"
 #include "foundation/constants.h"
+#include "foundation/str_util.h"
 
 /* CLI buffer size constants. */
 enum {
@@ -409,7 +410,10 @@ int cbm_replace_binary(const char *path, const unsigned char *data, int len, int
 #ifdef _WIN32
             /* Windows: can't unlink running .exe — rename aside */
             char old_path[CLI_BUF_1K];
-            snprintf(old_path, sizeof(old_path), "%s.old", path);
+            int old_len = snprintf(old_path, sizeof(old_path), "%s.old", path);
+            if (old_len < 0 || (size_t)old_len >= sizeof(old_path)) {
+                return CLI_ERR;
+            }
             (void)cbm_unlink(old_path);
             if (rename(path, old_path) != 0) {
                 return CLI_ERR;
@@ -2454,11 +2458,23 @@ int cbm_remove_indexes(const char *home_dir) {
         size_t len = strlen(ent->name);
         if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
             char path[CLI_BUF_1K];
-            snprintf(path, sizeof(path), "%s/%s", cache_dir, ent->name);
+            int path_len = snprintf(path, sizeof(path), "%s/%s", cache_dir, ent->name);
+            if (path_len < 0 || (size_t)path_len >= sizeof(path)) {
+                (void)fprintf(stderr,
+                              "warning: skipping index cleanup entry with overlong path: %s/%s\n",
+                              cache_dir, ent->name);
+                continue;
+            }
             /* Also remove .db.tmp if present */
             char tmp_path[CLI_FIELD_1040];
-            snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
-            cbm_unlink(tmp_path);
+            int tmp_len = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+            if (tmp_len >= 0 && (size_t)tmp_len < sizeof(tmp_path)) {
+                cbm_unlink(tmp_path);
+            } else {
+                (void)fprintf(stderr,
+                              "warning: skipping overlong temporary sidecar cleanup for %s\n",
+                              path);
+            }
             if (cbm_unlink(path) == 0) {
                 count++;
             }
@@ -2673,6 +2689,12 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "The architecture resource ranks every symbol by PageRank importance and returns the top N. "
      "Use 25 for most projects. Raise to 50-100 for large multi-language codebases where "
      "important functions may not appear in the first 25. Lower to 10 when tokens are limited."},
+    {"context_key_functions_limit", "10", NULL, "Search",
+     "Max key functions PUSHED in the first-response _context header (0 = use built-in 10)",
+     "0-100",
+     "Separate from key_functions_count (the architecture query bound) — this governs only the "
+     "auto-pushed summary that closes the codebase://architecture pull-only gap. Kept small (10) "
+     "to keep first-response token cost modest; raise to 20-25 if you want richer upfront context."},
     /* ── Tools ── */
     {"tool_mode", "streamlined", "CBM_TOOL_MODE", "Tools",
      "Which set of tools the MCP server exposes: 5 default tools or all 15 individual tools",
@@ -2719,6 +2741,18 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "20 iterations converges in ~5ms for 16K-node codebases. Typical convergence is 10-15 iters. "
      "Raise to 50-100 for very large codebases (>100K nodes). "
      "Diminishing returns above convergence — set too high wastes CPU at reindex time."},
+    {"pagerank_damping", "0.85", NULL, "PageRank",
+     "Damping factor — fraction of importance that follows edges vs. teleports randomly (the 'bored surfer')",
+     "0.0-1.0",
+     "0.85 is the standard Google PageRank value. Higher (0.9) spreads importance further along long "
+     "call chains; lower (0.7-0.8) keeps importance local to direct callers. Out-of-range and NaN "
+     "values are clamped to 0.85 at compute time, so an invalid value never crashes indexing."},
+    {"pagerank_epsilon", "0.000001", NULL, "PageRank",
+     "Convergence threshold — PageRank stops early when the L2 change between iterations drops below this",
+     "0.0-1.0",
+     "1e-6 default. Lower (1e-8) iterates longer for marginally finer convergence (rarely needed); "
+     "higher (1e-4) stops sooner with slightly less precise rankings. Must be > 0 — non-positive and "
+     "NaN values are clamped to 1e-6. Rarely needs tuning; pair with pagerank_max_iter as the hard cap."},
     {"rank_scope", "project", NULL, "PageRank",
      "Whether PageRank importance is computed per-project or across all indexed projects",
      "project|full",
@@ -2811,6 +2845,21 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "100-3600000",
      "60 seconds for repos with 50K+ files. Lower to 10000 for faster detection in large repos "
      "if CPU allows. Formula: min(base + file_count/500 * 1000, max)."},
+    {"store_idle_timeout_s", "60", NULL, "MCP",
+     "Seconds an MCP server keeps an idle SQLite project store open",
+     "1-65536",
+     "60 seconds balances latency for repeated tool calls with memory release while idle. Lower for "
+     "memory-constrained hosts; raise for long interactive sessions that repeatedly query one project."},
+    {"db_validate_busy_timeout_ms", "1000", NULL, "MCP",
+     "SQLite busy timeout for read-only cache database validation in MCP startup/discovery paths",
+     "0-65536",
+     "1 second avoids hanging JSON-RPC startup on locked databases. Raise on slow network filesystems; "
+     "set 0 to fail immediately."},
+    {"update_check_timeout_s", "5", NULL, "MCP",
+     "Curl timeout for the optional MCP background latest-release check (0=disabled)",
+     "0-256",
+     "Default preserves the historical 5-second bound. Set 0 for offline, hermetic, or privacy-sensitive "
+     "MCP deployments where the server must not make background network requests."},
     /* ── Architecture ── */
     {"arch_hotspot_limit", "25", NULL, "Architecture",
      "Max hotspot functions shown in the classic get_architecture tool's hotspots section",
@@ -2819,6 +2868,40 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "They identify the most-invoked code — good candidates for optimization and risk assessment. "
      "25 is enough for orientation; raise to 100 for exhaustive call-density analysis. "
      "Only applies to the classic 'get_architecture' tool (tool_mode=classic)."},
+    {"architecture_resolution", "1.0", NULL, "Architecture",
+     "Leiden community-detection resolution for architecture clusters",
+     "0.0001-10.0",
+     "1.0 is the standard Leiden default. Higher (2.0-5.0) splits code into more, finer-grained "
+     "clusters; lower (0.3-0.5) merges related clusters into coarse subsystems. Non-positive and "
+     "NaN values are clamped to 1.0. Drives the 'clusters' section of get_architecture."},
+    /* ── Similarity ── */
+    {"similarity_threshold", "0.0", NULL, "Similarity",
+     "MinHash Jaccard threshold for semantic SIMILAR edges (0.0 = use the built-in 0.95 default)",
+     "0.0-1.0",
+     "Two symbols get a SIMILAR edge when their estimated Jaccard similarity is at least this. "
+     "0.0 (default) uses the built-in 0.95, so only near-duplicates are linked. Lower to 0.7-0.8 to "
+     "surface more semantic duplicates (refactoring candidates); too low adds noisy edges that inflate "
+     "PageRank rankings. Effective only when indexing creates similarity edges (full/moderate modes)."},
+    {"semantic_threshold", "0.0", NULL, "Similarity",
+     "Combined semantic score threshold for SEMANTICALLY_RELATED edges (0.0 = built-in 0.75)",
+     "0.0-1.0",
+     "Controls the algorithmic semantic-edge pass. Higher values improve precision and reduce edge count; "
+     "lower values increase recall and runtime output volume. 0.0 preserves the upstream-compatible default."},
+    {"httplink_min_confidence", "0.0", NULL, "Similarity",
+     "Minimum confidence for HTTP route-to-call linking (0.0 = built-in 0.25)",
+     "0.0-1.0",
+     "Raises or lowers the fork-only HTTP linker's match threshold. Higher values reduce speculative "
+     "cross-service HTTP_CALLS edges; 0.0 keeps existing behavior."},
+    {"githistory_min_coupling", "0.0", NULL, "Similarity",
+     "Minimum file co-change coupling score for FILE_CHANGES_WITH edges (0.0 = built-in 0.3)",
+     "0.0-1.0",
+     "Controls how strongly two files must co-change before git-history coupling emits an edge. "
+     "Higher values reduce noisy historical edges; 0.0 keeps existing behavior."},
+    {"lsp_confidence_floor", "0.0", NULL, "Similarity",
+     "Minimum LSP-resolved call confidence accepted by call resolution (0.0 = built-in 0.6)",
+     "0.0-1.0",
+     "Applies consistently to sequential and parallel call resolution. Raise to prefer registry matches "
+     "over uncertain LSP hints; lower only when language-specific LSP coverage is known to be precise."},
     /* ── Degree / Sort ── */
     {"degree_mode", "weighted", NULL, "Degree",
      "What 'degree' means for min_degree/max_degree filters and sort_by=degree ranking",
@@ -3061,15 +3144,19 @@ static bool prompt_yn(const char *question) {
 /* Compute SHA-CBM_SZ_256 of a file using platform tools (sha256sum/shasum).
  * Writes CBM_SZ_64-char hex digest + NUL to out. Returns 0 on success. */
 static int sha256_file(const char *path, char *out, size_t out_size) {
-    if (out_size < SHA256_BUF_SIZE) {
+    if (!path || !cbm_validate_shell_arg(path) || out_size < SHA256_BUF_SIZE) {
         return CLI_ERR;
     }
     char cmd[CLI_BUF_1K];
+    int cmd_len;
 #ifdef __APPLE__
-    snprintf(cmd, sizeof(cmd), "shasum -a CBM_SZ_256 '%s' 2>/dev/null", path);
+    cmd_len = snprintf(cmd, sizeof(cmd), "shasum -a CBM_SZ_256 '%s' 2>/dev/null", path);
 #else
-    snprintf(cmd, sizeof(cmd), "sha256sum '%s' 2>/dev/null", path);
+    cmd_len = snprintf(cmd, sizeof(cmd), "sha256sum '%s' 2>/dev/null", path);
 #endif
+    if (cmd_len < 0 || (size_t)cmd_len >= sizeof(cmd)) {
+        return CLI_ERR;
+    }
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
         return CLI_ERR;
@@ -3099,6 +3186,24 @@ static int cbm_download_to_file(const char *url, const char *dest) {
 static int cbm_download_to_file_quiet(const char *url, const char *dest) {
     const char *argv[] = {"curl", "-fsSL", "-o", dest, url, NULL};
     return cbm_exec_no_shell(argv);
+}
+
+static int cbm_cli_make_temp_file(char *out, size_t out_sz, const char *prefix) {
+    if (!out || out_sz == 0 || !prefix || !prefix[0]) {
+        errno = EINVAL;
+        return CLI_ERR;
+    }
+    int n = snprintf(out, out_sz, "%s/%s_XXXXXX", cbm_tmpdir(), prefix);
+    if (n < 0 || (size_t)n >= out_sz) {
+        errno = ENAMETOOLONG;
+        return CLI_ERR;
+    }
+    int fd = cbm_mkstemp_s(out, out_sz);
+    if (fd < 0) {
+        return CLI_ERR;
+    }
+    cbm_close_fd(fd);
+    return 0;
 }
 
 /* ── macOS ad-hoc signing ─────────────────────────────────────── */
@@ -3151,19 +3256,29 @@ static int cbm_kill_other_instances(void) {
 /* Download checksums.txt and verify the archive integrity.
  * Returns: 0 = verified OK, 1 = mismatch (FAIL), -1 = could not verify (warning). */
 static int verify_download_checksum(const char *archive_path, const char *archive_name) {
-    char checksum_file[CLI_BUF_256];
-    snprintf(checksum_file, sizeof(checksum_file), "%s/cbm-checksums.txt", cbm_tmpdir());
+    char checksum_file[CBM_PATH_MAX];
+    if (cbm_cli_make_temp_file(checksum_file, sizeof(checksum_file), "cbm-checksums") != 0) {
+        (void)fprintf(stderr,
+                      "warning: could not create temporary checksum file — skipping verification\n");
+        return CLI_ERR;
+    }
 
     char dl_base_buf[CLI_BUF_512];
     const char *dl_base =
         cbm_safe_getenv("CBM_DOWNLOAD_URL", dl_base_buf, sizeof(dl_base_buf), NULL);
     char checksum_url[CLI_BUF_512];
+    int url_len;
     if (dl_base && dl_base[0]) {
-        snprintf(checksum_url, sizeof(checksum_url), "%s/checksums.txt", dl_base);
+        url_len = snprintf(checksum_url, sizeof(checksum_url), "%s/checksums.txt", dl_base);
     } else {
-        snprintf(checksum_url, sizeof(checksum_url), "%s",
-                 "https://github.com/DeusData/codebase-memory-mcp/releases/latest/download/"
-                 "checksums.txt");
+        url_len = snprintf(checksum_url, sizeof(checksum_url), "%s",
+                           "https://github.com/DeusData/codebase-memory-mcp/releases/latest/download/"
+                           "checksums.txt");
+    }
+    if (url_len < 0 || (size_t)url_len >= sizeof(checksum_url)) {
+        (void)fprintf(stderr, "warning: checksum URL too long — skipping verification\n");
+        cbm_unlink(checksum_file);
+        return CLI_ERR;
     }
     int rc = cbm_download_to_file_quiet(checksum_url, checksum_file);
     if (rc != 0) {
@@ -3174,8 +3289,8 @@ static int verify_download_checksum(const char *archive_path, const char *archiv
     }
 
     FILE *fp = fopen(checksum_file, "r");
-    cbm_unlink(checksum_file);
     if (!fp) {
+        cbm_unlink(checksum_file);
         return CLI_ERR;
     }
 
@@ -3190,6 +3305,7 @@ static int verify_download_checksum(const char *archive_path, const char *archiv
         }
     }
     (void)fclose(fp);
+    cbm_unlink(checksum_file);
 
     if (expected[0] == '\0') {
         (void)fprintf(stderr, "warning: %s not found in checksums.txt\n", archive_name);
@@ -4158,7 +4274,7 @@ static int extract_and_install_binary(extract_install_args_t args) {
 }
 
 /* Build the download URL for the update command. */
-static void build_update_url(char *url, int url_sz, const char *os, const char *arch,
+static int build_update_url(char *url, int url_sz, const char *os, const char *arch,
                              const char *ext, bool want_ui) {
     char base_url_buf[CLI_BUF_512];
     const char *base_url =
@@ -4171,8 +4287,9 @@ static void build_update_url(char *url, int url_sz, const char *os, const char *
      * have no such variant. Keep in sync with install.sh / install.js / pypi
      * _cli.py. */
     const char *portable = (strcmp(os, "linux") == 0) ? "-portable" : "";
-    snprintf(url, url_sz, "%s/codebase-memory-mcp-%s%s-%s%s.%s", base_url, want_ui ? "ui-" : "", os,
-             arch, portable, ext);
+    int n = snprintf(url, (size_t)url_sz, "%s/codebase-memory-mcp-%s%s-%s%s.%s", base_url,
+                     want_ui ? "ui-" : "", os, arch, portable, ext);
+    return (n >= 0 && n < url_sz) ? 0 : CLI_ERR;
 }
 
 /* Prompt to delete existing indexes. Returns 0 to continue, 1 to abort. */
@@ -4200,8 +4317,11 @@ static int update_clear_indexes(const char *home, bool dry_run) {
 /* Download, verify checksum, kill old instances, and install binary. Returns 0 on success. */
 static int download_verify_install(const char *url, const char *ext, const char *os,
                                    const char *arch, bool want_ui, const char *bin_dest) {
-    char tmp_archive[CLI_BUF_256];
-    snprintf(tmp_archive, sizeof(tmp_archive), "%s/cbm-update.%s", cbm_tmpdir(), ext);
+    char tmp_archive[CBM_PATH_MAX];
+    if (cbm_cli_make_temp_file(tmp_archive, sizeof(tmp_archive), "cbm-update") != 0) {
+        (void)fprintf(stderr, "error: cannot create temporary update archive path\n");
+        return CLI_TRUE;
+    }
 
     int rc = cbm_download_to_file(url, tmp_archive);
     if (rc != 0) {
@@ -4384,7 +4504,10 @@ int cbm_cmd_update(int argc, char **argv) {
     const char *ext = strcmp(os, "windows") == 0 ? "zip" : "tar.gz";
 
     char url[CLI_BUF_512];
-    build_update_url(url, sizeof(url), os, arch, ext, want_ui);
+    if (build_update_url(url, sizeof(url), os, arch, ext, want_ui) != 0) {
+        (void)fprintf(stderr, "error: update download URL is too long\n");
+        return CLI_TRUE;
+    }
 
     if (dry_run) {
         printf("\nWould download %s binary for %s/%s ...\n", variant_label, os, arch);

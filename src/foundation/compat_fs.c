@@ -5,8 +5,10 @@
  * Windows: FindFirstFile/FindNextFile, _popen/_pclose, _mkdir, _unlink.
  */
 #include "foundation/constants.h"
+#include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -181,6 +183,40 @@ int cbm_rmdir(const char *path) {
     return ret;
 }
 
+int cbm_replace_file_ex(const char *tmp_path, const char *dest_path, int *platform_error) {
+    if (platform_error) {
+        *platform_error = 0;
+    }
+    if (!tmp_path || !dest_path) {
+        if (platform_error) {
+            *platform_error = ERROR_INVALID_PARAMETER;
+        }
+        return CBM_NOT_FOUND;
+    }
+    wchar_t *wtmp = cbm_utf8_to_wide(tmp_path);
+    wchar_t *wdest = cbm_utf8_to_wide(dest_path);
+    if (!wtmp || !wdest) {
+        if (platform_error) {
+            *platform_error = ERROR_NOT_ENOUGH_MEMORY;
+        }
+        free(wtmp);
+        free(wdest);
+        return CBM_NOT_FOUND;
+    }
+    BOOL ok = MoveFileExW(wtmp, wdest, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    DWORD err = ok ? 0 : GetLastError();
+    free(wtmp);
+    free(wdest);
+    if (!ok && platform_error) {
+        *platform_error = (int)err;
+    }
+    return ok ? 0 : CBM_NOT_FOUND;
+}
+
+int cbm_replace_file(const char *tmp_path, const char *dest_path) {
+    return cbm_replace_file_ex(tmp_path, dest_path, NULL);
+}
+
 int cbm_exec_no_shell(const char *const *argv) {
     if (!argv || !argv[0]) {
         return CBM_NOT_FOUND;
@@ -293,6 +329,29 @@ int cbm_rmdir(const char *path) {
     return rmdir(path);
 }
 
+int cbm_replace_file_ex(const char *tmp_path, const char *dest_path, int *platform_error) {
+    if (platform_error) {
+        *platform_error = 0;
+    }
+    if (!tmp_path || !dest_path) {
+        if (platform_error) {
+            *platform_error = EINVAL;
+        }
+        return CBM_NOT_FOUND;
+    }
+    if (rename(tmp_path, dest_path) != 0) {
+        if (platform_error) {
+            *platform_error = errno;
+        }
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+}
+
+int cbm_replace_file(const char *tmp_path, const char *dest_path) {
+    return cbm_replace_file_ex(tmp_path, dest_path, NULL);
+}
+
 int cbm_exec_no_shell(const char *const *argv) {
     if (!argv || !argv[0]) {
         return CBM_NOT_FOUND;
@@ -331,3 +390,68 @@ int cbm_exec_no_shell(const char *const *argv) {
 }
 
 #endif /* _WIN32 */
+
+static void set_file_error(cbm_file_error_t *out, const char *stage, int code) {
+    if (out) {
+        out->stage = stage;
+        out->code = code;
+    }
+}
+
+int cbm_write_file_atomic(const char *dest_path, const void *data, size_t len,
+                          cbm_file_error_t *out_err) {
+    set_file_error(out_err, NULL, 0);
+    if (!dest_path || (!data && len > 0)) {
+        set_file_error(out_err, "invalid_argument", EINVAL);
+        return CBM_NOT_FOUND;
+    }
+
+    char tmp_path[CBM_PATH_MAX];
+    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.XXXXXX", dest_path);
+    if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
+        set_file_error(out_err, "path_too_long", 0);
+        return CBM_NOT_FOUND;
+    }
+
+    int fd = cbm_mkstemp_s(tmp_path, sizeof(tmp_path));
+    if (fd < 0) {
+        set_file_error(out_err, "open_temp", errno);
+        return CBM_NOT_FOUND;
+    }
+
+#ifdef _WIN32
+    FILE *fp = _fdopen(fd, "wb");
+#else
+    FILE *fp = fdopen(fd, "wb");
+#endif
+    if (!fp) {
+        int code = errno;
+        cbm_close_fd(fd);
+        cbm_unlink(tmp_path);
+        set_file_error(out_err, "open_temp", code);
+        return CBM_NOT_FOUND;
+    }
+
+    if (len > 0 && fwrite(data, 1, len, fp) != len) {
+        int code = ferror(fp) ? errno : 0;
+        (void)fclose(fp);
+        cbm_unlink(tmp_path);
+        set_file_error(out_err, "write_temp", code);
+        return CBM_NOT_FOUND;
+    }
+
+    if (fclose(fp) != 0) {
+        int code = errno;
+        cbm_unlink(tmp_path);
+        set_file_error(out_err, "close_temp", code);
+        return CBM_NOT_FOUND;
+    }
+
+    int replace_error = 0;
+    if (cbm_replace_file_ex(tmp_path, dest_path, &replace_error) != 0) {
+        cbm_unlink(tmp_path);
+        set_file_error(out_err, "rename_temp", replace_error);
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+}

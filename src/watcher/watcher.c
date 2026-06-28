@@ -62,10 +62,6 @@ struct cbm_watcher {
 
 /* ── Constants ─────────────────────────────────────────────────── */
 
-/* Time unit conversions */
-#define NS_PER_SEC 1000000000LL
-#define US_PER_MS 1000000LL
-
 /* Adaptive poll interval parameters (ms) */
 #define POLL_BASE_MS 5000
 #define POLL_FILE_STEP 500 /* add 1s per this many files */
@@ -79,7 +75,7 @@ struct cbm_watcher {
 static int64_t now_ns(void) {
     struct timespec ts;
     cbm_clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ((int64_t)ts.tv_sec * NS_PER_SEC) + ts.tv_nsec;
+    return ((int64_t)ts.tv_sec * (int64_t)CBM_NSEC_PER_SEC) + ts.tv_nsec;
 }
 
 /* ── Adaptive interval ──────────────────────────────────────────── */
@@ -399,7 +395,7 @@ static void init_baseline(project_state_t *s, const cbm_watcher_t *w) {
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "none");
     }
 
-    s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
+    s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * (int64_t)CBM_NSEC_PER_MSEC);
 }
 
 /* Check if a project has changes. Returns true if reindex needed. */
@@ -469,7 +465,7 @@ static void poll_project(const char *key, void *val, void *ud) {
     /* Check for changes */
     bool changed = check_changes(s);
     if (!changed) {
-        s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
+        s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * (int64_t)CBM_NSEC_PER_MSEC);
         return;
     }
 
@@ -491,7 +487,7 @@ static void poll_project(const char *key, void *val, void *ud) {
         }
     }
 
-    s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
+    s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * (int64_t)CBM_NSEC_PER_MSEC);
 }
 
 /* Callback to snapshot project state pointers into an array. */

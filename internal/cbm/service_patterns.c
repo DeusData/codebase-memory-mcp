@@ -649,8 +649,9 @@ static bool has_filesystem_extension(const char *path) {
 
     static const char *const hard_file_exts[] = {
         ".cfg",  ".conf",   ".credentials", ".crt",  ".db",         ".env",
-        ".ini",  ".key",    ".pem",         ".pid",  ".properties", ".service",
-        ".sock", ".socket", ".sqlite",      ".toml", NULL};
+        ".ini",  ".key",    ".log",         ".md",   ".pdf",        ".pem",
+        ".pid",  ".properties", ".rst",     ".service", ".sock",    ".socket",
+        ".sqlite", ".toml", ".txt",         NULL};
     for (int i = 0; hard_file_exts[i]; i++) {
         if (path_ext_matches(ext, hard_file_exts[i])) {
             return true;
@@ -716,6 +717,11 @@ bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *
     if (!path || !path[0]) {
         return false;
     }
+    /* Routes never contain whitespace; reject command/description strings
+     * (e.g. "/autorun test task description") that start with '/'. */
+    if (strpbrk(path, " \t\r\n")) {
+        return false;
+    }
     if (strncmp(path, "http://", 7) == 0 || strncmp(path, "https://", 8) == 0) {
         return true;
     }
@@ -724,6 +730,16 @@ bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *
     }
     if (path[0] != '/') {
         return false;
+    }
+    /* Reject CLI slash-command syntax ("/ar:allow", "/gh:pr") without blocking
+     * ordinary route parameters in later segments ("/teams/:team/users/:id"). */
+    const char *first_slash = strchr(path + 1, '/');
+    size_t first_segment_len = first_slash ? (size_t)(first_slash - (path + 1)) : strlen(path + 1);
+    if (first_segment_len > 0) {
+        const char *colon = memchr(path + 1, ':', first_segment_len);
+        if (colon && path[1] != ':') {
+            return false;
+        }
     }
     if (callee_is_delimiter_or_filesystem_builder(callee_name)) {
         return false;
