@@ -3,7 +3,7 @@
  *
  * §4b: the search_code_graph mega-tool was deleted; the default surface is now
  * 5 focused tools: search_graph, query_graph, search_code (from TOOLS[]) plus
- * trace_call_path and get_code (from STREAMLINED_TOOLS[]). Covers tool
+ * trace_path and get_code (from STREAMLINED_TOOLS[]). Covers tool
  * visibility, split-tool dispatch, get_code alias dispatch, project param path
  * support, and tool config visibility.
  */
@@ -64,6 +64,64 @@ static size_t tool_list_exact_count(const char *json) {
     return count;
 }
 
+static bool tool_schema_has_property(const char *json, const char *tool, const char *prop) {
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) return false;
+    const yyjson_val *tools = tool_array_from_doc(doc);
+    bool found = false;
+    if (tools) {
+        yyjson_arr_iter it;
+        yyjson_arr_iter_init((yyjson_val *)tools, &it);
+        yyjson_val *item;
+        while ((item = yyjson_arr_iter_next(&it)) != NULL) {
+            yyjson_val *name = yyjson_obj_get(item, "name");
+            if (!name || !yyjson_is_str(name) || strcmp(yyjson_get_str(name), tool) != 0) {
+                continue;
+            }
+            yyjson_val *schema = yyjson_obj_get(item, "inputSchema");
+            yyjson_val *props = schema ? yyjson_obj_get(schema, "properties") : NULL;
+            found = props && yyjson_obj_get(props, prop) != NULL;
+            break;
+        }
+    }
+    yyjson_doc_free(doc);
+    return found;
+}
+
+static bool tool_schema_required_has(const char *json, const char *tool, const char *prop) {
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) return false;
+    const yyjson_val *tools = tool_array_from_doc(doc);
+    bool found = false;
+    if (tools) {
+        yyjson_arr_iter it;
+        yyjson_arr_iter_init((yyjson_val *)tools, &it);
+        yyjson_val *item;
+        while ((item = yyjson_arr_iter_next(&it)) != NULL) {
+            yyjson_val *name = yyjson_obj_get(item, "name");
+            if (!name || !yyjson_is_str(name) || strcmp(yyjson_get_str(name), tool) != 0) {
+                continue;
+            }
+            yyjson_val *schema = yyjson_obj_get(item, "inputSchema");
+            yyjson_val *required = schema ? yyjson_obj_get(schema, "required") : NULL;
+            if (required && yyjson_is_arr(required)) {
+                yyjson_arr_iter rit;
+                yyjson_arr_iter_init(required, &rit);
+                yyjson_val *r;
+                while ((r = yyjson_arr_iter_next(&rit)) != NULL) {
+                    if (yyjson_is_str(r) && strcmp(yyjson_get_str(r), prop) == 0) {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+    }
+    yyjson_doc_free(doc);
+    return found;
+}
+
 static char *save_tool_mode(void) {
     const char *mode = getenv("CBM_TOOL_MODE");
     if (!mode) return NULL;
@@ -88,14 +146,14 @@ static void restore_tool_mode(char *saved) {
 TEST(streamlined_mode_shows_5_default_tools) {
     /* NULL srv → streamlined mode (no config available).
      * §4b: default surface is 5 tools — search_graph, query_graph, search_code,
-     * trace_call_path, get_code. The search_code_graph mega-tool is gone. */
+     * trace_path, get_code. The search_code_graph mega-tool is gone. */
     char *json = cbm_mcp_tools_list(NULL);
     ASSERT_NOT_NULL(json);
     /* The 5 default-surface tools must be present */
     ASSERT_NOT_NULL(strstr(json, "search_graph"));
     ASSERT_NOT_NULL(strstr(json, "query_graph"));
     ASSERT_NOT_NULL(strstr(json, "search_code"));
-    ASSERT_NOT_NULL(strstr(json, "trace_call_path"));
+    ASSERT_NOT_NULL(strstr(json, "trace_path"));
     ASSERT_NOT_NULL(strstr(json, "get_code"));
     /* The deleted mega-tool must NOT appear */
     ASSERT_NULL(strstr(json, "search_code_graph"));
@@ -122,7 +180,7 @@ TEST(classic_mode_shows_all_15_tools) {
     ASSERT_NOT_NULL(strstr(resp, "search_graph"));
     ASSERT_NOT_NULL(strstr(resp, "query_graph"));
     ASSERT_NOT_NULL(strstr(resp, "search_code"));
-    ASSERT_NOT_NULL(strstr(resp, "trace_call_path"));
+    ASSERT_NOT_NULL(strstr(resp, "trace_path"));
     ASSERT_NOT_NULL(strstr(resp, "get_code"));
     /* The deleted mega-tool must NOT appear */
     ASSERT_NULL(strstr(resp, "search_code_graph"));
@@ -144,7 +202,7 @@ TEST(api_surface_default_streamlined_regression_gate) {
     ASSERT(tool_list_has_exact_name(json, "search_graph"));
     ASSERT(tool_list_has_exact_name(json, "query_graph"));
     ASSERT(tool_list_has_exact_name(json, "search_code"));
-    ASSERT(tool_list_has_exact_name(json, "trace_call_path"));
+    ASSERT(tool_list_has_exact_name(json, "trace_path"));
     ASSERT(tool_list_has_exact_name(json, "get_code"));
     ASSERT(tool_list_has_exact_name(json, "_hidden_tools"));
 
@@ -169,7 +227,7 @@ TEST(api_surface_classic_regression_gate) {
     ASSERT(tool_list_has_exact_name(json, "index_repository"));
     ASSERT(tool_list_has_exact_name(json, "search_graph"));
     ASSERT(tool_list_has_exact_name(json, "query_graph"));
-    ASSERT(tool_list_has_exact_name(json, "trace_call_path"));
+    ASSERT(tool_list_has_exact_name(json, "trace_path"));
     ASSERT(tool_list_has_exact_name(json, "get_code_snippet"));
     ASSERT(tool_list_has_exact_name(json, "get_graph_schema"));
     ASSERT(tool_list_has_exact_name(json, "get_architecture"));
@@ -211,11 +269,107 @@ TEST(hidden_tools_reveal_discoverable_tools) {
     ASSERT(tool_list_has_exact_name(after, "get_code_snippet"));
     ASSERT(tool_list_has_exact_name(after, "get_architecture"));
     ASSERT(tool_list_has_exact_name(after, "index_dependencies"));
+    ASSERT(tool_list_has_exact_name(after, "trace_path"));
     ASSERT(tool_list_has_exact_name(after, "_hidden_tools"));
     ASSERT_EQ(17, tool_list_exact_count(after));
     free(after);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(streamlined_reveal_covers_classic_capabilities) {
+    char *saved_mode = save_tool_mode();
+
+    setenv("CBM_TOOL_MODE", "classic", 1);
+    char *classic = cbm_mcp_tools_list(NULL);
+    unsetenv("CBM_TOOL_MODE");
+    ASSERT_NOT_NULL(classic);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *hint = cbm_mcp_handle_tool(srv, "_hidden_tools", "{}");
+    ASSERT_NOT_NULL(hint);
+    free(hint);
+
+    char *revealed = cbm_mcp_tools_list(srv);
+    ASSERT_NOT_NULL(revealed);
+
+    const char *classic_tools[] = {
+        "index_repository", "search_graph", "query_graph", "trace_path",
+        "get_code_snippet", "get_graph_schema", "get_architecture",
+        "search_code", "list_projects", "delete_project", "index_status",
+        "detect_changes", "manage_adr", "ingest_traces", "index_dependencies",
+    };
+    for (size_t i = 0; i < sizeof(classic_tools) / sizeof(classic_tools[0]); i++) {
+        ASSERT(tool_list_has_exact_name(classic, classic_tools[i]));
+        ASSERT(tool_list_has_exact_name(revealed, classic_tools[i]));
+    }
+
+    /* Streamlined keeps get_code as the concise source-retrieval spelling, but
+     * reveal also exposes get_code_snippet for full upstream/classic parity. */
+    ASSERT(tool_list_has_exact_name(revealed, "get_code"));
+    ASSERT(tool_list_has_exact_name(revealed, "_hidden_tools"));
+    ASSERT(!tool_list_has_exact_name(classic, "get_code"));
+    ASSERT(!tool_list_has_exact_name(classic, "_hidden_tools"));
+
+    free(revealed);
+    cbm_mcp_server_free(srv);
+    free(classic);
+    restore_tool_mode(saved_mode);
+    PASS();
+}
+
+TEST(streamlined_core_parameter_contract) {
+    char *saved_mode = save_tool_mode();
+    unsetenv("CBM_TOOL_MODE");
+
+    char *json = cbm_mcp_tools_list(NULL);
+    restore_tool_mode(saved_mode);
+    ASSERT_NOT_NULL(json);
+
+    const char *search_params[] = {
+        "project", "label", "name_pattern", "qn_pattern", "file_pattern",
+        "semantic_query", "relationship", "min_degree", "max_degree",
+        "exclude_entry_points", "include_connected", "limit", "offset",
+        "sort_by", "mode", "compact", "include_dependencies", "exclude",
+    };
+    for (size_t i = 0; i < sizeof(search_params) / sizeof(search_params[0]); i++) {
+        ASSERT(tool_schema_has_property(json, "search_graph", search_params[i]));
+    }
+
+    const char *query_params[] = {"query", "project", "max_rows", "max_output_bytes"};
+    for (size_t i = 0; i < sizeof(query_params) / sizeof(query_params[0]); i++) {
+        ASSERT(tool_schema_has_property(json, "query_graph", query_params[i]));
+    }
+    ASSERT(tool_schema_required_has(json, "query_graph", "query"));
+
+    const char *trace_params[] = {
+        "function_name", "qualified_name", "project", "direction", "depth",
+        "max_results", "compact", "edge_types", "exclude",
+    };
+    for (size_t i = 0; i < sizeof(trace_params) / sizeof(trace_params[0]); i++) {
+        ASSERT(tool_schema_has_property(json, "trace_path", trace_params[i]));
+    }
+
+    const char *code_params[] = {
+        "qualified_name", "project", "mode", "max_lines", "auto_resolve",
+        "include_neighbors", "compact",
+    };
+    for (size_t i = 0; i < sizeof(code_params) / sizeof(code_params[0]); i++) {
+        ASSERT(tool_schema_has_property(json, "get_code", code_params[i]));
+    }
+    ASSERT(tool_schema_required_has(json, "get_code", "qualified_name"));
+
+    const char *source_params[] = {
+        "pattern", "project", "file_pattern", "path_filter", "regex",
+        "case_sensitive", "context", "mode", "limit",
+    };
+    for (size_t i = 0; i < sizeof(source_params) / sizeof(source_params[0]); i++) {
+        ASSERT(tool_schema_has_property(json, "search_code", source_params[i]));
+    }
+
+    free(json);
     PASS();
 }
 
@@ -266,8 +420,8 @@ TEST(get_code_dispatch) {
     PASS();
 }
 
-TEST(old_tool_names_still_dispatch) {
-    /* Original names should still work for backwards compatibility */
+TEST(canonical_tool_names_dispatch) {
+    /* Canonical streamlined/classic tool names should dispatch directly. */
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
 
@@ -292,20 +446,12 @@ TEST(old_tool_names_still_dispatch) {
     ASSERT_NULL(strstr(r3, "unknown tool"));
     free(r3);
 
-    /* trace_call_path */
-    char *r4 = cbm_mcp_handle_tool(srv, "trace_call_path",
+    /* trace_path */
+    char *r4 = cbm_mcp_handle_tool(srv, "trace_path",
         "{\"function_name\":\"main\"}");
     ASSERT_NOT_NULL(r4);
     ASSERT_NULL(strstr(r4, "unknown tool"));
     free(r4);
-
-    /* Upstream/main exposes trace_path; keep the alias callable even though
-     * this fork lists trace_call_path for its classic surface. */
-    char *r5 = cbm_mcp_handle_tool(srv, "trace_path",
-        "{\"function_name\":\"main\"}");
-    ASSERT_NOT_NULL(r5);
-    ASSERT_NULL(strstr(r5, "unknown tool"));
-    free(r5);
 
     cbm_mcp_server_free(srv);
     PASS();
@@ -905,7 +1051,7 @@ TEST(resource_capable_client_no_context_on_second_call) {
 TEST(tool_descriptions_reference_resources) {
     /* Tool descriptions should tell the AI about available resources
      * so it knows to read codebase://schema before writing Cypher, etc.
-     * §4b: trace_call_path mentions codebase://architecture; the _hidden_tools
+     * §4b: trace_path mentions codebase://architecture; the _hidden_tools
      * hint mentions all three resource URIs. */
     char *json = cbm_mcp_tools_list(NULL);
     ASSERT_NOT_NULL(json);
@@ -942,10 +1088,10 @@ TEST(error_no_project_loaded_has_hint) {
      * still fail and return the hint. Test via the error structure in trace. */
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
-    /* trace_call_path goes through REQUIRE_STORE → no project loaded if store NULL.
+    /* trace_path goes through REQUIRE_STORE → no project loaded if store NULL.
      * With cbm_mcp_server_new(NULL), resolve_store(NULL) returns the default store.
      * The function_not_found error (which also has hint) tests the pattern. */
-    char *r = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *r = cbm_mcp_handle_tool(srv, "trace_path",
         "{\"function_name\":\"nonexistent_fn\"}");
     ASSERT_NOT_NULL(r);
     /* The response should have a hint field (either "no project loaded" or "not found") */
@@ -958,7 +1104,7 @@ TEST(error_no_project_loaded_has_hint) {
 TEST(error_function_not_found_includes_name) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
-    char *r = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *r = cbm_mcp_handle_tool(srv, "trace_path",
         "{\"function_name\":\"nonexistent_xyz_func\"}");
     ASSERT_NOT_NULL(r);
     /* Error should include the function name that was searched for */
@@ -994,8 +1140,8 @@ TEST(error_missing_required_param_has_hint) {
     ASSERT_NOT_NULL(strstr(r1, "hint"));
     free(r1);
 
-    /* trace_call_path missing function_name */
-    char *r2 = cbm_mcp_handle_tool(srv, "trace_call_path", "{}");
+    /* trace_path missing function_name */
+    char *r2 = cbm_mcp_handle_tool(srv, "trace_path", "{}");
     ASSERT_NOT_NULL(r2);
     ASSERT_NOT_NULL(strstr(r2, "function_name or qualified_name is required"));
     ASSERT_NOT_NULL(strstr(r2, "hint"));
@@ -2324,11 +2470,13 @@ SUITE(tool_consolidation) {
     RUN_TEST(api_surface_default_streamlined_regression_gate);
     RUN_TEST(api_surface_classic_regression_gate);
     RUN_TEST(hidden_tools_reveal_discoverable_tools);
+    RUN_TEST(streamlined_reveal_covers_classic_capabilities);
+    RUN_TEST(streamlined_core_parameter_contract);
     /* Dispatch */
     RUN_TEST(search_graph_dispatch);
     RUN_TEST(query_graph_dispatch);
     RUN_TEST(get_code_dispatch);
-    RUN_TEST(old_tool_names_still_dispatch);
+    RUN_TEST(canonical_tool_names_dispatch);
     /* Path support */
     RUN_TEST(project_param_path_detection);
     /* Edge cases */

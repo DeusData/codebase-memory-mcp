@@ -320,7 +320,7 @@ TEST(f10_negative_depth_returns_results) {
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"foo\",\"depth\":-1}");
     char *resp = extract_text(raw);
     free(raw);
@@ -337,7 +337,7 @@ TEST(f10_negative_depth_returns_results) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
- *  Bug 3: trace_call_path fuzzy fallback on case mismatch
+ *  Bug 3: trace_path fuzzy fallback on case mismatch
  * ══════════════════════════════════════════════════════════════════ */
 
 TEST(trace_case_mismatch_finds_via_fallback) {
@@ -347,7 +347,7 @@ TEST(trace_case_mismatch_finds_via_fallback) {
     /* "Foo" does not exist — only "foo" does. Fallback search should find it.
      * No project passed: resolve_store returns in-memory store, fallback search
      * has no project filter, finds "foo", re-queries with result's project. */
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
         "{\"function_name\":\"Foo\"}");
     char *resp = extract_text(raw);
     free(raw);
@@ -371,7 +371,7 @@ TEST(trace_exact_match_still_works) {
      * No project: resolve_store returns in-memory store, find_nodes_by_name
      * uses project=NULL which binds NULL (won't match). Falls to fallback
      * which finds "foo" via search (no project filter). */
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
         "{\"function_name\":\"foo\"}");
     char *resp = extract_text(raw);
     free(raw);
@@ -389,7 +389,7 @@ TEST(trace_truly_missing_still_errors) {
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
     /* "nonexistent_xyz" doesn't match anything — should still error */
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
         "{\"function_name\":\"nonexistent_xyz\"}");
     char *resp = extract_text(raw);
     free(raw);
@@ -410,7 +410,7 @@ TEST(f15_invalid_direction_errors) {
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"foo\",\"direction\":\"invalid\"}");
     char *resp = extract_text(raw);
     free(raw);
@@ -434,7 +434,7 @@ TEST(f15_valid_direction_succeeds) {
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"foo\",\"direction\":\"outbound\"}");
     char *resp = extract_text(raw);
     free(raw);
@@ -726,7 +726,7 @@ TEST(config_default_sort_by_calls) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
- *  trace_call_path accepts qualified_name param (Change 3a)
+ *  trace_path accepts qualified_name param (Change 3a)
  * ══════════════════════════════════════════════════════════════════ */
 
 TEST(trace_accepts_qualified_name_param) {
@@ -735,7 +735,7 @@ TEST(trace_accepts_qualified_name_param) {
     ASSERT_NOT_NULL(srv);
     /* Passing full qualified_name should not error (even if BFS finds 0 callers on test store).
      * Must NOT return "function not found" — QN lookup path fires first. */
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
         "{\"qualified_name\":\"validation-test.test.foo\",\"project\":\"validation-test\",\"direction\":\"outbound\"}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
@@ -800,7 +800,7 @@ TEST(trace_qn_takes_priority_over_function_name) {
     ASSERT_NOT_NULL(srv);
     /* Pass a valid QN and a non-existent function_name.
      * QN lookup should find "foo" and succeed; function_name is ignored. */
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
         "{\"qualified_name\":\"validation-test.test.foo\","
         "\"function_name\":\"does_not_exist_anywhere\","
         "\"project\":\"validation-test\"}");
@@ -823,7 +823,7 @@ TEST(trace_qn_not_found_returns_specific_hint) {
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
     /* Pass a QN that doesn't exist — should get specific hint about using pattern= */
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
         "{\"qualified_name\":\"no-such.project.func\","
         "\"project\":\"validation-test\"}");
     char *resp = extract_text(raw); free(raw);
@@ -1023,11 +1023,11 @@ TEST(path_project_auto_indexes_separate_directory) {
  *  Regression: classic tool names still work
  * ══════════════════════════════════════════════════════════════════ */
 
-TEST(regression_trace_call_path_tool_name_still_works) {
+TEST(regression_trace_path_tool_name_still_works) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"foo\"}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
@@ -1142,7 +1142,7 @@ void suite_input_validation(void) {
     RUN_TEST(source_search_tilde_project_expands);
     RUN_TEST(source_search_no_project_falls_back_to_session);
     RUN_TEST(path_project_auto_indexes_separate_directory);
-    RUN_TEST(regression_trace_call_path_tool_name_still_works);
+    RUN_TEST(regression_trace_path_tool_name_still_works);
     RUN_TEST(config_context_injection_disabled);
     RUN_TEST(config_context_injection_enabled_by_default);
 }

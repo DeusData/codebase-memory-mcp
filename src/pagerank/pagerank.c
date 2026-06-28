@@ -10,8 +10,8 @@
 
 #include "pagerank.h"
 #include <cli/cli.h>
+#include <foundation/compat.h>
 #include <foundation/log.h>
-#include <foundation/platform.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,6 +69,7 @@ typedef struct {
     int src_idx;
     int dst_idx;
     int64_t edge_id;
+    char *project;
     double weight;
     bool is_calls;  /* DF-1: true if edge type == "CALLS" */
 } pr_edge_t;
@@ -131,6 +132,30 @@ static void id_map_free(id_map_t *m) {
     m->vals = NULL;
 }
 
+static int grow_node_arrays(int64_t **node_ids, char ***node_labels,
+                            char ***node_projects, int new_cap) {
+    /* These arrays own child strings. Use realloc rather than safe_realloc so
+     * OOM preserves the old arrays and cleanup can still free their children. */
+    int64_t *new_ids = realloc(*node_ids, (size_t)new_cap * sizeof(int64_t));
+    if (!new_ids) return -1;
+    *node_ids = new_ids;
+    char **new_labels = realloc(*node_labels, (size_t)new_cap * sizeof(char *));
+    if (!new_labels) return -1;
+    *node_labels = new_labels;
+    char **new_projects = realloc(*node_projects, (size_t)new_cap * sizeof(char *));
+    if (!new_projects) return -1;
+    *node_projects = new_projects;
+    return 0;
+}
+
+static int grow_edge_array(pr_edge_t **edges, int new_cap) {
+    /* pr_edge_t owns project strings, so preserve the old array on OOM. */
+    pr_edge_t *new_edges = realloc(*edges, (size_t)new_cap * sizeof(pr_edge_t));
+    if (!new_edges) return -1;
+    *edges = new_edges;
+    return 0;
+}
+
 /* ── Scope -> SQL WHERE clause (DRY: one function) ──────────── */
 
 static const char *scope_where(cbm_rank_scope_t scope) {
@@ -174,11 +199,12 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     id_map_t map = {0};
     int N = 0, E = 0, result = -1;
 
-    char **node_labels = NULL; /* label per node, parallel to node_ids */
+    char **node_labels = NULL;   /* label per node, parallel to node_ids */
+    char **node_projects = NULL; /* owning project per node, parallel to node_ids */
 
     /* ── Step 1: Load node IDs + labels ───────────────────── */
     char sql_buf[512];
-    snprintf(sql_buf, sizeof(sql_buf), "SELECT id, label FROM nodes WHERE %s",
+    snprintf(sql_buf, sizeof(sql_buf), "SELECT id, label, project FROM nodes WHERE %s",
              scope_where(scope));
 
     sqlite3_stmt *stmt = NULL;
@@ -189,18 +215,38 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     int cap = CBM_PAGERANK_INITIAL_CAP;
     node_ids = malloc((size_t)cap * sizeof(int64_t));
     node_labels = malloc((size_t)cap * sizeof(char *));
-    if (!node_ids || !node_labels) { sqlite3_finalize(stmt); free(node_ids); free(node_labels); return -1; }
+    node_projects = malloc((size_t)cap * sizeof(char *));
+    if (!node_ids || !node_labels || !node_projects) {
+        sqlite3_finalize(stmt);
+        free(node_ids);
+        free(node_labels);
+        free(node_projects);
+        return -1;
+    }
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         if (N >= cap) {
             cap *= 2;
-            node_ids = safe_realloc(node_ids, (size_t)cap * sizeof(int64_t));
-            node_labels = safe_realloc(node_labels, (size_t)cap * sizeof(char *));
-            if (!node_ids || !node_labels) { sqlite3_finalize(stmt); return -1; }
+            if (grow_node_arrays(&node_ids, &node_labels, &node_projects, cap) != 0) {
+                sqlite3_finalize(stmt);
+                stmt = NULL;
+                goto cleanup;
+            }
         }
         node_ids[N] = sqlite3_column_int64(stmt, 0);
         const char *lbl = (const char *)sqlite3_column_text(stmt, 1);
-        node_labels[N] = lbl ? strdup(lbl) : NULL;
+        const char *proj = (const char *)sqlite3_column_text(stmt, 2);
+        char *label_copy = lbl ? cbm_strdup(lbl) : NULL;
+        char *project_copy = cbm_strdup((proj && proj[0]) ? proj : project);
+        if ((lbl && !label_copy) || !project_copy) {
+            free(label_copy);
+            free(project_copy);
+            sqlite3_finalize(stmt);
+            stmt = NULL;
+            goto cleanup;
+        }
+        node_labels[N] = label_copy;
+        node_projects[N] = project_copy;
         N++;
     }
     sqlite3_finalize(stmt);
@@ -209,6 +255,7 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     if (N == 0) {
         free(node_ids);
         free(node_labels); /* no strdup'd elements since N==0 */
+        free(node_projects);
         return 0;
     }
 
@@ -218,13 +265,15 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
         /* free all strdup'd labels accumulated before the failure */
         for (int i = 0; i < N; i++) free(node_labels[i]);
         free(node_labels);
+        for (int i = 0; i < N; i++) free(node_projects[i]);
+        free(node_projects);
         return -1;
     }
     for (int i = 0; i < N; i++) id_map_put(&map, node_ids[i], i);
 
     /* ── Step 2: Load weighted edges ──────────────────────── */
     snprintf(sql_buf, sizeof(sql_buf),
-             "SELECT id, source_id, target_id, type FROM edges WHERE %s",
+             "SELECT id, source_id, target_id, type, project FROM edges WHERE %s",
              scope_where(scope));
     if (sqlite3_prepare_v2(db, sql_buf, -1, &stmt, NULL) != SQLITE_OK)
         goto cleanup;
@@ -239,6 +288,7 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
         int64_t src = sqlite3_column_int64(stmt, 1);
         int64_t dst = sqlite3_column_int64(stmt, 2);
         const char *type = (const char *)sqlite3_column_text(stmt, 3);
+        const char *edge_project = (const char *)sqlite3_column_text(stmt, 4);
 
         int si = id_map_get(&map, src);
         int di = id_map_get(&map, dst);
@@ -246,12 +296,22 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
 
         if (E >= ecap) {
             ecap *= 2;
-            edges = safe_realloc(edges, (size_t)ecap * sizeof(pr_edge_t));
-            if (!edges) { sqlite3_finalize(stmt); goto cleanup; }
+            if (grow_edge_array(&edges, ecap) != 0) {
+                sqlite3_finalize(stmt);
+                stmt = NULL;
+                goto cleanup;
+            }
+        }
+        char *edge_project_copy = cbm_strdup((edge_project && edge_project[0]) ? edge_project : project);
+        if (!edge_project_copy) {
+            sqlite3_finalize(stmt);
+            stmt = NULL;
+            goto cleanup;
         }
         edges[E].src_idx = si;
         edges[E].dst_idx = di;
         edges[E].edge_id = eid;
+        edges[E].project = edge_project_copy;
         edges[E].weight = edge_type_weight(weights, type);
         edges[E].is_calls = (type && strcmp(type, "CALLS") == 0);
         E++;
@@ -345,16 +405,19 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
 
     /* Batch insert within transaction */
     sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+    /* Node projects were loaded with node_ids, preserving dependency attribution
+     * without doing an indexed SELECT per stored row. */
     const char *ins_sql =
         "INSERT OR REPLACE INTO pagerank "
         "(node_id, project, rank, computed_at) "
-        "SELECT ?1, project, ?2, ?3 FROM nodes WHERE id = ?1";
+        "VALUES (?1, ?2, ?3, ?4)";
     sqlite3_stmt *ins_stmt = NULL;
     if (sqlite3_prepare_v2(db, ins_sql, -1, &ins_stmt, NULL) == SQLITE_OK) {
         for (int i = 0; i < N; i++) {
             sqlite3_bind_int64(ins_stmt, 1, node_ids[i]);
-            sqlite3_bind_double(ins_stmt, 2, rank[i]);
-            sqlite3_bind_text(ins_stmt, 3, ts, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins_stmt, 2, node_projects[i], -1, SQLITE_TRANSIENT);
+            sqlite3_bind_double(ins_stmt, 3, rank[i]);
+            sqlite3_bind_text(ins_stmt, 4, ts, -1, SQLITE_TRANSIENT);
             sqlite3_step(ins_stmt);
             sqlite3_reset(ins_stmt);
         }
@@ -375,7 +438,7 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     const char *lr_sql =
         "INSERT OR REPLACE INTO linkrank "
         "(edge_id, project, rank, computed_at) "
-        "SELECT ?1, project, ?2, ?3 FROM edges WHERE id = ?1";
+        "VALUES (?1, ?2, ?3, ?4)";
     sqlite3_stmt *lr_stmt = NULL;
     if (sqlite3_prepare_v2(db, lr_sql, -1, &lr_stmt, NULL) == SQLITE_OK) {
         sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
@@ -385,8 +448,9 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
             if (out_weight[s_idx] > 0.0)
                 lr = rank[s_idx] * edges[e].weight / out_weight[s_idx];
             sqlite3_bind_int64(lr_stmt, 1, edges[e].edge_id);
-            sqlite3_bind_double(lr_stmt, 2, lr);
-            sqlite3_bind_text(lr_stmt, 3, ts, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(lr_stmt, 2, edges[e].project, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_double(lr_stmt, 3, lr);
+            sqlite3_bind_text(lr_stmt, 4, ts, -1, SQLITE_TRANSIENT);
             sqlite3_step(lr_stmt);
             sqlite3_reset(lr_stmt);
         }
@@ -422,19 +486,20 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
             "INSERT OR REPLACE INTO node_degree "
             "(node_id, project, total_in, total_out, calls_in, calls_out, "
             " weighted_in, weighted_out, linkrank_in, computed_at) "
-            "SELECT ?1, project, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 FROM nodes WHERE id = ?1";
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
         sqlite3_stmt *deg_stmt = NULL;
         if (sqlite3_prepare_v2(db, deg_sql, -1, &deg_stmt, NULL) == SQLITE_OK) {
             for (int i = 0; i < N; i++) {
                 sqlite3_bind_int64(deg_stmt, 1, node_ids[i]);
-                sqlite3_bind_int(deg_stmt, 2, total_in[i]);
-                sqlite3_bind_int(deg_stmt, 3, total_out[i]);
-                sqlite3_bind_int(deg_stmt, 4, calls_in ? calls_in[i] : 0);
-                sqlite3_bind_int(deg_stmt, 5, calls_out ? calls_out[i] : 0);
-                sqlite3_bind_double(deg_stmt, 6, w_in ? w_in[i] : 0.0);
-                sqlite3_bind_double(deg_stmt, 7, out_weight[i]);
-                sqlite3_bind_double(deg_stmt, 8, lr_in ? lr_in[i] : 0.0);
-                sqlite3_bind_text(deg_stmt, 9, ts, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(deg_stmt, 2, node_projects[i], -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int(deg_stmt, 3, total_in[i]);
+                sqlite3_bind_int(deg_stmt, 4, total_out[i]);
+                sqlite3_bind_int(deg_stmt, 5, calls_in ? calls_in[i] : 0);
+                sqlite3_bind_int(deg_stmt, 6, calls_out ? calls_out[i] : 0);
+                sqlite3_bind_double(deg_stmt, 7, w_in ? w_in[i] : 0.0);
+                sqlite3_bind_double(deg_stmt, 8, out_weight[i]);
+                sqlite3_bind_double(deg_stmt, 9, lr_in ? lr_in[i] : 0.0);
+                sqlite3_bind_text(deg_stmt, 10, ts, -1, SQLITE_TRANSIENT);
                 sqlite3_step(deg_stmt);
                 sqlite3_reset(deg_stmt);
             }
@@ -461,7 +526,14 @@ cleanup:
         for (int i = 0; i < N; i++) free(node_labels[i]);
         free(node_labels);
     }
+    if (node_projects) {
+        for (int i = 0; i < N; i++) free(node_projects[i]);
+        free(node_projects);
+    }
     id_map_free(&map);
+    if (edges) {
+        for (int e = 0; e < E; e++) free(edges[e].project);
+    }
     free(edges);
     free(out_weight);
     free(rank);

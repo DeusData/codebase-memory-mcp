@@ -305,13 +305,13 @@ TEST(search_graph_include_deps_marks_source) {
     PASS();
 }
 
-TEST(trace_call_path_marks_boundary) {
+TEST(trace_path_marks_boundary) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_dep_query_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* trace_call_path with include_dependencies should mark boundary */
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    /* trace_path with include_dependencies should mark boundary */
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"process_data\","
                                     "\"project\":\"dep-query-test\","
                                     "\"include_dependencies\":true}");
@@ -827,7 +827,7 @@ TEST(test_trace_results_have_source_field) {
     cbm_mcp_server_t *srv = setup_dep_query_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"process_data\","
                                     "\"project\":\"dep-query-test\"}");
     char *resp = extract_text_content_di(raw);
@@ -889,7 +889,7 @@ SUITE(depindex) {
     /* AI grounding: core vs dependency disambiguation */
     RUN_TEST(search_graph_default_excludes_deps);
     RUN_TEST(search_graph_include_deps_marks_source);
-    RUN_TEST(trace_call_path_marks_boundary);
+    RUN_TEST(trace_path_marks_boundary);
     RUN_TEST(get_code_snippet_dep_shows_provenance);
 
     /* External node marking */

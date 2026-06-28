@@ -532,7 +532,7 @@ TEST(trace_compact_omits_redundant_name) {
     cbm_mcp_server_t *srv = setup_limit_test_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"func_000\","
                                     "\"project\":\"limit-test\",\"compact\":true}");
     char *resp = extract_text_content_tr(raw);
@@ -658,7 +658,7 @@ TEST(trace_ambiguous_function_returns_candidates) {
     dup.end_line = 2;
     cbm_store_upsert_node(st, &dup);
 
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"func_000\","
                                     "\"project\":\"limit-test\"}");
     char *resp = extract_text_content_tr(raw);
@@ -682,7 +682,7 @@ TEST(trace_bfs_deduplicates_cycles) {
 
     /* func_000 -> func_001 -> func_002 -> func_000 (cycle)
      * BFS should visit each node at most once in results */
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"func_000\","
                                     "\"project\":\"limit-test\","
                                     "\"direction\":\"outbound\",\"depth\":5}");
@@ -713,7 +713,7 @@ TEST(trace_max_results_parameter) {
     cbm_mcp_server_t *srv = setup_limit_test_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"func_000\","
                                     "\"project\":\"limit-test\","
                                     "\"max_results\":1}");
@@ -1271,11 +1271,11 @@ TEST(search_graph_include_dependencies_false_excludes_dep_nodes) {
 
 /* ── Change 3.1 reverted: trace compact default remains true ─── */
 
-TEST(trace_call_path_compact_defaults_to_true) {
+TEST(trace_path_compact_defaults_to_true) {
     cbm_mcp_server_t *srv = setup_sp_server();
     ASSERT_NOT_NULL(srv);
     /* No compact param -> defaults to true -> name omitted when it matches qn suffix */
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"main\","
                                     "\"project\":\"sp-test\","
                                     "\"direction\":\"outbound\"}");
@@ -1300,10 +1300,10 @@ TEST(trace_call_path_compact_defaults_to_true) {
     PASS();
 }
 
-TEST(trace_call_path_compact_false_includes_name) {
+TEST(trace_path_compact_false_includes_name) {
     cbm_mcp_server_t *srv = setup_sp_server();
     ASSERT_NOT_NULL(srv);
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"main\","
                                     "\"project\":\"sp-test\","
                                     "\"direction\":\"outbound\","
@@ -1328,13 +1328,13 @@ TEST(trace_call_path_compact_false_includes_name) {
 
 /* ── Change 3.2: trace edge_types user param ────────────────── */
 
-TEST(trace_call_path_edge_types_http_calls_traverses_http_edges) {
+TEST(trace_path_edge_types_http_calls_traverses_http_edges) {
     cbm_mcp_server_t *srv = setup_sp_server();
     ASSERT_NOT_NULL(srv);
     /* fetch_data(id=3) has HTTP_CALLS -> process_request(id=2).
      * With edge_types=["HTTP_CALLS"] outbound, process_request should appear.
      * With CALLS-only (old hardcoded): no CALLS from fetch_data -> empty callees. */
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"fetch_data\","
                                     "\"project\":\"sp-test\","
                                     "\"direction\":\"outbound\","
@@ -1355,11 +1355,11 @@ TEST(trace_call_path_edge_types_http_calls_traverses_http_edges) {
     PASS();
 }
 
-TEST(trace_call_path_default_edge_types_calls_only) {
+TEST(trace_path_default_edge_types_calls_only) {
     cbm_mcp_server_t *srv = setup_sp_server();
     ASSERT_NOT_NULL(srv);
     /* Without edge_types -> default CALLS -> main -> process_request appears */
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"main\","
                                     "\"project\":\"sp-test\","
                                     "\"direction\":\"outbound\"}");
@@ -1389,7 +1389,7 @@ TEST(all_mcp_responses_are_minified_json) {
     cbm_mcp_server_t *srv = setup_sp_server();
     ASSERT_NOT_NULL(srv);
 
-    const char *tools[] = {"search_graph", "trace_call_path", "get_architecture", "query_graph"};
+    const char *tools[] = {"search_graph", "trace_path", "get_architecture", "query_graph"};
     const char *args[]  = {
         "{\"project\":\"sp-test\",\"limit\":3}",
         "{\"function_name\":\"main\",\"project\":\"sp-test\"}",
@@ -1411,13 +1411,13 @@ TEST(all_mcp_responses_are_minified_json) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
- *  2.1 trace_call_path FIELD OMISSION (TDD)
+ *  2.1 trace_path FIELD OMISSION (TDD)
  *  Candidates block uses empty-string fallback for file_path (mcp.c:2116).
  *  RED until candidates block is fixed like search_graph.
  * ══════════════════════════════════════════════════════════════════ */
 
 /* Empty file_path in a candidate must be omitted, not emitted as "". */
-TEST(trace_call_path_candidates_omits_empty_file_path) {
+TEST(trace_path_candidates_omits_empty_file_path) {
     cbm_mcp_server_t *srv = setup_sp_server();
     ASSERT_NOT_NULL(srv);
     cbm_store_t *st = cbm_mcp_server_store(srv);
@@ -1432,7 +1432,7 @@ TEST(trace_call_path_candidates_omits_empty_file_path) {
     dup.properties_json = "{}";
     cbm_store_upsert_node(st, &dup);
 
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"main\","
                                     "\"project\":\"sp-test\"}");
     char *resp = extract_text_content_tr(raw);
@@ -1464,7 +1464,7 @@ TEST(trace_call_path_candidates_omits_empty_file_path) {
 }
 
 /* Non-empty file_path in candidates must still be present (regression guard). */
-TEST(trace_call_path_candidates_includes_nonempty_file_path) {
+TEST(trace_path_candidates_includes_nonempty_file_path) {
     cbm_mcp_server_t *srv = setup_sp_server();
     ASSERT_NOT_NULL(srv);
     cbm_store_t *st = cbm_mcp_server_store(srv);
@@ -1478,7 +1478,7 @@ TEST(trace_call_path_candidates_includes_nonempty_file_path) {
     dup.properties_json = "{}";
     cbm_store_upsert_node(st, &dup);
 
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"main\","
                                     "\"project\":\"sp-test\"}");
     char *resp = extract_text_content_tr(raw);
@@ -1545,16 +1545,16 @@ TEST(get_architecture_output_is_minified_and_no_empty_fields) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
- *  2.3 trace_call_path callers_total field
+ *  2.3 trace_path callers_total field
  * ══════════════════════════════════════════════════════════════════ */
 
-TEST(trace_call_path_response_includes_callers_total) {
+TEST(trace_path_response_includes_callers_total) {
     /* TDD RED: callers_total never emitted (Bug C) — becomes GREEN after fix */
     cbm_mcp_server_t *srv = setup_sp_server();
     ASSERT_NOT_NULL(srv);
     /* direction=both triggers do_inbound=true; main has no callers but
      * callers_total must still appear in the response */
-    char *raw = cbm_mcp_handle_tool(srv, "trace_call_path",
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"main\","
                                     "\"project\":\"sp-test\","
                                     "\"direction\":\"both\"}");
@@ -1709,9 +1709,9 @@ SUITE(token_reduction) {
     /* 2.0 JSON Output Minification */
     RUN_TEST(all_mcp_responses_are_minified_json);
 
-    /* 2.1 trace_call_path Field Omission */
-    RUN_TEST(trace_call_path_candidates_omits_empty_file_path);
-    RUN_TEST(trace_call_path_candidates_includes_nonempty_file_path);
+    /* 2.1 trace_path Field Omission */
+    RUN_TEST(trace_path_candidates_omits_empty_file_path);
+    RUN_TEST(trace_path_candidates_includes_nonempty_file_path);
 
     /* 2.2 get_architecture Compact Coverage */
     RUN_TEST(get_architecture_output_is_minified_and_no_empty_fields);
@@ -1725,13 +1725,13 @@ SUITE(token_reduction) {
     RUN_TEST(search_graph_exclude_entry_points_false_keeps_all);
     RUN_TEST(search_graph_include_dependencies_true_includes_dep_nodes);
     RUN_TEST(search_graph_include_dependencies_false_excludes_dep_nodes);
-    RUN_TEST(trace_call_path_compact_defaults_to_true);
-    RUN_TEST(trace_call_path_compact_false_includes_name);
-    RUN_TEST(trace_call_path_edge_types_http_calls_traverses_http_edges);
-    RUN_TEST(trace_call_path_default_edge_types_calls_only);
+    RUN_TEST(trace_path_compact_defaults_to_true);
+    RUN_TEST(trace_path_compact_false_includes_name);
+    RUN_TEST(trace_path_edge_types_http_calls_traverses_http_edges);
+    RUN_TEST(trace_path_default_edge_types_calls_only);
 
     /* 2.3 callers_total field completeness */
-    RUN_TEST(trace_call_path_response_includes_callers_total);
+    RUN_TEST(trace_path_response_includes_callers_total);
 
     /* 2.4 get_code_snippet empty field omission */
     RUN_TEST(get_code_snippet_omits_empty_name_label);

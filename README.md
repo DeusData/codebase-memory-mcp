@@ -387,7 +387,7 @@ codebase-memory-mcp cli --raw search_graph '{"label": "Function"}' | jq '.result
 | Tool | Description |
 |------|-------------|
 | `search_graph` | Structured search by label, name pattern, file pattern, degree filters. Pagination via limit/offset. |
-| `trace_path` | BFS traversal — who calls a function and what it calls (alias: `trace_call_path`). Depth 1-5. |
+| `trace_path` | BFS traversal — who calls a function and what it calls. Depth 1-5. |
 | `detect_changes` | Map git diff to affected symbols + blast radius with risk classification. |
 | `query_graph` | Execute Cypher-like graph queries (read-only). |
 | `get_graph_schema` | Node/edge counts, relationship patterns, property definitions per label. Run this first. |
