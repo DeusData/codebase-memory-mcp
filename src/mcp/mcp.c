@@ -343,7 +343,8 @@ typedef struct {
 
 static const tool_def_t TOOLS[] = {
     {"index_repository",
-     "Index a repository into the knowledge graph. "
+     "Index a repository into the knowledge graph. Use for explicit indexing or pre-warming; "
+     "the default search/trace tools auto-index the server CWD on first use when possible. "
      "Special mode 'cross-repo-intelligence': skip extraction, only match Routes/Channels "
      "across projects to create CROSS_HTTP_CALLS/CROSS_ASYNC_CALLS/CROSS_CHANNEL edges. "
      "Requires target_projects param. Ensure target projects have fresh indexes first.",
@@ -365,8 +366,9 @@ static const tool_def_t TOOLS[] = {
 
     {"search_graph",
      "Search the code knowledge graph for functions, classes, routes, and variables. Use INSTEAD "
-     "OF grep/glob when finding code definitions, implementations, or relationships. Returns "
-     "structured results in one call. When has_more=true, use offset+limit to paginate. "
+     "OF grep/glob when finding code definitions, implementations, or relationships. Auto-indexes "
+     "the server CWD on first use when possible. Returns structured results in one call. "
+     "When has_more=true, use offset+limit to paginate. "
      "Use mode=summary for quick codebase overview without individual results.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
      "\"Indexed project name. Omit to use the MCP server project derived from server CWD; first use "
@@ -378,10 +380,11 @@ static const tool_def_t TOOLS[] = {
      "\"qn_pattern\":{\"type\":\"string\",\"description\":\"Regex pattern on qualified name. "
      "Glob wildcards auto-convert to regex.\"},"
      "\"query\":{\"type\":\"string\",\"description\":\"Full-text/BM25 query over indexed symbol "
-     "text. Use when searching by words rather than symbol-name regex.\"},"
+     "text. Use when searching by words rather than symbol-name regex. When set, only project, "
+     "file_pattern, limit, and offset apply; graph filters and sort_by are ignored.\"},"
      "\"semantic_query\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":"
-     "\"Natural-language/keyword vector search terms appended as semantic_results. Use when "
-     "lexical names are unknown or vocabulary differs.\"},"
+     "\"Array of keyword strings for vector search, e.g. [\\\"send\\\",\\\"pubsub\\\"]. "
+     "Appends a separate semantic_results array; pass query/name filters for normal results.\"},"
      "\"file_pattern\":{\"type\":\"string\",\"description\":\"Glob or substring filter on result "
      "file paths.\"},\"relationship\":{\"type\":\"string\",\"description\":\"Graph edge type to "
      "filter connected results, for example CALLS or IMPORTS.\"},"
@@ -1025,7 +1028,7 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
             "get_graph_schema, get_architecture, list_projects, "
             "delete_project, index_status, detect_changes, manage_adr, "
             "ingest_traces, index_dependencies. "
-            "Projects auto-index on first query (no manual setup needed). "
+            "Default tools auto-index the server CWD on first query when possible. "
             "Call this tool to reveal these tools in tools/list for clients that "
             "only allow discovered tools. "
             "Enable all: set env CBM_TOOL_MODE=classic or config set tool_mode classic. "

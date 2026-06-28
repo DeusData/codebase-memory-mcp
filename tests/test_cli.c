@@ -2239,7 +2239,7 @@ TEST(cli_agent_instructions_content) {
     ASSERT_NOT_NULL(instr);
     ASSERT(strstr(instr, "search_graph") != NULL);
     ASSERT(strstr(instr, "trace_path") != NULL);
-    ASSERT(strstr(instr, "get_code_snippet") != NULL);
+    ASSERT(strstr(instr, "get_code") != NULL);
     PASS();
 }
 
