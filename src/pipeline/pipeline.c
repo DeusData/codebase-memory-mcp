@@ -179,7 +179,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->semantic_threshold = 0.0;
     p->githistory_min_coupling = 0.0;
     p->lsp_confidence_floor = 0.0;
-    p->incremental_reindex = CBM_INCREMENTAL_REINDEX_FAST;
+    p->incremental_reindex = CBM_INCREMENTAL_REINDEX_OFF;
     p->persistence = false;
     p->committed_nodes = -1;
     p->committed_edges = -1;
@@ -267,13 +267,13 @@ void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg) {
         cbm_pipeline_set_lsp_confidence_floor(p, lsp_floor);
     }
 
-    const char *incremental = cbm_config_get(cfg, CBM_CONFIG_INCREMENTAL_REINDEX, "fast");
+    const char *incremental = cbm_config_get(cfg, CBM_CONFIG_INCREMENTAL_REINDEX, "off");
     if (incremental && strcmp(incremental, "always") == 0) {
         p->incremental_reindex = CBM_INCREMENTAL_REINDEX_ALWAYS;
-    } else if (incremental && strcmp(incremental, "off") == 0) {
-        p->incremental_reindex = CBM_INCREMENTAL_REINDEX_OFF;
-    } else {
+    } else if (incremental && strcmp(incremental, "fast") == 0) {
         p->incremental_reindex = CBM_INCREMENTAL_REINDEX_FAST;
+    } else {
+        p->incremental_reindex = CBM_INCREMENTAL_REINDEX_OFF;
     }
 }
 
