@@ -648,6 +648,7 @@ char *cbm_mcp_initialize_response(const char *params_json) {
 
     yyjson_mut_val *caps = yyjson_mut_obj(doc);
     yyjson_mut_val *tools_cap = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_bool(doc, tools_cap, "listChanged", true);
     yyjson_mut_obj_add_val(doc, caps, "tools", tools_cap);
     /* Advertise MCP resources capability — clients can read codebase://schema etc. */
     yyjson_mut_val *res_cap = yyjson_mut_obj(doc);
@@ -804,6 +805,7 @@ static void free_string_array(char **arr) {
 
 /* Forward declarations for functions defined after first use */
 static void notify_resources_updated(cbm_mcp_server_t *srv);
+static void send_notification(cbm_mcp_server_t *srv, const char *method);
 static char *build_key_functions_sql(const char *exclude_csv, const char **exclude_arr, int limit);
 char *cbm_glob_to_like(const char *pattern); /* store.c */
 
@@ -830,6 +832,7 @@ struct cbm_mcp_server {
     bool just_autoindexed; /* IX-3: true after auto-index completes, reset on next search */
     bool context_injected; /* true after first _context header sent (Phase 9) */
     bool client_has_resources; /* true if client advertised resources capability */
+    bool hidden_tools_revealed; /* true after _hidden_tools requests real tools/list exposure */
     FILE *out_stream;          /* stdout for sending notifications (set in server_run) */
 
     /* Active pipeline tracking for cancellation support */
@@ -878,6 +881,7 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
             : "streamlined";
     }
     bool classic = (strcmp(tool_mode, "classic") == 0);
+    bool reveal_hidden = (!classic && srv && srv->hidden_tools_revealed);
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -900,8 +904,10 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
         for (int i = 0; i < STREAMLINED_TOOL_COUNT; i++) {
             emit_tool(doc, tools, &STREAMLINED_TOOLS[i]);
         }
-        /* Also emit individually-enabled tools (skip names already emitted as the
-         * default surface to avoid double-emit if someone sets tool_search_graph true).
+        /* Also emit individually-enabled tools, or every advanced tool after
+         * _hidden_tools has explicitly revealed them for this server session.
+         * This keeps the initial streamlined list compact while making hidden
+         * tools discoverable to real MCP clients that only call listed tools.
          * trace_call_path lives in both TOOLS[] and STREAMLINED_TOOLS[], so skip it too.
          * (get_code is streamlined-only; get_code_snippet is the TOOLS[] name.) */
         for (int i = 0; i < TOOL_COUNT; i++) {
@@ -913,7 +919,8 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
             }
             char key[64];
             snprintf(key, sizeof(key), "tool_%s", TOOLS[i].name);
-            if (srv && srv->config && cbm_config_get_bool(srv->config, key, false)) {
+            if (reveal_hidden ||
+                (srv && srv->config && cbm_config_get_bool(srv->config, key, false))) {
                 emit_tool(doc, tools, &TOOLS[i]);
             }
         }
@@ -931,6 +938,8 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
             "delete_project, index_status, detect_changes, manage_adr, "
             "ingest_traces, index_dependencies. "
             "Projects auto-index on first query (no manual setup needed). "
+            "Call this tool to reveal these tools in tools/list for clients that "
+            "only allow discovered tools. "
             "Enable all: set env CBM_TOOL_MODE=classic or config set tool_mode classic. "
             "Enable one: config set tool_<name> true (e.g. tool_index_repository true). "
             "Resources: codebase://schema (labels, edge types, Cypher examples), "
@@ -6614,11 +6623,20 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
 
     /* _hidden_tools: informational pseudo-tool for progressive disclosure */
     if (strcmp(tool_name, "_hidden_tools") == 0) {
+        bool changed = srv && !srv->hidden_tools_revealed;
+        if (srv) {
+            srv->hidden_tools_revealed = true;
+        }
+        if (changed) {
+            send_notification(srv, "notifications/tools/list_changed");
+        }
         return cbm_mcp_text_result(
             "{\"hidden_tools\":[\"index_repository\",\"get_code_snippet\","
             "\"get_graph_schema\",\"get_architecture\",\"list_projects\","
             "\"delete_project\",\"index_status\",\"detect_changes\","
             "\"manage_adr\",\"ingest_traces\",\"index_dependencies\"],"
+            "\"revealed\":true,"
+            "\"next_step\":\"call tools/list again; these tools are now advertised for this session\","
             "\"enable_all\":\"set env CBM_TOOL_MODE=classic or config set tool_mode classic\","
             "\"enable_one\":\"config set tool_<name> true (e.g. tool_index_repository true)\","
             "\"resources\":[\"codebase://schema\",\"codebase://architecture\",\"codebase://status\"]}", false);
