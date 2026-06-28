@@ -189,6 +189,36 @@ TEST(api_surface_classic_regression_gate) {
     PASS();
 }
 
+TEST(hidden_tools_reveal_discoverable_tools) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *before = cbm_mcp_tools_list(srv);
+    ASSERT_NOT_NULL(before);
+    ASSERT_EQ(6, tool_list_exact_count(before));
+    ASSERT(!tool_list_has_exact_name(before, "index_repository"));
+    ASSERT(!tool_list_has_exact_name(before, "get_architecture"));
+    free(before);
+
+    char *hint = cbm_mcp_handle_tool(srv, "_hidden_tools", "{}");
+    ASSERT_NOT_NULL(hint);
+    ASSERT_NOT_NULL(strstr(hint, "revealed"));
+    free(hint);
+
+    char *after = cbm_mcp_tools_list(srv);
+    ASSERT_NOT_NULL(after);
+    ASSERT(tool_list_has_exact_name(after, "index_repository"));
+    ASSERT(tool_list_has_exact_name(after, "get_code_snippet"));
+    ASSERT(tool_list_has_exact_name(after, "get_architecture"));
+    ASSERT(tool_list_has_exact_name(after, "index_dependencies"));
+    ASSERT(tool_list_has_exact_name(after, "_hidden_tools"));
+    ASSERT_EQ(17, tool_list_exact_count(after));
+    free(after);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* ── 2. Dispatch tests ────────────────────────────────────── */
 
 TEST(search_graph_dispatch) {
@@ -2293,6 +2323,7 @@ SUITE(tool_consolidation) {
     RUN_TEST(classic_mode_shows_all_15_tools);
     RUN_TEST(api_surface_default_streamlined_regression_gate);
     RUN_TEST(api_surface_classic_regression_gate);
+    RUN_TEST(hidden_tools_reveal_discoverable_tools);
     /* Dispatch */
     RUN_TEST(search_graph_dispatch);
     RUN_TEST(query_graph_dispatch);
