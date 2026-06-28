@@ -365,10 +365,10 @@ typedef struct {
  * edge a full reindex would not produce:
  *   - SIMILAR_TO / SEMANTICALLY_RELATED: rebuilt wholesale by the incremental
  *     post-passes (similarity / semantic_edges) over a drifting corpus.
- *   - FILE_CHANGES_WITH (git-history coupling) and DATA_FLOWS (route data flow):
- *     produced only by full-pipeline post-passes (githistory / route_nodes)
- *     that do NOT run during incremental; they remain a known incremental
- *     limitation rather than something to restore stale.
+ *   - FILE_CHANGES_WITH (git-history coupling): produced only by the full
+ *     githistory pass and not restored stale during incremental.
+ *   - DATA_FLOWS (route data flow): rebuilt by the incremental route refresh,
+ *     so stale pre-purge snapshots must not be re-linked afterward.
  * Every other edge type IS safe to re-link, by one of two routes that both
  * match a full reindex: edges re-emitted by the per-file resolution passes that
  * run incrementally (CALLS, USAGE, DEFINES, DEFINES_METHOD, INHERITS,
@@ -640,8 +640,20 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
     cbm_log_info("pass.timing", "pass", "incr_configlink", "elapsed_ms",
                  itoa_buf_incr((int)elapsed_ms_incr(t)));
 
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    cbm_pipeline_clear_route_derived_edges(ctx->gbuf);
+    cbm_pipeline_create_route_nodes(ctx->gbuf);
+    cbm_log_info("pass.timing", "pass", "incr_route_match", "elapsed_ms",
+                 itoa_buf_incr((int)elapsed_ms_incr(t)));
+
     /* SIMILAR_TO + SEMANTICALLY_RELATED edges only in moderate/full modes */
     if (ctx->mode <= CBM_MODE_MODERATE) {
+        /* These passes recompute global derived edge sets over the loaded graph.
+         * Clear the previous run's rows first; otherwise repeated incremental
+         * updates keep stale pairs whose node ids changed during purge/reparse. */
+        cbm_gbuf_delete_edges_by_type(ctx->gbuf, "SIMILAR_TO");
+        cbm_gbuf_delete_edges_by_type(ctx->gbuf, "SEMANTICALLY_RELATED");
+
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         cbm_pipeline_pass_similarity(ctx);
         cbm_log_info("pass.timing", "pass", "incr_similarity", "elapsed_ms",
@@ -653,6 +665,17 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
                      itoa_buf_incr((int)elapsed_ms_incr(t)));
     }
 }
+
+static const char *incremental_structure_root_qn(cbm_gbuf_t *gbuf, const char *project) {
+    const cbm_gbuf_node_t **branches = NULL;
+    int branch_count = 0;
+    if (cbm_gbuf_find_by_label(gbuf, "Branch", &branches, &branch_count) == 0 &&
+        branch_count > 0 && branches[0]->qualified_name) {
+        return branches[0]->qualified_name;
+    }
+    return project;
+}
+
 /* Atomically dump merged graph + hashes to disk.
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
  * reindexes can correctly distinguish "never indexed" from "indexed but
@@ -886,13 +909,10 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .path_aliases = path_aliases,
     };
 
+    const char *structure_root_qn = incremental_structure_root_qn(existing, project);
     for (int i = 0; i < ci; i++) {
-        char *file_qn = cbm_pipeline_fqn_compute(project, changed_files[i].rel_path, "__file__");
-        if (file_qn) {
-            cbm_gbuf_upsert_node(existing, "File", changed_files[i].rel_path, file_qn,
-                                 changed_files[i].rel_path, 0, 0, "{}");
-            free(file_qn);
-        }
+        cbm_pipeline_ensure_file_structure(existing, project, structure_root_qn,
+                                           changed_files[i].rel_path, NULL);
     }
 
     run_extract_resolve(&ctx, changed_files, ci);

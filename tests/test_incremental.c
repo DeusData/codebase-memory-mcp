@@ -50,6 +50,12 @@ static int g_full_imports = 0;
 static size_t g_rss_before_full = 0;
 static double g_full_index_ms = 0;
 
+enum {
+    INCR_ACCURACY_NODE_TOLERANCE = 2,
+    INCR_ACCURACY_EDGE_TOLERANCE = 50,
+    INCR_ACCURACY_CALL_TOLERANCE = 2,
+};
+
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
 static double now_ms(void) {
@@ -179,6 +185,114 @@ static int get_edge_count_by_type(const char *type) {
     int c = cbm_store_count_edges_by_type(s, g_project, type);
     cbm_store_close(s);
     return c;
+}
+
+static const char *const k_accuracy_edge_types[] = {
+    "CALLS",
+    "IMPORTS",
+    "DEFINES",
+    "CONTAINS_FILE",
+    "CONTAINS_FOLDER",
+    "HAS_BRANCH",
+    "DEFINES_METHOD",
+    "MEMBER_OF",
+    "HAS_FIELD",
+    "HANDLES",
+    "HTTP_CALLS",
+    "ASYNC_CALLS",
+    "DATA_FLOWS",
+    "INFRA_MAPS",
+    "CONFIGURES",
+    "DEPENDS_ON",
+    "FILE_CHANGES_WITH",
+    "SIMILAR_TO",
+    "SEMANTICALLY_RELATED",
+    "TESTS",
+    "TESTS_FILE",
+    "USAGE",
+    "THROWS",
+    "RAISES",
+    "WRITES",
+    "READS",
+    "INHERITS",
+    "DECORATES",
+    "IMPLEMENTS",
+    "EMITS",
+    "LISTENS_ON",
+    "GRPC_CALLS",
+    "GRAPHQL_CALLS",
+    "TRPC_CALLS",
+};
+
+enum { ACCURACY_EDGE_TYPE_COUNT = sizeof(k_accuracy_edge_types) / sizeof(k_accuracy_edge_types[0]) };
+
+static int accuracy_edge_type_count(void) {
+    return ACCURACY_EDGE_TYPE_COUNT;
+}
+
+static void capture_accuracy_edge_counts(int counts[ACCURACY_EDGE_TYPE_COUNT]) {
+    int n = accuracy_edge_type_count();
+    for (int i = 0; i < n; i++) {
+        counts[i] = get_edge_count_by_type(k_accuracy_edge_types[i]);
+    }
+}
+
+static void print_accuracy_edge_diff(const int incr_counts[ACCURACY_EDGE_TYPE_COUNT],
+                                     const int full_counts[ACCURACY_EDGE_TYPE_COUNT]) {
+    int n = accuracy_edge_type_count();
+    printf("    [accuracy:edge-types] type incr full delta\n");
+    for (int i = 0; i < n; i++) {
+        int delta = incr_counts[i] - full_counts[i];
+        if (delta != 0) {
+            printf("    [accuracy:edge-types] %s %d %d %+d\n", k_accuracy_edge_types[i],
+                   incr_counts[i], full_counts[i], delta);
+        }
+    }
+}
+
+typedef struct {
+    int total;
+    int handler;
+    int prefix_bridge;
+    int infra_match;
+    int empty;
+    int other;
+} handle_breakdown_t;
+
+static handle_breakdown_t capture_handle_breakdown(void) {
+    handle_breakdown_t b = {0};
+    cbm_store_t *s = open_store();
+    if (!s) {
+        return b;
+    }
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    if (cbm_store_find_edges_by_type(s, g_project, "HANDLES", &edges, &count) == CBM_STORE_OK) {
+        b.total = count;
+        for (int i = 0; i < count; i++) {
+            const char *props = edges[i].properties_json ? edges[i].properties_json : "{}";
+            if (strstr(props, "\"source\":\"prefix_decorator_bridge\"")) {
+                b.prefix_bridge++;
+            } else if (strstr(props, "\"source\":\"infra_match\"")) {
+                b.infra_match++;
+            } else if (strstr(props, "\"handler\"")) {
+                b.handler++;
+            } else if (strcmp(props, "{}") == 0) {
+                b.empty++;
+            } else {
+                b.other++;
+            }
+        }
+        cbm_store_free_edges(edges, count);
+    }
+    cbm_store_close(s);
+    return b;
+}
+
+static void print_handle_breakdown(const char *label, handle_breakdown_t b) {
+    printf("    [accuracy:handles:%s] total=%d handler=%d prefix_bridge=%d infra_match=%d "
+           "empty=%d other=%d\n",
+           label, b.total, b.handler, b.prefix_bridge, b.infra_match, b.empty, b.other);
 }
 
 static int has_function(const char *name_pattern) {
@@ -808,6 +922,9 @@ TEST(incr_accuracy_vs_full) {
     int incr_nodes = get_node_count();
     int incr_edges = get_edge_count();
     int incr_calls = get_edge_count_by_type("CALLS");
+    int incr_type_counts[ACCURACY_EDGE_TYPE_COUNT] = {0};
+    capture_accuracy_edge_counts(incr_type_counts);
+    handle_breakdown_t incr_handles = capture_handle_breakdown();
 
     /* Delete DB, force full reindex */
     unlink(g_dbpath);
@@ -818,11 +935,20 @@ TEST(incr_accuracy_vs_full) {
     int full_nodes = get_node_count();
     int full_edges = get_edge_count();
     int full_calls = get_edge_count_by_type("CALLS");
+    int full_type_counts[ACCURACY_EDGE_TYPE_COUNT] = {0};
+    capture_accuracy_edge_counts(full_type_counts);
+    handle_breakdown_t full_handles = capture_handle_breakdown();
 
-    /* Within tight tolerance (±2 for dedup timing differences) */
-    ASSERT_LTE(abs(full_nodes - incr_nodes), 2);
-    ASSERT_LTE(abs(full_nodes - incr_nodes), 50);
-    ASSERT_LTE(abs(full_calls - incr_calls), 2);
+    /* Full and incremental should agree exactly on nodes/CALLS and stay within
+     * the named derived-edge tolerance while route reconciliation is refined. */
+    ASSERT_LTE(abs(full_nodes - incr_nodes), INCR_ACCURACY_NODE_TOLERANCE);
+    if (abs(full_edges - incr_edges) > INCR_ACCURACY_EDGE_TOLERANCE) {
+        print_accuracy_edge_diff(incr_type_counts, full_type_counts);
+        print_handle_breakdown("incr", incr_handles);
+        print_handle_breakdown("full", full_handles);
+        ASSERT_LTE(abs(full_edges - incr_edges), INCR_ACCURACY_EDGE_TOLERANCE);
+    }
+    ASSERT_LTE(abs(full_calls - incr_calls), INCR_ACCURACY_CALL_TOLERANCE);
 
     printf("    [accuracy] incr: %d nodes/%d edges, full: %d nodes/%d edges\n", incr_nodes,
            incr_edges, full_nodes, full_edges);

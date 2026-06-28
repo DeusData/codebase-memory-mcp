@@ -38,6 +38,11 @@ enum {
 #include <stdio.h>
 #include <string.h>
 
+static const char *const RN_PROPS_INFRA_MATCH = "{\"source\":\"infra_match\"}";
+static const char *const RN_PROPS_PREFIX_BRIDGE = "{\"source\":\"prefix_decorator_bridge\"}";
+static const char *const RN_SOURCE_INFRA_MATCH = "\"source\":\"infra_match\"";
+static const char *const RN_SOURCE_PREFIX_BRIDGE = "\"source\":\"prefix_decorator_bridge\"";
+
 /* True for characters that may appear in a ":name" route parameter. */
 static inline bool is_route_ident_char(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
@@ -325,6 +330,7 @@ static bool is_broker_route(const char *qn) {
 static int match_one_infra_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *infra,
                                  const char *infra_path, const char *svc_name,
                                  const cbm_gbuf_node_t **all_routes, int route_count) {
+    int matched = 0;
     for (int j = 0; j < route_count; j++) {
         const cbm_gbuf_node_t *handler_route = all_routes[j];
         if (is_broker_route(handler_route->qualified_name)) {
@@ -350,7 +356,8 @@ static int match_one_infra_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *infra,
         int path_match =
             (strlen(handler_path) > SKIP_ONE && (strstr(infra_path, handler_path) != NULL ||
                                                  strstr(handler_path, infra_path) != NULL));
-        int root_svc_match = (strcmp(handler_path, "/") == 0);
+        int root_svc_match =
+            (file_matches && strcmp(handler_path, "/") == 0 && strcmp(infra_path, "/") == 0);
         if (path_match || root_svc_match) {
             const cbm_gbuf_edge_t **fn_handles = NULL;
             int fn_hcount = 0;
@@ -358,12 +365,12 @@ static int match_one_infra_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *infra,
                                                &fn_hcount);
             for (int fh = 0; fh < fn_hcount; fh++) {
                 cbm_gbuf_insert_edge(gb, fn_handles[fh]->source_id, infra->id, "HANDLES",
-                                     "{\"source\":\"infra_match\"}");
+                                     RN_PROPS_INFRA_MATCH);
             }
-            return SKIP_ONE;
+            matched = SKIP_ONE;
         }
     }
-    return 0;
+    return matched;
 }
 
 /* Phase 2: Match infra Route URLs to handler Route nodes by URL path + service name. */
@@ -507,15 +514,12 @@ static void ensure_decorator_routes(cbm_gbuf_t *gb) {
     }
 }
 
-/* Phase 2b: Connect prefix Routes to decorator handler Functions.
- * For each prefix Route (__route__ANY__/path), find the CALLS edge leading to it
- * (from the registering file), derive the service directory, then find decorator
- * Routes in that directory tree and create HANDLES from their handler Functions
- * to the prefix Route. This bridges include_router → decorator → handler. */
-/* Bridge decorator handler Functions to a prefix Route. Returns number connected. */
-static int bridge_funcs_to_prefix(cbm_gbuf_t *gb, const cbm_gbuf_node_t *prefix_route,
-                                  const char *registrar_path, int dir_len,
-                                  const char *prefix_segs) {
+/* Link decorator handlers under one registrar directory to one prefix Route.
+ * Returns newly inserted links; cbm_gbuf_insert_edge deduplicates HANDLES. */
+static int bridge_decorator_handlers_to_prefix(cbm_gbuf_t *gb,
+                                               const cbm_gbuf_node_t *prefix_route,
+                                               const char *registrar_path, int dir_len,
+                                               const char *prefix_segs) {
     const cbm_gbuf_node_t **funcs = NULL;
     int func_count = 0;
     cbm_gbuf_find_by_label(gb, "Function", &funcs, &func_count);
@@ -535,14 +539,20 @@ static int bridge_funcs_to_prefix(cbm_gbuf_t *gb, const cbm_gbuf_node_t *prefix_
         if (prefix_segs && prefix_segs[0] && !strstr(func->file_path, prefix_segs)) {
             continue;
         }
+        int before = cbm_gbuf_edge_count(gb);
         cbm_gbuf_insert_edge(gb, func->id, prefix_route->id, "HANDLES",
-                             "{\"source\":\"prefix_decorator_bridge\"}");
-        connected++;
+                             RN_PROPS_PREFIX_BRIDGE);
+        if (cbm_gbuf_edge_count(gb) > before) {
+            connected++;
+        }
     }
     return connected;
 }
 
-/* Phase 2b: Connect prefix Routes to decorator handler Functions. */
+/* Phase 2b: Connect prefix Routes to decorator handler Functions.
+ * For each __route__ANY__/path target, inspect every CALLS registrar edge,
+ * derive that registrar's service directory, and link matching decorator
+ * handlers to the prefix Route. */
 static void connect_prefix_to_decorators(cbm_gbuf_t *gb) {
     const cbm_gbuf_node_t **routes = NULL;
     int route_count = 0;
@@ -551,6 +561,8 @@ static void connect_prefix_to_decorators(cbm_gbuf_t *gb) {
     }
 
     int connected = 0;
+    int prefix_routes = 0;
+    int registrar_edges = 0;
 
     for (int ri = 0; ri < route_count; ri++) {
         const cbm_gbuf_node_t *prefix_route = routes[ri];
@@ -559,6 +571,7 @@ static void connect_prefix_to_decorators(cbm_gbuf_t *gb) {
                 0) {
             continue;
         }
+        prefix_routes++;
 
         const cbm_gbuf_edge_t **calls_in = NULL;
         int calls_count = 0;
@@ -566,29 +579,39 @@ static void connect_prefix_to_decorators(cbm_gbuf_t *gb) {
         if (calls_count == 0) {
             continue;
         }
-
-        const cbm_gbuf_node_t *registrar = cbm_gbuf_find_by_id(gb, calls_in[0]->source_id);
-        if (!registrar || !registrar->file_path) {
-            continue;
-        }
-        const char *last_slash = strrchr(registrar->file_path, '/');
-        if (!last_slash) {
-            continue;
-        }
-        int dir_len = (int)(last_slash - registrar->file_path) + SKIP_ONE;
+        registrar_edges += calls_count;
 
         const char *prefix_path = prefix_route->name;
         const char *prefix_segs =
             (prefix_path && prefix_path[0] == '/') ? prefix_path + SKIP_ONE : prefix_path;
 
-        connected +=
-            bridge_funcs_to_prefix(gb, prefix_route, registrar->file_path, dir_len, prefix_segs);
+        for (int ci = 0; ci < calls_count; ci++) {
+            const cbm_gbuf_node_t *registrar = cbm_gbuf_find_by_id(gb, calls_in[ci]->source_id);
+            if (!registrar || !registrar->file_path) {
+                continue;
+            }
+            const char *last_slash = strrchr(registrar->file_path, '/');
+            if (!last_slash) {
+                continue;
+            }
+            int dir_len = (int)(last_slash - registrar->file_path) + SKIP_ONE;
+            connected += bridge_decorator_handlers_to_prefix(gb, prefix_route, registrar->file_path,
+                                                             dir_len, prefix_segs);
+        }
     }
 
     if (connected > 0) {
         char buf[CBM_SZ_16];
         snprintf(buf, sizeof(buf), "%d", connected);
         cbm_log_info("pass.prefix_bridge", "connected", buf);
+    }
+    if (cbm_log_get_level() <= CBM_LOG_DEBUG) {
+        char pbuf[CBM_SZ_16], rbuf[CBM_SZ_16], cbuf[CBM_SZ_16];
+        snprintf(pbuf, sizeof(pbuf), "%d", prefix_routes);
+        snprintf(rbuf, sizeof(rbuf), "%d", registrar_edges);
+        snprintf(cbuf, sizeof(cbuf), "%d", connected);
+        cbm_log_debug("pass.prefix_bridge.detail", "prefix_routes", pbuf, "registrar_edges", rbuf,
+                      "connected", cbuf);
     }
 }
 
@@ -1193,6 +1216,15 @@ static void create_sveltekit_routes(cbm_gbuf_t *gb) {
         snprintf(b3, sizeof(b3), "%d", ctx.handles_created);
         cbm_log_info("pass.sveltekit_routes", "files", b1, "routes", b2, "handles", b3);
     }
+}
+
+void cbm_pipeline_clear_route_derived_edges(cbm_gbuf_t *gb) {
+    if (!gb) {
+        return;
+    }
+    cbm_gbuf_delete_edges_by_type(gb, "DATA_FLOWS");
+    cbm_gbuf_delete_edges_by_type_matching_props(gb, "HANDLES", RN_SOURCE_PREFIX_BRIDGE);
+    cbm_gbuf_delete_edges_by_type_matching_props(gb, "HANDLES", RN_SOURCE_INFRA_MATCH);
 }
 
 void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb) {
