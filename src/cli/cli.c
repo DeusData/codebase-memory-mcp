@@ -1143,6 +1143,10 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     snprintf(path, sizeof(path), "%s/.kiro", home_dir);
     agents.kiro = dir_exists(path);
 
+    /* Pi agent: ~/.pi/agent/ */
+    snprintf(path, sizeof(path), "%s/.pi/agent", home_dir);
+    agents.pi = dir_exists(path);
+
     return agents;
 }
 
@@ -1676,6 +1680,16 @@ int cbm_upsert_antigravity_mcp(const char *binary_path, const char *config_path)
 }
 
 int cbm_remove_antigravity_mcp(const char *config_path) {
+    return cbm_remove_editor_mcp(config_path);
+}
+
+/* ── Pi agent MCP config (JSON, standard mcpServers format) ───── */
+
+int cbm_upsert_pi_mcp(const char *binary_path, const char *config_path) {
+    return cbm_install_editor_mcp(binary_path, config_path);
+}
+
+int cbm_remove_pi_mcp(const char *config_path) {
     return cbm_remove_editor_mcp(config_path);
 }
 
@@ -2934,6 +2948,7 @@ static void print_detected_agents(const cbm_detected_agents_t *a) {
         {a->cursor, "Cursor"},
         {a->openclaw, "OpenClaw"},
         {a->kiro, "Kiro"},
+        {a->pi, "Pi agent"},
     };
     printf("Detected agents:");
     bool any = false;
@@ -3181,6 +3196,14 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
             printf("  instructions: %s\n", ip);
         }
     }
+    if (agents->pi) {
+        char cp[CLI_BUF_1K];
+        char ip[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.pi/agent/mcp.json", home);
+        snprintf(ip, sizeof(ip), "%s/.pi/agent/AGENTS.md", home);
+        install_generic_agent_config("Pi agent", binary_path, cp, ip, dry_run,
+                                     cbm_upsert_pi_mcp);
+    }
 }
 
 /* Install MCP configs for editor-based agents (Zed, KiloCode, VS Code, OpenClaw). */
@@ -3346,6 +3369,7 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
         {det.cursor, "cursor"},
         {det.openclaw, "openclaw"},
         {det.kiro, "kiro"},
+        {det.pi, "pi"},
     };
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -3657,6 +3681,14 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
             cbm_remove_instructions(ip);
         }
         printf("Aider: removed instructions\n");
+    }
+    if (agents->pi) {
+        char cp[CLI_BUF_1K];
+        char ip[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.pi/agent/mcp.json", home);
+        snprintf(ip, sizeof(ip), "%s/.pi/agent/AGENTS.md", home);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Pi agent", cp, ip}, dry_run,
+                                  cbm_remove_pi_mcp);
     }
 }
 

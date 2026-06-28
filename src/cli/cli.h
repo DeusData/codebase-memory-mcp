@@ -128,6 +128,7 @@ typedef struct {
     bool cursor;      /* ~/.cursor/ exists */
     bool openclaw;    /* ~/.openclaw/ exists */
     bool kiro;        /* ~/.kiro/ exists */
+    bool pi;          /* ~/.pi/agent/ exists */
 } cbm_detected_agents_t;
 
 /* Detect which coding agents are installed.
@@ -154,6 +155,12 @@ int cbm_upsert_antigravity_mcp(const char *binary_path, const char *config_path)
 
 /* Remove CMM MCP entry from antigravity mcp_config.json. Returns 0 on success. */
 int cbm_remove_antigravity_mcp(const char *config_path);
+
+/* Pi agent: upsert MCP entry in ~/.pi/agent/mcp.json. Returns 0 on success. */
+int cbm_upsert_pi_mcp(const char *binary_path, const char *config_path);
+
+/* Remove CMM MCP entry from Pi agent mcp.json. Returns 0 on success. */
+int cbm_remove_pi_mcp(const char *config_path);
 
 /* ── Instructions file upsert ─────────────────────────────────── */
 
