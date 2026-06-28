@@ -781,6 +781,8 @@ static bool cross_file_call_exists(cbm_store_t *s, const char *project, const ch
     return found;
 }
 
+static cbm_config_t *incremental_test_config(const char *cache_dir);
+
 /* Regression: incremental re-index of an edited file must NOT drop inbound
  * cross-file CALLS edges whose source lives in an UNCHANGED file.
  *
@@ -817,9 +819,12 @@ TEST(pipeline_incremental_preserves_cross_file_calls) {
     snprintf(helper, sizeof(helper), "%s/pkg/util/helper.go", g_tmpdir);
     ASSERT_EQ(th_append_file(helper, "\n// incremental regression marker\n"), 0);
 
-    /* 3. Re-run on the SAME db_path → auto-routes to incremental re-index. */
+    /* 3. Re-run on the SAME db_path with incremental explicitly enabled. */
+    cbm_config_t *cfg = incremental_test_config(g_tmpdir);
+    ASSERT_NOT_NULL(cfg);
     cbm_pipeline_t *p2 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p2);
+    cbm_pipeline_apply_config(p2, cfg);
     ASSERT_EQ(cbm_pipeline_run(p2), 0);
 
     /* 4. The inbound cross-file CALLS edge must survive and the total CALLS
@@ -834,6 +839,7 @@ TEST(pipeline_incremental_preserves_cross_file_calls) {
     ASSERT_TRUE(cross_file_call_exists(s2, project2, "Serve", "Help"));
     cbm_store_close(s2);
     cbm_pipeline_free(p2);
+    cbm_config_close(cfg);
 
     teardown_test_repo();
     PASS();
@@ -4945,6 +4951,14 @@ static void cleanup_incremental_repo(void) {
     th_rmtree(g_incr_tmpdir);
 }
 
+static cbm_config_t *incremental_test_config(const char *cache_dir) {
+    cbm_config_t *cfg = cbm_config_open(cache_dir);
+    if (cfg) {
+        cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_REINDEX, "always");
+    }
+    return cfg;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  FastAPI Depends() edge tracking (PR #66, fix #27)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -5025,8 +5039,11 @@ TEST(incremental_full_then_noop) {
     cbm_store_close(s);
 
     /* Second: incremental — nothing changed → should be no-op */
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
 
@@ -5037,6 +5054,7 @@ TEST(incremental_full_then_noop) {
     ASSERT_EQ(nodes_after, nodes_before);
     cbm_store_close(s);
     free(project);
+    cbm_config_close(cfg);
 
     cleanup_incremental_repo();
     PASS();
@@ -5066,8 +5084,11 @@ TEST(incremental_detects_changed_file) {
     fclose(f);
 
     /* Second: incremental — should detect change and re-index */
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
 
     /* Verify node count increased (NewFunc was added) */
@@ -5078,6 +5099,7 @@ TEST(incremental_detects_changed_file) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     free(project);
+    cbm_config_close(cfg);
 
     cleanup_incremental_repo();
     PASS();
@@ -5102,8 +5124,11 @@ TEST(incremental_detects_deleted_file) {
     unlink(path);
 
     /* Second: incremental — should remove Helper nodes */
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
 
     /* Verify node count decreased (Helper's file was deleted) */
@@ -5114,6 +5139,7 @@ TEST(incremental_detects_deleted_file) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     free(project);
+    cbm_config_close(cfg);
 
     cleanup_incremental_repo();
     PASS();
@@ -5141,8 +5167,11 @@ TEST(incremental_new_file_added) {
     fclose(f);
 
     /* Second: incremental — should pick up Extra */
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
 
     cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
@@ -5152,6 +5181,7 @@ TEST(incremental_new_file_added) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     free(project);
+    cbm_config_close(cfg);
 
     cleanup_incremental_repo();
     PASS();
@@ -5176,6 +5206,8 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     }
     char dbpath[512];
     snprintf(dbpath, sizeof(dbpath), "%s/test.db", tmpdir);
+    cbm_config_t *cfg = incremental_test_config(tmpdir);
+    ASSERT_NOT_NULL(cfg);
 
     char path[512];
     FILE *f;
@@ -5219,6 +5251,7 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     /* Step 2: fast-mode reindex — tools/util.go MUST survive (additive semantics) */
     p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
 
@@ -5266,6 +5299,7 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
 
     p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
 
@@ -5303,6 +5337,7 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     cbm_store_close(s);
 
     free(project);
+    cbm_config_close(cfg);
     th_rmtree(tmpdir);
     PASS();
 }
@@ -5352,8 +5387,11 @@ TEST(incremental_k8s_manifest_indexed) {
     fclose(f);
 
     /* Incremental re-index */
+    cbm_config_t *cfg = incremental_test_config(tmpdir);
+    ASSERT_NOT_NULL(cfg);
     p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
 
@@ -5368,6 +5406,7 @@ TEST(incremental_k8s_manifest_indexed) {
     cbm_store_close(s);
 
     free(project);
+    cbm_config_close(cfg);
     th_rmtree(tmpdir);
     PASS();
 }
@@ -5410,8 +5449,11 @@ TEST(incremental_kustomize_module_indexed) {
     fclose(f);
 
     /* Incremental re-index */
+    cbm_config_t *cfg = incremental_test_config(tmpdir);
+    ASSERT_NOT_NULL(cfg);
     p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
 
@@ -5433,6 +5475,7 @@ TEST(incremental_kustomize_module_indexed) {
     ASSERT_TRUE(found_kust);
 
     free(project);
+    cbm_config_close(cfg);
     th_rmtree(tmpdir);
     PASS();
 }
@@ -5668,7 +5711,7 @@ TEST(config_registry_includes_mcp_timeout_knobs) {
 TEST(config_registry_includes_incremental_reindex_policy) {
     const cbm_config_entry_t *entry = find_config_entry(CBM_CONFIG_INCREMENTAL_REINDEX);
     ASSERT_NOT_NULL(entry);
-    ASSERT_STR_EQ(entry->default_val, "fast");
+    ASSERT_STR_EQ(entry->default_val, "off");
     ASSERT_STR_EQ(entry->category, "Indexing");
     ASSERT_STR_EQ(entry->range, "fast|always|off");
     PASS();
