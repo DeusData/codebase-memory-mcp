@@ -2200,6 +2200,18 @@ static void alarm_handler(int sig) {
     _exit(1);
 }
 
+static int count_substr_mcp(const char *s, const char *needle) {
+    int count = 0;
+    if (!s || !needle) return 0;
+    size_t nlen = strlen(needle);
+    if (nlen == 0) return 0;
+    while ((s = strstr(s, needle)) != NULL) {
+        count++;
+        s += nlen;
+    }
+    return count;
+}
+
 TEST(mcp_server_run_rapid_messages) {
     /* Simulate a client sending initialize + notifications/initialized +
      * tools/list all at once (no delays), which exercises the FILE*
@@ -2254,6 +2266,58 @@ TEST(mcp_server_run_rapid_messages) {
     cbm_mcp_server_free(srv);
     fclose(out_fp);
     /* in_fp already EOF; fclose cleans up */
+    fclose(in_fp);
+    PASS();
+}
+
+TEST(mcp_hidden_tools_reveal_sends_list_changed) {
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+
+    const char *msgs =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n"
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"_hidden_tools\",\"arguments\":{}}}\n"
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\",\"params\":{}}\n";
+    ssize_t written = write(fds[1], msgs, strlen(msgs));
+    ASSERT_TRUE(written > 0);
+    close(fds[1]);
+
+    FILE *in_fp = fdopen(fds[0], "r");
+    ASSERT_NOT_NULL(in_fp);
+    FILE *out_fp = tmpfile();
+    ASSERT_NOT_NULL(out_fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    signal(SIGALRM, alarm_handler);
+    alarm(5);
+    int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
+    alarm(0);
+    signal(SIGALRM, SIG_DFL);
+    ASSERT_EQ(rc, 0);
+
+    ASSERT_EQ(fseek(out_fp, 0, SEEK_END), 0);
+    long out_len = ftell(out_fp);
+    ASSERT_TRUE(out_len > 0);
+    rewind(out_fp);
+
+    char *buf = malloc((size_t)out_len + 1);
+    ASSERT_NOT_NULL(buf);
+    size_t nread = fread(buf, 1, (size_t)out_len, out_fp);
+    buf[nread] = '\0';
+
+    ASSERT_NOT_NULL(strstr(buf, "\"id\":1"));
+    ASSERT_NOT_NULL(strstr(buf, "\"id\":2"));
+    ASSERT_NOT_NULL(strstr(buf, "\"id\":3"));
+    ASSERT_NOT_NULL(strstr(buf, "notifications/tools/list_changed"));
+    ASSERT_EQ(count_substr_mcp(buf, "\"name\":\"index_repository\""), 1);
+    ASSERT_EQ(count_substr_mcp(buf, "\"name\":\"get_architecture\""), 1);
+
+    free(buf);
+    cbm_mcp_server_free(srv);
+    fclose(out_fp);
     fclose(in_fp);
     PASS();
 }
@@ -2449,6 +2513,7 @@ SUITE(mcp) {
     /* Poll/getline FILE* buffering fix */
 #ifndef _WIN32
     RUN_TEST(mcp_server_run_rapid_messages);
+    RUN_TEST(mcp_hidden_tools_reveal_sends_list_changed);
 #endif
 
     /* Snippet resolution (port of snippet_test.go) */
