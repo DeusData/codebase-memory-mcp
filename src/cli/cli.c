@@ -2703,7 +2703,7 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "true|false",
      "Enable for automatic indexing; disable for manual control, CI, or embedded read-only contexts."},
     {"auto_index_limit", "50000", "CBM_AUTO_INDEX_LIMIT", "Indexing",
-     "Max files before auto-index is skipped (0=no limit, index everything)",
+     "Max indexable files before auto-index is skipped (0=no limit, index everything)",
      "0-10000000",
      "Protects against accidentally indexing huge monorepos. Raise for large codebases. "
      "Set 0 to disable the limit and always index regardless of repo size."},
