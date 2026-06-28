@@ -1012,6 +1012,12 @@ TEST(path_project_auto_indexes_separate_directory) {
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
+    const char *old_auto_index = getenv("CBM_AUTO_INDEX");
+    char *old_auto_index_copy = old_auto_index ? strdup(old_auto_index) : NULL;
+    if (old_auto_index) {
+        ASSERT_NOT_NULL(old_auto_index_copy);
+    }
+    cbm_setenv("CBM_AUTO_INDEX", "true", 1);
 
     /* First query: session project path → establishes session_root internally */
     char args1[512];
@@ -1029,12 +1035,16 @@ TEST(path_project_auto_indexes_separate_directory) {
              "{\"project\":\"%s\",\"pattern\":\"path_autoindex_sentinel\"}", target_tmp);
     char *raw2 = cbm_mcp_handle_tool(srv, "search_graph", args2);
     char *resp = extract_text(raw2); free(raw2);
-    ASSERT_NOT_NULL(resp);
-
-    bool has_match = strstr(resp, "path_autoindex_sentinel") != NULL;
+    bool has_match = resp && strstr(resp, "path_autoindex_sentinel") != NULL;
     free(resp);
 
     cbm_mcp_server_free(srv);
+    if (old_auto_index_copy) {
+        cbm_setenv("CBM_AUTO_INDEX", old_auto_index_copy, 1);
+        free(old_auto_index_copy);
+    } else {
+        cbm_unsetenv("CBM_AUTO_INDEX");
+    }
     unlink(target_src); rmdir(target_tmp);
     unlink(session_src); rmdir(session_tmp);
 

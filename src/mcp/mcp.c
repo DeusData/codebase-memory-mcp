@@ -973,6 +973,28 @@ static int cbm_mcp_update_check_timeout_s(cbm_mcp_server_t *srv) {
                                       CBM_SZ_256);
 }
 
+static bool cbm_mcp_auto_index_enabled(cbm_mcp_server_t *srv) {
+    bool auto_index = (srv && srv->config);
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
+    const char *auto_env = getenv("CBM_AUTO_INDEX");
+    if (auto_env && auto_env[0]) {
+        return strcmp(auto_env, "true") == 0 || strcmp(auto_env, "1") == 0 ||
+               strcmp(auto_env, "on") == 0;
+    }
+    if (srv && srv->config) {
+        return cbm_config_get_bool(srv->config, CBM_CONFIG_AUTO_INDEX, true);
+    }
+    return auto_index;
+}
+
+static int cbm_mcp_auto_index_limit(cbm_mcp_server_t *srv) {
+    if (srv && srv->config) {
+        return cbm_config_get_int(srv->config, CBM_CONFIG_AUTO_INDEX_LIMIT,
+                                  CBM_DEFAULT_AUTO_INDEX_LIMIT);
+    }
+    return CBM_DEFAULT_AUTO_INDEX_LIMIT;
+}
+
 /* ── Tool list (needs full struct definition above) ──────────── */
 
 char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
@@ -1486,17 +1508,18 @@ static char *build_project_list_error(const char *reason) {
 }
 
 /* Auto-index on first use: when store is NULL, session_root is set, and
- * auto_index_on_first_use is enabled, run the pipeline synchronously.
+ * auto_index is enabled by config/env, run the pipeline synchronously.
  * This eliminates the need for an explicit index_repository call.
- * MCP is strict request-response — synchronous blocking is safe here
- * (same pattern used by handle_index_repository at line ~1959). */
+ * MCP is strict request-response — synchronous blocking matches the
+ * handle_index_repository path. */
 /* REQUIRE_STORE_EX: like REQUIRE_STORE but runs _pre_free_cleanup before freeing
  * project and returning.  Use this in handlers that allocate extra heap locals
  * (e.g. qn, snippet_mode) that must also be freed on the early-return paths. */
 #define REQUIRE_STORE_EX(store, project, _pre_free_cleanup)                                       \
     do {                                                                                          \
         if (!(store) && srv->session_root[0] && access(srv->session_root, F_OK) == 0) {              \
-            /* Try auto-index on first use (only if session_root is a real directory) */           \
+            /* Join an already-started background index, then start synchronous first-use            \
+             * indexing only when auto_index is enabled by config/env. */                           \
             if (srv->autoindex_active) {                                                          \
                 /* Background thread running — wait for it to complete */                         \
                 cbm_thread_join(&srv->autoindex_tid);                                              \
@@ -1504,7 +1527,7 @@ static char *build_project_list_error(const char *reason) {
                 /* Re-resolve store after background index finished */                            \
                 store = resolve_store(srv, project);                                              \
             }                                                                                     \
-            if (!(store)) {                                                                       \
+            if (!(store) && cbm_mcp_auto_index_enabled(srv)) {                                     \
                 /* No background thread or it failed — try sync index */                          \
                 cbm_pipeline_t *_p = cbm_pipeline_new(                                            \
                     srv->session_root, NULL, CBM_MODE_FULL);                                      \
@@ -2246,14 +2269,14 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
     }
     cbm_store_t *store = resolve_store(srv, db_project);
 
-    /* Auto-index on first use (same logic as REQUIRE_STORE macro). */
+    /* Auto-index on first use (same enablement as REQUIRE_STORE). */
     if (!store && srv->session_root[0] && access(srv->session_root, F_OK) == 0) {
         if (srv->autoindex_active) {
             cbm_thread_join(&srv->autoindex_tid);
             srv->autoindex_active = false;
             store = resolve_store(srv, db_project);
         }
-        if (!store) {
+        if (!store && cbm_mcp_auto_index_enabled(srv)) {
             cbm_pipeline_t *_p = cbm_pipeline_new(srv->session_root, NULL, CBM_MODE_FULL);
             if (_p) {
                 cbm_pipeline_apply_config(_p, srv->config);
@@ -2284,7 +2307,7 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
      *   project="/path/to/react-grid-layout" (in ~/myapp/.gitignore)
      * session_root stays ~/myapp; react-grid-layout is never indexed by the block
      * above.  This block catches that case and indexes the exact requested path. */
-    if (!store && _raw_path) {
+    if (!store && _raw_path && cbm_mcp_auto_index_enabled(srv)) {
         struct stat _st;
         if (stat(_raw_path, &_st) == 0 && S_ISDIR(_st.st_mode)) {
             cbm_pipeline_t *_p = cbm_pipeline_new(_raw_path, NULL, CBM_MODE_FULL);
@@ -7108,23 +7131,10 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     if (!needs_index) return;
 
     /* Check auto_index: env var CBM_AUTO_INDEX > config DB > no-config manual.
-     * Production servers attach a config store before run, so the registry
-     * default remains true there. Embedded/test servers without config stay
-     * manual unless the env var explicitly opts in. */
-    bool auto_index = (srv->config != NULL);
-    int file_limit = CBM_DEFAULT_AUTO_INDEX_LIMIT;
-    // NOLINTNEXTLINE(concurrency-mt-unsafe)
-    const char *auto_env = getenv("CBM_AUTO_INDEX");
-    if (auto_env && auto_env[0]) {
-        auto_index = (strcmp(auto_env, "true") == 0 || strcmp(auto_env, "1") == 0);
-    } else if (srv->config) {
-        auto_index = cbm_config_get_bool(srv->config, CBM_CONFIG_AUTO_INDEX, true);
-    }
-    if (srv->config) {
-        file_limit =
-            cbm_config_get_int(srv->config, CBM_CONFIG_AUTO_INDEX_LIMIT,
-                               CBM_DEFAULT_AUTO_INDEX_LIMIT);
-    }
+     * Shared with synchronous first-use indexing so auto_index=false cannot
+     * be bypassed by a later search/trace request. */
+    bool auto_index = cbm_mcp_auto_index_enabled(srv);
+    int file_limit = cbm_mcp_auto_index_limit(srv);
 
     if (!auto_index) {
         cbm_log_info("autoindex.skip", "reason", "disabled", "hint",
