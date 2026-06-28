@@ -32,7 +32,7 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     /* VCS */
     ".git", ".hg", ".svn", ".worktrees",
     /* IDE */
-    ".idea", ".vs", ".vscode", ".eclipse", ".claude",
+    ".idea", ".vs", ".vscode", ".eclipse", ".claude", ".claude-worktrees",
     /* Python */
     ".cache", ".eggs", ".env", ".mypy_cache", ".nox", ".pytest_cache", ".ruff_cache", ".tox",
     ".venv", "__pycache__", "env", "htmlcov", "site-packages", "venv",

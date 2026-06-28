@@ -735,6 +735,83 @@ TEST(cli_gemini_mcp_install) {
     PASS();
 }
 
+TEST(cli_openclaw_mcp_install_uses_nested_servers) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-openclaw-mcp-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/.openclaw/openclaw.json", tmpdir);
+
+    int rc = cbm_install_openclaw_mcp("/usr/local/bin/codebase-memory-mcp", configpath);
+    ASSERT_EQ(rc, 0);
+
+    const char *data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "\"mcp\"") != NULL);
+    ASSERT(strstr(data, "\"servers\"") != NULL);
+    ASSERT(strstr(data, "\"enabled\": true") != NULL);
+    ASSERT(strstr(data, "\"command\": \"/usr/local/bin/codebase-memory-mcp\"") != NULL);
+    ASSERT(strstr(data, "\"args\": []") != NULL);
+    ASSERT(strstr(data, "\"mcpServers\"") == NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_openclaw_mcp_preserves_existing_config) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-openclaw-mcp-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.openclaw", tmpdir);
+    test_mkdirp(dir);
+
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/openclaw.json", dir);
+    write_test_file(configpath,
+                    "{\"theme\":\"dark\",\"mcp\":{\"servers\":{\"other\":{\"command\":\"x\"}}}}");
+
+    int rc = cbm_install_openclaw_mcp("/usr/local/bin/codebase-memory-mcp", configpath);
+    ASSERT_EQ(rc, 0);
+
+    const char *data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "theme") != NULL);
+    ASSERT(strstr(data, "other") != NULL);
+    ASSERT(strstr(data, "codebase-memory-mcp") != NULL);
+    ASSERT(strstr(data, "\"mcpServers\"") == NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_openclaw_mcp_uninstall_uses_nested_servers) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-openclaw-mcp-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/.openclaw/openclaw.json", tmpdir);
+
+    ASSERT_EQ(cbm_install_openclaw_mcp("/usr/local/bin/codebase-memory-mcp", configpath), 0);
+    ASSERT_EQ(cbm_remove_openclaw_mcp(configpath), 0);
+
+    const char *data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "\"mcp\"") != NULL);
+    ASSERT(strstr(data, "\"servers\"") != NULL);
+    ASSERT(strstr(data, "\"codebase-memory-mcp\"") == NULL);
+    ASSERT(strstr(data, "\"mcpServers\"") == NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  VS Code MCP config tests
  * ═══════════════════════════════════════════════════════════════════ */
@@ -2849,6 +2926,9 @@ SUITE(cli) {
     RUN_TEST(cli_editor_mcp_preserves_others);
     RUN_TEST(cli_editor_mcp_uninstall);
     RUN_TEST(cli_gemini_mcp_install);
+    RUN_TEST(cli_openclaw_mcp_install_uses_nested_servers);
+    RUN_TEST(cli_openclaw_mcp_preserves_existing_config);
+    RUN_TEST(cli_openclaw_mcp_uninstall_uses_nested_servers);
 
     /* VS Code MCP (2 tests — install_test.go) */
     RUN_TEST(cli_vscode_mcp_install);
