@@ -5602,6 +5602,42 @@ TEST(pipeline_unit_threshold_setters_clamp_invalid_values) {
     PASS();
 }
 
+TEST(pipeline_apply_config_sets_all_thresholds) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pipeline_cfg_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SIMILARITY_THRESHOLD, "0.71"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_HTTPLINK_MIN_CONFIDENCE, "0.26"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SEMANTIC_THRESHOLD, "0.76"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_MIN_COUPLING, "0.31"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_LSP_CONFIDENCE_FLOOR, "0.61"), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+
+    ASSERT_TRUE(cbm_pipeline_similarity_threshold(p) > 0.70);
+    ASSERT_TRUE(cbm_pipeline_similarity_threshold(p) < 0.72);
+    ASSERT_TRUE(cbm_pipeline_httplink_min_confidence(p) > 0.25);
+    ASSERT_TRUE(cbm_pipeline_httplink_min_confidence(p) < 0.27);
+    ASSERT_TRUE(cbm_pipeline_semantic_threshold(p) > 0.75);
+    ASSERT_TRUE(cbm_pipeline_semantic_threshold(p) < 0.77);
+    ASSERT_TRUE(cbm_pipeline_githistory_min_coupling(p) > 0.30);
+    ASSERT_TRUE(cbm_pipeline_githistory_min_coupling(p) < 0.32);
+    ASSERT_TRUE(cbm_pipeline_lsp_confidence_floor(p) > 0.60);
+    ASSERT_TRUE(cbm_pipeline_lsp_confidence_floor(p) < 0.62);
+
+    cbm_pipeline_free(p);
+    cbm_config_close(cfg);
+    rm_rf(tmpdir);
+    PASS();
+}
+
 static const cbm_config_entry_t *find_config_entry(const char *key) {
     for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
         if (strcmp(CBM_CONFIG_REGISTRY[i].key, key) == 0) {
@@ -6149,6 +6185,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cancel_null);
     RUN_TEST(pipeline_run_null);
     RUN_TEST(pipeline_unit_threshold_setters_clamp_invalid_values);
+    RUN_TEST(pipeline_apply_config_sets_all_thresholds);
     RUN_TEST(config_registry_includes_mcp_timeout_knobs);
     /* File persistence */
     RUN_TEST(store_file_persistence);

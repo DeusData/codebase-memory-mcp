@@ -14,6 +14,7 @@
 
 enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #define PL_NSEC_PER_SEC 1000000000LL
+#include "cli/cli.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
 #include "pipeline/pipeline_internal.h"
@@ -221,6 +222,42 @@ void cbm_pipeline_set_githistory_min_coupling(cbm_pipeline_t *p, double threshol
 void cbm_pipeline_set_lsp_confidence_floor(cbm_pipeline_t *p, double threshold) {
     if (p) {
         p->lsp_confidence_floor = pipeline_unit_threshold(threshold);
+    }
+}
+
+void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg) {
+    if (!p || !cfg) {
+        return;
+    }
+
+    double sim_thresh =
+        cbm_config_get_double(cfg, CBM_CONFIG_SIMILARITY_THRESHOLD, 0.0);
+    if (sim_thresh > 0.0) {
+        cbm_pipeline_set_similarity_threshold(p, sim_thresh);
+    }
+
+    double httplink_min =
+        cbm_config_get_double(cfg, CBM_CONFIG_HTTPLINK_MIN_CONFIDENCE, 0.0);
+    if (httplink_min > 0.0) {
+        cbm_pipeline_set_httplink_min_confidence(p, httplink_min);
+    }
+
+    double semantic_thresh =
+        cbm_config_get_double(cfg, CBM_CONFIG_SEMANTIC_THRESHOLD, 0.0);
+    if (semantic_thresh > 0.0) {
+        cbm_pipeline_set_semantic_threshold(p, semantic_thresh);
+    }
+
+    double gh_min =
+        cbm_config_get_double(cfg, CBM_CONFIG_GITHISTORY_MIN_COUPLING, 0.0);
+    if (gh_min > 0.0) {
+        cbm_pipeline_set_githistory_min_coupling(p, gh_min);
+    }
+
+    double lsp_floor =
+        cbm_config_get_double(cfg, CBM_CONFIG_LSP_CONFIDENCE_FLOOR, 0.0);
+    if (lsp_floor > 0.0) {
+        cbm_pipeline_set_lsp_confidence_floor(p, lsp_floor);
     }
 }
 

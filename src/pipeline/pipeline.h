@@ -22,6 +22,7 @@
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
 typedef struct cbm_gbuf cbm_gbuf_t;
+typedef struct cbm_config cbm_config_t;
 
 /* ── Opaque handle ──────────────────────────────────────────────── */
 
@@ -76,6 +77,14 @@ void cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name);
  * Must be called before cbm_pipeline_run(). Pipeline does NOT own the store. */
 void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store);
 
+/* Config keys consumed by cbm_pipeline_apply_config(). A value <=0 leaves the
+ * corresponding pass on its compiled-in default. */
+#define CBM_CONFIG_SIMILARITY_THRESHOLD "similarity_threshold"
+#define CBM_CONFIG_HTTPLINK_MIN_CONFIDENCE "httplink_min_confidence"
+#define CBM_CONFIG_SEMANTIC_THRESHOLD "semantic_threshold"
+#define CBM_CONFIG_GITHISTORY_MIN_COUPLING "githistory_min_coupling"
+#define CBM_CONFIG_LSP_CONFIDENCE_FLOOR "lsp_confidence_floor"
+
 /* Set the Jaccard similarity threshold for SIMILAR-edge creation (pass_similarity).
  * <=0 (or unset) uses the CBM_MINHASH_JACCARD_THRESHOLD default. Before run(). */
 void cbm_pipeline_set_similarity_threshold(cbm_pipeline_t *p, double threshold);
@@ -83,6 +92,8 @@ void cbm_pipeline_set_httplink_min_confidence(cbm_pipeline_t *p, double threshol
 void cbm_pipeline_set_semantic_threshold(cbm_pipeline_t *p, double threshold);
 void cbm_pipeline_set_githistory_min_coupling(cbm_pipeline_t *p, double threshold);
 void cbm_pipeline_set_lsp_confidence_floor(cbm_pipeline_t *p, double threshold);
+/* Apply config-backed thresholds. NULL cfg is allowed and leaves defaults. */
+void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg);
 double cbm_pipeline_similarity_threshold(const cbm_pipeline_t *p);
 double cbm_pipeline_httplink_min_confidence(const cbm_pipeline_t *p);
 double cbm_pipeline_semantic_threshold(const cbm_pipeline_t *p);

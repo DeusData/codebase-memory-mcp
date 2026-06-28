@@ -455,7 +455,7 @@ int cbm_discover_installed_deps(cbm_pkg_manager_t mgr, const char *project_root,
  * With max 1000 files/dep at ~1ms/file: ~1s/dep * 20 deps = ~20s worst case.
  * Memory: O(symbols_per_dep) peak per dep pipeline, freed between iterations. */
 int cbm_dep_auto_index(const char *project_name, const char *project_root,
-                       cbm_store_t *store, int max_deps) {
+                       cbm_store_t *store, int max_deps, cbm_config_t *cfg) {
     if (max_deps == 0) return 0;
     int effective_max = (max_deps < 0) ? INT_MAX : max_deps;
 
@@ -477,6 +477,7 @@ int cbm_dep_auto_index(const char *project_name, const char *project_root,
 
         cbm_pipeline_t *dp = cbm_pipeline_new(deps[i].path, NULL, CBM_MODE_DEP);
         if (dp) {
+            cbm_pipeline_apply_config(dp, cfg);
             cbm_pipeline_set_project_name(dp, dep_proj);
             cbm_pipeline_set_flush_store(dp, store);
             if (cbm_pipeline_run(dp) == 0) reindexed++;

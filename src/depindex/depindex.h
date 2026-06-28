@@ -18,6 +18,7 @@
 
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
+typedef struct cbm_config cbm_config_t;
 
 /* ── Constants ─────────────────────────────────────────────────── */
 
@@ -136,9 +137,11 @@ void cbm_dep_discovered_free(cbm_dep_discovered_t *deps, int count);
 
 /* Detect ecosystem, discover deps from fresh graph, index via flush.
  * Called AFTER dump_to_sqlite by index_repository, watcher, autoindex.
+ * cfg may be NULL; when present, dependency pipelines use the same indexing
+ * thresholds as the parent project pipeline.
  * Returns number of deps indexed, or 0 if none. */
 int cbm_dep_auto_index(const char *project_name, const char *project_root,
-                       cbm_store_t *store, int max_deps);
+                       cbm_store_t *store, int max_deps, cbm_config_t *cfg);
 
 /* ── Cross-Boundary Edges ──────────────────────────────────────── */
 
