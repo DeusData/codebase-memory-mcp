@@ -5,6 +5,7 @@
  * poll_once behavior.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/platform.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <watcher/watcher.h>
@@ -187,6 +188,73 @@ TEST(watcher_poll_nonexistent_path) {
 
     cbm_watcher_free(w);
     cbm_store_close(store);
+    PASS();
+}
+
+TEST(watcher_prunes_sustained_missing_root) {
+    char rootdir[256];
+    snprintf(rootdir, sizeof(rootdir), "/tmp/cbm_watcher_stale_root_XXXXXX");
+    if (!cbm_mkdtemp(rootdir)) {
+        SKIP("cbm_mkdtemp root failed");
+    }
+
+    char cachedir[256];
+    snprintf(cachedir, sizeof(cachedir), "/tmp/cbm_watcher_stale_cache_XXXXXX");
+    if (!cbm_mkdtemp(cachedir)) {
+        th_rmtree(rootdir);
+        SKIP("cbm_mkdtemp cache failed");
+    }
+
+    char saved_cache_dir[1024];
+    bool had_cache_dir =
+        cbm_safe_getenv("CBM_CACHE_DIR", saved_cache_dir, sizeof(saved_cache_dir), NULL) != NULL;
+    cbm_setenv("CBM_CACHE_DIR", cachedir, 1);
+
+    char db_path[512];
+    char wal_path[512];
+    char shm_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/stale-project.db", cachedir);
+    snprintf(wal_path, sizeof(wal_path), "%s/stale-project.db-wal", cachedir);
+    snprintf(shm_path, sizeof(shm_path), "%s/stale-project.db-shm", cachedir);
+    th_write_file(db_path, "db\n");
+    th_write_file(wal_path, "wal\n");
+    th_write_file(shm_path, "shm\n");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "stale-project", rootdir);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+
+    /* Existing root: first poll initializes baseline only. */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+
+    th_rmtree(rootdir);
+
+    /* Transient miss: keep the project and cached DB. */
+    cbm_watcher_touch(w, "stale-project");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+    ASSERT_EQ(access(db_path, F_OK), 0);
+
+    /* Sustained absence: prune watcher state and cached DB files. */
+    cbm_watcher_touch(w, "stale-project");
+    cbm_watcher_poll_once(w);
+    cbm_watcher_touch(w, "stale-project");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+    ASSERT_NEQ(access(db_path, F_OK), 0);
+    ASSERT_NEQ(access(wal_path, F_OK), 0);
+    ASSERT_NEQ(access(shm_path, F_OK), 0);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    if (had_cache_dir) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_dir, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(cachedir);
     PASS();
 }
 
@@ -1508,6 +1576,7 @@ SUITE(watcher) {
     /* Polling */
     RUN_TEST(watcher_poll_no_projects);
     RUN_TEST(watcher_poll_nonexistent_path);
+    RUN_TEST(watcher_prunes_sustained_missing_root);
     RUN_TEST(watcher_poll_this_repo);
     RUN_TEST(watcher_stop_flag);
 

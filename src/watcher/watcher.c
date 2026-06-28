@@ -22,6 +22,7 @@
 #include "foundation/compat.h"
 #include "foundation/compat_thread.h"
 #include "foundation/compat_fs.h"
+#include "foundation/platform.h"
 #include "foundation/str_util.h"
 
 #include <stdio.h>
@@ -39,6 +40,7 @@ typedef struct {
     char last_head[CBM_SZ_64]; /* git HEAD hash */
     bool is_git;               /* false → skip polling */
     bool baseline_done;        /* true after first poll */
+    int missing_root_count;    /* consecutive polls where root_path was absent */
     int file_count;            /* approximate, for interval calc */
     int interval_ms;           /* adaptive poll interval */
     int64_t next_poll_ns;      /* next poll time (monotonic ns) */
@@ -65,6 +67,7 @@ struct cbm_watcher {
 #define POLL_BASE_MS 5000
 #define POLL_FILE_STEP 500 /* add 1s per this many files */
 #define POLL_MAX_MS 60000
+#define MISSING_ROOT_DELETE_AFTER 3
 
 /* Sleep chunk for responsive shutdown (ms) */
 #define SLEEP_CHUNK_MS 500
@@ -241,6 +244,32 @@ static void state_free(project_state_t *s) {
     free(s);
 }
 
+static bool root_path_exists(const char *root_path) {
+    struct stat st;
+    return root_path && stat(root_path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static void delete_cached_project_db(const char *project_name) {
+    if (!cbm_validate_project_name(project_name)) {
+        return;
+    }
+
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) {
+        return;
+    }
+
+    char path[CBM_SZ_1K];
+    char wal[CBM_SZ_1K];
+    char shm[CBM_SZ_1K];
+    snprintf(path, sizeof(path), "%s/%s.db", cache_dir, project_name);
+    snprintf(wal, sizeof(wal), "%s-wal", path);
+    snprintf(shm, sizeof(shm), "%s-shm", path);
+    (void)cbm_unlink(path);
+    (void)cbm_unlink(wal);
+    (void)cbm_unlink(shm);
+}
+
 /* Hash table foreach callback to free state entries */
 static void free_state_entry(const char *key, void *val, void *ud) {
     (void)key;
@@ -410,12 +439,49 @@ typedef struct {
     int reindexed;
 } poll_ctx_t;
 
+static void prune_missing_project(cbm_watcher_t *w, project_state_t *s) {
+    if (!w || !s || !s->project_name) {
+        return;
+    }
+
+    char project_name[CBM_SZ_1K];
+    snprintf(project_name, sizeof(project_name), "%s", s->project_name);
+
+    bool removed = false;
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *current = cbm_ht_get(w->projects, project_name);
+    if (current == s) {
+        delete_cached_project_db(project_name);
+        cbm_ht_delete(w->projects, project_name);
+        state_free(s);
+        removed = true;
+    }
+    cbm_mutex_unlock(&w->projects_lock);
+
+    if (removed) {
+        cbm_log_info("watcher.root_pruned", "project", project_name);
+    }
+}
+
 static void poll_project(const char *key, void *val, void *ud) {
     (void)key;
     poll_ctx_t *ctx = ud;
     project_state_t *s = val;
     if (!s) {
         return;
+    }
+
+    if (!root_path_exists(s->root_path)) {
+        s->missing_root_count++;
+        cbm_log_warn("watcher.root_missing", "project", s->project_name, "path", s->root_path);
+        if (s->missing_root_count >= MISSING_ROOT_DELETE_AFTER) {
+            prune_missing_project(ctx->w, s);
+        }
+        return;
+    }
+    if (s->missing_root_count > 0) {
+        cbm_log_info("watcher.root_restored", "project", s->project_name, "path", s->root_path);
+        s->missing_root_count = 0;
     }
 
     /* Initialize baseline on first poll */
