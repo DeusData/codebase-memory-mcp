@@ -9,7 +9,7 @@ description: >
 
 # Codebase Exploration via Knowledge Graph
 
-Use graph tools for structural code questions. They return precise results in ~500 tokens vs ~80K for grep-based exploration.
+Use graph tools for structural code questions. They return scoped graph results instead of broad file-search output.
 
 ## Workflow
 
@@ -25,7 +25,7 @@ If the project is missing from the list:
 index_repository(repo_path="/path/to/project")
 ```
 
-If already indexed, skip — auto-sync keeps the graph fresh.
+If already indexed, skip manual indexing unless you need an immediate refresh; auto-sync can refresh the graph when configured.
 
 ### Step 2: Get a structural overview
 
