@@ -22,6 +22,67 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+static const yyjson_val *tool_array_from_doc(yyjson_doc *doc) {
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (!root) return NULL;
+    yyjson_val *tools = yyjson_obj_get(root, "tools");
+    if (tools && yyjson_is_arr(tools)) return tools;
+    yyjson_val *result = yyjson_obj_get(root, "result");
+    if (!result) return NULL;
+    tools = yyjson_obj_get(result, "tools");
+    return tools && yyjson_is_arr(tools) ? tools : NULL;
+}
+
+static bool tool_list_has_exact_name(const char *json, const char *name) {
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) return false;
+    const yyjson_val *tools = tool_array_from_doc(doc);
+    bool found = false;
+    if (tools) {
+        yyjson_arr_iter it;
+        yyjson_arr_iter_init((yyjson_val *)tools, &it);
+        yyjson_val *tool;
+        while ((tool = yyjson_arr_iter_next(&it)) != NULL) {
+            yyjson_val *tool_name = yyjson_obj_get(tool, "name");
+            if (tool_name && yyjson_is_str(tool_name) &&
+                strcmp(yyjson_get_str(tool_name), name) == 0) {
+                found = true;
+                break;
+            }
+        }
+    }
+    yyjson_doc_free(doc);
+    return found;
+}
+
+static size_t tool_list_exact_count(const char *json) {
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) return 0;
+    const yyjson_val *tools = tool_array_from_doc(doc);
+    size_t count = tools ? yyjson_arr_size(tools) : 0;
+    yyjson_doc_free(doc);
+    return count;
+}
+
+static char *save_tool_mode(void) {
+    const char *mode = getenv("CBM_TOOL_MODE");
+    if (!mode) return NULL;
+    size_t len = strlen(mode);
+    char *copy = (char *)malloc(len + 1);
+    if (!copy) return NULL;
+    memcpy(copy, mode, len + 1);
+    return copy;
+}
+
+static void restore_tool_mode(char *saved) {
+    if (saved) {
+        setenv("CBM_TOOL_MODE", saved, 1);
+        free(saved);
+    } else {
+        unsetenv("CBM_TOOL_MODE");
+    }
+}
+
 /* ── 1. Tool visibility tests ─────────────────────────────── */
 
 TEST(streamlined_mode_shows_5_default_tools) {
@@ -67,6 +128,64 @@ TEST(classic_mode_shows_all_15_tools) {
     ASSERT_NULL(strstr(resp, "search_code_graph"));
     free(resp);
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(api_surface_default_streamlined_regression_gate) {
+    char *saved_mode = save_tool_mode();
+    unsetenv("CBM_TOOL_MODE");
+
+    char *json = cbm_mcp_tools_list(NULL);
+    restore_tool_mode(saved_mode);
+    ASSERT_NOT_NULL(json);
+
+    /* Five user-facing tools plus the _hidden_tools discovery hint. */
+    ASSERT_EQ(6, tool_list_exact_count(json));
+    ASSERT(tool_list_has_exact_name(json, "search_graph"));
+    ASSERT(tool_list_has_exact_name(json, "query_graph"));
+    ASSERT(tool_list_has_exact_name(json, "search_code"));
+    ASSERT(tool_list_has_exact_name(json, "trace_call_path"));
+    ASSERT(tool_list_has_exact_name(json, "get_code"));
+    ASSERT(tool_list_has_exact_name(json, "_hidden_tools"));
+
+    ASSERT(!tool_list_has_exact_name(json, "index_repository"));
+    ASSERT(!tool_list_has_exact_name(json, "get_code_snippet"));
+    ASSERT(!tool_list_has_exact_name(json, "get_architecture"));
+    ASSERT(!tool_list_has_exact_name(json, "index_dependencies"));
+    ASSERT(!tool_list_has_exact_name(json, "search_code_graph"));
+    free(json);
+    PASS();
+}
+
+TEST(api_surface_classic_regression_gate) {
+    char *saved_mode = save_tool_mode();
+    setenv("CBM_TOOL_MODE", "classic", 1);
+
+    char *json = cbm_mcp_tools_list(NULL);
+    restore_tool_mode(saved_mode);
+    ASSERT_NOT_NULL(json);
+
+    ASSERT_EQ(15, tool_list_exact_count(json));
+    ASSERT(tool_list_has_exact_name(json, "index_repository"));
+    ASSERT(tool_list_has_exact_name(json, "search_graph"));
+    ASSERT(tool_list_has_exact_name(json, "query_graph"));
+    ASSERT(tool_list_has_exact_name(json, "trace_call_path"));
+    ASSERT(tool_list_has_exact_name(json, "get_code_snippet"));
+    ASSERT(tool_list_has_exact_name(json, "get_graph_schema"));
+    ASSERT(tool_list_has_exact_name(json, "get_architecture"));
+    ASSERT(tool_list_has_exact_name(json, "search_code"));
+    ASSERT(tool_list_has_exact_name(json, "list_projects"));
+    ASSERT(tool_list_has_exact_name(json, "delete_project"));
+    ASSERT(tool_list_has_exact_name(json, "index_status"));
+    ASSERT(tool_list_has_exact_name(json, "detect_changes"));
+    ASSERT(tool_list_has_exact_name(json, "manage_adr"));
+    ASSERT(tool_list_has_exact_name(json, "ingest_traces"));
+    ASSERT(tool_list_has_exact_name(json, "index_dependencies"));
+
+    ASSERT(!tool_list_has_exact_name(json, "get_code"));
+    ASSERT(!tool_list_has_exact_name(json, "_hidden_tools"));
+    ASSERT(!tool_list_has_exact_name(json, "search_code_graph"));
+    free(json);
     PASS();
 }
 
@@ -149,6 +268,14 @@ TEST(old_tool_names_still_dispatch) {
     ASSERT_NOT_NULL(r4);
     ASSERT_NULL(strstr(r4, "unknown tool"));
     free(r4);
+
+    /* Upstream/main exposes trace_path; keep the alias callable even though
+     * this fork lists trace_call_path for its classic surface. */
+    char *r5 = cbm_mcp_handle_tool(srv, "trace_path",
+        "{\"function_name\":\"main\"}");
+    ASSERT_NOT_NULL(r5);
+    ASSERT_NULL(strstr(r5, "unknown tool"));
+    free(r5);
 
     cbm_mcp_server_free(srv);
     PASS();
@@ -2164,6 +2291,8 @@ SUITE(tool_consolidation) {
     /* Tool visibility */
     RUN_TEST(streamlined_mode_shows_5_default_tools);
     RUN_TEST(classic_mode_shows_all_15_tools);
+    RUN_TEST(api_surface_default_streamlined_regression_gate);
+    RUN_TEST(api_surface_classic_regression_gate);
     /* Dispatch */
     RUN_TEST(search_graph_dispatch);
     RUN_TEST(query_graph_dispatch);
