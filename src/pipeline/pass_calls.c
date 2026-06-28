@@ -376,15 +376,16 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
 static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                const CBMResolvedCallArray *lsp_calls, const char *rel,
                                const char *module_qn, const char **imp_keys, const char **imp_vals,
-                               int imp_count, CBMLanguage lang) {
+                               int imp_count, CBMLanguage lang,
+                               const cbm_lsp_resolution_index_t *lsp_idx) {
     const cbm_gbuf_node_t *source_node = calls_find_source(ctx, rel, call->enclosing_func_qn);
     if (!source_node) {
         return 0;
     }
 
     /* LSP-resolved calls take precedence over registry-textual matching. */
-    const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution_with_floor(
-        lsp_calls, call, ctx->lsp_confidence_floor);
+    const CBMResolvedCall *lsp =
+        cbm_lsp_resolution_index_find(lsp_idx, lsp_calls, call, ctx->lsp_confidence_floor);
     if (lsp) {
         const cbm_gbuf_node_t *target_node =
             cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name, lsp->callee_qn);
@@ -457,8 +458,16 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     int unresolved = 0;
     int errors = 0;
 
+    /* Sequential mode handles small file counts, including a few very large
+     * generated/parser files. Use the registry and service-pattern TLS caches
+     * already used by cbm_parallel_resolve() so repeated callee names and
+     * service-pattern checks pay the full strategy chain once per file instead
+     * of once per callsite. */
+    cbm_service_pattern_cache_begin();
+
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
+            cbm_service_pattern_cache_end();
             return CBM_NOT_FOUND;
         }
 
@@ -486,6 +495,13 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         /* Compute module QN for same-module resolution */
         char *module_qn = cbm_pipeline_fqn_module(ctx->project_name, rel);
 
+        cbm_registry_reach_cache_begin(result->calls.count + CBM_SZ_64);
+        cbm_registry_import_map_cache_begin(imp_keys, imp_vals, imp_count);
+        cbm_registry_resolve_cache_begin(result->calls.count + CBM_SZ_64);
+        cbm_lsp_resolution_index_t lsp_idx;
+        cbm_lsp_resolution_index_build(&lsp_idx, &result->resolved_calls, result->calls.count,
+                                       ctx->lsp_confidence_floor);
+
         /* Resolve each call */
         for (int c = 0; c < result->calls.count; c++) {
             CBMCall *call = &result->calls.items[c];
@@ -494,15 +510,20 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             }
             total_calls++;
 
-            /* Resolve + emit edge via shared helper (source-node lookup,
-             * LSP override, registry-textual fallback). */
+            /* Resolve + emit edge: source-node lookup, indexed LSP override,
+             * then registry-textual fallback. */
             if (resolve_single_call(ctx, call, &result->resolved_calls, rel, module_qn, imp_keys,
-                                    imp_vals, imp_count, files[i].language)) {
+                                    imp_vals, imp_count, files[i].language, &lsp_idx)) {
                 resolved++;
             } else {
                 unresolved++;
             }
         }
+
+        cbm_lsp_resolution_index_free(&lsp_idx);
+        cbm_registry_reach_cache_end();
+        cbm_registry_import_map_cache_end();
+        cbm_registry_resolve_cache_end();
 
         free(module_qn);
         free_import_map(imp_keys, imp_vals, imp_count);
@@ -517,6 +538,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
     /* Additional pattern-based edge passes run after normal call resolution */
     cbm_pipeline_pass_fastapi_depends(ctx, files, file_count);
+    cbm_service_pattern_cache_end();
 
     return 0;
 }

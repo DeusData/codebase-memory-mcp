@@ -1733,60 +1733,13 @@ static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const 
     }
 }
 
-/* Free a strdup'd key stored in the per-file lsp_idx hash table. */
-static void lsp_idx_free_key(const char *key, void *value, void *ud) {
-    (void)value;
-    (void)ud;
-    free((char *)key);
-}
-
 /* Resolve calls for one file and emit CALLS/HTTP_CALLS/ASYNC_CALLS edges. */
 static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
                                const char **imp_vals, int imp_count, CBMLanguage lang) {
-    /* Build a per-file hash index of resolved_calls keyed by
-     * "caller_qn|callee_short" for O(1) lookup. cbm_pipeline_find_lsp_
-     * resolution would otherwise do an O(N) linear scan over
-     * resolved_calls for EACH of result->calls.count calls — the
-     * dominant cost in parallel_resolve on kubernetes (~50s of pure
-     * scanning). On insert, keep the highest-confidence entry per key
-     * (matches the original "best" tie-break). Skip the build entirely
-     * when there are no calls (nothing to look up) or no resolved
-     * entries (lookups would all miss). */
-    CBMHashTable *lsp_idx = NULL;
-    if (result->calls.count > 0 && result->resolved_calls.count > 0) {
-        lsp_idx = cbm_ht_create((uint32_t)result->resolved_calls.count * 2u + 16u);
-        if (lsp_idx) {
-            for (int i = 0; i < result->resolved_calls.count; i++) {
-                CBMResolvedCall *rc_e = &result->resolved_calls.items[i];
-                double lsp_floor = rc->lsp_confidence_floor > 0.0
-                                       ? rc->lsp_confidence_floor
-                                       : (double)CBM_LSP_CONFIDENCE_FLOOR;
-                if (!rc_e->caller_qn || !rc_e->callee_qn ||
-                    (double)rc_e->confidence < lsp_floor) {
-                    continue;
-                }
-                const char *short_name = strrchr(rc_e->callee_qn, '.');
-                short_name = short_name ? short_name + 1 : rc_e->callee_qn;
-                char key[1024];
-                int kn = snprintf(key, sizeof(key), "%s|%s", rc_e->caller_qn, short_name);
-                if (kn <= 0 || kn >= (int)sizeof(key))
-                    continue;
-                CBMResolvedCall *existing = (CBMResolvedCall *)cbm_ht_get(lsp_idx, key);
-                if (!existing) {
-                    /* New entry — strdup so the key outlives the loop body. */
-                    char *kdup = strdup(key);
-                    if (kdup)
-                        cbm_ht_set(lsp_idx, kdup, rc_e);
-                } else if (rc_e->confidence > existing->confidence) {
-                    /* Update value; reuse stored key pointer to avoid leak. */
-                    const char *skey = cbm_ht_get_key(lsp_idx, key);
-                    if (skey)
-                        cbm_ht_set(lsp_idx, skey, rc_e);
-                }
-            }
-        }
-    }
+    cbm_lsp_resolution_index_t lsp_idx;
+    cbm_lsp_resolution_index_build(&lsp_idx, &result->resolved_calls, result->calls.count,
+                                   rc->lsp_confidence_floor);
 
     for (int c = 0; c < result->calls.count; c++) {
         CBMCall *call = &result->calls.items[c];
@@ -1803,28 +1756,14 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
 
         /* LSP-resolved calls take precedence over registry textual matching.
-         * Same helper + same CBM_LSP_CONFIDENCE_FLOOR as the sequential
-         * pipeline (pass_calls.c) — both paths must admit the same set of
-         * LSP overrides so a project doesn't get different attributions
-         * depending on whether parallel mode kicked in. */
+         * The shared lsp_resolve.h helper enforces the confidence floor,
+         * caller/callee match rule, and tie-break used by pass_calls.c, so
+         * parallel dispatch does not change call attribution. */
         cbm_resolution_t res = {0};
         const CBMResolvedCall *lsp = NULL;
         _rc_t0 = extract_now_ns();
-        if (lsp_idx && call->enclosing_func_qn) {
-            char key[1024];
-            int kn =
-                snprintf(key, sizeof(key), "%s|%s", call->enclosing_func_qn, call->callee_name);
-            if (kn > 0 && kn < (int)sizeof(key)) {
-                lsp = (const CBMResolvedCall *)cbm_ht_get(lsp_idx, key);
-            }
-        }
-        if (!lsp) {
-            /* Fallback to the linear scan for edge cases the index may
-             * miss (e.g. callee_name that wasn't the registered short
-             * name). Keeps semantics identical. */
-            lsp = cbm_pipeline_find_lsp_resolution_with_floor(
-                &result->resolved_calls, call, rc->lsp_confidence_floor);
-        }
+        lsp = cbm_lsp_resolution_index_find(&lsp_idx, &result->resolved_calls, call,
+                                            rc->lsp_confidence_floor);
         atomic_fetch_add_explicit(&rc->time_ns_rc_lsp_lookup, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         _rc_t0 = extract_now_ns();
@@ -1904,10 +1843,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                   memory_order_relaxed);
         ws->calls_resolved++;
     }
-    if (lsp_idx) {
-        cbm_ht_foreach(lsp_idx, lsp_idx_free_key, NULL);
-        cbm_ht_free(lsp_idx);
-    }
+    cbm_lsp_resolution_index_free(&lsp_idx);
 }
 
 /* Resolve usages for one file. */

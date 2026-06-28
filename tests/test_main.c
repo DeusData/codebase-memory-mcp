@@ -147,6 +147,7 @@ int main(void) {
         if (strstr("tool_consolidation", only_suite)) RUN_SUITE(tool_consolidation);
         if (strstr("cli", only_suite)) RUN_SUITE(cli);
         if (strstr("pipeline", only_suite)) RUN_SUITE(pipeline);
+        if (strstr("httplink", only_suite)) RUN_SUITE(httplink);
         if (strstr("parallel", only_suite)) RUN_SUITE(parallel);
         if (strstr("store_nodes", only_suite)) RUN_SUITE(store_nodes);
         if (strstr("store_search", only_suite)) RUN_SUITE(store_search);

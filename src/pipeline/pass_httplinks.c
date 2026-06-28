@@ -1323,6 +1323,16 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
     }
 
     cbm_log_info("httplink.routes", "count", itoa_hl(route_count));
+    if (route_count == 0) {
+        /* No Route nodes or HTTP/ASYNC route edges can be emitted without a
+         * discovered handler route. Avoid scanning every Function/Method body
+         * for URL literals in route-free codebases; generated parser fixtures
+         * otherwise spend seconds here only to produce zero links. */
+        cbm_log_info("httplink.callsites", "count", "0");
+        free(routes);
+        cbm_log_info("pass.done", "pass", "httplinks", "routes", "0", "calls", "0");
+        return 0;
+    }
 
     /* ── Phase 2: Resolve cross-file prefixes (serial) ────────── */
     resolve_cross_file_group_prefixes(ctx, routes, route_count);
