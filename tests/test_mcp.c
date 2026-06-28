@@ -606,6 +606,51 @@ TEST(tool_search_graph_query_honors_file_pattern_issue552) {
     PASS();
 }
 
+TEST(tool_search_graph_query_rejects_bad_semantic_query) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "bm25-semantic";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/bm25-semantic");
+
+    cbm_node_t node = {0};
+    node.project = proj;
+    node.label = "Function";
+    node.name = "publish_status";
+    node.qualified_name = "bm25-semantic.src.publish_status";
+    node.file_path = "src/status.c";
+    node.start_line = 1;
+    node.end_line = 3;
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    cbm_store_exec(st, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+    ASSERT_EQ(cbm_store_exec(st,
+                             "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                             "file_path) "
+                             "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
+                             "FROM nodes;"),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":553,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"bm25-semantic\",\"query\":\"status\","
+             "\"semantic_query\":\"publish\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "semantic_query must be an array"));
+    ASSERT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_query_graph_basic) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
 
@@ -2532,6 +2577,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_basic);
     RUN_TEST(tool_search_graph_includes_node_properties);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
+    RUN_TEST(tool_search_graph_query_rejects_bad_semantic_query);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_index_status_includes_git_metadata);
