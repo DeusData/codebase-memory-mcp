@@ -5097,10 +5097,24 @@ static char *cluster_make_label(const cbm_cluster_info_t *ci) {
         const char *primary = ci->top_nodes[0];
         if (cluster_label_is_generic(primary) && ci->top_node_count > 1) {
             const char *secondary = ci->top_nodes[1];
-            size_t len = strlen(primary) + strlen(secondary) + 4;
+            const char *pkg = ci->package_count > 0 ? ci->packages[0] : "";
+            size_t len = strlen(primary) + strlen(secondary) + strlen(pkg) + 4;
             char *label = malloc(len);
             if (label) {
-                snprintf(label, len, "%s/%s", primary, secondary);
+                if (pkg[0]) {
+                    snprintf(label, len, "%s/%s@%s", primary, secondary, pkg);
+                } else {
+                    snprintf(label, len, "%s/%s", primary, secondary);
+                }
+                return label;
+            }
+        }
+        if (cluster_label_is_generic(primary) && ci->package_count > 0) {
+            const char *pkg = ci->packages[0];
+            size_t len = strlen(primary) + strlen(pkg) + 2;
+            char *label = malloc(len);
+            if (label) {
+                snprintf(label, len, "%s@%s", primary, pkg);
                 return label;
             }
         }
