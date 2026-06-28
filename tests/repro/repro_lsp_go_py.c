@@ -201,6 +201,21 @@ static int assert_no_resolvable_edge_files(const RFile *files, int nfiles,
         return 1;
     }
     int rc = 0;
+    /* Exercised-check: the fixture MUST produce at least one callable-sourced
+     * CALLS edge (its in-fixture control call). Without it the "no edge to
+     * <callee>" invariant is VACUOUS — it also passes when extraction silently
+     * produced nothing, so a green would not prove the unresolvable call was
+     * actually processed and correctly dropped. */
+    int module_sourced = -1;
+    int callable_sourced = -1;
+    inv_count_calls_by_source(store, lp.project, &module_sourced, &callable_sourced);
+    (void)module_sourced;
+    if (callable_sourced <= 0) {
+        printf("  %sFAIL%s %s:%d: no callable-sourced CALLS edge — fixture not "
+               "exercised; the no-edge invariant for %s is vacuous\n",
+               tf_red(), tf_reset(), __FILE__, __LINE__, callee_substr);
+        rc = 1;
+    }
     if (!inv_no_calls_edge_to_qn(store, lp.project, callee_substr)) {
         printf("  %sFAIL%s %s:%d: a CALLS edge unexpectedly targets %s "
                "(expected NONE — callee is unresolvable)\n",
@@ -309,11 +324,11 @@ static const RFile kGoCrossFile[] = {
  * "lsp_unresolved"). NOTE: emit_unresolved_call uses confidence 0.0, so the
  * pipeline may not promote it into a CALLS edge with the strategy tag — this
  * fixture documents whether "lsp_unresolved" surfaces in the graph. */
-static const char kGoUnresolved[] =
-    "package main\n"
-    "func caller(v int) int {\n"
-    "    return totallyUnknownFn(v)\n"
-    "}\n";
+static const char kGoUnresolved[] = "package main\n"
+                                    "func known(x int) int { return x + 1 }\n"
+                                    "func caller(v int) int {\n"
+                                    "    return known(v) + totallyUnknownFn(v)\n"
+                                    "}\n";
 
 /* ── Python fixtures ───────────────────────────────────────────────────────── */
 
@@ -386,13 +401,13 @@ static const RFile kPyModuleAttr[] = {
  * symbol lookup misses → best-effort "module.attr" QN, low confidence). helpers
  * defines nothing named missing_fn. */
 static const RFile kPyModuleAttrUnresolved[] = {
-    {"helpers.py",
-     "def do_work(x):\n"
-     "    return x + 9\n"},
-    {"main.py",
-     "import helpers\n"
-     "def caller(v):\n"
-     "    return helpers.missing_fn(v)\n"},
+    {"helpers.py", "def do_work(x):\n"
+                   "    return x + 9\n"},
+    {"main.py", "import helpers\n"
+                "def known(x):\n"
+                "    return x + 1\n"
+                "def caller(v):\n"
+                "    return known(v) + helpers.missing_fn(v)\n"},
 };
 
 /* lsp_dict_dispatch — funcs["key"]() where funcs is a dict-literal dispatch

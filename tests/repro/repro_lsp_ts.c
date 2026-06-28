@@ -193,6 +193,21 @@ static int assert_no_resolvable_edge(const char *filename, const char *src,
         return 1;
     }
     int rc = 0;
+    /* Exercised-check: the fixture MUST produce at least one callable-sourced
+     * CALLS edge (its in-fixture control call). Without it the "no edge to
+     * <callee>" invariant is VACUOUS — it also passes when extraction silently
+     * produced nothing, so a green would not prove the unresolvable call was
+     * actually processed and correctly dropped. */
+    int module_sourced = -1;
+    int callable_sourced = -1;
+    inv_count_calls_by_source(store, lp.project, &module_sourced, &callable_sourced);
+    (void)module_sourced;
+    if (callable_sourced <= 0) {
+        printf("  %sFAIL%s %s:%d: no callable-sourced CALLS edge — fixture not "
+               "exercised; the no-edge invariant for %s is vacuous\n",
+               tf_red(), tf_reset(), __FILE__, __LINE__, callee_substr);
+        rc = 1;
+    }
     if (!inv_no_calls_edge_to_qn(store, lp.project, callee_substr)) {
         printf("  %sFAIL%s %s:%d: a CALLS edge unexpectedly targets %s "
                "(expected NONE — callee is unresolvable)\n",
@@ -333,7 +348,8 @@ static const char kTsDefault[] =
  * is EXPECTED ABSENT (RED) — it documents whether "lsp_unresolved" surfaces in
  * the graph. */
 static const char kTsUnresolved[] =
-    "function caller(v: number): number { return totallyUnknownFn(v); }\n";
+    "function known(x: number): number { return x + 1; }\n"
+    "function caller(v: number): number { return known(v) + totallyUnknownFn(v); }\n";
 
 /* ── Per-strategy tests ──────────────────────────────────────────────────── */
 

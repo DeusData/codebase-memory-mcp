@@ -174,6 +174,21 @@ static int assert_no_resolvable_edge(const char *filename, const char *src,
         return 1;
     }
     int rc = 0;
+    /* Exercised-check: the fixture MUST produce at least one callable-sourced
+     * CALLS edge (its in-fixture control call). Without it the "no edge to
+     * <callee>" invariant is VACUOUS — it also passes when extraction silently
+     * produced nothing, so a green would not prove the unresolvable call was
+     * actually processed and correctly dropped. */
+    int module_sourced = -1;
+    int callable_sourced = -1;
+    inv_count_calls_by_source(store, lp.project, &module_sourced, &callable_sourced);
+    (void)module_sourced;
+    if (callable_sourced <= 0) {
+        printf("  %sFAIL%s %s:%d: no callable-sourced CALLS edge — fixture not "
+               "exercised; the no-edge invariant for %s is vacuous\n",
+               tf_red(), tf_reset(), __FILE__, __LINE__, callee_substr);
+        rc = 1;
+    }
     if (!inv_no_calls_edge_to_qn(store, lp.project, callee_substr)) {
         printf("  %sFAIL%s %s:%d: a CALLS edge unexpectedly targets %s "
                "(expected NONE — callee is unresolvable)\n",
@@ -245,7 +260,8 @@ static const char kJavaStaticImport[] =
 static const char kJavaStaticImportText[] =
     "import static java.lang.Math.max;\n"
     "class Client {\n"
-    "    int run(int a, int b) { return max(a, b); }\n"
+    "    int known(int x) { return x + 1; }\n"
+    "    int run(int a, int b) { return known(a) + max(a, b); }\n"
     "}\n";
 
 /* lsp_super_dispatch — super.method() resolves on the superclass
@@ -375,7 +391,8 @@ static const char kJavaConstructorSynth[] =
  * surfaces on a CALLS edge at all. */
 static const char kJavaUnresolved[] =
     "class Client {\n"
-    "    int run(int v) { return totallyUnknownFn(v); }\n"
+    "    int known(int x) { return x + 1; }\n"
+    "    int run(int v) { return known(v) + totallyUnknownFn(v); }\n"
     "}\n";
 
 /* ── C# fixtures ─────────────────────────────────────────────────────────────
@@ -402,7 +419,7 @@ static const char kCsStaticTypedUnindexed[] =
     "    public static int Known() { return 1; }\n"
     "}\n"
     "class Client {\n"
-    "    public int Run() { return Helper.Missing(); }\n"
+    "    public int Run() { return Helper.Known() + Helper.Missing(); }\n"
     "}\n";
 
 /* cs_method_typed — obj.Method() on the object's OWN declared type
@@ -450,7 +467,7 @@ static const char kCsMethodTypedUnindexed[] =
     "    public int Inc(int x) { return x + 1; }\n"
     "}\n"
     "class Client {\n"
-    "    public int Run(Counter c) { return c.Missing(); }\n"
+    "    public int Run(Counter c) { return c.Inc(1) + c.Missing(); }\n"
     "}\n";
 
 /* cs_self_method — a bare Method() resolved on the enclosing class
