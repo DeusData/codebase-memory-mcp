@@ -60,6 +60,47 @@ Operational authority is stricter than code review authority.
 | Security advisory handling | `@DeusData` only | Do not delegate across advisories. Keep private reports isolated. |
 | Workflow, ruleset, CODEOWNERS, and branch protection changes | `@DeusData` only | Owner-only because these define authority itself. |
 
+## Release Preparation Checklist
+
+Release preparation is a checklist-driven operation. A release is not ready
+until each required gate is green or explicitly waived by the project owner in
+the release notes.
+
+- `dry-run.yml` completes successfully with the release candidate commit.
+- Local performance benchmarks are run on the release operator's machine using
+  the release candidate binary and CLI indexing, not test-only shortcuts.
+- `scripts/benchmark-index.sh` records results for the Linux kernel and for at
+  least one large open-source project per supported Hybrid LSP family.
+- Benchmark results are compared against the previous release's benchmark logs
+  using the same machine class, same repository revisions, same indexing mode,
+  and same benchmark script when available.
+- Indexing time must not materially regress compared with the previous release.
+  An unexplained slowdown greater than 15% on the same benchmark input is a
+  release blocker until investigated or explicitly owner-waived.
+- Node and edge counts must not materially diverge from the previous release
+  unless the release intentionally changes extraction behavior. Unexpected
+  graph-size shifts require investigation before publishing.
+- Benchmark logs, repository revisions, binary version, machine details, and
+  release decision are retained with the release preparation notes.
+
+The current Hybrid LSP release benchmark matrix is:
+
+| LSP family | Required large OSS benchmark |
+| --- | --- |
+| C / C++ | Linux kernel |
+| Go | Kubernetes |
+| Python | CPython or Django |
+| TypeScript / JavaScript / JSX / TSX | TypeScript or VS Code |
+| PHP | Laravel framework |
+| C# | Roslyn |
+| Java | Spring Framework or Elasticsearch |
+| Kotlin | Kotlin compiler or Ktor |
+| Rust | Rust compiler |
+
+The matrix may be updated by PR as the project evolves, but every supported
+Hybrid LSP family keeps at least one large OSS indexing benchmark before a
+release is published.
+
 Repository access follows the same authority model:
 
 - `Triage` is the default collaborator role for issue-only delegation.
