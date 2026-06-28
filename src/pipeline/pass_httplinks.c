@@ -1030,8 +1030,10 @@ static int match_and_link(cbm_pipeline_ctx_t *ctx, cbm_route_handler_t *routes, 
             }
 
             /* Score path match */
+            double min_conf = ctx->httplink_min_confidence > 0.0 ? ctx->httplink_min_confidence
+                                                                  : MIN_PATH_CONFIDENCE;
             double score = cbm_path_match_score(cs->path, rh->path);
-            if (score < MIN_PATH_CONFIDENCE) {
+            if (score < min_conf) {
                 continue; /* minimum confidence threshold */
             }
 

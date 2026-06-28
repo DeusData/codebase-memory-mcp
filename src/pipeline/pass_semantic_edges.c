@@ -1199,6 +1199,9 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
 
     cbm_gbuf_t *gbuf = ctx->gbuf;
     cbm_sem_config_t cfg = cbm_sem_get_config();
+    if (ctx->semantic_threshold > 0.0) {
+        cfg.threshold = (float)ctx->semantic_threshold;
+    }
 
     CBM_PROF_START(t_phase1a);
     cbm_sem_func_t *funcs = NULL;

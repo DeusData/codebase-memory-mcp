@@ -48,9 +48,12 @@ ssize_t cbm_getline(char **lineptr, size_t *n, FILE *stream);
 
 /* ── fileno ───────────────────────────────────────────────────── */
 #ifdef _WIN32
+#include <io.h>
 #define cbm_fileno _fileno
+#define cbm_close_fd _close
 #else
 #define cbm_fileno fileno
+#define cbm_close_fd close
 #endif
 
 /* ── strcasestr (Windows lacks it) ────────────────────────────── */
@@ -109,8 +112,13 @@ char *cbm_mkdtemp(char *tmpl);
 /* ── mkstemp (Windows lacks it) ──────────────────────────────── */
 #ifdef _WIN32
 int cbm_mkstemp(char *tmpl);
+int cbm_mkstemp_s(char *tmpl, size_t tmpl_sz);
 #else
 #define cbm_mkstemp mkstemp
+static inline int cbm_mkstemp_s(char *tmpl, size_t tmpl_sz) {
+    (void)tmpl_sz;
+    return mkstemp(tmpl);
+}
 #endif
 
 /* ── setenv / unsetenv (Windows lacks them) ──────────────────── */
@@ -129,7 +137,6 @@ static inline int cbm_unsetenv(const char *name) {
 
 /* ── pipe (Windows uses _pipe) ───────────────────────────────── */
 #ifdef _WIN32
-#include <io.h>
 #include <fcntl.h>
 #define cbm_pipe(fds) _pipe(fds, 4096, _O_BINARY)
 #else

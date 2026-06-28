@@ -32,6 +32,14 @@
 #include <math.h>
 #include <unistd.h>
 
+/* Resolve the on-disk cache dir — honors the CBM_CACHE_DIR env var (used by the
+ * test runner to isolate each run into a per-run temp dir) and otherwise falls
+ * back to ~/.cache/codebase-memory-mcp. Defined in foundation/platform.c.
+ * Forward-declared here so every test file builds the SAME db path the pipeline
+ * writes (the pipeline honors CBM_CACHE_DIR); hardcoding ~/.cache mismatched the
+ * write path and yielded empty-store failures under isolation. */
+const char *cbm_resolve_cache_dir(void);
+
 /* ── Global counters (defined in test_main.c) ──────────────────── */
 
 extern int tf_pass_count;

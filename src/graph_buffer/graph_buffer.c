@@ -28,6 +28,7 @@ enum {
 #include "sqlite_writer.h"
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "foundation/log.h"
 #include "foundation/dyn_array.h"
 #include "foundation/profile.h"
@@ -1449,7 +1450,19 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     if (!gb || !path) {
         return CBM_NOT_FOUND;
     }
-
+    char tmp_path[CBM_SZ_1K];
+    int tmp_len = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.XXXXXX", path);
+    if (tmp_len <= 0 || (size_t)tmp_len >= sizeof(tmp_path)) {
+        return CBM_NOT_FOUND;
+    }
+    char wal_path[CBM_SZ_1K];
+    char shm_path[CBM_SZ_1K];
+    int wal_len = snprintf(wal_path, sizeof(wal_path), "%s-wal", path);
+    int shm_len = snprintf(shm_path, sizeof(shm_path), "%s-shm", path);
+    if (wal_len <= 0 || (size_t)wal_len >= sizeof(wal_path) || shm_len <= 0 ||
+        (size_t)shm_len >= sizeof(shm_path)) {
+        return CBM_NOT_FOUND;
+    }
     CBM_PROF_START(t_count);
     int live_count = count_live_nodes(gb);
     CBM_PROF_END_N("dump", "1_count_live_nodes", t_count, live_count);
@@ -1470,14 +1483,24 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     char indexed_at[CBM_SZ_64];
     generate_iso_timestamp(indexed_at, sizeof(indexed_at));
 
-    /* Stream node rows to the DB in partitions. Under memory pressure, free each
+    int tmp_fd = cbm_mkstemp_s(tmp_path, sizeof(tmp_path));
+    if (tmp_fd < 0) {
+        free(src_nodes);
+        free(dump_nodes);
+        free(temp_to_final);
+        return CBM_NOT_FOUND;
+    }
+    cbm_close_fd(tmp_fd);
+
+    /* Stream node rows to the unique temp DB in partitions. Under memory pressure, free each
      * partition's heavy properties_json once persisted — the heavy column is
      * write-once and never read again, so this bounds the dump/finalize peak.
      * The DB output is identical whether or not freeing engages, so non-pressure
      * runs (and tests) leave the gbuf intact (the budget>0 guard keeps an
      * uninitialized budget from ever triggering the free). */
-    cbm_db_writer_t *w = cbm_writer_open(path);
+    cbm_db_writer_t *w = cbm_writer_open(tmp_path);
     if (!w) {
+        cbm_unlink(tmp_path);
         free(src_nodes);
         free(dump_nodes);
         free(temp_to_final);
@@ -1530,11 +1553,9 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
         rc = frc;
     }
 
-    /* Post-write integrity verification (B1 mitigation): the streaming dump can
-     * intermittently emit a structurally-corrupt .db (gbuf-data corruption that
-     * is ASan/TSan-invisible). Detect it with the fast projects-table check
-     * (O(1), not a full integrity_check) and remove the corrupt DB so neither
-     * queries nor tests ever read garbage — the next access re-indexes.
+    /* Post-write integrity verification (B1 mitigation): verify the temp DB
+     * before the atomic rename. A corrupt or unopenable temp file is deleted;
+     * the previously published DB, if any, remains in place for readers.
      *
      * Use the _full variant so a path-only defect (root_path the check considers
      * non-absolute, e.g. a relative repo_path like ".") is RETAINED, not deleted
@@ -1543,7 +1564,7 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
      * path is indexed (caught by self-indexing the repo with repo_path=".").
      * Consistent with #557 resolve_store. */
     if (rc == 0) {
-        cbm_store_t *verify = cbm_store_open_path((const char *)path);
+        cbm_store_t *verify = cbm_store_open_path((const char *)tmp_path);
         if (verify) {
             bool path_only = false;
             bool intact = cbm_store_check_integrity_full(verify, &path_only);
@@ -1553,13 +1574,29 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
                 char edges_str[CBM_SZ_16];
                 snprintf(nodes_str, sizeof(nodes_str), "%d", node_idx);
                 snprintf(edges_str, sizeof(edges_str), "%d", edge_idx);
-                cbm_log_error("dump.verify_corrupt", "path", path, "action",
-                              "deleting corrupt db; re-index required", "nodes", nodes_str, "edges",
-                              edges_str);
-                unlink(path);
+                cbm_log_error("dump.verify_corrupt", "path", tmp_path, "action",
+                              "deleting corrupt temp db; re-index required", "nodes", nodes_str,
+                              "edges", edges_str);
+                cbm_unlink(tmp_path);
                 rc = GB_ERR;
             }
+        } else {
+            cbm_log_error("dump.verify_open_failed", "path", tmp_path, "action",
+                          "deleting unverified temp db");
+            cbm_unlink(tmp_path);
+            rc = GB_ERR;
         }
+    }
+    if (rc == 0) {
+        cbm_unlink(wal_path);
+        cbm_unlink(shm_path);
+        if (cbm_replace_file(tmp_path, path) != 0) {
+            cbm_log_error("dump.rename_failed", "tmp", tmp_path, "path", path);
+            cbm_unlink(tmp_path);
+            rc = GB_ERR;
+        }
+    } else {
+        cbm_unlink(tmp_path);
     }
 
     log_dump_summary(node_idx, edge_idx);

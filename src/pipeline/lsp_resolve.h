@@ -45,21 +45,23 @@
  * the textual callee_name as the last dot-separated segment. The
  * pointer returned aliases into `arr` and stays valid as long as the
  * underlying CBMFileResult is alive. */
-static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
-    const CBMResolvedCallArray *arr, const CBMCall *call) {
+static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_with_floor(
+    const CBMResolvedCallArray *arr, const CBMCall *call, double confidence_floor) {
     if (!arr || arr->count == 0 || !call) {
         return NULL;
     }
     if (!call->enclosing_func_qn || !call->callee_name) {
         return NULL;
     }
+    double floor =
+        confidence_floor > 0.0 ? confidence_floor : (double)CBM_LSP_CONFIDENCE_FLOOR;
     const CBMResolvedCall *best = NULL;
     for (int i = 0; i < arr->count; i++) {
         const CBMResolvedCall *rc = &arr->items[i];
         if (!rc->caller_qn || !rc->callee_qn) {
             continue;
         }
-        if (rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
+        if ((double)rc->confidence < floor) {
             continue;
         }
         if (strcmp(rc->caller_qn, call->enclosing_func_qn) != 0) {
@@ -75,6 +77,11 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
         }
     }
     return best;
+}
+
+static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
+    const CBMResolvedCallArray *arr, const CBMCall *call) {
+    return cbm_pipeline_find_lsp_resolution_with_floor(arr, call, 0.0);
 }
 
 /* Resolve an LSP-emitted callee_qn to a graph-buffer node.

@@ -117,40 +117,29 @@ static void write_diagnostics(void) {
     long long qmax = atomic_load(&g_query_stats.max_us);
     long long qavg = qcount > 0 ? qtime / qcount : 0;
 
-    /* Write to .tmp then rename (atomic) */
-    char tmp_path[sizeof(g_diag_path) + DIAG_PATH_EXTRA];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", g_diag_path);
-
-    FILE *f = fopen(tmp_path, "w");
-    if (!f) {
+    char json[CBM_SZ_2K];
+    int n = snprintf(json, sizeof(json),
+                     "{\n"
+                     "  \"uptime_s\": %ld,\n"
+                     "  \"rss_bytes\": %zu,\n"
+                     "  \"peak_rss_bytes\": %zu,\n"
+                     "  \"heap_committed_bytes\": %zu,\n"
+                     "  \"peak_committed_bytes\": %zu,\n"
+                     "  \"page_faults\": %zu,\n"
+                     "  \"fd_count\": %d,\n"
+                     "  \"query_count\": %d,\n"
+                     "  \"query_errors\": %d,\n"
+                     "  \"query_total_us\": %lld,\n"
+                     "  \"query_avg_us\": %lld,\n"
+                     "  \"query_max_us\": %lld,\n"
+                     "  \"pid\": %d\n"
+                     "}\n",
+                     uptime, current_rss, peak_rss, current_commit, peak_commit, page_faults, fds,
+                     qcount, qerrors, qtime, qavg, qmax, (int)getpid());
+    if (n < 0 || (size_t)n >= sizeof(json)) {
         return;
     }
-
-    if (fprintf(f,
-                "{\n"
-                "  \"uptime_s\": %ld,\n"
-                "  \"rss_bytes\": %zu,\n"
-                "  \"peak_rss_bytes\": %zu,\n"
-                "  \"heap_committed_bytes\": %zu,\n"
-                "  \"peak_committed_bytes\": %zu,\n"
-                "  \"page_faults\": %zu,\n"
-                "  \"fd_count\": %d,\n"
-                "  \"query_count\": %d,\n"
-                "  \"query_errors\": %d,\n"
-                "  \"query_total_us\": %lld,\n"
-                "  \"query_avg_us\": %lld,\n"
-                "  \"query_max_us\": %lld,\n"
-                "  \"pid\": %d\n"
-                "}\n",
-                uptime, current_rss, peak_rss, current_commit, peak_commit, page_faults, fds,
-                qcount, qerrors, qtime, qavg, qmax, (int)getpid()) < 0) {
-        (void)fclose(f);
-        return;
-    }
-    if (fclose(f) != 0) {
-        return;
-    }
-    (void)rename(tmp_path, g_diag_path);
+    (void)cbm_write_file_atomic(g_diag_path, json, (size_t)n, NULL);
 }
 
 static void *diag_thread_fn(void *arg) {
@@ -177,8 +166,12 @@ bool cbm_diag_start(void) {
     g_start_time = time(NULL);
     atomic_store(&g_diag_stop, 0);
 
-    snprintf(g_diag_path, sizeof(g_diag_path), "%s/cbm-diagnostics-%d.json", cbm_tmpdir(),
-             (int)getpid());
+    int path_len = snprintf(g_diag_path, sizeof(g_diag_path), "%s/cbm-diagnostics-%d.json",
+                            cbm_tmpdir(), (int)getpid());
+    if (path_len < 0 || (size_t)path_len >= sizeof(g_diag_path)) {
+        g_diag_path[0] = '\0';
+        return false;
+    }
 
     if (cbm_thread_create(&g_diag_thread, 0, diag_thread_fn, NULL) != 0) {
         return false;
@@ -201,6 +194,8 @@ void cbm_diag_stop(void) {
     /* Clean up file */
     cbm_unlink(g_diag_path);
     char tmp_path[sizeof(g_diag_path) + DIAG_PATH_EXTRA];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", g_diag_path);
-    cbm_unlink(tmp_path);
+    int tmp_len = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", g_diag_path);
+    if (tmp_len >= 0 && (size_t)tmp_len < sizeof(tmp_path)) {
+        cbm_unlink(tmp_path);
+    }
 }

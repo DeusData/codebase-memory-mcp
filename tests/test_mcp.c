@@ -412,6 +412,56 @@ TEST(tool_list_projects_empty) {
     PASS();
 }
 
+TEST(tool_list_projects_includes_tmp_prefixed_project) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-list-tmp-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS(); /* skip if mkdtemp fails */
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char db_path[512];
+    int db_len = snprintf(db_path, sizeof(db_path), "%s/tmp-valid-project.db", cache);
+    ASSERT_TRUE(db_len > 0 && (size_t)db_len < sizeof(db_path));
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "tmp-valid-project", "/tmp/valid-project"),
+              CBM_STORE_OK);
+    cbm_store_close(store);
+
+    cbm_mcp_server_t *srv = setup_mcp_with_data();
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"list_projects\",\"arguments\":{}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "tmp-valid-project"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    cbm_unlink(db_path);
+    char wal[512];
+    char shm[512];
+    int wal_len = snprintf(wal, sizeof(wal), "%s-wal", db_path);
+    int shm_len = snprintf(shm, sizeof(shm), "%s-shm", db_path);
+    if (wal_len > 0 && (size_t)wal_len < sizeof(wal)) {
+        cbm_unlink(wal);
+    }
+    if (shm_len > 0 && (size_t)shm_len < sizeof(shm)) {
+        cbm_unlink(shm);
+    }
+    cbm_rmdir(cache);
+    PASS();
+}
+
 TEST(tool_get_graph_schema_empty) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
 
@@ -484,6 +534,13 @@ TEST(tool_search_graph_includes_node_properties) {
     ASSERT_NOT_NULL(strstr(inner, "signature"));
     ASSERT_NOT_NULL(strstr(inner, "func HandleRequest"));
     ASSERT_NOT_NULL(strstr(inner, "is_exported"));
+    const char *scan = inner;
+    int source_keys = 0;
+    while ((scan = strstr(scan, "\"source\"")) != NULL) {
+        source_keys++;
+        scan += strlen("\"source\"");
+    }
+    ASSERT_EQ(source_keys, 1);
     free(inner);
     free(resp);
 
@@ -1371,7 +1428,8 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     n_hr.end_line = 5;
     n_hr.properties_json = "{\"signature\":\"func HandleRequest() error\","
                            "\"return_type\":\"error\","
-                           "\"is_exported\":true}";
+                           "\"is_exported\":true,"
+                           "\"source\":\"infra\"}";
     int64_t id_hr = cbm_store_upsert_node(st, &n_hr);
 
     cbm_node_t n_po = {0};
@@ -2332,6 +2390,7 @@ SUITE(mcp) {
 
     /* Tool handlers */
     RUN_TEST(tool_list_projects_empty);
+    RUN_TEST(tool_list_projects_includes_tmp_prefixed_project);
     RUN_TEST(tool_get_graph_schema_empty);
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);

@@ -11,7 +11,7 @@
  */
 #include "foundation/constants.h"
 
-enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24, INCR_WAL_BUF = 1040 };
+enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
 #include <stdio.h>
@@ -634,7 +634,7 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
                      itoa_buf_incr((int)elapsed_ms_incr(t)));
     }
 }
-/* Delete old DB and dump merged graph + hashes to disk.
+/* Atomically dump merged graph + hashes to disk.
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
  * reindexes can correctly distinguish "never indexed" from "indexed but
  * not visited this pass". */
@@ -644,14 +644,6 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
                              const char *repo_path) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-
-    cbm_unlink(db_path);
-    char wal[INCR_WAL_BUF];
-    char shm[INCR_WAL_BUF];
-    snprintf(wal, sizeof(wal), "%s-wal", db_path);
-    snprintf(shm, sizeof(shm), "%s-shm", db_path);
-    cbm_unlink(wal);
-    cbm_unlink(shm);
 
     int dump_rc = cbm_gbuf_dump_to_sqlite(gbuf, db_path);
     cbm_log_info("incremental.dump", "rc", itoa_buf_incr(dump_rc), "elapsed_ms",
@@ -842,6 +834,11 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .registry = registry,
         .cancelled = cbm_pipeline_cancelled_ptr(p),
         .mode = cbm_pipeline_get_mode(p),
+        .similarity_threshold = cbm_pipeline_similarity_threshold(p),
+        .httplink_min_confidence = cbm_pipeline_httplink_min_confidence(p),
+        .semantic_threshold = cbm_pipeline_semantic_threshold(p),
+        .githistory_min_coupling = cbm_pipeline_githistory_min_coupling(p),
+        .lsp_confidence_floor = cbm_pipeline_lsp_confidence_floor(p),
         .path_aliases = path_aliases,
     };
 

@@ -50,6 +50,25 @@ int cbm_unlink(const char *path);
 /* Delete an empty directory. Returns 0 on success. */
 int cbm_rmdir(const char *path);
 
+/* Atomically replace dest_path with tmp_path when the platform supports it.
+ * tmp_path must already contain the complete new file. Returns 0 on success.
+ * POSIX: rename(). Windows: MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH). */
+int cbm_replace_file(const char *tmp_path, const char *dest_path);
+
+/* Same as cbm_replace_file(), but returns the platform-native failure code via
+ * platform_error: errno on POSIX, GetLastError() on Windows. */
+int cbm_replace_file_ex(const char *tmp_path, const char *dest_path, int *platform_error);
+
+typedef struct {
+    const char *stage; /* path_too_long, open_temp, write_temp, close_temp, rename_temp */
+    int code;          /* errno/GetLastError() when available, or 0 for validation errors */
+} cbm_file_error_t;
+
+/* Write data to a unique temp sibling, close it, then atomically replace dest_path.
+ * Binary-safe. Returns 0 on success and fills out_err on failure when provided. */
+int cbm_write_file_atomic(const char *dest_path, const void *data, size_t len,
+                          cbm_file_error_t *out_err);
+
 /* Execute a command without shell interpretation.
  * argv is a NULL-terminated array: {"cmd", "arg1", "arg2", NULL}.
  * Returns the process exit code, or -1 on fork/exec failure.

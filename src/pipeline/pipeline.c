@@ -12,7 +12,7 @@
  */
 #include "foundation/constants.h"
 
-enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, PL_WAL_BUF = 1040 };
+enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #define PL_NSEC_PER_SEC 1000000000LL
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
@@ -47,6 +47,10 @@ static inline void *intptr_to_ptr(intptr_t v) {
     return p;
 }
 
+static double pipeline_unit_threshold(double threshold) {
+    return (threshold > 0.0 && threshold <= 1.0) ? threshold : 0.0;
+}
+
 /* ── Global index lock ─────────────────────────────────────────── */
 /* Prevents concurrent pipeline runs on the same DB file.
  * Atomic spinlock: 0 = free, 1 = locked. */
@@ -79,6 +83,10 @@ struct cbm_pipeline {
     char *branch_qn;
     cbm_index_mode_t mode;
     double similarity_threshold; /* Jaccard threshold for SIMILAR edges; <=0 = default (#41) */
+    double httplink_min_confidence;
+    double semantic_threshold;
+    double githistory_min_coupling;
+    double lsp_confidence_floor;
     atomic_int cancelled;
     cbm_store_t *flush_store; /* when set, use flush_to_store instead of dump_to_sqlite */
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
@@ -160,6 +168,10 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
     p->mode = mode;
     p->similarity_threshold = 0.0; /* 0 = use CBM_MINHASH_JACCARD_THRESHOLD default */
+    p->httplink_min_confidence = 0.0;
+    p->semantic_threshold = 0.0;
+    p->githistory_min_coupling = 0.0;
+    p->lsp_confidence_floor = 0.0;
     p->persistence = false;
     p->committed_nodes = -1;
     p->committed_edges = -1;
@@ -184,8 +196,52 @@ void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store) {
  * Must be called before cbm_pipeline_run(). */
 void cbm_pipeline_set_similarity_threshold(cbm_pipeline_t *p, double threshold) {
     if (p) {
-        p->similarity_threshold = threshold;
+        p->similarity_threshold = pipeline_unit_threshold(threshold);
     }
+}
+
+void cbm_pipeline_set_httplink_min_confidence(cbm_pipeline_t *p, double threshold) {
+    if (p) {
+        p->httplink_min_confidence = pipeline_unit_threshold(threshold);
+    }
+}
+
+void cbm_pipeline_set_semantic_threshold(cbm_pipeline_t *p, double threshold) {
+    if (p) {
+        p->semantic_threshold = pipeline_unit_threshold(threshold);
+    }
+}
+
+void cbm_pipeline_set_githistory_min_coupling(cbm_pipeline_t *p, double threshold) {
+    if (p) {
+        p->githistory_min_coupling = pipeline_unit_threshold(threshold);
+    }
+}
+
+void cbm_pipeline_set_lsp_confidence_floor(cbm_pipeline_t *p, double threshold) {
+    if (p) {
+        p->lsp_confidence_floor = pipeline_unit_threshold(threshold);
+    }
+}
+
+double cbm_pipeline_httplink_min_confidence(const cbm_pipeline_t *p) {
+    return p ? p->httplink_min_confidence : 0.0;
+}
+
+double cbm_pipeline_similarity_threshold(const cbm_pipeline_t *p) {
+    return p ? p->similarity_threshold : 0.0;
+}
+
+double cbm_pipeline_semantic_threshold(const cbm_pipeline_t *p) {
+    return p ? p->semantic_threshold : 0.0;
+}
+
+double cbm_pipeline_githistory_min_coupling(const cbm_pipeline_t *p) {
+    return p ? p->githistory_min_coupling : 0.0;
+}
+
+double cbm_pipeline_lsp_confidence_floor(const cbm_pipeline_t *p) {
+    return p ? p->lsp_confidence_floor : 0.0;
 }
 
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
@@ -443,11 +499,13 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
 typedef struct {
     const char *repo_path;
     cbm_githistory_result_t *result;
+    double min_coupling_score;
 } gh_compute_arg_t;
 
 static void *gh_compute_thread_fn(void *arg) {
     gh_compute_arg_t *a = arg;
-    cbm_pipeline_githistory_compute(a->repo_path, a->result);
+    cbm_pipeline_githistory_compute_with_threshold(a->repo_path, a->result,
+                                                   a->min_coupling_score);
     return NULL;
 }
 
@@ -809,7 +867,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
 
 /* Try incremental pipeline or delete old DB for reindex.
  * Returns >= 0 if incremental was used (the return code), or -1 to proceed with full. */
-static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count) {
+static int try_incremental_or_reindex(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count) {
     char *db_path = resolve_db_path(p);
     if (!db_path) {
         return CBM_NOT_FOUND;
@@ -840,14 +898,7 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     } else if (check_store) {
         cbm_store_close(check_store);
     }
-    cbm_log_info("pipeline.route", "path", "reindex", "action", "deleting old db");
-    cbm_unlink(db_path);
-    char wal[PL_WAL_BUF];
-    char shm[PL_WAL_BUF];
-    snprintf(wal, sizeof(wal), "%s-wal", db_path);
-    snprintf(shm, sizeof(shm), "%s-shm", db_path);
-    cbm_unlink(wal);
-    cbm_unlink(shm);
+    cbm_log_info("pipeline.route", "path", "reindex", "action", "atomic_rewrite");
     free(db_path);
     return CBM_NOT_FOUND;
 }
@@ -865,7 +916,11 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     cbm_githistory_result_t gh_result = {0};
     cbm_thread_t gh_thread;
     bool gh_threaded = false;
-    gh_compute_arg_t gh_arg = {.repo_path = ctx->repo_path, .result = &gh_result};
+    gh_compute_arg_t gh_arg = {
+        .repo_path = ctx->repo_path,
+        .result = &gh_result,
+        .min_coupling_score = ctx->githistory_min_coupling,
+    };
 
     if (p->mode != CBM_MODE_FAST) {
         if (cbm_default_worker_count(true) > SKIP_ONE) {
@@ -874,7 +929,8 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
             }
         }
         if (!gh_threaded) {
-            cbm_pipeline_githistory_compute(ctx->repo_path, &gh_result);
+            cbm_pipeline_githistory_compute_with_threshold(ctx->repo_path, &gh_result,
+                                                           ctx->githistory_min_coupling);
             cbm_log_info("pass.timing", "pass", "githistory_compute", "elapsed_ms",
                          itoa_buf((int)elapsed_ms(t_gh)));
         }
@@ -1002,7 +1058,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
      * path uses an in-memory store and never writes a DB file, so there is no
      * old DB to consult or delete. */
     if (!p->flush_store) {
-        rc = try_incremental_or_delete_db(p, files, file_count);
+        rc = try_incremental_or_reindex(p, files, file_count);
         if (rc >= 0) {
             cbm_discover_free(files, file_count);
             return rc;
@@ -1027,6 +1083,10 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         .cancelled = &p->cancelled,
         .mode = (int)p->mode,
         .similarity_threshold = p->similarity_threshold,
+        .httplink_min_confidence = p->httplink_min_confidence,
+        .semantic_threshold = p->semantic_threshold,
+        .githistory_min_coupling = p->githistory_min_coupling,
+        .lsp_confidence_floor = p->lsp_confidence_floor,
         .path_aliases = path_aliases,
     };
 
@@ -1095,16 +1155,18 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!check_cancel(p)) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
-        const char *home = cbm_get_home_dir();
         char db_path[1024];
         if (p->db_path) {
             snprintf(db_path, sizeof(db_path), "%s", p->db_path);
         } else {
-            if (!home) {
-                home = cbm_tmpdir();
+            /* Honor CBM_CACHE_DIR (via cbm_resolve_cache_dir) so tests and
+             * isolated runs don't write into the user's real store. Falls back
+             * to the system tmp dir only if no cache dir can be resolved. */
+            const char *cdir = cbm_resolve_cache_dir();
+            if (!cdir) {
+                cdir = cbm_tmpdir();
             }
-            snprintf(db_path, sizeof(db_path), "%s/.cache/codebase-memory-mcp/%s.db", home,
-                     p->project_name);
+            snprintf(db_path, sizeof(db_path), "%s/%s.db", cdir, p->project_name);
         }
 
         /* Ensure parent directory exists (e.g. ~/.cache/codebase-memory-mcp/) */

@@ -11,6 +11,7 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
+#include "cli/cli.h"
 #include "git/git_context.h"
 #include "foundation/dump_verify.h"
 
@@ -5571,6 +5572,63 @@ TEST(pipeline_double_free_prevention) {
     PASS();
 }
 
+TEST(pipeline_unit_threshold_setters_clamp_invalid_values) {
+    cbm_pipeline_t *p = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+
+    cbm_pipeline_set_similarity_threshold(p, 0.7);
+    cbm_pipeline_set_httplink_min_confidence(p, 0.25);
+    cbm_pipeline_set_semantic_threshold(p, 0.75);
+    cbm_pipeline_set_githistory_min_coupling(p, 0.3);
+    cbm_pipeline_set_lsp_confidence_floor(p, 0.6);
+    ASSERT_TRUE(cbm_pipeline_similarity_threshold(p) == 0.7);
+    ASSERT_TRUE(cbm_pipeline_httplink_min_confidence(p) == 0.25);
+    ASSERT_TRUE(cbm_pipeline_semantic_threshold(p) == 0.75);
+    ASSERT_TRUE(cbm_pipeline_githistory_min_coupling(p) == 0.3);
+    ASSERT_TRUE(cbm_pipeline_lsp_confidence_floor(p) == 0.6);
+
+    cbm_pipeline_set_similarity_threshold(p, -1.0);
+    cbm_pipeline_set_httplink_min_confidence(p, 0.0);
+    cbm_pipeline_set_semantic_threshold(p, 1.5);
+    cbm_pipeline_set_githistory_min_coupling(p, 2.0);
+    cbm_pipeline_set_lsp_confidence_floor(p, -0.1);
+    ASSERT_TRUE(cbm_pipeline_similarity_threshold(p) == 0.0);
+    ASSERT_TRUE(cbm_pipeline_httplink_min_confidence(p) == 0.0);
+    ASSERT_TRUE(cbm_pipeline_semantic_threshold(p) == 0.0);
+    ASSERT_TRUE(cbm_pipeline_githistory_min_coupling(p) == 0.0);
+    ASSERT_TRUE(cbm_pipeline_lsp_confidence_floor(p) == 0.0);
+
+    cbm_pipeline_free(p);
+    PASS();
+}
+
+static const cbm_config_entry_t *find_config_entry(const char *key) {
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, key) == 0) {
+            return &CBM_CONFIG_REGISTRY[i];
+        }
+    }
+    return NULL;
+}
+
+TEST(config_registry_includes_mcp_timeout_knobs) {
+    const cbm_config_entry_t *idle = find_config_entry("store_idle_timeout_s");
+    ASSERT_NOT_NULL(idle);
+    ASSERT_STR_EQ(idle->default_val, "60");
+    ASSERT_STR_EQ(idle->category, "MCP");
+
+    const cbm_config_entry_t *validate = find_config_entry("db_validate_busy_timeout_ms");
+    ASSERT_NOT_NULL(validate);
+    ASSERT_STR_EQ(validate->default_val, "1000");
+    ASSERT_STR_EQ(validate->category, "MCP");
+
+    const cbm_config_entry_t *update = find_config_entry("update_check_timeout_s");
+    ASSERT_NOT_NULL(update);
+    ASSERT_STR_EQ(update->default_val, "5");
+    ASSERT_STR_EQ(update->category, "MCP");
+    PASS();
+}
+
 TEST(trackable_source_files) {
     /* Common source extensions are trackable */
     ASSERT_TRUE(cbm_is_trackable_file("main.go"));
@@ -6090,6 +6148,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cancel);
     RUN_TEST(pipeline_cancel_null);
     RUN_TEST(pipeline_run_null);
+    RUN_TEST(pipeline_unit_threshold_setters_clamp_invalid_values);
+    RUN_TEST(config_registry_includes_mcp_timeout_knobs);
     /* File persistence */
     RUN_TEST(store_file_persistence);
     RUN_TEST(store_bulk_persistence);

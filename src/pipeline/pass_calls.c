@@ -186,6 +186,13 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
                                       const cbm_gbuf_node_t *source_node, const char *module_qn,
                                       const char **imp_keys, const char **imp_vals, int imp_count) {
     const char *method = cbm_service_pattern_route_method(call->callee_name);
+    /* Reject CLI slash-command args (e.g. "/ar:allow") that start with '/' and
+     * so pass the caller's first_string_arg[0]=='/' check, but aren't valid
+     * route paths. Same gate as pass_route_nodes.c — keeps command-syntax
+     * strings from becoming spurious Route nodes. */
+    if (!cbm_service_pattern_is_http_route_literal(call->first_string_arg, call->callee_name)) {
+        return;
+    }
     char route_qn[CBM_ROUTE_QN_SIZE];
     char cpath[CBM_SZ_256];
     snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method ? method : "ANY",
@@ -270,6 +277,16 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                    (url_or_topic[0] == '/' || strstr(url_or_topic, "://") != NULL));
     bool is_topic = (url_or_topic && url_or_topic[0] != '\0' && svc == CBM_SVC_ASYNC &&
                      strlen(url_or_topic) > PAIR_LEN);
+    /* An HTTP call whose URL isn't a valid route path (e.g. CLI "/ar:ok" from a
+     * .get(...) accessor that the service-pattern matcher misclassified as
+     * HTTP) must not become a spurious Route node. Drop the URL so we fall
+     * through to the plain CALLS edge — the call relationship is preserved
+     * without fabricating a route. (Async topics aren't route paths, so only
+     * gate HTTP.) */
+    if (svc == CBM_SVC_HTTP && is_url &&
+        !cbm_service_pattern_is_http_route_literal(url_or_topic, call->callee_name)) {
+        is_url = false;
+    }
     if (!is_url && !is_topic) {
         char esc_callee[CBM_SZ_256];
         cbm_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
@@ -366,7 +383,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     }
 
     /* LSP-resolved calls take precedence over registry-textual matching. */
-    const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution(lsp_calls, call);
+    const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution_with_floor(
+        lsp_calls, call, ctx->lsp_confidence_floor);
     if (lsp) {
         const cbm_gbuf_node_t *target_node =
             cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name, lsp->callee_qn);

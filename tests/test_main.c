@@ -112,20 +112,56 @@ extern void suite_dump_verify_io(void);
  * caches at thread teardown (pass_parallel.c). */
 extern void cbm_kind_in_set_free_cache(void);
 
+/* Capacity for the per-run isolated cache dir path. comfortably fits
+ * "/tmp/cbm-test-cache-" + the 6 mkdtemp placeholder chars + headroom. */
+#define TEST_CACHE_DIR_CAP 512
+/* setenv() overwrite flag: nonzero = replace an existing value. */
+#define ENV_OVERWRITE 1
+
 int main(void) {
     printf("\n  codebase-memory-mcp  C test suite\n");
+
+    /* DEFAULT-ON store isolation: redirect every test index into a per-run
+     * temp dir so the suite never pollutes the user's real
+     * ~/.cache/codebase-memory-mcp. Opt out with CBM_TEST_NO_ISOLATE=1 (e.g.
+     * to debug against the real store).
+     *
+     * Works because every test helper now builds its db path via
+     * cbm_resolve_cache_dir() (honors CBM_CACHE_DIR), matching the pipeline
+     * write path. Earlier these helpers hardcoded ~/.cache and mismatched the
+     * CBM_CACHE_DIR-honoring write → 815 empty-store failures. The production
+     * path (pipeline.c + mcp.c) honors CBM_CACHE_DIR regardless. */
+    const char *no_iso = getenv("CBM_TEST_NO_ISOLATE");
+    if (!no_iso || no_iso[0] == '\0') {
+        static char test_cache_dir[TEST_CACHE_DIR_CAP];
+        snprintf(test_cache_dir, sizeof(test_cache_dir), "/tmp/cbm-test-cache-XXXXXX");
+        if (mkdtemp(test_cache_dir)) {
+            setenv("CBM_CACHE_DIR", test_cache_dir, ENV_OVERWRITE);
+        }
+    }
 
     const char *only_suite = getenv("CBM_ONLY_SUITE");
     if (only_suite && only_suite[0]) {
         if (strstr("incremental", only_suite)) RUN_SUITE(incremental);
         if (strstr("mcp", only_suite)) RUN_SUITE(mcp);
         if (strstr("tool_consolidation", only_suite)) RUN_SUITE(tool_consolidation);
+        if (strstr("cli", only_suite)) RUN_SUITE(cli);
+        if (strstr("pipeline", only_suite)) RUN_SUITE(pipeline);
+        if (strstr("parallel", only_suite)) RUN_SUITE(parallel);
         if (strstr("store_nodes", only_suite)) RUN_SUITE(store_nodes);
+        if (strstr("store_search", only_suite)) RUN_SUITE(store_search);
+        if (strstr("store_bulk", only_suite)) RUN_SUITE(store_bulk);
+        if (strstr("store_pragmas", only_suite)) RUN_SUITE(store_pragmas);
+        if (strstr("store_checkpoint", only_suite)) RUN_SUITE(store_checkpoint);
         if (strstr("sqlite_writer", only_suite)) RUN_SUITE(sqlite_writer);
         if (strstr("graph_buffer", only_suite)) RUN_SUITE(graph_buffer);
         if (strstr("pagerank", only_suite)) RUN_SUITE(pagerank);
         if (strstr("depindex", only_suite)) RUN_SUITE(depindex);
         if (strstr("store_arch", only_suite)) RUN_SUITE(store_arch);
+        if (strstr("infrascan", only_suite)) RUN_SUITE(infrascan);
+        if (strstr("watcher", only_suite)) RUN_SUITE(watcher);
+        if (strstr("security", only_suite)) RUN_SUITE(security);
+        if (strstr("artifact", only_suite)) RUN_SUITE(artifact);
         TEST_SUMMARY();
         return 0;
     }

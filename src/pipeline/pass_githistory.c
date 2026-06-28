@@ -315,6 +315,7 @@ typedef struct {
     cbm_change_coupling_t *out;
     int out_count;
     int max_out;
+    double min_coupling_score;
 } collect_coupling_ctx_t;
 
 static void collect_coupling_cb(const char *pair_key, void *val, void *ud) {
@@ -353,7 +354,9 @@ static void collect_coupling_cb(const char *pair_key, void *val, void *ud) {
     }
 
     double score = (double)co_count / (double)min_total;
-    if (score < MIN_COUPLING_SCORE) {
+    double min_score =
+        cctx->min_coupling_score > 0.0 ? cctx->min_coupling_score : MIN_COUPLING_SCORE;
+    if (score < min_score) {
         return;
     }
 
@@ -366,8 +369,10 @@ static void collect_coupling_cb(const char *pair_key, void *val, void *ud) {
     cc->last_co_change = ts ? *ts : 0;
 }
 
-int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_count,
-                                cbm_change_coupling_t *out, int max_out) {
+int cbm_compute_change_coupling_with_threshold(const cbm_commit_files_t *commits,
+                                               int commit_count,
+                                               cbm_change_coupling_t *out, int max_out,
+                                               double min_coupling_score) {
     CBMHashTable *file_counts = cbm_ht_create(CBM_SZ_1K);
     CBMHashTable *pair_counts = cbm_ht_create(CBM_SZ_2K);
     /* Parallel table mapping pair_key → max commit timestamp seen for that
@@ -438,6 +443,7 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
         .out = out,
         .out_count = 0,
         .max_out = max_out,
+        .min_coupling_score = min_coupling_score,
     };
     cbm_ht_foreach(pair_counts, collect_coupling_cb, &cctx);
 
@@ -451,6 +457,11 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
     return cctx.out_count;
 }
 
+int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_count,
+                                cbm_change_coupling_t *out, int max_out) {
+    return cbm_compute_change_coupling_with_threshold(commits, commit_count, out, max_out, 0.0);
+}
+
 /* ── Split pass: compute (I/O-bound) + apply (gbuf writes) ───────── */
 
 /* Pre-computed coupling result buffer for fused post-pass parallelism. */
@@ -459,7 +470,9 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
 
 /* Compute change couplings without touching the graph buffer.
  * Can run on a separate thread while other passes use the gbuf. */
-int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result_t *result) {
+int cbm_pipeline_githistory_compute_with_threshold(const char *repo_path,
+                                                   cbm_githistory_result_t *result,
+                                                   double min_coupling_score) {
     result->couplings = NULL;
     result->count = 0;
     result->commit_count = 0;
@@ -492,7 +505,8 @@ int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result
     }
 
     cbm_change_coupling_t *couplings = malloc(MAX_COUPLINGS * sizeof(cbm_change_coupling_t));
-    int coupling_count = cbm_compute_change_coupling(cf, commit_count, couplings, MAX_COUPLINGS);
+    int coupling_count = cbm_compute_change_coupling_with_threshold(
+        cf, commit_count, couplings, MAX_COUPLINGS, min_coupling_score);
 
     /* Per-file temporal aggregation: change_count + last_modified.
      * Single hash-table pass over the same commit set used for coupling so
@@ -541,6 +555,10 @@ int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result
     result->couplings = couplings;
     result->count = coupling_count;
     return 0;
+}
+
+int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result_t *result) {
+    return cbm_pipeline_githistory_compute_with_threshold(repo_path, result, 0.0);
 }
 
 /* Apply pre-computed couplings to the graph buffer (must be on main thread). */
@@ -609,7 +627,8 @@ int cbm_pipeline_pass_githistory(cbm_pipeline_ctx_t *ctx) {
     cbm_log_info("pass.start", "pass", "githistory");
 
     cbm_githistory_result_t result = {0};
-    cbm_pipeline_githistory_compute(ctx->repo_path, &result);
+    cbm_pipeline_githistory_compute_with_threshold(ctx->repo_path, &result,
+                                                   ctx->githistory_min_coupling);
 
     int edge_count = 0;
     if (result.count > 0 || result.file_temporal_count > 0) {

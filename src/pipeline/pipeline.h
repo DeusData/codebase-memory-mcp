@@ -79,6 +79,15 @@ void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store);
 /* Set the Jaccard similarity threshold for SIMILAR-edge creation (pass_similarity).
  * <=0 (or unset) uses the CBM_MINHASH_JACCARD_THRESHOLD default. Before run(). */
 void cbm_pipeline_set_similarity_threshold(cbm_pipeline_t *p, double threshold);
+void cbm_pipeline_set_httplink_min_confidence(cbm_pipeline_t *p, double threshold);
+void cbm_pipeline_set_semantic_threshold(cbm_pipeline_t *p, double threshold);
+void cbm_pipeline_set_githistory_min_coupling(cbm_pipeline_t *p, double threshold);
+void cbm_pipeline_set_lsp_confidence_floor(cbm_pipeline_t *p, double threshold);
+double cbm_pipeline_similarity_threshold(const cbm_pipeline_t *p);
+double cbm_pipeline_httplink_min_confidence(const cbm_pipeline_t *p);
+double cbm_pipeline_semantic_threshold(const cbm_pipeline_t *p);
+double cbm_pipeline_githistory_min_coupling(const cbm_pipeline_t *p);
+double cbm_pipeline_lsp_confidence_floor(const cbm_pipeline_t *p);
 
 /* Get the project name derived from repo_path. Returned string is
  * owned by the pipeline. Valid until cbm_pipeline_free(). */

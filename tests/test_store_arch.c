@@ -252,15 +252,44 @@ TEST(arch_languages) {
 
 TEST(arch_routes) {
     cbm_store_t *s = setup_arch_test_store();
+    cbm_node_t infra_url = {
+        .project = "test",
+        .label = "Route",
+        .name = "https://example.com/api/orders",
+        .qualified_name = "__route__infra__https://example.com/api/orders",
+        .properties_json = "{\"source\":\"infra\",\"key_path\":\"ServiceUrl\"}"};
+    cbm_store_upsert_node(s, &infra_url);
+    cbm_node_t code_url = {
+        .project = "test",
+        .label = "Route",
+        .name = "https://api.example.com/v1/orders",
+        .qualified_name = "__route__GET__https://api.example.com/v1/orders",
+        .properties_json =
+            "{\"method\":\"GET\",\"path\":\"https://api.example.com/v1/orders\"}"};
+    cbm_store_upsert_node(s, &code_url);
+
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"routes"};
     ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
 
-    ASSERT_EQ(info.route_count, 1);
-    ASSERT_STR_EQ(info.routes[0].method, "POST");
-    ASSERT_STR_EQ(info.routes[0].path, "/api/orders");
-    ASSERT_STR_EQ(info.routes[0].handler, "HandleRequest");
+    ASSERT_EQ(info.route_count, 2);
+    bool saw_app_route = false;
+    bool saw_code_url = false;
+    for (int i = 0; i < info.route_count; i++) {
+        if (strcmp(info.routes[i].path, "/api/orders") == 0) {
+            saw_app_route = true;
+            ASSERT_STR_EQ(info.routes[i].method, "POST");
+            ASSERT_STR_EQ(info.routes[i].handler, "HandleRequest");
+        }
+        if (strcmp(info.routes[i].path, "https://api.example.com/v1/orders") == 0) {
+            saw_code_url = true;
+            ASSERT_STR_EQ(info.routes[i].method, "GET");
+        }
+        ASSERT_STR_NEQ(info.routes[i].path, "https://example.com/api/orders");
+    }
+    ASSERT_TRUE(saw_app_route);
+    ASSERT_TRUE(saw_code_url);
 
     cbm_store_architecture_free(&info);
     cbm_store_close(s);
