@@ -18,13 +18,12 @@ Use graph degree filtering to find dead code, high-complexity functions, and ref
 
 ### Dead Code Detection
 
-Find functions with zero inbound CALLS edges, excluding entry points:
+Find likely isolated functions with zero CALLS degree, excluding entry points:
 
 ```
 search_graph(
   label="Function",
   relationship="CALLS",
-  direction="inbound",
   max_degree=0,
   exclude_entry_points=true
 )
@@ -37,7 +36,7 @@ search_graph(
 Before deleting, verify each candidate truly has no callers:
 
 ```
-trace_call_path(function_name="SuspectFunction", direction="inbound", depth=1)
+trace_path(function_name="SuspectFunction", direction="inbound", depth=1)
 ```
 
 Also check for read references (callbacks, stored in variables):
@@ -51,12 +50,7 @@ query_graph(query="MATCH (a)-[r:USAGE]->(b) WHERE b.name = 'SuspectFunction' RET
 These are often doing too much and are refactor candidates:
 
 ```
-search_graph(
-  label="Function",
-  relationship="CALLS",
-  direction="outbound",
-  min_degree=10
-)
+query_graph(query="MATCH (f)-[:CALLS]->(g) RETURN f.name, count(g) AS out_degree ORDER BY out_degree DESC LIMIT 20")
 ```
 
 ### High Fan-In Functions (called by 10+ others)
@@ -64,12 +58,7 @@ search_graph(
 These are critical functions — changes have wide impact:
 
 ```
-search_graph(
-  label="Function",
-  relationship="CALLS",
-  direction="inbound",
-  min_degree=10
-)
+query_graph(query="MATCH (f)<-[:CALLS]-(g) RETURN f.name, count(g) AS in_degree ORDER BY in_degree DESC LIMIT 20")
 ```
 
 ### Files That Change Together (Hidden Coupling)
@@ -87,7 +76,6 @@ High coupling between unrelated files suggests hidden dependencies.
 ```
 search_graph(
   relationship="IMPORTS",
-  direction="outbound",
   max_degree=0,
   label="Module"
 )

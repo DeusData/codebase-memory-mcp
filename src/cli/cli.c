@@ -489,21 +489,19 @@ static const char skill_content[] =
     "\n"
     "## Tracing Workflow\n"
     "1. `search_graph(name_pattern=\".*FuncName.*\")` — discover exact name\n"
-    "2. `trace_path(function_name=\"FuncName\", direction=\"both\", depth=3)` — trace\n"
+    "2. `trace_path(function_name=\"FuncName\", direction=\"both\", depth=3)` — trace callers and callees\n"
     "3. `detect_changes()` — map git diff to affected symbols\n"
     "\n"
     "## Quality Analysis\n"
     "- Dead code: `search_graph(max_degree=0, exclude_entry_points=true)`\n"
-    "- High fan-out: `search_graph(min_degree=10, relationship=\"CALLS\", "
-    "direction=\"outbound\")`\n"
-    "- High fan-in: `search_graph(min_degree=10, relationship=\"CALLS\", "
-    "direction=\"inbound\")`\n"
+    "- High fan-out: `query_graph(query=\"MATCH (f)-[:CALLS]->(g) RETURN f.name, count(g) AS out_degree ORDER BY out_degree DESC LIMIT 20\")`\n"
+    "- High fan-in: `query_graph(query=\"MATCH (f)<-[:CALLS]-(g) RETURN f.name, count(g) AS in_degree ORDER BY in_degree DESC LIMIT 20\")`\n"
     "\n"
-    "## 14 MCP Tools\n"
+    "## MCP Tools\n"
     "`index_repository`, `index_status`, `list_projects`, `delete_project`,\n"
     "`search_graph`, `search_code`, `trace_path`, `detect_changes`,\n"
     "`query_graph`, `get_graph_schema`, `get_code_snippet`, `get_architecture`,\n"
-    "`manage_adr`, `ingest_traces`\n"
+    "`manage_adr`, `ingest_traces`, `index_dependencies`\n"
     "\n"
     "## Edge Types\n"
     "CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD,\n"
@@ -521,12 +519,11 @@ static const char skill_content[] =
     "## Gotchas\n"
     "1. `search_graph(relationship=\"HTTP_CALLS\")` filters nodes by degree — "
     "use `query_graph` with Cypher to see actual edges.\n"
-    "2. `query_graph` has a 200-row cap — use `search_graph` with degree filters "
-    "for counting.\n"
-    "3. `trace_path` needs exact names — use `search_graph(name_pattern=...)` first.\n"
+    "2. `query_graph` output is capped by query_max_output_bytes; add LIMIT or set max_output_bytes=0.\n"
+    "3. `trace_path` works best with exact names — use `search_graph(name_pattern=...)` first.\n"
     "4. `direction=\"outbound\"` misses cross-service callers — use "
     "`direction=\"both\"`.\n"
-    "5. Results default to 10 per page — check `has_more` and use `offset`.\n";
+    "5. Results default to search_limit (50 unless configured); check `has_more` and use `offset`.\n";
 
 static const char codex_instructions_content[] =
     "# Codebase Knowledge Graph\n"
@@ -2644,7 +2641,7 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
 const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
     /* ── Indexing ── */
     {"auto_index", "true", "CBM_AUTO_INDEX", "Indexing",
-     "Auto-index session project on startup",
+     "Auto-index the MCP server project derived from CWD on startup",
      "true|false",
      "Enable to always have fresh data; disable for manual control or CI environments."},
     {"auto_index_limit", "50000", "CBM_AUTO_INDEX_LIMIT", "Indexing",
@@ -2709,14 +2706,14 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "true|false",
      "When true (default), the first search_graph response includes a "
      "_context object: node/edge counts, node labels, edge types, PageRank status, and "
-     "detected language ecosystem. Delivered once per session; subsequent calls are unaffected. "
-     "Why enable: the AI gets codebase structure upfront without needing to call "
+     "detected language ecosystem. Delivered once per MCP server process; later calls are unaffected. "
+     "Why enable: the MCP client gets codebase structure upfront without needing to call "
      "get_architecture or get_graph_schema separately. Useful for code exploration, "
-     "refactoring, debugging, and any session focused on understanding the codebase. "
-     "Why disable: context window space consumed by _context is wasted when the session "
+     "refactoring, debugging, and codebase-understanding tasks. "
+     "Why disable: context window space consumed by _context is wasted when the MCP client task "
      "involves non-code tasks, scripted/programmatic tool use, CI pipelines, token-metered "
      "environments, or when the model already has codebase context from another source. "
-     "To disable for a session: export CBM_CONTEXT_INJECTION=false "
+     "To disable for one MCP server process: export CBM_CONTEXT_INJECTION=false "
      "To disable by default: codebase-memory-mcp config set context_injection false"},
     {"compact", "true", "CBM_COMPACT", "Tools",
      "Default compact output for search_graph, trace_path, and get_code",
@@ -2849,7 +2846,7 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "Seconds an MCP server keeps an idle SQLite project store open",
      "1-65536",
      "60 seconds balances latency for repeated tool calls with memory release while idle. Lower for "
-     "memory-constrained hosts; raise for long interactive sessions that repeatedly query one project."},
+     "memory-constrained hosts; raise for long MCP server runs that repeatedly query one project."},
     {"db_validate_busy_timeout_ms", "1000", NULL, "MCP",
      "SQLite busy timeout for read-only cache database validation in MCP startup/discovery paths",
      "0-65536",
