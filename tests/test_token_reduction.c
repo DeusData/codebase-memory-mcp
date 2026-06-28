@@ -1086,6 +1086,30 @@ static cbm_mcp_server_t *setup_sp_server(void) {
     return srv;
 }
 
+static int add_trace_test_caller(cbm_mcp_server_t *srv) {
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    if (!st) return -1;
+    cbm_node_t n = {0};
+    n.project = "sp-test";
+    n.label = "Function";
+    n.name = "test_helper";
+    n.qualified_name = "sp-test.tests.test_helper";
+    n.file_path = "tests/test_main.py";
+    n.start_line = 1;
+    n.end_line = 4;
+    n.properties_json = "{}";
+    int64_t test_id = cbm_store_upsert_node(st, &n);
+    if (test_id <= 0) return -1;
+
+    cbm_edge_t e = {0};
+    e.project = "sp-test";
+    e.source_id = test_id;
+    e.target_id = 2; /* process_request in setup_sp_server */
+    e.type = "CALLS";
+    e.properties_json = "{}";
+    return cbm_store_insert_edge(st, &e) > 0 ? 0 : -1;
+}
+
 /* ── Changes 2.1 + 1.1 + 1.3: qn_pattern filters qualified_name ── */
 
 TEST(search_graph_qn_pattern_filters_results) {
@@ -1372,6 +1396,80 @@ TEST(trace_path_default_edge_types_calls_only) {
     /* main has CALLS -> process_request. Default behavior unchanged. */
     ASSERT_NOT_NULL(callees);
     ASSERT_GT((int)yyjson_arr_size(callees), 0);
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(trace_path_include_tests_filters_test_nodes) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    ASSERT_EQ(add_trace_test_caller(srv), 0);
+
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
+                                    "{\"function_name\":\"process_request\","
+                                    "\"project\":\"sp-test\","
+                                    "\"direction\":\"inbound\","
+                                    "\"compact\":false,"
+                                    "\"include_tests\":false}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "test_helper"));
+    ASSERT_NULL(strstr(resp, "\"is_test\""));
+    free(resp);
+
+    raw = cbm_mcp_handle_tool(srv, "trace_path",
+                              "{\"function_name\":\"process_request\","
+                              "\"project\":\"sp-test\","
+                              "\"direction\":\"inbound\","
+                              "\"compact\":false,"
+                              "\"include_tests\":true}");
+    resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "test_helper"));
+    ASSERT_NOT_NULL(strstr(resp, "\"is_test\":true"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(trace_path_risk_labels) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
+                                    "{\"function_name\":\"main\","
+                                    "\"project\":\"sp-test\","
+                                    "\"direction\":\"outbound\","
+                                    "\"risk_labels\":true}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"risk\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(trace_path_exclude_filters_file_paths) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
+                                    "{\"function_name\":\"main\","
+                                    "\"project\":\"sp-test\","
+                                    "\"direction\":\"outbound\","
+                                    "\"exclude\":[\"handlers.py\"]}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *callees = yyjson_obj_get(yyjson_doc_get_root(doc), "callees");
+    ASSERT_NOT_NULL(callees);
+    ASSERT_EQ((int)yyjson_arr_size(callees), 0);
     yyjson_doc_free(doc);
     free(resp);
     cbm_mcp_server_free(srv);
@@ -1729,6 +1827,9 @@ SUITE(token_reduction) {
     RUN_TEST(trace_path_compact_false_includes_name);
     RUN_TEST(trace_path_edge_types_http_calls_traverses_http_edges);
     RUN_TEST(trace_path_default_edge_types_calls_only);
+    RUN_TEST(trace_path_include_tests_filters_test_nodes);
+    RUN_TEST(trace_path_risk_labels);
+    RUN_TEST(trace_path_exclude_filters_file_paths);
 
     /* 2.3 callers_total field completeness */
     RUN_TEST(trace_path_response_includes_callers_total);

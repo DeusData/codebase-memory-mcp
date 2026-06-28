@@ -449,6 +449,29 @@ TEST(f15_valid_direction_succeeds) {
     PASS();
 }
 
+TEST(trace_invalid_mode_errors) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
+                                    "{\"function_name\":\"foo\",\"mode\":\"typo\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    ASSERT_NOT_NULL(strstr(resp, "error"));
+    ASSERT_NOT_NULL(strstr(resp, "mode"));
+    ASSERT_NOT_NULL(strstr(resp, "calls"));
+    ASSERT_NOT_NULL(strstr(resp, "data_flow"));
+    ASSERT_NOT_NULL(strstr(resp, "cross_service"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  G1: Summary mode includes results_suppressed indicator
  * ══════════════════════════════════════════════════════════════════ */
@@ -1121,6 +1144,7 @@ void suite_input_validation(void) {
     RUN_TEST(trace_truly_missing_still_errors);
     RUN_TEST(f15_invalid_direction_errors);
     RUN_TEST(f15_valid_direction_succeeds);
+    RUN_TEST(trace_invalid_mode_errors);
     RUN_TEST(g1_summary_mode_has_results_key);
     RUN_TEST(cq3_cypher_with_label_warns);
     RUN_TEST(ix2_status_resource_format);

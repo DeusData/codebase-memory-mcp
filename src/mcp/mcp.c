@@ -1,5 +1,5 @@
 /*
- * mcp.c — MCP server: JSON-RPC 2.0 over stdio with 14 graph tools.
+ * mcp.c — MCP server: JSON-RPC 2.0 over stdio with graph tools.
  *
  * Uses yyjson for fast JSON parsing/building.
  * Single-threaded event loop: read line → parse → dispatch → respond.
@@ -371,19 +371,26 @@ static const tool_def_t TOOLS[] = {
     {"search_graph",
      "Search the code knowledge graph for functions, classes, routes, and variables. Use INSTEAD "
      "OF grep/glob when finding code definitions, implementations, or relationships. Returns "
-     "precise results in one call. When has_more=true, use offset+limit to paginate. "
+     "structured results in one call. When has_more=true, use offset+limit to paginate. "
      "Use mode=summary for quick codebase overview without individual results.",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"label\":{\"type\":"
-     "\"string\"},\"name_pattern\":{\"type\":\"string\",\"description\":\"Regex pattern on symbol "
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
+     "\"Indexed project name. Omit to use the MCP server project derived from server CWD; first use "
+     "may auto-index it.\"},\"label\":{\"type\":\"string\",\"description\":\"Node label filter, "
+     "for example Function, Class, Method, Route, or File.\"},\"name_pattern\":{\"type\":\"string\",\"description\":\"Regex pattern on symbol "
      "name. Glob wildcards (*tool*, foo?) auto-convert to regex.\"},"
      "\"qn_pattern\":{\"type\":\"string\",\"description\":\"Regex pattern on qualified name. "
      "Glob wildcards auto-convert to regex.\"},"
      "\"semantic_query\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":"
      "\"Natural-language/keyword vector search terms appended as semantic_results. Use when "
      "lexical names are unknown or vocabulary differs.\"},"
-     "\"file_pattern\":{\"type\":\"string\"},\"relationship\":{\"type\":\"string\"},\"min_degree\":"
-     "{\"type\":\"integer\"},\"max_degree\":{\"type\":\"integer\"},\"exclude_entry_points\":{"
-     "\"type\":\"boolean\"},\"include_connected\":{\"type\":\"boolean\"},\"limit\":{\"type\":"
+     "\"file_pattern\":{\"type\":\"string\",\"description\":\"Glob or substring filter on result "
+     "file paths.\"},\"relationship\":{\"type\":\"string\",\"description\":\"Graph edge type to "
+     "filter connected results, for example CALLS or IMPORTS.\"},\"min_degree\":"
+     "{\"type\":\"integer\",\"description\":\"Minimum total in+out graph degree.\"},\"max_degree\":"
+     "{\"type\":\"integer\",\"description\":\"Maximum total in+out graph degree.\"},"
+     "\"exclude_entry_points\":{\"type\":\"boolean\",\"description\":\"Omit likely entry-point "
+     "nodes when looking for implementation internals.\"},\"include_connected\":{\"type\":"
+     "\"boolean\",\"description\":\"Include directly connected symbols for each match.\"},\"limit\":{\"type\":"
      "\"integer\",\"description\":\"Max results per page (configurable via search_limit config key). "
      "Response includes has_more and pagination_hint when more pages exist."
      "\"},\"offset\":{\"type\":\"integer\",\"default\":0,\"description\":\"Skip N results "
@@ -410,11 +417,12 @@ static const tool_def_t TOOLS[] = {
     {"query_graph",
      "Execute a Cypher query against the knowledge graph for complex multi-hop patterns, "
      "aggregations, and cross-service analysis. Output is capped by default (configurable via "
-     "query_max_output_bytes config key) — set max_output_bytes=0 for unlimited or add LIMIT. "
+     "query_max_output_bytes config key). Set max_output_bytes=0 for unlimited or add LIMIT. "
      "Dependency sub-project symbols (proj.dep.*) are tagged source:dependency; to rank your own "
      "project's symbols above them, ORDER BY CASE WHEN n.project LIKE '%.dep.%' THEN 1 ELSE 0 END.",
      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Cypher "
-     "query\"},\"project\":{\"type\":\"string\"},\"max_rows\":{\"type\":\"integer\","
+     "query\"},\"project\":{\"type\":\"string\",\"description\":\"Indexed project name. Omit to "
+     "use the MCP server project derived from server CWD.\"},\"max_rows\":{\"type\":\"integer\","
      "\"description\":\"Scan-level row limit (default: unlimited). Note: limits nodes scanned, "
      "not rows returned. For output size, use max_output_bytes or add LIMIT to your Cypher query.\"},\"max_output_bytes\":{\"type\":"
      "\"integer\",\"description\":\"Max response size in bytes (configurable via "
@@ -422,31 +430,50 @@ static const tool_def_t TOOLS[] = {
      "truncated=true with total_bytes and hint to add LIMIT.\"}},\"required\":[\"query\"]}"},
 
     {"trace_path",
-     "Trace function call paths — who calls a function and what it calls. Use INSTEAD OF grep when "
-     "finding callers, dependencies, or impact analysis. Matches exact name first, then falls back "
-     "to case-insensitive search if not found. Shows candidates array when function name "
-     "is ambiguous. Results are deduplicated (cycles don't inflate counts).",
+     "Trace function call paths: who calls a function and what it calls. Use INSTEAD OF grep when "
+     "finding callers, dependencies, or impact analysis. Auto-indexes the project on first use. "
+     "Pass qualified_name from search_graph when available; otherwise pass function_name. "
+     "All other params are optional defaults. Results are deduplicated and show candidates "
+     "when a name is ambiguous.",
      "{\"type\":\"object\",\"properties\":{\"function_name\":{\"type\":\"string\","
-     "\"description\":\"Function name to trace. Case-insensitive fallback if exact match not found."
-     "\"},\"project\":{"
-     "\"type\":\"string\"},\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\","
-     "\"both\"],\"default\":\"both\"},\"depth\":{\"type\":\"integer\",\"default\":3},\"max_results"
+     "\"description\":\"Function name to trace when qualified_name is unavailable. Exact match "
+     "first, then case-insensitive fallback."
+     "\"},\"qualified_name\":{\"type\":\"string\",\"description\":\"Exact qualified name from search "
+     "results. Prefer this for cross-tool chaining and disambiguation.\"},\"project\":{"
+     "\"type\":\"string\",\"description\":\"Indexed project name. Omit to use the MCP server project derived from server CWD; first use may auto-index it.\"},\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\","
+     "\"both\"],\"default\":\"both\",\"description\":\"Trace callers (inbound), callees "
+     "(outbound), or both.\"},\"depth\":{\"type\":\"integer\",\"default\":3,\"description\":"
+     "\"Maximum graph hops to traverse from the start function.\"},\"max_results"
      "\":{\"type\":\"integer\",\"description\":\"Max nodes per direction (configurable via "
      "trace_max_results config key). Set higher for exhaustive traces. Response includes "
      "callees_total/callers_total for truncation awareness.\"},\"compact\":{\"type\":\"boolean\","
      "\"default\":true,\"description\":"
-     "\"Omit name when it equals qualified_name's last segment (e.g. \\\"main\\\" in \\\"pkg.main\\\"). Reduces token count.\"},\"edge_types\":{\"type\":\"array\",\"items\":{"
-     "\"type\":\"string\"}},\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
-     "\"description\":\"Glob patterns for file paths to exclude from trace results."
-     "\"}},\"required\":[\"function_name\"]}"},
+     "\"Omit name when it equals qualified_name's last segment (e.g. \\\"main\\\" in \\\"pkg.main\\\"). Reduces token count.\"},"
+     "\"mode\":{\"type\":\"string\",\"enum\":[\"calls\",\"data_flow\",\"cross_service\"],"
+     "\"default\":\"calls\",\"description\":\"Default edge set when edge_types is omitted: "
+     "calls follows CALLS, data_flow follows CALLS+DATA_FLOWS, cross_service follows "
+     "service-boundary edge types.\"},"
+     "\"edge_types\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
+     "\"description\":\"Optional exact graph edge types to traverse. Defaults come from mode.\"},"
+     "\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
+     "\"description\":\"Optional file-path globs to omit, e.g. tests/** or vendor/**."
+     "\"},\"include_tests\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"Include test/spec file nodes in trace results and mark them with is_test.\"},"
+     "\"risk_labels\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"Annotate traced nodes with CRITICAL/HIGH/MEDIUM/LOW risk by hop distance.\"},"
+     "\"parameter_name\":{\"type\":\"string\",\"description\":\"Accepted for upstream compatibility; "
+     "reserved for future parameter-level data-flow narrowing."
+     "\"}},\"description\":\"Pass function_name OR qualified_name (at least one required).\"}"},
 
     {"get_code_snippet",
      "Get source code for a specific function, class, or symbol by qualified name. Use INSTEAD OF "
      "reading entire files when you need one function's implementation. Use mode=signature for "
-     "quick API lookup (99%% token savings). Use mode=head_tail for large functions to see both "
+     "API lookup without the source body. Use mode=head_tail for large functions to see both "
      "the signature and return/cleanup code. When truncated=true, set max_lines=0 for full source.",
-     "{\"type\":\"object\",\"properties\":{\"qualified_name\":{\"type\":\"string\"},\"project\":{"
-     "\"type\":\"string\"},\"auto_resolve\":{\"type\":\"boolean\",\"default\":false,\"description\":"
+     "{\"type\":\"object\",\"properties\":{\"qualified_name\":{\"type\":\"string\",\"description\":"
+     "\"Exact qualified name from search_graph results.\"},\"project\":{"
+     "\"type\":\"string\",\"description\":\"Indexed project name. Omit to use the MCP server "
+     "project derived from server CWD.\"},\"auto_resolve\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Auto-pick best match when name is ambiguous (by degree). Shows alternatives in response."
      "\"},\"include_neighbors\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Include "
      "caller/callee names (up to 10 each). Adds context but increases response size.\"},"
@@ -454,32 +481,38 @@ static const tool_def_t TOOLS[] = {
      "(configurable via snippet_max_lines config key). Set to 0 for unlimited. When truncated, "
      "response includes total_lines and signature for context.\"},\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"signature\","
      "\"head_tail\"],\"default\":\"full\",\"description\":\"full=source up to max_lines, "
-     "signature=API signature+params+return type only (no source body, ~99%% savings), "
+     "signature=API signature+params+return type only (no source body), "
      "head_tail=first 60%% + last 40%% of max_lines with omission marker (preserves return/"
      "cleanup code)\"}},\"required\":[\"qualified_name\"]}"},
 
     {"get_graph_schema", "Get the schema of the knowledge graph (node labels, edge types)",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
+     "\"Indexed project name to inspect.\"}},\"required\":["
      "\"project\"]}"},
 
     {"get_architecture",
-     "Get high-level architecture overview — packages, services, dependencies, and project "
+     "Get high-level architecture overview: packages, services, dependencies, and project "
      "structure at a glance. Includes 'clusters': Leiden community detection over the call/import "
      "graph, surfacing the de-facto modules (each with a label, member count, cohesion score, "
-     "representative top_nodes, and the packages/edge_types that bind it) — use these to grasp "
-     "the real architectural seams, which often cut across the folder layout.",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"aspects\":{\"type\":"
-     "\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]}"},
+     "representative top_nodes, and the packages/edge_types that bind it). Use these to inspect "
+     "actual dependency-based module boundaries, which may differ from the folder layout.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
+     "\"Indexed project name to summarize.\"},\"aspects\":{\"type\":"
+     "\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Optional sections to include; "
+     "omit for the default overview.\"}},\"required\":[\"project\"]}"},
 
     {"search_code",
      "Search source code with text or regex patterns. Case-insensitive by default. "
      "Use for string literals, error messages, and config values not in the knowledge graph. "
      "Use path_filter regex to scope results to specific paths.",
-     "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"project\":{\"type\":"
-     "\"string\"},\"file_pattern\":{\"type\":\"string\",\"description\":\"Glob for grep "
+     "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"description\":"
+     "\"Text or regex to search for.\"},\"project\":{\"type\":"
+     "\"string\",\"description\":\"Indexed project name. Omit to use the MCP server project "
+     "derived from server CWD.\"},\"file_pattern\":{\"type\":\"string\",\"description\":\"Glob for grep "
      "--include (e.g. *.go)\"},\"path_filter\":{\"type\":\"string\",\"description\":\"Regex "
      "filter on result file paths (e.g. ^src/ or \\\\.(go|ts)$)\"},"
-     "\"regex\":{\"type\":\"boolean\",\"default\":false},"
+     "\"regex\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Treat pattern as a "
+     "regular expression instead of literal text.\"},"
      "\"case_sensitive\":{\"type\":\"boolean\",\"default\":false,"
      "\"description\":\"Match case-sensitively (default: case-insensitive).\"},"
      "\"context\":{\"type\":\"integer\",\"default\":0,"
@@ -494,34 +527,45 @@ static const tool_def_t TOOLS[] = {
     {"list_projects", "List all indexed projects", "{\"type\":\"object\",\"properties\":{}}"},
 
     {"delete_project", "Delete a project from the index",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
+     "\"Indexed project name to delete.\"}},\"required\":["
      "\"project\"]}"},
 
     {"index_status", "Get the indexing status of a project",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
+     "\"Indexed project name to inspect.\"}},\"required\":["
      "\"project\"]}"},
 
     {"detect_changes", "Detect code changes and their impact",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"scope\":{\"type\":"
-     "\"string\"},\"depth\":{\"type\":\"integer\",\"default\":2},\"base_branch\":{\"type\":"
-     "\"string\",\"default\":\"main\"},\"since\":{\"type\":\"string\",\"description\":"
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
+     "\"Indexed project name whose repository history should be compared.\"},\"scope\":{\"type\":"
+     "\"string\",\"description\":\"Optional path or subsystem scope for impact analysis.\"},"
+     "\"depth\":{\"type\":\"integer\",\"default\":2,\"description\":\"Maximum dependency hops to "
+     "include in the impact graph.\"},\"base_branch\":{\"type\":"
+     "\"string\",\"default\":\"main\",\"description\":\"Git branch used when since is omitted.\"},"
+     "\"since\":{\"type\":\"string\",\"description\":"
      "\"Git ref or tag to compare from (e.g. HEAD~5, v0.5.0). Diffs <ref>...HEAD.\"}},"
      "\"required\":"
      "[\"project\"]}"},
 
     {"manage_adr", "Create or update Architecture Decision Records",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
-     "\"string\",\"enum\":[\"get\",\"update\",\"sections\"]},\"content\":{\"type\":\"string\"},"
-     "\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]"
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
+     "\"Indexed project name whose ADR data should be read or updated.\"},\"mode\":{\"type\":"
+     "\"string\",\"enum\":[\"get\",\"update\",\"sections\"],\"description\":\"get returns ADRs, "
+     "update writes content, sections returns selected sections.\"},\"content\":{\"type\":\"string\","
+     "\"description\":\"ADR markdown/content for update mode.\"},"
+     "\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Section "
+     "names to return in sections mode.\"}},\"required\":[\"project\"]"
      "}"},
 
     {"ingest_traces", "Ingest runtime traces to enhance the knowledge graph",
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\",\"items\":{\"type\":"
-     "\"object\"}},\"project\":{\"type\":"
-     "\"string\"}},\"required\":[\"traces\",\"project\"]}"},
+     "\"object\"},\"description\":\"Runtime trace events to merge into the graph.\"},\"project\":{\"type\":"
+     "\"string\",\"description\":\"Indexed project name receiving the trace data.\"}},\"required\":[\"traces\",\"project\"]}"},
 
     {"index_dependencies",
-     "Index dependency/library source for API reference. Works with ANY language (78 supported). "
+     "Index dependency/library source for API reference. Works with supported languages when "
+     "source_paths point to local source trees. "
      "Deps stored with {project}.dep.{name} project names, tagged source:dependency in results. "
      "PRIMARY: Use source_paths (works for all languages). "
      "SHORTCUT: package_manager auto-resolves paths for uv/cargo/npm/bun.",
@@ -542,50 +586,33 @@ static const tool_def_t TOOLS[] = {
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
 
-/* ── Streamlined tool definitions ──────────────────────────────
- * The 3 search tools (search_graph, query_graph, search_code) are drawn from
- * TOOLS[] and emitted as the default surface in cbm_mcp_tools_list(). This
- * array holds the additional default tools whose schemas live only here. */
+/* ── Streamlined-only tool definitions ──────────────────────────
+ * Canonical tools such as search_graph, query_graph, search_code, and trace_path
+ * are emitted from TOOLS[] in every mode so their schemas cannot drift between
+ * classic and streamlined surfaces. This array holds fork-only concise aliases. */
 
 static const tool_def_t STREAMLINED_TOOLS[] = {
-    {"trace_path",
-     "Trace function call paths — who calls a function and what it calls. "
-     "Use for impact analysis, understanding callers, and finding dependencies. "
-     "Auto-indexes the project on first use if not already indexed. "
-     "Matches exact name first, then falls back to case-insensitive search if not found. "
-     "Results sorted by PageRank within each hop level. depth < 1 clamped to 1. "
-     "direction must be inbound, outbound, or both (invalid values return error). "
-     "Read codebase://architecture for key functions to start tracing from.",
-     "{\"type\":\"object\",\"properties\":{"
-     "\"function_name\":{\"type\":\"string\",\"description\":\"Function name to trace. "
-     "Case-insensitive fallback if exact match not found.\"},"
-     "\"qualified_name\":{\"type\":\"string\",\"description\":\"Exact qualified name from search results "
-     "(e.g. 'proj.src.module.func'). Pass instead of function_name for cross-tool chaining.\"},"
-     "\"project\":{\"type\":\"string\"},"
-     "\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\",\"both\"]},"
-     "\"depth\":{\"type\":\"integer\",\"default\":3},"
-     "\"max_results\":{\"type\":\"integer\"},"
-     "\"compact\":{\"type\":\"boolean\"},"
-     "\"edge_types\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},"
-     "\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
-     "\"description\":\"Glob patterns for file paths to exclude from trace results\"}"
-     "},\"description\":\"Pass function_name OR qualified_name (at least one required).\"}"},
-
     {"get_code",
      "Get source code for a function, class, or symbol by qualified name. "
-     "Use INSTEAD OF reading entire files. Use mode=signature for API lookup (99%% savings). "
+     "Use INSTEAD OF reading entire files. Use mode=signature for API lookup without source body. "
      "Use mode=head_tail for large functions (preserves return code). "
-     "Module nodes return metadata only — use auto_resolve=true for file source. "
+     "Module nodes return metadata only. Use auto_resolve=true for file source. "
      "Get qualified_name values from search_graph results.",
      "{\"type\":\"object\",\"properties\":{"
      "\"qualified_name\":{\"type\":\"string\",\"description\":\"Qualified name from search results\"},"
-     "\"project\":{\"type\":\"string\"},"
-     "\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"signature\",\"head_tail\"]},"
-     "\"max_lines\":{\"type\":\"integer\"},"
-     "\"auto_resolve\":{\"type\":\"boolean\"},"
-     "\"include_neighbors\":{\"type\":\"boolean\"},"
+     "\"project\":{\"type\":\"string\",\"description\":\"Indexed project name. Omit to use the "
+     "MCP server project derived from server CWD.\"},"
+     "\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"signature\",\"head_tail\"],"
+     "\"default\":\"full\",\"description\":\"full=source up to max_lines, signature=API only, "
+     "head_tail=first and last lines for large functions.\"},"
+     "\"max_lines\":{\"type\":\"integer\",\"description\":\"Max source lines (configurable via "
+     "snippet_max_lines config key). Set to 0 for unlimited.\"},"
+     "\"auto_resolve\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Auto-pick the "
+     "highest-ranked match when qualified_name is ambiguous.\"},"
+     "\"include_neighbors\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Include "
+     "caller/callee names for local context.\"},"
      "\"compact\":{\"type\":\"boolean\",\"default\":true,"
-     "\"description\":\"Omit name when it equals last segment of qualified_name (default: compact config).\"}"
+     "\"description\":\"Omit name when it equals last segment of qualified_name. Default follows compact config.\"}"
      "},\"required\":[\"qualified_name\"]}"},
 };
 static const int STREAMLINED_TOOL_COUNT = sizeof(STREAMLINED_TOOLS) / sizeof(STREAMLINED_TOOLS[0]);
@@ -715,6 +742,44 @@ static bool ends_with_segment(const char *qn, const char *name) {
            strcmp(qn + qn_len - name_len, name) == 0;
 }
 
+static char **glob_patterns_to_like(char **patterns, int count) {
+    if (!patterns || count <= 0) {
+        return NULL;
+    }
+    char **likes = calloc((size_t)count + 1, sizeof(char *));
+    if (!likes) {
+        return NULL;
+    }
+    int out = 0;
+    for (int i = 0; i < count; i++) {
+        if (!patterns[i] || !patterns[i][0]) {
+            continue;
+        }
+        char *like = cbm_glob_to_like(patterns[i]);
+        if (!like) {
+            for (int j = 0; j < out; j++) {
+                free(likes[j]);
+            }
+            free(likes);
+            return NULL;
+        }
+        likes[out++] = like;
+    }
+    return likes;
+}
+
+static bool path_matches_like_any(const char *path, char **likes) {
+    if (!path || !likes) {
+        return false;
+    }
+    for (int i = 0; likes[i]; i++) {
+        if (sqlite3_strlike(likes[i], path, 0) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 char *cbm_mcp_get_string_arg(const char *args_json, const char *key) {
     yyjson_doc *doc = yyjson_read(args_json, strlen(args_json), 0);
@@ -767,7 +832,8 @@ bool cbm_mcp_get_bool_arg_default(const char *args_json, const char *key, bool d
 
 /* Extract a JSON array of strings from args. Returns heap-allocated
  * NULL-terminated array of heap-allocated strings. Caller must free each
- * string and the array itself. Returns NULL if key absent or not array. */
+ * string and the array itself. Returns NULL if key absent or not array; sets
+ * out_count to -1 on allocation failure. */
 static char **cbm_mcp_get_string_array_arg(const char *args_json, const char *key, int *out_count) {
     if (out_count) *out_count = 0;
     yyjson_doc *doc = yyjson_read(args_json, strlen(args_json), 0);
@@ -784,12 +850,27 @@ static char **cbm_mcp_get_string_array_arg(const char *args_json, const char *ke
         return NULL;
     }
     char **result = calloc((size_t)(n + 1), sizeof(char *));
+    if (!result) {
+        if (out_count) *out_count = -1;
+        yyjson_doc_free(doc);
+        return NULL;
+    }
     int count = 0;
     yyjson_val *item;
     yyjson_arr_iter iter = yyjson_arr_iter_with(arr);
     while ((item = yyjson_arr_iter_next(&iter))) {
         if (yyjson_is_str(item)) {
-            result[count++] = heap_strdup(yyjson_get_str(item));
+            char *copy = heap_strdup(yyjson_get_str(item));
+            if (!copy) {
+                for (int i = 0; i < count; i++) {
+                    free(result[i]);
+                }
+                free(result);
+                if (out_count) *out_count = -1;
+                yyjson_doc_free(doc);
+                return NULL;
+            }
+            result[count++] = copy;
         }
     }
     result[count] = NULL;
@@ -812,7 +893,6 @@ static void free_string_array(char **arr) {
 static void notify_resources_updated(cbm_mcp_server_t *srv);
 static void send_notification(cbm_mcp_server_t *srv, const char *method);
 static char *build_key_functions_sql(const char *exclude_csv, const char **exclude_arr, int limit);
-char *cbm_glob_to_like(const char *pattern); /* store.c */
 
 struct cbm_mcp_server {
     cbm_store_t *store;             /* currently open project store (or NULL) */
@@ -895,14 +975,14 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
     yyjson_mut_val *tools = yyjson_mut_arr(doc);
 
     if (!classic) {
-        /* Streamlined mode: default surface = the 3 focused search tools (drawn
-         * from TOOLS[] to keep a single schema source) followed by trace_path
-         * and get_code (from STREAMLINED_TOOLS[]). The search_code_graph mega-tool
-         * was removed — these 3 split tools replace it. */
+        /* Streamlined mode: default surface = focused graph/text tools from
+         * TOOLS[] plus fork-only aliases from STREAMLINED_TOOLS[]. Keeping
+         * canonical tools in TOOLS[] prevents schema drift between modes. */
         for (int i = 0; i < TOOL_COUNT; i++) {
             if (strcmp(TOOLS[i].name, "search_graph") == 0 ||
                 strcmp(TOOLS[i].name, "query_graph") == 0 ||
-                strcmp(TOOLS[i].name, "search_code") == 0) {
+                strcmp(TOOLS[i].name, "search_code") == 0 ||
+                strcmp(TOOLS[i].name, "trace_path") == 0) {
                 emit_tool(doc, tools, &TOOLS[i]);
             }
         }
@@ -910,11 +990,10 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
             emit_tool(doc, tools, &STREAMLINED_TOOLS[i]);
         }
         /* Also emit individually-enabled tools, or every advanced tool after
-         * _hidden_tools has explicitly revealed them for this server session.
+         * _hidden_tools has explicitly revealed them for this server process.
          * This keeps the initial streamlined list compact while making hidden
          * tools discoverable to real MCP clients that only call listed tools.
-         * trace_path is already listed from STREAMLINED_TOOLS[], so skip the
-         * classic trace definition here.
+         * trace_path is already listed from TOOLS[] above, so skip it here.
          * (get_code is streamlined-only; get_code_snippet is the TOOLS[] name.) */
         for (int i = 0; i < TOOL_COUNT; i++) {
             if (strcmp(TOOLS[i].name, "search_graph") == 0 ||
@@ -1224,7 +1303,7 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
                 /* Fall through and keep srv->store open. */
             } else {
                 cbm_log_error("store.auto_clean", "project", project, "path", path, "action",
-                              "deleting corrupt db — re-index required");
+                              "deleting corrupt db; re-index required");
                 cbm_store_close(srv->store);
                 srv->store = NULL;
                 /* Delete the corrupt cache DB + WAL/SHM files. */
@@ -1275,7 +1354,7 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
 /* Forward decl — definition lives below alongside list_projects. */
 static bool is_project_db_file(const char *name, size_t len);
 
-/* Forward decl — definition lives below in handle_trace_call_path's helpers. */
+/* Forward decl — definition lives below in trace_path helpers. */
 static void free_node_contents(cbm_node_t *n);
 
 /* Scan cache dir for .db files, writing comma-separated quoted names into out.
@@ -1527,7 +1606,7 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
         if (srv->session_root[0]) {
             yyjson_mut_obj_add_str(doc, ctx, "status", "auto_indexing");
             yyjson_mut_obj_add_str(doc, ctx, "hint",
-                "Auto-indexing your project — retry this query in a moment. "
+                "Auto-indexing your project; retry this query in a moment. "
                 "Pass project='/path/to/repo' or project='~/path/to/repo' explicitly to trigger immediately.");
         } else {
             yyjson_mut_obj_add_str(doc, ctx, "status", "not_indexed");
@@ -2025,7 +2104,7 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
 static char *verify_project_indexed(cbm_store_t *store, const char *project) {
     cbm_project_t proj_check = {0};
     if (cbm_store_get_project(store, project, &proj_check) != CBM_STORE_OK) {
-        char *err = build_project_list_error("project not indexed — run index_repository first");
+        char *err = build_project_list_error("project not indexed; run index_repository first");
         char *res = cbm_mcp_text_result(err, true);
         free(err);
         return res;
@@ -2088,7 +2167,7 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_obj_add_str(
                 doc, root, "adr_hint",
                 "No ADR found. Use manage_adr(mode='update') to persist architectural "
-                "decisions across sessions. Run get_architecture(aspects=['all']) first.");
+                "decisions across MCP server runs. Run get_architecture(aspects=['all']) first.");
         }
         cbm_project_free_fields(&proj_info);
     }
@@ -2878,6 +2957,14 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     params.include_connected = include_connected;
     int exclude_count = 0;
     char **exclude = cbm_mcp_get_string_array_arg(args, "exclude", &exclude_count);
+    if (exclude_count < 0) {
+        free(label); free(name_pattern); free(qn_pattern); free(unified_pattern);
+        free(file_pattern); free(relationship); free(sort_by); free(search_mode);
+        free(pe.value);
+        return cbm_mcp_text_result(
+            "{\"error\":\"out of memory preparing exclude patterns\","
+            "\"hint\":\"Retry with fewer exclude patterns or a smaller request.\"}", true);
+    }
     params.exclude_paths = (const char **)exclude;
 
     cbm_search_output_t out = {0};
@@ -3020,7 +3107,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         free_string_array(exclude);
         return cbm_mcp_text_result(
             "semantic_query must be an array of keyword strings, e.g. "
-            "[\"send\",\"pubsub\",\"publish\"] — not a single string. Split your query "
+            "[\"send\",\"pubsub\",\"publish\"], not a single string. Split your query "
             "into individual keywords; each is scored independently via per-keyword "
             "min-cosine.",
             true);
@@ -3121,7 +3208,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         char *ignored_label = cbm_mcp_get_string_arg(args, "label");
         if (ignored_label) {
             yyjson_mut_obj_add_str(doc, root, "warning",
-                "cypher param present — label, name_pattern, file_pattern, sort_by, and other "
+                "cypher param present; label, name_pattern, file_pattern, sort_by, and other "
                 "filter params are ignored in Cypher mode. Use WHERE clause instead.");
             free(ignored_label);
         }
@@ -3511,38 +3598,53 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
         if (db) {
             int excl_count = 0;
             char **excl_arr = cbm_mcp_get_string_array_arg(args, "exclude", &excl_count);
-            const char *excl_csv = srv->config
-                ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "")
-                : "";
-            int kf_limit = srv->config
-                ? cbm_config_get_int(srv->config, CBM_CONFIG_KEY_FUNCTIONS_COUNT, 25)
-                : 25;
-            char *kf_sql_heap = build_key_functions_sql(excl_csv, (const char **)excl_arr, kf_limit);
-            free_string_array(excl_arr);
-            const char *kf_sql = kf_sql_heap;
-            sqlite3_stmt *kf_stmt = NULL;
-            if (sqlite3_prepare_v2(db, kf_sql, -1, &kf_stmt, NULL) == SQLITE_OK) {
-                if (project) sqlite3_bind_text(kf_stmt, 1, project, -1, SQLITE_TRANSIENT);
-                yyjson_mut_val *kf_arr = yyjson_mut_arr(doc);
-                while (sqlite3_step(kf_stmt) == SQLITE_ROW) {
-                    yyjson_mut_val *kf = yyjson_mut_obj(doc);
-                    const char *n = (const char *)sqlite3_column_text(kf_stmt, 0);
-                    const char *qn = (const char *)sqlite3_column_text(kf_stmt, 1);
-                    const char *lbl = (const char *)sqlite3_column_text(kf_stmt, 2);
-                    const char *fp = (const char *)sqlite3_column_text(kf_stmt, 3);
-                    double rank = sqlite3_column_double(kf_stmt, 4);
-                    if (n && !ends_with_segment(qn, n))
-                        yyjson_mut_obj_add_strcpy(doc, kf, "name", n);
-                    if (qn)  yyjson_mut_obj_add_strcpy(doc, kf, "qualified_name", qn);
-                    if (lbl && lbl[0]) yyjson_mut_obj_add_strcpy(doc, kf, "label", lbl);
-                    if (fp  && fp[0])  yyjson_mut_obj_add_strcpy(doc, kf, "file_path", fp);
-                    add_pagerank_val(doc, kf, rank);
-                    yyjson_mut_arr_add_val(kf_arr, kf);
+            if (excl_count < 0) {
+                yyjson_mut_val *warnings = yyjson_mut_arr(doc);
+                yyjson_mut_arr_add_str(doc, warnings,
+                    "key_functions omitted: out of memory preparing exclude patterns");
+                yyjson_mut_obj_add_val(doc, root, "warnings", warnings);
+            } else {
+                const char *excl_csv = srv->config
+                    ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "")
+                    : "";
+                int kf_limit = srv->config
+                    ? cbm_config_get_int(srv->config, CBM_CONFIG_KEY_FUNCTIONS_COUNT, 25)
+                    : 25;
+                char *kf_sql_heap =
+                    build_key_functions_sql(excl_csv, (const char **)excl_arr, kf_limit);
+                if (!kf_sql_heap) {
+                    yyjson_mut_val *warnings = yyjson_mut_arr(doc);
+                    yyjson_mut_arr_add_str(doc, warnings,
+                        "key_functions omitted: out of memory building SQL");
+                    yyjson_mut_obj_add_val(doc, root, "warnings", warnings);
+                } else {
+                    const char *kf_sql = kf_sql_heap;
+                    sqlite3_stmt *kf_stmt = NULL;
+                    if (sqlite3_prepare_v2(db, kf_sql, -1, &kf_stmt, NULL) == SQLITE_OK) {
+                        if (project) sqlite3_bind_text(kf_stmt, 1, project, -1, SQLITE_TRANSIENT);
+                        yyjson_mut_val *kf_arr = yyjson_mut_arr(doc);
+                        while (sqlite3_step(kf_stmt) == SQLITE_ROW) {
+                            yyjson_mut_val *kf = yyjson_mut_obj(doc);
+                            const char *n = (const char *)sqlite3_column_text(kf_stmt, 0);
+                            const char *qn = (const char *)sqlite3_column_text(kf_stmt, 1);
+                            const char *lbl = (const char *)sqlite3_column_text(kf_stmt, 2);
+                            const char *fp = (const char *)sqlite3_column_text(kf_stmt, 3);
+                            double rank = sqlite3_column_double(kf_stmt, 4);
+                            if (n && !ends_with_segment(qn, n))
+                                yyjson_mut_obj_add_strcpy(doc, kf, "name", n);
+                            if (qn)  yyjson_mut_obj_add_strcpy(doc, kf, "qualified_name", qn);
+                            if (lbl && lbl[0]) yyjson_mut_obj_add_strcpy(doc, kf, "label", lbl);
+                            if (fp  && fp[0])  yyjson_mut_obj_add_strcpy(doc, kf, "file_path", fp);
+                            add_pagerank_val(doc, kf, rank);
+                            yyjson_mut_arr_add_val(kf_arr, kf);
+                        }
+                        sqlite3_finalize(kf_stmt);
+                        yyjson_mut_obj_add_val(doc, root, "key_functions", kf_arr);
+                    }
+                    free(kf_sql_heap);
                 }
-                sqlite3_finalize(kf_stmt);
-                yyjson_mut_obj_add_val(doc, root, "key_functions", kf_arr);
             }
-            free(kf_sql_heap);
+            free_string_array(excl_arr);
         }
     }
 
@@ -3731,7 +3833,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
-/* Forward declaration: defined after handle_trace_call_path */
+/* Forward declaration: defined after trace_path */
 static void free_node_contents(cbm_node_t *n);
 static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count);
 
@@ -3822,15 +3924,13 @@ static int pick_resolved_node(const cbm_node_t *nodes, int count, bool *ambiguou
     }
     return best;
 }
-static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
+static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
     char *func_name = cbm_mcp_get_string_arg(args, "function_name");
     char *qn_input = cbm_mcp_get_string_arg(args, "qualified_name"); /* cross-tool chaining */
     char *raw_project = cbm_mcp_get_string_arg(args, "project");
-    project_expand_t pe = {0};
-    cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
-    char *project = pe.value; /* take ownership for free() below */
     char *direction = cbm_mcp_get_string_arg(args, "direction");
     char *trace_mode = cbm_mcp_get_string_arg(args, "mode"); /* calls|data_flow|cross_service */
+    char *param_name = cbm_mcp_get_string_arg(args, "parameter_name");
     int depth = cbm_mcp_get_int_arg(args, "depth", 3);
     /* F10: clamp depth to minimum 1 — O(1) */
     if (depth < 1) depth = 1;
@@ -3839,29 +3939,40 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     int max_results = cbm_mcp_get_int_arg(args, "max_results", cfg_trace_max);
     bool cfg_compact_t = cbm_config_get_bool(srv->config, "compact", true);
     bool compact = cbm_mcp_get_bool_arg_default(args, "compact", cfg_compact_t);
+    bool include_tests = cbm_mcp_get_bool_arg(args, "include_tests");
+    bool risk_labels = cbm_mcp_get_bool_arg(args, "risk_labels");
+    int exclude_count = 0;
+    char **exclude_patterns = cbm_mcp_get_string_array_arg(args, "exclude", &exclude_count);
+    char **exclude_likes = glob_patterns_to_like(exclude_patterns, exclude_count);
 
-
-
-    if (!func_name && !qn_input) {
-        free(project);
+    /* Validate cheap request parameters before resolving the project. Project resolution can
+     * auto-index on first use, so malformed requests should fail without side effects. */
+    if (exclude_count < 0 || (exclude_count > 0 && !exclude_likes)) {
+        free(func_name);
+        free(qn_input);
+        free(raw_project);
         free(direction);
         free(trace_mode);
+        free(param_name);
+        free_string_array(exclude_patterns);
+        return cbm_mcp_text_result(
+            "{\"error\":\"out of memory preparing exclude patterns\","
+            "\"hint\":\"Retry with fewer exclude patterns or a smaller request.\"}", true);
+    }
+
+    if (!func_name && !qn_input) {
+        free(raw_project);
+        free(direction);
+        free(trace_mode);
+        free(param_name);
+        free_string_array(exclude_patterns);
+        free_string_array(exclude_likes);
         free(qn_input);
         return cbm_mcp_text_result(
             "{\"error\":\"function_name or qualified_name is required\","
             "\"hint\":\"Pass the name of a function to trace, e.g. {\\\"function_name\\\":\\\"main\\\"}\"}", true);
     }
-    if (!store) {
-        char *_err = build_project_list_error("project not found or not indexed");
-        char *_res = cbm_mcp_text_result(_err, true);
-        free(_err);
-        free(func_name);
-        free(qn_input);
-        free(project);
-        free(direction);
-        free(trace_mode);
-        return _res;
-    }
+
     /* Validate direction enum */
     if (direction && strcmp(direction, "inbound") != 0 &&
         strcmp(direction, "outbound") != 0 && strcmp(direction, "both") != 0) {
@@ -3871,15 +3982,50 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             "\"hint\":\"Valid values: inbound, outbound, both\"}", direction);
         free(func_name);
         free(qn_input);
-        free(project);
+        free(raw_project);
         free(direction);
         free(trace_mode);
+        free(param_name);
+        free_string_array(exclude_patterns);
+        free_string_array(exclude_likes);
+        return cbm_mcp_text_result(errbuf, true);
+    }
+    if (trace_mode && strcmp(trace_mode, "calls") != 0 &&
+        strcmp(trace_mode, "data_flow") != 0 &&
+        strcmp(trace_mode, "cross_service") != 0) {
+        char errbuf[256];
+        snprintf(errbuf, sizeof(errbuf),
+            "{\"error\":\"invalid mode '%s'\","
+            "\"hint\":\"Valid values: calls, data_flow, cross_service\"}", trace_mode);
+        free(func_name);
+        free(qn_input);
+        free(raw_project);
+        free(direction);
+        free(trace_mode);
+        free(param_name);
+        free_string_array(exclude_patterns);
+        free_string_array(exclude_likes);
         return cbm_mcp_text_result(errbuf, true);
     }
 
-    if (!direction) {
-        direction = heap_strdup("both");
+    project_expand_t pe = {0};
+    cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
+    char *project = pe.value; /* take ownership for free() below; raw_project consumed */
+    if (!store) {
+        char *_err = build_project_list_error("project not found or not indexed");
+        char *_res = cbm_mcp_text_result(_err, true);
+        free(_err);
+        free(func_name);
+        free(qn_input);
+        free(project);
+        free(direction);
+        free(trace_mode);
+        free(param_name);
+        free_string_array(exclude_patterns);
+        free_string_array(exclude_likes);
+        return _res;
     }
+    const char *effective_direction = direction ? direction : "both";
 
     /* QN-first lookup: if qualified_name provided, resolve to node directly */
     cbm_node_t *qn_node = NULL;
@@ -3952,6 +4098,9 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         free(project);
         free(direction);
         free(trace_mode);
+        free(param_name);
+        free_string_array(exclude_patterns);
+        free_string_array(exclude_likes);
         cbm_store_free_nodes(nodes, node_count);
         return cbm_mcp_text_result(errbuf, true);
     }
@@ -3969,6 +4118,9 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         free(project);
         free(direction);
         free(trace_mode);
+        free(param_name);
+        free_string_array(exclude_patterns);
+        free_string_array(exclude_likes);
         cbm_store_free_nodes(nodes, node_count);
         return result;
     }
@@ -3980,7 +4132,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     /* func_name may be NULL when only qualified_name was passed — use qn_input as fallback */
     yyjson_mut_obj_add_str(doc, root, "function",
         func_name ? func_name : (qn_input ? qn_input : ""));
-    yyjson_mut_obj_add_str(doc, root, "direction", direction);
+    yyjson_mut_obj_add_str(doc, root, "direction", effective_direction);
 
     /* Report candidates when multiple nodes matched but resolution picked one */
     if (node_count > 1) {
@@ -3999,11 +4151,26 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* Extract edge_types here — after all early returns — to avoid memory leaks.
-     * free_string_array(NULL) is NULL-safe (mcp.c:663).
+     * free_string_array(NULL) is NULL-safe.
      * Resolution order: explicit edge_types array > mode-based defaults > CALLS. */
     int edge_type_count_user = 0;
     char **edge_types_user = cbm_mcp_get_string_array_arg(args, "edge_types",
                                                            &edge_type_count_user);
+    if (edge_type_count_user < 0) {
+        yyjson_mut_doc_free(doc);
+        cbm_store_free_nodes(nodes, node_count);
+        free(func_name);
+        free(qn_input);
+        free(project);
+        free(direction);
+        free(trace_mode);
+        free(param_name);
+        free_string_array(exclude_patterns);
+        free_string_array(exclude_likes);
+        return cbm_mcp_text_result(
+            "{\"error\":\"out of memory preparing edge_types\","
+            "\"hint\":\"Retry with fewer edge_types or a smaller request.\"}", true);
+    }
     const char **edge_types;
     int edge_type_count;
     /* Mode-based default edge sets (stack-local; no ownership transfer). */
@@ -4030,8 +4197,10 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     /* Run BFS for each requested direction.
      * IMPORTANT: yyjson_mut_obj_add_str borrows pointers — we must keep
      * traversal results alive until after yy_doc_to_str serialization. */
-    bool do_outbound = strcmp(direction, "outbound") == 0 || strcmp(direction, "both") == 0;
-    bool do_inbound = strcmp(direction, "inbound") == 0 || strcmp(direction, "both") == 0;
+    bool do_outbound = strcmp(effective_direction, "outbound") == 0 ||
+                       strcmp(effective_direction, "both") == 0;
+    bool do_inbound = strcmp(effective_direction, "inbound") == 0 ||
+                      strcmp(effective_direction, "both") == 0;
 
     cbm_traverse_result_t tr_out = {0};
     cbm_traverse_result_t tr_in = {0};
@@ -4045,6 +4214,13 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         int64_t *seen_out = calloc((size_t)tr_out.visited_count + 1, sizeof(int64_t));
         int seen_out_n = 0;
         for (int i = 0; i < tr_out.visited_count; i++) {
+            bool is_test = cbm_is_test_file_path(tr_out.visited[i].node.file_path);
+            if (!include_tests && is_test) {
+                continue;
+            }
+            if (path_matches_like_any(tr_out.visited[i].node.file_path, exclude_likes)) {
+                continue;
+            }
             if (seen_out) { /* OOM-safe: skip dedup if calloc failed */
                 bool dup = false;
                 for (int j = 0; j < seen_out_n; j++) {
@@ -4063,6 +4239,13 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                 doc, item, "qualified_name",
                 tr_out.visited[i].node.qualified_name ? tr_out.visited[i].node.qualified_name : "");
             yyjson_mut_obj_add_int(doc, item, "hop", tr_out.visited[i].hop);
+            if (risk_labels) {
+                yyjson_mut_obj_add_str(doc, item, "risk",
+                                       cbm_risk_label(cbm_hop_to_risk(tr_out.visited[i].hop)));
+            }
+            if (is_test) {
+                yyjson_mut_obj_add_bool(doc, item, "is_test", true);
+            }
             {
                 double pr = cbm_pagerank_get(store, tr_out.visited[i].node.id);
                 if (pr > 0.0)
@@ -4092,6 +4275,13 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         int64_t *seen_in = calloc((size_t)tr_in.visited_count + 1, sizeof(int64_t));
         int seen_in_n = 0;
         for (int i = 0; i < tr_in.visited_count; i++) {
+            bool is_test = cbm_is_test_file_path(tr_in.visited[i].node.file_path);
+            if (!include_tests && is_test) {
+                continue;
+            }
+            if (path_matches_like_any(tr_in.visited[i].node.file_path, exclude_likes)) {
+                continue;
+            }
             if (seen_in) { /* OOM-safe: skip dedup if calloc failed */
                 bool dup = false;
                 for (int j = 0; j < seen_in_n; j++) {
@@ -4110,6 +4300,13 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                 doc, item, "qualified_name",
                 tr_in.visited[i].node.qualified_name ? tr_in.visited[i].node.qualified_name : "");
             yyjson_mut_obj_add_int(doc, item, "hop", tr_in.visited[i].hop);
+            if (risk_labels) {
+                yyjson_mut_obj_add_str(doc, item, "risk",
+                                       cbm_risk_label(cbm_hop_to_risk(tr_in.visited[i].hop)));
+            }
+            if (is_test) {
+                yyjson_mut_obj_add_bool(doc, item, "is_test", true);
+            }
             {
                 double pr = cbm_pagerank_get(store, tr_in.visited[i].node.id);
                 if (pr > 0.0)
@@ -4151,7 +4348,10 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     free(project);
     free(direction);
     free(trace_mode);
-    free_string_array(edge_types_user); /* NULL-safe; reuses existing helper (mcp.c:663) */
+    free(param_name);
+    free_string_array(exclude_patterns);
+    free_string_array(exclude_likes);
+    free_string_array(edge_types_user);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
@@ -4469,7 +4669,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
                     doc, root, "adr_hint",
                     "Project indexed. Consider creating an Architecture Decision Record: "
                     "explore the codebase with get_architecture(aspects=['all']), then use "
-                    "manage_adr(mode='store') to persist architectural insights across sessions.");
+                    "manage_adr(mode='store') to persist architectural insights across MCP server runs.");
             }
         }
     }
@@ -6599,7 +6799,7 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
         return handle_delete_project(srv, args_json);
     }
     if (strcmp(tool_name, "trace_path") == 0) {
-        return handle_trace_call_path(srv, args_json);
+        return handle_trace_path(srv, args_json);
     }
     if (strcmp(tool_name, "get_architecture") == 0) {
         return handle_get_architecture(srv, args_json);
@@ -6643,7 +6843,7 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
             "\"delete_project\",\"index_status\",\"detect_changes\","
             "\"manage_adr\",\"ingest_traces\",\"index_dependencies\"],"
             "\"revealed\":true,"
-            "\"next_step\":\"call tools/list again; these tools are now advertised for this session\","
+            "\"next_step\":\"call tools/list again; these tools are now advertised for this MCP server process\","
             "\"enable_all\":\"set env CBM_TOOL_MODE=classic or config set tool_mode classic\","
             "\"enable_one\":\"config set tool_<name> true (e.g. tool_index_repository true)\","
             "\"resources\":[\"codebase://schema\",\"codebase://architecture\",\"codebase://status\"]}", false);
