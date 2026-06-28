@@ -2,8 +2,8 @@
  * test_tool_consolidation.c — Tests for the streamlined/default tool surface.
  *
  * §4b: the search_code_graph mega-tool was deleted; the default surface is now
- * 5 focused tools: search_graph, query_graph, search_code (from TOOLS[]) plus
- * trace_path and get_code (from STREAMLINED_TOOLS[]). Covers tool
+ * 5 focused tools: search_graph, query_graph, search_code, trace_path (from
+ * TOOLS[]) plus get_code (from STREAMLINED_TOOLS[]). Covers tool
  * visibility, split-tool dispatch, get_code alias dispatch, project param path
  * support, and tool config visibility.
  */
@@ -346,11 +346,15 @@ TEST(streamlined_core_parameter_contract) {
 
     const char *trace_params[] = {
         "function_name", "qualified_name", "project", "direction", "depth",
-        "max_results", "compact", "edge_types", "exclude",
+        "max_results", "compact", "mode", "edge_types", "exclude",
+        "include_tests", "risk_labels", "parameter_name",
     };
     for (size_t i = 0; i < sizeof(trace_params) / sizeof(trace_params[0]); i++) {
         ASSERT(tool_schema_has_property(json, "trace_path", trace_params[i]));
     }
+    ASSERT(!tool_schema_has_property(json, "trace_path", "scope"));
+    ASSERT(!tool_schema_required_has(json, "trace_path", "function_name"));
+    ASSERT(!tool_schema_required_has(json, "trace_path", "project"));
 
     const char *code_params[] = {
         "qualified_name", "project", "mode", "max_lines", "auto_resolve",
@@ -370,6 +374,35 @@ TEST(streamlined_core_parameter_contract) {
     }
 
     free(json);
+    PASS();
+}
+
+TEST(revealed_trace_path_parameter_contract) {
+    char *saved_mode = save_tool_mode();
+    unsetenv("CBM_TOOL_MODE");
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *hint = cbm_mcp_handle_tool(srv, "_hidden_tools", "{}");
+    ASSERT_NOT_NULL(hint);
+    free(hint);
+
+    char *json = cbm_mcp_tools_list(srv);
+    restore_tool_mode(saved_mode);
+    ASSERT_NOT_NULL(json);
+
+    const char *trace_params[] = {
+        "function_name", "qualified_name", "project", "direction", "depth",
+        "max_results", "compact", "mode", "edge_types", "exclude",
+        "include_tests", "risk_labels", "parameter_name",
+    };
+    for (size_t i = 0; i < sizeof(trace_params) / sizeof(trace_params[0]); i++) {
+        ASSERT(tool_schema_has_property(json, "trace_path", trace_params[i]));
+    }
+    ASSERT(!tool_schema_has_property(json, "trace_path", "scope"));
+
+    free(json);
+    cbm_mcp_server_free(srv);
     PASS();
 }
 
@@ -2472,6 +2505,7 @@ SUITE(tool_consolidation) {
     RUN_TEST(hidden_tools_reveal_discoverable_tools);
     RUN_TEST(streamlined_reveal_covers_classic_capabilities);
     RUN_TEST(streamlined_core_parameter_contract);
+    RUN_TEST(revealed_trace_path_parameter_contract);
     /* Dispatch */
     RUN_TEST(search_graph_dispatch);
     RUN_TEST(query_graph_dispatch);
