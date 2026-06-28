@@ -3007,6 +3007,35 @@ const char *cbm_config_get_effective(cbm_config_t *cfg, const char *key, const c
     return cbm_config_get(cfg, key, default_val);
 }
 
+bool cbm_config_get_effective_bool(cbm_config_t *cfg, const char *key, bool default_val) {
+    const char *val = cbm_config_get_effective(cfg, key, default_val ? "true" : "false");
+    if (!val) {
+        return default_val;
+    }
+    if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcmp(val, "on") == 0) {
+        return true;
+    }
+    if (strcmp(val, "false") == 0 || strcmp(val, "0") == 0 || strcmp(val, "off") == 0) {
+        return false;
+    }
+    return default_val;
+}
+
+int cbm_config_get_effective_int(cbm_config_t *cfg, const char *key, int default_val) {
+    char default_buf[CBM_SZ_32];
+    snprintf(default_buf, sizeof(default_buf), "%d", default_val);
+    const char *val = cbm_config_get_effective(cfg, key, default_buf);
+    if (!val || !val[0]) {
+        return default_val;
+    }
+    char *endptr;
+    long parsed = strtol(val, &endptr, CLI_STRTOL_BASE);
+    if (endptr == val || *endptr != '\0') {
+        return default_val;
+    }
+    return (int)parsed;
+}
+
 /* ── Config CLI subcommand ────────────────────────────────────── */
 
 int cbm_cmd_config(int argc, char **argv) {

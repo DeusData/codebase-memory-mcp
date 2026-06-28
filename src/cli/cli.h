@@ -288,6 +288,8 @@ extern const cbm_config_entry_t CBM_CONFIG_REGISTRY[];
 /* Get config value with env var override: env > db > default.
  * Returns pointer valid until next call (static buffer). */
 const char *cbm_config_get_effective(cbm_config_t *cfg, const char *key, const char *default_val);
+bool cbm_config_get_effective_bool(cbm_config_t *cfg, const char *key, bool default_val);
+int cbm_config_get_effective_int(cbm_config_t *cfg, const char *key, int default_val);
 
 /* ── Subcommands (wired from main.c) ─────────────────────────── */
 

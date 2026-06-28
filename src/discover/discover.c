@@ -493,6 +493,9 @@ typedef struct {
     cbm_file_info_t *files;
     int count;
     int capacity;
+    int max_count;
+    bool count_only;
+    bool limit_exceeded;
     /* Directories skipped during the walk (rel paths), so callers can surface
      * which subtrees were dropped (#411). strdup'd; freed by the caller via
      * cbm_discover_free_excluded or internally when not requested. */
@@ -503,6 +506,9 @@ typedef struct {
 
 static void file_list_add_excluded(file_list_t *fl, const char *rel_path) {
     if (!rel_path || rel_path[0] == '\0') {
+        return;
+    }
+    if (fl->count_only) {
         return;
     }
     if (fl->excluded_count >= fl->excluded_cap) {
@@ -523,6 +529,13 @@ static void file_list_add_excluded(file_list_t *fl, const char *rel_path) {
 
 static void fl_add(file_list_t *fl, const char *abs_path, const char *rel_path, CBMLanguage lang,
                    int64_t size) {
+    if (fl->count_only) {
+        fl->count++;
+        if (fl->max_count > 0 && fl->count > fl->max_count) {
+            fl->limit_exceeded = true;
+        }
+        return;
+    }
     if (fl->count >= fl->capacity) {
         int new_cap = fl->capacity ? fl->capacity * PAIR_LEN : CBM_SZ_256;
         cbm_file_info_t *new_files = realloc(fl->files, new_cap * sizeof(cbm_file_info_t));
@@ -787,7 +800,7 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
     snprintf(stack[top].prefix, CBM_SZ_4K, "%s", rel_prefix);
     top++;
 
-    while (top > 0) {
+    while (top > 0 && !out->limit_exceeded) {
         walk_frame_t frame = stack[--top];
 
         cbm_gitignore_t *loaded = try_load_nested_gitignore(&frame);
@@ -805,7 +818,7 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
         }
 
         cbm_dirent_t *entry;
-        while ((entry = cbm_readdir(d)) != NULL) {
+        while (!out->limit_exceeded && (entry = cbm_readdir(d)) != NULL) {
             walk_dir_process_entry(entry, &frame, opts, gitignore, global_gi, cbmignore, stack,
                                    &top, out);
         }
@@ -824,21 +837,11 @@ int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_fil
     return cbm_discover_ex(repo_path, opts, out, count, NULL, NULL);
 }
 
-int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
-                    int *count, char ***excluded_out, int *excluded_count_out) {
-    if (excluded_out) {
-        *excluded_out = NULL;
-    }
-    if (excluded_count_out) {
-        *excluded_count_out = 0;
-    }
-    if (!repo_path || !out || !count) {
+static int discover_walk_filtered(const char *repo_path, const cbm_discover_opts_t *opts,
+                                  file_list_t *fl) {
+    if (!repo_path || !fl) {
         return CBM_NOT_FOUND;
     }
-
-    *out = NULL;
-    *count = 0;
-
     /* Verify directory exists */
     struct stat st;
     if (wide_stat(repo_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
@@ -895,13 +898,34 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
     }
 
     /* Walk */
-    file_list_t fl = {0};
-    walk_dir(repo_path, "", opts, gitignore, global_gi, cbmignore, &fl);
+    walk_dir(repo_path, "", opts, gitignore, global_gi, cbmignore, fl);
 
     /* Cleanup */
     cbm_gitignore_free(gitignore);
     cbm_gitignore_free(global_gi);
     cbm_gitignore_free(cbmignore);
+    return 0;
+}
+
+int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
+                    int *count, char ***excluded_out, int *excluded_count_out) {
+    if (excluded_out) {
+        *excluded_out = NULL;
+    }
+    if (excluded_count_out) {
+        *excluded_count_out = 0;
+    }
+    if (!repo_path || !out || !count) {
+        return CBM_NOT_FOUND;
+    }
+
+    *out = NULL;
+    *count = 0;
+
+    file_list_t fl = {0};
+    if (discover_walk_filtered(repo_path, opts, &fl) != 0) {
+        return CBM_NOT_FOUND;
+    }
 
     *out = fl.files;
     *count = fl.count;
@@ -915,6 +939,20 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
     } else {
         cbm_discover_free_excluded(fl.excluded, fl.excluded_count);
     }
+    return 0;
+}
+
+int cbm_discover_count_bounded(const char *repo_path, const cbm_discover_opts_t *opts,
+                               int max_count, int *count) {
+    if (!repo_path || !count) {
+        return CBM_NOT_FOUND;
+    }
+    *count = 0;
+    file_list_t fl = {.count_only = true, .max_count = max_count};
+    if (discover_walk_filtered(repo_path, opts, &fl) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    *count = fl.count;
     return 0;
 }
 

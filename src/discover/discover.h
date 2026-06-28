@@ -131,6 +131,13 @@ int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_fil
 int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
                     int *count, char ***excluded_out, int *excluded_count_out);
 
+/* Count indexable files using the same filters as cbm_discover(), without
+ * allocating per-file path records. If max_count > 0, the walk stops after
+ * count exceeds max_count so callers can enforce limits cheaply; *count may
+ * then be max_count + 1. */
+int cbm_discover_count_bounded(const char *repo_path, const cbm_discover_opts_t *opts,
+                               int max_count, int *count);
+
 /* Free an array of file info results. NULL-safe. */
 void cbm_discover_free(cbm_file_info_t *files, int count);
 

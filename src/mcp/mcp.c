@@ -43,6 +43,7 @@ enum {
 #include "store/store.h"
 #include <sqlite3.h>
 #include "cypher/cypher.h"
+#include "discover/discover.h"
 #include "pipeline/pipeline.h"
 #include "depindex/depindex.h"
 #include "pagerank/pagerank.h"
@@ -979,25 +980,14 @@ static int cbm_mcp_update_check_timeout_s(cbm_mcp_server_t *srv) {
 }
 
 static bool cbm_mcp_auto_index_enabled(cbm_mcp_server_t *srv) {
-    bool auto_index = (srv && srv->config);
-    // NOLINTNEXTLINE(concurrency-mt-unsafe)
-    const char *auto_env = getenv("CBM_AUTO_INDEX");
-    if (auto_env && auto_env[0]) {
-        return strcmp(auto_env, "true") == 0 || strcmp(auto_env, "1") == 0 ||
-               strcmp(auto_env, "on") == 0;
-    }
-    if (srv && srv->config) {
-        return cbm_config_get_bool(srv->config, CBM_CONFIG_AUTO_INDEX, true);
-    }
-    return auto_index;
+    bool default_val = (srv && srv->config);
+    return cbm_config_get_effective_bool(srv ? srv->config : NULL, CBM_CONFIG_AUTO_INDEX,
+                                         default_val);
 }
 
 static int cbm_mcp_auto_index_limit(cbm_mcp_server_t *srv) {
-    if (srv && srv->config) {
-        return cbm_config_get_int(srv->config, CBM_CONFIG_AUTO_INDEX_LIMIT,
-                                  CBM_DEFAULT_AUTO_INDEX_LIMIT);
-    }
-    return CBM_DEFAULT_AUTO_INDEX_LIMIT;
+    return cbm_config_get_effective_int(srv ? srv->config : NULL, CBM_CONFIG_AUTO_INDEX_LIMIT,
+                                        CBM_DEFAULT_AUTO_INDEX_LIMIT);
 }
 
 /* ── Tool list (needs full struct definition above) ──────────── */
@@ -7082,6 +7072,16 @@ static bool db_is_stale(const char *db_path, const char *repo_path, int max_age_
 #define CBM_CONFIG_REINDEX_ON_STARTUP "reindex_on_startup"
 #define CBM_CONFIG_REINDEX_STALE_SECONDS "reindex_stale_seconds"
 
+static bool cbm_mcp_reindex_on_startup(cbm_mcp_server_t *srv) {
+    return cbm_config_get_effective_bool(srv ? srv->config : NULL,
+                                         CBM_CONFIG_REINDEX_ON_STARTUP, false);
+}
+
+static int cbm_mcp_reindex_stale_seconds(cbm_mcp_server_t *srv) {
+    return cbm_config_get_effective_int(srv ? srv->config : NULL,
+                                        CBM_CONFIG_REINDEX_STALE_SECONDS, 0);
+}
+
 /* Start auto-indexing if configured and project not yet indexed. */
 static void maybe_auto_index(cbm_mcp_server_t *srv) {
     if (srv->session_root[0] == '\0') {
@@ -7095,12 +7095,8 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     if (db_check[0]) {
         if (db_has_content(db_check)) {
             /* DB exists and has nodes — check if stale */
-            bool reindex_on_startup = srv->config
-                ? cbm_config_get_bool(srv->config, CBM_CONFIG_REINDEX_ON_STARTUP, false)
-                : false;
-            int stale_seconds = srv->config
-                ? cbm_config_get_int(srv->config, CBM_CONFIG_REINDEX_STALE_SECONDS, 0)
-                : 0;
+            bool reindex_on_startup = cbm_mcp_reindex_on_startup(srv);
+            int stale_seconds = cbm_mcp_reindex_stale_seconds(srv);
             bool stale = db_is_stale(db_check, srv->session_root, stale_seconds);
 
             if (stale && reindex_on_startup) {
@@ -7150,43 +7146,18 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     /* Quick file count check to avoid OOM on massive repos. A configured limit
      * of 0 means "no limit", matching the public config registry. */
     if (file_limit > 0) {
-        if (!validate_search_path_arg(srv->session_root)) {
-            cbm_log_warn("autoindex.skip", "reason", "path contains shell metacharacters");
+        cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL, .ignore_file = NULL, .max_file_size = 0};
+        int count = 0;
+        if (cbm_discover_count_bounded(srv->session_root, &opts, file_limit, &count) != 0) {
+            cbm_log_warn("autoindex.skip", "reason", "file_count_failed");
             return;
         }
-        char cmd[CBM_SZ_1K];
-#ifdef _WIN32
-        const char *null_dev = "NUL";
-#else
-        const char *null_dev = "/dev/null";
-#endif
-        int cmd_len = snprintf(cmd, sizeof(cmd), "git -C \"%s\" ls-files 2>%s",
-                               srv->session_root, null_dev);
-        if (cmd_len < 0 || (size_t)cmd_len >= sizeof(cmd)) {
-            cbm_log_warn("autoindex.skip", "reason", "file_count_command_too_long");
+        if (count > file_limit) {
+            char count_buf[CBM_SZ_32];
+            snprintf(count_buf, sizeof(count_buf), "%d", count);
+            cbm_log_warn("autoindex.skip", "reason", "too_many_files", "files", count_buf, "limit",
+                         CBM_CONFIG_AUTO_INDEX_LIMIT);
             return;
-        }
-        FILE *fp = cbm_popen(cmd, "r");
-        if (fp) {
-            char *line = NULL;
-            size_t line_cap = 0;
-            int count = 0;
-            while (cbm_getline(&line, &line_cap, fp) > 0) {
-                count++;
-                if (count > file_limit) {
-                    break;
-                }
-            }
-            free(line);
-            if (count > file_limit) {
-                char count_buf[CBM_SZ_32];
-                snprintf(count_buf, sizeof(count_buf), "%d", count);
-                cbm_log_warn("autoindex.skip", "reason", "too_many_files", "files", count_buf, "limit",
-                             CBM_CONFIG_AUTO_INDEX_LIMIT);
-                cbm_pclose(fp);
-                return;
-            }
-            cbm_pclose(fp);
         }
     }
 
