@@ -9,6 +9,9 @@
 
 #include "foundation/constants.h"
 
+#define SLEN(s) (sizeof(s) - 1)
+#define MCP_CONTENT_HEADER "Content-Length:"
+
 enum {
     MCP_FIELD_SIZE = 1040,
     MCP_TIMEOUT_MS = 1000,
@@ -30,13 +33,12 @@ enum {
     MCP_BFS_LIMIT = 100,
     MCP_N_DEFAULTS_2 = 2,
     MCP_URI_PREFIX = 7,      /* strlen("file://") */
-    MCP_CONTENT_PREFIX = 15, /* strlen("Content-Length:") */
+    MCP_CONTENT_PREFIX = SLEN(MCP_CONTENT_HEADER),
     MCP_RETURN_2 = 2,
 };
 #define MCP_MS_TO_US 1000LL
 #define MCP_S_TO_US 1000000LL
 
-#define SLEN(s) (sizeof(s) - 1)
 #include "mcp/mcp.h"
 #include "store/store.h"
 #include <sqlite3.h>
@@ -924,7 +926,8 @@ struct cbm_mcp_server {
     bool context_injected; /* true after first _context header sent (Phase 9) */
     bool client_has_resources; /* true if client advertised resources capability */
     bool hidden_tools_revealed; /* true after _hidden_tools requests real tools/list exposure */
-    FILE *out_stream;          /* stdout for sending notifications (set in server_run) */
+    FILE *out_stream;          /* protocol output stream for notifications (set in server_run) */
+    bool out_content_length_framed; /* true while handling Content-Length-framed requests */
 
     /* Active pipeline tracking for cancellation support */
     cbm_pipeline_t *active_pipeline; /* non-NULL while index_repository runs */
@@ -7248,8 +7251,19 @@ static char *inject_update_notice(cbm_mcp_server_t *srv, char *result_json) {
 
 /* ── MCP Resources (Phase 10) ─────────────────────────────────── */
 
-/* Send a JSON-RPC notification (no id) to the client's output stream.
- * Used for notifications/resources/updated after index operations. */
+static void write_protocol_json(FILE *out, const char *json, bool content_length_framed) {
+    if (!out || !json) return;
+    if (content_length_framed) {
+        (void)fprintf(out, MCP_CONTENT_HEADER " %zu\r\n\r\n%s", strlen(json), json);
+    } else {
+        (void)fprintf(out, "%s\n", json);
+    }
+    (void)fflush(out);
+}
+
+/* Send a JSON-RPC notification (no id) to the client's protocol stream.
+ * Must match the active transport framing: raw JSON lines for line mode, or
+ * Content-Length frames after the client uses Content-Length framing. */
 static void send_notification(cbm_mcp_server_t *srv, const char *method) {
     if (!srv || !srv->out_stream) return;
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -7260,8 +7274,7 @@ static void send_notification(cbm_mcp_server_t *srv, const char *method) {
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     if (json) {
-        (void)fprintf(srv->out_stream, "%s\n", json);
-        (void)fflush(srv->out_stream);
+        write_protocol_json(srv->out_stream, json, srv->out_content_length_framed);
         free(json);
     }
 }
@@ -7810,13 +7823,12 @@ static void handle_content_length_frame(cbm_mcp_server_t *srv, FILE *in, FILE *o
     size_t nread = fread(body, SKIP_ONE, (size_t)content_len, in);
     body[nread] = '\0';
 
+    srv->out_content_length_framed = true;
     char *resp = cbm_mcp_server_handle(srv, body);
     free(body);
 
     if (resp) {
-        size_t rlen = strlen(resp);
-        (void)fprintf(out, "Content-Length: %zu\r\n\r\n%s", rlen, resp);
-        (void)fflush(out);
+        write_protocol_json(out, resp, true);
         free(resp);
     }
 }
@@ -7882,6 +7894,7 @@ static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
 
 int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
     srv->out_stream = out; /* store for sending notifications */
+    srv->out_content_length_framed = false;
     char *line = NULL;
     size_t cap = 0;
     int fd = cbm_fileno(in);
@@ -7941,7 +7954,7 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
         }
 
         /* Content-Length framing (LSP-style transport) */
-        if (strncmp(line, "Content-Length:", SLEN("Content-Length:")) == 0) {
+        if (strncmp(line, MCP_CONTENT_HEADER, SLEN(MCP_CONTENT_HEADER)) == 0) {
             int content_len = (int)strtol(line + MCP_CONTENT_PREFIX, NULL, CBM_DECIMAL_BASE);
             if (content_len > 0 && content_len <= MCP_DEFAULT_LIMIT * CBM_SZ_1K * CBM_SZ_1K) {
                 handle_content_length_frame(srv, in, out, &line, &cap, content_len);
@@ -7951,8 +7964,8 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
 
         char *resp = cbm_mcp_server_handle(srv, line);
         if (resp) {
-            (void)fprintf(out, "%s\n", resp);
-            (void)fflush(out);
+            srv->out_content_length_framed = false;
+            write_protocol_json(out, resp, false);
             free(resp);
         }
     }

@@ -5,6 +5,7 @@
  */
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h" /* cbm_unlink / cbm_rmdir */
+#include "../src/foundation/constants.h"
 #include "test_framework.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
@@ -2212,6 +2213,16 @@ static int count_substr_mcp(const char *s, const char *needle) {
     return count;
 }
 
+static bool append_content_length_frame(char **dst, size_t *remaining, const char *json) {
+    if (!dst || !*dst || !remaining || !json) return false;
+    size_t len = strlen(json);
+    int n = snprintf(*dst, *remaining, "Content-Length: %zu\r\n\r\n%s", len, json);
+    if (n < 0 || (size_t)n >= *remaining) return false;
+    *dst += n;
+    *remaining -= (size_t)n;
+    return true;
+}
+
 TEST(mcp_server_run_rapid_messages) {
     /* Simulate a client sending initialize + notifications/initialized +
      * tools/list all at once (no delays), which exercises the FILE*
@@ -2311,6 +2322,67 @@ TEST(mcp_hidden_tools_reveal_sends_list_changed) {
     ASSERT_NOT_NULL(strstr(buf, "\"id\":1"));
     ASSERT_NOT_NULL(strstr(buf, "\"id\":2"));
     ASSERT_NOT_NULL(strstr(buf, "\"id\":3"));
+    ASSERT_NOT_NULL(strstr(buf, "notifications/tools/list_changed"));
+    ASSERT_EQ(count_substr_mcp(buf, "\"name\":\"index_repository\""), 1);
+    ASSERT_EQ(count_substr_mcp(buf, "\"name\":\"get_architecture\""), 1);
+
+    free(buf);
+    cbm_mcp_server_free(srv);
+    fclose(out_fp);
+    fclose(in_fp);
+    PASS();
+}
+
+TEST(mcp_hidden_tools_reveal_frames_list_changed) {
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+
+    enum { FRAME_BUF_SIZE = CBM_SZ_2K };
+    char msgs[FRAME_BUF_SIZE];
+    char *cursor = msgs;
+    size_t remaining = sizeof(msgs);
+    ASSERT_TRUE(append_content_length_frame(
+        &cursor, &remaining,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}"));
+    ASSERT_TRUE(append_content_length_frame(
+        &cursor, &remaining,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"_hidden_tools\",\"arguments\":{}}}"));
+    ASSERT_TRUE(append_content_length_frame(
+        &cursor, &remaining,
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\",\"params\":{}}"));
+
+    size_t msg_len = (size_t)(cursor - msgs);
+    ssize_t written = write(fds[1], msgs, msg_len);
+    ASSERT_TRUE(written == (ssize_t)msg_len);
+    close(fds[1]);
+
+    FILE *in_fp = fdopen(fds[0], "r");
+    ASSERT_NOT_NULL(in_fp);
+    FILE *out_fp = tmpfile();
+    ASSERT_NOT_NULL(out_fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    signal(SIGALRM, alarm_handler);
+    alarm(5);
+    int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
+    alarm(0);
+    signal(SIGALRM, SIG_DFL);
+    ASSERT_EQ(rc, 0);
+
+    ASSERT_EQ(fseek(out_fp, 0, SEEK_END), 0);
+    long out_len = ftell(out_fp);
+    ASSERT_TRUE(out_len > 0);
+    rewind(out_fp);
+
+    char *buf = malloc((size_t)out_len + 1);
+    ASSERT_NOT_NULL(buf);
+    size_t nread = fread(buf, 1, (size_t)out_len, out_fp);
+    buf[nread] = '\0';
+
+    ASSERT_EQ(count_substr_mcp(buf, "Content-Length:"), 4);
     ASSERT_NOT_NULL(strstr(buf, "notifications/tools/list_changed"));
     ASSERT_EQ(count_substr_mcp(buf, "\"name\":\"index_repository\""), 1);
     ASSERT_EQ(count_substr_mcp(buf, "\"name\":\"get_architecture\""), 1);
@@ -2514,6 +2586,7 @@ SUITE(mcp) {
 #ifndef _WIN32
     RUN_TEST(mcp_server_run_rapid_messages);
     RUN_TEST(mcp_hidden_tools_reveal_sends_list_changed);
+    RUN_TEST(mcp_hidden_tools_reveal_frames_list_changed);
 #endif
 
     /* Snippet resolution (port of snippet_test.go) */
