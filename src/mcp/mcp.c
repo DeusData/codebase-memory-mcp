@@ -990,6 +990,59 @@ static int cbm_mcp_auto_index_limit(cbm_mcp_server_t *srv) {
                                         CBM_DEFAULT_AUTO_INDEX_LIMIT);
 }
 
+static bool cbm_mcp_auto_index_within_limit(cbm_mcp_server_t *srv, const char *root_path) {
+    int file_limit = cbm_mcp_auto_index_limit(srv);
+    if (file_limit <= 0) {
+        return true;
+    }
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL, .ignore_file = NULL, .max_file_size = 0};
+    int count = 0;
+    if (cbm_discover_count_bounded(root_path, &opts, file_limit, &count) != 0) {
+        cbm_log_warn("autoindex.skip", "reason", "file_count_failed", "path",
+                     root_path ? root_path : "");
+        return false;
+    }
+    if (count > file_limit) {
+        char count_buf[CBM_SZ_32];
+        snprintf(count_buf, sizeof(count_buf), "%d", count);
+        cbm_log_warn("autoindex.skip", "reason", "too_many_files", "files", count_buf, "limit",
+                     CBM_CONFIG_AUTO_INDEX_LIMIT, "path", root_path ? root_path : "");
+        return false;
+    }
+    return true;
+}
+
+static bool cbm_mcp_run_sync_auto_index(cbm_mcp_server_t *srv, const char *root_path,
+                                        const char *event, const char *log_key,
+                                        const char *log_value) {
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
+    if (!pipeline) {
+        if (srv) {
+            srv->autoindex_failed = true;
+        }
+        cbm_log_error("autoindex.create_failed", "root", root_path ? root_path : "");
+        return false;
+    }
+
+    cbm_pipeline_apply_config(pipeline, srv ? srv->config : NULL);
+    cbm_log_info(event, log_key, log_value ? log_value : "");
+    int rc = cbm_pipeline_run(pipeline);
+    cbm_pipeline_free(pipeline);
+
+    if (srv) {
+        srv->autoindex_failed = (rc != 0);
+        srv->just_autoindexed = (rc == 0);
+    }
+    if (rc != 0) {
+        cbm_log_error("autoindex.failed", log_key, log_value ? log_value : "");
+        cbm_mem_collect();
+        return false;
+    }
+
+    cbm_mem_collect();
+    return true;
+}
+
 /* ── Tool list (needs full struct definition above) ──────────── */
 
 char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
@@ -1502,64 +1555,20 @@ static char *build_project_list_error(const char *reason) {
     return build_project_list_error_srv(NULL, reason);
 }
 
-/* Auto-index on first use: when store is NULL, session_root is set, and
- * auto_index is enabled by config/env, run the pipeline synchronously.
- * This eliminates the need for an explicit index_repository call.
- * MCP is strict request-response — synchronous blocking matches the
- * handle_index_repository path. */
 /* REQUIRE_STORE_EX: like REQUIRE_STORE but runs _pre_free_cleanup before freeing
- * project and returning.  Use this in handlers that allocate extra heap locals
- * (e.g. qn, snippet_mode) that must also be freed on the early-return paths. */
+ * project and returning.  resolve_project_store owns first-use auto-indexing;
+ * this macro only joins an in-flight startup index and reports missing stores.
+ * Use this in handlers that allocate extra heap locals (e.g. qn, snippet_mode)
+ * that must also be freed on the early-return paths. */
 #define REQUIRE_STORE_EX(store, project, _pre_free_cleanup)                                       \
     do {                                                                                          \
         if (!(store) && srv->session_root[0] && access(srv->session_root, F_OK) == 0) {              \
-            /* Join an already-started background index, then start synchronous first-use            \
-             * indexing only when auto_index is enabled by config/env. */                           \
             if (srv->autoindex_active) {                                                          \
                 /* Background thread running — wait for it to complete */                         \
                 cbm_thread_join(&srv->autoindex_tid);                                              \
                 srv->autoindex_active = false;                                                    \
                 /* Re-resolve store after background index finished */                            \
                 store = resolve_store(srv, project);                                              \
-            }                                                                                     \
-            if (!(store) && cbm_mcp_auto_index_enabled(srv)) {                                     \
-                /* No background thread or it failed — try sync index */                          \
-                cbm_pipeline_t *_p = cbm_pipeline_new(                                            \
-                    srv->session_root, NULL, CBM_MODE_FULL);                                      \
-                if (_p) {                                                                         \
-                    cbm_pipeline_apply_config(_p, srv->config);                                    \
-                    cbm_log_info("autoindex.sync", "project", srv->session_project);               \
-                    int _rc = cbm_pipeline_run(_p);                                               \
-                    cbm_pipeline_free(_p);                                                        \
-                    if (_rc != 0) {                                                               \
-                        /* IX-1: Auto-index FAILED */                                             \
-                        srv->autoindex_failed = true;                                             \
-                        cbm_log_error("autoindex.failed", "project",                              \
-                                      srv->session_project);                                      \
-                    } else {                                                                      \
-                        srv->autoindex_failed = false;                                            \
-                        srv->just_autoindexed = true;                                             \
-                        /* Invalidate + reopen store */                                           \
-                        if (srv->owns_store && srv->store) {                                      \
-                            cbm_store_close(srv->store);                                          \
-                            srv->store = NULL;                                                    \
-                        }                                                                         \
-                        free(srv->current_project);                                               \
-                        srv->current_project = NULL;                                              \
-                        store = resolve_store(srv, srv->session_project);                          \
-                        if (store) {                                                              \
-                            cbm_dep_auto_index(srv->session_project, srv->session_root,           \
-                                               store, CBM_DEFAULT_AUTO_DEP_LIMIT, srv->config);   \
-                            cbm_pagerank_compute_with_config(store, srv->session_project,          \
-                                                            srv->config);                         \
-                        }                                                                         \
-                    }                                                                             \
-                    cbm_mem_collect();                                                             \
-                } else {                                                                          \
-                    srv->autoindex_failed = true;                                                  \
-                    cbm_log_error("autoindex.create_failed", "root",                              \
-                                  srv->session_root);                                              \
-                }                                                                                 \
             }                                                                                     \
         }                                                                                         \
         if (!(store)) {                                                                           \
@@ -2271,24 +2280,22 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
             srv->autoindex_active = false;
             store = resolve_store(srv, db_project);
         }
-        if (!store && cbm_mcp_auto_index_enabled(srv)) {
-            cbm_pipeline_t *_p = cbm_pipeline_new(srv->session_root, NULL, CBM_MODE_FULL);
-            if (_p) {
-                cbm_pipeline_apply_config(_p, srv->config);
-                cbm_log_info("autoindex.sync", "project", srv->session_project);
-                cbm_pipeline_run(_p);
-                cbm_pipeline_free(_p);
+        if (!store && !_raw_path && cbm_mcp_auto_index_enabled(srv) &&
+            cbm_mcp_auto_index_within_limit(srv, srv->session_root)) {
+            if (cbm_mcp_run_sync_auto_index(srv, srv->session_root, "autoindex.sync", "project",
+                                            srv->session_project)) {
                 if (srv->owns_store && srv->store) {
-                    cbm_store_close(srv->store); srv->store = NULL;
+                    cbm_store_close(srv->store);
+                    srv->store = NULL;
                 }
-                free(srv->current_project); srv->current_project = NULL;
+                free(srv->current_project);
+                srv->current_project = NULL;
                 store = resolve_store(srv, srv->session_project);
                 if (store) {
                     cbm_dep_auto_index(srv->session_project, srv->session_root,
                                        store, CBM_DEFAULT_AUTO_DEP_LIMIT, srv->config);
                     cbm_pagerank_compute_with_config(store, srv->session_project, srv->config);
                 }
-                cbm_mem_collect();
             }
         }
     }
@@ -2304,18 +2311,13 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
      * above.  This block catches that case and indexes the exact requested path. */
     if (!store && _raw_path && cbm_mcp_auto_index_enabled(srv)) {
         struct stat _st;
-        if (stat(_raw_path, &_st) == 0 && S_ISDIR(_st.st_mode)) {
-            cbm_pipeline_t *_p = cbm_pipeline_new(_raw_path, NULL, CBM_MODE_FULL);
-            if (_p) {
-                cbm_pipeline_apply_config(_p, srv->config);
-                cbm_log_info("autoindex.path", "path", _raw_path);
-                cbm_pipeline_run(_p);
-                cbm_pipeline_free(_p);
+        if (stat(_raw_path, &_st) == 0 && S_ISDIR(_st.st_mode) &&
+            cbm_mcp_auto_index_within_limit(srv, _raw_path)) {
+            if (cbm_mcp_run_sync_auto_index(srv, _raw_path, "autoindex.path", "path", _raw_path)) {
                 store = resolve_store(srv, db_project);
                 if (store) {
                     cbm_pagerank_compute_with_config(store, db_project, srv->config);
                 }
-                cbm_mem_collect();
             }
         }
     }
@@ -7135,7 +7137,6 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
      * Shared with synchronous first-use indexing so auto_index=false cannot
      * be bypassed by a later search/trace request. */
     bool auto_index = cbm_mcp_auto_index_enabled(srv);
-    int file_limit = cbm_mcp_auto_index_limit(srv);
 
     if (!auto_index) {
         cbm_log_info("autoindex.skip", "reason", "disabled", "hint",
@@ -7145,20 +7146,8 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
 
     /* Quick file count check to avoid OOM on massive repos. A configured limit
      * of 0 means "no limit", matching the public config registry. */
-    if (file_limit > 0) {
-        cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL, .ignore_file = NULL, .max_file_size = 0};
-        int count = 0;
-        if (cbm_discover_count_bounded(srv->session_root, &opts, file_limit, &count) != 0) {
-            cbm_log_warn("autoindex.skip", "reason", "file_count_failed");
-            return;
-        }
-        if (count > file_limit) {
-            char count_buf[CBM_SZ_32];
-            snprintf(count_buf, sizeof(count_buf), "%d", count);
-            cbm_log_warn("autoindex.skip", "reason", "too_many_files", "files", count_buf, "limit",
-                         CBM_CONFIG_AUTO_INDEX_LIMIT);
-            return;
-        }
+    if (!cbm_mcp_auto_index_within_limit(srv, srv->session_root)) {
+        return;
     }
 
     /* Launch auto-index in background */

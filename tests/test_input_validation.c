@@ -1052,6 +1052,83 @@ TEST(path_project_auto_indexes_separate_directory) {
     PASS();
 }
 
+TEST(path_project_autoindex_respects_file_limit) {
+    char session_tmp[256];
+    snprintf(session_tmp, sizeof(session_tmp), "/tmp/cbm_path_limit_sess_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(session_tmp));
+
+    char session_src[320];
+    snprintf(session_src, sizeof(session_src), "%s/main.c", session_tmp);
+    FILE *fp = fopen(session_src, "w");
+    if (fp) { fputs("void session_limit_fn(void) {}\n", fp); fclose(fp); }
+
+    char target_tmp[256];
+    snprintf(target_tmp, sizeof(target_tmp), "/tmp/cbm_path_limit_tgt_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(target_tmp));
+
+    char target_src1[320];
+    char target_src2[320];
+    snprintf(target_src1, sizeof(target_src1), "%s/upstream.c", target_tmp);
+    snprintf(target_src2, sizeof(target_src2), "%s/extra.c", target_tmp);
+    fp = fopen(target_src1, "w");
+    if (fp) { fputs("void path_limit_sentinel(void) {}\n", fp); fclose(fp); }
+    fp = fopen(target_src2, "w");
+    if (fp) { fputs("void path_limit_extra(void) {}\n", fp); fclose(fp); }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    const char *old_auto_index = getenv("CBM_AUTO_INDEX");
+    const char *old_limit = getenv("CBM_AUTO_INDEX_LIMIT");
+    char *old_auto_index_copy = old_auto_index ? strdup(old_auto_index) : NULL;
+    char *old_limit_copy = old_limit ? strdup(old_limit) : NULL;
+    if (old_auto_index) {
+        ASSERT_NOT_NULL(old_auto_index_copy);
+    }
+    if (old_limit) {
+        ASSERT_NOT_NULL(old_limit_copy);
+    }
+    cbm_setenv("CBM_AUTO_INDEX", "true", 1);
+    cbm_setenv("CBM_AUTO_INDEX_LIMIT", "1", 1);
+
+    char args1[512];
+    snprintf(args1, sizeof(args1),
+             "{\"project\":\"%s\",\"pattern\":\"session_limit_fn\",\"search_in\":\"source\"}",
+             session_tmp);
+    char *raw1 = cbm_mcp_handle_tool(srv, "search_code", args1);
+    free(raw1);
+
+    char args2[512];
+    snprintf(args2, sizeof(args2),
+             "{\"project\":\"%s\",\"pattern\":\"path_limit_sentinel\"}", target_tmp);
+    char *raw2 = cbm_mcp_handle_tool(srv, "search_graph", args2);
+    char *resp = extract_text(raw2);
+    free(raw2);
+    bool has_match = resp && strstr(resp, "path_limit_sentinel") != NULL;
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    if (old_auto_index_copy) {
+        cbm_setenv("CBM_AUTO_INDEX", old_auto_index_copy, 1);
+        free(old_auto_index_copy);
+    } else {
+        cbm_unsetenv("CBM_AUTO_INDEX");
+    }
+    if (old_limit_copy) {
+        cbm_setenv("CBM_AUTO_INDEX_LIMIT", old_limit_copy, 1);
+        free(old_limit_copy);
+    } else {
+        cbm_unsetenv("CBM_AUTO_INDEX_LIMIT");
+    }
+    unlink(target_src1);
+    unlink(target_src2);
+    rmdir(target_tmp);
+    unlink(session_src);
+    rmdir(session_tmp);
+
+    ASSERT_FALSE(has_match);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  Regression: classic tool names still work
  * ══════════════════════════════════════════════════════════════════ */
@@ -1176,6 +1253,7 @@ void suite_input_validation(void) {
     RUN_TEST(source_search_tilde_project_expands);
     RUN_TEST(source_search_no_project_falls_back_to_session);
     RUN_TEST(path_project_auto_indexes_separate_directory);
+    RUN_TEST(path_project_autoindex_respects_file_limit);
     RUN_TEST(regression_trace_path_tool_name_still_works);
     RUN_TEST(config_context_injection_disabled);
     RUN_TEST(config_context_injection_enabled_by_default);
