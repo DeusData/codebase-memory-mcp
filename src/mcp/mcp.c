@@ -350,7 +350,8 @@ typedef struct {
 static const tool_def_t TOOLS[] = {
     {"index_repository",
      "Index a repository into the knowledge graph. Use for explicit indexing or pre-warming; "
-     "the default search/trace tools auto-index the server CWD on first use when possible. "
+     "default search/trace tools can auto-index the server CWD or explicit directory paths "
+     "on first use when auto_index is enabled. "
      "Special mode 'cross-repo-intelligence': skip extraction, only match Routes/Channels "
      "across projects to create CROSS_HTTP_CALLS/CROSS_ASYNC_CALLS/CROSS_CHANNEL edges. "
      "Requires target_projects param. Ensure target projects have fresh indexes first.",
@@ -373,12 +374,13 @@ static const tool_def_t TOOLS[] = {
     {"search_graph",
      "Search the code knowledge graph for functions, classes, routes, and variables. Use INSTEAD "
      "OF grep/glob when finding code definitions, implementations, or relationships. Auto-indexes "
-     "the server CWD on first use when possible. Returns structured results in one call. "
+     "the server CWD or an explicit directory project on first use when enabled. "
+     "Returns structured results in one call. "
      "When has_more=true, use offset+limit to paginate. "
      "Use mode=summary for quick codebase overview without individual results.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
-     "\"Indexed project name. Omit to use the MCP server project derived from server CWD; first use "
-     "may auto-index it.\"},\"label\":{\"type\":\"string\",\"description\":\"Node label filter, "
+     "\"Indexed project name or repository directory. Omit to use the MCP server project derived "
+     "from server CWD; first use may auto-index it.\"},\"label\":{\"type\":\"string\",\"description\":\"Node label filter, "
      "for example Function, Class, Method, Route, or File.\"},\"name_pattern\":{\"type\":\"string\",\"description\":\"Regex pattern on symbol "
      "name. Glob wildcards (*tool*, foo?) auto-convert to regex.\"},"
      "\"pattern\":{\"type\":\"string\",\"description\":\"Regex or glob pattern matched against "
@@ -445,7 +447,8 @@ static const tool_def_t TOOLS[] = {
 
     {"trace_path",
      "Trace function call paths: who calls a function and what it calls. Use INSTEAD OF grep when "
-     "finding callers, dependencies, or impact analysis. Auto-indexes the project on first use. "
+     "finding callers, dependencies, or impact analysis. Auto-indexes the project on first use "
+     "when enabled. "
      "Pass qualified_name from search_graph when available; otherwise pass function_name. "
      "All other params are optional defaults. Results are deduplicated and show candidates "
      "when a name is ambiguous.",
@@ -454,7 +457,8 @@ static const tool_def_t TOOLS[] = {
      "first, then case-insensitive fallback."
      "\"},\"qualified_name\":{\"type\":\"string\",\"description\":\"Exact qualified name from search "
      "results. Prefer this for cross-tool chaining and disambiguation.\"},\"project\":{"
-     "\"type\":\"string\",\"description\":\"Indexed project name. Omit to use the MCP server project derived from server CWD; first use may auto-index it.\"},\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\","
+     "\"type\":\"string\",\"description\":\"Indexed project name or repository directory. Omit to "
+     "use the MCP server project derived from server CWD; first use may auto-index it.\"},\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\","
      "\"both\"],\"default\":\"both\",\"description\":\"Trace callers (inbound), callees "
      "(outbound), or both.\"},\"depth\":{\"type\":\"integer\",\"default\":3,\"description\":"
      "\"Maximum graph hops to traverse from the start function.\"},\"max_results"
@@ -610,10 +614,11 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "Get source code for a function, class, or symbol by qualified name. "
      "Use INSTEAD OF reading entire files. Use mode=signature for API lookup without source body. "
      "Use mode=head_tail for large functions (preserves return code). "
-     "Module nodes return metadata only. Use auto_resolve=true for file source. "
+     "Module nodes return metadata only. Use auto_resolve=true only for ambiguous names. "
      "Get qualified_name values from search_graph results.",
      "{\"type\":\"object\",\"properties\":{"
-     "\"qualified_name\":{\"type\":\"string\",\"description\":\"Qualified name from search results\"},"
+     "\"qualified_name\":{\"type\":\"string\",\"description\":\"Exact qualified_name from "
+     "search_graph results. Short or suffix names resolve only when unambiguous.\"},"
      "\"project\":{\"type\":\"string\",\"description\":\"Indexed project name. Omit to use the "
      "MCP server project derived from server CWD.\"},"
      "\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"signature\",\"head_tail\"],"
@@ -622,7 +627,7 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "\"max_lines\":{\"type\":\"integer\",\"description\":\"Max source lines (configurable via "
      "snippet_max_lines config key). Set to 0 for unlimited.\"},"
      "\"auto_resolve\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Auto-pick the "
-     "highest-ranked match when qualified_name is ambiguous.\"},"
+     "best ambiguous match; prefers non-test files, then highest graph degree.\"},"
      "\"include_neighbors\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Include "
      "caller/callee names for local context.\"},"
      "\"compact\":{\"type\":\"boolean\",\"default\":true,"
@@ -1050,19 +1055,19 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
             }
         }
 
-        /* Progressive disclosure: list hidden tools so AI knows they exist.
+        /* Progressive disclosure: list advanced tools so AI knows they exist.
          * Added as a special tool entry with description explaining how to enable.
          * The 5 default-surface tools (search_graph, query_graph, search_code,
-         * trace_path, get_code) are NOT listed here — only the 11 hidden ones. */
+         * trace_path, get_code) are NOT listed here. */
         yyjson_mut_val *hint_tool = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_str(doc, hint_tool, "name", "_hidden_tools");
         yyjson_mut_obj_add_str(doc, hint_tool, "description",
-            "11 additional tools available but hidden in streamlined mode. "
-            "Hidden: index_repository, get_code_snippet, "
+            "11 advanced tools are normally hidden in streamlined mode. "
+            "Advanced tools: index_repository, get_code_snippet, "
             "get_graph_schema, get_architecture, list_projects, "
             "delete_project, index_status, detect_changes, manage_adr, "
             "ingest_traces, index_dependencies. "
-            "Default tools auto-index the server CWD on first query when possible. "
+            "Default tools auto-index the server CWD or explicit directory projects when possible. "
             "Call this tool to reveal these tools in tools/list for clients that "
             "only allow discovered tools. "
             "Enable all: set env CBM_TOOL_MODE=classic or config set tool_mode classic. "

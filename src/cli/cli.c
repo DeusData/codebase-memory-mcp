@@ -486,7 +486,7 @@ static const char skill_content[] =
     "| Text search | `search_code(pattern=\"...\")` or Grep |\n"
     "\n"
     "## Exploration Workflow\n"
-    "1. `search_graph(pattern=\"...\")` — auto-indexes the server CWD when possible and finds code\n"
+    "1. `search_graph(pattern=\"...\")` — auto-indexes the server CWD or explicit repo path when possible and finds code\n"
     "2. `get_code(qualified_name=\"project.path.FuncName\")` — read one symbol's source\n"
     "3. `query_graph(query=\"MATCH ...\")` — use Cypher for multi-hop graph questions\n"
     "4. `_hidden_tools` — reveal classic tools such as list_projects and get_graph_schema if needed\n"
@@ -534,11 +534,11 @@ static const char codex_instructions_content[] =
     "This project uses codebase-memory-mcp to maintain a knowledge graph of the codebase.\n"
     "Use the MCP tools to explore and understand the code:\n"
     "\n"
-    "- `search_graph` — find functions, classes, routes by pattern; auto-indexes the server CWD when possible\n"
+    "- `search_graph` — find functions, classes, routes by pattern; auto-indexes the server CWD or explicit repo path when possible\n"
     "- `trace_path` — trace who calls a function or what it calls\n"
     "- `get_code` — read function source code by qualified_name\n"
     "- `query_graph` — run Cypher queries for complex patterns\n"
-    "- `get_architecture` — high-level project summary\n"
+    "- `get_architecture` — high-level summary after `_hidden_tools` reveal or `CBM_TOOL_MODE=classic`\n"
     "\n"
     "Always prefer graph tools over grep for code discovery.\n";
 
@@ -1163,7 +1163,7 @@ static const char agent_instructions_content[] =
     "2. `trace_path` — trace who calls a function or what it calls\n"
     "3. `get_code` — read specific function/class source code by qualified_name\n"
     "4. `query_graph` — run Cypher queries for complex patterns\n"
-    "5. `get_architecture` — high-level project summary\n"
+    "5. `get_architecture` — high-level summary after `_hidden_tools` reveal or `CBM_TOOL_MODE=classic`\n"
     "\n"
     "## When to fall back to grep/glob\n"
     "- Searching for string literals, error messages, config values\n"
@@ -1495,7 +1495,8 @@ int cbm_remove_codex_mcp(const char *config_path) {
 #define CMM_SESSION_REMINDER_CMD                                                    \
     "echo \"Code discovery: prefer codebase-memory-mcp (search_graph, trace_path, " \
     "get_code, query_graph, search_code) over grep/file-read; default tools "       \
-    "auto-index when possible; call _hidden_tools for explicit index_repository.\""
+    "auto-index CWD or explicit repo paths when possible; call _hidden_tools for "  \
+    "explicit index_repository.\""
 
 /* Sentinel-delimited block so upsert/remove are robust to the nested TOML
  * array-of-tables (which both start with '['). */
@@ -2039,7 +2040,7 @@ static void cbm_install_session_reminder_script(const char *home) {
            "   - search_code(pattern) for text search (graph-augmented grep)\n"
            "2. Use Grep/Glob/Read freely for text, configs, non-code files, and\n"
            "   always Read a file before editing it.\n"
-           "3. Default tools auto-index the server CWD when possible. Use _hidden_tools\n"
+           "3. Default tools auto-index the server CWD or explicit repo paths when possible. Use _hidden_tools\n"
            "   to reveal index_repository or get_architecture when explicit control is needed.\n"
            "REMINDER\n");
 #ifndef _WIN32
@@ -2689,9 +2690,9 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
 const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
     /* ── Indexing ── */
     {"auto_index", "true", "CBM_AUTO_INDEX", "Indexing",
-     "Auto-index the MCP server project derived from CWD on startup",
+     "Auto-index the MCP server CWD or explicit repo paths on startup/first use",
      "true|false",
-     "Enable to always have fresh data; disable for manual control or CI environments."},
+     "Enable for automatic indexing; disable for manual control, CI, or embedded read-only contexts."},
     {"auto_index_limit", "50000", "CBM_AUTO_INDEX_LIMIT", "Indexing",
      "Max files before auto-index is skipped (0=no limit, index everything)",
      "0-10000000",
@@ -2742,9 +2743,10 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "to keep first-response token cost modest; raise to 20-25 if you want richer upfront context."},
     /* ── Tools ── */
     {"tool_mode", "streamlined", "CBM_TOOL_MODE", "Tools",
-     "Which set of tools the MCP server exposes: 5 default tools or all 15 individual tools",
+     "Which tool surface the MCP server lists by default",
      "streamlined|classic",
-     "'streamlined' (default): exposes search_graph, query_graph, search_code, trace_path, get_code. "
+     "'streamlined' (default): lists 5 core tools plus _hidden_tools discovery: "
+     "search_graph, query_graph, search_code, trace_path, get_code. "
      "'classic': exposes all 15 individual tools including index_repository, get_code_snippet, get_architecture, "
      "list_projects, detect_changes, manage_adr, etc. "
      "You can also enable individual classic tools without switching modes: "

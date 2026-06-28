@@ -284,6 +284,15 @@ static int run_cli(int argc, char **argv) {
         return SKIP_ONE;
     }
 
+    /* Match the stdio MCP server: one-shot CLI tools should honor registry
+     * defaults and config/env overrides such as auto_index and search_limit. */
+    cbm_config_t *runtime_config = NULL;
+    const char *cfg_home = cbm_get_home_dir();
+    if (cfg_home) {
+        runtime_config = cbm_config_open(cbm_resolve_cache_dir());
+        cbm_mcp_server_set_config(srv, runtime_config);
+    }
+
     char *result = cbm_mcp_handle_tool(srv, tool_name, args_json);
     int exit_code = 0;
 
@@ -297,6 +306,7 @@ static int run_cli(int argc, char **argv) {
     }
 
     cbm_mcp_server_free(srv);
+    cbm_config_close(runtime_config);
     /* Union: fork's global pipeline cleanup (CLI mode: no background threads, safe
      * to release process-lifetime state now) + upstream's progress-sink teardown and
      * correct exit_code propagation. */
