@@ -180,10 +180,11 @@ TEST(mcp_tools_list) {
     char *json = cbm_mcp_tools_list(NULL);
     ASSERT_NOT_NULL(json);
     /* §4b: when srv=NULL (no config), cbm_mcp_tools_list defaults to "streamlined"
-     * mode and emits the 5-tool default surface: the 3 focused search tools
-     * (search_graph, query_graph, search_code) drawn from TOOLS[], plus
-     * trace_path and get_code from STREAMLINED_TOOLS[]. The old
-     * search_code_graph mega-tool has been deleted. */
+     * mode and emits five user-facing tools plus _hidden_tools. Canonical
+     * tools (including trace_path) come from TOOLS[] so classic and
+     * streamlined schemas cannot drift; get_code is the concise alias from
+     * STREAMLINED_TOOLS[]. The old search_code_graph mega-tool has been
+     * deleted. */
     ASSERT_NOT_NULL(strstr(json, "search_graph"));
     ASSERT_NOT_NULL(strstr(json, "query_graph"));
     ASSERT_NOT_NULL(strstr(json, "search_code"));

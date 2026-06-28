@@ -143,10 +143,12 @@ static void restore_tool_mode(char *saved) {
 
 /* ── 1. Tool visibility tests ─────────────────────────────── */
 
-TEST(streamlined_mode_shows_5_default_tools) {
+TEST(streamlined_mode_shows_default_user_tools) {
     /* NULL srv → streamlined mode (no config available).
-     * §4b: default surface is 5 tools — search_graph, query_graph, search_code,
-     * trace_path, get_code. The search_code_graph mega-tool is gone. */
+     * §4b: default surface is five user-facing tools plus _hidden_tools.
+     * Canonical tools are emitted from TOOLS[] to avoid schema drift; get_code
+     * is the concise streamlined alias. The search_code_graph mega-tool is
+     * gone. */
     char *json = cbm_mcp_tools_list(NULL);
     ASSERT_NOT_NULL(json);
     /* Default-surface tools must be present by name. */
@@ -2495,7 +2497,7 @@ SUITE(tool_consolidation) {
     /* MCP protocol conformance */
     RUN_TEST(all_tools_have_object_inputSchema);
     /* Tool visibility */
-    RUN_TEST(streamlined_mode_shows_5_default_tools);
+    RUN_TEST(streamlined_mode_shows_default_user_tools);
     RUN_TEST(server_default_mode_shows_streamlined_tools);
     RUN_TEST(api_surface_default_streamlined_regression_gate);
     RUN_TEST(api_surface_classic_regression_gate);
