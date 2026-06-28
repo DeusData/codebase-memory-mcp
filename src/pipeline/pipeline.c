@@ -13,7 +13,6 @@
 #include "foundation/constants.h"
 
 enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
-#define PL_NSEC_PER_SEC 1000000000LL
 #include "cli/cli.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
@@ -63,6 +62,12 @@ bool cbm_pipeline_try_lock(void) {
 
 #define LOCK_SPIN_NS 100000000 /* 100ms between lock retries */
 
+typedef enum {
+    CBM_INCREMENTAL_REINDEX_FAST = 0,
+    CBM_INCREMENTAL_REINDEX_ALWAYS,
+    CBM_INCREMENTAL_REINDEX_OFF,
+} cbm_incremental_reindex_policy_t;
+
 void cbm_pipeline_lock(void) {
     while (atomic_exchange(&g_pipeline_busy, 1) != 0) {
         struct timespec ts = {0, LOCK_SPIN_NS};
@@ -88,6 +93,7 @@ struct cbm_pipeline {
     double semantic_threshold;
     double githistory_min_coupling;
     double lsp_confidence_floor;
+    cbm_incremental_reindex_policy_t incremental_reindex;
     atomic_int cancelled;
     cbm_store_t *flush_store; /* when set, use flush_to_store instead of dump_to_sqlite */
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
@@ -173,6 +179,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->semantic_threshold = 0.0;
     p->githistory_min_coupling = 0.0;
     p->lsp_confidence_floor = 0.0;
+    p->incremental_reindex = CBM_INCREMENTAL_REINDEX_FAST;
     p->persistence = false;
     p->committed_nodes = -1;
     p->committed_edges = -1;
@@ -258,6 +265,15 @@ void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg) {
         cbm_config_get_double(cfg, CBM_CONFIG_LSP_CONFIDENCE_FLOOR, 0.0);
     if (lsp_floor > 0.0) {
         cbm_pipeline_set_lsp_confidence_floor(p, lsp_floor);
+    }
+
+    const char *incremental = cbm_config_get(cfg, CBM_CONFIG_INCREMENTAL_REINDEX, "fast");
+    if (incremental && strcmp(incremental, "always") == 0) {
+        p->incremental_reindex = CBM_INCREMENTAL_REINDEX_ALWAYS;
+    } else if (incremental && strcmp(incremental, "off") == 0) {
+        p->incremental_reindex = CBM_INCREMENTAL_REINDEX_OFF;
+    } else {
+        p->incremental_reindex = CBM_INCREMENTAL_REINDEX_FAST;
     }
 }
 
@@ -914,6 +930,16 @@ static int try_incremental_or_reindex(cbm_pipeline_t *p, cbm_file_info_t *files,
         free(db_path);
         return CBM_NOT_FOUND;
     }
+    if (p->incremental_reindex == CBM_INCREMENTAL_REINDEX_OFF ||
+        (p->incremental_reindex == CBM_INCREMENTAL_REINDEX_FAST &&
+         p->mode != CBM_MODE_FAST)) {
+        cbm_log_info("pipeline.route", "path", "full", "reason",
+                     p->incremental_reindex == CBM_INCREMENTAL_REINDEX_OFF
+                         ? "incremental_reindex=off"
+                         : "incremental_reindex=fast_requires_fast_mode");
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
     cbm_store_t *check_store = cbm_store_open_path(db_path);
     if (check_store && cbm_store_check_integrity(check_store)) {
         cbm_file_hash_t *hashes = NULL;
@@ -1248,12 +1274,12 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
                     if (stat(files[i].path, &fst) == 0) {
                         int64_t mtime_ns;
 #ifdef __APPLE__
-                        mtime_ns = ((int64_t)fst.st_mtimespec.tv_sec * 1000000000LL) +
+                        mtime_ns = ((int64_t)fst.st_mtimespec.tv_sec * CBM_NS_PER_SEC) +
                                    (int64_t)fst.st_mtimespec.tv_nsec;
 #elif defined(_WIN32)
-                        mtime_ns = (int64_t)fst.st_mtime * 1000000000LL;
+                        mtime_ns = (int64_t)fst.st_mtime * CBM_NS_PER_SEC;
 #else
-                        mtime_ns = ((int64_t)fst.st_mtim.tv_sec * 1000000000LL) +
+                        mtime_ns = ((int64_t)fst.st_mtim.tv_sec * CBM_NS_PER_SEC) +
                                    (int64_t)fst.st_mtim.tv_nsec;
 #endif
                         cbm_store_upsert_file_hash(hash_store, p->project_name,

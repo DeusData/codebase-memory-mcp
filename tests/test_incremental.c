@@ -13,6 +13,7 @@
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include <cli/cli.h>
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
@@ -36,6 +37,7 @@ static char g_tmpdir[256];
 static char g_repodir[512];
 static char g_dbpath[512];
 static cbm_mcp_server_t *g_srv = NULL;
+static cbm_config_t *g_cfg = NULL;
 static char *g_project = NULL;
 
 /* Baseline counts after full index */
@@ -249,6 +251,14 @@ static int incremental_setup(void) {
     g_srv = cbm_mcp_server_new(NULL);
     if (!g_srv)
         return -1;
+    g_cfg = cbm_config_open(cdir);
+    if (!g_cfg) {
+        cbm_mcp_server_free(g_srv);
+        g_srv = NULL;
+        return -1;
+    }
+    cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_REINDEX, "always");
+    cbm_mcp_server_set_config(g_srv, g_cfg);
 
     g_rss_before_full = cbm_mem_rss();
 
@@ -260,6 +270,8 @@ static void incremental_teardown(void) {
         cbm_mcp_server_free(g_srv);
         g_srv = NULL;
     }
+    cbm_config_close(g_cfg);
+    g_cfg = NULL;
     if (g_project) {
         unlink(g_dbpath);
         char wal[520], shm[520];
