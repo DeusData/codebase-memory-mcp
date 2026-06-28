@@ -147,11 +147,6 @@ static void add_pagerank_val(yyjson_mut_doc *doc, yyjson_mut_val *obj, double v)
 #define CBM_CONFIG_CONTEXT_KEY_FUNCTIONS_LIMIT "context_key_functions_limit"
 #define CBM_CONFIG_ARCH_HOTSPOT_LIMIT    "arch_hotspot_limit"
 #define CBM_CONFIG_ARCH_RESOLUTION       "architecture_resolution"
-#define CBM_CONFIG_SIMILARITY_THRESHOLD  "similarity_threshold"
-#define CBM_CONFIG_HTTPLINK_MIN_CONFIDENCE "httplink_min_confidence"
-#define CBM_CONFIG_SEMANTIC_THRESHOLD    "semantic_threshold"
-#define CBM_CONFIG_GITHISTORY_MIN_COUPLING "githistory_min_coupling"
-#define CBM_CONFIG_LSP_CONFIDENCE_FLOOR  "lsp_confidence_floor"
 
 /* Directory permissions: rwxr-xr-x */
 #define ADR_DIR_PERMS 0755
@@ -1491,6 +1486,7 @@ static char *build_project_list_error(const char *reason) {
                 cbm_pipeline_t *_p = cbm_pipeline_new(                                            \
                     srv->session_root, NULL, CBM_MODE_FULL);                                      \
                 if (_p) {                                                                         \
+                    cbm_pipeline_apply_config(_p, srv->config);                                    \
                     cbm_log_info("autoindex.sync", "project", srv->session_project);               \
                     int _rc = cbm_pipeline_run(_p);                                               \
                     cbm_pipeline_free(_p);                                                        \
@@ -1512,7 +1508,7 @@ static char *build_project_list_error(const char *reason) {
                         store = resolve_store(srv, srv->session_project);                          \
                         if (store) {                                                              \
                             cbm_dep_auto_index(srv->session_project, srv->session_root,           \
-                                               store, CBM_DEFAULT_AUTO_DEP_LIMIT);                \
+                                               store, CBM_DEFAULT_AUTO_DEP_LIMIT, srv->config);   \
                             cbm_pagerank_compute_with_config(store, srv->session_project,          \
                                                             srv->config);                         \
                         }                                                                         \
@@ -2237,6 +2233,7 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
         if (!store) {
             cbm_pipeline_t *_p = cbm_pipeline_new(srv->session_root, NULL, CBM_MODE_FULL);
             if (_p) {
+                cbm_pipeline_apply_config(_p, srv->config);
                 cbm_log_info("autoindex.sync", "project", srv->session_project);
                 cbm_pipeline_run(_p);
                 cbm_pipeline_free(_p);
@@ -2247,7 +2244,7 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
                 store = resolve_store(srv, srv->session_project);
                 if (store) {
                     cbm_dep_auto_index(srv->session_project, srv->session_root,
-                                       store, CBM_DEFAULT_AUTO_DEP_LIMIT);
+                                       store, CBM_DEFAULT_AUTO_DEP_LIMIT, srv->config);
                     cbm_pagerank_compute_with_config(store, srv->session_project, srv->config);
                 }
                 cbm_mem_collect();
@@ -2269,6 +2266,7 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
         if (stat(_raw_path, &_st) == 0 && S_ISDIR(_st.st_mode)) {
             cbm_pipeline_t *_p = cbm_pipeline_new(_raw_path, NULL, CBM_MODE_FULL);
             if (_p) {
+                cbm_pipeline_apply_config(_p, srv->config);
                 cbm_log_info("autoindex.path", "path", _raw_path);
                 cbm_pipeline_run(_p);
                 cbm_pipeline_free(_p);
@@ -4556,35 +4554,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             "\"hint\":\"Check that repo_path exists and is readable. The directory may be empty or inaccessible.\"}", true);
     }
     cbm_pipeline_set_persistence(p, persistence);
-    /* Similarity threshold (#41): tunable Jaccard cutoff for SIMILAR edges.
-     * Default 0.0 = use the built-in CBM_MINHASH_JACCARD_THRESHOLD. */
-    if (srv && srv->config) {
-        double sim_thresh =
-            cbm_config_get_double(srv->config, CBM_CONFIG_SIMILARITY_THRESHOLD, 0.0);
-        if (sim_thresh > 0.0) {
-            cbm_pipeline_set_similarity_threshold(p, sim_thresh);
-        }
-        double httplink_min =
-            cbm_config_get_double(srv->config, CBM_CONFIG_HTTPLINK_MIN_CONFIDENCE, 0.0);
-        if (httplink_min > 0.0) {
-            cbm_pipeline_set_httplink_min_confidence(p, httplink_min);
-        }
-        double semantic_thresh =
-            cbm_config_get_double(srv->config, CBM_CONFIG_SEMANTIC_THRESHOLD, 0.0);
-        if (semantic_thresh > 0.0) {
-            cbm_pipeline_set_semantic_threshold(p, semantic_thresh);
-        }
-        double gh_min =
-            cbm_config_get_double(srv->config, CBM_CONFIG_GITHISTORY_MIN_COUPLING, 0.0);
-        if (gh_min > 0.0) {
-            cbm_pipeline_set_githistory_min_coupling(p, gh_min);
-        }
-        double lsp_floor =
-            cbm_config_get_double(srv->config, CBM_CONFIG_LSP_CONFIDENCE_FLOOR, 0.0);
-        if (lsp_floor > 0.0) {
-            cbm_pipeline_set_lsp_confidence_floor(p, lsp_floor);
-        }
-    }
+    cbm_pipeline_apply_config(p, srv->config);
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
 
@@ -4635,7 +4605,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             /* Auto-detect ecosystem and index installed deps from fresh graph.
              * Queries manifest files already indexed by pipeline step 1. */
             int deps_reindexed = cbm_dep_auto_index(
-                project_name, repo_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT);
+                project_name, repo_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT, srv->config);
 
             /* Compute PageRank + LinkRank on full graph (project + deps).
              * Uses config-backed edge weights when config is available. */
@@ -6717,6 +6687,7 @@ static char *handle_index_dependencies(cbm_mcp_server_t *srv, const char *args) 
         char *dep_proj = cbm_dep_project_name(project, pkg_name);
         cbm_pipeline_t *dp = cbm_pipeline_new(source_dir, NULL, CBM_MODE_DEP);
         if (dp) {
+            cbm_pipeline_apply_config(dp, srv->config);
             cbm_pipeline_set_project_name(dp, dep_proj);
             cbm_pipeline_set_flush_store(dp, store);
             int rc = cbm_pipeline_run(dp);
@@ -6911,6 +6882,7 @@ static void *autoindex_thread(void *arg) {
         cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
         return NULL;
     }
+    cbm_pipeline_apply_config(p, srv->config);
 
     /* Block until any concurrent pipeline finishes */
     cbm_pipeline_lock();
@@ -6924,7 +6896,7 @@ static void *autoindex_thread(void *arg) {
         cbm_store_t *store = resolve_store(srv, srv->session_project);
         if (store) {
             cbm_dep_auto_index(srv->session_project, srv->session_root,
-                               store, CBM_DEFAULT_AUTO_DEP_LIMIT);
+                               store, CBM_DEFAULT_AUTO_DEP_LIMIT, srv->config);
             cbm_pagerank_compute_with_config(store, srv->session_project, srv->config);
         }
 
