@@ -165,18 +165,14 @@ TEST(streamlined_mode_shows_5_default_tools) {
     PASS();
 }
 
-TEST(classic_mode_shows_all_15_tools) {
-    /* Create server with tool_mode=classic config */
+TEST(server_default_mode_shows_streamlined_tools) {
+    /* New server default is streamlined mode unless CBM_TOOL_MODE/config opts
+     * into classic. */
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
-    /* In classic mode, all original tool names must appear.
-     * Without config set, default is streamlined — so test streamlined here.
-     * Classic requires config which needs a real config store.
-     * Test via server_handle with tools/list instead. */
     char *resp = cbm_mcp_server_handle(srv,
         "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/list\"}");
     ASSERT_NOT_NULL(resp);
-    /* Default (no config) = streamlined: §4b surface is the 5 split tools */
     ASSERT_NOT_NULL(strstr(resp, "search_graph"));
     ASSERT_NOT_NULL(strstr(resp, "query_graph"));
     ASSERT_NOT_NULL(strstr(resp, "search_code"));
@@ -329,10 +325,11 @@ TEST(streamlined_core_parameter_contract) {
     ASSERT_NOT_NULL(json);
 
     const char *search_params[] = {
-        "project", "label", "name_pattern", "qn_pattern", "file_pattern",
-        "semantic_query", "relationship", "min_degree", "max_degree",
-        "exclude_entry_points", "include_connected", "limit", "offset",
-        "sort_by", "mode", "compact", "include_dependencies", "exclude",
+        "project", "label", "name_pattern", "pattern", "qn_pattern",
+        "query", "file_pattern", "semantic_query", "relationship",
+        "case_sensitive", "min_degree", "max_degree", "exclude_entry_points",
+        "include_connected", "limit", "offset", "sort_by", "mode", "summary",
+        "compact", "include_dependencies", "exclude",
     };
     for (size_t i = 0; i < sizeof(search_params) / sizeof(search_params[0]); i++) {
         ASSERT(tool_schema_has_property(json, "search_graph", search_params[i]));
@@ -2499,7 +2496,7 @@ SUITE(tool_consolidation) {
     RUN_TEST(all_tools_have_object_inputSchema);
     /* Tool visibility */
     RUN_TEST(streamlined_mode_shows_5_default_tools);
-    RUN_TEST(classic_mode_shows_all_15_tools);
+    RUN_TEST(server_default_mode_shows_streamlined_tools);
     RUN_TEST(api_surface_default_streamlined_regression_gate);
     RUN_TEST(api_surface_classic_regression_gate);
     RUN_TEST(hidden_tools_reveal_discoverable_tools);
