@@ -28,6 +28,8 @@
 #include <stdint.h>
 #include <time.h>
 
+enum { TEST_ARCH_PATH_BUF = 512 };
+
 /* ── Helper: create architecture test store ──────────────────────── */
 
 static cbm_store_t *setup_arch_test_store(void) {
@@ -171,6 +173,97 @@ TEST(arch_entry_points_exclude_tests) {
     ASSERT_EQ(info.entry_point_count, 2); /* main, HandleRequest */
 
     cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_path_scoping) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "pscope", "/tmp/pscope"), CBM_STORE_OK);
+
+    cbm_node_t f1 = {.project = "pscope",
+                     .label = "File",
+                     .name = "a.go",
+                     .qualified_name = "pscope.apps.foo.a.go",
+                     .file_path = "apps/foo/a.go"};
+    cbm_node_t f2 = {.project = "pscope",
+                     .label = "File",
+                     .name = "b.go",
+                     .qualified_name = "pscope.other.b.go",
+                     .file_path = "other/b.go"};
+    cbm_store_upsert_node(s, &f1);
+    cbm_store_upsert_node(s, &f2);
+
+    cbm_node_t fn_foo = {.project = "pscope",
+                         .label = "Function",
+                         .name = "Foo",
+                         .qualified_name = "pscope.apps.foo.Foo",
+                         .file_path = "apps/foo/a.go"};
+    cbm_node_t fn_other = {.project = "pscope",
+                           .label = "Function",
+                           .name = "Bar",
+                           .qualified_name = "pscope.other.Bar",
+                           .file_path = "other/b.go"};
+    cbm_store_upsert_node(s, &fn_foo);
+    cbm_store_upsert_node(s, &fn_other);
+
+    const char *aspects[] = {"languages", "packages"};
+    cbm_architecture_info_t whole = {0};
+    ASSERT_EQ(cbm_store_get_architecture(s, "pscope", aspects, 2, &whole, 0, 1.0),
+              CBM_STORE_OK);
+
+    cbm_architecture_info_t scoped = {0};
+    ASSERT_EQ(cbm_store_get_architecture_scoped(s, "pscope", "apps/foo", aspects, 2, &scoped,
+                                                0, 1.0),
+              CBM_STORE_OK);
+
+    int whole_go = 0;
+    int scoped_go = 0;
+    for (int i = 0; i < whole.language_count; i++) {
+        if (strcmp(whole.languages[i].language, "Go") == 0) {
+            whole_go = whole.languages[i].file_count;
+        }
+    }
+    for (int i = 0; i < scoped.language_count; i++) {
+        if (strcmp(scoped.languages[i].language, "Go") == 0) {
+            scoped_go = scoped.languages[i].file_count;
+        }
+    }
+    ASSERT_TRUE(whole_go > scoped_go);
+    ASSERT_EQ(scoped_go, 1);
+
+    int whole_pkg_nodes = 0;
+    for (int i = 0; i < whole.package_count; i++) {
+        whole_pkg_nodes += whole.packages[i].node_count;
+    }
+    int scoped_pkg_nodes = 0;
+    for (int i = 0; i < scoped.package_count; i++) {
+        scoped_pkg_nodes += scoped.packages[i].node_count;
+    }
+    ASSERT_TRUE(whole_pkg_nodes > scoped_pkg_nodes);
+    ASSERT_EQ(scoped_pkg_nodes, 1);
+    ASSERT_TRUE(cbm_store_count_nodes(s, "pscope") >
+                cbm_store_count_nodes_scoped(s, "pscope", "apps/foo"));
+    char norm_path[TEST_ARCH_PATH_BUF];
+    ASSERT_TRUE(cbm_store_normalize_arch_path(".\\apps\\foo\\", norm_path, sizeof(norm_path)));
+    ASSERT_STR_EQ(norm_path, "apps/foo");
+
+    cbm_architecture_info_t scoped_slash = {0};
+    ASSERT_EQ(cbm_store_get_architecture_scoped(s, "pscope", "apps/foo/", aspects, 2,
+                                                &scoped_slash, 0, 1.0),
+              CBM_STORE_OK);
+    int slash_go = 0;
+    for (int i = 0; i < scoped_slash.language_count; i++) {
+        if (strcmp(scoped_slash.languages[i].language, "Go") == 0) {
+            slash_go = scoped_slash.languages[i].file_count;
+        }
+    }
+    ASSERT_EQ(slash_go, scoped_go);
+
+    cbm_store_architecture_free(&scoped_slash);
+    cbm_store_architecture_free(&whole);
+    cbm_store_architecture_free(&scoped);
     cbm_store_close(s);
     PASS();
 }
@@ -1450,6 +1543,7 @@ SUITE(store_arch) {
     /* Architecture */
     RUN_TEST(arch_get_all);
     RUN_TEST(arch_entry_points_exclude_tests);
+    RUN_TEST(arch_path_scoping);
     RUN_TEST(arch_hotspots_exclude_tests);
     RUN_TEST(arch_specific_aspects);
     RUN_TEST(arch_empty_project);

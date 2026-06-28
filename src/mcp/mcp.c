@@ -516,7 +516,10 @@ static const tool_def_t TOOLS[] = {
      "representative top_nodes, and the packages/edge_types that bind it). Use these to inspect "
      "actual dependency-based module boundaries, which may differ from the folder layout.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
-     "\"Indexed project name to summarize.\"},\"aspects\":{\"type\":"
+     "\"Indexed project name to summarize.\"},\"path\":{\"type\":\"string\",\"description\":"
+     "\"Optional relative directory/file prefix to scope architecture counts and sections, e.g. "
+     "src/server. Leading ./, leading slash, trailing slash, and backslashes are normalized.\"},"
+     "\"aspects\":{\"type\":"
      "\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Optional sections to include; "
      "omit for the default overview.\"}},\"required\":[\"project\"]}"},
 
@@ -3636,10 +3639,12 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
     char *project = pe.value;
     REQUIRE_STORE(store, project);
+    char *scope_path = cbm_mcp_get_string_arg(args, "path");
 
     char *not_indexed = verify_project_indexed(store, project);
     if (not_indexed) {
         free(project);
+        free(scope_path);
         return not_indexed;
     }
 
@@ -3679,7 +3684,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     /* Counts-only: this handler renders label/type counts but never property
      * keys, and full key discovery json_each-scans every row (seconds-to-
      * minutes on multi-million-node graphs). */
-    cbm_store_get_schema_counts(store, project, &schema);
+    cbm_store_get_schema_counts_scoped(store, project, scope_path, &schema);
 
     cbm_architecture_info_t arch = {0};
     int arch_hotspot_limit = srv && srv->config
@@ -3690,12 +3695,15 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     double arch_leiden_resolution = srv && srv->config
         ? cbm_config_get_double(srv->config, CBM_CONFIG_ARCH_RESOLUTION, 1.0)
         : 1.0;
-    cbm_store_get_architecture(store, project, aspects_strs_count > 0 ? aspects_strs : NULL,
-                               aspects_strs_count, &arch, arch_hotspot_limit,
-                               arch_leiden_resolution);
+    cbm_store_get_architecture_scoped(store, project, scope_path,
+                                      aspects_strs_count > 0 ? aspects_strs : NULL,
+                                      aspects_strs_count, &arch, arch_hotspot_limit,
+                                      arch_leiden_resolution);
 
-    int node_count = cbm_store_count_nodes(store, project);
-    int edge_count = cbm_store_count_edges(store, project);
+    int node_count = cbm_store_count_nodes_scoped(store, project, scope_path);
+    int edge_count = cbm_store_count_edges_scoped(store, project, scope_path);
+    char norm_path[CBM_SZ_512];
+    bool path_scoped = cbm_store_normalize_arch_path(scope_path, norm_path, sizeof(norm_path));
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -3706,6 +3714,15 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
 
     if (project) {
         yyjson_mut_obj_add_str(doc, root, "project", project);
+    }
+    if (path_scoped) {
+        yyjson_mut_obj_add_str(doc, root, "path", norm_path);
+        yyjson_mut_obj_add_int(doc, root, "root_total_nodes",
+                               cbm_store_count_nodes(store, project));
+        yyjson_mut_obj_add_int(doc, root, "root_total_edges",
+                               cbm_store_count_edges(store, project));
+        yyjson_mut_obj_add_int(doc, root, "scoped_total_nodes", node_count);
+        yyjson_mut_obj_add_int(doc, root, "scoped_total_edges", edge_count);
     }
     yyjson_mut_obj_add_int(doc, root, "total_nodes", node_count);
     yyjson_mut_obj_add_int(doc, root, "total_edges", edge_count);
@@ -3978,6 +3995,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
         yyjson_doc_free(aspects_doc);
     }
     free(project);
+    free(scope_path);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
