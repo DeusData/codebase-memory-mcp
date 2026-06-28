@@ -114,7 +114,7 @@ Enable automatic indexing on MCP session start:
 codebase-memory-mcp config set auto_index true
 ```
 
-When enabled, new projects are indexed automatically on first connection. Previously-indexed projects are registered with the background watcher for ongoing git-based change detection. Configurable file limit: `config set auto_index_limit 50000`.
+When enabled, new projects are indexed automatically on first connection. Previously-indexed projects are registered with the background watcher for git-based change detection; refreshes use the configured reindex policy. Configurable file limit: `config set auto_index_limit 50000`.
 
 ### Keeping Up to Date
 
@@ -176,7 +176,7 @@ Removes all agent configs, skills, hooks, and instructions. Does not remove the 
 
 ### Distribution & operation
 - **Single static binary, zero infrastructure**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
-- **Auto-sync**: Background watcher detects file changes and re-indexes automatically
+- **Auto-sync**: Background watcher detects git changes and re-indexes automatically when configured
 - **Route nodes**: REST endpoints are first-class graph entities
 - **CLI mode**: `codebase-memory-mcp cli search_graph '{"name_pattern": ".*Handler.*"}'`
 - **Available on**: npm, PyPI, Homebrew, Scoop, Winget, Chocolatey, AUR, `go install`
@@ -185,13 +185,13 @@ Removes all agent configs, skills, hooks, and instructions. Does not remove the 
 
 Commit a single compressed file to your repo and your teammates skip the reindex.
 
-`.codebase-memory/graph.db.zst` is a zstd-compressed snapshot of the knowledge graph that lives next to your source. When you index, the artifact is written or refreshed; when a teammate clones the repo and runs `codebase-memory-mcp` for the first time, the artifact is decompressed and incremental indexing fills in their local diff.
+`.codebase-memory/graph.db.zst` is a zstd-compressed snapshot of the knowledge graph that lives next to your source. When you index with persistence enabled, the artifact is written or refreshed; when a teammate clones the repo and runs `codebase-memory-mcp` for the first time, the artifact can bootstrap their local graph before any configured refresh.
 
 - **Format**: SQLite database, indexes stripped, `VACUUM INTO` compacted, then zstd 1.5.7 compressed (8–13:1 ratio typical)
 - **Two tiers**:
   - **Best** (`zstd -9` + index strip + `VACUUM INTO`) — written on explicit `index_repository`
-  - **Fast** (`zstd -3`) — written by the watcher for low-latency incremental updates
-- **Bootstrap**: when no local DB exists but the artifact is present, `index_repository` imports the artifact first, then runs incremental indexing — avoiding the full reindex cost
+  - **Fast** (`zstd -3`) — written by the watcher when it refreshes an existing artifact
+- **Bootstrap**: when no local DB exists but the artifact is present, `index_repository` imports the artifact first, then applies the configured refresh policy
 - **No merge pain**: a `.gitattributes` line with `merge=ours` is auto-created on first export, so concurrent edits don't produce conflicts on the binary artifact
 - **Optional**: never committed unless you want it. Add `.codebase-memory/` to `.gitignore` if you prefer everyone to reindex from scratch.
 
@@ -377,7 +377,7 @@ codebase-memory-mcp cli --raw search_graph '{"label": "Function"}' | jq '.result
 
 | Tool | Description |
 |------|-------------|
-| `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh after that. |
+| `index_repository` | Index a repository into the graph. Auto-sync can refresh it after that when configured. |
 | `list_projects` | List all indexed projects with node/edge counts. |
 | `delete_project` | Remove a project and all its graph data. |
 | `index_status` | Check indexing status of a project. |
@@ -431,7 +431,7 @@ Layered: hardcoded patterns (`.git`, `node_modules`, etc.) → `.gitignore` hier
 
 ```bash
 codebase-memory-mcp config list                          # show all settings
-codebase-memory-mcp config set auto_index true           # auto-index on session start
+codebase-memory-mcp config set auto_index true           # auto-index on startup/first use
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
 codebase-memory-mcp config reset auto_index              # reset to default
 ```

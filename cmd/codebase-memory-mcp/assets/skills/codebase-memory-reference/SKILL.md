@@ -13,7 +13,7 @@ description: >
 
 | Tool | Purpose |
 |------|---------|
-| `index_repository` | Parse and ingest repo into graph (only once — auto-sync keeps it fresh) |
+| `index_repository` | Parse and ingest repo into graph; auto-sync can refresh it when configured |
 | `index_status` | Check indexing status (ready/indexing/not found) |
 | `list_projects` | List all indexed projects with timestamps and counts |
 | `delete_project` | Remove a project from the graph |

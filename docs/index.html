@@ -688,11 +688,11 @@
             </div>
             <div class="feature">
                 <h3>Auto-sync</h3>
-                <p>A background watcher detects changes and re-indexes incrementally. No manual reindex after editing files.</p>
+                <p>A background watcher detects git changes and re-indexes when configured. The reindex policy controls whether refreshes use full or incremental indexing.</p>
             </div>
             <div class="feature">
                 <h3>Team-shared graph artifact</h3>
-                <p>Commit one zstd-compressed snapshot (<code>.codebase-memory/graph.db.zst</code>); teammates bootstrap from it and skip the full reindex.</p>
+                <p>Commit one zstd-compressed snapshot (<code>.codebase-memory/graph.db.zst</code>); teammates can bootstrap from it before any configured refresh.</p>
             </div>
             <div class="feature">
                 <h3>3D graph visualization</h3>
@@ -765,9 +765,9 @@
            (arm64/amd64), and Windows (amd64).</p>
 
         <h3>How does it stay up to date as I edit code?</h3>
-        <p>A background watcher detects file changes and re-indexes incrementally — typically a sub-millisecond
-           no-op when nothing changed. You only run a manual index for the first build or after a large
-           <code>git pull</code>.</p>
+        <p>A background watcher detects git changes and can re-index automatically when configured.
+           The default refresh path favors correctness with a full atomic rebuild; incremental reindexing
+           remains an explicit policy setting.</p>
 
         <h3>Why is there no built-in LLM?</h3>
         <p>Other code-graph tools embed an LLM to translate natural language into graph queries, which means
