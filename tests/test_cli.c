@@ -2737,6 +2737,48 @@ TEST(replace_binary_creates_new_file) {
 
 #endif /* _WIN32 */
 
+TEST(cli_remove_indexes_preserves_config_db) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-index-clean-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *old_cache_copy = old_cache ? strdup(old_cache) : NULL;
+    if (old_cache) {
+        ASSERT_NOT_NULL(old_cache_copy);
+    }
+    cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
+
+    char project_db[512];
+    char project_tmp[512];
+    char config_db[512];
+    snprintf(project_db, sizeof(project_db), "%s/project.db", tmpdir);
+    snprintf(project_tmp, sizeof(project_tmp), "%s/project.db.tmp", tmpdir);
+    snprintf(config_db, sizeof(config_db), "%s/_config.db", tmpdir);
+    ASSERT_EQ(write_test_file(project_db, "project"), 0);
+    ASSERT_EQ(write_test_file(project_tmp, "tmp"), 0);
+    ASSERT_EQ(write_test_file(config_db, "config"), 0);
+
+    ASSERT_EQ(cbm_remove_indexes(NULL), 1);
+
+    struct stat st;
+    ASSERT_NEQ(stat(project_db, &st), 0);
+    ASSERT_NEQ(stat(project_tmp, &st), 0);
+    ASSERT_EQ(stat(config_db, &st), 0);
+
+    if (old_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", old_cache_copy, 1);
+        free(old_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    remove(config_db);
+    rmdir(tmpdir);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Suite definition
  * ═══════════════════════════════════════════════════════════════════ */
@@ -2816,6 +2858,7 @@ SUITE(cli) {
     /* Binary swap on install --force (#472) */
     RUN_TEST(cli_install_copies_binary_to_target_issue472);
     RUN_TEST(cli_install_same_file_guard_issue472);
+    RUN_TEST(cli_remove_indexes_preserves_config_db);
 
     /* YAML parser (7 unit tests) */
     RUN_TEST(cli_yaml_parse_simple);
