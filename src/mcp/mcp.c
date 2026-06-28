@@ -136,6 +136,10 @@ static void add_pagerank_val(yyjson_mut_doc *doc, yyjson_mut_val *obj, double v)
 #define CBM_MCP_UPDATE_CHECK_TIMEOUT_S 5
 #define CBM_CONFIG_UPDATE_CHECK_TIMEOUT_S "update_check_timeout_s"
 
+/* Auto-index default used by production servers with a config store. Embedded
+ * no-config servers stay manual unless CBM_AUTO_INDEX explicitly opts in. */
+#define CBM_DEFAULT_AUTO_INDEX_LIMIT 50000
+
 /* Config key: comma-separated glob patterns to exclude from key_functions.
  * Set via: config set key_functions_exclude "scripts/,tools/,tests/" */
 #define CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE "key_functions_exclude"
@@ -961,6 +965,9 @@ static int cbm_mcp_db_validate_busy_timeout_ms(cbm_mcp_server_t *srv) {
 }
 
 static int cbm_mcp_update_check_timeout_s(cbm_mcp_server_t *srv) {
+    if (!srv || !srv->config) {
+        return 0;
+    }
     return cbm_mcp_config_int_clamped(srv, CBM_CONFIG_UPDATE_CHECK_TIMEOUT_S,
                                       CBM_MCP_UPDATE_CHECK_TIMEOUT_S, 0,
                                       CBM_SZ_256);
@@ -6838,7 +6845,7 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     if (strcmp(tool_name, "delete_project") == 0) {
         return handle_delete_project(srv, args_json);
     }
-    if (strcmp(tool_name, "trace_path") == 0) {
+    if (strcmp(tool_name, "trace_path") == 0 || strcmp(tool_name, "trace_call_path") == 0) {
         return handle_trace_path(srv, args_json);
     }
     if (strcmp(tool_name, "get_architecture") == 0) {
@@ -7100,13 +7107,12 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
 
     if (!needs_index) return;
 
-/* Default file limit for auto-indexing new projects */
-#define DEFAULT_AUTO_INDEX_LIMIT 50000
-
-    /* Check auto_index: env var CBM_AUTO_INDEX > config DB > default (true).
-     * Defaults to true so resources have data at startup. */
-    bool auto_index = true;
-    int file_limit = DEFAULT_AUTO_INDEX_LIMIT;
+    /* Check auto_index: env var CBM_AUTO_INDEX > config DB > no-config manual.
+     * Production servers attach a config store before run, so the registry
+     * default remains true there. Embedded/test servers without config stay
+     * manual unless the env var explicitly opts in. */
+    bool auto_index = (srv->config != NULL);
+    int file_limit = CBM_DEFAULT_AUTO_INDEX_LIMIT;
     // NOLINTNEXTLINE(concurrency-mt-unsafe)
     const char *auto_env = getenv("CBM_AUTO_INDEX");
     if (auto_env && auto_env[0]) {
@@ -7116,7 +7122,8 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     }
     if (srv->config) {
         file_limit =
-            cbm_config_get_int(srv->config, CBM_CONFIG_AUTO_INDEX_LIMIT, DEFAULT_AUTO_INDEX_LIMIT);
+            cbm_config_get_int(srv->config, CBM_CONFIG_AUTO_INDEX_LIMIT,
+                               CBM_DEFAULT_AUTO_INDEX_LIMIT);
     }
 
     if (!auto_index) {
