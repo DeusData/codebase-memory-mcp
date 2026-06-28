@@ -68,8 +68,8 @@ TEST(canonical_root_repo_root) {
         FAIL("realpath(tmp) failed");
     }
 #else
-    char expected[MAX_PATH];
-    if (_fullpath(expected, tmp, MAX_PATH) == NULL) {
+    char expected[4096];
+    if (_fullpath(expected, tmp, sizeof(expected)) == NULL) {
         cbm_git_context_free(&ctx);
         th_rmtree(tmp);
         FAIL("_fullpath(tmp) failed");
@@ -119,8 +119,8 @@ TEST(canonical_root_subdir) {
         FAIL("realpath(tmp) failed");
     }
 #else
-    char expected[MAX_PATH];
-    if (_fullpath(expected, tmp, MAX_PATH) == NULL) {
+    char expected[4096];
+    if (_fullpath(expected, tmp, sizeof(expected)) == NULL) {
         cbm_git_context_free(&ctx);
         th_rmtree(tmp);
         FAIL("_fullpath(tmp) failed");
@@ -143,8 +143,7 @@ TEST(canonical_root_subdir) {
 TEST(canonical_root_linked_worktree) {
 #ifdef _WIN32
     SKIP_PLATFORM("git worktree test not implemented for Windows");
-#endif
-
+#else
     /* th_mktempdir() returns a static buffer — copy before the second call. */
     char main_tmp[256];
     char *raw = th_mktempdir("cbm_main");
@@ -209,6 +208,7 @@ TEST(canonical_root_linked_worktree) {
     th_rmtree(main_tmp);
     th_rmtree(wt_tmp);
     PASS();
+#endif /* _WIN32 */
 }
 
 /* ── Suite ──────────────────────────────────────────────────────── */

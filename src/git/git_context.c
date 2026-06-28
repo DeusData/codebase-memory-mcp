@@ -160,8 +160,8 @@ static char *derive_canonical_root(const char *input_path, const char *worktree_
     }
 #else
     {
-        char resolved[MAX_PATH];
-        if (_fullpath(resolved, root, MAX_PATH) != NULL) {
+        char resolved[4096];
+        if (_fullpath(resolved, root, sizeof(resolved)) != NULL) {
             free(root);
             root = git_strdup(resolved);
             if (!root) {
