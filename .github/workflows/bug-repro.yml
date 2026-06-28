@@ -1,0 +1,84 @@
+# Bug-reproduction board — runs the cumulative reproduce-first suite (RED by
+# design, one case per open bug) across every platform on a chosen branch.
+#
+# This is the "test many bug vectors on many platforms at once" harness. It is
+# NON-GATING: dispatch-only, never a required check, so a red board never blocks
+# a merge. Dispatch against a feature branch with:
+#   gh workflow run bug-repro.yml --ref <branch> -f platforms=all
+name: Bug Repro Board
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Which platforms to run the repro board on'
+        type: choice
+        options: ['all', 'linux', 'macos', 'windows']
+        default: 'all'
+  # Iteration convenience: any push to a qa/** branch runs the board straight
+  # from that branch's own copy of this file (no main merge needed). Non-gating.
+  push:
+    # Exclude the dedicated lane branches so they only run their own workflow
+    # (fast-repro / soak / smoke), not the full board too.
+    branches: ['qa/**', '!qa/fast-**', '!qa/soak-**', '!qa/smoke-**']
+
+permissions:
+  contents: read
+
+jobs:
+  repro-unix:
+    if: ${{ github.event_name == 'push' || inputs.platforms == 'all' || inputs.platforms == 'linux' || inputs.platforms == 'macos' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            group: linux
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-24.04-arm
+            group: linux
+            cc: gcc
+            cxx: g++
+          - os: macos-14
+            group: macos
+            cc: cc
+            cxx: c++
+          - os: macos-15-intel
+            group: macos
+            cc: cc
+            cxx: c++
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install deps (Ubuntu)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      - name: Run bug-reproduction board
+        if: ${{ github.event_name == 'push' || inputs.platforms == 'all' || inputs.platforms == matrix.group }}
+        run: scripts/repro.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+
+  repro-windows:
+    if: ${{ github.event_name == 'push' || inputs.platforms == 'all' || inputs.platforms == 'windows' }}
+    runs-on: windows-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-compiler-rt
+            mingw-w64-clang-x86_64-zlib
+            make
+            git
+
+      - name: Run bug-reproduction board
+        shell: msys2 {0}
+        run: scripts/repro.sh CC=clang CXX=clang++

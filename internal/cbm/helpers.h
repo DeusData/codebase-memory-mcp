@@ -50,6 +50,28 @@ const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
 // enclosing-function attribution — drift between private copies caused #438.
 TSNode cbm_resolve_c_declarator_name_node(TSNode func_node);
 
+// Convert a resolved function/method name node to its name string, normalizing a
+// C++ conversion-operator's `operator_cast` node (which spans the full
+// "operator bool() const") down to "operator bool". Shared by the defs and
+// unified extractors so the def name and call-scope QN agree.
+char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source);
+
+// Resolve a function/method definition node's NAME node across all ~130 grammars
+// (generic `name` field, arrow→declarator, C/C++ declarator chain, plus the many
+// per-language quirks: Fortran subroutine, SCSS mixin, SQL create_function, R,
+// PowerShell, Ada, the Lisp/FP family, etc.). Defined in extract_defs.c. Shared by
+// the defs, calls, and unified extractors so all three agree on enclosing-function
+// naming — drift between private copies caused the Module-mis-attribution of
+// gap #3 (and #438 for the C-declarator case).
+TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang);
+
+// C++/CUDA out-of-line method definition (`void Foo::bar() {...}`): return the
+// immediate enclosing class name ("Foo") from the qualified declarator, or NULL
+// for a plain free function. Defined in extract_defs.c. Shared so the unified
+// (call-scope) extractor computes the SAME class-qualified enclosing QN as the
+// def extractor — drift dropped the class qualifier from in-body calls (#554/#621).
+char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *source);
+
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 
@@ -100,6 +122,21 @@ char *cbm_fqn_compute(CBMArena *a, const char *project, const char *rel_path, co
 
 // Module QN (file without name): project.rel_path_parts
 char *cbm_fqn_module(CBMArena *a, const char *project, const char *rel_path);
+
+// Language-aware module QN. For directory-module languages (Java package, Go
+// package) the module is derived from the CONTAINING DIRECTORY (the filename
+// stem is NOT baked in): `Outer.java` at root -> "proj", `myapp/db/conn.go` ->
+// "proj.myapp.db". For every OTHER language this returns exactly what
+// cbm_fqn_module returns (no behavior change).
+char *cbm_fqn_module_source_lang(CBMArena *a, const char *project, const char *rel_path,
+                                 CBMLanguage lang);
+
+// Language-aware symbol QN. For directory-module languages this is the
+// directory-based module + "." + name (so a top-level class `Outer` in
+// `Outer.java` is "proj.Outer", not "proj.Outer.Outer"). For every other
+// language this is exactly cbm_fqn_compute (no behavior change).
+char *cbm_fqn_compute_source_lang(CBMArena *a, const char *project, const char *rel_path,
+                                  const char *name, CBMLanguage lang);
 
 // Folder QN: project.dir_parts
 char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir);

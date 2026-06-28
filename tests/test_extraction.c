@@ -630,7 +630,7 @@ TEST(rust_struct) {
                                CBM_LANG_RUST, "t", "point.rs");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
-    ASSERT(has_def(r, "Class", "Point"));
+    ASSERT(has_def(r, "Struct", "Point"));
     ASSERT(has_def(r, "Method", "new"));
     cbm_free_result(r);
     PASS();
@@ -655,7 +655,7 @@ TEST(go_struct) {
                                CBM_LANG_GO, "t", "server.go");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
-    ASSERT(has_def(r, "Class", "Server"));
+    ASSERT(has_def(r, "Struct", "Server"));
     ASSERT(has_def(r, "Method", "Start"));
     cbm_free_result(r);
     PASS();
@@ -2726,6 +2726,101 @@ TEST(extract_java_method_annotations_issue382) {
     PASS();
 }
 
+/* Find an in-body call by its raw callee text; returns the call or NULL. */
+static const CBMCall *find_call_by_callee(CBMFileResult *r, const char *callee) {
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, callee) == 0) {
+            return &r->calls.items[i];
+        }
+    }
+    return NULL;
+}
+
+/* Reproduce-first: Java module QN must derive from the CONTAINING DIRECTORY, not
+ * the filename stem, so a top-level class `Outer` in `Outer.java` is `t.Outer`,
+ * NOT the doubled `t.Outer.Outer`. The nested method def QN must also equal the
+ * QN the textual calls-enclosing path records for an in-body call (the
+ * lsp_resolve join keys on exact caller_qn == enclosing_func_qn equality). */
+TEST(extract_java_no_double_class_qn) {
+    CBMFileResult *r = extract("class Outer {\n"
+                               "    int helper(int x) { return x + 2; }\n"
+                               "    class Inner {\n"
+                               "        int run(int v) { return helper(v); }\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_JAVA, "t", "Outer.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    /* Module QN is the directory (root) → just the project. */
+    ASSERT_NOT_NULL(r->module_qn);
+    ASSERT_STR_EQ(r->module_qn, "t");
+
+    /* No def QN anywhere may double the top-level class name. */
+    for (int i = 0; i < r->defs.count; i++) {
+        const char *qn = r->defs.items[i].qualified_name;
+        if (qn) {
+            ASSERT_EQ(strstr(qn, "Outer.Outer"), NULL);
+        }
+    }
+
+    /* The nested class and its method carry the single-form QN. */
+    const CBMDefinition *outer = find_def_by_name(r, "Outer");
+    ASSERT_NOT_NULL(outer);
+    ASSERT_STR_EQ(outer->qualified_name, "t.Outer");
+
+    const CBMDefinition *run = find_def_by_name(r, "run");
+    ASSERT_NOT_NULL(run);
+    ASSERT_STR_EQ(run->qualified_name, "t.Outer.Inner.run");
+
+    /* The in-body call to helper() must be attributed to the SAME QN as the
+     * method def — this is the equality the LSP cross-resolution join relies on
+     * for nested classes (the lsp_outer_dispatch repro). */
+    const CBMCall *call = find_call_by_callee(r, "helper");
+    ASSERT_NOT_NULL(call);
+    ASSERT_NOT_NULL(call->enclosing_func_qn);
+    ASSERT_STR_EQ(call->enclosing_func_qn, run->qualified_name);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Reproduce-first: Go module QN must derive from the CONTAINING DIRECTORY
+ * (package), not the filename stem, so a type/method in `myapp/db/conn.go`
+ * belongs to module `proj.myapp.db` and is NOT polluted with the `.conn.`
+ * filename segment. */
+TEST(extract_go_no_filename_in_module_qn) {
+    CBMFileResult *r = extract("package db\n\n"
+                               "type Conn struct{}\n\n"
+                               "func (c *Conn) Query() {}\n",
+                               CBM_LANG_GO, "proj", "myapp/db/conn.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    /* Module is the directory `myapp/db`, NOT `myapp/db/conn`. */
+    ASSERT_NOT_NULL(r->module_qn);
+    ASSERT_STR_EQ(r->module_qn, "proj.myapp.db");
+
+    /* The type and method QNs must not contain the filename segment `.conn.`. */
+    const CBMDefinition *conn = find_def_by_name(r, "Conn");
+    ASSERT_NOT_NULL(conn);
+    ASSERT_STR_EQ(conn->qualified_name, "proj.myapp.db.Conn");
+
+    /* Go method nodes keep a FLAT QN (module + name) with a separate
+     * parent_class link to the receiver type — the QN must carry the
+     * directory-based module and NOT the `.conn.` filename segment. */
+    const CBMDefinition *query = find_def_by_name(r, "Query");
+    ASSERT_NOT_NULL(query);
+    ASSERT_STR_EQ(query->qualified_name, "proj.myapp.db.Query");
+    ASSERT_EQ(strstr(query->qualified_name, ".conn."), NULL);
+    /* The method's parent_class must match the type node QN (for DEFINES_METHOD). */
+    ASSERT_NOT_NULL(query->parent_class);
+    ASSERT_STR_EQ(query->parent_class, "proj.myapp.db.Conn");
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #213: large TS files were indexed as a File node with zero children. */
 TEST(extract_large_ts_has_functions_issue213) {
     enum { NFUNCS = 4000 };
@@ -3247,6 +3342,8 @@ SUITE(extraction) {
     RUN_TEST(js_index_module_qn_not_collide_with_folder);
     RUN_TEST(python_regular_module_qn_unchanged);
     RUN_TEST(extract_java_method_annotations_issue382);
+    RUN_TEST(extract_java_no_double_class_qn);
+    RUN_TEST(extract_go_no_filename_in_module_qn);
     RUN_TEST(extract_large_ts_has_functions_issue213);
 
     /* Per-function complexity metrics (Tier A) */

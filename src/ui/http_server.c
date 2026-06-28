@@ -408,6 +408,12 @@ static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
             snprintf(path, sizeof(path), "/");
     }
 
+    /* The browser UI may send Windows backslash separators (e.g.
+     * "D:\projects\demo"). Normalize to forward slashes before the cbm_is_dir
+     * gate, exactly as the MCP repo_path handler and cbm_project_name_from_path
+     * already do — otherwise a real D:/ directory is rejected (#548). */
+    cbm_normalize_path_sep(path);
+
     if (!cbm_is_dir(path)) {
         cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"not a directory\"}");
         return;
@@ -459,10 +465,18 @@ static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     char parent[1024];
     snprintf(parent, sizeof(parent), "%s", path);
     char *last_slash = strrchr(parent, '/');
-    if (last_slash && last_slash != parent)
+    /* A Windows drive root "X:/" is its own parent (like POSIX "/"): truncating
+     * at the slash would yield the bare drive spec "X:", which the next browse
+     * resolves to the wrong directory and strands the user at the root (#548). */
+    size_t parent_len = strlen(parent);
+    bool is_drive_root = parent_len == 3 && parent[1] == ':' && parent[2] == '/';
+    if (is_drive_root) {
+        /* leave "X:/" unchanged */
+    } else if (last_slash && last_slash != parent) {
         *last_slash = '\0';
-    else
+    } else {
         snprintf(parent, sizeof(parent), "/");
+    }
 
     {
         char esc_parent[2048];

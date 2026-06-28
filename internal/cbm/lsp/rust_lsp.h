@@ -283,6 +283,19 @@ void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char **import_names, const char **import_qns, int import_count,
                             TSTree *cached_tree, CBMResolvedCallArray *out);
 
+/* Same as `cbm_run_rust_lsp_cross`, plus an optional parsed Cargo manifest
+ * (NULL = manifest-free behaviour). The manifest lets call paths whose head
+ * is a workspace member / declared dependency route across the crate
+ * boundary (`crate_a::foo` → the def inside crate_a). Wired from the
+ * cross-file LSP pass (pass_lsp_cross.c) which builds the manifest once from
+ * the project root Cargo.toml. */
+void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, int source_len,
+                                          const char *module_qn, CBMRustLSPDef *defs, int def_count,
+                                          const char **import_names, const char **import_qns,
+                                          int import_count, TSTree *cached_tree,
+                                          const struct CBMCargoManifest *manifest,
+                                          CBMResolvedCallArray *out);
+
 /* Per-file input for batch cross-file Rust LSP processing. */
 typedef struct {
     const char *source;

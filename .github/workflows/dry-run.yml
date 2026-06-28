@@ -50,6 +50,7 @@ jobs:
     uses: ./.github/workflows/_test.yml
     with:
       skip_perf: true
+      broad_platforms: true
 
   # ── Build all platforms ────────────────────────────────────────
   build:
@@ -65,6 +66,8 @@ jobs:
     if: ${{ inputs.skip_builds != true && !cancelled() && needs.build.result != 'failure' && needs.build.result != 'skipped' }}
     needs: [build]
     uses: ./.github/workflows/_smoke.yml
+    with:
+      broad_platforms: true
 
   # ── Soak tests (optional, parallel with smoke) ────────────────
   soak:

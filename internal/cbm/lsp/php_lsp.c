@@ -1235,8 +1235,8 @@ static const CBMType *eval_member_call_type(PHPLSPContext *ctx, TSNode call_node
 
 /* ── emit ───────────────────────────────────────────────────────── */
 
-static void emit_resolved(PHPLSPContext *ctx, const char *callee_qn, const char *strategy,
-                          float confidence) {
+static void emit_resolved_reason(PHPLSPContext *ctx, const char *callee_qn, const char *strategy,
+                                 float confidence, const char *reason) {
     if (!ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn)
         return;
     CBMResolvedCall rc;
@@ -1244,8 +1244,13 @@ static void emit_resolved(PHPLSPContext *ctx, const char *callee_qn, const char 
     rc.callee_qn = callee_qn;
     rc.strategy = strategy;
     rc.confidence = confidence;
-    rc.reason = NULL;
+    rc.reason = reason;
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+}
+
+static void emit_resolved(PHPLSPContext *ctx, const char *callee_qn, const char *strategy,
+                          float confidence) {
+    emit_resolved_reason(ctx, callee_qn, strategy, confidence, NULL);
 }
 
 static void emit_unresolved(PHPLSPContext *ctx, const char *expr_text, const char *reason) {
@@ -1524,10 +1529,14 @@ static void resolve_member_call(PHPLSPContext *ctx, TSNode call) {
         emit_resolved(ctx, f->qualified_name, strategy, 0.95f);
         return;
     }
-    /* Receiver known but method missing — magic __call? */
+    /* Receiver known but method missing — magic __call? The call dispatches to
+     * the class's __call handler, so resolve to <class>.__call (a real node).
+     * The textual callee is the dynamic method name (`anything`), not `__call`,
+     * so stash it in reason for the join (lsp_resolve.h, php_method_dynamic).
+     * Emit above the join's confidence floor — dispatch to __call is certain. */
     if (class_has_magic_call(ctx, class_qn, false)) {
-        emit_resolved(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, method_name),
-                      "php_method_dynamic", 0.20f);
+        emit_resolved_reason(ctx, cbm_arena_sprintf(ctx->arena, "%s.__call", class_qn),
+                             "php_method_dynamic", 0.85f, method_name);
         return;
     }
     /* Receiver known but class not in registry (e.g. vendor type not indexed,

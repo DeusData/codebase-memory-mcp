@@ -1,0 +1,124 @@
+# Smoke invariants — "the shipped binary does not fail" — across the WIDEST set of
+# GitHub-hosted runners. Builds the prod binary and runs scripts/smoke-invariants.sh
+# (version/help, MCP initialize handshake [#513], all 14 tools invocable, malformed-
+# input resilience, clean EOF exit, shared-lib resolution, install dry-run).
+#
+# Maximizing platforms is the point: ubuntu-22.04 (older glibc → AlmaLinux/#182
+# class), all arm64 variants + windows-11-arm (arch portability), multiple macOS
+# and Windows versions. A FAIL on any platform is a binary users would receive.
+#
+# NON-GATING: workflow_dispatch + push to qa/smoke-** only (the full ~10-platform
+# build is heavy, so it is opt-in rather than on every qa push).
+name: Smoke (all platforms)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['qa/smoke-**']
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Unix: linux amd64+arm64 (incl. older glibc 22.04), darwin arm64+amd64 ──
+  smoke-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04        # older glibc — AlmaLinux/#182 portability class
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-24.04
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-22.04-arm
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-24.04-arm
+            cc: gcc
+            cxx: g++
+          - os: macos-14            # arm64
+            cc: cc
+            cxx: c++
+          - os: macos-15            # arm64
+            cc: cc
+            cxx: c++
+          - os: macos-15-intel      # x86_64
+            cc: cc
+            cxx: c++
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install deps (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 git
+      - name: Build (prod binary)
+        run: scripts/build.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+      - name: Smoke invariants
+        run: |
+          chmod +x scripts/smoke-invariants.sh
+          scripts/smoke-invariants.sh build/c/codebase-memory-mcp
+
+  # ── Windows x64: 2022 + 2025 (msys2 CLANG64) ──────────────────────────────
+  smoke-windows-x64:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-python3
+            make
+            git
+            coreutils
+      - name: Build (prod binary)
+        shell: msys2 {0}
+        run: scripts/build.sh CC=clang CXX=clang++
+      - name: Smoke invariants
+        shell: msys2 {0}
+        run: |
+          chmod +x scripts/smoke-invariants.sh
+          BIN=build/c/codebase-memory-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          scripts/smoke-invariants.sh "$BIN"
+
+  # ── Windows arm64: windows-11-arm (msys2 CLANGARM64) — experimental ───────
+  # Best-effort: surfaces whether our binary builds + smokes on Windows on ARM.
+  smoke-windows-arm:
+    runs-on: windows-11-arm
+    timeout-minutes: 240
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: CLANGARM64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-aarch64-clang
+            mingw-w64-clang-aarch64-zlib
+            mingw-w64-clang-aarch64-python3
+            make
+            git
+            coreutils
+      - name: Build (prod binary)
+        shell: msys2 {0}
+        run: scripts/build.sh CC=clang CXX=clang++
+      - name: Smoke invariants
+        shell: msys2 {0}
+        run: |
+          chmod +x scripts/smoke-invariants.sh
+          BIN=build/c/codebase-memory-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          scripts/smoke-invariants.sh "$BIN"

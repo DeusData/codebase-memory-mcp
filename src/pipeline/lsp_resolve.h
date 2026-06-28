@@ -35,6 +35,35 @@
  * (Go, C/C++, Python, PHP). */
 #define CBM_LSP_CONFIDENCE_FLOOR 0.6f
 
+/* Bare last segment of a (possibly qualified) name, splitting on the LAST
+ * member/scope separator. C++ textual callees carry `::` (Class::method,
+ * Ns::f) and `->` (p->run), while the LSP records dotted internal QNs
+ * (Class.method). Splitting only on '.' (strrchr) leaves `Math::square`
+ * and `p->run` intact, so they never match the LSP's `square`/`run` short
+ * name and the type-aware strategy is silently dropped to the textual
+ * registry. Treat '.', ':' and '>' as terminal separators so the bare
+ * method name is recovered on BOTH the QN side (dotted, occasionally `::`
+ * for template/alias scopes) and the textual side (`.`/`::`/`->`). Other
+ * languages' callee names contain none of `::`/`->`, so this is a no-op
+ * for them. */
+static inline const char *cbm_lsp_bare_segment(const char *name) {
+    if (!name) {
+        return name;
+    }
+    const char *seg = name;
+    for (const char *p = name; *p; p++) {
+        /* '.' (dotted QN / Java-style member) and ':' (C++ `::`, last colon
+         * wins) are member/scope separators. '>' is only a separator when it
+         * closes the `->` arrow (preceded by '-'); a bare '>' closes a template
+         * argument list ("identity<int>") and must NOT split, else the segment
+         * would be the empty string after the trailing '>'. */
+        if (*p == '.' || *p == ':' || (*p == '>' && p != name && p[-1] == '-')) {
+            seg = p + SKIP_ONE;
+        }
+    }
+    return seg;
+}
+
 /* Look up the highest-confidence LSP-resolved call entry whose caller QN
  * matches the textual call's enclosing function and whose callee QN
  * short-name matches the textual callee. Returns a pointer into `arr`
@@ -65,10 +94,35 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
         if (strcmp(rc->caller_qn, call->enclosing_func_qn) != 0) {
             continue;
         }
-        const char *short_name = strrchr(rc->callee_qn, '.');
-        short_name = short_name ? short_name + SKIP_ONE : rc->callee_qn;
-        if (strcmp(short_name, call->callee_name) != 0) {
-            continue;
+        const char *short_name = cbm_lsp_bare_segment(rc->callee_qn);
+        /* The call's callee_name is receiver-qualified for method/qualified
+         * calls ("c.inc", "A.Helper", "Math::square", "p->run"); the LSP
+         * records the resolved class-qualified callee_qn ("Class.inc"). Compare
+         * the bare last segment on BOTH sides so method-dispatch resolutions
+         * join — the LSP already did the receiver->type resolution, and matching
+         * the full "c.inc" against "inc" would always miss, silently dropping the
+         * type-aware LSP strategy to the weaker textual registry. Free-function
+         * calls (bare callee_name) are unaffected. */
+        const char *call_short = cbm_lsp_bare_segment(call->callee_name);
+        if (strcmp(short_name, call_short) != 0) {
+            /* Indirect/implicit resolution: the textual callee differs from the
+             * resolved callee_qn's short name. A function-pointer / DLL call's
+             * callee is the pointer name (`fp`); a C++ destructor's only textual
+             * anchor is the deleted operand (`p`, vs. the `T.~T` callee QN). In
+             * both the LSP stashed the original textual name in `reason`. Match
+             * the call site on that name, gated to those strategies so `reason`
+             * is never misread as an unresolved-call diagnostic. */
+            if (!(rc->reason && rc->strategy &&
+                  (strcmp(rc->strategy, "lsp_func_ptr") == 0 ||
+                   strcmp(rc->strategy, "lsp_dll_resolve") == 0 ||
+                   strcmp(rc->strategy, "lsp_method_ref_ctor") == 0 ||
+                   strcmp(rc->strategy, "lsp_method_ref_ctor_synth") == 0 ||
+                   strcmp(rc->strategy, "lsp_dict_dispatch") == 0 ||
+                   strcmp(rc->strategy, "lsp_destructor") == 0 ||
+                   strcmp(rc->strategy, "php_method_dynamic") == 0) &&
+                  strcmp(cbm_lsp_bare_segment(rc->reason), call_short) == 0)) {
+                continue;
+            }
         }
         if (!best || rc->confidence > best->confidence) {
             best = rc;

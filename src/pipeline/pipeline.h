@@ -100,6 +100,12 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
 /* Module QN: project.dir.parts (no name). Caller must free(). */
 char *cbm_pipeline_fqn_module(const char *project, const char *rel_path);
 
+/* Language-aware module QN. When `module_is_dir` is true (Java/Go package
+ * semantics) the module is derived from the CONTAINING DIRECTORY (the filename
+ * stem is dropped), so it agrees with the extraction-side def QNs; when false
+ * it is exactly cbm_pipeline_fqn_module(). Caller must free(). */
+char *cbm_pipeline_fqn_module_dir(const char *project, const char *rel_path, bool module_is_dir);
+
 /* Folder QN: project.dir.parts. Caller must free(). */
 char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir);
 

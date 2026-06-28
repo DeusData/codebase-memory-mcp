@@ -22,6 +22,8 @@
 #include "lsp/php_lsp.h"
 #include "lsp/java_lsp.h"
 #include "lsp/kotlin_lsp.h"
+#include "lsp/rust_lsp.h"
+#include "lsp/rust_cargo.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
@@ -51,6 +53,15 @@ static const char *itoa_buf(int val) {
 }
 
 /* ── Local helpers ─────────────────────────────────────────────── */
+
+/* True for languages whose module QN is derived from the CONTAINING DIRECTORY
+ * (Java package, Go package) rather than the filename stem. MUST match the
+ * extraction-side cbm_lang_module_is_dir() in internal/cbm/helpers.c so the
+ * cross-file LSP caller_qn agrees with the def-node QN (the lsp_resolve join
+ * keys on exact equality). */
+static bool pxc_module_is_dir(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
+}
 
 /* Slurp a file into a malloc'd, NUL-terminated buffer. Mirrors the
  * read_file helper in pass_calls.c / pass_parallel.c (kept local so the
@@ -82,16 +93,16 @@ static char *pxc_read_file(const char *path, int *out_len) {
     return buf;
 }
 
-/* Map a CBMDefinition.label to a CBMLSPDef.label. Per-language LSP
- * registrars only care about Class/Interface/Trait/Enum/Type/Protocol/
- * Function/Method — variables, modules, decorators, etc. are skipped. */
+/* Map a CBMDefinition.label to a CBMLSPDef.label. Per-language LSP registrars
+ * only care about type-like containers (Class/Struct/Interface/Trait/Enum/Type)
+ * plus Protocol/Function/Method — variables, modules, decorators, etc. are
+ * skipped. Struct passes through so Rust/Go struct type-registration via the
+ * cross-file LSP path is not dropped. */
 static const char *pxc_map_label(const char *label) {
     if (!label)
         return NULL;
-    if (strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
-        strcmp(label, "Trait") == 0 || strcmp(label, "Enum") == 0 || strcmp(label, "Type") == 0 ||
-        strcmp(label, "Protocol") == 0 || strcmp(label, "Function") == 0 ||
-        strcmp(label, "Method") == 0) {
+    if (cbm_label_is_type_like(label) || strcmp(label, "Protocol") == 0 ||
+        strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0) {
         return label;
     }
     return NULL;
@@ -176,7 +187,8 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
         if (!cache[fi])
             continue;
         if (!def_modules[fi]) {
-            def_modules[fi] = cbm_pipeline_fqn_module(project_name, files[fi].rel_path);
+            def_modules[fi] = cbm_pipeline_fqn_module_dir(project_name, files[fi].rel_path,
+                                                          pxc_module_is_dir(files[fi].language));
         }
         for (int di = 0; di < cache[fi]->defs.count; di++) {
             if (pxc_build_lsp_def(&cache[fi]->arena, &cache[fi]->defs.items[di], def_modules[fi],
@@ -292,6 +304,7 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang) {
     case CBM_LANG_CSHARP: /* tier-2 prebuilt registry path (pass_parallel.c) */
     case CBM_LANG_JAVA:   /* fallback cbm_pxc_run_one path */
     case CBM_LANG_KOTLIN: /* fallback cbm_pxc_run_one path */
+    case CBM_LANG_RUST:   /* fallback cbm_pxc_run_one path (manifest-aware) */
         return true;
     default:
         return false;
@@ -352,6 +365,54 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
     cbm_arena_destroy(&keys);
 }
 
+/* ── Rust workspace manifest (Cargo.toml) for cross-CRATE resolution ──
+ *
+ * cbm_pxc_run_one's signature is shared with the parallel pass
+ * (pass_parallel.c) and cannot grow a manifest parameter without touching
+ * that file. We therefore pass the parsed workspace manifest to the Rust
+ * cross-file resolver through a file-static borrowed pointer that the
+ * sequential driver (cbm_pipeline_pass_lsp_cross, below) sets up once per
+ * pass run from the project's root Cargo.toml. The manifest's strings are
+ * owned by `g_pxc_rust_manifest_arena`; the pointer is borrowed (NULL when
+ * the project has no Cargo.toml — single-crate / non-workspace projects,
+ * where in-file resolution needs no workspace metadata). */
+static _Thread_local const CBMCargoManifest *g_pxc_rust_manifest = NULL;
+
+void cbm_pxc_set_rust_manifest(const CBMCargoManifest *m) {
+    g_pxc_rust_manifest = m;
+}
+
+/* Convert a CBMLSPDef array (the pipeline's lingua franca, go_lsp.h:73)
+ * into a CBMRustLSPDef array (rust_lsp.h) inside `arena`. The two structs
+ * share their first 9 string fields; CBMRustLSPDef adds `trait_qn` before
+ * `is_interface` whereas CBMLSPDef has `is_interface` followed by `lang`,
+ * so a memcpy is unsafe — copy field-by-field. trait_qn is left NULL
+ * because the pipeline's collect-all-defs step does not carry the
+ * impl-Trait-for-Type linkage; the resolver still recovers trait dispatch
+ * from the in-file walk (the cross-file path only needs receiver_type). */
+static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs, int def_count) {
+    if (!defs || def_count <= 0)
+        return NULL;
+    CBMRustLSPDef *out =
+        (CBMRustLSPDef *)cbm_arena_alloc(arena, (size_t)def_count * sizeof(CBMRustLSPDef));
+    if (!out)
+        return NULL;
+    for (int i = 0; i < def_count; i++) {
+        out[i].qualified_name = defs[i].qualified_name;
+        out[i].short_name = defs[i].short_name;
+        out[i].label = defs[i].label;
+        out[i].receiver_type = defs[i].receiver_type;
+        out[i].def_module_qn = defs[i].def_module_qn;
+        out[i].return_types = defs[i].return_types;
+        out[i].embedded_types = defs[i].embedded_types;
+        out[i].field_defs = defs[i].field_defs;
+        out[i].method_names_str = defs[i].method_names_str;
+        out[i].trait_qn = NULL;
+        out[i].is_interface = defs[i].is_interface;
+    }
+    return out;
+}
+
 /* Run cross-file LSP for a single file inside a scratch arena that gets
  * freed when the call returns. The LSP would otherwise allocate a fresh
  * type registry + stdlib + all project defs into the supplied arena, and
@@ -402,6 +463,18 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
         cbm_run_kotlin_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count,
                                  imp_names, imp_qns, imp_count, tree, &out);
         break;
+    case CBM_LANG_RUST: {
+        /* The Rust resolver wants CBMRustLSPDef (rust_lsp.h), not the
+         * pipeline's CBMLSPDef — the structs share their first 9 fields
+         * but diverge after, so convert into the scratch arena. The
+         * workspace manifest (set once by the sequential driver) lets
+         * `crate_a::foo` route across the crate boundary (#56). */
+        CBMRustLSPDef *rdefs = pxc_lspdefs_to_rust(&scratch, defs, def_count);
+        cbm_run_rust_lsp_cross_with_manifest(&scratch, source, source_len, module_qn, rdefs,
+                                             def_count, imp_names, imp_qns, imp_count, tree,
+                                             g_pxc_rust_manifest, &out);
+        break;
+    }
     default:
         break;
     }
@@ -428,12 +501,58 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
     cbm_arena_destroy(&scratch);
 }
 
+/* Parse the project's root Cargo.toml (if present) into `out_m`, using
+ * `marena` for the manifest's owned strings. Returns true when a manifest
+ * was parsed (a workspace root or any [package]/[dependencies]); false when
+ * there is no readable Cargo.toml, leaving *out_m untouched. The resulting
+ * manifest feeds cross-CRATE Rust resolution (#56): its [workspace].members
+ * map lets `crate_a::foo` route to the member crate's def. */
+static bool pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena,
+                                    CBMCargoManifest *out_m) {
+    if (!ctx || !ctx->repo_path || !marena || !out_m)
+        return false;
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/Cargo.toml", ctx->repo_path);
+    if (n <= 0 || (size_t)n >= sizeof(path))
+        return false;
+    int toml_len = 0;
+    char *toml = pxc_read_file(path, &toml_len);
+    if (!toml || toml_len <= 0) {
+        free(toml);
+        return false;
+    }
+    memset(out_m, 0, sizeof(*out_m));
+    cbm_cargo_parse(marena, toml, toml_len, out_m);
+    free(toml); /* cargo parser copies into marena */
+    return true;
+}
+
 int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                 int file_count, CBMFileResult **cache) {
     if (!ctx || !files || file_count <= 0 || !cache)
         return 0;
 
     cbm_log_info("pass.start", "pass", "lsp_cross", "files", itoa_buf(file_count));
+
+    /* Build the Rust workspace manifest once (only when the project has at
+     * least one Rust file, to avoid an unconditional Cargo.toml read).
+     * The manifest's strings live in `cargo_arena`; the resolver borrows
+     * the pointer through the file-static set below. */
+    bool have_rust = false;
+    for (int i = 0; i < file_count; i++) {
+        if (cache[i] && files[i].language == CBM_LANG_RUST) {
+            have_rust = true;
+            break;
+        }
+    }
+    CBMArena cargo_arena;
+    CBMCargoManifest cargo_manifest;
+    bool have_manifest = false;
+    if (have_rust) {
+        cbm_arena_init(&cargo_arena);
+        have_manifest = pxc_build_rust_manifest(ctx, &cargo_arena, &cargo_manifest);
+        cbm_pxc_set_rust_manifest(have_manifest ? &cargo_manifest : NULL);
+    }
 
     /* Per-file module QN cache so we don't recompute it once per def + once
      * per call. cbm_pipeline_fqn_module mallocs; freed at end. */
@@ -470,7 +589,8 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         }
 
         if (!def_modules[i]) {
-            def_modules[i] = cbm_pipeline_fqn_module(ctx->project_name, files[i].rel_path);
+            def_modules[i] = cbm_pipeline_fqn_module_dir(ctx->project_name, files[i].rel_path,
+                                                         pxc_module_is_dir(files[i].language));
         }
 
         const char **imp_keys = NULL;
@@ -499,6 +619,14 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     for (int i = 0; i < file_count; i++)
         free(def_modules[i]);
     free(def_modules);
+
+    /* Drop the borrowed manifest pointer before its arena dies, so a later
+     * pass (or a stale thread-local) can never read freed manifest memory. */
+    if (have_rust) {
+        cbm_pxc_set_rust_manifest(NULL);
+        cbm_arena_destroy(&cargo_arena);
+    }
+    (void)have_manifest;
 
     cbm_log_info("pass.done", "pass", "lsp_cross", "files_processed", itoa_buf(processed),
                  "files_skipped_no_lsp", itoa_buf(skipped_no_lsp), "files_skipped_no_source",

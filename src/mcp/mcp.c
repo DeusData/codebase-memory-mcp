@@ -793,14 +793,21 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     project_db_path(project, path, sizeof(path));
     srv->store = cbm_store_open_path_query(path);
     if (srv->store) {
-        /* Check DB integrity — auto-clean corrupt databases */
+        /* Check DB integrity — back up (never silently delete) a corrupt DB */
         if (!cbm_store_check_integrity(srv->store)) {
             cbm_log_error("store.auto_clean", "project", project, "path", path, "action",
-                          "deleting corrupt db — re-index required");
+                          "backing up corrupt db to .corrupt — re-index required");
             cbm_store_close(srv->store);
             srv->store = NULL;
-            /* Delete the corrupt DB + WAL/SHM files */
-            cbm_unlink(path);
+            /* #557 (data loss): rename the corrupt DB to a .corrupt backup instead
+             * of unlinking it, so the user's graph is recoverable / reportable.
+             * Re-index rebuilds a fresh DB at `path`. WAL/SHM are transient. */
+            char bak_path[MCP_FIELD_SIZE];
+            snprintf(bak_path, sizeof(bak_path), "%s.corrupt", path);
+            cbm_unlink(bak_path); /* clear any prior backup so rename succeeds on Windows */
+            if (rename(path, bak_path) != 0) {
+                cbm_unlink(path); /* rename failed (e.g. cross-device) — fall back to delete */
+            }
             char wal_path[MCP_FIELD_SIZE];
             char shm_path[MCP_FIELD_SIZE];
             snprintf(wal_path, sizeof(wal_path), "%s-wal", path);
@@ -2280,8 +2287,52 @@ static bool is_test_file(const char *path) {
 }
 
 /* Convert BFS traversal results into a yyjson_mut array. */
+/* Find the CALLS-edge "args" JSON (the serialized arg expressions) on the edge
+ * that leads to the given hop node, so data_flow mode can surface argument
+ * expressions (#514). Returns the borrowed substring "[...]" inside the edge's
+ * properties_json, with its length, or NULL when no args are recorded. */
+static const char *bfs_edge_args_for_hop(cbm_traverse_result_t *tr, int64_t hop_node_id,
+                                         size_t *out_len) {
+    for (int e = 0; e < tr->edge_count; e++) {
+        /* The hop node is the edge endpoint reached from the root side: for an
+         * outbound trace it is the target, for inbound it is the source. Match
+         * on either so both directions surface their args. */
+        if (tr->edges[e].target_id != hop_node_id && tr->edges[e].source_id != hop_node_id) {
+            continue;
+        }
+        const char *pj = tr->edges[e].properties_json;
+        if (!pj) {
+            continue;
+        }
+        const char *args = strstr(pj, "\"args\"");
+        if (!args) {
+            continue;
+        }
+        const char *open = strchr(args, '[');
+        if (!open) {
+            continue;
+        }
+        int depth = 0;
+        const char *p = open;
+        for (; *p; p++) {
+            if (*p == '[') {
+                depth++;
+            } else if (*p == ']') {
+                depth--;
+                if (depth == 0) {
+                    p++;
+                    break;
+                }
+            }
+        }
+        *out_len = (size_t)(p - open);
+        return open;
+    }
+    return NULL;
+}
+
 static yyjson_mut_val *bfs_to_json_array(yyjson_mut_doc *doc, cbm_traverse_result_t *tr,
-                                         bool risk_labels, bool include_tests) {
+                                         bool risk_labels, bool include_tests, bool data_flow) {
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
     for (int i = 0; i < tr->visited_count; i++) {
         const char *fp = tr->visited[i].node.file_path;
@@ -2302,6 +2353,18 @@ static yyjson_mut_val *bfs_to_json_array(yyjson_mut_doc *doc, cbm_traverse_resul
         }
         if (test) {
             yyjson_mut_obj_add_bool(doc, item, "is_test", true);
+        }
+        /* data_flow mode promises argument expressions at each call site; surface
+         * the CALLS edge's serialized args array as a raw JSON value (#514). */
+        if (data_flow) {
+            size_t alen = 0;
+            const char *args = bfs_edge_args_for_hop(tr, tr->visited[i].node.id, &alen);
+            if (args && alen > 0) {
+                yyjson_mut_val *av = yyjson_mut_rawn(doc, args, alen);
+                if (av) {
+                    yyjson_mut_obj_add_val(doc, item, "args", av);
+                }
+            }
         }
         yyjson_mut_arr_add_val(arr, item);
     }
@@ -2366,6 +2429,52 @@ static int pick_resolved_node(const cbm_node_t *nodes, int count, bool *ambiguou
         *ambiguous = true;
     }
     return best;
+}
+
+/* BFS from EVERY node sharing the resolved name and merge the results, so the
+ * caller/callee set is complete even when one logical symbol is represented by
+ * more than one graph node — e.g. a real .ts implementation plus an ambient
+ * .d.ts stub, whose inbound CALLS edges are otherwise split across the two
+ * nodes and silently truncated by tracing only one (#546). visited hops are
+ * deduped by node id; edges are concatenated. Ownership of all heap fields
+ * transfers into *out, freed by cbm_store_traverse_free. */
+static void bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int node_count,
+                                const char *direction, const char **edge_types, int edge_type_count,
+                                int depth, cbm_traverse_result_t *out) {
+    memset(out, 0, sizeof(*out));
+    int vcap = 0, ecap = 0;
+    for (int k = 0; k < node_count; k++) {
+        cbm_traverse_result_t tr = {0};
+        cbm_store_bfs(store, nodes[k].id, direction, edge_types, edge_type_count, depth,
+                      MCP_BFS_LIMIT, &tr);
+        for (int i = 0; i < tr.visited_count; i++) {
+            bool dup = false;
+            for (int j = 0; j < out->visited_count; j++) {
+                if (out->visited[j].node.id == tr.visited[i].node.id) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                continue;
+            }
+            if (out->visited_count >= vcap) {
+                vcap = vcap ? vcap * 2 : 8;
+                out->visited = safe_realloc(out->visited, vcap * sizeof(cbm_node_hop_t));
+            }
+            out->visited[out->visited_count++] = tr.visited[i];
+            memset(&tr.visited[i], 0, sizeof(tr.visited[i])); /* ownership moved */
+        }
+        for (int i = 0; i < tr.edge_count; i++) {
+            if (out->edge_count >= ecap) {
+                ecap = ecap ? ecap * 2 : 8;
+                out->edges = safe_realloc(out->edges, ecap * sizeof(cbm_edge_info_t));
+            }
+            out->edges[out->edge_count++] = tr.edges[i];
+            memset(&tr.edges[i], 0, sizeof(tr.edges[i])); /* ownership moved */
+        }
+        cbm_store_traverse_free(&tr); /* frees only the un-moved (root + dup) fields */
+    }
 }
 
 static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
@@ -2492,18 +2601,24 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     cbm_traverse_result_t tr_out = {0};
     cbm_traverse_result_t tr_in = {0};
 
+    bool data_flow = mode && strcmp(mode, "data_flow") == 0;
+
+    (void)sel; /* union across all same-name nodes — see bfs_union_same_name (#546) */
+
     if (do_outbound) {
-        cbm_store_bfs(store, nodes[sel].id, "outbound", edge_types, edge_type_count, depth,
-                      MCP_BFS_LIMIT, &tr_out);
-        yyjson_mut_obj_add_val(doc, root, "callees",
-                               bfs_to_json_array(doc, &tr_out, risk_labels, include_tests));
+        bfs_union_same_name(store, nodes, node_count, "outbound", edge_types, edge_type_count,
+                            depth, &tr_out);
+        yyjson_mut_obj_add_val(
+            doc, root, "callees",
+            bfs_to_json_array(doc, &tr_out, risk_labels, include_tests, data_flow));
     }
 
     if (do_inbound) {
-        cbm_store_bfs(store, nodes[sel].id, "inbound", edge_types, edge_type_count, depth,
-                      MCP_BFS_LIMIT, &tr_in);
-        yyjson_mut_obj_add_val(doc, root, "callers",
-                               bfs_to_json_array(doc, &tr_in, risk_labels, include_tests));
+        bfs_union_same_name(store, nodes, node_count, "inbound", edge_types, edge_type_count, depth,
+                            &tr_in);
+        yyjson_mut_obj_add_val(
+            doc, root, "callers",
+            bfs_to_json_array(doc, &tr_in, risk_labels, include_tests, data_flow));
     }
 
     /* Serialize BEFORE freeing traversal results (yyjson borrows strings) */
@@ -4238,18 +4353,30 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("project path contains invalid characters", true);
     }
 
-    /* Get changed files via git (-C avoids cd + quoting issues on Windows) */
+    /* Get changed files via git (-C avoids cd + quoting issues on Windows).
+     * Three sources are merged:
+     *   1. committed changes vs base   (diff <base>...HEAD)
+     *   2. unstaged tracked changes    (diff)
+     *   3. untracked + staged-new files (status --porcelain) — these are
+     *      invisible to `git diff` and were silently missed before, so a
+     *      brand-new file never appeared until a manual re-index (#520).
+     * status --porcelain prefixes each path with a 2-char code + space
+     * ("?? path", "A  path"); the prefix is stripped when parsing below. */
     char cmd[CBM_SZ_2K];
 #ifdef _WIN32
     snprintf(cmd, sizeof(cmd),
              "git -C \"%s\" diff --name-only \"%s\"...HEAD 2>NUL & "
-             "git -C \"%s\" diff --name-only 2>NUL",
-             root_path, base_branch, root_path);
+             "git -C \"%s\" diff --name-only 2>NUL & "
+             "git --no-optional-locks -C \"%s\" status --porcelain "
+             "--untracked-files=normal 2>NUL",
+             root_path, base_branch, root_path, root_path);
 #else
     snprintf(cmd, sizeof(cmd),
              "{ git -C '%s' diff --name-only '%s'...HEAD 2>/dev/null; "
-             "git -C '%s' diff --name-only 2>/dev/null; } | sort -u",
-             root_path, base_branch, root_path);
+             "git -C '%s' diff --name-only 2>/dev/null; "
+             "git --no-optional-locks -C '%s' status --porcelain "
+             "--untracked-files=normal 2>/dev/null; } | sort -u",
+             root_path, base_branch, root_path, root_path);
 #endif
 
     FILE *fp = cbm_popen(cmd, "r");
@@ -4287,11 +4414,30 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
             continue;
         }
 
-        yyjson_mut_arr_add_strcpy(doc, changed, line);
+        /* `git status --porcelain` prefixes each path with a two-character
+         * status code and a space ("?? path", "A  path", " M path"). The two
+         * `git diff --name-only` sources emit bare paths. Strip the porcelain
+         * prefix when present so all three sources yield clean paths; for a
+         * rename ("R  old -> new") keep the post-arrow destination path. */
+        char *path_line = line;
+        if (len > PAIR_LEN && line[PAIR_LEN] == ' ' && strchr(" MADRCU?!", line[0]) &&
+            strchr(" MADRCU?!", line[1])) {
+            path_line = line + PAIR_LEN + SKIP_ONE;
+            char *arrow = strstr(path_line, " -> ");
+            if (arrow) {
+                enum { ARROW_LEN = 4 }; /* length of " -> " */
+                path_line = arrow + ARROW_LEN;
+            }
+        }
+        if (path_line[0] == '\0') {
+            continue;
+        }
+
+        yyjson_mut_arr_add_strcpy(doc, changed, path_line);
         file_count++;
 
         if (want_symbols) {
-            detect_add_impacted_symbols(store, project, line, doc, impacted);
+            detect_add_impacted_symbols(store, project, path_line, doc, impacted);
         }
     }
     int git_status = cbm_pclose(fp);

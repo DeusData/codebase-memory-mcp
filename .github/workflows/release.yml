@@ -51,6 +51,7 @@ jobs:
     uses: ./.github/workflows/_test.yml
     with:
       skip_perf: ${{ inputs.skip_perf }}
+      broad_platforms: true
 
   # ── 3. Build all platforms ──────────────────────────────────────
   build:
@@ -63,6 +64,8 @@ jobs:
   smoke:
     needs: [build]
     uses: ./.github/workflows/_smoke.yml
+    with:
+      broad_platforms: true
 
   # ── 5. Soak tests ──────────────────────────────────────────────
   soak:

@@ -32,7 +32,7 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     /* VCS */
     ".git", ".hg", ".svn", ".worktrees",
     /* IDE */
-    ".idea", ".vs", ".vscode", ".eclipse", ".claude",
+    ".idea", ".vs", ".vscode", ".eclipse", ".claude", ".claude-worktrees", "Antigravity",
     /* Python */
     ".cache", ".eggs", ".env", ".mypy_cache", ".nox", ".pytest_cache", ".ruff_cache", ".tox",
     ".venv", "__pycache__", "env", "htmlcov", "site-packages", "venv",
@@ -776,11 +776,15 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
     struct stat gi_stat;
     bool is_git_repo = wide_stat(gi_path, &gi_stat) == 0 && S_ISDIR(gi_stat.st_mode);
     bool has_git_config = false;
+    /* Always honour the .gitignore at the indexed-directory root, even when the
+     * directory is not a git repo root (e.g. indexing a sub-package directly).
+     * The .git/info/exclude and global-excludes sources still require .git/.
+     * Fixes issue #510: a root .gitignore was silently ignored without .git/. */
+    snprintf(gi_path, sizeof(gi_path), "%s/.gitignore", repo_path);
+    gitignore = cbm_gitignore_load(gi_path);
     if (is_git_repo) {
         snprintf(gi_path, sizeof(gi_path), "%s/.git/config", repo_path);
         has_git_config = wide_stat(gi_path, &gi_stat) == 0 && S_ISREG(gi_stat.st_mode);
-        snprintf(gi_path, sizeof(gi_path), "%s/.gitignore", repo_path);
-        gitignore = cbm_gitignore_load(gi_path);
 
         char exc_path[CBM_SZ_4K];
         snprintf(exc_path, sizeof(exc_path), "%s/.git/info/exclude", repo_path);

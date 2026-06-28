@@ -8,30 +8,72 @@ on:
         description: 'Skip incremental perf tests (phases 2-7)'
         type: boolean
         default: true
+      broad_platforms:
+        description: 'Test the broad platform matrix (older glibc + extra OS versions) instead of the core set'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  # Emit the platform matrices as JSON. The CORE set is the default (fast,
+  # unchanged); the BROAD set adds extra free runners (older glibc /
+  # additional OS versions) for a wider "does it build everywhere" picture.
+  setup-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      unix: ${{ steps.set.outputs.unix }}
+      windows: ${{ steps.set.outputs.windows }}
+    steps:
+      - name: Compute matrices
+        id: set
+        env:
+          BROAD: ${{ inputs.broad_platforms }}
+        run: |
+          CORE_UNIX='[
+            {"os":"ubuntu-latest","cc":"gcc","cxx":"g++"},
+            {"os":"ubuntu-24.04-arm","cc":"gcc","cxx":"g++"},
+            {"os":"macos-14","cc":"cc","cxx":"c++"},
+            {"os":"macos-15-intel","cc":"cc","cxx":"c++"}
+          ]'
+          BROAD_UNIX='[
+            {"os":"ubuntu-22.04","cc":"gcc","cxx":"g++","optional":true},
+            {"os":"ubuntu-22.04-arm","cc":"gcc","cxx":"g++","optional":true},
+            {"os":"macos-15","cc":"cc","cxx":"c++","optional":true}
+          ]'
+          # Each Windows leg pins the msys2 environment + package arch to the
+          # RUNNER architecture so the build is native, never emulated:
+          #   x86-64 runners -> CLANG64 (mingw-w64-clang-x86_64-*)
+          #   ARM64  runner  -> CLANGARM64 (mingw-w64-clang-aarch64-*)
+          # windows-11-arm previously used the x86-64 CLANG64 toolchain, so its
+          # binary ran under Windows-on-ARM x86-64 emulation and ASan's function
+          # interception crashed (interception_win: unhandled instruction). With
+          # the native ARM64 toolchain ASan instruments native ARM64 code, so it
+          # is a real (non-optional) gate, not a tolerated emulated-flake.
+          CORE_WIN='[{"os":"windows-latest","msystem":"CLANG64","pkg":"x86_64"}]'
+          BROAD_WIN='[{"os":"windows-2025","optional":true,"msystem":"CLANG64","pkg":"x86_64"},{"os":"windows-11-arm","msystem":"CLANGARM64","pkg":"aarch64"}]'
+          if [ "$BROAD" = "true" ]; then
+            UNIX=$(jq -cn --argjson a "$CORE_UNIX" --argjson b "$BROAD_UNIX" '$a + $b')
+            WIN=$(jq -cn --argjson a "$CORE_WIN" --argjson b "$BROAD_WIN" '$a + $b')
+          else
+            UNIX=$(jq -cn --argjson a "$CORE_UNIX" '$a')
+            WIN=$(jq -cn --argjson a "$CORE_WIN" '$a')
+          fi
+          echo "unix={\"include\":$UNIX}" >> "$GITHUB_OUTPUT"
+          echo "windows={\"include\":$WIN}" >> "$GITHUB_OUTPUT"
+
   test-unix:
+    needs: setup-matrix
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            cc: gcc
-            cxx: g++
-          - os: ubuntu-24.04-arm
-            cc: gcc
-            cxx: g++
-          - os: macos-14
-            cc: cc
-            cxx: c++
-          - os: macos-15-intel
-            cc: cc
-            cxx: c++
+      matrix: ${{ fromJSON(needs.setup-matrix.outputs.unix) }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # Broad-only legs (extra OS versions) are informational: visible but
+    # non-blocking, so a flaky/less-common runner can't block a release.
+    continue-on-error: ${{ matrix.optional == true }}
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
@@ -45,24 +87,35 @@ jobs:
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
 
   test-windows:
-    runs-on: windows-latest
-    timeout-minutes: 60
+    needs: setup-matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup-matrix.outputs.windows) }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.optional == true }}
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
-          msystem: CLANG64
+          msystem: ${{ matrix.msystem }}
           path-type: inherit
           install: >-
-            mingw-w64-clang-x86_64-clang
-            mingw-w64-clang-x86_64-compiler-rt
-            mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-${{ matrix.pkg }}-clang
+            mingw-w64-clang-${{ matrix.pkg }}-compiler-rt
+            mingw-w64-clang-${{ matrix.pkg }}-zlib
             make
             git
 
       - name: Test
         shell: msys2 {0}
-        run: scripts/test.sh CC=clang CXX=clang++
+        # AddressSanitizer is unavailable on native ARM64 Windows (LLVM ships no
+        # libclang_rt.asan for aarch64-w64-windows-gnu) and cannot intercept the
+        # system DLLs under x86-64 emulation either, so windows-11-arm runs the
+        # native ARM64 build with SANITIZE= (no sanitizer) — still a real
+        # functional gate. ASan/UBSan coverage comes from the other 9 legs,
+        # including native-ARM Linux/macOS. x86-64 Windows keeps full sanitizers.
+        run: scripts/test.sh CC=clang CXX=clang++ ${{ matrix.os == 'windows-11-arm' && 'SANITIZE=' || '' }}
         env:
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}

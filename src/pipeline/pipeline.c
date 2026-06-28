@@ -491,9 +491,34 @@ static bool is_infra_file(const char *fp) {
             strstr(fp, ".tf") != NULL || strstr(fp, ".hcl") != NULL || strstr(fp, ".toml") != NULL);
 }
 
+/* True when a YAML key path denotes an UPSTREAM dependency, CONFIG value, or
+ * HEALTHCHECK target rather than an endpoint this service exposes. Such URLs
+ * (auth JWKS, downstream service base URLs, package-registry URLs, healthcheck
+ * curl targets) are NOT routes the service serves and must not mint Route nodes
+ * (#521). Exposed-endpoint keys (push_endpoint, post_url, callback, webhook)
+ * are intentionally absent here so they still produce infra Route nodes. */
+static bool is_upstream_config_key(const char *key_path) {
+    if (!key_path) {
+        /* No key context (e.g. flat string) — keep prior behaviour and mint. */
+        return false;
+    }
+    static const char *const deny[] = {"jwks",     "registry",     "registries", "healthcheck",
+                                       "upstream", "_service_url", "auth",       NULL};
+    for (int i = 0; deny[i]; i++) {
+        if (strstr(key_path, deny[i]) != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Try to create an infra Route node from one string_ref. */
 static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, const char *fp) {
     if (sr->kind != CBM_STRREF_URL || !sr->value || !strstr(sr->value, "://")) {
+        return;
+    }
+    /* Skip upstream/config/healthcheck URLs — they are not exposed routes (#521). */
+    if (is_upstream_config_key(sr->key_path)) {
         return;
     }
     char route_qn[CBM_ROUTE_QN_SIZE];
@@ -508,17 +533,51 @@ static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, con
     cbm_gbuf_upsert_node(gbuf, "Route", sr->value, route_qn, fp, 0, 0, route_props);
 }
 
+/* A URL string_ref that does NOT denote a route the service serves: a value
+ * containing whitespace is a command/sentence with an embedded URL (e.g. a
+ * Docker healthcheck `curl --fail http://... || exit 1`); a NULL key_path is a
+ * context-less/duplicate ref; an upstream/config/healthcheck key is an external
+ * dependency, not an exposed route. (#521) */
+static bool route_sr_denied(const CBMStringRef *sr) {
+    if (!sr->value || strchr(sr->value, ' ')) {
+        return true;
+    }
+    if (!sr->key_path) {
+        return true;
+    }
+    return is_upstream_config_key(sr->key_path);
+}
+
 static void cbm_pipeline_extract_infra_routes(cbm_gbuf_t *gbuf, const cbm_file_info_t *files,
                                               CBMFileResult **result_cache, int file_count) {
-    for (int i = 0; i < file_count; i++) {
-        if (!result_cache[i] || !is_infra_file(files[i].rel_path)) {
-            continue;
-        }
-        for (int si = 0; si < result_cache[i]->string_refs.count; si++) {
-            try_upsert_infra_route(gbuf, &result_cache[i]->string_refs.items[si],
-                                   files[i].rel_path);
+    /* DENY-WINS-BY-VALUE: the same URL is often extracted as several string_refs
+     * at different key_path granularities (full path, leaf key, flat). The Route
+     * node is keyed by VALUE, so it would be minted if ANY granularity passed the
+     * per-ref guard — e.g. a denied full path `registries.terraform-registry.url`
+     * is defeated by a sibling leaf `url`. So pass 1 collects every URL value
+     * denied under ANY of its refs; pass 2 mints only values never denied. (#521) */
+    CBMHashTable *denied = cbm_ht_create(16);
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < file_count; i++) {
+            if (!result_cache[i] || !is_infra_file(files[i].rel_path)) {
+                continue;
+            }
+            for (int si = 0; si < result_cache[i]->string_refs.count; si++) {
+                const CBMStringRef *sr = &result_cache[i]->string_refs.items[si];
+                if (sr->kind != CBM_STRREF_URL || !sr->value || !strstr(sr->value, "://")) {
+                    continue;
+                }
+                if (pass == 0) {
+                    if (denied && route_sr_denied(sr)) {
+                        cbm_ht_set(denied, sr->value, (void *)1);
+                    }
+                } else if (!denied || !cbm_ht_has(denied, sr->value)) {
+                    try_upsert_infra_route(gbuf, sr, files[i].rel_path);
+                }
+            }
         }
     }
+    cbm_ht_free(denied);
 }
 
 /* Run decorator_tags, configlink, and route matching passes. */

@@ -2587,7 +2587,7 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
 
     char edge_sql[ST_SQL_BUF];
     snprintf(edge_sql, sizeof(edge_sql),
-             "SELECT n1.name, n2.name, e.type "
+             "SELECT n1.name, n2.name, e.type, e.source_id, e.target_id, e.properties "
              "FROM edges e "
              "JOIN nodes n1 ON n1.id = e.source_id "
              "JOIN nodes n2 ON n2.id = e.target_id "
@@ -2624,6 +2624,9 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
         edges[en].to_name = heap_strdup((const char *)sqlite3_column_text(estmt, SKIP_ONE));
         edges[en].type = heap_strdup((const char *)sqlite3_column_text(estmt, CBM_SZ_2));
         edges[en].confidence = (double)SKIP_ONE;
+        edges[en].source_id = sqlite3_column_int64(estmt, ST_COL_3);
+        edges[en].target_id = sqlite3_column_int64(estmt, ST_COL_4);
+        edges[en].properties_json = heap_strdup((const char *)sqlite3_column_text(estmt, CBM_SZ_5));
         en++;
     }
     sqlite3_finalize(estmt);
@@ -2776,6 +2779,7 @@ void cbm_store_traverse_free(cbm_traverse_result_t *out) {
         safe_str_free(&out->edges[i].from_name);
         safe_str_free(&out->edges[i].to_name);
         safe_str_free(&out->edges[i].type);
+        safe_str_free(&out->edges[i].properties_json);
     }
     free(out->edges);
 

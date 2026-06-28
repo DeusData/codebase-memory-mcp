@@ -18,6 +18,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Minimal Python builtins as real graph nodes (py_builtins_inject_defs).
+ * #included here (CGo amalgamation pattern, see lsp_all.c) — referenced
+ * only from py_lsp.c, never compiled standalone. */
+#include "py_builtins.c"
+
 // Forward decls
 static void py_resolve_calls_in(PyLSPContext *ctx, TSNode node);
 static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node);
@@ -319,8 +324,9 @@ static const char *py_lookup_dict_dispatch(PyLSPContext *ctx, const char *var, c
     return NULL;
 }
 
-static void py_emit_resolved_call(PyLSPContext *ctx, const char *callee_qn, const char *strategy,
-                                  float confidence) {
+static void py_emit_resolved_call_reason(PyLSPContext *ctx, const char *callee_qn,
+                                         const char *strategy, float confidence,
+                                         const char *reason) {
     if (!ctx || !ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn)
         return;
     // Dedupe by (caller, callee). Bounded-window scan: most duplicate
@@ -349,7 +355,13 @@ static void py_emit_resolved_call(PyLSPContext *ctx, const char *callee_qn, cons
     rc.callee_qn = cbm_arena_strdup(ctx->arena, callee_qn);
     rc.strategy = strategy;
     rc.confidence = confidence;
+    rc.reason = reason ? cbm_arena_strdup(ctx->arena, reason) : NULL;
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+}
+
+static void py_emit_resolved_call(PyLSPContext *ctx, const char *callee_qn, const char *strategy,
+                                  float confidence) {
+    py_emit_resolved_call_reason(ctx, callee_qn, strategy, confidence, NULL);
 }
 
 /* ── helpers: registry-driven attribute lookup with depth cap ──── */
@@ -1659,7 +1671,10 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
             if (var_name && k_text) {
                 const char *tgt = py_lookup_dict_dispatch(ctx, var_name, k_text);
                 if (tgt) {
-                    py_emit_resolved_call(ctx, tgt, "lsp_dict_dispatch", 0.86f);
+                    /* The textual callee of `funcs["a"](v)` is the subscript base
+                     * identifier ("funcs"), not the resolved target ("foo"), so
+                     * stash it in `reason` for the join (see lsp_resolve.h). */
+                    py_emit_resolved_call_reason(ctx, tgt, "lsp_dict_dispatch", 0.86f, var_name);
                     return;
                 }
             }
@@ -1687,19 +1702,33 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
                         cbm_registry_lookup_type(ctx->registry, ctx->enclosing_class_qn);
                     if (enclosing && enclosing->embedded_types) {
                         for (int i = 0; enclosing->embedded_types[i]; i++) {
+                            // super().__init__() is a constructor delegation:
+                            // lsp_super_init is the MORE SPECIFIC, more accurate
+                            // strategy than the generic lsp_super. Resolve __init__
+                            // first and emit lsp_super_init — when the base both
+                            // registers __init__ (py_lookup_attribute hits) and the
+                            // generic super() proxy resolution applies, the generic
+                            // lsp_super used to also be emitted at 0.88, outranking
+                            // lsp_super_init (0.85) in the highest-confidence join so
+                            // the specific strategy never landed on the edge. Handle
+                            // __init__ BEFORE the generic lsp_super and rank it at
+                            // least as high (0.90) so the constructor-delegation
+                            // strategy wins. The plain super().method() form below is
+                            // unchanged — it still emits lsp_super.
+                            if (strcmp(attr_name, "__init__") == 0) {
+                                const CBMRegisteredFunc *fi = py_lookup_attribute(
+                                    ctx, enclosing->embedded_types[i], attr_name);
+                                const char *init_qn =
+                                    fi ? fi->qualified_name
+                                       : cbm_arena_sprintf(ctx->arena, "%s.__init__",
+                                                           enclosing->embedded_types[i]);
+                                py_emit_resolved_call(ctx, init_qn, "lsp_super_init", 0.90f);
+                                return;
+                            }
                             const CBMRegisteredFunc *f =
                                 py_lookup_attribute(ctx, enclosing->embedded_types[i], attr_name);
                             if (f) {
                                 py_emit_resolved_call(ctx, f->qualified_name, "lsp_super", 0.88f);
-                                return;
-                            }
-                            // Special case: super().__init__ — most parent
-                            // classes don't register __init__ with a return,
-                            // but we still want to emit the constructor edge.
-                            if (strcmp(attr_name, "__init__") == 0) {
-                                const char *init_qn = cbm_arena_sprintf(
-                                    ctx->arena, "%s.__init__", enclosing->embedded_types[i]);
-                                py_emit_resolved_call(ctx, init_qn, "lsp_super_init", 0.85f);
                                 return;
                             }
                         }
@@ -1718,6 +1747,41 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
             if (f) {
                 py_emit_resolved_call(ctx, f->qualified_name, "lsp_module_attr", 0.92f);
                 return;
+            }
+            // An `import sibling` of an IN-PROJECT module records the module's QN
+            // in its short, source-written form ("helpers"), but the sibling's
+            // defs are registered project-qualified ("<root>.helpers.do_work").
+            // So the lookup above misses for in-project modules even though the
+            // target IS resolvable, and the call used to drop to
+            // lsp_module_attr_unresolved @0.55 (below the join's 0.6 floor) — no
+            // edge. Retry against the project-qualified module: derive the
+            // project root from the current file's module_qn (strip its last
+            // segment) and look up "<root>.<mod>". A genuinely-external module
+            // (requests, os) has no such project def, so it correctly stays
+            // lsp_module_attr_unresolved.
+            if (mod && ctx->module_qn) {
+                const char *last_dot = strrchr(ctx->module_qn, '.');
+                if (last_dot && last_dot > ctx->module_qn) {
+                    size_t root_len = (size_t)(last_dot - ctx->module_qn);
+                    // Skip if mod is already rooted under the project to avoid
+                    // "<root>.<root>.mod".
+                    if (!(strncmp(mod, ctx->module_qn, root_len) == 0 && mod[root_len] == '.')) {
+                        char *qual_mod = (char *)cbm_arena_alloc(ctx->arena, root_len + 1 +
+                                                                                strlen(mod) + 1);
+                        if (qual_mod) {
+                            memcpy(qual_mod, ctx->module_qn, root_len);
+                            qual_mod[root_len] = '.';
+                            strcpy(qual_mod + root_len + 1, mod);
+                            const CBMRegisteredFunc *qf =
+                                cbm_registry_lookup_symbol(ctx->registry, qual_mod, attr_name);
+                            if (qf) {
+                                py_emit_resolved_call(ctx, qf->qualified_name, "lsp_module_attr",
+                                                      0.92f);
+                                return;
+                            }
+                        }
+                    }
+                }
             }
             // Best-effort: emit "module.attr" QN — Phase 9 cross-file may fix up.
             const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mod, attr_name);
@@ -3313,6 +3377,15 @@ void cbm_run_py_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
                     TSNode root) {
     if (!arena || !result)
         return;
+
+    /* Inject minimal builtin definitions as real graph nodes (builtins.len,
+     * builtins.str, builtins.str.upper, ...). The typeshed registry already
+     * RESOLVES builtin calls (emitting the strategy + a "builtins.*" callee_qn),
+     * but pass_calls.c only writes the CALLS edge when that callee_qn maps to a
+     * graph node. We run inside cbm_extract_file, before the pipeline mints
+     * def nodes from result->defs, so these become the target nodes the
+     * builtin/constructor/method edges point at. Upsert dedups by QN. */
+    py_builtins_inject_defs(result, arena);
 
     CBMTypeRegistry reg;
     cbm_registry_init(&reg, arena);

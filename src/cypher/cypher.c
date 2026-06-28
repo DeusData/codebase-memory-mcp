@@ -1615,6 +1615,10 @@ static int parse_return_or_with(parser_t *p, cbm_return_clause_t **out, bool is_
     }
 
     cbm_return_clause_t *r = calloc(CBM_ALLOC_ONE, sizeof(cbm_return_clause_t));
+    /* -1 = no LIMIT clause (return all). An explicit `LIMIT 0` parses to 0 below
+     * and must return 0 rows — distinguishing the two requires a sentinel, since
+     * calloc zeroes limit and `limit > 0` would treat LIMIT 0 as "no limit". */
+    r->limit = -1;
     int cap = CYP_INIT_CAP8;
     r->items = malloc(cap * sizeof(cbm_return_item_t));
 
@@ -2841,8 +2845,18 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
                           const cbm_node_pattern_t *target_node, binding_t *b, const char *to_var,
                           const char *rel_var, binding_t *new_bindings, int *new_count, int max_new,
                           int *match_count) {
+    /* When the terminal node variable is ALREADY bound (e.g. the second pattern
+     * `(c)-[:CALLS]->(f)` where `f` came from an earlier MATCH), we must FILTER
+     * to edges that actually reach the bound node — not overwrite the caller's
+     * `f` binding with whatever node the edge leads to. Overwriting corrupted
+     * the result of dead-code queries and produced wrong rows (#627). */
+    cbm_node_t *bound_to = binding_get(b, to_var);
+    int64_t bound_to_id = bound_to ? bound_to->id : 0;
     for (int ei = 0; ei < edge_count && *new_count < max_new; ei++) {
         int64_t tid = inbound ? edges[ei].source_id : edges[ei].target_id;
+        if (bound_to && tid != bound_to_id) {
+            continue; /* edge does not reach the already-bound terminal node */
+        }
         cbm_node_t found = {0};
         if (cbm_store_find_node_by_id(store, tid, &found) != CBM_STORE_OK) {
             continue;
@@ -2963,8 +2977,11 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
 
         bool is_variable_length = (rel->min_hops != SKIP_ONE || rel->max_hops != SKIP_ONE);
 
-        binding_t *new_bindings =
-            malloc(((*bind_cap * CYP_GROWTH_10) + SKIP_ONE) * sizeof(binding_t));
+        size_t alloc_n = (size_t)*bind_cap * (size_t)CYP_GROWTH_10 + SKIP_ONE;
+        binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
+        if (!new_bindings) {
+            return; /* OOM: leave existing bindings untouched rather than corrupt */
+        }
         int new_count = 0;
 
         for (int bi = 0; bi < *bind_count; bi++) {
@@ -3092,7 +3109,7 @@ static void rb_apply_skip_limit(result_builder_t *rb, int skip_n, int limit) {
         rb->row_count = 0;
     }
     /* Limit */
-    if (limit > 0 && rb->row_count > limit) {
+    if (limit >= 0 && rb->row_count > limit) {
         for (int i = limit; i < rb->row_count; i++) {
             for (int c = 0; c < rb->col_count; c++) {
                 safe_str_free(&rb->rows[i][c]);
@@ -3406,7 +3423,7 @@ static void bindings_skip_limit(binding_t *vbindings, int *count, int skip, int 
         }
         *count = 0;
     }
-    if (limit > 0 && *count > limit) {
+    if (limit >= 0 && *count > limit) {
         for (int i = limit; i < *count; i++) {
             binding_free(&vbindings[i]);
         }
@@ -4161,8 +4178,15 @@ static void cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *
 static void cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, binding_t **bindings,
                                  int *bind_count, cbm_node_t *extra_nodes, int extra_count,
                                  const char *nvar, bool opt) {
-    binding_t *new_bindings =
-        malloc(((*bind_count * extra_count * CYP_GROWTH_10) + SKIP_ONE) * sizeof(binding_t));
+    /* size_t arithmetic: bind_count * extra_count can exceed INT_MAX on large
+     * graphs (e.g. an unbound `c` scanned against ~29 K `f` bindings), wrapping
+     * the int product negative and yielding a tiny/garbage malloc → heap OOB
+     * write → SIGSEGV/SIGABRT (#627). */
+    size_t alloc_n = (size_t)*bind_count * (size_t)extra_count * (size_t)CYP_GROWTH_10 + SKIP_ONE;
+    binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
+    if (!new_bindings) {
+        return; /* OOM: leave existing bindings untouched rather than corrupt */
+    }
     int new_count = 0;
     for (int bi = 0; bi < *bind_count; bi++) {
         for (int ni = 0; ni < extra_count; ni++) {
@@ -4194,6 +4218,97 @@ static void cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, bindin
     *bind_count = new_count;
 }
 
+/* Drive a single-relationship additional pattern from its ALREADY-BOUND
+ * terminal node, binding the unbound START var to the edge's other endpoint.
+ *
+ * Handles `OPTIONAL MATCH (c)-[:CALLS]->(f)` where `f` is bound from an earlier
+ * MATCH and `c` is new: scanning every node for `c` and cross-joining (a) risks
+ * an int-overflow OOB write on large graphs and (b) leaves `c` bound to an
+ * arbitrary node so a later `WHERE c IS NULL` wrongly drops every row (#627).
+ * Instead we scan only the bound terminal's edges and bind `c` to real
+ * neighbours; with OPTIONAL we keep the row with `c` unbound when there are
+ * none — the correct dead-code semantics. */
+static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
+                                       binding_t **bindings, int *bind_count, const char *start_var,
+                                       bool opt) {
+    cbm_rel_pattern_t *rel = &patn->rels[0];
+    const cbm_node_pattern_t *start_node = &patn->nodes[0];
+    /* The relationship is written start-[r]->terminal. To enumerate the start
+     * nodes reachable from the bound terminal we invert the stored direction. */
+    bool rel_inbound = rel->direction && strcmp(rel->direction, "inbound") == 0;
+    bool scan_targets =
+        !rel_inbound; /* (start)->(term): start = edge source = scan term's inbound */
+
+    size_t alloc_n = (size_t)*bind_count * (size_t)CYP_GROWTH_10 + SKIP_ONE;
+    binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
+    if (!new_bindings) {
+        return;
+    }
+    int new_count = 0;
+    int max_new = (int)alloc_n;
+
+    for (int bi = 0; bi < *bind_count && new_count < max_new; bi++) {
+        binding_t *b = &(*bindings)[bi];
+        cbm_node_t *term = binding_get(b, patn->nodes[1].variable ? patn->nodes[1].variable : "");
+        int match_count = 0;
+        if (term) {
+            for (int ti = 0;
+                 ti < (rel->type_count > 0 ? rel->type_count : 1) && new_count < max_new; ti++) {
+                cbm_edge_t *edges = NULL;
+                int edge_count = 0;
+                if (rel->type_count > 0) {
+                    if (scan_targets) {
+                        cbm_store_find_edges_by_target_type(store, term->id, rel->types[ti], &edges,
+                                                            &edge_count);
+                    } else {
+                        cbm_store_find_edges_by_source_type(store, term->id, rel->types[ti], &edges,
+                                                            &edge_count);
+                    }
+                } else if (scan_targets) {
+                    cbm_store_find_edges_by_target(store, term->id, &edges, &edge_count);
+                } else {
+                    cbm_store_find_edges_by_source(store, term->id, &edges, &edge_count);
+                }
+                for (int ei = 0; ei < edge_count && new_count < max_new; ei++) {
+                    int64_t sid = scan_targets ? edges[ei].source_id : edges[ei].target_id;
+                    cbm_node_t found = {0};
+                    if (cbm_store_find_node_by_id(store, sid, &found) != CBM_STORE_OK) {
+                        continue;
+                    }
+                    if (start_node->label && !label_alt_matches(found.label, start_node->label)) {
+                        node_fields_free(&found);
+                        continue;
+                    }
+                    binding_t nb = {0};
+                    binding_copy(&nb, b);
+                    binding_set(&nb, start_var, &found);
+                    if (rel->variable) {
+                        binding_set_edge(&nb, rel->variable, &edges[ei]);
+                    }
+                    node_fields_free(&found);
+                    new_bindings[new_count++] = nb;
+                    match_count++;
+                }
+                cbm_store_free_edges(edges, edge_count);
+            }
+        }
+        if (opt && match_count == 0 && new_count < max_new) {
+            /* No matching neighbour: keep the row with start_var left UNBOUND so
+             * `WHERE <start> IS NULL` correctly identifies the no-edge case. */
+            binding_t nb = {0};
+            binding_copy(&nb, b);
+            new_bindings[new_count++] = nb;
+        }
+    }
+
+    for (int bi = 0; bi < *bind_count; bi++) {
+        binding_free(&(*bindings)[bi]);
+    }
+    free(*bindings);
+    *bindings = new_bindings;
+    *bind_count = new_count;
+}
+
 /* Expand additional MATCH patterns (pi >= 1) */
 static void expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const char *project,
                                        int max_rows, binding_t **bindings, int *bind_count,
@@ -4207,19 +4322,32 @@ static void expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const
         if (start_bound && patn->rel_count > 0) {
             const char *tv = nvar;
             expand_pattern_rels(store, patn, bindings, bind_count, bind_cap, &tv, opt);
-        } else {
-            cbm_node_t *extra_nodes = NULL;
-            int extra_count = 0;
-            scan_pattern_nodes(store, project, max_rows, &patn->nodes[0], &extra_nodes,
-                               &extra_count);
-            if (patn->rel_count == 0) {
-                cross_join_nodes(bindings, bind_count, extra_nodes, extra_count, nvar, opt);
-            } else {
-                cross_join_with_rels(store, patn, bindings, bind_count, extra_nodes, extra_count,
-                                     nvar, opt);
-            }
-            cbm_store_free_nodes(extra_nodes, extra_count);
+            continue;
         }
+
+        /* Single-rel pattern whose START is unbound but whose TERMINAL is already
+         * bound: drive from the bound terminal instead of scanning all nodes for
+         * the start var (avoids the int-overflow OOB write and the c-IS-NULL
+         * corruption of #627). */
+        if (!start_bound && patn->rel_count == 1 && *bind_count > 0) {
+            const char *term_var = patn->nodes[1].variable;
+            bool term_bound = term_var && binding_get(&(*bindings)[0], term_var) != NULL;
+            if (term_bound) {
+                expand_from_bound_terminal(store, patn, bindings, bind_count, nvar, opt);
+                continue;
+            }
+        }
+
+        cbm_node_t *extra_nodes = NULL;
+        int extra_count = 0;
+        scan_pattern_nodes(store, project, max_rows, &patn->nodes[0], &extra_nodes, &extra_count);
+        if (patn->rel_count == 0) {
+            cross_join_nodes(bindings, bind_count, extra_nodes, extra_count, nvar, opt);
+        } else {
+            cross_join_with_rels(store, patn, bindings, bind_count, extra_nodes, extra_count, nvar,
+                                 opt);
+        }
+        cbm_store_free_nodes(extra_nodes, extra_count);
     }
 }
 
@@ -4246,7 +4374,7 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
     }
 
     rb_apply_order_by(rb, ret);
-    rb_apply_skip_limit(rb, ret->skip, ret->limit > 0 ? ret->limit : max_rows);
+    rb_apply_skip_limit(rb, ret->skip, ret->limit >= 0 ? ret->limit : max_rows);
     if (ret->distinct) {
         rb_apply_distinct(rb);
     }

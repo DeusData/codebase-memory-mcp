@@ -24,7 +24,7 @@ jobs:
 
   license-gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Install ScanCode Toolkit
@@ -40,7 +40,7 @@ jobs:
 
   codeql-gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 240
     steps:
       - name: Wait for CodeQL on current commit (max 45 min)
         env:

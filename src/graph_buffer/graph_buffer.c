@@ -593,7 +593,19 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
          * label == existing->label), so the old value is replaced, never freed. */
         char *new_name = heap_strdup(name);
         char *new_props = properties_json ? heap_strdup(properties_json) : NULL;
-        existing->label = (char *)gb_intern(gb, label);
+        /* Don't let a per-file "Module" def downgrade a structural directory node
+         * ("Project" root or "Folder"). In a directory-based-module language
+         * (Go/Java) a file's module_qn equals its directory QN: a root file →
+         * the project name (== the "Project" node's QN); a file in pkg/ →
+         * proj.pkg (== the "pkg/" Folder node's QN). Its always-emitted Module
+         * def collides here; the directory node is the package/module container
+         * and must keep its structural label. (Both the sequential upsert and the
+         * parallel local-gbuf merge route through this function.) */
+        if (!(existing->label && label && strcmp(label, "Module") == 0 &&
+              (strcmp(existing->label, "Project") == 0 ||
+               strcmp(existing->label, "Folder") == 0))) {
+            existing->label = (char *)gb_intern(gb, label);
+        }
         free(existing->name);
         existing->name = new_name;
         existing->file_path = (char *)gb_intern(gb, file_path);

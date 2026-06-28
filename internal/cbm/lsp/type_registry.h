@@ -43,6 +43,7 @@ typedef struct {
     const char *alias_of;          // QN of aliased type (type Foo = Bar), NULL if not alias
     const char **type_param_names; // NULL-terminated, e.g., ["T", "K", NULL] for template classes
     bool is_interface;
+    bool is_object; // Kotlin `object`/`companion object` singleton (member calls are static)
 
     // --- TS-specific fields (NULL/empty for non-TS types — backward compatible) ---
     // TS interfaces / object types may be callable: `interface F { (x:number): string }`.

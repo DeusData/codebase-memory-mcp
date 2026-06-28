@@ -1129,7 +1129,7 @@ TEST(probe_pony_actor_node) {
     PASS();
 }
 
-/* Pony: methods (fun/be/new) → Function nodes. */
+/* Pony: methods (fun/be/new) inside a type → Method nodes. */
 TEST(probe_pony_method_nodes) {
     GpdMetrics m = gpd_metrics("Math.pony",
         "primitive Math\n"
@@ -1139,8 +1139,9 @@ TEST(probe_pony_method_nodes) {
         "  fun cube(n: U64): U64 =>\n"
         "    n * square(n)\n");
     ASSERT_TRUE(m.ok);
-    /* GREEN: fun methods must produce Function nodes. */
-    ASSERT_TRUE(m.functions >= 1);
+    /* GREEN: fun methods inside a primitive/actor/class are promoted to Method
+     * nodes (extract_defs.c Pony method-promotion), so assert on m.methods. */
+    ASSERT_TRUE(m.methods >= 1);
     PASS();
 }
 

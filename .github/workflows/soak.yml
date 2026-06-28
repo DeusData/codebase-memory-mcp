@@ -1,0 +1,130 @@
+# Real multi-hour soak — #581 query-only memory-leak reproducer.
+#
+# WHY THIS EXISTS (separate from _soak.yml / nightly-soak.yml):
+#   The nightly path was structurally incapable of running a real long soak:
+#     1. nightly-soak.yml passes duration_minutes: 240, but _soak.yml's
+#        soak-quick / soak-asan jobs hard-cap `timeout-minutes: 30` (45 for
+#        ASan). GitHub kills the job at 30 min → the "4h" soak NEVER ran past
+#        30 min. (Fixed in _soak.yml too, but this workflow guarantees the
+#        right budget for the long #581 run.)
+#     2. scripts/soak-test.sh's default mode reindexes every 2 min;
+#        index_repository triggers cbm_mem_collect (mimalloc page return),
+#        which sweeps the query-only leak — masking #581 even on a long run.
+#        This workflow drives CBM_SOAK_MODE=query-leak, which never reindexes
+#        and never mutates files, so the leak can accumulate and be detected
+#        by soak-test.sh's RSS slope / ratio / ceiling analysis.
+#
+# NON-GATING: workflow_dispatch + push to qa/soak-** only. Never a required
+# check, never blocks a merge.
+#
+# CRITICAL: timeout-minutes = duration + 60. A 240-min soak gets ~300 min.
+name: Soak (multi-hour #581)
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'Soak duration in minutes (default: 240 = 4h)'
+        type: number
+        default: 240
+      mode:
+        description: 'Soak mode (query-leak = #581 detector, no reindex/mutate)'
+        type: choice
+        options: ['default', 'query-leak']
+        default: 'query-leak'
+  # Iteration convenience: pushing a qa/soak-** branch starts a real run from
+  # that branch's own copy of this file (no main merge needed). Non-gating.
+  push:
+    branches: ['qa/soak-**']
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Unix: full matrix (linux amd64+arm64, darwin arm64+amd64) ──────────────
+  soak-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-24.04-arm
+            cc: gcc
+            cxx: g++
+          - os: macos-14
+            cc: cc
+            cxx: c++
+          - os: macos-15-intel
+            cc: cc
+            cxx: c++
+    runs-on: ${{ matrix.os }}
+    # Fixed budget (NOT the 30 min that silently truncated nightly). 320 min covers
+    # the 240-min default soak + build + analysis. `timeout-minutes` is evaluated at
+    # workflow setup where the `inputs` context is null on push events, so an
+    # inputs-based expression here is a startup failure — keep it a literal.
+    # (A workflow_dispatch run with duration > ~250 min should bump this.)
+    timeout-minutes: 320
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install deps (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 git
+
+      - name: Build (prod binary)
+        run: scripts/build.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+
+      - name: Soak
+        env:
+          # On push events there are no inputs → fall back to shell defaults
+          # (240 min / query-leak) so a qa/soak-** push runs the real #581 soak.
+          CBM_SOAK_MODE: ${{ inputs.mode || 'query-leak' }}
+          DURATION_MINUTES: ${{ inputs.duration_minutes || '240' }}
+        run: scripts/soak-test.sh build/c/codebase-memory-mcp "${DURATION_MINUTES}"
+
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: soak-${{ matrix.os }}-${{ inputs.mode || 'query-leak' }}
+          path: soak-results/
+          retention-days: 14
+
+  # ── Windows: the platform #581 actually crashes on (50+ GB → crash) ───────
+  soak-windows:
+    runs-on: windows-latest
+    timeout-minutes: 320
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-python3
+            make
+            git
+            coreutils
+      - name: Build (prod binary)
+        shell: msys2 {0}
+        run: scripts/build.sh CC=clang CXX=clang++
+      - name: Soak
+        shell: msys2 {0}
+        env:
+          CBM_SOAK_MODE: ${{ inputs.mode || 'query-leak' }}
+          DURATION_MINUTES: ${{ inputs.duration_minutes || '240' }}
+        run: |
+          BIN=build/c/codebase-memory-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          scripts/soak-test.sh "$BIN" "${DURATION_MINUTES}"
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: soak-windows-${{ inputs.mode || 'query-leak' }}
+          path: soak-results/
+          retention-days: 14

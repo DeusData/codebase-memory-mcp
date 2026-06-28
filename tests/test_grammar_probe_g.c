@@ -780,9 +780,11 @@ TEST(probe_properties_module_only) {
                                                  "server.port=8080\n"
                                                  "log.level=INFO\n");
     ASSERT_TRUE(m.ok);
-    /* GREEN: .properties produces only a Module node. */
+    /* GREEN: .properties produces a Module node plus one Variable per `key=value`
+     * property line (extract_defs.c CBM_LANG_PROPERTIES → push_var_def). The
+     * fixture has 3 property lines (server.host, server.port, log.level). */
     ASSERT_TRUE(m.modules == 1);
-    ASSERT_TRUE(m.variables == 0);
+    ASSERT_TRUE(m.variables == 3);
     PASS();
 }
 

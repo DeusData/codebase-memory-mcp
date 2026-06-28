@@ -50,6 +50,18 @@ Guarded by the `contract_all_grammars_in_graph` graph-breadth test in
 | slang    | added to the C-family declarator-name gate (tree-sitter-cpp/hlsl fork) |
 | squirrel | `resolve_func_name`: `function_declaration` → `identifier` child |
 
+## Local source patches (applied atop pinned upstream)
+
+The grammars below carry a small local patch to their vendored `scanner.c`, on
+top of the pinned upstream commit recorded in the vendoring table below.
+Re-vendoring from upstream must re-apply these.
+
+| grammar | location | patch | reason |
+|---|---|---|---|
+| crystal    | `crystal/scanner.c`, serialize    | guard `memcpy(&buffer[offset], state->literals.contents, literal_content_size)` with `if (literal_content_size > 0)` | UBSan: zero-length `memcpy` with a NULL/0-size source on the empty-state serialize round-trip (formal UB, harmless) |
+| rescript   | `rescript/scanner.c`, deserialize | guard `memcpy(state, buffer, n_bytes)` with `if (n_bytes > 0)` | UBSan: zero-length `memcpy` with a NULL `buffer` / `n_bytes == 0` on empty-state deserialize (formal UB, harmless). The sibling serialize copies a fixed `sizeof(ScannerState)` (always > 0, non-NULL src) and needs no guard. |
+| purescript | `purescript/scanner.c`, serialize | guard `memcpy(buffer, indents->data, to_copy)` with `if (to_copy > 0)` | UBSan: zero-length `memcpy` with a NULL/0-size source when the indent vector is empty (formal UB, harmless) |
+
 ## Vendored from verified upstream
 
 | grammar | cur ABI | upstream repo | pinned commit | verdict | LICENSE |

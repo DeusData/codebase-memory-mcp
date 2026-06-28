@@ -20,6 +20,20 @@ DURATION_MIN="${2:?Usage: soak-test.sh <binary> <duration_minutes>}"
 SKIP_CRASH="${3:-}"
 BINARY=$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")
 
+# Soak mode selector.
+#   default     = original mixed workload (queries + mutations + periodic reindex
+#                 + crash-recovery). Unchanged from before this env var existed.
+#   query-leak  = #581 detector. After the initial index, NEVER reindex and NEVER
+#                 mutate files, so the mimalloc page-return path (cbm_mem_collect,
+#                 triggered by index_repository) is never invoked and cannot sweep
+#                 a query-only leak. Phase 3 then hammers a variety of READ tools
+#                 (search_graph / query_graph / trace_path / get_code_snippet /
+#                 search_code) to exercise the query-only store-open + WAL + alloc
+#                 paths the bug report implicates. The RSS slope/ratio/ceiling
+#                 analysis below is the leak detector. The crash-recovery phase is
+#                 skipped in this mode because it reindexes (which would mask #581).
+CBM_SOAK_MODE="${CBM_SOAK_MODE:-default}"
+
 RESULTS_DIR="soak-results"
 mkdir -p "$RESULTS_DIR"
 
@@ -33,7 +47,7 @@ echo "timestamp,tool,duration_ms,exit_code" > "$LATENCY_CSV"
 
 DURATION_S=$((DURATION_MIN * 60))
 
-echo "=== soak-test: binary=$BINARY duration=${DURATION_MIN}m ==="
+echo "=== soak-test: binary=$BINARY duration=${DURATION_MIN}m mode=${CBM_SOAK_MODE} ==="
 
 # ── Helper: generate realistic test project (~200 files) ─────────
 
@@ -287,22 +301,36 @@ while [ "$(date +%s)" -lt "$END_TIME" ]; do
     NOW=$(date +%s)
     CYCLE=$((CYCLE + 1))
 
-    # Queries every 2 seconds
-    mcp_call search_graph "{\"project\":\"$PROJ_NAME\",\"name_pattern\":\".*compute.*\"}"
-    mcp_call trace_path "{\"project\":\"$PROJ_NAME\",\"function_name\":\"compute\",\"direction\":\"both\"}"
+    if [ "$CBM_SOAK_MODE" = "query-leak" ]; then
+        # ── #581 query-only leak mode ────────────────────────────────
+        # Pure read-query hammering: no mutation, no reindex — so
+        # cbm_mem_collect (mimalloc page return) is NEVER triggered and
+        # cannot sweep a query-only leak. Hammer a VARIETY of read tools to
+        # exercise the store-open + WAL + alloc paths the report implicates.
+        mcp_call search_graph "{\"project\":\"$PROJ_NAME\",\"name_pattern\":\".*Handle.*\"}"
+        mcp_call query_graph "{\"project\":\"$PROJ_NAME\",\"query\":\"MATCH (n) RETURN n.name LIMIT 25\"}"
+        mcp_call trace_path "{\"project\":\"$PROJ_NAME\",\"function_name\":\"handle_1\",\"direction\":\"both\"}"
+        mcp_call get_code_snippet "{\"project\":\"$PROJ_NAME\",\"qualified_name\":\"handle_1\"}"
+        mcp_call search_code "{\"project\":\"$PROJ_NAME\",\"pattern\":\"def \"}"
+    else
+        # ── default mode (unchanged) ─────────────────────────────────
+        # Queries every 2 seconds
+        mcp_call search_graph "{\"project\":\"$PROJ_NAME\",\"name_pattern\":\".*compute.*\"}"
+        mcp_call trace_path "{\"project\":\"$PROJ_NAME\",\"function_name\":\"compute\",\"direction\":\"both\"}"
 
-    # File mutation every 2 minutes
-    if [ $((NOW - LAST_MUTATE)) -ge 120 ]; then
-        echo "# mutation at cycle $CYCLE $(date)" >> "$SOAK_PROJECT/src/main.py"
-        git -C "$SOAK_PROJECT" add -A 2>/dev/null
-        git -C "$SOAK_PROJECT" -c user.email=test@test -c user.name=test commit -q -m "cycle $CYCLE" 2>/dev/null || true
-        LAST_MUTATE=$NOW
-    fi
+        # File mutation every 2 minutes
+        if [ $((NOW - LAST_MUTATE)) -ge 120 ]; then
+            echo "# mutation at cycle $CYCLE $(date)" >> "$SOAK_PROJECT/src/main.py"
+            git -C "$SOAK_PROJECT" add -A 2>/dev/null
+            git -C "$SOAK_PROJECT" -c user.email=test@test -c user.name=test commit -q -m "cycle $CYCLE" 2>/dev/null || true
+            LAST_MUTATE=$NOW
+        fi
 
-    # Full reindex every 2 minutes (compressed — simulates 15min real interval)
-    if [ $((NOW - LAST_REINDEX)) -ge 120 ]; then
-        mcp_call index_repository "{\"repo_path\":\"$SOAK_PROJECT\"}"
-        LAST_REINDEX=$NOW
+        # Full reindex every 2 minutes (compressed — simulates 15min real interval)
+        if [ $((NOW - LAST_REINDEX)) -ge 120 ]; then
+            mcp_call index_repository "{\"repo_path\":\"$SOAK_PROJECT\"}"
+            LAST_REINDEX=$NOW
+        fi
     fi
 
     # Collect diagnostics every 10 seconds (5 cycles)
@@ -324,8 +352,11 @@ IDLE_CPU=$(ps -o %cpu= -p "$SERVER_PID" 2>/dev/null | tr -d ' ' || echo "0")
 echo "OK: idle CPU=${IDLE_CPU}%"
 
 # ── Phase 5: Crash recovery test ────────────────────────────────
+# Skipped in query-leak mode: crash recovery re-indexes (Phase 5 calls
+# index_repository), which triggers cbm_mem_collect and would mask the #581
+# query-only leak the whole run is trying to surface.
 
-if [ "$SKIP_CRASH" != "--skip-crash-test" ]; then
+if [ "$SKIP_CRASH" != "--skip-crash-test" ] && [ "$CBM_SOAK_MODE" != "query-leak" ]; then
     echo "--- Phase 5: crash recovery ---"
 
     # Kill server mid-operation, restart, verify clean index

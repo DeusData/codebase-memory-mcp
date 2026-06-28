@@ -123,6 +123,23 @@ void cbm_mem_init(double ram_fraction) {
     mi_option_set(mi_option_purge_decommits, SKIP_ONE);
     mi_option_set(mi_option_purge_delay, 0); /* immediate purge, no 1s delay */
 
+    /* CBM_MEM_BUDGET_MB env override (memory analogue of CBM_WORKERS).
+     * Lets users cap the budget directly without an enclosing cgroup —
+     * useful on bare-metal hosts where cgroup memory limits are absent
+     * (#363). Explicit override > implicit RAM/cgroup detection. */
+    char env_buf[CBM_SZ_32];
+    if (cbm_safe_getenv("CBM_MEM_BUDGET_MB", env_buf, sizeof(env_buf), NULL) != NULL) {
+        long mb = strtol(env_buf, NULL, CBM_DECIMAL_BASE);
+        if (mb > 0) {
+            g_budget = (size_t)mb * MB_DIVISOR;
+            char ovr_mb[CBM_SZ_32];
+            snprintf(ovr_mb, sizeof(ovr_mb), "%ld", mb);
+            cbm_log_info("mem.init", "budget_mb", ovr_mb, "source", "CBM_MEM_BUDGET_MB");
+            return;
+        }
+        cbm_log_warn("mem.budget.env.invalid", "value", env_buf, "fallback", "ram_fraction");
+    }
+
     cbm_system_info_t info = cbm_system_info();
     g_budget = (size_t)((double)info.total_ram * ram_fraction);
 

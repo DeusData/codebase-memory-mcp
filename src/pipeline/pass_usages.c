@@ -24,6 +24,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* True for languages whose module QN derives from the CONTAINING DIRECTORY
+ * (Java/Go package). MUST match cbm_lang_module_is_dir() (internal/cbm/helpers.c)
+ * so same-module resolution keys against the directory-based def-node QNs. */
+static bool pu_module_is_dir(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
+}
+
 /* Read file into heap buffer. Caller must free(). */
 static char *read_file(const char *path, int *out_len) {
     FILE *f = fopen(path, "rb");
@@ -355,7 +362,8 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
         int imp_count = 0;
         build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
 
-        char *module_qn = cbm_pipeline_fqn_module(ctx->project_name, rel);
+        char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
+                                                      pu_module_is_dir(files[i].language));
 
         usage_resolved +=
             resolve_usage_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count);

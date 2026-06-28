@@ -2361,6 +2361,78 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
     return rust_lookup_method_in_trait(ctx, receiver_type_qn, method_name);
 }
 
+// True if `type_qn` implements a trait that declares `method_name` — i.e. a
+// method resolved inherently on the receiver is actually a trait-impl method
+// (lsp_trait_dispatch) rather than a plain inherent one (lsp_method_dispatch).
+// A struct's embedded_types are the traits it implements (the impl-link model
+// rust_resolve_trait_method already relies on), so a declaring trait among them
+// means the method came from `impl Trait for Type`.
+static bool rust_method_is_trait_impl(RustLSPContext *ctx, const char *type_qn,
+                                      const char *method_name) {
+    if (!ctx || !type_qn || !method_name)
+        return false;
+    const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, type_qn);
+    if (!rt || !rt->embedded_types)
+        return false;
+    for (int i = 0; rt->embedded_types[i]; i++) {
+        if (cbm_registry_lookup_method(ctx->registry, rt->embedded_types[i], method_name))
+            return true;
+    }
+    return false;
+}
+
+// Find the sole concrete implementer of trait `trait_qn` that declares
+// `method_name`, returning that impl's method (NULL if none or 2+), setting
+// *out_n to the count (capped at 2). Used for `Trait::method` UFCS so it
+// resolves to the concrete impl rather than the trait's own abstract method.
+// Matches the embedded (impl-link) entry by full QN OR bare name, since the
+// link is recorded short in some registry entries and fully-qualified in
+// others; dedups implementers by QN.
+static const CBMRegisteredFunc *rust_find_sole_trait_impl(RustLSPContext *ctx, const char *trait_qn,
+                                                          const char *method_name, int *out_n) {
+    if (out_n)
+        *out_n = 0;
+    if (!ctx || !trait_qn || !method_name)
+        return NULL;
+    const CBMTypeRegistry *reg = ctx->registry;
+    const char *tdot = strrchr(trait_qn, '.');
+    const char *tbare = tdot ? tdot + 1 : trait_qn;
+    const CBMRegisteredFunc *first = NULL;
+    const char *first_qn = NULL;
+    int n = 0;
+    for (int ti = 0; ti < reg->type_count && n < 2; ti++) {
+        const CBMRegisteredType *t = &reg->types[ti];
+        if (!t->embedded_types || !t->qualified_name)
+            continue;
+        bool impls = false;
+        for (int j = 0; t->embedded_types[j]; j++) {
+            const char *e = t->embedded_types[j];
+            const char *edot = strrchr(e, '.');
+            const char *ebare = edot ? edot + 1 : e;
+            if (strcmp(e, trait_qn) == 0 || strcmp(ebare, tbare) == 0) {
+                impls = true;
+                break;
+            }
+        }
+        if (!impls)
+            continue;
+        const CBMRegisteredFunc *mf =
+            cbm_registry_lookup_method(reg, t->qualified_name, method_name);
+        if (!mf)
+            continue;
+        if (!first_qn) {
+            first = mf;
+            first_qn = t->qualified_name;
+            n = 1;
+        } else if (strcmp(first_qn, t->qualified_name) != 0) {
+            n = 2;
+        }
+    }
+    if (out_n)
+        *out_n = n;
+    return n == 1 ? first : NULL;
+}
+
 /* ════════════════════════════════════════════════════════════════════
  * 8. Macro handling
  * ════════════════════════════════════════════════════════════════════ */
@@ -3465,6 +3537,11 @@ static void rust_resolve_call_expression(RustLSPContext *ctx, TSNode node) {
                 if (m->receiver_type && strcmp(m->receiver_type, type_qn) != 0) {
                     strategy = "lsp_trait_dispatch";
                     conf = (impl_count == 1) ? CBM_RUST_CONF_TRAIT_SOLE : CBM_RUST_CONF_TRAIT_AMB;
+                } else if (rust_method_is_trait_impl(ctx, type_qn, mname)) {
+                    // Inherently resolved, but the method comes from a trait impl
+                    // (`impl Trait for Type`) → polymorphic trait dispatch.
+                    strategy = "lsp_trait_dispatch";
+                    conf = CBM_RUST_CONF_TRAIT_SOLE;
                 }
                 rust_emit_resolved_call(ctx, m->qualified_name, strategy, conf);
                 (void)args_node;
@@ -3593,6 +3670,39 @@ static void rust_resolve_call_expression(RustLSPContext *ctx, TSNode node) {
         if (dot) {
             char *head = cbm_arena_strndup(ctx->arena, qn, (size_t)(dot - qn));
             const char *short_name = dot + 1;
+            /* If `head` is a trait, `Trait::method` UFCS resolves to the sole
+             * concrete impl (lsp_trait_ufcs), NEVER the trait's own abstract
+             * method that the inherent lookup below would find. Resolve the trait
+             * QN (head or module-qualified) via its is_interface flag — set at
+             * type-registration time, so it is reliable even on an early pass
+             * before impl links are wired. When the impl isn't known yet, emit
+             * nothing: a partial-pass lsp_ufcs to the abstract method would
+             * otherwise outrank (higher conf) the real trait_ufcs from the
+             * complete pass and win the join. */
+            const char *trait_qn = NULL;
+            const CBMRegisteredType *head_t = cbm_registry_lookup_type(ctx->registry, head);
+            if (head_t && head_t->is_interface) {
+                trait_qn = head;
+            } else if (ctx->module_qn) {
+                const char *fh = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, head);
+                const CBMRegisteredType *ft = cbm_registry_lookup_type(ctx->registry, fh);
+                if (ft && ft->is_interface)
+                    trait_qn = fh;
+            }
+            if (trait_qn) {
+                int tn = 0;
+                const CBMRegisteredFunc *ti_m =
+                    rust_find_sole_trait_impl(ctx, trait_qn, short_name, &tn);
+                if (tn >= 1) {
+                    rust_emit_resolved_call(
+                        ctx,
+                        ti_m ? ti_m->qualified_name
+                             : cbm_arena_sprintf(ctx->arena, "%s.%s", trait_qn, short_name),
+                        tn == 1 ? "lsp_trait_ufcs" : "lsp_trait_ufcs_amb",
+                        tn == 1 ? CBM_RUST_CONF_TRAIT_SOLE : CBM_RUST_CONF_TRAIT_AMB);
+                }
+                return;
+            }
             const CBMRegisteredFunc *m =
                 cbm_registry_lookup_method_aliased(ctx->registry, head, short_name);
             if (!m && ctx->module_qn) {
@@ -3625,18 +3735,62 @@ static void rust_resolve_call_expression(RustLSPContext *ctx, TSNode node) {
             }
         }
 
-        /* Global short-name fallback: scan the registry for a unique
-         * function whose short_name matches the path's tail and whose
-         * QN starts with the current crate prefix. This gives `mod
-         * foo; use foo::bar; bar()` a chance to resolve when the
-         * intermediate module wasn't tracked through an explicit
-         * use-map entry. */
         const char *tail = strrchr(path, ':');
         if (tail && tail > path && tail[-1] == ':') {
             tail += 1;
         } else {
             tail = path;
         }
+
+        /* Cross-crate workspace-member resolution (#56): when the call
+         * path's head is a declared Cargo workspace member (e.g.
+         * `crate_a::helper` from inside crate_b) we cannot rely on the
+         * caller-crate-scoped fallback below — that filters by the
+         * CALLER's module prefix and would resolve to a same-named local
+         * function instead. Route to the function defined inside the
+         * MEMBER crate by matching the registered QN's `.<member>.`
+         * path segment plus the call tail. Requires a parsed manifest
+         * (threaded through pass_lsp_cross.c); NULL manifest skips this. */
+        if (ctx->cargo_manifest && tail && *tail) {
+            const char *head_sep = strstr(path, "::");
+            if (head_sep && head_sep > path) {
+                char *head = cbm_arena_strndup(ctx->arena, path, (size_t)(head_sep - path));
+                const CBMCargoManifest *m = (const CBMCargoManifest *)ctx->cargo_manifest;
+                if (head && cbm_cargo_find_member(m, head)) {
+                    /* `.crate_a.` — the member directory appears as a dotted
+                     * QN segment for every def inside that crate. */
+                    char *needle = cbm_arena_sprintf(ctx->arena, ".%s.", head);
+                    const CBMRegisteredFunc *mem_unique = NULL;
+                    int mem_matches = 0;
+                    for (int i = 0; i < ctx->registry->func_count && mem_matches < 2; i++) {
+                        const CBMRegisteredFunc *f = &ctx->registry->funcs[i];
+                        if (!f->short_name || !f->qualified_name)
+                            continue;
+                        if (f->receiver_type)
+                            continue; /* free functions only */
+                        if (strcmp(f->short_name, tail) != 0)
+                            continue;
+                        if (!strstr(f->qualified_name, needle))
+                            continue; /* not defined in the member crate */
+                        mem_matches++;
+                        if (mem_matches == 1)
+                            mem_unique = f;
+                    }
+                    if (mem_matches == 1 && mem_unique) {
+                        rust_emit_resolved_call(ctx, mem_unique->qualified_name, "lsp_cross_crate",
+                                                CBM_RUST_CONF_DIRECT);
+                        return;
+                    }
+                }
+            }
+        }
+
+        /* Global short-name fallback: scan the registry for a unique
+         * function whose short_name matches the path's tail and whose
+         * QN starts with the current crate prefix. This gives `mod
+         * foo; use foo::bar; bar()` a chance to resolve when the
+         * intermediate module wasn't tracked through an explicit
+         * use-map entry. */
         if (tail && *tail && ctx->module_qn) {
             /* Crate prefix is the first dotted segment of module_qn after
              * the project name, but for simplicity we just match on
@@ -4530,8 +4684,10 @@ static void rust_build_registry_from_defs(CBMArena *arena, CBMTypeRegistry *reg,
         if (!d->qualified_name || !d->name)
             continue;
 
-        if (d->label && (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Type") == 0 ||
-                         strcmp(d->label, "Interface") == 0 || strcmp(d->label, "Trait") == 0)) {
+        // Every type-like container (Class/Struct/Type/Interface/Trait/Enum).
+        // Struct included so a Rust `struct Foo` (now labelled "Struct") registers
+        // as a type and its `impl Foo` methods/fields resolve.
+        if (cbm_label_is_type_like(d->label)) {
             CBMRegisteredType rt;
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name;
@@ -4839,7 +4995,10 @@ static void rust_build_registry_from_defs(CBMArena *arena, CBMTypeRegistry *reg,
             CBMDefinition *d = &result->defs.items[i];
             if (!d->qualified_name || !d->name)
                 continue;
-            if (!d->label || (strcmp(d->label, "Class") != 0 && strcmp(d->label, "Type") != 0))
+            /* `#[derive(...)]` rides on type-like defs — most often a struct or
+             * enum (now labelled "Struct"/"Enum"), also type aliases. Accept the
+             * whole type-like set so a derive on a struct is not dropped. */
+            if (!cbm_label_is_type_like(d->label))
                 continue;
             if (!d->decorators)
                 continue;
@@ -5116,10 +5275,12 @@ void cbm_run_rust_lsp(CBMArena *arena, CBMFileResult *result, const char *source
 
 extern const TSLanguage *tree_sitter_rust(void);
 
-void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,
-                            const char *module_qn, CBMRustLSPDef *defs, int def_count,
-                            const char **import_names, const char **import_qns, int import_count,
-                            TSTree *cached_tree, CBMResolvedCallArray *out) {
+void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, int source_len,
+                                          const char *module_qn, CBMRustLSPDef *defs, int def_count,
+                                          const char **import_names, const char **import_qns,
+                                          int import_count, TSTree *cached_tree,
+                                          const struct CBMCargoManifest *manifest,
+                                          CBMResolvedCallArray *out) {
     if (!source || source_len <= 0 || !out)
         return;
 
@@ -5151,8 +5312,9 @@ void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,
             continue;
         const char *def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
 
-        if (strcmp(d->label, "Type") == 0 || strcmp(d->label, "Class") == 0 ||
-            strcmp(d->label, "Interface") == 0 || strcmp(d->label, "Trait") == 0) {
+        // Every type-like container (Type/Class/Struct/Interface/Trait/Enum).
+        // Struct included so Rust structs (now labelled "Struct") register here.
+        if (cbm_label_is_type_like(d->label)) {
             CBMRegisteredType rt;
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = cbm_arena_strdup(arena, d->qualified_name);
@@ -5245,6 +5407,10 @@ void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,
 
     RustLSPContext ctx;
     rust_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, out);
+    /* Workspace/dependency awareness for cross-CRATE path routing (#56).
+     * Mirrors the single-file path (cbm_run_rust_lsp_with_manifest). NULL
+     * when no Cargo.toml was parsed — in-crate resolution is unaffected. */
+    ctx.cargo_manifest = manifest;
     rust_collect_uses(&ctx, root);
     for (int i = 0; i < import_count; i++) {
         if (import_names[i] && import_qns[i]) {
@@ -5258,6 +5424,18 @@ void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,
         if (parser)
             ts_parser_delete(parser);
     }
+}
+
+/* Manifest-free entry point. Preserves the pre-existing signature used by
+ * the unit tests (test_rust_lsp.c) and the batch wrapper — delegates to
+ * the manifest-aware variant with a NULL manifest. */
+void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,
+                            const char *module_qn, CBMRustLSPDef *defs, int def_count,
+                            const char **import_names, const char **import_qns, int import_count,
+                            TSTree *cached_tree, CBMResolvedCallArray *out) {
+    cbm_run_rust_lsp_cross_with_manifest(arena, source, source_len, module_qn, defs, def_count,
+                                         import_names, import_qns, import_count, cached_tree, NULL,
+                                         out);
 }
 
 void cbm_batch_rust_lsp_cross(CBMArena *arena, CBMBatchRustLSPFile *files, int file_count,

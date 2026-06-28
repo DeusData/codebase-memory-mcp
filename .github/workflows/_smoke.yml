@@ -2,31 +2,81 @@
 name: Smoke
 
 on:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      broad_platforms:
+        description: 'Smoke the shipped binaries on the broad platform matrix (extra OS versions) instead of the core set'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  # Emit the platform matrices as JSON. The CORE set is the default (fast,
+  # unchanged); the BROAD set adds extra free runners (additional OS versions)
+  # that download the SAME shipped artifact for their goos/goarch and verify it
+  # runs on a wider range of OS versions. No new artifacts are built — broad
+  # legs reuse the exact binaries produced by _build.yml.
+  setup-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      unix: ${{ steps.set.outputs.unix }}
+      windows: ${{ steps.set.outputs.windows }}
+      portable: ${{ steps.set.outputs.portable }}
+    steps:
+      - name: Compute matrices
+        id: set
+        env:
+          BROAD: ${{ inputs.broad_platforms }}
+        run: |
+          CORE_UNIX='[
+            {"os":"ubuntu-latest","goos":"linux","goarch":"amd64"},
+            {"os":"ubuntu-24.04-arm","goos":"linux","goarch":"arm64"},
+            {"os":"macos-14","goos":"darwin","goarch":"arm64"},
+            {"os":"macos-15-intel","goos":"darwin","goarch":"amd64"}
+          ]'
+          # Broad legs reuse existing goos/goarch artifacts on newer/older OS
+          # versions (e.g. ubuntu-22.04 = older glibc) to widen the run-anywhere
+          # signal without building new targets.
+          BROAD_UNIX='[
+            {"os":"ubuntu-22.04","goos":"linux","goarch":"amd64","optional":true},
+            {"os":"ubuntu-22.04-arm","goos":"linux","goarch":"arm64","optional":true},
+            {"os":"macos-15","goos":"darwin","goarch":"arm64","optional":true}
+          ]'
+          CORE_WIN='[{"os":"windows-latest"}]'
+          # windows-11-arm runs the shipped x86_64 binary under emulation —
+          # verifies the Windows artifact still launches on ARM hardware.
+          BROAD_WIN='[{"os":"windows-2025","optional":true},{"os":"windows-11-arm","optional":true}]'
+          CORE_PORTABLE='[
+            {"arch":"amd64","runner":"ubuntu-latest"},
+            {"arch":"arm64","runner":"ubuntu-24.04-arm"}
+          ]'
+          BROAD_PORTABLE='[
+            {"arch":"amd64","runner":"ubuntu-22.04","optional":true},
+            {"arch":"arm64","runner":"ubuntu-22.04-arm","optional":true}
+          ]'
+          if [ "$BROAD" = "true" ]; then
+            UNIX=$(jq -cn --argjson a "$CORE_UNIX" --argjson b "$BROAD_UNIX" '$a + $b')
+            WIN=$(jq -cn --argjson a "$CORE_WIN" --argjson b "$BROAD_WIN" '$a + $b')
+            PORTABLE=$(jq -cn --argjson a "$CORE_PORTABLE" --argjson b "$BROAD_PORTABLE" '$a + $b')
+          else
+            UNIX=$(jq -cn --argjson a "$CORE_UNIX" '$a')
+            WIN=$(jq -cn --argjson a "$CORE_WIN" '$a')
+            PORTABLE=$(jq -cn --argjson a "$CORE_PORTABLE" '$a')
+          fi
+          echo "unix={\"variant\":[\"standard\",\"ui\"],\"include\":$UNIX}" >> "$GITHUB_OUTPUT"
+          echo "windows={\"variant\":[\"standard\",\"ui\"],\"include\":$WIN}" >> "$GITHUB_OUTPUT"
+          echo "portable={\"variant\":[\"standard\",\"ui\"],\"include\":$PORTABLE}" >> "$GITHUB_OUTPUT"
+
   smoke-unix:
+    needs: setup-matrix
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            goos: linux
-            goarch: amd64
-          - os: ubuntu-24.04-arm
-            goos: linux
-            goarch: arm64
-          - os: macos-14
-            goos: darwin
-            goarch: arm64
-          - os: macos-15-intel
-            goos: darwin
-            goarch: amd64
-        variant: [standard, ui]
+      matrix: ${{ fromJSON(needs.setup-matrix.outputs.unix) }}
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -98,11 +148,12 @@ jobs:
           clamscan --no-summary ./codebase-memory-mcp
 
   smoke-windows:
+    needs: setup-matrix
     strategy:
       fail-fast: false
-      matrix:
-        variant: [standard, ui]
-    runs-on: windows-latest
+      matrix: ${{ fromJSON(needs.setup-matrix.outputs.windows) }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -164,16 +215,12 @@ jobs:
           Write-Host "=== Windows Defender: clean ==="
 
   smoke-linux-portable:
+    needs: setup-matrix
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-        variant: [standard, ui]
+      matrix: ${{ fromJSON(needs.setup-matrix.outputs.portable) }}
     runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3

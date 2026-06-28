@@ -1421,6 +1421,7 @@ static void kt_process_object_decl(KotlinLSPContext *ctx, TSNode node, bool is_c
         }
     }
 
+    rt.is_object = true; /* object / companion object → static-like member calls */
     cbm_registry_add_type((CBMTypeRegistry *)ctx->registry, rt);
 
     /* Recurse into body */
@@ -2245,8 +2246,12 @@ static const CBMType *kt_eval_constructor_or_func_call(KotlinLSPContext *ctx, TS
     if (cls_qn && ctx->registry) {
         const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, cls_qn);
         if (rt) {
-            kt_emit_resolved(ctx, kt_join_dot(ctx->arena, cls_qn, "<init>"), "lsp_kt_constructor",
-                             KT_CONF_CONSTRUCTOR);
+            /* A constructor call `Foo()` resolves to the Foo CLASS node, which the
+             * textual extractor stored; there is no separate `Foo.<init>` graph
+             * node, and the textual call site's callee is the bare class name
+             * `Foo` (not `<init>`). Emitting cls_qn (not cls_qn.<init>) makes the
+             * pipeline join's callee bare-segment match AND resolves the target. */
+            kt_emit_resolved(ctx, cls_qn, "lsp_kt_constructor", KT_CONF_CONSTRUCTOR);
             return cbm_type_named(ctx->arena, cls_qn);
         }
     }
@@ -2423,7 +2428,32 @@ static const CBMType *kt_eval_navigation_expression_type(KotlinLSPContext *ctx, 
         /* Check object-singleton or companion lookup */
         const CBMRegisteredFunc *rf = kotlin_lookup_method(ctx, recv_qn, member_text);
         if (rf && rf->qualified_name) {
-            kt_emit_resolved(ctx, rf->qualified_name, "lsp_kt_method", KT_CONF_METHOD);
+            /* Distinguish an extension function from a member method: a member's
+             * QN nests under the receiver (`<recv_qn>.<member>`), while an
+             * extension `fun Recv.ext()` is a TOP-LEVEL fun whose QN does NOT
+             * nest under recv_qn (only its receiver_type points back).
+             * kotlin_lookup_method matches both, so pick the strategy by QN shape. */
+            size_t recv_len = strlen(recv_qn);
+            bool is_member = (strncmp(rf->qualified_name, recv_qn, recv_len) == 0 &&
+                              rf->qualified_name[recv_len] == '.');
+            const char *strat = "lsp_kt_extension";
+            if (is_member) {
+                /* A member call on an `object`/`companion object` singleton is a
+                 * static dispatch; on a regular class instance it is a method. */
+                const CBMRegisteredType *recv_rt =
+                    cbm_registry_lookup_type(ctx->registry, recv_qn);
+                strat = (recv_rt && recv_rt->is_object) ? "lsp_kt_static" : "lsp_kt_method";
+            }
+            /* A call through the lambda implicit parameter `it` (e.g. inside
+             * `x.let { it.m() }`) is lambda-scoped dispatch, not a plain method. */
+            if (kt_node_is(receiver_node, "identifier") ||
+                kt_node_is(receiver_node, "simple_identifier")) {
+                char *rtext = kt_node_text(ctx, receiver_node);
+                if (rtext && strcmp(rtext, "it") == 0) {
+                    strat = "lsp_kt_lambda_it";
+                }
+            }
+            kt_emit_resolved(ctx, rf->qualified_name, strat, KT_CONF_METHOD);
             if (rf->signature && rf->signature->kind == CBM_TYPE_FUNC &&
                 rf->signature->data.func.return_types && rf->signature->data.func.return_types[0]) {
                 return rf->signature->data.func.return_types[0];
@@ -4076,11 +4106,14 @@ void cbm_run_kotlin_lsp(CBMArena *arena, CBMFileResult *result, const char *sour
         project_name = module_qn;
     }
 
-    /* Initial package_qn is empty — overridden by kotlin_lsp_process_file
-     * when it sees the `package_header` AST node. */
+    /* Initial package_qn is the FS-path module_qn ("<project>.<rel.path>"),
+     * matching the textual extractor's QN prefix so the LSP's caller_qn equals
+     * the call site's enclosing_func_qn (the join keys on an exact caller_qn
+     * match). A source `package_header`, when present, overrides this in
+     * kotlin_lsp_process_file for cross-file import resolution. */
     KotlinLSPContext ctx;
-    kotlin_lsp_init(&ctx, arena, use_source, use_source_len, &registry, "", module_qn, project_name,
-                    /*rel_path=*/NULL, &result->resolved_calls);
+    kotlin_lsp_init(&ctx, arena, use_source, use_source_len, &registry, module_qn, module_qn,
+                    project_name, /*rel_path=*/NULL, &result->resolved_calls);
 
     kotlin_lsp_process_file(&ctx, use_root);
 

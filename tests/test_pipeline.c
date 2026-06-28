@@ -1829,10 +1829,10 @@ TEST(pipeline_go_type_classification) {
     ASSERT_EQ(ic, 2);
     cbm_store_free_nodes(ifaces, ic);
 
-    /* Should have 1 Class node (Config struct) */
+    /* Should have 1 Struct node (Config struct) */
     cbm_node_t *cls = NULL;
     int cc = 0;
-    cbm_store_find_nodes_by_label(s, proj, "Class", &cls, &cc);
+    cbm_store_find_nodes_by_label(s, proj, "Struct", &cls, &cc);
     ASSERT_EQ(cc, 1);
     ASSERT_STR_EQ(cls[0].name, "Config");
     cbm_store_free_nodes(cls, cc);
@@ -1876,7 +1876,7 @@ TEST(pipeline_go_grouped_types) {
 
     cbm_node_t *cls = NULL;
     int cc = 0;
-    cbm_store_find_nodes_by_label(s, proj, "Class", &cls, &cc);
+    cbm_store_find_nodes_by_label(s, proj, "Struct", &cls, &cc);
     ASSERT_EQ(cc, 2); /* Request, Response */
     cbm_store_free_nodes(cls, cc);
 
@@ -2389,7 +2389,7 @@ TEST(pipeline_docstring_go_class) {
 
     bool found_docstring = false;
     for (int i = 0; i < nc; i++) {
-        if (strcmp(nodes[i].label, "Class") == 0 && nodes[i].properties_json &&
+        if (strcmp(nodes[i].label, "Struct") == 0 && nodes[i].properties_json &&
             strstr(nodes[i].properties_json, "docstring") &&
             strstr(nodes[i].properties_json, "MyStruct is documented")) {
             found_docstring = true;

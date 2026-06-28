@@ -10,6 +10,12 @@
 
 #include <stddef.h>
 #include <stdio.h>
+/* stdlib.h declares getenv (cbm_tmpdir) and, on Windows, _putenv_s (cbm_setenv/
+ * cbm_unsetenv). The x86-64 mingw toolchain pulled it in transitively, but the
+ * aarch64 (CLANGARM64) include chain does not, so include it directly — without
+ * it those calls become implicit declarations that conflict with the real
+ * stdlib.h types and fail to compile on native ARM64 Windows. */
+#include <stdlib.h>
 
 /* ── Thread-local storage ─────────────────────────────────────── */
 /* _Thread_local is C11 standard — works on GCC, Clang, and MSVC (2019+).

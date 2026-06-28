@@ -148,6 +148,9 @@ typedef struct {
     const char *to_name;
     const char *type;
     double confidence;
+    int64_t source_id; /* edge endpoints — let callers match an edge to a hop node */
+    int64_t target_id;
+    const char *properties_json; /* raw edge properties (carries CALLS arg expressions) */
 } cbm_edge_info_t;
 
 typedef struct {

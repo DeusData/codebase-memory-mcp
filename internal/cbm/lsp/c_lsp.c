@@ -744,9 +744,17 @@ static const char *c_adl_resolve(CLSPContext *ctx, const char *name, TSNode call
             namespaces[ns_count++] = ns;
     }
 
-    // Try each namespace
+    // Try each namespace, then the module-prefixed form of it. An argument type
+    // written as `ns::Data` evaluates to the namespace QN `ns`, but the function
+    // is registered under the module-qualified `<module>.ns.serialize`; without
+    // the module-prefixed retry the namespace-scoped overload is never found.
     for (int i = 0; i < ns_count; i++) {
         const CBMRegisteredFunc *f = cbm_registry_lookup_symbol(ctx->registry, namespaces[i], name);
+        if (!f && ctx->module_qn) {
+            const char *prefixed =
+                cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, namespaces[i]);
+            f = cbm_registry_lookup_symbol(ctx->registry, prefixed, name);
+        }
         if (f)
             return f->qualified_name;
     }
@@ -2559,12 +2567,71 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
         }
     }
 
+    /* Namespaced-type short-name fallback: a type name that resolves nowhere may
+     * be a type declared inside a namespace whose registered QN carries the
+     * namespace ("<module>.<ns>.Logger"), while the use site only knew the
+     * file-scoped "<module>.Logger" or the bare "Logger" (e.g. the return type of
+     * a namespace-scoped factory used outside that namespace). Resolve by the
+     * SHORT name (last segment) against the registry and retry with the full QN.
+     * Reached only after the direct/module/alias/base lookups all miss; prefers
+     * an in-module match. Mirrors the C# short-name type fallback. */
+    if (depth == 0 && ctx->registry) {
+        const char *dot = strrchr(type_qn, '.');
+        const char *shortn = dot ? dot + 1 : type_qn;
+        size_t slen = strlen(shortn);
+        const char *best_qn = NULL;
+        for (int i = 0; i < ctx->registry->type_count; i++) {
+            const char *q = ctx->registry->types[i].qualified_name;
+            if (!q) {
+                continue;
+            }
+            size_t qlen = strlen(q);
+            if (qlen <= slen + 1 || q[qlen - slen - 1] != '.' ||
+                strcmp(q + qlen - slen, shortn) != 0) {
+                continue;
+            }
+            if (strcmp(q, type_qn) == 0) {
+                continue; // already tried as-is above
+            }
+            best_qn = q;
+            if (ctx->module_qn && strncmp(q, ctx->module_qn, strlen(ctx->module_qn)) == 0) {
+                break; // prefer a match in the current module
+            }
+        }
+        if (best_qn) {
+            f = c_lookup_member_depth(ctx, best_qn, member_name, depth + 1);
+            if (f) {
+                return f;
+            }
+        }
+    }
+
     return NULL;
 }
 
 const CBMRegisteredFunc *c_lookup_member(CLSPContext *ctx, const char *type_qn,
                                          const char *member_name) {
     return c_lookup_member_depth(ctx, type_qn, member_name, 0);
+}
+
+// True if any BASE class of type_qn (not type_qn itself) declares member_name —
+// i.e. a method found directly on type_qn is an OVERRIDE of an inherited method.
+// This mirrors the existing virtual-dispatch notion (a derived override of a base
+// method) for the case where the override is resolved directly on the derived
+// type rather than through the base.
+static bool c_base_declares_member(CLSPContext *ctx, const char *type_qn, const char *member_name) {
+    const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, type_qn);
+    if (!rt && ctx->module_qn) {
+        rt = cbm_registry_lookup_type(
+            ctx->registry, cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, type_qn));
+    }
+    if (!rt || !rt->embedded_types)
+        return false;
+    for (int i = 0; rt->embedded_types[i]; i++) {
+        if (c_lookup_member(ctx, rt->embedded_types[i], member_name))
+            return true;
+    }
+    return false;
 }
 
 // Field type lookup
@@ -3284,8 +3351,8 @@ void c_process_statement(CLSPContext *ctx, TSNode node) {
 // Emit helpers
 // ============================================================================
 
-static void c_emit_resolved_call(CLSPContext *ctx, const char *callee_qn, const char *strategy,
-                                 float confidence) {
+static void c_emit_resolved_call_orig(CLSPContext *ctx, const char *callee_qn, const char *orig,
+                                      const char *strategy, float confidence) {
     if (!ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn)
         return;
     CBMResolvedCall rc;
@@ -3293,8 +3360,19 @@ static void c_emit_resolved_call(CLSPContext *ctx, const char *callee_qn, const 
     rc.callee_qn = callee_qn;
     rc.strategy = strategy;
     rc.confidence = confidence;
-    rc.reason = NULL;
+    // For a data-flow resolution (e.g. a function pointer `fp` resolved to its
+    // target), `reason` carries the ORIGINAL textual callee name the LSP
+    // resolved FROM, so the pipeline join can match the call site on that name
+    // even though it differs from the resolved callee_qn's short name. `reason`
+    // is otherwise NULL for resolved calls and is never read for them by the
+    // pipeline consumers, so this overload is side-effect-free.
+    rc.reason = orig;
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+}
+
+static void c_emit_resolved_call(CLSPContext *ctx, const char *callee_qn, const char *strategy,
+                                 float confidence) {
+    c_emit_resolved_call_orig(ctx, callee_qn, NULL, strategy, confidence);
 }
 
 static void c_emit_unresolved_call(CLSPContext *ctx, const char *expr_text, const char *reason) {
@@ -3402,6 +3480,11 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                                     } else {
                                         strategy = "lsp_base_dispatch";
                                     }
+                                } else if (c_base_declares_member(ctx, type_qn, field_name)) {
+                                    // Method resolved directly on type_qn but also
+                                    // declared in a base → a derived override of an
+                                    // inherited (virtual) method → polymorphic dispatch.
+                                    strategy = "lsp_virtual_dispatch";
                                 }
                                 // Check if through smart pointer
                                 if (is_arrow && obj_type->kind == CBM_TYPE_TEMPLATE &&
@@ -3601,9 +3684,12 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                     if (fp_target) {
                         // Distinguish DLL/dynamic resolution from static fp targets
                         bool is_dll = (strncmp(fp_target, "external.", 9) == 0);
-                        c_emit_resolved_call(ctx, fp_target,
-                                             is_dll ? "lsp_dll_resolve" : "lsp_func_ptr",
-                                             is_dll ? 0.80f : 0.85f);
+                        // The textual callee is the pointer variable `name` (e.g.
+                        // `fp`), resolved to a differently named target. Pass it
+                        // as orig so the join matches the call on the pointer name.
+                        c_emit_resolved_call_orig(ctx, fp_target, name,
+                                                  is_dll ? "lsp_dll_resolve" : "lsp_func_ptr",
+                                                  is_dll ? 0.80f : 0.85f);
                         goto recurse;
                     }
 
@@ -3762,7 +3848,12 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                 const char *short_name = strrchr(type_qn, '.');
                 short_name = short_name ? short_name + 1 : type_qn;
                 const char *dtor_qn = cbm_arena_sprintf(ctx->arena, "%s.~%s", type_qn, short_name);
-                c_emit_resolved_call(ctx, dtor_qn, "lsp_destructor", 0.90f);
+                // The destructor callee QN (`T.~T`) is not textually available
+                // from `delete p` — the call walk can only synthesize a call to
+                // the operand text. Stash that operand text in `reason` so the
+                // pipeline join binds the synthesized call via the reason gate.
+                c_emit_resolved_call_orig(ctx, dtor_qn, c_node_text(ctx, operand), "lsp_destructor",
+                                          0.90f);
             }
         }
     }
@@ -3934,6 +4025,13 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
          strcmp(kind, "do_statement") == 0)) {
         TSNode cond = ts_node_child_by_field_name(node, "condition", 9);
         if (!ts_node_is_null(cond)) {
+            // The `condition` field is a `condition_clause` wrapping the `( expr )`;
+            // unwrap it to the inner expression so its type evaluates (a clause
+            // node has no type, so `if (obj)` would never resolve obj's type).
+            if (strcmp(ts_node_type(cond), "condition_clause") == 0 &&
+                ts_node_named_child_count(cond) == 1) {
+                cond = ts_node_named_child(cond, 0);
+            }
             // If condition is a single expression of a custom type with operator bool
             const CBMType *cond_type = c_eval_expr_type(ctx, cond);
             const CBMType *base = c_simplify_type(ctx, cond_type, false);
@@ -4137,8 +4235,42 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
 
     // Build enclosing function QN
     const char *func_qn = c_build_qn(ctx, func_name);
-    if (ctx->module_qn && !strchr(func_qn, '.')) {
-        func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, func_qn);
+    // For a method defined INLINE inside its class body, func_name is a bare
+    // identifier ("compute") and enclosing_class_qn was inherited from
+    // c_process_class (saved_class_qn == enclosing_class_qn). The textual
+    // extractor and the registry qualify the method as module.Class.method, so
+    // building func_qn as module.method here (no class) made the LSP-resolved
+    // call's caller_qn disagree with the textual call's enclosing_func_qn and
+    // cbm_pipeline_find_lsp_resolution never joined them — every in-method call
+    // (e.g. lsp_implicit_this) silently lost its type-aware strategy. Prepend
+    // the enclosing class, mirroring the Go receiver-QN fix. Out-of-line
+    // definitions (Widget::compute) already carry the class in func_name (a
+    // qualified_identifier), so c_build_qn produces module.Class.method and the
+    // enclosing_class_qn was set HERE (saved_class_qn != enclosing_class_qn);
+    // skip those, and skip names that already contain the class scope.
+    if (ctx->enclosing_class_qn && saved_class_qn == ctx->enclosing_class_qn &&
+        !strchr(func_qn, '.')) {
+        func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->enclosing_class_qn, func_qn);
+    } else if (ctx->enclosing_class_qn && saved_class_qn != ctx->enclosing_class_qn &&
+               strchr(func_qn, '.')) {
+        /* Out-of-line method `Class::method`: c_build_qn yields the bare
+         * "Class.method" (no module) — the class scope was resolved HERE to the
+         * full module-qualified class QN (saved_class_qn != enclosing_class_qn).
+         * Rebuild as <class QN>.<method short name> so the caller_qn matches the
+         * def walk and call-scope QN, which qualify out-of-line methods the same
+         * way. Without this the caller_qn stays "Class.method", the exact-equality
+         * lsp_resolve join misses, and the LSP rescue is discarded (gap #5a). */
+        const char *dot = strrchr(func_qn, '.');
+        func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->enclosing_class_qn, dot + 1);
+    } else if (!strchr(func_qn, '.')) {
+        /* A free function in a namespace is qualified by the namespace scope
+         * (current_namespace is module_qn.ns), matching the def QN the extractor
+         * now produces; outside any namespace this falls back to the file module
+         * so non-namespaced free functions are unchanged. */
+        const char *scope = ctx->current_namespace ? ctx->current_namespace : ctx->module_qn;
+        if (scope) {
+            func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", scope, func_qn);
+        }
     }
     ctx->enclosing_func_qn = func_qn;
 

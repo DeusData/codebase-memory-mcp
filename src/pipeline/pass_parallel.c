@@ -391,6 +391,14 @@ static void free_import_map(const char **keys, const char **vals, int count) {
     }
 }
 
+/* True for languages whose module QN derives from the CONTAINING DIRECTORY
+ * (Java/Go package). MUST match cbm_lang_module_is_dir() (internal/cbm/helpers.c)
+ * and pxc_module_is_dir() (pass_lsp_cross.c) so same-module callee resolution
+ * keys against the directory-based def-node QNs in the registry. */
+static bool pp_module_is_dir(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
+}
+
 static bool is_checked_exception(const char *name) {
     if (!name) {
         return false;
@@ -410,12 +418,12 @@ static const char *resolve_as_class(const cbm_registry_t *reg, const char *name,
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         return NULL;
     }
+    /* Accept any type-like container (Class/Struct/Interface/Enum/Type/Trait):
+     * base classes, Rust `impl Trait for S` struct receivers, and Go struct
+     * embedding all resolve through here. Struct included so the struct receiver
+     * of an IMPLEMENTS edge is not dropped. */
     const char *label = cbm_registry_label_of(reg, res.qualified_name);
-    if (!label) {
-        return NULL;
-    }
-    if (strcmp(label, "Class") != 0 && strcmp(label, "Interface") != 0 &&
-        strcmp(label, "Type") != 0 && strcmp(label, "Enum") != 0) {
+    if (!cbm_label_is_type_like(label)) {
         return NULL;
     }
     return res.qualified_name;
@@ -822,11 +830,14 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     if (!def->name || !def->qualified_name || !def->label) {
         return 0;
     }
-    /* Register callable symbols + Interface — see pass_definitions.c for rationale.
-     * Variable/Field defs are registered too so READS/WRITES can resolve. */
+    /* Register callable symbols + every type-like container (Class/Struct/
+     * Interface/Enum/Type/Trait) — see pass_definitions.c for rationale. Struct
+     * included so Rust/Go/Swift/D structs resolve as type targets. Variable/Field
+     * defs are registered too so READS/WRITES can resolve.
+     * KEEP IN SYNC with pass_definitions.c and pipeline_incremental.c. */
     if (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
-        strcmp(def->label, "Class") == 0 || strcmp(def->label, "Interface") == 0 ||
-        strcmp(def->label, "Variable") == 0 || strcmp(def->label, "Field") == 0) {
+        cbm_label_is_type_like(def->label) || strcmp(def->label, "Variable") == 0 ||
+        strcmp(def->label, "Field") == 0) {
         cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
         (*reg_entries)++;
     }
@@ -1263,6 +1274,12 @@ static void emit_http_async_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t
 static void emit_config_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                              const cbm_gbuf_node_t *target, const CBMCall *call,
                              const cbm_resolution_t *res, const char *arg) {
+    /* emit_service_edge may be reached with target==NULL on the HTTP/ASYNC
+     * external-client bypass (#523); a CONFIGURES edge needs a real target, so
+     * never deref a NULL target here. */
+    if (!target) {
+        return;
+    }
     char esc_c[CBM_SZ_256];
     char esc_k[CBM_SZ_256];
     cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
@@ -1277,6 +1294,11 @@ static void emit_config_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
 static void emit_normal_calls_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                                    const cbm_gbuf_node_t *target, const CBMCall *call,
                                    const cbm_resolution_t *res) {
+    /* A CALLS edge needs a real target; the HTTP/ASYNC external-client bypass
+     * (#523) can reach emit_service_edge with target==NULL, so guard the deref. */
+    if (!target) {
+        return;
+    }
     char esc_c[CBM_SZ_256];
     cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
     char props[CBM_SZ_2K];
@@ -1841,6 +1863,31 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             continue;
         }
 
+        /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
+         * service signal lives in the callee_name. The registry can mis-resolve
+         * it to a spurious builtin short-name match (`requests.get` ->
+         * `builtins.dict.get` via "get"), which is non-empty and not an HTTP
+         * pattern, so the resolved-QN service checks below miss it and the call
+         * is dropped. Detect it on the callee_name FIRST so the HTTP_CALLS/
+         * ASYNC_CALLS edge is emitted regardless (target is a synthesized route
+         * node, not the unindexed library). Mirrors pass_calls.c. (#523) */
+        cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
+        if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
+            const char *cu = call->first_string_arg;
+            bool chas_url = cu && cu[0] != '\0' &&
+                            (cu[0] == '/' || strstr(cu, "://") != NULL ||
+                             (csvc == CBM_SVC_ASYNC && strlen(cu) > PP_ESC_SPACE));
+            if (chas_url) {
+                cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
+                                            .confidence = PP_HALF_CONF,
+                                            .strategy = "service_pattern"};
+                emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &svc_res,
+                                  module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
+                                  imp_count);
+                continue;
+            }
+        }
+
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
@@ -1866,6 +1913,23 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         atomic_fetch_add_explicit(&rc->time_ns_rc_target, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         if (!target_node || source_node->id == target_node->id) {
+            /* HTTP/ASYNC calls to an EXTERNAL client library (`requests.get(url)`)
+             * resolve to an unindexed QN (target_node == NULL), but their edge
+             * target is a synthesized route node, not the library — emit them
+             * anyway so cross-repo matching has an HTTP_CALLS edge to work with
+             * (#523). Mirrors the sequential resolve_single_call bypass. */
+            cbm_svc_kind_t psvc = cbm_service_pattern_match(res.qualified_name);
+            if ((psvc == CBM_SVC_HTTP || psvc == CBM_SVC_ASYNC) && !target_node) {
+                const char *u = call->first_string_arg;
+                bool url_or_topic = u && u[0] != '\0' &&
+                                    (u[0] == '/' || strstr(u, "://") != NULL ||
+                                     (psvc == CBM_SVC_ASYNC && strlen(u) > PP_ESC_SPACE));
+                if (url_or_topic) {
+                    emit_service_edge(ws->local_edge_buf, source_node, NULL, call, &res, module_qn,
+                                      rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count);
+                    ws->calls_resolved++;
+                }
+            }
             continue;
         }
         _rc_t0 = extract_now_ns();
@@ -2199,7 +2263,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
          * 98.7% hot spot in resolve_file_calls (881 of 893s CPU). */
         cbm_registry_resolve_cache_begin(result->calls.count + result->usages.count + 64);
 
-        char *module_qn = cbm_pipeline_fqn_module(rc->project_name, rel);
+        char *module_qn =
+            cbm_pipeline_fqn_module_dir(rc->project_name, rel, pp_module_is_dir(lang));
 
         /* ── Cross-file LSP (FUSED) ─────────────────────────────
          * Runs BEFORE resolve_file_calls so its additions to

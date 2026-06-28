@@ -509,9 +509,13 @@ static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_inf
  * resolve to the same-named Module node instead of the Class node. Only
  * callable / declared symbols belong in the registry. */
 static bool incr_label_is_registry_symbol(const char *label) {
+    /* Mirror pass_definitions.c / pass_parallel.c registry seeding EXACTLY:
+     * callables + every type-like container (Class/Struct/Interface/Enum/Type/
+     * Trait) + Variable/Field. Struct included so an incremental re-resolve seeds
+     * the same struct type nodes a full reindex would. */
     return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
-                     strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
-                     strcmp(label, "Variable") == 0 || strcmp(label, "Field") == 0);
+                     cbm_label_is_type_like(label) || strcmp(label, "Variable") == 0 ||
+                     strcmp(label, "Field") == 0);
 }
 
 /* Callback for cbm_gbuf_foreach_node: seed the registry with the existing

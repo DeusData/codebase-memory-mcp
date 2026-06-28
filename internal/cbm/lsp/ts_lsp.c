@@ -2653,6 +2653,16 @@ static void resolve_jsx_element(TSLSPContext *ctx, TSNode element_node) {
         const char *lname = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
         const char *mqn = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
         if (lname && mqn && strcmp(lname, tag_name) == 0) {
+            /* A relative module path ("./widget") is unresolved at the per-file
+             * stage — it is the raw specifier, not a module QN, so "./widget.Widget"
+             * matches no node and (winning the join on equal confidence) would drop
+             * the edge. The cross-file pass re-runs with the path resolved to the
+             * real module QN and emits the correct resolution, so skip the per-file
+             * emission for relative specifiers and let that one stand. */
+            if (mqn[0] == '.') {
+                ts_emit_unresolved_call(ctx, tag_name, "jsx_import_unresolved_path");
+                return;
+            }
             const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, tag_name);
             ts_emit_resolved_call(ctx, qn, "lsp_ts_jsx_import", 0.85f);
             return;

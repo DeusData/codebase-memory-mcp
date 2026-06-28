@@ -2691,6 +2691,15 @@ int cbm_cmd_config(int argc, char **argv) {
 /* Global auto-answer mode: 0=interactive, 1=always yes, -1=always no */
 static int g_auto_answer = 0;
 
+/* Test seam: force the auto-answer state so non-interactive bug-repro tests
+ * can drive prompt_yn() deterministically (1 => yes, -1 => no, 0 => prompt).
+ * Not declared in cli.h (internal); the repro runner links cli.c directly and
+ * carries an extern forward declaration. Production never calls this. */
+void cbm_set_auto_answer_for_test(int value);
+void cbm_set_auto_answer_for_test(int value) {
+    g_auto_answer = value;
+}
+
 static void parse_auto_answer(int argc, char **argv) {
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) {
@@ -3120,11 +3129,24 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         snprintf(ip, sizeof(ip), "%s/.codex/AGENTS.md", home);
         install_generic_agent_config("Codex CLI", binary_path, cp, ip, dry_run,
                                      cbm_upsert_codex_mcp);
+        /* Choose the hook target: if ~/.codex/hooks.json already exists, the
+         * user manages Codex hooks via the JSON representation — write the
+         * SessionStart reminder there instead of config.toml. Writing both
+         * makes Codex warn about loading hooks from two representations (#570).
+         * config.toml remains the mcp_config target above either way. */
+        char hooks_json[CLI_BUF_1K];
+        snprintf(hooks_json, sizeof(hooks_json), "%s/.codex/hooks.json", home);
+        bool use_hooks_json = cbm_file_exists(hooks_json);
+        const char *hook_target = use_hooks_json ? hooks_json : cp;
         if (g_install_plan) {
-            plan_record("Codex CLI", "hook", cp);
+            plan_record("Codex CLI", "hook", hook_target);
         } else {
             if (!dry_run) {
-                cbm_upsert_codex_hooks(cp);
+                if (use_hooks_json) {
+                    cbm_upsert_gemini_session_hooks(hooks_json);
+                } else {
+                    cbm_upsert_codex_hooks(cp);
+                }
             }
             printf("  hooks: SessionStart (codebase-memory-mcp reminder)\n");
         }
@@ -3183,6 +3205,36 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
     }
 }
 
+/* Scan Code/User/profiles/ and install (or plan) a per-profile mcp.json for
+ * each existing profile subdirectory, so VS Code profile users inherit the MCP
+ * server without manual steps (#431). No-op when profiles/ is absent. */
+static void install_vscode_profile_configs(const char *code_user, const char *binary_path,
+                                           bool dry_run) {
+    char profiles_dir[CLI_BUF_1K];
+    snprintf(profiles_dir, sizeof(profiles_dir), "%s/profiles", code_user);
+    cbm_dir_t *d = cbm_opendir(profiles_dir);
+    if (!d) {
+        return;
+    }
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        if (strcmp(ent->name, ".") == 0 || strcmp(ent->name, "..") == 0) {
+            continue;
+        }
+        char profile_path[CLI_BUF_1K];
+        snprintf(profile_path, sizeof(profile_path), "%s/%s", profiles_dir, ent->name);
+        struct stat st;
+        if (stat(profile_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            continue;
+        }
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/mcp.json", profile_path);
+        install_generic_agent_config("VS Code", binary_path, cp, NULL, dry_run,
+                                     cbm_install_vscode_mcp);
+    }
+    cbm_closedir(d);
+}
+
 /* Install MCP configs for editor-based agents (Zed, KiloCode, VS Code, OpenClaw). */
 static void install_editor_agent_configs(const cbm_detected_agents_t *agents, const char *home,
                                          const char *binary_path, bool dry_run) {
@@ -3215,14 +3267,21 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
                                      cbm_install_editor_mcp);
     }
     if (agents->vscode) {
-        char cp[CLI_BUF_1K];
+        char code_user[CLI_BUF_1K];
 #ifdef __APPLE__
-        snprintf(cp, sizeof(cp), "%s/Library/Application Support/Code/User/mcp.json", home);
+        snprintf(code_user, sizeof(code_user), "%s/Library/Application Support/Code/User", home);
 #else
-        snprintf(cp, sizeof(cp), "%s/Code/User/mcp.json", cbm_app_config_dir());
+        snprintf(code_user, sizeof(code_user), "%s/Code/User", cbm_app_config_dir());
 #endif
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/mcp.json", code_user);
         install_generic_agent_config("VS Code", binary_path, cp, NULL, dry_run,
                                      cbm_install_vscode_mcp);
+        /* VS Code profiles each keep their own settings under
+         * Code/User/profiles/<id>/. The default mcp.json above does NOT apply
+         * to a named profile, so write/plan a per-profile mcp.json for every
+         * existing profile directory (#431). */
+        install_vscode_profile_configs(code_user, binary_path, dry_run);
     }
     if (agents->cursor) {
         char cp[CLI_BUF_1K];
@@ -3283,6 +3342,59 @@ static int count_db_indexes(const char *home) {
     }
     cbm_closedir(d);
     return count;
+}
+
+/* Handle pre-existing indexes during (re)install (#607).
+ *
+ * Returns 1 to proceed with the install, 0 to abort (user declined the
+ * destructive reset prompt).
+ *
+ * Default (reset=false): PRESERVE the indexed graph. We do NOT delete any
+ * .db. We print an honest message telling the user the indexes are kept and
+ * that they should re-index after install to pick up this version's
+ * extraction improvements. The old behaviour deleted every index here while
+ * printing "must be rebuilt" and never rebuilt — silent, irrecoverable data
+ * loss (#607). Deletion is NOT a schema requirement (the store uses CREATE
+ * TABLE IF NOT EXISTS with no migrations); it only guarded against stale
+ * content, which a re-index fixes without destroying anything.
+ *
+ * Opt-in (reset=true, via `install --reset-indexes`): keep the original
+ * prompt-and-delete behaviour, with honest "Delete" wording.
+ *
+ * Not static: linked into the bug-repro test runner so repro_issue607.c can
+ * assert the default path preserves the DB. It is intentionally NOT declared
+ * in cli.h (internal helper); the test carries an extern forward declaration.
+ */
+int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_run);
+int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_run) {
+    int index_count = count_db_indexes(home);
+    if (index_count <= 0) {
+        return 1; /* nothing to handle, proceed */
+    }
+
+    if (!reset) {
+        /* Default: preserve. Be honest — keep the indexes, advise re-index. */
+        printf("Found %d existing index(es). Keeping them. After install, "
+               "re-index to pick up this version's improvements:\n",
+               index_count);
+        cbm_list_indexes(home);
+        printf("\n");
+        return 1; /* proceed without deleting */
+    }
+
+    /* Opt-in reset (--reset-indexes): the original prompt-and-delete path. */
+    printf("Found %d existing index(es):\n", index_count);
+    cbm_list_indexes(home);
+    printf("\n");
+    if (!prompt_yn("Delete these indexes and continue with install?")) {
+        printf("Install cancelled.\n");
+        return 0; /* abort */
+    }
+    if (!dry_run) {
+        int removed = cbm_remove_indexes(home);
+        printf("Removed %d index(es).\n\n", removed);
+    }
+    return 1; /* proceed */
 }
 
 /* ── Subcommand: install ──────────────────────────────────────── */
@@ -3395,6 +3507,7 @@ int cbm_cmd_install(int argc, char **argv) {
     bool dry_run = false;
     bool force = false;
     bool plan = false;
+    bool reset_indexes = false;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
@@ -3404,6 +3517,11 @@ int cbm_cmd_install(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--plan") == 0) {
             plan = true;
+        }
+        /* Opt-in: delete existing indexes during install. Default preserves
+         * the indexed graph (#607). Only this flag triggers deletion. */
+        if (strcmp(argv[i], "--reset-indexes") == 0) {
+            reset_indexes = true;
         }
     }
 
@@ -3431,19 +3549,11 @@ int cbm_cmd_install(int argc, char **argv) {
 
     printf("codebase-memory-mcp install %s\n\n", CBM_VERSION);
 
-    int index_count = count_db_indexes(home);
-    if (index_count > 0) {
-        printf("Found %d existing index(es) that must be rebuilt:\n", index_count);
-        cbm_list_indexes(home);
-        printf("\n");
-        if (!prompt_yn("Delete these indexes and continue with install?")) {
-            printf("Install cancelled.\n");
-            return CLI_TRUE;
-        }
-        if (!dry_run) {
-            int removed = cbm_remove_indexes(home);
-            printf("Removed %d index(es).\n\n", removed);
-        }
+    /* (#607) Default: preserve existing indexes. `--reset-indexes` opts into
+     * the old prompt-and-delete behaviour. The helper returns 0 only when the
+     * user declines the reset prompt, in which case we abort the install. */
+    if (cbm_install_handle_existing_indexes(home, reset_indexes, dry_run) == 0) {
+        return CLI_TRUE;
     }
 
     /* Step 1b: Kill running MCP server instances so agents pick up new config */

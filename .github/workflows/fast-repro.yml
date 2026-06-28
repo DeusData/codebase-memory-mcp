@@ -1,0 +1,37 @@
+# Fast repro lane — single platform, NO sanitizers — for quick fix-iteration
+# feedback (the red-count after a fix) without waiting ~15 min for the full
+# 5-platform ASan board. The full bug-repro.yml board remains the comprehensive
+# all-platform check; this is just the fast inner loop.
+#
+# Trigger: workflow_dispatch, or push to a qa/fast-** branch. Non-gating.
+name: Fast Repro
+
+on:
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: 'Comma list of suite-name substrings to run (empty = all)'
+        type: string
+        default: ''
+  push:
+    branches: ['qa/fast-**']
+
+permissions:
+  contents: read
+
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+      - name: test-repro (single platform, ASan; CBM_REPRO_ONLY filters suites)
+        env:
+          # Optionally narrow to specific suites for a fast targeted check, e.g.
+          # CBM_REPRO_ONLY="repro_invariant_enclosing_parity,repro_grammar_systems".
+          # Empty = run all. (No-sanitizer builds crash on some suites, so ASan
+          # stays on; the single-platform run is the speedup vs the 5-platform board.)
+          CBM_REPRO_ONLY: ${{ github.event.inputs.suites }}
+        run: scripts/repro.sh CC=gcc CXX=g++

@@ -1779,8 +1779,8 @@ void java_lsp_process_file(JavaLSPContext *ctx, TSNode root) {
 
 /* ── Call-edge resolution ─────────────────────────────────────────── */
 
-static void java_emit_resolved(JavaLSPContext *ctx, const char *callee_qn, const char *strategy,
-                               float confidence) {
+static void java_emit_resolved_orig(JavaLSPContext *ctx, const char *callee_qn, const char *orig,
+                                    const char *strategy, float confidence) {
     if (!ctx->resolved_calls || !ctx->enclosing_method_qn || !callee_qn)
         return;
     CBMResolvedCall rc;
@@ -1788,8 +1788,17 @@ static void java_emit_resolved(JavaLSPContext *ctx, const char *callee_qn, const
     rc.callee_qn = callee_qn;
     rc.strategy = strategy;
     rc.confidence = confidence;
-    rc.reason = NULL;
+    // For a data-flow resolution (constructor reference `Lhs::new` resolved to
+    // the Lhs class), `reason` carries the ORIGINAL textual callee (`new`) so the
+    // pipeline join can match the textual call site even though the resolved
+    // callee_qn's short name differs. NULL/unread for normal resolved calls.
+    rc.reason = orig;
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+}
+
+static void java_emit_resolved(JavaLSPContext *ctx, const char *callee_qn, const char *strategy,
+                               float confidence) {
+    java_emit_resolved_orig(ctx, callee_qn, NULL, strategy, confidence);
 }
 
 static void java_emit_unresolved(JavaLSPContext *ctx, const char *expr_text, const char *reason) {
@@ -1802,6 +1811,108 @@ static void java_emit_unresolved(JavaLSPContext *ctx, const char *expr_text, con
     rc.confidence = 0.0f;
     rc.reason = reason;
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+}
+
+/* Find a sole concrete in-project implementer of interface `iface_qn` that
+ * declares method `mname`. Returns the implementer's QN when exactly ONE
+ * exists (else NULL), and sets *out_count to the number found (capped at 2,
+ * so 2 means "two or more"). Walks the registered-type parent chain to
+ * confirm true subtyping. Mirrors the inline detection that used to live in
+ * resolve_method_call so both the f-found and f-absent interface paths share
+ * identical semantics. */
+static const char *java_find_sole_impl(JavaLSPContext *ctx, const char *iface_qn, const char *mname,
+                                       int *out_count) {
+    const char *first = NULL; /* first distinct impl QN seen */
+    int distinct = 0;         /* distinct impl classes (capped at 2) */
+    const char *iface_dot = strrchr(iface_qn, '.');
+    const char *iface_bare = iface_dot ? iface_dot + 1 : iface_qn;
+    for (int ti = 0; ti < ctx->registry->type_count && distinct < 2; ti++) {
+        const CBMRegisteredType *cand = &ctx->registry->types[ti];
+        if (cand->is_interface || !cand->qualified_name || cand->alias_of)
+            continue;
+        /* Does cand declare `mname`? The method-name array is often empty for
+         * fixture classes; the method REGISTRY is the authoritative source the
+         * dispatch path already uses, so consult it first and fall back to the
+         * name array. */
+        bool has = cbm_registry_lookup_method(ctx->registry, cand->qualified_name, mname) != NULL;
+        if (!has && cand->method_names) {
+            for (int mi = 0; cand->method_names[mi]; mi++) {
+                if (strcmp(cand->method_names[mi], mname) == 0) {
+                    has = true;
+                    break;
+                }
+            }
+        }
+        if (!has)
+            continue;
+        /* Subtype check: walk cand's supertype chain, matching iface by FULL
+         * QN or BARE name. The registry holds duplicate type entries whose
+         * `embedded_types` list a supertype sometimes by short name ("Shape")
+         * and sometimes by full QN ("proj.Shape"); a full-QN-only comparison
+         * silently misses the short-name form, so compare both. */
+        const char *cur = cand->qualified_name;
+        bool subtype = false;
+        for (int hops = 0; hops < JAVA_LSP_MAX_INHERIT_HOPS && cur && !subtype; hops++) {
+            const CBMRegisteredType *ct = cbm_registry_lookup_type(ctx->registry, cur);
+            if (!ct || !ct->embedded_types)
+                break;
+            const char *next = NULL;
+            for (int pi = 0; ct->embedded_types[pi]; pi++) {
+                const char *e = ct->embedded_types[pi];
+                const char *edot = strrchr(e, '.');
+                const char *ebare = edot ? edot + 1 : e;
+                if (strcmp(e, iface_qn) == 0 || strcmp(ebare, iface_bare) == 0) {
+                    subtype = true;
+                    break;
+                }
+                if (!next)
+                    next = e; /* first supertype → continue the walk upward */
+            }
+            cur = next;
+        }
+        if (!subtype)
+            continue;
+        /* Count DISTINCT impl classes: the registry duplicates entries per
+         * class, so dedup by QN — two entries of one class must not read as
+         * two implementers. */
+        if (!first) {
+            first = cand->qualified_name;
+            distinct = 1;
+        } else if (strcmp(first, cand->qualified_name) != 0) {
+            distinct = 2;
+        }
+    }
+    if (out_count)
+        *out_count = distinct;
+    return distinct == 1 ? first : NULL;
+}
+
+/* Emit the resolution for an interface-typed receiver `iface_qn` calling
+ * `mname`: a sole concrete in-project impl → lsp_interface_resolve (resolved
+ * to that impl's method, with a synthesized QN when the method isn't in the
+ * method registry); two-or-more impls → lsp_interface_dispatch on a synthesized
+ * iface-qualified target. Returns true when it emitted (caller should return),
+ * false when there is NO in-project implementer (impl_count == 0) so the caller
+ * can fall back to dispatching on the interface's own method — this keeps JDK
+ * interface calls (List/Stream/Predicate, no in-project impl) resolving via the
+ * strict type_dispatch path instead of being downgraded to interface_dispatch. */
+static bool java_emit_interface_resolution(JavaLSPContext *ctx, const char *iface_qn,
+                                           const char *mname) {
+    int impl_count = 0;
+    const char *sole_impl = java_find_sole_impl(ctx, iface_qn, mname, &impl_count);
+    if (impl_count == 1 && sole_impl) {
+        const CBMRegisteredFunc *cf = cbm_registry_lookup_method(ctx->registry, sole_impl, mname);
+        const char *target =
+            cf ? cf->qualified_name : cbm_arena_sprintf(ctx->arena, "%s.%s", sole_impl, mname);
+        java_emit_resolved(ctx, target, "lsp_interface_resolve", 0.85f);
+        return true;
+    }
+    if (impl_count >= 2) {
+        java_emit_resolved(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", iface_qn, mname),
+                           "lsp_interface_dispatch", 0.80f);
+        return true;
+    }
+    return false; /* impl_count == 0: caller falls back to type_dispatch. */
 }
 
 static void resolve_method_call(JavaLSPContext *ctx, TSNode call) {
@@ -1852,6 +1963,28 @@ static void resolve_method_call(JavaLSPContext *ctx, TSNode call) {
                 continue;
             char *cls = cbm_arena_strndup(ctx->arena, target, (size_t)(last_dot - target));
             const CBMRegisteredFunc *f = java_lookup_method(ctx, cls, mname, arity);
+            if (!f && ctx->registry) {
+                /* The import is written package-qualified ("demo.Util"), but the
+                 * class is registered under the project/directory QN
+                 * ("<proj>.Util") when the `package` declaration and the file's
+                 * directory differ. Resolve the import's class by its short name
+                 * against the registry and retry — preferring an in-module match.
+                 * Mirrors the C++ short-name type fallback. */
+                const char *cls_dot = strrchr(cls, '.');
+                const char *cls_short = cls_dot ? cls_dot + 1 : cls;
+                size_t sl = strlen(cls_short);
+                for (int ti = 0; ti < ctx->registry->type_count && !f; ti++) {
+                    const char *q = ctx->registry->types[ti].qualified_name;
+                    if (!q) {
+                        continue;
+                    }
+                    size_t ql = strlen(q);
+                    if (ql > sl + 1 && q[ql - sl - 1] == '.' &&
+                        strcmp(q + ql - sl, cls_short) == 0) {
+                        f = java_lookup_method(ctx, q, mname, arity);
+                    }
+                }
+            }
             if (f) {
                 java_emit_resolved(ctx, f->qualified_name, "lsp_static_import", 0.92f);
                 return;
@@ -1920,6 +2053,15 @@ static void resolve_method_call(JavaLSPContext *ctx, TSNode call) {
     if (recv_qn) {
         const CBMRegisteredFunc *f = java_lookup_method(ctx, recv_qn, mname, arity);
         if (f) {
+            /* When the receiver is an interface, java_lookup_method finds the
+             * interface's OWN (abstract/default) method. Prefer resolving to a
+             * sole concrete in-project implementer first; only fall through to
+             * type_dispatch on the interface method when there is NO in-project
+             * impl (e.g. JDK List/Stream/Predicate), keeping those strict. */
+            const CBMRegisteredType *rt0 = cbm_registry_lookup_type(ctx->registry, recv_qn);
+            if (rt0 && rt0->is_interface && java_emit_interface_resolution(ctx, recv_qn, mname)) {
+                return;
+            }
             const char *strategy = "lsp_type_dispatch";
             if (f->receiver_type && strcmp(f->receiver_type, recv_qn) != 0) {
                 strategy = "lsp_inherited_dispatch";
@@ -1927,64 +2069,12 @@ static void resolve_method_call(JavaLSPContext *ctx, TSNode call) {
             java_emit_resolved(ctx, f->qualified_name, strategy, 0.95f);
             return;
         }
-        /* Interface dispatch: walk all registered types implementing the
-         * interface and find a sole concrete impl. */
+        /* Interface dispatch with no directly-registered method: resolve to a
+         * sole concrete impl, else a synthesized iface-qualified dispatch. */
         const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, recv_qn);
         if (rt && rt->is_interface) {
-            const char *sole_impl = NULL;
-            int impl_count = 0;
-            for (int ti = 0; ti < ctx->registry->type_count && impl_count < 2; ti++) {
-                const CBMRegisteredType *cand = &ctx->registry->types[ti];
-                if (cand->is_interface || !cand->qualified_name || cand->alias_of)
-                    continue;
-                bool has = false;
-                if (cand->method_names) {
-                    for (int mi = 0; cand->method_names[mi]; mi++) {
-                        if (strcmp(cand->method_names[mi], mname) == 0) {
-                            has = true;
-                            break;
-                        }
-                    }
-                }
-                if (!has)
-                    continue;
-                /* Walk parent chain to confirm it's actually a subtype of rt. */
-                const char *cur = cand->qualified_name;
-                bool subtype = false;
-                for (int hops = 0; hops < JAVA_LSP_MAX_INHERIT_HOPS && cur; hops++) {
-                    if (strcmp(cur, recv_qn) == 0) {
-                        subtype = true;
-                        break;
-                    }
-                    const CBMRegisteredType *par = cbm_registry_lookup_type(ctx->registry, cur);
-                    if (!par || !par->embedded_types || !par->embedded_types[0])
-                        break;
-                    /* Walk all parents — pick the first match. */
-                    bool advanced = false;
-                    for (int pi = 0; par->embedded_types[pi]; pi++) {
-                        if (strcmp(par->embedded_types[pi], recv_qn) == 0) {
-                            subtype = true;
-                            cur = NULL;
-                            break;
-                        }
-                    }
-                    if (subtype)
-                        break;
-                    if (!advanced)
-                        cur = par->embedded_types[0];
-                }
-                if (subtype) {
-                    sole_impl = cand->qualified_name;
-                    impl_count++;
-                }
-            }
-            if (impl_count == 1 && sole_impl) {
-                const CBMRegisteredFunc *cf =
-                    cbm_registry_lookup_method(ctx->registry, sole_impl, mname);
-                if (cf) {
-                    java_emit_resolved(ctx, cf->qualified_name, "lsp_interface_resolve", 0.85f);
-                    return;
-                }
+            if (java_emit_interface_resolution(ctx, recv_qn, mname)) {
+                return;
             }
             java_emit_resolved(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", recv_qn, mname),
                                "lsp_interface_dispatch", 0.80f);
@@ -2587,12 +2677,15 @@ static void resolve_method_reference(JavaLSPContext *ctx, TSNode mref,
         short_name = short_name ? short_name + 1 : type_qn;
         const CBMRegisteredFunc *cf =
             cbm_registry_lookup_method(ctx->registry, type_qn, short_name);
-        if (cf) {
-            java_emit_resolved(ctx, cf->qualified_name, "lsp_method_ref_ctor", 0.90f);
-        } else {
-            java_emit_resolved(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", type_qn, short_name),
-                               "lsp_method_ref_ctor_synth", 0.80f);
-        }
+        // A `ClassName::new` reference constructs ClassName: resolve to the
+        // ClassName CLASS node (which the textual extractor stored), not the
+        // synthetic constructor QN that has no graph node. orig=mname ("new")
+        // lets the join match the textual `new` call site (the constructor
+        // reference is extracted as a call to `new`). cf distinguishes an
+        // indexed constructor (higher confidence) from a synthesized one.
+        java_emit_resolved_orig(ctx, type_qn, mname,
+                                cf ? "lsp_method_ref_ctor" : "lsp_method_ref_ctor_synth",
+                                cf ? 0.90f : 0.80f);
         return;
     }
 
@@ -2786,10 +2879,13 @@ static void java_resolve_calls_in_node_inner(JavaLSPContext *ctx, TSNode node) {
                 if (cf) {
                     java_emit_resolved(ctx, cf->qualified_name, "lsp_constructor", 0.95f);
                 } else {
-                    /* Synth a constructor QN — Class.Class — so downstream
-                     * still gets a resolvable edge. */
-                    java_emit_resolved(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", qn, short_name),
-                                       "lsp_constructor_synth", 0.85f);
+                    /* No explicit constructor in the registry, so there is no
+                     * `Class.Class` ctor node to point at. Resolve the `new Foo()`
+                     * call to the Foo CLASS node (`qn`) instead: its short name
+                     * equals the textual callee_name ("Foo"), so the pipeline
+                     * join matches, and the class node always exists, so a CALLS
+                     * edge forms carrying the strategy. */
+                    java_emit_resolved(ctx, qn, "lsp_constructor_synth", 0.85f);
                 }
             }
         }

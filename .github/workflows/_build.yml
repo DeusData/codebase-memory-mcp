@@ -45,7 +45,7 @@ jobs:
     # release with no Intel macOS binary (a user-reported gap). macos-15-intel
     # is GitHub's supported Intel image through Aug 2027 (the last x86_64 macOS
     # runner); revisit the Intel leg before that retirement.
-    timeout-minutes: 25
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
@@ -120,7 +120,7 @@ jobs:
 
   build-windows:
     runs-on: windows-latest
-    timeout-minutes: 25
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
@@ -195,7 +195,7 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 25
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 

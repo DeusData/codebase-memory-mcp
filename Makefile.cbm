@@ -390,7 +390,65 @@ TEST_SIMHASH_SRCS = tests/test_simhash.c
 
 TEST_STACK_OVERFLOW_SRCS = tests/test_stack_overflow.c
 
-ALL_TEST_SRCS = $(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
+# Cumulative BUG-REPRODUCTION suite (separate runner, NOT in ALL_TEST_SRCS).
+# These cases are RED by design (one open bug each) — see tests/repro/repro_main.c.
+# Kept out of the gating `make test` so `ci-ok` stays green; run via `make test-repro`.
+TEST_REPRO_SRCS = \
+    tests/repro/repro_main.c \
+    tests/repro/repro_extraction.c \
+    tests/repro/repro_issue495.c \
+    tests/repro/repro_issue521.c \
+    tests/repro/repro_issue382.c \
+    tests/repro/repro_issue408.c \
+    tests/repro/repro_issue56.c \
+    tests/repro/repro_issue480.c \
+    tests/repro/repro_issue571.c \
+    tests/repro/repro_issue523.c \
+    tests/repro/repro_issue546.c \
+    tests/repro/repro_issue627.c \
+    tests/repro/repro_issue514.c \
+    tests/repro/repro_issue510.c \
+    tests/repro/repro_issue557.c \
+    tests/repro/repro_issue520.c \
+    tests/repro/repro_issue333.c \
+    tests/repro/repro_issue570.c \
+    tests/repro/repro_issue409.c \
+    tests/repro/repro_issue431.c \
+    tests/repro/repro_issue607.c \
+    tests/repro/repro_issue403.c \
+    tests/repro/repro_issue434.c \
+    tests/repro/repro_issue471.c \
+    tests/repro/repro_issue221.c \
+    tests/repro/repro_issue548.c \
+    tests/repro/repro_new_ts_class_field_arrow.c \
+    tests/repro/repro_new_py_tuple_unpack.c \
+    tests/repro/repro_new_cypher_limit_zero.c \
+    tests/repro/repro_issue363.c \
+    tests/repro/repro_issue581.c \
+    tests/repro/repro_invariant_calls.c \
+    tests/repro/repro_invariant_graph.c \
+    tests/repro/repro_invariant_breadth.c \
+    tests/repro/repro_invariant_enclosing_parity.c \
+    tests/repro/repro_invariant_lsp_rescue.c \
+    tests/repro/repro_invariant_discovery_fqn.c \
+    tests/repro/repro_grammar_core.c \
+    tests/repro/repro_grammar_scripting.c \
+    tests/repro/repro_grammar_functional.c \
+    tests/repro/repro_grammar_systems.c \
+    tests/repro/repro_grammar_web.c \
+    tests/repro/repro_grammar_config.c \
+    tests/repro/repro_grammar_build.c \
+    tests/repro/repro_grammar_shells.c \
+    tests/repro/repro_grammar_scientific.c \
+    tests/repro/repro_grammar_markup.c \
+    tests/repro/repro_grammar_misc.c \
+    tests/repro/repro_lsp_c_cpp.c \
+    tests/repro/repro_lsp_go_py.c \
+    tests/repro/repro_lsp_ts.c \
+    tests/repro/repro_lsp_java_cs.c \
+    tests/repro/repro_lsp_kt_php_rust.c
+
+ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
 
 
 # ── Build directories ────────────────────────────────────────────
@@ -414,7 +472,7 @@ PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-repro test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -505,6 +563,20 @@ $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_
 
 test: $(BUILD_DIR)/test-runner
 	cd $(CURDIR) && $(BUILD_DIR)/test-runner
+
+# ── Cumulative bug-reproduction runner (RED by design, non-gating) ──
+# Mirrors test-runner's link line but uses repro_main.c (own main + counters)
+# and TEST_REPRO_SRCS instead of ALL_TEST_SRCS. Exits non-zero while any bug is
+# still reproduced (the expected state); bug-repro.yml surfaces it as a board.
+$(BUILD_DIR)/test-repro-runner: $(TEST_REPRO_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_TEST) -Itests -o $@ \
+		$(TEST_REPRO_SRCS) $(PROD_SRCS) \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
+		$(OBJS_VENDORED_TEST) \
+		$(LDFLAGS_TEST)
+
+test-repro: $(BUILD_DIR)/test-repro-runner
+	cd $(CURDIR) && $(BUILD_DIR)/test-repro-runner
 
 # ── TSan full test ───────────────────────────────────────────────
 
