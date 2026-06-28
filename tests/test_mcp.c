@@ -726,6 +726,23 @@ TEST(tool_trace_path_not_found) {
     PASS();
 }
 
+TEST(tool_trace_call_path_alias_dispatches) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"trace_call_path\","
+                                   "\"arguments\":{\"function_name\":\"NonExistent\","
+                                   "\"project\":\"nonexistent\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "not found"));
+    ASSERT_NULL(strstr(resp, "unknown tool"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_trace_missing_function_name) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -2584,6 +2601,7 @@ SUITE(mcp) {
 
     /* Tool handlers with validation */
     RUN_TEST(tool_trace_path_not_found);
+    RUN_TEST(tool_trace_call_path_alias_dispatches);
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_path_ambiguous);
     RUN_TEST(tool_trace_path_prefers_definition);
