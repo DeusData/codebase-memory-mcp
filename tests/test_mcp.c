@@ -171,12 +171,12 @@ TEST(mcp_tools_list) {
     /* §4b: when srv=NULL (no config), cbm_mcp_tools_list defaults to "streamlined"
      * mode and emits the 5-tool default surface: the 3 focused search tools
      * (search_graph, query_graph, search_code) drawn from TOOLS[], plus
-     * trace_call_path and get_code from STREAMLINED_TOOLS[]. The old
+     * trace_path and get_code from STREAMLINED_TOOLS[]. The old
      * search_code_graph mega-tool has been deleted. */
     ASSERT_NOT_NULL(strstr(json, "search_graph"));
     ASSERT_NOT_NULL(strstr(json, "query_graph"));
     ASSERT_NOT_NULL(strstr(json, "search_code"));
-    ASSERT_NOT_NULL(strstr(json, "trace_call_path"));
+    ASSERT_NOT_NULL(strstr(json, "trace_path"));
     ASSERT_NOT_NULL(strstr(json, "get_code"));
     /* The deleted mega-tool must NOT appear */
     ASSERT_NULL(strstr(json, "search_code_graph"));
@@ -365,7 +365,7 @@ TEST(server_handle_tools_list) {
     ASSERT_NOT_NULL(strstr(resp, "\"id\":2"));
     /* §4b: streamlined mode default surface — 5 split tools */
     ASSERT_NOT_NULL(strstr(resp, "search_graph"));
-    ASSERT_NOT_NULL(strstr(resp, "trace_call_path"));
+    ASSERT_NOT_NULL(strstr(resp, "trace_path"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -663,12 +663,12 @@ TEST(tool_index_status_includes_git_metadata) {
  *  TOOL HANDLERS WITH DATA
  * ══════════════════════════════════════════════════════════════════ */
 
-TEST(tool_trace_call_path_not_found) {
+TEST(tool_trace_path_not_found) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
     char *resp =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\","
-                                   "\"params\":{\"name\":\"trace_call_path\","
+                                   "\"params\":{\"name\":\"trace_path\","
                                    "\"arguments\":{\"function_name\":\"NonExistent\","
                                    "\"project\":\"nonexistent\"}}}");
     ASSERT_NOT_NULL(resp);
@@ -685,7 +685,7 @@ TEST(tool_trace_missing_function_name) {
 
     char *resp =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\","
-                                   "\"params\":{\"name\":\"trace_call_path\","
+                                   "\"params\":{\"name\":\"trace_path\","
                                    "\"arguments\":{}}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "required"));
@@ -697,7 +697,7 @@ TEST(tool_trace_missing_function_name) {
 
 /* Regression: two same-named definitions with equal rank must be reported
  * ambiguous, not silently traced (trace_path previously took nodes[0]). */
-TEST(tool_trace_call_path_ambiguous) {
+TEST(tool_trace_path_ambiguous) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     cbm_store_t *st = cbm_mcp_server_store(srv);
     const char *proj = "amb-proj";
@@ -722,7 +722,7 @@ TEST(tool_trace_call_path_ambiguous) {
 
     char *resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":61,\"method\":\"tools/call\","
-             "\"params\":{\"name\":\"trace_call_path\","
+             "\"params\":{\"name\":\"trace_path\","
              "\"arguments\":{\"function_name\":\"amb\",\"project\":\"amb-proj\"}}}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
@@ -739,7 +739,7 @@ TEST(tool_trace_call_path_ambiguous) {
 /* Regression: when same-named nodes differ in rank, trace must pick the real
  * definition (callable, larger body) — NOT nodes[0]. The Module is inserted
  * first; if trace took nodes[0] the outbound trace would be empty. */
-TEST(tool_trace_call_path_prefers_definition) {
+TEST(tool_trace_path_prefers_definition) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     cbm_store_t *st = cbm_mcp_server_store(srv);
     const char *proj = "pref-proj";
@@ -778,7 +778,7 @@ TEST(tool_trace_call_path_prefers_definition) {
 
     char *resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":62,\"method\":\"tools/call\","
-             "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":\"dup\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"function_name\":\"dup\","
              "\"project\":\"pref-proj\",\"direction\":\"outbound\"}}}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
@@ -2401,10 +2401,10 @@ SUITE(mcp) {
     RUN_TEST(tool_index_status_includes_git_metadata);
 
     /* Tool handlers with validation */
-    RUN_TEST(tool_trace_call_path_not_found);
+    RUN_TEST(tool_trace_path_not_found);
     RUN_TEST(tool_trace_missing_function_name);
-    RUN_TEST(tool_trace_call_path_ambiguous);
-    RUN_TEST(tool_trace_call_path_prefers_definition);
+    RUN_TEST(tool_trace_path_ambiguous);
+    RUN_TEST(tool_trace_path_prefers_definition);
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);

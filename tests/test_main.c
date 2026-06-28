@@ -158,6 +158,8 @@ int main(void) {
         if (strstr("graph_buffer", only_suite)) RUN_SUITE(graph_buffer);
         if (strstr("pagerank", only_suite)) RUN_SUITE(pagerank);
         if (strstr("depindex", only_suite)) RUN_SUITE(depindex);
+        if (strstr("token_reduction", only_suite)) RUN_SUITE(token_reduction);
+        if (strstr("input_validation", only_suite)) RUN_SUITE(input_validation);
         if (strstr("store_arch", only_suite)) RUN_SUITE(store_arch);
         if (strstr("infrascan", only_suite)) RUN_SUITE(infrascan);
         if (strstr("watcher", only_suite)) RUN_SUITE(watcher);

@@ -2667,7 +2667,7 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "Higher = more results but more tokens. Overridden by limit param per-query. "
      "50 is good for exploration; 200+ for exhaustive analysis."},
     {"trace_max_results", "25", NULL, "Search",
-     "Default max nodes per direction in trace_call_path",
+     "Default max nodes per direction in trace_path",
      "1-10000",
      "Controls how far call chains are traced. 25 covers typical call depth; raise to 100+ for deep dependency tracing."},
     {"query_max_output_bytes", "32768", NULL, "Search",
@@ -2699,7 +2699,7 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
     {"tool_mode", "streamlined", "CBM_TOOL_MODE", "Tools",
      "Which set of tools the MCP server exposes: 5 default tools or all 15 individual tools",
      "streamlined|classic",
-     "'streamlined' (default): exposes search_graph, query_graph, search_code, trace_call_path, get_code. "
+     "'streamlined' (default): exposes search_graph, query_graph, search_code, trace_path, get_code. "
      "'classic': exposes all 15 individual tools including index_repository, get_code_snippet, get_architecture, "
      "list_projects, detect_changes, manage_adr, etc. "
      "You can also enable individual classic tools without switching modes: "
@@ -2719,7 +2719,7 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "To disable for a session: export CBM_CONTEXT_INJECTION=false "
      "To disable by default: codebase-memory-mcp config set context_injection false"},
     {"compact", "true", "CBM_COMPACT", "Tools",
-     "Default compact output for search_graph, trace_call_path, and get_code",
+     "Default compact output for search_graph, trace_path, and get_code",
      "true|false",
      "true (default): omits name when equal to last qn segment, empty label/file, degree=0. "
      "Per-call compact= param overrides. false for programmatic output parsing."},

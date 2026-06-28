@@ -11,6 +11,7 @@
  *   - Kim et al. (2010) LinkRank: edge ranking formula
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/constants.h"
 #include "test_framework.h"
 #include <store/store.h>
 #include <pagerank/pagerank.h>
@@ -50,7 +51,7 @@ static double get_pr(cbm_store_t *s, int64_t node_id) {
 static int count_table_rows(cbm_store_t *s, const char *table) {
     sqlite3 *db = cbm_store_get_db(s);
     if (!db) return -1;
-    char sql[64];
+    char sql[CBM_LINE_BUF];
     snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM %s", table);
     sqlite3_stmt *stmt = NULL;
     int count = 0;
@@ -59,6 +60,29 @@ static int count_table_rows(cbm_store_t *s, const char *table) {
         sqlite3_finalize(stmt);
     }
     return count;
+}
+
+static int get_project_for_row(cbm_store_t *s, const char *table,
+                               const char *id_column, int64_t id,
+                               char *buf, size_t buf_sz) {
+    sqlite3 *db = cbm_store_get_db(s);
+    if (!db || !buf || buf_sz == 0) return 0;
+    buf[0] = '\0';
+    char sql[CBM_LINE_BUF];
+    snprintf(sql, sizeof(sql), "SELECT project FROM %s WHERE %s = ?1",
+             table, id_column);
+    sqlite3_stmt *stmt = NULL;
+    int found = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *project = (const char *)sqlite3_column_text(stmt, 0);
+            snprintf(buf, buf_sz, "%s", project ? project : "");
+            found = 1;
+        }
+        sqlite3_finalize(stmt);
+    }
+    return found;
 }
 
 static double get_lr_by_edge_id(cbm_store_t *s, int64_t edge_id) {
@@ -219,6 +243,36 @@ TEST(pagerank_full_scope_includes_deps) {
                                   &CBM_DEFAULT_EDGE_WEIGHTS, CBM_RANK_SCOPE_FULL);
     ASSERT_EQ(rc, 2);
     ASSERT_TRUE(get_pr(s, b) > 0.0);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pagerank_full_scope_preserves_dep_project_attribution) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "proj_attr", "/tmp/proj_attr");
+    cbm_store_upsert_project(s, "proj_attr.dep.lib", "/tmp/lib_attr");
+    int64_t app = add_node(s, "proj_attr", "app_main");
+    int64_t dep_a = add_node(s, "proj_attr.dep.lib", "lib_a");
+    int64_t dep_b = add_node(s, "proj_attr.dep.lib", "lib_b");
+    add_edge(s, "proj_attr", app, dep_a, "CALLS");
+    int64_t dep_edge = add_edge(s, "proj_attr.dep.lib", dep_a, dep_b, "CALLS");
+
+    int rc = cbm_pagerank_compute(s, "proj_attr", CBM_PAGERANK_DAMPING,
+                                  CBM_PAGERANK_EPSILON, CBM_PAGERANK_MAX_ITER,
+                                  &CBM_DEFAULT_EDGE_WEIGHTS, CBM_RANK_SCOPE_FULL);
+    ASSERT_EQ(rc, 3);
+
+    char project_buf[CBM_PATH_MAX];
+    ASSERT_TRUE(get_project_for_row(s, "pagerank", "node_id", dep_b,
+                                    project_buf, sizeof(project_buf)));
+    ASSERT_TRUE(strcmp(project_buf, "proj_attr.dep.lib") == 0);
+    ASSERT_TRUE(get_project_for_row(s, "node_degree", "node_id", dep_b,
+                                    project_buf, sizeof(project_buf)));
+    ASSERT_TRUE(strcmp(project_buf, "proj_attr.dep.lib") == 0);
+    ASSERT_TRUE(get_project_for_row(s, "linkrank", "edge_id", dep_edge,
+                                    project_buf, sizeof(project_buf)));
+    ASSERT_TRUE(strcmp(project_buf, "proj_attr.dep.lib") == 0);
+
     cbm_store_close(s);
     PASS();
 }
@@ -918,6 +972,7 @@ SUITE(pagerank) {
     RUN_TEST(pagerank_stored_in_db);
     RUN_TEST(pagerank_recompute_replaces);
     RUN_TEST(pagerank_full_scope_includes_deps);
+    RUN_TEST(pagerank_full_scope_preserves_dep_project_attribution);
     RUN_TEST(pagerank_project_scope_excludes_deps);
     RUN_TEST(pagerank_dangling_nodes);
     RUN_TEST(pagerank_null_safety);

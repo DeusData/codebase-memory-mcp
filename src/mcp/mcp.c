@@ -110,7 +110,7 @@ static void add_pagerank_val(yyjson_mut_doc *doc, yyjson_mut_val *obj, double v)
 #define CBM_DEFAULT_SNIPPET_MAX_LINES 200
 #define CBM_CONFIG_SNIPPET_MAX_LINES "snippet_max_lines"
 
-/* Default max BFS results for trace_call_path per direction.
+/* Default max BFS results for trace_path per direction.
  * Configurable via config key "trace_max_results". */
 #define CBM_DEFAULT_TRACE_MAX_RESULTS 25
 #define CBM_CONFIG_TRACE_MAX_RESULTS "trace_max_results"
@@ -378,6 +378,9 @@ static const tool_def_t TOOLS[] = {
      "name. Glob wildcards (*tool*, foo?) auto-convert to regex.\"},"
      "\"qn_pattern\":{\"type\":\"string\",\"description\":\"Regex pattern on qualified name. "
      "Glob wildcards auto-convert to regex.\"},"
+     "\"semantic_query\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":"
+     "\"Natural-language/keyword vector search terms appended as semantic_results. Use when "
+     "lexical names are unknown or vocabulary differs.\"},"
      "\"file_pattern\":{\"type\":\"string\"},\"relationship\":{\"type\":\"string\"},\"min_degree\":"
      "{\"type\":\"integer\"},\"max_degree\":{\"type\":\"integer\"},\"exclude_entry_points\":{"
      "\"type\":\"boolean\"},\"include_connected\":{\"type\":\"boolean\"},\"limit\":{\"type\":"
@@ -418,7 +421,7 @@ static const tool_def_t TOOLS[] = {
      "query_max_output_bytes config key). Set to 0 for unlimited. When exceeded, returns "
      "truncated=true with total_bytes and hint to add LIMIT.\"}},\"required\":[\"query\"]}"},
 
-    {"trace_call_path",
+    {"trace_path",
      "Trace function call paths — who calls a function and what it calls. Use INSTEAD OF grep when "
      "finding callers, dependencies, or impact analysis. Matches exact name first, then falls back "
      "to case-insensitive search if not found. Shows candidates array when function name "
@@ -481,6 +484,8 @@ static const tool_def_t TOOLS[] = {
      "\"description\":\"Match case-sensitively (default: case-insensitive).\"},"
      "\"context\":{\"type\":\"integer\",\"default\":0,"
      "\"description\":\"Number of surrounding lines to include around each match (like grep -C). Default 0.\"},"
+     "\"mode\":{\"type\":\"string\",\"enum\":[\"compact\",\"full\",\"files\"],\"default\":\"compact\","
+     "\"description\":\"compact=deduplicated matches, full=include source snippets, files=matching files only.\"},"
      "\"limit\":{\"type\":\"integer\",\"description\":\"Max "
      "results (configurable via search_limit config key). Set higher for exhaustive text search."
      "\"}},\"required\":["
@@ -543,7 +548,7 @@ static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
  * array holds the additional default tools whose schemas live only here. */
 
 static const tool_def_t STREAMLINED_TOOLS[] = {
-    {"trace_call_path",
+    {"trace_path",
      "Trace function call paths — who calls a function and what it calls. "
      "Use for impact analysis, understanding callers, and finding dependencies. "
      "Auto-indexes the project on first use if not already indexed. "
@@ -891,7 +896,7 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
 
     if (!classic) {
         /* Streamlined mode: default surface = the 3 focused search tools (drawn
-         * from TOOLS[] to keep a single schema source) followed by trace_call_path
+         * from TOOLS[] to keep a single schema source) followed by trace_path
          * and get_code (from STREAMLINED_TOOLS[]). The search_code_graph mega-tool
          * was removed — these 3 split tools replace it. */
         for (int i = 0; i < TOOL_COUNT; i++) {
@@ -908,13 +913,14 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
          * _hidden_tools has explicitly revealed them for this server session.
          * This keeps the initial streamlined list compact while making hidden
          * tools discoverable to real MCP clients that only call listed tools.
-         * trace_call_path lives in both TOOLS[] and STREAMLINED_TOOLS[], so skip it too.
+         * trace_path is already listed from STREAMLINED_TOOLS[], so skip the
+         * classic trace definition here.
          * (get_code is streamlined-only; get_code_snippet is the TOOLS[] name.) */
         for (int i = 0; i < TOOL_COUNT; i++) {
             if (strcmp(TOOLS[i].name, "search_graph") == 0 ||
                 strcmp(TOOLS[i].name, "query_graph") == 0 ||
                 strcmp(TOOLS[i].name, "search_code") == 0 ||
-                strcmp(TOOLS[i].name, "trace_call_path") == 0) {
+                strcmp(TOOLS[i].name, "trace_path") == 0) {
                 continue;
             }
             char key[64];
@@ -928,7 +934,7 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
         /* Progressive disclosure: list hidden tools so AI knows they exist.
          * Added as a special tool entry with description explaining how to enable.
          * The 5 default-surface tools (search_graph, query_graph, search_code,
-         * trace_call_path, get_code) are NOT listed here — only the 11 hidden ones. */
+         * trace_path, get_code) are NOT listed here — only the 11 hidden ones. */
         yyjson_mut_val *hint_tool = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_str(doc, hint_tool, "name", "_hidden_tools");
         yyjson_mut_obj_add_str(doc, hint_tool, "description",
@@ -954,7 +960,8 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
         yyjson_mut_obj_add_val(doc, hint_tool, "inputSchema", hint_schema);
         yyjson_mut_arr_add_val(tools, hint_tool);
     } else {
-        /* Classic mode: all 15 original tools */
+        /* Classic mode: all original tools. trace_path is the upstream-listed
+         * name and the single canonical call-tracing tool. */
         for (int i = 0; i < TOOL_COUNT; i++) {
             emit_tool(doc, tools, &TOOLS[i]);
         }
@@ -6562,7 +6569,7 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
         return cbm_mcp_text_result(
             "{\"error\":\"missing tool name\","
             "\"hint\":\"Available tools: search_graph, query_graph, search_code, "
-            "trace_call_path, get_code. "
+            "trace_path, get_code. "
             "Use tools/list to see all available tools.\"}", true);
     }
 
@@ -6591,7 +6598,7 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     if (strcmp(tool_name, "delete_project") == 0) {
         return handle_delete_project(srv, args_json);
     }
-    if (strcmp(tool_name, "trace_path") == 0 || strcmp(tool_name, "trace_call_path") == 0) {
+    if (strcmp(tool_name, "trace_path") == 0) {
         return handle_trace_call_path(srv, args_json);
     }
     if (strcmp(tool_name, "get_architecture") == 0) {
@@ -6646,7 +6653,7 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     snprintf(msg, sizeof(msg),
         "{\"error\":\"unknown tool: '%s'\","
         "\"hint\":\"Available tools: search_graph, query_graph, search_code, "
-        "trace_call_path, get_code. "
+        "trace_path, get_code. "
         "Use tools/list to see all available tools.\"}", tool_name);
     return cbm_mcp_text_result(msg, true);
 }

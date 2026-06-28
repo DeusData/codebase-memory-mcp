@@ -501,7 +501,7 @@ int cbm_dep_auto_index(const char *project_name, const char *project_root,
  * in any dep project (project_name.dep.*). If so, create an IMPORTS edge from
  * the project's import node to the dep's module node.
  *
- * This enables trace_call_path to follow imports across the project/dep boundary. */
+ * This enables trace_path to follow imports across the project/dep boundary. */
 /* Upper bound for the one-shot bulk fetch of dep Module nodes when linking
  * cross-boundary IMPORTS edges. Named (not magic) — per the no-magic-values
  * convention. Dep linking is index-time, so a generous fetch is fine. */
