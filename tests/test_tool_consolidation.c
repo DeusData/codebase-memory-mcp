@@ -149,7 +149,7 @@ TEST(streamlined_mode_shows_5_default_tools) {
      * trace_path, get_code. The search_code_graph mega-tool is gone. */
     char *json = cbm_mcp_tools_list(NULL);
     ASSERT_NOT_NULL(json);
-    /* The 5 default-surface tools must be present */
+    /* Default-surface tools must be present by name. */
     ASSERT_NOT_NULL(strstr(json, "search_graph"));
     ASSERT_NOT_NULL(strstr(json, "query_graph"));
     ASSERT_NOT_NULL(strstr(json, "search_code"));

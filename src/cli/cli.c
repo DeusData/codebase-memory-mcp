@@ -2751,9 +2751,9 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
     {"tool_mode", "streamlined", "CBM_TOOL_MODE", "Tools",
      "Which tool surface the MCP server lists by default",
      "streamlined|classic",
-     "'streamlined' (default): lists 5 core tools plus _hidden_tools discovery: "
+     "'streamlined' (default): lists core tools plus _hidden_tools discovery: "
      "search_graph, query_graph, search_code, trace_path, get_code. "
-     "'classic': exposes all 15 individual tools including index_repository, get_code_snippet, get_architecture, "
+     "'classic': exposes all individual tools including index_repository, get_code_snippet, get_architecture, "
      "list_projects, detect_changes, manage_adr, etc. "
      "You can also enable individual classic tools without switching modes: "
      "config set tool_index_repository true"},
