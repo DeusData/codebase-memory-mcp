@@ -96,6 +96,10 @@ TEST(skip_claude) {
     ASSERT_TRUE(cbm_should_skip_dir(".claude", CBM_MODE_FULL));
     PASS();
 }
+TEST(skip_claude_worktrees) {
+    ASSERT_TRUE(cbm_should_skip_dir(".claude-worktrees", CBM_MODE_FULL));
+    PASS();
+}
 
 /* Not skipped in full mode */
 TEST(no_skip_src) {
@@ -1046,6 +1050,7 @@ SUITE(discover) {
     RUN_TEST(skip_coverage);
     RUN_TEST(skip_idea);
     RUN_TEST(skip_claude);
+    RUN_TEST(skip_claude_worktrees);
 
     /* Not skipped */
     RUN_TEST(no_skip_src);

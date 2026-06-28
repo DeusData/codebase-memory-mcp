@@ -94,6 +94,17 @@ int cbm_install_editor_mcp(const char *binary_path, const char *config_path);
  * Returns 0 on success. */
 int cbm_remove_editor_mcp(const char *config_path);
 
+/* Install MCP server entry in OpenClaw JSON config.
+ * Format: { "mcp": { "servers": { "codebase-memory-mcp": {
+ *   "enabled": true, "command": binary_path, "args": []
+ * } } } }
+ * Preserves existing entries. Returns 0 on success. */
+int cbm_install_openclaw_mcp(const char *binary_path, const char *config_path);
+
+/* Remove MCP server entry from OpenClaw JSON config.
+ * Returns 0 on success. */
+int cbm_remove_openclaw_mcp(const char *config_path);
+
 /* Install MCP server entry in VS Code JSON config.
  * Format: { "servers": { "codebase-memory-mcp": { "type": "stdio", "command": binary_path } } }
  * Returns 0 on success. */

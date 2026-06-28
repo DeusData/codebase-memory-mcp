@@ -867,6 +867,96 @@ int cbm_remove_editor_mcp(const char *config_path) {
     return rc;
 }
 
+/* ── OpenClaw MCP (nested mcp.servers with command + args) ────── */
+
+int cbm_install_openclaw_mcp(const char *binary_path, const char *config_path) {
+    if (!binary_path || !config_path) {
+        return CLI_ERR;
+    }
+
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    if (!mdoc) {
+        return CLI_ERR;
+    }
+
+    yyjson_doc *doc = read_json_file(config_path);
+    yyjson_mut_val *root;
+    if (doc) {
+        root = yyjson_val_mut_copy(mdoc, yyjson_doc_get_root(doc));
+        yyjson_doc_free(doc);
+    } else {
+        root = yyjson_mut_obj(mdoc);
+    }
+    if (!root) {
+        yyjson_mut_doc_free(mdoc);
+        return CLI_ERR;
+    }
+    yyjson_mut_doc_set_root(mdoc, root);
+
+    yyjson_mut_val *mcp = yyjson_mut_obj_get(root, "mcp");
+    if (!mcp || !yyjson_mut_is_obj(mcp)) {
+        mcp = yyjson_mut_obj(mdoc);
+        yyjson_mut_obj_add_val(mdoc, root, "mcp", mcp);
+    }
+
+    yyjson_mut_val *servers = yyjson_mut_obj_get(mcp, "servers");
+    if (!servers || !yyjson_mut_is_obj(servers)) {
+        servers = yyjson_mut_obj(mdoc);
+        yyjson_mut_obj_add_val(mdoc, mcp, "servers", servers);
+    }
+
+    yyjson_mut_obj_remove_key(servers, "codebase-memory-mcp");
+
+    yyjson_mut_val *entry = yyjson_mut_obj(mdoc);
+    yyjson_mut_obj_add_bool(mdoc, entry, "enabled", true);
+    yyjson_mut_obj_add_str(mdoc, entry, "command", binary_path);
+    yyjson_mut_val *args = yyjson_mut_arr(mdoc);
+    yyjson_mut_obj_add_val(mdoc, entry, "args", args);
+    yyjson_mut_obj_add_val(mdoc, servers, "codebase-memory-mcp", entry);
+
+    int rc = write_json_file(config_path, mdoc);
+    yyjson_mut_doc_free(mdoc);
+    return rc;
+}
+
+int cbm_remove_openclaw_mcp(const char *config_path) {
+    if (!config_path) {
+        return CLI_ERR;
+    }
+
+    yyjson_doc *doc = read_json_file(config_path);
+    if (!doc) {
+        return CLI_ERR;
+    }
+
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_val_mut_copy(mdoc, yyjson_doc_get_root(doc));
+    yyjson_doc_free(doc);
+    if (!root) {
+        yyjson_mut_doc_free(mdoc);
+        return CLI_ERR;
+    }
+    yyjson_mut_doc_set_root(mdoc, root);
+
+    yyjson_mut_val *mcp = yyjson_mut_obj_get(root, "mcp");
+    if (!mcp || !yyjson_mut_is_obj(mcp)) {
+        yyjson_mut_doc_free(mdoc);
+        return 0;
+    }
+
+    yyjson_mut_val *servers = yyjson_mut_obj_get(mcp, "servers");
+    if (!servers || !yyjson_mut_is_obj(servers)) {
+        yyjson_mut_doc_free(mdoc);
+        return 0;
+    }
+
+    yyjson_mut_obj_remove_key(servers, "codebase-memory-mcp");
+
+    int rc = write_json_file(config_path, mdoc);
+    yyjson_mut_doc_free(mdoc);
+    return rc;
+}
+
 /* ── VS Code MCP (servers key with type:stdio) ────────────────── */
 
 int cbm_install_vscode_mcp(const char *binary_path, const char *config_path) {
@@ -3851,7 +3941,7 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
         char cp[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.openclaw/openclaw.json", home);
         install_generic_agent_config("OpenClaw", binary_path, cp, NULL, dry_run,
-                                     cbm_install_editor_mcp);
+                                     cbm_install_openclaw_mcp);
     }
     if (agents->kiro) {
         char cp[CLI_BUF_1K];
@@ -4330,7 +4420,7 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
         char cp[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.openclaw/openclaw.json", home);
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"OpenClaw", cp, NULL}, dry_run,
-                                  cbm_remove_editor_mcp);
+                                  cbm_remove_openclaw_mcp);
     }
     if (agents->kiro) {
         char cp[CLI_BUF_1K];
