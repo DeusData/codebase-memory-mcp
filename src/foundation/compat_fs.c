@@ -217,6 +217,23 @@ int cbm_replace_file(const char *tmp_path, const char *dest_path) {
     return cbm_replace_file_ex(tmp_path, dest_path, NULL);
 }
 
+int cbm_move_file_no_replace(const char *src_path, const char *dest_path) {
+    if (!src_path || !dest_path) {
+        return CBM_NOT_FOUND;
+    }
+    wchar_t *wsrc = cbm_utf8_to_wide(src_path);
+    wchar_t *wdest = cbm_utf8_to_wide(dest_path);
+    if (!wsrc || !wdest) {
+        free(wsrc);
+        free(wdest);
+        return CBM_NOT_FOUND;
+    }
+    BOOL ok = MoveFileW(wsrc, wdest);
+    free(wsrc);
+    free(wdest);
+    return ok ? 0 : CBM_NOT_FOUND;
+}
+
 int cbm_exec_no_shell(const char *const *argv) {
     if (!argv || !argv[0]) {
         return CBM_NOT_FOUND;
@@ -350,6 +367,22 @@ int cbm_replace_file_ex(const char *tmp_path, const char *dest_path, int *platfo
 
 int cbm_replace_file(const char *tmp_path, const char *dest_path) {
     return cbm_replace_file_ex(tmp_path, dest_path, NULL);
+}
+
+int cbm_move_file_no_replace(const char *src_path, const char *dest_path) {
+    if (!src_path || !dest_path) {
+        return CBM_NOT_FOUND;
+    }
+    if (link(src_path, dest_path) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (unlink(src_path) != 0) {
+        int saved_errno = errno;
+        (void)unlink(dest_path);
+        errno = saved_errno;
+        return CBM_NOT_FOUND;
+    }
+    return 0;
 }
 
 int cbm_exec_no_shell(const char *const *argv) {

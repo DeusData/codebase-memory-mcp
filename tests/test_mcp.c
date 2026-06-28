@@ -9,10 +9,20 @@
 #include "test_framework.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
+#include <sqlite3.h>
 #include <yyjson/yyjson.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+
+static bool test_file_exists_mcp(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        return false;
+    }
+    fclose(fp);
+    return true;
+}
 
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING
@@ -422,7 +432,10 @@ TEST(tool_list_projects_includes_tmp_prefixed_project) {
 
     const char *saved = getenv("CBM_CACHE_DIR");
     char *saved_copy = saved ? strdup(saved) : NULL;
+    const char *saved_auto = getenv("CBM_AUTO_INDEX");
+    char *saved_auto_copy = saved_auto ? strdup(saved_auto) : NULL;
     cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_AUTO_INDEX", "false", 1);
 
     char db_path[512];
     int db_len = snprintf(db_path, sizeof(db_path), "%s/tmp-valid-project.db", cache);
@@ -448,6 +461,12 @@ TEST(tool_list_projects_includes_tmp_prefixed_project) {
     } else {
         cbm_unsetenv("CBM_CACHE_DIR");
     }
+    if (saved_auto_copy) {
+        cbm_setenv("CBM_AUTO_INDEX", saved_auto_copy, 1);
+        free(saved_auto_copy);
+    } else {
+        cbm_unsetenv("CBM_AUTO_INDEX");
+    }
     cbm_unlink(db_path);
     char wal[512];
     char shm[512];
@@ -459,6 +478,64 @@ TEST(tool_list_projects_includes_tmp_prefixed_project) {
     if (shm_len > 0 && (size_t)shm_len < sizeof(shm)) {
         cbm_unlink(shm);
     }
+    cbm_rmdir(cache);
+    PASS();
+}
+
+TEST(resolve_store_quarantines_structurally_corrupt_db) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-corrupt-quarantine-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS(); /* skip if mkdtemp fails */
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    const char *saved_auto = getenv("CBM_AUTO_INDEX");
+    char *saved_auto_copy = saved_auto ? strdup(saved_auto) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_AUTO_INDEX", "false", 1);
+
+    char db_path[512];
+    int db_len = snprintf(db_path, sizeof(db_path), "%s/corrupt-project.db", cache);
+    ASSERT_TRUE(db_len > 0 && (size_t)db_len < sizeof(db_path));
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    sqlite3 *db = cbm_store_get_db(store);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(sqlite3_exec(db, "DROP TABLE projects;", NULL, NULL, NULL), SQLITE_OK);
+    cbm_store_close(store);
+
+    char quarantine[512];
+    int quarantine_len = snprintf(quarantine, sizeof(quarantine), "%s.corrupt", db_path);
+    ASSERT_TRUE(quarantine_len > 0 && (size_t)quarantine_len < sizeof(quarantine));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":"
+             "\"search_graph\",\"arguments\":{\"project\":\"corrupt-project\","
+             "\"pattern\":\"anything\"}}}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_FALSE(test_file_exists_mcp(db_path));
+    ASSERT_TRUE(test_file_exists_mcp(quarantine));
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (saved_auto_copy) {
+        cbm_setenv("CBM_AUTO_INDEX", saved_auto_copy, 1);
+        free(saved_auto_copy);
+    } else {
+        cbm_unsetenv("CBM_AUTO_INDEX");
+    }
+    cbm_unlink(quarantine);
     cbm_rmdir(cache);
     PASS();
 }
@@ -2589,6 +2666,7 @@ SUITE(mcp) {
     /* Tool handlers */
     RUN_TEST(tool_list_projects_empty);
     RUN_TEST(tool_list_projects_includes_tmp_prefixed_project);
+    RUN_TEST(resolve_store_quarantines_structurally_corrupt_db);
     RUN_TEST(tool_get_graph_schema_empty);
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);

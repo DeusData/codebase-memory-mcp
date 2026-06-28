@@ -1342,6 +1342,61 @@ static const char *parent_project_for_db(const char *project, char *buf, size_t 
     return project; /* no .dep → use as-is */
 }
 
+static bool mcp_join_suffix(char *out, size_t out_sz, const char *base, const char *suffix) {
+    int n = snprintf(out, out_sz, "%s%s", base ? base : "", suffix ? suffix : "");
+    return n > 0 && (size_t)n < out_sz;
+}
+
+static void quarantine_corrupt_sidecar(const char *path, const char *quarantine_path,
+                                       const char *suffix) {
+    char src[MCP_FIELD_SIZE];
+    char dst[MCP_FIELD_SIZE];
+    if (!mcp_join_suffix(src, sizeof(src), path, suffix) ||
+        !mcp_join_suffix(dst, sizeof(dst), quarantine_path, suffix)) {
+        cbm_log_warn("store.quarantine_sidecar_skip", "reason", "path_too_long", "suffix",
+                     suffix ? suffix : "");
+        return;
+    }
+
+    struct stat st;
+    if (stat(src, &st) != 0) {
+        return;
+    }
+    if (stat(dst, &st) == 0) {
+        cbm_log_warn("store.quarantine_sidecar_skip", "path", src, "reason",
+                     "quarantine_exists");
+        return;
+    }
+    if (cbm_move_file_no_replace(src, dst) != 0) {
+        cbm_log_warn("store.quarantine_sidecar_failed", "path", src);
+    }
+}
+
+static bool quarantine_corrupt_db(const char *path) {
+    char quarantine_path[MCP_FIELD_SIZE];
+    if (!mcp_join_suffix(quarantine_path, sizeof(quarantine_path), path, ".corrupt")) {
+        cbm_log_error("store.quarantine_failed", "reason", "path_too_long", "path",
+                      path ? path : "");
+        return false;
+    }
+
+    struct stat st;
+    if (stat(quarantine_path, &st) == 0) {
+        cbm_log_error("store.quarantine_failed", "reason", "quarantine_exists", "path",
+                      quarantine_path);
+        return false;
+    }
+    if (cbm_move_file_no_replace(path, quarantine_path) != 0) {
+        cbm_log_error("store.quarantine_failed", "reason", "move_failed", "path",
+                      path ? path : "");
+        return false;
+    }
+
+    quarantine_corrupt_sidecar(path, quarantine_path, "-wal");
+    quarantine_corrupt_sidecar(path, quarantine_path, "-shm");
+    return true;
+}
+
 static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     if (!project || project[0] == '\0') {
         /* No project name: return the current in-memory/default store if available.
@@ -1377,12 +1432,12 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     }
     srv->store = cbm_store_open_path_query(path);
     if (srv->store) {
-        /* Check DB integrity — auto-clean corrupt cache databases. A bad project
+        /* Check DB integrity before serving a cache database. A bad project
          * root_path (with an otherwise-fine projects table) is cosmetic: the
          * indexed nodes/edges are intact and queries key off project name, not
          * root_path. Retain such DBs instead of deleting them, to avoid the
          * data loss reported in #557. Only genuine structural corruption is
-         * removed, and only from the derived CBM cache. */
+         * quarantined out of the active derived-cache path. */
         bool path_only = false;
         if (!cbm_store_check_integrity_full(srv->store, &path_only)) {
             if (path_only) {
@@ -1390,21 +1445,13 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
                              "reason", "bad project root_path only; data retained");
                 /* Fall through and keep srv->store open. */
             } else {
-                cbm_log_error("store.auto_clean", "project", project, "path", path, "action",
-                              "deleting corrupt db; re-index required");
+                cbm_log_error("store.quarantine", "project", project, "path", path, "action",
+                              "quarantining corrupt cache db to .corrupt; re-index required");
                 cbm_store_close(srv->store);
                 srv->store = NULL;
-                /* Delete the corrupt cache DB + WAL/SHM files. */
-                (void)cbm_unlink(path);
-                char wal_path[MCP_FIELD_SIZE];
-                char shm_path[MCP_FIELD_SIZE];
-                int wal_len = snprintf(wal_path, sizeof(wal_path), "%s-wal", path);
-                int shm_len = snprintf(shm_path, sizeof(shm_path), "%s-shm", path);
-                if (wal_len > 0 && (size_t)wal_len < sizeof(wal_path)) {
-                    (void)cbm_unlink(wal_path);
-                }
-                if (shm_len > 0 && (size_t)shm_len < sizeof(shm_path)) {
-                    (void)cbm_unlink(shm_path);
+                if (!quarantine_corrupt_db(path)) {
+                    cbm_log_error("store.quarantine", "project", project, "path", path, "action",
+                                  "corrupt cache db retained; quarantine failed");
                 }
                 return NULL;
             }
