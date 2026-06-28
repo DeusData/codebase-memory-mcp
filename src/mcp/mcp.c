@@ -1057,12 +1057,12 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
 
         /* Progressive disclosure: list advanced tools so AI knows they exist.
          * Added as a special tool entry with description explaining how to enable.
-         * The 5 default-surface tools (search_graph, query_graph, search_code,
+         * Default-surface tools (search_graph, query_graph, search_code,
          * trace_path, get_code) are NOT listed here. */
         yyjson_mut_val *hint_tool = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_str(doc, hint_tool, "name", "_hidden_tools");
         yyjson_mut_obj_add_str(doc, hint_tool, "description",
-            "11 advanced tools are normally hidden in streamlined mode. "
+            "Advanced tools are normally hidden in streamlined mode. "
             "Advanced tools: index_repository, get_code_snippet, "
             "get_graph_schema, get_architecture, list_projects, "
             "delete_project, index_status, detect_changes, manage_adr, "
