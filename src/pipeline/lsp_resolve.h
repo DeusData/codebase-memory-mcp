@@ -24,8 +24,11 @@
 #include "cbm.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/constants.h"
+#include "foundation/hash_table.h"
 
+#include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Confidence floor below which LSP-resolved calls are ignored and the
@@ -84,6 +87,114 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
     return cbm_pipeline_find_lsp_resolution_with_floor(arr, call, 0.0);
 }
 
+typedef struct cbm_lsp_resolution_index {
+    CBMHashTable *entries;
+    bool complete;
+} cbm_lsp_resolution_index_t;
+
+static inline void cbm_lsp_resolution_index_free_key(const char *key, void *value, void *ud) {
+    (void)value;
+    (void)ud;
+    free((char *)key);
+}
+
+/* Build a per-file lookup table keyed by "caller_qn|callee_short".
+ *
+ * This preserves cbm_pipeline_find_lsp_resolution_with_floor() semantics:
+ * it applies the function's confidence_floor argument, requires exact caller_qn
+ * equality, compares the final dot-separated callee_qn segment to
+ * call->callee_name, and keeps the highest-confidence entry for duplicate
+ * keys. The index changes lookup cost from O(call_count * resolved_count) to
+ * O(resolved_count + call_count) for files where every eligible key is indexed.
+ *
+ * If memory allocation or key formatting fails for any eligible entry,
+ * `complete` is cleared. A later miss then falls back to the linear helper so
+ * correctness is preserved even when the optimization cannot cover every row. */
+static inline void cbm_lsp_resolution_index_build(cbm_lsp_resolution_index_t *idx,
+                                                  const CBMResolvedCallArray *arr,
+                                                  int call_count,
+                                                  double confidence_floor) {
+    if (!idx) {
+        return;
+    }
+    idx->entries = NULL;
+    idx->complete = false;
+    if (!arr || arr->count == 0 || call_count <= 0) {
+        return;
+    }
+
+    idx->entries = cbm_ht_create((uint32_t)arr->count * 2u + (uint32_t)CBM_SZ_16);
+    if (!idx->entries) {
+        return;
+    }
+    idx->complete = true;
+
+    double floor =
+        confidence_floor > 0.0 ? confidence_floor : (double)CBM_LSP_CONFIDENCE_FLOOR;
+    for (int i = 0; i < arr->count; i++) {
+        CBMResolvedCall *rc = &arr->items[i];
+        if (!rc->caller_qn || !rc->callee_qn || (double)rc->confidence < floor) {
+            continue;
+        }
+        const char *short_name = strrchr(rc->callee_qn, '.');
+        short_name = short_name ? short_name + SKIP_ONE : rc->callee_qn;
+
+        char key[CBM_SZ_1K];
+        int written = snprintf(key, sizeof(key), "%s|%s", rc->caller_qn, short_name);
+        if (written <= 0 || (size_t)written >= sizeof(key)) {
+            idx->complete = false;
+            continue;
+        }
+
+        CBMResolvedCall *existing = (CBMResolvedCall *)cbm_ht_get(idx->entries, key);
+        if (!existing) {
+            char *owned_key = strdup(key);
+            if (!owned_key) {
+                idx->complete = false;
+                continue;
+            }
+            cbm_ht_set(idx->entries, owned_key, rc);
+        } else if (rc->confidence > existing->confidence) {
+            const char *stored_key = cbm_ht_get_key(idx->entries, key);
+            if (stored_key) {
+                cbm_ht_set(idx->entries, stored_key, rc);
+            } else {
+                idx->complete = false;
+            }
+        }
+    }
+}
+
+static inline const CBMResolvedCall *cbm_lsp_resolution_index_find(
+    const cbm_lsp_resolution_index_t *idx, const CBMResolvedCallArray *arr, const CBMCall *call,
+    double confidence_floor) {
+    if (!call || !call->enclosing_func_qn || !call->callee_name) {
+        return NULL;
+    }
+    if (idx && idx->entries) {
+        char key[CBM_SZ_1K];
+        int written = snprintf(key, sizeof(key), "%s|%s", call->enclosing_func_qn,
+                               call->callee_name);
+        if (written > 0 && (size_t)written < sizeof(key)) {
+            const CBMResolvedCall *hit = (const CBMResolvedCall *)cbm_ht_get(idx->entries, key);
+            if (hit || idx->complete) {
+                return hit;
+            }
+        }
+    }
+    return cbm_pipeline_find_lsp_resolution_with_floor(arr, call, confidence_floor);
+}
+
+static inline void cbm_lsp_resolution_index_free(cbm_lsp_resolution_index_t *idx) {
+    if (!idx || !idx->entries) {
+        return;
+    }
+    cbm_ht_foreach(idx->entries, cbm_lsp_resolution_index_free_key, NULL);
+    cbm_ht_free(idx->entries);
+    idx->entries = NULL;
+    idx->complete = false;
+}
+
 /* Resolve an LSP-emitted callee_qn to a graph-buffer node.
  *
  * Per-file LSPs (notably py_lsp) sometimes emit `callee_qn` as the raw
@@ -96,7 +207,8 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
  *
  * The fallback rule: try the LSP-emitted QN as-is first; on miss, retry
  * with `<project>.<callee_qn>`. If that also misses, the target is
- * external/unknown and the caller drops the edge — same as today.
+ * external/unknown and the caller drops the edge, preserving the historical
+ * behavior for unresolved LSP targets.
  *
  * Returns the matching node, or NULL if neither lookup hits. */
 static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node(const cbm_gbuf_t *gbuf,
