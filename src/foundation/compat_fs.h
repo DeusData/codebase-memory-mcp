@@ -55,6 +55,10 @@ int cbm_rmdir(const char *path);
  * POSIX: rename(). Windows: MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH). */
 int cbm_replace_file(const char *tmp_path, const char *dest_path);
 
+/* Move src_path to dest_path only when dest_path does not already exist.
+ * Returns 0 on success and leaves src_path in place on destination conflicts. */
+int cbm_move_file_no_replace(const char *src_path, const char *dest_path);
+
 /* Same as cbm_replace_file(), but returns the platform-native failure code via
  * platform_error: errno on POSIX, GetLastError() on Windows. */
 int cbm_replace_file_ex(const char *tmp_path, const char *dest_path, int *platform_error);
