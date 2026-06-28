@@ -166,6 +166,7 @@ int main(void) {
         if (strstr("security", only_suite)) RUN_SUITE(security);
         if (strstr("artifact", only_suite)) RUN_SUITE(artifact);
         if (strstr("extraction", only_suite)) RUN_SUITE(extraction);
+        if (strstr("discover", only_suite)) RUN_SUITE(discover);
         if (strstr("lang_contract", only_suite)) RUN_SUITE(lang_contract);
         if (strstr("edge_types_probe", only_suite)) RUN_SUITE(edge_types_probe);
         TEST_SUMMARY();

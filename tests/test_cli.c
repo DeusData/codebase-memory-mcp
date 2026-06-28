@@ -2618,6 +2618,37 @@ TEST(cli_config_get_int) {
     PASS();
 }
 
+TEST(cli_config_get_effective_env_overrides_db) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, "auto_index_limit", "111"), 0);
+
+    const char *old_limit = getenv("CBM_AUTO_INDEX_LIMIT");
+    char *old_limit_copy = old_limit ? strdup(old_limit) : NULL;
+    if (old_limit) {
+        ASSERT_NOT_NULL(old_limit_copy);
+    }
+    cbm_setenv("CBM_AUTO_INDEX_LIMIT", "222", 1);
+
+    ASSERT_STR_EQ(cbm_config_get_effective(cfg, "auto_index_limit", "50000"), "222");
+    ASSERT_EQ(cbm_config_get_effective_int(cfg, "auto_index_limit", 50000), 222);
+
+    if (old_limit_copy) {
+        cbm_setenv("CBM_AUTO_INDEX_LIMIT", old_limit_copy, 1);
+        free(old_limit_copy);
+    } else {
+        cbm_unsetenv("CBM_AUTO_INDEX_LIMIT");
+    }
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_config_delete) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
@@ -2932,6 +2963,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_get_set);
     RUN_TEST(cli_config_get_bool);
     RUN_TEST(cli_config_get_int);
+    RUN_TEST(cli_config_get_effective_env_overrides_db);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
 

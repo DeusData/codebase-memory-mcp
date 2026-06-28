@@ -327,6 +327,28 @@ TEST(discover_simple) {
     PASS();
 }
 
+TEST(discover_count_bounded_non_git_uses_discover_filters) {
+    char *base = th_mktempdir("cbm_disc_count");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "src/a.go"), "package main\n");
+    th_write_file(TH_PATH(base, "src/b.py"), "print(1)\n");
+    th_write_file(TH_PATH(base, "src/icon.png"), "binary\n");
+    th_write_file(TH_PATH(base, "node_modules/ignored.js"), "console.log(1)\n");
+
+    cbm_discover_opts_t opts = {0};
+    int count = 0;
+    ASSERT_EQ(cbm_discover_count_bounded(base, &opts, 0, &count), 0);
+    ASSERT_EQ(count, 2);
+
+    count = 0;
+    ASSERT_EQ(cbm_discover_count_bounded(base, &opts, 1, &count), 0);
+    ASSERT_EQ(count, 2); /* one past the limit, enough for callers to skip */
+
+    th_cleanup(base);
+    PASS();
+}
+
 TEST(discover_skips_git_dir) {
     char *base = th_mktempdir("cbm_disc_git");
     ASSERT(base != NULL);
@@ -1081,6 +1103,7 @@ SUITE(discover) {
 
     /* Integration tests (cross-platform) */
     RUN_TEST(discover_simple);
+    RUN_TEST(discover_count_bounded_non_git_uses_discover_filters);
     RUN_TEST(discover_skips_git_dir);
     RUN_TEST(discover_with_gitignore);
     RUN_TEST(discover_with_global_xdg_ignore);
