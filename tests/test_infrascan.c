@@ -18,6 +18,25 @@ static int has_data_flow(cbm_gbuf_t *gb, int64_t source_id, int64_t target_id) {
     return 0;
 }
 
+static int count_handles_to(cbm_gbuf_t *gb, int64_t target_id) {
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_target_type(gb, target_id, "HANDLES", &edges, &count);
+    return count;
+}
+
+static bool has_handle(cbm_gbuf_t *gb, int64_t source_id, int64_t target_id) {
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_target_type(gb, target_id, "HANDLES", &edges, &count);
+    for (int i = 0; i < count; i++) {
+        if (edges[i]->source_id == source_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths) {
     ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/etc/crio/crio.conf", "requests.get"));
     ASSERT_FALSE(
@@ -145,9 +164,117 @@ TEST(infrascan_http_calls_join_matching_handler_route) {
     PASS();
 }
 
+TEST(infrascan_infra_match_does_not_expand_root_handlers_to_external_paths) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/cbm_infrascan_infra_match");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t root_route =
+        cbm_gbuf_upsert_node(gb, "Route", "/", "__route__GET__/", "api/server.py", 0, 0,
+                             "{\"method\":\"GET\"}");
+    int64_t root_handler = cbm_gbuf_upsert_node(gb, "Function", "root", "test.root",
+                                                "api/server.py", 1, 3, "{}");
+    int64_t external =
+        cbm_gbuf_upsert_node(gb, "Route", "https://github.com/pre-commit/pre-commit-hooks",
+                             "__route__infra__https://github.com/pre-commit/pre-commit-hooks",
+                             ".pre-commit-config.yaml", 0, 0, "{\"source\":\"infra\"}");
+    int64_t api_root = cbm_gbuf_upsert_node(gb, "Route", "https://api.example.com/",
+                                            "__route__infra__https://api.example.com/",
+                                            "deploy.yaml", 0, 0, "{\"source\":\"infra\"}");
+    ASSERT_GT(root_route, 0);
+    ASSERT_GT(root_handler, 0);
+    ASSERT_GT(external, 0);
+    ASSERT_GT(api_root, 0);
+
+    cbm_gbuf_insert_edge(gb, root_handler, root_route, "HANDLES", "{\"handler\":\"test.root\"}");
+
+    cbm_pipeline_create_route_nodes(gb);
+
+    ASSERT_EQ(count_handles_to(gb, external), 0);
+    ASSERT_EQ(count_handles_to(gb, api_root), 1);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(infrascan_infra_match_uses_all_matching_handler_routes) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/cbm_infrascan_infra_match_all");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t route_a = cbm_gbuf_upsert_node(gb, "Route", "/orders", "__route__GET__/orders",
+                                           "services/orders/api.py", 0, 0,
+                                           "{\"method\":\"GET\"}");
+    int64_t route_b = cbm_gbuf_upsert_node(gb, "Route", "/orders", "__route__POST__/orders",
+                                           "services/orders/admin.py", 0, 0,
+                                           "{\"method\":\"POST\"}");
+    int64_t handler_a = cbm_gbuf_upsert_node(gb, "Function", "list_orders", "test.list_orders",
+                                             "services/orders/api.py", 1, 3, "{}");
+    int64_t handler_b = cbm_gbuf_upsert_node(gb, "Function", "create_order", "test.create_order",
+                                             "services/orders/admin.py", 1, 3, "{}");
+    int64_t infra =
+        cbm_gbuf_upsert_node(gb, "Route", "https://orders.example.com/orders",
+                             "__route__infra__https://orders.example.com/orders", "deploy.yaml",
+                             0, 0, "{\"source\":\"infra\"}");
+    ASSERT_GT(route_a, 0);
+    ASSERT_GT(route_b, 0);
+    ASSERT_GT(handler_a, 0);
+    ASSERT_GT(handler_b, 0);
+    ASSERT_GT(infra, 0);
+
+    cbm_gbuf_insert_edge(gb, handler_a, route_a, "HANDLES", "{\"handler\":\"test.list_orders\"}");
+    cbm_gbuf_insert_edge(gb, handler_b, route_b, "HANDLES", "{\"handler\":\"test.create_order\"}");
+
+    cbm_pipeline_create_route_nodes(gb);
+
+    ASSERT_TRUE(has_handle(gb, handler_a, infra));
+    ASSERT_TRUE(has_handle(gb, handler_b, infra));
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(infrascan_prefix_bridge_uses_all_registrars_not_first_edge) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/cbm_infrascan_prefix_bridge");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t prefix =
+        cbm_gbuf_upsert_node(gb, "Route", "/api", "__route__ANY__/api", "svc/router.py", 0, 0,
+                             "{\"method\":\"ANY\"}");
+    int64_t users_registrar = cbm_gbuf_upsert_node(gb, "Function", "include_users",
+                                                   "test.svc.users.router.include_users",
+                                                   "svc/api/users/router.py", 1, 3, "{}");
+    int64_t orders_registrar = cbm_gbuf_upsert_node(gb, "Function", "include_orders",
+                                                    "test.svc.orders.router.include_orders",
+                                                    "svc/api/orders/router.py", 1, 3, "{}");
+    int64_t users_handler = cbm_gbuf_upsert_node(
+        gb, "Function", "list_users", "test.svc.users.handlers.list_users",
+        "svc/api/users/handlers.py", 10, 12, "{\"route_path\":\"/users\"}");
+    int64_t orders_handler = cbm_gbuf_upsert_node(
+        gb, "Function", "list_orders", "test.svc.orders.handlers.list_orders",
+        "svc/api/orders/handlers.py", 10, 12, "{\"route_path\":\"/orders\"}");
+    ASSERT_GT(prefix, 0);
+    ASSERT_GT(users_registrar, 0);
+    ASSERT_GT(orders_registrar, 0);
+    ASSERT_GT(users_handler, 0);
+    ASSERT_GT(orders_handler, 0);
+
+    cbm_gbuf_insert_edge(gb, users_registrar, prefix, "CALLS", "{}");
+    cbm_gbuf_insert_edge(gb, orders_registrar, prefix, "CALLS", "{}");
+
+    cbm_pipeline_create_route_nodes(gb);
+
+    ASSERT_TRUE(has_handle(gb, users_handler, prefix));
+    ASSERT_TRUE(has_handle(gb, orders_handler, prefix));
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 SUITE(infrascan) {
     RUN_TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths);
     RUN_TEST(infrascan_service_pattern_match_uses_qn_boundaries);
     RUN_TEST(infrascan_route_nodes_skip_bad_http_url_paths);
     RUN_TEST(infrascan_http_calls_join_matching_handler_route);
+    RUN_TEST(infrascan_infra_match_does_not_expand_root_handlers_to_external_paths);
+    RUN_TEST(infrascan_infra_match_uses_all_matching_handler_routes);
+    RUN_TEST(infrascan_prefix_bridge_uses_all_registrars_not_first_edge);
 }

@@ -1064,16 +1064,21 @@ int cbm_gbuf_edge_count_by_type(const cbm_gbuf_t *gb, const char *type) {
     return arr ? arr->count : 0;
 }
 
-int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
+static int delete_edges_by_type_filtered(cbm_gbuf_t *gb, const char *type,
+                                         const char *prop_substr) {
     if (!gb || !type) {
         return CBM_NOT_FOUND;
     }
 
     /* Remove edges of the given type from array and dedup index */
+    int deleted = 0;
     int write_idx = 0;
     for (int i = 0; i < gb->edges.count; i++) {
         cbm_gbuf_edge_t *e = gb->edges.items[i];
-        if (strcmp(e->type, type) == 0) {
+        int type_matches = (strcmp(e->type, type) == 0);
+        int props_match =
+            (!prop_substr || (e->properties_json && strstr(e->properties_json, prop_substr)));
+        if (type_matches && props_match) {
             char key[EDGE_KEY_BUF];
             make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type);
             const char *ekey = cbm_ht_get_key(gb->edge_by_key, key);
@@ -1081,6 +1086,7 @@ int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
             free((void *)ekey);
             free_edge_strings(e);
             free(e);
+            deleted++;
         } else {
             gb->edges.items[write_idx++] = gb->edges.items[i];
         }
@@ -1090,7 +1096,20 @@ int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
     /* Rebuild edge secondary indexes */
     rebuild_edge_secondary_indexes(gb);
 
-    return 0;
+    return deleted;
+}
+
+int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
+    int rc = delete_edges_by_type_filtered(gb, type, NULL);
+    return rc < 0 ? rc : 0;
+}
+
+int cbm_gbuf_delete_edges_by_type_matching_props(cbm_gbuf_t *gb, const char *type,
+                                                 const char *prop_substr) {
+    if (!prop_substr) {
+        return CBM_NOT_FOUND;
+    }
+    return delete_edges_by_type_filtered(gb, type, prop_substr);
 }
 
 /* ── Merge ───────────────────────────────────────────────────────── */

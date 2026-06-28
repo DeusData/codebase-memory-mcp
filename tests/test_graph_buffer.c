@@ -620,6 +620,35 @@ TEST(gbuf_delete_edges_preserves_other_types) {
     PASS();
 }
 
+TEST(gbuf_delete_edges_by_type_matching_props) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    int64_t a = cbm_gbuf_upsert_node(gb, "Function", "a", "pkg.a", "f.go", 1, 5, "{}");
+    int64_t b = cbm_gbuf_upsert_node(gb, "Route", "/b", "__route__GET__/b", "f.go", 6, 10, "{}");
+    int64_t c = cbm_gbuf_upsert_node(gb, "Route", "/c", "__route__GET__/c", "f.go", 11, 15, "{}");
+
+    cbm_gbuf_insert_edge(gb, a, b, "HANDLES", "{\"source\":\"prefix_decorator_bridge\"}");
+    cbm_gbuf_insert_edge(gb, a, c, "HANDLES", "{\"handler\":\"pkg.a\"}");
+    cbm_gbuf_insert_edge(gb, a, c, "CALLS", "{\"source\":\"prefix_decorator_bridge\"}");
+    ASSERT_EQ(cbm_gbuf_edge_count(gb), 3);
+
+    int deleted = cbm_gbuf_delete_edges_by_type_matching_props(
+        gb, "HANDLES", "\"source\":\"prefix_decorator_bridge\"");
+    ASSERT_EQ(deleted, 1);
+    ASSERT_EQ(cbm_gbuf_edge_count(gb), 2);
+    ASSERT_EQ(cbm_gbuf_edge_count_by_type(gb, "HANDLES"), 1);
+    ASSERT_EQ(cbm_gbuf_edge_count_by_type(gb, "CALLS"), 1);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_target_type(gb, b, "HANDLES", &edges, &count);
+    ASSERT_EQ(count, 0);
+    cbm_gbuf_find_edges_by_target_type(gb, c, "HANDLES", &edges, &count);
+    ASSERT_EQ(count, 1);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 TEST(gbuf_find_edges_by_target_type_multiple) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
     int64_t a = cbm_gbuf_upsert_node(gb, "Function", "a", "pkg.a", "f.go", 1, 5, "{}");
@@ -1093,6 +1122,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_find_edges_by_type);
     RUN_TEST(gbuf_delete_edges_by_type);
     RUN_TEST(gbuf_edge_count_by_type);
+    RUN_TEST(gbuf_delete_edges_by_type_matching_props);
     RUN_TEST(gbuf_dump_empty);
     RUN_TEST(gbuf_flush_to_store);
     RUN_TEST(gbuf_many_nodes);

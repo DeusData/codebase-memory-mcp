@@ -458,7 +458,12 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 /* Post-merge: create Route nodes for HTTP_CALLS/ASYNC_CALLS edges that
  * have url_path in properties but point to library functions instead of routes.
  * Re-targets these edges to Route nodes for cross-service traversal. */
+void cbm_pipeline_clear_route_derived_edges(cbm_gbuf_t *gb);
 void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb);
+
+int cbm_pipeline_ensure_file_structure(cbm_gbuf_t *gbuf, const char *project,
+                                       const char *root_qn, const char *rel_path,
+                                       CBMHashTable *seen_dirs);
 
 /* ── Pass function prototypes ────────────────────────────────────── */
 
