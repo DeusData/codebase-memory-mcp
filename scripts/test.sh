@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # test.sh — Clean build + run all C tests with ASan + UBSan.
 #
 # Usage:

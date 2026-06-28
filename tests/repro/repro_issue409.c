@@ -154,7 +154,7 @@ TEST(repro_issue409_install_wires_hook_augment_not_blocking_gate) {
     snprintf(script_path, sizeof(script_path),
              "%s/cbm-code-discovery-gate", hooks_dir);
     rp409_write_file(script_path,
-        "#!/bin/bash\n"
+        "#!/usr/bin/env bash\n"
         "# Gate hook: nudges Claude toward codebase-memory-mcp for code discovery.\n"
         "# First Grep/Glob/Read per session -> block. Subsequent -> allow.\n"
         "# PPID = Claude Code process PID, unique per session.\n"

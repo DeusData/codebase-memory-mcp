@@ -1933,7 +1933,7 @@ void cbm_install_hook_gate_script(const char *home, const char *binary_path) {
         return;
     }
     (void)fprintf(f,
-                  "#!/bin/bash\n"
+                  "#!/usr/bin/env bash\n"
                   "# codebase-memory-mcp search augmenter (Claude Code PreToolUse).\n"
                   "# NOTE: the legacy filename is kept for zero-migration upgrades.\n"
                   "# Despite the name this NEVER blocks a tool call - it only adds\n"
@@ -1977,7 +1977,7 @@ static void cbm_install_session_reminder_script(const char *home) {
         return;
     }
     (void)fprintf(
-        f, "#!/bin/bash\n"
+        f, "#!/usr/bin/env bash\n"
            "# SessionStart hook: remind agent to use codebase-memory-mcp tools.\n"
            "# Installed by codebase-memory-mcp. Fires on startup/resume/clear/compact.\n"
            "cat << 'REMINDER'\n"

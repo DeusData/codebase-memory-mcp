@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # lint.sh — Run all linters (clang-tidy + cppcheck + clang-format).
 #
 # Usage:

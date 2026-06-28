@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # build.sh — Clean build of production binary (standard or with UI).
 #
 # Usage:

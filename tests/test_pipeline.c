@@ -3707,7 +3707,7 @@ TEST(infra_parse_dotenv_quoted) {
 
 TEST(infra_parse_shell) {
     /* Port of TestParseShellScript */
-    const char *src = "#!/bin/bash\n"
+    const char *src = "#!/usr/bin/env bash\n"
                       "set -e\n"
                       "\n"
                       "# Configuration\n"
@@ -3726,7 +3726,7 @@ TEST(infra_parse_shell) {
 
     cbm_shell_result_t r;
     ASSERT_EQ(cbm_parse_shell_source(src, &r), 0);
-    ASSERT_STR_EQ(r.shebang, "/bin/bash");
+    ASSERT_STR_EQ(r.shebang, "/usr/bin/env bash");
 
     ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "ENVIRONMENT"), "development");
     ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "YOUR_CONTAINER_NAME"),
@@ -3755,7 +3755,7 @@ TEST(infra_parse_shell_with_source) {
 
 TEST(infra_parse_shell_secret_filtered) {
     /* Port of TestParseShellScriptSecretFiltered */
-    const char *src = "#!/bin/bash\n"
+    const char *src = "#!/usr/bin/env bash\n"
                       "export API_SECRET=\"should-not-appear\"\n"
                       "export DATABASE_URL=\"https://db.example.com\"\n";
 
@@ -3768,10 +3768,10 @@ TEST(infra_parse_shell_secret_filtered) {
 
 TEST(infra_parse_shell_shebang_only) {
     /* Port of TestParseShellScriptShebanOnly */
-    const char *src = "#!/bin/bash\n# just comments\n";
+    const char *src = "#!/usr/bin/env bash\n# just comments\n";
     cbm_shell_result_t r;
     ASSERT_EQ(cbm_parse_shell_source(src, &r), 0);
-    ASSERT_STR_EQ(r.shebang, "/bin/bash");
+    ASSERT_STR_EQ(r.shebang, "/usr/bin/env bash");
     PASS();
 }
 
@@ -4493,7 +4493,7 @@ TEST(envscan_shell_env_urls) {
         FAIL("tmpdir");
 
     write_temp_file(tmpdir, "setup.sh",
-                    "#!/bin/bash\n"
+                    "#!/usr/bin/env bash\n"
                     "export DB_URL=\"https://db.example.com/api/sync\"\n"
                     "APP_NAME=\"my-service\"\n"
                     "CALLBACK_URL=https://hooks.example.com/notify\n");
@@ -4668,7 +4668,7 @@ TEST(envscan_secret_value_exclusion) {
 
     write_temp_file(
         tmpdir, "deploy.sh",
-        "#!/bin/bash\n"
+        "#!/usr/bin/env bash\n"
         "export GH_URL=\"https://ghp_abcdefghijklmnopqrstuvwxyz1234567890@github.com/repo\"\n"
         "export NORMAL_ENDPOINT=\"https://api.example.com/orders\"\n");
 
@@ -4692,10 +4692,10 @@ TEST(envscan_secret_file_exclusion) {
 
     /* Secret file should be skipped */
     write_temp_file(tmpdir, "credentials.sh",
-                    "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n");
+                    "#!/usr/bin/env bash\nexport API_URL=\"https://api.example.com/v1\"\n");
     /* Normal file should be scanned */
     write_temp_file(tmpdir, "setup.sh",
-                    "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n");
+                    "#!/usr/bin/env bash\nexport API_URL=\"https://api.example.com/v1\"\n");
 
     cbm_env_binding_t bindings[32];
     int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
@@ -4727,7 +4727,7 @@ TEST(envscan_skips_ignored_dirs) {
     snprintf(gitdir, sizeof(gitdir), "%s/.git", tmpdir);
     cbm_mkdir(gitdir);
     write_temp_file(tmpdir, ".git/config.sh",
-                    "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n");
+                    "#!/usr/bin/env bash\nexport API_URL=\"https://api.example.com/v1\"\n");
 
     /* File inside node_modules should be skipped */
     char nmdir[512];
@@ -4737,11 +4737,11 @@ TEST(envscan_skips_ignored_dirs) {
     snprintf(nmpkg, sizeof(nmpkg), "%s/node_modules/pkg", tmpdir);
     cbm_mkdir(nmpkg);
     write_temp_file(tmpdir, "node_modules/pkg/config.sh",
-                    "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n");
+                    "#!/usr/bin/env bash\nexport API_URL=\"https://api.example.com/v1\"\n");
 
     /* File at root level should be scanned */
     write_temp_file(tmpdir, "deploy.sh",
-                    "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n");
+                    "#!/usr/bin/env bash\nexport API_URL=\"https://api.example.com/v1\"\n");
 
     cbm_env_binding_t bindings[32];
     int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
@@ -4776,7 +4776,7 @@ TEST(envscan_non_url_values_skipped) {
                     "ENV DEBUG=true\n"
                     "ENV LOG_LEVEL=info\n");
     write_temp_file(tmpdir, "config.sh",
-                    "#!/bin/bash\n"
+                    "#!/usr/bin/env bash\n"
                     "export REGION=\"us-east-1\"\n"
                     "export COUNT=42\n");
 
