@@ -2295,6 +2295,129 @@ TEST(tool_bad_project_name_no_overflow_issue235) {
 }
 #undef ISSUE235_DBNAME
 
+/* Issue #576: ingest_dbt_manifest parses a compiled dbt manifest.json and
+ * upserts model/seed/snapshot as graph nodes, source as Source nodes, and each
+ * node's depends_on.nodes as DEPENDS_ON edges, keyed by dbt unique_id. The
+ * handler opens (and creates) the project's on-disk store at
+ * <CBM_CACHE_DIR>/<project>.db, so an isolated cache dir plus a small fixture
+ * manifest exercises the whole path. The fixture carries 3 models + 1 seed +
+ * 1 snapshot + 2 sources and one `test` node that must be skipped, so the
+ * reported counts pin both the resource-type filter and the lineage edges. */
+static const char *DBT_MANIFEST_FIXTURE =
+    "{\"nodes\":{"
+    "\"model.shop.stg_orders\":{\"resource_type\":\"model\",\"name\":\"stg_orders\","
+    "\"depends_on\":{\"nodes\":[\"source.shop.raw.orders\"]}},"
+    "\"model.shop.stg_customers\":{\"resource_type\":\"model\",\"name\":\"stg_customers\","
+    "\"depends_on\":{\"nodes\":[\"source.shop.raw.customers\"]}},"
+    "\"model.shop.fct_orders\":{\"resource_type\":\"model\",\"name\":\"fct_orders\","
+    "\"depends_on\":{\"nodes\":[\"model.shop.stg_orders\",\"model.shop.stg_customers\"]}},"
+    "\"seed.shop.country_codes\":{\"resource_type\":\"seed\",\"name\":\"country_codes\","
+    "\"depends_on\":{\"nodes\":[]}},"
+    "\"snapshot.shop.orders_snap\":{\"resource_type\":\"snapshot\",\"name\":\"orders_snap\","
+    "\"depends_on\":{\"nodes\":[\"model.shop.fct_orders\"]}},"
+    "\"test.shop.not_null_fct_orders\":{\"resource_type\":\"test\",\"name\":\"not_null\","
+    "\"depends_on\":{\"nodes\":[\"model.shop.fct_orders\"]}}"
+    "},\"sources\":{"
+    "\"source.shop.raw.orders\":{\"resource_type\":\"source\",\"name\":\"orders\"},"
+    "\"source.shop.raw.customers\":{\"resource_type\":\"source\",\"name\":\"customers\"}"
+    "}}";
+
+TEST(tool_ingest_dbt_manifest_issue576) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-dbt-manifest-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS(); /* skip if mkdtemp fails */
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "test-dbt-manifest";
+
+    /* Write the fixture manifest into the isolated cache dir. */
+    char manifest_path[512];
+    snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.json", cache);
+    FILE *fp = fopen(manifest_path, "w");
+    int wrote = 0;
+    if (fp) {
+        fputs(DBT_MANIFEST_FIXTURE, fp);
+        fclose(fp);
+        wrote = 1;
+    }
+
+    /* The tool augments an existing project store (index_repository normally
+     * creates it). Pre-create the store at the path the tool reopens and
+     * register the project row, otherwise the FK-checked node upserts are
+     * rejected and nothing is ingested. */
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/%s.db", cache, project);
+    cbm_store_t *seed = cbm_store_open_path(dbpath);
+    int seeded = 0;
+    if (seed) {
+        cbm_store_upsert_project(seed, project, cache);
+        cbm_store_close(seed);
+        seeded = 1;
+    }
+
+    /* Call the tool through the MCP server and capture the reported counts. */
+    int ok_status = 0, ok_models = 0, ok_sources = 0, ok_edges = 0;
+    if (wrote && seeded) {
+        char req[2048];
+        snprintf(req, sizeof(req),
+                 "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":"
+                 "\"ingest_dbt_manifest\",\"arguments\":{\"project\":\"%s\","
+                 "\"manifest_path\":\"%s\"}}}",
+                 project, manifest_path);
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        if (srv) {
+            char *resp = cbm_mcp_server_handle(srv, req);
+            if (resp) {
+                char *inner = extract_text_content(resp);
+                if (inner) {
+                    ok_status = strstr(inner, "\"status\":\"ingested\"") != NULL;
+                    ok_models = strstr(inner, "\"models\":5") != NULL;
+                    ok_sources = strstr(inner, "\"sources\":2") != NULL;
+                    ok_edges = strstr(inner, "\"edges\":5") != NULL;
+                    free(inner);
+                }
+                free(resp);
+            }
+            cbm_mcp_server_free(srv);
+        }
+    }
+
+    /* Restore env and clean up BEFORE asserting, so a failed assertion never
+     * leaks the overridden CBM_CACHE_DIR into the rest of the suite. */
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    char dbwal[576];
+    char dbshm[576];
+    snprintf(dbwal, sizeof(dbwal), "%s-wal", dbpath);
+    snprintf(dbshm, sizeof(dbshm), "%s-shm", dbpath);
+    cbm_unlink(dbwal);
+    cbm_unlink(dbshm);
+    cbm_unlink(dbpath);
+    cbm_unlink(manifest_path);
+    cbm_rmdir(cache);
+
+    ASSERT(wrote);
+    ASSERT(seeded);
+    /* 3 models + 1 seed + 1 snapshot = 5 lineage-bearing nodes; the `test`
+     * node is skipped (so models is 5, not 6). */
+    ASSERT(ok_status);
+    ASSERT(ok_models);
+    ASSERT(ok_sources);
+    /* stg_orders/stg_customers -> source, fct_orders -> 2 stg, snap -> fct = 5
+     * DEPENDS_ON edges; the skipped test node contributes none. */
+    ASSERT(ok_edges);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
@@ -2369,6 +2492,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_includes_node_properties);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_query_graph_basic);
+    RUN_TEST(tool_ingest_dbt_manifest_issue576);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_index_status_includes_git_metadata);
 
