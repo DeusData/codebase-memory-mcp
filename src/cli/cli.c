@@ -71,7 +71,11 @@ enum {
 #include <unistd.h>
 #endif
 #ifdef __APPLE__
+#include <libproc.h>
 #include <mach-o/dyld.h>
+#endif
+#ifdef _WIN32
+#include <tlhelp32.h>
 #endif
 #include "foundation/compat_fs.h"
 
@@ -1365,6 +1369,17 @@ int cbm_remove_instructions(const char *path) {
 /* ── Codex MCP config (TOML) ─────────────────────────────────── */
 
 #define CODEX_CMM_SECTION "[mcp_servers.codebase-memory-mcp]"
+#define CODEX_HOOK_BEGIN "# >>> codebase-memory-mcp SessionStart >>>"
+#define CODEX_HOOK_END "# <<< codebase-memory-mcp SessionStart <<<"
+
+static const char *codex_mcp_section_suffix(const char *section_end) {
+    const char *next_section = strstr(section_end, "\n[");
+    const char *hook_begin = strstr(section_end, CODEX_HOOK_BEGIN);
+    if (hook_begin && (!next_section || hook_begin < next_section)) {
+        return hook_begin;
+    }
+    return next_section ? next_section + CLI_SKIP_ONE : "";
+}
 
 int cbm_upsert_codex_mcp(const char *binary_path, const char *config_path) {
     if (!binary_path || !config_path) {
@@ -1388,14 +1403,9 @@ int cbm_upsert_codex_mcp(const char *binary_path, const char *config_path) {
     if (existing) {
         /* Remove old section: from [mcp_servers.codebase-memory-mcp] to next [section] or EOF */
         char *section_end = existing + strlen(CODEX_CMM_SECTION);
-        /* Find next [section] header */
-        char *next_section = strstr(section_end, "\n[");
-        if (next_section) {
-            next_section++; /* keep the newline before next section */
-        }
+        const char *suffix = codex_mcp_section_suffix(section_end);
 
         size_t prefix_len = (size_t)(existing - content);
-        const char *suffix = next_section ? next_section : "";
         size_t suffix_len = strlen(suffix);
         size_t new_len = prefix_len + strlen(section) + CLI_SKIP_ONE + suffix_len;
         char *result = malloc(new_len + CLI_SKIP_ONE);
@@ -1451,10 +1461,7 @@ int cbm_remove_codex_mcp(const char *config_path) {
     }
 
     char *section_end = existing + strlen(CODEX_CMM_SECTION);
-    char *next_section = strstr(section_end, "\n[");
-    if (next_section) {
-        next_section++;
-    }
+    const char *suffix = codex_mcp_section_suffix(section_end);
 
     /* Remove leading newline if present */
     if (existing > content && *(existing - CLI_SKIP_ONE) == '\n') {
@@ -1462,7 +1469,6 @@ int cbm_remove_codex_mcp(const char *config_path) {
     }
 
     size_t prefix_len = (size_t)(existing - content);
-    const char *suffix = next_section ? next_section : "";
     size_t suffix_len = strlen(suffix);
     size_t new_len = prefix_len + suffix_len;
     char *result = malloc(new_len + CLI_SKIP_ONE);
@@ -1494,39 +1500,82 @@ int cbm_remove_codex_mcp(const char *config_path) {
 
 /* Sentinel-delimited block so upsert/remove are robust to the nested TOML
  * array-of-tables (which both start with '['). */
-#define CODEX_HOOK_BEGIN "# >>> codebase-memory-mcp SessionStart >>>"
-#define CODEX_HOOK_END "# <<< codebase-memory-mcp SessionStart <<<"
+static const char *codex_find_session_start_table(const char *from, const char *end_marker) {
+    const char *line = from;
+    const char *last = NULL;
+    while (line && line < end_marker) {
+        if (strncmp(line, "[[hooks.SessionStart]]", SLEN("[[hooks.SessionStart]]")) == 0) {
+            last = line;
+        }
+        const char *next = strchr(line, '\n');
+        if (!next || next >= end_marker) {
+            break;
+        }
+        line = next + CLI_SKIP_ONE;
+    }
+    return last;
+}
 
-/* Splice out an existing [CODEX_HOOK_BEGIN .. CODEX_HOOK_END] block (inclusive,
- * plus a leading newline). Returns a newly-malloc'd string the caller frees, or
- * NULL if no block was present (content is left untouched). */
+static bool codex_hook_block_bounds(const char *from, const char **out_begin,
+                                    const char **out_end) {
+    const char *begin = strstr(from, CODEX_HOOK_BEGIN);
+    const char *end_marker = strstr(from, CODEX_HOOK_END);
+    if (!begin && !end_marker) {
+        return false;
+    }
+
+    const char *block_begin = NULL;
+    if (begin && (!end_marker || begin < end_marker)) {
+        block_begin = begin;
+        end_marker = strstr(begin, CODEX_HOOK_END);
+    } else {
+        block_begin = codex_find_session_start_table(from, end_marker);
+    }
+    if (!block_begin || !end_marker) {
+        return false;
+    }
+
+    const char *block_end = end_marker + strlen(CODEX_HOOK_END);
+    if (*block_end == '\n') {
+        block_end++;
+    }
+    if (block_begin > from && *(block_begin - CLI_SKIP_ONE) == '\n') {
+        block_begin--;
+    }
+    *out_begin = block_begin;
+    *out_end = block_end;
+    return true;
+}
+
+/* Splice out all CMM Codex SessionStart hook blocks. Returns a newly-malloc'd
+ * string the caller frees, or NULL if no block was present. */
 static char *codex_hook_strip(const char *content) {
-    const char *begin = strstr(content, CODEX_HOOK_BEGIN);
-    if (!begin) {
-        return NULL;
-    }
-    const char *end = strstr(begin, CODEX_HOOK_END);
-    if (!end) {
-        return NULL;
-    }
-    end += strlen(CODEX_HOOK_END);
-    if (*end == '\n') {
-        end++;
-    }
-    /* Drop one leading newline before the block, if any. */
-    const char *cut = begin;
-    if (cut > content && *(cut - CLI_SKIP_ONE) == '\n') {
-        cut--;
-    }
-    size_t prefix_len = (size_t)(cut - content);
-    size_t suffix_len = strlen(end);
-    char *out = malloc(prefix_len + suffix_len + CLI_SKIP_ONE);
+    size_t content_len = strlen(content);
+    char *out = malloc(content_len + CLI_SKIP_ONE);
     if (!out) {
         return NULL;
     }
-    memcpy(out, content, prefix_len);
-    memcpy(out + prefix_len, end, suffix_len);
-    out[prefix_len + suffix_len] = '\0';
+
+    const char *cursor = content;
+    size_t out_len = 0;
+    bool changed = false;
+    const char *begin;
+    const char *end;
+    while (codex_hook_block_bounds(cursor, &begin, &end)) {
+        size_t keep_len = (size_t)(begin - cursor);
+        memcpy(out + out_len, cursor, keep_len);
+        out_len += keep_len;
+        cursor = end;
+        changed = true;
+    }
+    if (!changed) {
+        free(out);
+        return NULL;
+    }
+
+    size_t suffix_len = strlen(cursor);
+    memcpy(out + out_len, cursor, suffix_len);
+    out[out_len + suffix_len] = '\0';
     return out;
 }
 
@@ -3217,20 +3266,103 @@ static int cbm_macos_adhoc_sign(const char *binary_path) {
 }
 #endif
 
-/* ── Kill other MCP server instances ──────────────────────────── */
+/* ── Stop stale MCP server instances for a specific install target ─ */
 
-static int cbm_kill_other_instances(void) {
+static bool cbm_process_exe_path(unsigned long pid, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) {
+        return false;
+    }
+    out[0] = '\0';
 #ifdef _WIN32
-    /* taskkill /IM kills ALL matching processes INCLUDING self.
-     * Use /FI filter to exclude our own PID. */
-    char pid_filter[CBM_SZ_64];
-    snprintf(pid_filter, sizeof(pid_filter), "PID ne %lu", (unsigned long)GetCurrentProcessId());
-    const char *argv[] = {"taskkill", "/F",       "/FI", "IMAGENAME eq codebase-memory-mcp.exe",
-                          "/FI",      pid_filter, NULL};
-    (void)cbm_exec_no_shell(argv);
-    return 0;
+    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+    if (!hp) {
+        return false;
+    }
+    DWORD len = (DWORD)out_sz;
+    BOOL ok = QueryFullProcessImageNameA(hp, 0, out, &len);
+    CloseHandle(hp);
+    if (!ok || len == 0 || len >= out_sz) {
+        out[0] = '\0';
+        return false;
+    }
+    cbm_normalize_path_sep(out);
+    return true;
+#elif defined(__APPLE__)
+    int n = proc_pidpath((int)pid, out, (uint32_t)out_sz);
+    if (n <= 0 || (size_t)n >= out_sz) {
+        out[0] = '\0';
+        return false;
+    }
+    out[n] = '\0';
+    return true;
+#elif defined(__linux__)
+    char link_path[CLI_BUF_128];
+    int n = snprintf(link_path, sizeof(link_path), "/proc/%lu/exe", pid);
+    if (n < 0 || (size_t)n >= sizeof(link_path)) {
+        return false;
+    }
+    ssize_t r = readlink(link_path, out, out_sz - CLI_SKIP_ONE);
+    if (r <= 0 || (size_t)r >= out_sz) {
+        out[0] = '\0';
+        return false;
+    }
+    out[r] = '\0';
+    char *deleted = strstr(out, " (deleted)");
+    if (deleted) {
+        *deleted = '\0';
+    }
+    return true;
 #else
+#endif
+    return false;
+}
+
+static int cbm_stop_instances_for_target(const char *target_path) {
+    if (!target_path || !target_path[0]) {
+        return 0;
+    }
+    struct stat st;
+    if (stat(target_path, &st) != 0) {
+        return 0;
+    }
     int killed = 0;
+#ifdef _WIN32
+    DWORD self = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    PROCESSENTRY32 pe;
+    memset(&pe, 0, sizeof(pe));
+    pe.dwSize = sizeof(pe);
+    if (!Process32First(snap, &pe)) {
+        CloseHandle(snap);
+        return 0;
+    }
+    do {
+        if (pe.th32ProcessID == self) {
+            continue;
+        }
+        if (_stricmp(pe.szExeFile, "codebase-memory-mcp.exe") != 0) {
+            continue;
+        }
+        char exe_path[CLI_BUF_1K];
+        if (!cbm_process_exe_path((unsigned long)pe.th32ProcessID, exe_path, sizeof(exe_path))) {
+            continue;
+        }
+        if (!cbm_same_file(exe_path, target_path)) {
+            continue;
+        }
+        HANDLE hp = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+        if (hp) {
+            if (TerminateProcess(hp, 0)) {
+                killed++;
+            }
+            CloseHandle(hp);
+        }
+    } while (Process32Next(snap, &pe));
+    CloseHandle(snap);
+#else
     pid_t self = getpid();
     FILE *fp = cbm_popen("pgrep -x codebase-memory-mcp", "r");
     if (!fp) {
@@ -3239,15 +3371,23 @@ static int cbm_kill_other_instances(void) {
     char line[CLI_BUF_32];
     while (fgets(line, sizeof(line), fp)) {
         pid_t pid = (pid_t)strtol(line, NULL, CLI_STRTOL_BASE);
-        if (pid > 0 && pid != self) {
-            if (kill(pid, SIGTERM) == 0) {
-                killed++;
-            }
+        if (pid <= 0 || pid == self) {
+            continue;
+        }
+        char exe_path[CLI_BUF_1K];
+        if (!cbm_process_exe_path((unsigned long)pid, exe_path, sizeof(exe_path))) {
+            continue;
+        }
+        if (!cbm_same_file(exe_path, target_path)) {
+            continue;
+        }
+        if (kill(pid, SIGTERM) == 0) {
+            killed++;
         }
     }
     cbm_pclose(fp);
-    return killed;
 #endif
+    return killed;
 }
 
 /* Download checksums.txt and verify the archive integrity.
@@ -3878,15 +4018,7 @@ int cbm_cmd_install(int argc, char **argv) {
         }
     }
 
-    /* Step 1b: Kill running MCP server instances so agents pick up new config */
-    if (!dry_run) {
-        int killed = cbm_kill_other_instances();
-        if (killed > 0) {
-            printf("Stopped %d running MCP server instance(s).\n\n", killed);
-        }
-    }
-
-    /* Step 1c: Place the running binary at the canonical install target.
+    /* Step 1b: Place the running binary at the canonical install target.
      * Previously install only re-signed whatever was already at the target, so
      * `install --force` from a freshly built binary silently kept the OLD file
      * — operators ran stale code believing they had upgraded (#472). Copy the
@@ -3900,6 +4032,16 @@ int cbm_cmd_install(int argc, char **argv) {
 #else
     snprintf(bin_target, sizeof(bin_target), "%s/.local/bin/codebase-memory-mcp", home);
 #endif
+
+    /* Stop only server processes running this exact installed target. Matching
+     * every process named codebase-memory-mcp can terminate unrelated agent
+     * sessions when install is run against a fake HOME or alternate prefix. */
+    if (!dry_run) {
+        int killed = cbm_stop_instances_for_target(bin_target);
+        if (killed > 0) {
+            printf("Stopped %d running MCP server instance(s).\n\n", killed);
+        }
+    }
 
     if (!cbm_same_file(self_path, bin_target)) {
         struct stat tgt_st;
@@ -4338,7 +4480,7 @@ static int download_verify_install(const char *url, const char *ext, const char 
         return CLI_TRUE;
     }
 
-    int killed = cbm_kill_other_instances();
+    int killed = cbm_stop_instances_for_target(bin_dest);
     if (killed > 0) {
         printf("Stopped %d running MCP server instance(s).\n", killed);
     }

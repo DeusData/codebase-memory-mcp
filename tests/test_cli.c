@@ -44,6 +44,22 @@ static const char *read_test_file(const char *path) {
     return buf;
 }
 
+static size_t count_substr(const char *s, const char *needle) {
+    size_t count = 0;
+    if (!s || !needle) {
+        return 0;
+    }
+    size_t needle_len = strlen(needle);
+    if (needle_len == 0) {
+        return 0;
+    }
+    while ((s = strstr(s, needle)) != NULL) {
+        count++;
+        s += needle_len;
+    }
+    return count;
+}
+
 /* Helper: mkdirp */
 static int test_mkdirp(const char *path) {
     char tmp[1024];
@@ -1650,6 +1666,72 @@ TEST(cli_codex_session_hook_issue330) {
     PASS();
 }
 
+TEST(cli_codex_mcp_and_hook_upserts_are_idempotent) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codexhook-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char cfg[512];
+    snprintf(cfg, sizeof(cfg), "%s/config.toml", tmpdir);
+    write_test_file(cfg, "model = \"gpt-5\"\n");
+
+    ASSERT_EQ(cbm_upsert_codex_mcp("/usr/local/bin/codebase-memory-mcp", cfg), 0);
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    ASSERT_EQ(cbm_upsert_codex_mcp("/usr/local/bin/codebase-memory-mcp", cfg), 0);
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+
+    const char *d = read_test_file(cfg);
+    ASSERT_NOT_NULL(d);
+    ASSERT_EQ(count_substr(d, "[mcp_servers.codebase-memory-mcp]"), 1);
+    ASSERT_EQ(count_substr(d, "# >>> codebase-memory-mcp SessionStart >>>"), 1);
+    ASSERT_EQ(count_substr(d, "# <<< codebase-memory-mcp SessionStart <<<"), 1);
+    ASSERT_EQ(count_substr(d, "[[hooks.SessionStart]]"), 1);
+    ASSERT_EQ(count_substr(d, "[[hooks.SessionStart.hooks]]"), 1);
+    ASSERT(strstr(d, "model = \"gpt-5\"") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_codex_hook_strip_repairs_orphan_end_sentinel) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codexhook-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char cfg[512];
+    snprintf(cfg, sizeof(cfg), "%s/config.toml", tmpdir);
+    write_test_file(cfg, "model = \"gpt-5\"\n"
+                         "\n"
+                         "[[hooks.SessionStart]]\n"
+                         "[[hooks.SessionStart.hooks]]\n"
+                         "type = \"command\"\n"
+                         "command = 'echo old'\n"
+                         "# <<< codebase-memory-mcp SessionStart <<<\n"
+                         "\n"
+                         "# >>> codebase-memory-mcp SessionStart >>>\n"
+                         "[[hooks.SessionStart]]\n"
+                         "[[hooks.SessionStart.hooks]]\n"
+                         "type = \"command\"\n"
+                         "command = 'echo duplicate'\n"
+                         "# <<< codebase-memory-mcp SessionStart <<<\n");
+
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+
+    const char *d = read_test_file(cfg);
+    ASSERT_NOT_NULL(d);
+    ASSERT_EQ(count_substr(d, "# >>> codebase-memory-mcp SessionStart >>>"), 1);
+    ASSERT_EQ(count_substr(d, "# <<< codebase-memory-mcp SessionStart <<<"), 1);
+    ASSERT_EQ(count_substr(d, "[[hooks.SessionStart]]"), 1);
+    ASSERT_EQ(count_substr(d, "echo old"), 0);
+    ASSERT_EQ(count_substr(d, "echo duplicate"), 0);
+    ASSERT(strstr(d, "model = \"gpt-5\"") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* Gemini/Antigravity SessionStart reminder parity (settings.json JSON path). */
 TEST(cli_gemini_session_hook_parity) {
     char tmpdir[256];
@@ -2751,6 +2833,8 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_cursor_issue222);
     RUN_TEST(cli_install_plan_receipt_no_mutation_issue388);
     RUN_TEST(cli_codex_session_hook_issue330);
+    RUN_TEST(cli_codex_mcp_and_hook_upserts_are_idempotent);
+    RUN_TEST(cli_codex_hook_strip_repairs_orphan_end_sentinel);
     RUN_TEST(cli_gemini_session_hook_parity);
     RUN_TEST(cli_detect_agents_finds_gemini);
     RUN_TEST(cli_detect_agents_finds_zed);
