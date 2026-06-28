@@ -195,14 +195,14 @@ TEST(watcher_prunes_sustained_missing_root) {
     char rootdir[256];
     snprintf(rootdir, sizeof(rootdir), "/tmp/cbm_watcher_stale_root_XXXXXX");
     if (!cbm_mkdtemp(rootdir)) {
-        SKIP("cbm_mkdtemp root failed");
+        FAIL("cbm_mkdtemp root failed");
     }
 
     char cachedir[256];
     snprintf(cachedir, sizeof(cachedir), "/tmp/cbm_watcher_stale_cache_XXXXXX");
     if (!cbm_mkdtemp(cachedir)) {
         th_rmtree(rootdir);
-        SKIP("cbm_mkdtemp cache failed");
+        FAIL("cbm_mkdtemp cache failed");
     }
 
     char saved_cache_dir[1024];
