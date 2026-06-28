@@ -469,7 +469,7 @@ static const char skill_content[] =
     "\n"
     "# Codebase Memory — Knowledge Graph Tools\n"
     "\n"
-    "Graph tools return precise structural results in ~500 tokens vs ~80K for grep.\n"
+    "Graph tools return structured code results with lower token cost than broad grep.\n"
     "\n"
     "## Quick Decision Matrix\n"
     "\n"
@@ -483,13 +483,13 @@ static const char skill_content[] =
     "| Cross-service edges | `query_graph` with Cypher |\n"
     "| Impact of local changes | `detect_changes()` |\n"
     "| Risk-classified trace | `trace_path(risk_labels=true)` |\n"
-    "| Text search | `search_code` or Grep |\n"
+    "| Text search | `search_code(pattern=\"...\")` or Grep |\n"
     "\n"
     "## Exploration Workflow\n"
-    "1. `list_projects` — check if project is indexed\n"
-    "2. `get_graph_schema` — understand node/edge types\n"
-    "3. `search_graph(label=\"Function\", name_pattern=\".*Pattern.*\")` — find code\n"
-    "4. `get_code_snippet(qualified_name=\"project.path.FuncName\")` — read source\n"
+    "1. `search_graph(pattern=\"...\")` — auto-indexes the server CWD when possible and finds code\n"
+    "2. `get_code(qualified_name=\"project.path.FuncName\")` — read one symbol's source\n"
+    "3. `query_graph(query=\"MATCH ...\")` — use Cypher for multi-hop graph questions\n"
+    "4. `_hidden_tools` — reveal classic tools such as list_projects and get_graph_schema if needed\n"
     "\n"
     "## Tracing Workflow\n"
     "1. `search_graph(name_pattern=\".*FuncName.*\")` — discover exact name\n"
@@ -501,11 +501,11 @@ static const char skill_content[] =
     "- High fan-out: `query_graph(query=\"MATCH (f)-[:CALLS]->(g) RETURN f.name, count(g) AS out_degree ORDER BY out_degree DESC LIMIT 20\")`\n"
     "- High fan-in: `query_graph(query=\"MATCH (f)<-[:CALLS]-(g) RETURN f.name, count(g) AS in_degree ORDER BY in_degree DESC LIMIT 20\")`\n"
     "\n"
-    "## MCP Tools\n"
-    "`index_repository`, `index_status`, `list_projects`, `delete_project`,\n"
-    "`search_graph`, `search_code`, `trace_path`, `detect_changes`,\n"
-    "`query_graph`, `get_graph_schema`, `get_code_snippet`, `get_architecture`,\n"
-    "`manage_adr`, `ingest_traces`, `index_dependencies`\n"
+    "## Default MCP Tools\n"
+    "`search_graph`, `query_graph`, `search_code`, `trace_path`, `get_code`\n"
+    "\n"
+    "Use `_hidden_tools` to reveal advanced tools such as `index_repository`,\n"
+    "`get_graph_schema`, `get_architecture`, `detect_changes`, and `index_dependencies`.\n"
     "\n"
     "## Edge Types\n"
     "CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD,\n"
@@ -525,8 +525,7 @@ static const char skill_content[] =
     "use `query_graph` with Cypher to see actual edges.\n"
     "2. `query_graph` output is capped by query_max_output_bytes; add LIMIT or set max_output_bytes=0.\n"
     "3. `trace_path` works best with exact names — use `search_graph(name_pattern=...)` first.\n"
-    "4. `direction=\"outbound\"` misses cross-service callers — use "
-    "`direction=\"both\"`.\n"
+    "4. `direction=\"outbound\"` returns callees only; use `direction=\"both\"` for callers too.\n"
     "5. Results default to search_limit (50 unless configured); check `has_more` and use `offset`.\n";
 
 static const char codex_instructions_content[] =
@@ -535,9 +534,9 @@ static const char codex_instructions_content[] =
     "This project uses codebase-memory-mcp to maintain a knowledge graph of the codebase.\n"
     "Use the MCP tools to explore and understand the code:\n"
     "\n"
-    "- `search_graph` — find functions, classes, routes by pattern\n"
+    "- `search_graph` — find functions, classes, routes by pattern; auto-indexes the server CWD when possible\n"
     "- `trace_path` — trace who calls a function or what it calls\n"
-    "- `get_code_snippet` — read function source code\n"
+    "- `get_code` — read function source code by qualified_name\n"
     "- `query_graph` — run Cypher queries for complex patterns\n"
     "- `get_architecture` — high-level project summary\n"
     "\n"
@@ -1157,12 +1156,12 @@ static const char agent_instructions_content[] =
     "# Codebase Knowledge Graph (codebase-memory-mcp)\n"
     "\n"
     "This project uses codebase-memory-mcp to maintain a knowledge graph of the codebase.\n"
-    "ALWAYS prefer MCP graph tools over grep/glob/file-search for code discovery.\n"
+    "Prefer MCP graph tools over grep/glob/file-search for structural code discovery.\n"
     "\n"
     "## Priority Order\n"
     "1. `search_graph` — find functions, classes, routes, variables by pattern\n"
     "2. `trace_path` — trace who calls a function or what it calls\n"
-    "3. `get_code_snippet` — read specific function/class source code\n"
+    "3. `get_code` — read specific function/class source code by qualified_name\n"
     "4. `query_graph` — run Cypher queries for complex patterns\n"
     "5. `get_architecture` — high-level project summary\n"
     "\n"
@@ -1174,7 +1173,7 @@ static const char agent_instructions_content[] =
     "## Examples\n"
     "- Find a handler: `search_graph(name_pattern=\".*OrderHandler.*\")`\n"
     "- Who calls it: `trace_path(function_name=\"OrderHandler\", direction=\"inbound\")`\n"
-    "- Read source: `get_code_snippet(qualified_name=\"pkg/orders.OrderHandler\")`\n";
+    "- Read source: `get_code(qualified_name=\"pkg/orders.OrderHandler\")`\n";
 
 const char *cbm_get_agent_instructions(void) {
     return agent_instructions_content;
@@ -1495,8 +1494,8 @@ int cbm_remove_codex_mcp(const char *config_path) {
  * and NO newlines. (issues #330 + Gemini/Antigravity parity) */
 #define CMM_SESSION_REMINDER_CMD                                                    \
     "echo \"Code discovery: prefer codebase-memory-mcp (search_graph, trace_path, " \
-    "get_code_snippet, query_graph, search_code) over grep/file-read; run "         \
-    "index_repository first if the project is not indexed.\""
+    "get_code, query_graph, search_code) over grep/file-read; default tools "       \
+    "auto-index when possible; call _hidden_tools for explicit index_repository.\""
 
 /* Sentinel-delimited block so upsert/remove are robust to the nested TOML
  * array-of-tables (which both start with '['). */
@@ -2031,17 +2030,17 @@ static void cbm_install_session_reminder_script(const char *home) {
            "# SessionStart hook: remind agent to use codebase-memory-mcp tools.\n"
            "# Installed by codebase-memory-mcp. Fires on startup/resume/clear/compact.\n"
            "cat << 'REMINDER'\n"
-           "CRITICAL - Code Discovery Protocol:\n"
-           "1. ALWAYS use codebase-memory-mcp tools FIRST for ANY code exploration:\n"
+           "Code Discovery Protocol:\n"
+           "1. Prefer codebase-memory-mcp tools first for structural code exploration:\n"
            "   - search_graph(name_pattern/label/qn_pattern) to find functions/classes/routes\n"
            "   - trace_path(function_name, mode=calls|data_flow|cross_service) for call chains\n"
-           "   - get_code_snippet(qualified_name) for exact symbol source (precise ranges)\n"
+           "   - get_code(qualified_name) for exact symbol source in streamlined mode\n"
            "   - query_graph(query) for complex Cypher patterns\n"
-           "   - get_architecture(aspects) for project structure\n"
            "   - search_code(pattern) for text search (graph-augmented grep)\n"
            "2. Use Grep/Glob/Read freely for text, configs, non-code files, and\n"
            "   always Read a file before editing it.\n"
-           "3. If a project is not indexed yet, run index_repository FIRST.\n"
+           "3. Default tools auto-index the server CWD when possible. Use _hidden_tools\n"
+           "   to reveal index_repository or get_architecture when explicit control is needed.\n"
            "REMINDER\n");
 #ifndef _WIN32
     fchmod(fileno(f), CLI_OCTAL_PERM);
@@ -2086,7 +2085,7 @@ static int cbm_remove_session_hooks(const char *settings_path) {
 #define GEMINI_HOOK_MATCHER "google_search|grep_search"
 #define GEMINI_HOOK_COMMAND                                               \
     "echo 'Reminder: prefer codebase-memory-mcp search_graph/trace_path/" \
-    "get_code_snippet over grep/file search for code discovery.' >&2"
+    "get_code over grep/file search for code discovery.' >&2"
 
 int cbm_upsert_gemini_hooks(const char *settings_path) {
     return upsert_hooks_json((hooks_upsert_args_t){
