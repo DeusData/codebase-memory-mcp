@@ -2645,6 +2645,32 @@ TEST(extract_java_method_annotations_issue382) {
     PASS();
 }
 
+TEST(extract_python_mock_patch_is_not_route) {
+    CBMFileResult *r = extract("from unittest.mock import patch\n\n"
+                               "@patch(\"subprocess.run\")\n"
+                               "def test_cmd(mock_run):\n"
+                               "    pass\n\n"
+                               "@app.patch(\"/items/{id}\")\n"
+                               "def update_item():\n"
+                               "    pass\n",
+                               CBM_LANG_PYTHON, "t", "test_routes.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *mocked = find_def_by_name(r, "test_cmd");
+    ASSERT_NOT_NULL(mocked);
+    ASSERT_NULL(mocked->route_path);
+    ASSERT_NULL(mocked->route_method);
+
+    const CBMDefinition *route = find_def_by_name(r, "update_item");
+    ASSERT_NOT_NULL(route);
+    ASSERT_STR_EQ(route->route_path, "/items/{id}");
+    ASSERT_STR_EQ(route->route_method, "PATCH");
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #213: large TS files were indexed as a File node with zero children. */
 TEST(extract_large_ts_has_functions_issue213) {
     enum { NFUNCS = 4000 };
@@ -3163,6 +3189,7 @@ SUITE(extraction) {
     RUN_TEST(js_index_module_qn_not_collide_with_folder);
     RUN_TEST(python_regular_module_qn_unchanged);
     RUN_TEST(extract_java_method_annotations_issue382);
+    RUN_TEST(extract_python_mock_patch_is_not_route);
     RUN_TEST(extract_large_ts_has_functions_issue213);
 
     /* Per-function complexity metrics (Tier A) */

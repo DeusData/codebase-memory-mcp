@@ -53,6 +53,20 @@ TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths) {
     PASS();
 }
 
+TEST(infrascan_service_pattern_match_uses_qn_boundaries) {
+    ASSERT_EQ(cbm_service_pattern_match(
+                  "proj.plugins.autorun.tests.test_plugin._dispatch"),
+              CBM_SVC_NONE);
+    ASSERT_EQ(cbm_service_pattern_match("proj.myrequests.client.get"), CBM_SVC_NONE);
+
+    ASSERT_EQ(cbm_service_pattern_match("proj.gin.router.GET"), CBM_SVC_ROUTE_REG);
+    ASSERT_EQ(cbm_service_pattern_match("proj.express.router.get"), CBM_SVC_ROUTE_REG);
+    ASSERT_EQ(cbm_service_pattern_match("proj.venv.requests.api.get"), CBM_SVC_HTTP);
+    ASSERT_EQ(cbm_service_pattern_match("proj.service.requests_get"), CBM_SVC_HTTP);
+    ASSERT_EQ(cbm_service_pattern_match("proj.GuzzleHttp.Client.get"), CBM_SVC_HTTP);
+    PASS();
+}
+
 TEST(infrascan_route_nodes_skip_bad_http_url_paths) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/cbm_infrascan_route_guard");
     ASSERT_NOT_NULL(gb);
@@ -133,6 +147,7 @@ TEST(infrascan_http_calls_join_matching_handler_route) {
 
 SUITE(infrascan) {
     RUN_TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths);
+    RUN_TEST(infrascan_service_pattern_match_uses_qn_boundaries);
     RUN_TEST(infrascan_route_nodes_skip_bad_http_url_paths);
     RUN_TEST(infrascan_http_calls_join_matching_handler_route);
 }

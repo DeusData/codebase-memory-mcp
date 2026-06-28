@@ -24,6 +24,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #include "store/store.h"
 #include "discover/discover.h"
 #include "discover/userconfig.h"
+#include "depindex/depindex.h"
 #include "foundation/platform.h"
 #include "foundation/compat_fs.h"
 #include "foundation/log.h"
@@ -621,6 +622,9 @@ static void cbm_pipeline_process_infra_bindings(cbm_gbuf_t *gbuf, const cbm_file
 }
 
 static bool is_infra_file(const char *fp) {
+    if (cbm_is_manifest_path(fp)) {
+        return false;
+    }
     return fp != NULL &&
            (strstr(fp, ".yaml") != NULL || strstr(fp, ".yml") != NULL ||
             strstr(fp, ".tf") != NULL || strstr(fp, ".hcl") != NULL || strstr(fp, ".toml") != NULL);
