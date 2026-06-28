@@ -95,6 +95,7 @@ static const lib_pattern_t http_libraries[] = {
     {"Net::HTTP", CBM_SVC_HTTP, NULL},
 
     /* PHP */
+    {"GuzzleHttp", CBM_SVC_HTTP, NULL},
     {"Guzzle", CBM_SVC_HTTP, NULL},
     {"guzzle", CBM_SVC_HTTP, NULL},
     {"curl", CBM_SVC_HTTP, NULL},
@@ -534,17 +535,41 @@ static const method_suffix_t method_suffixes[] = {
 
 /* ── Matching implementation ───────────────────────────────────── */
 
-/* Check if any library identifier appears as a substring in the QN.
- * Case-sensitive: "requests" matches "project.venv.requests.api.get"
- * but not "Requests". Library names are specific enough to avoid
- * false positives even with substring matching. */
+static bool qn_token_char(char ch) {
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+           (ch >= '0' && ch <= '9');
+}
+
+static bool qn_pattern_occurrence_matches(const char *qn, const char *hit,
+                                          const char *pattern) {
+    size_t plen = strlen(pattern);
+    if (plen == 0) {
+        return false;
+    }
+    if (qn_token_char(pattern[0]) && hit > qn && qn_token_char(hit[-1])) {
+        return false;
+    }
+    if (qn_token_char(pattern[plen - 1]) && qn_token_char(hit[plen])) {
+        return false;
+    }
+    return true;
+}
+
+/* Check if a library identifier appears as a token-aligned substring in the QN.
+ * Case-sensitive: "requests" matches "project.venv.requests.api.get" but not
+ * "myrequests".  The boundary check also prevents short framework ids like
+ * "gin." from firing inside unrelated names such as "plugin.". */
 static const lib_pattern_t *match_qn(const char *qn, const lib_pattern_t *patterns) {
     if (!qn || !qn[0]) {
         return NULL;
     }
     for (int i = 0; patterns[i].library_id != NULL; i++) {
-        if (strstr(qn, patterns[i].library_id) != NULL) {
-            return &patterns[i];
+        const char *p = qn;
+        while ((p = strstr(p, patterns[i].library_id)) != NULL) {
+            if (qn_pattern_occurrence_matches(qn, p, patterns[i].library_id)) {
+                return &patterns[i];
+            }
+            p++;
         }
     }
     return NULL;

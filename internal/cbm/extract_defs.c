@@ -1247,15 +1247,26 @@ static bool try_route_from_decorator_call(CBMArena *a, TSNode dchild, const char
     if (!method) {
         return false;
     }
+    const char *dot = fn_text ? strrchr(fn_text, '.') : NULL;
+    bool has_receiver = dot && dot[SKIP_CHAR] != '\0';
+    bool is_generic_route = fn_text &&
+                            (strcmp(dot ? dot + SKIP_CHAR : fn_text, "route") == 0 ||
+                             strcmp(dot ? dot + SKIP_CHAR : fn_text, "api_route") == 0);
 
     TSNode args = find_decorator_args(dchild);
     if (!ts_node_is_null(args)) {
         const char *path = extract_route_path_from_args(a, args, source);
         if (path) {
+            if (!has_receiver && !is_generic_route) {
+                return false;
+            }
             *out_path = path;
             *out_method = method;
             return true;
         }
+    }
+    if (!has_receiver) {
+        return false;
     }
     *out_path = "/";
     *out_method = method;
