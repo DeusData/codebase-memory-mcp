@@ -5665,6 +5665,15 @@ TEST(config_registry_includes_mcp_timeout_knobs) {
     PASS();
 }
 
+TEST(config_registry_includes_incremental_reindex_policy) {
+    const cbm_config_entry_t *entry = find_config_entry(CBM_CONFIG_INCREMENTAL_REINDEX);
+    ASSERT_NOT_NULL(entry);
+    ASSERT_STR_EQ(entry->default_val, "fast");
+    ASSERT_STR_EQ(entry->category, "Indexing");
+    ASSERT_STR_EQ(entry->range, "fast|always|off");
+    PASS();
+}
+
 TEST(trackable_source_files) {
     /* Common source extensions are trackable */
     ASSERT_TRUE(cbm_is_trackable_file("main.go"));
@@ -6187,6 +6196,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_unit_threshold_setters_clamp_invalid_values);
     RUN_TEST(pipeline_apply_config_sets_all_thresholds);
     RUN_TEST(config_registry_includes_mcp_timeout_knobs);
+    RUN_TEST(config_registry_includes_incremental_reindex_policy);
     /* File persistence */
     RUN_TEST(store_file_persistence);
     RUN_TEST(store_bulk_persistence);

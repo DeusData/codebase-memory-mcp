@@ -2706,6 +2706,12 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "Re-index if DB is older than N seconds (0=disabled)",
      "0-2592000",
      "0=disabled. 3600=hourly, 86400=daily, 604800=weekly. Runs on startup if stale."},
+    {"incremental_reindex", "fast", NULL, "Indexing",
+     "When to use the disk incremental reindex path",
+     "fast|always|off",
+     "'fast' uses incremental only for fast-mode indexes. Full/moderate modes rebuild atomically because "
+     "their current incremental path still performs full-graph quality work. 'always' preserves the legacy "
+     "route for benchmarking; 'off' always rebuilds from scratch."},
     /* ── Search ── */
     {"search_limit", "50", NULL, "Search",
      "Default max results for search_graph/search_code",

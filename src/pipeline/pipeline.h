@@ -84,6 +84,7 @@ void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store);
 #define CBM_CONFIG_SEMANTIC_THRESHOLD "semantic_threshold"
 #define CBM_CONFIG_GITHISTORY_MIN_COUPLING "githistory_min_coupling"
 #define CBM_CONFIG_LSP_CONFIDENCE_FLOOR "lsp_confidence_floor"
+#define CBM_CONFIG_INCREMENTAL_REINDEX "incremental_reindex"
 
 /* Set the Jaccard similarity threshold for SIMILAR-edge creation (pass_similarity).
  * <=0 (or unset) uses the CBM_MINHASH_JACCARD_THRESHOLD default. Before run(). */
