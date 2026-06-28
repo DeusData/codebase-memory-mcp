@@ -126,16 +126,50 @@ static char *join_root_relative(const char *root, const char *rel) {
     return out;
 }
 
-static char *derive_canonical_root(const char *worktree_root, const char *git_common_dir) {
+static char *derive_canonical_root(const char *input_path, const char *worktree_root,
+                                   const char *git_common_dir) {
     const char *src = git_common_dir && git_common_dir[0] ? git_common_dir : worktree_root;
     if (!src) {
         return git_strdup("");
     }
 
-    char *root = path_is_absolute(src) ? git_strdup(src) : join_root_relative(worktree_root, src);
+    /* git rev-parse --git-common-dir outputs a path relative to the directory
+     * passed via -C (input_path), NOT to worktree_root. Using worktree_root as
+     * the base was wrong when input_path is a subdirectory or a linked worktree
+     * sibling — e.g. "../.git" joined with worktree_root produced "workspace/.."
+     * instead of the actual repo root. */
+    char *root = path_is_absolute(src) ? git_strdup(src) : join_root_relative(input_path, src);
     if (!root) {
         return NULL;
     }
+
+    /* Resolve ".." components before stripping the "/.git" suffix.
+     * Without this, "/workspace/scripts/../.git" would strip to
+     * "/workspace/scripts/.." instead of "/workspace". The .git directory
+     * must exist for a valid git repo, so realpath() / _fullpath() succeeds. */
+#ifndef _WIN32
+    {
+        char resolved[4096];
+        if (realpath(root, resolved) != NULL) {
+            free(root);
+            root = git_strdup(resolved);
+            if (!root) {
+                return NULL;
+            }
+        }
+    }
+#else
+    {
+        char resolved[MAX_PATH];
+        if (_fullpath(resolved, root, MAX_PATH) != NULL) {
+            free(root);
+            root = git_strdup(resolved);
+            if (!root) {
+                return NULL;
+            }
+        }
+    }
+#endif
 
     size_t len = strlen(root);
     while (len > 1 && (root[len - 1] == '/' || root[len - 1] == '\\')) {
@@ -251,7 +285,7 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
 
     out->is_worktree =
         out->git_dir && out->git_common_dir && strcmp(out->git_dir, out->git_common_dir) != 0;
-    out->canonical_root = derive_canonical_root(out->worktree_root, out->git_common_dir);
+    out->canonical_root = derive_canonical_root(path, out->worktree_root, out->git_common_dir);
     out->branch_slug = slug_from_branch(out->branch, out->is_detached);
     if (git_capture(path, "merge-base HEAD @{upstream}", &out->base_sha) != 0) {
         out->base_sha = git_strdup("");

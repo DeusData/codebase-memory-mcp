@@ -328,6 +328,7 @@ TEST_DISCOVER_SRCS = \
     tests/test_language.c \
     tests/test_userconfig.c \
     tests/test_gitignore.c \
+    tests/test_git_context.c \
     tests/test_discover.c
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
