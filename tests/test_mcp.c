@@ -541,6 +541,72 @@ TEST(resolve_store_quarantines_structurally_corrupt_db) {
     PASS();
 }
 
+TEST(resolve_store_leaves_foreign_sqlite_db_untouched) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-foreign-db-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS(); /* skip if mkdtemp fails */
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    const char *saved_auto = getenv("CBM_AUTO_INDEX");
+    char *saved_auto_copy = saved_auto ? strdup(saved_auto) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_AUTO_INDEX", "false", 1);
+
+    char db_path[512];
+    int db_len = snprintf(db_path, sizeof(db_path), "%s/foreign-project.db", cache);
+    ASSERT_TRUE(db_len > 0 && (size_t)db_len < sizeof(db_path));
+    sqlite3 *foreign_db = NULL;
+    ASSERT_EQ(sqlite3_open(db_path, &foreign_db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(foreign_db, "CREATE TABLE user_data(id INTEGER PRIMARY KEY);", NULL,
+                           NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(foreign_db);
+
+    char quarantine[512];
+    char wal[512];
+    char shm[512];
+    int quarantine_len = snprintf(quarantine, sizeof(quarantine), "%s.corrupt", db_path);
+    int wal_len = snprintf(wal, sizeof(wal), "%s-wal", db_path);
+    int shm_len = snprintf(shm, sizeof(shm), "%s-shm", db_path);
+    ASSERT_TRUE(quarantine_len > 0 && (size_t)quarantine_len < sizeof(quarantine));
+    ASSERT_TRUE(wal_len > 0 && (size_t)wal_len < sizeof(wal));
+    ASSERT_TRUE(shm_len > 0 && (size_t)shm_len < sizeof(shm));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":"
+             "\"search_graph\",\"arguments\":{\"project\":\"foreign-project\","
+             "\"pattern\":\"anything\"}}}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_TRUE(test_file_exists_mcp(db_path));
+    ASSERT_FALSE(test_file_exists_mcp(quarantine));
+    ASSERT_FALSE(test_file_exists_mcp(wal));
+    ASSERT_FALSE(test_file_exists_mcp(shm));
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (saved_auto_copy) {
+        cbm_setenv("CBM_AUTO_INDEX", saved_auto_copy, 1);
+        free(saved_auto_copy);
+    } else {
+        cbm_unsetenv("CBM_AUTO_INDEX");
+    }
+    cbm_unlink(db_path);
+    cbm_rmdir(cache);
+    PASS();
+}
+
 TEST(tool_get_graph_schema_empty) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
 
@@ -2668,6 +2734,7 @@ SUITE(mcp) {
     RUN_TEST(tool_list_projects_empty);
     RUN_TEST(tool_list_projects_includes_tmp_prefixed_project);
     RUN_TEST(resolve_store_quarantines_structurally_corrupt_db);
+    RUN_TEST(resolve_store_leaves_foreign_sqlite_db_untouched);
     RUN_TEST(tool_get_graph_schema_empty);
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);

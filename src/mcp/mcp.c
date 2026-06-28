@@ -913,6 +913,7 @@ static void free_string_array(char **arr) {
 static void notify_resources_updated(cbm_mcp_server_t *srv);
 static void send_notification(cbm_mcp_server_t *srv, const char *method);
 static char *build_key_functions_sql(const char *exclude_csv, const char **exclude_arr, int limit);
+static bool validate_cbm_db_with_timeout(const char *path, int busy_timeout_ms);
 
 struct cbm_mcp_server {
     cbm_store_t *store;             /* currently open project store (or NULL) */
@@ -1372,10 +1373,15 @@ static void quarantine_corrupt_sidecar(const char *path, const char *quarantine_
     }
 }
 
-static bool quarantine_corrupt_db(const char *path) {
+static bool quarantine_corrupt_db(const char *path, int validate_busy_timeout_ms) {
     char quarantine_path[MCP_FIELD_SIZE];
     if (!mcp_join_suffix(quarantine_path, sizeof(quarantine_path), path, ".corrupt")) {
         cbm_log_error("store.quarantine_failed", "reason", "path_too_long", "path",
+                      path ? path : "");
+        return false;
+    }
+    if (!validate_cbm_db_with_timeout(path, validate_busy_timeout_ms)) {
+        cbm_log_error("store.quarantine_failed", "reason", "not_cbm_cache_schema", "path",
                       path ? path : "");
         return false;
     }
@@ -1430,6 +1436,10 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     if (!path[0]) {
         return NULL;
     }
+    int validate_busy_timeout_ms = cbm_mcp_db_validate_busy_timeout_ms(srv);
+    if (!validate_cbm_db_with_timeout(path, validate_busy_timeout_ms)) {
+        return NULL;
+    }
     srv->store = cbm_store_open_path_query(path);
     if (srv->store) {
         /* Check DB integrity before serving a cache database. A bad project
@@ -1449,7 +1459,7 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
                               "quarantining corrupt cache db to .corrupt; re-index required");
                 cbm_store_close(srv->store);
                 srv->store = NULL;
-                if (!quarantine_corrupt_db(path)) {
+                if (!quarantine_corrupt_db(path, validate_busy_timeout_ms)) {
                     cbm_log_error("store.quarantine", "project", project, "path", path, "action",
                                   "corrupt cache db retained; quarantine failed");
                 }
@@ -2038,7 +2048,7 @@ static bool validate_cbm_db_with_timeout(const char *path, int busy_timeout_ms) 
         cbm_log_warn("db.skip", "file", base,
                      "reason", "not_cbm_database",
                      "hint", "File in cache dir lacks codebase-memory-mcp schema. "
-                             "Move it aside if not needed.");
+                             "It was not opened as a project and was not modified.");
     }
     if (stmt) sqlite3_finalize(stmt);
     sqlite3_close(db);
