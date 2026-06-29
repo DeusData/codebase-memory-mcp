@@ -4240,8 +4240,14 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
     bool ok = false;
     if (fl) {
         for (int fi = 0; fi < indexed_count; fi++) {
-            /* Use NUL-separated output so xargs -0 handles paths with
-             * spaces correctly.  Binary mode prevents CRLF on Windows. */
+            /* Build "<root>/<file>".  Separator differs by platform:
+             *   - Unix: NUL-separated, consumed by `xargs -0` (handles
+             *     spaces in paths; newline would split on \n in paths).
+             *   - Windows: newline-separated, consumed by PowerShell
+             *     `Get-Content | ForEach-Object { Select-String -LiteralPath $_ }`
+             *     which reads line-by-line and accepts spaces in each path;
+             *     NUL bytes break Get-Content ("Illegal characters in path").
+             * Binary mode prevents CRLF translation on Windows. */
             size_t rlen = strlen(root_path);
             size_t flen = strlen(indexed_files[fi]);
             char buf[CBM_SZ_2K];
@@ -4251,7 +4257,11 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
             buf[total++] = '/';
             memcpy(buf + total, indexed_files[fi], flen);
             total += flen;
+#ifdef _WIN32
+            buf[total++] = '\n'; /* line-separated for PowerShell Get-Content */
+#else
             buf[total++] = '\0'; /* NUL separator for xargs -0 */
+#endif
             (void)fwrite(buf, 1, total, fl);
         }
         (void)fclose(fl);
