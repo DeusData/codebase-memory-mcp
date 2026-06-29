@@ -1182,6 +1182,81 @@ TEST(search_code_ampersand_accepted_issue272) {
     PASS();
 }
 
+/* issue #670: search_code returned zero matches on macOS arm64 when the
+ * project root path contained a space.  write_scoped_filelist wrote
+ * newline-delimited paths to the filelist; BSD xargs split each entry on
+ * whitespace, turning "Test Project/main.go" into two broken tokens that
+ * grep could not open.  Fix: null-delimited filelist + xargs -0. */
+TEST(search_code_space_in_path_issue670) {
+    /* mkdtemp template must not contain a space */
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_670_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    /* Project root contains a space — reproduces the reporter's environment */
+    char proj_dir[512];
+    snprintf(proj_dir, sizeof(proj_dir), "%s/Test Project", tmp);
+    cbm_mkdir(proj_dir);
+
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/main.go", proj_dir);
+    FILE *fp = fopen(src_path, "w");
+    if (!fp) {
+        rmdir(proj_dir);
+        rmdir(tmp);
+        FAIL("fopen failed");
+    }
+    fprintf(fp, "package main\n\nfunc HandleRequest() error {\n\treturn nil\n}\n");
+    fclose(fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        unlink(src_path);
+        rmdir(proj_dir);
+        rmdir(tmp);
+        FAIL("cbm_mcp_server_new failed");
+    }
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj_name = "test-project";
+    cbm_mcp_server_set_project(srv, proj_name);
+    cbm_store_upsert_project(st, proj_name, proj_dir);
+
+    /* Insert a node so write_scoped_filelist finds indexed_count > 0 and
+     * returns true, forcing the scoped xargs path — the path the bug affected. */
+    cbm_node_t n = {0};
+    n.project = proj_name;
+    n.label = "Function";
+    n.name = "HandleRequest";
+    n.qualified_name = "test.HandleRequest";
+    n.file_path = "main.go";
+    n.start_line = 3;
+    n.end_line = 5;
+    cbm_store_upsert_node(st, &n);
+
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":670,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\","
+             "\"project\":\"test-project\"}}}");
+
+    char *resp = cbm_mcp_server_handle(srv, req);
+    ASSERT_NOT_NULL(resp);
+    /* Before the fix xargs split "Test Project" on the space, passing broken
+     * path fragments to grep → zero stdout → zero matches → no symbol in resp. */
+    ASSERT_TRUE(strstr(resp, "HandleRequest") != NULL);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    unlink(src_path);
+    rmdir(proj_dir);
+    rmdir(tmp);
+    PASS();
+}
+
 TEST(tool_detect_changes_no_project) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -2501,6 +2576,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
     RUN_TEST(search_code_ampersand_accepted_issue272);
+    RUN_TEST(search_code_space_in_path_issue670);
     RUN_TEST(tool_detect_changes_no_project);
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
