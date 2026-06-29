@@ -438,6 +438,36 @@ static bool is_alloc_name(const char *n) {
     return name_in_set(n, set);
 }
 
+// Whether a callee expression targets the same instance/class as the enclosing
+// method, i.e. counts as genuine self-recursion rather than a same-named call on
+// a different receiver.  callee_name may be bare ("recur") or qualified
+// ("self.recur", "this.recur", "cls.recur", "super.recur", "axios.get", ...).
+//
+// Bare names have no receiver → assume self-call (preserves prior behavior and
+// the common case of a free function calling itself by bare name).
+// Qualified names: only self/this/cls/@self receivers are same-object; super()
+// is the parent class (never self), and any other receiver (axios, console,
+// this.request on a different instance, etc.) is a different target.  See #599.
+static bool is_self_receiver(const char *callee_name) {
+    if (!callee_name || !callee_name[0]) {
+        return false;
+    }
+    const char *dot = strchr(callee_name, '.');
+    if (!dot) {
+        return true; // bare name → self-recursion candidate
+    }
+    // Receiver is everything before the first '.'.
+    size_t rlen = (size_t)(dot - callee_name);
+    static const char *const self_receivers[] = {"self", "this", "cls", "@self", NULL};
+    for (int i = 0; self_receivers[i]; i++) {
+        size_t sl = strlen(self_receivers[i]);
+        if (rlen == sl && strncmp(callee_name, self_receivers[i], sl) == 0) {
+            return true;
+        }
+    }
+    return false; // super / axios / console / any other receiver
+}
+
 // Count parameters from a signature string like "(int a, Foo* b, cb (*)(int,int))".
 // Fallback for languages where param_names isn't populated (e.g. C keeps only the
 // signature text). Counts commas at the top paren level; treats "()"/"(void)" as 0.
@@ -771,12 +801,17 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
             continue;
         }
         CBMDefinition *d = &result->defs.items[best];
-        // callee_name may be bare ("recur") or qualified ("pkg.recur", "self.recur")
+        // callee_name may be bare ("recur") or qualified ("self.recur",
+        // "super.recur", "axios.get").  Only treat as self-recursion when the
+        // callee resolves to the same instance/class — bare names or
+        // self/this/cls receivers.  super().X() and other-receiver calls
+        // (axios.get, console.error) must not count even when the method name
+        // matches (#599).
         const char *dot = strrchr(c->callee_name, '.');
         const char *callee_short = dot ? dot + 1 : c->callee_name;
         bool in_loop = c->loop_depth > 0;
 
-        if (strcmp(callee_short, d->name) == 0) {
+        if (strcmp(callee_short, d->name) == 0 && is_self_receiver(c->callee_name)) {
             // Direct self-recursion. The call graph omits self-edges (pass_calls
             // skips source==target), so detect it here; seeds "recursive".
             d->is_recursive = true;
