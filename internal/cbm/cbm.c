@@ -515,6 +515,31 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
         return result;
     }
 
+    /* Guard: skip parsing large SQL files that crash the tree-sitter SQL
+     * grammar.  The SQL grammar (39 MB parser.c) uses deeply recursive
+     * non-terminals that overflow the C stack on files with many statements
+     * (e.g. schema dumps >10K lines, stored procedures).  The stack overflow
+     * kills the thread before any timeout callback can fire, so we must
+     * reject the file *before* calling ts_parser_parse_with_options().
+     * Fixes #691 — large SQL files crash native parser. */
+    if (language == CBM_LANG_SQL) {
+        enum { CBM_SQL_MAX_LINES = 5000 };
+        int lines = 0;
+        for (const char *p = source; *p; p++) {
+            if (*p == '\n') {
+                lines++;
+                if (lines >= CBM_SQL_MAX_LINES) {
+                    break;
+                }
+            }
+        }
+        if (lines >= CBM_SQL_MAX_LINES) {
+            result->has_error = true;
+            result->error_msg = cbm_arena_strdup(a, "SQL file too large for tree-sitter parsing");
+            return result;
+        }
+    }
+
     // Get tree-sitter language
     const TSLanguage *ts_lang = cbm_ts_language(language);
     if (!ts_lang) {
