@@ -3821,10 +3821,10 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
     const char *flag = use_regex ? "-E" : "-F";
     if (scoped) {
         if (file_pattern) {
-            snprintf(cmd, cmd_sz, "xargs grep -Hn %s --include='%s' -f '%s' < '%s' 2>/dev/null",
+            snprintf(cmd, cmd_sz, "xargs -0 grep -Hn %s --include='%s' -f '%s' < '%s' 2>/dev/null",
                      flag, file_pattern, tmpfile, filelist);
         } else {
-            snprintf(cmd, cmd_sz, "xargs grep -Hn %s -f '%s' < '%s' 2>/dev/null", flag, tmpfile,
+            snprintf(cmd, cmd_sz, "xargs -0 grep -Hn %s -f '%s' < '%s' 2>/dev/null", flag, tmpfile,
                      filelist);
         }
     } else {
@@ -4240,10 +4240,19 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
     bool ok = false;
     if (fl) {
         for (int fi = 0; fi < indexed_count; fi++) {
-            /* Use forward slashes so xargs doesn't interpret Windows
-             * backslashes as escape sequences (e.g. \n becomes newline).
-             * Binary mode to prevent CRLF (xargs would see trailing \r). */
-            (void)fprintf(fl, "%s/%s\n", root_path, indexed_files[fi]);
+            /* Use NUL-separated output so xargs -0 handles paths with
+             * spaces correctly.  Binary mode prevents CRLF on Windows. */
+            size_t rlen = strlen(root_path);
+            size_t flen = strlen(indexed_files[fi]);
+            char buf[CBM_SZ_2K];
+            size_t total = 0;
+            memcpy(buf + total, root_path, rlen);
+            total += rlen;
+            buf[total++] = '/';
+            memcpy(buf + total, indexed_files[fi], flen);
+            total += flen;
+            buf[total++] = '\0'; /* NUL separator for xargs -0 */
+            (void)fwrite(buf, 1, total, fl);
         }
         (void)fclose(fl);
         ok = true;
