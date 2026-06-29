@@ -245,7 +245,7 @@ static bool expand_git_path(const char *path, char *out, size_t out_sz) {
 }
 
 static bool read_core_excludes_file(const char *config_path, char *out, size_t out_sz) {
-    FILE *f = fopen(config_path, "r");
+    FILE *f = cbm_fopen(config_path, "r");
     if (!f) {
         return false;
     }

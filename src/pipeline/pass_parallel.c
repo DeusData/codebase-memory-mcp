@@ -56,6 +56,7 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "helpers.h" /* cbm_kind_in_set_free_cache — per-worker-thread cache teardown */
 #include "pipeline/worker_pool.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "graph_buffer/graph_buffer.h"
 #include "service_patterns.h"
@@ -88,7 +89,7 @@ static uint64_t extract_now_ns(void) {
 
 /* Read file into a malloc'd buffer (= mimalloc in production). */
 static char *read_file(const char *path, int *out_len) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return NULL;
     }
