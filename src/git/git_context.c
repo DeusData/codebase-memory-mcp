@@ -2,6 +2,7 @@
 
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
+#include "foundation/platform.h"
 #include "foundation/str_util.h"
 
 #include <ctype.h>
@@ -10,6 +11,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
+/* realpath() is POSIX; on Windows use _fullpath (same semantics). */
+#ifdef _WIN32
+#define realpath(path, resolved) _fullpath(resolved, path, CBM_SZ_4K)
+#endif
 
 enum {
     GIT_CMD_MAX = 1024,
@@ -151,6 +157,19 @@ static char *derive_canonical_root(const char *worktree_root, const char *git_co
     }
 #endif
 
+    /* Normalize ".." components left by relative git_common_dir paths.
+     * E.g. "/workspace/../.git" → strip "/.git" → "/workspace/.." → "/",
+     * but the correct canonical root is "/workspace".  Fixes #659/#690:
+     * detect_changes returned empty impacted_symbols because the
+     * path-prefix mismatch between git diff output and graph file paths. */
+    cbm_normalize_path_sep(root);
+    char *resolved = realpath(root, NULL);
+    if (resolved) {
+        free(root);
+        return resolved;
+    }
+    /* realpath may fail if the path doesn't exist (e.g. during testing);
+     * fall back to the un-resolved path rather than returning NULL. */
     return root;
 }
 
