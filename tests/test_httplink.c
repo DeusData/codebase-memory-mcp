@@ -10,6 +10,7 @@
  * Total: 43 Go tests → 43 C tests
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 #include "test_framework.h"
 #include <pipeline/httplink.h>
 #include <foundation/yaml.h>
@@ -752,6 +753,43 @@ TEST(httplink_read_source_lines_missing_file) {
     PASS();
 }
 
+TEST(httplink_read_source_file_limited) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/httplink-full-test-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        printf("  SKIP: cbm_mkdtemp failed\n");
+        return -1;
+    }
+
+    char fpath[512];
+    snprintf(fpath, sizeof(fpath), "%s/app.js", tmpdir);
+    FILE *f = fopen(fpath, "w");
+    if (!f) {
+        printf("  SKIP: cannot write\n");
+        cbm_rmdir(tmpdir);
+        return -1;
+    }
+    fprintf(f, "const app = 1;\n");
+    fclose(f);
+
+    size_t len = 0;
+    char *source =
+        cbm_read_source_file_disk_limited(tmpdir, "app.js", CBM_HTTPLINK_FULL_SOURCE_MAX_BYTES, &len);
+    ASSERT_NOT_NULL(source);
+    ASSERT_STR_EQ(source, "const app = 1;\n");
+    ASSERT_EQ((int)len, 15);
+    free(source);
+
+    len = 123;
+    source = cbm_read_source_file_disk_limited(tmpdir, "app.js", 4, &len);
+    ASSERT_NULL(source);
+    ASSERT_EQ((int)len, 0);
+
+    cbm_unlink(fpath);
+    cbm_rmdir(tmpdir);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Integration tests with store (port of Linker tests)
  *  These test the full pipeline: create nodes → run linker → verify edges
@@ -890,9 +928,10 @@ SUITE(httplink) {
     RUN_TEST(httplink_http_client_keywords_all_languages);
     RUN_TEST(httplink_route_extraction_negative_cases);
 
-    /* Source lines (2 tests) */
+    /* Source readers (3 tests) */
     RUN_TEST(httplink_read_source_lines);
     RUN_TEST(httplink_read_source_lines_missing_file);
+    RUN_TEST(httplink_read_source_file_limited);
 
     /* Laravel path filter (1 test) */
     RUN_TEST(httplink_laravel_path_filter);

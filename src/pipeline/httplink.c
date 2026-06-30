@@ -1437,13 +1437,44 @@ int cbm_extract_laravel_routes(const char *name, const char *qn, const char *sou
 
 /* ── Read source lines ─────────────────────────────────────────── */
 
+static char *cbm_join_source_path(const char *root_dir, const char *rel_path) {
+    if (!root_dir || !rel_path) {
+        return NULL;
+    }
+
+    size_t root_len = strlen(root_dir);
+    size_t rel_len = strlen(rel_path);
+    bool root_has_sep = root_len > 0 && (root_dir[root_len - 1] == '/' || root_dir[root_len - 1] == '\\');
+    bool rel_has_sep = rel_len > 0 && (rel_path[0] == '/' || rel_path[0] == '\\');
+    size_t sep_len = (!root_has_sep && !rel_has_sep) ? 1 : 0;
+    if (root_len > SIZE_MAX - rel_len || root_len + rel_len > SIZE_MAX - sep_len - 1) {
+        return NULL;
+    }
+
+    char *full_path = malloc(root_len + sep_len + rel_len + 1);
+    if (!full_path) {
+        return NULL;
+    }
+    memcpy(full_path, root_dir, root_len);
+    size_t pos = root_len;
+    if (sep_len) {
+        full_path[pos++] = '/';
+    }
+    memcpy(full_path + pos, rel_path, rel_len);
+    full_path[pos + rel_len] = '\0';
+    return cbm_normalize_path_sep(full_path);
+}
+
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 char *cbm_read_source_lines_disk(const char *root_dir, const char *rel_path, int start_line,
                                  int end_line) {
-    char full_path[2048];
-    snprintf(full_path, sizeof(full_path), "%s/%s", root_dir, rel_path);
+    char *full_path = cbm_join_source_path(root_dir, rel_path);
+    if (!full_path) {
+        return NULL;
+    }
 
     FILE *f = fopen(full_path, "r");
+    free(full_path);
     if (!f) {
         return NULL;
     }
@@ -1473,7 +1504,12 @@ char *cbm_read_source_lines_disk(const char *root_dir, const char *rel_path, int
         if (result_len > 0) {
             if (result_len + 1 >= result_cap) {
                 result_cap = (result_cap == 0) ? 1024 : result_cap * 2;
-                result = safe_realloc(result, (size_t)result_cap);
+                char *next = safe_realloc(result, (size_t)result_cap);
+                if (!next) {
+                    (void)fclose(f);
+                    return NULL;
+                }
+                result = next;
             }
             result[result_len++] = '\n';
         }
@@ -1481,7 +1517,12 @@ char *cbm_read_source_lines_disk(const char *root_dir, const char *rel_path, int
         /* Add line content */
         if (result_len + llen >= result_cap) {
             result_cap = result_len + llen + 256;
-            result = safe_realloc(result, (size_t)result_cap);
+            char *next = safe_realloc(result, (size_t)result_cap);
+            if (!next) {
+                (void)fclose(f);
+                return NULL;
+            }
+            result = next;
         }
         memcpy(result + result_len, line_buf, (size_t)llen);
         result_len += llen;
@@ -1493,6 +1534,48 @@ char *cbm_read_source_lines_disk(const char *root_dir, const char *rel_path, int
         result[result_len] = '\0';
     }
     return result;
+}
+
+char *cbm_read_source_file_disk_limited(const char *root_dir, const char *rel_path,
+                                        size_t max_bytes, size_t *out_len) {
+    if (out_len) {
+        *out_len = 0;
+    }
+    if (max_bytes == 0) {
+        return NULL;
+    }
+
+    char *full_path = cbm_join_source_path(root_dir, rel_path);
+    if (!full_path) {
+        return NULL;
+    }
+
+    int64_t file_size = cbm_file_size(full_path);
+    if (file_size <= 0 || (uint64_t)file_size > (uint64_t)max_bytes) {
+        free(full_path);
+        return NULL;
+    }
+
+    size_t mapped_size = 0;
+    const void *mapped = cbm_mmap_read(full_path, &mapped_size);
+    free(full_path);
+    if (!mapped || mapped_size == 0 || mapped_size > max_bytes) {
+        cbm_munmap((void *)mapped, mapped_size);
+        return NULL;
+    }
+
+    char *source = malloc(mapped_size + 1);
+    if (!source) {
+        cbm_munmap((void *)mapped, mapped_size);
+        return NULL;
+    }
+    memcpy(source, mapped, mapped_size);
+    source[mapped_size] = '\0';
+    cbm_munmap((void *)mapped, mapped_size);
+    if (out_len) {
+        *out_len = mapped_size;
+    }
+    return source;
 }
 
 /* ── Read source lines from cached buffer ──────────────────────── */

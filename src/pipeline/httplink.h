@@ -10,8 +10,11 @@
 #ifndef CBM_HTTPLINK_H
 #define CBM_HTTPLINK_H
 
+#include "foundation/constants.h"
+
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 /* ── Types ─────────────────────────────────────────────────────── */
 
@@ -41,6 +44,14 @@ typedef struct {
     char url_path[256];
     char edge_type[16]; /* "HTTP_CALLS" or "ASYNC_CALLS" */
 } cbm_http_link_t;
+
+enum {
+    /* Module-level route discovery reads full files. Keep the cap explicit and
+     * local to httplink so generated or bundled files cannot dominate this pass. */
+    CBM_HTTPLINK_FULL_SOURCE_MAX_MIB = 10,
+    CBM_HTTPLINK_FULL_SOURCE_MAX_BYTES =
+        CBM_HTTPLINK_FULL_SOURCE_MAX_MIB * CBM_SZ_1K * CBM_SZ_1K,
+};
 
 /* ── Similarity functions ──────────────────────────────────────── */
 
@@ -125,6 +136,13 @@ int cbm_extract_laravel_routes(const char *name, const char *qn, const char *sou
  * Returns malloc'd string (caller must free), or NULL on error. */
 char *cbm_read_source_lines_disk(const char *root_dir, const char *rel_path, int start_line,
                                  int end_line);
+
+/* Read a full source file from disk with an explicit byte cap.
+ * root_dir + "/" + rel_path is the full path.
+ * Returns malloc'd NUL-terminated data (caller must free), or NULL on error,
+ * empty file, over-cap file, or path construction failure. */
+char *cbm_read_source_file_disk_limited(const char *root_dir, const char *rel_path,
+                                        size_t max_bytes, size_t *out_len);
 
 /* Read specific lines from a cached source buffer (no disk I/O).
  * source is the full file content, source_len its byte length.
