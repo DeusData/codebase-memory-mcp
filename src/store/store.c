@@ -141,6 +141,10 @@ struct cbm_store {
     sqlite3_stmt *stmt_get_file_hashes;
     sqlite3_stmt *stmt_delete_file_hash;
     sqlite3_stmt *stmt_delete_file_hashes;
+
+    sqlite3_stmt *stmt_upsert_file_state;
+    sqlite3_stmt *stmt_get_file_state;
+    sqlite3_stmt *stmt_delete_file_state;
 };
 
 /* ── Public accessor ────────────────────────────────────────────── */
@@ -306,7 +310,7 @@ static int init_schema(cbm_store_t *s) {
         "  completed_at TEXT,"
         "  repo_fingerprint TEXT DEFAULT '',"
         "  config_fingerprint TEXT DEFAULT '',"
-        "  status TEXT NOT NULL DEFAULT 'complete',"
+        "  status TEXT NOT NULL DEFAULT '" CBM_STORE_INDEX_STATUS_COMPLETE "',"
         "  PRIMARY KEY (project, generation)"
         ");"
         "CREATE TABLE IF NOT EXISTS file_state ("
@@ -333,7 +337,7 @@ static int init_schema(cbm_store_t *s) {
         "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
         "  edge_id INTEGER NOT NULL REFERENCES edges(id) ON DELETE CASCADE,"
         "  rel_path TEXT NOT NULL,"
-        "  derived_kind TEXT NOT NULL DEFAULT 'direct',"
+        "  derived_kind TEXT NOT NULL DEFAULT '" CBM_STORE_DERIVED_KIND_DIRECT "',"
         "  generation INTEGER NOT NULL DEFAULT 0,"
         "  PRIMARY KEY (project, edge_id)"
         ");"
@@ -359,7 +363,7 @@ static int init_schema(cbm_store_t *s) {
         "  view_name TEXT NOT NULL,"
         "  source_generation INTEGER NOT NULL DEFAULT 0,"
         "  computed_at TEXT,"
-        "  status TEXT NOT NULL DEFAULT 'stale',"
+        "  status TEXT NOT NULL DEFAULT '" CBM_STORE_DERIVED_STATUS_STALE "',"
         "  PRIMARY KEY (project, view_name)"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_node_degree_project"
@@ -933,6 +937,10 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_get_file_hashes);
     finalize_stmt(&s->stmt_delete_file_hash);
     finalize_stmt(&s->stmt_delete_file_hashes);
+
+    finalize_stmt(&s->stmt_upsert_file_state);
+    finalize_stmt(&s->stmt_get_file_state);
+    finalize_stmt(&s->stmt_delete_file_state);
 
     /* Use sqlite3_close_v2 — auto-deallocates when last statement finalizes.
      * Prevents ASan false-positive leaks from sqlite3 internal state. */
@@ -1835,6 +1843,87 @@ int cbm_store_delete_file_hashes(cbm_store_t *s, const char *project) {
     bind_text(stmt, SKIP_ONE, project);
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         store_set_error_sqlite(s, "delete_file_hashes");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+/* ── Exact-delta metadata ───────────────────────────────────────── */
+
+int cbm_store_upsert_file_state(cbm_store_t *s, const cbm_file_state_t *state) {
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_upsert_file_state,
+                       "INSERT INTO file_state (project, rel_path, content_hash, git_oid, "
+                       "mtime_ns, size, language, pass_fingerprint, generation, indexed_at) "
+                       "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) "
+                       "ON CONFLICT(project, rel_path) DO UPDATE SET "
+                       "content_hash=?3, git_oid=?4, mtime_ns=?5, size=?6, language=?7, "
+                       "pass_fingerprint=?8, generation=?9, indexed_at=?10;");
+    if (!stmt || !state) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, ST_COL_1, state->project);
+    bind_text(stmt, ST_COL_2, state->rel_path);
+    bind_text(stmt, ST_COL_3, state->content_hash);
+    bind_text(stmt, ST_COL_4, safe_str(state->git_oid));
+    sqlite3_bind_int64(stmt, ST_COL_5, state->mtime_ns);
+    sqlite3_bind_int64(stmt, ST_COL_6, state->size);
+    bind_text(stmt, ST_COL_7, safe_str(state->language));
+    bind_text(stmt, ST_COL_8, safe_str(state->pass_fingerprint));
+    sqlite3_bind_int64(stmt, ST_COL_9, state->generation);
+    bind_text(stmt, ST_COL_10, state->indexed_at);
+
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "upsert_file_state");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_get_file_state(cbm_store_t *s, const char *project, const char *rel_path,
+                             cbm_file_state_t *out) {
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_get_file_state,
+                       "SELECT project, rel_path, content_hash, git_oid, mtime_ns, size, "
+                       "language, pass_fingerprint, generation, indexed_at "
+                       "FROM file_state WHERE project = ?1 AND rel_path = ?2;");
+    if (!stmt || !out) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        return CBM_STORE_NOT_FOUND;
+    }
+
+    out->project = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+    out->rel_path = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_1));
+    out->content_hash = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_2));
+    out->git_oid = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_3));
+    out->mtime_ns = sqlite3_column_int64(stmt, ST_COL_4);
+    out->size = sqlite3_column_int64(stmt, ST_COL_5);
+    out->language = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_6));
+    out->pass_fingerprint = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_7));
+    out->generation = sqlite3_column_int64(stmt, ST_COL_8);
+    out->indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_9));
+    return CBM_STORE_OK;
+}
+
+int cbm_store_delete_file_state(cbm_store_t *s, const char *project, const char *rel_path) {
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_delete_file_state,
+                       "DELETE FROM file_state WHERE project = ?1 AND rel_path = ?2;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "delete_file_state");
         return CBM_STORE_ERR;
     }
     return CBM_STORE_OK;
@@ -6646,6 +6735,19 @@ void cbm_store_free_file_hashes(cbm_file_hash_t *hashes, int count) {
         safe_str_free(&hashes[i].sha256);
     }
     free(hashes);
+}
+
+void cbm_store_file_state_free_fields(cbm_file_state_t *state) {
+    if (!state) {
+        return;
+    }
+    safe_str_free(&state->project);
+    safe_str_free(&state->rel_path);
+    safe_str_free(&state->content_hash);
+    safe_str_free(&state->git_oid);
+    safe_str_free(&state->language);
+    safe_str_free(&state->pass_fingerprint);
+    safe_str_free(&state->indexed_at);
 }
 
 /* ── Vector search ────────────────────────��──────────────────────── */
