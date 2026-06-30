@@ -197,31 +197,34 @@ int64_t cbm_pipeline_upsert_service_route(cbm_gbuf_t *gb, const char *path, cbm_
                                 route_props);
 }
 
-/* Extract a JSON string value by key from properties.
- * Returns pointer into buf (caller provides buffer). NULL if not found. */
-static const char *json_extract(const char *json, const char *key, char *buf, int bufsz) {
-    if (!json || !key) {
-        return NULL;
+/* Extract a simple JSON string property emitted by the pipeline. Returns false
+ * for missing, empty, overlong, or non-string-looking values; callers must not
+ * route on truncated data. */
+static bool extract_json_string_prop(const char *json, const char *key, char *buf, size_t buf_sz) {
+    if (!json || !key || !buf || buf_sz == 0) {
+        return false;
     }
-    /* Build "key":" pattern */
     char pattern[CBM_SZ_128];
-    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+    int pn = snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+    if (pn < 0 || (size_t)pn >= sizeof(pattern)) {
+        return false;
+    }
     const char *start = strstr(json, pattern);
     if (!start) {
-        return NULL;
+        return false;
     }
     start += strlen(pattern);
     const char *end = strchr(start, '"');
     if (!end || end == start) {
-        return NULL;
+        return false;
     }
-    int len = (int)(end - start);
-    if (len >= bufsz) {
-        len = bufsz - SKIP_ONE;
+    size_t len = (size_t)(end - start);
+    if (len >= buf_sz) {
+        return false;
     }
-    memcpy(buf, start, (size_t)len);
+    memcpy(buf, start, len);
     buf[len] = '\0';
-    return buf;
+    return true;
 }
 
 /* Visitor context for edge scanning */
@@ -240,30 +243,35 @@ static void route_edge_visitor(const cbm_gbuf_edge_t *edge, void *userdata) {
 
     /* Extract url_path from properties */
     char url_buf[CBM_SZ_512];
-    const char *url = json_extract(edge->properties_json, "url_path", url_buf, sizeof(url_buf));
-    if (!url || !url[0]) {
+    if (!extract_json_string_prop(edge->properties_json, "url_path", url_buf, sizeof(url_buf))) {
         return;
     }
     char callee_buf[CBM_SZ_256];
-    const char *callee =
-        json_extract(edge->properties_json, "callee", callee_buf, sizeof(callee_buf));
+    const char *callee = NULL;
+    if (extract_json_string_prop(edge->properties_json, "callee", callee_buf, sizeof(callee_buf))) {
+        callee = callee_buf;
+    }
     if (strcmp(edge->type, "HTTP_CALLS") == 0 &&
-        !cbm_service_pattern_is_http_route_literal(url, callee)) {
+        !cbm_service_pattern_is_http_route_literal(url_buf, callee)) {
         return;
     }
 
     /* Extract method or broker */
     char method_buf[CBM_SZ_16];
     char broker_buf[CBM_SZ_64];
-    const char *method =
-        json_extract(edge->properties_json, "method", method_buf, sizeof(method_buf));
-    const char *broker =
-        json_extract(edge->properties_json, "broker", broker_buf, sizeof(broker_buf));
+    const char *method = NULL;
+    const char *broker = NULL;
+    if (extract_json_string_prop(edge->properties_json, "method", method_buf, sizeof(method_buf))) {
+        method = method_buf;
+    }
+    if (extract_json_string_prop(edge->properties_json, "broker", broker_buf, sizeof(broker_buf))) {
+        broker = broker_buf;
+    }
 
     /* Create or find Route node (deduped by QN) */
     cbm_svc_kind_t svc = strcmp(edge->type, "HTTP_CALLS") == 0 ? CBM_SVC_HTTP : CBM_SVC_ASYNC;
     int64_t route_id =
-        cbm_pipeline_upsert_service_route(ctx->gb, url, svc, method, broker, NULL, NULL);
+        cbm_pipeline_upsert_service_route(ctx->gb, url_buf, svc, method, broker, NULL, NULL);
     if (route_id == 0) {
         return;
     }
@@ -463,30 +471,6 @@ static void match_infra_routes(cbm_gbuf_t *gb) {
 /* Phase 2a: Ensure all functions with route_path properties have Route+HANDLES edges.
  * During incremental indexing, only changed files get Route nodes from extraction.
  * This pass scans ALL Function/Method nodes and creates missing Route+HANDLES. */
-/* Extract a JSON string property value into buf. Returns true if found. */
-static bool extract_json_prop(const char *json, const char *key, char *buf, int bufsz) {
-    if (!json) {
-        return false;
-    }
-    char pattern[CBM_SZ_64];
-    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
-    const char *p = strstr(json, pattern);
-    if (!p) {
-        return false;
-    }
-    p += strlen(pattern);
-    const char *end = strchr(p, '"');
-    if (!end || end <= p) {
-        return false;
-    }
-    int len = (int)(end - p);
-    if (len >= bufsz) {
-        return false;
-    }
-    memcpy(buf, p, (size_t)len);
-    buf[len] = '\0';
-    return true;
-}
 
 /* Process a single Function/Method node: create Route+HANDLES if it has route_path.
  * Returns 1 if a new HANDLES edge was created, 0 otherwise. */
@@ -496,7 +480,7 @@ static int ensure_one_decorator_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *fun
     }
 
     char path[CBM_SZ_256];
-    if (!extract_json_prop(func->properties_json, "route_path", path, sizeof(path))) {
+    if (!extract_json_string_prop(func->properties_json, "route_path", path, sizeof(path))) {
         return 0;
     }
     if (path[0] != '/') {
@@ -510,7 +494,7 @@ static int ensure_one_decorator_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *fun
     }
 
     char method[CBM_SZ_16] = CBM_ROUTE_DEFAULT_METHOD;
-    extract_json_prop(func->properties_json, "route_method", method, sizeof(method));
+    extract_json_string_prop(func->properties_json, "route_method", method, sizeof(method));
 
     char route_qn[CBM_ROUTE_QN_SIZE];
     char rprops[CBM_SZ_256];
@@ -756,11 +740,15 @@ typedef struct {
 
 static bool http_call_edge_has_valid_route(const cbm_gbuf_edge_t *edge) {
     char url_buf[CBM_SZ_512];
-    const char *url = json_extract(edge->properties_json, "url_path", url_buf, sizeof(url_buf));
+    if (!extract_json_string_prop(edge->properties_json, "url_path", url_buf, sizeof(url_buf))) {
+        return false;
+    }
     char callee_buf[CBM_SZ_256];
-    const char *callee =
-        json_extract(edge->properties_json, "callee", callee_buf, sizeof(callee_buf));
-    return cbm_service_pattern_is_http_route_literal(url, callee);
+    const char *callee = NULL;
+    if (extract_json_string_prop(edge->properties_json, "callee", callee_buf, sizeof(callee_buf))) {
+        callee = callee_buf;
+    }
+    return cbm_service_pattern_is_http_route_literal(url_buf, callee);
 }
 
 /* Try to create a DATA_FLOWS edge between caller and handler via a route.
