@@ -82,6 +82,15 @@ static int store_count_derived_view_state(cbm_store_t *s, const char *project,
     return count;
 }
 
+static int store_string_array_contains(char **items, int count, const char *needle) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(items[i], needle) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 TEST(store_open_memory) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -825,6 +834,87 @@ TEST(store_import_export_metadata_crud) {
               CBM_STORE_OK);
     ASSERT_EQ(count, 0);
     store_free_string_array(items, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_file_delta_affected_paths_from_exports_and_imports) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    ASSERT_EQ(cbm_store_upsert_symbol_export(s, "test", "test.lib.Kept", "lib.go",
+                                             CBM_STORE_NO_NODE_ID, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_symbol_export(s, "test", "test.lib.Removed", "lib.go",
+                                             CBM_STORE_NO_NODE_ID, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, "test", "caller.go", "test.lib", "Kept",
+                                          "test.lib.Kept", 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, "test", "caller.go", "test.lib", "KeptAgain",
+                                          "test.lib.Kept", 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, "test", "removed_user.go", "test.lib", "Removed",
+                                          "test.lib.Removed", 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, "test", "new_user.go", "test.lib", "New",
+                                          "test.lib.New", 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, "test", "unrelated.go", "test.other", "Other",
+                                          "test.other.Other", 1),
+              CBM_STORE_OK);
+
+    const char *new_exports[] = {"test.lib.Kept", "test.lib.New"};
+    char **paths = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_list_file_delta_affected_paths(s, "test", "lib.go", new_exports, 2,
+                                                       &paths, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 4);
+    ASSERT_EQ(store_string_array_contains(paths, count, "lib.go"), 1);
+    ASSERT_EQ(store_string_array_contains(paths, count, "caller.go"), 1);
+    ASSERT_EQ(store_string_array_contains(paths, count, "removed_user.go"), 1);
+    ASSERT_EQ(store_string_array_contains(paths, count, "new_user.go"), 1);
+    ASSERT_EQ(store_string_array_contains(paths, count, "unrelated.go"), 0);
+    store_free_string_array(paths, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_file_delta_affected_paths_high_fanout_dedupes) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_symbol_export(s, "test", "test.lib.Hot", "hot.go",
+                                             CBM_STORE_NO_NODE_ID, 1),
+              CBM_STORE_OK);
+
+    for (int i = 0; i < CBM_SZ_16; i++) {
+        char rel_path[CBM_SZ_64];
+        char local_name[CBM_SZ_64];
+        snprintf(rel_path, sizeof(rel_path), "fan_%02d.go", i);
+        snprintf(local_name, sizeof(local_name), "Hot%d", i);
+        ASSERT_EQ(cbm_store_upsert_import_ref(s, "test", rel_path, "test.lib", local_name,
+                                              "test.lib.Hot", 1),
+                  CBM_STORE_OK);
+        ASSERT_EQ(cbm_store_upsert_import_ref(s, "test", rel_path, "test.lib", "HotDuplicate",
+                                              "test.lib.Hot", 1),
+                  CBM_STORE_OK);
+    }
+
+    char **paths = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_list_file_delta_affected_paths(s, "test", "hot.go", NULL, 0, &paths,
+                                                       &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, CBM_SZ_16 + 1);
+    ASSERT_EQ(store_string_array_contains(paths, count, "hot.go"), 1);
+    ASSERT_EQ(store_string_array_contains(paths, count, "fan_00.go"), 1);
+    ASSERT_EQ(store_string_array_contains(paths, count, "fan_15.go"), 1);
+    store_free_string_array(paths, count);
 
     cbm_store_close(s);
     PASS();
@@ -2164,6 +2254,8 @@ SUITE(store_nodes) {
     RUN_TEST(store_file_state_crud);
     RUN_TEST(store_owner_metadata_crud);
     RUN_TEST(store_import_export_metadata_crud);
+    RUN_TEST(store_file_delta_affected_paths_from_exports_and_imports);
+    RUN_TEST(store_file_delta_affected_paths_high_fanout_dedupes);
     RUN_TEST(store_file_delta_publish_rolls_back_on_failure);
     RUN_TEST(store_file_delta_publish_commits_graph_and_metadata);
     RUN_TEST(store_node_properties_json);

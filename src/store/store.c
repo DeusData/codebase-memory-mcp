@@ -232,6 +232,16 @@ static sqlite3_stmt *prepare_cached(cbm_store_t *s, sqlite3_stmt **slot, const c
     return *slot;
 }
 
+static void store_free_text_array(char **items, int count) {
+    if (!items) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(items[i]);
+    }
+    free(items);
+}
+
 static int store_collect_text_column(cbm_store_t *s, sqlite3_stmt *stmt, const char *op,
                                      char ***out, int *count) {
     if (!out || !count || !stmt) {
@@ -256,10 +266,7 @@ static int store_collect_text_column(cbm_store_t *s, sqlite3_stmt *stmt, const c
         arr[n++] = heap_strdup(text);
     }
     if (rc != SQLITE_DONE) {
-        for (int i = 0; i < n; i++) {
-            free(arr[i]);
-        }
-        free(arr);
+        store_free_text_array(arr, n);
         store_set_error_sqlite(s, op);
         return CBM_STORE_ERR;
     }
@@ -267,6 +274,49 @@ static int store_collect_text_column(cbm_store_t *s, sqlite3_stmt *stmt, const c
     *out = arr;
     *count = n;
     return CBM_STORE_OK;
+}
+
+static int store_text_ptr_cmp(const void *a, const void *b) {
+    const char *const *sa = (const char *const *)a;
+    const char *const *sb = (const char *const *)b;
+    return strcmp(*sa, *sb);
+}
+
+static int store_append_text(char ***items, int *count, int *cap, const char *text) {
+    if (!items || !count || !cap || !text) {
+        return CBM_STORE_ERR;
+    }
+    if (*count >= *cap) {
+        int new_cap = (*cap > 0) ? *cap * ST_GROWTH : ST_INIT_CAP_8;
+        char **tmp = realloc(*items, (size_t)new_cap * sizeof(char *));
+        if (!tmp) {
+            return CBM_STORE_ERR;
+        }
+        *items = tmp;
+        *cap = new_cap;
+    }
+    char *copy = heap_strdup(text);
+    if (!copy) {
+        return CBM_STORE_ERR;
+    }
+    (*items)[(*count)++] = copy;
+    return CBM_STORE_OK;
+}
+
+static void store_sort_unique_text_array(char **items, int *count) {
+    if (!items || !count || *count <= 1) {
+        return;
+    }
+    qsort(items, (size_t)*count, sizeof(char *), store_text_ptr_cmp);
+    int out = 1;
+    for (int i = 1; i < *count; i++) {
+        if (strcmp(items[i], items[out - 1]) == 0) {
+            free(items[i]);
+            continue;
+        }
+        items[out++] = items[i];
+    }
+    *count = out;
 }
 
 /* Get ISO-8601 timestamp. */
@@ -2215,6 +2265,89 @@ int cbm_store_list_import_ref_paths_for_export_file(cbm_store_t *s, const char *
     bind_text(stmt, ST_COL_1, project);
     bind_text(stmt, ST_COL_2, export_rel_path);
     return store_collect_text_column(s, stmt, "list_import_ref_paths_for_export_file", out, count);
+}
+
+static int store_append_importers_for_target(cbm_store_t *s, const char *project,
+                                             const char *target_qn, char ***items, int *count,
+                                             int *cap) {
+    char **importers = NULL;
+    int importer_count = 0;
+    int rc =
+        cbm_store_list_import_ref_paths_by_target(s, project, target_qn, &importers, &importer_count);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    for (int i = 0; i < importer_count; i++) {
+        rc = store_append_text(items, count, cap, importers[i]);
+        if (rc != CBM_STORE_OK) {
+            store_free_text_array(importers, importer_count);
+            return rc;
+        }
+    }
+    store_free_text_array(importers, importer_count);
+    return CBM_STORE_OK;
+}
+
+int cbm_store_list_file_delta_affected_paths(cbm_store_t *s, const char *project,
+                                             const char *rel_path,
+                                             const char **new_export_qns, int new_export_count,
+                                             char ***out, int *count) {
+    if (!out || !count) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *count = 0;
+    if (!s || !project || !rel_path || new_export_count < 0 ||
+        (new_export_count > 0 && !new_export_qns)) {
+        return CBM_STORE_ERR;
+    }
+
+    int cap = ST_INIT_CAP_8;
+    int n = 0;
+    char **items = malloc((size_t)cap * sizeof(char *));
+    if (!items) {
+        return CBM_STORE_ERR;
+    }
+
+    int rc = store_append_text(&items, &n, &cap, rel_path);
+    if (rc != CBM_STORE_OK) {
+        store_free_text_array(items, n);
+        return rc;
+    }
+
+    char **old_exports = NULL;
+    int old_export_count = 0;
+    rc = cbm_store_list_symbol_exports_by_file(s, project, rel_path, &old_exports, &old_export_count);
+    if (rc != CBM_STORE_OK) {
+        store_free_text_array(items, n);
+        return rc;
+    }
+    for (int i = 0; i < old_export_count; i++) {
+        rc = store_append_importers_for_target(s, project, old_exports[i], &items, &n, &cap);
+        if (rc != CBM_STORE_OK) {
+            store_free_text_array(old_exports, old_export_count);
+            store_free_text_array(items, n);
+            return rc;
+        }
+    }
+    store_free_text_array(old_exports, old_export_count);
+
+    for (int i = 0; i < new_export_count; i++) {
+        if (!new_export_qns[i]) {
+            store_free_text_array(items, n);
+            return CBM_STORE_ERR;
+        }
+        rc = store_append_importers_for_target(s, project, new_export_qns[i], &items, &n, &cap);
+        if (rc != CBM_STORE_OK) {
+            store_free_text_array(items, n);
+            return rc;
+        }
+    }
+
+    store_sort_unique_text_array(items, &n);
+    *out = items;
+    *count = n;
+    return CBM_STORE_OK;
 }
 
 static int store_delete_owned_edges_by_file(cbm_store_t *s, const char *project,

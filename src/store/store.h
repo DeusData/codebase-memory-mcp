@@ -522,6 +522,14 @@ int cbm_store_list_import_ref_paths_for_export_file(cbm_store_t *s, const char *
                                                    const char *export_rel_path, char ***out,
                                                    int *count);
 
+/* Returns sorted unique paths containing rel_path plus importers of old persisted exports and
+ * caller-provided new_export_qns. Caller frees each returned string and the array.
+ * new_export_qns may be NULL when new_export_count is 0. */
+int cbm_store_list_file_delta_affected_paths(cbm_store_t *s, const char *project,
+                                             const char *rel_path,
+                                             const char **new_export_qns, int new_export_count,
+                                             char ***out, int *count);
+
 int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *delta);
 
 /* ── Search ─────────────────────────────────────────────────────── */
