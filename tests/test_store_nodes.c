@@ -1862,6 +1862,50 @@ TEST(store_file_delta_publish_commits_graph_and_metadata) {
     PASS();
 }
 
+TEST(store_file_delta_delete_cleans_graph_and_metadata) {
+    enum {
+        BASE_GENERATION = 1,
+        DELETE_GENERATION = 2,
+    };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(store_publish_helper_file_delta(s, BASE_GENERATION), CBM_STORE_OK);
+    ASSERT_EQ(store_publish_new_main_delta(s, BASE_GENERATION), CBM_STORE_OK);
+    ASSERT_EQ(store_node_qn_exists(s, "test", "test.helper.Helper"), 1);
+    ASSERT_EQ(store_node_qn_exists(s, "test", "test.main.New"), 1);
+    ASSERT_EQ(cbm_store_count_edges(s, "test"), 1);
+
+    ASSERT_EQ(cbm_store_delete_file_delta(s, "test", "helper.go", DELETE_GENERATION,
+                                          CBM_STORE_DERIVED_VIEW_NODES_FTS),
+              CBM_STORE_OK);
+
+    ASSERT_EQ(store_node_qn_exists(s, "test", "test.helper.Helper"), 0);
+    ASSERT_EQ(store_node_qn_exists(s, "test", "test.main.New"), 1);
+    ASSERT_EQ(cbm_store_count_edges(s, "test"), 0);
+    ASSERT_EQ(store_count_metadata_owners(s, 0, "test", "helper.go"), 0);
+    ASSERT_EQ(store_count_metadata_owners(s, 1, "test", "helper.go"), 0);
+    ASSERT_EQ(store_count_metadata_owners(s, 0, "test", "main.go"), 1);
+    ASSERT_EQ(store_count_metadata_owners(s, 1, "test", "main.go"), 0);
+
+    cbm_file_state_t deleted_state = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, "test", "helper.go", &deleted_state),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(store_count_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_NODES_FTS,
+                                             DELETE_GENERATION, CBM_STORE_DERIVED_STATUS_STALE),
+              1);
+
+    cbm_file_hash_t *hashes = NULL;
+    int hash_count = 0;
+    ASSERT_EQ(cbm_store_get_file_hashes(s, "test", &hashes, &hash_count), CBM_STORE_OK);
+    ASSERT_EQ(hash_count, 1);
+    ASSERT_STR_EQ(hashes[0].rel_path, "main.go");
+    cbm_store_free_file_hashes(hashes, hash_count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Properties JSON round-trip ─────────────────────────────────── */
 
 TEST(store_node_properties_json) {
@@ -2987,6 +3031,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_file_delta_batch_publish_rolls_back_all_files);
     RUN_TEST(store_file_delta_batch_complete_rolls_back_when_generation_missing);
     RUN_TEST(store_file_delta_publish_commits_graph_and_metadata);
+    RUN_TEST(store_file_delta_delete_cleans_graph_and_metadata);
     RUN_TEST(store_node_properties_json);
     RUN_TEST(store_node_null_properties);
     RUN_TEST(store_find_by_file_overlap);
