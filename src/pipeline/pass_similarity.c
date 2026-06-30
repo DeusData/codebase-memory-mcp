@@ -89,7 +89,48 @@ typedef struct {
     cbm_minhash_t fp;
     const char *file_path;
     const char *ext;
+    const char *qualified_name;
 } fp_entry_t;
+
+static int cmp_str_empty_last(const char *a, const char *b) {
+    const char *sa = a ? a : "";
+    const char *sb = b ? b : "";
+    if (sa[0] == '\0' && sb[0] != '\0') {
+        return 1;
+    }
+    if (sa[0] != '\0' && sb[0] == '\0') {
+        return -1;
+    }
+    return strcmp(sa, sb);
+}
+
+static int cmp_fp_entry(const void *a, const void *b) {
+    const fp_entry_t *ea = (const fp_entry_t *)a;
+    const fp_entry_t *eb = (const fp_entry_t *)b;
+    int c = cmp_str_empty_last(ea->qualified_name, eb->qualified_name);
+    if (c != 0) {
+        return c;
+    }
+    c = cmp_str_empty_last(ea->file_path, eb->file_path);
+    if (c != 0) {
+        return c;
+    }
+    return (ea->node_id > eb->node_id) - (ea->node_id < eb->node_id);
+}
+
+static int cmp_lsh_entry_ptr(const void *a, const void *b) {
+    const cbm_lsh_entry_t *const *ea = (const cbm_lsh_entry_t *const *)a;
+    const cbm_lsh_entry_t *const *eb = (const cbm_lsh_entry_t *const *)b;
+    int c = cmp_str_empty_last((*ea)->qualified_name, (*eb)->qualified_name);
+    if (c != 0) {
+        return c;
+    }
+    c = cmp_str_empty_last((*ea)->file_path, (*eb)->file_path);
+    if (c != 0) {
+        return c;
+    }
+    return ((*ea)->node_id > (*eb)->node_id) - ((*ea)->node_id < (*eb)->node_id);
+}
 
 /* Collect all Function/Method nodes with fingerprints from graph buffer. */
 static int collect_fp_entries(cbm_gbuf_t *gbuf, fp_entry_t **out_entries) {
@@ -124,8 +165,12 @@ static int collect_fp_entries(cbm_gbuf_t *gbuf, fp_entry_t **out_entries) {
                 .fp = fp,
                 .file_path = n->file_path,
                 .ext = file_ext(n->file_path),
+                .qualified_name = n->qualified_name,
             };
         }
+    }
+    if (count > 1) {
+        qsort(entries, (size_t)count, sizeof(*entries), cmp_fp_entry);
     }
     *out_entries = entries;
     return count;
@@ -194,6 +239,9 @@ static void sim_query_worker(int worker_id, void *ctx_ptr) {
 
         const fp_entry_t *src = &sc->entries[i];
         int cand_count = cbm_lsh_query_into(sc->lsh, &src->fp, cands, SIM_CAND_CAP);
+        if (cand_count > 1) {
+            qsort(cands, (size_t)cand_count, sizeof(cands[0]), cmp_lsh_entry_ptr);
+        }
 
         int emitted = 0;
         for (int c = 0; c < cand_count; c++) {
@@ -204,7 +252,14 @@ static void sim_query_worker(int worker_id, void *ctx_ptr) {
             if (strcmp(src->ext, cand->file_ext) != 0) {
                 continue;
             }
-            if (src->node_id >= cand->node_id) {
+            int endpoint_order = cmp_str_empty_last(src->qualified_name, cand->qualified_name);
+            if (endpoint_order == 0) {
+                endpoint_order = cmp_str_empty_last(src->file_path, cand->file_path);
+            }
+            if (endpoint_order == 0) {
+                endpoint_order = (src->node_id > cand->node_id) - (src->node_id < cand->node_id);
+            }
+            if (endpoint_order >= 0) {
                 continue;
             }
 
@@ -288,6 +343,7 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
             .fingerprint = &entries[i].fp,
             .file_path = entries[i].file_path,
             .file_ext = entries[i].ext,
+            .qualified_name = entries[i].qualified_name,
         };
         cbm_lsh_insert(lsh, &lsh_entries[i]);
     }

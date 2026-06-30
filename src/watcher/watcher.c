@@ -164,7 +164,8 @@ static int git_dirty_hash(const char *root_path, char *out_hex17) {
              root_path, WATCHER_NULDEV);
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
-        strcpy(out_hex17, "0000000000000000");
+        static const char empty_dirty_hash[] = "0000000000000000";
+        memcpy(out_hex17, empty_dirty_hash, sizeof(empty_dirty_hash));
         return -1;
     }
     char buf[4096] = {0};

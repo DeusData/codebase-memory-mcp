@@ -29,6 +29,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 #include "foundation/hash_table.h"
 #include "foundation/dyn_array.h"
 #include "foundation/platform.h"
+#include "foundation/str_util.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -105,33 +106,6 @@ static const char *simple_name(const char *qn) {
 
 /* Extract everything before the last dot. Returns heap-allocated string. */
 
-/* Count common dot-separated prefix segments. */
-static int common_prefix_len(const char *a, const char *b) {
-    if (!a || !b) {
-        return 0;
-    }
-    int count = 0;
-    while (*a && *b) {
-        /* Find next segment in each */
-        const char *adot = strchr(a, '.');
-        const char *bdot = strchr(b, '.');
-        size_t alen = adot ? (size_t)(adot - a) : strlen(a);
-        size_t blen = bdot ? (size_t)(bdot - b) : strlen(b);
-        if (alen != blen || memcmp(a, b, alen) != 0) {
-            break;
-        }
-        count++;
-        a += alen + (adot ? SKIP_ONE : 0);
-        b += blen + (bdot ? SKIP_ONE : 0);
-        if (!adot || !bdot) {
-            break;
-        }
-    }
-    return count;
-}
-
-enum { REG_TEST_PENALTY = 1000 };
-
 /* Check if a qualified name looks like a test/mock path. */
 static bool is_test_qn(const char *qn) {
     if (!qn) {
@@ -150,9 +124,9 @@ static bool is_test_qn(const char *qn) {
 static int candidate_score(const char *candidate_qn, const char *module_qn) {
     int score = 0;
     if (!is_test_qn(candidate_qn)) {
-        score += REG_TEST_PENALTY;
+        score += CBM_RESOLUTION_NON_TEST_BONUS;
     }
-    score += common_prefix_len(candidate_qn, module_qn);
+    score += cbm_str_common_dot_prefix_len(candidate_qn, module_qn);
     return score;
 }
 

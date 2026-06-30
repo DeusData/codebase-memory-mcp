@@ -75,6 +75,45 @@ TEST(gbuf_upsert_updates) {
     PASS();
 }
 
+TEST(gbuf_route_upsert_file_path_is_deterministic) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    const char *route_qn = "__route__GET__/items/{}";
+    int64_t id1 = cbm_gbuf_upsert_node(gb, "Route", "/items/{item_id}", route_qn, "z/last.py", 0,
+                                       0, "{}");
+    int64_t id2 = cbm_gbuf_upsert_node(gb, "Route", "/items/{id}", route_qn, "a/first.py", 0, 0,
+                                       "{\"method\":\"GET\",\"source\":\"decorator\"}");
+    int64_t id3 = cbm_gbuf_upsert_node(gb, "Route", "", route_qn, "", 0, 0, "{}");
+    ASSERT_EQ(id1, id2);
+    ASSERT_EQ(id1, id3);
+
+    const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(gb, route_qn);
+    ASSERT_NOT_NULL(n);
+    ASSERT_STR_EQ(n->name, "/items/{id}");
+    ASSERT_STR_EQ(n->file_path, "a/first.py");
+    ASSERT_STR_EQ(n->properties_json, "{\"method\":\"GET\",\"source\":\"decorator\"}");
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(gbuf_section_upsert_file_path_is_deterministic) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    const char *section_qn = "proj.docs.deployment.Implantacao";
+
+    int64_t id1 = cbm_gbuf_upsert_node(gb, "Section", "Implantacao", section_qn,
+                                       "docs/deployment/index.md", 1, 2, "{}");
+    int64_t id2 = cbm_gbuf_upsert_node(gb, "Section", "Implantacao", section_qn,
+                                       "docs/deployment.md", 1, 2, "{}");
+    ASSERT_EQ(id1, id2);
+
+    const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(gb, section_qn);
+    ASSERT_NOT_NULL(n);
+    ASSERT_STR_EQ(n->file_path, "docs/deployment.md");
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 TEST(gbuf_find_by_id) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
     int64_t id = cbm_gbuf_upsert_node(gb, "Function", "foo", "pkg.foo", "foo.go", 1, 5, "{}");
@@ -710,6 +749,51 @@ TEST(gbuf_merge_overlapping_qns) {
     PASS();
 }
 
+TEST(gbuf_merge_route_file_path_is_deterministic) {
+    cbm_gbuf_t *dst = cbm_gbuf_new("test", "/tmp");
+    cbm_gbuf_t *src = cbm_gbuf_new("test", "/tmp");
+    const char *route_qn = "__route__GET__/items/{}";
+
+    cbm_gbuf_upsert_node(dst, "Route", "/items/{item_id}", route_qn, "z/last.py", 0, 0, "{}");
+    cbm_gbuf_upsert_node(src, "Route", "/items/{id}", route_qn, "a/first.py", 0, 0,
+                         "{\"method\":\"GET\",\"source\":\"decorator\"}");
+
+    int rc = cbm_gbuf_merge(dst, src);
+    ASSERT_EQ(rc, 0);
+
+    const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(dst, route_qn);
+    ASSERT_NOT_NULL(n);
+    ASSERT_STR_EQ(n->name, "/items/{id}");
+    ASSERT_STR_EQ(n->file_path, "a/first.py");
+    ASSERT_STR_EQ(n->properties_json, "{\"method\":\"GET\",\"source\":\"decorator\"}");
+
+    cbm_gbuf_free(dst);
+    cbm_gbuf_free(src);
+    PASS();
+}
+
+TEST(gbuf_merge_section_file_path_is_deterministic) {
+    cbm_gbuf_t *dst = cbm_gbuf_new("test", "/tmp");
+    cbm_gbuf_t *src = cbm_gbuf_new("test", "/tmp");
+    const char *section_qn = "proj.docs.deployment.Implantacao";
+
+    cbm_gbuf_upsert_node(dst, "Section", "Implantacao", section_qn, "docs/deployment/index.md",
+                         1, 2, "{}");
+    cbm_gbuf_upsert_node(src, "Section", "Implantacao", section_qn, "docs/deployment.md", 1, 2,
+                         "{}");
+
+    int rc = cbm_gbuf_merge(dst, src);
+    ASSERT_EQ(rc, 0);
+
+    const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(dst, section_qn);
+    ASSERT_NOT_NULL(n);
+    ASSERT_STR_EQ(n->file_path, "docs/deployment.md");
+
+    cbm_gbuf_free(dst);
+    cbm_gbuf_free(src);
+    PASS();
+}
+
 TEST(gbuf_merge_edge_dedup) {
     _Atomic int64_t shared = 1;
     cbm_gbuf_t *dst = cbm_gbuf_new_shared_ids("test", "/tmp", &shared);
@@ -1131,6 +1215,8 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_upsert_null_qn);
     RUN_TEST(gbuf_upsert_empty_qn);
     RUN_TEST(gbuf_upsert_same_qn_updates_all_fields);
+    RUN_TEST(gbuf_route_upsert_file_path_is_deterministic);
+    RUN_TEST(gbuf_section_upsert_file_path_is_deterministic);
     RUN_TEST(gbuf_upsert_long_qn);
     RUN_TEST(gbuf_find_by_qn_missing);
     RUN_TEST(gbuf_find_by_id_missing);
@@ -1150,6 +1236,8 @@ SUITE(graph_buffer) {
 
     /* Merge tests */
     RUN_TEST(gbuf_merge_overlapping_qns);
+    RUN_TEST(gbuf_merge_route_file_path_is_deterministic);
+    RUN_TEST(gbuf_merge_section_file_path_is_deterministic);
     RUN_TEST(gbuf_merge_edge_dedup);
     RUN_TEST(gbuf_merge_empty_src_into_populated_dst);
     RUN_TEST(gbuf_merge_populated_src_into_empty_dst);

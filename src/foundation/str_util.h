@@ -35,6 +35,9 @@ bool cbm_str_ends_with(const char *s, const char *suffix);
 /* Check if string contains substring. */
 bool cbm_str_contains(const char *s, const char *sub);
 
+/* Count equal dot-separated leading segments in two qualified names. */
+int cbm_str_common_dot_prefix_len(const char *a, const char *b);
+
 /* Convert to lowercase (arena-allocated copy). */
 char *cbm_str_tolower(CBMArena *a, const char *s);
 

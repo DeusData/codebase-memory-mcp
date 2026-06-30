@@ -75,7 +75,7 @@ static const char *itoa_log(int val) {
     return bufs[i];
 }
 
-/* Build per-file import map from cached extraction result or graph buffer edges.
+/* Build per-file import map from resolved graph-buffer IMPORTS edges.
  * Returns parallel arrays of (local_name, module_qn) pairs. Caller frees. */
 /* Parse "local_name":"value" from JSON properties string. Returns strdup'd key or NULL. */
 static char *extract_local_name_from_json(const char *props_json) {
@@ -97,39 +97,11 @@ static char *extract_local_name_from_json(const char *props_json) {
 static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
                             const CBMFileResult *result, const char ***out_keys,
                             const char ***out_vals, int *out_count) {
+    (void)result;
     *out_keys = NULL;
     *out_vals = NULL;
     *out_count = 0;
 
-    /* Fast path: build from cached extraction result (no JSON parsing) */
-    if (result && result->imports.count > 0) {
-        const char **keys = calloc((size_t)result->imports.count, sizeof(const char *));
-        const char **vals = calloc((size_t)result->imports.count, sizeof(const char *));
-        int count = 0;
-
-        for (int i = 0; i < result->imports.count; i++) {
-            const CBMImport *imp = &result->imports.items[i];
-            if (!imp->local_name || !imp->local_name[0] || !imp->module_path) {
-                continue;
-            }
-            char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
-            const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
-            free(target_qn);
-            if (!target) {
-                continue;
-            }
-            keys[count] = strdup(imp->local_name);
-            vals[count] = target->qualified_name; /* borrowed from gbuf */
-            count++;
-        }
-
-        *out_keys = keys;
-        *out_vals = vals;
-        *out_count = count;
-        return 0;
-    }
-
-    /* Slow path: scan graph buffer IMPORTS edges + parse JSON properties */
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
     free(file_qn);

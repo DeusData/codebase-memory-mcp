@@ -127,6 +127,7 @@ typedef struct {
     int64_t node_id;
     const char *file_path;
     const char *file_ext;
+    const char *qualified_name;
 
     /* Sparse TF-IDF: stored as parallel arrays of (token_index, weight). */
     int *tfidf_indices;
@@ -165,11 +166,22 @@ void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int c
 void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
                                    const int *token_counts, int doc_count, int max_tokens_per_doc);
 
+/* Batch-build with an explicit worker count. worker_count <= 0 uses the default. */
+void cbm_sem_corpus_add_docs_batch_with_workers(cbm_sem_corpus_t *corpus, char **all_tokens,
+                                                const int *token_counts, int doc_count,
+                                                int max_tokens_per_doc, int worker_count);
+
 /* Finalize: compute IDF, build enriched token vectors via co-occurrence. */
 void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus);
 
+/* Finalize with an explicit worker count. worker_count <= 0 uses the default. */
+void cbm_sem_corpus_finalize_with_workers(cbm_sem_corpus_t *corpus, int worker_count);
+
 /* Get IDF weight for a token. Returns 0.0 for unknown tokens. */
 float cbm_sem_corpus_idf(const cbm_sem_corpus_t *corpus, const char *token);
+
+/* Get the stable corpus-local token id. Returns CBM_NOT_FOUND for unknown tokens. */
+int cbm_sem_corpus_token_id(const cbm_sem_corpus_t *corpus, const char *token);
 
 /* Get the enriched Random Indexing vector for a token (after co-occurrence). */
 const cbm_sem_vec_t *cbm_sem_corpus_ri_vec(const cbm_sem_corpus_t *corpus, const char *token);

@@ -961,10 +961,28 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         const char *rel = files[i].rel_path;
 
-        /* Register callable symbols + DEFINES/DEFINES_METHOD edges */
+        /* Register callable symbols + DEFINES/DEFINES_METHOD edges. Do this
+         * for every file before resolving imports; otherwise imports in an
+         * early file can miss a later definition and fall back to a duplicate
+         * short-name match. The sequential definitions pass uses the same
+         * two-phase shape. */
         for (int d = 0; d < result->defs.count; d++) {
             defines_edges += register_and_link_def(ctx, &result->defs.items[d], rel, &reg_entries);
         }
+    }
+
+    for (int i = 0; i < file_count; i++) {
+        if (cbm_pipeline_check_cancel(ctx)) {
+            cbm_pipeline_namespace_map_free(namespace_map);
+            return CBM_NOT_FOUND;
+        }
+
+        CBMFileResult *result = result_cache[i];
+        if (!result) {
+            continue;
+        }
+
+        const char *rel = files[i].rel_path;
 
         imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
         create_channel_edges(ctx, result, rel);

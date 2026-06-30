@@ -578,6 +578,69 @@ void cbm_gbuf_set_next_id(cbm_gbuf_t *gb, int64_t next_id) {
 
 /* ── Node operations ─────────────────────────────────────────────── */
 
+static bool uses_deterministic_source_hint(const char *label) {
+    return label && (strcmp(label, "Route") == 0 || strcmp(label, "Section") == 0);
+}
+
+static const char *select_upsert_file_path(const cbm_gbuf_node_t *existing, const char *label,
+                                           const char *file_path) {
+    const char *next = file_path ? file_path : "";
+    if (!existing || !uses_deterministic_source_hint(label)) {
+        return next;
+    }
+    const char *cur = existing->file_path ? existing->file_path : "";
+    if (cur[0] == '\0') {
+        return next;
+    }
+    if (next[0] == '\0') {
+        return cur;
+    }
+    return strcmp(next, cur) < 0 ? next : cur;
+}
+
+static const char *select_upsert_name(const cbm_gbuf_node_t *existing, const char *label,
+                                      const char *name) {
+    const char *next = name ? name : "";
+    if (!existing || !label || strcmp(label, "Route") != 0) {
+        return next;
+    }
+    const char *cur = existing->name ? existing->name : "";
+    if (cur[0] == '\0') {
+        return next;
+    }
+    if (next[0] == '\0') {
+        return cur;
+    }
+    return strcmp(next, cur) < 0 ? next : cur;
+}
+
+static bool json_props_empty(const char *props) {
+    return !props || props[0] == '\0' || strcmp(props, "{}") == 0;
+}
+
+static const char *select_upsert_properties_json(const cbm_gbuf_node_t *existing, const char *label,
+                                                 const char *properties_json) {
+    if (!existing || !label || strcmp(label, "Route") != 0) {
+        return properties_json;
+    }
+    const char *cur = existing->properties_json;
+    const char *next = properties_json;
+    bool cur_empty = json_props_empty(cur);
+    bool next_empty = json_props_empty(next);
+    if (next_empty) {
+        return cur_empty ? next : cur;
+    }
+    if (cur_empty) {
+        return next;
+    }
+    size_t cur_len = strlen(cur);
+    size_t next_len = strlen(next);
+    if (cur_len != next_len) {
+        return next_len > cur_len ? next : cur;
+    }
+    return strcmp(next, cur) < 0 ? next : cur;
+}
+
 int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name,
                              const char *qualified_name, const char *file_path, int start_line,
                              int end_line, const char *properties_json) {
@@ -588,16 +651,23 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
     /* Check if node already exists */
     cbm_gbuf_node_t *existing = cbm_ht_get(gb->node_by_qn, qualified_name);
     if (existing) {
+        const char *selected_name = select_upsert_name(existing, label, name);
+        const char *selected_file_path = select_upsert_file_path(existing, label, file_path);
+        const char *selected_props =
+            select_upsert_properties_json(existing, label, properties_json);
         /* Update in-place. name/properties are strdup'd BEFORE freeing old ones
          * (callers may pass existing->name as an argument). label/file_path are
          * interned: gb_intern returns a stable pool pointer (idempotent even when
-         * label == existing->label), so the old value is replaced, never freed. */
-        char *new_name = heap_strdup(name);
-        char *new_props = properties_json ? heap_strdup(properties_json) : NULL;
+         * label == existing->label), so the old value is replaced, never freed.
+         * Route and Section nodes can intentionally collapse multiple concrete
+         * source paths into one QN, so pick display/source hints/properties
+         * deterministically where those fields are only representative hints. */
+        char *new_name = heap_strdup(selected_name);
+        char *new_props = selected_props ? heap_strdup(selected_props) : NULL;
         existing->label = (char *)gb_intern(gb, label);
         free(existing->name);
         existing->name = new_name;
-        existing->file_path = (char *)gb_intern(gb, file_path);
+        existing->file_path = (char *)gb_intern(gb, selected_file_path);
         existing->start_line = start_line;
         existing->end_line = end_line;
         if (new_props) {
@@ -1121,19 +1191,28 @@ static void free_remap_entry(const char *key, void *val, void *ud) {
     free(val);
 }
 
-/* Handle QN collision: update dst node fields (src wins), record remap if IDs differ.
- * label/file_path are re-interned into dst's pool (sn's pointers belong to src). */
+/* Handle QN collision: update dst node fields, record remap if IDs differ.
+ * Representative source hints are chosen deterministically for labels that can
+ * collapse multiple paths into one QN; worker merge order is intentionally not
+ * part of the graph contract. label/file_path are re-interned into dst's pool
+ * (sn's pointers belong to src). */
 static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
                                   const cbm_gbuf_node_t *sn, CBMHashTable **remap) {
+    const char *selected_name = select_upsert_name(existing, sn->label, sn->name);
+    const char *selected_file_path = select_upsert_file_path(existing, sn->label, sn->file_path);
+    const char *selected_props =
+        select_upsert_properties_json(existing, sn->label, sn->properties_json);
+    char *new_name = heap_strdup(selected_name);
+    char *new_props = selected_props ? heap_strdup(selected_props) : NULL;
     existing->label = (char *)gb_intern(dst, sn->label);
     free(existing->name);
-    existing->name = heap_strdup(sn->name);
-    existing->file_path = (char *)gb_intern(dst, sn->file_path);
+    existing->name = new_name;
+    existing->file_path = (char *)gb_intern(dst, selected_file_path);
     existing->start_line = sn->start_line;
     existing->end_line = sn->end_line;
-    if (sn->properties_json) {
+    if (new_props) {
         free(existing->properties_json);
-        existing->properties_json = heap_strdup(sn->properties_json);
+        existing->properties_json = new_props;
     }
 
     if (sn->id != existing->id) {

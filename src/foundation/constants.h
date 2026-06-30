@@ -76,6 +76,11 @@ enum {
  * 'total' and 'has_more' so agents can detect truncation. */
 enum { CBM_DEFAULT_SEARCH_LIMIT = 200 };
 
+/* Resolution scoring: prefer production symbols over test/mock definitions
+ * before namespace-distance tie-breaks. Shared by call and import resolvers so
+ * duplicate-name behavior stays consistent. */
+enum { CBM_RESOLUTION_NON_TEST_BONUS = 1000 };
+
 /* ── Time conversion factors ─────────────────────────────────── */
 #define CBM_NSEC_PER_SEC 1000000000ULL
 #define CBM_USEC_PER_SEC 1000000ULL

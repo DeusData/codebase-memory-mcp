@@ -1867,15 +1867,17 @@ static bool project_is_path(const char *s) {
 static char *expand_tilde(const char *s) {
     if (s[0] != '~') return NULL;
     if (s[1] != '\0' && s[1] != '/') return NULL; /* "~user/..." — leave as-is */
-    const char *home = getenv("HOME");
+    char home_buf[CBM_SZ_1K];
+    const char *home = cbm_safe_getenv("HOME", home_buf, sizeof(home_buf), NULL);
     if (!home || !home[0]) return NULL;
     /* Build: home + rest  ("~" → home, "~/rest" → home + "/rest") */
     size_t hlen = strlen(home);
     const char *rest = s + 1; /* "" or "/rest" */
-    char *result = malloc(hlen + strlen(rest) + 1);
+    size_t rest_len = strlen(rest);
+    char *result = malloc(hlen + rest_len + 1);
     if (!result) return NULL;
     memcpy(result, home, hlen);
-    strcpy(result + hlen, rest); /* copies rest incl. NUL */
+    memcpy(result + hlen, rest, rest_len + 1);
     return result;
 }
 

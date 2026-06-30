@@ -104,6 +104,10 @@ enum { MAP_READY = 1 };
 /* Numeric conversion radix for strtol (base 10 decimal). */
 enum { BASE_DECIMAL = 10 };
 
+static int sem_worker_count_or_default(int worker_count) {
+    return worker_count > 0 ? worker_count : cbm_default_worker_count(false);
+}
+
 /* ── Configuration ───────────────────────────────────────────────── */
 
 cbm_sem_config_t cbm_sem_get_config(void) {
@@ -514,7 +518,12 @@ struct cbm_sem_corpus {
     int doc_cap;
 };
 
+static void free_ht_kv(const char *key, void *value, void *userdata);
+
 static int corpus_get_or_add(cbm_sem_corpus_t *c, const char *token) {
+    if (!c || !token) {
+        return CBM_NOT_FOUND;
+    }
     char idx_buf[CBM_SZ_16];
     const char *existing = cbm_ht_get(c->token_map, token);
     if (existing) {
@@ -538,6 +547,60 @@ static int corpus_get_or_add(cbm_sem_corpus_t *c, const char *token) {
     snprintf(idx_buf, sizeof(idx_buf), "%d", idx);
     cbm_ht_set(c->token_map, strdup(token), strdup(idx_buf));
     return idx;
+}
+
+static int cmp_corpus_entry_token(const void *a, const void *b) {
+    const corpus_entry_t *ea = (const corpus_entry_t *)a;
+    const corpus_entry_t *eb = (const corpus_entry_t *)b;
+    const char *ta = ea->token ? ea->token : "";
+    const char *tb = eb->token ? eb->token : "";
+    return strcmp(ta, tb);
+}
+
+static bool corpus_rebuild_token_map_sorted(cbm_sem_corpus_t *corpus) {
+    if (!corpus || corpus->entry_count <= 1) {
+        return true;
+    }
+    corpus_entry_t *sorted = malloc((size_t)corpus->entry_count * sizeof(*sorted));
+    if (!sorted) {
+        return false;
+    }
+    memcpy(sorted, corpus->entries, (size_t)corpus->entry_count * sizeof(*sorted));
+    qsort(sorted, (size_t)corpus->entry_count, sizeof(*sorted), cmp_corpus_entry_token);
+
+    CBMHashTable *new_map = cbm_ht_create((uint32_t)corpus->entry_count);
+    if (!new_map) {
+        free(sorted);
+        return false;
+    }
+    for (int i = 0; i < corpus->entry_count; i++) {
+        char idx_buf[CBM_SZ_16];
+        int n = snprintf(idx_buf, sizeof(idx_buf), "%d", i);
+        if (n <= 0 || (size_t)n >= sizeof(idx_buf) || !sorted[i].token) {
+            cbm_ht_foreach(new_map, free_ht_kv, NULL);
+            cbm_ht_free(new_map);
+            free(sorted);
+            return false;
+        }
+        char *key = strdup(sorted[i].token);
+        char *value = strdup(idx_buf);
+        if (!key || !value) {
+            free(key);
+            free(value);
+            cbm_ht_foreach(new_map, free_ht_kv, NULL);
+            cbm_ht_free(new_map);
+            free(sorted);
+            return false;
+        }
+        (void)cbm_ht_set(new_map, key, value);
+    }
+
+    cbm_ht_foreach(corpus->token_map, free_ht_kv, NULL);
+    cbm_ht_free(corpus->token_map);
+    free(corpus->entries);
+    corpus->entries = sorted;
+    corpus->token_map = new_map;
+    return true;
 }
 
 cbm_sem_corpus_t *cbm_sem_corpus_new(void) {
@@ -599,11 +662,11 @@ void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int c
 
 /* ── Parallel corpus batch build ──────────────────────────────────── */
 /* Strategy:
- *   Phase A (SEQUENTIAL): Scan all documents once to build the global
- *     token_map (inserts unique tokens, assigns global IDs). This is
- *     inherently sequential (hash table mutation), but much faster than
- *     the current per-doc add_doc because we avoid the per-doc malloc of
- *     the `seen` array and per-doc bookkeeping.
+ *   Phase A (SEQUENTIAL): Scan all documents once to discover the vocabulary,
+ *     then sort tokens and rebuild token_map so global IDs are stable across
+ *     full and incremental runs. Hash table mutation is sequential, but still
+ *     faster than per-doc add_doc because it avoids per-doc `seen` allocation
+ *     and bookkeeping.
  *   Phase B (PARALLEL): Each worker processes a chunk of docs, translates
  *     tokens → global IDs via read-only token_map lookups, fills
  *     doc_token_ids[d], and accumulates doc_freq contributions via atomics.
@@ -704,12 +767,19 @@ static void batch_resolve_worker(int worker_id, void *ctx_ptr) {
 
 void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
                                    const int *token_counts, int doc_count, int max_tokens_per_doc) {
+    cbm_sem_corpus_add_docs_batch_with_workers(corpus, all_tokens, token_counts, doc_count,
+                                               max_tokens_per_doc, 0);
+}
+
+void cbm_sem_corpus_add_docs_batch_with_workers(cbm_sem_corpus_t *corpus, char **all_tokens,
+                                                const int *token_counts, int doc_count,
+                                                int max_tokens_per_doc, int worker_count) {
     if (!corpus || !all_tokens || !token_counts || doc_count <= 0) {
         return;
     }
 
-    /* Phase A (SEQUENTIAL): Build token_map and allocate doc arrays.
-     * Hash table mutation can't be parallelized; strdup+insert is the cost. */
+    /* Phase A (SEQUENTIAL): discover tokens, allocate doc arrays, then
+     * canonicalize token IDs before Phase B writes doc_token_ids. */
     if (corpus->doc_cap < corpus->doc_count + doc_count) {
         int new_cap = corpus->doc_count + doc_count;
         int **grown_ids = realloc(corpus->doc_token_ids, (size_t)new_cap * sizeof(int *));
@@ -730,11 +800,12 @@ void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
         int count = token_counts[d];
         char **tokens = &all_tokens[(ptrdiff_t)d * max_tokens_per_doc];
         for (int i = 0; i < count; i++) {
-            /* Inserts token into token_map if new; we discard return here —
-             * Phase B will re-lookup in read-only mode to get the ID. */
+            /* Discovers unique tokens. Phase B re-lookups use canonical IDs
+             * after corpus_rebuild_token_map_sorted(). */
             (void)corpus_get_or_add(corpus, tokens[i]);
         }
     }
+    (void)corpus_rebuild_token_map_sorted(corpus);
 
     /* Phase B (PARALLEL): Resolve tokens → IDs and count doc_freq per entry.
      * token_map is now read-only; each worker owns its doc range (no writes
@@ -752,7 +823,7 @@ void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
         return;
     }
 
-    int worker_count = cbm_default_worker_count(false);
+    int resolved_worker_count = sem_worker_count_or_default(worker_count);
     batch_resolve_ctx_t bc = {
         .corpus = corpus,
         .all_tokens = all_tokens,
@@ -765,8 +836,8 @@ void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
     /* Temporarily re-base doc arrays so workers write to base_doc..base_doc+doc_count */
     corpus->doc_token_ids += base_doc;
     corpus->doc_token_counts += base_doc;
-    cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
-    cbm_parallel_for(worker_count, batch_resolve_worker, &bc, opts);
+    cbm_parallel_for_opts_t opts = {.max_workers = resolved_worker_count, .force_pthreads = false};
+    cbm_parallel_for(resolved_worker_count, batch_resolve_worker, &bc, opts);
     corpus->doc_token_ids -= base_doc;
     corpus->doc_token_counts -= base_doc;
 
@@ -1376,6 +1447,10 @@ static void finalize_pass2(finalize_params_t *p) {
 }
 
 void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus) {
+    cbm_sem_corpus_finalize_with_workers(corpus, 0);
+}
+
+void cbm_sem_corpus_finalize_with_workers(cbm_sem_corpus_t *corpus, int worker_count) {
     if (!corpus || corpus->finalized) {
         return;
     }
@@ -1383,11 +1458,11 @@ void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus) {
     /* Eager init before parallel dispatch to avoid lazy-init races */
     ensure_pretrained_map();
 
-    int worker_count = cbm_default_worker_count(false);
-    cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
+    int resolved_worker_count = sem_worker_count_or_default(worker_count);
+    cbm_parallel_for_opts_t opts = {.max_workers = resolved_worker_count, .force_pthreads = false};
 
     /* Finer chunks = better load balancing for skewed token distributions. */
-    int num_chunks = worker_count * CBM_SEM_COOCCUR_CHUNK;
+    int num_chunks = resolved_worker_count * CBM_SEM_COOCCUR_CHUNK;
     if (num_chunks > corpus->entry_count) {
         num_chunks = corpus->entry_count;
     }
@@ -1413,7 +1488,7 @@ void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus) {
         .corpus = corpus,
         .rev = rev,
         .src_entries = src_entries,
-        .worker_count = worker_count,
+        .worker_count = resolved_worker_count,
         .num_chunks = num_chunks,
         .chunk_size = chunk_size,
         .tile_size = CBM_SEM_TILE_SIZE,
@@ -1452,6 +1527,14 @@ float cbm_sem_corpus_idf(const cbm_sem_corpus_t *corpus, const char *token) {
         return 0.0F;
     }
     return logf((float)corpus->doc_count / (float)df);
+}
+
+int cbm_sem_corpus_token_id(const cbm_sem_corpus_t *corpus, const char *token) {
+    if (!corpus || !token) {
+        return CBM_NOT_FOUND;
+    }
+    int idx = parse_token_index(cbm_ht_get(corpus->token_map, token));
+    return (idx >= 0 && idx < corpus->entry_count) ? idx : CBM_NOT_FOUND;
 }
 
 const cbm_sem_vec_t *cbm_sem_corpus_ri_vec(const cbm_sem_corpus_t *corpus, const char *token) {

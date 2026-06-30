@@ -636,7 +636,8 @@ TEST(pass_similarity_same_file_tagged) {
 
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
     int64_t id_a = cbm_gbuf_upsert_node(gb, "Function", "foo", "test.a.foo", "same.go", 1, 10, props);
-    cbm_gbuf_upsert_node(gb, "Function", "bar", "test.a.bar", "same.go", 11, 20, props);
+    int64_t id_b =
+        cbm_gbuf_upsert_node(gb, "Function", "bar", "test.a.bar", "same.go", 11, 20, props);
 
     atomic_int cancelled = 0;
     cbm_pipeline_ctx_t ctx = {
@@ -649,12 +650,22 @@ TEST(pass_similarity_same_file_tagged) {
 
     cbm_pipeline_pass_similarity(&ctx);
 
+    ASSERT_EQ(count_similar_to_edges(gb), 1);
+    /* Edge should have same_file property */
     const cbm_gbuf_edge_t **edges = NULL;
     int edge_count = 0;
+    const char *edge_props = NULL;
     cbm_gbuf_find_edges_by_source_type(gb, id_a, "SIMILAR_TO", &edges, &edge_count);
-    ASSERT_EQ(edge_count, 1);
-    /* Edge should have same_file property */
-    ASSERT_NOT_NULL(strstr(edges[0]->properties_json, "\"same_file\":true"));
+    if (edge_count == 1) {
+        edge_props = edges[0]->properties_json;
+    } else {
+        cbm_gbuf_find_edges_by_source_type(gb, id_b, "SIMILAR_TO", &edges, &edge_count);
+        if (edge_count == 1) {
+            edge_props = edges[0]->properties_json;
+        }
+    }
+    ASSERT_NOT_NULL(edge_props);
+    ASSERT_NOT_NULL(strstr(edge_props, "\"same_file\":true"));
 
     cbm_gbuf_free(gb);
     PASS();
