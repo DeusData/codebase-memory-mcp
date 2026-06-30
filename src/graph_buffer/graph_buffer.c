@@ -12,6 +12,7 @@
 
 enum {
     GB_ERR = -1,
+    GB_INVALID_ID = 0,
     GB_COL_2 = 2,
     GB_COL_3 = 3,
     GB_COL_4 = 4,
@@ -37,6 +38,7 @@ enum {
 #include <sqlite3.h>
 
 #include <stdatomic.h>
+#include <stdarg.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -354,6 +356,122 @@ static void rebuild_edge_secondary_indexes(cbm_gbuf_t *gb) {
     for (int i = 0; i < gb->edges.count; i++) {
         register_edge_in_indexes(gb, gb->edges.items[i]);
     }
+}
+
+static int gbuf_invariant_error(char *err, size_t err_sz, const char *fmt, ...) {
+    if (err && err_sz > 0) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(err, err_sz, fmt, ap);
+        va_end(ap);
+    }
+    return GB_ERR;
+}
+
+static bool gbuf_node_is_live(const cbm_gbuf_t *gb, const cbm_gbuf_node_t *node) {
+    if (!gb || !gb->node_by_qn || !node || !node->qualified_name) {
+        return false;
+    }
+    return cbm_ht_get(gb->node_by_qn, node->qualified_name) == node;
+}
+
+static bool edge_index_has_id(const edge_ptr_array_t *arr, int64_t edge_id) {
+    if (!arr) {
+        return false;
+    }
+    for (int i = 0; i < arr->count; i++) {
+        if (arr->items[i] && arr->items[i]->id == edge_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int cbm_gbuf_validate_invariants(const cbm_gbuf_t *gb, char *err, size_t err_sz) {
+    if (err && err_sz > 0) {
+        err[0] = '\0';
+    }
+    if (!gb) {
+        return gbuf_invariant_error(err, err_sz, "graph buffer is NULL");
+    }
+    if (!gb->project || !gb->root_path) {
+        return gbuf_invariant_error(err, err_sz, "missing project or root_path");
+    }
+    if (!gb->node_by_qn || !gb->node_by_id || !gb->edge_by_key || !gb->edges_by_source_type ||
+        !gb->edges_by_target_type || !gb->edges_by_type) {
+        return gbuf_invariant_error(err, err_sz, "lookup indexes are unavailable");
+    }
+    if (gb->next_id <= GB_INVALID_ID) {
+        return gbuf_invariant_error(err, err_sz, "invalid next_id=%lld",
+                                    (long long)gb->next_id);
+    }
+
+    for (int i = 0; i < gb->nodes.count; i++) {
+        const cbm_gbuf_node_t *node = gb->nodes.items[i];
+        if (!node) {
+            return gbuf_invariant_error(err, err_sz, "node[%d] is NULL", i);
+        }
+        if (!gbuf_node_is_live(gb, node)) {
+            continue;
+        }
+        if (node->id <= GB_INVALID_ID || node->id >= gb->next_id) {
+            return gbuf_invariant_error(err, err_sz, "node id out of range id=%lld next_id=%lld",
+                                        (long long)node->id, (long long)gb->next_id);
+        }
+        char id_buf[CBM_SZ_32];
+        make_id_key(id_buf, sizeof(id_buf), node->id);
+        if (cbm_ht_get(gb->node_by_id, id_buf) != node) {
+            return gbuf_invariant_error(err, err_sz, "node_by_id mismatch id=%lld qn=%s",
+                                        (long long)node->id,
+                                        node->qualified_name ? node->qualified_name : "");
+        }
+    }
+
+    for (int i = 0; i < gb->edges.count; i++) {
+        const cbm_gbuf_edge_t *edge = gb->edges.items[i];
+        if (!edge) {
+            return gbuf_invariant_error(err, err_sz, "edge[%d] is NULL", i);
+        }
+        if (edge->id <= GB_INVALID_ID || edge->source_id <= GB_INVALID_ID ||
+            edge->target_id <= GB_INVALID_ID || !edge->type || edge->type[0] == '\0') {
+            return gbuf_invariant_error(err, err_sz,
+                                        "invalid edge fields edge_id=%lld src=%lld tgt=%lld",
+                                        (long long)edge->id, (long long)edge->source_id,
+                                        (long long)edge->target_id);
+        }
+        const cbm_gbuf_node_t *source = cbm_gbuf_find_by_id(gb, edge->source_id);
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gb, edge->target_id);
+        if (!gbuf_node_is_live(gb, source) || !gbuf_node_is_live(gb, target)) {
+            return gbuf_invariant_error(err, err_sz,
+                                        "edge endpoint missing edge_id=%lld src=%lld tgt=%lld",
+                                        (long long)edge->id, (long long)edge->source_id,
+                                        (long long)edge->target_id);
+        }
+
+        char key[EDGE_KEY_BUF];
+        make_edge_key(key, sizeof(key), edge->source_id, edge->target_id, edge->type);
+        if (cbm_ht_get(gb->edge_by_key, key) != edge) {
+            return gbuf_invariant_error(err, err_sz, "edge_by_key mismatch edge_id=%lld",
+                                        (long long)edge->id);
+        }
+        make_src_type_key(key, sizeof(key), edge->source_id, edge->type);
+        if (!edge_index_has_id(cbm_ht_get(gb->edges_by_source_type, key), edge->id)) {
+            return gbuf_invariant_error(err, err_sz,
+                                        "edges_by_source_type missing edge_id=%lld",
+                                        (long long)edge->id);
+        }
+        make_src_type_key(key, sizeof(key), edge->target_id, edge->type);
+        if (!edge_index_has_id(cbm_ht_get(gb->edges_by_target_type, key), edge->id)) {
+            return gbuf_invariant_error(err, err_sz,
+                                        "edges_by_target_type missing edge_id=%lld",
+                                        (long long)edge->id);
+        }
+        if (!edge_index_has_id(cbm_ht_get(gb->edges_by_type, edge->type), edge->id)) {
+            return gbuf_invariant_error(err, err_sz, "edges_by_type missing edge_id=%lld",
+                                        (long long)edge->id);
+        }
+    }
+    return 0;
 }
 
 /* Release all lookup hash tables (used by dump after building arrays). */
@@ -1528,7 +1646,7 @@ static int count_live_nodes(cbm_gbuf_t *gb) {
     int count = 0;
     for (int i = 0; i < gb->nodes.count; i++) {
         cbm_gbuf_node_t *n = gb->nodes.items[i];
-        if (n->qualified_name && cbm_ht_get(gb->node_by_qn, n->qualified_name)) {
+        if (gbuf_node_is_live(gb, n)) {
             count++;
         }
     }
@@ -1559,6 +1677,11 @@ static void release_and_remap_vectors(cbm_gbuf_t *gb, const int64_t *temp_to_fin
 int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     if (!gb || !path) {
         return CBM_NOT_FOUND;
+    }
+    char invariant_err[CBM_SZ_512];
+    if (cbm_gbuf_validate_invariants(gb, invariant_err, sizeof(invariant_err)) != 0) {
+        cbm_log_error("gbuf.dump.invalid_graph", "error", invariant_err);
+        return GB_ERR;
     }
     char tmp_path[CBM_SZ_1K];
     int tmp_len = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.XXXXXX", path);

@@ -10,6 +10,7 @@
 #define CBM_GRAPH_BUFFER_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdatomic.h>
 
@@ -122,6 +123,10 @@ void cbm_gbuf_foreach_node(const cbm_gbuf_t *gb, cbm_gbuf_node_visitor_fn fn, vo
 /* Iterate all edges. */
 typedef void (*cbm_gbuf_edge_visitor_fn)(const cbm_gbuf_edge_t *edge, void *userdata);
 void cbm_gbuf_foreach_edge(const cbm_gbuf_t *gb, cbm_gbuf_edge_visitor_fn fn, void *userdata);
+
+/* Validate structural invariants before handing dump rows to the SQLite writer.
+ * On failure, writes a concise diagnostic into err when provided. */
+int cbm_gbuf_validate_invariants(const cbm_gbuf_t *gb, char *err, size_t err_sz);
 
 /* ── Edge operations ─────────────────────────────────────────────── */
 

@@ -374,6 +374,82 @@ TEST(sw_empty) {
     PASS();
 }
 
+TEST(sw_vectors_and_token_vectors) {
+    char path[256];
+    ASSERT_EQ(make_temp_db(path, sizeof(path)), 0);
+
+    CBMDumpNode nodes[2] = {
+        {.id = 1,
+         .project = "test",
+         .label = "Function",
+         .name = "source",
+         .qualified_name = "test.source",
+         .file_path = "main.py",
+         .start_line = 1,
+         .end_line = 3,
+         .properties = "{}"},
+        {.id = 2,
+         .project = "test",
+         .label = "Function",
+         .name = "target",
+         .qualified_name = "test.target",
+         .file_path = "main.py",
+         .start_line = 5,
+         .end_line = 8,
+         .properties = "{}"},
+    };
+    CBMDumpEdge edges[1] = {
+        {.id = 1,
+         .project = "test",
+         .source_id = 1,
+         .target_id = 2,
+         .type = "SEMANTICALLY_RELATED",
+         .properties = "{\"score\":0.75}",
+         .url_path = ""},
+    };
+    static const uint8_t node_vec[] = {1, 2, 3, 4};
+    static const uint8_t token_vec[] = {5, 6, 7, 8, 9};
+    CBMDumpVector vectors[1] = {
+        {.node_id = 1, .project = "test", .vector = node_vec, .vector_len = sizeof(node_vec)},
+    };
+    CBMDumpTokenVec token_vecs[1] = {
+        {.id = 1, .project = "test", .token = "source", .vector = token_vec,
+         .vector_len = sizeof(token_vec), .idf = 1.25f},
+    };
+
+    int rc = cbm_write_db(path, "test", "/tmp/test", "2026-03-14T00:00:00Z", nodes, 2, edges, 1,
+                          vectors, 1, token_vecs, 1);
+    ASSERT_EQ(rc, 0);
+
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(path, &db), SQLITE_OK);
+    sqlite3_stmt *stmt = NULL;
+
+    sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &stmt, NULL);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "ok");
+    sqlite3_finalize(stmt);
+
+    sqlite3_prepare_v2(db, "SELECT length(vector) FROM node_vectors WHERE node_id=1", -1, &stmt,
+                       NULL);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), (int)sizeof(node_vec));
+    sqlite3_finalize(stmt);
+
+    sqlite3_prepare_v2(db, "SELECT token, length(vector), idf FROM token_vectors WHERE id=1", -1,
+                       &stmt, NULL);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "source");
+    ASSERT_EQ(sqlite3_column_int(stmt, 1), (int)sizeof(token_vec));
+    enum { TEST_IDF_FIXED_POINT = 1250 };
+    ASSERT_EQ(sqlite3_column_int(stmt, 2), TEST_IDF_FIXED_POINT);
+    sqlite3_finalize(stmt);
+
+    sqlite3_close(db);
+    unlink(path);
+    PASS();
+}
+
 /* --- Ported from scale_debug_test.go: TestWriteDB_MultiPage --- */
 TEST(sw_multi_page) {
     char path[256];
@@ -634,6 +710,7 @@ SUITE(sqlite_writer) {
     RUN_TEST(sw_scale_and_indexes);
     RUN_TEST(sw_long_index_keys_overflow);
     RUN_TEST(sw_empty);
+    RUN_TEST(sw_vectors_and_token_vectors);
     RUN_TEST(sw_multi_page);
     RUN_TEST(sw_oversized_node);
     RUN_TEST(sw_scale_root_path_integrity);
