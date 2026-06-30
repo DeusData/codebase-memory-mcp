@@ -1368,12 +1368,15 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
 }
 
 static bool import_edge_local_name_span(const cbm_gbuf_edge_t *edge, const char **out_start,
-                                        size_t *out_len) {
+                                        size_t *out_len, bool *out_has_escape) {
     if (out_start) {
         *out_start = NULL;
     }
     if (out_len) {
         *out_len = 0;
+    }
+    if (out_has_escape) {
+        *out_has_escape = false;
     }
     if (!edge || !edge->properties_json || !out_start || !out_len) {
         return false;
@@ -1384,13 +1387,45 @@ static bool import_edge_local_name_span(const cbm_gbuf_edge_t *edge, const char 
         return false;
     }
     start += sizeof(key) - 1;
-    const char *end = strchr(start, '"');
-    if (!end || end <= start) {
-        return false;
+    bool escaped = false;
+    for (const char *end = start; *end; end++) {
+        if (escaped) {
+            if (out_has_escape) {
+                *out_has_escape = true;
+            }
+            escaped = false;
+            continue;
+        }
+        if (*end == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (*end == '"') {
+            if (end <= start) {
+                return false;
+            }
+            *out_start = start;
+            *out_len = (size_t)(end - start);
+            return true;
+        }
     }
-    *out_start = start;
-    *out_len = (size_t)(end - start);
-    return true;
+    return false;
+}
+
+static char *import_edge_local_name_dup_json(const cbm_gbuf_edge_t *edge) {
+    yyjson_doc *doc =
+        edge && edge->properties_json
+            ? yyjson_read(edge->properties_json, strlen(edge->properties_json), 0)
+            : NULL;
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *local = yyjson_obj_get(root, "local_name");
+    const char *value = yyjson_is_str(local) ? yyjson_get_str(local) : NULL;
+    char *dup = value && value[0] ? strdup(value) : NULL;
+    yyjson_doc_free(doc);
+    return dup;
 }
 
 static bool import_edge_local_name_equals(const cbm_gbuf_edge_t *edge, const char *local_name) {
@@ -1399,8 +1434,15 @@ static bool import_edge_local_name_equals(const cbm_gbuf_edge_t *edge, const cha
     }
     const char *start = NULL;
     size_t len = 0;
-    if (!import_edge_local_name_span(edge, &start, &len)) {
+    bool has_escape = false;
+    if (!import_edge_local_name_span(edge, &start, &len, &has_escape)) {
         return false;
+    }
+    if (has_escape) {
+        char *decoded = import_edge_local_name_dup_json(edge);
+        bool match = decoded && strcmp(decoded, local_name) == 0;
+        free(decoded);
+        return match;
     }
     return len == strlen(local_name) && strncmp(start, local_name, len) == 0;
 }
@@ -1408,8 +1450,12 @@ static bool import_edge_local_name_equals(const cbm_gbuf_edge_t *edge, const cha
 static char *import_edge_local_name_dup(const cbm_gbuf_edge_t *edge) {
     const char *start = NULL;
     size_t len = 0;
-    if (!import_edge_local_name_span(edge, &start, &len)) {
+    bool has_escape = false;
+    if (!import_edge_local_name_span(edge, &start, &len, &has_escape)) {
         return NULL;
+    }
+    if (has_escape) {
+        return import_edge_local_name_dup_json(edge);
     }
     return cbm_strndup(start, len);
 }
@@ -1835,6 +1881,20 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     }
 
     return NULL;
+}
+
+int cbm_pipeline_insert_import_edge(cbm_pipeline_ctx_t *ctx, int64_t source_id,
+                                    const cbm_gbuf_node_t *target, const char *local_name) {
+    if (!ctx || !ctx->gbuf || source_id <= 0 || !target || target->id <= 0 ||
+        target->id == source_id) {
+        return 0;
+    }
+
+    char esc_local_name[CBM_SZ_128];
+    cbm_json_escape(esc_local_name, (int)sizeof(esc_local_name), local_name ? local_name : "");
+    char props[CBM_SZ_256];
+    snprintf(props, sizeof(props), "{\"local_name\":\"%s\"}", esc_local_name);
+    return cbm_gbuf_insert_edge(ctx->gbuf, source_id, target->id, "IMPORTS", props) > 0 ? 1 : 0;
 }
 
 /* ── Namespace map ───────────────────────────────────────────────── */

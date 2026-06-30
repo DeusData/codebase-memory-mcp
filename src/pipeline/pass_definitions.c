@@ -432,13 +432,7 @@ static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileRe
         }
         const cbm_gbuf_node_t *target =
             cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
-        if (target && target->id != source_node->id) {
-            char imp_props[CBM_SZ_256];
-            snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}",
-                     imp->local_name ? imp->local_name : "");
-            cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
-            count++;
-        }
+        count += cbm_pipeline_insert_import_edge(ctx, source_node->id, target, imp->local_name);
     }
     free(file_qn);
     return count;
