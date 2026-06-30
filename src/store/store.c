@@ -23,6 +23,7 @@ enum {
     ST_COL_7 = 7,
     ST_COL_8 = 8,
     ST_COL_9 = 9,
+    ST_COL_10 = 10,
     ST_FOUND = -1,
     ST_BUF_16 = 16,
     ST_BUF_64 = 64,
@@ -2967,6 +2968,7 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         }
         scan_node(stmt, &visited[n].node);
         visited[n].hop = sqlite3_column_int(stmt, ST_COL_9);
+        visited[n].pagerank_score = sqlite3_column_double(stmt, ST_COL_10);
         n++;
     }
 
