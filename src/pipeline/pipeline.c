@@ -1021,10 +1021,8 @@ static int try_incremental_or_reindex(cbm_pipeline_t *p, cbm_file_info_t *files,
     return CBM_NOT_FOUND;
 }
 
-/* Note: stat_mtime_ns() was removed here — unused in the main pipeline. The
- * authoritative, used copy lives in pipeline_incremental.c (mtime handling for
- * the incremental path). Kept this file's mtime logic out to satisfy
- * -Werror=unused-function. */
+/* mtime conversion is shared with incremental and exact-delta metadata so
+ * file_hash classification cannot drift by platform path. */
 
 /* Run githistory pass. */
 static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
@@ -1327,18 +1325,9 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
                 for (int i = 0; i < file_count; i++) {
                     struct stat fst;
                     if (stat(files[i].path, &fst) == 0) {
-                        int64_t mtime_ns;
-#ifdef __APPLE__
-                        mtime_ns = ((int64_t)fst.st_mtimespec.tv_sec * CBM_NS_PER_SEC) +
-                                   (int64_t)fst.st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-                        mtime_ns = (int64_t)fst.st_mtime * CBM_NS_PER_SEC;
-#else
-                        mtime_ns = ((int64_t)fst.st_mtim.tv_sec * CBM_NS_PER_SEC) +
-                                   (int64_t)fst.st_mtim.tv_nsec;
-#endif
-                        cbm_store_upsert_file_hash(hash_store, p->project_name,
-                                                   files[i].rel_path, "", mtime_ns, fst.st_size);
+                        cbm_store_upsert_file_hash(hash_store, p->project_name, files[i].rel_path,
+                                                   "", cbm_pipeline_stat_mtime_ns(&fst),
+                                                   fst.st_size);
                     }
                 }
                 if (hash_batched) {

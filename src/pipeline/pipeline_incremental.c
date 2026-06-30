@@ -65,20 +65,6 @@ static bool incr_test_fail_phase_enabled(const char *phase) {
            phase && strcmp(val, phase) == 0;
 }
 
-/* ── Platform-portable mtime_ns ──────────────────────────────────── */
-
-static int64_t stat_mtime_ns(const struct stat *st) {
-#ifdef __APPLE__
-    return ((int64_t)st->st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-           (int64_t)st->st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    return (int64_t)st->st_mtime * (int64_t)CBM_NSEC_PER_SEC;
-#else
-    return ((int64_t)st->st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-           (int64_t)st->st_mtim.tv_nsec;
-#endif
-}
-
 /* ── File classification ─────────────────────────────────────────── */
 
 /* Classify discovered files against stored hashes using mtime+size.
@@ -117,7 +103,7 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
             continue;
         }
 
-        if (stat_mtime_ns(&st) != h->mtime_ns || st.st_size != h->size) {
+        if (cbm_pipeline_stat_mtime_ns(&st) != h->mtime_ns || st.st_size != h->size) {
             changed[i] = true;
             n_changed++;
         } else {
@@ -495,7 +481,7 @@ static int persist_hashes(cbm_store_t *store, const char *project, cbm_file_info
             continue;
         }
         int rc = cbm_store_upsert_file_hash(store, project, files[i].rel_path, "",
-                                            stat_mtime_ns(&st), st.st_size);
+                                            cbm_pipeline_stat_mtime_ns(&st), st.st_size);
         if (rc != CBM_STORE_OK) {
             cbm_log_warn("incremental.persist_hash_failed", "scope", "current", "rel_path",
                          files[i].rel_path, "rc", itoa_buf_incr(rc));

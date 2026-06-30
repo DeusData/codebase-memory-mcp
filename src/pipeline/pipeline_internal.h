@@ -18,6 +18,7 @@
 #include "service_patterns.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
 #include <stdatomic.h>
+#include <sys/stat.h>
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
@@ -113,6 +114,10 @@ typedef struct {
 
 typedef struct {
     cbm_store_file_delta_t delta;
+    cbm_file_hash_t file_hash;
+    cbm_file_state_t file_state;
+    char file_content_hash[CBM_SZ_32];
+    char file_indexed_at[CBM_SZ_32];
     cbm_node_t *nodes;
     cbm_store_delta_edge_t *edges;
     cbm_store_symbol_export_t *exports;
@@ -195,9 +200,12 @@ void cbm_pipeline_free_import_map(const char **keys, const char **vals, int coun
 /* Build a store-level per-file delta descriptor from graph-buffer facts.
  * Returns CBM_STORE_OK even when unsupported_edge_count > 0; callers must fall
  * back instead of publishing when unsupported edges are present. */
+int64_t cbm_pipeline_stat_mtime_ns(const struct stat *st);
 int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *project,
                                             const char *rel_path, int64_t generation,
                                             cbm_pipeline_file_delta_t *out);
+int cbm_pipeline_attach_file_delta_metadata(cbm_pipeline_file_delta_t *delta,
+                                            const cbm_file_info_t *file);
 void cbm_pipeline_file_delta_free(cbm_pipeline_file_delta_t *delta);
 
 /* Preflight an exact-delta publish candidate. This never writes the store. */
