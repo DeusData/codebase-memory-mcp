@@ -1679,8 +1679,10 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    /* Make Cursor + Codex "detected". */
+    /* Make Claude Code + Cursor + Codex "detected". */
     char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.claude", tmpdir);
+    test_mkdirp(dir);
     snprintf(dir, sizeof(dir), "%s/.cursor", tmpdir);
     test_mkdirp(dir);
     snprintf(dir, sizeof(dir), "%s/.codex", tmpdir);
@@ -1692,8 +1694,17 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     ASSERT(strstr(json, "writes_started") != NULL);
     ASSERT(strstr(json, "next_safe_command") != NULL);
     ASSERT(strstr(json, "cursor") != NULL);
+    ASSERT(strstr(json, "skill_dirs_planned") != NULL);
+    ASSERT(strstr(json, ".claude/skills") != NULL);
     ASSERT(strstr(json, ".cursor/mcp.json") != NULL);
     ASSERT(strstr(json, ".codex/config.toml") != NULL);
+    const char *instrs = strstr(json, "\"instruction_files_planned\"");
+    ASSERT_NOT_NULL(instrs);
+    const char *skill_dirs = strstr(json, "\"skill_dirs_planned\"");
+    ASSERT_NOT_NULL(skill_dirs);
+    ASSERT(instrs < skill_dirs);
+    const char *misclassified = strstr(instrs, ".claude/skills");
+    ASSERT(misclassified == NULL || misclassified > skill_dirs);
     free(json);
 
     /* Critical: building the plan must NOT have created any config file. */
