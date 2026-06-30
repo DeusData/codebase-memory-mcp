@@ -17,6 +17,43 @@
 /* ── Schema / Open / Close ──────────────────────────────────────── */
 
 enum { STORE_TEST_SQLITE_AUTO_LEN = -1 };
+enum {
+    STORE_TEST_BIND_PROJECT = 1,
+    STORE_TEST_BIND_GENERATION = 2,
+    STORE_TEST_BIND_STATUS = 3,
+    STORE_TEST_BIND_REPO_FINGERPRINT = 4,
+    STORE_TEST_BIND_CONFIG_FINGERPRINT = 5,
+};
+
+static int store_count_index_generation(cbm_store_t *s, const char *project, int64_t generation,
+                                        const char *status, const char *repo_fingerprint,
+                                        const char *config_fingerprint) {
+    sqlite3_stmt *stmt = NULL;
+    int count = CBM_STORE_ERR;
+    sqlite3 *db = cbm_store_get_db(s);
+    const char *sql = "SELECT COUNT(*) FROM index_generations "
+                      "WHERE project = ?1 AND generation = ?2 AND status = ?3 "
+                      "AND repo_fingerprint = ?4 AND config_fingerprint = ?5 "
+                      "AND completed_at IS NULL AND started_at <> ''";
+    if (!db || sqlite3_prepare_v2(db, sql, STORE_TEST_SQLITE_AUTO_LEN, &stmt, NULL) !=
+                   SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_bind_text(stmt, STORE_TEST_BIND_PROJECT, project, STORE_TEST_SQLITE_AUTO_LEN,
+                      SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, STORE_TEST_BIND_GENERATION, generation);
+    sqlite3_bind_text(stmt, STORE_TEST_BIND_STATUS, status, STORE_TEST_SQLITE_AUTO_LEN,
+                      SQLITE_STATIC);
+    sqlite3_bind_text(stmt, STORE_TEST_BIND_REPO_FINGERPRINT, repo_fingerprint,
+                      STORE_TEST_SQLITE_AUTO_LEN, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, STORE_TEST_BIND_CONFIG_FINGERPRINT, config_fingerprint,
+                      STORE_TEST_SQLITE_AUTO_LEN, SQLITE_STATIC);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
 
 static int store_count_metadata_owners(cbm_store_t *s, int edge, const char *project,
                                        const char *rel_path) {
@@ -685,6 +722,50 @@ TEST(store_file_state_crud) {
     ASSERT_EQ(rc, CBM_STORE_OK);
     rc = cbm_store_get_file_state(s, "test", "main.go", &got);
     ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_index_generation_reservation_monotonic) {
+    enum { FIRST_GENERATION = 1, SECOND_GENERATION = 2 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", "repo-a", "config-a", &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, FIRST_GENERATION);
+    ASSERT_EQ(store_count_index_generation(s, "test", FIRST_GENERATION,
+                                           CBM_STORE_INDEX_STATUS_RESERVED, "repo-a",
+                                           "config-a"),
+              1);
+
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, SECOND_GENERATION);
+    ASSERT_EQ(store_count_index_generation(s, "test", SECOND_GENERATION,
+                                           CBM_STORE_INDEX_STATUS_RESERVED, "", ""),
+              1);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_index_generation_reservation_requires_project) {
+    enum { NO_RESERVED_GENERATION = 0, FIRST_GENERATION = 1, SENTINEL_GENERATION = 99 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+
+    int64_t generation = SENTINEL_GENERATION;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, "missing", "repo-a", "config-a",
+                                                 &generation),
+              CBM_STORE_ERR);
+    ASSERT_EQ(generation, NO_RESERVED_GENERATION);
+    ASSERT_EQ(store_count_index_generation(s, "missing", FIRST_GENERATION,
+                                           CBM_STORE_INDEX_STATUS_RESERVED, "repo-a", "config-a"),
+              0);
 
     cbm_store_close(s);
     PASS();
@@ -2252,6 +2333,8 @@ SUITE(store_nodes) {
     RUN_TEST(store_file_hash_crud);
     RUN_TEST(store_file_hash_upsert_rejects_null_required_fields);
     RUN_TEST(store_file_state_crud);
+    RUN_TEST(store_index_generation_reservation_monotonic);
+    RUN_TEST(store_index_generation_reservation_requires_project);
     RUN_TEST(store_owner_metadata_crud);
     RUN_TEST(store_import_export_metadata_crud);
     RUN_TEST(store_file_delta_affected_paths_from_exports_and_imports);
