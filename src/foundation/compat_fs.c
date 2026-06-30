@@ -13,6 +13,33 @@
 #include <stdlib.h>
 #include <string.h>
 
+static bool cbm_dirent_name_len(const char *name, size_t *out_len) {
+    if (!name) {
+        return false;
+    }
+    const char *end = memchr(name, '\0', CBM_DIRENT_NAME_MAX);
+    if (!end) {
+        return false;
+    }
+    if (out_len) {
+        *out_len = (size_t)(end - name);
+    }
+    return true;
+}
+
+bool cbm_dirent_name_fits(const char *name) {
+    return cbm_dirent_name_len(name, NULL);
+}
+
+static bool cbm_dirent_set_name(cbm_dirent_t *entry, const char *name) {
+    size_t nlen = 0;
+    if (!entry || !cbm_dirent_name_len(name, &nlen)) {
+        return false;
+    }
+    memcpy(entry->name, name, nlen + SKIP_ONE);
+    return true;
+}
+
 #ifdef _WIN32
 
 /* ── Windows implementation ────────────────────────────────── */
@@ -81,38 +108,37 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
     if (!d || d->done) {
         return NULL;
     }
-    if (!d->first) {
-        if (!FindNextFileW(d->find_handle, &d->find_data)) {
+
+    for (;;) {
+        if (!d->first) {
+            if (!FindNextFileW(d->find_handle, &d->find_data)) {
+                d->done = true;
+                return NULL;
+            }
+        }
+        d->first = false;
+
+        if (d->find_data.cFileName[0] == L'.' &&
+            (d->find_data.cFileName[1] == L'\0' ||
+             (d->find_data.cFileName[1] == L'.' && d->find_data.cFileName[2] == L'\0'))) {
+            continue;
+        }
+
+        char *u8 = cbm_wide_to_utf8(d->find_data.cFileName);
+        if (!u8) {
             d->done = true;
             return NULL;
         }
-    }
-    d->first = false;
-
-    while (d->find_data.cFileName[0] == L'.' &&
-           (d->find_data.cFileName[1] == L'\0' ||
-            (d->find_data.cFileName[1] == L'.' && d->find_data.cFileName[2] == L'\0'))) {
-        if (!FindNextFileW(d->find_handle, &d->find_data)) {
-            d->done = true;
-            return NULL;
+        bool copied = cbm_dirent_set_name(&d->entry, u8);
+        free(u8);
+        if (!copied) {
+            continue;
         }
-    }
 
-    char *u8 = cbm_wide_to_utf8(d->find_data.cFileName);
-    if (!u8) {
-        d->done = true;
-        return NULL;
+        d->entry.is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        d->entry.d_type = 0;
+        return &d->entry;
     }
-    size_t nlen = strlen(u8);
-    if (nlen >= CBM_DIRENT_NAME_MAX) {
-        nlen = CBM_DIRENT_NAME_MAX - SKIP_ONE;
-    }
-    memcpy(d->entry.name, u8, nlen);
-    d->entry.name[nlen] = '\0';
-    free(u8);
-    d->entry.is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-    d->entry.d_type = 0;
-    return &d->entry;
 }
 
 void cbm_closedir(cbm_dir_t *d) {
@@ -286,12 +312,9 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
              (de->d_name[SKIP_ONE] == '.' && de->d_name[PAIR_LEN] == '\0'))) {
             continue;
         }
-        size_t nlen = strlen(de->d_name);
-        if (nlen >= CBM_DIRENT_NAME_MAX) {
-            nlen = CBM_DIRENT_NAME_MAX - SKIP_ONE;
+        if (!cbm_dirent_set_name(&d->entry, de->d_name)) {
+            continue;
         }
-        memcpy(d->entry.name, de->d_name, nlen);
-        d->entry.name[nlen] = '\0';
         d->entry.is_dir = (de->d_type == DT_DIR);
         d->entry.d_type = de->d_type;
         return &d->entry;

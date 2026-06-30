@@ -1551,11 +1551,19 @@ static bool is_project_db_file(const char *name, size_t len);
 /* Forward decl — definition lives below in trace_path helpers. */
 static void free_node_contents(cbm_node_t *n);
 
-/* Scan cache dir for .db files, writing comma-separated quoted names into out.
- * Returns the number of projects found. */
-static int collect_db_project_names(const char *dir_path, char *out, size_t out_sz) {
+/* Scan cache dir for .db files, writing complete quoted JSON names into out.
+ * Returns the total projects found; out may list fewer when truncated is set. */
+static int collect_db_project_names(const char *dir_path, char *out, size_t out_sz,
+                                    bool *truncated) {
     int count = 0;
-    int offset = 0;
+    int listed = 0;
+    size_t offset = 0;
+    if (truncated) {
+        *truncated = false;
+    }
+    if (out && out_sz > 0) {
+        out[0] = '\0';
+    }
     cbm_dir_t *d = cbm_opendir(dir_path);
     if (!d) {
         return 0;
@@ -1567,20 +1575,48 @@ static int collect_db_project_names(const char *dir_path, char *out, size_t out_
         if (!is_project_db_file(n, len)) {
             continue;
         }
-        if ((size_t)offset >= out_sz)
-            break; /* bounds check before write */
-        if (count > 0 && offset < (int)out_sz - MCP_SEPARATOR) {
+        count++;
+
+        char project_name[CBM_DIRENT_NAME_MAX];
+        size_t project_len = len - MCP_DB_EXT;
+        if (project_len >= sizeof(project_name)) {
+            if (truncated) {
+                *truncated = true;
+            }
+            continue;
+        }
+        memcpy(project_name, n, project_len);
+        project_name[project_len] = '\0';
+
+        char escaped[CBM_SZ_1K];
+        int escaped_len = cbm_json_escape(escaped, (int)sizeof(escaped), project_name);
+        if (escaped_len <= 0 && project_name[0] != '\0') {
+            if (truncated) {
+                *truncated = true;
+            }
+            continue;
+        }
+
+        size_t item_len = (size_t)escaped_len + CBM_QUOTE_PAIR;
+        if (listed > 0) {
+            item_len += SKIP_ONE;
+        }
+        if (!out || out_sz == 0 || offset + item_len >= out_sz) {
+            if (truncated) {
+                *truncated = true;
+            }
+            continue;
+        }
+
+        if (listed > 0) {
             out[offset++] = ',';
         }
-        int wrote = snprintf(out + offset, out_sz - (size_t)offset, "\"%.*s\"",
-                             (int)(len - MCP_DB_EXT), n);
-        if (wrote > 0) {
-            offset += wrote;
-            if ((size_t)offset >= out_sz) {
-                offset = (int)out_sz - 1; /* clamp on truncation */
-            }
-        }
-        count++;
+        out[offset++] = '"';
+        memcpy(out + offset, escaped, (size_t)escaped_len);
+        offset += (size_t)escaped_len;
+        out[offset++] = '"';
+        out[offset] = '\0';
+        listed++;
     }
     cbm_closedir(d);
     return count;
@@ -1623,7 +1659,8 @@ static char *build_project_list_error_srv(cbm_mcp_server_t *srv, const char *rea
     cache_dir(dir_path, sizeof(dir_path));
 
     char projects[CBM_SZ_4K] = "";
-    int count = collect_db_project_names(dir_path, projects, sizeof(projects));
+    bool projects_truncated = false;
+    int count = collect_db_project_names(dir_path, projects, sizeof(projects), &projects_truncated);
 
     /* Optional: session_project and _context fields for richer error context */
     char session_frag[256] = "";
@@ -1646,8 +1683,10 @@ static char *build_project_list_error_srv(cbm_mcp_server_t *srv, const char *rea
     if (count > 0) {
         snprintf(buf, sizeof(buf),
                  "{\"error\":\"%s\",\"hint\":\"Use list_projects to see all indexed projects, "
-                 "then pass the project name.\",\"available_projects\":[%s],\"count\":%d%s%s}",
-                 reason, projects, count, session_frag, context_frag);
+                 "then pass the project name.\",\"available_projects\":[%s],\"count\":%d%s%s%s}",
+                 reason, projects, count,
+                 projects_truncated ? ",\"available_projects_truncated\":true" : "",
+                 session_frag, context_frag);
     } else {
         snprintf(buf, sizeof(buf),
                  "{\"error\":\"%s\",\"hint\":\"No projects indexed yet. "

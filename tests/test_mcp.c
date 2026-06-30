@@ -2928,6 +2928,19 @@ TEST(tool_bad_project_name_no_overflow_issue235) {
              "\"project\":\"definitely-not-a-real-project-xyz\"}}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "not found"));
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_NOT_NULL(root);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(root, "count")), ISSUE235_N);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "available_projects_truncated")));
+    yyjson_val *projects = yyjson_obj_get(root, "available_projects");
+    ASSERT_TRUE(yyjson_is_arr(projects));
+    ASSERT_TRUE((int)yyjson_arr_size(projects) < ISSUE235_N);
+    yyjson_doc_free(doc);
+    free(inner);
     free(resp);
     cbm_mcp_server_free(srv);
 

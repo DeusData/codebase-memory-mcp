@@ -3,6 +3,7 @@
  */
 #include "test_framework.h"
 #include "../src/foundation/compat.h" /* cbm_setenv / cbm_unsetenv (Windows-portable) */
+#include "../src/foundation/compat_fs.h"
 #include "../src/foundation/platform.h"
 #include "../src/foundation/system_info_internal.h"
 #include <stdlib.h>
@@ -160,6 +161,21 @@ TEST(platform_getenv_fits) {
     ASSERT_STR_EQ(buf, "");
 
     cbm_unsetenv(name);
+    PASS();
+}
+
+TEST(platform_dirent_name_fits_boundary) {
+    char fits[CBM_DIRENT_NAME_MAX];
+    char too_long[CBM_DIRENT_NAME_MAX + SKIP_ONE];
+
+    memset(fits, 'a', sizeof(fits) - SKIP_ONE);
+    fits[sizeof(fits) - SKIP_ONE] = '\0';
+    ASSERT_TRUE(cbm_dirent_name_fits(fits));
+
+    memset(too_long, 'b', sizeof(too_long) - SKIP_ONE);
+    too_long[sizeof(too_long) - SKIP_ONE] = '\0';
+    ASSERT_FALSE(cbm_dirent_name_fits(too_long));
+    ASSERT_FALSE(cbm_dirent_name_fits(NULL));
     PASS();
 }
 
@@ -348,6 +364,7 @@ SUITE(platform) {
     RUN_TEST(platform_default_workers_env_invalid);
     RUN_TEST(platform_default_workers_env_unset);
     RUN_TEST(platform_getenv_fits);
+    RUN_TEST(platform_dirent_name_fits_boundary);
 #ifdef __linux__
     RUN_TEST(cgroup_v2_cpu_quota);
     RUN_TEST(cgroup_v2_cpu_quota_rounds_up);
