@@ -2887,6 +2887,11 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "true|false",
      "false = restrict to project code only (exclude dep sub-projects). "
      "Set false for single-project focus workflows."},
+    {"search_disable_dep_ranking", "false", NULL, "Tools",
+     "Disable project-before-dependency ranking in search_graph",
+     "true|false",
+     "false (default) ranks project symbols before dependency symbols when include_dependencies=true. "
+     "true uses pure relevance order across project and dependency symbols."},
     /* ── PageRank ── */
     {"pagerank_max_iter", "20", NULL, "PageRank",
      "Max iterations for PageRank algorithm before stopping (more = more accurate convergence)",
