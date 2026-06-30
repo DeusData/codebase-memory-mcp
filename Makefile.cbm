@@ -479,7 +479,7 @@ PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-foundation test-tsan test-leak test-analyze test-memory test-gmalloc cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format install test-runner-nosan security
+.PHONY: test test-foundation test-tsan test-leak test-analyze test-memory test-gmalloc cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format lint-source-safety install test-runner-nosan security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -918,6 +918,10 @@ lint-no-suppress:
 	@echo "  Checking NOLINT(misc-no-recursion) against whitelist..."
 	@scripts/check-nolint-whitelist.sh
 	@bash scripts/check-source-safety.sh
+
+lint-source-safety:
+	@bash scripts/check-source-safety.sh
+	@bash scripts/test-source-safety.sh
 
 # All linters (run with make -j3 lint for parallel execution)
 lint: lint-tidy lint-cppcheck lint-format lint-no-suppress
