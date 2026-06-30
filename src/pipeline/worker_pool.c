@@ -18,10 +18,6 @@ enum { WP_TRUE = 1, WP_MIN = 1, WP_STEP = 1 };
 #include <stdatomic.h>
 #include <stdlib.h>
 
-/* 8 MB stack per worker — matches main thread default.
- * Required for deep AST recursion (tree-sitter + walk_defs). */
-#define CBM_WORKER_STACK_SIZE ((size_t)8 * CBM_SZ_1K * CBM_SZ_1K)
-
 /* ── Serial fallback ─────────────────────────────────────────────── */
 
 static void run_serial(int count, cbm_parallel_fn fn, void *ctx) {
@@ -51,7 +47,7 @@ static void *pthread_worker(void *arg) {
     return NULL;
 }
 
-static void run_pthreads(int count, cbm_parallel_fn fn, void *ctx, int nworkers) {
+static void run_pthreads(int count, cbm_parallel_fn fn, void *ctx, int max_workers) {
     _Atomic int next_idx = 0;
 
     pthread_worker_arg_t wa = {
@@ -61,21 +57,23 @@ static void run_pthreads(int count, cbm_parallel_fn fn, void *ctx, int nworkers)
         .count = count,
     };
 
-    cbm_thread_t *threads = (cbm_thread_t *)malloc((size_t)nworkers * sizeof(cbm_thread_t));
+    int thread_count = max_workers - WP_STEP;
+    cbm_thread_t *threads = (cbm_thread_t *)malloc((size_t)thread_count * sizeof(cbm_thread_t));
     if (!threads) {
         run_serial(count, fn, ctx);
         return;
     }
 
-    for (int i = 0; i < nworkers; i++) {
-        if (cbm_thread_create(&threads[i], CBM_WORKER_STACK_SIZE, pthread_worker, &wa) != 0) {
+    int threads_started = 0;
+    for (int i = 0; i < thread_count; i++) {
+        if (cbm_thread_create(&threads[i], 0, pthread_worker, &wa) != 0) {
             /* Failed to create thread — let remaining work run in main thread */
-            nworkers = i;
             break;
         }
+        threads_started++;
     }
 
-    /* Main thread also participates */
+    /* Main thread participates and counts against max_workers. */
     while (WP_TRUE) {
         int idx = atomic_fetch_add_explicit(&next_idx, WP_STEP, memory_order_relaxed);
         if (idx >= count) {
@@ -84,7 +82,7 @@ static void run_pthreads(int count, cbm_parallel_fn fn, void *ctx, int nworkers)
         fn(idx, ctx);
     }
 
-    for (int i = 0; i < nworkers; i++) {
+    for (int i = 0; i < threads_started; i++) {
         cbm_thread_join(&threads[i]);
     }
 
