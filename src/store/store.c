@@ -145,6 +145,10 @@ struct cbm_store {
     sqlite3_stmt *stmt_upsert_file_state;
     sqlite3_stmt *stmt_get_file_state;
     sqlite3_stmt *stmt_delete_file_state;
+    sqlite3_stmt *stmt_upsert_node_owner;
+    sqlite3_stmt *stmt_upsert_edge_owner;
+    sqlite3_stmt *stmt_delete_node_owners_by_file;
+    sqlite3_stmt *stmt_delete_edge_owners_by_file;
 };
 
 /* ── Public accessor ────────────────────────────────────────────── */
@@ -941,6 +945,10 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_upsert_file_state);
     finalize_stmt(&s->stmt_get_file_state);
     finalize_stmt(&s->stmt_delete_file_state);
+    finalize_stmt(&s->stmt_upsert_node_owner);
+    finalize_stmt(&s->stmt_upsert_edge_owner);
+    finalize_stmt(&s->stmt_delete_node_owners_by_file);
+    finalize_stmt(&s->stmt_delete_edge_owners_by_file);
 
     /* Use sqlite3_close_v2 — auto-deallocates when last statement finalizes.
      * Prevents ASan false-positive leaks from sqlite3 internal state. */
@@ -1924,6 +1932,89 @@ int cbm_store_delete_file_state(cbm_store_t *s, const char *project, const char 
     bind_text(stmt, ST_COL_2, rel_path);
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         store_set_error_sqlite(s, "delete_file_state");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_upsert_node_owner(cbm_store_t *s, const char *project, int64_t node_id,
+                                const char *rel_path, int64_t generation) {
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_upsert_node_owner,
+                       "INSERT INTO node_owners (project, node_id, rel_path, generation) "
+                       "VALUES (?1, ?2, ?3, ?4) "
+                       "ON CONFLICT(project, node_id) DO UPDATE SET rel_path=?3, generation=?4;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, ST_COL_1, project);
+    sqlite3_bind_int64(stmt, ST_COL_2, node_id);
+    bind_text(stmt, ST_COL_3, rel_path);
+    sqlite3_bind_int64(stmt, ST_COL_4, generation);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "upsert_node_owner");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_upsert_edge_owner(cbm_store_t *s, const char *project, int64_t edge_id,
+                                const char *rel_path, const char *derived_kind,
+                                int64_t generation) {
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_upsert_edge_owner,
+                       "INSERT INTO edge_owners (project, edge_id, rel_path, derived_kind, "
+                       "generation) VALUES (?1, ?2, ?3, ?4, ?5) "
+                       "ON CONFLICT(project, edge_id) DO UPDATE SET "
+                       "rel_path=?3, derived_kind=?4, generation=?5;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, ST_COL_1, project);
+    sqlite3_bind_int64(stmt, ST_COL_2, edge_id);
+    bind_text(stmt, ST_COL_3, rel_path);
+    bind_text(stmt, ST_COL_4, derived_kind ? derived_kind : CBM_STORE_DERIVED_KIND_DIRECT);
+    sqlite3_bind_int64(stmt, ST_COL_5, generation);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "upsert_edge_owner");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_delete_node_owners_by_file(cbm_store_t *s, const char *project,
+                                         const char *rel_path) {
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_delete_node_owners_by_file,
+                       "DELETE FROM node_owners WHERE project = ?1 AND rel_path = ?2;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "delete_node_owners_by_file");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_delete_edge_owners_by_file(cbm_store_t *s, const char *project,
+                                         const char *rel_path) {
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_delete_edge_owners_by_file,
+                       "DELETE FROM edge_owners WHERE project = ?1 AND rel_path = ?2;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "delete_edge_owners_by_file");
         return CBM_STORE_ERR;
     }
     return CBM_STORE_OK;

@@ -16,6 +16,28 @@
 
 /* ── Schema / Open / Close ──────────────────────────────────────── */
 
+enum { STORE_TEST_SQLITE_AUTO_LEN = -1 };
+
+static int store_count_metadata_owners(cbm_store_t *s, int edge, const char *project,
+                                       const char *rel_path) {
+    sqlite3_stmt *stmt = NULL;
+    int count = CBM_STORE_ERR;
+    const char *sql = edge ? "SELECT COUNT(*) FROM edge_owners WHERE project = ?1 AND rel_path = ?2"
+                           : "SELECT COUNT(*) FROM node_owners WHERE project = ?1 AND rel_path = ?2";
+    sqlite3 *db = cbm_store_get_db(s);
+    if (!db || sqlite3_prepare_v2(db, sql, STORE_TEST_SQLITE_AUTO_LEN, &stmt, NULL) !=
+                   SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_bind_text(stmt, 1, project, STORE_TEST_SQLITE_AUTO_LEN, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, rel_path, STORE_TEST_SQLITE_AUTO_LEN, SQLITE_STATIC);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
 TEST(store_open_memory) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -610,6 +632,60 @@ TEST(store_file_state_crud) {
     ASSERT_EQ(rc, CBM_STORE_OK);
     rc = cbm_store_get_file_state(s, "test", "main.go", &got);
     ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_owner_metadata_crud) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t nodes[2] = {
+        {.project = "test",
+         .label = "Function",
+         .name = "main",
+         .qualified_name = "test.main",
+         .file_path = "main.go",
+         .properties_json = "{}"},
+        {.project = "test",
+         .label = "Function",
+         .name = "helper",
+         .qualified_name = "test.helper",
+         .file_path = "helper.go",
+         .properties_json = "{}"},
+    };
+    int64_t main_id = cbm_store_upsert_node(s, &nodes[0]);
+    int64_t helper_id = cbm_store_upsert_node(s, &nodes[1]);
+    ASSERT_GT(main_id, 0);
+    ASSERT_GT(helper_id, 0);
+
+    cbm_edge_t edge = {.project = "test",
+                       .source_id = main_id,
+                       .target_id = helper_id,
+                       .type = "CALLS",
+                       .properties_json = "{}"};
+    int64_t edge_id = cbm_store_insert_edge(s, &edge);
+    ASSERT_GT(edge_id, 0);
+
+    ASSERT_EQ(cbm_store_upsert_node_owner(s, "test", main_id, "main.go", 1), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_edge_owner(s, "test", edge_id, "main.go", NULL, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(store_count_metadata_owners(s, 0, "test", "main.go"), 1);
+    ASSERT_EQ(store_count_metadata_owners(s, 1, "test", "main.go"), 1);
+
+    ASSERT_EQ(cbm_store_upsert_node_owner(s, "test", main_id, "renamed.go", 2),
+              CBM_STORE_OK);
+    ASSERT_EQ(store_count_metadata_owners(s, 0, "test", "main.go"), 0);
+    ASSERT_EQ(store_count_metadata_owners(s, 0, "test", "renamed.go"), 1);
+
+    ASSERT_EQ(cbm_store_delete_edge_owners_by_file(s, "test", "main.go"), CBM_STORE_OK);
+    ASSERT_EQ(store_count_metadata_owners(s, 1, "test", "main.go"), 0);
+    ASSERT_EQ(store_count_metadata_owners(s, 0, "test", "renamed.go"), 1);
+
+    ASSERT_EQ(cbm_store_delete_node_owners_by_file(s, "test", "renamed.go"), CBM_STORE_OK);
+    ASSERT_EQ(store_count_metadata_owners(s, 0, "test", "renamed.go"), 0);
 
     cbm_store_close(s);
     PASS();
@@ -1725,6 +1801,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_file_hash_crud);
     RUN_TEST(store_file_hash_upsert_rejects_null_required_fields);
     RUN_TEST(store_file_state_crud);
+    RUN_TEST(store_owner_metadata_crud);
     RUN_TEST(store_node_properties_json);
     RUN_TEST(store_node_null_properties);
     RUN_TEST(store_find_by_file_overlap);

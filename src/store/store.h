@@ -441,6 +441,19 @@ int cbm_store_get_file_state(cbm_store_t *s, const char *project, const char *re
 
 int cbm_store_delete_file_state(cbm_store_t *s, const char *project, const char *rel_path);
 
+int cbm_store_upsert_node_owner(cbm_store_t *s, const char *project, int64_t node_id,
+                                const char *rel_path, int64_t generation);
+
+int cbm_store_upsert_edge_owner(cbm_store_t *s, const char *project, int64_t edge_id,
+                                const char *rel_path, const char *derived_kind,
+                                int64_t generation);
+
+int cbm_store_delete_node_owners_by_file(cbm_store_t *s, const char *project,
+                                         const char *rel_path);
+
+int cbm_store_delete_edge_owners_by_file(cbm_store_t *s, const char *project,
+                                         const char *rel_path);
+
 /* ── Search ─────────────────────────────────────────────────────── */
 
 int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_search_output_t *out);
