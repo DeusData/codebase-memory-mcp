@@ -18,6 +18,7 @@
 #include "service_patterns.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
 #include <stdatomic.h>
+#include <string.h>
 #include <sys/stat.h>
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
@@ -50,6 +51,20 @@ bool cbm_pipeline_build_service_route_identity(const char *path, cbm_svc_kind_t 
 int64_t cbm_pipeline_upsert_service_route(cbm_gbuf_t *gb, const char *path, cbm_svc_kind_t svc,
                                           const char *method, const char *broker,
                                           const char *source, const char *file_path);
+
+static inline bool cbm_pipeline_label_is_registry_symbol(const char *label) {
+    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
+                     strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
+                     strcmp(label, "Variable") == 0 || strcmp(label, "Field") == 0);
+}
+
+static inline bool cbm_pipeline_label_is_import_target(const char *label) {
+    return label && (strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
+                     strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
+                     strcmp(label, "Module") == 0 || strcmp(label, "Struct") == 0 ||
+                     strcmp(label, "Enum") == 0 || strcmp(label, "Trait") == 0 ||
+                     strcmp(label, "Type") == 0 || strcmp(label, "File") == 0);
+}
 
 /* Time unit conversions */
 #define CBM_NS_PER_SEC 1000000000LL
@@ -220,6 +235,15 @@ int cbm_pipeline_apply_file_delta_batch(cbm_store_t *store,
                                         int delta_count, int max_affected_paths,
                                         cbm_pipeline_file_delta_plan_t *out);
 void cbm_pipeline_file_delta_plan_free(cbm_pipeline_file_delta_plan_t *plan);
+
+/* Seed a scratch graph with persisted unchanged nodes needed by import and
+ * symbol resolution. Used to build exact-delta descriptors without loading the
+ * full stored graph. `changed_paths` entries are borrowed and skipped. */
+int cbm_pipeline_seed_file_delta_scratch_from_store(cbm_store_t *store, cbm_gbuf_t *gbuf,
+                                                    cbm_registry_t *registry,
+                                                    const char *project,
+                                                    const char *const *changed_paths,
+                                                    int changed_path_count);
 
 /* Build a namespace → File-node-QN map from a set of extraction results.
  * Each result that declared a namespace/package contributes one entry keyed by

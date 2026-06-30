@@ -762,9 +762,7 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     }
     /* Register callable symbols + Interface — see pass_definitions.c for rationale.
      * Variable/Field defs are registered too so READS/WRITES can resolve. */
-    if (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
-        strcmp(def->label, "Class") == 0 || strcmp(def->label, "Interface") == 0 ||
-        strcmp(def->label, "Variable") == 0 || strcmp(def->label, "Field") == 0) {
+    if (cbm_pipeline_label_is_registry_symbol(def->label)) {
         cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
         (*reg_entries)++;
     }

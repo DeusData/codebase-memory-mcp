@@ -3214,6 +3214,126 @@ static void pipeline_delta_attach_test_metadata(cbm_pipeline_file_delta_t *delta
     delta->delta.file_state = state;
 }
 
+TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths) {
+    const char *project = "test";
+    const char *changed_paths[] = {"main.go"};
+    const int changed_path_count = (int)(sizeof(changed_paths) / sizeof(changed_paths[0]));
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp"), CBM_STORE_OK);
+
+    cbm_node_t helper = {.project = (char *)project,
+                         .label = "Function",
+                         .name = "Helper",
+                         .qualified_name = "test.helper.Helper",
+                         .file_path = "helper.go",
+                         .start_line = 1,
+                         .end_line = 1,
+                         .properties_json = "{\"is_exported\":true}"};
+    cbm_node_t stale = {.project = (char *)project,
+                        .label = "Function",
+                        .name = "Old",
+                        .qualified_name = "test.main.Old",
+                        .file_path = "main.go",
+                        .start_line = 1,
+                        .end_line = 1,
+                        .properties_json = "{\"is_exported\":true}"};
+    cbm_node_t module = {.project = (char *)project,
+                         .label = "Module",
+                         .name = "helper",
+                         .qualified_name = "test.helper",
+                         .file_path = "helper.go",
+                         .start_line = 1,
+                         .end_line = 1,
+                         .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &helper), 0);
+    ASSERT_GT(cbm_store_upsert_node(s, &stale), 0);
+    ASSERT_GT(cbm_store_upsert_node(s, &module), 0);
+
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, "/tmp");
+    cbm_registry_t *registry = cbm_registry_new();
+    ASSERT_NOT_NULL(scratch);
+    ASSERT_NOT_NULL(registry);
+    ASSERT_EQ(cbm_pipeline_seed_file_delta_scratch_from_store(
+                  s, scratch, registry, project, changed_paths, changed_path_count),
+              CBM_STORE_OK);
+
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(scratch, "test.helper.Helper"));
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(scratch, "test.helper"));
+    ASSERT_NULL(cbm_gbuf_find_by_qn(scratch, "test.main.Old"));
+    ASSERT_TRUE(cbm_registry_exists(registry, "test.helper.Helper"));
+    ASSERT_FALSE(cbm_registry_exists(registry, "test.main.Old"));
+
+    cbm_registry_free(registry);
+    cbm_gbuf_free(scratch);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_scratch_seed_supports_external_endpoint_descriptor) {
+    const char *project = "test";
+    const char *changed_paths[] = {"main.go"};
+    const int changed_path_count = (int)(sizeof(changed_paths) / sizeof(changed_paths[0]));
+    const char *helper_qn = "test.helper.Helper";
+    const char *main_file_qn = "test.main.__file__";
+    const char *main_qn = "test.main.Run";
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp"), CBM_STORE_OK);
+
+    cbm_node_t helper = {.project = (char *)project,
+                         .label = "Function",
+                         .name = "Helper",
+                         .qualified_name = (char *)helper_qn,
+                         .file_path = "helper.go",
+                         .start_line = 1,
+                         .end_line = 1,
+                         .properties_json = "{\"is_exported\":true}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &helper), 0);
+
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, "/tmp");
+    cbm_registry_t *registry = cbm_registry_new();
+    ASSERT_NOT_NULL(scratch);
+    ASSERT_NOT_NULL(registry);
+    ASSERT_EQ(cbm_pipeline_seed_file_delta_scratch_from_store(
+                  s, scratch, registry, project, changed_paths, changed_path_count),
+              CBM_STORE_OK);
+
+    int64_t file_id =
+        cbm_gbuf_upsert_node(scratch, "File", "main.go", main_file_qn, "main.go", 1, 1, "{}");
+    int64_t run_id = cbm_gbuf_upsert_node(scratch, "Function", "Run", main_qn, "main.go", 2, 4,
+                                          "{\"is_exported\":true}");
+    const cbm_gbuf_node_t *helper_node = cbm_gbuf_find_by_qn(scratch, helper_qn);
+    ASSERT_GT(file_id, 0);
+    ASSERT_GT(run_id, 0);
+    ASSERT_NOT_NULL(helper_node);
+    cbm_pipeline_ctx_t ctx = {.project_name = project, .repo_path = "/tmp", .gbuf = scratch};
+    ASSERT_EQ(cbm_pipeline_insert_import_edge(&ctx, file_id, helper_node, "Helper"), 1);
+    ASSERT_GT(cbm_gbuf_insert_edge(scratch, run_id, helper_node->id, "CALLS", "{}"), 0);
+
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(scratch, project, changed_paths[0], 1, &delta),
+              CBM_STORE_OK);
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+    ASSERT_EQ(delta.delta.edge_count, 2);
+    ASSERT_NOT_NULL(pipeline_delta_find_edge(&delta, "CALLS"));
+    ASSERT_NOT_NULL(pipeline_delta_find_edge(&delta, "IMPORTS"));
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, changed_paths[0]), 1);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_registry_free(registry);
+    cbm_gbuf_free(scratch);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(pipeline_file_delta_descriptor_from_gbuf) {
     cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
     ASSERT_NOT_NULL(gb);
@@ -8131,6 +8251,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_semantic_corpus_vectors_independent_of_worker_count);
     RUN_TEST(config_registry_includes_mcp_timeout_knobs);
     RUN_TEST(config_registry_includes_incremental_reindex_policy);
+    RUN_TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths);
+    RUN_TEST(pipeline_file_delta_scratch_seed_supports_external_endpoint_descriptor);
     RUN_TEST(pipeline_file_delta_descriptor_from_gbuf);
     RUN_TEST(pipeline_file_delta_descriptor_marks_unsupported_edges);
     RUN_TEST(pipeline_file_delta_metadata_from_file);

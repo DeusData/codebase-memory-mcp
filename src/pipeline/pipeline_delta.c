@@ -32,6 +32,12 @@ static const char cbm_delta_reason_unresolved_edge_endpoint[] = "unresolved_edge
 static const char cbm_delta_reason_unsupported_derived_view[] = "unsupported_derived_view";
 static const char cbm_delta_reason_unsupported_edges[] = "unsupported_edges";
 
+static const char *const cbm_delta_scratch_seed_labels[] = {
+    "File",      "Module", "Struct", "Enum",  "Trait",    "Type",
+    "Function",  "Method", "Class",  "Interface", "Variable", "Field",
+    NULL,
+};
+
 enum {
     CBM_DELTA_GROWTH = 2,
     CBM_DELTA_XXH64_HEX_LEN = (int)(sizeof(uint64_t) * PAIR_LEN),
@@ -56,6 +62,66 @@ static char *delta_strdup(const char *s) {
 
 static bool delta_same_path(const char *a, const char *b) {
     return a && b && strcmp(a, b) == 0;
+}
+
+static bool delta_path_in_list(const char *path, const char *const *paths, int count) {
+    if (!path || !paths || count <= 0) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        if (delta_same_path(path, paths[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int delta_seed_store_node(cbm_gbuf_t *gbuf, cbm_registry_t *registry,
+                                 const cbm_node_t *node) {
+    if (!gbuf || !node || !node->label || !node->qualified_name) {
+        return CBM_STORE_ERR;
+    }
+    int64_t id = cbm_gbuf_upsert_node(gbuf, node->label, node->name ? node->name : "",
+                                      node->qualified_name, node->file_path ? node->file_path : "",
+                                      node->start_line, node->end_line,
+                                      node->properties_json ? node->properties_json : "{}");
+    if (id <= 0) {
+        return CBM_STORE_ERR;
+    }
+    if (registry && cbm_pipeline_label_is_registry_symbol(node->label) && node->name) {
+        cbm_registry_add(registry, node->name, node->qualified_name, node->label);
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_pipeline_seed_file_delta_scratch_from_store(cbm_store_t *store, cbm_gbuf_t *gbuf,
+                                                    cbm_registry_t *registry,
+                                                    const char *project,
+                                                    const char *const *changed_paths,
+                                                    int changed_path_count) {
+    if (!store || !gbuf || !project || changed_path_count < 0 ||
+        (changed_path_count > 0 && !changed_paths)) {
+        return CBM_STORE_ERR;
+    }
+    for (const char *const *label = cbm_delta_scratch_seed_labels; *label; label++) {
+        cbm_node_t *nodes = NULL;
+        int node_count = 0;
+        int rc = cbm_store_find_nodes_by_label(store, project, *label, &nodes, &node_count);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+        for (int i = 0; i < node_count; i++) {
+            if (delta_path_in_list(nodes[i].file_path, changed_paths, changed_path_count)) {
+                continue;
+            }
+            if (delta_seed_store_node(gbuf, registry, &nodes[i]) != CBM_STORE_OK) {
+                cbm_store_free_nodes(nodes, node_count);
+                return CBM_STORE_ERR;
+            }
+        }
+        cbm_store_free_nodes(nodes, node_count);
+    }
+    return CBM_STORE_OK;
 }
 
 static bool delta_node_is_exported(const cbm_gbuf_node_t *node) {

@@ -300,10 +300,7 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
      * `IBar` to an INHERITS edge target during the enrichment phase.
      * Variable/Field defs are also registered so pass_usages.c can resolve
      * READS/WRITES accesses (rw->var_name) to a Variable/Field node QN. */
-    if (node_id > 0 && def->label &&
-        (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
-         strcmp(def->label, "Class") == 0 || strcmp(def->label, "Interface") == 0 ||
-         strcmp(def->label, "Variable") == 0 || strcmp(def->label, "Field") == 0)) {
+    if (node_id > 0 && cbm_pipeline_label_is_registry_symbol(def->label)) {
         cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");

@@ -593,25 +593,13 @@ static int persist_hashes(cbm_store_t *store, const char *project, cbm_file_info
 
 /* ── Registry seed visitor ────────────────────────────────────────── */
 
-/* Labels the full-index definition pass seeds into the registry
- * (pass_definitions.c — KEEP IN SYNC). Incremental re-resolution must see the
- * SAME symbol set, or it diverges from a clean full reindex: seeding extra
- * container nodes (File / Module / Folder / ...) lets a type usage like `Word`
- * resolve to the same-named Module node instead of the Class node. Only
- * callable / declared symbols belong in the registry. */
-static bool incr_label_is_registry_symbol(const char *label) {
-    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
-                     strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
-                     strcmp(label, "Variable") == 0 || strcmp(label, "Field") == 0);
-}
-
 /* Callback for cbm_gbuf_foreach_node: seed the registry with the existing
  * project's definition symbols so the resolver can match cross-file symbols
  * during incremental. Mirrors the full-index registry contents exactly so an
  * incremental re-resolve picks the same nodes a full reindex would. */
 static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     cbm_registry_t *r = (cbm_registry_t *)userdata;
-    if (!incr_label_is_registry_symbol(node->label)) {
+    if (!cbm_pipeline_label_is_registry_symbol(node->label)) {
         return;
     }
     cbm_registry_add(r, node->name, node->qualified_name, node->label);
