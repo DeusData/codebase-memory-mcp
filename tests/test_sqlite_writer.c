@@ -8,10 +8,15 @@
  * bypassing the SQL parser entirely. These tests verify integrity.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_thread.h"
+#include "../src/foundation/constants.h"
 #include "test_framework.h"
 /* sqlite_writer.h is at internal/cbm/ — Makefile adds -Iinternal/cbm */
 #include "sqlite_writer.h" /* CBMDumpNode, CBMDumpEdge, cbm_write_db */
 #include "sqlite3.h"       /* vendored/sqlite3/ via -Ivendored/sqlite3 */
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 /* ── Helper: create temp file path ─────────────────────────────── */
@@ -22,6 +27,65 @@ static int make_temp_db(char *path, size_t pathsz) {
     if (fd < 0)
         return -1;
     close(fd);
+    return 0;
+}
+
+static int verify_writer_db(const char *path, const char *project, const char *root_path,
+                            int expected_nodes, int expected_edges) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK) {
+        return CBM_NOT_FOUND;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &stmt, NULL) != SQLITE_OK ||
+        sqlite3_step(stmt) != SQLITE_ROW ||
+        strcmp((const char *)sqlite3_column_text(stmt, 0), "ok") != 0) {
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        sqlite3_close(db);
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+
+    if (sqlite3_prepare_v2(db, "SELECT root_path FROM projects WHERE name=?1", -1, &stmt, NULL) !=
+        SQLITE_OK) {
+        sqlite3_close(db);
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_STATIC);
+    if (sqlite3_step(stmt) != SQLITE_ROW ||
+        strcmp((const char *)sqlite3_column_text(stmt, 0), root_path) != 0) {
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM nodes", -1, &stmt, NULL) != SQLITE_OK ||
+        sqlite3_step(stmt) != SQLITE_ROW || sqlite3_column_int(stmt, 0) != expected_nodes) {
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        sqlite3_close(db);
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM edges", -1, &stmt, NULL) != SQLITE_OK ||
+        sqlite3_step(stmt) != SQLITE_ROW || sqlite3_column_int(stmt, 0) != expected_edges) {
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        sqlite3_close(db);
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
     return 0;
 }
 
@@ -705,6 +769,103 @@ TEST(sw_scale_root_path_integrity) {
     PASS();
 }
 
+typedef struct {
+    char path[CBM_PATH_MAX];
+    char project[CBM_SZ_32];
+    char root_path[CBM_PATH_MAX];
+    atomic_int *start;
+    int node_count;
+    int edge_count;
+    int rc;
+} sw_concurrent_job_t;
+
+static void *sw_concurrent_writer_thread(void *arg) {
+    sw_concurrent_job_t *job = (sw_concurrent_job_t *)arg;
+    while (atomic_load(job->start) == 0) {
+    }
+
+    CBMDumpNode *nodes = (CBMDumpNode *)calloc((size_t)job->node_count, sizeof(*nodes));
+    CBMDumpEdge *edges = (CBMDumpEdge *)calloc((size_t)job->edge_count, sizeof(*edges));
+    char (*names)[CBM_SZ_32] = malloc((size_t)job->node_count * CBM_SZ_32);
+    char (*qns)[CBM_SZ_64] = malloc((size_t)job->node_count * CBM_SZ_64);
+    char (*files)[CBM_SZ_32] = malloc((size_t)job->node_count * CBM_SZ_32);
+    if (!nodes || !edges || !names || !qns || !files) {
+        free(nodes);
+        free(edges);
+        free(names);
+        free(qns);
+        free(files);
+        job->rc = CBM_NOT_FOUND;
+        return NULL;
+    }
+
+    for (int i = 0; i < job->node_count; i++) {
+        snprintf(names[i], CBM_SZ_32, "fn_%04d", i);
+        snprintf(qns[i], CBM_SZ_64, "%s.mod.fn_%04d", job->project, i);
+        snprintf(files[i], CBM_SZ_32, "src/file_%03d.py", i % CBM_SZ_128);
+        nodes[i].id = i + 1;
+        nodes[i].project = job->project;
+        nodes[i].label = (i % PAIR_LEN) == 0 ? "Function" : "Class";
+        nodes[i].name = names[i];
+        nodes[i].qualified_name = qns[i];
+        nodes[i].file_path = files[i];
+        nodes[i].start_line = i + SKIP_ONE;
+        nodes[i].end_line = i + PAIR_LEN;
+        nodes[i].properties = "{}";
+    }
+    for (int i = 0; i < job->edge_count; i++) {
+        edges[i].id = i + 1;
+        edges[i].project = job->project;
+        edges[i].source_id = (i % job->node_count) + 1;
+        edges[i].target_id = ((i / job->node_count) % job->node_count) + 1;
+        edges[i].type = "CALLS";
+        edges[i].properties = "{}";
+        edges[i].url_path = "";
+    }
+
+    job->rc = cbm_write_db(job->path, job->project, job->root_path, "2026-06-30T00:00:00Z",
+                           nodes, job->node_count, edges, job->edge_count, NULL, 0, NULL, 0);
+    free(nodes);
+    free(edges);
+    free(names);
+    free(qns);
+    free(files);
+    return NULL;
+}
+
+TEST(sw_concurrent_writes_are_independent) {
+    enum {
+        CONCURRENT_WRITERS = PAIR_LEN,
+        CONCURRENT_NODES = CBM_SZ_1K,
+        CONCURRENT_EDGES = CBM_SZ_4K,
+    };
+    atomic_int start = 0;
+    sw_concurrent_job_t jobs[CONCURRENT_WRITERS] = {0};
+    cbm_thread_t threads[CONCURRENT_WRITERS];
+
+    for (int i = 0; i < CONCURRENT_WRITERS; i++) {
+        ASSERT_EQ(make_temp_db(jobs[i].path, sizeof(jobs[i].path)), 0);
+        snprintf(jobs[i].project, sizeof(jobs[i].project), "proj%d", i);
+        snprintf(jobs[i].root_path, sizeof(jobs[i].root_path), "/tmp/sw_concurrent_root_%d", i);
+        jobs[i].start = &start;
+        jobs[i].node_count = CONCURRENT_NODES;
+        jobs[i].edge_count = CONCURRENT_EDGES;
+        jobs[i].rc = CBM_NOT_FOUND;
+        ASSERT_EQ(cbm_thread_create(&threads[i], 0, sw_concurrent_writer_thread, &jobs[i]), 0);
+    }
+
+    atomic_store(&start, CBM_INIT_DONE);
+    for (int i = 0; i < CONCURRENT_WRITERS; i++) {
+        ASSERT_EQ(cbm_thread_join(&threads[i]), 0);
+        ASSERT_EQ(jobs[i].rc, 0);
+        ASSERT_EQ(verify_writer_db(jobs[i].path, jobs[i].project, jobs[i].root_path,
+                                   jobs[i].node_count, jobs[i].edge_count),
+                  0);
+        unlink(jobs[i].path);
+    }
+    PASS();
+}
+
 SUITE(sqlite_writer) {
     RUN_TEST(sw_minimal_data);
     RUN_TEST(sw_scale_and_indexes);
@@ -714,4 +875,5 @@ SUITE(sqlite_writer) {
     RUN_TEST(sw_multi_page);
     RUN_TEST(sw_oversized_node);
     RUN_TEST(sw_scale_root_path_integrity);
+    RUN_TEST(sw_concurrent_writes_are_independent);
 }
