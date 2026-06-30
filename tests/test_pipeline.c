@@ -5501,6 +5501,60 @@ TEST(pipeline_fastapi_depends_edges) {
     PASS();
 }
 
+TEST(import_edge_helper_escapes_local_name_once) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t source_file =
+        cbm_gbuf_upsert_node(gb, "File", "main.py", "proj.main.__file__", "main.py", 1, 1, "{}");
+    int64_t target_fn =
+        cbm_gbuf_upsert_node(gb, "Function", "factory", "proj.pkg.factory", "pkg.py", 1, 1, "{}");
+    ASSERT_GT(source_file, 0);
+    ASSERT_GT(target_fn, 0);
+
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gb, target_fn);
+    ASSERT_NOT_NULL(target);
+
+    cbm_pipeline_ctx_t ctx = {
+        .gbuf = gb,
+        .project_name = "proj",
+    };
+    const char alias[] = "quoted\"alias\\module\nnext\tfield";
+    ASSERT_EQ(cbm_pipeline_insert_import_edge(&ctx, source_file, target, alias), 1);
+    ASSERT_EQ(cbm_pipeline_insert_import_edge(&ctx, source_file, cbm_gbuf_find_by_id(gb, source_file),
+                                              "self"), 0);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, source_file, "IMPORTS", &edges, &edge_count),
+              0);
+    ASSERT_EQ(edge_count, 1);
+    ASSERT_EQ(edges[0]->target_id, target_fn);
+
+    yyjson_doc *doc =
+        yyjson_read(edges[0]->properties_json, strlen(edges[0]->properties_json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *local = yyjson_obj_get(root, "local_name");
+    ASSERT_NOT_NULL(local);
+    ASSERT_STR_EQ(yyjson_get_str(local), alias);
+    yyjson_doc_free(doc);
+
+    const char **keys = NULL;
+    const char **vals = NULL;
+    int import_count = 0;
+    ASSERT_EQ(cbm_pipeline_build_import_map_from_edges(gb, "proj", "main.py", &keys, &vals,
+                                                       &import_count),
+              0);
+    ASSERT_EQ(import_count, 1);
+    ASSERT_STR_EQ(keys[0], alias);
+    ASSERT_STR_EQ(vals[0], target->qualified_name);
+    cbm_pipeline_free_import_map(keys, vals, import_count);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 TEST(import_reexport_falls_back_when_pkgmap_target_missing) {
     cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
     ASSERT_NOT_NULL(gb);
@@ -7314,6 +7368,7 @@ SUITE(pipeline) {
     /* Incremental reindex */
     /* FastAPI Depends edge tracking */
     RUN_TEST(pipeline_fastapi_depends_edges);
+    RUN_TEST(import_edge_helper_escapes_local_name_once);
     RUN_TEST(import_reexport_falls_back_when_pkgmap_target_missing);
     RUN_TEST(import_symbol_fallback_prefers_import_path_over_insertion_order);
     /* Incremental */
