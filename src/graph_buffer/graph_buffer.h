@@ -180,6 +180,11 @@ int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t
 
 /* ── Dump to SQLite ──────────────────────────────────────────────── */
 
+/* Test-only fault injection for cbm_gbuf_dump_to_sqlite(): fail after temp DB
+ * verification and before atomic replacement. Used to prove publish failures
+ * leave the previous DB intact. */
+#define CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE "CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE"
+
 /* Dump the entire buffer to a SQLite file using the direct page writer.
  * Assigns sequential final IDs and remaps edge references.
  * Returns 0 on success, -1 on error. */

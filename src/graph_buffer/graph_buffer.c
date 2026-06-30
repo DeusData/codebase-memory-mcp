@@ -45,14 +45,12 @@ enum {
 
 /* Test-only fault injection for the atomic publish boundary. It lets the suite
  * prove a failed replace leaves the previously published DB untouched. */
-static const char cbm_gbuf_test_fail_before_replace_env[] =
-    "CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE";
 static const char cbm_test_env_disabled[] = "0";
 
 static bool cbm_gbuf_test_fail_before_replace_enabled(void) {
     char buf[CBM_SZ_16];
     const char *val =
-        cbm_safe_getenv(cbm_gbuf_test_fail_before_replace_env, buf, sizeof(buf), NULL);
+        cbm_safe_getenv(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE, buf, sizeof(buf), NULL);
     return val && val[0] != '\0' && strcmp(val, cbm_test_env_disabled) != 0;
 }
 
