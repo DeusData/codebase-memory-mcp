@@ -3,13 +3,22 @@
 #include "foundation/compat.h"
 #include "foundation/constants.h"
 
+#include <inttypes.h>
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <yyjson/yyjson.h>
 
+#define XXH_INLINE_ALL
+#include "xxhash/xxhash.h"
+
 static const char cbm_delta_edge_imports[] = "IMPORTS";
+static const char cbm_delta_file_hash_legacy_empty[] = "";
 static const char cbm_delta_prop_is_exported[] = "is_exported";
+static const char cbm_delta_pass_fingerprint_v1[] = "pipeline-file-delta-v1";
 static const char cbm_delta_reason_candidate[] = "candidate";
 static const char cbm_delta_reason_delete_requires_full[] = "delete_requires_full";
 static const char cbm_delta_reason_frontier_error[] = "frontier_error";
@@ -22,7 +31,11 @@ static const char cbm_delta_reason_unresolved_edge_endpoint[] = "unresolved_edge
 static const char cbm_delta_reason_unsupported_derived_view[] = "unsupported_derived_view";
 static const char cbm_delta_reason_unsupported_edges[] = "unsupported_edges";
 
-enum { CBM_DELTA_GROWTH = 2 };
+enum {
+    CBM_DELTA_GROWTH = 2,
+    CBM_DELTA_XXH64_HEX_LEN = (int)(sizeof(uint64_t) * PAIR_LEN),
+    CBM_DELTA_ISO8601_UTC_LEN = 20,
+};
 
 typedef struct {
     cbm_pipeline_file_delta_t *out;
@@ -215,6 +228,116 @@ int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *
         cbm_pipeline_file_delta_free(out);
     }
     return ctx.rc;
+}
+
+int64_t cbm_pipeline_stat_mtime_ns(const struct stat *st) {
+#ifdef __APPLE__
+    return ((int64_t)st->st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+           (int64_t)st->st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)st->st_mtime * (int64_t)CBM_NSEC_PER_SEC;
+#else
+    return ((int64_t)st->st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+           (int64_t)st->st_mtim.tv_nsec;
+#endif
+}
+
+static int delta_iso_now(char *buf, size_t sz) {
+    if (!buf || sz <= CBM_DELTA_ISO8601_UTC_LEN) {
+        return CBM_STORE_ERR;
+    }
+    time_t t = time(NULL);
+    struct tm tm;
+    cbm_gmtime_r(&t, &tm);
+    return strftime(buf, sz, "%Y-%m-%dT%H:%M:%SZ", &tm) == CBM_DELTA_ISO8601_UTC_LEN
+               ? CBM_STORE_OK
+               : CBM_STORE_ERR;
+}
+
+static int delta_content_hash_file(const char *path, char *out, size_t out_sz) {
+    if (!path || !out || out_sz <= CBM_DELTA_XXH64_HEX_LEN) {
+        return CBM_STORE_ERR;
+    }
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        return CBM_STORE_ERR;
+    }
+
+    XXH3_state_t *state = XXH3_createState();
+    if (!state) {
+        fclose(fp);
+        return CBM_STORE_ERR;
+    }
+    if (XXH3_64bits_reset(state) == XXH_ERROR) {
+        XXH3_freeState(state);
+        fclose(fp);
+        return CBM_STORE_ERR;
+    }
+
+    unsigned char buf[CBM_SZ_64K];
+    int rc = CBM_STORE_OK;
+    for (;;) {
+        size_t n = fread(buf, CBM_ALLOC_ONE, sizeof(buf), fp);
+        if (n > 0 && XXH3_64bits_update(state, buf, n) == XXH_ERROR) {
+            rc = CBM_STORE_ERR;
+            break;
+        }
+        if (n < sizeof(buf)) {
+            if (ferror(fp)) {
+                rc = CBM_STORE_ERR;
+            }
+            break;
+        }
+    }
+    uint64_t hash = XXH3_64bits_digest(state);
+    XXH3_freeState(state);
+    if (fclose(fp) != 0) {
+        rc = CBM_STORE_ERR;
+    }
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    int n = snprintf(out, out_sz, "%0*" PRIx64, CBM_DELTA_XXH64_HEX_LEN, hash);
+    return n == CBM_DELTA_XXH64_HEX_LEN ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
+int cbm_pipeline_attach_file_delta_metadata(cbm_pipeline_file_delta_t *delta,
+                                            const cbm_file_info_t *file) {
+    if (!delta || !file || !file->path || !delta->delta.project || !delta->delta.rel_path ||
+        delta->delta.generation < 0) {
+        return CBM_STORE_ERR;
+    }
+    struct stat st;
+    if (stat(file->path, &st) != 0) {
+        return CBM_STORE_ERR;
+    }
+    if (delta_content_hash_file(file->path, delta->file_content_hash,
+                                sizeof(delta->file_content_hash)) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    if (delta_iso_now(delta->file_indexed_at, sizeof(delta->file_indexed_at)) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+
+    int64_t mtime_ns = cbm_pipeline_stat_mtime_ns(&st);
+    delta->file_hash = (cbm_file_hash_t){.project = delta->delta.project,
+                                         .rel_path = delta->delta.rel_path,
+                                         .sha256 = cbm_delta_file_hash_legacy_empty,
+                                         .mtime_ns = mtime_ns,
+                                         .size = st.st_size};
+    delta->file_state = (cbm_file_state_t){.project = delta->delta.project,
+                                           .rel_path = delta->delta.rel_path,
+                                           .content_hash = delta->file_content_hash,
+                                           .git_oid = NULL,
+                                           .mtime_ns = mtime_ns,
+                                           .size = st.st_size,
+                                           .language = cbm_language_name(file->language),
+                                           .pass_fingerprint = cbm_delta_pass_fingerprint_v1,
+                                           .generation = delta->delta.generation,
+                                           .indexed_at = delta->file_indexed_at};
+    delta->delta.file_hash = &delta->file_hash;
+    delta->delta.file_state = &delta->file_state;
+    return CBM_STORE_OK;
 }
 
 void cbm_pipeline_file_delta_free(cbm_pipeline_file_delta_t *delta) {

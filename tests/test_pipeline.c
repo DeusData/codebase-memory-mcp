@@ -3265,6 +3265,60 @@ TEST(pipeline_file_delta_descriptor_marks_unsupported_edges) {
     PASS();
 }
 
+TEST(pipeline_file_delta_metadata_from_file) {
+    enum {
+        PIPELINE_DELTA_META_GENERATION_FIRST = 11,
+        PIPELINE_DELTA_META_GENERATION_SECOND = 12,
+    };
+    char *tmp = th_mktempdir("cbm_delta_meta");
+    ASSERT_NOT_NULL(tmp);
+    const char *path = TH_PATH(tmp, "main.go");
+    const char *first_content = "package main\nfunc Run() {}\n";
+    ASSERT_EQ(th_write_file(path, first_content), 0);
+
+    cbm_file_info_t file = {
+        .path = (char *)path,
+        .rel_path = "main.go",
+        .language = CBM_LANG_GO,
+        .size = (int64_t)strlen(first_content),
+    };
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test",
+                  .rel_path = "main.go",
+                  .generation = PIPELINE_DELTA_META_GENERATION_FIRST}};
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata(&delta, &file), CBM_STORE_OK);
+    ASSERT(delta.delta.file_hash == &delta.file_hash);
+    ASSERT(delta.delta.file_state == &delta.file_state);
+    ASSERT_STR_EQ(delta.file_hash.project, "test");
+    ASSERT_STR_EQ(delta.file_hash.rel_path, "main.go");
+    ASSERT_STR_EQ(delta.file_hash.sha256, "");
+    ASSERT_EQ(delta.file_hash.size, (int64_t)strlen(first_content));
+    ASSERT_STR_EQ(delta.file_state.project, "test");
+    ASSERT_STR_EQ(delta.file_state.rel_path, "main.go");
+    ASSERT_EQ(delta.file_state.size, (int64_t)strlen(first_content));
+    ASSERT_STR_EQ(delta.file_state.language, "Go");
+    ASSERT_EQ(delta.file_state.generation, PIPELINE_DELTA_META_GENERATION_FIRST);
+    ASSERT_NOT_NULL(delta.file_state.content_hash);
+    ASSERT_EQ((int)strlen(delta.file_state.content_hash), CBM_SZ_16);
+    ASSERT_NOT_NULL(delta.file_state.indexed_at);
+    ASSERT_NOT_NULL(strchr(delta.file_state.indexed_at, 'T'));
+    char first_hash[CBM_SZ_32];
+    snprintf(first_hash, sizeof(first_hash), "%s", delta.file_state.content_hash);
+
+    const char *second_content = "package main\nfunc Run() { println(\"changed\") }\n";
+    ASSERT_EQ(th_write_file(path, second_content), 0);
+    cbm_pipeline_file_delta_t changed = {
+        .delta = {.project = "test",
+                  .rel_path = "main.go",
+                  .generation = PIPELINE_DELTA_META_GENERATION_SECOND}};
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata(&changed, &file), CBM_STORE_OK);
+    ASSERT_NEQ(strcmp(first_hash, changed.file_state.content_hash), 0);
+    ASSERT_EQ(changed.file_state.generation, PIPELINE_DELTA_META_GENERATION_SECOND);
+
+    th_cleanup(tmp);
+    PASS();
+}
+
 TEST(pipeline_file_delta_plan_candidate_from_frontier) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -7835,6 +7889,7 @@ SUITE(pipeline) {
     RUN_TEST(config_registry_includes_incremental_reindex_policy);
     RUN_TEST(pipeline_file_delta_descriptor_from_gbuf);
     RUN_TEST(pipeline_file_delta_descriptor_marks_unsupported_edges);
+    RUN_TEST(pipeline_file_delta_metadata_from_file);
     RUN_TEST(pipeline_file_delta_plan_candidate_from_frontier);
     RUN_TEST(pipeline_file_delta_plan_falls_back_without_file_metadata);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unsupported_edges);
