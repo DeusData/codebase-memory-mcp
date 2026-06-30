@@ -211,9 +211,8 @@ int cbm_upsert_gemini_hooks(const char *settings_path);
  * Returns 0 on success. */
 int cbm_remove_gemini_hooks(const char *settings_path);
 
-/* Install/remove a SessionStart reminder hook in Codex config.toml (#330) and
- * Gemini/Antigravity settings.json — same methodology as the Claude Code
- * SessionStart hook (non-blocking; stdout injected as session context). */
+/* Install/remove non-blocking SessionStart reminder hooks. Hook stdout is
+ * intended session context for these harnesses, not MCP protocol output. */
 int cbm_upsert_codex_hooks(const char *config_path);
 int cbm_remove_codex_hooks(const char *config_path);
 int cbm_upsert_gemini_session_hooks(const char *settings_path);
