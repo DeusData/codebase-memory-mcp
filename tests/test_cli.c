@@ -2491,6 +2491,35 @@ TEST(cli_remove_claude_hooks) {
     PASS();
 }
 
+TEST(cli_claude_session_hooks_all_lifecycle_matchers) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-session-hook-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char settingspath[512];
+    snprintf(settingspath, sizeof(settingspath), "%s/settings.json", tmpdir);
+
+    ASSERT_EQ(cbm_upsert_claude_session_hooks(settingspath), 0);
+    const char *data = read_test_file(settingspath);
+    ASSERT_NOT_NULL(data);
+    ASSERT_EQ(count_substr(data, "\"SessionStart\""), 1);
+    ASSERT(strstr(data, "\"startup\"") != NULL);
+    ASSERT(strstr(data, "\"resume\"") != NULL);
+    ASSERT(strstr(data, "\"clear\"") != NULL);
+    ASSERT(strstr(data, "\"compact\"") != NULL);
+    ASSERT_EQ(count_substr(data, "cbm-session-reminder"), 4);
+
+    ASSERT_EQ(cbm_remove_claude_session_hooks(settingspath), 0);
+    data = read_test_file(settingspath);
+    ASSERT_NOT_NULL(data);
+    ASSERT_NULL(strstr(data, "SessionStart"));
+    ASSERT_NULL(strstr(data, "cbm-session-reminder"));
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Group D: Pre-Tool Hook Upsert — Gemini CLI / Antigravity
  * ═══════════════════════════════════════════════════════════════════ */
@@ -3039,6 +3068,7 @@ SUITE(cli) {
     RUN_TEST(cli_upsert_claude_hook_replace);
     RUN_TEST(cli_upsert_claude_hook_preserves_others);
     RUN_TEST(cli_remove_claude_hooks);
+    RUN_TEST(cli_claude_session_hooks_all_lifecycle_matchers);
 
     /* Gemini CLI hooks (4 tests — group D) */
     RUN_TEST(cli_upsert_gemini_hook_fresh);
