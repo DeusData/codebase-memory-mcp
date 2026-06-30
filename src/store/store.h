@@ -547,6 +547,9 @@ int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *d
 int cbm_store_publish_file_delta_batch(cbm_store_t *s,
                                        const cbm_store_file_delta_t *const *deltas,
                                        int delta_count);
+int cbm_store_publish_file_delta_batch_complete(cbm_store_t *s,
+                                                const cbm_store_file_delta_t *const *deltas,
+                                                int delta_count);
 
 /* ── Search ─────────────────────────────────────────────────────── */
 

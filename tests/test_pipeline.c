@@ -3714,11 +3714,8 @@ TEST(pipeline_file_delta_orchestrates_descriptor_plan_and_publish) {
 
     const cbm_store_file_delta_t *publish_deltas[] = {&final_helper_delta.delta,
                                                       &final_main_delta.delta};
-    ASSERT_EQ(cbm_store_publish_file_delta_batch(s, publish_deltas,
-                                                 PIPELINE_DELTA_PARITY_BATCH_COUNT),
-              CBM_STORE_OK);
-    ASSERT_EQ(cbm_store_finish_index_generation(s, project, generation,
-                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+    ASSERT_EQ(cbm_store_publish_file_delta_batch_complete(s, publish_deltas,
+                                                          PIPELINE_DELTA_PARITY_BATCH_COUNT),
               CBM_STORE_OK);
 
     ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, old_helper_qn), 0);
