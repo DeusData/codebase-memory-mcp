@@ -42,6 +42,59 @@
 #define MIN_PATH_CONFIDENCE 0.25 /* minimum score to create HTTP_CALLS edge */
 #define MODULE_WEIGHT 0.85       /* confidence weight for Module-sourced calls */
 
+enum {
+    HL_IMPORT_BINDING_MAX = 64,
+    HL_GROUP_PREFIX_BINDING_MAX = 16,
+    HL_BINDING_KEY_SIZE = 128,
+    HL_BINDING_VALUE_SIZE = 256,
+};
+
+typedef struct {
+    char key[HL_BINDING_KEY_SIZE];
+    char value[HL_BINDING_VALUE_SIZE];
+} hl_binding_t;
+
+static bool hl_copy_regex_span(char *dst, size_t dst_sz, const char *base, cbm_regmatch_t match) {
+    if (!dst || dst_sz == 0 || !base || match.rm_so < 0 || match.rm_eo < match.rm_so) {
+        return false;
+    }
+    size_t len = (size_t)(match.rm_eo - match.rm_so);
+    if (len >= dst_sz) {
+        return false;
+    }
+    memcpy(dst, base + match.rm_so, len);
+    dst[len] = '\0';
+    return true;
+}
+
+static bool hl_binding_add(hl_binding_t *bindings, int *count, int max_count, const char *base,
+                           cbm_regmatch_t key_match, cbm_regmatch_t value_match) {
+    if (!bindings || !count || *count < 0 || *count >= max_count) {
+        return false;
+    }
+    hl_binding_t entry;
+    memset(&entry, 0, sizeof(entry));
+    if (!hl_copy_regex_span(entry.key, sizeof(entry.key), base, key_match) ||
+        !hl_copy_regex_span(entry.value, sizeof(entry.value), base, value_match)) {
+        return false;
+    }
+    bindings[*count] = entry;
+    (*count)++;
+    return true;
+}
+
+static const char *hl_binding_lookup(const hl_binding_t *bindings, int count, const char *key) {
+    if (!bindings || !key || !key[0]) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        if (strcmp(bindings[i].key, key) == 0) {
+            return bindings[i].value;
+        }
+    }
+    return NULL;
+}
+
 /* ── Format int to string for logging ──────────────────────────── */
 
 static const char *itoa_hl(int val) {
@@ -370,56 +423,38 @@ static void resolve_fastapi_prefixes(cbm_pipeline_ctx_t *ctx, cbm_route_handler_
         }
 
         /* Build import map: var_name → dotted.module.path */
-        typedef struct {
-            char var[128];
-            char module[256];
-        } import_entry_t;
-        import_entry_t imports[64];
+        hl_binding_t imports[HL_IMPORT_BINDING_MAX];
         memset(imports, 0, sizeof(imports));
         int import_count = 0;
 
         const char *p = source;
         cbm_regmatch_t pm[3];
-        while (import_count < 64 && cbm_regexec(&import_re, p, 3, pm, 0) == 0) {
-            int mlen = (pm[1].rm_eo - pm[1].rm_so);
-            int vlen = (pm[2].rm_eo - pm[2].rm_so);
-            if (mlen < 256 && vlen < 128) {
-                snprintf(imports[import_count].module, 256, "%.*s", mlen, p + pm[1].rm_so);
-                snprintf(imports[import_count].var, 128, "%.*s", vlen, p + pm[2].rm_so);
-                import_count++;
-            }
+        while (import_count < HL_IMPORT_BINDING_MAX &&
+               cbm_regexec(&import_re, p, 3, pm, 0) == 0) {
+            (void)hl_binding_add(imports, &import_count, HL_IMPORT_BINDING_MAX, p, pm[2], pm[1]);
             p += pm[0].rm_eo;
         }
 
         /* Find include_router calls */
         p = source;
         while (cbm_regexec(&include_re, p, 3, pm, 0) == 0) {
-            char var_name[128] = {0};
-            char prefix[256] = {0};
-            int vlen = (pm[1].rm_eo - pm[1].rm_so);
-            int plen = (pm[2].rm_eo - pm[2].rm_so);
-            if (vlen < 128) {
-                snprintf(var_name, 128, "%.*s", vlen, p + pm[1].rm_so);
-            }
-            if (plen < 256) {
-                snprintf(prefix, 256, "%.*s", plen, p + pm[2].rm_so);
-            }
+            char var_name[HL_BINDING_KEY_SIZE] = {0};
+            char prefix[HL_BINDING_VALUE_SIZE] = {0};
+            bool copied = hl_copy_regex_span(var_name, sizeof(var_name), p, pm[1]) &&
+                          hl_copy_regex_span(prefix, sizeof(prefix), p, pm[2]);
             p += pm[0].rm_eo;
+            if (!copied) {
+                continue;
+            }
 
             /* Find which module this var was imported from */
-            const char *module_path = NULL;
-            for (int i = 0; i < import_count; i++) {
-                if (strcmp(imports[i].var, var_name) == 0) {
-                    module_path = imports[i].module;
-                    break;
-                }
-            }
+            const char *module_path = hl_binding_lookup(imports, import_count, var_name);
             if (!module_path) {
                 continue;
             }
 
             /* Convert dotted module path to file fragment */
-            char file_frag[256];
+            char file_frag[HL_BINDING_VALUE_SIZE];
             snprintf(file_frag, sizeof(file_frag), "%s", module_path);
             for (char *c = file_frag; *c; c++) {
                 if (*c == '.') {
@@ -446,7 +481,7 @@ static void resolve_fastapi_prefixes(cbm_pipeline_ctx_t *ctx, cbm_route_handler_
                  *   - slash-based file fragment ("orders/routes") against file_path */
                 if (strstr(routes[r].qualified_name, module_path) ||
                     (routes[r].function_name[0] && strstr(routes[r].qualified_name, file_frag))) {
-                    char new_path[256];
+                    char new_path[sizeof(routes[r].path)];
                     const char *old_path = routes[r].path;
                     while (*old_path == '/') {
                         old_path++;
@@ -512,61 +547,38 @@ static void resolve_express_prefixes(cbm_pipeline_ctx_t *ctx, cbm_route_handler_
         }
 
         /* Build import map: var_name → module_path */
-        typedef struct {
-            char var[128];
-            char module[256];
-        } import_entry_t;
-        import_entry_t imports[64];
+        hl_binding_t imports[HL_IMPORT_BINDING_MAX];
         memset(imports, 0, sizeof(imports));
         int import_count = 0;
 
         const char *p = source;
         cbm_regmatch_t pm[4];
-        while (import_count < 64 && cbm_regexec(&require_re, p, 4, pm, 0) == 0) {
-            int vlen = (pm[2].rm_eo - pm[2].rm_so);
-            int mlen = (pm[3].rm_eo - pm[3].rm_so);
-            if (vlen < 128 && mlen < 256) {
-                snprintf(imports[import_count].var, 128, "%.*s", vlen, p + pm[2].rm_so);
-                snprintf(imports[import_count].module, 256, "%.*s", mlen, p + pm[3].rm_so);
-                import_count++;
-            }
+        while (import_count < HL_IMPORT_BINDING_MAX &&
+               cbm_regexec(&require_re, p, 4, pm, 0) == 0) {
+            (void)hl_binding_add(imports, &import_count, HL_IMPORT_BINDING_MAX, p, pm[2], pm[3]);
             p += pm[0].rm_eo;
         }
         p = source;
-        while (import_count < 64 && cbm_regexec(&esimport_re, p, 3, pm, 0) == 0) {
-            int vlen = (pm[1].rm_eo - pm[1].rm_so);
-            int mlen = (pm[2].rm_eo - pm[2].rm_so);
-            if (vlen < 128 && mlen < 256) {
-                snprintf(imports[import_count].var, 128, "%.*s", vlen, p + pm[1].rm_so);
-                snprintf(imports[import_count].module, 256, "%.*s", mlen, p + pm[2].rm_so);
-                import_count++;
-            }
+        while (import_count < HL_IMPORT_BINDING_MAX &&
+               cbm_regexec(&esimport_re, p, 3, pm, 0) == 0) {
+            (void)hl_binding_add(imports, &import_count, HL_IMPORT_BINDING_MAX, p, pm[1], pm[2]);
             p += pm[0].rm_eo;
         }
 
         /* Find .use("/prefix", var) calls */
         p = source;
         while (cbm_regexec(&use_re, p, 3, pm, 0) == 0) {
-            char prefix[256] = {0};
-            char var_name[128] = {0};
-            int plen = (pm[1].rm_eo - pm[1].rm_so);
-            int vlen = (pm[2].rm_eo - pm[2].rm_so);
-            if (plen < 256) {
-                snprintf(prefix, 256, "%.*s", plen, p + pm[1].rm_so);
-            }
-            if (vlen < 128) {
-                snprintf(var_name, 128, "%.*s", vlen, p + pm[2].rm_so);
-            }
+            char prefix[HL_BINDING_VALUE_SIZE] = {0};
+            char var_name[HL_BINDING_KEY_SIZE] = {0};
+            bool copied = hl_copy_regex_span(prefix, sizeof(prefix), p, pm[1]) &&
+                          hl_copy_regex_span(var_name, sizeof(var_name), p, pm[2]);
             p += pm[0].rm_eo;
+            if (!copied) {
+                continue;
+            }
 
             /* Resolve var → module path */
-            const char *module_path = NULL;
-            for (int i = 0; i < import_count; i++) {
-                if (strcmp(imports[i].var, var_name) == 0) {
-                    module_path = imports[i].module;
-                    break;
-                }
-            }
+            const char *module_path = hl_binding_lookup(imports, import_count, var_name);
             if (!module_path) {
                 continue;
             }
@@ -603,7 +615,7 @@ static void resolve_express_prefixes(cbm_pipeline_ctx_t *ctx, cbm_route_handler_
 
                 if (strstr(routes[r].qualified_name, dotted_frag) ||
                     strstr(routes[r].qualified_name, file_frag)) {
-                    char new_path[256];
+                    char new_path[sizeof(routes[r].path)];
                     const char *old_path = routes[r].path;
                     while (*old_path == '/') {
                         old_path++;
@@ -709,17 +721,14 @@ static void resolve_cross_file_group_prefixes(cbm_pipeline_ctx_t *ctx, cbm_route
             cbm_regmatch_t pm[3];
             const char *p = caller_source;
             while (cbm_regexec(&group_direct_re, p, 3, pm, 0) == 0) {
-                char called_name[128] = {0};
-                char prefix[256] = {0};
-                int nlen = (pm[1].rm_eo - pm[1].rm_so);
-                int plen = (pm[2].rm_eo - pm[2].rm_so);
-                if (nlen < 128) {
-                    snprintf(called_name, 128, "%.*s", nlen, p + pm[1].rm_so);
-                }
-                if (plen < 256) {
-                    snprintf(prefix, 256, "%.*s", plen, p + pm[2].rm_so);
-                }
+                char called_name[HL_BINDING_KEY_SIZE] = {0};
+                char prefix[HL_BINDING_VALUE_SIZE] = {0};
+                bool copied = hl_copy_regex_span(called_name, sizeof(called_name), p, pm[1]) &&
+                              hl_copy_regex_span(prefix, sizeof(prefix), p, pm[2]);
                 p += pm[0].rm_eo;
+                if (!copied) {
+                    continue;
+                }
 
                 if (strcmp(called_name, func_node->name) == 0) {
                     /* Apply prefix to routes of this function */
@@ -734,7 +743,7 @@ static void resolve_cross_file_group_prefixes(cbm_pipeline_ctx_t *ctx, cbm_route
                         if (strncmp(routes[r].path, prefix, pfx_len) == 0) {
                             continue;
                         }
-                        char new_path[256];
+                        char new_path[sizeof(routes[r].path)];
                         const char *old = routes[r].path;
                         while (*old == '/') {
                             old++;
@@ -747,23 +756,15 @@ static void resolve_cross_file_group_prefixes(cbm_pipeline_ctx_t *ctx, cbm_route
             }
 
             /* Pattern 2: v1 := r.Group("/api"); RegisterRoutes(v1) */
-            typedef struct {
-                char var[128];
-                char prefix[256];
-            } var_prefix_t;
-            var_prefix_t var_pfx[16];
+            hl_binding_t var_pfx[HL_GROUP_PREFIX_BINDING_MAX];
             memset(var_pfx, 0, sizeof(var_pfx));
             int var_count = 0;
 
             p = caller_source;
-            while (var_count < 16 && cbm_regexec(&group_var_re, p, 3, pm, 0) == 0) {
-                int vlen = (pm[1].rm_eo - pm[1].rm_so);
-                int plen = (pm[2].rm_eo - pm[2].rm_so);
-                if (vlen < 128 && plen < 256) {
-                    snprintf(var_pfx[var_count].var, 128, "%.*s", vlen, p + pm[1].rm_so);
-                    snprintf(var_pfx[var_count].prefix, 256, "%.*s", plen, p + pm[2].rm_so);
-                    var_count++;
-                }
+            while (var_count < HL_GROUP_PREFIX_BINDING_MAX &&
+                   cbm_regexec(&group_var_re, p, 3, pm, 0) == 0) {
+                (void)hl_binding_add(var_pfx, &var_count, HL_GROUP_PREFIX_BINDING_MAX, p, pm[1],
+                                     pm[2]);
                 p += pm[0].rm_eo;
             }
 
@@ -776,16 +777,17 @@ static void resolve_cross_file_group_prefixes(cbm_pipeline_ctx_t *ctx, cbm_route
                 if (cbm_regcomp(&call_re, call_pat, CBM_REG_EXTENDED) == 0) {
                     p = caller_source;
                     while (cbm_regexec(&call_re, p, 2, pm, 0) == 0) {
-                        char arg_name[128] = {0};
-                        int alen = (pm[1].rm_eo - pm[1].rm_so);
-                        if (alen < 128) {
-                            snprintf(arg_name, 128, "%.*s", alen, p + pm[1].rm_so);
-                        }
+                        char arg_name[HL_BINDING_KEY_SIZE] = {0};
+                        bool copied_arg =
+                            hl_copy_regex_span(arg_name, sizeof(arg_name), p, pm[1]);
                         p += pm[0].rm_eo;
+                        if (!copied_arg) {
+                            continue;
+                        }
 
                         for (int v = 0; v < var_count; v++) {
-                            if (strcmp(var_pfx[v].var, arg_name) == 0) {
-                                char *prefix = var_pfx[v].prefix;
+                            if (strcmp(var_pfx[v].key, arg_name) == 0) {
+                                char *prefix = var_pfx[v].value;
                                 size_t pfx_len = strlen(prefix);
                                 while (pfx_len > 0 && prefix[pfx_len - 1] == '/') {
                                     prefix[--pfx_len] = '\0';
@@ -797,7 +799,7 @@ static void resolve_cross_file_group_prefixes(cbm_pipeline_ctx_t *ctx, cbm_route
                                     if (strncmp(routes[r].path, prefix, pfx_len) == 0) {
                                         continue;
                                     }
-                                    char new_path[256];
+                                    char new_path[sizeof(routes[r].path)];
                                     const char *old = routes[r].path;
                                     while (*old == '/') {
                                         old++;
