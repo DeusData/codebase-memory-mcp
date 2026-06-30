@@ -192,6 +192,11 @@ int cbm_upsert_claude_hooks(const char *settings_path);
  * Returns 0 on success. */
 int cbm_remove_claude_hooks(const char *settings_path);
 
+/* Install/remove Claude Code SessionStart reminder hooks for startup, resume,
+ * clear, and compact. Returns 0 when all matcher upserts/removals succeed. */
+int cbm_upsert_claude_session_hooks(const char *settings_path);
+int cbm_remove_claude_session_hooks(const char *settings_path);
+
 /* Write the PreToolUse gate shim to <home>/.claude/hooks/. The shim is a thin
  * wrapper that invokes the compiled `hook-augment` and writes to stdout only —
  * it must never create a predictable temp/state file (issue #384). Exposed for

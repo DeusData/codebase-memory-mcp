@@ -50,7 +50,6 @@ enum {
                                                                                        factor */
     CLI_MB_FACTOR = CLI_BUF_1K * CLI_BUF_1K,
     NUM_RETRIES = 5,
-    NUM_DIRS = 4,
     DECOMP_FACTOR = 10,
     GROWTH_FACTOR = 2,
     MIN_ARGC_GET = 2,
@@ -2143,12 +2142,13 @@ static void cbm_install_session_reminder_script(const char *home) {
 #endif
 }
 
-static int cbm_upsert_session_hooks(const char *settings_path) {
+int cbm_upsert_claude_session_hooks(const char *settings_path) {
     static const char *matchers[] = {"startup", "resume", "clear", "compact"};
+    enum { MATCHER_COUNT = sizeof(matchers) / sizeof(matchers[0]) };
     char command[CLI_BUF_1K];
     cbm_resolve_hook_command(CMM_SESSION_REMINDER_SCRIPT, command, sizeof(command));
     int rc = 0;
-    for (int i = 0; i < NUM_DIRS; i++) {
+    for (int i = 0; i < MATCHER_COUNT; i++) {
         if (upsert_hooks_json((hooks_upsert_args_t){.settings_path = settings_path,
                                                     .hook_event = "SessionStart",
                                                     .matcher_str = matchers[i],
@@ -2159,10 +2159,11 @@ static int cbm_upsert_session_hooks(const char *settings_path) {
     return rc;
 }
 
-static int cbm_remove_session_hooks(const char *settings_path) {
+int cbm_remove_claude_session_hooks(const char *settings_path) {
     static const char *matchers[] = {"startup", "resume", "clear", "compact"};
+    enum { MATCHER_COUNT = sizeof(matchers) / sizeof(matchers[0]) };
     int rc = 0;
-    for (int i = 0; i < NUM_DIRS; i++) {
+    for (int i = 0; i < MATCHER_COUNT; i++) {
         if (remove_hooks_json((hooks_remove_args_t){.settings_path = settings_path,
                                                     .hook_event = "SessionStart",
                                                     .matcher_str = matchers[i]}) != 0) {
@@ -3753,7 +3754,7 @@ static void install_claude_code_config(const char *home, const char *binary_path
         cbm_upsert_claude_hooks(settings_path);
         cbm_install_hook_gate_script(home, binary_path);
         cbm_install_session_reminder_script(home);
-        cbm_upsert_session_hooks(settings_path);
+        cbm_upsert_claude_session_hooks(settings_path);
     }
     printf("  hooks: PreToolUse (Grep/Glob search-graph augmenter, non-blocking)\n");
     printf("  hooks: SessionStart (MCP usage reminder on startup/resume/clear/compact)\n");
@@ -4282,7 +4283,7 @@ static void uninstall_claude_code(const char *home, bool dry_run) {
     snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
     if (!dry_run) {
         cbm_remove_claude_hooks(settings_path);
-        cbm_remove_session_hooks(settings_path);
+        cbm_remove_claude_session_hooks(settings_path);
     }
     printf("  removed PreToolUse + SessionStart hooks\n");
 }
