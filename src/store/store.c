@@ -149,6 +149,8 @@ struct cbm_store {
     sqlite3_stmt *stmt_upsert_edge_owner;
     sqlite3_stmt *stmt_delete_node_owners_by_file;
     sqlite3_stmt *stmt_delete_edge_owners_by_file;
+    sqlite3_stmt *stmt_count_node_owners_by_file;
+    sqlite3_stmt *stmt_count_edge_owners_by_file;
     sqlite3_stmt *stmt_upsert_symbol_export;
     sqlite3_stmt *stmt_delete_symbol_exports_by_file;
     sqlite3_stmt *stmt_list_symbol_exports_by_file;
@@ -1046,6 +1048,8 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_upsert_edge_owner);
     finalize_stmt(&s->stmt_delete_node_owners_by_file);
     finalize_stmt(&s->stmt_delete_edge_owners_by_file);
+    finalize_stmt(&s->stmt_count_node_owners_by_file);
+    finalize_stmt(&s->stmt_count_edge_owners_by_file);
     finalize_stmt(&s->stmt_upsert_symbol_export);
     finalize_stmt(&s->stmt_delete_symbol_exports_by_file);
     finalize_stmt(&s->stmt_list_symbol_exports_by_file);
@@ -2125,6 +2129,65 @@ int cbm_store_delete_edge_owners_by_file(cbm_store_t *s, const char *project,
         return CBM_STORE_ERR;
     }
     return CBM_STORE_OK;
+}
+
+static int store_count_file_owner_rows(cbm_store_t *s, sqlite3_stmt **slot, const char *sql,
+                                       const char *project, const char *rel_path,
+                                       const char *op, int *out_count) {
+    if (out_count) {
+        *out_count = 0;
+    }
+    if (!s || !project || !rel_path || !out_count) {
+        if (s) {
+            store_set_error(s, "count_file_owner_rows: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = prepare_cached(s, slot, sql);
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+    int step = sqlite3_step(stmt);
+    if (step != SQLITE_ROW) {
+        store_set_error_sqlite(s, op);
+        return CBM_STORE_ERR;
+    }
+    *out_count = sqlite3_column_int(stmt, 0);
+    return CBM_STORE_OK;
+}
+
+int cbm_store_count_file_delta_owners(cbm_store_t *s, const char *project,
+                                      const char *rel_path, int *out_node_owners,
+                                      int *out_edge_owners) {
+    static const char node_sql[] =
+        "SELECT COUNT(*) FROM node_owners WHERE project = ?1 AND rel_path = ?2;";
+    static const char edge_sql[] =
+        "SELECT COUNT(*) FROM edge_owners WHERE project = ?1 AND rel_path = ?2;";
+    if (!s || !out_node_owners || !out_edge_owners) {
+        if (out_node_owners) {
+            *out_node_owners = 0;
+        }
+        if (out_edge_owners) {
+            *out_edge_owners = 0;
+        }
+        if (s) {
+            store_set_error(s, "count_file_delta_owners: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+    int rc = store_count_file_owner_rows(s, &s->stmt_count_node_owners_by_file, node_sql, project,
+                                         rel_path, "count_node_owners_by_file", out_node_owners);
+    if (rc != CBM_STORE_OK) {
+        if (out_edge_owners) {
+            *out_edge_owners = 0;
+        }
+        return rc;
+    }
+    return store_count_file_owner_rows(s, &s->stmt_count_edge_owners_by_file, edge_sql, project,
+                                       rel_path, "count_edge_owners_by_file", out_edge_owners);
 }
 
 int cbm_store_upsert_symbol_export(cbm_store_t *s, const char *project,

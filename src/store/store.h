@@ -494,7 +494,11 @@ int cbm_store_delete_node_owners_by_file(cbm_store_t *s, const char *project,
                                          const char *rel_path);
 
 int cbm_store_delete_edge_owners_by_file(cbm_store_t *s, const char *project,
-                                         const char *rel_path);
+                                          const char *rel_path);
+
+int cbm_store_count_file_delta_owners(cbm_store_t *s, const char *project,
+                                      const char *rel_path, int *out_node_owners,
+                                      int *out_edge_owners);
 
 int cbm_store_upsert_symbol_export(cbm_store_t *s, const char *project,
                                    const char *qualified_name, const char *rel_path,

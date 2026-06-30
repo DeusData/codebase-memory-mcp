@@ -3214,6 +3214,39 @@ static void pipeline_delta_attach_test_metadata(cbm_pipeline_file_delta_t *delta
     delta->delta.file_state = state;
 }
 
+static int pipeline_delta_seed_existing_ownership(cbm_store_t *s, const char *project,
+                                                  const char *rel_path,
+                                                  const char *qualified_name) {
+    enum { PIPELINE_DELTA_TEST_BASE_GENERATION = 1 };
+    cbm_node_t node = {.project = (char *)project,
+                       .label = "Function",
+                       .name = "Existing",
+                       .qualified_name = (char *)qualified_name,
+                       .file_path = (char *)rel_path,
+                       .start_line = 1,
+                       .end_line = 1,
+                       .properties_json = "{}"};
+    int64_t node_id = cbm_store_upsert_node(s, &node);
+    if (node_id <= CBM_STORE_NO_NODE_ID) {
+        return CBM_STORE_ERR;
+    }
+    cbm_file_state_t state = {.project = (char *)project,
+                              .rel_path = (char *)rel_path,
+                              .content_hash = "base-content",
+                              .git_oid = "",
+                              .mtime_ns = 1,
+                              .size = 10,
+                              .language = "go",
+                              .pass_fingerprint = "test-pass",
+                              .generation = PIPELINE_DELTA_TEST_BASE_GENERATION,
+                              .indexed_at = "2026-06-30T00:00:00Z"};
+    if (cbm_store_upsert_file_state(s, &state) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    return cbm_store_upsert_node_owner(s, project, node_id, rel_path,
+                                       PIPELINE_DELTA_TEST_BASE_GENERATION);
+}
+
 TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths) {
     const char *project = "test";
     const char *changed_paths[] = {"main.go"};
@@ -3280,6 +3313,9 @@ TEST(pipeline_file_delta_scratch_seed_supports_external_endpoint_descriptor) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
     ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, changed_paths[0],
+                                                     "test.main.Old"),
+              CBM_STORE_OK);
 
     cbm_node_t helper = {.project = (char *)project,
                          .label = "Function",
@@ -3463,6 +3499,8 @@ TEST(pipeline_file_delta_plan_candidate_from_frontier) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
     ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, "test", "lib.go", "test.lib.Old"),
+              CBM_STORE_OK);
 
     cbm_store_symbol_export_t exports[1] = {
         {.qualified_name = "test.lib.Value", .node_id = CBM_STORE_NO_NODE_ID}};
@@ -3489,6 +3527,8 @@ TEST(pipeline_file_delta_apply_falls_back_on_publish_error) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
     ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, "test", "lib.go", "test.lib.Old"),
+              CBM_STORE_OK);
 
     cbm_node_t nodes[1] = {{.project = "test",
                             .label = "Function",
@@ -3516,6 +3556,26 @@ TEST(pipeline_file_delta_apply_falls_back_on_publish_error) {
     ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
     ASSERT_STR_EQ(plan.reason, "publish_error");
     ASSERT_EQ(pipeline_delta_store_qn_exists(s, "test", "test.lib.Value"), 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_without_existing_ownership) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = "test", .rel_path = "main.go"}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "missing_existing_ownership");
+    ASSERT_EQ(plan.affected_count, 0);
 
     cbm_pipeline_file_delta_plan_free(&plan);
     cbm_store_close(s);
@@ -3619,6 +3679,8 @@ TEST(pipeline_file_delta_plan_falls_back_on_unresolved_edge_endpoint) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
     ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, "test", "main.go", "test.main.Old"),
+              CBM_STORE_OK);
     cbm_node_t nodes[1] = {{.project = "test",
                             .label = "Function",
                             .name = "Run",
@@ -3656,6 +3718,8 @@ TEST(pipeline_file_delta_plan_accepts_resolved_external_edge_endpoint) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
     ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, "test", "main.go", "test.main.Old"),
+              CBM_STORE_OK);
     cbm_node_t helper = {.project = "test",
                          .label = "Function",
                          .name = "Helper",
@@ -3702,6 +3766,8 @@ TEST(pipeline_file_delta_plan_falls_back_on_large_frontier) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
     ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, "test", "lib.go", "test.lib.Old"),
+              CBM_STORE_OK);
     ASSERT_EQ(cbm_store_upsert_symbol_export(s, "test", "test.lib.Hot", "lib.go",
                                              CBM_STORE_NO_NODE_ID, 1),
               CBM_STORE_OK);
@@ -8258,6 +8324,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_metadata_from_file);
     RUN_TEST(pipeline_file_delta_plan_candidate_from_frontier);
     RUN_TEST(pipeline_file_delta_apply_falls_back_on_publish_error);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_without_existing_ownership);
     RUN_TEST(pipeline_file_delta_plan_falls_back_without_file_metadata);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unsupported_edges);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_delete);
