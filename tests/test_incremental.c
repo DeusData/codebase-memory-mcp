@@ -11,7 +11,10 @@
  * Requires network access for initial clone. Skips gracefully if offline.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
+#include "../src/foundation/constants.h"
 #include "test_framework.h"
+#include "test_graph_diff.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
 #include <mcp/mcp.h>
@@ -19,6 +22,7 @@
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
 #include <foundation/mem.h>
+#include <foundation/platform.h>
 /* Forward decl (foundation/platform.c): honors CBM_CACHE_DIR so the test reads
  * the index from the same dir the pipeline writes it (needed for isolation). */
 const char *cbm_resolve_cache_dir(void);
@@ -55,6 +59,8 @@ enum {
     INCR_ACCURACY_EDGE_TOLERANCE = 50,
     INCR_ACCURACY_CALL_TOLERANCE = 2,
 };
+
+static const char *INCR_TEST_ARTIFACT_ENV = "CBM_TEST_ARTIFACT_DIR";
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
@@ -158,6 +164,52 @@ static int count_in_response(const char *resp, const char *key) {
 
 static cbm_store_t *open_store(void) {
     return cbm_store_open_path(g_dbpath);
+}
+
+static int dump_current_store_to_file(const char *dest_path) {
+    cbm_store_t *s = open_store();
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    int rc = cbm_store_dump_to_file(s, dest_path);
+    cbm_store_close(s);
+    return rc;
+}
+
+static int dump_store_file_to_file(const char *src_path, const char *dest_path) {
+    cbm_store_t *s = cbm_store_open_path(src_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    int rc = cbm_store_dump_to_file(s, dest_path);
+    cbm_store_close(s);
+    return rc;
+}
+
+static void preserve_accuracy_artifacts(const char *incr_snapshot_path, const char *reason) {
+    char artifact_dir[CBM_SZ_512];
+    const char *dir =
+        cbm_safe_getenv(INCR_TEST_ARTIFACT_ENV, artifact_dir, sizeof(artifact_dir), cbm_tmpdir());
+    if (!dir || dir[0] == '\0') {
+        dir = cbm_tmpdir();
+    }
+
+    char incr_out[CBM_SZ_1K];
+    char full_out[CBM_SZ_1K];
+    int pid = (int)getpid();
+    int n1 = snprintf(incr_out, sizeof(incr_out), "%s/cbm-incr-accuracy-%d-incremental.db", dir,
+                      pid);
+    int n2 = snprintf(full_out, sizeof(full_out), "%s/cbm-incr-accuracy-%d-full.db", dir, pid);
+    if (n1 <= 0 || n2 <= 0 || (size_t)n1 >= sizeof(incr_out) ||
+        (size_t)n2 >= sizeof(full_out)) {
+        printf("    [accuracy:artifacts] skipped: artifact path too long\n");
+        return;
+    }
+
+    int incr_rc = dump_store_file_to_file(incr_snapshot_path, incr_out);
+    int full_rc = dump_current_store_to_file(full_out);
+    printf("    [accuracy:artifacts] reason=%s incremental=%s rc=%d full=%s rc=%d\n",
+           reason ? reason : "canonical-diff", incr_out, incr_rc, full_out, full_rc);
 }
 
 static int get_node_count(void) {
@@ -360,7 +412,7 @@ static int incremental_setup(void) {
     snprintf(cache_dir, sizeof(cache_dir), "%s", cdir);
     cbm_mkdir(cache_dir);
 
-    unlink(g_dbpath);
+    cbm_unlink(g_dbpath);
 
     g_srv = cbm_mcp_server_new(NULL);
     if (!g_srv)
@@ -926,6 +978,14 @@ TEST(incr_accuracy_vs_full) {
     capture_accuracy_edge_counts(incr_type_counts);
     handle_breakdown_t incr_handles = capture_handle_breakdown();
 
+    char incr_snapshot_path[CBM_SZ_512];
+    int snap_len = snprintf(incr_snapshot_path, sizeof(incr_snapshot_path),
+                            "%s/incr_accuracy_incremental.db", g_tmpdir);
+    ASSERT_GT(snap_len, 0);
+    ASSERT_LT((size_t)snap_len, sizeof(incr_snapshot_path));
+    cbm_unlink(incr_snapshot_path);
+    ASSERT_EQ(dump_current_store_to_file(incr_snapshot_path), CBM_STORE_OK);
+
     /* Delete DB, force full reindex */
     unlink(g_dbpath);
     resp = index_repo();
@@ -939,21 +999,40 @@ TEST(incr_accuracy_vs_full) {
     capture_accuracy_edge_counts(full_type_counts);
     handle_breakdown_t full_handles = capture_handle_breakdown();
 
-    /* Full and incremental should agree exactly on nodes/CALLS and stay within
-     * the named derived-edge tolerance while route reconciliation is refined. */
-    ASSERT_LTE(abs(full_nodes - incr_nodes), INCR_ACCURACY_NODE_TOLERANCE);
+    /* Counts remain useful diagnostics, but canonical graph equality below is
+     * the pass/fail contract. */
+    if (abs(full_nodes - incr_nodes) > INCR_ACCURACY_NODE_TOLERANCE) {
+        printf("    [accuracy:nodes] incr=%d full=%d delta=%+d\n", incr_nodes, full_nodes,
+               incr_nodes - full_nodes);
+    }
     if (abs(full_edges - incr_edges) > INCR_ACCURACY_EDGE_TOLERANCE) {
         print_accuracy_edge_diff(incr_type_counts, full_type_counts);
         print_handle_breakdown("incr", incr_handles);
         print_handle_breakdown("full", full_handles);
-        ASSERT_LTE(abs(full_edges - incr_edges), INCR_ACCURACY_EDGE_TOLERANCE);
     }
-    ASSERT_LTE(abs(full_calls - incr_calls), INCR_ACCURACY_CALL_TOLERANCE);
+    if (abs(full_calls - incr_calls) > INCR_ACCURACY_CALL_TOLERANCE) {
+        printf("    [accuracy:calls] incr=%d full=%d delta=%+d\n", incr_calls, full_calls,
+               incr_calls - full_calls);
+    }
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int graph_diff_rc =
+        cbm_test_compare_canonical_graphs(incr_snapshot_path, g_dbpath, g_project, diff_err,
+                                          sizeof(diff_err));
+    if (graph_diff_rc != 0) {
+        print_accuracy_edge_diff(incr_type_counts, full_type_counts);
+        print_handle_breakdown("incr", incr_handles);
+        print_handle_breakdown("full", full_handles);
+        printf("    [accuracy:canonical-diff] %s\n", diff_err);
+        preserve_accuracy_artifacts(incr_snapshot_path, "canonical-diff");
+    }
 
     printf("    [accuracy] incr: %d nodes/%d edges, full: %d nodes/%d edges\n", incr_nodes,
            incr_edges, full_nodes, full_edges);
 
     delete_file_at("fastapi/incr_accuracy.py");
+    cbm_unlink(incr_snapshot_path);
+    ASSERT_EQ(graph_diff_rc, 0);
     PASS();
 }
 

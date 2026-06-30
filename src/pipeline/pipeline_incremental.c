@@ -560,7 +560,7 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
 }
 
 /* Run parallel or sequential extract+resolve for changed files. */
-static void run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci) {
+static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci) {
     struct timespec t;
 
     /* Per-file LSP always runs (every mode). Cross-file LSP stays disabled in
@@ -580,16 +580,38 @@ static void run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *change
 
         CBMFileResult **cache = (CBMFileResult **)calloc(ci, sizeof(CBMFileResult *));
         if (cache) {
+            int rc = 0;
             cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-            cbm_parallel_extract(ctx, changed_files, ci, cache, &shared_ids, worker_count);
+            rc = cbm_parallel_extract(ctx, changed_files, ci, cache, &shared_ids, worker_count);
             cbm_gbuf_set_next_id(ctx->gbuf, atomic_load(&shared_ids));
             cbm_log_info("pass.timing", "pass", "incr_extract", "elapsed_ms",
                          itoa_buf_incr((int)elapsed_ms_incr(t)));
+            if (rc != 0) {
+                cbm_log_error("incremental.err", "phase", "incr_extract", "rc", itoa_buf_incr(rc));
+                for (int j = 0; j < ci; j++) {
+                    if (cache[j]) {
+                        cbm_free_result(cache[j]);
+                    }
+                }
+                free(cache);
+                return rc;
+            }
 
             cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-            cbm_build_registry_from_cache(ctx, changed_files, ci, cache);
+            rc = cbm_build_registry_from_cache(ctx, changed_files, ci, cache);
             cbm_log_info("pass.timing", "pass", "incr_registry", "elapsed_ms",
                          itoa_buf_incr((int)elapsed_ms_incr(t)));
+            if (rc != 0) {
+                cbm_log_error("incremental.err", "phase", "incr_registry", "rc",
+                              itoa_buf_incr(rc));
+                for (int j = 0; j < ci; j++) {
+                    if (cache[j]) {
+                        cbm_free_result(cache[j]);
+                    }
+                }
+                free(cache);
+                return rc;
+            }
 
             /* Incremental skips cross-file LSP precondition build — it
              * would need all_defs from the full project, not just the
@@ -598,9 +620,9 @@ static void run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *change
              * next full re-index. Pass NULL/0/NULL to make the fused
              * step in resolve_worker a no-op. */
             cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-            cbm_parallel_resolve(ctx, changed_files, ci, cache, &shared_ids, worker_count, NULL, 0,
-                                 NULL, NULL /* module_def_index */,
-                                 NULL /* cross_registries — incremental skips Tier 2 prebuild */);
+            rc = cbm_parallel_resolve(ctx, changed_files, ci, cache, &shared_ids, worker_count,
+                                      NULL, 0, NULL, NULL /* module_def_index */,
+                                      NULL /* cross_registries — incremental skips Tier 2 prebuild */);
             cbm_gbuf_set_next_id(ctx->gbuf, atomic_load(&shared_ids));
             cbm_log_info("pass.timing", "pass", "incr_resolve", "elapsed_ms",
                          itoa_buf_incr((int)elapsed_ms_incr(t)));
@@ -611,32 +633,63 @@ static void run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *change
                 }
             }
             free(cache);
+            if (rc != 0) {
+                cbm_log_error("incremental.err", "phase", "incr_resolve", "rc",
+                              itoa_buf_incr(rc));
+                return rc;
+            }
+        } else {
+            cbm_log_error("incremental.err", "phase", "incr_cache_alloc");
+            return CBM_NOT_FOUND;
         }
     } else {
+        int rc = 0;
         cbm_log_info("incremental.mode", "mode", "sequential", "changed", itoa_buf_incr(ci));
-        cbm_pipeline_pass_definitions(ctx, changed_files, ci);
-        cbm_pipeline_pass_calls(ctx, changed_files, ci);
-        cbm_pipeline_pass_usages(ctx, changed_files, ci);
-        cbm_pipeline_pass_semantic(ctx, changed_files, ci);
+        rc = cbm_pipeline_pass_definitions(ctx, changed_files, ci);
+        if (rc != 0) {
+            cbm_log_error("incremental.err", "phase", "incr_definitions", "rc",
+                          itoa_buf_incr(rc));
+            return rc;
+        }
+        rc = cbm_pipeline_pass_calls(ctx, changed_files, ci);
+        if (rc != 0) {
+            cbm_log_error("incremental.err", "phase", "incr_calls", "rc", itoa_buf_incr(rc));
+            return rc;
+        }
+        rc = cbm_pipeline_pass_usages(ctx, changed_files, ci);
+        if (rc != 0) {
+            cbm_log_error("incremental.err", "phase", "incr_usages", "rc", itoa_buf_incr(rc));
+            return rc;
+        }
+        rc = cbm_pipeline_pass_semantic(ctx, changed_files, ci);
+        if (rc != 0) {
+            cbm_log_error("incremental.err", "phase", "incr_semantic", "rc", itoa_buf_incr(rc));
+            return rc;
+        }
     }
+    return 0;
 }
 
 /* Run post-extraction passes (tests, decorator tags, configlink). */
-static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci,
-                           const char *project) {
+static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci,
+                          const char *project) {
     struct timespec t;
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    cbm_pipeline_pass_tests(ctx, changed_files, ci);
+    int rc = cbm_pipeline_pass_tests(ctx, changed_files, ci);
     cbm_log_info("pass.timing", "pass", "incr_tests", "elapsed_ms", itoa_buf_incr((int)elapsed_ms_incr(t)));
+    if (rc != 0) {
+        cbm_log_error("incremental.err", "phase", "incr_tests", "rc", itoa_buf_incr(rc));
+        return rc;
+    }
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    cbm_pipeline_pass_decorator_tags(ctx->gbuf, project);
+    (void)cbm_pipeline_pass_decorator_tags(ctx->gbuf, project);
     cbm_log_info("pass.timing", "pass", "incr_decorator_tags", "elapsed_ms",
                  itoa_buf_incr((int)elapsed_ms_incr(t)));
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    cbm_pipeline_pass_configlink(ctx);
+    (void)cbm_pipeline_pass_configlink(ctx);
     cbm_log_info("pass.timing", "pass", "incr_configlink", "elapsed_ms",
                  itoa_buf_incr((int)elapsed_ms_incr(t)));
 
@@ -655,15 +708,26 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
         cbm_gbuf_delete_edges_by_type(ctx->gbuf, "SEMANTICALLY_RELATED");
 
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-        cbm_pipeline_pass_similarity(ctx);
+        rc = cbm_pipeline_pass_similarity(ctx);
         cbm_log_info("pass.timing", "pass", "incr_similarity", "elapsed_ms",
                      itoa_buf_incr((int)elapsed_ms_incr(t)));
+        if (rc != 0) {
+            cbm_log_error("incremental.err", "phase", "incr_similarity", "rc",
+                          itoa_buf_incr(rc));
+            return rc;
+        }
 
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-        cbm_pipeline_pass_semantic_edges(ctx);
+        rc = cbm_pipeline_pass_semantic_edges(ctx);
         cbm_log_info("pass.timing", "pass", "incr_semantic_edges", "elapsed_ms",
                      itoa_buf_incr((int)elapsed_ms_incr(t)));
+        if (rc != 0) {
+            cbm_log_error("incremental.err", "phase", "incr_semantic_edges", "rc",
+                          itoa_buf_incr(rc));
+            return rc;
+        }
     }
+    return 0;
 }
 
 static const char *incremental_structure_root_qn(cbm_gbuf_t *gbuf, const char *project) {
@@ -680,16 +744,20 @@ static const char *incremental_structure_root_qn(cbm_gbuf_t *gbuf, const char *p
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
  * reindexes can correctly distinguish "never indexed" from "indexed but
  * not visited this pass". */
-static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
-                             cbm_file_info_t *files, int file_count,
-                             const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
-                             const char *repo_path) {
+static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
+                            cbm_file_info_t *files, int file_count,
+                            const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
+                            const char *repo_path) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
     int dump_rc = cbm_gbuf_dump_to_sqlite(gbuf, db_path);
     cbm_log_info("incremental.dump", "rc", itoa_buf_incr(dump_rc), "elapsed_ms",
                  itoa_buf_incr((int)elapsed_ms_incr(t)));
+    if (dump_rc != 0) {
+        cbm_log_error("incremental.err", "phase", "dump", "rc", itoa_buf_incr(dump_rc));
+        return dump_rc;
+    }
 
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {
@@ -710,12 +778,16 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
         }
 
         cbm_store_close(hash_store);
+    } else {
+        cbm_log_error("incremental.err", "phase", "hash_store_open");
+        return CBM_NOT_FOUND;
     }
 
     /* Auto-update artifact if one already exists (persistence was enabled previously) */
     if (repo_path && cbm_artifact_exists(repo_path)) {
         cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST);
     }
+    return 0;
 }
 
 /* ── Incremental pipeline entry point ────────────────────────────── */
@@ -779,26 +851,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     cbm_store_free_file_hashes(stored, stored_count);
 
-    /* Build list of changed files */
-    cbm_file_info_t *changed_files =
-        (n_changed > 0) ? malloc((size_t)n_changed * sizeof(cbm_file_info_t)) : NULL;
-    if (n_changed > 0 && !changed_files) {
-        cbm_log_error("incremental.err", "msg", "changed_files_oom");
-        free(is_changed);
-        free_deleted_paths(deleted, deleted_count);
-        free_mode_skipped(mode_skipped, mode_skipped_count);
-        cbm_store_close(store);
-        return CBM_NOT_FOUND;
-    }
+    cbm_file_info_t *changed_files = NULL;
     int ci = 0;
-    for (int i = 0; i < file_count; i++) {
-        if (is_changed[i]) {
-            changed_files[ci++] = files[i];
-        }
-    }
-    free(is_changed);
-
-    cbm_log_info("incremental.reparse", "files", itoa_buf_incr(ci));
 
     struct timespec t;
 
@@ -807,7 +861,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_gbuf_t *existing = cbm_gbuf_new(project, cbm_pipeline_repo_path(p));
     if (!existing) {
         cbm_log_error("incremental.err", "msg", "gbuf_new_oom");
-        free(changed_files);
+        free(is_changed);
         free_deleted_paths(deleted, deleted_count);
         free_mode_skipped(mode_skipped, mode_skipped_count);
         cbm_store_close(store);
@@ -822,7 +876,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     if (load_rc != 0) {
         cbm_log_error("incremental.err", "msg", "load_db_failed");
         cbm_gbuf_free(existing);
-        free(changed_files);
+        free(is_changed);
         free_deleted_paths(deleted, deleted_count);
         free_mode_skipped(mode_skipped, mode_skipped_count);
         cbm_store_close(store);
@@ -830,6 +884,24 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     }
 
     cbm_store_close(store);
+
+    changed_files = (n_changed > 0) ? malloc((size_t)n_changed * sizeof(cbm_file_info_t)) : NULL;
+    if (n_changed > 0 && !changed_files) {
+        cbm_log_error("incremental.err", "msg", "changed_files_oom");
+        free(is_changed);
+        cbm_gbuf_free(existing);
+        free_deleted_paths(deleted, deleted_count);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        return CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < file_count; i++) {
+        if (is_changed[i]) {
+            changed_files[ci++] = files[i];
+        }
+    }
+    free(is_changed);
+
+    cbm_log_info("incremental.reparse", "files", itoa_buf_incr(ci));
 
     /* Snapshot inbound cross-file edges into changed files BEFORE purging, so
      * the cascade delete doesn't permanently drop edges whose source lives in
@@ -887,6 +959,14 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     /* Step 3-5: Registry + extract + resolve */
     cbm_registry_t *registry = cbm_registry_new();
+    if (!registry) {
+        cbm_log_error("incremental.err", "msg", "registry_oom");
+        incr_free_edge_capture(&edge_cap);
+        cbm_gbuf_free(existing);
+        free(changed_files);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        return CBM_NOT_FOUND;
+    }
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     cbm_gbuf_foreach_node(existing, registry_visitor, registry);
     cbm_log_info("incremental.registry_seed", "symbols", itoa_buf_incr(cbm_registry_size(registry)),
@@ -910,18 +990,40 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     };
 
     const char *structure_root_qn = incremental_structure_root_qn(existing, project);
+    int pipeline_rc = 0;
     for (int i = 0; i < ci; i++) {
-        cbm_pipeline_ensure_file_structure(existing, project, structure_root_qn,
-                                           changed_files[i].rel_path, NULL);
+        pipeline_rc = cbm_pipeline_ensure_file_structure(existing, project, structure_root_qn,
+                                                         changed_files[i].rel_path, NULL);
+        if (pipeline_rc != 0) {
+            cbm_log_error("incremental.err", "phase", "ensure_file_structure", "rc",
+                          itoa_buf_incr(pipeline_rc));
+            break;
+        }
     }
 
-    run_extract_resolve(&ctx, changed_files, ci);
-    cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
-    run_postpasses(&ctx, changed_files, ci, project);
+    if (pipeline_rc == 0) {
+        pipeline_rc = run_extract_resolve(&ctx, changed_files, ci);
+    }
+    if (pipeline_rc == 0) {
+        pipeline_rc = cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
+        if (pipeline_rc != 0) {
+            cbm_log_error("incremental.err", "phase", "incr_k8s", "rc",
+                          itoa_buf_incr(pipeline_rc));
+        }
+    }
+    if (pipeline_rc == 0) {
+        pipeline_rc = run_postpasses(&ctx, changed_files, ci, project);
+    }
 
     free(changed_files);
-    cbm_registry_free(registry);
-    cbm_path_alias_collection_free(path_aliases);
+    if (pipeline_rc != 0) {
+        cbm_registry_free(registry);
+        cbm_path_alias_collection_free(path_aliases);
+        incr_free_edge_capture(&edge_cap);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        cbm_gbuf_free(existing);
+        return pipeline_rc;
+    }
 
     /* Re-link inbound cross-file edges that the purge orphaned. Runs after
      * re-resolution AND post-passes so the freshly re-created target nodes
@@ -933,6 +1035,30 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                  itoa_buf_incr(edge_cap.count), "elapsed_ms", itoa_buf_incr((int)elapsed_ms_incr(t)));
     incr_free_edge_capture(&edge_cap);
 
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    cbm_pipeline_pass_complexity(&ctx);
+    cbm_log_info("pass.timing", "pass", "incr_complexity", "elapsed_ms",
+                 itoa_buf_incr((int)elapsed_ms_incr(t)));
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    int httplink_rc = cbm_pipeline_pass_httplinks(&ctx);
+    cbm_log_info("pass.timing", "pass", "incr_httplinks", "elapsed_ms",
+                 itoa_buf_incr((int)elapsed_ms_incr(t)));
+    cbm_registry_free(registry);
+    cbm_path_alias_collection_free(path_aliases);
+    if (httplink_rc != 0) {
+        cbm_log_error("incremental.err", "phase", "incr_httplinks", "rc",
+                      itoa_buf_incr(httplink_rc));
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        cbm_gbuf_free(existing);
+        return httplink_rc;
+    }
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    cbm_pipeline_pass_normalize(existing);
+    cbm_log_info("pass.timing", "pass", "incr_normalize", "elapsed_ms",
+                 itoa_buf_incr((int)elapsed_ms_incr(t)));
+
     /* Step 7: Dump to disk (preserves mode-skipped hash rows so the next
      * reindex can correctly classify those files instead of seeing them
      * as never-existed; also exports a fast-mode artifact when one is
@@ -942,10 +1068,13 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * covers incremental reindexes, not just full ones. */
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
-    dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
-                     mode_skipped_count, cbm_pipeline_repo_path(p));
+    int persist_rc = dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
+                                      mode_skipped_count, cbm_pipeline_repo_path(p));
     free_mode_skipped(mode_skipped, mode_skipped_count);
     cbm_gbuf_free(existing);
+    if (persist_rc != 0) {
+        return persist_rc;
+    }
 
     cbm_log_info("incremental.done", "elapsed_ms", itoa_buf_incr((int)elapsed_ms_incr(t0)));
     return 0;

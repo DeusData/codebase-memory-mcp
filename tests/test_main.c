@@ -164,6 +164,7 @@ int main(void) {
         if (strstr("infrascan", only_suite)) RUN_SUITE(infrascan);
         if (strstr("watcher", only_suite)) RUN_SUITE(watcher);
         if (strstr("security", only_suite)) RUN_SUITE(security);
+        if (strstr("simhash", only_suite)) RUN_SUITE(simhash);
         if (strstr("artifact", only_suite)) RUN_SUITE(artifact);
         if (strstr("extraction", only_suite)) RUN_SUITE(extraction);
         if (strstr("discover", only_suite)) RUN_SUITE(discover);

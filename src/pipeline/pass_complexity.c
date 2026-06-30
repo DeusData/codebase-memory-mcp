@@ -7,8 +7,9 @@
  * *transitive* nested-loop degree: a function with a depth-1 loop that calls an
  * O(n) helper is effectively O(n^2). The estimate assumes calls may occur inside
  * loops (an upper bound) — it is a queryable bottleneck *candidate* signal, not a
- * proof (true big-O is undecidable; cf. SPEED / Loopus). Cycles in the call graph
- * are broken and flagged via a `recursive` property.
+ * proof (true big-O is undecidable; cf. SPEED / Loopus). Recursive cycles are
+ * collapsed into strongly connected components before propagation so full and
+ * incremental runs do not depend on transient node or edge visitation order.
  *
  * Writes two extra node properties: transitive_loop_depth, recursive.
  */
@@ -20,13 +21,17 @@
 #include "foundation/platform.h"
 #include "foundation/compat.h"
 #include "cbm.h"
+#include "yyjson/yyjson.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
 
-enum { CBM_TLD_MAX_DEPTH = 256 }; /* recursion-depth cap (cycle/stack guard) */
+enum {
+    CBM_TLD_MAX_DEPTH = 256, /* recursion-depth cap (stack guard on condensed DAG) */
+    CBM_SCC_ADJ_INIT_CAP = CBM_SZ_4,
+};
 
 /* Int → string for structured logging (thread-safe ring buffer). */
 static const char *itoa_cx(int val) {
@@ -75,72 +80,53 @@ static bool json_get_bool(const char *json, const char *key) {
     return *p == 't';
 }
 
-/* Append transitive_loop_depth + recursive to a node's properties JSON object. */
-static void append_complexity_props(cbm_gbuf_node_t *node, int tld, bool recursive) {
+/* Set transitive_loop_depth + recursive on a node's properties JSON object. */
+static void set_complexity_props(cbm_gbuf_node_t *node, int tld, bool recursive) {
     const char *old = node->properties_json ? node->properties_json : "{}";
-    size_t olen = strlen(old);
-    if (olen < 2 || old[olen - 1] != '}') {
-        return; /* not a JSON object — leave untouched */
-    }
-    bool empty = (olen == 2); /* "{}" */
-    char *neu = malloc(olen + CBM_SZ_64);
-    if (!neu) {
+    yyjson_doc *doc = yyjson_read(old, strlen(old), 0);
+    if (!doc) {
         return;
     }
-    memcpy(neu, old, olen - 1); /* copy without trailing '}' */
-    int w =
-        snprintf(neu + (olen - 1), CBM_SZ_64, "%s\"transitive_loop_depth\":%d,\"recursive\":%s}",
-                 empty ? "" : ",", tld, recursive ? "true" : "false");
-    if (w < 0) {
-        free(neu);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (!root || !yyjson_is_obj(root)) {
+        yyjson_doc_free(doc);
+        return;
+    }
+    yyjson_mut_doc *mdoc = yyjson_doc_mut_copy(doc, NULL);
+    yyjson_doc_free(doc);
+    if (!mdoc) {
+        return;
+    }
+    yyjson_mut_val *mroot = yyjson_mut_doc_get_root(mdoc);
+    if (!mroot || !yyjson_mut_is_obj(mroot)) {
+        yyjson_mut_doc_free(mdoc);
+        return;
+    }
+    (void)yyjson_mut_obj_remove_key(mroot, "transitive_loop_depth");
+    (void)yyjson_mut_obj_remove_key(mroot, "recursive");
+    if (!yyjson_mut_obj_add_int(mdoc, mroot, "transitive_loop_depth", tld) ||
+        !yyjson_mut_obj_add_bool(mdoc, mroot, "recursive", recursive)) {
+        yyjson_mut_doc_free(mdoc);
+        return;
+    }
+    char *neu = yyjson_mut_write(mdoc, 0, NULL);
+    yyjson_mut_doc_free(mdoc);
+    if (!neu) {
         return;
     }
     free(node->properties_json);
     node->properties_json = neu;
 }
 
-/* Memoized DFS: tld(id) = loop_depth(id) + max over CALLS-callees of tld(callee).
- * state: 0=unvisited, 1=in-progress (back-edge → cycle), 2=done. */
-static int tld_dfs(const cbm_gbuf_t *gb, int64_t id, const int *loop_depth, int *tld, char *state,
-                   bool *recursive, int64_t maxid, int depth) {
-    if (id < 1 || id > maxid) {
-        return 0;
-    }
-    if (state[id] == 2) {
-        return tld[id];
-    }
-    if (state[id] == 1) {
-        recursive[id] = true; /* back edge → call-graph cycle */
-        return 0;
-    }
-    if (depth > CBM_TLD_MAX_DEPTH) {
-        return loop_depth[id];
-    }
-    state[id] = 1;
-    int best = 0;
-    const cbm_gbuf_edge_t **edges = NULL;
-    int ne = 0;
-    cbm_gbuf_find_edges_by_source_type(gb, id, "CALLS", &edges, &ne);
-    for (int i = 0; i < ne; i++) {
-        int64_t c = edges[i]->target_id;
-        if (c == id) {
-            recursive[id] = true; /* direct self-recursion */
-            continue;
-        }
-        int ct = tld_dfs(gb, c, loop_depth, tld, state, recursive, maxid, depth + 1);
-        if (ct > best) {
-            best = ct;
-        }
-    }
-    tld[id] = loop_depth[id] + best;
-    state[id] = 2;
-    return tld[id];
-}
+typedef struct {
+    int *targets;
+    int count;
+    int cap;
+} scc_adj_t;
 
 /* Seed each Function/Method node's loop_depth and self_recursive flag, and
- * remember the node pointer for write-back. The self_recursive seed (set at
- * extraction) feeds the final recursive flag; tld_dfs additionally ORs in
- * mutual recursion discovered as a call-graph cycle. */
+ * remember the node pointer for write-back. SCC detection below ORs in mutual
+ * recursion discovered from CALLS cycles. */
 static void seed_loop_depths(const cbm_gbuf_t *gb, const char *label, int *loop_depth,
                              bool *recursive, cbm_gbuf_node_t **nptr, int64_t maxid) {
     const cbm_gbuf_node_t **nodes = NULL;
@@ -158,6 +144,202 @@ static void seed_loop_depths(const cbm_gbuf_t *gb, const char *label, int *loop_
     }
 }
 
+typedef struct {
+    const cbm_gbuf_t *gb;
+    cbm_gbuf_node_t **nptr;
+    int *index;
+    int *lowlink;
+    bool *on_stack;
+    int64_t *stack;
+    int stack_len;
+    int next_index;
+    int next_component;
+    bool *recursive;
+    int *component;
+    int64_t maxid;
+} recursion_scc_ctx_t;
+
+static void mark_scc_recursive(recursion_scc_ctx_t *ctx, int64_t root, int component_start,
+                               bool has_self_edge) {
+    int component_size = ctx->stack_len - component_start;
+    bool is_recursive = has_self_edge || component_size > 1;
+    int component_id = ctx->next_component++;
+    int64_t node_id = 0;
+    do {
+        node_id = ctx->stack[--ctx->stack_len];
+        ctx->on_stack[node_id] = false;
+        ctx->component[node_id] = component_id;
+        if (is_recursive) {
+            ctx->recursive[node_id] = true;
+        }
+    } while (node_id != root && ctx->stack_len > 0);
+}
+
+static void scc_visit(recursion_scc_ctx_t *ctx, int64_t id) {
+    ctx->index[id] = ctx->next_index;
+    ctx->lowlink[id] = ctx->next_index;
+    ctx->next_index++;
+    ctx->stack[ctx->stack_len++] = id;
+    ctx->on_stack[id] = true;
+
+    bool has_self_edge = false;
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    cbm_gbuf_find_edges_by_source_type(ctx->gb, id, "CALLS", &edges, &edge_count);
+    for (int i = 0; i < edge_count; i++) {
+        int64_t target = edges[i]->target_id;
+        if (target < 1 || target > ctx->maxid || !ctx->nptr[target]) {
+            continue;
+        }
+        if (target == id) {
+            has_self_edge = true;
+        }
+        if (ctx->index[target] == 0) {
+            scc_visit(ctx, target);
+            if (ctx->lowlink[target] < ctx->lowlink[id]) {
+                ctx->lowlink[id] = ctx->lowlink[target];
+            }
+        } else if (ctx->on_stack[target] && ctx->index[target] < ctx->lowlink[id]) {
+            ctx->lowlink[id] = ctx->index[target];
+        }
+    }
+
+    if (ctx->lowlink[id] == ctx->index[id]) {
+        int component_start = ctx->stack_len - 1;
+        while (component_start > 0 && ctx->stack[component_start] != id) {
+            component_start--;
+        }
+        mark_scc_recursive(ctx, id, component_start, has_self_edge);
+    }
+}
+
+static int mark_recursive_sccs(const cbm_gbuf_t *gb, cbm_gbuf_node_t **nptr, bool *recursive,
+                               int *component, int64_t maxid) {
+    size_t sz = (size_t)maxid + 1;
+    int *index = calloc(sz, sizeof(int));
+    int *lowlink = calloc(sz, sizeof(int));
+    bool *on_stack = calloc(sz, sizeof(bool));
+    int64_t *stack = calloc(sz, sizeof(int64_t));
+    if (!index || !lowlink || !on_stack || !stack) {
+        free(index);
+        free(lowlink);
+        free(on_stack);
+        free(stack);
+        return CBM_NOT_FOUND;
+    }
+
+    recursion_scc_ctx_t ctx = {
+        .gb = gb,
+        .nptr = nptr,
+        .index = index,
+        .lowlink = lowlink,
+        .on_stack = on_stack,
+        .stack = stack,
+        .stack_len = 0,
+        .next_index = 1,
+        .next_component = 0,
+        .recursive = recursive,
+        .component = component,
+        .maxid = maxid,
+    };
+    for (int64_t id = 1; id <= maxid; id++) {
+        if (nptr[id] && ctx.index[id] == 0) {
+            scc_visit(&ctx, id);
+        }
+    }
+
+    free(index);
+    free(lowlink);
+    free(on_stack);
+    free(stack);
+    return ctx.next_component;
+}
+
+static void free_scc_adj(scc_adj_t *adj, int count) {
+    if (!adj) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(adj[i].targets);
+    }
+    free(adj);
+}
+
+static int scc_adj_push(scc_adj_t *adj, int target) {
+    if (adj->count == adj->cap) {
+        int next_cap = adj->cap ? adj->cap * PAIR_LEN : CBM_SCC_ADJ_INIT_CAP;
+        int *next = realloc(adj->targets, (size_t)next_cap * sizeof(*next));
+        if (!next) {
+            return CBM_NOT_FOUND;
+        }
+        adj->targets = next;
+        adj->cap = next_cap;
+    }
+    adj->targets[adj->count++] = target;
+    return 0;
+}
+
+static scc_adj_t *build_scc_dag(const cbm_gbuf_t *gb, cbm_gbuf_node_t **nptr,
+                                const int *component, int component_count, int64_t maxid) {
+    scc_adj_t *adj = calloc((size_t)component_count, sizeof(*adj));
+    if (!adj) {
+        return NULL;
+    }
+    for (int64_t id = 1; id <= maxid; id++) {
+        if (!nptr[id]) {
+            continue;
+        }
+        int source_component = component[id];
+        if (source_component < 0 || source_component >= component_count) {
+            continue;
+        }
+        const cbm_gbuf_edge_t **edges = NULL;
+        int edge_count = 0;
+        cbm_gbuf_find_edges_by_source_type(gb, id, "CALLS", &edges, &edge_count);
+        for (int i = 0; i < edge_count; i++) {
+            int64_t target = edges[i]->target_id;
+            if (target < 1 || target > maxid || !nptr[target]) {
+                continue;
+            }
+            int target_component = component[target];
+            if (target_component < 0 || target_component >= component_count ||
+                target_component == source_component) {
+                continue;
+            }
+            if (scc_adj_push(&adj[source_component], target_component) != 0) {
+                free_scc_adj(adj, component_count);
+                return NULL;
+            }
+        }
+    }
+    return adj;
+}
+
+/* Propagate loop depth over the SCC-condensed call graph. SCC condensation
+ * converts recursive call cycles into DAG nodes, making the bound deterministic
+ * across full and incremental ID/order differences. */
+static int scc_tld_dfs(int component_id, const scc_adj_t *adj, const int *component_loop,
+                       int *component_tld, char *state, int depth) {
+    if (state[component_id] == 2) {
+        return component_tld[component_id];
+    }
+    if (state[component_id] == 1 || depth > CBM_TLD_MAX_DEPTH) {
+        return component_loop[component_id];
+    }
+    state[component_id] = 1;
+    int best = 0;
+    for (int i = 0; i < adj[component_id].count; i++) {
+        int child = adj[component_id].targets[i];
+        int child_tld = scc_tld_dfs(child, adj, component_loop, component_tld, state, depth + 1);
+        if (child_tld > best) {
+            best = child_tld;
+        }
+    }
+    component_tld[component_id] = component_loop[component_id] + best;
+    state[component_id] = 2;
+    return component_tld[component_id];
+}
+
 void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx) {
     cbm_gbuf_t *gb = ctx->gbuf;
     /* Node and edge IDs are drawn from one shared counter, so node IDs are NOT
@@ -169,39 +351,81 @@ void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx) {
     }
     size_t sz = (size_t)maxid + 1;
     int *loop_depth = calloc(sz, sizeof(int));
-    int *tld = calloc(sz, sizeof(int));
-    char *state = calloc(sz, sizeof(char));
     bool *recursive = calloc(sz, sizeof(bool));
     cbm_gbuf_node_t **nptr = calloc(sz, sizeof(cbm_gbuf_node_t *));
-    if (!loop_depth || !tld || !state || !recursive || !nptr) {
+    int *component = malloc(sz * sizeof(int));
+    if (!loop_depth || !recursive || !nptr || !component) {
         free(loop_depth);
-        free(tld);
-        free(state);
         free(recursive);
         free(nptr);
+        free(component);
         return;
+    }
+    for (int64_t id = 0; id <= maxid; id++) {
+        component[id] = CBM_NOT_FOUND;
     }
 
     seed_loop_depths(gb, "Function", loop_depth, recursive, nptr, maxid);
     seed_loop_depths(gb, "Method", loop_depth, recursive, nptr, maxid);
+    int component_count = mark_recursive_sccs(gb, nptr, recursive, component, maxid);
+    if (component_count <= 0) {
+        free(loop_depth);
+        free(recursive);
+        free(nptr);
+        free(component);
+        return;
+    }
+
+    scc_adj_t *adj = build_scc_dag(gb, nptr, component, component_count, maxid);
+    int *component_loop = calloc((size_t)component_count, sizeof(int));
+    int *component_tld = calloc((size_t)component_count, sizeof(int));
+    char *component_state = calloc((size_t)component_count, sizeof(char));
+    if (!adj || !component_loop || !component_tld || !component_state) {
+        free_scc_adj(adj, component_count);
+        free(component_loop);
+        free(component_tld);
+        free(component_state);
+        free(loop_depth);
+        free(recursive);
+        free(nptr);
+        free(component);
+        return;
+    }
+
+    for (int64_t id = 1; id <= maxid; id++) {
+        if (!nptr[id]) {
+            continue;
+        }
+        int component_id = component[id];
+        if (component_id >= 0 && loop_depth[id] > component_loop[component_id]) {
+            component_loop[component_id] = loop_depth[id];
+        }
+    }
+    for (int component_id = 0; component_id < component_count; component_id++) {
+        if (component_state[component_id] != 2) {
+            scc_tld_dfs(component_id, adj, component_loop, component_tld, component_state, 0);
+        }
+    }
 
     int updated = 0;
     for (int64_t id = 1; id <= maxid; id++) {
         if (!nptr[id]) {
             continue; /* only Function/Method nodes */
         }
-        if (state[id] != 2) {
-            tld_dfs(gb, id, loop_depth, tld, state, recursive, maxid, 0);
-        }
-        append_complexity_props(nptr[id], tld[id], recursive[id]);
+        int component_id = component[id];
+        int tld = component_id >= 0 ? component_tld[component_id] : loop_depth[id];
+        set_complexity_props(nptr[id], tld, recursive[id]);
         updated++;
     }
 
     cbm_log_info("pass.complexity", "functions", itoa_cx(updated));
 
+    free_scc_adj(adj, component_count);
+    free(component_loop);
+    free(component_tld);
+    free(component_state);
     free(loop_depth);
-    free(tld);
-    free(state);
     free(recursive);
     free(nptr);
+    free(component);
 }

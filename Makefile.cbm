@@ -914,6 +914,7 @@ lint-no-suppress:
 	fi
 	@echo "  Checking NOLINT(misc-no-recursion) against whitelist..."
 	@scripts/check-nolint-whitelist.sh
+	@bash scripts/check-source-safety.sh
 
 # All linters (run with make -j3 lint for parallel execution)
 lint: lint-tidy lint-cppcheck lint-format lint-no-suppress

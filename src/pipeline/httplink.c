@@ -1004,10 +1004,15 @@ int cbm_extract_go_routes(const char *name, const char *qn, const char *source,
                 /* Build prefix from chi stack */
                 route_chi_prefix[next_route][0] = '\0';
                 for (int s = 0; s < chi_top; s++) {
-                    int cur = (int)strlen(route_chi_prefix[next_route]);
-                    int pf = (int)strlen(chi_stack[s].prefix);
-                    if (cur + pf < HALF_BUF_GUARD) {
-                        strcat(route_chi_prefix[next_route], chi_stack[s].prefix);
+                    size_t cur = strlen(route_chi_prefix[next_route]);
+                    size_t remaining = sizeof(route_chi_prefix[next_route]) - cur;
+                    if (remaining <= 1) {
+                        break;
+                    }
+                    int written = snprintf(route_chi_prefix[next_route] + cur, remaining, "%s",
+                                           chi_stack[s].prefix);
+                    if (written < 0 || (size_t)written >= remaining) {
+                        break;
                     }
                 }
                 next_route++;

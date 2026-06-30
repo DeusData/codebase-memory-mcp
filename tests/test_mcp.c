@@ -2482,6 +2482,8 @@ TEST(server_handle_tools_call_missing_name) {
 #include <unistd.h>
 #include <signal.h>
 
+enum { MCP_STDIO_TEST_TIMEOUT_SECONDS = 5 };
+
 /* Signal handler used by alarm() to abort the test if it hangs */
 static void alarm_handler(int sig) {
     (void)sig;
@@ -2519,7 +2521,7 @@ TEST(mcp_server_run_rapid_messages) {
      * buffering fix: the first getline() over-reads kernel data into the
      * libc buffer; without the fix, subsequent poll() calls block for 60s.
      *
-     * We use alarm(5) to abort the test process if the server hangs. */
+     * We use alarm() to abort the test process if the server hangs. */
     int fds[2];
     ASSERT_EQ(pipe(fds), 0);
 
@@ -2543,7 +2545,7 @@ TEST(mcp_server_run_rapid_messages) {
 
     /* Install alarm to fail the test if cbm_mcp_server_run blocks */
     signal(SIGALRM, alarm_handler);
-    alarm(5);
+    alarm(MCP_STDIO_TEST_TIMEOUT_SECONDS);
 
     int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
 
@@ -2571,6 +2573,73 @@ TEST(mcp_server_run_rapid_messages) {
     PASS();
 }
 
+TEST(mcp_stdio_output_has_only_jsonrpc_messages) {
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+
+    const char *msgs = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+                       "\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{}}}\n"
+                       "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n";
+    ssize_t written = write(fds[1], msgs, strlen(msgs));
+    ASSERT_TRUE(written > 0);
+    close(fds[1]);
+
+    FILE *in_fp = fdopen(fds[0], "r");
+    ASSERT_NOT_NULL(in_fp);
+    FILE *out_fp = tmpfile();
+    ASSERT_NOT_NULL(out_fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    signal(SIGALRM, alarm_handler);
+    alarm(MCP_STDIO_TEST_TIMEOUT_SECONDS);
+    int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
+    alarm(0);
+    signal(SIGALRM, SIG_DFL);
+    ASSERT_EQ(rc, 0);
+
+    ASSERT_EQ(fseek(out_fp, 0, SEEK_END), 0);
+    long out_len = ftell(out_fp);
+    ASSERT_TRUE(out_len > 0);
+    rewind(out_fp);
+
+    char *buf = malloc((size_t)out_len + 1);
+    ASSERT_NOT_NULL(buf);
+    size_t nread = fread(buf, 1, (size_t)out_len, out_fp);
+    ASSERT_EQ(nread, (size_t)out_len);
+    buf[nread] = '\0';
+
+    int jsonrpc_lines = 0;
+    char *line = buf;
+    while (line && *line) {
+        char *next = strchr(line, '\n');
+        if (next) {
+            *next = '\0';
+        }
+        if (*line != '\0') {
+            ASSERT_EQ(line[0], '{');
+            ASSERT_NOT_NULL(strstr(line, "\"jsonrpc\":\"2.0\""));
+            size_t line_len = strlen(line);
+            while (line_len > 0 && (line[line_len - 1] == '\r' || line[line_len - 1] == ' ' ||
+                                    line[line_len - 1] == '\t')) {
+                line_len--;
+            }
+            ASSERT_TRUE(line_len > 0);
+            ASSERT_EQ(line[line_len - 1], '}');
+            jsonrpc_lines++;
+        }
+        line = next ? next + 1 : NULL;
+    }
+    ASSERT_EQ(jsonrpc_lines, 2);
+
+    free(buf);
+    cbm_mcp_server_free(srv);
+    fclose(out_fp);
+    fclose(in_fp);
+    PASS();
+}
+
 TEST(mcp_hidden_tools_reveal_sends_list_changed) {
     int fds[2];
     ASSERT_EQ(pipe(fds), 0);
@@ -2593,7 +2662,7 @@ TEST(mcp_hidden_tools_reveal_sends_list_changed) {
     ASSERT_NOT_NULL(srv);
 
     signal(SIGALRM, alarm_handler);
-    alarm(5);
+    alarm(MCP_STDIO_TEST_TIMEOUT_SECONDS);
     int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
     alarm(0);
     signal(SIGALRM, SIG_DFL);
@@ -2656,7 +2725,7 @@ TEST(mcp_hidden_tools_reveal_frames_list_changed) {
     ASSERT_NOT_NULL(srv);
 
     signal(SIGALRM, alarm_handler);
-    alarm(5);
+    alarm(MCP_STDIO_TEST_TIMEOUT_SECONDS);
     int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
     alarm(0);
     signal(SIGALRM, SIG_DFL);
@@ -2880,6 +2949,7 @@ SUITE(mcp) {
     /* Poll/getline FILE* buffering fix */
 #ifndef _WIN32
     RUN_TEST(mcp_server_run_rapid_messages);
+    RUN_TEST(mcp_stdio_output_has_only_jsonrpc_messages);
     RUN_TEST(mcp_hidden_tools_reveal_sends_list_changed);
     RUN_TEST(mcp_hidden_tools_reveal_frames_list_changed);
 #endif

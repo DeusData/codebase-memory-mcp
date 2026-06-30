@@ -1515,11 +1515,11 @@ static void kt_register_class_members(KotlinLSPContext *ctx, const char *class_q
                         const char **dq =
                             (const char **)cbm_arena_alloc(ctx->arena, 2 * sizeof(const char *));
                         if (dq) {
-                            char *tag = (char *)cbm_arena_alloc(
-                                ctx->arena, strlen("lambda_receiver:") + strlen(resolved) + 1);
+                            static const char lambda_receiver_prefix[] = "lambda_receiver:";
+                            size_t tag_len = strlen(lambda_receiver_prefix) + strlen(resolved) + 1;
+                            char *tag = (char *)cbm_arena_alloc(ctx->arena, tag_len);
                             if (tag) {
-                                strcpy(tag, "lambda_receiver:");
-                                strcat(tag, resolved);
+                                snprintf(tag, tag_len, "%s%s", lambda_receiver_prefix, resolved);
                                 dq[0] = tag;
                                 dq[1] = NULL;
                                 rf.decorator_qns = dq;

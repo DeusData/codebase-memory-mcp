@@ -1261,6 +1261,36 @@ static bool import_targetable_label(const char *label) {
     return false;
 }
 
+static int reexport_target_score(const cbm_gbuf_node_t *target, const char *owner_module_qn) {
+    if (!target || !target->qualified_name) {
+        return CBM_NOT_FOUND;
+    }
+    int score = cbm_str_common_dot_prefix_len(target->qualified_name, owner_module_qn);
+    if (!cbm_is_test_path(target->file_path)) {
+        score += CBM_RESOLUTION_NON_TEST_BONUS;
+    }
+    return score;
+}
+
+static bool reexport_target_better(const cbm_gbuf_node_t *candidate,
+                                   const cbm_gbuf_node_t *current,
+                                   const char *owner_module_qn) {
+    if (!candidate) {
+        return false;
+    }
+    if (!current) {
+        return true;
+    }
+    int candidate_score = reexport_target_score(candidate, owner_module_qn);
+    int current_score = reexport_target_score(current, owner_module_qn);
+    if (candidate_score != current_score) {
+        return candidate_score > current_score;
+    }
+    const char *candidate_qn = candidate->qualified_name ? candidate->qualified_name : "";
+    const char *current_qn = current->qualified_name ? current->qualified_name : "";
+    return strcmp(candidate_qn, current_qn) < 0;
+}
+
 /* Resolve a sibling-file import: a bare path/name (no leading "./") that names
  * a file relative to the importer's directory.  This covers build/markup
  * grammars whose import string is a sibling filename or directory rather than a
@@ -1338,6 +1368,103 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
     return found;
 }
 
+static bool import_edge_local_name_equals(const cbm_gbuf_edge_t *edge, const char *local_name) {
+    if (!edge || !edge->properties_json || !local_name || !local_name[0]) {
+        return false;
+    }
+    static const char key[] = "\"local_name\":\"";
+    const char *start = strstr(edge->properties_json, key);
+    if (!start) {
+        return false;
+    }
+    start += sizeof(key) - 1;
+    const char *end = strchr(start, '"');
+    size_t len = end && end > start ? (size_t)(end - start) : 0;
+    return len == strlen(local_name) && strncmp(start, local_name, len) == 0;
+}
+
+static const cbm_gbuf_node_t *find_file_node_for_module_qn(const cbm_gbuf_t *gbuf,
+                                                           const char *module_qn) {
+    if (!gbuf || !module_qn || !module_qn[0]) {
+        return NULL;
+    }
+    char file_qn[PKGMAP_PATH_BUF];
+    int n = snprintf(file_qn, sizeof(file_qn), "%s.__file__", module_qn);
+    if (n <= 0 || (size_t)n >= sizeof(file_qn)) {
+        return NULL;
+    }
+    return cbm_gbuf_find_by_qn(gbuf, file_qn);
+}
+
+static const cbm_gbuf_node_t *resolve_reexported_symbol(const cbm_pipeline_ctx_t *ctx,
+                                                        const char *source_rel,
+                                                        const char *source_file_qn,
+                                                        const char *owner,
+                                                        const char *local_name) {
+    if (!ctx || !owner || !owner[0] || !local_name || !local_name[0] ||
+        strcmp(local_name, "*") == 0) {
+        return NULL;
+    }
+
+    char *owner_module_qn = cbm_pipeline_resolve_module(ctx, source_rel, owner);
+    const cbm_gbuf_node_t *owner_file = find_file_node_for_module_qn(ctx->gbuf, owner_module_qn);
+    if (!owner_file) {
+        free(owner_module_qn);
+        owner_module_qn = cbm_pipeline_fqn_module(ctx->project_name, owner);
+        owner_file = find_file_node_for_module_qn(ctx->gbuf, owner_module_qn);
+    }
+    if (!owner_file || (source_file_qn && owner_file->qualified_name &&
+                        strcmp(owner_file->qualified_name, source_file_qn) == 0)) {
+        free(owner_module_qn);
+        return NULL;
+    }
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    int rc = cbm_gbuf_find_edges_by_source_type(ctx->gbuf, owner_file->id, "IMPORTS", &edges,
+                                                &edge_count);
+    if (rc != 0 || edge_count == 0 || !edges) {
+        free(owner_module_qn);
+        return NULL;
+    }
+    const cbm_gbuf_node_t *best = NULL;
+    for (int i = 0; i < edge_count; i++) {
+        if (!import_edge_local_name_equals(edges[i], local_name)) {
+            continue;
+        }
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(ctx->gbuf, edges[i]->target_id);
+        if (target && import_targetable_label(target->label) &&
+            reexport_target_better(target, best, owner_module_qn)) {
+            best = target;
+        }
+    }
+    free(owner_module_qn);
+    return best;
+}
+
+static const cbm_gbuf_node_t *resolve_reexported_import(const cbm_pipeline_ctx_t *ctx,
+                                                        const char *source_rel,
+                                                        const char *source_file_qn,
+                                                        const char *module_path) {
+    if (!ctx || !module_path || !strchr(module_path, '.')) {
+        return NULL;
+    }
+
+    char owner[PKGMAP_PATH_BUF];
+    int n = snprintf(owner, sizeof(owner), "%s", module_path);
+    if (n <= 0 || (size_t)n >= sizeof(owner)) {
+        return NULL;
+    }
+    char *dot = strrchr(owner, '.');
+    if (!dot || dot == owner || dot[1] == '\0') {
+        return NULL;
+    }
+    const char *local_name = dot + 1;
+    *dot = '\0';
+
+    return resolve_reexported_symbol(ctx, source_rel, source_file_qn, owner, local_name);
+}
+
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
@@ -1351,6 +1478,20 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     char *target_qn = cbm_pipeline_resolve_module(ctx, source_rel, imp->module_path);
     const cbm_gbuf_node_t *target = target_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, target_qn) : NULL;
     free(target_qn);
+    if (target) {
+        return target;
+    }
+
+    /* Strategy 1a: package/module re-export. For `from fastapi import Body`,
+     * the direct QN `fastapi.Body` may not exist; follow the package file's
+     * own IMPORTS edge for local_name=Body before falling back to duplicate
+     * short-name matching. */
+    target = resolve_reexported_import(ctx, source_rel, source_file_qn, imp->module_path);
+    if (target) {
+        return target;
+    }
+    target = resolve_reexported_symbol(ctx, source_rel, source_file_qn, imp->module_path,
+                                       imp->local_name);
     if (target) {
         return target;
     }

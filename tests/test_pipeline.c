@@ -5,6 +5,7 @@
  * on a temporary directory with known file layout.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/constants.h"
 #include "foundation/platform.h" // cbm_normalize_path_sep (drive-canonicalization regression)
 #include "test_framework.h"
 #include "test_helpers.h"
@@ -14,6 +15,7 @@
 #include "cli/cli.h"
 #include "git/git_context.h"
 #include "foundation/dump_verify.h"
+#include "semantic/semantic.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -1732,6 +1734,81 @@ TEST(pipeline_python_cross_module_call) {
         cbm_store_free_edges(edges, ec);
     cbm_store_free_nodes(targets, tc);
     cbm_store_free_nodes(callers, clc);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_python_reexport_call_uses_resolved_import_edge) {
+    enum { REEXPORT_FILE_COUNT = 4 };
+    const char *files[] = {"fastapi/__init__.py", "fastapi/param_functions.py",
+                           "fastapi/openapi/models.py", "docs_src/app/main.py"};
+    const char *contents[] = {
+        "from .param_functions import Header\n",
+        "def Header(default=None):\n    return default\n",
+        "class Header:\n    pass\n",
+        ("from fastapi import Header\n\n"
+         "def create_item():\n    return Header(None)\n")};
+
+    if (setup_lang_repo(files, contents, REEXPORT_FILE_COUNT) != 0) {
+        FAIL("tmpdir");
+    }
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *callers = NULL;
+    int caller_count = 0;
+    cbm_store_find_nodes_by_name(s, proj, "create_item", &callers, &caller_count);
+    ASSERT_GT(caller_count, 0);
+
+    cbm_node_t *headers = NULL;
+    int header_count = 0;
+    cbm_store_find_nodes_by_name(s, proj, "Header", &headers, &header_count);
+    ASSERT_GT(header_count, 1);
+
+    int64_t expected_target_id = 0;
+    int64_t wrong_target_id = 0;
+    for (int i = 0; i < header_count; i++) {
+        const char *qn = headers[i].qualified_name ? headers[i].qualified_name : "";
+        if (strstr(qn, ".fastapi.param_functions.Header")) {
+            expected_target_id = headers[i].id;
+        } else if (strstr(qn, ".fastapi.openapi.models.Header")) {
+            wrong_target_id = headers[i].id;
+        }
+    }
+    ASSERT_GT(expected_target_id, 0);
+    ASSERT_GT(wrong_target_id, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_source_type(s, callers[0].id, "CALLS", &edges, &edge_count);
+    bool found_expected = false;
+    bool found_wrong = false;
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].target_id == expected_target_id) {
+            found_expected = true;
+        }
+        if (edges[i].target_id == wrong_target_id) {
+            found_wrong = true;
+        }
+    }
+    ASSERT_TRUE(found_expected);
+    ASSERT_FALSE(found_wrong);
+
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    cbm_store_free_nodes(headers, header_count);
+    cbm_store_free_nodes(callers, caller_count);
     cbm_store_close(s);
     cbm_pipeline_free(p);
     teardown_lang_repo();
@@ -5011,6 +5088,63 @@ TEST(pipeline_fastapi_depends_edges) {
     PASS();
 }
 
+TEST(import_reexport_falls_back_when_pkgmap_target_missing) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t openapi_header = cbm_gbuf_upsert_node(
+        gb, "Class", "Header", "proj.fastapi.openapi.models.Header", "fastapi/openapi/models.py", 1,
+        1, "{}");
+    int64_t package_file = cbm_gbuf_upsert_node(gb, "File", "__init__.py", "proj.fastapi.__file__",
+                                                "fastapi/__init__.py", 1, 1, "{}");
+    int64_t test_header = cbm_gbuf_upsert_node(
+        gb, "Class", "Header", "proj.tests.test_headers.Header", "tests/test_headers.py", 1, 1,
+        "{}");
+    int64_t exported_header = cbm_gbuf_upsert_node(
+        gb, "Function", "Header", "proj.fastapi.param_functions.Header", "fastapi/param_functions.py",
+        1, 1, "{}");
+    ASSERT_GT(openapi_header, 0);
+    ASSERT_GT(package_file, 0);
+    ASSERT_GT(test_header, 0);
+    ASSERT_GT(exported_header, 0);
+    cbm_gbuf_insert_edge(gb, package_file, test_header, "IMPORTS", "{\"local_name\":\"Header\"}");
+    cbm_gbuf_insert_edge(gb, package_file, exported_header, "IMPORTS", "{\"local_name\":\"Header\"}");
+
+    CBMHashTable *pkgmap = cbm_ht_create(CBM_SZ_16);
+    ASSERT_NOT_NULL(pkgmap);
+    cbm_ht_set(pkgmap, strdup("fastapi"), strdup("proj.src.fastapi.__init__"));
+    cbm_pipeline_set_pkgmap(pkgmap);
+
+    cbm_pipeline_ctx_t ctx = {
+        .gbuf = gb,
+        .project_name = "proj",
+    };
+    CBMImport imp = {
+        .local_name = "Header",
+        .module_path = "fastapi.Header",
+    };
+    const cbm_gbuf_node_t *target =
+        cbm_pipeline_resolve_import_node(&ctx, "docs_src/app/main.py",
+                                         "proj.docs_src.app.main.__file__", &imp, NULL);
+
+    ASSERT_NOT_NULL(target);
+    ASSERT_STR_EQ(target->qualified_name, "proj.fastapi.param_functions.Header");
+
+    CBMImport owner_imp = {
+        .local_name = "Header",
+        .module_path = "fastapi",
+    };
+    target = cbm_pipeline_resolve_import_node(&ctx, "docs_src/app/main.py",
+                                             "proj.docs_src.app.main.__file__", &owner_imp, NULL);
+    ASSERT_NOT_NULL(target);
+    ASSERT_STR_EQ(target->qualified_name, "proj.fastapi.param_functions.Header");
+
+    cbm_pipeline_set_pkgmap(NULL);
+    cbm_pkgmap_free(pkgmap);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* DLL resolve test removed — feature removed due to Windows Defender
  * false positive (Wacatac.B!ml). See issue #89. */
 
@@ -5681,6 +5815,164 @@ TEST(pipeline_apply_config_sets_all_thresholds) {
     PASS();
 }
 
+static const char *semantic_edge_props_for(cbm_gbuf_t *gb, const char *src_qn,
+                                           const char *dst_qn) {
+    const cbm_gbuf_node_t *src = cbm_gbuf_find_by_qn(gb, src_qn);
+    const cbm_gbuf_node_t *dst = cbm_gbuf_find_by_qn(gb, dst_qn);
+    if (!src || !dst) {
+        return NULL;
+    }
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(gb, src->id, "SEMANTICALLY_RELATED", &edges,
+                                           &edge_count) != 0) {
+        return NULL;
+    }
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i]->target_id == dst->id) {
+            return edges[i]->properties_json;
+        }
+    }
+    return NULL;
+}
+
+static cbm_gbuf_t *build_semantic_order_graph(bool reverse_alpha_calls) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("sem-order", "/tmp/sem-order");
+    if (!gb) {
+        return NULL;
+    }
+    const char props[] =
+        "{\"signature\":\"(request: Request, item: Item) -> Response\","
+        "\"return_type\":\"Response\",\"param_names\":[\"request\",\"item\"],"
+        "\"param_types\":[\"Request\",\"Item\"],\"bt\":\"validate item return response\"}";
+    int64_t alpha =
+        cbm_gbuf_upsert_node(gb, "Function", "alpha_handler", "sem-order.alpha_handler",
+                             "routes.py", 1, 20, props);
+    int64_t beta = cbm_gbuf_upsert_node(gb, "Function", "beta_handler", "sem-order.beta_handler",
+                                        "routes.py", 21, 40, props);
+    int64_t validate =
+        cbm_gbuf_upsert_node(gb, "Function", "validate_item", "sem-order.validate_item",
+                             "helpers.py", 1, 5, "{\"signature\":\"(item)\"}");
+    int64_t serialize =
+        cbm_gbuf_upsert_node(gb, "Function", "serialize_response", "sem-order.serialize_response",
+                             "helpers.py", 6, 10, "{\"signature\":\"(response)\"}");
+    if (alpha <= 0 || beta <= 0 || validate <= 0 || serialize <= 0) {
+        cbm_gbuf_free(gb);
+        return NULL;
+    }
+    if (reverse_alpha_calls) {
+        cbm_gbuf_insert_edge(gb, alpha, serialize, "CALLS", "{}");
+        cbm_gbuf_insert_edge(gb, alpha, validate, "CALLS", "{}");
+    } else {
+        cbm_gbuf_insert_edge(gb, alpha, validate, "CALLS", "{}");
+        cbm_gbuf_insert_edge(gb, alpha, serialize, "CALLS", "{}");
+    }
+    cbm_gbuf_insert_edge(gb, beta, validate, "CALLS", "{}");
+    cbm_gbuf_insert_edge(gb, beta, serialize, "CALLS", "{}");
+    return gb;
+}
+
+TEST(pipeline_semantic_edges_independent_of_call_insertion_order) {
+    cbm_gbuf_t *gb_forward = build_semantic_order_graph(false);
+    cbm_gbuf_t *gb_reverse = build_semantic_order_graph(true);
+    ASSERT_NOT_NULL(gb_forward);
+    ASSERT_NOT_NULL(gb_reverse);
+
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx_forward = {
+        .project_name = "sem-order",
+        .repo_path = "/tmp/sem-order",
+        .gbuf = gb_forward,
+        .cancelled = &cancelled,
+        .semantic_threshold = 0.01,
+    };
+    cbm_pipeline_ctx_t ctx_reverse = ctx_forward;
+    ctx_reverse.gbuf = gb_reverse;
+
+    ASSERT_EQ(cbm_pipeline_pass_semantic_edges(&ctx_forward), 0);
+    ASSERT_EQ(cbm_pipeline_pass_semantic_edges(&ctx_reverse), 0);
+
+    const char *forward =
+        semantic_edge_props_for(gb_forward, "sem-order.alpha_handler", "sem-order.beta_handler");
+    const char *reverse =
+        semantic_edge_props_for(gb_reverse, "sem-order.alpha_handler", "sem-order.beta_handler");
+    ASSERT_NOT_NULL(forward);
+    ASSERT_NOT_NULL(reverse);
+    ASSERT_STR_EQ(forward, reverse);
+
+    cbm_gbuf_free(gb_forward);
+    cbm_gbuf_free(gb_reverse);
+    PASS();
+}
+
+static cbm_sem_corpus_t *build_semantic_worker_parity_corpus(int worker_count) {
+    enum {
+        SEM_PARITY_DOCS = 4,
+        SEM_PARITY_MAX_TOKENS = 7,
+    };
+    char *tokens[SEM_PARITY_DOCS * SEM_PARITY_MAX_TOKENS] = {
+        "request", "validate", "item",     "response", "json",     "route",    "status",
+        "request", "validate", "payload",  "response", "json",     "handler",  "status",
+        "auth",    "token",    "validate", "request",  "handler",  "security", "status",
+        "auth",    "token",    "refresh",  "response", "security", "handler",  "json",
+    };
+    int counts[SEM_PARITY_DOCS] = {
+        7,
+        7,
+        7,
+        7,
+    };
+    cbm_sem_corpus_t *corpus = cbm_sem_corpus_new();
+    if (!corpus) {
+        return NULL;
+    }
+    cbm_sem_corpus_add_docs_batch_with_workers(corpus, tokens, counts, SEM_PARITY_DOCS,
+                                               SEM_PARITY_MAX_TOKENS, worker_count);
+    cbm_sem_corpus_finalize_with_workers(corpus, worker_count);
+    return corpus;
+}
+
+TEST(pipeline_semantic_corpus_vectors_independent_of_worker_count) {
+    enum {
+        SEM_PARITY_SERIAL_WORKERS = 1,
+        SEM_PARITY_PARALLEL_WORKERS = 4,
+    };
+    const float eps = 0.000001F;
+    cbm_sem_corpus_t *serial = build_semantic_worker_parity_corpus(SEM_PARITY_SERIAL_WORKERS);
+    cbm_sem_corpus_t *parallel = build_semantic_worker_parity_corpus(SEM_PARITY_PARALLEL_WORKERS);
+    ASSERT_NOT_NULL(serial);
+    ASSERT_NOT_NULL(parallel);
+
+    ASSERT_EQ(cbm_sem_corpus_doc_count(serial), cbm_sem_corpus_doc_count(parallel));
+    int token_count = cbm_sem_corpus_token_count(serial);
+    ASSERT_EQ(token_count, cbm_sem_corpus_token_count(parallel));
+    const char *previous_token = NULL;
+    for (int i = 0; i < token_count; i++) {
+        const cbm_sem_vec_t *serial_vec = NULL;
+        const cbm_sem_vec_t *parallel_vec = NULL;
+        float serial_idf = 0.0F;
+        float parallel_idf = 0.0F;
+        const char *serial_token = cbm_sem_corpus_token_at(serial, i, &serial_vec, &serial_idf);
+        const char *parallel_token =
+            cbm_sem_corpus_token_at(parallel, i, &parallel_vec, &parallel_idf);
+        ASSERT_STR_EQ(serial_token, parallel_token);
+        if (previous_token) {
+            ASSERT(strcmp(previous_token, serial_token) <= 0);
+        }
+        previous_token = serial_token;
+        ASSERT_FLOAT_EQ(serial_idf, parallel_idf, eps);
+        ASSERT_NOT_NULL(serial_vec);
+        ASSERT_NOT_NULL(parallel_vec);
+        for (int d = 0; d < CBM_SEM_DIM; d++) {
+            ASSERT_FLOAT_EQ(serial_vec->v[d], parallel_vec->v[d], eps);
+        }
+    }
+
+    cbm_sem_corpus_free(serial);
+    cbm_sem_corpus_free(parallel);
+    PASS();
+}
+
 static const cbm_config_entry_t *find_config_entry(const char *key) {
     for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
         if (strcmp(CBM_CONFIG_REGISTRY[i].key, key) == 0) {
@@ -6181,6 +6473,66 @@ TEST(pipeline_complexity_transitive_loop_depth) {
     PASS();
 }
 
+static void loop_props(char *buf, size_t buf_sz, int loop_depth) {
+    snprintf(buf, buf_sz, "{\"loop_depth\":%d,\"self_recursive\":false}", loop_depth);
+}
+
+TEST(pipeline_complexity_scc_tld_is_deterministic) {
+    enum {
+        CX_LOOP_A = 1,
+        CX_LOOP_B = 2,
+        CX_LOOP_LEAF = 3,
+        CX_COMPONENT_TLD = CX_LOOP_B + CX_LOOP_LEAF,
+    };
+    cbm_gbuf_t *gb = cbm_gbuf_new("cx-scc", "/tmp/cx-scc");
+    ASSERT_NOT_NULL(gb);
+
+    char props_a[CBM_SZ_64];
+    char props_b[CBM_SZ_64];
+    char props_leaf[CBM_SZ_64];
+    loop_props(props_a, sizeof(props_a), CX_LOOP_A);
+    loop_props(props_b, sizeof(props_b), CX_LOOP_B);
+    loop_props(props_leaf, sizeof(props_leaf), CX_LOOP_LEAF);
+
+    int64_t a = cbm_gbuf_upsert_node(gb, "Function", "a", "cx.a", "cx.go", 1, 4, props_a);
+    int64_t b = cbm_gbuf_upsert_node(gb, "Function", "b", "cx.b", "cx.go", 5, 8, props_b);
+    int64_t leaf =
+        cbm_gbuf_upsert_node(gb, "Function", "leaf", "cx.leaf", "cx.go", 9, 12, props_leaf);
+    ASSERT_GT(a, 0);
+    ASSERT_GT(b, 0);
+    ASSERT_GT(leaf, 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, a, b, "CALLS", "{}"), 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, b, a, "CALLS", "{}"), 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, b, leaf, "CALLS", "{}"), 0);
+
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "cx-scc",
+        .repo_path = "/tmp/cx-scc",
+        .gbuf = gb,
+        .cancelled = &cancelled,
+    };
+    cbm_pipeline_pass_complexity(&ctx);
+
+    const cbm_gbuf_node_t *node_a = cbm_gbuf_find_by_qn(gb, "cx.a");
+    const cbm_gbuf_node_t *node_b = cbm_gbuf_find_by_qn(gb, "cx.b");
+    ASSERT_NOT_NULL(node_a);
+    ASSERT_NOT_NULL(node_b);
+    ASSERT_NOT_NULL(node_a->properties_json);
+    ASSERT_NOT_NULL(node_b->properties_json);
+
+    char expected_tld[CBM_SZ_64];
+    snprintf(expected_tld, sizeof(expected_tld), "\"transitive_loop_depth\":%d",
+             CX_COMPONENT_TLD);
+    ASSERT_NOT_NULL(strstr(node_a->properties_json, expected_tld));
+    ASSERT_NOT_NULL(strstr(node_b->properties_json, expected_tld));
+    ASSERT_NOT_NULL(strstr(node_a->properties_json, "\"recursive\":true"));
+    ASSERT_NOT_NULL(strstr(node_b->properties_json, "\"recursive\":true"));
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* Regression for #334: the plausibility gate compares committed (extracted)
  * node count against persisted rows. committed_nodes must be captured BEFORE
  * cbm_gbuf_dump_to_sqlite frees the gbuf node index — otherwise it reads 0 and
@@ -6238,6 +6590,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_run_null);
     RUN_TEST(pipeline_unit_threshold_setters_clamp_invalid_values);
     RUN_TEST(pipeline_apply_config_sets_all_thresholds);
+    RUN_TEST(pipeline_semantic_edges_independent_of_call_insertion_order);
+    RUN_TEST(pipeline_semantic_corpus_vectors_independent_of_worker_count);
     RUN_TEST(config_registry_includes_mcp_timeout_knobs);
     RUN_TEST(config_registry_includes_incremental_reindex_policy);
     /* File persistence */
@@ -6258,6 +6612,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_edge_props_valid_json);
     /* Complexity propagation pass (Tier B) */
     RUN_TEST(pipeline_complexity_transitive_loop_depth);
+    RUN_TEST(pipeline_complexity_scc_tld_is_deterministic);
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
@@ -6283,6 +6638,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_project);
     RUN_TEST(pipeline_go_cross_package_call);
     RUN_TEST(pipeline_python_cross_module_call);
+    RUN_TEST(pipeline_python_reexport_call_uses_resolved_import_edge);
     RUN_TEST(pipeline_go_type_classification);
     RUN_TEST(pipeline_go_grouped_types);
     RUN_TEST(pipeline_kotlin_project);
@@ -6420,6 +6776,7 @@ SUITE(pipeline) {
     /* Incremental reindex */
     /* FastAPI Depends edge tracking */
     RUN_TEST(pipeline_fastapi_depends_edges);
+    RUN_TEST(import_reexport_falls_back_when_pkgmap_target_missing);
     /* Incremental */
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_detects_changed_file);

@@ -154,6 +154,29 @@ bool cbm_str_contains(const char *s, const char *sub) {
     return strstr(s, sub) != NULL;
 }
 
+int cbm_str_common_dot_prefix_len(const char *a, const char *b) {
+    if (!a || !b) {
+        return 0;
+    }
+    int count = 0;
+    while (*a && *b) {
+        const char *adot = strchr(a, '.');
+        const char *bdot = strchr(b, '.');
+        size_t alen = adot ? (size_t)(adot - a) : strlen(a);
+        size_t blen = bdot ? (size_t)(bdot - b) : strlen(b);
+        if (alen != blen || memcmp(a, b, alen) != 0) {
+            break;
+        }
+        count++;
+        a += alen + (adot ? SKIP_ONE : 0);
+        b += blen + (bdot ? SKIP_ONE : 0);
+        if (!adot || !bdot) {
+            break;
+        }
+    }
+    return count;
+}
+
 char *cbm_str_tolower(CBMArena *a, const char *s) {
     if (!s) {
         return NULL;
