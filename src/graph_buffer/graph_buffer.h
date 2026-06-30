@@ -109,7 +109,7 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path);
 
 /* Batch purge: delete every node whose file_path is in `paths` in a SINGLE pass
  * (O(N+E) total) instead of one scan per file (O(C·(N+E))). NULL paths skipped.
- * Keys borrowed (not freed). Returns total nodes deleted. */
+ * Keys borrowed (not freed). Returns total nodes deleted, or negative on setup failure. */
 int cbm_gbuf_delete_by_paths(cbm_gbuf_t *gb, const char *const *paths, int count);
 
 /* Bulk-load all nodes and edges for a project from an existing SQLite DB
