@@ -1551,6 +1551,120 @@ TEST(store_file_delta_publish_multifile_generation) {
     PASS();
 }
 
+TEST(store_file_delta_batch_publish_rolls_back_all_files) {
+    enum { BASE_GENERATION = 1, FAILED_GENERATION = 2, BATCH_DELTA_COUNT = 2 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, BASE_GENERATION);
+    ASSERT_EQ(store_publish_helper_file_delta(s, generation), CBM_STORE_OK);
+    ASSERT_EQ(store_publish_old_main_delta(s, generation), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, "test", generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, FAILED_GENERATION);
+
+    cbm_node_t helper_nodes[1] = {{.project = "test",
+                                   .label = "Function",
+                                   .name = "NewHelper",
+                                   .qualified_name = "test.helper.NewHelper",
+                                   .file_path = "helper.go",
+                                   .properties_json = "{}"}};
+    cbm_file_hash_t helper_hash = {.project = "test",
+                                   .rel_path = "helper.go",
+                                   .sha256 = "new-helper-hash",
+                                   .mtime_ns = 2,
+                                   .size = 20};
+    cbm_file_state_t helper_state = {.project = "test",
+                                     .rel_path = "helper.go",
+                                     .content_hash = "new-helper-content",
+                                     .git_oid = "",
+                                     .mtime_ns = 2,
+                                     .size = 20,
+                                     .language = "c",
+                                     .pass_fingerprint = "pass-b",
+                                     .generation = generation,
+                                     .indexed_at = "2026-06-30T00:01:00Z"};
+    cbm_store_symbol_export_t helper_exports[1] = {
+        {.qualified_name = "test.helper.NewHelper", .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_store_file_delta_t helper_delta = {.project = "test",
+                                           .rel_path = "helper.go",
+                                           .generation = generation,
+                                           .file_hash = &helper_hash,
+                                           .file_state = &helper_state,
+                                           .nodes = helper_nodes,
+                                           .node_count = 1,
+                                           .exports = helper_exports,
+                                           .export_count = 1};
+
+    cbm_node_t main_nodes[1] = {{.project = "test",
+                                 .label = "Function",
+                                 .name = "New",
+                                 .qualified_name = "test.main.New",
+                                 .file_path = "main.go",
+                                 .properties_json = "{}"}};
+    cbm_store_delta_edge_t bad_edges[1] = {{.source_qn = "test.main.New",
+                                            .target_qn = "test.main.Missing",
+                                            .type = "CALLS",
+                                            .properties_json = "{}"}};
+    cbm_file_hash_t main_hash = {.project = "test",
+                                 .rel_path = "main.go",
+                                 .sha256 = "bad-main-hash",
+                                 .mtime_ns = 2,
+                                 .size = 20};
+    cbm_file_state_t main_state = {.project = "test",
+                                   .rel_path = "main.go",
+                                   .content_hash = "bad-main-content",
+                                   .git_oid = "",
+                                   .mtime_ns = 2,
+                                   .size = 20,
+                                   .language = "c",
+                                   .pass_fingerprint = "pass-b",
+                                   .generation = generation,
+                                   .indexed_at = "2026-06-30T00:01:00Z"};
+    cbm_store_file_delta_t bad_main_delta = {.project = "test",
+                                             .rel_path = "main.go",
+                                             .generation = generation,
+                                             .file_hash = &main_hash,
+                                             .file_state = &main_state,
+                                             .nodes = main_nodes,
+                                             .node_count = 1,
+                                             .edges = bad_edges,
+                                             .edge_count = 1};
+    const cbm_store_file_delta_t *deltas[BATCH_DELTA_COUNT] = {&helper_delta, &bad_main_delta};
+    ASSERT_EQ(cbm_store_publish_file_delta_batch(s, deltas, BATCH_DELTA_COUNT),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, "test", generation,
+                                                CBM_STORE_INDEX_STATUS_FAILED),
+              CBM_STORE_OK);
+
+    ASSERT_EQ(store_node_qn_exists(s, "test", "test.helper.Helper"), 1);
+    ASSERT_EQ(store_node_qn_exists(s, "test", "test.helper.NewHelper"), 0);
+    ASSERT_EQ(store_node_qn_exists(s, "test", "test.main.Old"), 1);
+    ASSERT_EQ(store_node_qn_exists(s, "test", "test.main.New"), 0);
+    ASSERT_EQ(cbm_store_count_edges(s, "test"), 0);
+
+    cbm_file_state_t got = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, "test", "helper.go", &got), CBM_STORE_OK);
+    ASSERT_STR_EQ(got.content_hash, "helper-content");
+    ASSERT_EQ(got.generation, BASE_GENERATION);
+    cbm_store_file_state_free_fields(&got);
+    ASSERT_EQ(store_count_index_generation(s, "test", FAILED_GENERATION,
+                                           CBM_STORE_INDEX_STATUS_FAILED, "", "",
+                                           STORE_TEST_COMPLETED_SET),
+              1);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_file_delta_publish_commits_graph_and_metadata) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -2789,6 +2903,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_file_delta_publish_matches_fresh_final_graph);
     RUN_TEST(store_file_delta_publish_failure_finishes_generation_failed);
     RUN_TEST(store_file_delta_publish_multifile_generation);
+    RUN_TEST(store_file_delta_batch_publish_rolls_back_all_files);
     RUN_TEST(store_file_delta_publish_commits_graph_and_metadata);
     RUN_TEST(store_node_properties_json);
     RUN_TEST(store_node_null_properties);

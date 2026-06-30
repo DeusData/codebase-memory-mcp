@@ -2716,18 +2716,22 @@ static bool store_file_delta_contract_valid(const cbm_store_file_delta_t *delta)
     return true;
 }
 
-int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *delta) {
-    if (!s || !delta || !delta->project || !delta->rel_path || delta->generation < 0 ||
+static bool store_file_delta_shape_valid(const cbm_store_file_delta_t *delta) {
+    if (!delta || !delta->project || !delta->rel_path || delta->generation < 0 ||
         delta->node_count < 0 || delta->edge_count < 0 || delta->export_count < 0 ||
         delta->import_count < 0) {
-        return CBM_STORE_ERR;
+        return false;
     }
     if ((delta->node_count > 0 && !delta->nodes) || (delta->edge_count > 0 && !delta->edges) ||
         (delta->export_count > 0 && !delta->exports) ||
         (delta->import_count > 0 && !delta->imports)) {
-        return CBM_STORE_ERR;
+        return false;
     }
-    if (!store_file_delta_contract_valid(delta)) {
+    return store_file_delta_contract_valid(delta);
+}
+
+int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *delta) {
+    if (!s || !store_file_delta_shape_valid(delta)) {
         return CBM_STORE_ERR;
     }
 
@@ -2739,6 +2743,47 @@ int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *d
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(s);
         return rc;
+    }
+    rc = cbm_store_commit(s);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_publish_file_delta_batch(cbm_store_t *s,
+                                       const cbm_store_file_delta_t *const *deltas,
+                                       int delta_count) {
+    if (!s || !deltas || delta_count <= 0) {
+        return CBM_STORE_ERR;
+    }
+
+    const char *project = NULL;
+    int64_t generation = -1;
+    for (int i = 0; i < delta_count; i++) {
+        const cbm_store_file_delta_t *delta = deltas[i];
+        if (!store_file_delta_shape_valid(delta)) {
+            return CBM_STORE_ERR;
+        }
+        if (!project) {
+            project = delta->project;
+            generation = delta->generation;
+        } else if (strcmp(project, delta->project) != 0 || generation != delta->generation) {
+            return CBM_STORE_ERR;
+        }
+    }
+
+    int rc = cbm_store_begin(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    for (int i = 0; i < delta_count; i++) {
+        rc = store_publish_file_delta_body(s, deltas[i]);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(s);
+            return rc;
+        }
     }
     rc = cbm_store_commit(s);
     if (rc != CBM_STORE_OK) {
