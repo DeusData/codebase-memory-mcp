@@ -149,6 +149,13 @@ struct cbm_store {
     sqlite3_stmt *stmt_upsert_edge_owner;
     sqlite3_stmt *stmt_delete_node_owners_by_file;
     sqlite3_stmt *stmt_delete_edge_owners_by_file;
+    sqlite3_stmt *stmt_upsert_symbol_export;
+    sqlite3_stmt *stmt_delete_symbol_exports_by_file;
+    sqlite3_stmt *stmt_list_symbol_exports_by_file;
+    sqlite3_stmt *stmt_upsert_import_ref;
+    sqlite3_stmt *stmt_delete_import_refs_by_file;
+    sqlite3_stmt *stmt_list_import_ref_paths_by_target;
+    sqlite3_stmt *stmt_list_import_ref_paths_for_export_file;
 };
 
 /* ── Public accessor ────────────────────────────────────────────── */
@@ -220,6 +227,43 @@ static sqlite3_stmt *prepare_cached(cbm_store_t *s, sqlite3_stmt **slot, const c
         return NULL;
     }
     return *slot;
+}
+
+static int store_collect_text_column(cbm_store_t *s, sqlite3_stmt *stmt, const char *op,
+                                     char ***out, int *count) {
+    if (!out || !count || !stmt) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *count = 0;
+
+    int cap = ST_INIT_CAP_8;
+    int n = 0;
+    char **arr = malloc((size_t)cap * sizeof(char *));
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *text = (const char *)sqlite3_column_text(stmt, 0);
+        if (!text) {
+            continue;
+        }
+        if (n >= cap) {
+            cap *= ST_GROWTH;
+            arr = safe_realloc(arr, (size_t)cap * sizeof(char *));
+        }
+        arr[n++] = heap_strdup(text);
+    }
+    if (rc != SQLITE_DONE) {
+        for (int i = 0; i < n; i++) {
+            free(arr[i]);
+        }
+        free(arr);
+        store_set_error_sqlite(s, op);
+        return CBM_STORE_ERR;
+    }
+
+    *out = arr;
+    *count = n;
+    return CBM_STORE_OK;
 }
 
 /* Get ISO-8601 timestamp. */
@@ -949,6 +993,13 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_upsert_edge_owner);
     finalize_stmt(&s->stmt_delete_node_owners_by_file);
     finalize_stmt(&s->stmt_delete_edge_owners_by_file);
+    finalize_stmt(&s->stmt_upsert_symbol_export);
+    finalize_stmt(&s->stmt_delete_symbol_exports_by_file);
+    finalize_stmt(&s->stmt_list_symbol_exports_by_file);
+    finalize_stmt(&s->stmt_upsert_import_ref);
+    finalize_stmt(&s->stmt_delete_import_refs_by_file);
+    finalize_stmt(&s->stmt_list_import_ref_paths_by_target);
+    finalize_stmt(&s->stmt_list_import_ref_paths_for_export_file);
 
     /* Use sqlite3_close_v2 — auto-deallocates when last statement finalizes.
      * Prevents ASan false-positive leaks from sqlite3 internal state. */
@@ -2018,6 +2069,146 @@ int cbm_store_delete_edge_owners_by_file(cbm_store_t *s, const char *project,
         return CBM_STORE_ERR;
     }
     return CBM_STORE_OK;
+}
+
+int cbm_store_upsert_symbol_export(cbm_store_t *s, const char *project,
+                                   const char *qualified_name, const char *rel_path,
+                                   int64_t node_id, int64_t generation) {
+    sqlite3_stmt *stmt = prepare_cached(
+        s, &s->stmt_upsert_symbol_export,
+        "INSERT INTO symbol_exports (project, qualified_name, rel_path, node_id, generation) "
+        "VALUES (?1, ?2, ?3, ?4, ?5) "
+        "ON CONFLICT(project, qualified_name, rel_path) DO UPDATE SET "
+        "node_id=?4, generation=?5;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, qualified_name);
+    bind_text(stmt, ST_COL_3, rel_path);
+    if (node_id > CBM_STORE_NO_NODE_ID) {
+        sqlite3_bind_int64(stmt, ST_COL_4, node_id);
+    } else {
+        sqlite3_bind_null(stmt, ST_COL_4);
+    }
+    sqlite3_bind_int64(stmt, ST_COL_5, generation);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "upsert_symbol_export");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_delete_symbol_exports_by_file(cbm_store_t *s, const char *project,
+                                            const char *rel_path) {
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_delete_symbol_exports_by_file,
+                       "DELETE FROM symbol_exports WHERE project = ?1 AND rel_path = ?2;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "delete_symbol_exports_by_file");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_list_symbol_exports_by_file(cbm_store_t *s, const char *project,
+                                          const char *rel_path, char ***out, int *count) {
+    sqlite3_stmt *stmt = prepare_cached(
+        s, &s->stmt_list_symbol_exports_by_file,
+        "SELECT qualified_name FROM symbol_exports "
+        "WHERE project = ?1 AND rel_path = ?2 ORDER BY qualified_name;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+    return store_collect_text_column(s, stmt, "list_symbol_exports_by_file", out, count);
+}
+
+int cbm_store_upsert_import_ref(cbm_store_t *s, const char *project, const char *rel_path,
+                                const char *import_text, const char *local_name,
+                                const char *target_qn, int64_t generation) {
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_upsert_import_ref,
+                       "INSERT INTO import_refs (project, rel_path, import_text, local_name, "
+                       "target_qn, generation) VALUES (?1, ?2, ?3, ?4, ?5, ?6) "
+                       "ON CONFLICT(project, rel_path, import_text, local_name) DO UPDATE SET "
+                       "target_qn=?5, generation=?6;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+    bind_text(stmt, ST_COL_3, import_text);
+    bind_text(stmt, ST_COL_4, safe_str(local_name));
+    bind_text(stmt, ST_COL_5, safe_str(target_qn));
+    sqlite3_bind_int64(stmt, ST_COL_6, generation);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "upsert_import_ref");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_delete_import_refs_by_file(cbm_store_t *s, const char *project,
+                                         const char *rel_path) {
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_delete_import_refs_by_file,
+                       "DELETE FROM import_refs WHERE project = ?1 AND rel_path = ?2;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "delete_import_refs_by_file");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_list_import_ref_paths_by_target(cbm_store_t *s, const char *project,
+                                              const char *target_qn, char ***out,
+                                              int *count) {
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_list_import_ref_paths_by_target,
+                       "SELECT DISTINCT rel_path FROM import_refs "
+                       "WHERE project = ?1 AND target_qn = ?2 ORDER BY rel_path;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, target_qn);
+    return store_collect_text_column(s, stmt, "list_import_ref_paths_by_target", out, count);
+}
+
+int cbm_store_list_import_ref_paths_for_export_file(cbm_store_t *s, const char *project,
+                                                   const char *export_rel_path, char ***out,
+                                                   int *count) {
+    sqlite3_stmt *stmt = prepare_cached(
+        s, &s->stmt_list_import_ref_paths_for_export_file,
+        "SELECT DISTINCT i.rel_path FROM import_refs i "
+        "JOIN symbol_exports e ON e.project = i.project AND e.qualified_name = i.target_qn "
+        "WHERE e.project = ?1 AND e.rel_path = ?2 AND i.rel_path != e.rel_path "
+        "ORDER BY i.rel_path;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, export_rel_path);
+    return store_collect_text_column(s, stmt, "list_import_ref_paths_for_export_file", out, count);
 }
 
 /* ── FindNodesByFileOverlap ─────────────────────────────────────── */

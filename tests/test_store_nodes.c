@@ -38,6 +38,16 @@ static int store_count_metadata_owners(cbm_store_t *s, int edge, const char *pro
     return count;
 }
 
+static void store_free_string_array(char **items, int count) {
+    if (!items) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(items[i]);
+    }
+    free(items);
+}
+
 TEST(store_open_memory) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -686,6 +696,101 @@ TEST(store_owner_metadata_crud) {
 
     ASSERT_EQ(cbm_store_delete_node_owners_by_file(s, "test", "renamed.go"), CBM_STORE_OK);
     ASSERT_EQ(store_count_metadata_owners(s, 0, "test", "renamed.go"), 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_import_export_metadata_crud) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    cbm_node_t node = {.project = "test",
+                       .label = "Function",
+                       .name = "Helper",
+                       .qualified_name = "test.lib.Helper",
+                       .file_path = "lib.go",
+                       .properties_json = "{}"};
+    int64_t node_id = cbm_store_upsert_node(s, &node);
+    ASSERT_GT(node_id, 0);
+
+    ASSERT_EQ(cbm_store_upsert_symbol_export(s, "test", "test.lib.Helper", "lib.go", node_id, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_symbol_export(s, "test", "test.lib.Unresolved", "lib.go",
+                                             CBM_STORE_NO_NODE_ID, 1),
+              CBM_STORE_OK);
+
+    char **items = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_list_symbol_exports_by_file(s, "test", "lib.go", &items, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    ASSERT_STR_EQ(items[0], "test.lib.Helper");
+    ASSERT_STR_EQ(items[1], "test.lib.Unresolved");
+    store_free_string_array(items, count);
+
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, "test", "caller.go", "test.lib", "Helper",
+                                          "test.lib.Helper", 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, "test", "other.go", "test.other", "Other",
+                                          "test.other.Other", 1),
+              CBM_STORE_OK);
+
+    items = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_list_import_ref_paths_by_target(s, "test", "test.lib.Helper", &items,
+                                                       &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(items[0], "caller.go");
+    store_free_string_array(items, count);
+
+    items = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_list_import_ref_paths_for_export_file(s, "test", "lib.go", &items,
+                                                             &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(items[0], "caller.go");
+    store_free_string_array(items, count);
+
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, "test", "caller.go", "test.lib", "Helper",
+                                          "test.lib.Renamed", 2),
+              CBM_STORE_OK);
+    items = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_list_import_ref_paths_by_target(s, "test", "test.lib.Helper", &items,
+                                                       &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    store_free_string_array(items, count);
+
+    items = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_list_import_ref_paths_by_target(s, "test", "test.lib.Renamed", &items,
+                                                       &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(items[0], "caller.go");
+    store_free_string_array(items, count);
+
+    ASSERT_EQ(cbm_store_delete_import_refs_by_file(s, "test", "caller.go"), CBM_STORE_OK);
+    items = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_list_import_ref_paths_by_target(s, "test", "test.lib.Renamed", &items,
+                                                       &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    store_free_string_array(items, count);
+
+    ASSERT_EQ(cbm_store_delete_symbol_exports_by_file(s, "test", "lib.go"), CBM_STORE_OK);
+    items = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_list_symbol_exports_by_file(s, "test", "lib.go", &items, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    store_free_string_array(items, count);
 
     cbm_store_close(s);
     PASS();
@@ -1802,6 +1907,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_file_hash_upsert_rejects_null_required_fields);
     RUN_TEST(store_file_state_crud);
     RUN_TEST(store_owner_metadata_crud);
+    RUN_TEST(store_import_export_metadata_crud);
     RUN_TEST(store_node_properties_json);
     RUN_TEST(store_node_null_properties);
     RUN_TEST(store_find_by_file_overlap);
