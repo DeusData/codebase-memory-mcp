@@ -189,75 +189,17 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
     return defs;
 }
 
-/* Build per-file import map (local_name -> resolved module QN) from gbuf
- * IMPORTS edges. Mirrors build_import_map() in pass_parallel.c. Returns 0
- * with *out_count = 0 when the file has no IMPORTS edges. Caller frees keys
- * with pxc_free_import_map. */
+/* Build per-file import map (local_name -> resolved module QN) from resolved
+ * IMPORTS edges. Returns 0 with *out_count = 0 when the file has no imports. */
 static int pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name,
                                 const char *rel_path, const char ***out_keys,
                                 const char ***out_vals, int *out_count) {
-    *out_keys = NULL;
-    *out_vals = NULL;
-    *out_count = 0;
-
-    char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
-    if (!file_qn)
-        return 0;
-    const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(gbuf, file_qn);
-    free(file_qn);
-    if (!file_node)
-        return 0;
-
-    const cbm_gbuf_edge_t **edges = NULL;
-    int edge_count = 0;
-    int rc =
-        cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges, &edge_count);
-    if (rc != 0 || edge_count == 0)
-        return 0;
-
-    const char **keys = (const char **)calloc((size_t)edge_count, sizeof(const char *));
-    const char **vals = (const char **)calloc((size_t)edge_count, sizeof(const char *));
-    if (!keys || !vals) {
-        free(keys);
-        free(vals);
-        return 0;
-    }
-    int count = 0;
-    for (int i = 0; i < edge_count; i++) {
-        const cbm_gbuf_edge_t *e = edges[i];
-        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, e->target_id);
-        if (!target || !e->properties_json)
-            continue;
-        const char *start = strstr(e->properties_json, "\"local_name\":\"");
-        if (!start)
-            continue;
-        start += strlen("\"local_name\":\"");
-        const char *end = strchr(start, '"');
-        if (!end || end <= start)
-            continue;
-        size_t n = (size_t)(end - start);
-        char *local = (char *)malloc(n + 1);
-        if (!local)
-            continue;
-        memcpy(local, start, n);
-        local[n] = '\0';
-        keys[count] = local;
-        vals[count] = target->qualified_name; /* borrowed from gbuf */
-        count++;
-    }
-    *out_keys = keys;
-    *out_vals = vals;
-    *out_count = count;
-    return 0;
+    return cbm_pipeline_build_import_map_from_edges(gbuf, project_name, rel_path, out_keys,
+                                                    out_vals, out_count);
 }
 
 static void pxc_free_import_map(const char **keys, const char **vals, int count) {
-    if (keys) {
-        for (int i = 0; i < count; i++)
-            free((void *)keys[i]);
-        free((void *)keys);
-    }
-    free((void *)vals); /* vals strings borrowed from gbuf — don't free elements */
+    cbm_pipeline_free_import_map(keys, vals, count);
 }
 
 /* Detect TS dialect flags from a relative path. */

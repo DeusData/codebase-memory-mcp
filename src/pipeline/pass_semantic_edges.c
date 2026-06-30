@@ -299,12 +299,41 @@ static const char *file_ext(const char *path) {
     return dot ? dot : "";
 }
 
-static int cmp_cstr_ptr(const void *a, const void *b) {
-    const char *const *sa = (const char *const *)a;
-    const char *const *sb = (const char *const *)b;
-    const char *aa = *sa ? *sa : "";
-    const char *bb = *sb ? *sb : "";
-    return strcmp(aa, bb);
+typedef struct {
+    const char *key;
+    const char *name;
+} sem_neighbor_name_t;
+
+static int cmp_neighbor_name(const sem_neighbor_name_t *a, const sem_neighbor_name_t *b) {
+    const char *ak = a && a->key ? a->key : "";
+    const char *bk = b && b->key ? b->key : "";
+    int c = strcmp(ak, bk);
+    if (c != 0) {
+        return c;
+    }
+    const char *an = a && a->name ? a->name : "";
+    const char *bn = b && b->name ? b->name : "";
+    return strcmp(an, bn);
+}
+
+static int neighbor_name_insert_top(sem_neighbor_name_t *items, int count, int cap,
+                                    sem_neighbor_name_t candidate) {
+    if (!items || cap <= 0 || !candidate.name) {
+        return count;
+    }
+    if (count == cap && cmp_neighbor_name(&candidate, &items[count - SKIP_ONE]) >= 0) {
+        return count;
+    }
+    if (count < cap) {
+        count++;
+    }
+    int pos = count - SKIP_ONE;
+    while (pos > 0 && cmp_neighbor_name(&candidate, &items[pos - SKIP_ONE]) < 0) {
+        items[pos] = items[pos - SKIP_ONE];
+        pos--;
+    }
+    items[pos] = candidate;
+    return count;
 }
 
 static int cmp_tfidf_term(const void *a, const void *b) {
@@ -325,15 +354,22 @@ static int collect_call_neighbor_names(const cbm_gbuf_t *gbuf, int64_t node_id, 
     if (rc != 0) {
         return 0;
     }
+    sem_neighbor_name_t selected[MAX_CALLEES];
     int count = 0;
-    for (int e = 0; e < ec && count < max_names; e++) {
+    for (int e = 0; e < ec; e++) {
         int64_t id = outbound ? edges[e]->target_id : edges[e]->source_id;
         const cbm_gbuf_node_t *neighbor = cbm_gbuf_find_by_id(gbuf, id);
         if (neighbor && neighbor->name) {
-            names[count++] = neighbor->name;
+            sem_neighbor_name_t candidate = {
+                .key = neighbor->qualified_name ? neighbor->qualified_name : neighbor->name,
+                .name = neighbor->name,
+            };
+            count = neighbor_name_insert_top(selected, count, max_names, candidate);
         }
     }
-    qsort(names, (size_t)count, sizeof(*names), cmp_cstr_ptr);
+    for (int i = 0; i < count; i++) {
+        names[i] = selected[i].name;
+    }
     return count;
 }
 
