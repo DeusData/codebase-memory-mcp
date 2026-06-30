@@ -4096,6 +4096,64 @@ static int pick_resolved_node(const cbm_node_t *nodes, int count, bool *ambiguou
     }
     return best;
 }
+
+static void trace_append_nodes(cbm_mcp_server_t *srv, yyjson_mut_doc *doc, yyjson_mut_val *arr,
+                               const cbm_traverse_result_t *tr, bool compact,
+                               bool include_tests, bool risk_labels, char **exclude_likes) {
+    /* yyjson borrows node strings here; callers must serialize before
+     * cbm_store_traverse_free(). */
+    int64_t *seen = calloc((size_t)tr->visited_count + SKIP_ONE, sizeof(int64_t));
+    int seen_count = 0;
+    for (int i = 0; i < tr->visited_count; i++) {
+        const cbm_node_hop_t *hop = &tr->visited[i];
+        bool is_test = cbm_is_test_file_path(hop->node.file_path);
+        if (!include_tests && is_test) {
+            continue;
+        }
+        if (path_matches_like_any(hop->node.file_path, exclude_likes)) {
+            continue;
+        }
+        if (seen) {
+            bool dup = false;
+            for (int j = 0; j < seen_count; j++) {
+                if (seen[j] == hop->node.id) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                continue;
+            }
+            seen[seen_count++] = hop->node.id;
+        }
+
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        if ((!compact || !ends_with_segment(hop->node.qualified_name, hop->node.name)) &&
+            hop->node.name && hop->node.name[0]) {
+            yyjson_mut_obj_add_str(doc, item, "name", hop->node.name);
+        }
+        yyjson_mut_obj_add_str(doc, item, "qualified_name",
+                               hop->node.qualified_name ? hop->node.qualified_name : "");
+        yyjson_mut_obj_add_int(doc, item, "hop", hop->hop);
+        if (risk_labels) {
+            yyjson_mut_obj_add_str(doc, item, "risk", cbm_risk_label(cbm_hop_to_risk(hop->hop)));
+        }
+        if (is_test) {
+            yyjson_mut_obj_add_bool(doc, item, "is_test", true);
+        }
+        if (hop->pagerank_score > 0.0) {
+            add_pagerank_val(doc, item, hop->pagerank_score);
+        }
+        bool dep_node = cbm_is_dep_project(hop->node.project, srv->session_project);
+        yyjson_mut_obj_add_str(doc, item, "source", dep_node ? "dependency" : "project");
+        if (dep_node) {
+            yyjson_mut_obj_add_bool(doc, item, "read_only", true);
+        }
+        yyjson_mut_arr_add_val(arr, item);
+    }
+    free(seen);
+}
+
 static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
     char *func_name = cbm_mcp_get_string_arg(args, "function_name");
     char *qn_input = cbm_mcp_get_string_arg(args, "qualified_name"); /* cross-tool chaining */
@@ -4382,55 +4440,8 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
                       max_results, &tr_out);
 
         yyjson_mut_val *callees = yyjson_mut_arr(doc);
-        /* Deduplicate by node ID to prevent cycle inflation */
-        int64_t *seen_out = calloc((size_t)tr_out.visited_count + 1, sizeof(int64_t));
-        int seen_out_n = 0;
-        for (int i = 0; i < tr_out.visited_count; i++) {
-            bool is_test = cbm_is_test_file_path(tr_out.visited[i].node.file_path);
-            if (!include_tests && is_test) {
-                continue;
-            }
-            if (path_matches_like_any(tr_out.visited[i].node.file_path, exclude_likes)) {
-                continue;
-            }
-            if (seen_out) { /* OOM-safe: skip dedup if calloc failed */
-                bool dup = false;
-                for (int j = 0; j < seen_out_n; j++) {
-                    if (seen_out[j] == tr_out.visited[i].node.id) { dup = true; break; }
-                }
-                if (dup) continue;
-                seen_out[seen_out_n++] = tr_out.visited[i].node.id;
-            }
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            if ((!compact || !ends_with_segment(tr_out.visited[i].node.qualified_name,
-                                                tr_out.visited[i].node.name)) &&
-                tr_out.visited[i].node.name && tr_out.visited[i].node.name[0]) {
-                yyjson_mut_obj_add_str(doc, item, "name", tr_out.visited[i].node.name);
-            }
-            yyjson_mut_obj_add_str(
-                doc, item, "qualified_name",
-                tr_out.visited[i].node.qualified_name ? tr_out.visited[i].node.qualified_name : "");
-            yyjson_mut_obj_add_int(doc, item, "hop", tr_out.visited[i].hop);
-            if (risk_labels) {
-                yyjson_mut_obj_add_str(doc, item, "risk",
-                                       cbm_risk_label(cbm_hop_to_risk(tr_out.visited[i].hop)));
-            }
-            if (is_test) {
-                yyjson_mut_obj_add_bool(doc, item, "is_test", true);
-            }
-            if (tr_out.visited[i].pagerank_score > 0.0)
-                add_pagerank_val(doc, item, tr_out.visited[i].pagerank_score);
-            /* Boundary tagging: mark if callee is in a dependency */
-            bool callee_dep = cbm_is_dep_project(tr_out.visited[i].node.project,
-                                                  srv->session_project);
-            yyjson_mut_obj_add_str(doc, item, "source",
-                                   callee_dep ? "dependency" : "project");
-            if (callee_dep) {
-                yyjson_mut_obj_add_bool(doc, item, "read_only", true);
-            }
-            yyjson_mut_arr_add_val(callees, item);
-        }
-        free(seen_out);
+        trace_append_nodes(srv, doc, callees, &tr_out, compact, include_tests, risk_labels,
+                           exclude_likes);
         yyjson_mut_obj_add_val(doc, root, "callees", callees);
         yyjson_mut_obj_add_int(doc, root, "callees_total", tr_out.visited_count);
     }
@@ -4440,55 +4451,8 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
                       max_results, &tr_in);
 
         yyjson_mut_val *callers = yyjson_mut_arr(doc);
-        /* Deduplicate by node ID */
-        int64_t *seen_in = calloc((size_t)tr_in.visited_count + 1, sizeof(int64_t));
-        int seen_in_n = 0;
-        for (int i = 0; i < tr_in.visited_count; i++) {
-            bool is_test = cbm_is_test_file_path(tr_in.visited[i].node.file_path);
-            if (!include_tests && is_test) {
-                continue;
-            }
-            if (path_matches_like_any(tr_in.visited[i].node.file_path, exclude_likes)) {
-                continue;
-            }
-            if (seen_in) { /* OOM-safe: skip dedup if calloc failed */
-                bool dup = false;
-                for (int j = 0; j < seen_in_n; j++) {
-                    if (seen_in[j] == tr_in.visited[i].node.id) { dup = true; break; }
-                }
-                if (dup) continue;
-                seen_in[seen_in_n++] = tr_in.visited[i].node.id;
-            }
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            if ((!compact || !ends_with_segment(tr_in.visited[i].node.qualified_name,
-                                                tr_in.visited[i].node.name)) &&
-                tr_in.visited[i].node.name && tr_in.visited[i].node.name[0]) {
-                yyjson_mut_obj_add_str(doc, item, "name", tr_in.visited[i].node.name);
-            }
-            yyjson_mut_obj_add_str(
-                doc, item, "qualified_name",
-                tr_in.visited[i].node.qualified_name ? tr_in.visited[i].node.qualified_name : "");
-            yyjson_mut_obj_add_int(doc, item, "hop", tr_in.visited[i].hop);
-            if (risk_labels) {
-                yyjson_mut_obj_add_str(doc, item, "risk",
-                                       cbm_risk_label(cbm_hop_to_risk(tr_in.visited[i].hop)));
-            }
-            if (is_test) {
-                yyjson_mut_obj_add_bool(doc, item, "is_test", true);
-            }
-            if (tr_in.visited[i].pagerank_score > 0.0)
-                add_pagerank_val(doc, item, tr_in.visited[i].pagerank_score);
-            /* Boundary tagging: mark if caller is in a dependency */
-            bool caller_dep = cbm_is_dep_project(tr_in.visited[i].node.project,
-                                                  srv->session_project);
-            yyjson_mut_obj_add_str(doc, item, "source",
-                                   caller_dep ? "dependency" : "project");
-            if (caller_dep) {
-                yyjson_mut_obj_add_bool(doc, item, "read_only", true);
-            }
-            yyjson_mut_arr_add_val(callers, item);
-        }
-        free(seen_in);
+        trace_append_nodes(srv, doc, callers, &tr_in, compact, include_tests, risk_labels,
+                           exclude_likes);
         yyjson_mut_obj_add_val(doc, root, "callers", callers);
         yyjson_mut_obj_add_int(doc, root, "callers_total", tr_in.visited_count);
     }
