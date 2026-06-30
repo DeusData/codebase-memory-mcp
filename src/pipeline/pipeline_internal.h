@@ -58,6 +58,9 @@ int64_t cbm_pipeline_upsert_service_route(cbm_gbuf_t *gb, const char *path, cbm_
 /* Test-only incremental fault injection. Values name internal phases and are
  * intentionally not user configuration. */
 #define CBM_TEST_FAIL_INCREMENTAL_PHASE "CBM_TEST_FAIL_INCREMENTAL_PHASE"
+#define CBM_TEST_FAIL_INCREMENTAL_EXTRACT "incr_extract"
+#define CBM_TEST_FAIL_INCREMENTAL_REGISTRY "incr_registry"
+#define CBM_TEST_FAIL_INCREMENTAL_RESOLVE "incr_resolve"
 #define CBM_TEST_FAIL_INCREMENTAL_POSTPASS "postpass"
 #define CBM_TEST_FAIL_INCREMENTAL_HASH_PERSIST "hash_persist"
 
