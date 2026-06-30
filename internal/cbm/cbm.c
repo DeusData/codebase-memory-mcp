@@ -356,20 +356,37 @@ void cbm_alloc_init(void) {
 
 // --- Init/Shutdown ---
 
-static int cbm_initialized = 0;
+enum {
+    CBM_LIB_INIT_UNINIT = 0,
+    CBM_LIB_INIT_INITIALIZING = 1,
+    CBM_LIB_INIT_READY = 2,
+};
+
+static _Atomic int cbm_init_state = CBM_LIB_INIT_UNINIT;
 
 int cbm_init(void) {
-    if (cbm_initialized) {
+    if (atomic_load_explicit(&cbm_init_state, memory_order_acquire) == CBM_LIB_INIT_READY) {
         return 0;
     }
-    enum { CBM_INIT_DONE = 1 };
-    cbm_initialized = CBM_INIT_DONE;
+
+    int expected = CBM_LIB_INIT_UNINIT;
+    if (!atomic_compare_exchange_strong_explicit(&cbm_init_state, &expected,
+                                                 CBM_LIB_INIT_INITIALIZING,
+                                                 memory_order_acq_rel, memory_order_acquire)) {
+        while (atomic_load_explicit(&cbm_init_state, memory_order_acquire) !=
+               CBM_LIB_INIT_READY) {
+            /* Another thread is completing library initialization. */
+        }
+        return 0;
+    }
+
     /* Defense-in-depth allocator binds (idempotent). main() calls cbm_alloc_init
      * first; this covers non-main entry points (pipeline passes call cbm_init).
      * For sqlite the SQLITE_CONFIG_MALLOC bind only takes effect if it runs
      * before sqlite initializes — main() guarantees that ordering; here it is a
      * best-effort idempotent re-assert for paths that never hit main(). */
     cbm_alloc_init();
+    atomic_store_explicit(&cbm_init_state, CBM_LIB_INIT_READY, memory_order_release);
     return 0;
 }
 
@@ -395,7 +412,7 @@ void cbm_shutdown(void) {
     // Clean up thread-local parser for the calling thread.
     // Note: other threads' TLS parsers are freed when those threads exit.
     cbm_destroy_thread_parser();
-    cbm_initialized = 0;
+    atomic_store_explicit(&cbm_init_state, CBM_LIB_INIT_UNINIT, memory_order_release);
 }
 
 // --- Bottleneck call-name classification (language-agnostic heuristics) ---
