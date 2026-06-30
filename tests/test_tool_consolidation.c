@@ -406,6 +406,30 @@ TEST(revealed_trace_path_parameter_contract) {
     PASS();
 }
 
+TEST(revealed_advanced_tool_schema_matches_handlers) {
+    char *saved_mode = save_tool_mode();
+    unsetenv("CBM_TOOL_MODE");
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *hint = cbm_mcp_handle_tool(srv, "_hidden_tools", "{}");
+    ASSERT_NOT_NULL(hint);
+    free(hint);
+
+    char *json = cbm_mcp_tools_list(srv);
+    restore_tool_mode(saved_mode);
+    ASSERT_NOT_NULL(json);
+
+    ASSERT(tool_schema_has_property(json, "get_code_snippet", "compact"));
+    ASSERT(tool_schema_has_property(json, "get_architecture", "exclude"));
+    ASSERT_NOT_NULL(strstr(json, "Graph edge creation from traces is not yet implemented"));
+    ASSERT_NOT_NULL(strstr(json, "Reserved for future multi-hop impact traversal"));
+
+    free(json);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* ── 2. Dispatch tests ────────────────────────────────────── */
 
 TEST(search_graph_dispatch) {
@@ -2506,6 +2530,7 @@ SUITE(tool_consolidation) {
     RUN_TEST(streamlined_reveal_covers_classic_capabilities);
     RUN_TEST(streamlined_core_parameter_contract);
     RUN_TEST(revealed_trace_path_parameter_contract);
+    RUN_TEST(revealed_advanced_tool_schema_matches_handlers);
     /* Dispatch */
     RUN_TEST(search_graph_dispatch);
     RUN_TEST(query_graph_dispatch);

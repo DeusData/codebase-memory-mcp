@@ -500,6 +500,9 @@ static const tool_def_t TOOLS[] = {
      "\"Auto-pick best match when name is ambiguous (by degree). Shows alternatives in response."
      "\"},\"include_neighbors\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Include "
      "caller/callee names (up to 10 each). Adds context but increases response size.\"},"
+     "\"compact\":{\"type\":\"boolean\",\"default\":true,\"description\":\"Per-call override "
+     "for the compact config key (true by default). Omit name when it equals the last segment "
+     "of qualified_name.\"},"
      "\"max_lines\":{\"type\":\"integer\",\"description\":\"Max source lines "
      "(configurable via snippet_max_lines config key). Set to 0 for unlimited. When truncated, "
      "response includes total_lines and signature for context.\"},\"mode\":{\"type\":\"string\",\"enum\":[\"full\",\"signature\","
@@ -525,7 +528,10 @@ static const tool_def_t TOOLS[] = {
      "src/server. Leading ./, leading slash, trailing slash, and backslashes are normalized.\"},"
      "\"aspects\":{\"type\":"
      "\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Optional sections to include; "
-     "omit for the default overview.\"}},\"required\":[\"project\"]}"},
+     "omit for the default overview.\"},"
+     "\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Optional "
+     "file-path globs to omit from key_functions, e.g. tests/** or vendor/**.\"}},"
+     "\"required\":[\"project\"]}"},
 
     {"search_code",
      "Search source code with text or regex patterns. Case-insensitive by default. "
@@ -566,8 +572,9 @@ static const tool_def_t TOOLS[] = {
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
      "\"Indexed project name whose repository history should be compared.\"},\"scope\":{\"type\":"
      "\"string\",\"description\":\"Optional path or subsystem scope for impact analysis.\"},"
-     "\"depth\":{\"type\":\"integer\",\"default\":2,\"description\":\"Maximum dependency hops to "
-     "include in the impact graph.\"},\"base_branch\":{\"type\":"
+     "\"depth\":{\"type\":\"integer\",\"default\":2,\"description\":\"Reserved for future "
+     "multi-hop impact traversal; current result reports changed files and directly defined "
+     "symbols.\"},\"base_branch\":{\"type\":"
      "\"string\",\"default\":\"main\",\"description\":\"Git branch used when since is omitted.\"},"
      "\"since\":{\"type\":\"string\",\"description\":"
      "\"Git ref or tag to compare from (e.g. HEAD~5, v0.5.0). Diffs <ref>...HEAD.\"}},"
@@ -584,7 +591,9 @@ static const tool_def_t TOOLS[] = {
      "names to return in sections mode.\"}},\"required\":[\"project\"]"
      "}"},
 
-    {"ingest_traces", "Ingest runtime traces to enhance the knowledge graph",
+    {"ingest_traces",
+     "Accept runtime trace events and report the event count. Graph edge creation from traces is "
+     "not yet implemented.",
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\",\"items\":{\"type\":"
      "\"object\"},\"description\":\"Runtime trace events to merge into the graph.\"},\"project\":{\"type\":"
      "\"string\",\"description\":\"Indexed project name receiving the trace data.\"}},\"required\":[\"traces\",\"project\"]}"},
