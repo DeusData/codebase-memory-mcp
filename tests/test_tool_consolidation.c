@@ -9,7 +9,10 @@
  */
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/constants.h"
+#include "test_helpers.h"
 #include "test_framework.h"
+#include <cli/cli.h>
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <depindex/depindex.h>
@@ -139,6 +142,48 @@ static void restore_tool_mode(char *saved) {
     } else {
         unsetenv("CBM_TOOL_MODE");
     }
+}
+
+static char *extract_tool_text(const char *mcp_result) {
+    yyjson_doc *doc = yyjson_read(mcp_result, strlen(mcp_result), 0);
+    if (!doc) {
+        return strdup(mcp_result);
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *content = yyjson_obj_get(root, "content");
+    if (!content || !yyjson_is_arr(content)) {
+        yyjson_doc_free(doc);
+        return strdup(mcp_result);
+    }
+    yyjson_val *item = yyjson_arr_get(content, 0);
+    yyjson_val *text = item ? yyjson_obj_get(item, "text") : NULL;
+    const char *str = text && yyjson_is_str(text) ? yyjson_get_str(text) : mcp_result;
+    char *copy = strdup(str);
+    yyjson_doc_free(doc);
+    return copy;
+}
+
+static bool json_array_has_string(const char *json, const char *array_key, const char *value) {
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) {
+        return false;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *arr = yyjson_obj_get(root, array_key);
+    bool found = false;
+    if (arr && yyjson_is_arr(arr)) {
+        yyjson_arr_iter it;
+        yyjson_arr_iter_init(arr, &it);
+        yyjson_val *item;
+        while ((item = yyjson_arr_iter_next(&it)) != NULL) {
+            if (yyjson_is_str(item) && strcmp(yyjson_get_str(item), value) == 0) {
+                found = true;
+                break;
+            }
+        }
+    }
+    yyjson_doc_free(doc);
+    return found;
 }
 
 /* ── 1. Tool visibility tests ─────────────────────────────── */
@@ -273,6 +318,53 @@ TEST(hidden_tools_reveal_discoverable_tools) {
     free(after);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(hidden_tools_payload_excludes_already_visible_configured_tools) {
+    char *saved_mode = save_tool_mode();
+    setenv("CBM_TOOL_MODE", "streamlined", 1);
+
+    char *tmp = th_mktempdir("cbm_hidden_tools_cfg");
+    ASSERT_NOT_NULL(tmp);
+    char cfg_dir[CBM_SZ_512];
+    int n = snprintf(cfg_dir, sizeof(cfg_dir), "%s", tmp);
+    ASSERT_TRUE(n > 0 && (size_t)n < sizeof(cfg_dir));
+
+    cbm_config_t *cfg = cbm_config_open(cfg_dir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, "tool_index_repository", "true"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+
+    char *before = cbm_mcp_tools_list(srv);
+    ASSERT_NOT_NULL(before);
+    ASSERT(tool_list_has_exact_name(before, "index_repository"));
+    ASSERT(!tool_list_has_exact_name(before, "get_architecture"));
+    free(before);
+
+    char *hint = cbm_mcp_handle_tool(srv, "_hidden_tools", "{}");
+    ASSERT_NOT_NULL(hint);
+    char *text = extract_tool_text(hint);
+    ASSERT_NOT_NULL(text);
+    ASSERT(json_array_has_string(text, "advanced_tools", "index_repository"));
+    ASSERT(json_array_has_string(text, "already_visible_tools", "index_repository"));
+    ASSERT(!json_array_has_string(text, "hidden_tools", "index_repository"));
+    ASSERT(json_array_has_string(text, "hidden_tools", "get_architecture"));
+    free(text);
+    free(hint);
+
+    char *after = cbm_mcp_tools_list(srv);
+    ASSERT_NOT_NULL(after);
+    ASSERT(tool_list_has_exact_name(after, "get_architecture"));
+    ASSERT_EQ(17, tool_list_exact_count(after));
+    free(after);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    restore_tool_mode(saved_mode);
     PASS();
 }
 
@@ -2527,6 +2619,7 @@ SUITE(tool_consolidation) {
     RUN_TEST(api_surface_default_streamlined_regression_gate);
     RUN_TEST(api_surface_classic_regression_gate);
     RUN_TEST(hidden_tools_reveal_discoverable_tools);
+    RUN_TEST(hidden_tools_payload_excludes_already_visible_configured_tools);
     RUN_TEST(streamlined_reveal_covers_classic_capabilities);
     RUN_TEST(streamlined_core_parameter_contract);
     RUN_TEST(revealed_trace_path_parameter_contract);

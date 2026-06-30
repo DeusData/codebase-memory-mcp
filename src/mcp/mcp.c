@@ -669,6 +669,13 @@ static void emit_tool(yyjson_mut_doc *doc, yyjson_mut_val *tools, const tool_def
     yyjson_mut_arr_add_val(tools, tool);
 }
 
+static bool is_streamlined_default_tool(const char *name) {
+    return name && (strcmp(name, "search_graph") == 0 ||
+                    strcmp(name, "query_graph") == 0 ||
+                    strcmp(name, "search_code") == 0 ||
+                    strcmp(name, "trace_path") == 0);
+}
+
 /* cbm_mcp_tools_list() defined after struct cbm_mcp_server (needs full type) */
 
 /* Supported protocol versions, newest first. The server picks the newest
@@ -963,6 +970,40 @@ struct cbm_mcp_server {
     int64_t active_request_id;       /* JSON-RPC id of the in-progress tool call */
 };
 
+static bool cbm_mcp_tool_mode_is_classic(cbm_mcp_server_t *srv) {
+    /* Env var keeps script/test overrides independent from the persisted config. */
+    char tool_mode_buf[CBM_SZ_64];
+    const char *tool_mode = cbm_safe_getenv("CBM_TOOL_MODE", tool_mode_buf,
+                                            sizeof(tool_mode_buf), NULL);
+    if (tool_mode && tool_mode[0] != '\0') {
+        return strcmp(tool_mode, "classic") == 0;
+    }
+    tool_mode = (srv && srv->config)
+        ? cbm_config_get(srv->config, CBM_CONFIG_TOOL_MODE, "streamlined")
+        : "streamlined";
+    return strcmp(tool_mode, "classic") == 0;
+}
+
+static bool cbm_mcp_tool_config_enabled(cbm_mcp_server_t *srv, const char *tool_name) {
+    if (!srv || !srv->config || !tool_name) {
+        return false;
+    }
+    char key[CBM_SZ_64];
+    int n = snprintf(key, sizeof(key), "tool_%s", tool_name);
+    if (n < 0 || (size_t)n >= sizeof(key)) {
+        return false;
+    }
+    return cbm_config_get_bool(srv->config, key, false);
+}
+
+static bool cbm_mcp_advanced_tool_visible(cbm_mcp_server_t *srv, const char *tool_name) {
+    if (cbm_mcp_tool_mode_is_classic(srv)) {
+        return true;
+    }
+    return (srv && srv->hidden_tools_revealed) ||
+           cbm_mcp_tool_config_enabled(srv, tool_name);
+}
+
 static int cbm_mcp_config_int_clamped(cbm_mcp_server_t *srv, const char *key, int default_val,
                                       int min_val, int max_val) {
     int value = srv && srv->config ? cbm_config_get_int(srv->config, key, default_val) : default_val;
@@ -1070,14 +1111,7 @@ static bool cbm_mcp_run_sync_auto_index(cbm_mcp_server_t *srv, const char *root_
 /* ── Tool list (needs full struct definition above) ──────────── */
 
 char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
-    /* Env var CBM_TOOL_MODE overrides config (for backwards compat without config store) */
-    const char *tool_mode = getenv("CBM_TOOL_MODE");
-    if (!tool_mode || tool_mode[0] == '\0') {
-        tool_mode = (srv && srv->config)
-            ? cbm_config_get(srv->config, CBM_CONFIG_TOOL_MODE, "streamlined")
-            : "streamlined";
-    }
-    bool classic = (strcmp(tool_mode, "classic") == 0);
+    bool classic = cbm_mcp_tool_mode_is_classic(srv);
     bool reveal_hidden = (!classic && srv && srv->hidden_tools_revealed);
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -1091,10 +1125,7 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
          * TOOLS[] plus fork-only aliases from STREAMLINED_TOOLS[]. Keeping
          * canonical tools in TOOLS[] prevents schema drift between modes. */
         for (int i = 0; i < TOOL_COUNT; i++) {
-            if (strcmp(TOOLS[i].name, "search_graph") == 0 ||
-                strcmp(TOOLS[i].name, "query_graph") == 0 ||
-                strcmp(TOOLS[i].name, "search_code") == 0 ||
-                strcmp(TOOLS[i].name, "trace_path") == 0) {
+            if (is_streamlined_default_tool(TOOLS[i].name)) {
                 emit_tool(doc, tools, &TOOLS[i]);
             }
         }
@@ -1108,16 +1139,10 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
          * trace_path is already listed from TOOLS[] above, so skip it here.
          * (get_code is streamlined-only; get_code_snippet is the TOOLS[] name.) */
         for (int i = 0; i < TOOL_COUNT; i++) {
-            if (strcmp(TOOLS[i].name, "search_graph") == 0 ||
-                strcmp(TOOLS[i].name, "query_graph") == 0 ||
-                strcmp(TOOLS[i].name, "search_code") == 0 ||
-                strcmp(TOOLS[i].name, "trace_path") == 0) {
+            if (is_streamlined_default_tool(TOOLS[i].name)) {
                 continue;
             }
-            char key[64];
-            snprintf(key, sizeof(key), "tool_%s", TOOLS[i].name);
-            if (reveal_hidden ||
-                (srv && srv->config && cbm_config_get_bool(srv->config, key, false))) {
+            if (reveal_hidden || cbm_mcp_tool_config_enabled(srv, TOOLS[i].name)) {
                 emit_tool(doc, tools, &TOOLS[i]);
             }
         }
@@ -6901,6 +6926,55 @@ static char *handle_index_dependencies(cbm_mcp_server_t *srv, const char *args) 
 
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
+static char *build_hidden_tools_payload(cbm_mcp_server_t *srv) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return heap_strdup("{\"error\":\"failed to build hidden tools payload\"}");
+    }
+
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    yyjson_mut_val *advanced = yyjson_mut_arr(doc);
+    yyjson_mut_val *hidden = yyjson_mut_arr(doc);
+    yyjson_mut_val *visible = yyjson_mut_arr(doc);
+
+    for (int i = 0; i < TOOL_COUNT; i++) {
+        const char *name = TOOLS[i].name;
+        if (is_streamlined_default_tool(name)) {
+            continue;
+        }
+
+        yyjson_mut_arr_add_str(doc, advanced, name);
+        if (cbm_mcp_advanced_tool_visible(srv, name)) {
+            yyjson_mut_arr_add_str(doc, visible, name);
+        } else {
+            yyjson_mut_arr_add_str(doc, hidden, name);
+        }
+    }
+
+    yyjson_mut_obj_add_val(doc, root, "advanced_tools", advanced);
+    yyjson_mut_obj_add_val(doc, root, "hidden_tools", hidden);
+    yyjson_mut_obj_add_val(doc, root, "already_visible_tools", visible);
+    yyjson_mut_obj_add_bool(doc, root, "revealed", true);
+    yyjson_mut_obj_add_str(doc, root, "next_step",
+                           "call tools/list again; hidden tools are now advertised for this MCP server process");
+    yyjson_mut_obj_add_str(doc, root, "enable_all",
+                           "set env CBM_TOOL_MODE=classic or config set tool_mode classic");
+    yyjson_mut_obj_add_str(doc, root, "enable_one",
+                           "config set tool_<name> true (e.g. tool_index_repository true)");
+
+    yyjson_mut_val *resources = yyjson_mut_arr(doc);
+    yyjson_mut_arr_add_str(doc, resources, "codebase://schema");
+    yyjson_mut_arr_add_str(doc, resources, "codebase://architecture");
+    yyjson_mut_arr_add_str(doc, resources, "codebase://status");
+    yyjson_mut_obj_add_val(doc, root, "resources", resources);
+
+    char *out = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return out ? out : heap_strdup("{\"error\":\"failed to serialize hidden tools payload\"}");
+}
+
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
     if (!tool_name) {
         return cbm_mcp_text_result(
@@ -6968,22 +7042,16 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     /* _hidden_tools: informational pseudo-tool for progressive disclosure */
     if (strcmp(tool_name, "_hidden_tools") == 0) {
         bool changed = srv && !srv->hidden_tools_revealed;
+        char *payload = build_hidden_tools_payload(srv);
         if (srv) {
             srv->hidden_tools_revealed = true;
         }
         if (changed) {
             send_notification(srv, "notifications/tools/list_changed");
         }
-        return cbm_mcp_text_result(
-            "{\"hidden_tools\":[\"index_repository\",\"get_code_snippet\","
-            "\"get_graph_schema\",\"get_architecture\",\"list_projects\","
-            "\"delete_project\",\"index_status\",\"detect_changes\","
-            "\"manage_adr\",\"ingest_traces\",\"index_dependencies\"],"
-            "\"revealed\":true,"
-            "\"next_step\":\"call tools/list again; these tools are now advertised for this MCP server process\","
-            "\"enable_all\":\"set env CBM_TOOL_MODE=classic or config set tool_mode classic\","
-            "\"enable_one\":\"config set tool_<name> true (e.g. tool_index_repository true)\","
-            "\"resources\":[\"codebase://schema\",\"codebase://architecture\",\"codebase://status\"]}", false);
+        char *result = cbm_mcp_text_result(payload, false);
+        free(payload);
+        return result;
     }
 
     char msg[512];
