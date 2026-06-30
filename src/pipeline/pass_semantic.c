@@ -64,19 +64,6 @@ static const char *itoa_log(int val) {
     return bufs[i];
 }
 
-/* Build per-file import map from resolved graph-buffer IMPORTS edges. */
-static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
-                            const CBMFileResult *result, const char ***out_keys,
-                            const char ***out_vals, int *out_count) {
-    (void)result;
-    return cbm_pipeline_build_import_map_from_edges(ctx->gbuf, ctx->project_name, rel_path,
-                                                    out_keys, out_vals, out_count);
-}
-
-static void free_import_map(const char **keys, const char **vals, int count) {
-    cbm_pipeline_free_import_map(keys, vals, count);
-}
-
 /* Resolve a class/type name through the registry. Returns borrowed QN or NULL. */
 static const char *resolve_as_class(const cbm_registry_t *reg, const char *name,
                                     const char *module_qn, const char **imp_keys,
@@ -452,7 +439,8 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        cbm_pipeline_build_import_map_from_edges(ctx->gbuf, ctx->project_name, rel, &imp_keys,
+                                                 &imp_vals, &imp_count);
 
         char *module_qn = cbm_pipeline_fqn_module(ctx->project_name, rel);
 
@@ -467,7 +455,7 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
             resolve_impl_traits(ctx, result, module_qn, imp_keys, imp_vals, imp_count);
 
         free(module_qn);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pipeline_free_import_map(imp_keys, imp_vals, imp_count);
         if (result_owned) {
             cbm_free_result(result);
         }

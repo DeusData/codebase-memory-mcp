@@ -75,18 +75,6 @@ static const char *itoa_log(int val) {
     return bufs[i];
 }
 
-static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
-                            const CBMFileResult *result, const char ***out_keys,
-                            const char ***out_vals, int *out_count) {
-    (void)result;
-    return cbm_pipeline_build_import_map_from_edges(ctx->gbuf, ctx->project_name, rel_path,
-                                                    out_keys, out_vals, out_count);
-}
-
-static void free_import_map(const char **keys, const char **vals, int count) {
-    cbm_pipeline_free_import_map(keys, vals, count);
-}
-
 /* Handle a route registration call: create Route node + HANDLES edge. */
 static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                       const cbm_gbuf_node_t *source_node, const char *module_qn,
@@ -373,7 +361,8 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        cbm_pipeline_build_import_map_from_edges(ctx->gbuf, ctx->project_name, rel, &imp_keys,
+                                                 &imp_vals, &imp_count);
 
         /* Compute module QN for same-module resolution */
         char *module_qn = cbm_pipeline_fqn_module(ctx->project_name, rel);
@@ -409,7 +398,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         cbm_registry_resolve_cache_end();
 
         free(module_qn);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pipeline_free_import_map(imp_keys, imp_vals, imp_count);
         if (result_owned) {
             cbm_free_result(result);
         }
@@ -544,7 +533,8 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, files[i].rel_path, result, &imp_keys, &imp_vals, &imp_count);
+        cbm_pipeline_build_import_map_from_edges(ctx->gbuf, ctx->project_name, files[i].rel_path,
+                                                 &imp_keys, &imp_vals, &imp_count);
 
         for (int d = 0; d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];
@@ -563,7 +553,7 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         }
 
         free(module_qn);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pipeline_free_import_map(imp_keys, imp_vals, imp_count);
         free(source);
     }
 

@@ -189,19 +189,6 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
     return defs;
 }
 
-/* Build per-file import map (local_name -> resolved module QN) from resolved
- * IMPORTS edges. Returns 0 with *out_count = 0 when the file has no imports. */
-static int pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name,
-                                const char *rel_path, const char ***out_keys,
-                                const char ***out_vals, int *out_count) {
-    return cbm_pipeline_build_import_map_from_edges(gbuf, project_name, rel_path, out_keys,
-                                                    out_vals, out_count);
-}
-
-static void pxc_free_import_map(const char **keys, const char **vals, int count) {
-    cbm_pipeline_free_import_map(keys, vals, count);
-}
-
 /* Detect TS dialect flags from a relative path. */
 void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool *out_jsx,
                       bool *out_dts) {
@@ -418,8 +405,8 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        pxc_build_import_map(ctx->gbuf, ctx->project_name, files[i].rel_path, &imp_keys, &imp_vals,
-                             &imp_count);
+        cbm_pipeline_build_import_map_from_edges(ctx->gbuf, ctx->project_name, files[i].rel_path,
+                                                 &imp_keys, &imp_vals, &imp_count);
 
         if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
             bool js, jsx, dts;
@@ -433,7 +420,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         per_lang_calls++;
         processed++;
 
-        pxc_free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pipeline_free_import_map(imp_keys, imp_vals, imp_count);
         free(source);
     }
 
