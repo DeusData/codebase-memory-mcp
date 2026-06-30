@@ -419,7 +419,8 @@ static const tool_def_t TOOLS[] = {
      "file. Use summary first to understand scope, then full with filters to drill down."
      "\"},\"summary\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Alias for "
      "mode=summary. Kept for concise prompts; ignored when mode is set."
-     "\"},\"compact\":{\"type\":\"boolean\",\"default\":true,\"description\":\"Omit fields at their "
+     "\"},\"compact\":{\"type\":\"boolean\",\"default\":true,\"description\":\"Per-call override for the compact config key "
+     "(true by default). Omit fields at their "
      "default: name when it equals qualified_name's last segment (e.g. \\\"main\\\" in "
      "\\\"pkg.main\\\"), empty label/file_path, and zero degrees. Absent fields assume defaults: "
      "label/file_path='', degree=0. Saves tokens.\"},"
@@ -467,7 +468,7 @@ static const tool_def_t TOOLS[] = {
      "trace_max_results config key). Set higher for exhaustive traces. Response includes "
      "callees_total/callers_total for truncation awareness.\"},\"compact\":{\"type\":\"boolean\","
      "\"default\":true,\"description\":"
-     "\"Omit name when it equals qualified_name's last segment (e.g. \\\"main\\\" in \\\"pkg.main\\\"). Reduces token count.\"},"
+     "\"Per-call override for the compact config key (true by default). Omit name when it equals qualified_name's last segment (e.g. \\\"main\\\" in \\\"pkg.main\\\"). Reduces token count.\"},"
      "\"mode\":{\"type\":\"string\",\"enum\":[\"calls\",\"data_flow\",\"cross_service\"],"
      "\"default\":\"calls\",\"description\":\"Default edge set when edge_types is omitted: "
      "calls follows CALLS, data_flow follows CALLS+DATA_FLOWS, cross_service follows "
@@ -635,7 +636,7 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "\"include_neighbors\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Include "
      "caller/callee names for local context.\"},"
      "\"compact\":{\"type\":\"boolean\",\"default\":true,"
-     "\"description\":\"Omit name when it equals last segment of qualified_name. Default follows compact config.\"}"
+     "\"description\":\"Per-call override for the compact config key (true by default). Omit name when it equals last segment of qualified_name.\"}"
      "},\"required\":[\"qualified_name\"]}"},
 };
 static const int STREAMLINED_TOOL_COUNT = sizeof(STREAMLINED_TOOLS) / sizeof(STREAMLINED_TOOLS[0]);

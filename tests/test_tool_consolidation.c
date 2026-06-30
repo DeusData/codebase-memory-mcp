@@ -363,6 +363,7 @@ TEST(streamlined_core_parameter_contract) {
         ASSERT(tool_schema_has_property(json, "get_code", code_params[i]));
     }
     ASSERT(tool_schema_required_has(json, "get_code", "qualified_name"));
+    ASSERT_NOT_NULL(strstr(json, "compact config key"));
 
     const char *source_params[] = {
         "pattern", "project", "file_pattern", "path_filter", "regex",
