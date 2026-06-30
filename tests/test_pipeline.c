@@ -720,6 +720,87 @@ TEST(pipeline_edge_props_valid_json) {
     PASS();
 }
 
+TEST(pipeline_persisted_route_purity_for_http_literals) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/route_noise.py", g_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(path));
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        teardown_test_repo();
+        FAIL("failed to write route_noise.py");
+    }
+    fprintf(f, "import os\n"
+               "from fastapi import FastAPI\n"
+               "import requests\n"
+               "\n"
+               "app = FastAPI()\n"
+               "\n"
+               "@app.get('/api/orders')\n"
+               "def orders():\n"
+               "    return {'ok': True}\n"
+               "\n"
+               "def client():\n"
+               "    requests.get('/tmp/alpha')\n"
+               "    requests.get('/Users/test/plans/foo.md')\n"
+               "    requests.get('/ar:allow')\n"
+               "    os.path.join('/api', 'orders')\n"
+               "    open('/usr/bin/uv')\n");
+    fclose(f);
+
+    char db_path[CBM_PATH_MAX];
+    n = snprintf(db_path, sizeof(db_path), "%s/test_route_purity.db", g_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(db_path));
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, project, "Route", &routes, &route_count),
+              CBM_STORE_OK);
+    bool saw_api = false;
+    for (int i = 0; i < route_count; i++) {
+        const char *name = routes[i].name ? routes[i].name : "";
+        if (strcmp(name, "/api/orders") == 0) {
+            saw_api = true;
+            continue;
+        }
+        ASSERT_FALSE(strcmp(name, "/tmp/alpha") == 0);
+        ASSERT_FALSE(strcmp(name, "/Users/test/plans/foo.md") == 0);
+        ASSERT_FALSE(strcmp(name, "/ar:allow") == 0);
+        ASSERT_FALSE(strcmp(name, "/usr/bin/uv") == 0);
+    }
+    ASSERT_TRUE(saw_api);
+
+    cbm_search_params_t params = {
+        .project = project, .label = "Route", .min_degree = -1, .max_degree = -1, .limit = 100};
+    cbm_search_output_t out = {0};
+    ASSERT_EQ(cbm_store_search(s, &params, &out), CBM_STORE_OK);
+    for (int i = 0; i < out.count; i++) {
+        const char *name = out.results[i].node.name ? out.results[i].node.name : "";
+        ASSERT_FALSE(strcmp(name, "/tmp/alpha") == 0);
+        ASSERT_FALSE(strcmp(name, "/Users/test/plans/foo.md") == 0);
+        ASSERT_FALSE(strcmp(name, "/ar:allow") == 0);
+        ASSERT_FALSE(strcmp(name, "/usr/bin/uv") == 0);
+    }
+
+    cbm_store_search_free(&out);
+    cbm_store_free_nodes(routes, route_count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
 /* ── Calls pass tests ──────────────────────────────────────────── */
 
 TEST(pipeline_calls_resolution) {
@@ -7063,6 +7144,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_definitions_properties);
     RUN_TEST(pipeline_def_props_valid_json_when_oversized);
     RUN_TEST(pipeline_edge_props_valid_json);
+    RUN_TEST(pipeline_persisted_route_purity_for_http_literals);
     /* Complexity propagation pass (Tier B) */
     RUN_TEST(pipeline_complexity_transitive_loop_depth);
     RUN_TEST(pipeline_complexity_scc_tld_is_deterministic);
