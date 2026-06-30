@@ -1204,7 +1204,7 @@ TEST(gbuf_dump_relative_root_path_retained) {
 }
 
 TEST(gbuf_dump_failure_before_replace_keeps_existing_db) {
-    static const char *fail_env = "CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE";
+    static const char *fail_env = CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE;
     char saved_fail[CBM_SZ_32] = {0};
     bool had_fail = cbm_safe_getenv(fail_env, saved_fail, sizeof(saved_fail), NULL) != NULL;
 

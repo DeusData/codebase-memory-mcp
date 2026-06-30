@@ -5036,6 +5036,28 @@ static cbm_config_t *incremental_test_config(const char *cache_dir) {
     return cfg;
 }
 
+static int pipeline_store_has_function_name(const char *db_path, const char *project,
+                                            const char *name) {
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return 0;
+    }
+    cbm_node_t *funcs = NULL;
+    int count = 0;
+    int found = 0;
+    if (cbm_store_find_nodes_by_label(s, project, "Function", &funcs, &count) == CBM_STORE_OK) {
+        for (int i = 0; i < count; i++) {
+            if (funcs[i].name && strcmp(funcs[i].name, name) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        cbm_store_free_nodes(funcs, count);
+    }
+    cbm_store_close(s);
+    return found;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  FastAPI Depends() edge tracking (PR #66, fix #27)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -5235,6 +5257,67 @@ TEST(incremental_detects_changed_file) {
     free(project);
     cbm_config_close(cfg);
 
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_dump_failure_keeps_existing_db) {
+    static const char *test_env_enabled = "1";
+    char saved_fail[CBM_SZ_32] = {0};
+    bool had_fail =
+        cbm_safe_getenv(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE, saved_fail, sizeof(saved_fail),
+                        NULL) != NULL;
+
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_before = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_before, 0);
+    cbm_store_close(s);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package main\n\n"
+               "func Helper() string {\n\treturn \"hello\"\n}\n\n"
+               "func NewFunc() int {\n\treturn 42\n}\n");
+    fclose(f);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+
+    cbm_setenv(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE, test_env_enabled, 1);
+    int rc = cbm_pipeline_run(p);
+    if (had_fail) {
+        cbm_setenv(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE, saved_fail, 1);
+    } else {
+        cbm_unsetenv(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE);
+    }
+
+    ASSERT_NEQ(rc, 0);
+    s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_count_nodes(s, project), nodes_before);
+    cbm_store_close(s);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
+
+    cbm_pipeline_free(p);
+    free(project);
+    cbm_config_close(cfg);
     cleanup_incremental_repo();
     PASS();
 }
@@ -6780,6 +6863,7 @@ SUITE(pipeline) {
     /* Incremental */
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_detects_changed_file);
+    RUN_TEST(incremental_dump_failure_keeps_existing_db);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
     RUN_TEST(incremental_fast_preserves_mode_skipped_tools_dir);
