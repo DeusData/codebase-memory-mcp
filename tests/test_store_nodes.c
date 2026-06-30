@@ -5,6 +5,8 @@
  * TestNodeDedup, TestProjectCRUD, TestUpsertNodeBatch, etc.)
  */
 #include "test_framework.h"
+#include "test_graph_diff.h"
+#include "test_helpers.h"
 #include "test_sqlite_helpers.h"
 #include <foundation/compat.h>
 #include <foundation/constants.h>
@@ -1443,8 +1445,20 @@ TEST(store_file_delta_publish_matches_fresh_final_graph) {
     ASSERT_STR_EQ(items[0], "main.go");
     store_free_string_array(items, count);
 
+    char *tmp = th_mktempdir("cbm_delta_graph_diff");
+    ASSERT_NOT_NULL(tmp);
+    const char *delta_db = TH_PATH(tmp, "delta.db");
+    const char *fresh_db = TH_PATH(tmp, "fresh.db");
+    ASSERT_EQ(cbm_store_dump_to_file(delta_store, delta_db), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_dump_to_file(fresh_store, fresh_db), CBM_STORE_OK);
+    char diff_err[CBM_SZ_8K] = {0};
+    ASSERT_EQ(cbm_test_compare_canonical_graphs(delta_db, fresh_db, "test", diff_err,
+                                                sizeof(diff_err)),
+              0);
+
     cbm_store_close(delta_store);
     cbm_store_close(fresh_store);
+    th_cleanup(tmp);
     PASS();
 }
 

@@ -4060,12 +4060,40 @@ TEST(pipeline_file_delta_orchestrates_descriptor_plan_and_publish) {
     ASSERT_STR_EQ(import_paths[0], main_rel);
     pipeline_delta_free_string_array(import_paths, import_count);
 
+    cbm_store_t *fresh = cbm_store_open_memory();
+    ASSERT_NOT_NULL(fresh);
+    ASSERT_EQ(cbm_store_upsert_project(fresh, project, tmp), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_reserve_index_generation(fresh, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, BASE_GENERATION);
+    ASSERT_EQ(cbm_store_finish_index_generation(fresh, project, generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_reserve_index_generation(fresh, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, FINAL_GENERATION);
+    const cbm_store_file_delta_t *fresh_store_deltas[] = {&final_helper_delta.delta,
+                                                          &final_main_delta.delta};
+    ASSERT_EQ(cbm_store_publish_file_delta_batch_complete(
+                  fresh, fresh_store_deltas, PIPELINE_DELTA_PARITY_BATCH_COUNT),
+              CBM_STORE_OK);
+
+    const char *delta_db = TH_PATH(tmp, "delta-route.db");
+    const char *fresh_db = TH_PATH(tmp, "fresh-final.db");
+    ASSERT_EQ(cbm_store_dump_to_file(s, delta_db), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_dump_to_file(fresh, fresh_db), CBM_STORE_OK);
+    char diff_err[CBM_SZ_8K] = {0};
+    ASSERT_EQ(cbm_test_compare_canonical_graphs(delta_db, fresh_db, project, diff_err,
+                                                sizeof(diff_err)),
+              0);
+
     cbm_pipeline_file_delta_plan_free(&main_before_helper_plan);
     cbm_pipeline_file_delta_plan_free(&main_only_apply_plan);
     cbm_pipeline_file_delta_plan_free(&batch_plan);
     cbm_pipeline_file_delta_free(&final_helper_delta);
     cbm_pipeline_file_delta_free(&final_main_delta);
     cbm_gbuf_free(final_gb);
+    cbm_store_close(fresh);
     cbm_store_close(s);
     th_cleanup(tmp);
     PASS();
