@@ -146,6 +146,14 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 int cbm_pipeline_insert_import_edge(cbm_pipeline_ctx_t *ctx, int64_t source_id,
                                     const cbm_gbuf_node_t *target, const char *local_name);
 
+/* Resolve and insert all IMPORTS edges for one file.
+ * Shared by sequential and parallel definition passes so source-file lookup,
+ * resolver order, JSON properties, and self-edge filtering cannot drift. */
+int cbm_pipeline_create_import_edges_for_file(cbm_pipeline_ctx_t *ctx,
+                                              const CBMFileResult *result,
+                                              const char *rel_path,
+                                              CBMHashTable *namespace_map);
+
 /* Build a per-file import map from already-resolved IMPORTS edges.
  * Returned keys are heap strings; values are borrowed graph-buffer QNs. */
 int cbm_pipeline_build_import_map_from_edges(const cbm_gbuf_t *gbuf, const char *project_name,

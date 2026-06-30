@@ -414,30 +414,6 @@ static int create_env_configures_for_file(cbm_pipeline_ctx_t *ctx, const CBMFile
     return count;
 }
 
-/* Create IMPORTS edges for one file's imports.  Mirrors the resolution
- * logic in pass_parallel.c register_and_link_def — keep the two in sync. */
-static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
-                                        const char *rel, CBMHashTable *namespace_map) {
-    int count = 0;
-    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
-    const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-    if (!source_node) {
-        free(file_qn);
-        return 0;
-    }
-    for (int j = 0; j < result->imports.count; j++) {
-        const CBMImport *imp = &result->imports.items[j];
-        if (!imp->module_path) {
-            continue;
-        }
-        const cbm_gbuf_node_t *target =
-            cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
-        count += cbm_pipeline_insert_import_edge(ctx, source_node->id, target, imp->local_name);
-    }
-    free(file_qn);
-    return count;
-}
-
 int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                   int file_count) {
     cbm_log_info("pass.start", "pass", "definitions", "files", itoa_log(file_count));
@@ -516,7 +492,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
              * resolve to defs already in the graph, but the file's
              * own defs are now persisted before the lookup. No namespace
              * map is available without the cache (single-file scope). */
-            total_imports += create_import_edges_for_file(ctx, result, rel, NULL);
+            total_imports += cbm_pipeline_create_import_edges_for_file(ctx, result, rel, NULL);
             create_channel_edges_for_file(ctx, result, rel);
             create_env_configures_for_file(ctx, result, rel);
             cbm_free_result(result);
@@ -548,8 +524,8 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             if (!result) {
                 continue;
             }
-            total_imports +=
-                create_import_edges_for_file(ctx, result, files[i].rel_path, namespace_map);
+            total_imports += cbm_pipeline_create_import_edges_for_file(
+                ctx, result, files[i].rel_path, namespace_map);
             create_channel_edges_for_file(ctx, result, files[i].rel_path);
             create_env_configures_for_file(ctx, result, files[i].rel_path);
         }
