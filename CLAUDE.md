@@ -1,5 +1,11 @@
 # codebase-memory-mcp — Developer Notes for Claude
 
+Before changing capabilities or architecture, map the existing design first: look for
+equivalent tools, config, helpers, metadata, algorithms, and conventions. Prefer extending
+the established path over adding a parallel one. New abstractions should close a named gap
+and fit the repo's ownership, allocation, threading, logging, portability, protocol I/O,
+and naming patterns.
+
 ## Build & Test (C server)
 
 All C targets use `Makefile.cbm`:
