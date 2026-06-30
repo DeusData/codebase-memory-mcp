@@ -8,7 +8,7 @@
 #   - New production diffs should use CBM platform wrappers for env/fs APIs.
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="${CBM_SOURCE_SAFETY_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 violations=0
 
 add_violation() {
@@ -31,7 +31,12 @@ grep_source() {
     if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         git -C "$ROOT" grep -nE "$pattern" -- "$@" 2>/dev/null || true
     else
-        grep -RInE "$pattern" "$@" 2>/dev/null || true
+        local paths=()
+        local p
+        for p in "$@"; do
+            paths+=("$ROOT/$p")
+        done
+        grep -RInE "$pattern" "${paths[@]}" 2>/dev/null || true
     fi
 }
 
