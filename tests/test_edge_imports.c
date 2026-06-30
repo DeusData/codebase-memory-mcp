@@ -1,35 +1,33 @@
 /*
- * test_edge_imports.c — Pipeline/edge-creation reproduction suite for IMPORTS
- * edges across all 9 hybrid-LSP languages.
+ * test_edge_imports.c — Pipeline/edge-creation regression suite for IMPORTS
+ * edges across the hybrid-LSP languages covered below.
  *
  * ── CONTEXT ─────────────────────────────────────────────────────────────────
  * This suite tests the GRAPH LEVEL (pipeline / edge-creation), NOT extraction.
- * A real-repo sanity check (2026-06) found IMPORTS edges ≈ 0 for several
- * languages even though CBMFileResult.imports IS populated at extraction time:
+ * A 2026-06 real-repo sanity check found IMPORTS edges near zero for several
+ * languages even though CBMFileResult.imports was populated at extraction time.
+ * The current branch routes all registered fixtures through resolved IMPORTS
+ * graph edges; a failure here is a regression or an unsupported fixture shape.
  *
  *   Language     import keyword   real-repo edges   status
  *   ----------   --------------   ---------------   --------
- *   Rust         use              2168 uses → 0      BUG (expected RED)
- *   Kotlin       import           6110 → ~0          BUG (expected RED)
- *   Java         import           many  → 0          BUG (expected RED)
- *   C#           using            many  → 0          BUG (expected RED)
- *   PHP          use              many  → ~0          BUG (expected RED)
- *   Python       import/from      working             OK  (expected GREEN)
- *   TypeScript   import           working             OK  (expected GREEN)
- *   Go           import           working             OK  (expected GREEN)
+ *   Rust         use              formerly 2168 uses -> 0 edges
+ *   Kotlin       import           formerly 6110 uses -> near-zero edges
+ *   Java         import           formerly many uses -> 0 edges
+ *   C#           using            formerly many uses -> 0 edges
+ *   PHP          use              formerly many uses -> near-zero edges
+ *   Python       import/from      historical guard
+ *   TypeScript   import           historical guard
+ *   Go           import           historical guard
  *
  * ── WHAT THIS FILE TESTS ────────────────────────────────────────────────────
  * Each test indexes a small multi-file fixture through the FULL production
  * pipeline (index_repository → graph DB), then asserts:
  *   cbm_store_count_edges_by_type(store, project, "IMPORTS") >= N
  *
- * GREEN (guard) tests: Python, TypeScript, Go — these already produce IMPORTS
- * edges and MUST keep doing so. A RED here is a real regression.
- *
- * RED (bug reproduction) tests: Rust, Kotlin, Java, C#, PHP — the pipeline
- * does not yet turn extracted imports into resolved IMPORTS graph edges for
- * these languages. Each test should FAIL until the bug is fixed, at which
- * point it becomes a permanent regression guard.
+ * All registered tests are expected to pass. Python, TypeScript, and Go guard
+ * older working behavior; Rust, Kotlin, Java, C#, and PHP guard the fixed
+ * graph-level import-edge gaps.
  *
  * ── FIXTURE DESIGN ──────────────────────────────────────────────────────────
  * Every fixture uses two files in the same project: one defines a module/type,
@@ -38,9 +36,8 @@
  * so the resolver has a resolvable target in the same project graph.
  *
  * ── REGISTRATION ────────────────────────────────────────────────────────────
- * SUITE(edge_imports) is declared here. Do NOT register it in test_main.c
- * (another agent owns that file); the suite runs standalone via its own runner
- * when linked.
+ * SUITE(edge_imports) is declared here and registered in test_main.c. Run it
+ * directly with: CBM_ONLY_SUITE=edge_imports ./build/c/test-runner
  */
 
 #include "../src/foundation/compat.h"
