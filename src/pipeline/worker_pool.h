@@ -17,11 +17,12 @@ typedef void (*cbm_parallel_fn)(int idx, void *ctx);
 
 /* Options for parallel dispatch. */
 typedef struct {
-    int max_workers;     /* 0 = auto-detect from cbm_default_worker_count */
+    int max_workers;     /* 0 = auto-detect; total callbacks active at once */
     bool force_pthreads; /* unused, kept for API compat */
 } cbm_parallel_for_opts_t;
 
-/* Dispatch `count` iterations of `fn(idx, ctx)` across worker threads.
+/* Dispatch `count` iterations of `fn(idx, ctx)` across worker threads plus
+ * the caller thread, with no more than opts.max_workers callbacks active.
  * Each index [0..count-1] is visited exactly once.
  * Blocks until all iterations complete.
  *

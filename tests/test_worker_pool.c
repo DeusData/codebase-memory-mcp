@@ -204,6 +204,50 @@ TEST(parallel_for_actually_parallel) {
     PASS();
 }
 
+typedef struct {
+    _Atomic int concurrent_max;
+    _Atomic int concurrent_now;
+    _Atomic int arrived;
+    int target_arrivals;
+} concurrency_bound_ctx_t;
+
+static void concurrency_bound_worker(int idx, void *ctx_ptr) {
+    (void)idx;
+    enum { BOUND_SPINS = 5000000 };
+    concurrency_bound_ctx_t *cc = ctx_ptr;
+    int cur = atomic_fetch_add(&cc->concurrent_now, 1) + 1;
+    atomic_fetch_add(&cc->arrived, 1);
+
+    int prev_max = atomic_load(&cc->concurrent_max);
+    while (cur > prev_max) {
+        if (atomic_compare_exchange_weak(&cc->concurrent_max, &prev_max, cur)) {
+            break;
+        }
+    }
+
+    for (int spins = 0; spins < BOUND_SPINS; spins++) {
+        if (atomic_load(&cc->arrived) >= cc->target_arrivals) {
+            break;
+        }
+    }
+    atomic_fetch_sub(&cc->concurrent_now, 1);
+}
+
+TEST(parallel_for_max_workers_is_total_concurrency) {
+    enum { MAX_WORKERS = 2, ITERATIONS = 3 };
+    concurrency_bound_ctx_t cc;
+    atomic_init(&cc.concurrent_max, 0);
+    atomic_init(&cc.concurrent_now, 0);
+    atomic_init(&cc.arrived, 0);
+    cc.target_arrivals = ITERATIONS;
+
+    cbm_parallel_for_opts_t opts = {.max_workers = MAX_WORKERS, .force_pthreads = false};
+    cbm_parallel_for(ITERATIONS, concurrency_bound_worker, &cc, opts);
+
+    ASSERT_LTE(atomic_load(&cc.concurrent_max), MAX_WORKERS);
+    PASS();
+}
+
 static void tls_worker(int idx, void *ctx_ptr) {
     (void)idx;
     static _Thread_local int tls_val = 0;
@@ -387,6 +431,7 @@ SUITE(worker_pool) {
     RUN_TEST(parallel_for_force_pthreads);
     RUN_TEST(parallel_for_per_slot_write);
     RUN_TEST(parallel_for_actually_parallel);
+    RUN_TEST(parallel_for_max_workers_is_total_concurrency);
     RUN_TEST(tls_persistence_across_dispatch);
     /* Resource management & edge cases */
     RUN_TEST(parallel_for_negative_count);
