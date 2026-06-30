@@ -1245,22 +1245,6 @@ static const char *import_candidate_symbol(const char *module_path, char *out, s
     return out;
 }
 
-/* True for node labels that represent an importable definition (so a symbol-name
- * fallback does not link to, e.g., a Variable or Field). */
-static bool import_targetable_label(const char *label) {
-    if (!label) {
-        return false;
-    }
-    static const char *ok[] = {"Class", "Interface", "Function", "Method", "Module", "Struct",
-                               "Enum",  "Trait",     "Type",     "File",   NULL};
-    for (const char **l = ok; *l; l++) {
-        if (strcmp(*l, label) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static int import_target_score(const cbm_gbuf_node_t *target, const char *context_qn) {
     if (!target || !target->qualified_name) {
         return CBM_NOT_FOUND;
@@ -1579,7 +1563,7 @@ static const cbm_gbuf_node_t *resolve_reexported_symbol(const cbm_pipeline_ctx_t
             continue;
         }
         const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(ctx->gbuf, edges[i]->target_id);
-        if (target && import_targetable_label(target->label) &&
+        if (target && cbm_pipeline_label_is_import_target(target->label) &&
             import_target_better(target, best, owner_module_qn)) {
             best = target;
         }
@@ -1795,7 +1779,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
             if (cbm_gbuf_find_by_name(ctx->gbuf, cands[ci], &hits, &n) == 0 && hits) {
                 for (int i = 0; i < n; i++) {
                     const cbm_gbuf_node_t *cand = hits[i];
-                    if (!cand || !import_targetable_label(cand->label)) {
+                    if (!cand || !cbm_pipeline_label_is_import_target(cand->label)) {
                         continue;
                     }
                     if (source_file_qn && cand->qualified_name &&
