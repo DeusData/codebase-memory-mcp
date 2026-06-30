@@ -24,6 +24,7 @@ static const char cbm_delta_reason_delete_requires_full[] = "delete_requires_ful
 static const char cbm_delta_reason_frontier_error[] = "frontier_error";
 static const char cbm_delta_reason_frontier_too_large[] = "frontier_too_large";
 static const char cbm_delta_reason_invalid_input[] = "invalid_input";
+static const char cbm_delta_reason_missing_existing_ownership[] = "missing_existing_ownership";
 static const char cbm_delta_reason_missing_file_metadata[] = "missing_file_metadata";
 static const char cbm_delta_reason_preflight_error[] = "preflight_error";
 static const char cbm_delta_reason_publish_error[] = "publish_error";
@@ -464,6 +465,36 @@ static bool delta_derived_view_supported(const cbm_store_file_delta_t *delta) {
                      strcmp(delta->derived_view_name, CBM_STORE_DERIVED_VIEW_NODES_FTS) == 0);
 }
 
+static bool delta_existing_ownership_available(cbm_store_t *store,
+                                               const cbm_store_file_delta_t *delta,
+                                               cbm_pipeline_file_delta_plan_t *plan) {
+    cbm_file_state_t state = {0};
+    int rc = cbm_store_get_file_state(store, delta->project, delta->rel_path, &state);
+    cbm_store_file_state_free_fields(&state);
+    if (rc == CBM_STORE_NOT_FOUND) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_missing_existing_ownership);
+        return false;
+    }
+    if (rc != CBM_STORE_OK) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_preflight_error);
+        return false;
+    }
+
+    int node_owners = 0;
+    int edge_owners = 0;
+    rc = cbm_store_count_file_delta_owners(store, delta->project, delta->rel_path, &node_owners,
+                                           &edge_owners);
+    if (rc != CBM_STORE_OK) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_preflight_error);
+        return false;
+    }
+    if (node_owners <= 0) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_missing_existing_ownership);
+        return false;
+    }
+    return true;
+}
+
 static bool delta_node_qn_present(const cbm_store_file_delta_t *delta, const char *qn) {
     if (!delta || !qn) {
         return false;
@@ -664,6 +695,9 @@ int cbm_pipeline_plan_file_delta(cbm_store_t *store, const cbm_pipeline_file_del
     if (!delta_plan_precheck_common(delta, out)) {
         return CBM_STORE_OK;
     }
+    if (!delta_existing_ownership_available(store, &delta->delta, out)) {
+        return CBM_STORE_OK;
+    }
     int endpoint_rc = delta_edge_endpoints_resolve(store, &delta->delta);
     if (endpoint_rc == CBM_STORE_NOT_FOUND) {
         delta_plan_set_fallback(out, cbm_delta_reason_unresolved_edge_endpoint);
@@ -729,6 +763,9 @@ int cbm_pipeline_plan_file_delta_batch(cbm_store_t *store,
             return CBM_STORE_OK;
         }
         if (!delta_plan_precheck_common(delta, out)) {
+            return CBM_STORE_OK;
+        }
+        if (!delta_existing_ownership_available(store, &delta->delta, out)) {
             return CBM_STORE_OK;
         }
         int endpoint_rc =
