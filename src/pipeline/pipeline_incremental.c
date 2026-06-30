@@ -1,11 +1,10 @@
 /*
  * pipeline_incremental.c — Disk-based incremental re-indexing.
  *
- * Operates on the existing SQLite DB directly (not RAM-first graph buffer).
  * Compares file mtime+size against stored hashes to classify changed/unchanged.
- * Deletes changed files' nodes (edges cascade via ON DELETE CASCADE),
- * re-parses only changed files through passes into a temp graph buffer,
- * then merges new nodes/edges into the disk DB. Persists updated hashes.
+ * For non-noop changes, loads the existing SQLite graph into a graph buffer,
+ * purges changed/deleted file paths, reparses changed files, and republishes
+ * the full graph. This is correctness containment, not a true delta publish.
  *
  * Called from pipeline.c when a DB with stored hashes already exists.
  */
@@ -33,12 +32,9 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include <stdatomic.h>
 #include <stdint.h>
 
-/* ── Constants ───────────────────────────────────────────────────── */
-
-#define CBM_MS_PER_SEC 1000.0
-#define CBM_NS_PER_MS 1000000.0
-
 /* ── Timing helper (same as pipeline.c) ──────────────────────────── */
+
+static const char cbm_incr_test_env_disabled[] = "0";
 
 /* Fork renames this elapsed_ms_incr (vs pipeline.c's elapsed_ms) to avoid an
  * ODR/duplicate-symbol collision when both TUs are linked into the same binary. */
@@ -47,7 +43,7 @@ static double elapsed_ms_incr(struct timespec start) {
     cbm_clock_gettime(CLOCK_MONOTONIC, &now);
     double s = (double)(now.tv_sec - start.tv_sec);
     double ns = (double)(now.tv_nsec - start.tv_nsec);
-    return (s * CBM_MS_PER_SEC) + (ns / CBM_NS_PER_MS);
+    return (s * (double)CBM_MSEC_PER_SEC) + (ns / (double)CBM_NSEC_PER_MSEC);
 }
 
 /* itoa into static buffer — matches pipeline.c helper. Fork renames to
@@ -61,15 +57,25 @@ static const char *itoa_buf_incr(int v) {
     return buf[idx];
 }
 
+static bool incr_test_fail_phase_enabled(const char *phase) {
+    char buf[CBM_SZ_64];
+    const char *val =
+        cbm_safe_getenv(CBM_TEST_FAIL_INCREMENTAL_PHASE, buf, sizeof(buf), NULL);
+    return val && val[0] != '\0' && strcmp(val, cbm_incr_test_env_disabled) != 0 &&
+           phase && strcmp(val, phase) == 0;
+}
+
 /* ── Platform-portable mtime_ns ──────────────────────────────────── */
 
 static int64_t stat_mtime_ns(const struct stat *st) {
 #ifdef __APPLE__
-    return ((int64_t)st->st_mtimespec.tv_sec * CBM_NS_PER_SEC) + (int64_t)st->st_mtimespec.tv_nsec;
+    return ((int64_t)st->st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+           (int64_t)st->st_mtimespec.tv_nsec;
 #elif defined(_WIN32)
-    return (int64_t)st->st_mtime * CBM_NS_PER_SEC;
+    return (int64_t)st->st_mtime * (int64_t)CBM_NSEC_PER_SEC;
 #else
-    return ((int64_t)st->st_mtim.tv_sec * CBM_NS_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
+    return ((int64_t)st->st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+           (int64_t)st->st_mtim.tv_nsec;
 #endif
 }
 
@@ -1017,7 +1023,13 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         }
     }
     if (pipeline_rc == 0) {
-        pipeline_rc = run_postpasses(&ctx, changed_files, ci, project);
+        if (incr_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_POSTPASS)) {
+            cbm_log_error("incremental.err", "phase", CBM_TEST_FAIL_INCREMENTAL_POSTPASS, "rc",
+                          itoa_buf_incr(CBM_NOT_FOUND));
+            pipeline_rc = CBM_NOT_FOUND;
+        } else {
+            pipeline_rc = run_postpasses(&ctx, changed_files, ci, project);
+        }
     }
 
     free(changed_files);

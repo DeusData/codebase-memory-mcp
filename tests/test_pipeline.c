@@ -5721,6 +5721,31 @@ TEST(import_symbol_fallback_prefers_import_path_over_insertion_order) {
  *  Incremental reindex
  * ═══════════════════════════════════════════════════════════════════ */
 
+typedef struct {
+    const char *key;
+    char value[CBM_SZ_64];
+    bool had_value;
+} pipeline_env_snapshot_t;
+
+static const char pipeline_test_env_enabled[] = "1";
+
+static pipeline_env_snapshot_t pipeline_env_save(const char *key) {
+    pipeline_env_snapshot_t snap = {.key = key};
+    snap.had_value = cbm_safe_getenv(key, snap.value, sizeof(snap.value), NULL) != NULL;
+    return snap;
+}
+
+static void pipeline_env_restore(const pipeline_env_snapshot_t *snap) {
+    if (!snap || !snap->key) {
+        return;
+    }
+    if (snap->had_value) {
+        cbm_setenv(snap->key, snap->value, 1);
+    } else {
+        cbm_unsetenv(snap->key);
+    }
+}
+
 TEST(incremental_full_then_noop) {
     /* Full index, then re-run → should detect no changes and skip */
     if (setup_incremental_repo() != 0) {
@@ -5809,11 +5834,7 @@ TEST(incremental_detects_changed_file) {
 }
 
 TEST(incremental_dump_failure_keeps_existing_db) {
-    static const char *test_env_enabled = "1";
-    char saved_fail[CBM_SZ_32] = {0};
-    bool had_fail =
-        cbm_safe_getenv(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE, saved_fail, sizeof(saved_fail),
-                        NULL) != NULL;
+    pipeline_env_snapshot_t fail_env = pipeline_env_save(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE);
 
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -5832,7 +5853,7 @@ TEST(incremental_dump_failure_keeps_existing_db) {
     cbm_store_close(s);
     ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
 
-    char path[512];
+    char path[CBM_PATH_MAX];
     snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
     FILE *f = fopen(path, "w");
     ASSERT_NOT_NULL(f);
@@ -5847,13 +5868,69 @@ TEST(incremental_dump_failure_keeps_existing_db) {
     ASSERT_NOT_NULL(p);
     cbm_pipeline_apply_config(p, cfg);
 
-    cbm_setenv(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE, test_env_enabled, 1);
+    cbm_setenv(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE, pipeline_test_env_enabled, 1);
     int rc = cbm_pipeline_run(p);
-    if (had_fail) {
-        cbm_setenv(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE, saved_fail, 1);
-    } else {
-        cbm_unsetenv(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE);
+    pipeline_env_restore(&fail_env);
+
+    ASSERT_NEQ(rc, 0);
+    s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_count_nodes(s, project), nodes_before);
+    cbm_store_close(s);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
+
+    cbm_pipeline_free(p);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_postpass_failure_keeps_existing_db) {
+    pipeline_env_snapshot_t fail_env = pipeline_env_save(CBM_TEST_FAIL_INCREMENTAL_PHASE);
+
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
     }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_before = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_before, 0);
+    cbm_store_close(s);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
+
+    char path[CBM_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package main\n\n"
+               "func Helper() string {\n\treturn \"hello\"\n}\n\n"
+               "func NewFunc() int {\n\treturn 42\n}\n");
+    fclose(f);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL, .ignore_file = NULL, .max_file_size = 0};
+    ASSERT_EQ(cbm_discover(g_incr_tmpdir, &opts, &files, &file_count), 0);
+    ASSERT_GT(file_count, 0);
+
+    cbm_setenv(CBM_TEST_FAIL_INCREMENTAL_PHASE, CBM_TEST_FAIL_INCREMENTAL_POSTPASS, 1);
+    int rc = cbm_pipeline_run_incremental(p, g_incr_dbpath, files, file_count);
+    pipeline_env_restore(&fail_env);
+    cbm_discover_free(files, file_count);
 
     ASSERT_NEQ(rc, 0);
     s = cbm_store_open_path(g_incr_dbpath);
@@ -7418,6 +7495,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_detects_changed_file);
     RUN_TEST(incremental_dump_failure_keeps_existing_db);
+    RUN_TEST(incremental_postpass_failure_keeps_existing_db);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
     RUN_TEST(incremental_fast_preserves_mode_skipped_tools_dir);
