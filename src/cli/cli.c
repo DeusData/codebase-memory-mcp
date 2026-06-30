@@ -1575,9 +1575,9 @@ int cbm_remove_codex_mcp(const char *config_path) {
 }
 
 /* ── SessionStart reminder hook (Codex / Gemini / Antigravity) ──────
- * Same methodology as the Claude Code SessionStart hook: a non-blocking
- * lifecycle hook whose stdout is injected as session context, reminding the
- * agent to use codebase-memory-mcp graph tools first. The command is written
+ * Non-blocking lifecycle hook whose stdout is injected as session context,
+ * reminding the agent to use codebase-memory-mcp graph tools first. This
+ * stdout is harness context, not MCP protocol output. The command is written
  * so it is valid both inside a TOML single-quoted literal (Codex config.toml)
  * and a JSON string (Gemini settings.json) — i.e. it contains NO single quotes
  * and NO newlines. (issues #330 + Gemini/Antigravity parity) */
