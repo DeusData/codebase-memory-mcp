@@ -2766,6 +2766,23 @@ TEST(cli_config_get_effective_env_overrides_db) {
     PASS();
 }
 
+TEST(cli_config_registry_includes_dep_ranking_toggle) {
+    const cbm_config_entry_t *found = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, "search_disable_dep_ranking") == 0) {
+            found = &CBM_CONFIG_REGISTRY[i];
+            break;
+        }
+    }
+
+    ASSERT_NOT_NULL(found);
+    ASSERT_STR_EQ(found->default_val, "false");
+    ASSERT_STR_EQ(found->range, "true|false");
+    ASSERT_NOT_NULL(strstr(found->description, "search_graph"));
+    ASSERT_NOT_NULL(strstr(found->guidance, "dependency"));
+    PASS();
+}
+
 TEST(cli_config_delete) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
@@ -3085,6 +3102,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_get_bool);
     RUN_TEST(cli_config_get_int);
     RUN_TEST(cli_config_get_effective_env_overrides_db);
+    RUN_TEST(cli_config_registry_includes_dep_ranking_toggle);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
 
