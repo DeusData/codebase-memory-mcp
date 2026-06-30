@@ -115,33 +115,9 @@ static char *read_source_lines(const cbm_pipeline_ctx_t *ctx, const char *rel_pa
     return cbm_read_source_lines_disk(ctx->repo_path, rel_path, start_line, end_line);
 }
 
-/* Read full source file, using cache if available. Returns malloc'd copy (caller must free). */
-/* Read full source from disk (used for module route discovery — few files,
- * filtered by .php/.js extension). */
 static char *read_full_source(const cbm_pipeline_ctx_t *ctx, const char *rel_path) {
-    char path_buf[2048];
-    snprintf(path_buf, sizeof(path_buf), "%s/%s", ctx->repo_path, rel_path);
-    FILE *f = fopen(path_buf, "rb");
-    if (!f) {
-        return NULL;
-    }
-    (void)fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
-    if (sz <= 0 || sz > (long)10 * 1024 * 1024) {
-        (void)fclose(f);
-        return NULL;
-    }
-    char *source = malloc((size_t)sz + 1);
-    if (!source) {
-        (void)fclose(f);
-        return NULL;
-    }
-    size_t nread = fread(source, 1, (size_t)sz, f);
-    (void)fclose(f);
-    // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
-    source[nread] = '\0';
-    return source;
+    return cbm_read_source_file_disk_limited(ctx->repo_path, rel_path,
+                                             CBM_HTTPLINK_FULL_SOURCE_MAX_BYTES, NULL);
 }
 
 /* ── JSON helpers ──────────────────────────────────────────────── */
