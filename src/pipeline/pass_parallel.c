@@ -330,17 +330,6 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     }
 }
 
-/* Build import map from graph buffer IMPORTS edges (read-only access to gbuf). */
-static int build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path,
-                            const char ***out_keys, const char ***out_vals, int *out_count) {
-    return cbm_pipeline_build_import_map_from_edges(gbuf, project_name, rel_path, out_keys,
-                                                    out_vals, out_count);
-}
-
-static void free_import_map(const char **keys, const char **vals, int count) {
-    cbm_pipeline_free_import_map(keys, vals, count);
-}
-
 static bool is_checked_exception(const char *name) {
     if (!name) {
         return false;
@@ -2049,7 +2038,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         const char **imp_vals = NULL;
         int imp_count = 0;
         uint64_t _imp_t0 = extract_now_ns();
-        build_import_map(rc->main_gbuf, rc->project_name, rel, &imp_keys, &imp_vals, &imp_count);
+        cbm_pipeline_build_import_map_from_edges(rc->main_gbuf, rc->project_name, rel, &imp_keys,
+                                                 &imp_vals, &imp_count);
         atomic_fetch_add_explicit(&rc->time_ns_import_map, extract_now_ns() - _imp_t0,
                                   memory_order_relaxed);
 
@@ -2273,7 +2263,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         cbm_registry_resolve_cache_end();
 
         free(module_qn);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pipeline_free_import_map(imp_keys, imp_vals, imp_count);
 
         atomic_fetch_add_explicit(&rc->time_ns_total_loop, extract_now_ns() - _loop_t0,
                                   memory_order_relaxed);
