@@ -1295,6 +1295,46 @@ static int store_publish_new_main_delta(cbm_store_t *s, int64_t generation) {
     return cbm_store_publish_file_delta(s, &delta);
 }
 
+static int store_publish_bad_main_delta(cbm_store_t *s, int64_t generation) {
+    cbm_node_t nodes[1] = {{.project = "test",
+                            .label = "Function",
+                            .name = "New",
+                            .qualified_name = "test.main.New",
+                            .file_path = "main.go",
+                            .properties_json = "{}"}};
+    cbm_store_delta_edge_t edges[1] = {{.source_qn = "test.main.New",
+                                        .target_qn = "test.main.Missing",
+                                        .type = "CALLS",
+                                        .properties_json = "{}"}};
+    cbm_file_hash_t hash = {.project = "test",
+                            .rel_path = "main.go",
+                            .sha256 = "bad-main-hash",
+                            .mtime_ns = 2,
+                            .size = 20};
+    cbm_file_state_t state = {.project = "test",
+                              .rel_path = "main.go",
+                              .content_hash = "bad-main-content",
+                              .git_oid = "",
+                              .mtime_ns = 2,
+                              .size = 20,
+                              .language = "c",
+                              .pass_fingerprint = "pass-b",
+                              .generation = generation,
+                              .indexed_at = "2026-06-30T00:01:00Z"};
+    cbm_store_file_delta_t delta = {.project = "test",
+                                    .rel_path = "main.go",
+                                    .generation = generation,
+                                    .file_hash = &hash,
+                                    .file_state = &state,
+                                    .nodes = nodes,
+                                    .node_count = 1,
+                                    .edges = edges,
+                                    .edge_count = 1,
+                                    .derived_view_name = CBM_STORE_DERIVED_VIEW_NODES_FTS,
+                                    .derived_status = CBM_STORE_DERIVED_STATUS_COMPLETE};
+    return cbm_store_publish_file_delta(s, &delta);
+}
+
 TEST(store_file_delta_publish_matches_fresh_final_graph) {
     enum {
         BASE_GENERATION = 1,
@@ -1383,6 +1423,45 @@ TEST(store_file_delta_publish_matches_fresh_final_graph) {
 
     cbm_store_close(delta_store);
     cbm_store_close(fresh_store);
+    PASS();
+}
+
+TEST(store_file_delta_publish_failure_finishes_generation_failed) {
+    enum { BASE_GENERATION = 1, FAILED_GENERATION = 2 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, BASE_GENERATION);
+    ASSERT_EQ(store_publish_helper_file_delta(s, generation), CBM_STORE_OK);
+    ASSERT_EQ(store_publish_old_main_delta(s, generation), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, "test", generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, FAILED_GENERATION);
+    ASSERT_EQ(store_publish_bad_main_delta(s, generation), CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, "test", generation,
+                                                CBM_STORE_INDEX_STATUS_FAILED),
+              CBM_STORE_OK);
+
+    ASSERT_EQ(store_node_qn_exists(s, "test", "test.main.Old"), 1);
+    ASSERT_EQ(store_node_qn_exists(s, "test", "test.main.New"), 0);
+    ASSERT_EQ(store_count_index_generation(s, "test", FAILED_GENERATION,
+                                           CBM_STORE_INDEX_STATUS_FAILED, "", "",
+                                           STORE_TEST_COMPLETED_SET),
+              1);
+    ASSERT_EQ(store_count_index_generation(s, "test", FAILED_GENERATION,
+                                           CBM_STORE_INDEX_STATUS_RESERVED, "", "",
+                                           STORE_TEST_COMPLETED_NULL),
+              0);
+
+    cbm_store_close(s);
     PASS();
 }
 
@@ -2622,6 +2701,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_file_delta_affected_paths_high_fanout_dedupes);
     RUN_TEST(store_file_delta_publish_rolls_back_on_failure);
     RUN_TEST(store_file_delta_publish_matches_fresh_final_graph);
+    RUN_TEST(store_file_delta_publish_failure_finishes_generation_failed);
     RUN_TEST(store_file_delta_publish_commits_graph_and_metadata);
     RUN_TEST(store_node_properties_json);
     RUN_TEST(store_node_null_properties);
