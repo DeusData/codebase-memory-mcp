@@ -24,6 +24,12 @@ typedef struct cbm_store cbm_store_t;
 #define CBM_STORE_ERR (-1)
 #define CBM_STORE_NOT_FOUND (-2)
 
+/* Exact-delta metadata vocabulary. Keep these named so schema defaults and
+ * future publish code do not drift into stringly-typed status variants. */
+#define CBM_STORE_INDEX_STATUS_COMPLETE "complete"
+#define CBM_STORE_DERIVED_STATUS_STALE "stale"
+#define CBM_STORE_DERIVED_KIND_DIRECT "direct"
+
 /* ── Data structures ────────────────────────────────────────────── */
 
 typedef struct {
@@ -60,6 +66,19 @@ typedef struct {
     int64_t mtime_ns;
     int64_t size;
 } cbm_file_hash_t;
+
+typedef struct {
+    const char *project;
+    const char *rel_path;
+    const char *content_hash;
+    const char *git_oid;
+    int64_t mtime_ns;
+    int64_t size;
+    const char *language;
+    const char *pass_fingerprint;
+    int64_t generation;
+    const char *indexed_at;
+} cbm_file_state_t;
 
 /* Find nodes overlapping a line range in a file (excludes Module/Package). */
 int cbm_store_find_nodes_by_file_overlap(cbm_store_t *s, const char *project, const char *file_path,
@@ -413,6 +432,15 @@ int cbm_store_delete_file_hash(cbm_store_t *s, const char *project, const char *
 
 int cbm_store_delete_file_hashes(cbm_store_t *s, const char *project);
 
+/* ── Exact-delta metadata ───────────────────────────────────────── */
+
+int cbm_store_upsert_file_state(cbm_store_t *s, const cbm_file_state_t *state);
+
+int cbm_store_get_file_state(cbm_store_t *s, const char *project, const char *rel_path,
+                             cbm_file_state_t *out);
+
+int cbm_store_delete_file_state(cbm_store_t *s, const char *project, const char *rel_path);
+
 /* ── Search ─────────────────────────────────────────────────────── */
 
 int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_search_output_t *out);
@@ -682,6 +710,9 @@ void cbm_store_free_projects(cbm_project_t *projects, int count);
 
 /* Free an array of file hashes. */
 void cbm_store_free_file_hashes(cbm_file_hash_t *hashes, int count);
+
+/* Free heap-allocated strings in a stack-allocated file state. */
+void cbm_store_file_state_free_fields(cbm_file_state_t *state);
 
 /* ── Vector search ───────────────────────────────────────────────── */
 

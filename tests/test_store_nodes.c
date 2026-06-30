@@ -551,6 +551,70 @@ TEST(store_file_hash_upsert_rejects_null_required_fields) {
     PASS();
 }
 
+TEST(store_file_state_crud) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_file_state_t state = {
+        .project = "test",
+        .rel_path = "main.go",
+        .content_hash = "content-a",
+        .git_oid = "git-a",
+        .mtime_ns = 1000000,
+        .size = 512,
+        .language = "go",
+        .pass_fingerprint = "pass-a",
+        .generation = 1,
+        .indexed_at = "2026-03-14T00:00:00Z",
+    };
+    int rc = cbm_store_upsert_file_state(s, &state);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+
+    cbm_file_state_t got = {0};
+    rc = cbm_store_get_file_state(s, "test", "main.go", &got);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_STR_EQ(got.content_hash, "content-a");
+    ASSERT_STR_EQ(got.git_oid, "git-a");
+    ASSERT_EQ(got.mtime_ns, 1000000);
+    ASSERT_EQ(got.size, 512);
+    ASSERT_STR_EQ(got.language, "go");
+    ASSERT_STR_EQ(got.pass_fingerprint, "pass-a");
+    ASSERT_EQ(got.generation, 1);
+    ASSERT_STR_EQ(got.indexed_at, "2026-03-14T00:00:00Z");
+    cbm_store_file_state_free_fields(&got);
+
+    state.content_hash = "content-b";
+    state.git_oid = "";
+    state.mtime_ns = 2000000;
+    state.size = 1024;
+    state.language = "c";
+    state.pass_fingerprint = "pass-b";
+    state.generation = 2;
+    state.indexed_at = "2026-03-15T00:00:00Z";
+    rc = cbm_store_upsert_file_state(s, &state);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+
+    rc = cbm_store_get_file_state(s, "test", "main.go", &got);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_STR_EQ(got.content_hash, "content-b");
+    ASSERT_STR_EQ(got.git_oid, "");
+    ASSERT_EQ(got.mtime_ns, 2000000);
+    ASSERT_EQ(got.size, 1024);
+    ASSERT_STR_EQ(got.language, "c");
+    ASSERT_STR_EQ(got.pass_fingerprint, "pass-b");
+    ASSERT_EQ(got.generation, 2);
+    cbm_store_file_state_free_fields(&got);
+
+    rc = cbm_store_delete_file_state(s, "test", "main.go");
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    rc = cbm_store_get_file_state(s, "test", "main.go", &got);
+    ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Properties JSON round-trip ─────────────────────────────────── */
 
 TEST(store_node_properties_json) {
@@ -1660,6 +1724,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_cascade_delete);
     RUN_TEST(store_file_hash_crud);
     RUN_TEST(store_file_hash_upsert_rejects_null_required_fields);
+    RUN_TEST(store_file_state_crud);
     RUN_TEST(store_node_properties_json);
     RUN_TEST(store_node_null_properties);
     RUN_TEST(store_find_by_file_overlap);
