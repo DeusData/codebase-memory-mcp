@@ -11,6 +11,7 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/path_alias.h"
 #include "graph_buffer/graph_buffer.h"
+#include "store/store.h"
 #include "discover/discover.h"
 #include "foundation/hash_table.h"
 #include "cbm.h"
@@ -110,6 +111,15 @@ typedef struct {
     const cbm_path_alias_collection_t *path_aliases;
 } cbm_pipeline_ctx_t;
 
+typedef struct {
+    cbm_store_file_delta_t delta;
+    cbm_node_t *nodes;
+    cbm_store_delta_edge_t *edges;
+    cbm_store_symbol_export_t *exports;
+    cbm_store_import_ref_t *imports;
+    int unsupported_edge_count;
+} cbm_pipeline_file_delta_t;
+
 /* Get the current pipeline's package map (NULL if none). */
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
 void cbm_pipeline_set_pkgmap(CBMHashTable *map);
@@ -154,12 +164,23 @@ int cbm_pipeline_create_import_edges_for_file(cbm_pipeline_ctx_t *ctx,
                                               const char *rel_path,
                                               CBMHashTable *namespace_map);
 
+/* Extract IMPORTS edge local_name from the canonical edge JSON. Caller frees. */
+char *cbm_pipeline_import_edge_local_name_dup(const cbm_gbuf_edge_t *edge);
+
 /* Build a per-file import map from already-resolved IMPORTS edges.
  * Returned keys are heap strings; values are borrowed graph-buffer QNs. */
 int cbm_pipeline_build_import_map_from_edges(const cbm_gbuf_t *gbuf, const char *project_name,
                                              const char *rel_path, const char ***out_keys,
                                              const char ***out_vals, int *out_count);
 void cbm_pipeline_free_import_map(const char **keys, const char **vals, int count);
+
+/* Build a store-level per-file delta descriptor from graph-buffer facts.
+ * Returns CBM_STORE_OK even when unsupported_edge_count > 0; callers must fall
+ * back instead of publishing when unsupported edges are present. */
+int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *project,
+                                            const char *rel_path, int64_t generation,
+                                            cbm_pipeline_file_delta_t *out);
+void cbm_pipeline_file_delta_free(cbm_pipeline_file_delta_t *delta);
 
 /* Build a namespace → File-node-QN map from a set of extraction results.
  * Each result that declared a namespace/package contributes one entry keyed by
