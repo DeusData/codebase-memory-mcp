@@ -29,6 +29,7 @@ typedef struct cbm_store cbm_store_t;
 #define CBM_STORE_INDEX_STATUS_COMPLETE "complete"
 #define CBM_STORE_DERIVED_STATUS_STALE "stale"
 #define CBM_STORE_DERIVED_KIND_DIRECT "direct"
+#define CBM_STORE_NO_NODE_ID 0
 
 /* ── Data structures ────────────────────────────────────────────── */
 
@@ -453,6 +454,34 @@ int cbm_store_delete_node_owners_by_file(cbm_store_t *s, const char *project,
 
 int cbm_store_delete_edge_owners_by_file(cbm_store_t *s, const char *project,
                                          const char *rel_path);
+
+int cbm_store_upsert_symbol_export(cbm_store_t *s, const char *project,
+                                   const char *qualified_name, const char *rel_path,
+                                   int64_t node_id, int64_t generation);
+
+int cbm_store_delete_symbol_exports_by_file(cbm_store_t *s, const char *project,
+                                            const char *rel_path);
+
+/* Caller frees each returned string and the array. */
+int cbm_store_list_symbol_exports_by_file(cbm_store_t *s, const char *project,
+                                          const char *rel_path, char ***out, int *count);
+
+int cbm_store_upsert_import_ref(cbm_store_t *s, const char *project, const char *rel_path,
+                                const char *import_text, const char *local_name,
+                                const char *target_qn, int64_t generation);
+
+int cbm_store_delete_import_refs_by_file(cbm_store_t *s, const char *project,
+                                         const char *rel_path);
+
+/* Caller frees each returned string and the array. */
+int cbm_store_list_import_ref_paths_by_target(cbm_store_t *s, const char *project,
+                                              const char *target_qn, char ***out,
+                                              int *count);
+
+/* Caller frees each returned string and the array. */
+int cbm_store_list_import_ref_paths_for_export_file(cbm_store_t *s, const char *project,
+                                                   const char *export_rel_path, char ***out,
+                                                   int *count);
 
 /* ── Search ─────────────────────────────────────────────────────── */
 
