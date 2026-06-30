@@ -10,6 +10,7 @@
  * Total: 47 Go tests → 47 C tests
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/constants.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
@@ -72,6 +73,50 @@ static int test_mkdirp(const char *path) {
         }
     }
     return cbm_mkdir(tmp) == 0 || errno == EEXIST ? 0 : -1;
+}
+
+static char *make_overlong_nested_path(const char *base, const char *leaf) {
+    size_t cap = (size_t)CBM_PATH_MAX * 2;
+    char *path = malloc(cap);
+    if (!path) {
+        return NULL;
+    }
+    int n = snprintf(path, cap, "%s", base);
+    if (n < 0 || (size_t)n >= cap) {
+        free(path);
+        return NULL;
+    }
+    size_t used = (size_t)n;
+    const char *segment = "/a";
+    size_t segment_len = strlen(segment);
+    while (used <= (size_t)CBM_PATH_MAX) {
+        if (used + segment_len >= cap) {
+            free(path);
+            return NULL;
+        }
+        memcpy(path + used, segment, segment_len + 1);
+        used += segment_len;
+    }
+    size_t leaf_len = strlen(leaf);
+    const char *separator = "/";
+    size_t separator_len = strlen(separator);
+    if (used + separator_len + leaf_len >= cap) {
+        free(path);
+        return NULL;
+    }
+    memcpy(path + used, separator, separator_len + 1);
+    used += separator_len;
+    if (leaf_len > 0) {
+        memcpy(path + used, leaf, leaf_len + 1);
+    } else {
+        path[used] = '\0';
+    }
+    return path;
+}
+
+static int test_path_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0;
 }
 
 /* Helper: recursive remove */
@@ -2181,6 +2226,26 @@ TEST(cli_upsert_antigravity_mcp_replace) {
     PASS();
 }
 
+TEST(cli_upsert_json_rejects_overlong_path_without_truncated_parent) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-json-long-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char unexpected[512];
+    snprintf(unexpected, sizeof(unexpected), "%s/a", tmpdir);
+    char *configpath = make_overlong_nested_path(tmpdir, "mcp_config.json");
+    ASSERT_NOT_NULL(configpath);
+
+    int rc = cbm_upsert_antigravity_mcp("/usr/local/bin/codebase-memory-mcp", configpath);
+    ASSERT_NEQ(rc, 0);
+    ASSERT_FALSE(test_path_exists(unexpected));
+
+    free(configpath);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Group C: Instructions File Upsert
  * ═══════════════════════════════════════════════════════════════════ */
@@ -2203,6 +2268,26 @@ TEST(cli_upsert_instructions_fresh) {
     ASSERT(strstr(data, "<!-- codebase-memory-mcp:end -->") != NULL);
     ASSERT(strstr(data, "Hello world") != NULL);
 
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_upsert_instructions_rejects_overlong_path_without_truncated_parent) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-instr-long-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char unexpected[512];
+    snprintf(unexpected, sizeof(unexpected), "%s/a", tmpdir);
+    char *filepath = make_overlong_nested_path(tmpdir, "AGENTS.md");
+    ASSERT_NOT_NULL(filepath);
+
+    int rc = cbm_upsert_instructions(filepath, "# Test content\n");
+    ASSERT_NEQ(rc, 0);
+    ASSERT_FALSE(test_path_exists(unexpected));
+
+    free(filepath);
     test_rmdir_r(tmpdir);
     PASS();
 }
@@ -3066,12 +3151,14 @@ SUITE(cli) {
     RUN_TEST(cli_upsert_opencode_mcp_fresh);
     RUN_TEST(cli_upsert_opencode_mcp_existing);
 
-    /* Antigravity MCP config upsert (2 tests — group B) */
+    /* Antigravity MCP config upsert (3 tests — group B) */
     RUN_TEST(cli_upsert_antigravity_mcp_fresh);
     RUN_TEST(cli_upsert_antigravity_mcp_replace);
+    RUN_TEST(cli_upsert_json_rejects_overlong_path_without_truncated_parent);
 
-    /* Instructions file upsert (6 tests — group C) */
+    /* Instructions file upsert (7 tests — group C) */
     RUN_TEST(cli_upsert_instructions_fresh);
+    RUN_TEST(cli_upsert_instructions_rejects_overlong_path_without_truncated_parent);
     RUN_TEST(cli_upsert_instructions_existing);
     RUN_TEST(cli_upsert_instructions_replace);
     RUN_TEST(cli_upsert_instructions_no_duplicate);
