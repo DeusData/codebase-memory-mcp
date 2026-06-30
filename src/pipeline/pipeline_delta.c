@@ -418,6 +418,31 @@ static bool delta_qn_list_contains(const char **qns, int count, const char *qn) 
     return false;
 }
 
+static bool delta_plan_precheck_common(const cbm_pipeline_file_delta_t *delta,
+                                       cbm_pipeline_file_delta_plan_t *plan) {
+    if (delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_delete_requires_full);
+        return false;
+    }
+    if (delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_RENAME) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_rename_requires_full);
+        return false;
+    }
+    if (delta->unsupported_edge_count > 0) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_unsupported_edges);
+        return false;
+    }
+    if (!delta_file_metadata_complete(&delta->delta)) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_missing_file_metadata);
+        return false;
+    }
+    if (!delta_derived_view_supported(&delta->delta)) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_unsupported_derived_view);
+        return false;
+    }
+    return true;
+}
+
 static int delta_edge_endpoints_resolve(cbm_store_t *store, const cbm_store_file_delta_t *delta) {
     if (!delta || delta->edge_count <= 0) {
         return CBM_STORE_OK;
@@ -462,6 +487,102 @@ static int delta_edge_endpoints_resolve(cbm_store_t *store, const cbm_store_file
     return found == qn_count ? CBM_STORE_OK : CBM_STORE_NOT_FOUND;
 }
 
+static bool delta_batch_node_qn_present(const cbm_pipeline_file_delta_t *const *deltas,
+                                        int delta_count, const char *qn) {
+    if (!deltas || !qn) {
+        return false;
+    }
+    for (int i = 0; i < delta_count; i++) {
+        if (deltas[i] && delta_node_qn_present(&deltas[i]->delta, qn)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int delta_batch_edge_endpoints_resolve(cbm_store_t *store,
+                                              const cbm_store_file_delta_t *delta,
+                                              const cbm_pipeline_file_delta_t *const *deltas,
+                                              int delta_count) {
+    if (!delta || delta->edge_count <= 0) {
+        return CBM_STORE_OK;
+    }
+    if (delta->edge_count > INT_MAX / PAIR_LEN) {
+        return CBM_STORE_ERR;
+    }
+    int qn_cap = delta->edge_count * PAIR_LEN;
+    const char **qns = malloc((size_t)qn_cap * sizeof(*qns));
+    if (!qns) {
+        return CBM_STORE_ERR;
+    }
+    int qn_count = 0;
+    for (int i = 0; i < delta->edge_count; i++) {
+        const char *edge_qns[PAIR_LEN] = {delta->edges[i].source_qn, delta->edges[i].target_qn};
+        for (int j = 0; j < PAIR_LEN; j++) {
+            const char *qn = edge_qns[j];
+            if (!qn) {
+                free(qns);
+                return CBM_STORE_NOT_FOUND;
+            }
+            if (!delta_batch_node_qn_present(deltas, delta_count, qn) &&
+                !delta_qn_list_contains(qns, qn_count, qn)) {
+                qns[qn_count++] = qn;
+            }
+        }
+    }
+    if (qn_count == 0) {
+        free(qns);
+        return CBM_STORE_OK;
+    }
+    int64_t *ids = calloc((size_t)qn_count, sizeof(*ids));
+    if (!ids) {
+        free(qns);
+        return CBM_STORE_ERR;
+    }
+    int found = cbm_store_find_node_ids_by_qns(store, delta->project, qns, qn_count, ids);
+    free(ids);
+    free(qns);
+    if (found < 0) {
+        return CBM_STORE_ERR;
+    }
+    return found == qn_count ? CBM_STORE_OK : CBM_STORE_NOT_FOUND;
+}
+
+static int delta_plan_append_affected_path(cbm_pipeline_file_delta_plan_t *plan,
+                                           const char *path) {
+    if (!plan || !path) {
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < plan->affected_count; i++) {
+        if (strcmp(plan->affected_paths[i], path) == 0) {
+            return CBM_STORE_OK;
+        }
+    }
+    char *dup = delta_strdup(path);
+    if (!dup) {
+        return CBM_STORE_ERR;
+    }
+    char **next =
+        realloc(plan->affected_paths, (size_t)(plan->affected_count + 1) * sizeof(*next));
+    if (!next) {
+        free(dup);
+        return CBM_STORE_ERR;
+    }
+    plan->affected_paths = next;
+    plan->affected_paths[plan->affected_count++] = dup;
+    return CBM_STORE_OK;
+}
+
+static int delta_plan_append_frontier(cbm_pipeline_file_delta_plan_t *plan, char **paths,
+                                      int count) {
+    for (int i = 0; i < count; i++) {
+        if (delta_plan_append_affected_path(plan, paths[i]) != CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
+    }
+    return CBM_STORE_OK;
+}
+
 int cbm_pipeline_plan_file_delta(cbm_store_t *store, const cbm_pipeline_file_delta_t *delta,
                                  int max_affected_paths, cbm_pipeline_file_delta_plan_t *out) {
     if (!out) {
@@ -473,24 +594,7 @@ int cbm_pipeline_plan_file_delta(cbm_store_t *store, const cbm_pipeline_file_del
         max_affected_paths <= 0) {
         return CBM_STORE_OK;
     }
-    if (delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE) {
-        delta_plan_set_fallback(out, cbm_delta_reason_delete_requires_full);
-        return CBM_STORE_OK;
-    }
-    if (delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_RENAME) {
-        delta_plan_set_fallback(out, cbm_delta_reason_rename_requires_full);
-        return CBM_STORE_OK;
-    }
-    if (delta->unsupported_edge_count > 0) {
-        delta_plan_set_fallback(out, cbm_delta_reason_unsupported_edges);
-        return CBM_STORE_OK;
-    }
-    if (!delta_file_metadata_complete(&delta->delta)) {
-        delta_plan_set_fallback(out, cbm_delta_reason_missing_file_metadata);
-        return CBM_STORE_OK;
-    }
-    if (!delta_derived_view_supported(&delta->delta)) {
-        delta_plan_set_fallback(out, cbm_delta_reason_unsupported_derived_view);
+    if (!delta_plan_precheck_common(delta, out)) {
         return CBM_STORE_OK;
     }
     int endpoint_rc = delta_edge_endpoints_resolve(store, &delta->delta);
@@ -526,6 +630,89 @@ int cbm_pipeline_plan_file_delta(cbm_store_t *store, const cbm_pipeline_file_del
     if (out->affected_count > max_affected_paths) {
         delta_plan_set_fallback(out, cbm_delta_reason_frontier_too_large);
         return CBM_STORE_OK;
+    }
+
+    out->route = CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE;
+    out->reason = cbm_delta_reason_candidate;
+    return CBM_STORE_OK;
+}
+
+int cbm_pipeline_plan_file_delta_batch(cbm_store_t *store,
+                                       const cbm_pipeline_file_delta_t *const *deltas,
+                                       int delta_count, int max_affected_paths,
+                                       cbm_pipeline_file_delta_plan_t *out) {
+    if (!out) {
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+    delta_plan_set_fallback(out, cbm_delta_reason_invalid_input);
+    if (!store || !deltas || delta_count <= 0 || max_affected_paths <= 0) {
+        return CBM_STORE_OK;
+    }
+
+    const char *project = NULL;
+    for (int i = 0; i < delta_count; i++) {
+        const cbm_pipeline_file_delta_t *delta = deltas[i];
+        if (!delta || !delta->delta.project || !delta->delta.rel_path) {
+            return CBM_STORE_OK;
+        }
+        if (!project) {
+            project = delta->delta.project;
+        } else if (strcmp(project, delta->delta.project) != 0) {
+            return CBM_STORE_OK;
+        }
+        if (!delta_plan_precheck_common(delta, out)) {
+            return CBM_STORE_OK;
+        }
+        int endpoint_rc =
+            delta_batch_edge_endpoints_resolve(store, &delta->delta, deltas, delta_count);
+        if (endpoint_rc == CBM_STORE_NOT_FOUND) {
+            delta_plan_set_fallback(out, cbm_delta_reason_unresolved_edge_endpoint);
+            return CBM_STORE_OK;
+        }
+        if (endpoint_rc != CBM_STORE_OK) {
+            delta_plan_set_fallback(out, cbm_delta_reason_preflight_error);
+            return CBM_STORE_OK;
+        }
+    }
+
+    for (int i = 0; i < delta_count; i++) {
+        const cbm_store_file_delta_t *delta = &deltas[i]->delta;
+        const char **new_export_qns = NULL;
+        if (delta->export_count > 0) {
+            new_export_qns = malloc((size_t)delta->export_count * sizeof(*new_export_qns));
+            if (!new_export_qns) {
+                delta_plan_set_fallback(out, cbm_delta_reason_frontier_error);
+                return CBM_STORE_OK;
+            }
+            for (int j = 0; j < delta->export_count; j++) {
+                new_export_qns[j] = delta->exports[j].qualified_name;
+            }
+        }
+
+        char **paths = NULL;
+        int path_count = 0;
+        int rc = cbm_store_list_file_delta_affected_paths(
+            store, delta->project, delta->rel_path, new_export_qns, delta->export_count, &paths,
+            &path_count);
+        free(new_export_qns);
+        if (rc != CBM_STORE_OK ||
+            delta_plan_append_frontier(out, paths, path_count) != CBM_STORE_OK) {
+            for (int j = 0; j < path_count; j++) {
+                free(paths[j]);
+            }
+            free(paths);
+            delta_plan_set_fallback(out, cbm_delta_reason_frontier_error);
+            return CBM_STORE_OK;
+        }
+        for (int j = 0; j < path_count; j++) {
+            free(paths[j]);
+        }
+        free(paths);
+        if (out->affected_count > max_affected_paths) {
+            delta_plan_set_fallback(out, cbm_delta_reason_frontier_too_large);
+            return CBM_STORE_OK;
+        }
     }
 
     out->route = CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE;

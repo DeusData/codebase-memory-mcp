@@ -3581,6 +3581,7 @@ TEST(pipeline_file_delta_orchestrates_descriptor_plan_and_publish) {
         BASE_GENERATION = 1,
         FINAL_GENERATION = 2,
         PIPELINE_DELTA_PARITY_MAX_AFFECTED = CBM_SZ_4,
+        PIPELINE_DELTA_PARITY_BATCH_COUNT = 2,
         EXPECTED_FINAL_CALLS_EDGES = 1,
         EXPECTED_FINAL_IMPORTS_EDGES = 1,
         EXPECTED_FINAL_EDGES = EXPECTED_FINAL_CALLS_EDGES + EXPECTED_FINAL_IMPORTS_EDGES,
@@ -3693,6 +3694,24 @@ TEST(pipeline_file_delta_orchestrates_descriptor_plan_and_publish) {
     ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata(&final_main_delta, &main_file),
               CBM_STORE_OK);
 
+    cbm_pipeline_file_delta_plan_t main_before_helper_plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &final_main_delta,
+                                           PIPELINE_DELTA_PARITY_MAX_AFFECTED,
+                                           &main_before_helper_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(main_before_helper_plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(main_before_helper_plan.reason, "unresolved_edge_endpoint");
+
+    const cbm_pipeline_file_delta_t *batch_deltas[] = {&final_helper_delta, &final_main_delta};
+    cbm_pipeline_file_delta_plan_t batch_plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta_batch(s, batch_deltas,
+                                                 PIPELINE_DELTA_PARITY_BATCH_COUNT,
+                                                 PIPELINE_DELTA_PARITY_MAX_AFFECTED, &batch_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(batch_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&batch_plan, helper_rel), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&batch_plan, main_rel), 1);
+
     cbm_pipeline_file_delta_plan_t helper_plan = {0};
     ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &final_helper_delta,
                                            PIPELINE_DELTA_PARITY_MAX_AFFECTED, &helper_plan),
@@ -3738,6 +3757,8 @@ TEST(pipeline_file_delta_orchestrates_descriptor_plan_and_publish) {
     ASSERT_STR_EQ(import_paths[0], main_rel);
     pipeline_delta_free_string_array(import_paths, import_count);
 
+    cbm_pipeline_file_delta_plan_free(&main_before_helper_plan);
+    cbm_pipeline_file_delta_plan_free(&batch_plan);
     cbm_pipeline_file_delta_plan_free(&helper_plan);
     cbm_pipeline_file_delta_plan_free(&main_plan);
     cbm_pipeline_file_delta_free(&final_helper_delta);
