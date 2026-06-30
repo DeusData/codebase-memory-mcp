@@ -100,7 +100,6 @@ static void add_pagerank_val(yyjson_mut_doc *doc, yyjson_mut_val *obj, double v)
  * Prevents unbounded 500K-result responses. Callers can override.
  * Configurable via config key "search_limit". */
 #define CBM_MCP_DEFAULT_SEARCH_LIMIT 50
-#define CBM_CONFIG_SEARCH_LIMIT "search_limit"
 
 /* Default: rank dependency sub-project symbols (proj.dep.*) LAST so a stdlib
  * symbol like 'Path' never fronts the user's own 'Path'. Tunable off via config
@@ -2911,9 +2910,17 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
      * and return early.  The regex/vector path below handles all other callers.
      * If FTS5 is unavailable or the query is empty after tokenization, fall
      * through to the regex path. */
+    int cfg_search_limit = cbm_config_get_int(srv->config, CBM_CONFIG_SEARCH_LIMIT,
+                                               CBM_MCP_DEFAULT_SEARCH_LIMIT);
+    if (cfg_search_limit <= 0) {
+        cfg_search_limit = CBM_MCP_DEFAULT_SEARCH_LIMIT;
+    }
     char *query = cbm_mcp_get_string_arg(args, "query");
     if (query && query[0]) {
-        int q_limit = cbm_mcp_get_int_arg(args, "limit", BM25_DEFAULT_LIMIT);
+        int q_limit = cbm_mcp_get_int_arg(args, "limit", cfg_search_limit);
+        if (q_limit <= 0) {
+            q_limit = cfg_search_limit;
+        }
         int q_offset = cbm_mcp_get_int_arg(args, "offset", 0);
         char *q_file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
         char *bm25_json = bm25_search(store, project, query, q_file_pattern, q_limit, q_offset);
@@ -3040,8 +3047,6 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         free(file_pattern); free(relationship); free(sort_by); free(pe.value);
         return cbm_mcp_text_result(errbuf, true);
     }
-    int cfg_search_limit = cbm_config_get_int(srv->config, CBM_CONFIG_SEARCH_LIMIT,
-                                               CBM_MCP_DEFAULT_SEARCH_LIMIT);
     int limit = cbm_mcp_get_int_arg(args, "limit", cfg_search_limit);
     /* F4: treat limit<=0 as default */
     if (limit <= 0) limit = cfg_search_limit;
