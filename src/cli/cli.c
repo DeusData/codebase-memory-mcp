@@ -568,6 +568,38 @@ static int mkdirp(const char *path, int mode) {
     return (int)cbm_mkdir_p(path, mode) ? 0 : CLI_ERR;
 }
 
+static bool cbm_snprintf_fits(int n, size_t out_sz) {
+    return n >= 0 && (size_t)n < out_sz;
+}
+
+static int cbm_prepare_parent_dir(const char *path) {
+    if (!path || !path[0]) {
+        return CLI_ERR;
+    }
+
+    char dir[CBM_PATH_MAX];
+    int n = snprintf(dir, sizeof(dir), "%s", path);
+    if (!cbm_snprintf_fits(n, sizeof(dir))) {
+        return CLI_ERR;
+    }
+
+    char *last_slash = strrchr(dir, '/');
+#ifdef _WIN32
+    char *last_bslash = strrchr(dir, '\\');
+    if (last_bslash && (!last_slash || last_bslash > last_slash)) {
+        last_slash = last_bslash;
+    }
+#endif
+    if (!last_slash) {
+        return CLI_OK;
+    }
+    *last_slash = '\0';
+    if (!dir[0]) {
+        return CLI_OK;
+    }
+    return mkdirp(dir, DIR_PERMS);
+}
+
 /* ── Recursive rmdir ──────────────────────────────────────────── */
 
 enum { RMDIR_STACK_CAP = CBM_SZ_256 };
@@ -756,13 +788,8 @@ static yyjson_doc *read_json_file(const char *path) {
 
 /* Write a mutable yyjson document to a file with pretty printing. */
 static int write_json_file(const char *path, yyjson_mut_doc *doc) {
-    /* Ensure parent directory exists */
-    char dir[CLI_BUF_1K];
-    snprintf(dir, sizeof(dir), "%s", path);
-    char *last_slash = strrchr(dir, '/');
-    if (last_slash) {
-        *last_slash = '\0';
-        mkdirp(dir, DIR_PERMS);
+    if (cbm_prepare_parent_dir(path) != CLI_OK) {
+        return CLI_ERR;
     }
 
     yyjson_write_flag flags = YYJSON_WRITE_PRETTY | YYJSON_WRITE_ESCAPE_UNICODE;
@@ -771,20 +798,24 @@ static int write_json_file(const char *path, yyjson_mut_doc *doc) {
     if (!json) {
         return CLI_ERR;
     }
-
-    FILE *f = fopen(path, "w");
-    if (!f) {
+    if (len > SIZE_MAX - (size_t)CLI_PAIR_LEN) {
         free(json);
         return CLI_ERR;
     }
 
-    size_t written = fwrite(json, CLI_ELEM_SIZE, len, f);
-    /* Add trailing newline */
-    (void)fputc('\n', f);
-    (void)fclose(f);
+    int rc = CLI_ERR;
+    char *json_nl = malloc(len + CLI_PAIR_LEN);
+    if (json_nl) {
+        memcpy(json_nl, json, len);
+        json_nl[len] = '\n';
+        json_nl[len + CLI_SKIP_ONE] = '\0';
+        int wrc = cbm_write_file_atomic(path, json_nl, len + CLI_SKIP_ONE, NULL);
+        rc = wrc == 0 ? CLI_OK : CLI_ERR;
+        free(json_nl);
+    }
     free(json);
 
-    return written == len ? 0 : CLI_ERR;
+    return rc;
 }
 
 /* ── Editor MCP: Cursor/Windsurf/Gemini (mcpServers key) ──────── */
@@ -1309,23 +1340,12 @@ static char *read_file_str(const char *path, size_t *out_len) {
 
 /* Write string to file, creating parent dirs if needed. */
 static int write_file_str(const char *path, const char *content) {
-    /* Ensure parent directory */
-    char dir[CLI_BUF_1K];
-    snprintf(dir, sizeof(dir), "%s", path);
-    char *last_slash = strrchr(dir, '/');
-    if (last_slash) {
-        *last_slash = '\0';
-        mkdirp(dir, DIR_PERMS);
-    }
-
-    FILE *f = fopen(path, "w");
-    if (!f) {
+    if (cbm_prepare_parent_dir(path) != CLI_OK) {
         return CLI_ERR;
     }
+
     size_t len = strlen(content);
-    size_t written = fwrite(content, CLI_ELEM_SIZE, len, f);
-    (void)fclose(f);
-    return written == len ? 0 : CLI_ERR;
+    return cbm_write_file_atomic(path, content, len, NULL) == 0 ? CLI_OK : CLI_ERR;
 }
 
 int cbm_upsert_instructions(const char *path, const char *content) {
