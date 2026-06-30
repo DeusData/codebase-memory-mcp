@@ -18,7 +18,10 @@
 #include "foundation/platform.h"
 #include "foundation/log.h"
 #include "cbm.h"
+#include <store/store.h>
+#include <sqlite3.h>
 
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
@@ -389,6 +392,291 @@ TEST(parallel_args_json_no_overflow) {
     PASS();
 }
 
+/* ── Production pipeline worker-count parity ─────────────────────── */
+
+enum {
+    PARITY_REPO_FILE_COUNT = 64,
+    PARITY_EXPECTED_FILE_HASHES = PARITY_REPO_FILE_COUNT + 2,
+    PARITY_DB_PATH_COUNT = 4,
+    PARITY_PATH_BUF = CBM_SZ_512,
+    PARITY_SOURCE_BUF = CBM_SZ_4K,
+    PARITY_REP_QN_COUNT = 4,
+};
+
+typedef struct {
+    int nodes;
+    int edges;
+    int file_hashes;
+    int calls;
+    int imports;
+    int usage;
+    int semantic;
+    int representative_qns;
+} pipeline_db_counts_t;
+
+static int parity_format(char *dst, size_t dst_sz, const char *fmt, ...) {
+    if (!dst || dst_sz == 0 || !fmt) {
+        return CBM_NOT_FOUND;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(dst, dst_sz, fmt, ap);
+    va_end(ap);
+    return n >= 0 && (size_t)n < dst_sz ? 0 : CBM_NOT_FOUND;
+}
+
+static void remove_sqlite_family(const char *db_path) {
+    if (!db_path || !db_path[0]) {
+        return;
+    }
+    cbm_unlink(db_path);
+    char sidecar[PARITY_PATH_BUF];
+    if (parity_format(sidecar, sizeof(sidecar), "%s-wal", db_path) == 0) {
+        cbm_unlink(sidecar);
+    }
+    if (parity_format(sidecar, sizeof(sidecar), "%s-shm", db_path) == 0) {
+        cbm_unlink(sidecar);
+    }
+}
+
+static int sqlite_integrity_ok(const char *db_path) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int ok = 0;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK && db &&
+        sqlite3_prepare_v2(db, "PRAGMA integrity_check;", CBM_NOT_FOUND, &stmt, NULL) ==
+            SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *msg = (const char *)sqlite3_column_text(stmt, 0);
+        ok = msg && strcmp(msg, "ok") == 0;
+    }
+    if (stmt) {
+        sqlite3_finalize(stmt);
+    }
+    if (db) {
+        sqlite3_close(db);
+    }
+    return ok;
+}
+
+static int write_worker_parity_repo(char *repo_dir, size_t repo_dir_sz) {
+    if (!repo_dir || repo_dir_sz == 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (parity_format(repo_dir, repo_dir_sz, "%s/cbm_pipe_parity_XXXXXX", cbm_tmpdir()) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (!cbm_mkdtemp(repo_dir)) {
+        return CBM_NOT_FOUND;
+    }
+
+    char path[PARITY_PATH_BUF];
+    char src[PARITY_SOURCE_BUF];
+
+    if (parity_format(path, sizeof(path), "%s/common.py", repo_dir) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (th_write_file(path,
+                      "def shared(value):\n"
+                      "    return value + 1\n"
+                      "\n"
+                      "class Shared:\n"
+                      "    def touch(self, value):\n"
+                      "        return shared(value)\n") != 0) {
+        return CBM_NOT_FOUND;
+    }
+
+    for (int i = 0; i < PARITY_REPO_FILE_COUNT; i++) {
+        if (parity_format(path, sizeof(path), "%s/mod_%02d.py", repo_dir, i) != 0) {
+            return CBM_NOT_FOUND;
+        }
+        int prev = (i + PARITY_REPO_FILE_COUNT - 1) % PARITY_REPO_FILE_COUNT;
+        if (parity_format(src, sizeof(src),
+                          "from common import Shared, shared\n"
+                          "from mod_%02d import func_%02d\n"
+                          "\n"
+                          "class Worker%02d:\n"
+                          "    def method_%02d(self, value):\n"
+                          "        helper = Shared()\n"
+                          "        return helper.touch(shared(value))\n"
+                          "\n"
+                          "def func_%02d(value):\n"
+                          "    item = Worker%02d()\n"
+                          "    return item.method_%02d(value)\n"
+                          "\n"
+                          "def chain_%02d(value):\n"
+                          "    return func_%02d(value) + func_%02d(value) + shared(value)\n",
+                          prev, prev, i, i, i, i, i, i, i, prev) != 0) {
+            return CBM_NOT_FOUND;
+        }
+        if (th_write_file(path, src) != 0) {
+            return CBM_NOT_FOUND;
+        }
+    }
+
+    if (parity_format(path, sizeof(path), "%s/app.py", repo_dir) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return CBM_NOT_FOUND;
+    }
+    int write_ok = 1;
+    for (int i = 0; i < PARITY_REPO_FILE_COUNT; i++) {
+        write_ok = write_ok && fprintf(f, "from mod_%02d import chain_%02d\n", i, i) >= 0;
+    }
+    write_ok = write_ok && fputs("\ndef main():\n    total = 0\n", f) >= 0;
+    for (int i = 0; i < PARITY_REPO_FILE_COUNT; i++) {
+        write_ok = write_ok && fprintf(f, "    total += chain_%02d(%d)\n", i, i) >= 0;
+    }
+    write_ok = write_ok && fputs("    return total\n", f) >= 0;
+    if (fclose(f) != 0) {
+        write_ok = 0;
+    }
+    return write_ok ? 0 : CBM_NOT_FOUND;
+}
+
+static int count_representative_qns(cbm_store_t *store) {
+    static const char *qns[PARITY_REP_QN_COUNT] = {
+        "pipe-parity.common.shared",
+        "pipe-parity.common.Shared.touch",
+        "pipe-parity.mod_00.func_00",
+        "pipe-parity.app.main",
+    };
+    int found = 0;
+    for (int i = 0; i < PARITY_REP_QN_COUNT; i++) {
+        cbm_node_t node = {0};
+        if (cbm_store_find_node_by_qn(store, "pipe-parity", qns[i], &node) == CBM_STORE_OK) {
+            found++;
+            cbm_node_free_fields(&node);
+        }
+    }
+    return found;
+}
+
+static int run_pipeline_worker_case(const char *repo_dir, const char *db_path, int workers,
+                                    pipeline_db_counts_t *out) {
+    if (!repo_dir || !db_path || !out) {
+        return CBM_NOT_FOUND;
+    }
+    char worker_buf[CBM_SZ_32];
+    if (parity_format(worker_buf, sizeof(worker_buf), "%d", workers) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (workers > 0) {
+        cbm_setenv("CBM_WORKERS", worker_buf, 1);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+
+    remove_sqlite_family(db_path);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(repo_dir, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return CBM_NOT_FOUND;
+    }
+    cbm_pipeline_set_project_name(p, "pipe-parity");
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    if (rc != 0 || !sqlite_integrity_ok(db_path)) {
+        return CBM_NOT_FOUND;
+    }
+
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    if (!store) {
+        return CBM_NOT_FOUND;
+    }
+    cbm_file_hash_t *hashes = NULL;
+    int hash_count = 0;
+    int hash_rc = cbm_store_get_file_hashes(store, "pipe-parity", &hashes, &hash_count);
+    out->nodes = cbm_store_count_nodes(store, "pipe-parity");
+    out->edges = cbm_store_count_edges(store, "pipe-parity");
+    out->calls = cbm_store_count_edges_by_type(store, "pipe-parity", "CALLS");
+    out->imports = cbm_store_count_edges_by_type(store, "pipe-parity", "IMPORTS");
+    out->usage = cbm_store_count_edges_by_type(store, "pipe-parity", "USAGE");
+    out->semantic = cbm_store_count_edges_by_type(store, "pipe-parity", "SEMANTICALLY_RELATED");
+    out->file_hashes = hash_rc == CBM_STORE_OK ? hash_count : CBM_STORE_ERR;
+    out->representative_qns = count_representative_qns(store);
+    cbm_store_free_file_hashes(hashes, hash_count);
+
+    cbm_project_t project = {0};
+    int project_rc = cbm_store_get_project(store, "pipe-parity", &project);
+    int project_root_ok =
+        project_rc == CBM_STORE_OK && project.root_path && strcmp(project.root_path, repo_dir) == 0;
+    cbm_project_free_fields(&project);
+
+    cbm_store_close(store);
+
+    return (project_root_ok && out->nodes > 0 && out->edges > 0 &&
+            out->file_hashes == PARITY_EXPECTED_FILE_HASHES && out->calls > 0 &&
+            out->imports > 0 && out->representative_qns == PARITY_REP_QN_COUNT)
+               ? 0
+               : CBM_NOT_FOUND;
+}
+
+static int assert_pipeline_counts_equal(const pipeline_db_counts_t *want,
+                                        const pipeline_db_counts_t *got) {
+    if (!want || !got) {
+        return CBM_NOT_FOUND;
+    }
+    return want->nodes == got->nodes && want->edges == got->edges &&
+           want->file_hashes == got->file_hashes && want->calls == got->calls &&
+           want->imports == got->imports && want->usage == got->usage &&
+           want->semantic == got->semantic && want->representative_qns == got->representative_qns
+               ? 0
+               : CBM_NOT_FOUND;
+}
+
+TEST(parallel_full_pipeline_worker_count_parity_64_files) {
+    char saved_workers[CBM_SZ_32] = {0};
+    bool had_workers =
+        cbm_safe_getenv("CBM_WORKERS", saved_workers, sizeof(saved_workers), NULL) != NULL;
+
+    char repo_dir[PARITY_PATH_BUF] = {0};
+    int rc = write_worker_parity_repo(repo_dir, sizeof(repo_dir));
+
+    const int workers[PARITY_DB_PATH_COUNT] = {1, 2, 4, 0};
+    char db_paths[PARITY_DB_PATH_COUNT][PARITY_PATH_BUF] = {{0}};
+    pipeline_db_counts_t counts[PARITY_DB_PATH_COUNT] = {{0}};
+    if (rc == 0) {
+        for (int i = 0; i < PARITY_DB_PATH_COUNT; i++) {
+            if (parity_format(db_paths[i], sizeof(db_paths[i]), "%s/pipe-parity-%d.db", repo_dir,
+                              i) != 0) {
+                rc = CBM_NOT_FOUND;
+                break;
+            }
+            if (run_pipeline_worker_case(repo_dir, db_paths[i], workers[i], &counts[i]) != 0) {
+                rc = CBM_NOT_FOUND;
+                break;
+            }
+        }
+    }
+
+    if (rc == 0) {
+        for (int i = 1; i < PARITY_DB_PATH_COUNT; i++) {
+            if (assert_pipeline_counts_equal(&counts[0], &counts[i]) != 0) {
+                rc = CBM_NOT_FOUND;
+                break;
+            }
+        }
+    }
+
+    for (int i = 0; i < PARITY_DB_PATH_COUNT; i++) {
+        remove_sqlite_family(db_paths[i]);
+    }
+    if (repo_dir[0]) {
+        th_rmtree(repo_dir);
+    }
+    if (had_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+
+    ASSERT_EQ(rc, 0);
+    PASS();
+}
+
 /* ── Graph buffer merge tests ─────────────────────────────────────── */
 
 TEST(gbuf_shared_ids_unique) {
@@ -727,6 +1015,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_inherits_parity);
     RUN_TEST(parallel_implements_parity);
     RUN_TEST(parallel_total_edges);
+    RUN_TEST(parallel_full_pipeline_worker_count_parity_64_files);
     RUN_TEST(parallel_empty_files);
     RUN_TEST(parallel_args_json_no_overflow);
 
