@@ -1585,8 +1585,8 @@ int cbm_remove_codex_mcp(const char *config_path) {
 #define CMM_SESSION_REMINDER_CMD                                                    \
     "echo \"Code discovery: prefer codebase-memory-mcp (search_graph, trace_path, " \
     "get_code, query_graph, search_code) over grep/file-read; default tools "       \
-    "auto-index CWD or explicit repo paths when possible; call _hidden_tools for "  \
-    "explicit index_repository.\""
+    "auto-index CWD or explicit repo paths when auto_index=true and under "         \
+    "auto_index_limit; call _hidden_tools for explicit index_repository.\""
 
 /* Sentinel-delimited block so upsert/remove are robust to the nested TOML
  * array-of-tables (which both start with '['). */
@@ -2130,7 +2130,8 @@ static void cbm_install_session_reminder_script(const char *home) {
            "   - search_code(pattern) for text search (graph-augmented grep)\n"
            "2. Use Grep/Glob/Read freely for text, configs, non-code files, and\n"
            "   always Read a file before editing it.\n"
-           "3. Default tools auto-index the server CWD or explicit repo paths when possible. Use _hidden_tools\n"
+           "3. Default tools auto-index the server CWD or explicit repo paths when\n"
+           "   auto_index=true and under auto_index_limit. Use _hidden_tools\n"
            "   to reveal index_repository or get_architecture when explicit control is needed.\n"
            "REMINDER\n");
 #ifndef _WIN32
