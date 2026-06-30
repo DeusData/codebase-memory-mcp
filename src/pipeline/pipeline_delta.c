@@ -26,6 +26,7 @@ static const char cbm_delta_reason_frontier_too_large[] = "frontier_too_large";
 static const char cbm_delta_reason_invalid_input[] = "invalid_input";
 static const char cbm_delta_reason_missing_file_metadata[] = "missing_file_metadata";
 static const char cbm_delta_reason_preflight_error[] = "preflight_error";
+static const char cbm_delta_reason_publish_error[] = "publish_error";
 static const char cbm_delta_reason_rename_requires_full[] = "rename_requires_full";
 static const char cbm_delta_reason_unresolved_edge_endpoint[] = "unresolved_edge_endpoint";
 static const char cbm_delta_reason_unsupported_derived_view[] = "unsupported_derived_view";
@@ -717,6 +718,34 @@ int cbm_pipeline_plan_file_delta_batch(cbm_store_t *store,
 
     out->route = CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE;
     out->reason = cbm_delta_reason_candidate;
+    return CBM_STORE_OK;
+}
+
+int cbm_pipeline_apply_file_delta_batch(cbm_store_t *store,
+                                        const cbm_pipeline_file_delta_t *const *deltas,
+                                        int delta_count, int max_affected_paths,
+                                        cbm_pipeline_file_delta_plan_t *out) {
+    int rc =
+        cbm_pipeline_plan_file_delta_batch(store, deltas, delta_count, max_affected_paths, out);
+    if (rc != CBM_STORE_OK || !out || out->route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
+        return rc;
+    }
+
+    const cbm_store_file_delta_t **publish_deltas =
+        malloc((size_t)delta_count * sizeof(*publish_deltas));
+    if (!publish_deltas) {
+        delta_plan_set_fallback(out, cbm_delta_reason_preflight_error);
+        return CBM_STORE_OK;
+    }
+    for (int i = 0; i < delta_count; i++) {
+        publish_deltas[i] = &deltas[i]->delta;
+    }
+    rc = cbm_store_publish_file_delta_batch_complete(store, publish_deltas, delta_count);
+    free(publish_deltas);
+    if (rc != CBM_STORE_OK) {
+        delta_plan_set_fallback(out, cbm_delta_reason_publish_error);
+        return CBM_STORE_OK;
+    }
     return CBM_STORE_OK;
 }
 
