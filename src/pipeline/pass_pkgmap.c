@@ -1912,6 +1912,36 @@ int cbm_pipeline_insert_import_edge(cbm_pipeline_ctx_t *ctx, int64_t source_id,
     return emitted;
 }
 
+int cbm_pipeline_create_import_edges_for_file(cbm_pipeline_ctx_t *ctx,
+                                              const CBMFileResult *result,
+                                              const char *rel_path,
+                                              CBMHashTable *namespace_map) {
+    if (!ctx || !ctx->gbuf || !result || !rel_path) {
+        return 0;
+    }
+
+    int count = 0;
+    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
+    const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
+    if (!source_node) {
+        free(file_qn);
+        return 0;
+    }
+
+    for (int i = 0; i < result->imports.count; i++) {
+        const CBMImport *imp = &result->imports.items[i];
+        if (!imp->module_path) {
+            continue;
+        }
+        const cbm_gbuf_node_t *target =
+            cbm_pipeline_resolve_import_node(ctx, rel_path, file_qn, imp, namespace_map);
+        count += cbm_pipeline_insert_import_edge(ctx, source_node->id, target, imp->local_name);
+    }
+
+    free(file_qn);
+    return count;
+}
+
 /* ── Namespace map ───────────────────────────────────────────────── */
 
 CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,

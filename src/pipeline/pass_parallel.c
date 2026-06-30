@@ -800,29 +800,6 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     return edges;
 }
 
-/* Create IMPORTS edges for one file's imports (parallel path). */
-static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
-                                const char *rel, CBMHashTable *namespace_map) {
-    int count = 0;
-    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
-    const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-    if (!source_node) {
-        free(file_qn);
-        return 0;
-    }
-    for (int j = 0; j < result->imports.count; j++) {
-        CBMImport *imp = &result->imports.items[j];
-        if (!imp->module_path) {
-            continue;
-        }
-        const cbm_gbuf_node_t *target =
-            cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
-        count += cbm_pipeline_insert_import_edge(ctx, source_node->id, target, imp->local_name);
-    }
-    free(file_qn);
-    return count;
-}
-
 /* Find channel source node (enclosing function or file). */
 static const cbm_gbuf_node_t *find_channel_src(cbm_pipeline_ctx_t *ctx, const CBMChannel *ch,
                                                const char *rel) {
@@ -924,7 +901,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         const char *rel = files[i].rel_path;
 
-        imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
+        imports_edges += cbm_pipeline_create_import_edges_for_file(ctx, result, rel, namespace_map);
         create_channel_edges(ctx, result, rel);
     }
 
