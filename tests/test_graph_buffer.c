@@ -8,6 +8,8 @@
 #include "graph_buffer/graph_buffer.h"
 #include "store/store.h"
 #include "foundation/compat.h" /* cbm_mkstemp */
+#include "foundation/constants.h"
+#include "foundation/platform.h"
 #include "sqlite3.h"           /* vendored/sqlite3/ via -Ivendored/sqlite3 */
 #include <unistd.h>
 
@@ -19,6 +21,18 @@ static int gbuf_make_temp_db(char *path, size_t pathsz) {
     }
     close(fd);
     return 0;
+}
+
+static int gbuf_store_has_qn(const char *path, const char *project, const char *qn) {
+    cbm_store_t *store = cbm_store_open_path_query(path);
+    if (!store) {
+        return 0;
+    }
+    cbm_node_t node = {0};
+    int found = cbm_store_find_node_by_qn(store, project, qn, &node) == CBM_STORE_OK;
+    cbm_node_free_fields(&node);
+    cbm_store_close(store);
+    return found;
 }
 
 /* ── Node operations ───────────────────────────────────────────── */
@@ -1189,6 +1203,45 @@ TEST(gbuf_dump_relative_root_path_retained) {
     PASS();
 }
 
+TEST(gbuf_dump_failure_before_replace_keeps_existing_db) {
+    static const char *fail_env = "CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE";
+    char saved_fail[CBM_SZ_32] = {0};
+    bool had_fail = cbm_safe_getenv(fail_env, saved_fail, sizeof(saved_fail), NULL) != NULL;
+
+    char path[256];
+    ASSERT_EQ(gbuf_make_temp_db(path, sizeof(path)), 0);
+
+    cbm_gbuf_t *old_gb = cbm_gbuf_new("proj", "/tmp/repo");
+    ASSERT_NOT_NULL(old_gb);
+    cbm_gbuf_upsert_node(old_gb, "Function", "old", "proj.old", "old.c", 1, 2, "{}");
+    ASSERT_EQ(cbm_gbuf_dump_to_sqlite(old_gb, path), 0);
+    cbm_gbuf_free(old_gb);
+
+    ASSERT(gbuf_store_has_qn(path, "proj", "proj.old"));
+    ASSERT(!gbuf_store_has_qn(path, "proj", "proj.new"));
+
+    cbm_gbuf_t *new_gb = cbm_gbuf_new("proj", "/tmp/repo");
+    ASSERT_NOT_NULL(new_gb);
+    cbm_gbuf_upsert_node(new_gb, "Function", "new", "proj.new", "new.c", 1, 2, "{}");
+
+    cbm_setenv(fail_env, "1", 1);
+    int dump_rc = cbm_gbuf_dump_to_sqlite(new_gb, path);
+
+    if (had_fail) {
+        cbm_setenv(fail_env, saved_fail, 1);
+    } else {
+        cbm_unsetenv(fail_env);
+    }
+
+    ASSERT_NEQ(dump_rc, 0);
+    ASSERT(gbuf_store_has_qn(path, "proj", "proj.old"));
+    ASSERT(!gbuf_store_has_qn(path, "proj", "proj.new"));
+
+    cbm_gbuf_free(new_gb);
+    unlink(path);
+    PASS();
+}
+
 SUITE(graph_buffer) {
     /* Original tests */
     RUN_TEST(gbuf_create_free);
@@ -1259,4 +1312,5 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_dump_pipeline_path_integrity);
     /* Relative root_path retain regression (#57 self-index finding) */
     RUN_TEST(gbuf_dump_relative_root_path_retained);
+    RUN_TEST(gbuf_dump_failure_before_replace_keeps_existing_db);
 }

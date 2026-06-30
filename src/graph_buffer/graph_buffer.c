@@ -33,6 +33,7 @@ enum {
 #include "foundation/dyn_array.h"
 #include "foundation/profile.h"
 #include "foundation/mem.h"
+#include "foundation/platform.h"
 #include <sqlite3.h>
 
 #include <stdatomic.h>
@@ -41,6 +42,19 @@ enum {
 #include <stdlib.h>
 #include <string.h> // strdup
 #include <time.h>
+
+/* Test-only fault injection for the atomic publish boundary. It lets the suite
+ * prove a failed replace leaves the previously published DB untouched. */
+static const char cbm_gbuf_test_fail_before_replace_env[] =
+    "CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE";
+static const char cbm_test_env_disabled[] = "0";
+
+static bool cbm_gbuf_test_fail_before_replace_enabled(void) {
+    char buf[CBM_SZ_16];
+    const char *val =
+        cbm_safe_getenv(cbm_gbuf_test_fail_before_replace_env, buf, sizeof(buf), NULL);
+    return val && val[0] != '\0' && strcmp(val, cbm_test_env_disabled) != 0;
+}
 
 static inline void *intptr_to_ptr(intptr_t v) {
     void *p;
@@ -1681,6 +1695,13 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
         } else {
             cbm_log_error("dump.verify_open_failed", "path", tmp_path, "action",
                           "deleting unverified temp db");
+            cbm_unlink(tmp_path);
+            rc = GB_ERR;
+        }
+    }
+    if (rc == 0) {
+        if (cbm_gbuf_test_fail_before_replace_enabled()) {
+            cbm_log_error("dump.test_fail_before_replace", "tmp", tmp_path, "path", path);
             cbm_unlink(tmp_path);
             rc = GB_ERR;
         }
