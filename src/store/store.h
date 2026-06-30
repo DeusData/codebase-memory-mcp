@@ -27,6 +27,7 @@ typedef struct cbm_store cbm_store_t;
 /* Exact-delta metadata vocabulary. Keep these named so schema defaults and
  * future publish code do not drift into stringly-typed status variants. */
 #define CBM_STORE_INDEX_STATUS_COMPLETE "complete"
+#define CBM_STORE_INDEX_STATUS_RESERVED "reserved"
 #define CBM_STORE_DERIVED_STATUS_STALE "stale"
 #define CBM_STORE_DERIVED_STATUS_COMPLETE "complete"
 #define CBM_STORE_DERIVED_KIND_DIRECT "direct"
@@ -529,6 +530,13 @@ int cbm_store_list_file_delta_affected_paths(cbm_store_t *s, const char *project
                                              const char *rel_path,
                                              const char **new_export_qns, int new_export_count,
                                              char ***out, int *count);
+
+/* Reserve the next per-project index generation in its own BEGIN IMMEDIATE transaction.
+ * Callers should use the returned generation for a later exact-delta publish. */
+int cbm_store_reserve_index_generation(cbm_store_t *s, const char *project,
+                                       const char *repo_fingerprint,
+                                       const char *config_fingerprint,
+                                       int64_t *out_generation);
 
 int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *delta);
 
