@@ -572,6 +572,18 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     cbm_registry_add(r, node->name, node->qualified_name, node->label);
 }
 
+static void incr_free_result_cache(CBMFileResult **cache, int count) {
+    if (!cache) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        if (cache[i]) {
+            cbm_free_result(cache[i]);
+        }
+    }
+    free(cache);
+}
+
 /* Run parallel or sequential extract+resolve for changed files. */
 static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci) {
     struct timespec t;
@@ -594,6 +606,12 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         CBMFileResult **cache = (CBMFileResult **)calloc(ci, sizeof(CBMFileResult *));
         if (cache) {
             int rc = 0;
+            if (incr_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_EXTRACT)) {
+                cbm_log_error("incremental.err", "phase", CBM_TEST_FAIL_INCREMENTAL_EXTRACT, "rc",
+                              itoa_buf_incr(CBM_NOT_FOUND));
+                incr_free_result_cache(cache, ci);
+                return CBM_NOT_FOUND;
+            }
             cbm_clock_gettime(CLOCK_MONOTONIC, &t);
             rc = cbm_parallel_extract(ctx, changed_files, ci, cache, &shared_ids, worker_count);
             cbm_gbuf_set_next_id(ctx->gbuf, atomic_load(&shared_ids));
@@ -601,15 +619,16 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                          itoa_buf_incr((int)elapsed_ms_incr(t)));
             if (rc != 0) {
                 cbm_log_error("incremental.err", "phase", "incr_extract", "rc", itoa_buf_incr(rc));
-                for (int j = 0; j < ci; j++) {
-                    if (cache[j]) {
-                        cbm_free_result(cache[j]);
-                    }
-                }
-                free(cache);
+                incr_free_result_cache(cache, ci);
                 return rc;
             }
 
+            if (incr_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_REGISTRY)) {
+                cbm_log_error("incremental.err", "phase", CBM_TEST_FAIL_INCREMENTAL_REGISTRY, "rc",
+                              itoa_buf_incr(CBM_NOT_FOUND));
+                incr_free_result_cache(cache, ci);
+                return CBM_NOT_FOUND;
+            }
             cbm_clock_gettime(CLOCK_MONOTONIC, &t);
             rc = cbm_build_registry_from_cache(ctx, changed_files, ci, cache);
             cbm_log_info("pass.timing", "pass", "incr_registry", "elapsed_ms",
@@ -617,12 +636,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
             if (rc != 0) {
                 cbm_log_error("incremental.err", "phase", "incr_registry", "rc",
                               itoa_buf_incr(rc));
-                for (int j = 0; j < ci; j++) {
-                    if (cache[j]) {
-                        cbm_free_result(cache[j]);
-                    }
-                }
-                free(cache);
+                incr_free_result_cache(cache, ci);
                 return rc;
             }
             /* Registry build allocates on the main graph after parallel_extract.
@@ -637,6 +651,12 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
              * still fires; cross-file resolution is deferred to the
              * next full re-index. Pass NULL/0/NULL to make the fused
              * step in resolve_worker a no-op. */
+            if (incr_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_RESOLVE)) {
+                cbm_log_error("incremental.err", "phase", CBM_TEST_FAIL_INCREMENTAL_RESOLVE, "rc",
+                              itoa_buf_incr(CBM_NOT_FOUND));
+                incr_free_result_cache(cache, ci);
+                return CBM_NOT_FOUND;
+            }
             cbm_clock_gettime(CLOCK_MONOTONIC, &t);
             rc = cbm_parallel_resolve(ctx, changed_files, ci, cache, &shared_ids, worker_count,
                                       NULL, 0, NULL, NULL /* module_def_index */,
@@ -645,12 +665,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
             cbm_log_info("pass.timing", "pass", "incr_resolve", "elapsed_ms",
                          itoa_buf_incr((int)elapsed_ms_incr(t)));
 
-            for (int j = 0; j < ci; j++) {
-                if (cache[j]) {
-                    cbm_free_result(cache[j]);
-                }
-            }
-            free(cache);
+            incr_free_result_cache(cache, ci);
             if (rc != 0) {
                 cbm_log_error("incremental.err", "phase", "incr_resolve", "rc",
                               itoa_buf_incr(rc));

@@ -5415,6 +5415,56 @@ static int setup_incremental_repo(void) {
     return 0;
 }
 
+enum { INCR_PARALLEL_CHANGED_FILE_COUNT = 64 };
+
+static int incremental_parallel_file_path(int index, char *path, size_t path_sz) {
+    int n = snprintf(path, path_sz, "%s/file_%03d.go", g_incr_tmpdir, index);
+    return (n < 0 || (size_t)n >= path_sz) ? -1 : 0;
+}
+
+static int write_incremental_parallel_file(int index, bool changed) {
+    char path[CBM_PATH_MAX];
+    if (incremental_parallel_file_path(index, path, sizeof(path)) != 0) {
+        return -1;
+    }
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return -1;
+    }
+    fprintf(f, "package main\n\nfunc Func%03d() int {\n\treturn %d\n}\n", index,
+            index + (changed ? 1 : 0));
+    if (changed && index == 0) {
+        fprintf(f, "\nfunc NewFunc() int {\n\treturn 42\n}\n");
+    }
+    return fclose(f);
+}
+
+static int setup_incremental_parallel_repo(void) {
+    int n = snprintf(g_incr_tmpdir, sizeof(g_incr_tmpdir), "/tmp/cbm_incr_parallel_XXXXXX");
+    if (n < 0 || (size_t)n >= sizeof(g_incr_tmpdir) || !cbm_mkdtemp(g_incr_tmpdir)) {
+        return -1;
+    }
+    n = snprintf(g_incr_dbpath, sizeof(g_incr_dbpath), "%s/test.db", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(g_incr_dbpath)) {
+        return -1;
+    }
+    for (int i = 0; i < INCR_PARALLEL_CHANGED_FILE_COUNT; i++) {
+        if (write_incremental_parallel_file(i, false) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int rewrite_incremental_parallel_repo(void) {
+    for (int i = 0; i < INCR_PARALLEL_CHANGED_FILE_COUNT; i++) {
+        if (write_incremental_parallel_file(i, true) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static void cleanup_incremental_repo(void) {
     th_rmtree(g_incr_tmpdir);
 }
@@ -5759,6 +5809,58 @@ static void pipeline_env_restore(const pipeline_env_snapshot_t *snap) {
     }
 }
 
+static int run_parallel_incremental_phase_failure_case(const char *phase) {
+    pipeline_env_snapshot_t fail_env = pipeline_env_save(CBM_TEST_FAIL_INCREMENTAL_PHASE);
+
+    if (setup_incremental_parallel_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_before = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_before, 0);
+    cbm_store_close(s);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
+    ASSERT_EQ(rewrite_incremental_parallel_repo(), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL, .ignore_file = NULL, .max_file_size = 0};
+    ASSERT_EQ(cbm_discover(g_incr_tmpdir, &opts, &files, &file_count), 0);
+    ASSERT_GTE(file_count, INCR_PARALLEL_CHANGED_FILE_COUNT);
+
+    cbm_setenv(CBM_TEST_FAIL_INCREMENTAL_PHASE, phase, 1);
+    int rc = cbm_pipeline_run_incremental(p, g_incr_dbpath, files, file_count);
+    pipeline_env_restore(&fail_env);
+    cbm_discover_free(files, file_count);
+
+    ASSERT_NEQ(rc, 0);
+    s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_count_nodes(s, project), nodes_before);
+    cbm_store_close(s);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
+
+    cbm_pipeline_free(p);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    return 0;
+}
+
 TEST(incremental_full_then_noop) {
     /* Full index, then re-run → should detect no changes and skip */
     if (setup_incremental_repo() != 0) {
@@ -6001,6 +6103,21 @@ TEST(incremental_hash_persist_failure_falls_back_to_full) {
     free(project);
     cbm_config_close(cfg);
     cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_parallel_extract_failure_keeps_existing_db) {
+    ASSERT_EQ(run_parallel_incremental_phase_failure_case(CBM_TEST_FAIL_INCREMENTAL_EXTRACT), 0);
+    PASS();
+}
+
+TEST(incremental_parallel_registry_failure_keeps_existing_db) {
+    ASSERT_EQ(run_parallel_incremental_phase_failure_case(CBM_TEST_FAIL_INCREMENTAL_REGISTRY), 0);
+    PASS();
+}
+
+TEST(incremental_parallel_resolve_failure_keeps_existing_db) {
+    ASSERT_EQ(run_parallel_incremental_phase_failure_case(CBM_TEST_FAIL_INCREMENTAL_RESOLVE), 0);
     PASS();
 }
 
@@ -7555,6 +7672,9 @@ SUITE(pipeline) {
     RUN_TEST(incremental_dump_failure_keeps_existing_db);
     RUN_TEST(incremental_postpass_failure_keeps_existing_db);
     RUN_TEST(incremental_hash_persist_failure_falls_back_to_full);
+    RUN_TEST(incremental_parallel_extract_failure_keeps_existing_db);
+    RUN_TEST(incremental_parallel_registry_failure_keeps_existing_db);
+    RUN_TEST(incremental_parallel_resolve_failure_keeps_existing_db);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
     RUN_TEST(incremental_fast_preserves_mode_skipped_tools_dir);
