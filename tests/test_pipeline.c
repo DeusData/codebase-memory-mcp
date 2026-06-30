@@ -3214,9 +3214,9 @@ static void pipeline_delta_attach_test_metadata(cbm_pipeline_file_delta_t *delta
     delta->delta.file_state = state;
 }
 
-static int pipeline_delta_seed_existing_ownership(cbm_store_t *s, const char *project,
-                                                  const char *rel_path,
-                                                  const char *qualified_name) {
+static int64_t pipeline_delta_seed_existing_ownership_id(cbm_store_t *s, const char *project,
+                                                         const char *rel_path,
+                                                         const char *qualified_name) {
     enum { PIPELINE_DELTA_TEST_BASE_GENERATION = 1 };
     cbm_node_t node = {.project = (char *)project,
                        .label = "Function",
@@ -3228,7 +3228,7 @@ static int pipeline_delta_seed_existing_ownership(cbm_store_t *s, const char *pr
                        .properties_json = "{}"};
     int64_t node_id = cbm_store_upsert_node(s, &node);
     if (node_id <= CBM_STORE_NO_NODE_ID) {
-        return CBM_STORE_ERR;
+        return CBM_STORE_NO_NODE_ID;
     }
     cbm_file_state_t state = {.project = (char *)project,
                               .rel_path = (char *)rel_path,
@@ -3241,10 +3241,22 @@ static int pipeline_delta_seed_existing_ownership(cbm_store_t *s, const char *pr
                               .generation = PIPELINE_DELTA_TEST_BASE_GENERATION,
                               .indexed_at = "2026-06-30T00:00:00Z"};
     if (cbm_store_upsert_file_state(s, &state) != CBM_STORE_OK) {
-        return CBM_STORE_ERR;
+        return CBM_STORE_NO_NODE_ID;
     }
-    return cbm_store_upsert_node_owner(s, project, node_id, rel_path,
-                                       PIPELINE_DELTA_TEST_BASE_GENERATION);
+    if (cbm_store_upsert_node_owner(s, project, node_id, rel_path,
+                                    PIPELINE_DELTA_TEST_BASE_GENERATION) != CBM_STORE_OK) {
+        return CBM_STORE_NO_NODE_ID;
+    }
+    return node_id;
+}
+
+static int pipeline_delta_seed_existing_ownership(cbm_store_t *s, const char *project,
+                                                  const char *rel_path,
+                                                  const char *qualified_name) {
+    return pipeline_delta_seed_existing_ownership_id(s, project, rel_path, qualified_name) >
+                   CBM_STORE_NO_NODE_ID
+               ? CBM_STORE_OK
+               : CBM_STORE_ERR;
 }
 
 TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths) {
@@ -3575,6 +3587,79 @@ TEST(pipeline_file_delta_plan_falls_back_without_existing_ownership) {
     ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
     ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
     ASSERT_STR_EQ(plan.reason, "missing_existing_ownership");
+    ASSERT_EQ(plan.affected_count, 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_on_external_inbound_edge) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    int64_t main_id =
+        pipeline_delta_seed_existing_ownership_id(s, "test", "main.go", "test.main.Old");
+    int64_t helper_id =
+        pipeline_delta_seed_existing_ownership_id(s, "test", "helper.go", "test.helper.Helper");
+    ASSERT_GT(main_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_GT(helper_id, CBM_STORE_NO_NODE_ID);
+    cbm_edge_t inbound = {.project = "test",
+                          .source_id = helper_id,
+                          .target_id = main_id,
+                          .type = "CALLS",
+                          .properties_json = "{}"};
+    ASSERT_GT(cbm_store_insert_edge(s, &inbound), CBM_STORE_NO_NODE_ID);
+
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = "test", .rel_path = "main.go"}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "inbound_edges_require_full");
+    ASSERT_EQ(plan.affected_count, 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_on_unowned_structural_inbound_edge) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    int64_t main_id =
+        pipeline_delta_seed_existing_ownership_id(s, "test", "main.go", "test.main.Old");
+    ASSERT_GT(main_id, CBM_STORE_NO_NODE_ID);
+
+    cbm_node_t folder = {.project = "test",
+                         .label = "Folder",
+                         .name = "test",
+                         .qualified_name = "test",
+                         .file_path = "",
+                         .properties_json = "{}"};
+    int64_t folder_id = cbm_store_upsert_node(s, &folder);
+    ASSERT_GT(folder_id, CBM_STORE_NO_NODE_ID);
+
+    cbm_edge_t inbound = {.project = "test",
+                          .source_id = folder_id,
+                          .target_id = main_id,
+                          .type = "CONTAINS_FILE",
+                          .properties_json = "{}"};
+    ASSERT_GT(cbm_store_insert_edge(s, &inbound), CBM_STORE_NO_NODE_ID);
+
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = "test", .rel_path = "main.go"}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "inbound_edges_require_full");
     ASSERT_EQ(plan.affected_count, 0);
 
     cbm_pipeline_file_delta_plan_free(&plan);
@@ -8325,6 +8410,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_plan_candidate_from_frontier);
     RUN_TEST(pipeline_file_delta_apply_falls_back_on_publish_error);
     RUN_TEST(pipeline_file_delta_plan_falls_back_without_existing_ownership);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_external_inbound_edge);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_unowned_structural_inbound_edge);
     RUN_TEST(pipeline_file_delta_plan_falls_back_without_file_metadata);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unsupported_edges);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_delete);

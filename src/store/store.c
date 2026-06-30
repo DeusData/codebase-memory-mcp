@@ -151,6 +151,7 @@ struct cbm_store {
     sqlite3_stmt *stmt_delete_edge_owners_by_file;
     sqlite3_stmt *stmt_count_node_owners_by_file;
     sqlite3_stmt *stmt_count_edge_owners_by_file;
+    sqlite3_stmt *stmt_list_file_delta_inbound_source_paths;
     sqlite3_stmt *stmt_upsert_symbol_export;
     sqlite3_stmt *stmt_delete_symbol_exports_by_file;
     sqlite3_stmt *stmt_list_symbol_exports_by_file;
@@ -1050,6 +1051,7 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_delete_edge_owners_by_file);
     finalize_stmt(&s->stmt_count_node_owners_by_file);
     finalize_stmt(&s->stmt_count_edge_owners_by_file);
+    finalize_stmt(&s->stmt_list_file_delta_inbound_source_paths);
     finalize_stmt(&s->stmt_upsert_symbol_export);
     finalize_stmt(&s->stmt_delete_symbol_exports_by_file);
     finalize_stmt(&s->stmt_list_symbol_exports_by_file);
@@ -2188,6 +2190,41 @@ int cbm_store_count_file_delta_owners(cbm_store_t *s, const char *project,
     }
     return store_count_file_owner_rows(s, &s->stmt_count_edge_owners_by_file, edge_sql, project,
                                        rel_path, "count_edge_owners_by_file", out_edge_owners);
+}
+
+int cbm_store_list_file_delta_inbound_source_paths(cbm_store_t *s, const char *project,
+                                                   const char *rel_path, char ***out,
+                                                   int *count) {
+    if (out) {
+        *out = NULL;
+    }
+    if (count) {
+        *count = 0;
+    }
+    if (!s || !project || !rel_path || !out || !count) {
+        if (s) {
+            store_set_error(s, "list_file_delta_inbound_source_paths: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = prepare_cached(
+        s, &s->stmt_list_file_delta_inbound_source_paths,
+        "SELECT DISTINCT COALESCE(src_owner.rel_path, '') FROM edges e "
+        "JOIN node_owners tgt_owner "
+        "  ON tgt_owner.project = ?1 AND tgt_owner.rel_path = ?2 "
+        " AND tgt_owner.node_id = e.target_id "
+        "LEFT JOIN node_owners src_owner "
+        "  ON src_owner.project = ?1 AND src_owner.node_id = e.source_id "
+        "WHERE e.project = ?1 "
+        "  AND (src_owner.rel_path IS NULL OR src_owner.rel_path != ?2) "
+        "ORDER BY 1;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+    return store_collect_text_column(s, stmt, "list_file_delta_inbound_source_paths", out, count);
 }
 
 int cbm_store_upsert_symbol_export(cbm_store_t *s, const char *project,
