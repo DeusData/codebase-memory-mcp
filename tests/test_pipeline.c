@@ -3364,6 +3364,44 @@ TEST(pipeline_file_delta_plan_candidate_from_frontier) {
     PASS();
 }
 
+TEST(pipeline_file_delta_apply_falls_back_on_publish_error) {
+    enum { PIPELINE_DELTA_APPLY_ONE = 1 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    cbm_node_t nodes[1] = {{.project = "test",
+                            .label = "Function",
+                            .name = "Value",
+                            .qualified_name = "test.lib.Value",
+                            .file_path = "lib.go",
+                            .properties_json = "{}"}};
+    cbm_store_symbol_export_t exports[1] = {
+        {.qualified_name = "test.lib.Value", .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = "test",
+                                                 .rel_path = "lib.go",
+                                                 .nodes = nodes,
+                                                 .node_count = 1,
+                                                 .exports = exports,
+                                                 .export_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, deltas, PIPELINE_DELTA_APPLY_ONE,
+                                                  CBM_SZ_4, &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "publish_error");
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, "test", "test.lib.Value"), 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(pipeline_file_delta_plan_falls_back_without_file_metadata) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -8097,6 +8135,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_descriptor_marks_unsupported_edges);
     RUN_TEST(pipeline_file_delta_metadata_from_file);
     RUN_TEST(pipeline_file_delta_plan_candidate_from_frontier);
+    RUN_TEST(pipeline_file_delta_apply_falls_back_on_publish_error);
     RUN_TEST(pipeline_file_delta_plan_falls_back_without_file_metadata);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unsupported_edges);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_delete);
