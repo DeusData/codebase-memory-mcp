@@ -1916,6 +1916,18 @@ static bool is_valid_json_response(const char *json) {
     return true;
 }
 
+static int count_substr_mcp(const char *s, const char *needle) {
+    int count = 0;
+    if (!s || !needle) return 0;
+    size_t nlen = strlen(needle);
+    if (nlen == 0) return 0;
+    while ((s = strstr(s, needle)) != NULL) {
+        count++;
+        s += nlen;
+    }
+    return count;
+}
+
 static bool snippet_source_has_replacement(const char *json) {
     yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
     if (!doc) {
@@ -1954,6 +1966,52 @@ TEST(snippet_exact_qn) {
     ASSERT_NOT_NULL(strstr(resp, "\"callees\":2"));
     free(resp);
 
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(snippet_source_key_is_code_body_only) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                          "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_EQ(count_substr_mcp(resp, "\"source\":"), 1);
+    ASSERT_NOT_NULL(strstr(resp, "\"source_origin\":\"project\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"property_source\":\"infra\""));
+
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    const char *source = yyjson_get_str(yyjson_obj_get(root, "source"));
+    ASSERT_NOT_NULL(source);
+    ASSERT_NOT_NULL(strstr(source, "func HandleRequest() error"));
+    yyjson_doc_free(doc);
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(snippet_invalid_mode_errors) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                          "\"project\":\"test-project\",\"mode\":\"compact\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"error\":\"invalid mode 'compact'\""));
+    ASSERT_NOT_NULL(strstr(resp, "Valid values: full, signature, head_tail"));
+    ASSERT_NULL(strstr(resp, "func HandleRequest() error"));
+
+    free(resp);
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
     PASS();
@@ -2578,18 +2636,6 @@ static void alarm_handler(int sig) {
     _exit(1);
 }
 
-static int count_substr_mcp(const char *s, const char *needle) {
-    int count = 0;
-    if (!s || !needle) return 0;
-    size_t nlen = strlen(needle);
-    if (nlen == 0) return 0;
-    while ((s = strstr(s, needle)) != NULL) {
-        count++;
-        s += nlen;
-    }
-    return count;
-}
-
 static bool append_content_length_frame(char **dst, size_t *remaining, const char *json) {
     if (!dst || !*dst || !remaining || !json) return false;
     size_t len = strlen(json);
@@ -3043,6 +3089,8 @@ SUITE(mcp) {
 
     /* Snippet resolution (port of snippet_test.go) */
     RUN_TEST(snippet_exact_qn);
+    RUN_TEST(snippet_source_key_is_code_body_only);
+    RUN_TEST(snippet_invalid_mode_errors);
     RUN_TEST(snippet_compact_false_name_present);
     RUN_TEST(snippet_qn_suffix);
     RUN_TEST(snippet_unique_short_name);
