@@ -118,6 +118,12 @@ typedef struct {
     cbm_store_symbol_export_t *exports;
     cbm_store_import_ref_t *imports;
     int unsupported_edge_count;
+    enum {
+        CBM_PIPELINE_DELTA_CHANGE_UPSERT = 0,
+        CBM_PIPELINE_DELTA_CHANGE_DELETE = 1,
+        CBM_PIPELINE_DELTA_CHANGE_RENAME = 2,
+    } change_kind;
+    const char *old_rel_path; /* borrowed; set for rename preflight only */
 } cbm_pipeline_file_delta_t;
 
 typedef enum {
