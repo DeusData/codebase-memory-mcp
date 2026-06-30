@@ -26,6 +26,7 @@
 // NOLINTNEXTLINE(misc-include-cleaner) — platform.h included for worker count
 #include "foundation/platform.h"
 #include "foundation/log.h"
+#include "foundation/profile.h"
 #include "foundation/compat.h"
 #include "foundation/compat_regex.h"
 
@@ -1235,9 +1236,12 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
     const cbm_gbuf_node_t **label_nodes[3] = {NULL, NULL, NULL};
     int label_counts[3] = {0, 0, 0};
 
+    CBM_PROF_START(t_collect_nodes);
     for (int li = 0; li < 3; li++) {
         cbm_gbuf_find_by_label(ctx->gbuf, route_labels[li], &label_nodes[li], &label_counts[li]);
     }
+    int total_label_nodes = label_counts[0] + label_counts[1] + label_counts[2];
+    CBM_PROF_END_N("httplinks", "0_collect_nodes_seq", t_collect_nodes, total_label_nodes);
 
     cbm_route_handler_t *routes = calloc(MAX_ROUTES, sizeof(cbm_route_handler_t));
     if (!routes) {
@@ -1247,6 +1251,7 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
 
     {
         /* Parallel route discovery from disk. */
+        CBM_PROF_START(t_routes);
         int total_route_nodes = 0;
         for (int li = 0; li < 3; li++) {
             total_route_nodes += label_counts[li];
@@ -1298,6 +1303,7 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
         }
         free(work_items);
         free(route_bufs);
+        CBM_PROF_END_N("httplinks", "1_route_discovery_parallel", t_routes, wi);
     }
 
     cbm_log_info("httplink.routes", "count", itoa_hl(route_count));
@@ -1313,18 +1319,24 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
     }
 
     /* ── Phase 2: Resolve cross-file prefixes (serial) ────────── */
+    CBM_PROF_START(t_prefix);
     resolve_cross_file_group_prefixes(ctx, routes, route_count);
     resolve_fastapi_prefixes(ctx, routes, route_count);
     resolve_express_prefixes(ctx, routes, route_count);
+    CBM_PROF_END_N("httplinks", "2_prefix_resolution_seq", t_prefix, route_count);
 
     /* ── Phase 3: Registration edges (serial) ─────────────────── */
+    CBM_PROF_START(t_registration);
     int reg_edges = create_registration_call_edges(ctx, routes, route_count);
+    CBM_PROF_END_N("httplinks", "3_registration_edges_seq", t_registration, route_count);
     if (reg_edges > 0) {
         cbm_log_info("httplink.registration_edges", "count", itoa_hl(reg_edges));
     }
 
     /* ── Phase 4: Route nodes + HANDLES edges (serial) ────────── */
+    CBM_PROF_START(t_insert_routes);
     int route_nodes = insert_route_nodes(ctx, routes, route_count);
+    CBM_PROF_END_N("httplinks", "4_route_insert_seq", t_insert_routes, route_count);
 
     /* ── Phase 5: Call site collection via parallel disk scan ──────
      * Each Function/Method node's source is read from disk and scanned for
@@ -1334,16 +1346,13 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
 
     cbm_http_call_site_t *sites = calloc(MAX_CALL_SITES, sizeof(cbm_http_call_site_t));
     int site_count = 0;
+    int total_site_nodes = label_counts[0] + label_counts[1];
 
+    CBM_PROF_START(t_sites);
     if (sites) {
         const char *site_labels[] = {"Function", "Method"};
         const cbm_gbuf_node_t **all_site_nodes = NULL;
         const char **all_site_labels = NULL;
-        int total_site_nodes = 0;
-
-        for (int li = 0; li < 2; li++) {
-            total_site_nodes += label_counts[li];
-        }
 
         if (total_site_nodes > 0) {
             all_site_nodes = malloc((size_t)total_site_nodes * sizeof(cbm_gbuf_node_t *));
@@ -1397,14 +1406,17 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
         // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
         free(all_site_labels);
     }
+    CBM_PROF_END_N("httplinks", "5_callsite_scan_parallel", t_sites, total_site_nodes);
 
     cbm_log_info("httplink.callsites", "count", itoa_hl(site_count));
 
     /* ── Phase 6: Match and link (serial) ─────────────────────── */
+    CBM_PROF_START(t_match);
     int link_count = 0;
     if (sites && site_count > 0 && route_count > 0) {
         link_count = match_and_link(ctx, routes, route_count, sites, site_count);
     }
+    CBM_PROF_END_N("httplinks", "6_match_link_seq", t_match, site_count);
 
     free(routes);
     free(sites);
