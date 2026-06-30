@@ -1890,11 +1890,26 @@ int cbm_pipeline_insert_import_edge(cbm_pipeline_ctx_t *ctx, int64_t source_id,
         return 0;
     }
 
-    char esc_local_name[CBM_SZ_128];
-    cbm_json_escape(esc_local_name, (int)sizeof(esc_local_name), local_name ? local_name : "");
-    char props[CBM_SZ_256];
-    snprintf(props, sizeof(props), "{\"local_name\":\"%s\"}", esc_local_name);
-    return cbm_gbuf_insert_edge(ctx->gbuf, source_id, target->id, "IMPORTS", props) > 0 ? 1 : 0;
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return 0;
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    if (!root || !yyjson_mut_obj_add_strcpy(doc, root, "local_name", local_name ? local_name : "")) {
+        yyjson_mut_doc_free(doc);
+        return 0;
+    }
+    yyjson_mut_doc_set_root(doc, root);
+
+    char *props = yyjson_mut_write(doc, YYJSON_WRITE_ALLOW_INVALID_UNICODE, NULL);
+    yyjson_mut_doc_free(doc);
+    if (!props) {
+        return 0;
+    }
+
+    int emitted = cbm_gbuf_insert_edge(ctx->gbuf, source_id, target->id, "IMPORTS", props) > 0 ? 1 : 0;
+    free(props);
+    return emitted;
 }
 
 /* ── Namespace map ───────────────────────────────────────────────── */
