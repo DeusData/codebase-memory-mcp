@@ -215,6 +215,10 @@ int cbm_pipeline_plan_file_delta_batch(cbm_store_t *store,
                                        const cbm_pipeline_file_delta_t *const *deltas,
                                        int delta_count, int max_affected_paths,
                                        cbm_pipeline_file_delta_plan_t *out);
+int cbm_pipeline_apply_file_delta_batch(cbm_store_t *store,
+                                        const cbm_pipeline_file_delta_t *const *deltas,
+                                        int delta_count, int max_affected_paths,
+                                        cbm_pipeline_file_delta_plan_t *out);
 void cbm_pipeline_file_delta_plan_free(cbm_pipeline_file_delta_plan_t *plan);
 
 /* Build a namespace → File-node-QN map from a set of extraction results.

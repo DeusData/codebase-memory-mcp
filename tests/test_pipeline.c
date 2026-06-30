@@ -3581,6 +3581,7 @@ TEST(pipeline_file_delta_orchestrates_descriptor_plan_and_publish) {
         BASE_GENERATION = 1,
         FINAL_GENERATION = 2,
         PIPELINE_DELTA_PARITY_MAX_AFFECTED = CBM_SZ_4,
+        PIPELINE_DELTA_PARITY_SINGLE_COUNT = 1,
         PIPELINE_DELTA_PARITY_BATCH_COUNT = 2,
         EXPECTED_FINAL_CALLS_EDGES = 1,
         EXPECTED_FINAL_IMPORTS_EDGES = 1,
@@ -3701,22 +3702,29 @@ TEST(pipeline_file_delta_orchestrates_descriptor_plan_and_publish) {
               CBM_STORE_OK);
     ASSERT_EQ(main_before_helper_plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
     ASSERT_STR_EQ(main_before_helper_plan.reason, "unresolved_edge_endpoint");
+    const cbm_pipeline_file_delta_t *main_only_deltas[] = {&final_main_delta};
+    cbm_pipeline_file_delta_plan_t main_only_apply_plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, main_only_deltas,
+                                                  PIPELINE_DELTA_PARITY_SINGLE_COUNT,
+                                                  PIPELINE_DELTA_PARITY_MAX_AFFECTED,
+                                                  &main_only_apply_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(main_only_apply_plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(main_only_apply_plan.reason, "unresolved_edge_endpoint");
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, old_helper_qn), 1);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, old_main_qn), 1);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_helper_qn), 0);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_main_qn), 0);
 
     const cbm_pipeline_file_delta_t *batch_deltas[] = {&final_helper_delta, &final_main_delta};
     cbm_pipeline_file_delta_plan_t batch_plan = {0};
-    ASSERT_EQ(cbm_pipeline_plan_file_delta_batch(s, batch_deltas,
-                                                 PIPELINE_DELTA_PARITY_BATCH_COUNT,
-                                                 PIPELINE_DELTA_PARITY_MAX_AFFECTED, &batch_plan),
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, batch_deltas,
+                                                  PIPELINE_DELTA_PARITY_BATCH_COUNT,
+                                                  PIPELINE_DELTA_PARITY_MAX_AFFECTED, &batch_plan),
               CBM_STORE_OK);
     ASSERT_EQ(batch_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
     ASSERT_EQ(pipeline_delta_plan_contains_path(&batch_plan, helper_rel), 1);
     ASSERT_EQ(pipeline_delta_plan_contains_path(&batch_plan, main_rel), 1);
-
-    const cbm_store_file_delta_t *publish_deltas[] = {&final_helper_delta.delta,
-                                                      &final_main_delta.delta};
-    ASSERT_EQ(cbm_store_publish_file_delta_batch_complete(s, publish_deltas,
-                                                          PIPELINE_DELTA_PARITY_BATCH_COUNT),
-              CBM_STORE_OK);
 
     ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, old_helper_qn), 0);
     ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, old_main_qn), 0);
@@ -3744,6 +3752,7 @@ TEST(pipeline_file_delta_orchestrates_descriptor_plan_and_publish) {
     pipeline_delta_free_string_array(import_paths, import_count);
 
     cbm_pipeline_file_delta_plan_free(&main_before_helper_plan);
+    cbm_pipeline_file_delta_plan_free(&main_only_apply_plan);
     cbm_pipeline_file_delta_plan_free(&batch_plan);
     cbm_pipeline_file_delta_free(&final_helper_delta);
     cbm_pipeline_file_delta_free(&final_main_delta);
