@@ -120,6 +120,18 @@ typedef struct {
     int unsupported_edge_count;
 } cbm_pipeline_file_delta_t;
 
+typedef enum {
+    CBM_PIPELINE_DELTA_ROUTE_FALLBACK = 0,
+    CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE = 1,
+} cbm_pipeline_delta_route_t;
+
+typedef struct {
+    cbm_pipeline_delta_route_t route;
+    const char *reason;
+    char **affected_paths;
+    int affected_count;
+} cbm_pipeline_file_delta_plan_t;
+
 /* Get the current pipeline's package map (NULL if none). */
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
 void cbm_pipeline_set_pkgmap(CBMHashTable *map);
@@ -181,6 +193,11 @@ int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *
                                             const char *rel_path, int64_t generation,
                                             cbm_pipeline_file_delta_t *out);
 void cbm_pipeline_file_delta_free(cbm_pipeline_file_delta_t *delta);
+
+/* Preflight an exact-delta publish candidate. This never writes the store. */
+int cbm_pipeline_plan_file_delta(cbm_store_t *store, const cbm_pipeline_file_delta_t *delta,
+                                 int max_affected_paths, cbm_pipeline_file_delta_plan_t *out);
+void cbm_pipeline_file_delta_plan_free(cbm_pipeline_file_delta_plan_t *plan);
 
 /* Build a namespace → File-node-QN map from a set of extraction results.
  * Each result that declared a namespace/package contributes one entry keyed by

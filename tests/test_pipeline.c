@@ -3160,6 +3160,16 @@ static const cbm_store_import_ref_t *pipeline_delta_first_import(
     return delta->delta.import_count > 0 ? &delta->imports[0] : NULL;
 }
 
+static int pipeline_delta_plan_contains_path(const cbm_pipeline_file_delta_plan_t *plan,
+                                             const char *path) {
+    for (int i = 0; i < plan->affected_count; i++) {
+        if (strcmp(plan->affected_paths[i], path) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 TEST(pipeline_file_delta_descriptor_from_gbuf) {
     cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
     ASSERT_NOT_NULL(gb);
@@ -3228,6 +3238,78 @@ TEST(pipeline_file_delta_descriptor_marks_unsupported_edges) {
 
     cbm_pipeline_file_delta_free(&delta);
     cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_candidate_from_frontier) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    cbm_store_symbol_export_t exports[1] = {
+        {.qualified_name = "test.lib.Value", .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test", .rel_path = "lib.go", .exports = exports, .export_count = 1}};
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_STR_EQ(plan.reason, "candidate");
+    ASSERT_EQ(plan.affected_count, 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, "lib.go"), 1);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_on_unsupported_edges) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test", .rel_path = "main.go"}, .unsupported_edge_count = 1};
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "unsupported_edges");
+    ASSERT_EQ(plan.affected_count, 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_on_large_frontier) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_symbol_export(s, "test", "test.lib.Hot", "lib.go",
+                                             CBM_STORE_NO_NODE_ID, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, "test", "a.go", "test.lib", "Hot",
+                                          "test.lib.Hot", 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, "test", "b.go", "test.lib", "Hot",
+                                          "test.lib.Hot", 1),
+              CBM_STORE_OK);
+
+    cbm_store_symbol_export_t exports[1] = {
+        {.qualified_name = "test.lib.Hot", .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test", .rel_path = "lib.go", .exports = exports, .export_count = 1}};
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_2, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "frontier_too_large");
+    ASSERT_EQ(plan.affected_count, 3);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, "lib.go"), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, "a.go"), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, "b.go"), 1);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
     PASS();
 }
 
@@ -7564,6 +7646,9 @@ SUITE(pipeline) {
     RUN_TEST(config_registry_includes_incremental_reindex_policy);
     RUN_TEST(pipeline_file_delta_descriptor_from_gbuf);
     RUN_TEST(pipeline_file_delta_descriptor_marks_unsupported_edges);
+    RUN_TEST(pipeline_file_delta_plan_candidate_from_frontier);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_unsupported_edges);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_large_frontier);
     /* File persistence */
     RUN_TEST(store_file_persistence);
     RUN_TEST(store_bulk_persistence);
