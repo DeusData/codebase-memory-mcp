@@ -28,7 +28,9 @@ typedef struct cbm_store cbm_store_t;
  * future publish code do not drift into stringly-typed status variants. */
 #define CBM_STORE_INDEX_STATUS_COMPLETE "complete"
 #define CBM_STORE_DERIVED_STATUS_STALE "stale"
+#define CBM_STORE_DERIVED_STATUS_COMPLETE "complete"
 #define CBM_STORE_DERIVED_KIND_DIRECT "direct"
+#define CBM_STORE_DERIVED_VIEW_NODES_FTS "nodes_fts"
 #define CBM_STORE_NO_NODE_ID 0
 
 /* ── Data structures ────────────────────────────────────────────── */
@@ -80,6 +82,43 @@ typedef struct {
     int64_t generation;
     const char *indexed_at;
 } cbm_file_state_t;
+
+typedef struct {
+    const char *source_qn;
+    const char *target_qn;
+    const char *type;
+    const char *properties_json;
+    const char *derived_kind;
+} cbm_store_delta_edge_t;
+
+typedef struct {
+    const char *qualified_name;
+    int64_t node_id; /* CBM_STORE_NO_NODE_ID resolves by qualified_name when present. */
+} cbm_store_symbol_export_t;
+
+typedef struct {
+    const char *import_text;
+    const char *local_name;
+    const char *target_qn;
+} cbm_store_import_ref_t;
+
+typedef struct {
+    const char *project;
+    const char *rel_path;
+    int64_t generation;
+    const cbm_file_hash_t *file_hash;   /* optional */
+    const cbm_file_state_t *file_state; /* optional */
+    const cbm_node_t *nodes;
+    int node_count;
+    const cbm_store_delta_edge_t *edges;
+    int edge_count;
+    const cbm_store_symbol_export_t *exports;
+    int export_count;
+    const cbm_store_import_ref_t *imports;
+    int import_count;
+    const char *derived_view_name; /* optional, e.g. CBM_STORE_DERIVED_VIEW_NODES_FTS */
+    const char *derived_status;    /* optional, defaults to CBM_STORE_DERIVED_STATUS_COMPLETE */
+} cbm_store_file_delta_t;
 
 /* Find nodes overlapping a line range in a file (excludes Module/Package). */
 int cbm_store_find_nodes_by_file_overlap(cbm_store_t *s, const char *project, const char *file_path,
@@ -482,6 +521,8 @@ int cbm_store_list_import_ref_paths_by_target(cbm_store_t *s, const char *projec
 int cbm_store_list_import_ref_paths_for_export_file(cbm_store_t *s, const char *project,
                                                    const char *export_rel_path, char ***out,
                                                    int *count);
+
+int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *delta);
 
 /* ── Search ─────────────────────────────────────────────────────── */
 
