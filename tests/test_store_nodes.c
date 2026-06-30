@@ -5,6 +5,9 @@
  * TestNodeDedup, TestProjectCRUD, TestUpsertNodeBatch, etc.)
  */
 #include "test_framework.h"
+#include "test_sqlite_helpers.h"
+#include <foundation/compat.h>
+#include <foundation/constants.h>
 #include <store/store.h>
 #include <sqlite3.h>
 #include <string.h>
@@ -33,6 +36,51 @@ TEST(store_open_memory_twice) {
     /* independent databases */
     cbm_store_close(s1);
     cbm_store_close(s2);
+    PASS();
+}
+
+TEST(store_exact_delta_metadata_schema) {
+    static const char *tables[] = {
+        "index_generations", "file_state",       "node_owners",        "edge_owners",
+        "symbol_exports",   "import_refs",      "derived_view_state",
+    };
+    static const char *indexes[] = {
+        "idx_file_state_hash",       "idx_node_owners_path", "idx_edge_owners_path",
+        "idx_symbol_exports_path",   "idx_import_refs_target",
+        "idx_derived_view_state_status",
+    };
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    sqlite3 *db = cbm_store_get_db(s);
+    ASSERT_NOT_NULL(db);
+
+    for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
+        ASSERT_TRUE(cbm_test_sqlite_object_exists(db, "table", tables[i]));
+    }
+    for (size_t i = 0; i < sizeof(indexes) / sizeof(indexes[0]); i++) {
+        ASSERT_TRUE(cbm_test_sqlite_object_exists(db, "index", indexes[i]));
+    }
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_open_path_query_does_not_create_missing_db) {
+    char path[CBM_SZ_256];
+    int n = snprintf(path, sizeof(path), "%s/cbm_store_query_missing_XXXXXX", cbm_tmpdir());
+    ASSERT_GT(n, 0);
+    ASSERT_LT(n, (int)sizeof(path));
+    int fd = cbm_mkstemp_s(path, sizeof(path));
+    ASSERT_GT(fd, -1);
+    cbm_close_fd(fd);
+    ASSERT_EQ(remove(path), 0);
+
+    cbm_store_t *s = cbm_store_open_path_query(path);
+    ASSERT_NULL(s);
+
+    FILE *probe = fopen(path, "rb");
+    ASSERT_NULL(probe);
     PASS();
 }
 
@@ -1587,6 +1635,8 @@ SUITE(store_nodes) {
     RUN_TEST(store_open_memory);
     RUN_TEST(store_close_null);
     RUN_TEST(store_open_memory_twice);
+    RUN_TEST(store_exact_delta_metadata_schema);
+    RUN_TEST(store_open_path_query_does_not_create_missing_db);
     RUN_TEST(store_integrity_clean);
     RUN_TEST(store_integrity_empty);
     RUN_TEST(store_integrity_corrupt_bad_path);

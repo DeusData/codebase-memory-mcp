@@ -11,6 +11,8 @@
 #include "../src/foundation/compat_thread.h"
 #include "../src/foundation/constants.h"
 #include "test_framework.h"
+#include "test_sqlite_helpers.h"
+#include <store/store.h>
 /* sqlite_writer.h is at internal/cbm/ — Makefile adds -Iinternal/cbm */
 #include "sqlite_writer.h" /* CBMDumpNode, CBMDumpEdge, cbm_write_db */
 #include "sqlite3.h"       /* vendored/sqlite3/ via -Ivendored/sqlite3 */
@@ -181,6 +183,43 @@ TEST(sw_minimal_data) {
     sqlite3_finalize(stmt);
 
     sqlite3_close(db);
+    unlink(path);
+    PASS();
+}
+
+TEST(sw_store_open_migrates_exact_delta_metadata) {
+    char path[CBM_SZ_256];
+    ASSERT_EQ(make_temp_db(path, sizeof(path)), 0);
+
+    CBMDumpNode nodes[1] = {
+        {.id = 1,
+         .project = "test",
+         .label = "Module",
+         .name = "main",
+         .qualified_name = "test.main",
+         .file_path = "main.go",
+         .start_line = 1,
+         .end_line = 1,
+         .properties = "{}"},
+    };
+
+    int rc = cbm_write_db(path, "test", "/tmp/test", "2026-03-14T00:00:00Z", nodes, 1, NULL, 0,
+                          NULL, 0, NULL, 0);
+    ASSERT_EQ(rc, 0);
+
+    sqlite3 *raw = NULL;
+    ASSERT_EQ(sqlite3_open(path, &raw), SQLITE_OK);
+    ASSERT_FALSE(cbm_test_sqlite_object_exists(raw, "table", "file_state"));
+    sqlite3_close(raw);
+
+    cbm_store_t *store = cbm_store_open_path(path);
+    ASSERT_NOT_NULL(store);
+    sqlite3 *db = cbm_store_get_db(store);
+    ASSERT_TRUE(cbm_test_sqlite_object_exists(db, "table", "file_state"));
+    ASSERT_TRUE(cbm_test_sqlite_object_exists(db, "table", "node_owners"));
+    ASSERT_TRUE(cbm_test_sqlite_object_exists(db, "index", "idx_node_owners_path"));
+    cbm_store_close(store);
+
     unlink(path);
     PASS();
 }
@@ -868,6 +907,7 @@ TEST(sw_concurrent_writes_are_independent) {
 
 SUITE(sqlite_writer) {
     RUN_TEST(sw_minimal_data);
+    RUN_TEST(sw_store_open_migrates_exact_delta_metadata);
     RUN_TEST(sw_scale_and_indexes);
     RUN_TEST(sw_long_index_keys_overflow);
     RUN_TEST(sw_empty);
