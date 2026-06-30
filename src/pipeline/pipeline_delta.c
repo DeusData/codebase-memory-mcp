@@ -3,6 +3,7 @@
 #include "foundation/compat.h"
 #include "foundation/constants.h"
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <yyjson/yyjson.h>
@@ -15,7 +16,10 @@ static const char cbm_delta_reason_frontier_error[] = "frontier_error";
 static const char cbm_delta_reason_frontier_too_large[] = "frontier_too_large";
 static const char cbm_delta_reason_invalid_input[] = "invalid_input";
 static const char cbm_delta_reason_missing_file_metadata[] = "missing_file_metadata";
+static const char cbm_delta_reason_preflight_error[] = "preflight_error";
 static const char cbm_delta_reason_rename_requires_full[] = "rename_requires_full";
+static const char cbm_delta_reason_unresolved_edge_endpoint[] = "unresolved_edge_endpoint";
+static const char cbm_delta_reason_unsupported_derived_view[] = "unsupported_derived_view";
 static const char cbm_delta_reason_unsupported_edges[] = "unsupported_edges";
 
 enum { CBM_DELTA_GROWTH = 2 };
@@ -265,6 +269,76 @@ static bool delta_file_metadata_complete(const cbm_store_file_delta_t *delta) {
            delta->file_state->content_hash && delta->file_state->indexed_at;
 }
 
+static bool delta_derived_view_supported(const cbm_store_file_delta_t *delta) {
+    return delta && (!delta->derived_view_name ||
+                     strcmp(delta->derived_view_name, CBM_STORE_DERIVED_VIEW_NODES_FTS) == 0);
+}
+
+static bool delta_node_qn_present(const cbm_store_file_delta_t *delta, const char *qn) {
+    if (!delta || !qn) {
+        return false;
+    }
+    for (int i = 0; i < delta->node_count; i++) {
+        if (delta->nodes[i].qualified_name && strcmp(delta->nodes[i].qualified_name, qn) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool delta_qn_list_contains(const char **qns, int count, const char *qn) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(qns[i], qn) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int delta_edge_endpoints_resolve(cbm_store_t *store, const cbm_store_file_delta_t *delta) {
+    if (!delta || delta->edge_count <= 0) {
+        return CBM_STORE_OK;
+    }
+    if (delta->edge_count > INT_MAX / PAIR_LEN) {
+        return CBM_STORE_ERR;
+    }
+    int qn_cap = delta->edge_count * PAIR_LEN;
+    const char **qns = malloc((size_t)qn_cap * sizeof(*qns));
+    if (!qns) {
+        return CBM_STORE_ERR;
+    }
+    int qn_count = 0;
+    for (int i = 0; i < delta->edge_count; i++) {
+        const char *edge_qns[PAIR_LEN] = {delta->edges[i].source_qn, delta->edges[i].target_qn};
+        for (int j = 0; j < PAIR_LEN; j++) {
+            const char *qn = edge_qns[j];
+            if (!qn) {
+                free(qns);
+                return CBM_STORE_NOT_FOUND;
+            }
+            if (!delta_node_qn_present(delta, qn) && !delta_qn_list_contains(qns, qn_count, qn)) {
+                qns[qn_count++] = qn;
+            }
+        }
+    }
+    if (qn_count == 0) {
+        free(qns);
+        return CBM_STORE_OK;
+    }
+    int64_t *ids = calloc((size_t)qn_count, sizeof(*ids));
+    if (!ids) {
+        free(qns);
+        return CBM_STORE_ERR;
+    }
+    int found = cbm_store_find_node_ids_by_qns(store, delta->project, qns, qn_count, ids);
+    free(ids);
+    free(qns);
+    if (found < 0) {
+        return CBM_STORE_ERR;
+    }
+    return found == qn_count ? CBM_STORE_OK : CBM_STORE_NOT_FOUND;
+}
+
 int cbm_pipeline_plan_file_delta(cbm_store_t *store, const cbm_pipeline_file_delta_t *delta,
                                  int max_affected_paths, cbm_pipeline_file_delta_plan_t *out) {
     if (!out) {
@@ -290,6 +364,19 @@ int cbm_pipeline_plan_file_delta(cbm_store_t *store, const cbm_pipeline_file_del
     }
     if (!delta_file_metadata_complete(&delta->delta)) {
         delta_plan_set_fallback(out, cbm_delta_reason_missing_file_metadata);
+        return CBM_STORE_OK;
+    }
+    if (!delta_derived_view_supported(&delta->delta)) {
+        delta_plan_set_fallback(out, cbm_delta_reason_unsupported_derived_view);
+        return CBM_STORE_OK;
+    }
+    int endpoint_rc = delta_edge_endpoints_resolve(store, &delta->delta);
+    if (endpoint_rc == CBM_STORE_NOT_FOUND) {
+        delta_plan_set_fallback(out, cbm_delta_reason_unresolved_edge_endpoint);
+        return CBM_STORE_OK;
+    }
+    if (endpoint_rc != CBM_STORE_OK) {
+        delta_plan_set_fallback(out, cbm_delta_reason_preflight_error);
         return CBM_STORE_OK;
     }
 
