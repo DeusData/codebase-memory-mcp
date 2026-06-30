@@ -5525,7 +5525,8 @@ enum {
     CBM_CLUSTER_MAX_TOPNODES = 5, /* representative node names per cluster */
     CBM_CLUSTER_MAX_PKGS = 5,     /* packages listed per cluster */
     CBM_CLUSTER_MIN_MEMBERS = 2,  /* skip singletons */
-    CBM_CLUSTER_NODE_CAP = 8000   /* bound the work for very large graphs */
+    CBM_CLUSTER_NODE_CAP = 8000,  /* bound the work for very large graphs */
+    CBM_CLUSTER_LABEL_CONTEXT_SEGMENTS = 2
 };
 
 static int cluster_id_cmp(const void *key, const void *el) {
@@ -5573,12 +5574,71 @@ static bool cluster_label_is_generic(const char *label) {
     return false;
 }
 
-static char *cluster_make_label(const cbm_cluster_info_t *ci) {
+/* Label-only namespace context: up to two segments after the project, excluding
+ * the final symbol so `project.pkg.func` labels as `pkg`, not `pkg.func`. */
+static const char *cluster_label_context_from_qn(const char *qn) {
+    if (!qn || !qn[0]) {
+        return "";
+    }
+    const char *dots[ST_QN_MAX_DOTS] = {NULL};
+    int ndots = 0;
+    for (const char *p = qn; *p && ndots < ST_QN_MAX_DOTS; p++) {
+        if (*p == '.') {
+            dots[ndots++] = p;
+        }
+    }
+    if (ndots < ST_COL_2) {
+        return "";
+    }
+
+    static CBM_TLS char buf[CBM_SZ_256];
+    const char *start = dots[0] + SKIP_ONE;
+    const char *end =
+        (ndots > CBM_CLUSTER_LABEL_CONTEXT_SEGMENTS) ? dots[CBM_CLUSTER_LABEL_CONTEXT_SEGMENTS]
+                                                     : dots[SKIP_ONE];
+    size_t len = (size_t)(end - start);
+    if (len == 0 || len >= sizeof(buf)) {
+        return "";
+    }
+    memcpy(buf, start, len);
+    buf[len] = '\0';
+    return buf;
+}
+
+static const char *cluster_best_context(const char **qns, const int *comm, int n, int c) {
+    const char *contexts[CBM_CLUSTER_MAX_PKGS];
+    int counts[CBM_CLUSTER_MAX_PKGS];
+    int count = 0;
+    for (int i = 0; i < n; i++) {
+        if (comm[i] != c) {
+            continue;
+        }
+        cluster_add_pkg(contexts, counts, &count, CBM_CLUSTER_MAX_PKGS,
+                        cluster_label_context_from_qn(qns[i]));
+    }
+    const char *best = "";
+    int best_count = 0;
+    for (int i = 0; i < count; i++) {
+        if (counts[i] > best_count) {
+            best = contexts[i];
+            best_count = counts[i];
+        }
+    }
+    char *ret = best[0] ? heap_strdup(best) : NULL;
+    for (int i = 0; i < count; i++) {
+        safe_str_free(&contexts[i]);
+    }
+    return ret ? ret : "";
+}
+
+static char *cluster_make_label(const cbm_cluster_info_t *ci, const char *context) {
     if (ci->top_node_count > 0) {
         const char *primary = ci->top_nodes[0];
         if (cluster_label_is_generic(primary) && ci->top_node_count > 1) {
             const char *secondary = ci->top_nodes[1];
-            const char *pkg = ci->package_count > 0 ? ci->packages[0] : "";
+            const char *pkg = (context && context[0])
+                                  ? context
+                                  : (ci->package_count > 0 ? ci->packages[0] : "");
             size_t len = strlen(primary) + strlen(secondary) + strlen(pkg) + 4;
             char *label = malloc(len);
             if (label) {
@@ -5591,7 +5651,7 @@ static char *cluster_make_label(const cbm_cluster_info_t *ci) {
             }
         }
         if (cluster_label_is_generic(primary) && ci->package_count > 0) {
-            const char *pkg = ci->packages[0];
+            const char *pkg = (context && context[0]) ? context : ci->packages[0];
             size_t len = strlen(primary) + strlen(pkg) + 2;
             char *label = malloc(len);
             if (label) {
@@ -5675,7 +5735,11 @@ static void cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *c
      * "execute_tmux_command"). Labeling by the dominant package made every
      * cluster in a single-package repo share one identical, uninformative
      * label. The package list is preserved separately in `packages`. */
-    ci->label = cluster_make_label(ci);
+    const char *label_context = cluster_best_context(qns, comm, n, c);
+    ci->label = cluster_make_label(ci, label_context);
+    if (label_context && label_context[0]) {
+        safe_str_free(&label_context);
+    }
 
     ci->edge_types = malloc(sizeof(char *));
     ci->edge_types[0] = heap_strdup("CALLS");
