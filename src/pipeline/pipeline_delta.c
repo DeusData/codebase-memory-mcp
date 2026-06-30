@@ -10,9 +10,12 @@
 static const char cbm_delta_edge_imports[] = "IMPORTS";
 static const char cbm_delta_prop_is_exported[] = "is_exported";
 static const char cbm_delta_reason_candidate[] = "candidate";
+static const char cbm_delta_reason_delete_requires_full[] = "delete_requires_full";
 static const char cbm_delta_reason_frontier_error[] = "frontier_error";
 static const char cbm_delta_reason_frontier_too_large[] = "frontier_too_large";
 static const char cbm_delta_reason_invalid_input[] = "invalid_input";
+static const char cbm_delta_reason_missing_file_metadata[] = "missing_file_metadata";
+static const char cbm_delta_reason_rename_requires_full[] = "rename_requires_full";
 static const char cbm_delta_reason_unsupported_edges[] = "unsupported_edges";
 
 enum { CBM_DELTA_GROWTH = 2 };
@@ -248,6 +251,20 @@ static void delta_plan_set_fallback(cbm_pipeline_file_delta_plan_t *plan, const 
     plan->reason = reason;
 }
 
+static bool delta_field_matches(const char *actual, const char *expected) {
+    return actual && expected && strcmp(actual, expected) == 0;
+}
+
+static bool delta_file_metadata_complete(const cbm_store_file_delta_t *delta) {
+    return delta && delta->file_hash && delta->file_state &&
+           delta_field_matches(delta->file_hash->project, delta->project) &&
+           delta_field_matches(delta->file_hash->rel_path, delta->rel_path) &&
+           delta->file_hash->sha256 &&
+           delta_field_matches(delta->file_state->project, delta->project) &&
+           delta_field_matches(delta->file_state->rel_path, delta->rel_path) &&
+           delta->file_state->content_hash && delta->file_state->indexed_at;
+}
+
 int cbm_pipeline_plan_file_delta(cbm_store_t *store, const cbm_pipeline_file_delta_t *delta,
                                  int max_affected_paths, cbm_pipeline_file_delta_plan_t *out) {
     if (!out) {
@@ -259,8 +276,20 @@ int cbm_pipeline_plan_file_delta(cbm_store_t *store, const cbm_pipeline_file_del
         max_affected_paths <= 0) {
         return CBM_STORE_OK;
     }
+    if (delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE) {
+        delta_plan_set_fallback(out, cbm_delta_reason_delete_requires_full);
+        return CBM_STORE_OK;
+    }
+    if (delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_RENAME) {
+        delta_plan_set_fallback(out, cbm_delta_reason_rename_requires_full);
+        return CBM_STORE_OK;
+    }
     if (delta->unsupported_edge_count > 0) {
         delta_plan_set_fallback(out, cbm_delta_reason_unsupported_edges);
+        return CBM_STORE_OK;
+    }
+    if (!delta_file_metadata_complete(&delta->delta)) {
+        delta_plan_set_fallback(out, cbm_delta_reason_missing_file_metadata);
         return CBM_STORE_OK;
     }
 

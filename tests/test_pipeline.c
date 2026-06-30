@@ -3170,6 +3170,30 @@ static int pipeline_delta_plan_contains_path(const cbm_pipeline_file_delta_plan_
     return 0;
 }
 
+static void pipeline_delta_attach_test_metadata(cbm_pipeline_file_delta_t *delta,
+                                                cbm_file_hash_t *hash,
+                                                cbm_file_state_t *state) {
+    enum { PIPELINE_DELTA_TEST_GENERATION = 1 };
+    *hash = (cbm_file_hash_t){.project = delta->delta.project,
+                              .rel_path = delta->delta.rel_path,
+                              .sha256 = "test-hash",
+                              .mtime_ns = 1,
+                              .size = 10};
+    *state = (cbm_file_state_t){.project = delta->delta.project,
+                                .rel_path = delta->delta.rel_path,
+                                .content_hash = "test-content",
+                                .git_oid = "",
+                                .mtime_ns = 1,
+                                .size = 10,
+                                .language = "go",
+                                .pass_fingerprint = "test-pass",
+                                .generation = PIPELINE_DELTA_TEST_GENERATION,
+                                .indexed_at = "2026-06-30T00:00:00Z"};
+    delta->delta.generation = PIPELINE_DELTA_TEST_GENERATION;
+    delta->delta.file_hash = hash;
+    delta->delta.file_state = state;
+}
+
 TEST(pipeline_file_delta_descriptor_from_gbuf) {
     cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
     ASSERT_NOT_NULL(gb);
@@ -3250,6 +3274,9 @@ TEST(pipeline_file_delta_plan_candidate_from_frontier) {
         {.qualified_name = "test.lib.Value", .node_id = CBM_STORE_NO_NODE_ID}};
     cbm_pipeline_file_delta_t delta = {
         .delta = {.project = "test", .rel_path = "lib.go", .exports = exports, .export_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
 
     cbm_pipeline_file_delta_plan_t plan = {0};
     ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
@@ -3257,6 +3284,23 @@ TEST(pipeline_file_delta_plan_candidate_from_frontier) {
     ASSERT_STR_EQ(plan.reason, "candidate");
     ASSERT_EQ(plan.affected_count, 1);
     ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, "lib.go"), 1);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_without_file_metadata) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = "test", .rel_path = "main.go"}};
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "missing_file_metadata");
+    ASSERT_EQ(plan.affected_count, 0);
 
     cbm_pipeline_file_delta_plan_free(&plan);
     cbm_store_close(s);
@@ -3273,6 +3317,41 @@ TEST(pipeline_file_delta_plan_falls_back_on_unsupported_edges) {
     ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
     ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
     ASSERT_STR_EQ(plan.reason, "unsupported_edges");
+    ASSERT_EQ(plan.affected_count, 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_on_delete) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = "test", .rel_path = "gone.go"},
+                                       .change_kind = CBM_PIPELINE_DELTA_CHANGE_DELETE};
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "delete_requires_full");
+    ASSERT_EQ(plan.affected_count, 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_on_rename) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = "test", .rel_path = "new.go"},
+                                       .change_kind = CBM_PIPELINE_DELTA_CHANGE_RENAME,
+                                       .old_rel_path = "old.go"};
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "rename_requires_full");
     ASSERT_EQ(plan.affected_count, 0);
 
     cbm_pipeline_file_delta_plan_free(&plan);
@@ -3298,6 +3377,9 @@ TEST(pipeline_file_delta_plan_falls_back_on_large_frontier) {
         {.qualified_name = "test.lib.Hot", .node_id = CBM_STORE_NO_NODE_ID}};
     cbm_pipeline_file_delta_t delta = {
         .delta = {.project = "test", .rel_path = "lib.go", .exports = exports, .export_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
 
     cbm_pipeline_file_delta_plan_t plan = {0};
     ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_2, &plan), CBM_STORE_OK);
@@ -7647,7 +7729,10 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_descriptor_from_gbuf);
     RUN_TEST(pipeline_file_delta_descriptor_marks_unsupported_edges);
     RUN_TEST(pipeline_file_delta_plan_candidate_from_frontier);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_without_file_metadata);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unsupported_edges);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_delete);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_rename);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_large_frontier);
     /* File persistence */
     RUN_TEST(store_file_persistence);
