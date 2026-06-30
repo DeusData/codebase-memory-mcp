@@ -14,6 +14,7 @@
 #include "discover/discover.h"
 #include "foundation/hash_table.h"
 #include "cbm.h"
+#include "service_patterns.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
 #include <stdatomic.h>
 
@@ -24,6 +25,8 @@
 
 /* Route node QN buffer size (must fit __route__METHOD__/full/url/path) */
 #define CBM_ROUTE_QN_SIZE 768
+#define CBM_ROUTE_DEFAULT_METHOD "ANY"
+#define CBM_ROUTE_DEFAULT_ASYNC_BROKER "async"
 
 /* Canonicalize route-path parameter placeholders (":id", "{id}", "<id>",
  * "${...}") to a single "{}" token so that client call sites and server
@@ -32,6 +35,19 @@
  * canonicalize to "/u/{}"). The result never exceeds the input length, so
  * out_sz >= strlen(in) + 1 always suffices. Returns out. */
 const char *cbm_route_canon_path(const char *in, char *out, size_t out_sz);
+
+/* Build the deterministic Route qualified_name and JSON properties for
+ * HTTP/async service edges. This keeps sequential, parallel, and post-merge
+ * Route-node paths on the same canonicalization and properties schema. */
+bool cbm_pipeline_build_service_route_identity(const char *path, cbm_svc_kind_t svc,
+                                               const char *method, const char *broker,
+                                               const char *source, char *route_qn,
+                                               size_t route_qn_sz, char *route_props,
+                                               size_t route_props_sz);
+
+int64_t cbm_pipeline_upsert_service_route(cbm_gbuf_t *gb, const char *path, cbm_svc_kind_t svc,
+                                          const char *method, const char *broker,
+                                          const char *source, const char *file_path);
 
 /* Time unit conversions */
 #define CBM_NS_PER_SEC 1000000000LL

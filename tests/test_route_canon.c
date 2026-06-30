@@ -9,6 +9,7 @@
  */
 #include "test_framework.h"
 #include "pipeline/pipeline_internal.h"
+#include <yyjson/yyjson.h>
 
 #include <string.h>
 
@@ -93,6 +94,55 @@ TEST(route_canon_truncation_safe) {
     PASS();
 }
 
+TEST(route_identity_http_default_is_canonical_json) {
+    char qn[CBM_ROUTE_QN_SIZE];
+    char props[CBM_SZ_256];
+    ASSERT_TRUE(cbm_pipeline_build_service_route_identity(
+        "/players/:id", CBM_SVC_HTTP, NULL, NULL, "arg_url", qn, sizeof(qn), props,
+        sizeof(props)));
+    ASSERT_STR_EQ(qn, "__route__ANY__/players/{}");
+    ASSERT_NOT_NULL(strstr(props, "\"method\":\"" CBM_ROUTE_DEFAULT_METHOD "\""));
+    ASSERT_NOT_NULL(strstr(props, "\"source\":\"arg_url\""));
+    yyjson_doc *doc = yyjson_read(props, strlen(props), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_doc_free(doc);
+    PASS();
+}
+
+TEST(route_identity_source_is_escaped_json) {
+    char qn[CBM_ROUTE_QN_SIZE];
+    char props[CBM_SZ_256];
+    ASSERT_TRUE(cbm_pipeline_build_service_route_identity(
+        "/api/orders", CBM_SVC_HTTP, "GET", NULL, "decor\"ator", qn, sizeof(qn), props,
+        sizeof(props)));
+    ASSERT_STR_EQ(qn, "__route__GET__/api/orders");
+    ASSERT_NOT_NULL(strstr(props, "\"source\":\"decor\\\"ator\""));
+    yyjson_doc *doc = yyjson_read(props, strlen(props), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_doc_free(doc);
+    PASS();
+}
+
+TEST(route_identity_async_default_is_canonical_json) {
+    char qn[CBM_ROUTE_QN_SIZE];
+    char props[CBM_SZ_256];
+    ASSERT_TRUE(cbm_pipeline_build_service_route_identity(
+        "orders.created", CBM_SVC_ASYNC, NULL, NULL, NULL, qn, sizeof(qn), props,
+        sizeof(props)));
+    ASSERT_STR_EQ(qn, "__route__" CBM_ROUTE_DEFAULT_ASYNC_BROKER "__orders.created");
+    ASSERT_STR_EQ(props, "{\"broker\":\"" CBM_ROUTE_DEFAULT_ASYNC_BROKER "\"}");
+    PASS();
+}
+
+TEST(route_identity_rejects_unknown_service_kind) {
+    char qn[CBM_ROUTE_QN_SIZE];
+    char props[CBM_SZ_256];
+    ASSERT_FALSE(cbm_pipeline_build_service_route_identity(
+        "/api/orders", CBM_SVC_CONFIG, NULL, NULL, NULL, qn, sizeof(qn), props,
+        sizeof(props)));
+    PASS();
+}
+
 SUITE(route_canon) {
     RUN_TEST(route_canon_static_unchanged);
     RUN_TEST(route_canon_colon_param);
@@ -105,4 +155,8 @@ SUITE(route_canon) {
     RUN_TEST(route_canon_colon_mid_segment_is_literal);
     RUN_TEST(route_canon_null_and_empty);
     RUN_TEST(route_canon_truncation_safe);
+    RUN_TEST(route_identity_http_default_is_canonical_json);
+    RUN_TEST(route_identity_source_is_escaped_json);
+    RUN_TEST(route_identity_async_default_is_canonical_json);
+    RUN_TEST(route_identity_rejects_unknown_service_kind);
 }

@@ -132,6 +132,71 @@ const char *cbm_route_canon_path(const char *in, char *out, size_t out_sz) {
     return out;
 }
 
+bool cbm_pipeline_build_service_route_identity(const char *path, cbm_svc_kind_t svc,
+                                               const char *method, const char *broker,
+                                               const char *source, char *route_qn,
+                                               size_t route_qn_sz, char *route_props,
+                                               size_t route_props_sz) {
+    if (!path || !route_qn || route_qn_sz == 0 || !route_props || route_props_sz == 0) {
+        return false;
+    }
+
+    char cpath[CBM_SZ_256];
+    const char *prefix = NULL;
+    const char *qpath = path;
+    if (svc == CBM_SVC_HTTP) {
+        prefix = method ? method : CBM_ROUTE_DEFAULT_METHOD;
+        qpath = cbm_route_canon_path(path, cpath, sizeof(cpath));
+    } else if (svc == CBM_SVC_ASYNC) {
+        prefix = broker ? broker : CBM_ROUTE_DEFAULT_ASYNC_BROKER;
+    } else {
+        return false;
+    }
+
+    int qn_len = snprintf(route_qn, route_qn_sz, "__route__%s__%s", prefix, qpath);
+    if (qn_len < 0 || (size_t)qn_len >= route_qn_sz) {
+        return false;
+    }
+
+    char esc_value[CBM_SZ_256];
+    char esc_source[CBM_SZ_256];
+    cbm_json_escape(esc_value, sizeof(esc_value), prefix);
+    if (source && source[0] != '\0') {
+        cbm_json_escape(esc_source, sizeof(esc_source), source);
+        int prop_len;
+        if (svc == CBM_SVC_HTTP) {
+            prop_len = snprintf(route_props, route_props_sz, "{\"method\":\"%s\",\"source\":\"%s\"}",
+                                esc_value, esc_source);
+        } else {
+            prop_len = snprintf(route_props, route_props_sz, "{\"broker\":\"%s\",\"source\":\"%s\"}",
+                                esc_value, esc_source);
+        }
+        return prop_len >= 0 && (size_t)prop_len < route_props_sz;
+    }
+
+    int prop_len;
+    if (svc == CBM_SVC_HTTP) {
+        prop_len = snprintf(route_props, route_props_sz, "{\"method\":\"%s\"}", esc_value);
+    } else {
+        prop_len = snprintf(route_props, route_props_sz, "{\"broker\":\"%s\"}", esc_value);
+    }
+    return prop_len >= 0 && (size_t)prop_len < route_props_sz;
+}
+
+int64_t cbm_pipeline_upsert_service_route(cbm_gbuf_t *gb, const char *path, cbm_svc_kind_t svc,
+                                          const char *method, const char *broker,
+                                          const char *source, const char *file_path) {
+    char route_qn[CBM_ROUTE_QN_SIZE];
+    char route_props[CBM_SZ_256];
+    if (!cbm_pipeline_build_service_route_identity(path, svc, method, broker, source, route_qn,
+                                                   sizeof(route_qn), route_props,
+                                                   sizeof(route_props))) {
+        return 0;
+    }
+    return cbm_gbuf_upsert_node(gb, "Route", path, route_qn, file_path ? file_path : "", 0, 0,
+                                route_props);
+}
+
 /* Extract a JSON string value by key from properties.
  * Returns pointer into buf (caller provides buffer). NULL if not found. */
 static const char *json_extract(const char *json, const char *key, char *buf, int bufsz) {
@@ -195,28 +260,13 @@ static void route_edge_visitor(const cbm_gbuf_edge_t *edge, void *userdata) {
     const char *broker =
         json_extract(edge->properties_json, "broker", broker_buf, sizeof(broker_buf));
 
-    /* Build Route QN */
-    char route_qn[CBM_ROUTE_QN_SIZE];
-    if (strcmp(edge->type, "HTTP_CALLS") == 0) {
-        char cpath[CBM_SZ_256];
-        snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method ? method : "ANY",
-                 cbm_route_canon_path(url, cpath, sizeof(cpath)));
-    } else {
-        snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", broker ? broker : "async", url);
-    }
-
-    /* Build properties for Route node */
-    char route_props[CBM_SZ_256];
-    if (method) {
-        snprintf(route_props, sizeof(route_props), "{\"method\":\"%s\"}", method);
-    } else if (broker) {
-        snprintf(route_props, sizeof(route_props), "{\"broker\":\"%s\"}", broker);
-    } else {
-        snprintf(route_props, sizeof(route_props), "{}");
-    }
-
     /* Create or find Route node (deduped by QN) */
-    cbm_gbuf_upsert_node(ctx->gb, "Route", url, route_qn, "", 0, 0, route_props);
+    cbm_svc_kind_t svc = strcmp(edge->type, "HTTP_CALLS") == 0 ? CBM_SVC_HTTP : CBM_SVC_ASYNC;
+    int64_t route_id =
+        cbm_pipeline_upsert_service_route(ctx->gb, url, svc, method, broker, NULL, NULL);
+    if (route_id == 0) {
+        return;
+    }
     ctx->created++;
 
     /* Note: we do NOT re-target the edge here because modifying edges during
@@ -459,17 +509,18 @@ static int ensure_one_decorator_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *fun
         return 0;
     }
 
-    char method[CBM_SZ_16] = "ANY";
+    char method[CBM_SZ_16] = CBM_ROUTE_DEFAULT_METHOD;
     extract_json_prop(func->properties_json, "route_method", method, sizeof(method));
 
     char route_qn[CBM_ROUTE_QN_SIZE];
-    char cpath[CBM_SZ_256];
-    snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method,
-             cbm_route_canon_path(path, cpath, sizeof(cpath)));
+    char rprops[CBM_SZ_256];
+    if (!cbm_pipeline_build_service_route_identity(path, CBM_SVC_HTTP, method, NULL, "decorator",
+                                                   route_qn, sizeof(route_qn), rprops,
+                                                   sizeof(rprops))) {
+        return 0;
+    }
     const cbm_gbuf_node_t *existing = cbm_gbuf_find_by_qn(gb, route_qn);
 
-    char rprops[CBM_SZ_256];
-    snprintf(rprops, sizeof(rprops), "{\"method\":\"%s\",\"source\":\"decorator\"}", method);
     int64_t route_id = cbm_gbuf_upsert_node(gb, "Route", path, route_qn,
                                             func->file_path ? func->file_path : "", 0, 0, rprops);
 
@@ -1176,15 +1227,8 @@ static void sveltekit_file_visitor(const cbm_gbuf_node_t *node, void *userdata) 
             continue;
         }
 
-        char route_qn[CBM_ROUTE_QN_SIZE];
-        char cpath[CBM_SZ_256];
-        snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method,
-                 cbm_route_canon_path(route_path, cpath, sizeof(cpath)));
-        char route_props[CBM_SZ_256];
-        snprintf(route_props, sizeof(route_props),
-                 "{\"method\":\"%s\",\"framework\":\"sveltekit\"}", method);
-        int64_t route_id =
-            cbm_gbuf_upsert_node(ctx->gb, "Route", route_path, route_qn, "", 0, 0, route_props);
+        int64_t route_id = cbm_pipeline_upsert_service_route(ctx->gb, route_path, CBM_SVC_HTTP,
+                                                             method, NULL, "sveltekit", NULL);
         if (route_id == 0) {
             continue;
         }
