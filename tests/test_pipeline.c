@@ -3145,6 +3145,92 @@ TEST(gitdiff_parse_hunks_deletion) {
     PASS();
 }
 
+static const cbm_store_delta_edge_t *pipeline_delta_find_edge(const cbm_pipeline_file_delta_t *delta,
+                                                              const char *type) {
+    for (int i = 0; i < delta->delta.edge_count; i++) {
+        if (strcmp(delta->edges[i].type, type) == 0) {
+            return &delta->edges[i];
+        }
+    }
+    return NULL;
+}
+
+static const cbm_store_import_ref_t *pipeline_delta_first_import(
+    const cbm_pipeline_file_delta_t *delta) {
+    return delta->delta.import_count > 0 ? &delta->imports[0] : NULL;
+}
+
+TEST(pipeline_file_delta_descriptor_from_gbuf) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+    int64_t file_id = cbm_gbuf_upsert_node(gb, "File", "main.go", "proj.main.__file__",
+                                           "main.go", 1, 1, "{}");
+    int64_t run_id = cbm_gbuf_upsert_node(gb, "Function", "Run", "proj.main.Run",
+                                          "main.go", 3, 5, "{\"is_exported\":true}");
+    int64_t helper_id = cbm_gbuf_upsert_node(gb, "Function", "Helper", "proj.helper.Helper",
+                                             "helper.go", 1, 3, "{\"is_exported\":true}");
+    ASSERT_GT(file_id, 0);
+    ASSERT_GT(run_id, 0);
+    ASSERT_GT(helper_id, 0);
+
+    const cbm_gbuf_node_t *helper = cbm_gbuf_find_by_qn(gb, "proj.helper.Helper");
+    ASSERT_NOT_NULL(helper);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj", .repo_path = "/tmp/proj", .gbuf = gb};
+    ASSERT_EQ(cbm_pipeline_insert_import_edge(&ctx, file_id, helper, "Helper"), 1);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, run_id, helper_id, "CALLS", "{\"line\":4}"), 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, helper_id, run_id, "CALLS", "{\"line\":2}"), 0);
+
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(gb, "proj", "main.go", 7, &delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(delta.unsupported_edge_count, 0);
+    ASSERT_EQ(delta.delta.node_count, 2);
+    ASSERT_EQ(delta.delta.export_count, 1);
+    ASSERT_EQ(delta.delta.edge_count, 2);
+    ASSERT_EQ(delta.delta.import_count, 1);
+    ASSERT_STR_EQ(delta.delta.project, "proj");
+    ASSERT_STR_EQ(delta.delta.rel_path, "main.go");
+    ASSERT_EQ(delta.delta.generation, 7);
+    ASSERT_STR_EQ(delta.delta.derived_view_name, CBM_STORE_DERIVED_VIEW_NODES_FTS);
+    ASSERT_STR_EQ(delta.delta.derived_status, CBM_STORE_DERIVED_STATUS_STALE);
+    ASSERT_STR_EQ(delta.exports[0].qualified_name, "proj.main.Run");
+
+    const cbm_store_delta_edge_t *call_edge = pipeline_delta_find_edge(&delta, "CALLS");
+    ASSERT_NOT_NULL(call_edge);
+    ASSERT_STR_EQ(call_edge->source_qn, "proj.main.Run");
+    ASSERT_STR_EQ(call_edge->target_qn, "proj.helper.Helper");
+
+    const cbm_store_import_ref_t *imp = pipeline_delta_first_import(&delta);
+    ASSERT_NOT_NULL(imp);
+    ASSERT_STR_EQ(imp->import_text, "proj.helper.Helper");
+    ASSERT_STR_EQ(imp->local_name, "Helper");
+    ASSERT_STR_EQ(imp->target_qn, "proj.helper.Helper");
+
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(pipeline_file_delta_descriptor_marks_unsupported_edges) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+    int64_t run_id = cbm_gbuf_upsert_node(gb, "Function", "Run", "proj.main.Run",
+                                          "main.go", 3, 5, "{}");
+    ASSERT_GT(run_id, 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, run_id, 9999, "CALLS", "{}"), 0);
+
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(gb, "proj", "main.go", 8, &delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(delta.unsupported_edge_count, 1);
+    ASSERT_EQ(delta.delta.node_count, 1);
+    ASSERT_EQ(delta.delta.edge_count, 0);
+
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* ── Config helpers (pass_configures.c) ───────────────────────── */
 
 TEST(configures_is_env_var_name) {
@@ -7476,6 +7562,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_semantic_corpus_vectors_independent_of_worker_count);
     RUN_TEST(config_registry_includes_mcp_timeout_knobs);
     RUN_TEST(config_registry_includes_incremental_reindex_policy);
+    RUN_TEST(pipeline_file_delta_descriptor_from_gbuf);
+    RUN_TEST(pipeline_file_delta_descriptor_marks_unsupported_edges);
     /* File persistence */
     RUN_TEST(store_file_persistence);
     RUN_TEST(store_bulk_persistence);

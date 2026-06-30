@@ -1447,7 +1447,7 @@ static bool import_edge_local_name_equals(const cbm_gbuf_edge_t *edge, const cha
     return len == strlen(local_name) && strncmp(start, local_name, len) == 0;
 }
 
-static char *import_edge_local_name_dup(const cbm_gbuf_edge_t *edge) {
+char *cbm_pipeline_import_edge_local_name_dup(const cbm_gbuf_edge_t *edge) {
     const char *start = NULL;
     size_t len = 0;
     bool has_escape = false;
@@ -1503,7 +1503,7 @@ int cbm_pipeline_build_import_map_from_edges(const cbm_gbuf_t *gbuf, const char 
     for (int i = 0; i < edge_count; i++) {
         const cbm_gbuf_edge_t *edge = edges[i];
         const cbm_gbuf_node_t *target = edge ? cbm_gbuf_find_by_id(gbuf, edge->target_id) : NULL;
-        char *key = import_edge_local_name_dup(edge);
+        char *key = cbm_pipeline_import_edge_local_name_dup(edge);
         if (!target || !key) {
             free(key);
             continue;
