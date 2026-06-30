@@ -500,6 +500,12 @@ int cbm_store_count_file_delta_owners(cbm_store_t *s, const char *project,
                                       const char *rel_path, int *out_node_owners,
                                       int *out_edge_owners);
 
+/* Caller frees each returned string and the array. Empty string means the inbound
+ * source node has no owner metadata and must be treated as unsafe for exact delta. */
+int cbm_store_list_file_delta_inbound_source_paths(cbm_store_t *s, const char *project,
+                                                   const char *rel_path, char ***out,
+                                                   int *count);
+
 int cbm_store_upsert_symbol_export(cbm_store_t *s, const char *project,
                                    const char *qualified_name, const char *rel_path,
                                    int64_t node_id, int64_t generation);
