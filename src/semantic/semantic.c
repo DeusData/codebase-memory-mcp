@@ -7,6 +7,7 @@
  */
 #include "semantic/semantic.h"
 #include "foundation/constants.h"
+#include "foundation/compat.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
 #include "foundation/profile.h"
@@ -420,15 +421,25 @@ static void ensure_pretrained_map(void) {
     }
     cbm_mutex_lock(&g_pretrained_mtx);
     if (!atomic_load_explicit(&g_pretrained_ready, memory_order_acquire)) {
-        g_pretrained_map = cbm_ht_create(PRETRAINED_TOKEN_COUNT);
+        CBMHashTable *map = cbm_ht_create(PRETRAINED_TOKEN_COUNT);
         char idx_buf[CBM_SZ_16];
-        for (int i = 0; i < PRETRAINED_TOKEN_COUNT; i++) {
-            const char *tok = PRETRAINED_TOKENS[i];
-            if (tok && tok[0]) {
-                snprintf(idx_buf, sizeof(idx_buf), "%d", i);
-                cbm_ht_set(g_pretrained_map, strdup(tok), strdup(idx_buf));
+        if (map) {
+            for (int i = 0; i < PRETRAINED_TOKEN_COUNT; i++) {
+                const char *tok = PRETRAINED_TOKENS[i];
+                if (tok && tok[0]) {
+                    snprintf(idx_buf, sizeof(idx_buf), "%d", i);
+                    char *key = cbm_strdup(tok);
+                    char *val = cbm_strdup(idx_buf);
+                    if (!key || !val) {
+                        free(key);
+                        free(val);
+                        continue;
+                    }
+                    cbm_ht_set(map, key, val);
+                }
             }
         }
+        g_pretrained_map = map;
         atomic_store_explicit(&g_pretrained_ready, MAP_READY, memory_order_release);
     }
     cbm_mutex_unlock(&g_pretrained_mtx);

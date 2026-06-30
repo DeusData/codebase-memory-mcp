@@ -13,6 +13,34 @@
 
 /* ── System Info Tests ────────────────────────────────────────────── */
 
+typedef struct {
+    cbm_system_info_t *infos;
+} system_info_parallel_ctx_t;
+
+static void system_info_parallel_worker(int idx, void *ctx_ptr) {
+    system_info_parallel_ctx_t *ctx = ctx_ptr;
+    ctx->infos[idx] = cbm_system_info();
+}
+
+TEST(system_info_parallel_first_call_consistent) {
+    enum { SYSINFO_PARALLEL_CALLS = 64, SYSINFO_PARALLEL_WORKERS = 4 };
+    cbm_system_info_t infos[SYSINFO_PARALLEL_CALLS];
+    memset(infos, 0, sizeof(infos));
+    system_info_parallel_ctx_t ctx = {.infos = infos};
+
+    cbm_parallel_for_opts_t opts = {.max_workers = SYSINFO_PARALLEL_WORKERS,
+                                    .force_pthreads = false};
+    cbm_parallel_for(SYSINFO_PARALLEL_CALLS, system_info_parallel_worker, &ctx, opts);
+
+    ASSERT_GT(infos[0].total_cores, 0);
+    for (int i = 1; i < SYSINFO_PARALLEL_CALLS; i++) {
+        ASSERT_EQ(infos[i].total_cores, infos[0].total_cores);
+        ASSERT_EQ(infos[i].perf_cores, infos[0].perf_cores);
+        ASSERT_EQ(infos[i].total_ram, infos[0].total_ram);
+    }
+    PASS();
+}
+
 TEST(system_info_total_cores) {
     cbm_system_info_t info = cbm_system_info();
     ASSERT(info.total_cores > 0);
@@ -412,6 +440,7 @@ TEST(parallel_for_serial_matches_parallel) {
 /* ── Suite Registration ──────────────────────────────────────────── */
 
 SUITE(system_info) {
+    RUN_TEST(system_info_parallel_first_call_consistent);
     RUN_TEST(system_info_total_cores);
     RUN_TEST(system_info_total_cores_sane);
     RUN_TEST(system_info_perf_cores);
