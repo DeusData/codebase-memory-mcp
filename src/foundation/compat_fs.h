@@ -11,10 +11,12 @@
 #include <stddef.h>
 #include <stdio.h>
 
+#include "foundation/constants.h"
+
 /* ── Directory iteration ──────────────────────────────────────── */
 
 /* Max filename length (MAX_PATH on Windows, NAME_MAX on POSIX). */
-#define CBM_DIRENT_NAME_MAX 260
+#define CBM_DIRENT_NAME_MAX (CBM_SZ_256 + CBM_SZ_4)
 
 typedef struct cbm_dir cbm_dir_t;
 
@@ -30,6 +32,9 @@ cbm_dir_t *cbm_opendir(const char *path);
 /* Read next entry. Returns NULL when done. The returned pointer is
  * valid until the next cbm_readdir call on the same handle. */
 cbm_dirent_t *cbm_readdir(cbm_dir_t *d);
+
+/* True when name can be represented exactly in cbm_dirent_t.name. */
+bool cbm_dirent_name_fits(const char *name);
 
 /* Close directory handle. */
 void cbm_closedir(cbm_dir_t *d);
