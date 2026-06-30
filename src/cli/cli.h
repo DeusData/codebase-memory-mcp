@@ -285,6 +285,7 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key);
 /* Well-known config keys */
 #define CBM_CONFIG_AUTO_INDEX "auto_index"
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
+#define CBM_CONFIG_SEARCH_LIMIT "search_limit"
 
 /* ── Config registry (all known keys, defaults, env overrides) ── */
 

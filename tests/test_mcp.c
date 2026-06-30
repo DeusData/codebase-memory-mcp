@@ -6,7 +6,9 @@
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h" /* cbm_unlink / cbm_rmdir */
 #include "../src/foundation/constants.h"
+#include "test_helpers.h"
 #include "test_framework.h"
+#include <cli/cli.h>
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <sqlite3.h>
@@ -694,6 +696,29 @@ TEST(tool_search_graph_includes_node_properties) {
     PASS();
 }
 
+static bool mcp_test_upsert_fts_node(cbm_store_t *st, const char *project, const char *label,
+                                     const char *name, const char *qualified_name,
+                                     const char *file_path) {
+    cbm_node_t node = {0};
+    node.project = project;
+    node.label = label;
+    node.name = name;
+    node.qualified_name = qualified_name;
+    node.file_path = file_path;
+    node.start_line = 1;
+    node.end_line = 3;
+    return cbm_store_upsert_node(st, &node) > 0;
+}
+
+static int mcp_test_rebuild_nodes_fts(cbm_store_t *st) {
+    cbm_store_exec(st, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+    return cbm_store_exec(st,
+                          "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                          "file_path) "
+                          "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
+                          "FROM nodes;");
+}
+
 TEST(tool_search_graph_query_honors_file_pattern_issue552) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -704,33 +729,12 @@ TEST(tool_search_graph_query_honors_file_pattern_issue552) {
     cbm_mcp_server_set_project(srv, proj);
     cbm_store_upsert_project(st, proj, "/tmp/issue-552");
 
-    cbm_node_t lib_status = {0};
-    lib_status.project = proj;
-    lib_status.label = "Function";
-    lib_status.name = "status";
-    lib_status.qualified_name = "issue-552.src.lib.status";
-    lib_status.file_path = "src/lib/status.c";
-    lib_status.start_line = 1;
-    lib_status.end_line = 3;
-    ASSERT_GT(cbm_store_upsert_node(st, &lib_status), 0);
-
-    cbm_node_t component_status = {0};
-    component_status.project = proj;
-    component_status.label = "Function";
-    component_status.name = "status";
-    component_status.qualified_name = "issue-552.src.components.status";
-    component_status.file_path = "src/components/status.c";
-    component_status.start_line = 1;
-    component_status.end_line = 3;
-    ASSERT_GT(cbm_store_upsert_node(st, &component_status), 0);
-
-    cbm_store_exec(st, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
-    ASSERT_EQ(cbm_store_exec(st,
-                             "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
-                             "file_path) "
-                             "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
-                             "FROM nodes;"),
-              CBM_STORE_OK);
+    ASSERT_TRUE(mcp_test_upsert_fts_node(st, proj, "Function", "status",
+                                         "issue-552.src.lib.status", "src/lib/status.c"));
+    ASSERT_TRUE(mcp_test_upsert_fts_node(st, proj, "Function", "status",
+                                         "issue-552.src.components.status",
+                                         "src/components/status.c"));
+    ASSERT_EQ(mcp_test_rebuild_nodes_fts(st), CBM_STORE_OK);
 
     char *resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":552,\"method\":\"tools/call\","
@@ -750,6 +754,61 @@ TEST(tool_search_graph_query_honors_file_pattern_issue552) {
     PASS();
 }
 
+TEST(tool_search_graph_query_uses_search_limit_config) {
+    char *tmp = th_mktempdir("cbm_mcp_bm25_limit");
+    ASSERT_NOT_NULL(tmp);
+    char cfg_dir[512];
+    int n = snprintf(cfg_dir, sizeof(cfg_dir), "%s", tmp);
+    ASSERT_TRUE(n > 0 && (size_t)n < sizeof(cfg_dir));
+
+    cbm_config_t *cfg = cbm_config_open(cfg_dir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SEARCH_LIMIT, "1"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "bm25-limit";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/bm25-limit");
+
+    ASSERT_TRUE(mcp_test_upsert_fts_node(st, proj, "Function", "status_ready",
+                                         "bm25-limit.src.status_ready",
+                                         "src/status_ready.c"));
+    ASSERT_TRUE(mcp_test_upsert_fts_node(st, proj, "Function", "status_pending",
+                                         "bm25-limit.src.status_pending",
+                                         "src/status_pending.c"));
+    ASSERT_EQ(mcp_test_rebuild_nodes_fts(st), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":554,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"bm25-limit\",\"query\":\"status\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "search_mode")), "bm25");
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "has_more")));
+    yyjson_val *results = yyjson_obj_get(root, "results");
+    ASSERT_NOT_NULL(results);
+    ASSERT_EQ(yyjson_arr_size(results), 1);
+
+    yyjson_doc_free(doc);
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    th_rmtree(cfg_dir);
+    PASS();
+}
+
 TEST(tool_search_graph_query_rejects_bad_semantic_query) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -760,23 +819,9 @@ TEST(tool_search_graph_query_rejects_bad_semantic_query) {
     cbm_mcp_server_set_project(srv, proj);
     cbm_store_upsert_project(st, proj, "/tmp/bm25-semantic");
 
-    cbm_node_t node = {0};
-    node.project = proj;
-    node.label = "Function";
-    node.name = "publish_status";
-    node.qualified_name = "bm25-semantic.src.publish_status";
-    node.file_path = "src/status.c";
-    node.start_line = 1;
-    node.end_line = 3;
-    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
-
-    cbm_store_exec(st, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
-    ASSERT_EQ(cbm_store_exec(st,
-                             "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
-                             "file_path) "
-                             "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
-                             "FROM nodes;"),
-              CBM_STORE_OK);
+    ASSERT_TRUE(mcp_test_upsert_fts_node(st, proj, "Function", "publish_status",
+                                         "bm25-semantic.src.publish_status", "src/status.c"));
+    ASSERT_EQ(mcp_test_rebuild_nodes_fts(st), CBM_STORE_OK);
 
     char *resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":553,\"method\":\"tools/call\","
@@ -2893,6 +2938,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_basic);
     RUN_TEST(tool_search_graph_includes_node_properties);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
+    RUN_TEST(tool_search_graph_query_uses_search_limit_config);
     RUN_TEST(tool_search_graph_query_rejects_bad_semantic_query);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);
