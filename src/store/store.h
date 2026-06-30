@@ -28,6 +28,7 @@ typedef struct cbm_store cbm_store_t;
  * future publish code do not drift into stringly-typed status variants. */
 #define CBM_STORE_INDEX_STATUS_COMPLETE "complete"
 #define CBM_STORE_INDEX_STATUS_RESERVED "reserved"
+#define CBM_STORE_INDEX_STATUS_FAILED "failed"
 #define CBM_STORE_DERIVED_STATUS_STALE "stale"
 #define CBM_STORE_DERIVED_STATUS_COMPLETE "complete"
 #define CBM_STORE_DERIVED_KIND_DIRECT "direct"
@@ -537,6 +538,10 @@ int cbm_store_reserve_index_generation(cbm_store_t *s, const char *project,
                                        const char *repo_fingerprint,
                                        const char *config_fingerprint,
                                        int64_t *out_generation);
+
+/* Finish a previously reserved generation as complete or failed. */
+int cbm_store_finish_index_generation(cbm_store_t *s, const char *project, int64_t generation,
+                                      const char *status);
 
 int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *delta);
 
