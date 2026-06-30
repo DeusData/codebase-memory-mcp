@@ -2671,6 +2671,50 @@ static int store_resolve_node_id(cbm_store_t *s, const char *project, const char
     return CBM_STORE_OK;
 }
 
+static int store_delete_file_delta_body(cbm_store_t *s, const char *project, const char *rel_path,
+                                        int64_t generation, const char *derived_view_name) {
+    int rc = store_delete_owned_edges_by_file(s, project, rel_path);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_delete_owned_nodes_by_file(s, project, rel_path);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = cbm_store_delete_edge_owners_by_file(s, project, rel_path);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = cbm_store_delete_node_owners_by_file(s, project, rel_path);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = cbm_store_delete_symbol_exports_by_file(s, project, rel_path);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = cbm_store_delete_import_refs_by_file(s, project, rel_path);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = cbm_store_delete_file_hash(s, project, rel_path);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = cbm_store_delete_file_state(s, project, rel_path);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    if (derived_view_name) {
+        rc = store_upsert_derived_view_state(s, project, derived_view_name, generation,
+                                             CBM_STORE_DERIVED_STATUS_STALE);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+    }
+    return CBM_STORE_OK;
+}
+
 static int store_publish_file_delta_body(cbm_store_t *s, const cbm_store_file_delta_t *delta) {
     int rc = store_delete_owned_edges_by_file(s, delta->project, delta->rel_path);
     if (rc != CBM_STORE_OK) {
@@ -2777,6 +2821,33 @@ static int store_publish_file_delta_body(cbm_store_t *s, const cbm_store_file_de
         if (rc != CBM_STORE_OK) {
             return rc;
         }
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_delete_file_delta(cbm_store_t *s, const char *project, const char *rel_path,
+                                int64_t generation, const char *derived_view_name) {
+    if (!s || !project || !project[0] || !rel_path || !rel_path[0] ||
+        (derived_view_name && (!derived_view_name[0] || generation <= 0))) {
+        if (s) {
+            store_set_error(s, "delete_file_delta: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    int rc = cbm_store_begin(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_delete_file_delta_body(s, project, rel_path, generation, derived_view_name);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    rc = cbm_store_commit(s);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
     }
     return CBM_STORE_OK;
 }
