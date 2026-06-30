@@ -20,8 +20,10 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "lsp/c_lsp.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* ── Helpers (same as test_go_lsp.c) ───────────────────────────── */
 
@@ -53,6 +55,63 @@ static CBMFileResult *extract_c(const char *src) {
 
 static CBMFileResult *extract_cpp(const char *src) {
     return cbm_extract_file(src, (int)strlen(src), CBM_LANG_CPP, "test", "main.cpp", 0, NULL, NULL);
+}
+
+TEST(clsp_shared_cross_registry_read_only) {
+    const char *source = "class Widget {\n"
+                         "public:\n"
+                         "    Widget& value();\n"
+                         "    void mutate() {}\n"
+                         "};\n"
+                         "int existing(int a, int b = 1) { return a; }\n"
+                         "Widget factory();\n"
+                         "void test() {\n"
+                         "    Widget w;\n"
+                         "    w.mutate();\n"
+                         "    existing(1);\n"
+                         "}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.main.Widget",
+         .short_name = "Widget",
+         .label = "Class",
+         .def_module_qn = "test.main",
+         .lang = CBM_LANG_CPP},
+        {.qualified_name = "test.main.existing",
+         .short_name = "existing",
+         .label = "Function",
+         .def_module_qn = "test.main",
+         .return_types = "int",
+         .lang = CBM_LANG_CPP},
+    };
+
+    CBMArena registry_arena;
+    CBMArena run_arena;
+    cbm_arena_init(&registry_arena);
+    cbm_arena_init(&run_arena);
+
+    CBMTypeRegistry *reg = cbm_c_build_cross_registry(&registry_arena, defs, 2);
+    ASSERT_NOT_NULL(reg);
+    int func_count = reg->func_count;
+    int type_count = reg->type_count;
+    const CBMRegisteredFunc *existing = cbm_registry_lookup_func(reg, "test.main.existing");
+    ASSERT_NOT_NULL(existing);
+    int min_params = existing->min_params;
+
+    CBMResolvedCallArray out = {0};
+    cbm_run_c_lsp_cross_with_registry(&run_arena, source, (int)strlen(source), "test.main", true,
+                                      reg, NULL, NULL, 0, NULL, &out);
+
+    ASSERT_EQ(reg->func_count, func_count);
+    ASSERT_EQ(reg->type_count, type_count);
+    existing = cbm_registry_lookup_func(reg, "test.main.existing");
+    ASSERT_NOT_NULL(existing);
+    ASSERT_EQ(existing->min_params, min_params);
+    ASSERT_NULL(cbm_registry_lookup_func(reg, "test.main.factory"));
+    ASSERT_NULL(cbm_registry_lookup_method(reg, "test.main.Widget", "value"));
+
+    cbm_arena_destroy(&run_arena);
+    cbm_arena_destroy(&registry_arena);
+    PASS();
 }
 
 TEST(clsp_simple_var_decl) {
@@ -15185,6 +15244,7 @@ TEST(clsp_easy_win_sfinaeconditional_return) {
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(c_lsp) {
+    RUN_TEST(clsp_shared_cross_registry_read_only);
     RUN_TEST(clsp_simple_var_decl);
     RUN_TEST(clsp_pointer_arrow);
     RUN_TEST(clsp_dot_access);

@@ -171,6 +171,8 @@ EXTRACTION_SRCS = \
 
 # LSP resolvers (compiled as one unit via lsp_all.c)
 LSP_SRCS = $(CBM_DIR)/lsp_all.c
+LSP_INCLUDED_SRCS = $(wildcard $(CBM_DIR)/lsp/*.c $(CBM_DIR)/lsp/*.h \
+                              $(CBM_DIR)/lsp/generated/*.c $(CBM_DIR)/lsp/generated/*.h)
 
 # Tree-sitter runtime
 TS_RUNTIME_SRC = $(CBM_DIR)/ts_runtime.c
@@ -497,7 +499,7 @@ $(BUILD_DIR)/%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
 
-$(BUILD_DIR)/lsp_all.o: $(CBM_DIR)/lsp_all.c | $(BUILD_DIR)
+$(BUILD_DIR)/lsp_all.o: $(CBM_DIR)/lsp_all.c $(LSP_INCLUDED_SRCS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TEST) $(SANITIZE) -c -o $@ $<
 
 $(BUILD_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
@@ -579,7 +581,7 @@ $(NOSAN_DIR)/%.o: $(CBM_DIR)/%.c | $(NOSAN_DIR)
 $(NOSAN_DIR)/ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(NOSAN_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_NOSAN) -c -o $@ $<
 
-$(NOSAN_DIR)/lsp_all.o: $(CBM_DIR)/lsp_all.c | $(NOSAN_DIR)
+$(NOSAN_DIR)/lsp_all.o: $(CBM_DIR)/lsp_all.c $(LSP_INCLUDED_SRCS) | $(NOSAN_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_NOSAN) -c -o $@ $<
 
 $(NOSAN_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(NOSAN_DIR)
@@ -672,7 +674,7 @@ $(TSAN_DIR)/%.o: $(CBM_DIR)/%.c | $(TSAN_DIR)
 $(TSAN_DIR)/ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(TSAN_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TSAN) -c -o $@ $<
 
-$(TSAN_DIR)/lsp_all.o: $(CBM_DIR)/lsp_all.c | $(TSAN_DIR)
+$(TSAN_DIR)/lsp_all.o: $(CBM_DIR)/lsp_all.c $(LSP_INCLUDED_SRCS) | $(TSAN_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TSAN) -fsanitize=thread -fno-omit-frame-pointer -c -o $@ $<
 
 $(TSAN_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(TSAN_DIR)
@@ -776,7 +778,7 @@ $(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/prod_ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/prod_lsp_all.o: $(CBM_DIR)/lsp_all.c | $(BUILD_DIR)
+$(BUILD_DIR)/prod_lsp_all.o: $(CBM_DIR)/lsp_all.c $(LSP_INCLUDED_SRCS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/prod_preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
