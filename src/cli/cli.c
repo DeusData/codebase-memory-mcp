@@ -84,6 +84,7 @@ enum {
 #include <errno.h>  // EEXIST
 #include <fcntl.h>  // open, O_WRONLY, O_CREAT, O_TRUNC
 #include <stdint.h> // uintptr_t
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>   // strtok_r
@@ -572,14 +573,28 @@ static bool cbm_snprintf_fits(int n, size_t out_sz) {
     return n >= 0 && (size_t)n < out_sz;
 }
 
+static bool cbm_format_fits(char *out, size_t out_sz, const char *fmt, ...) {
+    if (!out || out_sz == 0 || !fmt) {
+        return false;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(out, out_sz, fmt, ap);
+    va_end(ap);
+    if (!cbm_snprintf_fits(n, out_sz)) {
+        out[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
 static int cbm_prepare_parent_dir(const char *path) {
     if (!path || !path[0]) {
         return CLI_ERR;
     }
 
     char dir[CBM_PATH_MAX];
-    int n = snprintf(dir, sizeof(dir), "%s", path);
-    if (!cbm_snprintf_fits(n, sizeof(dir))) {
+    if (!cbm_format_fits(dir, sizeof(dir), "%s", path)) {
         return CLI_ERR;
     }
 
@@ -1156,11 +1171,17 @@ static void cbm_claude_config_dir(const char *home_dir, char *out, size_t out_sz
     }
     out[0] = '\0';
     char env_buf[CLI_BUF_1K];
-    const char *env = cbm_safe_getenv("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
+    bool env_present = false;
+    const char *env = cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf),
+                                      &env_present)
+                          ? env_buf
+                          : NULL;
     if (env && env[0]) {
-        snprintf(out, out_sz, "%s", env);
+        (void)cbm_format_fits(out, out_sz, "%s", env);
+    } else if (env_present) {
+        return;
     } else if (home_dir && home_dir[0]) {
-        snprintf(out, out_sz, "%s/.claude", home_dir);
+        (void)cbm_format_fits(out, out_sz, "%s/.claude", home_dir);
     }
 }
 
@@ -1172,29 +1193,40 @@ static void cbm_claude_user_root(const char *home_dir, char *out, size_t out_sz)
     }
     out[0] = '\0';
     char env_buf[CLI_BUF_1K];
-    const char *env = cbm_safe_getenv("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
+    bool env_present = false;
+    const char *env = cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf),
+                                      &env_present)
+                          ? env_buf
+                          : NULL;
     if (env && env[0]) {
-        snprintf(out, out_sz, "%s", env);
+        (void)cbm_format_fits(out, out_sz, "%s", env);
+    } else if (env_present) {
+        return;
     } else if (home_dir && home_dir[0]) {
-        snprintf(out, out_sz, "%s", home_dir);
+        (void)cbm_format_fits(out, out_sz, "%s", home_dir);
     }
 }
 
 /* Build the hook command string written into Claude Code's settings.json.
  * Honors $CLAUDE_CONFIG_DIR. When CLAUDE_CONFIG_DIR is unset, preserves the
  * legacy tilde-expanded form so settings.json stays portable across HOME values. */
-static void cbm_resolve_hook_command(const char *script_name, char *out, size_t out_sz) {
+static bool cbm_resolve_hook_command(const char *script_name, char *out, size_t out_sz) {
     if (out_sz == 0) {
-        return;
+        return false;
     }
     out[0] = '\0';
     char env_buf[CLI_BUF_1K];
-    const char *env = cbm_safe_getenv("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
+    bool env_present = false;
+    const char *env = cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf),
+                                      &env_present)
+                          ? env_buf
+                          : NULL;
     if (env && env[0]) {
-        snprintf(out, out_sz, "%s/hooks/%s", env, script_name);
-    } else {
-        snprintf(out, out_sz, "~/.claude/hooks/%s", script_name);
+        return cbm_format_fits(out, out_sz, "%s/hooks/%s", env, script_name);
+    } else if (!env_present) {
+        return cbm_format_fits(out, out_sz, "~/.claude/hooks/%s", script_name);
     }
+    return false;
 }
 
 cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
@@ -2038,7 +2070,9 @@ static int remove_hooks_json(hooks_remove_args_t args) {
 
 int cbm_upsert_claude_hooks(const char *settings_path) {
     char command[CLI_BUF_1K];
-    cbm_resolve_hook_command(CMM_HOOK_GATE_SCRIPT, command, sizeof(command));
+    if (!cbm_resolve_hook_command(CMM_HOOK_GATE_SCRIPT, command, sizeof(command))) {
+        return CLI_ERR;
+    }
     return upsert_hooks_json((hooks_upsert_args_t){
         .settings_path = settings_path,
         .hook_event = "PreToolUse",
@@ -2081,11 +2115,16 @@ void cbm_install_hook_gate_script(const char *home, const char *binary_path) {
         return;
     }
     char hooks_dir[CLI_BUF_1K];
-    snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
-    cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM);
+    if (!cbm_format_fits(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir) ||
+        !cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM)) {
+        return;
+    }
 
     char script_path[CLI_BUF_1K];
-    snprintf(script_path, sizeof(script_path), "%s/" CMM_HOOK_GATE_SCRIPT, hooks_dir);
+    if (!cbm_format_fits(script_path, sizeof(script_path), "%s/" CMM_HOOK_GATE_SCRIPT,
+                         hooks_dir)) {
+        return;
+    }
 
     FILE *f = fopen(script_path, "w");
     if (!f) {
@@ -2125,11 +2164,16 @@ static void cbm_install_session_reminder_script(const char *home) {
         return;
     }
     char hooks_dir[CLI_BUF_1K];
-    snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
-    cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM);
+    if (!cbm_format_fits(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir) ||
+        !cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM)) {
+        return;
+    }
 
     char script_path[CLI_BUF_1K];
-    snprintf(script_path, sizeof(script_path), "%s/" CMM_SESSION_REMINDER_SCRIPT, hooks_dir);
+    if (!cbm_format_fits(script_path, sizeof(script_path), "%s/" CMM_SESSION_REMINDER_SCRIPT,
+                         hooks_dir)) {
+        return;
+    }
 
     FILE *f = fopen(script_path, "w");
     if (!f) {
@@ -2166,7 +2210,9 @@ int cbm_upsert_claude_session_hooks(const char *settings_path) {
     static const char *matchers[] = {"startup", "resume", "clear", "compact"};
     enum { MATCHER_COUNT = sizeof(matchers) / sizeof(matchers[0]) };
     char command[CLI_BUF_1K];
-    cbm_resolve_hook_command(CMM_SESSION_REMINDER_SCRIPT, command, sizeof(command));
+    if (!cbm_resolve_hook_command(CMM_SESSION_REMINDER_SCRIPT, command, sizeof(command))) {
+        return CLI_ERR;
+    }
     int rc = 0;
     for (int i = 0; i < MATCHER_COUNT; i++) {
         if (upsert_hooks_json((hooks_upsert_args_t){.settings_path = settings_path,
@@ -3729,24 +3775,35 @@ static void install_claude_code_config(const char *home, const char *binary_path
     cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
     char user_root[CLI_BUF_1K];
     cbm_claude_user_root(home, user_root, sizeof(user_root));
+    if (!config_dir[0] || !user_root[0]) {
+        return;
+    }
 
     char skills_dir[CLI_BUF_1K];
-    snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
+    if (!cbm_format_fits(skills_dir, sizeof(skills_dir), "%s/skills", config_dir)) {
+        return;
+    }
 
     /* Plan mode: record the planned writes and return without mutating (#388). */
     if (g_install_plan) {
         char p[CLI_BUF_1K];
         plan_record("Claude Code", "skills", skills_dir);
-        snprintf(p, sizeof(p), "%s/.mcp.json", config_dir);
-        plan_record("Claude Code", "mcp_config", p);
-        snprintf(p, sizeof(p), "%s/.claude.json", user_root);
-        plan_record("Claude Code", "mcp_config", p);
-        snprintf(p, sizeof(p), "%s/settings.json", config_dir);
-        plan_record("Claude Code", "mcp_config", p);
-        snprintf(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_HOOK_GATE_SCRIPT);
-        plan_record("Claude Code", "hook", p);
-        snprintf(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_SESSION_REMINDER_SCRIPT);
-        plan_record("Claude Code", "hook", p);
+        if (cbm_format_fits(p, sizeof(p), "%s/.mcp.json", config_dir)) {
+            plan_record("Claude Code", "mcp_config", p);
+        }
+        if (cbm_format_fits(p, sizeof(p), "%s/.claude.json", user_root)) {
+            plan_record("Claude Code", "mcp_config", p);
+        }
+        if (cbm_format_fits(p, sizeof(p), "%s/settings.json", config_dir)) {
+            plan_record("Claude Code", "mcp_config", p);
+        }
+        if (cbm_format_fits(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_HOOK_GATE_SCRIPT)) {
+            plan_record("Claude Code", "hook", p);
+        }
+        if (cbm_format_fits(p, sizeof(p), "%s/hooks/%s", config_dir,
+                            CMM_SESSION_REMINDER_SCRIPT)) {
+            plan_record("Claude Code", "hook", p);
+        }
         return;
     }
 
@@ -3760,21 +3817,27 @@ static void install_claude_code_config(const char *home, const char *binary_path
     }
 
     char mcp_path[CLI_BUF_1K];
-    snprintf(mcp_path, sizeof(mcp_path), "%s/.mcp.json", config_dir);
+    if (!cbm_format_fits(mcp_path, sizeof(mcp_path), "%s/.mcp.json", config_dir)) {
+        return;
+    }
     if (!dry_run) {
         cbm_install_editor_mcp(binary_path, mcp_path);
     }
     printf("  mcp: %s\n", mcp_path);
 
     char mcp_path2[CLI_BUF_1K];
-    snprintf(mcp_path2, sizeof(mcp_path2), "%s/.claude.json", user_root);
+    if (!cbm_format_fits(mcp_path2, sizeof(mcp_path2), "%s/.claude.json", user_root)) {
+        return;
+    }
     if (!dry_run) {
         cbm_install_editor_mcp(binary_path, mcp_path2);
     }
     printf("  mcp: %s\n", mcp_path2);
 
     char settings_path[CLI_BUF_1K];
-    snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
+    if (!cbm_format_fits(settings_path, sizeof(settings_path), "%s/settings.json", config_dir)) {
+        return;
+    }
     if (!dry_run) {
         cbm_upsert_claude_hooks(settings_path);
         cbm_install_hook_gate_script(home, binary_path);
@@ -4193,9 +4256,17 @@ int cbm_cmd_install(int argc, char **argv) {
 
     char bin_target[CLI_BUF_1K];
 #ifdef _WIN32
-    snprintf(bin_target, sizeof(bin_target), "%s/.local/bin/codebase-memory-mcp.exe", home);
+    if (!cbm_format_fits(bin_target, sizeof(bin_target),
+                         "%s/.local/bin/codebase-memory-mcp.exe", home)) {
+        (void)fprintf(stderr, "error: install target path is too long\n");
+        return CLI_TRUE;
+    }
 #else
-    snprintf(bin_target, sizeof(bin_target), "%s/.local/bin/codebase-memory-mcp", home);
+    if (!cbm_format_fits(bin_target, sizeof(bin_target), "%s/.local/bin/codebase-memory-mcp",
+                         home)) {
+        (void)fprintf(stderr, "error: install target path is too long\n");
+        return CLI_TRUE;
+    }
 #endif
 
     /* Stop only server processes running this exact installed target. Matching
@@ -4223,11 +4294,17 @@ int cbm_cmd_install(int argc, char **argv) {
         }
         if (do_copy) {
             char bin_dir[CLI_BUF_1K];
-            snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
+            if (!cbm_format_fits(bin_dir, sizeof(bin_dir), "%s/.local/bin", home)) {
+                (void)fprintf(stderr, "error: install bin directory path is too long\n");
+                return CLI_TRUE;
+            }
             if (dry_run) {
                 printf("Would install binary -> %s\n\n", bin_target);
             } else {
-                cbm_mkdir_p(bin_dir, CLI_OCTAL_PERM);
+                if (!cbm_mkdir_p(bin_dir, CLI_OCTAL_PERM)) {
+                    (void)fprintf(stderr, "error: failed to create %s\n", bin_dir);
+                    return CLI_TRUE;
+                }
                 if (cbm_copy_binary_to_target(self_path, bin_target) != 0) {
                     (void)fprintf(stderr, "error: failed to copy binary to %s\n", bin_target);
                     return CLI_TRUE;
@@ -4258,7 +4335,10 @@ int cbm_cmd_install(int argc, char **argv) {
 
     /* Step 4: Ensure PATH */
     char bin_dir[CLI_BUF_1K];
-    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
+    if (!cbm_format_fits(bin_dir, sizeof(bin_dir), "%s/.local/bin", home)) {
+        (void)fprintf(stderr, "error: install bin directory path is too long\n");
+        return CLI_TRUE;
+    }
     const char *rc = cbm_detect_shell_rc(home);
     if (rc[0]) {
         int path_rc = cbm_ensure_path(bin_dir, rc, dry_run);
@@ -4285,27 +4365,38 @@ static void uninstall_claude_code(const char *home, bool dry_run) {
     cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
     char user_root[CLI_BUF_1K];
     cbm_claude_user_root(home, user_root, sizeof(user_root));
+    if (!config_dir[0] || !user_root[0]) {
+        return;
+    }
 
     char skills_dir[CLI_BUF_1K];
-    snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
+    if (!cbm_format_fits(skills_dir, sizeof(skills_dir), "%s/skills", config_dir)) {
+        return;
+    }
     int removed = cbm_remove_skills(skills_dir, dry_run);
     printf("Claude Code: removed %d skill(s)\n", removed);
 
     char mcp_path[CLI_BUF_1K];
-    snprintf(mcp_path, sizeof(mcp_path), "%s/.mcp.json", config_dir);
+    if (!cbm_format_fits(mcp_path, sizeof(mcp_path), "%s/.mcp.json", config_dir)) {
+        return;
+    }
     if (!dry_run) {
         cbm_remove_editor_mcp(mcp_path);
     }
     printf("  removed MCP config entry\n");
 
     char mcp_path2[CLI_BUF_1K];
-    snprintf(mcp_path2, sizeof(mcp_path2), "%s/.claude.json", user_root);
+    if (!cbm_format_fits(mcp_path2, sizeof(mcp_path2), "%s/.claude.json", user_root)) {
+        return;
+    }
     if (!dry_run) {
         cbm_remove_editor_mcp(mcp_path2);
     }
 
     char settings_path[CLI_BUF_1K];
-    snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
+    if (!cbm_format_fits(settings_path, sizeof(settings_path), "%s/settings.json", config_dir)) {
+        return;
+    }
     if (!dry_run) {
         cbm_remove_claude_hooks(settings_path);
         cbm_remove_claude_session_hooks(settings_path);
@@ -4833,13 +4924,27 @@ int cbm_cmd_update(int argc, char **argv) {
     /* Step 4-5: Download, verify, and install binary */
     char bin_dest[CLI_BUF_1K];
 #ifdef _WIN32
-    snprintf(bin_dest, sizeof(bin_dest), "%s/.local/bin/codebase-memory-mcp.exe", home);
+    if (!cbm_format_fits(bin_dest, sizeof(bin_dest), "%s/.local/bin/codebase-memory-mcp.exe",
+                         home)) {
+        (void)fprintf(stderr, "error: update target path is too long\n");
+        return CLI_TRUE;
+    }
 #else
-    snprintf(bin_dest, sizeof(bin_dest), "%s/.local/bin/codebase-memory-mcp", home);
+    if (!cbm_format_fits(bin_dest, sizeof(bin_dest), "%s/.local/bin/codebase-memory-mcp",
+                         home)) {
+        (void)fprintf(stderr, "error: update target path is too long\n");
+        return CLI_TRUE;
+    }
 #endif
     char bin_dir[CLI_BUF_1K];
-    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
-    cbm_mkdir_p(bin_dir, CLI_OCTAL_PERM);
+    if (!cbm_format_fits(bin_dir, sizeof(bin_dir), "%s/.local/bin", home)) {
+        (void)fprintf(stderr, "error: update bin directory path is too long\n");
+        return CLI_TRUE;
+    }
+    if (!cbm_mkdir_p(bin_dir, CLI_OCTAL_PERM)) {
+        (void)fprintf(stderr, "error: failed to create %s\n", bin_dir);
+        return CLI_TRUE;
+    }
 
     int rc = download_verify_install(url, ext, os, arch, want_ui, bin_dest);
     if (rc != 0) {

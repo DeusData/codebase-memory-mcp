@@ -121,6 +121,10 @@ int cbm_default_worker_count(bool initial);
  * Returns NULL when the variable is unset and fallback is NULL. */
 const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback);
 
+/* Copy a non-empty environment value only if it fits completely.
+ * Sets *present when the variable is set and non-empty, even if it does not fit. */
+bool cbm_getenv_fits(const char *name, char *buf, size_t buf_sz, bool *present);
+
 /* ── Home directory ─────────────────────────────────────────────── */
 
 /* Cross-platform home directory: tries HOME first, then USERPROFILE (Windows).

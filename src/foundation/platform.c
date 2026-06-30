@@ -322,6 +322,41 @@ const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const ch
     return NULL;
 }
 
+bool cbm_getenv_fits(const char *name, char *buf, size_t buf_sz, bool *present) {
+    if (present) {
+        *present = false;
+    }
+    if (!name || !buf || buf_sz == 0) {
+        return false;
+    }
+    buf[0] = '\0';
+
+    char **env = CBM_ENVIRON;
+    if (!env) {
+        return false;
+    }
+    size_t nlen = strlen(name);
+    for (; *env; env++) {
+        if (strncmp(*env, name, nlen) != 0 || (*env)[nlen] != '=') {
+            continue;
+        }
+        const char *value = *env + nlen + SKIP_ONE;
+        if (!value[0]) {
+            return false;
+        }
+        if (present) {
+            *present = true;
+        }
+        size_t vlen = strlen(value);
+        if (vlen >= buf_sz) {
+            return false;
+        }
+        memcpy(buf, value, vlen + SKIP_ONE);
+        return true;
+    }
+    return false;
+}
+
 /* ── Home directory (cross-platform) ───────────────────── */
 
 const char *cbm_get_home_dir(void) {
