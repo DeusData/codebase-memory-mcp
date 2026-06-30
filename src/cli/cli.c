@@ -4070,11 +4070,14 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
 
     yyjson_mut_val *configs = yyjson_mut_arr(doc);
     yyjson_mut_val *instrs = yyjson_mut_arr(doc);
+    yyjson_mut_val *skill_dirs = yyjson_mut_arr(doc);
     yyjson_mut_val *hooks = yyjson_mut_arr(doc);
     for (int i = 0; i < plan.count; i++) {
         cbm_plan_entry_t *e = &plan.items[i];
         if (strcmp(e->kind, "mcp_config") == 0) {
             yyjson_mut_arr_add_strcpy(doc, configs, e->path);
+        } else if (strcmp(e->kind, "skills") == 0) {
+            yyjson_mut_arr_add_strcpy(doc, skill_dirs, e->path);
         } else if (strcmp(e->kind, "hook") == 0) {
             yyjson_mut_val *h = yyjson_mut_obj(doc);
             yyjson_mut_obj_add_strcpy(doc, h, "agent", e->agent);
@@ -4086,6 +4089,7 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
     }
     yyjson_mut_obj_add_val(doc, root, "config_files_planned", configs);
     yyjson_mut_obj_add_val(doc, root, "instruction_files_planned", instrs);
+    yyjson_mut_obj_add_val(doc, root, "skill_dirs_planned", skill_dirs);
     yyjson_mut_obj_add_val(doc, root, "hooks_planned", hooks);
     yyjson_mut_obj_add_bool(doc, root, "writes_started", false);
     yyjson_mut_obj_add_bool(doc, root, "network_after_install", false);
