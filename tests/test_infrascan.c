@@ -97,10 +97,13 @@ TEST(infrascan_route_nodes_skip_bad_http_url_paths) {
         cbm_gbuf_upsert_node(gb, "Function", "str.split", "str.split", "", 0, 0, "{}");
     int64_t empty_callee =
         cbm_gbuf_upsert_node(gb, "Function", "requests.post", "requests.post", "", 0, 0, "{}");
+    int64_t long_callee =
+        cbm_gbuf_upsert_node(gb, "Function", "requests.put", "requests.put", "", 0, 0, "{}");
     ASSERT_GT(caller, 0);
     ASSERT_GT(fs_callee, 0);
     ASSERT_GT(split_callee, 0);
     ASSERT_GT(empty_callee, 0);
+    ASSERT_GT(long_callee, 0);
 
     cbm_gbuf_insert_edge(gb, caller, fs_callee, "HTTP_CALLS",
                          "{\"callee\":\"requests.get\",\"url_path\":\"/etc/crio/crio.conf\","
@@ -110,12 +113,28 @@ TEST(infrascan_route_nodes_skip_bad_http_url_paths) {
                          "\"method\":\"ANY\"}");
     cbm_gbuf_insert_edge(gb, caller, empty_callee, "HTTP_CALLS",
                          "{\"callee\":\"requests.get\",\"method\":\"GET\"}");
+    char long_path[CBM_SZ_1K];
+    const char route_prefix[] = "/api/";
+    memset(long_path, 'a', sizeof(long_path));
+    memcpy(long_path, route_prefix, sizeof(route_prefix) - 1);
+    long_path[sizeof(long_path) - 1] = '\0';
+    char long_props[CBM_SZ_2K];
+    int n = snprintf(long_props, sizeof(long_props),
+                     "{\"callee\":\"requests.put\",\"url_path\":\"%s\",\"method\":\"PUT\"}",
+                     long_path);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(long_props));
+    cbm_gbuf_insert_edge(gb, caller, long_callee, "HTTP_CALLS", long_props);
 
     cbm_pipeline_create_route_nodes(gb);
 
     ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "__route__GET__/etc/crio/crio.conf"));
     ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "__route__ANY__/locations/"));
     ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "__route__GET__"));
+    const cbm_gbuf_node_t **routes = NULL;
+    int route_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_by_label(gb, "Route", &routes, &route_count), 0);
+    ASSERT_EQ(route_count, 0);
 
     cbm_gbuf_free(gb);
     PASS();
