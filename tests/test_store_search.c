@@ -6,6 +6,7 @@
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include <pagerank/pagerank.h>
 #include <store/store.h>
 #include <string.h>
 #include <stdlib.h>
@@ -991,6 +992,38 @@ TEST(store_bfs_with_risk_labels) {
     PASS();
 }
 
+TEST(store_bfs_carries_joined_pagerank_score) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t na = {
+        .project = "test", .label = "Function", .name = "A", .qualified_name = "test.A"};
+    cbm_node_t nb = {
+        .project = "test", .label = "Function", .name = "B", .qualified_name = "test.B"};
+    int64_t idA = cbm_store_upsert_node(s, &na);
+    int64_t idB = cbm_store_upsert_node(s, &nb);
+    cbm_edge_t e = {.project = "test", .source_id = idA, .target_id = idB, .type = "CALLS"};
+    cbm_store_insert_edge(s, &e);
+
+    char rank_sql[256];
+    snprintf(rank_sql, sizeof(rank_sql),
+             "INSERT INTO pagerank(project,node_id,rank,computed_at) "
+             "VALUES('test',%lld,0.75,'2026-06-30T00:00:00Z')",
+             (long long)idB);
+    ASSERT_EQ(cbm_store_exec(s, rank_sql), CBM_STORE_OK);
+
+    const char *types[] = {"CALLS"};
+    cbm_traverse_result_t result = {0};
+    ASSERT_EQ(cbm_store_bfs(s, idA, "outbound", types, 1, 1, 10, &result), CBM_STORE_OK);
+    ASSERT_EQ(result.visited_count, 1);
+    ASSERT_EQ(result.visited[0].node.id, idB);
+    ASSERT_FLOAT_EQ(result.visited[0].pagerank_score, 0.75, CBM_PAGERANK_EPSILON);
+
+    cbm_store_traverse_free(&result);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── BFS cross-service summary ─────────────────────────────────── */
 
 TEST(store_bfs_cross_service_summary) {
@@ -1594,6 +1627,7 @@ SUITE(store_search) {
     RUN_TEST(store_cross_service_detection);
     RUN_TEST(store_deduplicate_hops);
     RUN_TEST(store_bfs_with_risk_labels);
+    RUN_TEST(store_bfs_carries_joined_pagerank_score);
     RUN_TEST(store_bfs_cross_service_summary);
     RUN_TEST(store_glob_to_like);
     RUN_TEST(store_extract_like_hints);

@@ -4418,11 +4418,8 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
             if (is_test) {
                 yyjson_mut_obj_add_bool(doc, item, "is_test", true);
             }
-            {
-                double pr = cbm_pagerank_get(store, tr_out.visited[i].node.id);
-                if (pr > 0.0)
-                    add_pagerank_val(doc, item, pr);
-            }
+            if (tr_out.visited[i].pagerank_score > 0.0)
+                add_pagerank_val(doc, item, tr_out.visited[i].pagerank_score);
             /* Boundary tagging: mark if callee is in a dependency */
             bool callee_dep = cbm_is_dep_project(tr_out.visited[i].node.project,
                                                   srv->session_project);
@@ -4479,11 +4476,8 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
             if (is_test) {
                 yyjson_mut_obj_add_bool(doc, item, "is_test", true);
             }
-            {
-                double pr = cbm_pagerank_get(store, tr_in.visited[i].node.id);
-                if (pr > 0.0)
-                    add_pagerank_val(doc, item, pr);
-            }
+            if (tr_in.visited[i].pagerank_score > 0.0)
+                add_pagerank_val(doc, item, tr_in.visited[i].pagerank_score);
             /* Boundary tagging: mark if caller is in a dependency */
             bool caller_dep = cbm_is_dep_project(tr_in.visited[i].node.project,
                                                   srv->session_project);

@@ -153,6 +153,7 @@ typedef struct {
 typedef struct {
     cbm_node_t node;
     int hop; /* BFS depth from root */
+    double pagerank_score; /* PageRank rank already selected by cbm_store_bfs(), 0.0 if absent */
 } cbm_node_hop_t;
 
 typedef struct {
