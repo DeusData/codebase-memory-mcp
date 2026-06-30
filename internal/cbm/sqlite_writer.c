@@ -14,6 +14,10 @@
 //   - Records: header (varint count + serial types) + body (column values)
 //   - Varints: 1-9 bytes, big-endian, MSB continuation
 
+#if !defined(_GNU_SOURCE) && (defined(__linux__) || defined(__GLIBC__))
+#define _GNU_SOURCE /* glibc qsort_r declaration */
+#endif
+
 #include "sqlite_writer.h"
 #include "foundation/constants.h"
 #include "foundation/compat_thread.h"
@@ -1463,10 +1467,6 @@ static uint8_t *build_master_record(const MasterEntry *e, int *out_len) {
 }
 
 // --- qsort comparators for index sorting ---
-// Single-threaded writer: static context is safe.
-
-static const CBMDumpNode *g_sort_nodes;
-static const CBMDumpEdge *g_sort_edges;
 
 static inline int cmp_i64(int64_t a, int64_t b) {
     return (a > b) - (a < b);
@@ -1476,148 +1476,198 @@ static inline const char *safe_str(const char *s) {
     return s ? s : "";
 }
 
+typedef struct sqlite_sort_ctx sqlite_sort_ctx_t;
+typedef int (*sort_cmp_fn)(const sqlite_sort_ctx_t *ctx, int ia, int ib);
+
+struct sqlite_sort_ctx {
+    const CBMDumpNode *nodes;
+    const CBMDumpEdge *edges;
+    sort_cmp_fn cmp;
+};
+
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+static int cmp_perm_ctx_bsd(void *ctx, const void *a, const void *b) {
+    const sqlite_sort_ctx_t *sort_ctx = (const sqlite_sort_ctx_t *)ctx;
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    return sort_ctx->cmp ? sort_ctx->cmp(sort_ctx, ia, ib) : 0;
+}
+#elif defined(__GLIBC__) || defined(__linux__)
+static int cmp_perm_ctx_gnu(const void *a, const void *b, void *ctx) {
+    const sqlite_sort_ctx_t *sort_ctx = (const sqlite_sort_ctx_t *)ctx;
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    return sort_ctx->cmp ? sort_ctx->cmp(sort_ctx, ia, ib) : 0;
+}
+#else
+typedef struct {
+    int idx;
+    const sqlite_sort_ctx_t *ctx;
+    sort_cmp_fn cmp;
+} SortItem;
+
+static int cmp_sort_item(const void *a, const void *b) {
+    const SortItem *ia = (const SortItem *)a;
+    const SortItem *ib = (const SortItem *)b;
+    return ia->cmp(ia->ctx, ia->idx, ib->idx);
+}
+#endif
+
+static int sort_perm_with_ctx(int *perm, int n, const sqlite_sort_ctx_t *ctx, sort_cmp_fn cmp) {
+    if (n <= 1) {
+        return 0;
+    }
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+    sqlite_sort_ctx_t sort_ctx = *ctx;
+    sort_ctx.cmp = cmp;
+    qsort_r(perm, (size_t)n, sizeof(int), &sort_ctx, cmp_perm_ctx_bsd);
+    return 0;
+#elif defined(__GLIBC__) || defined(__linux__)
+    sqlite_sort_ctx_t sort_ctx = *ctx;
+    sort_ctx.cmp = cmp;
+    qsort_r(perm, (size_t)n, sizeof(int), cmp_perm_ctx_gnu, &sort_ctx);
+    return 0;
+#else
+    SortItem *items = (SortItem *)malloc((size_t)n * sizeof(*items));
+    if (!items) {
+        return ERR_SORT_FAILED;
+    }
+    for (int i = 0; i < n; i++) {
+        items[i].idx = perm[i];
+        items[i].ctx = ctx;
+        items[i].cmp = cmp;
+    }
+    qsort(items, (size_t)n, sizeof(*items), cmp_sort_item);
+    for (int i = 0; i < n; i++) {
+        perm[i] = items[i].idx;
+    }
+    free(items);
+    return 0;
+#endif
+}
+
 // Allocate permutation array [0, 1, ..., n-1], sort with comparator.
 // Returns NULL on allocation failure.
-static int *make_sorted_perm(int n, int (*cmp)(const void *, const void *)) {
+static int *make_sorted_perm(int n, const sqlite_sort_ctx_t *ctx, sort_cmp_fn cmp) {
     int *perm = (int *)malloc(n * sizeof(int));
     if (!perm) {
-        (void)fprintf(stderr, "cbm_write_db: perm malloc failed n=%d size=%zu\n", n,
-                      (size_t)n * sizeof(int));
         return NULL;
     }
     for (int i = 0; i < n; i++) {
         perm[i] = i;
     }
-    qsort(perm, n, sizeof(int), cmp);
+    if (sort_perm_with_ctx(perm, n, ctx, cmp) != 0) {
+        free(perm);
+        return NULL;
+    }
     return perm;
 }
 
 // --- Node index comparators (project is same for all, skip it) ---
 
-static int cmp_node_by_label(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = strcmp(safe_str(g_sort_nodes[ia].label), safe_str(g_sort_nodes[ib].label));
+static int cmp_node_by_label(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = strcmp(safe_str(ctx->nodes[ia].label), safe_str(ctx->nodes[ib].label));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_nodes[ia].id, g_sort_nodes[ib].id);
+    return cmp_i64(ctx->nodes[ia].id, ctx->nodes[ib].id);
 }
 
-static int cmp_node_by_name(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = strcmp(safe_str(g_sort_nodes[ia].name), safe_str(g_sort_nodes[ib].name));
+static int cmp_node_by_name(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = strcmp(safe_str(ctx->nodes[ia].name), safe_str(ctx->nodes[ib].name));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_nodes[ia].id, g_sort_nodes[ib].id);
+    return cmp_i64(ctx->nodes[ia].id, ctx->nodes[ib].id);
 }
 
-static int cmp_node_by_file(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = strcmp(safe_str(g_sort_nodes[ia].file_path), safe_str(g_sort_nodes[ib].file_path));
+static int cmp_node_by_file(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = strcmp(safe_str(ctx->nodes[ia].file_path), safe_str(ctx->nodes[ib].file_path));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_nodes[ia].id, g_sort_nodes[ib].id);
+    return cmp_i64(ctx->nodes[ia].id, ctx->nodes[ib].id);
 }
 
-static int cmp_node_by_qn(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = strcmp(safe_str(g_sort_nodes[ia].qualified_name),
-                   safe_str(g_sort_nodes[ib].qualified_name));
+static int cmp_node_by_qn(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = strcmp(safe_str(ctx->nodes[ia].qualified_name), safe_str(ctx->nodes[ib].qualified_name));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_nodes[ia].id, g_sort_nodes[ib].id);
+    return cmp_i64(ctx->nodes[ia].id, ctx->nodes[ib].id);
 }
 
 // --- Edge index comparators ---
 
 // idx_edges_source: (source_id, type) + rowid
-static int cmp_edge_by_source_type(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = cmp_i64(g_sort_edges[ia].source_id, g_sort_edges[ib].source_id);
+static int cmp_edge_by_source_type(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = cmp_i64(ctx->edges[ia].source_id, ctx->edges[ib].source_id);
     if (c) {
         return c;
     }
-    c = strcmp(safe_str(g_sort_edges[ia].type), safe_str(g_sort_edges[ib].type));
+    c = strcmp(safe_str(ctx->edges[ia].type), safe_str(ctx->edges[ib].type));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
+    return cmp_i64(ctx->edges[ia].id, ctx->edges[ib].id);
 }
 
 // idx_edges_target: (target_id, type) + rowid
-static int cmp_edge_by_target_type(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = cmp_i64(g_sort_edges[ia].target_id, g_sort_edges[ib].target_id);
+static int cmp_edge_by_target_type(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = cmp_i64(ctx->edges[ia].target_id, ctx->edges[ib].target_id);
     if (c) {
         return c;
     }
-    c = strcmp(safe_str(g_sort_edges[ia].type), safe_str(g_sort_edges[ib].type));
+    c = strcmp(safe_str(ctx->edges[ia].type), safe_str(ctx->edges[ib].type));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
+    return cmp_i64(ctx->edges[ia].id, ctx->edges[ib].id);
 }
 
 // idx_edges_type: (project, type) + rowid
-static int cmp_edge_by_type(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = strcmp(safe_str(g_sort_edges[ia].type), safe_str(g_sort_edges[ib].type));
+static int cmp_edge_by_type(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = strcmp(safe_str(ctx->edges[ia].type), safe_str(ctx->edges[ib].type));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
+    return cmp_i64(ctx->edges[ia].id, ctx->edges[ib].id);
 }
 
 // idx_edges_target_type: (project, target_id, type) + rowid
-static int cmp_edge_by_proj_target_type(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = cmp_i64(g_sort_edges[ia].target_id, g_sort_edges[ib].target_id);
+static int cmp_edge_by_proj_target_type(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = cmp_i64(ctx->edges[ia].target_id, ctx->edges[ib].target_id);
     if (c) {
         return c;
     }
-    c = strcmp(safe_str(g_sort_edges[ia].type), safe_str(g_sort_edges[ib].type));
+    c = strcmp(safe_str(ctx->edges[ia].type), safe_str(ctx->edges[ib].type));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
+    return cmp_i64(ctx->edges[ia].id, ctx->edges[ib].id);
 }
 
 // idx_edges_source_type: (project, source_id, type) + rowid
-static int cmp_edge_by_proj_source_type(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = cmp_i64(g_sort_edges[ia].source_id, g_sort_edges[ib].source_id);
+static int cmp_edge_by_proj_source_type(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = cmp_i64(ctx->edges[ia].source_id, ctx->edges[ib].source_id);
     if (c) {
         return c;
     }
-    c = strcmp(safe_str(g_sort_edges[ia].type), safe_str(g_sort_edges[ib].type));
+    c = strcmp(safe_str(ctx->edges[ia].type), safe_str(ctx->edges[ib].type));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
+    return cmp_i64(ctx->edges[ia].id, ctx->edges[ib].id);
 }
 
 // idx_edges_url_path: (project, url_path_gen) + rowid — NULL sorts first
-static int cmp_edge_by_url_path(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    const char *ua = g_sort_edges[ia].url_path;
-    const char *ub = g_sort_edges[ib].url_path;
+static int cmp_edge_by_url_path(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    const char *ua = ctx->edges[ia].url_path;
+    const char *ub = ctx->edges[ib].url_path;
     bool na = (!ua || ua[0] == '\0');
     bool nb = (!ub || ub[0] == '\0');
     if (na && nb) {
-        return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
+        return cmp_i64(ctx->edges[ia].id, ctx->edges[ib].id);
     }
     if (na) {
         return CBM_NOT_FOUND;
@@ -1629,39 +1679,38 @@ static int cmp_edge_by_url_path(const void *a, const void *b) {
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
+    return cmp_i64(ctx->edges[ia].id, ctx->edges[ib].id);
 }
 
 // autoindex_edges_1: UNIQUE(source_id, target_id, type) + rowid
-static int cmp_edge_by_src_tgt_type(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = cmp_i64(g_sort_edges[ia].source_id, g_sort_edges[ib].source_id);
+static int cmp_edge_by_src_tgt_type(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = cmp_i64(ctx->edges[ia].source_id, ctx->edges[ib].source_id);
     if (c) {
         return c;
     }
-    c = cmp_i64(g_sort_edges[ia].target_id, g_sort_edges[ib].target_id);
+    c = cmp_i64(ctx->edges[ia].target_id, ctx->edges[ib].target_id);
     if (c) {
         return c;
     }
-    c = strcmp(safe_str(g_sort_edges[ia].type), safe_str(g_sort_edges[ib].type));
+    c = strcmp(safe_str(ctx->edges[ia].type), safe_str(ctx->edges[ib].type));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
+    return cmp_i64(ctx->edges[ia].id, ctx->edges[ib].id);
 }
 
 // --- Parallel sort support ---
 
 typedef struct {
     int count;
-    int (*cmp)(const void *, const void *);
+    sqlite_sort_ctx_t ctx;
+    sort_cmp_fn cmp;
     int *perm; // output: sorted permutation array, caller frees
 } SortJob;
 
 static void *sort_worker(void *arg) {
     SortJob *j = (SortJob *)arg;
-    j->perm = make_sorted_perm(j->count, j->cmp);
+    j->perm = make_sorted_perm(j->count, &j->ctx, j->cmp);
     return NULL;
 }
 
@@ -2205,27 +2254,25 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
 
     // --- Build indexes (all sorted by key columns before writing) ---
 
-    // Set sort contexts for qsort comparators.
-    g_sort_nodes = nodes;
-    g_sort_edges = edges;
-
     // Parallel sort: all 11 index permutations sorted simultaneously.
     // Sorting is O(N log N) per index — the dominant CPU cost in index building.
     // Cell building + B-tree writing remains serial (sequential page allocation).
+    const sqlite_sort_ctx_t node_sort_ctx = {.nodes = nodes, .edges = NULL, .cmp = NULL};
+    const sqlite_sort_ctx_t edge_sort_ctx = {.nodes = NULL, .edges = edges, .cmp = NULL};
     SortJob nsorts[] = {
-        {node_count, cmp_node_by_label, NULL},
-        {node_count, cmp_node_by_name, NULL},
-        {node_count, cmp_node_by_file, NULL},
-        {node_count, cmp_node_by_qn, NULL},
+        {node_count, node_sort_ctx, cmp_node_by_label, NULL},
+        {node_count, node_sort_ctx, cmp_node_by_name, NULL},
+        {node_count, node_sort_ctx, cmp_node_by_file, NULL},
+        {node_count, node_sort_ctx, cmp_node_by_qn, NULL},
     };
     SortJob esorts[] = {
-        {edge_count, cmp_edge_by_source_type, NULL},
-        {edge_count, cmp_edge_by_target_type, NULL},
-        {edge_count, cmp_edge_by_type, NULL},
-        {edge_count, cmp_edge_by_proj_target_type, NULL},
-        {edge_count, cmp_edge_by_proj_source_type, NULL},
-        {edge_count, cmp_edge_by_url_path, NULL},
-        {edge_count, cmp_edge_by_src_tgt_type, NULL},
+        {edge_count, edge_sort_ctx, cmp_edge_by_source_type, NULL},
+        {edge_count, edge_sort_ctx, cmp_edge_by_target_type, NULL},
+        {edge_count, edge_sort_ctx, cmp_edge_by_type, NULL},
+        {edge_count, edge_sort_ctx, cmp_edge_by_proj_target_type, NULL},
+        {edge_count, edge_sort_ctx, cmp_edge_by_proj_source_type, NULL},
+        {edge_count, edge_sort_ctx, cmp_edge_by_url_path, NULL},
+        {edge_count, edge_sort_ctx, cmp_edge_by_src_tgt_type, NULL},
     };
 
     CBM_PROF_START(t_sort);

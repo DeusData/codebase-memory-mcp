@@ -5555,6 +5555,48 @@ TEST(import_edge_helper_escapes_local_name_once) {
     PASS();
 }
 
+TEST(import_edge_helper_preserves_long_local_name) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t source_file =
+        cbm_gbuf_upsert_node(gb, "File", "main.py", "proj.main.__file__", "main.py", 1, 1, "{}");
+    int64_t target_fn =
+        cbm_gbuf_upsert_node(gb, "Function", "factory", "proj.pkg.factory", "pkg.py", 1, 1, "{}");
+    ASSERT_GT(source_file, 0);
+    ASSERT_GT(target_fn, 0);
+
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gb, target_fn);
+    ASSERT_NOT_NULL(target);
+
+    enum { LONG_ALIAS_LEN = CBM_SZ_256 + CBM_SZ_64 };
+    char alias[LONG_ALIAS_LEN + SKIP_ONE];
+    for (int i = 0; i < LONG_ALIAS_LEN; i++) {
+        alias[i] = (char)('a' + (i % CBM_DECIMAL_BASE));
+    }
+    alias[LONG_ALIAS_LEN] = '\0';
+
+    cbm_pipeline_ctx_t ctx = {
+        .gbuf = gb,
+        .project_name = "proj",
+    };
+    ASSERT_EQ(cbm_pipeline_insert_import_edge(&ctx, source_file, target, alias), 1);
+
+    const char **keys = NULL;
+    const char **vals = NULL;
+    int import_count = 0;
+    ASSERT_EQ(cbm_pipeline_build_import_map_from_edges(gb, "proj", "main.py", &keys, &vals,
+                                                       &import_count),
+              0);
+    ASSERT_EQ(import_count, 1);
+    ASSERT_STR_EQ(keys[0], alias);
+    ASSERT_STR_EQ(vals[0], target->qualified_name);
+    cbm_pipeline_free_import_map(keys, vals, import_count);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 TEST(import_reexport_falls_back_when_pkgmap_target_missing) {
     cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
     ASSERT_NOT_NULL(gb);
@@ -7369,6 +7411,7 @@ SUITE(pipeline) {
     /* FastAPI Depends edge tracking */
     RUN_TEST(pipeline_fastapi_depends_edges);
     RUN_TEST(import_edge_helper_escapes_local_name_once);
+    RUN_TEST(import_edge_helper_preserves_long_local_name);
     RUN_TEST(import_reexport_falls_back_when_pkgmap_target_missing);
     RUN_TEST(import_symbol_fallback_prefers_import_path_over_insertion_order);
     /* Incremental */
