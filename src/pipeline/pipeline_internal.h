@@ -55,6 +55,11 @@ int64_t cbm_pipeline_upsert_service_route(cbm_gbuf_t *gb, const char *path, cbm_
 #define CBM_MS_PER_SEC 1000.0
 #define CBM_US_PER_SEC_F 1e6
 
+/* Test-only incremental fault injection. Values name internal phases and are
+ * intentionally not user configuration. */
+#define CBM_TEST_FAIL_INCREMENTAL_PHASE "CBM_TEST_FAIL_INCREMENTAL_PHASE"
+#define CBM_TEST_FAIL_INCREMENTAL_POSTPASS "postpass"
+
 /* ── Pipeline context (internal) ─────────────────────────────────── */
 
 /* Per-worker manifest collection entry. */
@@ -595,8 +600,8 @@ void cbm_envscan_free_patterns(void);
 /* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
 
 /* Run incremental re-index on an existing disk DB.
- * Classifies files by mtime+size, deletes changed nodes, re-parses changed
- * files, merges into disk DB. Returns 0 on success. */
+ * Classifies files by mtime+size, loads the current DB into a graph buffer,
+ * reparses changed files, and republishes the graph. Returns 0 on success. */
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
                                  int file_count);
 
