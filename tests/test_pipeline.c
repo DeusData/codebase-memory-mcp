@@ -5449,6 +5449,19 @@ static int pipeline_store_has_function_name(const char *db_path, const char *pro
     return found;
 }
 
+static int pipeline_store_file_hash_count(const char *db_path, const char *project) {
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    cbm_file_hash_t *hashes = NULL;
+    int count = 0;
+    int rc = cbm_store_get_file_hashes(s, project, &hashes, &count);
+    cbm_store_free_file_hashes(hashes, count);
+    cbm_store_close(s);
+    return rc == CBM_STORE_OK ? count : CBM_STORE_ERR;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  FastAPI Depends() edge tracking (PR #66, fix #27)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -5938,6 +5951,51 @@ TEST(incremental_postpass_failure_keeps_existing_db) {
     ASSERT_EQ(cbm_store_count_nodes(s, project), nodes_before);
     cbm_store_close(s);
     ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
+
+    cbm_pipeline_free(p);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_hash_persist_failure_falls_back_to_full) {
+    pipeline_env_snapshot_t fail_env = pipeline_env_save(CBM_TEST_FAIL_INCREMENTAL_PHASE);
+
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_GTE(pipeline_store_file_hash_count(g_incr_dbpath, project), 2);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
+
+    char path[CBM_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package main\n\n"
+               "func Helper() string {\n\treturn \"hello\"\n}\n\n"
+               "func NewFunc() int {\n\treturn 42\n}\n");
+    fclose(f);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+
+    cbm_setenv(CBM_TEST_FAIL_INCREMENTAL_PHASE, CBM_TEST_FAIL_INCREMENTAL_HASH_PERSIST, 1);
+    int rc = cbm_pipeline_run(p);
+    pipeline_env_restore(&fail_env);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
+    ASSERT_GTE(pipeline_store_file_hash_count(g_incr_dbpath, project), 2);
 
     cbm_pipeline_free(p);
     free(project);
@@ -7496,6 +7554,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_detects_changed_file);
     RUN_TEST(incremental_dump_failure_keeps_existing_db);
     RUN_TEST(incremental_postpass_failure_keeps_existing_db);
+    RUN_TEST(incremental_hash_persist_failure_falls_back_to_full);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
     RUN_TEST(incremental_fast_preserves_mode_skipped_tools_dir);

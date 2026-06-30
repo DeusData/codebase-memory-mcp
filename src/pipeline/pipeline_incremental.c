@@ -465,20 +465,21 @@ static void incr_free_edge_capture(cbm_edge_capture_t *cap) {
 /* Persist file hash rows for the current discovery and any mode-skipped
  * files preserved from the previous DB.
  *
- * Partial-failure policy: an `upsert` failure on any single row is logged
- * as a warning and the loop continues. We deliberately do NOT abort the
- * whole reindex on a single bad row — partial preservation is better than
- * total loss, and a transient failure on one file should not invalidate
- * the entire incremental update. The trade-off is that a silently-failed
- * row produces the same downstream effect as if the file were never
- * indexed at all (forced re-parse on the next run for current-files,
- * potential orphaned-node revival for mode_skipped). The warning surface
- * is the only signal that something went wrong. */
-static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_info_t *files,
-                           int file_count, const cbm_file_hash_t *mode_skipped,
-                           int mode_skipped_count) {
+ * Partial-failure policy: continue writing all rows so one bad row does not
+ * discard useful metadata for the others, but return an error summary so the
+ * caller can fail closed instead of reporting a successful incremental run with
+ * stale classification metadata. */
+static int persist_hashes(cbm_store_t *store, const char *project, cbm_file_info_t *files,
+                          int file_count, const cbm_file_hash_t *mode_skipped,
+                          int mode_skipped_count) {
     int current_failed = 0;
     int ms_failed = 0;
+
+    if (incr_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_HASH_PERSIST)) {
+        cbm_log_error("incremental.err", "phase", CBM_TEST_FAIL_INCREMENTAL_HASH_PERSIST, "rc",
+                      itoa_buf_incr(CBM_STORE_ERR));
+        return CBM_STORE_ERR;
+    }
 
     /* Batch all hash upserts in one transaction: N files -> 1 COMMIT under
      * WAL instead of N autocommit fsyncs (a 10k-file reindex did 10k separate
@@ -530,13 +531,19 @@ static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_inf
     }
 
     if (batched) {
-        (void)cbm_store_commit(store);
+        int commit_rc = cbm_store_commit(store);
+        if (commit_rc != CBM_STORE_OK) {
+            cbm_log_warn("incremental.persist_summary", "commit_failed", itoa_buf_incr(commit_rc));
+            return commit_rc;
+        }
     }
 
     if (current_failed > 0 || ms_failed > 0) {
         cbm_log_warn("incremental.persist_summary", "current_failed", itoa_buf_incr(current_failed),
                      "mode_skipped_failed", itoa_buf_incr(ms_failed));
+        return CBM_STORE_ERR;
     }
+    return CBM_STORE_OK;
 }
 
 /* ── Registry seed visitor ────────────────────────────────────────── */
@@ -772,7 +779,8 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
 
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {
-        persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
+        int hash_rc =
+            persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
 
         /* FTS5 rebuild after incremental dump.  The btree dump path bypasses
          * any triggers that could have kept nodes_fts synchronized, so we
@@ -789,6 +797,9 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         }
 
         cbm_store_close(hash_store);
+        if (hash_rc != CBM_STORE_OK) {
+            return hash_rc;
+        }
     } else {
         cbm_log_error("incremental.err", "phase", "hash_store_open");
         return CBM_NOT_FOUND;
