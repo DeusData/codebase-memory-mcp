@@ -962,6 +962,13 @@ static int cbm_mcp_config_int_clamped(cbm_mcp_server_t *srv, const char *key, in
     return value;
 }
 
+static int cbm_mcp_get_positive_int_arg(const char *args_json, const char *key,
+                                        int default_val, int fallback_val) {
+    int effective_default = default_val > 0 ? default_val : fallback_val;
+    int value = cbm_mcp_get_int_arg(args_json, key, effective_default);
+    return value > 0 ? value : effective_default;
+}
+
 static int cbm_mcp_store_idle_timeout_s(cbm_mcp_server_t *srv) {
     return cbm_mcp_config_int_clamped(srv, CBM_CONFIG_STORE_IDLE_TIMEOUT_S,
                                       CBM_MCP_DEFAULT_STORE_IDLE_TIMEOUT_S, 1,
@@ -2912,15 +2919,10 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
      * through to the regex path. */
     int cfg_search_limit = cbm_config_get_int(srv->config, CBM_CONFIG_SEARCH_LIMIT,
                                                CBM_MCP_DEFAULT_SEARCH_LIMIT);
-    if (cfg_search_limit <= 0) {
-        cfg_search_limit = CBM_MCP_DEFAULT_SEARCH_LIMIT;
-    }
     char *query = cbm_mcp_get_string_arg(args, "query");
     if (query && query[0]) {
-        int q_limit = cbm_mcp_get_int_arg(args, "limit", cfg_search_limit);
-        if (q_limit <= 0) {
-            q_limit = cfg_search_limit;
-        }
+        int q_limit = cbm_mcp_get_positive_int_arg(args, "limit", cfg_search_limit,
+                                                   CBM_MCP_DEFAULT_SEARCH_LIMIT);
         int q_offset = cbm_mcp_get_int_arg(args, "offset", 0);
         char *q_file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
         char *bm25_json = bm25_search(store, project, query, q_file_pattern, q_limit, q_offset);
@@ -3047,9 +3049,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         free(file_pattern); free(relationship); free(sort_by); free(pe.value);
         return cbm_mcp_text_result(errbuf, true);
     }
-    int limit = cbm_mcp_get_int_arg(args, "limit", cfg_search_limit);
-    /* F4: treat limit<=0 as default */
-    if (limit <= 0) limit = cfg_search_limit;
+    int limit = cbm_mcp_get_positive_int_arg(args, "limit", cfg_search_limit,
+                                             CBM_MCP_DEFAULT_SEARCH_LIMIT);
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
     bool cfg_compact = cbm_config_get_bool(srv->config, "compact", true);
     bool compact = cbm_mcp_get_bool_arg_default(args, "compact", cfg_compact);
@@ -4172,7 +4173,8 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
     if (depth < 1) depth = 1;
     int cfg_trace_max = cbm_config_get_int(srv->config, CBM_CONFIG_TRACE_MAX_RESULTS,
                                             CBM_DEFAULT_TRACE_MAX_RESULTS);
-    int max_results = cbm_mcp_get_int_arg(args, "max_results", cfg_trace_max);
+    int max_results = cbm_mcp_get_positive_int_arg(args, "max_results", cfg_trace_max,
+                                                   CBM_DEFAULT_TRACE_MAX_RESULTS);
     bool cfg_compact_t = cbm_config_get_bool(srv->config, "compact", true);
     bool compact = cbm_mcp_get_bool_arg_default(args, "compact", cfg_compact_t);
     bool include_tests = cbm_mcp_get_bool_arg(args, "include_tests");
@@ -6024,7 +6026,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     int context_lines = cbm_mcp_get_int_arg(args, "context", 0);
     int cfg_search_limit_sc = cbm_config_get_int(srv->config, CBM_CONFIG_SEARCH_LIMIT,
                                                 CBM_MCP_DEFAULT_SEARCH_LIMIT);
-    int limit = cbm_mcp_get_int_arg(args, "limit", cfg_search_limit_sc);
+    int limit = cbm_mcp_get_positive_int_arg(args, "limit", cfg_search_limit_sc,
+                                             CBM_MCP_DEFAULT_SEARCH_LIMIT);
     bool use_regex = cbm_mcp_get_bool_arg(args, "regex");
     uint64_t search_t0 = cbm_now_ms();
     /* In literal (non-regex) mode a '|' is matched as a byte, not alternation —

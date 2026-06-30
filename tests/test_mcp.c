@@ -1040,6 +1040,18 @@ TEST(tool_trace_path_prefers_definition) {
     ASSERT_NOT_NULL(strstr(inner, "callee"));
     free(inner);
     free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"function_name\":\"dup\","
+             "\"project\":\"pref-proj\",\"direction\":\"outbound\",\"max_results\":0}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "callee"));
+    free(inner);
+    free(resp);
+
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -1330,6 +1342,34 @@ TEST(search_code_multi_word) {
     ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
     free(resp);
 
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(search_code_limit_zero_uses_config_default) {
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":190,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\","
+             "\"project\":\"test-project\",\"limit\":0}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *results = yyjson_obj_get(root, "results");
+    ASSERT_NOT_NULL(results);
+    ASSERT_GT(yyjson_arr_size(results), 0);
+
+    yyjson_doc_free(doc);
+    free(inner);
+    free(resp);
     cleanup_snippet_dir(tmp);
     cbm_mcp_server_free(srv);
     PASS();
@@ -2963,6 +3003,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_code_missing_pattern);
     RUN_TEST(tool_search_code_no_project);
     RUN_TEST(search_code_multi_word);
+    RUN_TEST(search_code_limit_zero_uses_config_default);
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
     RUN_TEST(search_code_ampersand_accepted_issue272);
