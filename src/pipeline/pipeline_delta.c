@@ -323,7 +323,7 @@ static int delta_iso_now(char *buf, size_t sz) {
                : CBM_STORE_ERR;
 }
 
-static int delta_content_hash_file(const char *path, char *out, size_t out_sz) {
+int cbm_pipeline_content_hash_file(const char *path, char *out, size_t out_sz) {
     if (!path || !out || out_sz <= CBM_DELTA_XXH64_HEX_LEN) {
         return CBM_STORE_ERR;
     }
@@ -380,8 +380,8 @@ int cbm_pipeline_attach_file_delta_metadata(cbm_pipeline_file_delta_t *delta,
     if (stat(file->path, &st) != 0) {
         return CBM_STORE_ERR;
     }
-    if (delta_content_hash_file(file->path, delta->file_content_hash,
-                                sizeof(delta->file_content_hash)) != CBM_STORE_OK) {
+    if (cbm_pipeline_content_hash_file(file->path, delta->file_content_hash,
+                                       sizeof(delta->file_content_hash)) != CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
     if (delta_iso_now(delta->file_indexed_at, sizeof(delta->file_indexed_at)) != CBM_STORE_OK) {
