@@ -3712,22 +3712,11 @@ TEST(pipeline_file_delta_orchestrates_descriptor_plan_and_publish) {
     ASSERT_EQ(pipeline_delta_plan_contains_path(&batch_plan, helper_rel), 1);
     ASSERT_EQ(pipeline_delta_plan_contains_path(&batch_plan, main_rel), 1);
 
-    cbm_pipeline_file_delta_plan_t helper_plan = {0};
-    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &final_helper_delta,
-                                           PIPELINE_DELTA_PARITY_MAX_AFFECTED, &helper_plan),
+    const cbm_store_file_delta_t *publish_deltas[] = {&final_helper_delta.delta,
+                                                      &final_main_delta.delta};
+    ASSERT_EQ(cbm_store_publish_file_delta_batch(s, publish_deltas,
+                                                 PIPELINE_DELTA_PARITY_BATCH_COUNT),
               CBM_STORE_OK);
-    ASSERT_EQ(helper_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
-    ASSERT_EQ(pipeline_delta_plan_contains_path(&helper_plan, helper_rel), 1);
-    ASSERT_EQ(pipeline_delta_plan_contains_path(&helper_plan, main_rel), 1);
-    ASSERT_EQ(cbm_store_publish_file_delta(s, &final_helper_delta.delta), CBM_STORE_OK);
-
-    cbm_pipeline_file_delta_plan_t main_plan = {0};
-    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &final_main_delta,
-                                           PIPELINE_DELTA_PARITY_MAX_AFFECTED, &main_plan),
-              CBM_STORE_OK);
-    ASSERT_EQ(main_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
-    ASSERT_EQ(pipeline_delta_plan_contains_path(&main_plan, main_rel), 1);
-    ASSERT_EQ(cbm_store_publish_file_delta(s, &final_main_delta.delta), CBM_STORE_OK);
     ASSERT_EQ(cbm_store_finish_index_generation(s, project, generation,
                                                 CBM_STORE_INDEX_STATUS_COMPLETE),
               CBM_STORE_OK);
@@ -3759,8 +3748,6 @@ TEST(pipeline_file_delta_orchestrates_descriptor_plan_and_publish) {
 
     cbm_pipeline_file_delta_plan_free(&main_before_helper_plan);
     cbm_pipeline_file_delta_plan_free(&batch_plan);
-    cbm_pipeline_file_delta_plan_free(&helper_plan);
-    cbm_pipeline_file_delta_plan_free(&main_plan);
     cbm_pipeline_file_delta_free(&final_helper_delta);
     cbm_pipeline_file_delta_free(&final_main_delta);
     cbm_gbuf_free(final_gb);
