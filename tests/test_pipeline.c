@@ -3170,6 +3170,26 @@ static int pipeline_delta_plan_contains_path(const cbm_pipeline_file_delta_plan_
     return 0;
 }
 
+static void pipeline_delta_free_string_array(char **items, int count) {
+    if (!items) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(items[i]);
+    }
+    free(items);
+}
+
+static int pipeline_delta_store_qn_exists(cbm_store_t *s, const char *project, const char *qn) {
+    cbm_node_t node = {0};
+    int rc = cbm_store_find_node_by_qn(s, project, qn, &node);
+    if (rc == CBM_STORE_OK) {
+        cbm_node_free_fields(&node);
+        return 1;
+    }
+    return 0;
+}
+
 static void pipeline_delta_attach_test_metadata(cbm_pipeline_file_delta_t *delta,
                                                 cbm_file_hash_t *hash,
                                                 cbm_file_state_t *state) {
@@ -3553,6 +3573,178 @@ TEST(pipeline_file_delta_plan_falls_back_on_large_frontier) {
 
     cbm_pipeline_file_delta_plan_free(&plan);
     cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_orchestrates_descriptor_plan_and_publish) {
+    enum {
+        BASE_GENERATION = 1,
+        FINAL_GENERATION = 2,
+        PIPELINE_DELTA_PARITY_MAX_AFFECTED = CBM_SZ_4,
+        EXPECTED_FINAL_CALLS_EDGES = 1,
+        EXPECTED_FINAL_IMPORTS_EDGES = 1,
+        EXPECTED_FINAL_EDGES = EXPECTED_FINAL_CALLS_EDGES + EXPECTED_FINAL_IMPORTS_EDGES,
+    };
+    const char *project = "test";
+    const char *helper_rel = "helper.go";
+    const char *main_rel = "main.go";
+    const char *old_helper_qn = "test.helper.Helper";
+    const char *new_helper_qn = "test.helper.NewHelper";
+    const char *old_main_qn = "test.main.Old";
+    const char *new_main_qn = "test.main.New";
+
+    char *tmp = th_mktempdir("cbm_delta_pipeline");
+    ASSERT_NOT_NULL(tmp);
+    const char *helper_path = TH_PATH(tmp, helper_rel);
+    const char *main_path = TH_PATH(tmp, main_rel);
+    ASSERT_EQ(th_write_file(helper_path, "package helper\nfunc Helper() {}\n"), 0);
+    ASSERT_EQ(th_write_file(main_path, "package main\nfunc Old() {}\n"), 0);
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, tmp), CBM_STORE_OK);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, BASE_GENERATION);
+
+    cbm_gbuf_t *base_gb = cbm_gbuf_new(project, tmp);
+    ASSERT_NOT_NULL(base_gb);
+    int64_t base_helper_id = cbm_gbuf_upsert_node(base_gb, "Function", "Helper",
+                                                  old_helper_qn, helper_rel, 1, 1,
+                                                  "{\"is_exported\":true}");
+    int64_t base_file_id = cbm_gbuf_upsert_node(base_gb, "File", main_rel,
+                                                "test.main.__file__", main_rel, 1, 1, "{}");
+    int64_t base_main_id = cbm_gbuf_upsert_node(base_gb, "Function", "Old", old_main_qn,
+                                                main_rel, 1, 1, "{\"is_exported\":true}");
+    ASSERT_GT(base_helper_id, 0);
+    ASSERT_GT(base_file_id, 0);
+    ASSERT_GT(base_main_id, 0);
+    const cbm_gbuf_node_t *base_helper = cbm_gbuf_find_by_qn(base_gb, old_helper_qn);
+    ASSERT_NOT_NULL(base_helper);
+    cbm_pipeline_ctx_t base_ctx = {.project_name = project, .repo_path = tmp, .gbuf = base_gb};
+    ASSERT_EQ(cbm_pipeline_insert_import_edge(&base_ctx, base_file_id, base_helper, "Helper"), 1);
+    ASSERT_GT(cbm_gbuf_insert_edge(base_gb, base_main_id, base_helper_id, "CALLS", "{}"), 0);
+
+    cbm_pipeline_file_delta_t base_helper_delta = {0};
+    cbm_pipeline_file_delta_t base_main_delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(base_gb, project, helper_rel, generation,
+                                                      &base_helper_delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(base_gb, project, main_rel, generation,
+                                                      &base_main_delta),
+              CBM_STORE_OK);
+    cbm_file_info_t helper_file = {.path = (char *)helper_path,
+                                   .rel_path = (char *)helper_rel,
+                                   .language = CBM_LANG_GO};
+    cbm_file_info_t main_file = {
+        .path = (char *)main_path, .rel_path = (char *)main_rel, .language = CBM_LANG_GO};
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata(&base_helper_delta, &helper_file),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata(&base_main_delta, &main_file),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_publish_file_delta(s, &base_helper_delta.delta), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_publish_file_delta(s, &base_main_delta.delta), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, project, generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+    cbm_pipeline_file_delta_free(&base_helper_delta);
+    cbm_pipeline_file_delta_free(&base_main_delta);
+    cbm_gbuf_free(base_gb);
+
+    ASSERT_EQ(th_write_file(helper_path, "package helper\nfunc NewHelper() {}\n"), 0);
+    ASSERT_EQ(th_write_file(main_path,
+                            "package main\nimport \"helper\"\nfunc New() { helper.NewHelper() }\n"),
+              0);
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, FINAL_GENERATION);
+
+    cbm_gbuf_t *final_gb = cbm_gbuf_new(project, tmp);
+    ASSERT_NOT_NULL(final_gb);
+    int64_t new_helper_id = cbm_gbuf_upsert_node(final_gb, "Function", "NewHelper",
+                                                 new_helper_qn, helper_rel, 1, 1,
+                                                 "{\"is_exported\":true}");
+    int64_t final_file_id = cbm_gbuf_upsert_node(final_gb, "File", main_rel,
+                                                 "test.main.__file__", main_rel, 1, 1, "{}");
+    int64_t new_main_id = cbm_gbuf_upsert_node(final_gb, "Function", "New", new_main_qn,
+                                               main_rel, 3, 3, "{\"is_exported\":true}");
+    ASSERT_GT(new_helper_id, 0);
+    ASSERT_GT(final_file_id, 0);
+    ASSERT_GT(new_main_id, 0);
+    const cbm_gbuf_node_t *new_helper = cbm_gbuf_find_by_qn(final_gb, new_helper_qn);
+    ASSERT_NOT_NULL(new_helper);
+    cbm_pipeline_ctx_t final_ctx = {.project_name = project, .repo_path = tmp, .gbuf = final_gb};
+    ASSERT_EQ(cbm_pipeline_insert_import_edge(&final_ctx, final_file_id, new_helper, "NewHelper"),
+              1);
+    ASSERT_GT(cbm_gbuf_insert_edge(final_gb, new_main_id, new_helper_id, "CALLS", "{}"), 0);
+
+    cbm_pipeline_file_delta_t final_helper_delta = {0};
+    cbm_pipeline_file_delta_t final_main_delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(final_gb, project, helper_rel, generation,
+                                                      &final_helper_delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(final_gb, project, main_rel, generation,
+                                                      &final_main_delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata(&final_helper_delta, &helper_file),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata(&final_main_delta, &main_file),
+              CBM_STORE_OK);
+
+    cbm_pipeline_file_delta_plan_t helper_plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &final_helper_delta,
+                                           PIPELINE_DELTA_PARITY_MAX_AFFECTED, &helper_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(helper_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&helper_plan, helper_rel), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&helper_plan, main_rel), 1);
+    ASSERT_EQ(cbm_store_publish_file_delta(s, &final_helper_delta.delta), CBM_STORE_OK);
+
+    cbm_pipeline_file_delta_plan_t main_plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &final_main_delta,
+                                           PIPELINE_DELTA_PARITY_MAX_AFFECTED, &main_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(main_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&main_plan, main_rel), 1);
+    ASSERT_EQ(cbm_store_publish_file_delta(s, &final_main_delta.delta), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, project, generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, old_helper_qn), 0);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, old_main_qn), 0);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_helper_qn), 1);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_main_qn), 1);
+    ASSERT_EQ(cbm_store_count_edges(s, project), EXPECTED_FINAL_EDGES);
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "CALLS"), EXPECTED_FINAL_CALLS_EDGES);
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "IMPORTS"), EXPECTED_FINAL_IMPORTS_EDGES);
+
+    cbm_file_state_t got = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, project, helper_rel, &got), CBM_STORE_OK);
+    ASSERT_EQ(got.generation, FINAL_GENERATION);
+    cbm_store_file_state_free_fields(&got);
+    ASSERT_EQ(cbm_store_get_file_state(s, project, main_rel, &got), CBM_STORE_OK);
+    ASSERT_EQ(got.generation, FINAL_GENERATION);
+    cbm_store_file_state_free_fields(&got);
+
+    char **import_paths = NULL;
+    int import_count = 0;
+    ASSERT_EQ(cbm_store_list_import_ref_paths_by_target(s, project, new_helper_qn, &import_paths,
+                                                        &import_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(import_count, 1);
+    ASSERT_STR_EQ(import_paths[0], main_rel);
+    pipeline_delta_free_string_array(import_paths, import_count);
+
+    cbm_pipeline_file_delta_plan_free(&helper_plan);
+    cbm_pipeline_file_delta_plan_free(&main_plan);
+    cbm_pipeline_file_delta_free(&final_helper_delta);
+    cbm_pipeline_file_delta_free(&final_main_delta);
+    cbm_gbuf_free(final_gb);
+    cbm_store_close(s);
+    th_cleanup(tmp);
     PASS();
 }
 
@@ -7899,6 +8091,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unresolved_edge_endpoint);
     RUN_TEST(pipeline_file_delta_plan_accepts_resolved_external_edge_endpoint);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_large_frontier);
+    RUN_TEST(pipeline_file_delta_orchestrates_descriptor_plan_and_publish);
     /* File persistence */
     RUN_TEST(store_file_persistence);
     RUN_TEST(store_bulk_persistence);
