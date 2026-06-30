@@ -36,6 +36,7 @@ enum {
 #include "service_patterns.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const char *const RN_PROPS_INFRA_MATCH = "{\"source\":\"infra_match\"}";
@@ -383,50 +384,106 @@ static bool is_broker_route(const char *qn) {
     return false;
 }
 
+typedef struct {
+    const cbm_gbuf_node_t *route;
+    const char *handler_path;
+    const char *file_path;
+    bool is_prefix_route;
+} rn_handler_route_ref_t;
+
+static bool handler_route_ref_init(rn_handler_route_ref_t *out,
+                                   const cbm_gbuf_node_t *handler_route) {
+    if (!out || !handler_route || is_broker_route(handler_route->qualified_name)) {
+        return false;
+    }
+    const char *handler_name = handler_route->name;
+    const char *handler_path = handler_name ? strchr(handler_name, '/') : NULL;
+    if (!handler_path) {
+        return false;
+    }
+    out->route = handler_route;
+    out->handler_path = handler_path;
+    out->file_path = handler_route->file_path;
+    out->is_prefix_route =
+        (handler_route->qualified_name != NULL &&
+         strncmp(handler_route->qualified_name, "__route__ANY__", SLEN("__route__ANY__")) == 0);
+    return true;
+}
+
+static rn_handler_route_ref_t *build_handler_route_refs(const cbm_gbuf_node_t **all_routes,
+                                                        int route_count, int *out_count) {
+    if (out_count) {
+        *out_count = 0;
+    }
+    if (!all_routes || route_count <= 0 || !out_count) {
+        return NULL;
+    }
+    rn_handler_route_ref_t *refs = calloc((size_t)route_count, sizeof(*refs));
+    if (!refs) {
+        return NULL;
+    }
+    int count = 0;
+    for (int i = 0; i < route_count; i++) {
+        if (handler_route_ref_init(&refs[count], all_routes[i])) {
+            count++;
+        }
+    }
+    *out_count = count;
+    return refs;
+}
+
+static int match_handler_route_ref(cbm_gbuf_t *gb, const cbm_gbuf_node_t *infra,
+                                   const char *infra_path, const char *svc_name,
+                                   const rn_handler_route_ref_t *handler) {
+    int file_matches = (handler->file_path != NULL && strstr(handler->file_path, svc_name) != NULL);
+    if (!file_matches && !handler->is_prefix_route) {
+        return 0;
+    }
+
+    const char *handler_path = handler->handler_path;
+    int path_match =
+        (strlen(handler_path) > SKIP_ONE && (strstr(infra_path, handler_path) != NULL ||
+                                             strstr(handler_path, infra_path) != NULL));
+    int root_svc_match =
+        (file_matches && strcmp(handler_path, "/") == 0 && strcmp(infra_path, "/") == 0);
+    if (!path_match && !root_svc_match) {
+        return 0;
+    }
+
+    const cbm_gbuf_edge_t **fn_handles = NULL;
+    int fn_hcount = 0;
+    cbm_gbuf_find_edges_by_target_type(gb, handler->route->id, "HANDLES", &fn_handles,
+                                       &fn_hcount);
+    for (int fh = 0; fh < fn_hcount; fh++) {
+        cbm_gbuf_insert_edge(gb, fn_handles[fh]->source_id, infra->id, "HANDLES",
+                             RN_PROPS_INFRA_MATCH);
+    }
+    return 1;
+}
+
 /* Try to match a single infra Route to a handler Route and create HANDLES bridge.
  * Returns 1 if matched, 0 otherwise. */
 static int match_one_infra_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *infra,
                                  const char *infra_path, const char *svc_name,
-                                 const cbm_gbuf_node_t **all_routes, int route_count) {
+                                 const rn_handler_route_ref_t *handler_routes, int handler_count) {
+    int matched = 0;
+    for (int j = 0; j < handler_count; j++) {
+        matched |=
+            match_handler_route_ref(gb, infra, infra_path, svc_name, &handler_routes[j]);
+    }
+    return matched;
+}
+
+static int match_one_infra_route_scan(cbm_gbuf_t *gb, const cbm_gbuf_node_t *infra,
+                                      const char *infra_path, const char *svc_name,
+                                      const cbm_gbuf_node_t **all_routes, int route_count) {
     int matched = 0;
     for (int j = 0; j < route_count; j++) {
-        const cbm_gbuf_node_t *handler_route = all_routes[j];
-        if (is_broker_route(handler_route->qualified_name)) {
+        rn_handler_route_ref_t ref;
+        if (!handler_route_ref_init(&ref, all_routes[j])) {
             continue;
         }
-        int file_matches = (handler_route->file_path != NULL &&
-                            strstr(handler_route->file_path, svc_name) != NULL);
-        int is_prefix_route =
-            (handler_route->qualified_name != NULL &&
-             strncmp(handler_route->qualified_name, "__route__ANY__", SLEN("__route__ANY__")) == 0);
-        if (!file_matches && !is_prefix_route) {
-            continue;
-        }
-        const char *handler_name = handler_route->name;
-        if (!handler_name) {
-            continue;
-        }
-        const char *handler_path = strchr(handler_name, '/');
-        if (!handler_path) {
-            continue;
-        }
-
-        int path_match =
-            (strlen(handler_path) > SKIP_ONE && (strstr(infra_path, handler_path) != NULL ||
-                                                 strstr(handler_path, infra_path) != NULL));
-        int root_svc_match =
-            (file_matches && strcmp(handler_path, "/") == 0 && strcmp(infra_path, "/") == 0);
-        if (path_match || root_svc_match) {
-            const cbm_gbuf_edge_t **fn_handles = NULL;
-            int fn_hcount = 0;
-            cbm_gbuf_find_edges_by_target_type(gb, handler_route->id, "HANDLES", &fn_handles,
-                                               &fn_hcount);
-            for (int fh = 0; fh < fn_hcount; fh++) {
-                cbm_gbuf_insert_edge(gb, fn_handles[fh]->source_id, infra->id, "HANDLES",
-                                     RN_PROPS_INFRA_MATCH);
-            }
-            matched = SKIP_ONE;
-        }
+        matched |= match_handler_route_ref(gb, infra, infra_path, svc_name, &ref);
     }
     return matched;
 }
@@ -440,6 +497,9 @@ static void match_infra_routes(cbm_gbuf_t *gb) {
     }
 
     int matched = 0;
+    int handler_count = 0;
+    rn_handler_route_ref_t *handler_routes =
+        build_handler_route_refs(all_routes, route_count, &handler_count);
 
     for (int i = 0; i < route_count; i++) {
         const cbm_gbuf_node_t *infra = all_routes[i];
@@ -458,8 +518,16 @@ static void match_infra_routes(cbm_gbuf_t *gb) {
             continue;
         }
 
-        matched += match_one_infra_route(gb, infra, infra_path, svc_name, all_routes, route_count);
+        if (handler_routes) {
+            matched +=
+                match_one_infra_route(gb, infra, infra_path, svc_name, handler_routes, handler_count);
+        } else {
+            matched += match_one_infra_route_scan(gb, infra, infra_path, svc_name, all_routes,
+                                                  route_count);
+        }
     }
+
+    free(handler_routes);
 
     if (matched > 0) {
         char buf[CBM_SZ_16];
