@@ -216,6 +216,7 @@ void cbm_pipeline_free_import_map(const char **keys, const char **vals, int coun
  * Returns CBM_STORE_OK even when unsupported_edge_count > 0; callers must fall
  * back instead of publishing when unsupported edges are present. */
 int64_t cbm_pipeline_stat_mtime_ns(const struct stat *st);
+int cbm_pipeline_content_hash_file(const char *path, char *out, size_t out_sz);
 int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *project,
                                             const char *rel_path, int64_t generation,
                                             cbm_pipeline_file_delta_t *out);

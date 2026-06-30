@@ -3507,6 +3507,36 @@ TEST(pipeline_file_delta_metadata_from_file) {
     PASS();
 }
 
+TEST(pipeline_content_hash_helper_matches_file_delta_metadata) {
+    enum { PIPELINE_DELTA_META_GENERATION = 13 };
+    char *tmp = th_mktempdir("cbm_delta_hash");
+    ASSERT_NOT_NULL(tmp);
+    const char *path = TH_PATH(tmp, "main.go");
+    const char *content = "package main\nfunc Run() { println(\"hash\") }\n";
+    ASSERT_EQ(th_write_file(path, content), 0);
+
+    char expected_hash[CBM_SZ_32];
+    ASSERT_EQ(cbm_pipeline_content_hash_file(path, expected_hash, sizeof(expected_hash)),
+              CBM_STORE_OK);
+
+    cbm_file_info_t file = {
+        .path = (char *)path,
+        .rel_path = "main.go",
+        .language = CBM_LANG_GO,
+        .size = (int64_t)strlen(content),
+    };
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test",
+                  .rel_path = "main.go",
+                  .generation = PIPELINE_DELTA_META_GENERATION}};
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata(&delta, &file), CBM_STORE_OK);
+    ASSERT_STR_EQ(delta.file_state.content_hash, expected_hash);
+    ASSERT_EQ((int)strlen(expected_hash), CBM_SZ_16);
+
+    th_cleanup(tmp);
+    PASS();
+}
+
 TEST(pipeline_file_delta_plan_candidate_from_frontier) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -8435,6 +8465,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_descriptor_from_gbuf);
     RUN_TEST(pipeline_file_delta_descriptor_marks_unsupported_edges);
     RUN_TEST(pipeline_file_delta_metadata_from_file);
+    RUN_TEST(pipeline_content_hash_helper_matches_file_delta_metadata);
     RUN_TEST(pipeline_file_delta_plan_candidate_from_frontier);
     RUN_TEST(pipeline_file_delta_apply_falls_back_on_publish_error);
     RUN_TEST(pipeline_file_delta_plan_falls_back_without_existing_ownership);
