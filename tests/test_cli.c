@@ -2471,6 +2471,68 @@ TEST(cli_hook_gate_script_no_predictable_tmp_issue384) {
     PASS();
 }
 
+TEST(cli_hook_gate_script_rejects_overlong_home_without_truncated_parent) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-gate-long-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *saved_ccd = getenv("CLAUDE_CONFIG_DIR");
+    char *saved_ccd_copy = saved_ccd ? strdup(saved_ccd) : NULL;
+    cbm_unsetenv("CLAUDE_CONFIG_DIR");
+
+    char unexpected[512];
+    snprintf(unexpected, sizeof(unexpected), "%s/a", tmpdir);
+    char *home = make_overlong_nested_path(tmpdir, "home");
+    ASSERT_NOT_NULL(home);
+
+    cbm_install_hook_gate_script(home, "/usr/local/bin/codebase-memory-mcp");
+    ASSERT_FALSE(test_path_exists(unexpected));
+
+    free(home);
+    if (saved_ccd_copy) {
+        cbm_setenv("CLAUDE_CONFIG_DIR", saved_ccd_copy, 1);
+        free(saved_ccd_copy);
+    } else {
+        cbm_unsetenv("CLAUDE_CONFIG_DIR");
+    }
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_claude_hooks_reject_overlong_config_dir_command) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-env-long-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *saved_ccd = getenv("CLAUDE_CONFIG_DIR");
+    char *saved_ccd_copy = saved_ccd ? strdup(saved_ccd) : NULL;
+    char *config_dir = make_overlong_nested_path(tmpdir, "claude-config");
+    ASSERT_NOT_NULL(config_dir);
+    cbm_setenv("CLAUDE_CONFIG_DIR", config_dir, 1);
+
+    char settingspath[512];
+    snprintf(settingspath, sizeof(settingspath), "%s/settings.json", tmpdir);
+    ASSERT_NEQ(cbm_upsert_claude_hooks(settingspath), 0);
+    ASSERT_NEQ(cbm_upsert_claude_session_hooks(settingspath), 0);
+    ASSERT_FALSE(test_path_exists(settingspath));
+
+    char unexpected[512];
+    snprintf(unexpected, sizeof(unexpected), "%s/a", tmpdir);
+    ASSERT_FALSE(test_path_exists(unexpected));
+
+    free(config_dir);
+    if (saved_ccd_copy) {
+        cbm_setenv("CLAUDE_CONFIG_DIR", saved_ccd_copy, 1);
+        free(saved_ccd_copy);
+    } else {
+        cbm_unsetenv("CLAUDE_CONFIG_DIR");
+    }
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_upsert_claude_hook_existing) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-XXXXXX");
@@ -3165,8 +3227,10 @@ SUITE(cli) {
     RUN_TEST(cli_remove_instructions);
     RUN_TEST(cli_agent_instructions_content);
 
-    /* Claude Code hooks (5 tests — group D) */
+    /* Claude Code hooks (7 tests — group D) */
     RUN_TEST(cli_hook_gate_script_no_predictable_tmp_issue384);
+    RUN_TEST(cli_hook_gate_script_rejects_overlong_home_without_truncated_parent);
+    RUN_TEST(cli_claude_hooks_reject_overlong_config_dir_command);
     RUN_TEST(cli_upsert_claude_hook_fresh);
     RUN_TEST(cli_upsert_claude_hook_existing);
     RUN_TEST(cli_upsert_claude_hook_replace);

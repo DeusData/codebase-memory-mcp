@@ -132,6 +132,37 @@ TEST(platform_default_workers_env_unset) {
     PASS();
 }
 
+TEST(platform_getenv_fits) {
+    const char *name = "CBM_TEST_GETENV_FITS";
+    char buf[8];
+    bool present = true;
+
+    cbm_unsetenv(name);
+    ASSERT_FALSE(cbm_getenv_fits(name, buf, sizeof(buf), &present));
+    ASSERT_FALSE(present);
+    ASSERT_STR_EQ(buf, "");
+
+    cbm_setenv(name, "", 1);
+    present = true;
+    ASSERT_FALSE(cbm_getenv_fits(name, buf, sizeof(buf), &present));
+    ASSERT_FALSE(present);
+    ASSERT_STR_EQ(buf, "");
+
+    cbm_setenv(name, "fits", 1);
+    ASSERT_TRUE(cbm_getenv_fits(name, buf, sizeof(buf), &present));
+    ASSERT_TRUE(present);
+    ASSERT_STR_EQ(buf, "fits");
+
+    cbm_setenv(name, "too-long-for-buffer", 1);
+    present = false;
+    ASSERT_FALSE(cbm_getenv_fits(name, buf, sizeof(buf), &present));
+    ASSERT_TRUE(present);
+    ASSERT_STR_EQ(buf, "");
+
+    cbm_unsetenv(name);
+    PASS();
+}
+
 /* ── cgroup-aware detection (Linux only) ─────────────────────────── */
 
 #ifdef __linux__
@@ -316,6 +347,7 @@ SUITE(platform) {
     RUN_TEST(platform_default_workers_env_override);
     RUN_TEST(platform_default_workers_env_invalid);
     RUN_TEST(platform_default_workers_env_unset);
+    RUN_TEST(platform_getenv_fits);
 #ifdef __linux__
     RUN_TEST(cgroup_v2_cpu_quota);
     RUN_TEST(cgroup_v2_cpu_quota_rounds_up);
