@@ -294,6 +294,29 @@ static void cascade_delete_edges(cbm_gbuf_t *gb, CBMHashTable *deleted_set) {
     gb->edges.count = write_idx;
 }
 
+static int gbuf_ht_set_flag_checked(CBMHashTable *set, const char *key) {
+    if (!set || !key) {
+        return CBM_NOT_FOUND;
+    }
+    cbm_ht_set(set, key, intptr_to_ptr(SKIP_ONE));
+    return cbm_ht_has(set, key) ? 0 : CBM_NOT_FOUND;
+}
+
+static int gbuf_deleted_set_add_node_id(cbm_gbuf_t *gb, CBMHashTable *deleted_set,
+                                        const cbm_gbuf_node_t *node) {
+    if (!gb || !deleted_set || !node) {
+        return CBM_NOT_FOUND;
+    }
+
+    char id_buf[CBM_SZ_32];
+    make_id_key(id_buf, sizeof(id_buf), node->id);
+    const char *stored_key = cbm_ht_get_key(gb->node_by_id, id_buf);
+    if (!stored_key) {
+        return CBM_NOT_FOUND;
+    }
+    return gbuf_ht_set_flag_checked(deleted_set, stored_key);
+}
+
 /* Register a node in primary (QN, ID) and secondary (label, name) indexes. */
 static void register_node_in_indexes(cbm_gbuf_t *gb, cbm_gbuf_node_t *node) {
     cbm_ht_set(gb->node_by_qn, node->qualified_name, node);
@@ -922,20 +945,26 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label) {
         return 0;
     }
 
-    /* Build hash set of deleted node IDs for O(1) lookup */
-    CBMHashTable *deleted_set = cbm_ht_create(arr->count);
+    CBMHashTable *deleted_set = cbm_ht_create((uint32_t)arr->count);
+    if (!deleted_set) {
+        return CBM_NOT_FOUND;
+    }
+
+    for (int i = 0; i < arr->count; i++) {
+        if (gbuf_deleted_set_add_node_id(gb, deleted_set, arr->items[i]) != 0) {
+            cbm_ht_free(deleted_set);
+            return CBM_NOT_FOUND;
+        }
+    }
+
     for (int i = 0; i < arr->count; i++) {
         const cbm_gbuf_node_t *n = arr->items[i];
-
         char id_buf[CBM_SZ_32];
         make_id_key(id_buf, sizeof(id_buf), n->id);
-        cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
 
         /* Remove from primary indexes */
         cbm_ht_delete(gb->node_by_qn, n->qualified_name);
-        const char *stored_key = cbm_ht_get_key(gb->node_by_id, id_buf);
         cbm_ht_delete(gb->node_by_id, id_buf);
-        free((void *)stored_key);
     }
 
     /* Clear the label array */
@@ -975,14 +1004,24 @@ int cbm_gbuf_delete_by_paths(cbm_gbuf_t *gb, const char *const *paths, int count
         return 0;
     }
 
-    CBMHashTable *path_set = cbm_ht_create((size_t)count * 32);
+    CBMHashTable *path_set = cbm_ht_create((uint32_t)count);
+    if (!path_set) {
+        return CBM_NOT_FOUND;
+    }
+
     for (int i = 0; i < count; i++) {
-        if (paths[i]) {
-            cbm_ht_set(path_set, paths[i], intptr_to_ptr(SKIP_ONE));
+        if (paths[i] && gbuf_ht_set_flag_checked(path_set, paths[i]) != 0) {
+            cbm_ht_free(path_set);
+            return CBM_NOT_FOUND;
         }
     }
 
     CBMHashTable *deleted_set = cbm_ht_create(CBM_SZ_64);
+    if (!deleted_set) {
+        cbm_ht_free(path_set);
+        return CBM_NOT_FOUND;
+    }
+
     int deleted_count = 0;
     int scanned = 0;
 
@@ -996,29 +1035,43 @@ int cbm_gbuf_delete_by_paths(cbm_gbuf_t *gb, const char *const *paths, int count
             continue;
         }
 
+        if (gbuf_deleted_set_add_node_id(gb, deleted_set, n) != 0) {
+            cbm_ht_free(path_set);
+            cbm_ht_free(deleted_set);
+            return CBM_NOT_FOUND;
+        }
+        deleted_count++;
+    }
+
+    if (deleted_count == 0) {
+        cbm_ht_free(path_set);
+        cbm_ht_free(deleted_set);
+        return 0;
+    }
+
+    for (int i = 0; i < gb->nodes.count; i++) {
+        cbm_gbuf_node_t *n = gb->nodes.items[i];
+        if (!n->qualified_name) {
+            continue;
+        }
+
         char id_buf[CBM_SZ_32];
         make_id_key(id_buf, sizeof(id_buf), n->id);
-        cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
+        if (!cbm_ht_get(deleted_set, id_buf)) {
+            continue;
+        }
 
         remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_label, n->label), n->id);
         remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_name, n->name), n->id);
 
         cbm_ht_delete(gb->node_by_qn, n->qualified_name);
-        const char *stored_key = cbm_ht_get_key(gb->node_by_id, id_buf);
         cbm_ht_delete(gb->node_by_id, id_buf);
-        free((void *)stored_key);
 
         free(n->qualified_name);
         n->qualified_name = NULL;
-        deleted_count++;
     }
 
     cbm_ht_free(path_set); /* keys borrowed from caller — not freed here */
-
-    if (deleted_count == 0) {
-        cbm_ht_free(deleted_set);
-        return 0;
-    }
 
     cascade_delete_edges(gb, deleted_set);
 

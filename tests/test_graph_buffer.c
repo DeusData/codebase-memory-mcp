@@ -195,7 +195,7 @@ TEST(gbuf_delete_by_label) {
     ASSERT_EQ(cbm_gbuf_edge_count(gb), 1);
 
     /* Delete all functions — should cascade-delete the CALLS edge */
-    cbm_gbuf_delete_by_label(gb, "Function");
+    ASSERT_EQ(cbm_gbuf_delete_by_label(gb, "Function"), 0);
     ASSERT_EQ(cbm_gbuf_node_count(gb), 1); /* only Class remains */
     ASSERT_EQ(cbm_gbuf_edge_count(gb), 0); /* edge cascade-deleted */
 
@@ -550,7 +550,7 @@ TEST(gbuf_delete_by_label_cascades_edges) {
     ASSERT_EQ(cbm_gbuf_edge_count(gb), 3);
 
     /* Delete all Class nodes — should remove fn→Cls edge only */
-    cbm_gbuf_delete_by_label(gb, "Class");
+    ASSERT_EQ(cbm_gbuf_delete_by_label(gb, "Class"), 0);
     ASSERT_EQ(cbm_gbuf_node_count(gb), 2);
     ASSERT_EQ(cbm_gbuf_edge_count(gb), 2); /* fn→meth and meth→fn survive */
 
@@ -559,6 +559,29 @@ TEST(gbuf_delete_by_label_cascades_edges) {
     int ecount = 0;
     cbm_gbuf_find_edges_by_source_type(gb, f, "CALLS", &edges, &ecount);
     ASSERT_EQ(ecount, 1); /* only fn→meth remains */
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(gbuf_delete_by_paths_cascades_edges) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t a = cbm_gbuf_upsert_node(gb, "Function", "a", "pkg.a", "a.go", 1, 5, "{}");
+    int64_t b = cbm_gbuf_upsert_node(gb, "Function", "b", "pkg.b", "b.go", 1, 5, "{}");
+    int64_t c = cbm_gbuf_upsert_node(gb, "Function", "c", "pkg.c", "c.go", 1, 5, "{}");
+    cbm_gbuf_insert_edge(gb, a, b, "CALLS", "{}");
+    cbm_gbuf_insert_edge(gb, b, c, "CALLS", "{}");
+    cbm_gbuf_insert_edge(gb, c, a, "CALLS", "{}");
+
+    const char *paths[] = {"a.go", NULL, "b.go"};
+    ASSERT_EQ(cbm_gbuf_delete_by_paths(gb, paths, (int)(sizeof(paths) / sizeof(paths[0]))), 2);
+    ASSERT_EQ(cbm_gbuf_node_count(gb), 1);
+    ASSERT_EQ(cbm_gbuf_edge_count(gb), 0);
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "pkg.a"));
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "pkg.b"));
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gb, "pkg.c"));
 
     cbm_gbuf_free(gb);
     PASS();
@@ -1320,6 +1343,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_find_by_label_no_matches);
     RUN_TEST(gbuf_find_by_name_multiple);
     RUN_TEST(gbuf_delete_by_label_cascades_edges);
+    RUN_TEST(gbuf_delete_by_paths_cascades_edges);
     RUN_TEST(gbuf_node_count_empty);
     RUN_TEST(gbuf_upsert_100_nodes_stress);
 
