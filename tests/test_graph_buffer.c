@@ -11,6 +11,8 @@
 #include "foundation/constants.h"
 #include "foundation/platform.h"
 #include "sqlite3.h"           /* vendored/sqlite3/ via -Ivendored/sqlite3 */
+#include <stdatomic.h>
+#include <string.h>
 #include <unistd.h>
 
 static int gbuf_make_temp_db(char *path, size_t pathsz) {
@@ -596,11 +598,51 @@ TEST(gbuf_upsert_100_nodes_stress) {
 
 TEST(gbuf_edge_nonexistent_endpoints) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
-    /* Edges with non-existent source/target IDs are accepted (no FK validation
-     * in the buffer — validation happens at flush time when remapping IDs) */
+    /* Edge insertion stays append-oriented; the pre-dump invariant validator
+     * owns structural endpoint checks so producers can be diagnosed together. */
     int64_t eid = cbm_gbuf_insert_edge(gb, 9999, 8888, "CALLS", "{}");
     ASSERT_GT(eid, 0);
     ASSERT_EQ(cbm_gbuf_edge_count(gb), 1);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(gbuf_validate_invariants_valid_graph) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    int64_t a = cbm_gbuf_upsert_node(gb, "Function", "a", "pkg.a", "f.go", 1, 5, "{}");
+    int64_t b = cbm_gbuf_upsert_node(gb, "Function", "b", "pkg.b", "f.go", 6, 10, "{}");
+    ASSERT_GT(a, 0);
+    ASSERT_GT(b, 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, a, b, "CALLS", "{}"), 0);
+
+    char err[CBM_SZ_256];
+    ASSERT_EQ(cbm_gbuf_validate_invariants(gb, err, sizeof(err)), 0);
+    ASSERT_STR_EQ(err, "");
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(gbuf_dump_rejects_missing_edge_endpoint) {
+    char path[256];
+    ASSERT_EQ(gbuf_make_temp_db(path, sizeof(path)), 0);
+    unlink(path);
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    int64_t a = cbm_gbuf_upsert_node(gb, "Function", "a", "pkg.a", "f.go", 1, 5, "{}");
+    ASSERT_GT(a, 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, a, 9999, "CALLS", "{}"), 0);
+
+    char err[CBM_SZ_256];
+    ASSERT_NEQ(cbm_gbuf_validate_invariants(gb, err, sizeof(err)), 0);
+    ASSERT(strstr(err, "endpoint") != NULL);
+    ASSERT_NEQ(cbm_gbuf_dump_to_sqlite(gb, path), 0);
+
+    FILE *f = fopen(path, "rb");
+    ASSERT_NULL(f);
+
     cbm_gbuf_free(gb);
     PASS();
 }
@@ -1120,7 +1162,9 @@ TEST(gbuf_dump_pipeline_path_integrity) {
 
     /* Worker gbuf: some NEW qns + some colliding qns, then merge (parallel-pipeline
      * simulation — exercises cbm_gbuf_merge + the QN-collision ID remap). */
-    cbm_gbuf_t *gw = cbm_gbuf_new("proj", "/tmp/gbuf_pipeline_root");
+    _Atomic int64_t shared_ids;
+    atomic_init(&shared_ids, cbm_gbuf_next_id(gb));
+    cbm_gbuf_t *gw = cbm_gbuf_new_shared_ids("proj", "/tmp/gbuf_pipeline_root", &shared_ids);
     ASSERT_NOT_NULL(gw);
     for (int i = 0; i < W; i++) {
         if (i % 2 == 0) {
@@ -1281,6 +1325,8 @@ SUITE(graph_buffer) {
 
     /* Edge edge cases */
     RUN_TEST(gbuf_edge_nonexistent_endpoints);
+    RUN_TEST(gbuf_validate_invariants_valid_graph);
+    RUN_TEST(gbuf_dump_rejects_missing_edge_endpoint);
     RUN_TEST(gbuf_edge_dedup_merges_properties);
     RUN_TEST(gbuf_edge_count_empty);
     RUN_TEST(gbuf_edge_count_by_type_missing);
