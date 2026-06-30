@@ -2497,6 +2497,36 @@ static bool store_index_finish_status_valid(const char *status) {
                       strcmp(status, CBM_STORE_INDEX_STATUS_FAILED) == 0);
 }
 
+static int store_finish_index_generation_body(cbm_store_t *s, const char *project,
+                                              int64_t generation, const char *status) {
+    const char *sql = "UPDATE index_generations SET completed_at = ?3, status = ?4 "
+                      "WHERE project = ?1 AND generation = ?2 AND status = ?5;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "finish_index_generation prepare");
+        return CBM_STORE_ERR;
+    }
+
+    char ts[CBM_SZ_64];
+    iso_now(ts, sizeof(ts));
+    bind_text(stmt, ST_COL_1, project);
+    sqlite3_bind_int64(stmt, ST_COL_2, generation);
+    bind_text(stmt, ST_COL_3, ts);
+    bind_text(stmt, ST_COL_4, status);
+    bind_text(stmt, ST_COL_5, CBM_STORE_INDEX_STATUS_RESERVED);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "finish_index_generation");
+        return CBM_STORE_ERR;
+    }
+    if (sqlite3_changes(s->db) != 1) {
+        store_set_error(s, "finish_index_generation: reserved generation not found");
+        return CBM_STORE_NOT_FOUND;
+    }
+    return CBM_STORE_OK;
+}
+
 int cbm_store_finish_index_generation(cbm_store_t *s, const char *project, int64_t generation,
                                       const char *status) {
     if (!s || !s->db || !project || generation <= 0 || !store_index_finish_status_valid(status)) {
@@ -2511,33 +2541,10 @@ int cbm_store_finish_index_generation(cbm_store_t *s, const char *project, int64
         return rc;
     }
 
-    const char *sql = "UPDATE index_generations SET completed_at = ?3, status = ?4 "
-                      "WHERE project = ?1 AND generation = ?2 AND status = ?5;";
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        store_set_error_sqlite(s, "finish_index_generation prepare");
+    rc = store_finish_index_generation_body(s, project, generation, status);
+    if (rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(s);
-        return CBM_STORE_ERR;
-    }
-
-    char ts[CBM_SZ_64];
-    iso_now(ts, sizeof(ts));
-    bind_text(stmt, ST_COL_1, project);
-    sqlite3_bind_int64(stmt, ST_COL_2, generation);
-    bind_text(stmt, ST_COL_3, ts);
-    bind_text(stmt, ST_COL_4, status);
-    bind_text(stmt, ST_COL_5, CBM_STORE_INDEX_STATUS_RESERVED);
-    rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    if (rc != SQLITE_DONE) {
-        store_set_error_sqlite(s, "finish_index_generation");
-        (void)cbm_store_rollback(s);
-        return CBM_STORE_ERR;
-    }
-    if (sqlite3_changes(s->db) != 1) {
-        store_set_error(s, "finish_index_generation: reserved generation not found");
-        (void)cbm_store_rollback(s);
-        return CBM_STORE_NOT_FOUND;
+        return rc;
     }
 
     rc = cbm_store_commit(s);
@@ -2730,6 +2737,35 @@ static bool store_file_delta_shape_valid(const cbm_store_file_delta_t *delta) {
     return store_file_delta_contract_valid(delta);
 }
 
+static bool store_file_delta_batch_shape_valid(const cbm_store_file_delta_t *const *deltas,
+                                               int delta_count, const char **out_project,
+                                               int64_t *out_generation) {
+    if (!deltas || delta_count <= 0) {
+        return false;
+    }
+    const char *project = NULL;
+    int64_t generation = -1;
+    for (int i = 0; i < delta_count; i++) {
+        const cbm_store_file_delta_t *delta = deltas[i];
+        if (!store_file_delta_shape_valid(delta)) {
+            return false;
+        }
+        if (!project) {
+            project = delta->project;
+            generation = delta->generation;
+        } else if (strcmp(project, delta->project) != 0 || generation != delta->generation) {
+            return false;
+        }
+    }
+    if (out_project) {
+        *out_project = project;
+    }
+    if (out_generation) {
+        *out_generation = generation;
+    }
+    return true;
+}
+
 int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *delta) {
     if (!s || !store_file_delta_shape_valid(delta)) {
         return CBM_STORE_ERR;
@@ -2755,23 +2791,8 @@ int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *d
 int cbm_store_publish_file_delta_batch(cbm_store_t *s,
                                        const cbm_store_file_delta_t *const *deltas,
                                        int delta_count) {
-    if (!s || !deltas || delta_count <= 0) {
+    if (!s || !store_file_delta_batch_shape_valid(deltas, delta_count, NULL, NULL)) {
         return CBM_STORE_ERR;
-    }
-
-    const char *project = NULL;
-    int64_t generation = -1;
-    for (int i = 0; i < delta_count; i++) {
-        const cbm_store_file_delta_t *delta = deltas[i];
-        if (!store_file_delta_shape_valid(delta)) {
-            return CBM_STORE_ERR;
-        }
-        if (!project) {
-            project = delta->project;
-            generation = delta->generation;
-        } else if (strcmp(project, delta->project) != 0 || generation != delta->generation) {
-            return CBM_STORE_ERR;
-        }
     }
 
     int rc = cbm_store_begin(s);
@@ -2784,6 +2805,40 @@ int cbm_store_publish_file_delta_batch(cbm_store_t *s,
             (void)cbm_store_rollback(s);
             return rc;
         }
+    }
+    rc = cbm_store_commit(s);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_publish_file_delta_batch_complete(cbm_store_t *s,
+                                                const cbm_store_file_delta_t *const *deltas,
+                                                int delta_count) {
+    const char *project = NULL;
+    int64_t generation = -1;
+    if (!s || !store_file_delta_batch_shape_valid(deltas, delta_count, &project, &generation) ||
+        generation <= 0) {
+        return CBM_STORE_ERR;
+    }
+
+    int rc = cbm_store_begin(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    for (int i = 0; i < delta_count; i++) {
+        rc = store_publish_file_delta_body(s, deltas[i]);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(s);
+            return rc;
+        }
+    }
+    rc = store_finish_index_generation_body(s, project, generation, CBM_STORE_INDEX_STATUS_COMPLETE);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
     }
     rc = cbm_store_commit(s);
     if (rc != CBM_STORE_OK) {
