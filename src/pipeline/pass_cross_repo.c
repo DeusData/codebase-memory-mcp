@@ -10,7 +10,7 @@
  * get a CROSS_* edge so the link is visible from either side.
  */
 #include "pipeline/pass_cross_repo.h"
-#include "pipeline/pipeline_internal.h" // cbm_route_canon_path
+#include "pipeline/pipeline_internal.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
@@ -29,7 +29,6 @@
 
 enum {
     CR_PATH_BUF = 1024,
-    CR_QN_BUF = 512,
     CR_PROPS_BUF = 2048,
     CR_MAX_EDGES = 4096,
     CR_DB_EXT_LEN = 3, /* strlen(".db") */
@@ -288,13 +287,14 @@ static int match_http_routes(cbm_store_t *src_store, const char *src_project,
             continue;
         }
 
-        /* Build the expected Route QN in the target project (param-canonicalized
-         * so client url_path matches the server handler regardless of framework
-         * placeholder syntax). */
-        char route_qn[CR_QN_BUF];
-        char cpath[CBM_SZ_256];
-        const char *curl = cbm_route_canon_path(url_path, cpath, sizeof(cpath));
-        snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method[0] ? method : "ANY", curl);
+        char route_qn[CBM_ROUTE_QN_SIZE];
+        char route_props[CBM_SZ_256];
+        if (!cbm_pipeline_build_service_route_identity(url_path, CBM_SVC_HTTP,
+                                                       method[0] ? method : NULL, NULL, NULL,
+                                                       route_qn, sizeof(route_qn), route_props,
+                                                       sizeof(route_props))) {
+            continue;
+        }
 
         char handler_name[CBM_SZ_256] = {0};
         char handler_file[CBM_SZ_512] = {0};
@@ -303,7 +303,11 @@ static int match_http_routes(cbm_store_t *src_store, const char *src_project,
                                handler_file, sizeof(handler_file));
         if (handler_id == 0) {
             /* Try without method (ANY) */
-            snprintf(route_qn, sizeof(route_qn), "__route__ANY__%s", curl);
+            if (!cbm_pipeline_build_service_route_identity(
+                    url_path, CBM_SVC_HTTP, NULL, NULL, NULL, route_qn, sizeof(route_qn),
+                    route_props, sizeof(route_props))) {
+                continue;
+            }
             handler_id = find_route_handler(tgt_store, route_qn, handler_name, sizeof(handler_name),
                                             handler_file, sizeof(handler_file));
         }
@@ -353,9 +357,14 @@ static int match_async_routes(cbm_store_t *src_store, const char *src_project,
             continue;
         }
 
-        char route_qn[CR_QN_BUF];
-        snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", broker[0] ? broker : "async",
-                 url_path);
+        char route_qn[CBM_ROUTE_QN_SIZE];
+        char route_props[CBM_SZ_256];
+        if (!cbm_pipeline_build_service_route_identity(url_path, CBM_SVC_ASYNC, NULL,
+                                                       broker[0] ? broker : NULL, NULL, route_qn,
+                                                       sizeof(route_qn), route_props,
+                                                       sizeof(route_props))) {
+            continue;
+        }
 
         char handler_name[CBM_SZ_256] = {0};
         char handler_file[CBM_SZ_512] = {0};
@@ -533,7 +542,7 @@ static int match_typed_routes(cbm_store_t *src_store, const char *src_project,
         }
 
         /* Look up the Route QN from the target node (already points to the Route). */
-        char route_qn[CR_QN_BUF] = {0};
+        char route_qn[CBM_ROUTE_QN_SIZE] = {0};
         if (!lookup_node_qn(src_db, route_id, route_qn, sizeof(route_qn))) {
             continue;
         }

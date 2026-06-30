@@ -33,6 +33,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #include "foundation/compat_thread.h"
 #include "foundation/profile.h"
 #include "foundation/mem.h"
+#include "foundation/str_util.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -610,8 +611,13 @@ static int process_one_infra_binding(cbm_gbuf_t *gbuf, const CBMInfraBinding *ib
     int64_t url_route_id = cbm_gbuf_upsert_node(gbuf, "Route", ib->target_url, url_route_qn,
                                                 rel_path, 0, 0, "{\"source\":\"infra\"}");
     char topic_route_qn[CBM_ROUTE_QN_SIZE];
-    snprintf(topic_route_qn, sizeof(topic_route_qn), "__route__%s__%s",
-             ib->broker ? ib->broker : "async", ib->source_name);
+    char topic_route_props[CBM_SZ_256];
+    if (!cbm_pipeline_build_service_route_identity(ib->source_name, CBM_SVC_ASYNC, NULL,
+                                                   ib->broker, "infra", topic_route_qn,
+                                                   sizeof(topic_route_qn), topic_route_props,
+                                                   sizeof(topic_route_props))) {
+        return 0;
+    }
     const cbm_gbuf_node_t *topic_route = cbm_gbuf_find_by_qn(gbuf, topic_route_qn);
     int64_t topic_route_id;
     if (topic_route) {
@@ -622,14 +628,21 @@ static int process_one_infra_binding(cbm_gbuf_t *gbuf, const CBMInfraBinding *ib
          * call created the node first (e.g. a standalone scheduler/subscription
          * manifest). */
         topic_route_id = cbm_gbuf_upsert_node(gbuf, "Route", ib->source_name, topic_route_qn,
-                                              rel_path, 0, 0, ib->broker ? ib->broker : "async");
+                                              rel_path, 0, 0, topic_route_props);
         if (topic_route_id <= 0) {
             return 0;
         }
     }
     char props[CBM_SZ_512];
+    char esc_broker[CBM_SZ_128];
+    char esc_topic[CBM_SZ_256];
+    char esc_endpoint[CBM_SZ_256];
+    cbm_json_escape(esc_broker, sizeof(esc_broker),
+                    ib->broker ? ib->broker : CBM_ROUTE_DEFAULT_ASYNC_BROKER);
+    cbm_json_escape(esc_topic, sizeof(esc_topic), ib->source_name);
+    cbm_json_escape(esc_endpoint, sizeof(esc_endpoint), ib->target_url);
     snprintf(props, sizeof(props), "{\"broker\":\"%s\",\"topic\":\"%s\",\"endpoint\":\"%s\"}",
-             ib->broker ? ib->broker : "async", ib->source_name, ib->target_url);
+             esc_broker, esc_topic, esc_endpoint);
     cbm_gbuf_insert_edge(gbuf, topic_route_id, url_route_id, "INFRA_MAPS", props);
     return SKIP_ONE;
 }

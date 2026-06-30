@@ -451,16 +451,14 @@ static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info
     ws->nodes_created++;
     if (def->route_path && def->route_path[0] != '\0' &&
         cbm_service_pattern_is_http_route_literal(def->route_path, NULL)) {
-        const char *rm = def->route_method ? def->route_method : "ANY";
-        char route_qn[CBM_ROUTE_QN_SIZE];
-        char cpath[CBM_SZ_256];
-        snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", rm,
-                 cbm_route_canon_path(def->route_path, cpath, sizeof(cpath)));
-        char rprops[CBM_SZ_256];
-        snprintf(rprops, sizeof(rprops), "{\"method\":\"%s\",\"source\":\"decorator\"}", rm);
+        const char *rm = def->route_method ? def->route_method : CBM_ROUTE_DEFAULT_METHOD;
         int64_t route_id =
-            cbm_gbuf_upsert_node(ws->local_gbuf, "Route", def->route_path, route_qn,
-                                 def->file_path ? def->file_path : fi->rel_path, 0, 0, rprops);
+            cbm_pipeline_upsert_service_route(ws->local_gbuf, def->route_path, CBM_SVC_HTTP, rm,
+                                              NULL, "decorator",
+                                              def->file_path ? def->file_path : fi->rel_path);
+        if (route_id == 0) {
+            return;
+        }
         char hprops[CBM_SZ_512];
         char esc_h[CBM_SZ_512];
         cbm_json_escape(esc_h, sizeof(esc_h), def->qualified_name);
@@ -1181,31 +1179,6 @@ static void finalize_and_emit(cbm_gbuf_t *gbuf, int64_t src_id, int64_t tgt_id,
     cbm_gbuf_insert_edge(gbuf, src_id, tgt_id, edge_type, props);
 }
 
-/* Build Route node QN and properties for HTTP/async service edges. */
-static int64_t build_service_route(cbm_gbuf_t *gbuf, const char *arg, const char *method,
-                                   const char *broker, cbm_svc_kind_t svc) {
-    char route_qn[CBM_ROUTE_QN_SIZE];
-    const char *prefix;
-    char cpath[CBM_SZ_256];
-    const char *qpath = arg;
-    if (svc == CBM_SVC_HTTP) {
-        prefix = method ? method : "ANY";
-        qpath = cbm_route_canon_path(arg, cpath, sizeof(cpath));
-    } else {
-        prefix = broker ? broker : "async";
-    }
-    snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", prefix, qpath);
-    char route_props[CBM_SZ_256];
-    if (method) {
-        snprintf(route_props, sizeof(route_props), "{\"method\":\"%s\"}", method);
-    } else if (broker) {
-        snprintf(route_props, sizeof(route_props), "{\"broker\":\"%s\"}", broker);
-    } else {
-        snprintf(route_props, sizeof(route_props), "{}");
-    }
-    return cbm_gbuf_upsert_node(gbuf, "Route", arg, route_qn, "", 0, 0, route_props);
-}
-
 /* Emit HTTP_CALLS or ASYNC_CALLS edge via Route node. */
 static void emit_http_async_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                                          const CBMCall *call, const cbm_resolution_t *res,
@@ -1221,7 +1194,11 @@ static void emit_http_async_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t
         return;
     }
 
-    int64_t route_id = build_service_route(gbuf, arg, method, broker, svc);
+    int64_t route_id =
+        cbm_pipeline_upsert_service_route(gbuf, arg, svc, method, broker, NULL, NULL);
+    if (route_id == 0) {
+        return;
+    }
 
     char esc_c[CBM_SZ_256];
     char esc_a[CBM_SZ_256];
@@ -1278,13 +1255,11 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
     if (!cbm_service_pattern_is_http_route_literal(route_path, call->callee_name)) {
         return;
     }
-    char rqn[CBM_ROUTE_QN_SIZE];
-    char cpath[CBM_SZ_256];
-    snprintf(rqn, sizeof(rqn), "__route__%s__%s", method ? method : "ANY",
-             cbm_route_canon_path(route_path, cpath, sizeof(cpath)));
-    char rp[CBM_SZ_256];
-    snprintf(rp, sizeof(rp), "{\"method\":\"%s\"}", method ? method : "ANY");
-    int64_t rid = cbm_gbuf_upsert_node(gbuf, "Route", route_path, rqn, "", 0, 0, rp);
+    int64_t rid =
+        cbm_pipeline_upsert_service_route(gbuf, route_path, CBM_SVC_HTTP, method, NULL, NULL, NULL);
+    if (rid == 0) {
+        return;
+    }
     char esc_cn[CBM_SZ_256]; /* sliced source text: escape quotes/newlines */
     char esc_rp[CBM_SZ_512];
     cbm_json_escape(esc_cn, sizeof(esc_cn), call->callee_name);
@@ -1380,13 +1355,11 @@ static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, 
         if (!cbm_service_pattern_is_http_route_literal(norm, call->callee_name)) {
             continue;
         }
-        char route_qn[CBM_ROUTE_QN_SIZE];
-        char cpath[CBM_SZ_256];
-        snprintf(route_qn, sizeof(route_qn), "__route__ANY__%s",
-                 cbm_route_canon_path(norm, cpath, sizeof(cpath)));
-        int64_t route_id = cbm_gbuf_upsert_node(gbuf, "Route", norm, route_qn,
-                                                source_path ? source_path : "", 0, 0,
-                                                "{\"source\":\"arg_url\"}");
+        int64_t route_id = cbm_pipeline_upsert_service_route(
+            gbuf, norm, CBM_SVC_HTTP, NULL, NULL, "arg_url", source_path ? source_path : "");
+        if (route_id == 0) {
+            continue;
+        }
         char esc_c[CBM_SZ_256];
         char esc_n[CBM_SZ_256];
         cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);

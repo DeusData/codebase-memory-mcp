@@ -99,14 +99,11 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
     if (!cbm_service_pattern_is_http_route_literal(call->first_string_arg, call->callee_name)) {
         return;
     }
-    char route_qn[CBM_ROUTE_QN_SIZE];
-    char cpath[CBM_SZ_256];
-    snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method ? method : "ANY",
-             cbm_route_canon_path(call->first_string_arg, cpath, sizeof(cpath)));
-    char route_props[CBM_SZ_256];
-    snprintf(route_props, sizeof(route_props), "{\"method\":\"%s\"}", method ? method : "ANY");
-    int64_t route_id = cbm_gbuf_upsert_node(ctx->gbuf, "Route", call->first_string_arg, route_qn,
-                                            "", 0, 0, route_props);
+    int64_t route_id = cbm_pipeline_upsert_service_route(
+        ctx->gbuf, call->first_string_arg, CBM_SVC_HTTP, method, NULL, NULL, NULL);
+    if (route_id == 0) {
+        return;
+    }
     char esc_cn[CBM_SZ_256]; /* sliced source text: escape quotes/newlines */
     char esc_fa[CBM_SZ_256];
     cbm_json_escape(esc_cn, sizeof(esc_cn), call->callee_name);
@@ -131,30 +128,6 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
             }
         }
     }
-}
-
-/* Emit an HTTP/async route edge for a service call. */
-/* Build route QN and upsert Route node for HTTP/async edge. */
-static int64_t create_svc_route_node(cbm_pipeline_ctx_t *ctx, const char *url, cbm_svc_kind_t svc,
-                                     const char *method, const char *broker) {
-    char route_qn[CBM_ROUTE_QN_SIZE];
-    const char *prefix;
-    char cpath[CBM_SZ_256];
-    const char *qpath = url;
-    if (svc == CBM_SVC_HTTP) {
-        prefix = method ? method : "ANY";
-        qpath = cbm_route_canon_path(url, cpath, sizeof(cpath));
-    } else {
-        prefix = broker ? broker : "async";
-    }
-    snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", prefix, qpath);
-    const char *rp;
-    if (svc == CBM_SVC_HTTP) {
-        rp = method ? method : "{}";
-    } else {
-        rp = broker ? broker : "{}";
-    }
-    return cbm_gbuf_upsert_node(ctx->gbuf, "Route", url, route_qn, "", 0, 0, rp);
 }
 
 /* Insert an edge, splicing the call-site line (,"line":N) in before the closing
@@ -209,7 +182,11 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         (svc == CBM_SVC_HTTP) ? cbm_service_pattern_http_method(call->callee_name) : NULL;
     const char *broker =
         (svc == CBM_SVC_ASYNC) ? cbm_service_pattern_broker(res->qualified_name) : NULL;
-    int64_t route_id = create_svc_route_node(ctx, url_or_topic, svc, method, broker);
+    int64_t route_id = cbm_pipeline_upsert_service_route(ctx->gbuf, url_or_topic, svc, method,
+                                                         broker, NULL, NULL);
+    if (route_id == 0) {
+        return;
+    }
     char esc_callee[CBM_SZ_256];
     char esc_url[CBM_SZ_256];
     cbm_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
