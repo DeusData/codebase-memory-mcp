@@ -157,6 +157,7 @@ int main(void) {
         if (strstr("sqlite_writer", only_suite)) RUN_SUITE(sqlite_writer);
         if (strstr("graph_buffer", only_suite)) RUN_SUITE(graph_buffer);
         if (strstr("pagerank", only_suite)) RUN_SUITE(pagerank);
+        if (strstr("c_lsp", only_suite)) RUN_SUITE(c_lsp);
         if (strstr("depindex", only_suite)) RUN_SUITE(depindex);
         if (strstr("token_reduction", only_suite)) RUN_SUITE(token_reduction);
         if (strstr("input_validation", only_suite)) RUN_SUITE(input_validation);
