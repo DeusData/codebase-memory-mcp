@@ -2492,6 +2492,62 @@ int cbm_store_reserve_index_generation(cbm_store_t *s, const char *project,
     return CBM_STORE_OK;
 }
 
+static bool store_index_finish_status_valid(const char *status) {
+    return status && (strcmp(status, CBM_STORE_INDEX_STATUS_COMPLETE) == 0 ||
+                      strcmp(status, CBM_STORE_INDEX_STATUS_FAILED) == 0);
+}
+
+int cbm_store_finish_index_generation(cbm_store_t *s, const char *project, int64_t generation,
+                                      const char *status) {
+    if (!s || !s->db || !project || generation <= 0 || !store_index_finish_status_valid(status)) {
+        if (s) {
+            store_set_error(s, "finish_index_generation: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    int rc = cbm_store_begin(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    const char *sql = "UPDATE index_generations SET completed_at = ?3, status = ?4 "
+                      "WHERE project = ?1 AND generation = ?2 AND status = ?5;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "finish_index_generation prepare");
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+
+    char ts[CBM_SZ_64];
+    iso_now(ts, sizeof(ts));
+    bind_text(stmt, ST_COL_1, project);
+    sqlite3_bind_int64(stmt, ST_COL_2, generation);
+    bind_text(stmt, ST_COL_3, ts);
+    bind_text(stmt, ST_COL_4, status);
+    bind_text(stmt, ST_COL_5, CBM_STORE_INDEX_STATUS_RESERVED);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "finish_index_generation");
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+    if (sqlite3_changes(s->db) != 1) {
+        store_set_error(s, "finish_index_generation: reserved generation not found");
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_NOT_FOUND;
+    }
+
+    rc = cbm_store_commit(s);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    return CBM_STORE_OK;
+}
+
 static int store_resolve_node_id(cbm_store_t *s, const char *project, const char *qn,
                                  int64_t *out_id) {
     const char *qns[1] = {qn};

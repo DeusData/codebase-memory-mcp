@@ -23,18 +23,24 @@ enum {
     STORE_TEST_BIND_STATUS = 3,
     STORE_TEST_BIND_REPO_FINGERPRINT = 4,
     STORE_TEST_BIND_CONFIG_FINGERPRINT = 5,
+    STORE_TEST_BIND_COMPLETED_STATE = 6,
+};
+enum {
+    STORE_TEST_COMPLETED_NULL = 0,
+    STORE_TEST_COMPLETED_SET = 1,
 };
 
 static int store_count_index_generation(cbm_store_t *s, const char *project, int64_t generation,
                                         const char *status, const char *repo_fingerprint,
-                                        const char *config_fingerprint) {
+                                        const char *config_fingerprint, int completed_state) {
     sqlite3_stmt *stmt = NULL;
     int count = CBM_STORE_ERR;
     sqlite3 *db = cbm_store_get_db(s);
     const char *sql = "SELECT COUNT(*) FROM index_generations "
                       "WHERE project = ?1 AND generation = ?2 AND status = ?3 "
                       "AND repo_fingerprint = ?4 AND config_fingerprint = ?5 "
-                      "AND completed_at IS NULL AND started_at <> ''";
+                      "AND ((?6 = 0 AND completed_at IS NULL) OR "
+                      "(?6 = 1 AND completed_at IS NOT NULL)) AND started_at <> ''";
     if (!db || sqlite3_prepare_v2(db, sql, STORE_TEST_SQLITE_AUTO_LEN, &stmt, NULL) !=
                    SQLITE_OK) {
         return CBM_STORE_ERR;
@@ -48,6 +54,7 @@ static int store_count_index_generation(cbm_store_t *s, const char *project, int
                       STORE_TEST_SQLITE_AUTO_LEN, SQLITE_STATIC);
     sqlite3_bind_text(stmt, STORE_TEST_BIND_CONFIG_FINGERPRINT, config_fingerprint,
                       STORE_TEST_SQLITE_AUTO_LEN, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, STORE_TEST_BIND_COMPLETED_STATE, completed_state);
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         count = sqlite3_column_int(stmt, 0);
     }
@@ -739,14 +746,15 @@ TEST(store_index_generation_reservation_monotonic) {
     ASSERT_EQ(generation, FIRST_GENERATION);
     ASSERT_EQ(store_count_index_generation(s, "test", FIRST_GENERATION,
                                            CBM_STORE_INDEX_STATUS_RESERVED, "repo-a",
-                                           "config-a"),
+                                           "config-a", STORE_TEST_COMPLETED_NULL),
               1);
 
     ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", NULL, NULL, &generation),
               CBM_STORE_OK);
     ASSERT_EQ(generation, SECOND_GENERATION);
     ASSERT_EQ(store_count_index_generation(s, "test", SECOND_GENERATION,
-                                           CBM_STORE_INDEX_STATUS_RESERVED, "", ""),
+                                           CBM_STORE_INDEX_STATUS_RESERVED, "", "",
+                                           STORE_TEST_COMPLETED_NULL),
               1);
 
     cbm_store_close(s);
@@ -764,8 +772,68 @@ TEST(store_index_generation_reservation_requires_project) {
               CBM_STORE_ERR);
     ASSERT_EQ(generation, NO_RESERVED_GENERATION);
     ASSERT_EQ(store_count_index_generation(s, "missing", FIRST_GENERATION,
-                                           CBM_STORE_INDEX_STATUS_RESERVED, "repo-a", "config-a"),
+                                           CBM_STORE_INDEX_STATUS_RESERVED, "repo-a", "config-a",
+                                           STORE_TEST_COMPLETED_NULL),
               0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_index_generation_finish_complete) {
+    enum { FIRST_GENERATION = 1 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", "repo-a", "config-a", &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, FIRST_GENERATION);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, "test", generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+    ASSERT_EQ(store_count_index_generation(s, "test", FIRST_GENERATION,
+                                           CBM_STORE_INDEX_STATUS_COMPLETE, "repo-a",
+                                           "config-a", STORE_TEST_COMPLETED_SET),
+              1);
+    ASSERT_EQ(store_count_index_generation(s, "test", FIRST_GENERATION,
+                                           CBM_STORE_INDEX_STATUS_RESERVED, "repo-a",
+                                           "config-a", STORE_TEST_COMPLETED_NULL),
+              0);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, "test", generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_NOT_FOUND);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_index_generation_finish_failed_and_invalid_status) {
+    enum { FIRST_GENERATION = 1 };
+    const char *invalid_status = "invalid-status";
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, FIRST_GENERATION);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, "test", generation, invalid_status),
+              CBM_STORE_ERR);
+    ASSERT_EQ(store_count_index_generation(s, "test", FIRST_GENERATION,
+                                           CBM_STORE_INDEX_STATUS_RESERVED, "", "",
+                                           STORE_TEST_COMPLETED_NULL),
+              1);
+
+    ASSERT_EQ(cbm_store_finish_index_generation(s, "test", generation,
+                                                CBM_STORE_INDEX_STATUS_FAILED),
+              CBM_STORE_OK);
+    ASSERT_EQ(store_count_index_generation(s, "test", FIRST_GENERATION,
+                                           CBM_STORE_INDEX_STATUS_FAILED, "", "",
+                                           STORE_TEST_COMPLETED_SET),
+              1);
 
     cbm_store_close(s);
     PASS();
@@ -2335,6 +2403,8 @@ SUITE(store_nodes) {
     RUN_TEST(store_file_state_crud);
     RUN_TEST(store_index_generation_reservation_monotonic);
     RUN_TEST(store_index_generation_reservation_requires_project);
+    RUN_TEST(store_index_generation_finish_complete);
+    RUN_TEST(store_index_generation_finish_failed_and_invalid_status);
     RUN_TEST(store_owner_metadata_crud);
     RUN_TEST(store_import_export_metadata_crud);
     RUN_TEST(store_file_delta_affected_paths_from_exports_and_imports);
