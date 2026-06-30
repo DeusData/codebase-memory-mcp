@@ -111,6 +111,10 @@ static void add_pagerank_val(yyjson_mut_doc *doc, yyjson_mut_val *obj, double v)
  * Configurable via config key "snippet_max_lines". */
 #define CBM_DEFAULT_SNIPPET_MAX_LINES 200
 #define CBM_CONFIG_SNIPPET_MAX_LINES "snippet_max_lines"
+enum {
+    CBM_SNIPPET_HEAD_PERCENT = 60,
+    CBM_SNIPPET_PERCENT_DENOMINATOR = 100,
+};
 
 /* Default max BFS results for trace_path per direction.
  * Configurable via config key "trace_max_results". */
@@ -5037,31 +5041,26 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
             }
         }
         if (path_ok) {
-
-                if (mode && strcmp(mode, "signature") == 0) {
-            /* Signature mode: no source read — use properties only */
-            truncated = true;
-        } else if (mode && strcmp(mode, "head_tail") == 0 && max_lines > 0 &&
-                   total_lines > max_lines) {
-            /* Head+tail mode: read first 60% (signature/setup) and last 40%
-             * (return/cleanup). Middle implementation detail is omitted. */
-            int head_count = (max_lines * 60) / 100;
-            int tail_count = max_lines - head_count;
-            if (head_count < 1) head_count = 1;
-            if (tail_count < 1) tail_count = 1;
-            source = read_file_lines(abs_path, start, start + head_count - 1);
-            source_tail = read_file_lines(abs_path, end - tail_count + 1, end);
-            truncated = true;
-        } else if (max_lines > 0 && total_lines > max_lines) {
-            /* Full mode with truncation */
-            end = start + max_lines - 1;
-            source = read_file_lines(abs_path, start, end);
-            truncated = true;
-        } else {
-            /* Full mode, no truncation needed */
-            source = read_file_lines(abs_path, start, end);
-        }
-    }   /* end if (path_ok) */
+            if (mode && strcmp(mode, "signature") == 0) {
+                truncated = true;
+            } else if (mode && strcmp(mode, "head_tail") == 0 && max_lines > 0 &&
+                       total_lines > max_lines) {
+                int head_count = (max_lines * CBM_SNIPPET_HEAD_PERCENT) /
+                                 CBM_SNIPPET_PERCENT_DENOMINATOR;
+                int tail_count = max_lines - head_count;
+                if (head_count < 1) head_count = 1;
+                if (tail_count < 1) tail_count = 1;
+                source = read_file_lines(abs_path, start, start + head_count - 1);
+                source_tail = read_file_lines(abs_path, end - tail_count + 1, end);
+                truncated = true;
+            } else if (max_lines > 0 && total_lines > max_lines) {
+                end = start + max_lines - 1;
+                source = read_file_lines(abs_path, start, end);
+                truncated = true;
+            } else {
+                source = read_file_lines(abs_path, start, end);
+            }
+        }   /* end if (path_ok) */
     }   /* end if (root_path && node->file_path) */
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -5153,8 +5152,13 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
                     }
                     if (yyjson_is_str(val)) {
                         const char *sv = yyjson_get_str(val);
-                        if (sv && sv[0])
-                            yyjson_mut_obj_add_str(doc, root_obj, k, sv);
+                        if (sv && sv[0]) {
+                            if (strcmp(k, "source") == 0) {
+                                yyjson_mut_obj_add_str(doc, root_obj, "property_source", sv);
+                            } else {
+                                yyjson_mut_obj_add_str(doc, root_obj, k, sv);
+                            }
+                        }
                     } else if (yyjson_is_bool(val)) {
                         bool bv = yyjson_get_bool(val);
                         /* compact: omit false booleans (false = absent/default) */
@@ -5209,9 +5213,9 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
         yyjson_mut_obj_add_val(doc, root_obj, "alternatives", arr);
     }
 
-    /* Provenance tagging: mark if snippet is from a dependency */
+    /* Provenance tagging: keep "source" reserved for the code body. */
     bool snippet_dep = cbm_is_dep_project(node->project, srv->session_project);
-    yyjson_mut_obj_add_str(doc, root_obj, "source",
+    yyjson_mut_obj_add_str(doc, root_obj, "source_origin",
                            snippet_dep ? "dependency" : "project");
     if (snippet_dep) {
         yyjson_mut_obj_add_bool(doc, root_obj, "read_only", true);
@@ -5275,6 +5279,18 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
             "{\"error\":\"qualified_name is required\","
             "\"hint\":\"Pass a symbol qualified name, e.g. {\\\"qualified_name\\\":\\\"myapp.src.main.handle_request\\\"}. "
             "Use search_graph to find qualified names.\"}", true);
+    }
+
+    if (snippet_mode && strcmp(snippet_mode, "full") != 0 &&
+        strcmp(snippet_mode, "signature") != 0 && strcmp(snippet_mode, "head_tail") != 0) {
+        char errbuf[256];
+        snprintf(errbuf, sizeof(errbuf),
+            "{\"error\":\"invalid mode '%s'\","
+            "\"hint\":\"Valid values: full, signature, head_tail\"}", snippet_mode);
+        free(qn);
+        free(project);
+        free(snippet_mode);
+        return cbm_mcp_text_result(errbuf, true);
     }
 
     REQUIRE_STORE_EX(store, project, (free(qn), free(snippet_mode), qn = NULL, snippet_mode = NULL));

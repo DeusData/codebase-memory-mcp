@@ -844,7 +844,7 @@ TEST(test_trace_results_have_source_field) {
     PASS();
 }
 
-TEST(test_snippet_has_source_field) {
+TEST(test_snippet_has_source_origin_field) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_dep_query_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
@@ -856,7 +856,7 @@ TEST(test_snippet_has_source_field) {
     free(raw);
     ASSERT_NOT_NULL(resp);
 
-    ASSERT_NOT_NULL(strstr(resp, "\"source\":\"project\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"source_origin\":\"project\""));
 
     free(resp);
     cbm_mcp_server_free(srv);
@@ -930,6 +930,6 @@ SUITE(depindex) {
 
     /* Trace and snippet source tagging */
     RUN_TEST(test_trace_results_have_source_field);
-    RUN_TEST(test_snippet_has_source_field);
+    RUN_TEST(test_snippet_has_source_origin_field);
     RUN_TEST(test_cross_edges_null_safety);
 }
