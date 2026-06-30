@@ -4909,28 +4909,77 @@ static int arch_file_tree(cbm_store_t *s, const char *project, const char *path,
 
 /* Build deduplicated, normalized edge weight arrays from raw edges.
  * Returns total number of unique edges in *out_wn. */
-/* Find the index of a node ID in the nodes array, or -1. */
-static int louvain_node_index(const int64_t *nodes, int n, int64_t id) {
-    for (int i = 0; i < n; i++) {
-        if (nodes[i] == id) {
-            return i;
-        }
+typedef struct {
+    int64_t id;
+    int index;
+} cbm_louvain_node_ref_t;
+
+typedef struct {
+    int src;
+    int dst;
+} cbm_louvain_pair_t;
+
+static int louvain_node_ref_cmp(const void *a, const void *b) {
+    const cbm_louvain_node_ref_t *ra = a;
+    const cbm_louvain_node_ref_t *rb = b;
+    if (ra->id != rb->id) {
+        return (ra->id > rb->id) - (ra->id < rb->id);
     }
-    return CBM_NOT_FOUND;
+    return (ra->index > rb->index) - (ra->index < rb->index);
+}
+
+static int louvain_node_ref_key_cmp(const void *key, const void *el) {
+    int64_t id = *(const int64_t *)key;
+    const cbm_louvain_node_ref_t *ref = el;
+    return (id > ref->id) - (id < ref->id);
+}
+
+static int louvain_pair_cmp(const void *a, const void *b) {
+    const cbm_louvain_pair_t *pa = a;
+    const cbm_louvain_pair_t *pb = b;
+    if (pa->src != pb->src) {
+        return (pa->src > pb->src) - (pa->src < pb->src);
+    }
+    return (pa->dst > pb->dst) - (pa->dst < pb->dst);
+}
+
+static int louvain_node_index(const cbm_louvain_node_ref_t *refs, int n, int64_t id) {
+    const cbm_louvain_node_ref_t *hit =
+        bsearch(&id, refs, (size_t)n, sizeof(cbm_louvain_node_ref_t), louvain_node_ref_key_cmp);
+    if (!hit) {
+        return CBM_NOT_FOUND;
+    }
+    while (hit > refs && (hit - 1)->id == id) {
+        hit--;
+    }
+    return hit->index;
 }
 
 static void louvain_build_weights(const int64_t *nodes, int n, const cbm_louvain_edge_t *edges,
                                   int edge_count, int **out_wsi, int **out_wdi, double **out_ww,
                                   int *out_wn) {
-    int wcap = edge_count > 0 ? edge_count : SKIP_ONE;
-    int wn = 0;
-    int *wsi = malloc(wcap * sizeof(int));
-    int *wdi = malloc(wcap * sizeof(int));
-    double *ww = malloc(wcap * sizeof(double));
+    cbm_louvain_node_ref_t *refs = malloc((size_t)n * sizeof(cbm_louvain_node_ref_t));
+    cbm_louvain_pair_t *pairs =
+        malloc((size_t)(edge_count > 0 ? edge_count : SKIP_ONE) * sizeof(cbm_louvain_pair_t));
+    if (!refs || !pairs) {
+        free(refs);
+        free(pairs);
+        *out_wsi = NULL;
+        *out_wdi = NULL;
+        *out_ww = NULL;
+        *out_wn = 0;
+        return;
+    }
 
+    for (int i = 0; i < n; i++) {
+        refs[i] = (cbm_louvain_node_ref_t){nodes[i], i};
+    }
+    qsort(refs, (size_t)n, sizeof(cbm_louvain_node_ref_t), louvain_node_ref_cmp);
+
+    int pair_count = 0;
     for (int e = 0; e < edge_count; e++) {
-        int si = louvain_node_index(nodes, n, edges[e].src);
-        int di = louvain_node_index(nodes, n, edges[e].dst);
+        int si = louvain_node_index(refs, n, edges[e].src);
+        int di = louvain_node_index(refs, n, edges[e].dst);
         if (si < 0 || di < 0 || si == di) {
             continue;
         }
@@ -4939,28 +4988,43 @@ static void louvain_build_weights(const int64_t *nodes, int n, const cbm_louvain
             si = di;
             di = tmp;
         }
-        int found = ST_FOUND;
-        for (int i = 0; i < wn; i++) {
-            if (wsi[i] == si && wdi[i] == di) {
-                found = i;
-                break;
-            }
-        }
-        if (found >= 0) {
-            ww[found] += (double)SKIP_ONE;
-        } else {
-            if (wn >= wcap) {
-                wcap *= ST_GROWTH;
-                wsi = safe_realloc(wsi, wcap * sizeof(int));
-                wdi = safe_realloc(wdi, wcap * sizeof(int));
-                ww = safe_realloc(ww, wcap * sizeof(double));
-            }
-            wsi[wn] = si;
-            wdi[wn] = di;
-            ww[wn] = (double)SKIP_ONE;
-            wn++;
-        }
+        pairs[pair_count++] = (cbm_louvain_pair_t){si, di};
     }
+    free(refs);
+
+    if (pair_count > 1) {
+        qsort(pairs, (size_t)pair_count, sizeof(cbm_louvain_pair_t), louvain_pair_cmp);
+    }
+
+    int *wsi = malloc((size_t)(pair_count > 0 ? pair_count : SKIP_ONE) * sizeof(int));
+    int *wdi = malloc((size_t)(pair_count > 0 ? pair_count : SKIP_ONE) * sizeof(int));
+    double *ww = malloc((size_t)(pair_count > 0 ? pair_count : SKIP_ONE) * sizeof(double));
+    if (!wsi || !wdi || !ww) {
+        free(pairs);
+        free(wsi);
+        free(wdi);
+        free(ww);
+        *out_wsi = NULL;
+        *out_wdi = NULL;
+        *out_ww = NULL;
+        *out_wn = 0;
+        return;
+    }
+
+    int wn = 0;
+    for (int i = 0; i < pair_count; i++) {
+        if (wn > 0 && wsi[wn - SKIP_ONE] == pairs[i].src &&
+            wdi[wn - SKIP_ONE] == pairs[i].dst) {
+            ww[wn - SKIP_ONE] += (double)SKIP_ONE;
+            continue;
+        }
+        wsi[wn] = pairs[i].src;
+        wdi[wn] = pairs[i].dst;
+        ww[wn] = (double)SKIP_ONE;
+        wn++;
+    }
+    free(pairs);
+
     *out_wsi = wsi;
     *out_wdi = wdi;
     *out_ww = ww;

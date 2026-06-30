@@ -28,7 +28,7 @@
 #include <stdint.h>
 #include <time.h>
 
-enum { TEST_ARCH_PATH_BUF = 512 };
+enum { TEST_ARCH_PATH_BUF = 512, TEST_ARCH_NO_COMMUNITY = -1 };
 
 /* ── Helper: create architecture test store ──────────────────────── */
 
@@ -1042,6 +1042,44 @@ TEST(louvain_single_node) {
     PASS();
 }
 
+TEST(louvain_normalizes_duplicate_unsorted_edges) {
+    int64_t nodes[] = {30, 10, 40, 20};
+    cbm_louvain_edge_t edges[] = {
+        {10, 20}, {20, 10}, {10, 20}, {20, 10}, {10, 20},
+        {30, 40}, {40, 30}, {30, 40}, {40, 30}, {30, 40},
+        {20, 30}, {10, 10}, {10, 999},
+    };
+    cbm_louvain_result_t *result = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_louvain(nodes, 4, edges, (int)(sizeof(edges) / sizeof(edges[0])), &result,
+                          &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 4);
+
+    int c10 = TEST_ARCH_NO_COMMUNITY;
+    int c20 = TEST_ARCH_NO_COMMUNITY;
+    int c30 = TEST_ARCH_NO_COMMUNITY;
+    int c40 = TEST_ARCH_NO_COMMUNITY;
+    for (int i = 0; i < count; i++) {
+        if (result[i].node_id == 10) {
+            c10 = result[i].community;
+        } else if (result[i].node_id == 20) {
+            c20 = result[i].community;
+        } else if (result[i].node_id == 30) {
+            c30 = result[i].community;
+        } else if (result[i].node_id == 40) {
+            c40 = result[i].community;
+        }
+    }
+    ASSERT_EQ(c10, c20);
+    ASSERT_EQ(c30, c40);
+    ASSERT_TRUE(c10 != TEST_ARCH_NO_COMMUNITY);
+    ASSERT_TRUE(c30 != TEST_ARCH_NO_COMMUNITY);
+
+    free(result);
+    PASS();
+}
+
 TEST(louvain_converges) {
     /* Two fully connected clusters of 10 nodes each, bridged by one edge */
     int64_t nodes[20];
@@ -1588,6 +1626,7 @@ SUITE(store_arch) {
     RUN_TEST(louvain_basic);
     RUN_TEST(louvain_empty);
     RUN_TEST(louvain_single_node);
+    RUN_TEST(louvain_normalizes_duplicate_unsorted_edges);
     RUN_TEST(louvain_converges);
     RUN_TEST(leiden_multilevel_collapses_noise);
     RUN_TEST(leiden_resolution_controls_granularity);
