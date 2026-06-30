@@ -16,6 +16,7 @@ enum { DEFAULT_CORES = 1, MIN_WORKERS = 1, CBM_WORKERS_MAX = 256 };
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/system_info_internal.h"
+#include <stdatomic.h>
 #include <stdint.h> // uint64_t
 #include <stdlib.h> // strtol
 #include <string.h>
@@ -261,21 +262,43 @@ static cbm_system_info_t detect_system_windows(void) {
 
 /* ── Public API ──────────────────────────────────────────────────── */
 
-static int info_cached = 0;
+enum {
+    INFO_CACHE_UNINIT = 0,
+    INFO_CACHE_INITIALIZING = 1,
+    INFO_CACHE_READY = 2,
+};
+
+static _Atomic int info_cache_state = INFO_CACHE_UNINIT;
 static cbm_system_info_t cached_info;
 
-cbm_system_info_t cbm_system_info(void) {
-    if (!info_cached) {
+static cbm_system_info_t detect_system_info(void) {
 #ifdef _WIN32
-        cached_info = detect_system_windows();
+    return detect_system_windows();
 #elif defined(__APPLE__)
-        cached_info = detect_system_macos();
+    return detect_system_macos();
 #elif defined(__NetBSD__) || defined(__FreeBSD__) || defined(__OpenBSD__)
-        cached_info = detect_system_bsd();
+    return detect_system_bsd();
 #else
-        cached_info = detect_system_linux();
+    return detect_system_linux();
 #endif
-        info_cached = SKIP_ONE;
+}
+
+cbm_system_info_t cbm_system_info(void) {
+    if (atomic_load_explicit(&info_cache_state, memory_order_acquire) == INFO_CACHE_READY) {
+        return cached_info;
+    }
+
+    int expected = INFO_CACHE_UNINIT;
+    if (atomic_compare_exchange_strong_explicit(&info_cache_state, &expected,
+                                                INFO_CACHE_INITIALIZING, memory_order_acq_rel,
+                                                memory_order_acquire)) {
+        cached_info = detect_system_info();
+        atomic_store_explicit(&info_cache_state, INFO_CACHE_READY, memory_order_release);
+        return cached_info;
+    }
+
+    while (atomic_load_explicit(&info_cache_state, memory_order_acquire) != INFO_CACHE_READY) {
+        /* Another thread is publishing cached_info. */
     }
     return cached_info;
 }
