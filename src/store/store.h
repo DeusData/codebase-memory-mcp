@@ -544,6 +544,9 @@ int cbm_store_finish_index_generation(cbm_store_t *s, const char *project, int64
                                       const char *status);
 
 int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *delta);
+int cbm_store_publish_file_delta_batch(cbm_store_t *s,
+                                       const cbm_store_file_delta_t *const *deltas,
+                                       int delta_count);
 
 /* ── Search ─────────────────────────────────────────────────────── */
 
