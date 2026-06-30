@@ -864,6 +864,10 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         free(cache);
         return rc != 0 ? rc : CBM_NOT_FOUND;
     }
+    /* Registry build runs on the main graph and can allocate import, channel,
+     * and other support nodes after parallel_extract. Keep the worker ID source
+     * in sync before parallel_resolve creates worker-local decorator nodes. */
+    atomic_store_explicit(&shared_ids, cbm_gbuf_next_id(p->gbuf), memory_order_relaxed);
     /* Cross-file LSP precondition: build a project-wide CBMLSPDef[]
      * once. The fused resolve_worker invokes cbm_pxc_run_one(_ts) per
      * file using these defs + the file's IMPORTS map, so cross-file

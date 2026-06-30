@@ -1261,28 +1261,27 @@ static bool import_targetable_label(const char *label) {
     return false;
 }
 
-static int reexport_target_score(const cbm_gbuf_node_t *target, const char *owner_module_qn) {
+static int import_target_score(const cbm_gbuf_node_t *target, const char *context_qn) {
     if (!target || !target->qualified_name) {
         return CBM_NOT_FOUND;
     }
-    int score = cbm_str_common_dot_prefix_len(target->qualified_name, owner_module_qn);
+    int score = cbm_str_common_dot_prefix_len(target->qualified_name, context_qn);
     if (!cbm_is_test_path(target->file_path)) {
         score += CBM_RESOLUTION_NON_TEST_BONUS;
     }
     return score;
 }
 
-static bool reexport_target_better(const cbm_gbuf_node_t *candidate,
-                                   const cbm_gbuf_node_t *current,
-                                   const char *owner_module_qn) {
+static bool import_target_better(const cbm_gbuf_node_t *candidate, const cbm_gbuf_node_t *current,
+                                 const char *context_qn) {
     if (!candidate) {
         return false;
     }
     if (!current) {
         return true;
     }
-    int candidate_score = reexport_target_score(candidate, owner_module_qn);
-    int current_score = reexport_target_score(current, owner_module_qn);
+    int candidate_score = import_target_score(candidate, context_qn);
+    int current_score = import_target_score(current, context_qn);
     if (candidate_score != current_score) {
         return candidate_score > current_score;
     }
@@ -1368,8 +1367,15 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
     return found;
 }
 
-static bool import_edge_local_name_equals(const cbm_gbuf_edge_t *edge, const char *local_name) {
-    if (!edge || !edge->properties_json || !local_name || !local_name[0]) {
+static bool import_edge_local_name_span(const cbm_gbuf_edge_t *edge, const char **out_start,
+                                        size_t *out_len) {
+    if (out_start) {
+        *out_start = NULL;
+    }
+    if (out_len) {
+        *out_len = 0;
+    }
+    if (!edge || !edge->properties_json || !out_start || !out_len) {
         return false;
     }
     static const char key[] = "\"local_name\":\"";
@@ -1379,8 +1385,102 @@ static bool import_edge_local_name_equals(const cbm_gbuf_edge_t *edge, const cha
     }
     start += sizeof(key) - 1;
     const char *end = strchr(start, '"');
-    size_t len = end && end > start ? (size_t)(end - start) : 0;
+    if (!end || end <= start) {
+        return false;
+    }
+    *out_start = start;
+    *out_len = (size_t)(end - start);
+    return true;
+}
+
+static bool import_edge_local_name_equals(const cbm_gbuf_edge_t *edge, const char *local_name) {
+    if (!local_name || !local_name[0]) {
+        return false;
+    }
+    const char *start = NULL;
+    size_t len = 0;
+    if (!import_edge_local_name_span(edge, &start, &len)) {
+        return false;
+    }
     return len == strlen(local_name) && strncmp(start, local_name, len) == 0;
+}
+
+static char *import_edge_local_name_dup(const cbm_gbuf_edge_t *edge) {
+    const char *start = NULL;
+    size_t len = 0;
+    if (!import_edge_local_name_span(edge, &start, &len)) {
+        return NULL;
+    }
+    return cbm_strndup(start, len);
+}
+
+int cbm_pipeline_build_import_map_from_edges(const cbm_gbuf_t *gbuf, const char *project_name,
+                                             const char *rel_path, const char ***out_keys,
+                                             const char ***out_vals, int *out_count) {
+    if (out_keys) {
+        *out_keys = NULL;
+    }
+    if (out_vals) {
+        *out_vals = NULL;
+    }
+    if (out_count) {
+        *out_count = 0;
+    }
+    if (!gbuf || !project_name || !rel_path || !out_keys || !out_vals || !out_count) {
+        return 0;
+    }
+
+    char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
+    const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(gbuf, file_qn);
+    free(file_qn);
+    if (!file_node) {
+        return 0;
+    }
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    int rc = cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges,
+                                                &edge_count);
+    if (rc != 0 || edge_count <= 0 || !edges) {
+        return 0;
+    }
+
+    const char **keys = calloc((size_t)edge_count, sizeof(const char *));
+    const char **vals = calloc((size_t)edge_count, sizeof(const char *));
+    if (!keys || !vals) {
+        free(keys);
+        free(vals);
+        return CBM_NOT_FOUND;
+    }
+
+    int count = 0;
+    for (int i = 0; i < edge_count; i++) {
+        const cbm_gbuf_edge_t *edge = edges[i];
+        const cbm_gbuf_node_t *target = edge ? cbm_gbuf_find_by_id(gbuf, edge->target_id) : NULL;
+        char *key = import_edge_local_name_dup(edge);
+        if (!target || !key) {
+            free(key);
+            continue;
+        }
+        keys[count] = key;
+        vals[count] = target->qualified_name;
+        count++;
+    }
+
+    *out_keys = keys;
+    *out_vals = vals;
+    *out_count = count;
+    return 0;
+}
+
+void cbm_pipeline_free_import_map(const char **keys, const char **vals, int count) {
+    if (keys) {
+        for (int i = 0; i < count; i++) {
+            free((void *)keys[i]);
+        }
+        free((void *)keys);
+    }
+    free((void *)vals);
 }
 
 static const cbm_gbuf_node_t *find_file_node_for_module_qn(const cbm_gbuf_t *gbuf,
@@ -1434,7 +1534,7 @@ static const cbm_gbuf_node_t *resolve_reexported_symbol(const cbm_pipeline_ctx_t
         }
         const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(ctx->gbuf, edges[i]->target_id);
         if (target && import_targetable_label(target->label) &&
-            reexport_target_better(target, best, owner_module_qn)) {
+            import_target_better(target, best, owner_module_qn)) {
             best = target;
         }
     }
@@ -1641,9 +1741,11 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
             *dot = '\0';
             end = dot;
         }
+        char *context_qn = cbm_pipeline_resolve_module(ctx, source_rel, imp->module_path);
         for (int ci = 0; ci < ncands; ci++) {
             const cbm_gbuf_node_t **hits = NULL;
             int n = 0;
+            const cbm_gbuf_node_t *best = NULL;
             if (cbm_gbuf_find_by_name(ctx->gbuf, cands[ci], &hits, &n) == 0 && hits) {
                 for (int i = 0; i < n; i++) {
                     const cbm_gbuf_node_t *cand = hits[i];
@@ -1654,10 +1756,17 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                         strcmp(cand->qualified_name, source_file_qn) == 0) {
                         continue; /* self */
                     }
-                    return cand;
+                    if (import_target_better(cand, best, context_qn)) {
+                        best = cand;
+                    }
                 }
             }
+            if (best) {
+                free(context_qn);
+                return best;
+            }
         }
+        free(context_qn);
     }
 
     /* Strategy 4: crate-relative module path → File/Module node.  Rust glob

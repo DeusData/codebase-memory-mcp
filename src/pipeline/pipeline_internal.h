@@ -115,6 +115,13 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                                                         const CBMImport *imp,
                                                         CBMHashTable *namespace_map);
 
+/* Build a per-file import map from already-resolved IMPORTS edges.
+ * Returned keys are heap strings; values are borrowed graph-buffer QNs. */
+int cbm_pipeline_build_import_map_from_edges(const cbm_gbuf_t *gbuf, const char *project_name,
+                                             const char *rel_path, const char ***out_keys,
+                                             const char ***out_vals, int *out_count);
+void cbm_pipeline_free_import_map(const char **keys, const char **vals, int count);
+
 /* Build a namespace → File-node-QN map from a set of extraction results.
  * Each result that declared a namespace/package contributes one entry keyed by
  * the namespace string (e.g. "App.Utils", "com.example").  Returns NULL when no

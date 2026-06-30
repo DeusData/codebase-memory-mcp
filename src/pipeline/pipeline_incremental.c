@@ -612,6 +612,11 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                 free(cache);
                 return rc;
             }
+            /* Registry build allocates on the main graph after parallel_extract.
+             * Refresh the shared worker ID source before parallel_resolve creates
+             * worker-local nodes, or merged buffers can collide with main IDs. */
+            atomic_store_explicit(&shared_ids, cbm_gbuf_next_id(ctx->gbuf),
+                                  memory_order_relaxed);
 
             /* Incremental skips cross-file LSP precondition build — it
              * would need all_defs from the full project, not just the

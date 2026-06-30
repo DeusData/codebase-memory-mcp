@@ -16,7 +16,9 @@
 #include "git/git_context.h"
 #include "foundation/dump_verify.h"
 #include "semantic/semantic.h"
+#include "test_graph_diff.h"
 
+#include <sqlite3.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
@@ -1585,6 +1587,102 @@ static void teardown_lang_repo(void) {
     g_lang_tmpdir[0] = '\0';
 }
 
+static int pipeline_dump_store_file_to_file(const char *src_path, const char *dest_path) {
+    cbm_store_t *s = cbm_store_open_path(src_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    int rc = cbm_store_dump_to_file(s, dest_path);
+    cbm_store_close(s);
+    return rc;
+}
+
+static bool pipeline_store_has_edge_between_qns(const char *db_path, const char *project,
+                                                const char *source_qn, const char *type,
+                                                const char *target_qn) {
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        return false;
+    }
+
+    cbm_node_t src = {0};
+    cbm_node_t tgt = {0};
+    bool found = false;
+    if (cbm_store_find_node_by_qn(s, project, source_qn, &src) == CBM_STORE_OK &&
+        cbm_store_find_node_by_qn(s, project, target_qn, &tgt) == CBM_STORE_OK) {
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        if (cbm_store_find_edges_by_source_type(s, src.id, type, &edges, &edge_count) ==
+            CBM_STORE_OK) {
+            for (int i = 0; i < edge_count; i++) {
+                if (edges[i].target_id == tgt.id) {
+                    found = true;
+                    break;
+                }
+            }
+            cbm_store_free_edges(edges, edge_count);
+        }
+    }
+
+    cbm_store_close(s);
+    return found;
+}
+
+static void pipeline_restore_workers_env(bool had_workers, const char *saved_workers) {
+    if (had_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+}
+
+static int pipeline_run_with_worker_count(const char *repo_path, const char *db_path, int workers,
+                                          char **out_project) {
+    char worker_buf[CBM_SZ_32];
+    int n = snprintf(worker_buf, sizeof(worker_buf), "%d", workers);
+    if (n <= 0 || (size_t)n >= sizeof(worker_buf) ||
+        cbm_setenv("CBM_WORKERS", worker_buf, 1) != 0) {
+        return CBM_NOT_FOUND;
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(repo_path, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return CBM_NOT_FOUND;
+    }
+    int rc = cbm_pipeline_run(p);
+    if (rc == 0 && out_project) {
+        *out_project = strdup(cbm_pipeline_project_name(p));
+        if (!*out_project) {
+            rc = CBM_NOT_FOUND;
+        }
+    }
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+static int pipeline_count_channel_edges_to_non_channels(const char *db_path, const char *project) {
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_stmt *stmt = NULL;
+    int count = CBM_NOT_FOUND;
+    static const char sql[] =
+        "SELECT COUNT(*) "
+        "FROM edges e JOIN nodes t ON t.id = e.target_id "
+        "WHERE e.project = ?1 AND e.type IN ('EMITS','LISTENS_ON') AND t.label <> 'Channel'";
+    if (db && sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            count = sqlite3_column_int(stmt, 0);
+        }
+    }
+    sqlite3_finalize(stmt);
+    cbm_store_close(s);
+    return count;
+}
+
 TEST(pipeline_python_project) {
     /* Port of TestPipelinePythonProject */
     const char *files[] = {"main.py", "utils.py"};
@@ -1811,6 +1909,218 @@ TEST(pipeline_python_reexport_call_uses_resolved_import_edge) {
     cbm_store_free_nodes(callers, caller_count);
     cbm_store_close(s);
     cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_incremental_reexport_target_matches_full) {
+    enum { REEXPORT_FILE_COUNT = 4 };
+    const char *files[] = {"fastapi/__init__.py", "fastapi/param_functions.py",
+                           "fastapi/openapi/models.py", "docs_src/app/main.py"};
+    const char *contents[] = {
+        "from .param_functions import Header\n",
+        "def Header(default=None):\n    return default\n",
+        "class Header:\n    pass\n",
+        ("from fastapi import Header\n\n"
+         "def create_item():\n    return Header(None)\n")};
+
+    if (setup_lang_repo(files, contents, REEXPORT_FILE_COUNT) != 0) {
+        FAIL("tmpdir");
+    }
+
+    char db[CBM_SZ_512];
+    int n = snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(db));
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(TH_PATH(g_lang_tmpdir, "fastapi/__init__.py"),
+                            "from .openapi.models import Header\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_lang_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    cbm_config_close(cfg);
+
+    char incremental_db[CBM_SZ_512];
+    n = snprintf(incremental_db, sizeof(incremental_db), "%s/reexport-incremental.db",
+                 g_lang_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(incremental_db));
+    cbm_unlink(incremental_db);
+    ASSERT_EQ(pipeline_dump_store_file_to_file(db, incremental_db), CBM_STORE_OK);
+
+    cbm_unlink(db);
+    p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc =
+        cbm_test_compare_canonical_graphs(incremental_db, db, project, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        printf("    [incremental:reexport-diff] %s\n", diff_err);
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    cbm_unlink(incremental_db);
+    free(project);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_parallel_duplicate_import_inherits_matches_sequential) {
+    enum { FILLER_FILE_COUNT = 52, SEQUENTIAL_WORKERS = 1, PARALLEL_WORKERS = 4 };
+    const char *files[] = {"fastapi/openapi/models.py", "fastapi/security/base.py",
+                           "fastapi/security/api_key.py"};
+    const char *contents[] = {
+        "class SecurityBase:\n    pass\n",
+        "from fastapi.openapi.models import SecurityBase as SecurityBaseModel\n\n"
+        "class SecurityBase:\n    model: SecurityBaseModel\n",
+        "from fastapi.security.base import SecurityBase\n\n"
+        "class APIKeyBase(SecurityBase):\n    pass\n"};
+
+    if (setup_lang_repo(files, contents, 3) != 0) {
+        FAIL("tmpdir");
+    }
+    for (int i = 0; i < FILLER_FILE_COUNT; i++) {
+        char rel[CBM_SZ_128];
+        char body[CBM_SZ_256];
+        int rn = snprintf(rel, sizeof(rel), "fillers/filler_%02d.py", i);
+        int bn = snprintf(body, sizeof(body), "def filler_%02d():\n    return %d\n", i, i);
+        ASSERT_GT(rn, 0);
+        ASSERT_LT((size_t)rn, sizeof(rel));
+        ASSERT_GT(bn, 0);
+        ASSERT_LT((size_t)bn, sizeof(body));
+        ASSERT_EQ(th_write_file(TH_PATH(g_lang_tmpdir, rel), body), 0);
+    }
+
+    char seq_db[CBM_SZ_512];
+    char par_db[CBM_SZ_512];
+    int n = snprintf(seq_db, sizeof(seq_db), "%s/seq.db", g_lang_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(seq_db));
+    n = snprintf(par_db, sizeof(par_db), "%s/par.db", g_lang_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(par_db));
+
+    char saved_workers[CBM_SZ_32] = {0};
+    bool had_workers = cbm_safe_getenv("CBM_WORKERS", saved_workers, sizeof(saved_workers),
+                                       NULL) != NULL;
+
+    char *project = NULL;
+    int seq_rc =
+        pipeline_run_with_worker_count(g_lang_tmpdir, seq_db, SEQUENTIAL_WORKERS, &project);
+    int par_rc = pipeline_run_with_worker_count(g_lang_tmpdir, par_db, PARALLEL_WORKERS, NULL);
+    pipeline_restore_workers_env(had_workers, saved_workers);
+    ASSERT_EQ(seq_rc, 0);
+    ASSERT_EQ(par_rc, 0);
+    ASSERT_NOT_NULL(project);
+
+    char src_qn[CBM_SZ_512];
+    char target_qn[CBM_SZ_512];
+    n = snprintf(src_qn, sizeof(src_qn), "%s.fastapi.security.api_key.APIKeyBase", project);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(src_qn));
+    n = snprintf(target_qn, sizeof(target_qn), "%s.fastapi.security.base.SecurityBase", project);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(target_qn));
+
+    char base_file_qn[CBM_SZ_512];
+    char openapi_module_qn[CBM_SZ_512];
+    n = snprintf(base_file_qn, sizeof(base_file_qn), "%s.fastapi.security.base.__file__",
+                 project);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(base_file_qn));
+    n = snprintf(openapi_module_qn, sizeof(openapi_module_qn), "%s.fastapi.openapi.models",
+                 project);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(openapi_module_qn));
+
+    ASSERT_TRUE(pipeline_store_has_edge_between_qns(seq_db, project, base_file_qn, "IMPORTS",
+                                                    openapi_module_qn));
+    ASSERT_TRUE(pipeline_store_has_edge_between_qns(par_db, project, base_file_qn, "IMPORTS",
+                                                    openapi_module_qn));
+    ASSERT_TRUE(
+        pipeline_store_has_edge_between_qns(seq_db, project, src_qn, "INHERITS", target_qn));
+    ASSERT_TRUE(
+        pipeline_store_has_edge_between_qns(par_db, project, src_qn, "INHERITS", target_qn));
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = cbm_test_compare_canonical_graphs(seq_db, par_db, project, diff_err,
+                                                    sizeof(diff_err));
+    if (diff_rc != 0) {
+        printf("    [parallel:duplicate-import-diff] %s\n", diff_err);
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_parallel_channel_edges_target_channels) {
+    enum { FILLER_FILE_COUNT = 52, PARALLEL_WORKERS = 4 };
+    const char *files[] = {"app/main.py"};
+    const char *contents[] = {
+        "from fastapi import FastAPI, WebSocket\n\n"
+        "app = FastAPI()\n\n"
+        "def marker(fn):\n    return fn\n\n"
+        "@app.websocket('/ws')\n"
+        "async def ws(websocket: WebSocket):\n"
+        "    await websocket.accept()\n"
+        "    await websocket.send_text('Hello, router!')\n"
+        "    await websocket.send_text('Hello, world!')\n\n"
+        "@app.get('/items')\n"
+        "def read_items():\n"
+        "    return {'ok': True}\n\n"
+        "@marker\n"
+        "def decorated():\n"
+        "    return read_items()\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0) {
+        FAIL("tmpdir");
+    }
+    for (int i = 0; i < FILLER_FILE_COUNT; i++) {
+        char rel[CBM_SZ_128];
+        char body[CBM_SZ_256];
+        int rn = snprintf(rel, sizeof(rel), "fillers/filler_%02d.py", i);
+        int bn = snprintf(body, sizeof(body), "def filler_%02d():\n    return %d\n", i, i);
+        ASSERT_GT(rn, 0);
+        ASSERT_LT((size_t)rn, sizeof(rel));
+        ASSERT_GT(bn, 0);
+        ASSERT_LT((size_t)bn, sizeof(body));
+        ASSERT_EQ(th_write_file(TH_PATH(g_lang_tmpdir, rel), body), 0);
+    }
+
+    char db[CBM_SZ_512];
+    int n = snprintf(db, sizeof(db), "%s/channel-parallel.db", g_lang_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(db));
+
+    char saved_workers[CBM_SZ_32] = {0};
+    bool had_workers = cbm_safe_getenv("CBM_WORKERS", saved_workers, sizeof(saved_workers),
+                                       NULL) != NULL;
+    char *project = NULL;
+    int rc = pipeline_run_with_worker_count(g_lang_tmpdir, db, PARALLEL_WORKERS, &project);
+    pipeline_restore_workers_env(had_workers, saved_workers);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(project);
+    ASSERT_EQ(pipeline_count_channel_edges_to_non_channels(db, project), 0);
+
+    free(project);
     teardown_lang_repo();
     PASS();
 }
@@ -5167,6 +5477,66 @@ TEST(import_reexport_falls_back_when_pkgmap_target_missing) {
     PASS();
 }
 
+TEST(import_symbol_fallback_prefers_import_path_over_insertion_order) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t security_http_base = cbm_gbuf_upsert_node(
+        gb, "Class", "HTTPBase", "proj.fastapi.security.http.HTTPBase",
+        "fastapi/security/http.py", 1, 1, "{}");
+    int64_t openapi_http_base = cbm_gbuf_upsert_node(
+        gb, "Class", "HTTPBase", "proj.fastapi.openapi.models.HTTPBase",
+        "fastapi/openapi/models.py", 1, 1, "{}");
+    int64_t openapi_oauth2 = cbm_gbuf_upsert_node(
+        gb, "Class", "OAuth2", "proj.fastapi.openapi.models.OAuth2",
+        "fastapi/openapi/models.py", 1, 1, "{}");
+    int64_t security_oauth2 = cbm_gbuf_upsert_node(
+        gb, "Class", "OAuth2", "proj.fastapi.security.oauth2.OAuth2",
+        "fastapi/security/oauth2.py", 1, 1, "{}");
+    ASSERT_GT(security_http_base, 0);
+    ASSERT_GT(openapi_http_base, 0);
+    ASSERT_GT(openapi_oauth2, 0);
+    ASSERT_GT(security_oauth2, 0);
+
+    cbm_pipeline_ctx_t ctx = {
+        .gbuf = gb,
+        .project_name = "proj",
+    };
+    CBMImport model_alias = {
+        .local_name = "HTTPBaseModel",
+        .module_path = "fastapi.openapi.models.HTTPBase",
+    };
+    const cbm_gbuf_node_t *target =
+        cbm_pipeline_resolve_import_node(&ctx, "fastapi/security/http.py",
+                                         "proj.fastapi.security.http.__file__", &model_alias,
+                                         NULL);
+    ASSERT_NOT_NULL(target);
+    ASSERT_STR_EQ(target->qualified_name, "proj.fastapi.openapi.models.HTTPBase");
+
+    CBMImport public_class = {
+        .local_name = "HTTPBase",
+        .module_path = "fastapi.security.http.HTTPBase",
+    };
+    target = cbm_pipeline_resolve_import_node(&ctx, "tests/test_security_http_base.py",
+                                             "proj.tests.test_security_http_base.__file__",
+                                             &public_class, NULL);
+    ASSERT_NOT_NULL(target);
+    ASSERT_STR_EQ(target->qualified_name, "proj.fastapi.security.http.HTTPBase");
+
+    CBMImport oauth_model_alias = {
+        .local_name = "OAuth2Model",
+        .module_path = "fastapi.openapi.models.OAuth2",
+    };
+    target = cbm_pipeline_resolve_import_node(&ctx, "fastapi/security/oauth2.py",
+                                             "proj.fastapi.security.oauth2.__file__",
+                                             &oauth_model_alias, NULL);
+    ASSERT_NOT_NULL(target);
+    ASSERT_STR_EQ(target->qualified_name, "proj.fastapi.openapi.models.OAuth2");
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* DLL resolve test removed — feature removed due to Windows Defender
  * false positive (Wacatac.B!ml). See issue #89. */
 
@@ -6722,6 +7092,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_go_cross_package_call);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_python_reexport_call_uses_resolved_import_edge);
+    RUN_TEST(pipeline_incremental_reexport_target_matches_full);
+    RUN_TEST(pipeline_parallel_duplicate_import_inherits_matches_sequential);
+    RUN_TEST(pipeline_parallel_channel_edges_target_channels);
     RUN_TEST(pipeline_go_type_classification);
     RUN_TEST(pipeline_go_grouped_types);
     RUN_TEST(pipeline_kotlin_project);
@@ -6860,6 +7233,7 @@ SUITE(pipeline) {
     /* FastAPI Depends edge tracking */
     RUN_TEST(pipeline_fastapi_depends_edges);
     RUN_TEST(import_reexport_falls_back_when_pkgmap_target_missing);
+    RUN_TEST(import_symbol_fallback_prefers_import_path_over_insertion_order);
     /* Incremental */
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_detects_changed_file);
