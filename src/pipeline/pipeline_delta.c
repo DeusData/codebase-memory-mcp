@@ -9,6 +9,11 @@
 
 static const char cbm_delta_edge_imports[] = "IMPORTS";
 static const char cbm_delta_prop_is_exported[] = "is_exported";
+static const char cbm_delta_reason_candidate[] = "candidate";
+static const char cbm_delta_reason_frontier_error[] = "frontier_error";
+static const char cbm_delta_reason_frontier_too_large[] = "frontier_too_large";
+static const char cbm_delta_reason_invalid_input[] = "invalid_input";
+static const char cbm_delta_reason_unsupported_edges[] = "unsupported_edges";
 
 enum { CBM_DELTA_GROWTH = 2 };
 
@@ -236,4 +241,66 @@ void cbm_pipeline_file_delta_free(cbm_pipeline_file_delta_t *delta) {
     free(delta->exports);
     free(delta->imports);
     memset(delta, 0, sizeof(*delta));
+}
+
+static void delta_plan_set_fallback(cbm_pipeline_file_delta_plan_t *plan, const char *reason) {
+    plan->route = CBM_PIPELINE_DELTA_ROUTE_FALLBACK;
+    plan->reason = reason;
+}
+
+int cbm_pipeline_plan_file_delta(cbm_store_t *store, const cbm_pipeline_file_delta_t *delta,
+                                 int max_affected_paths, cbm_pipeline_file_delta_plan_t *out) {
+    if (!out) {
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+    delta_plan_set_fallback(out, cbm_delta_reason_invalid_input);
+    if (!store || !delta || !delta->delta.project || !delta->delta.rel_path ||
+        max_affected_paths <= 0) {
+        return CBM_STORE_OK;
+    }
+    if (delta->unsupported_edge_count > 0) {
+        delta_plan_set_fallback(out, cbm_delta_reason_unsupported_edges);
+        return CBM_STORE_OK;
+    }
+
+    const char **new_export_qns = NULL;
+    if (delta->delta.export_count > 0) {
+        new_export_qns = malloc((size_t)delta->delta.export_count * sizeof(*new_export_qns));
+        if (!new_export_qns) {
+            delta_plan_set_fallback(out, cbm_delta_reason_frontier_error);
+            return CBM_STORE_OK;
+        }
+        for (int i = 0; i < delta->delta.export_count; i++) {
+            new_export_qns[i] = delta->delta.exports[i].qualified_name;
+        }
+    }
+
+    int rc = cbm_store_list_file_delta_affected_paths(
+        store, delta->delta.project, delta->delta.rel_path, new_export_qns,
+        delta->delta.export_count, &out->affected_paths, &out->affected_count);
+    free(new_export_qns);
+    if (rc != CBM_STORE_OK) {
+        delta_plan_set_fallback(out, cbm_delta_reason_frontier_error);
+        return CBM_STORE_OK;
+    }
+    if (out->affected_count > max_affected_paths) {
+        delta_plan_set_fallback(out, cbm_delta_reason_frontier_too_large);
+        return CBM_STORE_OK;
+    }
+
+    out->route = CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE;
+    out->reason = cbm_delta_reason_candidate;
+    return CBM_STORE_OK;
+}
+
+void cbm_pipeline_file_delta_plan_free(cbm_pipeline_file_delta_plan_t *plan) {
+    if (!plan) {
+        return;
+    }
+    for (int i = 0; i < plan->affected_count; i++) {
+        free(plan->affected_paths[i]);
+    }
+    free(plan->affected_paths);
+    memset(plan, 0, sizeof(*plan));
 }
