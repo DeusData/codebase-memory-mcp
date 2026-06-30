@@ -3359,6 +3359,113 @@ TEST(pipeline_file_delta_plan_falls_back_on_rename) {
     PASS();
 }
 
+TEST(pipeline_file_delta_plan_falls_back_on_unsupported_derived_view) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test",
+                  .rel_path = "main.go",
+                  .derived_view_name = "pagerank",
+                  .derived_status = CBM_STORE_DERIVED_STATUS_STALE}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "unsupported_derived_view");
+    ASSERT_EQ(plan.affected_count, 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_on_unresolved_edge_endpoint) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    cbm_node_t nodes[1] = {{.project = "test",
+                            .label = "Function",
+                            .name = "Run",
+                            .qualified_name = "test.main.Run",
+                            .file_path = "main.go",
+                            .properties_json = "{}"}};
+    cbm_store_delta_edge_t edges[1] = {{.source_qn = "test.main.Run",
+                                        .target_qn = "test.missing.Helper",
+                                        .type = "CALLS",
+                                        .properties_json = "{}",
+                                        .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT}};
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test",
+                  .rel_path = "main.go",
+                  .nodes = nodes,
+                  .node_count = 1,
+                  .edges = edges,
+                  .edge_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "unresolved_edge_endpoint");
+    ASSERT_EQ(plan.affected_count, 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_accepts_resolved_external_edge_endpoint) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    cbm_node_t helper = {.project = "test",
+                         .label = "Function",
+                         .name = "Helper",
+                         .qualified_name = "test.helper.Helper",
+                         .file_path = "helper.go",
+                         .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &helper), 0);
+
+    cbm_node_t nodes[1] = {{.project = "test",
+                            .label = "Function",
+                            .name = "Run",
+                            .qualified_name = "test.main.Run",
+                            .file_path = "main.go",
+                            .properties_json = "{}"}};
+    cbm_store_delta_edge_t edges[1] = {{.source_qn = "test.main.Run",
+                                        .target_qn = "test.helper.Helper",
+                                        .type = "CALLS",
+                                        .properties_json = "{}",
+                                        .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT}};
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test",
+                  .rel_path = "main.go",
+                  .nodes = nodes,
+                  .node_count = 1,
+                  .edges = edges,
+                  .edge_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_STR_EQ(plan.reason, "candidate");
+    ASSERT_EQ(plan.affected_count, 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, "main.go"), 1);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(pipeline_file_delta_plan_falls_back_on_large_frontier) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -7733,6 +7840,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unsupported_edges);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_delete);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_rename);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_unsupported_derived_view);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_unresolved_edge_endpoint);
+    RUN_TEST(pipeline_file_delta_plan_accepts_resolved_external_edge_endpoint);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_large_frontier);
     /* File persistence */
     RUN_TEST(store_file_persistence);
