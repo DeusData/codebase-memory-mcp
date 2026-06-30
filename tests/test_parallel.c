@@ -85,6 +85,25 @@ static void teardown_parallel_repo(void) {
     g_par_tmpdir[0] = '\0';
 }
 
+static void cbm_init_parallel_worker(int idx, void *ctx_ptr) {
+    int *rcs = (int *)ctx_ptr;
+    rcs[idx] = cbm_init();
+}
+
+TEST(parallel_cbm_init_concurrent_idempotent) {
+    enum { INIT_CALLS = 32, INIT_WORKERS = 4 };
+    int rcs[INIT_CALLS];
+    memset(rcs, 0x7f, sizeof(rcs));
+
+    cbm_parallel_for_opts_t opts = {.max_workers = INIT_WORKERS, .force_pthreads = false};
+    cbm_parallel_for(INIT_CALLS, cbm_init_parallel_worker, rcs, opts);
+
+    for (int i = 0; i < INIT_CALLS; i++) {
+        ASSERT_EQ(rcs[i], 0);
+    }
+    PASS();
+}
+
 /* ── Run sequential pipeline on files, returning gbuf ─────────────── */
 
 static cbm_gbuf_t *run_sequential(const char *project, const char *repo_path,
@@ -993,6 +1012,7 @@ TEST(grpc_no_phantom_route_from_plain_var_issue294) {
 /* ── Suite Registration ──────────────────────────────────────────── */
 
 SUITE(parallel) {
+    RUN_TEST(parallel_cbm_init_concurrent_idempotent);
     RUN_TEST(grpc_service_name_preserves_service_suffix_issue294);
     RUN_TEST(grpc_no_phantom_route_from_plain_var_issue294);
     /* Graph buffer merge/shared-ID tests */

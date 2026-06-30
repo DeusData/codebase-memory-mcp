@@ -7,6 +7,7 @@
 
 #include "foundation/constants.h"
 #include <fcntl.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -209,13 +210,30 @@ void cbm_munmap(void *addr, size_t size) {
 
 #ifdef __APPLE__
 static mach_timebase_info_data_t timebase_info;
-static int timebase_init = 0;
+enum {
+    CBM_TIMEBASE_UNINIT = 0,
+    CBM_TIMEBASE_INITIALIZING = 1,
+    CBM_TIMEBASE_READY = 2,
+};
+static _Atomic int timebase_state = CBM_TIMEBASE_UNINIT;
 
 uint64_t cbm_now_ns(void) {
-    if (!timebase_init) {
-        mach_timebase_info(&timebase_info);
-        timebase_init = SKIP_ONE;
+    if (atomic_load_explicit(&timebase_state, memory_order_acquire) != CBM_TIMEBASE_READY) {
+        int expected = CBM_TIMEBASE_UNINIT;
+        if (atomic_compare_exchange_strong_explicit(&timebase_state, &expected,
+                                                    CBM_TIMEBASE_INITIALIZING,
+                                                    memory_order_acq_rel,
+                                                    memory_order_acquire)) {
+            mach_timebase_info(&timebase_info);
+            atomic_store_explicit(&timebase_state, CBM_TIMEBASE_READY, memory_order_release);
+        } else {
+            while (atomic_load_explicit(&timebase_state, memory_order_acquire) !=
+                   CBM_TIMEBASE_READY) {
+                /* Another thread is publishing timebase_info. */
+            }
+        }
     }
+
     uint64_t ticks = mach_absolute_time();
     return ticks * timebase_info.numer / timebase_info.denom;
 }
