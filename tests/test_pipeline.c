@@ -3574,8 +3574,40 @@ TEST(pipeline_file_delta_metadata_from_file) {
     PASS();
 }
 
-TEST(pipeline_content_hash_helper_matches_file_delta_metadata) {
+TEST(pipeline_file_delta_metadata_accepts_effective_fingerprint) {
     enum { PIPELINE_DELTA_META_GENERATION = 13 };
+    char effective_fingerprint[CBM_SZ_256];
+    ASSERT_EQ(cbm_pipeline_format_file_delta_pass_fingerprint(
+                  effective_fingerprint, sizeof(effective_fingerprint), CBM_MODE_FULL, 0.7,
+                  0.25, 0.75, 0.3, 0.6),
+              CBM_STORE_OK);
+    char *tmp = th_mktempdir("cbm_delta_meta_fingerprint");
+    ASSERT_NOT_NULL(tmp);
+    const char *path = TH_PATH(tmp, "main.go");
+    const char *content = "package main\nfunc Run() { println(\"fingerprint\") }\n";
+    ASSERT_EQ(th_write_file(path, content), 0);
+
+    cbm_file_info_t file = {
+        .path = (char *)path,
+        .rel_path = "main.go",
+        .language = CBM_LANG_GO,
+        .size = (int64_t)strlen(content),
+    };
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test",
+                  .rel_path = "main.go",
+                  .generation = PIPELINE_DELTA_META_GENERATION}};
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata_with_fingerprint(
+                  &delta, &file, effective_fingerprint),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(delta.file_state.pass_fingerprint, effective_fingerprint);
+
+    th_cleanup(tmp);
+    PASS();
+}
+
+TEST(pipeline_content_hash_helper_matches_file_delta_metadata) {
+    enum { PIPELINE_DELTA_META_GENERATION = 14 };
     char *tmp = th_mktempdir("cbm_delta_hash");
     ASSERT_NOT_NULL(tmp);
     const char *path = TH_PATH(tmp, "main.go");
@@ -8958,6 +8990,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_descriptor_from_gbuf);
     RUN_TEST(pipeline_file_delta_descriptor_marks_unsupported_edges);
     RUN_TEST(pipeline_file_delta_metadata_from_file);
+    RUN_TEST(pipeline_file_delta_metadata_accepts_effective_fingerprint);
     RUN_TEST(pipeline_content_hash_helper_matches_file_delta_metadata);
     RUN_TEST(pipeline_file_state_persist_helper_writes_hash_metadata);
     RUN_TEST(pipeline_file_state_current_check_rejects_stale_pass_fingerprint);
