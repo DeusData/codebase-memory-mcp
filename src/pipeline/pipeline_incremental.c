@@ -25,6 +25,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
+#include "foundation/profile.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -993,8 +994,10 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
         changed_paths[i] = changed_files[i].rel_path;
     }
 
+    CBM_PROF_START(t_exact_seed);
     rc = cbm_pipeline_seed_file_delta_scratch_from_store(
         store, scratch, registry, project, changed_paths, changed_count);
+    CBM_PROF_END_N("incremental_exact", "1_seed_scratch", t_exact_seed, changed_count);
     if (rc != CBM_STORE_OK) {
         cbm_log_info("incremental.exact.fallback", "reason", "scratch_seed", "rc",
                      itoa_buf_incr(rc));
@@ -1022,6 +1025,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     };
 
     const char *structure_root_qn = incremental_structure_root_qn(scratch, project);
+    CBM_PROF_START(t_exact_structure);
     for (int i = 0; i < changed_count; i++) {
         rc = cbm_pipeline_ensure_file_structure(scratch, project, structure_root_qn,
                                                 changed_files[i].rel_path, NULL);
@@ -1031,32 +1035,47 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
             goto cleanup;
         }
     }
+    CBM_PROF_END_N("incremental_exact", "2_ensure_structure", t_exact_structure, changed_count);
+    CBM_PROF_START(t_exact_extract_resolve);
     rc = run_extract_resolve(&ctx, changed_files, changed_count);
+    CBM_PROF_END_N("incremental_exact", "3_extract_resolve", t_exact_extract_resolve,
+                   changed_count);
     if (rc != 0) {
         cbm_log_info("incremental.exact.fallback", "reason", "extract_resolve", "rc",
                      itoa_buf_incr(rc));
         goto cleanup;
     }
+    CBM_PROF_START(t_exact_k8s);
     rc = cbm_pipeline_pass_k8s(&ctx, changed_files, changed_count);
+    CBM_PROF_END_N("incremental_exact", "4_k8s", t_exact_k8s, changed_count);
     if (rc != 0) {
         cbm_log_info("incremental.exact.fallback", "reason", "k8s", "rc", itoa_buf_incr(rc));
         goto cleanup;
     }
+    CBM_PROF_START(t_exact_postpasses);
     rc = run_postpasses(&ctx, changed_files, changed_count, project);
+    CBM_PROF_END_N("incremental_exact", "5_postpasses", t_exact_postpasses, changed_count);
     if (rc != 0) {
         cbm_log_info("incremental.exact.fallback", "reason", "postpasses", "rc",
                      itoa_buf_incr(rc));
         goto cleanup;
     }
+    CBM_PROF_START(t_exact_complexity);
     cbm_pipeline_pass_complexity_for_paths(&ctx, changed_paths, changed_count);
+    CBM_PROF_END_N("incremental_exact", "6_complexity", t_exact_complexity, changed_count);
+    CBM_PROF_START(t_exact_httplinks);
     rc = cbm_pipeline_pass_httplinks(&ctx);
+    CBM_PROF_END_N("incremental_exact", "7_httplinks", t_exact_httplinks, changed_count);
     if (rc != 0) {
         cbm_log_info("incremental.exact.fallback", "reason", "httplinks", "rc",
                      itoa_buf_incr(rc));
         goto cleanup;
     }
+    CBM_PROF_START(t_exact_normalize);
     cbm_pipeline_pass_normalize(scratch);
+    CBM_PROF_END_N("incremental_exact", "8_normalize", t_exact_normalize, changed_count);
 
+    CBM_PROF_START(t_exact_build_delta);
     for (int i = 0; i < changed_count; i++) {
         rc = cbm_pipeline_build_file_delta_from_gbuf(scratch, project, changed_files[i].rel_path,
                                                      CBM_PIPELINE_COMPAT_GENERATION, &deltas[i]);
@@ -1075,9 +1094,12 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
         }
         delta_ptrs[i] = &deltas[i];
     }
+    CBM_PROF_END_N("incremental_exact", "9_build_deltas", t_exact_build_delta, changed_count);
 
+    CBM_PROF_START(t_exact_plan);
     rc = cbm_pipeline_plan_file_delta_batch(store, delta_ptrs, changed_count,
                                             CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS, &plan);
+    CBM_PROF_END_N("incremental_exact", "10_plan_delta", t_exact_plan, changed_count);
     if (rc != CBM_STORE_OK || plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
         cbm_log_info("incremental.exact.fallback", "reason",
                      plan.reason ? plan.reason : "plan_error");
@@ -1085,12 +1107,15 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     }
     cbm_pipeline_file_delta_plan_free(&plan);
 
+    CBM_PROF_START(t_exact_reserve);
     rc = cbm_store_reserve_index_generation(store, project, NULL, NULL, &generation);
+    CBM_PROF_END("incremental_exact", "11_reserve_generation", t_exact_reserve);
     if (rc != CBM_STORE_OK || generation <= 0) {
         cbm_log_info("incremental.exact.fallback", "reason", "reserve_generation", "rc",
                      itoa_buf_incr(rc));
         goto cleanup;
     }
+    CBM_PROF_START(t_exact_stamp);
     for (int i = 0; i < changed_count; i++) {
         rc = cbm_pipeline_file_delta_stamp_generation(&deltas[i], generation);
         if (rc != CBM_STORE_OK) {
@@ -1100,9 +1125,12 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
             goto cleanup;
         }
     }
+    CBM_PROF_END_N("incremental_exact", "12_stamp_generation", t_exact_stamp, changed_count);
 
+    CBM_PROF_START(t_exact_apply);
     rc = cbm_pipeline_apply_file_delta_batch(store, delta_ptrs, changed_count,
                                              CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS, &plan);
+    CBM_PROF_END_N("incremental_exact", "13_apply_delta", t_exact_apply, changed_count);
     if (rc != CBM_STORE_OK || plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
         incr_mark_generation_failed(store, project, generation);
         cbm_log_info("incremental.exact.fallback", "reason",

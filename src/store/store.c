@@ -69,6 +69,7 @@ enum {
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/log.h"
+#include "foundation/profile.h"
 #include "foundation/compat_regex.h"
 #include "foundation/str_util.h"
 
@@ -519,8 +520,11 @@ static int create_user_indexes(cbm_store_t *s) {
         "CREATE INDEX IF NOT EXISTS idx_linkrank_project ON linkrank(project);"
         "CREATE INDEX IF NOT EXISTS idx_file_state_hash ON file_state(project, content_hash);"
         "CREATE INDEX IF NOT EXISTS idx_node_owners_path ON node_owners(project, rel_path);"
+        "CREATE INDEX IF NOT EXISTS idx_node_owners_node_id ON node_owners(node_id);"
         "CREATE INDEX IF NOT EXISTS idx_edge_owners_path ON edge_owners(project, rel_path);"
+        "CREATE INDEX IF NOT EXISTS idx_edge_owners_edge_id ON edge_owners(edge_id);"
         "CREATE INDEX IF NOT EXISTS idx_symbol_exports_path ON symbol_exports(project, rel_path);"
+        "CREATE INDEX IF NOT EXISTS idx_symbol_exports_node_id ON symbol_exports(node_id);"
         "CREATE INDEX IF NOT EXISTS idx_import_refs_target ON import_refs(project, target_qn);"
         "CREATE INDEX IF NOT EXISTS idx_derived_view_state_status"
         "  ON derived_view_state(project, status);";
@@ -3242,31 +3246,45 @@ static int store_delete_file_delta_transaction(cbm_store_t *s, const char *proje
 
 static int store_publish_file_delta_delete_body(cbm_store_t *s,
                                                 const cbm_store_file_delta_t *delta) {
+    CBM_PROF_START(t_edges);
     int rc = store_delete_owned_edges_by_file(s, delta->project, delta->rel_path);
+    CBM_PROF_END("store_delta_delete", "1_edges", t_edges);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
+    CBM_PROF_START(t_fts);
     rc = store_nodes_fts_delete_by_file(s, delta->project, delta->rel_path);
+    CBM_PROF_END("store_delta_delete", "2_fts", t_fts);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
+    CBM_PROF_START(t_nodes);
     rc = store_delete_owned_nodes_by_file(s, delta->project, delta->rel_path);
+    CBM_PROF_END("store_delta_delete", "3_nodes", t_nodes);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
+    CBM_PROF_START(t_edge_owners);
     rc = cbm_store_delete_edge_owners_by_file(s, delta->project, delta->rel_path);
+    CBM_PROF_END("store_delta_delete", "4_edge_owners", t_edge_owners);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
+    CBM_PROF_START(t_node_owners);
     rc = cbm_store_delete_node_owners_by_file(s, delta->project, delta->rel_path);
+    CBM_PROF_END("store_delta_delete", "5_node_owners", t_node_owners);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
+    CBM_PROF_START(t_exports);
     rc = cbm_store_delete_symbol_exports_by_file(s, delta->project, delta->rel_path);
+    CBM_PROF_END("store_delta_delete", "6_exports", t_exports);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
+    CBM_PROF_START(t_imports);
     rc = cbm_store_delete_import_refs_by_file(s, delta->project, delta->rel_path);
+    CBM_PROF_END("store_delta_delete", "7_imports", t_imports);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
@@ -3394,30 +3412,38 @@ static int store_publish_file_delta_batch_body(cbm_store_t *s,
                                                const cbm_store_file_delta_t *const *deltas,
                                                int delta_count) {
     int rc = CBM_STORE_OK;
+    CBM_PROF_START(t_delete);
     for (int i = 0; i < delta_count; i++) {
         rc = store_publish_file_delta_delete_body(s, deltas[i]);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
     }
+    CBM_PROF_END_N("store_delta_publish", "1_delete_old_rows", t_delete, delta_count);
+    CBM_PROF_START(t_nodes);
     for (int i = 0; i < delta_count; i++) {
         rc = store_publish_file_delta_nodes_body(s, deltas[i]);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
     }
+    CBM_PROF_END_N("store_delta_publish", "2_upsert_nodes", t_nodes, delta_count);
+    CBM_PROF_START(t_edges);
     for (int i = 0; i < delta_count; i++) {
         rc = store_publish_file_delta_edges_body(s, deltas[i]);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
     }
+    CBM_PROF_END_N("store_delta_publish", "3_upsert_edges", t_edges, delta_count);
+    CBM_PROF_START(t_metadata);
     for (int i = 0; i < delta_count; i++) {
         rc = store_publish_file_delta_metadata_body(s, deltas[i]);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
     }
+    CBM_PROF_END_N("store_delta_publish", "4_upsert_metadata", t_metadata, delta_count);
     return CBM_STORE_OK;
 }
 
@@ -3569,21 +3595,29 @@ int cbm_store_publish_file_delta_batch(cbm_store_t *s,
         return CBM_STORE_ERR;
     }
 
+    CBM_PROF_START(t_begin);
     int rc = cbm_store_begin(s);
+    CBM_PROF_END("store_delta_publish", "0_begin", t_begin);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
+    CBM_PROF_START(t_body);
     rc = store_publish_file_delta_batch_body(s, deltas, delta_count);
+    CBM_PROF_END_N("store_delta_publish", "5_body_total", t_body, delta_count);
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(s);
         return rc;
     }
+    CBM_PROF_START(t_stale);
     rc = store_mark_graph_derived_views_stale_body(s, project, generation);
+    CBM_PROF_END("store_delta_publish", "6_mark_stale", t_stale);
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(s);
         return rc;
     }
+    CBM_PROF_START(t_commit);
     rc = cbm_store_commit(s);
+    CBM_PROF_END("store_delta_publish", "8_commit", t_commit);
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(s);
         return rc;
@@ -3601,26 +3635,36 @@ int cbm_store_publish_file_delta_batch_complete(cbm_store_t *s,
         return CBM_STORE_ERR;
     }
 
+    CBM_PROF_START(t_begin);
     int rc = cbm_store_begin(s);
+    CBM_PROF_END("store_delta_publish", "0_begin", t_begin);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
+    CBM_PROF_START(t_body);
     rc = store_publish_file_delta_batch_body(s, deltas, delta_count);
+    CBM_PROF_END_N("store_delta_publish", "5_body_total", t_body, delta_count);
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(s);
         return rc;
     }
+    CBM_PROF_START(t_stale);
     rc = store_mark_graph_derived_views_stale_body(s, project, generation);
+    CBM_PROF_END("store_delta_publish", "6_mark_stale", t_stale);
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(s);
         return rc;
     }
+    CBM_PROF_START(t_finish);
     rc = store_finish_index_generation_body(s, project, generation, CBM_STORE_INDEX_STATUS_COMPLETE);
+    CBM_PROF_END("store_delta_publish", "7_finish_generation", t_finish);
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(s);
         return rc;
     }
+    CBM_PROF_START(t_commit);
     rc = cbm_store_commit(s);
+    CBM_PROF_END("store_delta_publish", "8_commit", t_commit);
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(s);
         return rc;
