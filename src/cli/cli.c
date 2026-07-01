@@ -475,6 +475,7 @@ static const char skill_content[] =
     "| Dead code | `search_graph(max_degree=0, exclude_entry_points=true)` |\n"
     "| Cross-service edges | `query_graph` with Cypher |\n"
     "| Impact of local changes | `detect_changes()` |\n"
+    "| Persistent personal repo memory | `manage_memory(mode=\"get\")` |\n"
     "| Risk-classified trace | `trace_path(risk_labels=true)` |\n"
     "| Text search | `search_code` or Grep |\n"
     "\n"
@@ -496,11 +497,27 @@ static const char skill_content[] =
     "- High fan-in: `search_graph(min_degree=10, relationship=\"CALLS\", "
     "direction=\"inbound\")`\n"
     "\n"
-    "## 14 MCP Tools\n"
+    "## Personal Memory Workflow\n"
+    "1. At session start, call `manage_memory(mode=\"get\")` to lookup/reference "
+    "previous local learnings for this repo and branch.\n"
+    "2. If empty or stale, inspect with `get_architecture`, `get_graph_schema`, and "
+    "`search_graph`; draft compact ADR sections.\n"
+    "3. Store new learnings with `manage_memory(mode=\"update\", content=\"...\")`. "
+    "This writes local user storage only, not the repo.\n"
+    "   Store codebase knowledge: purpose, architecture, stack, module map, conventions, "
+    "gotchas, decisions, workflows, test/build commands, and branch-specific notes.\n"
+    "4. After branch work, update CHANGELOG/DECISIONS/learnings via "
+    "`manage_memory(mode=\"update\")`.\n"
+    "5. Use `manage_memory(mode=\"promote\", branch=\"feature\")` after merge-worthy branch work.\n"
+    "6. Use `manage_memory(mode=\"list\")`, `settings`, and `delete` for maintenance.\n"
+    "Config defaults: `memory_enabled=true`, `memory_default_scope=personal`, "
+    "`memory_dir=<user data dir>`. Change with `codebase-memory-mcp config set ...`.\n"
+    "\n"
+    "## 15 MCP Tools\n"
     "`index_repository`, `index_status`, `list_projects`, `delete_project`,\n"
     "`search_graph`, `search_code`, `trace_path`, `detect_changes`,\n"
     "`query_graph`, `get_graph_schema`, `get_code_snippet`, `get_architecture`,\n"
-    "`manage_adr`, `ingest_traces`\n"
+    "`manage_adr`, `manage_memory`, `ingest_traces`\n"
     "\n"
     "## Edge Types\n"
     "CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD,\n"
@@ -2807,6 +2824,35 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
     return rc;
 }
 
+static const char *cbm_config_default_value(const char *key) {
+    if (!key) {
+        return "";
+    }
+    if (strcmp(key, CBM_CONFIG_AUTO_INDEX) == 0) {
+        return "false";
+    }
+    if (strcmp(key, CBM_CONFIG_AUTO_INDEX_LIMIT) == 0) {
+        return "50000";
+    }
+    if (strcmp(key, CBM_CONFIG_UI_LANG) == 0) {
+        return "auto";
+    }
+    if (strcmp(key, CBM_CONFIG_AUTO_UPDATE) == 0) {
+        return "true";
+    }
+    if (strcmp(key, CBM_CONFIG_MEMORY_ENABLED) == 0) {
+        return "true";
+    }
+    if (strcmp(key, CBM_CONFIG_MEMORY_DIR) == 0) {
+        const char *dir = cbm_resolve_memory_dir();
+        return dir ? dir : "";
+    }
+    if (strcmp(key, CBM_CONFIG_MEMORY_DEFAULT_SCOPE) == 0) {
+        return "personal";
+    }
+    return "";
+}
+
 /* ── Config CLI subcommand ────────────────────────────────────── */
 
 int cbm_cmd_config(int argc, char **argv) {
@@ -2824,6 +2870,14 @@ int cbm_cmd_config(int argc, char **argv) {
                "Max files for auto-indexing new projects");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_LANG, "auto",
                "Pin graph UI language: en, zh, or auto");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_UPDATE, "true",
+               "Check for newer releases on MCP startup");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_MEMORY_ENABLED, "true",
+               "Enable local personal repo memory");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_MEMORY_DIR, "user-data",
+               "Directory for local personal memory.db (overridden by CBM_MEMORY_DIR)");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_MEMORY_DEFAULT_SCOPE, "personal",
+               "Default memory scope for LLM workflows");
         return 0;
     }
 
@@ -2850,13 +2904,26 @@ int cbm_cmd_config(int argc, char **argv) {
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX_LIMIT,
                cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "50000"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
-               cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto"));
+               cbm_config_get(cfg, CBM_CONFIG_UI_LANG, cbm_config_default_value(CBM_CONFIG_UI_LANG)));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_UPDATE,
+               cbm_config_get(cfg, CBM_CONFIG_AUTO_UPDATE,
+                              cbm_config_default_value(CBM_CONFIG_AUTO_UPDATE)));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_MEMORY_ENABLED,
+               cbm_config_get(cfg, CBM_CONFIG_MEMORY_ENABLED,
+                              cbm_config_default_value(CBM_CONFIG_MEMORY_ENABLED)));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_MEMORY_DIR,
+               cbm_config_get(cfg, CBM_CONFIG_MEMORY_DIR,
+                              cbm_config_default_value(CBM_CONFIG_MEMORY_DIR)));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_MEMORY_DEFAULT_SCOPE,
+               cbm_config_get(cfg, CBM_CONFIG_MEMORY_DEFAULT_SCOPE,
+                              cbm_config_default_value(CBM_CONFIG_MEMORY_DEFAULT_SCOPE)));
     } else if (strcmp(argv[0], "get") == 0) {
         if (argc < MIN_ARGC_GET) {
             (void)fprintf(stderr, "Usage: config get <key>\n");
             rc = CLI_TRUE;
         } else {
-            printf("%s\n", cbm_config_get(cfg, argv[CLI_SKIP_ONE], ""));
+            printf("%s\n", cbm_config_get(cfg, argv[CLI_SKIP_ONE],
+                                          cbm_config_default_value(argv[CLI_SKIP_ONE])));
         }
     } else if (strcmp(argv[0], "set") == 0) {
         if (argc < MIN_ARGC_CMD) {

@@ -6,6 +6,7 @@
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h" /* cbm_unlink / cbm_rmdir */
 #include "../src/foundation/log.h"
+#include "../src/foundation/platform.h"
 #include "test_framework.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
@@ -178,7 +179,7 @@ TEST(mcp_initialize_response) {
 TEST(mcp_tools_list) {
     char *json = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(json);
-    /* Should contain all 14 tools */
+    /* Should contain all 15 tools */
     ASSERT_NOT_NULL(strstr(json, "index_repository"));
     ASSERT_NOT_NULL(strstr(json, "search_graph"));
     ASSERT_NOT_NULL(strstr(json, "query_graph"));
@@ -192,6 +193,7 @@ TEST(mcp_tools_list) {
     ASSERT_NOT_NULL(strstr(json, "index_status"));
     ASSERT_NOT_NULL(strstr(json, "detect_changes"));
     ASSERT_NOT_NULL(strstr(json, "manage_adr"));
+    ASSERT_NOT_NULL(strstr(json, "manage_memory"));
     ASSERT_NOT_NULL(strstr(json, "ingest_traces"));
     free(json);
     PASS();
@@ -1398,6 +1400,117 @@ TEST(tool_manage_adr_unified_backend_issue256) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_manage_memory_personal_store) {
+    char tmp_dir[256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-memory-test-XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        PASS();
+    }
+    char memory_dir[512];
+    snprintf(memory_dir, sizeof(memory_dir), "%s/memory", tmp_dir);
+    ASSERT_EQ(setenv("CBM_MEMORY_DIR", memory_dir, 1), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    cbm_store_upsert_project(st, "memory-proj", tmp_dir);
+    cbm_mcp_server_set_project(srv, "memory-proj");
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":130,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"settings\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "CBM_MEMORY_DIR"));
+    ASSERT_NOT_NULL(strstr(resp, "repo_upload"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1301,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"update\",\"branch\":\"main\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "missing_content"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":131,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"update\",\"branch\":\"main\",\"content\":\"## PURPOSE\\nLocal only.\\n\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "updated"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":132,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"get\",\"branch\":\"main\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "Local only."));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":135,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"list\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"count\":1"));
+    ASSERT_NOT_NULL(strstr(resp, "\"branch\":\"main\""));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":136,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"update\",\"branch\":\"feature\",\"content\":\"## PURPOSE\\nFeature memory.\\n\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "updated"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":137,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"promote\",\"branch\":\"feature\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "promoted"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":138,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"get\",\"branch\":\"main\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "Feature memory."));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":133,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"delete\",\"branch\":\"main\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "deleted"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":134,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"get\",\"branch\":\"main\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "no_memory"));
+    free(resp);
+
+    char memory_db[512];
+    snprintf(memory_db, sizeof(memory_db), "%s/memory.db", memory_dir);
+    ASSERT_TRUE(cbm_file_exists(memory_db));
+
+    cbm_mcp_server_free(srv);
+    unsetenv("CBM_MEMORY_DIR");
+    remove(memory_db);
+    rmdir(memory_dir);
+    rmdir(tmp_dir);
     PASS();
 }
 
@@ -3038,6 +3151,7 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
     RUN_TEST(tool_manage_adr_unified_backend_issue256);
+    RUN_TEST(tool_manage_memory_personal_store);
     RUN_TEST(tool_ingest_traces_basic);
     RUN_TEST(tool_ingest_traces_empty);
 
