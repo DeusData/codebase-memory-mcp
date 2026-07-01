@@ -8,6 +8,7 @@
 #include "graph_buffer/graph_buffer.h"
 #include "store/store.h"
 #include "foundation/compat.h" /* cbm_mkstemp */
+#include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/platform.h"
 #include "sqlite3.h"           /* vendored/sqlite3/ via -Ivendored/sqlite3 */
@@ -650,7 +651,7 @@ TEST(gbuf_validate_invariants_valid_graph) {
 TEST(gbuf_dump_rejects_missing_edge_endpoint) {
     char path[256];
     ASSERT_EQ(gbuf_make_temp_db(path, sizeof(path)), 0);
-    unlink(path);
+    cbm_unlink(path);
 
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
     ASSERT_NOT_NULL(gb);
@@ -1235,7 +1236,7 @@ TEST(gbuf_dump_pipeline_path_integrity) {
     ASSERT_GT(ecount, 0);
 
     sqlite3_close(db);
-    unlink(path);
+    cbm_unlink(path);
     cbm_gbuf_free(gw);
     cbm_gbuf_free(gb);
     PASS();
@@ -1265,7 +1266,7 @@ TEST(gbuf_dump_relative_root_path_retained) {
         fclose(f);
     }
 
-    unlink(path);
+    cbm_unlink(path);
     cbm_gbuf_free(gb);
     PASS();
 }
@@ -1305,7 +1306,7 @@ TEST(gbuf_dump_failure_before_replace_keeps_existing_db) {
     ASSERT(!gbuf_store_has_qn(path, "proj", "proj.new"));
 
     cbm_gbuf_free(new_gb);
-    unlink(path);
+    cbm_unlink(path);
     PASS();
 }
 

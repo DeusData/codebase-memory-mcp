@@ -9,6 +9,7 @@
 #include "test_helpers.h"
 #include "test_sqlite_helpers.h"
 #include <foundation/compat.h>
+#include <foundation/compat_fs.h>
 #include <foundation/constants.h>
 #include <store/store.h>
 #include <sqlite3.h>
@@ -225,7 +226,7 @@ TEST(store_open_path_query_does_not_create_missing_db) {
     int fd = cbm_mkstemp_s(path, sizeof(path));
     ASSERT_GT(fd, -1);
     cbm_close_fd(fd);
-    ASSERT_EQ(remove(path), 0);
+    ASSERT_EQ(cbm_unlink(path), 0);
 
     cbm_store_t *s = cbm_store_open_path_query(path);
     ASSERT_NULL(s);
