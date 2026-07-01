@@ -12,6 +12,7 @@ import json
 import os
 import queue
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,7 @@ PROJECT_DB_SUFFIX = ".db"
 CONFIG_DB_NAME = "_config.db"
 LOG_TAIL_LINES = 24
 MCP_INIT_PROTOCOL_VERSION = "2024-11-05"
+MATRIX_SCENARIOS_DEFAULT = "go_modify_1,go_modify_2,go_create,go_delete,go_rename,go_new_folder,route_decorator,python_reexport"
 PUBLISH_FULL = "full"
 PUBLISH_INCREMENTAL_NOOP = "incremental_noop"
 PUBLISH_INCREMENTAL_EXACT = "incremental_exact"
@@ -76,6 +78,29 @@ def modify_existing_files(repo_dir: Path, changed_files: int, funcs_per_file: in
         write_text(repo_dir / rel, go_file_content(index, 1000, funcs_per_file))
         changed.append(rel.as_posix())
     return changed
+
+
+def create_python_reexport_repo(repo_dir: Path) -> None:
+    write_text(repo_dir / "fastapi" / "__init__.py", "from .param_functions import Header\n")
+    write_text(repo_dir / "fastapi" / "param_functions.py", "def Header(default=None):\n    return default\n")
+    write_text(repo_dir / "fastapi" / "openapi" / "models.py", "class Header:\n    pass\n")
+    write_text(
+        repo_dir / "docs_src" / "app" / "main.py",
+        "from fastapi import Header\n\n"
+        "def create_item():\n"
+        "    return Header(None)\n",
+    )
+
+
+def create_route_repo(repo_dir: Path, route_path: str) -> None:
+    write_text(
+        repo_dir / "routes.py",
+        "from fastapi import FastAPI\n\n"
+        "app = FastAPI()\n\n"
+        f"@app.get('{route_path}')\n"
+        "def orders():\n"
+        "    return {'ok': True}\n",
+    )
 
 
 def command_result(
@@ -270,6 +295,21 @@ def parse_logged_elapsed_ms(stderr: str, marker: str) -> int | None:
     return None
 
 
+def parse_exact_reason(stderr: str) -> str | None:
+    prefixes = (
+        "msg=incremental.exact.fallback reason=",
+        "msg=incremental.exact.delete.fallback reason=",
+        "msg=incremental.exact.skip reason=",
+    )
+    for line in stderr.splitlines():
+        for prefix in prefixes:
+            if prefix not in line:
+                continue
+            reason = line.split(prefix, 1)[1].split()[0]
+            return reason or None
+    return None
+
+
 def indexed_work_elapsed_ms(logged_elapsed_ms: dict[str, int | None]) -> int | None:
     incremental_ms = logged_elapsed_ms.get("incremental_done")
     if incremental_ms is not None:
@@ -317,6 +357,7 @@ def build_index_result(
             or is_incremental_publish_kind(publish_kind),
         },
         "logged_elapsed_ms": logged_elapsed_ms,
+        "exact_reason": parse_exact_reason(stderr),
         "stderr_tail": log_tail(stderr),
     }
     if include_logs:
@@ -369,12 +410,301 @@ def remove_project_dbs(cache_dir: Path) -> list[str]:
     return removed
 
 
+def find_project_db(cache_dir: Path) -> Path:
+    dbs = sorted(
+        path
+        for path in cache_dir.iterdir()
+        if path.is_file() and path.name != CONFIG_DB_NAME and path.name.endswith(PROJECT_DB_SUFFIX)
+    )
+    if len(dbs) != 1:
+        names = ", ".join(path.name for path in dbs)
+        raise RuntimeError(f"expected one project DB in {cache_dir}, found {len(dbs)}: {names}")
+    return dbs[0]
+
+
+def canonical_query_rows(db_path: Path, project: str, sql: str) -> list[str]:
+    con = sqlite3.connect(str(db_path))
+    try:
+        rows = [str(row[0]) for row in con.execute(sql, (project,))]
+    finally:
+        con.close()
+    return rows
+
+
+CANONICAL_NODES_SQL = (
+    "SELECT quote(label) || char(9) || quote(name) || char(9) || "
+    "quote(qualified_name) || char(9) || quote(coalesce(file_path,'')) || char(9) || "
+    "start_line || char(9) || end_line || char(9) || "
+    "COALESCE((SELECT group_concat(item, char(30)) FROM ("
+    "SELECT quote(je.key) || '=' || je.type || '=' || "
+    "COALESCE(quote(CAST(je.value AS TEXT)), 'NULL') AS item "
+    "FROM json_each(n.properties) AS je "
+    "ORDER BY je.key, je.type, CAST(je.value AS TEXT)"
+    ")), '') "
+    "FROM nodes n WHERE project = ?1 "
+    "ORDER BY label, name, qualified_name, coalesce(file_path,''), start_line, end_line, "
+    "COALESCE((SELECT group_concat(item, char(30)) FROM ("
+    "SELECT quote(je.key) || '=' || je.type || '=' || "
+    "COALESCE(quote(CAST(je.value AS TEXT)), 'NULL') AS item "
+    "FROM json_each(n.properties) AS je "
+    "ORDER BY je.key, je.type, CAST(je.value AS TEXT)"
+    ")), '')"
+)
+
+CANONICAL_EDGES_SQL = (
+    "SELECT quote(s.label) || char(9) || quote(s.qualified_name) || char(9) || "
+    "quote(coalesce(s.file_path,'')) || char(9) || s.start_line || char(9) || "
+    "s.end_line || char(9) || quote(t.label) || char(9) || quote(t.qualified_name) || "
+    "char(9) || quote(coalesce(t.file_path,'')) || char(9) || t.start_line || char(9) || "
+    "t.end_line || char(9) || quote(e.type) || char(9) || "
+    "COALESCE((SELECT group_concat(item, char(30)) FROM ("
+    "SELECT quote(je.key) || '=' || je.type || '=' || "
+    "COALESCE(quote(CAST(je.value AS TEXT)), 'NULL') AS item "
+    "FROM json_each(e.properties) AS je "
+    "ORDER BY je.key, je.type, CAST(je.value AS TEXT)"
+    ")), '') "
+    "FROM edges e "
+    "JOIN nodes s ON s.id = e.source_id "
+    "JOIN nodes t ON t.id = e.target_id "
+    "WHERE e.project = ?1 "
+    "ORDER BY s.label, s.qualified_name, coalesce(s.file_path,''), s.start_line, s.end_line, "
+    "t.label, t.qualified_name, coalesce(t.file_path,''), t.start_line, t.end_line, "
+    "e.type, COALESCE((SELECT group_concat(item, char(30)) FROM ("
+    "SELECT quote(je.key) || '=' || je.type || '=' || "
+    "COALESCE(quote(CAST(je.value AS TEXT)), 'NULL') AS item "
+    "FROM json_each(e.properties) AS je "
+    "ORDER BY je.key, je.type, CAST(je.value AS TEXT)"
+    ")), '')"
+)
+
+CANONICAL_HASHES_SQL = (
+    "SELECT quote(rel_path) || char(9) || quote(sha256) || char(9) || mtime_ns || char(9) || "
+    "size FROM file_hashes WHERE project = ?1 ORDER BY rel_path"
+)
+
+
+def compare_canonical_graph(left_db: Path, right_db: Path, project: str) -> dict[str, Any]:
+    for kind, sql in (
+        ("canonical nodes", CANONICAL_NODES_SQL),
+        ("canonical edges", CANONICAL_EDGES_SQL),
+        ("file hashes", CANONICAL_HASHES_SQL),
+    ):
+        left = canonical_query_rows(left_db, project, sql)
+        right = canonical_query_rows(right_db, project, sql)
+        if left != right:
+            left_set = set(left)
+            right_set = set(right)
+            left_only = next((row for row in left if row not in right_set), None)
+            right_only = next((row for row in right if row not in left_set), None)
+            return {
+                "equal": False,
+                "kind": kind,
+                "left_count": len(left),
+                "right_count": len(right),
+                "left_only": left_only,
+                "right_only": right_only,
+            }
+    return {"equal": True}
+
+
 def build_env(cache_dir: Path) -> dict[str, str]:
     env = dict(os.environ)
     env["CBM_CACHE_DIR"] = str(cache_dir)
     env["CBM_AUTO_INDEX"] = "false"
     env["CBM_CONTEXT_INJECTION"] = "false"
     return env
+
+
+def prepare_matrix_scenario(name: str, repo_dir: Path, files: int, funcs_per_file: int) -> None:
+    if name in {
+        "go_modify_1",
+        "go_modify_2",
+        "go_create",
+        "go_delete",
+        "go_rename",
+        "go_new_folder",
+    }:
+        create_repo(repo_dir, files, funcs_per_file)
+        return
+    if name == "route_decorator":
+        create_route_repo(repo_dir, "/api/orders")
+        return
+    if name == "python_reexport":
+        create_python_reexport_repo(repo_dir)
+        return
+    raise ValueError(f"unknown matrix scenario: {name}")
+
+
+def mutate_matrix_scenario(name: str, repo_dir: Path, funcs_per_file: int) -> list[str]:
+    if name == "go_modify_1":
+        return modify_existing_files(repo_dir, 1, funcs_per_file)
+    if name == "go_modify_2":
+        return modify_existing_files(repo_dir, 2, funcs_per_file)
+    if name == "go_create":
+        rel = Path("pkg") / "file_created.go"
+        write_text(repo_dir / rel, go_file_content(9999, 1, funcs_per_file))
+        return [rel.as_posix()]
+    if name == "go_delete":
+        rel = Path("pkg") / "file_0000.go"
+        (repo_dir / rel).unlink()
+        return [rel.as_posix()]
+    if name == "go_rename":
+        old_rel = Path("pkg") / "file_0000.go"
+        new_rel = Path("pkg") / "file_renamed.go"
+        (repo_dir / old_rel).unlink()
+        write_text(repo_dir / new_rel, go_file_content(9998, 1, funcs_per_file))
+        return [old_rel.as_posix(), new_rel.as_posix()]
+    if name == "go_new_folder":
+        rel = Path("newpkg") / "leaf.go"
+        write_text(repo_dir / rel, "package newpkg\n\nfunc NewFolderLeaf() int {\n\treturn 23\n}\n")
+        return [rel.as_posix()]
+    if name == "route_decorator":
+        create_route_repo(repo_dir, "/api/items")
+        return ["routes.py"]
+    if name == "python_reexport":
+        rel = Path("fastapi") / "__init__.py"
+        write_text(repo_dir / rel, "from .openapi.models import Header\n")
+        return [rel.as_posix()]
+    raise ValueError(f"unknown matrix scenario: {name}")
+
+
+def run_index_for_transport(
+    transport: str,
+    binary: Path,
+    env: dict[str, str],
+    repo_dir: Path,
+    timeout: int,
+    include_logs: bool,
+    client: McpClient | None = None,
+) -> dict[str, Any]:
+    if transport == "mcp":
+        if client is None:
+            raise RuntimeError("MCP transport requires an active client")
+        return run_index_mcp(client, repo_dir, include_logs)
+    return run_index(binary, env, repo_dir, timeout, include_logs)
+
+
+def run_matrix_case(
+    scenario: str,
+    binary: Path,
+    env: dict[str, str],
+    case_root: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    repo_dir = case_root / "repo"
+    cache_dir = case_root / "cache"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    case_env = dict(env)
+    case_env["CBM_CACHE_DIR"] = str(cache_dir)
+    run_config_set(binary, case_env, "incremental_reindex", "always", args.timeout)
+    run_config_set(binary, case_env, "rank_refresh", args.rank_refresh, args.timeout)
+
+    prepare_matrix_scenario(scenario, repo_dir, args.files, args.functions_per_file)
+    if args.transport == "mcp":
+        with McpClient(binary, case_env, args.timeout) as client:
+            initial = run_index_for_transport(
+                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client
+            )
+            changed_paths = mutate_matrix_scenario(scenario, repo_dir, args.functions_per_file)
+            incremental = run_index_for_transport(
+                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client
+            )
+    else:
+        initial = run_index_for_transport(
+            args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs
+        )
+        changed_paths = mutate_matrix_scenario(scenario, repo_dir, args.functions_per_file)
+        incremental = run_index_for_transport(
+            args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs
+        )
+
+    project_db = find_project_db(cache_dir)
+    project = str(incremental.get("response", {}).get("project") or project_db.stem)
+    incremental_snapshot = case_root / "incremental.db"
+    shutil.copy2(project_db, incremental_snapshot)
+    removed_dbs = remove_project_dbs(cache_dir)
+
+    if args.transport == "mcp":
+        with McpClient(binary, case_env, args.timeout) as client:
+            full_rebuild = run_index_for_transport(
+                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client
+            )
+    else:
+        full_rebuild = run_index_for_transport(
+            args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs
+        )
+
+    full_db = find_project_db(cache_dir)
+    canonical = compare_canonical_graph(incremental_snapshot, full_db, project)
+    incremental_reason = incremental.get("exact_reason")
+    publish_kind = incremental.get("publish_kind")
+    explicit_route = publish_kind == PUBLISH_INCREMENTAL_EXACT or bool(incremental_reason)
+    passed = bool(canonical.get("equal")) and explicit_route
+    speedup = max(1, int(full_rebuild["elapsed_ms"])) / max(1, int(incremental["elapsed_ms"]))
+    return {
+        "scenario": scenario,
+        "project": project,
+        "changed_paths": changed_paths,
+        "removed_project_dbs": removed_dbs,
+        "initial_fast_full": initial,
+        "incremental": incremental,
+        "fresh_fast_full_after_change": full_rebuild,
+        "canonical_graph": canonical,
+        "explicit_exact_or_fallback": explicit_route,
+        "exact_reason": incremental_reason,
+        "speedup_full_rebuild_over_incremental": speedup,
+        "passed": passed,
+    }
+
+
+def run_matrix(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], int]:
+    auto_root = not bool(args.work_root)
+    work_root = Path(args.work_root).expanduser() if args.work_root else Path(
+        tempfile.mkdtemp(prefix="cbm-incr-matrix-")
+    )
+    work_root.mkdir(parents=True, exist_ok=True)
+    scenarios = [item.strip() for item in args.matrix_scenarios.split(",") if item.strip()]
+    report: dict[str, Any] = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "binary": str(binary),
+        "work_root": str(work_root),
+        "mode": "matrix",
+        "parameters": {
+            "files": args.files,
+            "functions_per_file": args.functions_per_file,
+            "rank_refresh": args.rank_refresh,
+            "timeout": args.timeout,
+            "transport": args.transport,
+            "scenarios": scenarios,
+        },
+        "cleanup": {"requested": auto_root and not args.keep_work_root, "removed": False},
+        "cases": [],
+    }
+    exit_code = 1
+    try:
+        base_env = build_env(work_root / "cache-base")
+        for scenario in scenarios:
+            case = run_matrix_case(scenario, binary, base_env, work_root / scenario, args)
+            report["cases"].append(case)
+        report["derived"] = {
+            "passed": all(bool(case.get("passed")) for case in report["cases"]),
+            "case_count": len(report["cases"]),
+        }
+        exit_code = 0 if report["derived"]["passed"] else 1
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        exit_code = 1
+    finally:
+        if auto_root and not args.keep_work_root:
+            shutil.rmtree(work_root, ignore_errors=True)
+            report["cleanup"]["removed"] = not work_root.exists()
+        if args.out:
+            out_path = Path(args.out).expanduser()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(json.dumps(report, indent=2, sort_keys=True))
+    return report, exit_code
 
 
 def parse_args() -> argparse.Namespace:
@@ -396,6 +726,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--keep-work-root", action="store_true")
     parser.add_argument("--include-logs", action="store_true")
+    parser.add_argument("--matrix", action="store_true", help="Run the affected-frontier scenario matrix.")
+    parser.add_argument(
+        "--matrix-scenarios",
+        default=MATRIX_SCENARIOS_DEFAULT,
+        help="Comma-separated matrix scenarios to run.",
+    )
     parser.add_argument(
         "--transport",
         choices=("cli", "mcp"),
@@ -414,6 +750,9 @@ def main() -> int:
     if not binary.is_file():
         print(f"error: binary not found: {binary}", file=sys.stderr)
         return 2
+    if args.matrix:
+        _, matrix_exit_code = run_matrix(args, binary)
+        return matrix_exit_code
 
     auto_root = not bool(args.work_root)
     work_root = Path(args.work_root).expanduser() if args.work_root else Path(
