@@ -7551,6 +7551,26 @@ static int pipeline_store_file_hash_count(const char *db_path, const char *proje
     return rc == CBM_STORE_OK ? count : CBM_STORE_ERR;
 }
 
+static int pipeline_store_file_state_generation(const char *db_path, const char *project,
+                                                const char *rel_path, int64_t *out_generation) {
+    if (!out_generation) {
+        return CBM_STORE_ERR;
+    }
+    *out_generation = 0;
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    cbm_file_state_t state = {0};
+    int rc = cbm_store_get_file_state(s, project, rel_path, &state);
+    if (rc == CBM_STORE_OK) {
+        *out_generation = state.generation;
+        cbm_store_file_state_free_fields(&state);
+    }
+    cbm_store_close(s);
+    return rc;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  FastAPI Depends() edge tracking (PR #66, fix #27)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -7983,6 +8003,99 @@ TEST(incremental_detects_changed_file) {
     free(project);
     cbm_config_close(cfg);
 
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_exact_upsert_uses_positive_generation) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 1\n}\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 2\n}\n\n"
+                            "func NewLeaf() int {\n\treturn 7\n}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "NewLeaf"));
+    int64_t generation = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "leaf.go",
+                                                   &generation),
+              CBM_STORE_OK);
+    ASSERT_GT(generation, CBM_PIPELINE_COMPAT_GENERATION);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_full_mode_keeps_exact_upsert_disabled) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/main.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func main() {\n\tHelper()\n}\n\n"
+                            "func FullModeNewMain() int {\n\treturn 9\n}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "FullModeNewMain"));
+    int64_t generation = -1;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "main.go",
+                                                   &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, CBM_PIPELINE_COMPAT_GENERATION);
+
+    free(project);
+    cbm_config_close(cfg);
     cleanup_incremental_repo();
     PASS();
 }
@@ -9832,6 +9945,8 @@ SUITE(pipeline) {
     /* Incremental */
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_detects_changed_file);
+    RUN_TEST(incremental_fast_exact_upsert_uses_positive_generation);
+    RUN_TEST(incremental_full_mode_keeps_exact_upsert_disabled);
     RUN_TEST(incremental_detects_same_size_rewrite_with_preserved_mtime);
     RUN_TEST(incremental_missing_file_state_keeps_legacy_metadata_path);
     RUN_TEST(incremental_dump_failure_keeps_existing_db);
