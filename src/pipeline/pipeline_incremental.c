@@ -1,7 +1,8 @@
 /*
  * pipeline_incremental.c — Disk-based incremental re-indexing.
  *
- * Compares file mtime+size against stored hashes to classify changed/unchanged.
+ * Compares file metadata against stored hashes, hash-confirming metadata-equal
+ * files when compatible file_state rows are available.
  * For non-noop changes, loads the existing SQLite graph into a graph buffer,
  * purges changed/deleted file paths, reparses changed files, and republishes
  * the full graph. This is correctness containment, not a true delta publish.
@@ -67,11 +68,35 @@ static bool incr_test_fail_phase_enabled(const char *phase) {
 
 /* ── File classification ─────────────────────────────────────────── */
 
-/* Classify discovered files against stored hashes using mtime+size.
+static bool file_state_hash_match_or_legacy(cbm_store_t *store, const char *project,
+                                            const cbm_file_info_t *file) {
+    if (!store || !project || !project[0] || !file || !file->path || !file->rel_path) {
+        return true;
+    }
+
+    cbm_file_state_t state = {0};
+    int rc = cbm_store_get_file_state(store, project, file->rel_path, &state);
+    if (rc == CBM_STORE_NOT_FOUND) {
+        return true;
+    }
+    if (rc != CBM_STORE_OK || !state.content_hash || !state.content_hash[0]) {
+        cbm_store_file_state_free_fields(&state);
+        return false;
+    }
+
+    char current_hash[CBM_SZ_32];
+    rc = cbm_pipeline_content_hash_file(file->path, current_hash, sizeof(current_hash));
+    bool matches = (rc == CBM_STORE_OK && strcmp(current_hash, state.content_hash) == 0);
+    cbm_store_file_state_free_fields(&state);
+    return matches;
+}
+
+/* Classify discovered files against stored metadata.
  * Returns a boolean array: changed[i] = true if files[i] needs re-parsing.
  * Caller must free the returned array. */
-static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_hash_t *stored,
-                            int stored_count, int *out_changed, int *out_unchanged) {
+static bool *classify_files(cbm_store_t *store, const char *project, cbm_file_info_t *files,
+                            int file_count, cbm_file_hash_t *stored, int stored_count,
+                            int *out_changed, int *out_unchanged) {
     bool *changed = calloc((size_t)file_count, sizeof(bool));
     if (!changed) {
         return NULL;
@@ -83,6 +108,10 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
     /* Build lookup: rel_path -> stored hash */
     CBMHashTable *ht =
         cbm_ht_create(stored_count > 0 ? (size_t)stored_count * PAIR_LEN : CBM_SZ_64);
+    if (!ht) {
+        free(changed);
+        return NULL;
+    }
     for (int i = 0; i < stored_count; i++) {
         cbm_ht_set(ht, stored[i].rel_path, &stored[i]);
     }
@@ -104,6 +133,9 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
         }
 
         if (cbm_pipeline_stat_mtime_ns(&st) != h->mtime_ns || st.st_size != h->size) {
+            changed[i] = true;
+            n_changed++;
+        } else if (!file_state_hash_match_or_legacy(store, project, &files[i])) {
             changed[i] = true;
             n_changed++;
         } else {
@@ -334,7 +366,8 @@ static void incr_classification_free(cbm_incr_classification_t *c) {
     memset(c, 0, sizeof(*c));
 }
 
-static int incr_classification_build(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count,
+static int incr_classification_build(cbm_pipeline_t *p, cbm_store_t *store, const char *project,
+                                     cbm_file_info_t *files, int file_count,
                                      cbm_file_hash_t *stored, int stored_count,
                                      cbm_incr_classification_t *out) {
     if (!p || !out) {
@@ -343,7 +376,8 @@ static int incr_classification_build(cbm_pipeline_t *p, cbm_file_info_t *files, 
     memset(out, 0, sizeof(*out));
 
     out->is_changed =
-        classify_files(files, file_count, stored, stored_count, &out->n_changed, &out->n_unchanged);
+        classify_files(store, project, files, file_count, stored, stored_count, &out->n_changed,
+                       &out->n_unchanged);
     if (!out->is_changed) {
         cbm_log_error("incremental.err", "msg", "classify_files_oom");
         return CBM_NOT_FOUND;
@@ -894,7 +928,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     /* Classify stored/current files once. This shared result is the future
      * route-decision boundary for exact delta and the existing containment path. */
     cbm_incr_classification_t cls = {0};
-    if (incr_classification_build(p, files, file_count, stored, stored_count, &cls) != 0) {
+    if (incr_classification_build(p, store, project, files, file_count, stored, stored_count,
+                                  &cls) != 0) {
         cbm_store_free_file_hashes(stored, stored_count);
         cbm_store_close(store);
         return CBM_NOT_FOUND;

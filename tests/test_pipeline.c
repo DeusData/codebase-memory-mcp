@@ -25,6 +25,11 @@
 #include "foundation/compat_thread.h"
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <sys/utime.h>
+#else
+#include <utime.h>
+#endif
 #include <unistd.h>
 #include "graph_buffer/graph_buffer.h"
 #include "yyjson/yyjson.h"
@@ -6639,6 +6644,26 @@ static int pipeline_store_has_function_name(const char *db_path, const char *pro
     return found;
 }
 
+static int pipeline_restore_file_times(const char *path, const struct stat *st) {
+    if (!path || !st) {
+        return -1;
+    }
+#ifdef _WIN32
+    struct __utimbuf64 times = {.actime = st->st_atime, .modtime = st->st_mtime};
+    return _utime64(path, &times);
+#else
+    struct timespec times[CBM_SZ_2];
+#ifdef __APPLE__
+    times[0] = st->st_atimespec;
+    times[SKIP_ONE] = st->st_mtimespec;
+#else
+    times[0] = st->st_atim;
+    times[SKIP_ONE] = st->st_mtim;
+#endif
+    return utimensat(AT_FDCWD, path, times, 0);
+#endif
+}
+
 static int pipeline_store_file_hash_count(const char *db_path, const char *project) {
     cbm_store_t *s = cbm_store_open_path_query(db_path);
     if (!s) {
@@ -7084,6 +7109,91 @@ TEST(incremental_detects_changed_file) {
     free(project);
     cbm_config_close(cfg);
 
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_detects_same_size_rewrite_with_preserved_mtime) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    const char original[] = "package main\n\nfunc Helper() string {\n\treturn \"hello\"\n}\n";
+    const char rewritten[] = "package main\n\nfunc Helped() string {\n\treturn \"hello\"\n}\n";
+    ASSERT_EQ((int)strlen(original), (int)strlen(rewritten));
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "Helper"));
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "Helped"));
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    struct stat before;
+    ASSERT_EQ(stat(path, &before), 0);
+    ASSERT_EQ((int64_t)before.st_size, (int64_t)strlen(original));
+    ASSERT_EQ(th_write_file(path, rewritten), 0);
+    ASSERT_EQ(pipeline_restore_file_times(path, &before), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "Helper"));
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "Helped"));
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_missing_file_state_keeps_legacy_metadata_path) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_before = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_before, 0);
+    ASSERT_EQ(cbm_store_delete_file_state(s, project, "helper.go"), CBM_STORE_OK);
+    cbm_file_state_t state = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, project, "helper.go", &state), CBM_STORE_NOT_FOUND);
+    cbm_store_close(s);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_count_nodes(s, project), nodes_before);
+    cbm_store_close(s);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "Helper"));
+
+    free(project);
+    cbm_config_close(cfg);
     cleanup_incremental_repo();
     PASS();
 }
@@ -8832,6 +8942,8 @@ SUITE(pipeline) {
     /* Incremental */
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_detects_changed_file);
+    RUN_TEST(incremental_detects_same_size_rewrite_with_preserved_mtime);
+    RUN_TEST(incremental_missing_file_state_keeps_legacy_metadata_path);
     RUN_TEST(incremental_dump_failure_keeps_existing_db);
     RUN_TEST(incremental_postpass_failure_keeps_existing_db);
     RUN_TEST(incremental_hash_persist_failure_falls_back_to_full);
