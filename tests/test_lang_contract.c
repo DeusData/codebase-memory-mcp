@@ -637,7 +637,7 @@ static const CallCase CALL_CASES[] = {
      "print(value)\n}\n",
      true, NULL},
     {"dart", "a.dart", "void helper() {\n  print('helper');\n}\n\nvoid run() {\n  helper();\n}\n",
-     false, "selector call node carries no callee field; no dart branch in extract_calls.c"},
+     true, NULL},
     {"scala", "a.scala", "def helper(): Int =\n  21 + 21\n\ndef run(): Int =\n  helper() * 2\n",
      true, NULL},
     {"bash", "a.sh", "helper() {\n  echo \"doing work\"\n}\n\nrun() {\n  helper\n}\n", true, NULL},

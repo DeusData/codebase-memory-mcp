@@ -681,7 +681,7 @@ static TSNode resolve_func_name_c_family(TSNode *node_ptr, CBMLanguage lang, con
     }
     if ((lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
          lang == CBM_LANG_GLSL || lang == CBM_LANG_HLSL || lang == CBM_LANG_ISPC ||
-         lang == CBM_LANG_SLANG) &&
+         lang == CBM_LANG_SLANG || lang == CBM_LANG_OBJC) &&
         strcmp(kind, "function_definition") == 0) {
         return resolve_c_declarator_name(*node_ptr);
     }

@@ -181,6 +181,40 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
             }
         }
     }
+    if (ctx->language == CBM_LANG_OBJC && strcmp(ts_node_type(node), "method_definition") == 0) {
+        TSNode id = cbm_find_child_by_kind(node, "identifier");
+        if (!ts_node_is_null(id)) {
+            char *method_name = cbm_node_text(ctx->arena, id, ctx->source);
+            if (method_name && method_name[0]) {
+                if (state->enclosing_class_qn) {
+                    return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn,
+                                             method_name);
+                }
+                return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, method_name);
+            }
+        }
+    }
+    if (ctx->language == CBM_LANG_DART &&
+        (strcmp(ts_node_type(node), "function_signature") == 0 ||
+         strcmp(ts_node_type(node), "method_signature") == 0)) {
+        TSNode signature = node;
+        if (strcmp(ts_node_type(node), "method_signature") == 0) {
+            TSNode child_sig = cbm_find_child_by_kind(node, "function_signature");
+            if (!ts_node_is_null(child_sig)) {
+                signature = child_sig;
+            }
+        }
+        TSNode id = cbm_find_child_by_kind(signature, "identifier");
+        if (!ts_node_is_null(id)) {
+            char *name = cbm_node_text(ctx->arena, id, ctx->source);
+            if (name && name[0]) {
+                if (state->enclosing_class_qn) {
+                    return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name);
+                }
+                return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+            }
+        }
+    }
 
     TSNode name_node = resolve_func_name_node(node, ctx->language);
     if (ts_node_is_null(name_node)) {
@@ -204,6 +238,13 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node) {
     /* Newer tree-sitter-kotlin: class/object name is a type_identifier child. */
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_KOTLIN) {
         name_node = cbm_find_child_by_kind(node, "type_identifier");
+    }
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_OBJC) {
+        name_node = cbm_find_child_by_kind(node, "identifier");
+    }
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_RUST &&
+        strcmp(ts_node_type(node), "impl_item") == 0) {
+        name_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
     }
     if (ts_node_is_null(name_node)) {
         return NULL;
@@ -881,14 +922,17 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
         if (cqn) {
             push_scope(state, SCOPE_CLASS, depth, cqn);
         }
-    } else if (ctx->language == CBM_LANG_RUST && strcmp(ts_node_type(node), "impl_item") == 0) {
-        TSNode type_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
-        if (!ts_node_is_null(type_node)) {
-            char *type_name = cbm_node_text(ctx->arena, type_node, ctx->source);
-            if (type_name && type_name[0]) {
-                const char *tqn =
-                    cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, type_name);
-                push_scope(state, SCOPE_CLASS, depth, tqn);
+    } else if (ctx->language == CBM_LANG_DART && strcmp(ts_node_type(node), "function_body") == 0) {
+        TSNode prev = ts_node_prev_sibling(node);
+        while (!ts_node_is_null(prev) &&
+               strcmp(ts_node_type(prev), "function_signature") != 0 &&
+               strcmp(ts_node_type(prev), "method_signature") != 0) {
+            prev = ts_node_prev_sibling(prev);
+        }
+        if (!ts_node_is_null(prev)) {
+            const char *fqn = compute_func_qn(ctx, prev, spec, state);
+            if (fqn) {
+                push_scope(state, SCOPE_FUNC, depth, fqn);
             }
         }
     }
