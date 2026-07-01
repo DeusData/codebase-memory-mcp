@@ -775,6 +775,18 @@ static char *extract_nix_callee(CBMArena *a, TSNode node, const char *source, co
     return NULL;
 }
 
+// COBOL CALL statements carry the program name in the grammar's x field.
+static char *extract_cobol_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "call_statement") != 0) {
+        return NULL;
+    }
+    TSNode target = ts_node_child_by_field_name(node, TS_FIELD("x"));
+    if (ts_node_is_null(target)) {
+        return NULL;
+    }
+    return (char *)strip_quotes(a, cbm_node_text(a, target, source));
+}
+
 // Make builtins are represented as function_call nodes; $(shell ...) is shell_function.
 static char *extract_make_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
     if (strcmp(nk, "shell_function") == 0) {
@@ -870,6 +882,10 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
     }
     if (lang == CBM_LANG_NIX) {
         char *c = extract_nix_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
+    if (lang == CBM_LANG_COBOL) {
+        char *c = extract_cobol_callee(a, node, source, nk);
         return c ? c : extract_scripting_callee(a, node, source, lang, nk);
     }
 
