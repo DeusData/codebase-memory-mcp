@@ -10,6 +10,7 @@
  * Total: 47 Go tests → 47 C tests
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 #include "../src/foundation/constants.h"
 #include "test_framework.h"
 #include "test_helpers.h"
@@ -253,7 +254,7 @@ TEST(cli_detect_shell_rc_zsh) {
         free(old_shell);
     } else
         cbm_unsetenv("SHELL");
-    rmdir(tmpdir);
+    cbm_rmdir(tmpdir);
     PASS();
 }
 
@@ -277,7 +278,7 @@ TEST(cli_detect_shell_rc_bash) {
         free(old_shell);
     } else
         cbm_unsetenv("SHELL");
-    rmdir(tmpdir);
+    cbm_rmdir(tmpdir);
     PASS();
 }
 
@@ -300,13 +301,13 @@ TEST(cli_detect_shell_rc_bash_with_bashrc) {
     const char *rc = cbm_detect_shell_rc(tmpdir);
     ASSERT_STR_EQ(rc, bashrc);
 
-    unlink(bashrc);
+    cbm_unlink(bashrc);
     if (old_shell) {
         cbm_setenv("SHELL", old_shell, 1);
         free(old_shell);
     } else
         cbm_unsetenv("SHELL");
-    rmdir(tmpdir);
+    cbm_rmdir(tmpdir);
     PASS();
 }
 
@@ -328,7 +329,7 @@ TEST(cli_detect_shell_rc_fish) {
         free(old_shell);
     } else
         cbm_unsetenv("SHELL");
-    rmdir(tmpdir);
+    cbm_rmdir(tmpdir);
     PASS();
 }
 
@@ -350,7 +351,7 @@ TEST(cli_detect_shell_rc_default) {
         free(old_shell);
     } else
         cbm_unsetenv("SHELL");
-    rmdir(tmpdir);
+    cbm_rmdir(tmpdir);
     PASS();
 }
 
@@ -376,7 +377,7 @@ TEST(cli_find_cli_not_found) {
         cbm_setenv("PATH", old_path, 1);
         free(old_path);
     }
-    rmdir(tmpdir);
+    cbm_rmdir(tmpdir);
     PASS();
 }
 
@@ -393,7 +394,7 @@ TEST(cli_find_cli_on_path) {
     th_make_executable(fakecli);
 
 #ifdef _WIN32
-    rmdir(tmpdir);
+    cbm_rmdir(tmpdir);
     SKIP_PLATFORM("Windows: PATH-based CLI lookup uses POSIX semantics");
 #endif
     const char *raw = getenv("PATH");
@@ -408,8 +409,8 @@ TEST(cli_find_cli_on_path) {
         cbm_setenv("PATH", old_path, 1);
         free(old_path);
     }
-    unlink(fakecli);
-    rmdir(tmpdir);
+    cbm_unlink(fakecli);
+    cbm_rmdir(tmpdir);
     PASS();
 }
 
@@ -421,7 +422,7 @@ TEST(cli_find_cli_fallback_paths) {
         FAIL("cbm_mkdtemp failed");
 
 #ifdef _WIN32
-    rmdir(tmpdir);
+    cbm_rmdir(tmpdir);
     SKIP_PLATFORM("Windows: fallback path lookup uses POSIX semantics");
 #endif
     char localbin[512];
@@ -1161,7 +1162,7 @@ TEST(cli_copy_file_source_not_found) {
     int rc = cbm_copy_file(src, dst);
     ASSERT(rc != 0);
 
-    rmdir(tmpdir);
+    cbm_rmdir(tmpdir);
     PASS();
 }
 
@@ -1449,7 +1450,7 @@ TEST(cli_install_dry_run) {
         ASSERT(stat(path, &st) != 0);
     }
 
-    rmdir(tmpdir);
+    cbm_rmdir(tmpdir);
     PASS();
 }
 
@@ -2018,7 +2019,7 @@ TEST(cli_detect_agents_none_found) {
         free(saved_ccd_copy);
     }
 
-    rmdir(tmpdir);
+    cbm_rmdir(tmpdir);
     PASS();
 }
 
@@ -3015,8 +3016,8 @@ TEST(replace_binary_overwrites_readonly) {
     ASSERT_EQ(stat(path, &st), 0);
     ASSERT_EQ(st.st_mode & 0777, 0755);
 
-    remove(path);
-    rmdir(tmpdir);
+    cbm_unlink(path);
+    cbm_rmdir(tmpdir);
     PASS();
 }
 
@@ -3042,8 +3043,8 @@ TEST(replace_binary_creates_new_file) {
     fclose(check);
     ASSERT_STR_EQ(buf, "brand-new");
 
-    remove(path);
-    rmdir(tmpdir);
+    cbm_unlink(path);
+    cbm_rmdir(tmpdir);
     PASS();
 }
 
@@ -3086,8 +3087,8 @@ TEST(cli_remove_indexes_preserves_config_db) {
     } else {
         cbm_unsetenv("CBM_CACHE_DIR");
     }
-    remove(config_db);
-    rmdir(tmpdir);
+    cbm_unlink(config_db);
+    cbm_rmdir(tmpdir);
     PASS();
 }
 

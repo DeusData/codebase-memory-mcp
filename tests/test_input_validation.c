@@ -7,6 +7,7 @@
  * input, and asserts the error response contains helpful guidance.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 #include "test_framework.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
@@ -1045,8 +1046,10 @@ TEST(path_project_auto_indexes_separate_directory) {
     } else {
         cbm_unsetenv("CBM_AUTO_INDEX");
     }
-    unlink(target_src); rmdir(target_tmp);
-    unlink(session_src); rmdir(session_tmp);
+    cbm_unlink(target_src);
+    cbm_rmdir(target_tmp);
+    cbm_unlink(session_src);
+    cbm_rmdir(session_tmp);
 
     ASSERT_TRUE(has_match);
     PASS();
@@ -1119,11 +1122,11 @@ TEST(path_project_autoindex_respects_file_limit) {
     } else {
         cbm_unsetenv("CBM_AUTO_INDEX_LIMIT");
     }
-    unlink(target_src1);
-    unlink(target_src2);
-    rmdir(target_tmp);
-    unlink(session_src);
-    rmdir(session_tmp);
+    cbm_unlink(target_src1);
+    cbm_unlink(target_src2);
+    cbm_rmdir(target_tmp);
+    cbm_unlink(session_src);
+    cbm_rmdir(session_tmp);
 
     ASSERT_FALSE(has_match);
     PASS();
