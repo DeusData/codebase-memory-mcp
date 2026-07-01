@@ -32,6 +32,8 @@ enum {
     STORE_TEST_COMPLETED_SET = 1,
 };
 
+static const char STORE_TEST_INVALID_DERIVED_STATUS[] = "fresh-ish";
+
 static int store_count_index_generation(cbm_store_t *s, const char *project, int64_t generation,
                                         const char *status, const char *repo_fingerprint,
                                         const char *config_fingerprint, int completed_state) {
@@ -1906,6 +1908,58 @@ TEST(store_file_delta_delete_cleans_graph_and_metadata) {
     PASS();
 }
 
+TEST(store_derived_view_state_public_api) {
+    enum {
+        STALE_GENERATION = 5,
+        COMPLETE_GENERATION = 6,
+    };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    const char *views[] = {CBM_STORE_DERIVED_VIEW_PAGERANK,
+                           CBM_STORE_DERIVED_VIEW_NODE_DEGREE,
+                           CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES};
+    ASSERT_EQ(cbm_store_mark_derived_views_stale(s, "test", STALE_GENERATION, views,
+                                                 (int)(sizeof(views) / sizeof(views[0]))),
+              CBM_STORE_OK);
+    ASSERT_EQ(store_count_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                             STALE_GENERATION, CBM_STORE_DERIVED_STATUS_STALE),
+              1);
+    ASSERT_EQ(store_count_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_NODE_DEGREE,
+                                             STALE_GENERATION, CBM_STORE_DERIVED_STATUS_STALE),
+              1);
+    ASSERT_EQ(store_count_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
+                                             STALE_GENERATION, CBM_STORE_DERIVED_STATUS_STALE),
+              1);
+
+    ASSERT_EQ(cbm_store_set_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                               COMPLETE_GENERATION,
+                                               CBM_STORE_DERIVED_STATUS_COMPLETE),
+              CBM_STORE_OK);
+    ASSERT_EQ(store_count_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                             STALE_GENERATION, CBM_STORE_DERIVED_STATUS_STALE),
+              0);
+    ASSERT_EQ(store_count_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                             COMPLETE_GENERATION,
+                                             CBM_STORE_DERIVED_STATUS_COMPLETE),
+              1);
+
+    ASSERT_EQ(cbm_store_set_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_LINKRANK,
+                                               COMPLETE_GENERATION,
+                                               STORE_TEST_INVALID_DERIVED_STATUS),
+              CBM_STORE_ERR);
+    ASSERT_EQ(store_count_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_LINKRANK,
+                                             COMPLETE_GENERATION,
+                                             CBM_STORE_DERIVED_STATUS_COMPLETE),
+              0);
+    ASSERT_EQ(cbm_store_mark_derived_views_stale(s, "test", COMPLETE_GENERATION, NULL, 0),
+              CBM_STORE_OK);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Properties JSON round-trip ─────────────────────────────────── */
 
 TEST(store_node_properties_json) {
@@ -3032,6 +3086,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_file_delta_batch_complete_rolls_back_when_generation_missing);
     RUN_TEST(store_file_delta_publish_commits_graph_and_metadata);
     RUN_TEST(store_file_delta_delete_cleans_graph_and_metadata);
+    RUN_TEST(store_derived_view_state_public_api);
     RUN_TEST(store_node_properties_json);
     RUN_TEST(store_node_null_properties);
     RUN_TEST(store_find_by_file_overlap);

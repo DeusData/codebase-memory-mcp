@@ -2517,6 +2517,79 @@ static int store_upsert_derived_view_state(cbm_store_t *s, const char *project,
     return CBM_STORE_OK;
 }
 
+static bool store_derived_status_valid(const char *status) {
+    return status && (strcmp(status, CBM_STORE_DERIVED_STATUS_STALE) == 0 ||
+                      strcmp(status, CBM_STORE_DERIVED_STATUS_COMPLETE) == 0);
+}
+
+int cbm_store_set_derived_view_state(cbm_store_t *s, const char *project,
+                                     const char *view_name, int64_t generation,
+                                     const char *status) {
+    if (!s || !s->db || !project || !project[0] || !view_name || !view_name[0] ||
+        generation <= 0 || !store_derived_status_valid(status)) {
+        if (s) {
+            store_set_error(s, "set_derived_view_state: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    int rc = cbm_store_begin(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_upsert_derived_view_state(s, project, view_name, generation, status);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    rc = cbm_store_commit(s);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_mark_derived_views_stale(cbm_store_t *s, const char *project,
+                                       int64_t generation, const char *const *view_names,
+                                       int view_count) {
+    if (!s || !s->db || !project || !project[0] || generation <= 0 || view_count < 0 ||
+        (view_count > 0 && !view_names)) {
+        if (s) {
+            store_set_error(s, "mark_derived_views_stale: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < view_count; i++) {
+        if (!view_names[i] || !view_names[i][0]) {
+            store_set_error(s, "mark_derived_views_stale: invalid view name");
+            return CBM_STORE_ERR;
+        }
+    }
+    if (view_count == 0) {
+        return CBM_STORE_OK;
+    }
+
+    int rc = cbm_store_begin(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    for (int i = 0; i < view_count; i++) {
+        rc = store_upsert_derived_view_state(s, project, view_names[i], generation,
+                                             CBM_STORE_DERIVED_STATUS_STALE);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(s);
+            return rc;
+        }
+    }
+    rc = cbm_store_commit(s);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    return CBM_STORE_OK;
+}
+
 int cbm_store_reserve_index_generation(cbm_store_t *s, const char *project,
                                        const char *repo_fingerprint,
                                        const char *config_fingerprint,

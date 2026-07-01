@@ -33,6 +33,12 @@ typedef struct cbm_store cbm_store_t;
 #define CBM_STORE_DERIVED_STATUS_COMPLETE "complete"
 #define CBM_STORE_DERIVED_KIND_DIRECT "direct"
 #define CBM_STORE_DERIVED_VIEW_NODES_FTS "nodes_fts"
+#define CBM_STORE_DERIVED_VIEW_PAGERANK "pagerank"
+#define CBM_STORE_DERIVED_VIEW_LINKRANK "linkrank"
+#define CBM_STORE_DERIVED_VIEW_NODE_DEGREE "node_degree"
+#define CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES "semantic_edges"
+#define CBM_STORE_DERIVED_VIEW_ROUTES "routes"
+#define CBM_STORE_DERIVED_VIEW_ARCHITECTURE "architecture"
 #define CBM_STORE_NO_NODE_ID 0
 
 /* ── Data structures ────────────────────────────────────────────── */
@@ -552,6 +558,16 @@ int cbm_store_reserve_index_generation(cbm_store_t *s, const char *project,
 /* Finish a previously reserved generation as complete or failed. */
 int cbm_store_finish_index_generation(cbm_store_t *s, const char *project, int64_t generation,
                                       const char *status);
+
+/* Record derived-view freshness. Status must be one of CBM_STORE_DERIVED_STATUS_*. */
+int cbm_store_set_derived_view_state(cbm_store_t *s, const char *project,
+                                     const char *view_name, int64_t generation,
+                                     const char *status);
+
+/* Mark multiple derived views stale in one transaction. view_count may be 0. */
+int cbm_store_mark_derived_views_stale(cbm_store_t *s, const char *project,
+                                       int64_t generation, const char *const *view_names,
+                                       int view_count);
 
 int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *delta);
 int cbm_store_publish_file_delta_batch(cbm_store_t *s,
