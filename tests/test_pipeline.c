@@ -7660,6 +7660,17 @@ static int pipeline_file_delta_count_usage_edge(const cbm_pipeline_file_delta_t 
     return matches;
 }
 
+static const char *pipeline_exact_scratch_structure_root_qn(const cbm_gbuf_t *gbuf,
+                                                            const char *project) {
+    const cbm_gbuf_node_t **branches = NULL;
+    int branch_count = 0;
+    if (cbm_gbuf_find_by_label(gbuf, "Branch", &branches, &branch_count) == 0 &&
+        branch_count > 0 && branches[0]->qualified_name) {
+        return branches[0]->qualified_name;
+    }
+    return project;
+}
+
 static int pipeline_build_exact_scratch_for_changed_files(cbm_store_t *store,
                                                           const char *repo_path,
                                                           const char *project,
@@ -7707,7 +7718,7 @@ static int pipeline_build_exact_scratch_for_changed_files(cbm_store_t *store,
                               .githistory_min_coupling = pipeline_default_threshold,
                               .lsp_confidence_floor = pipeline_default_threshold,
                               .result_cache = result_cache};
-    const char *structure_root_qn = project;
+    const char *structure_root_qn = pipeline_exact_scratch_structure_root_qn(scratch, project);
     for (int i = 0; i < changed_count; i++) {
         if (cbm_pipeline_ensure_file_structure(scratch, project, structure_root_qn,
                                                changed_files[i].rel_path, NULL) != 0) {
