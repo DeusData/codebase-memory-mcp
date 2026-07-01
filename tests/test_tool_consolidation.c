@@ -727,12 +727,16 @@ TEST(search_graph_slug_project_sets_session_context) {
      * list_projects. Results already came from that DB, but the first response
      * context used to stay empty unless project was passed as a filesystem path. */
     const char *proj = "_tc_ctx_slug_";
-    char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/%s.db", cbm_resolve_cache_dir(), proj);
+    char *root_path = th_mktempdir("cbm_tc_ctx_slug");
+    ASSERT_NOT_NULL(root_path);
+    char db_path[CBM_SZ_1K];
+    int npath = snprintf(db_path, sizeof(db_path), "%s/%s.db", cbm_resolve_cache_dir(), proj);
+    ASSERT_GT(npath, 0);
+    ASSERT((size_t)npath < sizeof(db_path));
 
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
-    ASSERT_EQ(cbm_store_upsert_project(s, proj, "/tmp/tc_ctx_slug"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(s, proj, root_path), CBM_STORE_OK);
     cbm_node_t n = {.project = proj,
                     .label = "Function",
                     .name = "tc_ctx_slug_fn",
@@ -752,8 +756,17 @@ TEST(search_graph_slug_project_sets_session_context) {
     ASSERT_NOT_NULL(strstr(result, "\\\"nodes\\\":1"));
     free(result);
 
+    result = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"_tc_ctx_slug_missing_\",\"name_pattern\":\"tc_ctx_slug_fn\",\"limit\":1}");
+    ASSERT_NOT_NULL(result);
+    ASSERT(strstr(result, "error") != NULL || strstr(result, "not found") != NULL ||
+           strstr(result, "not_found") != NULL);
+    free(result);
+
     cbm_mcp_server_free(srv);
     (void)unlink(db_path);
+    th_cleanup(root_path);
     PASS();
 }
 
