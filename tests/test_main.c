@@ -7,6 +7,7 @@
 int tf_pass_count = 0;
 int tf_fail_count = 0;
 int tf_skip_count = 0;
+int tf_filter_count = 0;
 
 #include "test_framework.h"
 #include <sqlite3.h>
@@ -140,6 +141,10 @@ int main(void) {
         }
     }
 
+    /* Optional focused runs:
+     *   CBM_ONLY_SUITE=<substring> selects matching suites.
+     *   CBM_ONLY_TEST=<substring> selects matching tests after suite setup.
+     * Leave both unset to run the complete test suite. */
     const char *only_suite = getenv("CBM_ONLY_SUITE");
     if (only_suite && only_suite[0]) {
         if (strstr("arena", only_suite)) RUN_SUITE(arena);

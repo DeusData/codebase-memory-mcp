@@ -45,6 +45,9 @@ const char *cbm_resolve_cache_dir(void);
 extern int tf_pass_count;
 extern int tf_fail_count;
 extern int tf_skip_count;
+extern int tf_filter_count;
+
+#define TF_ONLY_TEST_ENV "CBM_ONLY_TEST"
 
 /* ── Color helpers ─────────────────────────────────────────────── */
 
@@ -230,8 +233,17 @@ static inline const char *tf_reset(void) {
 
 /* ── Test runner ───────────────────────────────────────────────── */
 
+static inline int tf_test_filter_matches(const char *name) {
+    const char *only_test = getenv(TF_ONLY_TEST_ENV);
+    return !only_test || only_test[0] == '\0' || strstr(name, only_test) != NULL;
+}
+
 #define RUN_TEST(name)                                    \
     do {                                                  \
+        if (!tf_test_filter_matches(#name)) {             \
+            tf_filter_count++;                            \
+            break;                                        \
+        }                                                 \
         printf("  %-55s", #name);                         \
         fflush(stdout);                                   \
         int _result = test_##name();                      \
@@ -265,7 +277,13 @@ static inline const char *tf_reset(void) {
             printf(", %s%d failed%s", tf_red(), tf_fail_count, tf_reset());  \
         if (tf_skip_count > 0)                                               \
             printf(", %s%d skipped%s", tf_dim(), tf_skip_count, tf_reset()); \
+        if (tf_filter_count > 0)                                             \
+            printf(", %s%d filtered%s", tf_dim(), tf_filter_count,           \
+                   tf_reset());                                              \
         printf("\n────────────────────────────────────────────\n\n");        \
+        if (getenv(TF_ONLY_TEST_ENV) && getenv(TF_ONLY_TEST_ENV)[0] &&        \
+            tf_pass_count == 0 && tf_fail_count == 0 && tf_skip_count == 0)    \
+            return 1;                                                        \
         return tf_fail_count > 0 ? 1 : 0;                                    \
     } while (0)
 
