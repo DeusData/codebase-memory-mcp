@@ -73,7 +73,7 @@ static bool incr_test_fail_phase_enabled(const char *phase) {
  * Caller must free the returned array. */
 static bool *classify_files(cbm_store_t *store, const char *project, cbm_file_info_t *files,
                             int file_count, cbm_file_hash_t *stored, int stored_count,
-                            int *out_changed, int *out_unchanged) {
+                            const char *pass_fingerprint, int *out_changed, int *out_unchanged) {
     bool *changed = calloc((size_t)file_count, sizeof(bool));
     if (!changed) {
         return NULL;
@@ -113,7 +113,7 @@ static bool *classify_files(cbm_store_t *store, const char *project, cbm_file_in
             changed[i] = true;
             n_changed++;
         } else if (!cbm_pipeline_file_state_is_current_or_legacy(
-                       store, project, &files[i], cbm_pipeline_file_delta_pass_fingerprint())) {
+                       store, project, &files[i], pass_fingerprint)) {
             changed[i] = true;
             n_changed++;
         } else {
@@ -347,6 +347,7 @@ static void incr_classification_free(cbm_incr_classification_t *c) {
 static int incr_classification_build(cbm_pipeline_t *p, cbm_store_t *store, const char *project,
                                      cbm_file_info_t *files, int file_count,
                                      cbm_file_hash_t *stored, int stored_count,
+                                     const char *pass_fingerprint,
                                      cbm_incr_classification_t *out) {
     if (!p || !out) {
         return CBM_NOT_FOUND;
@@ -354,8 +355,8 @@ static int incr_classification_build(cbm_pipeline_t *p, cbm_store_t *store, cons
     memset(out, 0, sizeof(*out));
 
     out->is_changed =
-        classify_files(store, project, files, file_count, stored, stored_count, &out->n_changed,
-                       &out->n_unchanged);
+        classify_files(store, project, files, file_count, stored, stored_count, pass_fingerprint,
+                       &out->n_changed, &out->n_unchanged);
     if (!out->is_changed) {
         cbm_log_error("incremental.err", "msg", "classify_files_oom");
         return CBM_NOT_FOUND;
@@ -825,7 +826,7 @@ static const char *incremental_structure_root_qn(cbm_gbuf_t *gbuf, const char *p
 static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
                             cbm_file_info_t *files, int file_count,
                             const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
-                            const char *repo_path) {
+                            const char *repo_path, const char *pass_fingerprint) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
@@ -844,7 +845,8 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         int state_rc = CBM_STORE_OK;
         if (hash_rc == CBM_STORE_OK) {
             state_rc = cbm_pipeline_persist_file_states(hash_store, project, files, file_count,
-                                                        CBM_PIPELINE_COMPAT_GENERATION, NULL);
+                                                        CBM_PIPELINE_COMPAT_GENERATION,
+                                                        pass_fingerprint);
         }
 
         /* FTS5 rebuild after incremental dump.  The btree dump path bypasses
@@ -890,6 +892,12 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
 
     const char *project = cbm_pipeline_project_name(p);
+    char pass_fingerprint[CBM_SZ_256];
+    if (cbm_pipeline_current_pass_fingerprint(p, pass_fingerprint, sizeof(pass_fingerprint)) !=
+        CBM_STORE_OK) {
+        cbm_log_error("incremental.err", "phase", "pass_fingerprint");
+        return CBM_NOT_FOUND;
+    }
 
     /* Open existing disk DB */
     cbm_store_t *store = cbm_store_open_path(db_path);
@@ -907,7 +915,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * route-decision boundary for exact delta and the existing containment path. */
     cbm_incr_classification_t cls = {0};
     if (incr_classification_build(p, store, project, files, file_count, stored, stored_count,
-                                  &cls) != 0) {
+                                  pass_fingerprint, &cls) != 0) {
         cbm_store_free_file_hashes(stored, stored_count);
         cbm_store_close(store);
         return CBM_NOT_FOUND;
@@ -1136,7 +1144,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
     int persist_rc = dump_and_persist(existing, db_path, project, files, file_count, cls.mode_skipped,
-                                      cls.mode_skipped_count, cbm_pipeline_repo_path(p));
+                                      cls.mode_skipped_count, cbm_pipeline_repo_path(p),
+                                      pass_fingerprint);
     incr_classification_free(&cls);
     cbm_gbuf_free(existing);
     if (persist_rc != 0) {

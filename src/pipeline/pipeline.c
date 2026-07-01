@@ -299,6 +299,15 @@ double cbm_pipeline_lsp_confidence_floor(const cbm_pipeline_t *p) {
     return p ? p->lsp_confidence_floor : 0.0;
 }
 
+int cbm_pipeline_current_pass_fingerprint(const cbm_pipeline_t *p, char *out, size_t out_sz) {
+    if (!p) {
+        return CBM_STORE_ERR;
+    }
+    return cbm_pipeline_format_file_delta_pass_fingerprint(
+        out, out_sz, p->mode, p->similarity_threshold, p->httplink_min_confidence,
+        p->semantic_threshold, p->githistory_min_coupling, p->lsp_confidence_floor);
+}
+
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     if (p) {
         p->persistence = enabled;
@@ -1366,9 +1375,15 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
                         goto cleanup;
                     }
                 }
+                char pass_fingerprint[CBM_SZ_256];
                 int state_rc =
-                    cbm_pipeline_persist_file_states(hash_store, p->project_name, files, file_count,
-                                                     CBM_PIPELINE_COMPAT_GENERATION, NULL);
+                    cbm_pipeline_current_pass_fingerprint(p, pass_fingerprint,
+                                                          sizeof(pass_fingerprint));
+                if (state_rc == CBM_STORE_OK) {
+                    state_rc = cbm_pipeline_persist_file_states(
+                        hash_store, p->project_name, files, file_count,
+                        CBM_PIPELINE_COMPAT_GENERATION, pass_fingerprint);
+                }
                 if (state_rc != CBM_STORE_OK) {
                     cbm_log_error("pipeline.err", "phase", "persist_file_state", "rc",
                                   itoa_buf(state_rc));

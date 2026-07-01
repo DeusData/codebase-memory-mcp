@@ -3701,6 +3701,81 @@ TEST(pipeline_file_state_current_check_rejects_stale_pass_fingerprint) {
     PASS();
 }
 
+TEST(pipeline_pass_fingerprint_includes_effective_mode_and_thresholds) {
+    char full_default[CBM_SZ_256];
+    char full_tuned[CBM_SZ_256];
+    char full_tuned_again[CBM_SZ_256];
+    char fast_default[CBM_SZ_256];
+
+    cbm_pipeline_t *full = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FULL);
+    cbm_pipeline_t *fast = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(full);
+    ASSERT_NOT_NULL(fast);
+
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(full, full_default, sizeof(full_default)),
+              CBM_STORE_OK);
+    cbm_pipeline_set_similarity_threshold(full, 0.7);
+    cbm_pipeline_set_httplink_min_confidence(full, 0.25);
+    cbm_pipeline_set_semantic_threshold(full, 0.75);
+    cbm_pipeline_set_githistory_min_coupling(full, 0.3);
+    cbm_pipeline_set_lsp_confidence_floor(full, 0.6);
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(full, full_tuned, sizeof(full_tuned)),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(full, full_tuned_again,
+                                                    sizeof(full_tuned_again)),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(fast, fast_default, sizeof(fast_default)),
+              CBM_STORE_OK);
+
+    ASSERT_NEQ(strcmp(full_default, full_tuned), 0);
+    ASSERT_STR_EQ(full_tuned, full_tuned_again);
+    ASSERT_NEQ(strcmp(full_default, fast_default), 0);
+
+    cbm_pipeline_free(full);
+    cbm_pipeline_free(fast);
+    PASS();
+}
+
+TEST(pipeline_file_state_current_check_rejects_stale_config_fingerprint) {
+    enum { PIPELINE_FILE_STATE_GENERATION = 16 };
+    char *tmp = th_mktempdir("cbm_file_state_current_config");
+    ASSERT_NOT_NULL(tmp);
+    const char *path = TH_PATH(tmp, "main.go");
+    const char *content = "package main\nfunc Run() { println(\"config\") }\n";
+    ASSERT_EQ(th_write_file(path, content), 0);
+
+    char old_fingerprint[CBM_SZ_256];
+    char current_fingerprint[CBM_SZ_256];
+    ASSERT_EQ(cbm_pipeline_format_file_delta_pass_fingerprint(
+                  old_fingerprint, sizeof(old_fingerprint), CBM_MODE_FULL, 0.7, 0.25, 0.75,
+                  0.3, 0.6),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_format_file_delta_pass_fingerprint(
+                  current_fingerprint, sizeof(current_fingerprint), CBM_MODE_FULL, 0.8, 0.25,
+                  0.75, 0.3, 0.6),
+              CBM_STORE_OK);
+    ASSERT_NEQ(strcmp(old_fingerprint, current_fingerprint), 0);
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", tmp), CBM_STORE_OK);
+
+    cbm_file_info_t file = {.path = (char *)path,
+                            .rel_path = "main.go",
+                            .language = CBM_LANG_GO,
+                            .size = (int64_t)strlen(content)};
+    ASSERT_EQ(cbm_pipeline_persist_file_states(s, "test", &file, 1,
+                                               PIPELINE_FILE_STATE_GENERATION, old_fingerprint),
+              CBM_STORE_OK);
+    ASSERT_FALSE(cbm_pipeline_file_state_is_current_or_legacy(
+        s, "test", &file, current_fingerprint));
+    ASSERT_TRUE(cbm_pipeline_file_state_is_current_or_legacy(s, "test", &file, old_fingerprint));
+
+    cbm_store_close(s);
+    th_cleanup(tmp);
+    PASS();
+}
+
 TEST(pipeline_file_state_persist_helper_rolls_back_on_failure) {
     char *tmp = th_mktempdir("cbm_file_state_persist_fail");
     ASSERT_NOT_NULL(tmp);
@@ -8886,6 +8961,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_content_hash_helper_matches_file_delta_metadata);
     RUN_TEST(pipeline_file_state_persist_helper_writes_hash_metadata);
     RUN_TEST(pipeline_file_state_current_check_rejects_stale_pass_fingerprint);
+    RUN_TEST(pipeline_pass_fingerprint_includes_effective_mode_and_thresholds);
+    RUN_TEST(pipeline_file_state_current_check_rejects_stale_config_fingerprint);
     RUN_TEST(pipeline_file_state_persist_helper_rolls_back_on_failure);
     RUN_TEST(pipeline_file_delta_plan_candidate_from_frontier);
     RUN_TEST(pipeline_file_delta_apply_falls_back_on_publish_error);
