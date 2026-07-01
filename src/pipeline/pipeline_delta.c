@@ -16,6 +16,7 @@
 #include "xxhash/xxhash.h"
 
 static const char cbm_delta_edge_imports[] = "IMPORTS";
+static const char cbm_delta_edge_contains_file[] = "CONTAINS_FILE";
 static const char cbm_delta_file_hash_legacy_empty[] = "";
 static const char cbm_delta_prop_is_exported[] = "is_exported";
 static const char cbm_delta_pass_fingerprint_v1[] = "pipeline-file-delta-v1";
@@ -289,11 +290,18 @@ static void delta_visit_edge(const cbm_gbuf_edge_t *edge, void *userdata) {
         ctx->out->unsupported_edge_count++;
         return;
     }
-    if (!delta_same_path(src->file_path, ctx->rel_path)) {
+    bool source_owned = delta_same_path(src->file_path, ctx->rel_path);
+    bool target_is_changed_file = delta_same_path(tgt->file_path, ctx->rel_path) &&
+                                  tgt->label && strcmp(tgt->label, "File") == 0;
+    bool regenerated_file_structure = !source_owned &&
+                                      strcmp(edge->type, cbm_delta_edge_contains_file) == 0 &&
+                                      target_is_changed_file;
+    if (!source_owned && !regenerated_file_structure) {
         return;
     }
     ctx->rc = delta_append_edge(ctx, src, tgt, edge);
-    if (ctx->rc == CBM_STORE_OK && strcmp(edge->type, cbm_delta_edge_imports) == 0) {
+    if (source_owned && ctx->rc == CBM_STORE_OK &&
+        strcmp(edge->type, cbm_delta_edge_imports) == 0) {
         ctx->rc = delta_append_import(ctx, tgt, edge);
     }
 }
