@@ -68,29 +68,6 @@ static bool incr_test_fail_phase_enabled(const char *phase) {
 
 /* ── File classification ─────────────────────────────────────────── */
 
-static bool file_state_hash_match_or_legacy(cbm_store_t *store, const char *project,
-                                            const cbm_file_info_t *file) {
-    if (!store || !project || !project[0] || !file || !file->path || !file->rel_path) {
-        return true;
-    }
-
-    cbm_file_state_t state = {0};
-    int rc = cbm_store_get_file_state(store, project, file->rel_path, &state);
-    if (rc == CBM_STORE_NOT_FOUND) {
-        return true;
-    }
-    if (rc != CBM_STORE_OK || !state.content_hash || !state.content_hash[0]) {
-        cbm_store_file_state_free_fields(&state);
-        return false;
-    }
-
-    char current_hash[CBM_SZ_32];
-    rc = cbm_pipeline_content_hash_file(file->path, current_hash, sizeof(current_hash));
-    bool matches = (rc == CBM_STORE_OK && strcmp(current_hash, state.content_hash) == 0);
-    cbm_store_file_state_free_fields(&state);
-    return matches;
-}
-
 /* Classify discovered files against stored metadata.
  * Returns a boolean array: changed[i] = true if files[i] needs re-parsing.
  * Caller must free the returned array. */
@@ -135,7 +112,8 @@ static bool *classify_files(cbm_store_t *store, const char *project, cbm_file_in
         if (cbm_pipeline_stat_mtime_ns(&st) != h->mtime_ns || st.st_size != h->size) {
             changed[i] = true;
             n_changed++;
-        } else if (!file_state_hash_match_or_legacy(store, project, &files[i])) {
+        } else if (!cbm_pipeline_file_state_is_current_or_legacy(
+                       store, project, &files[i], cbm_pipeline_file_delta_pass_fingerprint())) {
             changed[i] = true;
             n_changed++;
         } else {

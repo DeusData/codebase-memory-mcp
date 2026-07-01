@@ -62,6 +62,10 @@ static char *delta_strdup(const char *s) {
     return cbm_strdup(s ? s : "");
 }
 
+const char *cbm_pipeline_file_delta_pass_fingerprint(void) {
+    return cbm_delta_pass_fingerprint_v1;
+}
+
 static bool delta_same_path(const char *a, const char *b) {
     return a && b && strcmp(a, b) == 0;
 }
@@ -370,6 +374,33 @@ int cbm_pipeline_content_hash_file(const char *path, char *out, size_t out_sz) {
     return n == CBM_DELTA_XXH64_HEX_LEN ? CBM_STORE_OK : CBM_STORE_ERR;
 }
 
+bool cbm_pipeline_file_state_is_current_or_legacy(cbm_store_t *store, const char *project,
+                                                  const cbm_file_info_t *file,
+                                                  const char *pass_fingerprint) {
+    if (!store || !project || !project[0] || !file || !file->path || !file->rel_path) {
+        return true;
+    }
+
+    cbm_file_state_t state = {0};
+    int rc = cbm_store_get_file_state(store, project, file->rel_path, &state);
+    if (rc == CBM_STORE_NOT_FOUND) {
+        return true;
+    }
+    const char *current_pass =
+        pass_fingerprint ? pass_fingerprint : cbm_pipeline_file_delta_pass_fingerprint();
+    bool matches = false;
+    if (rc == CBM_STORE_OK && state.content_hash && state.content_hash[0] &&
+        state.pass_fingerprint && strcmp(state.pass_fingerprint, current_pass) == 0) {
+        char current_hash[CBM_SZ_32];
+        matches =
+            (cbm_pipeline_content_hash_file(file->path, current_hash, sizeof(current_hash)) ==
+                 CBM_STORE_OK &&
+             strcmp(current_hash, state.content_hash) == 0);
+    }
+    cbm_store_file_state_free_fields(&state);
+    return matches;
+}
+
 int cbm_pipeline_persist_file_states(cbm_store_t *store, const char *project,
                                      const cbm_file_info_t *files, int file_count,
                                      int64_t generation, const char *pass_fingerprint) {
@@ -410,7 +441,7 @@ int cbm_pipeline_persist_file_states(cbm_store_t *store, const char *project,
                                   .size = st.st_size,
                                   .language = cbm_language_name(files[i].language),
                                   .pass_fingerprint = pass_fingerprint ? pass_fingerprint
-                                                                       : cbm_delta_pass_fingerprint_v1,
+                                                                       : cbm_pipeline_file_delta_pass_fingerprint(),
                                   .generation = generation,
                                   .indexed_at = indexed_at};
         rc = cbm_store_upsert_file_state(store, &state);
@@ -458,7 +489,8 @@ int cbm_pipeline_attach_file_delta_metadata(cbm_pipeline_file_delta_t *delta,
                                            .mtime_ns = mtime_ns,
                                            .size = st.st_size,
                                            .language = cbm_language_name(file->language),
-                                           .pass_fingerprint = cbm_delta_pass_fingerprint_v1,
+                                           .pass_fingerprint =
+                                               cbm_pipeline_file_delta_pass_fingerprint(),
                                            .generation = delta->delta.generation,
                                            .indexed_at = delta->file_indexed_at};
     delta->delta.file_hash = &delta->file_hash;
