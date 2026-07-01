@@ -391,18 +391,62 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) 
     }
 }
 
+static bool resolve_db_path_buf(const cbm_pipeline_t *p, char *path, size_t path_sz) {
+    if (!p || !path || path_sz == 0) {
+        return false;
+    }
+    path[0] = '\0';
+    if (p->db_path) {
+        int n = snprintf(path, path_sz, "%s", p->db_path);
+        return n > 0 && (size_t)n < path_sz;
+    }
+
+    const char *cdir = cbm_resolve_cache_dir();
+    if (!cdir) {
+        cdir = cbm_tmpdir();
+    }
+    if (!cdir || !p->project_name) {
+        return false;
+    }
+    int n = snprintf(path, path_sz, "%s/%s.db", cdir, p->project_name);
+    return n > 0 && (size_t)n < path_sz;
+}
+
 /* Resolve the DB path for this pipeline. Caller must free(). */
 static char *resolve_db_path(const cbm_pipeline_t *p) {
-    char *path = malloc(CBM_SZ_1K);
-    if (!path) {
+    char path[CBM_PATH_MAX];
+    if (!resolve_db_path_buf(p, path, sizeof(path))) {
         return NULL;
     }
-    if (p->db_path) {
-        snprintf(path, 1024, "%s", p->db_path);
-    } else {
-        snprintf(path, 1024, "%s/%s.db", cbm_resolve_cache_dir(), p->project_name);
+    char *out = cbm_strdup(path);
+    if (!out) {
+        return NULL;
     }
-    return path;
+    return out;
+}
+
+static bool pipeline_parent_dir(char *out, size_t out_sz, const char *path) {
+    if (!out || out_sz == 0 || !path) {
+        return false;
+    }
+    int n = snprintf(out, out_sz, "%s", path);
+    if (n <= 0 || (size_t)n >= out_sz) {
+        out[0] = '\0';
+        return false;
+    }
+    char *last_slash = strrchr(out, '/');
+#ifdef _WIN32
+    char *last_bslash = strrchr(out, '\\');
+    if (last_bslash && (!last_slash || last_bslash > last_slash)) {
+        last_slash = last_bslash;
+    }
+#endif
+    if (last_slash) {
+        *last_slash = '\0';
+    } else {
+        out[0] = '\0';
+    }
+    return true;
 }
 
 static int check_cancel(const cbm_pipeline_t *p) {
@@ -1280,27 +1324,22 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!check_cancel(p)) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
-        char db_path[1024];
-        if (p->db_path) {
-            snprintf(db_path, sizeof(db_path), "%s", p->db_path);
-        } else {
-            /* Honor CBM_CACHE_DIR (via cbm_resolve_cache_dir) so tests and
-             * isolated runs don't write into the user's real store. Falls back
-             * to the system tmp dir only if no cache dir can be resolved. */
-            const char *cdir = cbm_resolve_cache_dir();
-            if (!cdir) {
-                cdir = cbm_tmpdir();
-            }
-            snprintf(db_path, sizeof(db_path), "%s/%s.db", cdir, p->project_name);
+        char db_path[CBM_PATH_MAX];
+        if (!resolve_db_path_buf(p, db_path, sizeof(db_path))) {
+            cbm_log_error("pipeline.err", "phase", "resolve_db_path", "reason", "path_too_long");
+            rc = CBM_NOT_FOUND;
+            goto cleanup;
         }
 
         /* Ensure parent directory exists (e.g. ~/.cache/codebase-memory-mcp/) */
-        char db_dir[1024];
-        snprintf(db_dir, sizeof(db_dir), "%s", db_path);
-        char *last_slash = strrchr(db_dir, '/');
-        if (last_slash) {
-            *last_slash = '\0';
-            cbm_mkdir_p(db_dir, 0755);
+        char db_dir[CBM_PATH_MAX];
+        if (!pipeline_parent_dir(db_dir, sizeof(db_dir), db_path)) {
+            cbm_log_error("pipeline.err", "phase", "resolve_db_dir", "reason", "path_too_long");
+            rc = CBM_NOT_FOUND;
+            goto cleanup;
+        }
+        if (db_dir[0]) {
+            cbm_mkdir_p(db_dir, CBM_DIR_PERMS);
         }
 
         /* Record committed counts BEFORE the dump: cbm_gbuf_dump_to_sqlite /
