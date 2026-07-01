@@ -80,6 +80,21 @@ static bool json_get_bool(const char *json, const char *key) {
     return *p == 't';
 }
 
+static bool path_in_scope(const char *path, const char *const *paths, int path_count) {
+    if (!paths || path_count <= 0) {
+        return true;
+    }
+    if (!path) {
+        return false;
+    }
+    for (int i = 0; i < path_count; i++) {
+        if (paths[i] && strcmp(path, paths[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Set transitive_loop_depth + recursive on a node's properties JSON object. */
 static void set_complexity_props(cbm_gbuf_node_t *node, int tld, bool recursive) {
     const char *old = node->properties_json ? node->properties_json : "{}";
@@ -340,7 +355,8 @@ static int scc_tld_dfs(int component_id, const scc_adj_t *adj, const int *compon
     return component_tld[component_id];
 }
 
-void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx) {
+static void pass_complexity_impl(cbm_pipeline_ctx_t *ctx, const char *const *paths,
+                                 int path_count) {
     cbm_gbuf_t *gb = ctx->gbuf;
     /* Node and edge IDs are drawn from one shared counter, so node IDs are NOT
      * contiguous 1..node_count — they interleave with edge IDs. Size the lookup
@@ -412,6 +428,9 @@ void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx) {
         if (!nptr[id]) {
             continue; /* only Function/Method nodes */
         }
+        if (!path_in_scope(nptr[id]->file_path, paths, path_count)) {
+            continue;
+        }
         int component_id = component[id];
         int tld = component_id >= 0 ? component_tld[component_id] : loop_depth[id];
         set_complexity_props(nptr[id], tld, recursive[id]);
@@ -428,4 +447,13 @@ void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx) {
     free(recursive);
     free(nptr);
     free(component);
+}
+
+void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx) {
+    pass_complexity_impl(ctx, NULL, 0);
+}
+
+void cbm_pipeline_pass_complexity_for_paths(cbm_pipeline_ctx_t *ctx, const char *const *paths,
+                                            int path_count) {
+    pass_complexity_impl(ctx, paths, path_count);
 }
