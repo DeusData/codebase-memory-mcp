@@ -3200,6 +3200,37 @@ static int store_nodes_fts_delete_by_file(cbm_store_t *s, const char *project,
     return CBM_STORE_OK;
 }
 
+static int store_nodes_fts_delete_orphan_folders(cbm_store_t *s, const char *project) {
+    static const char sql[] =
+        "INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, label, file_path) "
+        "SELECT 'delete', n.id, cbm_camel_split(n.name), n.qualified_name, n.label, n.file_path "
+        "FROM nodes n "
+        "WHERE n.project = ?1 AND n.label = 'Folder' "
+        "  AND EXISTS (SELECT 1 FROM nodes_fts WHERE rowid = n.id) "
+        "  AND NOT EXISTS (SELECT 1 FROM edges e "
+        "                  WHERE e.project = n.project AND e.source_id = n.id "
+        "                    AND e.type = 'CONTAINS_FILE') "
+        "  AND NOT EXISTS (SELECT 1 FROM edges e "
+        "                  WHERE e.project = n.project AND e.source_id = n.id "
+        "                    AND e.type = 'CONTAINS_FOLDER');";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        if (store_nodes_fts_unavailable(s)) {
+            return CBM_STORE_OK;
+        }
+        store_set_error_sqlite(s, "nodes_fts_delete_orphan_folders");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    int step = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (step != SQLITE_DONE) {
+        store_set_error_sqlite(s, "nodes_fts_delete_orphan_folders");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
 static int store_nodes_fts_insert_node(cbm_store_t *s, int64_t node_id, const cbm_node_t *node) {
     static const char sql[] =
         "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
@@ -3224,6 +3255,70 @@ static int store_nodes_fts_insert_node(cbm_store_t *s, int64_t node_id, const cb
         return CBM_STORE_ERR;
     }
     return CBM_STORE_OK;
+}
+
+static int store_prune_orphan_folders_body(cbm_store_t *s, const char *project) {
+    static const char orphan_edges_sql[] =
+        "DELETE FROM edges WHERE project = ?1 AND type = 'CONTAINS_FOLDER' "
+        "AND target_id IN ("
+        "  SELECT n.id FROM nodes n "
+        "  WHERE n.project = ?1 AND n.label = 'Folder' "
+        "    AND NOT EXISTS (SELECT 1 FROM edges e "
+        "                    WHERE e.project = n.project AND e.source_id = n.id "
+        "                      AND e.type = 'CONTAINS_FILE') "
+        "    AND NOT EXISTS (SELECT 1 FROM edges e "
+        "                    WHERE e.project = n.project AND e.source_id = n.id "
+        "                      AND e.type = 'CONTAINS_FOLDER')"
+        ");";
+    static const char orphan_nodes_sql[] =
+        "DELETE FROM nodes WHERE project = ?1 AND label = 'Folder' "
+        "AND NOT EXISTS (SELECT 1 FROM edges e "
+        "                WHERE e.project = nodes.project AND e.source_id = nodes.id "
+        "                  AND e.type = 'CONTAINS_FILE') "
+        "AND NOT EXISTS (SELECT 1 FROM edges e "
+        "                WHERE e.project = nodes.project AND e.source_id = nodes.id "
+        "                  AND e.type = 'CONTAINS_FOLDER');";
+
+    for (;;) {
+        int rc = store_nodes_fts_delete_orphan_folders(s, project);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+
+        sqlite3_stmt *edge_stmt = NULL;
+        if (sqlite3_prepare_v2(s->db, orphan_edges_sql, CBM_NOT_FOUND, &edge_stmt, NULL) !=
+            SQLITE_OK) {
+            store_set_error_sqlite(s, "prune_orphan_folders edges prepare");
+            sqlite3_finalize(edge_stmt);
+            return CBM_STORE_ERR;
+        }
+        bind_text(edge_stmt, ST_COL_1, project);
+        if (sqlite3_step(edge_stmt) != SQLITE_DONE) {
+            store_set_error_sqlite(s, "prune_orphan_folders edges");
+            sqlite3_finalize(edge_stmt);
+            return CBM_STORE_ERR;
+        }
+        sqlite3_finalize(edge_stmt);
+
+        sqlite3_stmt *node_stmt = NULL;
+        if (sqlite3_prepare_v2(s->db, orphan_nodes_sql, CBM_NOT_FOUND, &node_stmt, NULL) !=
+            SQLITE_OK) {
+            store_set_error_sqlite(s, "prune_orphan_folders nodes prepare");
+            sqlite3_finalize(node_stmt);
+            return CBM_STORE_ERR;
+        }
+        bind_text(node_stmt, ST_COL_1, project);
+        if (sqlite3_step(node_stmt) != SQLITE_DONE) {
+            store_set_error_sqlite(s, "prune_orphan_folders nodes");
+            sqlite3_finalize(node_stmt);
+            return CBM_STORE_ERR;
+        }
+        int removed = sqlite3_changes(s->db);
+        sqlite3_finalize(node_stmt);
+        if (removed == 0) {
+            return CBM_STORE_OK;
+        }
+    }
 }
 
 static int store_delete_file_delta_body(cbm_store_t *s, const char *project, const char *rel_path,
@@ -3261,6 +3356,10 @@ static int store_delete_file_delta_body(cbm_store_t *s, const char *project, con
         return rc;
     }
     rc = cbm_store_delete_file_state(s, project, rel_path);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_prune_orphan_folders_body(s, project);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
@@ -3375,36 +3474,66 @@ static int store_publish_file_delta_nodes_body(cbm_store_t *s,
     return CBM_STORE_OK;
 }
 
-static int store_publish_file_delta_edges_body(cbm_store_t *s,
-                                               const cbm_store_file_delta_t *delta) {
+static int store_publish_file_delta_context_nodes_body(cbm_store_t *s,
+                                                       const cbm_store_file_delta_t *delta) {
     int rc = CBM_STORE_OK;
-    for (int i = 0; i < delta->edge_count; i++) {
-        int64_t source_id = CBM_STORE_NO_NODE_ID;
-        int64_t target_id = CBM_STORE_NO_NODE_ID;
-        rc = store_resolve_node_id(s, delta->project, delta->edges[i].source_qn, &source_id);
+    for (int i = 0; i < delta->context_node_count; i++) {
+        int64_t id = cbm_store_upsert_node(s, &delta->context_nodes[i]);
+        if (id <= CBM_STORE_NO_NODE_ID) {
+            return CBM_STORE_ERR;
+        }
+        rc = store_nodes_fts_insert_node(s, id, &delta->context_nodes[i]);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
-        rc = store_resolve_node_id(s, delta->project, delta->edges[i].target_qn, &target_id);
+    }
+    return CBM_STORE_OK;
+}
+
+static int store_publish_delta_edges(cbm_store_t *s, const cbm_store_file_delta_t *delta,
+                                     const cbm_store_delta_edge_t *edges, int edge_count,
+                                     bool own_edges) {
+    int rc = CBM_STORE_OK;
+    for (int i = 0; i < edge_count; i++) {
+        int64_t source_id = CBM_STORE_NO_NODE_ID;
+        int64_t target_id = CBM_STORE_NO_NODE_ID;
+        rc = store_resolve_node_id(s, delta->project, edges[i].source_qn, &source_id);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+        rc = store_resolve_node_id(s, delta->project, edges[i].target_qn, &target_id);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
         cbm_edge_t edge = {.project = delta->project,
                            .source_id = source_id,
                            .target_id = target_id,
-                           .type = delta->edges[i].type,
-                           .properties_json = delta->edges[i].properties_json};
+                           .type = edges[i].type,
+                           .properties_json = edges[i].properties_json};
         int64_t edge_id = cbm_store_insert_edge(s, &edge);
         if (edge_id <= CBM_STORE_NO_NODE_ID) {
             return CBM_STORE_ERR;
         }
-        rc = cbm_store_upsert_edge_owner(s, delta->project, edge_id, delta->rel_path,
-                                         delta->edges[i].derived_kind, delta->generation);
-        if (rc != CBM_STORE_OK) {
-            return rc;
+        if (own_edges) {
+            rc = cbm_store_upsert_edge_owner(s, delta->project, edge_id, delta->rel_path,
+                                             edges[i].derived_kind, delta->generation);
+            if (rc != CBM_STORE_OK) {
+                return rc;
+            }
         }
     }
     return CBM_STORE_OK;
+}
+
+static int store_publish_file_delta_edges_body(cbm_store_t *s,
+                                               const cbm_store_file_delta_t *delta) {
+    return store_publish_delta_edges(s, delta, delta->edges, delta->edge_count, true);
+}
+
+static int store_publish_file_delta_context_edges_body(cbm_store_t *s,
+                                                       const cbm_store_file_delta_t *delta) {
+    return store_publish_delta_edges(s, delta, delta->context_edges, delta->context_edge_count,
+                                     false);
 }
 
 static int store_publish_file_delta_metadata_body(cbm_store_t *s,
@@ -3461,7 +3590,15 @@ static int store_publish_file_delta_body(cbm_store_t *s, const cbm_store_file_de
     if (rc != CBM_STORE_OK) {
         return rc;
     }
+    rc = store_publish_file_delta_context_nodes_body(s, delta);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
     rc = store_publish_file_delta_nodes_body(s, delta);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_publish_file_delta_context_edges_body(s, delta);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
@@ -3486,6 +3623,10 @@ static int store_publish_file_delta_batch_body(cbm_store_t *s,
     CBM_PROF_END_N("store_delta_publish", "1_delete_old_rows", t_delete, delta_count);
     CBM_PROF_START(t_nodes);
     for (int i = 0; i < delta_count; i++) {
+        rc = store_publish_file_delta_context_nodes_body(s, deltas[i]);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
         rc = store_publish_file_delta_nodes_body(s, deltas[i]);
         if (rc != CBM_STORE_OK) {
             return rc;
@@ -3494,6 +3635,10 @@ static int store_publish_file_delta_batch_body(cbm_store_t *s,
     CBM_PROF_END_N("store_delta_publish", "2_upsert_nodes", t_nodes, delta_count);
     CBM_PROF_START(t_edges);
     for (int i = 0; i < delta_count; i++) {
+        rc = store_publish_file_delta_context_edges_body(s, deltas[i]);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
         rc = store_publish_file_delta_edges_body(s, deltas[i]);
         if (rc != CBM_STORE_OK) {
             return rc;
@@ -3542,6 +3687,18 @@ static bool store_delta_field_matches(const char *actual, const char *expected) 
     return actual && expected && strcmp(actual, expected) == 0;
 }
 
+static bool store_delta_context_node_valid(const cbm_store_file_delta_t *delta,
+                                           const cbm_node_t *node) {
+    return node && store_delta_field_matches(node->project, delta->project) &&
+           node->label && strcmp(node->label, "Folder") == 0 && node->qualified_name &&
+           node->file_path && node->file_path[0] != '\0';
+}
+
+static bool store_delta_context_edge_valid(const cbm_store_delta_edge_t *edge) {
+    return edge && edge->source_qn && edge->target_qn && edge->type &&
+           strcmp(edge->type, "CONTAINS_FOLDER") == 0;
+}
+
 static bool store_file_delta_contract_valid(const cbm_store_file_delta_t *delta) {
     if (delta->file_hash &&
         (!store_delta_field_matches(delta->file_hash->project, delta->project) ||
@@ -3559,6 +3716,16 @@ static bool store_file_delta_contract_valid(const cbm_store_file_delta_t *delta)
         if (!store_delta_field_matches(delta->nodes[i].project, delta->project) ||
             !store_delta_field_matches(delta->nodes[i].file_path, delta->rel_path) ||
             !delta->nodes[i].qualified_name) {
+            return false;
+        }
+    }
+    for (int i = 0; i < delta->context_node_count; i++) {
+        if (!store_delta_context_node_valid(delta, &delta->context_nodes[i])) {
+            return false;
+        }
+    }
+    for (int i = 0; i < delta->context_edge_count; i++) {
+        if (!store_delta_context_edge_valid(&delta->context_edges[i])) {
             return false;
         }
     }
@@ -3582,11 +3749,14 @@ static bool store_file_delta_contract_valid(const cbm_store_file_delta_t *delta)
 
 static bool store_file_delta_shape_valid(const cbm_store_file_delta_t *delta) {
     if (!delta || !delta->project || !delta->rel_path || delta->generation < 0 ||
+        delta->context_node_count < 0 || delta->context_edge_count < 0 ||
         delta->node_count < 0 || delta->edge_count < 0 || delta->export_count < 0 ||
         delta->import_count < 0) {
         return false;
     }
-    if ((delta->node_count > 0 && !delta->nodes) || (delta->edge_count > 0 && !delta->edges) ||
+    if ((delta->context_node_count > 0 && !delta->context_nodes) ||
+        (delta->context_edge_count > 0 && !delta->context_edges) ||
+        (delta->node_count > 0 && !delta->nodes) || (delta->edge_count > 0 && !delta->edges) ||
         (delta->export_count > 0 && !delta->exports) ||
         (delta->import_count > 0 && !delta->imports)) {
         return false;

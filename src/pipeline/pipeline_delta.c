@@ -58,6 +58,8 @@ typedef struct {
     const cbm_gbuf_t *gbuf;
     const char *project;
     const char *rel_path;
+    int context_node_cap;
+    int context_edge_cap;
     int node_cap;
     int edge_cap;
     int export_cap;
@@ -279,6 +281,48 @@ static int delta_append_node(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t *
     return CBM_STORE_OK;
 }
 
+static bool delta_path_is_ancestor_dir(const char *dir, const char *rel_path) {
+    if (!dir || !dir[0] || !rel_path || !rel_path[0]) {
+        return false;
+    }
+    size_t dir_len = strlen(dir);
+    return strncmp(rel_path, dir, dir_len) == 0 && rel_path[dir_len] == '/';
+}
+
+static bool delta_node_is_structure_context(const cbm_gbuf_node_t *node, const char *rel_path) {
+    return node && node->label && strcmp(node->label, "Folder") == 0 &&
+           delta_path_is_ancestor_dir(node->file_path, rel_path);
+}
+
+static bool delta_node_is_structure_root(const cbm_gbuf_node_t *node) {
+    return node && node->label &&
+           (strcmp(node->label, "Project") == 0 || strcmp(node->label, "Branch") == 0);
+}
+
+static int delta_append_context_node(cbm_delta_build_ctx_t *ctx,
+                                     const cbm_gbuf_node_t *node) {
+    if (ctx->out->delta.context_node_count >= ctx->context_node_cap &&
+        delta_grow((void **)&ctx->out->context_nodes, &ctx->context_node_cap,
+                   sizeof(*ctx->out->context_nodes)) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    cbm_node_t *dst = &ctx->out->context_nodes[ctx->out->delta.context_node_count++];
+    *dst = (cbm_node_t){.id = CBM_STORE_NO_NODE_ID,
+                        .project = delta_strdup(ctx->project),
+                        .label = delta_strdup(node->label),
+                        .name = delta_strdup(node->name),
+                        .qualified_name = delta_strdup(node->qualified_name),
+                        .file_path = delta_strdup(node->file_path),
+                        .start_line = node->start_line,
+                        .end_line = node->end_line,
+                        .properties_json = delta_strdup(node->properties_json ? node->properties_json : "{}")};
+    if (!dst->project || !dst->label || !dst->name || !dst->qualified_name || !dst->file_path ||
+        !dst->properties_json) {
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
 static int delta_append_export(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t *node) {
     if (ctx->out->delta.export_count >= ctx->export_cap &&
         delta_grow((void **)&ctx->out->exports, &ctx->export_cap, sizeof(*ctx->out->exports)) !=
@@ -289,6 +333,29 @@ static int delta_append_export(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t
     *dst = (cbm_store_symbol_export_t){.qualified_name = delta_strdup(node->qualified_name),
                                        .node_id = CBM_STORE_NO_NODE_ID};
     return dst->qualified_name ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
+static int delta_append_context_edge(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t *src,
+                                     const cbm_gbuf_node_t *tgt,
+                                     const cbm_gbuf_edge_t *edge) {
+    if (ctx->out->delta.context_edge_count >= ctx->context_edge_cap &&
+        delta_grow((void **)&ctx->out->context_edges, &ctx->context_edge_cap,
+                   sizeof(*ctx->out->context_edges)) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    cbm_store_delta_edge_t *dst =
+        &ctx->out->context_edges[ctx->out->delta.context_edge_count++];
+    *dst = (cbm_store_delta_edge_t){
+        .source_qn = delta_strdup(src->qualified_name),
+        .target_qn = delta_strdup(tgt->qualified_name),
+        .type = delta_strdup(edge->type),
+        .properties_json = delta_strdup(edge->properties_json ? edge->properties_json : "{}"),
+        .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT,
+    };
+    if (!dst->source_qn || !dst->target_qn || !dst->type || !dst->properties_json) {
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
 }
 
 static int delta_append_edge(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t *src,
@@ -336,12 +403,16 @@ static int delta_append_import(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t
 
 static void delta_visit_node(const cbm_gbuf_node_t *node, void *userdata) {
     cbm_delta_build_ctx_t *ctx = (cbm_delta_build_ctx_t *)userdata;
-    if (ctx->rc != CBM_STORE_OK || !delta_same_path(node->file_path, ctx->rel_path)) {
+    if (ctx->rc != CBM_STORE_OK) {
         return;
     }
-    ctx->rc = delta_append_node(ctx, node);
-    if (ctx->rc == CBM_STORE_OK && delta_node_is_exported(node)) {
-        ctx->rc = delta_append_export(ctx, node);
+    if (delta_same_path(node->file_path, ctx->rel_path)) {
+        ctx->rc = delta_append_node(ctx, node);
+        if (ctx->rc == CBM_STORE_OK && delta_node_is_exported(node)) {
+            ctx->rc = delta_append_export(ctx, node);
+        }
+    } else if (delta_node_is_structure_context(node, ctx->rel_path)) {
+        ctx->rc = delta_append_context_node(ctx, node);
     }
 }
 
@@ -357,11 +428,20 @@ static void delta_visit_edge(const cbm_gbuf_edge_t *edge, void *userdata) {
         return;
     }
     bool source_owned = delta_same_path(src->file_path, ctx->rel_path);
+    bool source_context = delta_node_is_structure_context(src, ctx->rel_path);
+    bool target_context = delta_node_is_structure_context(tgt, ctx->rel_path);
     bool target_is_changed_file = delta_same_path(tgt->file_path, ctx->rel_path) &&
                                   tgt->label && strcmp(tgt->label, "File") == 0;
+    bool context_structure_edge =
+        strcmp(edge->type, "CONTAINS_FOLDER") == 0 && target_context &&
+        (source_context || delta_node_is_structure_root(src));
     bool regenerated_file_structure = !source_owned &&
                                       strcmp(edge->type, cbm_delta_edge_contains_file) == 0 &&
                                       target_is_changed_file;
+    if (context_structure_edge) {
+        ctx->rc = delta_append_context_edge(ctx, src, tgt, edge);
+        return;
+    }
     if (!source_owned && !regenerated_file_structure) {
         return;
     }
@@ -401,6 +481,8 @@ int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *
     out->delta.edges = out->edges;
     out->delta.exports = out->exports;
     out->delta.imports = out->imports;
+    out->delta.context_nodes = out->context_nodes;
+    out->delta.context_edges = out->context_edges;
     if (ctx.rc != CBM_STORE_OK) {
         cbm_pipeline_file_delta_free(out);
     }
@@ -652,6 +734,20 @@ void cbm_pipeline_file_delta_free(cbm_pipeline_file_delta_t *delta) {
         free((void *)delta->nodes[i].file_path);
         free((void *)delta->nodes[i].properties_json);
     }
+    for (int i = 0; i < delta->delta.context_node_count; i++) {
+        free((void *)delta->context_nodes[i].project);
+        free((void *)delta->context_nodes[i].label);
+        free((void *)delta->context_nodes[i].name);
+        free((void *)delta->context_nodes[i].qualified_name);
+        free((void *)delta->context_nodes[i].file_path);
+        free((void *)delta->context_nodes[i].properties_json);
+    }
+    for (int i = 0; i < delta->delta.context_edge_count; i++) {
+        free((void *)delta->context_edges[i].source_qn);
+        free((void *)delta->context_edges[i].target_qn);
+        free((void *)delta->context_edges[i].type);
+        free((void *)delta->context_edges[i].properties_json);
+    }
     for (int i = 0; i < delta->delta.edge_count; i++) {
         free((void *)delta->edges[i].source_qn);
         free((void *)delta->edges[i].target_qn);
@@ -666,6 +762,8 @@ void cbm_pipeline_file_delta_free(cbm_pipeline_file_delta_t *delta) {
         free((void *)delta->imports[i].local_name);
         free((void *)delta->imports[i].target_qn);
     }
+    free(delta->context_nodes);
+    free(delta->context_edges);
     free(delta->nodes);
     free(delta->edges);
     free(delta->exports);
@@ -817,6 +915,12 @@ static bool delta_node_qn_present(const cbm_store_file_delta_t *delta, const cha
     if (!delta || !qn) {
         return false;
     }
+    for (int i = 0; i < delta->context_node_count; i++) {
+        if (delta->context_nodes[i].qualified_name &&
+            strcmp(delta->context_nodes[i].qualified_name, qn) == 0) {
+            return true;
+        }
+    }
     for (int i = 0; i < delta->node_count; i++) {
         if (delta->nodes[i].qualified_name && strcmp(delta->nodes[i].qualified_name, qn) == 0) {
             return true;
@@ -862,31 +966,47 @@ static bool delta_plan_precheck_common(const cbm_pipeline_file_delta_t *delta,
     return true;
 }
 
+static int delta_collect_edge_endpoint_qns(const cbm_store_file_delta_t *delta,
+                                           const cbm_store_delta_edge_t *edges, int edge_count,
+                                           const char **qns, int *qn_count) {
+    for (int i = 0; i < edge_count; i++) {
+        const char *edge_qns[PAIR_LEN] = {edges[i].source_qn, edges[i].target_qn};
+        for (int j = 0; j < PAIR_LEN; j++) {
+            const char *qn = edge_qns[j];
+            if (!qn) {
+                return CBM_STORE_NOT_FOUND;
+            }
+            if (!delta_node_qn_present(delta, qn) && !delta_qn_list_contains(qns, *qn_count, qn)) {
+                qns[(*qn_count)++] = qn;
+            }
+        }
+    }
+    return CBM_STORE_OK;
+}
+
 static int delta_edge_endpoints_resolve(cbm_store_t *store, const cbm_store_file_delta_t *delta) {
-    if (!delta || delta->edge_count <= 0) {
+    if (!delta || (delta->edge_count <= 0 && delta->context_edge_count <= 0)) {
         return CBM_STORE_OK;
     }
-    if (delta->edge_count > INT_MAX / PAIR_LEN) {
+    if (delta->context_edge_count > INT_MAX / PAIR_LEN ||
+        delta->edge_count > (INT_MAX / PAIR_LEN) - delta->context_edge_count) {
         return CBM_STORE_ERR;
     }
-    int qn_cap = delta->edge_count * PAIR_LEN;
+    int qn_cap = (delta->edge_count + delta->context_edge_count) * PAIR_LEN;
     const char **qns = malloc((size_t)qn_cap * sizeof(*qns));
     if (!qns) {
         return CBM_STORE_ERR;
     }
     int qn_count = 0;
-    for (int i = 0; i < delta->edge_count; i++) {
-        const char *edge_qns[PAIR_LEN] = {delta->edges[i].source_qn, delta->edges[i].target_qn};
-        for (int j = 0; j < PAIR_LEN; j++) {
-            const char *qn = edge_qns[j];
-            if (!qn) {
-                free(qns);
-                return CBM_STORE_NOT_FOUND;
-            }
-            if (!delta_node_qn_present(delta, qn) && !delta_qn_list_contains(qns, qn_count, qn)) {
-                qns[qn_count++] = qn;
-            }
-        }
+    int rc = delta_collect_edge_endpoint_qns(delta, delta->context_edges, delta->context_edge_count,
+                                             qns, &qn_count);
+    if (rc == CBM_STORE_OK) {
+        rc = delta_collect_edge_endpoint_qns(delta, delta->edges, delta->edge_count, qns,
+                                             &qn_count);
+    }
+    if (rc != CBM_STORE_OK) {
+        free(qns);
+        return rc;
     }
     if (qn_count == 0) {
         free(qns);
@@ -919,35 +1039,51 @@ static bool delta_batch_node_qn_present(const cbm_pipeline_file_delta_t *const *
     return false;
 }
 
+static int delta_collect_batch_edge_endpoint_qns(
+    const cbm_pipeline_file_delta_t *const *deltas, int delta_count,
+    const cbm_store_delta_edge_t *edges, int edge_count, const char **qns, int *qn_count) {
+    for (int i = 0; i < edge_count; i++) {
+        const char *edge_qns[PAIR_LEN] = {edges[i].source_qn, edges[i].target_qn};
+        for (int j = 0; j < PAIR_LEN; j++) {
+            const char *qn = edge_qns[j];
+            if (!qn) {
+                return CBM_STORE_NOT_FOUND;
+            }
+            if (!delta_batch_node_qn_present(deltas, delta_count, qn) &&
+                !delta_qn_list_contains(qns, *qn_count, qn)) {
+                qns[(*qn_count)++] = qn;
+            }
+        }
+    }
+    return CBM_STORE_OK;
+}
+
 static int delta_batch_edge_endpoints_resolve(cbm_store_t *store,
                                               const cbm_store_file_delta_t *delta,
                                               const cbm_pipeline_file_delta_t *const *deltas,
                                               int delta_count) {
-    if (!delta || delta->edge_count <= 0) {
+    if (!delta || (delta->edge_count <= 0 && delta->context_edge_count <= 0)) {
         return CBM_STORE_OK;
     }
-    if (delta->edge_count > INT_MAX / PAIR_LEN) {
+    if (delta->context_edge_count > INT_MAX / PAIR_LEN ||
+        delta->edge_count > (INT_MAX / PAIR_LEN) - delta->context_edge_count) {
         return CBM_STORE_ERR;
     }
-    int qn_cap = delta->edge_count * PAIR_LEN;
+    int qn_cap = (delta->edge_count + delta->context_edge_count) * PAIR_LEN;
     const char **qns = malloc((size_t)qn_cap * sizeof(*qns));
     if (!qns) {
         return CBM_STORE_ERR;
     }
     int qn_count = 0;
-    for (int i = 0; i < delta->edge_count; i++) {
-        const char *edge_qns[PAIR_LEN] = {delta->edges[i].source_qn, delta->edges[i].target_qn};
-        for (int j = 0; j < PAIR_LEN; j++) {
-            const char *qn = edge_qns[j];
-            if (!qn) {
-                free(qns);
-                return CBM_STORE_NOT_FOUND;
-            }
-            if (!delta_batch_node_qn_present(deltas, delta_count, qn) &&
-                !delta_qn_list_contains(qns, qn_count, qn)) {
-                qns[qn_count++] = qn;
-            }
-        }
+    int rc = delta_collect_batch_edge_endpoint_qns(deltas, delta_count, delta->context_edges,
+                                                   delta->context_edge_count, qns, &qn_count);
+    if (rc == CBM_STORE_OK) {
+        rc = delta_collect_batch_edge_endpoint_qns(deltas, delta_count, delta->edges,
+                                                   delta->edge_count, qns, &qn_count);
+    }
+    if (rc != CBM_STORE_OK) {
+        free(qns);
+        return rc;
     }
     if (qn_count == 0) {
         free(qns);

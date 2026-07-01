@@ -145,6 +145,8 @@ typedef struct {
     cbm_file_state_t file_state;
     char file_content_hash[CBM_SZ_32];
     char file_indexed_at[CBM_SZ_32];
+    cbm_node_t *context_nodes;
+    cbm_store_delta_edge_t *context_edges;
     cbm_node_t *nodes;
     cbm_store_delta_edge_t *edges;
     cbm_store_symbol_export_t *exports;

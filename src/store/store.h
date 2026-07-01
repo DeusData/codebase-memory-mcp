@@ -134,6 +134,10 @@ typedef struct {
     int64_t generation;
     const cbm_file_hash_t *file_hash;   /* optional */
     const cbm_file_state_t *file_state; /* optional */
+    const cbm_node_t *context_nodes;     /* optional unowned structure nodes needed by edges */
+    int context_node_count;
+    const cbm_store_delta_edge_t *context_edges; /* optional unowned structure edges */
+    int context_edge_count;
     const cbm_node_t *nodes;
     int node_count;
     const cbm_store_delta_edge_t *edges;
