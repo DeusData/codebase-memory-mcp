@@ -239,6 +239,16 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
   /* Breadcrumb segments */
   const displayPath = currentPath.replace(/\\/g, "/");
   const segments = displayPath.split("/").filter(Boolean);
+  /* A Windows drive path ("C:/Users/rap") has no unified "/" root — its first
+   * segment is the drive letter. Build crumb targets accordingly so clicking a
+   * segment navigates to a real directory instead of a bogus "/C:/..." path
+   * that the backend rejects as "not a directory". */
+  const isWinPath = /^[A-Za-z]:$/.test(segments[0] ?? "");
+  const crumbPath = (i: number): string => {
+    const parts = segments.slice(0, i + 1);
+    if (isWinPath) return parts.length === 1 ? `${parts[0]}/` : parts.join("/");
+    return "/" + parts.join("/");
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={onClose}>
@@ -297,12 +307,14 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
 
         {/* Breadcrumb */}
         <div className="px-5 py-2 border-y border-border/20 flex items-center gap-0.5 overflow-x-auto text-[11px] shrink-0">
-          <button onClick={() => browse("/")} className="text-primary/60 hover:text-primary shrink-0 transition-colors">/</button>
+          {!isWinPath && (
+            <button onClick={() => browse("/")} className="text-primary/60 hover:text-primary shrink-0 transition-colors">/</button>
+          )}
           {segments.map((seg, i) => (
             <span key={i} className="flex items-center gap-0.5 shrink-0">
-              <span className="text-foreground/15">/</span>
+              {(i > 0 || !isWinPath) && <span className="text-foreground/15">/</span>}
               <button
-                onClick={() => browse("/" + segments.slice(0, i + 1).join("/"))}
+                onClick={() => browse(crumbPath(i))}
                 className={`transition-colors ${i === segments.length - 1 ? "text-foreground/70 font-medium" : "text-primary/50 hover:text-primary"}`}
               >
                 {seg}

@@ -1,6 +1,6 @@
 /* @vitest-environment jsdom */
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { StatsTab } from "./StatsTab";
 
@@ -42,6 +42,7 @@ function mockProjectsFetch(extra?: (url: string, init?: RequestInit) => Response
 
 describe("StatsTab index modal", () => {
   afterEach(() => {
+    cleanup();
     vi.unstubAllGlobals();
   });
 
@@ -91,5 +92,38 @@ describe("StatsTab index modal", () => {
     expect(screen.getByText("beta")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Index beta" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Browse D:/" })).toBeInTheDocument();
+  });
+
+  it("navigates Windows breadcrumb segments to real drive paths", async () => {
+    const fetchMock = mockProjectsFetch((url) => {
+      if (url.startsWith("/api/browse")) {
+        return new Response(JSON.stringify({
+          path: "C:/Users/rap",
+          parent: "C:/Users",
+          dirs: ["Documents", "Downloads"],
+          roots: ["C:/", "D:/"],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return undefined;
+    });
+
+    render(<StatsTab onSelectProject={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Index your first repository" }));
+
+    /* No bogus unified "/" root crumb on a Windows drive path. */
+    await screen.findByRole("button", { name: "C:" });
+    expect(screen.queryByRole("button", { name: "/" })).not.toBeInTheDocument();
+
+    /* Clicking the drive crumb browses to "C:/", not "/C:". */
+    fireEvent.click(screen.getByRole("button", { name: "C:" }));
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith("/api/browse?path=C%3A%2F");
+    });
+
+    /* Clicking a nested crumb browses to "C:/Users", not "/C:/Users". */
+    fireEvent.click(screen.getByRole("button", { name: "Users" }));
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith("/api/browse?path=C%3A%2FUsers");
+    });
   });
 });
