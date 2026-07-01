@@ -1222,6 +1222,20 @@ TEST(nickel_function_application_edge) {
     PASS();
 }
 
+TEST(func_function_application_edge) {
+    CBMFileResult *r = extract("() helper() {\n"
+                               "}\n"
+                               "() main() {\n"
+                               "  helper();\n"
+                               "}\n",
+                               CBM_LANG_FUNC, "t", "contract.fc");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "helper"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Fortran --- */
 TEST(fortran_function) {
     /* Fortran subroutine name extraction is incomplete — just verify no crash */
@@ -3416,6 +3430,7 @@ SUITE(extraction) {
     RUN_TEST(jsonnet_function_call_edge);
     RUN_TEST(typst_function_call_edge);
     RUN_TEST(nickel_function_application_edge);
+    RUN_TEST(func_function_application_edge);
     RUN_TEST(fortran_function);
 
     /* OOP/Systems variants */
