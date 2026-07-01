@@ -38,7 +38,8 @@ static const char cbm_delta_reason_unsupported_derived_view[] = "unsupported_der
 static const char cbm_delta_reason_unsupported_edges[] = "unsupported_edges";
 
 static const char *const cbm_delta_scratch_seed_labels[] = {
-    "File",      "Module", "Struct", "Enum",  "Trait",    "Type",
+    "Project",   "Branch", "Folder", "File",  "Module",   "Struct",
+    "Enum",      "Trait",  "Type",
     "Function",  "Method", "Class",  "Interface", "Variable", "Field",
     NULL,
 };

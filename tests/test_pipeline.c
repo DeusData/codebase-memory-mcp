@@ -3416,6 +3416,100 @@ TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths) {
     PASS();
 }
 
+TEST(pipeline_file_delta_scratch_seed_preserves_structure_roots) {
+    enum { PIPELINE_DELTA_STRUCTURE_GENERATION = 1 };
+    const char *project = "test";
+    const char *repo_path = "/tmp";
+    const char *rel_path = "main.go";
+    const char *changed_paths[] = {rel_path};
+    const int changed_path_count = (int)(sizeof(changed_paths) / sizeof(changed_paths[0]));
+    const char *branch_qn = "test.branch.main";
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, repo_path), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, rel_path, "test.main.Old"),
+              CBM_STORE_OK);
+
+    char *file_qn = cbm_pipeline_fqn_compute(project, rel_path, "__file__");
+    ASSERT_NOT_NULL(file_qn);
+    cbm_node_t project_node = {.project = (char *)project,
+                               .label = "Project",
+                               .name = (char *)project,
+                               .qualified_name = (char *)project,
+                               .file_path = NULL,
+                               .properties_json = "{}"};
+    cbm_node_t branch_node = {.project = (char *)project,
+                              .label = "Branch",
+                              .name = "main",
+                              .qualified_name = (char *)branch_qn,
+                              .file_path = NULL,
+                              .properties_json = "{}"};
+    cbm_node_t file_node = {.project = (char *)project,
+                            .label = "File",
+                            .name = (char *)rel_path,
+                            .qualified_name = file_qn,
+                            .file_path = (char *)rel_path,
+                            .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &project_node), CBM_STORE_NO_NODE_ID);
+    int64_t branch_id = cbm_store_upsert_node(s, &branch_node);
+    int64_t file_id = cbm_store_upsert_node(s, &file_node);
+    ASSERT_GT(branch_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_GT(file_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_EQ(cbm_store_upsert_node_owner(s, project, file_id, rel_path,
+                                          PIPELINE_DELTA_STRUCTURE_GENERATION),
+              CBM_STORE_OK);
+    cbm_edge_t contains = {.project = (char *)project,
+                           .source_id = branch_id,
+                           .target_id = file_id,
+                           .type = "CONTAINS_FILE",
+                           .properties_json = "{}"};
+    int64_t edge_id = cbm_store_insert_edge(s, &contains);
+    ASSERT_GT(edge_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_EQ(cbm_store_upsert_edge_owner(s, project, edge_id, rel_path, NULL,
+                                          PIPELINE_DELTA_STRUCTURE_GENERATION),
+              CBM_STORE_OK);
+
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, repo_path);
+    cbm_registry_t *registry = cbm_registry_new();
+    ASSERT_NOT_NULL(scratch);
+    ASSERT_NOT_NULL(registry);
+    ASSERT_EQ(cbm_pipeline_seed_file_delta_scratch_from_store(
+                  s, scratch, registry, project, changed_paths, changed_path_count),
+              CBM_STORE_OK);
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(scratch, project));
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(scratch, branch_qn));
+    ASSERT_NULL(cbm_gbuf_find_by_qn(scratch, file_qn));
+
+    ASSERT_EQ(cbm_pipeline_ensure_file_structure(scratch, project, branch_qn, rel_path, NULL), 0);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Function", "New", "test.main.New", rel_path, 1,
+                                   1, "{\"is_exported\":true}"),
+              0);
+
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(scratch, project, rel_path, 0, &delta),
+              CBM_STORE_OK);
+    const cbm_store_delta_edge_t *structure_edge =
+        pipeline_delta_find_edge(&delta, "CONTAINS_FILE");
+    ASSERT_NOT_NULL(structure_edge);
+    ASSERT_STR_EQ(structure_edge->source_qn, branch_qn);
+    ASSERT_STR_EQ(structure_edge->target_qn, file_qn);
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_registry_free(registry);
+    cbm_gbuf_free(scratch);
+    cbm_store_close(s);
+    free(file_qn);
+    PASS();
+}
+
 TEST(pipeline_file_delta_scratch_seed_supports_external_endpoint_descriptor) {
     const char *project = "test";
     const char *changed_paths[] = {"main.go"};
@@ -9507,6 +9601,7 @@ SUITE(pipeline) {
     RUN_TEST(config_registry_includes_mcp_timeout_knobs);
     RUN_TEST(config_registry_includes_incremental_reindex_policy);
     RUN_TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths);
+    RUN_TEST(pipeline_file_delta_scratch_seed_preserves_structure_roots);
     RUN_TEST(pipeline_file_delta_scratch_seed_supports_external_endpoint_descriptor);
     RUN_TEST(pipeline_file_delta_descriptor_from_gbuf);
     RUN_TEST(pipeline_file_delta_descriptor_marks_unsupported_edges);
