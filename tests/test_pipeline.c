@@ -7649,26 +7649,36 @@ static cbm_config_t *incremental_test_config(const char *cache_dir) {
     return cfg;
 }
 
-static int pipeline_store_has_function_name(const char *db_path, const char *project,
-                                            const char *name) {
+static int pipeline_store_has_node_name_by_label(const char *db_path, const char *project,
+                                                 const char *label, const char *name) {
     cbm_store_t *s = cbm_store_open_path_query(db_path);
     if (!s) {
         return 0;
     }
-    cbm_node_t *funcs = NULL;
+    cbm_node_t *nodes = NULL;
     int count = 0;
     int found = 0;
-    if (cbm_store_find_nodes_by_label(s, project, "Function", &funcs, &count) == CBM_STORE_OK) {
+    if (cbm_store_find_nodes_by_label(s, project, label, &nodes, &count) == CBM_STORE_OK) {
         for (int i = 0; i < count; i++) {
-            if (funcs[i].name && strcmp(funcs[i].name, name) == 0) {
+            if (nodes[i].name && strcmp(nodes[i].name, name) == 0) {
                 found = 1;
                 break;
             }
         }
-        cbm_store_free_nodes(funcs, count);
+        cbm_store_free_nodes(nodes, count);
     }
     cbm_store_close(s);
     return found;
+}
+
+static int pipeline_store_has_function_name(const char *db_path, const char *project,
+                                            const char *name) {
+    return pipeline_store_has_node_name_by_label(db_path, project, "Function", name);
+}
+
+static int pipeline_store_has_route_name(const char *db_path, const char *project,
+                                         const char *name) {
+    return pipeline_store_has_node_name_by_label(db_path, project, "Route", name);
 }
 
 static int pipeline_restore_file_times(const char *path, const struct stat *st) {
@@ -8993,6 +9003,67 @@ TEST(incremental_fast_new_folder_falls_back_to_full_rebuild_parity) {
         g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
     if (diff_rc != 0) {
         FAIL(diff_err[0] ? diff_err : "new-folder fallback differed from fresh FAST rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_route_decorator_change_matches_full_rebuild) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/routes.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "from fastapi import FastAPI\n\n"
+                            "app = FastAPI()\n\n"
+                            "@app.get('/api/orders')\n"
+                            "def orders():\n"
+                            "    return {'ok': True}\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(pipeline_store_has_route_name(g_incr_dbpath, project, "/api/orders"));
+
+    ASSERT_EQ(th_write_file(path,
+                            "from fastapi import FastAPI\n\n"
+                            "app = FastAPI()\n\n"
+                            "@app.get('/api/items')\n"
+                            "def orders():\n"
+                            "    return {'ok': True}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_publish_kind_t kind = cbm_pipeline_publish_kind(p);
+    ASSERT(kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT ||
+           kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
+    cbm_pipeline_free(p);
+
+    ASSERT(!pipeline_store_has_route_name(g_incr_dbpath, project, "/api/orders"));
+    ASSERT(pipeline_store_has_route_name(g_incr_dbpath, project, "/api/items"));
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "route decorator incremental differed from fresh FAST rebuild");
     }
     ASSERT_EQ(diff_rc, 0);
 
@@ -11169,6 +11240,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_delete_falls_back_to_full_rebuild_parity);
     RUN_TEST(incremental_fast_rename_like_batch_falls_back_to_full_rebuild_parity);
     RUN_TEST(incremental_fast_new_folder_falls_back_to_full_rebuild_parity);
+    RUN_TEST(incremental_fast_route_decorator_change_matches_full_rebuild);
     RUN_TEST(incremental_fast_exact_scratch_multifile_usage_edges_match_fresh);
     RUN_TEST(incremental_fast_exact_batch_publish_matches_fresh_rebuild_for_two_file_go);
     RUN_TEST(incremental_full_mode_keeps_exact_upsert_disabled);
