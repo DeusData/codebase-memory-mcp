@@ -185,6 +185,7 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
     }
 
     int rc = cbm_pipeline_run(p);
+    bool graph_changed = cbm_pipeline_graph_changed(p);
     cbm_pipeline_free(p);
 
     /* Re-index dependencies after fresh dump. Uses cbm_project_name_from_path
@@ -193,8 +194,13 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
         char *pname = cbm_project_name_from_path(root_path);
         cbm_store_t *store = cbm_store_open(pname);
         if (store) {
-            cbm_dep_auto_index(pname, root_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT, NULL);
-            cbm_pagerank_compute_default(store, pname);
+            int deps_reindexed =
+                cbm_dep_auto_index(pname, root_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT, NULL);
+            if (graph_changed || deps_reindexed > 0 || !cbm_pagerank_views_complete(store, pname)) {
+                cbm_pagerank_compute_default(store, pname);
+            } else {
+                cbm_log_info("pagerank.skip", "project", pname, "reason", "graph_unchanged");
+            }
             cbm_store_close(store);
         }
         free(pname);

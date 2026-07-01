@@ -257,6 +257,26 @@ TEST(pagerank_stored_in_db) {
     PASS();
 }
 
+TEST(pagerank_views_complete_requires_all_rank_views) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "fresh", "/tmp/fresh");
+    add_node(s, "fresh", "f1");
+    add_node(s, "fresh", "f2");
+
+    ASSERT_FALSE(cbm_pagerank_views_complete(s, "fresh"));
+    cbm_pagerank_compute_default(s, "fresh");
+    ASSERT_TRUE(cbm_pagerank_views_complete(s, "fresh"));
+
+    ASSERT_EQ(cbm_store_set_derived_view_state(s, "fresh", CBM_STORE_DERIVED_VIEW_LINKRANK,
+                                               CBM_STORE_DERIVED_GENERATION_UNKNOWN,
+                                               CBM_STORE_DERIVED_STATUS_STALE),
+              CBM_STORE_OK);
+    ASSERT_FALSE(cbm_pagerank_views_complete(s, "fresh"));
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(pagerank_recompute_replaces) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "re", "/tmp/re");
@@ -1060,6 +1080,7 @@ SUITE(pagerank) {
     RUN_TEST(pagerank_invalid_inputs_clamp_cleanly);
     RUN_TEST(pagerank_sum_to_one);
     RUN_TEST(pagerank_stored_in_db);
+    RUN_TEST(pagerank_views_complete_requires_all_rank_views);
     RUN_TEST(pagerank_recompute_replaces);
     RUN_TEST(pagerank_full_scope_includes_deps);
     RUN_TEST(pagerank_full_scope_preserves_dep_project_attribution);

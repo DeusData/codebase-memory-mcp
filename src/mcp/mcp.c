@@ -4967,6 +4967,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     cbm_pipeline_lock();
     srv->active_pipeline = p;
     int rc = cbm_pipeline_run(p);
+    bool graph_changed = cbm_pipeline_graph_changed(p);
     srv->active_pipeline = NULL;
     cbm_pipeline_unlock();
 
@@ -5004,7 +5005,12 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
             /* Compute PageRank + LinkRank on full graph (project + deps).
              * Uses config-backed edge weights when config is available. */
-            cbm_pagerank_compute_with_config(store, project_name, srv->config);
+            if (graph_changed || deps_reindexed > 0 ||
+                !cbm_pagerank_views_complete(store, project_name)) {
+                cbm_pagerank_compute_with_config(store, project_name, srv->config);
+            } else {
+                cbm_log_info("pagerank.skip", "project", project_name, "reason", "graph_unchanged");
+            }
             /* Register project with watcher so future file changes trigger auto-reindex */
             if (srv->watcher)
                 cbm_watcher_watch(srv->watcher, project_name, repo_path);
@@ -7338,6 +7344,7 @@ static void *autoindex_thread(void *arg) {
     /* Block until any concurrent pipeline finishes */
     cbm_pipeline_lock();
     int rc = cbm_pipeline_run(p);
+    bool graph_changed = cbm_pipeline_graph_changed(p);
     cbm_pipeline_unlock();
 
     cbm_pipeline_free(p);
@@ -7346,9 +7353,15 @@ static void *autoindex_thread(void *arg) {
         /* Re-index dependencies after fresh dump */
         cbm_store_t *store = resolve_store(srv, srv->session_project);
         if (store) {
-            cbm_dep_auto_index(srv->session_project, srv->session_root,
-                               store, CBM_DEFAULT_AUTO_DEP_LIMIT, srv->config);
-            cbm_pagerank_compute_with_config(store, srv->session_project, srv->config);
+            int deps_reindexed = cbm_dep_auto_index(srv->session_project, srv->session_root,
+                                                    store, CBM_DEFAULT_AUTO_DEP_LIMIT, srv->config);
+            if (graph_changed || deps_reindexed > 0 ||
+                !cbm_pagerank_views_complete(store, srv->session_project)) {
+                cbm_pagerank_compute_with_config(store, srv->session_project, srv->config);
+            } else {
+                cbm_log_info("pagerank.skip", "project", srv->session_project, "reason",
+                             "graph_unchanged");
+            }
         }
 
         cbm_log_info("autoindex.done", "project", srv->session_project);

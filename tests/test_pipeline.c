@@ -8244,6 +8244,7 @@ static int run_parallel_incremental_phase_failure_case(const char *phase) {
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_TRUE(cbm_pipeline_graph_changed(p));
     char *project = strdup(cbm_pipeline_project_name(p));
     cbm_pipeline_free(p);
 
@@ -8313,6 +8314,7 @@ TEST(incremental_full_then_noop) {
     ASSERT_NOT_NULL(p);
     cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_FALSE(cbm_pipeline_graph_changed(p));
     cbm_pipeline_free(p);
 
     s = cbm_store_open_path(g_incr_dbpath);

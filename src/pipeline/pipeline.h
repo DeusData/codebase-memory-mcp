@@ -125,6 +125,11 @@ void cbm_pipeline_get_excluded(const cbm_pipeline_t *p, char ***out, int *count)
  * Nodes are the #334 plausibility-gate axis; edges are informational only. */
 void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges);
 
+/* True when the last successful run changed persisted graph contents.
+ * Incremental no-op runs return false so callers can skip derived-view
+ * recomputation when the existing derived views are already complete. */
+bool cbm_pipeline_graph_changed(const cbm_pipeline_t *p);
+
 /* ── Index lock (prevents concurrent pipeline runs on same DB) ──── */
 
 /* Try to acquire the global index lock. Returns true if acquired,

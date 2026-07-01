@@ -116,6 +116,7 @@ struct cbm_pipeline {
     /* Committed graph size at dump time (-1 = dump did not run). #334 gate axis. */
     int committed_nodes;
     int committed_edges;
+    bool graph_changed;
 };
 
 /* ── Global pkgmap (one active pipeline at a time) ─────────────── */
@@ -185,6 +186,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->persistence = false;
     p->committed_nodes = -1;
     p->committed_edges = -1;
+    p->graph_changed = false;
     atomic_init(&p->cancelled, 0);
 
     return p;
@@ -388,6 +390,16 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) 
     if (p) {
         p->committed_nodes = nodes;
         p->committed_edges = edges;
+    }
+}
+
+bool cbm_pipeline_graph_changed(const cbm_pipeline_t *p) {
+    return p && p->graph_changed;
+}
+
+void cbm_pipeline_set_graph_changed(cbm_pipeline_t *p, bool changed) {
+    if (p) {
+        p->graph_changed = changed;
     }
 }
 
@@ -1229,6 +1241,9 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
+    p->graph_changed = false;
+    p->committed_nodes = -1;
+    p->committed_edges = -1;
 
     CBM_PROF_START(t_pipeline_total);
     struct timespec t0;
@@ -1410,6 +1425,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
             cbm_log_error("pipeline.err", "phase", "dump");
             goto cleanup;
         }
+        cbm_pipeline_set_graph_changed(p, true);
         cbm_log_info("pass.timing", "pass", "dump", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
         /* Persist file hashes so next run can use incremental path.
