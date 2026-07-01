@@ -8,6 +8,7 @@
  * until the corresponding feature is implemented (GREEN).
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 #include "test_framework.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
@@ -145,12 +146,12 @@ static cbm_mcp_server_t *setup_limit_test_server(char *tmp_dir, size_t tmp_sz) {
 static void cleanup_limit_test_dir(const char *tmp_dir) {
     char path[512];
     snprintf(path, sizeof(path), "%s/project/many.py", tmp_dir);
-    unlink(path);
+    cbm_unlink(path);
     snprintf(path, sizeof(path), "%s/project/big.py", tmp_dir);
-    unlink(path);
+    cbm_unlink(path);
     snprintf(path, sizeof(path), "%s/project", tmp_dir);
-    rmdir(path);
-    rmdir(tmp_dir);
+    cbm_rmdir(path);
+    cbm_rmdir(tmp_dir);
 }
 
 /* ══════════════════════════════════════════════════════════════════

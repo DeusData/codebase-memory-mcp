@@ -8,6 +8,7 @@
  * bypassing the SQL parser entirely. These tests verify integrity.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 #include "../src/foundation/compat_thread.h"
 #include "../src/foundation/constants.h"
 #include "test_framework.h"
@@ -183,7 +184,7 @@ TEST(sw_minimal_data) {
     sqlite3_finalize(stmt);
 
     sqlite3_close(db);
-    unlink(path);
+    cbm_unlink(path);
     PASS();
 }
 
@@ -220,7 +221,7 @@ TEST(sw_store_open_migrates_exact_delta_metadata) {
     ASSERT_TRUE(cbm_test_sqlite_object_exists(db, "index", "idx_node_owners_path"));
     cbm_store_close(store);
 
-    unlink(path);
+    cbm_unlink(path);
     PASS();
 }
 
@@ -374,7 +375,7 @@ TEST(sw_scale_and_indexes) {
     sqlite3_finalize(stmt);
 
     sqlite3_close(db);
-    unlink(path);
+    cbm_unlink(path);
     PASS();
 }
 
@@ -450,7 +451,7 @@ TEST(sw_long_index_keys_overflow) {
 
     free(longname);
     free(longqn);
-    unlink(path);
+    cbm_unlink(path);
     PASS();
 }
 
@@ -473,7 +474,7 @@ TEST(sw_empty) {
     sqlite3_finalize(stmt);
 
     sqlite3_close(db);
-    unlink(path);
+    cbm_unlink(path);
     PASS();
 }
 
@@ -549,7 +550,7 @@ TEST(sw_vectors_and_token_vectors) {
     sqlite3_finalize(stmt);
 
     sqlite3_close(db);
-    unlink(path);
+    cbm_unlink(path);
     PASS();
 }
 
@@ -626,7 +627,7 @@ TEST(sw_multi_page) {
     sqlite3_finalize(stmt);
 
     sqlite3_close(db);
-    unlink(path);
+    cbm_unlink(path);
     PASS();
 }
 
@@ -690,7 +691,7 @@ TEST(sw_oversized_node) {
     sqlite3_finalize(stmt);
 
     sqlite3_close(db);
-    unlink(path);
+    cbm_unlink(path);
     PASS();
 }
 
@@ -798,7 +799,7 @@ TEST(sw_scale_root_path_integrity) {
     sqlite3_finalize(stmt);
 
     sqlite3_close(db);
-    unlink(path);
+    cbm_unlink(path);
     free(nodes);
     free(edges);
     free(namebuf);
@@ -900,7 +901,7 @@ TEST(sw_concurrent_writes_are_independent) {
         ASSERT_EQ(verify_writer_db(jobs[i].path, jobs[i].project, jobs[i].root_path,
                                    jobs[i].node_count, jobs[i].edge_count),
                   0);
-        unlink(jobs[i].path);
+        cbm_unlink(jobs[i].path);
     }
     PASS();
 }
