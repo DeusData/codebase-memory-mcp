@@ -64,6 +64,12 @@ printf '#include <stdio.h>\nvoid bad(void) { printf("bad\\n"); }\n' \
     >"$stdout_root/src/mcp/bad.c"
 expect_fail_contains "stdout" "$stdout_root" "stdout write"
 
+fprintf_stdout_root="$TMP_ROOT/fprintf_stdout"
+make_tree "$fprintf_stdout_root"
+printf '#include <stdio.h>\nvoid bad(void) { fprintf(stdout, "bad\\n"); }\n' \
+    >"$fprintf_stdout_root/src/pipeline/bad.c"
+expect_fail_contains "fprintf_stdout" "$fprintf_stdout_root" "stdout write"
+
 string_root="$TMP_ROOT/string"
 make_tree "$string_root"
 printf '#include <string.h>\nvoid bad(char *d, const char *s) { strcpy(d, s); }\n' \

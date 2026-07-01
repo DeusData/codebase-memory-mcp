@@ -3792,7 +3792,7 @@ static int query_neighbor_names(sqlite3 *db, const char *sql, int64_t node_id, i
             cap *= ST_GROWTH;
             names = safe_realloc(names, (size_t)cap * sizeof(char *));
         }
-        names[count++] = strdup(name);
+        names[count++] = heap_strdup(name);
     }
     sqlite3_finalize(stmt);
     *out = names;
@@ -4071,7 +4071,7 @@ int cbm_extract_like_hints(const char *pattern, char **out, int max_out) {
             /* Meta character — flush current literal segment */
             if (blen >= ST_GLOB_MIN_LEN && count < max_out) {
                 buf[blen] = '\0';
-                out[count++] = strdup(buf);
+                out[count++] = heap_strdup(buf);
             }
             blen = 0;
             i++;
@@ -4087,7 +4087,7 @@ int cbm_extract_like_hints(const char *pattern, char **out, int max_out) {
     /* Flush trailing segment */
     if (blen >= ST_GLOB_MIN_LEN && count < max_out) {
         buf[blen] = '\0';
-        out[count++] = strdup(buf);
+        out[count++] = heap_strdup(buf);
     }
     return count;
 }
