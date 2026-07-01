@@ -220,7 +220,11 @@ void cbm_pipeline_free_import_map(const char **keys, const char **vals, int coun
  * Returns CBM_STORE_OK even when unsupported_edge_count > 0; callers must fall
  * back instead of publishing when unsupported edges are present. */
 int64_t cbm_pipeline_stat_mtime_ns(const struct stat *st);
+const char *cbm_pipeline_file_delta_pass_fingerprint(void);
 int cbm_pipeline_content_hash_file(const char *path, char *out, size_t out_sz);
+bool cbm_pipeline_file_state_is_current_or_legacy(cbm_store_t *store, const char *project,
+                                                  const cbm_file_info_t *file,
+                                                  const char *pass_fingerprint);
 /* Persists file_state rows in its own transaction. */
 int cbm_pipeline_persist_file_states(cbm_store_t *store, const char *project,
                                      const cbm_file_info_t *files, int file_count,

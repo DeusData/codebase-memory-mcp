@@ -3665,6 +3665,42 @@ TEST(pipeline_file_state_persist_helper_writes_hash_metadata) {
     PASS();
 }
 
+TEST(pipeline_file_state_current_check_rejects_stale_pass_fingerprint) {
+    enum { PIPELINE_FILE_STATE_GENERATION = 15 };
+    char *tmp = th_mktempdir("cbm_file_state_current_pass");
+    ASSERT_NOT_NULL(tmp);
+    const char *path = TH_PATH(tmp, "main.go");
+    const char *content = "package main\nfunc Run() { println(\"current\") }\n";
+    ASSERT_EQ(th_write_file(path, content), 0);
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", tmp), CBM_STORE_OK);
+
+    cbm_file_info_t file = {.path = (char *)path,
+                            .rel_path = "main.go",
+                            .language = CBM_LANG_GO,
+                            .size = (int64_t)strlen(content)};
+    ASSERT_TRUE(cbm_pipeline_file_state_is_current_or_legacy(
+        s, "test", &file, cbm_pipeline_file_delta_pass_fingerprint()));
+
+    ASSERT_EQ(cbm_pipeline_persist_file_states(s, "test", &file, 1,
+                                               PIPELINE_FILE_STATE_GENERATION, "old-pass"),
+              CBM_STORE_OK);
+    ASSERT_FALSE(cbm_pipeline_file_state_is_current_or_legacy(
+        s, "test", &file, cbm_pipeline_file_delta_pass_fingerprint()));
+
+    ASSERT_EQ(cbm_pipeline_persist_file_states(s, "test", &file, 1,
+                                               PIPELINE_FILE_STATE_GENERATION + 1, NULL),
+              CBM_STORE_OK);
+    ASSERT_TRUE(cbm_pipeline_file_state_is_current_or_legacy(
+        s, "test", &file, cbm_pipeline_file_delta_pass_fingerprint()));
+
+    cbm_store_close(s);
+    th_cleanup(tmp);
+    PASS();
+}
+
 TEST(pipeline_file_state_persist_helper_rolls_back_on_failure) {
     char *tmp = th_mktempdir("cbm_file_state_persist_fail");
     ASSERT_NOT_NULL(tmp);
@@ -8849,6 +8885,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_metadata_from_file);
     RUN_TEST(pipeline_content_hash_helper_matches_file_delta_metadata);
     RUN_TEST(pipeline_file_state_persist_helper_writes_hash_metadata);
+    RUN_TEST(pipeline_file_state_current_check_rejects_stale_pass_fingerprint);
     RUN_TEST(pipeline_file_state_persist_helper_rolls_back_on_failure);
     RUN_TEST(pipeline_file_delta_plan_candidate_from_frontier);
     RUN_TEST(pipeline_file_delta_apply_falls_back_on_publish_error);
