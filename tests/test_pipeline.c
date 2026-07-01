@@ -4307,6 +4307,133 @@ TEST(pipeline_file_delta_apply_succeeds_after_generation_stamp) {
     PASS();
 }
 
+TEST(pipeline_file_delta_apply_inserts_new_file_without_existing_ownership) {
+    enum { PIPELINE_NEW_FILE_DELTA_COUNT = 1 };
+    const char *project = "test";
+    const char *rel_path = "pkg/new.go";
+    const char *new_qn = "test.pkg.new.Value";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+
+    char *folder_qn = cbm_pipeline_fqn_folder(project, "pkg");
+    ASSERT_NOT_NULL(folder_qn);
+    cbm_node_t folder = {.project = (char *)project,
+                         .label = "Folder",
+                         .name = "pkg",
+                         .qualified_name = folder_qn,
+                         .file_path = "pkg",
+                         .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &folder), CBM_STORE_NO_NODE_ID);
+
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, "/tmp/test");
+    ASSERT_NOT_NULL(scratch);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Project", project, project, NULL, 0, 0, "{}"), 0);
+    ASSERT_EQ(cbm_pipeline_ensure_file_structure(scratch, project, project, rel_path, NULL), 0);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Function", "Value", new_qn, rel_path, 1, 1,
+                                   "{\"is_exported\":true}"),
+              0);
+
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(scratch, project, rel_path, 0, &delta),
+              CBM_STORE_OK);
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+    delta.delta.generation = 0;
+    delta.file_state.generation = 0;
+
+    cbm_pipeline_file_delta_plan_t preflight_plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &preflight_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(preflight_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&preflight_plan, rel_path), 1);
+    ASSERT_EQ(preflight_plan.affected_count, 1);
+    cbm_pipeline_file_delta_plan_free(&preflight_plan);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_GT(generation, 0);
+    ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&delta, generation), CBM_STORE_OK);
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t apply_plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, deltas, PIPELINE_NEW_FILE_DELTA_COUNT,
+                                                  CBM_SZ_4, &apply_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(apply_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_qn), 1);
+
+    int node_owners = 0;
+    int edge_owners = 0;
+    ASSERT_EQ(cbm_store_count_file_delta_owners(s, project, rel_path, &node_owners,
+                                                &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_GT(node_owners, 0);
+    cbm_file_state_t got = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, project, rel_path, &got), CBM_STORE_OK);
+    ASSERT_EQ(got.generation, generation);
+    cbm_store_file_state_free_fields(&got);
+
+    cbm_pipeline_file_delta_plan_free(&apply_plan);
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(scratch);
+    free(folder_qn);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_apply_falls_back_on_new_file_importer_frontier) {
+    enum { PIPELINE_NEW_IMPORTER_DELTA_COUNT = 1 };
+    const char *project = "test";
+    const char *new_rel = "pkg/new.go";
+    const char *main_rel = "main.go";
+    const char *new_qn = "test.pkg.new.Value";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, main_rel, "test.main.Main"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, project, main_rel, "test.pkg.new", "Value",
+                                          new_qn, 1),
+              CBM_STORE_OK);
+
+    cbm_node_t nodes[1] = {{.project = (char *)project,
+                            .label = "Function",
+                            .name = "Value",
+                            .qualified_name = (char *)new_qn,
+                            .file_path = (char *)new_rel,
+                            .properties_json = "{\"is_exported\":true}"}};
+    cbm_store_symbol_export_t exports[1] = {
+        {.qualified_name = new_qn, .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = project,
+                                                 .rel_path = new_rel,
+                                                 .nodes = nodes,
+                                                 .node_count = 1,
+                                                 .exports = exports,
+                                                 .export_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, deltas,
+                                                  PIPELINE_NEW_IMPORTER_DELTA_COUNT,
+                                                  CBM_SZ_4, &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "frontier_requires_batch");
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_qn), 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(pipeline_file_delta_plan_falls_back_without_existing_ownership) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -11015,6 +11142,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_apply_falls_back_on_publish_error);
     RUN_TEST(pipeline_file_delta_apply_falls_back_without_generation);
     RUN_TEST(pipeline_file_delta_apply_succeeds_after_generation_stamp);
+    RUN_TEST(pipeline_file_delta_apply_inserts_new_file_without_existing_ownership);
+    RUN_TEST(pipeline_file_delta_apply_falls_back_on_new_file_importer_frontier);
     RUN_TEST(pipeline_file_delta_plan_falls_back_without_existing_ownership);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_external_inbound_edge);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unowned_structural_inbound_edge);

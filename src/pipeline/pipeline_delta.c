@@ -697,17 +697,17 @@ static bool delta_derived_view_supported(const cbm_store_file_delta_t *delta) {
                      strcmp(delta->derived_view_name, CBM_STORE_DERIVED_VIEW_NODES_FTS) == 0);
 }
 
-static bool delta_existing_ownership_available(cbm_store_t *store,
-                                               const cbm_store_file_delta_t *delta,
-                                               cbm_pipeline_file_delta_plan_t *plan) {
+static bool delta_existing_or_insert_ownership_supported(
+    cbm_store_t *store, const cbm_pipeline_file_delta_t *file_delta,
+    cbm_pipeline_file_delta_plan_t *plan) {
+    const cbm_store_file_delta_t *delta = &file_delta->delta;
     cbm_file_state_t state = {0};
     int rc = cbm_store_get_file_state(store, delta->project, delta->rel_path, &state);
     cbm_store_file_state_free_fields(&state);
+    bool existing_state = true;
     if (rc == CBM_STORE_NOT_FOUND) {
-        delta_plan_set_fallback(plan, cbm_delta_reason_missing_existing_ownership);
-        return false;
-    }
-    if (rc != CBM_STORE_OK) {
+        existing_state = false;
+    } else if (rc != CBM_STORE_OK) {
         delta_plan_set_fallback(plan, cbm_delta_reason_preflight_error);
         return false;
     }
@@ -719,6 +719,11 @@ static bool delta_existing_ownership_available(cbm_store_t *store,
     if (rc != CBM_STORE_OK) {
         delta_plan_set_fallback(plan, cbm_delta_reason_preflight_error);
         return false;
+    }
+    if (!existing_state && node_owners == 0 && edge_owners == 0 &&
+        file_delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_UPSERT &&
+        delta->node_count > 0) {
+        return true;
     }
     if (node_owners <= 0) {
         delta_plan_set_fallback(plan, cbm_delta_reason_missing_existing_ownership);
@@ -1011,7 +1016,7 @@ int cbm_pipeline_plan_file_delta(cbm_store_t *store, const cbm_pipeline_file_del
     if (!delta_plan_precheck_common(delta, out)) {
         return CBM_STORE_OK;
     }
-    if (!delta_existing_ownership_available(store, &delta->delta, out)) {
+    if (!delta_existing_or_insert_ownership_supported(store, delta, out)) {
         return CBM_STORE_OK;
     }
     enum { CBM_DELTA_SINGLE_COUNT = 1 };
@@ -1090,7 +1095,7 @@ int cbm_pipeline_plan_file_delta_batch(cbm_store_t *store,
         if (!delta_plan_precheck_common(delta, out)) {
             return CBM_STORE_OK;
         }
-        if (!delta_existing_ownership_available(store, &delta->delta, out)) {
+        if (!delta_existing_or_insert_ownership_supported(store, delta, out)) {
             return CBM_STORE_OK;
         }
         if (!delta_inbound_edges_supported(store, delta, deltas, delta_count, out)) {
