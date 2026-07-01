@@ -559,7 +559,7 @@ TEST(httplink_load_config_from_file) {
 
     FILE *f = fopen(cfgpath, "w");
     if (!f) {
-        rmdir(tmpdir);
+        cbm_rmdir(tmpdir);
         SKIP("cannot write .cgrconfig");
     }
     fprintf(f, "\n"
@@ -583,8 +583,8 @@ TEST(httplink_load_config_from_file) {
     cbm_httplink_config_free(&cfg);
 
     /* Cleanup */
-    unlink(cfgpath);
-    rmdir(tmpdir);
+    cbm_unlink(cfgpath);
+    cbm_rmdir(tmpdir);
     PASS();
 }
 
@@ -599,7 +599,7 @@ TEST(httplink_load_config_invalid_yaml) {
 
     FILE *f = fopen(cfgpath, "w");
     if (!f) {
-        rmdir(tmpdir);
+        cbm_rmdir(tmpdir);
         SKIP("cannot write .cgrconfig");
     }
     fprintf(f, "not: [valid: yaml");
@@ -612,8 +612,8 @@ TEST(httplink_load_config_invalid_yaml) {
     cbm_httplink_config_free(&cfg);
 
     /* Cleanup */
-    unlink(cfgpath);
-    rmdir(tmpdir);
+    cbm_unlink(cfgpath);
+    cbm_rmdir(tmpdir);
     PASS();
 }
 
@@ -742,8 +742,8 @@ TEST(httplink_read_source_lines) {
     free(result);
 
     /* Cleanup */
-    unlink(fpath);
-    rmdir(tmpdir);
+    cbm_unlink(fpath);
+    cbm_rmdir(tmpdir);
     PASS();
 }
 

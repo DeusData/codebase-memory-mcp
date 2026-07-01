@@ -207,9 +207,9 @@ TEST(mcp_tools_list_classic_mode) {
      * (src/mcp/mcp.c:870), so set it, capture the list, then unset it BEFORE any
      * ASSERT — a failed assert must not leak the classic setting into sibling
      * tests (which expect the streamlined default). */
-    setenv("CBM_TOOL_MODE", "classic", 1);
+    cbm_setenv("CBM_TOOL_MODE", "classic", 1);
     char *json = cbm_mcp_tools_list(NULL);
-    unsetenv("CBM_TOOL_MODE");
+    cbm_unsetenv("CBM_TOOL_MODE");
     ASSERT_NOT_NULL(json);
     /* Classic split tools are present (TOOLS[] in mcp.c). */
     ASSERT_NOT_NULL(strstr(json, "\"index_repository\""));
@@ -1673,7 +1673,15 @@ TEST(tool_index_repository_reports_incremental_containment_reason) {
 
     ASSERT_EQ(th_write_file(TH_PATH(repo, "go.mod"), "module example.com/pubreason\n\ngo 1.22\n"),
               0);
-    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.go"), "package main\n\nfunc main() {}\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.go"),
+                            "package main\n\nfunc main() {\n\tHelper()\n\tLeaf()\n}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "helper.go"),
+                            "package main\n\nfunc Helper() int {\n\treturn 1\n}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "leaf.go"),
+                            "package main\n\nfunc Leaf() int {\n\treturn 2\n}\n"),
+              0);
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -1691,8 +1699,17 @@ TEST(tool_index_repository_reports_incremental_containment_reason) {
     ASSERT_NOT_NULL(strstr(resp, "indexed"));
     free(resp);
 
-    ASSERT_EQ(th_write_file(TH_PATH(repo, "pkg/file_created.go"),
-                            "package pkg\n\nfunc Created() int {\n\treturn 7\n}\n"),
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.go"),
+                            "package main\n\nfunc main() {\n\tHelper()\n\tLeaf()\n}\n\n"
+                            "func NewMain() int {\n\treturn 11\n}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "helper.go"),
+                            "package main\n\nfunc Helper() int {\n\treturn 3\n}\n\n"
+                            "func NewHelper() int {\n\treturn 13\n}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "leaf.go"),
+                            "package main\n\nfunc Leaf() int {\n\treturn 5\n}\n\n"
+                            "func NewLeaf() int {\n\treturn 17\n}\n"),
               0);
 
     n = snprintf(req, sizeof(req),
@@ -1706,7 +1723,7 @@ TEST(tool_index_repository_reports_incremental_containment_reason) {
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "\"publish_kind\":\"incremental_containment\""));
-    ASSERT_NOT_NULL(strstr(inner, "\"publish_reason\":\"missing_existing_ownership\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"publish_reason\":\"changed_batch_too_large\""));
 
     free(inner);
     free(resp);
@@ -2000,9 +2017,9 @@ TEST(tool_manage_adr_get_with_existing_adr) {
 
     /* Clean up */
     cbm_mcp_server_free(srv);
-    remove(adr_path);
-    rmdir(adr_dir);
-    rmdir(tmp_dir);
+    cbm_unlink(adr_path);
+    cbm_rmdir(adr_dir);
+    cbm_rmdir(tmp_dir);
     PASS();
 }
 
@@ -2322,10 +2339,10 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
 static void cleanup_snippet_dir(const char *tmp_dir) {
     char path[512];
     snprintf(path, sizeof(path), "%s/project/main.go", tmp_dir);
-    unlink(path);
+    cbm_unlink(path);
     snprintf(path, sizeof(path), "%s/project", tmp_dir);
-    rmdir(path);
-    rmdir(tmp_dir);
+    cbm_rmdir(path);
+    cbm_rmdir(tmp_dir);
 }
 
 /* Extract the inner "text" value from an MCP tool result JSON.
