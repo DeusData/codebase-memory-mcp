@@ -8227,6 +8227,100 @@ static char *cluster_make_label(const cbm_cluster_info_t *ci, const char *contex
     return heap_strdup("cluster");
 }
 
+static char *cluster_make_disambiguated_label(const cbm_cluster_info_t *ci, const char *context,
+                                              int cluster_id, bool include_id) {
+    if (!ci || ci->top_node_count <= 0 || !ci->top_nodes[0]) {
+        return heap_strdup("cluster");
+    }
+
+    const char *primary = ci->top_nodes[0];
+    const char *secondary = (ci->top_node_count > 1 && ci->top_nodes[1]) ? ci->top_nodes[1] : "";
+    const char *ctx =
+        (context && context[0]) ? context : (ci->package_count > 0 ? ci->packages[0] : "");
+    char id_buf[ST_BUF_64];
+    int id_len = include_id ? snprintf(id_buf, sizeof(id_buf), "cluster%d", cluster_id) : 0;
+    if (!include_id || id_len <= 0 || (size_t)id_len >= sizeof(id_buf)) {
+        id_buf[0] = '\0';
+    }
+
+    size_t len = strlen(primary) + 1;
+    if (secondary[0]) {
+        len += strlen(secondary) + 1; /* slash */
+    }
+    if (ctx[0]) {
+        len += strlen(ctx) + 1; /* at sign */
+    }
+    if (id_buf[0]) {
+        len += strlen(id_buf) + 1; /* hash */
+    }
+
+    char *label = malloc(len);
+    if (!label) {
+        return heap_strdup(primary);
+    }
+
+    int n;
+    if (secondary[0] && ctx[0] && id_buf[0]) {
+        n = snprintf(label, len, "%s/%s@%s#%s", primary, secondary, ctx, id_buf);
+    } else if (secondary[0] && ctx[0]) {
+        n = snprintf(label, len, "%s/%s@%s", primary, secondary, ctx);
+    } else if (secondary[0] && id_buf[0]) {
+        n = snprintf(label, len, "%s/%s#%s", primary, secondary, id_buf);
+    } else if (ctx[0] && id_buf[0]) {
+        n = snprintf(label, len, "%s@%s#%s", primary, ctx, id_buf);
+    } else if (secondary[0]) {
+        n = snprintf(label, len, "%s/%s", primary, secondary);
+    } else if (ctx[0]) {
+        n = snprintf(label, len, "%s@%s", primary, ctx);
+    } else if (id_buf[0]) {
+        n = snprintf(label, len, "%s#%s", primary, id_buf);
+    } else {
+        n = snprintf(label, len, "%s", primary);
+    }
+    if (n < 0 || (size_t)n >= len) {
+        free(label);
+        return heap_strdup(primary);
+    }
+    return label;
+}
+
+static void cluster_disambiguate_label_pass(cbm_cluster_info_t *clusters, int count, int n,
+                                            const int *comm, const char **qns, bool include_id) {
+    bool duplicate[CBM_CLUSTER_TOP_N] = {false};
+    for (int i = 0; i < count; i++) {
+        for (int j = 0; j < count; j++) {
+            if (i != j && clusters[i].label && clusters[j].label &&
+                strcmp(clusters[i].label, clusters[j].label) == 0) {
+                duplicate[i] = true;
+                break;
+            }
+        }
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (!duplicate[i]) {
+            continue;
+        }
+
+        const char *context = cluster_best_context(qns, comm, n, clusters[i].id);
+        char *label =
+            cluster_make_disambiguated_label(&clusters[i], context, clusters[i].id, include_id);
+        if (context && context[0]) {
+            safe_str_free(&context);
+        }
+        if (label) {
+            safe_str_free(&clusters[i].label);
+            clusters[i].label = label;
+        }
+    }
+}
+
+static void cluster_disambiguate_duplicate_labels(cbm_cluster_info_t *clusters, int count,
+                                                  int n, const int *comm, const char **qns) {
+    cluster_disambiguate_label_pass(clusters, count, n, comm, qns, false);
+    cluster_disambiguate_label_pass(clusters, count, n, comm, qns, true);
+}
+
 /* Build the cluster_info for one community c into *ci. */
 static void cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *comm,
                               const int *degree, const char **names, const char **qns, int members,
@@ -8460,6 +8554,7 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
             cluster_build_one(&clusters[cc], c, n, comm, degree, names, qns, members[c], cohesion);
             cc++;
         }
+        cluster_disambiguate_duplicate_labels(clusters, cc, n, comm, qns);
         out->clusters = clusters;
         out->cluster_count = cc;
 

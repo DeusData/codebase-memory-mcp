@@ -1487,6 +1487,64 @@ TEST(arch_cluster_generic_labels_include_namespace_context) {
     PASS();
 }
 
+TEST(arch_cluster_duplicate_nongeneric_labels_are_disambiguated) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    int64_t id[8];
+    for (int g = 0; g < 2; g++) {
+        for (int i = 0; i < 4; i++) {
+            char qn[128];
+            int n = snprintf(qn, sizeof(qn), "test.pkg%d.installer.download%d", g, i);
+            ASSERT_TRUE(n > 0 && (size_t)n < sizeof(qn));
+            cbm_node_t node = {.project = "test",
+                               .label = "Function",
+                               .name = "download",
+                               .qualified_name = qn,
+                               .file_path = "install.go"};
+            id[(g * 4) + i] = cbm_store_upsert_node(s, &node);
+        }
+    }
+
+    for (int g = 0; g < 2; g++) {
+        int base = g * 4;
+        for (int i = 1; i < 4; i++) {
+            cbm_edge_t e1 = {.project = "test",
+                             .source_id = id[base],
+                             .target_id = id[base + i],
+                             .type = "CALLS"};
+            cbm_store_insert_edge(s, &e1);
+            cbm_edge_t e2 = {.project = "test",
+                             .source_id = id[base + i],
+                             .target_id = id[base],
+                             .type = "CALLS"};
+            cbm_store_insert_edge(s, &e2);
+        }
+    }
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"clusters"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
+
+    const char *download_labels[2] = {NULL, NULL};
+    int seen = 0;
+    for (int i = 0; i < info.cluster_count && seen < 2; i++) {
+        const char *label = info.clusters[i].label;
+        if (label && strstr(label, "download") == label) {
+            download_labels[seen++] = label;
+        }
+    }
+    ASSERT_EQ(seen, 2);
+    ASSERT_TRUE(strcmp(download_labels[0], download_labels[1]) != 0);
+    ASSERT_TRUE(strcmp(download_labels[0], "download") != 0);
+    ASSERT_TRUE(strcmp(download_labels[1], "download") != 0);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Helper function tests ──────────────────────────────────────── */
 
 TEST(qn_to_package) {
@@ -1696,6 +1754,7 @@ SUITE(store_arch) {
     RUN_TEST(arch_clusters_basic);
     RUN_TEST(arch_cluster_generic_labels_include_package_context);
     RUN_TEST(arch_cluster_generic_labels_include_namespace_context);
+    RUN_TEST(arch_cluster_duplicate_nongeneric_labels_are_disambiguated);
 
     /* Helpers */
     RUN_TEST(qn_to_package);
