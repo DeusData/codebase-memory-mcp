@@ -321,7 +321,7 @@ int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *
         .rel_path = rel_path,
         .generation = generation,
         .derived_view_name = CBM_STORE_DERIVED_VIEW_NODES_FTS,
-        .derived_status = CBM_STORE_DERIVED_STATUS_STALE,
+        .derived_status = CBM_STORE_DERIVED_STATUS_COMPLETE,
     };
     cbm_delta_build_ctx_t ctx = {
         .out = out,

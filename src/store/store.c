@@ -3057,9 +3057,71 @@ static int store_resolve_node_id(cbm_store_t *s, const char *project, const char
     return CBM_STORE_OK;
 }
 
+static bool store_nodes_fts_unavailable(cbm_store_t *s) {
+    const char *msg = (s && s->db) ? sqlite3_errmsg(s->db) : NULL;
+    return msg && strstr(msg, "no such table: nodes_fts") != NULL;
+}
+
+static int store_nodes_fts_delete_by_file(cbm_store_t *s, const char *project,
+                                          const char *rel_path) {
+    static const char sql[] =
+        "INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, label, file_path) "
+        "SELECT 'delete', id, cbm_camel_split(name), qualified_name, label, file_path "
+        "FROM nodes "
+        "WHERE project = ?1 AND file_path = ?2 "
+        "  AND EXISTS (SELECT 1 FROM nodes_fts WHERE rowid = nodes.id);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        if (store_nodes_fts_unavailable(s)) {
+            return CBM_STORE_OK;
+        }
+        store_set_error_sqlite(s, "nodes_fts_delete_by_file");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+    int step = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (step != SQLITE_DONE) {
+        store_set_error_sqlite(s, "nodes_fts_delete_by_file");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+static int store_nodes_fts_insert_node(cbm_store_t *s, int64_t node_id, const cbm_node_t *node) {
+    static const char sql[] =
+        "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+        "VALUES(?1, cbm_camel_split(?2), ?3, ?4, ?5);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        if (store_nodes_fts_unavailable(s)) {
+            return CBM_STORE_OK;
+        }
+        store_set_error_sqlite(s, "nodes_fts_insert_node");
+        return CBM_STORE_ERR;
+    }
+    sqlite3_bind_int64(stmt, ST_COL_1, node_id);
+    bind_text(stmt, ST_COL_2, node->name ? node->name : "");
+    bind_text(stmt, ST_COL_3, node->qualified_name ? node->qualified_name : "");
+    bind_text(stmt, ST_COL_4, node->label ? node->label : "");
+    bind_text(stmt, ST_COL_5, node->file_path ? node->file_path : "");
+    int step = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (step != SQLITE_DONE) {
+        store_set_error_sqlite(s, "nodes_fts_insert_node");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
 static int store_delete_file_delta_body(cbm_store_t *s, const char *project, const char *rel_path,
                                         int64_t generation, const char *derived_view_name) {
     int rc = store_delete_owned_edges_by_file(s, project, rel_path);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_nodes_fts_delete_by_file(s, project, rel_path);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
@@ -3141,6 +3203,10 @@ static int store_publish_file_delta_delete_body(cbm_store_t *s,
     if (rc != CBM_STORE_OK) {
         return rc;
     }
+    rc = store_nodes_fts_delete_by_file(s, delta->project, delta->rel_path);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
     rc = store_delete_owned_nodes_by_file(s, delta->project, delta->rel_path);
     if (rc != CBM_STORE_OK) {
         return rc;
@@ -3173,6 +3239,10 @@ static int store_publish_file_delta_nodes_body(cbm_store_t *s,
             return CBM_STORE_ERR;
         }
         rc = cbm_store_upsert_node_owner(s, delta->project, id, delta->rel_path, delta->generation);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+        rc = store_nodes_fts_insert_node(s, id, &delta->nodes[i]);
         if (rc != CBM_STORE_OK) {
             return rc;
         }

@@ -798,6 +798,78 @@ static int mcp_test_rebuild_nodes_fts(cbm_store_t *st) {
                           "FROM nodes;");
 }
 
+TEST(tool_search_graph_query_sees_file_delta_fts_updates) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "fts-delta";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/fts-delta"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    cbm_node_t old_node = {.project = proj,
+                           .label = "Function",
+                           .name = "obsolete",
+                           .qualified_name = "fts-delta.obsolete",
+                           .file_path = "src/status.c",
+                           .start_line = 1,
+                           .end_line = 3};
+    cbm_store_file_delta_t old_delta = {.project = proj,
+                                        .rel_path = "src/status.c",
+                                        .generation = 1,
+                                        .nodes = &old_node,
+                                        .node_count = 1,
+                                        .derived_view_name = CBM_STORE_DERIVED_VIEW_NODES_FTS,
+                                        .derived_status = CBM_STORE_DERIVED_STATUS_COMPLETE};
+    ASSERT_EQ(cbm_store_publish_file_delta(st, &old_delta), CBM_STORE_OK);
+
+    cbm_node_t new_node = {.project = proj,
+                           .label = "Function",
+                           .name = "freshmarker",
+                           .qualified_name = "fts-delta.freshmarker",
+                           .file_path = "src/status.c",
+                           .start_line = 1,
+                           .end_line = 3};
+    cbm_store_file_delta_t new_delta = {.project = proj,
+                                        .rel_path = "src/status.c",
+                                        .generation = 2,
+                                        .nodes = &new_node,
+                                        .node_count = 1,
+                                        .derived_view_name = CBM_STORE_DERIVED_VIEW_NODES_FTS,
+                                        .derived_status = CBM_STORE_DERIVED_STATUS_COMPLETE};
+    ASSERT_EQ(cbm_store_publish_file_delta(st, &new_delta), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":554,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"fts-delta\",\"query\":\"freshmarker\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+    ASSERT_NOT_NULL(strstr(inner, "freshmarker"));
+    ASSERT_NULL(strstr(inner, "obsolete"));
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":555,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"fts-delta\",\"query\":\"obsolete\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+    ASSERT_NULL(strstr(inner, "obsolete"));
+    ASSERT_NULL(strstr(inner, "freshmarker"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_search_graph_query_honors_file_pattern_issue552) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -3261,6 +3333,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_includes_node_properties);
     RUN_TEST(tool_search_graph_warns_on_stale_pagerank_view);
     RUN_TEST(tool_search_graph_warns_on_stale_route_view);
+    RUN_TEST(tool_search_graph_query_sees_file_delta_fts_updates);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_query_uses_search_limit_config);
     RUN_TEST(tool_search_graph_query_rejects_bad_semantic_query);
