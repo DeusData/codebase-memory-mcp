@@ -84,29 +84,34 @@ for f in "${FORMER_SITES[@]}"; do
 done
 
 # ── AC row 5: CBM_PERCENT's legitimate consumers untouched (characterization pin) ──
-declare -A PIN_LINES=(
-    ["src/foundation/mem.c"]="92 102"
-    ["src/foundation/vmem.c"]="78 90"
-    ["src/cypher/cypher.c"]="2838"
+# Pinned by MINIMUM occurrence count per file, not exact line number — adding
+# unrelated code earlier in a file (e.g. new ceiling constants ahead of
+# check_pressure() in mem.c) legitimately shifts later line numbers without
+# touching the CBM_PERCENT usage itself; an exact-line pin would false-positive
+# on that harmless drift. The count floor still catches the real regression
+# this row guards against: the collapse repurposing/deleting a legitimate use.
+declare -A PIN_COUNTS=(
+    ["src/foundation/mem.c"]=2
+    ["src/foundation/vmem.c"]=2
+    ["src/cypher/cypher.c"]=1
 )
 
 echo "[cap-dedup] Pinning CBM_PERCENT's legitimate percentage/depth consumers (must be untouched)..." >&2
-for f in "${!PIN_LINES[@]}"; do
+for f in "${!PIN_COUNTS[@]}"; do
     content="$(show "$f")"
     if [[ -z "$content" ]]; then
         echo "[cap-dedup] FAIL: could not read $f at $REF" >&2
         FAILURES=$((FAILURES + 1))
         continue
     fi
-    for ln in ${PIN_LINES[$f]}; do
-        line_text="$(sed -n "${ln}p" <<<"$content")"
-        if [[ "$line_text" != *"CBM_PERCENT"* ]]; then
-            echo "[cap-dedup] FAIL: $f:$ln no longer references CBM_PERCENT (got: $line_text)" >&2
-            FAILURES=$((FAILURES + 1))
-        else
-            echo "[cap-dedup] PASS: $f:$ln still references CBM_PERCENT" >&2
-        fi
-    done
+    expected="${PIN_COUNTS[$f]}"
+    actual="$(grep -c 'CBM_PERCENT' <<<"$content")"
+    if [[ "$actual" -lt "$expected" ]]; then
+        echo "[cap-dedup] FAIL: $f has $actual CBM_PERCENT reference(s), expected >= $expected" >&2
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "[cap-dedup] PASS: $f has $actual CBM_PERCENT reference(s) (>= $expected expected)" >&2
+    fi
 done
 
 # CBM_PERCENT's definition itself must still be 100 (untouched/unrenamed).
