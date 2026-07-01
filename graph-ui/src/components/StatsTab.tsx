@@ -266,6 +266,20 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
     return "/" + parts.join("/");
   };
 
+  /* Root/drive quick-jump buttons. On Windows the POSIX "/" root is meaningless
+   * — browsing it returns an empty listing — so drop it and offer drive roots
+   * instead. An older backend may not enumerate drives, so always include the
+   * current drive; other drives stay reachable by typing a path. */
+  const displayRoots = (() => {
+    if (!isWinPath) return roots;
+    const drives = Array.from(new Set(
+      roots.filter((r) => /^[A-Za-z]:[\\/]?$/.test(r)).map((r) => `${r[0].toUpperCase()}:/`),
+    ));
+    const curRoot = `${displayPath[0].toUpperCase()}:/`;
+    if (!drives.includes(curRoot)) drives.unshift(curRoot);
+    return drives;
+  })();
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={onClose}>
       <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
@@ -299,7 +313,7 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
             className="flex-1 bg-white/[0.04] border border-white/[0.06] rounded-lg px-3 py-2 text-[12px] text-foreground outline-none focus:border-primary/40 placeholder:text-foreground/20"
           />
           <div className="flex items-center gap-1">
-            {roots.map((root) => (
+            {displayRoots.map((root) => (
               <button
                 key={root}
                 aria-label={t.index.browseRoot(root)}
