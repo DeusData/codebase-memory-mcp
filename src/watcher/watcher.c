@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include "watcher/watcher.h"
 #include "git/git_command.h"
+#include "git/git_snapshot.h"
 #include "store/store.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
@@ -44,18 +45,13 @@
 /* Sleep chunk for responsive shutdown (ms) */
 #define SLEEP_CHUNK_MS 500
 
-enum {
-    CBM_WATCHER_DIRTY_HASH_HEX_LEN = 16,
-    CBM_WATCHER_DIRTY_HASH_BUFSZ = CBM_WATCHER_DIRTY_HASH_HEX_LEN + 1,
-};
-
 /* ── Per-project state ──────────────────────────────────────────── */
 
 typedef struct {
     char *project_name;
     char *root_path;
     char last_head[CBM_SZ_64]; /* git HEAD hash */
-    char last_dirty_hash[CBM_WATCHER_DIRTY_HASH_BUFSZ]; /* git status hash */
+    char last_dirty_hash[CBM_GIT_DIRTY_HASH_BUFSZ]; /* git status hash */
     bool is_git;               /* false → skip polling */
     bool baseline_done;        /* true after first poll */
     int file_count;            /* approximate, for interval calc */
@@ -98,133 +94,8 @@ int cbm_watcher_poll_interval_ms(int file_count, int base_ms, int max_ms) {
 
 /* ── Git helpers ────────────────────────────────────────────────── */
 
-#if !defined(_WIN32)
-static bool watcher_format_git_submodule_status_command(char *cmd, size_t cmd_size,
-                                                        const char *root_path) {
-    if (!cmd || cmd_size == 0 || !root_path || !cbm_git_validate_repo_path(root_path)) {
-        return false;
-    }
-    int n = snprintf(cmd, cmd_size,
-                     "git --no-optional-locks -C \"%s\" submodule foreach --quiet --recursive "
-                     "\"git status --porcelain --untracked-files=normal 2>/dev/null\" "
-                     "2>/dev/null",
-                     root_path);
-    return cbm_git_command_fits(n, cmd_size);
-}
-#endif
-
 static bool watcher_git_path_supported(const char *root_path) {
-    char cmd[CBM_GIT_CMD_BUFSZ];
-    if (!cbm_git_format_command(cmd, sizeof(cmd), root_path, "rev-parse --git-dir")) {
-        return false;
-    }
-    if (!cbm_git_format_command(cmd, sizeof(cmd), root_path, "rev-parse HEAD")) {
-        return false;
-    }
-    if (!cbm_git_format_status_command(cmd, sizeof(cmd), root_path)) {
-        return false;
-    }
-    if (!cbm_git_format_command(cmd, sizeof(cmd), root_path, "ls-files")) {
-        return false;
-    }
-    return true;
-}
-
-static bool is_git_repo(const char *root_path) {
-    return cbm_git_drain_command(root_path, "rev-parse --git-dir") == 0;
-}
-
-static int git_head(const char *root_path, char *out, size_t out_size) {
-    return cbm_git_capture_first_line_buf(root_path, "rev-parse HEAD", out, out_size);
-}
-
-/* djb2 hash over a string — non-cryptographic, fast, good distribution */
-static uint64_t djb2(const char *s) {
-    uint64_t h = 5381;
-    while (*s) {
-        h = ((h << 5) + h) ^ (unsigned char)*s++;
-    }
-    return h;
-}
-
-/* Read full git status --porcelain output into a 16-char hex hash.
- * Returns the number of bytes read (>0 means dirty), -1 on popen failure.
- * out_hex17 must be at least CBM_WATCHER_DIRTY_HASH_BUFSZ bytes.
- *
- * Also folds in submodule status (POSIX only): uncommitted changes inside a
- * submodule are invisible to the parent repo's `git status`, so we append each
- * submodule's porcelain output to the hashed buffer. This keeps the dirty-hash
- * dedup (preventing reindex loops on permanently-dirty trees) while extending
- * coverage to submodules — a superset of both the fork's hash-based dedup and
- * upstream's submodule-aware git_is_dirty(). */
-static int git_dirty_hash(const char *root_path, char *out_hex17) {
-    char cmd[CBM_GIT_CMD_BUFSZ];
-    if (!cbm_git_format_status_command(cmd, sizeof(cmd), root_path)) {
-        static const char empty_dirty_hash[] = "0000000000000000";
-        memcpy(out_hex17, empty_dirty_hash, sizeof(empty_dirty_hash));
-        return -1;
-    }
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        static const char empty_dirty_hash[] = "0000000000000000";
-        memcpy(out_hex17, empty_dirty_hash, sizeof(empty_dirty_hash));
-        return -1;
-    }
-    char buf[CBM_GIT_OUTPUT_BUFSZ] = {0};
-    // NOLINTNEXTLINE(bugprone-not-null-terminated-result) — buf has extra NUL byte
-    size_t n = fread(buf, CBM_ALLOC_ONE, sizeof(buf) - 1, fp);
-    buf[n] = '\0';
-    cbm_pclose(fp);
-
-#if !defined(_WIN32)
-    /* Append submodule porcelain output to the hashed buffer so submodule
-     * changes register in the dirty hash. POSIX-only: `git submodule foreach`
-     * takes an inner shell command that cmd.exe cannot pass intact; the
-     * parent-repo status check above already covers the common case on Windows. */
-    if (n + 1 < sizeof(buf)) {
-        if (watcher_format_git_submodule_status_command(cmd, sizeof(cmd), root_path)) {
-            fp = cbm_popen(cmd, "r");
-            if (fp) {
-                size_t remaining = sizeof(buf) - 1 - n;
-                size_t sm = fread(buf + n, 1, remaining, fp);
-                buf[n + sm] = '\0';
-                n += sm;
-                cbm_pclose(fp);
-            }
-        }
-    }
-#endif
-    uint64_t h = djb2(n > 0 ? buf : "");
-    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
-    snprintf(out_hex17, CBM_WATCHER_DIRTY_HASH_BUFSZ, "%016llx", (unsigned long long)h);
-    return (int)n; /* >0 means dirty */
-}
-
-/* Count tracked files via git ls-files */
-static int git_file_count(const char *root_path) {
-    char cmd[CBM_GIT_CMD_BUFSZ];
-    if (!cbm_git_format_command(cmd, sizeof(cmd), root_path, "ls-files")) {
-        return 0;
-    }
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        return 0;
-    }
-
-    /* Count newlines (one tracked file per line). `wc -l` is unavailable on
-     * Windows, so count in C, robust to paths longer than the read buffer. */
-    int count = 0;
-    char buf[CBM_SZ_1K];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
-        for (size_t i = 0; i < n; i++) {
-            if (buf[i] == '\n') {
-                count++;
-            }
-        }
-    }
-    cbm_pclose(fp);
-    return count;
+    return cbm_git_snapshot_path_supported(root_path);
 }
 
 /* ── Project state lifecycle ────────────────────────────────────── */
@@ -395,12 +266,21 @@ static void init_baseline(project_state_t *s, const cbm_watcher_t *w) {
         return;
     }
 
-    s->is_git = is_git_repo(s->root_path);
+    cbm_git_snapshot_t snap = {0};
+    if (cbm_git_snapshot_read(s->root_path, CBM_GIT_SNAPSHOT_HEAD | CBM_GIT_SNAPSHOT_FILE_COUNT,
+                              &snap) != 0) {
+        s->baseline_done = true;
+        s->is_git = false;
+        cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "none");
+        s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * (int64_t)CBM_NSEC_PER_MSEC);
+        return;
+    }
+    s->is_git = snap.is_git;
     s->baseline_done = true;
 
     if (s->is_git) {
-        git_head(s->root_path, s->last_head, sizeof(s->last_head));
-        s->file_count = git_file_count(s->root_path);
+        memcpy(s->last_head, snap.head, sizeof(s->last_head));
+        s->file_count = snap.file_count;
         s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count, w->poll_base_ms, w->poll_max_ms);
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "git", "files",
                      s->file_count > 0 ? "yes" : "0");
@@ -417,30 +297,32 @@ static bool check_changes(project_state_t *s) {
         return false;
     }
 
-    /* Check HEAD movement */
-    char head[CBM_SZ_64] = {0};
-    if (git_head(s->root_path, head, sizeof(head)) == 0) {
-        if (s->last_head[0] != '\0' && strcmp(head, s->last_head) != 0) {
-            /* HEAD moved — commit, checkout, pull */
-            strncpy(s->last_head, head, sizeof(s->last_head) - 1);
-            s->last_dirty_hash[0] = '\0'; /* HEAD moved: clear hash to force recheck */
-            return true;
-        }
-        strncpy(s->last_head, head, sizeof(s->last_head) - 1);
+    cbm_git_snapshot_t snap = {0};
+    if (cbm_git_snapshot_read(s->root_path, CBM_GIT_SNAPSHOT_HEAD | CBM_GIT_SNAPSHOT_DIRTY,
+                              &snap) != 0 || !snap.is_git) {
+        return false;
     }
 
-    /* Check working tree — only reindex if content actually changed since last poll */
-    char new_hash[17];
-    int dirty = git_dirty_hash(s->root_path, new_hash);
-    if (dirty <= 0) {
-        /* Clean tree — clear hash so future dirt is always caught */
+    if (snap.head[0] != '\0' && s->last_head[0] != '\0' && strcmp(snap.head, s->last_head) != 0) {
+        /* HEAD moved: commit, checkout, pull */
+        memcpy(s->last_head, snap.head, sizeof(s->last_head));
+        s->last_dirty_hash[0] = '\0'; /* HEAD moved: clear hash to force recheck */
+        return true;
+    }
+    if (snap.head[0] != '\0') {
+        memcpy(s->last_head, snap.head, sizeof(s->last_head));
+    }
+
+    /* Check working tree: only reindex if content changed since last poll. */
+    if (snap.dirty_bytes <= 0) {
+        /* Clean tree: clear hash so future dirt is always caught. */
         s->last_dirty_hash[0] = '\0';
         return false;
     }
-    if (strcmp(new_hash, s->last_dirty_hash) == 0) {
-        return false; /* same dirty state as last check — no new changes */
+    if (strcmp(snap.dirty_hash, s->last_dirty_hash) == 0) {
+        return false; /* same dirty state as last check: no new changes */
     }
-    strncpy(s->last_dirty_hash, new_hash, sizeof(s->last_dirty_hash) - 1);
+    memcpy(s->last_dirty_hash, snap.dirty_hash, sizeof(s->last_dirty_hash));
     return true;
 }
 
@@ -488,13 +370,18 @@ static void poll_project(const char *key, void *val, void *ud) {
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
         if (rc == 0) {
             ctx->reindexed++;
-            /* Update HEAD after successful reindex */
-            git_head(s->root_path, s->last_head, sizeof(s->last_head));
-            /* Refresh dirty hash so same uncommitted changes don't retrigger */
-            git_dirty_hash(s->root_path, s->last_dirty_hash);
-            /* Refresh file count for interval */
-            s->file_count = git_file_count(s->root_path);
-            s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count, ctx->w->poll_base_ms, ctx->w->poll_max_ms);
+            cbm_git_snapshot_t snap = {0};
+            if (cbm_git_snapshot_read(s->root_path,
+                                      CBM_GIT_SNAPSHOT_HEAD | CBM_GIT_SNAPSHOT_DIRTY |
+                                          CBM_GIT_SNAPSHOT_FILE_COUNT,
+                                      &snap) == 0 && snap.is_git) {
+                memcpy(s->last_head, snap.head, sizeof(s->last_head));
+                memcpy(s->last_dirty_hash, snap.dirty_hash, sizeof(s->last_dirty_hash));
+                s->file_count = snap.file_count;
+                s->interval_ms =
+                    cbm_watcher_poll_interval_ms(s->file_count, ctx->w->poll_base_ms,
+                                                 ctx->w->poll_max_ms);
+            }
         } else {
             cbm_log_warn("watcher.index.err", "project", s->project_name);
         }
