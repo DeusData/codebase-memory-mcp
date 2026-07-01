@@ -800,6 +800,40 @@ static char *extract_meson_callee(CBMArena *a, TSNode node, const char *source, 
     return ts_node_is_null(cmd) ? NULL : cbm_node_text(a, cmd, source);
 }
 
+static bool cbm_ascii_equals_ignore_case(const char *a, const char *b) {
+    if (!a || !b) {
+        return false;
+    }
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+            return false;
+        }
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+static char *extract_nasm_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "actual_instruction") != 0) {
+        return NULL;
+    }
+    TSNode opcode = ts_node_child_by_field_name(node, TS_FIELD("instruction"));
+    char *op = ts_node_is_null(opcode) ? NULL : cbm_node_text(a, opcode, source);
+    if (!cbm_ascii_equals_ignore_case(op, "call")) {
+        return NULL;
+    }
+    TSNode operands = ts_node_child_by_field_name(node, TS_FIELD("operands"));
+    if (ts_node_is_null(operands) || ts_node_named_child_count(operands) == 0) {
+        return NULL;
+    }
+    TSNode target = ts_node_named_child(operands, 0);
+    if (strcmp(ts_node_type(target), "operand") == 0 && ts_node_named_child_count(target) > 0) {
+        target = ts_node_named_child(target, 0);
+    }
+    return cbm_node_text(a, target, source);
+}
+
 // Puppet function_call stores its callee as the first named child.
 static char *extract_puppet_callee(CBMArena *a, TSNode node, const char *source,
                                    const char *nk) {
@@ -876,6 +910,10 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
     }
     if (lang == CBM_LANG_MESON) {
         char *c = extract_meson_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
+    if (lang == CBM_LANG_NASM) {
+        char *c = extract_nasm_callee(a, node, source, nk);
         return c ? c : extract_scripting_callee(a, node, source, lang, nk);
     }
     if (lang == CBM_LANG_PUPPET) {
