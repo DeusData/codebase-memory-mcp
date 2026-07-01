@@ -2990,6 +2990,12 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "'full' (default): score the project plus its dependency sub-projects. "
      "'project': score only the requested project's own symbols. "
      "'deps': score only dependency sub-project symbols."},
+    {"rank_refresh", "eager", NULL, "PageRank",
+     "When to recompute PageRank/LinkRank after indexing",
+     "eager|stale_on_exact",
+     "'eager' (default): recompute after graph changes, dependency reindexes, or missing rank views. "
+     "'stale_on_exact': exact incremental graph deltas may skip synchronous rank recompute only after "
+     "rank views are marked stale; search/trace then omit stale rank until a refresh runs."},
     {"edge_weight_calls", "1.0", NULL, "PageRank",
      "How much importance flows along direct function/method call edges (CALLS)",
      "0.0-100.0",
