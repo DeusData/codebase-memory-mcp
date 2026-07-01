@@ -122,6 +122,51 @@ static void add_derived_freshness_warnings(yyjson_mut_doc *doc, yyjson_mut_val *
     }
 }
 
+static bool query_mentions_any(const char *query, const char *const *terms, int term_count) {
+    if (!query || !terms || term_count <= 0) {
+        return false;
+    }
+    for (int i = 0; i < term_count; i++) {
+        if (terms[i] && cbm_strcasestr(query, terms[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool query_mentions_route_derived_graph(const char *query) {
+    static const char *const terms[] = {"Route",        "HANDLES",          "HTTP_CALLS",
+                                        "ASYNC_CALLS",  "GRPC_CALLS",       "GRAPHQL_CALLS",
+                                        "TRPC_CALLS",   "CROSS_HTTP_CALLS", "CROSS_ASYNC_CALLS",
+                                        "CROSS_CHANNEL", "CROSS_GRPC_CALLS", "CROSS_GRAPHQL_CALLS",
+                                        "CROSS_TRPC_CALLS"};
+    return query_mentions_any(query, terms, (int)(sizeof(terms) / sizeof(terms[0])));
+}
+
+static bool query_mentions_semantic_derived_graph(const char *query) {
+    static const char *const terms[] = {"SEMANTICALLY_RELATED", "SIMILAR_TO"};
+    return query_mentions_any(query, terms, (int)(sizeof(terms) / sizeof(terms[0])));
+}
+
+static void add_query_graph_derived_warnings(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                             cbm_store_t *store, const char *project,
+                                             const char *query) {
+    if (!doc || !root || !store || !project || !query) {
+        return;
+    }
+    if (query_mentions_route_derived_graph(query) &&
+        cbm_store_derived_view_is_stale(store, project, CBM_STORE_DERIVED_VIEW_ROUTES)) {
+        add_response_warning(doc, root,
+                             "routes derived view is stale; query_graph route results may be stale.");
+    }
+    if (query_mentions_semantic_derived_graph(query) &&
+        cbm_store_derived_view_is_stale(store, project, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES)) {
+        add_response_warning(
+            doc, root,
+            "semantic_edges derived view is stale; query_graph semantic edges may be stale.");
+    }
+}
+
 /* Default snippet fallback line count (when end_line unknown) */
 #define SNIPPET_DEFAULT_LINES 50
 
@@ -3461,6 +3506,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
+    add_query_graph_derived_warnings(doc, root, store, project, query);
 
     /* columns */
     yyjson_mut_val *cols = yyjson_mut_arr(doc);
