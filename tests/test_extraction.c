@@ -1458,6 +1458,21 @@ TEST(cobol_paragraph) {
     PASS();
 }
 
+TEST(cobol_call_statement_edge) {
+    CBMFileResult *r = extract("       IDENTIFICATION DIVISION.\n"
+                               "       PROGRAM-ID. HELLO.\n"
+                               "       PROCEDURE DIVISION.\n"
+                               "       MAIN-PARA.\n"
+                               "           CALL 'SUBPROG'.\n"
+                               "           STOP RUN.\n",
+                               CBM_LANG_COBOL, "test", "calls.cbl");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "SUBPROG"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Verilog module --- */
 TEST(verilog_module) {
     CBMFileResult *r =
@@ -3410,6 +3425,7 @@ SUITE(extraction) {
     RUN_TEST(cpp_operator_and_implicit_calls_emit_call_sites);
     RUN_TEST(cpp_out_of_line_method_issue428);
     RUN_TEST(cobol_paragraph);
+    RUN_TEST(cobol_call_statement_edge);
     RUN_TEST(verilog_module);
     RUN_TEST(cuda_kernel);
     RUN_TEST(python_decorator);
