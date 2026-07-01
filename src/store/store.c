@@ -2528,7 +2528,8 @@ int cbm_store_set_derived_view_state(cbm_store_t *s, const char *project,
                                      const char *view_name, int64_t generation,
                                      const char *status) {
     if (!s || !s->db || !project || !project[0] || !view_name || !view_name[0] ||
-        generation <= 0 || !store_derived_status_valid(status)) {
+        generation < CBM_STORE_DERIVED_GENERATION_UNKNOWN ||
+        !store_derived_status_valid(status)) {
         if (s) {
             store_set_error(s, "set_derived_view_state: invalid argument");
         }
@@ -2555,7 +2556,8 @@ int cbm_store_set_derived_view_state(cbm_store_t *s, const char *project,
 int cbm_store_mark_derived_views_stale(cbm_store_t *s, const char *project,
                                        int64_t generation, const char *const *view_names,
                                        int view_count) {
-    if (!s || !s->db || !project || !project[0] || generation <= 0 || view_count < 0 ||
+    if (!s || !s->db || !project || !project[0] ||
+        generation < CBM_STORE_DERIVED_GENERATION_UNKNOWN || view_count < 0 ||
         (view_count > 0 && !view_names)) {
         if (s) {
             store_set_error(s, "mark_derived_views_stale: invalid argument");
@@ -2629,6 +2631,18 @@ int cbm_store_get_derived_view_state(cbm_store_t *s, const char *project,
         return CBM_STORE_ERR;
     }
     return CBM_STORE_OK;
+}
+
+bool cbm_store_derived_view_is_stale(cbm_store_t *s, const char *project,
+                                     const char *view_name) {
+    cbm_derived_view_state_t state = {0};
+    int rc = cbm_store_get_derived_view_state(s, project, view_name, &state);
+    if (rc != CBM_STORE_OK) {
+        return false;
+    }
+    bool stale = state.status && strcmp(state.status, CBM_STORE_DERIVED_STATUS_STALE) == 0;
+    cbm_store_derived_view_state_free_fields(&state);
+    return stale;
 }
 
 int cbm_store_reserve_index_generation(cbm_store_t *s, const char *project,
@@ -3981,14 +3995,27 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     char count_sql[CBM_SZ_4K];
     int bind_idx = 0;
 
-    /* Conditionally join pagerank table only when sort_by is relevance.
-     * Avoids JOIN overhead for name/degree sorts. */
-    bool use_pagerank = (!params->sort_by ||
-                         strcmp(params->sort_by, "relevance") == 0);
+    const char *freshness_project =
+        (params->project && params->project[0] && !params->project_pattern) ? params->project : NULL;
+    out->pagerank_stale =
+        freshness_project &&
+        cbm_store_derived_view_is_stale(s, freshness_project, CBM_STORE_DERIVED_VIEW_PAGERANK);
+    out->linkrank_stale =
+        freshness_project &&
+        cbm_store_derived_view_is_stale(s, freshness_project, CBM_STORE_DERIVED_VIEW_LINKRANK);
+    out->node_degree_stale =
+        freshness_project &&
+        cbm_store_derived_view_is_stale(s, freshness_project, CBM_STORE_DERIVED_VIEW_NODE_DEGREE);
+
+    /* Conditionally join pagerank table only when sort_by is relevance and the
+     * freshness ledger has not explicitly marked PageRank stale. Missing ledger
+     * rows are treated as legacy-compatible, so older indexes keep their rank data. */
+    bool use_pagerank =
+        (!params->sort_by || strcmp(params->sort_by, "relevance") == 0) && !out->pagerank_stale;
     /* DF-1: Use precomputed node_degree table when available (O(1) JOIN vs O(|E|) subquery).
      * HC-6: Falls back to edge COUNT when node_degree is empty. */
     bool has_degree_table = false;
-    {
+    if (!out->node_degree_stale) {
         sqlite3_stmt *check = NULL;
         if (sqlite3_prepare_v2(s->db,
                 "SELECT 1 FROM node_degree LIMIT 1", -1, &check, NULL) == SQLITE_OK) {
@@ -4137,7 +4164,7 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
                      dep_last, name_col, id_col, limit, offset);
         }
     } else if (params->sort_by && strcmp(params->sort_by, "linkrank") == 0) {
-        if (has_degree_table && !has_degree_filter) {
+        if (has_degree_table && !out->linkrank_stale && !has_degree_filter) {
             snprintf(order_limit, sizeof(order_limit),
                      " ORDER BY COALESCE(nd.linkrank_in, 0) DESC, %s%s, %s LIMIT %d OFFSET %d",
                      dep_last, name_col, id_col, limit, offset);
@@ -4247,6 +4274,15 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         return rc;
     }
     out->root = root;
+    const char *freshness_project = root.project && root.project[0] ? root.project : NULL;
+    out->pagerank_stale =
+        freshness_project &&
+        cbm_store_derived_view_is_stale(s, freshness_project, CBM_STORE_DERIVED_VIEW_PAGERANK);
+    out->linkrank_stale =
+        freshness_project &&
+        cbm_store_derived_view_is_stale(s, freshness_project, CBM_STORE_DERIVED_VIEW_LINKRANK);
+    bool use_pagerank = !out->pagerank_stale;
+    bool use_linkrank = !out->linkrank_stale;
 
     /* MERGE: fork delta — build edge type IN clause with ?N parameterized
      * placeholders and cap at 16 (bfs_et_count) so the bind loop and clause
@@ -4286,6 +4322,10 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         next_id = "e.target_id";
     }
 
+    const char *pagerank_select =
+        use_pagerank ? "COALESCE(pr.rank, 0.0) AS pr_rank " : "0.0 AS pr_rank ";
+    const char *pagerank_join = use_pagerank ? "LEFT JOIN pagerank pr ON pr.node_id = n.id " : "";
+    const char *pagerank_order = use_pagerank ? "bfs.hop, pr_rank DESC" : "bfs.hop, n.name, n.id";
     snprintf(sql, sizeof(sql),
              "WITH RECURSIVE bfs(node_id, hop) AS ("
              "  SELECT %lld, 0"
@@ -4297,14 +4337,15 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
              ")"
              "SELECT DISTINCT n.id, n.project, n.label, n.name, n.qualified_name, "
              "n.file_path, n.start_line, n.end_line, n.properties, bfs.hop, "
-             "COALESCE(pr.rank, 0.0) AS pr_rank "
+             "%s"
              "FROM bfs "
              "JOIN nodes n ON n.id = bfs.node_id "
-             "LEFT JOIN pagerank pr ON pr.node_id = n.id "
+             "%s"
              "WHERE bfs.hop > 0 " /* exclude root */
-             "ORDER BY bfs.hop, pr_rank DESC "
+             "ORDER BY %s "
              "LIMIT %d;",
-             (long long)start_id, next_id, join_cond, types_clause, max_depth, max_results);
+             (long long)start_id, next_id, join_cond, types_clause, max_depth, pagerank_select,
+             pagerank_join, pagerank_order, max_results);
 
     sqlite3_stmt *stmt = NULL;
     rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL);
@@ -4368,17 +4409,21 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         /* Build edge query using the same ?N placeholders for edge types.
          * types_clause already contains "?1,?2,..." — safe placeholder string. */
         char edge_sql[ST_SQL_BUF];
+        const char *linkrank_select =
+            use_linkrank ? "COALESCE(lr.rank, 0.0) AS lr_rank " : "0.0 AS lr_rank ";
+        const char *linkrank_join = use_linkrank ? "LEFT JOIN linkrank lr ON lr.edge_id = e.id " : "";
+        const char *linkrank_order = use_linkrank ? "lr_rank DESC" : "n1.name, n2.name, e.type";
         snprintf(edge_sql, sizeof(edge_sql),
                  "SELECT n1.name, n2.name, e.type, "
-                 "COALESCE(lr.rank, 0.0) AS lr_rank "
+                 "%s"
                  "FROM edges e "
                  "JOIN nodes n1 ON n1.id = e.source_id "
                  "JOIN nodes n2 ON n2.id = e.target_id "
-                 "LEFT JOIN linkrank lr ON lr.edge_id = e.id "
+                 "%s"
                  "WHERE e.source_id IN (%s) AND e.target_id IN (%s) "
                  "AND e.type IN (%s) "
-                 "ORDER BY lr_rank DESC",
-                 id_set, id_set, types_clause);
+                 "ORDER BY %s",
+                 linkrank_select, linkrank_join, id_set, id_set, types_clause, linkrank_order);
 
         sqlite3_stmt *estmt = NULL;
         rc = sqlite3_prepare_v2(s->db, edge_sql, CBM_NOT_FOUND, &estmt, NULL);

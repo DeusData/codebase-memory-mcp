@@ -31,6 +31,7 @@ typedef struct cbm_store cbm_store_t;
 #define CBM_STORE_INDEX_STATUS_FAILED "failed"
 #define CBM_STORE_DERIVED_STATUS_STALE "stale"
 #define CBM_STORE_DERIVED_STATUS_COMPLETE "complete"
+#define CBM_STORE_DERIVED_GENERATION_UNKNOWN 0
 #define CBM_STORE_DERIVED_KIND_DIRECT "direct"
 #define CBM_STORE_DERIVED_VIEW_NODES_FTS "nodes_fts"
 #define CBM_STORE_DERIVED_VIEW_PAGERANK "pagerank"
@@ -221,6 +222,9 @@ typedef struct {
     cbm_search_result_t *results;
     int count;
     int total; /* total before pagination */
+    bool pagerank_stale;
+    bool linkrank_stale;
+    bool node_degree_stale;
 } cbm_search_output_t;
 
 /* ── Traversal ──────────────────────────────────────────────────── */
@@ -244,6 +248,8 @@ typedef struct {
     int visited_count;
     cbm_edge_info_t *edges;
     int edge_count;
+    bool pagerank_stale;
+    bool linkrank_stale;
 } cbm_traverse_result_t;
 
 /* ── Schema introspection ───────────────────────────────────────── */
@@ -580,6 +586,8 @@ int cbm_store_mark_derived_views_stale(cbm_store_t *s, const char *project,
 int cbm_store_get_derived_view_state(cbm_store_t *s, const char *project,
                                      const char *view_name,
                                      cbm_derived_view_state_t *out);
+bool cbm_store_derived_view_is_stale(cbm_store_t *s, const char *project,
+                                     const char *view_name);
 
 int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *delta);
 int cbm_store_publish_file_delta_batch(cbm_store_t *s,

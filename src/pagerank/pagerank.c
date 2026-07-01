@@ -198,6 +198,9 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     double *w_in = NULL;
     id_map_t map = {0};
     int N = 0, E = 0, result = -1;
+    bool pagerank_written = false;
+    bool linkrank_written = false;
+    bool node_degree_written = false;
 
     char **node_labels = NULL;   /* label per node, parallel to node_ids */
     char **node_projects = NULL; /* owning project per node, parallel to node_ids */
@@ -413,12 +416,15 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
         "VALUES (?1, ?2, ?3, ?4)";
     sqlite3_stmt *ins_stmt = NULL;
     if (sqlite3_prepare_v2(db, ins_sql, -1, &ins_stmt, NULL) == SQLITE_OK) {
+        pagerank_written = true;
         for (int i = 0; i < N; i++) {
             sqlite3_bind_int64(ins_stmt, 1, node_ids[i]);
             sqlite3_bind_text(ins_stmt, 2, node_projects[i], -1, SQLITE_TRANSIENT);
             sqlite3_bind_double(ins_stmt, 3, rank[i]);
             sqlite3_bind_text(ins_stmt, 4, ts, -1, SQLITE_TRANSIENT);
-            sqlite3_step(ins_stmt);
+            if (sqlite3_step(ins_stmt) != SQLITE_DONE) {
+                pagerank_written = false;
+            }
             sqlite3_reset(ins_stmt);
         }
         sqlite3_finalize(ins_stmt);
@@ -441,6 +447,7 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
         "VALUES (?1, ?2, ?3, ?4)";
     sqlite3_stmt *lr_stmt = NULL;
     if (sqlite3_prepare_v2(db, lr_sql, -1, &lr_stmt, NULL) == SQLITE_OK) {
+        linkrank_written = true;
         sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
         for (int e = 0; e < E; e++) {
             int s_idx = edges[e].src_idx;
@@ -451,7 +458,9 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
             sqlite3_bind_text(lr_stmt, 2, edges[e].project, -1, SQLITE_TRANSIENT);
             sqlite3_bind_double(lr_stmt, 3, lr);
             sqlite3_bind_text(lr_stmt, 4, ts, -1, SQLITE_TRANSIENT);
-            sqlite3_step(lr_stmt);
+            if (sqlite3_step(lr_stmt) != SQLITE_DONE) {
+                linkrank_written = false;
+            }
             sqlite3_reset(lr_stmt);
         }
         sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
@@ -489,6 +498,7 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
             "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
         sqlite3_stmt *deg_stmt = NULL;
         if (sqlite3_prepare_v2(db, deg_sql, -1, &deg_stmt, NULL) == SQLITE_OK) {
+            node_degree_written = true;
             for (int i = 0; i < N; i++) {
                 sqlite3_bind_int64(deg_stmt, 1, node_ids[i]);
                 sqlite3_bind_text(deg_stmt, 2, node_projects[i], -1, SQLITE_TRANSIENT);
@@ -500,7 +510,9 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
                 sqlite3_bind_double(deg_stmt, 8, out_weight[i]);
                 sqlite3_bind_double(deg_stmt, 9, lr_in ? lr_in[i] : 0.0);
                 sqlite3_bind_text(deg_stmt, 10, ts, -1, SQLITE_TRANSIENT);
-                sqlite3_step(deg_stmt);
+                if (sqlite3_step(deg_stmt) != SQLITE_DONE) {
+                    node_degree_written = false;
+                }
                 sqlite3_reset(deg_stmt);
             }
             sqlite3_finalize(deg_stmt);
@@ -516,6 +528,22 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     snprintf(e_s, sizeof(e_s), "%d", E);
     cbm_log_info("pagerank.done", "project", project,
                  "nodes", n_s, "edges", e_s, "iterations", iter_s);
+
+    if (pagerank_written) {
+        (void)cbm_store_set_derived_view_state(store, project, CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                               CBM_STORE_DERIVED_GENERATION_UNKNOWN,
+                                               CBM_STORE_DERIVED_STATUS_COMPLETE);
+    }
+    if (linkrank_written) {
+        (void)cbm_store_set_derived_view_state(store, project, CBM_STORE_DERIVED_VIEW_LINKRANK,
+                                               CBM_STORE_DERIVED_GENERATION_UNKNOWN,
+                                               CBM_STORE_DERIVED_STATUS_COMPLETE);
+    }
+    if (node_degree_written) {
+        (void)cbm_store_set_derived_view_state(store, project, CBM_STORE_DERIVED_VIEW_NODE_DEGREE,
+                                               CBM_STORE_DERIVED_GENERATION_UNKNOWN,
+                                               CBM_STORE_DERIVED_STATUS_COMPLETE);
+    }
 
     result = N;
 

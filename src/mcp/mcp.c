@@ -93,6 +93,30 @@ static void add_pagerank_val(yyjson_mut_doc *doc, yyjson_mut_val *obj, double v)
     yyjson_mut_obj_add_val(doc, obj, "pagerank", yyjson_mut_rawcpy(doc, buf));
 }
 
+static void add_derived_freshness_warnings(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                           bool pagerank_stale, bool linkrank_stale,
+                                           bool node_degree_stale) {
+    yyjson_mut_val *warnings = yyjson_mut_arr(doc);
+    if (pagerank_stale) {
+        yyjson_mut_arr_add_str(
+            doc, warnings,
+            "pagerank derived view is stale; stale PageRank values were omitted.");
+    }
+    if (linkrank_stale) {
+        yyjson_mut_arr_add_str(
+            doc, warnings,
+            "linkrank derived view is stale; stale LinkRank ordering was not used.");
+    }
+    if (node_degree_stale) {
+        yyjson_mut_arr_add_str(
+            doc, warnings,
+            "node_degree derived view is stale; precomputed degree data was not used.");
+    }
+    if (yyjson_mut_arr_size(warnings) > 0) {
+        yyjson_mut_obj_add_val(doc, root, "warnings", warnings);
+    }
+}
+
 /* Default snippet fallback line count (when end_line unknown) */
 #define SNIPPET_DEFAULT_LINES 50
 
@@ -3235,6 +3259,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     /* Auto-context: first response gets full architecture/schema/_context header.
      * Subsequent responses just get session_project. */
     inject_context_once(doc, root, srv, store);
+    add_derived_freshness_warnings(doc, root, out.pagerank_stale, out.linkrank_stale,
+                                   out.node_degree_stale);
 
     if (is_summary) {
         /* Summary mode: aggregate counts by label and file (top 20) */
@@ -4541,6 +4567,13 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_val(doc, root, "callers", callers);
         yyjson_mut_obj_add_int(doc, root, "callers_total", tr_in.visited_count);
     }
+
+    add_derived_freshness_warnings(doc, root,
+                                   (do_outbound && tr_out.pagerank_stale) ||
+                                       (do_inbound && tr_in.pagerank_stale),
+                                   (do_outbound && tr_out.linkrank_stale) ||
+                                       (do_inbound && tr_in.linkrank_stale),
+                                   false);
 
     if (srv->session_project[0])
         yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);

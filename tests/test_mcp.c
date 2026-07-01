@@ -696,6 +696,49 @@ TEST(tool_search_graph_includes_node_properties) {
     PASS();
 }
 
+TEST(tool_search_graph_warns_on_stale_pagerank_view) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, "test", "/tmp/test"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, "test");
+
+    cbm_node_t node = {.project = "test",
+                       .label = "Function",
+                       .name = "Handle",
+                       .qualified_name = "test.Handle",
+                       .file_path = "handle.c"};
+    int64_t id = cbm_store_upsert_node(st, &node);
+    ASSERT_TRUE(id > 0);
+    char rank_sql[256];
+    snprintf(rank_sql, sizeof(rank_sql),
+             "INSERT INTO pagerank(project,node_id,rank,computed_at) "
+             "VALUES('test',%lld,0.9,'2026-06-30T00:00:00Z')",
+             (long long)id);
+    ASSERT_EQ(cbm_store_exec(st, rank_sql), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_set_derived_view_state(st, "test", CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                               CBM_STORE_DERIVED_GENERATION_UNKNOWN,
+                                               CBM_STORE_DERIVED_STATUS_STALE),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"test\",\"label\":\"Function\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
+    ASSERT_NOT_NULL(strstr(inner, "pagerank derived view is stale"));
+    ASSERT_NULL(strstr(inner, "\"pagerank\":"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 static bool mcp_test_upsert_fts_node(cbm_store_t *st, const char *project, const char *label,
                                      const char *name, const char *qualified_name,
                                      const char *file_path) {
@@ -3036,6 +3079,7 @@ SUITE(mcp) {
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);
     RUN_TEST(tool_search_graph_includes_node_properties);
+    RUN_TEST(tool_search_graph_warns_on_stale_pagerank_view);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_query_uses_search_limit_config);
     RUN_TEST(tool_search_graph_query_rejects_bad_semantic_query);
