@@ -24,8 +24,8 @@
 
 /* ── Constants ────────────────────────────────────────────────── */
 
-#define DEFAULT_MAX_NODES 2000
-#define HARD_MAX_NODES 10000
+#define DEFAULT_MAX_NODES 50000
+#define HARD_MAX_NODES 50000
 #define BH_THETA 1.2f
 
 /* Local optimization: gentle, preserves structure */
