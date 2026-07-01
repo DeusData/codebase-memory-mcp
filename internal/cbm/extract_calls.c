@@ -920,9 +920,13 @@ static char *extract_nasm_callee(CBMArena *a, TSNode node, const char *source, c
     return cbm_node_text(a, target, source);
 }
 
-// Puppet function_call stores its callee as the first named child.
+// Puppet function calls name their callee as child 0; include statements call `include`.
 static char *extract_puppet_callee(CBMArena *a, TSNode node, const char *source,
                                    const char *nk) {
+    if (strcmp(nk, "include_statement") == 0) {
+        static const char include_lit[] = "include";
+        return cbm_arena_strndup(a, include_lit, sizeof(include_lit) - SKIP_ONE);
+    }
     if (strcmp(nk, "function_call") != 0 || ts_node_named_child_count(node) == 0) {
         return NULL;
     }

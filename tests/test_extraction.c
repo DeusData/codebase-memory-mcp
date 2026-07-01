@@ -2342,6 +2342,15 @@ TEST(puppet_function_call_edge) {
     PASS();
 }
 
+TEST(puppet_include_statement_call_edge) {
+    CBMFileResult *r = extract("include profile::base\n", CBM_LANG_PUPPET, "test", "site.pp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "include"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(vimscript_function_extraction) {
     CBMFileResult *r = extract("function! SayHello()\n  echo 'Hello'\nendfunction\n",
                                CBM_LANG_VIMSCRIPT, "test", "plugin.vim");
@@ -3580,6 +3589,7 @@ SUITE(extraction) {
     RUN_TEST(llvm_call_edge);
     RUN_TEST(nasm_call_edge);
     RUN_TEST(puppet_function_call_edge);
+    RUN_TEST(puppet_include_statement_call_edge);
     RUN_TEST(vimscript_function_extraction);
     RUN_TEST(vimscript_function_without_bang);
     RUN_TEST(julia_function_extraction);

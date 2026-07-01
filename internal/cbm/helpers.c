@@ -193,16 +193,25 @@ bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     return false;
 }
 
-/* Keep in sync with generated/python_stdlib_data.c entries that the Python LSP
- * resolves to as builtins.<name>; unfilter only names with real target nodes. */
+/* Keyword-like calls that should still be emitted as call records. Keep Python
+ * entries in sync with generated/python_stdlib_data.c builtins.<name> nodes. */
 static const char *const python_resolvable_builtins[] = {"len",  "print", "str",   "int",
                                                          "list", "dict",  "range", NULL};
+static const char *const puppet_resolvable_builtins[] = {"include", NULL};
 
 bool cbm_is_resolvable_builtin(const char *name, CBMLanguage lang) {
-    if (!name || !name[0] || lang != CBM_LANG_PYTHON) {
+    if (!name || !name[0]) {
         return false;
     }
-    for (const char *const *b = python_resolvable_builtins; *b; b++) {
+    const char *const *builtins = NULL;
+    if (lang == CBM_LANG_PYTHON) {
+        builtins = python_resolvable_builtins;
+    } else if (lang == CBM_LANG_PUPPET) {
+        builtins = puppet_resolvable_builtins;
+    } else {
+        return false;
+    }
+    for (const char *const *b = builtins; *b; b++) {
         if (strcmp(name, *b) == 0) {
             return true;
         }
