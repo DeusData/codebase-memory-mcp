@@ -221,6 +221,13 @@ void cbm_pipeline_free_import_map(const char **keys, const char **vals, int coun
  * back instead of publishing when unsupported edges are present. */
 int64_t cbm_pipeline_stat_mtime_ns(const struct stat *st);
 const char *cbm_pipeline_file_delta_pass_fingerprint(void);
+int cbm_pipeline_format_file_delta_pass_fingerprint(char *out, size_t out_sz, int mode,
+                                                    double similarity_threshold,
+                                                    double httplink_min_confidence,
+                                                    double semantic_threshold,
+                                                    double githistory_min_coupling,
+                                                    double lsp_confidence_floor);
+int cbm_pipeline_current_pass_fingerprint(const cbm_pipeline_t *p, char *out, size_t out_sz);
 int cbm_pipeline_content_hash_file(const char *path, char *out, size_t out_sz);
 bool cbm_pipeline_file_state_is_current_or_legacy(cbm_store_t *store, const char *project,
                                                   const cbm_file_info_t *file,
