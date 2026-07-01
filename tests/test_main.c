@@ -10,6 +10,8 @@ int tf_skip_count = 0;
 int tf_filter_count = 0;
 
 #include "test_framework.h"
+#include "foundation/compat.h"
+#include "foundation/constants.h"
 #include <sqlite3.h>
 
 /* Forward declarations of suite functions */
@@ -113,10 +115,9 @@ extern void suite_dump_verify_io(void);
  * caches at thread teardown (pass_parallel.c). */
 extern void cbm_kind_in_set_free_cache(void);
 
-/* Capacity for the per-run isolated cache dir path. comfortably fits
- * "/tmp/cbm-test-cache-" + the 6 mkdtemp placeholder chars + headroom. */
-#define TEST_CACHE_DIR_CAP 512
-/* setenv() overwrite flag: nonzero = replace an existing value. */
+/* Capacity for the per-run isolated cache dir path. */
+#define TEST_CACHE_DIR_CAP CBM_PATH_MAX
+/* cbm_setenv() overwrite flag: nonzero = replace an existing value. */
 #define ENV_OVERWRITE 1
 
 int main(void) {
@@ -135,9 +136,10 @@ int main(void) {
     const char *no_iso = getenv("CBM_TEST_NO_ISOLATE");
     if (!no_iso || no_iso[0] == '\0') {
         static char test_cache_dir[TEST_CACHE_DIR_CAP];
-        snprintf(test_cache_dir, sizeof(test_cache_dir), "/tmp/cbm-test-cache-XXXXXX");
-        if (mkdtemp(test_cache_dir)) {
-            setenv("CBM_CACHE_DIR", test_cache_dir, ENV_OVERWRITE);
+        int n = snprintf(test_cache_dir, sizeof(test_cache_dir), "%s/cbm-test-cache-XXXXXX",
+                         cbm_tmpdir());
+        if (n >= 0 && (size_t)n < sizeof(test_cache_dir) && cbm_mkdtemp(test_cache_dir)) {
+            cbm_setenv("CBM_CACHE_DIR", test_cache_dir, ENV_OVERWRITE);
         }
     }
 

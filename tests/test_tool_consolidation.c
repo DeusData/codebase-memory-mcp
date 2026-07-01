@@ -137,10 +137,10 @@ static char *save_tool_mode(void) {
 
 static void restore_tool_mode(char *saved) {
     if (saved) {
-        setenv("CBM_TOOL_MODE", saved, 1);
+        cbm_setenv("CBM_TOOL_MODE", saved, 1);
         free(saved);
     } else {
-        unsetenv("CBM_TOOL_MODE");
+        cbm_unsetenv("CBM_TOOL_MODE");
     }
 }
 
@@ -234,7 +234,7 @@ TEST(server_default_mode_shows_streamlined_tools) {
 
 TEST(api_surface_default_streamlined_regression_gate) {
     char *saved_mode = save_tool_mode();
-    unsetenv("CBM_TOOL_MODE");
+    cbm_unsetenv("CBM_TOOL_MODE");
 
     char *json = cbm_mcp_tools_list(NULL);
     restore_tool_mode(saved_mode);
@@ -260,7 +260,7 @@ TEST(api_surface_default_streamlined_regression_gate) {
 
 TEST(api_surface_classic_regression_gate) {
     char *saved_mode = save_tool_mode();
-    setenv("CBM_TOOL_MODE", "classic", 1);
+    cbm_setenv("CBM_TOOL_MODE", "classic", 1);
 
     char *json = cbm_mcp_tools_list(NULL);
     restore_tool_mode(saved_mode);
@@ -323,7 +323,7 @@ TEST(hidden_tools_reveal_discoverable_tools) {
 
 TEST(hidden_tools_payload_excludes_already_visible_configured_tools) {
     char *saved_mode = save_tool_mode();
-    setenv("CBM_TOOL_MODE", "streamlined", 1);
+    cbm_setenv("CBM_TOOL_MODE", "streamlined", 1);
 
     char *tmp = th_mktempdir("cbm_hidden_tools_cfg");
     ASSERT_NOT_NULL(tmp);
@@ -371,9 +371,9 @@ TEST(hidden_tools_payload_excludes_already_visible_configured_tools) {
 TEST(streamlined_reveal_covers_classic_capabilities) {
     char *saved_mode = save_tool_mode();
 
-    setenv("CBM_TOOL_MODE", "classic", 1);
+    cbm_setenv("CBM_TOOL_MODE", "classic", 1);
     char *classic = cbm_mcp_tools_list(NULL);
-    unsetenv("CBM_TOOL_MODE");
+    cbm_unsetenv("CBM_TOOL_MODE");
     ASSERT_NOT_NULL(classic);
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -412,7 +412,7 @@ TEST(streamlined_reveal_covers_classic_capabilities) {
 
 TEST(streamlined_core_parameter_contract) {
     char *saved_mode = save_tool_mode();
-    unsetenv("CBM_TOOL_MODE");
+    cbm_unsetenv("CBM_TOOL_MODE");
 
     char *json = cbm_mcp_tools_list(NULL);
     restore_tool_mode(saved_mode);
@@ -483,7 +483,7 @@ TEST(default_tool_autoindex_description_is_precise) {
     free(json);
 
     char *saved_mode = save_tool_mode();
-    setenv("CBM_TOOL_MODE", "classic", 1);
+    cbm_setenv("CBM_TOOL_MODE", "classic", 1);
     char *classic = cbm_mcp_tools_list(NULL);
     restore_tool_mode(saved_mode);
     ASSERT_NOT_NULL(classic);
@@ -495,7 +495,7 @@ TEST(default_tool_autoindex_description_is_precise) {
 
 TEST(revealed_trace_path_parameter_contract) {
     char *saved_mode = save_tool_mode();
-    unsetenv("CBM_TOOL_MODE");
+    cbm_unsetenv("CBM_TOOL_MODE");
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -524,7 +524,7 @@ TEST(revealed_trace_path_parameter_contract) {
 
 TEST(revealed_advanced_tool_schema_matches_handlers) {
     char *saved_mode = save_tool_mode();
-    unsetenv("CBM_TOOL_MODE");
+    cbm_unsetenv("CBM_TOOL_MODE");
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -765,7 +765,7 @@ TEST(search_graph_slug_project_sets_session_context) {
     free(result);
 
     cbm_mcp_server_free(srv);
-    (void)unlink(db_path);
+    (void)cbm_unlink(db_path);
     th_cleanup(root_path);
     PASS();
 }
@@ -1540,7 +1540,7 @@ TEST(dep_search_explicit_dep_project_name) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/_tc_deptest_proj_.db",
              cbm_resolve_cache_dir());
-    (void)unlink(path);
+    (void)cbm_unlink(path);
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -1854,7 +1854,7 @@ TEST(cross_project_search_not_confused_by_prefix) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/myapp-other-project.db",
              cbm_resolve_cache_dir());
-    (void)unlink(path);
+    (void)cbm_unlink(path);
 
     cbm_mcp_server_free(srv);
     PASS();
@@ -1909,7 +1909,7 @@ TEST(prefix_collision_dash_after_session_name) {
     free(r);
     char path[1024];
     snprintf(path, sizeof(path), "%s/myapp-v2.db", cbm_resolve_cache_dir());
-    (void)unlink(path);
+    (void)cbm_unlink(path);
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -1925,7 +1925,7 @@ TEST(prefix_collision_underscore_after_session_name) {
     free(r);
     char path[1024];
     snprintf(path, sizeof(path), "%s/myapp_test.db", cbm_resolve_cache_dir());
-    (void)unlink(path);
+    (void)cbm_unlink(path);
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -1959,7 +1959,7 @@ TEST(prefix_collision_completely_different_project) {
     free(r);
     char path[1024];
     snprintf(path, sizeof(path), "%s/other-project.db", cbm_resolve_cache_dir());
-    (void)unlink(path);
+    (void)cbm_unlink(path);
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -1976,7 +1976,7 @@ TEST(prefix_collision_session_is_substring_of_project) {
     free(r);
     char path[1024];
     snprintf(path, sizeof(path), "%s/abc.db", cbm_resolve_cache_dir());
-    (void)unlink(path);
+    (void)cbm_unlink(path);
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -2023,7 +2023,7 @@ TEST(get_code_no_project_uses_open_store_tier1) {
     free(gr);
 
     cbm_mcp_server_free(srv);
-    (void)unlink(db_path);
+    (void)cbm_unlink(db_path);
     PASS();
 }
 
@@ -2064,7 +2064,7 @@ TEST(get_code_single_fuzzy_result_resolves_not_ambiguous) {
     free(gr);
 
     cbm_mcp_server_free(srv);
-    (void)unlink(db_path);
+    (void)cbm_unlink(db_path);
     PASS();
 }
 
@@ -2100,7 +2100,7 @@ TEST(get_code_cold_start_parses_project_from_qn) {
     free(gr);
 
     cbm_mcp_server_free(srv);
-    (void)unlink(db_path);
+    (void)cbm_unlink(db_path);
     PASS();
 }
 
@@ -2108,9 +2108,11 @@ TEST(get_code_cold_start_parses_project_from_qn) {
 
 TEST(watcher_registered_after_index_repository) {
     /* Create a tiny temp repo so indexing succeeds quickly */
-    char repo_path[] = "/tmp/cbm_watch_test_XXXXXX";
-    ASSERT_NOT_NULL(mkdtemp(repo_path));
-    char src_path[256];
+    char repo_path[CBM_PATH_MAX];
+    int repo_len = snprintf(repo_path, sizeof(repo_path), "%s/cbm_watch_test_XXXXXX", cbm_tmpdir());
+    ASSERT(repo_len >= 0 && (size_t)repo_len < sizeof(repo_path));
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo_path));
+    char src_path[CBM_PATH_MAX];
     snprintf(src_path, sizeof(src_path), "%s/test.c", repo_path);
     FILE *f = fopen(src_path, "w");
     if (f) { fprintf(f, "void hello(void) {}\n"); fclose(f); }
@@ -2131,8 +2133,8 @@ TEST(watcher_registered_after_index_repository) {
 
     cbm_mcp_server_free(srv);
     cbm_watcher_free(w);
-    (void)unlink(src_path);
-    (void)rmdir(repo_path);
+    (void)cbm_unlink(src_path);
+    (void)cbm_rmdir(repo_path);
     PASS();
 }
 
@@ -2165,7 +2167,7 @@ TEST(watcher_registered_on_resolve_store) {
 
     cbm_mcp_server_free(srv);
     cbm_watcher_free(w);
-    (void)unlink(db_path);
+    (void)cbm_unlink(db_path);
     PASS();
 }
 
@@ -2198,7 +2200,7 @@ TEST(watcher_not_registered_for_unknown_path) {
 
     cbm_mcp_server_free(srv);
     cbm_watcher_free(w);
-    (void)unlink(db_path);
+    (void)cbm_unlink(db_path);
     PASS();
 }
 
@@ -2256,7 +2258,7 @@ TEST(compact_defaults_to_true) {
     yyjson_doc_free(doc);
     free(resp);
     cbm_mcp_server_free(srv);
-    (void)unlink(db_path);
+    (void)cbm_unlink(db_path);
     PASS();
 }
 
@@ -2291,7 +2293,7 @@ TEST(pagerank_output_has_limited_precision) {
     ASSERT_NULL(strstr(resp, "000000000")); /* No 9+ consecutive zeros in pagerank */
     free(resp);
     cbm_mcp_server_free(srv);
-    (void)unlink(db_path);
+    (void)cbm_unlink(db_path);
     PASS();
 }
 
@@ -2328,7 +2330,7 @@ TEST(empty_db_not_treated_as_indexed) {
     sqlite3_finalize(stmt);
     sqlite3_close(db);
 
-    (void)unlink(db_path);
+    (void)cbm_unlink(db_path);
     PASS();
 }
 
@@ -2379,7 +2381,7 @@ TEST(search_exclude_filters_file_paths) {
     free(resp);
 
     cbm_mcp_server_free(srv);
-    (void)unlink(db_path);
+    (void)cbm_unlink(db_path);
     PASS();
 }
 
@@ -2406,7 +2408,7 @@ TEST(search_exclude_empty_array_no_effect) {
     free(resp);
 
     cbm_mcp_server_free(srv);
-    (void)unlink(db_path);
+    (void)cbm_unlink(db_path);
     PASS();
 }
 
@@ -2436,7 +2438,7 @@ TEST(search_exclude_all_returns_empty) {
     free(resp);
 
     cbm_mcp_server_free(srv);
-    (void)unlink(db_path);
+    (void)cbm_unlink(db_path);
     PASS();
 }
 
@@ -2536,9 +2538,9 @@ TEST(source_grep_case_insensitive_by_default) {
     free(resp);
 
     cbm_mcp_server_free(srv);
-    remove(src_path);
+    cbm_unlink(src_path);
     cbm_rmdir(proj_dir);
-    (void)unlink(db_path);
+    (void)cbm_unlink(db_path);
     PASS();
 }
 
@@ -2577,9 +2579,9 @@ TEST(source_grep_case_sensitive_flag_works) {
     free(resp);
 
     cbm_mcp_server_free(srv);
-    remove(src_path);
+    cbm_unlink(src_path);
     cbm_rmdir(proj_dir);
-    (void)unlink(db_path);
+    (void)cbm_unlink(db_path);
     PASS();
 }
 
@@ -2639,9 +2641,9 @@ TEST(source_grep_mode_summary_warns) {
     free(resp);
 
     cbm_mcp_server_free(srv);
-    remove(src_path);
+    cbm_unlink(src_path);
     cbm_rmdir(proj_dir);
-    (void)unlink(db_path);
+    (void)cbm_unlink(db_path);
     PASS();
 }
 
