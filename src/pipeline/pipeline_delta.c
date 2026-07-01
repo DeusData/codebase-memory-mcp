@@ -37,9 +37,13 @@ static const char cbm_delta_reason_unresolved_edge_endpoint[] = "unresolved_edge
 static const char cbm_delta_reason_unsupported_derived_view[] = "unsupported_derived_view";
 static const char cbm_delta_reason_unsupported_edges[] = "unsupported_edges";
 
-static const char *const cbm_delta_scratch_seed_labels[] = {
-    "Project", "Branch", "Folder", "File", "Module", "Struct", "Enum", "Trait",
-    "Type",    "Function", "Method", "Class", "Interface", "Variable", "Field",
+static const char *const cbm_delta_scratch_graph_seed_labels[] = {
+    "Project", "Branch", "Folder", "File", "Module", NULL,
+};
+
+static const char *const cbm_delta_scratch_registry_seed_labels[] = {
+    "Struct", "Enum", "Trait", "Type", "Function", "Method", "Class", "Interface", "Variable",
+    "Field",
     NULL,
 };
 
@@ -133,23 +137,27 @@ static int delta_seed_store_node(cbm_gbuf_t *gbuf, cbm_registry_t *registry,
     return CBM_STORE_OK;
 }
 
-static bool delta_seed_node_in_scratch_graph(const char *label) {
-    return label && (strcmp(label, "Project") == 0 || strcmp(label, "Branch") == 0 ||
-                     strcmp(label, "Folder") == 0 || strcmp(label, "File") == 0 ||
-                     strcmp(label, "Module") == 0);
-}
-
 static bool delta_can_materialize_store_node(const cbm_node_t *node) {
     return node && node->label &&
            (cbm_pipeline_label_is_registry_symbol(node->label) ||
             cbm_pipeline_label_is_import_target(node->label));
 }
 
-static void delta_seed_registry_symbol(cbm_registry_t *registry, const cbm_node_t *node) {
-    if (registry && node && cbm_pipeline_label_is_registry_symbol(node->label) && node->name &&
-        node->qualified_name) {
-        cbm_registry_add(registry, node->name, node->qualified_name, node->label);
+typedef struct {
+    cbm_registry_t *registry;
+    const char *const *changed_paths;
+    int changed_path_count;
+} cbm_delta_registry_seed_ctx_t;
+
+static int delta_seed_registry_row(const char *label, const char *name, const char *qualified_name,
+                                   const char *file_path, void *userdata) {
+    cbm_delta_registry_seed_ctx_t *ctx = (cbm_delta_registry_seed_ctx_t *)userdata;
+    if (!ctx || !ctx->registry || !label || !name || !qualified_name ||
+        delta_path_in_list(file_path, ctx->changed_paths, ctx->changed_path_count)) {
+        return CBM_STORE_OK;
     }
+    cbm_registry_add(ctx->registry, name, qualified_name, label);
+    return CBM_STORE_OK;
 }
 
 int cbm_pipeline_seed_file_delta_scratch_from_store(cbm_store_t *store, cbm_gbuf_t *gbuf,
@@ -161,7 +169,7 @@ int cbm_pipeline_seed_file_delta_scratch_from_store(cbm_store_t *store, cbm_gbuf
         (changed_path_count > 0 && !changed_paths)) {
         return CBM_STORE_ERR;
     }
-    for (const char *const *label = cbm_delta_scratch_seed_labels; *label; label++) {
+    for (const char *const *label = cbm_delta_scratch_graph_seed_labels; *label; label++) {
         cbm_node_t *nodes = NULL;
         int node_count = 0;
         int rc = cbm_store_find_nodes_by_label(store, project, *label, &nodes, &node_count);
@@ -172,16 +180,24 @@ int cbm_pipeline_seed_file_delta_scratch_from_store(cbm_store_t *store, cbm_gbuf
             if (delta_path_in_list(nodes[i].file_path, changed_paths, changed_path_count)) {
                 continue;
             }
-            delta_seed_registry_symbol(registry, &nodes[i]);
-            if (!delta_seed_node_in_scratch_graph(nodes[i].label)) {
-                continue;
-            }
             if (delta_seed_store_node(gbuf, NULL, &nodes[i]) != CBM_STORE_OK) {
                 cbm_store_free_nodes(nodes, node_count);
                 return CBM_STORE_ERR;
             }
         }
         cbm_store_free_nodes(nodes, node_count);
+    }
+    cbm_delta_registry_seed_ctx_t seed_ctx = {
+        .registry = registry,
+        .changed_paths = changed_paths,
+        .changed_path_count = changed_path_count,
+    };
+    for (const char *const *label = cbm_delta_scratch_registry_seed_labels; *label; label++) {
+        int rc = cbm_store_visit_nodes_by_label(store, project, *label, delta_seed_registry_row,
+                                                &seed_ctx);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
     }
     return CBM_STORE_OK;
 }

@@ -1551,6 +1551,49 @@ int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const cha
                               project, label, out, count);
 }
 
+int cbm_store_visit_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
+                                   cbm_store_node_identity_visitor_fn visitor, void *userdata) {
+    enum {
+        VISIT_NODE_LABEL_COL = 0,
+        VISIT_NODE_NAME_COL,
+        VISIT_NODE_QN_COL,
+        VISIT_NODE_FILE_PATH_COL,
+    };
+    if (!s || !s->db || !project || !label || !visitor) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(s->db,
+                                "SELECT label, name, qualified_name, file_path FROM nodes "
+                                "WHERE project = ?1 AND label = ?2;",
+                                CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK || !stmt) {
+        store_set_error_sqlite(s, "visit_nodes_by_label prepare");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, SKIP_ONE, project);
+    bind_text(stmt, ST_COL_2, label);
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *row_label = (const char *)sqlite3_column_text(stmt, VISIT_NODE_LABEL_COL);
+        const char *row_name = (const char *)sqlite3_column_text(stmt, VISIT_NODE_NAME_COL);
+        const char *row_qn = (const char *)sqlite3_column_text(stmt, VISIT_NODE_QN_COL);
+        const char *row_path = (const char *)sqlite3_column_text(stmt, VISIT_NODE_FILE_PATH_COL);
+        if (visitor(row_label, row_name, row_qn, row_path, userdata) != CBM_STORE_OK) {
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
+    }
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "visit_nodes_by_label");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return CBM_STORE_OK;
+}
+
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,
                                  cbm_node_t **out, int *count) {
     return find_nodes_generic(s, &s->stmt_find_nodes_by_file,
