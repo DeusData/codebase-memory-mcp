@@ -77,6 +77,14 @@ typedef struct {
      * configs are an easy follow-on). NULL when no usable configs were found.
      * Owned by pipeline.c / pipeline_incremental.c. */
     const cbm_path_alias_collection_t *path_aliases;
+
+    /* ObjectScript $$$macro table built from .inc files in the repo (NULL if
+     * no ObjectScript include files were found). Owned by pipeline.c. */
+    const CBMMacroTable *macro_table;
+
+    /* ObjectScript method-return-type table built from extracted definitions
+     * (NULL until pass_calls builds it). Owned by pipeline.c. */
+    const CBMReturnTypeTable *return_type_table;
 } cbm_pipeline_ctx_t;
 
 /* Get the current pipeline's package map (NULL if none). */

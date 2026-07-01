@@ -130,6 +130,8 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_k8s.c \
     $(CBM_DIR)/helpers.c \
     $(CBM_DIR)/lang_specs.c \
+    $(CBM_DIR)/macro_table.c \
+    $(CBM_DIR)/iris_export_xml.c \
     $(CBM_DIR)/service_patterns.c
 
 # LSP resolvers (compiled as one unit via lsp_all.c)
@@ -201,6 +203,7 @@ PIPELINE_SRCS = \
     src/pipeline/pass_semantic_edges.c \
     src/pipeline/pass_complexity.c \
     src/pipeline/pass_cross_repo.c \
+    src/pipeline/pass_ensemble_routing.c \
     src/pipeline/artifact.c \
     src/pipeline/pass_pkgmap.c
 

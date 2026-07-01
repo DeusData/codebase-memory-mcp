@@ -18,10 +18,13 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #include "pipeline/artifact.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h"
+#include "pipeline/pass_ensemble_routing.h"
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
 #include "git/git_context.h"
 #include "store/store.h"
+#include "macro_table.h"
+#include "arena.h"
 #include "discover/discover.h"
 #include "discover/userconfig.h"
 #include "foundation/platform.h"
@@ -622,6 +625,9 @@ static void predump_cfg(cbm_pipeline_ctx_t *ctx) {
 static void predump_complexity(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_complexity(ctx);
 }
+static void predump_ensemble(cbm_pipeline_ctx_t *ctx) {
+    cbm_pipeline_pass_ensemble_routing(ctx);
+}
 
 static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     static const struct {
@@ -629,11 +635,12 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
         const char *name;
         bool moderate_only; /* true = skip in fast mode */
     } passes[] = {
-        {predump_deco, "decorator_tags", false}, {predump_cfg, "configlink", false},
-        {predump_route, "route_match", false},   {predump_sim, "similarity", true},
-        {predump_sem, "semantic_edges", true},   {predump_complexity, "complexity", false},
+        {predump_deco, "decorator_tags", false},       {predump_cfg, "configlink", false},
+        {predump_route, "route_match", false},         {predump_sim, "similarity", true},
+        {predump_sem, "semantic_edges", true},         {predump_complexity, "complexity", false},
+        {predump_ensemble, "ensemble_routing", false},
     };
-    enum { PREDUMP_PASS_COUNT = 6 };
+    enum { PREDUMP_PASS_COUNT = 7 };
     struct timespec t;
     for (int i = 0; i < PREDUMP_PASS_COUNT && !check_cancel(p); i++) {
         /* "moderate_only" passes (similarity/semantic edges) run in FULL,
@@ -666,6 +673,61 @@ static int seq_pass_lsp_cross_dispatch(cbm_pipeline_ctx_t *ctx, const cbm_file_i
 }
 
 /* Run the sequential pipeline path: definitions, k8s, lsp_cross, calls, usages, semantic. */
+/* Build the ObjectScript $$$macro table from .inc include files in the repo.
+ * Returns NULL (and does no work) when no ObjectScript include files exist.
+ * Caller owns the returned heap table. */
+static CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, int count,
+                                                       const char *repo_path) {
+    (void)repo_path;
+    bool has_inc = false;
+    for (int i = 0; i < count; i++) {
+        if (files[i].language == CBM_LANG_OBJECTSCRIPT_ROUTINE && files[i].path &&
+            strstr(files[i].path, ".inc")) {
+            has_inc = true;
+            break;
+        }
+    }
+    if (!has_inc) {
+        return NULL;
+    }
+
+    CBMMacroTable *mt = (CBMMacroTable *)calloc(1, sizeof(CBMMacroTable));
+    if (!mt) {
+        return NULL;
+    }
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_macro_table_init_system(mt);
+
+    for (int i = 0; i < count; i++) {
+        if (files[i].language != CBM_LANG_OBJECTSCRIPT_ROUTINE) {
+            continue;
+        }
+        if (!files[i].path || !strstr(files[i].path, ".inc")) {
+            continue;
+        }
+        FILE *f = fopen(files[i].path, "rb");
+        if (!f) {
+            continue;
+        }
+        fseek(f, 0, SEEK_END);
+        long fsize = ftell(f);
+        rewind(f);
+        if (fsize > 0) {
+            char *src = (char *)malloc((size_t)fsize + 1);
+            if (src) {
+                size_t nread = fread(src, 1, (size_t)fsize, f);
+                src[nread] = '\0';
+                cbm_parse_inc_file(mt, &arena, src);
+                free(src);
+            }
+        }
+        (void)fclose(f);
+    }
+    return mt;
+}
+
 static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                    const cbm_file_info_t *files, int file_count,
                                    struct timespec *t) {
@@ -681,6 +743,13 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     CBMFileResult **seq_cache = (CBMFileResult **)calloc(file_count, sizeof(CBMFileResult *));
     if (seq_cache) {
         ctx->result_cache = seq_cache;
+    }
+
+    /* ObjectScript: build the $$$macro table from .inc include files so that
+     * pass_calls can resolve macro-mediated dispatch. NULL when not present. */
+    CBMMacroTable *mt = cbm_build_macro_table_from_files(files, file_count, ctx->repo_path);
+    if (mt) {
+        ctx->macro_table = mt;
     }
     typedef int (*seq_pass_fn)(cbm_pipeline_ctx_t *, const cbm_file_info_t *, int);
     static const struct {
@@ -724,6 +793,18 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         }
         free(seq_cache);
         ctx->result_cache = NULL;
+    }
+    /* ObjectScript: free the macro / return-type tables built for this run. */
+    if (ctx->macro_table) {
+        free((void *)ctx->macro_table);
+        ctx->macro_table = NULL;
+    }
+    if (ctx->return_type_table) {
+        for (int i = 0; i < ctx->return_type_table->count; i++) {
+            free((void *)ctx->return_type_table->entries[i].return_type);
+        }
+        free((void *)ctx->return_type_table);
+        ctx->return_type_table = NULL;
     }
     return rc;
 }

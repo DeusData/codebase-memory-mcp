@@ -497,6 +497,15 @@ static int count_params_from_signature(const char *sig) {
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, const char **include_paths) {
+    return cbm_extract_file_ex(source, source_len, language, project, rel_path, timeout_micros,
+                               extra_defines, include_paths, NULL, NULL);
+}
+
+CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLanguage language,
+                                   const char *project, const char *rel_path,
+                                   int64_t timeout_micros, const char **extra_defines,
+                                   const char **include_paths, const CBMMacroTable *macro_table,
+                                   const CBMReturnTypeTable *return_type_table) {
     // Allocate result on heap (arena inside for all string data)
     enum { SINGLE = 1 };
     CBMFileResult *result = (CBMFileResult *)calloc(SINGLE, sizeof(CBMFileResult));
@@ -584,6 +593,8 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
         .rel_path = rel_path,
         .module_qn = result->module_qn,
         .root = root,
+        .macro_table = macro_table,
+        .return_type_table = return_type_table,
     };
 
     // Run extractors: defs + imports use separate walks (unique recursion patterns),
