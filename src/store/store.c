@@ -3101,6 +3101,40 @@ static int store_delete_file_delta_body(cbm_store_t *s, const char *project, con
     return CBM_STORE_OK;
 }
 
+static int store_delete_file_delta_transaction(cbm_store_t *s, const char *project,
+                                               const char *rel_path, int64_t generation,
+                                               const char *derived_view_name,
+                                               bool finish_generation) {
+    int rc = cbm_store_begin(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_delete_file_delta_body(s, project, rel_path, generation, derived_view_name);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    rc = store_mark_graph_derived_views_stale_body(s, project, generation);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    if (finish_generation) {
+        rc = store_finish_index_generation_body(s, project, generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(s);
+            return rc;
+        }
+    }
+    rc = cbm_store_commit(s);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    return CBM_STORE_OK;
+}
+
 static int store_publish_file_delta_body(cbm_store_t *s, const cbm_store_file_delta_t *delta) {
     int rc = store_delete_owned_edges_by_file(s, delta->project, delta->rel_path);
     if (rc != CBM_STORE_OK) {
@@ -3220,27 +3254,8 @@ int cbm_store_delete_file_delta(cbm_store_t *s, const char *project, const char 
         }
         return CBM_STORE_ERR;
     }
-
-    int rc = cbm_store_begin(s);
-    if (rc != CBM_STORE_OK) {
-        return rc;
-    }
-    rc = store_delete_file_delta_body(s, project, rel_path, generation, derived_view_name);
-    if (rc != CBM_STORE_OK) {
-        (void)cbm_store_rollback(s);
-        return rc;
-    }
-    rc = store_mark_graph_derived_views_stale_body(s, project, generation);
-    if (rc != CBM_STORE_OK) {
-        (void)cbm_store_rollback(s);
-        return rc;
-    }
-    rc = cbm_store_commit(s);
-    if (rc != CBM_STORE_OK) {
-        (void)cbm_store_rollback(s);
-        return rc;
-    }
-    return CBM_STORE_OK;
+    return store_delete_file_delta_transaction(s, project, rel_path, generation,
+                                               derived_view_name, false);
 }
 
 int cbm_store_delete_file_delta_complete(cbm_store_t *s, const char *project,
@@ -3253,33 +3268,8 @@ int cbm_store_delete_file_delta_complete(cbm_store_t *s, const char *project,
         }
         return CBM_STORE_ERR;
     }
-
-    int rc = cbm_store_begin(s);
-    if (rc != CBM_STORE_OK) {
-        return rc;
-    }
-    rc = store_delete_file_delta_body(s, project, rel_path, generation, derived_view_name);
-    if (rc != CBM_STORE_OK) {
-        (void)cbm_store_rollback(s);
-        return rc;
-    }
-    rc = store_mark_graph_derived_views_stale_body(s, project, generation);
-    if (rc != CBM_STORE_OK) {
-        (void)cbm_store_rollback(s);
-        return rc;
-    }
-    rc = store_finish_index_generation_body(s, project, generation,
-                                            CBM_STORE_INDEX_STATUS_COMPLETE);
-    if (rc != CBM_STORE_OK) {
-        (void)cbm_store_rollback(s);
-        return rc;
-    }
-    rc = cbm_store_commit(s);
-    if (rc != CBM_STORE_OK) {
-        (void)cbm_store_rollback(s);
-        return rc;
-    }
-    return CBM_STORE_OK;
+    return store_delete_file_delta_transaction(s, project, rel_path, generation,
+                                               derived_view_name, true);
 }
 
 static bool store_delta_field_matches(const char *actual, const char *expected) {
