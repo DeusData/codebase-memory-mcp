@@ -11,6 +11,7 @@
 #include "test_helpers.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/lsp_resolve.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
@@ -808,6 +809,91 @@ TEST(gbuf_next_id_accessors) {
     PASS();
 }
 
+TEST(lsp_resolution_matches_cpp_segments_and_reason_joins) {
+    CBMResolvedCall items[] = {
+        {.caller_qn = "proj.C.run",
+         .callee_qn = "proj.C.doWork",
+         .strategy = "lsp_type_dispatch",
+         .confidence = 0.90f,
+         .reason = NULL},
+        {.caller_qn = "proj.C.run",
+         .callee_qn = "proj.target",
+         .strategy = "lsp_func_ptr",
+         .confidence = 0.85f,
+         .reason = "fp"},
+        {.caller_qn = "proj.C.run",
+         .callee_qn = "proj.C.~C",
+         .strategy = "lsp_destructor",
+         .confidence = 0.90f,
+         .reason = "ptr"},
+    };
+    CBMResolvedCallArray arr = {.items = items, .count = 3, .cap = 3};
+
+    CBMCall member_call = {.enclosing_func_qn = "proj.C.run", .callee_name = "obj->doWork"};
+    ASSERT(cbm_pipeline_find_lsp_resolution(&arr, &member_call) == &items[0]);
+
+    CBMCall scoped_call = {.enclosing_func_qn = "proj.C.run", .callee_name = "ns::doWork"};
+    ASSERT(cbm_pipeline_find_lsp_resolution(&arr, &scoped_call) == &items[0]);
+
+    CBMCall fp_call = {.enclosing_func_qn = "proj.C.run", .callee_name = "fp"};
+    ASSERT(cbm_pipeline_find_lsp_resolution(&arr, &fp_call) == &items[1]);
+
+    CBMCall dtor_call = {.enclosing_func_qn = "proj.C.run", .callee_name = "ptr"};
+    ASSERT(cbm_pipeline_find_lsp_resolution(&arr, &dtor_call) == &items[2]);
+
+    PASS();
+}
+
+TEST(lsp_resolution_index_matches_linear_cpp_semantics) {
+    CBMResolvedCall items[] = {
+        {.caller_qn = "proj.C.run",
+         .callee_qn = "proj.C.doWork",
+         .strategy = "lsp_type_dispatch",
+         .confidence = 0.90f,
+         .reason = NULL},
+        {.caller_qn = "proj.C.run",
+         .callee_qn = "proj.target",
+         .strategy = "lsp_func_ptr",
+         .confidence = 0.85f,
+         .reason = "fp"},
+    };
+    CBMResolvedCallArray arr = {.items = items, .count = 2, .cap = 2};
+    cbm_lsp_resolution_index_t idx = {0};
+    cbm_lsp_resolution_index_build(&idx, &arr, 2, 0.0);
+    ASSERT_TRUE(idx.complete);
+
+    CBMCall member_call = {.enclosing_func_qn = "proj.C.run", .callee_name = "obj->doWork"};
+    ASSERT(cbm_lsp_resolution_index_find(&idx, &arr, &member_call, 0.0) == &items[0]);
+
+    CBMCall fp_call = {.enclosing_func_qn = "proj.C.run", .callee_name = "fp"};
+    ASSERT(cbm_lsp_resolution_index_find(&idx, &arr, &fp_call, 0.0) == &items[1]);
+
+    cbm_lsp_resolution_index_free(&idx);
+    PASS();
+}
+
+TEST(lsp_resolution_index_overlong_key_falls_back_to_linear) {
+    char caller[CBM_SZ_1K + CBM_SZ_128];
+    memset(caller, 'a', sizeof(caller) - 1);
+    caller[sizeof(caller) - 1] = '\0';
+
+    CBMResolvedCall item = {.caller_qn = caller,
+                            .callee_qn = "proj.target",
+                            .strategy = "lsp_direct",
+                            .confidence = 0.95f,
+                            .reason = NULL};
+    CBMResolvedCallArray arr = {.items = &item, .count = 1, .cap = 1};
+    cbm_lsp_resolution_index_t idx = {0};
+    cbm_lsp_resolution_index_build(&idx, &arr, 1, 0.0);
+    ASSERT_FALSE(idx.complete);
+
+    CBMCall call = {.enclosing_func_qn = caller, .callee_name = "target"};
+    ASSERT(cbm_lsp_resolution_index_find(&idx, &arr, &call, 0.0) == &item);
+
+    cbm_lsp_resolution_index_free(&idx);
+    PASS();
+}
+
 /* ── Parallel-pipeline LSP-override regression ────────────────────── */
 /* Pin the wiring fix that unified pass_calls.c (sequential) and
  * pass_parallel.c (parallel) on cbm_pipeline_find_lsp_resolution +
@@ -1022,6 +1108,9 @@ SUITE(parallel) {
     RUN_TEST(gbuf_merge_empty_src);
     RUN_TEST(gbuf_merge_src_free_safe);
     RUN_TEST(gbuf_next_id_accessors);
+    RUN_TEST(lsp_resolution_matches_cpp_segments_and_reason_joins);
+    RUN_TEST(lsp_resolution_index_matches_linear_cpp_semantics);
+    RUN_TEST(lsp_resolution_index_overlong_key_falls_back_to_linear);
 
     /* Parallel pipeline parity tests */
     RUN_TEST(parallel_node_count);
