@@ -3497,6 +3497,17 @@ static int pipeline_delta_seed_existing_ownership(cbm_store_t *s, const char *pr
                : CBM_STORE_ERR;
 }
 
+static int pipeline_delta_seed_project_node(cbm_store_t *s, const char *project) {
+    cbm_node_t project_node = {.project = (char *)project,
+                               .label = "Project",
+                               .name = (char *)project,
+                               .qualified_name = (char *)project,
+                               .file_path = "",
+                               .properties_json = "{}"};
+    return cbm_store_upsert_node(s, &project_node) > CBM_STORE_NO_NODE_ID ? CBM_STORE_OK
+                                                                          : CBM_STORE_ERR;
+}
+
 TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths) {
     const char *project = "test";
     const char *changed_paths[] = {"main.go"};
@@ -4316,6 +4327,7 @@ TEST(pipeline_file_delta_apply_inserts_new_file_without_existing_ownership) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
     ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_project_node(s, project), CBM_STORE_OK);
 
     char *folder_qn = cbm_pipeline_fqn_folder(project, "pkg");
     ASSERT_NOT_NULL(folder_qn);
@@ -4534,6 +4546,7 @@ TEST(pipeline_file_delta_plan_accepts_full_pipeline_structure_edge) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
     ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_project_node(s, project), CBM_STORE_OK);
     ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, rel_path, "test.src.main.Old"),
               CBM_STORE_OK);
 
@@ -4650,6 +4663,110 @@ TEST(pipeline_file_delta_plan_falls_back_on_new_folder_structure_edge) {
 
     cbm_pipeline_file_delta_plan_free(&plan);
     cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(scratch);
+    free(folder_qn);
+    free(file_qn);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_apply_inserts_and_prunes_new_folder_context) {
+    enum {
+        PIPELINE_NEW_FOLDER_DELTA_COUNT = 1,
+    };
+    const char *project = "test";
+    const char *rel_path = "src/main.go";
+    const char *new_qn = "test.src.main.New";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_project_node(s, project), CBM_STORE_OK);
+
+    char *file_qn = cbm_pipeline_fqn_compute(project, rel_path, "__file__");
+    char *folder_qn = cbm_pipeline_fqn_folder(project, "src");
+    ASSERT_NOT_NULL(file_qn);
+    ASSERT_NOT_NULL(folder_qn);
+
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, "/tmp/test");
+    ASSERT_NOT_NULL(scratch);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Project", project, project, NULL, 0, 0, "{}"), 0);
+    ASSERT_EQ(cbm_pipeline_ensure_file_structure(scratch, project, project, rel_path, NULL), 0);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Function", "New", new_qn, rel_path, 1, 1,
+                                   "{\"is_exported\":true}"),
+              0);
+
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(scratch, project, rel_path, 0, &delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(delta.delta.context_node_count, 1);
+    ASSERT_EQ(delta.delta.context_edge_count, 1);
+    ASSERT_STR_EQ(delta.context_nodes[0].qualified_name, folder_qn);
+    ASSERT_STR_EQ(delta.context_edges[0].type, "CONTAINS_FOLDER");
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+    delta.delta.generation = 0;
+    delta.file_state.generation = 0;
+
+    cbm_pipeline_file_delta_plan_t preflight_plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &preflight_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(preflight_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    cbm_pipeline_file_delta_plan_free(&preflight_plan);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_GT(generation, 0);
+    ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&delta, generation), CBM_STORE_OK);
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t apply_plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, deltas, PIPELINE_NEW_FOLDER_DELTA_COUNT,
+                                                  CBM_SZ_4, &apply_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(apply_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_qn), 1);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, folder_qn), 1);
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "CONTAINS_FOLDER"), 1);
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "CONTAINS_FILE"), 1);
+
+    int node_owners = 0;
+    int edge_owners = 0;
+    ASSERT_EQ(cbm_store_count_file_delta_owners(s, project, "src", &node_owners, &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_EQ(node_owners, 0);
+    ASSERT_EQ(edge_owners, 0);
+    ASSERT_EQ(cbm_store_count_file_delta_owners(s, project, rel_path, &node_owners,
+                                                &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_GT(node_owners, 0);
+    ASSERT_GT(edge_owners, 0);
+
+    cbm_pipeline_file_delta_plan_free(&apply_plan);
+    cbm_pipeline_file_delta_free(&delta);
+
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    cbm_pipeline_file_delta_t delete_delta = {
+        .delta = {.project = project, .rel_path = rel_path, .generation = generation},
+        .change_kind = CBM_PIPELINE_DELTA_CHANGE_DELETE};
+    const cbm_pipeline_file_delta_t *delete_deltas[] = {&delete_delta};
+    cbm_pipeline_file_delta_plan_t delete_plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, delete_deltas,
+                                                  PIPELINE_NEW_FOLDER_DELTA_COUNT, CBM_SZ_4,
+                                                  &delete_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(delete_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_qn), 0);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, file_qn), 0);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, folder_qn), 0);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, project), 1);
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "CONTAINS_FOLDER"), 0);
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "CONTAINS_FILE"), 0);
+
+    cbm_pipeline_file_delta_plan_free(&delete_plan);
     cbm_gbuf_free(scratch);
     free(folder_qn);
     free(file_qn);
@@ -9088,7 +9205,7 @@ TEST(incremental_fast_rename_like_batch_falls_back_to_full_rebuild_parity) {
     PASS();
 }
 
-TEST(incremental_fast_new_folder_falls_back_to_full_rebuild_parity) {
+TEST(incremental_fast_new_folder_exact_delta_parity) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
@@ -9125,13 +9242,13 @@ TEST(incremental_fast_new_folder_falls_back_to_full_rebuild_parity) {
     ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "pkg/leaf.go",
                                                    &generation),
               CBM_STORE_OK);
-    ASSERT_EQ(generation, CBM_PIPELINE_COMPAT_GENERATION);
+    ASSERT_GT(generation, CBM_PIPELINE_COMPAT_GENERATION);
 
     char diff_err[CBM_SZ_8K] = {0};
     int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
         g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
     if (diff_rc != 0) {
-        FAIL(diff_err[0] ? diff_err : "new-folder fallback differed from fresh FAST rebuild");
+        FAIL(diff_err[0] ? diff_err : "new-folder exact delta differed from fresh FAST rebuild");
     }
     ASSERT_EQ(diff_rc, 0);
 
@@ -11149,6 +11266,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unowned_structural_inbound_edge);
     RUN_TEST(pipeline_file_delta_plan_accepts_full_pipeline_structure_edge);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_new_folder_structure_edge);
+    RUN_TEST(pipeline_file_delta_apply_inserts_and_prunes_new_folder_context);
     RUN_TEST(pipeline_file_delta_plan_accepts_regenerated_structural_inbound_edge);
     RUN_TEST(pipeline_file_delta_plan_falls_back_without_file_metadata);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unsupported_edges);
@@ -11370,7 +11488,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_single_delete_exact_matches_full_rebuild);
     RUN_TEST(incremental_fast_delete_falls_back_to_full_rebuild_parity);
     RUN_TEST(incremental_fast_rename_like_batch_falls_back_to_full_rebuild_parity);
-    RUN_TEST(incremental_fast_new_folder_falls_back_to_full_rebuild_parity);
+    RUN_TEST(incremental_fast_new_folder_exact_delta_parity);
     RUN_TEST(incremental_fast_route_decorator_change_matches_full_rebuild);
     RUN_TEST(incremental_fast_exact_scratch_multifile_usage_edges_match_fresh);
     RUN_TEST(incremental_fast_exact_batch_publish_matches_fresh_rebuild_for_two_file_go);
