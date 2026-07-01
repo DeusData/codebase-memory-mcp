@@ -8,6 +8,7 @@
 #include "../src/foundation/constants.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include <git/git_snapshot.h>
 #include <watcher/watcher.h>
 #include <store/store.h>
 #include <string.h>
@@ -162,6 +163,85 @@ TEST(watcher_rejects_overlong_git_command_path) {
 
     cbm_watcher_free(w);
     cbm_store_close(store);
+    PASS();
+}
+
+TEST(git_snapshot_rejects_overlong_path) {
+    char long_path[CBM_SZ_2K];
+    long_path[0] = '/';
+    memset(long_path + 1, 'b', sizeof(long_path) - CBM_SZ_2);
+    long_path[sizeof(long_path) - 1] = '\0';
+
+    cbm_git_snapshot_t snap = {0};
+    ASSERT_FALSE(cbm_git_snapshot_path_supported(long_path));
+    ASSERT_EQ(cbm_git_snapshot_read(long_path, CBM_GIT_SNAPSHOT_HEAD, &snap), CBM_NOT_FOUND);
+    ASSERT_FALSE(snap.path_supported);
+    PASS();
+}
+
+TEST(git_snapshot_non_git_path) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_git_snapshot_nongit_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    cbm_git_snapshot_t snap = {0};
+    ASSERT_EQ(cbm_git_snapshot_read(tmpdir,
+                                    CBM_GIT_SNAPSHOT_HEAD | CBM_GIT_SNAPSHOT_DIRTY |
+                                        CBM_GIT_SNAPSHOT_FILE_COUNT,
+                                    &snap),
+              0);
+    ASSERT_TRUE(snap.path_supported);
+    ASSERT_FALSE(snap.is_git);
+    ASSERT_EQ(snap.file_count, 0);
+    ASSERT_STR_EQ(snap.dirty_hash, "0000000000000000");
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(git_snapshot_clean_and_dirty_repo) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_git_snapshot_repo_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_git_snapshot_t snap = {0};
+    ASSERT_EQ(cbm_git_snapshot_read(tmpdir,
+                                    CBM_GIT_SNAPSHOT_HEAD | CBM_GIT_SNAPSHOT_DIRTY |
+                                        CBM_GIT_SNAPSHOT_FILE_COUNT,
+                                    &snap),
+              0);
+    ASSERT_TRUE(snap.path_supported);
+    ASSERT_TRUE(snap.is_git);
+    ASSERT_TRUE(snap.head[0] != '\0');
+    ASSERT_EQ(snap.file_count, 1);
+    ASSERT_EQ(snap.dirty_bytes, 0);
+    ASSERT_STR_EQ(snap.dirty_hash, "0000000000000000");
+
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "new.go"), "package main\n");
+    }
+    ASSERT_EQ(cbm_git_snapshot_read(tmpdir, CBM_GIT_SNAPSHOT_DIRTY, &snap), 0);
+    ASSERT_TRUE(snap.is_git);
+    ASSERT_TRUE(snap.dirty_bytes > 0);
+    ASSERT_TRUE(strcmp(snap.dirty_hash, "0000000000000000") != 0);
+
+    th_rmtree(tmpdir);
     PASS();
 }
 
@@ -1771,6 +1851,9 @@ SUITE(watcher) {
     RUN_TEST(watcher_watch_replace);
     RUN_TEST(watcher_null_safety);
     RUN_TEST(watcher_rejects_overlong_git_command_path);
+    RUN_TEST(git_snapshot_rejects_overlong_path);
+    RUN_TEST(git_snapshot_non_git_path);
+    RUN_TEST(git_snapshot_clean_and_dirty_repo);
 
     /* Polling */
     RUN_TEST(watcher_poll_no_projects);
