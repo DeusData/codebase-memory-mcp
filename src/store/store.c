@@ -2099,6 +2099,112 @@ int cbm_store_upsert_edge_owner(cbm_store_t *s, const char *project, int64_t edg
     return CBM_STORE_OK;
 }
 
+static int store_exec_rebuild_owner_sql(cbm_store_t *s, const char *sql, const char *project,
+                                        int64_t generation, const char *op) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, op);
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    sqlite3_bind_int64(stmt, ST_COL_2, generation);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, op);
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return CBM_STORE_OK;
+}
+
+int cbm_store_rebuild_file_delta_owners(cbm_store_t *s, const char *project,
+                                        int64_t generation) {
+    if (!s || !project || !project[0] || generation < 0) {
+        if (s) {
+            store_set_error(s, "rebuild_file_delta_owners: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    int rc = cbm_store_begin(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    sqlite3_stmt *delete_nodes = NULL;
+    sqlite3_stmt *delete_edges = NULL;
+    const char *delete_node_sql = "DELETE FROM node_owners WHERE project = ?1;";
+    const char *delete_edge_sql = "DELETE FROM edge_owners WHERE project = ?1;";
+    if (sqlite3_prepare_v2(s->db, delete_node_sql, CBM_NOT_FOUND, &delete_nodes, NULL) !=
+            SQLITE_OK ||
+        sqlite3_prepare_v2(s->db, delete_edge_sql, CBM_NOT_FOUND, &delete_edges, NULL) !=
+            SQLITE_OK) {
+        store_set_error_sqlite(s, "rebuild_file_delta_owners delete prepare");
+        sqlite3_finalize(delete_nodes);
+        sqlite3_finalize(delete_edges);
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+    bind_text(delete_nodes, ST_COL_1, project);
+    bind_text(delete_edges, ST_COL_1, project);
+    if (sqlite3_step(delete_nodes) != SQLITE_DONE || sqlite3_step(delete_edges) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "rebuild_file_delta_owners delete");
+        sqlite3_finalize(delete_nodes);
+        sqlite3_finalize(delete_edges);
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(delete_nodes);
+    sqlite3_finalize(delete_edges);
+
+    const char *node_sql =
+        "INSERT INTO node_owners (project, node_id, rel_path, generation) "
+        "SELECT project, id, file_path, ?2 FROM nodes "
+        "WHERE project = ?1 AND file_path IS NOT NULL AND file_path <> '';";
+    rc = store_exec_rebuild_owner_sql(s, node_sql, project, generation,
+                                      "rebuild_file_delta_owners nodes");
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+
+    const char *edge_sql =
+        "INSERT INTO edge_owners (project, edge_id, rel_path, derived_kind, generation) "
+        "SELECT e.project, e.id, "
+        "CASE WHEN src.file_path IS NOT NULL AND src.file_path <> '' THEN src.file_path "
+        "ELSE tgt.file_path END, ?3, ?2 "
+        "FROM edges e "
+        "JOIN nodes src ON src.id = e.source_id "
+        "JOIN nodes tgt ON tgt.id = e.target_id "
+        "WHERE e.project = ?1 AND ("
+        "(src.file_path IS NOT NULL AND src.file_path <> '') OR "
+        "(tgt.file_path IS NOT NULL AND tgt.file_path <> ''));";
+    sqlite3_stmt *edge_stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, edge_sql, CBM_NOT_FOUND, &edge_stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "rebuild_file_delta_owners edges prepare");
+        sqlite3_finalize(edge_stmt);
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+    bind_text(edge_stmt, ST_COL_1, project);
+    sqlite3_bind_int64(edge_stmt, ST_COL_2, generation);
+    bind_text(edge_stmt, ST_COL_3, CBM_STORE_DERIVED_KIND_DIRECT);
+    if (sqlite3_step(edge_stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "rebuild_file_delta_owners edges");
+        sqlite3_finalize(edge_stmt);
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(edge_stmt);
+
+    rc = cbm_store_commit(s);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    return CBM_STORE_OK;
+}
+
 int cbm_store_delete_node_owners_by_file(cbm_store_t *s, const char *project,
                                          const char *rel_path) {
     sqlite3_stmt *stmt =

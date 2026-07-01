@@ -1391,6 +1391,17 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
                     rc = state_rc;
                     goto cleanup;
                 }
+                if (p->incremental_reindex != CBM_INCREMENTAL_REINDEX_OFF) {
+                    int owner_rc = cbm_store_rebuild_file_delta_owners(
+                        hash_store, p->project_name, CBM_PIPELINE_COMPAT_GENERATION);
+                    if (owner_rc != CBM_STORE_OK) {
+                        cbm_log_error("pipeline.err", "phase", "rebuild_file_delta_owners", "rc",
+                                      itoa_buf(owner_rc));
+                        cbm_store_close(hash_store);
+                        rc = owner_rc;
+                        goto cleanup;
+                    }
+                }
                 cbm_store_close(hash_store);
                 cbm_log_info("pass.timing", "pass", "persist_hashes", "files",
                              itoa_buf(file_count));

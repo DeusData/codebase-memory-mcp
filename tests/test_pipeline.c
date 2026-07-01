@@ -997,6 +997,40 @@ TEST(pipeline_full_and_incremental_persist_file_state) {
     PASS();
 }
 
+TEST(pipeline_incremental_full_index_rebuilds_owner_metadata) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    int n = snprintf(db_path, sizeof(db_path), "%s/test_owner_metadata.db", g_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(db_path));
+
+    cbm_config_t *cfg = incremental_test_config(g_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    int node_owners = 0;
+    int edge_owners = 0;
+    ASSERT_EQ(cbm_store_count_file_delta_owners(s, project, "pkg/util/helper.go",
+                                                &node_owners, &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_GT(node_owners, 0);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    cbm_config_close(cfg);
+
+    teardown_test_repo();
+    PASS();
+}
+
 /* ── Git history pass tests ─────────────────────────────────────── */
 
 TEST(githistory_is_trackable) {
@@ -9036,6 +9070,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
     RUN_TEST(pipeline_full_and_incremental_persist_file_state);
+    RUN_TEST(pipeline_incremental_full_index_rebuilds_owner_metadata);
     /* Git history pass */
     RUN_TEST(githistory_is_trackable);
     RUN_TEST(githistory_compute_coupling);

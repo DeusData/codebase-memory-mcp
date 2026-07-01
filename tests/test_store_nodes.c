@@ -924,6 +924,84 @@ TEST(store_owner_metadata_crud) {
     PASS();
 }
 
+TEST(store_rebuild_file_delta_owners_derives_from_graph) {
+    enum { TEST_GENERATION = 7 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    cbm_node_t nodes[3] = {
+        {.project = "test",
+         .label = "Function",
+         .name = "main",
+         .qualified_name = "test.main",
+         .file_path = "main.go",
+         .properties_json = "{}"},
+        {.project = "test",
+         .label = "Function",
+         .name = "helper",
+         .qualified_name = "test.helper",
+         .file_path = "helper.go",
+         .properties_json = "{}"},
+        {.project = "test",
+         .label = "Package",
+         .name = "pkg",
+         .qualified_name = "test.pkg",
+         .file_path = "",
+         .properties_json = "{}"},
+    };
+    int64_t main_id = cbm_store_upsert_node(s, &nodes[0]);
+    int64_t helper_id = cbm_store_upsert_node(s, &nodes[1]);
+    int64_t package_id = cbm_store_upsert_node(s, &nodes[2]);
+    ASSERT_GT(main_id, 0);
+    ASSERT_GT(helper_id, 0);
+    ASSERT_GT(package_id, 0);
+
+    cbm_edge_t direct_edge = {.project = "test",
+                              .source_id = main_id,
+                              .target_id = helper_id,
+                              .type = "CALLS",
+                              .properties_json = "{}"};
+    cbm_edge_t target_fallback_edge = {.project = "test",
+                                       .source_id = package_id,
+                                       .target_id = helper_id,
+                                       .type = "CONTAINS",
+                                       .properties_json = "{}"};
+    int64_t direct_edge_id = cbm_store_insert_edge(s, &direct_edge);
+    int64_t fallback_edge_id = cbm_store_insert_edge(s, &target_fallback_edge);
+    ASSERT_GT(direct_edge_id, 0);
+    ASSERT_GT(fallback_edge_id, 0);
+
+    ASSERT_EQ(cbm_store_upsert_node_owner(s, "test", main_id, "stale.go", TEST_GENERATION - 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_edge_owner(s, "test", direct_edge_id, "stale.go", NULL,
+                                          TEST_GENERATION - 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(store_count_metadata_owners(s, 0, "test", "stale.go"), 1);
+    ASSERT_EQ(store_count_metadata_owners(s, 1, "test", "stale.go"), 1);
+
+    ASSERT_EQ(cbm_store_rebuild_file_delta_owners(s, "test", TEST_GENERATION), CBM_STORE_OK);
+
+    int node_owners = 0;
+    int edge_owners = 0;
+    ASSERT_EQ(cbm_store_count_file_delta_owners(s, "test", "main.go", &node_owners,
+                                                &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_EQ(node_owners, 1);
+    ASSERT_EQ(edge_owners, 1);
+
+    ASSERT_EQ(cbm_store_count_file_delta_owners(s, "test", "helper.go", &node_owners,
+                                                &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_EQ(node_owners, 1);
+    ASSERT_EQ(edge_owners, 1);
+    ASSERT_EQ(store_count_metadata_owners(s, 0, "test", "stale.go"), 0);
+    ASSERT_EQ(store_count_metadata_owners(s, 1, "test", "stale.go"), 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_import_export_metadata_crud) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -3207,6 +3285,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_index_generation_finish_complete);
     RUN_TEST(store_index_generation_finish_failed_and_invalid_status);
     RUN_TEST(store_owner_metadata_crud);
+    RUN_TEST(store_rebuild_file_delta_owners_derives_from_graph);
     RUN_TEST(store_import_export_metadata_crud);
     RUN_TEST(store_file_delta_affected_paths_from_exports_and_imports);
     RUN_TEST(store_file_delta_affected_paths_high_fanout_dedupes);

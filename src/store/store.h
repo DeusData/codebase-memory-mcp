@@ -510,6 +510,11 @@ int cbm_store_upsert_edge_owner(cbm_store_t *s, const char *project, int64_t edg
                                 const char *rel_path, const char *derived_kind,
                                 int64_t generation);
 
+/* Rebuild file-delta owner rows from the persisted graph for one project.
+ * Used after a full index when exact incremental reindexing is enabled. */
+int cbm_store_rebuild_file_delta_owners(cbm_store_t *s, const char *project,
+                                        int64_t generation);
+
 int cbm_store_delete_node_owners_by_file(cbm_store_t *s, const char *project,
                                          const char *rel_path);
 
