@@ -475,8 +475,8 @@ static const tool_def_t TOOLS[] = {
      "},\"required\":[\"repo_path\"]}"},
 
     {"search_graph",
-     "Search the code knowledge graph for functions, classes, routes, and variables. Use INSTEAD "
-     "OF grep/glob when finding code definitions, implementations, or relationships. Auto-indexes "
+     "Search the code knowledge graph for functions, classes, routes, and variables. Prefer this "
+     "over grep/glob for code definitions, implementations, or relationships. Auto-indexes "
      "the server CWD or an explicit directory project on first use when enabled. "
      "Returns structured results in one call. "
      "When has_more=true, use offset+limit to paginate. "
@@ -550,8 +550,8 @@ static const tool_def_t TOOLS[] = {
      "truncated=true with total_bytes and hint to add LIMIT.\"}},\"required\":[\"query\"]}"},
 
     {"trace_path",
-     "Trace function call paths: who calls a function and what it calls. Use INSTEAD OF grep when "
-     "finding callers, dependencies, or impact analysis. Auto-indexes the project on first use "
+     "Trace function call paths: who calls a function and what it calls. Prefer this for callers, "
+     "dependencies, or impact analysis. Auto-indexes the project on first use "
      "when enabled. "
      "Pass qualified_name from search_graph when available; otherwise pass function_name. "
      "All other params are optional defaults. Results are deduplicated and show candidates "
@@ -588,7 +588,7 @@ static const tool_def_t TOOLS[] = {
      "\"}},\"description\":\"Pass function_name OR qualified_name (at least one required).\"}"},
 
     {"get_code_snippet",
-     "Get source code for a specific function, class, or symbol by qualified name. Use INSTEAD OF "
+     "Get source code for a specific function, class, or symbol by qualified name. Prefer this over "
      "reading entire files when you need one function's implementation. Use mode=signature for "
      "API lookup without the source body. Use mode=head_tail for large functions to see both "
      "the signature and return/cleanup code. When truncated=true, set max_lines=0 for full source.",
@@ -730,7 +730,7 @@ static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
 static const tool_def_t STREAMLINED_TOOLS[] = {
     {"get_code",
      "Get source code for a function, class, or symbol by qualified name. "
-     "Use INSTEAD OF reading entire files. Use mode=signature for API lookup without source body. "
+     "Prefer this over reading entire files. Use mode=signature for API lookup without source body. "
      "Use mode=head_tail for large functions (preserves return code). "
      "Module nodes return metadata only. Use auto_resolve=true only for ambiguous names. "
      "Get qualified_name values from search_graph results.",
