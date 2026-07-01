@@ -2264,7 +2264,7 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
 static const char *class_label_for_kind(const char *kind) {
     if (strcmp(kind, "interface_declaration") == 0 || strcmp(kind, "interface_type") == 0 ||
         strcmp(kind, "trait_item") == 0 || strcmp(kind, "trait_definition") == 0 ||
-        strcmp(kind, "protocol_declaration") == 0) {
+        strcmp(kind, "protocol_declaration") == 0 || strcmp(kind, "extension_definition") == 0) {
         return "Interface";
     }
     if (strcmp(kind, "enum_specifier") == 0 || strcmp(kind, "enum_declaration") == 0 ||
