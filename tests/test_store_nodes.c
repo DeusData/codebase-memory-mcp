@@ -195,8 +195,9 @@ TEST(store_exact_delta_metadata_schema) {
         "symbol_exports",   "import_refs",      "derived_view_state",
     };
     static const char *indexes[] = {
-        "idx_file_state_hash",       "idx_node_owners_path", "idx_edge_owners_path",
-        "idx_symbol_exports_path",   "idx_import_refs_target",
+        "idx_file_state_hash",       "idx_node_owners_path",      "idx_node_owners_node_id",
+        "idx_edge_owners_path",      "idx_edge_owners_edge_id",   "idx_symbol_exports_path",
+        "idx_symbol_exports_node_id", "idx_import_refs_target",
         "idx_derived_view_state_status",
     };
 
