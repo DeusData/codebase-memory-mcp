@@ -92,6 +92,14 @@ typedef struct {
 } cbm_file_state_t;
 
 typedef struct {
+    const char *project;
+    const char *view_name;
+    int64_t source_generation;
+    const char *computed_at;
+    const char *status;
+} cbm_derived_view_state_t;
+
+typedef struct {
     const char *source_qn;
     const char *target_qn;
     const char *type;
@@ -569,6 +577,10 @@ int cbm_store_mark_derived_views_stale(cbm_store_t *s, const char *project,
                                        int64_t generation, const char *const *view_names,
                                        int view_count);
 
+int cbm_store_get_derived_view_state(cbm_store_t *s, const char *project,
+                                     const char *view_name,
+                                     cbm_derived_view_state_t *out);
+
 int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *delta);
 int cbm_store_publish_file_delta_batch(cbm_store_t *s,
                                        const cbm_store_file_delta_t *const *deltas,
@@ -854,6 +866,7 @@ void cbm_store_free_file_hashes(cbm_file_hash_t *hashes, int count);
 
 /* Free heap-allocated strings in a stack-allocated file state. */
 void cbm_store_file_state_free_fields(cbm_file_state_t *state);
+void cbm_store_derived_view_state_free_fields(cbm_derived_view_state_t *state);
 
 /* ── Vector search ───────────────────────────────────────────────── */
 
