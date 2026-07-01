@@ -59,3 +59,5 @@ soak-results/
 
 # LSP originality-check reference cache (scripts/check-lsp-originality.sh)
 .lsp-refs/
+__pycache__/
+*.pyc
