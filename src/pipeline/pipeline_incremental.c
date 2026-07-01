@@ -929,6 +929,7 @@ static int incr_try_exact_delete_route(cbm_pipeline_t *p, cbm_store_t *store, co
     cbm_pipeline_set_committed_counts(p, cbm_store_count_nodes(store, project),
                                       cbm_store_count_edges(store, project));
     cbm_pipeline_set_graph_changed(p, true);
+    cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
     if (cbm_pipeline_repo_path(p) && cbm_artifact_exists(cbm_pipeline_repo_path(p))) {
         (void)cbm_artifact_export(db_path, cbm_pipeline_repo_path(p), project, CBM_ARTIFACT_FAST);
     }
@@ -1108,6 +1109,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     cbm_pipeline_set_committed_counts(p, cbm_store_count_nodes(store, project),
                                       cbm_store_count_edges(store, project));
     cbm_pipeline_set_graph_changed(p, true);
+    cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
     if (cbm_pipeline_repo_path(p) && cbm_artifact_exists(cbm_pipeline_repo_path(p))) {
         (void)cbm_artifact_export(db_path, cbm_pipeline_repo_path(p), project, CBM_ARTIFACT_FAST);
     }
@@ -1254,6 +1256,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                          itoa_buf_incr(cls.n_metadata_only));
         }
         cbm_log_info("incremental.noop", "reason", "no_changes");
+        cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_NOOP);
         incr_classification_free(&cls);
         cbm_store_free_file_hashes(stored, stored_count);
         cbm_store_close(store);
@@ -1490,6 +1493,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                                       pass_fingerprint);
     if (persist_rc == 0) {
         cbm_pipeline_set_graph_changed(p, true);
+        cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
     }
     incr_classification_free(&cls);
     cbm_gbuf_free(existing);

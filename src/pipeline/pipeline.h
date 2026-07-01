@@ -43,6 +43,14 @@ typedef enum {
 } cbm_index_mode_t;
 #endif
 
+typedef enum {
+    CBM_PIPELINE_PUBLISH_NONE = 0,
+    CBM_PIPELINE_PUBLISH_FULL,
+    CBM_PIPELINE_PUBLISH_INCREMENTAL_NOOP,
+    CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT,
+    CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT,
+} cbm_pipeline_publish_kind_t;
+
 /* ── Pipeline lifecycle ─────────────────────────────────────────── */
 
 /* Create a new pipeline. Caller owns the result. */
@@ -129,6 +137,10 @@ void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int 
  * Incremental no-op runs return false so callers can skip derived-view
  * recomputation when the existing derived views are already complete. */
 bool cbm_pipeline_graph_changed(const cbm_pipeline_t *p);
+
+/* Last publish route for the most recent run. This is observability for callers
+ * that need derived-view policy decisions; it does not change graph contents. */
+cbm_pipeline_publish_kind_t cbm_pipeline_publish_kind(const cbm_pipeline_t *p);
 
 /* ── Index lock (prevents concurrent pipeline runs on same DB) ──── */
 
