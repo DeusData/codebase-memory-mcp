@@ -72,6 +72,10 @@ static inline bool cbm_pipeline_label_is_import_target(const char *label) {
 #define CBM_MS_PER_SEC 1000.0
 #define CBM_US_PER_SEC_F 1e6
 
+/* Generation used by full/containment indexing paths before exact-delta
+ * generation reservation is active. Matches the store schema default. */
+enum { CBM_PIPELINE_COMPAT_GENERATION = 0 };
+
 /* Test-only incremental fault injection. Values name internal phases and are
  * intentionally not user configuration. */
 #define CBM_TEST_FAIL_INCREMENTAL_PHASE "CBM_TEST_FAIL_INCREMENTAL_PHASE"
@@ -217,6 +221,10 @@ void cbm_pipeline_free_import_map(const char **keys, const char **vals, int coun
  * back instead of publishing when unsupported edges are present. */
 int64_t cbm_pipeline_stat_mtime_ns(const struct stat *st);
 int cbm_pipeline_content_hash_file(const char *path, char *out, size_t out_sz);
+/* Persists file_state rows in its own transaction. */
+int cbm_pipeline_persist_file_states(cbm_store_t *store, const char *project,
+                                     const cbm_file_info_t *files, int file_count,
+                                     int64_t generation, const char *pass_fingerprint);
 int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *project,
                                             const char *rel_path, int64_t generation,
                                             cbm_pipeline_file_delta_t *out);

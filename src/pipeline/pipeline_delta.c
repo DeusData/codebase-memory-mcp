@@ -370,6 +370,63 @@ int cbm_pipeline_content_hash_file(const char *path, char *out, size_t out_sz) {
     return n == CBM_DELTA_XXH64_HEX_LEN ? CBM_STORE_OK : CBM_STORE_ERR;
 }
 
+int cbm_pipeline_persist_file_states(cbm_store_t *store, const char *project,
+                                     const cbm_file_info_t *files, int file_count,
+                                     int64_t generation, const char *pass_fingerprint) {
+    if (!store || !project || !project[0] || file_count < 0 || (file_count > 0 && !files) ||
+        generation < 0) {
+        return CBM_STORE_ERR;
+    }
+    int rc = cbm_store_begin(store);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    for (int i = 0; i < file_count; i++) {
+        if (!files[i].path || !files[i].rel_path || !files[i].rel_path[0]) {
+            (void)cbm_store_rollback(store);
+            return CBM_STORE_ERR;
+        }
+        struct stat st;
+        if (stat(files[i].path, &st) != 0) {
+            (void)cbm_store_rollback(store);
+            return CBM_STORE_ERR;
+        }
+        char content_hash[CBM_SZ_32];
+        if (cbm_pipeline_content_hash_file(files[i].path, content_hash, sizeof(content_hash)) !=
+            CBM_STORE_OK) {
+            (void)cbm_store_rollback(store);
+            return CBM_STORE_ERR;
+        }
+        char indexed_at[CBM_SZ_32];
+        if (delta_iso_now(indexed_at, sizeof(indexed_at)) != CBM_STORE_OK) {
+            (void)cbm_store_rollback(store);
+            return CBM_STORE_ERR;
+        }
+        cbm_file_state_t state = {.project = project,
+                                  .rel_path = files[i].rel_path,
+                                  .content_hash = content_hash,
+                                  .git_oid = NULL,
+                                  .mtime_ns = cbm_pipeline_stat_mtime_ns(&st),
+                                  .size = st.st_size,
+                                  .language = cbm_language_name(files[i].language),
+                                  .pass_fingerprint = pass_fingerprint ? pass_fingerprint
+                                                                       : cbm_delta_pass_fingerprint_v1,
+                                  .generation = generation,
+                                  .indexed_at = indexed_at};
+        rc = cbm_store_upsert_file_state(store, &state);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(store);
+            return rc;
+        }
+    }
+    rc = cbm_store_commit(store);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(store);
+        return rc;
+    }
+    return CBM_STORE_OK;
+}
+
 int cbm_pipeline_attach_file_delta_metadata(cbm_pipeline_file_delta_t *delta,
                                             const cbm_file_info_t *file) {
     if (!delta || !file || !file->path || !delta->delta.project || !delta->delta.rel_path ||
