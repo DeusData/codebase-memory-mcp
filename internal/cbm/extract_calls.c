@@ -257,6 +257,14 @@ static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *so
             strcmp(fk, "value_identifier") == 0 || strcmp(fk, "value_identifier_path") == 0) {
             return cbm_node_text(a, func_node, source);
         }
+        /* C++ explicit template call f<T>(args): return the `name` child so
+         * the textual callee matches LSP's bare resolved function name. */
+        if (strcmp(fk, "template_function") == 0) {
+            TSNode tname = ts_node_child_by_field_name(func_node, TS_FIELD("name"));
+            if (!ts_node_is_null(tname)) {
+                return cbm_node_text(a, tname, source);
+            }
+        }
         // R member call: module$fn() — function node is an extract_operator
         // with lhs (object) and rhs (method). Emit "module.fn" so it resolves
         // like other member calls (#219). Previously dropped → no CALLS edge.
@@ -1175,6 +1183,190 @@ static void extract_jsx_component_ref(CBMExtractCtx *ctx, TSNode node, const cha
     }
 }
 
+/* Kotlin operator/convention syntax and Java/C++ implicit syntax can represent
+ * real calls without a call_expression node. These helpers add the textual
+ * CBMCall records required for existing type-aware LSP resolutions to join. */
+static void push_synthetic_call(CBMExtractCtx *ctx, TSNode node, const char *callee,
+                                const char *enclosing_func_qn) {
+    if (!callee || !callee[0]) {
+        return;
+    }
+    CBMCall call = {0};
+    call.callee_name = callee;
+    call.enclosing_func_qn = enclosing_func_qn;
+    call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
+    cbm_calls_push(&ctx->result->calls, ctx->arena, call);
+}
+
+static void extract_kotlin_operator_call(CBMExtractCtx *ctx, TSNode node, const char *kind,
+                                         const char *enclosing_func_qn) {
+    if (strcmp(kind, "binary_expression") != 0 && strcmp(kind, "additive_expression") != 0 &&
+        strcmp(kind, "multiplicative_expression") != 0 &&
+        strcmp(kind, "comparison_expression") != 0 && strcmp(kind, "equality_expression") != 0 &&
+        strcmp(kind, "range_expression") != 0) {
+        return;
+    }
+
+    uint32_t ncc = ts_node_named_child_count(node);
+    TSNode lhs = ts_node_child_by_field_name(node, TS_FIELD("left"));
+    TSNode rhs = ts_node_child_by_field_name(node, TS_FIELD("right"));
+    if (ts_node_is_null(lhs) && ncc >= 1) {
+        lhs = ts_node_named_child(node, 0);
+    }
+    if (ts_node_is_null(rhs) && ncc >= 2) {
+        rhs = ts_node_named_child(node, ncc - 1);
+    }
+    if (ts_node_is_null(lhs) || ts_node_is_null(rhs)) {
+        return;
+    }
+
+    uint32_t lhs_end = ts_node_end_byte(lhs);
+    uint32_t rhs_start = ts_node_start_byte(rhs);
+    if (rhs_start <= lhs_end) {
+        return;
+    }
+    const char *between = ctx->source + lhs_end;
+    size_t blen = (size_t)(rhs_start - lhs_end);
+    const char *op_method = NULL;
+    if (cbm_memmem(between, blen, "===", 3) || cbm_memmem(between, blen, "!==", 3)) {
+        return;
+    }
+    if (cbm_memmem(between, blen, "==", 2) || cbm_memmem(between, blen, "!=", 2)) {
+        op_method = "equals";
+    } else if (cbm_memmem(between, blen, "..<", 3)) {
+        op_method = "rangeUntil";
+    } else if (cbm_memmem(between, blen, "..", 2)) {
+        op_method = "rangeTo";
+    } else if (cbm_memmem(between, blen, "<", 1) || cbm_memmem(between, blen, ">", 1)) {
+        op_method = "compareTo";
+    } else if (cbm_memmem(between, blen, "+", 1)) {
+        op_method = "plus";
+    } else if (cbm_memmem(between, blen, "-", 1)) {
+        op_method = "minus";
+    } else if (cbm_memmem(between, blen, "*", 1)) {
+        op_method = "times";
+    } else if (cbm_memmem(between, blen, "/", 1)) {
+        op_method = "div";
+    } else if (cbm_memmem(between, blen, "%", 1)) {
+        op_method = "rem";
+    }
+    push_synthetic_call(ctx, node, op_method, enclosing_func_qn);
+}
+
+static void extract_kotlin_desugared_calls(CBMExtractCtx *ctx, TSNode node, const char *kind,
+                                           const char *enclosing_func_qn) {
+    if (strcmp(kind, "property_declaration") == 0) {
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode c = ts_node_named_child(node, i);
+            if (strcmp(ts_node_type(c), "multi_variable_declaration") != 0) {
+                continue;
+            }
+            uint32_t vc = ts_node_named_child_count(c);
+            uint32_t comp = 0;
+            for (uint32_t j = 0; j < vc; j++) {
+                TSNode v = ts_node_named_child(c, j);
+                if (strcmp(ts_node_type(v), "variable_declaration") != 0) {
+                    continue;
+                }
+                comp++;
+                push_synthetic_call(ctx, node, cbm_arena_sprintf(ctx->arena, "component%u", comp),
+                                    enclosing_func_qn);
+            }
+            break;
+        }
+    } else if (strcmp(kind, "for_statement") == 0) {
+        push_synthetic_call(ctx, node, "iterator", enclosing_func_qn);
+        push_synthetic_call(ctx, node, "hasNext", enclosing_func_qn);
+        push_synthetic_call(ctx, node, "next", enclosing_func_qn);
+    }
+}
+
+static void extract_cpp_operator_call(CBMExtractCtx *ctx, TSNode node, const char *kind,
+                                      const char *enclosing_func_qn) {
+    if (strcmp(kind, "binary_expression") != 0) {
+        return;
+    }
+    TSNode lhs = ts_node_child_by_field_name(node, TS_FIELD("left"));
+    TSNode rhs = ts_node_child_by_field_name(node, TS_FIELD("right"));
+    if (ts_node_is_null(lhs) || ts_node_is_null(rhs)) {
+        return;
+    }
+    for (uint32_t i = 0; i < ts_node_child_count(node); i++) {
+        TSNode child = ts_node_child(node, i);
+        if (ts_node_is_named(child)) {
+            continue;
+        }
+        char *op = cbm_node_text(ctx->arena, child, ctx->source);
+        if (op && op[0]) {
+            push_synthetic_call(ctx, node, cbm_arena_sprintf(ctx->arena, "operator%s", op),
+                                enclosing_func_qn);
+        }
+        break;
+    }
+}
+
+static void extract_cpp_implicit_calls(CBMExtractCtx *ctx, TSNode node, const char *kind,
+                                       const char *enclosing_func_qn) {
+    const char *callee = NULL;
+    if (strcmp(kind, "delete_expression") == 0) {
+        TSNode operand = ts_node_child_by_field_name(node, TS_FIELD("argument"));
+        if (ts_node_is_null(operand) && ts_node_named_child_count(node) > 0) {
+            operand = ts_node_named_child(node, 0);
+        }
+        if (!ts_node_is_null(operand)) {
+            callee = cbm_node_text(ctx->arena, operand, ctx->source);
+        }
+    } else if (strcmp(kind, "if_statement") == 0 || strcmp(kind, "while_statement") == 0 ||
+               strcmp(kind, "do_statement") == 0) {
+        TSNode cond = ts_node_child_by_field_name(node, TS_FIELD("condition"));
+        if (!ts_node_is_null(cond)) {
+            TSNode inner = cond;
+            if (strcmp(ts_node_type(cond), "condition_clause") == 0 &&
+                ts_node_named_child_count(cond) == 1) {
+                inner = ts_node_named_child(cond, 0);
+            }
+            if (strcmp(ts_node_type(inner), "identifier") == 0) {
+                callee = "operator bool";
+            }
+        }
+    } else if (strcmp(kind, "declaration") == 0) {
+        TSNode type = ts_node_child_by_field_name(node, TS_FIELD("type"));
+        TSNode decl = ts_node_child_by_field_name(node, TS_FIELD("declarator"));
+        if (!ts_node_is_null(type) && !ts_node_is_null(decl) &&
+            strcmp(ts_node_type(decl), "init_declarator") == 0) {
+            TSNode value = ts_node_child_by_field_name(decl, TS_FIELD("value"));
+            if (!ts_node_is_null(value) && strcmp(ts_node_type(value), "identifier") == 0) {
+                char *tn = cbm_node_text(ctx->arena, type, ctx->source);
+                if (tn) {
+                    const char *colon = strrchr(tn, ':');
+                    callee = colon ? colon + 1 : tn;
+                }
+            }
+        }
+    }
+    push_synthetic_call(ctx, node, callee, enclosing_func_qn);
+}
+
+static void extract_java_method_reference(CBMExtractCtx *ctx, TSNode node, const char *kind,
+                                          const char *enclosing_func_qn) {
+    if (strcmp(kind, "method_reference") != 0) {
+        return;
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    if (nc < 1) {
+        return;
+    }
+    char *mname = NULL;
+    if (nc >= 2) {
+        mname = cbm_node_text(ctx->arena, ts_node_named_child(node, nc - 1), ctx->source);
+    }
+    if (!mname || !mname[0]) {
+        mname = "new";
+    }
+    push_synthetic_call(ctx, node, mname, enclosing_func_qn);
+}
+
 void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state) {
     if (!spec->call_node_types || !spec->call_node_types[0]) {
         return;
@@ -1235,5 +1427,19 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
 
     if (ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_JAVASCRIPT) {
         extract_jsx_component_ref(ctx, node, ts_node_type(node), state->enclosing_func_qn);
+    }
+
+    if (ctx->language == CBM_LANG_JAVA) {
+        extract_java_method_reference(ctx, node, ts_node_type(node), state->enclosing_func_qn);
+    }
+
+    if (ctx->language == CBM_LANG_KOTLIN) {
+        extract_kotlin_operator_call(ctx, node, ts_node_type(node), state->enclosing_func_qn);
+        extract_kotlin_desugared_calls(ctx, node, ts_node_type(node), state->enclosing_func_qn);
+    }
+
+    if (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) {
+        extract_cpp_operator_call(ctx, node, ts_node_type(node), state->enclosing_func_qn);
+        extract_cpp_implicit_calls(ctx, node, ts_node_type(node), state->enclosing_func_qn);
     }
 }
