@@ -478,8 +478,18 @@ TEST(default_tool_autoindex_description_is_precise) {
     ASSERT_NOT_NULL(strstr(json, "already indexed/current project"));
     ASSERT_NOT_NULL(strstr(json, "Does not index projects"));
     ASSERT_NULL(strstr(json, "Default tools auto-index"));
+    ASSERT_NULL(strstr(json, "INSTEAD OF"));
 
     free(json);
+
+    char *saved_mode = save_tool_mode();
+    setenv("CBM_TOOL_MODE", "classic", 1);
+    char *classic = cbm_mcp_tools_list(NULL);
+    restore_tool_mode(saved_mode);
+    ASSERT_NOT_NULL(classic);
+    ASSERT_NULL(strstr(classic, "INSTEAD OF"));
+    free(classic);
+
     PASS();
 }
 
