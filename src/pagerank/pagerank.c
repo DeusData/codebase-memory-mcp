@@ -210,6 +210,7 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     int *total_in = NULL, *total_out = NULL;
     int *calls_in = NULL, *calls_out = NULL;
     double *w_in = NULL;
+    double *lr_in = NULL;
     id_map_t map = {0};
     int N = 0, E = 0, result = -1;
     bool pagerank_written = false;
@@ -457,19 +458,30 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
         stmt = NULL;
     }
 
+    if (total_in) {
+        lr_in = calloc((size_t)N, sizeof(double));
+    }
+
     const char *lr_sql =
         "INSERT OR REPLACE INTO linkrank "
         "(edge_id, project, rank, computed_at) "
         "VALUES (?1, ?2, ?3, ?4)";
     sqlite3_stmt *lr_stmt = NULL;
-    if (sqlite3_prepare_v2(db, lr_sql, -1, &lr_stmt, NULL) == SQLITE_OK) {
+    bool have_lr_stmt = sqlite3_prepare_v2(db, lr_sql, -1, &lr_stmt, NULL) == SQLITE_OK;
+    if (have_lr_stmt) {
         linkrank_written = true;
         sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
-        for (int e = 0; e < E; e++) {
-            int s_idx = edges[e].src_idx;
-            double lr = 0.0;
-            if (out_weight[s_idx] > 0.0)
-                lr = rank[s_idx] * edges[e].weight / out_weight[s_idx];
+    }
+    for (int e = 0; e < E; e++) {
+        int s_idx = edges[e].src_idx;
+        double lr = 0.0;
+        if (out_weight[s_idx] > 0.0) {
+            lr = rank[s_idx] * edges[e].weight / out_weight[s_idx];
+        }
+        if (lr_in) {
+            lr_in[edges[e].dst_idx] += lr;
+        }
+        if (have_lr_stmt) {
             sqlite3_bind_int64(lr_stmt, 1, edges[e].edge_id);
             sqlite3_bind_text(lr_stmt, 2, edges[e].project, -1, SQLITE_TRANSIENT);
             sqlite3_bind_double(lr_stmt, 3, lr);
@@ -479,23 +491,15 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
             }
             sqlite3_reset(lr_stmt);
         }
+    }
+    if (have_lr_stmt) {
         sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
         sqlite3_finalize(lr_stmt);
+        lr_stmt = NULL;
     }
 
     /* ── Step 7: Compute and store node_degree ──────────── */
     if (total_in) {
-        /* Accumulate linkrank_in per destination node */
-        double *lr_in = calloc((size_t)N, sizeof(double));
-        if (lr_in) {
-            for (int e = 0; e < E; e++) {
-                int s_idx = edges[e].src_idx;
-                if (out_weight[s_idx] > 0.0) {
-                    double lr = rank[s_idx] * edges[e].weight / out_weight[s_idx];
-                    lr_in[edges[e].dst_idx] += lr;
-                }
-            }
-        }
         /* Clear old degree data */
         snprintf(sql_buf, sizeof(sql_buf), "DELETE FROM node_degree WHERE %s",
                  scope_where(CBM_RANK_SCOPE_FULL));
@@ -534,7 +538,6 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
             sqlite3_finalize(deg_stmt);
         }
         sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
-        free(lr_in);
     }
 
     /* ── Logging ──────────────────────────────────────────── */
@@ -587,6 +590,7 @@ cleanup:
     free(calls_in);
     free(calls_out);
     free(w_in);
+    free(lr_in);
     return result;
 }
 
