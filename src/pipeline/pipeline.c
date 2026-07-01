@@ -117,6 +117,7 @@ struct cbm_pipeline {
     int committed_nodes;
     int committed_edges;
     bool graph_changed;
+    cbm_pipeline_publish_kind_t publish_kind;
 };
 
 /* ── Global pkgmap (one active pipeline at a time) ─────────────── */
@@ -187,6 +188,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->committed_nodes = -1;
     p->committed_edges = -1;
     p->graph_changed = false;
+    p->publish_kind = CBM_PIPELINE_PUBLISH_NONE;
     atomic_init(&p->cancelled, 0);
 
     return p;
@@ -397,9 +399,19 @@ bool cbm_pipeline_graph_changed(const cbm_pipeline_t *p) {
     return p && p->graph_changed;
 }
 
+cbm_pipeline_publish_kind_t cbm_pipeline_publish_kind(const cbm_pipeline_t *p) {
+    return p ? p->publish_kind : CBM_PIPELINE_PUBLISH_NONE;
+}
+
 void cbm_pipeline_set_graph_changed(cbm_pipeline_t *p, bool changed) {
     if (p) {
         p->graph_changed = changed;
+    }
+}
+
+void cbm_pipeline_set_publish_kind(cbm_pipeline_t *p, cbm_pipeline_publish_kind_t kind) {
+    if (p) {
+        p->publish_kind = kind;
     }
 }
 
@@ -1242,6 +1254,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         return CBM_NOT_FOUND;
     }
     p->graph_changed = false;
+    p->publish_kind = CBM_PIPELINE_PUBLISH_NONE;
     p->committed_nodes = -1;
     p->committed_edges = -1;
 
@@ -1426,6 +1439,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
             goto cleanup;
         }
         cbm_pipeline_set_graph_changed(p, true);
+        cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_FULL);
         cbm_log_info("pass.timing", "pass", "dump", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
         /* Persist file hashes so next run can use incremental path.

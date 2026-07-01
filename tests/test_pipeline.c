@@ -8326,6 +8326,7 @@ TEST(incremental_full_then_noop) {
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
     char *project = strdup(cbm_pipeline_project_name(p));
     cbm_pipeline_free(p);
 
@@ -8344,6 +8345,7 @@ TEST(incremental_full_then_noop) {
     cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     ASSERT_FALSE(cbm_pipeline_graph_changed(p));
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_NOOP);
     cbm_pipeline_free(p);
 
     s = cbm_store_open_path(g_incr_dbpath);
@@ -8498,6 +8500,7 @@ TEST(incremental_fast_exact_upsert_matches_full_rebuild) {
     ASSERT_EQ(run_rc, 0);
     ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
     ASSERT(strstr(logs, "msg=incremental.exact.done files=1") != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
     cbm_pipeline_free(p);
 
     ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "NewLeaf"));
@@ -8561,6 +8564,7 @@ TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild) {
     ASSERT_EQ(run_rc, 0);
     ASSERT(strstr(logs, "msg=incremental.classify changed=2") != NULL);
     ASSERT(strstr(logs, "msg=incremental.exact.done files=2") != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
     cbm_pipeline_free(p);
 
     ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "NewMain"));
@@ -8639,6 +8643,7 @@ TEST(incremental_fast_three_file_batch_falls_back_to_full_rebuild_parity) {
     ASSERT_NOT_NULL(p);
     cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
     cbm_pipeline_free(p);
 
     ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "NewMain"));
