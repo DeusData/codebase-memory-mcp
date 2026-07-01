@@ -631,6 +631,11 @@ int cbm_store_publish_file_delta_batch(cbm_store_t *s,
 int cbm_store_publish_file_delta_batch_complete(cbm_store_t *s,
                                                 const cbm_store_file_delta_t *const *deltas,
                                                 int delta_count);
+int cbm_store_apply_file_delta_batch_complete(cbm_store_t *s,
+                                              const cbm_store_file_delta_t *const *delete_deltas,
+                                              int delete_count,
+                                              const cbm_store_file_delta_t *const *upsert_deltas,
+                                              int upsert_count);
 
 /* Delete all canonical graph and freshness metadata owned by one file in one transaction.
  * If non-empty derived_view_name is set, mark that per-file derived view stale too.

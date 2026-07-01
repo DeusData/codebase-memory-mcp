@@ -1214,6 +1214,8 @@ int cbm_pipeline_plan_file_delta_batch(cbm_store_t *store,
     }
 
     const char *project = NULL;
+    int delete_count = 0;
+    int upsert_count = 0;
     for (int i = 0; i < delta_count; i++) {
         const cbm_pipeline_file_delta_t *delta = deltas[i];
         if (!delta || !delta->delta.project || !delta->delta.rel_path) {
@@ -1224,10 +1226,18 @@ int cbm_pipeline_plan_file_delta_batch(cbm_store_t *store,
         } else if (strcmp(project, delta->delta.project) != 0) {
             return CBM_STORE_OK;
         }
-        if (delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE && delta_count != 1) {
-            delta_plan_set_fallback(out, cbm_delta_reason_delete_batch_requires_full);
-            return CBM_STORE_OK;
+        if (delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE) {
+            delete_count++;
+        } else {
+            upsert_count++;
         }
+    }
+    if (delete_count > 0 && upsert_count == 0 && delta_count != 1) {
+        delta_plan_set_fallback(out, cbm_delta_reason_delete_batch_requires_full);
+        return CBM_STORE_OK;
+    }
+    for (int i = 0; i < delta_count; i++) {
+        const cbm_pipeline_file_delta_t *delta = deltas[i];
         if (!delta_plan_precheck_common(delta, out)) {
             return CBM_STORE_OK;
         }
@@ -1345,6 +1355,45 @@ int cbm_pipeline_apply_file_delta_batch(cbm_store_t *store,
         if (rc != CBM_STORE_OK) {
             delta_plan_set_fallback(out, cbm_delta_reason_publish_error);
             return CBM_STORE_OK;
+        }
+        return CBM_STORE_OK;
+    }
+
+    int delete_count = 0;
+    int upsert_count = 0;
+    for (int i = 0; i < delta_count; i++) {
+        if (deltas[i] && deltas[i]->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE) {
+            delete_count++;
+        } else {
+            upsert_count++;
+        }
+    }
+    if (delete_count > 0) {
+        const cbm_store_file_delta_t **delete_deltas =
+            malloc((size_t)delete_count * sizeof(*delete_deltas));
+        const cbm_store_file_delta_t **upsert_deltas =
+            upsert_count > 0 ? malloc((size_t)upsert_count * sizeof(*upsert_deltas)) : NULL;
+        if (!delete_deltas || (upsert_count > 0 && !upsert_deltas)) {
+            free(delete_deltas);
+            free(upsert_deltas);
+            delta_plan_set_fallback(out, cbm_delta_reason_preflight_error);
+            return CBM_STORE_OK;
+        }
+        int di = 0;
+        int ui = 0;
+        for (int i = 0; i < delta_count; i++) {
+            if (deltas[i]->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE) {
+                delete_deltas[di++] = &deltas[i]->delta;
+            } else {
+                upsert_deltas[ui++] = &deltas[i]->delta;
+            }
+        }
+        rc = cbm_store_apply_file_delta_batch_complete(store, delete_deltas, delete_count,
+                                                       upsert_deltas, upsert_count);
+        free(delete_deltas);
+        free(upsert_deltas);
+        if (rc != CBM_STORE_OK) {
+            delta_plan_set_fallback(out, cbm_delta_reason_publish_error);
         }
         return CBM_STORE_OK;
     }
