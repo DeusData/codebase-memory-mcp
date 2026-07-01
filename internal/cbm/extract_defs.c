@@ -1274,6 +1274,23 @@ static bool annotation_is_class_route_prefix(const char *name) {
     return name && (strcmp(name, "RequestMapping") == 0 || strcmp(name, "Path") == 0);
 }
 
+/* Path from one class-level @RequestMapping / @Path annotation, or NULL. */
+static const char *prefix_path_from_class_annotation(CBMArena *a, TSNode ann, const char *source) {
+    TSNode name_node = annotation_name_node(ann);
+    if (ts_node_is_null(name_node)) {
+        return NULL;
+    }
+    char *name = cbm_node_text(a, name_node, source);
+    if (!annotation_is_class_route_prefix(name)) {
+        return NULL;
+    }
+    TSNode args = annotation_args_node(ann);
+    if (ts_node_is_null(args)) {
+        return NULL;
+    }
+    return extract_route_path_from_args(a, args, source);
+}
+
 /* Scan class/declaration annotations for @RequestMapping / @Path prefix (issue #734). */
 static const char *extract_class_route_prefix(CBMArena *a, TSNode class_node, const char *source,
                                               const CBMLangSpec *spec) {
@@ -1285,19 +1302,9 @@ static const char *extract_class_route_prefix(CBMArena *a, TSNode class_node, co
         if (!cbm_kind_in_set(prev, spec->decorator_node_types)) {
             break;
         }
-        TSNode name_node = annotation_name_node(prev);
-        if (!ts_node_is_null(name_node)) {
-            char *name = cbm_node_text(a, name_node, source);
-            if (annotation_is_class_route_prefix(name)) {
-                TSNode args = annotation_args_node(prev);
-                const char *path = NULL;
-                if (!ts_node_is_null(args)) {
-                    path = extract_route_path_from_args(a, args, source);
-                }
-                if (path) {
-                    return path;
-                }
-            }
+        const char *path = prefix_path_from_class_annotation(a, prev, source);
+        if (path) {
+            return path;
         }
         prev = ts_node_prev_sibling(prev);
     }
@@ -1309,19 +1316,7 @@ static const char *extract_class_route_prefix(CBMArena *a, TSNode class_node, co
             if (!cbm_kind_in_set(mchild, spec->decorator_node_types)) {
                 continue;
             }
-            TSNode name_node = annotation_name_node(mchild);
-            if (ts_node_is_null(name_node)) {
-                continue;
-            }
-            char *name = cbm_node_text(a, name_node, source);
-            if (!annotation_is_class_route_prefix(name)) {
-                continue;
-            }
-            TSNode args = annotation_args_node(mchild);
-            const char *path = NULL;
-            if (!ts_node_is_null(args)) {
-                path = extract_route_path_from_args(a, args, source);
-            }
+            const char *path = prefix_path_from_class_annotation(a, mchild, source);
             if (path) {
                 return path;
             }

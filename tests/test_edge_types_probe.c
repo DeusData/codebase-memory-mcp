@@ -161,6 +161,9 @@ static int et_route_qn_present(const EtFile *files, int nfiles, const char *http
     if (!ok) {
         fprintf(stderr, "  [ET-ROUTE] FAIL qn=%s not in store\n", route_qn);
     }
+    if (ok) {
+        cbm_node_free_fields(&found);
+    }
     et_cleanup(&lp, store);
     return ok;
 }
