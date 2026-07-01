@@ -33,6 +33,11 @@ enum {
 };
 
 static const char STORE_TEST_INVALID_DERIVED_STATUS[] = "fresh-ish";
+static const char *const STORE_TEST_GRAPH_DERIVED_VIEWS[] = {
+    CBM_STORE_DERIVED_VIEW_PAGERANK,        CBM_STORE_DERIVED_VIEW_LINKRANK,
+    CBM_STORE_DERIVED_VIEW_NODE_DEGREE,     CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
+    CBM_STORE_DERIVED_VIEW_ROUTES,          CBM_STORE_DERIVED_VIEW_ARCHITECTURE,
+};
 
 static int store_count_index_generation(cbm_store_t *s, const char *project, int64_t generation,
                                         const char *status, const char *repo_fingerprint,
@@ -128,6 +133,28 @@ static int store_count_derived_view_state(cbm_store_t *s, const char *project,
     }
     sqlite3_finalize(stmt);
     return count;
+}
+
+static int store_count_stale_graph_derived_views(cbm_store_t *s, const char *project,
+                                                 int64_t generation) {
+    int total = 0;
+    for (size_t i = 0; i < sizeof(STORE_TEST_GRAPH_DERIVED_VIEWS) /
+                               sizeof(STORE_TEST_GRAPH_DERIVED_VIEWS[0]);
+         i++) {
+        int count =
+            store_count_derived_view_state(s, project, STORE_TEST_GRAPH_DERIVED_VIEWS[i],
+                                           generation, CBM_STORE_DERIVED_STATUS_STALE);
+        if (count < 0) {
+            return count;
+        }
+        total += count;
+    }
+    return total;
+}
+
+static int store_graph_derived_view_count(void) {
+    return (int)(sizeof(STORE_TEST_GRAPH_DERIVED_VIEWS) /
+                 sizeof(STORE_TEST_GRAPH_DERIVED_VIEWS[0]));
 }
 
 static int store_string_array_contains(char **items, int count, const char *needle) {
@@ -1562,6 +1589,8 @@ TEST(store_file_delta_publish_multifile_generation) {
                                            CBM_STORE_INDEX_STATUS_COMPLETE, "", "",
                                            STORE_TEST_COMPLETED_SET),
               1);
+    ASSERT_EQ(store_count_stale_graph_derived_views(s, "test", FINAL_GENERATION),
+              store_graph_derived_view_count());
 
     cbm_store_close(s);
     PASS();
@@ -1676,6 +1705,71 @@ TEST(store_file_delta_batch_publish_rolls_back_all_files) {
                                            CBM_STORE_INDEX_STATUS_FAILED, "", "",
                                            STORE_TEST_COMPLETED_SET),
               1);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_file_delta_batch_complete_marks_graph_views_stale) {
+    enum { BATCH_GENERATION = 1, BATCH_DELTA_COUNT = 1 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, BATCH_GENERATION);
+
+    cbm_node_t helper_nodes[1] = {{.project = "test",
+                                   .label = "Function",
+                                   .name = "Helper",
+                                   .qualified_name = "test.helper.Helper",
+                                   .file_path = "helper.go",
+                                   .properties_json = "{}"}};
+    cbm_file_hash_t helper_hash = {.project = "test",
+                                   .rel_path = "helper.go",
+                                   .sha256 = "helper-hash",
+                                   .mtime_ns = 1,
+                                   .size = 10};
+    cbm_file_state_t helper_state = {.project = "test",
+                                     .rel_path = "helper.go",
+                                     .content_hash = "helper-content",
+                                     .git_oid = "",
+                                     .mtime_ns = 1,
+                                     .size = 10,
+                                     .language = "c",
+                                     .pass_fingerprint = "pass-a",
+                                     .generation = BATCH_GENERATION,
+                                     .indexed_at = "2026-06-30T00:00:00Z"};
+    cbm_store_symbol_export_t helper_exports[1] = {
+        {.qualified_name = "test.helper.Helper", .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_store_file_delta_t helper_delta = {.project = "test",
+                                           .rel_path = "helper.go",
+                                           .generation = BATCH_GENERATION,
+                                           .file_hash = &helper_hash,
+                                           .file_state = &helper_state,
+                                           .nodes = helper_nodes,
+                                           .node_count = 1,
+                                           .exports = helper_exports,
+                                           .export_count = 1,
+                                           .derived_view_name = CBM_STORE_DERIVED_VIEW_NODES_FTS,
+                                           .derived_status = CBM_STORE_DERIVED_STATUS_COMPLETE};
+    const cbm_store_file_delta_t *deltas[BATCH_DELTA_COUNT] = {&helper_delta};
+    ASSERT_EQ(cbm_store_publish_file_delta_batch_complete(s, deltas, BATCH_DELTA_COUNT),
+              CBM_STORE_OK);
+
+    ASSERT_EQ(store_node_qn_exists(s, "test", "test.helper.Helper"), 1);
+    ASSERT_EQ(store_count_index_generation(s, "test", BATCH_GENERATION,
+                                           CBM_STORE_INDEX_STATUS_COMPLETE, "", "",
+                                           STORE_TEST_COMPLETED_SET),
+              1);
+    ASSERT_EQ(store_count_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_NODES_FTS,
+                                             BATCH_GENERATION,
+                                             CBM_STORE_DERIVED_STATUS_COMPLETE),
+              1);
+    ASSERT_EQ(store_count_stale_graph_derived_views(s, "test", BATCH_GENERATION),
+              store_graph_derived_view_count());
 
     cbm_store_close(s);
     PASS();
@@ -1859,6 +1953,8 @@ TEST(store_file_delta_publish_commits_graph_and_metadata) {
     ASSERT_EQ(store_count_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_NODES_FTS, 2,
                                              CBM_STORE_DERIVED_STATUS_COMPLETE),
               1);
+    ASSERT_EQ(store_count_stale_graph_derived_views(s, "test", 2),
+              store_graph_derived_view_count());
 
     cbm_store_close(s);
     PASS();
@@ -1896,6 +1992,8 @@ TEST(store_file_delta_delete_cleans_graph_and_metadata) {
     ASSERT_EQ(store_count_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_NODES_FTS,
                                              DELETE_GENERATION, CBM_STORE_DERIVED_STATUS_STALE),
               1);
+    ASSERT_EQ(store_count_stale_graph_derived_views(s, "test", DELETE_GENERATION),
+              store_graph_derived_view_count());
 
     cbm_file_hash_t *hashes = NULL;
     int hash_count = 0;
@@ -3117,6 +3215,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_file_delta_publish_failure_finishes_generation_failed);
     RUN_TEST(store_file_delta_publish_multifile_generation);
     RUN_TEST(store_file_delta_batch_publish_rolls_back_all_files);
+    RUN_TEST(store_file_delta_batch_complete_marks_graph_views_stale);
     RUN_TEST(store_file_delta_batch_complete_rolls_back_when_generation_missing);
     RUN_TEST(store_file_delta_publish_commits_graph_and_metadata);
     RUN_TEST(store_file_delta_delete_cleans_graph_and_metadata);

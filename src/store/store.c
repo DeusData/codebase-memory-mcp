@@ -2524,6 +2524,36 @@ static bool store_derived_status_valid(const char *status) {
                       strcmp(status, CBM_STORE_DERIVED_STATUS_COMPLETE) == 0);
 }
 
+static const char *const store_graph_derived_view_names[] = {
+    CBM_STORE_DERIVED_VIEW_PAGERANK,        CBM_STORE_DERIVED_VIEW_LINKRANK,
+    CBM_STORE_DERIVED_VIEW_NODE_DEGREE,     CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
+    CBM_STORE_DERIVED_VIEW_ROUTES,          CBM_STORE_DERIVED_VIEW_ARCHITECTURE,
+};
+
+static int store_graph_derived_view_count(void) {
+    return (int)(sizeof(store_graph_derived_view_names) / sizeof(store_graph_derived_view_names[0]));
+}
+
+static int store_mark_derived_views_stale_body(cbm_store_t *s, const char *project,
+                                               int64_t generation,
+                                               const char *const *view_names, int view_count) {
+    for (int i = 0; i < view_count; i++) {
+        int rc = store_upsert_derived_view_state(s, project, view_names[i], generation,
+                                                 CBM_STORE_DERIVED_STATUS_STALE);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+    }
+    return CBM_STORE_OK;
+}
+
+static int store_mark_graph_derived_views_stale_body(cbm_store_t *s, const char *project,
+                                                     int64_t generation) {
+    return store_mark_derived_views_stale_body(s, project, generation,
+                                               store_graph_derived_view_names,
+                                               store_graph_derived_view_count());
+}
+
 int cbm_store_set_derived_view_state(cbm_store_t *s, const char *project,
                                      const char *view_name, int64_t generation,
                                      const char *status) {
@@ -2578,13 +2608,10 @@ int cbm_store_mark_derived_views_stale(cbm_store_t *s, const char *project,
     if (rc != CBM_STORE_OK) {
         return rc;
     }
-    for (int i = 0; i < view_count; i++) {
-        rc = store_upsert_derived_view_state(s, project, view_names[i], generation,
-                                             CBM_STORE_DERIVED_STATUS_STALE);
-        if (rc != CBM_STORE_OK) {
-            (void)cbm_store_rollback(s);
-            return rc;
-        }
+    rc = store_mark_derived_views_stale_body(s, project, generation, view_names, view_count);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
     }
     rc = cbm_store_commit(s);
     if (rc != CBM_STORE_OK) {
@@ -2972,6 +2999,11 @@ int cbm_store_delete_file_delta(cbm_store_t *s, const char *project, const char 
         (void)cbm_store_rollback(s);
         return rc;
     }
+    rc = store_mark_graph_derived_views_stale_body(s, project, generation);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
     rc = cbm_store_commit(s);
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(s);
@@ -3079,6 +3111,11 @@ int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *d
         (void)cbm_store_rollback(s);
         return rc;
     }
+    rc = store_mark_graph_derived_views_stale_body(s, delta->project, delta->generation);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
     rc = cbm_store_commit(s);
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(s);
@@ -3090,7 +3127,9 @@ int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *d
 int cbm_store_publish_file_delta_batch(cbm_store_t *s,
                                        const cbm_store_file_delta_t *const *deltas,
                                        int delta_count) {
-    if (!s || !store_file_delta_batch_shape_valid(deltas, delta_count, NULL, NULL)) {
+    const char *project = NULL;
+    int64_t generation = -1;
+    if (!s || !store_file_delta_batch_shape_valid(deltas, delta_count, &project, &generation)) {
         return CBM_STORE_ERR;
     }
 
@@ -3104,6 +3143,11 @@ int cbm_store_publish_file_delta_batch(cbm_store_t *s,
             (void)cbm_store_rollback(s);
             return rc;
         }
+    }
+    rc = store_mark_graph_derived_views_stale_body(s, project, generation);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
     }
     rc = cbm_store_commit(s);
     if (rc != CBM_STORE_OK) {
@@ -3133,6 +3177,11 @@ int cbm_store_publish_file_delta_batch_complete(cbm_store_t *s,
             (void)cbm_store_rollback(s);
             return rc;
         }
+    }
+    rc = store_mark_graph_derived_views_stale_body(s, project, generation);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
     }
     rc = store_finish_index_generation_body(s, project, generation, CBM_STORE_INDEX_STATUS_COMPLETE);
     if (rc != CBM_STORE_OK) {
