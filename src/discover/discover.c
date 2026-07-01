@@ -419,6 +419,11 @@ typedef struct {
     int excluded_cap;
 } file_list_t;
 
+typedef struct {
+    cbm_gitignore_t *ignore;
+    cbm_gitignore_t *negation_overrides;
+} cbmignore_matchers_t;
+
 static void file_list_add_excluded(file_list_t *fl, const char *rel_path) {
     if (!rel_path || rel_path[0] == '\0') {
         return;
@@ -473,14 +478,115 @@ static const char *local_rel_path(const char *rel_path, const char *local_prefix
     return rel_path;
 }
 
+static char *read_text_file(const char *path) {
+    if (!path) {
+        return NULL;
+    }
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return NULL;
+    }
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        (void)fclose(f);
+        return NULL;
+    }
+    long size = ftell(f);
+    if (size < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        (void)fclose(f);
+        return NULL;
+    }
+
+    char *buf = malloc((size_t)size + SKIP_ONE);
+    if (!buf) {
+        (void)fclose(f);
+        return NULL;
+    }
+
+    size_t n = fread(buf, SKIP_ONE, (size_t)size, f);
+    buf[n] = '\0';
+    (void)fclose(f);
+    return buf;
+}
+
+static cbm_gitignore_t *parse_cbmignore_negation_overrides(const char *content) {
+    if (!content) {
+        return NULL;
+    }
+
+    /* Invert pattern polarity so a true match means the last matching rule was negated. */
+    size_t len = strlen(content);
+    char *inverted = malloc(len * PAIR_LEN + SKIP_ONE);
+    if (!inverted) {
+        return NULL;
+    }
+
+    const char *line = content;
+    char *out = inverted;
+    while (*line) {
+        const char *eol = strchr(line, '\n');
+        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
+
+        if (line_len == 0 || line[0] == '#') {
+            memcpy(out, line, line_len);
+            out += line_len;
+        } else if (line[0] == '!') {
+            if (line_len > SKIP_ONE) {
+                memcpy(out, line + SKIP_ONE, line_len - SKIP_ONE);
+                out += line_len - SKIP_ONE;
+            }
+        } else {
+            *out++ = '!';
+            memcpy(out, line, line_len);
+            out += line_len;
+        }
+
+        if (!eol) {
+            break;
+        }
+        *out++ = '\n';
+        line = eol + SKIP_ONE;
+    }
+    *out = '\0';
+
+    cbm_gitignore_t *gi = cbm_gitignore_parse(inverted);
+    free(inverted);
+    return gi;
+}
+
+static cbmignore_matchers_t load_cbmignore_matchers(const char *path) {
+    cbmignore_matchers_t matchers = {0};
+    char *content = read_text_file(path);
+    if (!content) {
+        return matchers;
+    }
+
+    matchers.ignore = cbm_gitignore_parse(content);
+    matchers.negation_overrides = parse_cbmignore_negation_overrides(content);
+    free(content);
+    return matchers;
+}
+
+static void free_cbmignore_matchers(cbmignore_matchers_t *matchers) {
+    if (!matchers) {
+        return;
+    }
+    cbm_gitignore_free(matchers->ignore);
+    cbm_gitignore_free(matchers->negation_overrides);
+}
+
 /* Check if a directory entry should be skipped (hardcoded dirs + gitignore). */
 static bool should_skip_directory(const char *entry_name, const char *rel_path,
                                   const cbm_discover_opts_t *opts, const cbm_gitignore_t *gitignore,
                                   const cbm_gitignore_t *global_gi,
-                                  const cbm_gitignore_t *cbmignore, const cbm_gitignore_t *local_gi,
-                                  const char *local_gi_prefix) {
+                                  const cbm_gitignore_t *cbmignore,
+                                  const cbm_gitignore_t *cbmignore_negation_overrides,
+                                  const cbm_gitignore_t *local_gi, const char *local_gi_prefix) {
     if (cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL)) {
-        return true;
+        if (!cbm_gitignore_matches(cbmignore_negation_overrides, rel_path, true)) {
+            return true;
+        }
     }
     if (gitignore && cbm_gitignore_matches(gitignore, rel_path, true)) {
         return true;
@@ -656,8 +762,9 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
                                    const cbm_discover_opts_t *opts,
                                    const cbm_gitignore_t *gitignore,
                                    const cbm_gitignore_t *global_gi,
-                                   const cbm_gitignore_t *cbmignore, walk_frame_t *stack, int *top,
-                                   file_list_t *out) {
+                                   const cbm_gitignore_t *cbmignore,
+                                   const cbm_gitignore_t *cbmignore_negation_overrides,
+                                   walk_frame_t *stack, int *top, file_list_t *out) {
     char abs_path[CBM_SZ_4K];
     char rel_path[CBM_SZ_4K];
     snprintf(abs_path, sizeof(abs_path), "%s/%s", frame->dir, entry->name);
@@ -674,7 +781,8 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
 
     if (S_ISDIR(st.st_mode)) {
         if (!should_skip_directory(entry->name, rel_path, opts, gitignore, global_gi, cbmignore,
-                                   frame->local_gi, frame->local_gi_prefix)) {
+                                   cbmignore_negation_overrides, frame->local_gi,
+                                   frame->local_gi_prefix)) {
             walk_push_subdir(stack, top, abs_path, rel_path, frame);
         } else {
             /* Record the excluded subtree root so callers can report it (#411). */
@@ -690,7 +798,8 @@ enum { GI_OWNED_CAP = 64 };
 
 static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_discover_opts_t *opts,
                      const cbm_gitignore_t *gitignore, const cbm_gitignore_t *global_gi,
-                     const cbm_gitignore_t *cbmignore, file_list_t *out) {
+                     const cbm_gitignore_t *cbmignore,
+                     const cbm_gitignore_t *cbmignore_negation_overrides, file_list_t *out) {
     walk_frame_t *stack = calloc(WALK_STACK_CAP, sizeof(walk_frame_t));
     if (!stack) {
         return;
@@ -724,8 +833,8 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
 
         cbm_dirent_t *entry;
         while ((entry = cbm_readdir(d)) != NULL) {
-            walk_dir_process_entry(entry, &frame, opts, gitignore, global_gi, cbmignore, stack,
-                                   &top, out);
+            walk_dir_process_entry(entry, &frame, opts, gitignore, global_gi, cbmignore,
+                                   cbmignore_negation_overrides, stack, &top, out);
         }
         cbm_closedir(d);
     }
@@ -808,22 +917,23 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
     }
 
     /* Load cbmignore if specified or exists at repo root */
-    cbm_gitignore_t *cbmignore = NULL;
+    cbmignore_matchers_t cbmignore = {0};
     if (opts && opts->ignore_file) {
-        cbmignore = cbm_gitignore_load(opts->ignore_file);
+        cbmignore = load_cbmignore_matchers(opts->ignore_file);
     } else {
         snprintf(gi_path, sizeof(gi_path), "%s/.cbmignore", repo_path);
-        cbmignore = cbm_gitignore_load(gi_path);
+        cbmignore = load_cbmignore_matchers(gi_path);
     }
 
     /* Walk */
     file_list_t fl = {0};
-    walk_dir(repo_path, "", opts, gitignore, global_gi, cbmignore, &fl);
+    walk_dir(repo_path, "", opts, gitignore, global_gi, cbmignore.ignore,
+             cbmignore.negation_overrides, &fl);
 
     /* Cleanup */
     cbm_gitignore_free(gitignore);
     cbm_gitignore_free(global_gi);
-    cbm_gitignore_free(cbmignore);
+    free_cbmignore_matchers(&cbmignore);
 
     *out = fl.files;
     *count = fl.count;

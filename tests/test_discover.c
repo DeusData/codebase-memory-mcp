@@ -920,12 +920,132 @@ TEST(discover_git_info_exclude_stacks_with_gitignore) {
     bool found_log = false;
     bool found_scratch = false;
     for (int i = 0; i < count; i++) {
-        if (strstr(files[i].rel_path, ".log"))    found_log     = true;
-        if (strstr(files[i].rel_path, "scratch")) found_scratch = true;
+        if (strstr(files[i].rel_path, ".log"))
+            found_log = true;
+        if (strstr(files[i].rel_path, "scratch"))
+            found_scratch = true;
     }
     ASSERT_FALSE(found_log);
     ASSERT_FALSE(found_scratch);
     ASSERT_TRUE(strstr(files[0].rel_path, "main.go") != NULL);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_cbmignore_negates_always_skip_dir) {
+    char *base = th_mktempdir("cbm_disc_cbmi_neg_obj");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, ".cbmignore"), "!obj/\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "obj/generated.go"), "package obj\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 2);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "main.go"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "obj/generated.go"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_always_skip_dir_without_negation) {
+    char *base = th_mktempdir("cbm_disc_obj_default");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "obj/generated.go"), "package obj\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "main.go"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "obj/generated.go"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_cbmignore_negates_only_nested_skip_dir) {
+    char *base = th_mktempdir("cbm_disc_cbmi_neg_nested");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, ".cbmignore"), "!src/target/\n");
+    th_write_file(TH_PATH(base, "src/main.go"), "package src\n");
+    th_write_file(TH_PATH(base, "src/target/lib.go"), "package target\n");
+    th_write_file(TH_PATH(base, "other/target/lib.go"), "package other\n");
+    th_write_file(TH_PATH(base, "target/root.go"), "package root\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 2);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "src/main.go"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "src/target/lib.go"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "other/target/lib.go"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "target/root.go"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_cbmignore_positive_dir_does_not_unskip_builtin) {
+    char *base = th_mktempdir("cbm_disc_cbmi_pos_obj");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, ".cbmignore"), "obj/\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "obj/generated.go"), "package obj\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "main.go"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "obj/generated.go"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_cbmignore_negates_fast_skip_dir) {
+    char *base = th_mktempdir("cbm_disc_cbmi_neg_fast");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, ".cbmignore"), "!docs/\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "docs/guide.go"), "package docs\n");
+
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FAST};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 2);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "main.go"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "docs/guide.go"));
 
     cbm_discover_free(files, count);
     th_cleanup(base);
@@ -1104,6 +1224,11 @@ SUITE(discover) {
     RUN_TEST(discover_generic_dirs_fast_mode);
     RUN_TEST(discover_deploy_excluded_full_mode);
     RUN_TEST(discover_cbmignore_no_git);
+    RUN_TEST(discover_cbmignore_negates_always_skip_dir);
+    RUN_TEST(discover_always_skip_dir_without_negation);
+    RUN_TEST(discover_cbmignore_negates_only_nested_skip_dir);
+    RUN_TEST(discover_cbmignore_positive_dir_does_not_unskip_builtin);
+    RUN_TEST(discover_cbmignore_negates_fast_skip_dir);
 
     /* .git/info/exclude support (issue #489) */
     RUN_TEST(discover_git_info_exclude);
