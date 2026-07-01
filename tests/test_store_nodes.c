@@ -2773,6 +2773,16 @@ TEST(store_find_node_ids_by_qns) {
     ASSERT_EQ(ids[1], id2);
     ASSERT_EQ(ids[2], 0); /* missing → 0 */
 
+    const char *mixed_qns[] = {"test.A", NULL, "test.B", "test.A", "other.C"};
+    int64_t mixed_ids[5];
+    int mixed_found = cbm_store_find_node_ids_by_qns(s, "test", mixed_qns, 5, mixed_ids);
+    ASSERT_EQ(mixed_found, 3);
+    ASSERT_EQ(mixed_ids[0], id1);
+    ASSERT_EQ(mixed_ids[1], 0);
+    ASSERT_EQ(mixed_ids[2], id2);
+    ASSERT_EQ(mixed_ids[3], id1);
+    ASSERT_EQ(mixed_ids[4], 0);
+
     /* Empty batch */
     int found2 = cbm_store_find_node_ids_by_qns(s, "test", NULL, 0, ids);
     ASSERT_EQ(found2, 0);
