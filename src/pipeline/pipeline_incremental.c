@@ -552,7 +552,13 @@ static void run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *change
         CBMFileResult **cache = (CBMFileResult **)calloc(ci, sizeof(CBMFileResult *));
         if (cache) {
             cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-            cbm_parallel_extract(ctx, changed_files, ci, cache, &shared_ids, worker_count);
+            const cbm_parallel_extract_opts_t extract_opts = {
+                .retain_sources = false,
+                .retain_sources_set = true,
+            };
+
+            cbm_parallel_extract_ex(ctx, changed_files, ci, cache, &shared_ids, worker_count,
+                                    &extract_opts);
             cbm_gbuf_set_next_id(ctx->gbuf, atomic_load(&shared_ids));
             cbm_log_info("pass.timing", "pass", "incr_extract", "elapsed_ms",
                          itoa_buf((int)elapsed_ms(t)));

@@ -111,8 +111,10 @@ static cbm_gbuf_t *run_sequential(const char *project, const char *repo_path,
 
 /* ── Run parallel pipeline on files, returning gbuf ───────────────── */
 
-static cbm_gbuf_t *run_parallel(const char *project, const char *repo_path, cbm_file_info_t *files,
-                                int file_count, int worker_count) {
+static cbm_gbuf_t *run_parallel_with_extract_opts(const char *project, const char *repo_path,
+                                                  cbm_file_info_t *files, int file_count,
+                                                  int worker_count,
+                                                  const cbm_parallel_extract_opts_t *extract_opts) {
     cbm_gbuf_t *gbuf = cbm_gbuf_new(project, repo_path);
     cbm_registry_t *reg = cbm_registry_new();
     atomic_int cancelled;
@@ -130,10 +132,15 @@ static cbm_gbuf_t *run_parallel(const char *project, const char *repo_path, cbm_
     int64_t gbuf_next = cbm_gbuf_next_id(gbuf);
     atomic_init(&shared_ids, gbuf_next);
 
-    CBMFileResult **result_cache = calloc(file_count, sizeof(CBMFileResult *));
+    CBMFileResult **result_cache = calloc((size_t)file_count, sizeof(CBMFileResult *));
 
     cbm_init();
-    cbm_parallel_extract(&ctx, files, file_count, result_cache, &shared_ids, worker_count);
+    if (extract_opts) {
+        cbm_parallel_extract_ex(&ctx, files, file_count, result_cache, &shared_ids, worker_count,
+                                extract_opts);
+    } else {
+        cbm_parallel_extract(&ctx, files, file_count, result_cache, &shared_ids, worker_count);
+    }
     cbm_gbuf_set_next_id(gbuf, atomic_load(&shared_ids));
 
     cbm_build_registry_from_cache(&ctx, files, file_count, result_cache);
@@ -172,6 +179,12 @@ static cbm_gbuf_t *run_parallel(const char *project, const char *repo_path, cbm_
 
     cbm_registry_free(reg);
     return gbuf;
+}
+
+static cbm_gbuf_t *run_parallel(const char *project, const char *repo_path, cbm_file_info_t *files,
+                                int file_count, int worker_count) {
+    return run_parallel_with_extract_opts(project, repo_path, files, file_count, worker_count,
+                                          NULL);
 }
 
 /* ── Parity Tests ─────────────────────────────────────────────────── */
@@ -662,6 +675,69 @@ TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges) {
     PASS();
 }
 
+TEST(parallel_python_lsp_cross_file_reads_unretained_source) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_pylsp_xf_nosrc_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+
+    char gpath[512];
+    snprintf(gpath, sizeof(gpath), "%s/greeter.py", tmpdir);
+    FILE *gf = fopen(gpath, "w");
+    if (!gf) {
+        FAIL("fopen greeter.py failed");
+    }
+    fprintf(gf, "class Greeter:\n"
+                "    def hello(self):\n"
+                "        return 'hi'\n");
+    fclose(gf);
+
+    char apath[512];
+    snprintf(apath, sizeof(apath), "%s/app.py", tmpdir);
+    FILE *af = fopen(apath, "w");
+    if (!af) {
+        unlink(gpath);
+        rmdir(tmpdir);
+        FAIL("fopen app.py failed");
+    }
+    fprintf(af, "from greeter import Greeter\n"
+                "\n"
+                "def main():\n"
+                "    g = Greeter()\n"
+                "    g.hello()\n");
+    fclose(af);
+
+    cbm_file_info_t files[2] = {0};
+    files[0].path = gpath;
+    files[0].rel_path = (char *)"greeter.py";
+    files[0].language = CBM_LANG_PYTHON;
+    files[1].path = apath;
+    files[1].rel_path = (char *)"app.py";
+    files[1].language = CBM_LANG_PYTHON;
+
+    cbm_parallel_extract_opts_t extract_opts = {
+        .retain_sources = false,
+        .retain_sources_set = true,
+    };
+    cbm_gbuf_t *gbuf = run_parallel_with_extract_opts("cbm_par_pylsp_xf_nosrc", tmpdir, files, 2, 2,
+                                                      &extract_opts);
+    ASSERT_NOT_NULL(gbuf);
+
+    lsp_edge_count_ctx_t c = {0};
+    cbm_gbuf_foreach_edge(gbuf, count_lsp_call_edges, &c);
+
+    ASSERT_GT(c.total_calls, 0);
+    ASSERT_GT(c.lsp_strategy_count, 0);
+
+    cbm_gbuf_free(gbuf);
+
+    unlink(apath);
+    unlink(gpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
 /* issue #294: gRPC service-name extraction must (a) preserve the canonical
  * proto service name (FooServiceClient → FooService, not Foo) and (b) only
  * match real stub/client types — ordinary receiver vars must NOT produce
@@ -719,6 +795,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_node_count);
     RUN_TEST(parallel_python_lsp_override_emits_lsp_strategy_edges);
     RUN_TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges);
+    RUN_TEST(parallel_python_lsp_cross_file_reads_unretained_source);
     RUN_TEST(parallel_calls_parity);
     RUN_TEST(parallel_defines_parity);
     RUN_TEST(parallel_defines_method_parity);
