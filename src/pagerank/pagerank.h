@@ -27,6 +27,10 @@ struct cbm_config;
 #define CBM_CONFIG_PAGERANK_DAMPING  "pagerank_damping"
 #define CBM_CONFIG_PAGERANK_EPSILON  "pagerank_epsilon"
 #define CBM_CONFIG_RANK_SCOPE        "rank_scope"
+#define CBM_CONFIG_RANK_REFRESH      "rank_refresh"
+
+#define CBM_RANK_REFRESH_EAGER          "eager"
+#define CBM_RANK_REFRESH_STALE_ON_EXACT "stale_on_exact"
 
 /* Config keys for edge type weights (all doubles, override via `config set`) */
 #define CBM_CONFIG_EDGE_WEIGHT_CALLS          "edge_weight_calls"
@@ -106,12 +110,14 @@ int cbm_pagerank_compute_with_config(cbm_store_t *store, const char *project,
 
 /* Refresh rank-derived views after an index run when needed.
  * Computes when the graph changed, dependencies were reindexed, or existing
- * PageRank/LinkRank/node_degree views are missing/incomplete. Returns ranked
- * node count from compute, 0 when skipped, or -1 on invalid input/compute error.
- * cfg may be NULL (uses defaults). */
+ * PageRank/LinkRank/node_degree views are missing/incomplete. With
+ * rank_refresh=stale_on_exact, an exact incremental publish may defer rank
+ * recompute only when rank-derived views are already marked stale. Returns
+ * ranked node count from compute, 0 when skipped/deferred, or -1 on invalid
+ * input/compute error. cfg may be NULL (uses defaults). */
 int cbm_pagerank_refresh_if_needed(cbm_store_t *store, const char *project,
                                    struct cbm_config *cfg, bool graph_changed,
-                                   int deps_reindexed);
+                                   int deps_reindexed, bool exact_incremental_publish);
 
 /* True only when PageRank, LinkRank, and node_degree derived views are all
  * recorded complete for the project. Missing rows return false so callers

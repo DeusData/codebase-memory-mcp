@@ -181,6 +181,24 @@ static cbm_rank_scope_t rank_scope_from_config(cbm_config_t *cfg) {
     return CBM_DEFAULT_RANK_SCOPE;
 }
 
+typedef enum {
+    CBM_RANK_REFRESH_POLICY_EAGER = 0,
+    CBM_RANK_REFRESH_POLICY_STALE_ON_EXACT,
+} cbm_rank_refresh_policy_t;
+
+static cbm_rank_refresh_policy_t rank_refresh_policy_from_config(cbm_config_t *cfg) {
+    const char *policy = cfg ? cbm_config_get(cfg, CBM_CONFIG_RANK_REFRESH,
+                                             CBM_RANK_REFRESH_EAGER)
+                             : CBM_RANK_REFRESH_EAGER;
+    if (!policy || !policy[0] || strcmp(policy, CBM_RANK_REFRESH_EAGER) == 0) {
+        return CBM_RANK_REFRESH_POLICY_EAGER;
+    }
+    if (strcmp(policy, CBM_RANK_REFRESH_STALE_ON_EXACT) == 0) {
+        return CBM_RANK_REFRESH_POLICY_STALE_ON_EXACT;
+    }
+    return CBM_RANK_REFRESH_POLICY_EAGER;
+}
+
 /* ── Core PageRank + LinkRank ────────────────────────────────── */
 
 int cbm_pagerank_compute(cbm_store_t *store, const char *project,
@@ -631,27 +649,19 @@ int cbm_pagerank_compute_with_config(cbm_store_t *store, const char *project,
         max_iter, &w, scope);
 }
 
-int cbm_pagerank_refresh_if_needed(cbm_store_t *store, const char *project,
-                                   cbm_config_t *cfg, bool graph_changed,
-                                   int deps_reindexed) {
-    if (!store || !project || !project[0]) {
-        return -1;
+static bool pagerank_view_has_status(cbm_store_t *store, const char *project, const char *view,
+                                     const char *status) {
+    cbm_derived_view_state_t state = {0};
+    bool matches = false;
+    if (cbm_store_get_derived_view_state(store, project, view, &state) == CBM_STORE_OK) {
+        matches = state.status && strcmp(state.status, status) == 0;
     }
-    if (graph_changed || deps_reindexed > 0 || !cbm_pagerank_views_complete(store, project)) {
-        return cbm_pagerank_compute_with_config(store, project, cfg);
-    }
-    cbm_log_info("pagerank.skip", "project", project, "reason", "graph_unchanged");
-    return 0;
+    cbm_store_derived_view_state_free_fields(&state);
+    return matches;
 }
 
 static bool pagerank_view_complete(cbm_store_t *store, const char *project, const char *view) {
-    cbm_derived_view_state_t state = {0};
-    bool complete = false;
-    if (cbm_store_get_derived_view_state(store, project, view, &state) == CBM_STORE_OK) {
-        complete = state.status && strcmp(state.status, CBM_STORE_DERIVED_STATUS_COMPLETE) == 0;
-    }
-    cbm_store_derived_view_state_free_fields(&state);
-    return complete;
+    return pagerank_view_has_status(store, project, view, CBM_STORE_DERIVED_STATUS_COMPLETE);
 }
 
 bool cbm_pagerank_views_complete(cbm_store_t *store, const char *project) {
@@ -661,6 +671,37 @@ bool cbm_pagerank_views_complete(cbm_store_t *store, const char *project) {
     return pagerank_view_complete(store, project, CBM_STORE_DERIVED_VIEW_PAGERANK) &&
            pagerank_view_complete(store, project, CBM_STORE_DERIVED_VIEW_LINKRANK) &&
            pagerank_view_complete(store, project, CBM_STORE_DERIVED_VIEW_NODE_DEGREE);
+}
+
+static bool pagerank_views_stale(cbm_store_t *store, const char *project) {
+    if (!store || !project || !project[0]) {
+        return false;
+    }
+    return pagerank_view_has_status(store, project, CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                    CBM_STORE_DERIVED_STATUS_STALE) &&
+           pagerank_view_has_status(store, project, CBM_STORE_DERIVED_VIEW_LINKRANK,
+                                    CBM_STORE_DERIVED_STATUS_STALE) &&
+           pagerank_view_has_status(store, project, CBM_STORE_DERIVED_VIEW_NODE_DEGREE,
+                                    CBM_STORE_DERIVED_STATUS_STALE);
+}
+
+int cbm_pagerank_refresh_if_needed(cbm_store_t *store, const char *project,
+                                   cbm_config_t *cfg, bool graph_changed,
+                                   int deps_reindexed, bool exact_incremental_publish) {
+    if (!store || !project || !project[0]) {
+        return -1;
+    }
+    if (!graph_changed && deps_reindexed <= 0 && cbm_pagerank_views_complete(store, project)) {
+        cbm_log_info("pagerank.skip", "project", project, "reason", "graph_unchanged");
+        return 0;
+    }
+    if (graph_changed && deps_reindexed <= 0 && exact_incremental_publish &&
+        rank_refresh_policy_from_config(cfg) == CBM_RANK_REFRESH_POLICY_STALE_ON_EXACT &&
+        pagerank_views_stale(store, project)) {
+        cbm_log_info("pagerank.defer", "project", project, "reason", "exact_delta_stale_views");
+        return 0;
+    }
+    return cbm_pagerank_compute_with_config(store, project, cfg);
 }
 
 double cbm_pagerank_get(cbm_store_t *store, int64_t node_id) {

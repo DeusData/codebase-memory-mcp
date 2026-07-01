@@ -4968,6 +4968,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     srv->active_pipeline = p;
     int rc = cbm_pipeline_run(p);
     bool graph_changed = cbm_pipeline_graph_changed(p);
+    cbm_pipeline_publish_kind_t publish_kind = cbm_pipeline_publish_kind(p);
     srv->active_pipeline = NULL;
     cbm_pipeline_unlock();
 
@@ -5003,8 +5004,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             int deps_reindexed = cbm_dep_auto_index(
                 project_name, repo_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT, srv->config);
 
-            (void)cbm_pagerank_refresh_if_needed(store, project_name, srv->config, graph_changed,
-                                                 deps_reindexed);
+            (void)cbm_pagerank_refresh_if_needed(
+                store, project_name, srv->config, graph_changed, deps_reindexed,
+                publish_kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
             /* Register project with watcher so future file changes trigger auto-reindex */
             if (srv->watcher)
                 cbm_watcher_watch(srv->watcher, project_name, repo_path);
@@ -7339,6 +7341,7 @@ static void *autoindex_thread(void *arg) {
     cbm_pipeline_lock();
     int rc = cbm_pipeline_run(p);
     bool graph_changed = cbm_pipeline_graph_changed(p);
+    cbm_pipeline_publish_kind_t publish_kind = cbm_pipeline_publish_kind(p);
     cbm_pipeline_unlock();
 
     cbm_pipeline_free(p);
@@ -7349,8 +7352,9 @@ static void *autoindex_thread(void *arg) {
         if (store) {
             int deps_reindexed = cbm_dep_auto_index(srv->session_project, srv->session_root,
                                                     store, CBM_DEFAULT_AUTO_DEP_LIMIT, srv->config);
-            (void)cbm_pagerank_refresh_if_needed(store, srv->session_project, srv->config,
-                                                 graph_changed, deps_reindexed);
+            (void)cbm_pagerank_refresh_if_needed(
+                store, srv->session_project, srv->config, graph_changed, deps_reindexed,
+                publish_kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
         }
 
         cbm_log_info("autoindex.done", "project", srv->session_project);

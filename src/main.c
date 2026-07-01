@@ -186,6 +186,7 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
 
     int rc = cbm_pipeline_run(p);
     bool graph_changed = cbm_pipeline_graph_changed(p);
+    cbm_pipeline_publish_kind_t publish_kind = cbm_pipeline_publish_kind(p);
     cbm_pipeline_free(p);
 
     /* Re-index dependencies after fresh dump. Uses cbm_project_name_from_path
@@ -197,7 +198,9 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
             int deps_reindexed =
                 cbm_dep_auto_index(pname, root_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT, NULL);
             (void)cbm_pagerank_refresh_if_needed(store, pname, NULL, graph_changed,
-                                                 deps_reindexed);
+                                                 deps_reindexed,
+                                                 publish_kind ==
+                                                     CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
             cbm_store_close(store);
         }
         free(pname);

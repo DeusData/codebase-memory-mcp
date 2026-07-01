@@ -285,7 +285,7 @@ TEST(pagerank_refresh_if_needed_repairs_missing_views) {
     add_edge(s, "refresh_missing", a, b, "CALLS");
 
     ASSERT_FALSE(cbm_pagerank_views_complete(s, "refresh_missing"));
-    ASSERT_EQ(cbm_pagerank_refresh_if_needed(s, "refresh_missing", NULL, false, 0), 2);
+    ASSERT_EQ(cbm_pagerank_refresh_if_needed(s, "refresh_missing", NULL, false, 0, false), 2);
     ASSERT_TRUE(cbm_pagerank_views_complete(s, "refresh_missing"));
     ASSERT_EQ(count_table_rows(s, "pagerank"), 2);
 
@@ -301,7 +301,7 @@ TEST(pagerank_refresh_if_needed_skips_complete_unchanged_graph) {
     add_edge(s, "refresh_skip", a, b, "CALLS");
 
     ASSERT_EQ(cbm_pagerank_compute_default(s, "refresh_skip"), 2);
-    ASSERT_EQ(cbm_pagerank_refresh_if_needed(s, "refresh_skip", NULL, false, 0), 0);
+    ASSERT_EQ(cbm_pagerank_refresh_if_needed(s, "refresh_skip", NULL, false, 0, false), 0);
     ASSERT_EQ(count_table_rows(s, "pagerank"), 2);
 
     cbm_store_close(s);
@@ -316,7 +316,7 @@ TEST(pagerank_refresh_if_needed_recomputes_changed_graph) {
     int64_t b = add_node(s, "refresh_changed", "b");
     add_edge(s, "refresh_changed", a, b, "CALLS");
 
-    ASSERT_EQ(cbm_pagerank_refresh_if_needed(s, "refresh_changed", NULL, true, 0), 2);
+    ASSERT_EQ(cbm_pagerank_refresh_if_needed(s, "refresh_changed", NULL, true, 0, false), 2);
     ASSERT_EQ(count_table_rows(s, "pagerank"), 2);
 
     cbm_store_close(s);
@@ -333,9 +333,80 @@ TEST(pagerank_refresh_if_needed_recomputes_reindexed_deps) {
     int64_t dep = add_node(s, "refresh_deps.dep.lib", "dep");
     add_edge(s, "refresh_deps", app, dep, "CALLS");
 
-    ASSERT_EQ(cbm_pagerank_refresh_if_needed(s, "refresh_deps", NULL, false, 1), 2);
+    ASSERT_EQ(cbm_pagerank_refresh_if_needed(s, "refresh_deps", NULL, false, 1, false), 2);
     ASSERT_TRUE(get_pr(s, dep) > 0.0);
 
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pagerank_refresh_stale_on_exact_defers_only_with_stale_rank_views) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "refresh_policy", "/tmp/refresh_policy");
+    int64_t a = add_node(s, "refresh_policy", "a");
+    int64_t b = add_node(s, "refresh_policy", "b");
+    add_edge(s, "refresh_policy", a, b, "CALLS");
+
+    char tmpdir[CBM_PATH_MAX];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/pr-refresh-XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(tmpdir) != NULL);
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_REFRESH, CBM_RANK_REFRESH_STALE_ON_EXACT), 0);
+
+    ASSERT_EQ(cbm_pagerank_compute_default(s, "refresh_policy"), 2);
+    int64_t c = add_node(s, "refresh_policy", "c");
+    add_edge(s, "refresh_policy", b, c, "CALLS");
+    const char *rank_views[] = {CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                CBM_STORE_DERIVED_VIEW_LINKRANK,
+                                CBM_STORE_DERIVED_VIEW_NODE_DEGREE};
+    int rank_view_count = (int)(sizeof(rank_views) / sizeof(rank_views[0]));
+    ASSERT_EQ(cbm_store_mark_derived_views_stale(s, "refresh_policy",
+                                                 CBM_STORE_DERIVED_GENERATION_UNKNOWN,
+                                                 rank_views, rank_view_count),
+              CBM_STORE_OK);
+
+    ASSERT_EQ(cbm_pagerank_refresh_if_needed(s, "refresh_policy", cfg, true, 0, true), 0);
+    ASSERT_FALSE(cbm_pagerank_views_complete(s, "refresh_policy"));
+    ASSERT_EQ(count_table_rows(s, "pagerank"), 2);
+
+    ASSERT_EQ(cbm_pagerank_refresh_if_needed(s, "refresh_policy", cfg, true, 0, false), 3);
+    ASSERT_TRUE(cbm_pagerank_views_complete(s, "refresh_policy"));
+    ASSERT_EQ(count_table_rows(s, "pagerank"), 3);
+
+    cbm_config_close(cfg);
+    th_rmtree(tmpdir);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pagerank_refresh_invalid_policy_uses_eager_default) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "refresh_invalid_policy", "/tmp/refresh_invalid_policy");
+    int64_t a = add_node(s, "refresh_invalid_policy", "a");
+    int64_t b = add_node(s, "refresh_invalid_policy", "b");
+    add_edge(s, "refresh_invalid_policy", a, b, "CALLS");
+
+    char tmpdir[CBM_PATH_MAX];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/pr-refresh-bad-XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(tmpdir) != NULL);
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_REFRESH, "bogus"), 0);
+
+    const char *rank_views[] = {CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                CBM_STORE_DERIVED_VIEW_LINKRANK,
+                                CBM_STORE_DERIVED_VIEW_NODE_DEGREE};
+    int rank_view_count = (int)(sizeof(rank_views) / sizeof(rank_views[0]));
+    ASSERT_EQ(cbm_store_mark_derived_views_stale(s, "refresh_invalid_policy",
+                                                 CBM_STORE_DERIVED_GENERATION_UNKNOWN,
+                                                 rank_views, rank_view_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pagerank_refresh_if_needed(s, "refresh_invalid_policy", cfg, true, 0, true), 2);
+    ASSERT_TRUE(cbm_pagerank_views_complete(s, "refresh_invalid_policy"));
+
+    cbm_config_close(cfg);
+    th_rmtree(tmpdir);
     cbm_store_close(s);
     PASS();
 }
@@ -1148,6 +1219,8 @@ SUITE(pagerank) {
     RUN_TEST(pagerank_refresh_if_needed_skips_complete_unchanged_graph);
     RUN_TEST(pagerank_refresh_if_needed_recomputes_changed_graph);
     RUN_TEST(pagerank_refresh_if_needed_recomputes_reindexed_deps);
+    RUN_TEST(pagerank_refresh_stale_on_exact_defers_only_with_stale_rank_views);
+    RUN_TEST(pagerank_refresh_invalid_policy_uses_eager_default);
     RUN_TEST(pagerank_recompute_replaces);
     RUN_TEST(pagerank_full_scope_includes_deps);
     RUN_TEST(pagerank_full_scope_preserves_dep_project_attribution);

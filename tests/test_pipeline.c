@@ -17,6 +17,7 @@
 #include "foundation/dump_verify.h"
 #include "foundation/log.h"
 #include "semantic/semantic.h"
+#include "pagerank/pagerank.h"
 #include "test_graph_diff.h"
 
 #include <sqlite3.h>
@@ -10137,6 +10138,16 @@ TEST(config_registry_includes_incremental_reindex_policy) {
     PASS();
 }
 
+TEST(config_registry_includes_rank_refresh_policy) {
+    const cbm_config_entry_t *entry = find_config_entry(CBM_CONFIG_RANK_REFRESH);
+    ASSERT_NOT_NULL(entry);
+    ASSERT_STR_EQ(entry->default_val, CBM_RANK_REFRESH_EAGER);
+    ASSERT_STR_EQ(entry->category, "PageRank");
+    ASSERT_STR_EQ(entry->range, "eager|stale_on_exact");
+    ASSERT_NOT_NULL(strstr(entry->guidance, CBM_RANK_REFRESH_STALE_ON_EXACT));
+    PASS();
+}
+
 TEST(trackable_source_files) {
     /* Common source extensions are trackable */
     ASSERT_TRUE(cbm_is_trackable_file("main.go"));
@@ -10749,6 +10760,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_semantic_corpus_vectors_independent_of_worker_count);
     RUN_TEST(config_registry_includes_mcp_timeout_knobs);
     RUN_TEST(config_registry_includes_incremental_reindex_policy);
+    RUN_TEST(config_registry_includes_rank_refresh_policy);
     RUN_TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths);
     RUN_TEST(pipeline_file_delta_scratch_seed_preserves_structure_roots);
     RUN_TEST(pipeline_file_delta_scratch_seed_supports_external_endpoint_descriptor);
