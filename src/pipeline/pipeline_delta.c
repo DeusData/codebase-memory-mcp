@@ -1072,6 +1072,19 @@ static bool delta_plan_affected_paths_in_batch(const cbm_pipeline_file_delta_pla
     return true;
 }
 
+static bool delta_batch_has_positive_generation(const cbm_pipeline_file_delta_t *const *deltas,
+                                                int delta_count) {
+    if (!deltas || delta_count <= 0) {
+        return false;
+    }
+    for (int i = 0; i < delta_count; i++) {
+        if (!deltas[i] || deltas[i]->delta.generation <= 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int cbm_pipeline_apply_file_delta_batch(cbm_store_t *store,
                                         const cbm_pipeline_file_delta_t *const *deltas,
                                         int delta_count, int max_affected_paths,
@@ -1083,6 +1096,10 @@ int cbm_pipeline_apply_file_delta_batch(cbm_store_t *store,
     }
     if (!delta_plan_affected_paths_in_batch(out, deltas, delta_count)) {
         delta_plan_set_fallback(out, cbm_delta_reason_frontier_requires_batch);
+        return CBM_STORE_OK;
+    }
+    if (!delta_batch_has_positive_generation(deltas, delta_count)) {
+        delta_plan_set_fallback(out, cbm_delta_reason_missing_generation);
         return CBM_STORE_OK;
     }
     if (delta_count == 1 && deltas[0] &&

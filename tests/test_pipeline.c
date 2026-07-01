@@ -3942,6 +3942,38 @@ TEST(pipeline_file_delta_apply_falls_back_on_publish_error) {
     PASS();
 }
 
+TEST(pipeline_file_delta_apply_falls_back_without_generation) {
+    enum { PIPELINE_DELTA_APPLY_ONE = 1 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, "test", "lib.go", "test.lib.Old"),
+              CBM_STORE_OK);
+
+    cbm_store_symbol_export_t exports[1] = {
+        {.qualified_name = "test.lib.Value", .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test", .rel_path = "lib.go", .exports = exports, .export_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+    delta.delta.generation = 0;
+    delta.file_state.generation = 0;
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, deltas, PIPELINE_DELTA_APPLY_ONE,
+                                                  CBM_SZ_4, &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "missing_generation");
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, "test", "test.lib.Value"), 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(pipeline_file_delta_plan_falls_back_without_existing_ownership) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -9402,6 +9434,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_state_persist_helper_rolls_back_on_failure);
     RUN_TEST(pipeline_file_delta_plan_candidate_from_frontier);
     RUN_TEST(pipeline_file_delta_apply_falls_back_on_publish_error);
+    RUN_TEST(pipeline_file_delta_apply_falls_back_without_generation);
     RUN_TEST(pipeline_file_delta_plan_falls_back_without_existing_ownership);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_external_inbound_edge);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unowned_structural_inbound_edge);
