@@ -208,6 +208,26 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
 
 #define CLI_USAGE "Usage: codebase-memory-mcp cli [--progress] [--json] <tool_name> [json_args]\n"
 
+static bool cli_args_request_help(int argc, char **argv) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void print_cli_help(void) {
+    fputs(CLI_USAGE, stdout);
+    fputs("\nOptions:\n", stdout);
+    fputs("  --json       Print the raw MCP tool-result JSON envelope\n", stdout);
+    fputs("  --progress   Print progress diagnostics to stderr during tool execution\n", stdout);
+    fputs("\nExamples:\n", stdout);
+    fputs("  codebase-memory-mcp cli search_graph '{\"query\":\"handler\"}'\n", stdout);
+    fputs("  codebase-memory-mcp cli --json trace_path '{\"function_name\":\"main\"}'\n", stdout);
+    fputs("\nRun `codebase-memory-mcp --help` for the default and advanced tool lists.\n", stdout);
+}
+
 /* Extract text content from MCP tool result envelope and print it.
  * MCP results: {"content":[{"type":"text","text":"..."}],"isError":...}
  * Returns 1 if the result was an error, 0 otherwise. */
@@ -366,8 +386,14 @@ static int handle_subcommand(int argc, char **argv) {
             return 0;
         }
         if (strcmp(argv[i], "cli") == 0) {
+            int cli_argc = argc - i - SKIP_ONE;
+            char **cli_argv = argv + i + SKIP_ONE;
+            if (cli_args_request_help(cli_argc, cli_argv)) {
+                print_cli_help();
+                return 0;
+            }
             cbm_mem_init(MAIN_RAM_FRACTION);
-            return run_cli(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
+            return run_cli(cli_argc, cli_argv);
         }
         if (strcmp(argv[i], "hook-augment") == 0) {
             cbm_mem_init(MAIN_RAM_FRACTION);
