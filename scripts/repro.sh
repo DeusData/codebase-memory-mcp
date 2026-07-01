@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # repro.sh — Build + run the cumulative BUG-REPRODUCTION suite (test-repro).
 #
 # Unlike test.sh (the gating suite, must be GREEN), this suite is RED by design:
