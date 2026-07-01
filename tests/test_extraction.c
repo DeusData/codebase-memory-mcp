@@ -1241,6 +1241,20 @@ TEST(objc_implementation) {
     PASS();
 }
 
+TEST(objc_method_call_attributed_to_method) {
+    CBMFileResult *r = extract("static int helper(int x) { return x + 1; }\n"
+                               "@implementation Calculator\n"
+                               "- (int)compute:(int)x { return helper(x); }\n"
+                               "@end\n",
+                               CBM_LANG_OBJC, "t", "Calculator.m");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "helper"));
+    ASSERT(has_call_enclosing(r, "helper", "Calculator.compute", NULL));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Dart top-level function --- */
 TEST(dart_top_level_function) {
     CBMFileResult *r = extract(
@@ -1254,6 +1268,17 @@ TEST(dart_top_level_function) {
     PASS();
 }
 
+TEST(dart_body_call_attributed_to_function) {
+    CBMFileResult *r =
+        extract("void helper() {\n  print('helper');\n}\n\nvoid run() {\n  helper();\n}\n",
+                CBM_LANG_DART, "t", "main.dart");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_enclosing(r, "helper", "run", NULL));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Rust enum --- */
 TEST(rust_enum) {
     CBMFileResult *r =
@@ -1261,6 +1286,20 @@ TEST(rust_enum) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_GTE(r->defs.count, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rust_impl_call_attributed_to_method) {
+    CBMFileResult *r = extract("struct Calc { base: i32 }\n\n"
+                               "impl Calc {\n"
+                               "  fn helper(&self, x: i32) -> i32 { self.base + x }\n"
+                               "  fn run(&self, y: i32) -> i32 { self.helper(y) }\n"
+                               "}\n",
+                               CBM_LANG_RUST, "t", "calc.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_enclosing(r, "helper", "Calc.run", NULL));
     cbm_free_result(r);
     PASS();
 }
@@ -3182,8 +3221,11 @@ SUITE(extraction) {
     RUN_TEST(swift_chained_call);
     RUN_TEST(objc_interface);
     RUN_TEST(objc_implementation);
+    RUN_TEST(objc_method_call_attributed_to_method);
     RUN_TEST(dart_top_level_function);
+    RUN_TEST(dart_body_call_attributed_to_function);
     RUN_TEST(rust_enum);
+    RUN_TEST(rust_impl_call_attributed_to_method);
     RUN_TEST(zig_struct);
     RUN_TEST(cpp_function);
     RUN_TEST(cpp_out_of_line_method_issue428);
