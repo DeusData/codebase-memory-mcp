@@ -1967,6 +1967,763 @@ TEST(tool_bad_project_name_no_overflow_issue235) {
 #undef ISSUE235_DBNAME
 
 /* ══════════════════════════════════════════════════════════════════
+ *  REPO_MAP — P4 token-budgeted, seed-aware query tool
+ *  (pai/p4-repo-map-query-tool test plan; pinned ACs: AC2, AC6; AC7 tool
+ *  legs in scope). All fixtures use an in-memory store pre-opened via
+ *  cbm_mcp_server_set_project so resolve_store's "already open" shortcut
+ *  serves the fixture data without touching disk (mirrors
+ *  tool_get_architecture_emits_populated_sections above).
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Create an in-memory server with `project` pre-registered (both as the
+ * server's current_project — so resolve_store never hits disk — and as a
+ * row in the `projects` table, so verify_project_indexed passes). */
+static cbm_mcp_server_t *rm_setup_server(const char *project) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_mcp_server_set_project(srv, project);
+    cbm_store_upsert_project(st, project, "/tmp/repo-map-test");
+    return srv;
+}
+
+/* Upsert a scored Function/Method/Class fixture node. `signature`, when
+ * non-NULL, is stored verbatim as the "signature" property (repo_map
+ * renders it directly — see rm_render rule documented on handle_repo_map).
+ * Returns the node id. */
+static int64_t rm_add_node(cbm_store_t *st, const char *project, const char *label,
+                           const char *name, const char *qn, const char *file_path,
+                           double importance, const char *signature) {
+    char props[512];
+    if (signature) {
+        snprintf(props, sizeof(props), "{\"importance\":%.6f,\"signature\":\"%s\"}", importance,
+                 signature);
+    } else {
+        snprintf(props, sizeof(props), "{\"importance\":%.6f}", importance);
+    }
+    cbm_node_t n = {0};
+    n.project = project;
+    n.label = label;
+    n.name = name;
+    n.qualified_name = qn;
+    n.file_path = file_path;
+    n.start_line = 1;
+    n.end_line = 2;
+    n.properties_json = props;
+    return cbm_store_upsert_node(st, &n);
+}
+
+/* Upsert a Function/Method/Class fixture node with NO "importance" key —
+ * the exact shape of every pre-P3 index (spec AC7's score-absence case). */
+static int64_t rm_add_node_no_score(cbm_store_t *st, const char *project, const char *label,
+                                    const char *name, const char *qn, const char *file_path) {
+    cbm_node_t n = {0};
+    n.project = project;
+    n.label = label;
+    n.name = name;
+    n.qualified_name = qn;
+    n.file_path = file_path;
+    n.start_line = 1;
+    n.end_line = 2;
+    n.properties_json = "{}";
+    return cbm_store_upsert_node(st, &n);
+}
+
+static void rm_add_edge(cbm_store_t *st, const char *project, int64_t src, int64_t dst,
+                        const char *type) {
+    cbm_edge_t e = {0};
+    e.project = project;
+    e.source_id = src;
+    e.target_id = dst;
+    e.type = type;
+    e.properties_json = "{}";
+    cbm_store_insert_edge(st, &e);
+}
+
+/* Three plain, unconnected symbols with distinct importance — the smallest
+ * fixture that has a well-defined global ranking. */
+static void rm_add_simple_fixture(cbm_store_t *st, const char *project) {
+    rm_add_node(st, project, "Function", "A", "qA", "pkg/a.go", 50.0, "A() error");
+    rm_add_node(st, project, "Function", "B", "qB", "pkg/b.go", 40.0, "B() error");
+    rm_add_node(st, project, "Function", "C", "qC", "pkg/c.go", 30.0, "C() error");
+}
+
+enum { RM_FANOUT_COUNT = 30 };
+
+/* 30 symbols in one file, descending importance, with a real-shaped
+ * signature — used to exercise the token-budget binary search (AC2a). */
+static void rm_add_budget_fixture(cbm_store_t *st, const char *project) {
+    char name[64];
+    char qn[96];
+    char sig[96];
+    for (int i = 0; i < RM_FANOUT_COUNT; i++) {
+        snprintf(name, sizeof(name), "f%02d", i);
+        snprintf(qn, sizeof(qn), "q.f%02d", i);
+        snprintf(sig, sizeof(sig), "f%02d(a, b, c int) (int, error)", i);
+        rm_add_node(st, project, "Function", name, qn, "pkg/file.go",
+                   (double)(RM_FANOUT_COUNT - i), sig);
+    }
+}
+
+/* Call repo_map and return the extracted inner JSON text (caller frees). */
+static char *rm_call(cbm_mcp_server_t *srv, const char *args_json) {
+    char *raw = cbm_mcp_handle_tool(srv, "repo_map", args_json);
+    char *text = extract_text_content(raw);
+    free(raw);
+    return text;
+}
+
+/* Read an integer field out of a repo_map response's inner JSON text. -1 if absent. */
+static long rm_json_int(const char *json, const char *key) {
+    if (!json) {
+        return -1;
+    }
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) {
+        return -1;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *val = root ? yyjson_obj_get(root, key) : NULL;
+    long result = (val && yyjson_is_int(val)) ? (long)yyjson_get_int(val) : -1;
+    yyjson_doc_free(doc);
+    return result;
+}
+
+/* Read a string field out of a repo_map response's inner JSON text (caller frees). NULL if absent. */
+static char *rm_json_str(const char *json, const char *key) {
+    if (!json) {
+        return NULL;
+    }
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *val = root ? yyjson_obj_get(root, key) : NULL;
+    char *result = (val && yyjson_is_str(val)) ? strdup(yyjson_get_str(val)) : NULL;
+    yyjson_doc_free(doc);
+    return result;
+}
+
+/* ── Row 1: registration + dispatch ──────────────────────────────── */
+
+TEST(repo_map_registered_in_tools_list) {
+    char *json = cbm_mcp_tools_list();
+    ASSERT_NOT_NULL(json);
+    const char *p = strstr(json, "\"repo_map\"");
+    ASSERT_NOT_NULL(p);
+    ASSERT_NOT_NULL(strstr(p, "\"project\""));
+    ASSERT_NOT_NULL(strstr(p, "\"seed_anchors\""));
+    ASSERT_NOT_NULL(strstr(p, "\"token_budget\""));
+    free(json);
+    PASS();
+}
+
+TEST(repo_map_dispatchable_via_full_jsonrpc) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-dispatch");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    rm_add_node(st, "rm-dispatch", "Function", "Foo", "rm-dispatch.Foo", "pkg/foo.go", 5.0,
+               "Foo() error");
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":500,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"repo_map\",\"arguments\":{\"project\":\"rm-dispatch\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":500"));
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"map\""));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── Row 2: AC2a token-budget fit ────────────────────────────────── */
+
+TEST(repo_map_budget_default_applies_when_absent) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-budget-default");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    rm_add_budget_fixture(st, "rm-budget-default");
+
+    char *text = rm_call(srv, "{\"project\":\"rm-budget-default\"}");
+    ASSERT_NOT_NULL(text);
+    ASSERT_EQ(rm_json_int(text, "budget"), 1600);
+    long est = rm_json_int(text, "estimated_tokens");
+    ASSERT_TRUE(est >= 0 && est <= 1600);
+    free(text);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(repo_map_budget_fits_and_uses_available_space) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-budget-tight");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    rm_add_budget_fixture(st, "rm-budget-tight");
+
+    char *text = rm_call(srv, "{\"project\":\"rm-budget-tight\",\"token_budget\":100}");
+    ASSERT_NOT_NULL(text);
+    long est = rm_json_int(text, "estimated_tokens");
+    long cnt = rm_json_int(text, "symbol_count");
+    ASSERT_TRUE(est >= 0 && est <= 100);
+    /* Content is plentiful (30 lines >> budget) — the binary search must
+     * converge UP to close to the ceiling, not truncate to a tiny result. */
+    ASSERT_TRUE(est >= 50);
+    ASSERT_TRUE(cnt > 0 && cnt < RM_FANOUT_COUNT);
+    free(text);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(repo_map_budget_tiny_no_overshoot_no_hang) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-budget-tiny");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    rm_add_budget_fixture(st, "rm-budget-tiny");
+
+    char *text = rm_call(srv, "{\"project\":\"rm-budget-tiny\",\"token_budget\":64}");
+    ASSERT_NOT_NULL(text);
+    long est = rm_json_int(text, "estimated_tokens");
+    long cnt = rm_json_int(text, "symbol_count");
+    ASSERT_TRUE(est >= 0 && est <= 64);
+    ASSERT_TRUE(cnt >= 0 && cnt < RM_FANOUT_COUNT);
+    free(text);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(repo_map_budget_larger_than_whole_map_returns_everything) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-budget-huge");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    rm_add_budget_fixture(st, "rm-budget-huge");
+
+    char *text = rm_call(srv, "{\"project\":\"rm-budget-huge\",\"token_budget\":100000}");
+    ASSERT_NOT_NULL(text);
+    ASSERT_EQ(rm_json_int(text, "symbol_count"), RM_FANOUT_COUNT);
+    ASSERT_NOT_NULL(strstr(text, "f00("));
+    ASSERT_NOT_NULL(strstr(text, "f29("));
+    free(text);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(repo_map_budget_zero_or_negative_is_input_error) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-budget-bad");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    rm_add_budget_fixture(st, "rm-budget-bad");
+
+    char *raw = cbm_mcp_handle_tool(srv, "repo_map",
+                                    "{\"project\":\"rm-budget-bad\",\"token_budget\":0}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NOT_NULL(strstr(raw, "\"isError\":true"));
+    /* Discriminating: must be the tool's own budget validation, not the
+     * dispatch-level "unknown tool" error (red-boundary trivial-pass guard). */
+    ASSERT_NOT_NULL(strstr(raw, "token_budget"));
+    ASSERT_NULL(strstr(raw, "unknown tool"));
+    free(raw);
+
+    raw = cbm_mcp_handle_tool(srv, "repo_map",
+                              "{\"project\":\"rm-budget-bad\",\"token_budget\":-5}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NOT_NULL(strstr(raw, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(raw, "token_budget"));
+    ASSERT_NULL(strstr(raw, "unknown tool"));
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── Row 3: AC2b seed-boost ranking ──────────────────────────────── */
+
+/* Two clusters: a HIGH-raw-importance "distant" trio with no relation to the
+ * seed, and a MODEST-raw-importance "seed" cluster (S + 4 CALLS/USAGE
+ * neighbours — deliberately > REPO_MAP_WEAK_NEIGHBOR_THRESHOLD so the widen
+ * path (row 4) does not fire here). */
+static void rm_add_seed_boost_fixture(cbm_store_t *st, const char *project) {
+    rm_add_node(st, project, "Function", "D0", "proj.D0", "pkg/distant.go", 100.0, "D0() error");
+    rm_add_node(st, project, "Function", "D1", "proj.D1", "pkg/distant.go", 90.0, "D1() error");
+    rm_add_node(st, project, "Function", "D2", "proj.D2", "pkg/distant.go", 80.0, "D2() error");
+
+    int64_t s = rm_add_node(st, project, "Function", "S", "proj.S", "pkg/seed.go", 5.0,
+                            "S() error");
+    int64_t n1 =
+        rm_add_node(st, project, "Function", "N1", "proj.N1", "pkg/seed_n.go", 4.0, "N1() error");
+    int64_t n2 =
+        rm_add_node(st, project, "Function", "N2", "proj.N2", "pkg/seed_n.go", 4.0, "N2() error");
+    int64_t n3 =
+        rm_add_node(st, project, "Function", "N3", "proj.N3", "pkg/seed_n.go", 3.0, "N3() error");
+    int64_t n4 =
+        rm_add_node(st, project, "Function", "N4", "proj.N4", "pkg/seed_n.go", 3.0, "N4() error");
+
+    rm_add_edge(st, project, s, n1, "CALLS");
+    rm_add_edge(st, project, s, n2, "CALLS");
+    rm_add_edge(st, project, n3, s, "CALLS"); /* inbound direction too */
+    rm_add_edge(st, project, s, n4, "USAGE");
+}
+
+TEST(repo_map_seed_boost_ranks_neighbourhood_above_distant) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-seed-boost");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    rm_add_seed_boost_fixture(st, "rm-seed-boost");
+
+    /* Seeded: S's neighbourhood must outrank the distant high-importance cluster. */
+    char *seeded =
+        rm_call(srv, "{\"project\":\"rm-seed-boost\",\"seed_anchors\":[\"S\"],"
+                     "\"token_budget\":100000}");
+    ASSERT_NOT_NULL(seeded);
+    const char *s_pos = strstr(seeded, "S() error");
+    const char *d0_pos = strstr(seeded, "D0() error");
+    ASSERT_NOT_NULL(s_pos);
+    ASSERT_NOT_NULL(d0_pos);
+    ASSERT_TRUE(s_pos < d0_pos);
+
+    /* No seeds: inversion — raw importance dominates, distant wins. */
+    char *global = rm_call(srv, "{\"project\":\"rm-seed-boost\",\"token_budget\":100000}");
+    ASSERT_NOT_NULL(global);
+    const char *g_s_pos = strstr(global, "S() error");
+    const char *g_d0_pos = strstr(global, "D0() error");
+    ASSERT_NOT_NULL(g_s_pos);
+    ASSERT_NOT_NULL(g_d0_pos);
+    ASSERT_TRUE(g_d0_pos < g_s_pos);
+
+    free(seeded);
+    free(global);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(repo_map_tight_budget_seed_crowds_out_distant) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-seed-tight");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    rm_add_seed_boost_fixture(st, "rm-seed-tight");
+
+    /* Budget fits only the top ~2 lines of the seeded ranking — since the
+     * whole 5-member seed cluster outranks the distant trio, none of the
+     * distant symbols can appear at all. */
+    char *text =
+        rm_call(srv, "{\"project\":\"rm-seed-tight\",\"seed_anchors\":[\"S\"],"
+                     "\"token_budget\":15}");
+    ASSERT_NOT_NULL(text);
+    /* Positive discriminator first: the top seeded symbol IS in the map
+     * (guards the red-boundary trivial pass where an error response also
+     * "contains no D0"). */
+    ASSERT_NOT_NULL(strstr(text, "S() error"));
+    ASSERT_NULL(strstr(text, "D0() error"));
+    ASSERT_NULL(strstr(text, "D1() error"));
+    ASSERT_NULL(strstr(text, "D2() error"));
+    free(text);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(repo_map_seed_by_file_path) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-seed-file");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    rm_add_seed_boost_fixture(st, "rm-seed-file");
+
+    char *text = rm_call(srv, "{\"project\":\"rm-seed-file\",\"seed_anchors\":[\"pkg/seed.go\"],"
+                             "\"token_budget\":100000}");
+    ASSERT_NOT_NULL(text);
+    const char *s_pos = strstr(text, "S() error");
+    const char *d0_pos = strstr(text, "D0() error");
+    ASSERT_NOT_NULL(s_pos);
+    ASSERT_NOT_NULL(d0_pos);
+    ASSERT_TRUE(s_pos < d0_pos);
+    ASSERT_NOT_NULL(strstr(text, "\"mode\":\"seeded\""));
+    free(text);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(repo_map_seed_resolves_multiple_nodes) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-seed-multi");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *project = "rm-seed-multi";
+
+    rm_add_node(st, project, "Function", "Hi", "proj.pkgA.Hi", "pkg/a.go", 50.0, "Hi() error");
+    rm_add_node(st, project, "Function", "Dup", "proj.pkgB.Dup", "pkg/b.go", 2.0, "DupB() error");
+    rm_add_node(st, project, "Function", "Dup", "proj.pkgC.Dup", "pkg/c.go", 2.0, "DupC() error");
+
+    char *text = rm_call(srv, "{\"project\":\"rm-seed-multi\",\"seed_anchors\":[\"Dup\"],"
+                             "\"token_budget\":100000}");
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"seed_anchors_resolved\":1"));
+    const char *dupb_pos = strstr(text, "DupB() error");
+    const char *dupc_pos = strstr(text, "DupC() error");
+    const char *hi_pos = strstr(text, "Hi() error");
+    ASSERT_NOT_NULL(dupb_pos);
+    ASSERT_NOT_NULL(dupc_pos);
+    ASSERT_NOT_NULL(hi_pos);
+    /* Both nodes resolved by the shared name "Dup" are boosted (2*50=100)
+     * above the unrelated higher-raw-importance "Hi" (50). */
+    ASSERT_TRUE(dupb_pos < hi_pos);
+    ASSERT_TRUE(dupc_pos < hi_pos);
+    free(text);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── Row 4: AC2b sharpening — weak-seed widen ────────────────────── */
+
+TEST(repo_map_weak_seed_triggers_widen_walk) {
+    /* Builder's chosen widen rule (also documented on handle_repo_map in
+     * mcp.c): when a seed's 1-hop CALLS|USAGE neighbourhood has
+     * <= REPO_MAP_WEAK_NEIGHBOR_THRESHOLD (3) members, widen via (a)
+     * file-of-symbol seeding — every other symbol defined in the seed's own
+     * file — and (b) one more hop from the 1-hop neighbours (2-hop
+     * expansion). Both widened sets get REPO_MAP_WIDEN_BOOST (25x) vs the
+     * direct seed/1-hop REPO_MAP_SEED_BOOST (50x). Here W has exactly ONE
+     * 1-hop neighbour (W1), so widen fires. */
+    cbm_mcp_server_t *srv = rm_setup_server("rm-weak-seed");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *project = "rm-weak-seed";
+
+    int64_t w = rm_add_node(st, project, "Function", "W", "rm-weak-seed.W", "pkg/weak.go", 1.0,
+                            "W() error");
+    int64_t w1 = rm_add_node(st, project, "Function", "W1", "rm-weak-seed.W1", "pkg/other.go",
+                             1.0, "W1() error");
+    rm_add_node(st, project, "Function", "WSibling", "rm-weak-seed.WSibling", "pkg/weak.go", 1.0,
+               "WSibling() error");
+    int64_t w1a = rm_add_node(st, project, "Function", "W1a", "rm-weak-seed.W1a",
+                              "pkg/other2.go", 1.0, "W1a() error");
+    /* Raw importance between the widen boost (1*25=25) and the strong seed
+     * boost (1*50=50) — proves the widen-boosted symbols outrank a *higher*
+     * raw-importance unrelated symbol, not just "small graph, all fits". */
+    rm_add_node(st, project, "Function", "Filler", "rm-weak-seed.Filler", "pkg/filler.go", 10.0,
+               "Filler() error");
+
+    rm_add_edge(st, project, w, w1, "CALLS");
+    rm_add_edge(st, project, w1, w1a, "CALLS");
+
+    char *text = rm_call(srv, "{\"project\":\"rm-weak-seed\",\"seed_anchors\":[\"W\"],"
+                             "\"token_budget\":100000}");
+    ASSERT_NOT_NULL(text);
+    const char *wsib_pos = strstr(text, "WSibling() error");
+    const char *w1a_pos = strstr(text, "W1a() error");
+    const char *filler_pos = strstr(text, "Filler() error");
+    ASSERT_NOT_NULL(wsib_pos); /* file-of-symbol widen member present */
+    ASSERT_NOT_NULL(w1a_pos);  /* 2-hop widen member present */
+    ASSERT_NOT_NULL(filler_pos);
+    ASSERT_TRUE(wsib_pos < filler_pos);
+    ASSERT_TRUE(w1a_pos < filler_pos);
+    free(text);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── Row 5: AC2c empty/unusable seeds → global map ───────────────── */
+
+TEST(repo_map_no_seed_and_empty_seed_and_all_unresolvable_yield_identical_global_map) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-empty-seed");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    rm_add_simple_fixture(st, "rm-empty-seed");
+
+    char *no_seed = rm_call(srv, "{\"project\":\"rm-empty-seed\",\"token_budget\":100000}");
+    char *empty_arr = rm_call(
+        srv, "{\"project\":\"rm-empty-seed\",\"seed_anchors\":[],\"token_budget\":100000}");
+    char *all_unresolvable =
+        rm_call(srv, "{\"project\":\"rm-empty-seed\",\"seed_anchors\":[\"nonexistent_xyz\"],"
+                     "\"token_budget\":100000}");
+    ASSERT_NOT_NULL(no_seed);
+    ASSERT_NOT_NULL(empty_arr);
+    ASSERT_NOT_NULL(all_unresolvable);
+
+    char *no_seed_map = rm_json_str(no_seed, "map");
+    char *empty_map = rm_json_str(empty_arr, "map");
+    char *unresolvable_map = rm_json_str(all_unresolvable, "map");
+    ASSERT_NOT_NULL(no_seed_map);
+    ASSERT_NOT_NULL(empty_map);
+    ASSERT_NOT_NULL(unresolvable_map);
+    ASSERT_STR_EQ(no_seed_map, empty_map);
+    ASSERT_STR_EQ(no_seed_map, unresolvable_map);
+
+    ASSERT_NOT_NULL(strstr(no_seed, "\"mode\":\"global\""));
+    ASSERT_NOT_NULL(strstr(empty_arr, "\"mode\":\"global\""));
+    ASSERT_NOT_NULL(strstr(all_unresolvable, "\"mode\":\"global\""));
+
+    free(no_seed_map);
+    free(empty_map);
+    free(unresolvable_map);
+    free(no_seed);
+    free(empty_arr);
+    free(all_unresolvable);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(repo_map_mixed_resolvable_and_unresolvable_seeds_uses_seeded_mode) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-mixed-seed");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    rm_add_simple_fixture(st, "rm-mixed-seed");
+
+    char *text =
+        rm_call(srv, "{\"project\":\"rm-mixed-seed\",\"seed_anchors\":[\"nonexistent_xyz\","
+                     "\"A\"],\"token_budget\":100000}");
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"mode\":\"seeded\""));
+    ASSERT_NOT_NULL(strstr(text, "\"seed_anchors_requested\":2"));
+    ASSERT_NOT_NULL(strstr(text, "\"seed_anchors_resolved\":1"));
+    free(text);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── Row 8: spec AC7 score-absence gating ────────────────────────── */
+
+TEST(repo_map_unscored_project_returns_explicit_gate_error) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-unscored");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    rm_add_node_no_score(st, "rm-unscored", "Function", "Foo", "qFoo", "pkg/foo.go");
+    rm_add_node_no_score(st, "rm-unscored", "Function", "Bar", "qBar", "pkg/bar.go");
+
+    char *raw = cbm_mcp_handle_tool(srv, "repo_map", "{\"project\":\"rm-unscored\"}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NOT_NULL(strstr(raw, "\"isError\":true"));
+    char *inner = extract_text_content(raw);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "unscored"));
+    free(inner);
+    free(raw);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(repo_map_partial_score_population_is_not_gated) {
+    /* One Function with no importance (pre-P3 leftover) alongside one Class
+     * WITH a persisted score — spec AC7's "partial population" sub-case.
+     * Documented behaviour: the gate fires only when NO node is scored at
+     * all; a partially-scored project proceeds (unscored nodes rank as 0 —
+     * not a crash, not a silently-unranked map). */
+    cbm_mcp_server_t *srv = rm_setup_server("rm-partial-score");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    rm_add_node_no_score(st, "rm-partial-score", "Function", "Unscored", "qU", "pkg/u.go");
+    rm_add_node(st, "rm-partial-score", "Class", "Scored", "qS", "pkg/s.go", 10.0, "Scored()");
+
+    char *raw = cbm_mcp_handle_tool(srv, "repo_map", "{\"project\":\"rm-partial-score\"}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NULL(strstr(raw, "\"isError\":true"));
+    char *inner = extract_text_content(raw);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "Scored()"));
+    free(inner);
+    free(raw);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── Row 9: spec AC7 graceful input/error paths ──────────────────── */
+
+TEST(repo_map_missing_project_is_error_no_crash) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char *raw = cbm_mcp_handle_tool(srv, "repo_map", "{}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NOT_NULL(strstr(raw, "\"isError\":true"));
+    /* Discriminating: must be the tool's own project-missing error, not
+     * dispatch-level "unknown tool" (red-boundary trivial-pass guard). */
+    ASSERT_NULL(strstr(raw, "unknown tool"));
+    free(raw);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(repo_map_unknown_project_require_store_error) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char *raw = cbm_mcp_handle_tool(srv, "repo_map", "{\"project\":\"totally-unknown-xyz\"}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_TRUE(strstr(raw, "not found") != NULL || strstr(raw, "not indexed") != NULL);
+    free(raw);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(repo_map_indexed_false_project_verify_indexed_error) {
+    /* current_project pre-set (resolve_store's cache shortcut returns a
+     * non-NULL store) but no row was ever upserted into `projects` for this
+     * name — exercises verify_project_indexed's error path specifically,
+     * distinct from REQUIRE_STORE's file-not-found path above. */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_mcp_server_set_project(srv, "ghost-project");
+
+    char *raw = cbm_mcp_handle_tool(srv, "repo_map", "{\"project\":\"ghost-project\"}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NOT_NULL(strstr(raw, "not indexed"));
+    free(raw);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(repo_map_malformed_seed_anchors_string_coerced) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-malformed-1");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    rm_add_simple_fixture(st, "rm-malformed-1");
+
+    /* seed_anchors as a bare string instead of an array — coerced into a
+     * single-element list (documented leniency, not an error). */
+    char *raw = cbm_mcp_handle_tool(srv, "repo_map",
+                                    "{\"project\":\"rm-malformed-1\",\"seed_anchors\":\"A\"}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NULL(strstr(raw, "\"isError\":true"));
+    char *inner = extract_text_content(raw);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"mode\":\"seeded\""));
+    free(inner);
+    free(raw);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(repo_map_malformed_seed_anchors_non_string_elements_skipped) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-malformed-2");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    rm_add_simple_fixture(st, "rm-malformed-2");
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "repo_map", "{\"project\":\"rm-malformed-2\",\"seed_anchors\":[1,2,\"A\"]}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NULL(strstr(raw, "\"isError\":true"));
+    char *inner = extract_text_content(raw);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"mode\":\"seeded\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"seed_anchors_resolved\":1"));
+    free(inner);
+    free(raw);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(repo_map_absurdly_long_seed_list_capped_no_hang) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-malformed-3");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    rm_add_simple_fixture(st, "rm-malformed-3");
+
+    /* 200 bogus seed names — well past REPO_MAP_MAX_SEEDS (50). Must not
+     * hang or crash; excess entries are silently dropped. */
+    char buf[4096] = "{\"project\":\"rm-malformed-3\",\"seed_anchors\":[";
+    size_t pos = strlen(buf);
+    for (int i = 0; i < 200; i++) {
+        char frag[32];
+        int n = snprintf(frag, sizeof(frag), "%s\"bogus%d\"", i > 0 ? "," : "", i);
+        if (n < 0 || pos + (size_t)n >= sizeof(buf) - 4) {
+            break;
+        }
+        memcpy(buf + pos, frag, (size_t)n);
+        pos += (size_t)n;
+    }
+    memcpy(buf + pos, "]}", 3);
+
+    char *raw = cbm_mcp_handle_tool(srv, "repo_map", buf);
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NULL(strstr(raw, "\"isError\":true"));
+    free(raw);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── Row 10: signature-level rendering, no bodies ────────────────── */
+
+TEST(repo_map_renders_signature_level_no_body_leak) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-render");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *project = "rm-render";
+
+    cbm_node_t n = {0};
+    n.project = project;
+    n.label = "Function";
+    n.name = "Foo";
+    n.qualified_name = "rm-render.Foo";
+    n.file_path = "pkg/foo.go";
+    n.start_line = 1;
+    n.end_line = 5;
+    n.properties_json = "{\"importance\":10.0,\"signature\":\"Foo(x int) error\","
+                        "\"body_preview\":\"BODY_MARKER_DO_NOT_LEAK do_something()\"}";
+    ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+
+    char *text = rm_call(srv, "{\"project\":\"rm-render\"}");
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "pkg/foo.go: Foo(x int) error"));
+    ASSERT_NULL(strstr(text, "BODY_MARKER_DO_NOT_LEAK"));
+    free(text);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── Row 11: determinism ──────────────────────────────────────────── */
+
+TEST(repo_map_deterministic_byte_identical_across_calls) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-determinism");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *project = "rm-determinism";
+    /* Two tied scores force the tie-break rule (qualified_name ASC) to do
+     * the work — the case where sort stability actually matters. */
+    rm_add_node(st, project, "Function", "Tie1", "qTie1", "pkg/x.go", 5.0, "Tie1() error");
+    rm_add_node(st, project, "Function", "Tie2", "qTie2", "pkg/x.go", 5.0, "Tie2() error");
+    rm_add_node(st, project, "Function", "Other", "qOther", "pkg/y.go", 3.0, "Other() error");
+
+    char *first = rm_call(srv, "{\"project\":\"rm-determinism\",\"token_budget\":100000}");
+    char *second = rm_call(srv, "{\"project\":\"rm-determinism\",\"token_budget\":100000}");
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+    /* Positive discriminator: a real map with the tied pair rendered in
+     * tie-break order (guards the red-boundary trivial pass where two
+     * identical error strings compare equal). */
+    const char *tie1_pos = strstr(first, "Tie1() error");
+    const char *tie2_pos = strstr(first, "Tie2() error");
+    ASSERT_NOT_NULL(tie1_pos);
+    ASSERT_NOT_NULL(tie2_pos);
+    ASSERT_TRUE(tie1_pos < tie2_pos); /* qualified_name ASC: qTie1 < qTie2 */
+    ASSERT_STR_EQ(first, second);
+    free(first);
+    free(second);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── Row 12: no cross-project leakage ────────────────────────────── */
+
+TEST(repo_map_no_cross_project_leakage) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_store_upsert_project(st, "projA", "/tmp/projA");
+    cbm_store_upsert_project(st, "projB", "/tmp/projB");
+    rm_add_node(st, "projA", "Function", "FnA", "projA.FnA", "pkg/a.go", 10.0, "FnA() error");
+    rm_add_node(st, "projB", "Function", "FnB", "projB.FnB", "pkg/b.go", 10.0, "FnB() error");
+
+    cbm_mcp_server_set_project(srv, "projA");
+    char *text = rm_call(srv, "{\"project\":\"projA\",\"token_budget\":100000}");
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "FnA() error"));
+    ASSERT_NULL(strstr(text, "FnB() error"));
+    ASSERT_NULL(strstr(text, "pkg/b.go"));
+    free(text);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── Row 13: memory/lifecycle hygiene ─────────────────────────────── */
+
+TEST(repo_map_repeated_calls_stable_no_leak_surface) {
+    cbm_mcp_server_t *srv = rm_setup_server("rm-repeat");
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    rm_add_simple_fixture(st, "rm-repeat");
+
+    char *baseline = rm_call(srv, "{\"project\":\"rm-repeat\",\"token_budget\":100000}");
+    ASSERT_NOT_NULL(baseline);
+    /* Positive discriminator: baseline is a real map, not a repeated
+     * identical error response (red-boundary trivial-pass guard). */
+    ASSERT_NOT_NULL(strstr(baseline, "A() error"));
+    for (int i = 0; i < 20; i++) {
+        char *text = rm_call(srv, "{\"project\":\"rm-repeat\",\"token_budget\":100000}");
+        ASSERT_NOT_NULL(text);
+        ASSERT_STR_EQ(baseline, text);
+        free(text);
+    }
+    ASSERT_TRUE(cbm_mcp_server_has_cached_store(srv));
+    free(baseline);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -2105,4 +2862,32 @@ SUITE(mcp) {
     RUN_TEST(snippet_include_neighbors_default);
     RUN_TEST(snippet_include_neighbors_enabled);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
+
+    /* repo_map (P4 token-budgeted, seed-aware query tool) */
+    RUN_TEST(repo_map_registered_in_tools_list);
+    RUN_TEST(repo_map_dispatchable_via_full_jsonrpc);
+    RUN_TEST(repo_map_budget_default_applies_when_absent);
+    RUN_TEST(repo_map_budget_fits_and_uses_available_space);
+    RUN_TEST(repo_map_budget_tiny_no_overshoot_no_hang);
+    RUN_TEST(repo_map_budget_larger_than_whole_map_returns_everything);
+    RUN_TEST(repo_map_budget_zero_or_negative_is_input_error);
+    RUN_TEST(repo_map_seed_boost_ranks_neighbourhood_above_distant);
+    RUN_TEST(repo_map_tight_budget_seed_crowds_out_distant);
+    RUN_TEST(repo_map_seed_by_file_path);
+    RUN_TEST(repo_map_seed_resolves_multiple_nodes);
+    RUN_TEST(repo_map_weak_seed_triggers_widen_walk);
+    RUN_TEST(repo_map_no_seed_and_empty_seed_and_all_unresolvable_yield_identical_global_map);
+    RUN_TEST(repo_map_mixed_resolvable_and_unresolvable_seeds_uses_seeded_mode);
+    RUN_TEST(repo_map_unscored_project_returns_explicit_gate_error);
+    RUN_TEST(repo_map_partial_score_population_is_not_gated);
+    RUN_TEST(repo_map_missing_project_is_error_no_crash);
+    RUN_TEST(repo_map_unknown_project_require_store_error);
+    RUN_TEST(repo_map_indexed_false_project_verify_indexed_error);
+    RUN_TEST(repo_map_malformed_seed_anchors_string_coerced);
+    RUN_TEST(repo_map_malformed_seed_anchors_non_string_elements_skipped);
+    RUN_TEST(repo_map_absurdly_long_seed_list_capped_no_hang);
+    RUN_TEST(repo_map_renders_signature_level_no_body_leak);
+    RUN_TEST(repo_map_deterministic_byte_identical_across_calls);
+    RUN_TEST(repo_map_no_cross_project_leakage);
+    RUN_TEST(repo_map_repeated_calls_stable_no_leak_surface);
 }
