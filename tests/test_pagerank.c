@@ -90,6 +90,24 @@ static double get_lr_by_edge_id(cbm_store_t *s, int64_t edge_id) {
     return cbm_linkrank_get(s, edge_id);
 }
 
+static double get_linkrank_in_by_node_id(cbm_store_t *s, int64_t node_id) {
+    sqlite3 *db = cbm_store_get_db(s);
+    if (!db) return 0.0;
+    sqlite3_stmt *stmt = NULL;
+    double value = 0.0;
+    if (sqlite3_prepare_v2(db,
+                           "SELECT COALESCE(linkrank_in, 0.0) "
+                           "FROM node_degree WHERE node_id = ?1",
+                           -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, node_id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            value = sqlite3_column_double(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
+    return value;
+}
+
 /* ── 1. Core PageRank tests ──────────────────────────────── */
 
 TEST(pagerank_empty_graph) {
@@ -695,6 +713,24 @@ TEST(linkrank_sum_equals_pagerank_sum) {
     PASS();
 }
 
+TEST(linkrank_in_matches_incoming_linkrank_sum) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "lrin", "/tmp/lrin");
+    int64_t a = add_node(s, "lrin", "a");
+    int64_t b = add_node(s, "lrin", "b");
+    int64_t c = add_node(s, "lrin", "c");
+    int64_t ab = add_edge(s, "lrin", a, b, "CALLS");
+    int64_t cb = add_edge(s, "lrin", c, b, "USAGE");
+    add_edge(s, "lrin", b, a, "CALLS");
+
+    cbm_pagerank_compute_default(s, "lrin");
+    double incoming = get_lr_by_edge_id(s, ab) + get_lr_by_edge_id(s, cb);
+    ASSERT_TRUE(fabs(get_linkrank_in_by_node_id(s, b) - incoming) < 1e-9);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── 4. Integration: dep scoping ─────────────────────────── */
 
 TEST(pagerank_after_dep_index) {
@@ -1053,6 +1089,7 @@ SUITE(pagerank) {
     RUN_TEST(linkrank_self_loop_edge);
     RUN_TEST(linkrank_no_edges);
     RUN_TEST(linkrank_sum_equals_pagerank_sum);
+    RUN_TEST(linkrank_in_matches_incoming_linkrank_sum);
     /* Integration (1 test) */
     RUN_TEST(pagerank_after_dep_index);
     /* Phase 8.5: key_functions + config weights + stats + streamlining (7 tests) */
