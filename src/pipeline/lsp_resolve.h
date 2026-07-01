@@ -64,15 +64,51 @@ static inline const char *cbm_lsp_bare_segment(const char *name) {
     return seg;
 }
 
+/* Tail helper: return the start of the final two dot-separated segments
+ * ("Class.method") or NULL when the QN is too short. */
+static inline const char *cbm_pipeline_qn_class_method_tail(const char *qn) {
+    if (!qn) {
+        return NULL;
+    }
+    const char *last = strrchr(qn, '.');
+    if (!last || last == qn) {
+        return NULL;
+    }
+    const char *second = last;
+    while (second > qn) {
+        second--;
+        if (*second == '.') {
+            if (second == qn) {
+                return qn;
+            }
+            return second + 1;
+        }
+    }
+    return qn;
+}
+
+static inline const char *cbm_pipeline_call_callee_leaf(const char *callee_name) {
+    return cbm_lsp_bare_segment(callee_name);
+}
+
+static inline int cbm_pipeline_qn_class_method_tail_eq(const char *qn, const char *tail) {
+    const char *qt = cbm_pipeline_qn_class_method_tail(qn);
+    return qt && tail && strcmp(qt, tail) == 0;
+}
+
 /* Look up the highest-confidence LSP-resolved call entry whose caller QN
  * matches the textual call's enclosing function and whose callee QN
  * short-name matches the textual callee. Returns a pointer into `arr`
  * or NULL if no qualifying entry exists.
  *
- * Match rule: the LSP emits CBMResolvedCall entries whose caller_qn
- * matches the call's enclosing function and whose callee_qn ends with
- * the textual callee_name as the last dot-separated segment. The
- * pointer returned aliases into `arr` and stays valid as long as the
+ * Match rule:
+ *   1. exact caller_qn + callee short-name match wins first;
+ *   2. if no exact caller match exists, a unique Class.method tail
+ *      match between rc->caller_qn and call->enclosing_func_qn may win;
+ *   3. ambiguous tails return NULL so the registry fallback stays in
+ *      control.
+ *
+ * The pointer returned aliases into `arr` and stays valid as long as the
  * underlying CBMFileResult is alive. */
 static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
     const CBMResolvedCallArray *arr, const CBMCall *call) {
@@ -82,7 +118,8 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
     if (!call->enclosing_func_qn || !call->callee_name) {
         return NULL;
     }
-    const CBMResolvedCall *best = NULL;
+
+    const CBMResolvedCall *best_exact = NULL;
     for (int i = 0; i < arr->count; i++) {
         const CBMResolvedCall *rc = &arr->items[i];
         if (!rc->caller_qn || !rc->callee_qn) {
@@ -124,26 +161,55 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
                 continue;
             }
         }
-        if (!best || rc->confidence > best->confidence) {
-            best = rc;
+        if (!best_exact || rc->confidence > best_exact->confidence) {
+            best_exact = rc;
         }
     }
-    return best;
+    if (best_exact) {
+        return best_exact;
+    }
+
+    const char *call_tail = cbm_pipeline_qn_class_method_tail(call->enclosing_func_qn);
+    if (!call_tail) {
+        return NULL;
+    }
+
+    const CBMResolvedCall *best_tail = NULL;
+    for (int i = 0; i < arr->count; i++) {
+        const CBMResolvedCall *rc = &arr->items[i];
+        if (!rc->caller_qn || !rc->callee_qn) {
+            continue;
+        }
+        if (rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
+            continue;
+        }
+        const char *short_name = strrchr(rc->callee_qn, '.');
+        short_name = short_name ? short_name + SKIP_ONE : rc->callee_qn;
+        const char *call_leaf = cbm_pipeline_call_callee_leaf(call->callee_name);
+        if (!call_leaf || strcmp(short_name, call_leaf) != 0) {
+            continue;
+        }
+        if (!cbm_pipeline_qn_class_method_tail_eq(rc->caller_qn, call_tail)) {
+            continue;
+        }
+        if (best_tail) {
+            return NULL;
+        }
+        best_tail = rc;
+    }
+    return best_tail;
 }
 
 /* Resolve an LSP-emitted callee_qn to a graph-buffer node.
  *
- * Per-file LSPs (notably py_lsp) sometimes emit `callee_qn` as the raw
- * import-module path the source code uses (e.g. `greeter.Greeter` from
- * `from greeter import Greeter`) rather than the project-qualified QN
- * the gbuf actually stores (`<project>.greeter.Greeter`). This is
- * unavoidable at the per-file LSP layer: the LSP cannot tell in-project
- * imports (qualify) from external imports (don't qualify, e.g. `os.path`)
- * without consulting the gbuf, which is built downstream.
- *
- * The fallback rule: try the LSP-emitted QN as-is first; on miss, retry
- * with `<project>.<callee_qn>`. If that also misses, the target is
- * external/unknown and the caller drops the edge — same as today.
+ * Per-file LSPs sometimes emit `callee_qn` as the raw package-shaped
+ * import path the source code uses rather than the project-qualified QN
+ * the gbuf actually stores. The fallback rule is:
+ *   1. try the LSP-emitted QN as-is;
+ *   2. retry with `<project>.<callee_qn>` when needed;
+ *   3. if both fail, use the exact node-name index to narrow candidates
+ *      by short method name and accept exactly one Function/Method whose
+ *      qualified_name has the same Class.method tail.
  *
  * Returns the matching node, or NULL if neither lookup hits. */
 static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node(const cbm_gbuf_t *gbuf,
@@ -156,21 +222,50 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node(const cbm_gbuf
     if (direct) {
         return direct;
     }
-    if (!project_name || !project_name[0]) {
+    if (project_name && project_name[0]) {
+        size_t proj_len = strlen(project_name);
+        if (!(strncmp(callee_qn, project_name, proj_len) == 0 && callee_qn[proj_len] == '.')) {
+            char buf[CBM_SZ_1K];
+            int written = snprintf(buf, sizeof(buf), "%s.%s", project_name, callee_qn);
+            if (written > 0 && (size_t)written < sizeof(buf)) {
+                const cbm_gbuf_node_t *prefixed = cbm_gbuf_find_by_qn(gbuf, buf);
+                if (prefixed) {
+                    return prefixed;
+                }
+            }
+        }
+    }
+
+    const char *short_name = strrchr(callee_qn, '.');
+    short_name = short_name ? short_name + SKIP_ONE : callee_qn;
+    const char *callee_tail = cbm_pipeline_qn_class_method_tail(callee_qn);
+    if (!callee_tail) {
         return NULL;
     }
-    /* Skip the prefix retry if callee_qn is already project-qualified —
-     * avoids producing nonsense like `proj.proj.foo.Bar`. */
-    size_t proj_len = strlen(project_name);
-    if (strncmp(callee_qn, project_name, proj_len) == 0 && callee_qn[proj_len] == '.') {
+    const cbm_gbuf_node_t **hits = NULL;
+    int hit_count = 0;
+    if (cbm_gbuf_find_by_name(gbuf, short_name, &hits, &hit_count) != 0 || hit_count == 0) {
         return NULL;
     }
-    char buf[CBM_SZ_1K];
-    int written = snprintf(buf, sizeof(buf), "%s.%s", project_name, callee_qn);
-    if (written < 0 || (size_t)written >= sizeof(buf)) {
-        return NULL;
+
+    const cbm_gbuf_node_t *match = NULL;
+    for (int i = 0; i < hit_count; i++) {
+        const cbm_gbuf_node_t *cand = hits[i];
+        if (!cand || !cand->label || !cand->qualified_name) {
+            continue;
+        }
+        if (strcmp(cand->label, "Function") != 0 && strcmp(cand->label, "Method") != 0) {
+            continue;
+        }
+        if (!cbm_pipeline_qn_class_method_tail_eq(cand->qualified_name, callee_tail)) {
+            continue;
+        }
+        if (match) {
+            return NULL;
+        }
+        match = cand;
     }
-    return cbm_gbuf_find_by_qn(gbuf, buf);
+    return match;
 }
 
 #endif /* CBM_PIPELINE_LSP_RESOLVE_H */

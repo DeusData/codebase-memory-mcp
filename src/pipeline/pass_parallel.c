@@ -1805,9 +1805,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         const CBMResolvedCall *lsp = NULL;
         _rc_t0 = extract_now_ns();
         if (lsp_idx && call->enclosing_func_qn) {
+            const char *call_leaf = cbm_pipeline_call_callee_leaf(call->callee_name);
             char key[1024];
-            int kn =
-                snprintf(key, sizeof(key), "%s|%s", call->enclosing_func_qn, call->callee_name);
+            int kn = call_leaf
+                         ? snprintf(key, sizeof(key), "%s|%s", call->enclosing_func_qn, call_leaf)
+                         : -1;
             if (kn > 0 && kn < (int)sizeof(key)) {
                 lsp = (const CBMResolvedCall *)cbm_ht_get(lsp_idx, key);
             }
@@ -2212,16 +2214,17 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         /* Cross-file LSP is a per-file tree-sitter re-parse + AST walk +
          * registry lookups — ~50-150ms per file. It can ONLY find calls
          * that exist in the AST. If the per-file extract found zero calls,
-         * cross-LSP will too: the AST is the same. And if every call is
-         * already resolved (resolved_calls.count >= calls.count), there's
-         * nothing left for cross-LSP to improve. Skip in both cases —
-         * pure perf win, zero semantic loss. This is the smart-pruning
-         * pre-condition that brings down kubernetes resolve time
-         * dramatically (most files have no cross-file calls left to
-         * resolve once per-file LSP has run). */
+         * cross-LSP will too: the AST is the same. For non-JVM languages,
+         * skip when per-file LSP already produced at least as many resolved
+         * entries as textual calls. Java/Kotlin per-file LSP can fill the
+         * count with constructors or same-file calls while a mixed-source-root
+         * Java↔Kotlin call remains unresolved, so JVM callers run whenever
+         * calls exist. */
+        bool jvm_cross_lsp = (lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN);
         bool cross_lsp_eligible =
             (rc->all_defs && rc->def_count > 0 && cbm_pxc_has_cross_lsp(lang) &&
-             result->calls.count > 0 && result->resolved_calls.count < result->calls.count &&
+             result->calls.count > 0 &&
+             (jvm_cross_lsp || result->resolved_calls.count < result->calls.count) &&
              !is_generated);
 
         /* Skip files with nothing else to resolve and no cross-LSP work. */
@@ -2352,9 +2355,9 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                         CBMLSPDef *ts_filtered = NULL;
                         if (rc->module_def_index) {
                             int fc = 0;
-                            ts_filtered =
-                                cbm_pxc_filter_defs_for_file(rc->module_def_index, rc->all_defs,
-                                                             def_module, imp_vals, imp_count, &fc);
+                            ts_filtered = cbm_pxc_filter_defs_for_file(
+                                rc->module_def_index, rc->all_defs, lang, result->namespace_name,
+                                def_module, imp_vals, imp_count, &fc);
                             if (ts_filtered) {
                                 ts_defs = ts_filtered;
                                 ts_def_count = fc;
@@ -2380,11 +2383,11 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                     /* Fallback: gopls per-file filter + per-file registry build. */
                     CBMLSPDef *file_defs = rc->all_defs;
                     int file_def_count = rc->def_count;
+                    int filtered_count = 0;
                     if (rc->module_def_index) {
-                        int filtered_count = 0;
-                        filtered = cbm_pxc_filter_defs_for_file(rc->module_def_index, rc->all_defs,
-                                                                def_module, imp_vals, imp_count,
-                                                                &filtered_count);
+                        filtered = cbm_pxc_filter_defs_for_file(
+                            rc->module_def_index, rc->all_defs, lang, result->namespace_name,
+                            def_module, imp_vals, imp_count, &filtered_count);
                         if (filtered) {
                             file_defs = filtered;
                             file_def_count = filtered_count;

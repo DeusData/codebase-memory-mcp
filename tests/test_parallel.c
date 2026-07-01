@@ -529,6 +529,163 @@ static void count_lsp_call_edges(const cbm_gbuf_edge_t *edge, void *ud) {
     }
 }
 
+static const char *class_method_tail(const char *qn) {
+    if (!qn) {
+        return NULL;
+    }
+    const char *last = strrchr(qn, '.');
+    if (!last || last == qn) {
+        return NULL;
+    }
+    const char *second = last;
+    while (second > qn) {
+        second--;
+        if (*second == '.') {
+            return second == qn ? qn : second + 1;
+        }
+    }
+    return qn;
+}
+
+static const cbm_gbuf_node_t *find_unique_callable_node_by_tail(const cbm_gbuf_t *gbuf,
+                                                                const char *tail) {
+    const char *method = tail ? strrchr(tail, '.') : NULL;
+    method = method ? method + 1 : tail;
+    if (!gbuf || !tail || !method) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_by_name(gbuf, method, &nodes, &count) != 0) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *match = NULL;
+    for (int i = 0; i < count; i++) {
+        const cbm_gbuf_node_t *node = nodes[i];
+        if (!node || !node->label || !node->qualified_name) {
+            continue;
+        }
+        if (strcmp(node->label, "Method") != 0 && strcmp(node->label, "Function") != 0) {
+            continue;
+        }
+        const char *node_tail = class_method_tail(node->qualified_name);
+        if (!node_tail || strcmp(node_tail, tail) != 0) {
+            continue;
+        }
+        if (match) {
+            return NULL;
+        }
+        match = node;
+    }
+    return match;
+}
+
+static const cbm_gbuf_edge_t *find_calls_edge_by_tails(const cbm_gbuf_t *gbuf,
+                                                       const char *source_tail,
+                                                       const char *target_tail) {
+    const cbm_gbuf_node_t *source = find_unique_callable_node_by_tail(gbuf, source_tail);
+    const cbm_gbuf_node_t *target = find_unique_callable_node_by_tail(gbuf, target_tail);
+    if (!source || !target) {
+        return NULL;
+    }
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(gbuf, source->id, "CALLS", &edges, &count) != 0) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        if (edges[i] && edges[i]->target_id == target->id) {
+            return edges[i];
+        }
+    }
+    return NULL;
+}
+
+TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_jvm_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+
+    char jpath[512];
+    snprintf(jpath, sizeof(jpath), "%s/src/main/java/com/example/Example.java", tmpdir);
+    char jdir[512];
+    snprintf(jdir, sizeof(jdir), "%s/src/main/java/com/example", tmpdir);
+    cbm_mkdir_p(jdir, 0755);
+    FILE *jf = fopen(jpath, "w");
+    if (!jf) {
+        FAIL("fopen example.java failed");
+    }
+    fprintf(jf, "package com.example;\n"
+                "\n"
+                "class JavaCaller {\n"
+                "    String call(KotlinService kotlinService) {\n"
+                "        return kotlinService.ping(new JavaService());\n"
+                "    }\n"
+                "}\n"
+                "\n"
+                "class JavaService {\n"
+                "    String pong() {\n"
+                "        return \"pong\";\n"
+                "    }\n"
+                "}\n");
+    fclose(jf);
+
+    char kpath[512];
+    snprintf(kpath, sizeof(kpath), "%s/src/main/kotlin/com/example/KotlinService.kt", tmpdir);
+    char kdir[512];
+    snprintf(kdir, sizeof(kdir), "%s/src/main/kotlin/com/example", tmpdir);
+    cbm_mkdir_p(kdir, 0755);
+    FILE *kf = fopen(kpath, "w");
+    if (!kf) {
+        unlink(jpath);
+        rmdir(tmpdir);
+        FAIL("fopen example.kt failed");
+    }
+    fprintf(kf, "package com.example\n"
+                "\n"
+                "class KotlinService {\n"
+                "    fun ping(javaService: JavaService): String {\n"
+                "        return javaService.pong()\n"
+                "    }\n"
+                "}\n");
+    fclose(kf);
+
+    cbm_file_info_t files[2] = {0};
+    files[0].path = jpath;
+    files[0].rel_path = (char *)"src/main/java/com/example/Example.java";
+    files[0].language = CBM_LANG_JAVA;
+    files[1].path = kpath;
+    files[1].rel_path = (char *)"src/main/kotlin/com/example/KotlinService.kt";
+    files[1].language = CBM_LANG_KOTLIN;
+
+    cbm_gbuf_t *gbuf = run_parallel("com", tmpdir, files, 2, 2);
+    ASSERT_NOT_NULL(gbuf);
+
+    const cbm_gbuf_edge_t *java_to_kotlin =
+        find_calls_edge_by_tails(gbuf, "JavaCaller.call", "KotlinService.ping");
+    const cbm_gbuf_edge_t *kotlin_to_java =
+        find_calls_edge_by_tails(gbuf, "KotlinService.ping", "JavaService.pong");
+
+    ASSERT_NOT_NULL(java_to_kotlin);
+    ASSERT_NOT_NULL(kotlin_to_java);
+    ASSERT_NOT_NULL(java_to_kotlin->properties_json);
+    ASSERT_NOT_NULL(kotlin_to_java->properties_json);
+    ASSERT_NOT_NULL(strstr(java_to_kotlin->properties_json, "\"strategy\":\"lsp"));
+    ASSERT_NOT_NULL(strstr(kotlin_to_java->properties_json, "\"strategy\":\"lsp"));
+    ASSERT_TRUE(strstr(java_to_kotlin->properties_json, "\"strategy\":\"callee_suffix\"") == NULL);
+    ASSERT_TRUE(strstr(kotlin_to_java->properties_json, "\"strategy\":\"callee_suffix\"") == NULL);
+
+    cbm_gbuf_free(gbuf);
+    unlink(kpath);
+    unlink(jpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
+
 TEST(parallel_python_lsp_override_emits_lsp_strategy_edges) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_pylsp_XXXXXX");
@@ -719,6 +876,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_node_count);
     RUN_TEST(parallel_python_lsp_override_emits_lsp_strategy_edges);
     RUN_TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges);
+    RUN_TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges);
     RUN_TEST(parallel_calls_parity);
     RUN_TEST(parallel_defines_parity);
     RUN_TEST(parallel_defines_method_parity);

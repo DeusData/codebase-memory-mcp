@@ -4136,6 +4136,85 @@ void cbm_run_kotlin_lsp(CBMArena *arena, CBMFileResult *result, const char *sour
  * a call site in another file resolves to the right node. Types and functions
  * keep their full project-qualified QN; functions carry receiver_type so the
  * sole-definer fallback can tell a top-level fun from a method. */
+static const char *kt_cross_builtin_return_qn(const char *name) {
+    if (!name) {
+        return NULL;
+    }
+    if (strcmp(name, "String") == 0) {
+        return "kotlin.String";
+    }
+    if (strcmp(name, "Int") == 0 || strcmp(name, "Integer") == 0) {
+        return "kotlin.Int";
+    }
+    if (strcmp(name, "Long") == 0) {
+        return "kotlin.Long";
+    }
+    if (strcmp(name, "Float") == 0) {
+        return "kotlin.Float";
+    }
+    if (strcmp(name, "Double") == 0) {
+        return "kotlin.Double";
+    }
+    if (strcmp(name, "Boolean") == 0 || strcmp(name, "Bool") == 0) {
+        return "kotlin.Boolean";
+    }
+    if (strcmp(name, "Char") == 0 || strcmp(name, "Character") == 0) {
+        return "kotlin.Char";
+    }
+    if (strcmp(name, "Byte") == 0) {
+        return "kotlin.Byte";
+    }
+    if (strcmp(name, "Short") == 0) {
+        return "kotlin.Short";
+    }
+    if (strcmp(name, "Unit") == 0 || strcmp(name, "Void") == 0 || strcmp(name, "void") == 0) {
+        return "kotlin.Unit";
+    }
+    if (strcmp(name, "Any") == 0 || strcmp(name, "Object") == 0) {
+        return "kotlin.Any";
+    }
+    return NULL;
+}
+
+static const CBMType *kt_cross_return_type(CBMArena *arena, const CBMLSPDef *d) {
+    if (!arena || !d || !d->return_types || !d->return_types[0]) {
+        return NULL;
+    }
+    const char *text = d->return_types;
+    const char *bar = strchr(text, '|');
+    const char *first = bar ? cbm_arena_strndup(arena, text, (size_t)(bar - text)) : text;
+    if (!first || !first[0]) {
+        return NULL;
+    }
+    if (!strchr(first, '.')) {
+        const char *builtin = kt_cross_builtin_return_qn(first);
+        if (builtin) {
+            first = builtin;
+        } else if (d->namespace_name && d->namespace_name[0]) {
+            first = kt_join_dot(arena, d->namespace_name, first);
+        }
+    }
+    return cbm_type_named(arena, first);
+}
+
+static const CBMType *kt_cross_func_sig_with_return(CBMArena *arena, const CBMLSPDef *d) {
+    const CBMType *ret = kt_cross_return_type(arena, d);
+    if (!ret || cbm_type_is_unknown(ret)) {
+        return NULL;
+    }
+    const char **empty_pn = (const char **)cbm_arena_alloc(arena, sizeof(*empty_pn));
+    const CBMType **empty_pt = (const CBMType **)cbm_arena_alloc(arena, sizeof(*empty_pt));
+    const CBMType **rets = (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(*rets));
+    if (!empty_pn || !empty_pt || !rets) {
+        return NULL;
+    }
+    empty_pn[0] = NULL;
+    empty_pt[0] = NULL;
+    rets[0] = ret;
+    rets[1] = NULL;
+    return cbm_type_func(arena, empty_pn, empty_pt, rets);
+}
+
 static void kt_register_cross_def(CBMTypeRegistry *reg, CBMArena *arena, const CBMLSPDef *d) {
     if (!d->qualified_name || !d->short_name || !d->label) {
         return;
@@ -4185,6 +4264,7 @@ static void kt_register_cross_def(CBMTypeRegistry *reg, CBMArena *arena, const C
         /* receiver_type distinguishes a top-level fun (NULL) from a method
          * (set) — the sole-definer fallback only matches top-level funs. */
         rf.receiver_type = d->receiver_type;
+        rf.signature = kt_cross_func_sig_with_return(arena, d);
         cbm_registry_add_func(reg, rf);
     }
 }
