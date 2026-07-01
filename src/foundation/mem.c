@@ -17,6 +17,7 @@
 #include <mimalloc.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -106,6 +107,30 @@ static void check_pressure(size_t rss) {
 
 /* ── Public API ────────────────────────────────────────────────── */
 
+size_t cbm_mem_resolve_budget(size_t total_ram, double ram_fraction, const char *max_memory_mb) {
+    if (ram_fraction <= 0.0 || ram_fraction > MAX_RAM_FRACTION) {
+        ram_fraction = DEFAULT_RAM_FRACTION;
+    }
+    size_t budget = (size_t)((double)total_ram * ram_fraction);
+
+    /* Explicit CBM_MAX_MEMORY_MB override (positive integer MiB) wins over the
+     * fraction-derived default. Clamp to total_ram when known so we never claim
+     * more than physical/cgroup RAM. Invalid / non-positive values are ignored
+     * (caller logs a warning). */
+    if (max_memory_mb != NULL && max_memory_mb[0] != '\0') {
+        char *end = NULL;
+        long long want_mb = strtoll(max_memory_mb, &end, CBM_DECIMAL_BASE);
+        if (end != max_memory_mb && want_mb > 0) {
+            size_t want = (size_t)want_mb * MB_DIVISOR;
+            if (total_ram > 0 && want > total_ram) {
+                want = total_ram;
+            }
+            budget = want;
+        }
+    }
+    return budget;
+}
+
 void cbm_mem_init(double ram_fraction) {
     int expected = 0;
     if (!atomic_compare_exchange_strong(&g_initialized, &expected, 1)) {
@@ -141,13 +166,39 @@ void cbm_mem_init(double ram_fraction) {
     }
 
     cbm_system_info_t info = cbm_system_info();
-    g_budget = (size_t)((double)info.total_ram * ram_fraction);
+
+    /* CBM_MAX_MEMORY_MB env override: an explicit memory budget in MiB that
+     * takes precedence over the ram_fraction-derived value. Lets RAM-
+     * constrained hosts cap the in-memory graph budget, and lets containers
+     * pin a budget *below* the detected cgroup limit so headroom is left for
+     * sibling processes (e.g. an MCP client/parent). Same precedence shape as
+     * the CBM_WORKERS override: explicit override > implicit detection. (#580) */
+    char env_buf[CBM_SZ_32];
+    const char *env = cbm_safe_getenv("CBM_MAX_MEMORY_MB", env_buf, sizeof(env_buf), NULL);
+    g_budget = cbm_mem_resolve_budget(info.total_ram, ram_fraction, env);
+
+    const char *budget_source = "ram_fraction";
+    if (env != NULL && env[0] != '\0') {
+        char *end = NULL;
+        long long want_mb = strtoll(env, &end, CBM_DECIMAL_BASE);
+        if (end != env && want_mb > 0) {
+            budget_source = "env";
+            if (info.total_ram > 0 && (size_t)want_mb * MB_DIVISOR > info.total_ram) {
+                char cap_mb[CBM_SZ_32];
+                snprintf(cap_mb, sizeof(cap_mb), "%zu", info.total_ram / MB_DIVISOR);
+                cbm_log_warn("mem.max.clamped", "requested_mb", env, "cap_mb", cap_mb);
+            }
+        } else {
+            cbm_log_warn("mem.max.invalid", "value", env, "fallback", "ram_fraction");
+        }
+    }
 
     char budget_mb[CBM_SZ_32];
     char ram_mb[CBM_SZ_32];
     snprintf(budget_mb, sizeof(budget_mb), "%zu", g_budget / MB_DIVISOR);
     snprintf(ram_mb, sizeof(ram_mb), "%zu", info.total_ram / MB_DIVISOR);
-    cbm_log_info("mem.init", "budget_mb", budget_mb, "total_ram_mb", ram_mb);
+    cbm_log_info("mem.init", "budget_mb", budget_mb, "total_ram_mb", ram_mb, "source",
+                 budget_source);
 }
 
 size_t cbm_mem_rss(void) {

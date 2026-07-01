@@ -290,6 +290,64 @@ TEST(mem_init_second_call_noop) {
     PASS();
 }
 
+/* ── CBM_MAX_MEMORY_MB budget override (pure resolver) ────────────
+ * cbm_mem_init is one-shot per process, so the override logic lives in the
+ * pure cbm_mem_resolve_budget() helper which we can exercise directly. (#580) */
+
+#define CBM_TEST_MB ((size_t)1024 * 1024)
+
+TEST(resolve_budget_no_override_uses_fraction) {
+    /* No env override → ram_fraction × total_ram. */
+    size_t total = 8192 * CBM_TEST_MB;
+    ASSERT_EQ(cbm_mem_resolve_budget(total, 0.5, NULL), 4096 * CBM_TEST_MB);
+    ASSERT_EQ(cbm_mem_resolve_budget(total, 0.25, ""), 2048 * CBM_TEST_MB);
+    PASS();
+}
+
+TEST(resolve_budget_invalid_fraction_defaults) {
+    /* Out-of-range fractions fall back to the 0.5 default. */
+    size_t total = 8192 * CBM_TEST_MB;
+    ASSERT_EQ(cbm_mem_resolve_budget(total, 0.0, NULL), 4096 * CBM_TEST_MB);
+    ASSERT_EQ(cbm_mem_resolve_budget(total, -1.0, NULL), 4096 * CBM_TEST_MB);
+    ASSERT_EQ(cbm_mem_resolve_budget(total, 1.5, NULL), 4096 * CBM_TEST_MB);
+    PASS();
+}
+
+TEST(resolve_budget_override_wins) {
+    /* The key use case: pin a budget *below* the fraction default. */
+    size_t total = 8192 * CBM_TEST_MB;
+    ASSERT_EQ(cbm_mem_resolve_budget(total, 0.5, "2048"), 2048 * CBM_TEST_MB);
+    /* Override above the fraction default is also honored (up to total_ram). */
+    ASSERT_EQ(cbm_mem_resolve_budget(total, 0.5, "6144"), 6144 * CBM_TEST_MB);
+    PASS();
+}
+
+TEST(resolve_budget_override_clamped_to_total) {
+    /* Override larger than physical/cgroup RAM clamps to total_ram. */
+    size_t total = 1024 * CBM_TEST_MB;
+    ASSERT_EQ(cbm_mem_resolve_budget(total, 0.5, "100000"), total);
+    PASS();
+}
+
+TEST(resolve_budget_override_when_total_unknown) {
+    /* Detection failed (total_ram == 0): override still yields a usable budget
+     * and is not clamped to zero. */
+    ASSERT_EQ(cbm_mem_resolve_budget(0, 0.5, "512"), 512 * CBM_TEST_MB);
+    PASS();
+}
+
+TEST(resolve_budget_invalid_override_falls_back) {
+    /* Non-numeric, zero, and negative overrides are ignored. */
+    size_t total = 8192 * CBM_TEST_MB;
+    size_t fraction_budget = 4096 * CBM_TEST_MB;
+    ASSERT_EQ(cbm_mem_resolve_budget(total, 0.5, "abc"), fraction_budget);
+    ASSERT_EQ(cbm_mem_resolve_budget(total, 0.5, "0"), fraction_budget);
+    ASSERT_EQ(cbm_mem_resolve_budget(total, 0.5, "-512"), fraction_budget);
+    PASS();
+}
+
+#undef CBM_TEST_MB
+
 /* ── Arena integration tests ──────────────────────────────────── */
 
 TEST(arena_alloc_and_destroy) {
@@ -653,6 +711,13 @@ SUITE(mem) {
     RUN_TEST(mem_init_negative_fraction);
     RUN_TEST(mem_init_over_one_fraction);
     RUN_TEST(mem_init_second_call_noop);
+    /* CBM_MAX_MEMORY_MB budget override */
+    RUN_TEST(resolve_budget_no_override_uses_fraction);
+    RUN_TEST(resolve_budget_invalid_fraction_defaults);
+    RUN_TEST(resolve_budget_override_wins);
+    RUN_TEST(resolve_budget_override_clamped_to_total);
+    RUN_TEST(resolve_budget_override_when_total_unknown);
+    RUN_TEST(resolve_budget_invalid_override_falls_back);
     /* Arena integration */
     RUN_TEST(arena_alloc_and_destroy);
     RUN_TEST(arena_grow_tracks_sizes);
