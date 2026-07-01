@@ -82,15 +82,13 @@ static char *pxc_read_file(const char *path, int *out_len) {
     return buf;
 }
 
-/* Map a CBMDefinition.label to a CBMLSPDef.label. Per-language LSP
- * registrars only care about Class/Interface/Trait/Enum/Type/Protocol/
- * Function/Method — variables, modules, decorators, etc. are skipped. */
+/* Map a CBMDefinition.label to a CBMLSPDef.label. Per-language LSP registrars
+ * only care about type-like labels, Protocol, Function, and Method. */
 static const char *pxc_map_label(const char *label) {
     if (!label)
         return NULL;
-    if (strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
-        strcmp(label, "Trait") == 0 || strcmp(label, "Enum") == 0 || strcmp(label, "Type") == 0 ||
-        strcmp(label, "Protocol") == 0 || strcmp(label, "Function") == 0 ||
+    if (cbm_label_is_type_like(label) || strcmp(label, "Protocol") == 0 ||
+        strcmp(label, "Function") == 0 ||
         strcmp(label, "Method") == 0) {
         return label;
     }

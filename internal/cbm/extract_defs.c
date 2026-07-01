@@ -3289,15 +3289,25 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     const char *label = class_label_for_kind(kind);
 
     // Sway/WGSL: label struct defs as "Struct" and Sway `abi` blocks as
-    // "Interface". Scoped to these grammar-only languages so established
-    // struct-as-"Class" labeling (Rust/C++/Go/Cap'n Proto …) and the
-    // downstream type/IMPLEMENTS resolvers that depend on it are unaffected.
+    // "Interface". C/C++/ObjC/Cap'n Proto keep historical struct-as-"Class"
+    // semantics because those grammars model class-like records through the
+    // same downstream resolver paths.
     if (ctx->language == CBM_LANG_SWAY || ctx->language == CBM_LANG_WGSL) {
         if (strcmp(kind, "struct_item") == 0 || strcmp(kind, "struct_declaration") == 0) {
             label = "Struct";
         } else if (strcmp(kind, "abi_item") == 0) {
             label = "Interface";
         }
+    }
+    if (ctx->language == CBM_LANG_RUST || ctx->language == CBM_LANG_SWIFT ||
+        ctx->language == CBM_LANG_DLANG) {
+        if (strcmp(kind, "struct_item") == 0 || strcmp(kind, "struct_declaration") == 0) {
+            label = "Struct";
+        }
+    }
+    if (ctx->language == CBM_LANG_SWIFT && strcmp(kind, "class_declaration") == 0 &&
+        !ts_node_is_null(cbm_find_child_by_kind(node, "struct"))) {
+        label = "Struct";
     }
     // F#: a `type_definition` that has a primary constructor (`type Foo(...) =`)
     // or an `inherit` clause is an OOP class, not a plain type alias. Label it
@@ -3313,7 +3323,7 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         }
     }
 
-    // Go type_spec: check inner type for interface/struct
+    // Go type_spec: check inner type for interface/struct.
     if (strcmp(kind, "type_spec") == 0) {
         TSNode type_inner = ts_node_child_by_field_name(node, TS_FIELD("type"));
         if (!ts_node_is_null(type_inner)) {
@@ -3321,7 +3331,7 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             if (strcmp(inner_kind, "interface_type") == 0) {
                 label = "Interface";
             } else if (strcmp(inner_kind, "struct_type") == 0) {
-                label = "Class";
+                label = "Struct";
             }
         }
     }

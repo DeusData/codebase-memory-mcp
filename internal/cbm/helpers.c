@@ -146,6 +146,12 @@ static const char *generic_keywords[] = {
     "def",      "fn",        "func",      "fun",    "proc",   "sub",       "method",  "async",
     "await",    "yield",     NULL};
 
+bool cbm_label_is_type_like(const char *label) {
+    return label && (strcmp(label, "Class") == 0 || strcmp(label, "Struct") == 0 ||
+                     strcmp(label, "Interface") == 0 || strcmp(label, "Enum") == 0 ||
+                     strcmp(label, "Type") == 0 || strcmp(label, "Trait") == 0);
+}
+
 bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     if (!name || !name[0]) {
         return true;

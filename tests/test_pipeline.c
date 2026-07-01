@@ -1388,6 +1388,56 @@ TEST(implements_creates_override) {
     PASS();
 }
 
+TEST(implements_accepts_struct_label) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test-proj", "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t iface_id =
+        cbm_gbuf_upsert_node(gb, "Interface", "Runner", "pkg.Runner", "pkg/runner.go", 1, 3, "{}");
+    ASSERT_GT(iface_id, 0);
+    int64_t run_method_id =
+        cbm_gbuf_upsert_node(gb, "Method", "Run", "pkg.Runner.Run", "pkg/runner.go", 2, 2, "{}");
+    ASSERT_GT(run_method_id, 0);
+    cbm_gbuf_insert_edge(gb, iface_id, run_method_id, "DEFINES_METHOD", "{}");
+
+    int64_t struct_id =
+        cbm_gbuf_upsert_node(gb, "Struct", "Job", "pkg.Job", "pkg/job.go", 1, 4, "{}");
+    ASSERT_GT(struct_id, 0);
+    int64_t job_run_id = cbm_gbuf_upsert_node(gb, "Method", "Run", "pkg.Job.Run", "pkg/job.go", 2,
+                                              3, "{\"receiver\":\"(j Job)\"}");
+    ASSERT_GT(job_run_id, 0);
+
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "test-proj",
+        .repo_path = "/tmp/test",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+    };
+    int edges_created = cbm_pipeline_implements_go(&ctx);
+    ASSERT_GT(edges_created, 0);
+
+    const cbm_gbuf_edge_t **impl_edges = NULL;
+    int impl_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, struct_id, "IMPLEMENTS", &impl_edges,
+                                                 &impl_count),
+              0);
+    ASSERT_EQ(impl_count, 1);
+    ASSERT_EQ(impl_edges[0]->target_id, iface_id);
+
+    const cbm_gbuf_edge_t **override_edges = NULL;
+    int override_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, job_run_id, "OVERRIDE", &override_edges,
+                                                 &override_count),
+              0);
+    ASSERT_EQ(override_count, 1);
+    ASSERT_EQ(override_edges[0]->target_id, run_method_id);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 TEST(implements_no_match) {
     /* Port of TestPassImplementsNoOverrideWithoutMatch.
      * Interface requires Read+Write, struct only has Read → no edges. */
@@ -2393,13 +2443,13 @@ TEST(pipeline_go_type_classification) {
     ASSERT_EQ(ic, 2);
     cbm_store_free_nodes(ifaces, ic);
 
-    /* Should have 1 Class node (Config struct) */
-    cbm_node_t *cls = NULL;
-    int cc = 0;
-    cbm_store_find_nodes_by_label(s, proj, "Class", &cls, &cc);
-    ASSERT_EQ(cc, 1);
-    ASSERT_STR_EQ(cls[0].name, "Config");
-    cbm_store_free_nodes(cls, cc);
+    /* Should have 1 Struct node (Config struct) */
+    cbm_node_t *structs = NULL;
+    int sc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Struct", &structs, &sc);
+    ASSERT_EQ(sc, 1);
+    ASSERT_STR_EQ(structs[0].name, "Config");
+    cbm_store_free_nodes(structs, sc);
 
     /* Should have 1 Type node (ID alias) */
     cbm_node_t *types = NULL;
@@ -2438,11 +2488,11 @@ TEST(pipeline_go_grouped_types) {
     ASSERT_NOT_NULL(s);
     const char *proj = cbm_pipeline_project_name(p);
 
-    cbm_node_t *cls = NULL;
-    int cc = 0;
-    cbm_store_find_nodes_by_label(s, proj, "Class", &cls, &cc);
-    ASSERT_EQ(cc, 2); /* Request, Response */
-    cbm_store_free_nodes(cls, cc);
+    cbm_node_t *structs = NULL;
+    int sc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Struct", &structs, &sc);
+    ASSERT_EQ(sc, 2); /* Request, Response */
+    cbm_store_free_nodes(structs, sc);
 
     cbm_node_t *ifaces = NULL;
     int ic = 0;
@@ -2928,7 +2978,7 @@ TEST(pipeline_docstring_kotlin_function) {
     PASS();
 }
 
-TEST(pipeline_docstring_go_class) {
+TEST(pipeline_docstring_go_struct) {
     /* Go struct with // comment docstring */
     const char *files[] = {"main.go"};
     const char *contents[] = {"package main\n\n"
@@ -2953,7 +3003,7 @@ TEST(pipeline_docstring_go_class) {
 
     bool found_docstring = false;
     for (int i = 0; i < nc; i++) {
-        if (strcmp(nodes[i].label, "Class") == 0 && nodes[i].properties_json &&
+        if (strcmp(nodes[i].label, "Struct") == 0 && nodes[i].properties_json &&
             strstr(nodes[i].properties_json, "docstring") &&
             strstr(nodes[i].properties_json, "MyStruct is documented")) {
             found_docstring = true;
@@ -10728,6 +10778,7 @@ SUITE(pipeline) {
     RUN_TEST(testdetect_is_test_function);
     /* Implements pass (graph buffer based) */
     RUN_TEST(implements_creates_override);
+    RUN_TEST(implements_accepts_struct_label);
     RUN_TEST(implements_no_match);
     /* Usages pass (full pipeline integration) */
     RUN_TEST(usages_creates_edges);
@@ -10756,7 +10807,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_docstring_python_function);
     RUN_TEST(pipeline_docstring_java_method);
     RUN_TEST(pipeline_docstring_kotlin_function);
-    RUN_TEST(pipeline_docstring_go_class);
+    RUN_TEST(pipeline_docstring_go_struct);
     /* Project name */
     RUN_TEST(project_name_from_path);
     RUN_TEST(project_name_drive_letter_case_insensitive_issue394);

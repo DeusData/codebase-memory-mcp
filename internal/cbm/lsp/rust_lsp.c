@@ -4524,14 +4524,13 @@ static void rust_build_registry_from_defs(CBMArena *arena, CBMTypeRegistry *reg,
     cbm_registry_init(reg, arena);
     cbm_rust_stdlib_register(reg, arena);
 
-    /* Phase A: register every Class/Type/Trait/Function/Method definition. */
+    /* Phase A: register every type-like, Function, and Method definition. */
     for (int i = 0; i < result->defs.count; i++) {
         CBMDefinition *d = &result->defs.items[i];
         if (!d->qualified_name || !d->name)
             continue;
 
-        if (d->label && (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Type") == 0 ||
-                         strcmp(d->label, "Interface") == 0 || strcmp(d->label, "Trait") == 0)) {
+        if (cbm_label_is_type_like(d->label)) {
             CBMRegisteredType rt;
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name;
@@ -4839,7 +4838,7 @@ static void rust_build_registry_from_defs(CBMArena *arena, CBMTypeRegistry *reg,
             CBMDefinition *d = &result->defs.items[i];
             if (!d->qualified_name || !d->name)
                 continue;
-            if (!d->label || (strcmp(d->label, "Class") != 0 && strcmp(d->label, "Type") != 0))
+            if (!cbm_label_is_type_like(d->label))
                 continue;
             if (!d->decorators)
                 continue;
@@ -5151,8 +5150,7 @@ void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,
             continue;
         const char *def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
 
-        if (strcmp(d->label, "Type") == 0 || strcmp(d->label, "Class") == 0 ||
-            strcmp(d->label, "Interface") == 0 || strcmp(d->label, "Trait") == 0) {
+        if (cbm_label_is_type_like(d->label)) {
             CBMRegisteredType rt;
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = cbm_arena_strdup(arena, d->qualified_name);

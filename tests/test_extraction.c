@@ -630,7 +630,8 @@ TEST(rust_struct) {
                                CBM_LANG_RUST, "t", "point.rs");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
-    ASSERT(has_def(r, "Class", "Point"));
+    ASSERT(has_def(r, "Struct", "Point"));
+    ASSERT_FALSE(has_def(r, "Class", "Point"));
     ASSERT(has_def(r, "Method", "new"));
     cbm_free_result(r);
     PASS();
@@ -655,7 +656,8 @@ TEST(go_struct) {
                                CBM_LANG_GO, "t", "server.go");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
-    ASSERT(has_def(r, "Class", "Server"));
+    ASSERT(has_def(r, "Struct", "Server"));
+    ASSERT_FALSE(has_def(r, "Class", "Server"));
     ASSERT(has_def(r, "Method", "Start"));
     cbm_free_result(r);
     PASS();
@@ -668,6 +670,17 @@ TEST(go_interface) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def_any(r, "Handler"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dlang_struct) {
+    CBMFileResult *r =
+        extract("module app;\nstruct Point { int x; int y; }\n", CBM_LANG_DLANG, "t", "point.d");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Struct", "Point"));
+    ASSERT_FALSE(has_def(r, "Class", "Point"));
     cbm_free_result(r);
     PASS();
 }
@@ -1087,6 +1100,8 @@ TEST(swift_struct) {
                                CBM_LANG_SWIFT, "t", "Point.swift");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Struct", "Point"));
+    ASSERT_FALSE(has_def(r, "Class", "Point"));
     ASSERT(has_def(r, "Method", "distance"));
     cbm_free_result(r);
     PASS();
@@ -3017,6 +3032,7 @@ SUITE(extraction) {
     RUN_TEST(go_function);
     RUN_TEST(go_struct);
     RUN_TEST(go_interface);
+    RUN_TEST(dlang_struct);
     RUN_TEST(zig_function);
     RUN_TEST(c_function);
     RUN_TEST(c_struct);

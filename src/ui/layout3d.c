@@ -83,7 +83,7 @@ static float size_for_label(const char *label) {
         return 12.0f;
     if (strcmp(label, "File") == 0)
         return 8.0f;
-    if (strcmp(label, "Class") == 0)
+    if (strcmp(label, "Class") == 0 || strcmp(label, "Struct") == 0)
         return 6.0f;
     if (strcmp(label, "Interface") == 0)
         return 6.0f;

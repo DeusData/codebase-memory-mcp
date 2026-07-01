@@ -74,13 +74,12 @@ static const char *resolve_as_class(const cbm_registry_t *reg, const char *name,
         return NULL;
     }
 
-    /* Verify it's a Class, Interface, or Type */
+    /* Verify it is a user-defined type target. */
     const char *label = cbm_registry_label_of(reg, res.qualified_name);
     if (!label) {
         return NULL;
     }
-    if (strcmp(label, "Class") != 0 && strcmp(label, "Interface") != 0 &&
-        strcmp(label, "Type") != 0 && strcmp(label, "Enum") != 0) {
+    if (!cbm_label_is_type_like(label)) {
         return NULL;
     }
     return res.qualified_name;
@@ -140,14 +139,14 @@ typedef struct {
     int64_t id;
 } go_imethod_t;
 
-/* Check if class has all interface methods and create IMPLEMENTS + OVERRIDE edges. */
-static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *cls,
-                                     const cbm_gbuf_node_t *iface, const go_imethod_t *imethods,
-                                     int im_count) {
-    if (!cls->file_path || !cls->qualified_name) {
+/* Check if a Go type has all interface methods and create graph edges. */
+static int check_go_type_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *typ,
+                                    const cbm_gbuf_node_t *iface, const go_imethod_t *imethods,
+                                    int im_count) {
+    if (!typ->file_path || !typ->qualified_name) {
         return 0;
     }
-    if (!fp_ends_with(cls->file_path, ".go")) {
+    if (!fp_ends_with(typ->file_path, ".go")) {
         return 0;
     }
     /* Resolve the struct's methods two ways and use whichever finds them:
@@ -155,16 +154,16 @@ static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_nod
      *       pipeline path, where Go receiver methods carry a flat QN (e.g.
      *       "pkg.Area" rather than "pkg.Circle.Area"), so QN-string
      *       reconstruction would miss; and
-     *   (b) the reconstructed QN "<ClassQN>.<methodName>" — used by tests and any
-     *       extractor that does emit class-qualified method QNs without
-     *       DEFINES_METHOD edges from the class. */
+     *   (b) the reconstructed QN "<TypeQN>.<methodName>" — used by tests and any
+     *       extractor that emits type-qualified method QNs without
+     *       DEFINES_METHOD edges from the type. */
     const cbm_gbuf_edge_t **cls_dm = NULL;
     int cls_dm_count = 0;
-    cbm_gbuf_find_edges_by_source_type(ctx->gbuf, cls->id, "DEFINES_METHOD", &cls_dm,
+    cbm_gbuf_find_edges_by_source_type(ctx->gbuf, typ->id, "DEFINES_METHOD", &cls_dm,
                                        &cls_dm_count);
 
     char prefix[CBM_SZ_512];
-    snprintf(prefix, sizeof(prefix), "%s.", cls->qualified_name);
+    snprintf(prefix, sizeof(prefix), "%s.", typ->qualified_name);
 
     /* For each interface method, find the matching struct method node. */
     const cbm_gbuf_node_t *matched[CBM_SZ_128];
@@ -178,7 +177,7 @@ static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_nod
                 break;
             }
         }
-        /* (b) reconstructed "<ClassQN>.<methodName>" */
+        /* (b) reconstructed "<TypeQN>.<methodName>" */
         if (!found) {
             char method_qn[CBM_SZ_512];
             snprintf(method_qn, sizeof(method_qn), "%s%s", prefix, imethods[m].name);
@@ -189,7 +188,7 @@ static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_nod
         }
         matched[m] = found;
     }
-    cbm_gbuf_insert_edge(ctx->gbuf, cls->id, iface->id, "IMPLEMENTS", "{}");
+    cbm_gbuf_insert_edge(ctx->gbuf, typ->id, iface->id, "IMPLEMENTS", "{}");
     int edges = SKIP_ONE;
     for (int m = 0; m < im_count; m++) {
         cbm_gbuf_insert_edge(ctx->gbuf, matched[m]->id, imethods[m].id, "OVERRIDE", "{}");
@@ -208,11 +207,15 @@ int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx) {
         return 0;
     }
 
-    /* Find all Class nodes */
+    /* Find all Go struct nodes; older fixtures may still use Class. */
+    const cbm_gbuf_node_t **structs = NULL;
+    int struct_count = 0;
+    cbm_gbuf_find_by_label(ctx->gbuf, "Struct", &structs, &struct_count);
+
     const cbm_gbuf_node_t **classes = NULL;
     int class_count = 0;
     cbm_gbuf_find_by_label(ctx->gbuf, "Class", &classes, &class_count);
-    if (class_count == 0) {
+    if (struct_count == 0 && class_count == 0) {
         return 0;
     }
 
@@ -244,9 +247,14 @@ int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx) {
             continue;
         }
 
-        /* Check each Class node for method-set satisfaction */
+        /* Check each Go struct node for method-set satisfaction. */
+        for (int c = 0; c < struct_count; c++) {
+            edge_count += check_go_type_implements(ctx, structs[c], iface, imethods, im_count);
+        }
+
+        /* Preserve compatibility with legacy graph-buffer fixtures. */
         for (int c = 0; c < class_count; c++) {
-            edge_count += check_go_class_implements(ctx, classes[c], iface, imethods, im_count);
+            edge_count += check_go_type_implements(ctx, classes[c], iface, imethods, im_count);
         }
     }
     return edge_count;

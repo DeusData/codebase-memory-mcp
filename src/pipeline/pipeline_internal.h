@@ -54,16 +54,14 @@ int64_t cbm_pipeline_upsert_service_route(cbm_gbuf_t *gb, const char *path, cbm_
 
 static inline bool cbm_pipeline_label_is_registry_symbol(const char *label) {
     return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
-                     strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
-                     strcmp(label, "Variable") == 0 || strcmp(label, "Field") == 0);
+                     cbm_label_is_type_like(label) || strcmp(label, "Variable") == 0 ||
+                     strcmp(label, "Field") == 0);
 }
 
 static inline bool cbm_pipeline_label_is_import_target(const char *label) {
-    return label && (strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
-                     strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
-                     strcmp(label, "Module") == 0 || strcmp(label, "Struct") == 0 ||
-                     strcmp(label, "Enum") == 0 || strcmp(label, "Trait") == 0 ||
-                     strcmp(label, "Type") == 0 || strcmp(label, "File") == 0);
+    return label && (cbm_label_is_type_like(label) || strcmp(label, "Function") == 0 ||
+                     strcmp(label, "Method") == 0 || strcmp(label, "Module") == 0 ||
+                     strcmp(label, "File") == 0);
 }
 
 /* Time unit conversions */

@@ -353,8 +353,7 @@ static const char *resolve_as_class(const cbm_registry_t *reg, const char *name,
     if (!label) {
         return NULL;
     }
-    if (strcmp(label, "Class") != 0 && strcmp(label, "Interface") != 0 &&
-        strcmp(label, "Type") != 0 && strcmp(label, "Enum") != 0) {
+    if (!cbm_label_is_type_like(label)) {
         return NULL;
     }
     return res.qualified_name;
