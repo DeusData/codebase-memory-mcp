@@ -730,9 +730,30 @@ static bool is_infra_file(const char *fp) {
             strstr(fp, ".tf") != NULL || strstr(fp, ".hcl") != NULL || strstr(fp, ".toml") != NULL);
 }
 
+/* True when an infra key path denotes an upstream dependency, config value, or
+ * healthcheck target rather than an endpoint this service exposes. Exposed
+ * endpoint keys such as push_endpoint, callback, and webhook are intentionally
+ * absent so they can still produce infra Route nodes. */
+static bool is_upstream_config_key(const char *key_path) {
+    if (!key_path) {
+        return false;
+    }
+    static const char *const deny[] = {"jwks",     "registry",     "registries", "healthcheck",
+                                       "upstream", "_service_url", "auth",       NULL};
+    for (int i = 0; deny[i]; i++) {
+        if (strstr(key_path, deny[i]) != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Try to create an infra Route node from one string_ref. */
 static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, const char *fp) {
     if (sr->kind != CBM_STRREF_URL || !sr->value || !strstr(sr->value, "://")) {
+        return;
+    }
+    if (is_upstream_config_key(sr->key_path)) {
         return;
     }
     char route_qn[CBM_ROUTE_QN_SIZE];
@@ -747,17 +768,48 @@ static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, con
     cbm_gbuf_upsert_node(gbuf, "Route", sr->value, route_qn, fp, 0, 0, route_props);
 }
 
+/* The graph node is keyed by URL value, while extraction may emit several refs
+ * for the same value at different key-path granularities. If any ref says the
+ * value is upstream/config/healthcheck-only, suppress that URL globally. */
+static bool route_sr_denied(const CBMStringRef *sr) {
+    if (!sr || !sr->value || strpbrk(sr->value, " \t\r\n") != NULL) {
+        return true;
+    }
+    if (!sr->key_path) {
+        return true;
+    }
+    return is_upstream_config_key(sr->key_path);
+}
+
 static void cbm_pipeline_extract_infra_routes(cbm_gbuf_t *gbuf, const cbm_file_info_t *files,
                                               CBMFileResult **result_cache, int file_count) {
-    for (int i = 0; i < file_count; i++) {
-        if (!result_cache[i] || !is_infra_file(files[i].rel_path)) {
-            continue;
-        }
-        for (int si = 0; si < result_cache[i]->string_refs.count; si++) {
-            try_upsert_infra_route(gbuf, &result_cache[i]->string_refs.items[si],
-                                   files[i].rel_path);
+    enum { CBM_INFRA_ROUTE_DENY_PASS_COUNT = 2 };
+    CBMHashTable *denied = cbm_ht_create(CBM_SZ_16);
+    if (!denied) {
+        cbm_log_warn("pass.infra_routes", "reason", "deny_set_alloc_failed");
+        return;
+    }
+    for (int pass = 0; pass < CBM_INFRA_ROUTE_DENY_PASS_COUNT; pass++) {
+        for (int i = 0; i < file_count; i++) {
+            if (!result_cache[i] || !is_infra_file(files[i].rel_path)) {
+                continue;
+            }
+            for (int si = 0; si < result_cache[i]->string_refs.count; si++) {
+                const CBMStringRef *sr = &result_cache[i]->string_refs.items[si];
+                if (sr->kind != CBM_STRREF_URL || !sr->value || !strstr(sr->value, "://")) {
+                    continue;
+                }
+                if (pass == 0) {
+                    if (route_sr_denied(sr)) {
+                        cbm_ht_set(denied, sr->value, intptr_to_ptr(1));
+                    }
+                } else if (!cbm_ht_has(denied, sr->value)) {
+                    try_upsert_infra_route(gbuf, sr, files[i].rel_path);
+                }
+            }
         }
     }
+    cbm_ht_free(denied);
 }
 
 /* Run decorator_tags, configlink, and route matching passes. */
