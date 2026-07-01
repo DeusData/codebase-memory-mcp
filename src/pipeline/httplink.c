@@ -50,6 +50,16 @@ static int imax(int a, int b) {
     return a > b ? a : b;
 }
 
+static void httplink_copy_cstr(char *dst, size_t dst_sz, const char *src) {
+    if (!dst || dst_sz == 0) {
+        return;
+    }
+    int n = snprintf(dst, dst_sz, "%s", src ? src : "");
+    if (n < 0 || (size_t)n >= dst_sz) {
+        dst[dst_sz - 1] = '\0';
+    }
+}
+
 int cbm_levenshtein_distance(const char *a, const char *b) {
     int la = (int)strlen(a);
     int lb = (int)strlen(b);
@@ -274,9 +284,9 @@ bool cbm_paths_match(const char *call_path, const char *route_path) {
     /* Split both into segments */
     char call_copy[1024];
     char route_copy[1024];
-    strncpy(call_copy, norm_call, sizeof(call_copy) - 1);
+    httplink_copy_cstr(call_copy, sizeof(call_copy), norm_call);
     call_copy[sizeof(call_copy) - 1] = '\0';
-    strncpy(route_copy, norm_route, sizeof(route_copy) - 1);
+    httplink_copy_cstr(route_copy, sizeof(route_copy), norm_route);
     route_copy[sizeof(route_copy) - 1] = '\0';
 
     /* For suffix matching with segments: try matching from the end.
@@ -357,9 +367,9 @@ static double segment_jaccard(const char *norm_call, const char *norm_route) {
     /* Split into segments */
     char a[1024];
     char b[1024];
-    strncpy(a, norm_call, sizeof(a) - 1);
+    httplink_copy_cstr(a, sizeof(a), norm_call);
     a[sizeof(a) - 1] = '\0';
-    strncpy(b, norm_route, sizeof(b) - 1);
+    httplink_copy_cstr(b, sizeof(b), norm_route);
     b[sizeof(b) - 1] = '\0';
 
     char *a_segs[64];
@@ -432,9 +442,9 @@ double cbm_path_match_score(const char *call_path, const char *route_path) {
             /* Segment-wise match with wildcards */
             char c2[1024];
             char r2[1024];
-            strncpy(c2, norm_call, sizeof(c2) - 1);
+            httplink_copy_cstr(c2, sizeof(c2), norm_call);
             c2[sizeof(c2) - 1] = '\0';
-            strncpy(r2, norm_route, sizeof(r2) - 1);
+            httplink_copy_cstr(r2, sizeof(r2), norm_route);
             r2[sizeof(r2) - 1] = '\0';
 
             char *cs[64];
@@ -493,9 +503,9 @@ bool cbm_same_service(const char *qn1, const char *qn2) {
     /* Split QN by '.', strip last 2 segments (module+name), compare rest */
     char a[1024];
     char b[1024];
-    strncpy(a, qn1, sizeof(a) - 1);
+    httplink_copy_cstr(a, sizeof(a), qn1);
     a[sizeof(a) - 1] = '\0';
-    strncpy(b, qn2, sizeof(b) - 1);
+    httplink_copy_cstr(b, sizeof(b), qn2);
     b[sizeof(b) - 1] = '\0';
 
     /* Count segments */
@@ -798,10 +808,10 @@ int cbm_extract_python_routes(const char *name, const char *qn, const char **dec
             memcpy(r->path, decorators[i] + match[1].rm_so, (size_t)plen);
             r->path[plen] = '\0';
 
-            strncpy(r->method, "WS", sizeof(r->method) - 1);
-            strncpy(r->protocol, "ws", sizeof(r->protocol) - 1);
-            strncpy(r->function_name, name ? name : "", sizeof(r->function_name) - 1);
-            strncpy(r->qualified_name, qn ? qn : "", sizeof(r->qualified_name) - 1);
+            httplink_copy_cstr(r->method, sizeof(r->method), "WS");
+            httplink_copy_cstr(r->protocol, sizeof(r->protocol), "ws");
+            httplink_copy_cstr(r->function_name, sizeof(r->function_name), name ? name : "");
+            httplink_copy_cstr(r->qualified_name, sizeof(r->qualified_name), qn ? qn : "");
             count++;
             continue;
         }
@@ -831,8 +841,8 @@ int cbm_extract_python_routes(const char *name, const char *qn, const char **dec
             memcpy(r->path, decorators[i] + match[2].rm_so, (size_t)plen);
             r->path[plen] = '\0';
 
-            strncpy(r->function_name, name ? name : "", sizeof(r->function_name) - 1);
-            strncpy(r->qualified_name, qn ? qn : "", sizeof(r->qualified_name) - 1);
+            httplink_copy_cstr(r->function_name, sizeof(r->function_name), name ? name : "");
+            httplink_copy_cstr(r->qualified_name, sizeof(r->qualified_name), qn ? qn : "");
             count++;
         }
     }
@@ -977,7 +987,7 @@ int cbm_extract_go_routes(const char *name, const char *qn, const char *source,
             /* Check if we've passed a chi Route() match end */
             while (next_chi < nchi && i >= chi_matches[next_chi].end_pos) {
                 pending = true;
-                strncpy(pending_prefix, chi_matches[next_chi].prefix, sizeof(pending_prefix) - 1);
+                httplink_copy_cstr(pending_prefix, sizeof(pending_prefix), chi_matches[next_chi].prefix);
                 pending_prefix[sizeof(pending_prefix) - 1] = '\0';
                 next_chi++;
             }
@@ -985,8 +995,8 @@ int cbm_extract_go_routes(const char *name, const char *qn, const char *source,
             if (i < src_len && source[i] == '{') {
                 brace_depth++;
                 if (pending && chi_top < 32) {
-                    strncpy(chi_stack[chi_top].prefix, pending_prefix,
-                            sizeof(chi_stack[chi_top].prefix) - 1);
+                    httplink_copy_cstr(chi_stack[chi_top].prefix,
+                                       sizeof(chi_stack[chi_top].prefix), pending_prefix);
                     chi_stack[chi_top].prefix[sizeof(chi_stack[chi_top].prefix) - 1] = '\0';
                     chi_stack[chi_top].depth = brace_depth;
                     chi_top++;
@@ -1067,7 +1077,7 @@ int cbm_extract_go_routes(const char *name, const char *qn, const char *source,
             if (strcmp(receiver, gin_groups[g].var) == 0) {
                 char full_path[512];
                 snprintf(full_path, sizeof(full_path), "%s%s", gin_groups[g].prefix, r->path);
-                strncpy(r->path, full_path, sizeof(r->path) - 1);
+                httplink_copy_cstr(r->path, sizeof(r->path), full_path);
                 r->path[sizeof(r->path) - 1] = '\0';
                 gin_applied = true;
                 break;
@@ -1078,12 +1088,12 @@ int cbm_extract_go_routes(const char *name, const char *qn, const char *source,
         if (!gin_applied && route_chi_prefix[ri][0]) {
             char full_path[512];
             snprintf(full_path, sizeof(full_path), "%s%s", route_chi_prefix[ri], r->path);
-            strncpy(r->path, full_path, sizeof(r->path) - 1);
+            httplink_copy_cstr(r->path, sizeof(r->path), full_path);
             r->path[sizeof(r->path) - 1] = '\0';
         }
 
-        strncpy(r->function_name, name ? name : "", sizeof(r->function_name) - 1);
-        strncpy(r->qualified_name, qn ? qn : "", sizeof(r->qualified_name) - 1);
+        httplink_copy_cstr(r->function_name, sizeof(r->function_name), name ? name : "");
+        httplink_copy_cstr(r->qualified_name, sizeof(r->qualified_name), qn ? qn : "");
 
         /* Handler ref from capture group 3 (e.g., "h.CreateOrder") */
         if (route_matches[ri].handler_so >= 0) {
@@ -1153,10 +1163,10 @@ int cbm_extract_java_routes(const char *name, const char *qn, const char **decor
             memcpy(r->path, decorators[i] + match[1].rm_so, (size_t)plen);
             r->path[plen] = '\0';
 
-            strncpy(r->method, "WS", sizeof(r->method) - 1);
-            strncpy(r->protocol, "ws", sizeof(r->protocol) - 1);
-            strncpy(r->function_name, name ? name : "", sizeof(r->function_name) - 1);
-            strncpy(r->qualified_name, qn ? qn : "", sizeof(r->qualified_name) - 1);
+            httplink_copy_cstr(r->method, sizeof(r->method), "WS");
+            httplink_copy_cstr(r->protocol, sizeof(r->protocol), "ws");
+            httplink_copy_cstr(r->function_name, sizeof(r->function_name), name ? name : "");
+            httplink_copy_cstr(r->qualified_name, sizeof(r->qualified_name), qn ? qn : "");
             count++;
             continue;
         }
@@ -1176,17 +1186,17 @@ int cbm_extract_java_routes(const char *name, const char *qn, const char **decor
             method_name[mlen] = '\0';
 
             if (strcmp(method_name, "Get") == 0) {
-                strncpy(r->method, "GET", sizeof(r->method) - 1);
+                httplink_copy_cstr(r->method, sizeof(r->method), "GET");
             } else if (strcmp(method_name, "Post") == 0) {
-                strncpy(r->method, "POST", sizeof(r->method) - 1);
+                httplink_copy_cstr(r->method, sizeof(r->method), "POST");
             } else if (strcmp(method_name, "Put") == 0) {
-                strncpy(r->method, "PUT", sizeof(r->method) - 1);
+                httplink_copy_cstr(r->method, sizeof(r->method), "PUT");
             } else if (strcmp(method_name, "Delete") == 0) {
-                strncpy(r->method, "DELETE", sizeof(r->method) - 1);
+                httplink_copy_cstr(r->method, sizeof(r->method), "DELETE");
             } else if (strcmp(method_name, "Patch") == 0) {
-                strncpy(r->method, "PATCH", sizeof(r->method) - 1);
+                httplink_copy_cstr(r->method, sizeof(r->method), "PATCH");
             } else {
-                strncpy(r->method, "ANY", sizeof(r->method) - 1);
+                httplink_copy_cstr(r->method, sizeof(r->method), "ANY");
             }
 
             /* Path */
@@ -1197,8 +1207,8 @@ int cbm_extract_java_routes(const char *name, const char *qn, const char **decor
             memcpy(r->path, decorators[i] + match[3].rm_so, (size_t)plen);
             r->path[plen] = '\0';
 
-            strncpy(r->function_name, name ? name : "", sizeof(r->function_name) - 1);
-            strncpy(r->qualified_name, qn ? qn : "", sizeof(r->qualified_name) - 1);
+            httplink_copy_cstr(r->function_name, sizeof(r->function_name), name ? name : "");
+            httplink_copy_cstr(r->qualified_name, sizeof(r->qualified_name), qn ? qn : "");
             count++;
         }
     }
@@ -1246,10 +1256,10 @@ int cbm_extract_ktor_routes(const char *name, const char *qn, const char *source
         memcpy(r->path, p + match[1].rm_so, (size_t)plen);
         r->path[plen] = '\0';
 
-        strncpy(r->method, "WS", sizeof(r->method) - 1);
-        strncpy(r->protocol, "ws", sizeof(r->protocol) - 1);
-        strncpy(r->function_name, name ? name : "", sizeof(r->function_name) - 1);
-        strncpy(r->qualified_name, qn ? qn : "", sizeof(r->qualified_name) - 1);
+        httplink_copy_cstr(r->method, sizeof(r->method), "WS");
+        httplink_copy_cstr(r->protocol, sizeof(r->protocol), "ws");
+        httplink_copy_cstr(r->function_name, sizeof(r->function_name), name ? name : "");
+        httplink_copy_cstr(r->qualified_name, sizeof(r->qualified_name), qn ? qn : "");
         count++;
         p += match[0].rm_eo;
     }
@@ -1285,8 +1295,8 @@ int cbm_extract_ktor_routes(const char *name, const char *qn, const char *source
             memcpy(r->path, p + match[2].rm_so, (size_t)plen);
             r->path[plen] = '\0';
 
-            strncpy(r->function_name, name ? name : "", sizeof(r->function_name) - 1);
-            strncpy(r->qualified_name, qn ? qn : "", sizeof(r->qualified_name) - 1);
+            httplink_copy_cstr(r->function_name, sizeof(r->function_name), name ? name : "");
+            httplink_copy_cstr(r->qualified_name, sizeof(r->qualified_name), qn ? qn : "");
             count++;
         }
         p += match[0].rm_eo;
@@ -1363,8 +1373,8 @@ int cbm_extract_express_routes(const char *name, const char *qn, const char *sou
             memcpy(r->path, p + match[3].rm_so, (size_t)plen);
             r->path[plen] = '\0';
 
-            strncpy(r->function_name, name ? name : "", sizeof(r->function_name) - 1);
-            strncpy(r->qualified_name, qn ? qn : "", sizeof(r->qualified_name) - 1);
+            httplink_copy_cstr(r->function_name, sizeof(r->function_name), name ? name : "");
+            httplink_copy_cstr(r->qualified_name, sizeof(r->qualified_name), qn ? qn : "");
             count++;
         }
         p += match[0].rm_eo;
@@ -1425,8 +1435,8 @@ int cbm_extract_laravel_routes(const char *name, const char *qn, const char *sou
             continue;
         }
 
-        strncpy(r->function_name, name ? name : "", sizeof(r->function_name) - 1);
-        strncpy(r->qualified_name, qn ? qn : "", sizeof(r->qualified_name) - 1);
+        httplink_copy_cstr(r->function_name, sizeof(r->function_name), name ? name : "");
+        httplink_copy_cstr(r->qualified_name, sizeof(r->qualified_name), qn ? qn : "");
         count++;
         p += match[0].rm_eo;
     }
