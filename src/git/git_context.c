@@ -1,6 +1,7 @@
 #include "git/git_context.h"
 
 #include "foundation/compat_fs.h"
+#include "foundation/compat.h"
 #include "foundation/constants.h"
 #include "foundation/str_util.h"
 
@@ -12,22 +13,9 @@
 #include <sys/stat.h>
 
 enum {
-    GIT_CMD_MAX = 1024,
-    GIT_OUTPUT_MAX = 4096,
+    CBM_GIT_CONTEXT_CMD_BUFSZ = CBM_SZ_1K,
+    CBM_GIT_CONTEXT_OUTPUT_BUFSZ = CBM_SZ_4K,
 };
-
-static char *git_strdup(const char *s) {
-    if (!s) {
-        s = "";
-    }
-    size_t n = strlen(s) + 1;
-    char *out = (char *)malloc(n);
-    if (!out) {
-        return NULL;
-    }
-    memcpy(out, s, n);
-    return out;
-}
 
 static void trim_newlines(char *s) {
     if (!s) {
@@ -62,7 +50,7 @@ static int git_capture(const char *repo_path, const char *git_args, char **out) 
         return CBM_NOT_FOUND;
     }
 
-    char cmd[GIT_CMD_MAX];
+    char cmd[CBM_GIT_CONTEXT_CMD_BUFSZ];
 #ifdef _WIN32
     const char *null_dev = "NUL";
 #else
@@ -80,7 +68,7 @@ static int git_capture(const char *repo_path, const char *git_args, char **out) 
         return CBM_NOT_FOUND;
     }
 
-    char buf[GIT_OUTPUT_MAX];
+    char buf[CBM_GIT_CONTEXT_OUTPUT_BUFSZ];
     if (!fgets(buf, sizeof(buf), fp)) {
         cbm_pclose(fp);
         return CBM_NOT_FOUND;
@@ -92,7 +80,7 @@ static int git_capture(const char *repo_path, const char *git_args, char **out) 
         return CBM_NOT_FOUND;
     }
 
-    *out = git_strdup(buf);
+    *out = cbm_strdup(buf);
     return *out ? 0 : CBM_NOT_FOUND;
 }
 
@@ -112,7 +100,7 @@ static bool path_is_absolute(const char *path) {
 
 static char *join_root_relative(const char *root, const char *rel) {
     if (!root || !root[0]) {
-        return git_strdup(rel);
+        return cbm_strdup(rel);
     }
     int n = snprintf(NULL, 0, "%s/%s", root, rel);
     if (n < 0) {
@@ -129,10 +117,10 @@ static char *join_root_relative(const char *root, const char *rel) {
 static char *derive_canonical_root(const char *worktree_root, const char *git_common_dir) {
     const char *src = git_common_dir && git_common_dir[0] ? git_common_dir : worktree_root;
     if (!src) {
-        return git_strdup("");
+        return cbm_strdup("");
     }
 
-    char *root = path_is_absolute(src) ? git_strdup(src) : join_root_relative(worktree_root, src);
+    char *root = path_is_absolute(src) ? cbm_strdup(src) : join_root_relative(worktree_root, src);
     if (!root) {
         return NULL;
     }
@@ -186,7 +174,7 @@ static char *slug_from_branch(const char *branch, bool detached) {
 
     if (slug[0] == '\0') {
         free(slug);
-        return git_strdup(fallback);
+        return cbm_strdup(fallback);
     }
     return slug;
 }
@@ -217,7 +205,7 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
         return CBM_NOT_FOUND;
     }
 
-    out->input_path = git_strdup(path);
+    out->input_path = cbm_strdup(path);
     if (!out->input_path) {
         return CBM_NOT_FOUND;
     }
@@ -235,17 +223,17 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
     out->is_git = true;
 
     if (git_capture(path, "rev-parse --git-dir", &out->git_dir) != 0) {
-        out->git_dir = git_strdup("");
+        out->git_dir = cbm_strdup("");
     }
     if (git_capture(path, "rev-parse --git-common-dir", &out->git_common_dir) != 0) {
-        out->git_common_dir = git_strdup("");
+        out->git_common_dir = cbm_strdup("");
     }
     if (git_capture(path, "rev-parse --verify HEAD", &out->head_sha) != 0) {
-        out->head_sha = git_strdup("");
+        out->head_sha = cbm_strdup("");
     }
 
     if (git_capture(path, "symbolic-ref --quiet --short HEAD", &out->branch) != 0) {
-        out->branch = git_strdup("DETACHED");
+        out->branch = cbm_strdup("DETACHED");
         out->is_detached = true;
     }
 
@@ -254,7 +242,7 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
     out->canonical_root = derive_canonical_root(out->worktree_root, out->git_common_dir);
     out->branch_slug = slug_from_branch(out->branch, out->is_detached);
     if (git_capture(path, "merge-base HEAD @{upstream}", &out->base_sha) != 0) {
-        out->base_sha = git_strdup("");
+        out->base_sha = cbm_strdup("");
     }
 
     if (!out->git_dir || !out->git_common_dir || !out->head_sha || !out->branch ||
