@@ -167,6 +167,20 @@ static const char *scope_where(cbm_rank_scope_t scope) {
     }
 }
 
+static cbm_rank_scope_t rank_scope_from_config(cbm_config_t *cfg) {
+    const char *scope = cbm_config_get(cfg, CBM_CONFIG_RANK_SCOPE, NULL);
+    if (!scope || !scope[0] || strcmp(scope, "full") == 0) {
+        return CBM_DEFAULT_RANK_SCOPE;
+    }
+    if (strcmp(scope, "project") == 0) {
+        return CBM_RANK_SCOPE_PROJECT;
+    }
+    if (strcmp(scope, "deps") == 0) {
+        return CBM_RANK_SCOPE_DEPS;
+    }
+    return CBM_DEFAULT_RANK_SCOPE;
+}
+
 /* ── Core PageRank + LinkRank ────────────────────────────────── */
 
 int cbm_pagerank_compute(cbm_store_t *store, const char *project,
@@ -396,9 +410,11 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     char ts[CBM_ISO_TIMESTAMP_LEN];
     iso_now(ts, sizeof(ts));
 
-    /* Clear old ranks for this scope */
+    /* Rank tables do not include a scope column. Clear project and dependency
+     * ranks before writing any scope so narrower recomputes cannot leave stale
+     * rows from a previous full-scope compute. */
     snprintf(sql_buf, sizeof(sql_buf), "DELETE FROM pagerank WHERE %s",
-             scope_where(scope));
+             scope_where(CBM_RANK_SCOPE_FULL));
     if (sqlite3_prepare_v2(db, sql_buf, -1, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
         sqlite3_step(stmt);
@@ -433,7 +449,7 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
 
     /* ── Step 6: Compute LinkRank for edges ───────────────── */
     snprintf(sql_buf, sizeof(sql_buf), "DELETE FROM linkrank WHERE %s",
-             scope_where(scope));
+             scope_where(CBM_RANK_SCOPE_FULL));
     if (sqlite3_prepare_v2(db, sql_buf, -1, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
         sqlite3_step(stmt);
@@ -482,7 +498,7 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
         }
         /* Clear old degree data */
         snprintf(sql_buf, sizeof(sql_buf), "DELETE FROM node_degree WHERE %s",
-                 scope_where(scope));
+                 scope_where(CBM_RANK_SCOPE_FULL));
         if (sqlite3_prepare_v2(db, sql_buf, -1, &stmt, NULL) == SQLITE_OK) {
             sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
             sqlite3_step(stmt);
@@ -604,9 +620,11 @@ int cbm_pagerank_compute_with_config(cbm_store_t *store, const char *project,
     double damping = cbm_config_get_double(cfg, CBM_CONFIG_PAGERANK_DAMPING, CBM_PAGERANK_DAMPING);
     double epsilon = cbm_config_get_double(cfg, CBM_CONFIG_PAGERANK_EPSILON, CBM_PAGERANK_EPSILON);
 
+    cbm_rank_scope_t scope = rank_scope_from_config(cfg);
+
     return cbm_pagerank_compute(store, project,
         damping, epsilon,
-        max_iter, &w, CBM_DEFAULT_RANK_SCOPE);
+        max_iter, &w, scope);
 }
 
 double cbm_pagerank_get(cbm_store_t *store, int64_t node_id) {

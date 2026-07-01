@@ -2984,13 +2984,12 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "1e-6 default. Lower (1e-8) iterates longer for marginally finer convergence (rarely needed); "
      "higher (1e-4) stops sooner with slightly less precise rankings. Must be > 0 — non-positive and "
      "NaN values are clamped to 1e-6. Rarely needs tuning; pair with pagerank_max_iter as the hard cap."},
-    {"rank_scope", "project", NULL, "PageRank",
-     "Whether PageRank importance is computed per-project or across all indexed projects",
-     "project|full",
-     "'project' (default): each project's symbols are scored independently — scores are "
-     "comparable within a project but not across projects. "
-     "'full': scores all projects in one global computation — enables cross-project comparison "
-     "but is slower and dependency scores mix with your project's scores."},
+    {"rank_scope", "full", NULL, "PageRank",
+     "Project/dependency scope used when computing PageRank and LinkRank",
+     "full|project|deps",
+     "'full' (default): score the project plus its dependency sub-projects. "
+     "'project': score only the requested project's own symbols. "
+     "'deps': score only dependency sub-project symbols."},
     {"edge_weight_calls", "1.0", NULL, "PageRank",
      "How much importance flows along direct function/method call edges (CALLS)",
      "0.0-100.0",

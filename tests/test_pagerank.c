@@ -13,6 +13,7 @@
 #include "../src/foundation/compat.h"
 #include "../src/foundation/constants.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <store/store.h>
 #include <pagerank/pagerank.h>
 #include <depindex/depindex.h>
@@ -309,6 +310,39 @@ TEST(pagerank_project_scope_excludes_deps) {
                                   &CBM_DEFAULT_EDGE_WEIGHTS, CBM_RANK_SCOPE_PROJECT);
     ASSERT_EQ(rc, 1);
     ASSERT_TRUE(get_pr(s, dep) == 0.0);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pagerank_rank_scope_config_controls_scope_and_clears_stale_rows) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "cfgscope", "/tmp/cfgscope");
+    cbm_store_upsert_project(s, "cfgscope.dep.lib", "/tmp/lib");
+    int64_t app = add_node(s, "cfgscope", "app_main");
+    int64_t dep = add_node(s, "cfgscope.dep.lib", "lib_func");
+    add_edge(s, "cfgscope", app, dep, "CALLS");
+
+    char tmpdir[CBM_PATH_MAX];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/pr-scope-XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(tmpdir) != NULL);
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_SCOPE, "full"), 0);
+    ASSERT_EQ(cbm_pagerank_compute_with_config(s, "cfgscope", cfg), 2);
+    ASSERT_TRUE(get_pr(s, dep) > 0.0);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_SCOPE, "project"), 0);
+    ASSERT_EQ(cbm_pagerank_compute_with_config(s, "cfgscope", cfg), 1);
+    ASSERT_TRUE(get_pr(s, app) > 0.0);
+    ASSERT_TRUE(get_pr(s, dep) == 0.0);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_SCOPE, "invalid"), 0);
+    ASSERT_EQ(cbm_pagerank_compute_with_config(s, "cfgscope", cfg), 2);
+    ASSERT_TRUE(get_pr(s, dep) > 0.0);
+
+    cbm_config_close(cfg);
+    th_rmtree(tmpdir);
     cbm_store_close(s);
     PASS();
 }
@@ -885,7 +919,7 @@ TEST(pagerank_damping_epsilon_config_tunable) {
     add_edge(s, "cfg", hub, s3, "CALLS");
     add_edge(s, "cfg", s1, hub, "CALLS");
 
-    char tmpdir[256];
+    char tmpdir[CBM_PATH_MAX];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/pr-cfg-XXXXXX");
     ASSERT_TRUE(cbm_mkdtemp(tmpdir) != NULL);
     cbm_config_t *cfg = cbm_config_open(tmpdir);
@@ -909,8 +943,7 @@ TEST(pagerank_damping_epsilon_config_tunable) {
     ASSERT_TRUE(fabs(total - 1.0) < 0.05);
 
     cbm_config_close(cfg);
-    /* tmpdir is uniquely-named under /tmp; left for OS cleanup (no shared
-     * recursive-rmdir helper available in the test framework). */
+    th_rmtree(tmpdir);
     cbm_store_close(s);
     PASS();
 }
@@ -995,6 +1028,7 @@ SUITE(pagerank) {
     RUN_TEST(pagerank_full_scope_includes_deps);
     RUN_TEST(pagerank_full_scope_preserves_dep_project_attribution);
     RUN_TEST(pagerank_project_scope_excludes_deps);
+    RUN_TEST(pagerank_rank_scope_config_controls_scope_and_clears_stale_rows);
     RUN_TEST(pagerank_dangling_nodes);
     RUN_TEST(pagerank_null_safety);
     /* Edge cases from igraph/NetworkX (13 tests) */
