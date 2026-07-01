@@ -80,6 +80,10 @@ static bool json_get_bool(const char *json, const char *key) {
     return *p == 't';
 }
 
+static int max_int(int a, int b) {
+    return a > b ? a : b;
+}
+
 static bool path_in_scope(const char *path, const char *const *paths, int path_count) {
     if (!paths || path_count <= 0) {
         return true;
@@ -143,7 +147,8 @@ typedef struct {
  * remember the node pointer for write-back. SCC detection below ORs in mutual
  * recursion discovered from CALLS cycles. */
 static void seed_loop_depths(const cbm_gbuf_t *gb, const char *label, int *loop_depth,
-                             bool *recursive, cbm_gbuf_node_t **nptr, int64_t maxid) {
+                             int *stored_tld, bool *recursive, cbm_gbuf_node_t **nptr,
+                             int64_t maxid) {
     const cbm_gbuf_node_t **nodes = NULL;
     int count = 0;
     if (cbm_gbuf_find_by_label(gb, label, &nodes, &count) != 0) {
@@ -153,6 +158,8 @@ static void seed_loop_depths(const cbm_gbuf_t *gb, const char *label, int *loop_
         const cbm_gbuf_node_t *n = nodes[i];
         if (n->id >= 1 && n->id <= maxid) {
             loop_depth[n->id] = json_get_int(n->properties_json, "loop_depth", 0);
+            stored_tld[n->id] =
+                json_get_int(n->properties_json, "transitive_loop_depth", CBM_NOT_FOUND);
             recursive[n->id] = json_get_bool(n->properties_json, "self_recursive");
             nptr[n->id] = (cbm_gbuf_node_t *)n;
         }
@@ -356,7 +363,7 @@ static int scc_tld_dfs(int component_id, const scc_adj_t *adj, const int *compon
 }
 
 static void pass_complexity_impl(cbm_pipeline_ctx_t *ctx, const char *const *paths,
-                                 int path_count) {
+                                 int path_count, bool use_stored_tld) {
     cbm_gbuf_t *gb = ctx->gbuf;
     /* Node and edge IDs are drawn from one shared counter, so node IDs are NOT
      * contiguous 1..node_count — they interleave with edge IDs. Size the lookup
@@ -367,25 +374,29 @@ static void pass_complexity_impl(cbm_pipeline_ctx_t *ctx, const char *const *pat
     }
     size_t sz = (size_t)maxid + 1;
     int *loop_depth = calloc(sz, sizeof(int));
+    int *stored_tld = malloc(sz * sizeof(int));
     bool *recursive = calloc(sz, sizeof(bool));
     cbm_gbuf_node_t **nptr = calloc(sz, sizeof(cbm_gbuf_node_t *));
     int *component = malloc(sz * sizeof(int));
-    if (!loop_depth || !recursive || !nptr || !component) {
+    if (!loop_depth || !stored_tld || !recursive || !nptr || !component) {
         free(loop_depth);
+        free(stored_tld);
         free(recursive);
         free(nptr);
         free(component);
         return;
     }
     for (int64_t id = 0; id <= maxid; id++) {
+        stored_tld[id] = CBM_NOT_FOUND;
         component[id] = CBM_NOT_FOUND;
     }
 
-    seed_loop_depths(gb, "Function", loop_depth, recursive, nptr, maxid);
-    seed_loop_depths(gb, "Method", loop_depth, recursive, nptr, maxid);
+    seed_loop_depths(gb, "Function", loop_depth, stored_tld, recursive, nptr, maxid);
+    seed_loop_depths(gb, "Method", loop_depth, stored_tld, recursive, nptr, maxid);
     int component_count = mark_recursive_sccs(gb, nptr, recursive, component, maxid);
     if (component_count <= 0) {
         free(loop_depth);
+        free(stored_tld);
         free(recursive);
         free(nptr);
         free(component);
@@ -402,6 +413,7 @@ static void pass_complexity_impl(cbm_pipeline_ctx_t *ctx, const char *const *pat
         free(component_tld);
         free(component_state);
         free(loop_depth);
+        free(stored_tld);
         free(recursive);
         free(nptr);
         free(component);
@@ -413,8 +425,11 @@ static void pass_complexity_impl(cbm_pipeline_ctx_t *ctx, const char *const *pat
             continue;
         }
         int component_id = component[id];
-        if (component_id >= 0 && loop_depth[id] > component_loop[component_id]) {
-            component_loop[component_id] = loop_depth[id];
+        int base_tld = (use_stored_tld && stored_tld[id] >= 0)
+                           ? max_int(loop_depth[id], stored_tld[id])
+                           : loop_depth[id];
+        if (component_id >= 0 && base_tld > component_loop[component_id]) {
+            component_loop[component_id] = base_tld;
         }
     }
     for (int component_id = 0; component_id < component_count; component_id++) {
@@ -444,16 +459,17 @@ static void pass_complexity_impl(cbm_pipeline_ctx_t *ctx, const char *const *pat
     free(component_tld);
     free(component_state);
     free(loop_depth);
+    free(stored_tld);
     free(recursive);
     free(nptr);
     free(component);
 }
 
 void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx) {
-    pass_complexity_impl(ctx, NULL, 0);
+    pass_complexity_impl(ctx, NULL, 0, false);
 }
 
 void cbm_pipeline_pass_complexity_for_paths(cbm_pipeline_ctx_t *ctx, const char *const *paths,
                                             int path_count) {
-    pass_complexity_impl(ctx, paths, path_count);
+    pass_complexity_impl(ctx, paths, path_count, true);
 }
