@@ -10013,6 +10013,19 @@ TEST(pipeline_unit_threshold_setters_clamp_invalid_values) {
     PASS();
 }
 
+TEST(pipeline_publish_kind_names_are_stable) {
+    ASSERT_STR_EQ(cbm_pipeline_publish_kind_name(CBM_PIPELINE_PUBLISH_NONE), "none");
+    ASSERT_STR_EQ(cbm_pipeline_publish_kind_name(CBM_PIPELINE_PUBLISH_FULL), "full");
+    ASSERT_STR_EQ(cbm_pipeline_publish_kind_name(CBM_PIPELINE_PUBLISH_INCREMENTAL_NOOP),
+                  "incremental_noop");
+    ASSERT_STR_EQ(cbm_pipeline_publish_kind_name(CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT),
+                  "incremental_exact");
+    ASSERT_STR_EQ(cbm_pipeline_publish_kind_name(CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT),
+                  "incremental_containment");
+    ASSERT_STR_EQ(cbm_pipeline_publish_kind_name((cbm_pipeline_publish_kind_t)999), "unknown");
+    PASS();
+}
+
 TEST(pipeline_apply_config_sets_all_thresholds) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pipeline_cfg_XXXXXX");
@@ -11175,6 +11188,7 @@ SUITE(pipeline) {
     /* Resource management & internal helper tests */
     RUN_TEST(pipeline_empty_path);
     RUN_TEST(pipeline_project_name_content);
+    RUN_TEST(pipeline_publish_kind_names_are_stable);
     RUN_TEST(pipeline_cancel_sets_flag);
     RUN_TEST(pipeline_double_cancel);
     RUN_TEST(pipeline_double_free_prevention);

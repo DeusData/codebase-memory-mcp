@@ -403,6 +403,23 @@ cbm_pipeline_publish_kind_t cbm_pipeline_publish_kind(const cbm_pipeline_t *p) {
     return p ? p->publish_kind : CBM_PIPELINE_PUBLISH_NONE;
 }
 
+const char *cbm_pipeline_publish_kind_name(cbm_pipeline_publish_kind_t kind) {
+    switch (kind) {
+    case CBM_PIPELINE_PUBLISH_NONE:
+        return "none";
+    case CBM_PIPELINE_PUBLISH_FULL:
+        return "full";
+    case CBM_PIPELINE_PUBLISH_INCREMENTAL_NOOP:
+        return "incremental_noop";
+    case CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT:
+        return "incremental_exact";
+    case CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT:
+        return "incremental_containment";
+    default:
+        return "unknown";
+    }
+}
+
 void cbm_pipeline_set_graph_changed(cbm_pipeline_t *p, bool changed) {
     if (p) {
         p->graph_changed = changed;

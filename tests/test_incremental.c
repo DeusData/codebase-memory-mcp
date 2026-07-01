@@ -2174,6 +2174,21 @@ TEST(tool_index_mode_fast) {
     PASS();
 }
 
+TEST(tool_index_publish_metadata) {
+    double ms;
+    char *r = call_tool_timed("index_repository", &ms, "{\"repo_path\":\"%s\",\"mode\":\"fast\"}",
+                              g_repodir);
+    ASSERT(r != NULL);
+    ASSERT(strstr(r, "\\\"publish_kind\\\":\\\"") != NULL);
+    ASSERT(strstr(r, "\\\"graph_changed\\\":") != NULL);
+    ASSERT(strstr(r, "\\\"publish_kind\\\":\\\"full\\\"") != NULL ||
+           strstr(r, "\\\"publish_kind\\\":\\\"incremental_noop\\\"") != NULL ||
+           strstr(r, "\\\"publish_kind\\\":\\\"incremental_exact\\\"") != NULL ||
+           strstr(r, "\\\"publish_kind\\\":\\\"incremental_containment\\\"") != NULL);
+    free(r);
+    PASS();
+}
+
 TEST(tool_index_invalid_path) {
     double ms;
     char *r = call_tool_timed("index_repository", &ms, "{\"repo_path\":\"/nonexistent/path/xyz\"}");
@@ -3264,6 +3279,7 @@ SUITE(incremental) {
 
     /* Phase 19: index_repository params */
     RUN_TEST(tool_index_mode_fast);
+    RUN_TEST(tool_index_publish_metadata);
     RUN_TEST(tool_index_invalid_path);
     RUN_TEST(tool_index_missing_param);
 
