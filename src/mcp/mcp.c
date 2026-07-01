@@ -452,8 +452,9 @@ typedef struct {
 static const tool_def_t TOOLS[] = {
     {"index_repository",
      "Index a repository into the knowledge graph. Use for explicit indexing or pre-warming; "
-     "default search/trace tools can auto-index the server CWD or explicit directory paths "
-     "on first use when auto_index is enabled. "
+     "graph-backed default tools (search_graph, query_graph, trace_path, get_code) can "
+     "auto-index the server CWD or explicit directory paths on first use when auto_index "
+     "is enabled. "
      "Special mode 'cross-repo-intelligence': skip extraction, only match Routes/Channels "
      "across projects to create CROSS_HTTP_CALLS/CROSS_ASYNC_CALLS/CROSS_CHANNEL edges. "
      "Requires target_projects param. Ensure target projects have fresh indexes first.",
@@ -632,13 +633,15 @@ static const tool_def_t TOOLS[] = {
      "\"required\":[\"project\"]}"},
 
     {"search_code",
-     "Search source code with text or regex patterns. Case-insensitive by default. "
+     "Search source code in an indexed/current project with text or regex patterns. "
+     "Does not index projects; use search_graph or index_repository first. "
+     "Case-insensitive by default. "
      "Use for string literals, error messages, and config values not in the knowledge graph. "
      "Use path_filter regex to scope results to specific paths.",
      "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"description\":"
      "\"Text or regex to search for.\"},\"project\":{\"type\":"
-     "\"string\",\"description\":\"Indexed project name. Omit to use the MCP server project "
-     "derived from server CWD.\"},\"file_pattern\":{\"type\":\"string\",\"description\":\"Glob for grep "
+     "\"string\",\"description\":\"Indexed project name. Omit to use the current MCP "
+     "server project after it has been indexed.\"},\"file_pattern\":{\"type\":\"string\",\"description\":\"Glob for grep "
      "--include (e.g. *.go)\"},\"path_filter\":{\"type\":\"string\",\"description\":\"Regex "
      "filter on result file paths (e.g. ^src/ or \\\\.(go|ts)$)\"},"
      "\"regex\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Treat pattern as a "
@@ -1257,8 +1260,9 @@ char *cbm_mcp_tools_list(cbm_mcp_server_t *srv) {
             "get_graph_schema, get_architecture, list_projects, "
             "delete_project, index_status, detect_changes, manage_adr, "
             "ingest_traces, index_dependencies. "
-            "Default tools auto-index the server CWD or explicit directory projects when "
-            "auto_index=true and auto_index_limit is not exceeded. "
+            "Graph-backed default tools auto-index the server CWD or explicit directory projects "
+            "when auto_index=true and auto_index_limit is not exceeded; search_code searches "
+            "source files for an already indexed/current project. "
             "Call this tool to reveal these tools in tools/list for clients that "
             "only allow discovered tools. "
             "Enable all: set env CBM_TOOL_MODE=classic or config set tool_mode classic. "
