@@ -4076,6 +4076,122 @@ TEST(pipeline_file_delta_plan_falls_back_on_large_frontier) {
     PASS();
 }
 
+TEST(pipeline_file_delta_plan_batch_accepts_mutual_frontier) {
+    enum {
+        PIPELINE_MUTUAL_GENERATION = 1,
+        PIPELINE_MUTUAL_SINGLE_COUNT = 1,
+        PIPELINE_MUTUAL_DELTA_COUNT = 2,
+        PIPELINE_MUTUAL_MAX_AFFECTED = 4,
+    };
+    const char *project = "test";
+    const char *a_rel = "a.go";
+    const char *b_rel = "b.go";
+    const char *old_a_qn = "test.a.OldA";
+    const char *old_b_qn = "test.b.OldB";
+    const char *new_a_qn = "test.a.NewA";
+    const char *new_b_qn = "test.b.NewB";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    int64_t old_a_id = pipeline_delta_seed_existing_ownership_id(s, project, a_rel, old_a_qn);
+    int64_t old_b_id = pipeline_delta_seed_existing_ownership_id(s, project, b_rel, old_b_qn);
+    ASSERT_GT(old_a_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_GT(old_b_id, CBM_STORE_NO_NODE_ID);
+    cbm_edge_t old_a_to_b = {.project = (char *)project,
+                             .source_id = old_a_id,
+                             .target_id = old_b_id,
+                             .type = "CALLS",
+                             .properties_json = "{}"};
+    cbm_edge_t old_b_to_a = {.project = (char *)project,
+                             .source_id = old_b_id,
+                             .target_id = old_a_id,
+                             .type = "CALLS",
+                             .properties_json = "{}"};
+    ASSERT_GT(cbm_store_insert_edge(s, &old_a_to_b), 0);
+    ASSERT_GT(cbm_store_insert_edge(s, &old_b_to_a), 0);
+    ASSERT_EQ(cbm_store_upsert_symbol_export(s, project, old_a_qn, a_rel, old_a_id,
+                                             PIPELINE_MUTUAL_GENERATION),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_symbol_export(s, project, old_b_qn, b_rel, old_b_id,
+                                             PIPELINE_MUTUAL_GENERATION),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, project, a_rel, "test.b", "OldB", old_b_qn,
+                                          PIPELINE_MUTUAL_GENERATION),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, project, b_rel, "test.a", "OldA", old_a_qn,
+                                          PIPELINE_MUTUAL_GENERATION),
+              CBM_STORE_OK);
+
+    cbm_node_t a_nodes[PIPELINE_MUTUAL_SINGLE_COUNT] = {{.project = (char *)project,
+                                                         .label = "Function",
+                                                         .name = "NewA",
+                                                         .qualified_name = (char *)new_a_qn,
+                                                         .file_path = (char *)a_rel,
+                                                         .properties_json = "{}"}};
+    cbm_node_t b_nodes[PIPELINE_MUTUAL_SINGLE_COUNT] = {{.project = (char *)project,
+                                                         .label = "Function",
+                                                         .name = "NewB",
+                                                         .qualified_name = (char *)new_b_qn,
+                                                         .file_path = (char *)b_rel,
+                                                         .properties_json = "{}"}};
+    cbm_store_delta_edge_t a_edges[PIPELINE_MUTUAL_SINGLE_COUNT] = {
+        {.source_qn = new_a_qn,
+         .target_qn = new_b_qn,
+         .type = "CALLS",
+         .properties_json = "{}",
+         .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT}};
+    cbm_store_delta_edge_t b_edges[PIPELINE_MUTUAL_SINGLE_COUNT] = {
+        {.source_qn = new_b_qn,
+         .target_qn = new_a_qn,
+         .type = "CALLS",
+         .properties_json = "{}",
+         .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT}};
+    cbm_store_symbol_export_t a_exports[PIPELINE_MUTUAL_SINGLE_COUNT] = {
+        {.qualified_name = new_a_qn, .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_store_symbol_export_t b_exports[PIPELINE_MUTUAL_SINGLE_COUNT] = {
+        {.qualified_name = new_b_qn, .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t a_delta = {
+        .delta = {.project = project,
+                  .rel_path = a_rel,
+                  .nodes = a_nodes,
+                  .node_count = PIPELINE_MUTUAL_SINGLE_COUNT,
+                  .edges = a_edges,
+                  .edge_count = PIPELINE_MUTUAL_SINGLE_COUNT,
+                  .exports = a_exports,
+                  .export_count = PIPELINE_MUTUAL_SINGLE_COUNT}};
+    cbm_pipeline_file_delta_t b_delta = {
+        .delta = {.project = project,
+                  .rel_path = b_rel,
+                  .nodes = b_nodes,
+                  .node_count = PIPELINE_MUTUAL_SINGLE_COUNT,
+                  .edges = b_edges,
+                  .edge_count = PIPELINE_MUTUAL_SINGLE_COUNT,
+                  .exports = b_exports,
+                  .export_count = PIPELINE_MUTUAL_SINGLE_COUNT}};
+    cbm_file_hash_t a_hash = {0};
+    cbm_file_hash_t b_hash = {0};
+    cbm_file_state_t a_state = {0};
+    cbm_file_state_t b_state = {0};
+    pipeline_delta_attach_test_metadata(&a_delta, &a_hash, &a_state);
+    pipeline_delta_attach_test_metadata(&b_delta, &b_hash, &b_state);
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&a_delta, &b_delta};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta_batch(s, deltas, PIPELINE_MUTUAL_DELTA_COUNT,
+                                                 PIPELINE_MUTUAL_MAX_AFFECTED, &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_STR_EQ(plan.reason, "candidate");
+    ASSERT_EQ(plan.affected_count, PIPELINE_MUTUAL_DELTA_COUNT);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, a_rel), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, b_rel), 1);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(pipeline_file_delta_orchestrates_descriptor_plan_and_publish) {
     enum {
         BASE_GENERATION = 1,
@@ -8747,6 +8863,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unresolved_edge_endpoint);
     RUN_TEST(pipeline_file_delta_plan_accepts_resolved_external_edge_endpoint);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_large_frontier);
+    RUN_TEST(pipeline_file_delta_plan_batch_accepts_mutual_frontier);
     RUN_TEST(pipeline_file_delta_orchestrates_descriptor_plan_and_publish);
     /* File persistence */
     RUN_TEST(store_file_persistence);
