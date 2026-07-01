@@ -4035,6 +4035,78 @@ TEST(pipeline_file_delta_plan_falls_back_on_unowned_structural_inbound_edge) {
     PASS();
 }
 
+TEST(pipeline_file_delta_plan_falls_back_on_full_pipeline_structure_edge) {
+    enum { PIPELINE_DELTA_TEST_BASE_GENERATION = 1 };
+    const char *project = "test";
+    const char *rel_path = "src/main.go";
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, rel_path, "test.src.main.Old"),
+              CBM_STORE_OK);
+
+    char *file_qn = cbm_pipeline_fqn_compute(project, rel_path, "__file__");
+    char *folder_qn = cbm_pipeline_fqn_folder(project, "src");
+    ASSERT_NOT_NULL(file_qn);
+    ASSERT_NOT_NULL(folder_qn);
+
+    cbm_node_t file_node = {.project = (char *)project,
+                            .label = "File",
+                            .name = "main.go",
+                            .qualified_name = file_qn,
+                            .file_path = (char *)rel_path,
+                            .properties_json = "{}"};
+    int64_t file_id = cbm_store_upsert_node(s, &file_node);
+    ASSERT_GT(file_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_EQ(cbm_store_upsert_node_owner(s, project, file_id, rel_path,
+                                          PIPELINE_DELTA_TEST_BASE_GENERATION),
+              CBM_STORE_OK);
+
+    cbm_node_t folder_node = {.project = (char *)project,
+                              .label = "Folder",
+                              .name = "src",
+                              .qualified_name = folder_qn,
+                              .file_path = "src",
+                              .properties_json = "{}"};
+    int64_t folder_id = cbm_store_upsert_node(s, &folder_node);
+    ASSERT_GT(folder_id, CBM_STORE_NO_NODE_ID);
+    cbm_edge_t contains = {.project = (char *)project,
+                           .source_id = folder_id,
+                           .target_id = file_id,
+                           .type = "CONTAINS_FILE",
+                           .properties_json = "{}"};
+    ASSERT_GT(cbm_store_insert_edge(s, &contains), CBM_STORE_NO_NODE_ID);
+
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, "/tmp/test");
+    ASSERT_NOT_NULL(scratch);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Project", project, project, NULL, 0, 0, "{}"), 0);
+    ASSERT_EQ(cbm_pipeline_ensure_file_structure(scratch, project, project, rel_path, NULL), 0);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Function", "New", "test.src.main.New", rel_path, 1,
+                                   1, "{\"is_exported\":true}"),
+              0);
+
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(scratch, project, rel_path, 1, &delta),
+              CBM_STORE_OK);
+    ASSERT_NULL(pipeline_delta_find_edge(&delta, "CONTAINS_FILE"));
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "inbound_edges_require_full");
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(scratch);
+    free(folder_qn);
+    free(file_qn);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(pipeline_file_delta_plan_falls_back_without_file_metadata) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -9036,6 +9108,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_plan_falls_back_without_existing_ownership);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_external_inbound_edge);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unowned_structural_inbound_edge);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_full_pipeline_structure_edge);
     RUN_TEST(pipeline_file_delta_plan_falls_back_without_file_metadata);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unsupported_edges);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_delete);
