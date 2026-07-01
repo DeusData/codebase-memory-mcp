@@ -244,6 +244,9 @@ int cbm_pipeline_attach_file_delta_metadata_with_fingerprint(cbm_pipeline_file_d
                                                              const char *pass_fingerprint);
 int cbm_pipeline_attach_file_delta_metadata(cbm_pipeline_file_delta_t *delta,
                                             const cbm_file_info_t *file);
+/* Stamp the reserved generation after exact-delta planning and before publish. */
+int cbm_pipeline_file_delta_stamp_generation(cbm_pipeline_file_delta_t *delta,
+                                             int64_t generation);
 void cbm_pipeline_file_delta_free(cbm_pipeline_file_delta_t *delta);
 
 /* Preflight an exact-delta publish candidate. This never writes the store. */

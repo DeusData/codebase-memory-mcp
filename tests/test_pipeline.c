@@ -3640,6 +3640,27 @@ TEST(pipeline_file_delta_metadata_accepts_effective_fingerprint) {
     PASS();
 }
 
+TEST(pipeline_file_delta_stamp_generation_updates_metadata) {
+    enum { PIPELINE_DELTA_STAMP_GENERATION = 21 };
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = "test", .rel_path = "main.go"}};
+    cbm_file_hash_t hash = {.project = "test", .rel_path = "main.go", .sha256 = ""};
+    delta.file_state = (cbm_file_state_t){.project = "test",
+                                          .rel_path = "main.go",
+                                          .content_hash = "test-content",
+                                          .indexed_at = "2026-07-01T00:00:00Z"};
+    delta.delta.file_hash = &hash;
+    delta.delta.file_state = &delta.file_state;
+
+    ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&delta, 0), CBM_STORE_ERR);
+    ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&delta, PIPELINE_DELTA_STAMP_GENERATION),
+              CBM_STORE_OK);
+    ASSERT_EQ(delta.delta.generation, PIPELINE_DELTA_STAMP_GENERATION);
+    ASSERT_EQ(delta.file_state.generation, PIPELINE_DELTA_STAMP_GENERATION);
+    ASSERT_EQ(delta.delta.file_state->generation, PIPELINE_DELTA_STAMP_GENERATION);
+
+    PASS();
+}
+
 TEST(pipeline_content_hash_helper_matches_file_delta_metadata) {
     enum { PIPELINE_DELTA_META_GENERATION = 14 };
     char *tmp = th_mktempdir("cbm_delta_hash");
@@ -3970,6 +3991,71 @@ TEST(pipeline_file_delta_apply_falls_back_without_generation) {
     ASSERT_EQ(pipeline_delta_store_qn_exists(s, "test", "test.lib.Value"), 0);
 
     cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_apply_succeeds_after_generation_stamp) {
+    enum { PIPELINE_DELTA_APPLY_ONE = 1 };
+    const char *project = "test";
+    const char *rel_path = "lib.go";
+    const char *old_qn = "test.lib.Old";
+    const char *new_qn = "test.lib.Value";
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, rel_path, old_qn), CBM_STORE_OK);
+
+    cbm_node_t nodes[1] = {{.project = (char *)project,
+                            .label = "Function",
+                            .name = "Value",
+                            .qualified_name = (char *)new_qn,
+                            .file_path = (char *)rel_path,
+                            .properties_json = "{}"}};
+    cbm_store_symbol_export_t exports[1] = {
+        {.qualified_name = new_qn, .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = project,
+                                                 .rel_path = rel_path,
+                                                 .nodes = nodes,
+                                                 .node_count = 1,
+                                                 .exports = exports,
+                                                 .export_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+    delta.delta.generation = 0;
+    delta.file_state.generation = 0;
+    state.generation = 0;
+
+    cbm_pipeline_file_delta_plan_t preflight_plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &preflight_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(preflight_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    cbm_pipeline_file_delta_plan_free(&preflight_plan);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_GT(generation, 0);
+    ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&delta, generation), CBM_STORE_OK);
+    ASSERT(delta.delta.file_state == &delta.file_state);
+    ASSERT_EQ(delta.file_state.generation, generation);
+    ASSERT_EQ(state.generation, 0);
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t apply_plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, deltas, PIPELINE_DELTA_APPLY_ONE,
+                                                  CBM_SZ_4, &apply_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(apply_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, old_qn), 0);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_qn), 1);
+    cbm_file_state_t got = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, project, rel_path, &got), CBM_STORE_OK);
+    ASSERT_EQ(got.generation, generation);
+    cbm_store_file_state_free_fields(&got);
+
+    cbm_pipeline_file_delta_plan_free(&apply_plan);
     cbm_store_close(s);
     PASS();
 }
@@ -9426,6 +9512,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_descriptor_marks_unsupported_edges);
     RUN_TEST(pipeline_file_delta_metadata_from_file);
     RUN_TEST(pipeline_file_delta_metadata_accepts_effective_fingerprint);
+    RUN_TEST(pipeline_file_delta_stamp_generation_updates_metadata);
     RUN_TEST(pipeline_content_hash_helper_matches_file_delta_metadata);
     RUN_TEST(pipeline_file_state_persist_helper_writes_hash_metadata);
     RUN_TEST(pipeline_file_state_current_check_rejects_stale_pass_fingerprint);
@@ -9435,6 +9522,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_plan_candidate_from_frontier);
     RUN_TEST(pipeline_file_delta_apply_falls_back_on_publish_error);
     RUN_TEST(pipeline_file_delta_apply_falls_back_without_generation);
+    RUN_TEST(pipeline_file_delta_apply_succeeds_after_generation_stamp);
     RUN_TEST(pipeline_file_delta_plan_falls_back_without_existing_ownership);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_external_inbound_edge);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unowned_structural_inbound_edge);

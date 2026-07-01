@@ -546,6 +546,23 @@ int cbm_pipeline_attach_file_delta_metadata(cbm_pipeline_file_delta_t *delta,
         delta, file, cbm_pipeline_file_delta_pass_fingerprint());
 }
 
+int cbm_pipeline_file_delta_stamp_generation(cbm_pipeline_file_delta_t *delta,
+                                             int64_t generation) {
+    if (!delta || generation <= 0) {
+        return CBM_STORE_ERR;
+    }
+    const cbm_file_state_t *attached_state = delta->delta.file_state;
+    if (attached_state && attached_state != &delta->file_state) {
+        delta->file_state = *attached_state;
+    }
+    delta->delta.generation = generation;
+    delta->file_state.generation = generation;
+    if (attached_state) {
+        delta->delta.file_state = &delta->file_state;
+    }
+    return CBM_STORE_OK;
+}
+
 void cbm_pipeline_file_delta_free(cbm_pipeline_file_delta_t *delta) {
     if (!delta) {
         return;
