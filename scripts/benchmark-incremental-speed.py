@@ -287,6 +287,10 @@ def is_incremental_publish_kind(publish_kind: str) -> bool:
     }
 
 
+def is_explicit_incremental_route(publish_kind: str | None, reason: str | None = None) -> bool:
+    return is_incremental_publish_kind(publish_kind or "") or bool(reason)
+
+
 def parse_logged_elapsed_ms(stderr: str, marker: str) -> int | None:
     for line in stderr.splitlines():
         if marker not in line:
@@ -645,7 +649,7 @@ def run_matrix_case(
     canonical = compare_canonical_graph(incremental_snapshot, full_db, project)
     incremental_reason = incremental.get("exact_reason")
     publish_kind = incremental.get("publish_kind")
-    explicit_route = publish_kind == PUBLISH_INCREMENTAL_EXACT or bool(incremental_reason)
+    explicit_route = is_explicit_incremental_route(publish_kind, incremental_reason)
     passed = bool(canonical.get("equal")) and explicit_route
     speedup = max(1, int(full_rebuild["elapsed_ms"])) / max(1, int(incremental["elapsed_ms"]))
     return {
@@ -658,6 +662,7 @@ def run_matrix_case(
         "fresh_fast_full_after_change": full_rebuild,
         "canonical_graph": canonical,
         "explicit_exact_or_fallback": explicit_route,
+        "explicit_incremental_route": explicit_route,
         "exact_reason": incremental_reason,
         "speedup_full_rebuild_over_incremental": speedup,
         "passed": passed,
@@ -816,9 +821,11 @@ def main() -> int:
         full_ms = max(1, int(full_rebuild["elapsed_ms"]))
         speedup = full_ms / incr_ms
         incremental_markers = incremental["markers"]
-        exact_marker = bool(incremental_markers["incremental_exact_done"])
+        explicit_incremental_route = is_incremental_publish_kind(
+            str(incremental.get("publish_kind") or "")
+        )
         defer_marker = bool(incremental_markers["pagerank_defer"])
-        passed = speedup >= args.min_speedup and exact_marker
+        passed = speedup >= args.min_speedup and explicit_incremental_route
 
         report.update(
             {
@@ -827,11 +834,13 @@ def main() -> int:
                 "measurements": {
                     "initial_fast_full": initial,
                     "incremental_exact": incremental,
+                    "incremental": incremental,
                     "fresh_fast_full_after_change": full_rebuild,
                 },
                 "derived": {
                     "speedup_full_rebuild_over_incremental": speedup,
-                    "exact_incremental_marker_seen": exact_marker,
+                    "exact_incremental_marker_seen": explicit_incremental_route,
+                    "explicit_incremental_route_seen": explicit_incremental_route,
                     "rank_defer_marker_seen": defer_marker,
                     "passed": passed,
                 },

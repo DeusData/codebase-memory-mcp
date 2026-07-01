@@ -977,17 +977,21 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     cbm_path_alias_collection_t *path_aliases = NULL;
     cbm_pipeline_file_delta_t *deltas = NULL;
     const cbm_pipeline_file_delta_t **delta_ptrs = NULL;
+    const cbm_store_file_delta_t **store_delta_ptrs = NULL;
     CBMFileResult **result_cache = NULL;
     cbm_pipeline_file_delta_plan_t plan = {0};
     int64_t generation = 0;
+    bool graph_noop_candidate = false;
 
     changed_paths = malloc((size_t)changed_count * sizeof(*changed_paths));
     deltas = calloc((size_t)delta_count, sizeof(*deltas));
     delta_ptrs = malloc((size_t)delta_count * sizeof(*delta_ptrs));
+    store_delta_ptrs = malloc((size_t)delta_count * sizeof(*store_delta_ptrs));
     result_cache = calloc((size_t)changed_count, sizeof(*result_cache));
     scratch = cbm_gbuf_new(project, cbm_pipeline_repo_path(p));
     registry = cbm_registry_new();
-    if (!changed_paths || !deltas || !delta_ptrs || !result_cache || !scratch || !registry) {
+    if (!changed_paths || !deltas || !delta_ptrs || !store_delta_ptrs || !result_cache ||
+        !scratch || !registry) {
         cbm_pipeline_set_publish_reason(p, "alloc");
         cbm_log_info("incremental.exact.fallback", "reason", "alloc");
         goto cleanup;
@@ -1115,6 +1119,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
             goto cleanup;
         }
         delta_ptrs[i] = &deltas[i];
+        store_delta_ptrs[i] = &deltas[i].delta;
     }
     for (int i = 0; i < deleted_count; i++) {
         int delta_index = changed_count + i;
@@ -1124,20 +1129,36 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
                                                   .generation = CBM_PIPELINE_COMPAT_GENERATION + 1},
                                         .change_kind = CBM_PIPELINE_DELTA_CHANGE_DELETE};
         delta_ptrs[delta_index] = &deltas[delta_index];
+        store_delta_ptrs[delta_index] = &deltas[delta_index].delta;
     }
     CBM_PROF_END_N("incremental_exact", "9_build_deltas", t_exact_build_delta, changed_count);
 
-    CBM_PROF_START(t_exact_plan);
-    rc = cbm_pipeline_plan_file_delta_batch(store, delta_ptrs, delta_count,
-                                            CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS, &plan);
-    CBM_PROF_END_N("incremental_exact", "10_plan_delta", t_exact_plan, delta_count);
-    if (rc != CBM_STORE_OK || plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
-        cbm_pipeline_set_publish_reason(p, plan.reason ? plan.reason : "plan_error");
-        cbm_log_info("incremental.exact.fallback", "reason",
-                     plan.reason ? plan.reason : "plan_error");
-        goto cleanup;
+    if (deleted_count == 0) {
+        CBM_PROF_START(t_exact_graph_equal);
+        rc = cbm_store_file_delta_batch_graph_equal(store, store_delta_ptrs, delta_count,
+                                                    &graph_noop_candidate);
+        CBM_PROF_END_N("incremental_exact", "10b_graph_equal", t_exact_graph_equal, delta_count);
+        if (rc != CBM_STORE_OK) {
+            cbm_pipeline_set_publish_reason(p, "graph_equal");
+            cbm_log_info("incremental.exact.fallback", "reason", "graph_equal", "rc",
+                         itoa_buf_incr(rc));
+            goto cleanup;
+        }
     }
-    cbm_pipeline_file_delta_plan_free(&plan);
+
+    if (!graph_noop_candidate) {
+        CBM_PROF_START(t_exact_plan);
+        rc = cbm_pipeline_plan_file_delta_batch(store, delta_ptrs, delta_count,
+                                                CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS, &plan);
+        CBM_PROF_END_N("incremental_exact", "10_plan_delta", t_exact_plan, delta_count);
+        if (rc != CBM_STORE_OK || plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
+            cbm_pipeline_set_publish_reason(p, plan.reason ? plan.reason : "plan_error");
+            cbm_log_info("incremental.exact.fallback", "reason",
+                         plan.reason ? plan.reason : "plan_error");
+            goto cleanup;
+        }
+        cbm_pipeline_file_delta_plan_free(&plan);
+    }
 
     CBM_PROF_START(t_exact_reserve);
     rc = cbm_store_reserve_index_generation(store, project, NULL, NULL, &generation);
@@ -1165,6 +1186,28 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     }
     CBM_PROF_END_N("incremental_exact", "12_stamp_generation", t_exact_stamp, delta_count);
 
+    if (graph_noop_candidate) {
+        CBM_PROF_START(t_exact_noop);
+        rc = cbm_store_refresh_file_delta_metadata_batch_complete(store, store_delta_ptrs,
+                                                                  delta_count);
+        CBM_PROF_END_N("incremental_exact", "12b_refresh_metadata", t_exact_noop, delta_count);
+        if (rc != CBM_STORE_OK) {
+            incr_mark_generation_failed(store, project, generation);
+            cbm_pipeline_set_publish_reason(p, "metadata_refresh");
+            cbm_log_info("incremental.exact.fallback", "reason", "metadata_refresh", "rc",
+                         itoa_buf_incr(rc));
+            goto cleanup;
+        }
+        cbm_pipeline_set_committed_counts(p, cbm_store_count_nodes(store, project),
+                                          cbm_store_count_edges(store, project));
+        cbm_pipeline_set_graph_changed(p, false);
+        cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_NOOP);
+        cbm_pipeline_set_publish_reason(p, NULL);
+        cbm_log_info("incremental.exact.noop", "files", itoa_buf_incr(delta_count));
+        *applied = 1;
+        goto cleanup;
+    }
+
     CBM_PROF_START(t_exact_apply);
     rc = cbm_pipeline_apply_file_delta_batch(store, delta_ptrs, delta_count,
                                              CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS, &plan);
@@ -1190,6 +1233,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
 
 cleanup:
     cbm_pipeline_file_delta_plan_free(&plan);
+    free(store_delta_ptrs);
     free(delta_ptrs);
     incr_free_file_deltas(deltas, delta_count);
     incr_free_result_cache(result_cache, changed_count);

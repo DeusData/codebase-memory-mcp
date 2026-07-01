@@ -2290,8 +2290,8 @@ int cbm_store_rebuild_file_delta_owners(cbm_store_t *s, const char *project,
         "SELECT e.project, e.id, "
         "CASE WHEN sf.file_path IS NOT NULL THEN src.file_path ELSE tgt.file_path END, ?3, ?2 "
         "FROM edges e "
-        "JOIN nodes src ON src.id = e.source_id "
-        "JOIN nodes tgt ON tgt.id = e.target_id "
+        "JOIN nodes src ON src.project = e.project AND src.id = e.source_id "
+        "JOIN nodes tgt ON tgt.project = e.project AND tgt.id = e.target_id "
         "LEFT JOIN (SELECT DISTINCT project, file_path FROM nodes "
         "           WHERE label = 'File' AND file_path IS NOT NULL AND file_path <> '') sf "
         "  ON sf.project = e.project AND sf.file_path = src.file_path "
@@ -2511,8 +2511,8 @@ int cbm_store_list_file_delta_inbound_edges(cbm_store_t *s, const char *project,
         "JOIN node_owners tgt_owner "
         "  ON tgt_owner.project = ?1 AND tgt_owner.rel_path = ?2 "
         " AND tgt_owner.node_id = e.target_id "
-        "JOIN nodes src ON src.id = e.source_id "
-        "JOIN nodes tgt ON tgt.id = e.target_id "
+        "JOIN nodes src ON src.project = e.project AND src.id = e.source_id "
+        "JOIN nodes tgt ON tgt.project = e.project AND tgt.id = e.target_id "
         "LEFT JOIN node_owners src_owner "
         "  ON src_owner.project = ?1 AND src_owner.node_id = e.source_id "
         "LEFT JOIN edge_owners edge_owner "
@@ -3585,6 +3585,221 @@ static int store_publish_file_delta_metadata_body(cbm_store_t *s,
     return CBM_STORE_OK;
 }
 
+static bool store_file_delta_shape_valid(const cbm_store_file_delta_t *delta);
+
+static int store_count_rows_i(cbm_store_t *s, const char *sql, const char *project,
+                              const char *rel_path, int *out) {
+    if (!s || !sql || !project || !rel_path || !out) {
+        return CBM_STORE_ERR;
+    }
+    *out = 0;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "count_rows_i prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+    int step = sqlite3_step(stmt);
+    if (step == SQLITE_ROW) {
+        *out = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+        return CBM_STORE_OK;
+    }
+    sqlite3_finalize(stmt);
+    store_set_error_sqlite(s, "count_rows_i");
+    return CBM_STORE_ERR;
+}
+
+static int store_delta_row_exists(sqlite3_stmt *stmt, bool *out_exists) {
+    if (!stmt || !out_exists) {
+        return CBM_STORE_ERR;
+    }
+    *out_exists = false;
+    int step = sqlite3_step(stmt);
+    if (step == SQLITE_ROW) {
+        *out_exists = true;
+        sqlite3_finalize(stmt);
+        return CBM_STORE_OK;
+    }
+    sqlite3_finalize(stmt);
+    if (step == SQLITE_DONE) {
+        return CBM_STORE_OK;
+    }
+    return CBM_STORE_ERR;
+}
+
+static void store_delta_graph_equal_debug(const cbm_store_file_delta_t *delta, const char *reason,
+                                          int expected, int actual) {
+    char env[ST_BUF_16];
+    if (!delta ||
+        cbm_safe_getenv("CBM_DEBUG_DELTA_GRAPH_EQUAL", env, sizeof(env), NULL) == NULL ||
+        env[0] == '\0' || env[0] == '0') {
+        return;
+    }
+    char expected_buf[ST_BUF_16];
+    char actual_buf[ST_BUF_16];
+    if (snprintf(expected_buf, sizeof(expected_buf), "%d", expected) < 0 ||
+        snprintf(actual_buf, sizeof(actual_buf), "%d", actual) < 0) {
+        return;
+    }
+    cbm_log_debug("delta.graph_equal.mismatch", "reason", reason ? reason : "unknown",
+                  "project", delta->project, "rel_path", delta->rel_path, "expected",
+                  expected_buf, "actual", actual_buf);
+}
+
+static int store_delta_node_exists(cbm_store_t *s, const cbm_store_file_delta_t *delta,
+                                   const cbm_node_t *node, bool require_owner,
+                                   bool *out_exists) {
+    static const char owned_sql[] =
+        "SELECT 1 FROM nodes n "
+        "JOIN node_owners o ON o.project = n.project AND o.node_id = n.id "
+        "WHERE n.project = ?1 AND o.rel_path = ?2 AND n.label = ?3 AND n.name = ?4 "
+        "  AND n.qualified_name = ?5 AND COALESCE(n.file_path, '') = ?6 "
+        "  AND n.start_line = ?7 AND n.end_line = ?8 "
+        "  AND COALESCE(n.properties, '{}') = ?9 LIMIT 1;";
+    static const char context_sql[] =
+        "SELECT 1 FROM nodes n "
+        "WHERE n.project = ?1 AND n.label = ?3 AND n.name = ?4 "
+        "  AND n.qualified_name = ?5 AND COALESCE(n.file_path, '') = ?6 "
+        "  AND n.start_line = ?7 AND n.end_line = ?8 "
+        "  AND COALESCE(n.properties, '{}') = ?9 LIMIT 1;";
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = require_owner ? owned_sql : context_sql;
+    if (!s || !delta || !node || !out_exists ||
+        sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        if (s) {
+            store_set_error_sqlite(s, "delta_node_exists prepare");
+        }
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, delta->project);
+    bind_text(stmt, ST_COL_2, delta->rel_path);
+    bind_text(stmt, ST_COL_3, node->label);
+    bind_text(stmt, ST_COL_4, node->name ? node->name : "");
+    bind_text(stmt, ST_COL_5, node->qualified_name);
+    bind_text(stmt, ST_COL_6, node->file_path ? node->file_path : "");
+    sqlite3_bind_int(stmt, ST_COL_7, node->start_line);
+    sqlite3_bind_int(stmt, ST_COL_8, node->end_line);
+    bind_text(stmt, ST_COL_9, node->properties_json ? node->properties_json : "{}");
+    return store_delta_row_exists(stmt, out_exists);
+}
+
+static int store_delta_edge_exists(cbm_store_t *s, const cbm_store_file_delta_t *delta,
+                                   const cbm_store_delta_edge_t *edge, bool require_owner,
+                                   bool *out_exists) {
+    static const char owned_sql[] =
+        "SELECT 1 FROM edges e "
+        "JOIN edge_owners o ON o.project = e.project AND o.edge_id = e.id "
+        "JOIN nodes src ON src.project = e.project AND src.id = e.source_id "
+        "JOIN nodes tgt ON tgt.project = e.project AND tgt.id = e.target_id "
+        "WHERE e.project = ?1 AND o.rel_path = ?2 AND src.qualified_name = ?3 "
+        "  AND tgt.qualified_name = ?4 AND e.type = ?5 "
+        "  AND COALESCE(e.properties, '{}') = ?6 LIMIT 1;";
+    static const char context_sql[] =
+        "SELECT 1 FROM edges e "
+        "JOIN nodes src ON src.project = e.project AND src.id = e.source_id "
+        "JOIN nodes tgt ON tgt.project = e.project AND tgt.id = e.target_id "
+        "WHERE e.project = ?1 AND src.qualified_name = ?3 "
+        "  AND tgt.qualified_name = ?4 AND e.type = ?5 "
+        "  AND COALESCE(e.properties, '{}') = ?6 LIMIT 1;";
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = require_owner ? owned_sql : context_sql;
+    if (!s || !delta || !edge || !out_exists ||
+        sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        if (s) {
+            store_set_error_sqlite(s, "delta_edge_exists prepare");
+        }
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, delta->project);
+    bind_text(stmt, ST_COL_2, delta->rel_path);
+    bind_text(stmt, ST_COL_3, edge->source_qn);
+    bind_text(stmt, ST_COL_4, edge->target_qn);
+    bind_text(stmt, ST_COL_5, edge->type);
+    bind_text(stmt, ST_COL_6, edge->properties_json ? edge->properties_json : "{}");
+    return store_delta_row_exists(stmt, out_exists);
+}
+
+static int store_file_delta_graph_equal_one(cbm_store_t *s, const cbm_store_file_delta_t *delta,
+                                            bool *out_equal) {
+    static const char node_count_sql[] =
+        "SELECT COUNT(*) FROM node_owners WHERE project = ?1 AND rel_path = ?2;";
+    static const char edge_count_sql[] =
+        "SELECT COUNT(*) FROM edge_owners WHERE project = ?1 AND rel_path = ?2;";
+    if (!out_equal) {
+        return CBM_STORE_ERR;
+    }
+    *out_equal = false;
+    if (!s || !store_file_delta_shape_valid(delta)) {
+        return CBM_STORE_ERR;
+    }
+
+    int count = 0;
+    int rc = store_count_rows_i(s, node_count_sql, delta->project, delta->rel_path, &count);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    if (count != delta->node_count) {
+        store_delta_graph_equal_debug(delta, "node_owner_count", delta->node_count, count);
+        return CBM_STORE_OK;
+    }
+    rc = store_count_rows_i(s, edge_count_sql, delta->project, delta->rel_path, &count);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    if (count != delta->edge_count) {
+        store_delta_graph_equal_debug(delta, "edge_owner_count", delta->edge_count, count);
+        return CBM_STORE_OK;
+    }
+
+    /* symbol_exports/import_refs are incremental metadata, not canonical graph rows.
+     * The no-op refresh path replaces them after graph equality is proven. */
+    bool exists = false;
+    for (int i = 0; i < delta->node_count; i++) {
+        int rc = store_delta_node_exists(s, delta, &delta->nodes[i], true, &exists);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+        if (!exists) {
+            store_delta_graph_equal_debug(delta, "node_missing", i, 0);
+            return CBM_STORE_OK;
+        }
+    }
+    for (int i = 0; i < delta->context_node_count; i++) {
+        int rc = store_delta_node_exists(s, delta, &delta->context_nodes[i], false, &exists);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+        if (!exists) {
+            store_delta_graph_equal_debug(delta, "context_node_missing", i, 0);
+            return CBM_STORE_OK;
+        }
+    }
+    for (int i = 0; i < delta->edge_count; i++) {
+        int rc = store_delta_edge_exists(s, delta, &delta->edges[i], true, &exists);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+        if (!exists) {
+            store_delta_graph_equal_debug(delta, "edge_missing", i, 0);
+            return CBM_STORE_OK;
+        }
+    }
+    for (int i = 0; i < delta->context_edge_count; i++) {
+        int rc = store_delta_edge_exists(s, delta, &delta->context_edges[i], false, &exists);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+        if (!exists) {
+            store_delta_graph_equal_debug(delta, "context_edge_missing", i, 0);
+            return CBM_STORE_OK;
+        }
+    }
+    *out_equal = true;
+    return CBM_STORE_OK;
+}
+
 static int store_publish_file_delta_body(cbm_store_t *s, const cbm_store_file_delta_t *delta) {
     int rc = store_publish_file_delta_delete_body(s, delta);
     if (rc != CBM_STORE_OK) {
@@ -3829,6 +4044,80 @@ static bool store_file_delta_apply_batch_shape_valid(
         *out_generation = generation;
     }
     return project && generation > 0;
+}
+
+int cbm_store_file_delta_batch_graph_equal(cbm_store_t *s,
+                                           const cbm_store_file_delta_t *const *deltas,
+                                           int delta_count, bool *out_equal) {
+    if (out_equal) {
+        *out_equal = false;
+    }
+    if (!s || !out_equal || !store_file_delta_batch_shape_valid(deltas, delta_count, NULL, NULL)) {
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < delta_count; i++) {
+        bool equal = false;
+        int rc = store_file_delta_graph_equal_one(s, deltas[i], &equal);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+        if (!equal) {
+            return CBM_STORE_OK;
+        }
+    }
+    *out_equal = true;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_refresh_file_delta_metadata_batch_complete(
+    cbm_store_t *s, const cbm_store_file_delta_t *const *deltas, int delta_count) {
+    const char *project = NULL;
+    int64_t generation = -1;
+    if (!s || !store_file_delta_batch_shape_valid(deltas, delta_count, &project, &generation) ||
+        generation <= 0) {
+        return CBM_STORE_ERR;
+    }
+
+    CBM_PROF_START(t_begin);
+    int rc = cbm_store_begin(s);
+    CBM_PROF_END("store_delta_noop", "0_begin", t_begin);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    CBM_PROF_START(t_metadata);
+    for (int i = 0; i < delta_count; i++) {
+        rc = cbm_store_delete_symbol_exports_by_file(s, deltas[i]->project, deltas[i]->rel_path);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(s);
+            return rc;
+        }
+        rc = cbm_store_delete_import_refs_by_file(s, deltas[i]->project, deltas[i]->rel_path);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(s);
+            return rc;
+        }
+        rc = store_publish_file_delta_metadata_body(s, deltas[i]);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(s);
+            return rc;
+        }
+    }
+    CBM_PROF_END_N("store_delta_noop", "1_metadata", t_metadata, delta_count);
+    CBM_PROF_START(t_finish);
+    rc = store_finish_index_generation_body(s, project, generation, CBM_STORE_INDEX_STATUS_COMPLETE);
+    CBM_PROF_END("store_delta_noop", "2_finish_generation", t_finish);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    CBM_PROF_START(t_commit);
+    rc = cbm_store_commit(s);
+    CBM_PROF_END("store_delta_noop", "3_commit", t_commit);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    return CBM_STORE_OK;
 }
 
 int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *delta) {
