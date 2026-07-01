@@ -231,6 +231,14 @@ Benchmarked on Apple M3 Pro:
 
 **Token efficiency**: Five structural queries consumed ~3,400 tokens via codebase-memory-mcp versus ~412,000 tokens via file-by-file grep exploration — a **99.2% reduction**.
 
+### Real-World Example: A Bash/Config-Heavy Ops-Tooling Repo
+
+The benchmarks above are measured on large polyglot application codebases (Linux kernel, Django). It's worth showing what "Excellent"-tier Bash parsing (see [Language Support](#language-support)) translates to for a different repo shape: infra/ops-tooling repos that are mostly shell scripts, YAML/JSON config, and Markdown docs — not a typical multi-language application.
+
+One real session on an internal dev-tooling repo (bash + JSON + Markdown, ~14.9k indexed nodes / ~20.5k edges): a coding agent's single `search_code` call reproduced — ranked and deduplicated — the full list of consumers of a shared JSON config file in **~375ms**. The same task, done by fanning out a grep-based sub-agent instead, took **~131s across 12 tool calls** to assemble the equivalent answer by hand. Shell functions indexed as first-class graph nodes with `CALLS` edges made this possible on plain tree-sitter extraction alone — no Hybrid LSP tier needed.
+
+*(One real-world measurement from an actual agent session, not a controlled multi-trial benchmark — offered as a data point for teams wondering whether the token-efficiency value proposition holds outside typical application codebases.)*
+
 ## Troubleshooting & Diagnostics
 
 codebase-memory-mcp runs **100% locally and collects no telemetry** — your code, queries, environment, and usage never leave your machine. That privacy guarantee also means that when you hit something we can't reproduce on our side (a slow memory climb over hours, a performance regression, a leak that only appears after days of real use), **we have no data at all unless you choose to send it.** Here is how to capture it yourself.
