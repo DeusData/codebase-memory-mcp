@@ -1932,6 +1932,16 @@ TEST(store_derived_view_state_public_api) {
     ASSERT_EQ(store_count_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
                                              STALE_GENERATION, CBM_STORE_DERIVED_STATUS_STALE),
               1);
+    cbm_derived_view_state_t got = {0};
+    ASSERT_EQ(cbm_store_get_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_NODE_DEGREE,
+                                               &got),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(got.project, "test");
+    ASSERT_STR_EQ(got.view_name, CBM_STORE_DERIVED_VIEW_NODE_DEGREE);
+    ASSERT_EQ(got.source_generation, STALE_GENERATION);
+    ASSERT_STR_EQ(got.status, CBM_STORE_DERIVED_STATUS_STALE);
+    ASSERT_NOT_NULL(got.computed_at);
+    cbm_store_derived_view_state_free_fields(&got);
 
     ASSERT_EQ(cbm_store_set_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_PAGERANK,
                                                COMPLETE_GENERATION,
@@ -1944,6 +1954,12 @@ TEST(store_derived_view_state_public_api) {
                                              COMPLETE_GENERATION,
                                              CBM_STORE_DERIVED_STATUS_COMPLETE),
               1);
+    ASSERT_EQ(cbm_store_get_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                               &got),
+              CBM_STORE_OK);
+    ASSERT_EQ(got.source_generation, COMPLETE_GENERATION);
+    ASSERT_STR_EQ(got.status, CBM_STORE_DERIVED_STATUS_COMPLETE);
+    cbm_store_derived_view_state_free_fields(&got);
 
     ASSERT_EQ(cbm_store_set_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_LINKRANK,
                                                COMPLETE_GENERATION,
@@ -1953,6 +1969,9 @@ TEST(store_derived_view_state_public_api) {
                                              COMPLETE_GENERATION,
                                              CBM_STORE_DERIVED_STATUS_COMPLETE),
               0);
+    ASSERT_EQ(cbm_store_get_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_LINKRANK,
+                                               &got),
+              CBM_STORE_NOT_FOUND);
     ASSERT_EQ(cbm_store_mark_derived_views_stale(s, "test", COMPLETE_GENERATION, NULL, 0),
               CBM_STORE_OK);
 

@@ -162,6 +162,7 @@ struct cbm_store {
     sqlite3_stmt *stmt_delete_owned_edges_by_file;
     sqlite3_stmt *stmt_delete_owned_nodes_by_file;
     sqlite3_stmt *stmt_upsert_derived_view_state;
+    sqlite3_stmt *stmt_get_derived_view_state;
 };
 
 /* ── Public accessor ────────────────────────────────────────────── */
@@ -1062,6 +1063,7 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_delete_owned_edges_by_file);
     finalize_stmt(&s->stmt_delete_owned_nodes_by_file);
     finalize_stmt(&s->stmt_upsert_derived_view_state);
+    finalize_stmt(&s->stmt_get_derived_view_state);
 
     /* Use sqlite3_close_v2 — auto-deallocates when last statement finalizes.
      * Prevents ASan false-positive leaks from sqlite3 internal state. */
@@ -2586,6 +2588,45 @@ int cbm_store_mark_derived_views_stale(cbm_store_t *s, const char *project,
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(s);
         return rc;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_get_derived_view_state(cbm_store_t *s, const char *project,
+                                     const char *view_name,
+                                     cbm_derived_view_state_t *out) {
+    if (!s || !s->db || !project || !project[0] || !view_name || !view_name[0] || !out) {
+        if (s) {
+            store_set_error(s, "get_derived_view_state: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    memset(out, 0, sizeof(*out));
+    sqlite3_stmt *stmt = prepare_cached(
+        s, &s->stmt_get_derived_view_state,
+        "SELECT project, view_name, source_generation, computed_at, status "
+        "FROM derived_view_state WHERE project = ?1 AND view_name = ?2;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, view_name);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        return CBM_STORE_NOT_FOUND;
+    }
+
+    out->project = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+    out->view_name = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_1));
+    out->source_generation = sqlite3_column_int64(stmt, ST_COL_2);
+    out->computed_at = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_3));
+    out->status = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_4));
+    if (!out->project || !out->view_name || !out->computed_at || !out->status) {
+        cbm_store_derived_view_state_free_fields(out);
+        store_set_error(s, "get_derived_view_state: out of memory");
+        return CBM_STORE_ERR;
     }
     return CBM_STORE_OK;
 }
@@ -7911,6 +7952,16 @@ void cbm_store_file_state_free_fields(cbm_file_state_t *state) {
     safe_str_free(&state->language);
     safe_str_free(&state->pass_fingerprint);
     safe_str_free(&state->indexed_at);
+}
+
+void cbm_store_derived_view_state_free_fields(cbm_derived_view_state_t *state) {
+    if (!state) {
+        return;
+    }
+    safe_str_free(&state->project);
+    safe_str_free(&state->view_name);
+    safe_str_free(&state->computed_at);
+    safe_str_free(&state->status);
 }
 
 /* ── Vector search ────────────────────────��──────────────────────── */
