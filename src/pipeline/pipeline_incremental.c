@@ -1044,7 +1044,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
                      itoa_buf_incr(rc));
         goto cleanup;
     }
-    cbm_pipeline_pass_complexity(&ctx);
+    cbm_pipeline_pass_complexity_for_paths(&ctx, changed_paths, changed_count);
     rc = cbm_pipeline_pass_httplinks(&ctx);
     if (rc != 0) {
         cbm_log_info("incremental.exact.fallback", "reason", "httplinks", "rc",

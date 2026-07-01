@@ -7937,7 +7937,7 @@ static int pipeline_build_exact_scratch_for_changed_files(cbm_store_t *store,
         cbm_pipeline_pass_usages(&ctx, changed_files, changed_count) != 0) {
         goto cleanup;
     }
-    cbm_pipeline_pass_complexity(&ctx);
+    cbm_pipeline_pass_complexity_for_paths(&ctx, changed_paths, changed_count);
     if (cbm_pipeline_pass_httplinks(&ctx) != 0) {
         goto cleanup;
     }
@@ -10672,6 +10672,50 @@ TEST(pipeline_complexity_scc_tld_is_deterministic) {
     PASS();
 }
 
+TEST(pipeline_complexity_scoped_writeback_keeps_unchanged_nodes) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("cx-scope", "/tmp/cx-scope");
+    ASSERT_NOT_NULL(gb);
+
+    char changed_props[CBM_SZ_64];
+    char unchanged_props[CBM_SZ_128];
+    loop_props(changed_props, sizeof(changed_props), 1);
+    snprintf(unchanged_props, sizeof(unchanged_props),
+             "{\"loop_depth\":3,\"self_recursive\":false,\"stable\":true}");
+
+    int64_t changed =
+        cbm_gbuf_upsert_node(gb, "Function", "changed", "cx.changed", "changed.go", 1, 4,
+                             changed_props);
+    int64_t unchanged =
+        cbm_gbuf_upsert_node(gb, "Function", "unchanged", "cx.unchanged", "unchanged.go", 1, 4,
+                             unchanged_props);
+    ASSERT_GT(changed, 0);
+    ASSERT_GT(unchanged, 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, changed, unchanged, "CALLS", "{}"), 0);
+
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "cx-scope",
+        .repo_path = "/tmp/cx-scope",
+        .gbuf = gb,
+        .cancelled = &cancelled,
+    };
+    const char *scope[] = {"changed.go"};
+    cbm_pipeline_pass_complexity_for_paths(&ctx, scope, (int)(sizeof(scope) / sizeof(scope[0])));
+
+    const cbm_gbuf_node_t *changed_node = cbm_gbuf_find_by_qn(gb, "cx.changed");
+    const cbm_gbuf_node_t *unchanged_node = cbm_gbuf_find_by_qn(gb, "cx.unchanged");
+    ASSERT_NOT_NULL(changed_node);
+    ASSERT_NOT_NULL(unchanged_node);
+    ASSERT_NOT_NULL(changed_node->properties_json);
+    ASSERT_NOT_NULL(unchanged_node->properties_json);
+    ASSERT_NOT_NULL(strstr(changed_node->properties_json, "\"transitive_loop_depth\":4"));
+    ASSERT_NULL(strstr(unchanged_node->properties_json, "transitive_loop_depth"));
+    ASSERT_NOT_NULL(strstr(unchanged_node->properties_json, "\"stable\":true"));
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* Regression for #334: the plausibility gate compares committed (extracted)
  * node count against persisted rows. committed_nodes must be captured BEFORE
  * cbm_gbuf_dump_to_sqlite frees the gbuf node index — otherwise it reads 0 and
@@ -10820,6 +10864,7 @@ SUITE(pipeline) {
     /* Complexity propagation pass (Tier B) */
     RUN_TEST(pipeline_complexity_transitive_loop_depth);
     RUN_TEST(pipeline_complexity_scc_tld_is_deterministic);
+    RUN_TEST(pipeline_complexity_scoped_writeback_keeps_unchanged_nodes);
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
