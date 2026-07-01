@@ -295,7 +295,7 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
     }
     const cbm_gbuf_node_t *dec = NULL;
     if (res.qualified_name && res.qualified_name[0] != '\0') {
-        dec = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+        dec = cbm_pipeline_find_node_by_qn(ctx, res.qualified_name);
     }
     if (!dec) {
         /* The decorator target is not a local symbol (external attribute /
@@ -347,7 +347,7 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
             if (!base_qn) {
                 continue;
             }
-            const cbm_gbuf_node_t *base_node = cbm_gbuf_find_by_qn(ctx->gbuf, base_qn);
+            const cbm_gbuf_node_t *base_node = cbm_pipeline_find_node_by_qn(ctx, base_qn);
             if (base_node && node->id != base_node->id) {
                 /* A base that resolves to an Interface is an IMPLEMENTS relation
                  * (Java `implements`, C# `: IFace`, TS `implements`); a Class/
@@ -410,8 +410,8 @@ static int resolve_impl_traits(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         if (!struct_qn) {
             continue;
         }
-        const cbm_gbuf_node_t *tn = cbm_gbuf_find_by_qn(ctx->gbuf, trait_qn);
-        const cbm_gbuf_node_t *sn = cbm_gbuf_find_by_qn(ctx->gbuf, struct_qn);
+        const cbm_gbuf_node_t *tn = cbm_pipeline_find_node_by_qn(ctx, trait_qn);
+        const cbm_gbuf_node_t *sn = cbm_pipeline_find_node_by_qn(ctx, struct_qn);
         if (tn && sn && tn->id != sn->id) {
             cbm_gbuf_insert_edge(ctx->gbuf, sn->id, tn->id, "IMPLEMENTS", "{}");
             count++;

@@ -115,7 +115,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             continue;
         }
 
-        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+        const cbm_gbuf_node_t *tgt = cbm_pipeline_find_node_by_qn(ctx, res.qualified_name);
         if (!tgt || src->id == tgt->id) {
             continue;
         }
@@ -154,7 +154,7 @@ static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
 
         const cbm_gbuf_node_t *tgt = NULL;
         if (res.qualified_name && res.qualified_name[0]) {
-            tgt = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+            tgt = cbm_pipeline_find_node_by_qn(ctx, res.qualified_name);
         }
         if (!tgt || src->id == tgt->id) {
             continue;
@@ -188,7 +188,7 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
             continue;
         }
 
-        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+        const cbm_gbuf_node_t *tgt = cbm_pipeline_find_node_by_qn(ctx, res.qualified_name);
         if (!tgt || src->id == tgt->id) {
             continue;
         }

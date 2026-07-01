@@ -127,6 +127,16 @@ typedef struct {
      * configs are an easy follow-on). NULL when no usable configs were found.
      * Owned by pipeline.c / pipeline_incremental.c. */
     const cbm_path_alias_collection_t *path_aliases;
+
+    /* Exact-delta scratch optimization: when set on the single-threaded exact
+     * upsert route, resolvers may materialize referenced unchanged nodes from
+     * the store on demand instead of preloading every stored symbol node. The
+     * changed-path list prevents stale stored nodes for files being reparsed
+     * from re-entering the scratch graph. Leave NULL/0 on full, containment,
+     * dependency, and parallel worker paths. */
+    cbm_store_t *store_backed_node_lookup;
+    const char *const *store_backed_changed_paths;
+    int store_backed_changed_path_count;
 } cbm_pipeline_ctx_t;
 
 typedef struct {
@@ -192,7 +202,7 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
  *
  * `namespace_map` may be NULL (skips step 2).  `source_file_qn` is the importing
  * file's __file__ QN, used to avoid self-imports in step 3. */
-const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
+const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
                                                         const CBMImport *imp,
@@ -279,6 +289,7 @@ int cbm_pipeline_seed_file_delta_scratch_from_store(cbm_store_t *store, cbm_gbuf
                                                     const char *project,
                                                     const char *const *changed_paths,
                                                     int changed_path_count);
+const cbm_gbuf_node_t *cbm_pipeline_find_node_by_qn(cbm_pipeline_ctx_t *ctx, const char *qn);
 
 /* Build a namespace → File-node-QN map from a set of extraction results.
  * Each result that declared a namespace/package contributes one entry keyed by

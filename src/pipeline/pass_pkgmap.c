@@ -1287,8 +1287,7 @@ static bool import_target_better(const cbm_gbuf_node_t *candidate, const cbm_gbu
  * Builds a path relative to source_rel's directory, then looks up the resulting
  * File/Module-node QN (extension is stripped by fqn_module).  Returns a borrowed
  * node or NULL.  Several filename conventions are tried in turn. */
-static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx,
-                                                   const char *source_rel,
+static const cbm_gbuf_node_t *resolve_sibling_file(cbm_pipeline_ctx_t *ctx, const char *source_rel,
                                                    const char *source_file_qn,
                                                    const char *module_path) {
     if (!module_path || !module_path[0]) {
@@ -1339,7 +1338,7 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
         if (!qn) {
             continue;
         }
-        const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
+        const cbm_gbuf_node_t *n = cbm_pipeline_find_node_by_qn(ctx, qn);
         free(qn);
         if (n && (!source_file_qn || !n->qualified_name ||
                   strcmp(n->qualified_name, source_file_qn) != 0)) {
@@ -1526,7 +1525,7 @@ static const cbm_gbuf_node_t *find_file_node_for_module_qn(const cbm_gbuf_t *gbu
     return cbm_gbuf_find_by_qn(gbuf, file_qn);
 }
 
-static const cbm_gbuf_node_t *resolve_reexported_symbol(const cbm_pipeline_ctx_t *ctx,
+static const cbm_gbuf_node_t *resolve_reexported_symbol(cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
                                                         const char *owner,
@@ -1572,7 +1571,7 @@ static const cbm_gbuf_node_t *resolve_reexported_symbol(const cbm_pipeline_ctx_t
     return best;
 }
 
-static const cbm_gbuf_node_t *resolve_reexported_import(const cbm_pipeline_ctx_t *ctx,
+static const cbm_gbuf_node_t *resolve_reexported_import(cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
                                                         const char *module_path) {
@@ -1595,7 +1594,7 @@ static const cbm_gbuf_node_t *resolve_reexported_import(const cbm_pipeline_ctx_t
     return resolve_reexported_symbol(ctx, source_rel, source_file_qn, owner, local_name);
 }
 
-const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
+const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
                                                         const CBMImport *imp,
@@ -1606,7 +1605,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 
     /* Strategy 1: module-path resolution → existing node (Python/TS/Go). */
     char *target_qn = cbm_pipeline_resolve_module(ctx, source_rel, imp->module_path);
-    const cbm_gbuf_node_t *target = target_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, target_qn) : NULL;
+    const cbm_gbuf_node_t *target = target_qn ? cbm_pipeline_find_node_by_qn(ctx, target_qn) : NULL;
     free(target_qn);
     if (target) {
         return target;
@@ -1689,7 +1688,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                 if (len > 0 && len < sizeof(qbuf)) {
                     memcpy(qbuf, seg, len);
                     qbuf[len] = '\0';
-                    const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, qbuf);
+                    const cbm_gbuf_node_t *n = cbm_pipeline_find_node_by_qn(ctx, qbuf);
                     if (n && (!source_file_qn || strcmp(n->qualified_name, source_file_qn) != 0)) {
                         return n;
                     }
@@ -1795,6 +1794,28 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                 free(context_qn);
                 return best;
             }
+            const char **reg_qns = NULL;
+            int reg_count = 0;
+            if (cbm_registry_find_by_name(ctx->registry, cands[ci], &reg_qns, &reg_count) == 0 &&
+                reg_qns) {
+                for (int ri = 0; ri < reg_count; ri++) {
+                    const cbm_gbuf_node_t *cand = cbm_pipeline_find_node_by_qn(ctx, reg_qns[ri]);
+                    if (!cand || !cbm_pipeline_label_is_import_target(cand->label)) {
+                        continue;
+                    }
+                    if (source_file_qn && cand->qualified_name &&
+                        strcmp(cand->qualified_name, source_file_qn) == 0) {
+                        continue;
+                    }
+                    if (import_target_better(cand, best, context_qn)) {
+                        best = cand;
+                    }
+                }
+            }
+            if (best) {
+                free(context_qn);
+                return best;
+            }
         }
         free(context_qn);
     }
@@ -1849,7 +1870,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
             snprintf(work, sizeof(work), "%s", body);
             for (;;) {
                 char *rqn = cbm_pipeline_resolve_module(ctx, source_rel, work);
-                const cbm_gbuf_node_t *n = rqn ? cbm_gbuf_find_by_qn(ctx->gbuf, rqn) : NULL;
+                const cbm_gbuf_node_t *n = rqn ? cbm_pipeline_find_node_by_qn(ctx, rqn) : NULL;
                 free(rqn);
                 if (n && (!source_file_qn || !n->qualified_name ||
                           strcmp(n->qualified_name, source_file_qn) != 0)) {

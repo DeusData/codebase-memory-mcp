@@ -655,7 +655,8 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
 
 #define MIN_FILES_FOR_PARALLEL_INCR 50
     int worker_count = cbm_default_worker_count(true);
-    bool use_parallel = (worker_count > SKIP_ONE && ci > MIN_FILES_FOR_PARALLEL_INCR);
+    bool use_parallel = (worker_count > SKIP_ONE && ci > MIN_FILES_FOR_PARALLEL_INCR &&
+                         !ctx->store_backed_node_lookup);
 
     if (use_parallel) {
         cbm_log_info("incremental.mode", "mode", "parallel", "workers", itoa_buf_incr(worker_count),
@@ -1015,6 +1016,9 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
         .lsp_confidence_floor = cbm_pipeline_lsp_confidence_floor(p),
         .path_aliases = path_aliases,
         .result_cache = result_cache,
+        .store_backed_node_lookup = store,
+        .store_backed_changed_paths = changed_paths,
+        .store_backed_changed_path_count = changed_count,
     };
 
     const char *structure_root_qn = incremental_structure_root_qn(scratch, project);
