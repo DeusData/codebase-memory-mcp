@@ -152,13 +152,33 @@ static bool search_graph_uses_route_derived_graph(const char *label, const char 
     return (label && strcmp(label, "Route") == 0) || query_mentions_route_derived_graph(relationship);
 }
 
+static bool cypher_result_contains_route_label(const cbm_cypher_result_t *result) {
+    if (!result || result->col_count <= 0 || result->row_count <= 0) {
+        return false;
+    }
+    for (int c = 0; c < result->col_count; c++) {
+        const char *col = result->columns[c];
+        if (!col || !strstr(col, ".label")) {
+            continue;
+        }
+        for (int r = 0; r < result->row_count; r++) {
+            if (result->rows[r] && result->rows[r][c] &&
+                strcmp(result->rows[r][c], "Route") == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static void add_query_graph_derived_warnings(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                              cbm_store_t *store, const char *project,
-                                             const char *query) {
+                                             const char *query,
+                                             const cbm_cypher_result_t *result) {
     if (!doc || !root || !store || !project || !query) {
         return;
     }
-    if (query_mentions_route_derived_graph(query) &&
+    if ((query_mentions_route_derived_graph(query) || cypher_result_contains_route_label(result)) &&
         cbm_store_derived_view_is_stale(store, project, CBM_STORE_DERIVED_VIEW_ROUTES)) {
         add_response_warning(doc, root,
                              "routes derived view is stale; query_graph route results may be stale.");
@@ -3515,7 +3535,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
-    add_query_graph_derived_warnings(doc, root, store, project, query);
+    add_query_graph_derived_warnings(doc, root, store, project, query, &result);
 
     /* columns */
     yyjson_mut_val *cols = yyjson_mut_arr(doc);
