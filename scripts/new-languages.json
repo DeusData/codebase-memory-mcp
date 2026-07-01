@@ -1291,5 +1291,20 @@
     "filenames": [],
     "has_scanner": true,
     "module_root": "source_file"
+  },
+  {
+    "name": "mojo",
+    "enum": "MOJO",
+    "display": "Mojo",
+    "ts_func": "tree_sitter_mojo",
+    "repo": "https://github.com/lsh/tree-sitter-mojo",
+    "subdir": "",
+    "extensions": [
+      ".mojo",
+      ".🔥"
+    ],
+    "filenames": [],
+    "has_scanner": true,
+    "module_root": "module"
   }
 ]

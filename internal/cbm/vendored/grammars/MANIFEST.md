@@ -130,6 +130,7 @@ Guarded by the `contract_all_grammars_in_graph` graph-breadth test in
 | matlab | 15 | acristoffers/tree-sitter-matlab | `c2390a59016f` | VERIFIED-BOTH | ✅ |
 | mermaid | 14 | monaqa/tree-sitter-mermaid | `90ae195b3193` | VERIFIED-BOTH | ✅ |
 | meson | 15 | tree-sitter-grammars/tree-sitter-meson | `c84f3540624b` | VERIFIED-BOTH | ✅ |
+| mojo | 15 | lsh/tree-sitter-mojo | `33193a99afe6` | PENDING (vendored files removed pending provenance audit — #737) | ⏳ |
 | nasm | 14 | naclsn/tree-sitter-nasm | `d1b3638d017f` | VERIFIED-BOTH | ✅ |
 | nickel | 15 | nickel-lang/tree-sitter-nickel | `b5b6cc3bc7b9` | VERIFIED-BOTH | ✅ |
 | nix | 13 | nix-community/tree-sitter-nix | `eabf96807ea4` | VERIFIED-BOTH | ✅ |
