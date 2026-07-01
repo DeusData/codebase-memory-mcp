@@ -1338,6 +1338,65 @@ TEST(tool_trace_path_prefers_definition) {
     PASS();
 }
 
+TEST(tool_trace_path_warns_on_stale_rank_views) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "trace-stale";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/trace-stale"), CBM_STORE_OK);
+
+    cbm_node_t root = {.project = proj,
+                       .label = "Function",
+                       .name = "root",
+                       .qualified_name = "trace-stale.root",
+                       .file_path = "root.c",
+                       .start_line = 1,
+                       .end_line = 10};
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "callee",
+                         .qualified_name = "trace-stale.callee",
+                         .file_path = "callee.c",
+                         .start_line = 11,
+                         .end_line = 20};
+    int64_t root_id = cbm_store_upsert_node(st, &root);
+    int64_t callee_id = cbm_store_upsert_node(st, &callee);
+    ASSERT_GT(root_id, 0);
+    ASSERT_GT(callee_id, 0);
+    cbm_edge_t edge = {.project = proj,
+                       .source_id = root_id,
+                       .target_id = callee_id,
+                       .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
+
+    const char *stale_views[] = {CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                 CBM_STORE_DERIVED_VIEW_LINKRANK};
+    ASSERT_EQ(cbm_store_mark_derived_views_stale(st, proj, CBM_STORE_DERIVED_GENERATION_UNKNOWN,
+                                                 stale_views,
+                                                 (int)(sizeof(stale_views) / sizeof(stale_views[0]))),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":64,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\","
+             "\"arguments\":{\"function_name\":\"root\",\"project\":\"trace-stale\","
+             "\"direction\":\"outbound\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "callee"));
+    ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
+    ASSERT_NOT_NULL(strstr(inner, "pagerank derived view is stale"));
+    ASSERT_NOT_NULL(strstr(inner, "linkrank derived view is stale"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_delete_project_not_found) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -3388,6 +3447,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_path_ambiguous);
     RUN_TEST(tool_trace_path_prefers_definition);
+    RUN_TEST(tool_trace_path_warns_on_stale_rank_views);
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
