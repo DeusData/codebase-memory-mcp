@@ -15,6 +15,7 @@
 #include "cli/cli.h"
 #include "git/git_context.h"
 #include "foundation/dump_verify.h"
+#include "foundation/log.h"
 #include "semantic/semantic.h"
 #include "test_graph_diff.h"
 
@@ -39,6 +40,34 @@
 static char g_tmpdir[256];
 
 enum { PIPELINE_TEST_OVERLONG_DB_PATH = CBM_PATH_MAX + CBM_SZ_128 };
+
+static char g_pipeline_log_capture[CBM_SZ_16K];
+static CBMLogLevel g_pipeline_prev_log_level = CBM_LOG_INFO;
+
+static void pipeline_capture_log_sink(const char *line) {
+    size_t used = strlen(g_pipeline_log_capture);
+    size_t avail = sizeof(g_pipeline_log_capture) - used;
+    if (avail <= SKIP_ONE) {
+        return;
+    }
+    int n = snprintf(g_pipeline_log_capture + used, avail, "%s\n", line);
+    if (n < 0 || (size_t)n >= avail) {
+        g_pipeline_log_capture[sizeof(g_pipeline_log_capture) - SKIP_ONE] = '\0';
+    }
+}
+
+static void pipeline_capture_logs_start(void) {
+    g_pipeline_log_capture[0] = '\0';
+    g_pipeline_prev_log_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_sink(pipeline_capture_log_sink);
+}
+
+static const char *pipeline_capture_logs_end(void) {
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(g_pipeline_prev_log_level);
+    return g_pipeline_log_capture;
+}
 
 /* Create:
  *   /tmp/cbm_test_XXXXXX/
@@ -8463,7 +8492,12 @@ TEST(incremental_fast_exact_upsert_matches_full_rebuild) {
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
     cbm_pipeline_apply_config(p, cfg);
-    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.done files=1") != NULL);
     cbm_pipeline_free(p);
 
     ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "NewLeaf"));
@@ -8521,7 +8555,12 @@ TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild) {
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
     cbm_pipeline_apply_config(p, cfg);
-    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=2") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.done files=2") != NULL);
     cbm_pipeline_free(p);
 
     ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "NewMain"));
