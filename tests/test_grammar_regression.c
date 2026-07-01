@@ -100,6 +100,14 @@ const GrammarCase CBM_GRAMMAR_CASES[] = {
     {"swift", CBM_LANG_SWIFT, "a.swift", "func foo() {}\nclass A {}\n", 2, {"foo", "A", NULL}},
     {"scala", CBM_LANG_SCALA, "a.scala", "object A {\n  def foo() = 1\n}\n", 1, {"A", NULL}},
     {"gdscript", CBM_LANG_GDSCRIPT, "a.gd", "func foo():\n    pass\n", 1, {"foo", NULL}},
+    /* Mojo: fn/def -> function, struct -> class, trait -> interface */
+    {"mojo",
+     CBM_LANG_MOJO,
+     "a.mojo",
+     "fn foo() -> Int:\n    return 1\nstruct Bar:\n    var x: Int\ntrait Baz:\n    fn m(self): "
+     "...\n",
+     3,
+     {"foo", "Bar", "Baz", NULL}},
     {"groovy", CBM_LANG_GROOVY, "a.groovy", "class A {\n  def foo() {}\n}\n", 1, {"A", NULL}},
     {"zig", CBM_LANG_ZIG, "a.zig", "fn foo() void {}\nfn bar() void {}\n", 1, {"foo", NULL}},
     {"solidity",

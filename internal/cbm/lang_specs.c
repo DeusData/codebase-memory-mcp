@@ -164,6 +164,7 @@ extern const TSLanguage *tree_sitter_apex(void);
 extern const TSLanguage *tree_sitter_soql(void);
 extern const TSLanguage *tree_sitter_sosl(void);
 extern const TSLanguage *tree_sitter_pine(void);
+extern const TSLanguage *tree_sitter_mojo(void);
 
 // -- Empty sentinel --
 static const char *empty_types[] = {NULL};
@@ -204,6 +205,18 @@ static const char *py_branch_types[] = {
 static const char *py_var_types[] = {"assignment", "augmented_assignment", NULL};
 static const char *py_throw_types[] = {"raise_statement", NULL};
 static const char *py_decorator_types[] = {"decorator", NULL};
+
+// ==================== MOJO ====================
+// Mojo (Modular) is a Python superset; the lsh/tree-sitter-mojo grammar is
+// forked from tree-sitter-python, so every node type mirrors Python exactly
+// EXCEPT the class array — Mojo's "struct"/"class" both parse as
+// class_definition, but "trait" and the "__extension" form get their own
+// nodes. So the spec reuses the py_* arrays and overrides only the class
+// types. ("fn"/"def" both parse as function_definition; compile-time
+// "alias NAME = value" has no dedicated node and is recovered as an
+// `assignment`, so it falls under py_var_types like ordinary `var` fields.)
+static const char *mojo_class_types[] = {"class_definition", "trait_definition",
+                                         "extension_definition", NULL};
 
 // ==================== JAVASCRIPT ====================
 static const char *js_func_types[] = {"function_declaration", "generator_function_declaration",
@@ -2038,6 +2051,12 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                        cfml_call_types, empty_types, empty_types, cfml_branch_types, empty_types,
                        empty_types, empty_types, NULL, empty_types, NULL, NULL, tree_sitter_cfml,
                        NULL},
+
+    // CBM_LANG_MOJO (Python-derived; reuses py_* arrays, only class types differ)
+    [CBM_LANG_MOJO] = {CBM_LANG_MOJO, py_func_types, mojo_class_types, empty_types, py_module_types,
+                       py_call_types, py_import_types, py_import_from_types, py_branch_types,
+                       py_var_types, py_var_types, py_throw_types, NULL, py_decorator_types,
+                       py_env_funcs, py_env_members, tree_sitter_mojo, NULL},
 
     // CBM_LANG_GLEAM
     [CBM_LANG_GLEAM] = {CBM_LANG_GLEAM, gleam_func_types, gleam_class_types, gleam_field_types,

@@ -489,7 +489,9 @@ enum { GRAMMAR_BREADTH_MAX = 300, GRAMMAR_PATH_BUF = 96 };
  *   sshconfig     — discover detects ssh_config / .ssh/config, not the generic name "config" */
 static bool grammar_graph_allowlisted(const char *name) {
     static const char *allow[] = {"nasm",      "dotenv",        "jsdoc",     "regex",
-                                  "gitignore", "gitattributes", "sshconfig", NULL};
+                                  "gitignore", "gitattributes", "sshconfig",
+                                  /* mojo — grammar files removed pending provenance audit (#737) */
+                                  "mojo", NULL};
     for (int i = 0; allow[i]; i++) {
         if (strcmp(allow[i], name) == 0) {
             return true;

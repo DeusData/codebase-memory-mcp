@@ -170,6 +170,7 @@ typedef enum {
     CBM_LANG_QML,       // Qt QML (Qt Modeling Language — declarative UI + embedded JS)
     CBM_LANG_CFSCRIPT,  // CFML script dialect (.cfc components — Lucee/ColdFusion)
     CBM_LANG_CFML,      // CFML tag dialect (.cfm templates — Lucee/ColdFusion)
+    CBM_LANG_MOJO,      // Mojo (Modular — Python-superset systems language; .mojo / .🔥)
     CBM_LANG_COUNT
 } CBMLanguage;
 

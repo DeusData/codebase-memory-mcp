@@ -102,6 +102,7 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"swift", "Class:1,Function:1,Module:1"},
     {"scala", "Class:1,Function:1,Method:1,Module:1"},
     {"gdscript", "Function:1,Module:1"},
+    {"mojo", "Class:1,Function:1,Interface:1,Method:1,Module:1,Variable:1"},
     {"groovy", "Class:1,Method:1,Module:1"},
     {"zig", "Function:2,Module:1"},
     {"solidity", "Class:1,Function:1,Method:1,Module:1"},
