@@ -17,7 +17,13 @@ interface CameraTarget {
   lookAt: THREE.Vector3;
 }
 
-function CameraAnimator({ target }: { target: CameraTarget | null }) {
+function CameraAnimator({
+  target,
+  controlsRef,
+}: {
+  target: CameraTarget | null;
+  controlsRef: React.RefObject<OrbitControlsImpl | null>;
+}) {
   const { camera } = useThree();
   const targetRef = useRef<CameraTarget | null>(null);
   const progress = useRef(1);
@@ -36,7 +42,17 @@ function CameraAnimator({ target }: { target: CameraTarget | null }) {
     const t = 1 - Math.pow(1 - progress.current, 3); /* ease-out cubic */
 
     camera.position.lerp(targetRef.current.position, t * 0.08);
-    camera.lookAt(targetRef.current.lookAt);
+
+    /* Move the OrbitControls pivot to the focus point as well. Otherwise the
+     * controls keep their target at the origin and re-center the view on the
+     * next frame, snapping the camera back to the middle after the fly-to. */
+    const controls = controlsRef.current;
+    if (controls) {
+      controls.target.lerp(targetRef.current.lookAt, t * 0.08);
+      controls.update();
+    } else {
+      camera.lookAt(targetRef.current.lookAt);
+    }
   });
 
   return null;
@@ -179,7 +195,7 @@ export function GraphScene({
 
       {hovered && <NodeTooltip node={hovered} />}
 
-      <CameraAnimator target={cameraTarget} />
+      <CameraAnimator target={cameraTarget} controlsRef={controlsRef} />
       <IdleAutoRotate controlsRef={controlsRef} />
 
       <EffectComposer multisampling={GRAPH_COMPOSER_MULTISAMPLING}>
