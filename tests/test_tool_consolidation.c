@@ -469,6 +469,20 @@ TEST(streamlined_core_parameter_contract) {
     PASS();
 }
 
+TEST(default_tool_autoindex_description_is_precise) {
+    char *json = cbm_mcp_tools_list(NULL);
+    ASSERT_NOT_NULL(json);
+
+    ASSERT_NOT_NULL(strstr(json, "Graph-backed default tools auto-index"));
+    ASSERT_NOT_NULL(strstr(json, "search_code searches"));
+    ASSERT_NOT_NULL(strstr(json, "already indexed/current project"));
+    ASSERT_NOT_NULL(strstr(json, "Does not index projects"));
+    ASSERT_NULL(strstr(json, "Default tools auto-index"));
+
+    free(json);
+    PASS();
+}
+
 TEST(revealed_trace_path_parameter_contract) {
     char *saved_mode = save_tool_mode();
     unsetenv("CBM_TOOL_MODE");
@@ -2622,6 +2636,7 @@ SUITE(tool_consolidation) {
     RUN_TEST(hidden_tools_payload_excludes_already_visible_configured_tools);
     RUN_TEST(streamlined_reveal_covers_classic_capabilities);
     RUN_TEST(streamlined_core_parameter_contract);
+    RUN_TEST(default_tool_autoindex_description_is_precise);
     RUN_TEST(revealed_trace_path_parameter_contract);
     RUN_TEST(revealed_advanced_tool_schema_matches_handlers);
     /* Dispatch */

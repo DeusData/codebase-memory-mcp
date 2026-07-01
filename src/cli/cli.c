@@ -504,6 +504,10 @@ static const char skill_content[] =
     "## Default MCP Tools\n"
     "`search_graph`, `query_graph`, `search_code`, `trace_path`, `get_code`\n"
     "\n"
+    "Graph-backed default tools (`search_graph`, `query_graph`, `trace_path`, `get_code`)\n"
+    "auto-index the server CWD or explicit repo path when auto_index=true and under\n"
+    "auto_index_limit. `search_code` searches source files for an already indexed/current project.\n"
+    "\n"
     "Use `_hidden_tools` to reveal advanced tools such as `index_repository`,\n"
     "`get_graph_schema`, `get_architecture`, `detect_changes`, and `index_dependencies`.\n"
     "\n"
@@ -534,13 +538,13 @@ static const char codex_instructions_content[] =
     "This project uses codebase-memory-mcp to maintain a knowledge graph of the codebase.\n"
     "Use the MCP tools to explore and understand the code:\n"
     "\n"
-    "- `search_graph` — find functions, classes, routes by pattern; auto-indexes the server CWD or explicit repo path when auto_index=true and under auto_index_limit\n"
+    "- `search_graph` — find functions, classes, routes by pattern; graph-backed tools can auto-index the server CWD or explicit repo path when auto_index=true and under auto_index_limit\n"
     "- `trace_path` — trace who calls a function or what it calls\n"
     "- `get_code` — read function source code by qualified_name\n"
     "- `query_graph` — run Cypher queries for complex patterns\n"
     "- `get_architecture` — high-level summary after `_hidden_tools` reveal or `CBM_TOOL_MODE=classic`\n"
     "\n"
-    "Always prefer graph tools over grep for code discovery.\n";
+    "Prefer graph tools over grep for structural code discovery.\n";
 
 /* Old skill names — cleaned up during install to remove stale directories. */
 static const char *old_skill_names[] = {
@@ -1635,9 +1639,10 @@ int cbm_remove_codex_mcp(const char *config_path) {
  * and NO newlines. (issues #330 + Gemini/Antigravity parity) */
 #define CMM_SESSION_REMINDER_CMD                                                    \
     "echo \"Code discovery: prefer codebase-memory-mcp (search_graph, trace_path, " \
-    "get_code, query_graph, search_code) over grep/file-read; default tools "       \
+    "get_code, query_graph, search_code) over grep/file-read; graph-backed tools "  \
     "auto-index CWD or explicit repo paths when auto_index=true and under "         \
-    "auto_index_limit; call _hidden_tools for explicit index_repository.\""
+    "auto_index_limit; search_code needs an indexed project; call _hidden_tools "   \
+    "for explicit index_repository.\""
 
 /* Sentinel-delimited block so upsert/remove are robust to the nested TOML
  * array-of-tables (which both start with '['). */
@@ -2190,11 +2195,12 @@ static void cbm_install_session_reminder_script(const char *home) {
            "   - trace_path(function_name, mode=calls|data_flow|cross_service) for call chains\n"
            "   - get_code(qualified_name) for exact symbol source in streamlined mode\n"
            "   - query_graph(query) for complex Cypher patterns\n"
-           "   - search_code(pattern) for text/regex source search\n"
+           "   - search_code(pattern) for text/regex source search in an indexed project\n"
            "2. Use Grep/Glob/Read freely for text, configs, non-code files, and\n"
            "   always Read a file before editing it.\n"
-           "3. Default tools auto-index the server CWD or explicit repo paths when\n"
-           "   auto_index=true and under auto_index_limit. Use _hidden_tools\n"
+           "3. Graph-backed tools auto-index the server CWD or explicit repo paths when\n"
+           "   auto_index=true and under auto_index_limit. search_code needs an\n"
+           "   indexed project. Use _hidden_tools\n"
            "   to reveal index_repository or get_architecture when explicit control is needed.\n"
            "REMINDER\n");
 #ifndef _WIN32
@@ -2894,7 +2900,7 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "0-104857600",
      "32KB default prevents huge responses. Set 0 for unlimited Cypher results. Raise for bulk analysis queries."},
     {"snippet_max_lines", "200", NULL, "Search",
-     "Max source lines returned by get_code (0=unlimited)",
+     "Max source lines returned by get_code/get_code_snippet (0=unlimited)",
      "0-1000000",
      "200 lines covers most functions. Set 0 for unlimited to get full file contents."},
     {"key_functions_exclude", "", "CBM_KEY_FUNCTIONS_EXCLUDE", "Search",
