@@ -3609,7 +3609,7 @@ TEST(pipeline_file_delta_descriptor_from_gbuf) {
     ASSERT_STR_EQ(delta.delta.rel_path, "main.go");
     ASSERT_EQ(delta.delta.generation, 7);
     ASSERT_STR_EQ(delta.delta.derived_view_name, CBM_STORE_DERIVED_VIEW_NODES_FTS);
-    ASSERT_STR_EQ(delta.delta.derived_status, CBM_STORE_DERIVED_STATUS_STALE);
+    ASSERT_STR_EQ(delta.delta.derived_status, CBM_STORE_DERIVED_STATUS_COMPLETE);
     ASSERT_STR_EQ(delta.exports[0].qualified_name, "proj.main.Run");
 
     const cbm_store_delta_edge_t *call_edge = pipeline_delta_find_edge(&delta, "CALLS");
