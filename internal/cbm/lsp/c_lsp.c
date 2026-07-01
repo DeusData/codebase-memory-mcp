@@ -4139,6 +4139,11 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
     const char *func_qn = c_build_qn(ctx, func_name);
     if (ctx->module_qn && !strchr(func_qn, '.')) {
         func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, func_qn);
+    } else if (ctx->enclosing_class_qn && saved_class_qn != ctx->enclosing_class_qn &&
+               strchr(func_qn, '.')) {
+        /* Out-of-line Class::method: rebuild bare Class.method with the resolved class QN. */
+        const char *dot = strrchr(func_qn, '.');
+        func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->enclosing_class_qn, dot + 1);
     }
     ctx->enclosing_func_qn = func_qn;
 

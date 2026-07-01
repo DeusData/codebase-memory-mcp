@@ -87,6 +87,22 @@ static const char *compute_wolfram_func_qn(CBMExtractCtx *ctx, TSNode node) {
     return NULL;
 }
 
+static const char *compute_ocaml_func_qn(CBMExtractCtx *ctx, TSNode node) {
+    TSNode binding = cbm_find_child_by_kind(node, "let_binding");
+    if (ts_node_is_null(binding)) {
+        return NULL;
+    }
+    TSNode pattern = ts_node_child_by_field_name(binding, TS_FIELD("pattern"));
+    if (ts_node_is_null(pattern)) {
+        return NULL;
+    }
+    char *name = cbm_node_text(ctx->arena, pattern, ctx->source);
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+}
+
 // Resolve the name node for a function, handling arrow functions.
 static TSNode resolve_func_name_node(TSNode node) {
     TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
@@ -110,6 +126,9 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
     (void)spec;
     if (ctx->language == CBM_LANG_WOLFRAM) {
         return compute_wolfram_func_qn(ctx, node);
+    }
+    if (ctx->language == CBM_LANG_OCAML) {
+        return compute_ocaml_func_qn(ctx, node);
     }
 
     TSNode name_node = resolve_func_name_node(node);
@@ -790,9 +809,21 @@ static bool is_export_of_declaration(TSNode node) {
 static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                  WalkState *state, uint32_t depth) {
     if (spec->function_node_types && cbm_kind_in_set(node, spec->function_node_types)) {
-        const char *fqn = compute_func_qn(ctx, node, spec, state);
-        if (fqn) {
-            push_scope(state, SCOPE_FUNC, depth, fqn);
+        bool skip_nested = false;
+        if (ctx->language == CBM_LANG_OCAML) {
+            /* OCaml def extraction emits only the outer value_definition node. */
+            for (int i = 0; i < state->scope_top; i++) {
+                if (state->scopes[i].kind == SCOPE_FUNC) {
+                    skip_nested = true;
+                    break;
+                }
+            }
+        }
+        if (!skip_nested) {
+            const char *fqn = compute_func_qn(ctx, node, spec, state);
+            if (fqn) {
+                push_scope(state, SCOPE_FUNC, depth, fqn);
+            }
         }
     } else if (spec->class_node_types && cbm_kind_in_set(node, spec->class_node_types)) {
         const char *cqn = compute_class_qn(ctx, node);
