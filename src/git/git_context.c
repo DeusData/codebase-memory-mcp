@@ -1,8 +1,8 @@
 #include "git/git_context.h"
 
-#include "foundation/compat_fs.h"
+#include "git/git_command.h"
+
 #include "foundation/compat.h"
-#include "foundation/constants.h"
 #include "foundation/str_util.h"
 
 #include <ctype.h>
@@ -11,78 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-
-enum {
-    CBM_GIT_CONTEXT_CMD_BUFSZ = CBM_SZ_1K,
-    CBM_GIT_CONTEXT_OUTPUT_BUFSZ = CBM_SZ_4K,
-};
-
-static void trim_newlines(char *s) {
-    if (!s) {
-        return;
-    }
-    size_t n = strlen(s);
-    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
-        s[--n] = '\0';
-    }
-}
-
-static bool git_validate_repo_path(const char *repo_path) {
-    if (!cbm_validate_shell_arg(repo_path)) {
-        return false;
-    }
-#ifdef _WIN32
-    for (const char *p = repo_path; *p; p++) {
-        if (*p == '%' || *p == '!' || *p == '^') {
-            return false;
-        }
-    }
-#endif
-    return true;
-}
-
-static int git_capture(const char *repo_path, const char *git_args, char **out) {
-    if (!out) {
-        return CBM_NOT_FOUND;
-    }
-    *out = NULL;
-    if (!repo_path || !git_args || !git_validate_repo_path(repo_path)) {
-        return CBM_NOT_FOUND;
-    }
-
-    char cmd[CBM_GIT_CONTEXT_CMD_BUFSZ];
-#ifdef _WIN32
-    const char *null_dev = "NUL";
-#else
-    const char *null_dev = "/dev/null";
-#endif
-    /* Double quotes work for POSIX shells and cmd.exe. cbm_validate_shell_arg()
-     * rejects quote/backslash/substitution metacharacters before interpolation. */
-    int n = snprintf(cmd, sizeof(cmd), "git -C \"%s\" %s 2>%s", repo_path, git_args, null_dev);
-    if (n < 0 || n >= (int)sizeof(cmd)) {
-        return CBM_NOT_FOUND;
-    }
-
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        return CBM_NOT_FOUND;
-    }
-
-    char buf[CBM_GIT_CONTEXT_OUTPUT_BUFSZ];
-    if (!fgets(buf, sizeof(buf), fp)) {
-        cbm_pclose(fp);
-        return CBM_NOT_FOUND;
-    }
-    trim_newlines(buf);
-
-    int rc = cbm_pclose(fp);
-    if (rc != 0 || buf[0] == '\0') {
-        return CBM_NOT_FOUND;
-    }
-
-    *out = cbm_strdup(buf);
-    return *out ? 0 : CBM_NOT_FOUND;
-}
 
 static bool path_is_absolute(const char *path) {
     if (!path || !path[0]) {
@@ -216,23 +144,26 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
         return 0;
     }
 
-    if (git_capture(path, "rev-parse --show-toplevel", &out->worktree_root) != 0) {
+    if (cbm_git_capture_first_line(path, "rev-parse --show-toplevel", &out->worktree_root) !=
+        0) {
         out->is_git = false;
         return 0;
     }
     out->is_git = true;
 
-    if (git_capture(path, "rev-parse --git-dir", &out->git_dir) != 0) {
+    if (cbm_git_capture_first_line(path, "rev-parse --git-dir", &out->git_dir) != 0) {
         out->git_dir = cbm_strdup("");
     }
-    if (git_capture(path, "rev-parse --git-common-dir", &out->git_common_dir) != 0) {
+    if (cbm_git_capture_first_line(path, "rev-parse --git-common-dir", &out->git_common_dir) !=
+        0) {
         out->git_common_dir = cbm_strdup("");
     }
-    if (git_capture(path, "rev-parse --verify HEAD", &out->head_sha) != 0) {
+    if (cbm_git_capture_first_line(path, "rev-parse --verify HEAD", &out->head_sha) != 0) {
         out->head_sha = cbm_strdup("");
     }
 
-    if (git_capture(path, "symbolic-ref --quiet --short HEAD", &out->branch) != 0) {
+    if (cbm_git_capture_first_line(path, "symbolic-ref --quiet --short HEAD", &out->branch) !=
+        0) {
         out->branch = cbm_strdup("DETACHED");
         out->is_detached = true;
     }
@@ -241,7 +172,7 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
         out->git_dir && out->git_common_dir && strcmp(out->git_dir, out->git_common_dir) != 0;
     out->canonical_root = derive_canonical_root(out->worktree_root, out->git_common_dir);
     out->branch_slug = slug_from_branch(out->branch, out->is_detached);
-    if (git_capture(path, "merge-base HEAD @{upstream}", &out->base_sha) != 0) {
+    if (cbm_git_capture_first_line(path, "merge-base HEAD @{upstream}", &out->base_sha) != 0) {
         out->base_sha = cbm_strdup("");
     }
 
