@@ -1364,7 +1364,8 @@ static const char *vhdl_class_types[] = {
     "interface_declaration",  "package_declaration",     "protected_type_declaration",
     "record_type_definition", "type_declaration",        NULL};
 static const char *vhdl_call_types[] = {"function_call", "procedure_call_statement",
-                                        "component_instantiation_statement", NULL};
+                                        "component_instantiation_statement", "parenthesis_group",
+                                        NULL};
 static const char *vhdl_import_types[] = {"library_clause", "use_clause", NULL};
 static const char *vhdl_branch_types[] = {"if_statement", "case_statement", "loop_statement", NULL};
 static const char *vhdl_var_types[] = {"variable_declaration", "signal_declaration",
