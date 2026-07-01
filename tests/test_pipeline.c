@@ -7538,6 +7538,23 @@ static int pipeline_restore_file_times(const char *path, const struct stat *st) 
 #endif
 }
 
+enum { PIPELINE_TEST_MTIME_BUMP_SECONDS = 2 };
+
+static int pipeline_bump_file_mtime_seconds(const char *path, const struct stat *st, long seconds) {
+    if (!path || !st) {
+        return -1;
+    }
+    struct stat bumped = *st;
+#ifdef _WIN32
+    bumped.st_mtime += seconds;
+#elif defined(__APPLE__)
+    bumped.st_mtimespec.tv_sec += seconds;
+#else
+    bumped.st_mtim.tv_sec += seconds;
+#endif
+    return pipeline_restore_file_times(path, &bumped);
+}
+
 static int pipeline_store_file_hash_count(const char *db_path, const char *project) {
     cbm_store_t *s = cbm_store_open_path_query(db_path);
     if (!s) {
@@ -7549,6 +7566,34 @@ static int pipeline_store_file_hash_count(const char *db_path, const char *proje
     cbm_store_free_file_hashes(hashes, count);
     cbm_store_close(s);
     return rc == CBM_STORE_OK ? count : CBM_STORE_ERR;
+}
+
+static int pipeline_store_file_hash_mtime(const char *db_path, const char *project,
+                                          const char *rel_path, int64_t *out_mtime_ns) {
+    if (!out_mtime_ns) {
+        return CBM_STORE_ERR;
+    }
+    *out_mtime_ns = 0;
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    cbm_file_hash_t *hashes = NULL;
+    int count = 0;
+    int rc = cbm_store_get_file_hashes(s, project, &hashes, &count);
+    if (rc == CBM_STORE_OK) {
+        rc = CBM_STORE_NOT_FOUND;
+        for (int i = 0; i < count; i++) {
+            if (hashes[i].rel_path && strcmp(hashes[i].rel_path, rel_path) == 0) {
+                *out_mtime_ns = hashes[i].mtime_ns;
+                rc = CBM_STORE_OK;
+                break;
+            }
+        }
+    }
+    cbm_store_free_file_hashes(hashes, count);
+    cbm_store_close(s);
+    return rc;
 }
 
 static int pipeline_store_file_state_generation(const char *db_path, const char *project,
@@ -8148,6 +8193,60 @@ TEST(incremental_full_then_noop) {
     free(project);
     cbm_config_close(cfg);
 
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_touch_only_refreshes_metadata_without_reindex) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    int64_t generation_before = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper.go",
+                                                   &generation_before),
+              CBM_STORE_OK);
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    struct stat before;
+    ASSERT_EQ(stat(path, &before), 0);
+    ASSERT_EQ(pipeline_bump_file_mtime_seconds(path, &before, PIPELINE_TEST_MTIME_BUMP_SECONDS),
+              0);
+    struct stat touched;
+    ASSERT_EQ(stat(path, &touched), 0);
+    ASSERT_NEQ(cbm_pipeline_stat_mtime_ns(&touched), cbm_pipeline_stat_mtime_ns(&before));
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    int64_t generation_after = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper.go",
+                                                   &generation_after),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation_after, generation_before);
+
+    int64_t hash_mtime_ns = 0;
+    ASSERT_EQ(pipeline_store_file_hash_mtime(g_incr_dbpath, project, "helper.go",
+                                             &hash_mtime_ns),
+              CBM_STORE_OK);
+    ASSERT_EQ(hash_mtime_ns, cbm_pipeline_stat_mtime_ns(&touched));
+
+    free(project);
+    cbm_config_close(cfg);
     cleanup_incremental_repo();
     PASS();
 }
@@ -10624,6 +10723,7 @@ SUITE(pipeline) {
     RUN_TEST(import_symbol_fallback_prefers_import_path_over_insertion_order);
     /* Incremental */
     RUN_TEST(incremental_full_then_noop);
+    RUN_TEST(incremental_touch_only_refreshes_metadata_without_reindex);
     RUN_TEST(incremental_detects_changed_file);
     RUN_TEST(incremental_fast_exact_upsert_matches_full_rebuild);
     RUN_TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild);

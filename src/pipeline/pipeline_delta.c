@@ -415,17 +415,18 @@ int cbm_pipeline_content_hash_file(const char *path, char *out, size_t out_sz) {
     return n == CBM_DELTA_XXH64_HEX_LEN ? CBM_STORE_OK : CBM_STORE_ERR;
 }
 
-bool cbm_pipeline_file_state_is_current_or_legacy(cbm_store_t *store, const char *project,
-                                                  const cbm_file_info_t *file,
-                                                  const char *pass_fingerprint) {
+static bool file_state_content_matches_current(cbm_store_t *store, const char *project,
+                                               const cbm_file_info_t *file,
+                                               const char *pass_fingerprint,
+                                               bool missing_is_legacy_current) {
     if (!store || !project || !project[0] || !file || !file->path || !file->rel_path) {
-        return true;
+        return missing_is_legacy_current;
     }
 
     cbm_file_state_t state = {0};
     int rc = cbm_store_get_file_state(store, project, file->rel_path, &state);
     if (rc == CBM_STORE_NOT_FOUND) {
-        return true;
+        return missing_is_legacy_current;
     }
     const char *current_pass =
         pass_fingerprint ? pass_fingerprint : cbm_pipeline_file_delta_pass_fingerprint();
@@ -440,6 +441,18 @@ bool cbm_pipeline_file_state_is_current_or_legacy(cbm_store_t *store, const char
     }
     cbm_store_file_state_free_fields(&state);
     return matches;
+}
+
+bool cbm_pipeline_file_state_is_current_or_legacy(cbm_store_t *store, const char *project,
+                                                  const cbm_file_info_t *file,
+                                                  const char *pass_fingerprint) {
+    return file_state_content_matches_current(store, project, file, pass_fingerprint, true);
+}
+
+bool cbm_pipeline_file_state_content_matches_current(cbm_store_t *store, const char *project,
+                                                     const cbm_file_info_t *file,
+                                                     const char *pass_fingerprint) {
+    return file_state_content_matches_current(store, project, file, pass_fingerprint, false);
 }
 
 int cbm_pipeline_persist_file_states(cbm_store_t *store, const char *project,

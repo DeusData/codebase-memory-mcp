@@ -73,7 +73,8 @@ static bool incr_test_fail_phase_enabled(const char *phase) {
  * Caller must free the returned array. */
 static bool *classify_files(cbm_store_t *store, const char *project, cbm_file_info_t *files,
                             int file_count, cbm_file_hash_t *stored, int stored_count,
-                            const char *pass_fingerprint, int *out_changed, int *out_unchanged) {
+                            const char *pass_fingerprint, int *out_changed, int *out_unchanged,
+                            int *out_metadata_only) {
     bool *changed = calloc((size_t)file_count, sizeof(bool));
     if (!changed) {
         return NULL;
@@ -81,6 +82,7 @@ static bool *classify_files(cbm_store_t *store, const char *project, cbm_file_in
 
     int n_changed = 0;
     int n_unchanged = 0;
+    int n_metadata_only = 0;
 
     /* Build lookup: rel_path -> stored hash */
     CBMHashTable *ht =
@@ -109,9 +111,18 @@ static bool *classify_files(cbm_store_t *store, const char *project, cbm_file_in
             continue;
         }
 
-        if (cbm_pipeline_stat_mtime_ns(&st) != h->mtime_ns || st.st_size != h->size) {
+        if (st.st_size != h->size) {
             changed[i] = true;
             n_changed++;
+        } else if (cbm_pipeline_stat_mtime_ns(&st) != h->mtime_ns) {
+            if (cbm_pipeline_file_state_content_matches_current(store, project, &files[i],
+                                                                pass_fingerprint)) {
+                n_unchanged++;
+                n_metadata_only++;
+            } else {
+                changed[i] = true;
+                n_changed++;
+            }
         } else if (!cbm_pipeline_file_state_is_current_or_legacy(
                        store, project, &files[i], pass_fingerprint)) {
             changed[i] = true;
@@ -124,6 +135,9 @@ static bool *classify_files(cbm_store_t *store, const char *project, cbm_file_in
     cbm_ht_free(ht);
     *out_changed = n_changed;
     *out_unchanged = n_unchanged;
+    if (out_metadata_only) {
+        *out_metadata_only = n_metadata_only;
+    }
     return changed;
 }
 
@@ -325,6 +339,7 @@ typedef struct {
     bool *is_changed;
     int n_changed;
     int n_unchanged;
+    int n_metadata_only;
     char **deleted;
     int deleted_count;
     cbm_file_hash_t *mode_skipped;
@@ -356,7 +371,7 @@ static int incr_classification_build(cbm_pipeline_t *p, cbm_store_t *store, cons
 
     out->is_changed =
         classify_files(store, project, files, file_count, stored, stored_count, pass_fingerprint,
-                       &out->n_changed, &out->n_unchanged);
+                       &out->n_changed, &out->n_unchanged, &out->n_metadata_only);
     if (!out->is_changed) {
         cbm_log_error("incremental.err", "msg", "classify_files_oom");
         return CBM_NOT_FOUND;
@@ -1140,12 +1155,20 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     cbm_log_info("incremental.classify", "changed", itoa_buf_incr(cls.n_changed), "unchanged",
                  itoa_buf_incr(cls.n_unchanged), "deleted", itoa_buf_incr(cls.deleted_count),
-                 "mode_skipped", itoa_buf_incr(cls.mode_skipped_count));
+                 "mode_skipped", itoa_buf_incr(cls.mode_skipped_count), "metadata_only",
+                 itoa_buf_incr(cls.n_metadata_only));
 
-    /* Fast path: nothing changed → skip. The on-disk DB is left untouched,
-     * which means existing hash rows (including for any mode-skipped files
-     * that were already preserved by an earlier run) remain intact. */
+    /* Fast path: no graph changes. If only filesystem metadata drifted after a
+     * hash-confirmed touch, refresh file_hash rows so future runs keep the
+     * cheap metadata path. Refresh failure is nonfatal; graph state is already
+     * current and a later run can hash-confirm again. */
     if (cls.n_changed == 0 && cls.deleted_count == 0) {
+        if (cls.n_metadata_only > 0 &&
+            persist_hashes(store, project, files, file_count, cls.mode_skipped,
+                           cls.mode_skipped_count) != CBM_STORE_OK) {
+            cbm_log_warn("incremental.noop_metadata_refresh_failed", "count",
+                         itoa_buf_incr(cls.n_metadata_only));
+        }
         cbm_log_info("incremental.noop", "reason", "no_changes");
         incr_classification_free(&cls);
         cbm_store_free_file_hashes(stored, stored_count);
