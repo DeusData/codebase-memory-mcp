@@ -739,6 +739,42 @@ TEST(tool_search_graph_warns_on_stale_pagerank_view) {
     PASS();
 }
 
+TEST(tool_search_graph_warns_on_stale_route_view) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "search-route-stale";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/search-route-stale"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    cbm_node_t route = {.project = proj,
+                        .label = "Route",
+                        .name = "/api/status",
+                        .qualified_name = "__route__/api/status",
+                        .file_path = "src/status.c"};
+    ASSERT_GT(cbm_store_upsert_node(st, &route), 0);
+    ASSERT_EQ(cbm_store_set_derived_view_state(st, proj, CBM_STORE_DERIVED_VIEW_ROUTES,
+                                               CBM_STORE_DERIVED_GENERATION_UNKNOWN,
+                                               CBM_STORE_DERIVED_STATUS_STALE),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":44,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"search-route-stale\",\"label\":\"Route\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
+    ASSERT_NOT_NULL(strstr(inner, "routes derived view is stale"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 static bool mcp_test_upsert_fts_node(cbm_store_t *st, const char *project, const char *label,
                                      const char *name, const char *qualified_name,
                                      const char *file_path) {
@@ -3224,6 +3260,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_basic);
     RUN_TEST(tool_search_graph_includes_node_properties);
     RUN_TEST(tool_search_graph_warns_on_stale_pagerank_view);
+    RUN_TEST(tool_search_graph_warns_on_stale_route_view);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_query_uses_search_limit_config);
     RUN_TEST(tool_search_graph_query_rejects_bad_semantic_query);

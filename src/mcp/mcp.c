@@ -148,6 +148,10 @@ static bool query_mentions_semantic_derived_graph(const char *query) {
     return query_mentions_any(query, terms, (int)(sizeof(terms) / sizeof(terms[0])));
 }
 
+static bool search_graph_uses_route_derived_graph(const char *label, const char *relationship) {
+    return (label && strcmp(label, "Route") == 0) || query_mentions_route_derived_graph(relationship);
+}
+
 static void add_query_graph_derived_warnings(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                              cbm_store_t *store, const char *project,
                                              const char *query) {
@@ -3317,6 +3321,11 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     inject_context_once(doc, root, srv, store);
     add_derived_freshness_warnings(doc, root, out.pagerank_stale, out.linkrank_stale,
                                    out.node_degree_stale);
+    if (search_graph_uses_route_derived_graph(label, relationship) &&
+        cbm_store_derived_view_is_stale(store, project, CBM_STORE_DERIVED_VIEW_ROUTES)) {
+        add_response_warning(doc, root,
+                             "routes derived view is stale; search_graph route results may be stale.");
+    }
 
     if (is_summary) {
         /* Summary mode: aggregate counts by label and file (top 20) */
