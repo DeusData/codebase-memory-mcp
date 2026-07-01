@@ -154,6 +154,7 @@ typedef struct {
     bool cursor;      /* ~/.cursor/ exists */
     bool openclaw;    /* ~/.openclaw/ exists */
     bool kiro;        /* ~/.kiro/ exists */
+    bool junie;       /* ~/.junie/ exists */
 } cbm_detected_agents_t;
 
 /* Detect which coding agents are installed.
@@ -180,6 +181,13 @@ int cbm_upsert_antigravity_mcp(const char *binary_path, const char *config_path)
 
 /* Remove CMM MCP entry from antigravity mcp_config.json. Returns 0 on success. */
 int cbm_remove_antigravity_mcp(const char *config_path);
+
+/* Junie (JetBrains): upsert MCP entry in ~/.junie/mcp/mcp.json (mcpServers format).
+ * Returns 0 on success. */
+int cbm_upsert_junie_mcp(const char *binary_path, const char *config_path);
+
+/* Remove CMM MCP entry from Junie mcp.json. Returns 0 on success. */
+int cbm_remove_junie_mcp(const char *config_path);
 
 /* ── Instructions file upsert ─────────────────────────────────── */
 
