@@ -288,6 +288,31 @@ TEST(infrascan_prefix_bridge_uses_all_registrars_not_first_edge) {
     PASS();
 }
 
+TEST(infrascan_sveltekit_routes_keep_source_file_ownership) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/cbm_infrascan_sveltekit_route");
+    ASSERT_NOT_NULL(gb);
+
+    const char *file_path = "apps/web/src/routes/api/items/+server.ts";
+    int64_t file = cbm_gbuf_upsert_node(gb, "File", "+server.ts", "test.apps.web.routes.api.items.server",
+                                        file_path, 0, 0, "{}");
+    int64_t handler = cbm_gbuf_upsert_node(gb, "Function", "GET",
+                                           "test.apps.web.routes.api.items.GET", file_path, 1, 10,
+                                           "{}");
+    ASSERT_GT(file, 0);
+    ASSERT_GT(handler, 0);
+    cbm_gbuf_insert_edge(gb, file, handler, "DEFINES", "{}");
+
+    cbm_pipeline_create_route_nodes(gb);
+
+    const cbm_gbuf_node_t *route = cbm_gbuf_find_by_qn(gb, "__route__GET__/api/items");
+    ASSERT_NOT_NULL(route);
+    ASSERT_STR_EQ(route->file_path, file_path);
+    ASSERT_TRUE(has_handle(gb, handler, route->id));
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 SUITE(infrascan) {
     RUN_TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths);
     RUN_TEST(infrascan_service_pattern_match_uses_qn_boundaries);
@@ -296,4 +321,5 @@ SUITE(infrascan) {
     RUN_TEST(infrascan_infra_match_does_not_expand_root_handlers_to_external_paths);
     RUN_TEST(infrascan_infra_match_uses_all_matching_handler_routes);
     RUN_TEST(infrascan_prefix_bridge_uses_all_registrars_not_first_edge);
+    RUN_TEST(infrascan_sveltekit_routes_keep_source_file_ownership);
 }

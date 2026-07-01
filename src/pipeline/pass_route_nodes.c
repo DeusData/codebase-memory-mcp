@@ -1283,8 +1283,8 @@ static void sveltekit_file_visitor(const cbm_gbuf_node_t *node, void *userdata) 
             continue;
         }
 
-        int64_t route_id = cbm_pipeline_upsert_service_route(ctx->gb, route_path, CBM_SVC_HTTP,
-                                                             method, NULL, "sveltekit", NULL);
+        int64_t route_id = cbm_pipeline_upsert_service_route(
+            ctx->gb, route_path, CBM_SVC_HTTP, method, NULL, "sveltekit", node->file_path);
         if (route_id == 0) {
             continue;
         }
