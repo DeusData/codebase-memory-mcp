@@ -207,12 +207,14 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
   useEffect(() => { browse(); }, [browse]);
   useEffect(() => { filterRef.current?.focus(); }, []);
 
-  /* When the user types a path directly into the Repository path field, refresh
-   * the folder listing to match (debounced). Without this the breadcrumb and
-   * path box updated but the directory list stayed stale — e.g. typing "D:/"
-   * still showed the previous location's folders. */
+  /* Windows only: when the user types a drive path into the Repository path
+   * field, refresh the folder listing to match (debounced). On Windows, typing
+   * is the way to switch drives, and without this the breadcrumb and path box
+   * updated but the directory list stayed stale (e.g. typing "D:/" still showed
+   * the previous drive's folders). POSIX navigation is left unchanged. */
   useEffect(() => {
     if (!currentPath || currentPath === lastBrowsedRef.current) return;
+    if (!/^[A-Za-z]:/.test(currentPath.replace(/\\/g, "/"))) return;
     const id = setTimeout(() => { void browse(currentPath, { silent: true }); }, 350);
     return () => clearTimeout(id);
   }, [currentPath, browse]);
@@ -297,7 +299,7 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
               aria-label={t.index.repositoryPath}
               value={currentPath}
               onChange={(e) => setCurrentPath(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void browse(currentPath); } }}
+              onKeyDown={(e) => { if (e.key === "Enter" && /^[A-Za-z]:/.test(currentPath.replace(/\\/g, "/"))) { e.preventDefault(); void browse(currentPath); } }}
               className="w-full bg-white/[0.04] border border-white/[0.06] rounded-lg px-3 py-2 text-[12px] text-foreground font-mono outline-none focus:border-primary/40"
             />
           </label>

@@ -180,4 +180,24 @@ describe("StatsTab index modal", () => {
       expect(fetchMock).toHaveBeenCalledWith("/api/browse?path=C%3A%2F");
     });
   });
+
+  it("does not auto-refresh on POSIX when a path is typed", async () => {
+    const fetchMock = mockProjectsFetch(); // browse returns POSIX path "/home/dev"
+
+    render(<StatsTab onSelectProject={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Index your first repository" }));
+    await screen.findByText("alpha"); // initial POSIX listing
+
+    const browseCalls = () =>
+      fetchMock.mock.calls.filter((c) => String(c[0]).startsWith("/api/browse")).length;
+    const before = browseCalls();
+
+    fireEvent.change(screen.getByLabelText("Repository path"), {
+      target: { value: "/usr/local" },
+    });
+
+    /* Wait past the debounce window; a POSIX path must NOT trigger a re-browse. */
+    await new Promise((r) => setTimeout(r, 400));
+    expect(browseCalls()).toBe(before);
+  });
 });
