@@ -22,6 +22,7 @@
 #include "foundation/compat.h"
 #include "foundation/compat_thread.h"
 #include "foundation/compat_fs.h"
+#include "foundation/platform.h"
 #include "foundation/str_util.h"
 
 #include <stdio.h>
@@ -30,6 +31,7 @@
 #include <time.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 /* ── Per-project state ──────────────────────────────────────────── */
 
@@ -39,6 +41,7 @@ typedef struct {
     char last_head[CBM_SZ_64]; /* git HEAD hash */
     bool is_git;               /* false → skip polling */
     bool baseline_done;        /* true after first poll */
+    int missing_root_count;    /* consecutive polls where root_path was absent */
     int file_count;            /* approximate, for interval calc */
     int interval_ms;           /* adaptive poll interval */
     int64_t next_poll_ns;      /* next poll time (monotonic ns) */
@@ -69,6 +72,8 @@ struct cbm_watcher {
 #define POLL_BASE_MS 5000
 #define POLL_FILE_STEP 500 /* add 1s per this many files */
 #define POLL_MAX_MS 60000
+/* Sustained absence window before deleting an irreversible cached DB. */
+#define MISSING_ROOT_DELETE_AFTER ((3 * 60 * CBM_MSEC_PER_SEC) / POLL_BASE_MS)
 
 /* Sleep chunk for responsive shutdown (ms) */
 #define SLEEP_CHUNK_MS 500
@@ -245,11 +250,69 @@ static void state_free(project_state_t *s) {
     free(s);
 }
 
+typedef enum {
+    ROOT_PATH_EXISTS,
+    ROOT_PATH_MISSING,
+    ROOT_PATH_UNAVAILABLE,
+} root_path_status_t;
+
+static root_path_status_t root_path_status(const char *root_path) {
+    if (!root_path) {
+        return ROOT_PATH_UNAVAILABLE;
+    }
+
+    struct stat st;
+    if (stat(root_path, &st) == 0) {
+        return S_ISDIR(st.st_mode) ? ROOT_PATH_EXISTS : ROOT_PATH_UNAVAILABLE;
+    }
+    return (errno == ENOENT || errno == ENOTDIR) ? ROOT_PATH_MISSING : ROOT_PATH_UNAVAILABLE;
+}
+
+static void delete_cached_project_db(const char *project_name) {
+    if (!cbm_validate_project_name(project_name)) {
+        return;
+    }
+
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) {
+        return;
+    }
+
+    char path[CBM_SZ_1K];
+    char wal[CBM_SZ_1K];
+    char shm[CBM_SZ_1K];
+    snprintf(path, sizeof(path), "%s/%s.db", cache_dir, project_name);
+    snprintf(wal, sizeof(wal), "%s-wal", path);
+    snprintf(shm, sizeof(shm), "%s-shm", path);
+    (void)cbm_unlink(path);
+    (void)cbm_unlink(wal);
+    (void)cbm_unlink(shm);
+}
+
 /* Hash table foreach callback to free state entries */
 static void free_state_entry(const char *key, void *val, void *ud) {
     (void)key;
     (void)ud;
     state_free(val);
+}
+
+static void defer_state_free_locked(cbm_watcher_t *w, project_state_t *s) {
+    if (!w || !s) {
+        return;
+    }
+    if (w->pending_free_count >= w->pending_free_cap) {
+        int new_cap = w->pending_free_cap ? w->pending_free_cap * 2 : 8;
+        project_state_t **tmp = realloc(w->pending_free, (size_t)new_cap * sizeof(project_state_t *));
+        if (tmp) {
+            w->pending_free = tmp;
+            w->pending_free_cap = new_cap;
+        }
+    }
+    if (w->pending_free_count < w->pending_free_cap) {
+        w->pending_free[w->pending_free_count++] = s;
+    } else {
+        state_free(s); /* realloc failed — fall back to immediate free */
+    }
 }
 
 /* ── Watcher lifecycle ──────────────────────────────────────────── */
@@ -336,20 +399,7 @@ void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name) {
         /* Defer free: the state may still be referenced by a poll_once
          * snapshot taken before we acquired the lock.  poll_once will
          * drain this list at the start of its next cycle. */
-        if (w->pending_free_count >= w->pending_free_cap) {
-            int new_cap = w->pending_free_cap ? w->pending_free_cap * 2 : 8;
-            project_state_t **tmp =
-                realloc(w->pending_free, (size_t)new_cap * sizeof(project_state_t *));
-            if (tmp) {
-                w->pending_free = tmp;
-                w->pending_free_cap = new_cap;
-            }
-        }
-        if (w->pending_free_count < w->pending_free_cap) {
-            w->pending_free[w->pending_free_count++] = s;
-        } else {
-            state_free(s); /* realloc failed — fall back to immediate free */
-        }
+        defer_state_free_locked(w, s);
         removed = true;
     }
     cbm_mutex_unlock(&w->projects_lock);
@@ -437,12 +487,57 @@ typedef struct {
     int reindexed;
 } poll_ctx_t;
 
+static void prune_missing_project(cbm_watcher_t *w, project_state_t *s) {
+    if (!w || !s || !s->project_name) {
+        return;
+    }
+
+    char project_name[CBM_SZ_1K];
+    snprintf(project_name, sizeof(project_name), "%s", s->project_name);
+
+    bool removed = false;
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *current = cbm_ht_get(w->projects, project_name);
+    if (current == s) {
+        delete_cached_project_db(project_name);
+        cbm_ht_delete(w->projects, project_name);
+        defer_state_free_locked(w, s);
+        removed = true;
+    }
+    cbm_mutex_unlock(&w->projects_lock);
+
+    if (removed) {
+        cbm_log_info("watcher.root_pruned", "project", project_name);
+    }
+}
+
 static void poll_project(const char *key, void *val, void *ud) {
     (void)key;
     poll_ctx_t *ctx = ud;
     project_state_t *s = val;
     if (!s) {
         return;
+    }
+
+    root_path_status_t root_status = root_path_status(s->root_path);
+    if (root_status == ROOT_PATH_MISSING) {
+        s->missing_root_count++;
+        cbm_log_warn("watcher.root_missing", "project", s->project_name, "path", s->root_path);
+        if (s->missing_root_count >= MISSING_ROOT_DELETE_AFTER) {
+            prune_missing_project(ctx->w, s);
+        }
+        return;
+    }
+    if (root_status == ROOT_PATH_UNAVAILABLE) {
+        if (s->missing_root_count > 0) {
+            s->missing_root_count = 0;
+        }
+        cbm_log_warn("watcher.root_unavailable", "project", s->project_name, "path", s->root_path);
+        return;
+    }
+    if (s->missing_root_count > 0) {
+        cbm_log_info("watcher.root_restored", "project", s->project_name, "path", s->root_path);
+        s->missing_root_count = 0;
     }
 
     /* Initialize baseline on first poll */
