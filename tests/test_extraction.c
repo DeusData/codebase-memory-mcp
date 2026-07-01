@@ -1236,6 +1236,30 @@ TEST(func_function_application_edge) {
     PASS();
 }
 
+TEST(vhdl_function_call_edge) {
+    CBMFileResult *r =
+        extract("entity test is\n"
+                "end entity;\n"
+                "architecture rtl of test is\n"
+                "  function add(x : integer; y : integer) return integer is\n"
+                "  begin\n"
+                "    return x + y;\n"
+                "  end function;\n"
+                "begin\n"
+                "  process\n"
+                "    variable z : integer;\n"
+                "  begin\n"
+                "    z := add(1, 2);\n"
+                "  end process;\n"
+                "end rtl;\n",
+                CBM_LANG_VHDL, "t", "adder.vhd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "add"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Fortran --- */
 TEST(fortran_function) {
     /* Fortran subroutine name extraction is incomplete — just verify no crash */
@@ -3431,6 +3455,7 @@ SUITE(extraction) {
     RUN_TEST(typst_function_call_edge);
     RUN_TEST(nickel_function_application_edge);
     RUN_TEST(func_function_application_edge);
+    RUN_TEST(vhdl_function_call_edge);
     RUN_TEST(fortran_function);
 
     /* OOP/Systems variants */

@@ -816,6 +816,24 @@ static char *extract_cobol_callee(CBMArena *a, TSNode node, const char *source, 
     return (char *)strip_quotes(a, cbm_node_text(a, target, source));
 }
 
+// VHDL function calls parse as name + parenthesis_group, not always function_call.
+static char *extract_vhdl_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "parenthesis_group") != 0) {
+        return NULL;
+    }
+    TSNode prev = ts_node_prev_named_sibling(node);
+    if (ts_node_is_null(prev)) {
+        return NULL;
+    }
+    const char *pk = ts_node_type(prev);
+    if (strcmp(pk, "library_function") == 0 || strcmp(pk, "identifier") == 0 ||
+        strcmp(pk, "name") == 0 || strcmp(pk, "simple_name") == 0) {
+        char *t = cbm_node_text(a, prev, source);
+        return (t && t[0]) ? t : NULL;
+    }
+    return NULL;
+}
+
 // Make builtins are represented as function_call nodes; $(shell ...) is shell_function.
 static char *extract_make_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
     if (strcmp(nk, "shell_function") == 0) {
@@ -919,6 +937,10 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
     }
     if (lang == CBM_LANG_NICKEL) {
         char *c = extract_nickel_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
+    if (lang == CBM_LANG_VHDL) {
+        char *c = extract_vhdl_callee(a, node, source, nk);
         return c ? c : extract_scripting_callee(a, node, source, lang, nk);
     }
 
