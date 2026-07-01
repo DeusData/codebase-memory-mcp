@@ -1168,22 +1168,25 @@ TEST(julia_short_form_assignment_function) {
 /* --- Elm --- */
 TEST(elm_function) {
     CBMFileResult *r =
-        extract("add x y = x + y\nmultiply x y = x * y\n", CBM_LANG_ELM, "t", "Math.elm");
+        extract("add x y = x + y\nmultiply x y = add x y\n", CBM_LANG_ELM, "t", "Math.elm");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Function", "add"));
+    ASSERT(has_call_exact(r, "add"));
     cbm_free_result(r);
     PASS();
 }
 
 /* --- Nix --- */
 TEST(nix_function) {
-    CBMFileResult *r =
-        extract("{ pkgs ? import <nixpkgs> {} }:\nlet\n  hello = pkgs.writeShellScriptBin "
-                "\"hello\" ''echo hello'';\nin { inherit hello; }\n",
-                CBM_LANG_NIX, "t", "default.nix");
+    CBMFileResult *r = extract("let\n"
+                               "  addOne = x: x + 1;\n"
+                               "  result = addOne 2;\n"
+                               "in result\n",
+                               CBM_LANG_NIX, "t", "default.nix");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "addOne"));
     cbm_free_result(r);
     PASS();
 }
@@ -1594,6 +1597,18 @@ TEST(sql_function) {
     PASS();
 }
 
+TEST(sql_invocation_call_edge) {
+    CBMFileResult *r =
+        extract("CREATE FUNCTION get_user_count() RETURNS INTEGER AS $$ SELECT COUNT(*) FROM "
+                "users; $$ LANGUAGE SQL;\nSELECT get_user_count();\n",
+                CBM_LANG_SQL, "t", "funcs.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "get_user_count"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Meson project --- */
 TEST(meson_project) {
     CBMFileResult *r = extract(
@@ -1615,6 +1630,18 @@ TEST(css_rules) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_GTE(r->defs.count, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(css_function_call_edge) {
+    CBMFileResult *r =
+        extract(".hero { width: calc(100% - 1rem); background-image: url(\"hero.png\"); }\n",
+                CBM_LANG_CSS, "t", "styles.css");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "calc"));
+    ASSERT(has_call_exact(r, "url"));
     cbm_free_result(r);
     PASS();
 }
@@ -3309,8 +3336,10 @@ SUITE(extraction) {
     /* Config/Markup */
     RUN_TEST(html_elements);
     RUN_TEST(sql_function);
+    RUN_TEST(sql_invocation_call_edge);
     RUN_TEST(meson_project);
     RUN_TEST(css_rules);
+    RUN_TEST(css_function_call_edge);
     RUN_TEST(scss_rules);
     RUN_TEST(scss_function_call_edge);
     RUN_TEST(toml_basic);

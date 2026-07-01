@@ -670,9 +670,99 @@ static char *extract_scss_callee(CBMArena *a, TSNode node, const char *source, c
     return NULL;
 }
 
+// CSS call_expression nodes carry the callee in a function_name child.
+static char *extract_css_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "call_expression") != 0) {
+        return NULL;
+    }
+    TSNode fn = cbm_find_child_by_kind(node, "function_name");
+    return ts_node_is_null(fn) ? NULL : cbm_node_text(a, fn, source);
+}
+
+// SQL invocation nodes wrap the callee under object_reference > name.
+static char *extract_sql_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "invocation") != 0) {
+        return NULL;
+    }
+    TSNode oref = cbm_find_child_by_kind(node, "object_reference");
+    if (ts_node_is_null(oref)) {
+        return NULL;
+    }
+    TSNode nm = ts_node_child_by_field_name(oref, TS_FIELD("name"));
+    return ts_node_is_null(nm) ? NULL : cbm_node_text(a, nm, source);
+}
+
+// Elm function_call_expr stores its target under target > value_expr > name.
+static char *extract_elm_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "function_call_expr") != 0) {
+        return NULL;
+    }
+    TSNode target = ts_node_child_by_field_name(node, TS_FIELD("target"));
+    if (ts_node_is_null(target)) {
+        return NULL;
+    }
+    TSNode ve = strcmp(ts_node_type(target), "value_expr") == 0
+                    ? target
+                    : cbm_find_child_by_kind(target, "value_expr");
+    if (ts_node_is_null(ve)) {
+        return NULL;
+    }
+    TSNode qid = ts_node_child_by_field_name(ve, TS_FIELD("name"));
+    if (ts_node_is_null(qid)) {
+        qid = cbm_find_child_by_kind(ve, "value_qid");
+    }
+    if (ts_node_is_null(qid)) {
+        return NULL;
+    }
+    TSNode id = cbm_find_child_by_kind(qid, "lower_case_identifier");
+    return ts_node_is_null(id) ? cbm_node_text(a, qid, source) : cbm_node_text(a, id, source);
+}
+
+// Nix apply_expression is left-associative; descend the function side to the head.
+static char *extract_nix_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "apply_expression") != 0) {
+        return NULL;
+    }
+    TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
+    enum { NIX_APPLY_HEAD_DEPTH = 8 };
+    for (int depth = 0; depth < NIX_APPLY_HEAD_DEPTH && !ts_node_is_null(fn); depth++) {
+        const char *fk = ts_node_type(fn);
+        if (strcmp(fk, "apply_expression") == 0) {
+            fn = ts_node_child_by_field_name(fn, TS_FIELD("function"));
+            continue;
+        }
+        if (strcmp(fk, "variable_expression") == 0) {
+            TSNode name = ts_node_child_by_field_name(fn, TS_FIELD("name"));
+            return ts_node_is_null(name) ? NULL : cbm_node_text(a, name, source);
+        }
+        if (strcmp(fk, "identifier") == 0) {
+            return cbm_node_text(a, fn, source);
+        }
+        break;
+    }
+    return NULL;
+}
+
 static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *source,
                                           CBMLanguage lang) {
     const char *nk = ts_node_type(node);
+
+    if (lang == CBM_LANG_CSS) {
+        char *c = extract_css_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
+    if (lang == CBM_LANG_SQL) {
+        char *c = extract_sql_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
+    if (lang == CBM_LANG_ELM) {
+        char *c = extract_elm_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
+    if (lang == CBM_LANG_NIX) {
+        char *c = extract_nix_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
 
     if (lang == CBM_LANG_CLOJURE || lang == CBM_LANG_COMMONLISP || lang == CBM_LANG_SCHEME ||
         lang == CBM_LANG_FENNEL || lang == CBM_LANG_RACKET || lang == CBM_LANG_EMACSLISP) {
