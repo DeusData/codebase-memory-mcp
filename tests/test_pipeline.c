@@ -3934,7 +3934,7 @@ TEST(pipeline_file_delta_plan_falls_back_on_unsupported_derived_view) {
     cbm_pipeline_file_delta_t delta = {
         .delta = {.project = "test",
                   .rel_path = "main.go",
-                  .derived_view_name = "pagerank",
+                  .derived_view_name = CBM_STORE_DERIVED_VIEW_PAGERANK,
                   .derived_status = CBM_STORE_DERIVED_STATUS_STALE}};
     cbm_file_hash_t hash = {0};
     cbm_file_state_t state = {0};
