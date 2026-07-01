@@ -2,6 +2,10 @@
 #
 # Usage:
 #   make -f Makefile.cbm test           # Build + run all tests (ASan + UBSan)
+#   CBM_ONLY_SUITE=pipeline make -f Makefile.cbm test
+#                                        # Run one suite after building
+#   CBM_ONLY_SUITE=pipeline CBM_ONLY_TEST=exact build/c/test-runner
+#                                        # Run matching tests inside one suite
 #   make -f Makefile.cbm test-foundation # Foundation tests only (fast)
 #   make -f Makefile.cbm test-tsan      # Thread sanitizer build
 #   make -f Makefile.cbm cbm            # Production binary (auto-signed on macOS)
@@ -732,7 +736,8 @@ endif
 # Catches uninit reads, use-after-free, and overruns that ASan/TSan can miss
 # (used to investigate the B1 custom-writer non-deterministic corruption).
 # All run the NOSAN binary: ASan replaces malloc, which would defeat these
-# libmalloc knobs. Set CBM_ONLY_SUITE=<suite> to target a slow suite.
+# libmalloc knobs. Set CBM_ONLY_SUITE=<suite> to target a slow suite, and
+# optionally CBM_ONLY_TEST=<substring> to run matching tests after suite setup.
 MEM_LOG = $(BUILD_DIR)/mem-report.txt
 ifeq ($(UNAME_S),Darwin)
 # MallocScribble=1     → freed memory filled with 0x55 (catches use-after-free).
