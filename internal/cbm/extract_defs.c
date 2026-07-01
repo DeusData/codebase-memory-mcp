@@ -314,6 +314,14 @@ static TSNode resolve_func_name_scripting(TSNode node, CBMLanguage lang, const c
     if (lang == CBM_LANG_JULIA && strcmp(kind, "function_definition") == 0) {
         return resolve_julia_func_name(node);
     }
+    if (lang == CBM_LANG_JULIA && strcmp(kind, "assignment") == 0) {
+        if (ts_node_named_child_count(node) > 0) {
+            TSNode lhs = ts_node_named_child(node, 0);
+            if (!ts_node_is_null(lhs) && strcmp(ts_node_type(lhs), "call_expression") == 0) {
+                return resolve_julia_func_name(lhs);
+            }
+        }
+    }
 
     TSNode null_node = {0};
     return null_node;

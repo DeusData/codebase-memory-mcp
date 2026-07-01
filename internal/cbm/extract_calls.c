@@ -307,15 +307,21 @@ static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *so
     return NULL;
 }
 
-// Haskell/OCaml: extract callee from apply/infix nodes.
+// Haskell/OCaml/PureScript: extract callee from apply/infix nodes.
 static char *extract_fp_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
-    if (strcmp(nk, "apply") == 0 || strcmp(nk, "application_expression") == 0) {
+    if (strcmp(nk, "apply") == 0 || strcmp(nk, "application_expression") == 0 ||
+        strcmp(nk, "exp_apply") == 0) {
         if (ts_node_child_count(node) > 0) {
             TSNode callee = ts_node_child(node, 0);
             const char *ck = ts_node_type(callee);
             if (strcmp(ck, "identifier") == 0 || strcmp(ck, "variable") == 0 ||
-                strcmp(ck, "constructor") == 0 || strcmp(ck, "value_path") == 0) {
+                strcmp(ck, "constructor") == 0 || strcmp(ck, "value_path") == 0 ||
+                strcmp(ck, "exp_name") == 0) {
                 return cbm_node_text(a, callee, source);
+            }
+            if (strcmp(ck, "exp_apply") == 0 || strcmp(ck, "apply") == 0 ||
+                strcmp(ck, "application_expression") == 0) {
+                return extract_fp_callee(a, callee, source, ck);
             }
         }
     }
@@ -614,6 +620,48 @@ static char *extract_dart_callee(CBMArena *a, TSNode node, const char *source, c
     return NULL;
 }
 
+static bool agda_expr_belongs_to_signature(TSNode node) {
+    TSNode cur = node;
+    while (!ts_node_is_null(cur)) {
+        if (strcmp(ts_node_type(cur), "function") == 0) {
+            TSNode lhs = cbm_find_child_by_kind(cur, "lhs");
+            return !ts_node_is_null(lhs) &&
+                   !ts_node_is_null(cbm_find_child_by_kind(lhs, "function_name"));
+        }
+        cur = ts_node_parent(cur);
+    }
+    return false;
+}
+
+// Agda function application parses as an expr with the callee in child 0.
+static char *extract_agda_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "module_application") == 0) {
+        return extract_callee_from_fields(a, node, source);
+    }
+    if (strcmp(nk, "expr") != 0 || ts_node_named_child_count(node) < 2 ||
+        agda_expr_belongs_to_signature(node)) {
+        return NULL;
+    }
+    TSNode head = ts_node_named_child(node, 0);
+    if (strcmp(ts_node_type(head), "atom") == 0 && ts_node_named_child_count(head) > 0) {
+        head = ts_node_named_child(head, 0);
+    }
+    return cbm_node_text(a, head, source);
+}
+
+// SCSS: include statements and @function calls store callees as named children.
+static char *extract_scss_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "include_statement") == 0) {
+        TSNode id = cbm_find_child_by_kind(node, "identifier");
+        return ts_node_is_null(id) ? NULL : cbm_node_text(a, id, source);
+    }
+    if (strcmp(nk, "call_expression") == 0) {
+        TSNode fn = cbm_find_child_by_kind(node, "function_name");
+        return ts_node_is_null(fn) ? NULL : cbm_node_text(a, fn, source);
+    }
+    return NULL;
+}
+
 static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *source,
                                           CBMLanguage lang) {
     const char *nk = ts_node_type(node);
@@ -643,13 +691,19 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
     if (lang == CBM_LANG_DART) {
         return extract_dart_callee(a, node, source, nk);
     }
+    if (lang == CBM_LANG_AGDA) {
+        return extract_agda_callee(a, node, source, nk);
+    }
+    if (lang == CBM_LANG_SCSS) {
+        return extract_scss_callee(a, node, source, nk);
+    }
     if (lang == CBM_LANG_OBJC) {
         return extract_objc_callee(a, node, source, nk);
     }
     if (lang == CBM_LANG_ERLANG) {
         return extract_erlang_callee(a, node, source, nk);
     }
-    if (lang == CBM_LANG_HASKELL || lang == CBM_LANG_OCAML) {
+    if (lang == CBM_LANG_HASKELL || lang == CBM_LANG_OCAML || lang == CBM_LANG_PURESCRIPT) {
         return extract_fp_callee(a, node, source, nk);
     }
     if (lang == CBM_LANG_WOLFRAM && strcmp(nk, "apply") == 0) {
