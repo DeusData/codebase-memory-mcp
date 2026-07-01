@@ -1936,6 +1936,8 @@ TEST(store_derived_view_state_public_api) {
     ASSERT_EQ(cbm_store_get_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_NODE_DEGREE,
                                                &got),
               CBM_STORE_OK);
+    ASSERT_TRUE(cbm_store_derived_view_is_stale(s, "test",
+                                                CBM_STORE_DERIVED_VIEW_NODE_DEGREE));
     ASSERT_STR_EQ(got.project, "test");
     ASSERT_STR_EQ(got.view_name, CBM_STORE_DERIVED_VIEW_NODE_DEGREE);
     ASSERT_EQ(got.source_generation, STALE_GENERATION);
@@ -1958,6 +1960,19 @@ TEST(store_derived_view_state_public_api) {
                                                &got),
               CBM_STORE_OK);
     ASSERT_EQ(got.source_generation, COMPLETE_GENERATION);
+    ASSERT_STR_EQ(got.status, CBM_STORE_DERIVED_STATUS_COMPLETE);
+    cbm_store_derived_view_state_free_fields(&got);
+    ASSERT_FALSE(cbm_store_derived_view_is_stale(s, "test",
+                                                 CBM_STORE_DERIVED_VIEW_PAGERANK));
+
+    ASSERT_EQ(cbm_store_set_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_ARCHITECTURE,
+                                               CBM_STORE_DERIVED_GENERATION_UNKNOWN,
+                                               CBM_STORE_DERIVED_STATUS_COMPLETE),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_ARCHITECTURE,
+                                               &got),
+              CBM_STORE_OK);
+    ASSERT_EQ(got.source_generation, CBM_STORE_DERIVED_GENERATION_UNKNOWN);
     ASSERT_STR_EQ(got.status, CBM_STORE_DERIVED_STATUS_COMPLETE);
     cbm_store_derived_view_state_free_fields(&got);
 

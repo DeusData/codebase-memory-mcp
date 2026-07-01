@@ -1020,6 +1020,66 @@ TEST(store_bfs_carries_joined_pagerank_score) {
     ASSERT_FLOAT_EQ(result.visited[0].pagerank_score, 0.75, CBM_PAGERANK_EPSILON);
 
     cbm_store_traverse_free(&result);
+
+    ASSERT_EQ(cbm_store_set_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                               CBM_STORE_DERIVED_GENERATION_UNKNOWN,
+                                               CBM_STORE_DERIVED_STATUS_STALE),
+              CBM_STORE_OK);
+    cbm_traverse_result_t stale_result = {0};
+    ASSERT_EQ(cbm_store_bfs(s, idA, "outbound", types, 1, 1, 10, &stale_result),
+              CBM_STORE_OK);
+    ASSERT_TRUE(stale_result.pagerank_stale);
+    ASSERT_EQ(stale_result.visited_count, 1);
+    ASSERT_FLOAT_EQ(stale_result.visited[0].pagerank_score, 0.0, CBM_PAGERANK_EPSILON);
+
+    cbm_store_traverse_free(&stale_result);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_search_uses_legacy_but_not_stale_pagerank) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t na = {
+        .project = "test", .label = "Function", .name = "A", .qualified_name = "test.A"};
+    cbm_node_t nb = {
+        .project = "test", .label = "Function", .name = "B", .qualified_name = "test.B"};
+    int64_t idA = cbm_store_upsert_node(s, &na);
+    int64_t idB = cbm_store_upsert_node(s, &nb);
+
+    char rank_sql[512];
+    snprintf(rank_sql, sizeof(rank_sql),
+             "INSERT INTO pagerank(project,node_id,rank,computed_at) "
+             "VALUES('test',%lld,0.1,'2026-06-30T00:00:00Z'),"
+             "('test',%lld,0.9,'2026-06-30T00:00:00Z')",
+             (long long)idA, (long long)idB);
+    ASSERT_EQ(cbm_store_exec(s, rank_sql), CBM_STORE_OK);
+
+    cbm_search_params_t params = {0};
+    params.project = "test";
+    params.limit = 2;
+    params.min_degree = -1;
+    params.max_degree = -1;
+    cbm_search_output_t out = {0};
+    ASSERT_EQ(cbm_store_search(s, &params, &out), CBM_STORE_OK);
+    ASSERT_FALSE(out.pagerank_stale);
+    ASSERT_EQ(out.count, 2);
+    ASSERT_STR_EQ(out.results[0].node.name, "B");
+    ASSERT_FLOAT_EQ(out.results[0].pagerank_score, 0.9, CBM_PAGERANK_EPSILON);
+    cbm_store_search_free(&out);
+
+    ASSERT_EQ(cbm_store_set_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                               CBM_STORE_DERIVED_GENERATION_UNKNOWN,
+                                               CBM_STORE_DERIVED_STATUS_STALE),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_search(s, &params, &out), CBM_STORE_OK);
+    ASSERT_TRUE(out.pagerank_stale);
+    ASSERT_EQ(out.count, 2);
+    ASSERT_STR_EQ(out.results[0].node.name, "A");
+    ASSERT_FLOAT_EQ(out.results[0].pagerank_score, 0.0, CBM_PAGERANK_EPSILON);
+
+    cbm_store_search_free(&out);
     cbm_store_close(s);
     PASS();
 }
@@ -1628,6 +1688,7 @@ SUITE(store_search) {
     RUN_TEST(store_deduplicate_hops);
     RUN_TEST(store_bfs_with_risk_labels);
     RUN_TEST(store_bfs_carries_joined_pagerank_score);
+    RUN_TEST(store_search_uses_legacy_but_not_stale_pagerank);
     RUN_TEST(store_bfs_cross_service_summary);
     RUN_TEST(store_glob_to_like);
     RUN_TEST(store_extract_like_hints);

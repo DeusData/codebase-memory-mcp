@@ -213,6 +213,27 @@ TEST(pagerank_stored_in_db) {
     add_node(s, "db", "f2");
     cbm_pagerank_compute_default(s, "db");
     ASSERT_EQ(count_table_rows(s, "pagerank"), 2);
+
+    cbm_derived_view_state_t state = {0};
+    ASSERT_EQ(cbm_store_get_derived_view_state(s, "db", CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                               &state),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(state.status, CBM_STORE_DERIVED_STATUS_COMPLETE);
+    ASSERT_EQ(state.source_generation, CBM_STORE_DERIVED_GENERATION_UNKNOWN);
+    cbm_store_derived_view_state_free_fields(&state);
+
+    ASSERT_EQ(cbm_store_get_derived_view_state(s, "db", CBM_STORE_DERIVED_VIEW_LINKRANK,
+                                               &state),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(state.status, CBM_STORE_DERIVED_STATUS_COMPLETE);
+    cbm_store_derived_view_state_free_fields(&state);
+
+    ASSERT_EQ(cbm_store_get_derived_view_state(s, "db", CBM_STORE_DERIVED_VIEW_NODE_DEGREE,
+                                               &state),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(state.status, CBM_STORE_DERIVED_STATUS_COMPLETE);
+    cbm_store_derived_view_state_free_fields(&state);
+
     cbm_store_close(s);
     PASS();
 }
