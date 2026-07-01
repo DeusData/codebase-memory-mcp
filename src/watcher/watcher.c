@@ -33,13 +33,29 @@
 #include <stdatomic.h>
 #include <sys/stat.h>
 
+/* ── Constants ─────────────────────────────────────────────────── */
+
+/* Adaptive poll interval parameters (ms) */
+#define POLL_BASE_MS 5000
+#define POLL_FILE_STEP 500 /* add 1s per this many files */
+#define POLL_MAX_MS 60000
+
+/* Sleep chunk for responsive shutdown (ms) */
+#define SLEEP_CHUNK_MS 500
+
+enum {
+    CBM_WATCHER_GIT_CMD_BUFSZ = CBM_SZ_1K,
+    CBM_WATCHER_DIRTY_HASH_HEX_LEN = 16,
+    CBM_WATCHER_DIRTY_HASH_BUFSZ = CBM_WATCHER_DIRTY_HASH_HEX_LEN + 1,
+};
+
 /* ── Per-project state ──────────────────────────────────────────── */
 
 typedef struct {
     char *project_name;
     char *root_path;
     char last_head[CBM_SZ_64]; /* git HEAD hash */
-    char last_dirty_hash[17];  /* djb2 hex of git status --porcelain output */
+    char last_dirty_hash[CBM_WATCHER_DIRTY_HASH_BUFSZ]; /* git status hash */
     bool is_git;               /* false → skip polling */
     bool baseline_done;        /* true after first poll */
     int file_count;            /* approximate, for interval calc */
@@ -59,16 +75,6 @@ struct cbm_watcher {
     int poll_base_ms;  /* 0 = use POLL_BASE_MS default */
     int poll_max_ms;   /* 0 = use POLL_MAX_MS default */
 };
-
-/* ── Constants ─────────────────────────────────────────────────── */
-
-/* Adaptive poll interval parameters (ms) */
-#define POLL_BASE_MS 5000
-#define POLL_FILE_STEP 500 /* add 1s per this many files */
-#define POLL_MAX_MS 60000
-
-/* Sleep chunk for responsive shutdown (ms) */
-#define SLEEP_CHUNK_MS 500
 
 /* ── Time helper ────────────────────────────────────────────────── */
 
@@ -102,9 +108,68 @@ int cbm_watcher_poll_interval_ms(int file_count, int base_ms, int max_ms) {
 #define WATCHER_NULDEV "/dev/null"
 #endif
 
+static bool watcher_cmd_fits(int n, size_t cmd_size) {
+    return n >= 0 && (size_t)n < cmd_size;
+}
+
+static bool watcher_format_git_command(char *cmd, size_t cmd_size, const char *root_path,
+                                       const char *git_args) {
+    if (!cmd || cmd_size == 0 || !root_path || !git_args || !cbm_validate_shell_arg(root_path)) {
+        return false;
+    }
+    int n = snprintf(cmd, cmd_size, "git -C \"%s\" %s 2>%s", root_path, git_args,
+                     WATCHER_NULDEV);
+    return watcher_cmd_fits(n, cmd_size);
+}
+
+static bool watcher_format_git_status_command(char *cmd, size_t cmd_size, const char *root_path) {
+    if (!cmd || cmd_size == 0 || !root_path || !cbm_validate_shell_arg(root_path)) {
+        return false;
+    }
+    int n = snprintf(cmd, cmd_size,
+                     "git --no-optional-locks -C \"%s\" status --porcelain "
+                     "--untracked-files=normal 2>%s",
+                     root_path, WATCHER_NULDEV);
+    return watcher_cmd_fits(n, cmd_size);
+}
+
+#if !defined(_WIN32)
+static bool watcher_format_git_submodule_status_command(char *cmd, size_t cmd_size,
+                                                        const char *root_path) {
+    if (!cmd || cmd_size == 0 || !root_path || !cbm_validate_shell_arg(root_path)) {
+        return false;
+    }
+    int n = snprintf(cmd, cmd_size,
+                     "git --no-optional-locks -C \"%s\" submodule foreach --quiet --recursive "
+                     "\"git status --porcelain --untracked-files=normal 2>/dev/null\" "
+                     "2>/dev/null",
+                     root_path);
+    return watcher_cmd_fits(n, cmd_size);
+}
+#endif
+
+static bool watcher_git_path_supported(const char *root_path) {
+    char cmd[CBM_WATCHER_GIT_CMD_BUFSZ];
+    if (!watcher_format_git_command(cmd, sizeof(cmd), root_path, "rev-parse --git-dir")) {
+        return false;
+    }
+    if (!watcher_format_git_command(cmd, sizeof(cmd), root_path, "rev-parse HEAD")) {
+        return false;
+    }
+    if (!watcher_format_git_status_command(cmd, sizeof(cmd), root_path)) {
+        return false;
+    }
+    if (!watcher_format_git_command(cmd, sizeof(cmd), root_path, "ls-files")) {
+        return false;
+    }
+    return true;
+}
+
 static bool is_git_repo(const char *root_path) {
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse --git-dir 2>%s", root_path, WATCHER_NULDEV);
+    char cmd[CBM_WATCHER_GIT_CMD_BUFSZ];
+    if (!watcher_format_git_command(cmd, sizeof(cmd), root_path, "rev-parse --git-dir")) {
+        return false;
+    }
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
         return false;
@@ -118,8 +183,10 @@ static bool is_git_repo(const char *root_path) {
 }
 
 static int git_head(const char *root_path, char *out, size_t out_size) {
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse HEAD 2>%s", root_path, WATCHER_NULDEV);
+    char cmd[CBM_WATCHER_GIT_CMD_BUFSZ];
+    if (!watcher_format_git_command(cmd, sizeof(cmd), root_path, "rev-parse HEAD")) {
+        return CBM_NOT_FOUND;
+    }
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
         return CBM_NOT_FOUND;
@@ -148,7 +215,7 @@ static uint64_t djb2(const char *s) {
 
 /* Read full git status --porcelain output into a 16-char hex hash.
  * Returns the number of bytes read (>0 means dirty), -1 on popen failure.
- * out_hex17 must be at least 17 bytes.
+ * out_hex17 must be at least CBM_WATCHER_DIRTY_HASH_BUFSZ bytes.
  *
  * Also folds in submodule status (POSIX only): uncommitted changes inside a
  * submodule are invisible to the parent repo's `git status`, so we append each
@@ -157,11 +224,12 @@ static uint64_t djb2(const char *s) {
  * coverage to submodules — a superset of both the fork's hash-based dedup and
  * upstream's submodule-aware git_is_dirty(). */
 static int git_dirty_hash(const char *root_path, char *out_hex17) {
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd),
-             "git --no-optional-locks -C \"%s\" status --porcelain "
-             "--untracked-files=normal 2>%s",
-             root_path, WATCHER_NULDEV);
+    char cmd[CBM_WATCHER_GIT_CMD_BUFSZ];
+    if (!watcher_format_git_status_command(cmd, sizeof(cmd), root_path)) {
+        static const char empty_dirty_hash[] = "0000000000000000";
+        memcpy(out_hex17, empty_dirty_hash, sizeof(empty_dirty_hash));
+        return -1;
+    }
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
         static const char empty_dirty_hash[] = "0000000000000000";
@@ -180,31 +248,30 @@ static int git_dirty_hash(const char *root_path, char *out_hex17) {
      * takes an inner shell command that cmd.exe cannot pass intact; the
      * parent-repo status check above already covers the common case on Windows. */
     if (n + 1 < sizeof(buf)) {
-        snprintf(cmd, sizeof(cmd),
-                 "git --no-optional-locks -C '%s' submodule foreach --quiet --recursive "
-                 "'git status --porcelain --untracked-files=normal 2>/dev/null' "
-                 "2>/dev/null",
-                 root_path);
-        fp = cbm_popen(cmd, "r");
-        if (fp) {
-            size_t remaining = sizeof(buf) - 1 - n;
-            size_t sm = fread(buf + n, 1, remaining, fp);
-            buf[n + sm] = '\0';
-            n += sm;
-            cbm_pclose(fp);
+        if (watcher_format_git_submodule_status_command(cmd, sizeof(cmd), root_path)) {
+            fp = cbm_popen(cmd, "r");
+            if (fp) {
+                size_t remaining = sizeof(buf) - 1 - n;
+                size_t sm = fread(buf + n, 1, remaining, fp);
+                buf[n + sm] = '\0';
+                n += sm;
+                cbm_pclose(fp);
+            }
         }
     }
 #endif
     uint64_t h = djb2(n > 0 ? buf : "");
     // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
-    snprintf(out_hex17, 17, "%016llx", (unsigned long long)h);
+    snprintf(out_hex17, CBM_WATCHER_DIRTY_HASH_BUFSZ, "%016llx", (unsigned long long)h);
     return (int)n; /* >0 means dirty */
 }
 
 /* Count tracked files via git ls-files */
 static int git_file_count(const char *root_path) {
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C \"%s\" ls-files 2>%s", root_path, WATCHER_NULDEV);
+    char cmd[CBM_WATCHER_GIT_CMD_BUFSZ];
+    if (!watcher_format_git_command(cmd, sizeof(cmd), root_path, "ls-files")) {
+        return 0;
+    }
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
         return 0;
@@ -298,6 +365,11 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
     if (!cbm_validate_shell_arg(root_path)) {
         cbm_log_warn("watcher.watch.reject", "project", project_name, "reason",
                      "path contains shell metacharacters");
+        return;
+    }
+    if (!watcher_git_path_supported(root_path)) {
+        cbm_log_warn("watcher.watch.reject", "project", project_name, "reason",
+                     "path too long for git command");
         return;
     }
 

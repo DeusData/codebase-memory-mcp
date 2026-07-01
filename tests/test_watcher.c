@@ -5,6 +5,7 @@
  * poll_once behavior.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/constants.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <watcher/watcher.h>
@@ -144,6 +145,23 @@ TEST(watcher_null_safety) {
     cbm_watcher_touch(NULL, "x");
     ASSERT_EQ(cbm_watcher_watch_count(NULL), 0);
     ASSERT_EQ(cbm_watcher_poll_once(NULL), 0);
+    PASS();
+}
+
+TEST(watcher_rejects_overlong_git_command_path) {
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, NULL, NULL);
+
+    char long_path[CBM_SZ_2K];
+    long_path[0] = '/';
+    memset(long_path + 1, 'a', sizeof(long_path) - CBM_SZ_2);
+    long_path[sizeof(long_path) - 1] = '\0';
+
+    cbm_watcher_watch(w, "too-long", long_path);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
     PASS();
 }
 
@@ -1752,6 +1770,7 @@ SUITE(watcher) {
     RUN_TEST(watcher_unwatch_nonexistent);
     RUN_TEST(watcher_watch_replace);
     RUN_TEST(watcher_null_safety);
+    RUN_TEST(watcher_rejects_overlong_git_command_path);
 
     /* Polling */
     RUN_TEST(watcher_poll_no_projects);
