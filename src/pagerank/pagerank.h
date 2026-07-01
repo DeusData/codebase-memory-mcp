@@ -10,6 +10,7 @@
 #ifndef CBM_PAGERANK_H
 #define CBM_PAGERANK_H
 
+#include <stdbool.h>
 #include <store/store.h>
 
 /* Forward declaration — full definition in cli/cli.h */
@@ -102,6 +103,11 @@ int cbm_pagerank_compute_default(cbm_store_t *store, const char *project);
  * cfg may be NULL (uses defaults). */
 int cbm_pagerank_compute_with_config(cbm_store_t *store, const char *project,
                                      struct cbm_config *cfg);
+
+/* True only when PageRank, LinkRank, and node_degree derived views are all
+ * recorded complete for the project. Missing rows return false so callers
+ * repair older DBs instead of skipping necessary work. */
+bool cbm_pagerank_views_complete(cbm_store_t *store, const char *project);
 
 /* Get PageRank score for a single node. Returns 0.0 if not computed. */
 double cbm_pagerank_get(cbm_store_t *store, int64_t node_id);

@@ -631,6 +631,25 @@ int cbm_pagerank_compute_with_config(cbm_store_t *store, const char *project,
         max_iter, &w, scope);
 }
 
+static bool pagerank_view_complete(cbm_store_t *store, const char *project, const char *view) {
+    cbm_derived_view_state_t state = {0};
+    bool complete = false;
+    if (cbm_store_get_derived_view_state(store, project, view, &state) == CBM_STORE_OK) {
+        complete = state.status && strcmp(state.status, CBM_STORE_DERIVED_STATUS_COMPLETE) == 0;
+    }
+    cbm_store_derived_view_state_free_fields(&state);
+    return complete;
+}
+
+bool cbm_pagerank_views_complete(cbm_store_t *store, const char *project) {
+    if (!store || !project || !project[0]) {
+        return false;
+    }
+    return pagerank_view_complete(store, project, CBM_STORE_DERIVED_VIEW_PAGERANK) &&
+           pagerank_view_complete(store, project, CBM_STORE_DERIVED_VIEW_LINKRANK) &&
+           pagerank_view_complete(store, project, CBM_STORE_DERIVED_VIEW_NODE_DEGREE);
+}
+
 double cbm_pagerank_get(cbm_store_t *store, int64_t node_id) {
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) return 0.0;

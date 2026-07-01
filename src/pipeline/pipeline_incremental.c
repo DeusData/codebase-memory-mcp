@@ -928,6 +928,7 @@ static int incr_try_exact_delete_route(cbm_pipeline_t *p, cbm_store_t *store, co
 
     cbm_pipeline_set_committed_counts(p, cbm_store_count_nodes(store, project),
                                       cbm_store_count_edges(store, project));
+    cbm_pipeline_set_graph_changed(p, true);
     if (cbm_pipeline_repo_path(p) && cbm_artifact_exists(cbm_pipeline_repo_path(p))) {
         (void)cbm_artifact_export(db_path, cbm_pipeline_repo_path(p), project, CBM_ARTIFACT_FAST);
     }
@@ -1106,6 +1107,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
 
     cbm_pipeline_set_committed_counts(p, cbm_store_count_nodes(store, project),
                                       cbm_store_count_edges(store, project));
+    cbm_pipeline_set_graph_changed(p, true);
     if (cbm_pipeline_repo_path(p) && cbm_artifact_exists(cbm_pipeline_repo_path(p))) {
         (void)cbm_artifact_export(db_path, cbm_pipeline_repo_path(p), project, CBM_ARTIFACT_FAST);
     }
@@ -1477,6 +1479,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     int persist_rc = dump_and_persist(existing, db_path, project, files, file_count, cls.mode_skipped,
                                       cls.mode_skipped_count, cbm_pipeline_repo_path(p),
                                       pass_fingerprint);
+    if (persist_rc == 0) {
+        cbm_pipeline_set_graph_changed(p, true);
+    }
     incr_classification_free(&cls);
     cbm_gbuf_free(existing);
     if (persist_rc != 0) {
