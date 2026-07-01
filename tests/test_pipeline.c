@@ -3508,6 +3508,18 @@ static int pipeline_delta_seed_project_node(cbm_store_t *s, const char *project)
                                                                           : CBM_STORE_ERR;
 }
 
+static int pipeline_store_file_state_generation_memory(cbm_store_t *s, const char *project,
+                                                       const char *rel_path,
+                                                       int64_t *generation) {
+    cbm_file_state_t state = {0};
+    int rc = cbm_store_get_file_state(s, project, rel_path, &state);
+    if (rc == CBM_STORE_OK && generation) {
+        *generation = state.generation;
+    }
+    cbm_store_file_state_free_fields(&state);
+    return rc;
+}
+
 TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths) {
     const char *project = "test";
     const char *changed_paths[] = {"main.go"};
@@ -4956,6 +4968,85 @@ TEST(pipeline_file_delta_apply_deletes_owned_file_delta) {
     ASSERT_EQ(cbm_store_get_file_state(s, project, rel_path, &state), CBM_STORE_NOT_FOUND);
 
     cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_apply_mixed_delete_upsert_batch) {
+    enum {
+        PIPELINE_RENAME_BASE_GENERATION = 1,
+        PIPELINE_RENAME_FINAL_GENERATION = 2,
+        PIPELINE_RENAME_DELTA_COUNT = 2,
+    };
+    const char *project = "test";
+    const char *old_rel = "pkg/file_0000.go";
+    const char *new_rel = "pkg/file_renamed.go";
+    const char *old_qn = "test.pkg.file_0000.OldName";
+    const char *new_qn = "test.pkg.file_renamed.NewName";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_project_node(s, project), CBM_STORE_OK);
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, PIPELINE_RENAME_BASE_GENERATION);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, project, generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, old_rel, old_qn),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_store_file_state_generation_memory(s, project, old_rel, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, PIPELINE_RENAME_BASE_GENERATION);
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, PIPELINE_RENAME_FINAL_GENERATION);
+
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, "/tmp/test");
+    ASSERT_NOT_NULL(scratch);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Project", project, project, NULL, 0, 0, "{}"), 0);
+    ASSERT_EQ(cbm_pipeline_ensure_file_structure(scratch, project, project, new_rel, NULL), 0);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Function", "NewName", new_qn, new_rel, 1, 1,
+                                   "{\"is_exported\":true}"),
+              0);
+
+    cbm_pipeline_file_delta_t upsert_delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(scratch, project, new_rel,
+                                                      PIPELINE_RENAME_FINAL_GENERATION,
+                                                      &upsert_delta),
+              CBM_STORE_OK);
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&upsert_delta, &hash, &state);
+    ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&upsert_delta,
+                                                       PIPELINE_RENAME_FINAL_GENERATION),
+              CBM_STORE_OK);
+    cbm_pipeline_file_delta_t delete_delta = {
+        .delta = {.project = project,
+                  .rel_path = old_rel,
+                  .generation = PIPELINE_RENAME_FINAL_GENERATION},
+        .change_kind = CBM_PIPELINE_DELTA_CHANGE_DELETE};
+    const cbm_pipeline_file_delta_t *deltas[] = {&delete_delta, &upsert_delta};
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, deltas, PIPELINE_RENAME_DELTA_COUNT,
+                                                  CBM_SZ_4, &plan),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(plan.reason, "candidate");
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, old_qn), 0);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_qn), 1);
+    ASSERT_EQ(pipeline_store_file_state_generation_memory(s, project, old_rel, &generation),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(pipeline_store_file_state_generation_memory(s, project, new_rel, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, PIPELINE_RENAME_FINAL_GENERATION);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_pipeline_file_delta_free(&upsert_delta);
+    cbm_gbuf_free(scratch);
     cbm_store_close(s);
     PASS();
 }
@@ -11272,6 +11363,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unsupported_edges);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_delete);
     RUN_TEST(pipeline_file_delta_apply_deletes_owned_file_delta);
+    RUN_TEST(pipeline_file_delta_apply_mixed_delete_upsert_batch);
     RUN_TEST(pipeline_file_delta_apply_falls_back_on_delete_batch);
     RUN_TEST(pipeline_file_delta_apply_falls_back_when_frontier_path_missing_from_batch);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_rename);
