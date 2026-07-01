@@ -2653,6 +2653,12 @@ static void resolve_jsx_element(TSLSPContext *ctx, TSNode element_node) {
         const char *lname = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
         const char *mqn = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
         if (lname && mqn && strcmp(lname, tag_name) == 0) {
+            /* Per-file import data keeps raw relative specifiers; the cross-file
+             * pass resolves them to real module QNs. */
+            if (mqn[0] == '.') {
+                ts_emit_unresolved_call(ctx, tag_name, "jsx_import_unresolved_path");
+                return;
+            }
             const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, tag_name);
             ts_emit_resolved_call(ctx, qn, "lsp_ts_jsx_import", 0.85f);
             return;

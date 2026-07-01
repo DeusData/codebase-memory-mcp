@@ -37,6 +37,18 @@ static int find_resolved(const CBMFileResult *r, const char *callerSub, const ch
     return -1;
 }
 
+static int find_resolved_exact_caller(const CBMFileResult *r, const char *caller,
+                                      const char *calleeSub) {
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->caller_qn && rc->callee_qn && strcmp(rc->caller_qn, caller) == 0 &&
+            strstr(rc->callee_qn, calleeSub)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 static int count_resolved(const CBMFileResult *r, const char *callerSub, const char *calleeSub) {
     int n = 0;
     for (int i = 0; i < r->resolved_calls.count; i++) {
@@ -111,6 +123,16 @@ TEST(clsp_shared_cross_registry_read_only) {
 
     cbm_arena_destroy(&run_arena);
     cbm_arena_destroy(&registry_arena);
+    PASS();
+}
+
+TEST(clsp_cpp_out_of_line_method_lsp_caller_qn) {
+    CBMFileResult *r = extract_cpp("class Helper { public: void work(); };\n"
+                                   "class Processor { public: int run(); Helper helper; };\n"
+                                   "int Processor::run() { helper.work(); return 0; }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_resolved_exact_caller(r, "test.main.Processor.run", "helper.work"), 0);
+    cbm_free_result(r);
     PASS();
 }
 
@@ -15245,6 +15267,7 @@ TEST(clsp_easy_win_sfinaeconditional_return) {
 
 SUITE(c_lsp) {
     RUN_TEST(clsp_shared_cross_registry_read_only);
+    RUN_TEST(clsp_cpp_out_of_line_method_lsp_caller_qn);
     RUN_TEST(clsp_simple_var_decl);
     RUN_TEST(clsp_pointer_arrow);
     RUN_TEST(clsp_dot_access);

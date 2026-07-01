@@ -53,6 +53,22 @@ static int find_resolved(const CBMFileResult *r, const char *callerSub, const ch
     return -1;
 }
 
+static int find_resolved_strategy(const CBMFileResult *r, const char *callerSub,
+                                  const char *calleeSub, const char *strategy) {
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->confidence < 0.5f) {
+            continue;
+        }
+        if (rc->caller_qn && rc->callee_qn && rc->strategy &&
+            strstr(rc->caller_qn, callerSub) && strstr(rc->callee_qn, calleeSub) &&
+            strcmp(rc->strategy, strategy) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 static int require_resolved(const CBMFileResult *r, const char *callerSub, const char *calleeSub) {
     int idx = find_resolved(r, callerSub, calleeSub);
     if (idx < 0) {
@@ -756,6 +772,21 @@ TEST(jlsp_static_import_method) {
     CBMFileResult *r = extract_java(src);
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(require_resolved(r, "run", "Math.sqrt"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_static_import_package_class_short_name) {
+    const char *src =
+        "package demo;\n"
+        "import static demo.Util.twice;\n"
+        "class Util { static int twice(int x) { return x + x; } }\n"
+        "public class Main {\n"
+        "  public int run(int x) { return twice(x); }\n"
+        "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_resolved_strategy(r, "run", "Util.twice", "lsp_static_import"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -1841,6 +1872,7 @@ void suite_java_lsp(void) {
 
     /* Imports */
     RUN_TEST(jlsp_static_import_method);
+    RUN_TEST(jlsp_static_import_package_class_short_name);
     RUN_TEST(jlsp_on_demand_import);
 
     /* Generics */

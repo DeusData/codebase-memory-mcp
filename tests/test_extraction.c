@@ -37,6 +37,25 @@ static int has_call(CBMFileResult *r, const char *callee) {
     return 0;
 }
 
+static int has_call_enclosing(CBMFileResult *r, const char *callee, const char *must_contain,
+                              const char *must_not_contain) {
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (!c->callee_name || !c->enclosing_func_qn ||
+            strstr(c->callee_name, callee) == NULL) {
+            continue;
+        }
+        if (must_contain && strstr(c->enclosing_func_qn, must_contain) == NULL) {
+            continue;
+        }
+        if (must_not_contain && strstr(c->enclosing_func_qn, must_not_contain) != NULL) {
+            continue;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 /* Check if any import with the given module path exists. */
 static int __attribute__((unused)) has_import(CBMFileResult *r, const char *path_substr) {
     for (int i = 0; i < r->imports.count; i++) {
@@ -895,6 +914,19 @@ TEST(ocaml_function) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Function", "add"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(ocaml_nested_let_call_attributed_to_outer_function) {
+    CBMFileResult *r = extract("let outer name =\n"
+                               "  let local = print_endline name in\n"
+                               "  local\n",
+                               CBM_LANG_OCAML, "t", "main.ml");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "outer"));
+    ASSERT(has_call_enclosing(r, "print_endline", "outer", "local"));
     cbm_free_result(r);
     PASS();
 }
@@ -3066,6 +3098,7 @@ SUITE(extraction) {
     RUN_TEST(elixir_function);
     RUN_TEST(haskell_function);
     RUN_TEST(ocaml_function);
+    RUN_TEST(ocaml_nested_let_call_attributed_to_outer_function);
     RUN_TEST(erlang_function);
 
     /* Markup/Config */

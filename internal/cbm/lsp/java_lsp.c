@@ -1852,6 +1852,24 @@ static void resolve_method_call(JavaLSPContext *ctx, TSNode call) {
                 continue;
             char *cls = cbm_arena_strndup(ctx->arena, target, (size_t)(last_dot - target));
             const CBMRegisteredFunc *f = java_lookup_method(ctx, cls, mname, arity);
+            if (!f && ctx->registry) {
+                /* Static imports can be package-qualified while the local type is
+                 * registered under the project/module QN. Retry by class short name. */
+                const char *cls_dot = strrchr(cls, '.');
+                const char *cls_short = cls_dot ? cls_dot + 1 : cls;
+                size_t sl = strlen(cls_short);
+                for (int ti = 0; ti < ctx->registry->type_count && !f; ti++) {
+                    const char *q = ctx->registry->types[ti].qualified_name;
+                    if (!q) {
+                        continue;
+                    }
+                    size_t ql = strlen(q);
+                    if (ql > sl + 1 && q[ql - sl - 1] == '.' &&
+                        strcmp(q + ql - sl, cls_short) == 0) {
+                        f = java_lookup_method(ctx, q, mname, arity);
+                    }
+                }
+            }
             if (f) {
                 java_emit_resolved(ctx, f->qualified_name, "lsp_static_import", 0.92f);
                 return;
