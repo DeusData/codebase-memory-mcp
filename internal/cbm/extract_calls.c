@@ -692,6 +692,25 @@ static char *extract_sql_callee(CBMArena *a, TSNode node, const char *source, co
     return ts_node_is_null(nm) ? NULL : cbm_node_text(a, nm, source);
 }
 
+// Jsonnet functioncall nodes carry the callee in their first id child.
+static char *extract_jsonnet_callee(CBMArena *a, TSNode node, const char *source,
+                                    const char *nk) {
+    if (strcmp(nk, "functioncall") != 0) {
+        return NULL;
+    }
+    TSNode id = cbm_find_child_by_kind(node, "id");
+    return ts_node_is_null(id) ? NULL : cbm_node_text(a, id, source);
+}
+
+// Typst call nodes carry the callee in the item field.
+static char *extract_typst_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "call") != 0) {
+        return NULL;
+    }
+    TSNode item = ts_node_child_by_field_name(node, TS_FIELD("item"));
+    return ts_node_is_null(item) ? NULL : cbm_node_text(a, item, source);
+}
+
 // Elm function_call_expr stores its target under target > value_expr > name.
 static char *extract_elm_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
     if (strcmp(nk, "function_call_expr") != 0) {
@@ -743,10 +762,44 @@ static char *extract_nix_callee(CBMArena *a, TSNode node, const char *source, co
     return NULL;
 }
 
+// Make builtins are represented as function_call nodes; $(shell ...) is shell_function.
+static char *extract_make_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "shell_function") == 0) {
+        static const char shell_lit[] = "shell";
+        return cbm_arena_strndup(a, shell_lit, sizeof(shell_lit) - SKIP_ONE);
+    }
+    if (strcmp(nk, "function_call") != 0) {
+        return NULL;
+    }
+    TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
+    if (ts_node_is_null(fn) && ts_node_named_child_count(node) > 0) {
+        fn = ts_node_named_child(node, 0);
+    }
+    return ts_node_is_null(fn) ? NULL : cbm_node_text(a, fn, source);
+}
+
+// Puppet function_call stores its callee as the first named child.
+static char *extract_puppet_callee(CBMArena *a, TSNode node, const char *source,
+                                   const char *nk) {
+    if (strcmp(nk, "function_call") != 0 || ts_node_named_child_count(node) == 0) {
+        return NULL;
+    }
+    TSNode head = ts_node_named_child(node, 0);
+    return strcmp(ts_node_type(head), "identifier") == 0 ? cbm_node_text(a, head, source) : NULL;
+}
+
 static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *source,
                                           CBMLanguage lang) {
     const char *nk = ts_node_type(node);
 
+    if (lang == CBM_LANG_JSONNET) {
+        char *c = extract_jsonnet_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
+    if (lang == CBM_LANG_TYPST) {
+        char *c = extract_typst_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
     if (lang == CBM_LANG_CSS) {
         char *c = extract_css_callee(a, node, source, nk);
         return c ? c : extract_scripting_callee(a, node, source, lang, nk);
@@ -794,6 +847,14 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
     }
     if (lang == CBM_LANG_SCSS) {
         return extract_scss_callee(a, node, source, nk);
+    }
+    if (lang == CBM_LANG_MAKEFILE) {
+        char *c = extract_make_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
+    if (lang == CBM_LANG_PUPPET) {
+        char *c = extract_puppet_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
     }
     if (lang == CBM_LANG_OBJC) {
         return extract_objc_callee(a, node, source, nk);
