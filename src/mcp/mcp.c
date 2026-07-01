@@ -4995,6 +4995,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     yyjson_mut_obj_add_str(doc, root, "project", project_name);
     yyjson_mut_obj_add_str(doc, root, "status", rc == 0 ? "indexed" : "error");
+    yyjson_mut_obj_add_str(doc, root, "publish_kind",
+                           cbm_pipeline_publish_kind_name(publish_kind));
+    yyjson_mut_obj_add_bool(doc, root, "graph_changed", graph_changed);
 
     if (rc == 0) {
         cbm_store_t *store = resolve_store(srv, project_name);
