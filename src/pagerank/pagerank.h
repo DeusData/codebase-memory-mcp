@@ -104,6 +104,15 @@ int cbm_pagerank_compute_default(cbm_store_t *store, const char *project);
 int cbm_pagerank_compute_with_config(cbm_store_t *store, const char *project,
                                      struct cbm_config *cfg);
 
+/* Refresh rank-derived views after an index run when needed.
+ * Computes when the graph changed, dependencies were reindexed, or existing
+ * PageRank/LinkRank/node_degree views are missing/incomplete. Returns ranked
+ * node count from compute, 0 when skipped, or -1 on invalid input/compute error.
+ * cfg may be NULL (uses defaults). */
+int cbm_pagerank_refresh_if_needed(cbm_store_t *store, const char *project,
+                                   struct cbm_config *cfg, bool graph_changed,
+                                   int deps_reindexed);
+
 /* True only when PageRank, LinkRank, and node_degree derived views are all
  * recorded complete for the project. Missing rows return false so callers
  * repair older DBs instead of skipping necessary work. */

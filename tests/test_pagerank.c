@@ -277,6 +277,69 @@ TEST(pagerank_views_complete_requires_all_rank_views) {
     PASS();
 }
 
+TEST(pagerank_refresh_if_needed_repairs_missing_views) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "refresh_missing", "/tmp/refresh_missing");
+    int64_t a = add_node(s, "refresh_missing", "a");
+    int64_t b = add_node(s, "refresh_missing", "b");
+    add_edge(s, "refresh_missing", a, b, "CALLS");
+
+    ASSERT_FALSE(cbm_pagerank_views_complete(s, "refresh_missing"));
+    ASSERT_EQ(cbm_pagerank_refresh_if_needed(s, "refresh_missing", NULL, false, 0), 2);
+    ASSERT_TRUE(cbm_pagerank_views_complete(s, "refresh_missing"));
+    ASSERT_EQ(count_table_rows(s, "pagerank"), 2);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pagerank_refresh_if_needed_skips_complete_unchanged_graph) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "refresh_skip", "/tmp/refresh_skip");
+    int64_t a = add_node(s, "refresh_skip", "a");
+    int64_t b = add_node(s, "refresh_skip", "b");
+    add_edge(s, "refresh_skip", a, b, "CALLS");
+
+    ASSERT_EQ(cbm_pagerank_compute_default(s, "refresh_skip"), 2);
+    ASSERT_EQ(cbm_pagerank_refresh_if_needed(s, "refresh_skip", NULL, false, 0), 0);
+    ASSERT_EQ(count_table_rows(s, "pagerank"), 2);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pagerank_refresh_if_needed_recomputes_changed_graph) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "refresh_changed", "/tmp/refresh_changed");
+    int64_t a = add_node(s, "refresh_changed", "a");
+    ASSERT_EQ(cbm_pagerank_compute_default(s, "refresh_changed"), 1);
+    int64_t b = add_node(s, "refresh_changed", "b");
+    add_edge(s, "refresh_changed", a, b, "CALLS");
+
+    ASSERT_EQ(cbm_pagerank_refresh_if_needed(s, "refresh_changed", NULL, true, 0), 2);
+    ASSERT_EQ(count_table_rows(s, "pagerank"), 2);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pagerank_refresh_if_needed_recomputes_reindexed_deps) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "refresh_deps", "/tmp/refresh_deps");
+    int64_t app = add_node(s, "refresh_deps", "app");
+    ASSERT_EQ(cbm_pagerank_compute_default(s, "refresh_deps"), 1);
+
+    cbm_store_upsert_project(s, "refresh_deps.dep.lib", "/tmp/refresh_dep_lib");
+    int64_t dep = add_node(s, "refresh_deps.dep.lib", "dep");
+    add_edge(s, "refresh_deps", app, dep, "CALLS");
+
+    ASSERT_EQ(cbm_pagerank_refresh_if_needed(s, "refresh_deps", NULL, false, 1), 2);
+    ASSERT_TRUE(get_pr(s, dep) > 0.0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(pagerank_recompute_replaces) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "re", "/tmp/re");
@@ -1081,6 +1144,10 @@ SUITE(pagerank) {
     RUN_TEST(pagerank_sum_to_one);
     RUN_TEST(pagerank_stored_in_db);
     RUN_TEST(pagerank_views_complete_requires_all_rank_views);
+    RUN_TEST(pagerank_refresh_if_needed_repairs_missing_views);
+    RUN_TEST(pagerank_refresh_if_needed_skips_complete_unchanged_graph);
+    RUN_TEST(pagerank_refresh_if_needed_recomputes_changed_graph);
+    RUN_TEST(pagerank_refresh_if_needed_recomputes_reindexed_deps);
     RUN_TEST(pagerank_recompute_replaces);
     RUN_TEST(pagerank_full_scope_includes_deps);
     RUN_TEST(pagerank_full_scope_preserves_dep_project_attribution);
