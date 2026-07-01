@@ -5003,14 +5003,8 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             int deps_reindexed = cbm_dep_auto_index(
                 project_name, repo_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT, srv->config);
 
-            /* Compute PageRank + LinkRank on full graph (project + deps).
-             * Uses config-backed edge weights when config is available. */
-            if (graph_changed || deps_reindexed > 0 ||
-                !cbm_pagerank_views_complete(store, project_name)) {
-                cbm_pagerank_compute_with_config(store, project_name, srv->config);
-            } else {
-                cbm_log_info("pagerank.skip", "project", project_name, "reason", "graph_unchanged");
-            }
+            (void)cbm_pagerank_refresh_if_needed(store, project_name, srv->config, graph_changed,
+                                                 deps_reindexed);
             /* Register project with watcher so future file changes trigger auto-reindex */
             if (srv->watcher)
                 cbm_watcher_watch(srv->watcher, project_name, repo_path);
@@ -7355,13 +7349,8 @@ static void *autoindex_thread(void *arg) {
         if (store) {
             int deps_reindexed = cbm_dep_auto_index(srv->session_project, srv->session_root,
                                                     store, CBM_DEFAULT_AUTO_DEP_LIMIT, srv->config);
-            if (graph_changed || deps_reindexed > 0 ||
-                !cbm_pagerank_views_complete(store, srv->session_project)) {
-                cbm_pagerank_compute_with_config(store, srv->session_project, srv->config);
-            } else {
-                cbm_log_info("pagerank.skip", "project", srv->session_project, "reason",
-                             "graph_unchanged");
-            }
+            (void)cbm_pagerank_refresh_if_needed(store, srv->session_project, srv->config,
+                                                 graph_changed, deps_reindexed);
         }
 
         cbm_log_info("autoindex.done", "project", srv->session_project);

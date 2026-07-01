@@ -631,6 +631,19 @@ int cbm_pagerank_compute_with_config(cbm_store_t *store, const char *project,
         max_iter, &w, scope);
 }
 
+int cbm_pagerank_refresh_if_needed(cbm_store_t *store, const char *project,
+                                   cbm_config_t *cfg, bool graph_changed,
+                                   int deps_reindexed) {
+    if (!store || !project || !project[0]) {
+        return -1;
+    }
+    if (graph_changed || deps_reindexed > 0 || !cbm_pagerank_views_complete(store, project)) {
+        return cbm_pagerank_compute_with_config(store, project, cfg);
+    }
+    cbm_log_info("pagerank.skip", "project", project, "reason", "graph_unchanged");
+    return 0;
+}
+
 static bool pagerank_view_complete(cbm_store_t *store, const char *project, const char *view) {
     cbm_derived_view_state_t state = {0};
     bool complete = false;
