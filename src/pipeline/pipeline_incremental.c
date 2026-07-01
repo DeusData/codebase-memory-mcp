@@ -475,10 +475,10 @@ static void incr_capture_inbound_edge(const cbm_gbuf_edge_t *edge, void *userdat
         cap->cap = ncap;
     }
     cbm_saved_edge_t *s = &cap->items[cap->count];
-    s->source_qn = strdup(src->qualified_name);
-    s->target_qn = strdup(tgt->qualified_name);
-    s->type = strdup(edge->type);
-    s->props = strdup(edge->properties_json ? edge->properties_json : "{}");
+    s->source_qn = cbm_strdup(src->qualified_name);
+    s->target_qn = cbm_strdup(tgt->qualified_name);
+    s->type = cbm_strdup(edge->type);
+    s->props = cbm_strdup(edge->properties_json ? edge->properties_json : "{}");
     if (!s->source_qn || !s->target_qn || !s->type || !s->props) {
         free(s->source_qn);
         free(s->target_qn);
