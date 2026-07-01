@@ -4117,6 +4117,54 @@ TEST(pipeline_file_delta_plan_accepts_full_pipeline_structure_edge) {
     PASS();
 }
 
+TEST(pipeline_file_delta_plan_falls_back_on_new_folder_structure_edge) {
+    const char *project = "test";
+    const char *rel_path = "src/main.go";
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, rel_path, "test.src.main.Old"),
+              CBM_STORE_OK);
+
+    char *file_qn = cbm_pipeline_fqn_compute(project, rel_path, "__file__");
+    char *folder_qn = cbm_pipeline_fqn_folder(project, "src");
+    ASSERT_NOT_NULL(file_qn);
+    ASSERT_NOT_NULL(folder_qn);
+
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, "/tmp/test");
+    ASSERT_NOT_NULL(scratch);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Project", project, project, NULL, 0, 0, "{}"), 0);
+    ASSERT_EQ(cbm_pipeline_ensure_file_structure(scratch, project, project, rel_path, NULL), 0);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Function", "New", "test.src.main.New", rel_path, 1,
+                                   1, "{\"is_exported\":true}"),
+              0);
+
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(scratch, project, rel_path, 1, &delta),
+              CBM_STORE_OK);
+    const cbm_store_delta_edge_t *structure_edge =
+        pipeline_delta_find_edge(&delta, "CONTAINS_FILE");
+    ASSERT_NOT_NULL(structure_edge);
+    ASSERT_STR_EQ(structure_edge->source_qn, folder_qn);
+    ASSERT_STR_EQ(structure_edge->target_qn, file_qn);
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "unresolved_edge_endpoint");
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(scratch);
+    free(folder_qn);
+    free(file_qn);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(pipeline_file_delta_plan_accepts_regenerated_structural_inbound_edge) {
     enum { PIPELINE_DELTA_TEST_BASE_GENERATION = 1 };
     const char *project = "test";
@@ -9207,6 +9255,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_external_inbound_edge);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unowned_structural_inbound_edge);
     RUN_TEST(pipeline_file_delta_plan_accepts_full_pipeline_structure_edge);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_new_folder_structure_edge);
     RUN_TEST(pipeline_file_delta_plan_accepts_regenerated_structural_inbound_edge);
     RUN_TEST(pipeline_file_delta_plan_falls_back_without_file_metadata);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unsupported_edges);
