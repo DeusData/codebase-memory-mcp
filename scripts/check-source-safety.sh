@@ -6,6 +6,7 @@
 #   - MCP/server runtime code must not write protocol-breaking text to stdout.
 #   - Production source must not add unsafe unbounded string-copy helpers.
 #   - New production diffs should use CBM platform wrappers for env/fs APIs.
+#   - New production diffs should use CBM allocation/duplication wrappers.
 set -uo pipefail
 
 ROOT="${CBM_SOURCE_SAFETY_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -74,6 +75,9 @@ if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
             +*)
                 if [[ "$line" =~ (^|[^A-Za-z0-9_])(unlink|rename|remove|rmdir|mkdir|getenv|setenv|unsetenv|mkstemp|mkdtemp)[[:space:]]*\( ]]; then
                     add_violation "new raw env/fs API in production diff, use CBM compat wrapper or document an exception: $line"
+                fi
+                if [[ "$line" =~ (^|[^A-Za-z0-9_])strdup[[:space:]]*\( ]]; then
+                    add_violation "new raw strdup in production diff, use cbm_strdup or a local ownership wrapper: $line"
                 fi
                 ;;
         esac

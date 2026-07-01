@@ -81,4 +81,15 @@ git -C "$rawfs_root" commit -qm init
 printf 'void bad(void) { unlink("x"); }\n' >>"$rawfs_root/src/pipeline/ok.c"
 expect_fail_contains "raw_fs_diff" "$rawfs_root" "new raw env/fs API"
 
+rawdup_root="$TMP_ROOT/rawdup"
+make_tree "$rawdup_root"
+git -C "$rawdup_root" init -q
+git -C "$rawdup_root" config user.email source-safety@example.invalid
+git -C "$rawdup_root" config user.name source-safety
+printf 'void ok(void) {}\n' >"$rawdup_root/src/pipeline/ok.c"
+git -C "$rawdup_root" add src/pipeline/ok.c
+git -C "$rawdup_root" commit -qm init
+printf 'char *bad(const char *s) { return strdup(s); }\n' >>"$rawdup_root/src/pipeline/ok.c"
+expect_fail_contains "raw_strdup_diff" "$rawdup_root" "new raw strdup"
+
 echo "[source-safety-test] OK"
