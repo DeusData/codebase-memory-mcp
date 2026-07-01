@@ -1228,10 +1228,19 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         return CBM_NOT_FOUND;
     }
 
-    cbm_log_info("incremental.classify", "changed", itoa_buf_incr(cls.n_changed), "unchanged",
-                 itoa_buf_incr(cls.n_unchanged), "deleted", itoa_buf_incr(cls.deleted_count),
-                 "mode_skipped", itoa_buf_incr(cls.mode_skipped_count), "metadata_only",
-                 itoa_buf_incr(cls.n_metadata_only));
+    char changed_buf[INCR_TS_BUF];
+    char unchanged_buf[INCR_TS_BUF];
+    char deleted_buf[INCR_TS_BUF];
+    char mode_skipped_buf[INCR_TS_BUF];
+    char metadata_only_buf[INCR_TS_BUF];
+    snprintf(changed_buf, sizeof(changed_buf), "%d", cls.n_changed);
+    snprintf(unchanged_buf, sizeof(unchanged_buf), "%d", cls.n_unchanged);
+    snprintf(deleted_buf, sizeof(deleted_buf), "%d", cls.deleted_count);
+    snprintf(mode_skipped_buf, sizeof(mode_skipped_buf), "%d", cls.mode_skipped_count);
+    snprintf(metadata_only_buf, sizeof(metadata_only_buf), "%d", cls.n_metadata_only);
+    cbm_log_info("incremental.classify", "changed", changed_buf, "unchanged", unchanged_buf,
+                 "deleted", deleted_buf, "mode_skipped", mode_skipped_buf, "metadata_only",
+                 metadata_only_buf);
 
     /* Fast path: no graph changes. If only filesystem metadata drifted after a
      * hash-confirmed touch, refresh file_hash rows so future runs keep the
