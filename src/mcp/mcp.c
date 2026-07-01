@@ -1494,6 +1494,38 @@ static const char *parent_project_for_db(const char *project, char *buf, size_t 
     return project; /* no .dep → use as-is */
 }
 
+static bool root_path_looks_usable(const char *root_path) {
+    if (!root_path || !root_path[0]) {
+        return false;
+    }
+    if (root_path[0] == '/' || root_path[0] == '\\') {
+        return true;
+    }
+    return ((root_path[0] >= 'A' && root_path[0] <= 'Z') ||
+            (root_path[0] >= 'a' && root_path[0] <= 'z')) &&
+           root_path[1] == ':';
+}
+
+static void sync_session_from_open_project(cbm_mcp_server_t *srv, cbm_store_t *store,
+                                           const char *db_project,
+                                           const cbm_project_t *opened_project) {
+    if (!srv || srv->session_project[0] || !store || !db_project || !db_project[0]) {
+        return;
+    }
+
+    const char *root_path = opened_project ? opened_project->root_path : NULL;
+    cbm_project_t parent = {0};
+    if (cbm_store_get_project(store, db_project, &parent) == CBM_STORE_OK) {
+        root_path = parent.root_path;
+    }
+
+    snprintf(srv->session_project, sizeof(srv->session_project), "%s", db_project);
+    if (root_path_looks_usable(root_path)) {
+        snprintf(srv->session_root, sizeof(srv->session_root), "%s", root_path);
+    }
+    cbm_project_free_fields(&parent);
+}
+
 static bool mcp_join_suffix(char *out, size_t out_sz, const char *base, const char *suffix) {
     int n = snprintf(out, out_sz, "%s%s", base ? base : "", suffix ? suffix : "");
     return n > 0 && (size_t)n < out_sz;
@@ -1629,15 +1661,13 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
             return NULL;
         }
         /* Register newly-accessed project with watcher (root_path from DB).
-         * Validate the path looks like a real path (starts with '/' or a drive
-         * letter) before watching — a retained bad-path DB (#557) may store a
+         * Validate that it looks like an absolute POSIX, UNC, or Windows-drive
+         * path before watching — a retained bad-path DB (#557) may store a
          * numeric/empty root_path that would point the watcher at nothing. */
-        if (srv->watcher && proj_verify.root_path && proj_verify.root_path[0]) {
-            char c0 = proj_verify.root_path[0];
-            if (c0 == '/' || (c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z')) {
-                cbm_watcher_watch(srv->watcher, project, proj_verify.root_path);
-            }
+        if (srv->watcher && root_path_looks_usable(proj_verify.root_path)) {
+            cbm_watcher_watch(srv->watcher, project, proj_verify.root_path);
         }
+        sync_session_from_open_project(srv, srv->store, db_project, &proj_verify);
         cbm_project_free_fields(&proj_verify);
         srv->owns_store = true;
         free(srv->current_project);

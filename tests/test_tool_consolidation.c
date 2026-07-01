@@ -722,6 +722,41 @@ TEST(search_graph_has_session_project) {
     PASS();
 }
 
+TEST(search_graph_slug_project_sets_session_context) {
+    /* A fresh CLI/MCP server may be called with project=<slug> from
+     * list_projects. Results already came from that DB, but the first response
+     * context used to stay empty unless project was passed as a filesystem path. */
+    const char *proj = "_tc_ctx_slug_";
+    char db_path[1024];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cbm_resolve_cache_dir(), proj);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, proj, "/tmp/tc_ctx_slug"), CBM_STORE_OK);
+    cbm_node_t n = {.project = proj,
+                    .label = "Function",
+                    .name = "tc_ctx_slug_fn",
+                    .qualified_name = "_tc_ctx_slug_.tc_ctx_slug_fn",
+                    .file_path = "src/tc_ctx_slug.c"};
+    ASSERT_GT(cbm_store_upsert_node(s, &n), 0);
+    cbm_store_close(s);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *result = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"_tc_ctx_slug_\",\"name_pattern\":\"tc_ctx_slug_fn\",\"limit\":1}");
+    ASSERT_NOT_NULL(result);
+    ASSERT_NOT_NULL(strstr(result, "session_project"));
+    ASSERT_NOT_NULL(strstr(result, "_tc_ctx_slug_"));
+    ASSERT_NOT_NULL(strstr(result, "\\\"nodes\\\":1"));
+    free(result);
+
+    cbm_mcp_server_free(srv);
+    (void)unlink(db_path);
+    PASS();
+}
+
 TEST(index_status_has_session_project) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -2664,6 +2699,7 @@ SUITE(tool_consolidation) {
     RUN_TEST(hidden_tools_still_dispatch);
     /* Session context */
     RUN_TEST(search_graph_has_session_project);
+    RUN_TEST(search_graph_slug_project_sets_session_context);
     RUN_TEST(index_status_has_session_project);
     /* Context injection */
     RUN_TEST(first_response_has_context_header);
