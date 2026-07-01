@@ -4351,6 +4351,60 @@ TEST(pipeline_file_delta_apply_deletes_owned_file_delta) {
     PASS();
 }
 
+TEST(pipeline_file_delta_apply_falls_back_on_delete_batch) {
+    enum {
+        PIPELINE_DELETE_BATCH_BASE_GENERATION = 1,
+        PIPELINE_DELETE_BATCH_FINAL_GENERATION = 2,
+        PIPELINE_DELETE_BATCH_COUNT = 2,
+    };
+    const char *project = "test";
+    const char *first_rel = "one.go";
+    const char *second_rel = "two.go";
+    const char *first_qn = "test.one.Old";
+    const char *second_qn = "test.two.Old";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, PIPELINE_DELETE_BATCH_BASE_GENERATION);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, project, generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, first_rel, first_qn),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, second_rel, second_qn),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, PIPELINE_DELETE_BATCH_FINAL_GENERATION);
+
+    cbm_pipeline_file_delta_t first = {.delta = {.project = project,
+                                                 .rel_path = first_rel,
+                                                 .generation = generation},
+                                       .change_kind = CBM_PIPELINE_DELTA_CHANGE_DELETE};
+    cbm_pipeline_file_delta_t second = {.delta = {.project = project,
+                                                  .rel_path = second_rel,
+                                                  .generation = generation},
+                                        .change_kind = CBM_PIPELINE_DELTA_CHANGE_DELETE};
+    const cbm_pipeline_file_delta_t *deltas[] = {&first, &second};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, deltas, PIPELINE_DELETE_BATCH_COUNT,
+                                                  CBM_SZ_4, &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "delete_batch_requires_full");
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, first_qn), 1);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, second_qn), 1);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(pipeline_file_delta_apply_falls_back_when_frontier_path_missing_from_batch) {
     enum { PIPELINE_FRONTIER_MISSING_DELTA_COUNT = 1 };
     const char *project = "test";
@@ -9358,6 +9412,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unsupported_edges);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_delete);
     RUN_TEST(pipeline_file_delta_apply_deletes_owned_file_delta);
+    RUN_TEST(pipeline_file_delta_apply_falls_back_on_delete_batch);
     RUN_TEST(pipeline_file_delta_apply_falls_back_when_frontier_path_missing_from_batch);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_rename);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unsupported_derived_view);
