@@ -38,6 +38,8 @@
 
 static char g_tmpdir[256];
 
+enum { PIPELINE_TEST_OVERLONG_DB_PATH = CBM_PATH_MAX + CBM_SZ_128 };
+
 /* Create:
  *   /tmp/cbm_test_XXXXXX/
  *     main.go       (empty)
@@ -10473,6 +10475,33 @@ TEST(pipeline_committed_counts_match_persisted) {
     PASS();
 }
 
+TEST(pipeline_rejects_overlong_db_path_without_truncated_write) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[PIPELINE_TEST_OVERLONG_DB_PATH];
+    int prefix_len = snprintf(db_path, sizeof(db_path), "%s/", g_tmpdir);
+    ASSERT_GT(prefix_len, 0);
+    ASSERT_TRUE((size_t)prefix_len < sizeof(db_path));
+    memset(db_path + prefix_len, 'a', sizeof(db_path) - (size_t)prefix_len - CBM_ALLOC_ONE);
+    db_path[sizeof(db_path) - 1] = '\0';
+
+    char truncated[CBM_PATH_MAX];
+    int trunc_len = snprintf(truncated, sizeof(truncated), "%s", db_path);
+    ASSERT_TRUE(trunc_len >= CBM_PATH_MAX);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    ASSERT_NEQ(rc, 0);
+    ASSERT_NEQ(access(truncated, F_OK), 0);
+
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
 SUITE(pipeline) {
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
@@ -10535,6 +10564,7 @@ SUITE(pipeline) {
     /* Integration: structure pass */
     RUN_TEST(pipeline_structure_nodes);
     RUN_TEST(pipeline_committed_counts_match_persisted);
+    RUN_TEST(pipeline_rejects_overlong_db_path_without_truncated_write);
     RUN_TEST(pipeline_structure_edges);
     RUN_TEST(pipeline_branch_root_structure);
     RUN_TEST(pipeline_project_name_derived);
