@@ -7731,6 +7731,11 @@ static int pipeline_build_exact_scratch_for_changed_files(cbm_store_t *store,
         cbm_pipeline_pass_usages(&ctx, changed_files, changed_count) != 0) {
         goto cleanup;
     }
+    cbm_pipeline_pass_complexity(&ctx);
+    if (cbm_pipeline_pass_httplinks(&ctx) != 0) {
+        goto cleanup;
+    }
+    cbm_pipeline_pass_normalize(scratch);
     for (int i = 0; i < changed_count; i++) {
         rc = cbm_pipeline_build_file_delta_from_gbuf(scratch, project, changed_files[i].rel_path,
                                                      CBM_PIPELINE_COMPAT_GENERATION, &deltas[i]);
@@ -8374,6 +8379,110 @@ TEST(incremental_fast_exact_scratch_multifile_usage_edges_match_fresh) {
     cbm_pipeline_file_delta_free(&deltas[1]);
     cbm_gbuf_free(scratch);
     cbm_store_close(store);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_exact_batch_publish_matches_fresh_rebuild_for_two_file_go) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char pass_fingerprint[CBM_SZ_256];
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(p, pass_fingerprint,
+                                                    sizeof(pass_fingerprint)),
+              CBM_STORE_OK);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    char main_path[CBM_PATH_MAX];
+    char helper_path[CBM_PATH_MAX];
+    int n = snprintf(main_path, sizeof(main_path), "%s/main.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(main_path));
+    n = snprintf(helper_path, sizeof(helper_path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(helper_path));
+    ASSERT_EQ(th_write_file(main_path,
+                            "package main\n\n"
+                            "func main() {\n\tHelper()\n\tNewHelper()\n}\n\n"
+                            "func NewMain() int {\n\treturn 11\n}\n"),
+              0);
+    ASSERT_EQ(th_write_file(helper_path,
+                            "package main\n\n"
+                            "func Helper() string {\n\treturn \"updated\"\n}\n\n"
+                            "func NewHelper() int {\n\treturn 13\n}\n"),
+              0);
+
+    cbm_file_info_t changed[] = {
+        {.path = main_path, .rel_path = "main.go", .language = CBM_LANG_GO},
+        {.path = helper_path, .rel_path = "helper.go", .language = CBM_LANG_GO},
+    };
+    const int changed_count = (int)(sizeof(changed) / sizeof(changed[0]));
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_gbuf_t *scratch = NULL;
+    cbm_pipeline_file_delta_t deltas[CBM_SZ_2] = {0};
+    ASSERT_EQ(pipeline_build_exact_scratch_for_changed_files(store, g_incr_tmpdir, project,
+                                                             changed, changed_count, &scratch,
+                                                             deltas),
+              CBM_STORE_OK);
+    for (int i = 0; i < changed_count; i++) {
+        ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata_with_fingerprint(
+                      &deltas[i], &changed[i], pass_fingerprint),
+                  CBM_STORE_OK);
+    }
+
+    const cbm_pipeline_file_delta_t *delta_ptrs[CBM_SZ_2] = {&deltas[0], &deltas[1]};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta_batch(store, delta_ptrs, changed_count,
+                                                 CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS,
+                                                 &plan),
+              CBM_STORE_OK);
+    if (plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
+        FAIL(plan.reason ? plan.reason : "exact batch plan rejected candidate");
+    }
+    cbm_pipeline_file_delta_plan_free(&plan);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(store, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_GT(generation, CBM_PIPELINE_COMPAT_GENERATION);
+    for (int i = 0; i < changed_count; i++) {
+        ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&deltas[i], generation),
+                  CBM_STORE_OK);
+    }
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(store, delta_ptrs, changed_count,
+                                                  CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS,
+                                                  &plan),
+              CBM_STORE_OK);
+    if (plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
+        const char *store_err = cbm_store_error(store);
+        if (store_err && store_err[0]) {
+            FAIL(store_err);
+        }
+        FAIL(plan.reason ? plan.reason : "exact batch apply rejected candidate");
+    }
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(store);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "exact batch publish differed from fresh FAST rebuild");
+    }
+
+    cbm_pipeline_file_delta_free(&deltas[0]);
+    cbm_pipeline_file_delta_free(&deltas[1]);
+    cbm_gbuf_free(scratch);
     free(project);
     cbm_config_close(cfg);
     cleanup_incremental_repo();
@@ -10271,6 +10380,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_exact_upsert_matches_full_rebuild);
     RUN_TEST(incremental_fast_multi_file_batch_falls_back_to_full_rebuild_parity);
     RUN_TEST(incremental_fast_exact_scratch_multifile_usage_edges_match_fresh);
+    RUN_TEST(incremental_fast_exact_batch_publish_matches_fresh_rebuild_for_two_file_go);
     RUN_TEST(incremental_full_mode_keeps_exact_upsert_disabled);
     RUN_TEST(incremental_detects_same_size_rewrite_with_preserved_mtime);
     RUN_TEST(incremental_missing_file_state_keeps_legacy_metadata_path);

@@ -3135,7 +3135,8 @@ static int store_delete_file_delta_transaction(cbm_store_t *s, const char *proje
     return CBM_STORE_OK;
 }
 
-static int store_publish_file_delta_body(cbm_store_t *s, const cbm_store_file_delta_t *delta) {
+static int store_publish_file_delta_delete_body(cbm_store_t *s,
+                                                const cbm_store_file_delta_t *delta) {
     int rc = store_delete_owned_edges_by_file(s, delta->project, delta->rel_path);
     if (rc != CBM_STORE_OK) {
         return rc;
@@ -3160,7 +3161,12 @@ static int store_publish_file_delta_body(cbm_store_t *s, const cbm_store_file_de
     if (rc != CBM_STORE_OK) {
         return rc;
     }
+    return CBM_STORE_OK;
+}
 
+static int store_publish_file_delta_nodes_body(cbm_store_t *s,
+                                               const cbm_store_file_delta_t *delta) {
+    int rc = CBM_STORE_OK;
     for (int i = 0; i < delta->node_count; i++) {
         int64_t id = cbm_store_upsert_node(s, &delta->nodes[i]);
         if (id <= CBM_STORE_NO_NODE_ID) {
@@ -3171,7 +3177,12 @@ static int store_publish_file_delta_body(cbm_store_t *s, const cbm_store_file_de
             return rc;
         }
     }
+    return CBM_STORE_OK;
+}
 
+static int store_publish_file_delta_edges_body(cbm_store_t *s,
+                                               const cbm_store_file_delta_t *delta) {
+    int rc = CBM_STORE_OK;
     for (int i = 0; i < delta->edge_count; i++) {
         int64_t source_id = CBM_STORE_NO_NODE_ID;
         int64_t target_id = CBM_STORE_NO_NODE_ID;
@@ -3198,7 +3209,12 @@ static int store_publish_file_delta_body(cbm_store_t *s, const cbm_store_file_de
             return rc;
         }
     }
+    return CBM_STORE_OK;
+}
 
+static int store_publish_file_delta_metadata_body(cbm_store_t *s,
+                                                  const cbm_store_file_delta_t *delta) {
+    int rc = CBM_STORE_OK;
     for (int i = 0; i < delta->export_count; i++) {
         int64_t node_id = delta->exports[i].node_id;
         if (node_id <= CBM_STORE_NO_NODE_ID &&
@@ -3238,6 +3254,53 @@ static int store_publish_file_delta_body(cbm_store_t *s, const cbm_store_file_de
     if (delta->derived_view_name) {
         rc = store_upsert_derived_view_state(s, delta->project, delta->derived_view_name,
                                              delta->generation, delta->derived_status);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+    }
+    return CBM_STORE_OK;
+}
+
+static int store_publish_file_delta_body(cbm_store_t *s, const cbm_store_file_delta_t *delta) {
+    int rc = store_publish_file_delta_delete_body(s, delta);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_publish_file_delta_nodes_body(s, delta);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_publish_file_delta_edges_body(s, delta);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    return store_publish_file_delta_metadata_body(s, delta);
+}
+
+static int store_publish_file_delta_batch_body(cbm_store_t *s,
+                                               const cbm_store_file_delta_t *const *deltas,
+                                               int delta_count) {
+    int rc = CBM_STORE_OK;
+    for (int i = 0; i < delta_count; i++) {
+        rc = store_publish_file_delta_delete_body(s, deltas[i]);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+    }
+    for (int i = 0; i < delta_count; i++) {
+        rc = store_publish_file_delta_nodes_body(s, deltas[i]);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+    }
+    for (int i = 0; i < delta_count; i++) {
+        rc = store_publish_file_delta_edges_body(s, deltas[i]);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+    }
+    for (int i = 0; i < delta_count; i++) {
+        rc = store_publish_file_delta_metadata_body(s, deltas[i]);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
@@ -3397,12 +3460,10 @@ int cbm_store_publish_file_delta_batch(cbm_store_t *s,
     if (rc != CBM_STORE_OK) {
         return rc;
     }
-    for (int i = 0; i < delta_count; i++) {
-        rc = store_publish_file_delta_body(s, deltas[i]);
-        if (rc != CBM_STORE_OK) {
-            (void)cbm_store_rollback(s);
-            return rc;
-        }
+    rc = store_publish_file_delta_batch_body(s, deltas, delta_count);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
     }
     rc = store_mark_graph_derived_views_stale_body(s, project, generation);
     if (rc != CBM_STORE_OK) {
@@ -3431,12 +3492,10 @@ int cbm_store_publish_file_delta_batch_complete(cbm_store_t *s,
     if (rc != CBM_STORE_OK) {
         return rc;
     }
-    for (int i = 0; i < delta_count; i++) {
-        rc = store_publish_file_delta_body(s, deltas[i]);
-        if (rc != CBM_STORE_OK) {
-            (void)cbm_store_rollback(s);
-            return rc;
-        }
+    rc = store_publish_file_delta_batch_body(s, deltas, delta_count);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
     }
     rc = store_mark_graph_derived_views_stale_body(s, project, generation);
     if (rc != CBM_STORE_OK) {
