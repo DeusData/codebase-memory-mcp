@@ -808,6 +808,61 @@ TEST(pipeline_persisted_route_purity_for_http_literals) {
     PASS();
 }
 
+TEST(pipeline_infra_route_deny_wins_by_url_value) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/infra.yaml", g_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(path));
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        teardown_test_repo();
+        FAIL("failed to write infra.yaml");
+    }
+    fprintf(f, "registries:\n"
+               "  terraform_registry:\n"
+               "    url: https://registry.terraform.io\n"
+               "healthcheck: curl --fail http://localhost:8080/health || exit 1\n"
+               "push_endpoint: https://hooks.example.test/push\n");
+    fclose(f);
+
+    char db_path[CBM_PATH_MAX];
+    n = snprintf(db_path, sizeof(db_path), "%s/test_infra_route_deny.db", g_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(db_path));
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, project, "Route", &routes, &route_count),
+              CBM_STORE_OK);
+    bool saw_push_endpoint = false;
+    for (int i = 0; i < route_count; i++) {
+        const char *name = routes[i].name ? routes[i].name : "";
+        ASSERT_FALSE(strcmp(name, "https://registry.terraform.io") == 0);
+        ASSERT_FALSE(strcmp(name, "http://localhost:8080/health") == 0);
+        ASSERT_FALSE(strstr(name, "curl --fail http://localhost:8080/health") != NULL);
+        if (strcmp(name, "https://hooks.example.test/push") == 0) {
+            saw_push_endpoint = true;
+        }
+    }
+    ASSERT_TRUE(saw_push_endpoint);
+
+    cbm_store_free_nodes(routes, route_count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
 /* ── Calls pass tests ──────────────────────────────────────────── */
 
 TEST(pipeline_calls_resolution) {
@@ -10653,6 +10708,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_def_props_valid_json_when_oversized);
     RUN_TEST(pipeline_edge_props_valid_json);
     RUN_TEST(pipeline_persisted_route_purity_for_http_literals);
+    RUN_TEST(pipeline_infra_route_deny_wins_by_url_value);
     /* Complexity propagation pass (Tier B) */
     RUN_TEST(pipeline_complexity_transitive_loop_depth);
     RUN_TEST(pipeline_complexity_scc_tld_is_deterministic);
