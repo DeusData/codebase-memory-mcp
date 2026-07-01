@@ -252,8 +252,14 @@ TEST(watcher_detects_git_commit) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
     wt_git(tmpdir, "add file.txt");
     wt_git(tmpdir, "commit -q -m init");
 
@@ -268,7 +274,10 @@ TEST(watcher_detects_git_commit) {
     ASSERT_EQ(index_call_count, 0);
 
     /* Make a change: new commit */
-    { char p[300]; th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "world\n"); }
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "world\n");
+    }
     wt_git(tmpdir, "add file.txt");
     wt_git(tmpdir, "commit -q -m add-world");
 
@@ -296,8 +305,14 @@ TEST(watcher_detects_dirty_worktree) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
     wt_git(tmpdir, "add file.txt");
     wt_git(tmpdir, "commit -q -m init");
 
@@ -336,8 +351,14 @@ TEST(watcher_detects_new_file) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
     wt_git(tmpdir, "add file.txt");
     wt_git(tmpdir, "commit -q -m init");
 
@@ -377,8 +398,14 @@ TEST(watcher_no_change_no_reindex) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
     wt_git(tmpdir, "add file.txt");
     wt_git(tmpdir, "commit -q -m init");
 
@@ -415,13 +442,27 @@ TEST(watcher_multiple_projects) {
     if (!cbm_mkdtemp(tmpdirA) || !cbm_mkdtemp(tmpdirB))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdirA, "init -q") != 0) { th_rmtree(tmpdirA); th_rmtree(tmpdirB); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdirA, "a.txt"), "a\n"); }
+    if (wt_git(tmpdirA, "init -q") != 0) {
+        th_rmtree(tmpdirA);
+        th_rmtree(tmpdirB);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdirA, "a.txt"), "a\n");
+    }
     wt_git(tmpdirA, "add a.txt");
     wt_git(tmpdirA, "commit -q -m init");
 
-    if (wt_git(tmpdirB, "init -q") != 0) { th_rmtree(tmpdirA); th_rmtree(tmpdirB); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdirB, "b.txt"), "b\n"); }
+    if (wt_git(tmpdirB, "init -q") != 0) {
+        th_rmtree(tmpdirA);
+        th_rmtree(tmpdirB);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdirB, "b.txt"), "b\n");
+    }
     wt_git(tmpdirB, "add b.txt");
     wt_git(tmpdirB, "commit -q -m init");
 
@@ -527,8 +568,14 @@ TEST(watcher_interval_blocks_repoll) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
     wt_git(tmpdir, "add file.txt");
     wt_git(tmpdir, "commit -q -m init");
 
@@ -597,8 +644,14 @@ TEST(watcher_git_removed_no_crash) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
     wt_git(tmpdir, "add file.txt");
     wt_git(tmpdir, "commit -q -m init");
 
@@ -638,8 +691,14 @@ TEST(watcher_continued_dirty) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
     wt_git(tmpdir, "add file.txt");
     wt_git(tmpdir, "commit -q -m init");
 
@@ -702,8 +761,14 @@ TEST(watcher_baseline_dirty_repo) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
     wt_git(tmpdir, "add file.txt");
     wt_git(tmpdir, "commit -q -m init");
 
@@ -742,8 +807,14 @@ TEST(watcher_unwatch_prunes_state) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
     wt_git(tmpdir, "add file.txt");
     wt_git(tmpdir, "commit -q -m init");
 
@@ -784,8 +855,14 @@ TEST(watcher_watch_after_unwatch) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
     wt_git(tmpdir, "add file.txt");
     wt_git(tmpdir, "commit -q -m init");
 
@@ -841,9 +918,18 @@ TEST(watcher_detects_file_delete) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "todelete.go"), "todelete\n"); }
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "todelete.go"), "todelete\n");
+    }
     wt_git(tmpdir, "add -A");
     wt_git(tmpdir, "commit -q -m init");
 
@@ -882,8 +968,14 @@ TEST(watcher_detects_subdir_file) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "main.go"), "hello\n"); }
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "main.go"), "hello\n");
+    }
     wt_git(tmpdir, "add main.go");
     wt_git(tmpdir, "commit -q -m init");
 
@@ -948,8 +1040,14 @@ TEST(watcher_full_flow_new_file) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "main.go"), "package main\n"); }
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "main.go"), "package main\n");
+    }
     wt_git(tmpdir, "add main.go");
     wt_git(tmpdir, "commit -q -m init");
 
@@ -994,8 +1092,14 @@ TEST(watcher_fallback_still_detects) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "main.go"), "hello\n"); }
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "main.go"), "hello\n");
+    }
     wt_git(tmpdir, "add main.go");
     wt_git(tmpdir, "commit -q -m init");
 
@@ -1009,7 +1113,10 @@ TEST(watcher_fallback_still_detects) {
     ASSERT_EQ(index_call_count, 0);
 
     /* Remove .git and re-init (simulates strategy reset) */
-    { char p[300]; th_rmtree(wt_path(p, sizeof(p), tmpdir, ".git")); }
+    {
+        char p[300];
+        th_rmtree(wt_path(p, sizeof(p), tmpdir, ".git"));
+    }
     wt_git(tmpdir, "init -q");
     wt_git(tmpdir, "add -A");
     wt_git(tmpdir, "commit -q -m reinit");
@@ -1049,13 +1156,27 @@ TEST(watcher_poll_only_watched_projects) {
         FAIL("cbm_mkdtemp failed");
 
     /* Init both repos */
-    if (wt_git(tmpdirA, "init -q") != 0) { th_rmtree(tmpdirA); th_rmtree(tmpdirB); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdirA, "a.txt"), "a\n"); }
+    if (wt_git(tmpdirA, "init -q") != 0) {
+        th_rmtree(tmpdirA);
+        th_rmtree(tmpdirB);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdirA, "a.txt"), "a\n");
+    }
     wt_git(tmpdirA, "add a.txt");
     wt_git(tmpdirA, "commit -q -m init");
 
-    if (wt_git(tmpdirB, "init -q") != 0) { th_rmtree(tmpdirA); th_rmtree(tmpdirB); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdirB, "b.txt"), "b\n"); }
+    if (wt_git(tmpdirB, "init -q") != 0) {
+        th_rmtree(tmpdirA);
+        th_rmtree(tmpdirB);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdirB, "b.txt"), "b\n");
+    }
     wt_git(tmpdirB, "add b.txt");
     wt_git(tmpdirB, "commit -q -m init");
 
@@ -1104,8 +1225,14 @@ TEST(watcher_touch_resets_immediate) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
     wt_git(tmpdir, "add file.txt");
     wt_git(tmpdir, "commit -q -m init");
 
@@ -1150,8 +1277,14 @@ TEST(watcher_modify_tracked_file) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "main.go"), "package main\n"); }
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "main.go"), "package main\n");
+    }
     wt_git(tmpdir, "add main.go");
     wt_git(tmpdir, "commit -q -m init");
 
@@ -1473,6 +1606,58 @@ TEST(watcher_callback_data_passed) {
     PASS();
 }
 
+TEST(watcher_unwatch_drains_pending_free) {
+    /* Unwatch moves project_state to pending_free; the next poll_once
+     * must drain it without crash or leak. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_df_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "df-repo", tmpdir);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+    index_call_count = 0;
+
+    /* Baseline */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    /* Make dirty + detect change */
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "dirty\n");
+    }
+    cbm_watcher_touch(w, "df-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    /* Unwatch — state moves to pending_free */
+    cbm_watcher_unwatch(w, "df-repo");
+    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+
+    /* Next poll drains pending_free — no crash, no double-free */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 TEST(watcher_null_poll_once) {
     /* poll_once(NULL) → 0 */
     int reindexed = cbm_watcher_poll_once(NULL);
@@ -1561,6 +1746,7 @@ SUITE(watcher) {
     RUN_TEST(watcher_poll_non_git_dir);
     RUN_TEST(watcher_stop_prevents_run);
     RUN_TEST(watcher_watch_unwatch_rapid_cycle);
+    RUN_TEST(watcher_unwatch_drains_pending_free);
     RUN_TEST(watcher_callback_data_passed);
     RUN_TEST(watcher_null_poll_once);
     RUN_TEST(watcher_null_watch_count);

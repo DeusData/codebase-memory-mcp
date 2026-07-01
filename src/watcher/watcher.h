@@ -34,7 +34,8 @@ typedef int (*cbm_index_fn)(const char *project_name, const char *root_path, voi
  * user_data is passed to index_fn. */
 cbm_watcher_t *cbm_watcher_new(cbm_store_t *store, cbm_index_fn index_fn, void *user_data);
 
-/* Free the watcher and all per-project state. NULL-safe. */
+/* Free the watcher and all per-project state. NULL-safe.
+ * Precondition: cbm_watcher_stop() + thread join must have completed. */
 void cbm_watcher_free(cbm_watcher_t *w);
 
 /* ── Watch list management ──────────────────────────────────────── */

@@ -53,6 +53,10 @@ struct cbm_watcher {
     CBMHashTable *projects; /* name → project_state_t* */
     cbm_mutex_t projects_lock;
     atomic_int stopped;
+    /* Deferred-free list: freed after the next poll_once. */
+    project_state_t **pending_free;
+    int pending_free_count;
+    int pending_free_cap;
 };
 
 /* ── Constants ─────────────────────────────────────────────────── */
@@ -272,9 +276,16 @@ void cbm_watcher_free(cbm_watcher_t *w) {
     if (!w) {
         return;
     }
+    /* Safety net: ensure stopped is set before draining pending_free.
+     * In production the caller should cbm_watcher_stop() + join first. */
+    atomic_store(&w->stopped, 1);
     cbm_mutex_lock(&w->projects_lock);
     cbm_ht_foreach(w->projects, free_state_entry, NULL);
     cbm_ht_free(w->projects);
+    for (int i = 0; i < w->pending_free_count; i++) {
+        state_free(w->pending_free[i]);
+    }
+    free(w->pending_free);
     cbm_mutex_unlock(&w->projects_lock);
     cbm_mutex_destroy(&w->projects_lock);
     free(w);
@@ -322,7 +333,23 @@ void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name) {
     project_state_t *s = cbm_ht_get(w->projects, project_name);
     if (s) {
         cbm_ht_delete(w->projects, project_name);
-        state_free(s);
+        /* Defer free: the state may still be referenced by a poll_once
+         * snapshot taken before we acquired the lock.  poll_once will
+         * drain this list at the start of its next cycle. */
+        if (w->pending_free_count >= w->pending_free_cap) {
+            int new_cap = w->pending_free_cap ? w->pending_free_cap * 2 : 8;
+            project_state_t **tmp =
+                realloc(w->pending_free, (size_t)new_cap * sizeof(project_state_t *));
+            if (tmp) {
+                w->pending_free = tmp;
+                w->pending_free_cap = new_cap;
+            }
+        }
+        if (w->pending_free_count < w->pending_free_cap) {
+            w->pending_free[w->pending_free_count++] = s;
+        } else {
+            state_free(s); /* realloc failed — fall back to immediate free */
+        }
         removed = true;
     }
     cbm_mutex_unlock(&w->projects_lock);
@@ -484,6 +511,13 @@ int cbm_watcher_poll_once(cbm_watcher_t *w) {
      * This keeps the critical section small — poll_project does git I/O
      * and may invoke index_fn which runs the full pipeline. */
     cbm_mutex_lock(&w->projects_lock);
+
+    /* Free deferred entries from the previous cycle. */
+    for (int i = 0; i < w->pending_free_count; i++) {
+        state_free(w->pending_free[i]);
+    }
+    w->pending_free_count = 0;
+
     int n = cbm_ht_count(w->projects);
     if (n == 0) {
         cbm_mutex_unlock(&w->projects_lock);
