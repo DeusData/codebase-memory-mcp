@@ -1678,9 +1678,8 @@ void cbm_run_go_lsp(CBMArena* arena, CBMFileResult* result,
         CBMDefinition* d = &result->defs.items[i];
         if (!d->qualified_name || !d->name) continue;
 
-        // Register Class/Type nodes
-        if (d->label && (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Type") == 0 ||
-                         strcmp(d->label, "Interface") == 0)) {
+        // Register type-like nodes.
+        if (cbm_label_is_type_like(d->label)) {
             CBMRegisteredType rt;
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name;
@@ -2499,9 +2498,8 @@ void cbm_run_go_lsp_cross(
 
         const char* def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
 
-        // Type/Interface/Class
-        if (strcmp(d->label, "Type") == 0 || strcmp(d->label, "Class") == 0 ||
-            strcmp(d->label, "Interface") == 0) {
+        // Type-like definitions.
+        if (cbm_label_is_type_like(d->label)) {
             CBMRegisteredType rt;
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name;  // borrowed
@@ -2752,8 +2750,7 @@ CBMTypeRegistry* cbm_go_build_cross_registry(
          * fall back to — this registry is project-wide, not per-file. */
         const char* def_mod = d->def_module_qn ? d->def_module_qn : "";
 
-        if (strcmp(d->label, "Type") == 0 || strcmp(d->label, "Class") == 0 ||
-            strcmp(d->label, "Interface") == 0) {
+        if (cbm_label_is_type_like(d->label)) {
             CBMRegisteredType rt;
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name; /* borrowed */
