@@ -1483,22 +1483,86 @@ int cbm_store_find_node_ids_by_qns(cbm_store_t *s, const char *project, const ch
         return 0;
     }
 
-    /* Zero out results */
     memset(out_ids, 0, (size_t)qn_count * sizeof(int64_t));
 
     int found = 0;
-    cbm_node_t node = {0};
-    for (int i = 0; i < qn_count; i++) {
-        if (!qns[i]) {
+    int offset = 0;
+    const int sqlite_bind_limit = sqlite3_limit(s->db, SQLITE_LIMIT_VARIABLE_NUMBER, -1);
+    const int qn_bind_limit =
+        sqlite_bind_limit > SKIP_ONE ? (sqlite_bind_limit - SKIP_ONE) / PAIR_LEN : SKIP_ONE;
+    static const char prefix[] = "WITH q(ord, qn) AS (VALUES ";
+    static const char suffix[] =
+        ") SELECT q.ord, n.id FROM q JOIN nodes n "
+        "ON n.project=? AND n.qualified_name=q.qn;";
+
+    while (offset < qn_count) {
+        char sql[ST_SQL_BUF];
+        int pos = snprintf(sql, sizeof(sql), "%s", prefix);
+        if (pos < 0 || pos >= (int)sizeof(sql)) {
+            return CBM_STORE_ERR;
+        }
+
+        int chunk_end = offset;
+        int bind_count = 0;
+        for (; chunk_end < qn_count && bind_count < qn_bind_limit; chunk_end++) {
+            if (!qns[chunk_end] || out_ids[chunk_end] > CBM_STORE_NO_NODE_ID) {
+                continue;
+            }
+            static const char row_sql[] = "(?,?)";
+            int extra = (bind_count > 0 ? 1 : 0) + (int)SLEN(row_sql) + (int)SLEN(suffix);
+            if (pos + extra + ST_IN_CLAUSE_MARGIN >= (int)sizeof(sql)) {
+                break;
+            }
+            if (bind_count > 0) {
+                sql[pos++] = ',';
+            }
+            memcpy(sql + pos, row_sql, SLEN(row_sql));
+            pos += (int)SLEN(row_sql);
+            bind_count++;
+        }
+        if (bind_count == 0) {
+            offset++;
             continue;
         }
-        int rc = cbm_store_find_node_by_qn(s, project, qns[i], &node);
-        if (rc == CBM_STORE_OK) {
-            out_ids[i] = node.id;
-            found++;
-            cbm_node_free_fields(&node);
-            memset(&node, 0, sizeof(node));
+        if (pos + (int)SLEN(suffix) >= (int)sizeof(sql)) {
+            return CBM_STORE_ERR;
         }
+        memcpy(sql + pos, suffix, SLEN(suffix) + 1);
+
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "find_node_ids_by_qns");
+            return CBM_STORE_ERR;
+        }
+
+        int bind_col = SKIP_ONE;
+        for (int i = offset; i < chunk_end; i++) {
+            if (!qns[i] || out_ids[i] > CBM_STORE_NO_NODE_ID) {
+                continue;
+            }
+            sqlite3_bind_int(stmt, bind_col++, i);
+            bind_text(stmt, bind_col++, qns[i]);
+        }
+        bind_text(stmt, bind_col, project);
+
+        int step_rc = SQLITE_ROW;
+        while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            int index = sqlite3_column_int(stmt, 0);
+            int64_t id = sqlite3_column_int64(stmt, SKIP_ONE);
+            if (index < 0 || index >= qn_count || id <= CBM_STORE_NO_NODE_ID ||
+                out_ids[index] > CBM_STORE_NO_NODE_ID) {
+                continue;
+            }
+            out_ids[index] = id;
+            found++;
+        }
+        if (step_rc != SQLITE_DONE) {
+            store_set_error_sqlite(s, "find_node_ids_by_qns");
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
+        sqlite3_finalize(stmt);
+        offset = chunk_end;
     }
     return found;
 }
