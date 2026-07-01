@@ -96,8 +96,9 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
 /* Convenience: compute with defaults (FULL scope, d=0.85, eps=1e-6, 20 iter) */
 int cbm_pagerank_compute_default(cbm_store_t *store, const char *project);
 
-/* Convenience: compute with config-backed edge weights.
- * Reads edge_weight_* config keys, falls back to CBM_DEFAULT_EDGE_WEIGHTS.
+/* Convenience: compute with config-backed rank settings.
+ * Reads rank_scope, pagerank_* and edge_weight_* config keys; invalid values
+ * fall back to the same defaults as cbm_pagerank_compute_default().
  * cfg may be NULL (uses defaults). */
 int cbm_pagerank_compute_with_config(cbm_store_t *store, const char *project,
                                      struct cbm_config *cfg);
