@@ -1212,6 +1212,16 @@ TEST(typst_function_call_edge) {
     PASS();
 }
 
+TEST(nickel_function_application_edge) {
+    CBMFileResult *r =
+        extract("let inc = fun x => x + 1 in inc 41\n", CBM_LANG_NICKEL, "t", "lib.ncl");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "inc"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Fortran --- */
 TEST(fortran_function) {
     /* Fortran subroutine name extraction is incomplete — just verify no crash */
@@ -3405,6 +3415,7 @@ SUITE(extraction) {
     RUN_TEST(nix_function);
     RUN_TEST(jsonnet_function_call_edge);
     RUN_TEST(typst_function_call_edge);
+    RUN_TEST(nickel_function_application_edge);
     RUN_TEST(fortran_function);
 
     /* OOP/Systems variants */

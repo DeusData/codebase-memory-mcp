@@ -724,6 +724,35 @@ static char *extract_typst_callee(CBMArena *a, TSNode node, const char *source, 
     return ts_node_is_null(item) ? NULL : cbm_node_text(a, item, source);
 }
 
+// Nickel function application is an applicative with t1=function and t2=argument.
+static char *extract_nickel_callee(CBMArena *a, TSNode node, const char *source,
+                                   const char *nk) {
+    if (strcmp(nk, "applicative") != 0 ||
+        ts_node_is_null(ts_node_child_by_field_name(node, TS_FIELD("t2")))) {
+        return NULL;
+    }
+    TSNode parent = ts_node_parent(node);
+    if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "applicative") == 0) {
+        return NULL;
+    }
+    TSNode cur = node;
+    enum { NICKEL_APPLY_HEAD_DEPTH = 8 };
+    for (int depth = 0; depth < NICKEL_APPLY_HEAD_DEPTH && !ts_node_is_null(cur); depth++) {
+        if (strcmp(ts_node_type(cur), "ident") == 0) {
+            return cbm_node_text(a, cur, source);
+        }
+        TSNode next = ts_node_child_by_field_name(cur, TS_FIELD("t1"));
+        if (ts_node_is_null(next) && ts_node_named_child_count(cur) > 0) {
+            next = ts_node_named_child(cur, 0);
+        }
+        if (ts_node_is_null(next) || ts_node_eq(next, cur)) {
+            break;
+        }
+        cur = next;
+    }
+    return NULL;
+}
+
 // Elm function_call_expr stores its target under target > value_expr > name.
 static char *extract_elm_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
     if (strcmp(nk, "function_call_expr") != 0) {
@@ -886,6 +915,10 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
     }
     if (lang == CBM_LANG_COBOL) {
         char *c = extract_cobol_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
+    if (lang == CBM_LANG_NICKEL) {
+        char *c = extract_nickel_callee(a, node, source, nk);
         return c ? c : extract_scripting_callee(a, node, source, lang, nk);
     }
 
