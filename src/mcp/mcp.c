@@ -4969,6 +4969,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     int rc = cbm_pipeline_run(p);
     bool graph_changed = cbm_pipeline_graph_changed(p);
     cbm_pipeline_publish_kind_t publish_kind = cbm_pipeline_publish_kind(p);
+    const char *publish_reason = cbm_pipeline_publish_reason(p);
     srv->active_pipeline = NULL;
     cbm_pipeline_unlock();
 
@@ -4997,6 +4998,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_str(doc, root, "status", rc == 0 ? "indexed" : "error");
     yyjson_mut_obj_add_str(doc, root, "publish_kind",
                            cbm_pipeline_publish_kind_name(publish_kind));
+    if (publish_reason && publish_reason[0]) {
+        yyjson_mut_obj_add_str(doc, root, "publish_reason", publish_reason);
+    }
     yyjson_mut_obj_add_bool(doc, root, "graph_changed", graph_changed);
 
     if (rc == 0) {

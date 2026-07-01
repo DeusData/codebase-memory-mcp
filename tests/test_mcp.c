@@ -10,6 +10,7 @@
 #include "test_framework.h"
 #include <cli/cli.h>
 #include <mcp/mcp.h>
+#include <pipeline/pipeline.h>
 #include <store/store.h>
 #include <sqlite3.h>
 #include <yyjson/yyjson.h>
@@ -1644,6 +1645,81 @@ TEST(tool_index_repository_missing_path) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_index_repository_reports_incremental_containment_reason) {
+    char *repo_tmp = th_mktempdir("cbm_mcp_publish_reason_repo");
+    if (!repo_tmp) {
+        PASS();
+    }
+    char repo[CBM_PATH_MAX];
+    int n = snprintf(repo, sizeof(repo), "%s", repo_tmp);
+    ASSERT(n >= 0 && (size_t)n < sizeof(repo));
+
+    char *cache_tmp = th_mktempdir("cbm_mcp_publish_reason_cache");
+    ASSERT_NOT_NULL(cache_tmp);
+    char cache[CBM_PATH_MAX];
+    n = snprintf(cache, sizeof(cache), "%s", cache_tmp);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cache));
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? cbm_strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    cbm_config_t *cfg = cbm_config_open(cache);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_REINDEX, "always"), 0);
+
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "go.mod"), "module example.com/pubreason\n\ngo 1.22\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.go"), "package main\n\nfunc main() {}\n"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+
+    char req[CBM_SZ_4K];
+    n = snprintf(req, sizeof(req),
+                 "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"index_repository\","
+                 "\"arguments\":{\"repo_path\":\"%s\",\"mode\":\"fast\"}}}",
+                 repo);
+    ASSERT(n >= 0 && (size_t)n < sizeof(req));
+    char *resp = cbm_mcp_server_handle(srv, req);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "indexed"));
+    free(resp);
+
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "pkg/file_created.go"),
+                            "package pkg\n\nfunc Created() int {\n\treturn 7\n}\n"),
+              0);
+
+    n = snprintf(req, sizeof(req),
+                 "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"index_repository\","
+                 "\"arguments\":{\"repo_path\":\"%s\",\"mode\":\"fast\"}}}",
+                 repo);
+    ASSERT(n >= 0 && (size_t)n < sizeof(req));
+    resp = cbm_mcp_server_handle(srv, req);
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"publish_kind\":\"incremental_containment\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"publish_reason\":\"missing_existing_ownership\""));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_cleanup(repo);
+    th_cleanup(cache);
     PASS();
 }
 
@@ -3457,6 +3533,7 @@ SUITE(mcp) {
 
     /* Pipeline-dependent tool handlers */
     RUN_TEST(tool_index_repository_missing_path);
+    RUN_TEST(tool_index_repository_reports_incremental_containment_reason);
     RUN_TEST(tool_get_code_snippet_missing_qn);
     RUN_TEST(tool_get_code_snippet_not_found);
     RUN_TEST(tool_search_code_missing_pattern);
