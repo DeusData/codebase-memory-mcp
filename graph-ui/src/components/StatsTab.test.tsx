@@ -46,7 +46,7 @@ describe("StatsTab index modal", () => {
     vi.unstubAllGlobals();
   });
 
-  it("submits a custom path and project name", async () => {
+  it("submits a custom path", async () => {
     let submitted: unknown = null;
     mockProjectsFetch((url, init) => {
       if (url === "/api/index") {
@@ -65,16 +65,10 @@ describe("StatsTab index modal", () => {
     fireEvent.change(await screen.findByLabelText("Repository path"), {
       target: { value: "D:\\work\\信租风控通后端" },
     });
-    fireEvent.change(screen.getByLabelText("Project name"), {
-      target: { value: "信租风控通后端" },
-    });
     fireEvent.click(screen.getByRole("button", { name: "Index This Folder" }));
 
     await waitFor(() => {
-      expect(submitted).toEqual({
-        root_path: "D:\\work\\信租风控通后端",
-        project_name: "信租风控通后端",
-      });
+      expect(submitted).toEqual({ root_path: "D:\\work\\信租风控通后端" });
     });
   });
 

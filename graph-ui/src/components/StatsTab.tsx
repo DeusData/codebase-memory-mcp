@@ -172,7 +172,6 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const [dirs, setDirs] = useState<string[]>([]);
   const [roots, setRoots] = useState<string[]>(["/"]);
   const [parentPath, setParentPath] = useState("");
-  const [projectName, setProjectName] = useState("");
   const [filter, setFilter] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -211,9 +210,7 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
     if (!path) return;
     setSubmitting(true); setError(null);
     try {
-      const body: { root_path: string; project_name?: string } = { root_path: path };
-      if (projectName.trim()) body.project_name = projectName.trim();
-      const res = await fetch("/api/index", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const res = await fetch("/api/index", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root_path: path }) });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? "Failed");
       onCreated(); onClose();
@@ -250,7 +247,7 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
           <p className="text-[12px] text-foreground/30">{t.index.instructions}</p>
         </div>
 
-        <div className="px-5 pb-3 grid grid-cols-[1fr_220px] gap-3 shrink-0">
+        <div className="px-5 pb-3 shrink-0">
           <label className="block">
             <span className="block text-[10px] uppercase tracking-widest text-foreground/25 mb-1">{t.index.repositoryPath}</span>
             <input
@@ -258,16 +255,6 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
               value={currentPath}
               onChange={(e) => setCurrentPath(e.target.value)}
               className="w-full bg-white/[0.04] border border-white/[0.06] rounded-lg px-3 py-2 text-[12px] text-foreground font-mono outline-none focus:border-primary/40"
-            />
-          </label>
-          <label className="block">
-            <span className="block text-[10px] uppercase tracking-widest text-foreground/25 mb-1">{t.index.projectName}</span>
-            <input
-              aria-label={t.index.projectName}
-              value={projectName}
-              placeholder={t.index.projectNamePlaceholder}
-              onChange={(e) => setProjectName(e.target.value)}
-              className="w-full bg-white/[0.04] border border-white/[0.06] rounded-lg px-3 py-2 text-[12px] text-foreground outline-none focus:border-primary/40 placeholder:text-foreground/20"
             />
           </label>
         </div>
