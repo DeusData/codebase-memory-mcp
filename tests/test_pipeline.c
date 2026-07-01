@@ -7621,6 +7621,130 @@ static int pipeline_compare_current_db_to_fresh_fast_rebuild(const char *repo_pa
     return rc;
 }
 
+static int pipeline_gbuf_count_usage_edge(const cbm_gbuf_t *gb, const char *source_qn,
+                                          const char *target_qn, const char *callee) {
+    const cbm_gbuf_node_t *src = cbm_gbuf_find_by_qn(gb, source_qn);
+    const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(gb, target_qn);
+    if (!src || !tgt) {
+        return 0;
+    }
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(gb, src->id, "USAGE", &edges, &edge_count) != 0) {
+        return 0;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        const cbm_gbuf_edge_t *edge = edges[i];
+        if (edge && edge->target_id == tgt->id &&
+            (!callee || (edge->properties_json && strstr(edge->properties_json, callee)))) {
+            matches++;
+        }
+    }
+    return matches;
+}
+
+static int pipeline_file_delta_count_usage_edge(const cbm_pipeline_file_delta_t *delta,
+                                                const char *source_qn, const char *target_qn,
+                                                const char *callee) {
+    int matches = 0;
+    for (int i = 0; i < delta->delta.edge_count; i++) {
+        const cbm_store_delta_edge_t *edge = &delta->edges[i];
+        if (edge->type && strcmp(edge->type, "USAGE") == 0 &&
+            edge->source_qn && strcmp(edge->source_qn, source_qn) == 0 &&
+            edge->target_qn && strcmp(edge->target_qn, target_qn) == 0 &&
+            (!callee || (edge->properties_json && strstr(edge->properties_json, callee)))) {
+            matches++;
+        }
+    }
+    return matches;
+}
+
+static int pipeline_build_exact_scratch_for_changed_files(cbm_store_t *store,
+                                                          const char *repo_path,
+                                                          const char *project,
+                                                          cbm_file_info_t *changed_files,
+                                                          int changed_count,
+                                                          cbm_gbuf_t **out_scratch,
+                                                          cbm_pipeline_file_delta_t *deltas) {
+    if (out_scratch) {
+        *out_scratch = NULL;
+    }
+    if (!store || !repo_path || !project || !changed_files || changed_count <= 0 ||
+        !out_scratch || !deltas) {
+        return CBM_STORE_ERR;
+    }
+
+    const char **changed_paths = calloc((size_t)changed_count, sizeof(*changed_paths));
+    CBMFileResult **result_cache = calloc((size_t)changed_count, sizeof(*result_cache));
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, repo_path);
+    cbm_registry_t *registry = cbm_registry_new();
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    int rc = CBM_STORE_ERR;
+    if (!changed_paths || !result_cache || !scratch || !registry) {
+        goto cleanup;
+    }
+    for (int i = 0; i < changed_count; i++) {
+        changed_paths[i] = changed_files[i].rel_path;
+    }
+    rc = cbm_pipeline_seed_file_delta_scratch_from_store(store, scratch, registry, project,
+                                                         changed_paths, changed_count);
+    if (rc != CBM_STORE_OK) {
+        goto cleanup;
+    }
+
+    const double pipeline_default_threshold = 0.0; /* Pipeline constructor sentinel: use pass defaults. */
+    cbm_pipeline_ctx_t ctx = {.project_name = project,
+                              .repo_path = repo_path,
+                              .gbuf = scratch,
+                              .registry = registry,
+                              .cancelled = &cancelled,
+                              .mode = CBM_MODE_FAST,
+                              .similarity_threshold = pipeline_default_threshold,
+                              .httplink_min_confidence = pipeline_default_threshold,
+                              .semantic_threshold = pipeline_default_threshold,
+                              .githistory_min_coupling = pipeline_default_threshold,
+                              .lsp_confidence_floor = pipeline_default_threshold,
+                              .result_cache = result_cache};
+    const char *structure_root_qn = project;
+    for (int i = 0; i < changed_count; i++) {
+        if (cbm_pipeline_ensure_file_structure(scratch, project, structure_root_qn,
+                                               changed_files[i].rel_path, NULL) != 0) {
+            goto cleanup;
+        }
+    }
+    if (cbm_pipeline_pass_definitions(&ctx, changed_files, changed_count) != 0 ||
+        cbm_pipeline_pass_lsp_cross(&ctx, changed_files, changed_count, result_cache) != 0 ||
+        cbm_pipeline_pass_calls(&ctx, changed_files, changed_count) != 0 ||
+        cbm_pipeline_pass_usages(&ctx, changed_files, changed_count) != 0) {
+        goto cleanup;
+    }
+    for (int i = 0; i < changed_count; i++) {
+        rc = cbm_pipeline_build_file_delta_from_gbuf(scratch, project, changed_files[i].rel_path,
+                                                     CBM_PIPELINE_COMPAT_GENERATION, &deltas[i]);
+        if (rc != CBM_STORE_OK) {
+            goto cleanup;
+        }
+    }
+
+    *out_scratch = scratch;
+    scratch = NULL;
+    rc = CBM_STORE_OK;
+
+cleanup:
+    for (int i = 0; i < changed_count; i++) {
+        if (result_cache && result_cache[i]) {
+            cbm_free_result(result_cache[i]);
+        }
+    }
+    free(result_cache);
+    cbm_registry_free(registry);
+    cbm_gbuf_free(scratch);
+    free(changed_paths);
+    return rc;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  FastAPI Depends() edge tracking (PR #66, fix #27)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -8173,6 +8297,72 @@ TEST(incremental_fast_multi_file_batch_falls_back_to_full_rebuild_parity) {
     }
     ASSERT_EQ(diff_rc, 0);
 
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_exact_scratch_multifile_usage_edges_match_fresh) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    char main_path[CBM_PATH_MAX];
+    char helper_path[CBM_PATH_MAX];
+    int n = snprintf(main_path, sizeof(main_path), "%s/main.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(main_path));
+    n = snprintf(helper_path, sizeof(helper_path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(helper_path));
+    ASSERT_EQ(th_write_file(main_path,
+                            "package main\n\n"
+                            "func main() {\n\tHelper()\n\tNewHelper()\n}\n\n"
+                            "func NewMain() int {\n\treturn 11\n}\n"),
+              0);
+    ASSERT_EQ(th_write_file(helper_path,
+                            "package main\n\n"
+                            "func Helper() string {\n\treturn \"updated\"\n}\n\n"
+                            "func NewHelper() int {\n\treturn 13\n}\n"),
+              0);
+
+    cbm_file_info_t changed[] = {
+        {.path = main_path, .rel_path = "main.go", .language = CBM_LANG_GO},
+        {.path = helper_path, .rel_path = "helper.go", .language = CBM_LANG_GO},
+    };
+    cbm_store_t *store = cbm_store_open_path_query(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_gbuf_t *scratch = NULL;
+    cbm_pipeline_file_delta_t deltas[CBM_SZ_2] = {0};
+    ASSERT_EQ(pipeline_build_exact_scratch_for_changed_files(
+                  store, g_incr_tmpdir, project, changed,
+                  (int)(sizeof(changed) / sizeof(changed[0])), &scratch, deltas),
+              CBM_STORE_OK);
+
+    char *helper_module_qn = cbm_pipeline_fqn_module(project, "helper.go");
+    char *main_fn_qn = cbm_pipeline_fqn_compute(project, "main.go", "main");
+    ASSERT_NOT_NULL(helper_module_qn);
+    ASSERT_NOT_NULL(main_fn_qn);
+    ASSERT_EQ(pipeline_gbuf_count_usage_edge(scratch, helper_module_qn, main_fn_qn, "main"), 1);
+    ASSERT_EQ(pipeline_file_delta_count_usage_edge(&deltas[1], helper_module_qn, main_fn_qn,
+                                                   "main"),
+              1);
+
+    free(helper_module_qn);
+    free(main_fn_qn);
+    cbm_pipeline_file_delta_free(&deltas[0]);
+    cbm_pipeline_file_delta_free(&deltas[1]);
+    cbm_gbuf_free(scratch);
+    cbm_store_close(store);
     free(project);
     cbm_config_close(cfg);
     cleanup_incremental_repo();
@@ -10069,6 +10259,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_detects_changed_file);
     RUN_TEST(incremental_fast_exact_upsert_matches_full_rebuild);
     RUN_TEST(incremental_fast_multi_file_batch_falls_back_to_full_rebuild_parity);
+    RUN_TEST(incremental_fast_exact_scratch_multifile_usage_edges_match_fresh);
     RUN_TEST(incremental_full_mode_keeps_exact_upsert_disabled);
     RUN_TEST(incremental_detects_same_size_rewrite_with_preserved_mtime);
     RUN_TEST(incremental_missing_file_state_keeps_legacy_metadata_path);
