@@ -2159,8 +2159,11 @@ int cbm_store_rebuild_file_delta_owners(cbm_store_t *s, const char *project,
 
     const char *node_sql =
         "INSERT INTO node_owners (project, node_id, rel_path, generation) "
-        "SELECT project, id, file_path, ?2 FROM nodes "
-        "WHERE project = ?1 AND file_path IS NOT NULL AND file_path <> '';";
+        "SELECT n.project, n.id, n.file_path, ?2 FROM nodes n "
+        "WHERE n.project = ?1 AND n.file_path IS NOT NULL AND n.file_path <> '' "
+        "AND EXISTS (SELECT 1 FROM nodes f "
+        "            WHERE f.project = n.project AND f.label = 'File' "
+        "              AND f.file_path = n.file_path);";
     rc = store_exec_rebuild_owner_sql(s, node_sql, project, generation,
                                       "rebuild_file_delta_owners nodes");
     if (rc != CBM_STORE_OK) {
@@ -2168,17 +2171,22 @@ int cbm_store_rebuild_file_delta_owners(cbm_store_t *s, const char *project,
         return rc;
     }
 
+    /* Folder/Project structure nodes can carry directory paths in file_path.
+     * Only paths backed by a File node are valid delta ownership rel_paths. */
     const char *edge_sql =
         "INSERT INTO edge_owners (project, edge_id, rel_path, derived_kind, generation) "
         "SELECT e.project, e.id, "
-        "CASE WHEN src.file_path IS NOT NULL AND src.file_path <> '' THEN src.file_path "
-        "ELSE tgt.file_path END, ?3, ?2 "
+        "CASE WHEN sf.file_path IS NOT NULL THEN src.file_path ELSE tgt.file_path END, ?3, ?2 "
         "FROM edges e "
         "JOIN nodes src ON src.id = e.source_id "
         "JOIN nodes tgt ON tgt.id = e.target_id "
-        "WHERE e.project = ?1 AND ("
-        "(src.file_path IS NOT NULL AND src.file_path <> '') OR "
-        "(tgt.file_path IS NOT NULL AND tgt.file_path <> ''));";
+        "LEFT JOIN (SELECT DISTINCT project, file_path FROM nodes "
+        "           WHERE label = 'File' AND file_path IS NOT NULL AND file_path <> '') sf "
+        "  ON sf.project = e.project AND sf.file_path = src.file_path "
+        "LEFT JOIN (SELECT DISTINCT project, file_path FROM nodes "
+        "           WHERE label = 'File' AND file_path IS NOT NULL AND file_path <> '') tf "
+        "  ON tf.project = e.project AND tf.file_path = tgt.file_path "
+        "WHERE e.project = ?1 AND (sf.file_path IS NOT NULL OR tf.file_path IS NOT NULL);";
     sqlite3_stmt *edge_stmt = NULL;
     if (sqlite3_prepare_v2(s->db, edge_sql, CBM_NOT_FOUND, &edge_stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "rebuild_file_delta_owners edges prepare");

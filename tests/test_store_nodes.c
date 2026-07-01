@@ -930,7 +930,7 @@ TEST(store_rebuild_file_delta_owners_derives_from_graph) {
     ASSERT_NOT_NULL(s);
     ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
 
-    cbm_node_t nodes[3] = {
+    cbm_node_t nodes[7] = {
         {.project = "test",
          .label = "Function",
          .name = "main",
@@ -949,13 +949,45 @@ TEST(store_rebuild_file_delta_owners_derives_from_graph) {
          .qualified_name = "test.pkg",
          .file_path = "",
          .properties_json = "{}"},
+        {.project = "test",
+         .label = "File",
+         .name = "main.go",
+         .qualified_name = "test.main.__file__",
+         .file_path = "main.go",
+         .properties_json = "{}"},
+        {.project = "test",
+         .label = "File",
+         .name = "helper.go",
+         .qualified_name = "test.helper.__file__",
+         .file_path = "helper.go",
+         .properties_json = "{}"},
+        {.project = "test",
+         .label = "Folder",
+         .name = "src",
+         .qualified_name = "test.src",
+         .file_path = "src",
+         .properties_json = "{}"},
+        {.project = "test",
+         .label = "File",
+         .name = "main.go",
+         .qualified_name = "test.src.main.__file__",
+         .file_path = "src/main.go",
+         .properties_json = "{}"},
     };
     int64_t main_id = cbm_store_upsert_node(s, &nodes[0]);
     int64_t helper_id = cbm_store_upsert_node(s, &nodes[1]);
     int64_t package_id = cbm_store_upsert_node(s, &nodes[2]);
+    int64_t main_file_id = cbm_store_upsert_node(s, &nodes[3]);
+    int64_t helper_file_id = cbm_store_upsert_node(s, &nodes[4]);
+    int64_t folder_id = cbm_store_upsert_node(s, &nodes[5]);
+    int64_t nested_file_id = cbm_store_upsert_node(s, &nodes[6]);
     ASSERT_GT(main_id, 0);
     ASSERT_GT(helper_id, 0);
     ASSERT_GT(package_id, 0);
+    ASSERT_GT(main_file_id, 0);
+    ASSERT_GT(helper_file_id, 0);
+    ASSERT_GT(folder_id, 0);
+    ASSERT_GT(nested_file_id, 0);
 
     cbm_edge_t direct_edge = {.project = "test",
                               .source_id = main_id,
@@ -967,10 +999,17 @@ TEST(store_rebuild_file_delta_owners_derives_from_graph) {
                                        .target_id = helper_id,
                                        .type = "CONTAINS",
                                        .properties_json = "{}"};
+    cbm_edge_t structural_edge = {.project = "test",
+                                  .source_id = folder_id,
+                                  .target_id = nested_file_id,
+                                  .type = "CONTAINS_FILE",
+                                  .properties_json = "{}"};
     int64_t direct_edge_id = cbm_store_insert_edge(s, &direct_edge);
     int64_t fallback_edge_id = cbm_store_insert_edge(s, &target_fallback_edge);
+    int64_t structural_edge_id = cbm_store_insert_edge(s, &structural_edge);
     ASSERT_GT(direct_edge_id, 0);
     ASSERT_GT(fallback_edge_id, 0);
+    ASSERT_GT(structural_edge_id, 0);
 
     ASSERT_EQ(cbm_store_upsert_node_owner(s, "test", main_id, "stale.go", TEST_GENERATION - 1),
               CBM_STORE_OK);
@@ -987,10 +1026,19 @@ TEST(store_rebuild_file_delta_owners_derives_from_graph) {
     ASSERT_EQ(cbm_store_count_file_delta_owners(s, "test", "main.go", &node_owners,
                                                 &edge_owners),
               CBM_STORE_OK);
-    ASSERT_EQ(node_owners, 1);
+    ASSERT_EQ(node_owners, 2);
     ASSERT_EQ(edge_owners, 1);
 
     ASSERT_EQ(cbm_store_count_file_delta_owners(s, "test", "helper.go", &node_owners,
+                                                &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_EQ(node_owners, 2);
+    ASSERT_EQ(edge_owners, 1);
+    ASSERT_EQ(cbm_store_count_file_delta_owners(s, "test", "src", &node_owners, &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_EQ(node_owners, 0);
+    ASSERT_EQ(edge_owners, 0);
+    ASSERT_EQ(cbm_store_count_file_delta_owners(s, "test", "src/main.go", &node_owners,
                                                 &edge_owners),
               CBM_STORE_OK);
     ASSERT_EQ(node_owners, 1);
