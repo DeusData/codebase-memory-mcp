@@ -240,6 +240,9 @@ int cbm_pipeline_content_hash_file(const char *path, char *out, size_t out_sz);
 bool cbm_pipeline_file_state_is_current_or_legacy(cbm_store_t *store, const char *project,
                                                   const cbm_file_info_t *file,
                                                   const char *pass_fingerprint);
+bool cbm_pipeline_file_state_content_matches_current(cbm_store_t *store, const char *project,
+                                                     const cbm_file_info_t *file,
+                                                     const char *pass_fingerprint);
 /* Persists file_state rows in its own transaction. */
 int cbm_pipeline_persist_file_states(cbm_store_t *store, const char *project,
                                      const cbm_file_info_t *files, int file_count,
