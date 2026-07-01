@@ -883,6 +883,37 @@ TEST(tool_search_graph_query_rejects_bad_semantic_query) {
     PASS();
 }
 
+TEST(tool_search_graph_semantic_query_warns_on_stale_semantic_view) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "semantic-stale";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/semantic-stale"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_set_derived_view_state(st, proj, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
+                                               CBM_STORE_DERIVED_GENERATION_UNKNOWN,
+                                               CBM_STORE_DERIVED_STATUS_STALE),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":48,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"semantic-stale\","
+             "\"semantic_query\":[\"publish\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
+    ASSERT_NOT_NULL(strstr(inner, "semantic_edges derived view is stale"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_query_graph_basic) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
 
@@ -1173,6 +1204,56 @@ TEST(tool_get_architecture_emits_populated_sections) {
      * is serialized — which is exactly what #281 wires up. */
     ASSERT_NOT_NULL(strstr(inner, "\"entry_points\""));
     ASSERT_NOT_NULL(strstr(inner, "main"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_architecture_warns_on_stale_derived_views) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "arch-stale";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/arch-stale"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    cbm_node_t fn = {.project = proj,
+                     .label = "Function",
+                     .name = "Run",
+                     .qualified_name = "arch-stale.Run",
+                     .file_path = "run.c"};
+    int64_t id = cbm_store_upsert_node(st, &fn);
+    ASSERT_GT(id, 0);
+    char rank_sql[256];
+    snprintf(rank_sql, sizeof(rank_sql),
+             "INSERT INTO pagerank(project,node_id,rank,computed_at) "
+             "VALUES('arch-stale',%lld,0.9,'2026-06-30T00:00:00Z')",
+             (long long)id);
+    ASSERT_EQ(cbm_store_exec(st, rank_sql), CBM_STORE_OK);
+    const char *stale_views[] = {CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                 CBM_STORE_DERIVED_VIEW_ROUTES,
+                                 CBM_STORE_DERIVED_VIEW_ARCHITECTURE};
+    ASSERT_EQ(cbm_store_mark_derived_views_stale(st, proj, CBM_STORE_DERIVED_GENERATION_UNKNOWN,
+                                                 stale_views,
+                                                 (int)(sizeof(stale_views) / sizeof(stale_views[0]))),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":94,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"get_architecture\","
+             "\"arguments\":{\"project\":\"arch-stale\",\"aspects\":[\"all\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
+    ASSERT_NOT_NULL(strstr(inner, "architecture derived view is stale"));
+    ASSERT_NOT_NULL(strstr(inner, "routes derived view is stale"));
+    ASSERT_NOT_NULL(strstr(inner, "key_functions were omitted"));
+    ASSERT_NULL(strstr(inner, "\"key_functions\""));
 
     free(inner);
     free(resp);
@@ -3083,6 +3164,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_query_uses_search_limit_config);
     RUN_TEST(tool_search_graph_query_rejects_bad_semantic_query);
+    RUN_TEST(tool_search_graph_semantic_query_warns_on_stale_semantic_view);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_index_status_includes_git_metadata);
@@ -3096,6 +3178,7 @@ SUITE(mcp) {
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
+    RUN_TEST(tool_get_architecture_warns_on_stale_derived_views);
     RUN_TEST(tool_get_architecture_path_scoping);
     RUN_TEST(tool_query_graph_missing_query);
 
