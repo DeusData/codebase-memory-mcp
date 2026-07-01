@@ -730,6 +730,17 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                           itoa_buf_incr(rc));
             return rc;
         }
+        if (ctx->result_cache) {
+            cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+            rc = cbm_pipeline_pass_lsp_cross(ctx, changed_files, ci, ctx->result_cache);
+            cbm_log_info("pass.timing", "pass", "incr_lsp_cross", "elapsed_ms",
+                         itoa_buf_incr((int)elapsed_ms_incr(t)));
+            if (rc != 0) {
+                cbm_log_error("incremental.err", "phase", "incr_lsp_cross", "rc",
+                              itoa_buf_incr(rc));
+                return rc;
+            }
+        }
         rc = cbm_pipeline_pass_calls(ctx, changed_files, ci);
         if (rc != 0) {
             cbm_log_error("incremental.err", "phase", "incr_calls", "rc", itoa_buf_incr(rc));
@@ -848,13 +859,17 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
         !pass_fingerprint || !applied) {
         return CBM_STORE_OK;
     }
-    if (deleted_count != 0 || cbm_pipeline_get_mode(p) < CBM_MODE_FAST ||
+    if (deleted_count != 0 || changed_count > CBM_PIPELINE_EXACT_DELTA_MAX_CHANGED_PATHS ||
+        cbm_pipeline_get_mode(p) < CBM_MODE_FAST ||
         changed_count > CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS) {
         cbm_log_info("incremental.exact.skip", "reason",
                      deleted_count != 0
                          ? "has_deletes"
-                         : (cbm_pipeline_get_mode(p) < CBM_MODE_FAST ? "global_derived_edges"
-                                                                      : "frontier_too_large"));
+                         : (changed_count > CBM_PIPELINE_EXACT_DELTA_MAX_CHANGED_PATHS
+                                ? "changed_batch_too_large"
+                                : (cbm_pipeline_get_mode(p) < CBM_MODE_FAST
+                                       ? "global_derived_edges"
+                                       : "frontier_too_large")));
         return CBM_STORE_OK;
     }
 
@@ -865,15 +880,17 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     cbm_path_alias_collection_t *path_aliases = NULL;
     cbm_pipeline_file_delta_t *deltas = NULL;
     const cbm_pipeline_file_delta_t **delta_ptrs = NULL;
+    CBMFileResult **result_cache = NULL;
     cbm_pipeline_file_delta_plan_t plan = {0};
     int64_t generation = 0;
 
     changed_paths = malloc((size_t)changed_count * sizeof(*changed_paths));
     deltas = calloc((size_t)changed_count, sizeof(*deltas));
     delta_ptrs = malloc((size_t)changed_count * sizeof(*delta_ptrs));
+    result_cache = calloc((size_t)changed_count, sizeof(*result_cache));
     scratch = cbm_gbuf_new(project, cbm_pipeline_repo_path(p));
     registry = cbm_registry_new();
-    if (!changed_paths || !deltas || !delta_ptrs || !scratch || !registry) {
+    if (!changed_paths || !deltas || !delta_ptrs || !result_cache || !scratch || !registry) {
         cbm_log_info("incremental.exact.fallback", "reason", "alloc");
         goto cleanup;
     }
@@ -907,6 +924,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
         .githistory_min_coupling = cbm_pipeline_githistory_min_coupling(p),
         .lsp_confidence_floor = cbm_pipeline_lsp_confidence_floor(p),
         .path_aliases = path_aliases,
+        .result_cache = result_cache,
     };
 
     const char *structure_root_qn = incremental_structure_root_qn(scratch, project);
@@ -1010,6 +1028,7 @@ cleanup:
     cbm_pipeline_file_delta_plan_free(&plan);
     free(delta_ptrs);
     incr_free_file_deltas(deltas, changed_count);
+    incr_free_result_cache(result_cache, changed_count);
     cbm_path_alias_collection_free(path_aliases);
     cbm_registry_free(registry);
     cbm_gbuf_free(scratch);

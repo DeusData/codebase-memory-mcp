@@ -7571,6 +7571,56 @@ static int pipeline_store_file_state_generation(const char *db_path, const char 
     return rc;
 }
 
+static int pipeline_compare_current_db_to_fresh_fast_rebuild(const char *repo_path,
+                                                             const char *db_path,
+                                                             const char *project,
+                                                             cbm_config_t *cfg, char *err,
+                                                             size_t err_sz) {
+    char exact_db[CBM_SZ_512];
+    int n = snprintf(exact_db, sizeof(exact_db), "%s/exact-upsert.db", repo_path);
+    if (n < 0 || (size_t)n >= sizeof(exact_db)) {
+        if (err && err_sz > 0) {
+            snprintf(err, err_sz, "exact snapshot path overflow");
+        }
+        return CBM_STORE_ERR;
+    }
+    cbm_unlink(exact_db);
+    int rc = pipeline_dump_store_file_to_file(db_path, exact_db);
+    if (rc != CBM_STORE_OK) {
+        if (err && err_sz > 0) {
+            snprintf(err, err_sz, "exact snapshot dump failed: rc=%d", rc);
+        }
+        cbm_unlink(exact_db);
+        return rc;
+    }
+
+    cbm_unlink(db_path);
+    cbm_pipeline_t *p = cbm_pipeline_new(repo_path, db_path, CBM_MODE_FAST);
+    if (!p) {
+        if (err && err_sz > 0) {
+            snprintf(err, err_sz, "fresh FAST pipeline allocation failed");
+        }
+        cbm_unlink(exact_db);
+        return CBM_STORE_ERR;
+    }
+    cbm_pipeline_apply_config(p, cfg);
+    int run_rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    if (run_rc != 0) {
+        if (err && err_sz > 0) {
+            snprintf(err, err_sz, "fresh FAST rebuild failed: rc=%d", run_rc);
+        }
+        cbm_unlink(exact_db);
+        return CBM_STORE_ERR;
+    }
+
+    rc = cbm_test_compare_canonical_graphs(exact_db, db_path, project, err, err_sz);
+    if (rc == 0) {
+        cbm_unlink(exact_db);
+    }
+    return rc;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  FastAPI Depends() edge tracking (PR #66, fix #27)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -8051,27 +8101,76 @@ TEST(incremental_fast_exact_upsert_matches_full_rebuild) {
               CBM_STORE_OK);
     ASSERT_GT(generation, CBM_PIPELINE_COMPAT_GENERATION);
 
-    char exact_db[CBM_SZ_512];
-    n = snprintf(exact_db, sizeof(exact_db), "%s/exact-upsert.db", g_incr_tmpdir);
-    ASSERT(n >= 0 && (size_t)n < sizeof(exact_db));
-    cbm_unlink(exact_db);
-    ASSERT_EQ(pipeline_dump_store_file_to_file(g_incr_dbpath, exact_db), CBM_STORE_OK);
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        printf("    [exact-upsert-diff] %s\n", diff_err);
+    }
+    ASSERT_EQ(diff_rc, 0);
 
-    cbm_unlink(g_incr_dbpath);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_multi_file_batch_falls_back_to_full_rebuild_parity) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/main.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func main() {\n\tHelper()\n\tNewHelper()\n}\n\n"
+                            "func NewMain() int {\n\treturn 11\n}\n"),
+              0);
+    n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Helper() string {\n\treturn \"updated\"\n}\n\n"
+                            "func NewHelper() int {\n\treturn 13\n}\n"),
+              0);
+
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
     cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
 
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "NewMain"));
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "NewHelper"));
+    int64_t main_generation = 0;
+    int64_t helper_generation = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "main.go",
+                                                   &main_generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper.go",
+                                                   &helper_generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(main_generation, CBM_PIPELINE_COMPAT_GENERATION);
+    ASSERT_EQ(main_generation, helper_generation);
+
     char diff_err[CBM_SZ_8K] = {0};
-    int diff_rc =
-        cbm_test_compare_canonical_graphs(exact_db, g_incr_dbpath, project, diff_err,
-                                          sizeof(diff_err));
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
     if (diff_rc != 0) {
-        printf("    [exact-upsert-diff] %s\n", diff_err);
+        printf("    [multi-file-fallback-diff] %s\n", diff_err);
     }
-    cbm_unlink(exact_db);
     ASSERT_EQ(diff_rc, 0);
 
     free(project);
@@ -9969,6 +10068,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_detects_changed_file);
     RUN_TEST(incremental_fast_exact_upsert_matches_full_rebuild);
+    RUN_TEST(incremental_fast_multi_file_batch_falls_back_to_full_rebuild_parity);
     RUN_TEST(incremental_full_mode_keeps_exact_upsert_disabled);
     RUN_TEST(incremental_detects_same_size_rewrite_with_preserved_mtime);
     RUN_TEST(incremental_missing_file_state_keeps_legacy_metadata_path);
