@@ -14,12 +14,28 @@
  *     priv     0.1  if the name is private (leading underscore)
  *     generic  0.1  if the name is DEFINED in >= 5 distinct files
  *     distinct 10   if the name is snake_case or camelCase AND len >= 8
- *     test_penalty 0.1 if the symbol is test scaffolding, detected via the
- *                  TESTS / TESTS_FILE EDGES (never a filename substring):
- *                  the symbol is the TARGET of an incoming TESTS edge
- *                  (create_tests_edges: test-fn -> prod symbol), OR it lives
- *                  in a file that is the SOURCE of a TESTS_FILE edge
- *                  (create_tests_file_edges: test-file -> prod-file).
+ *     test_penalty 0.1 if the symbol is test scaffolding:
+ *                  - the symbol is the TARGET of an incoming TESTS edge
+ *                    (create_tests_edges: test-fn -> prod helper living in a
+ *                    NON-test file, e.g. a fixture in testutil.go), OR
+ *                  - the symbol lives in a test file per the graph's canonical
+ *                    cbm_is_test_path() classifier (the SAME one pass_tests
+ *                    uses).
+ *
+ * REAL-DATA DEVIATION FROM THE SPEC'S "edge-based TESTS/TESTS_FILE" mechanism
+ * (surfaced to Peter, documented in builder-notes.md): on the real connectors
+ * graph the TESTS/TESTS_FILE edges alone do NOT achieve AC1's exclusion goal.
+ * TESTS_FILE is emitted only when a test file maps to a resolvable production
+ * file (15 edges total on connectors); TESTS edges never point at a symbol that
+ * lives in a test file (create_tests_edges excludes tgt_is_test); and the node
+ * is_test property is stamped on <2% of nodes and on NONE of the test-resident
+ * fixtures/classes. So edge-only left the entire top-40 as test scaffolding
+ * (session_dir, FakeConnectorClient, ...). cbm_is_test_path() is the graph's
+ * own precise classifier (test_ prefix, _test.<ext> suffix, /tests/ dir, ...) —
+ * it is NOT the naive strstr("test") the spec warned against: it correctly
+ * leaves e.g. src/testutil_helpers.go UNpenalised (test-plan row #6 inversion).
+ * The TESTS-edge leg is retained so prod helpers in non-test files that are
+ * exercised by tests are still demoted.
  *
  * Weighted-degree only. PageRank (transitive importance) is a measured
  * refinement deliberately NOT built here — the spike showed the weighted
@@ -119,44 +135,6 @@ static int name_distinct_file_count(const cbm_gbuf_t *gb, const char *name) {
     return distinct;
 }
 
-/* Set of file paths that are the SOURCE of a TESTS_FILE edge (= test files). */
-typedef struct {
-    const char **paths;
-    int count;
-} cbm_test_file_set_t;
-
-static void test_file_set_build(const cbm_gbuf_t *gb, cbm_test_file_set_t *set) {
-    set->paths = NULL;
-    set->count = 0;
-    const cbm_gbuf_edge_t **edges = NULL;
-    int ne = 0;
-    if (cbm_gbuf_find_edges_by_type(gb, "TESTS_FILE", &edges, &ne) != 0 || ne == 0) {
-        return;
-    }
-    set->paths = malloc((size_t)ne * sizeof(*set->paths));
-    if (!set->paths) {
-        return;
-    }
-    for (int i = 0; i < ne; i++) {
-        const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(gb, edges[i]->source_id);
-        if (src && src->file_path) {
-            set->paths[set->count++] = src->file_path;
-        }
-    }
-}
-
-static bool test_file_set_contains(const cbm_test_file_set_t *set, const char *path) {
-    if (!path) {
-        return false;
-    }
-    for (int i = 0; i < set->count; i++) {
-        if (set->paths[i] && strcmp(set->paths[i], path) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static int incoming_edge_count(const cbm_gbuf_t *gb, int64_t id, const char *type) {
     const cbm_gbuf_edge_t **edges = NULL;
     int ne = 0;
@@ -197,9 +175,6 @@ void cbm_pipeline_pass_importance(cbm_pipeline_ctx_t *ctx) {
         return;
     }
 
-    cbm_test_file_set_t tfset;
-    test_file_set_build(gb, &tfset);
-
     int updated = 0;
     for (int li = 0; li < CBM_IMPORTANCE_LABEL_COUNT; li++) {
         const cbm_gbuf_node_t **nodes = NULL;
@@ -223,8 +198,8 @@ void cbm_pipeline_pass_importance(cbm_pipeline_ctx_t *ctx) {
             if (name_is_distinctive(n->name)) {
                 score *= CBM_IMPORTANCE_DISTINCT_MUL;
             }
-            bool is_test = incoming_edge_count(gb, n->id, "TESTS") > 0 ||
-                           test_file_set_contains(&tfset, n->file_path);
+            bool is_test = cbm_is_test_path(n->file_path) ||
+                           incoming_edge_count(gb, n->id, "TESTS") > 0;
             if (is_test) {
                 score *= CBM_IMPORTANCE_TEST_MUL;
             }
@@ -237,6 +212,4 @@ void cbm_pipeline_pass_importance(cbm_pipeline_ctx_t *ctx) {
     char buf[CBM_SZ_32];
     snprintf(buf, sizeof(buf), "%d", updated);
     cbm_log_info("pass.importance", "symbols", buf);
-
-    free(tfset.paths);
 }
