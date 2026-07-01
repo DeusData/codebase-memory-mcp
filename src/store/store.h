@@ -423,6 +423,14 @@ int cbm_store_find_nodes_by_name_any(cbm_store_t *s, const char *name, cbm_node_
 int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
                                   cbm_node_t **out, int *count);
 
+/* Visit lightweight node identity rows for a label without allocating full
+ * cbm_node_t values. Callback strings are borrowed until the next callback. */
+typedef int (*cbm_store_node_identity_visitor_fn)(const char *label, const char *name,
+                                                  const char *qualified_name,
+                                                  const char *file_path, void *userdata);
+int cbm_store_visit_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
+                                   cbm_store_node_identity_visitor_fn visitor, void *userdata);
+
 /* Find nodes by file path. */
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,
                                  cbm_node_t **out, int *count);

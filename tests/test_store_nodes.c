@@ -423,6 +423,82 @@ TEST(store_node_find_by_label) {
     PASS();
 }
 
+typedef struct {
+    int count;
+    int saw_a;
+    int saw_c;
+    int saw_other_project;
+} store_visit_nodes_by_label_ctx_t;
+
+static int store_visit_nodes_by_label_cb(const char *label, const char *name,
+                                         const char *qualified_name, const char *file_path,
+                                         void *userdata) {
+    store_visit_nodes_by_label_ctx_t *ctx = (store_visit_nodes_by_label_ctx_t *)userdata;
+    if (!ctx || !label || !name || !qualified_name || !file_path) {
+        return CBM_STORE_ERR;
+    }
+    ctx->count++;
+    if (strcmp(label, "Function") != 0) {
+        return CBM_STORE_ERR;
+    }
+    if (strcmp(name, "A") == 0 && strcmp(qualified_name, "test.A") == 0 &&
+        strcmp(file_path, "main.go") == 0) {
+        ctx->saw_a = 1;
+    }
+    if (strcmp(name, "C") == 0 && strcmp(qualified_name, "test.C") == 0 &&
+        strcmp(file_path, "util.go") == 0) {
+        ctx->saw_c = 1;
+    }
+    if (strcmp(qualified_name, "other.A") == 0) {
+        ctx->saw_other_project = 1;
+    }
+    return CBM_STORE_OK;
+}
+
+TEST(store_visit_nodes_by_label_identity_rows) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_store_upsert_project(s, "other", "/tmp/other");
+
+    cbm_node_t n1 = {.project = "test",
+                     .label = "Function",
+                     .name = "A",
+                     .qualified_name = "test.A",
+                     .file_path = "main.go",
+                     .properties_json = "{\"ignored\":true}"};
+    cbm_node_t n2 = {.project = "test",
+                     .label = "Class",
+                     .name = "B",
+                     .qualified_name = "test.B",
+                     .file_path = "main.go"};
+    cbm_node_t n3 = {.project = "test",
+                     .label = "Function",
+                     .name = "C",
+                     .qualified_name = "test.C",
+                     .file_path = "util.go"};
+    cbm_node_t n4 = {.project = "other",
+                     .label = "Function",
+                     .name = "A",
+                     .qualified_name = "other.A",
+                     .file_path = "main.go"};
+    cbm_store_upsert_node(s, &n1);
+    cbm_store_upsert_node(s, &n2);
+    cbm_store_upsert_node(s, &n3);
+    cbm_store_upsert_node(s, &n4);
+
+    store_visit_nodes_by_label_ctx_t ctx = {0};
+    int rc = cbm_store_visit_nodes_by_label(s, "test", "Function",
+                                            store_visit_nodes_by_label_cb, &ctx);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(ctx.count, 2);
+    ASSERT_EQ(ctx.saw_a, 1);
+    ASSERT_EQ(ctx.saw_c, 1);
+    ASSERT_EQ(ctx.saw_other_project, 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_node_find_by_file) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
@@ -3366,6 +3442,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_crud);
     RUN_TEST(store_node_dedup);
     RUN_TEST(store_node_find_by_label);
+    RUN_TEST(store_visit_nodes_by_label_identity_rows);
     RUN_TEST(store_node_find_by_file);
     RUN_TEST(store_node_find_not_found);
     RUN_TEST(store_node_count_empty);
