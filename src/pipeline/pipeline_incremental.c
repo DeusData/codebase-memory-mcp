@@ -863,6 +863,79 @@ static void incr_mark_generation_failed(cbm_store_t *store, const char *project,
     }
 }
 
+static int incr_try_exact_delete_route(cbm_pipeline_t *p, cbm_store_t *store, const char *db_path,
+                                       const char *project, char **deleted, int deleted_count,
+                                       int changed_count, int *applied) {
+    if (applied) {
+        *applied = 0;
+    }
+    if (!p || !store || !db_path || !project || !deleted || !applied) {
+        return CBM_STORE_OK;
+    }
+    if (changed_count != 0 || deleted_count != 1 ||
+        cbm_pipeline_get_mode(p) < CBM_MODE_FAST) {
+        return CBM_STORE_OK;
+    }
+
+    const char *rel_path = deleted[0];
+    if (!rel_path || !rel_path[0]) {
+        cbm_log_info("incremental.exact.delete.fallback", "reason", "missing_rel_path");
+        return CBM_STORE_OK;
+    }
+
+    enum {
+        CBM_INCR_DELETE_DELTA_COUNT = 1,
+        CBM_INCR_DELETE_PREFLIGHT_GENERATION = CBM_PIPELINE_COMPAT_GENERATION + 1,
+    };
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = project,
+                  .rel_path = rel_path,
+                  .generation = CBM_INCR_DELETE_PREFLIGHT_GENERATION},
+        .change_kind = CBM_PIPELINE_DELTA_CHANGE_DELETE,
+    };
+    const cbm_pipeline_file_delta_t *delta_ptrs[] = {&delta};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    int rc = cbm_pipeline_plan_file_delta_batch(store, delta_ptrs, CBM_INCR_DELETE_DELTA_COUNT,
+                                                CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS,
+                                                &plan);
+    if (rc != CBM_STORE_OK || plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
+        cbm_log_info("incremental.exact.delete.fallback", "reason",
+                     plan.reason ? plan.reason : "plan_error");
+        cbm_pipeline_file_delta_plan_free(&plan);
+        return CBM_STORE_OK;
+    }
+    cbm_pipeline_file_delta_plan_free(&plan);
+
+    int64_t generation = 0;
+    rc = cbm_store_reserve_index_generation(store, project, NULL, NULL, &generation);
+    if (rc != CBM_STORE_OK || generation <= 0) {
+        cbm_log_info("incremental.exact.delete.fallback", "reason", "reserve_generation", "rc",
+                     itoa_buf_incr(rc));
+        return CBM_STORE_OK;
+    }
+    delta.delta.generation = generation;
+
+    rc = cbm_pipeline_apply_file_delta_batch(store, delta_ptrs, CBM_INCR_DELETE_DELTA_COUNT,
+                                             CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS, &plan);
+    if (rc != CBM_STORE_OK || plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
+        incr_mark_generation_failed(store, project, generation);
+        cbm_log_info("incremental.exact.delete.fallback", "reason",
+                     plan.reason ? plan.reason : "apply_error");
+        cbm_pipeline_file_delta_plan_free(&plan);
+        return CBM_STORE_OK;
+    }
+    cbm_pipeline_file_delta_plan_free(&plan);
+
+    cbm_pipeline_set_committed_counts(p, cbm_store_count_nodes(store, project),
+                                      cbm_store_count_edges(store, project));
+    if (cbm_pipeline_repo_path(p) && cbm_artifact_exists(cbm_pipeline_repo_path(p))) {
+        (void)cbm_artifact_export(db_path, cbm_pipeline_repo_path(p), project, CBM_ARTIFACT_FAST);
+    }
+    cbm_log_info("incremental.exact.delete.done", "files", "1");
+    *applied = 1;
+    return CBM_STORE_OK;
+}
+
 static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, const char *db_path,
                                        const char *project, cbm_file_info_t *changed_files,
                                        int changed_count, int deleted_count,
@@ -1181,6 +1254,15 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_file_info_t *changed_files = cls.changed_files;
     int ci = cls.changed_file_count;
     int exact_applied = 0;
+    (void)incr_try_exact_delete_route(p, store, db_path, project, cls.deleted, cls.deleted_count,
+                                      ci, &exact_applied);
+    if (exact_applied) {
+        incr_classification_free(&cls);
+        cbm_store_close(store);
+        cbm_log_info("incremental.done", "elapsed_ms", itoa_buf_incr((int)elapsed_ms_incr(t0)));
+        return 0;
+    }
+
     (void)incr_try_exact_upsert_route(p, store, db_path, project, changed_files, ci,
                                       cls.deleted_count, pass_fingerprint, &exact_applied);
     if (exact_applied) {
