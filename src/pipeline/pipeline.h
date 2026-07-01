@@ -142,6 +142,7 @@ bool cbm_pipeline_graph_changed(const cbm_pipeline_t *p);
  * that need derived-view policy decisions; it does not change graph contents. */
 cbm_pipeline_publish_kind_t cbm_pipeline_publish_kind(const cbm_pipeline_t *p);
 const char *cbm_pipeline_publish_kind_name(cbm_pipeline_publish_kind_t kind);
+const char *cbm_pipeline_publish_reason(const cbm_pipeline_t *p);
 
 /* ── Index lock (prevents concurrent pipeline runs on same DB) ──── */
 

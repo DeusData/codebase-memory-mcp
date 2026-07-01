@@ -8694,6 +8694,7 @@ TEST(incremental_fast_falls_back_for_inbound_transitive_complexity_and_matches_f
     ASSERT(strstr(logs, "msg=incremental.exact.fallback reason=inbound_edges_require_full") !=
            NULL);
     ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "inbound_edges_require_full");
     cbm_pipeline_free(p);
 
     char diff_err[CBM_SZ_8K] = {0};
@@ -8760,6 +8761,7 @@ TEST(incremental_fast_three_file_batch_falls_back_to_full_rebuild_parity) {
     cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "changed_batch_too_large");
     cbm_pipeline_free(p);
 
     ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "NewMain"));

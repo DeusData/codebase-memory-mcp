@@ -118,6 +118,7 @@ struct cbm_pipeline {
     int committed_edges;
     bool graph_changed;
     cbm_pipeline_publish_kind_t publish_kind;
+    char *publish_reason;
 };
 
 /* ── Global pkgmap (one active pipeline at a time) ─────────────── */
@@ -189,6 +190,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->committed_edges = -1;
     p->graph_changed = false;
     p->publish_kind = CBM_PIPELINE_PUBLISH_NONE;
+    p->publish_reason = NULL;
     atomic_init(&p->cancelled, 0);
 
     return p;
@@ -325,6 +327,7 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     free(p->repo_path);
     free(p->db_path);
     free(p->project_name);
+    free(p->publish_reason);
     cbm_discover_free_excluded(p->excluded_dirs, p->excluded_count);
     p->excluded_dirs = NULL;
     p->excluded_count = 0;
@@ -403,6 +406,10 @@ cbm_pipeline_publish_kind_t cbm_pipeline_publish_kind(const cbm_pipeline_t *p) {
     return p ? p->publish_kind : CBM_PIPELINE_PUBLISH_NONE;
 }
 
+const char *cbm_pipeline_publish_reason(const cbm_pipeline_t *p) {
+    return p ? p->publish_reason : NULL;
+}
+
 const char *cbm_pipeline_publish_kind_name(cbm_pipeline_publish_kind_t kind) {
     switch (kind) {
     case CBM_PIPELINE_PUBLISH_NONE:
@@ -430,6 +437,15 @@ void cbm_pipeline_set_publish_kind(cbm_pipeline_t *p, cbm_pipeline_publish_kind_
     if (p) {
         p->publish_kind = kind;
     }
+}
+
+void cbm_pipeline_set_publish_reason(cbm_pipeline_t *p, const char *reason) {
+    if (!p) {
+        return;
+    }
+    char *next = (reason && reason[0]) ? cbm_strdup(reason) : NULL;
+    free(p->publish_reason);
+    p->publish_reason = next;
 }
 
 static bool resolve_db_path_buf(const cbm_pipeline_t *p, char *path, size_t path_sz) {
@@ -1272,6 +1288,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     }
     p->graph_changed = false;
     p->publish_kind = CBM_PIPELINE_PUBLISH_NONE;
+    cbm_pipeline_set_publish_reason(p, NULL);
     p->committed_nodes = -1;
     p->committed_edges = -1;
 

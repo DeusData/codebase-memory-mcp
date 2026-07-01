@@ -274,6 +274,11 @@ def response_publish_kind(data: dict[str, Any]) -> str:
     return publish_kind if isinstance(publish_kind, str) else ""
 
 
+def response_publish_reason(data: dict[str, Any]) -> str:
+    publish_reason = data.get("publish_reason")
+    return publish_reason if isinstance(publish_reason, str) else ""
+
+
 def is_incremental_publish_kind(publish_kind: str) -> bool:
     return publish_kind in {
         PUBLISH_INCREMENTAL_NOOP,
@@ -337,6 +342,7 @@ def build_index_result(
         "incremental_done": parse_logged_elapsed_ms(stderr, "incremental.done"),
     }
     indexed_ms = indexed_work_elapsed_ms(logged_elapsed_ms)
+    publish_reason = response_publish_reason(data)
     result: dict[str, Any] = {
         "elapsed_ms": elapsed_ms_int,
         "indexed_work_elapsed_ms": indexed_ms,
@@ -357,7 +363,7 @@ def build_index_result(
             or is_incremental_publish_kind(publish_kind),
         },
         "logged_elapsed_ms": logged_elapsed_ms,
-        "exact_reason": parse_exact_reason(stderr),
+        "exact_reason": publish_reason or parse_exact_reason(stderr),
         "stderr_tail": log_tail(stderr),
     }
     if include_logs:
