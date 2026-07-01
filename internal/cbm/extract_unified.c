@@ -103,8 +103,8 @@ static const char *compute_ocaml_func_qn(CBMExtractCtx *ctx, TSNode node) {
     return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
 }
 
-// Resolve the name node for a function, handling arrow functions.
-static TSNode resolve_func_name_node(TSNode node) {
+// Resolve the name node for function-scope attribution.
+static TSNode resolve_func_name_node(TSNode node, CBMLanguage lang) {
     TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
     if (ts_node_is_null(name_node) && strcmp(ts_node_type(node), "arrow_function") == 0) {
         TSNode parent = ts_node_parent(node);
@@ -116,6 +116,35 @@ static TSNode resolve_func_name_node(TSNode node) {
      * function name is a simple_identifier child of function_declaration. */
     if (ts_node_is_null(name_node) && strcmp(ts_node_type(node), "function_declaration") == 0) {
         name_node = cbm_find_child_by_kind(node, "simple_identifier");
+    }
+    if (ts_node_is_null(name_node) && lang == CBM_LANG_JULIA &&
+        strcmp(ts_node_type(node), "assignment") == 0 && ts_node_named_child_count(node) > 0) {
+        TSNode lhs = ts_node_named_child(node, 0);
+        if (!ts_node_is_null(lhs) && strcmp(ts_node_type(lhs), "call_expression") == 0) {
+            enum { JULIA_CALL_HEAD_MAX_DESCENT = 8 };
+            TSNode cur = lhs;
+            for (int depth = 0; depth < JULIA_CALL_HEAD_MAX_DESCENT &&
+                                !ts_node_is_null(cur) && ts_node_named_child_count(cur) > 0;
+                 depth++) {
+                TSNode first = ts_node_named_child(cur, 0);
+                const char *kind = ts_node_type(first);
+                if (strcmp(kind, "identifier") == 0 ||
+                    strcmp(kind, "operator_identifier") == 0) {
+                    name_node = first;
+                    break;
+                }
+                cur = first;
+            }
+        }
+    }
+    if (ts_node_is_null(name_node) && lang == CBM_LANG_SCSS) {
+        name_node = cbm_find_child_by_kind(node, "function_name");
+        if (ts_node_is_null(name_node)) {
+            name_node = cbm_find_child_by_kind(node, "name");
+        }
+        if (ts_node_is_null(name_node)) {
+            name_node = cbm_find_child_by_kind(node, "identifier");
+        }
     }
     return name_node;
 }
@@ -130,8 +159,30 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
     if (ctx->language == CBM_LANG_OCAML) {
         return compute_ocaml_func_qn(ctx, node);
     }
+    if (ctx->language == CBM_LANG_AGDA && strcmp(ts_node_type(node), "function") == 0) {
+        TSNode lhs = cbm_find_child_by_kind(node, "lhs");
+        if (!ts_node_is_null(lhs)) {
+            TSNode name_node = cbm_find_child_by_kind(lhs, "function_name");
+            if (ts_node_is_null(name_node)) {
+                enum { AGDA_LHS_HEAD_MAX_DESCENT = 8 };
+                TSNode cur = lhs;
+                for (int hop = 0; hop < AGDA_LHS_HEAD_MAX_DESCENT &&
+                                  !ts_node_is_null(cur) && ts_node_named_child_count(cur) > 0;
+                     hop++) {
+                    cur = ts_node_named_child(cur, 0);
+                }
+                name_node = cur;
+            }
+            if (!ts_node_is_null(name_node)) {
+                char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
+                if (name && name[0]) {
+                    return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+                }
+            }
+        }
+    }
 
-    TSNode name_node = resolve_func_name_node(node);
+    TSNode name_node = resolve_func_name_node(node, ctx->language);
     if (ts_node_is_null(name_node)) {
         return NULL;
     }

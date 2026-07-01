@@ -931,6 +931,31 @@ TEST(ocaml_nested_let_call_attributed_to_outer_function) {
     PASS();
 }
 
+TEST(purescript_exp_apply_call_edge) {
+    CBMFileResult *r = extract("module Main where\n\ngreet name = name\nmain = greet \"world\"\n",
+                               CBM_LANG_PURESCRIPT, "t", "Main.purs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call(r, "greet"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(agda_body_call_attributed_to_function) {
+    CBMFileResult *r = extract("module M where\n"
+                               "postulate Nat : Set\n"
+                               "add : Nat -> Nat -> Nat\n"
+                               "add x y = x\n"
+                               "compute : Nat -> Nat\n"
+                               "compute x = add x x\n",
+                               CBM_LANG_AGDA, "t", "M.agda");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_enclosing(r, "add", "compute", NULL));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Erlang --- */
 TEST(erlang_function) {
     CBMFileResult *r = extract(
@@ -1082,6 +1107,19 @@ TEST(julia_function) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Function", "add"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(julia_short_form_assignment_function) {
+    CBMFileResult *r = extract("helper(x) = x + 1\nrun(y) = helper(y)\nvalue = 5\n",
+                               CBM_LANG_JULIA, "t", "math.jl");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "helper"));
+    ASSERT(has_def(r, "Function", "run"));
+    ASSERT_FALSE(has_def(r, "Function", "value"));
+    ASSERT(has_call_enclosing(r, "helper", "run", NULL));
     cbm_free_result(r);
     PASS();
 }
@@ -1488,6 +1526,18 @@ TEST(scss_rules) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_GTE(r->defs.count, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(scss_function_call_edge) {
+    CBMFileResult *r =
+        extract("@function double($x) { @return $x * 2; }\n"
+                "@function use-double($x) { @return double($x); }\n",
+                CBM_LANG_SCSS, "t", "styles.scss");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_enclosing(r, "double", "use-double", NULL));
     cbm_free_result(r);
     PASS();
 }
@@ -3099,6 +3149,8 @@ SUITE(extraction) {
     RUN_TEST(haskell_function);
     RUN_TEST(ocaml_function);
     RUN_TEST(ocaml_nested_let_call_attributed_to_outer_function);
+    RUN_TEST(purescript_exp_apply_call_edge);
+    RUN_TEST(agda_body_call_attributed_to_function);
     RUN_TEST(erlang_function);
 
     /* Markup/Config */
@@ -3117,6 +3169,7 @@ SUITE(extraction) {
     /* v0.5 expansion */
     RUN_TEST(fsharp_function);
     RUN_TEST(julia_function);
+    RUN_TEST(julia_short_form_assignment_function);
     RUN_TEST(elm_function);
     RUN_TEST(nix_function);
     RUN_TEST(fortran_function);
@@ -3152,6 +3205,7 @@ SUITE(extraction) {
     RUN_TEST(meson_project);
     RUN_TEST(css_rules);
     RUN_TEST(scss_rules);
+    RUN_TEST(scss_function_call_edge);
     RUN_TEST(toml_basic);
     RUN_TEST(cmake_function);
     RUN_TEST(json_object);

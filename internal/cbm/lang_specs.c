@@ -714,7 +714,10 @@ static const char *fsharp_branch_types[] = {"if_expression",    "for_expression"
 static const char *fsharp_var_types[] = {"value_declaration", NULL};
 
 // ==================== JULIA ====================
-static const char *julia_func_types[] = {"function_definition", "short_function_definition", NULL};
+/* Julia short-form `f(x) = body` parses as assignment with a call_expression LHS.
+ * Name resolution rejects plain assignments, so variables are not function defs. */
+static const char *julia_func_types[] = {"function_definition", "short_function_definition",
+                                         "assignment", NULL};
 static const char *julia_class_types[] = {"struct_definition", "abstract_definition",
                                           "primitive_definition", NULL};
 static const char *julia_module_types[] = {"source_file", NULL};
@@ -1119,7 +1122,7 @@ static const char *ada_throw_types[] = {"raise_statement", NULL};
 static const char *ada_module_types[] = {"compilation", NULL};
 static const char *agda_func_types[] = {"function", NULL};
 static const char *agda_class_types[] = {"data", "record", NULL};
-static const char *agda_call_types[] = {"module_application", NULL};
+static const char *agda_call_types[] = {"module_application", "expr", NULL};
 static const char *agda_import_types[] = {"import", "open", "import_directive", "instance", NULL};
 static const char *agda_branch_types[] = {"lambda", "match", "do", NULL};
 static const char *agda_var_types[] = {"typed_binding", NULL};
