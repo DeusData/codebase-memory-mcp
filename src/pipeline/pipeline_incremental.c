@@ -819,6 +819,204 @@ static const char *incremental_structure_root_qn(cbm_gbuf_t *gbuf, const char *p
     return project;
 }
 
+static void incr_free_file_deltas(cbm_pipeline_file_delta_t *deltas, int count) {
+    if (!deltas) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        cbm_pipeline_file_delta_free(&deltas[i]);
+    }
+    free(deltas);
+}
+
+static void incr_mark_generation_failed(cbm_store_t *store, const char *project,
+                                        int64_t generation) {
+    if (store && project && generation > 0) {
+        (void)cbm_store_finish_index_generation(store, project, generation,
+                                                CBM_STORE_INDEX_STATUS_FAILED);
+    }
+}
+
+static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, const char *db_path,
+                                       const char *project, cbm_file_info_t *changed_files,
+                                       int changed_count, int deleted_count,
+                                       const char *pass_fingerprint, int *applied) {
+    if (applied) {
+        *applied = 0;
+    }
+    if (!p || !store || !db_path || !project || !changed_files || changed_count <= 0 ||
+        !pass_fingerprint || !applied) {
+        return CBM_STORE_OK;
+    }
+    if (deleted_count != 0 || cbm_pipeline_get_mode(p) < CBM_MODE_FAST ||
+        changed_count > CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS) {
+        cbm_log_info("incremental.exact.skip", "reason",
+                     deleted_count != 0
+                         ? "has_deletes"
+                         : (cbm_pipeline_get_mode(p) < CBM_MODE_FAST ? "global_derived_edges"
+                                                                      : "frontier_too_large"));
+        return CBM_STORE_OK;
+    }
+
+    int rc = CBM_STORE_OK;
+    const char **changed_paths = NULL;
+    cbm_gbuf_t *scratch = NULL;
+    cbm_registry_t *registry = NULL;
+    cbm_path_alias_collection_t *path_aliases = NULL;
+    cbm_pipeline_file_delta_t *deltas = NULL;
+    const cbm_pipeline_file_delta_t **delta_ptrs = NULL;
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    int64_t generation = 0;
+
+    changed_paths = malloc((size_t)changed_count * sizeof(*changed_paths));
+    deltas = calloc((size_t)changed_count, sizeof(*deltas));
+    delta_ptrs = malloc((size_t)changed_count * sizeof(*delta_ptrs));
+    scratch = cbm_gbuf_new(project, cbm_pipeline_repo_path(p));
+    registry = cbm_registry_new();
+    if (!changed_paths || !deltas || !delta_ptrs || !scratch || !registry) {
+        cbm_log_info("incremental.exact.fallback", "reason", "alloc");
+        goto cleanup;
+    }
+    for (int i = 0; i < changed_count; i++) {
+        if (!changed_files[i].rel_path) {
+            cbm_log_info("incremental.exact.fallback", "reason", "missing_rel_path");
+            goto cleanup;
+        }
+        changed_paths[i] = changed_files[i].rel_path;
+    }
+
+    rc = cbm_pipeline_seed_file_delta_scratch_from_store(
+        store, scratch, registry, project, changed_paths, changed_count);
+    if (rc != CBM_STORE_OK) {
+        cbm_log_info("incremental.exact.fallback", "reason", "scratch_seed", "rc",
+                     itoa_buf_incr(rc));
+        goto cleanup;
+    }
+
+    path_aliases = cbm_load_path_aliases(cbm_pipeline_repo_path(p));
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = project,
+        .repo_path = cbm_pipeline_repo_path(p),
+        .gbuf = scratch,
+        .registry = registry,
+        .cancelled = cbm_pipeline_cancelled_ptr(p),
+        .mode = cbm_pipeline_get_mode(p),
+        .similarity_threshold = cbm_pipeline_similarity_threshold(p),
+        .httplink_min_confidence = cbm_pipeline_httplink_min_confidence(p),
+        .semantic_threshold = cbm_pipeline_semantic_threshold(p),
+        .githistory_min_coupling = cbm_pipeline_githistory_min_coupling(p),
+        .lsp_confidence_floor = cbm_pipeline_lsp_confidence_floor(p),
+        .path_aliases = path_aliases,
+    };
+
+    const char *structure_root_qn = incremental_structure_root_qn(scratch, project);
+    for (int i = 0; i < changed_count; i++) {
+        rc = cbm_pipeline_ensure_file_structure(scratch, project, structure_root_qn,
+                                                changed_files[i].rel_path, NULL);
+        if (rc != 0) {
+            cbm_log_info("incremental.exact.fallback", "reason", "ensure_structure", "rc",
+                         itoa_buf_incr(rc));
+            goto cleanup;
+        }
+    }
+    rc = run_extract_resolve(&ctx, changed_files, changed_count);
+    if (rc != 0) {
+        cbm_log_info("incremental.exact.fallback", "reason", "extract_resolve", "rc",
+                     itoa_buf_incr(rc));
+        goto cleanup;
+    }
+    rc = cbm_pipeline_pass_k8s(&ctx, changed_files, changed_count);
+    if (rc != 0) {
+        cbm_log_info("incremental.exact.fallback", "reason", "k8s", "rc", itoa_buf_incr(rc));
+        goto cleanup;
+    }
+    rc = run_postpasses(&ctx, changed_files, changed_count, project);
+    if (rc != 0) {
+        cbm_log_info("incremental.exact.fallback", "reason", "postpasses", "rc",
+                     itoa_buf_incr(rc));
+        goto cleanup;
+    }
+    cbm_pipeline_pass_complexity(&ctx);
+    rc = cbm_pipeline_pass_httplinks(&ctx);
+    if (rc != 0) {
+        cbm_log_info("incremental.exact.fallback", "reason", "httplinks", "rc",
+                     itoa_buf_incr(rc));
+        goto cleanup;
+    }
+    cbm_pipeline_pass_normalize(scratch);
+
+    for (int i = 0; i < changed_count; i++) {
+        rc = cbm_pipeline_build_file_delta_from_gbuf(scratch, project, changed_files[i].rel_path,
+                                                     CBM_PIPELINE_COMPAT_GENERATION, &deltas[i]);
+        if (rc != CBM_STORE_OK) {
+            cbm_log_info("incremental.exact.fallback", "reason", "build_delta", "rc",
+                         itoa_buf_incr(rc));
+            goto cleanup;
+        }
+        rc = cbm_pipeline_attach_file_delta_metadata_with_fingerprint(&deltas[i],
+                                                                      &changed_files[i],
+                                                                      pass_fingerprint);
+        if (rc != CBM_STORE_OK) {
+            cbm_log_info("incremental.exact.fallback", "reason", "metadata", "rc",
+                         itoa_buf_incr(rc));
+            goto cleanup;
+        }
+        delta_ptrs[i] = &deltas[i];
+    }
+
+    rc = cbm_pipeline_plan_file_delta_batch(store, delta_ptrs, changed_count,
+                                            CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS, &plan);
+    if (rc != CBM_STORE_OK || plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
+        cbm_log_info("incremental.exact.fallback", "reason",
+                     plan.reason ? plan.reason : "plan_error");
+        goto cleanup;
+    }
+    cbm_pipeline_file_delta_plan_free(&plan);
+
+    rc = cbm_store_reserve_index_generation(store, project, NULL, NULL, &generation);
+    if (rc != CBM_STORE_OK || generation <= 0) {
+        cbm_log_info("incremental.exact.fallback", "reason", "reserve_generation", "rc",
+                     itoa_buf_incr(rc));
+        goto cleanup;
+    }
+    for (int i = 0; i < changed_count; i++) {
+        rc = cbm_pipeline_file_delta_stamp_generation(&deltas[i], generation);
+        if (rc != CBM_STORE_OK) {
+            incr_mark_generation_failed(store, project, generation);
+            cbm_log_info("incremental.exact.fallback", "reason", "stamp_generation", "rc",
+                         itoa_buf_incr(rc));
+            goto cleanup;
+        }
+    }
+
+    rc = cbm_pipeline_apply_file_delta_batch(store, delta_ptrs, changed_count,
+                                             CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS, &plan);
+    if (rc != CBM_STORE_OK || plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
+        incr_mark_generation_failed(store, project, generation);
+        cbm_log_info("incremental.exact.fallback", "reason",
+                     plan.reason ? plan.reason : "apply_error");
+        goto cleanup;
+    }
+
+    cbm_pipeline_set_committed_counts(p, cbm_store_count_nodes(store, project),
+                                      cbm_store_count_edges(store, project));
+    if (cbm_pipeline_repo_path(p) && cbm_artifact_exists(cbm_pipeline_repo_path(p))) {
+        (void)cbm_artifact_export(db_path, cbm_pipeline_repo_path(p), project, CBM_ARTIFACT_FAST);
+    }
+    cbm_log_info("incremental.exact.done", "files", itoa_buf_incr(changed_count));
+    *applied = 1;
+
+cleanup:
+    cbm_pipeline_file_delta_plan_free(&plan);
+    free(delta_ptrs);
+    incr_free_file_deltas(deltas, changed_count);
+    cbm_path_alias_collection_free(path_aliases);
+    cbm_registry_free(registry);
+    cbm_gbuf_free(scratch);
+    free(changed_paths);
+    return CBM_STORE_OK;
+}
+
 /* Atomically dump merged graph + hashes to disk.
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
  * reindexes can correctly distinguish "never indexed" from "indexed but
@@ -940,6 +1138,15 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     cbm_file_info_t *changed_files = cls.changed_files;
     int ci = cls.changed_file_count;
+    int exact_applied = 0;
+    (void)incr_try_exact_upsert_route(p, store, db_path, project, changed_files, ci,
+                                      cls.deleted_count, pass_fingerprint, &exact_applied);
+    if (exact_applied) {
+        incr_classification_free(&cls);
+        cbm_store_close(store);
+        cbm_log_info("incremental.done", "elapsed_ms", itoa_buf_incr((int)elapsed_ms_incr(t0)));
+        return 0;
+    }
 
     struct timespec t;
 

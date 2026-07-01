@@ -162,6 +162,10 @@ typedef struct {
     int affected_count;
 } cbm_pipeline_file_delta_plan_t;
 
+/* Conservative live exact-delta frontier cap. Larger affected sets fall back
+ * to the existing containment reindex path until broader parity benchmarks pass. */
+enum { CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS = CBM_SZ_4 };
+
 /* Get the current pipeline's package map (NULL if none). */
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
 void cbm_pipeline_set_pkgmap(CBMHashTable *map);
