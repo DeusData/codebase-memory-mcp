@@ -239,6 +239,9 @@ int cbm_pipeline_persist_file_states(cbm_store_t *store, const char *project,
 int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *project,
                                             const char *rel_path, int64_t generation,
                                             cbm_pipeline_file_delta_t *out);
+int cbm_pipeline_attach_file_delta_metadata_with_fingerprint(cbm_pipeline_file_delta_t *delta,
+                                                             const cbm_file_info_t *file,
+                                                             const char *pass_fingerprint);
 int cbm_pipeline_attach_file_delta_metadata(cbm_pipeline_file_delta_t *delta,
                                             const cbm_file_info_t *file);
 void cbm_pipeline_file_delta_free(cbm_pipeline_file_delta_t *delta);

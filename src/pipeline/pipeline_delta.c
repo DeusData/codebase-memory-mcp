@@ -488,8 +488,9 @@ int cbm_pipeline_persist_file_states(cbm_store_t *store, const char *project,
     return CBM_STORE_OK;
 }
 
-int cbm_pipeline_attach_file_delta_metadata(cbm_pipeline_file_delta_t *delta,
-                                            const cbm_file_info_t *file) {
+int cbm_pipeline_attach_file_delta_metadata_with_fingerprint(cbm_pipeline_file_delta_t *delta,
+                                                             const cbm_file_info_t *file,
+                                                             const char *pass_fingerprint) {
     if (!delta || !file || !file->path || !delta->delta.project || !delta->delta.rel_path ||
         delta->delta.generation < 0) {
         return CBM_STORE_ERR;
@@ -520,12 +521,19 @@ int cbm_pipeline_attach_file_delta_metadata(cbm_pipeline_file_delta_t *delta,
                                            .size = st.st_size,
                                            .language = cbm_language_name(file->language),
                                            .pass_fingerprint =
-                                               cbm_pipeline_file_delta_pass_fingerprint(),
+                                               pass_fingerprint ? pass_fingerprint
+                                                                : cbm_pipeline_file_delta_pass_fingerprint(),
                                            .generation = delta->delta.generation,
                                            .indexed_at = delta->file_indexed_at};
     delta->delta.file_hash = &delta->file_hash;
     delta->delta.file_state = &delta->file_state;
     return CBM_STORE_OK;
+}
+
+int cbm_pipeline_attach_file_delta_metadata(cbm_pipeline_file_delta_t *delta,
+                                            const cbm_file_info_t *file) {
+    return cbm_pipeline_attach_file_delta_metadata_with_fingerprint(
+        delta, file, cbm_pipeline_file_delta_pass_fingerprint());
 }
 
 void cbm_pipeline_file_delta_free(cbm_pipeline_file_delta_t *delta) {
