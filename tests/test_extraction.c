@@ -37,6 +37,16 @@ static int has_call(CBMFileResult *r, const char *callee) {
     return 0;
 }
 
+/* Check if any call exactly matches the given callee. */
+static int has_call_exact(CBMFileResult *r, const char *callee) {
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name &&
+            strcmp(r->calls.items[i].callee_name, callee) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 static int has_call_enclosing(CBMFileResult *r, const char *callee, const char *must_contain,
                               const char *must_not_contain) {
     for (int i = 0; i < r->calls.count; i++) {
@@ -376,6 +386,19 @@ TEST(java_interface) {
     PASS();
 }
 
+TEST(java_method_reference_emits_call_site) {
+    CBMFileResult *r = extract("import java.util.*;\n"
+                               "class App {\n"
+                               "  void run(List<String> xs) { xs.stream().map(String::trim); }\n"
+                               "}\n",
+                               CBM_LANG_JAVA, "t", "App.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "trim"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Regression for #279: a Java class declaring both `extends` and
  * `implements` must produce one INHERITS edge per base — the extends parent
  * AND every implements interface — with bare type names (not the keyword
@@ -571,6 +594,24 @@ TEST(kotlin_class) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Class", "User"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(kotlin_operator_and_convention_calls_emit_call_sites) {
+    CBMFileResult *r = extract("class Vec(val x: Int) {\n"
+                               "  operator fun plus(other: Vec): Vec = Vec(x + other.x)\n"
+                               "  operator fun component1(): Int = x\n"
+                               "}\n"
+                               "fun run(a: Vec, b: Vec) {\n"
+                               "  val c = a + b\n"
+                               "  val (x) = c\n"
+                               "}\n",
+                               CBM_LANG_KOTLIN, "t", "Vec.kt");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "plus"));
+    ASSERT(has_call_exact(r, "component1"));
     cbm_free_result(r);
     PASS();
 }
@@ -1324,6 +1365,27 @@ TEST(cpp_function) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_GTE(r->defs.count, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(cpp_operator_and_implicit_calls_emit_call_sites) {
+    CBMFileResult *r = extract("struct Vec {\n"
+                               "  Vec operator+(const Vec&) const;\n"
+                               "  operator bool() const;\n"
+                               "};\n"
+                               "void run(Vec a, Vec b, Vec *p) {\n"
+                               "  Vec c = a;\n"
+                               "  Vec d = a + b;\n"
+                               "  if (d) { delete p; }\n"
+                               "}\n",
+                               CBM_LANG_CPP, "t", "vec.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "Vec"));
+    ASSERT(has_call_exact(r, "operator+"));
+    ASSERT(has_call_exact(r, "operator bool"));
+    ASSERT(has_call_exact(r, "p"));
     cbm_free_result(r);
     PASS();
 }
@@ -3143,6 +3205,7 @@ SUITE(extraction) {
     RUN_TEST(java_class);
     RUN_TEST(java_method);
     RUN_TEST(java_interface);
+    RUN_TEST(java_method_reference_emits_call_site);
     RUN_TEST(java_class_extends_and_implements);
     RUN_TEST(python_class_base_extracted_bare);
     RUN_TEST(php_class);
@@ -3154,6 +3217,7 @@ SUITE(extraction) {
     RUN_TEST(swift_class);
     RUN_TEST(kotlin_function);
     RUN_TEST(kotlin_class);
+    RUN_TEST(kotlin_operator_and_convention_calls_emit_call_sites);
     RUN_TEST(scala_function);
     RUN_TEST(scala_class);
     RUN_TEST(dart_class);
@@ -3228,6 +3292,7 @@ SUITE(extraction) {
     RUN_TEST(rust_impl_call_attributed_to_method);
     RUN_TEST(zig_struct);
     RUN_TEST(cpp_function);
+    RUN_TEST(cpp_operator_and_implicit_calls_emit_call_sites);
     RUN_TEST(cpp_out_of_line_method_issue428);
     RUN_TEST(cobol_paragraph);
     RUN_TEST(verilog_module);
