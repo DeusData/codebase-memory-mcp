@@ -1638,6 +1638,8 @@ TEST(meson_project) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_GTE(r->defs.count, 1);
+    ASSERT(has_call_exact(r, "project"));
+    ASSERT(has_call_exact(r, "executable"));
     cbm_free_result(r);
     PASS();
 }
@@ -2189,6 +2191,18 @@ TEST(makefile_builtin_call_edges) {
     ASSERT_FALSE(r->has_error);
     ASSERT(has_call_exact(r, "wildcard"));
     ASSERT(has_call_exact(r, "shell"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(just_function_call_edge) {
+    CBMFileResult *r = extract("NAME := uppercase('hello')\n"
+                               "default:\n"
+                               "\techo {{ NAME }}\n",
+                               CBM_LANG_JUST, "test", "justfile");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "uppercase"));
     cbm_free_result(r);
     PASS();
 }
@@ -3430,6 +3444,7 @@ SUITE(extraction) {
     RUN_TEST(makefile_multiple_targets);
     RUN_TEST(makefile_variable_extraction);
     RUN_TEST(makefile_builtin_call_edges);
+    RUN_TEST(just_function_call_edge);
     RUN_TEST(puppet_function_call_edge);
     RUN_TEST(vimscript_function_extraction);
     RUN_TEST(vimscript_function_without_bang);
