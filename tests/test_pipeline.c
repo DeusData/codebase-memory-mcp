@@ -8007,7 +8007,7 @@ TEST(incremental_detects_changed_file) {
     PASS();
 }
 
-TEST(incremental_fast_exact_upsert_uses_positive_generation) {
+TEST(incremental_fast_exact_upsert_matches_full_rebuild) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
@@ -8050,6 +8050,29 @@ TEST(incremental_fast_exact_upsert_uses_positive_generation) {
                                                    &generation),
               CBM_STORE_OK);
     ASSERT_GT(generation, CBM_PIPELINE_COMPAT_GENERATION);
+
+    char exact_db[CBM_SZ_512];
+    n = snprintf(exact_db, sizeof(exact_db), "%s/exact-upsert.db", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(exact_db));
+    cbm_unlink(exact_db);
+    ASSERT_EQ(pipeline_dump_store_file_to_file(g_incr_dbpath, exact_db), CBM_STORE_OK);
+
+    cbm_unlink(g_incr_dbpath);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc =
+        cbm_test_compare_canonical_graphs(exact_db, g_incr_dbpath, project, diff_err,
+                                          sizeof(diff_err));
+    if (diff_rc != 0) {
+        printf("    [exact-upsert-diff] %s\n", diff_err);
+    }
+    cbm_unlink(exact_db);
+    ASSERT_EQ(diff_rc, 0);
 
     free(project);
     cbm_config_close(cfg);
@@ -9945,7 +9968,7 @@ SUITE(pipeline) {
     /* Incremental */
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_detects_changed_file);
-    RUN_TEST(incremental_fast_exact_upsert_uses_positive_generation);
+    RUN_TEST(incremental_fast_exact_upsert_matches_full_rebuild);
     RUN_TEST(incremental_full_mode_keeps_exact_upsert_disabled);
     RUN_TEST(incremental_detects_same_size_rewrite_with_preserved_mtime);
     RUN_TEST(incremental_missing_file_state_keeps_legacy_metadata_path);
