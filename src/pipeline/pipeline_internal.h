@@ -165,10 +165,10 @@ typedef struct {
 /* Conservative live exact-delta frontier cap. Larger affected sets fall back
  * to the existing containment reindex path until broader parity benchmarks pass. */
 enum { CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS = CBM_SZ_4 };
-/* Live exact upserts are currently limited to one changed file. Same-batch
- * cross-file usage parity is still under design, so multi-file batches fall
- * back before publish. */
-enum { CBM_PIPELINE_EXACT_DELTA_MAX_CHANGED_PATHS = CBM_ALLOC_ONE };
+/* Live exact upserts are currently limited to two changed files. Larger
+ * batches keep the existing fallback path until same-batch parity coverage
+ * includes deletes, renames, new folders, and derived-view freshness. */
+enum { CBM_PIPELINE_EXACT_DELTA_MAX_CHANGED_PATHS = CBM_SZ_2 };
 
 /* Get the current pipeline's package map (NULL if none). */
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
