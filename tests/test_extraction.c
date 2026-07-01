@@ -2222,6 +2222,20 @@ TEST(llvm_call_edge) {
     PASS();
 }
 
+TEST(nasm_call_edge) {
+    CBMFileResult *r = extract("global _start\n"
+                               "extern puts\n"
+                               "_start:\n"
+                               "  call puts\n"
+                               "  ret\n",
+                               CBM_LANG_NASM, "test", "calls.asm");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "puts"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(puppet_function_call_edge) {
     CBMFileResult *r = extract("notice('ready')\n", CBM_LANG_PUPPET, "test", "site.pp");
     ASSERT_NOT_NULL(r);
@@ -3461,6 +3475,7 @@ SUITE(extraction) {
     RUN_TEST(makefile_builtin_call_edges);
     RUN_TEST(just_function_call_edge);
     RUN_TEST(llvm_call_edge);
+    RUN_TEST(nasm_call_edge);
     RUN_TEST(puppet_function_call_edge);
     RUN_TEST(vimscript_function_extraction);
     RUN_TEST(vimscript_function_without_bang);
