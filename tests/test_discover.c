@@ -1008,6 +1008,41 @@ TEST(discover_nested_gitignore_stacks_with_root) {
     PASS();
 }
 
+TEST(discover_root_gitignore_respected_without_git_dir) {
+    char *repo = th_mktempdir("cbm_disc_subpkg_repo");
+    ASSERT(repo != NULL);
+
+    th_mkdir_p(TH_PATH(repo, ".git"));
+    th_write_file(TH_PATH(repo, "pkg/.gitignore"), "secret.py\n");
+    th_write_file(TH_PATH(repo, "pkg/secret.py"), "def secret(): return 1\n");
+    th_write_file(TH_PATH(repo, "pkg/keep.py"), "def keep(): return 1\n");
+
+    char pkg[512];
+    snprintf(pkg, sizeof(pkg), "%s/pkg", repo);
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(pkg, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+
+    bool found_secret = false;
+    bool found_keep = false;
+    for (int i = 0; i < count; i++) {
+        if (strstr(files[i].rel_path, "secret.py"))
+            found_secret = true;
+        if (strstr(files[i].rel_path, "keep.py"))
+            found_keep = true;
+    }
+    ASSERT_FALSE(found_secret);
+    ASSERT_TRUE(found_keep);
+    ASSERT_EQ(count, 1);
+
+    cbm_discover_free(files, count);
+    th_cleanup(repo);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(discover) {
@@ -1112,4 +1147,5 @@ SUITE(discover) {
     /* Nested .gitignore tests (issue #178) */
     RUN_TEST(discover_nested_gitignore);
     RUN_TEST(discover_nested_gitignore_stacks_with_root);
+    RUN_TEST(discover_root_gitignore_respected_without_git_dir);
 }

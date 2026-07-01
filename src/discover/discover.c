@@ -763,7 +763,8 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
         return CBM_NOT_FOUND;
     }
 
-    /* Load gitignore sources when a .git directory is present.
+    /* Load the indexed-directory .gitignore unconditionally.  When a .git
+     * directory is present, also load repository-local and global excludes.
      * Sources merged in order (later patterns win on conflict):
      *   1. <repo>/.gitignore        — committed exclusions
      *   2. <repo>/.git/info/exclude — per-clone exclusions, not committed
