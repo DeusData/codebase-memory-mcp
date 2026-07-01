@@ -778,6 +778,15 @@ static char *extract_make_callee(CBMArena *a, TSNode node, const char *source, c
     return ts_node_is_null(fn) ? NULL : cbm_node_text(a, fn, source);
 }
 
+// Meson normal_command stores its callee in the command field.
+static char *extract_meson_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "normal_command") != 0) {
+        return NULL;
+    }
+    TSNode cmd = ts_node_child_by_field_name(node, TS_FIELD("command"));
+    return ts_node_is_null(cmd) ? NULL : cbm_node_text(a, cmd, source);
+}
+
 // Puppet function_call stores its callee as the first named child.
 static char *extract_puppet_callee(CBMArena *a, TSNode node, const char *source,
                                    const char *nk) {
@@ -850,6 +859,10 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
     }
     if (lang == CBM_LANG_MAKEFILE) {
         char *c = extract_make_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
+    if (lang == CBM_LANG_MESON) {
+        char *c = extract_meson_callee(a, node, source, nk);
         return c ? c : extract_scripting_callee(a, node, source, lang, nk);
     }
     if (lang == CBM_LANG_PUPPET) {

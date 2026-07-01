@@ -889,7 +889,7 @@ static const char *svelte_branch_types[] = {"if_statement", "each_statement", "a
 // ==================== MESON ====================
 static const char *meson_func_types[] = {"function_expression", NULL};
 static const char *meson_module_types[] = {"source_file", NULL};
-static const char *meson_call_types[] = {"function_expression", "command", NULL};
+static const char *meson_call_types[] = {"normal_command", "function_expression", NULL};
 static const char *meson_branch_types[] = {"if_statement", "foreach_statement", NULL};
 static const char *meson_var_types[] = {"assignment_statement", NULL};
 
