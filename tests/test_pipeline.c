@@ -7618,6 +7618,30 @@ static int pipeline_store_file_state_generation(const char *db_path, const char 
     return rc;
 }
 
+static int pipeline_store_completed_generation_count(const char *db_path, const char *project) {
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT COUNT(*) FROM index_generations "
+                      "WHERE project = ?1 AND status = ?2 AND generation > ?3;";
+    int count = CBM_STORE_ERR;
+    if (db && sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, CBM_STORE_INDEX_STATUS_COMPLETE, CBM_NOT_FOUND,
+                          SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 3, CBM_PIPELINE_COMPAT_GENERATION);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            count = sqlite3_column_int(stmt, 0);
+        }
+    }
+    sqlite3_finalize(stmt);
+    cbm_store_close(s);
+    return count;
+}
+
 static int pipeline_compare_current_db_to_fresh_fast_rebuild(const char *repo_path,
                                                              const char *db_path,
                                                              const char *project,
@@ -8495,6 +8519,59 @@ TEST(incremental_fast_three_file_batch_falls_back_to_full_rebuild_parity) {
         g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
     if (diff_rc != 0) {
         FAIL(diff_err[0] ? diff_err : "three-file fallback differed from fresh FAST rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_single_delete_exact_matches_full_rebuild) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 1\n}\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "Leaf"));
+
+    ASSERT_EQ(cbm_unlink(path), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "Leaf"));
+    int64_t leaf_generation = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "leaf.go",
+                                                   &leaf_generation),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_GT(pipeline_store_completed_generation_count(g_incr_dbpath, project), 0);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "single-delete exact differed from fresh FAST rebuild");
     }
     ASSERT_EQ(diff_rc, 0);
 
@@ -10758,6 +10835,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_exact_upsert_matches_full_rebuild);
     RUN_TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild);
     RUN_TEST(incremental_fast_three_file_batch_falls_back_to_full_rebuild_parity);
+    RUN_TEST(incremental_fast_single_delete_exact_matches_full_rebuild);
     RUN_TEST(incremental_fast_delete_falls_back_to_full_rebuild_parity);
     RUN_TEST(incremental_fast_rename_like_batch_falls_back_to_full_rebuild_parity);
     RUN_TEST(incremental_fast_new_folder_falls_back_to_full_rebuild_parity);
