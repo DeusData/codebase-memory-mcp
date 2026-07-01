@@ -1191,6 +1191,27 @@ TEST(nix_function) {
     PASS();
 }
 
+TEST(jsonnet_function_call_edge) {
+    CBMFileResult *r =
+        extract("local helper(x) = x + 1;\n{ value: helper(41) }\n", CBM_LANG_JSONNET, "t",
+                "lib.jsonnet");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "helper"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(typst_function_call_edge) {
+    CBMFileResult *r = extract("#let greet(name) = name\n#greet(\"Ada\")\n", CBM_LANG_TYPST,
+                               "t", "doc.typ");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "greet"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Fortran --- */
 TEST(fortran_function) {
     /* Fortran subroutine name extraction is incomplete — just verify no crash */
@@ -2155,6 +2176,28 @@ TEST(makefile_variable_extraction) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     /* Variable extraction may or may not work depending on Makefile grammar support */
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(makefile_builtin_call_edges) {
+    CBMFileResult *r = extract("FILES := $(wildcard *.c)\n"
+                               "COUNT := $(shell ls | wc -l)\n"
+                               "all:\n\t@echo $(FILES) $(COUNT)\n",
+                               CBM_LANG_MAKEFILE, "test", "Makefile");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "wildcard"));
+    ASSERT(has_call_exact(r, "shell"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(puppet_function_call_edge) {
+    CBMFileResult *r = extract("notice('ready')\n", CBM_LANG_PUPPET, "test", "site.pp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "notice"));
     cbm_free_result(r);
     PASS();
 }
@@ -3302,6 +3345,8 @@ SUITE(extraction) {
     RUN_TEST(julia_short_form_assignment_function);
     RUN_TEST(elm_function);
     RUN_TEST(nix_function);
+    RUN_TEST(jsonnet_function_call_edge);
+    RUN_TEST(typst_function_call_edge);
     RUN_TEST(fortran_function);
 
     /* OOP/Systems variants */
@@ -3384,6 +3429,8 @@ SUITE(extraction) {
     RUN_TEST(makefile_rule_as_function);
     RUN_TEST(makefile_multiple_targets);
     RUN_TEST(makefile_variable_extraction);
+    RUN_TEST(makefile_builtin_call_edges);
+    RUN_TEST(puppet_function_call_edge);
     RUN_TEST(vimscript_function_extraction);
     RUN_TEST(vimscript_function_without_bang);
     RUN_TEST(julia_function_extraction);

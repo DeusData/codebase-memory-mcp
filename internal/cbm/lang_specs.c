@@ -826,7 +826,7 @@ static const char *markdown_class_types[] = {"atx_heading", "setext_heading", NU
 // ==================== MAKEFILE ====================
 static const char *makefile_func_types[] = {"rule", "recipe", NULL};
 static const char *makefile_module_types[] = {"makefile", NULL};
-static const char *makefile_call_types[] = {"function_call", "call", NULL};
+static const char *makefile_call_types[] = {"function_call", "call", "shell_function", NULL};
 static const char *makefile_import_types[] = {"include_directive", "include", NULL};
 static const char *makefile_var_types[] = {"variable_assignment", NULL};
 
