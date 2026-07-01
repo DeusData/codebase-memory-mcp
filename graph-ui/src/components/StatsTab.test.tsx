@@ -126,4 +126,35 @@ describe("StatsTab index modal", () => {
       expect(fetchMock).toHaveBeenCalledWith("/api/browse?path=C%3A%2FUsers");
     });
   });
+
+  it("refreshes the folder list when a drive is typed into the path field", async () => {
+    mockProjectsFetch((url) => {
+      if (url.startsWith("/api/browse")) {
+        const m = /[?&]path=([^&]*)/.exec(url);
+        const path = m ? decodeURIComponent(m[1]) : "C:/Users/rap";
+        const onD = path.replace(/\\/g, "/").toUpperCase().startsWith("D:");
+        return new Response(JSON.stringify({
+          path,
+          parent: "C:/",
+          dirs: onD ? ["projects", "games"] : ["Documents", "Downloads"],
+          roots: ["C:/", "D:/"],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return undefined;
+    });
+
+    render(<StatsTab onSelectProject={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Index your first repository" }));
+
+    /* Initial C: listing is shown. */
+    expect(await screen.findByText("Documents")).toBeInTheDocument();
+
+    /* Typing a different drive refreshes the listing to that drive (debounced). */
+    fireEvent.change(await screen.findByLabelText("Repository path"), {
+      target: { value: "D:/" },
+    });
+
+    expect(await screen.findByText("projects")).toBeInTheDocument();
+    expect(screen.queryByText("Documents")).not.toBeInTheDocument();
+  });
 });

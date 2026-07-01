@@ -179,25 +179,44 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const filterRef = useRef<HTMLInputElement>(null);
+  /* Path whose listing is currently shown. Lets the typed-path effect skip a
+   * redundant re-fetch after browse() sets currentPath itself. */
+  const lastBrowsedRef = useRef<string>("");
 
-  const browse = useCallback(async (path?: string) => {
-    setLoading(true);
+  const browse = useCallback(async (path?: string, opts?: { silent?: boolean }) => {
+    const silent = opts?.silent ?? false;
+    if (!silent) setLoading(true);
     setError(null);
     try {
       const q = path ? `?path=${encodeURIComponent(path)}` : "";
       const res = await fetch(`/api/browse${q}`);
       const data = await res.json();
       if (data.error) throw new Error(data.error);
+      lastBrowsedRef.current = data.path ?? "";
       setCurrentPath(data.path ?? "");
       setDirs((data.dirs ?? []).sort());
       setRoots(data.roots ?? ["/"]);
       setParentPath(data.parent ?? "/");
-    } catch (e) { setError(e instanceof Error ? e.message : "Browse failed"); }
-    finally { setLoading(false); }
+    } catch (e) {
+      /* Silent (typed-path) refreshes keep the last good listing instead of
+       * flashing an error while the user is still typing a path. */
+      if (!silent) setError(e instanceof Error ? e.message : "Browse failed");
+    }
+    finally { if (!silent) setLoading(false); }
   }, []);
 
   useEffect(() => { browse(); }, [browse]);
   useEffect(() => { filterRef.current?.focus(); }, []);
+
+  /* When the user types a path directly into the Repository path field, refresh
+   * the folder listing to match (debounced). Without this the breadcrumb and
+   * path box updated but the directory list stayed stale — e.g. typing "D:/"
+   * still showed the previous location's folders. */
+  useEffect(() => {
+    if (!currentPath || currentPath === lastBrowsedRef.current) return;
+    const id = setTimeout(() => { void browse(currentPath, { silent: true }); }, 350);
+    return () => clearTimeout(id);
+  }, [currentPath, browse]);
 
   const filteredDirs = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -267,6 +286,7 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
               aria-label={t.index.repositoryPath}
               value={currentPath}
               onChange={(e) => setCurrentPath(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void browse(currentPath); } }}
               className="w-full bg-white/[0.04] border border-white/[0.06] rounded-lg px-3 py-2 text-[12px] text-foreground font-mono outline-none focus:border-primary/40"
             />
           </label>
