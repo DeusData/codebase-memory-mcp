@@ -2354,6 +2354,7 @@ void cbm_store_free_inbound_edges(cbm_store_inbound_edge_t *edges, int count) {
         free(edges[i].type);
         free(edges[i].source_rel_path);
         free(edges[i].target_rel_path);
+        free(edges[i].edge_rel_path);
     }
     free(edges);
 }
@@ -2393,7 +2394,8 @@ int cbm_store_list_file_delta_inbound_edges(cbm_store_t *s, const char *project,
 
     const char *sql =
         "SELECT src.qualified_name, tgt.qualified_name, e.type, "
-        "       COALESCE(src_owner.rel_path, ''), COALESCE(tgt_owner.rel_path, '') "
+        "       COALESCE(src_owner.rel_path, ''), COALESCE(tgt_owner.rel_path, ''), "
+        "       COALESCE(edge_owner.rel_path, '') "
         "FROM edges e "
         "JOIN node_owners tgt_owner "
         "  ON tgt_owner.project = ?1 AND tgt_owner.rel_path = ?2 "
@@ -2402,6 +2404,8 @@ int cbm_store_list_file_delta_inbound_edges(cbm_store_t *s, const char *project,
         "JOIN nodes tgt ON tgt.id = e.target_id "
         "LEFT JOIN node_owners src_owner "
         "  ON src_owner.project = ?1 AND src_owner.node_id = e.source_id "
+        "LEFT JOIN edge_owners edge_owner "
+        "  ON edge_owner.project = ?1 AND edge_owner.edge_id = e.id "
         "WHERE e.project = ?1 "
         "  AND (src_owner.rel_path IS NULL OR src_owner.rel_path != ?2) "
         "ORDER BY src.qualified_name, tgt.qualified_name, e.type;";
@@ -2431,8 +2435,9 @@ int cbm_store_list_file_delta_inbound_edges(cbm_store_t *s, const char *project,
         edge->type = heap_strdup((const char *)sqlite3_column_text(stmt, 2));
         edge->source_rel_path = heap_strdup((const char *)sqlite3_column_text(stmt, 3));
         edge->target_rel_path = heap_strdup((const char *)sqlite3_column_text(stmt, 4));
+        edge->edge_rel_path = heap_strdup((const char *)sqlite3_column_text(stmt, 5));
         if (!edge->source_qn || !edge->target_qn || !edge->type || !edge->source_rel_path ||
-            !edge->target_rel_path) {
+            !edge->target_rel_path || !edge->edge_rel_path) {
             rc = CBM_STORE_ERR;
             break;
         }
@@ -3226,6 +3231,45 @@ int cbm_store_delete_file_delta(cbm_store_t *s, const char *project, const char 
         return rc;
     }
     rc = store_mark_graph_derived_views_stale_body(s, project, generation);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    rc = cbm_store_commit(s);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_delete_file_delta_complete(cbm_store_t *s, const char *project,
+                                         const char *rel_path, int64_t generation,
+                                         const char *derived_view_name) {
+    if (!s || !project || !project[0] || !rel_path || !rel_path[0] || generation <= 0 ||
+        (derived_view_name && !derived_view_name[0])) {
+        if (s) {
+            store_set_error(s, "delete_file_delta_complete: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    int rc = cbm_store_begin(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_delete_file_delta_body(s, project, rel_path, generation, derived_view_name);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    rc = store_mark_graph_derived_views_stale_body(s, project, generation);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    rc = store_finish_index_generation_body(s, project, generation,
+                                            CBM_STORE_INDEX_STATUS_COMPLETE);
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(s);
         return rc;

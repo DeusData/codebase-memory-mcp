@@ -1054,6 +1054,7 @@ TEST(store_rebuild_file_delta_owners_derives_from_graph) {
     ASSERT_STR_EQ(inbound[0].type, "CONTAINS_FILE");
     ASSERT_STR_EQ(inbound[0].source_rel_path, "");
     ASSERT_STR_EQ(inbound[0].target_rel_path, "src/main.go");
+    ASSERT_STR_EQ(inbound[0].edge_rel_path, "src/main.go");
     cbm_store_free_inbound_edges(inbound, inbound_count);
     ASSERT_EQ(store_count_metadata_owners(s, 0, "test", "stale.go"), 0);
     ASSERT_EQ(store_count_metadata_owners(s, 1, "test", "stale.go"), 0);
@@ -2139,6 +2140,42 @@ TEST(store_file_delta_delete_cleans_graph_and_metadata) {
     ASSERT_EQ(hash_count, 1);
     ASSERT_STR_EQ(hashes[0].rel_path, "main.go");
     cbm_store_free_file_hashes(hashes, hash_count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_file_delta_delete_complete_finishes_generation) {
+    enum {
+        BASE_GENERATION = 1,
+        DELETE_GENERATION = 2,
+    };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, BASE_GENERATION);
+    ASSERT_EQ(store_publish_helper_file_delta(s, BASE_GENERATION), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, "test", BASE_GENERATION,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+
+    generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, DELETE_GENERATION);
+    ASSERT_EQ(cbm_store_delete_file_delta_complete(s, "test", "helper.go", generation,
+                                                   CBM_STORE_DERIVED_VIEW_NODES_FTS),
+              CBM_STORE_OK);
+
+    ASSERT_EQ(store_node_qn_exists(s, "test", "test.helper.Helper"), 0);
+    ASSERT_EQ(store_count_index_generation(s, "test", DELETE_GENERATION,
+                                           CBM_STORE_INDEX_STATUS_COMPLETE, "", "",
+                                           STORE_TEST_COMPLETED_SET),
+              1);
 
     cbm_store_close(s);
     PASS();
@@ -3358,6 +3395,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_file_delta_batch_complete_rolls_back_when_generation_missing);
     RUN_TEST(store_file_delta_publish_commits_graph_and_metadata);
     RUN_TEST(store_file_delta_delete_cleans_graph_and_metadata);
+    RUN_TEST(store_file_delta_delete_complete_finishes_generation);
     RUN_TEST(store_derived_view_state_public_api);
     RUN_TEST(store_node_properties_json);
     RUN_TEST(store_node_null_properties);

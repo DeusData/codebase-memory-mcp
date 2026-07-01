@@ -114,6 +114,7 @@ typedef struct {
     char *type;
     char *source_rel_path; /* empty when source node has no owner metadata */
     char *target_rel_path;
+    char *edge_rel_path; /* empty when the inbound edge has no owner metadata */
 } cbm_store_inbound_edge_t;
 
 typedef struct {
@@ -624,6 +625,11 @@ int cbm_store_publish_file_delta_batch_complete(cbm_store_t *s,
  * Project-wide graph-derived views are always marked stale at the supplied generation. */
 int cbm_store_delete_file_delta(cbm_store_t *s, const char *project, const char *rel_path,
                                 int64_t generation, const char *derived_view_name);
+/* Same delete semantics as cbm_store_delete_file_delta(), plus mark the reserved generation
+ * complete in the same transaction. generation must be positive and already reserved. */
+int cbm_store_delete_file_delta_complete(cbm_store_t *s, const char *project,
+                                         const char *rel_path, int64_t generation,
+                                         const char *derived_view_name);
 
 /* ── Search ─────────────────────────────────────────────────────── */
 
