@@ -8403,6 +8403,170 @@ TEST(incremental_fast_three_file_batch_falls_back_to_full_rebuild_parity) {
     PASS();
 }
 
+TEST(incremental_fast_delete_falls_back_to_full_rebuild_parity) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "Helper"));
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(cbm_unlink(path), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "Helper"));
+    int64_t main_generation = 0;
+    int64_t helper_generation = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "main.go",
+                                                   &main_generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper.go",
+                                                   &helper_generation),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(main_generation, CBM_PIPELINE_COMPAT_GENERATION);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "delete fallback differed from fresh FAST rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_rename_like_batch_falls_back_to_full_rebuild_parity) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "Helper"));
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(cbm_unlink(path), 0);
+    n = snprintf(path, sizeof(path), "%s/helper2.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func RenamedHelper() string {\n\treturn \"renamed\"\n}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "Helper"));
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "RenamedHelper"));
+    int64_t helper_generation = 0;
+    int64_t helper2_generation = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper.go",
+                                                   &helper_generation),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper2.go",
+                                                   &helper2_generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(helper2_generation, CBM_PIPELINE_COMPAT_GENERATION);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "rename-like fallback differed from fresh FAST rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_new_folder_falls_back_to_full_rebuild_parity) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/pkg", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_TRUE(cbm_mkdir_p(path, 0755));
+    n = snprintf(path, sizeof(path), "%s/pkg/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package pkg\n\n"
+                            "func FolderLeaf() int {\n\treturn 23\n}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "FolderLeaf"));
+    int64_t generation = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "pkg/leaf.go",
+                                                   &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, CBM_PIPELINE_COMPAT_GENERATION);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "new-folder fallback differed from fresh FAST rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_fast_exact_scratch_multifile_usage_edges_match_fresh) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -10464,6 +10628,9 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_exact_upsert_matches_full_rebuild);
     RUN_TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild);
     RUN_TEST(incremental_fast_three_file_batch_falls_back_to_full_rebuild_parity);
+    RUN_TEST(incremental_fast_delete_falls_back_to_full_rebuild_parity);
+    RUN_TEST(incremental_fast_rename_like_batch_falls_back_to_full_rebuild_parity);
+    RUN_TEST(incremental_fast_new_folder_falls_back_to_full_rebuild_parity);
     RUN_TEST(incremental_fast_exact_scratch_multifile_usage_edges_match_fresh);
     RUN_TEST(incremental_fast_exact_batch_publish_matches_fresh_rebuild_for_two_file_go);
     RUN_TEST(incremental_full_mode_keeps_exact_upsert_disabled);
