@@ -8554,16 +8554,27 @@ static cbm_vector_result_t *vs_append_result(cbm_vector_result_t *results, int *
         results = grown;
         *cap = nc;
     }
-    int idx = (*count)++;
-    results[idx].node_id = sqlite3_column_int64(stmt, 0);
     const char *name = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
     const char *qn = (const char *)sqlite3_column_text(stmt, ST_COL_2);
     const char *fp = (const char *)sqlite3_column_text(stmt, ST_COL_3);
     const char *label = (const char *)sqlite3_column_text(stmt, ST_COL_4);
-    results[idx].name = name ? strdup(name) : strdup("");
-    results[idx].qualified_name = qn ? strdup(qn) : strdup("");
-    results[idx].file_path = fp ? strdup(fp) : strdup("");
-    results[idx].label = label ? strdup(label) : strdup("");
+    char *name_copy = heap_strdup(name ? name : "");
+    char *qn_copy = heap_strdup(qn ? qn : "");
+    char *fp_copy = heap_strdup(fp ? fp : "");
+    char *label_copy = heap_strdup(label ? label : "");
+    if (!name_copy || !qn_copy || !fp_copy || !label_copy) {
+        free(name_copy);
+        free(qn_copy);
+        free(fp_copy);
+        free(label_copy);
+        return NULL;
+    }
+    int idx = (*count)++;
+    results[idx].node_id = sqlite3_column_int64(stmt, 0);
+    results[idx].name = name_copy;
+    results[idx].qualified_name = qn_copy;
+    results[idx].file_path = fp_copy;
+    results[idx].label = label_copy;
     const int8_t *node_vec = (const int8_t *)sqlite3_column_blob(stmt, ST_COL_6);
     int node_vec_len = sqlite3_column_bytes(stmt, ST_COL_6);
     results[idx].score = vs_min_cosine_score(node_vec, node_vec_len, kw_vecs, actual_kw);
@@ -8623,13 +8634,22 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
     int count = 0;
     int cap = 0;
     int step_rc = 0;
+    bool result_oom = false;
     while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         cbm_vector_result_t *grown =
             vs_append_result(results, &count, &cap, stmt, kw_vecs, actual_kw);
         if (!grown) {
+            result_oom = true;
             break;
         }
         results = grown;
+    }
+
+    if (result_oom) {
+        sqlite3_finalize(stmt);
+        cbm_store_free_vector_results(results, count);
+        store_set_error(s, "vector_search result allocation failed");
+        return CBM_STORE_ERR;
     }
 
     if (step_rc != SQLITE_DONE) {
