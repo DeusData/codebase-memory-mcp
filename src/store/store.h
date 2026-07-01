@@ -589,6 +589,8 @@ int cbm_store_get_derived_view_state(cbm_store_t *s, const char *project,
 bool cbm_store_derived_view_is_stale(cbm_store_t *s, const char *project,
                                      const char *view_name);
 
+/* Publish canonical graph and freshness metadata owned by one file in one transaction.
+ * Project-wide graph-derived views are marked stale at the delta generation. */
 int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *delta);
 int cbm_store_publish_file_delta_batch(cbm_store_t *s,
                                        const cbm_store_file_delta_t *const *deltas,
@@ -598,7 +600,8 @@ int cbm_store_publish_file_delta_batch_complete(cbm_store_t *s,
                                                 int delta_count);
 
 /* Delete all canonical graph and freshness metadata owned by one file in one transaction.
- * If non-empty derived_view_name is set, mark that derived view stale at generation. */
+ * If non-empty derived_view_name is set, mark that per-file derived view stale too.
+ * Project-wide graph-derived views are always marked stale at the supplied generation. */
 int cbm_store_delete_file_delta(cbm_store_t *s, const char *project, const char *rel_path,
                                 int64_t generation, const char *derived_view_name);
 
