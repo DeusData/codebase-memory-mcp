@@ -1479,7 +1479,8 @@ static const char *mermaid_module_types[] = {"source_file", NULL};
 static const char *puppet_func_types[] = {"function_declaration", "lambda", NULL};
 static const char *puppet_class_types[] = {"class_definition", "node_definition",
                                            "resource_declaration", "type_declaration", NULL};
-static const char *puppet_call_types[] = {"function_call", "resource_declaration", NULL};
+static const char *puppet_call_types[] = {"function_call", "resource_declaration",
+                                          "include_statement", NULL};
 static const char *puppet_import_types[] = {"include_statement", "require_statement", "include",
                                             "require", NULL};
 static const char *puppet_branch_types[] = {"if_statement", "unless_statement", "case_statement",
