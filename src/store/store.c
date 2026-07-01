@@ -8281,7 +8281,7 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
     sqlite3_stmt *stmt = NULL;
     int prep_rc = sqlite3_prepare_v2(s->db, sql, SQLITE_AUTO_LEN, &stmt, NULL);
     if (prep_rc != SQLITE_OK) {
-        (void)fprintf(stderr, "vector_search: %s\n", sqlite3_errmsg(s->db));
+        store_set_error_sqlite(s, "vector_search prepare");
         return CBM_STORE_ERR;
     }
 

@@ -93,27 +93,32 @@ static void add_pagerank_val(yyjson_mut_doc *doc, yyjson_mut_val *obj, double v)
     yyjson_mut_obj_add_val(doc, obj, "pagerank", yyjson_mut_rawcpy(doc, buf));
 }
 
+static void add_response_warning(yyjson_mut_doc *doc, yyjson_mut_val *root, const char *message) {
+    if (!doc || !root || !message) {
+        return;
+    }
+    yyjson_mut_val *warnings = yyjson_mut_obj_get(root, "warnings");
+    if (!warnings || !yyjson_mut_is_arr(warnings)) {
+        warnings = yyjson_mut_arr(doc);
+        yyjson_mut_obj_add_val(doc, root, "warnings", warnings);
+    }
+    yyjson_mut_arr_add_str(doc, warnings, message);
+}
+
 static void add_derived_freshness_warnings(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                            bool pagerank_stale, bool linkrank_stale,
                                            bool node_degree_stale) {
-    yyjson_mut_val *warnings = yyjson_mut_arr(doc);
     if (pagerank_stale) {
-        yyjson_mut_arr_add_str(
-            doc, warnings,
-            "pagerank derived view is stale; stale PageRank values were omitted.");
+        add_response_warning(doc, root,
+                             "pagerank derived view is stale; stale PageRank values were omitted.");
     }
     if (linkrank_stale) {
-        yyjson_mut_arr_add_str(
-            doc, warnings,
-            "linkrank derived view is stale; stale LinkRank ordering was not used.");
+        add_response_warning(doc, root,
+                             "linkrank derived view is stale; stale LinkRank ordering was not used.");
     }
     if (node_degree_stale) {
-        yyjson_mut_arr_add_str(
-            doc, warnings,
-            "node_degree derived view is stale; precomputed degree data was not used.");
-    }
-    if (yyjson_mut_arr_size(warnings) > 0) {
-        yyjson_mut_obj_add_val(doc, root, "warnings", warnings);
+        add_response_warning(doc, root,
+                             "node_degree derived view is stale; precomputed degree data was not used.");
     }
 }
 
@@ -2925,6 +2930,12 @@ static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const 
     if (sq_val && !yyjson_is_arr(sq_val)) {
         type_error = true;
     } else if (sq_val && yyjson_arr_size(sq_val) > 0) {
+        if (project && cbm_store_derived_view_is_stale(
+                           store, project, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES)) {
+            add_response_warning(
+                doc, root,
+                "semantic_edges derived view is stale; semantic_results may be stale.");
+        }
         const char *keywords[MAX_KW_SEARCH];
         int ki = extract_semantic_keywords(sq_val, keywords, MAX_KW_SEARCH);
         cbm_vector_result_t *vresults = NULL;
@@ -3839,6 +3850,22 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     }
     yyjson_mut_obj_add_int(doc, root, "total_nodes", node_count);
     yyjson_mut_obj_add_int(doc, root, "total_edges", edge_count);
+    bool architecture_stale =
+        project && cbm_store_derived_view_is_stale(store, project,
+                                                   CBM_STORE_DERIVED_VIEW_ARCHITECTURE);
+    bool routes_stale =
+        project && cbm_store_derived_view_is_stale(store, project, CBM_STORE_DERIVED_VIEW_ROUTES);
+    bool pagerank_stale =
+        project && cbm_store_derived_view_is_stale(store, project, CBM_STORE_DERIVED_VIEW_PAGERANK);
+    if (architecture_stale) {
+        add_response_warning(
+            doc, root,
+            "architecture derived view is stale; summaries may need a full refresh.");
+    }
+    if (routes_stale) {
+        add_response_warning(doc, root,
+                             "routes derived view is stale; route results may be stale.");
+    }
 
     /* Node label summary */
     if (aspect_wanted(aspects_doc, aspects_arr, "structure")) {
@@ -3874,16 +3901,19 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* Key functions: top 10 by PageRank with config + param exclude patterns */
-    {
+    if (pagerank_stale) {
+        add_response_warning(
+            doc, root,
+            "pagerank derived view is stale; key_functions were omitted.");
+    } else {
         sqlite3 *db = cbm_store_get_db(store);
         if (db) {
             int excl_count = 0;
             char **excl_arr = cbm_mcp_get_string_array_arg(args, "exclude", &excl_count);
             if (excl_count < 0) {
-                yyjson_mut_val *warnings = yyjson_mut_arr(doc);
-                yyjson_mut_arr_add_str(doc, warnings,
+                add_response_warning(
+                    doc, root,
                     "key_functions omitted: out of memory preparing exclude patterns");
-                yyjson_mut_obj_add_val(doc, root, "warnings", warnings);
             } else {
                 const char *excl_csv = srv->config
                     ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "")
@@ -3894,10 +3924,8 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
                 char *kf_sql_heap =
                     build_key_functions_sql(excl_csv, (const char **)excl_arr, kf_limit);
                 if (!kf_sql_heap) {
-                    yyjson_mut_val *warnings = yyjson_mut_arr(doc);
-                    yyjson_mut_arr_add_str(doc, warnings,
-                        "key_functions omitted: out of memory building SQL");
-                    yyjson_mut_obj_add_val(doc, root, "warnings", warnings);
+                    add_response_warning(doc, root,
+                                         "key_functions omitted: out of memory building SQL");
                 } else {
                     const char *kf_sql = kf_sql_heap;
                     sqlite3_stmt *kf_stmt = NULL;
