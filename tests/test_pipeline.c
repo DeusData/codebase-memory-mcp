@@ -3541,11 +3541,21 @@ TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths) {
                   s, scratch, registry, project, changed_paths, changed_path_count),
               CBM_STORE_OK);
 
-    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(scratch, "test.helper.Helper"));
+    ASSERT_NULL(cbm_gbuf_find_by_qn(scratch, "test.helper.Helper"));
     ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(scratch, "test.helper"));
     ASSERT_NULL(cbm_gbuf_find_by_qn(scratch, "test.main.Old"));
     ASSERT_TRUE(cbm_registry_exists(registry, "test.helper.Helper"));
     ASSERT_FALSE(cbm_registry_exists(registry, "test.main.Old"));
+    cbm_pipeline_ctx_t ctx = {.project_name = project,
+                              .repo_path = "/tmp",
+                              .gbuf = scratch,
+                              .registry = registry,
+                              .store_backed_node_lookup = s,
+                              .store_backed_changed_paths = changed_paths,
+                              .store_backed_changed_path_count = changed_path_count};
+    ASSERT_NOT_NULL(cbm_pipeline_find_node_by_qn(&ctx, "test.helper.Helper"));
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(scratch, "test.helper.Helper"));
+    ASSERT_NULL(cbm_pipeline_find_node_by_qn(&ctx, "test.main.Old"));
 
     cbm_registry_free(registry);
     cbm_gbuf_free(scratch);
@@ -3683,11 +3693,17 @@ TEST(pipeline_file_delta_scratch_seed_supports_external_endpoint_descriptor) {
         cbm_gbuf_upsert_node(scratch, "File", "main.go", main_file_qn, "main.go", 1, 1, "{}");
     int64_t run_id = cbm_gbuf_upsert_node(scratch, "Function", "Run", main_qn, "main.go", 2, 4,
                                           "{\"is_exported\":true}");
-    const cbm_gbuf_node_t *helper_node = cbm_gbuf_find_by_qn(scratch, helper_qn);
     ASSERT_GT(file_id, 0);
     ASSERT_GT(run_id, 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = project,
+                              .repo_path = "/tmp",
+                              .gbuf = scratch,
+                              .registry = registry,
+                              .store_backed_node_lookup = s,
+                              .store_backed_changed_paths = changed_paths,
+                              .store_backed_changed_path_count = changed_path_count};
+    const cbm_gbuf_node_t *helper_node = cbm_pipeline_find_node_by_qn(&ctx, helper_qn);
     ASSERT_NOT_NULL(helper_node);
-    cbm_pipeline_ctx_t ctx = {.project_name = project, .repo_path = "/tmp", .gbuf = scratch};
     ASSERT_EQ(cbm_pipeline_insert_import_edge(&ctx, file_id, helper_node, "Helper"), 1);
     ASSERT_GT(cbm_gbuf_insert_edge(scratch, run_id, helper_node->id, "CALLS", "{}"), 0);
 
@@ -7923,7 +7939,10 @@ static int pipeline_build_exact_scratch_for_changed_files(cbm_store_t *store,
                               .semantic_threshold = pipeline_default_threshold,
                               .githistory_min_coupling = pipeline_default_threshold,
                               .lsp_confidence_floor = pipeline_default_threshold,
-                              .result_cache = result_cache};
+                              .result_cache = result_cache,
+                              .store_backed_node_lookup = store,
+                              .store_backed_changed_paths = changed_paths,
+                              .store_backed_changed_path_count = changed_count};
     const char *structure_root_qn = pipeline_exact_scratch_structure_root_qn(scratch, project);
     for (int i = 0; i < changed_count; i++) {
         if (cbm_pipeline_ensure_file_structure(scratch, project, structure_root_qn,

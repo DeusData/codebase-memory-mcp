@@ -38,9 +38,8 @@ static const char cbm_delta_reason_unsupported_derived_view[] = "unsupported_der
 static const char cbm_delta_reason_unsupported_edges[] = "unsupported_edges";
 
 static const char *const cbm_delta_scratch_seed_labels[] = {
-    "Project",   "Branch", "Folder", "File",  "Module",   "Struct",
-    "Enum",      "Trait",  "Type",
-    "Function",  "Method", "Class",  "Interface", "Variable", "Field",
+    "Project", "Branch", "Folder", "File", "Module", "Struct", "Enum", "Trait",
+    "Type",    "Function", "Method", "Class", "Interface", "Variable", "Field",
     NULL,
 };
 
@@ -134,6 +133,25 @@ static int delta_seed_store_node(cbm_gbuf_t *gbuf, cbm_registry_t *registry,
     return CBM_STORE_OK;
 }
 
+static bool delta_seed_node_in_scratch_graph(const char *label) {
+    return label && (strcmp(label, "Project") == 0 || strcmp(label, "Branch") == 0 ||
+                     strcmp(label, "Folder") == 0 || strcmp(label, "File") == 0 ||
+                     strcmp(label, "Module") == 0);
+}
+
+static bool delta_can_materialize_store_node(const cbm_node_t *node) {
+    return node && node->label &&
+           (cbm_pipeline_label_is_registry_symbol(node->label) ||
+            cbm_pipeline_label_is_import_target(node->label));
+}
+
+static void delta_seed_registry_symbol(cbm_registry_t *registry, const cbm_node_t *node) {
+    if (registry && node && cbm_pipeline_label_is_registry_symbol(node->label) && node->name &&
+        node->qualified_name) {
+        cbm_registry_add(registry, node->name, node->qualified_name, node->label);
+    }
+}
+
 int cbm_pipeline_seed_file_delta_scratch_from_store(cbm_store_t *store, cbm_gbuf_t *gbuf,
                                                     cbm_registry_t *registry,
                                                     const char *project,
@@ -154,7 +172,11 @@ int cbm_pipeline_seed_file_delta_scratch_from_store(cbm_store_t *store, cbm_gbuf
             if (delta_path_in_list(nodes[i].file_path, changed_paths, changed_path_count)) {
                 continue;
             }
-            if (delta_seed_store_node(gbuf, registry, &nodes[i]) != CBM_STORE_OK) {
+            delta_seed_registry_symbol(registry, &nodes[i]);
+            if (!delta_seed_node_in_scratch_graph(nodes[i].label)) {
+                continue;
+            }
+            if (delta_seed_store_node(gbuf, NULL, &nodes[i]) != CBM_STORE_OK) {
                 cbm_store_free_nodes(nodes, node_count);
                 return CBM_STORE_ERR;
             }
@@ -162,6 +184,31 @@ int cbm_pipeline_seed_file_delta_scratch_from_store(cbm_store_t *store, cbm_gbuf
         cbm_store_free_nodes(nodes, node_count);
     }
     return CBM_STORE_OK;
+}
+
+const cbm_gbuf_node_t *cbm_pipeline_find_node_by_qn(cbm_pipeline_ctx_t *ctx, const char *qn) {
+    if (!ctx || !ctx->gbuf || !qn || !qn[0]) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *found = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
+    if (found || !ctx->store_backed_node_lookup || !ctx->project_name) {
+        return found;
+    }
+
+    cbm_node_t stored = {0};
+    int rc = cbm_store_find_node_by_qn(ctx->store_backed_node_lookup, ctx->project_name, qn, &stored);
+    if (rc != CBM_STORE_OK) {
+        return NULL;
+    }
+    if (delta_path_in_list(stored.file_path, ctx->store_backed_changed_paths,
+                           ctx->store_backed_changed_path_count) ||
+        !delta_can_materialize_store_node(&stored) ||
+        delta_seed_store_node(ctx->gbuf, NULL, &stored) != CBM_STORE_OK) {
+        cbm_node_free_fields(&stored);
+        return NULL;
+    }
+    cbm_node_free_fields(&stored);
+    return cbm_gbuf_find_by_qn(ctx->gbuf, qn);
 }
 
 static bool delta_node_is_exported(const cbm_gbuf_node_t *node) {

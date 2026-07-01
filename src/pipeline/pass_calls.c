@@ -106,6 +106,9 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
                                                      module_qn, imp_keys, imp_vals, imp_count);
         if (hres.qualified_name != NULL && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_qn(ctx->gbuf, hres.qualified_name);
+            if (handler == NULL) {
+                handler = cbm_pipeline_find_node_by_qn(ctx, hres.qualified_name);
+            }
             if (handler != NULL) {
                 char hprops[CBM_SZ_1K]; /* must exceed escaped value + wrapper or snprintf cuts the
                                            closing brace */
@@ -243,6 +246,24 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
     return src;
 }
 
+static const cbm_gbuf_node_t *calls_lsp_target_node(cbm_pipeline_ctx_t *ctx,
+                                                    const char *callee_qn) {
+    const cbm_gbuf_node_t *direct = cbm_pipeline_find_node_by_qn(ctx, callee_qn);
+    if (direct || !ctx || !ctx->project_name || !callee_qn) {
+        return direct;
+    }
+    size_t proj_len = strlen(ctx->project_name);
+    if (strncmp(callee_qn, ctx->project_name, proj_len) == 0 && callee_qn[proj_len] == '.') {
+        return NULL;
+    }
+    char buf[CBM_SZ_1K];
+    int written = snprintf(buf, sizeof(buf), "%s.%s", ctx->project_name, callee_qn);
+    if (written < 0 || (size_t)written >= sizeof(buf)) {
+        return NULL;
+    }
+    return cbm_pipeline_find_node_by_qn(ctx, buf);
+}
+
 /* Resolve one call and emit the appropriate edge. Returns 1 if resolved, 0 if not. */
 static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                const CBMResolvedCallArray *lsp_calls, const char *rel,
@@ -258,8 +279,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     const CBMResolvedCall *lsp =
         cbm_lsp_resolution_index_find(lsp_idx, lsp_calls, call, ctx->lsp_confidence_floor);
     if (lsp) {
-        const cbm_gbuf_node_t *target_node =
-            cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name, lsp->callee_qn);
+        const cbm_gbuf_node_t *target_node = calls_lsp_target_node(ctx, lsp->callee_qn);
         if (target_node && source_node->id != target_node->id) {
             cbm_resolution_t res = {0};
             /* Use the gbuf node's QN so downstream edge props show the canonical
@@ -292,7 +312,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                         res.strategy)) {
         return 0;
     }
-    const cbm_gbuf_node_t *target_node = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+    const cbm_gbuf_node_t *target_node = cbm_pipeline_find_node_by_qn(ctx, res.qualified_name);
     if (!target_node || source_node->id == target_node->id) {
         return 0;
     }
@@ -472,7 +492,7 @@ static int scan_depends_in_sig(cbm_pipeline_ctx_t *ctx, const cbm_regex_t *re, c
         cbm_resolution_t res = cbm_registry_resolve(ctx->registry, func_ref, module_qn, ik, iv, ic);
         if (res.qualified_name && res.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *sn = cbm_gbuf_find_by_qn(ctx->gbuf, def->qualified_name);
-            const cbm_gbuf_node_t *tn = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+            const cbm_gbuf_node_t *tn = cbm_pipeline_find_node_by_qn(ctx, res.qualified_name);
             if (sn && tn && sn->id != tn->id) {
                 cbm_gbuf_insert_edge(ctx->gbuf, sn->id, tn->id, "CALLS",
                                      "{\"confidence\":0.95,\"strategy\":\"fastapi_depends\"}");
