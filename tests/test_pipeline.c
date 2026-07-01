@@ -8138,6 +8138,33 @@ static int pipeline_store_completed_generation_count(const char *db_path, const 
     return count;
 }
 
+static int pipeline_store_count_file_rows_sql(const char *db_path, const char *project,
+                                              const char *rel_path, const char *sql,
+                                              int *out_count) {
+    if (!db_path || !project || !rel_path || !sql || !out_count) {
+        return CBM_STORE_ERR;
+    }
+    *out_count = 0;
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_stmt *stmt = NULL;
+    int rc = CBM_STORE_ERR;
+    if (db && sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, rel_path, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            *out_count = sqlite3_column_int(stmt, 0);
+            rc = CBM_STORE_OK;
+        }
+    }
+    sqlite3_finalize(stmt);
+    cbm_store_close(s);
+    return rc;
+}
+
 static int pipeline_compare_current_db_to_fresh_fast_rebuild(const char *repo_path,
                                                              const char *db_path,
                                                              const char *project,
@@ -8298,9 +8325,16 @@ static int pipeline_build_exact_scratch_for_changed_files(cbm_store_t *store,
     if (cbm_pipeline_pass_definitions(&ctx, changed_files, changed_count) != 0 ||
         cbm_pipeline_pass_lsp_cross(&ctx, changed_files, changed_count, result_cache) != 0 ||
         cbm_pipeline_pass_calls(&ctx, changed_files, changed_count) != 0 ||
-        cbm_pipeline_pass_usages(&ctx, changed_files, changed_count) != 0) {
+        cbm_pipeline_pass_usages(&ctx, changed_files, changed_count) != 0 ||
+        cbm_pipeline_pass_semantic(&ctx, changed_files, changed_count) != 0 ||
+        cbm_pipeline_pass_k8s(&ctx, changed_files, changed_count) != 0 ||
+        cbm_pipeline_pass_tests(&ctx, changed_files, changed_count) != 0) {
         goto cleanup;
     }
+    (void)cbm_pipeline_pass_decorator_tags(scratch, project);
+    (void)cbm_pipeline_pass_configlink(&ctx);
+    cbm_pipeline_clear_route_derived_edges(scratch);
+    cbm_pipeline_create_route_nodes(scratch);
     cbm_pipeline_pass_complexity_for_paths(&ctx, changed_paths, changed_count);
     if (cbm_pipeline_pass_httplinks(&ctx) != 0) {
         goto cleanup;
@@ -8880,6 +8914,130 @@ TEST(incremental_fast_exact_upsert_matches_full_rebuild) {
         g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
     if (diff_rc != 0) {
         printf("    [exact-upsert-diff] %s\n", diff_err);
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_body_only_change_uses_graph_noop) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    int64_t generation_before = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper.go",
+                                                   &generation_before),
+              CBM_STORE_OK);
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Helper() string {\n\treturn \"goodbye\"\n}\n"),
+              0);
+
+    cbm_store_t *store = cbm_store_open_path_query(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_file_info_t changed[] = {
+        {.path = path, .rel_path = "helper.go", .language = CBM_LANG_GO},
+    };
+    cbm_gbuf_t *scratch = NULL;
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(pipeline_build_exact_scratch_for_changed_files(store, g_incr_tmpdir, project,
+                                                             changed, CBM_ALLOC_ONE, &scratch,
+                                                             &delta),
+              CBM_STORE_OK);
+    const cbm_store_file_delta_t *store_delta = &delta.delta;
+    bool graph_equal = false;
+    ASSERT_EQ(cbm_store_file_delta_batch_graph_equal(store, &store_delta, CBM_ALLOC_ONE,
+                                                     &graph_equal),
+              CBM_STORE_OK);
+    if (!graph_equal) {
+        static const char node_owner_count_sql[] =
+            "SELECT COUNT(*) FROM node_owners WHERE project = ?1 AND rel_path = ?2;";
+        static const char edge_owner_count_sql[] =
+            "SELECT COUNT(*) FROM edge_owners WHERE project = ?1 AND rel_path = ?2;";
+        static const char export_count_sql[] =
+            "SELECT COUNT(*) FROM symbol_exports WHERE project = ?1 AND rel_path = ?2;";
+        static const char import_count_sql[] =
+            "SELECT COUNT(*) FROM import_refs WHERE project = ?1 AND rel_path = ?2;";
+        int stored_nodes = -1;
+        int stored_edges = -1;
+        int stored_exports = -1;
+        int stored_imports = -1;
+        (void)pipeline_store_count_file_rows_sql(g_incr_dbpath, project, "helper.go",
+                                                 node_owner_count_sql, &stored_nodes);
+        (void)pipeline_store_count_file_rows_sql(g_incr_dbpath, project, "helper.go",
+                                                 edge_owner_count_sql, &stored_edges);
+        (void)pipeline_store_count_file_rows_sql(g_incr_dbpath, project, "helper.go",
+                                                 export_count_sql, &stored_exports);
+        (void)pipeline_store_count_file_rows_sql(g_incr_dbpath, project, "helper.go",
+                                                 import_count_sql, &stored_imports);
+        char detail[CBM_SZ_512];
+        int dn = snprintf(detail, sizeof(detail),
+                          "graph equality rejected body-only delta: stored n/e/x/i=%d/%d/%d/%d "
+                          "delta n/e/x/i=%d/%d/%d/%d ctx n/e=%d/%d",
+                          stored_nodes, stored_edges, stored_exports, stored_imports,
+                          delta.delta.node_count, delta.delta.edge_count,
+                          delta.delta.export_count, delta.delta.import_count,
+                          delta.delta.context_node_count, delta.delta.context_edge_count);
+        if (dn < 0 || (size_t)dn >= sizeof(detail)) {
+            FAIL("graph equality rejected body-only delta; diagnostic overflow");
+        }
+        FAIL(detail);
+    }
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(scratch);
+    cbm_store_close(store);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    if (!strstr(logs, "msg=incremental.exact.noop files=1")) {
+        const char *debug = strstr(logs, "msg=delta.graph_equal.mismatch");
+        char detail[CBM_SZ_512];
+        int dn = snprintf(detail, sizeof(detail), "missing incremental no-op marker: %.420s",
+                          debug ? debug : logs);
+        if (dn < 0 || (size_t)dn >= sizeof(detail)) {
+            FAIL("missing incremental no-op marker; diagnostic overflow");
+        }
+        FAIL(detail);
+    }
+    ASSERT_FALSE(cbm_pipeline_graph_changed(p));
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_NOOP);
+    cbm_pipeline_free(p);
+
+    int64_t generation_after = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper.go",
+                                                   &generation_after),
+              CBM_STORE_OK);
+    ASSERT_GT(generation_after, generation_before);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "body-only graph no-op differed from fresh FAST rebuild");
     }
     ASSERT_EQ(diff_rc, 0);
 
@@ -11574,6 +11732,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_touch_only_refreshes_metadata_without_reindex);
     RUN_TEST(incremental_detects_changed_file);
     RUN_TEST(incremental_fast_exact_upsert_matches_full_rebuild);
+    RUN_TEST(incremental_fast_body_only_change_uses_graph_noop);
     RUN_TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild);
     RUN_TEST(incremental_fast_falls_back_for_inbound_transitive_complexity_and_matches_full);
     RUN_TEST(incremental_fast_three_file_batch_falls_back_to_full_rebuild_parity);

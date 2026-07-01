@@ -1707,6 +1707,103 @@ TEST(store_file_delta_publish_matches_fresh_final_graph) {
     PASS();
 }
 
+TEST(store_file_delta_graph_noop_refreshes_metadata_only) {
+    enum {
+        BASE_GENERATION = 1,
+        FINAL_GENERATION = 2,
+    };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, BASE_GENERATION);
+    ASSERT_EQ(store_publish_helper_file_delta(s, BASE_GENERATION), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, "test", BASE_GENERATION,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_delete_symbol_exports_by_file(s, "test", "helper.go"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, FINAL_GENERATION);
+
+    cbm_node_t same_nodes[1] = {{.project = "test",
+                                 .label = "Function",
+                                 .name = "Helper",
+                                 .qualified_name = "test.helper.Helper",
+                                 .file_path = "helper.go",
+                                 .properties_json = "{}"}};
+    cbm_file_hash_t hash = {.project = "test",
+                            .rel_path = "helper.go",
+                            .sha256 = "helper-hash-v2",
+                            .mtime_ns = 2,
+                            .size = 20};
+    cbm_file_state_t state = {.project = "test",
+                              .rel_path = "helper.go",
+                              .content_hash = "helper-content-v2",
+                              .git_oid = "",
+                              .mtime_ns = 2,
+                              .size = 20,
+                              .language = "c",
+                              .pass_fingerprint = "pass-a",
+                              .generation = FINAL_GENERATION,
+                              .indexed_at = "2026-06-30T00:02:00Z"};
+    cbm_store_symbol_export_t exports[1] = {
+        {.qualified_name = "test.helper.Helper", .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_store_file_delta_t same_delta = {.project = "test",
+                                         .rel_path = "helper.go",
+                                         .generation = FINAL_GENERATION,
+                                         .file_hash = &hash,
+                                         .file_state = &state,
+                                         .nodes = same_nodes,
+                                         .node_count = 1,
+                                         .exports = exports,
+                                         .export_count = 1};
+    const cbm_store_file_delta_t *same_deltas[] = {&same_delta};
+    bool graph_equal = false;
+    ASSERT_EQ(cbm_store_file_delta_batch_graph_equal(s, same_deltas, 1, &graph_equal),
+              CBM_STORE_OK);
+    ASSERT_TRUE(graph_equal);
+    ASSERT_EQ(cbm_store_refresh_file_delta_metadata_batch_complete(s, same_deltas, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(store_node_qn_exists(s, "test", "test.helper.Helper"), 1);
+    ASSERT_EQ(cbm_store_count_edges(s, "test"), 0);
+    char **restored_exports = NULL;
+    int restored_export_count = 0;
+    ASSERT_EQ(cbm_store_list_symbol_exports_by_file(s, "test", "helper.go", &restored_exports,
+                                                    &restored_export_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(restored_export_count, 1);
+    store_free_string_array(restored_exports, restored_export_count);
+
+    cbm_file_state_t got = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, "test", "helper.go", &got), CBM_STORE_OK);
+    ASSERT_STR_EQ(got.content_hash, "helper-content-v2");
+    ASSERT_EQ(got.generation, FINAL_GENERATION);
+    cbm_store_file_state_free_fields(&got);
+
+    cbm_node_t changed_nodes[1] = {{.project = "test",
+                                    .label = "Function",
+                                    .name = "Renamed",
+                                    .qualified_name = "test.helper.Renamed",
+                                    .file_path = "helper.go",
+                                    .properties_json = "{}"}};
+    cbm_store_symbol_export_t changed_exports[1] = {
+        {.qualified_name = "test.helper.Renamed", .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_store_file_delta_t changed_delta = same_delta;
+    changed_delta.nodes = changed_nodes;
+    changed_delta.exports = changed_exports;
+    const cbm_store_file_delta_t *changed_deltas[] = {&changed_delta};
+    graph_equal = true;
+    ASSERT_EQ(cbm_store_file_delta_batch_graph_equal(s, changed_deltas, 1, &graph_equal),
+              CBM_STORE_OK);
+    ASSERT_FALSE(graph_equal);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_file_delta_publish_failure_finishes_generation_failed) {
     enum { BASE_GENERATION = 1, FAILED_GENERATION = 2 };
     cbm_store_t *s = cbm_store_open_memory();
@@ -3476,6 +3573,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_file_delta_affected_paths_high_fanout_dedupes);
     RUN_TEST(store_file_delta_publish_rolls_back_on_failure);
     RUN_TEST(store_file_delta_publish_matches_fresh_final_graph);
+    RUN_TEST(store_file_delta_graph_noop_refreshes_metadata_only);
     RUN_TEST(store_file_delta_publish_failure_finishes_generation_failed);
     RUN_TEST(store_file_delta_publish_multifile_generation);
     RUN_TEST(store_file_delta_batch_publish_rolls_back_all_files);
