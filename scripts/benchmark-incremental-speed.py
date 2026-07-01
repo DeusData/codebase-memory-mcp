@@ -118,6 +118,13 @@ def parse_logged_elapsed_ms(stderr: str, marker: str) -> int | None:
     return None
 
 
+def indexed_work_elapsed_ms(logged_elapsed_ms: dict[str, int | None]) -> int | None:
+    incremental_ms = logged_elapsed_ms.get("incremental_done")
+    if incremental_ms is not None:
+        return incremental_ms
+    return logged_elapsed_ms.get("pipeline_done")
+
+
 def run_config_set(binary: Path, env: dict[str, str], key: str, value: str, timeout: int) -> None:
     proc, _ = command_result([str(binary), "config", "set", key, value], env, timeout)
     if proc.returncode != 0:
@@ -140,8 +147,16 @@ def run_index(
     if proc.returncode != 0:
         raise RuntimeError(f"index_repository failed: {proc.stderr.strip()}")
     data = unwrap_cli_json(proc.stdout)
+    elapsed_ms_int = int(elapsed_ms)
+    logged_elapsed_ms = {
+        "pipeline_done": parse_logged_elapsed_ms(proc.stderr, "pipeline.done"),
+        "incremental_done": parse_logged_elapsed_ms(proc.stderr, "incremental.done"),
+    }
+    indexed_ms = indexed_work_elapsed_ms(logged_elapsed_ms)
     result: dict[str, Any] = {
-        "elapsed_ms": int(elapsed_ms),
+        "elapsed_ms": elapsed_ms_int,
+        "indexed_work_elapsed_ms": indexed_ms,
+        "unlogged_overhead_ms": (elapsed_ms_int - indexed_ms) if indexed_ms is not None else None,
         "response": data,
         "stdout_bytes": len(proc.stdout.encode("utf-8")),
         "markers": {
@@ -152,10 +167,7 @@ def run_index(
             "full_route": log_has(proc.stderr, "pipeline.route path=full"),
             "incremental_route": log_has(proc.stderr, "pipeline.route path=incremental"),
         },
-        "logged_elapsed_ms": {
-            "pipeline_done": parse_logged_elapsed_ms(proc.stderr, "pipeline.done"),
-            "incremental_done": parse_logged_elapsed_ms(proc.stderr, "incremental.done"),
-        },
+        "logged_elapsed_ms": logged_elapsed_ms,
         "stderr_tail": log_tail(proc.stderr),
     }
     if include_logs:
