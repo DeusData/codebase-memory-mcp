@@ -829,6 +829,11 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
     if (hash_store) {
         int hash_rc =
             persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
+        int state_rc = CBM_STORE_OK;
+        if (hash_rc == CBM_STORE_OK) {
+            state_rc = cbm_pipeline_persist_file_states(hash_store, project, files, file_count,
+                                                        CBM_PIPELINE_COMPAT_GENERATION, NULL);
+        }
 
         /* FTS5 rebuild after incremental dump.  The btree dump path bypasses
          * any triggers that could have kept nodes_fts synchronized, so we
@@ -847,6 +852,11 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         cbm_store_close(hash_store);
         if (hash_rc != CBM_STORE_OK) {
             return hash_rc;
+        }
+        if (state_rc != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "phase", "persist_file_state", "rc",
+                          itoa_buf_incr(state_rc));
+            return state_rc;
         }
     } else {
         cbm_log_error("incremental.err", "phase", "hash_store_open");

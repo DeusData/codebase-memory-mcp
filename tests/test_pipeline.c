@@ -930,6 +930,68 @@ TEST(pipeline_incremental_preserves_cross_file_calls) {
     PASS();
 }
 
+TEST(pipeline_full_and_incremental_persist_file_state) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    int n = snprintf(db_path, sizeof(db_path), "%s/test_file_state.db", g_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(db_path));
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+
+    const char *project1 = cbm_pipeline_project_name(p1);
+    cbm_store_t *s1 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s1);
+    cbm_file_state_t first = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s1, project1, "pkg/util/helper.go", &first), CBM_STORE_OK);
+    ASSERT_STR_EQ(first.language, "Go");
+    ASSERT_EQ(first.generation, CBM_PIPELINE_COMPAT_GENERATION);
+    ASSERT_NOT_NULL(first.content_hash);
+    char first_hash[CBM_SZ_32];
+    n = snprintf(first_hash, sizeof(first_hash), "%s", first.content_hash);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(first_hash));
+    cbm_store_file_state_free_fields(&first);
+    cbm_store_close(s1);
+    cbm_pipeline_free(p1);
+
+    char helper[512];
+    n = snprintf(helper, sizeof(helper), "%s/pkg/util/helper.go", g_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(helper));
+    ASSERT_EQ(th_append_file(helper, "\nfunc Extra() {}\n"), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p2 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    cbm_pipeline_apply_config(p2, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+
+    const char *project2 = cbm_pipeline_project_name(p2);
+    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s2);
+    cbm_file_state_t second = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s2, project2, "pkg/util/helper.go", &second),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(second.language, "Go");
+    ASSERT_EQ(second.generation, CBM_PIPELINE_COMPAT_GENERATION);
+    ASSERT_NOT_NULL(second.content_hash);
+    ASSERT_NEQ(strcmp(first_hash, second.content_hash), 0);
+    cbm_store_file_state_free_fields(&second);
+    cbm_store_close(s2);
+    cbm_pipeline_free(p2);
+    cbm_config_close(cfg);
+
+    teardown_test_repo();
+    PASS();
+}
+
 /* ── Git history pass tests ─────────────────────────────────────── */
 
 TEST(githistory_is_trackable) {
@@ -3533,6 +3595,100 @@ TEST(pipeline_content_hash_helper_matches_file_delta_metadata) {
     ASSERT_STR_EQ(delta.file_state.content_hash, expected_hash);
     ASSERT_EQ((int)strlen(expected_hash), CBM_SZ_16);
 
+    th_cleanup(tmp);
+    PASS();
+}
+
+TEST(pipeline_file_state_persist_helper_writes_hash_metadata) {
+    enum { PIPELINE_FILE_STATE_GENERATION = 14 };
+    char *tmp = th_mktempdir("cbm_file_state_persist");
+    ASSERT_NOT_NULL(tmp);
+    const char *go_path = TH_PATH(tmp, "main.go");
+    const char *py_path = TH_PATH(tmp, "worker.py");
+    const char *go_content = "package main\nfunc Run() { println(\"persist\") }\n";
+    const char *py_content = "def run():\n    return 'persist'\n";
+    ASSERT_EQ(th_write_file(go_path, go_content), 0);
+    ASSERT_EQ(th_write_file(py_path, py_content), 0);
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", tmp), CBM_STORE_OK);
+
+    cbm_file_info_t files[2] = {
+        {.path = (char *)go_path,
+         .rel_path = "main.go",
+         .language = CBM_LANG_GO,
+         .size = (int64_t)strlen(go_content)},
+        {.path = (char *)py_path,
+         .rel_path = "worker.py",
+         .language = CBM_LANG_PYTHON,
+         .size = (int64_t)strlen(py_content)},
+    };
+    ASSERT_EQ(cbm_pipeline_persist_file_states(s, "test", files, 2, PIPELINE_FILE_STATE_GENERATION,
+                                               "test-pass"),
+              CBM_STORE_OK);
+
+    char expected_go_hash[CBM_SZ_32];
+    char expected_py_hash[CBM_SZ_32];
+    ASSERT_EQ(cbm_pipeline_content_hash_file(go_path, expected_go_hash, sizeof(expected_go_hash)),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_content_hash_file(py_path, expected_py_hash, sizeof(expected_py_hash)),
+              CBM_STORE_OK);
+
+    cbm_file_state_t go_state = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, "test", "main.go", &go_state), CBM_STORE_OK);
+    ASSERT_STR_EQ(go_state.content_hash, expected_go_hash);
+    ASSERT_STR_EQ(go_state.language, "Go");
+    ASSERT_STR_EQ(go_state.pass_fingerprint, "test-pass");
+    ASSERT_EQ(go_state.size, (int64_t)strlen(go_content));
+    ASSERT_EQ(go_state.generation, PIPELINE_FILE_STATE_GENERATION);
+    ASSERT_NOT_NULL(go_state.indexed_at);
+    ASSERT_NOT_NULL(strchr(go_state.indexed_at, 'T'));
+    cbm_store_file_state_free_fields(&go_state);
+
+    cbm_file_state_t py_state = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, "test", "worker.py", &py_state), CBM_STORE_OK);
+    ASSERT_STR_EQ(py_state.content_hash, expected_py_hash);
+    ASSERT_STR_EQ(py_state.language, "Python");
+    ASSERT_STR_EQ(py_state.pass_fingerprint, "test-pass");
+    ASSERT_EQ(py_state.size, (int64_t)strlen(py_content));
+    ASSERT_EQ(py_state.generation, PIPELINE_FILE_STATE_GENERATION);
+    cbm_store_file_state_free_fields(&py_state);
+
+    cbm_store_close(s);
+    th_cleanup(tmp);
+    PASS();
+}
+
+TEST(pipeline_file_state_persist_helper_rolls_back_on_failure) {
+    char *tmp = th_mktempdir("cbm_file_state_persist_fail");
+    ASSERT_NOT_NULL(tmp);
+    const char *path = TH_PATH(tmp, "main.go");
+    const char *content = "package main\nfunc Run() {}\n";
+    ASSERT_EQ(th_write_file(path, content), 0);
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", tmp), CBM_STORE_OK);
+
+    cbm_file_info_t files[2] = {
+        {.path = (char *)path,
+         .rel_path = "main.go",
+         .language = CBM_LANG_GO,
+         .size = (int64_t)strlen(content)},
+        {.path = (char *)TH_PATH(tmp, "missing.py"),
+         .rel_path = "missing.py",
+         .language = CBM_LANG_PYTHON,
+         .size = 0},
+    };
+    ASSERT_EQ(cbm_pipeline_persist_file_states(s, "test", files, 2,
+                                               CBM_PIPELINE_COMPAT_GENERATION, "test-pass"),
+              CBM_STORE_ERR);
+
+    cbm_file_state_t state = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, "test", "main.go", &state), CBM_STORE_NOT_FOUND);
+
+    cbm_store_close(s);
     th_cleanup(tmp);
     PASS();
 }
@@ -8466,6 +8622,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_descriptor_marks_unsupported_edges);
     RUN_TEST(pipeline_file_delta_metadata_from_file);
     RUN_TEST(pipeline_content_hash_helper_matches_file_delta_metadata);
+    RUN_TEST(pipeline_file_state_persist_helper_writes_hash_metadata);
+    RUN_TEST(pipeline_file_state_persist_helper_rolls_back_on_failure);
     RUN_TEST(pipeline_file_delta_plan_candidate_from_frontier);
     RUN_TEST(pipeline_file_delta_apply_falls_back_on_publish_error);
     RUN_TEST(pipeline_file_delta_plan_falls_back_without_existing_ownership);
@@ -8503,6 +8661,7 @@ SUITE(pipeline) {
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
+    RUN_TEST(pipeline_full_and_incremental_persist_file_state);
     /* Git history pass */
     RUN_TEST(githistory_is_trackable);
     RUN_TEST(githistory_compute_coupling);
