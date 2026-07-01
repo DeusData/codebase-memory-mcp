@@ -2521,8 +2521,10 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
     /* Save the resolved filesystem path BEFORE expand_project_param consumes
      * raw_project.  Used below to auto-index paths that aren't under session_root
      * (e.g. .gitignore-excluded subdirs that are separate git repos). */
+    bool raw_project_explicit = raw_project != NULL;
+    bool raw_project_path = raw_project_explicit && project_is_path(raw_project);
     char *_raw_path = NULL;
-    if (raw_project && project_is_path(raw_project)) {
+    if (raw_project_path) {
         char *_exp = expand_tilde(raw_project);
         _raw_path = realpath(_exp ? _exp : raw_project, NULL);
         if (!_raw_path && (_exp || raw_project[0] == '/')) {
@@ -2551,9 +2553,15 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
         }
     }
     cbm_store_t *store = resolve_store(srv, db_project);
+    bool session_store_selected = db_project && srv->session_project[0] &&
+                                  strcmp(db_project, srv->session_project) == 0;
+    bool may_use_session_root = !raw_project_explicit || session_store_selected;
 
-    /* Auto-index on first use (same enablement as REQUIRE_STORE). */
-    if (!store && srv->session_root[0] && access(srv->session_root, F_OK) == 0) {
+    /* Auto-index on first use (same enablement as REQUIRE_STORE). Explicit
+     * non-path project names are authoritative: a missing slug must report
+     * not-found instead of silently searching the active session project. */
+    if (!store && may_use_session_root && srv->session_root[0] &&
+        access(srv->session_root, F_OK) == 0) {
         if (srv->autoindex_active) {
             cbm_thread_join(&srv->autoindex_tid);
             srv->autoindex_active = false;
