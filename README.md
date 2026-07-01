@@ -389,6 +389,7 @@ Every MCP tool can be invoked from the command line:
 
 ```bash
 codebase-memory-mcp cli index_repository '{"repo_path": "/path/to/repo"}'
+codebase-memory-mcp cli delete_project '{"project":"project-name"}'
 codebase-memory-mcp cli search_graph '{"name_pattern": ".*Handler.*", "label": "Function"}'
 codebase-memory-mcp cli trace_path '{"function_name": "Search", "direction": "both"}'
 codebase-memory-mcp cli query_graph '{"query": "MATCH (f:Function) RETURN f.name LIMIT 5"}'
