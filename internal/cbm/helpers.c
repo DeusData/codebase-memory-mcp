@@ -193,6 +193,23 @@ bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     return false;
 }
 
+/* Keep in sync with generated/python_stdlib_data.c entries that the Python LSP
+ * resolves to as builtins.<name>; unfilter only names with real target nodes. */
+static const char *const python_resolvable_builtins[] = {"len",  "print", "str",   "int",
+                                                         "list", "dict",  "range", NULL};
+
+bool cbm_is_resolvable_builtin(const char *name, CBMLanguage lang) {
+    if (!name || !name[0] || lang != CBM_LANG_PYTHON) {
+        return false;
+    }
+    for (const char *const *b = python_resolvable_builtins; *b; b++) {
+        if (strcmp(name, *b) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // --- Export detection ---
 
 bool cbm_is_exported(const char *name, CBMLanguage lang) {

@@ -15,6 +15,9 @@ char *cbm_node_text(CBMArena *a, TSNode node, const char *source);
 // Check if a string is a language keyword (should be skipped as callee/usage).
 bool cbm_is_keyword(const char *name, CBMLanguage lang);
 
+// Builtins with generated LSP target nodes; call extraction must keep these callees.
+bool cbm_is_resolvable_builtin(const char *name, CBMLanguage lang);
+
 // Classify a string literal as URL, config, or neither.
 // Returns CBM_STRREF_URL (0), CBM_STRREF_CONFIG (1), or -1 for neither.
 int cbm_classify_string(const char *str, int len);
