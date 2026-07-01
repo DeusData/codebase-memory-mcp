@@ -312,6 +312,19 @@ static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *so
         return method;
     }
 
+    TSNode callee_node = ts_node_child_by_field_name(node, TS_FIELD("callee"));
+    if (!ts_node_is_null(callee_node)) {
+        while (ts_node_named_child_count(callee_node) == 1) {
+            const char *ck = ts_node_type(callee_node);
+            if (strcmp(ck, "value") != 0 && strcmp(ck, "var") != 0 &&
+                strcmp(ck, "expression") != 0) {
+                break;
+            }
+            callee_node = ts_node_named_child(callee_node, 0);
+        }
+        return cbm_node_text(a, callee_node, source);
+    }
+
     return NULL;
 }
 

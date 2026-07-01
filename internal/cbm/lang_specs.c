@@ -973,7 +973,8 @@ static const char *d_throw_types[] = {"throw_expression", NULL};
 
 // ==================== LLVM IR ====================
 static const char *llvm_func_types[] = {"function_header", NULL};
-static const char *llvm_call_types[] = {"call", "invoke", NULL};
+static const char *llvm_call_types[] = {"instruction_call", "instruction_invoke",
+                                        "instruction_callbr", NULL};
 static const char *llvm_branch_types[] = {"br", "switch", NULL};
 static const char *llvm_var_types[] = {"local_var", "global_var", NULL};
 

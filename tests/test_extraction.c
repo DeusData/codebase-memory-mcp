@@ -2207,6 +2207,21 @@ TEST(just_function_call_edge) {
     PASS();
 }
 
+TEST(llvm_call_edge) {
+    CBMFileResult *r = extract("declare void @callee()\n"
+                               "define void @caller() {\n"
+                               "entry:\n"
+                               "  call void @callee()\n"
+                               "  ret void\n"
+                               "}\n",
+                               CBM_LANG_LLVM_IR, "test", "calls.ll");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "@callee"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(puppet_function_call_edge) {
     CBMFileResult *r = extract("notice('ready')\n", CBM_LANG_PUPPET, "test", "site.pp");
     ASSERT_NOT_NULL(r);
@@ -3445,6 +3460,7 @@ SUITE(extraction) {
     RUN_TEST(makefile_variable_extraction);
     RUN_TEST(makefile_builtin_call_edges);
     RUN_TEST(just_function_call_edge);
+    RUN_TEST(llvm_call_edge);
     RUN_TEST(puppet_function_call_edge);
     RUN_TEST(vimscript_function_extraction);
     RUN_TEST(vimscript_function_without_bang);
