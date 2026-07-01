@@ -637,30 +637,60 @@ static bool delta_path_in_batch(const char *path, const cbm_pipeline_file_delta_
     return false;
 }
 
+static bool delta_batch_contains_edge(const cbm_pipeline_file_delta_t *const *deltas,
+                                      int delta_count, const char *source_qn,
+                                      const char *target_qn, const char *type) {
+    if (!deltas || !source_qn || !target_qn || !type) {
+        return false;
+    }
+    for (int i = 0; i < delta_count; i++) {
+        const cbm_pipeline_file_delta_t *delta = deltas[i];
+        if (!delta) {
+            continue;
+        }
+        for (int j = 0; j < delta->delta.edge_count; j++) {
+            const cbm_store_delta_edge_t *edge = &delta->delta.edges[j];
+            if (edge->source_qn && edge->target_qn && edge->type &&
+                strcmp(edge->source_qn, source_qn) == 0 &&
+                strcmp(edge->target_qn, target_qn) == 0 && strcmp(edge->type, type) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool delta_unowned_inbound_edge_is_regenerated(
+    const cbm_store_inbound_edge_t *edge, const cbm_pipeline_file_delta_t *const *deltas,
+    int delta_count) {
+    return edge && edge->source_rel_path && edge->source_rel_path[0] == '\0' && edge->type &&
+           strcmp(edge->type, "CONTAINS_FILE") == 0 &&
+           delta_batch_contains_edge(deltas, delta_count, edge->source_qn, edge->target_qn,
+                                     edge->type);
+}
+
 static bool delta_inbound_edges_supported(cbm_store_t *store,
                                           const cbm_pipeline_file_delta_t *delta,
                                           const cbm_pipeline_file_delta_t *const *deltas,
                                           int delta_count,
                                           cbm_pipeline_file_delta_plan_t *plan) {
-    char **source_paths = NULL;
-    int source_count = 0;
-    int rc = cbm_store_list_file_delta_inbound_source_paths(
-        store, delta->delta.project, delta->delta.rel_path, &source_paths, &source_count);
+    cbm_store_inbound_edge_t *edges = NULL;
+    int edge_count = 0;
+    int rc = cbm_store_list_file_delta_inbound_edges(store, delta->delta.project,
+                                                     delta->delta.rel_path, &edges, &edge_count);
     if (rc != CBM_STORE_OK) {
         delta_plan_set_fallback(plan, cbm_delta_reason_preflight_error);
         return false;
     }
     bool ok = true;
-    for (int i = 0; i < source_count; i++) {
-        if (!delta_path_in_batch(source_paths[i], deltas, delta_count)) {
+    for (int i = 0; i < edge_count; i++) {
+        if (!delta_path_in_batch(edges[i].source_rel_path, deltas, delta_count) &&
+            !delta_unowned_inbound_edge_is_regenerated(&edges[i], deltas, delta_count)) {
             ok = false;
             break;
         }
     }
-    for (int i = 0; i < source_count; i++) {
-        free(source_paths[i]);
-    }
-    free(source_paths);
+    cbm_store_free_inbound_edges(edges, edge_count);
     if (!ok) {
         delta_plan_set_fallback(plan, cbm_delta_reason_inbound_edges_require_full);
     }

@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include "foundation/constants.h"
 
+#include <limits.h>
 #include <math.h>
 
 enum {
@@ -2341,6 +2342,117 @@ int cbm_store_list_file_delta_inbound_source_paths(cbm_store_t *s, const char *p
     bind_text(stmt, ST_COL_1, project);
     bind_text(stmt, ST_COL_2, rel_path);
     return store_collect_text_column(s, stmt, "list_file_delta_inbound_source_paths", out, count);
+}
+
+void cbm_store_free_inbound_edges(cbm_store_inbound_edge_t *edges, int count) {
+    if (!edges) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(edges[i].source_qn);
+        free(edges[i].target_qn);
+        free(edges[i].type);
+        free(edges[i].source_rel_path);
+        free(edges[i].target_rel_path);
+    }
+    free(edges);
+}
+
+static int store_inbound_edges_grow(cbm_store_inbound_edge_t **items, int *cap) {
+    if (!items || !cap) {
+        return CBM_STORE_ERR;
+    }
+    if (*cap > INT_MAX / ST_GROWTH) {
+        return CBM_STORE_ERR;
+    }
+    int new_cap = (*cap > 0) ? *cap * ST_GROWTH : ST_INIT_CAP_8;
+    cbm_store_inbound_edge_t *next = realloc(*items, (size_t)new_cap * sizeof(*next));
+    if (!next) {
+        return CBM_STORE_ERR;
+    }
+    *items = next;
+    *cap = new_cap;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_list_file_delta_inbound_edges(cbm_store_t *s, const char *project,
+                                            const char *rel_path,
+                                            cbm_store_inbound_edge_t **out, int *count) {
+    if (out) {
+        *out = NULL;
+    }
+    if (count) {
+        *count = 0;
+    }
+    if (!s || !project || !rel_path || !out || !count) {
+        if (s) {
+            store_set_error(s, "list_file_delta_inbound_edges: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    const char *sql =
+        "SELECT src.qualified_name, tgt.qualified_name, e.type, "
+        "       COALESCE(src_owner.rel_path, ''), COALESCE(tgt_owner.rel_path, '') "
+        "FROM edges e "
+        "JOIN node_owners tgt_owner "
+        "  ON tgt_owner.project = ?1 AND tgt_owner.rel_path = ?2 "
+        " AND tgt_owner.node_id = e.target_id "
+        "JOIN nodes src ON src.id = e.source_id "
+        "JOIN nodes tgt ON tgt.id = e.target_id "
+        "LEFT JOIN node_owners src_owner "
+        "  ON src_owner.project = ?1 AND src_owner.node_id = e.source_id "
+        "WHERE e.project = ?1 "
+        "  AND (src_owner.rel_path IS NULL OR src_owner.rel_path != ?2) "
+        "ORDER BY src.qualified_name, tgt.qualified_name, e.type;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "list_file_delta_inbound_edges prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+
+    int cap = 0;
+    int n = 0;
+    int partial = 0;
+    cbm_store_inbound_edge_t *items = NULL;
+    int rc = CBM_STORE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n >= cap && store_inbound_edges_grow(&items, &cap) != CBM_STORE_OK) {
+            rc = CBM_STORE_ERR;
+            break;
+        }
+        cbm_store_inbound_edge_t *edge = &items[n];
+        memset(edge, 0, sizeof(*edge));
+        partial = 1;
+        edge->source_qn = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        edge->target_qn = heap_strdup((const char *)sqlite3_column_text(stmt, 1));
+        edge->type = heap_strdup((const char *)sqlite3_column_text(stmt, 2));
+        edge->source_rel_path = heap_strdup((const char *)sqlite3_column_text(stmt, 3));
+        edge->target_rel_path = heap_strdup((const char *)sqlite3_column_text(stmt, 4));
+        if (!edge->source_qn || !edge->target_qn || !edge->type || !edge->source_rel_path ||
+            !edge->target_rel_path) {
+            rc = CBM_STORE_ERR;
+            break;
+        }
+        n++;
+        partial = 0;
+    }
+    if (rc != SQLITE_DONE && rc != CBM_STORE_ERR) {
+        store_set_error_sqlite(s, "list_file_delta_inbound_edges");
+        rc = CBM_STORE_ERR;
+    } else if (rc == SQLITE_DONE) {
+        rc = CBM_STORE_OK;
+    }
+    sqlite3_finalize(stmt);
+    if (rc != CBM_STORE_OK) {
+        cbm_store_free_inbound_edges(items, n + partial);
+        return rc;
+    }
+    *out = items;
+    *count = n;
+    return CBM_STORE_OK;
 }
 
 int cbm_store_upsert_symbol_export(cbm_store_t *s, const char *project,

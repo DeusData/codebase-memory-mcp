@@ -109,6 +109,14 @@ typedef struct {
 } cbm_store_delta_edge_t;
 
 typedef struct {
+    char *source_qn;
+    char *target_qn;
+    char *type;
+    char *source_rel_path; /* empty when source node has no owner metadata */
+    char *target_rel_path;
+} cbm_store_inbound_edge_t;
+
+typedef struct {
     const char *qualified_name;
     int64_t node_id; /* CBM_STORE_NO_NODE_ID resolves by qualified_name when present. */
 } cbm_store_symbol_export_t;
@@ -530,6 +538,13 @@ int cbm_store_count_file_delta_owners(cbm_store_t *s, const char *project,
 int cbm_store_list_file_delta_inbound_source_paths(cbm_store_t *s, const char *project,
                                                    const char *rel_path, char ***out,
                                                    int *count);
+
+/* Caller frees with cbm_store_free_inbound_edges(). */
+int cbm_store_list_file_delta_inbound_edges(cbm_store_t *s, const char *project,
+                                            const char *rel_path,
+                                            cbm_store_inbound_edge_t **out, int *count);
+
+void cbm_store_free_inbound_edges(cbm_store_inbound_edge_t *edges, int count);
 
 int cbm_store_upsert_symbol_export(cbm_store_t *s, const char *project,
                                    const char *qualified_name, const char *rel_path,

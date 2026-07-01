@@ -1043,6 +1043,18 @@ TEST(store_rebuild_file_delta_owners_derives_from_graph) {
               CBM_STORE_OK);
     ASSERT_EQ(node_owners, 1);
     ASSERT_EQ(edge_owners, 1);
+    cbm_store_inbound_edge_t *inbound = NULL;
+    int inbound_count = 0;
+    ASSERT_EQ(cbm_store_list_file_delta_inbound_edges(s, "test", "src/main.go", &inbound,
+                                                      &inbound_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(inbound_count, 1);
+    ASSERT_STR_EQ(inbound[0].source_qn, "test.src");
+    ASSERT_STR_EQ(inbound[0].target_qn, "test.src.main.__file__");
+    ASSERT_STR_EQ(inbound[0].type, "CONTAINS_FILE");
+    ASSERT_STR_EQ(inbound[0].source_rel_path, "");
+    ASSERT_STR_EQ(inbound[0].target_rel_path, "src/main.go");
+    cbm_store_free_inbound_edges(inbound, inbound_count);
     ASSERT_EQ(store_count_metadata_owners(s, 0, "test", "stale.go"), 0);
     ASSERT_EQ(store_count_metadata_owners(s, 1, "test", "stale.go"), 0);
 
