@@ -834,6 +834,33 @@ static char *extract_vhdl_callee(CBMArena *a, TSNode node, const char *source, c
     return NULL;
 }
 
+static char *extract_first_leaf_identifier(CBMArena *a, TSNode node, const char *source) {
+    TSNode cur = node;
+    enum { CALLEE_LEAF_DESCENT_LIMIT = 8 };
+    for (int depth = 0; depth < CALLEE_LEAF_DESCENT_LIMIT && !ts_node_is_null(cur); depth++) {
+        const char *k = ts_node_type(cur);
+        if (strcmp(k, "simple_identifier") == 0 || strcmp(k, "identifier") == 0 ||
+            strcmp(k, "word") == 0 || strcmp(k, "name") == 0 || strcmp(k, "qid") == 0) {
+            char *t = cbm_node_text(a, cur, source);
+            return (t && t[0]) ? t : NULL;
+        }
+        if (ts_node_named_child_count(cur) == 0) {
+            return NULL;
+        }
+        cur = ts_node_named_child(cur, 0);
+    }
+    return NULL;
+}
+
+// HDL callees are often wrapped by subroutine/tf/hierarchical identifier nodes.
+static char *extract_hdl_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "function_subroutine_call") != 0 && strcmp(nk, "subroutine_call") != 0 &&
+        strcmp(nk, "tf_call") != 0 && strcmp(nk, "system_tf_call") != 0) {
+        return NULL;
+    }
+    return extract_first_leaf_identifier(a, node, source);
+}
+
 // Make builtins are represented as function_call nodes; $(shell ...) is shell_function.
 static char *extract_make_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
     if (strcmp(nk, "shell_function") == 0) {
@@ -941,6 +968,10 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
     }
     if (lang == CBM_LANG_VHDL) {
         char *c = extract_vhdl_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
+    if (lang == CBM_LANG_VERILOG || lang == CBM_LANG_SYSTEMVERILOG) {
+        char *c = extract_hdl_callee(a, node, source, nk);
         return c ? c : extract_scripting_callee(a, node, source, lang, nk);
     }
 

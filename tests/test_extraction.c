@@ -1260,6 +1260,40 @@ TEST(vhdl_function_call_edge) {
     PASS();
 }
 
+TEST(verilog_function_call_edge) {
+    CBMFileResult *r = extract("module m;\n"
+                               "  function integer foo;\n"
+                               "    input integer x;\n"
+                               "    begin foo = x; end\n"
+                               "  endfunction\n"
+                               "  integer y;\n"
+                               "  initial begin\n"
+                               "    y = foo(1);\n"
+                               "  end\n"
+                               "endmodule\n",
+                               CBM_LANG_VERILOG, "t", "mod.v");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "foo"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(systemverilog_subroutine_call_edge) {
+    CBMFileResult *r = extract("module m;\n"
+                               "  function int foo(); return 1; endfunction\n"
+                               "  initial begin\n"
+                               "    foo();\n"
+                               "  end\n"
+                               "endmodule\n",
+                               CBM_LANG_SYSTEMVERILOG, "t", "mod.sv");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "foo"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Fortran --- */
 TEST(fortran_function) {
     /* Fortran subroutine name extraction is incomplete — just verify no crash */
@@ -3456,6 +3490,8 @@ SUITE(extraction) {
     RUN_TEST(nickel_function_application_edge);
     RUN_TEST(func_function_application_edge);
     RUN_TEST(vhdl_function_call_edge);
+    RUN_TEST(verilog_function_call_edge);
+    RUN_TEST(systemverilog_subroutine_call_edge);
     RUN_TEST(fortran_function);
 
     /* OOP/Systems variants */

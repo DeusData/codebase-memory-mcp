@@ -1384,7 +1384,7 @@ static const char *systemverilog_class_types[] = {"class_declaration",
                                                   "type_declaration",
                                                   NULL};
 static const char *systemverilog_call_types[] = {"function_subroutine_call", "system_tf_call",
-                                                 "method_call", NULL};
+                                                 "subroutine_call", "method_call", NULL};
 static const char *systemverilog_import_types[] = {
     "package_import_declaration", "extends",  "import",     "include",
     "include_statement",          "instance", "use_clause", NULL};
