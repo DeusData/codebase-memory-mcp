@@ -42,6 +42,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "kotlin_builtins.c"
+
 #define KT_EVAL_MAX_DEPTH 32
 #define KT_IMPORT_INITIAL_CAP 16
 
@@ -4083,6 +4085,7 @@ void cbm_run_kotlin_lsp(CBMArena *arena, CBMFileResult *result, const char *sour
                     /*rel_path=*/NULL, &result->resolved_calls);
 
     kotlin_lsp_process_file(&ctx, use_root);
+    kt_builtins_inject_defs(result, arena);
 
     if (patched_tree) {
         ts_tree_delete(patched_tree);

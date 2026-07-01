@@ -10,6 +10,10 @@
 
 #include <stddef.h>
 #include <stdio.h>
+/* getenv and, on Windows, _putenv_s are used by these compatibility helpers.
+ * Include stdlib.h directly so strict toolchains do not depend on transitive
+ * declarations from other headers. */
+#include <stdlib.h>
 
 /* ── Thread-local storage ─────────────────────────────────────── */
 /* _Thread_local is C11 standard — works on GCC, Clang, and MSVC (2019+).

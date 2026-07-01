@@ -2034,6 +2034,18 @@ TEST(python_calls) {
     PASS();
 }
 
+TEST(python_resolvable_builtin_calls) {
+    CBMFileResult *r = extract("def main(xs):\n    return len(xs) + int(str(xs[0]))\n",
+                               CBM_LANG_PYTHON, "t", "main.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call(r, "len"));
+    ASSERT(has_call(r, "int"));
+    ASSERT(has_call(r, "str"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(python_iris_classMethodValue) {
     CBMFileResult *r = extract(
         "import iris\n"
@@ -3156,6 +3168,7 @@ SUITE(extraction) {
 
     /* Cross-cutting */
     RUN_TEST(python_calls);
+    RUN_TEST(python_resolvable_builtin_calls);
     RUN_TEST(python_iris_classMethodValue);
     RUN_TEST(go_calls);
     RUN_TEST(python_imports);
