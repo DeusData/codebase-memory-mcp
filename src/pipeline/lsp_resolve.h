@@ -22,6 +22,7 @@
 #define CBM_PIPELINE_LSP_RESOLVE_H
 
 #include "cbm.h"
+#include "foundation/compat.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
@@ -37,6 +38,45 @@
  * Applies to every language whose LSP populates result->resolved_calls
  * (Go, C/C++, Python, PHP). */
 #define CBM_LSP_CONFIDENCE_FLOOR 0.6f
+#define CBM_LSP_RESOLUTION_KEY_SEP '|'
+
+/* Bare last segment of a possibly qualified callee. C++ textual calls may use
+ * `::` or `->` while LSP QNs use dots; splitting on all member separators keeps
+ * sequential and parallel LSP override matching semantically identical. */
+static inline const char *cbm_lsp_bare_segment(const char *name) {
+    if (!name) {
+        return name;
+    }
+    const char *seg = name;
+    for (const char *p = name; *p; p++) {
+        if (*p == '.' || *p == ':' || (*p == '>' && p != name && p[-1] == '-')) {
+            seg = p + SKIP_ONE;
+        }
+    }
+    return seg;
+}
+
+static inline bool cbm_lsp_reason_join_strategy(const char *strategy) {
+    return strategy &&
+           (strcmp(strategy, "lsp_func_ptr") == 0 ||
+            strcmp(strategy, "lsp_dll_resolve") == 0 ||
+            strcmp(strategy, "lsp_method_ref_ctor") == 0 ||
+            strcmp(strategy, "lsp_method_ref_ctor_synth") == 0 ||
+            strcmp(strategy, "lsp_dict_dispatch") == 0 ||
+            strcmp(strategy, "lsp_destructor") == 0 ||
+            strcmp(strategy, "php_method_dynamic") == 0);
+}
+
+static inline bool cbm_lsp_resolution_matches_call(const CBMResolvedCall *rc,
+                                                   const CBMCall *call) {
+    const char *call_short = cbm_lsp_bare_segment(call->callee_name);
+    const char *resolved_short = cbm_lsp_bare_segment(rc->callee_qn);
+    if (strcmp(resolved_short, call_short) == 0) {
+        return true;
+    }
+    return rc->reason && cbm_lsp_reason_join_strategy(rc->strategy) &&
+           strcmp(cbm_lsp_bare_segment(rc->reason), call_short) == 0;
+}
 
 /* Look up the highest-confidence LSP-resolved call entry whose caller QN
  * matches the textual call's enclosing function and whose callee QN
@@ -44,10 +84,11 @@
  * or NULL if no qualifying entry exists.
  *
  * Match rule: the LSP emits CBMResolvedCall entries whose caller_qn
- * matches the call's enclosing function and whose callee_qn ends with
- * the textual callee_name as the last dot-separated segment. The
- * pointer returned aliases into `arr` and stays valid as long as the
- * underlying CBMFileResult is alive. */
+ * matches the call's enclosing function. The resolved callee QN and textual
+ * callee are compared by their last member segment, including C++ `::` and
+ * `->` forms; selected indirect strategies may instead match the original
+ * textual callee carried in `reason`. The returned pointer aliases into `arr`
+ * and stays valid as long as the underlying CBMFileResult is alive. */
 static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_with_floor(
     const CBMResolvedCallArray *arr, const CBMCall *call, double confidence_floor) {
     if (!arr || arr->count == 0 || !call) {
@@ -70,9 +111,7 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_with_floor
         if (strcmp(rc->caller_qn, call->enclosing_func_qn) != 0) {
             continue;
         }
-        const char *short_name = strrchr(rc->callee_qn, '.');
-        short_name = short_name ? short_name + SKIP_ONE : rc->callee_qn;
-        if (strcmp(short_name, call->callee_name) != 0) {
+        if (!cbm_lsp_resolution_matches_call(rc, call)) {
             continue;
         }
         if (!best || rc->confidence > best->confidence) {
@@ -98,13 +137,49 @@ static inline void cbm_lsp_resolution_index_free_key(const char *key, void *valu
     free((char *)key);
 }
 
+static inline void cbm_lsp_resolution_index_store(cbm_lsp_resolution_index_t *idx,
+                                                  const char *caller_qn,
+                                                  const char *callee_short,
+                                                  CBMResolvedCall *rc) {
+    if (!idx || !idx->entries || !caller_qn || !callee_short || !rc) {
+        if (idx) {
+            idx->complete = false;
+        }
+        return;
+    }
+    char key[CBM_SZ_1K];
+    int written = snprintf(key, sizeof(key), "%s%c%s", caller_qn,
+                           CBM_LSP_RESOLUTION_KEY_SEP, callee_short);
+    if (written <= 0 || (size_t)written >= sizeof(key)) {
+        idx->complete = false;
+        return;
+    }
+
+    CBMResolvedCall *existing = (CBMResolvedCall *)cbm_ht_get(idx->entries, key);
+    if (!existing) {
+        char *owned_key = cbm_strdup(key);
+        if (!owned_key) {
+            idx->complete = false;
+            return;
+        }
+        cbm_ht_set(idx->entries, owned_key, rc);
+    } else if (rc->confidence > existing->confidence) {
+        const char *stored_key = cbm_ht_get_key(idx->entries, key);
+        if (stored_key) {
+            cbm_ht_set(idx->entries, stored_key, rc);
+        } else {
+            idx->complete = false;
+        }
+    }
+}
+
 /* Build a per-file lookup table keyed by "caller_qn|callee_short".
  *
  * This preserves cbm_pipeline_find_lsp_resolution_with_floor() semantics:
  * it applies the function's confidence_floor argument, requires exact caller_qn
- * equality, compares the final dot-separated callee_qn segment to
- * call->callee_name, and keeps the highest-confidence entry for duplicate
- * keys. The index changes lookup cost from O(call_count * resolved_count) to
+ * equality, compares shared callee segments with C++ `::`/`->` awareness,
+ * indexes allowed original-text reason joins, and keeps the highest-confidence
+ * entry for duplicate keys. The index changes lookup cost from O(call_count * resolved_count) to
  * O(resolved_count + call_count) for files where every eligible key is indexed.
  *
  * If memory allocation or key formatting fails for any eligible entry,
@@ -136,31 +211,11 @@ static inline void cbm_lsp_resolution_index_build(cbm_lsp_resolution_index_t *id
         if (!rc->caller_qn || !rc->callee_qn || (double)rc->confidence < floor) {
             continue;
         }
-        const char *short_name = strrchr(rc->callee_qn, '.');
-        short_name = short_name ? short_name + SKIP_ONE : rc->callee_qn;
-
-        char key[CBM_SZ_1K];
-        int written = snprintf(key, sizeof(key), "%s|%s", rc->caller_qn, short_name);
-        if (written <= 0 || (size_t)written >= sizeof(key)) {
-            idx->complete = false;
-            continue;
-        }
-
-        CBMResolvedCall *existing = (CBMResolvedCall *)cbm_ht_get(idx->entries, key);
-        if (!existing) {
-            char *owned_key = strdup(key);
-            if (!owned_key) {
-                idx->complete = false;
-                continue;
-            }
-            cbm_ht_set(idx->entries, owned_key, rc);
-        } else if (rc->confidence > existing->confidence) {
-            const char *stored_key = cbm_ht_get_key(idx->entries, key);
-            if (stored_key) {
-                cbm_ht_set(idx->entries, stored_key, rc);
-            } else {
-                idx->complete = false;
-            }
+        cbm_lsp_resolution_index_store(idx, rc->caller_qn,
+                                       cbm_lsp_bare_segment(rc->callee_qn), rc);
+        if (rc->reason && cbm_lsp_reason_join_strategy(rc->strategy)) {
+            cbm_lsp_resolution_index_store(idx, rc->caller_qn,
+                                           cbm_lsp_bare_segment(rc->reason), rc);
         }
     }
 }
@@ -173,8 +228,9 @@ static inline const CBMResolvedCall *cbm_lsp_resolution_index_find(
     }
     if (idx && idx->entries) {
         char key[CBM_SZ_1K];
-        int written = snprintf(key, sizeof(key), "%s|%s", call->enclosing_func_qn,
-                               call->callee_name);
+        int written = snprintf(key, sizeof(key), "%s%c%s", call->enclosing_func_qn,
+                               CBM_LSP_RESOLUTION_KEY_SEP,
+                               cbm_lsp_bare_segment(call->callee_name));
         if (written > 0 && (size_t)written < sizeof(key)) {
             const CBMResolvedCall *hit = (const CBMResolvedCall *)cbm_ht_get(idx->entries, key);
             if (hit || idx->complete) {
