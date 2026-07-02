@@ -487,6 +487,46 @@ TEST(lsp_cpp_deep_expression_no_crash) {
     PASS();
 }
 
+TEST(lsp_perl_deep_expression_no_crash) {
+    /* Deeply nested Perl call expressions f(f(f(...f(1)...))).
+     *
+     * Root cause (PR #461 Windows CI SIGSEGV): the crash is NOT in the Perl LSP
+     * walkers — those are bounded by CBM_LSP_PERL_MAX_WALK_DEPTH and never even
+     * run here, because the process dies earlier, inside tree-sitter's GLR
+     * parser. Perl's grammar is ambiguous for paren-optional function calls
+     * (ambiguous_function_call_expression), so a deep f(f(...)) chain builds a
+     * deeply linked parse stack whose ambiguity-merge (stack_node_add_link in
+     * ts_runtime/src/stack.c) recurses once per nesting level (~260 B/frame).
+     * At this depth it overflows the small Windows thread stack (~1 MB) and even
+     * the 8 MB POSIX stack. Java/C++ survive identical nesting because their
+     * grammars are unambiguous here, so no recursive stack merge occurs. The fix
+     * caps that recursion (CBM_TS_STACK_MERGE_MAX_DEPTH); past the cap the
+     * ambiguity is left on the GLR stack instead of merged — a valid parse, never
+     * a wrong one. See lsp_java_deep_nesting_no_crash on the depth choice.
+     *
+     * Uses the fork harness (so_extract_crashes). Depth 2000 is well above
+     * the CBM_TS_STACK_MERGE_MAX_DEPTH=512 cap (exercises the fix) but fast
+     * to parse: Perl's GLR merge is O(n^2) at this pattern, so 30k (used by
+     * Java/C++) would time out on CI even post-fix. */
+    const int DEPTH = 2000;
+    size_t sz = (size_t)DEPTH * 3 + 256;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *p = src;
+    p += snprintf(p, sz, "sub f { return $_[0]; }\nsub g { return ");
+    for (int i = 0; i < DEPTH; i++) {
+        *p++ = 'f';
+        *p++ = '(';
+    }
+    *p++ = '1';
+    memset(p, ')', DEPTH);
+    p += DEPTH;
+    snprintf(p, sz - (size_t)(p - src), "; }\n");
+    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_PERL, "deep.pl"));
+    free(src);
+    PASS();
+}
+
 TEST(lsp_java_lambda_args_exceed_params_no_crash) {
     /* A call with MORE arguments than the resolved method's declared params:
      * bind_lambda_args indexed the NULL-terminated signature param_types array
@@ -528,6 +568,7 @@ SUITE(stack_overflow) {
     RUN_TEST(lsp_java_deep_nesting_no_crash);
     RUN_TEST(lsp_java_lambda_args_exceed_params_no_crash);
     RUN_TEST(lsp_cpp_deep_expression_no_crash);
+    RUN_TEST(lsp_perl_deep_expression_no_crash);
     RUN_TEST(lsp_ts_cyclic_types_no_crash);
 
     RUN_TEST(js_calls_exceed_512);
