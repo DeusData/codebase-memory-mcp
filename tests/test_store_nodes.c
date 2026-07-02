@@ -1140,6 +1140,74 @@ TEST(store_rebuild_file_delta_owners_derives_from_graph) {
     ASSERT_GT(fallback_edge_id, 0);
     ASSERT_GT(structural_edge_id, 0);
 
+    cbm_file_state_t same_stem_c_state = {.project = "test",
+                                          .rel_path = "src/pipeline/pipeline.c",
+                                          .content_hash = "hash-c",
+                                          .git_oid = "",
+                                          .mtime_ns = 1,
+                                          .size = 2,
+                                          .language = "C",
+                                          .pass_fingerprint = "test",
+                                          .generation = TEST_GENERATION,
+                                          .indexed_at = "2026-07-02T00:00:00Z"};
+    cbm_file_state_t same_stem_h_state = {.project = "test",
+                                          .rel_path = "src/pipeline/pipeline.h",
+                                          .content_hash = "hash-h",
+                                          .git_oid = "",
+                                          .mtime_ns = 1,
+                                          .size = 2,
+                                          .language = "C",
+                                          .pass_fingerprint = "test",
+                                          .generation = TEST_GENERATION,
+                                          .indexed_at = "2026-07-02T00:00:00Z"};
+    ASSERT_EQ(cbm_store_upsert_file_state(s, &same_stem_c_state), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_state(s, &same_stem_h_state), CBM_STORE_OK);
+
+    cbm_node_t same_stem_nodes[] = {
+        {.project = "test",
+         .label = "Module",
+         .name = "src/pipeline/pipeline.c",
+         .qualified_name = "test.src.pipeline.pipeline",
+         .file_path = "src/pipeline/pipeline.c",
+         .properties_json = "{}"},
+        {.project = "test",
+         .label = "Function",
+         .name = "cbm_pipeline_run",
+         .qualified_name = "test.src.pipeline.pipeline.cbm_pipeline_run",
+         .file_path = "src/pipeline/pipeline.c",
+         .properties_json = "{}"},
+        {.project = "test",
+         .label = "Function",
+         .name = "cbm_pipeline_mode",
+         .qualified_name = "test.src.pipeline.pipeline.cbm_pipeline_mode",
+         .file_path = "src/pipeline/pipeline.h",
+         .properties_json = "{}"},
+        /* Historical File-node QN collision: pipeline.c and pipeline.h both
+         * map to test.src.pipeline.pipeline.__file__; file_state must still
+         * allow ownership for src/pipeline/pipeline.c. */
+        {.project = "test",
+         .label = "File",
+         .name = "pipeline.h",
+         .qualified_name = "test.src.pipeline.pipeline.__file__",
+         .file_path = "src/pipeline/pipeline.h",
+         .properties_json = "{}"},
+    };
+    int64_t same_stem_module_id = cbm_store_upsert_node(s, &same_stem_nodes[0]);
+    int64_t same_stem_c_fn_id = cbm_store_upsert_node(s, &same_stem_nodes[1]);
+    int64_t same_stem_h_fn_id = cbm_store_upsert_node(s, &same_stem_nodes[2]);
+    int64_t same_stem_file_id = cbm_store_upsert_node(s, &same_stem_nodes[3]);
+    ASSERT_GT(same_stem_module_id, 0);
+    ASSERT_GT(same_stem_c_fn_id, 0);
+    ASSERT_GT(same_stem_h_fn_id, 0);
+    ASSERT_GT(same_stem_file_id, 0);
+    cbm_edge_t same_stem_call = {.project = "test",
+                                 .source_id = same_stem_module_id,
+                                 .target_id = same_stem_h_fn_id,
+                                 .type = "CALLS",
+                                 .properties_json = "{}"};
+    int64_t same_stem_call_id = cbm_store_insert_edge(s, &same_stem_call);
+    ASSERT_GT(same_stem_call_id, 0);
+
     ASSERT_EQ(cbm_store_upsert_node_owner(s, "test", main_id, "stale.go", TEST_GENERATION - 1),
               CBM_STORE_OK);
     ASSERT_EQ(cbm_store_upsert_edge_owner(s, "test", direct_edge_id, "stale.go", NULL,
@@ -1185,6 +1253,32 @@ TEST(store_rebuild_file_delta_owners_derives_from_graph) {
     ASSERT_STR_EQ(inbound[0].target_rel_path, "src/main.go");
     ASSERT_STR_EQ(inbound[0].edge_rel_path, "src/main.go");
     cbm_store_free_inbound_edges(inbound, inbound_count);
+
+    ASSERT_EQ(cbm_store_count_file_delta_owners(s, "test", "src/pipeline/pipeline.c",
+                                                &node_owners, &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_EQ(node_owners, 2);
+    ASSERT_EQ(edge_owners, 1);
+    ASSERT_EQ(cbm_store_count_file_delta_owners(s, "test", "src/pipeline/pipeline.h",
+                                                &node_owners, &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_EQ(node_owners, 2);
+    ASSERT_EQ(edge_owners, 0);
+
+    inbound = NULL;
+    inbound_count = 0;
+    ASSERT_EQ(cbm_store_list_file_delta_inbound_edges(s, "test", "src/pipeline/pipeline.h",
+                                                      &inbound, &inbound_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(inbound_count, 1);
+    ASSERT_STR_EQ(inbound[0].source_qn, "test.src.pipeline.pipeline");
+    ASSERT_STR_EQ(inbound[0].target_qn, "test.src.pipeline.pipeline.cbm_pipeline_mode");
+    ASSERT_STR_EQ(inbound[0].type, "CALLS");
+    ASSERT_STR_EQ(inbound[0].source_rel_path, "src/pipeline/pipeline.c");
+    ASSERT_STR_EQ(inbound[0].target_rel_path, "src/pipeline/pipeline.h");
+    ASSERT_STR_EQ(inbound[0].edge_rel_path, "src/pipeline/pipeline.c");
+    cbm_store_free_inbound_edges(inbound, inbound_count);
+
     ASSERT_EQ(store_count_metadata_owners(s, 0, "test", "stale.go"), 0);
     ASSERT_EQ(store_count_metadata_owners(s, 1, "test", "stale.go"), 0);
 
