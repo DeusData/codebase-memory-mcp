@@ -1751,6 +1751,14 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
+    /* Fetch the persisted project row so we can surface indexed_at — lets
+     * staleness be compared against the graph's own timestamp instead of
+     * re-verifying everything by whole-file reads. proj holds heap-owned
+     * strings (heap_strdup in cbm_store_get_project); freed after the
+     * response is serialized (see below). */
+    cbm_project_t proj = {0};
+    bool have_proj = (cbm_store_get_project(store, project, &proj) == CBM_STORE_OK);
+
     if (project) {
         int nodes = cbm_store_count_nodes(store, project);
         int edges = cbm_store_count_edges(store, project);
@@ -1758,6 +1766,12 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
         yyjson_mut_obj_add_int(doc, root, "edges", edges);
         yyjson_mut_obj_add_str(doc, root, "status", nodes > 0 ? "ready" : "empty");
+        /* indexed_at added via the no-copy _str variant, so proj.indexed_at
+         * MUST stay alive until after yy_doc_to_str(doc) below — matching the
+         * `project` heap-string handling in this same function. */
+        if (have_proj && proj.indexed_at) {
+            yyjson_mut_obj_add_str(doc, root, "indexed_at", proj.indexed_at);
+        }
         if (nodes == 0) {
             yyjson_mut_obj_add_str(
                 doc, root, "hint",
@@ -1769,6 +1783,11 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+    /* Free proj's heap-owned fields only after serialization — indexed_at was
+     * added no-copy above. */
+    if (have_proj) {
+        cbm_project_free_fields(&proj);
+    }
     free(project);
 
     char *result = cbm_mcp_text_result(json, false);
@@ -4589,17 +4608,25 @@ static char *handle_repo_map(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
-    /* Resolve seeds -> x50 boosts + seed records. */
+    /* Resolve seeds -> x50 boosts + seed records. Anchor names that fail to
+     * resolve are retained (ownership transferred out of anchors[]) so they
+     * can be surfaced as `seeds_unresolved` in the response — otherwise a
+     * seed miss (wrong path, file not on base) is silent to the caller.
+     * They are freed after the response JSON is serialized (below). */
     rm_boost_list_t *boosts = calloc(CBM_ALLOC_ONE, sizeof(*boosts));
     rm_seed_t seeds[REPO_MAP_MAX_BOOSTED];
     int seed_count = 0;
     int seeds_resolved = 0;
+    char *unresolved[REPO_MAP_MAX_SEEDS];
+    int unresolved_count = 0;
     for (int i = 0; i < anchor_count; i++) {
         if (rm_resolve_anchor(store, project, anchors[i], boosts, seeds, &seed_count,
                               REPO_MAP_MAX_BOOSTED)) {
             seeds_resolved++;
+            free(anchors[i]);
+        } else {
+            unresolved[unresolved_count++] = anchors[i]; /* retained; freed after JSON build */
         }
-        free(anchors[i]);
     }
 
     /* 1-hop CALLS|USAGE neighbourhood of all seeds -> x50. */
@@ -4690,6 +4717,9 @@ static char *handle_repo_map(cbm_mcp_server_t *srv, const char *args) {
         CBM_STORE_OK) {
         free(boosts);
         free(project);
+        for (int i = 0; i < unresolved_count; i++) {
+            free(unresolved[i]); /* retained unresolved anchor names — free on this error path too */
+        }
         return cbm_mcp_text_result("importance ranking query failed", true);
     }
 
@@ -4794,11 +4824,26 @@ static char *handle_repo_map(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_int(doc, root, "total_symbols", total_symbols);
     yyjson_mut_obj_add_int(doc, root, "seed_anchors_requested", seeds_requested);
     yyjson_mut_obj_add_int(doc, root, "seed_anchors_resolved", seeds_resolved);
+    /* seeds_unresolved: the anchor names rm_resolve_anchor rejected. Omitted
+     * entirely when every requested seed resolved (or none were requested) —
+     * nothing to report. Names copied into the doc via the _strcpy (copying)
+     * variant so the retained anchors[] strings can be freed immediately
+     * below regardless of the doc's lifetime. */
+    if (unresolved_count > 0) {
+        yyjson_mut_val *ua = yyjson_mut_arr(doc);
+        for (int i = 0; i < unresolved_count; i++) {
+            yyjson_mut_arr_add_strcpy(doc, ua, unresolved[i]);
+        }
+        yyjson_mut_obj_add_val(doc, root, "seeds_unresolved", ua);
+    }
     yyjson_mut_obj_add_str(doc, root, "map", map ? map : "");
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
 
+    for (int i = 0; i < unresolved_count; i++) {
+        free(unresolved[i]);
+    }
     for (int i = 0; i < cand_count; i++) {
         cbm_node_free_fields(&cands[i].node);
         free(cands[i].line);
