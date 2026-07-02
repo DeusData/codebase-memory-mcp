@@ -2934,6 +2934,22 @@ TEST(cli_config_registry_includes_dep_ranking_toggle) {
     PASS();
 }
 
+TEST(cli_config_registry_reindex_startup_guidance_is_precise) {
+    const cbm_config_entry_t *found = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, "reindex_on_startup") == 0) {
+            found = &CBM_CONFIG_REGISTRY[i];
+            break;
+        }
+    }
+
+    ASSERT_NOT_NULL(found);
+    ASSERT_NOT_NULL(strstr(found->guidance, "startup"));
+    ASSERT_NOT_NULL(strstr(found->guidance, "stale"));
+    ASSERT_NULL(strstr(found->guidance, "always-fresh"));
+    PASS();
+}
+
 TEST(cli_config_delete) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
@@ -3258,6 +3274,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_get_int);
     RUN_TEST(cli_config_get_effective_env_overrides_db);
     RUN_TEST(cli_config_registry_includes_dep_ranking_toggle);
+    RUN_TEST(cli_config_registry_reindex_startup_guidance_is_precise);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
 
