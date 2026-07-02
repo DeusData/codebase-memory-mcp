@@ -903,6 +903,32 @@ static char *build_project_list_error(const char *reason) {
     return heap_strdup(buf);
 }
 
+/* Read the caller's project argument. Accepts `project_id` as an ergonomic
+ * alias for `project` — never advertised in the TOOLS[] input_schema strings
+ * (upstream API name stays canonical; the alias is silent forgiveness, not a
+ * documented parameter). `project` wins when both are present, even when its
+ * value is wrong (an unknown project) — a present `project` is never
+ * overridden by `project_id`. Empty string is treated as absent (never
+ * looked up as a project name); a non-string JSON value is already NULL from
+ * cbm_mcp_get_string_arg. Caller owns the heap-allocated result.
+ * (pai/codebase-memory-search) */
+static char *get_project_arg(const char *args_json) {
+    char *project = cbm_mcp_get_string_arg(args_json, "project");
+    if (project && project[0] == '\0') {
+        free(project);
+        project = NULL;
+    }
+    if (!project) {
+        char *alias = cbm_mcp_get_string_arg(args_json, "project_id");
+        if (alias && alias[0] == '\0') {
+            free(alias);
+            alias = NULL;
+        }
+        project = alias;
+    }
+    return project;
+}
+
 /* Bail with project list when no store is available. */
 #define REQUIRE_STORE(store, project)                                                  \
     do {                                                                               \
@@ -1052,7 +1078,10 @@ static char *verify_project_indexed(cbm_store_t *store, const char *project) {
 }
 
 static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
-    char *project = cbm_mcp_get_string_arg(args, "project");
+    char *project = get_project_arg(args);
+    if (!project) {
+        return cbm_mcp_text_result("project is required", true);
+    }
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
 
@@ -1483,7 +1512,10 @@ static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const 
 }
 
 static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
-    char *project = cbm_mcp_get_string_arg(args, "project");
+    char *project = get_project_arg(args);
+    if (!project) {
+        return cbm_mcp_text_result("project is required", true);
+    }
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
 
@@ -1626,14 +1658,18 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
 
 static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     char *query = cbm_mcp_get_string_arg(args, "query");
-    char *project = cbm_mcp_get_string_arg(args, "project");
-    cbm_store_t *store = resolve_store(srv, project);
+    char *project = get_project_arg(args);
     int max_rows = cbm_mcp_get_int_arg(args, "max_rows", 0);
 
     if (!query) {
         free(project);
         return cbm_mcp_text_result("query is required", true);
     }
+    if (!project) {
+        free(query);
+        return cbm_mcp_text_result("project is required", true);
+    }
+    cbm_store_t *store = resolve_store(srv, project);
     if (!store) {
         char *_err = build_project_list_error("project not found or not indexed");
         char *_res = cbm_mcp_text_result(_err, true);
@@ -1704,7 +1740,10 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
 }
 
 static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
-    char *project = cbm_mcp_get_string_arg(args, "project");
+    char *project = get_project_arg(args);
+    if (!project) {
+        return cbm_mcp_text_result("project is required", true);
+    }
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
 
@@ -1739,7 +1778,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
 
 /* delete_project: just erase the .db file (and WAL/SHM). */
 static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
-    char *name = cbm_mcp_get_string_arg(args, "project");
+    char *name = get_project_arg(args);
     if (!name) {
         return cbm_mcp_text_result("project is required", true);
     }
@@ -1850,7 +1889,10 @@ static void append_cross_repo_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
 }
 
 static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
-    char *project = cbm_mcp_get_string_arg(args, "project");
+    char *project = get_project_arg(args);
+    if (!project) {
+        return cbm_mcp_text_result("project is required", true);
+    }
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
 
@@ -2222,8 +2264,7 @@ static yyjson_mut_val *bfs_to_json_array(yyjson_mut_doc *doc, cbm_traverse_resul
 
 static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *func_name = cbm_mcp_get_string_arg(args, "function_name");
-    char *project = cbm_mcp_get_string_arg(args, "project");
-    cbm_store_t *store = resolve_store(srv, project);
+    char *project = get_project_arg(args);
     char *direction = cbm_mcp_get_string_arg(args, "direction");
     char *mode = cbm_mcp_get_string_arg(args, "mode");
     char *param_name = cbm_mcp_get_string_arg(args, "parameter_name");
@@ -2238,6 +2279,14 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         free(param_name);
         return cbm_mcp_text_result("function_name is required", true);
     }
+    if (!project) {
+        free(func_name);
+        free(direction);
+        free(mode);
+        free(param_name);
+        return cbm_mcp_text_result("project is required", true);
+    }
+    cbm_store_t *store = resolve_store(srv, project);
     if (!store) {
         char *_err = build_project_list_error("project not found or not indexed");
         char *_res = cbm_mcp_text_result(_err, true);
@@ -2922,12 +2971,16 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
 
 static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     char *qn = cbm_mcp_get_string_arg(args, "qualified_name");
-    char *project = cbm_mcp_get_string_arg(args, "project");
+    char *project = get_project_arg(args);
     bool include_neighbors = cbm_mcp_get_bool_arg(args, "include_neighbors");
 
     if (!qn) {
         free(project);
         return cbm_mcp_text_result("qualified_name is required", true);
+    }
+    if (!project) {
+        free(qn);
+        return cbm_mcp_text_result("project is required", true);
     }
 
     cbm_store_t *store = resolve_store(srv, project);
@@ -3623,7 +3676,7 @@ static bool compile_path_filter(const char *filter, cbm_regex_t *re) {
 
 static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char *pattern = cbm_mcp_get_string_arg(args, "pattern");
-    char *project = cbm_mcp_get_string_arg(args, "project");
+    char *project = get_project_arg(args);
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
     char *path_filter = cbm_mcp_get_string_arg(args, "path_filter");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
@@ -3649,14 +3702,14 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("pattern is required", true);
     }
 
-    /* Project is required */
+    /* Project is required. Deliberately a plain message (never
+     * build_project_list_error) — "missing the param" and "gave an unknown
+     * value" are different failures and must not share the available_projects
+     * shape (pai/codebase-memory-search). */
     if (!project) {
         free(pattern);
         free(file_pattern);
-        char *_err = build_project_list_error("project is required");
-        char *_res = cbm_mcp_text_result(_err, true);
-        free(_err);
-        return _res;
+        return cbm_mcp_text_result("project is required", true);
     }
 
     char *root_path = get_project_root(srv, project);
@@ -3881,7 +3934,7 @@ static void detect_add_impacted_symbols(cbm_store_t *store, const char *project,
 }
 
 static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
-    char *project = cbm_mcp_get_string_arg(args, "project");
+    char *project = get_project_arg(args);
     char *base_branch = cbm_mcp_get_string_arg(args, "base_branch");
     char *scope = cbm_mcp_get_string_arg(args, "scope");
     int depth = cbm_mcp_get_int_arg(args, "depth", MCP_DEFAULT_BFS_DEPTH);
@@ -3901,12 +3954,22 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("base_branch contains invalid characters", true);
     }
 
+    if (!project) {
+        free(project);
+        free(base_branch);
+        free(scope);
+        return cbm_mcp_text_result("project is required", true);
+    }
+
     char *root_path = get_project_root(srv, project);
     if (!root_path) {
         free(project);
         free(base_branch);
         free(scope);
-        return cbm_mcp_text_result("project not found", true);
+        char *_err = build_project_list_error("project not found or not indexed");
+        char *_res = cbm_mcp_text_result(_err, true);
+        free(_err);
+        return _res;
     }
 
     if (!validate_search_path_arg(root_path)) {
@@ -4077,12 +4140,19 @@ static char *adr_read_legacy_file(const char *root_path) {
     "PATTERNS, TRADEOFFS, PHILOSOPHY."
 
 static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
-    char *project = cbm_mcp_get_string_arg(args, "project");
+    char *project = get_project_arg(args);
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     char *content = cbm_mcp_get_string_arg(args, "content");
 
     if (!mode_str) {
         mode_str = heap_strdup("get");
+    }
+
+    if (!project) {
+        free(project);
+        free(mode_str);
+        free(content);
+        return cbm_mcp_text_result("project is required", true);
     }
 
     /* ADRs are stored in the SQLite store (project_summaries), the SAME
@@ -4093,7 +4163,10 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
         free(project);
         free(mode_str);
         free(content);
-        return cbm_mcp_text_result("project not found", true);
+        char *_err = build_project_list_error("project not found or not indexed");
+        char *_res = cbm_mcp_text_result(_err, true);
+        free(_err);
+        return _res;
     }
 
     /* One-time migration: older versions wrote ADRs to a file at
@@ -4433,7 +4506,10 @@ static bool rm_resolve_anchor(cbm_store_t *store, const char *project, const cha
 }
 
 static char *handle_repo_map(cbm_mcp_server_t *srv, const char *args) {
-    char *project = cbm_mcp_get_string_arg(args, "project");
+    char *project = get_project_arg(args);
+    if (!project) {
+        return cbm_mcp_text_result("project is required", true);
+    }
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
 
