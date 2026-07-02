@@ -449,6 +449,40 @@ TEST(cli_find_cli_fallback_paths) {
     PASS();
 }
 
+TEST(cli_find_cli_fallback_scans_cargo_bin) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-find-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+#ifdef _WIN32
+    cbm_rmdir(tmpdir);
+    SKIP_PLATFORM("Windows: fallback path lookup uses POSIX semantics");
+#endif
+    char cargobin[512];
+    snprintf(cargobin, sizeof(cargobin), "%s/.cargo/bin", tmpdir);
+    test_mkdirp(cargobin);
+
+    char fakecli[512];
+    snprintf(fakecli, sizeof(fakecli), "%s/testcargo", cargobin);
+    write_test_file(fakecli, "#!/bin/sh\n");
+    th_make_executable(fakecli);
+
+    const char *raw = getenv("PATH");
+    char *old_path = raw ? strdup(raw) : NULL;
+    cbm_setenv("PATH", "/nonexistent", 1);
+
+    const char *result = cbm_find_cli("testcargo", tmpdir);
+    ASSERT_STR_EQ(result, fakecli);
+
+    if (old_path) {
+        cbm_setenv("PATH", old_path, 1);
+        free(old_path);
+    }
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Dry-run flag parsing (port of TestDryRun)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -3131,6 +3165,7 @@ SUITE(cli) {
     RUN_TEST(cli_find_cli_not_found);
     RUN_TEST(cli_find_cli_on_path);
     RUN_TEST(cli_find_cli_fallback_paths);
+    RUN_TEST(cli_find_cli_fallback_scans_cargo_bin);
 
     /* Dry-run flag parsing (1 test — install_test.go) */
     RUN_TEST(cli_dry_run_flags);
