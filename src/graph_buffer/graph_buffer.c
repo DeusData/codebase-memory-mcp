@@ -2027,23 +2027,47 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
         return CBM_NOT_FOUND;
     }
 
-    /* Upsert project */
-    cbm_store_upsert_project(store, gb->project, gb->root_path);
+    int64_t *temp_to_real = NULL;
+    int rc = cbm_store_begin_bulk(store);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
 
-    /* Begin bulk mode */
-    cbm_store_begin_bulk(store);
-    cbm_store_drop_indexes(store);
-    cbm_store_begin(store);
+    rc = cbm_store_begin(store);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_end_bulk(store);
+        return rc;
+    }
+
+    rc = cbm_store_upsert_project(store, gb->project, gb->root_path);
+    if (rc != CBM_STORE_OK) {
+        goto fail;
+    }
+
+    rc = cbm_store_drop_indexes(store);
+    if (rc != CBM_STORE_OK) {
+        goto fail;
+    }
 
     /* Delete existing project data */
-    cbm_store_delete_edges_by_project(store, gb->project);
-    cbm_store_delete_nodes_by_project(store, gb->project);
+    rc = cbm_store_delete_edges_by_project(store, gb->project);
+    if (rc != CBM_STORE_OK) {
+        goto fail;
+    }
+    rc = cbm_store_delete_nodes_by_project(store, gb->project);
+    if (rc != CBM_STORE_OK) {
+        goto fail;
+    }
 
     /* Build temp_id → real_id map.
      * Temp IDs start at 1 and are sequential, but can have gaps from edge inserts.
      * Use max_id as size. */
     int64_t max_temp_id = gb->next_id;
-    int64_t *temp_to_real = calloc(max_temp_id, sizeof(int64_t));
+    temp_to_real = calloc(max_temp_id, sizeof(int64_t));
+    if (!temp_to_real) {
+        rc = CBM_NOT_FOUND;
+        goto fail;
+    }
 
     for (int i = 0; i < gb->nodes.count; i++) {
         cbm_gbuf_node_t *n = gb->nodes.items[i];
@@ -2064,7 +2088,11 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
             .properties_json = n->properties_json,
         };
         int64_t real_id = cbm_store_upsert_node(store, &sn);
-        if (real_id > 0 && n->id < max_temp_id) {
+        if (real_id <= 0) {
+            rc = CBM_STORE_ERR;
+            goto fail;
+        }
+        if (n->id < max_temp_id) {
             temp_to_real[n->id] = real_id;
         }
     }
@@ -2085,15 +2113,30 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
             .type = e->type,
             .properties_json = e->properties_json,
         };
-        cbm_store_insert_edge(store, &se);
+        if (cbm_store_insert_edge(store, &se) <= 0) {
+            rc = CBM_STORE_ERR;
+            goto fail;
+        }
     }
 
-    cbm_store_commit(store);
-    cbm_store_create_indexes(store);
-    cbm_store_end_bulk(store);
+    rc = cbm_store_create_indexes(store);
+    if (rc != CBM_STORE_OK) {
+        goto fail;
+    }
+    rc = cbm_store_commit(store);
+    if (rc != CBM_STORE_OK) {
+        goto fail;
+    }
+    int end_bulk_rc = cbm_store_end_bulk(store);
 
     free(temp_to_real);
-    return 0;
+    return end_bulk_rc == CBM_STORE_OK ? 0 : end_bulk_rc;
+
+fail:
+    (void)cbm_store_rollback(store);
+    (void)cbm_store_end_bulk(store);
+    free(temp_to_real);
+    return rc;
 }
 
 int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store) {
