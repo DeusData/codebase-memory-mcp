@@ -7235,20 +7235,35 @@ static int arch_layers(cbm_store_t *s, const char *project, const char *path,
 }
 
 /* Add a child to a dir entry if not already present. */
-static void dir_add_child(char ***children, int *child_count, int *child_cap, const char *child) {
+static int dir_add_child(char ***children, int *child_count, int *child_cap, const char *child) {
     for (int k = 0; k < *child_count; k++) {
         if (strcmp((*children)[k], child) == 0) {
-            return;
+            return CBM_STORE_OK;
         }
     }
-    if (*child_count >= *child_cap) {
-        *child_cap = *child_cap ? *child_cap * PAIR_LEN : ST_INIT_CAP_4;
-        *children = realloc(*children, *child_cap * sizeof(char *));
+    char *copy = heap_strdup(child);
+    if (!copy) {
+        return CBM_STORE_ERR;
     }
-    (*children)[(*child_count)++] = heap_strdup(child);
+    if (*child_count >= *child_cap) {
+        if (*child_cap > INT_MAX / PAIR_LEN) {
+            free(copy);
+            return CBM_STORE_ERR;
+        }
+        int new_cap = *child_cap ? *child_cap * PAIR_LEN : ST_INIT_CAP_4;
+        char **next = realloc(*children, (size_t)new_cap * sizeof(*next));
+        if (!next) {
+            free(copy);
+            return CBM_STORE_ERR;
+        }
+        *children = next;
+        *child_cap = new_cap;
+    }
+    (*children)[(*child_count)++] = copy;
+    return CBM_STORE_OK;
 }
 
-/* Find or create a directory entry by path. Returns its index, or -1 if full. */
+/* Find or create a directory entry by path. Returns index, CBM_STORE_ERR, or CBM_NOT_FOUND if full. */
 static int dir_find_or_create(char **dir_paths, int *dir_child_counts, char ***dir_children,
                               int *dir_children_caps, int *dn, int dcap, const char *dir) {
     for (int i = 0; i < *dn; i++) {
@@ -7258,7 +7273,11 @@ static int dir_find_or_create(char **dir_paths, int *dir_child_counts, char ***d
     }
     if (*dn < dcap) {
         int idx = *dn;
-        dir_paths[idx] = heap_strdup(dir);
+        char *path = heap_strdup(dir);
+        if (!path) {
+            return CBM_STORE_ERR;
+        }
+        dir_paths[idx] = path;
         dir_child_counts[idx] = 0;
         dir_children[idx] = NULL;
         dir_children_caps[idx] = 0;
@@ -7311,17 +7330,23 @@ static int split_path_parts(const char *fp, char *buf, int buf_sz, char **parts,
 }
 
 /* Register dir hierarchy for one file path. */
-static void arch_register_file_dirs(const char *fp, char **dir_paths, int *dir_child_counts,
-                                    char ***dir_children, int *dir_children_caps, int *dn,
-                                    int dcap) {
+static int arch_register_file_dirs(const char *fp, char **dir_paths, int *dir_child_counts,
+                                   char ***dir_children, int *dir_children_caps, int *dn,
+                                   int dcap) {
     char tmp[CBM_SZ_512];
     char *parts[ST_SEARCH_MAX_BINDS];
     int nparts = split_path_parts(fp, tmp, (int)sizeof(tmp), parts, ST_SEARCH_MAX_BINDS);
 
     int ri = dir_find_or_create(dir_paths, dir_child_counts, dir_children, dir_children_caps, dn,
                                 dcap, "");
+    if (ri < 0 && *dn < dcap) {
+        return CBM_STORE_ERR;
+    }
     if (ri >= 0 && nparts > 0) {
-        dir_add_child(&dir_children[ri], &dir_child_counts[ri], &dir_children_caps[ri], parts[0]);
+        if (dir_add_child(&dir_children[ri], &dir_child_counts[ri], &dir_children_caps[ri],
+                          parts[0]) != CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
     }
 
     for (int depth = 0; depth < nparts - SKIP_ONE && depth < ST_MAX_PATH_DEPTH; depth++) {
@@ -7351,10 +7376,17 @@ static void arch_register_file_dirs(const char *fp, char **dir_paths, int *dir_c
         }
         int di = dir_find_or_create(dir_paths, dir_child_counts, dir_children, dir_children_caps,
                                     dn, dcap, dir);
+        if (di < 0 && *dn < dcap) {
+            return CBM_STORE_ERR;
+        }
         if (di >= 0) {
-            dir_add_child(&dir_children[di], &dir_child_counts[di], &dir_children_caps[di], child);
+            if (dir_add_child(&dir_children[di], &dir_child_counts[di], &dir_children_caps[di],
+                              child) != CBM_STORE_OK) {
+                return CBM_STORE_ERR;
+            }
         }
     }
+    return CBM_STORE_OK;
 }
 
 /* Count the number of '/' in a string. */
@@ -7369,22 +7401,46 @@ static int count_slashes(const char *s) {
 }
 
 /* Push a tree entry, growing the array if needed. */
-static void push_tree_entry(cbm_file_tree_entry_t **entries, int *en, int *ecap,
-                            cbm_file_tree_entry_t e) {
+static int push_tree_entry(cbm_file_tree_entry_t **entries, int *en, int *ecap,
+                           cbm_file_tree_entry_t e) {
     if (*en >= *ecap) {
-        *ecap *= ST_GROWTH;
-        *entries = safe_realloc(*entries, *ecap * sizeof(cbm_file_tree_entry_t));
+        if (*ecap > INT_MAX / ST_GROWTH) {
+            return CBM_STORE_ERR;
+        }
+        int new_cap = *ecap * ST_GROWTH;
+        cbm_file_tree_entry_t *next =
+            realloc(*entries, (size_t)new_cap * sizeof(cbm_file_tree_entry_t));
+        if (!next) {
+            return CBM_STORE_ERR;
+        }
+        *entries = next;
+        *ecap = new_cap;
     }
     (*entries)[(*en)++] = e;
+    return CBM_STORE_OK;
+}
+
+static void arch_free_tree_entries(cbm_file_tree_entry_t *entries, int count) {
+    if (!entries) {
+        return;
+    }
+    for (int j = 0; j < count; j++) {
+        safe_str_free(&entries[j].path);
+        safe_str_free(&entries[j].type);
+    }
+    free(entries);
 }
 
 /* Collect tree entries from dir arrays. */
-static void arch_collect_entries(char **dir_paths, int *dir_child_counts, char ***dir_children,
-                                 int dn, char **files, int fn, cbm_file_tree_entry_t **entries_out,
-                                 int *en_out) {
+static int arch_collect_entries(char **dir_paths, int *dir_child_counts, char ***dir_children,
+                                int dn, char **files, int fn, cbm_file_tree_entry_t **entries_out,
+                                int *en_out) {
     int ecap = CBM_SZ_64;
     int en = 0;
     cbm_file_tree_entry_t *entries = calloc(ecap, sizeof(cbm_file_tree_entry_t));
+    if (!entries) {
+        return CBM_STORE_ERR;
+    }
 
     /* Root children */
     for (int i = 0; i < dn; i++) {
@@ -7392,9 +7448,15 @@ static void arch_collect_entries(char **dir_paths, int *dir_child_counts, char *
             continue;
         }
         for (int k = 0; k < dir_child_counts[i]; k++) {
-            push_tree_entry(
-                &entries, &en, &ecap,
-                make_tree_entry(dir_children[i][k], files, fn, dir_paths, dir_child_counts, dn));
+            cbm_file_tree_entry_t e =
+                make_tree_entry(dir_children[i][k], files, fn, dir_paths, dir_child_counts, dn);
+            if (!e.path || !e.type ||
+                push_tree_entry(&entries, &en, &ecap, e) != CBM_STORE_OK) {
+                safe_str_free(&e.path);
+                safe_str_free(&e.type);
+                arch_free_tree_entries(entries, en);
+                return CBM_STORE_ERR;
+            }
         }
     }
 
@@ -7405,9 +7467,20 @@ static void arch_collect_entries(char **dir_paths, int *dir_child_counts, char *
         }
         for (int k = 0; k < dir_child_counts[i]; k++) {
             char path[CBM_SZ_512];
-            snprintf(path, sizeof(path), "%s/%s", dir_paths[i], dir_children[i][k]);
-            push_tree_entry(&entries, &en, &ecap,
-                            make_tree_entry(path, files, fn, dir_paths, dir_child_counts, dn));
+            int npath = snprintf(path, sizeof(path), "%s/%s", dir_paths[i], dir_children[i][k]);
+            if (npath <= 0 || (size_t)npath >= sizeof(path)) {
+                arch_free_tree_entries(entries, en);
+                return CBM_STORE_ERR;
+            }
+            cbm_file_tree_entry_t e =
+                make_tree_entry(path, files, fn, dir_paths, dir_child_counts, dn);
+            if (!e.path || !e.type ||
+                push_tree_entry(&entries, &en, &ecap, e) != CBM_STORE_OK) {
+                safe_str_free(&e.path);
+                safe_str_free(&e.type);
+                arch_free_tree_entries(entries, en);
+                return CBM_STORE_ERR;
+            }
         }
     }
 
@@ -7424,6 +7497,7 @@ static void arch_collect_entries(char **dir_paths, int *dir_child_counts, char *
 
     *entries_out = entries;
     *en_out = en;
+    return CBM_STORE_OK;
 }
 
 /* Free dir arrays. */
@@ -7479,6 +7553,11 @@ static int arch_file_tree(cbm_store_t *s, const char *project, const char *path,
     int *dir_child_counts = calloc(dcap, sizeof(int));
     char ***dir_children = calloc(dcap, sizeof(char **));
     int *dir_children_caps = calloc(dcap, sizeof(int));
+    int rc = CBM_STORE_ERR;
+    if (!files || !dir_paths || !dir_child_counts || !dir_children || !dir_children_caps) {
+        store_set_error(s, "arch_file_tree out of memory");
+        goto cleanup;
+    }
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         const char *fp = (const char *)sqlite3_column_text(stmt, 0);
@@ -7486,20 +7565,48 @@ static int arch_file_tree(cbm_store_t *s, const char *project, const char *path,
             continue;
         }
         if (fn >= fcap) {
-            fcap *= ST_GROWTH;
-            files = safe_realloc(files, fcap * sizeof(char *));
+            if (fcap > INT_MAX / ST_GROWTH) {
+                store_set_error(s, "arch_file_tree out of memory");
+                goto cleanup;
+            }
+            int new_cap = fcap * ST_GROWTH;
+            char **next = realloc(files, (size_t)new_cap * sizeof(*next));
+            if (!next) {
+                store_set_error(s, "arch_file_tree out of memory");
+                goto cleanup;
+            }
+            files = next;
+            fcap = new_cap;
         }
-        files[fn++] = heap_strdup(fp);
-        arch_register_file_dirs(fp, dir_paths, dir_child_counts, dir_children, dir_children_caps,
-                                &dn, dcap);
+        char *file_path = heap_strdup(fp);
+        if (!file_path) {
+            store_set_error(s, "arch_file_tree out of memory");
+            goto cleanup;
+        }
+        files[fn++] = file_path;
+        if (arch_register_file_dirs(fp, dir_paths, dir_child_counts, dir_children, dir_children_caps,
+                                    &dn, dcap) != CBM_STORE_OK) {
+            store_set_error(s, "arch_file_tree out of memory");
+            goto cleanup;
+        }
     }
     sqlite3_finalize(stmt);
+    stmt = NULL;
 
-    arch_collect_entries(dir_paths, dir_child_counts, dir_children, dn, files, fn, &out->file_tree,
-                         &out->file_tree_count);
+    if (arch_collect_entries(dir_paths, dir_child_counts, dir_children, dn, files, fn,
+                             &out->file_tree, &out->file_tree_count) != CBM_STORE_OK) {
+        store_set_error(s, "arch_file_tree out of memory");
+        goto cleanup;
+    }
 
+    rc = CBM_STORE_OK;
+
+cleanup:
+    if (stmt) {
+        sqlite3_finalize(stmt);
+    }
     arch_free_dirs(dir_paths, dir_child_counts, dir_children, dir_children_caps, dn, files, fn);
-    return CBM_STORE_OK;
+    return rc;
 }
 
 /* ── Louvain community detection ───────────────────────────────── */
