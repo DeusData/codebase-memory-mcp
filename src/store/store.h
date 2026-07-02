@@ -254,6 +254,14 @@ int cbm_store_drop_indexes(cbm_store_t *s);
 /* Recreate user indexes after bulk inserts. */
 int cbm_store_create_indexes(cbm_store_t *s);
 
+/* Rebuild the nodes_fts BM25 index from the nodes table.  Drops and recreates
+ * the FTS virtual table (which upgrades legacy 4-column databases to the schema
+ * carrying the `body` column), then re-inserts every node with its camelCase-
+ * split name and prose body (the docstring property) so full-text search matches
+ * both identifiers and content — markdown section bodies (#518) and YAML/JSON
+ * descriptions (#519).  Returns CBM_STORE_OK or CBM_STORE_ERR. */
+int cbm_store_fts_rebuild(cbm_store_t *s);
+
 /* ── WAL / Checkpoint ───────────────────────────────────────────── */
 
 /* Force WAL checkpoint + PRAGMA optimize. */

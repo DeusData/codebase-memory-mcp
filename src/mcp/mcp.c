@@ -1627,7 +1627,11 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         ") fts "
         "JOIN nodes n ON n.id = fts.rowid "
         "WHERE n.project = ?2 "
-        "  AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
+        /* Section and Module are searchable (#518/#519): their FTS `body` column
+         * carries markdown section prose and YAML/JSON description text.  They
+         * rank below code symbols (no boost above), so code results stay first.
+         * File/Folder/Variable/Project remain excluded as structural noise. */
+        "  AND n.label NOT IN ('File','Folder','Variable','Project') "
         "  AND (?6 IS NULL OR n.file_path LIKE ?6) "
         "ORDER BY rank "
         "LIMIT ?3 OFFSET ?4";
@@ -1652,17 +1656,17 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
      * Uses the identical subquery structure so the FTS5 early-exit applies here too. */
     int total = 0;
     {
-        const char *count_sql =
-            "SELECT COUNT(*) FROM ("
-            "    SELECT fts.rowid FROM ("
-            "        SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?1"
-            "        ORDER BY bm25(nodes_fts) LIMIT ?3"
-            "    ) fts "
-            "    JOIN nodes n ON n.id = fts.rowid "
-            "    WHERE n.project = ?2 "
-            "      AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project')"
-            "      AND (?6 IS NULL OR n.file_path LIKE ?6)"
-            ")";
+        const char *count_sql = "SELECT COUNT(*) FROM ("
+                                "    SELECT fts.rowid FROM ("
+                                "        SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?1"
+                                "        ORDER BY bm25(nodes_fts) LIMIT ?3"
+                                "    ) fts "
+                                "    JOIN nodes n ON n.id = fts.rowid "
+                                "    WHERE n.project = ?2 "
+                                /* Mirror the label filter in the main query above (#518/#519). */
+                                "      AND n.label NOT IN ('File','Folder','Variable','Project')"
+                                "      AND (?6 IS NULL OR n.file_path LIKE ?6)"
+                                ")";
         sqlite3_stmt *cs = NULL;
         if (sqlite3_prepare_v2(db, count_sql, BM25_SQL_AUTO_LEN, &cs, NULL) == SQLITE_OK) {
             sqlite3_bind_text(cs, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN,

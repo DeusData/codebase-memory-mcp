@@ -216,6 +216,60 @@ static void iso_now(char *buf, size_t sz) {
 
 /* ── Schema ─────────────────────────────────────────────────────── */
 
+/* FTS5 contentless virtual table DDL — single source of truth shared by
+ * init_schema (fresh databases) and cbm_store_fts_rebuild (re-index + legacy
+ * upgrade).  Columns: name, qualified_name, label, file_path, body.  `body`
+ * (added for #518/#519) carries prose — markdown section bodies, YAML/JSON
+ * description values, and function docstrings — so BM25 matches content, not
+ * only identifiers.  Contentless (content='') stores only the inverted index;
+ * we feed cbm_camel_split(name) and the raw body text at insert time.  The
+ * column is named `body` rather than `content` to avoid colliding with the
+ * `content=''` option keyword in the FTS5 DDL grammar. */
+static const char NODES_FTS_DDL[] = "CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5("
+                                    "  name, qualified_name, label, file_path, body,"
+                                    "  content='',"
+                                    "  tokenize='unicode61 remove_diacritics 2'"
+                                    ");";
+
+/* FTS backfill INSERTs.  The `body` column is fed the node's docstring property,
+ * or '' when absent or when properties is not valid JSON.  The json_valid() guard
+ * is essential — json_extract() raises on malformed JSON and would otherwise abort
+ * the whole INSERT...SELECT (pre-fix databases contain such rows; see the
+ * create_user_indexes note).  The primary form camelCase-splits the name; the
+ * fallback uses the plain name should cbm_camel_split be unavailable.  Keep the
+ * two body expressions in sync. */
+static const char FTS_BACKFILL_SQL[] =
+    "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path, body) "
+    "SELECT id, cbm_camel_split(name), qualified_name, label, file_path,"
+    " CASE WHEN json_valid(properties)"
+    " THEN coalesce(json_extract(properties,'$.docstring'),'') ELSE '' END "
+    "FROM nodes;";
+
+static const char FTS_BACKFILL_SQL_FALLBACK[] =
+    "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path, body) "
+    "SELECT id, name, qualified_name, label, file_path,"
+    " CASE WHEN json_valid(properties)"
+    " THEN coalesce(json_extract(properties,'$.docstring'),'') ELSE '' END "
+    "FROM nodes;";
+
+int cbm_store_fts_rebuild(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return CBM_STORE_ERR;
+    }
+    /* Drop + recreate so legacy 4-column tables gain the `body` column. */
+    if (cbm_store_exec(s, "DROP TABLE IF EXISTS nodes_fts;") != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    if (cbm_store_exec(s, NODES_FTS_DDL) != CBM_STORE_OK) {
+        return CBM_STORE_ERR; /* FTS5 not compiled in — regex search path still works. */
+    }
+    int rc = cbm_store_exec(s, FTS_BACKFILL_SQL);
+    if (rc != CBM_STORE_OK) {
+        rc = cbm_store_exec(s, FTS_BACKFILL_SQL_FALLBACK);
+    }
+    return rc;
+}
+
 static int init_schema(cbm_store_t *s) {
     const char *ddl =
         "CREATE TABLE IF NOT EXISTS projects ("
@@ -266,22 +320,13 @@ static int init_schema(cbm_store_t *s) {
         return rc;
     }
 
-    /* FTS5 contentless virtual table for BM25 full-text search.
-     * Contentless (content='') means FTS5 stores only the inverted index,
-     * not a copy of the source text — required for camelCase tokenization
-     * because we feed it `cbm_camel_split(name)` at insert time but want
-     * queries to match against the split tokens, not the original.
+    /* FTS5 contentless virtual table for BM25 full-text search (see NODES_FTS_DDL).
+     * Created here for fresh databases and read paths; cbm_store_fts_rebuild drops
+     * and recreates it during indexing, which also upgrades legacy 4-column tables.
      * Fails silently if FTS5 is not compiled in (SQLITE_ENABLE_FTS5). */
     {
         char *fts_err = NULL;
-        int fts_rc = sqlite3_exec(s->db,
-                                  "CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5("
-                                  "  name, qualified_name, label, file_path,"
-                                  "  content='',"
-                                  "  tokenize='unicode61 remove_diacritics 2'"
-                                  ");",
-                                  NULL, NULL, &fts_err);
-        if (fts_rc != SQLITE_OK && fts_err) {
+        if (sqlite3_exec(s->db, NODES_FTS_DDL, NULL, NULL, &fts_err) != SQLITE_OK && fts_err) {
             sqlite3_free(fts_err);
         }
     }
