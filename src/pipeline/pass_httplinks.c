@@ -157,8 +157,7 @@ static char **extract_decorators(const char *json, int *out_count) {
     yyjson_arr_iter_init(decs, &iter);
     while ((item = yyjson_arr_iter_next(&iter))) {
         if (yyjson_is_str(item)) {
-            // NOLINTNEXTLINE(misc-include-cleaner) — strdup provided by standard header
-            out[idx++] = strdup(yyjson_get_str(item));
+            out[idx++] = cbm_strdup(yyjson_get_str(item));
         }
     }
     out[idx] = NULL;
