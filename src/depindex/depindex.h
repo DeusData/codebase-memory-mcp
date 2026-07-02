@@ -143,6 +143,13 @@ void cbm_dep_discovered_free(cbm_dep_discovered_t *deps, int count);
 int cbm_dep_auto_index(const char *project_name, const char *project_root,
                        cbm_store_t *store, int max_deps, cbm_config_t *cfg);
 
+/* Same as cbm_dep_auto_index(), but the package limit is already effective:
+ * 0 disables, <0 is unlimited, >0 caps packages. cfg still configures each
+ * dependency pipeline for non-limit settings. */
+int cbm_dep_auto_index_effective(const char *project_name, const char *project_root,
+                                 cbm_store_t *store, int effective_max_deps,
+                                 cbm_config_t *cfg);
+
 /* ── Cross-Boundary Edges ──────────────────────────────────────── */
 
 /* Create IMPORTS edges from project code to dep modules.

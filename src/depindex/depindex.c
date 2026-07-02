@@ -473,14 +473,11 @@ int cbm_dep_auto_index_effective_limit(cbm_config_t *cfg, int default_limit) {
  * Runtime: O(N_deps * pipeline_run) where pipeline_run is O(files * parse_time).
  * With max 1000 files/dep at ~1ms/file: ~1s/dep * 20 deps = ~20s worst case.
  * Memory: O(symbols_per_dep) peak per dep pipeline, freed between iterations. */
-int cbm_dep_auto_index(const char *project_name, const char *project_root,
-                       cbm_store_t *store, int max_deps, cbm_config_t *cfg) {
-    if (cfg) {
-        max_deps = cbm_dep_auto_index_effective_limit(cfg, max_deps);
-    }
-    if (max_deps == 0) return 0;
-    int effective_max = (max_deps < 0) ? INT_MAX : max_deps;
-
+int cbm_dep_auto_index_effective(const char *project_name, const char *project_root,
+                                 cbm_store_t *store, int effective_max_deps,
+                                 cbm_config_t *cfg) {
+    if (effective_max_deps == 0) return 0;
+    int effective_max = (effective_max_deps < 0) ? INT_MAX : effective_max_deps;
     cbm_pkg_manager_t mgr = cbm_detect_ecosystem(project_root);
     if (mgr == CBM_PKG_COUNT) return 0;
 
@@ -529,6 +526,12 @@ int cbm_dep_auto_index(const char *project_name, const char *project_root,
     }
 
     return reindexed;
+}
+
+int cbm_dep_auto_index(const char *project_name, const char *project_root,
+                       cbm_store_t *store, int max_deps, cbm_config_t *cfg) {
+    int effective_max_deps = cfg ? cbm_dep_auto_index_effective_limit(cfg, max_deps) : max_deps;
+    return cbm_dep_auto_index_effective(project_name, project_root, store, effective_max_deps, cfg);
 }
 
 /* ── Cross-Boundary Edges ──────────────────────────────────────── */
