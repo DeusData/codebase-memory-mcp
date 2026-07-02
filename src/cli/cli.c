@@ -4825,7 +4825,7 @@ static char *fetch_latest_tag(void) {
             slash[--len] = '\0';
         }
         if (len > 0) {
-            tag = strdup(slash);
+            tag = cbm_strdup(slash);
         }
         break;
     }
