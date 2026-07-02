@@ -2095,11 +2095,24 @@ static char *expand_tilde(const char *s) {
     return result;
 }
 
+/* Return a heap-owned canonical path for an existing filesystem entry. */
+static char *mcp_resolve_existing_path(const char *path) {
+    if (!path || !path[0]) return NULL;
+#ifdef _WIN32
+    char resolved[CBM_SZ_4K];
+    if (!_fullpath(resolved, path, sizeof(resolved))) return NULL;
+    return heap_strdup(resolved);
+#else
+    return realpath(path, NULL);
+#endif
+}
+
 /* Return the canonical path string used for path-derived project slugs.
- * realpath() is used when possible; otherwise the tilde-expanded path, or the
- * original path, is copied so missing paths still produce stable error slugs.
- * out_realpath_ok tells callers whether the returned string is a realpath()
- * result for cases where only existing paths should update session_root. */
+ * Existing paths use the platform canonicalizer; otherwise the tilde-expanded
+ * path, or the original path, is copied so missing paths still produce stable
+ * error slugs. out_realpath_ok tells callers whether the returned string is a
+ * canonical existing-path result for cases where only existing paths should
+ * update session_root. */
 static char *project_canonical_path(const char *s, bool *out_realpath_ok) {
     if (out_realpath_ok) {
         *out_realpath_ok = false;
@@ -2107,7 +2120,7 @@ static char *project_canonical_path(const char *s, bool *out_realpath_ok) {
     if (!project_is_path(s)) return NULL;
     char *expanded = expand_tilde(s); /* non-NULL only for ~/ paths */
     const char *to_resolve = expanded ? expanded : s;
-    char *resolved = realpath(to_resolve, NULL);
+    char *resolved = mcp_resolve_existing_path(to_resolve);
     if (resolved) {
         free(expanded);
         if (out_realpath_ok) {
@@ -2122,7 +2135,7 @@ static char *project_canonical_path(const char *s, bool *out_realpath_ok) {
 
 /* Convert a filesystem path to a heap-allocated project slug.
  * Handles ~/ tilde expansion, resolves symlinks and relative components
- * via realpath(3), then derives the slug from the canonical absolute path.
+ * when the path exists, then derives the slug from the canonical path.
  * Returns NULL if s is not a path. Caller must free the result. */
 static char *project_slug_from_path(const char *s) {
     char *canonical = project_canonical_path(s, NULL);
@@ -5295,16 +5308,11 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
         abs_path = malloc(apsz);
         snprintf(abs_path, apsz, "%s/%s", root_path, node->file_path);
 
-        /* Path containment: resolve symlinks/../ and verify file stays within root */
-        char real_root[4096];
-        char real_file[4096];
+        /* Path containment: resolve symlinks/../ and verify file stays within root. */
+        char *real_root = mcp_resolve_existing_path(root_path);
+        char *real_file = mcp_resolve_existing_path(abs_path);
         bool path_ok = false;
-#ifdef _WIN32
-        if (_fullpath(real_root, root_path, sizeof(real_root)) &&
-            _fullpath(real_file, abs_path, sizeof(real_file))) {
-#else
-        if (realpath(root_path, real_root) && realpath(abs_path, real_file)) {
-#endif
+        if (real_root && real_file) {
             size_t root_len = strlen(real_root);
             if (strncmp(real_file, real_root, root_len) == 0 &&
                 (real_file[root_len] == '/' || real_file[root_len] == '\\' ||
@@ -5312,6 +5320,8 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
                 path_ok = true;
             }
         }
+        free(real_root);
+        free(real_file);
         if (path_ok) {
             if (mode && strcmp(mode, "signature") == 0) {
                 truncated = true;
