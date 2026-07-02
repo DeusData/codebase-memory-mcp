@@ -178,8 +178,8 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
         return NULL;
     }
 
-    p->repo_path = strdup(repo_path);
-    p->db_path = db_path ? strdup(db_path) : NULL;
+    p->repo_path = cbm_strdup(repo_path);
+    p->db_path = db_path ? cbm_strdup(db_path) : NULL;
     p->project_name = cbm_project_name_from_path(repo_path);
     (void)cbm_git_context_resolve(repo_path, &p->git_ctx);
     p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
@@ -204,7 +204,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
 void cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
     if (!p || !name) return;
     free(p->project_name);
-    p->project_name = strdup(name);
+    p->project_name = cbm_strdup(name);
 }
 
 void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store) {
@@ -529,13 +529,13 @@ static void free_seen_dir_key(const char *key, void *val, void *ud) {
 /* Walk directory chain upward, creating Folder nodes and CONTAINS_FOLDER edges. */
 static void create_folder_chain(cbm_gbuf_t *gbuf, const char *project, const char *root_qn,
                                 const char *dir, CBMHashTable *seen_dirs) {
-    char *walk = strdup(dir);
+    char *walk = cbm_strdup(dir);
     if (!walk) {
         return;
     }
     while (walk[0] != '\0' && (!seen_dirs || !cbm_ht_get(seen_dirs, walk))) {
         if (seen_dirs) {
-            char *seen_key = strdup(walk);
+            char *seen_key = cbm_strdup(walk);
             if (!seen_key) {
                 break;
             }
@@ -549,7 +549,7 @@ static void create_folder_chain(cbm_gbuf_t *gbuf, const char *project, const cha
         dir_base = dir_base ? dir_base + SKIP_ONE : walk;
         cbm_gbuf_upsert_node(gbuf, "Folder", dir_base, folder_qn, walk, 0, 0, "{}");
 
-        char *pdir = strdup(walk);
+        char *pdir = cbm_strdup(walk);
         if (!pdir) {
             free(folder_qn);
             break;
@@ -559,7 +559,7 @@ static void create_folder_chain(cbm_gbuf_t *gbuf, const char *project, const cha
             *ps = '\0';
         } else {
             free(pdir);
-            pdir = strdup("");
+            pdir = cbm_strdup("");
         }
         const char *pqn;
         char *pqn_heap = NULL;
@@ -606,7 +606,7 @@ int cbm_pipeline_ensure_file_structure(cbm_gbuf_t *gbuf, const char *project,
     snprintf(props, sizeof(props), "{\"extension\":\"%s\"}", ext ? ext : "");
     cbm_gbuf_upsert_node(gbuf, "File", basename, file_qn, rel_path, 0, 0, props);
 
-    char *dir = strdup(rel_path);
+    char *dir = cbm_strdup(rel_path);
     if (!dir) {
         free(file_qn);
         return CBM_NOT_FOUND;
@@ -616,7 +616,7 @@ int cbm_pipeline_ensure_file_structure(cbm_gbuf_t *gbuf, const char *project,
         *last_slash = '\0';
     } else {
         free(dir);
-        dir = strdup("");
+        dir = cbm_strdup("");
         if (!dir) {
             free(file_qn);
             return CBM_NOT_FOUND;
