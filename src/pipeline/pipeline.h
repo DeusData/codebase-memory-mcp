@@ -124,6 +124,11 @@ const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
  * pipeline to propagate cancellation into the sub-pipeline context. */
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 
+/* Check whether this pipeline's project in an already-open store is current
+ * for the pipeline mode and configured thresholds. This is a metadata-only
+ * gate when mtime/size match and hash-confirms only ambiguous files. */
+int cbm_pipeline_store_project_current(cbm_pipeline_t *p, cbm_store_t *store, bool *out_current);
+
 /* Get the index mode (CBM_MODE_FULL, CBM_MODE_MODERATE, CBM_MODE_FAST, CBM_MODE_DEP). */
 int cbm_pipeline_get_mode(const cbm_pipeline_t *p);
 

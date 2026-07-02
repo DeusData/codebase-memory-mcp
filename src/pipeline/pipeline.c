@@ -340,6 +340,126 @@ int cbm_pipeline_current_pass_fingerprint(const cbm_pipeline_t *p, char *out, si
         p->semantic_threshold, p->githistory_min_coupling, p->lsp_confidence_floor);
 }
 
+static bool pipeline_file_state_metadata_current(cbm_store_t *store, const char *project,
+                                                 const cbm_file_info_t *file,
+                                                 const char *pass_fingerprint,
+                                                 const struct stat *st) {
+    cbm_file_state_t state = {0};
+    int rc = cbm_store_get_file_state(store, project, file->rel_path, &state);
+    bool current = false;
+    if (rc == CBM_STORE_OK && state.content_hash && state.content_hash[0] &&
+        state.pass_fingerprint && strcmp(state.pass_fingerprint, pass_fingerprint) == 0 &&
+        state.size == st->st_size &&
+        state.mtime_ns == cbm_pipeline_stat_mtime_ns(st)) {
+        current = true;
+    }
+    cbm_store_file_state_free_fields(&state);
+    return current;
+}
+
+static int pipeline_store_project_files_current(cbm_store_t *store, const char *project,
+                                                cbm_file_info_t *files, int file_count,
+                                                const char *pass_fingerprint,
+                                                bool *out_current) {
+    *out_current = false;
+    if (!store || !project || !project[0] || !files || file_count <= 0 || !pass_fingerprint) {
+        return CBM_STORE_ERR;
+    }
+
+    cbm_file_hash_t *stored = NULL;
+    int stored_count = 0;
+    int rc = cbm_store_get_file_hashes(store, project, &stored, &stored_count);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    if (stored_count != file_count) {
+        cbm_store_free_file_hashes(stored, stored_count);
+        return CBM_STORE_OK;
+    }
+
+    CBMHashTable *ht = cbm_ht_create((size_t)stored_count * PAIR_LEN);
+    if (!ht) {
+        cbm_store_free_file_hashes(stored, stored_count);
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < stored_count; i++) {
+        cbm_ht_set(ht, stored[i].rel_path, &stored[i]);
+    }
+
+    bool current = true;
+    for (int i = 0; i < file_count; i++) {
+        cbm_file_hash_t *hash = cbm_ht_get(ht, files[i].rel_path);
+        struct stat st;
+        if (!hash || stat(files[i].path, &st) != 0) {
+            current = false;
+            break;
+        }
+        int64_t mtime_ns = cbm_pipeline_stat_mtime_ns(&st);
+        if (st.st_size == hash->size && mtime_ns == hash->mtime_ns) {
+            if (!pipeline_file_state_metadata_current(store, project, &files[i], pass_fingerprint,
+                                                      &st)) {
+                current = false;
+                break;
+            }
+            continue;
+        }
+        if (!cbm_pipeline_file_state_content_matches_current(store, project, &files[i],
+                                                             pass_fingerprint)) {
+            current = false;
+            break;
+        }
+    }
+
+    cbm_ht_free(ht);
+    cbm_store_free_file_hashes(stored, stored_count);
+    *out_current = current;
+    return CBM_STORE_OK;
+}
+
+int cbm_pipeline_store_project_current(cbm_pipeline_t *p, cbm_store_t *store, bool *out_current) {
+    if (!out_current) {
+        return CBM_STORE_ERR;
+    }
+    *out_current = false;
+    if (!p || !store || !p->project_name || !p->project_name[0] || !p->repo_path) {
+        return CBM_STORE_ERR;
+    }
+
+    char pass_fingerprint[CBM_SZ_256];
+    int rc =
+        cbm_pipeline_current_pass_fingerprint(p, pass_fingerprint, sizeof(pass_fingerprint));
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    cbm_discover_opts_t opts = {
+        .mode = p->mode,
+        .ignore_file = NULL,
+        .max_file_size = 0,
+    };
+    const cbm_userconfig_t *previous_userconfig = cbm_get_user_lang_config();
+    cbm_userconfig_t *loaded_userconfig = NULL;
+    const cbm_userconfig_t *active_userconfig = p->userconfig;
+    if (!active_userconfig) {
+        loaded_userconfig = cbm_userconfig_load(p->repo_path);
+        active_userconfig = loaded_userconfig;
+    }
+    cbm_set_user_lang_config(active_userconfig);
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    if (cbm_discover(p->repo_path, &opts, &files, &file_count) != 0) {
+        cbm_set_user_lang_config(previous_userconfig);
+        cbm_userconfig_free(loaded_userconfig);
+        return CBM_STORE_ERR;
+    }
+    rc = pipeline_store_project_files_current(store, p->project_name, files, file_count,
+                                              pass_fingerprint, out_current);
+    cbm_discover_free(files, file_count);
+    cbm_set_user_lang_config(previous_userconfig);
+    cbm_userconfig_free(loaded_userconfig);
+    return rc;
+}
+
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     if (p) {
         p->persistence = enabled;
@@ -1208,6 +1328,92 @@ static int try_incremental_or_reindex(cbm_pipeline_t *p, cbm_file_info_t *files,
     return CBM_NOT_FOUND;
 }
 
+static int pipeline_persist_replacement_metadata(cbm_pipeline_t *p, cbm_store_t *store,
+                                                 cbm_file_info_t *files, int file_count,
+                                                 bool rebuild_fts) {
+    if (!p || !store || !p->project_name || !p->project_name[0] || file_count < 0 ||
+        (file_count > 0 && !files)) {
+        return CBM_STORE_ERR;
+    }
+
+    bool hash_batched = (cbm_store_begin(store) == CBM_STORE_OK);
+    int delete_rc = cbm_store_delete_file_hashes(store, p->project_name);
+    if (delete_rc != CBM_STORE_OK) {
+        if (hash_batched) {
+            (void)cbm_store_rollback(store);
+        }
+        cbm_log_error("pipeline.err", "phase", "persist_hashes_delete", "rc",
+                      itoa_buf(delete_rc));
+        return delete_rc;
+    }
+
+    int hash_failed = 0;
+    for (int i = 0; i < file_count; i++) {
+        struct stat fst;
+        if (stat(files[i].path, &fst) == 0) {
+            int hash_rc = cbm_store_upsert_file_hash(store, p->project_name, files[i].rel_path, "",
+                                                     cbm_pipeline_stat_mtime_ns(&fst),
+                                                     fst.st_size);
+            if (hash_rc != CBM_STORE_OK) {
+                hash_failed++;
+            }
+        }
+    }
+    if (hash_failed > 0) {
+        if (hash_batched) {
+            (void)cbm_store_rollback(store);
+        }
+        cbm_log_error("pipeline.err", "phase", "persist_hashes", "failed",
+                      itoa_buf(hash_failed));
+        return CBM_STORE_ERR;
+    }
+    if (hash_batched) {
+        int commit_rc = cbm_store_commit(store);
+        if (commit_rc != CBM_STORE_OK) {
+            cbm_log_error("pipeline.err", "phase", "persist_hashes_commit", "rc",
+                          itoa_buf(commit_rc));
+            return commit_rc;
+        }
+    }
+
+    char pass_fingerprint[CBM_SZ_256];
+    int state_rc =
+        cbm_pipeline_current_pass_fingerprint(p, pass_fingerprint, sizeof(pass_fingerprint));
+    if (state_rc == CBM_STORE_OK) {
+        state_rc = cbm_pipeline_persist_file_states(
+            store, p->project_name, files, file_count, CBM_PIPELINE_COMPAT_GENERATION,
+            pass_fingerprint);
+    }
+    if (state_rc != CBM_STORE_OK) {
+        cbm_log_error("pipeline.err", "phase", "persist_file_state", "rc", itoa_buf(state_rc));
+        return state_rc;
+    }
+    if (p->incremental_reindex != CBM_INCREMENTAL_REINDEX_OFF) {
+        int owner_rc =
+            cbm_store_rebuild_file_delta_owners(store, p->project_name,
+                                                CBM_PIPELINE_COMPAT_GENERATION);
+        if (owner_rc != CBM_STORE_OK) {
+            cbm_log_error("pipeline.err", "phase", "rebuild_file_delta_owners", "rc",
+                          itoa_buf(owner_rc));
+            return owner_rc;
+        }
+    }
+    if (rebuild_fts) {
+        int fts_rc = cbm_store_rebuild_nodes_fts(store);
+        if (fts_rc != CBM_STORE_OK) {
+            cbm_log_error("pipeline.err", "phase", "rebuild_nodes_fts", "rc", itoa_buf(fts_rc));
+            return fts_rc;
+        }
+    }
+    int derived_rc = cbm_pipeline_mark_replacement_derived_views(store, p->project_name, p->mode);
+    if (derived_rc != CBM_STORE_OK) {
+        cbm_log_error("pipeline.err", "phase", "mark_derived_views", "rc", itoa_buf(derived_rc));
+        return derived_rc;
+    }
+    cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
+    return CBM_STORE_OK;
+}
+
 /* mtime conversion is shared with incremental and exact-delta metadata so
  * file_hash classification cannot drift by platform path. */
 
@@ -1452,10 +1658,9 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
                      itoa_buf((int)elapsed_ms(t)));
     }
 
-    /* Dump: when flush_store is set (dep indexing) flush to the in-memory
-     * store; otherwise write the .db sqlite file and persist file hashes
-     * for the next incremental run. The flush_store path skips hash
-     * persistence (no DB file is written). */
+    /* Dump: when flush_store is set (dep indexing) flush to the open store;
+     * otherwise write the .db sqlite file. Both paths persist replacement
+     * metadata so later freshness checks use the same file-state policy. */
     if (!check_cancel(p)) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
@@ -1497,107 +1702,19 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_FULL);
         cbm_log_info("pass.timing", "pass", "dump", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
-        /* Persist file hashes so next run can use incremental path.
-         * Skipped for dep indexing (flush_store): no DB file is written. */
-        if (!p->flush_store) {
+        if (p->flush_store) {
+            rc = pipeline_persist_replacement_metadata(p, p->flush_store, files, file_count, false);
+            if (rc != CBM_STORE_OK) {
+                goto cleanup;
+            }
+        } else {
             cbm_store_t *hash_store = cbm_store_open_path(db_path);
             if (hash_store) {
-                /* Batch upserts in one transaction: N files -> 1 COMMIT under WAL
-                 * instead of N autocommit fsyncs. Falls back to autocommit if
-                 * BEGIN fails. Matches persist_hashes() in pipeline_incremental.c. */
-                bool hash_batched = (cbm_store_begin(hash_store) == CBM_STORE_OK);
-                int delete_rc = cbm_store_delete_file_hashes(hash_store, p->project_name);
-                if (delete_rc != CBM_STORE_OK) {
-                    if (hash_batched) {
-                        (void)cbm_store_rollback(hash_store);
-                    }
-                    cbm_log_error("pipeline.err", "phase", "persist_hashes_delete", "rc",
-                                  itoa_buf(delete_rc));
-                    cbm_store_close(hash_store);
-                    rc = delete_rc;
-                    goto cleanup;
-                }
-                int hash_failed = 0;
-                for (int i = 0; i < file_count; i++) {
-                    struct stat fst;
-                    if (stat(files[i].path, &fst) == 0) {
-                        int hash_rc =
-                            cbm_store_upsert_file_hash(hash_store, p->project_name,
-                                                       files[i].rel_path, "",
-                                                       cbm_pipeline_stat_mtime_ns(&fst),
-                                                       fst.st_size);
-                        if (hash_rc != CBM_STORE_OK) {
-                            hash_failed++;
-                        }
-                    }
-                }
-                if (hash_failed > 0) {
-                    if (hash_batched) {
-                        (void)cbm_store_rollback(hash_store);
-                    }
-                    cbm_log_error("pipeline.err", "phase", "persist_hashes", "failed",
-                                  itoa_buf(hash_failed));
-                    cbm_store_close(hash_store);
-                    rc = CBM_STORE_ERR;
-                    goto cleanup;
-                }
-                if (hash_batched) {
-                    int commit_rc = cbm_store_commit(hash_store);
-                    if (commit_rc != CBM_STORE_OK) {
-                        cbm_log_error("pipeline.err", "phase", "persist_hashes_commit", "rc",
-                                      itoa_buf(commit_rc));
-                        cbm_store_close(hash_store);
-                        rc = commit_rc;
-                        goto cleanup;
-                    }
-                }
-                char pass_fingerprint[CBM_SZ_256];
-                int state_rc =
-                    cbm_pipeline_current_pass_fingerprint(p, pass_fingerprint,
-                                                          sizeof(pass_fingerprint));
-                if (state_rc == CBM_STORE_OK) {
-                    state_rc = cbm_pipeline_persist_file_states(
-                        hash_store, p->project_name, files, file_count,
-                        CBM_PIPELINE_COMPAT_GENERATION, pass_fingerprint);
-                }
-                if (state_rc != CBM_STORE_OK) {
-                    cbm_log_error("pipeline.err", "phase", "persist_file_state", "rc",
-                                  itoa_buf(state_rc));
-                    cbm_store_close(hash_store);
-                    rc = state_rc;
-                    goto cleanup;
-                }
-                if (p->incremental_reindex != CBM_INCREMENTAL_REINDEX_OFF) {
-                    int owner_rc = cbm_store_rebuild_file_delta_owners(
-                        hash_store, p->project_name, CBM_PIPELINE_COMPAT_GENERATION);
-                    if (owner_rc != CBM_STORE_OK) {
-                        cbm_log_error("pipeline.err", "phase", "rebuild_file_delta_owners", "rc",
-                                      itoa_buf(owner_rc));
-                        cbm_store_close(hash_store);
-                        rc = owner_rc;
-                        goto cleanup;
-                    }
-                }
-                int fts_rc = cbm_store_rebuild_nodes_fts(hash_store);
-                if (fts_rc != CBM_STORE_OK) {
-                    cbm_log_error("pipeline.err", "phase", "rebuild_nodes_fts", "rc",
-                                  itoa_buf(fts_rc));
-                    cbm_store_close(hash_store);
-                    rc = fts_rc;
-                    goto cleanup;
-                }
-                int derived_rc = cbm_pipeline_mark_replacement_derived_views(
-                    hash_store, p->project_name, p->mode);
-                if (derived_rc != CBM_STORE_OK) {
-                    cbm_log_error("pipeline.err", "phase", "mark_derived_views", "rc",
-                                  itoa_buf(derived_rc));
-                    cbm_store_close(hash_store);
-                    rc = derived_rc;
-                    goto cleanup;
-                }
+                rc = pipeline_persist_replacement_metadata(p, hash_store, files, file_count, true);
                 cbm_store_close(hash_store);
-                cbm_log_info("pass.timing", "pass", "persist_hashes", "files",
-                             itoa_buf(file_count));
+                if (rc != CBM_STORE_OK) {
+                    goto cleanup;
+                }
             }
 
             /* Export persistent .db.zst artifact when persistence is enabled.

@@ -779,6 +779,22 @@ TEST(test_auto_index_deps_refreshes_nodes_fts) {
     ASSERT_GT(cbm_store_count_nodes(store, "dep-fts-test.dep.requests"), 0);
     ASSERT_GT(count_fts_matches(store, "dep-fts-test.dep.requests", "get"), 0);
 
+    cbm_file_hash_t *hashes = NULL;
+    int hash_count = 0;
+    ASSERT_EQ(cbm_store_get_file_hashes(store, "dep-fts-test.dep.requests", &hashes, &hash_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(hash_count, 1);
+    cbm_store_free_file_hashes(hashes, hash_count);
+
+    cbm_file_state_t state = {0};
+    ASSERT_EQ(cbm_store_get_file_state(store, "dep-fts-test.dep.requests", "__init__.py", &state),
+              CBM_STORE_OK);
+    ASSERT_NOT_NULL(state.pass_fingerprint);
+    cbm_store_file_state_free_fields(&state);
+
+    ASSERT_EQ(cbm_dep_auto_index(project, proj_dir, store, 1, NULL), 0);
+    ASSERT_GT(count_fts_matches(store, "dep-fts-test.dep.requests", "get"), 0);
+
     char init_path[512];
     n = snprintf(init_path, sizeof(init_path),
                  "%s/.venv/lib/python3.12/site-packages/requests/__init__.py", proj_dir);
@@ -955,6 +971,47 @@ TEST(test_cross_edges_null_safety) {
     PASS();
 }
 
+TEST(test_cross_edges_record_file_owner) {
+    cbm_store_t *st = cbm_store_open_memory();
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, "dep-owner-test", "/tmp/project"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(st, "dep-owner-test.dep.requests", "/tmp/requests"),
+              CBM_STORE_OK);
+
+    cbm_node_t import_node = {0};
+    import_node.project = "dep-owner-test";
+    import_node.label = "Variable";
+    import_node.name = "requests";
+    import_node.qualified_name = "dep-owner-test.app.imports.requests";
+    import_node.file_path = "app.py";
+    import_node.start_line = 1;
+    import_node.end_line = 1;
+    import_node.properties_json = "{}";
+    ASSERT_GT(cbm_store_upsert_node(st, &import_node), 0);
+
+    cbm_node_t module_node = {0};
+    module_node.project = "dep-owner-test.dep.requests";
+    module_node.label = "Module";
+    module_node.name = "requests";
+    module_node.qualified_name = "dep-owner-test.dep.requests";
+    module_node.file_path = "__init__.py";
+    module_node.start_line = 1;
+    module_node.end_line = 1;
+    module_node.properties_json = "{}";
+    ASSERT_GT(cbm_store_upsert_node(st, &module_node), 0);
+
+    ASSERT_EQ(cbm_dep_link_cross_edges(st, "dep-owner-test"), 1);
+    int node_owners = 0;
+    int edge_owners = 0;
+    ASSERT_EQ(cbm_store_count_file_delta_owners(st, "dep-owner-test", "app.py", &node_owners,
+                                                &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_EQ(edge_owners, 1);
+
+    cbm_store_close(st);
+    PASS();
+}
+
 TEST(test_auto_index_deps_config_limit_policy) {
     char cache_tmp[CBM_SZ_256];
     int n = snprintf(cache_tmp, sizeof(cache_tmp), "%s/cbm_dep_policy_XXXXXX", cbm_tmpdir());
@@ -1035,5 +1092,6 @@ SUITE(depindex) {
     RUN_TEST(test_trace_results_have_source_field);
     RUN_TEST(test_snippet_has_source_origin_field);
     RUN_TEST(test_cross_edges_null_safety);
+    RUN_TEST(test_cross_edges_record_file_owner);
     RUN_TEST(test_auto_index_deps_config_limit_policy);
 }

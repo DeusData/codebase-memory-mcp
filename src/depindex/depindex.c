@@ -501,6 +501,13 @@ int cbm_dep_auto_index(const char *project_name, const char *project_root,
         if (dp) {
             cbm_pipeline_apply_config(dp, cfg);
             cbm_pipeline_set_project_name(dp, dep_proj);
+            bool current = false;
+            int current_rc = cbm_pipeline_store_project_current(dp, store, &current);
+            if (current_rc == CBM_STORE_OK && current) {
+                cbm_pipeline_free(dp);
+                free(dep_proj);
+                continue;
+            }
             cbm_pipeline_set_flush_store(dp, store);
             if (cbm_pipeline_run(dp) == 0) reindexed++;
             cbm_pipeline_free(dp);
@@ -509,8 +516,10 @@ int cbm_dep_auto_index(const char *project_name, const char *project_root,
     }
     cbm_dep_discovered_free(deps, dep_count);
 
-    if (reindexed > 0) {
+    if (dep_count > 0) {
         cbm_dep_link_cross_edges(store, project_name);
+    }
+    if (reindexed > 0) {
         int fts_rc = cbm_store_rebuild_nodes_fts(store);
         if (fts_rc != CBM_STORE_OK) {
             char rc_str[CBM_NAME_MAX];
@@ -595,8 +604,18 @@ int cbm_dep_link_cross_edges(cbm_store_t *store, const char *project_name) {
             .type = "IMPORTS",
             .project = project_name,
         };
-        cbm_store_insert_edge(store, &edge);
+        int64_t edge_id = cbm_store_insert_edge(store, &edge);
+        if (edge_id <= 0) {
+            continue;
+        }
         linked++;
+        if (out.results[i].node.file_path && out.results[i].node.file_path[0] &&
+            cbm_store_upsert_edge_owner(store, project_name, edge_id,
+                                        out.results[i].node.file_path, NULL,
+                                        CBM_PIPELINE_FILE_DELTA_GENERATION) != CBM_STORE_OK) {
+            cbm_log_warn("dep.cross_edges.owner", "project", project_name, "file",
+                         out.results[i].node.file_path);
+        }
     }
 
     if (mod_by_name) cbm_ht_free(mod_by_name); /* keys borrowed from mod_out, not freed */

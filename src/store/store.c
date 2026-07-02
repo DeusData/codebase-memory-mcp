@@ -2158,8 +2158,14 @@ int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash
     int cap = ST_INIT_CAP_16;
     int n = 0;
     cbm_file_hash_t *arr = malloc(cap * sizeof(cbm_file_hash_t));
+    if (!arr) {
+        sqlite3_reset(stmt);
+        store_set_error(s, "get_file_hashes out of memory");
+        return CBM_STORE_ERR;
+    }
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         if (n >= cap) {
             cap *= ST_GROWTH;
             arr = safe_realloc(arr, cap * sizeof(cbm_file_hash_t));
@@ -2171,6 +2177,13 @@ int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash
         arr[n].size = sqlite3_column_int64(stmt, CBM_SZ_4);
         n++;
     }
+    if (step_rc != SQLITE_DONE) {
+        cbm_store_free_file_hashes(arr, n);
+        sqlite3_reset(stmt);
+        store_set_error_sqlite(s, "get_file_hashes");
+        return CBM_STORE_ERR;
+    }
+    sqlite3_reset(stmt);
 
     *out = arr;
     *count = n;
@@ -2257,6 +2270,7 @@ int cbm_store_get_file_state(cbm_store_t *s, const char *project, const char *re
     bind_text(stmt, ST_COL_2, rel_path);
     int rc = sqlite3_step(stmt);
     if (rc != SQLITE_ROW) {
+        sqlite3_reset(stmt);
         return CBM_STORE_NOT_FOUND;
     }
 
@@ -2270,6 +2284,7 @@ int cbm_store_get_file_state(cbm_store_t *s, const char *project, const char *re
     out->pass_fingerprint = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_7));
     out->generation = sqlite3_column_int64(stmt, ST_COL_8);
     out->indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_9));
+    sqlite3_reset(stmt);
     return CBM_STORE_OK;
 }
 
