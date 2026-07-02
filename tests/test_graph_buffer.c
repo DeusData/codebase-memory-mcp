@@ -266,6 +266,40 @@ TEST(gbuf_find_by_label) {
     PASS();
 }
 
+TEST(gbuf_upsert_reindexes_label_and_name) {
+    enum {
+        COMPAT_DECL_START = 41,
+        COMPAT_DECL_END = 42,
+        COMPAT_DEF_START = 22,
+        COMPAT_DEF_END = 36,
+    };
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    int64_t id1 = cbm_gbuf_upsert_node(gb, "Macro", "OLD_NAME", "pkg.compat.cbm_strndup",
+                                       "compat.h", COMPAT_DECL_START, COMPAT_DECL_END, "{}");
+    int64_t id2 = cbm_gbuf_upsert_node(gb, "Function", "cbm_strndup",
+                                       "pkg.compat.cbm_strndup", "compat.c", COMPAT_DEF_START,
+                                       COMPAT_DEF_END,
+                                       "{\"loop_depth\":1,\"self_recursive\":false}");
+    ASSERT_EQ(id1, id2);
+
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_gbuf_find_by_label(gb, "Macro", &nodes, &count), 0);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(cbm_gbuf_find_by_label(gb, "Function", &nodes, &count), 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(nodes[0]->id, id1);
+
+    ASSERT_EQ(cbm_gbuf_find_by_name(gb, "OLD_NAME", &nodes, &count), 0);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(cbm_gbuf_find_by_name(gb, "cbm_strndup", &nodes, &count), 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(nodes[0]->id, id1);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 TEST(gbuf_find_by_name) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
     cbm_gbuf_upsert_node(gb, "Function", "main", "a.main", "a.go", 1, 5, "{}");
@@ -925,6 +959,42 @@ TEST(gbuf_merge_overlapping_qns) {
     PASS();
 }
 
+TEST(gbuf_merge_reindexes_label_and_name) {
+    enum {
+        COMPAT_DECL_START = 48,
+        COMPAT_DECL_END = 50,
+        COMPAT_DEF_START = 197,
+        COMPAT_DEF_END = 230,
+    };
+    cbm_gbuf_t *dst = cbm_gbuf_new("test", "/tmp");
+    cbm_gbuf_t *src = cbm_gbuf_new("test", "/tmp");
+
+    cbm_gbuf_upsert_node(dst, "Macro", "OLD_NAME", "pkg.compat.cbm_getline", "compat.h",
+                         COMPAT_DECL_START, COMPAT_DECL_END, "{}");
+    cbm_gbuf_upsert_node(src, "Function", "cbm_getline", "pkg.compat.cbm_getline",
+                         "compat.c", COMPAT_DEF_START, COMPAT_DEF_END,
+                         "{\"loop_depth\":1,\"self_recursive\":false}");
+    ASSERT_EQ(cbm_gbuf_merge(dst, src), 0);
+
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_gbuf_find_by_label(dst, "Macro", &nodes, &count), 0);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(cbm_gbuf_find_by_label(dst, "Function", &nodes, &count), 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(nodes[0]->name, "cbm_getline");
+
+    ASSERT_EQ(cbm_gbuf_find_by_name(dst, "OLD_NAME", &nodes, &count), 0);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(cbm_gbuf_find_by_name(dst, "cbm_getline", &nodes, &count), 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(nodes[0]->label, "Function");
+
+    cbm_gbuf_free(dst);
+    cbm_gbuf_free(src);
+    PASS();
+}
+
 TEST(gbuf_merge_route_file_path_is_deterministic) {
     cbm_gbuf_t *dst = cbm_gbuf_new("test", "/tmp");
     cbm_gbuf_t *src = cbm_gbuf_new("test", "/tmp");
@@ -1481,6 +1551,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_upsert_updates);
     RUN_TEST(gbuf_find_by_id);
     RUN_TEST(gbuf_find_by_label);
+    RUN_TEST(gbuf_upsert_reindexes_label_and_name);
     RUN_TEST(gbuf_find_by_name);
     RUN_TEST(gbuf_delete_by_label);
     RUN_TEST(gbuf_insert_edge);
@@ -1525,6 +1596,7 @@ SUITE(graph_buffer) {
 
     /* Merge tests */
     RUN_TEST(gbuf_merge_overlapping_qns);
+    RUN_TEST(gbuf_merge_reindexes_label_and_name);
     RUN_TEST(gbuf_merge_route_file_path_is_deterministic);
     RUN_TEST(gbuf_merge_section_file_path_is_deterministic);
     RUN_TEST(gbuf_merge_definition_source_prefers_richer_span);
