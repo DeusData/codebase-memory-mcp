@@ -27,13 +27,10 @@ static bool test_file_exists_mcp(const char *path) {
     return true;
 }
 
-static void assert_stale_freshness_view(const char *json, const char *view_name) {
-    ASSERT_NOT_NULL(json);
-    ASSERT_NOT_NULL(view_name);
-    ASSERT_NOT_NULL(strstr(json, "\"freshness\""));
-    ASSERT_NOT_NULL(strstr(json, "\"state\":\"stale_with_warning\""));
-    ASSERT_NOT_NULL(strstr(json, "\"stale_views\""));
-    ASSERT_NOT_NULL(strstr(json, view_name));
+static bool has_stale_freshness_view(const char *json, const char *view_name) {
+    return json && view_name && strstr(json, "\"freshness\"") &&
+           strstr(json, "\"state\":\"stale_with_warning\"") &&
+           strstr(json, "\"stale_views\"") && strstr(json, view_name);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -741,7 +738,7 @@ TEST(tool_search_graph_warns_on_stale_pagerank_view) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
     ASSERT_NOT_NULL(strstr(inner, "pagerank derived view is stale"));
-    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_PAGERANK);
+    ASSERT(has_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_PAGERANK));
     ASSERT_NULL(strstr(inner, "\"pagerank\":"));
 
     free(inner);
@@ -779,7 +776,7 @@ TEST(tool_search_graph_warns_on_stale_route_view) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
     ASSERT_NOT_NULL(strstr(inner, "routes derived view is stale"));
-    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_ROUTES);
+    ASSERT(has_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_ROUTES));
 
     free(inner);
     free(resp);
@@ -1027,7 +1024,7 @@ TEST(tool_search_graph_semantic_query_warns_on_stale_semantic_view) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
     ASSERT_NOT_NULL(strstr(inner, "semantic_edges derived view is stale"));
-    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES);
+    ASSERT(has_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES));
 
     free(inner);
     free(resp);
@@ -1074,7 +1071,7 @@ TEST(tool_query_graph_warns_on_stale_route_view) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
     ASSERT_NOT_NULL(strstr(inner, "routes derived view is stale"));
-    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_ROUTES);
+    ASSERT(has_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_ROUTES));
 
     free(inner);
     free(resp);
@@ -1144,7 +1141,39 @@ TEST(tool_query_graph_warns_on_stale_semantic_edges) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
     ASSERT_NOT_NULL(strstr(inner, "semantic_edges derived view is stale"));
-    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES);
+    ASSERT(has_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_query_graph_warns_on_stale_similarity_edges) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "query-similarity-stale";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/query-similarity-stale"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_set_derived_view_state(st, proj, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
+                                               CBM_STORE_DERIVED_GENERATION_UNKNOWN,
+                                               CBM_STORE_DERIVED_STATUS_STALE),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":116,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"query_graph\","
+             "\"arguments\":{\"project\":\"query-similarity-stale\","
+             "\"query\":\"MATCH (a)-[:SIMILAR_TO]->(b) RETURN a.name, b.name LIMIT 5\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
+    ASSERT_NOT_NULL(strstr(inner, "semantic_edges derived view is stale"));
+    ASSERT(has_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES));
 
     free(inner);
     free(resp);
@@ -1405,8 +1434,8 @@ TEST(tool_trace_path_warns_on_stale_rank_views) {
     ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
     ASSERT_NOT_NULL(strstr(inner, "pagerank derived view is stale"));
     ASSERT_NOT_NULL(strstr(inner, "linkrank derived view is stale"));
-    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_PAGERANK);
-    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_LINKRANK);
+    ASSERT(has_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_PAGERANK));
+    ASSERT(has_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_LINKRANK));
 
     free(inner);
     free(resp);
@@ -1536,9 +1565,9 @@ TEST(tool_get_architecture_warns_on_stale_derived_views) {
     ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
     ASSERT_NOT_NULL(strstr(inner, "architecture derived view is stale"));
     ASSERT_NOT_NULL(strstr(inner, "routes derived view is stale"));
-    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_ARCHITECTURE);
-    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_ROUTES);
-    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_PAGERANK);
+    ASSERT(has_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_ARCHITECTURE));
+    ASSERT(has_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_ROUTES));
+    ASSERT(has_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_PAGERANK));
     ASSERT_NOT_NULL(strstr(inner, "key_functions were omitted"));
     ASSERT_NULL(strstr(inner, "\"key_functions\""));
 
@@ -3550,6 +3579,7 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_warns_on_stale_route_view);
     RUN_TEST(tool_query_graph_warns_when_broad_query_returns_stale_route);
     RUN_TEST(tool_query_graph_warns_on_stale_semantic_edges);
+    RUN_TEST(tool_query_graph_warns_on_stale_similarity_edges);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_index_status_includes_git_metadata);
 
