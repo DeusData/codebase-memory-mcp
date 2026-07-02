@@ -2493,6 +2493,9 @@ TEST(cli_config_get_bool) {
     ASSERT_FALSE(cbm_config_get_bool(cfg, "auto_index", false));
     ASSERT_TRUE(cbm_config_get_bool(cfg, "auto_index", true));
 
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_WATCH, false));
+    ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_WATCH, true));
+
     /* true variants */
     cbm_config_set(cfg, "k1", "true");
     ASSERT_TRUE(cbm_config_get_bool(cfg, "k1", false));

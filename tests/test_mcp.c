@@ -6,12 +6,17 @@
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h" /* cbm_unlink / cbm_rmdir */
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
+#include <watcher/watcher.h>
+#include "cli/cli.h"
+#include "pipeline/pipeline.h"
 #include <yyjson/yyjson.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <unistd.h>
 
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING
@@ -2209,6 +2214,78 @@ TEST(tool_bad_project_name_no_overflow_issue235) {
 }
 #undef ISSUE235_DBNAME
 
+TEST(mcp_auto_watch_disabled_skips_watcher_on_connect) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-autowatch-XXXXXX");
+    if (!cbm_mkdtemp(cache))
+        PASS();
+
+    char repodir[512];
+    snprintf(repodir, sizeof(repodir), "%s/repo", cache);
+    test_mkdirp(repodir);
+
+    char *project = cbm_project_name_from_path(repodir);
+    ASSERT_NOT_NULL(project);
+
+    char db_path[1024];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *db = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(cbm_store_upsert_project(db, project, repodir), CBM_STORE_OK);
+    cbm_store_close(db);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char old_cwd[1024];
+    ASSERT_NOT_NULL(getcwd(old_cwd, sizeof(old_cwd)));
+    ASSERT_EQ(chdir(repodir), 0);
+
+    cbm_config_t *cfg = cbm_config_open(cache);
+    ASSERT_NOT_NULL(cfg);
+
+    cbm_store_t *wstore = cbm_store_open_memory();
+    cbm_watcher_t *watcher = cbm_watcher_new(wstore, NULL, NULL);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_mcp_server_set_watcher(srv, watcher);
+    cbm_mcp_server_set_config(srv, cfg);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+    free(resp);
+    ASSERT_EQ(cbm_watcher_watch_count(watcher), 0);
+
+    cbm_mcp_server_free(srv);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_WATCH, "true"), 0);
+
+    srv = cbm_mcp_server_new(NULL);
+    cbm_mcp_server_set_watcher(srv, watcher);
+    cbm_mcp_server_set_config(srv, cfg);
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}");
+    free(resp);
+    ASSERT_EQ(cbm_watcher_watch_count(watcher), 1);
+
+    cbm_mcp_server_free(srv);
+    cbm_watcher_free(watcher);
+    cbm_store_close(wstore);
+    cbm_config_close(cfg);
+    free(project);
+    chdir(old_cwd);
+
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        free(saved_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    cbm_unlink(db_path);
+    test_rmdir_r(repodir);
+    cbm_rmdir(cache);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
@@ -2353,4 +2430,5 @@ SUITE(mcp) {
     RUN_TEST(snippet_include_neighbors_enabled);
     RUN_TEST(snippet_source_invalid_utf8);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
+    RUN_TEST(mcp_auto_watch_disabled_skips_watcher_on_connect);
 }
