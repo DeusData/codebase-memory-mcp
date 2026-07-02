@@ -307,7 +307,7 @@ const char *cbm_find_cli(const char *name, const char *home_dir) {
 #else
     paths[4][0] = '\0';
 #endif
-    for (int i = 0; i < NUM_RETRIES; i++) {
+    for (int i = 0; i < NUM_PATHS; i++) {
         if (paths[i][0] && is_executable(paths[i])) {
             snprintf(buf, sizeof(buf), "%s", paths[i]);
             return buf;
