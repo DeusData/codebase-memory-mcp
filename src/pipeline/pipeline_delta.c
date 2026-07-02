@@ -261,26 +261,50 @@ static int delta_grow(void **items, int *cap, size_t item_sz) {
     return CBM_STORE_OK;
 }
 
+static void delta_edge_free_fields(cbm_store_delta_edge_t *edge) {
+    if (!edge) {
+        return;
+    }
+    free((void *)edge->source_qn);
+    free((void *)edge->target_qn);
+    free((void *)edge->type);
+    free((void *)edge->properties_json);
+    *edge = (cbm_store_delta_edge_t){0};
+}
+
+static void delta_import_free_fields(cbm_store_import_ref_t *import) {
+    if (!import) {
+        return;
+    }
+    free((void *)import->import_text);
+    free((void *)import->local_name);
+    free((void *)import->target_qn);
+    *import = (cbm_store_import_ref_t){0};
+}
+
 static int delta_append_node(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t *node) {
     if (ctx->out->delta.node_count >= ctx->node_cap &&
         delta_grow((void **)&ctx->out->nodes, &ctx->node_cap, sizeof(*ctx->out->nodes)) !=
             CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
-    cbm_node_t *dst = &ctx->out->nodes[ctx->out->delta.node_count++];
-    *dst = (cbm_node_t){.id = CBM_STORE_NO_NODE_ID,
-                        .project = delta_strdup(ctx->project),
-                        .label = delta_strdup(node->label),
-                        .name = delta_strdup(node->name),
-                        .qualified_name = delta_strdup(node->qualified_name),
-                        .file_path = delta_strdup(node->file_path),
-                        .start_line = node->start_line,
-                        .end_line = node->end_line,
-                        .properties_json = delta_strdup(node->properties_json ? node->properties_json : "{}")};
-    if (!dst->project || !dst->label || !dst->name || !dst->qualified_name || !dst->file_path ||
-        !dst->properties_json) {
+    cbm_node_t row = {
+        .id = CBM_STORE_NO_NODE_ID,
+        .project = delta_strdup(ctx->project),
+        .label = delta_strdup(node->label),
+        .name = delta_strdup(node->name),
+        .qualified_name = delta_strdup(node->qualified_name),
+        .file_path = delta_strdup(node->file_path),
+        .start_line = node->start_line,
+        .end_line = node->end_line,
+        .properties_json = delta_strdup(node->properties_json ? node->properties_json : "{}"),
+    };
+    if (!row.project || !row.label || !row.name || !row.qualified_name || !row.file_path ||
+        !row.properties_json) {
+        cbm_node_free_fields(&row);
         return CBM_STORE_ERR;
     }
+    ctx->out->nodes[ctx->out->delta.node_count++] = row;
     return CBM_STORE_OK;
 }
 
@@ -309,20 +333,23 @@ static int delta_append_context_node(cbm_delta_build_ctx_t *ctx,
                    sizeof(*ctx->out->context_nodes)) != CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
-    cbm_node_t *dst = &ctx->out->context_nodes[ctx->out->delta.context_node_count++];
-    *dst = (cbm_node_t){.id = CBM_STORE_NO_NODE_ID,
-                        .project = delta_strdup(ctx->project),
-                        .label = delta_strdup(node->label),
-                        .name = delta_strdup(node->name),
-                        .qualified_name = delta_strdup(node->qualified_name),
-                        .file_path = delta_strdup(node->file_path),
-                        .start_line = node->start_line,
-                        .end_line = node->end_line,
-                        .properties_json = delta_strdup(node->properties_json ? node->properties_json : "{}")};
-    if (!dst->project || !dst->label || !dst->name || !dst->qualified_name || !dst->file_path ||
-        !dst->properties_json) {
+    cbm_node_t row = {
+        .id = CBM_STORE_NO_NODE_ID,
+        .project = delta_strdup(ctx->project),
+        .label = delta_strdup(node->label),
+        .name = delta_strdup(node->name),
+        .qualified_name = delta_strdup(node->qualified_name),
+        .file_path = delta_strdup(node->file_path),
+        .start_line = node->start_line,
+        .end_line = node->end_line,
+        .properties_json = delta_strdup(node->properties_json ? node->properties_json : "{}"),
+    };
+    if (!row.project || !row.label || !row.name || !row.qualified_name || !row.file_path ||
+        !row.properties_json) {
+        cbm_node_free_fields(&row);
         return CBM_STORE_ERR;
     }
+    ctx->out->context_nodes[ctx->out->delta.context_node_count++] = row;
     return CBM_STORE_OK;
 }
 
@@ -332,10 +359,13 @@ static int delta_append_export(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t
             CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
-    cbm_store_symbol_export_t *dst = &ctx->out->exports[ctx->out->delta.export_count++];
-    *dst = (cbm_store_symbol_export_t){.qualified_name = delta_strdup(node->qualified_name),
-                                       .node_id = CBM_STORE_NO_NODE_ID};
-    return dst->qualified_name ? CBM_STORE_OK : CBM_STORE_ERR;
+    cbm_store_symbol_export_t row = {.qualified_name = delta_strdup(node->qualified_name),
+                                     .node_id = CBM_STORE_NO_NODE_ID};
+    if (!row.qualified_name) {
+        return CBM_STORE_ERR;
+    }
+    ctx->out->exports[ctx->out->delta.export_count++] = row;
+    return CBM_STORE_OK;
 }
 
 static int delta_append_context_edge(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t *src,
@@ -346,18 +376,18 @@ static int delta_append_context_edge(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_
                    sizeof(*ctx->out->context_edges)) != CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
-    cbm_store_delta_edge_t *dst =
-        &ctx->out->context_edges[ctx->out->delta.context_edge_count++];
-    *dst = (cbm_store_delta_edge_t){
+    cbm_store_delta_edge_t row = {
         .source_qn = delta_strdup(src->qualified_name),
         .target_qn = delta_strdup(tgt->qualified_name),
         .type = delta_strdup(edge->type),
         .properties_json = delta_strdup(edge->properties_json ? edge->properties_json : "{}"),
         .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT,
     };
-    if (!dst->source_qn || !dst->target_qn || !dst->type || !dst->properties_json) {
+    if (!row.source_qn || !row.target_qn || !row.type || !row.properties_json) {
+        delta_edge_free_fields(&row);
         return CBM_STORE_ERR;
     }
+    ctx->out->context_edges[ctx->out->delta.context_edge_count++] = row;
     return CBM_STORE_OK;
 }
 
@@ -368,17 +398,18 @@ static int delta_append_edge(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t *
             CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
-    cbm_store_delta_edge_t *dst = &ctx->out->edges[ctx->out->delta.edge_count++];
-    *dst = (cbm_store_delta_edge_t){
+    cbm_store_delta_edge_t row = {
         .source_qn = delta_strdup(src->qualified_name),
         .target_qn = delta_strdup(tgt->qualified_name),
         .type = delta_strdup(edge->type),
         .properties_json = delta_strdup(edge->properties_json ? edge->properties_json : "{}"),
         .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT,
     };
-    if (!dst->source_qn || !dst->target_qn || !dst->type || !dst->properties_json) {
+    if (!row.source_qn || !row.target_qn || !row.type || !row.properties_json) {
+        delta_edge_free_fields(&row);
         return CBM_STORE_ERR;
     }
+    ctx->out->edges[ctx->out->delta.edge_count++] = row;
     return CBM_STORE_OK;
 }
 
@@ -390,17 +421,18 @@ static int delta_append_import(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t
         return CBM_STORE_ERR;
     }
     char *local = cbm_pipeline_import_edge_local_name_dup(edge);
-    cbm_store_import_ref_t *dst = &ctx->out->imports[ctx->out->delta.import_count++];
     /* The graph edge preserves local_name and target_qn, not the original import
      * specifier. target_qn is the stable key needed for reverse closure. */
-    *dst = (cbm_store_import_ref_t){
+    cbm_store_import_ref_t row = {
         .import_text = delta_strdup(tgt->qualified_name),
         .local_name = local ? local : delta_strdup(""),
         .target_qn = delta_strdup(tgt->qualified_name),
     };
-    if (!dst->import_text || !dst->local_name || !dst->target_qn) {
+    if (!row.import_text || !row.local_name || !row.target_qn) {
+        delta_import_free_fields(&row);
         return CBM_STORE_ERR;
     }
+    ctx->out->imports[ctx->out->delta.import_count++] = row;
     return CBM_STORE_OK;
 }
 
