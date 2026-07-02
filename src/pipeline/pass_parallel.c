@@ -671,13 +671,14 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                          "total", itoa_log(ec->file_count));
         }
 
-        /* Reclaim all slab + tier2 memory between files.
+        /* Reclaim slab memory between files.
          *
          * After cbm_free_tree(result), all tree nodes are on free lists.
          * We then destroy the parser (frees its internal allocations too),
-         * leaving ZERO live slab/tier2 pointers. At that point, we can
-         * safely munmap/free every page, bounding peak memory per-file
-         * instead of accumulating across all 644 files.
+         * so the current thread should have no live parser-owned slab
+         * pointers. If tree-sitter returns a chunk from another parser
+         * thread later, the allocator retires that page and frees it when
+         * the final live chunk is returned.
          *
          * get_thread_parser() in cbm_extract_file will create a fresh
          * parser for the next file — cost is microseconds vs seconds
@@ -2405,11 +2406,9 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                     }
                 }
                 free(filtered);
-                /* Contract: cbm_slab_reclaim() requires the thread parser to be
-                 * destroyed first; otherwise its lexer holds slab pointers
-                 * (lexer.included_ranges) that get freed underneath it, causing
-                 * a heap-use-after-free on the next ts_lexer_goto. The next
-                 * cbm_extract_file on this thread will recreate the parser. */
+                /* Contract: destroy the thread parser before reclaim so the
+                 * lexer releases its slab pointers. Foreign-live chunks are
+                 * handled by the allocator's global ownership registry. */
                 cbm_destroy_thread_parser();
                 cbm_slab_reclaim();
                 uint64_t lsp_elapsed_ns = extract_now_ns() - lsp_t0;

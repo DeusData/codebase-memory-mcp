@@ -8,6 +8,7 @@
 #include "../src/foundation/mem.h"
 #include "../src/foundation/arena.h"
 #include "../src/foundation/slab_alloc.h"
+#include "../src/foundation/compat_thread.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
@@ -521,6 +522,59 @@ TEST(slab_mixed_alloc_free_stress) {
     PASS();
 }
 
+typedef struct {
+    void *ptr;
+    atomic_int *go;
+} slab_cross_thread_free_ctx_t;
+
+static void *slab_cross_thread_free_worker(void *arg) {
+    slab_cross_thread_free_ctx_t *ctx = (slab_cross_thread_free_ctx_t *)arg;
+    while (ctx->go && !atomic_load_explicit(ctx->go, memory_order_acquire)) {
+        cbm_usleep(1000);
+    }
+    cbm_slab_test_free(ctx->ptr);
+    return NULL;
+}
+
+TEST(slab_cross_thread_free_is_safe) {
+    cbm_slab_install();
+
+    void *p = cbm_slab_test_malloc(32);
+    ASSERT_NOT_NULL(p);
+    memset(p, 0x5A, 32);
+
+    atomic_int go;
+    atomic_init(&go, 1);
+    slab_cross_thread_free_ctx_t ctx = {.ptr = p, .go = &go};
+    cbm_thread_t t;
+    ASSERT_EQ(cbm_thread_create(&t, 0, slab_cross_thread_free_worker, &ctx), 0);
+    ASSERT_EQ(cbm_thread_join(&t), 0);
+
+    cbm_slab_destroy_thread();
+    PASS();
+}
+
+TEST(slab_reclaim_with_foreign_live_chunk_is_safe) {
+    cbm_slab_install();
+
+    void *p = cbm_slab_test_malloc(32);
+    ASSERT_NOT_NULL(p);
+    memset(p, 0xA5, 32);
+
+    atomic_int go;
+    atomic_init(&go, 0);
+    slab_cross_thread_free_ctx_t ctx = {.ptr = p, .go = &go};
+    cbm_thread_t t;
+    ASSERT_EQ(cbm_thread_create(&t, 0, slab_cross_thread_free_worker, &ctx), 0);
+
+    cbm_slab_reclaim();
+    atomic_store_explicit(&go, 1, memory_order_release);
+    ASSERT_EQ(cbm_thread_join(&t), 0);
+
+    cbm_slab_destroy_thread();
+    PASS();
+}
+
 /* ── Parallel extraction integration test ──────────────────── */
 
 static char g_mem_tmpdir[256];
@@ -665,6 +719,8 @@ SUITE(mem) {
     RUN_TEST(slab_realloc_slab_to_heap);
     RUN_TEST(slab_calloc_zeroed);
     RUN_TEST(slab_mixed_alloc_free_stress);
+    RUN_TEST(slab_cross_thread_free_is_safe);
+    RUN_TEST(slab_reclaim_with_foreign_live_chunk_is_safe);
     /* Integration */
     RUN_TEST(parallel_extract_with_slab);
 }
