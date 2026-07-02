@@ -2990,7 +2990,7 @@ static void plan_record(const char *agent, const char *kind, const char *path) {
 }
 
 static void install_claude_code_config(const char *home, const char *binary_path, bool force,
-                                       bool dry_run) {
+                                       bool dry_run, bool install_hooks) {
     char config_dir[CLI_BUF_1K];
     cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
     char user_root[CLI_BUF_1K];
@@ -3010,9 +3010,13 @@ static void install_claude_code_config(const char *home, const char *binary_path
         snprintf(p, sizeof(p), "%s/settings.json", config_dir);
         plan_record("Claude Code", "mcp_config", p);
         snprintf(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_HOOK_GATE_SCRIPT);
-        plan_record("Claude Code", "hook", p);
+        if (install_hooks) {
+            plan_record("Claude Code", "hook", p);
+        }
         snprintf(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_SESSION_REMINDER_SCRIPT);
-        plan_record("Claude Code", "hook", p);
+        if (install_hooks) {
+            plan_record("Claude Code", "hook", p);
+        }
         return;
     }
 
@@ -3041,14 +3045,16 @@ static void install_claude_code_config(const char *home, const char *binary_path
 
     char settings_path[CLI_BUF_1K];
     snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
-    if (!dry_run) {
+    if (!dry_run && install_hooks) {
         cbm_upsert_claude_hooks(settings_path);
         cbm_install_hook_gate_script(home, binary_path);
         cbm_install_session_reminder_script(home);
         cbm_upsert_session_hooks(settings_path);
+        printf("  hooks: PreToolUse (Grep/Glob search-graph augmenter, non-blocking)\n");
+        printf("  hooks: SessionStart (MCP usage reminder on startup/resume/clear/compact)\n");
+    } else if (!dry_run) {
+        printf("  hooks: skipped (pass --hooks to install search augment hooks)\n");
     }
-    printf("  hooks: PreToolUse (Grep/Glob search-graph augmenter, non-blocking)\n");
-    printf("  hooks: SessionStart (MCP usage reminder on startup/resume/clear/compact)\n");
 
     /* Migration nudge: when CLAUDE_CONFIG_DIR is set and a legacy ~/.claude tree
      * still exists, mention it so users can clean up stale artifacts. */
@@ -3093,7 +3099,8 @@ static void install_generic_agent_config(const char *label, const char *binary_p
 
 /* Install MCP configs for CLI-based agents (Codex, Gemini, OpenCode, Antigravity, Aider). */
 /* Install Gemini CLI config with hooks. */
-static void install_gemini_config(const char *home, const char *binary_path, bool dry_run) {
+static void install_gemini_config(const char *home, const char *binary_path, bool dry_run,
+                                  bool install_hooks) {
     char cp[CLI_BUF_1K];
     char ip[CLI_BUF_1K];
     snprintf(cp, sizeof(cp), "%s/.gemini/settings.json", home);
@@ -3101,18 +3108,20 @@ static void install_gemini_config(const char *home, const char *binary_path, boo
     install_generic_agent_config("Gemini CLI", binary_path, cp, ip, dry_run,
                                  cbm_install_editor_mcp);
     if (g_install_plan) {
-        plan_record("Gemini CLI", "hook", cp); /* BeforeTool + SessionStart in settings.json */
+        if (install_hooks) {
+            plan_record("Gemini CLI", "hook", cp); /* BeforeTool + SessionStart in settings.json */
+        }
         return;
     }
-    if (!dry_run) {
+    if (!dry_run && install_hooks) {
         cbm_upsert_gemini_hooks(cp);
         cbm_upsert_gemini_session_hooks(cp);
+        printf("  hooks: BeforeTool + SessionStart (codebase-memory-mcp reminder)\n");
     }
-    printf("  hooks: BeforeTool + SessionStart (codebase-memory-mcp reminder)\n");
 }
 
 static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const char *home,
-                                      const char *binary_path, bool dry_run) {
+                                      const char *binary_path, bool dry_run, bool install_hooks) {
     if (agents->codex) {
         char cp[CLI_BUF_1K];
         char ip[CLI_BUF_1K];
@@ -3121,16 +3130,16 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         install_generic_agent_config("Codex CLI", binary_path, cp, ip, dry_run,
                                      cbm_upsert_codex_mcp);
         if (g_install_plan) {
-            plan_record("Codex CLI", "hook", cp);
-        } else {
-            if (!dry_run) {
-                cbm_upsert_codex_hooks(cp);
+            if (install_hooks) {
+                plan_record("Codex CLI", "hook", cp);
             }
+        } else if (!dry_run && install_hooks) {
+            cbm_upsert_codex_hooks(cp);
             printf("  hooks: SessionStart (codebase-memory-mcp reminder)\n");
         }
     }
     if (agents->gemini) {
-        install_gemini_config(home, binary_path, dry_run);
+        install_gemini_config(home, binary_path, dry_run, install_hooks);
     }
     if (agents->opencode) {
         char cp[CLI_BUF_1K];
@@ -3160,11 +3169,11 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         char sp[CLI_BUF_1K];
         snprintf(sp, sizeof(sp), "%s/.gemini/antigravity-cli/settings.json", home);
         if (g_install_plan) {
-            plan_record("Antigravity", "hook", sp);
-        } else {
-            if (!dry_run) {
-                cbm_upsert_gemini_session_hooks(sp);
+            if (install_hooks) {
+                plan_record("Antigravity", "hook", sp);
             }
+        } else if (!dry_run && install_hooks) {
+            cbm_upsert_gemini_session_hooks(sp);
             printf("  hooks: SessionStart (codebase-memory-mcp reminder)\n");
         }
     }
@@ -3250,16 +3259,16 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
 }
 
 static void cbm_install_agent_configs(const char *home, const char *binary_path, bool force,
-                                      bool dry_run) {
+                                      bool dry_run, bool install_hooks) {
     cbm_detected_agents_t agents = cbm_detect_agents(home);
     if (!g_install_plan) {
         print_detected_agents(&agents);
     }
 
     if (agents.claude_code) {
-        install_claude_code_config(home, binary_path, force, dry_run);
+        install_claude_code_config(home, binary_path, force, dry_run, install_hooks);
     }
-    install_cli_agent_configs(&agents, home, binary_path, dry_run);
+    install_cli_agent_configs(&agents, home, binary_path, dry_run, install_hooks);
     install_editor_agent_configs(&agents, home, binary_path, dry_run);
 }
 
@@ -3317,7 +3326,7 @@ static void cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
  * the config / instruction / hook files `install` WOULD write, produced by
  * running the real install dispatch in record-only mode (no mutation, no
  * network). Returns a heap JSON string (caller frees) or NULL. */
-char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
+char *cbm_build_install_plan_json(const char *home, const char *binary_path, bool install_hooks) {
     if (!home || !binary_path) {
         return NULL;
     }
@@ -3326,7 +3335,7 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
      * site records into `plan` — so the receipt cannot drift from behavior. */
     cbm_install_plan_t plan = {0};
     g_install_plan = &plan;
-    cbm_install_agent_configs(home, binary_path, false, true);
+    cbm_install_agent_configs(home, binary_path, false, true, install_hooks);
     g_install_plan = NULL;
 
     cbm_detected_agents_t det = cbm_detect_agents(home);
@@ -3395,6 +3404,7 @@ int cbm_cmd_install(int argc, char **argv) {
     bool dry_run = false;
     bool force = false;
     bool plan = false;
+    bool install_hooks = false;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
@@ -3404,6 +3414,9 @@ int cbm_cmd_install(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--plan") == 0) {
             plan = true;
+        }
+        if (strcmp(argv[i], "--hooks") == 0) {
+            install_hooks = true;
         }
     }
 
@@ -3419,7 +3432,7 @@ int cbm_cmd_install(int argc, char **argv) {
     if (plan) {
         char self_path[CLI_BUF_1K] = {0};
         cbm_detect_self_path(self_path, sizeof(self_path), home);
-        char *json = cbm_build_install_plan_json(home, self_path);
+        char *json = cbm_build_install_plan_json(home, self_path, install_hooks);
         if (!json) {
             (void)fprintf(stderr, "error: failed to build install plan\n");
             return CLI_TRUE;
@@ -3515,7 +3528,7 @@ int cbm_cmd_install(int argc, char **argv) {
 #endif
 
     /* Step 3: Install/refresh all agent configs, pointing at the install target. */
-    cbm_install_agent_configs(home, bin_target, force, dry_run);
+    cbm_install_agent_configs(home, bin_target, force, dry_run, install_hooks);
 
     /* Step 4: Ensure PATH */
     char bin_dir[CLI_BUF_1K];
@@ -4110,7 +4123,7 @@ int cbm_cmd_update(int argc, char **argv) {
 
     /* Step 6: Refresh all agent configs (skills, MCP entries, hooks) */
     printf("Refreshing agent configurations...\n");
-    cbm_install_agent_configs(home, bin_dest, true, false);
+    cbm_install_agent_configs(home, bin_dest, true, false, false);
 
     /* Step 7: Verify new version (exec directly, no shell interpretation) */
     printf("\nUpdate complete. Verifying:\n");

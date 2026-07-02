@@ -284,7 +284,7 @@ static void print_help(void) {
     printf("Usage:\n");
     printf("  codebase-memory-mcp              Run MCP server on stdio\n");
     printf("  codebase-memory-mcp cli <tool> [json]  Run a single tool\n");
-    printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run]\n");
+    printf("  codebase-memory-mcp install [-y|-n] [--force] [--hooks] [--dry-run]\n");
     printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
     printf("  codebase-memory-mcp update [-y|-n]\n");
     printf("  codebase-memory-mcp config <list|get|set|reset>\n");
