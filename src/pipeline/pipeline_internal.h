@@ -14,10 +14,12 @@
 #include "store/store.h"
 #include "discover/discover.h"
 #include "foundation/hash_table.h"
+#include "foundation/str_util.h"
 #include "cbm.h"
 #include "service_patterns.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
 #include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -73,6 +75,113 @@ static inline bool cbm_pipeline_label_is_import_target(const char *label) {
 /* Generation used by full/containment indexing paths before exact-delta
  * generation reservation is active. Matches the store schema default. */
 enum { CBM_PIPELINE_COMPAT_GENERATION = 0 };
+
+enum {
+    CBM_CALL_ARG_EXPR_MAX = 120,
+    CBM_CALL_ARG_JSON_MARGIN = 20,
+    CBM_CALL_ARG_JSON_GUARD = CBM_SZ_32,
+    CBM_CALL_LINE_MARGIN = 24,
+};
+
+static inline void cbm_pipeline_sanitize_call_arg_expr(char *expr_buf, size_t expr_buf_sz,
+                                                       const char *expr) {
+    if (!expr_buf || expr_buf_sz == 0) {
+        return;
+    }
+    if (expr) {
+        snprintf(expr_buf, expr_buf_sz, "%.*s", CBM_CALL_ARG_EXPR_MAX, expr);
+        for (char *p = expr_buf; *p; p++) {
+            if (*p == '"') {
+                *p = '\'';
+            }
+            if (*p == '\n' || *p == '\r') {
+                *p = ' ';
+            }
+        }
+    } else {
+        expr_buf[0] = '\0';
+    }
+}
+
+static inline int cbm_pipeline_format_call_arg_json(char *buf, size_t bufsize,
+                                                    const CBMCallArg *arg,
+                                                    const char *expr) {
+    if (!buf || !arg || bufsize == 0) {
+        return 0;
+    }
+    char esc_keyword[CBM_SZ_128];
+    char esc_expr[CBM_SZ_128];
+    char esc_value[CBM_SZ_128];
+    cbm_json_escape(esc_expr, sizeof(esc_expr), expr);
+    if (arg->keyword && arg->value) {
+        cbm_json_escape(esc_keyword, sizeof(esc_keyword), arg->keyword);
+        cbm_json_escape(esc_value, sizeof(esc_value), arg->value);
+        return snprintf(buf, bufsize, "{\"i\":%d,\"k\":\"%s\",\"e\":\"%s\",\"v\":\"%s\"}",
+                        arg->index, esc_keyword, esc_expr, esc_value);
+    }
+    if (arg->keyword) {
+        cbm_json_escape(esc_keyword, sizeof(esc_keyword), arg->keyword);
+        return snprintf(buf, bufsize, "{\"i\":%d,\"k\":\"%s\",\"e\":\"%s\"}", arg->index,
+                        esc_keyword, esc_expr);
+    }
+    if (arg->value) {
+        cbm_json_escape(esc_value, sizeof(esc_value), arg->value);
+        return snprintf(buf, bufsize, "{\"i\":%d,\"e\":\"%s\",\"v\":\"%s\"}", arg->index,
+                        esc_expr, esc_value);
+    }
+    return snprintf(buf, bufsize, "{\"i\":%d,\"e\":\"%s\"}", arg->index, esc_expr);
+}
+
+static inline size_t cbm_pipeline_append_call_args_json(char *buf, size_t bufsize, size_t pos,
+                                                       const CBMCall *call) {
+    if (!buf || !call || call->arg_count == 0 || bufsize <= CBM_CALL_ARG_JSON_MARGIN ||
+        pos >= bufsize - CBM_CALL_ARG_JSON_MARGIN) {
+        return pos;
+    }
+    int n = snprintf(buf + pos, bufsize - pos, ",\"args\":[");
+    if (n <= 0 || (size_t)n >= bufsize - pos) {
+        return pos;
+    }
+    pos += (size_t)n;
+    for (int i = 0; i < call->arg_count && pos < bufsize - CBM_CALL_ARG_JSON_GUARD; i++) {
+        const CBMCallArg *arg = &call->args[i];
+        size_t mark = pos;
+        if (i > 0 && pos < bufsize - SKIP_ONE) {
+            buf[pos++] = ',';
+        }
+        char expr_buf[CBM_SZ_128];
+        cbm_pipeline_sanitize_call_arg_expr(expr_buf, sizeof(expr_buf), arg->expr);
+        n = cbm_pipeline_format_call_arg_json(buf + pos, bufsize - pos, arg, expr_buf);
+        if (n <= 0 || (size_t)n >= bufsize - pos) {
+            pos = mark;
+            break;
+        }
+        pos += (size_t)n;
+    }
+    if (pos < bufsize - SKIP_ONE) {
+        buf[pos++] = ']';
+    }
+    buf[pos] = '\0';
+    return pos;
+}
+
+static inline void cbm_pipeline_close_call_edge_props(char *props, size_t props_sz, size_t pos,
+                                                      const CBMCall *call, bool include_line) {
+    if (!props || props_sz == 0 || pos >= props_sz - SKIP_ONE) {
+        return;
+    }
+    pos = cbm_pipeline_append_call_args_json(props, props_sz, pos, call);
+    if (include_line && call && call->start_line > 0 && pos < props_sz - CBM_CALL_LINE_MARGIN) {
+        int n = snprintf(props + pos, props_sz - pos, ",\"line\":%d", call->start_line);
+        if (n > 0 && (size_t)n < props_sz - pos) {
+            pos += (size_t)n;
+        }
+    }
+    if (pos < props_sz - SKIP_ONE) {
+        props[pos] = '}';
+        props[pos + SKIP_ONE] = '\0';
+    }
+}
 
 /* Test-only incremental fault injection. Values name internal phases and are
  * intentionally not user configuration. */

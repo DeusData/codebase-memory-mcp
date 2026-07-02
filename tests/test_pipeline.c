@@ -477,6 +477,26 @@ TEST(pipeline_mode_global_semantic_edges_policy) {
     PASS();
 }
 
+TEST(pipeline_call_edge_props_include_args_and_line) {
+    char props[CBM_SZ_512];
+    int n = snprintf(props, sizeof(props),
+                     "{\"callee\":\"cbm_label_is_type_like\",\"confidence\":0.75,"
+                     "\"strategy\":\"unique_name\",\"candidates\":1");
+    ASSERT_GT(n, 0);
+
+    CBMCall call = {0};
+    call.start_line = 62;
+    call.arg_count = 1;
+    call.args[0].index = 0;
+    call.args[0].expr = "label";
+
+    cbm_pipeline_close_call_edge_props(props, sizeof(props), (size_t)n, &call, true);
+    ASSERT(strstr(props, "\"args\":[{\"i\":0,\"e\":\"label\"}]") != NULL);
+    ASSERT(strstr(props, "\"line\":62") != NULL);
+    ASSERT_EQ(props[strlen(props) - SKIP_ONE], '}');
+    PASS();
+}
+
 TEST(pipeline_fast_mode) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
@@ -9221,6 +9241,16 @@ TEST(incremental_fast_falls_back_for_inbound_transitive_complexity_and_matches_f
     ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "inbound_edges_require_full");
     cbm_pipeline_free(p);
 
+    cbm_store_t *owner_store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(owner_store);
+    int node_owners = 0;
+    int edge_owners = 0;
+    ASSERT_EQ(cbm_store_count_file_delta_owners(owner_store, project, "main.go", &node_owners,
+                                                &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_GT(node_owners, 0);
+    cbm_store_close(owner_store);
+
     char diff_err[CBM_SZ_8K] = {0};
     int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
         g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
@@ -11618,6 +11648,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_branch_root_structure);
     RUN_TEST(pipeline_project_name_derived);
     RUN_TEST(pipeline_mode_global_semantic_edges_policy);
+    RUN_TEST(pipeline_call_edge_props_include_args_and_line);
     RUN_TEST(pipeline_fast_mode);
     /* Definitions pass */
     RUN_TEST(pipeline_definitions_function_nodes);
