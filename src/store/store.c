@@ -3494,16 +3494,43 @@ static int store_publish_delta_edges(cbm_store_t *s, const cbm_store_file_delta_
                                      const cbm_store_delta_edge_t *edges, int edge_count,
                                      bool own_edges) {
     int rc = CBM_STORE_OK;
+    if (edge_count <= 0) {
+        return CBM_STORE_OK;
+    }
+
+    size_t endpoint_count = (size_t)edge_count * PAIR_LEN;
+    if (endpoint_count > (size_t)INT_MAX ||
+        endpoint_count > SIZE_MAX / sizeof(const char *) ||
+        endpoint_count > SIZE_MAX / sizeof(int64_t)) {
+        return CBM_STORE_ERR;
+    }
+    const char **endpoint_qns = malloc(endpoint_count * sizeof(*endpoint_qns));
+    int64_t *endpoint_ids = malloc(endpoint_count * sizeof(*endpoint_ids));
+    if (!endpoint_qns || !endpoint_ids) {
+        free(endpoint_qns);
+        free(endpoint_ids);
+        return CBM_STORE_ERR;
+    }
+
     for (int i = 0; i < edge_count; i++) {
-        int64_t source_id = CBM_STORE_NO_NODE_ID;
-        int64_t target_id = CBM_STORE_NO_NODE_ID;
-        rc = store_resolve_node_id(s, delta->project, edges[i].source_qn, &source_id);
-        if (rc != CBM_STORE_OK) {
-            return rc;
-        }
-        rc = store_resolve_node_id(s, delta->project, edges[i].target_qn, &target_id);
-        if (rc != CBM_STORE_OK) {
-            return rc;
+        endpoint_qns[(size_t)i * PAIR_LEN] = edges[i].source_qn;
+        endpoint_qns[(size_t)i * PAIR_LEN + SKIP_ONE] = edges[i].target_qn;
+    }
+    int found = cbm_store_find_node_ids_by_qns(s, delta->project, endpoint_qns, (int)endpoint_count,
+                                               endpoint_ids);
+    if (found < (int)endpoint_count) {
+        free(endpoint_qns);
+        free(endpoint_ids);
+        return found < 0 ? CBM_STORE_ERR : CBM_STORE_NOT_FOUND;
+    }
+
+    for (int i = 0; i < edge_count; i++) {
+        int64_t source_id = endpoint_ids[(size_t)i * PAIR_LEN];
+        int64_t target_id = endpoint_ids[(size_t)i * PAIR_LEN + SKIP_ONE];
+        if (source_id <= CBM_STORE_NO_NODE_ID || target_id <= CBM_STORE_NO_NODE_ID) {
+            free(endpoint_qns);
+            free(endpoint_ids);
+            return CBM_STORE_NOT_FOUND;
         }
         cbm_edge_t edge = {.project = delta->project,
                            .source_id = source_id,
@@ -3512,16 +3539,22 @@ static int store_publish_delta_edges(cbm_store_t *s, const cbm_store_file_delta_
                            .properties_json = edges[i].properties_json};
         int64_t edge_id = cbm_store_insert_edge(s, &edge);
         if (edge_id <= CBM_STORE_NO_NODE_ID) {
+            free(endpoint_qns);
+            free(endpoint_ids);
             return CBM_STORE_ERR;
         }
         if (own_edges) {
             rc = cbm_store_upsert_edge_owner(s, delta->project, edge_id, delta->rel_path,
                                              edges[i].derived_kind, delta->generation);
             if (rc != CBM_STORE_OK) {
+                free(endpoint_qns);
+                free(endpoint_ids);
                 return rc;
             }
         }
     }
+    free(endpoint_qns);
+    free(endpoint_ids);
     return CBM_STORE_OK;
 }
 
