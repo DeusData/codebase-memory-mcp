@@ -16,21 +16,24 @@
 #include "xxhash/xxhash.h"
 
 static const char cbm_delta_edge_imports[] = "IMPORTS";
-static const char cbm_delta_edge_contains_file[] = "CONTAINS_FILE";
+static const char cbm_delta_edge_contains_file[] = CBM_PIPELINE_EDGE_CONTAINS_FILE;
 static const char cbm_delta_file_hash_legacy_empty[] = "";
 static const char cbm_delta_prop_is_exported[] = "is_exported";
 static const char cbm_delta_pass_fingerprint_v1[] = "pipeline-file-delta-v1";
 static const char cbm_delta_reason_candidate[] = "candidate";
 static const char cbm_delta_reason_delete_batch_requires_full[] = "delete_batch_requires_full";
-static const char cbm_delta_reason_frontier_error[] = "frontier_error";
-static const char cbm_delta_reason_frontier_requires_batch[] = "frontier_requires_batch";
-static const char cbm_delta_reason_frontier_too_large[] = "frontier_too_large";
-static const char cbm_delta_reason_inbound_edges_require_full[] = "inbound_edges_require_full";
+static const char cbm_delta_reason_frontier_error[] = CBM_PIPELINE_DELTA_REASON_FRONTIER_ERROR;
+static const char cbm_delta_reason_frontier_requires_batch[] =
+    CBM_PIPELINE_DELTA_REASON_FRONTIER_REQUIRES_BATCH;
+static const char cbm_delta_reason_frontier_too_large[] =
+    CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE;
+static const char cbm_delta_reason_inbound_edges_require_full[] =
+    CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL;
 static const char cbm_delta_reason_invalid_input[] = "invalid_input";
 static const char cbm_delta_reason_missing_generation[] = "missing_generation";
 static const char cbm_delta_reason_missing_existing_ownership[] = "missing_existing_ownership";
 static const char cbm_delta_reason_missing_file_metadata[] = "missing_file_metadata";
-static const char cbm_delta_reason_preflight_error[] = "preflight_error";
+static const char cbm_delta_reason_preflight_error[] = CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR;
 static const char cbm_delta_reason_publish_error[] = "publish_error";
 static const char cbm_delta_reason_rename_requires_full[] = "rename_requires_full";
 static const char cbm_delta_reason_unresolved_edge_endpoint[] = "unresolved_edge_endpoint";
@@ -906,7 +909,7 @@ static bool delta_unowned_inbound_edge_is_regenerated(
     const cbm_store_inbound_edge_t *edge, const cbm_pipeline_file_delta_t *const *deltas,
     int delta_count) {
     return edge && edge->source_rel_path && edge->source_rel_path[0] == '\0' && edge->type &&
-           strcmp(edge->type, "CONTAINS_FILE") == 0 &&
+           strcmp(edge->type, cbm_delta_edge_contains_file) == 0 &&
            delta_batch_contains_edge(deltas, delta_count, edge->source_qn, edge->target_qn,
                                      edge->type);
 }

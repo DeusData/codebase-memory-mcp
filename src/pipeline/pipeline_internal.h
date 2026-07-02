@@ -315,6 +315,13 @@ typedef struct {
     int affected_count;
 } cbm_pipeline_file_delta_plan_t;
 
+#define CBM_PIPELINE_EDGE_CONTAINS_FILE "CONTAINS_FILE"
+#define CBM_PIPELINE_DELTA_REASON_FRONTIER_ERROR "frontier_error"
+#define CBM_PIPELINE_DELTA_REASON_FRONTIER_REQUIRES_BATCH "frontier_requires_batch"
+#define CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE "frontier_too_large"
+#define CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL "inbound_edges_require_full"
+#define CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR "preflight_error"
+
 /* Conservative live exact-delta frontier cap. Larger affected sets fall back
  * to the existing containment reindex path until broader parity benchmarks pass. */
 enum { CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS = CBM_SZ_4 };
