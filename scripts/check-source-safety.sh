@@ -73,11 +73,11 @@ if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         case "$line" in
             +++*|"+" ) continue ;;
             +*)
-                if [[ "$line" =~ (^|[^A-Za-z0-9_])(unlink|rename|remove|rmdir|mkdir|getenv|setenv|unsetenv|mkstemp|mkdtemp)[[:space:]]*\( ]]; then
+                if [[ "$line" =~ (^|[^A-Za-z0-9_])(access|unlink|rename|remove|rmdir|mkdir|getenv|setenv|unsetenv|mkstemp|mkdtemp)[[:space:]]*\( ]]; then
                     add_violation "new raw env/fs API in production diff, use CBM compat wrapper or document an exception: $line"
                 fi
-                if [[ "$line" =~ (^|[^A-Za-z0-9_])strdup[[:space:]]*\( ]]; then
-                    add_violation "new raw strdup in production diff, use cbm_strdup or a local ownership wrapper: $line"
+                if [[ "$line" =~ (^|[^A-Za-z0-9_])(strdup|strndup)[[:space:]]*\( ]]; then
+                    add_violation "new raw strdup/strndup in production diff, use cbm_strdup/cbm_strndup or a local ownership wrapper: $line"
                 fi
                 ;;
         esac
