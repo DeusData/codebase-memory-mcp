@@ -434,6 +434,23 @@ def run_config_set(binary: Path, env: dict[str, str], key: str, value: str, time
         raise command_failure(f"config_set_{key}", cmd, env, proc, elapsed_ms)
 
 
+def parse_config_overrides(items: list[str]) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for item in items:
+        key, sep, value = item.partition("=")
+        if not sep or not key or not value:
+            raise SystemExit(f"error: --config must be key=value, got {item!r}")
+        overrides[key] = value
+    return overrides
+
+
+def apply_config_overrides(
+    binary: Path, env: dict[str, str], overrides: dict[str, str], timeout: int
+) -> None:
+    for key, value in overrides.items():
+        run_config_set(binary, env, key, value, timeout)
+
+
 def build_index_result(
     data: dict[str, Any],
     stderr: str,
@@ -1076,6 +1093,7 @@ def run_matrix_case(
     case_env["CBM_CACHE_DIR"] = str(cache_dir)
     run_config_set(binary, case_env, "incremental_reindex", "always", args.timeout)
     run_config_set(binary, case_env, "rank_refresh", args.rank_refresh, args.timeout)
+    apply_config_overrides(binary, case_env, args.config_overrides, args.timeout)
 
     prepare_matrix_scenario(scenario, repo_dir, args.files, args.functions_per_file)
     if args.transport == "mcp":
@@ -1152,6 +1170,7 @@ def run_matrix(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], 
             "files": args.files,
             "functions_per_file": args.functions_per_file,
             "rank_refresh": args.rank_refresh,
+            "config_overrides": args.config_overrides,
             "timeout": args.timeout,
             "transport": args.transport,
             "scenarios": scenarios,
@@ -1201,6 +1220,7 @@ def run_self_dogfood_case(
     try:
         run_config_set(binary, case_env, "incremental_reindex", "always", args.timeout)
         run_config_set(binary, case_env, "rank_refresh", args.rank_refresh, args.timeout)
+        apply_config_overrides(binary, case_env, args.config_overrides, args.timeout)
         if args.transport == "mcp":
             with McpClient(binary, case_env, args.timeout) as client:
                 initial = run_index_for_transport(
@@ -1297,6 +1317,7 @@ def run_self_dogfood(args: argparse.Namespace, binary: Path) -> tuple[dict[str, 
         "mode": "self_dogfood",
         "parameters": {
             "rank_refresh": args.rank_refresh,
+            "config_overrides": args.config_overrides,
             "timeout": args.timeout,
             "transport": args.transport,
             "scenarios": scenarios,
@@ -1348,6 +1369,13 @@ def parse_args() -> argparse.Namespace:
         choices=("eager", "stale_on_exact"),
         default=DEFAULT_RANK_REFRESH,
     )
+    parser.add_argument(
+        "--config",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Additional config override; repeat to set multiple keys. Applied after built-in settings.",
+    )
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--keep-work-root", action="store_true")
     parser.add_argument("--include-logs", action="store_true")
@@ -1387,7 +1415,9 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OVERHEAD_TOOL,
         help="Existing MCP tool used by --overhead-probes.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.config_overrides = parse_config_overrides(args.config)
+    return args
 
 
 def resolve_binary_path(binary_arg: str) -> Path:
@@ -1434,6 +1464,7 @@ def main() -> int:
             "changed_files": args.changed_files,
             "min_speedup": args.min_speedup,
             "rank_refresh": args.rank_refresh,
+            "config_overrides": args.config_overrides,
             "timeout": args.timeout,
             "transport": args.transport,
             "overhead_probes": args.overhead_probes,
@@ -1448,6 +1479,7 @@ def main() -> int:
         env = build_env(cache_dir)
         run_config_set(binary, env, "incremental_reindex", "always", args.timeout)
         run_config_set(binary, env, "rank_refresh", args.rank_refresh, args.timeout)
+        apply_config_overrides(binary, env, args.config_overrides, args.timeout)
 
         if args.transport == "mcp":
             with McpClient(binary, env, args.timeout) as client:

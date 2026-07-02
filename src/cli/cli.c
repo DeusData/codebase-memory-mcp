@@ -9,6 +9,7 @@
 #include "foundation/platform.h"
 #include "foundation/constants.h"
 #include "foundation/str_util.h"
+#include "pipeline/pipeline.h"
 
 /* CLI buffer size constants. */
 enum {
@@ -2877,12 +2878,28 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "Re-index if DB is older than N seconds (0=disabled)",
      "0-2592000",
      "0=disabled. 3600=hourly, 86400=daily, 604800=weekly. Runs on startup if stale."},
-    {"incremental_reindex", "off", NULL, "Indexing",
+    {CBM_CONFIG_INCREMENTAL_REINDEX, "off", NULL, "Indexing",
      "When to use the disk incremental reindex path",
      "fast|always|off",
      "'off' rebuilds atomically from scratch and is the default until disk incremental avoids full-graph "
      "work. 'fast' uses incremental only for fast-mode indexes. 'always' preserves the legacy route for "
      "benchmarking and canary tests."},
+    {CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS,
+     CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_CHANGED_PATHS,
+     NULL,
+     "Indexing",
+     "Max changed files eligible for exact disk incremental publish",
+     "1-100000",
+     "Default is conservative. Raise only with canonical-graph benchmarks for your workload; larger "
+     "batches can approach full-rebuild cost."},
+    {CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS,
+     CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_AFFECTED_PATHS,
+     NULL,
+     "Indexing",
+     "Max changed plus inbound-dependent source files exact delta may reparse",
+     "1-100000",
+     "Default is conservative. Raise only with canonical-graph benchmarks for your workload; larger "
+     "frontiers can approach full-rebuild cost."},
     /* ── Search ── */
     {"search_limit", "50", NULL, "Search",
      "Default max results for search_graph/search_code",

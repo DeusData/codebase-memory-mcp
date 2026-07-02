@@ -943,9 +943,9 @@ static int incr_try_exact_delete_route(cbm_pipeline_t *p, cbm_store_t *store, co
     };
     const cbm_pipeline_file_delta_t *delta_ptrs[] = {&delta};
     cbm_pipeline_file_delta_plan_t plan = {0};
+    int max_affected_paths = cbm_pipeline_exact_max_affected_paths(p);
     int rc = cbm_pipeline_plan_file_delta_batch(store, delta_ptrs, CBM_INCR_DELETE_DELTA_COUNT,
-                                                CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS,
-                                                &plan);
+                                                max_affected_paths, &plan);
     if (rc != CBM_STORE_OK || plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
         cbm_pipeline_set_publish_reason(p, plan.reason ? plan.reason : "plan_error");
         cbm_log_info("incremental.exact.delete.fallback", "reason",
@@ -966,7 +966,7 @@ static int incr_try_exact_delete_route(cbm_pipeline_t *p, cbm_store_t *store, co
     delta.delta.generation = generation;
 
     rc = cbm_pipeline_apply_file_delta_batch(store, delta_ptrs, CBM_INCR_DELETE_DELTA_COUNT,
-                                             CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS, &plan);
+                                             max_affected_paths, &plan);
     if (rc != CBM_STORE_OK || plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
         incr_mark_generation_failed(store, project, generation);
         cbm_pipeline_set_publish_reason(p, plan.reason ? plan.reason : "apply_error");
@@ -1099,11 +1099,13 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
         !all_files || all_file_count <= 0 || !pass_fingerprint || !applied) {
         return CBM_STORE_OK;
     }
-    if (deleted_count < 0 || changed_count > CBM_PIPELINE_EXACT_DELTA_MAX_CHANGED_PATHS ||
+    int max_changed_paths = cbm_pipeline_exact_max_changed_paths(p);
+    int max_affected_paths = cbm_pipeline_exact_max_affected_paths(p);
+    if (deleted_count < 0 || changed_count > max_changed_paths ||
         cbm_pipeline_get_mode(p) < CBM_MODE_FAST ||
-        changed_count + deleted_count > CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS) {
+        changed_count + deleted_count > max_affected_paths) {
         const char *reason =
-            changed_count > CBM_PIPELINE_EXACT_DELTA_MAX_CHANGED_PATHS
+            changed_count > max_changed_paths
                 ? "changed_batch_too_large"
                 : (cbm_pipeline_get_mode(p) < CBM_MODE_FAST ? "global_derived_edges"
                                                             : CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE);
@@ -1112,7 +1114,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
         return CBM_STORE_OK;
     }
 
-    int exact_file_cap = CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS - deleted_count;
+    int exact_file_cap = max_affected_paths - deleted_count;
     if (exact_file_cap <= 0) {
         cbm_pipeline_set_publish_reason(p, CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE);
         cbm_log_info("incremental.exact.skip", "reason",
@@ -1325,7 +1327,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     if (!graph_noop_candidate) {
         CBM_PROF_START(t_exact_plan);
         rc = cbm_pipeline_plan_file_delta_batch(store, delta_ptrs, delta_count,
-                                                CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS, &plan);
+                                                max_affected_paths, &plan);
         CBM_PROF_END_N("incremental_exact", "10_plan_delta", t_exact_plan, delta_count);
         if (rc != CBM_STORE_OK || plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
             cbm_pipeline_set_publish_reason(p, plan.reason ? plan.reason : "plan_error");
@@ -1386,7 +1388,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
 
     CBM_PROF_START(t_exact_apply);
     rc = cbm_pipeline_apply_file_delta_batch(store, delta_ptrs, delta_count,
-                                             CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS, &plan);
+                                             max_affected_paths, &plan);
     CBM_PROF_END_N("incremental_exact", "13_apply_delta", t_exact_apply, delta_count);
     if (rc != CBM_STORE_OK || plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
         incr_mark_generation_failed(store, project, generation);
