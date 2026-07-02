@@ -120,6 +120,9 @@ extern void suite_grammar_probe_e(void);
 extern void suite_grammar_probe_f(void);
 extern void suite_grammar_probe_g(void);
 extern void suite_incremental(void);
+extern void suite_semantic(void);
+extern void suite_ast_profile(void);
+extern void suite_slab_alloc(void);
 extern void suite_simhash(void);
 extern void suite_stack_overflow(void);
 extern void suite_dump_verify(void);
@@ -239,6 +242,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(parallel);
 
     /* mem + arena + slab integration */
+    RUN_SELECTED_SUITE(slab_alloc);
     RUN_SELECTED_SUITE(mem);
 
     /* UI (config, embedded assets, layout) */
@@ -254,6 +258,8 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(yaml);
 
     /* SimHash / SIMILAR_TO */
+    RUN_SELECTED_SUITE(semantic);
+    RUN_SELECTED_SUITE(ast_profile);
     RUN_SELECTED_SUITE(simhash);
 
     /* Stack overflow regression (GitHub #199) */
