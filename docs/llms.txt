@@ -7,7 +7,7 @@
 - License: MIT, open source.
 - Languages: 158 (158 vendored tree-sitter grammars compiled into the binary).
 - Hybrid LSP type resolution: 9 language families (Python, TypeScript/JavaScript/JSX/TSX, PHP, C#, Go, C/C++, Java, Kotlin, Rust) — a lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers including tsserver, pyright, gopls, Roslyn, Eclipse JDT, and rust-analyzer.
-- MCP tools: 14 (search_graph incl. semantic_query vector search, trace_path (alias: trace_call_path), query_graph (Cypher), detect_changes, get_architecture, get_code_snippet, manage_adr, and more).
+- MCP tools: 15 (search_graph incl. semantic_query vector search, trace_path (alias: trace_call_path), query_graph (Cypher), detect_changes, get_architecture, get_code_snippet, manage_adr, manage_memory, and more).
 - Semantic search: natural-language code discovery via bundled nomic-embed-code embeddings (768-dim, compiled into the binary); 11-signal combined scoring; fully local, no API key.
 - Semantic & similarity edges: SEMANTICALLY_RELATED (vocabulary-mismatch matches) and SIMILAR_TO (MinHash + LSH near-clone / duplicate detection).
 - Cross-repo intelligence: CROSS_* edges link nodes across multiple repos indexed in one store; multi-galaxy 3D layout and cross-repo architecture summary.
