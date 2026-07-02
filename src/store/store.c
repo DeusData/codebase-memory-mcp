@@ -6491,6 +6491,33 @@ static void arch_free_layers(cbm_package_layer_t *items, int count) {
     free(items);
 }
 
+static void arch_clear_cluster(cbm_cluster_info_t *item) {
+    if (!item) {
+        return;
+    }
+    safe_str_free(&item->label);
+    for (int j = 0; j < item->top_node_count; j++) {
+        safe_str_free(&item->top_nodes[j]);
+    }
+    free(item->top_nodes);
+    for (int j = 0; j < item->package_count; j++) {
+        safe_str_free(&item->packages[j]);
+    }
+    free(item->packages);
+    for (int j = 0; j < item->edge_type_count; j++) {
+        safe_str_free(&item->edge_types[j]);
+    }
+    free(item->edge_types);
+    memset(item, 0, sizeof(*item));
+}
+
+static void arch_free_clusters(cbm_cluster_info_t *items, int count) {
+    for (int i = 0; i < count; i++) {
+        arch_clear_cluster(&items[i]);
+    }
+    free(items);
+}
+
 static int arch_languages(cbm_store_t *s, const char *project, const char *path,
                           cbm_architecture_info_t *out) {
     char norm[CBM_SZ_512];
@@ -8653,22 +8680,93 @@ static int cluster_id_index(const int64_t *ids, int n, int64_t id) {
     return hit ? (int)(hit - ids) : CBM_NOT_FOUND;
 }
 
+static void cluster_free_node_arrays(int64_t *ids, const char **names, const char **qns, int count) {
+    for (int i = 0; i < count; i++) {
+        safe_str_free(&names[i]);
+        safe_str_free(&qns[i]);
+    }
+    free(ids);
+    free(names);
+    free(qns);
+}
+
+static void cluster_free_edge_arrays(cbm_louvain_edge_t *edges, int *esrc, int *edst, int *degree) {
+    free(edges);
+    free(esrc);
+    free(edst);
+    free(degree);
+}
+
+static int cluster_grow_nodes(int64_t **ids, const char ***names, const char ***qns, int *cap) {
+    if (!ids || !names || !qns || !cap || *cap <= 0 || *cap > INT_MAX / ST_GROWTH) {
+        return CBM_STORE_ERR;
+    }
+    int new_cap = *cap * ST_GROWTH;
+    int64_t *new_ids = realloc(*ids, (size_t)new_cap * sizeof(int64_t));
+    if (!new_ids) {
+        return CBM_STORE_ERR;
+    }
+    *ids = new_ids;
+    const char **new_names = realloc((void *)*names, (size_t)new_cap * sizeof(char *));
+    if (!new_names) {
+        return CBM_STORE_ERR;
+    }
+    *names = new_names;
+    const char **new_qns = realloc((void *)*qns, (size_t)new_cap * sizeof(char *));
+    if (!new_qns) {
+        return CBM_STORE_ERR;
+    }
+    *qns = new_qns;
+    *cap = new_cap;
+    return CBM_STORE_OK;
+}
+
+static int cluster_grow_edges(cbm_louvain_edge_t **edges, int **esrc, int **edst, int *cap) {
+    if (!edges || !esrc || !edst || !cap || *cap <= 0 || *cap > INT_MAX / ST_GROWTH) {
+        return CBM_STORE_ERR;
+    }
+    int new_cap = *cap * ST_GROWTH;
+    cbm_louvain_edge_t *new_edges =
+        realloc(*edges, (size_t)new_cap * sizeof(cbm_louvain_edge_t));
+    if (!new_edges) {
+        return CBM_STORE_ERR;
+    }
+    *edges = new_edges;
+    int *new_esrc = realloc(*esrc, (size_t)new_cap * sizeof(int));
+    if (!new_esrc) {
+        return CBM_STORE_ERR;
+    }
+    *esrc = new_esrc;
+    int *new_edst = realloc(*edst, (size_t)new_cap * sizeof(int));
+    if (!new_edst) {
+        return CBM_STORE_ERR;
+    }
+    *edst = new_edst;
+    *cap = new_cap;
+    return CBM_STORE_OK;
+}
+
 /* Append `pkg` to a distinct package list (with a per-package count). */
-static void cluster_add_pkg(const char **pkgs, int *counts, int *count, int cap, const char *pkg) {
+static int cluster_add_pkg(const char **pkgs, int *counts, int *count, int cap, const char *pkg) {
     if (!pkg || !pkg[0]) {
-        return;
+        return CBM_STORE_OK;
     }
     for (int i = 0; i < *count; i++) {
         if (strcmp(pkgs[i], pkg) == 0) {
             counts[i]++;
-            return;
+            return CBM_STORE_OK;
         }
     }
     if (*count < cap) {
-        pkgs[*count] = heap_strdup(pkg);
+        char *copy = heap_strdup(pkg);
+        if (!copy) {
+            return CBM_STORE_ERR;
+        }
+        pkgs[*count] = copy;
         counts[*count] = 1;
         (*count)++;
     }
+    return CBM_STORE_OK;
 }
 
 static bool cluster_label_is_generic(const char *label) {
@@ -8725,8 +8823,13 @@ static const char *cluster_best_context(const char **qns, const int *comm, int n
         if (comm[i] != c) {
             continue;
         }
-        cluster_add_pkg(contexts, counts, &count, CBM_CLUSTER_MAX_PKGS,
-                        cluster_label_context_from_qn(qns[i]));
+        if (cluster_add_pkg(contexts, counts, &count, CBM_CLUSTER_MAX_PKGS,
+                            cluster_label_context_from_qn(qns[i])) != CBM_STORE_OK) {
+            for (int j = 0; j < count; j++) {
+                safe_str_free(&contexts[j]);
+            }
+            return "";
+        }
     }
     const char *best = "";
     int best_count = 0;
@@ -8874,9 +8977,9 @@ static void cluster_disambiguate_duplicate_labels(cbm_cluster_info_t *clusters, 
 }
 
 /* Build the cluster_info for one community c into *ci. */
-static void cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *comm,
-                              const int *degree, const char **names, const char **qns, int members,
-                              double cohesion) {
+static int cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *comm,
+                             const int *degree, const char **names, const char **qns, int members,
+                             double cohesion) {
     memset(ci, 0, sizeof(*ci));
     ci->id = c;
     ci->members = members;
@@ -8910,8 +9013,16 @@ static void cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *c
     }
     if (tn > 0) {
         ci->top_nodes = malloc((size_t)tn * sizeof(char *));
+        if (!ci->top_nodes) {
+            return CBM_STORE_ERR;
+        }
         for (int i = 0; i < tn; i++) {
             ci->top_nodes[i] = heap_strdup(names[top_idx[i]]);
+            if (!ci->top_nodes[i]) {
+                ci->top_node_count = i + 1;
+                arch_clear_cluster(ci);
+                return CBM_STORE_ERR;
+            }
         }
         ci->top_node_count = tn;
     }
@@ -8922,14 +9033,35 @@ static void cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *c
     int pc = 0;
     for (int i = 0; i < n; i++) {
         if (comm[i] == c) {
-            cluster_add_pkg(pkgs, pkg_counts, &pc, CBM_CLUSTER_MAX_PKGS,
-                            cbm_qn_to_top_package(qns[i]));
+            if (cluster_add_pkg(pkgs, pkg_counts, &pc, CBM_CLUSTER_MAX_PKGS,
+                                cbm_qn_to_top_package(qns[i])) != CBM_STORE_OK) {
+                for (int j = 0; j < pc; j++) {
+                    safe_str_free(&pkgs[j]);
+                }
+                arch_clear_cluster(ci);
+                return CBM_STORE_ERR;
+            }
         }
     }
     if (pc > 0) {
         ci->packages = malloc((size_t)pc * sizeof(char *));
+        if (!ci->packages) {
+            for (int i = 0; i < pc; i++) {
+                safe_str_free(&pkgs[i]);
+            }
+            arch_clear_cluster(ci);
+            return CBM_STORE_ERR;
+        }
         for (int i = 0; i < pc; i++) {
             ci->packages[i] = heap_strdup(pkgs[i]);
+            if (!ci->packages[i]) {
+                ci->package_count = i + 1;
+                for (int j = 0; j < pc; j++) {
+                    safe_str_free(&pkgs[j]);
+                }
+                arch_clear_cluster(ci);
+                return CBM_STORE_ERR;
+            }
         }
         ci->package_count = pc;
         for (int i = 0; i < pc; i++) {
@@ -8946,10 +9078,24 @@ static void cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *c
     if (label_context && label_context[0]) {
         safe_str_free(&label_context);
     }
+    if (!ci->label) {
+        arch_clear_cluster(ci);
+        return CBM_STORE_ERR;
+    }
 
     ci->edge_types = malloc(sizeof(char *));
+    if (!ci->edge_types) {
+        arch_clear_cluster(ci);
+        return CBM_STORE_ERR;
+    }
     ci->edge_types[0] = heap_strdup("CALLS");
+    if (!ci->edge_types[0]) {
+        ci->edge_type_count = 1;
+        arch_clear_cluster(ci);
+        return CBM_STORE_ERR;
+    }
     ci->edge_type_count = 1;
+    return CBM_STORE_OK;
 }
 
 /* Comparator for sorting community indices by descending member count. */
@@ -8994,27 +9140,40 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
     int64_t *ids = malloc((size_t)cap * sizeof(int64_t));
     const char **names = malloc((size_t)cap * sizeof(char *));
     const char **qns = malloc((size_t)cap * sizeof(char *));
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    if (!ids || !names || !qns) {
+        sqlite3_finalize(st);
+        cluster_free_node_arrays(ids, names, qns, 0);
+        return CBM_STORE_OK; /* clusters are best-effort */
+    }
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) {
         if (n >= cap) {
-            cap *= ST_GROWTH;
-            ids = safe_realloc(ids, (size_t)cap * sizeof(int64_t));
-            names = safe_realloc(names, (size_t)cap * sizeof(char *));
-            qns = safe_realloc(qns, (size_t)cap * sizeof(char *));
+            if (cluster_grow_nodes(&ids, &names, &qns, &cap) != CBM_STORE_OK) {
+                sqlite3_finalize(st);
+                cluster_free_node_arrays(ids, names, qns, n);
+                return CBM_STORE_OK; /* clusters are best-effort */
+            }
         }
         ids[n] = sqlite3_column_int64(st, 0);
+        names[n] = NULL;
+        qns[n] = NULL;
         names[n] = heap_strdup((const char *)sqlite3_column_text(st, SKIP_ONE));
         qns[n] = heap_strdup((const char *)sqlite3_column_text(st, CBM_SZ_2));
+        if (!names[n] || !qns[n]) {
+            sqlite3_finalize(st);
+            cluster_free_node_arrays(ids, names, qns, n + 1);
+            return CBM_STORE_OK; /* clusters are best-effort */
+        }
         n++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        sqlite3_finalize(st);
+        cluster_free_node_arrays(ids, names, qns, n);
+        return CBM_STORE_OK; /* clusters are best-effort */
     }
     sqlite3_finalize(st);
     if (n < CBM_CLUSTER_MIN_MEMBERS) {
-        for (int i = 0; i < n; i++) {
-            safe_str_free(&names[i]);
-            safe_str_free(&qns[i]);
-        }
-        free(ids);
-        free(names);
-        free(qns);
+        cluster_free_node_arrays(ids, names, qns, n);
         return CBM_STORE_OK;
     }
 
@@ -9023,22 +9182,30 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
     int *esrc = malloc((size_t)n * sizeof(int));
     int *edst = malloc((size_t)n * sizeof(int));
     int *degree = calloc((size_t)n, sizeof(int));
+    if (!edges || !esrc || !edst || !degree) {
+        cluster_free_node_arrays(ids, names, qns, n);
+        cluster_free_edge_arrays(edges, esrc, edst, degree);
+        return CBM_STORE_OK; /* clusters are best-effort */
+    }
     int ne = 0;
     const char *esql = "SELECT source_id, target_id FROM edges WHERE project=?1 AND type='CALLS'";
     if (sqlite3_prepare_v2(s->db, esql, CBM_NOT_FOUND, &st, NULL) == SQLITE_OK) {
         int ecap = n;
         bind_text(st, SKIP_ONE, project);
-        while (sqlite3_step(st) == SQLITE_ROW) {
+        step_rc = SQLITE_OK;
+        while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) {
             int si = cluster_id_index(ids, n, sqlite3_column_int64(st, 0));
             int ti = cluster_id_index(ids, n, sqlite3_column_int64(st, SKIP_ONE));
             if (si < 0 || ti < 0 || si == ti) {
                 continue;
             }
             if (ne >= ecap) {
-                ecap *= ST_GROWTH;
-                edges = safe_realloc(edges, (size_t)ecap * sizeof(cbm_louvain_edge_t));
-                esrc = safe_realloc(esrc, (size_t)ecap * sizeof(int));
-                edst = safe_realloc(edst, (size_t)ecap * sizeof(int));
+                if (cluster_grow_edges(&edges, &esrc, &edst, &ecap) != CBM_STORE_OK) {
+                    sqlite3_finalize(st);
+                    cluster_free_node_arrays(ids, names, qns, n);
+                    cluster_free_edge_arrays(edges, esrc, edst, degree);
+                    return CBM_STORE_OK; /* clusters are best-effort */
+                }
             }
             edges[ne].src = ids[si];
             edges[ne].dst = ids[ti];
@@ -9047,6 +9214,12 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
             degree[si]++;
             degree[ti]++;
             ne++;
+        }
+        if (step_rc != SQLITE_DONE) {
+            sqlite3_finalize(st);
+            cluster_free_node_arrays(ids, names, qns, n);
+            cluster_free_edge_arrays(edges, esrc, edst, degree);
+            return CBM_STORE_OK; /* clusters are best-effort */
         }
         sqlite3_finalize(st);
     }
@@ -9058,10 +9231,12 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
     int C = 0;
     if (cbm_leiden(ids, n, edges, ne, resolution, &res, &rn) == CBM_STORE_OK && res && rn == n) {
         comm = malloc((size_t)n * sizeof(int));
-        for (int i = 0; i < n; i++) {
-            comm[i] = res[i].community;
-            if (comm[i] + 1 > C) {
-                C = comm[i] + 1;
+        if (comm) {
+            for (int i = 0; i < n; i++) {
+                comm[i] = res[i].community;
+                if (comm[i] + 1 > C) {
+                    C = comm[i] + 1;
+                }
             }
         }
     }
@@ -9072,6 +9247,12 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
         int *members = calloc((size_t)C, sizeof(int));
         int *internal = calloc((size_t)C, sizeof(int));
         int *boundary = calloc((size_t)C, sizeof(int));
+        if (!members || !internal || !boundary) {
+            free(members);
+            free(internal);
+            free(boundary);
+            goto clusters_done;
+        }
         for (int i = 0; i < n; i++) {
             members[comm[i]]++;
         }
@@ -9088,13 +9269,26 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
 
         /* 5. Rank communities by size, take the top N non-singletons. */
         cluster_rank_t *rank = malloc((size_t)C * sizeof(cluster_rank_t));
+        if (!rank) {
+            free(members);
+            free(internal);
+            free(boundary);
+            goto clusters_done;
+        }
         for (int c = 0; c < C; c++) {
             rank[c] = (cluster_rank_t){c, members[c]};
         }
         qsort(rank, (size_t)C, sizeof(cluster_rank_t), cluster_rank_cmp);
 
         cbm_cluster_info_t *clusters =
-            malloc((size_t)CBM_CLUSTER_TOP_N * sizeof(cbm_cluster_info_t));
+            calloc((size_t)CBM_CLUSTER_TOP_N, sizeof(cbm_cluster_info_t));
+        if (!clusters) {
+            free(members);
+            free(internal);
+            free(boundary);
+            free(rank);
+            goto clusters_done;
+        }
         int cc = 0;
         for (int r = 0; r < C && cc < CBM_CLUSTER_TOP_N; r++) {
             int c = rank[r].comm;
@@ -9103,7 +9297,15 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
             }
             double denom = internal[c] + boundary[c];
             double cohesion = denom > 0 ? (double)internal[c] / denom : 0.0;
-            cluster_build_one(&clusters[cc], c, n, comm, degree, names, qns, members[c], cohesion);
+            if (cluster_build_one(&clusters[cc], c, n, comm, degree, names, qns, members[c],
+                                  cohesion) != CBM_STORE_OK) {
+                arch_free_clusters(clusters, cc);
+                free(members);
+                free(internal);
+                free(boundary);
+                free(rank);
+                goto clusters_done;
+            }
             cc++;
         }
         cluster_disambiguate_duplicate_labels(clusters, cc, n, comm, qns);
@@ -9116,18 +9318,10 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
         free(rank);
     }
 
+clusters_done:
     free(comm);
-    for (int i = 0; i < n; i++) {
-        safe_str_free(&names[i]);
-        safe_str_free(&qns[i]);
-    }
-    free(ids);
-    free(names);
-    free(qns);
-    free(edges);
-    free(esrc);
-    free(edst);
-    free(degree);
+    cluster_free_node_arrays(ids, names, qns, n);
+    cluster_free_edge_arrays(edges, esrc, edst, degree);
     return CBM_STORE_OK;
 }
 
@@ -9255,22 +9449,7 @@ void cbm_store_architecture_free(cbm_architecture_info_t *out) {
     }
     free(out->services);
     arch_free_layers(out->layers, out->layer_count);
-    for (int i = 0; i < out->cluster_count; i++) {
-        safe_str_free(&out->clusters[i].label);
-        for (int j = 0; j < out->clusters[i].top_node_count; j++) {
-            safe_str_free(&out->clusters[i].top_nodes[j]);
-        }
-        free(out->clusters[i].top_nodes);
-        for (int j = 0; j < out->clusters[i].package_count; j++) {
-            safe_str_free(&out->clusters[i].packages[j]);
-        }
-        free(out->clusters[i].packages);
-        for (int j = 0; j < out->clusters[i].edge_type_count; j++) {
-            safe_str_free(&out->clusters[i].edge_types[j]);
-        }
-        free(out->clusters[i].edge_types);
-    }
-    free(out->clusters);
+    arch_free_clusters(out->clusters, out->cluster_count);
     for (int i = 0; i < out->file_tree_count; i++) {
         safe_str_free(&out->file_tree[i].path);
         safe_str_free(&out->file_tree[i].type);
