@@ -1783,6 +1783,9 @@ TEST(cli_codex_session_hook_issue330) {
     ASSERT(strstr(d, "[[hooks.SessionStart]]") != NULL);
     ASSERT(strstr(d, "[[hooks.SessionStart.hooks]]") != NULL);
     ASSERT(strstr(d, "search_graph") != NULL);
+    ASSERT(strstr(d, "before broad grep for structural code discovery") != NULL);
+    ASSERT(strstr(d, "MCP server CWD") != NULL);
+    ASSERT(strstr(d, "grep/file-read") == NULL);
     ASSERT(strstr(d, "[mcp_servers.other]") != NULL); /* pre-existing content preserved */
     /* Idempotent: a second upsert leaves exactly ONE hook block. */
     ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
