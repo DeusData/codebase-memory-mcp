@@ -452,6 +452,14 @@ TEST(pipeline_project_name_derived) {
     PASS();
 }
 
+TEST(pipeline_mode_global_semantic_edges_policy) {
+    ASSERT_TRUE(cbm_pipeline_mode_builds_global_semantic_edges(CBM_MODE_FULL));
+    ASSERT_TRUE(cbm_pipeline_mode_builds_global_semantic_edges(CBM_MODE_MODERATE));
+    ASSERT_FALSE(cbm_pipeline_mode_builds_global_semantic_edges(CBM_MODE_FAST));
+    ASSERT_FALSE(cbm_pipeline_mode_builds_global_semantic_edges(CBM_MODE_DEP));
+    PASS();
+}
+
 TEST(pipeline_fast_mode) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
@@ -11586,6 +11594,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_structure_edges);
     RUN_TEST(pipeline_branch_root_structure);
     RUN_TEST(pipeline_project_name_derived);
+    RUN_TEST(pipeline_mode_global_semantic_edges_policy);
     RUN_TEST(pipeline_fast_mode);
     /* Definitions pass */
     RUN_TEST(pipeline_definitions_function_nodes);

@@ -110,7 +110,7 @@ typedef struct {
     cbm_gbuf_t *gbuf;         /* owned by pipeline */
     cbm_registry_t *registry; /* owned by pipeline */
     atomic_int *cancelled;    /* pointer to pipeline's cancelled flag */
-    int mode;                 /* cbm_index_mode_t (0=full, 1=moderate, 2=fast, 3=advanced) */
+    int mode;                 /* cbm_index_mode_t (0=full, 1=moderate, 2=fast, 3=dep) */
     double similarity_threshold; /* Jaccard threshold for SIMILAR edges; <=0 means
                                   * use the CBM_MINHASH_JACCARD_THRESHOLD default (#41). */
     double httplink_min_confidence;    /* <=0 uses httplink pass default 0.25 */
@@ -139,6 +139,10 @@ typedef struct {
     const char *const *store_backed_changed_paths;
     int store_backed_changed_path_count;
 } cbm_pipeline_ctx_t;
+
+static inline bool cbm_pipeline_mode_builds_global_semantic_edges(int mode) {
+    return mode == CBM_MODE_FULL || mode == CBM_MODE_MODERATE;
+}
 
 typedef struct {
     cbm_store_file_delta_t delta;
