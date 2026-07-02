@@ -62,6 +62,50 @@ static size_t count_substr(const char *s, const char *needle) {
     return count;
 }
 
+typedef struct {
+    const char *name;
+    char *value;
+} cli_env_snapshot_t;
+
+static bool cli_env_snapshot(cli_env_snapshot_t *snap, const char *name) {
+    const char *value = getenv(name);
+    snap->name = name;
+    snap->value = value ? cbm_strndup(value, strlen(value)) : NULL;
+    return !value || snap->value;
+}
+
+static void cli_env_restore(cli_env_snapshot_t *snap) {
+    if (!snap->name) {
+        return;
+    }
+    if (snap->value) {
+        cbm_setenv(snap->name, snap->value, 1);
+        free(snap->value);
+        snap->value = NULL;
+    } else {
+        cbm_unsetenv(snap->name);
+    }
+}
+
+static int cli_run_help_without_home(int (*cmd)(int, char **)) {
+    cli_env_snapshot_t home = {0};
+    cli_env_snapshot_t userprofile = {0};
+    if (!cli_env_snapshot(&home, "HOME") || !cli_env_snapshot(&userprofile, "USERPROFILE")) {
+        cli_env_restore(&userprofile);
+        cli_env_restore(&home);
+        return -1;
+    }
+
+    cbm_unsetenv("HOME");
+    cbm_unsetenv("USERPROFILE");
+    char *args[] = {"--help"};
+    int rc = cmd(1, args);
+
+    cli_env_restore(&userprofile);
+    cli_env_restore(&home);
+    return rc;
+}
+
 /* Helper: mkdirp */
 static int test_mkdirp(const char *path) {
     char tmp[1024];
@@ -1512,6 +1556,21 @@ TEST(cli_uninstall_dry_run) {
     }
 
     test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_install_help_does_not_require_home) {
+    ASSERT_EQ(cli_run_help_without_home(cbm_cmd_install), 0);
+    PASS();
+}
+
+TEST(cli_uninstall_help_does_not_require_home) {
+    ASSERT_EQ(cli_run_help_without_home(cbm_cmd_uninstall), 0);
+    PASS();
+}
+
+TEST(cli_update_help_does_not_require_home) {
+    ASSERT_EQ(cli_run_help_without_home(cbm_cmd_update), 0);
     PASS();
 }
 
@@ -3221,6 +3280,9 @@ SUITE(cli) {
     /* Dry-run lifecycle (2 tests) */
     RUN_TEST(cli_install_dry_run);
     RUN_TEST(cli_uninstall_dry_run);
+    RUN_TEST(cli_install_help_does_not_require_home);
+    RUN_TEST(cli_uninstall_help_does_not_require_home);
+    RUN_TEST(cli_update_help_does_not_require_home);
 
     /* Full lifecycle (1 test — cli_test.go) */
     RUN_TEST(cli_install_and_uninstall);

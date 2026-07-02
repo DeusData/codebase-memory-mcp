@@ -4219,7 +4219,58 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
     return json; /* malloc'd; caller frees */
 }
 
+static bool cli_args_have_help(int argc, char **argv) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void print_install_help(void) {
+    puts("Usage: codebase-memory-mcp install [-y|-n] [--force] [--dry-run] [--plan]");
+    puts("");
+    puts("Install the current binary, MCP agent configs, skills, hooks, and PATH entries.");
+    puts("");
+    puts("Options:");
+    puts("  -y, --yes   Answer yes to prompts");
+    puts("  -n, --no    Answer no to prompts");
+    puts("  --force     Overwrite existing installed files where supported");
+    puts("  --dry-run   Show actions without modifying files");
+    puts("  --plan      Print JSON install plan and do not modify files");
+}
+
+static void print_uninstall_help(void) {
+    puts("Usage: codebase-memory-mcp uninstall [-y|-n] [--dry-run]");
+    puts("");
+    puts("Remove MCP agent configs, skills, hooks, indexes, and installed binary.");
+    puts("");
+    puts("Options:");
+    puts("  -y, --yes   Answer yes to prompts");
+    puts("  -n, --no    Answer no to prompts");
+    puts("  --dry-run   Show actions without modifying files");
+}
+
+static void print_update_help(void) {
+    puts("Usage: codebase-memory-mcp update [-y|-n] [--force] [--dry-run] [--standard|--ui]");
+    puts("");
+    puts("Download a release binary, replace the installed binary, and refresh agent configs.");
+    puts("");
+    puts("Options:");
+    puts("  -y, --yes   Answer yes to prompts");
+    puts("  -n, --no    Answer no to prompts");
+    puts("  --force     Skip latest-version check");
+    puts("  --dry-run   Show actions without downloading or modifying files");
+    puts("  --standard  Select MCP-server-only binary without prompting");
+    puts("  --ui        Select binary with embedded graph visualization without prompting");
+}
+
 int cbm_cmd_install(int argc, char **argv) {
+    if (cli_args_have_help(argc, argv)) {
+        print_install_help();
+        return CLI_OK;
+    }
     parse_auto_answer(argc, argv);
     bool dry_run = false;
     bool force = false;
@@ -4582,6 +4633,10 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
 }
 
 int cbm_cmd_uninstall(int argc, char **argv) {
+    if (cli_args_have_help(argc, argv)) {
+        print_uninstall_help();
+        return CLI_OK;
+    }
     parse_auto_answer(argc, argv);
     bool dry_run = false;
     for (int i = 0; i < argc; i++) {
@@ -4879,6 +4934,10 @@ static bool check_already_latest(void) {
 }
 
 int cbm_cmd_update(int argc, char **argv) {
+    if (cli_args_have_help(argc, argv)) {
+        print_update_help();
+        return CLI_OK;
+    }
     parse_auto_answer(argc, argv);
 
     bool dry_run = false;
