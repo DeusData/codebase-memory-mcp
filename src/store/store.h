@@ -615,6 +615,9 @@ int cbm_store_set_derived_view_state(cbm_store_t *s, const char *project,
 int cbm_store_mark_derived_views_stale(cbm_store_t *s, const char *project,
                                        int64_t generation, const char *const *view_names,
                                        int view_count);
+int cbm_store_mark_derived_views_complete(cbm_store_t *s, const char *project,
+                                          int64_t generation,
+                                          const char *const *view_names, int view_count);
 
 int cbm_store_get_derived_view_state(cbm_store_t *s, const char *project,
                                      const char *view_name,

@@ -2424,6 +2424,21 @@ TEST(store_derived_view_state_public_api) {
     ASSERT_STR_EQ(got.status, CBM_STORE_DERIVED_STATUS_COMPLETE);
     cbm_store_derived_view_state_free_fields(&got);
 
+    const char *complete_views[] = {CBM_STORE_DERIVED_VIEW_ROUTES,
+                                    CBM_STORE_DERIVED_VIEW_ARCHITECTURE};
+    ASSERT_EQ(cbm_store_mark_derived_views_complete(
+                  s, "test", COMPLETE_GENERATION, complete_views,
+                  (int)(sizeof(complete_views) / sizeof(complete_views[0]))),
+              CBM_STORE_OK);
+    ASSERT_EQ(store_count_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_ROUTES,
+                                             COMPLETE_GENERATION,
+                                             CBM_STORE_DERIVED_STATUS_COMPLETE),
+              1);
+    ASSERT_EQ(store_count_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_ARCHITECTURE,
+                                             COMPLETE_GENERATION,
+                                             CBM_STORE_DERIVED_STATUS_COMPLETE),
+              1);
+
     ASSERT_EQ(cbm_store_set_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_LINKRANK,
                                                COMPLETE_GENERATION,
                                                STORE_TEST_INVALID_DERIVED_STATUS),

@@ -1296,7 +1296,7 @@ cleanup:
 static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
                             cbm_file_info_t *files, int file_count,
                             const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
-                            const char *repo_path, const char *pass_fingerprint) {
+                            const char *repo_path, const char *pass_fingerprint, int mode) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
@@ -1337,6 +1337,13 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
                           itoa_buf_incr(fts_rc));
             cbm_store_close(hash_store);
             return fts_rc;
+        }
+        int derived_rc = cbm_pipeline_mark_replacement_derived_views(hash_store, project, mode);
+        if (derived_rc != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "phase", "mark_derived_views", "rc",
+                          itoa_buf_incr(derived_rc));
+            cbm_store_close(hash_store);
+            return derived_rc;
         }
 
         cbm_store_close(hash_store);
@@ -1660,7 +1667,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                                       cbm_gbuf_edge_count(existing));
     int persist_rc = dump_and_persist(existing, db_path, project, files, file_count, cls.mode_skipped,
                                       cls.mode_skipped_count, cbm_pipeline_repo_path(p),
-                                      pass_fingerprint);
+                                      pass_fingerprint, cbm_pipeline_get_mode(p));
     if (persist_rc == 0) {
         cbm_pipeline_set_graph_changed(p, true);
         cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);

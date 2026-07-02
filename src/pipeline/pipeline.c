@@ -1591,6 +1591,15 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
                     rc = fts_rc;
                     goto cleanup;
                 }
+                int derived_rc = cbm_pipeline_mark_replacement_derived_views(
+                    hash_store, p->project_name, p->mode);
+                if (derived_rc != CBM_STORE_OK) {
+                    cbm_log_error("pipeline.err", "phase", "mark_derived_views", "rc",
+                                  itoa_buf(derived_rc));
+                    cbm_store_close(hash_store);
+                    rc = derived_rc;
+                    goto cleanup;
+                }
                 cbm_store_close(hash_store);
                 cbm_log_info("pass.timing", "pass", "persist_hashes", "files",
                              itoa_buf(file_count));

@@ -2976,17 +2976,24 @@ static int store_graph_derived_view_count(void) {
     return (int)(sizeof(store_graph_derived_view_names) / sizeof(store_graph_derived_view_names[0]));
 }
 
-static int store_mark_derived_views_stale_body(cbm_store_t *s, const char *project,
-                                               int64_t generation,
-                                               const char *const *view_names, int view_count) {
+static int store_mark_derived_views_status_body(cbm_store_t *s, const char *project,
+                                                int64_t generation,
+                                                const char *const *view_names, int view_count,
+                                                const char *status) {
     for (int i = 0; i < view_count; i++) {
-        int rc = store_upsert_derived_view_state(s, project, view_names[i], generation,
-                                                 CBM_STORE_DERIVED_STATUS_STALE);
+        int rc = store_upsert_derived_view_state(s, project, view_names[i], generation, status);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
     }
     return CBM_STORE_OK;
+}
+
+static int store_mark_derived_views_stale_body(cbm_store_t *s, const char *project,
+                                               int64_t generation,
+                                               const char *const *view_names, int view_count) {
+    return store_mark_derived_views_status_body(s, project, generation, view_names, view_count,
+                                                CBM_STORE_DERIVED_STATUS_STALE);
 }
 
 static int store_mark_graph_derived_views_stale_body(cbm_store_t *s, const char *project,
@@ -3025,14 +3032,15 @@ int cbm_store_set_derived_view_state(cbm_store_t *s, const char *project,
     return CBM_STORE_OK;
 }
 
-int cbm_store_mark_derived_views_stale(cbm_store_t *s, const char *project,
-                                       int64_t generation, const char *const *view_names,
-                                       int view_count) {
+static int store_mark_derived_views_status(cbm_store_t *s, const char *project,
+                                           int64_t generation,
+                                           const char *const *view_names, int view_count,
+                                           const char *status) {
     if (!s || !s->db || !project || !project[0] ||
         generation < CBM_STORE_DERIVED_GENERATION_UNKNOWN || view_count < 0 ||
-        (view_count > 0 && !view_names)) {
+        (view_count > 0 && !view_names) || !store_derived_status_valid(status)) {
         if (s) {
-            store_set_error(s, "mark_derived_views_stale: invalid argument");
+            store_set_error(s, "mark_derived_views_status: invalid argument");
         }
         return CBM_STORE_ERR;
     }
@@ -3050,7 +3058,8 @@ int cbm_store_mark_derived_views_stale(cbm_store_t *s, const char *project,
     if (rc != CBM_STORE_OK) {
         return rc;
     }
-    rc = store_mark_derived_views_stale_body(s, project, generation, view_names, view_count);
+    rc = store_mark_derived_views_status_body(s, project, generation, view_names, view_count,
+                                              status);
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(s);
         return rc;
@@ -3061,6 +3070,20 @@ int cbm_store_mark_derived_views_stale(cbm_store_t *s, const char *project,
         return rc;
     }
     return CBM_STORE_OK;
+}
+
+int cbm_store_mark_derived_views_stale(cbm_store_t *s, const char *project,
+                                       int64_t generation, const char *const *view_names,
+                                       int view_count) {
+    return store_mark_derived_views_status(s, project, generation, view_names, view_count,
+                                           CBM_STORE_DERIVED_STATUS_STALE);
+}
+
+int cbm_store_mark_derived_views_complete(cbm_store_t *s, const char *project,
+                                          int64_t generation,
+                                          const char *const *view_names, int view_count) {
+    return store_mark_derived_views_status(s, project, generation, view_names, view_count,
+                                           CBM_STORE_DERIVED_STATUS_COMPLETE);
 }
 
 int cbm_store_get_derived_view_state(cbm_store_t *s, const char *project,
