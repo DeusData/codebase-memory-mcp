@@ -198,10 +198,9 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
         if (store) {
             int deps_reindexed =
                 cbm_dep_auto_index(pname, root_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT, cfg);
-            (void)cbm_pagerank_refresh_if_needed(store, pname, NULL, graph_changed,
-                                                 deps_reindexed,
-                                                 publish_kind ==
-                                                     CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+            (void)cbm_pagerank_refresh_after_publish(
+                store, pname, cfg, graph_changed, deps_reindexed,
+                cbm_rank_refresh_publish_from_pipeline(publish_kind));
             cbm_store_close(store);
         }
         free(pname);

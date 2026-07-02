@@ -5192,9 +5192,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             }
 
             CBM_PROF_START(prof_index_rank_refresh);
-            (void)cbm_pagerank_refresh_if_needed(
+            (void)cbm_pagerank_refresh_after_publish(
                 store, project_name, srv->config, graph_changed, deps_reindexed,
-                publish_kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+                cbm_rank_refresh_publish_from_pipeline(publish_kind));
             CBM_PROF_END("index_repository", "rank_refresh", prof_index_rank_refresh);
             /* Register project with watcher so future file changes trigger auto-reindex */
             if (srv->watcher)
@@ -7555,9 +7555,9 @@ static void *autoindex_thread(void *arg) {
             int deps_reindexed = cbm_mcp_auto_index_deps(
                 srv, srv->session_project, srv->session_root, store,
                 effective_dep_limit, NULL);
-            (void)cbm_pagerank_refresh_if_needed(
+            (void)cbm_pagerank_refresh_after_publish(
                 store, srv->session_project, srv->config, graph_changed, deps_reindexed,
-                publish_kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+                cbm_rank_refresh_publish_from_pipeline(publish_kind));
         }
 
         cbm_log_info("autoindex.done", "project", srv->session_project);

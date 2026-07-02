@@ -266,7 +266,13 @@ static inline int cbm_pipeline_mark_replacement_derived_views(cbm_store_t *store
         CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
     };
 
-    int rc = cbm_store_mark_derived_views_complete(
+    int rc = cbm_store_mark_rank_derived_views_stale(
+        store, project, CBM_PIPELINE_COMPAT_GENERATION);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    rc = cbm_store_mark_derived_views_complete(
         store, project, CBM_PIPELINE_COMPAT_GENERATION, complete_graph_views,
         (int)(sizeof(complete_graph_views) / sizeof(complete_graph_views[0])));
     if (rc != CBM_STORE_OK) {

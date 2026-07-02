@@ -197,6 +197,7 @@ static cbm_rank_scope_t rank_scope_from_config(cbm_config_t *cfg) {
 typedef enum {
     CBM_RANK_REFRESH_POLICY_EAGER = 0,
     CBM_RANK_REFRESH_POLICY_STALE_ON_EXACT,
+    CBM_RANK_REFRESH_POLICY_STALE_ON_INCREMENTAL,
 } cbm_rank_refresh_policy_t;
 
 static cbm_rank_refresh_policy_t rank_refresh_policy_from_config(cbm_config_t *cfg) {
@@ -209,7 +210,38 @@ static cbm_rank_refresh_policy_t rank_refresh_policy_from_config(cbm_config_t *c
     if (strcmp(policy, CBM_RANK_REFRESH_STALE_ON_EXACT) == 0) {
         return CBM_RANK_REFRESH_POLICY_STALE_ON_EXACT;
     }
+    if (strcmp(policy, CBM_RANK_REFRESH_STALE_ON_INCREMENTAL) == 0) {
+        return CBM_RANK_REFRESH_POLICY_STALE_ON_INCREMENTAL;
+    }
     return CBM_RANK_REFRESH_POLICY_EAGER;
+}
+
+static bool rank_refresh_policy_allows_defer(cbm_rank_refresh_policy_t policy,
+                                             cbm_rank_refresh_publish_t publish_kind) {
+    if (policy == CBM_RANK_REFRESH_POLICY_STALE_ON_EXACT) {
+        return publish_kind == CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_EXACT;
+    }
+    if (policy == CBM_RANK_REFRESH_POLICY_STALE_ON_INCREMENTAL) {
+        return publish_kind == CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_EXACT ||
+               publish_kind == CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_CONTAINMENT;
+    }
+    return false;
+}
+
+cbm_rank_refresh_publish_t
+cbm_rank_refresh_publish_from_pipeline(cbm_pipeline_publish_kind_t publish_kind) {
+    switch (publish_kind) {
+    case CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT:
+        return CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_EXACT;
+    case CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT:
+        return CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_CONTAINMENT;
+    case CBM_PIPELINE_PUBLISH_INCREMENTAL_NOOP:
+        return CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_NOOP;
+    case CBM_PIPELINE_PUBLISH_FULL:
+    case CBM_PIPELINE_PUBLISH_NONE:
+    default:
+        return CBM_RANK_REFRESH_PUBLISH_FULL;
+    }
 }
 
 /* ── Core PageRank + LinkRank ────────────────────────────────── */
@@ -702,9 +734,10 @@ static bool pagerank_views_stale(cbm_store_t *store, const char *project) {
                                     CBM_STORE_DERIVED_STATUS_STALE);
 }
 
-int cbm_pagerank_refresh_if_needed(cbm_store_t *store, const char *project,
-                                   cbm_config_t *cfg, bool graph_changed,
-                                   int deps_reindexed, bool exact_incremental_publish) {
+int cbm_pagerank_refresh_after_publish(cbm_store_t *store, const char *project,
+                                       cbm_config_t *cfg, bool graph_changed,
+                                       int deps_reindexed,
+                                       cbm_rank_refresh_publish_t publish_kind) {
     if (!store || !project || !project[0]) {
         return -1;
     }
@@ -712,13 +745,23 @@ int cbm_pagerank_refresh_if_needed(cbm_store_t *store, const char *project,
         cbm_log_info("pagerank.skip", "project", project, "reason", "graph_unchanged");
         return 0;
     }
-    if (graph_changed && deps_reindexed <= 0 && exact_incremental_publish &&
-        rank_refresh_policy_from_config(cfg) == CBM_RANK_REFRESH_POLICY_STALE_ON_EXACT &&
+    cbm_rank_refresh_policy_t policy = rank_refresh_policy_from_config(cfg);
+    if (graph_changed && deps_reindexed <= 0 &&
+        rank_refresh_policy_allows_defer(policy, publish_kind) &&
         pagerank_views_stale(store, project)) {
-        cbm_log_info("pagerank.defer", "project", project, "reason", "exact_delta_stale_views");
+        cbm_log_info("pagerank.defer", "project", project, "reason", "incremental_stale_views");
         return 0;
     }
     return cbm_pagerank_compute_with_config(store, project, cfg);
+}
+
+int cbm_pagerank_refresh_if_needed(cbm_store_t *store, const char *project,
+                                   cbm_config_t *cfg, bool graph_changed,
+                                   int deps_reindexed, bool exact_incremental_publish) {
+    return cbm_pagerank_refresh_after_publish(
+        store, project, cfg, graph_changed, deps_reindexed,
+        exact_incremental_publish ? CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_EXACT
+                                  : CBM_RANK_REFRESH_PUBLISH_FULL);
 }
 
 double cbm_pagerank_get(cbm_store_t *store, int64_t node_id) {

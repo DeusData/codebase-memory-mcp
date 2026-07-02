@@ -3028,8 +3028,18 @@ static const char *const store_graph_derived_view_names[] = {
     CBM_STORE_DERIVED_VIEW_ROUTES,          CBM_STORE_DERIVED_VIEW_ARCHITECTURE,
 };
 
+static const char *const store_rank_derived_view_names[] = {
+    CBM_STORE_DERIVED_VIEW_PAGERANK,
+    CBM_STORE_DERIVED_VIEW_LINKRANK,
+    CBM_STORE_DERIVED_VIEW_NODE_DEGREE,
+};
+
 static int store_graph_derived_view_count(void) {
     return (int)(sizeof(store_graph_derived_view_names) / sizeof(store_graph_derived_view_names[0]));
+}
+
+static int store_rank_derived_view_count(void) {
+    return (int)(sizeof(store_rank_derived_view_names) / sizeof(store_rank_derived_view_names[0]));
 }
 
 static int store_mark_derived_views_status_body(cbm_store_t *s, const char *project,
@@ -3140,6 +3150,13 @@ int cbm_store_mark_derived_views_complete(cbm_store_t *s, const char *project,
                                           const char *const *view_names, int view_count) {
     return store_mark_derived_views_status(s, project, generation, view_names, view_count,
                                            CBM_STORE_DERIVED_STATUS_COMPLETE);
+}
+
+int cbm_store_mark_rank_derived_views_stale(cbm_store_t *s, const char *project,
+                                            int64_t generation) {
+    return cbm_store_mark_derived_views_stale(s, project, generation,
+                                              store_rank_derived_view_names,
+                                              store_rank_derived_view_count());
 }
 
 int cbm_store_get_derived_view_state(cbm_store_t *s, const char *project,

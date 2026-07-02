@@ -11,6 +11,7 @@
 #define CBM_PAGERANK_H
 
 #include <stdbool.h>
+#include <pipeline/pipeline.h>
 #include <store/store.h>
 
 /* Forward declaration — full definition in cli/cli.h */
@@ -31,6 +32,17 @@ struct cbm_config;
 
 #define CBM_RANK_REFRESH_EAGER          "eager"
 #define CBM_RANK_REFRESH_STALE_ON_EXACT "stale_on_exact"
+#define CBM_RANK_REFRESH_STALE_ON_INCREMENTAL "stale_on_incremental"
+
+typedef enum {
+    CBM_RANK_REFRESH_PUBLISH_FULL = 0,
+    CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_EXACT = 1,
+    CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_CONTAINMENT = 2,
+    CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_NOOP = 3,
+} cbm_rank_refresh_publish_t;
+
+cbm_rank_refresh_publish_t
+cbm_rank_refresh_publish_from_pipeline(cbm_pipeline_publish_kind_t publish_kind);
 
 /* Config keys for edge type weights (all doubles, override via `config set`) */
 #define CBM_CONFIG_EDGE_WEIGHT_CALLS          "edge_weight_calls"
@@ -108,13 +120,20 @@ int cbm_pagerank_compute_default(cbm_store_t *store, const char *project);
 int cbm_pagerank_compute_with_config(cbm_store_t *store, const char *project,
                                      struct cbm_config *cfg);
 
-/* Refresh rank-derived views after an index run when needed.
+/* Refresh rank-derived views after an index publish when needed.
  * Computes when the graph changed, dependencies were reindexed, or existing
- * PageRank/LinkRank/node_degree views are missing/incomplete. With
- * rank_refresh=stale_on_exact, an exact incremental publish may defer rank
- * recompute only when rank-derived views are already marked stale. Returns
- * ranked node count from compute, 0 when skipped/deferred, or -1 on invalid
- * input/compute error. cfg may be NULL (uses defaults). */
+ * PageRank/LinkRank/node_degree views are missing/incomplete. With an opt-in
+ * stale policy, eligible incremental publishes may defer recompute only when
+ * rank-derived views are already marked stale. Returns ranked node count from
+ * compute, 0 when skipped/deferred, or -1 on invalid input/compute error. cfg
+ * may be NULL (uses defaults). */
+int cbm_pagerank_refresh_after_publish(cbm_store_t *store, const char *project,
+                                       struct cbm_config *cfg, bool graph_changed,
+                                       int deps_reindexed,
+                                       cbm_rank_refresh_publish_t publish_kind);
+
+/* Backwards-compatible wrapper for older callers: exact_incremental_publish=true
+ * maps to CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_EXACT, false maps to FULL. */
 int cbm_pagerank_refresh_if_needed(cbm_store_t *store, const char *project,
                                    struct cbm_config *cfg, bool graph_changed,
                                    int deps_reindexed, bool exact_incremental_publish);
