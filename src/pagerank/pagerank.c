@@ -12,6 +12,7 @@
 #include <cli/cli.h>
 #include <foundation/compat.h>
 #include <foundation/log.h>
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -73,6 +74,10 @@ typedef struct {
     double weight;
     bool is_calls;  /* DF-1: true if edge type == "CALLS" */
 } pr_edge_t;
+
+enum {
+    CBM_PAGERANK_GROWTH_FACTOR = 2,
+};
 
 /* ── ISO timestamp helper ────────────────────────────────────── */
 
@@ -153,6 +158,14 @@ static int grow_edge_array(pr_edge_t **edges, int new_cap) {
     pr_edge_t *new_edges = realloc(*edges, (size_t)new_cap * sizeof(pr_edge_t));
     if (!new_edges) return -1;
     *edges = new_edges;
+    return 0;
+}
+
+static int next_pagerank_capacity(int cap, int *out) {
+    if (!out || cap <= 0 || cap > INT_MAX / CBM_PAGERANK_GROWTH_FACTOR) {
+        return -1;
+    }
+    *out = cap * CBM_PAGERANK_GROWTH_FACTOR;
     return 0;
 }
 
@@ -262,12 +275,14 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         if (N >= cap) {
-            cap *= 2;
-            if (grow_node_arrays(&node_ids, &node_labels, &node_projects, cap) != 0) {
+            int new_cap = 0;
+            if (next_pagerank_capacity(cap, &new_cap) != 0 ||
+                grow_node_arrays(&node_ids, &node_labels, &node_projects, new_cap) != 0) {
                 sqlite3_finalize(stmt);
                 stmt = NULL;
                 goto cleanup;
             }
+            cap = new_cap;
         }
         node_ids[N] = sqlite3_column_int64(stmt, 0);
         const char *lbl = (const char *)sqlite3_column_text(stmt, 1);
@@ -331,12 +346,14 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
         if (si < 0 || di < 0) continue;
 
         if (E >= ecap) {
-            ecap *= 2;
-            if (grow_edge_array(&edges, ecap) != 0) {
+            int new_ecap = 0;
+            if (next_pagerank_capacity(ecap, &new_ecap) != 0 ||
+                grow_edge_array(&edges, new_ecap) != 0) {
                 sqlite3_finalize(stmt);
                 stmt = NULL;
                 goto cleanup;
             }
+            ecap = new_ecap;
         }
         char *edge_project_copy = cbm_strdup((edge_project && edge_project[0]) ? edge_project : project);
         if (!edge_project_copy) {

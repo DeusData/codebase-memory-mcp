@@ -9306,6 +9306,12 @@ void cbm_store_adr_free(cbm_adr_t *adr) {
 /* ── Architecture doc discovery ────────────────────────────────── */
 
 int cbm_store_find_architecture_docs(cbm_store_t *s, const char *project, char ***out, int *count) {
+    if (!s || !out || !count) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *count = 0;
+
     const char *sql = "SELECT file_path FROM nodes WHERE project=?1 AND label='File' "
                       "AND (file_path LIKE '%ARCHITECTURE.md' OR file_path LIKE '%ADR.md' "
                       "OR file_path LIKE '%DECISIONS.md' OR file_path LIKE 'docs/adr/%' "
@@ -9321,13 +9327,50 @@ int cbm_store_find_architecture_docs(cbm_store_t *s, const char *project, char *
 
     int cap = ST_INIT_CAP_8;
     int n = 0;
-    char **arr = malloc(cap * sizeof(char *));
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    char **arr = malloc((size_t)cap * sizeof(*arr));
+    if (!arr) {
+        sqlite3_finalize(stmt);
+        store_set_error(s, "find_arch_docs out of memory");
+        return CBM_STORE_ERR;
+    }
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         if (n >= cap) {
-            cap *= ST_GROWTH;
-            arr = safe_realloc(arr, cap * sizeof(char *));
+            if (cap > INT_MAX / ST_GROWTH) {
+                store_free_text_array(arr, n);
+                sqlite3_finalize(stmt);
+                store_set_error(s, "find_arch_docs out of memory");
+                return CBM_STORE_ERR;
+            }
+            int new_cap = cap * ST_GROWTH;
+            char **next = realloc(arr, (size_t)new_cap * sizeof(*next));
+            if (!next) {
+                store_free_text_array(arr, n);
+                sqlite3_finalize(stmt);
+                store_set_error(s, "find_arch_docs out of memory");
+                return CBM_STORE_ERR;
+            }
+            arr = next;
+            cap = new_cap;
         }
-        arr[n++] = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        const char *path = (const char *)sqlite3_column_text(stmt, 0);
+        if (!path) {
+            continue;
+        }
+        char *copy = heap_strdup(path);
+        if (!copy) {
+            store_free_text_array(arr, n);
+            sqlite3_finalize(stmt);
+            store_set_error(s, "find_arch_docs out of memory");
+            return CBM_STORE_ERR;
+        }
+        arr[n++] = copy;
+    }
+    if (step_rc != SQLITE_DONE) {
+        store_free_text_array(arr, n);
+        store_set_error_sqlite(s, "find_arch_docs");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
     }
     sqlite3_finalize(stmt);
     *out = arr;
