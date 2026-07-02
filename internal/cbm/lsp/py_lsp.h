@@ -72,6 +72,10 @@ typedef struct {
     // Expression evaluator recursion depth guard.
     int eval_depth;
 
+    // AST-walk recursion depth for py_resolve_calls_in (guards stack overflow on
+    // deeply-nested/cyclic files; see cbm_lsp_max_walk_depth). Zero via memset.
+    int walk_depth;
+
     // Debug mode (CBM_LSP_DEBUG env, shared across all language LSPs).
     bool debug;
 } PyLSPContext;

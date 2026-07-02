@@ -1304,6 +1304,81 @@ TEST(search_code_multi_word) {
     PASS();
 }
 
+/* Reproduce-first (#687): scoped content search over a repo whose ROOT PATH
+ * contains a space. write_scoped_filelist emits "<root>/<file>" records that the
+ * Unix pipeline pipes to grep via xargs. With plain `xargs` (newline-split) the
+ * space splits one path into several bogus args -> grep finds nothing ->
+ * total_grep_matches == 0 (RED on the unfixed code). The fix writes NUL-separated
+ * records + uses `xargs -0`, so the path stays a single argument -> match found
+ * (GREEN). On Windows the scoped path uses PowerShell Get-Content -LiteralPath,
+ * which already handles spaces, so this asserts correct behavior there too. */
+TEST(search_code_scoped_path_with_spaces_issue687) {
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_srch_space_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    /* Project root deliberately contains a space. */
+    char proj_dir[640];
+    snprintf(proj_dir, sizeof(proj_dir), "%s/my project", tmp);
+    cbm_mkdir(proj_dir);
+
+    char src_path[768];
+    snprintf(src_path, sizeof(src_path), "%s/main.go", proj_dir);
+    FILE *fp = fopen(src_path, "w");
+    if (!fp) {
+        rmdir(proj_dir);
+        rmdir(tmp);
+        FAIL("cannot write source file under spaced path");
+    }
+    fprintf(fp, "package main\n\nfunc HandleRequest() error {\n\treturn nil\n}\n");
+    fclose(fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "space-search";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, proj_dir);
+
+    /* A node so the file is "indexed" (cbm_store_list_files -> scoped grep path)
+     * and the grep hit classifies to a result. */
+    cbm_node_t n = {.project = proj,
+                    .label = "Function",
+                    .name = "HandleRequest",
+                    .qualified_name = "space-search.main.HandleRequest",
+                    .file_path = "main.go",
+                    .start_line = 3,
+                    .end_line = 5};
+    ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":94,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\",\"project\":\"space-search\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    /* grep must have found the match despite the space in the root path. */
+    int grep_matches = -1;
+    const char *g = strstr(inner, "\"total_grep_matches\":");
+    if (g) {
+        sscanf(g, "\"total_grep_matches\":%d", &grep_matches);
+    }
+    ASSERT_TRUE(grep_matches > 0);
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    unlink(src_path);
+    rmdir(proj_dir);
+    rmdir(tmp);
+    PASS();
+}
+
 /* issue #283: search_code with regex=true and a syntactically invalid pattern
  * must return an explicit error, not an empty result indistinguishable from a
  * legitimate no-match. */
@@ -3248,6 +3323,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_code_missing_pattern);
     RUN_TEST(tool_search_code_no_project);
     RUN_TEST(search_code_multi_word);
+    RUN_TEST(search_code_scoped_path_with_spaces_issue687);
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
     RUN_TEST(search_code_ampersand_accepted_issue272);

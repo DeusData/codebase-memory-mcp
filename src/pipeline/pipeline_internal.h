@@ -65,6 +65,10 @@ typedef struct {
     cbm_gbuf_t *gbuf;         /* owned by pipeline */
     cbm_registry_t *registry; /* owned by pipeline */
     atomic_int *cancelled;    /* pointer to pipeline's cancelled flag */
+    cbm_pipeline_t *pipeline; /* back-pointer for recording per-file skips
+                               * (Stage 2 / Track B). May be NULL on paths that
+                               * don't record; cbm_pipeline_add_file_error is
+                               * NULL-safe. */
     int mode;                 /* cbm_index_mode_t (0=full, 1=moderate, 2=fast, 3=advanced) */
 
     /* Extraction result cache (sequential pipeline optimization).

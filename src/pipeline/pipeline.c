@@ -92,6 +92,14 @@ struct cbm_pipeline {
     char **excluded_dirs;
     int excluded_count;
 
+    /* Per-file indexing failures (skipped files) surfaced via MCP/CLI/logfile
+     * (Stage 2 / Track B). A skip is the expected handled outcome of a bad or
+     * oversized file — the run still succeeds ("indexed"). Owned by the
+     * pipeline; freed in cbm_pipeline_free. */
+    cbm_file_error_t *file_errors;
+    int file_errors_count;
+    int file_errors_cap;
+
     /* User-defined extension overrides (loaded once per run) */
     cbm_userconfig_t *userconfig;
 
@@ -207,6 +215,15 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     cbm_discover_free_excluded(p->excluded_dirs, p->excluded_count);
     p->excluded_dirs = NULL;
     p->excluded_count = 0;
+    for (int i = 0; i < p->file_errors_count; i++) {
+        free(p->file_errors[i].path);
+        free(p->file_errors[i].reason);
+        free(p->file_errors[i].phase);
+    }
+    free(p->file_errors);
+    p->file_errors = NULL;
+    p->file_errors_count = 0;
+    p->file_errors_cap = 0;
     free(p->branch_qn);
     free(p->saved_adr); /* freed here too: error paths can exit before the
                          * restore in dump_and_persist_hashes runs. Issue #516. */
@@ -250,6 +267,51 @@ void cbm_pipeline_get_excluded(const cbm_pipeline_t *p, char ***out, int *count)
     }
     if (count) {
         *count = p ? p->excluded_count : 0;
+    }
+}
+
+/* NULL-safe heap strdup (avoids a strdup dependency + guards NULL inputs). */
+static char *fe_strdup(const char *s) {
+    if (!s) {
+        return NULL;
+    }
+    size_t n = strlen(s) + 1;
+    char *d = (char *)malloc(n);
+    if (d) {
+        memcpy(d, s, n);
+    }
+    return d;
+}
+
+void cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char *reason,
+                                 const char *phase) {
+    if (!p) {
+        return;
+    }
+    if (p->file_errors_count >= p->file_errors_cap) {
+        int ncap = p->file_errors_cap ? p->file_errors_cap * 2 : 16;
+        cbm_file_error_t *grown =
+            (cbm_file_error_t *)realloc(p->file_errors, (size_t)ncap * sizeof(*grown));
+        if (!grown) {
+            /* Never abort indexing just to record a skip — drop this record. */
+            return;
+        }
+        p->file_errors = grown;
+        p->file_errors_cap = ncap;
+    }
+    cbm_file_error_t *e = &p->file_errors[p->file_errors_count];
+    e->path = fe_strdup(path);
+    e->reason = fe_strdup(reason);
+    e->phase = fe_strdup(phase);
+    p->file_errors_count++;
+}
+
+void cbm_pipeline_get_file_errors(const cbm_pipeline_t *p, cbm_file_error_t **out, int *count) {
+    if (out) {
+        *out = p ? p->file_errors : NULL;
+    }
+    if (count) {
+        *count = p ? p->file_errors_count : 0;
     }
 }
 
@@ -1208,6 +1270,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         .gbuf = p->gbuf,
         .registry = p->registry,
         .cancelled = &p->cancelled,
+        .pipeline = p, /* so passes can record per-file skips (Track B) */
         .mode = (int)p->mode,
         .path_aliases = path_aliases,
     };

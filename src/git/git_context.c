@@ -126,15 +126,57 @@ static char *join_root_relative(const char *root, const char *rel) {
     return out;
 }
 
-static char *derive_canonical_root(const char *worktree_root, const char *git_common_dir) {
-    const char *src = git_common_dir && git_common_dir[0] ? git_common_dir : worktree_root;
-    if (!src) {
-        return git_strdup("");
-    }
-
-    char *root = path_is_absolute(src) ? git_strdup(src) : join_root_relative(worktree_root, src);
-    if (!root) {
-        return NULL;
+/* Derive the canonical repo root.
+ *
+ * Preferred (git 2.31+): abs_common_dir is `git rev-parse --path-format=absolute
+ * --git-common-dir` — git's OWN absolute, canonical common-dir. Because a main
+ * repo and its linked worktree both ask the same git binary, they resolve to the
+ * IDENTICAL path, so canonical_root is consistent across worktrees AND platforms
+ * with no manual join or realpath/_fullpath — which diverged under msys vs native
+ * path representations (#659 root cause, and the worktree==main-root breakage in
+ * test_pipeline.c git_context_linked_worktree). git also resolves the relative
+ * ".." internally, so the subdirectory case (#659) is fixed here too.
+ *
+ * Fallback (git < 2.31, no --path-format → abs_common_dir empty): the relative
+ * --git-common-dir is relative to input_path (the -C dir), so join against it and
+ * realpath-normalize the "..". Unix only — on Windows git emits an absolute
+ * common-dir so this branch isn't reached in practice, and _fullpath there
+ * reintroduces the msys divergence. */
+static char *derive_canonical_root(const char *input_path, const char *worktree_root,
+                                   const char *git_common_dir, const char *abs_common_dir) {
+    char *root = NULL;
+    if (abs_common_dir && abs_common_dir[0] && path_is_absolute(abs_common_dir)) {
+        root = git_strdup(abs_common_dir);
+        if (!root) {
+            return NULL;
+        }
+    } else {
+        const char *src = git_common_dir && git_common_dir[0] ? git_common_dir : worktree_root;
+        if (!src) {
+            return git_strdup("");
+        }
+#ifndef _WIN32
+        root = path_is_absolute(src) ? git_strdup(src) : join_root_relative(input_path, src);
+        if (!root) {
+            return NULL;
+        }
+        {
+            char resolved[4096];
+            if (realpath(root, resolved) != NULL) {
+                free(root);
+                root = git_strdup(resolved);
+                if (!root) {
+                    return NULL;
+                }
+            }
+        }
+#else
+        (void)input_path;
+        root = path_is_absolute(src) ? git_strdup(src) : join_root_relative(worktree_root, src);
+        if (!root) {
+            return NULL;
+        }
+#endif
     }
 
     size_t len = strlen(root);
@@ -251,7 +293,13 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
 
     out->is_worktree =
         out->git_dir && out->git_common_dir && strcmp(out->git_dir, out->git_common_dir) != 0;
-    out->canonical_root = derive_canonical_root(out->worktree_root, out->git_common_dir);
+    /* git 2.31+ canonical absolute common-dir (best-effort; NULL on older git,
+     * where derive_canonical_root falls back to the relative common-dir). */
+    char *abs_common_dir = NULL;
+    (void)git_capture(path, "rev-parse --path-format=absolute --git-common-dir", &abs_common_dir);
+    out->canonical_root =
+        derive_canonical_root(path, out->worktree_root, out->git_common_dir, abs_common_dir);
+    free(abs_common_dir);
     out->branch_slug = slug_from_branch(out->branch, out->is_detached);
     if (git_capture(path, "merge-base HEAD @{upstream}", &out->base_sha) != 0) {
         out->base_sha = git_strdup("");

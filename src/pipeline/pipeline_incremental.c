@@ -814,6 +814,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .gbuf = existing,
         .registry = registry,
         .cancelled = cbm_pipeline_cancelled_ptr(p),
+        .pipeline = p, /* so passes can record per-file skips (Track B) */
         .mode = cbm_pipeline_get_mode(p),
         .path_aliases = path_aliases,
     };

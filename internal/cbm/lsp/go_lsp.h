@@ -26,6 +26,10 @@ typedef struct {
     // Output: resolved calls accumulate here
     CBMResolvedCallArray* resolved_calls;
 
+    // AST-walk recursion depth for resolve_calls_in_node (guards stack overflow
+    // on deeply-nested/cyclic files; see cbm_lsp_max_walk_depth). Zero via memset.
+    int walk_depth;
+
     // Debug mode (CBM_LSP_DEBUG env)
     bool debug;
 } GoLSPContext;

@@ -3,11 +3,15 @@
 #include "helpers.h"
 #include "lang_specs.h"
 #include "foundation/constants.h"
+#include "foundation/platform.h" // safe_realloc (frees old on failure)
+#include "foundation/log.h"      // cbm_log_warn
 #include "extract_node_stack.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include <stdint.h>          // uint32_t
+#include <stdio.h>           // snprintf
+#include <stdlib.h>          // getenv, atoi
 #include <string.h>
 #include <ctype.h>
 
@@ -5538,12 +5542,70 @@ typedef struct {
     const char *enclosing_class_qn; // saved context for class nesting
 } walk_defs_frame_t;
 
-#define CBM_WALK_DEFS_STACK_CAP 4096
+/* #668: walk_defs previously used a fixed `walk_defs_frame_t stack[4096]` — a
+ * single ~160 KB C-stack frame. That overflowed small thread stacks (the
+ * pre-2026-03 Windows 1 MB main thread) on the definitions pass, and its
+ * `top < 4096` push guards SILENTLY DROPPED every top-level definition past
+ * 4096. Use a growable heap stack instead: a tiny initial footprint that doubles
+ * on demand, bounded by a generous, env-configurable ceiling that WARNs (once)
+ * rather than dropping — so a file with thousands of top-level defs is fully
+ * extracted, and a pathological one degrades to a warned, bounded skip instead
+ * of an OOM or a stack overflow. */
+typedef struct {
+    walk_defs_frame_t *data;
+    int top;
+    int cap;
+    const char *path; // for the WARN when the ceiling is hit (may be NULL)
+    bool warned;
+} wd_stack_t;
+
+// Generous safety ceiling (frames), env-overridable via CBM_WALK_DEFS_MAX.
+// Realistic files never approach this; it only bounds a pathological/adversarial
+// file so extraction degrades to a warned skip rather than unbounded memory.
+static int wd_stack_max(void) {
+    const char *e = getenv("CBM_WALK_DEFS_MAX");
+    if (e) {
+        int v = atoi(e);
+        if (v > 0) {
+            return v;
+        }
+    }
+    return 8 * 1024 * 1024; // 8M frames (~320 MB) default
+}
+
+static void wd_push(wd_stack_t *s, TSNode node, const char *enclosing_qn) {
+    if (s->top >= s->cap) {
+        int ncap = s->cap ? s->cap * 2 : 256;
+        if (ncap > wd_stack_max()) {
+            if (!s->warned) {
+                char lim[24];
+                snprintf(lim, sizeof(lim), "%d", wd_stack_max());
+                cbm_log_warn("extract.walk_defs_capped", "limit", lim, "path",
+                             s->path ? s->path : "");
+                s->warned = true;
+            }
+            return; // bounded: stop growing (warned, not silent)
+        }
+        walk_defs_frame_t *nd = safe_realloc(s->data, (size_t)ncap * sizeof(walk_defs_frame_t));
+        if (!nd) {
+            /* OOM — safe_realloc already freed the old buffer. Bail cleanly: drop
+             * pending frames so the walk_defs loop drains and exits without a NULL
+             * deref; extraction keeps whatever was already emitted. */
+            s->data = NULL;
+            s->cap = 0;
+            s->top = 0;
+            return;
+        }
+        s->data = nd;
+        s->cap = ncap;
+    }
+    s->data[s->top++] = (walk_defs_frame_t){node, enclosing_qn};
+}
 
 // Push nested class nodes from a class body container onto the defs stack.
 // Iteratively walks into wrapper nodes (field_declaration, template_declaration).
-static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, walk_defs_frame_t *stack,
-                                    int *top, const char *enclosing_qn, CBMArena *arena) {
+static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, wd_stack_t *s,
+                                    const char *enclosing_qn, CBMArena *arena) {
     TSNodeStack nc_stack;
     ts_nstack_init(&nc_stack, arena, NESTED_CLASS_STACK_CAP);
     ts_nstack_push(&nc_stack, arena, body);
@@ -5554,9 +5616,7 @@ static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, walk_d
         for (int i = (int)nc - SKIP_CHAR; i >= 0; i--) {
             TSNode child = ts_node_child(cur, (uint32_t)i);
             if (cbm_kind_in_set(child, spec->class_node_types)) {
-                if (*top < CBM_WALK_DEFS_STACK_CAP) {
-                    stack[(*top)++] = (walk_defs_frame_t){child, enclosing_qn};
-                }
+                wd_push(s, child, enclosing_qn);
             } else {
                 const char *ck = ts_node_type(child);
                 if (strcmp(ck, "field_declaration") == 0 ||
@@ -5624,8 +5684,8 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const char 
 }
 
 // Push nested class children from a class body container onto the walk stack.
-static void push_class_body_children(TSNode node, const CBMLangSpec *spec, walk_defs_frame_t *stack,
-                                     int *top, const char *new_enclosing, CBMArena *arena) {
+static void push_class_body_children(TSNode node, const CBMLangSpec *spec, wd_stack_t *s,
+                                     const char *new_enclosing, CBMArena *arena) {
     uint32_t nc = ts_node_child_count(node);
     for (uint32_t ci = 0; ci < nc; ci++) {
         TSNode child = ts_node_child(node, ci);
@@ -5638,13 +5698,13 @@ static void push_class_body_children(TSNode node, const CBMLangSpec *spec, walk_
             // double-extracted) as top-level functions. Gated to Groovy so other
             // grammars that also name a node "closure" are unaffected.
             (strcmp(ck, "closure") == 0 && spec->language == CBM_LANG_GROOVY)) {
-            push_nested_class_nodes(child, spec, stack, top, new_enclosing, arena);
+            push_nested_class_nodes(child, spec, s, new_enclosing, arena);
             return;
         }
     }
     // No body found — push all children directly
-    for (int ci = (int)nc - SKIP_CHAR; ci >= 0 && *top < CBM_WALK_DEFS_STACK_CAP; ci--) {
-        stack[(*top)++] = (walk_defs_frame_t){ts_node_child(node, (uint32_t)ci), new_enclosing};
+    for (int ci = (int)nc - SKIP_CHAR; ci >= 0; ci--) {
+        wd_push(s, ts_node_child(node, (uint32_t)ci), new_enclosing);
     }
 }
 
@@ -6030,12 +6090,12 @@ static void recover_kotlin_error_classes(CBMExtractCtx *ctx, TSNode err_node) {
 
 static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, int depth_unused) {
     (void)depth_unused;
-    walk_defs_frame_t stack[CBM_WALK_DEFS_STACK_CAP];
-    int top = 0;
-    stack[top++] = (walk_defs_frame_t){root, ctx->enclosing_class_qn};
+    wd_stack_t s = {0};
+    s.path = ctx->rel_path;
+    wd_push(&s, root, ctx->enclosing_class_qn);
 
-    while (top > 0) {
-        walk_defs_frame_t frame = stack[--top];
+    while (s.top > 0) {
+        walk_defs_frame_t frame = s.data[--s.top];
         TSNode node = frame.node;
         ctx->enclosing_class_qn = frame.enclosing_class_qn;
         const char *kind = ts_node_type(node);
@@ -6072,9 +6132,8 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             // field, double-mint). Push children so nested tags/defs are still
             // traversed, then skip the generic func path.
             uint32_t cc = ts_node_child_count(node);
-            for (int i = (int)cc - SKIP_CHAR; i >= 0 && top < CBM_WALK_DEFS_STACK_CAP; i--) {
-                stack[top++] =
-                    (walk_defs_frame_t){ts_node_child(node, (uint32_t)i), frame.enclosing_class_qn};
+            for (int i = (int)cc - SKIP_CHAR; i >= 0; i--) {
+                wd_push(&s, ts_node_child(node, (uint32_t)i), frame.enclosing_class_qn);
             }
             continue;
         }
@@ -6087,9 +6146,8 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             // still carries the quotes. Push children so nested defines are still
             // traversed, then skip the generic func path.
             uint32_t cc = ts_node_child_count(node);
-            for (int i = (int)cc - SKIP_CHAR; i >= 0 && top < CBM_WALK_DEFS_STACK_CAP; i--) {
-                stack[top++] =
-                    (walk_defs_frame_t){ts_node_child(node, (uint32_t)i), frame.enclosing_class_qn};
+            for (int i = (int)cc - SKIP_CHAR; i >= 0; i--) {
+                wd_push(&s, ts_node_child(node, (uint32_t)i), frame.enclosing_class_qn);
             }
             continue;
         }
@@ -6116,9 +6174,8 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             ts_node_is_null(
                 find_first_descendant_by_kind(node, "func_type", CBM_DESCENDANT_MAX_DEPTH))) {
             uint32_t cc = ts_node_child_count(node);
-            for (int i = (int)cc - SKIP_CHAR; i >= 0 && top < CBM_WALK_DEFS_STACK_CAP; i--) {
-                stack[top++] =
-                    (walk_defs_frame_t){ts_node_child(node, (uint32_t)i), frame.enclosing_class_qn};
+            for (int i = (int)cc - SKIP_CHAR; i >= 0; i--) {
+                wd_push(&s, ts_node_child(node, (uint32_t)i), frame.enclosing_class_qn);
             }
             continue;
         }
@@ -6158,8 +6215,8 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
         if (is_namespace_scope_kind(ctx->language, kind)) {
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
             uint32_t nsc = ts_node_child_count(node);
-            for (int i = (int)nsc - SKIP_CHAR; i >= 0 && top < CBM_WALK_DEFS_STACK_CAP; i--) {
-                stack[top++] = (walk_defs_frame_t){ts_node_child(node, (uint32_t)i), new_enclosing};
+            for (int i = (int)nsc - SKIP_CHAR; i >= 0; i--) {
+                wd_push(&s, ts_node_child(node, (uint32_t)i), new_enclosing);
             }
             continue;
         }
@@ -6167,16 +6224,16 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
         if (cbm_kind_in_set(node, spec->class_node_types)) {
             extract_class_def(ctx, node, spec);
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
-            push_class_body_children(node, spec, stack, &top, new_enclosing, ctx->arena);
+            push_class_body_children(node, spec, &s, new_enclosing, ctx->arena);
             continue;
         }
 
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_CHAR; i >= 0 && top < CBM_WALK_DEFS_STACK_CAP; i--) {
-            stack[top++] =
-                (walk_defs_frame_t){ts_node_child(node, (uint32_t)i), frame.enclosing_class_qn};
+        for (int i = (int)count - SKIP_CHAR; i >= 0; i--) {
+            wd_push(&s, ts_node_child(node, (uint32_t)i), frame.enclosing_class_qn);
         }
     }
+    free(s.data);
 }
 
 void cbm_extract_definitions(CBMExtractCtx *ctx) {

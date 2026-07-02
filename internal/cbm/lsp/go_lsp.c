@@ -6,7 +6,22 @@
 #include <stdlib.h>
 
 // Forward declarations
-static void resolve_calls_in_node(GoLSPContext* ctx, TSNode node);
+static void resolve_calls_in_node_inner(GoLSPContext* ctx, TSNode node);
+
+/* Depth-guarded entry for the AST call-resolution walk. The walk recurses once
+ * per nesting level; a deeply-nested or cyclic file can overflow the native
+ * stack (SIGSEGV) and take down the whole index. Past the cap the subtree is
+ * skipped — its calls stay unresolved, which is graceful degradation, not a
+ * crash. The cap is CBM_LSP_MAX_WALK_DEPTH, env-overridable via the same name.
+ * The walk_depth-- runs after the inner returns, so early returns in the body
+ * never leak the counter. */
+static void resolve_calls_in_node(GoLSPContext* ctx, TSNode node) {
+    if (ctx->walk_depth >= cbm_lsp_max_walk_depth())
+        return;
+    ctx->walk_depth++;
+    resolve_calls_in_node_inner(ctx, node);
+    ctx->walk_depth--;
+}
 static void emit_resolved_call(GoLSPContext* ctx, const char* callee_qn, const char* strategy, float confidence);
 static const CBMType* go_lookup_field(GoLSPContext* ctx, const char* type_qn, const char* field_name, int depth);
 static void extract_type_params_from_ast(CBMArena* arena, CBMTypeRegistry* reg,
@@ -1108,7 +1123,7 @@ static void emit_unresolved_call(GoLSPContext* ctx, const char* expr_text, const
 
 // --- Walk call expressions and resolve them ---
 
-static void resolve_calls_in_node(GoLSPContext* ctx, TSNode node) {
+static void resolve_calls_in_node_inner(GoLSPContext* ctx, TSNode node) {
     if (ts_node_is_null(node)) return;
     const char* kind = ts_node_type(node);
 
