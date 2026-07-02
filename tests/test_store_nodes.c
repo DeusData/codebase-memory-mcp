@@ -843,6 +843,36 @@ TEST(store_file_state_crud) {
     PASS();
 }
 
+TEST(store_file_state_get_resets_cached_statement) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    cbm_file_state_t state = {
+        .project = "test",
+        .rel_path = "main.go",
+        .content_hash = "content-a",
+        .git_oid = "",
+        .mtime_ns = 1000000,
+        .size = 512,
+        .language = "go",
+        .pass_fingerprint = "pass-a",
+        .generation = 1,
+        .indexed_at = "2026-03-14T00:00:00Z",
+    };
+    ASSERT_EQ(cbm_store_upsert_file_state(s, &state), CBM_STORE_OK);
+
+    cbm_file_state_t got = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, "test", "main.go", &got), CBM_STORE_OK);
+    cbm_store_file_state_free_fields(&got);
+
+    ASSERT_EQ(cbm_store_drop_indexes(s), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_create_indexes(s), CBM_STORE_OK);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_index_generation_reservation_monotonic) {
     enum { FIRST_GENERATION = 1, SECOND_GENERATION = 2 };
     cbm_store_t *s = cbm_store_open_memory();
@@ -3578,6 +3608,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_file_hash_crud);
     RUN_TEST(store_file_hash_upsert_rejects_null_required_fields);
     RUN_TEST(store_file_state_crud);
+    RUN_TEST(store_file_state_get_resets_cached_statement);
     RUN_TEST(store_index_generation_reservation_monotonic);
     RUN_TEST(store_index_generation_reservation_requires_project);
     RUN_TEST(store_index_generation_finish_complete);
