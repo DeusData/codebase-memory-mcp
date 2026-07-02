@@ -669,6 +669,8 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
         result->nodes[i].name = sn->name ? strdup(sn->name) : NULL;
         result->nodes[i].qualified_name = sn->qualified_name ? strdup(sn->qualified_name) : NULL;
         result->nodes[i].file_path = sn->file_path ? strdup(sn->file_path) : NULL;
+        result->nodes[i].start_line = sn->start_line;
+        result->nodes[i].end_line = sn->end_line;
         result->nodes[i].color = stellar_color(deg[i]);
         /* Size: base from label + boost from degree (hubs are bigger stars) */
         float base_size = size_for_label(sn->label);
@@ -777,6 +779,12 @@ char *cbm_layout_to_json(const cbm_layout_result_t *r) {
             yyjson_mut_obj_add_str(doc, nd, "name", r->nodes[i].name);
         if (r->nodes[i].file_path)
             yyjson_mut_obj_add_str(doc, nd, "file_path", r->nodes[i].file_path);
+        if (r->nodes[i].qualified_name)
+            yyjson_mut_obj_add_str(doc, nd, "qualified_name", r->nodes[i].qualified_name);
+        if (r->nodes[i].start_line > 0)
+            yyjson_mut_obj_add_int(doc, nd, "start_line", r->nodes[i].start_line);
+        if (r->nodes[i].end_line > 0)
+            yyjson_mut_obj_add_int(doc, nd, "end_line", r->nodes[i].end_line);
         double nsz = isfinite(r->nodes[i].size) ? (double)r->nodes[i].size : 1.0;
         yyjson_mut_obj_add_real(doc, nd, "size", nsz);
         char hex[CBM_SZ_8];

@@ -20,6 +20,11 @@
 #include "mcp/mcp.h"
 #include "store/store.h"
 #include "cli/cli.h"
+#include "git/git_context.h"
+
+#if defined(HAVE_LIBGIT2)
+#include <git2.h>
+#endif
 /* pipeline.h no longer needed — indexing runs as subprocess */
 #include "foundation/log.h"
 #include "foundation/platform.h"
@@ -107,6 +112,137 @@ static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         cbm_config_close(cfg);
     }
     cbm_http_replyf(c, 200, g_cors_json, "{\"lang\":\"%s\"}", lang_buf);
+}
+
+/* Defined further below (after the server-state section). */
+static void db_path_for_project(const char *project, char *buf, size_t bufsz);
+
+/* Normalize a git remote URL (scp-style, ssh://, https://) to a canonical
+ * "https://host/org/repo" web base with any trailing ".git" removed. Returns a
+ * malloc'd string or NULL if the shape isn't recognized. Caller frees. */
+static char *normalize_git_remote_https(const char *url) {
+    if (!url || !url[0])
+        return NULL;
+    char host_path[1024] = {0}; /* "host/org/repo" */
+    if (strncmp(url, "git@", 4) == 0) {
+        const char *at = url + 4;
+        const char *colon = strchr(at, ':');
+        if (!colon)
+            return NULL;
+        snprintf(host_path, sizeof(host_path), "%.*s/%s", (int)(colon - at), at, colon + 1);
+    } else {
+        const char *p = strstr(url, "://");
+        if (!p)
+            return NULL;
+        p += 3;
+        const char *at = strchr(p, '@'); /* strip any embedded credentials */
+        if (at)
+            p = at + 1;
+        snprintf(host_path, sizeof(host_path), "%s", p);
+    }
+    size_t l = strlen(host_path);
+    if (l > 4 && strcmp(host_path + l - 4, ".git") == 0)
+        host_path[l - 4] = '\0';
+    l = strlen(host_path);
+    if (l > 0 && host_path[l - 1] == '/')
+        host_path[l - 1] = '\0';
+    char *out = malloc(strlen(host_path) + 9);
+    if (!out)
+        return NULL;
+    sprintf(out, "https://%s", host_path);
+    return out;
+}
+
+/* Read the "origin" remote URL for the repo at root_path. malloc'd or NULL. */
+static char *git_origin_remote_url(const char *root_path) {
+#if defined(HAVE_LIBGIT2)
+    git_libgit2_init();
+    git_repository *repo = NULL;
+    char *out = NULL;
+    if (git_repository_open(&repo, root_path) == 0) {
+        git_remote *rem = NULL;
+        if (git_remote_lookup(&rem, repo, "origin") == 0) {
+            const char *u = git_remote_url(rem);
+            if (u)
+                out = strdup(u);
+            git_remote_free(rem);
+        }
+        git_repository_free(repo);
+    }
+    git_libgit2_shutdown();
+    return out;
+#else
+    (void)root_path;
+    return NULL;
+#endif
+}
+
+/* GET /api/repo-info?project=NAME → { root_path, branch, remote_url, web_base,
+ * blob_base }. blob_base is "<web_base>/blob/<branch>" ready for the frontend to
+ * append "/<file_path>#L<start>-L<end>". Fields are empty strings when unknown
+ * (e.g. no git remote). */
+static void handle_repo_info(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    if (!cbm_http_query_param(req->query, "project", project, (int)sizeof(project)) ||
+        project[0] == '\0') {
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing project parameter\"}");
+        return;
+    }
+
+    char db_path[1024];
+    db_path_for_project(project, db_path, sizeof(db_path));
+    if (!cbm_file_exists(db_path)) {
+        cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
+        return;
+    }
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"cannot open store\"}");
+        return;
+    }
+
+    char root_path[1024] = {0};
+    cbm_project_t proj;
+    memset(&proj, 0, sizeof(proj));
+    if (cbm_store_get_project(store, project, &proj) == CBM_STORE_OK && proj.root_path) {
+        snprintf(root_path, sizeof(root_path), "%s", proj.root_path);
+    }
+    cbm_project_free_fields(&proj);
+    cbm_store_close(store);
+
+    char branch[256] = {0};
+    if (root_path[0]) {
+        cbm_git_context_t gctx;
+        memset(&gctx, 0, sizeof(gctx));
+        if (cbm_git_context_resolve(root_path, &gctx) == 0 && gctx.branch) {
+            snprintf(branch, sizeof(branch), "%s", gctx.branch);
+        }
+        cbm_git_context_free(&gctx);
+    }
+
+    char *remote = root_path[0] ? git_origin_remote_url(root_path) : NULL;
+    char *web_base = normalize_git_remote_https(remote);
+
+    char blob_base[1152] = {0};
+    if (web_base && web_base[0] && branch[0]) {
+        snprintf(blob_base, sizeof(blob_base), "%s/blob/%s", web_base, branch);
+    }
+
+    /* JSON-escape the free-form fields. */
+    char esc_root[2048], esc_branch[512], esc_remote[2048], esc_web[2048], esc_blob[2304];
+    cbm_json_escape(esc_root, (int)sizeof(esc_root), root_path);
+    cbm_json_escape(esc_branch, (int)sizeof(esc_branch), branch);
+    cbm_json_escape(esc_remote, (int)sizeof(esc_remote), remote ? remote : "");
+    cbm_json_escape(esc_web, (int)sizeof(esc_web), web_base ? web_base : "");
+    cbm_json_escape(esc_blob, (int)sizeof(esc_blob), blob_base);
+
+    cbm_http_replyf(c, 200, g_cors_json,
+                    "{\"root_path\":\"%s\",\"branch\":\"%s\",\"remote_url\":\"%s\","
+                    "\"web_base\":\"%s\",\"blob_base\":\"%s\"}",
+                    esc_root, esc_branch, esc_remote, esc_web, esc_blob);
+
+    free(remote);
+    free(web_base);
 }
 
 /* ── Server state ─────────────────────────────────────────────── */
@@ -1392,6 +1528,12 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
     /* GET /api/layout → 3D graph layout */
     if (is_get && cbm_http_path_match(req->path, "/api/layout*")) {
         handle_layout(c, req);
+        return;
+    }
+
+    /* GET /api/repo-info → git remote / branch for GitHub deep-links */
+    if (is_get && cbm_http_path_match(req->path, "/api/repo-info*")) {
+        handle_repo_info(c, req);
         return;
     }
 

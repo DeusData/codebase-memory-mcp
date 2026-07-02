@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { GraphNode } from "../lib/types";
 import { useUiMessages } from "../lib/i18n";
@@ -7,6 +7,9 @@ interface SidebarProps {
   nodes: GraphNode[];
   onSelectPath: (path: string, nodeIds: Set<number>) => void;
   selectedPath: string | null;
+  /* When true, render the list inline (no inner scroll) so a parent container
+   * scrolls the whole sidebar as one region. */
+  inline?: boolean;
 }
 
 interface DirNode {
@@ -105,21 +108,49 @@ function TreeItem({ dir, depth, onSelect, selectedPath }: {
   );
 }
 
-export function Sidebar({ nodes, onSelectPath, selectedPath }: SidebarProps) {
+export function Sidebar({ nodes, onSelectPath, selectedPath, inline = false }: SidebarProps) {
   const t = useUiMessages();
   const [search, setSearch] = useState("");
   const tree = useMemo(() => flattenSingleChild(buildFileTree(nodes)), [nodes]);
 
-  const filtered = useMemo(() => {
-    if (!search) return null;
-    const q = search.toLowerCase();
-    return nodes.filter((n) => n.name.toLowerCase().includes(q) || (n.file_path ?? "").toLowerCase().includes(q)).slice(0, 50);
+  const SEARCH_CAP = 500;
+  const { filtered, truncated, invalidRegex } = useMemo(() => {
+    if (!search) return { filtered: null, truncated: false, invalidRegex: false };
+
+    /* Treat the query as a case-insensitive regex; fall back to a literal
+     * substring match if it isn't valid regex syntax. Match against name,
+     * file_path, and qualified_name. */
+    let test: (s: string) => boolean;
+    let bad = false;
+    try {
+      const re = new RegExp(search, "i");
+      test = (s) => re.test(s);
+    } catch {
+      bad = true;
+      const q = search.toLowerCase();
+      test = (s) => s.toLowerCase().includes(q);
+    }
+
+    const hits = nodes.filter(
+      (n) => test(n.name) || test(n.file_path ?? "") || test(n.qualified_name ?? ""),
+    );
+    return {
+      filtered: hits.slice(0, SEARCH_CAP),
+      truncated: hits.length > SEARCH_CAP,
+      invalidRegex: bad,
+    };
   }, [nodes, search]);
 
   const topLevel = useMemo(() => [...tree.children.values()].sort((a, b) => a.name.localeCompare(b.name)), [tree.children]);
 
+  const ListWrapper = inline
+    ? ({ children }: { children: ReactNode }) => <div>{children}</div>
+    : ({ children }: { children: ReactNode }) => (
+        <ScrollArea className="flex-1 min-h-0">{children}</ScrollArea>
+      );
+
   return (
-    <div className="flex flex-col flex-1 min-h-0">
+    <div className={inline ? "flex flex-col" : "flex flex-col flex-1 min-h-0"}>
       <div className="px-3 py-2.5 border-b border-border/30">
         <div className="relative">
           <input
@@ -127,12 +158,19 @@ export function Sidebar({ nodes, onSelectPath, selectedPath }: SidebarProps) {
             placeholder={t.graph.search}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="w-full bg-white/[0.04] border border-white/[0.06] rounded-lg px-3 py-1.5 text-[12px] text-foreground placeholder-foreground/25 outline-none focus:border-primary/40 focus:bg-white/[0.06] transition-all"
+            className={`w-full bg-white/[0.04] border rounded-lg px-3 py-1.5 text-[12px] text-foreground placeholder-foreground/25 outline-none focus:bg-white/[0.06] transition-all ${
+              invalidRegex ? "border-amber-500/40" : "border-white/[0.06] focus:border-primary/40"
+            }`}
           />
+          {invalidRegex && (
+            <p className="text-[9px] text-amber-400/70 mt-1 px-0.5">
+              invalid regex — matching as literal text
+            </p>
+          )}
         </div>
       </div>
 
-      <ScrollArea className="flex-1 min-h-0">
+      <ListWrapper>
         <div className="py-1">
           {filtered ? (
             filtered.length === 0 ? (
@@ -140,23 +178,30 @@ export function Sidebar({ nodes, onSelectPath, selectedPath }: SidebarProps) {
                 {t.common.noMatches}
               </p>
             ) : (
-              filtered.map((n) => (
-                <button
-                  key={n.id}
-                  onClick={() => onSelectPath(n.file_path ?? "", new Set([n.id]))}
-                  className="flex items-center gap-2 w-full text-left px-4 py-1.5 text-[11px] hover:bg-white/[0.03] transition-colors"
-                >
-                  <span className="w-[5px] h-[5px] rounded-full shrink-0" style={{ backgroundColor: n.color }} />
-                  <span className="text-foreground/60 truncate">{n.name}</span>
-                  <span className="text-foreground/15 ml-auto text-[10px] font-mono truncate max-w-[100px]">{n.file_path}</span>
-                </button>
-              ))
+              <>
+                {filtered.map((n) => (
+                  <button
+                    key={n.id}
+                    onClick={() => onSelectPath(n.file_path ?? "", new Set([n.id]))}
+                    className="flex items-center gap-2 w-full text-left px-4 py-1.5 text-[11px] hover:bg-white/[0.03] transition-colors"
+                  >
+                    <span className="w-[5px] h-[5px] rounded-full shrink-0" style={{ backgroundColor: n.color }} />
+                    <span className="text-foreground/60 truncate">{n.name}</span>
+                    <span className="text-foreground/15 ml-auto text-[10px] font-mono truncate max-w-[100px]">{n.file_path}</span>
+                  </button>
+                ))}
+                {truncated && (
+                  <p className="text-foreground/25 text-[10px] px-4 py-2 text-center">
+                    showing first {SEARCH_CAP} matches — refine the search
+                  </p>
+                )}
+              </>
             )
           ) : (
             topLevel.map((c) => <TreeItem key={c.fullPath} dir={c} depth={0} onSelect={onSelectPath} selectedPath={selectedPath} />)
           )}
         </div>
-      </ScrollArea>
+      </ListWrapper>
 
       {selectedPath && (
         <div className="px-3 py-2 border-t border-border/30">

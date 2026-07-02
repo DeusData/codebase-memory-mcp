@@ -11,7 +11,7 @@ import { FilterPanel } from "./FilterPanel";
 import { NodeDetailPanel } from "./NodeDetailPanel";
 import { ResizeHandle } from "./ResizeHandle";
 import { ErrorBoundary } from "./ErrorBoundary";
-import type { GraphNode, GraphData } from "../lib/types";
+import type { GraphNode, GraphData, RepoInfo } from "../lib/types";
 import { colorForStatus } from "../lib/colors";
 
 /* Persist panel widths */
@@ -41,6 +41,7 @@ export function GraphTab({ project }: GraphTabProps) {
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [cameraTarget, setCameraTarget] = useState<CameraTarget | null>(null);
+  const [repoInfo, setRepoInfo] = useState<RepoInfo | null>(null);
   const [showLabels, setShowLabels] = useState(true);
   const [leftWidth, setLeftWidth] = useState(() => loadWidth("cbm-left-w", 260));
   const [rightWidth, setRightWidth] = useState(() => loadWidth("cbm-right-w", 280));
@@ -127,6 +128,24 @@ export function GraphTab({ project }: GraphTabProps) {
       setSelectedPath(null);
     }
   }, [project, fetchOverview]);
+
+  /* Fetch git remote metadata for GitHub deep-links */
+  useEffect(() => {
+    if (!project) {
+      setRepoInfo(null);
+      return;
+    }
+    let cancelled = false;
+    fetch(`/api/repo-info?project=${encodeURIComponent(project)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (!cancelled && d && !d.error) setRepoInfo(d as RepoInfo);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [project]);
 
   const handleSelectPath = useCallback(
     (path: string, nodeIds: Set<number>) => {
@@ -261,7 +280,7 @@ export function GraphTab({ project }: GraphTabProps) {
     <div className="h-full flex">
       {/* Left sidebar — resizable */}
       <div
-        className="border-r border-border/30 flex flex-col h-full bg-[#0b1920]/90 backdrop-blur-md shrink-0"
+        className="border-r border-border/30 flex flex-col h-full overflow-y-auto bg-[#0b1920]/90 backdrop-blur-md shrink-0"
         style={{ width: leftWidth }}
       >
         <FilterPanel
@@ -287,6 +306,7 @@ export function GraphTab({ project }: GraphTabProps) {
           nodes={filteredData.nodes}
           onSelectPath={handleSelectPath}
           selectedPath={selectedPath}
+          inline
         />
       </div>
       <ResizeHandle
@@ -384,6 +404,8 @@ export function GraphTab({ project }: GraphTabProps) {
               node={selectedNode}
               allNodes={filteredData.nodes}
               allEdges={filteredData.edges}
+              project={project}
+              repoInfo={repoInfo}
               onClose={() => {
                 setSelectedNode(null);
                 setHighlightedIds(null);

@@ -1,9 +1,16 @@
 import { Html } from "@react-three/drei";
 import type { GraphNode } from "../lib/types";
-import { colorForLabel } from "../lib/colors";
+import { colorForLabel, colorForStatus } from "../lib/colors";
 
 interface NodeTooltipProps {
   node: GraphNode;
+}
+
+function lineRange(node: GraphNode): string | null {
+  if (!node.start_line) return null;
+  if (node.end_line && node.end_line !== node.start_line)
+    return `L${node.start_line}-${node.end_line}`;
+  return `L${node.start_line}`;
 }
 
 export function NodeTooltip({ node }: NodeTooltipProps) {
@@ -23,8 +30,26 @@ export function NodeTooltip({ node }: NodeTooltipProps) {
           <span className="text-white/30 ml-1 shrink-0">{node.label}</span>
         </div>
         {node.file_path && (
-          <p className="text-white/30 font-mono truncate">{node.file_path}</p>
+          <p className="text-white/30 font-mono truncate">
+            {node.file_path}
+            {lineRange(node) && <span className="text-white/40"> · {lineRange(node)}</span>}
+          </p>
         )}
+        {node.status && node.status !== "structural" && (
+          <div className="flex items-center gap-1.5 mt-1">
+            <span
+              className="w-1.5 h-1.5 rounded-full shrink-0"
+              style={{ backgroundColor: colorForStatus(node.status) }}
+            />
+            <span className="text-white/45">{node.status}</span>
+            {node.in_calls !== undefined && (
+              <span className="text-white/25">
+                · {node.in_calls} caller{node.in_calls === 1 ? "" : "s"}
+              </span>
+            )}
+          </div>
+        )}
+        <p className="text-white/20 mt-1 text-[10px]">click for code →</p>
       </div>
     </Html>
   );
