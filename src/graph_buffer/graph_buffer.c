@@ -135,7 +135,31 @@ static void make_id_key(char *buf, size_t bufsz, int64_t id) {
     snprintf(buf, bufsz, "%lld", (long long)id);
 }
 
-static void make_edge_key(char *buf, size_t bufsz, int64_t src, int64_t tgt, const char *type) {
+/* IMPORTS edges carry exactly one imported symbol's local_name (#768): two
+ * named imports from the same specifier resolve to the same (source,
+ * target) pair but are distinct symbols. Key on local_name too so the
+ * second import doesn't dedup-collide with and overwrite the first --
+ * every pass that walks IMPORTS edges (pass_calls.c, pass_usages.c,
+ * pass_semantic.c, pass_lsp_cross.c) expects one local_name per edge, so
+ * losing an edge here silently breaks cross-file call resolution for
+ * whichever symbol got dropped, not just "who imports X" queries. Other
+ * edge types keep the plain (source,target,type) key: collapsing repeat
+ * edges of the same type between the same two nodes (e.g. multiple call
+ * sites) into one is the existing, intended dedup behavior there. */
+static void make_edge_key(char *buf, size_t bufsz, int64_t src, int64_t tgt, const char *type,
+                          const char *properties_json) {
+    if (properties_json && strcmp(type, "IMPORTS") == 0) {
+        static const char local_name_key[] = "\"local_name\":\"";
+        const char *ln = strstr(properties_json, local_name_key);
+        if (ln) {
+            ln += sizeof(local_name_key) - 1;
+            const char *end = strchr(ln, '"');
+            size_t ln_len = end ? (size_t)(end - ln) : strlen(ln);
+            snprintf(buf, bufsz, "%lld:%lld:%s:%.*s", (long long)src, (long long)tgt, type,
+                     (int)ln_len, ln);
+            return;
+        }
+    }
     snprintf(buf, bufsz, "%lld:%lld:%s", (long long)src, (long long)tgt, type);
 }
 
@@ -244,7 +268,7 @@ static void remove_node_from_ptr_array(node_ptr_array_t *arr, int64_t node_id) {
 static void unindex_edge(cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e) {
     char key[EDGE_KEY_BUF];
 
-    make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type);
+    make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type, e->properties_json);
     const char *ekey = cbm_ht_get_key(gb->edge_by_key, key);
     cbm_ht_delete(gb->edge_by_key, key);
     free((void *)ekey);
@@ -919,7 +943,7 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
 
     /* Check for dedup */
     char key[EDGE_KEY_BUF];
-    make_edge_key(key, sizeof(key), source_id, target_id, type);
+    make_edge_key(key, sizeof(key), source_id, target_id, type, properties_json);
 
     cbm_gbuf_edge_t *existing = cbm_ht_get(gb->edge_by_key, key);
     if (existing) {
@@ -1032,7 +1056,8 @@ int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
         cbm_gbuf_edge_t *e = gb->edges.items[i];
         if (strcmp(e->type, type) == 0) {
             char key[EDGE_KEY_BUF];
-            make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type);
+            make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type,
+                          e->properties_json);
             const char *ekey = cbm_ht_get_key(gb->edge_by_key, key);
             cbm_ht_delete(gb->edge_by_key, key);
             free((void *)ekey);

@@ -7,6 +7,7 @@
 #include "test_framework.h"
 #include "graph_buffer/graph_buffer.h"
 #include "store/store.h"
+#include <string.h>
 
 /* ── Node operations ───────────────────────────────────────────── */
 
@@ -167,6 +168,42 @@ TEST(gbuf_edge_dedup) {
     /* Different type = different edge */
     int64_t eid3 = cbm_gbuf_insert_edge(gb, n1, n2, "IMPORTS", "{}");
     ASSERT_NEQ(eid1, eid3);
+    ASSERT_EQ(cbm_gbuf_edge_count(gb), 2);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* #768: two named imports from the same specifier (same source, same target
+ * file) must produce two distinct IMPORTS edges, keyed apart by local_name --
+ * not collapse into one edge that silently drops whichever import lost the
+ * dedup race. Re-inserting the SAME local_name (e.g. an idempotent re-index)
+ * must still dedup to one edge. */
+TEST(gbuf_imports_multi_symbol_dedup) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    int64_t consumer = cbm_gbuf_upsert_node(gb, "File", "consumer.ts", "pkg.consumer", "consumer.ts",
+                                            1, 1, "{}");
+    int64_t lib = cbm_gbuf_upsert_node(gb, "File", "lib.ts", "pkg.lib", "lib.ts", 1, 1, "{}");
+
+    int64_t eid_a = cbm_gbuf_insert_edge(gb, consumer, lib, "IMPORTS", "{\"local_name\":\"A\"}");
+    int64_t eid_b = cbm_gbuf_insert_edge(gb, consumer, lib, "IMPORTS", "{\"local_name\":\"B\"}");
+    ASSERT_GT(eid_a, 0);
+    ASSERT_GT(eid_b, 0);
+    ASSERT_NEQ(eid_a, eid_b); /* distinct symbols -> distinct edges */
+    ASSERT_EQ(cbm_gbuf_edge_count(gb), 2);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, consumer, "IMPORTS", &edges, &count);
+    ASSERT_EQ(count, 2);
+    ASSERT_TRUE(strstr(edges[0]->properties_json, "\"local_name\":\"A\"") != NULL ||
+                strstr(edges[1]->properties_json, "\"local_name\":\"A\"") != NULL);
+    ASSERT_TRUE(strstr(edges[0]->properties_json, "\"local_name\":\"B\"") != NULL ||
+                strstr(edges[1]->properties_json, "\"local_name\":\"B\"") != NULL);
+
+    /* Re-inserting the same symbol (idempotent re-index) still dedups. */
+    int64_t eid_a_again = cbm_gbuf_insert_edge(gb, consumer, lib, "IMPORTS", "{\"local_name\":\"A\"}");
+    ASSERT_EQ(eid_a_again, eid_a);
     ASSERT_EQ(cbm_gbuf_edge_count(gb), 2);
 
     cbm_gbuf_free(gb);
@@ -941,6 +978,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_delete_by_label);
     RUN_TEST(gbuf_insert_edge);
     RUN_TEST(gbuf_edge_dedup);
+    RUN_TEST(gbuf_imports_multi_symbol_dedup);
     RUN_TEST(gbuf_find_edges_by_source_type);
     RUN_TEST(gbuf_find_edges_by_target_type);
     RUN_TEST(gbuf_find_edges_by_type);
