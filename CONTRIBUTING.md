@@ -26,11 +26,22 @@ The binary is output to `build/c/codebase-memory-mcp`.
 scripts/test.sh
 ```
 
-This builds with ASan + UBSan and runs all tests (~2040 cases). Key test files:
+This is the local maintainer gate used by the project scripts. It cleans the C build, runs the
+full ASan + UBSan C test suite, builds the production binary, and then runs the parent-watchdog
+and security-string regression scripts. The exact test count changes as suites are added; use the
+runner summary as the source of truth. Key test files:
 - `tests/test_pipeline.c` — pipeline integration tests
 - `tests/test_httplink.c` — HTTP route extraction and linking
 - `tests/test_mcp.c` — MCP protocol and tool handler tests
 - `tests/test_store_*.c` — SQLite graph store tests
+
+Useful script options and environment:
+
+```bash
+scripts/test.sh --arch arm64             # macOS: force target architecture
+scripts/test.sh CC=clang CXX=clang++     # override compiler
+CBM_RUN_HANG_TEST=1 scripts/test.sh      # include the slower C++ index-hang guard
+```
 
 ## Run C Server Tests
 
@@ -54,6 +65,14 @@ CBM_ONLY_SUITE=pipeline CBM_ONLY_TEST=exact build/c/test-runner
 
 By default, tests isolate `CBM_CACHE_DIR` in a temporary directory so local indexes are not
 polluted. Set `CBM_TEST_NO_ISOLATE=1` only when intentionally testing the user's configured cache.
+
+Build flags follow the Makefile conventions:
+
+```bash
+make -f Makefile.cbm test SANITIZE=      # disable ASan/UBSan, mainly for unsupported toolchains
+make -f Makefile.cbm cbm CFLAGS_EXTRA=-DCBM_VERSION=dev
+make -f Makefile.cbm cbm STATIC=1        # static link where supported
+```
 
 **Memory leak detection:**
 
