@@ -259,6 +259,10 @@ static int store_collect_text_column(cbm_store_t *s, sqlite3_stmt *stmt, const c
     int cap = ST_INIT_CAP_8;
     int n = 0;
     char **arr = malloc((size_t)cap * sizeof(char *));
+    if (!arr) {
+        store_set_error(s, "collect_text_column out of memory");
+        return CBM_STORE_ERR;
+    }
     int rc = SQLITE_OK;
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         const char *text = (const char *)sqlite3_column_text(stmt, 0);
@@ -266,10 +270,28 @@ static int store_collect_text_column(cbm_store_t *s, sqlite3_stmt *stmt, const c
             continue;
         }
         if (n >= cap) {
-            cap *= ST_GROWTH;
-            arr = safe_realloc(arr, (size_t)cap * sizeof(char *));
+            if (cap > INT_MAX / ST_GROWTH) {
+                store_free_text_array(arr, n);
+                store_set_error(s, "collect_text_column out of memory");
+                return CBM_STORE_ERR;
+            }
+            int new_cap = cap * ST_GROWTH;
+            char **next = realloc(arr, (size_t)new_cap * sizeof(*next));
+            if (!next) {
+                store_free_text_array(arr, n);
+                store_set_error(s, "collect_text_column out of memory");
+                return CBM_STORE_ERR;
+            }
+            arr = next;
+            cap = new_cap;
         }
-        arr[n++] = heap_strdup(text);
+        char *copy = heap_strdup(text);
+        if (!copy) {
+            store_free_text_array(arr, n);
+            store_set_error(s, "collect_text_column out of memory");
+            return CBM_STORE_ERR;
+        }
+        arr[n++] = copy;
     }
     if (rc != SQLITE_DONE) {
         store_free_text_array(arr, n);
@@ -293,6 +315,9 @@ static int store_append_text(char ***items, int *count, int *cap, const char *te
         return CBM_STORE_ERR;
     }
     if (*count >= *cap) {
+        if (*cap > INT_MAX / ST_GROWTH) {
+            return CBM_STORE_ERR;
+        }
         int new_cap = (*cap > 0) ? *cap * ST_GROWTH : ST_INIT_CAP_8;
         char **tmp = realloc(*items, (size_t)new_cap * sizeof(char *));
         if (!tmp) {
