@@ -511,6 +511,12 @@ int cbm_dep_auto_index(const char *project_name, const char *project_root,
 
     if (reindexed > 0) {
         cbm_dep_link_cross_edges(store, project_name);
+        int fts_rc = cbm_store_rebuild_nodes_fts(store);
+        if (fts_rc != CBM_STORE_OK) {
+            char rc_str[CBM_NAME_MAX];
+            snprintf(rc_str, sizeof(rc_str), "%d", fts_rc);
+            cbm_log_error("dep.auto_index", "phase", "rebuild_nodes_fts", "rc", rc_str);
+        }
     }
 
     return reindexed;

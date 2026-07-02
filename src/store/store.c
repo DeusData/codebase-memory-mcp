@@ -239,6 +239,15 @@ static sqlite3_stmt *prepare_cached(cbm_store_t *s, sqlite3_stmt **slot, const c
     return *slot;
 }
 
+static int step_count_and_reset(sqlite3_stmt *stmt) {
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_reset(stmt);
+    return count;
+}
+
 static void store_free_text_array(char **items, int count) {
     if (!items) {
         return;
@@ -1782,10 +1791,7 @@ int cbm_store_count_nodes(cbm_store_t *s, const char *project) {
     }
 
     bind_text(stmt, SKIP_ONE, project);
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        return sqlite3_column_int(stmt, 0);
-    }
-    return 0;
+    return step_count_and_reset(stmt);
 }
 
 int cbm_store_delete_nodes_by_project(cbm_store_t *s, const char *project) {
@@ -2019,10 +2025,7 @@ int cbm_store_count_edges(cbm_store_t *s, const char *project) {
     }
 
     bind_text(stmt, SKIP_ONE, project);
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        return sqlite3_column_int(stmt, 0);
-    }
-    return 0;
+    return step_count_and_reset(stmt);
 }
 
 int cbm_store_count_edges_by_type(cbm_store_t *s, const char *project, const char *type) {
@@ -2035,10 +2038,7 @@ int cbm_store_count_edges_by_type(cbm_store_t *s, const char *project, const cha
 
     bind_text(stmt, SKIP_ONE, project);
     bind_text(stmt, ST_COL_2, type);
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        return sqlite3_column_int(stmt, 0);
-    }
-    return 0;
+    return step_count_and_reset(stmt);
 }
 
 int cbm_store_delete_edges_by_project(cbm_store_t *s, const char *project) {
@@ -2053,6 +2053,32 @@ int cbm_store_delete_edges_by_project(cbm_store_t *s, const char *project) {
         store_set_error_sqlite(s, "delete_edges_by_project");
         return CBM_STORE_ERR;
     }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_delete_edges_touching_project_nodes(cbm_store_t *s, const char *project) {
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+
+    static const char sql[] =
+        "DELETE FROM edges "
+        "WHERE source_id IN (SELECT id FROM nodes WHERE project = ?1) "
+        "   OR target_id IN (SELECT id FROM nodes WHERE project = ?1);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "delete_edges_touching_project_nodes prepare");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, ST_COL_1, project);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "delete_edges_touching_project_nodes");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
     return CBM_STORE_OK;
 }
 
