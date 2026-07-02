@@ -2987,6 +2987,58 @@ TEST(complexity_guarded_recursion) {
     PASS();
 }
 
+/* #599: receiver-aware recursion detection.  super().X() is a call on the
+ * parent class — never self-recursion — even when the method name matches the
+ * enclosing method.  Same-name calls on unrelated receivers (axios.get inside
+ * a method also named get) must not count either.  Bare names and self/this
+ * receivers still count.  Guards the regression maintainer DeusData named. */
+TEST(complexity_receiver_aware_recursion) {
+    /* super().save() inside a method named save: parent-class call, NOT self. */
+    CBMFileResult *r = extract("class Repo:\n"
+                               "    def save(self):\n"
+                               "        if self.id:\n"
+                               "            super().save()\n"
+                               "        else:\n"
+                               "            self.save()\n"  /* genuine self-call */
+                               "}\n",
+                               CBM_LANG_PYTHON, "t", "super_call.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "save");
+    ASSERT_NOT_NULL(d);
+    ASSERT_TRUE(d->is_recursive);        /* self.save() still triggers it */
+    ASSERT_FALSE(d->unguarded_recursion); /* both calls guarded by `if/else` */
+    cbm_free_result(r);
+
+    /* Method named `get` calls axios.get() — same name, different receiver. */
+    r = extract("class Client:\n"
+                "    def get(self, url):\n"
+                "        return axios.get(url)\n",
+                CBM_LANG_PYTHON, "t", "axios_get.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    d = find_def(r, "get");
+    ASSERT_NOT_NULL(d);
+    ASSERT_FALSE(d->is_recursive);      /* axios.get != self */
+    ASSERT_FALSE(d->unguarded_recursion);
+    cbm_free_result(r);
+
+    /* self.recur() — same object, qualifies as self-recursion. */
+    r = extract("class C:\n"
+                "    def recur(self, n):\n"
+                "        if n > 0:\n"
+                "            self.recur(n - 1)\n",
+                CBM_LANG_PYTHON, "t", "self_recur.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    d = find_def(r, "recur");
+    ASSERT_NOT_NULL(d);
+    ASSERT_TRUE(d->is_recursive);
+    ASSERT_FALSE(d->unguarded_recursion); /* guarded by `if n > 0` */
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Deep chained member access + parameter count structure smells. */
 TEST(complexity_access_depth_and_params) {
     CBMFileResult *r = extract("package p\n"
@@ -3353,6 +3405,7 @@ SUITE(extraction) {
     RUN_TEST(complexity_linear_scan_in_loop);
     RUN_TEST(complexity_recursion_in_loop_unguarded);
     RUN_TEST(complexity_guarded_recursion);
+    RUN_TEST(complexity_receiver_aware_recursion);
     RUN_TEST(complexity_access_depth_and_params);
 
     cbm_shutdown();
