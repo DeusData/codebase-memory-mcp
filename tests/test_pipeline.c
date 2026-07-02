@@ -9064,7 +9064,8 @@ TEST(incremental_fast_body_only_change_uses_graph_noop) {
     const char *logs = pipeline_capture_logs_end();
     ASSERT_EQ(run_rc, 0);
     ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
-    if (!strstr(logs, "msg=incremental.exact.noop files=1")) {
+    if (!strstr(logs, "msg=incremental.exact.frontier changed=1 expanded=2") ||
+        !strstr(logs, "msg=incremental.exact.noop files=2")) {
         const char *debug = strstr(logs, "msg=delta.graph_equal.mismatch");
         char detail[CBM_SZ_512];
         int dn = snprintf(detail, sizeof(detail), "missing incremental no-op marker: %.420s",
@@ -9168,7 +9169,7 @@ TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild) {
     PASS();
 }
 
-TEST(incremental_fast_falls_back_for_inbound_transitive_complexity_and_matches_full) {
+TEST(incremental_fast_falls_back_for_oversized_inbound_frontier_and_matches_full) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
@@ -9186,15 +9187,105 @@ TEST(incremental_fast_falls_back_for_inbound_transitive_complexity_and_matches_f
                             "\treturn 1\n"
                             "}\n"),
               0);
+    const char *caller_names[] = {"caller_a.go", "caller_b.go", "caller_c.go", "caller_d.go"};
+    const char *caller_funcs[] = {"CallerA", "CallerB", "CallerC", "CallerD"};
+    for (size_t i = 0; i < sizeof(caller_names) / sizeof(caller_names[0]); i++) {
+        n = snprintf(path, sizeof(path), "%s/%s", g_incr_tmpdir, caller_names[i]);
+        ASSERT(n >= 0 && (size_t)n < sizeof(path));
+        char body[CBM_SZ_512];
+        n = snprintf(body, sizeof(body),
+                     "package main\n\n"
+                     "func %s() int {\n"
+                     "\treturn Leaf()\n"
+                     "}\n",
+                     caller_funcs[i]);
+        ASSERT(n >= 0 && (size_t)n < sizeof(body));
+        ASSERT_EQ(th_write_file(path, body), 0);
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n"
+                            "\tfor i := 0; i < 10; i++ {\n"
+                            "\t\tfor j := 0; j < 10; j++ {\n"
+                            "\t\t}\n"
+                            "\t}\n"
+                            "\treturn 2\n"
+                            "}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.fallback reason=frontier_too_large") != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "frontier_too_large");
+    cbm_pipeline_free(p);
+
+    cbm_store_t *owner_store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(owner_store);
+    int node_owners = 0;
+    int edge_owners = 0;
+    ASSERT_EQ(cbm_store_count_file_delta_owners(owner_store, project, "leaf.go", &node_owners,
+                                                &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_GT(node_owners, 0);
+    cbm_store_close(owner_store);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "oversized inbound fallback differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_expands_small_inbound_frontier_and_matches_full) {
+    enum {
+        PIPELINE_EXPECTED_EXACT_FILES = 3,
+    };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n"
+                            "\treturn 1\n"
+                            "}\n"),
+              0);
     n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
     ASSERT(n >= 0 && (size_t)n < sizeof(path));
     ASSERT_EQ(th_write_file(path,
                             "package main\n\n"
                             "func Helper() int {\n"
-                            "\tfor i := 0; i < 10; i++ {\n"
-                            "\t\tLeaf()\n"
-                            "\t}\n"
-                            "\treturn 1\n"
+                            "\treturn Leaf()\n"
                             "}\n"),
               0);
     n = snprintf(path, sizeof(path), "%s/main.go", g_incr_tmpdir);
@@ -9216,14 +9307,14 @@ TEST(incremental_fast_falls_back_for_inbound_transitive_complexity_and_matches_f
     cbm_pipeline_free(p);
     ASSERT_NOT_NULL(project);
 
-    n = snprintf(path, sizeof(path), "%s/main.go", g_incr_tmpdir);
+    n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
     ASSERT(n >= 0 && (size_t)n < sizeof(path));
     ASSERT_EQ(th_write_file(path,
                             "package main\n\n"
-                            "func main() {\n"
+                            "func Leaf() int {\n"
                             "\tfor i := 0; i < 10; i++ {\n"
-                            "\t\tHelper()\n"
                             "\t}\n"
+                            "\treturn 2\n"
                             "}\n"),
               0);
 
@@ -9235,27 +9326,41 @@ TEST(incremental_fast_falls_back_for_inbound_transitive_complexity_and_matches_f
     const char *logs = pipeline_capture_logs_end();
     ASSERT_EQ(run_rc, 0);
     ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
-    ASSERT(strstr(logs, "msg=incremental.exact.fallback reason=inbound_edges_require_full") !=
-           NULL);
-    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
-    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "inbound_edges_require_full");
+    char frontier_log[CBM_SZ_128];
+    n = snprintf(frontier_log, sizeof(frontier_log),
+                 "msg=incremental.exact.frontier changed=1 expanded=%d",
+                 PIPELINE_EXPECTED_EXACT_FILES);
+    ASSERT(n >= 0 && (size_t)n < sizeof(frontier_log));
+    ASSERT(strstr(logs, frontier_log) != NULL);
+    char done_log[CBM_SZ_128];
+    n = snprintf(done_log, sizeof(done_log), "msg=incremental.exact.done files=%d",
+                 PIPELINE_EXPECTED_EXACT_FILES);
+    ASSERT(n >= 0 && (size_t)n < sizeof(done_log));
+    ASSERT(strstr(logs, done_log) != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
     cbm_pipeline_free(p);
 
-    cbm_store_t *owner_store = cbm_store_open_path(g_incr_dbpath);
-    ASSERT_NOT_NULL(owner_store);
-    int node_owners = 0;
-    int edge_owners = 0;
-    ASSERT_EQ(cbm_store_count_file_delta_owners(owner_store, project, "main.go", &node_owners,
-                                                &edge_owners),
+    int64_t leaf_generation = 0;
+    int64_t helper_generation = 0;
+    int64_t main_generation = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "leaf.go",
+                                                   &leaf_generation),
               CBM_STORE_OK);
-    ASSERT_GT(node_owners, 0);
-    cbm_store_close(owner_store);
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper.go",
+                                                   &helper_generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "main.go",
+                                                   &main_generation),
+              CBM_STORE_OK);
+    ASSERT_GT(leaf_generation, CBM_PIPELINE_COMPAT_GENERATION);
+    ASSERT_EQ(leaf_generation, helper_generation);
+    ASSERT_EQ(helper_generation, main_generation);
 
     char diff_err[CBM_SZ_8K] = {0};
     int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
         g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
     if (diff_rc != 0) {
-        FAIL(diff_err[0] ? diff_err : "exact transitive complexity differed from fresh rebuild");
+        FAIL(diff_err[0] ? diff_err : "small inbound exact frontier differed from fresh rebuild");
     }
     ASSERT_EQ(diff_rc, 0);
 
@@ -11842,7 +11947,8 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_exact_upsert_matches_full_rebuild);
     RUN_TEST(incremental_fast_body_only_change_uses_graph_noop);
     RUN_TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild);
-    RUN_TEST(incremental_fast_falls_back_for_inbound_transitive_complexity_and_matches_full);
+    RUN_TEST(incremental_fast_falls_back_for_oversized_inbound_frontier_and_matches_full);
+    RUN_TEST(incremental_fast_expands_small_inbound_frontier_and_matches_full);
     RUN_TEST(incremental_fast_three_file_batch_falls_back_to_full_rebuild_parity);
     RUN_TEST(incremental_fast_single_delete_exact_matches_full_rebuild);
     RUN_TEST(incremental_fast_delete_falls_back_to_full_rebuild_parity);
