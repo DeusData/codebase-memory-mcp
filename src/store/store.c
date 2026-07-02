@@ -7260,8 +7260,10 @@ static cbm_file_tree_entry_t make_tree_entry(const char *path, char **files, int
 
 /* Split a path by '/' into parts. Returns number of parts. */
 static int split_path_parts(const char *fp, char *buf, int buf_sz, char **parts, int max_parts) {
-    strncpy(buf, fp, buf_sz - SKIP_ONE);
-    buf[buf_sz - SKIP_ONE] = '\0';
+    if (!fp || !buf || !parts || buf_sz <= 0 || max_parts <= 0) {
+        return 0;
+    }
+    cbm_str_copy(buf, (size_t)buf_sz, fp);
     int nparts = 0;
     char *p = buf;
     parts[nparts++] = p;

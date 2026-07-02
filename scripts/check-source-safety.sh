@@ -4,7 +4,7 @@
 # This complements clang/cppcheck by enforcing project conventions that generic
 # linters cannot infer:
 #   - MCP/server runtime code must not write protocol-breaking text to stdout.
-#   - Production source must not add unsafe unbounded string-copy helpers.
+#   - Production source must not add unsafe or ambiguous fixed-buffer string-copy helpers.
 #   - New production diffs should use CBM platform wrappers for env/fs APIs.
 #   - New production diffs should use CBM allocation/duplication wrappers.
 set -uo pipefail
@@ -50,7 +50,7 @@ while IFS= read -r hit; do
         add_violation "unsafe string API in production source: $hit"
     fi
 done < <(
-    grep_source '\b(strcpy|strcat|sprintf|gets)[[:space:]]*\(' src internal cmd
+    grep_source '\b(strcpy|strncpy|strcat|sprintf|gets)[[:space:]]*\(' src internal cmd
 )
 
 while IFS= read -r hit; do
