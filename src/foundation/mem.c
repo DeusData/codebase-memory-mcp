@@ -106,6 +106,21 @@ static void check_pressure(size_t rss) {
 
 /* ── Public API ────────────────────────────────────────────────── */
 
+#define RAM_FRACTION_DEFAULT 0.5
+#define RAM_FRACTION_16GB 0.25
+#define RAM_FRACTION_32GB 0.35
+#define RAM_BYTES_PER_GB (1024ULL * 1024 * 1024)
+
+double cbm_mem_ram_fraction_for_total(size_t total_ram_bytes) {
+    if (total_ram_bytes <= 16ULL * RAM_BYTES_PER_GB) {
+        return RAM_FRACTION_16GB;
+    }
+    if (total_ram_bytes <= 32ULL * RAM_BYTES_PER_GB) {
+        return RAM_FRACTION_32GB;
+    }
+    return RAM_FRACTION_DEFAULT;
+}
+
 void cbm_mem_init(double ram_fraction) {
     int expected = 0;
     if (!atomic_compare_exchange_strong(&g_initialized, &expected, 1)) {

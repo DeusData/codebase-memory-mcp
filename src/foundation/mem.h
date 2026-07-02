@@ -11,6 +11,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* Tiered default fraction for MCP startup: 25% on <=16GB, 35% on <=32GB, else 50%. */
+double cbm_mem_ram_fraction_for_total(size_t total_ram_bytes);
+
 /* Initialize memory budget = ram_fraction * total_physical_ram.
  * Thread-safe: only the first call takes effect.
  * Configures mimalloc options for reduced upfront memory. */

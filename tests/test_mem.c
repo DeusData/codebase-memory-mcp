@@ -140,6 +140,29 @@ TEST(mem_over_budget_low_rss) {
     PASS();
 }
 
+/* ── Tiered RAM fraction (host-size defaults) ─────────────────── */
+
+TEST(mem_ram_fraction_16gb_tier) {
+    size_t ram_16gb = 16ULL * 1024 * 1024 * 1024;
+    ASSERT_EQ(cbm_mem_ram_fraction_for_total(ram_16gb), 0.25);
+    ASSERT_EQ(cbm_mem_ram_fraction_for_total(ram_16gb - 1), 0.25);
+    PASS();
+}
+
+TEST(mem_ram_fraction_32gb_tier) {
+    size_t ram_32gb = 32ULL * 1024 * 1024 * 1024;
+    size_t ram_17gb = 17ULL * 1024 * 1024 * 1024;
+    ASSERT_EQ(cbm_mem_ram_fraction_for_total(ram_17gb), 0.35);
+    ASSERT_EQ(cbm_mem_ram_fraction_for_total(ram_32gb), 0.35);
+    PASS();
+}
+
+TEST(mem_ram_fraction_large_host) {
+    size_t ram_64gb = 64ULL * 1024 * 1024 * 1024;
+    ASSERT_EQ(cbm_mem_ram_fraction_for_total(ram_64gb), 0.5);
+    PASS();
+}
+
 /* ── RSS tracking tests ───────────────────────────────────────── */
 
 TEST(mem_rss_positive) {
@@ -638,6 +661,9 @@ SUITE(mem) {
     RUN_TEST(mem_worker_budget_one_worker);
     RUN_TEST(mem_worker_budget_many_workers);
     RUN_TEST(mem_over_budget_low_rss);
+    RUN_TEST(mem_ram_fraction_16gb_tier);
+    RUN_TEST(mem_ram_fraction_32gb_tier);
+    RUN_TEST(mem_ram_fraction_large_host);
     /* RSS tracking */
     RUN_TEST(mem_rss_positive);
     RUN_TEST(mem_peak_rss_gte_rss);

@@ -30,8 +30,6 @@ enum {
     MAIN_MAX_PORT = 65536,
     PARENT_WATCHDOG_STACK_SIZE = 64 * CBM_SZ_1K, /* watchdog only polls — tiny stack suffices */
 };
-#define MAIN_RAM_FRACTION 0.5
-
 #define SLEN(s) (sizeof(s) - 1)
 #include "foundation/log.h"
 #include "foundation/diagnostics.h"
@@ -453,11 +451,11 @@ static int handle_subcommand(int argc, char **argv) {
             return 0;
         }
         if (strcmp(argv[i], "cli") == 0) {
-            cbm_mem_init(MAIN_RAM_FRACTION);
+            cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
             return run_cli(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "hook-augment") == 0) {
-            cbm_mem_init(MAIN_RAM_FRACTION);
+            cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
             return cbm_cmd_hook_augment();
         }
         if (strcmp(argv[i], "install") == 0) {
@@ -553,9 +551,7 @@ int main(int argc, char **argv) {
 #endif
 
     /* Default: MCP server on stdio */
-    cbm_mem_init(MAIN_RAM_FRACTION); /* 50% of RAM — safe now because mimalloc tracks ALL
-                                      * memory (C + C++ allocations) via global override.
-                                      * No more untracked heap blind spots. */
+    cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
     /* Store binary path for subprocess spawning + hook log sink */
     cbm_http_server_set_binary_path(argv[0]);
     cbm_log_set_sink_ex(cbm_ui_log_append, CBM_LOG_SINK_TEE);
