@@ -1411,7 +1411,7 @@ TEST(tool_manage_memory_personal_store) {
     }
     char memory_dir[512];
     snprintf(memory_dir, sizeof(memory_dir), "%s/memory", tmp_dir);
-    ASSERT_EQ(setenv("CBM_MEMORY_DIR", memory_dir, 1), 0);
+    ASSERT_EQ(cbm_setenv("CBM_MEMORY_DIR", memory_dir, 1), 0);
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -1507,7 +1507,7 @@ TEST(tool_manage_memory_personal_store) {
     ASSERT_TRUE(cbm_file_exists(memory_db));
 
     cbm_mcp_server_free(srv);
-    unsetenv("CBM_MEMORY_DIR");
+    cbm_unsetenv("CBM_MEMORY_DIR");
     remove(memory_db);
     rmdir(memory_dir);
     rmdir(tmp_dir);

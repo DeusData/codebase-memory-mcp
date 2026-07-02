@@ -19,8 +19,8 @@ const char *cbm_memory_default_branch(const cbm_git_context_t *ctx);
 char *cbm_memory_repo_id(const char *project, const char *root_path, const cbm_git_context_t *ctx);
 char *cbm_memory_doc_key(const char *repo_id, const char *branch, const char *doc_type);
 
-void cbm_memory_add_settings_json(struct cbm_config *cfg, yyjson_mut_doc *doc,
-                                  yyjson_mut_val *root, const char *db_path);
+void cbm_memory_add_settings_json(struct cbm_config *cfg, yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                  const char *db_path);
 void cbm_memory_add_list_json(cbm_store_t *store, const char *repo_id, yyjson_mut_doc *doc,
                               yyjson_mut_val *root);
 

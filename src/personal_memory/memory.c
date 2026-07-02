@@ -128,17 +128,18 @@ char *cbm_memory_doc_key(const char *repo_id, const char *branch, const char *do
     return out;
 }
 
-void cbm_memory_add_settings_json(struct cbm_config *cfg, yyjson_mut_doc *doc,
-                                  yyjson_mut_val *root, const char *db_path) {
+void cbm_memory_add_settings_json(struct cbm_config *cfg, yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                  const char *db_path) {
     const char *cache_dir_resolved = cbm_resolve_cache_dir();
     const char *memory_dir_resolved = cbm_memory_resolve_dir(cfg);
     char memory_dir_buf[CBM_SZ_1K];
     snprintf(memory_dir_buf, sizeof(memory_dir_buf), "%s",
              memory_dir_resolved ? memory_dir_resolved : "");
-    const char *default_scope = cfg ? cbm_config_get(cfg, CBM_CONFIG_MEMORY_DEFAULT_SCOPE, "personal")
-                                    : "personal";
+    const char *default_scope =
+        cfg ? cbm_config_get(cfg, CBM_CONFIG_MEMORY_DEFAULT_SCOPE, "personal") : "personal";
     char default_scope_buf[CBM_SZ_256];
-    snprintf(default_scope_buf, sizeof(default_scope_buf), "%s", default_scope ? default_scope : "");
+    snprintf(default_scope_buf, sizeof(default_scope_buf), "%s",
+             default_scope ? default_scope : "");
     yyjson_mut_obj_add_str(doc, root, "storage", "personal");
     yyjson_mut_obj_add_bool(doc, root, "enabled", cbm_memory_enabled(cfg));
     yyjson_mut_obj_add_strcpy(doc, root, "default_scope", default_scope_buf);
@@ -174,8 +175,7 @@ void cbm_memory_add_list_json(cbm_store_t *store, const char *repo_id, yyjson_mu
                     branch += strlen("::branch:");
                     yyjson_mut_obj_add_strncpy(doc, item, "branch", branch,
                                                (size_t)(doc_type - branch));
-                    yyjson_mut_obj_add_strcpy(doc, item, "doc_type",
-                                              doc_type + strlen("::doc:"));
+                    yyjson_mut_obj_add_strcpy(doc, item, "doc_type", doc_type + strlen("::doc:"));
                 }
                 yyjson_mut_obj_add_strcpy(doc, item, "updated_at", updated_at ? updated_at : "");
                 yyjson_mut_arr_add_val(items, item);

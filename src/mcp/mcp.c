@@ -487,17 +487,21 @@ static const tool_def_t TOOLS[] = {
     {"manage_adr", "Manage ADR", "Create or update Architecture Decision Records",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
      "\"string\",\"enum\":[\"get\",\"update\",\"sections\"]},\"scope\":{\"type\":\"string\","
-     "\"enum\":[\"project\",\"personal\"],\"default\":\"project\"},\"branch\":{\"type\":\"string\"},"
-     "\"content\":{\"type\":\"string\"},\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},"
+     "\"enum\":[\"project\",\"personal\"],\"default\":\"project\"},\"branch\":{\"type\":"
+     "\"string\"},"
+     "\"content\":{\"type\":\"string\"},\"sections\":{\"type\":\"array\",\"items\":{\"type\":"
+     "\"string\"}}},"
      "\"required\":[\"project\"]"
      "}"},
 
     {"manage_memory", "Manage personal repo memory",
      "Create or update local personal memory stored outside source repos",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
-     "\"string\",\"enum\":[\"get\",\"update\",\"sections\",\"settings\",\"bootstrap\",\"delete\",\"list\",\"promote\",\"sync\"]},"
+     "\"string\",\"enum\":[\"get\",\"update\",\"sections\",\"settings\",\"bootstrap\",\"delete\","
+     "\"list\",\"promote\",\"sync\"]},"
      "\"doc_type\":{\"type\":\"string\",\"default\":\"adr\"},\"branch\":{\"type\":\"string\"},"
-     "\"content\":{\"type\":\"string\"},\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},"
+     "\"content\":{\"type\":\"string\"},\"sections\":{\"type\":\"array\",\"items\":{\"type\":"
+     "\"string\"}}},"
      "\"required\":[\"project\"]}"},
 
     {"ingest_traces", "Ingest traces", "Ingest runtime traces to enhance the knowledge graph",
@@ -4847,8 +4851,8 @@ static char *adr_read_legacy_file(const char *root_path) {
     "then draft and store. Sections: PURPOSE, STACK, ARCHITECTURE, "               \
     "PATTERNS, TRADEOFFS, PHILOSOPHY."
 
-#define MEMORY_EMPTY_HINT                                                          \
-    "No personal memory yet. Explore with get_architecture/search_graph, then "     \
+#define MEMORY_EMPTY_HINT                                                       \
+    "No personal memory yet. Explore with get_architecture/search_graph, then " \
     "store a compact ADR with manage_memory(mode='update', content='...')."
 
 static char *handle_manage_memory(cbm_mcp_server_t *srv, const char *args) {
@@ -4886,7 +4890,8 @@ static char *handle_manage_memory(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_git_context_t ctx = {0};
     (void)cbm_git_context_resolve(root_path, &ctx);
-    const char *current_branch = branch_arg && branch_arg[0] ? branch_arg : cbm_memory_current_branch(&ctx);
+    const char *current_branch =
+        branch_arg && branch_arg[0] ? branch_arg : cbm_memory_current_branch(&ctx);
     const char *base_branch = cbm_memory_default_branch(&ctx);
     char *repo_id = cbm_memory_repo_id(project, root_path, &ctx);
     char *key = cbm_memory_doc_key(repo_id, current_branch, doc_type);

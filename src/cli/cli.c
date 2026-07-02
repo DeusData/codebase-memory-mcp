@@ -2903,8 +2903,9 @@ int cbm_cmd_config(int argc, char **argv) {
                cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX, "false"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX_LIMIT,
                cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "50000"));
-        printf("  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
-               cbm_config_get(cfg, CBM_CONFIG_UI_LANG, cbm_config_default_value(CBM_CONFIG_UI_LANG)));
+        printf(
+            "  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
+            cbm_config_get(cfg, CBM_CONFIG_UI_LANG, cbm_config_default_value(CBM_CONFIG_UI_LANG)));
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_UPDATE,
                cbm_config_get(cfg, CBM_CONFIG_AUTO_UPDATE,
                               cbm_config_default_value(CBM_CONFIG_AUTO_UPDATE)));

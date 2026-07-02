@@ -31,6 +31,11 @@ on:
         required: false
         type: boolean
         default: false
+      fork_release:
+        description: "Fork-only release: skip VirusTotal, npm, PyPI, and MCP Registry publishing"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -189,7 +194,7 @@ jobs:
     needs: [release-draft, security]
     # Explicit condition: a skipped ancestor (soak with soak_level=none) must
     # not skip the publish chain — only real failures/cancellations block it.
-    if: ${{ !cancelled() && !failure() && needs.release-draft.result == 'success' }}
+    if: ${{ !inputs.fork_release && !cancelled() && !failure() && needs.release-draft.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -404,6 +409,23 @@ jobs:
       contents: write
     steps:
       - name: Un-draft GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: gh release edit "$VERSION" --draft=false --repo "$GITHUB_REPOSITORY"
+
+  # ── 9b. Fork-only publish ─────────────────────────────────────
+  # Personal forks normally do not have VirusTotal/npm/PyPI/MCP Registry
+  # secrets. This path still runs build + smoke + release artifact creation,
+  # then publishes the GitHub release without upstream-only distribution jobs.
+  publish-final-fork:
+    needs: [release-draft]
+    if: ${{ inputs.fork_release && !cancelled() && !failure() && needs.release-draft.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Un-draft fork GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version }}
