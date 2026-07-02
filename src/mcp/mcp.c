@@ -43,6 +43,7 @@ enum {
 #include <sqlite3.h>
 #include "cypher/cypher.h"
 #include "pipeline/pipeline.h"
+#include "pipeline/project_resolve.h"
 #include "pipeline/pass_cross_repo.h"
 #include "git/git_context.h"
 #include "cli/cli.h"
@@ -5624,10 +5625,17 @@ static void detect_session(cbm_mcp_server_t *srv) {
      * used by the pipeline, otherwise session queries look for a .db file
      * that doesn't match the indexed project name. */
     if (srv->session_root[0]) {
-        char *pname = cbm_project_name_from_path(srv->session_root);
-        if (pname) {
-            snprintf(srv->session_project, sizeof(srv->session_project), "%s", pname);
-            free(pname);
+        char *existing = cbm_find_existing_project_name(srv->session_root);
+        if (existing) {
+            snprintf(srv->session_project, sizeof(srv->session_project), "%s", existing);
+            cbm_log_info("session.project.reuse", "project", existing, "path", srv->session_root);
+            free(existing);
+        } else {
+            char *pname = cbm_project_name_from_path(srv->session_root);
+            if (pname) {
+                snprintf(srv->session_project, sizeof(srv->session_project), "%s", pname);
+                free(pname);
+            }
         }
     }
 }
