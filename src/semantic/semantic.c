@@ -21,6 +21,7 @@
 #include "xxhash/xxhash.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -163,7 +164,10 @@ static bool is_camel_break(const char *name, int i) {
 static void flush_token(char *buf, int *blen, char **out, int *count, int max_out) {
     if (*blen > 0 && *count < max_out) {
         buf[*blen] = '\0';
-        out[(*count)++] = strdup(buf);
+        char *token = cbm_strdup(buf);
+        if (token) {
+            out[(*count)++] = token;
+        }
     }
     *blen = 0;
 }
@@ -363,7 +367,10 @@ int cbm_sem_tokenize(const char *name, char **out, int max_out) {
     for (int t = 0; t < orig_count && count < max_out; t++) {
         for (int a = 0; abbrevs[a].abbrev; a++) {
             if (strcmp(out[t], abbrevs[a].abbrev) == 0) {
-                out[count++] = strdup(abbrevs[a].expanded);
+                char *expanded = cbm_strdup(abbrevs[a].expanded);
+                if (expanded) {
+                    out[count++] = expanded;
+                }
                 break;
             }
         }
@@ -531,8 +538,27 @@ struct cbm_sem_corpus {
 
 static void free_ht_kv(const char *key, void *value, void *userdata);
 
+static bool corpus_reserve_doc_arrays(cbm_sem_corpus_t *corpus, int new_cap) {
+    if (!corpus || new_cap <= corpus->doc_cap) {
+        return true;
+    }
+    int **grown_ids = realloc(corpus->doc_token_ids, (size_t)new_cap * sizeof(int *));
+    if (!grown_ids) {
+        return false;
+    }
+    corpus->doc_token_ids = grown_ids;
+
+    int *grown_counts = realloc(corpus->doc_token_counts, (size_t)new_cap * sizeof(int));
+    if (!grown_counts) {
+        return false;
+    }
+    corpus->doc_token_counts = grown_counts;
+    corpus->doc_cap = new_cap;
+    return true;
+}
+
 static int corpus_get_or_add(cbm_sem_corpus_t *c, const char *token) {
-    if (!c || !token) {
+    if (!c || !c->token_map || !token) {
         return CBM_NOT_FOUND;
     }
     char idx_buf[CBM_SZ_16];
@@ -551,12 +577,25 @@ static int corpus_get_or_add(cbm_sem_corpus_t *c, const char *token) {
         c->entries = grown;
         c->entry_cap = new_cap;
     }
-    int idx = c->entry_count++;
-    c->entries[idx].token = strdup(token);
+    int idx = c->entry_count;
+    int n = snprintf(idx_buf, sizeof(idx_buf), "%d", idx);
+    if (n <= 0 || (size_t)n >= sizeof(idx_buf)) {
+        return CBM_NOT_FOUND;
+    }
+    char *entry_token = cbm_strdup(token);
+    char *key = cbm_strdup(token);
+    char *value = cbm_strdup(idx_buf);
+    if (!entry_token || !key || !value) {
+        free(entry_token);
+        free(key);
+        free(value);
+        return CBM_NOT_FOUND;
+    }
+    c->entry_count++;
+    c->entries[idx].token = entry_token;
     c->entries[idx].doc_freq = 0;
     memset(&c->entries[idx].enriched_vec, 0, sizeof(cbm_sem_vec_t));
-    snprintf(idx_buf, sizeof(idx_buf), "%d", idx);
-    cbm_ht_set(c->token_map, strdup(token), strdup(idx_buf));
+    cbm_ht_set(c->token_map, key, value);
     return idx;
 }
 
@@ -593,8 +632,8 @@ static bool corpus_rebuild_token_map_sorted(cbm_sem_corpus_t *corpus) {
             free(sorted);
             return false;
         }
-        char *key = strdup(sorted[i].token);
-        char *value = strdup(idx_buf);
+        char *key = cbm_strdup(sorted[i].token);
+        char *value = cbm_strdup(idx_buf);
         if (!key || !value) {
             free(key);
             free(value);
@@ -630,28 +669,29 @@ void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int c
     if (corpus->doc_count >= corpus->doc_cap) {
         int new_cap =
             corpus->doc_cap < DOC_TOKENS_INIT ? DOC_TOKENS_INIT : corpus->doc_cap * PAIR_LEN;
-        int **grown_ids = realloc(corpus->doc_token_ids, (size_t)new_cap * sizeof(int *));
-        int *grown_counts = realloc(corpus->doc_token_counts, (size_t)new_cap * sizeof(int));
-        if (!grown_ids || !grown_counts) {
-            free(grown_ids);
-            free(grown_counts);
+        if (!corpus_reserve_doc_arrays(corpus, new_cap)) {
             return;
         }
-        corpus->doc_token_ids = grown_ids;
-        corpus->doc_token_counts = grown_counts;
-        corpus->doc_cap = new_cap;
     }
-    int doc_idx = corpus->doc_count++;
-    corpus->doc_token_ids[doc_idx] = malloc((size_t)count * sizeof(int));
-    corpus->doc_token_counts[doc_idx] = count;
+    int *doc_ids = malloc((size_t)count * sizeof(int));
+    if (!doc_ids) {
+        return;
+    }
 
     /* Per-doc unique set for IDF */
     int *seen = calloc((size_t)corpus->entry_cap + (size_t)count + CORPUS_INIT_CAP, sizeof(int));
+    if (!seen) {
+        free(doc_ids);
+        return;
+    }
     int seen_count = 0;
+    int doc_idx = corpus->doc_count++;
+    corpus->doc_token_ids[doc_idx] = doc_ids;
+    corpus->doc_token_counts[doc_idx] = count;
 
     for (int i = 0; i < count; i++) {
         int tid = corpus_get_or_add(corpus, tokens[i]);
-        corpus->doc_token_ids[doc_idx][i] = tid;
+        doc_ids[i] = tid;
         if (tid < 0) {
             continue;
         }
@@ -705,6 +745,11 @@ static void batch_resolve_one_doc(batch_resolve_ctx_t *bc, int doc_index, int *s
         return;
     }
     int *ids = malloc((size_t)count * sizeof(int));
+    if (!ids) {
+        bc->corpus->doc_token_ids[doc_index] = NULL;
+        bc->corpus->doc_token_counts[doc_index] = 0;
+        return;
+    }
     bc->corpus->doc_token_ids[doc_index] = ids;
     bc->corpus->doc_token_counts[doc_index] = count;
 
@@ -785,24 +830,20 @@ void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
 void cbm_sem_corpus_add_docs_batch_with_workers(cbm_sem_corpus_t *corpus, char **all_tokens,
                                                 const int *token_counts, int doc_count,
                                                 int max_tokens_per_doc, int worker_count) {
-    if (!corpus || !all_tokens || !token_counts || doc_count <= 0) {
+    if (!corpus || !all_tokens || !token_counts || doc_count <= 0 || max_tokens_per_doc <= 0) {
         return;
     }
 
     /* Phase A (SEQUENTIAL): discover tokens, allocate doc arrays, then
      * canonicalize token IDs before Phase B writes doc_token_ids. */
+    if (doc_count > INT_MAX - corpus->doc_count) {
+        return;
+    }
     if (corpus->doc_cap < corpus->doc_count + doc_count) {
         int new_cap = corpus->doc_count + doc_count;
-        int **grown_ids = realloc(corpus->doc_token_ids, (size_t)new_cap * sizeof(int *));
-        int *grown_counts = realloc(corpus->doc_token_counts, (size_t)new_cap * sizeof(int));
-        if (!grown_ids || !grown_counts) {
-            free(grown_ids);
-            free(grown_counts);
+        if (!corpus_reserve_doc_arrays(corpus, new_cap)) {
             return;
         }
-        corpus->doc_token_ids = grown_ids;
-        corpus->doc_token_counts = grown_counts;
-        corpus->doc_cap = new_cap;
     }
     int base_doc = corpus->doc_count;
     corpus->doc_count += doc_count;
