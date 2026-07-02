@@ -11,6 +11,7 @@
  *                                          resolved_calls entries
  */
 #include "py_lsp.h"
+#include "lsp_env.h"
 #include "../cbm.h"
 #include "../helpers.h"
 #include "tree_sitter/api.h"
@@ -51,8 +52,7 @@ void py_lsp_init(PyLSPContext *ctx, CBMArena *arena, const char *source, int sou
     ctx->module_qn = module_qn;
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL);
-    const char *dbg = getenv("CBM_LSP_DEBUG");
-    ctx->debug = dbg && dbg[0] && dbg[0] != '0';
+    ctx->debug = cbm_lsp_env_flag_enabled("CBM_LSP_DEBUG");
 }
 
 void py_lsp_add_import(PyLSPContext *ctx, const char *local_name, const char *module_qn) {

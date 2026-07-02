@@ -32,6 +32,7 @@
  */
 
 #include "java_lsp.h"
+#include "lsp_env.h"
 #include "../helpers.h"
 
 #include <ctype.h>
@@ -284,8 +285,7 @@ void java_lsp_init(JavaLSPContext *ctx, CBMArena *arena, const char *source, int
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL);
 
-    const char *dbg = getenv("CBM_LSP_DEBUG");
-    ctx->debug = (dbg && dbg[0]);
+    ctx->debug = cbm_lsp_env_flag_enabled("CBM_LSP_DEBUG");
 }
 
 void java_lsp_add_import(JavaLSPContext *ctx, const char *local_name, const char *target_qn,

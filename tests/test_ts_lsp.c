@@ -2477,6 +2477,35 @@ TEST(tslsp_baseline_vs_lsp_simple) {
     PASS();
 }
 
+static bool lsp_disabled_false_value_keeps_ts_lsp_enabled(const char *value) {
+    const char *source = "class Conn { ping(): void {} }\n"
+                         "function go(c: Conn) { c.ping(); }\n";
+
+    cbm_setenv("CBM_LSP_DISABLED", "1", 1);
+    CBMFileResult *base = extract_ts(source);
+    int br = 0, bu = 0, bt = 0;
+    count_calls(base, &br, &bu, &bt);
+    cbm_free_result(base);
+
+    cbm_setenv("CBM_LSP_DISABLED", value, 1);
+    CBMFileResult *lsp = extract_ts(source);
+    int lr = 0, lu = 0, lt = 0;
+    count_calls(lsp, &lr, &lu, &lt);
+    cbm_free_result(lsp);
+
+    cbm_unsetenv("CBM_LSP_DISABLED");
+    return lr >= br + 1;
+}
+
+TEST(tslsp_disabled_false_values_keep_lsp_enabled) {
+    ASSERT(lsp_disabled_false_value_keeps_ts_lsp_enabled("0"));
+    ASSERT(lsp_disabled_false_value_keeps_ts_lsp_enabled("false"));
+    ASSERT(lsp_disabled_false_value_keeps_ts_lsp_enabled("False"));
+    ASSERT(lsp_disabled_false_value_keeps_ts_lsp_enabled("off"));
+    ASSERT(lsp_disabled_false_value_keeps_ts_lsp_enabled("NO"));
+    PASS();
+}
+
 TEST(tslsp_baseline_vs_lsp_chained) {
     const char *source =
         "class Q { where(s: string): Q { return this; } limit(n: number): Q { return this; } "
@@ -4188,6 +4217,7 @@ SUITE(ts_lsp) {
 
     /* LSP vs baseline comparison (requires CBM_LSP_DISABLED knob in resolver) */
     RUN_TEST(tslsp_baseline_vs_lsp_simple);
+    RUN_TEST(tslsp_disabled_false_values_keep_lsp_enabled);
     RUN_TEST(tslsp_baseline_vs_lsp_chained);
     RUN_TEST(tslsp_baseline_vs_lsp_callbacks);
     RUN_TEST(tslsp_baseline_vs_lsp_narrowing);

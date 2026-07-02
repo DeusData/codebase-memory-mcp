@@ -471,10 +471,10 @@ BUILD_DIR = build/c
 # ── Object file compilation (grammars need relaxed warnings) ─────
 
 # Grammar + tree-sitter runtime: compiled without -Werror (upstream code has warnings)
-GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
-GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
+GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -Isrc -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
+GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Isrc -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
                       $(SANITIZE)
-GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
+GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Isrc -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
                       -fsanitize=thread -fno-omit-frame-pointer
 
 # Object files for grammars + ts_runtime + lsp_all + preprocessor
@@ -575,7 +575,7 @@ OBJS_VENDORED_TEST  = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $
 #   tre        (only on Windows; TRE_CFLAGS has no -fsanitize)
 #
 NOSAN_DIR            = $(BUILD_DIR)/nosan
-GRAMMAR_CFLAGS_NOSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
+GRAMMAR_CFLAGS_NOSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Isrc -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
 GRAMMAR_OBJS_NOSAN   = $(patsubst $(CBM_DIR)/%.c,$(NOSAN_DIR)/%.o,$(GRAMMAR_SRCS))
 
 $(NOSAN_DIR):
