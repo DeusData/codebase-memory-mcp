@@ -1044,6 +1044,8 @@ static int incr_expand_exact_inbound_frontier(cbm_store_t *store, const char *pr
         return CBM_STORE_ERR;
     }
 
+    const int original_exact_count = *exact_count;
+    bool saw_batch_owned_empty_source_edge = false;
     for (int cursor = 0; cursor < *exact_count; cursor++) {
         const char *rel_path = exact_files[cursor].rel_path;
         cbm_store_inbound_edge_t *edges = NULL;
@@ -1061,8 +1063,25 @@ static int incr_expand_exact_inbound_frontier(cbm_store_t *store, const char *pr
             if (!source_rel_path || source_rel_path[0] == '\0') {
                 if (incr_empty_source_inbound_edge_is_structure(&edges[i]) ||
                     incr_inbound_edge_owner_is_exact_file(&edges[i], exact_files, *exact_count)) {
+                    if (!incr_empty_source_inbound_edge_is_structure(&edges[i])) {
+                        if (*exact_count > original_exact_count) {
+                            if (out_reason) {
+                                *out_reason = CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL;
+                            }
+                            cbm_store_free_inbound_edges(edges, edge_count);
+                            return CBM_STORE_NOT_FOUND;
+                        }
+                        saw_batch_owned_empty_source_edge = true;
+                    }
                     continue;
                 }
+                if (out_reason) {
+                    *out_reason = CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL;
+                }
+                cbm_store_free_inbound_edges(edges, edge_count);
+                return CBM_STORE_NOT_FOUND;
+            }
+            if (saw_batch_owned_empty_source_edge) {
                 if (out_reason) {
                     *out_reason = CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL;
                 }
