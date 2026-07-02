@@ -289,6 +289,53 @@ TEST(path_alias_loader_monorepo) {
     PASS();
 }
 
+/* ── Monorepo alias climbing out of its tsconfig's directory (#730) ── */
+
+TEST(path_alias_loader_monorepo_dotdot_climb) {
+    char tmpl[256];
+    snprintf(tmpl, sizeof(tmpl), "/tmp/cbm_palias_climb_XXXXXX");
+    char *root = cbm_mkdtemp(tmpl);
+    ASSERT_NOT_NULL(root);
+
+    char sub[512];
+    snprintf(sub, sizeof(sub), "%s/apps", root);
+    cbm_mkdir(sub);
+    snprintf(sub, sizeof(sub), "%s/apps/web", root);
+    cbm_mkdir(sub);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/apps/web/tsconfig.json", root);
+    ASSERT_EQ(write_file(path,
+                         "{\n  \"compilerOptions\": {\n    \"paths\": {\n"
+                         "      \"@shared/*\": [\"../../packages/shared/src/*\"]\n"
+                         "    }\n  }\n}\n"),
+              0);
+
+    cbm_path_alias_collection_t *coll = cbm_load_path_aliases(root);
+    ASSERT_NOT_NULL(coll);
+
+    const cbm_path_alias_map_t *m =
+        cbm_path_alias_find_for_file(coll, "apps/web/src/feature/x.ts");
+    ASSERT_NOT_NULL(m);
+    char *r = cbm_path_alias_resolve(m, "@shared/utils");
+    ASSERT_NOT_NULL(r);
+    /* "../.." from apps/web climbs to repo root, then descends into
+     * packages/shared/src — not the literal (unmatchable) "apps/web/../../..." */
+    ASSERT_STR_EQ(r, "packages/shared/src/utils");
+    free(r);
+
+    cbm_path_alias_collection_free(coll);
+
+    snprintf(path, sizeof(path), "%s/apps/web/tsconfig.json", root);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/apps/web", root);
+    rmdir(path);
+    snprintf(path, sizeof(path), "%s/apps", root);
+    rmdir(path);
+    rmdir(root);
+    PASS();
+}
+
 /* ── Loader returns NULL when no configs found ─────────────────── */
 
 TEST(path_alias_loader_no_configs) {
@@ -315,5 +362,6 @@ void suite_path_alias(void) {
     RUN_TEST(path_alias_null_safety);
     RUN_TEST(path_alias_find_for_file_nearest_ancestor);
     RUN_TEST(path_alias_loader_monorepo);
+    RUN_TEST(path_alias_loader_monorepo_dotdot_climb);
     RUN_TEST(path_alias_loader_no_configs);
 }

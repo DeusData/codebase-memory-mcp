@@ -63,27 +63,74 @@ static char *strip_resolved_ext(char *path) {
     return path;
 }
 
-/* If target starts with "./" and dir_prefix is non-empty, prepend dir_prefix.
- * Returns heap-allocated repo-relative target. */
+/* Join dir_prefix with target, collapsing "." and ".." segments so aliases
+ * that climb out of their tsconfig's directory (the common monorepo
+ * pattern: a tsconfig at apps/web/tsconfig.json pointing an alias at a
+ * wildcard target like "../../packages/shared/src/" + wildcard) resolve
+ * to a real repo-relative path. Naive concatenation left literal ".."
+ * components in the target, which never match a module's FQN since
+ * cbm_pipeline_fqn_module tokenizes on '/' without collapsing them
+ * (#730). A trailing '/' on target (the usual case right before a
+ * wildcard) is preserved so the caller's later wildcard-substring
+ * concat still lines up. Returns heap-allocated
+ * repo-relative target. */
 static char *resolve_target_relative(const char *dir_prefix, const char *target) {
     if (!target) {
         return NULL;
     }
-    const char *t = target;
-    if (t[0] == '.' && t[1] == '/') {
-        t += 2;
-    }
-    if (!dir_prefix || dir_prefix[0] == '\0') {
-        return strdup(t);
-    }
-    size_t dp_len = strlen(dir_prefix);
-    size_t t_len = strlen(t);
-    char *result = malloc(dp_len + 1 + t_len + 1);
-    if (!result) {
+    size_t dp_len = (dir_prefix && dir_prefix[0] != '\0') ? strlen(dir_prefix) : 0;
+    size_t t_len = strlen(target);
+    char *buf = malloc(dp_len + t_len + 2);
+    if (!buf) {
         return NULL;
     }
-    snprintf(result, dp_len + 1 + t_len + 1, "%s/%s", dir_prefix, t);
-    return result;
+    buf[0] = '\0';
+    if (dp_len > 0) {
+        memcpy(buf, dir_prefix, dp_len);
+        buf[dp_len] = '\0';
+    }
+
+    bool trailing_slash = t_len > 0 && target[t_len - 1] == '/';
+
+    const char *p = target;
+    while (*p) {
+        while (*p == '/') {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+        const char *seg_start = p;
+        while (*p && *p != '/') {
+            p++;
+        }
+        size_t seg_len = (size_t)(p - seg_start);
+        if (seg_len == 1 && seg_start[0] == '.') {
+            continue;
+        }
+        if (seg_len == 2 && seg_start[0] == '.' && seg_start[1] == '.') {
+            char *last = strrchr(buf, '/');
+            if (last) {
+                *last = '\0';
+            } else {
+                buf[0] = '\0';
+            }
+            continue;
+        }
+        size_t cur = strlen(buf);
+        if (cur > 0) {
+            buf[cur++] = '/';
+        }
+        memcpy(buf + cur, seg_start, seg_len);
+        buf[cur + seg_len] = '\0';
+    }
+
+    if (trailing_slash) {
+        size_t cur = strlen(buf);
+        buf[cur] = '/';
+        buf[cur + 1] = '\0';
+    }
+    return buf;
 }
 
 /* qsort comparator: alias entries by alias_prefix length, descending. */
