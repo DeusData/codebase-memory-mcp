@@ -6,6 +6,7 @@
  */
 #include "foundation/constants.h"
 #include "foundation/compat_fs.h"
+#include "foundation/compat_fs_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -201,8 +202,9 @@ int cbm_rmdir(const char *path) {
  * Returns a heap-allocated wide string, or NULL on allocation failure.
  * Quoting follows the MSVC CRT convention: arguments containing spaces,
  * tabs, or double-quotes are wrapped in double-quotes, with backslashes
- * before a closing quote doubled and the quote itself escaped. */
-static wchar_t *cbm_build_cmdline(const char *const *argv) {
+ * before a closing quote doubled and the quote itself escaped.
+ * Declared in compat_fs_internal.h so the test suite can drive it. */
+wchar_t *cbm_build_cmdline(const char *const *argv) {
     /* First pass: compute required buffer size. */
     size_t total = 1; /* NUL terminator */
     for (int i = 0; argv[i]; i++) {

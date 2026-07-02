@@ -12,6 +12,11 @@
 #include <cypher/cypher.h>
 #include "../src/foundation/str_util.h"
 #include "../src/foundation/compat_fs.h"
+#ifdef _WIN32
+#include "../src/foundation/compat_fs_internal.h"
+#include <wchar.h>
+#include <stdlib.h>
+#endif
 
 #include <string.h>
 #include <sys/stat.h>
@@ -364,6 +369,118 @@ TEST(exec_no_shell_captures_exit_code) {
     PASS();
 }
 
+#else /* _WIN32 */
+
+/* ──────────────────────────────────────────────────────────────────
+ *  WINDOWS COMMAND-LINE QUOTING (cbm_build_cmdline)
+ *
+ *  Regression guard for #697: cbm_exec_no_shell used _spawnvp, whose
+ *  MinGW CRT did not quote arguments containing spaces. The taskkill
+ *  filter "IMAGENAME eq codebase-memory-mcp.exe" was passed as three
+ *  bare tokens, so taskkill printed
+ *      ERROR: Invalid argument/option - 'eq'.
+ *  on every install. cbm_build_cmdline now performs MSVC-convention
+ *  quoting; these tests pin that behaviour so it cannot silently
+ *  regress. The quoting is pure logic, so it runs deterministically in
+ *  CI on the windows-latest test job.
+ * ────────────────────────────────────────────────────────────────── */
+
+/* Assert that cbm_build_cmdline(argv) produces `expected` (wide). */
+#define ASSERT_CMDLINE(argv, expected)                                                     \
+    do {                                                                                   \
+        wchar_t *_cl = cbm_build_cmdline(argv);                                             \
+        ASSERT_NOT_NULL(_cl);                                                               \
+        if (wcscmp(_cl, (expected)) != 0) {                                                \
+            free(_cl);                                                                      \
+            FAIL("cbm_build_cmdline produced an unexpected command line");                  \
+        }                                                                                   \
+        free(_cl);                                                                          \
+    } while (0)
+
+TEST(cmdline_taskkill_filter_is_single_quoted_token) {
+    /* The exact #697 regression: the filter value contains spaces and
+     * must survive as ONE quoted argument, not three bare words. */
+    const char *argv[] = {"taskkill", "/FI", "IMAGENAME eq codebase-memory-mcp.exe", NULL};
+    ASSERT_CMDLINE(argv, L"taskkill /FI \"IMAGENAME eq codebase-memory-mcp.exe\"");
+    PASS();
+}
+
+TEST(cmdline_simple_args_are_not_quoted) {
+    /* Arguments with no spaces/tabs/quotes stay bare. */
+    const char *argv[] = {"foo", "bar", "baz", NULL};
+    ASSERT_CMDLINE(argv, L"foo bar baz");
+    PASS();
+}
+
+TEST(cmdline_single_arg_no_trailing_space) {
+    const char *argv[] = {"codebase-memory-mcp.exe", NULL};
+    ASSERT_CMDLINE(argv, L"codebase-memory-mcp.exe");
+    PASS();
+}
+
+TEST(cmdline_empty_arg_becomes_empty_quotes) {
+    /* An empty argument must be preserved as "" so argv positions line up. */
+    const char *argv[] = {"cmd", "", "tail", NULL};
+    ASSERT_CMDLINE(argv, L"cmd \"\" tail");
+    PASS();
+}
+
+TEST(cmdline_embedded_quote_is_escaped) {
+    /* A literal double-quote is escaped as \" inside the quoted token. */
+    const char *argv[] = {"echo", "a\"b", NULL};
+    ASSERT_CMDLINE(argv, L"echo \"a\\\"b\"");
+    PASS();
+}
+
+TEST(cmdline_trailing_backslashes_doubled_before_close_quote) {
+    /* Per the MSVC convention, backslashes immediately before the closing
+     * quote are doubled so the quote is not accidentally escaped. The arg
+     * `C:\dir with space\` becomes "C:\dir with space\\". */
+    const char *argv[] = {"type", "C:\\dir with space\\", NULL};
+    ASSERT_CMDLINE(argv, L"type \"C:\\dir with space\\\\\"");
+    PASS();
+}
+
+TEST(cmdline_null_argv_returns_null) {
+    /* Defensive: builder over an empty argv still yields a valid (empty)
+     * string rather than crashing. */
+    const char *argv[] = {NULL};
+    wchar_t *cl = cbm_build_cmdline(argv);
+    ASSERT_NOT_NULL(cl);
+    ASSERT_EQ((int)wcslen(cl), 0);
+    free(cl);
+    PASS();
+}
+
+#undef ASSERT_CMDLINE
+
+/* ──────────────────────────────────────────────────────────────────
+ *  WINDOWS SHELL-FREE EXECUTION (cbm_exec_no_shell, CreateProcessW path)
+ *
+ *  Exercises the live CreateProcessW code path end-to-end via cmd.exe so
+ *  the Windows spawn path is not left entirely uncovered by CI.
+ * ────────────────────────────────────────────────────────────────── */
+
+TEST(exec_no_shell_win_exit_zero) {
+    const char *argv[] = {"cmd", "/c", "exit 0", NULL};
+    int rc = cbm_exec_no_shell(argv);
+    ASSERT_EQ(rc, 0);
+    PASS();
+}
+
+TEST(exec_no_shell_win_captures_exit_code) {
+    const char *argv[] = {"cmd", "/c", "exit 42", NULL};
+    int rc = cbm_exec_no_shell(argv);
+    ASSERT_EQ(rc, 42);
+    PASS();
+}
+
+TEST(exec_no_shell_win_null_argv_returns_error) {
+    int rc = cbm_exec_no_shell(NULL);
+    ASSERT_NEQ(rc, 0);
+    PASS();
+}
+
 #endif /* _WIN32 */
 
 /* ══════════════════════════════════════════════════════════════════
@@ -417,5 +534,18 @@ SUITE(security) {
     RUN_TEST(exec_no_shell_nonexistent_command);
     RUN_TEST(exec_no_shell_null_argv_returns_error);
     RUN_TEST(exec_no_shell_captures_exit_code);
+#else
+    /* Windows command-line quoting (regression guard for #697) */
+    RUN_TEST(cmdline_taskkill_filter_is_single_quoted_token);
+    RUN_TEST(cmdline_simple_args_are_not_quoted);
+    RUN_TEST(cmdline_single_arg_no_trailing_space);
+    RUN_TEST(cmdline_empty_arg_becomes_empty_quotes);
+    RUN_TEST(cmdline_embedded_quote_is_escaped);
+    RUN_TEST(cmdline_trailing_backslashes_doubled_before_close_quote);
+    RUN_TEST(cmdline_null_argv_returns_null);
+    /* Live CreateProcessW spawn path */
+    RUN_TEST(exec_no_shell_win_exit_zero);
+    RUN_TEST(exec_no_shell_win_captures_exit_code);
+    RUN_TEST(exec_no_shell_win_null_argv_returns_error);
 #endif
 }
