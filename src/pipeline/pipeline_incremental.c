@@ -852,7 +852,7 @@ static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_file
                  itoa_buf_incr((int)elapsed_ms_incr(t)));
 
     /* SIMILAR_TO + SEMANTICALLY_RELATED edges only in moderate/full modes */
-    if (ctx->mode <= CBM_MODE_MODERATE) {
+    if (cbm_pipeline_mode_builds_global_semantic_edges(ctx->mode)) {
         /* These passes recompute global derived edge sets over the loaded graph.
          * Clear the previous run's rows first; otherwise repeated incremental
          * updates keep stale pairs whose node ids changed during purge/reparse. */

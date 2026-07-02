@@ -922,7 +922,7 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     static const struct {
         predump_pass_fn fn;
         const char *name;
-        bool moderate_only; /* true = skip in fast mode */
+        bool global_semantic; /* true = only modes that build global semantic views */
     } passes[] = {
         {predump_deco, "decorator_tags", false}, {predump_cfg, "configlink", false},
         {predump_route, "route_match", false},   {predump_sim, "similarity", true},
@@ -931,11 +931,8 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     enum { PREDUMP_PASS_COUNT = 6 };
     struct timespec t;
     for (int i = 0; i < PREDUMP_PASS_COUNT && !check_cancel(p); i++) {
-        /* "moderate_only" passes (similarity/semantic edges) run in FULL,
-         * MODERATE and ADVANCED — they are skipped only in FAST. Compare
-         * explicitly against FAST rather than `> MODERATE` so ADVANCED
-         * (numerically 3) is not mistaken for a lighter mode than FULL. */
-        if (passes[i].moderate_only && p->mode == CBM_MODE_FAST) {
+        if (passes[i].global_semantic &&
+            !cbm_pipeline_mode_builds_global_semantic_edges(p->mode)) {
             continue;
         }
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
