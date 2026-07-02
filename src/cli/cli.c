@@ -2875,7 +2875,7 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
     {"reindex_on_startup", "false", "CBM_REINDEX_ON_STARTUP", "Indexing",
      "Re-index stale projects when server starts",
      "true|false",
-     "Enable for always-fresh indexes (adds startup latency). Prefer reindex_stale_seconds for scheduled refresh."},
+     "Enable to refresh stale indexes at startup (adds startup latency). Prefer reindex_stale_seconds for scheduled refresh."},
     {"reindex_stale_seconds", "0", NULL, "Indexing",
      "Re-index if DB is older than N seconds (0=disabled)",
      "0-2592000",
