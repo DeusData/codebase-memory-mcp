@@ -102,6 +102,8 @@ struct cbm_pipeline {
     double githistory_min_coupling;
     double lsp_confidence_floor;
     cbm_incremental_reindex_policy_t incremental_reindex;
+    int exact_delta_max_changed_paths;
+    int exact_delta_max_affected_paths;
     atomic_int cancelled;
     cbm_store_t *flush_store; /* when set, use flush_to_store instead of dump_to_sqlite */
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
@@ -189,6 +191,8 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->githistory_min_coupling = 0.0;
     p->lsp_confidence_floor = 0.0;
     p->incremental_reindex = CBM_INCREMENTAL_REINDEX_OFF;
+    p->exact_delta_max_changed_paths = CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_CHANGED_PATHS;
+    p->exact_delta_max_affected_paths = CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS;
     p->persistence = false;
     p->committed_nodes = -1;
     p->committed_edges = -1;
@@ -266,6 +270,24 @@ void cbm_pipeline_set_lsp_confidence_floor(cbm_pipeline_t *p, double threshold) 
     }
 }
 
+void cbm_pipeline_set_exact_delta_limits(cbm_pipeline_t *p, int max_changed_paths,
+                                         int max_affected_paths) {
+    if (!p) {
+        return;
+    }
+    if (max_changed_paths <= 0) {
+        max_changed_paths = CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_CHANGED_PATHS;
+    }
+    if (max_affected_paths <= 0) {
+        max_affected_paths = CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS;
+    }
+    if (max_affected_paths < max_changed_paths) {
+        max_affected_paths = max_changed_paths;
+    }
+    p->exact_delta_max_changed_paths = max_changed_paths;
+    p->exact_delta_max_affected_paths = max_affected_paths;
+}
+
 void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg) {
     if (!p || !cfg) {
         return;
@@ -309,6 +331,12 @@ void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg) {
     } else {
         p->incremental_reindex = CBM_INCREMENTAL_REINDEX_OFF;
     }
+
+    int max_changed = cbm_config_get_int(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS,
+                                         p->exact_delta_max_changed_paths);
+    int max_affected = cbm_config_get_int(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS,
+                                          p->exact_delta_max_affected_paths);
+    cbm_pipeline_set_exact_delta_limits(p, max_changed, max_affected);
 }
 
 double cbm_pipeline_httplink_min_confidence(const cbm_pipeline_t *p) {
@@ -329,6 +357,16 @@ double cbm_pipeline_githistory_min_coupling(const cbm_pipeline_t *p) {
 
 double cbm_pipeline_lsp_confidence_floor(const cbm_pipeline_t *p) {
     return p ? p->lsp_confidence_floor : 0.0;
+}
+
+int cbm_pipeline_exact_max_changed_paths(const cbm_pipeline_t *p) {
+    return p ? p->exact_delta_max_changed_paths
+             : CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_CHANGED_PATHS;
+}
+
+int cbm_pipeline_exact_max_affected_paths(const cbm_pipeline_t *p) {
+    return p ? p->exact_delta_max_affected_paths
+             : CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS;
 }
 
 int cbm_pipeline_current_pass_fingerprint(const cbm_pipeline_t *p, char *out, size_t out_sz) {

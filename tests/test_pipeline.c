@@ -8035,6 +8035,92 @@ static cbm_config_t *incremental_test_config(const char *cache_dir) {
     return cfg;
 }
 
+enum { PIPELINE_INCR_FRONTIER_CALLER_COUNT = CBM_SZ_4 };
+
+static int write_incremental_leaf_file(int leaf_value) {
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    char body[CBM_SZ_512];
+    n = snprintf(body, sizeof(body),
+                 "package main\n\n"
+                 "func Leaf() int {\n"
+                 "\tfor i := 0; i < 10; i++ {\n"
+                 "\t\tfor j := 0; j < 10; j++ {\n"
+                 "\t\t}\n"
+                 "\t}\n"
+                 "\treturn %d\n"
+                 "}\n",
+                 leaf_value);
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return -1;
+    }
+    return th_write_file(path, body);
+}
+
+static int write_incremental_leaf_file_with_extra(int leaf_value) {
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    char body[CBM_SZ_512];
+    n = snprintf(body, sizeof(body),
+                 "package main\n\n"
+                 "func Leaf() int {\n"
+                 "\tfor i := 0; i < 10; i++ {\n"
+                 "\t\tfor j := 0; j < 10; j++ {\n"
+                 "\t\t}\n"
+                 "\t}\n"
+                 "\treturn %d\n"
+                 "}\n\n"
+                 "func LeafExtra() int {\n"
+                 "\treturn Leaf()\n"
+                 "}\n",
+                 leaf_value);
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return -1;
+    }
+    return th_write_file(path, body);
+}
+
+static int write_incremental_frontier_callers(void) {
+    const char *caller_names[PIPELINE_INCR_FRONTIER_CALLER_COUNT] = {
+        "caller_a.go", "caller_b.go", "caller_c.go", "caller_d.go"};
+    const char *caller_funcs[PIPELINE_INCR_FRONTIER_CALLER_COUNT] = {
+        "CallerA", "CallerB", "CallerC", "CallerD"};
+    char path[CBM_PATH_MAX];
+    char body[CBM_SZ_512];
+    for (size_t i = 0; i < sizeof(caller_names) / sizeof(caller_names[0]); i++) {
+        int n = snprintf(path, sizeof(path), "%s/%s", g_incr_tmpdir, caller_names[i]);
+        if (n < 0 || (size_t)n >= sizeof(path)) {
+            return -1;
+        }
+        n = snprintf(body, sizeof(body),
+                     "package main\n\n"
+                     "func %s() int {\n"
+                     "\treturn Leaf()\n"
+                     "}\n",
+                     caller_funcs[i]);
+        if (n < 0 || (size_t)n >= sizeof(body)) {
+            return -1;
+        }
+        if (th_write_file(path, body) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int write_incremental_frontier_fixture(int leaf_value) {
+    if (write_incremental_leaf_file(leaf_value) != 0) {
+        return -1;
+    }
+    return write_incremental_frontier_callers();
+}
+
 static int pipeline_store_has_node_name_by_label(const char *db_path, const char *project,
                                                  const char *label, const char *name) {
     cbm_store_t *s = cbm_store_open_path_query(db_path);
@@ -9174,34 +9260,7 @@ TEST(incremental_fast_falls_back_for_oversized_inbound_frontier_and_matches_full
         FAIL("setup failed");
     }
 
-    char path[CBM_PATH_MAX];
-    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
-    ASSERT(n >= 0 && (size_t)n < sizeof(path));
-    ASSERT_EQ(th_write_file(path,
-                            "package main\n\n"
-                            "func Leaf() int {\n"
-                            "\tfor i := 0; i < 10; i++ {\n"
-                            "\t\tfor j := 0; j < 10; j++ {\n"
-                            "\t\t}\n"
-                            "\t}\n"
-                            "\treturn 1\n"
-                            "}\n"),
-              0);
-    const char *caller_names[] = {"caller_a.go", "caller_b.go", "caller_c.go", "caller_d.go"};
-    const char *caller_funcs[] = {"CallerA", "CallerB", "CallerC", "CallerD"};
-    for (size_t i = 0; i < sizeof(caller_names) / sizeof(caller_names[0]); i++) {
-        n = snprintf(path, sizeof(path), "%s/%s", g_incr_tmpdir, caller_names[i]);
-        ASSERT(n >= 0 && (size_t)n < sizeof(path));
-        char body[CBM_SZ_512];
-        n = snprintf(body, sizeof(body),
-                     "package main\n\n"
-                     "func %s() int {\n"
-                     "\treturn Leaf()\n"
-                     "}\n",
-                     caller_funcs[i]);
-        ASSERT(n >= 0 && (size_t)n < sizeof(body));
-        ASSERT_EQ(th_write_file(path, body), 0);
-    }
+    ASSERT_EQ(write_incremental_frontier_fixture(CBM_ALLOC_ONE), 0);
 
     cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
     ASSERT_NOT_NULL(cfg);
@@ -9213,18 +9272,7 @@ TEST(incremental_fast_falls_back_for_oversized_inbound_frontier_and_matches_full
     cbm_pipeline_free(p);
     ASSERT_NOT_NULL(project);
 
-    n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
-    ASSERT(n >= 0 && (size_t)n < sizeof(path));
-    ASSERT_EQ(th_write_file(path,
-                            "package main\n\n"
-                            "func Leaf() int {\n"
-                            "\tfor i := 0; i < 10; i++ {\n"
-                            "\t\tfor j := 0; j < 10; j++ {\n"
-                            "\t\t}\n"
-                            "\t}\n"
-                            "\treturn 2\n"
-                            "}\n"),
-              0);
+    ASSERT_EQ(write_incremental_leaf_file(CBM_SZ_2), 0);
 
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
@@ -9254,6 +9302,68 @@ TEST(incremental_fast_falls_back_for_oversized_inbound_frontier_and_matches_full
         g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
     if (diff_rc != 0) {
         FAIL(diff_err[0] ? diff_err : "oversized inbound fallback differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_configured_frontier_cap_allows_bounded_exact) {
+    enum {
+        PIPELINE_EXPECTED_EXACT_FRONTIER_FILES =
+            PIPELINE_INCR_FRONTIER_CALLER_COUNT + CBM_ALLOC_ONE,
+        PIPELINE_CONFIGURED_AFFECTED_CAP = CBM_SZ_8,
+    };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    ASSERT_EQ(write_incremental_frontier_fixture(CBM_ALLOC_ONE), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    char cap_value[CBM_SZ_32];
+    int n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_CONFIGURED_AFFECTED_CAP);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, cap_value), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(write_incremental_leaf_file_with_extra(CBM_SZ_2), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    char frontier_log[CBM_SZ_128];
+    n = snprintf(frontier_log, sizeof(frontier_log),
+                 "msg=incremental.exact.frontier changed=1 expanded=%d",
+                 PIPELINE_EXPECTED_EXACT_FRONTIER_FILES);
+    ASSERT(n >= 0 && (size_t)n < sizeof(frontier_log));
+    ASSERT(strstr(logs, frontier_log) != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    ASSERT_NULL(cbm_pipeline_publish_reason(p));
+    cbm_pipeline_free(p);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "LeafExtra"));
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "configured exact frontier differed from fresh rebuild");
     }
     ASSERT_EQ(diff_rc, 0);
 
@@ -9858,7 +9968,7 @@ TEST(incremental_fast_exact_batch_publish_matches_fresh_rebuild_for_two_file_go)
     const cbm_pipeline_file_delta_t *delta_ptrs[CBM_SZ_2] = {&deltas[0], &deltas[1]};
     cbm_pipeline_file_delta_plan_t plan = {0};
     ASSERT_EQ(cbm_pipeline_plan_file_delta_batch(store, delta_ptrs, changed_count,
-                                                 CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS,
+                                                 CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS,
                                                  &plan),
               CBM_STORE_OK);
     if (plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
@@ -9875,7 +9985,7 @@ TEST(incremental_fast_exact_batch_publish_matches_fresh_rebuild_for_two_file_go)
                   CBM_STORE_OK);
     }
     ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(store, delta_ptrs, changed_count,
-                                                  CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS,
+                                                  CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS,
                                                   &plan),
               CBM_STORE_OK);
     if (plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
@@ -10787,6 +10897,10 @@ TEST(pipeline_publish_kind_names_are_stable) {
 }
 
 TEST(pipeline_apply_config_sets_all_thresholds) {
+    enum {
+        PIPELINE_TEST_EXACT_MAX_CHANGED = 3,
+        PIPELINE_TEST_EXACT_MAX_AFFECTED = 9,
+    };
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pipeline_cfg_XXXXXX");
     if (!cbm_mkdtemp(tmpdir)) {
@@ -10800,6 +10914,16 @@ TEST(pipeline_apply_config_sets_all_thresholds) {
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SEMANTIC_THRESHOLD, "0.76"), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_MIN_COUPLING, "0.31"), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_LSP_CONFIDENCE_FLOOR, "0.61"), 0);
+    char max_changed[CBM_SZ_32];
+    char max_affected[CBM_SZ_32];
+    int n = snprintf(max_changed, sizeof(max_changed), "%d", PIPELINE_TEST_EXACT_MAX_CHANGED);
+    ASSERT(n >= 0 && (size_t)n < sizeof(max_changed));
+    n = snprintf(max_affected, sizeof(max_affected), "%d", PIPELINE_TEST_EXACT_MAX_AFFECTED);
+    ASSERT(n >= 0 && (size_t)n < sizeof(max_affected));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS, max_changed),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, max_affected),
+              0);
 
     cbm_pipeline_t *p = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
@@ -10815,10 +10939,37 @@ TEST(pipeline_apply_config_sets_all_thresholds) {
     ASSERT_TRUE(cbm_pipeline_githistory_min_coupling(p) < 0.32);
     ASSERT_TRUE(cbm_pipeline_lsp_confidence_floor(p) > 0.60);
     ASSERT_TRUE(cbm_pipeline_lsp_confidence_floor(p) < 0.62);
+    ASSERT_EQ(cbm_pipeline_exact_max_changed_paths(p), PIPELINE_TEST_EXACT_MAX_CHANGED);
+    ASSERT_EQ(cbm_pipeline_exact_max_affected_paths(p), PIPELINE_TEST_EXACT_MAX_AFFECTED);
 
     cbm_pipeline_free(p);
     cbm_config_close(cfg);
     rm_rf(tmpdir);
+    PASS();
+}
+
+TEST(pipeline_exact_delta_limits_keep_safe_defaults) {
+    enum { PIPELINE_TEST_EXACT_INVERTED_CHANGED = CBM_SZ_8 };
+    cbm_pipeline_t *p = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+
+    ASSERT_EQ(cbm_pipeline_exact_max_changed_paths(p),
+              CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_CHANGED_PATHS);
+    ASSERT_EQ(cbm_pipeline_exact_max_affected_paths(p),
+              CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS);
+
+    cbm_pipeline_set_exact_delta_limits(p, 0, -1);
+    ASSERT_EQ(cbm_pipeline_exact_max_changed_paths(p),
+              CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_CHANGED_PATHS);
+    ASSERT_EQ(cbm_pipeline_exact_max_affected_paths(p),
+              CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS);
+
+    cbm_pipeline_set_exact_delta_limits(p, PIPELINE_TEST_EXACT_INVERTED_CHANGED,
+                                        CBM_ALLOC_ONE);
+    ASSERT_EQ(cbm_pipeline_exact_max_changed_paths(p), PIPELINE_TEST_EXACT_INVERTED_CHANGED);
+    ASSERT_EQ(cbm_pipeline_exact_max_affected_paths(p), PIPELINE_TEST_EXACT_INVERTED_CHANGED);
+
+    cbm_pipeline_free(p);
     PASS();
 }
 
@@ -11050,6 +11201,23 @@ TEST(config_registry_includes_incremental_reindex_policy) {
     ASSERT_STR_EQ(entry->default_val, "off");
     ASSERT_STR_EQ(entry->category, "Indexing");
     ASSERT_STR_EQ(entry->range, "fast|always|off");
+    PASS();
+}
+
+TEST(config_registry_includes_incremental_exact_frontier_caps) {
+    const cbm_config_entry_t *changed =
+        find_config_entry(CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS);
+    ASSERT_NOT_NULL(changed);
+    ASSERT_STR_EQ(changed->default_val, CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_CHANGED_PATHS);
+    ASSERT_STR_EQ(changed->category, "Indexing");
+    ASSERT_STR_EQ(changed->range, "1-100000");
+
+    const cbm_config_entry_t *affected =
+        find_config_entry(CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS);
+    ASSERT_NOT_NULL(affected);
+    ASSERT_STR_EQ(affected->default_val, CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_AFFECTED_PATHS);
+    ASSERT_STR_EQ(affected->category, "Indexing");
+    ASSERT_STR_EQ(affected->range, "1-100000");
     PASS();
 }
 
@@ -11716,12 +11884,14 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_run_null);
     RUN_TEST(pipeline_unit_threshold_setters_clamp_invalid_values);
     RUN_TEST(pipeline_apply_config_sets_all_thresholds);
+    RUN_TEST(pipeline_exact_delta_limits_keep_safe_defaults);
     RUN_TEST(pipeline_semantic_edges_independent_of_call_insertion_order);
     RUN_TEST(pipeline_semantic_corpus_vectors_independent_of_worker_count);
     RUN_TEST(pipeline_semantic_corpus_add_doc_reserves_without_losing_docs);
     RUN_TEST(pipeline_semantic_batch_rejects_invalid_token_stride);
     RUN_TEST(config_registry_includes_mcp_timeout_knobs);
     RUN_TEST(config_registry_includes_incremental_reindex_policy);
+    RUN_TEST(config_registry_includes_incremental_exact_frontier_caps);
     RUN_TEST(config_registry_includes_rank_refresh_policy);
     RUN_TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths);
     RUN_TEST(pipeline_file_delta_scratch_seed_preserves_structure_roots);
@@ -11970,6 +12140,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_body_only_change_uses_graph_noop);
     RUN_TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild);
     RUN_TEST(incremental_fast_falls_back_for_oversized_inbound_frontier_and_matches_full);
+    RUN_TEST(incremental_fast_configured_frontier_cap_allows_bounded_exact);
     RUN_TEST(incremental_fast_expands_small_inbound_frontier_and_matches_full);
     RUN_TEST(incremental_fast_three_file_batch_falls_back_to_full_rebuild_parity);
     RUN_TEST(incremental_fast_single_delete_exact_matches_full_rebuild);

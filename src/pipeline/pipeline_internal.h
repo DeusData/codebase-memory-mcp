@@ -322,13 +322,12 @@ typedef struct {
 #define CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL "inbound_edges_require_full"
 #define CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR "preflight_error"
 
-/* Conservative live exact-delta frontier cap. Larger affected sets fall back
- * to the existing containment reindex path until broader parity benchmarks pass. */
-enum { CBM_PIPELINE_EXACT_DELTA_MAX_AFFECTED_PATHS = CBM_SZ_4 };
-/* Live exact upserts are currently limited to two changed files. Larger
- * batches keep the existing fallback path until same-batch parity coverage
- * includes deletes, renames, new folders, and derived-view freshness. */
-enum { CBM_PIPELINE_EXACT_DELTA_MAX_CHANGED_PATHS = CBM_SZ_2 };
+/* Conservative default exact-delta caps. Larger affected sets fall back to the
+ * containment path unless config opts into a benchmarked frontier size. */
+enum { CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS = CBM_SZ_4 };
+/* Default changed-file batch cap. Larger batches need explicit config and
+ * same-batch parity coverage for deletes, renames, folders, and derived views. */
+enum { CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_CHANGED_PATHS = CBM_SZ_2 };
 
 /* Get the current pipeline's package map (NULL if none). */
 CBMHashTable *cbm_pipeline_get_pkgmap(void);

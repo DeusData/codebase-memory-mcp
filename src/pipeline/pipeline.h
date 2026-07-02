@@ -97,6 +97,10 @@ void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store);
 #define CBM_CONFIG_GITHISTORY_MIN_COUPLING "githistory_min_coupling"
 #define CBM_CONFIG_LSP_CONFIDENCE_FLOOR "lsp_confidence_floor"
 #define CBM_CONFIG_INCREMENTAL_REINDEX "incremental_reindex"
+#define CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS "incremental_exact_max_changed_paths"
+#define CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS "incremental_exact_max_affected_paths"
+#define CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_CHANGED_PATHS "2"
+#define CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_AFFECTED_PATHS "4"
 
 /* Set the Jaccard similarity threshold for SIMILAR-edge creation (pass_similarity).
  * <=0 (or unset) uses the CBM_MINHASH_JACCARD_THRESHOLD default. Before run(). */
@@ -105,6 +109,8 @@ void cbm_pipeline_set_httplink_min_confidence(cbm_pipeline_t *p, double threshol
 void cbm_pipeline_set_semantic_threshold(cbm_pipeline_t *p, double threshold);
 void cbm_pipeline_set_githistory_min_coupling(cbm_pipeline_t *p, double threshold);
 void cbm_pipeline_set_lsp_confidence_floor(cbm_pipeline_t *p, double threshold);
+void cbm_pipeline_set_exact_delta_limits(cbm_pipeline_t *p, int max_changed_paths,
+                                         int max_affected_paths);
 /* Apply config-backed thresholds. NULL cfg is allowed and leaves defaults. */
 void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg);
 double cbm_pipeline_similarity_threshold(const cbm_pipeline_t *p);
@@ -112,6 +118,8 @@ double cbm_pipeline_httplink_min_confidence(const cbm_pipeline_t *p);
 double cbm_pipeline_semantic_threshold(const cbm_pipeline_t *p);
 double cbm_pipeline_githistory_min_coupling(const cbm_pipeline_t *p);
 double cbm_pipeline_lsp_confidence_floor(const cbm_pipeline_t *p);
+int cbm_pipeline_exact_max_changed_paths(const cbm_pipeline_t *p);
+int cbm_pipeline_exact_max_affected_paths(const cbm_pipeline_t *p);
 
 /* Get the project name derived from repo_path. Returned string is
  * owned by the pipeline. Valid until cbm_pipeline_free(). */
