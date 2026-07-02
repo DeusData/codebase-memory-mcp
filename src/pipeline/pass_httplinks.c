@@ -247,6 +247,9 @@ static void free_decorators(char **decs) {
 /* ── Suffix helpers ────────────────────────────────────────────── */
 
 static bool has_suffix(const char *s, const char *suffix) {
+    if (!s || !suffix) {
+        return false;
+    }
     size_t sl = strlen(s);
     size_t xl = strlen(suffix);
     if (xl > sl) {
@@ -259,6 +262,15 @@ static bool is_jsts_file(const char *path) {
     // NOLINTNEXTLINE(readability-implicit-bool-conversion)
     return has_suffix(path, ".js") || has_suffix(path, ".ts") || has_suffix(path, ".mjs") ||
            has_suffix(path, ".mts") || has_suffix(path, ".tsx");
+}
+
+static bool has_source_route_extractor(const char *path) {
+    /* Keep this in lockstep with the source extractor dispatch below.
+     * Decorator-based routes are handled before this gate and remain
+     * language-driven by definition properties rather than file extension. */
+    // NOLINTNEXTLINE(readability-implicit-bool-conversion)
+    return has_suffix(path, ".go") || is_jsts_file(path) || has_suffix(path, ".php") ||
+           has_suffix(path, ".kt") || has_suffix(path, ".kts");
 }
 
 /* ── Route discovery ───────────────────────────────────────────── */
@@ -292,10 +304,11 @@ static int discover_node_routes(const cbm_gbuf_node_t *n, const cbm_pipeline_ctx
 
     /* 2. Source-based routes — scoped by file extension to avoid
      * cross-framework false positives (e.g. Ktor regex matching PHP Cache::get) */
-    if (n->file_path && n->start_line > 0 && n->end_line > 0 && total < max_out) {
-        char *source = read_source_lines(ctx, n->file_path, n->start_line, n->end_line);
+    const char *fp = n->file_path;
+    if (has_source_route_extractor(fp) && n->start_line > 0 && n->end_line > 0 &&
+        total < max_out) {
+        char *source = read_source_lines(ctx, fp, n->start_line, n->end_line);
         if (source) {
-            const char *fp = n->file_path;
             int nr;
 
             if (has_suffix(fp, ".go")) {
