@@ -1353,6 +1353,124 @@ static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const 
     return NULL;
 }
 
+// Find a keyword argument by name in an argument_list node and return its value child.
+static TSNode find_drf_kwarg_in_args(CBMArena *a, TSNode args, const char *kwarg_name,
+                                     const char *source) {
+    uint32_t nc = ts_node_named_child_count(args);
+    for (uint32_t ai = 0; ai < nc; ai++) {
+        TSNode child = ts_node_named_child(args, ai);
+        if (strcmp(ts_node_type(child), "keyword_argument") != 0)
+            continue;
+        TSNode name_node = ts_node_child_by_field_name(child, TS_FIELD("name"));
+        if (ts_node_is_null(name_node))
+            continue;
+        char *name = cbm_node_text(a, name_node, source);
+        if (name && strcmp(name, kwarg_name) == 0) {
+            return ts_node_child_by_field_name(child, TS_FIELD("value"));
+        }
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
+// Try to extract a route from a Django REST Framework @action decorator on a
+// ViewSet method:
+//   @action(detail=True, methods=["post"], url_path="approve")
+// Sets *out_path/*out_method so the downstream Route+HANDLES pipeline (Phase 2a
+// ensure_one_decorator_route) emits the handler->Route edge in the normal
+// direction. Falls back to the method name for url_path and "GET" for methods.
+// Known limitation: multi-method actions (methods=["get","post"]) capture only
+// the first method -> a single Route rather than one per method.
+static bool try_drf_action_decorator(CBMArena *a, TSNode dchild, const char *source,
+                                     TSNode func_node, const char **out_path,
+                                     const char **out_method) {
+    TSNode fn = ts_node_child_by_field_name(dchild, TS_FIELD("function"));
+    if (ts_node_is_null(fn)) {
+        fn = ts_node_named_child(dchild, 0);
+    }
+    if (ts_node_is_null(fn)) {
+        return false;
+    }
+    const char *fn_type = ts_node_type(fn);
+    if (strcmp(fn_type, "identifier") != 0) {
+        return false;
+    }
+    char *fn_text = cbm_node_text(a, fn, source);
+    if (!fn_text || strcmp(fn_text, "action") != 0) {
+        return false;
+    }
+    TSNode args = find_decorator_args(dchild);
+    if (ts_node_is_null(args)) {
+        return false;
+    }
+    const char *method = NULL;
+    TSNode methods_val = find_drf_kwarg_in_args(a, args, "methods", source);
+    if (!ts_node_is_null(methods_val) && strcmp(ts_node_type(methods_val), "list") == 0) {
+        uint32_t mc = ts_node_named_child_count(methods_val);
+        for (uint32_t mi = 0; mi < mc && !method; mi++) {
+            TSNode item = ts_node_named_child(methods_val, mi);
+            if (strcmp(ts_node_type(item), "string") != 0)
+                continue;
+            char *text = cbm_node_text(a, item, source);
+            if (!text)
+                continue;
+            int tlen = (int)strlen(text);
+            if (tlen < PAIR_CHARS || (text[0] != '"' && text[0] != '\''))
+                continue;
+            char inner[CBM_SZ_16];
+            int ilen = tlen - PAIR_CHARS;
+            if (ilen <= 0 || ilen >= (int)sizeof(inner))
+                continue;
+            memcpy(inner, text + SKIP_CHAR, (size_t)ilen);
+            inner[ilen] = '\0';
+            for (int ci = 0; inner[ci]; ci++) {
+                if (inner[ci] >= 'a' && inner[ci] <= 'z')
+                    inner[ci] -= 32;
+            }
+            method = cbm_arena_strdup(a, inner);
+        }
+    }
+    if (!method) {
+        method = "GET";
+    }
+    const char *segment = NULL;
+    TSNode url_path_val = find_drf_kwarg_in_args(a, args, "url_path", source);
+    if (!ts_node_is_null(url_path_val) && strcmp(ts_node_type(url_path_val), "string") == 0) {
+        char *text = cbm_node_text(a, url_path_val, source);
+        if (text) {
+            int tlen = (int)strlen(text);
+            if (tlen >= PAIR_CHARS && (text[0] == '"' || text[0] == '\'')) {
+                segment = cbm_arena_strndup(a, text + SKIP_CHAR, (size_t)(tlen - PAIR_CHARS));
+            }
+        }
+    }
+    if (!segment) {
+        TSNode name_node = func_name_node(func_node);
+        if (!ts_node_is_null(name_node)) {
+            segment = cbm_node_text(a, name_node, source);
+        }
+    }
+    if (!segment) {
+        return false;
+    }
+    // Extract detail kwarg (default True in DRF)
+    bool detail = true;
+    TSNode detail_val = find_drf_kwarg_in_args(a, args, "detail", source);
+    if (!ts_node_is_null(detail_val)) {
+        const char *dv = ts_node_type(detail_val);
+        if (strcmp(dv, "false") == 0) {
+            detail = false;
+        }
+    }
+    if (detail) {
+        *out_path = cbm_arena_sprintf(a, "/{pk}/%s", segment);
+    } else {
+        *out_path = cbm_arena_sprintf(a, "/%s", segment);
+    }
+    *out_method = method;
+    return true;
+}
+
 // Try to extract a route from a single decorator call node.
 // Returns true if a route method was found (even with fallback path "/").
 static bool try_route_from_decorator_call(CBMArena *a, TSNode dchild, const char *source,
@@ -1514,6 +1632,9 @@ static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const c
                 continue;
             }
             if (try_route_from_decorator_call(a, dchild, source, out_path, out_method)) {
+                return;
+            }
+            if (try_drf_action_decorator(a, dchild, source, func_node, out_path, out_method)) {
                 return;
             }
         }

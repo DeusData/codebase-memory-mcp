@@ -33,7 +33,7 @@
 
 /* Read an entire file into a malloc'd buffer. Returns NULL on failure. */
 static char *pkgmap_read_file(const char *path, int *out_len) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return NULL;
     }

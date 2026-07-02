@@ -491,6 +491,63 @@ TEST(project_name_encodes_unicode_segments_issue571) {
     PASS();
 }
 
+/* issue #624: #571 preserves non-ASCII path segments by hex-encoding each byte
+ * (1 byte -> 2 hex chars), so a DEEP non-ASCII path triples in length and can
+ * blow past the filesystem's 255-byte filename-component limit. Then
+ * "<cache>/<name>.db" is un-openable (ENAMETOOLONG). The derived name must be
+ * length-capped (with a hash suffix that disambiguates otherwise-identical
+ * prefixes) while staying validator-safe — and SHORT names must NOT drift. */
+#define FQN_CAP_UNDER_TEST 200
+TEST(project_name_length_capped_issue624) {
+    /* 开 = U+5F00, UTF-8 "\xe5\xbc\x80" (3 bytes -> 6 hex chars). 60 copies makes
+     * the raw hex-encoded name ~360 chars, well past the 200-byte cap. */
+    static const char KAI[] = "\xe5\xbc\x80";
+    char deepA[512];
+    char deepB[512];
+    const char *prefix = "/Users/dev/";
+    size_t p = strlen(prefix);
+    memcpy(deepA, prefix, p);
+    for (int i = 0; i < 60; i++) {
+        memcpy(deepA + p, KAI, 3);
+        p += 3;
+    }
+    /* deepB shares the entire deep prefix and differs ONLY in the trailing seg */
+    memcpy(deepB, deepA, p);
+    memcpy(deepA + p, "/alpha", 7); /* includes NUL */
+    memcpy(deepB + p, "/omega", 7);
+
+    char *nameA = cbm_project_name_from_path(deepA);
+    char *nameB = cbm_project_name_from_path(deepB);
+    ASSERT_NOT_NULL(nameA);
+    ASSERT_NOT_NULL(nameB);
+
+    /* (a) capped: name must fit within the filename-component budget */
+    ASSERT_LTE(strlen(nameA), FQN_CAP_UNDER_TEST);
+    ASSERT_LTE(strlen(nameB), FQN_CAP_UNDER_TEST);
+    /* (b) still a valid project name (resolve_store must accept it) */
+    ASSERT_TRUE(cbm_validate_project_name(nameA));
+    ASSERT_TRUE(cbm_validate_project_name(nameB));
+    /* (c) two deep paths differing only in the trailing segment must NOT
+     * collide after capping — the hash suffix disambiguates them. */
+    ASSERT_STR_NEQ(nameA, nameB);
+
+    free(nameA);
+    free(nameB);
+
+    /* Short CJK path (the issue #571 case) must be UNCHANGED — no drift. */
+    char *shortName = cbm_project_name_from_path(
+        "/Users/yunxin/Desktop/\xe5\xbc\x80\xe5\x8f\x91/"
+        "\xe5\x90\x8e\xe7\xab\xaf/"
+        "\xe4\xbf\xa1\xe7\xa7\x9f\xe9\xa3\x8e\xe6\x8e\xa7\xe9\x80\x9a\xe5\x90\x8e\xe7\xab\xaf");
+    ASSERT_NOT_NULL(shortName);
+    ASSERT_LTE(strlen(shortName), FQN_CAP_UNDER_TEST);
+    ASSERT_STR_EQ(shortName, "Users-yunxin-Desktop-e5bc80e58f91-e5908ee7abaf-"
+                             "e4bfa1e7a79fe9a38ee68ea7e9809ae5908ee7abaf");
+    free(shortName);
+
+    PASS();
+}
+
 /* ================================================================
  * Suite
  * ================================================================ */
@@ -593,6 +650,7 @@ SUITE(fqn) {
     RUN_TEST(project_name_deep_path);
     RUN_TEST(project_name_always_validator_safe_issue349);
     RUN_TEST(project_name_encodes_unicode_segments_issue571);
+    RUN_TEST(project_name_length_capped_issue624);
     RUN_TEST(project_name_colon_only);
     RUN_TEST(project_name_backslash_only);
     RUN_TEST(project_name_consecutive_colons);

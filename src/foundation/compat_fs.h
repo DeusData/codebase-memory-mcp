@@ -50,10 +50,16 @@ int cbm_unlink(const char *path);
 /* Delete an empty directory. Returns 0 on success. */
 int cbm_rmdir(const char *path);
 
+/* Open a file by UTF-8 path.
+ * On Windows, converts to wide-char and calls _wfopen so paths with
+ * non-ASCII characters (accents, CJK, etc.) are handled correctly.
+ * On POSIX, delegates to fopen. mode must be an ASCII string. */
+FILE *cbm_fopen(const char *path, const char *mode);
+
 /* Execute a command without shell interpretation.
  * argv is a NULL-terminated array: {"cmd", "arg1", "arg2", NULL}.
  * Returns the process exit code, or -1 on fork/exec failure.
- * POSIX: fork() + execvp(). Windows: _spawnvp(). */
+ * POSIX: fork() + execvp(). Windows: CreateProcess with proper quoting. */
 int cbm_exec_no_shell(const char *const *argv);
 
 #endif /* CBM_COMPAT_FS_H */

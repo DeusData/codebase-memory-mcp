@@ -10,6 +10,7 @@
 
 #include <stdbool.h>
 #include <stddef.h> // NULL
+#include <stdint.h> // uint32_t
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h> // strdup
@@ -17,6 +18,13 @@
 /* Maximum path segments in a FQN (CBM_SZ_256 slots total, -2 for project + name) */
 #define FQN_MAX_PATH_SEGS 254
 #define FQN_MAX_DIR_SEGS 255
+
+/* Max bytes for a derived project name. The name becomes a filename component
+ * ("<cache>/<name>.db" and sidecars ".db-wal"/".db.corrupt"), so it must stay
+ * under the filesystem's 255-byte component limit. 200 leaves headroom for the
+ * longest sidecar suffix. #571 hex-encodes each non-ASCII byte to 2 chars, so a
+ * deep CJK path can triple past 255 and make the DB file un-openable (#624). */
+#define FQN_MAX_NAME_LEN 200
 
 /* ── Internal helpers ─────────────────────────────────────────────── */
 
@@ -351,6 +359,31 @@ char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir) {
     return result;
 }
 
+/* Bound a derived project name to FQN_MAX_NAME_LEN bytes so "<cache>/<name>.db"
+ * stays within the filesystem's 255-byte filename-component limit (#624). Names
+ * within the cap are returned UNCHANGED (no drift). Longer names keep their first
+ * (CAP-9) bytes and get a "-XXXXXXXX" FNV-1a hash of the FULL name appended, so
+ * two long paths that share a prefix but differ later still map to distinct
+ * names. The suffix ends in a hex digit, so the result stays validator-safe. */
+static char *fqn_bound_name_len(char *name) {
+    if (!name) {
+        return name;
+    }
+    size_t n = strlen(name);
+    if (n <= FQN_MAX_NAME_LEN) {
+        return name; /* within cap → unchanged, no drift */
+    }
+    uint32_t h = 2166136261u; /* FNV-1a offset basis over the FULL name */
+    for (size_t i = 0; i < n; i++) {
+        h ^= (unsigned char)name[i];
+        h *= 16777619u;
+    }
+    /* Keep first (CAP-9) bytes + "-" + 8 hex = CAP total. The buffer holds n+1
+     * bytes and n > CAP, so writing 9 chars + NUL at offset (CAP-9) fits. */
+    snprintf(name + (FQN_MAX_NAME_LEN - 9), 10, "-%08x", h);
+    return name;
+}
+
 char *cbm_project_name_from_path(const char *abs_path) {
     if (!abs_path || !abs_path[0]) {
         return strdup("root");
@@ -433,5 +466,8 @@ char *cbm_project_name_from_path(const char *abs_path) {
 
     char *result = strdup(start);
     free(path);
+    if (result) {
+        result = fqn_bound_name_len(result); /* #624: cap filename-component length */
+    }
     return result;
 }

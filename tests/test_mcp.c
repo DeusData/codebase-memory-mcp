@@ -816,6 +816,115 @@ TEST(tool_trace_call_path_prefers_definition) {
     PASS();
 }
 
+/* Reproduce-first (#650, distilled): two GENUINELY-DIFFERENT same-named functions
+ * whose bodies differ in length score differently, so the old exact-tie check did
+ * not flag them ambiguous — and bfs_union_same_name (#546) then merged the caller
+ * sets of both into one confidently-conflated answer (the mirror of #546's under-
+ * report). The fix: 2+ real callable defs => ambiguous (disambiguate), never union
+ * distinct symbols. RED before the pick_resolved_node real_def_count rule (response
+ * merged callerA+callerB), GREEN after (response is ambiguous, no "callers"). */
+TEST(tool_trace_call_path_distinct_defs_not_over_unioned) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "ou-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/ou");
+    /* two unrelated real definitions of "dupreal", DIFFERENT body spans */
+    cbm_node_t da = {.project = proj, .label = "Function", .name = "dupreal",
+                     .qualified_name = "ou-proj.a.dupreal", .file_path = "a.c",
+                     .start_line = 10, .end_line = 20}; /* span 10 */
+    cbm_node_t db = {.project = proj, .label = "Function", .name = "dupreal",
+                     .qualified_name = "ou-proj.b.dupreal", .file_path = "b.c",
+                     .start_line = 10, .end_line = 40}; /* span 30 (no tie) */
+    cbm_node_t ca = {.project = proj, .label = "Function", .name = "callerA",
+                     .qualified_name = "ou-proj.a.callerA", .file_path = "a.c",
+                     .start_line = 30, .end_line = 40};
+    cbm_node_t cb = {.project = proj, .label = "Function", .name = "callerB",
+                     .qualified_name = "ou-proj.b.callerB", .file_path = "b.c",
+                     .start_line = 50, .end_line = 60};
+    int64_t id_da = cbm_store_upsert_node(st, &da);
+    int64_t id_db = cbm_store_upsert_node(st, &db);
+    int64_t id_ca = cbm_store_upsert_node(st, &ca);
+    int64_t id_cb = cbm_store_upsert_node(st, &cb);
+    ASSERT_GT(id_da, 0);
+    ASSERT_GT(id_db, 0);
+    ASSERT_GT(id_ca, 0);
+    ASSERT_GT(id_cb, 0);
+    cbm_edge_t ea = {.project = proj, .source_id = id_ca, .target_id = id_da, .type = "CALLS"};
+    cbm_edge_t eb = {.project = proj, .source_id = id_cb, .target_id = id_db, .type = "CALLS"};
+    cbm_store_insert_edge(st, &ea);
+    cbm_store_insert_edge(st, &eb);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":\"dupreal\","
+             "\"project\":\"ou-proj\",\"direction\":\"inbound\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    /* distinct symbols must be disambiguated, not merged into one caller set */
+    ASSERT_NOT_NULL(strstr(inner, "ambiguous"));
+    ASSERT_NOT_NULL(strstr(inner, "suggestions"));
+    ASSERT_NULL(strstr(inner, "\"callers\""));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Guard that the ambiguity gate does NOT regress the #546 fix: a real .ts
+ * implementation plus a body-less ambient .d.ts stub is ONE logical symbol
+ * (one real callable def + a fragment), so it must stay non-ambiguous and the
+ * caller sets from both nodes must be unioned. */
+TEST(tool_trace_call_path_dts_stub_unions_with_impl) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "dts-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/dts");
+    cbm_node_t impl = {.project = proj, .label = "Function", .name = "sym546",
+                       .qualified_name = "dts-proj.impl.sym546", .file_path = "src/sym.ts",
+                       .start_line = 10, .end_line = 30}; /* real body */
+    cbm_node_t stub = {.project = proj, .label = "Function", .name = "sym546",
+                       .qualified_name = "dts-proj.stub.sym546", .file_path = "types/sym.d.ts",
+                       .start_line = 5, .end_line = 5}; /* body-less ambient decl */
+    cbm_node_t crel = {.project = proj, .label = "Function", .name = "callerRel",
+                       .qualified_name = "dts-proj.callerRel", .file_path = "src/rel.ts",
+                       .start_line = 1, .end_line = 8};
+    cbm_node_t cali = {.project = proj, .label = "Function", .name = "callerAlias",
+                       .qualified_name = "dts-proj.callerAlias", .file_path = "src/ali.ts",
+                       .start_line = 1, .end_line = 8};
+    int64_t id_impl = cbm_store_upsert_node(st, &impl);
+    int64_t id_stub = cbm_store_upsert_node(st, &stub);
+    int64_t id_crel = cbm_store_upsert_node(st, &crel);
+    int64_t id_cali = cbm_store_upsert_node(st, &cali);
+    ASSERT_GT(id_impl, 0);
+    ASSERT_GT(id_stub, 0);
+    ASSERT_GT(id_crel, 0);
+    ASSERT_GT(id_cali, 0);
+    /* callers split by import style: relative -> impl, path-alias -> stub */
+    cbm_edge_t er = {.project = proj, .source_id = id_crel, .target_id = id_impl, .type = "CALLS"};
+    cbm_edge_t el = {.project = proj, .source_id = id_cali, .target_id = id_stub, .type = "CALLS"};
+    cbm_store_insert_edge(st, &er);
+    cbm_store_insert_edge(st, &el);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":64,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":\"sym546\","
+             "\"project\":\"dts-proj\",\"direction\":\"inbound\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "ambiguous"));
+    /* union across impl + stub: BOTH callers appear (this is the #546 fix) */
+    ASSERT_NOT_NULL(strstr(inner, "callerRel"));
+    ASSERT_NOT_NULL(strstr(inner, "callerAlias"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_delete_project_not_found) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -1194,6 +1303,81 @@ TEST(search_code_multi_word) {
 
     cleanup_snippet_dir(tmp);
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Reproduce-first (#687): scoped content search over a repo whose ROOT PATH
+ * contains a space. write_scoped_filelist emits "<root>/<file>" records that the
+ * Unix pipeline pipes to grep via xargs. With plain `xargs` (newline-split) the
+ * space splits one path into several bogus args -> grep finds nothing ->
+ * total_grep_matches == 0 (RED on the unfixed code). The fix writes NUL-separated
+ * records + uses `xargs -0`, so the path stays a single argument -> match found
+ * (GREEN). On Windows the scoped path uses PowerShell Get-Content -LiteralPath,
+ * which already handles spaces, so this asserts correct behavior there too. */
+TEST(search_code_scoped_path_with_spaces_issue687) {
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_srch_space_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    /* Project root deliberately contains a space. */
+    char proj_dir[640];
+    snprintf(proj_dir, sizeof(proj_dir), "%s/my project", tmp);
+    cbm_mkdir(proj_dir);
+
+    char src_path[768];
+    snprintf(src_path, sizeof(src_path), "%s/main.go", proj_dir);
+    FILE *fp = fopen(src_path, "w");
+    if (!fp) {
+        rmdir(proj_dir);
+        rmdir(tmp);
+        FAIL("cannot write source file under spaced path");
+    }
+    fprintf(fp, "package main\n\nfunc HandleRequest() error {\n\treturn nil\n}\n");
+    fclose(fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "space-search";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, proj_dir);
+
+    /* A node so the file is "indexed" (cbm_store_list_files -> scoped grep path)
+     * and the grep hit classifies to a result. */
+    cbm_node_t n = {.project = proj,
+                    .label = "Function",
+                    .name = "HandleRequest",
+                    .qualified_name = "space-search.main.HandleRequest",
+                    .file_path = "main.go",
+                    .start_line = 3,
+                    .end_line = 5};
+    ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":94,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\",\"project\":\"space-search\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    /* grep must have found the match despite the space in the root path. */
+    int grep_matches = -1;
+    const char *g = strstr(inner, "\"total_grep_matches\":");
+    if (g) {
+        sscanf(g, "\"total_grep_matches\":%d", &grep_matches);
+    }
+    ASSERT_TRUE(grep_matches > 0);
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    unlink(src_path);
+    rmdir(proj_dir);
+    rmdir(tmp);
     PASS();
 }
 
@@ -2613,6 +2797,112 @@ TEST(tool_bad_project_name_no_overflow_issue235) {
 }
 #undef ISSUE235_DBNAME
 
+/* Issue #235 (follow-up): with many long-named projects indexed,
+ * collect_db_project_names overflowed projects[CBM_SZ_4K] and truncated the
+ * LAST name MID-TOKEN, then clamped offset to out_sz-1 — emitting malformed,
+ * unterminated JSON like
+ *   ...,"available_projects":["a",...,"vjson_49_bbb],"count":50}
+ * (unclosed string + unclosed array). build_project_list_error wrapped that
+ * invalid body into the tool error, so a "project not found" reply was NOT
+ * valid JSON once enough projects were indexed.
+ *
+ * Reproduce-first: fill an isolated cache dir with enough long INTERNAL-named
+ * dbs to overflow the 4 KB buffer, hit the bad-project path, then assert the
+ * ERROR BODY (the inner MCP text content) parses as valid JSON and that
+ * available_projects is a JSON array whose length == count. RED on the
+ * truncating code (yyjson_read returns NULL on the mid-token cut); GREEN after
+ * the element-boundary fix, which only ever writes whole "name" tokens. */
+#define BADPROJ_JSON_DBNAME(buf, dir, i)                                                      \
+    snprintf((buf), sizeof(buf),                                                              \
+             "%s/vjson_%02d_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.db",                       \
+             (dir), (i))
+TEST(tool_bad_project_error_valid_json_issue235) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-badproj-vjson-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS(); /* skip if mkdtemp fails */
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    /* 50 * ~120-char INTERNAL names >> 4 KB → the available_projects buffer
+     * overflows and the last name is cut mid-token on the unfixed code. */
+    enum { BADPROJ_N = 50 };
+    for (int i = 0; i < BADPROJ_N; i++) {
+        char name[512];
+        BADPROJ_JSON_DBNAME(name, cache, i);
+        char iname[256];
+        snprintf(iname, sizeof(iname),
+                 "vjson_%02d_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                 i);
+        cbm_store_t *st = cbm_store_open_path(name);
+        if (st) {
+            cbm_store_upsert_project(st, iname, cache);
+            cbm_store_close(st);
+        }
+    }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":"
+             "\"search_graph\",\"arguments\":{\"label\":\"Function\","
+             "\"project\":\"definitely-not-a-real-project-xyz\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "not found"));
+
+    /* The inner MCP text content is the error body built by
+     * build_project_list_error. Capture its validity BEFORE cleanup so a RED
+     * failure still restores the environment. */
+    char *body = extract_text_content(resp);
+    bool body_valid = false;
+    bool aps_ok = false; /* available_projects is an array whose len == count */
+    if (body) {
+        yyjson_doc *bdoc = yyjson_read(body, strlen(body), 0);
+        if (bdoc) {
+            body_valid = true;
+            yyjson_val *broot = yyjson_doc_get_root(bdoc);
+            yyjson_val *aps = yyjson_obj_get(broot, "available_projects");
+            yyjson_val *cnt = yyjson_obj_get(broot, "count");
+            if (aps && yyjson_is_arr(aps) && cnt && yyjson_is_int(cnt)) {
+                aps_ok = (yyjson_arr_size(aps) == (size_t)yyjson_get_int(cnt));
+            }
+            yyjson_doc_free(bdoc);
+        }
+    }
+    free(body);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    for (int i = 0; i < BADPROJ_N; i++) {
+        char name[512];
+        BADPROJ_JSON_DBNAME(name, cache, i);
+        cbm_unlink(name);
+        char side[540];
+        snprintf(side, sizeof(side), "%s-wal", name);
+        cbm_unlink(side);
+        snprintf(side, sizeof(side), "%s-shm", name);
+        cbm_unlink(side);
+    }
+    cbm_rmdir(cache);
+
+    /* RED on the unfixed code: mid-token truncation → invalid JSON body. */
+    ASSERT_TRUE(body_valid);
+    ASSERT_TRUE(aps_ok);
+    PASS();
+}
+#undef BADPROJ_JSON_DBNAME
+
 /* ── #704: project resolution must key on the db's INTERNAL project name ──
  *
  * Issue #704: project resolution is registry-less and filename-addressed.
@@ -3129,6 +3419,8 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_call_path_ambiguous);
     RUN_TEST(tool_trace_call_path_prefers_definition);
+    RUN_TEST(tool_trace_call_path_distinct_defs_not_over_unioned);
+    RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
@@ -3144,6 +3436,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_code_missing_pattern);
     RUN_TEST(tool_search_code_no_project);
     RUN_TEST(search_code_multi_word);
+    RUN_TEST(search_code_scoped_path_with_spaces_issue687);
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
     RUN_TEST(search_code_ampersand_accepted_issue272);
@@ -3199,5 +3492,6 @@ SUITE(mcp) {
     RUN_TEST(snippet_include_neighbors_enabled);
     RUN_TEST(snippet_source_invalid_utf8);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
+    RUN_TEST(tool_bad_project_error_valid_json_issue235);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
 }

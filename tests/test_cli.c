@@ -2362,6 +2362,26 @@ TEST(cli_hook_gate_script_no_predictable_tmp_issue384) {
     PASS();
 }
 
+/* issue #618: hook-augment was a structural no-op on Windows because its path
+ * guards required POSIX-style '/'-prefixed absolute paths, so a drive-letter
+ * cwd (C:/repo) was rejected before any search_graph query. The predicate must
+ * accept POSIX and Windows drive roots alike (callers normalize '\\' to '/'). */
+TEST(cli_hook_augment_path_is_abs) {
+    /* POSIX absolute (unchanged behavior) */
+    ASSERT(cbm_hook_path_is_abs("/home/u/proj"));
+    /* Windows drive roots — the #618 regression */
+    ASSERT(cbm_hook_path_is_abs("C:/Users/me/proj"));
+    ASSERT(cbm_hook_path_is_abs("C:/"));
+    ASSERT(cbm_hook_path_is_abs("C:"));
+    ASSERT(cbm_hook_path_is_abs("d:/lowercase/drive"));
+    /* Not absolute → augmenter no-ops cleanly */
+    ASSERT(!cbm_hook_path_is_abs("relative/path"));
+    ASSERT(!cbm_hook_path_is_abs("proj"));
+    ASSERT(!cbm_hook_path_is_abs(""));
+    ASSERT(!cbm_hook_path_is_abs(NULL));
+    PASS();
+}
+
 TEST(cli_upsert_claude_hook_existing) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-XXXXXX");
@@ -3026,6 +3046,7 @@ SUITE(cli) {
 
     /* Claude Code hooks (5 tests — group D) */
     RUN_TEST(cli_hook_gate_script_no_predictable_tmp_issue384);
+    RUN_TEST(cli_hook_augment_path_is_abs);
     RUN_TEST(cli_upsert_claude_hook_fresh);
     RUN_TEST(cli_upsert_claude_hook_existing);
     RUN_TEST(cli_upsert_claude_hook_replace);

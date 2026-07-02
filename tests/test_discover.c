@@ -932,6 +932,69 @@ TEST(discover_git_info_exclude_stacks_with_gitignore) {
     PASS();
 }
 
+/* ── Linked-worktree ignore tests ──────────────────────────────── */
+
+/* In a linked worktree, <repo>/.git is a regular file ("gitdir: <path>"), not a
+ * directory, and info/exclude + config live in the shared common dir named by
+ * <gitdir>/commondir. The discover step must follow the gitlink so per-clone
+ * excludes are honored exactly as in an ordinary checkout. Regression for the
+ * worktree gap left by issue #489 (which only handled .git as a directory). */
+TEST(discover_worktree_info_exclude) {
+    char *base = th_mktempdir("cbm_disc_wt_exc");
+    ASSERT(base != NULL);
+
+    /* Worktree gitlink -> per-worktree gitdir (relative to the worktree root). */
+    th_write_file(TH_PATH(base, ".git"), "gitdir: maingit/worktrees/wt\n");
+    /* Per-worktree gitdir points back to the shared common dir via commondir. */
+    th_mkdir_p(TH_PATH(base, "maingit/worktrees/wt"));
+    th_write_file(TH_PATH(base, "maingit/worktrees/wt/commondir"), "../..\n");
+    /* Shared exclude lives in the common dir, not the per-worktree gitdir. */
+    th_mkdir_p(TH_PATH(base, "maingit/info"));
+    th_write_file(TH_PATH(base, "maingit/info/exclude"), "build/\n");
+
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "build/gen.go"), "package build\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strstr(files[0].rel_path, "main.go") != NULL);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* Committed .gitignore must still apply in a worktree even when commondir is
+ * absent (older gitdir layouts): the gitlink resolver falls back to the gitdir
+ * itself, and the root .gitignore is loaded unconditionally (issue #510). */
+TEST(discover_worktree_committed_gitignore) {
+    char *base = th_mktempdir("cbm_disc_wt_gi");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, ".git"), "gitdir: maingit/worktrees/wt\n");
+    th_mkdir_p(TH_PATH(base, "maingit/worktrees/wt"));
+    th_write_file(TH_PATH(base, ".gitignore"), "build/\n");
+
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "build/gen.go"), "package build\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strstr(files[0].rel_path, "main.go") != NULL);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 /* ── Nested .gitignore tests (issue #178) ──────────────────────── */
 
 TEST(discover_nested_gitignore) {
@@ -1108,6 +1171,10 @@ SUITE(discover) {
     /* .git/info/exclude support (issue #489) */
     RUN_TEST(discover_git_info_exclude);
     RUN_TEST(discover_git_info_exclude_stacks_with_gitignore);
+
+    /* Linked-worktree ignore resolution (gitlink + commondir) */
+    RUN_TEST(discover_worktree_info_exclude);
+    RUN_TEST(discover_worktree_committed_gitignore);
 
     /* Nested .gitignore tests (issue #178) */
     RUN_TEST(discover_nested_gitignore);

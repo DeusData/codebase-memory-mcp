@@ -19,6 +19,7 @@
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "cbm.h"
 
 #include <stdio.h>
@@ -34,7 +35,7 @@ static bool ps_module_is_dir(CBMLanguage lang) {
 }
 
 static char *read_file(const char *path, int *out_len) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return NULL;
     }

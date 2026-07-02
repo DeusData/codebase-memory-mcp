@@ -343,7 +343,13 @@ static int run_cli(int argc, char **argv) {
         }
         args_json = heap_args;
     } else if (rem_argc >= SKIP_ONE && cli_first_nonspace_is_brace(rem_argv[0])) {
-        /* raw-JSON back-compat: cli <tool> '{"k":"v"}' */
+        /* raw-JSON back-compat: cli <tool> '{"k":"v"}' (deprecated path). Warn on
+         * STDERR only — stdout must stay clean JSON for piping. */
+        (void)fprintf(stderr,
+                      "warning: passing raw JSON to 'cli %s' is deprecated and "
+                      "will be removed in a future release; use flags (run 'cli "
+                      "%s --help'), --args-file <path>, or piped stdin.\n",
+                      tool_name, tool_name);
         args_json = rem_argv[0];
     } else if (rem_argc >= SKIP_ONE && strncmp(rem_argv[0], "--", 2) == 0) {
         /* flag form: cli <tool> --flag value --bare-bool ... */

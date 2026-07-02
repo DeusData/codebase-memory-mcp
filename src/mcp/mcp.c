@@ -1069,17 +1069,22 @@ static int collect_db_project_names(const char *dir_path, char *out, size_t out_
         if (!db_internal_project_name(full_path, iname, sizeof(iname), NULL)) {
             continue;
         }
-        if ((size_t)offset >= out_sz)
-            break; /* bounds check before write */
-        if (count > 0 && offset < (int)out_sz - MCP_SEPARATOR) {
+        /* Element-boundary write: only emit this name if the WHOLE element —
+         * optional leading comma + "iname" — plus the NUL fits in what remains.
+         * Never truncate mid-token; a partial name would corrupt the JSON array
+         * (issue #235). Stop cleanly at the last name that fits: the array then
+         * always holds complete names and `count` == its length. */
+        size_t off = (size_t)offset;
+        size_t need = strlen(iname) + 2 /* quotes */ + (count > 0 ? 1u : 0u) /* comma */;
+        if (off + need + 1 > out_sz) {
+            break; /* would not fit entirely — stop at this element boundary */
+        }
+        if (count > 0) {
             out[offset++] = ',';
         }
         int wrote = snprintf(out + offset, out_sz - (size_t)offset, "\"%s\"", iname);
         if (wrote > 0) {
-            offset += wrote;
-            if ((size_t)offset >= out_sz) {
-                offset = (int)out_sz - 1; /* clamp on truncation */
-            }
+            offset += wrote; /* guaranteed to fit (checked above) — no truncation */
         }
         count++;
     }
@@ -2694,9 +2699,33 @@ static long node_resolution_score(const cbm_node_t *n) {
     return label_rank * (long)RES_LABEL_WEIGHT + span;
 }
 
-/* Pick the best-resolving node among name matches. Sets *ambiguous when the top
- * score is shared by more than one candidate (a genuine tie the caller must
- * disambiguate) so resolution never silently traces the wrong same-named node. */
+/* A "real" callable definition: a Function/Method node with a non-empty body
+ * span (end_line > start_line). A body-less node (start_line == end_line) is an
+ * ambient declaration / signature stub — e.g. a TypeScript `.d.ts` declaration
+ * — which is a *fragment* of one logical symbol, not a distinct definition. The
+ * distinction lets pick_resolved_node union a stub with its real implementation
+ * (#546) while still treating two genuinely-different same-named functions as
+ * ambiguous rather than conflating their caller sets. */
+static bool node_is_real_callable_def(const cbm_node_t *n) {
+    if (!n->label) {
+        return false;
+    }
+    if (strcmp(n->label, "Function") != 0 && strcmp(n->label, "Method") != 0) {
+        return false;
+    }
+    return (long)n->end_line - (long)n->start_line > 0;
+}
+
+/* Pick the best-resolving node among name matches. Sets *ambiguous when the
+ * matches can't be reduced to one logical symbol, so resolution never silently
+ * traces (or conflates) the wrong same-named node:
+ *   1. the top score is shared by >1 candidate (a genuine rank/span tie), or
+ *   2. two or more *real* callable definitions share the name — distinct
+ *      implementations, not a definition plus its body-less stub(s).
+ * Rule 2 completes rule 1: without it, two same-named functions whose bodies
+ * differ in length score differently, dodge the tie, and get their caller sets
+ * unioned by bfs_union_same_name (#546) into one confidently-conflated answer.
+ * Body-less .d.ts stubs still union with their implementation (#650). */
 static int pick_resolved_node(const cbm_node_t *nodes, int count, bool *ambiguous) {
     *ambiguous = false;
     if (count <= 1) {
@@ -2712,10 +2741,17 @@ static int pick_resolved_node(const cbm_node_t *nodes, int count, bool *ambiguou
         }
     }
     int top_count = 0;
+    int real_def_count = 0;
     for (int i = 0; i < count; i++) {
         if (node_resolution_score(&nodes[i]) == best_score) {
             top_count++;
         }
+        if (node_is_real_callable_def(&nodes[i])) {
+            real_def_count++;
+        }
+    }
+    if (real_def_count > 1) {
+        *ambiguous = true;
     }
     if (top_count > 1) {
         *ambiguous = true;
@@ -2955,7 +2991,7 @@ static void free_node_contents(cbm_node_t *n) {
 /* ── Helper: read lines [start, end] from a file ─────────────── */
 
 static char *read_file_lines(const char *path, int start, int end) {
-    FILE *fp = fopen(path, "r");
+    FILE *fp = cbm_fopen(path, "r");
     if (!fp) {
         return NULL;
     }
@@ -3841,10 +3877,13 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
     const char *flag = use_regex ? "-E" : "-F";
     if (scoped) {
         if (file_pattern) {
-            snprintf(cmd, cmd_sz, "xargs grep -Hn %s --include='%s' -f '%s' < '%s' 2>/dev/null",
+            /* -0: read NUL-separated paths from the filelist so paths containing
+             * spaces stay one argument (issue #687). Pairs with the NUL separator
+             * written by write_scoped_filelist. */
+            snprintf(cmd, cmd_sz, "xargs -0 grep -Hn %s --include='%s' -f '%s' < '%s' 2>/dev/null",
                      flag, file_pattern, tmpfile, filelist);
         } else {
-            snprintf(cmd, cmd_sz, "xargs grep -Hn %s -f '%s' < '%s' 2>/dev/null", flag, tmpfile,
+            snprintf(cmd, cmd_sz, "xargs -0 grep -Hn %s -f '%s' < '%s' 2>/dev/null", flag, tmpfile,
                      filelist);
         }
     } else {
@@ -4260,10 +4299,22 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
     bool ok = false;
     if (fl) {
         for (int fi = 0; fi < indexed_count; fi++) {
-            /* Use forward slashes so xargs doesn't interpret Windows
-             * backslashes as escape sequences (e.g. \n becomes newline).
-             * Binary mode to prevent CRLF (xargs would see trailing \r). */
-            (void)fprintf(fl, "%s/%s\n", root_path, indexed_files[fi]);
+            /* Write "<root>/<file>" piece-by-piece (no fixed-size buffer, so an
+             * arbitrarily long absolute path cannot overflow). Forward slash join
+             * so xargs doesn't treat Windows backslashes as escapes; binary mode
+             * (wb) prevents CRLF translation. Record separator differs by platform:
+             *   - Unix: NUL, consumed by `xargs -0` — handles spaces in paths (a
+             *     newline separator would split plain xargs on the space).
+             *   - Windows: newline, consumed by PowerShell `Get-Content |
+             *     Select-String -LiteralPath` (NUL bytes break Get-Content). */
+            (void)fwrite(root_path, 1, strlen(root_path), fl);
+            (void)fputc('/', fl);
+            (void)fwrite(indexed_files[fi], 1, strlen(indexed_files[fi]), fl);
+#ifdef _WIN32
+            (void)fputc('\n', fl);
+#else
+            (void)fputc('\0', fl);
+#endif
         }
         (void)fclose(fl);
         ok = true;
@@ -4817,7 +4868,7 @@ static char *adr_read_legacy_file(const char *root_path) {
     }
     char adr_path[CBM_SZ_4K];
     snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md", root_path);
-    FILE *fp = fopen(adr_path, "r");
+    FILE *fp = cbm_fopen(adr_path, "r");
     if (!fp) {
         return NULL;
     }

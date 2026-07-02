@@ -243,6 +243,20 @@ static void ha_emit(const char *text) {
     yyjson_mut_doc_free(doc);
 }
 
+/* True for an absolute path we can walk up: POSIX "/..." or a Windows drive
+ * root — "X:/..." or a bare "X:" (callers normalize '\\' to '/' first).
+ * Declared in cli.h so the Windows drive-letter handling (#618) has direct
+ * regression coverage. */
+bool cbm_hook_path_is_abs(const char *d) {
+    if (!d || !d[0]) {
+        return false;
+    }
+    if (d[0] == '/') {
+        return true;
+    }
+    return isalpha((unsigned char)d[0]) && d[1] == ':' && (d[2] == '/' || d[2] == '\0');
+}
+
 /* Walk up from `start`, deriving a project name at each level and querying
  * search_graph until an indexed project is found (or the walk is exhausted).
  * Stops at the first non-error result: a valid project with zero hits is a
@@ -251,7 +265,7 @@ static char *ha_resolve_and_query(cbm_mcp_server_t *srv, const char *start, cons
     char dir[4096];
     snprintf(dir, sizeof(dir), "%s", start);
 
-    for (int level = 0; level < HA_MAX_WALKUP && dir[0] == '/'; level++) {
+    for (int level = 0; level < HA_MAX_WALKUP && cbm_hook_path_is_abs(dir); level++) {
         char *project = cbm_project_name_from_path(dir);
         if (project) {
             char *args = ha_build_args(project, token);
@@ -275,7 +289,10 @@ static char *ha_resolve_and_query(cbm_mcp_server_t *srv, const char *start, cons
         /* Not indexed at this level — climb to the parent. */
         char *slash = strrchr(dir, '/');
         if (!slash || slash == dir) {
-            break;
+            break; /* POSIX root "/" */
+        }
+        if (slash == dir + 2 && dir[1] == ':') {
+            break; /* Windows drive root "X:/" — don't strip to "X:" */
         }
         *slash = '\0';
     }
@@ -313,9 +330,9 @@ int cbm_cmd_hook_augment(void) {
     }
 
     const char *cwd = ha_obj_str(root, "cwd");
-#ifndef _WIN32
     char cwdbuf[4096];
-    if (!cwd || cwd[0] != '/') {
+#ifndef _WIN32
+    if (!cwd || !cbm_hook_path_is_abs(cwd)) {
         if (!getcwd(cwdbuf, sizeof(cwdbuf))) {
             yyjson_doc_free(doc);
             free(input);
@@ -324,10 +341,20 @@ int cbm_cmd_hook_augment(void) {
         cwd = cwdbuf;
     }
 #else
-    /* Windows: Claude Code passes cwd in the hook payload. The walk-up loop
-     * below requires POSIX-style absolute paths ('/'-prefixed), so without a
-     * usable cwd there is nothing to augment — fail open cleanly. */
-    if (!cwd || cwd[0] != '/') {
+    /* Windows: Claude Code passes an absolute drive-letter cwd in the hook
+     * payload (e.g. C:\repo). Normalize '\\' -> '/' and require an absolute
+     * path; the walk-up loop handles POSIX and "X:/..." roots alike. Without
+     * a usable cwd there is nothing to augment — fail open cleanly. */
+    if (cwd) {
+        snprintf(cwdbuf, sizeof(cwdbuf), "%s", cwd);
+        for (char *p = cwdbuf; *p; p++) {
+            if (*p == '\\') {
+                *p = '/';
+            }
+        }
+        cwd = cwdbuf;
+    }
+    if (!cwd || !cbm_hook_path_is_abs(cwd)) {
         yyjson_doc_free(doc);
         free(input);
         return 0;

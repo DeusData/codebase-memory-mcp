@@ -123,7 +123,7 @@ static int cmp_scope_by_specificity(const void *a, const void *b) {
  * (e.g. "apps/manager", or "" for repo root). Returns NULL if the file is
  * missing, malformed, or has neither a usable paths block nor a baseUrl. */
 static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char *dir_prefix) {
-    FILE *f = fopen(abs_path, "r");
+    FILE *f = cbm_fopen(abs_path, "r");
     if (!f) {
         return NULL;
     }
@@ -346,7 +346,7 @@ static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_con
     for (int i = 0; i < TS_CONFIG_NAMES_COUNT && *count < max_count; i++) {
         char check[CBM_SZ_512];
         snprintf(check, sizeof(check), "%s/%s", abs_dir, TS_CONFIG_NAMES[i]);
-        FILE *f = fopen(check, "r");
+        FILE *f = cbm_fopen(check, "r");
         if (f) {
             fclose(f);
             snprintf(out[*count].abs, sizeof(out[*count].abs), "%s", check);

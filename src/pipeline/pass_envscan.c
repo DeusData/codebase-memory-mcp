@@ -316,7 +316,7 @@ static int scan_line(const char *line, file_type_t ft, char *key_out, size_t key
 /* Scan a single file for env URL bindings. Returns number of bindings added. */
 static int scan_env_file(const char *full_path, const char *rel, file_type_t ft,
                          cbm_env_binding_t *out, int max_out) {
-    FILE *f = fopen(full_path, "r");
+    FILE *f = cbm_fopen(full_path, "r");
     if (!f) {
         return 0;
     }

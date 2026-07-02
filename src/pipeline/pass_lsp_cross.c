@@ -28,6 +28,7 @@
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
+#include "foundation/compat_fs.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,7 +68,7 @@ static bool pxc_module_is_dir(CBMLanguage lang) {
  * read_file helper in pass_calls.c / pass_parallel.c (kept local so the
  * pipeline doesn't grow a public read-file API just for this pass). */
 static char *pxc_read_file(const char *path, int *out_len) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = cbm_fopen(path, "rb");
     if (!f)
         return NULL;
     (void)fseek(f, 0, SEEK_END);

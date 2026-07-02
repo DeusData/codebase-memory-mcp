@@ -135,6 +135,18 @@ EXTRACTION_SRCS = \
 # LSP resolvers (compiled as one unit via lsp_all.c)
 LSP_SRCS = $(CBM_DIR)/lsp_all.c
 
+# Header/source dependencies of the lsp_all unity object. lsp_all.c #includes
+# every lsp/*.c resolver, which in turn include cbm.h — and CBMCall is copied
+# BY VALUE across the lsp -> pipeline boundary (cbm_calls_push). This object is
+# compiled standalone and linked in, NOT recompiled with the rest on every link,
+# so it must list the headers/sources it pulls in. Without this, a changed struct
+# layout (e.g. a new CBMCall field) leaves a stale lsp_all.o with the old layout —
+# an ODR mismatch that under-reads the by-value struct copy. Explicit because this
+# Makefile does not use compiler auto-dependency (-MMD) generation.
+LSP_UNITY_DEPS = $(CBM_DIR)/lsp_all.c \
+                 $(wildcard $(CBM_DIR)/lsp/*.c $(CBM_DIR)/lsp/*.h \
+                            $(CBM_DIR)/lsp/generated/*.c $(CBM_DIR)/*.h)
+
 # Tree-sitter runtime
 TS_RUNTIME_SRC = $(CBM_DIR)/ts_runtime.c
 
@@ -494,7 +506,7 @@ $(BUILD_DIR)/%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
 
-$(BUILD_DIR)/lsp_all.o: $(CBM_DIR)/lsp_all.c | $(BUILD_DIR)
+$(BUILD_DIR)/lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TEST) $(SANITIZE) -c -o $@ $<
 
 $(BUILD_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
@@ -598,7 +610,7 @@ $(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/prod_ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/prod_lsp_all.o: $(CBM_DIR)/lsp_all.c | $(BUILD_DIR)
+$(BUILD_DIR)/prod_lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/prod_preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)

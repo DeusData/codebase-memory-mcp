@@ -122,7 +122,7 @@ static bool artifact_path(char *buf, size_t bufsz, const char *repo_path, const 
 
 /* Read entire file into malloc'd buffer. Sets *out_len. Returns NULL on error. */
 static char *read_file_alloc(const char *path, size_t *out_len) {
-    FILE *fp = fopen(path, "rb");
+    FILE *fp = cbm_fopen(path, "rb");
     if (!fp) {
         return NULL;
     }
