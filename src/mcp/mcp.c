@@ -520,6 +520,10 @@ static const tool_def_t TOOLS[] = {
      "\"target_projects\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
      "\"description\":\"Projects to search for cross-repo links (cross-repo-intelligence mode). "
      "Use [\\\"*\\\"] for all indexed projects. Run list_projects to see available projects.\"},"
+     "\"auto_index_deps\":{\"type\":\"boolean\",\"description\":"
+     "\"Set false to skip dependency package indexing for this call. Default follows config auto_index_deps.\"},"
+     "\"auto_dep_limit\":{\"type\":\"integer\",\"description\":"
+     "\"Dependency package cap for this call. Default follows config auto_dep_limit; 0 means unlimited.\"},"
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Write compressed artifact to .codebase-memory/graph.db.zst for team sharing. "
      "Teammates can bootstrap from the artifact instead of full re-indexing.\"}"
@@ -1025,6 +1029,20 @@ bool cbm_mcp_get_bool_arg_default(const char *args_json, const char *key, bool d
     return result;
 }
 
+static bool cbm_mcp_has_arg(const char *args_json, const char *key) {
+    if (!args_json || !key) {
+        return false;
+    }
+    yyjson_doc *doc = yyjson_read(args_json, strlen(args_json), 0);
+    if (!doc) {
+        return false;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    bool found = yyjson_obj_get(root, key) != NULL;
+    yyjson_doc_free(doc);
+    return found;
+}
+
 /* Extract a JSON array of strings from args. Returns heap-allocated
  * NULL-terminated array of heap-allocated strings. Caller must free each
  * string and the array itself. Returns NULL if key absent or not array; sets
@@ -1209,14 +1227,32 @@ static bool cbm_mcp_incremental_metadata_enabled(cbm_mcp_server_t *srv) {
     return policy && strcmp(policy, "off") != 0;
 }
 
+static int cbm_mcp_effective_auto_dep_limit(cbm_mcp_server_t *srv, const char *args_json) {
+    bool enabled = cbm_config_get_bool(srv ? srv->config : NULL, CBM_CONFIG_AUTO_INDEX_DEPS, true);
+    if (cbm_mcp_has_arg(args_json, CBM_CONFIG_AUTO_INDEX_DEPS)) {
+        enabled = cbm_mcp_get_bool_arg_default(args_json, CBM_CONFIG_AUTO_INDEX_DEPS, enabled);
+    }
+    if (!enabled) {
+        return 0;
+    }
+
+    int limit = cbm_config_get_int(srv ? srv->config : NULL, CBM_CONFIG_AUTO_DEP_LIMIT,
+                                   CBM_DEFAULT_AUTO_DEP_LIMIT);
+    if (cbm_mcp_has_arg(args_json, CBM_CONFIG_AUTO_DEP_LIMIT)) {
+        limit = cbm_mcp_get_int_arg(args_json, CBM_CONFIG_AUTO_DEP_LIMIT, limit);
+    }
+    return limit <= 0 ? -1 : limit;
+}
+
 static int cbm_mcp_auto_index_deps(cbm_mcp_server_t *srv, const char *project,
-                                   const char *root_path, cbm_store_t *store, int *out_rc) {
+                                   const char *root_path, cbm_store_t *store,
+                                   int effective_dep_limit, int *out_rc) {
     if (out_rc) {
         *out_rc = CBM_STORE_OK;
     }
     int deps_reindexed =
-        cbm_dep_auto_index(project, root_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT,
-                           srv ? srv->config : NULL);
+        cbm_dep_auto_index_effective(project, root_path, store, effective_dep_limit,
+                                     srv ? srv->config : NULL);
     if (deps_reindexed > 0 && cbm_mcp_incremental_metadata_enabled(srv)) {
         int owner_rc = cbm_store_rebuild_file_delta_owners(
             store, project, CBM_PIPELINE_FILE_DELTA_GENERATION);
@@ -2689,8 +2725,10 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
                 srv->current_project = NULL;
                 store = resolve_store(srv, srv->session_project);
                 if (store) {
+                    int effective_dep_limit = cbm_mcp_effective_auto_dep_limit(srv, NULL);
                     (void)cbm_mcp_auto_index_deps(srv, srv->session_project,
-                                                  srv->session_root, store, NULL);
+                                                  srv->session_root, store,
+                                                  effective_dep_limit, NULL);
                     cbm_pagerank_compute_with_config(store, srv->session_project, srv->config);
                 }
             }
@@ -5140,8 +5178,10 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
              * Queries manifest files already indexed by pipeline step 1. */
             CBM_PROF_START(prof_index_deps);
             int dep_owner_rc = CBM_STORE_OK;
+            int effective_dep_limit = cbm_mcp_effective_auto_dep_limit(srv, args);
             int deps_reindexed =
-                cbm_mcp_auto_index_deps(srv, project_name, repo_path, store, &dep_owner_rc);
+                cbm_mcp_auto_index_deps(srv, project_name, repo_path, store,
+                                        effective_dep_limit, &dep_owner_rc);
             CBM_PROF_END("index_repository", "dep_auto_index", prof_index_deps);
 
             if (dep_owner_rc != CBM_STORE_OK) {
@@ -7511,8 +7551,10 @@ static void *autoindex_thread(void *arg) {
         /* Re-index dependencies after fresh dump */
         cbm_store_t *store = resolve_store(srv, srv->session_project);
         if (store) {
+            int effective_dep_limit = cbm_mcp_effective_auto_dep_limit(srv, NULL);
             int deps_reindexed = cbm_mcp_auto_index_deps(
-                srv, srv->session_project, srv->session_root, store, NULL);
+                srv, srv->session_project, srv->session_root, store,
+                effective_dep_limit, NULL);
             (void)cbm_pagerank_refresh_if_needed(
                 store, srv->session_project, srv->config, graph_changed, deps_reindexed,
                 publish_kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);

@@ -9,6 +9,7 @@
 #include "test_helpers.h"
 #include "test_framework.h"
 #include <cli/cli.h>
+#include <depindex/depindex.h>
 #include <mcp/mcp.h>
 #include <pipeline/pipeline.h>
 #include <store/store.h>
@@ -1688,6 +1689,125 @@ TEST(tool_index_repository_missing_path) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_index_repository_auto_index_deps_arg_disables_deps) {
+    char *repo_tmp = th_mktempdir("cbm_mcp_dep_arg_repo");
+    ASSERT_NOT_NULL(repo_tmp);
+    char repo[CBM_PATH_MAX];
+    int n = snprintf(repo, sizeof(repo), "%s", repo_tmp);
+    ASSERT(n >= 0 && (size_t)n < sizeof(repo));
+
+    char *cache_tmp = th_mktempdir("cbm_mcp_dep_arg_cache");
+    ASSERT_NOT_NULL(cache_tmp);
+    char cache[CBM_PATH_MAX];
+    n = snprintf(cache, sizeof(cache), "%s", cache_tmp);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cache));
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? cbm_strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    cbm_config_t *cfg = cbm_config_open(cache);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "true"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_DEP_LIMIT, "5"), 0);
+
+    char vendor_dir[CBM_PATH_MAX];
+    n = snprintf(vendor_dir, sizeof(vendor_dir), "%s/vendor/libdep", repo);
+    ASSERT(n >= 0 && (size_t)n < sizeof(vendor_dir));
+    ASSERT_EQ(th_mkdir_p(vendor_dir), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "Makefile"), "all:\n\tcc main.c\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int main(void) { return 0; }\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(vendor_dir, "lib.c"), "int libdep(void) { return 1; }\n"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+
+    char req[CBM_SZ_4K];
+    n = snprintf(req, sizeof(req),
+                 "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"index_repository\","
+                 "\"arguments\":{\"repo_path\":\"%s\",\"mode\":\"fast\","
+                 "\"auto_index_deps\":false}}}",
+                 repo);
+    ASSERT(n >= 0 && (size_t)n < sizeof(req));
+    char *resp = cbm_mcp_server_handle(srv, req);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "indexed"));
+    ASSERT_NULL(strstr(resp, "dependencies_indexed"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_cleanup(repo);
+    th_cleanup(cache);
+    PASS();
+}
+
+TEST(tool_index_repository_auto_dep_limit_arg_caps_deps) {
+    char *repo_tmp = th_mktempdir("cbm_mcp_dep_limit_repo");
+    ASSERT_NOT_NULL(repo_tmp);
+    char repo[CBM_PATH_MAX];
+    int n = snprintf(repo, sizeof(repo), "%s", repo_tmp);
+    ASSERT(n >= 0 && (size_t)n < sizeof(repo));
+
+    char *cache_tmp = th_mktempdir("cbm_mcp_dep_limit_cache");
+    ASSERT_NOT_NULL(cache_tmp);
+    char cache[CBM_PATH_MAX];
+    n = snprintf(cache, sizeof(cache), "%s", cache_tmp);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cache));
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? cbm_strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    cbm_config_t *cfg = cbm_config_open(cache);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "true"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_DEP_LIMIT, "5"), 0);
+
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "Makefile"), "all:\n\tcc main.c\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int main(void) { return 0; }\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "vendor/liba/liba.c"), "int liba(void) { return 1; }\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "vendor/libb/libb.c"), "int libb(void) { return 2; }\n"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+
+    char req[CBM_SZ_4K];
+    n = snprintf(req, sizeof(req),
+                 "{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"index_repository\","
+                 "\"arguments\":{\"repo_path\":\"%s\",\"mode\":\"fast\","
+                 "\"auto_dep_limit\":1}}}",
+                 repo);
+    ASSERT(n >= 0 && (size_t)n < sizeof(req));
+    char *resp = cbm_mcp_server_handle(srv, req);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "indexed"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"dependencies_indexed\\\":1"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_cleanup(repo);
+    th_cleanup(cache);
     PASS();
 }
 
@@ -3612,6 +3732,8 @@ SUITE(mcp) {
 
     /* Pipeline-dependent tool handlers */
     RUN_TEST(tool_index_repository_missing_path);
+    RUN_TEST(tool_index_repository_auto_index_deps_arg_disables_deps);
+    RUN_TEST(tool_index_repository_auto_dep_limit_arg_caps_deps);
     RUN_TEST(tool_index_repository_reports_incremental_containment_reason);
     RUN_TEST(tool_get_code_snippet_missing_qn);
     RUN_TEST(tool_get_code_snippet_not_found);
