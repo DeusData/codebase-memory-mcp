@@ -162,7 +162,7 @@ static void *http_thread(void *arg) {
 /* ── Index callback for watcher ─────────────────────────────────── */
 
 static int watcher_index_fn(const char *project_name, const char *root_path, void *user_data) {
-    (void)user_data;
+    cbm_config_t *cfg = (cbm_config_t *)user_data;
 
     /* Skip indexing if shutdown is in progress */
     if (atomic_load(&g_shutdown)) {
@@ -183,6 +183,7 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
         cbm_pipeline_unlock();
         return CBM_NOT_FOUND;
     }
+    cbm_pipeline_apply_config(p, cfg);
 
     int rc = cbm_pipeline_run(p);
     bool graph_changed = cbm_pipeline_graph_changed(p);
@@ -196,7 +197,7 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
         cbm_store_t *store = cbm_store_open(pname);
         if (store) {
             int deps_reindexed =
-                cbm_dep_auto_index(pname, root_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT, NULL);
+                cbm_dep_auto_index(pname, root_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT, cfg);
             (void)cbm_pagerank_refresh_if_needed(store, pname, NULL, graph_changed,
                                                  deps_reindexed,
                                                  publish_kind ==
@@ -557,7 +558,7 @@ int main(int argc, char **argv) {
     cbm_ui_log_init();
 
     cbm_store_t *watch_store = cbm_store_open_memory();
-    g_watcher = cbm_watcher_new(watch_store, watcher_index_fn, NULL);
+    g_watcher = cbm_watcher_new(watch_store, watcher_index_fn, runtime_config);
 
     /* Wire watcher + config into MCP server for session auto-index */
     cbm_mcp_server_set_watcher(g_server, g_watcher);

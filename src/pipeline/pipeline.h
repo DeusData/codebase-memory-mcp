@@ -51,6 +51,10 @@ typedef enum {
     CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT,
 } cbm_pipeline_publish_kind_t;
 
+/* Generation used by compatibility full/containment publishes that replace the
+ * graph as one committed view. Exact deltas reserve higher generations. */
+#define CBM_PIPELINE_FILE_DELTA_GENERATION 0
+
 /* ── Pipeline lifecycle ─────────────────────────────────────────── */
 
 /* Create a new pipeline. Caller owns the result. */

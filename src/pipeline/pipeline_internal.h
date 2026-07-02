@@ -72,9 +72,8 @@ static inline bool cbm_pipeline_label_is_import_target(const char *label) {
 #define CBM_MS_PER_SEC 1000.0
 #define CBM_US_PER_SEC_F 1e6
 
-/* Generation used by full/containment indexing paths before exact-delta
- * generation reservation is active. Matches the store schema default. */
-enum { CBM_PIPELINE_COMPAT_GENERATION = 0 };
+/* Internal alias retained for the existing exact-delta code vocabulary. */
+enum { CBM_PIPELINE_COMPAT_GENERATION = CBM_PIPELINE_FILE_DELTA_GENERATION };
 
 enum {
     CBM_CALL_ARG_EXPR_MAX = 120,
