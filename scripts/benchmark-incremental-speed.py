@@ -35,6 +35,10 @@ DEFAULT_OVERHEAD_TOOL = "index_status"
 PROJECT_DB_SUFFIX = ".db"
 CONFIG_DB_NAME = "_config.db"
 LOG_TAIL_LINES = 24
+FAILURE_TAIL_LINES = 80
+FAILURE_ARTIFACT_DIRNAME = "failures"
+FAILURE_FALLBACK_DIRNAME = "cbm-benchmark-failures"
+FAILURE_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 MCP_INIT_PROTOCOL_VERSION = "2024-11-05"
 MATRIX_SCENARIOS_DEFAULT = "go_modify_1,go_modify_2,go_create,go_delete,go_rename,go_new_folder,route_decorator,python_reexport"
 SELF_DOGFOOD_SCENARIOS_DEFAULT = "noop,one_source_file,route_handler,store_pipeline_batch,multi_file_small"
@@ -45,6 +49,12 @@ PUBLISH_FULL = "full"
 PUBLISH_INCREMENTAL_NOOP = "incremental_noop"
 PUBLISH_INCREMENTAL_EXACT = "incremental_exact"
 PUBLISH_INCREMENTAL_CONTAINMENT = "incremental_containment"
+
+
+class BenchmarkCommandError(RuntimeError):
+    def __init__(self, message: str, detail: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.detail = detail
 
 
 def now_ms() -> float:
@@ -126,6 +136,64 @@ def command_result(
         timeout=timeout,
     )
     return proc, now_ms() - start
+
+
+def text_tail(text: str, max_lines: int = FAILURE_TAIL_LINES) -> list[str]:
+    lines = text.splitlines()
+    return lines[-max_lines:]
+
+
+def failure_artifact_dir(env: dict[str, str]) -> Path:
+    cache_dir = env.get("CBM_CACHE_DIR")
+    if cache_dir:
+        return Path(cache_dir).expanduser().parent / FAILURE_ARTIFACT_DIRNAME
+    return Path(tempfile.gettempdir()) / FAILURE_FALLBACK_DIRNAME
+
+
+def command_failure(
+    label: str,
+    cmd: list[str],
+    env: dict[str, str],
+    proc: subprocess.CompletedProcess[str],
+    elapsed_ms: float,
+) -> BenchmarkCommandError:
+    safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("_") or "command"
+    stamp = datetime.now(timezone.utc).strftime(FAILURE_TIMESTAMP_FORMAT)
+    prefix = failure_artifact_dir(env) / f"{stamp}-{safe_label}"
+    stdout_path = Path(f"{prefix}.stdout.txt")
+    stderr_path = Path(f"{prefix}.stderr.txt")
+    meta_path = Path(f"{prefix}.meta.json")
+
+    write_text(stdout_path, proc.stdout)
+    write_text(stderr_path, proc.stderr)
+    detail: dict[str, Any] = {
+        "label": label,
+        "returncode": proc.returncode,
+        "elapsed_ms": round(elapsed_ms, 3),
+        "stdout_bytes": len(proc.stdout.encode("utf-8")),
+        "stderr_bytes": len(proc.stderr.encode("utf-8")),
+        "stdout_tail": text_tail(proc.stdout),
+        "stderr_tail": text_tail(proc.stderr),
+        "artifacts": {
+            "stdout": str(stdout_path),
+            "stderr": str(stderr_path),
+            "meta": str(meta_path),
+        },
+    }
+    write_text(
+        meta_path,
+        json.dumps({"cmd": cmd, **detail}, indent=2, sort_keys=True) + "\n",
+    )
+    return BenchmarkCommandError(
+        f"{label} failed with rc={proc.returncode}; artifacts={detail['artifacts']}",
+        detail,
+    )
+
+
+def record_report_error(report: dict[str, Any], exc: Exception) -> None:
+    report["error"] = f"{type(exc).__name__}: {exc}"
+    if isinstance(exc, BenchmarkCommandError):
+        report["error_detail"] = exc.detail
 
 
 def command_stdout(cmd: list[str], timeout: int, cwd: Path | None = None) -> str:
@@ -360,9 +428,10 @@ def indexed_work_elapsed_ms(logged_elapsed_ms: dict[str, int | None]) -> int | N
 
 
 def run_config_set(binary: Path, env: dict[str, str], key: str, value: str, timeout: int) -> None:
-    proc, _ = command_result([str(binary), "config", "set", key, value], env, timeout)
+    cmd = [str(binary), "config", "set", key, value]
+    proc, elapsed_ms = command_result(cmd, env, timeout)
     if proc.returncode != 0:
-        raise RuntimeError(f"config set {key} failed: {proc.stderr.strip()}")
+        raise command_failure(f"config_set_{key}", cmd, env, proc, elapsed_ms)
 
 
 def build_index_result(
@@ -420,13 +489,14 @@ def run_index(
     include_logs: bool,
 ) -> dict[str, Any]:
     args = json.dumps({"repo_path": str(repo_dir), "mode": "fast"})
+    cmd = [str(binary), "cli", "--json", "index_repository", args]
     proc, elapsed_ms = command_result(
-        [str(binary), "cli", "--json", "index_repository", args],
+        cmd,
         env,
         timeout,
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"index_repository failed: {proc.stderr.strip()}")
+        raise command_failure("index_repository", cmd, env, proc, elapsed_ms)
     data = unwrap_cli_json(proc.stdout)
     return build_index_result(
         data, proc.stderr, len(proc.stdout.encode("utf-8")), elapsed_ms, include_logs
@@ -466,13 +536,10 @@ def run_cli_tool_probe(
     timeout: int,
     include_logs: bool,
 ) -> dict[str, Any]:
-    proc, elapsed_ms = command_result(
-        [str(binary), "cli", "--json", tool_name, "{}"],
-        env,
-        timeout,
-    )
+    cmd = [str(binary), "cli", "--json", tool_name, "{}"]
+    proc, elapsed_ms = command_result(cmd, env, timeout)
     if proc.returncode != 0:
-        raise RuntimeError(f"{tool_name} probe failed: {proc.stderr.strip()}")
+        raise command_failure(f"{tool_name}_probe", cmd, env, proc, elapsed_ms)
     data = unwrap_cli_json(proc.stdout)
     return build_tool_probe_result(
         data, proc.stderr, len(proc.stdout.encode("utf-8")), elapsed_ms, include_logs
@@ -516,13 +583,10 @@ def run_cli_tool_call(
     timeout: int,
     include_logs: bool,
 ) -> dict[str, Any]:
-    proc, elapsed_ms = command_result(
-        [str(binary), "cli", "--json", tool_name, json.dumps(arguments, separators=(",", ":"))],
-        env,
-        timeout,
-    )
+    cmd = [str(binary), "cli", "--json", tool_name, json.dumps(arguments, separators=(",", ":"))]
+    proc, elapsed_ms = command_result(cmd, env, timeout)
     if proc.returncode != 0:
-        raise RuntimeError(f"{tool_name} call failed: {proc.stderr.strip()}")
+        raise command_failure(f"{tool_name}_call", cmd, env, proc, elapsed_ms)
     data = unwrap_cli_json(proc.stdout)
     return build_tool_call_result(
         data, proc.stderr, len(proc.stdout.encode("utf-8")), elapsed_ms, include_logs
@@ -1107,7 +1171,7 @@ def run_matrix(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], 
         }
         exit_code = 0 if report["derived"]["passed"] else 1
     except Exception as exc:
-        report["error"] = f"{type(exc).__name__}: {exc}"
+        record_report_error(report, exc)
         exit_code = 1
     finally:
         if auto_root and not args.keep_work_root:
@@ -1253,7 +1317,7 @@ def run_self_dogfood(args: argparse.Namespace, binary: Path) -> tuple[dict[str, 
         }
         exit_code = 0 if report["derived"]["passed"] else 1
     except Exception as exc:
-        report["error"] = f"{type(exc).__name__}: {exc}"
+        record_report_error(report, exc)
         exit_code = 1
     finally:
         if auto_root and not args.keep_work_root:
@@ -1447,7 +1511,7 @@ def main() -> int:
         )
         exit_code = 0 if passed else 1
     except Exception as exc:
-        report["error"] = f"{type(exc).__name__}: {exc}"
+        record_report_error(report, exc)
         exit_code = 1
     finally:
         if auto_root and not args.keep_work_root:
