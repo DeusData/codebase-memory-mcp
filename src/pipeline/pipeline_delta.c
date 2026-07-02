@@ -905,11 +905,11 @@ static bool delta_batch_contains_edge(const cbm_pipeline_file_delta_t *const *de
     return false;
 }
 
-static bool delta_unowned_inbound_edge_is_regenerated(
+static bool delta_inbound_edge_is_regenerated_by_batch(
     const cbm_store_inbound_edge_t *edge, const cbm_pipeline_file_delta_t *const *deltas,
     int delta_count) {
-    return edge && edge->source_rel_path && edge->source_rel_path[0] == '\0' && edge->type &&
-           strcmp(edge->type, cbm_delta_edge_contains_file) == 0 &&
+    return edge && edge->source_rel_path && edge->source_rel_path[0] == '\0' &&
+           delta_path_in_batch(edge->edge_rel_path, deltas, delta_count) &&
            delta_batch_contains_edge(deltas, delta_count, edge->source_qn, edge->target_qn,
                                      edge->type);
 }
@@ -936,7 +936,7 @@ static bool delta_inbound_edges_supported(cbm_store_t *store,
     bool ok = true;
     for (int i = 0; i < edge_count; i++) {
         if (!delta_path_in_batch(edges[i].source_rel_path, deltas, delta_count) &&
-            !delta_unowned_inbound_edge_is_regenerated(&edges[i], deltas, delta_count) &&
+            !delta_inbound_edge_is_regenerated_by_batch(&edges[i], deltas, delta_count) &&
             !delta_owned_inbound_edge_is_deleted(&edges[i], delta)) {
             ok = false;
             break;
