@@ -22,8 +22,20 @@ static inline bool cbm_str_contains_raw(const char *s, const char *sub) {
 }
 
 static char log_buf[4096];
+static char sink_buf[4096];
 static int saved_stderr;
 static int pipe_fds[2];
+
+static void test_log_sink(const char *line) {
+    if (!line) {
+        return;
+    }
+    size_t used = strlen(sink_buf);
+    if (used >= sizeof(sink_buf) - 1) {
+        return;
+    }
+    snprintf(sink_buf + used, sizeof(sink_buf) - used, "%s\n", line);
+}
 
 static void capture_start(void) {
     fflush(stderr);
@@ -112,6 +124,40 @@ TEST(log_int_helper) {
     PASS();
 }
 
+TEST(log_profile_mirror_is_opt_in_and_prof_only) {
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_profile_stderr_mirror(false);
+    sink_buf[0] = '\0';
+    cbm_log_set_sink(test_log_sink);
+
+    capture_start();
+    cbm_log_info("prof", "phase", "unit", "sub", "sink_only");
+    const char *output = capture_end();
+    ASSERT_EQ(strlen(output), 0);
+    ASSERT(cbm_str_contains_raw(sink_buf, "msg=prof"));
+
+    sink_buf[0] = '\0';
+    cbm_log_set_profile_stderr_mirror(true);
+    capture_start();
+    cbm_log_info("prof", "phase", "unit", "sub", "mirrored");
+    output = capture_end();
+    ASSERT(cbm_str_contains_raw(output, "msg=prof"));
+    ASSERT(cbm_str_contains_raw(output, "sub=mirrored"));
+    ASSERT(cbm_str_contains_raw(sink_buf, "msg=prof"));
+
+    sink_buf[0] = '\0';
+    capture_start();
+    cbm_log_info("not.prof", "key", "value");
+    output = capture_end();
+    ASSERT_EQ(strlen(output), 0);
+    ASSERT(cbm_str_contains_raw(sink_buf, "msg=not.prof"));
+
+    cbm_log_set_sink(NULL);
+    cbm_log_set_profile_stderr_mirror(false);
+    cbm_log_set_level(CBM_LOG_INFO);
+    PASS();
+}
+
 /* CBM_LOG_LEVEL parsing — distilled from #414 (closes #413). */
 TEST(log_level_from_env_textual) {
     cbm_setenv("CBM_LOG_LEVEL", "error", 1);
@@ -191,6 +237,7 @@ SUITE(log) {
     RUN_TEST(log_filtered_by_level);
     RUN_TEST(log_error_output);
     RUN_TEST(log_int_helper);
+    RUN_TEST(log_profile_mirror_is_opt_in_and_prof_only);
     RUN_TEST(log_level_from_env_textual);
     RUN_TEST(log_level_from_env_numeric);
     RUN_TEST(log_level_from_env_invalid_ignored);

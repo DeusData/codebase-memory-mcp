@@ -23,11 +23,13 @@ void cbm_profile_init(void) {
     const char *env = getenv("CBM_PROFILE");
     if (env && env[0] != '\0' && env[0] != '0') {
         cbm_profile_active = true;
+        cbm_log_set_profile_stderr_mirror(true);
     }
 }
 
 void cbm_profile_enable(void) {
     cbm_profile_active = true;
+    cbm_log_set_profile_stderr_mirror(true);
 }
 
 void cbm_profile_now(struct timespec *ts) {
