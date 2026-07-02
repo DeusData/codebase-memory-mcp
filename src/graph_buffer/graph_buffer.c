@@ -56,6 +56,13 @@ static bool cbm_gbuf_test_fail_before_replace_enabled(void) {
     return val && val[0] != '\0' && strcmp(val, cbm_test_env_disabled) != 0;
 }
 
+static bool cbm_gbuf_test_fail_before_flush_commit_enabled(void) {
+    char buf[CBM_SZ_16];
+    const char *val =
+        cbm_safe_getenv(CBM_TEST_FAIL_GBUF_FLUSH_BEFORE_COMMIT, buf, sizeof(buf), NULL);
+    return val && val[0] != '\0' && strcmp(val, cbm_test_env_disabled) != 0;
+}
+
 static inline void *intptr_to_ptr(intptr_t v) {
     void *p;
     memcpy(&p, &v, sizeof(p));
@@ -2041,31 +2048,24 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
         return rc;
     }
 
-    phase = "upsert_project";
-    rc = cbm_store_upsert_project(store, gb->project, gb->root_path);
-    if (rc != CBM_STORE_OK) {
-        goto fail;
-    }
-
     phase = "drop_indexes";
     rc = cbm_store_drop_indexes(store);
     if (rc != CBM_STORE_OK) {
         goto fail;
     }
 
-    /* Delete existing project data */
-    phase = "delete_project_edges";
-    rc = cbm_store_delete_edges_by_project(store, gb->project);
+    /* Delete the project row so ON DELETE CASCADE clears graph and freshness
+     * tables owned by this project before the replacement graph is inserted.
+     * This preserves sibling projects, including dependency subprojects; caller
+     * code still owns contentless FTS rebuilds and user-authored project memory. */
+    phase = "delete_project";
+    rc = cbm_store_delete_project(store, gb->project);
     if (rc != CBM_STORE_OK) {
         goto fail;
     }
-    phase = "delete_touching_edges";
-    rc = cbm_store_delete_edges_touching_project_nodes(store, gb->project);
-    if (rc != CBM_STORE_OK) {
-        goto fail;
-    }
-    phase = "delete_project_nodes";
-    rc = cbm_store_delete_nodes_by_project(store, gb->project);
+
+    phase = "upsert_project";
+    rc = cbm_store_upsert_project(store, gb->project, gb->root_path);
     if (rc != CBM_STORE_OK) {
         goto fail;
     }
@@ -2136,6 +2136,11 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     phase = "create_indexes";
     rc = cbm_store_create_indexes(store);
     if (rc != CBM_STORE_OK) {
+        goto fail;
+    }
+    if (cbm_gbuf_test_fail_before_flush_commit_enabled()) {
+        phase = "test_fail_before_commit";
+        rc = GB_ERR;
         goto fail;
     }
     phase = "commit";
