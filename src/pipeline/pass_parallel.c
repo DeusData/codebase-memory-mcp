@@ -425,6 +425,7 @@ typedef struct {
 
     cbm_pkg_entries_t *pkg_entries; /* per-worker manifest arrays (separate allocation) */
     _Atomic int64_t retained_bytes; /* total source bytes copied into result arenas */
+    bool extract_macros;
 } extract_ctx_t;
 
 /* Insert one definition node (and its route if present) into the local gbuf. */
@@ -527,8 +528,9 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
 
         uint64_t file_t0 = extract_now_ns();
 
-        CBMFileResult *result = cbm_extract_file(source, source_len, fi->language, ec->project_name,
-                                                 fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL);
+        CBMFileResult *result = cbm_extract_file_with_options(
+            source, source_len, fi->language, ec->project_name, fi->rel_path, CBM_EXTRACT_BUDGET,
+            NULL, NULL, ec->extract_macros);
 
         uint64_t file_elapsed_ms = (extract_now_ns() - file_t0) / PP_USEC_PER_MS;
 
@@ -709,6 +711,7 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .shared_ids = shared_ids,
         .cancelled = ctx->cancelled,
         .pkg_entries = pkg_entries,
+        .extract_macros = cbm_pipeline_mode_extracts_macro_nodes(ctx->mode),
     };
     atomic_init(&ec.next_worker_id, 0);
     atomic_init(&ec.next_file_idx, 0);

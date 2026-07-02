@@ -77,6 +77,28 @@ static bool has_strategy_with_key(const cbm_gbuf_edge_t **edges, int count, cons
     return false;
 }
 
+static int count_strategy(const cbm_gbuf_edge_t **edges, int count, const char *strategy) {
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"strategy\":\"%s\"", strategy);
+    int found = 0;
+    for (int i = 0; i < count; i++) {
+        if (edges[i]->properties_json && strstr(edges[i]->properties_json, needle)) {
+            found++;
+        }
+    }
+    return found;
+}
+
+static int count_prop_substr(const cbm_gbuf_edge_t **edges, int count, const char *needle) {
+    int found = 0;
+    for (int i = 0; i < count; i++) {
+        if (edges[i]->properties_json && strstr(edges[i]->properties_json, needle)) {
+            found++;
+        }
+    }
+    return found;
+}
+
 /* Recursive remove */
 static void rm_rf(const char *path) {
     th_rmtree(path);
@@ -232,6 +254,95 @@ TEST(configlink_dep_import_package_json) {
     PASS();
 }
 
+TEST(configlink_recompute_replaces_stale_derived_edges) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/test");
+
+    int64_t cfg_id = cbm_gbuf_upsert_node(gb, "Variable", "service_timeout",
+                                          "test.config.service_timeout", "config.toml", 0, 0,
+                                          NULL);
+    int64_t current_id = cbm_gbuf_upsert_node(gb, "Function", "getServiceTimeout",
+                                              "test.main.getServiceTimeout", "main.go", 0, 0,
+                                              NULL);
+    int64_t stale_key_id = cbm_gbuf_upsert_node(gb, "Function", "oldLineComment",
+                                                "test.old.oldLineComment", "old.c", 0, 0, NULL);
+    int64_t stale_dep_id = cbm_gbuf_upsert_node(gb, "Module", "old_dep_source",
+                                                "test.old.dep_source", "old.js", 0, 0, NULL);
+    int64_t direct_id = cbm_gbuf_upsert_node(gb, "Function", "readEnv",
+                                             "test.env.readEnv", "env.c", 0, 0, NULL);
+    ASSERT_GT(cfg_id, 0);
+    ASSERT_GT(current_id, 0);
+    ASSERT_GT(stale_key_id, 0);
+    ASSERT_GT(stale_dep_id, 0);
+    ASSERT_GT(direct_id, 0);
+
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, stale_key_id, cfg_id, "CONFIGURES",
+                                   "{\"strategy\":\"key_symbol\",\"confidence\":0.75,"
+                                   "\"config_key\":\"line_comment\"}"),
+              0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, stale_dep_id, cfg_id, "CONFIGURES",
+                                   "{\"strategy\":\"dependency_import\",\"confidence\":0.95,"
+                                   "\"dep_name\":\"old\"}"),
+              0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, direct_id, cfg_id, "CONFIGURES",
+                                   "{\"source\":\"env_access\"}"),
+              0);
+
+    int n = run_configlink(gb, "test", NULL);
+    ASSERT_EQ(n, 1);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_type(gb, "CONFIGURES", &edges, &count);
+    ASSERT_EQ(count_strategy(edges, count, "key_symbol"), 1);
+    ASSERT_EQ(count_strategy(edges, count, "dependency_import"), 0);
+    ASSERT_TRUE(has_strategy_with_key(edges, count, "key_symbol", "service_timeout"));
+    ASSERT_EQ(count_prop_substr(edges, count, "\"source\":\"env_access\""), 1);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(configlink_key_symbol_searches_beyond_former_code_cap) {
+    enum {
+        CONFIGLINK_FORMER_CODE_ENTRY_CAP = 8192,
+        CONFIGLINK_CAP_REGRESSION_FILLER_COUNT = CONFIGLINK_FORMER_CODE_ENTRY_CAP + CBM_SZ_8,
+    };
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t cfg_id = cbm_gbuf_upsert_node(gb, "Variable", "target_value",
+                                          "test.config.target_value", "config.toml", 0, 0,
+                                          NULL);
+    ASSERT_GT(cfg_id, 0);
+
+    for (int i = 0; i < CONFIGLINK_CAP_REGRESSION_FILLER_COUNT; i++) {
+        char name[CBM_SZ_64];
+        char qn[CBM_SZ_128];
+        int nn = snprintf(name, sizeof(name), "filler_%04d", i);
+        int qn_n = snprintf(qn, sizeof(qn), "test.main.filler_%04d", i);
+        ASSERT_GT(nn, 0);
+        ASSERT_LT((size_t)nn, sizeof(name));
+        ASSERT_GT(qn_n, 0);
+        ASSERT_LT((size_t)qn_n, sizeof(qn));
+        ASSERT_GT(cbm_gbuf_upsert_node(gb, "Function", name, qn, "main.go", 0, 0, NULL), 0);
+    }
+
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Function", "getTargetValue",
+                                   "test.main.getTargetValue", "main.go", 0, 0, NULL),
+              0);
+
+    int n = run_configlink(gb, "test", NULL);
+    ASSERT_EQ(n, 1);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_type(gb, "CONFIGURES", &edges, &count);
+    ASSERT_TRUE(has_strategy_with_key(edges, count, "key_symbol", "target_value"));
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* ── Strategy 3: Config File Path → Code String Reference ───────── */
 
 /* Go: TestConfigFileRef_ExactPath
@@ -302,6 +413,8 @@ SUITE(configlink) {
 
     /* Strategy 2: Dependency → Import */
     RUN_TEST(configlink_dep_import_package_json);
+    RUN_TEST(configlink_recompute_replaces_stale_derived_edges);
+    RUN_TEST(configlink_key_symbol_searches_beyond_former_code_cap);
 
     /* Strategy 3: File Path → Reference */
     RUN_TEST(configlink_file_ref_no_false_positive);

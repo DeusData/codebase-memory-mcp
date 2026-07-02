@@ -181,6 +181,30 @@ TEST(extract_cpp_macros_issue375) {
     PASS();
 }
 
+TEST(extract_c_macro_option_is_per_call) {
+    const char *src = "#define FAST_SKIP_ME 1\n"
+                      "int main(void) { return FAST_SKIP_ME; }\n";
+
+    cbm_set_macro_extraction(1);
+    CBMFileResult *full = cbm_extract_file_with_options(
+        src, (int)strlen(src), CBM_LANG_C, "p", "macro_option.c", 0, NULL, NULL, true);
+    ASSERT_NOT_NULL(full);
+    ASSERT_FALSE(full->has_error);
+    ASSERT(has_def(full, "Macro", "FAST_SKIP_ME"));
+    ASSERT(has_def(full, "Function", "main"));
+    cbm_free_result(full);
+
+    CBMFileResult *fast = cbm_extract_file_with_options(
+        src, (int)strlen(src), CBM_LANG_C, "p", "macro_option.c", 0, NULL, NULL, false);
+    ASSERT_NOT_NULL(fast);
+    ASSERT_FALSE(fast->has_error);
+    ASSERT_FALSE(has_def(fast, "Macro", "FAST_SKIP_ME"));
+    ASSERT(has_def(fast, "Function", "main"));
+    cbm_free_result(fast);
+
+    PASS();
+}
+
 /* --- GDScript: AST -> graph visitor (Godot, #186) --- */
 TEST(extract_gdscript_issue186) {
     CBMFileResult *r = extract("extends Node\n"
@@ -3411,6 +3435,7 @@ SUITE(extraction) {
     RUN_TEST(extract_ts_factory_object_methods_issue341);
     RUN_TEST(extract_c_macros_issue375);
     RUN_TEST(extract_cpp_macros_issue375);
+    RUN_TEST(extract_c_macro_option_is_per_call);
     RUN_TEST(extract_gdscript_issue186);
     RUN_TEST(extract_powershell_issue35);
     RUN_TEST(extract_luau_issue39);

@@ -496,6 +496,7 @@ typedef struct {
     const char *rel_path;
     const char *module_qn;
     TSNode root;
+    bool extract_macros;                   // C/C++ #define Macro nodes for full mode
     EFCache ef_cache;                      // enclosing function cache
     const char *enclosing_class_qn;        // for nested class QN computation
     CBMStringConstantMap string_constants; // module-level NAME = "value" pairs
@@ -524,6 +525,10 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
                                 const char **extra_defines, // NULL-terminated, or NULL
                                 const char **include_paths  // NULL-terminated, or NULL
 );
+CBMFileResult *cbm_extract_file_with_options(
+    const char *source, int source_len, CBMLanguage language, const char *project,
+    const char *rel_path, int64_t timeout_micros, const char **extra_defines,
+    const char **include_paths, bool extract_macros);
 
 // Free all memory associated with a result.
 void cbm_free_result(CBMFileResult *result);
@@ -557,9 +562,8 @@ uint64_t cbm_get_preprocess_ns(void);
 uint64_t cbm_get_files_preprocessed(void);
 void cbm_reset_profile(void);
 
-// Toggle C/C++ preprocessor Macro-node extraction (#375). The pipeline enables
-// it only for full/advanced index modes (it dominates extraction on macro-dense
-// codebases). Default ON. Set before extraction; read-only during.
+// Toggle the default for direct cbm_extract_file() callers. Pipelines pass this
+// explicitly via cbm_extract_file_with_options(), avoiding cross-pipeline races.
 void cbm_set_macro_extraction(int enabled);
 int cbm_macro_extraction_enabled(void);
 

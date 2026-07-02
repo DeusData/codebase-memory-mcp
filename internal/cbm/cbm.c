@@ -39,12 +39,9 @@ static _Atomic uint64_t total_preprocess_ns = 0;
 static _Atomic uint64_t total_files_preprocessed = 0;
 static _Atomic uint64_t total_files = 0;
 
-// C/C++ preprocessor #define macros are extracted as Macro nodes (#375). On a
-// macro-dense codebase (e.g. the Linux kernel: ~2.4M macros, 49% of all nodes)
-// this is the dominant extraction cost, so it is gated to the full/advanced
-// index modes. Default ON to preserve behavior for direct callers/tests; the
-// pipeline sets it from the index mode before extraction. Set once pre-extract,
-// read-only during, so a relaxed atomic is sufficient.
+// Default for direct cbm_extract_file() callers. Pipelines pass this per call
+// via cbm_extract_file_with_options(), because MCP can run multiple pipelines
+// with different modes in the same process.
 static _Atomic int g_extract_macros = 1;
 void cbm_set_macro_extraction(int enabled) {
     atomic_store_explicit(&g_extract_macros, enabled ? 1 : 0, memory_order_relaxed);
@@ -514,6 +511,16 @@ static int count_params_from_signature(const char *sig) {
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, const char **include_paths) {
+    return cbm_extract_file_with_options(source, source_len, language, project, rel_path,
+                                         timeout_micros, extra_defines, include_paths,
+                                         cbm_macro_extraction_enabled() != 0);
+}
+
+CBMFileResult *cbm_extract_file_with_options(const char *source, int source_len,
+                                             CBMLanguage language, const char *project,
+                                             const char *rel_path, int64_t timeout_micros,
+                                             const char **extra_defines,
+                                             const char **include_paths, bool extract_macros) {
     // Allocate result on heap (arena inside for all string data)
     enum { SINGLE = 1 };
     CBMFileResult *result = (CBMFileResult *)calloc(SINGLE, sizeof(CBMFileResult));
@@ -597,6 +604,7 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
         .rel_path = rel_path,
         .module_qn = result->module_qn,
         .root = root,
+        .extract_macros = extract_macros,
     };
 
     // Run extractors: defs + imports use separate walks (unique recursion patterns),
@@ -708,6 +716,7 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
                         .rel_path = rel_path,
                         .module_qn = result->module_qn,
                         .root = pp_root,
+                        .extract_macros = extract_macros,
                     };
                     // Re-run unified extraction on expanded source.
                     // This adds macro-expanded calls; duplicates with original calls are

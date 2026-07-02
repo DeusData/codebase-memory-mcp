@@ -1322,11 +1322,6 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
     cbm_path_alias_collection_t *path_aliases = NULL;
 
-    /* C/C++ #define Macro nodes (#375) dominate extraction on macro-dense repos
-     * (≈49% of nodes on the Linux kernel), so gate them to full mode — moderate
-     * and fast skip them entirely. Set before any extraction dispatch. */
-    cbm_set_macro_extraction(p->mode == CBM_MODE_FULL);
-
     /* Load user-defined extension overrides (fail-open: NULL on error) */
     CBM_PROF_START(t_userconfig);
     p->userconfig = cbm_userconfig_load(p->repo_path);

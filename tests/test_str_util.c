@@ -368,6 +368,11 @@ TEST(path_base_trailing_slash) {
     PASS();
 }
 
+TEST(path_base_backslash_separator) {
+    ASSERT_STR_EQ(cbm_path_base("dir\\package.json"), "package.json");
+    PASS();
+}
+
 /* ── validate_shell_arg tests ─────────────────────────────────── */
 
 TEST(validate_shell_arg_null) {
@@ -536,6 +541,7 @@ SUITE(str_util) {
     RUN_TEST(path_base_empty);
     RUN_TEST(path_base_just_filename);
     RUN_TEST(path_base_trailing_slash);
+    RUN_TEST(path_base_backslash_separator);
     /* validate_shell_arg */
     RUN_TEST(validate_shell_arg_null);
     RUN_TEST(validate_shell_arg_safe);

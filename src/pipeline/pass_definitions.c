@@ -3,7 +3,7 @@
  *
  * For each discovered file:
  *   1. Read source content from disk
- *   2. Call cbm_extract_file() to get defs, calls, imports
+ *   2. Call cbm_extract_file_with_options() to get defs, calls, imports
  *   3. Create Function/Class/Method/Variable/Module nodes in graph buffer
  *   4. Register callables in the function registry
  *   5. Store import maps and call sites for later passes
@@ -461,10 +461,10 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         }
 
         /* Extract */
-        CBMFileResult *result =
-            cbm_extract_file(source, source_len, lang, ctx->project_name, rel, CBM_EXTRACT_BUDGET,
-                             NULL, NULL /* no extra defines or include paths */
-            );
+        CBMFileResult *result = cbm_extract_file_with_options(
+            source, source_len, lang, ctx->project_name, rel, CBM_EXTRACT_BUDGET, NULL,
+            NULL /* no extra defines or include paths */,
+            cbm_pipeline_mode_extracts_macro_nodes(ctx->mode));
         free(source);
 
         if (!result) {

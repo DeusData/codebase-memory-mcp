@@ -20,7 +20,7 @@ char *cbm_path_join_n(CBMArena *a, const char **parts, int n);
 /* Get the file extension (without dot). Returns "" if none. */
 const char *cbm_path_ext(const char *path);
 
-/* Get the base name (after last '/'). Returns path if no '/'. */
+/* Get the base name (after last '/' or '\\'). Returns path if no separator. */
 const char *cbm_path_base(const char *path);
 
 /* Get the directory part (before last '/'). Returns "." if no '/'. */
