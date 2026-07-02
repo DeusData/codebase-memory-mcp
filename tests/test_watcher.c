@@ -34,6 +34,19 @@ static const char *wt_path(char *buf, size_t n, const char *dir, const char *rel
     return buf;
 }
 
+static bool wt_mktempdir(char *buf, size_t n, const char *prefix) {
+    char *path = th_mktempdir(prefix);
+    if (!path) {
+        return false;
+    }
+    int written = snprintf(buf, n, "%s", path);
+    if (written < 0 || (size_t)written >= n) {
+        th_rmtree(path);
+        return false;
+    }
+    return true;
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  ADAPTIVE INTERVAL
  * ══════════════════════════════════════════════════════════════════ */
@@ -259,6 +272,28 @@ static int index_callback(const char *name, const char *path, void *ud) {
     return 0;
 }
 
+typedef struct {
+    cbm_watcher_t *watcher;
+    const char *replacement_path;
+    int calls;
+} watcher_mutating_cb_t;
+
+static int unwatching_index_callback(const char *name, const char *path, void *ud) {
+    (void)path;
+    watcher_mutating_cb_t *ctx = (watcher_mutating_cb_t *)ud;
+    ctx->calls++;
+    cbm_watcher_unwatch(ctx->watcher, name);
+    return 0;
+}
+
+static int replacing_index_callback(const char *name, const char *path, void *ud) {
+    (void)path;
+    watcher_mutating_cb_t *ctx = (watcher_mutating_cb_t *)ud;
+    ctx->calls++;
+    cbm_watcher_watch(ctx->watcher, name, ctx->replacement_path);
+    return 0;
+}
+
 TEST(watcher_poll_no_projects) {
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -268,6 +303,78 @@ TEST(watcher_poll_no_projects) {
 
     cbm_watcher_free(w);
     cbm_store_close(store);
+    PASS();
+}
+
+TEST(watcher_unwatch_during_poll_callback_no_uaf) {
+    char tmpdir[CBM_SZ_256];
+    if (!wt_mktempdir(tmpdir, sizeof(tmpdir), "cbm_watcher_unwatch_cb")) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[CBM_SZ_512]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    watcher_mutating_cb_t cb = {0};
+    cbm_watcher_t *w = cbm_watcher_new(NULL, unwatching_index_callback, &cb);
+    cb.watcher = w;
+    cbm_watcher_watch(w, "unwatch-cb", tmpdir);
+    cbm_watcher_poll_once(w); /* baseline */
+
+    { char p[CBM_SZ_512]; th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "changed\n"); }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m changed");
+
+    cbm_watcher_touch(w, "unwatch-cb");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(cb.calls, 1);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+
+    cbm_watcher_free(w);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(watcher_replace_during_poll_callback_no_uaf) {
+    char tmpdir_a[CBM_SZ_256];
+    char tmpdir_b[CBM_SZ_256];
+    bool made_a = wt_mktempdir(tmpdir_a, sizeof(tmpdir_a), "cbm_watcher_replace_a");
+    bool made_b = wt_mktempdir(tmpdir_b, sizeof(tmpdir_b), "cbm_watcher_replace_b");
+    if (!made_a || !made_b) {
+        if (made_a) th_rmtree(tmpdir_a);
+        if (made_b) th_rmtree(tmpdir_b);
+        FAIL("cbm_mkdtemp failed");
+    }
+    if (wt_git(tmpdir_a, "init -q") != 0) {
+        th_rmtree(tmpdir_a);
+        th_rmtree(tmpdir_b);
+        FAIL("git init failed");
+    }
+    { char p[CBM_SZ_512]; th_write_file(wt_path(p, sizeof(p), tmpdir_a, "file.txt"), "hello\n"); }
+    wt_git(tmpdir_a, "add file.txt");
+    wt_git(tmpdir_a, "commit -q -m init");
+
+    watcher_mutating_cb_t cb = {.replacement_path = tmpdir_b};
+    cbm_watcher_t *w = cbm_watcher_new(NULL, replacing_index_callback, &cb);
+    cb.watcher = w;
+    cbm_watcher_watch(w, "replace-cb", tmpdir_a);
+    cbm_watcher_poll_once(w); /* baseline */
+
+    { char p[CBM_SZ_512]; th_append_file(wt_path(p, sizeof(p), tmpdir_a, "file.txt"), "changed\n"); }
+    wt_git(tmpdir_a, "add file.txt");
+    wt_git(tmpdir_a, "commit -q -m changed");
+
+    cbm_watcher_touch(w, "replace-cb");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(cb.calls, 1);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0); /* replacement path gets its own baseline */
+
+    cbm_watcher_free(w);
+    th_rmtree(tmpdir_a);
+    th_rmtree(tmpdir_b);
     PASS();
 }
 
@@ -1885,6 +1992,8 @@ SUITE(watcher) {
     RUN_TEST(watcher_watch_idempotent);
     RUN_TEST(watcher_unwatch_prunes_state);
     RUN_TEST(watcher_watch_after_unwatch);
+    RUN_TEST(watcher_unwatch_during_poll_callback_no_uaf);
+    RUN_TEST(watcher_replace_during_poll_callback_no_uaf);
 
     /* FSNotify ports (adapted for git-based detection) */
     RUN_TEST(watcher_detects_file_delete);

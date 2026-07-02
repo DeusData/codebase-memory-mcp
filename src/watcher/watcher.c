@@ -59,6 +59,18 @@ typedef struct {
     int64_t next_poll_ns;      /* next poll time (monotonic ns) */
 } project_state_t;
 
+typedef struct {
+    char *project_name;
+    char *root_path;
+    char last_head[CBM_SZ_64];
+    char last_dirty_hash[CBM_GIT_DIRTY_HASH_BUFSZ];
+    bool is_git;
+    bool baseline_done;
+    int file_count;
+    int interval_ms;
+    int64_t next_poll_ns;
+} project_snapshot_t;
+
 /* ── Watcher struct ─────────────────────────────────────────────── */
 
 struct cbm_watcher {
@@ -124,6 +136,49 @@ static void state_free(project_state_t *s) {
     free(s->project_name);
     free(s->root_path);
     free(s);
+}
+
+static bool snapshot_from_state(project_snapshot_t *dst, const project_state_t *src) {
+    if (!dst || !src) {
+        return false;
+    }
+    memset(dst, 0, sizeof(*dst));
+    dst->project_name = cbm_strdup(src->project_name);
+    dst->root_path = cbm_strdup(src->root_path);
+    if (!dst->project_name || !dst->root_path) {
+        free(dst->project_name);
+        free(dst->root_path);
+        memset(dst, 0, sizeof(*dst));
+        return false;
+    }
+    memcpy(dst->last_head, src->last_head, sizeof(dst->last_head));
+    memcpy(dst->last_dirty_hash, src->last_dirty_hash, sizeof(dst->last_dirty_hash));
+    dst->is_git = src->is_git;
+    dst->baseline_done = src->baseline_done;
+    dst->file_count = src->file_count;
+    dst->interval_ms = src->interval_ms;
+    dst->next_poll_ns = src->next_poll_ns;
+    return true;
+}
+
+static void snapshot_free(project_snapshot_t *s) {
+    if (!s) {
+        return;
+    }
+    free(s->project_name);
+    free(s->root_path);
+    memset(s, 0, sizeof(*s));
+}
+
+static void state_apply_snapshot(project_state_t *dst, const project_snapshot_t *src) {
+    bool touched_during_poll = dst->next_poll_ns == 0 && src->next_poll_ns != 0;
+    memcpy(dst->last_head, src->last_head, sizeof(dst->last_head));
+    memcpy(dst->last_dirty_hash, src->last_dirty_hash, sizeof(dst->last_dirty_hash));
+    dst->is_git = src->is_git;
+    dst->baseline_done = src->baseline_done;
+    dst->file_count = src->file_count;
+    dst->interval_ms = src->interval_ms;
+    dst->next_poll_ns = touched_during_poll ? 0 : src->next_poll_ns;
 }
 
 /* Hash table foreach callback to free state entries */
@@ -257,7 +312,7 @@ int cbm_watcher_watch_count(cbm_watcher_t *w) {
 /* ── Single poll cycle ──────────────────────────────────────────── */
 
 /* Init baseline for a project: check if git, get HEAD, count files */
-static void init_baseline(project_state_t *s, const cbm_watcher_t *w) {
+static void init_baseline(project_snapshot_t *s, const cbm_watcher_t *w) {
     if (!cbm_file_exists(s->root_path)) {
         cbm_log_warn("watcher.root_gone", "project", s->project_name, "path", s->root_path);
         s->baseline_done = true;
@@ -291,7 +346,7 @@ static void init_baseline(project_state_t *s, const cbm_watcher_t *w) {
 }
 
 /* Check if a project has changes. Returns true if reindex needed. */
-static bool check_changes(project_state_t *s) {
+static bool check_changes(project_snapshot_t *s) {
     if (!s->is_git) {
         return false;
     }
@@ -325,6 +380,17 @@ static bool check_changes(project_state_t *s) {
     return true;
 }
 
+static bool watcher_snapshot_current(cbm_watcher_t *w, const project_snapshot_t *snap) {
+    bool current = false;
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *cur = cbm_ht_get(w->projects, snap->project_name);
+    if (cur && strcmp(cur->root_path, snap->root_path) == 0) {
+        current = true;
+    }
+    cbm_mutex_unlock(&w->projects_lock);
+    return current;
+}
+
 /* Context for poll_once foreach callback */
 typedef struct {
     cbm_watcher_t *w;
@@ -335,7 +401,7 @@ typedef struct {
 static void poll_project(const char *key, void *val, void *ud) {
     (void)key;
     poll_ctx_t *ctx = ud;
-    project_state_t *s = val;
+    project_snapshot_t *s = val;
     if (!s) {
         return;
     }
@@ -364,6 +430,9 @@ static void poll_project(const char *key, void *val, void *ud) {
     }
 
     /* Trigger reindex */
+    if (!watcher_snapshot_current(ctx->w, s)) {
+        return;
+    }
     cbm_log_info("watcher.changed", "project", s->project_name, "strategy", "git");
     if (ctx->w->index_fn) {
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
@@ -389,19 +458,33 @@ static void poll_project(const char *key, void *val, void *ud) {
     s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * (int64_t)CBM_NSEC_PER_MSEC);
 }
 
-/* Callback to snapshot project state pointers into an array. */
+/* Callback to snapshot project state values into an array. */
 typedef struct {
-    project_state_t **items;
+    project_snapshot_t *items;
     int count;
     int cap;
+    bool oom;
 } snapshot_ctx_t;
 
 static void snapshot_project(const char *key, void *val, void *ud) {
     (void)key;
     snapshot_ctx_t *sc = ud;
     if (val && sc->count < sc->cap) {
-        sc->items[sc->count++] = val;
+        if (snapshot_from_state(&sc->items[sc->count], val)) {
+            sc->count++;
+        } else {
+            sc->oom = true;
+        }
     }
+}
+
+static void watcher_apply_snapshot(cbm_watcher_t *w, const project_snapshot_t *snap) {
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *cur = cbm_ht_get(w->projects, snap->project_name);
+    if (cur && strcmp(cur->root_path, snap->root_path) == 0) {
+        state_apply_snapshot(cur, snap);
+    }
+    cbm_mutex_unlock(&w->projects_lock);
 }
 
 int cbm_watcher_poll_once(cbm_watcher_t *w) {
@@ -409,16 +492,17 @@ int cbm_watcher_poll_once(cbm_watcher_t *w) {
         return 0;
     }
 
-    /* Snapshot project pointers under lock, then poll without holding it.
-     * This keeps the critical section small — poll_project does git I/O
-     * and may invoke index_fn which runs the full pipeline. */
+    /* Snapshot project state under lock, then poll without holding it.
+     * Write-back is conditional on the same project/path still being watched.
+     * This keeps git I/O and index_fn outside the watcher mutex without using
+     * raw state pointers that watch/unwatch could free mid-poll. */
     cbm_mutex_lock(&w->projects_lock);
     int n = cbm_ht_count(w->projects);
     if (n == 0) {
         cbm_mutex_unlock(&w->projects_lock);
         return 0;
     }
-    project_state_t **snap = malloc(n * sizeof(project_state_t *));
+    project_snapshot_t *snap = calloc((size_t)n, sizeof(*snap));
     if (!snap) {
         cbm_mutex_unlock(&w->projects_lock);
         return 0;
@@ -426,6 +510,13 @@ int cbm_watcher_poll_once(cbm_watcher_t *w) {
     snapshot_ctx_t sc = {.items = snap, .count = 0, .cap = n};
     cbm_ht_foreach(w->projects, snapshot_project, &sc);
     cbm_mutex_unlock(&w->projects_lock);
+    if (sc.oom) {
+        for (int i = 0; i < sc.count; i++) {
+            snapshot_free(&snap[i]);
+        }
+        free(snap);
+        return 0;
+    }
 
     poll_ctx_t ctx = {
         .w = w,
@@ -433,7 +524,9 @@ int cbm_watcher_poll_once(cbm_watcher_t *w) {
         .reindexed = 0,
     };
     for (int i = 0; i < sc.count; i++) {
-        poll_project(NULL, snap[i], &ctx);
+        poll_project(NULL, &snap[i], &ctx);
+        watcher_apply_snapshot(w, &snap[i]);
+        snapshot_free(&snap[i]);
     }
     free(snap);
     return ctx.reindexed;
