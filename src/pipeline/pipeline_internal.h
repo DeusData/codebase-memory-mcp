@@ -144,6 +144,32 @@ static inline bool cbm_pipeline_mode_builds_global_semantic_edges(int mode) {
     return mode == CBM_MODE_FULL || mode == CBM_MODE_MODERATE;
 }
 
+static inline int cbm_pipeline_mark_replacement_derived_views(cbm_store_t *store,
+                                                              const char *project, int mode) {
+    static const char *const complete_graph_views[] = {
+        CBM_STORE_DERIVED_VIEW_ROUTES,
+        CBM_STORE_DERIVED_VIEW_ARCHITECTURE,
+    };
+    static const char *const semantic_views[] = {
+        CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
+    };
+
+    int rc = cbm_store_mark_derived_views_complete(
+        store, project, CBM_PIPELINE_COMPAT_GENERATION, complete_graph_views,
+        (int)(sizeof(complete_graph_views) / sizeof(complete_graph_views[0])));
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    if (cbm_pipeline_mode_builds_global_semantic_edges(mode)) {
+        return cbm_store_mark_derived_views_complete(
+            store, project, CBM_PIPELINE_COMPAT_GENERATION, semantic_views,
+            (int)(sizeof(semantic_views) / sizeof(semantic_views[0])));
+    }
+    return cbm_store_mark_derived_views_stale(
+        store, project, CBM_PIPELINE_COMPAT_GENERATION, semantic_views,
+        (int)(sizeof(semantic_views) / sizeof(semantic_views[0])));
+}
+
 typedef struct {
     cbm_store_file_delta_t delta;
     cbm_file_hash_t file_hash;

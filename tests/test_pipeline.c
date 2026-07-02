@@ -258,6 +258,17 @@ TEST(store_bulk_persistence) {
 
 /* ── Integration: structure pass on temp repo ────────────────────── */
 
+static bool pipeline_test_derived_status_is(cbm_store_t *s, const char *project,
+                                            const char *view_name, const char *status) {
+    cbm_derived_view_state_t state = {0};
+    bool matches = false;
+    if (cbm_store_get_derived_view_state(s, project, view_name, &state) == CBM_STORE_OK) {
+        matches = state.status && strcmp(state.status, status) == 0;
+    }
+    cbm_store_derived_view_state_free_fields(&state);
+    return matches;
+}
+
 TEST(pipeline_structure_nodes) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
@@ -308,6 +319,12 @@ TEST(pipeline_structure_nodes) {
     /* Verify edges exist */
     int edge_count = cbm_store_count_edges(s, project);
     ASSERT_GTE(edge_count, 5); /* CONTAINS_FOLDER + CONTAINS_FILE edges */
+    ASSERT_TRUE(pipeline_test_derived_status_is(s, project, CBM_STORE_DERIVED_VIEW_ROUTES,
+                                                CBM_STORE_DERIVED_STATUS_COMPLETE));
+    ASSERT_TRUE(pipeline_test_derived_status_is(s, project, CBM_STORE_DERIVED_VIEW_ARCHITECTURE,
+                                                CBM_STORE_DERIVED_STATUS_COMPLETE));
+    ASSERT_TRUE(pipeline_test_derived_status_is(s, project, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
+                                                CBM_STORE_DERIVED_STATUS_COMPLETE));
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -480,6 +497,12 @@ TEST(pipeline_fast_mode) {
     const char *project = cbm_pipeline_project_name(p);
     int node_count = cbm_store_count_nodes(s, project);
     ASSERT_GT(node_count, 0);
+    ASSERT_TRUE(pipeline_test_derived_status_is(s, project, CBM_STORE_DERIVED_VIEW_ROUTES,
+                                                CBM_STORE_DERIVED_STATUS_COMPLETE));
+    ASSERT_TRUE(pipeline_test_derived_status_is(s, project, CBM_STORE_DERIVED_VIEW_ARCHITECTURE,
+                                                CBM_STORE_DERIVED_STATUS_COMPLETE));
+    ASSERT_TRUE(pipeline_test_derived_status_is(s, project, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
+                                                CBM_STORE_DERIVED_STATUS_STALE));
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
