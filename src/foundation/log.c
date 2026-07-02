@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include <inttypes.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +14,7 @@
 
 static CBMLogLevel g_log_level = CBM_LOG_INFO;
 static cbm_log_sink_fn g_log_sink = NULL;
+static atomic_bool g_profile_stderr_mirror = false;
 
 /* CBM_LOG_LEVEL support — distilled from #414 (closes #413, thanks @santanusinha). */
 void cbm_log_init_from_env(void) {
@@ -53,6 +55,10 @@ void cbm_log_init_from_env(void) {
 
 void cbm_log_set_sink(cbm_log_sink_fn fn) {
     g_log_sink = fn;
+}
+
+void cbm_log_set_profile_stderr_mirror(bool enabled) {
+    atomic_store_explicit(&g_profile_stderr_mirror, enabled, memory_order_relaxed);
 }
 
 void cbm_log_set_level(CBMLogLevel level) {
@@ -109,6 +115,10 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
      * Otherwise write structured log to stderr. */
     if (g_log_sink) {
         g_log_sink(line_buf);
+        if (msg && strcmp(msg, "prof") == 0 &&
+            atomic_load_explicit(&g_profile_stderr_mirror, memory_order_relaxed)) {
+            (void)fprintf(stderr, "%s\n", line_buf);
+        }
     } else {
         (void)fprintf(stderr, "%s\n", line_buf);
     }

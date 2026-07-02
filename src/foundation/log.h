@@ -12,6 +12,7 @@
 #ifndef CBM_LOG_H
 #define CBM_LOG_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 typedef enum {
@@ -60,5 +61,10 @@ void cbm_log_int(CBMLogLevel level, const char *msg, const char *key, int64_t va
 /* Optional log sink callback — called with the formatted log line. */
 typedef void (*cbm_log_sink_fn)(const char *line);
 void cbm_log_set_sink(cbm_log_sink_fn fn);
+
+/* When enabled, msg=prof lines are also mirrored to stderr even when a custom
+ * sink is active. This is opt-in so MCP stdio stdout stays protocol-only and
+ * normal server logs remain sink-routed by default. */
+void cbm_log_set_profile_stderr_mirror(bool enabled);
 
 #endif /* CBM_LOG_H */
