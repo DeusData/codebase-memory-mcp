@@ -27,6 +27,15 @@ static bool test_file_exists_mcp(const char *path) {
     return true;
 }
 
+static void assert_stale_freshness_view(const char *json, const char *view_name) {
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(view_name);
+    ASSERT_NOT_NULL(strstr(json, "\"freshness\""));
+    ASSERT_NOT_NULL(strstr(json, "\"state\":\"stale_with_warning\""));
+    ASSERT_NOT_NULL(strstr(json, "\"stale_views\""));
+    ASSERT_NOT_NULL(strstr(json, view_name));
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING
  * ══════════════════════════════════════════════════════════════════ */
@@ -732,6 +741,7 @@ TEST(tool_search_graph_warns_on_stale_pagerank_view) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
     ASSERT_NOT_NULL(strstr(inner, "pagerank derived view is stale"));
+    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_PAGERANK);
     ASSERT_NULL(strstr(inner, "\"pagerank\":"));
 
     free(inner);
@@ -769,6 +779,7 @@ TEST(tool_search_graph_warns_on_stale_route_view) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
     ASSERT_NOT_NULL(strstr(inner, "routes derived view is stale"));
+    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_ROUTES);
 
     free(inner);
     free(resp);
@@ -1016,6 +1027,7 @@ TEST(tool_search_graph_semantic_query_warns_on_stale_semantic_view) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
     ASSERT_NOT_NULL(strstr(inner, "semantic_edges derived view is stale"));
+    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES);
 
     free(inner);
     free(resp);
@@ -1062,6 +1074,7 @@ TEST(tool_query_graph_warns_on_stale_route_view) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
     ASSERT_NOT_NULL(strstr(inner, "routes derived view is stale"));
+    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_ROUTES);
 
     free(inner);
     free(resp);
@@ -1131,6 +1144,7 @@ TEST(tool_query_graph_warns_on_stale_semantic_edges) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
     ASSERT_NOT_NULL(strstr(inner, "semantic_edges derived view is stale"));
+    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES);
 
     free(inner);
     free(resp);
@@ -1391,6 +1405,8 @@ TEST(tool_trace_path_warns_on_stale_rank_views) {
     ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
     ASSERT_NOT_NULL(strstr(inner, "pagerank derived view is stale"));
     ASSERT_NOT_NULL(strstr(inner, "linkrank derived view is stale"));
+    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_PAGERANK);
+    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_LINKRANK);
 
     free(inner);
     free(resp);
@@ -1520,6 +1536,9 @@ TEST(tool_get_architecture_warns_on_stale_derived_views) {
     ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
     ASSERT_NOT_NULL(strstr(inner, "architecture derived view is stale"));
     ASSERT_NOT_NULL(strstr(inner, "routes derived view is stale"));
+    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_ARCHITECTURE);
+    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_ROUTES);
+    assert_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_PAGERANK);
     ASSERT_NOT_NULL(strstr(inner, "key_functions were omitted"));
     ASSERT_NULL(strstr(inner, "\"key_functions\""));
 
