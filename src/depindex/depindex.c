@@ -9,14 +9,14 @@
 #include "store/store.h"
 #include "foundation/log.h"
 #include "foundation/compat_fs.h"
+#include "foundation/compat.h"
 #include "foundation/hash_table.h"
+#include "foundation/platform.h"
 
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/stat.h>
 
 /* ── Package Manager Parse/String ──────────────────────────────── */
 
@@ -65,7 +65,7 @@ char *cbm_dep_project_name(const char *project, const char *package_name) {
     if (!project || !package_name) return NULL;
     char buf[CBM_DEP_PATH_MAX];
     snprintf(buf, sizeof(buf), "%s" CBM_DEP_SEPARATOR "%s", project, package_name);
-    return strdup(buf);
+    return cbm_strdup(buf);
 }
 
 bool cbm_is_dep_project(const char *project_name, const char *session_project) {
@@ -134,8 +134,7 @@ static bool has_vendored_deps_dir(const char *project_root) {
             if (ent->name[0] == '.') continue;
             char sub[CBM_DEP_PATH_MAX];
             snprintf(sub, sizeof(sub), "%s/%s", path, ent->name);
-            struct stat st;
-            if (stat(sub, &st) == 0 && S_ISDIR(st.st_mode)) { has_subdir = true; break; }
+            if (cbm_is_dir(sub)) { has_subdir = true; break; }
         }
         cbm_closedir(d);
         if (has_subdir) return true;
@@ -150,7 +149,7 @@ cbm_pkg_manager_t cbm_detect_ecosystem(const char *project_root) {
 /* Macro: check file exists → return manager */
 #define CHECK(file, mgr) \
     do { snprintf(path, sizeof(path), "%s/" file, project_root); \
-         if (access(path, F_OK) == 0) return (mgr); } while (0)
+         if (cbm_file_exists(path)) return (mgr); } while (0)
 
     /* Interpreted-language ecosystems (highest confidence — unique lockfiles/manifests) */
     CHECK("bun.lockb",       CBM_PKG_BUN);   /* bun before npm: more specific */
@@ -207,12 +206,12 @@ void cbm_dep_resolved_free(cbm_dep_resolved_t *r) {
     r->version = NULL;
 }
 
-static const char *get_home_dir(void) {
+static const char *get_home_dir(char *buf, size_t buf_sz) {
 #ifdef _WIN32
-    const char *home = getenv("USERPROFILE");
-    if (!home) home = getenv("HOME");
+    const char *home = cbm_safe_getenv("USERPROFILE", buf, buf_sz, NULL);
+    if (!home) home = cbm_safe_getenv("HOME", buf, buf_sz, NULL);
 #else
-    const char *home = getenv("HOME");
+    const char *home = cbm_safe_getenv("HOME", buf, buf_sz, NULL);
 #endif
     return home ? home : "/tmp";
 }
@@ -247,8 +246,8 @@ static int resolve_uv(const char *package_name, const char *project_root,
                 if (strncmp(ent->name, "python", 6) != 0) continue;
                 snprintf(probe, sizeof(probe), "%s/%s/lib/%s/site-packages/%s",
                          project_root, venv_prefixes[p], ent->name, variants[v]);
-                if (access(probe, F_OK) == 0) {
-                    out->path = strdup(probe);
+                if (cbm_file_exists(probe)) {
+                    out->path = cbm_strdup(probe);
                     cbm_closedir(d);
                     return 0;
                 }
@@ -265,8 +264,11 @@ static int resolve_uv(const char *package_name, const char *project_root,
 static int resolve_cargo(const char *package_name, const char *project_root,
                           cbm_dep_resolved_t *out) {
     (void)project_root;
-    const char *home = get_home_dir();
-    const char *cargo_home = getenv("CARGO_HOME");
+    char home_buf[CBM_DEP_PATH_MAX];
+    const char *home = get_home_dir(home_buf, sizeof(home_buf));
+    char cargo_home_buf[CBM_DEP_PATH_MAX];
+    const char *cargo_home =
+        cbm_safe_getenv("CARGO_HOME", cargo_home_buf, sizeof(cargo_home_buf), NULL);
     char registry_base[CBM_DEP_PATH_MAX];
     if (cargo_home) {
         snprintf(registry_base, sizeof(registry_base), "%s/registry/src", cargo_home);
@@ -291,8 +293,8 @@ static int resolve_cargo(const char *package_name, const char *project_root,
                 rent->name[pkg_len] == '-') {
                 char full[CBM_DEP_PATH_MAX];
                 snprintf(full, sizeof(full), "%s/%s", reg_path, rent->name);
-                out->path = strdup(full);
-                out->version = strdup(rent->name + pkg_len + 1);
+                out->path = cbm_strdup(full);
+                out->version = cbm_strdup(rent->name + pkg_len + 1);
                 cbm_closedir(rd);
                 cbm_closedir(d);
                 return 0;
@@ -311,8 +313,8 @@ static int resolve_npm(const char *package_name, const char *project_root,
                         cbm_dep_resolved_t *out) {
     char probe[CBM_DEP_PATH_MAX];
     snprintf(probe, sizeof(probe), "%s/node_modules/%s", project_root, package_name);
-    if (access(probe, F_OK) == 0) {
-        out->path = strdup(probe);
+    if (cbm_file_exists(probe)) {
+        out->path = cbm_strdup(probe);
         return 0;
     }
     return -1;
@@ -376,10 +378,9 @@ static int discover_vendored_deps(const char *project_root, cbm_dep_discovered_t
             if (ent->name[0] == '.') continue;
             char sub[CBM_DEP_PATH_MAX];
             snprintf(sub, sizeof(sub), "%s/%s", dir_path, ent->name);
-            struct stat st;
-            if (stat(sub, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
-            (*out)[*count].package = strdup(ent->name);
-            (*out)[*count].path    = strdup(sub);
+            if (!cbm_is_dir(sub)) continue;
+            (*out)[*count].package = cbm_strdup(ent->name);
+            (*out)[*count].path    = cbm_strdup(sub);
             (*count)++;
         }
         cbm_closedir(d);
@@ -435,7 +436,7 @@ int cbm_discover_installed_deps(cbm_pkg_manager_t mgr, const char *project_root,
 
         cbm_dep_resolved_t resolved = {0};
         if (cbm_resolve_pkg_source(mgr, name, project_root, &resolved) == 0) {
-            results[n].package = strdup(name);
+            results[n].package = cbm_strdup(name);
             results[n].path = resolved.path;
             results[n].version = resolved.version;
             n++;
