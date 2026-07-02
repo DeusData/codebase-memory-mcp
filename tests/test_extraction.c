@@ -532,6 +532,17 @@ TEST(swift_class) {
     PASS();
 }
 
+TEST(swift_protocol) {
+    CBMFileResult *r = extract("protocol StudyRunning {\n    func generate() -> String\n}\n",
+                               CBM_LANG_SWIFT, "t", "StudyRunning.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Interface", "StudyRunning"));
+    ASSERT(has_def(r, "Method", "generate"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Kotlin --- */
 TEST(kotlin_function) {
     CBMFileResult *r = extract("fun greet(name: String): String = \"Hello $name\"\nfun main() { "
@@ -1087,7 +1098,18 @@ TEST(swift_struct) {
                                CBM_LANG_SWIFT, "t", "Point.swift");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "Point"));
     ASSERT(has_def(r, "Method", "distance"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_enum) {
+    CBMFileResult *r = extract("enum StudyDepth {\n    case brief\n    case study\n    case deep\n}\n",
+                               CBM_LANG_SWIFT, "t", "StudyDepth.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Enum", "StudyDepth"));
     cbm_free_result(r);
     PASS();
 }
@@ -3154,6 +3176,7 @@ SUITE(extraction) {
     RUN_TEST(csharp_class);
     RUN_TEST(csharp_interface);
     RUN_TEST(swift_class);
+    RUN_TEST(swift_protocol);
     RUN_TEST(kotlin_function);
     RUN_TEST(kotlin_class);
     RUN_TEST(scala_function);
@@ -3212,6 +3235,7 @@ SUITE(extraction) {
 
     /* OOP/Systems variants */
     RUN_TEST(swift_struct);
+    RUN_TEST(swift_enum);
     RUN_TEST(swift_simple_call);
     RUN_TEST(swift_method_call);
     RUN_TEST(swift_constructor_call);
