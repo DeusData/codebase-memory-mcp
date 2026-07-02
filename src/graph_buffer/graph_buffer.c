@@ -255,6 +255,37 @@ static void remove_node_from_ptr_array(node_ptr_array_t *arr, int64_t node_id) {
     }
 }
 
+static void index_node_in_ptr_array(CBMHashTable *ht, const char *key, cbm_gbuf_node_t *node) {
+    node_ptr_array_t *arr = get_or_create_node_array(ht, key ? key : "");
+    if (!arr) {
+        return;
+    }
+    for (int i = 0; i < arr->count; i++) {
+        if (arr->items[i]->id == node->id) {
+            return;
+        }
+    }
+    cbm_da_push(arr, (const cbm_gbuf_node_t *)node);
+}
+
+static void update_node_secondary_indexes(cbm_gbuf_t *gb, cbm_gbuf_node_t *node,
+                                          const char *old_label, const char *old_name,
+                                          const char *new_label, const char *new_name) {
+    const char *old_label_key = old_label ? old_label : "";
+    const char *new_label_key = new_label ? new_label : "";
+    if (strcmp(old_label_key, new_label_key) != 0) {
+        remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_label, old_label_key), node->id);
+        index_node_in_ptr_array(gb->nodes_by_label, new_label_key, node);
+    }
+
+    const char *old_name_key = old_name ? old_name : "";
+    const char *new_name_key = new_name ? new_name : "";
+    if (strcmp(old_name_key, new_name_key) != 0) {
+        remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_name, old_name_key), node->id);
+        index_node_in_ptr_array(gb->nodes_by_name, new_name_key, node);
+    }
+}
+
 /* Remove an edge from all indexes (dedup + source_type + target_type + type). */
 static void unindex_edge(cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e) {
     char key[EDGE_KEY_BUF];
@@ -330,13 +361,8 @@ static void register_node_in_indexes(cbm_gbuf_t *gb, cbm_gbuf_node_t *node) {
         cbm_ht_set(gb->node_by_id, strdup(id_buf), node);
     }
 
-    node_ptr_array_t *by_label =
-        get_or_create_node_array(gb->nodes_by_label, node->label ? node->label : "");
-    cbm_da_push(by_label, (const cbm_gbuf_node_t *)node);
-
-    node_ptr_array_t *by_name =
-        get_or_create_node_array(gb->nodes_by_name, node->name ? node->name : "");
-    cbm_da_push(by_name, (const cbm_gbuf_node_t *)node);
+    index_node_in_ptr_array(gb->nodes_by_label, node->label, node);
+    index_node_in_ptr_array(gb->nodes_by_name, node->name, node);
 }
 
 /* Push an edge pointer into a dynamic array (wraps macro to reduce CC contribution). */
@@ -894,6 +920,10 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
          * cannot decide whether a forward declaration hides the implementation. */
         char *new_name = heap_strdup(selected_name);
         char *new_props = selected_props ? heap_strdup(selected_props) : NULL;
+        const char *old_label = existing->label;
+        const char *old_name = existing->name;
+        update_node_secondary_indexes(gb, existing, old_label, old_name, selected_label,
+                                      selected_name);
         existing->label = (char *)gb_intern(gb, selected_label);
         free(existing->name);
         existing->name = new_name;
@@ -1477,6 +1507,10 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
                                      : existing->properties_json;
     char *new_name = heap_strdup(selected_name);
     char *new_props = selected_props ? heap_strdup(selected_props) : NULL;
+    const char *old_label = existing->label;
+    const char *old_name = existing->name;
+    update_node_secondary_indexes(dst, existing, old_label, old_name, selected_label,
+                                  selected_name);
     existing->label = (char *)gb_intern(dst, selected_label);
     free(existing->name);
     existing->name = new_name;
