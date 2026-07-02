@@ -1328,8 +1328,9 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
         }
         const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
         free(qn);
-        if (n && (!source_file_qn || !n->qualified_name ||
-                  strcmp(n->qualified_name, source_file_qn) != 0)) {
+        if (n && import_targetable_label(n->label) &&
+            (!source_file_qn || !n->qualified_name ||
+             strcmp(n->qualified_name, source_file_qn) != 0)) {
             found = n;
             break;
         }
@@ -1347,7 +1348,13 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         return NULL;
     }
 
-    /* Strategy 1: module-path resolution → existing node (Python/TS/Go). */
+    /* Strategy 1: module-path resolution → existing node (Python/TS/Go).
+     * No label filter here: directory-module languages (Go/Java packages)
+     * legitimately resolve straight to a Folder node -- that's the intended,
+     * correct import target, not a collision. The Folder-collision problem
+     * (#767) only shows up downstream, in Strategy 4's retry-with-truncated-
+     * path loop, which re-enters resolve_module with a DIFFERENT, shortened
+     * string that the original import never named. */
     char *target_qn = cbm_pipeline_resolve_module(ctx, source_rel, imp->module_path);
     const cbm_gbuf_node_t *target = target_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, target_qn) : NULL;
     free(target_qn);
@@ -1571,8 +1578,9 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                 char *rqn = cbm_pipeline_resolve_module(ctx, source_rel, work);
                 const cbm_gbuf_node_t *n = rqn ? cbm_gbuf_find_by_qn(ctx->gbuf, rqn) : NULL;
                 free(rqn);
-                if (n && (!source_file_qn || !n->qualified_name ||
-                          strcmp(n->qualified_name, source_file_qn) != 0)) {
+                if (n && import_targetable_label(n->label) &&
+                    (!source_file_qn || !n->qualified_name ||
+                     strcmp(n->qualified_name, source_file_qn) != 0)) {
                     return n;
                 }
                 char *sl = strrchr(work, '/');
