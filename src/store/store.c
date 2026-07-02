@@ -6421,6 +6421,59 @@ static const char *file_ext(const char *path) {
 
 /* ── Architecture aspect implementations ───────────────────────── */
 
+static int arch_grow_array(cbm_store_t *s, void **items, int *cap, size_t item_size,
+                           const char *op) {
+    if (!items || !cap || item_size == 0 || *cap <= 0 || *cap > INT_MAX / ST_GROWTH) {
+        store_set_error(s, op);
+        return CBM_STORE_ERR;
+    }
+    int old_cap = *cap;
+    int new_cap = old_cap * ST_GROWTH;
+    void *next = realloc(*items, (size_t)new_cap * item_size);
+    if (!next) {
+        store_set_error(s, op);
+        return CBM_STORE_ERR;
+    }
+    memset((char *)next + ((size_t)old_cap * item_size), 0,
+           (size_t)(new_cap - old_cap) * item_size);
+    *items = next;
+    *cap = new_cap;
+    return CBM_STORE_OK;
+}
+
+static void arch_free_packages(cbm_package_summary_t *items, int count) {
+    for (int i = 0; i < count; i++) {
+        safe_str_free(&items[i].name);
+    }
+    free(items);
+}
+
+static void arch_free_entry_points(cbm_entry_point_t *items, int count) {
+    for (int i = 0; i < count; i++) {
+        safe_str_free(&items[i].name);
+        safe_str_free(&items[i].qualified_name);
+        safe_str_free(&items[i].file);
+    }
+    free(items);
+}
+
+static void arch_free_routes(cbm_route_info_t *items, int count) {
+    for (int i = 0; i < count; i++) {
+        safe_str_free(&items[i].method);
+        safe_str_free(&items[i].path);
+        safe_str_free(&items[i].handler);
+    }
+    free(items);
+}
+
+static void arch_free_hotspots(cbm_hotspot_t *items, int count) {
+    for (int i = 0; i < count; i++) {
+        safe_str_free(&items[i].name);
+        safe_str_free(&items[i].qualified_name);
+    }
+    free(items);
+}
+
 static int arch_languages(cbm_store_t *s, const char *project, const char *path,
                           cbm_architecture_info_t *out) {
     char norm[CBM_SZ_512];
@@ -6532,16 +6585,39 @@ static int arch_entry_points(cbm_store_t *s, const char *project, const char *pa
 
     int cap = ST_INIT_CAP_8;
     int n = 0;
-    cbm_entry_point_t *arr = calloc(cap, sizeof(cbm_entry_point_t));
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    cbm_entry_point_t *arr = calloc((size_t)cap, sizeof(*arr));
+    if (!arr) {
+        sqlite3_finalize(stmt);
+        store_set_error(s, "arch_entry_points out of memory");
+        return CBM_STORE_ERR;
+    }
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         if (n >= cap) {
-            cap *= ST_GROWTH;
-            arr = safe_realloc(arr, cap * sizeof(cbm_entry_point_t));
+            if (arch_grow_array(s, (void **)&arr, &cap, sizeof(*arr),
+                                "arch_entry_points out of memory") != CBM_STORE_OK) {
+                arch_free_entry_points(arr, n);
+                sqlite3_finalize(stmt);
+                return CBM_STORE_ERR;
+            }
         }
-        arr[n].name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-        arr[n].qualified_name = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
-        arr[n].file = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
+        arr[n].name = heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, 0)));
+        arr[n].qualified_name =
+            heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, SKIP_ONE)));
+        arr[n].file = heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, CBM_SZ_2)));
+        if (!arr[n].name || !arr[n].qualified_name || !arr[n].file) {
+            arch_free_entry_points(arr, n + 1);
+            sqlite3_finalize(stmt);
+            store_set_error(s, "arch_entry_points out of memory");
+            return CBM_STORE_ERR;
+        }
         n++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        arch_free_entry_points(arr, n);
+        store_set_error_sqlite(s, "arch_entry_points");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
     }
     sqlite3_finalize(stmt);
     out->entry_points = arr;
@@ -6626,8 +6702,14 @@ static int arch_routes(cbm_store_t *s, const char *project, const char *path,
 
     int cap = ST_INIT_CAP_8;
     int n = 0;
-    cbm_route_info_t *arr = calloc(cap, sizeof(cbm_route_info_t));
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    cbm_route_info_t *arr = calloc((size_t)cap, sizeof(*arr));
+    if (!arr) {
+        sqlite3_finalize(stmt);
+        store_set_error(s, "arch_routes out of memory");
+        return CBM_STORE_ERR;
+    }
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         const char *name = (const char *)sqlite3_column_text(stmt, 0);
         const char *props = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
         const char *fp = (const char *)sqlite3_column_text(stmt, CBM_SZ_2);
@@ -6645,8 +6727,12 @@ static int arch_routes(cbm_store_t *s, const char *project, const char *path,
             break;
         }
         if (n >= cap) {
-            cap *= ST_GROWTH;
-            arr = safe_realloc(arr, cap * sizeof(cbm_route_info_t));
+            if (arch_grow_array(s, (void **)&arr, &cap, sizeof(*arr),
+                                "arch_routes out of memory") != CBM_STORE_OK) {
+                arch_free_routes(arr, n);
+                sqlite3_finalize(stmt);
+                return CBM_STORE_ERR;
+            }
         }
 
         arr[n].method = heap_strdup("");
@@ -6669,7 +6755,19 @@ static int arch_routes(cbm_store_t *s, const char *project, const char *path,
             safe_str_free(&arr[n].handler);
             arr[n].handler = val;
         }
+        if (!arr[n].method || !arr[n].path || !arr[n].handler) {
+            arch_free_routes(arr, n + 1);
+            sqlite3_finalize(stmt);
+            store_set_error(s, "arch_routes out of memory");
+            return CBM_STORE_ERR;
+        }
         n++;
+    }
+    if (step_rc != SQLITE_DONE && n < ST_ARCH_ROUTE_RESULT_LIMIT) {
+        arch_free_routes(arr, n);
+        store_set_error_sqlite(s, "arch_routes");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
     }
     sqlite3_finalize(stmt);
     out->routes = arr;
@@ -6756,16 +6854,39 @@ static int arch_hotspots(cbm_store_t *s, const char *project, const char *path,
 
     int cap = ST_INIT_CAP_8;
     int n = 0;
-    cbm_hotspot_t *arr = calloc(cap, sizeof(cbm_hotspot_t));
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    cbm_hotspot_t *arr = calloc((size_t)cap, sizeof(*arr));
+    if (!arr) {
+        sqlite3_finalize(stmt);
+        store_set_error(s, "arch_hotspots out of memory");
+        return CBM_STORE_ERR;
+    }
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         if (n >= cap) {
-            cap *= ST_GROWTH;
-            arr = safe_realloc(arr, cap * sizeof(cbm_hotspot_t));
+            if (arch_grow_array(s, (void **)&arr, &cap, sizeof(*arr),
+                                "arch_hotspots out of memory") != CBM_STORE_OK) {
+                arch_free_hotspots(arr, n);
+                sqlite3_finalize(stmt);
+                return CBM_STORE_ERR;
+            }
         }
-        arr[n].name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-        arr[n].qualified_name = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
+        arr[n].name = heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, 0)));
+        arr[n].qualified_name =
+            heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, SKIP_ONE)));
+        if (!arr[n].name || !arr[n].qualified_name) {
+            arch_free_hotspots(arr, n + 1);
+            sqlite3_finalize(stmt);
+            store_set_error(s, "arch_hotspots out of memory");
+            return CBM_STORE_ERR;
+        }
         arr[n].fan_in = sqlite3_column_int(stmt, CBM_SZ_2);
         n++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        arch_free_hotspots(arr, n);
+        store_set_error_sqlite(s, "arch_hotspots");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
     }
     sqlite3_finalize(stmt);
     out->hotspots = arr;
@@ -7050,15 +7171,37 @@ static int arch_packages(cbm_store_t *s, const char *project, const char *path,
 
     int cap = ST_INIT_CAP_16;
     int n = 0;
-    cbm_package_summary_t *arr = calloc(cap, sizeof(cbm_package_summary_t));
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    cbm_package_summary_t *arr = calloc((size_t)cap, sizeof(*arr));
+    if (!arr) {
+        sqlite3_finalize(stmt);
+        store_set_error(s, "arch_packages out of memory");
+        return CBM_STORE_ERR;
+    }
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         if (n >= cap) {
-            cap *= ST_GROWTH;
-            arr = safe_realloc(arr, cap * sizeof(cbm_package_summary_t));
+            if (arch_grow_array(s, (void **)&arr, &cap, sizeof(*arr),
+                                "arch_packages out of memory") != CBM_STORE_OK) {
+                arch_free_packages(arr, n);
+                sqlite3_finalize(stmt);
+                return CBM_STORE_ERR;
+            }
         }
-        arr[n].name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        arr[n].name = heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, 0)));
+        if (!arr[n].name) {
+            arch_free_packages(arr, n + 1);
+            sqlite3_finalize(stmt);
+            store_set_error(s, "arch_packages out of memory");
+            return CBM_STORE_ERR;
+        }
         arr[n].node_count = sqlite3_column_int(stmt, SKIP_ONE);
         n++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        arch_free_packages(arr, n);
+        store_set_error_sqlite(s, "arch_packages");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
     }
     sqlite3_finalize(stmt);
 
@@ -8854,27 +8997,10 @@ void cbm_store_architecture_free(cbm_architecture_info_t *out) {
         safe_str_free(&out->languages[i].language);
     }
     free(out->languages);
-    for (int i = 0; i < out->package_count; i++) {
-        safe_str_free(&out->packages[i].name);
-    }
-    free(out->packages);
-    for (int i = 0; i < out->entry_point_count; i++) {
-        safe_str_free(&out->entry_points[i].name);
-        safe_str_free(&out->entry_points[i].qualified_name);
-        safe_str_free(&out->entry_points[i].file);
-    }
-    free(out->entry_points);
-    for (int i = 0; i < out->route_count; i++) {
-        safe_str_free(&out->routes[i].method);
-        safe_str_free(&out->routes[i].path);
-        safe_str_free(&out->routes[i].handler);
-    }
-    free(out->routes);
-    for (int i = 0; i < out->hotspot_count; i++) {
-        safe_str_free(&out->hotspots[i].name);
-        safe_str_free(&out->hotspots[i].qualified_name);
-    }
-    free(out->hotspots);
+    arch_free_packages(out->packages, out->package_count);
+    arch_free_entry_points(out->entry_points, out->entry_point_count);
+    arch_free_routes(out->routes, out->route_count);
+    arch_free_hotspots(out->hotspots, out->hotspot_count);
     for (int i = 0; i < out->boundary_count; i++) {
         safe_str_free(&out->boundaries[i].from);
         safe_str_free(&out->boundaries[i].to);
