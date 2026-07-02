@@ -1318,30 +1318,28 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
                                                         CBM_PIPELINE_COMPAT_GENERATION,
                                                         pass_fingerprint);
         }
-
-        /* FTS5 rebuild after incremental dump.  The btree dump path bypasses
-         * any triggers that could have kept nodes_fts synchronized, so we
-         * rebuild from the nodes table here.  See the full-dump path in
-         * pipeline.c for the matching logic. */
-        cbm_store_exec(hash_store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
-        if (cbm_store_exec(hash_store,
-                           "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                           "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
-                           "FROM nodes;") != CBM_STORE_OK) {
-            cbm_store_exec(hash_store,
-                           "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                           "SELECT id, name, qualified_name, label, file_path FROM nodes;");
-        }
-
-        cbm_store_close(hash_store);
         if (hash_rc != CBM_STORE_OK) {
+            cbm_store_close(hash_store);
             return hash_rc;
         }
         if (state_rc != CBM_STORE_OK) {
             cbm_log_error("incremental.err", "phase", "persist_file_state", "rc",
                           itoa_buf_incr(state_rc));
+            cbm_store_close(hash_store);
             return state_rc;
         }
+
+        /* The direct btree dump bypasses any triggers that could have kept the
+         * contentless FTS table synchronized, so rebuild it after replacement. */
+        int fts_rc = cbm_store_rebuild_nodes_fts(hash_store);
+        if (fts_rc != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "phase", "rebuild_nodes_fts", "rc",
+                          itoa_buf_incr(fts_rc));
+            cbm_store_close(hash_store);
+            return fts_rc;
+        }
+
+        cbm_store_close(hash_store);
     } else {
         cbm_log_error("incremental.err", "phase", "hash_store_open");
         return CBM_NOT_FOUND;

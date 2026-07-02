@@ -3273,6 +3273,33 @@ static bool store_nodes_fts_unavailable(cbm_store_t *s) {
     return msg && strstr(msg, "no such table: nodes_fts") != NULL;
 }
 
+int cbm_store_rebuild_nodes_fts(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return CBM_STORE_ERR;
+    }
+    static const char delete_all_sql[] = "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');";
+    static const char insert_camel_sql[] =
+        "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+        "SELECT id, cbm_camel_split(name), qualified_name, label, file_path FROM nodes;";
+    static const char insert_plain_sql[] =
+        "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+        "SELECT id, name, qualified_name, label, file_path FROM nodes;";
+
+    int rc = exec_sql(s, delete_all_sql);
+    if (rc != CBM_STORE_OK) {
+        return store_nodes_fts_unavailable(s) ? CBM_STORE_OK : rc;
+    }
+    rc = exec_sql(s, insert_camel_sql);
+    if (rc == CBM_STORE_OK || store_nodes_fts_unavailable(s)) {
+        return CBM_STORE_OK;
+    }
+    rc = exec_sql(s, insert_plain_sql);
+    if (rc == CBM_STORE_OK || store_nodes_fts_unavailable(s)) {
+        return CBM_STORE_OK;
+    }
+    return rc;
+}
+
 static int store_nodes_fts_delete_by_file(cbm_store_t *s, const char *project,
                                           const char *rel_path) {
     static const char sql[] =
