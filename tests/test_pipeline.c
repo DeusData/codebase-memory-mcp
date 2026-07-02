@@ -10032,8 +10032,11 @@ TEST(incremental_missing_file_state_keeps_legacy_metadata_path) {
     PASS();
 }
 
-TEST(incremental_dump_failure_keeps_existing_db) {
-    pipeline_env_snapshot_t fail_env = pipeline_env_save(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE);
+TEST(incremental_publish_failure_keeps_existing_db) {
+    pipeline_env_snapshot_t flush_fail_env =
+        pipeline_env_save(CBM_TEST_FAIL_GBUF_FLUSH_BEFORE_COMMIT);
+    pipeline_env_snapshot_t dump_fail_env =
+        pipeline_env_save(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE);
 
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -10067,9 +10070,11 @@ TEST(incremental_dump_failure_keeps_existing_db) {
     ASSERT_NOT_NULL(p);
     cbm_pipeline_apply_config(p, cfg);
 
+    cbm_setenv(CBM_TEST_FAIL_GBUF_FLUSH_BEFORE_COMMIT, pipeline_test_env_enabled, 1);
     cbm_setenv(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE, pipeline_test_env_enabled, 1);
     int rc = cbm_pipeline_run(p);
-    pipeline_env_restore(&fail_env);
+    pipeline_env_restore(&flush_fail_env);
+    pipeline_env_restore(&dump_fail_env);
 
     ASSERT_NEQ(rc, 0);
     s = cbm_store_open_path(g_incr_dbpath);
@@ -10352,6 +10357,22 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     ASSERT_GT(tools_count_before, 0); /* full mode must see tools/util.go */
     cbm_store_free_nodes(tools_nodes_before, tools_count_before);
     int total_before = cbm_store_count_nodes(s, project);
+    char dep_project[CBM_SZ_512];
+    int dep_len = snprintf(dep_project, sizeof(dep_project), "%s.dep.requests", project);
+    ASSERT_TRUE(dep_len > 0 && (size_t)dep_len < sizeof(dep_project));
+    ASSERT_EQ(cbm_store_upsert_project(s, dep_project, "/tmp/requests"), CBM_STORE_OK);
+    cbm_node_t dep_node = {
+        .project = dep_project,
+        .label = "Module",
+        .name = "requests",
+        .qualified_name = dep_project,
+        .file_path = "__init__.py",
+        .start_line = 1,
+        .end_line = 1,
+        .properties_json = "{}",
+    };
+    ASSERT_GT(cbm_store_upsert_node(s, &dep_node), 0);
+    ASSERT_GT(cbm_store_count_nodes(s, dep_project), 0);
     cbm_store_close(s);
 
     /* Step 2: fast-mode reindex — tools/util.go MUST survive (additive semantics) */
@@ -10379,11 +10400,11 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     ASSERT_GTE(total_after, total_before); /* additive — never less */
     cbm_store_close(s);
 
-    /* Step 3: mutate main.go and fast reindex — forces dump_and_persist to
+    /* Step 3: mutate main.go and fast reindex — forces publish_and_persist to
      * run (instead of the noop early-return path that step 2 hit). This is
      * the real dangerous path: the gbuf gets loaded, mutated for main.go,
-     * dumped back to disk. tools/util.go must survive THAT cycle, not just
-     * the trivial noop path. Audit finding from 2026-04-13. */
+     * and published back to the store. tools/util.go must survive that cycle,
+     * not just the trivial noop path. Audit finding from 2026-04-13. */
     snprintf(path, sizeof(path), "%s/main.go", tmpdir);
     f = fopen(path, "w");
     ASSERT_NOT_NULL(f);
@@ -10415,9 +10436,10 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     int tools_count_run3 = 0;
     cbm_store_find_nodes_by_file(s, project, "tools/util.go", &tools_nodes_run3, &tools_count_run3);
     /* tools/util.go nodes must STILL be present after a fast reindex that
-     * actually ran the full dump_and_persist cycle (not the noop fast-path). */
+     * actually ran the full publish_and_persist cycle (not the noop fast-path). */
     ASSERT_EQ(tools_count_run3, tools_count_before);
     cbm_store_free_nodes(tools_nodes_run3, tools_count_run3);
+    ASSERT_GT(cbm_store_count_nodes(s, dep_project), 0);
     cbm_store_close(s);
 
     /* Step 4: actually delete tools/util.go from disk and full-reindex.
@@ -11960,7 +11982,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_full_mode_keeps_exact_upsert_disabled);
     RUN_TEST(incremental_detects_same_size_rewrite_with_preserved_mtime);
     RUN_TEST(incremental_missing_file_state_keeps_legacy_metadata_path);
-    RUN_TEST(incremental_dump_failure_keeps_existing_db);
+    RUN_TEST(incremental_publish_failure_keeps_existing_db);
     RUN_TEST(incremental_postpass_failure_keeps_existing_db);
     RUN_TEST(incremental_hash_persist_failure_falls_back_to_full);
     RUN_TEST(incremental_parallel_extract_failure_keeps_existing_db);

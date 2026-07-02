@@ -170,7 +170,7 @@ static bool *classify_files(cbm_store_t *store, const char *project, cbm_file_in
  * from a live graph mid-session).
  *
  * Mode-skipped hash preservation is the second half of the additive-merge
- * contract: dump_and_persist re-upserts these hash rows so the next reindex
+ * contract: publish_and_persist re-upserts these hash rows so the next reindex
  * can correctly detect a real on-disk deletion of a mode-skipped file (as
  * opposed to seeing it as "never existed" → noop → orphaned graph nodes).
  *
@@ -1421,27 +1421,28 @@ cleanup:
     return CBM_STORE_OK;
 }
 
-/* Atomically dump merged graph + hashes to disk.
+/* Transactionally publish the merged project graph + hashes.
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
  * reindexes can correctly distinguish "never indexed" from "indexed but
  * not visited this pass". */
-static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
-                            cbm_file_info_t *files, int file_count,
-                            const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
-                            const char *repo_path, const char *pass_fingerprint, int mode) {
+static int publish_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
+                               cbm_file_info_t *files, int file_count,
+                               const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
+                               const char *repo_path, const char *pass_fingerprint, int mode) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
-    int dump_rc = cbm_gbuf_dump_to_sqlite(gbuf, db_path);
-    cbm_log_info("incremental.dump", "rc", itoa_buf_incr(dump_rc), "elapsed_ms",
-                 itoa_buf_incr((int)elapsed_ms_incr(t)));
-    if (dump_rc != 0) {
-        cbm_log_error("incremental.err", "phase", "dump", "rc", itoa_buf_incr(dump_rc));
-        return dump_rc;
-    }
-
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {
+        int flush_rc = cbm_gbuf_flush_to_store(gbuf, hash_store);
+        cbm_log_info("incremental.flush", "rc", itoa_buf_incr(flush_rc), "elapsed_ms",
+                     itoa_buf_incr((int)elapsed_ms_incr(t)));
+        if (flush_rc != 0) {
+            cbm_log_error("incremental.err", "phase", "flush", "rc", itoa_buf_incr(flush_rc));
+            cbm_store_close(hash_store);
+            return flush_rc;
+        }
+
         int hash_rc =
             persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
         int state_rc = CBM_STORE_OK;
@@ -1470,8 +1471,8 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
             return owner_rc;
         }
 
-        /* The direct btree dump bypasses any triggers that could have kept the
-         * contentless FTS table synchronized, so rebuild it after replacement. */
+        /* Project replacement rewrites node IDs and the contentless FTS table
+         * has no backing content to cascade from, so rebuild it after publish. */
         int fts_rc = cbm_store_rebuild_nodes_fts(hash_store);
         if (fts_rc != CBM_STORE_OK) {
             cbm_log_error("incremental.err", "phase", "rebuild_nodes_fts", "rc",
@@ -1798,18 +1799,18 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_log_info("pass.timing", "pass", "incr_normalize", "elapsed_ms",
                  itoa_buf_incr((int)elapsed_ms_incr(t)));
 
-    /* Step 7: Dump to disk (preserves mode-skipped hash rows so the next
-     * reindex can correctly classify those files instead of seeing them
-     * as never-existed; also exports a fast-mode artifact when one is
-     * already present alongside the repo). */
-    /* Record committed counts before dump_and_persist (whose dump frees the
-     * gbuf node index, zeroing the count) so the #334 plausibility gate also
-     * covers incremental reindexes, not just full ones. */
+    /* Step 7: Publish the merged project graph (preserves mode-skipped hash
+     * rows so the next reindex can correctly classify those files instead of
+     * seeing them as never-existed; also exports a fast-mode artifact when one
+     * is already present alongside the repo). */
+    /* Record committed counts before publishing so the #334 plausibility gate
+     * covers incremental reindexes, not just full publishes. */
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
-    int persist_rc = dump_and_persist(existing, db_path, project, files, file_count, cls.mode_skipped,
-                                      cls.mode_skipped_count, cbm_pipeline_repo_path(p),
-                                      pass_fingerprint, cbm_pipeline_get_mode(p));
+    int persist_rc = publish_and_persist(existing, db_path, project, files, file_count,
+                                         cls.mode_skipped, cls.mode_skipped_count,
+                                         cbm_pipeline_repo_path(p), pass_fingerprint,
+                                         cbm_pipeline_get_mode(p));
     if (persist_rc == 0) {
         cbm_pipeline_set_graph_changed(p, true);
         cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);

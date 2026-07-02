@@ -190,6 +190,7 @@ int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t
  * verification and before atomic replacement. Used to prove publish failures
  * leave the previous DB intact. */
 #define CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE "CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE"
+#define CBM_TEST_FAIL_GBUF_FLUSH_BEFORE_COMMIT "CBM_TEST_FAIL_GBUF_FLUSH_BEFORE_COMMIT"
 
 /* Dump the entire buffer to a SQLite file using the direct page writer.
  * Assigns sequential final IDs and remaps edge references.
@@ -197,7 +198,7 @@ int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t
 int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path);
 
 /* Flush the buffer to an existing store via the store API.
- * Deletes existing project data first. Returns 0 on success. */
+ * Transactionally replaces one project and preserves other projects. */
 int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store);
 
 /* Merge nodes and edges from gb into an already-open store WITHOUT wiping
