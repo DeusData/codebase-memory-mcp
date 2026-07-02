@@ -2034,24 +2034,23 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
         return CBM_NOT_FOUND;
     }
 
+    CBM_PROF_START(t_flush_total);
     int64_t *temp_to_real = NULL;
     const char *phase = "begin_bulk";
+    CBM_PROF_START(t_begin_bulk);
     int rc = cbm_store_begin_bulk(store);
+    CBM_PROF_END("gbuf_flush", "0_begin_bulk", t_begin_bulk);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
 
     phase = "begin";
+    CBM_PROF_START(t_begin);
     rc = cbm_store_begin(store);
+    CBM_PROF_END("gbuf_flush", "1_begin", t_begin);
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_end_bulk(store);
         return rc;
-    }
-
-    phase = "drop_indexes";
-    rc = cbm_store_drop_indexes(store);
-    if (rc != CBM_STORE_OK) {
-        goto fail;
     }
 
     /* Delete the project row so ON DELETE CASCADE clears graph and freshness
@@ -2059,13 +2058,27 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
      * This preserves sibling projects, including dependency subprojects; caller
      * code still owns contentless FTS rebuilds and user-authored project memory. */
     phase = "delete_project";
+    CBM_PROF_START(t_delete_project);
     rc = cbm_store_delete_project(store, gb->project);
+    CBM_PROF_END("gbuf_flush", "2_delete_project", t_delete_project);
+    if (rc != CBM_STORE_OK) {
+        goto fail;
+    }
+
+    /* Keep indexes during the cascade delete above: SQLite uses the child-table
+     * FK indexes to avoid scanning the whole graph. Drop them only for inserts. */
+    phase = "drop_indexes";
+    CBM_PROF_START(t_drop_indexes);
+    rc = cbm_store_drop_indexes(store);
+    CBM_PROF_END("gbuf_flush", "3_drop_indexes", t_drop_indexes);
     if (rc != CBM_STORE_OK) {
         goto fail;
     }
 
     phase = "upsert_project";
+    CBM_PROF_START(t_upsert_project);
     rc = cbm_store_upsert_project(store, gb->project, gb->root_path);
+    CBM_PROF_END("gbuf_flush", "4_upsert_project", t_upsert_project);
     if (rc != CBM_STORE_OK) {
         goto fail;
     }
@@ -2082,6 +2095,7 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     }
 
     phase = "upsert_nodes";
+    CBM_PROF_START(t_upsert_nodes);
     for (int i = 0; i < gb->nodes.count; i++) {
         cbm_gbuf_node_t *n = gb->nodes.items[i];
 
@@ -2109,9 +2123,11 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
             temp_to_real[n->id] = real_id;
         }
     }
+    CBM_PROF_END_N("gbuf_flush", "5_upsert_nodes", t_upsert_nodes, gb->nodes.count);
 
     /* Insert all edges with remapped IDs */
     phase = "insert_edges";
+    CBM_PROF_START(t_insert_edges);
     for (int i = 0; i < gb->edges.count; i++) {
         cbm_gbuf_edge_t *e = gb->edges.items[i];
         int64_t real_src = (e->source_id < max_temp_id) ? temp_to_real[e->source_id] : 0;
@@ -2132,9 +2148,12 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
             goto fail;
         }
     }
+    CBM_PROF_END_N("gbuf_flush", "6_insert_edges", t_insert_edges, gb->edges.count);
 
     phase = "create_indexes";
+    CBM_PROF_START(t_create_indexes);
     rc = cbm_store_create_indexes(store);
+    CBM_PROF_END("gbuf_flush", "7_create_indexes", t_create_indexes);
     if (rc != CBM_STORE_OK) {
         goto fail;
     }
@@ -2144,11 +2163,16 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
         goto fail;
     }
     phase = "commit";
+    CBM_PROF_START(t_commit);
     rc = cbm_store_commit(store);
+    CBM_PROF_END("gbuf_flush", "8_commit", t_commit);
     if (rc != CBM_STORE_OK) {
         goto fail;
     }
+    CBM_PROF_START(t_end_bulk);
     int end_bulk_rc = cbm_store_end_bulk(store);
+    CBM_PROF_END("gbuf_flush", "9_end_bulk", t_end_bulk);
+    CBM_PROF_END_N("gbuf_flush", "TOTAL", t_flush_total, gb->nodes.count + gb->edges.count);
 
     free(temp_to_real);
     return end_bulk_rc == CBM_STORE_OK ? 0 : end_bulk_rc;
