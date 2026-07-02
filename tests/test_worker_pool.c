@@ -402,6 +402,26 @@ TEST(parallel_for_no_duplicates) {
     PASS();
 }
 
+TEST(parallel_for_workers_above_count_visits_each_index_once) {
+    enum {
+        OVERWORKER_COUNT = 2,
+        OVERWORKER_MAX_WORKERS = 64,
+    };
+    _Atomic int counts[OVERWORKER_COUNT];
+    for (int i = 0; i < OVERWORKER_COUNT; i++) {
+        atomic_init(&counts[i], 0);
+    }
+
+    cbm_parallel_for_opts_t opts = {.max_workers = OVERWORKER_MAX_WORKERS,
+                                    .force_pthreads = false};
+    cbm_parallel_for(OVERWORKER_COUNT, count_visit_worker, counts, opts);
+
+    for (int i = 0; i < OVERWORKER_COUNT; i++) {
+        ASSERT_EQ(atomic_load(&counts[i]), 1);
+    }
+    PASS();
+}
+
 /* Helper for single_iteration_idx_zero test */
 static int g_received_idx = -1;
 
@@ -471,6 +491,7 @@ SUITE(worker_pool) {
     RUN_TEST(parallel_for_immediate_return_callback);
     RUN_TEST(parallel_for_context_passed_correctly);
     RUN_TEST(parallel_for_no_duplicates);
+    RUN_TEST(parallel_for_workers_above_count_visits_each_index_once);
     RUN_TEST(parallel_for_single_iteration_idx_zero);
     RUN_TEST(parallel_for_serial_matches_parallel);
 }

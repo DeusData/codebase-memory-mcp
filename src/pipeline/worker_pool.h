@@ -23,6 +23,7 @@ typedef struct {
 
 /* Dispatch `count` iterations of `fn(idx, ctx)` across worker threads plus
  * the caller thread, with no more than opts.max_workers callbacks active.
+ * Worker count is clamped to count; no idle helper threads are created.
  * Each index [0..count-1] is visited exactly once.
  * Blocks until all iterations complete.
  *

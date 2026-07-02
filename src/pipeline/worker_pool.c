@@ -104,6 +104,9 @@ void cbm_parallel_for(int count, cbm_parallel_fn fn, void *ctx, cbm_parallel_for
     if (nworkers < WP_MIN) {
         nworkers = SKIP_ONE;
     }
+    if (nworkers > count) {
+        nworkers = count;
+    }
 
     /* Serial fallback: single worker or trivially small workload */
     if (nworkers <= WP_MIN || count <= WP_MIN) {
