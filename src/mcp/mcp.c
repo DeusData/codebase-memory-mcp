@@ -692,13 +692,15 @@ static const tool_def_t TOOLS[] = {
      "Does not index projects; use search_graph or index_repository first. "
      "Case-insensitive by default. "
      "Use for string literals, error messages, and config values not in the knowledge graph. "
-     "Use path_filter regex to scope results to specific paths.",
+     "Use file_pattern to narrow traversal; path_filter filters result paths and can fast-scope "
+     "anchored literal file regexes.",
      "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"description\":"
      "\"Text or regex to search for.\"},\"project\":{\"type\":"
      "\"string\",\"description\":\"Indexed project name. Omit to use the current MCP "
      "server project after it has been indexed.\"},\"file_pattern\":{\"type\":\"string\",\"description\":\"Glob for grep "
-     "--include (e.g. *.go)\"},\"path_filter\":{\"type\":\"string\",\"description\":\"Regex "
-     "filter on result file paths (e.g. ^src/ or \\\\.(go|ts)$)\"},"
+     "--include; use this to reduce traversal (e.g. *.go).\"},\"path_filter\":{\"type\":\"string\",\"description\":\"Regex "
+     "filter on result file paths; anchored literal file regexes such as ^src/main\\\\.go$ "
+     "search only that file.\"},"
      "\"regex\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Treat pattern as a "
      "regular expression instead of literal text.\"},"
      "\"case_sensitive\":{\"type\":\"boolean\",\"default\":false,"
@@ -6132,8 +6134,14 @@ static yyjson_mut_val *build_dir_distribution(yyjson_mut_doc *doc, search_result
 static char *assemble_search_output(search_result_t *sr, int sr_count, grep_match_t *raw,
                                     int raw_count, int gm_count, int limit, int mode,
                                     int context_lines, const char *root_path,
-                                    bool warn_literal_pipe, uint64_t elapsed_ms) {
-    enum { MODE_COMPACT = 0, MODE_FULL = 1, MODE_FILES = 2, SEARCH_SLOW_MS = 5000 };
+                                    bool warn_literal_pipe, uint64_t elapsed_ms,
+                                    const char *search_scope) {
+    enum {
+        MODE_COMPACT = 0,
+        MODE_FULL = 1,
+        MODE_FILES = 2,
+        SEARCH_SLOW_MS = (int)(CBM_SZ_5 * CBM_MSEC_PER_SEC),
+    };
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
@@ -6189,6 +6197,8 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
     yyjson_mut_obj_add_int(doc, root_obj, "total_results", sr_count);
     yyjson_mut_obj_add_int(doc, root_obj, "raw_match_count", raw_count);
     yyjson_mut_obj_add_int(doc, root_obj, "elapsed_ms", (int)elapsed_ms);
+    yyjson_mut_obj_add_str(doc, root_obj, "search_scope",
+                           search_scope ? search_scope : "project_recursive");
     if (sr_count > 0 && gm_count > 0) {
         char ratio[CBM_SZ_32];
         snprintf(ratio, sizeof(ratio), "%.1fx", (double)gm_count / (double)(sr_count + raw_count));
@@ -6445,6 +6455,72 @@ static bool validate_search_args(const char *root_path, const char *file_pattern
     return true;
 }
 
+static bool search_rel_path_is_safe(const char *rel_path) {
+    if (!rel_path || !rel_path[0] || rel_path[0] == '/' || rel_path[0] == '\\') {
+        return false;
+    }
+    if (((rel_path[0] >= 'a' && rel_path[0] <= 'z') ||
+         (rel_path[0] >= 'A' && rel_path[0] <= 'Z')) &&
+        rel_path[1] == ':') {
+        return false;
+    }
+
+    const char *seg = rel_path;
+    for (const char *p = rel_path;; p++) {
+        if (*p == '/' || *p == '\\' || *p == '\0') {
+            size_t len = (size_t)(p - seg);
+            if ((len == SKIP_ONE && seg[0] == '.') ||
+                (len == PAIR_LEN && seg[0] == '.' && seg[SKIP_ONE] == '.')) {
+                return false;
+            }
+            if (*p == '\0') {
+                break;
+            }
+            seg = p + SKIP_ONE;
+        }
+    }
+    return true;
+}
+
+static bool regex_meta_char(char c) {
+    return strchr(".^$*+?()[]{}|\\", c) != NULL;
+}
+
+static bool extract_exact_path_filter(const char *filter, char *out, size_t out_sz) {
+    if (!filter || !out || out_sz == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    size_t len = strlen(filter);
+    if (len < CBM_SZ_3 || filter[0] != '^' || filter[len - SKIP_ONE] != '$') {
+        return false;
+    }
+
+    size_t pos = 0;
+    for (size_t i = SKIP_ONE; i + SKIP_ONE < len; i++) {
+        char c = filter[i];
+        if (c == '\\') {
+            if (i + PAIR_LEN > len - SKIP_ONE) {
+                return false;
+            }
+            c = filter[++i];
+            if (!regex_meta_char(c)) {
+                return false;
+            }
+        } else if (regex_meta_char(c)) {
+            return false;
+        }
+        if (pos + SKIP_ONE >= out_sz) {
+            out[0] = '\0';
+            return false;
+        }
+        out[pos++] = c;
+    }
+    out[pos] = '\0';
+    cbm_normalize_path_sep(out);
+    return validate_search_path_arg(out) && search_rel_path_is_safe(out);
+}
+
 /* Write pattern to a temp file for grep -f. Returns true on success. */
 static bool write_pattern_file(char *tmpfile, int tmpfile_sz, const char *pattern) {
     if (!tmpfile || tmpfile_sz <= 0 || !pattern) {
@@ -6492,6 +6568,11 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
     char *path_filter = cbm_mcp_get_string_arg(args, "path_filter");
+    char exact_filter_path[CBM_PATH_MAX];
+    exact_filter_path[0] = '\0';
+    bool has_exact_filter_path =
+        !file_pattern && extract_exact_path_filter(path_filter, exact_filter_path,
+                                                   sizeof(exact_filter_path));
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     int context_lines = cbm_mcp_get_int_arg(args, "context", 0);
     int cfg_search_limit_sc = cbm_config_get_int(srv->config, CBM_CONFIG_SEARCH_LIMIT,
@@ -6541,6 +6622,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     path_filter = NULL;
 
     if (!pattern) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(project);
         free(file_pattern);
         return cbm_mcp_text_result(
@@ -6553,6 +6637,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         project = heap_strdup(srv->session_project);
     }
     if (!project) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(pattern);
         free(file_pattern);
         char *_err = build_project_list_error("project is required");
@@ -6563,6 +6650,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     char *root_path = get_project_root(srv, project);
     if (!root_path) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(pattern);
         free(project);
         free(file_pattern);
@@ -6646,6 +6736,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         char errmsg[CBM_SZ_256];
         snprintf(errmsg, sizeof(errmsg), "search failed: cannot create temp file (%s)",
                  strerror(errno));
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(root_path);
         free(pattern);
         free(project);
@@ -6664,14 +6757,17 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     enum { GREP_MAX_MATCHES = 500 };
     int grep_limit = GREP_MAX_MATCHES;
 
-    /* Always grep the full project root — scoping to indexed files only would
-     * miss files written or modified after the last index run (e.g. in tests
-     * and in active development workflows where new files aren't yet indexed).
-     * Vendored/generated code can be excluded via .gitignore or path_filter. */
+    /* Default to the full project root so active edits and newly created files
+     * are searchable before the next index. Exact literal path_filter values can
+     * safely narrow traversal to one file; general regex path_filter stays a
+     * post-filter because approximating regexes as filesystem globs is lossy. */
     char filelist[CBM_PATH_MAX];
     int filelist_len = snprintf(filelist, sizeof(filelist), "%s.files", tmpfile);
     if (filelist_len < 0 || (size_t)filelist_len >= sizeof(filelist)) {
         cbm_unlink(tmpfile);
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(root_path);
         free(pattern);
         free(project);
@@ -6681,11 +6777,33 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
             "\"hint\":\"Use a shorter TMPDIR/TEMP path or project path.\"}", true);
     }
     bool scoped = false;
+    char grep_root[CBM_PATH_MAX];
+    const char *grep_target = root_path;
+    if (has_exact_filter_path) {
+        int gn = snprintf(grep_root, sizeof(grep_root), "%s/%s", root_path, exact_filter_path);
+        if (gn < 0 || (size_t)gn >= sizeof(grep_root) || !validate_search_path_arg(grep_root)) {
+            cbm_unlink(tmpfile);
+            free(root_path);
+            free(pattern);
+            free(project);
+            free(file_pattern);
+            if (has_path_filter) {
+                cbm_regfree(&path_regex);
+            }
+            return cbm_mcp_text_result(
+                "{\"error\":\"search failed: exact path_filter path too long\","
+                "\"hint\":\"Use a shorter project path or path_filter.\"}", true);
+        }
+        grep_target = grep_root;
+    }
 
-    char cmd[4096];
+    char cmd[CBM_SZ_4K];
     if (!build_grep_cmd(cmd, sizeof(cmd), use_regex, case_sensitive, scoped, file_pattern, tmpfile,
-                        filelist, root_path)) {
+                        filelist, grep_target)) {
         cbm_unlink(tmpfile);
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(root_path);
         free(pattern);
         free(project);
@@ -6700,6 +6818,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         cbm_unlink(tmpfile);
         if (scoped) {
             cbm_unlink(filelist);
+        }
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
         }
         free(root_path);
         free(pattern);
@@ -6770,9 +6891,11 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     /* ── Phase 4: Context assembly (extracted helper) ─────────── */
 
+    const char *search_scope = has_exact_filter_path ? "path_filter_exact" : "project_recursive";
     char *result =
         assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode, context_lines,
-                               root_path, pat_has_pipe && !use_regex, cbm_now_ms() - search_t0);
+                               root_path, pat_has_pipe && !use_regex, cbm_now_ms() - search_t0,
+                               search_scope);
     free(gm);
     free(sr);
     free(raw);

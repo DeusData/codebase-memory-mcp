@@ -2117,6 +2117,31 @@ TEST(search_code_ampersand_accepted_issue272) {
     PASS();
 }
 
+TEST(search_code_exact_path_filter_scopes_traversal) {
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":95,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"HandleRequest\","
+                                   "\"path_filter\":\"^main\\\\.go$\","
+                                   "\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"search_scope\":\"path_filter_exact\""));
+    ASSERT_NOT_NULL(strstr(inner, "HandleRequest"));
+    ASSERT_NULL(strstr(inner, "\"isError\":true"));
+
+    free(inner);
+    free(resp);
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_detect_changes_no_project) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -3744,6 +3769,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
     RUN_TEST(search_code_ampersand_accepted_issue272);
+    RUN_TEST(search_code_exact_path_filter_scopes_traversal);
     RUN_TEST(tool_detect_changes_no_project);
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
