@@ -216,8 +216,7 @@ const char *cbm_detect_shell_rc(const char *home_dir) {
     if (strstr(shell, "/bash")) {
         /* Prefer .bashrc, fall back to .bash_profile */
         snprintf(buf, sizeof(buf), "%s/.bashrc", home_dir);
-        struct stat st;
-        if (stat(buf, &st) == 0) {
+        if (cbm_file_exists(buf)) {
             return buf;
         }
         snprintf(buf, sizeof(buf), "%s/.bash_profile", home_dir);
@@ -243,12 +242,12 @@ const char *cbm_detect_shell_rc(const char *home_dir) {
 #endif
 
 /* Check if a path exists and is executable.
- * On Windows, stat() doesn't set S_IXUSR — just check existence. */
+ * On Windows, executable-bit checks are not portable, so existence is enough. */
 static bool is_executable(const char *path) {
-    struct stat st;
 #ifdef _WIN32
-    return stat(path, &st) == 0;
+    return cbm_file_exists(path);
 #else
+    struct stat st;
     return stat(path, &st) == 0 && (st.st_mode & S_IXUSR);
 #endif
 }
@@ -407,8 +406,7 @@ int cbm_replace_binary(const char *path, const unsigned char *data, int len, int
     /* Remove existing file if it exists. On Unix, unlink works even if the
      * binary is running (inode stays alive until the process exits). On Windows,
      * unlink fails on running .exe — rename it aside as fallback. */
-    struct stat st_check;
-    if (stat(path, &st_check) == 0) {
+    if (cbm_file_exists(path)) {
         /* File exists — remove or rename it */
         if (cbm_unlink(path) != 0) {
 #ifdef _WIN32
@@ -419,7 +417,7 @@ int cbm_replace_binary(const char *path, const unsigned char *data, int len, int
                 return CLI_ERR;
             }
             (void)cbm_unlink(old_path);
-            if (rename(path, old_path) != 0) {
+            if (cbm_move_file_no_replace(path, old_path) != 0) {
                 return CLI_ERR;
             }
 #else
@@ -1163,8 +1161,7 @@ int cbm_remove_zed_mcp(const char *config_path) {
 /* ── Agent detection ──────────────────────────────────────────── */
 
 static bool dir_exists(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+    return cbm_is_dir(path);
 }
 
 /* Resolve the Claude Code config dir.
