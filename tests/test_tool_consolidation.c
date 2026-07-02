@@ -538,6 +538,8 @@ TEST(revealed_advanced_tool_schema_matches_handlers) {
 
     ASSERT(tool_schema_has_property(json, "get_code_snippet", "compact"));
     ASSERT(tool_schema_has_property(json, "get_architecture", "exclude"));
+    ASSERT(!tool_schema_required_has(json, "get_graph_schema", "project"));
+    ASSERT(!tool_schema_required_has(json, "get_architecture", "project"));
     ASSERT_NOT_NULL(strstr(json, "Graph edge creation from traces is not yet implemented"));
     ASSERT_NOT_NULL(strstr(json, "Reserved for future multi-hop impact traversal"));
 

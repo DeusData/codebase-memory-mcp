@@ -612,8 +612,8 @@ static const tool_def_t TOOLS[] = {
 
     {"get_graph_schema", "Get the schema of the knowledge graph (node labels, edge types)",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
-     "\"Indexed project name to inspect.\"}},\"required\":["
-     "\"project\"]}"},
+     "\"Indexed project name or repository directory. Omit to use the MCP server project derived "
+     "from server CWD; first use may auto-index it.\"}}}"},
 
     {"get_architecture",
      "Get high-level architecture overview: packages, services, dependencies, and project "
@@ -622,15 +622,15 @@ static const tool_def_t TOOLS[] = {
      "representative top_nodes, and the packages/edge_types that bind it). Use these to inspect "
      "actual dependency-based module boundaries, which may differ from the folder layout.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
-     "\"Indexed project name to summarize.\"},\"path\":{\"type\":\"string\",\"description\":"
+     "\"Indexed project name or repository directory. Omit to use the MCP server project derived "
+     "from server CWD; first use may auto-index it.\"},\"path\":{\"type\":\"string\",\"description\":"
      "\"Optional relative directory/file prefix to scope architecture counts and sections, e.g. "
      "src/server. Leading ./, leading slash, trailing slash, and backslashes are normalized.\"},"
      "\"aspects\":{\"type\":"
      "\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Optional sections to include; "
      "omit for the default overview.\"},"
      "\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Optional "
-     "file-path globs to omit from key_functions, e.g. tests/** or vendor/**.\"}},"
-     "\"required\":[\"project\"]}"},
+     "file-path globs to omit from key_functions, e.g. tests/** or vendor/**.\"}}}"},
 
     {"search_code",
      "Search source code in an indexed/current project with text or regex patterns. "
