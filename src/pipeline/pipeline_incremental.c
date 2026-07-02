@@ -1022,6 +1022,13 @@ static bool incr_empty_source_inbound_edge_is_structure(const cbm_store_inbound_
            strcmp(edge->type, CBM_PIPELINE_EDGE_CONTAINS_FILE) == 0;
 }
 
+static bool incr_inbound_edge_owner_is_exact_file(const cbm_store_inbound_edge_t *edge,
+                                                  const cbm_file_info_t *exact_files,
+                                                  int exact_count) {
+    return edge && edge->source_rel_path && edge->source_rel_path[0] == '\0' &&
+           incr_file_info_has_rel_path(exact_files, exact_count, edge->edge_rel_path);
+}
+
 static int incr_expand_exact_inbound_frontier(cbm_store_t *store, const char *project,
                                               const cbm_file_info_t *all_files, int all_file_count,
                                               cbm_file_info_t *exact_files, int *exact_count,
@@ -1052,7 +1059,8 @@ static int incr_expand_exact_inbound_frontier(cbm_store_t *store, const char *pr
         for (int i = 0; i < edge_count; i++) {
             const char *source_rel_path = edges[i].source_rel_path;
             if (!source_rel_path || source_rel_path[0] == '\0') {
-                if (incr_empty_source_inbound_edge_is_structure(&edges[i])) {
+                if (incr_empty_source_inbound_edge_is_structure(&edges[i]) ||
+                    incr_inbound_edge_owner_is_exact_file(&edges[i], exact_files, *exact_count)) {
                     continue;
                 }
                 if (out_reason) {
