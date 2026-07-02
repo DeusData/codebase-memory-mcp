@@ -10786,6 +10786,43 @@ TEST(pipeline_semantic_corpus_vectors_independent_of_worker_count) {
     PASS();
 }
 
+TEST(pipeline_semantic_corpus_add_doc_reserves_without_losing_docs) {
+    enum {
+        SEM_RESERVE_DOCS = 70,
+        SEM_RESERVE_TOKEN_COUNT = 2,
+    };
+    const char *tokens[SEM_RESERVE_TOKEN_COUNT] = {"alpha", "beta"};
+    cbm_sem_corpus_t *corpus = cbm_sem_corpus_new();
+    ASSERT_NOT_NULL(corpus);
+
+    for (int i = 0; i < SEM_RESERVE_DOCS; i++) {
+        cbm_sem_corpus_add_doc(corpus, tokens, SEM_RESERVE_TOKEN_COUNT);
+    }
+
+    ASSERT_EQ(cbm_sem_corpus_doc_count(corpus), SEM_RESERVE_DOCS);
+    ASSERT_EQ(cbm_sem_corpus_token_count(corpus), SEM_RESERVE_TOKEN_COUNT);
+    ASSERT_GTE(cbm_sem_corpus_token_id(corpus, "alpha"), 0);
+    ASSERT_GTE(cbm_sem_corpus_token_id(corpus, "beta"), 0);
+
+    cbm_sem_corpus_free(corpus);
+    PASS();
+}
+
+TEST(pipeline_semantic_batch_rejects_invalid_token_stride) {
+    char *tokens[1] = {"alpha"};
+    int counts[1] = {1};
+    cbm_sem_corpus_t *corpus = cbm_sem_corpus_new();
+    ASSERT_NOT_NULL(corpus);
+
+    cbm_sem_corpus_add_docs_batch_with_workers(corpus, tokens, counts, 1, 0, 1);
+
+    ASSERT_EQ(cbm_sem_corpus_doc_count(corpus), 0);
+    ASSERT_EQ(cbm_sem_corpus_token_count(corpus), 0);
+
+    cbm_sem_corpus_free(corpus);
+    PASS();
+}
+
 static const cbm_config_entry_t *find_config_entry(const char *key) {
     for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
         if (strcmp(CBM_CONFIG_REGISTRY[i].key, key) == 0) {
@@ -11487,6 +11524,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_apply_config_sets_all_thresholds);
     RUN_TEST(pipeline_semantic_edges_independent_of_call_insertion_order);
     RUN_TEST(pipeline_semantic_corpus_vectors_independent_of_worker_count);
+    RUN_TEST(pipeline_semantic_corpus_add_doc_reserves_without_losing_docs);
+    RUN_TEST(pipeline_semantic_batch_rejects_invalid_token_stride);
     RUN_TEST(config_registry_includes_mcp_timeout_knobs);
     RUN_TEST(config_registry_includes_incremental_reindex_policy);
     RUN_TEST(config_registry_includes_rank_refresh_policy);
