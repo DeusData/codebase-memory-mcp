@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -36,6 +37,10 @@ CONFIG_DB_NAME = "_config.db"
 LOG_TAIL_LINES = 24
 MCP_INIT_PROTOCOL_VERSION = "2024-11-05"
 MATRIX_SCENARIOS_DEFAULT = "go_modify_1,go_modify_2,go_create,go_delete,go_rename,go_new_folder,route_decorator,python_reexport"
+SELF_DOGFOOD_SCENARIOS_DEFAULT = "noop,one_source_file,route_handler,store_pipeline_batch,multi_file_small"
+SELF_DOGFOOD_MARKER_PREFIX = "cbm_pan4_oracle"
+SELF_DOGFOOD_REPO_SUBDIR = "repo"
+SELF_DOGFOOD_CACHE_SUBDIR = "cache"
 PUBLISH_FULL = "full"
 PUBLISH_INCREMENTAL_NOOP = "incremental_noop"
 PUBLISH_INCREMENTAL_EXACT = "incremental_exact"
@@ -121,6 +126,19 @@ def command_result(
         timeout=timeout,
     )
     return proc, now_ms() - start
+
+
+def command_stdout(cmd: list[str], timeout: int, cwd: Path | None = None) -> str:
+    proc, _ = command_result(cmd, dict(os.environ), timeout, cwd)
+    if proc.returncode != 0:
+        rendered = " ".join(cmd)
+        raise RuntimeError(f"{rendered} failed: {proc.stderr.strip()}")
+    return proc.stdout.strip()
+
+
+def append_text(path: Path, text: str) -> None:
+    current = path.read_text(encoding="utf-8")
+    path.write_text(current + text, encoding="utf-8")
 
 
 def unwrap_cli_json(stdout: str) -> dict[str, Any]:
@@ -470,6 +488,74 @@ def run_mcp_tool_probe(
     return build_tool_probe_result(data, stderr, stdout_bytes, elapsed_ms, include_logs)
 
 
+def build_tool_call_result(
+    data: dict[str, Any],
+    stderr: str,
+    stdout_bytes: int,
+    elapsed_ms: float,
+    include_logs: bool,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "elapsed_ms": round(elapsed_ms, 3),
+        "stdout_bytes": stdout_bytes,
+        "response": data,
+        "freshness_state": response_freshness_state(data) or None,
+        "freshness": response_freshness(data),
+        "stderr_tail": log_tail(stderr),
+    }
+    if include_logs:
+        result["stderr"] = stderr
+    return result
+
+
+def run_cli_tool_call(
+    binary: Path,
+    env: dict[str, str],
+    tool_name: str,
+    arguments: dict[str, Any],
+    timeout: int,
+    include_logs: bool,
+) -> dict[str, Any]:
+    proc, elapsed_ms = command_result(
+        [str(binary), "cli", "--json", tool_name, json.dumps(arguments, separators=(",", ":"))],
+        env,
+        timeout,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"{tool_name} call failed: {proc.stderr.strip()}")
+    data = unwrap_cli_json(proc.stdout)
+    return build_tool_call_result(
+        data, proc.stderr, len(proc.stdout.encode("utf-8")), elapsed_ms, include_logs
+    )
+
+
+def run_mcp_tool_call(
+    client: McpClient,
+    tool_name: str,
+    arguments: dict[str, Any],
+    include_logs: bool,
+) -> dict[str, Any]:
+    data, stderr, stdout_bytes, elapsed_ms = client.call_tool(tool_name, arguments)
+    return build_tool_call_result(data, stderr, stdout_bytes, elapsed_ms, include_logs)
+
+
+def run_tool_call_for_transport(
+    transport: str,
+    binary: Path,
+    env: dict[str, str],
+    tool_name: str,
+    arguments: dict[str, Any],
+    timeout: int,
+    include_logs: bool,
+    client: McpClient | None = None,
+) -> dict[str, Any]:
+    if transport == "mcp":
+        if client is None:
+            raise RuntimeError("MCP transport requires an active client")
+        return run_mcp_tool_call(client, tool_name, arguments, include_logs)
+    return run_cli_tool_call(binary, env, tool_name, arguments, timeout, include_logs)
+
+
 def summarize_elapsed_ms(probes: list[dict[str, Any]]) -> dict[str, Any]:
     elapsed = sorted(float(probe["elapsed_ms"]) for probe in probes)
     if not elapsed:
@@ -540,8 +626,13 @@ def find_project_db(cache_dir: Path) -> Path:
     return dbs[0]
 
 
+def decode_sqlite_text(data: bytes) -> str:
+    return data.decode("utf-8", "surrogateescape")
+
+
 def canonical_query_rows(db_path: Path, project: str, sql: str) -> list[str]:
     con = sqlite3.connect(str(db_path))
+    con.text_factory = decode_sqlite_text
     try:
         rows = [str(row[0]) for row in con.execute(sql, (project,))]
     finally:
@@ -686,6 +777,210 @@ def mutate_matrix_scenario(name: str, repo_dir: Path, funcs_per_file: int) -> li
     raise ValueError(f"unknown matrix scenario: {name}")
 
 
+def resolve_git_repo_root(repo_root: Path, timeout: int) -> Path:
+    root = repo_root.expanduser().resolve()
+    return Path(command_stdout(["git", "rev-parse", "--show-toplevel"], timeout, root)).resolve()
+
+
+def git_metadata(repo_root: Path, timeout: int) -> dict[str, Any]:
+    def maybe(args: list[str]) -> str:
+        try:
+            return command_stdout(["git", *args], timeout, repo_root)
+        except Exception as exc:  # noqa: BLE001 - metadata should not abort benchmark execution.
+            return f"<error: {type(exc).__name__}: {exc}>"
+
+    return {
+        "repo_root": str(repo_root),
+        "head": maybe(["rev-parse", "HEAD"]),
+        "short_head": maybe(["rev-parse", "--short", "HEAD"]),
+        "branch": maybe(["branch", "--show-current"]),
+        "dirty_status_short": maybe(["status", "--short"]),
+    }
+
+
+def create_self_dogfood_worktree(source_repo: Path, case_root: Path, timeout: int) -> Path:
+    repo_dir = case_root / SELF_DOGFOOD_REPO_SUBDIR
+    if repo_dir.exists():
+        raise RuntimeError(f"self-dogfood worktree already exists: {repo_dir}")
+    proc, _ = command_result(
+        ["git", "worktree", "add", "--detach", str(repo_dir), "HEAD"],
+        dict(os.environ),
+        timeout,
+        source_repo,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"git worktree add failed: {proc.stderr.strip()}")
+    return repo_dir
+
+
+def remove_self_dogfood_worktree(source_repo: Path, repo_dir: Path, timeout: int) -> dict[str, Any]:
+    cleanup: dict[str, Any] = {"requested": True, "path": str(repo_dir), "removed": False}
+    proc, _ = command_result(
+        ["git", "worktree", "remove", "--force", str(repo_dir)],
+        dict(os.environ),
+        timeout,
+        source_repo,
+    )
+    if proc.returncode != 0:
+        cleanup["git_worktree_remove_error"] = proc.stderr.strip()
+        shutil.rmtree(repo_dir, ignore_errors=True)
+    cleanup["removed"] = not repo_dir.exists()
+    return cleanup
+
+
+def self_dogfood_marker(name: str) -> str:
+    return f"{SELF_DOGFOOD_MARKER_PREFIX}_{name}"
+
+
+def append_c_marker_function(repo_dir: Path, rel_path: str, marker: str, value: int) -> str:
+    append_text(
+        repo_dir / rel_path,
+        (
+            "\n"
+            f"static int {marker}(void) {{\n"
+            f"    return {value};\n"
+            "}\n"
+        ),
+    )
+    return rel_path
+
+
+def mutate_self_dogfood_scenario(name: str, repo_dir: Path) -> dict[str, Any]:
+    marker = self_dogfood_marker(name)
+    changed: list[str] = []
+    if name == "noop":
+        return {"marker": None, "changed_paths": changed, "description": "no source mutation"}
+    if name == "one_source_file":
+        changed.append(
+            append_c_marker_function(repo_dir, "src/pipeline/pipeline_internal.h", marker, 4101)
+        )
+        return {"marker": marker, "changed_paths": changed, "description": "single C header edit"}
+    if name == "route_handler":
+        changed.append(append_c_marker_function(repo_dir, "src/ui/http_server.c", marker, 4102))
+        append_text(
+            repo_dir / "src/ui/http_server.c",
+            "\n/* P.A.N4 route oracle literal: /api/pan4-oracle */\n",
+        )
+        return {
+            "marker": marker,
+            "changed_paths": changed,
+            "description": "HTTP UI handler source edit with route literal oracle",
+        }
+    if name == "store_pipeline_batch":
+        changed.append(append_c_marker_function(repo_dir, "src/store/store.h", marker, 4103))
+        second_marker = f"{marker}_pipeline"
+        changed.append(
+            append_c_marker_function(repo_dir, "src/pipeline/pipeline_internal.h", second_marker, 4104)
+        )
+        return {
+            "marker": marker,
+            "secondary_marker": second_marker,
+            "changed_paths": changed,
+            "description": "small store plus pipeline header batch",
+        }
+    if name == "multi_file_small":
+        changed.append(append_c_marker_function(repo_dir, "src/mcp/mcp.c", marker, 4105))
+        second_marker = f"{marker}_test"
+        changed.append(append_c_marker_function(repo_dir, "tests/test_mcp.c", second_marker, 4106))
+        return {
+            "marker": marker,
+            "secondary_marker": second_marker,
+            "changed_paths": changed,
+            "description": "small production plus test source batch",
+        }
+    raise ValueError(f"unknown self-dogfood scenario: {name}")
+
+
+def oracle_passed(tool_result: dict[str, Any], marker: str | None) -> bool:
+    if not marker:
+        return True
+    response = tool_result.get("response")
+    return marker in json.dumps(response, sort_keys=True)
+
+
+def run_self_dogfood_oracles(
+    transport: str,
+    binary: Path,
+    env: dict[str, str],
+    project: str,
+    mutation: dict[str, Any],
+    args: argparse.Namespace,
+    client: McpClient | None = None,
+) -> dict[str, Any]:
+    marker = mutation.get("marker")
+    changed_paths = list(mutation.get("changed_paths") or [])
+    first_changed = changed_paths[0] if changed_paths else ""
+    oracles: dict[str, Any] = {}
+    if marker:
+        search_code_args: dict[str, Any] = {"project": project, "pattern": marker, "limit": 5}
+        if first_changed:
+            search_code_args["file_pattern"] = Path(first_changed).name
+            search_code_args["path_filter"] = f"^{re.escape(first_changed)}$"
+        oracles["marker_search_graph"] = run_tool_call_for_transport(
+            transport,
+            binary,
+            env,
+            "search_graph",
+            {"project": project, "name_pattern": marker, "limit": 5},
+            args.timeout,
+            args.include_logs,
+            client,
+        )
+        oracles["marker_search_code"] = run_tool_call_for_transport(
+            transport,
+            binary,
+            env,
+            "search_code",
+            search_code_args,
+            args.timeout,
+            args.include_logs,
+            client,
+        )
+    if first_changed:
+        oracles["changed_file_query_graph"] = run_tool_call_for_transport(
+            transport,
+            binary,
+            env,
+            "query_graph",
+            {
+                "project": project,
+                "query": (
+                    "MATCH (n) WHERE n.file_path CONTAINS "
+                    f"'{first_changed}' RETURN n.name, n.label, n.file_path LIMIT 10"
+                ),
+            },
+            args.timeout,
+            args.include_logs,
+            client,
+        )
+        oracles["scoped_architecture"] = run_tool_call_for_transport(
+            transport,
+            binary,
+            env,
+            "get_architecture",
+            {"project": project, "path": first_changed, "aspects": ["all"]},
+            args.timeout,
+            args.include_logs,
+            client,
+        )
+    oracles["route_freshness_probe"] = run_tool_call_for_transport(
+        transport,
+        binary,
+        env,
+        "search_graph",
+        {"project": project, "label": "Route", "limit": 3},
+        args.timeout,
+        args.include_logs,
+        client,
+    )
+    oracles["passed"] = all(
+        oracle_passed(result, marker)
+        for key, result in oracles.items()
+        if key in {"marker_search_graph", "marker_search_code"}
+    )
+    return oracles
+
+
 def run_index_for_transport(
     transport: str,
     binary: Path,
@@ -826,12 +1121,159 @@ def run_matrix(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], 
     return report, exit_code
 
 
+def run_self_dogfood_case(
+    scenario: str,
+    source_repo: Path,
+    binary: Path,
+    case_root: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    cache_dir = case_root / SELF_DOGFOOD_CACHE_SUBDIR
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    repo_dir = create_self_dogfood_worktree(source_repo, case_root, args.timeout)
+    case_env = build_env(cache_dir)
+    cleanup: dict[str, Any] = {"requested": not args.keep_work_root, "removed": False}
+    result: dict[str, Any] | None = None
+    try:
+        run_config_set(binary, case_env, "incremental_reindex", "always", args.timeout)
+        run_config_set(binary, case_env, "rank_refresh", args.rank_refresh, args.timeout)
+        if args.transport == "mcp":
+            with McpClient(binary, case_env, args.timeout) as client:
+                initial = run_index_for_transport(
+                    args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client
+                )
+                mutation = mutate_self_dogfood_scenario(scenario, repo_dir)
+                incremental = run_index_for_transport(
+                    args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client
+                )
+                project_db = find_project_db(cache_dir)
+                project = str(incremental.get("response", {}).get("project") or project_db.stem)
+                oracles = run_self_dogfood_oracles(
+                    args.transport, binary, case_env, project, mutation, args, client
+                )
+        else:
+            initial = run_index_for_transport(
+                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs
+            )
+            mutation = mutate_self_dogfood_scenario(scenario, repo_dir)
+            incremental = run_index_for_transport(
+                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs
+            )
+            project_db = find_project_db(cache_dir)
+            project = str(incremental.get("response", {}).get("project") or project_db.stem)
+            oracles = run_self_dogfood_oracles(
+                args.transport, binary, case_env, project, mutation, args
+            )
+
+        incremental_snapshot = case_root / "incremental.db"
+        shutil.copy2(project_db, incremental_snapshot)
+        removed_dbs = remove_project_dbs(cache_dir)
+        if args.transport == "mcp":
+            with McpClient(binary, case_env, args.timeout) as client:
+                full_rebuild = run_index_for_transport(
+                    args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client
+                )
+        else:
+            full_rebuild = run_index_for_transport(
+                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs
+            )
+        full_db = find_project_db(cache_dir)
+        canonical = compare_canonical_graph(incremental_snapshot, full_db, project)
+        publish_kind = incremental.get("publish_kind")
+        incremental_reason = incremental.get("exact_reason")
+        explicit_route = is_explicit_incremental_route(publish_kind, incremental_reason)
+        speedup = max(1, int(full_rebuild["elapsed_ms"])) / max(1, int(incremental["elapsed_ms"]))
+        passed = bool(canonical.get("equal")) and explicit_route and bool(oracles.get("passed"))
+        result = {
+            "scenario": scenario,
+            "project": project,
+            "repo_dir": str(repo_dir),
+            "mutation": mutation,
+            "removed_project_dbs": removed_dbs,
+            "initial_fast_full": initial,
+            "incremental": incremental,
+            "fresh_fast_full_after_change": full_rebuild,
+            "canonical_graph": canonical,
+            "oracles": oracles,
+            "explicit_incremental_route": explicit_route,
+            "exact_reason": incremental_reason,
+            "speedup_full_rebuild_over_incremental": speedup,
+            "passed": passed,
+        }
+    finally:
+        if not args.keep_work_root:
+            cleanup = remove_self_dogfood_worktree(source_repo, repo_dir, args.timeout)
+        if cache_dir.exists() and not args.keep_work_root:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            cleanup["cache_removed"] = not cache_dir.exists()
+        cleanup["case_root_removed"] = False
+        if not args.keep_work_root and case_root.exists():
+            shutil.rmtree(case_root, ignore_errors=True)
+            cleanup["case_root_removed"] = not case_root.exists()
+    if result is None:
+        raise RuntimeError(f"self-dogfood case did not produce a result: {scenario}")
+    result["cleanup"] = cleanup
+    return result
+
+
+def run_self_dogfood(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], int]:
+    auto_root = not bool(args.work_root)
+    work_root = Path(args.work_root).expanduser() if args.work_root else Path(
+        tempfile.mkdtemp(prefix="cbm-self-dogfood-")
+    )
+    work_root.mkdir(parents=True, exist_ok=True)
+    source_repo = resolve_git_repo_root(Path(args.repo_root), args.timeout)
+    scenarios = [item.strip() for item in args.self_dogfood_scenarios.split(",") if item.strip()]
+    report: dict[str, Any] = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "binary": str(binary),
+        "work_root": str(work_root),
+        "source_repo": str(source_repo),
+        "source_git": git_metadata(source_repo, args.timeout),
+        "mode": "self_dogfood",
+        "parameters": {
+            "rank_refresh": args.rank_refresh,
+            "timeout": args.timeout,
+            "transport": args.transport,
+            "scenarios": scenarios,
+        },
+        "cleanup": {"requested": auto_root and not args.keep_work_root, "removed": False},
+        "cases": [],
+    }
+    exit_code = 1
+    try:
+        for scenario in scenarios:
+            case = run_self_dogfood_case(
+                scenario, source_repo, binary, work_root / scenario, args
+            )
+            report["cases"].append(case)
+        report["derived"] = {
+            "passed": all(bool(case.get("passed")) for case in report["cases"]),
+            "case_count": len(report["cases"]),
+        }
+        exit_code = 0 if report["derived"]["passed"] else 1
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        exit_code = 1
+    finally:
+        if auto_root and not args.keep_work_root:
+            shutil.rmtree(work_root, ignore_errors=True)
+            report["cleanup"]["removed"] = not work_root.exists()
+        if args.out:
+            out_path = Path(args.out).expanduser()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(json.dumps(report, indent=2, sort_keys=True))
+    return report, exit_code
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Gate exact fast-mode incremental indexing against a fresh full rebuild."
     )
     parser.add_argument("--binary", default="build/c/codebase-memory-mcp")
     parser.add_argument("--work-root", default="")
+    parser.add_argument("--repo-root", default=".")
     parser.add_argument("--out", default="")
     parser.add_argument("--files", type=int, default=DEFAULT_FILE_COUNT)
     parser.add_argument("--functions-per-file", type=int, default=DEFAULT_FUNCTIONS_PER_FILE)
@@ -847,9 +1289,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-logs", action="store_true")
     parser.add_argument("--matrix", action="store_true", help="Run the affected-frontier scenario matrix.")
     parser.add_argument(
+        "--self-dogfood",
+        action="store_true",
+        help="Run isolated edit-loop scenarios against a detached worktree of --repo-root.",
+    )
+    parser.add_argument(
         "--matrix-scenarios",
         default=MATRIX_SCENARIOS_DEFAULT,
         help="Comma-separated matrix scenarios to run.",
+    )
+    parser.add_argument(
+        "--self-dogfood-scenarios",
+        default=SELF_DOGFOOD_SCENARIOS_DEFAULT,
+        help="Comma-separated real-repo edit-loop scenarios to run.",
     )
     parser.add_argument(
         "--transport",
@@ -874,18 +1326,29 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_binary_path(binary_arg: str) -> Path:
+    binary = Path(binary_arg).expanduser()
+    if binary.is_absolute():
+        return binary.resolve()
+    cwd_candidate = (Path.cwd() / binary).resolve()
+    if cwd_candidate.is_file():
+        return cwd_candidate
+    script_candidate = (Path(__file__).resolve().parents[1] / binary).resolve()
+    return script_candidate
+
+
 def main() -> int:
     args = parse_args()
-    binary = Path(args.binary).expanduser()
-    if not binary.is_absolute():
-        binary = Path.cwd() / binary
-    binary = binary.resolve()
+    binary = resolve_binary_path(args.binary)
     if not binary.is_file():
         print(f"error: binary not found: {binary}", file=sys.stderr)
         return 2
     if args.matrix:
         _, matrix_exit_code = run_matrix(args, binary)
         return matrix_exit_code
+    if args.self_dogfood:
+        _, self_dogfood_exit_code = run_self_dogfood(args, binary)
+        return self_dogfood_exit_code
 
     auto_root = not bool(args.work_root)
     work_root = Path(args.work_root).expanduser() if args.work_root else Path(
