@@ -1433,11 +1433,10 @@ static const char *project_db_path(const char *project, char *buf, size_t bufsz)
 /* Try to identify the project prefix of a qualified name by scanning each
  * dot-separated prefix and checking if a matching DB file exists.
  * Returns a heap-allocated project name (caller must free), or NULL if no
- * matching DB is found.  Cost: one access() call per dot in the QN (~5-10). */
+ * matching DB is found.  Cost: one path-existence check per dot in the QN (~5-10). */
 static char *extract_project_from_qn(const char *qn) {
     if (!qn) return NULL;
-    const char *cdir = cbm_resolve_cache_dir();
-    if (!cdir) return NULL;
+    if (!cbm_resolve_cache_dir()) return NULL;
 
     /* Scan each dot-separated prefix of the QN and test if a matching DB file
      * exists.  Walk left-to-right so the last hit is the longest (most
@@ -1449,13 +1448,13 @@ static char *extract_project_from_qn(const char *qn) {
     memcpy(candidate, qn, qn_len + 1);
 
     size_t best_end = 0; /* length of the longest matching prefix found */
-    char db_path[1024];
+    char db_path[MCP_FIELD_SIZE];
 
     for (size_t i = 0; i < qn_len; i++) {
         if (candidate[i] == '.') {
             candidate[i] = '\0';
-            snprintf(db_path, sizeof(db_path), "%s/%s.db", cdir, candidate);
-            if (access(db_path, F_OK) == 0) {
+            project_db_path(candidate, db_path, sizeof(db_path));
+            if (db_path[0] && cbm_file_exists(db_path)) {
                 best_end = i; /* length of this prefix */
             }
             candidate[i] = '.';
@@ -1542,11 +1541,10 @@ static void quarantine_corrupt_sidecar(const char *path, const char *quarantine_
         return;
     }
 
-    struct stat st;
-    if (stat(src, &st) != 0) {
+    if (!cbm_file_exists(src)) {
         return;
     }
-    if (stat(dst, &st) == 0) {
+    if (cbm_file_exists(dst)) {
         cbm_log_warn("store.quarantine_sidecar_skip", "path", src, "reason",
                      "quarantine_exists");
         return;
@@ -1569,8 +1567,7 @@ static bool quarantine_corrupt_db(const char *path, int validate_busy_timeout_ms
         return false;
     }
 
-    struct stat st;
-    if (stat(quarantine_path, &st) == 0) {
+    if (cbm_file_exists(quarantine_path)) {
         cbm_log_error("store.quarantine_failed", "reason", "quarantine_exists", "path",
                       quarantine_path);
         return false;
@@ -1839,7 +1836,7 @@ static char *build_project_list_error(const char *reason) {
  * that must also be freed on the early-return paths. */
 #define REQUIRE_STORE_EX(store, project, _pre_free_cleanup)                                       \
     do {                                                                                          \
-        if (!(store) && srv->session_root[0] && access(srv->session_root, F_OK) == 0) {              \
+        if (!(store) && srv->session_root[0] && cbm_is_dir(srv->session_root)) {                     \
             if (srv->autoindex_active) {                                                          \
                 /* Background thread running — wait for it to complete */                         \
                 cbm_thread_join(&srv->autoindex_tid);                                              \
@@ -2242,9 +2239,9 @@ static void fill_project_params(const project_expand_t *pe, cbm_search_params_t 
 static bool validate_cbm_db_with_timeout(const char *path, int busy_timeout_ms) {
     if (!path) return false;
 
-    struct stat vst;
-    if (stat(path, &vst) != 0) return false;
-    if (vst.st_size == 0) {
+    int64_t file_size = cbm_file_size(path);
+    if (file_size < 0) return false;
+    if (file_size == 0) {
         cbm_log_warn("db.skip", "path", path, "reason", "empty_file");
         return false;
     }
@@ -2505,9 +2502,10 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     cbm_project_t proj_info = {0};
     if (cbm_store_get_project(store, project, &proj_info) == 0 && proj_info.root_path) {
         char adr_path[CBM_SZ_4K];
-        snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md", proj_info.root_path);
-        struct stat adr_st;
-        bool adr_exists = (stat(adr_path, &adr_st) == 0);
+        int adr_len = snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md",
+                               proj_info.root_path);
+        bool adr_exists = adr_len > 0 && (size_t)adr_len < sizeof(adr_path) &&
+                          cbm_file_exists(adr_path);
         yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
         if (!adr_exists) {
             yyjson_mut_obj_add_str(
@@ -2577,7 +2575,7 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
      * non-path project names are authoritative: a missing slug must report
      * not-found instead of silently searching the active session project. */
     if (!store && may_use_session_root && srv->session_root[0] &&
-        access(srv->session_root, F_OK) == 0) {
+        cbm_is_dir(srv->session_root)) {
         if (srv->autoindex_active) {
             cbm_thread_join(&srv->autoindex_tid);
             srv->autoindex_active = false;
@@ -2613,9 +2611,7 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
      * session_root stays ~/myapp; react-grid-layout is never indexed by the block
      * above.  This block catches that case and indexes the exact requested path. */
     if (!store && _raw_path && cbm_mcp_auto_index_enabled(srv)) {
-        struct stat _st;
-        if (stat(_raw_path, &_st) == 0 && S_ISDIR(_st.st_mode) &&
-            cbm_mcp_auto_index_within_limit(srv, _raw_path)) {
+        if (cbm_is_dir(_raw_path) && cbm_mcp_auto_index_within_limit(srv, _raw_path)) {
             if (cbm_mcp_run_sync_auto_index(srv, _raw_path, "autoindex.path", "path", _raw_path)) {
                 store = resolve_store(srv, db_project);
                 if (store) {
@@ -3803,7 +3799,7 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     int wal_len = snprintf(wal, sizeof(wal), "%s-wal", path);
     int shm_len = snprintf(shm, sizeof(shm), "%s-shm", path);
 
-    bool exists = (access(path, F_OK) == 0);
+    bool exists = cbm_file_exists(path);
     const char *status = "not_found";
     const char *error_detail = NULL;
     bool is_error = false;
@@ -5048,11 +5044,11 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
 
             /* Check ADR presence and suggest creation if missing */
-            char adr_path[4096];
-            snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md", repo_path);
-            struct stat adr_st;
-            // NOLINTNEXTLINE(readability-implicit-bool-conversion)
-            bool adr_exists = (stat(adr_path, &adr_st) == 0);
+            char adr_path[CBM_SZ_4K];
+            int adr_len = snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md",
+                                   repo_path);
+            bool adr_exists = adr_len > 0 && (size_t)adr_len < sizeof(adr_path) &&
+                              cbm_file_exists(adr_path);
             yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
             if (!adr_exists) {
                 yyjson_mut_obj_add_str(
@@ -7107,7 +7103,7 @@ static char *handle_index_dependencies(cbm_mcp_server_t *srv, const char *args) 
             }
         }
 
-        if (!source_dir || access(source_dir, F_OK) != 0) {
+        if (!source_dir || !cbm_is_dir(source_dir)) {
             yyjson_mut_obj_add_str(doc, pr, "status", "not_found");
             yyjson_mut_obj_add_str(doc, pr, "hint",
                 "Use source_paths[] with the directory containing dep source.");
@@ -7395,8 +7391,9 @@ static void *autoindex_thread(void *arg) {
 /* Check if a DB file has actual content (at least 1 node).
  * Returns true if DB exists AND has nodes. Lightweight raw SQLite check. */
 static bool db_has_content(const char *db_path) {
-    struct stat st;
-    if (stat(db_path, &st) != 0) return false; /* file doesn't exist */
+    int64_t file_size = cbm_file_size(db_path);
+    if (file_size < 0) return false; /* file doesn't exist */
+    if (file_size == 0) return false;
 
     sqlite3 *db = NULL;
     if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
@@ -7505,8 +7502,7 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
                 needs_index = false;
             }
         } else {
-            struct stat st;
-            if (stat(db_check, &st) == 0) {
+            if (cbm_file_exists(db_check)) {
                 /* DB file exists but has 0 nodes — treat as not indexed */
                 cbm_log_info("autoindex.empty_db", "reason", "db_exists_but_empty", "project",
                              srv->session_project);
