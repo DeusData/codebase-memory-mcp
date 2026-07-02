@@ -21,8 +21,10 @@
 #include "store/store.h"
 /* pipeline.h no longer needed — indexing runs as subprocess */
 #include "foundation/log.h"
+#include "foundation/constants.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "foundation/str_util.h"
 #include "foundation/compat_thread.h"
 
@@ -50,6 +52,10 @@
 
 /* Max JSON-RPC request body size (1 MB) — transport enforces the same cap. */
 #define MAX_BODY_SIZE CBM_HTTP_MAX_BODY
+
+/* Poll interval for child-indexer log tailing in the UI background job. */
+#define UI_INDEX_LOG_POLL_MS 500L
+#define UI_INDEX_LOG_POLL_NS (UI_INDEX_LOG_POLL_MS * (long)CBM_NSEC_PER_MSEC)
 
 /* ── CORS: only allow localhost origins (blocks remote website attacks) ────── */
 
@@ -125,6 +131,9 @@ static bool serve_embedded(cbm_http_conn_t *c, const char *path) {
 
 /* Build DB path for a project: <cache_dir>/<project>.db */
 static void db_path_for_project(const char *project, char *buf, size_t bufsz) {
+    if (!buf || bufsz == 0) {
+        return;
+    }
     if (!cbm_validate_project_name(project)) {
         buf[0] = '\0';
         return;
@@ -133,7 +142,10 @@ static void db_path_for_project(const char *project, char *buf, size_t bufsz) {
     if (!dir) {
         dir = cbm_tmpdir();
     }
-    snprintf(buf, bufsz, "%s/%s.db", dir, project);
+    int n = snprintf(buf, bufsz, "%s/%s.db", dir, project);
+    if (n <= 0 || (size_t)n >= bufsz) {
+        buf[0] = '\0';
+    }
 }
 
 /* ── Log ring buffer ──────────────────────────────────────────── */
@@ -730,7 +742,7 @@ static void *index_thread_fn(void *arg) {
         if (child_done)
             break;
 
-        struct timespec ts = {0, 500000000};
+        struct timespec ts = {0, UI_INDEX_LOG_POLL_NS};
         cbm_nanosleep(&ts, NULL);
     }
 
@@ -738,7 +750,7 @@ static void *index_thread_fn(void *arg) {
     waitpid(child_pid, &wstatus, 0);
     int exit_code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
 
-    (void)unlink(log_file);
+    (void)cbm_unlink(log_file);
 #endif
 
     if (exit_code != 0) {
@@ -845,23 +857,31 @@ static void handle_delete_project(cbm_http_conn_t *c, const cbm_http_req_t *req)
 
     char db_path[1024];
     db_path_for_project(name, db_path, sizeof(db_path));
+    if (db_path[0] == '\0') {
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"project path too long\"}");
+        return;
+    }
 
     if (!cbm_file_exists(db_path)) {
         cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
         return;
     }
 
-    if (unlink(db_path) != 0) {
+    if (cbm_unlink(db_path) != 0) {
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"failed to delete\"}");
         return;
     }
 
     /* Also remove WAL and SHM files if they exist */
     char wal_path[1040], shm_path[1040];
-    snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
-    snprintf(shm_path, sizeof(shm_path), "%s-shm", db_path);
-    (void)unlink(wal_path);
-    (void)unlink(shm_path);
+    int wal_len = snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+    int shm_len = snprintf(shm_path, sizeof(shm_path), "%s-shm", db_path);
+    if (wal_len > 0 && (size_t)wal_len < sizeof(wal_path)) {
+        (void)cbm_unlink(wal_path);
+    }
+    if (shm_len > 0 && (size_t)shm_len < sizeof(shm_path)) {
+        (void)cbm_unlink(shm_path);
+    }
 
     cbm_log_info("ui.project.deleted", "name", name);
     cbm_http_replyf(c, 200, g_cors_json, "{\"deleted\":true}");
