@@ -10039,6 +10039,12 @@ TEST(incremental_parallel_resolve_failure_keeps_existing_db) {
     PASS();
 }
 
+TEST(incremental_classify_deleted_failure_keeps_existing_db) {
+    ASSERT_EQ(run_parallel_incremental_phase_failure_case(CBM_TEST_FAIL_INCREMENTAL_CLASSIFY_DELETED),
+              0);
+    PASS();
+}
+
 TEST(incremental_detects_deleted_file) {
     /* Full index, delete a file, re-index → deleted file's nodes removed */
     if (setup_incremental_repo() != 0) {
@@ -11791,6 +11797,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_parallel_extract_failure_keeps_existing_db);
     RUN_TEST(incremental_parallel_registry_failure_keeps_existing_db);
     RUN_TEST(incremental_parallel_resolve_failure_keeps_existing_db);
+    RUN_TEST(incremental_classify_deleted_failure_keeps_existing_db);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
     RUN_TEST(incremental_fast_preserves_mode_skipped_tools_dir);
