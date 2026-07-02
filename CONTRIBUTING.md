@@ -38,9 +38,22 @@ The MCP server core is written in C and has its own test suite under `tests/`:
 
 ```bash
 make -f Makefile.cbm test          # full suite with ASan + UBSan
+make -f Makefile.cbm test-tsan     # full suite with ThreadSanitizer
 make -f Makefile.cbm test-leak     # heap leak check (see below)
+make -f Makefile.cbm test-memory   # macOS MallocScribble/PreScribble nosan run
+make -f Makefile.cbm test-gmalloc  # macOS Guard Malloc nosan run
 make -f Makefile.cbm test-analyze  # Clang static analyzer (requires clang, not gcc)
 ```
+
+Focused runs are opt-in. Leave these unset for the complete suite:
+
+```bash
+CBM_ONLY_SUITE=pipeline make -f Makefile.cbm test
+CBM_ONLY_SUITE=pipeline CBM_ONLY_TEST=exact build/c/test-runner
+```
+
+By default, tests isolate `CBM_CACHE_DIR` in a temporary directory so local indexes are not
+polluted. Set `CBM_TEST_NO_ISOLATE=1` only when intentionally testing the user's configured cache.
 
 **Memory leak detection:**
 
@@ -60,9 +73,13 @@ Process NNNNN: 0 leaks for 0 total leaked bytes.
 
 ```bash
 scripts/lint.sh
+make -f Makefile.cbm lint-source-safety
 ```
 
-Runs clang-tidy, cppcheck, and clang-format. All must pass before committing (also enforced by pre-commit hook).
+Runs clang-tidy, cppcheck, and clang-format. `lint-source-safety` runs the source guard and its
+self-tests; it blocks new MCP stdout writes, insecure string APIs, raw env/filesystem calls in
+reviewed paths, and other regressions that should use existing CBM helpers instead. All must pass
+before committing (also enforced by pre-commit hook).
 
 ## Run Security Audit
 
