@@ -29,6 +29,8 @@ DEFAULT_CHANGED_FILES = 2
 DEFAULT_MIN_SPEEDUP = 10.0
 DEFAULT_TIMEOUT_SECONDS = 240
 DEFAULT_RANK_REFRESH = "stale_on_exact"
+DEFAULT_OVERHEAD_PROBES = 0
+DEFAULT_OVERHEAD_TOOL = "index_status"
 PROJECT_DB_SUFFIX = ".db"
 CONFIG_DB_NAME = "_config.db"
 LOG_TAIL_LINES = 24
@@ -403,6 +405,95 @@ def run_index_mcp(client: McpClient, repo_dir: Path, include_logs: bool) -> dict
     return build_index_result(data, stderr, stdout_bytes, elapsed_ms, include_logs)
 
 
+def build_tool_probe_result(
+    data: dict[str, Any],
+    stderr: str,
+    stdout_bytes: int,
+    elapsed_ms: float,
+    include_logs: bool,
+) -> dict[str, Any]:
+    elapsed_ms_value = round(elapsed_ms, 3)
+    result: dict[str, Any] = {
+        "elapsed_ms": elapsed_ms_value,
+        "stdout_bytes": stdout_bytes,
+        "response_keys": sorted(str(key) for key in data.keys()),
+        "stderr_tail": log_tail(stderr),
+    }
+    if include_logs:
+        result["stderr"] = stderr
+    return result
+
+
+def run_cli_tool_probe(
+    binary: Path,
+    env: dict[str, str],
+    tool_name: str,
+    timeout: int,
+    include_logs: bool,
+) -> dict[str, Any]:
+    proc, elapsed_ms = command_result(
+        [str(binary), "cli", "--json", tool_name, "{}"],
+        env,
+        timeout,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"{tool_name} probe failed: {proc.stderr.strip()}")
+    data = unwrap_cli_json(proc.stdout)
+    return build_tool_probe_result(
+        data, proc.stderr, len(proc.stdout.encode("utf-8")), elapsed_ms, include_logs
+    )
+
+
+def run_mcp_tool_probe(
+    client: McpClient,
+    tool_name: str,
+    include_logs: bool,
+) -> dict[str, Any]:
+    data, stderr, stdout_bytes, elapsed_ms = client.call_tool(tool_name, {})
+    return build_tool_probe_result(data, stderr, stdout_bytes, elapsed_ms, include_logs)
+
+
+def summarize_elapsed_ms(probes: list[dict[str, Any]]) -> dict[str, Any]:
+    elapsed = sorted(float(probe["elapsed_ms"]) for probe in probes)
+    if not elapsed:
+        return {"count": 0}
+    return {
+        "count": len(elapsed),
+        "min_ms": elapsed[0],
+        "median_ms": elapsed[len(elapsed) // 2],
+        "max_ms": elapsed[-1],
+    }
+
+
+def measure_cli_overhead_probes(
+    binary: Path,
+    env: dict[str, str],
+    tool_name: str,
+    count: int,
+    timeout: int,
+    include_logs: bool,
+) -> dict[str, Any] | None:
+    if count <= 0:
+        return None
+    probes = [
+        run_cli_tool_probe(binary, env, tool_name, timeout, include_logs)
+        for _ in range(count)
+    ]
+    return {"tool": tool_name, "trials": probes, "summary": summarize_elapsed_ms(probes)}
+
+
+def measure_mcp_overhead_probes(
+    client: McpClient,
+    tool_name: str,
+    count: int,
+    include_logs: bool,
+) -> dict[str, Any] | None:
+    if count <= 0:
+        return None
+    probes = [run_mcp_tool_probe(client, tool_name, include_logs) for _ in range(count)]
+    return {"tool": tool_name, "trials": probes, "summary": summarize_elapsed_ms(probes)}
+
+
 def remove_project_dbs(cache_dir: Path) -> list[str]:
     removed: list[str] = []
     for path in cache_dir.iterdir():
@@ -749,6 +840,20 @@ def parse_args() -> argparse.Namespace:
         default="cli",
         help="Measure cold CLI subprocess calls or persistent MCP tool-call latency.",
     )
+    parser.add_argument(
+        "--overhead-probes",
+        type=int,
+        default=DEFAULT_OVERHEAD_PROBES,
+        help=(
+            "Run N cheap tool-call probes before indexing to estimate invocation overhead; "
+            "0 preserves the historical gate behavior."
+        ),
+    )
+    parser.add_argument(
+        "--overhead-tool",
+        default=DEFAULT_OVERHEAD_TOOL,
+        help="Existing MCP tool used by --overhead-probes.",
+    )
     return parser.parse_args()
 
 
@@ -787,6 +892,8 @@ def main() -> int:
             "rank_refresh": args.rank_refresh,
             "timeout": args.timeout,
             "transport": args.transport,
+            "overhead_probes": args.overhead_probes,
+            "overhead_tool": args.overhead_tool,
         },
         "cleanup": {"requested": auto_root and not args.keep_work_root, "removed": False},
     }
@@ -800,6 +907,9 @@ def main() -> int:
 
         if args.transport == "mcp":
             with McpClient(binary, env, args.timeout) as client:
+                overhead_probe = measure_mcp_overhead_probes(
+                    client, args.overhead_tool, args.overhead_probes, args.include_logs
+                )
                 initial = run_index_mcp(client, repo_dir, args.include_logs)
                 changed_paths = modify_existing_files(
                     repo_dir, args.changed_files, args.functions_per_file
@@ -809,6 +919,14 @@ def main() -> int:
             with McpClient(binary, env, args.timeout) as client:
                 full_rebuild = run_index_mcp(client, repo_dir, args.include_logs)
         else:
+            overhead_probe = measure_cli_overhead_probes(
+                binary,
+                env,
+                args.overhead_tool,
+                args.overhead_probes,
+                args.timeout,
+                args.include_logs,
+            )
             initial = run_index(binary, env, repo_dir, args.timeout, args.include_logs)
             changed_paths = modify_existing_files(
                 repo_dir, args.changed_files, args.functions_per_file
@@ -832,6 +950,7 @@ def main() -> int:
                 "changed_paths": changed_paths,
                 "removed_project_dbs": removed_dbs,
                 "measurements": {
+                    "overhead_probe": overhead_probe,
                     "initial_fast_full": initial,
                     "incremental_exact": incremental,
                     "incremental": incremental,
