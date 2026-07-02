@@ -1093,6 +1093,16 @@ typedef struct {
     _Atomic int *cancelled;
 } hl_route_ctx_t;
 
+static int hl_active_worker_count(int max_workers, int item_count) {
+    if (item_count <= 0) {
+        return 0;
+    }
+    if (max_workers < 1) {
+        max_workers = 1;
+    }
+    return max_workers < item_count ? max_workers : item_count;
+}
+
 static void hl_route_worker(int worker_id, void *arg) {
     hl_route_ctx_t *rc = arg;
     hl_route_buf_t *buf = &rc->worker_bufs[worker_id];
@@ -1285,23 +1295,25 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
             }
         }
 
-        hl_route_buf_t *route_bufs = calloc((size_t)worker_count, sizeof(hl_route_buf_t));
+        int route_workers = hl_active_worker_count(worker_count, wi);
+        hl_route_buf_t *route_bufs =
+            route_workers > 0 ? calloc((size_t)route_workers, sizeof(hl_route_buf_t)) : NULL;
 
-        if (work_items && route_bufs && wi > 0) {
+        if (work_items && route_bufs && route_workers > 0) {
             hl_route_ctx_t rc = {
                 .items = work_items,
                 .item_count = wi,
                 .ctx = ctx,
                 .worker_bufs = route_bufs,
-                .worker_count = worker_count,
+                .worker_count = route_workers,
                 .cancelled = ctx->cancelled,
             };
             atomic_init(&rc.next_idx, 0);
 
-            cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
-            cbm_parallel_for(worker_count, hl_route_worker, &rc, opts);
+            cbm_parallel_for_opts_t opts = {.max_workers = route_workers, .force_pthreads = false};
+            cbm_parallel_for(route_workers, hl_route_worker, &rc, opts);
 
-            for (int w = 0; w < worker_count; w++) {
+            for (int w = 0; w < route_workers; w++) {
                 int to_copy = route_bufs[w].count;
                 if (to_copy > MAX_ROUTES - route_count) {
                     to_copy = MAX_ROUTES - route_count;
@@ -1382,24 +1394,26 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
                 }
             }
 
-            hl_site_buf_t *site_bufs = calloc((size_t)worker_count, sizeof(hl_site_buf_t));
-            if (site_bufs && si2 > 0) {
+            int site_workers = hl_active_worker_count(worker_count, si2);
+            hl_site_buf_t *site_bufs =
+                site_workers > 0 ? calloc((size_t)site_workers, sizeof(hl_site_buf_t)) : NULL;
+            if (site_bufs && site_workers > 0) {
                 hl_site_ctx_t sc = {
                     .nodes = all_site_nodes,
                     .labels = all_site_labels,
                     .node_count = si2,
                     .ctx = ctx,
                     .worker_bufs = site_bufs,
-                    .worker_count = worker_count,
+                    .worker_count = site_workers,
                     .cancelled = ctx->cancelled,
                 };
                 atomic_init(&sc.next_idx, 0);
 
-                cbm_parallel_for_opts_t opts = {.max_workers = worker_count,
+                cbm_parallel_for_opts_t opts = {.max_workers = site_workers,
                                                 .force_pthreads = false};
-                cbm_parallel_for(worker_count, hl_site_worker, &sc, opts);
+                cbm_parallel_for(site_workers, hl_site_worker, &sc, opts);
 
-                for (int w = 0; w < worker_count; w++) {
+                for (int w = 0; w < site_workers; w++) {
                     int to_copy = site_bufs[w].count;
                     if (to_copy > MAX_CALL_SITES - site_count) {
                         to_copy = MAX_CALL_SITES - site_count;
