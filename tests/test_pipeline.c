@@ -11450,8 +11450,9 @@ TEST(config_registry_includes_rank_refresh_policy) {
     ASSERT_NOT_NULL(entry);
     ASSERT_STR_EQ(entry->default_val, CBM_RANK_REFRESH_EAGER);
     ASSERT_STR_EQ(entry->category, "PageRank");
-    ASSERT_STR_EQ(entry->range, "eager|stale_on_exact");
+    ASSERT_STR_EQ(entry->range, "eager|stale_on_exact|stale_on_incremental");
     ASSERT_NOT_NULL(strstr(entry->guidance, CBM_RANK_REFRESH_STALE_ON_EXACT));
+    ASSERT_NOT_NULL(strstr(entry->guidance, CBM_RANK_REFRESH_STALE_ON_INCREMENTAL));
     PASS();
 }
 

@@ -1366,7 +1366,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-speedup", type=float, default=DEFAULT_MIN_SPEEDUP)
     parser.add_argument(
         "--rank-refresh",
-        choices=("eager", "stale_on_exact"),
+        choices=("eager", "stale_on_exact", "stale_on_incremental"),
         default=DEFAULT_RANK_REFRESH,
     )
     parser.add_argument(
