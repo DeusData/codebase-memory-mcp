@@ -177,6 +177,25 @@ int cbm_str_common_dot_prefix_len(const char *a, const char *b) {
     return count;
 }
 
+bool cbm_str_copy(char *dst, size_t dst_sz, const char *src) {
+    if (!dst || dst_sz == 0) {
+        return false;
+    }
+    if (!src) {
+        src = "";
+    }
+    size_t len = strlen(src);
+    size_t copy_len = len;
+    if (copy_len >= dst_sz) {
+        copy_len = dst_sz - 1;
+    }
+    if (copy_len > 0) {
+        memcpy(dst, src, copy_len);
+    }
+    dst[copy_len] = '\0';
+    return len < dst_sz;
+}
+
 char *cbm_str_tolower(CBMArena *a, const char *s) {
     if (!s) {
         return NULL;

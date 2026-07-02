@@ -103,6 +103,22 @@ TEST(str_contains) {
     PASS();
 }
 
+TEST(str_copy_fixed_buffer) {
+    char buf[6] = {'x', 'x', 'x', 'x', 'x', 'x'};
+    ASSERT_TRUE(cbm_str_copy(buf, sizeof(buf), "hello"));
+    ASSERT_STR_EQ(buf, "hello");
+
+    ASSERT_FALSE(cbm_str_copy(buf, sizeof(buf), "hello world"));
+    ASSERT_STR_EQ(buf, "hello");
+
+    ASSERT_TRUE(cbm_str_copy(buf, sizeof(buf), NULL));
+    ASSERT_STR_EQ(buf, "");
+
+    ASSERT_FALSE(cbm_str_copy(NULL, sizeof(buf), "x"));
+    ASSERT_FALSE(cbm_str_copy(buf, 0, "x"));
+    PASS();
+}
+
 TEST(str_tolower) {
     setup();
     ASSERT_STR_EQ(cbm_str_tolower(&a, "Hello World"), "hello world");
@@ -481,6 +497,7 @@ SUITE(str_util) {
     RUN_TEST(str_starts_with);
     RUN_TEST(str_ends_with);
     RUN_TEST(str_contains);
+    RUN_TEST(str_copy_fixed_buffer);
     RUN_TEST(str_tolower);
     RUN_TEST(str_replace_char);
     RUN_TEST(str_strip_ext);

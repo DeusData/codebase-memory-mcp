@@ -76,6 +76,12 @@ printf '#include <string.h>\nvoid bad(char *d, const char *s) { strcpy(d, s); }\
     >"$string_root/src/pipeline/bad.c"
 expect_fail_contains "unsafe_string" "$string_root" "unsafe string API"
 
+strncpy_root="$TMP_ROOT/strncpy"
+make_tree "$strncpy_root"
+printf '#include <string.h>\nvoid bad(char *d, const char *s) { strncpy(d, s, 3); }\n' \
+    >"$strncpy_root/src/pipeline/bad.c"
+expect_fail_contains "unsafe_strncpy" "$strncpy_root" "unsafe string API"
+
 rawfs_root="$TMP_ROOT/rawfs"
 make_tree "$rawfs_root"
 git -C "$rawfs_root" init -q

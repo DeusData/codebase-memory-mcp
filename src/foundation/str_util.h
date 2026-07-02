@@ -38,6 +38,10 @@ bool cbm_str_contains(const char *s, const char *sub);
 /* Count equal dot-separated leading segments in two qualified names. */
 int cbm_str_common_dot_prefix_len(const char *a, const char *b);
 
+/* Copy src into fixed buffer dst, always NUL-terminating when dst_sz > 0.
+ * NULL src is copied as "". Returns true when the complete string fit. */
+bool cbm_str_copy(char *dst, size_t dst_sz, const char *src);
+
 /* Convert to lowercase (arena-allocated copy). */
 char *cbm_str_tolower(CBMArena *a, const char *s);
 

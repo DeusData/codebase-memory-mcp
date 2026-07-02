@@ -7,7 +7,7 @@
  *   - Levels: DEBUG, INFO, WARN, ERROR
  *   - Level filtering at runtime via cbm_log_set_level() or the
  *     CBM_LOG_LEVEL env var (see cbm_log_init_from_env)
- *   - Thread-safe (each fprintf is atomic on POSIX for lines < PIPE_BUF)
+ *   - Configure level/sink at startup; concurrent log calls use stdio's stream lock.
  */
 #ifndef CBM_LOG_H
 #define CBM_LOG_H

@@ -23,6 +23,7 @@ enum {
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "foundation/log.h"
+#include "foundation/str_util.h"
 
 #include <ctype.h>
 #include "foundation/compat_fs.h"
@@ -274,8 +275,7 @@ static int scan_terraform_line(const char *line, char *key, size_t ksz, char *va
     if (vlen <= 0 || vlen >= (int)vsz) {
         return 0;
     }
-    strncpy(key, "_tf_default", ksz - SKIP_ONE);
-    key[ksz - SKIP_ONE] = '\0';
+    cbm_str_copy(key, ksz, "_tf_default");
     memcpy(val, line + m[ENV_GRP_2].rm_so, vlen);
     val[vlen] = '\0';
     return SKIP_ONE;
@@ -363,12 +363,9 @@ static int scan_env_file(const char *full_path, const char *rel, file_type_t ft,
             continue;
         }
 
-        strncpy(out[count].key, key, sizeof(out[count].key) - 1);
-        out[count].key[sizeof(out[count].key) - SKIP_ONE] = '\0';
-        strncpy(out[count].value, value, sizeof(out[count].value) - 1);
-        out[count].value[sizeof(out[count].value) - SKIP_ONE] = '\0';
-        strncpy(out[count].file_path, rel, sizeof(out[count].file_path) - 1);
-        out[count].file_path[sizeof(out[count].file_path) - SKIP_ONE] = '\0';
+        cbm_str_copy(out[count].key, sizeof(out[count].key), key);
+        cbm_str_copy(out[count].value, sizeof(out[count].value), value);
+        cbm_str_copy(out[count].file_path, sizeof(out[count].file_path), rel);
         count++;
     }
     (void)fclose(f);
@@ -388,8 +385,7 @@ static int process_env_entry(cbm_dirent_t *ent, const char *dir_path, const char
     }
     if (S_ISDIR(st.st_mode)) {
         if (!is_ignored_dir(ent->name) && *stack_top < CBM_SZ_256) {
-            strncpy(path_stack[*stack_top], full_path, sizeof(path_stack[0]) - 1);
-            path_stack[*stack_top][sizeof(path_stack[0]) - SKIP_ONE] = '\0';
+            cbm_str_copy(path_stack[*stack_top], sizeof(path_stack[0]), full_path);
             (*stack_top)++;
         }
         return 0;
@@ -417,14 +413,12 @@ int cbm_scan_project_env_urls(const char *root_path, cbm_env_binding_t *out, int
     int count = 0;
     char path_stack[CBM_SZ_256][CBM_SZ_512];
     int stack_top = SKIP_ONE;
-    strncpy(path_stack[0], root_path, sizeof(path_stack[0]) - 1);
-    path_stack[0][sizeof(path_stack[0]) - SKIP_ONE] = '\0';
+    cbm_str_copy(path_stack[0], sizeof(path_stack[0]), root_path);
 
     while (stack_top > 0 && count < max_out) {
         stack_top--;
         char dir_path[CBM_SZ_512];
-        strncpy(dir_path, path_stack[stack_top], sizeof(dir_path) - SKIP_ONE);
-        dir_path[sizeof(dir_path) - SKIP_ONE] = '\0';
+        cbm_str_copy(dir_path, sizeof(dir_path), path_stack[stack_top]);
 
         cbm_dir_t *d = cbm_opendir(dir_path);
         if (!d) {
