@@ -6,6 +6,7 @@
  */
 #include "foundation/constants.h"
 #include "foundation/compat_fs.h"
+#include "foundation/compat_fs_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -197,11 +198,129 @@ int cbm_rmdir(const char *path) {
     return ret;
 }
 
+/* Build a properly-quoted Windows command line from an argv array.
+ * Returns a heap-allocated wide string, or NULL on allocation failure.
+ * Quoting follows the MSVC CRT convention: arguments containing spaces,
+ * tabs, or double-quotes are wrapped in double-quotes, with backslashes
+ * before a closing quote doubled and the quote itself escaped.
+ * Declared in compat_fs_internal.h so the test suite can drive it. */
+wchar_t *cbm_build_cmdline(const char *const *argv) {
+    /* First pass: compute required buffer size. */
+    size_t total = 1; /* NUL terminator */
+    for (int i = 0; argv[i]; i++) {
+        const char *arg = argv[i];
+        bool needs_quote = (arg[0] == '\0');
+        for (const char *p = arg; *p; p++) {
+            if (*p == ' ' || *p == '\t' || *p == '"') {
+                needs_quote = true;
+            }
+        }
+        if (i > 0) {
+            total++; /* space separator */
+        }
+        if (needs_quote) {
+            total += 2; /* opening and closing quote */
+            size_t backslashes = 0;
+            for (const char *p = arg; *p; p++) {
+                if (*p == '\\') {
+                    backslashes++;
+                } else if (*p == '"') {
+                    total += backslashes + 1; /* double backslashes + escape backslash */
+                    backslashes = 0;
+                } else {
+                    backslashes = 0;
+                }
+                total++;
+            }
+            /* Trailing backslashes before closing quote must be doubled. */
+            total += backslashes;
+        } else {
+            total += strlen(arg);
+        }
+    }
+
+    wchar_t *out = (wchar_t *)malloc(total * sizeof(wchar_t));
+    if (!out) {
+        return NULL;
+    }
+
+    /* Second pass: write the command line. */
+    wchar_t *w = out;
+    for (int i = 0; argv[i]; i++) {
+        const char *arg = argv[i];
+        bool needs_quote = (arg[0] == '\0');
+        for (const char *p = arg; *p; p++) {
+            if (*p == ' ' || *p == '\t' || *p == '"') {
+                needs_quote = true;
+                break;
+            }
+        }
+        if (i > 0) {
+            *w++ = L' ';
+        }
+        if (needs_quote) {
+            *w++ = L'"';
+            size_t backslashes = 0;
+            for (const char *p = arg; *p; p++) {
+                if (*p == '\\') {
+                    backslashes++;
+                    *w++ = L'\\';
+                } else if (*p == '"') {
+                    /* Double the preceding backslashes, then escape the quote. */
+                    for (size_t b = 0; b < backslashes; b++) {
+                        *w++ = L'\\';
+                    }
+                    *w++ = L'\\';
+                    *w++ = L'"';
+                    backslashes = 0;
+                } else {
+                    backslashes = 0;
+                    *w++ = (wchar_t)(unsigned char)*p;
+                }
+            }
+            /* Double trailing backslashes before the closing quote. */
+            for (size_t b = 0; b < backslashes; b++) {
+                *w++ = L'\\';
+            }
+            *w++ = L'"';
+        } else {
+            for (const char *p = arg; *p; p++) {
+                *w++ = (wchar_t)(unsigned char)*p;
+            }
+        }
+    }
+    *w = L'\0';
+    return out;
+}
+
 int cbm_exec_no_shell(const char *const *argv) {
     if (!argv || !argv[0]) {
         return CBM_NOT_FOUND;
     }
-    return (int)_spawnvp(_P_WAIT, argv[0], argv);
+
+    wchar_t *cmdline = cbm_build_cmdline(argv);
+    if (!cmdline) {
+        return CBM_NOT_FOUND;
+    }
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    memset(&pi, 0, sizeof(pi));
+    si.cb = sizeof(si);
+
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        free(cmdline);
+        return CBM_NOT_FOUND;
+    }
+    free(cmdline);
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exit_code = (DWORD)CBM_NOT_FOUND;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (int)exit_code;
 }
 
 #else /* POSIX */
