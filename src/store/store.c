@@ -6502,7 +6502,8 @@ static int arch_languages(cbm_store_t *s, const char *project, const char *path,
     int lang_counts[CBM_SZ_64];
     int nlang = 0;
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         const char *fp = (const char *)sqlite3_column_text(stmt, 0);
         const char *ext = file_ext(fp);
         const char *lang = ext_to_lang(ext);
@@ -6524,6 +6525,11 @@ static int arch_languages(cbm_store_t *s, const char *project, const char *path,
             nlang++;
         }
     }
+    if (step_rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "arch_languages");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
     sqlite3_finalize(stmt);
 
     /* Sort by count descending (simple insertion sort) */
@@ -6543,12 +6549,26 @@ static int arch_languages(cbm_store_t *s, const char *project, const char *path,
         nlang = ST_MAX_LANG;
     }
 
-    out->languages = (nlang > 0) ? calloc(nlang, sizeof(cbm_language_count_t)) : NULL;
-    out->language_count = nlang;
-    for (int i = 0; i < nlang; i++) {
-        out->languages[i].language = heap_strdup(lang_names[i]);
-        out->languages[i].file_count = lang_counts[i];
+    cbm_language_count_t *languages =
+        (nlang > 0) ? calloc((size_t)nlang, sizeof(cbm_language_count_t)) : NULL;
+    if (nlang > 0 && !languages) {
+        store_set_error(s, "arch_languages out of memory");
+        return CBM_STORE_ERR;
     }
+    for (int i = 0; i < nlang; i++) {
+        languages[i].language = heap_strdup(lang_names[i]);
+        if (!languages[i].language) {
+            for (int j = 0; j < i; j++) {
+                safe_str_free(&languages[j].language);
+            }
+            free(languages);
+            store_set_error(s, "arch_languages out of memory");
+            return CBM_STORE_ERR;
+        }
+        languages[i].file_count = lang_counts[i];
+    }
+    out->languages = languages;
+    out->language_count = nlang;
     return CBM_STORE_OK;
 }
 
@@ -8922,32 +8942,32 @@ int cbm_store_get_architecture_scoped(cbm_store_t *s, const char *project, const
     if (want_aspect(aspects, aspect_count, "languages")) {
         rc = arch_languages(s, project, path, out);
         if (rc != CBM_STORE_OK) {
-            return rc;
+            goto fail;
         }
     }
     if (want_aspect(aspects, aspect_count, "packages")) {
         rc = arch_packages(s, project, path, out);
         if (rc != CBM_STORE_OK) {
-            return rc;
+            goto fail;
         }
     }
     if (want_aspect(aspects, aspect_count, "entry_points")) {
         rc = arch_entry_points(s, project, path, out);
         if (rc != CBM_STORE_OK) {
-            return rc;
+            goto fail;
         }
     }
     if (want_aspect(aspects, aspect_count, "routes")) {
         rc = arch_routes(s, project, path, out);
         if (rc != CBM_STORE_OK) {
-            return rc;
+            goto fail;
         }
     }
     if (want_aspect(aspects, aspect_count, "hotspots")) {
         rc = arch_hotspots(s, project, path, out,
                            hotspot_limit > 0 ? hotspot_limit : CBM_ARCH_HOTSPOT_DEFAULT_LIMIT);
         if (rc != CBM_STORE_OK) {
-            return rc;
+            goto fail;
         }
     }
     if (want_aspect(aspects, aspect_count, "boundaries")) {
@@ -8955,7 +8975,7 @@ int cbm_store_get_architecture_scoped(cbm_store_t *s, const char *project, const
         int bcount = 0;
         rc = arch_boundaries(s, project, path, &barr, &bcount);
         if (rc != CBM_STORE_OK) {
-            return rc;
+            goto fail;
         }
         out->boundaries = barr;
         out->boundary_count = bcount;
@@ -8963,23 +8983,27 @@ int cbm_store_get_architecture_scoped(cbm_store_t *s, const char *project, const
     if (want_aspect(aspects, aspect_count, "layers")) {
         rc = arch_layers(s, project, path, out);
         if (rc != CBM_STORE_OK) {
-            return rc;
+            goto fail;
         }
     }
     if (want_aspect(aspects, aspect_count, "file_tree")) {
         rc = arch_file_tree(s, project, path, out);
         if (rc != CBM_STORE_OK) {
-            return rc;
+            goto fail;
         }
     }
     if (want_aspect(aspects, aspect_count, "clusters")) {
         rc = arch_clusters(s, project, path, out, leiden_resolution);
         if (rc != CBM_STORE_OK) {
-            return rc;
+            goto fail;
         }
     }
 
     return CBM_STORE_OK;
+
+fail:
+    cbm_store_architecture_free(out);
+    return rc;
 }
 
 int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char **aspects,
