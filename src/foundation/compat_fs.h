@@ -61,7 +61,9 @@ int cbm_rmdir(const char *path);
 int cbm_replace_file(const char *tmp_path, const char *dest_path);
 
 /* Move src_path to dest_path only when dest_path does not already exist.
- * Returns 0 on success and leaves src_path in place on destination conflicts. */
+ * Returns 0 on success and leaves src_path in place on destination conflicts.
+ * Best for sibling temp/quarantine paths: POSIX uses link()+unlink(), so a
+ * cross-device move fails instead of silently copying or replacing. */
 int cbm_move_file_no_replace(const char *src_path, const char *dest_path);
 
 /* Same as cbm_replace_file(), but returns the platform-native failure code via

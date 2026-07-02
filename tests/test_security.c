@@ -425,6 +425,32 @@ TEST(compat_move_file_no_replace_preserves_existing_destination) {
     PASS();
 }
 
+TEST(compat_move_file_no_replace_moves_when_destination_missing) {
+    char *dir = th_mktempdir("cbm_move_file_no_replace_ok");
+    ASSERT_NOT_NULL(dir);
+    char root[256];
+    snprintf(root, sizeof(root), "%s", dir);
+
+    const char *dest = TH_PATH(root, "target.txt");
+    const char *src = TH_PATH(root, "source.txt");
+    ASSERT_EQ(th_write_file(src, "new"), 0);
+
+    ASSERT_EQ(cbm_move_file_no_replace(src, dest), 0);
+
+    FILE *fp = fopen(dest, "rb");
+    ASSERT_NOT_NULL(fp);
+    char buf[8] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    ASSERT_EQ((int)n, 3);
+    ASSERT_STR_EQ(buf, "new");
+
+    struct stat st;
+    ASSERT_NEQ(stat(src, &st), 0);
+    th_cleanup(root);
+    PASS();
+}
+
 TEST(compat_write_file_atomic_replaces_destination) {
     char *dir = th_mktempdir("cbm_write_file_atomic");
     ASSERT_NOT_NULL(dir);
@@ -579,6 +605,7 @@ SUITE(security) {
 
     RUN_TEST(compat_replace_file_replaces_destination);
     RUN_TEST(compat_move_file_no_replace_preserves_existing_destination);
+    RUN_TEST(compat_move_file_no_replace_moves_when_destination_missing);
     RUN_TEST(compat_write_file_atomic_replaces_destination);
     RUN_TEST(compat_write_file_atomic_reports_replace_failure);
     RUN_TEST(compat_write_file_atomic_concurrent_same_destination);
