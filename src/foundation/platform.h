@@ -125,6 +125,12 @@ const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const ch
  * Sets *present when the variable is set and non-empty, even if it does not fit. */
 bool cbm_getenv_fits(const char *name, char *buf, size_t buf_sz, bool *present);
 
+/* Environment feature flag parser.
+ * Unset, empty, "0", "false", "off", and "no" are disabled; any other
+ * present value is enabled. Matching for textual false values is ASCII
+ * case-insensitive. */
+bool cbm_env_flag_enabled(const char *name);
+
 /* ── Home directory ─────────────────────────────────────────────── */
 
 /* Cross-platform home directory: tries HOME first, then USERPROFILE (Windows).

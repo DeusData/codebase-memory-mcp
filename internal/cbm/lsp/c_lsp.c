@@ -1,5 +1,5 @@
 #include "c_lsp.h"
-#include "lsp_env.h"
+#include "foundation/platform.h"
 #include "lsp_node_iter.h"
 #include "../helpers.h"
 #include <string.h>
@@ -69,7 +69,7 @@ void c_lsp_init(CLSPContext *ctx, CBMArena *arena, const char *source, int sourc
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL);
 
-    ctx->debug = cbm_lsp_env_flag_enabled("CBM_LSP_DEBUG");
+    ctx->debug = cbm_env_flag_enabled("CBM_LSP_DEBUG");
 }
 
 void c_lsp_add_include(CLSPContext *ctx, const char *header_path, const char *ns_qn) {

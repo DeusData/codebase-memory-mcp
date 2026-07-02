@@ -26,7 +26,7 @@
  */
 
 #include "rust_lsp.h"
-#include "lsp_env.h"
+#include "foundation/platform.h"
 #include "rust_cargo.h"
 #include "../helpers.h"
 #include <ctype.h>
@@ -70,7 +70,7 @@ void rust_lsp_init(RustLSPContext *ctx, CBMArena *arena, const char *source, int
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL);
 
-    ctx->debug = cbm_lsp_env_flag_enabled("CBM_LSP_DEBUG");
+    ctx->debug = cbm_env_flag_enabled("CBM_LSP_DEBUG");
 }
 
 /* Doubling-array push of a `(local, full-path)` use entry. */
