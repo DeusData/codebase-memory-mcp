@@ -8,7 +8,9 @@
  * until the corresponding feature is implemented (GREEN).
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/constants.h"
 #include "test_framework.h"
+#include <cli/cli.h>
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <depindex/depindex.h>
@@ -876,6 +878,29 @@ TEST(test_cross_edges_null_safety) {
     PASS();
 }
 
+TEST(test_auto_index_deps_config_limit_policy) {
+    char cache_tmp[CBM_SZ_256];
+    int n = snprintf(cache_tmp, sizeof(cache_tmp), "%s/cbm_dep_policy_XXXXXX", cbm_tmpdir());
+    ASSERT(n > 0 && (size_t)n < sizeof(cache_tmp));
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache_tmp));
+    cbm_config_t *cfg = cbm_config_open(cache_tmp);
+    ASSERT_NOT_NULL(cfg);
+
+    ASSERT_EQ(cbm_dep_auto_index_effective_limit(cfg, CBM_DEFAULT_AUTO_DEP_LIMIT),
+              CBM_DEFAULT_AUTO_DEP_LIMIT);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "false"), 0);
+    ASSERT_EQ(cbm_dep_auto_index_effective_limit(cfg, CBM_DEFAULT_AUTO_DEP_LIMIT), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "true"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_DEP_LIMIT, "7"), 0);
+    ASSERT_EQ(cbm_dep_auto_index_effective_limit(cfg, CBM_DEFAULT_AUTO_DEP_LIMIT), 7);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_DEP_LIMIT, "0"), 0);
+    ASSERT_EQ(cbm_dep_auto_index_effective_limit(cfg, CBM_DEFAULT_AUTO_DEP_LIMIT), -1);
+
+    cbm_config_close(cfg);
+    cleanup_fixture_dir(cache_tmp);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
@@ -932,4 +957,5 @@ SUITE(depindex) {
     RUN_TEST(test_trace_results_have_source_field);
     RUN_TEST(test_snippet_has_source_origin_field);
     RUN_TEST(test_cross_edges_null_safety);
+    RUN_TEST(test_auto_index_deps_config_limit_policy);
 }

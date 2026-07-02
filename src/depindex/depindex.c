@@ -5,6 +5,7 @@
  * and cross-boundary edge creation for dependency source code.
  */
 #include "depindex/depindex.h"
+#include "cli/cli.h"
 #include "pipeline/pipeline.h"
 #include "store/store.h"
 #include "foundation/log.h"
@@ -451,12 +452,32 @@ int cbm_discover_installed_deps(cbm_pkg_manager_t mgr, const char *project_root,
 
 /* ── Auto-Index ────────────────────────────────────────────────── */
 
+int cbm_dep_auto_index_effective_limit(cbm_config_t *cfg, int default_limit) {
+    if (!cfg) {
+        return default_limit;
+    }
+    if (!cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, true)) {
+        return 0;
+    }
+
+    int limit = cbm_config_get_int(cfg, CBM_CONFIG_AUTO_DEP_LIMIT, default_limit);
+    /* The direct API keeps max_deps=0 as disabled. The config registry documents
+     * auto_dep_limit=0 as unlimited, so map configured callers to -1 here. */
+    if (limit <= 0) {
+        return -1;
+    }
+    return limit;
+}
+
 /* Auto-detect ecosystem, discover deps, index each via flush_to_store.
  * Runtime: O(N_deps * pipeline_run) where pipeline_run is O(files * parse_time).
  * With max 1000 files/dep at ~1ms/file: ~1s/dep * 20 deps = ~20s worst case.
  * Memory: O(symbols_per_dep) peak per dep pipeline, freed between iterations. */
 int cbm_dep_auto_index(const char *project_name, const char *project_root,
                        cbm_store_t *store, int max_deps, cbm_config_t *cfg) {
+    if (cfg) {
+        max_deps = cbm_dep_auto_index_effective_limit(cfg, max_deps);
+    }
     if (max_deps == 0) return 0;
     int effective_max = (max_deps < 0) ? INT_MAX : max_deps;
 

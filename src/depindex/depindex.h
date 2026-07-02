@@ -150,4 +150,8 @@ int cbm_dep_auto_index(const char *project_name, const char *project_root,
  * Returns number of edges created. */
 int cbm_dep_link_cross_edges(cbm_store_t *store, const char *project_name);
 
+/* Effective dependency auto-index limit from config.
+ * Return 0 to disable, -1 for unlimited, or a positive package count. */
+int cbm_dep_auto_index_effective_limit(cbm_config_t *cfg, int default_limit);
+
 #endif /* CBM_DEPINDEX_H */

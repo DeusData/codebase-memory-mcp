@@ -1202,6 +1202,38 @@ static bool cbm_mcp_auto_index_enabled(cbm_mcp_server_t *srv) {
                                          default_val);
 }
 
+static bool cbm_mcp_incremental_metadata_enabled(cbm_mcp_server_t *srv) {
+    const char *policy =
+        srv && srv->config ? cbm_config_get(srv->config, CBM_CONFIG_INCREMENTAL_REINDEX, "off")
+                           : "off";
+    return policy && strcmp(policy, "off") != 0;
+}
+
+static int cbm_mcp_auto_index_deps(cbm_mcp_server_t *srv, const char *project,
+                                   const char *root_path, cbm_store_t *store, int *out_rc) {
+    if (out_rc) {
+        *out_rc = CBM_STORE_OK;
+    }
+    int deps_reindexed =
+        cbm_dep_auto_index(project, root_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT,
+                           srv ? srv->config : NULL);
+    if (deps_reindexed > 0 && cbm_mcp_incremental_metadata_enabled(srv)) {
+        int owner_rc = cbm_store_rebuild_file_delta_owners(
+            store, project, CBM_PIPELINE_FILE_DELTA_GENERATION);
+        if (owner_rc != CBM_STORE_OK) {
+            char rc_buf[CBM_SZ_32];
+            snprintf(rc_buf, sizeof(rc_buf), "%d", owner_rc);
+            cbm_log_error("index_repository.err", "phase",
+                          "rebuild_file_delta_owners_after_deps", "rc",
+                          rc_buf);
+            if (out_rc) {
+                *out_rc = owner_rc;
+            }
+        }
+    }
+    return deps_reindexed;
+}
+
 static int cbm_mcp_auto_index_limit(cbm_mcp_server_t *srv) {
     return cbm_config_get_effective_int(srv ? srv->config : NULL, CBM_CONFIG_AUTO_INDEX_LIMIT,
                                         CBM_DEFAULT_AUTO_INDEX_LIMIT);
@@ -2657,8 +2689,8 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
                 srv->current_project = NULL;
                 store = resolve_store(srv, srv->session_project);
                 if (store) {
-                    cbm_dep_auto_index(srv->session_project, srv->session_root,
-                                       store, CBM_DEFAULT_AUTO_DEP_LIMIT, srv->config);
+                    (void)cbm_mcp_auto_index_deps(srv, srv->session_project,
+                                                  srv->session_root, store, NULL);
                     cbm_pagerank_compute_with_config(store, srv->session_project, srv->config);
                 }
             }
@@ -5092,7 +5124,6 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_set_root(doc, root);
 
     yyjson_mut_obj_add_str(doc, root, "project", project_name);
-    yyjson_mut_obj_add_str(doc, root, "status", rc == 0 ? "indexed" : "error");
     yyjson_mut_obj_add_str(doc, root, "publish_kind",
                            cbm_pipeline_publish_kind_name(publish_kind));
     if (publish_reason && publish_reason[0]) {
@@ -5108,9 +5139,17 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             /* Auto-detect ecosystem and index installed deps from fresh graph.
              * Queries manifest files already indexed by pipeline step 1. */
             CBM_PROF_START(prof_index_deps);
-            int deps_reindexed = cbm_dep_auto_index(
-                project_name, repo_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT, srv->config);
+            int dep_owner_rc = CBM_STORE_OK;
+            int deps_reindexed =
+                cbm_mcp_auto_index_deps(srv, project_name, repo_path, store, &dep_owner_rc);
             CBM_PROF_END("index_repository", "dep_auto_index", prof_index_deps);
+
+            if (dep_owner_rc != CBM_STORE_OK) {
+                rc = dep_owner_rc;
+                yyjson_mut_obj_add_str(
+                    doc, root, "error",
+                    "failed to refresh file-delta owner metadata after dependency indexing");
+            }
 
             CBM_PROF_START(prof_index_rank_refresh);
             (void)cbm_pagerank_refresh_if_needed(
@@ -5156,6 +5195,8 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             CBM_PROF_END("index_repository", "adr_check", prof_index_adr);
         }
     }
+
+    yyjson_mut_obj_add_str(doc, root, "status", rc == 0 ? "indexed" : "error");
 
     /* Surface excluded subtrees (#411) so users know what wasn't indexed.
      * The discover layer collects .gitignore'd / config-excluded directories;
@@ -7470,8 +7511,8 @@ static void *autoindex_thread(void *arg) {
         /* Re-index dependencies after fresh dump */
         cbm_store_t *store = resolve_store(srv, srv->session_project);
         if (store) {
-            int deps_reindexed = cbm_dep_auto_index(srv->session_project, srv->session_root,
-                                                    store, CBM_DEFAULT_AUTO_DEP_LIMIT, srv->config);
+            int deps_reindexed = cbm_mcp_auto_index_deps(
+                srv, srv->session_project, srv->session_root, store, NULL);
             (void)cbm_pagerank_refresh_if_needed(
                 store, srv->session_project, srv->config, graph_changed, deps_reindexed,
                 publish_kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
