@@ -621,8 +621,8 @@ TEST(httplink_all_exclude_paths_merge) {
     /* User-configured paths should be appended after defaults */
     cbm_httplink_config_t cfg = cbm_httplink_default_config();
     cfg.exclude_paths = calloc(2, sizeof(char *));
-    cfg.exclude_paths[0] = strdup("/custom1");
-    cfg.exclude_paths[1] = strdup("/custom2");
+    cfg.exclude_paths[0] = cbm_strdup("/custom1");
+    cfg.exclude_paths[1] = cbm_strdup("/custom2");
     cfg.exclude_path_count = 2;
 
     const char *paths[64];
@@ -640,6 +640,16 @@ TEST(httplink_all_exclude_paths_merge) {
     ASSERT_STR_EQ(paths[cbm_default_exclude_paths_count + 1], "/custom2");
 
     cbm_httplink_config_free(&cfg);
+    PASS();
+}
+
+TEST(httplink_is_path_excluded_skips_null_entries) {
+    const char *paths[] = {NULL, "/health", NULL};
+
+    ASSERT_TRUE(cbm_is_path_excluded("/health", paths, 3));
+    ASSERT_FALSE(cbm_is_path_excluded("/ready", paths, 3));
+    ASSERT_FALSE(cbm_is_path_excluded("/health", NULL, 3));
+
     PASS();
 }
 
@@ -916,13 +926,14 @@ SUITE(httplink) {
     RUN_TEST(httplink_detect_protocol);
     RUN_TEST(httplink_is_test_node);
 
-    /* Config (6 tests — 2 original + 4 YAML-dependent) */
+    /* Config (7 tests — 2 original + 5 YAML/defensive helpers) */
     RUN_TEST(httplink_is_path_excluded);
     RUN_TEST(httplink_default_exclude_paths);
     RUN_TEST(httplink_load_config_default);
     RUN_TEST(httplink_load_config_from_file);
     RUN_TEST(httplink_load_config_invalid_yaml);
     RUN_TEST(httplink_all_exclude_paths_merge);
+    RUN_TEST(httplink_is_path_excluded_skips_null_entries);
 
     /* Langparity (2 tests) */
     RUN_TEST(httplink_http_client_keywords_all_languages);

@@ -128,8 +128,10 @@ double cbm_ngram_overlap(const char *a, const char *b, int n) {
         memcpy(key, a + i, (size_t)klen);
         key[klen] = '\0';
         if (!cbm_ht_get(set_a, key)) {
-            // NOLINTNEXTLINE(misc-include-cleaner) — strdup provided by string.h
-            cbm_ht_set(set_a, strdup(key), (void *)1);
+            char *owned_key = cbm_strdup(key);
+            if (owned_key) {
+                cbm_ht_set(set_a, owned_key, (void *)1);
+            }
         }
     }
 
@@ -142,8 +144,10 @@ double cbm_ngram_overlap(const char *a, const char *b, int n) {
         memcpy(key, b + i, (size_t)klen);
         key[klen] = '\0';
         if (!cbm_ht_get(set_b, key)) {
-            // NOLINTNEXTLINE(misc-include-cleaner) — strdup provided by string.h
-            cbm_ht_set(set_b, strdup(key), (void *)1);
+            char *owned_key = cbm_strdup(key);
+            if (owned_key) {
+                cbm_ht_set(set_b, owned_key, (void *)1);
+            }
             if (cbm_ht_get(set_a, key)) {
                 intersection++;
             }
@@ -646,7 +650,13 @@ bool cbm_is_path_excluded(const char *path, const char **exclude_paths, int coun
         norm[--len] = '\0';
     }
 
+    if (!exclude_paths) {
+        return false;
+    }
     for (int i = 0; i < count; i++) {
+        if (!exclude_paths[i]) {
+            continue;
+        }
         /* Normalize exclude path too */
         char excl[512];
         int elen = 0;
@@ -1730,11 +1740,23 @@ cbm_httplink_config_t cbm_httplink_load_config(const char *dir) {
         // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
         cfg.exclude_paths = calloc((size_t)count, sizeof(char *));
         if (cfg.exclude_paths) {
-            for (int i = 0; i < count; i++) {
-                // NOLINTNEXTLINE(misc-include-cleaner) — strdup provided by standard header
-                cfg.exclude_paths[i] = strdup(items[i]);
+            int copied = 0;
+            for (; copied < count; copied++) {
+                cfg.exclude_paths[copied] = cbm_strdup(items[copied]);
+                if (!cfg.exclude_paths[copied]) {
+                    break;
+                }
             }
-            cfg.exclude_path_count = count;
+            if (copied == count) {
+                cfg.exclude_path_count = count;
+            } else {
+                for (int i = 0; i < copied; i++) {
+                    free(cfg.exclude_paths[i]);
+                }
+                free(cfg.exclude_paths);
+                cfg.exclude_paths = NULL;
+                cfg.exclude_path_count = 0;
+            }
         }
     }
 
