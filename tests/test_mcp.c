@@ -247,6 +247,62 @@ TEST(mcp_tools_array_schemas_have_items) {
     PASS();
 }
 
+TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731) {
+    char *json = cbm_mcp_tools_list();
+    ASSERT_NOT_NULL(json);
+
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_NOT_NULL(root);
+    yyjson_val *tools = yyjson_obj_get(root, "tools");
+    ASSERT_NOT_NULL(tools);
+    ASSERT_TRUE(yyjson_is_arr(tools));
+
+    yyjson_val *tool;
+    yyjson_arr_iter iter;
+    yyjson_arr_iter_init(tools, &iter);
+    yyjson_val *ingest_traces = NULL;
+    while ((tool = yyjson_arr_iter_next(&iter)) != NULL) {
+        yyjson_val *name = yyjson_obj_get(tool, "name");
+        if (name && yyjson_is_str(name) && strcmp(yyjson_get_str(name), "ingest_traces") == 0) {
+            ingest_traces = tool;
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(ingest_traces);
+
+    yyjson_val *input_schema = yyjson_obj_get(ingest_traces, "inputSchema");
+    ASSERT_NOT_NULL(input_schema);
+    yyjson_val *properties = yyjson_obj_get(input_schema, "properties");
+    ASSERT_NOT_NULL(properties);
+    yyjson_val *traces = yyjson_obj_get(properties, "traces");
+    ASSERT_NOT_NULL(traces);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(traces, "type")), "array");
+    yyjson_val *items = yyjson_obj_get(traces, "items");
+    ASSERT_NOT_NULL(items);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(items, "type")), "object");
+    yyjson_val *item_properties = yyjson_obj_get(items, "properties");
+    ASSERT_NOT_NULL(item_properties);
+    yyjson_val *caller = yyjson_obj_get(item_properties, "caller");
+    ASSERT_NOT_NULL(caller);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(caller, "type")), "string");
+    yyjson_val *callee = yyjson_obj_get(item_properties, "callee");
+    ASSERT_NOT_NULL(callee);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(callee, "type")), "string");
+    yyjson_val *count = yyjson_obj_get(item_properties, "count");
+    ASSERT_NOT_NULL(count);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(count, "type")), "integer");
+    yyjson_val *additional_properties = yyjson_obj_get(items, "additionalProperties");
+    ASSERT_NOT_NULL(additional_properties);
+    ASSERT_TRUE(yyjson_is_bool(additional_properties));
+    ASSERT_FALSE(yyjson_get_bool(additional_properties));
+
+    yyjson_doc_free(doc);
+    free(json);
+    PASS();
+}
+
 TEST(mcp_text_result) {
     char *json = cbm_mcp_text_result("{\"total\":5}", false);
     ASSERT_NOT_NULL(json);
@@ -3175,6 +3231,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_tools_list_latest_metadata);
     RUN_TEST(mcp_index_repository_declares_name_override_issue571);
     RUN_TEST(mcp_tools_array_schemas_have_items);
+    RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);
     RUN_TEST(mcp_text_result);
     RUN_TEST(mcp_text_result_skips_structured_content_for_plain_text);
     RUN_TEST(mcp_cancel_matches_request_id);
