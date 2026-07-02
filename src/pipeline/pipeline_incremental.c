@@ -1329,6 +1329,15 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
             return state_rc;
         }
 
+        int owner_rc =
+            cbm_store_rebuild_file_delta_owners(hash_store, project, CBM_PIPELINE_COMPAT_GENERATION);
+        if (owner_rc != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "phase", "rebuild_file_delta_owners", "rc",
+                          itoa_buf_incr(owner_rc));
+            cbm_store_close(hash_store);
+            return owner_rc;
+        }
+
         /* The direct btree dump bypasses any triggers that could have kept the
          * contentless FTS table synchronized, so rebuild it after replacement. */
         int fts_rc = cbm_store_rebuild_nodes_fts(hash_store);

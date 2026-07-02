@@ -121,19 +121,16 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
     }
 }
 
-/* Insert an edge, splicing the call-site line (,"line":N) in before the closing
- * brace when one was captured. Mirrors finalize_and_emit() on the parallel path
- * so CALLS edges carry their source line regardless of resolution path. Restricted
- * to CALLS: route/config edge props feed full-only predump passes
- * (create_route_nodes/create_data_flows), so altering them desyncs full vs
- * incremental indexing. */
+/* Insert an edge, using the shared CALLS finalizer so sequential containment
+ * and parallel full indexing serialize call-site args/line identically. Keep
+ * this restricted to CALLS: route/config edge props feed full-only predump
+ * passes, so altering them desyncs full vs incremental indexing. */
 static void calls_emit_edge(cbm_gbuf_t *gbuf, int64_t src, int64_t tgt, const char *type,
                             char *props, size_t cap, const CBMCall *call) {
-    if (call && call->start_line > 0 && strcmp(type, "CALLS") == 0) {
+    if (call && strcmp(type, "CALLS") == 0) {
         size_t len = strlen(props);
-        if (len >= SKIP_ONE && props[len - SKIP_ONE] == '}' && len + CBM_SZ_32 < cap) {
-            snprintf(props + len - SKIP_ONE, cap - (len - SKIP_ONE), ",\"line\":%d}",
-                     call->start_line);
+        if (len >= SKIP_ONE && props[len - SKIP_ONE] == '}') {
+            cbm_pipeline_close_call_edge_props(props, cap, len - SKIP_ONE, call, true);
         }
     }
     cbm_gbuf_insert_edge(gbuf, src, tgt, type, props);
