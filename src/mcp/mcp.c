@@ -107,20 +107,68 @@ static void add_response_warning(yyjson_mut_doc *doc, yyjson_mut_val *root, cons
     yyjson_mut_arr_add_str(doc, warnings, message);
 }
 
+#define CBM_MCP_FRESHNESS_KEY "freshness"
+#define CBM_MCP_FRESHNESS_STATE_KEY "state"
+#define CBM_MCP_FRESHNESS_STALE_VIEWS_KEY "stale_views"
+#define CBM_MCP_FRESHNESS_STALE_WITH_WARNING "stale_with_warning"
+
+static void add_response_stale_view(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                    const char *view_name) {
+    if (!doc || !root || !view_name || !view_name[0]) {
+        return;
+    }
+
+    yyjson_mut_val *freshness = yyjson_mut_obj_get(root, CBM_MCP_FRESHNESS_KEY);
+    if (!freshness || !yyjson_mut_is_obj(freshness)) {
+        freshness = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_val(doc, root, CBM_MCP_FRESHNESS_KEY, freshness);
+    }
+    if (!yyjson_mut_obj_get(freshness, CBM_MCP_FRESHNESS_STATE_KEY)) {
+        yyjson_mut_obj_add_str(doc, freshness, CBM_MCP_FRESHNESS_STATE_KEY,
+                               CBM_MCP_FRESHNESS_STALE_WITH_WARNING);
+    }
+
+    yyjson_mut_val *stale_views =
+        yyjson_mut_obj_get(freshness, CBM_MCP_FRESHNESS_STALE_VIEWS_KEY);
+    if (!stale_views || !yyjson_mut_is_arr(stale_views)) {
+        stale_views = yyjson_mut_arr(doc);
+        yyjson_mut_obj_add_val(doc, freshness, CBM_MCP_FRESHNESS_STALE_VIEWS_KEY, stale_views);
+    }
+    yyjson_mut_arr_iter iter;
+    yyjson_mut_val *item;
+    yyjson_mut_arr_iter_init(stale_views, &iter);
+    while ((item = yyjson_mut_arr_iter_next(&iter))) {
+        const char *existing = yyjson_mut_get_str(item);
+        if (existing && strcmp(existing, view_name) == 0) {
+            return;
+        }
+    }
+    yyjson_mut_arr_add_str(doc, stale_views, view_name);
+}
+
+static void add_stale_derived_view_warning(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                           const char *view_name, const char *message) {
+    add_response_warning(doc, root, message);
+    add_response_stale_view(doc, root, view_name);
+}
+
 static void add_derived_freshness_warnings(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                            bool pagerank_stale, bool linkrank_stale,
                                            bool node_degree_stale) {
     if (pagerank_stale) {
-        add_response_warning(doc, root,
-                             "pagerank derived view is stale; stale PageRank values were omitted.");
+        add_stale_derived_view_warning(
+            doc, root, CBM_STORE_DERIVED_VIEW_PAGERANK,
+            "pagerank derived view is stale; stale PageRank values were omitted.");
     }
     if (linkrank_stale) {
-        add_response_warning(doc, root,
-                             "linkrank derived view is stale; stale LinkRank ordering was not used.");
+        add_stale_derived_view_warning(
+            doc, root, CBM_STORE_DERIVED_VIEW_LINKRANK,
+            "linkrank derived view is stale; stale LinkRank ordering was not used.");
     }
     if (node_degree_stale) {
-        add_response_warning(doc, root,
-                             "node_degree derived view is stale; precomputed degree data was not used.");
+        add_stale_derived_view_warning(
+            doc, root, CBM_STORE_DERIVED_VIEW_NODE_DEGREE,
+            "node_degree derived view is stale; precomputed degree data was not used.");
     }
 }
 
@@ -182,13 +230,14 @@ static void add_query_graph_derived_warnings(yyjson_mut_doc *doc, yyjson_mut_val
     }
     if ((query_mentions_route_derived_graph(query) || cypher_result_contains_route_label(result)) &&
         cbm_store_derived_view_is_stale(store, project, CBM_STORE_DERIVED_VIEW_ROUTES)) {
-        add_response_warning(doc, root,
-                             "routes derived view is stale; query_graph route results may be stale.");
+        add_stale_derived_view_warning(
+            doc, root, CBM_STORE_DERIVED_VIEW_ROUTES,
+            "routes derived view is stale; query_graph route results may be stale.");
     }
     if (query_mentions_semantic_derived_graph(query) &&
         cbm_store_derived_view_is_stale(store, project, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES)) {
-        add_response_warning(
-            doc, root,
+        add_stale_derived_view_warning(
+            doc, root, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
             "semantic_edges derived view is stale; query_graph semantic edges may be stale.");
     }
 }
@@ -3070,8 +3119,8 @@ static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const 
     } else if (sq_val && yyjson_arr_size(sq_val) > 0) {
         if (project && cbm_store_derived_view_is_stale(
                            store, project, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES)) {
-            add_response_warning(
-                doc, root,
+            add_stale_derived_view_warning(
+                doc, root, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
                 "semantic_edges derived view is stale; semantic_results may be stale.");
         }
         const char *keywords[MAX_KW_SEARCH];
@@ -3412,8 +3461,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                                    out.node_degree_stale);
     if (search_graph_uses_route_derived_graph(label, relationship) &&
         cbm_store_derived_view_is_stale(store, project, CBM_STORE_DERIVED_VIEW_ROUTES)) {
-        add_response_warning(doc, root,
-                             "routes derived view is stale; search_graph route results may be stale.");
+        add_stale_derived_view_warning(
+            doc, root, CBM_STORE_DERIVED_VIEW_ROUTES,
+            "routes derived view is stale; search_graph route results may be stale.");
     }
 
     if (is_summary) {
@@ -4002,13 +4052,13 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     bool pagerank_stale =
         project && cbm_store_derived_view_is_stale(store, project, CBM_STORE_DERIVED_VIEW_PAGERANK);
     if (architecture_stale) {
-        add_response_warning(
-            doc, root,
+        add_stale_derived_view_warning(
+            doc, root, CBM_STORE_DERIVED_VIEW_ARCHITECTURE,
             "architecture derived view is stale; summaries may need a full refresh.");
     }
     if (routes_stale) {
-        add_response_warning(doc, root,
-                             "routes derived view is stale; route results may be stale.");
+        add_stale_derived_view_warning(doc, root, CBM_STORE_DERIVED_VIEW_ROUTES,
+                                       "routes derived view is stale; route results may be stale.");
     }
 
     /* Node label summary */
@@ -4046,8 +4096,8 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
 
     /* Key functions: top 10 by PageRank with config + param exclude patterns */
     if (pagerank_stale) {
-        add_response_warning(
-            doc, root,
+        add_stale_derived_view_warning(
+            doc, root, CBM_STORE_DERIVED_VIEW_PAGERANK,
             "pagerank derived view is stale; key_functions were omitted.");
     } else {
         sqlite3 *db = cbm_store_get_db(store);

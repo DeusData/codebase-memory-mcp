@@ -281,6 +281,19 @@ def response_publish_reason(data: dict[str, Any]) -> str:
     return publish_reason if isinstance(publish_reason, str) else ""
 
 
+def response_freshness(data: dict[str, Any]) -> dict[str, Any] | None:
+    freshness = data.get("freshness")
+    return freshness if isinstance(freshness, dict) else None
+
+
+def response_freshness_state(data: dict[str, Any]) -> str:
+    freshness = response_freshness(data)
+    if not freshness:
+        return ""
+    state = freshness.get("state")
+    return state if isinstance(state, str) else ""
+
+
 def is_incremental_publish_kind(publish_kind: str) -> bool:
     return publish_kind in {
         PUBLISH_INCREMENTAL_NOOP,
@@ -349,12 +362,16 @@ def build_index_result(
     }
     indexed_ms = indexed_work_elapsed_ms(logged_elapsed_ms)
     publish_reason = response_publish_reason(data)
+    freshness = response_freshness(data)
+    freshness_state = response_freshness_state(data)
     result: dict[str, Any] = {
         "elapsed_ms": elapsed_ms_int,
         "indexed_work_elapsed_ms": indexed_ms,
         "unlogged_overhead_ms": (elapsed_ms_int - indexed_ms) if indexed_ms is not None else None,
         "response": data,
         "publish_kind": publish_kind or None,
+        "freshness_state": freshness_state or None,
+        "freshness": freshness,
         "stdout_bytes": stdout_bytes,
         "markers": {
             "incremental_exact_done": log_has(stderr, "incremental.exact.done")
