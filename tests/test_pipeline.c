@@ -8232,6 +8232,68 @@ static int write_incremental_frontier_fixture(int leaf_value) {
     return write_incremental_frontier_callers();
 }
 
+static int pipeline_store_insert_file_owned_unowned_source_edge(const char *db_path,
+                                                               const char *project,
+                                                               const char *rel_path,
+                                                               const char *target_name,
+                                                               const char *edge_type) {
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    char *target_qn = cbm_pipeline_fqn_compute(project, rel_path, target_name);
+    if (!target_qn) {
+        cbm_store_close(s);
+        return CBM_STORE_ERR;
+    }
+    cbm_node_t target = {0};
+    int rc = cbm_store_find_node_by_qn(s, project, target_qn, &target);
+    if (rc != CBM_STORE_OK) {
+        free(target_qn);
+        cbm_store_close(s);
+        return rc;
+    }
+    char source_qn[CBM_SZ_512];
+    int n = snprintf(source_qn, sizeof(source_qn), "%s.__unowned_source", project);
+    if (n < 0 || (size_t)n >= sizeof(source_qn)) {
+        cbm_node_free_fields(&target);
+        free(target_qn);
+        cbm_store_close(s);
+        return CBM_STORE_ERR;
+    }
+    cbm_node_t source = {.project = (char *)project,
+                         .label = "Module",
+                         .name = "unowned_source",
+                         .qualified_name = source_qn,
+                         .file_path = "",
+                         .properties_json = "{}"};
+    int64_t source_id = cbm_store_upsert_node(s, &source);
+    if (source_id <= CBM_STORE_NO_NODE_ID) {
+        cbm_node_free_fields(&target);
+        free(target_qn);
+        cbm_store_close(s);
+        return CBM_STORE_ERR;
+    }
+    cbm_edge_t edge = {.project = (char *)project,
+                       .source_id = source_id,
+                       .target_id = target.id,
+                       .type = (char *)edge_type,
+                       .properties_json = "{}"};
+    int64_t edge_id = cbm_store_insert_edge(s, &edge);
+    if (edge_id <= CBM_STORE_NO_NODE_ID) {
+        cbm_node_free_fields(&target);
+        free(target_qn);
+        cbm_store_close(s);
+        return CBM_STORE_ERR;
+    }
+    rc = cbm_store_upsert_edge_owner(s, project, edge_id, rel_path, NULL,
+                                     CBM_PIPELINE_COMPAT_GENERATION);
+    cbm_node_free_fields(&target);
+    free(target_qn);
+    cbm_store_close(s);
+    return rc;
+}
+
 static int pipeline_store_has_node_name_by_label(const char *db_path, const char *project,
                                                  const char *label, const char *name) {
     cbm_store_t *s = cbm_store_open_path_query(db_path);
@@ -9477,6 +9539,57 @@ TEST(incremental_fast_configured_frontier_cap_allows_bounded_exact) {
         FAIL(diff_err[0] ? diff_err : "configured exact frontier differed from fresh rebuild");
     }
     ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_before_exact_build) {
+    enum { PIPELINE_CONFIGURED_AFFECTED_CAP = CBM_SZ_8 };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    ASSERT_EQ(write_incremental_frontier_fixture(CBM_ALLOC_ONE), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    char cap_value[CBM_SZ_32];
+    int n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_CONFIGURED_AFFECTED_CAP);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, cap_value), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(pipeline_store_insert_file_owned_unowned_source_edge(g_incr_dbpath, project,
+                                                                   "leaf.go", "Leaf", "CALLS"),
+              CBM_STORE_OK);
+    ASSERT_EQ(write_incremental_leaf_file_with_extra(CBM_SZ_2), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.fallback reason=inbound_edges_require_full") !=
+           NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.frontier") == NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.done") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "inbound_edges_require_full");
+    cbm_pipeline_free(p);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "LeafExtra"));
 
     free(project);
     cbm_config_close(cfg);
@@ -12254,6 +12367,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild);
     RUN_TEST(incremental_fast_falls_back_for_oversized_inbound_frontier_and_matches_full);
     RUN_TEST(incremental_fast_configured_frontier_cap_allows_bounded_exact);
+    RUN_TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_before_exact_build);
     RUN_TEST(incremental_fast_expands_small_inbound_frontier_and_matches_full);
     RUN_TEST(incremental_fast_three_file_batch_falls_back_to_full_rebuild_parity);
     RUN_TEST(incremental_fast_single_delete_exact_matches_full_rebuild);
