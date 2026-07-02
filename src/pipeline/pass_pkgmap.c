@@ -1406,7 +1406,7 @@ static char *import_edge_local_name_dup_json(const cbm_gbuf_edge_t *edge) {
     yyjson_val *root = yyjson_doc_get_root(doc);
     yyjson_val *local = yyjson_obj_get(root, "local_name");
     const char *value = yyjson_is_str(local) ? yyjson_get_str(local) : NULL;
-    char *dup = value && value[0] ? strdup(value) : NULL;
+    char *dup = value && value[0] ? cbm_strdup(value) : NULL;
     yyjson_doc_free(doc);
     return dup;
 }
