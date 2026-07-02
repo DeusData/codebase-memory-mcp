@@ -521,6 +521,7 @@ int main(int argc, char **argv) {
      * below opens sqlite early), else sqlite3_config returns SQLITE_MISUSE and
      * the bind is silently ignored. No-op in the test build. */
     cbm_alloc_init();
+    cbm_cli_set_version(CBM_VERSION);
     cbm_profile_init(); /* reads CBM_PROFILE env var, gates all prof macros */
     /* CBM_LOG_LEVEL support — distilled from #414 (closes #413). Apply before
      * the first log statement so the configured level governs all output. */

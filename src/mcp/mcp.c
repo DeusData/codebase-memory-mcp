@@ -657,7 +657,7 @@ char *cbm_mcp_initialize_response(const char *params_json) {
 
     yyjson_mut_val *impl = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_str(doc, impl, "name", "codebase-memory-mcp");
-    yyjson_mut_obj_add_str(doc, impl, "version", "0.10.0");
+    yyjson_mut_obj_add_str(doc, impl, "version", cbm_cli_get_version());
     yyjson_mut_obj_add_val(doc, root, "serverInfo", impl);
 
     yyjson_mut_val *caps = yyjson_mut_obj(doc);
