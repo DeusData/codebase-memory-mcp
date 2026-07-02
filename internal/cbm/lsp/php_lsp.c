@@ -18,6 +18,7 @@
  */
 
 #include "php_lsp.h"
+#include "lsp_env.h"
 #include "lsp_node_iter.h"
 #include "../helpers.h"
 #include <ctype.h>
@@ -134,8 +135,7 @@ void php_lsp_init(PHPLSPContext *ctx, CBMArena *arena, const char *source, int s
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL);
 
-    const char *dbg = getenv("CBM_LSP_DEBUG");
-    ctx->debug = (dbg && dbg[0]);
+    ctx->debug = cbm_lsp_env_flag_enabled("CBM_LSP_DEBUG");
 }
 
 void php_lsp_add_use(PHPLSPContext *ctx, const char *local_name, const char *target_qn,

@@ -27,6 +27,7 @@
  */
 
 #include "ts_lsp.h"
+#include "lsp_env.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3147,8 +3148,7 @@ void ts_lsp_init(TSLSPContext *ctx, CBMArena *arena, const char *source, int sou
     ctx->dts_mode = dts_mode;
     ctx->current_scope = arena ? cbm_scope_push(arena, NULL) : NULL;
 
-    const char *debug_env = getenv("CBM_LSP_DEBUG");
-    ctx->debug = (debug_env && debug_env[0]);
+    ctx->debug = cbm_lsp_env_flag_enabled("CBM_LSP_DEBUG");
 }
 
 void ts_lsp_add_import(TSLSPContext *ctx, const char *local_name, const char *module_qn) {
@@ -4784,8 +4784,7 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     // Diagnostic / benchmarking knob: setting `CBM_LSP_DISABLED=1` skips the resolver.
     // This is used by the baseline-vs-LSP comparison tests to measure how many calls
     // the LSP-augmented path adds over plain tree-sitter extraction.
-    const char *disabled = getenv("CBM_LSP_DISABLED");
-    if (disabled && disabled[0] && disabled[0] != '0')
+    if (cbm_lsp_env_flag_enabled("CBM_LSP_DISABLED"))
         return;
 
     CBMTypeRegistry reg;

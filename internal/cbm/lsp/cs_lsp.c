@@ -40,6 +40,7 @@
  */
 
 #include "cs_lsp.h"
+#include "lsp_env.h"
 #include "lsp_node_iter.h"
 #include "../helpers.h"
 #include <ctype.h>
@@ -213,8 +214,7 @@ void cs_lsp_init(CSLSPContext *ctx, CBMArena *arena, const char *source, int sou
      * file's <ImplicitUsings>; we just always include it. */
     cs_lsp_add_using(ctx, CBM_CS_USING_NAMESPACE, "", "System", false);
 
-    const char *dbg = getenv("CBM_LSP_DEBUG");
-    ctx->debug = (dbg && dbg[0]);
+    ctx->debug = cbm_lsp_env_flag_enabled("CBM_LSP_DEBUG");
 }
 
 /* ── using management ───────────────────────────────────────────── */

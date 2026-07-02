@@ -35,6 +35,7 @@
  */
 
 #include "kotlin_lsp.h"
+#include "lsp_env.h"
 #include "../helpers.h"
 #include <ctype.h>
 #include <stdarg.h>
@@ -450,7 +451,7 @@ void kotlin_lsp_init(KotlinLSPContext *ctx, CBMArena *arena, const char *source,
     ctx->import_kinds = (CBMKotlinUseKind *)cbm_arena_alloc(arena, sizeof(CBMKotlinUseKind) *
                                                                        (size_t)ctx->import_cap);
     ctx->import_count = 0;
-    ctx->debug = (getenv("CBM_LSP_DEBUG") != NULL);
+    ctx->debug = cbm_lsp_env_flag_enabled("CBM_LSP_DEBUG");
 
     /* Compute the JVM file class name. The Kotlin convention is that
      * top-level functions/properties live in a synthetic class named
@@ -3491,7 +3492,7 @@ void kotlin_lsp_process_file(KotlinLSPContext *ctx, TSNode root) {
     if (ts_node_is_null(root)) {
         return;
     }
-    if (getenv("CBM_LSP_KOTLIN_AST")) {
+    if (cbm_lsp_env_flag_enabled("CBM_LSP_KOTLIN_AST")) {
         fprintf(stderr, "=== AST for %s ===\n", ctx->rel_path ? ctx->rel_path : "<unknown>");
         kt_debug_dump_ast(root, ctx->source, 0);
         fprintf(stderr, "=== END AST ===\n");
@@ -4019,7 +4020,7 @@ void cbm_run_kotlin_lsp(CBMArena *arena, CBMFileResult *result, const char *sour
     TSNode use_root = root;
     const char *use_source = source;
     int use_source_len = source_len;
-    bool debug = (getenv("CBM_LSP_DEBUG") != NULL);
+    bool debug = cbm_lsp_env_flag_enabled("CBM_LSP_DEBUG");
     if (debug && patched_src) {
         fprintf(stderr, "[kotlin_lsp] preprocessed %d → %d bytes\n", source_len, patched_len);
         fprintf(stderr, "[kotlin_lsp] patched source:\n%s\n[end patched]\n", patched_src);
