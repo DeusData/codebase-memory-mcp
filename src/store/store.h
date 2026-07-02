@@ -500,6 +500,11 @@ int cbm_store_count_edges_by_type(cbm_store_t *s, const char *project, const cha
 /* Delete all edges for a project. */
 int cbm_store_delete_edges_by_project(cbm_store_t *s, const char *project);
 
+/* Delete edges from any project that reference nodes in project.
+ * Used before replacing a whole project graph so cross-project edges cannot
+ * keep old nodes alive through foreign-key references. */
+int cbm_store_delete_edges_touching_project_nodes(cbm_store_t *s, const char *project);
+
 /* Delete edges by type. */
 int cbm_store_delete_edges_by_type(cbm_store_t *s, const char *project, const char *type);
 

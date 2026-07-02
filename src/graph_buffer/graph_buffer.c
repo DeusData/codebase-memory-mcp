@@ -2028,32 +2028,43 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     }
 
     int64_t *temp_to_real = NULL;
+    const char *phase = "begin_bulk";
     int rc = cbm_store_begin_bulk(store);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
 
+    phase = "begin";
     rc = cbm_store_begin(store);
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_end_bulk(store);
         return rc;
     }
 
+    phase = "upsert_project";
     rc = cbm_store_upsert_project(store, gb->project, gb->root_path);
     if (rc != CBM_STORE_OK) {
         goto fail;
     }
 
+    phase = "drop_indexes";
     rc = cbm_store_drop_indexes(store);
     if (rc != CBM_STORE_OK) {
         goto fail;
     }
 
     /* Delete existing project data */
+    phase = "delete_project_edges";
     rc = cbm_store_delete_edges_by_project(store, gb->project);
     if (rc != CBM_STORE_OK) {
         goto fail;
     }
+    phase = "delete_touching_edges";
+    rc = cbm_store_delete_edges_touching_project_nodes(store, gb->project);
+    if (rc != CBM_STORE_OK) {
+        goto fail;
+    }
+    phase = "delete_project_nodes";
     rc = cbm_store_delete_nodes_by_project(store, gb->project);
     if (rc != CBM_STORE_OK) {
         goto fail;
@@ -2065,10 +2076,12 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     int64_t max_temp_id = gb->next_id;
     temp_to_real = calloc(max_temp_id, sizeof(int64_t));
     if (!temp_to_real) {
+        phase = "alloc_temp_map";
         rc = CBM_NOT_FOUND;
         goto fail;
     }
 
+    phase = "upsert_nodes";
     for (int i = 0; i < gb->nodes.count; i++) {
         cbm_gbuf_node_t *n = gb->nodes.items[i];
 
@@ -2098,6 +2111,7 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     }
 
     /* Insert all edges with remapped IDs */
+    phase = "insert_edges";
     for (int i = 0; i < gb->edges.count; i++) {
         cbm_gbuf_edge_t *e = gb->edges.items[i];
         int64_t real_src = (e->source_id < max_temp_id) ? temp_to_real[e->source_id] : 0;
@@ -2119,10 +2133,12 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
         }
     }
 
+    phase = "create_indexes";
     rc = cbm_store_create_indexes(store);
     if (rc != CBM_STORE_OK) {
         goto fail;
     }
+    phase = "commit";
     rc = cbm_store_commit(store);
     if (rc != CBM_STORE_OK) {
         goto fail;
@@ -2133,6 +2149,12 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     return end_bulk_rc == CBM_STORE_OK ? 0 : end_bulk_rc;
 
 fail:
+    {
+        char rc_str[CBM_SZ_32];
+        snprintf(rc_str, sizeof(rc_str), "%d", rc);
+        cbm_log_error("gbuf.flush.err", "phase", phase, "project", gb->project,
+                      "rc", rc_str, "store_error", cbm_store_error(store));
+    }
     (void)cbm_store_rollback(store);
     (void)cbm_store_end_bulk(store);
     free(temp_to_real);

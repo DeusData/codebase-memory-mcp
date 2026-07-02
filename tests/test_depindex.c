@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "sqlite3.h"
 
 /* ── Helpers ─────────────────────────────────────────────────── */
 
@@ -105,6 +106,14 @@ static int __attribute__((unused)) setup_uv_fixture(char *tmp_dir, size_t tmp_sz
     snprintf(proj_dir, sizeof(proj_dir), "%s/project", tmp_dir);
     cbm_mkdir(proj_dir);
 
+    char pyproject_path[512];
+    snprintf(pyproject_path, sizeof(pyproject_path), "%s/pyproject.toml", proj_dir);
+    FILE *fp = fopen(pyproject_path, "w");
+    if (!fp)
+        return -1;
+    fprintf(fp, "[project]\nname = \"fixture\"\ndependencies = [\"requests\"]\n");
+    fclose(fp);
+
     /* Create .venv/lib/python3.12/site-packages/requests/ */
     char venv_path[512];
     snprintf(venv_path, sizeof(venv_path), "%s/.venv", proj_dir);
@@ -122,7 +131,7 @@ static int __attribute__((unused)) setup_uv_fixture(char *tmp_dir, size_t tmp_sz
     /* Write a simple __init__.py */
     char init_path[512];
     snprintf(init_path, sizeof(init_path), "%s/__init__.py", venv_path);
-    FILE *fp = fopen(init_path, "w");
+    fp = fopen(init_path, "w");
     if (!fp)
         return -1;
     fprintf(fp, "\"\"\"Requests library.\"\"\"\n\n"
@@ -193,6 +202,27 @@ static cbm_mcp_server_t *setup_dep_query_server(char *tmp_dir, size_t tmp_sz) {
     cbm_store_upsert_node(st, &n_proc);
 
     return srv;
+}
+
+static int count_fts_matches(cbm_store_t *st, const char *project, const char *query) {
+    sqlite3 *db = cbm_store_get_db(st);
+    if (!db) return -1;
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT COUNT(*) "
+        "FROM nodes_fts f JOIN nodes n ON n.id = f.rowid "
+        "WHERE nodes_fts MATCH ?1 AND n.project = ?2";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, query, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, project, -1, SQLITE_TRANSIENT);
+    int count = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return count;
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -720,6 +750,53 @@ TEST(test_dep_reindex_replaces) {
     PASS();
 }
 
+TEST(test_auto_index_deps_refreshes_nodes_fts) {
+    char tmp[256];
+    ASSERT_EQ(setup_uv_fixture(tmp, sizeof(tmp)), 0);
+
+    char proj_dir[512];
+    int n = snprintf(proj_dir, sizeof(proj_dir), "%s/project", tmp);
+    ASSERT(n > 0 && (size_t)n < sizeof(proj_dir));
+
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+
+    const char *project = "dep-fts-test";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, proj_dir), CBM_STORE_OK);
+
+    cbm_node_t dep_manifest = {0};
+    dep_manifest.project = project;
+    dep_manifest.label = "Variable";
+    dep_manifest.name = "requests";
+    dep_manifest.qualified_name = "dep-fts-test.pyproject.dependencies.requests";
+    dep_manifest.file_path = "pyproject.toml";
+    dep_manifest.start_line = 3;
+    dep_manifest.end_line = 3;
+    dep_manifest.properties_json = "{}";
+    ASSERT_GT(cbm_store_upsert_node(store, &dep_manifest), 0);
+
+    ASSERT_EQ(cbm_dep_auto_index(project, proj_dir, store, 1, NULL), 1);
+    ASSERT_GT(cbm_store_count_nodes(store, "dep-fts-test.dep.requests"), 0);
+    ASSERT_GT(count_fts_matches(store, "dep-fts-test.dep.requests", "get"), 0);
+
+    char init_path[512];
+    n = snprintf(init_path, sizeof(init_path),
+                 "%s/.venv/lib/python3.12/site-packages/requests/__init__.py", proj_dir);
+    ASSERT(n > 0 && (size_t)n < sizeof(init_path));
+    FILE *fp = fopen(init_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fprintf(fp, "def put(url, **kwargs):\n    return url\n");
+    fclose(fp);
+
+    ASSERT_EQ(cbm_dep_auto_index(project, proj_dir, store, 1, NULL), 1);
+    ASSERT_EQ(count_fts_matches(store, "dep-fts-test.dep.requests", "get"), 0);
+    ASSERT_GT(count_fts_matches(store, "dep-fts-test.dep.requests", "put"), 0);
+
+    cbm_store_close(store);
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  RESULT TAGGING: source field on all search results
  * ══════════════════════════════════════════════════════════════════ */
@@ -944,6 +1021,7 @@ SUITE(depindex) {
     RUN_TEST(test_resolve_npm_node_modules);
     RUN_TEST(test_pipeline_set_project_name);
     RUN_TEST(test_dep_reindex_replaces);
+    RUN_TEST(test_auto_index_deps_refreshes_nodes_fts);
 
     /* Result tagging */
     RUN_TEST(test_search_results_have_source_field);
