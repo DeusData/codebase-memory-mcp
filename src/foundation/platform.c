@@ -340,6 +340,34 @@ const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const ch
     return NULL;
 }
 
+static char cbm_ascii_lower(char c) {
+    return (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
+}
+
+static bool cbm_ascii_eq_ignore_case(const char *a, const char *b) {
+    if (!a || !b) {
+        return false;
+    }
+    while (*a && *b) {
+        if (cbm_ascii_lower(*a) != cbm_ascii_lower(*b)) {
+            return false;
+        }
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+bool cbm_env_flag_enabled(const char *name) {
+    char buf[CBM_SZ_32];
+    const char *value = cbm_safe_getenv(name, buf, sizeof(buf), NULL);
+    if (!value || value[0] == '\0') {
+        return false;
+    }
+    return strcmp(value, "0") != 0 && !cbm_ascii_eq_ignore_case(value, "false") &&
+           !cbm_ascii_eq_ignore_case(value, "off") && !cbm_ascii_eq_ignore_case(value, "no");
+}
+
 bool cbm_getenv_fits(const char *name, char *buf, size_t buf_sz, bool *present) {
     if (present) {
         *present = false;

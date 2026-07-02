@@ -164,6 +164,40 @@ TEST(platform_getenv_fits) {
     PASS();
 }
 
+TEST(platform_env_flag_enabled) {
+    const char *name = "CBM_TEST_ENV_FLAG";
+
+    cbm_unsetenv(name);
+    ASSERT_FALSE(cbm_env_flag_enabled(name));
+
+    cbm_setenv(name, "", 1);
+    ASSERT_FALSE(cbm_env_flag_enabled(name));
+
+    cbm_setenv(name, "0", 1);
+    ASSERT_FALSE(cbm_env_flag_enabled(name));
+
+    cbm_setenv(name, "false", 1);
+    ASSERT_FALSE(cbm_env_flag_enabled(name));
+
+    cbm_setenv(name, "OFF", 1);
+    ASSERT_FALSE(cbm_env_flag_enabled(name));
+
+    cbm_setenv(name, "No", 1);
+    ASSERT_FALSE(cbm_env_flag_enabled(name));
+
+    cbm_setenv(name, "1", 1);
+    ASSERT_TRUE(cbm_env_flag_enabled(name));
+
+    cbm_setenv(name, "true", 1);
+    ASSERT_TRUE(cbm_env_flag_enabled(name));
+
+    cbm_setenv(name, "debug", 1);
+    ASSERT_TRUE(cbm_env_flag_enabled(name));
+
+    cbm_unsetenv(name);
+    PASS();
+}
+
 TEST(platform_dirent_name_fits_boundary) {
     char fits[CBM_DIRENT_NAME_MAX];
     char too_long[CBM_DIRENT_NAME_MAX + SKIP_ONE];
@@ -364,6 +398,7 @@ SUITE(platform) {
     RUN_TEST(platform_default_workers_env_invalid);
     RUN_TEST(platform_default_workers_env_unset);
     RUN_TEST(platform_getenv_fits);
+    RUN_TEST(platform_env_flag_enabled);
     RUN_TEST(platform_dirent_name_fits_boundary);
 #ifdef __linux__
     RUN_TEST(cgroup_v2_cpu_quota);

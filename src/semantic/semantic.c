@@ -125,7 +125,9 @@ cbm_sem_config_t cbm_sem_get_config(void) {
         .threshold = (float)CBM_SEM_EDGE_THRESHOLD,
         .max_edges = CBM_SEM_MAX_EDGES,
     };
-    const char *thresh = getenv("CBM_SEMANTIC_THRESHOLD");
+    char thresh_buf[CBM_SZ_32];
+    const char *thresh =
+        cbm_safe_getenv("CBM_SEMANTIC_THRESHOLD", thresh_buf, sizeof(thresh_buf), NULL);
     if (thresh) {
         /* strtod reports errors via endptr; reject non-numeric input silently. */
         char *end = NULL;
@@ -138,8 +140,7 @@ cbm_sem_config_t cbm_sem_get_config(void) {
 }
 
 bool cbm_sem_is_enabled(void) {
-    const char *val = getenv("CBM_SEMANTIC_ENABLED");
-    return val && val[0] == '1';
+    return cbm_env_flag_enabled("CBM_SEMANTIC_ENABLED");
 }
 
 /* ── Token extraction ────────────────────────────────────────────── */

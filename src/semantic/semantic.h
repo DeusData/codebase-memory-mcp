@@ -82,7 +82,7 @@ typedef struct {
 /* Get default config (can be overridden via env vars). */
 cbm_sem_config_t cbm_sem_get_config(void);
 
-/* Check if semantic embeddings are enabled (CBM_SEMANTIC_ENABLED=1). */
+/* Check if semantic embeddings are enabled (CBM_SEMANTIC_ENABLED flag). */
 bool cbm_sem_is_enabled(void);
 
 /* ── Token extraction ────────────────────────────────────────────── */
