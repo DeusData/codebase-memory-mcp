@@ -451,6 +451,29 @@ TEST(resolve_suffix_match) {
     PASS();
 }
 
+TEST(resolve_suffix_match_tie_is_insertion_order_independent) {
+    cbm_registry_t *forward = cbm_registry_new();
+    cbm_registry_t *reverse = cbm_registry_new();
+    ASSERT_NOT_NULL(forward);
+    ASSERT_NOT_NULL(reverse);
+
+    cbm_registry_add(forward, "store", "proj.alpha.Widget.store", "Field");
+    cbm_registry_add(forward, "store", "proj.beta.Widget.store", "Field");
+    cbm_registry_add(reverse, "store", "proj.beta.Widget.store", "Field");
+    cbm_registry_add(reverse, "store", "proj.alpha.Widget.store", "Field");
+
+    cbm_resolution_t a = cbm_registry_resolve(forward, "store", "proj.header", NULL, NULL, 0);
+    cbm_resolution_t b = cbm_registry_resolve(reverse, "store", "proj.header", NULL, NULL, 0);
+    ASSERT_STR_EQ(a.strategy, "suffix_match");
+    ASSERT_STR_EQ(b.strategy, "suffix_match");
+    ASSERT_STR_EQ(a.qualified_name, "proj.alpha.Widget.store");
+    ASSERT_STR_EQ(b.qualified_name, a.qualified_name);
+
+    cbm_registry_free(forward);
+    cbm_registry_free(reverse);
+    PASS();
+}
+
 /* A name with more than REG_MAX_CANDIDATES (256) registered definitions is
  * unresolvable by name alone: the candidate penalty floors its confidence to
  * ~3/count (noise), while walking the candidate array per file dominated
@@ -785,6 +808,7 @@ SUITE(registry) {
     RUN_TEST(confidence_band_speculative);
     /* Suffix match + import map suffix */
     RUN_TEST(resolve_suffix_match);
+    RUN_TEST(resolve_suffix_match_tie_is_insertion_order_independent);
     RUN_TEST(resolve_caps_unresolvably_ambiguous_names);
     RUN_TEST(resolve_import_map_suffix);
     /* Import reachability */

@@ -130,14 +130,17 @@ static int candidate_score(const char *candidate_qn, const char *module_qn) {
     return score;
 }
 
-/* Pick candidate with highest composite score (test-deprioritization + namespace proximity). */
+/* Pick candidate with highest composite score. Equal-score ties are resolved
+ * lexically so resolver output does not depend on registry insertion order
+ * (full index traversal vs incremental store seeding can differ). */
 static const char *best_by_import_distance(const char **candidates, int count,
                                            const char *module_qn) {
     const char *best = NULL;
     int best_score = CBM_NOT_FOUND;
     for (int i = 0; i < count; i++) {
         int score = candidate_score(candidates[i], module_qn);
-        if (score > best_score) {
+        if (score > best_score || (score == best_score && best &&
+                                   strcmp(candidates[i], best) < 0)) {
             best_score = score;
             best = candidates[i];
         }
