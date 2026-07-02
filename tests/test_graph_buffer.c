@@ -1232,6 +1232,48 @@ TEST(gbuf_flush_verify_store_data) {
     PASS();
 }
 
+TEST(gbuf_flush_begin_failure_preserves_existing_project) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "proj", "/tmp/repo"), CBM_STORE_OK);
+
+    cbm_node_t existing = {
+        .project = "proj",
+        .label = "Function",
+        .name = "existing",
+        .qualified_name = "proj::existing",
+        .file_path = "old.go",
+        .start_line = 1,
+        .end_line = 3,
+        .properties_json = "{}",
+    };
+    ASSERT_GT(cbm_store_upsert_node(store, &existing), 0);
+    ASSERT_EQ(cbm_store_count_nodes(store, "proj"), 1);
+
+    ASSERT_EQ(cbm_store_begin(store), CBM_STORE_OK);
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/repo");
+    ASSERT_NOT_NULL(gb);
+    cbm_gbuf_upsert_node(gb, "Function", "replacement", "proj::replacement", "new.go", 1, 5,
+                         "{}");
+
+    ASSERT_NEQ(cbm_gbuf_flush_to_store(gb, store), 0);
+    ASSERT_EQ(cbm_store_count_nodes(store, "proj"), 1);
+
+    cbm_node_t out = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(store, "proj", "proj::existing", &out), CBM_STORE_OK);
+    cbm_node_free_fields(&out);
+    ASSERT_EQ(cbm_store_find_node_by_qn(store, "proj", "proj::replacement", &out),
+              CBM_STORE_NOT_FOUND);
+
+    ASSERT_EQ(cbm_store_rollback(store), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_count_nodes(store, "proj"), 1);
+
+    cbm_gbuf_free(gb);
+    cbm_store_close(store);
+    PASS();
+}
+
 TEST(gbuf_merge_into_store_preserves) {
     /* First, flush initial data via flush_to_store */
     cbm_gbuf_t *gb1 = cbm_gbuf_new("proj", "/tmp/repo");
@@ -1609,6 +1651,7 @@ SUITE(graph_buffer) {
     /* Flush/merge-into-store tests */
     RUN_TEST(gbuf_flush_to_store_null);
     RUN_TEST(gbuf_flush_verify_store_data);
+    RUN_TEST(gbuf_flush_begin_failure_preserves_existing_project);
     RUN_TEST(gbuf_merge_into_store_preserves);
     RUN_TEST(gbuf_flush_skips_orphan_edges);
 
