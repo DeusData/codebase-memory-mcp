@@ -24,6 +24,15 @@ typedef struct {
     const char *target_qn;   // e.g. "test.main.foo"
 } CBMDictLiteralEntry;
 
+// Memoization entry for py_eval_expr_type. Keyed by the expression node's
+// start byte offset, which is a unique identity for a node
+// within a single file's parse tree (two distinct expressions never start
+// at the same byte)
+typedef struct {
+    uint32_t node_start_byte;
+    const CBMType *result;
+} CBMPyTypeCacheEntry;
+
 // PyLSPContext holds state for one Python file's type evaluation.
 typedef struct {
     CBMArena *arena;
@@ -31,6 +40,13 @@ typedef struct {
     int source_len;
     const CBMTypeRegistry *registry;
     CBMScope *current_scope;
+
+    // Memoization cache for py_eval_expr_type (issue #710: deeply chained
+    // method calls caused exponential reevaluation of shared subchains without this, Open
+    // addressing, linear probe, grown geometrically
+    CBMPyTypeCacheEntry *type_cache;
+    int type_cache_count;
+    int type_cache_cap;
 
     // Import map: local_name -> module_qn (arena-allocated, NULL-terminated).
     // Built from CBMFileResult.imports.

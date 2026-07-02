@@ -26,6 +26,7 @@
 // Forward decls
 static void py_resolve_calls_in(PyLSPContext *ctx, TSNode node);
 static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node);
+static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node);
 static void py_process_statement(PyLSPContext *ctx, TSNode node);
 static const CBMRegisteredFunc *py_lookup_attribute(PyLSPContext *ctx, const char *type_qn,
                                                     const char *member_name);
@@ -692,7 +693,8 @@ static const CBMType *py_iterable_element_type(PyLSPContext *ctx, const CBMType 
     return cbm_type_unknown();
 }
 
-static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node) {
+// previously named py_eval_expr_type
+static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node) {
     if (!ctx || ts_node_is_null(node))
         return cbm_type_unknown();
 
@@ -1286,7 +1288,114 @@ static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node) {
     return cbm_type_unknown();
 }
 
-/* ── statement processing: bind from assignments, for-loops, with-as ──── */
+/* ── py_eval_expr_type memoization (issue #710) ──────────────────────────
+ *
+ * py_eval_expr_type_uncached is a recursive-descent type evaluator. For a
+ * deeply chained call expression — `Builder().add(x).add(y)....add(z)` —
+ * resolving the outer call's type requires resolving the inner call's
+ * type, recursively, down the whole chain. On its own that is O(depth),
+ * which is fine even for 60+ levels.
+ *
+ * Cache lives on PyLSPContext (one per file), arena-allocated, so it's
+ * freed automatically when the file's arena is destroyed — no manual
+ * cleanup needed.
+ */
+
+enum { PY_TYPE_CACHE_INITIAL_CAP = 256 };
+
+/* Linear-probe lookup. Returns the cached type, or NULL if this node
+ * hasn't been evaluated yet (a NULL result is never itself cached — see
+ * py_type_cache_insert — so NULL unambiguously means "not yet computed"). */
+static const CBMType *py_type_cache_lookup(PyLSPContext *ctx, uint32_t key) {
+    if (!ctx->type_cache || ctx->type_cache_cap == 0)
+        return NULL;
+    int cap = ctx->type_cache_cap;
+    int idx = (int)(key % (uint32_t)cap);
+    for (int probed = 0; probed < cap; probed++) {
+        CBMPyTypeCacheEntry *e = &ctx->type_cache[idx];
+        if (!e->result)
+            return NULL; /* empty slot: key was never inserted */
+        if (e->node_start_byte == key)
+            return e->result;
+        idx = (idx + 1) % cap;
+    }
+    return NULL; /* table full and key not found (shouldn't happen: we grow before full) */
+}
+
+/* Grow the cache (arena allocation: old table is simply abandoned, freed
+ * when the per-file arena is destroyed, same pattern as
+ * ts_nstack_push in extract_node_stack.h). Rehashes all live entries. */
+static void py_type_cache_grow(PyLSPContext *ctx) {
+    int old_cap = ctx->type_cache_cap;
+    CBMPyTypeCacheEntry *old_entries = ctx->type_cache;
+
+    int new_cap = old_cap ? old_cap * 2 : PY_TYPE_CACHE_INITIAL_CAP;
+    CBMPyTypeCacheEntry *new_entries = (CBMPyTypeCacheEntry *)cbm_arena_alloc(
+        ctx->arena, (size_t)new_cap * sizeof(CBMPyTypeCacheEntry));
+    if (!new_entries)
+        return;
+    memset(new_entries, 0, (size_t)new_cap * sizeof(CBMPyTypeCacheEntry));
+
+    ctx->type_cache = new_entries;
+    ctx->type_cache_cap = new_cap;
+    ctx->type_cache_count = 0;
+
+    for (int i = 0; i < old_cap; i++) {
+        if (old_entries[i].result) {
+            /* Re-insert via the now-larger table. Safe to call insert here:
+             * it only grows again if count*4 >= cap*3, which can't happen
+             * mid-rehash since we just doubled capacity. */
+            int idx = (int)(old_entries[i].node_start_byte % (uint32_t)new_cap);
+            while (new_entries[idx].result) {
+                idx = (idx + 1) % new_cap;
+            }
+            new_entries[idx] = old_entries[i];
+            ctx->type_cache_count++;
+        }
+    }
+}
+
+/* Insert a result into the cache. A NULL result is never cached (so a
+ * lookup miss and an explicit "evaluated to NULL" are indistinguishable —
+ * acceptable since py_eval_expr_type_uncached treats NULL the same as
+ * cbm_type_unknown() everywhere it's checked, so re-evaluating a rare NULL
+ * case costs nothing asymptotically). */
+static void py_type_cache_insert(PyLSPContext *ctx, uint32_t key, const CBMType *result) {
+    if (!result)
+        return;
+    if (!ctx->type_cache || ctx->type_cache_count * 4 >= ctx->type_cache_cap * 3) {
+        py_type_cache_grow(ctx);
+        if (!ctx->type_cache)
+            return; /* OOM during first grow: skip caching, fall back to recompute */
+    }
+    int cap = ctx->type_cache_cap;
+    int idx = (int)(key % (uint32_t)cap);
+    while (ctx->type_cache[idx].result) {
+        if (ctx->type_cache[idx].node_start_byte == key)
+            return; /* already cached (re-entrant evaluation of the same node) */
+        idx = (idx + 1) % cap;
+    }
+    ctx->type_cache[idx].node_start_byte = key;
+    ctx->type_cache[idx].result = result;
+    ctx->type_cache_count++;
+}
+
+/* Memoizing wrapper — the function every call site in this file actually
+ * calls. py_eval_expr_type_uncached holds the real evaluation logic and is
+ * called at most once per distinct node. */
+static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node) {
+    if (!ctx || ts_node_is_null(node))
+        return cbm_type_unknown();
+
+    uint32_t key = ts_node_start_byte(node);
+    const CBMType *cached = py_type_cache_lookup(ctx, key);
+    if (cached)
+        return cached;
+
+    const CBMType *result = py_eval_expr_type_uncached(ctx, node);
+    py_type_cache_insert(ctx, key, result);
+    return result;
+}
 
 static void py_process_statement(PyLSPContext *ctx, TSNode node) {
     if (!ctx || ts_node_is_null(node))
@@ -1766,8 +1875,8 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
                     // Skip if mod is already rooted under the project to avoid
                     // "<root>.<root>.mod".
                     if (!(strncmp(mod, ctx->module_qn, root_len) == 0 && mod[root_len] == '.')) {
-                        char *qual_mod = (char *)cbm_arena_alloc(ctx->arena, root_len + 1 +
-                                                                                strlen(mod) + 1);
+                        char *qual_mod =
+                            (char *)cbm_arena_alloc(ctx->arena, root_len + 1 + strlen(mod) + 1);
                         if (qual_mod) {
                             memcpy(qual_mod, ctx->module_qn, root_len);
                             qual_mod[root_len] = '.';

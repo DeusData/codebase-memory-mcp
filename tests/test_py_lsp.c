@@ -1243,6 +1243,39 @@ TEST(pylsp_round6_property_access_chains) {
     PASS();
 }
 
+TEST(pylsp_issue710_deep_call_chain_no_hang) {
+    /* Regression for #710: a deeply chained builder expression made
+     * py_eval_expr_type re-evaluate shared sub-chains at every level,
+     * O(2^depth). On the pre-fix code this hangs the definitions pass
+     * for 800+ seconds on a single file; with per-node memoization it
+     * completes in milliseconds. This test builds a ~40-link chain and
+     * asserts extraction terminates and stays addressable — if the
+     * exponential blowup regresses, the suite hangs here (caught by the
+     * runner's timeout) rather than passing silently. */
+    CBMFileResult *r = extract_py(
+        "from typing import Self\n"
+        "class G:\n"
+        "    def add(self, x) -> Self:\n"
+        "        return self\n"
+        "    def compile(self):\n"
+        "        return 1\n"
+        "def build():\n"
+        "    return (\n"
+        "        G()\n"
+        "        .add(1).add(2).add(3).add(4).add(5).add(6).add(7).add(8)\n"
+        "        .add(9).add(10).add(11).add(12).add(13).add(14).add(15)\n"
+        "        .add(16).add(17).add(18).add(19).add(20).add(21).add(22)\n"
+        "        .add(23).add(24).add(25).add(26).add(27).add(28).add(29)\n"
+        "        .add(30).add(31).add(32).add(33).add(34).add(35).add(36)\n"
+        "        .add(37).add(38).add(39).add(40)\n"
+        "        .compile()\n"
+        "    )\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "build", "compile"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(py_lsp) {
@@ -1293,6 +1326,7 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_round1_assert_type_passthrough);
     RUN_TEST(pylsp_round1_forward_reference);
     RUN_TEST(pylsp_round1_self_return_chains);
+    RUN_TEST(pylsp_issue710_deep_call_chain_no_hang);
     RUN_TEST(pylsp_round1_generic_subscript_annotation);
     /* Round 2 — narrowing */
     RUN_TEST(pylsp_round2_isinstance_narrow);
