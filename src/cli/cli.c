@@ -525,6 +525,398 @@ static const char skill_content[] =
     "`direction=\"both\"`.\n"
     "5. Results default to 10 per page — check `has_more` and use `offset`.\n";
 
+
+/* ── pi adapter embedded content ───────────────────────────────── */
+static const char pi_extension_content[] =
+    "/**\n"
+    " * cbmem.ts \u2014 codebase-memory-mcp bridge for pi.\n"
+    " *\n"
+    " * pi has no native MCP (see pi README: \"No MCP. Build CLI tools with READMEs,\n"
+    " * or build an extension that adds MCP support.\"). codebase-memory-mcp ships a\n"
+    " * CLI mode where every MCP tool is invokable as:\n"
+    " *\n"
+    " *     codebase-memory-mcp cli <tool> '<json-args>'\n"
+    " *\n"
+    " * This extension wraps that CLI as native pi tools so the agent sees the code\n"
+    " * *graph* (call edges, architecture, semantic neighbours) before reaching for\n"
+    " * grep / file-by-file reads \u2014 the same graph-first discipline the brain's\n"
+    " * `velocity` server enforces over the Obsidian vault. Five structural queries\n"
+    " * here cost ~3.4K tokens versus ~412K for grep exploration (upstream benchmark).\n"
+    " *\n"
+    " * Design:\n"
+    " * - The binary writes JSON to stdout and human logs to stderr; we read stdout.\n"
+    " * - Project scope is resolved from the tool's cwd via `list_projects`\n"
+    " *   (matching root_path / canonical_root, symlink-aware), falling back to a\n"
+    " *   one-time `index_repository` whose response carries the project name.\n"
+    " *   Resolved names are cached per-cwd for the session.\n"
+    " * - Every tool degrades gracefully: a missing binary returns an actionable\n"
+    " *   message rather than throwing, so a fresh machine without cbmem still runs.\n"
+    " */\n"
+    "\n"
+    "import type { ExtensionAPI, ToolDefinition } from \"@mariozechner/pi-coding-agent\";\n"
+    "import { Type } from \"@sinclair/typebox\";\n"
+    "import { spawn } from \"node:child_process\";\n"
+    "import { existsSync, realpathSync } from \"node:fs\";\n"
+    "import { join } from \"node:path\";\n"
+    "import { homedir } from \"node:os\";\n"
+    "\n"
+    "// \u2500\u2500 Binary resolution \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+    "\n"
+    "/** Locate the codebase-memory-mcp binary. PATH wins; then ~/.local/bin. */\n"
+    "function findBinary(): string | null {\n"
+    "\tconst candidates = [\n"
+    "\t\tprocess.env.CBM_BINARY,\n"
+    "\t\tjoin(homedir(), \".local\", \"bin\", \"codebase-memory-mcp\"),\n"
+    "\t\t\"/usr/local/bin/codebase-memory-mcp\",\n"
+    "\t\t\"/opt/homebrew/bin/codebase-memory-mcp\",\n"
+    "\t].filter(Boolean) as string[];\n"
+    "\tfor (const c of candidates) {\n"
+    "\t\tif (existsSync(c)) return c;\n"
+    "\t}\n"
+    "\t// Fall back to bare name and let PATH resolution in spawn handle it.\n"
+    "\treturn \"codebase-memory-mcp\";\n"
+    "}\n"
+    "\n"
+    "const BINARY = findBinary();\n"
+    "\n"
+    "interface CbmResult {\n"
+    "\tok: boolean;\n"
+    "\tjson?: any;\n"
+    "\tstdout: string;\n"
+    "\tstderr: string;\n"
+    "\terror?: string;\n"
+    "}\n"
+    "\n"
+    "/** Run one cbmem CLI tool. Never throws; failures come back as ok:false. */\n"
+    "function runCbm(tool: string, args: Record<string, unknown>, cwd: string, signal?: AbortSignal): Promise<CbmResult> {\n"
+    "\treturn new Promise((resolve) => {\n"
+    "\t\tconst child = spawn(BINARY, [\"cli\", tool, JSON.stringify(args)], {\n"
+    "\t\t\tcwd,\n"
+    "\t\t\tstdio: [\"ignore\", \"pipe\", \"pipe\"],\n"
+    "\t\t\tenv: { ...process.env, CBM_LOG_LEVEL: \"error\" },\n"
+    "\t\t});\n"
+    "\t\tlet stdout = \"\";\n"
+    "\t\tlet stderr = \"\";\n"
+    "\t\tconst onAbort = () => {\n"
+    "\t\t\tif (!child.killed) child.kill();\n"
+    "\t\t};\n"
+    "\t\tsignal?.addEventListener(\"abort\", onAbort, { once: true });\n"
+    "\t\tchild.stdout.on(\"data\", (d: Buffer) => (stdout += d.toString()));\n"
+    "\t\tchild.stderr.on(\"data\", (d: Buffer) => (stderr += d.toString()));\n"
+    "\t\tchild.on(\"error\", (err) => {\n"
+    "\t\t\tsignal?.removeEventListener(\"abort\", onAbort);\n"
+    "\t\t\tresolve({ ok: false, stdout, stderr, error: err.message });\n"
+    "\t\t});\n"
+    "\t\tchild.on(\"close\", () => {\n"
+    "\t\t\tsignal?.removeEventListener(\"abort\", onAbort);\n"
+    "\t\t\t// The binary prints JSON on stdout; logs (if any leak) go to stderr.\n"
+    "\t\t\t// Take the last non-empty stdout line that parses as JSON.\n"
+    "\t\t\tconst lines = stdout.split(\"\\n\").map((l) => l.trim()).filter(Boolean);\n"
+    "\t\t\tlet json: any;\n"
+    "\t\t\tfor (let i = lines.length - 1; i >= 0; i--) {\n"
+    "\t\t\t\ttry {\n"
+    "\t\t\t\t\tjson = JSON.parse(lines[i]);\n"
+    "\t\t\t\t\tbreak;\n"
+    "\t\t\t\t} catch {\n"
+    "\t\t\t\t\t/* keep scanning upward */\n"
+    "\t\t\t\t}\n"
+    "\t\t\t}\n"
+    "\t\t\tresolve({ ok: json !== undefined, json, stdout, stderr });\n"
+    "\t\t});\n"
+    "\t});\n"
+    "}\n"
+    "\n"
+    "// \u2500\u2500 Project resolution (cwd \u2192 indexed project name) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+    "\n"
+    "const projectCache = new Map<string, string>();\n"
+    "\n"
+    "function canonical(p: string): string {\n"
+    "\ttry {\n"
+    "\t\treturn realpathSync(p);\n"
+    "\t} catch {\n"
+    "\t\treturn p;\n"
+    "\t}\n"
+    "}\n"
+    "\n"
+    "/**\n"
+    " * Resolve the indexed project name for `cwd`. Returns null only if the repo is\n"
+    " * unindexed AND indexing failed. Caches successful resolutions per cwd.\n"
+    " */\n"
+    "async function resolveProject(cwd: string, signal?: AbortSignal): Promise<{ project: string | null; note?: string }> {\n"
+    "\tif (projectCache.has(cwd)) return { project: projectCache.get(cwd)! };\n"
+    "\tconst target = canonical(cwd);\n"
+    "\n"
+    "\tconst list = await runCbm(\"list_projects\", {}, cwd, signal);\n"
+    "\tif (list.ok && Array.isArray(list.json?.projects)) {\n"
+    "\t\tfor (const p of list.json.projects) {\n"
+    "\t\t\tconst roots = [p.root_path, p.git?.canonical_root, p.git?.worktree_root].filter(Boolean).map(canonical);\n"
+    "\t\t\tif (roots.includes(target)) {\n"
+    "\t\t\t\tprojectCache.set(cwd, p.name);\n"
+    "\t\t\t\treturn { project: p.name };\n"
+    "\t\t\t}\n"
+    "\t\t}\n"
+    "\t}\n"
+    "\n"
+    "\t// Not indexed yet \u2014 index it once (incremental if a prior artifact exists).\n"
+    "\tconst idx = await runCbm(\"index_repository\", { repo_path: cwd }, cwd, signal);\n"
+    "\tif (idx.ok && idx.json?.project) {\n"
+    "\t\tprojectCache.set(cwd, idx.json.project);\n"
+    "\t\treturn { project: idx.json.project, note: `indexed ${cwd} \u2192 ${idx.json.project} (${idx.json.nodes} nodes, ${idx.json.edges} edges)` };\n"
+    "\t}\n"
+    "\treturn { project: null, note: idx.error ? `cbmem unavailable: ${idx.error}` : \"could not index this repo\" };\n"
+    "}\n"
+    "\n"
+    "// \u2500\u2500 Tool result helpers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+    "\n"
+    "function ok(text: string) {\n"
+    "\treturn { content: [{ type: \"text\" as const, text }] };\n"
+    "}\n"
+    "function err(text: string) {\n"
+    "\treturn { content: [{ type: \"text\" as const, text }], isError: true };\n"
+    "}\n"
+    "\n"
+    "/** Wrap a query tool: resolve project, inject it, run, pretty-print JSON. */\n"
+    "async function queryTool(\n"
+    "\ttool: string,\n"
+    "\tparams: Record<string, unknown>,\n"
+    "\tcwd: string,\n"
+    "\tsignal: AbortSignal | undefined,\n"
+    "): Promise<ReturnType<typeof ok>> {\n"
+    "\tif (BINARY === \"codebase-memory-mcp\" && !process.env.CBM_BINARY) {\n"
+    "\t\t// best-effort; spawn may still fail if not on PATH \u2014 handled below\n"
+    "\t}\n"
+    "\tconst { project, note } = await resolveProject(cwd, signal);\n"
+    "\tif (!project) return err(note ?? \"no indexed project for this directory; install codebase-memory-mcp and retry\");\n"
+    "\tconst args = { project, ...params };\n"
+    "\tconst res = await runCbm(tool, args, cwd, signal);\n"
+    "\tif (!res.ok) {\n"
+    "\t\treturn err(res.error ? `cbmem error: ${res.error}` : res.stderr.trim() || \"cbmem returned no parseable output\");\n"
+    "\t}\n"
+    "\tconst pretty = JSON.stringify(res.json, null, 1);\n"
+    "\tconst prefix = note ? `(${note})\\n` : \"\";\n"
+    "\treturn ok(prefix + pretty);\n"
+    "}\n"
+    "\n"
+    "// \u2500\u2500 Tool definitions \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+    "\n"
+    "function tool(\n"
+    "\tname: string,\n"
+    "\tlabel: string,\n"
+    "\tdescription: string,\n"
+    "\tparameters: any,\n"
+    "\tcbmTool: string,\n"
+    "): ToolDefinition {\n"
+    "\treturn {\n"
+    "\t\tname,\n"
+    "\t\tlabel,\n"
+    "\t\tdescription,\n"
+    "\t\tparameters,\n"
+    "\t\tasync execute(_id: string, params: any, signal: AbortSignal, _onUpdate: unknown, ctx: any) {\n"
+    "\t\t\treturn queryTool(cbmTool, params ?? {}, ctx.cwd, signal) as any;\n"
+    "\t\t},\n"
+    "\t} as ToolDefinition;\n"
+    "}\n"
+    "\n"
+    "export function createCbmTools(): ToolDefinition[] {\n"
+    "\treturn [\n"
+    "\t\ttool(\n"
+    "\t\t\t\"cbm_search_graph\",\n"
+    "\t\t\t\"CBM Search Graph\",\n"
+    "\t\t\t\"Graph-first code discovery. Find symbols by name/label/degree across the indexed \" +\n"
+    "\t\t\t\t\"codebase WITHOUT grep. Prefer this over grep for 'where is X defined / used'.\\n\" +\n"
+    "\t\t\t\t\"- Find by name: {name_pattern: '.*Handler.*', label: 'Function'}\\n\" +\n"
+    "\t\t\t\t\"- Dead code: {max_degree: 0, exclude_entry_points: true}\\n\" +\n"
+    "\t\t\t\t\"- High fan-in: {min_degree: 10, relationship: 'CALLS'}\\n\" +\n"
+    "\t\t\t\t\"Project is auto-resolved from the working directory.\",\n"
+    "\t\t\tType.Object({\n"
+    "\t\t\t\tname_pattern: Type.Optional(Type.String({ description: \"Regex over symbol names, e.g. '.*Handler.*'.\" })),\n"
+    "\t\t\t\tlabel: Type.Optional(Type.String({ description: \"Node label: Function, Method, Class, Interface, Route, File, etc.\" })),\n"
+    "\t\t\t\tfile_pattern: Type.Optional(Type.String({ description: \"Restrict to files matching this pattern.\" })),\n"
+    "\t\t\t\tmin_degree: Type.Optional(Type.Number({ description: \"Minimum total degree (callers+callees).\" })),\n"
+    "\t\t\t\tmax_degree: Type.Optional(Type.Number({ description: \"Maximum total degree (0 = dead code).\" })),\n"
+    "\t\t\t\trelationship: Type.Optional(Type.String({ description: \"Edge type for degree filters, e.g. CALLS.\" })),\n"
+    "\t\t\t\texclude_entry_points: Type.Optional(Type.Boolean({ description: \"Exclude entry points (for dead-code scans).\" })),\n"
+    "\t\t\t\tlimit: Type.Optional(Type.Number({ description: \"Max results (default server-side).\" })),\n"
+    "\t\t\t\toffset: Type.Optional(Type.Number({ description: \"Pagination offset.\" })),\n"
+    "\t\t\t}),\n"
+    "\t\t\t\"search_graph\",\n"
+    "\t\t),\n"
+    "\t\ttool(\n"
+    "\t\t\t\"cbm_trace_path\",\n"
+    "\t\t\t\"CBM Trace Path\",\n"
+    "\t\t\t\"Trace the call graph (BFS). Who calls a function and what it calls \u2014 across files \" +\n"
+    "\t\t\t\t\"and packages, import-aware. Use instead of manually reading call sites.\\n\" +\n"
+    "\t\t\t\t\"- Who calls X: {function_name: 'X', direction: 'inbound'}\\n\" +\n"
+    "\t\t\t\t\"- What X calls: {function_name: 'X', direction: 'outbound'}\\n\" +\n"
+    "\t\t\t\t\"- Full context: {function_name: 'X', direction: 'both', depth: 3}\",\n"
+    "\t\t\tType.Object({\n"
+    "\t\t\t\tfunction_name: Type.String({ description: \"Function/method name to trace from.\" }),\n"
+    "\t\t\t\tdirection: Type.Optional(Type.String({ description: \"'inbound' | 'outbound' | 'both' (default both).\" })),\n"
+    "\t\t\t\tdepth: Type.Optional(Type.Number({ description: \"BFS depth 1-5 (default 2).\" })),\n"
+    "\t\t\t\trisk_labels: Type.Optional(Type.Boolean({ description: \"Annotate nodes with risk classification.\" })),\n"
+    "\t\t\t}),\n"
+    "\t\t\t\"trace_path\",\n"
+    "\t\t),\n"
+    "\t\ttool(\n"
+    "\t\t\t\"cbm_get_architecture\",\n"
+    "\t\t\t\"CBM Architecture\",\n"
+    "\t\t\t\"One-call codebase overview: languages, packages, entry points, routes, hotspots, \" +\n"
+    "\t\t\t\t\"boundaries, layers, clusters, and ADRs. Run this first when orienting in an unfamiliar repo.\",\n"
+    "\t\t\tType.Object({\n"
+    "\t\t\t\taspects: Type.Optional(Type.Array(Type.String(), { description: \"Subset of aspects, e.g. ['languages','routes','hotspots']. Omit for all.\" })),\n"
+    "\t\t\t}),\n"
+    "\t\t\t\"get_architecture\",\n"
+    "\t\t),\n"
+    "\t\ttool(\n"
+    "\t\t\t\"cbm_semantic_query\",\n"
+    "\t\t\t\"CBM Semantic Query\",\n"
+    "\t\t\t\"Vector search over the whole code graph using bundled embeddings (no API key). \" +\n"
+    "\t\t\t\t\"Use for concept-level questions where you don't know the exact symbol name, \" +\n"
+    "\t\t\t\t\"e.g. 'where are coding agents detected', 'retry with backoff logic'.\",\n"
+    "\t\t\tType.Object({\n"
+    "\t\t\t\tquery: Type.String({ description: \"Natural-language description of the code you're looking for.\" }),\n"
+    "\t\t\t\tlimit: Type.Optional(Type.Number({ description: \"Max results (default server-side).\" })),\n"
+    "\t\t\t}),\n"
+    "\t\t\t\"semantic_query\",\n"
+    "\t\t),\n"
+    "\t\ttool(\n"
+    "\t\t\t\"cbm_detect_changes\",\n"
+    "\t\t\t\"CBM Detect Changes\",\n"
+    "\t\t\t\"Map the current git diff to affected symbols and their blast radius, with risk \" +\n"
+    "\t\t\t\t\"classification. Run before committing or reviewing to see what a change touches downstream.\",\n"
+    "\t\t\tType.Object({\n"
+    "\t\t\t\tstaged: Type.Optional(Type.Boolean({ description: \"Use staged diff instead of working tree.\" })),\n"
+    "\t\t\t}),\n"
+    "\t\t\t\"detect_changes\",\n"
+    "\t\t),\n"
+    "\t\ttool(\n"
+    "\t\t\t\"cbm_query_graph\",\n"
+    "\t\t\t\"CBM Cypher Query\",\n"
+    "\t\t\t\"Run a read-only openCypher subset query against the code graph, e.g. \" +\n"
+    "\t\t\t\t\"\\\"MATCH (f:Function)-[:CALLS]->(g) WHERE f.name = 'main' RETURN g.name\\\". \" +\n"
+    "\t\t\t\t\"Unsupported constructs fail with a clear error rather than empty results.\",\n"
+    "\t\t\tType.Object({\n"
+    "\t\t\t\tquery: Type.String({ description: \"openCypher read query.\" }),\n"
+    "\t\t\t}),\n"
+    "\t\t\t\"query_graph\",\n"
+    "\t\t),\n"
+    "\t\t// Index management \u2014 explicit, in case the agent wants to (re)index or list.\n"
+    "\t\t{\n"
+    "\t\t\tname: \"cbm_index\",\n"
+    "\t\t\tlabel: \"CBM Index\",\n"
+    "\t\t\tdescription:\n"
+    "\t\t\t\t\"Index (or incrementally refresh) the repository at the working directory into the \" +\n"
+    "\t\t\t\t\"code graph. Auto-sync keeps it fresh afterwards; you rarely need to call this manually.\",\n"
+    "\t\t\tparameters: Type.Object({\n"
+    "\t\t\t\trepo_path: Type.Optional(Type.String({ description: \"Repo to index (default: working directory).\" })),\n"
+    "\t\t\t}),\n"
+    "\t\t\tasync execute(_id: string, params: any, signal: AbortSignal, _u: unknown, ctx: any) {\n"
+    "\t\t\t\tconst repo = params?.repo_path ?? ctx.cwd;\n"
+    "\t\t\t\tprojectCache.delete(ctx.cwd);\n"
+    "\t\t\t\tconst res = await runCbm(\"index_repository\", { repo_path: repo }, ctx.cwd, signal);\n"
+    "\t\t\t\tif (!res.ok) return err(res.error ? `cbmem error: ${res.error}` : res.stderr.trim() || \"index failed\") as any;\n"
+    "\t\t\t\tif (res.json?.project) projectCache.set(ctx.cwd, res.json.project);\n"
+    "\t\t\t\treturn ok(JSON.stringify(res.json, null, 1)) as any;\n"
+    "\t\t\t},\n"
+    "\t\t} as ToolDefinition,\n"
+    "\t\t{\n"
+    "\t\t\tname: \"cbm_list_projects\",\n"
+    "\t\t\tlabel: \"CBM List Projects\",\n"
+    "\t\t\tdescription: \"List all repositories indexed in the codebase-memory graph with node/edge counts.\",\n"
+    "\t\t\tparameters: Type.Object({}),\n"
+    "\t\t\tasync execute(_id: string, _params: any, signal: AbortSignal, _u: unknown, ctx: any) {\n"
+    "\t\t\t\tconst res = await runCbm(\"list_projects\", {}, ctx.cwd, signal);\n"
+    "\t\t\t\tif (!res.ok) return err(res.error ? `cbmem error: ${res.error}` : \"list_projects failed\") as any;\n"
+    "\t\t\t\treturn ok(JSON.stringify(res.json, null, 1)) as any;\n"
+    "\t\t\t},\n"
+    "\t\t} as ToolDefinition,\n"
+    "\t];\n"
+    "}\n"
+    "\n"
+    "export default function (pi: ExtensionAPI) {\n"
+    "\tfor (const t of createCbmTools()) {\n"
+    "\t\tpi.registerTool(t);\n"
+    "\t}\n"
+    "}\n";
+
+static const char pi_skill_content[] =
+    "---\n"
+    "name: codebase-memory\n"
+    "description: \"Graph-first code navigation via codebase-memory-mcp. Use BEFORE grep/file-by-file reading when you need to find where code is defined or used, trace call paths, understand an unfamiliar repo's architecture, or assess the blast radius of a change. Triggers on: 'where is X defined', 'what calls X', 'what does X call', 'how is this codebase structured', 'what does this diff affect', 'find the function that\u2026'.\"\n"
+    "---\n"
+    "\n"
+    "# codebase-memory \u2014 see the graph before you grep\n"
+    "\n"
+    "A persistent **code knowledge graph** is available through the `cbm_*` tools\n"
+    "(backed by the `codebase-memory-mcp` binary via pi's `cbmem` extension). It\n"
+    "indexes the repo into nodes (`Function`, `Method`, `Class`, `Route`, `File`\u2026)\n"
+    "and edges (`CALLS`, `IMPORTS`, `IMPLEMENTS`, `DATA_FLOWS`\u2026). Structural queries\n"
+    "cost a fraction of the tokens that grep + file reads burn \u2014 a handful of graph\n"
+    "calls replaces hundreds of thousands of tokens of blind exploration.\n"
+    "\n"
+    "This is the same discipline the brain's `velocity` server enforces over the\n"
+    "Obsidian vault: **query the graph first, fall back to raw reads only when the\n"
+    "graph can't answer.**\n"
+    "\n"
+    "## When to use which tool\n"
+    "\n"
+    "| You want to\u2026 | Tool | Example args |\n"
+    "|---|---|---|\n"
+    "| Find a symbol by name | `cbm_search_graph` | `{name_pattern: \".*Handler.*\", label: \"Function\"}` |\n"
+    "| Find dead code | `cbm_search_graph` | `{max_degree: 0, exclude_entry_points: true}` |\n"
+    "| Find by concept (unknown name) | `cbm_semantic_query` | `{query: \"retry with exponential backoff\"}` |\n"
+    "| Who calls X | `cbm_trace_path` | `{function_name: \"X\", direction: \"inbound\"}` |\n"
+    "| What X calls | `cbm_trace_path` | `{function_name: \"X\", direction: \"outbound\"}` |\n"
+    "| Full call context | `cbm_trace_path` | `{function_name: \"X\", direction: \"both\", depth: 3}` |\n"
+    "| Orient in an unfamiliar repo | `cbm_get_architecture` | `{}` (or `{aspects: [\"languages\",\"routes\",\"hotspots\"]}` ) |\n"
+    "| Blast radius of current diff | `cbm_detect_changes` | `{}` |\n"
+    "| Precise relationship query | `cbm_query_graph` | `{query: \"MATCH (f:Function)-[:CALLS]->(g) WHERE f.name='main' RETURN g.name\"}` |\n"
+    "| (Re)index / list repos | `cbm_index` / `cbm_list_projects` | `{}` |\n"
+    "\n"
+    "## Workflow\n"
+    "\n"
+    "1. **Orient** \u2014 in a repo you don't know, call `cbm_get_architecture` first.\n"
+    "2. **Discover** \u2014 `cbm_search_graph` (exact-ish name) or `cbm_semantic_query`\n"
+    "   (concept). These return qualified names you can feed to other tools.\n"
+    "3. **Trace** \u2014 `cbm_trace_path` to follow call edges instead of reading every\n"
+    "   call site by hand.\n"
+    "4. **Verify before changing** \u2014 `cbm_detect_changes` to see what a diff touches\n"
+    "   downstream, with risk classification.\n"
+    "5. **Read last** \u2014 only open files with `read` once the graph has pointed you at\n"
+    "   the exact symbol/location. The graph finds *where*; `read` confirms *what*.\n"
+    "\n"
+    "## Notes\n"
+    "\n"
+    "- **Project scope is automatic.** The tools resolve the indexed project from the\n"
+    "  working directory and index it on first use if needed \u2014 you don't pass a\n"
+    "  project name.\n"
+    "- **The graph is grounded, not generative.** Results come from a structural\n"
+    "  parse (158 languages, hybrid LSP type resolution), not an LLM guess. Trust the\n"
+    "  edges; if a symbol is missing, the repo may need a re-index (`cbm_index`).\n"
+    "- **Not a replacement for reading.** It's a router: it gets you to the right\n"
+    "  ~20 lines in one or two calls instead of grepping the whole tree.\n";
+
+static const char pi_agent_instructions_content[] =
+    "## Code discovery \u2014 graph-first (codebase-memory)\n"
+    "\n"
+    "This environment has a persistent **code knowledge graph** via the `cbm_*` tools\n"
+    "(`cbmem` extension wrapping the `codebase-memory-mcp` binary). **Before** grep or\n"
+    "file-by-file reading for \"where is X / what calls X / how is this repo built / what\n"
+    "does this diff affect\", query the graph:\n"
+    "\n"
+    "- `cbm_get_architecture` \u2014 orient in an unfamiliar repo (run first).\n"
+    "- `cbm_search_graph` / `cbm_semantic_query` \u2014 find a symbol by name / by concept.\n"
+    "- `cbm_trace_path` \u2014 who calls X, what X calls (instead of reading call sites).\n"
+    "- `cbm_detect_changes` \u2014 blast radius of the current git diff before committing.\n"
+    "\n"
+    "The graph finds *where* in one or two calls; `read` then confirms *what*. Project\n"
+    "scope is auto-resolved from the working directory (indexed on first use). Full\n"
+    "guidance: the `codebase-memory` skill.\n";
+
+const char *cbm_get_pi_extension(void) {
+    return pi_extension_content;
+}
+
 static const char codex_instructions_content[] =
     "# Codebase Knowledge Graph\n"
     "\n"
@@ -712,6 +1104,69 @@ bool cbm_remove_old_monolithic_skill(const char *skills_dir, bool dry_run) {
         return true;
     }
     return rmdir_recursive(old_path) == 0;
+}
+
+static int write_file_str(const char *path, const char *content);
+
+static void cbm_pi_skills_dir(const char *home_dir, char *out, size_t out_sz) {
+    if (out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    char env_buf[CLI_BUF_1K];
+    const char *xdg = cbm_safe_getenv("XDG_CONFIG_HOME", env_buf, sizeof(env_buf), NULL);
+    if (xdg && xdg[0]) {
+        snprintf(out, out_sz, "%s/agents/skills", xdg);
+    } else if (home_dir && home_dir[0]) {
+        snprintf(out, out_sz, "%s/.config/agents/skills", home_dir);
+    }
+}
+
+int cbm_install_pi_extension(const char *binary_path, const char *pi_dir) {
+    (void)binary_path;
+    if (!pi_dir || !pi_dir[0]) {
+        return CLI_ERR;
+    }
+    char ext_dir[CLI_BUF_1K];
+    snprintf(ext_dir, sizeof(ext_dir), "%s/extensions", pi_dir);
+    if (mkdirp(ext_dir, DIR_PERMS) != 0) {
+        return CLI_ERR;
+    }
+    char ext_path[CLI_BUF_1K];
+    snprintf(ext_path, sizeof(ext_path), "%s/cbmem.ts", ext_dir);
+    return write_file_str(ext_path, pi_extension_content);
+}
+
+int cbm_remove_pi_extension(const char *pi_dir) {
+    if (!pi_dir || !pi_dir[0]) {
+        return CLI_ERR;
+    }
+    char ext_path[CLI_BUF_1K];
+    snprintf(ext_path, sizeof(ext_path), "%s/extensions/cbmem.ts", pi_dir);
+    if (cbm_unlink(ext_path) == 0) {
+        return 0;
+    }
+    return errno == ENOENT ? CLI_TRUE : CLI_ERR;
+}
+
+int cbm_install_pi_skill(const char *home_dir, bool force) {
+    char skills_dir[CLI_BUF_1K];
+    cbm_pi_skills_dir(home_dir, skills_dir, sizeof(skills_dir));
+    if (!skills_dir[0]) {
+        return CLI_ERR;
+    }
+    char skill_dir[CLI_BUF_1K];
+    snprintf(skill_dir, sizeof(skill_dir), "%s/codebase-memory", skills_dir);
+    char skill_path[CLI_BUF_1K];
+    snprintf(skill_path, sizeof(skill_path), "%s/SKILL.md", skill_dir);
+    struct stat st;
+    if (!force && stat(skill_path, &st) == 0) {
+        return 0;
+    }
+    if (mkdirp(skill_dir, DIR_PERMS) != 0) {
+        return CLI_ERR;
+    }
+    return write_file_str(skill_path, pi_skill_content) == 0 ? CLI_TRUE : CLI_ERR;
 }
 
 /* ── JSON config helpers (using yyjson) ───────────────────────── */
@@ -1131,6 +1586,20 @@ static void cbm_claude_config_dir(const char *home_dir, char *out, size_t out_sz
     }
 }
 
+void cbm_pi_config_dir(const char *home_dir, char *out, size_t out_sz) {
+    if (out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    char env_buf[CLI_BUF_1K];
+    const char *env = cbm_safe_getenv("PI_CODING_AGENT_DIR", env_buf, sizeof(env_buf), NULL);
+    if (env && env[0]) {
+        snprintf(out, out_sz, "%s", env);
+    } else if (home_dir && home_dir[0]) {
+        snprintf(out, out_sz, "%s/.pi/agent", home_dir);
+    }
+}
+
 /* Resolve the parent dir containing `.claude.json` (Claude Code's user config file).
  * Honors $CLAUDE_CONFIG_DIR; falls back to "$home_dir". */
 static void cbm_claude_user_root(const char *home_dir, char *out, size_t out_sz) {
@@ -1233,6 +1702,9 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     /* Kiro: ~/.kiro/ */
     snprintf(path, sizeof(path), "%s/.kiro", home_dir);
     agents.kiro = dir_exists(path);
+
+    cbm_pi_config_dir(home_dir, path, sizeof(path));
+    agents.pi = path[0] != '\0' && dir_exists(path);
 
     return agents;
 }
@@ -3144,6 +3616,7 @@ static void print_detected_agents(const cbm_detected_agents_t *a) {
         {a->cursor, "Cursor"},
         {a->openclaw, "OpenClaw"},
         {a->kiro, "Kiro"},
+        {a->pi, "pi"},
     };
     printf("Detected agents:");
     bool any = false;
@@ -3304,6 +3777,37 @@ static void install_generic_agent_config(const char *label, const char *binary_p
         }
         printf("  instructions: %s\n", instr_path);
     }
+}
+
+static void install_pi_config(const char *home, const char *binary_path, bool force,
+                              bool dry_run) {
+    char pi_dir[CLI_BUF_1K];
+    cbm_pi_config_dir(home, pi_dir, sizeof(pi_dir));
+    char ext_path[CLI_BUF_1K];
+    snprintf(ext_path, sizeof(ext_path), "%s/extensions/cbmem.ts", pi_dir);
+    char skills_dir[CLI_BUF_1K];
+    cbm_pi_skills_dir(home, skills_dir, sizeof(skills_dir));
+    char skill_path[CLI_BUF_1K];
+    snprintf(skill_path, sizeof(skill_path), "%s/codebase-memory/SKILL.md", skills_dir);
+    char agents_path[CLI_BUF_1K];
+    snprintf(agents_path, sizeof(agents_path), "%s/AGENTS.md", pi_dir);
+
+    if (g_install_plan) {
+        plan_record("pi", "instructions", ext_path);
+        plan_record("pi", "skills", skill_path);
+        plan_record("pi", "instructions", agents_path);
+        return;
+    }
+
+    if (!dry_run) {
+        struct stat st;
+        if (force || stat(ext_path, &st) != 0) {
+            cbm_install_pi_extension(binary_path, pi_dir);
+        }
+        cbm_install_pi_skill(home, force);
+        cbm_upsert_instructions(agents_path, pi_agent_instructions_content);
+    }
+    printf("pi: installed extension + skill + instructions\n");
 }
 
 /* Install MCP configs for CLI-based agents (Codex, Gemini, OpenCode, Antigravity, Aider). */
@@ -3524,6 +4028,9 @@ static void cbm_install_agent_configs(const char *home, const char *binary_path,
     if (agents.claude_code) {
         install_claude_code_config(home, binary_path, force, dry_run);
     }
+    if (agents.pi) {
+        install_pi_config(home, binary_path, force, dry_run);
+    }
     install_cli_agent_configs(&agents, home, binary_path, dry_run);
     install_editor_agent_configs(&agents, home, binary_path, dry_run);
 }
@@ -3664,6 +4171,7 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
         {det.cursor, "cursor"},
         {det.openclaw, "openclaw"},
         {det.kiro, "kiro"},
+        {det.pi, "pi"},
     };
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -3914,6 +4422,21 @@ static void uninstall_agent_mcp_instr(mcp_uninstall_args_t paths, bool dry_run,
     }
 }
 
+static void uninstall_pi(const char *home, bool dry_run) {
+    char pi_dir[CLI_BUF_1K];
+    cbm_pi_config_dir(home, pi_dir, sizeof(pi_dir));
+    char skills_dir[CLI_BUF_1K];
+    cbm_pi_skills_dir(home, skills_dir, sizeof(skills_dir));
+    char agents_path[CLI_BUF_1K];
+    snprintf(agents_path, sizeof(agents_path), "%s/AGENTS.md", pi_dir);
+    if (!dry_run) {
+        cbm_remove_pi_extension(pi_dir);
+        cbm_remove_skills(skills_dir, false);
+        cbm_remove_instructions(agents_path);
+    }
+    printf("pi: removed extension + skill + instructions\n");
+}
+
 /* Remove CLI agent configs (Codex, Gemini, OpenCode, Antigravity, Aider). */
 /* Uninstall Gemini CLI config + hooks. */
 static void uninstall_gemini_config(const char *home, bool dry_run) {
@@ -4059,6 +4582,9 @@ int cbm_cmd_uninstall(int argc, char **argv) {
     cbm_detected_agents_t agents = cbm_detect_agents(home);
     if (agents.claude_code) {
         uninstall_claude_code(home, dry_run);
+    }
+    if (agents.pi) {
+        uninstall_pi(home, dry_run);
     }
     uninstall_cli_agents(&agents, home, dry_run);
     uninstall_editor_agents(&agents, home, dry_run);

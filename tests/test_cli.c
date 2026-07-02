@@ -34,7 +34,7 @@ static int write_test_file(const char *path, const char *content) {
 
 /* Helper: read a file into static buffer */
 static const char *read_test_file(const char *path) {
-    static char buf[8192];
+    static char buf[32768];
     FILE *f = fopen(path, "r");
     if (!f)
         return NULL;
@@ -1654,6 +1654,191 @@ TEST(cli_detect_agents_finds_cursor_issue222) {
     PASS();
 }
 
+TEST(cli_detect_agents_finds_pi) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-detect-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *saved = getenv("PI_CODING_AGENT_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_unsetenv("PI_CODING_AGENT_DIR");
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.pi/agent", tmpdir);
+    test_mkdirp(dir);
+
+    cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+    ASSERT_TRUE(agents.pi);
+
+    if (saved_copy) {
+        cbm_setenv("PI_CODING_AGENT_DIR", saved_copy, 1);
+        free(saved_copy);
+    }
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_detect_agents_honors_pi_env) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-detect-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char custom[512];
+    snprintf(custom, sizeof(custom), "%s/custom-pi", tmpdir);
+    test_mkdirp(custom);
+
+    const char *saved = getenv("PI_CODING_AGENT_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("PI_CODING_AGENT_DIR", custom, 1);
+
+    cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+    ASSERT_TRUE(agents.pi);
+
+    if (saved_copy) {
+        cbm_setenv("PI_CODING_AGENT_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("PI_CODING_AGENT_DIR");
+    }
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_install_pi_writes_extension_and_skill) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-pi-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *saved_home = getenv("HOME");
+    char *saved_home_copy = saved_home ? strdup(saved_home) : NULL;
+    const char *saved_pi = getenv("PI_CODING_AGENT_DIR");
+    char *saved_pi_copy = saved_pi ? strdup(saved_pi) : NULL;
+    const char *saved_xdg = getenv("XDG_CONFIG_HOME");
+    char *saved_xdg_copy = saved_xdg ? strdup(saved_xdg) : NULL;
+    const char *saved_ccd = getenv("CLAUDE_CONFIG_DIR");
+    char *saved_ccd_copy = saved_ccd ? strdup(saved_ccd) : NULL;
+    const char *saved_path = getenv("PATH");
+    char *saved_path_copy = saved_path ? strdup(saved_path) : NULL;
+    const char *saved_shell = getenv("SHELL");
+    char *saved_shell_copy = saved_shell ? strdup(saved_shell) : NULL;
+
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_unsetenv("PI_CODING_AGENT_DIR");
+    cbm_unsetenv("CLAUDE_CONFIG_DIR");
+    cbm_setenv("PATH", "/nonexistent", 1);
+    char xdg[512];
+    snprintf(xdg, sizeof(xdg), "%s/.config", tmpdir);
+    cbm_setenv("XDG_CONFIG_HOME", xdg, 1);
+    cbm_setenv("SHELL", "/bin/sh", 1);
+
+    char pi_dir[512];
+    snprintf(pi_dir, sizeof(pi_dir), "%s/.pi/agent", tmpdir);
+    test_mkdirp(pi_dir);
+
+    char *plan = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(plan);
+    ASSERT(strstr(plan, "pi") != NULL);
+    ASSERT(strstr(plan, ".pi/agent/extensions/cbmem.ts") != NULL);
+    ASSERT(strstr(plan, ".config/agents/skills/codebase-memory/SKILL.md") != NULL);
+    ASSERT(strstr(plan, ".pi/agent/AGENTS.md") != NULL);
+    free(plan);
+
+    char *argv[] = {"install", "--force"};
+    ASSERT_EQ(cbm_cmd_install(2, argv), 0);
+
+    char ext_path[1024];
+    snprintf(ext_path, sizeof(ext_path), "%s/extensions/cbmem.ts", pi_dir);
+    const char *ext = read_test_file(ext_path);
+    ASSERT_NOT_NULL(ext);
+    ASSERT(strstr(ext, "pi.registerTool") != NULL);
+
+    char skill_path[1024];
+    snprintf(skill_path, sizeof(skill_path), "%s/.config/agents/skills/codebase-memory/SKILL.md", tmpdir);
+    const char *skill = read_test_file(skill_path);
+    ASSERT_NOT_NULL(skill);
+    ASSERT(strstr(skill, "Graph-first code navigation") != NULL);
+
+    char agents_path[1024];
+    snprintf(agents_path, sizeof(agents_path), "%s/AGENTS.md", pi_dir);
+    const char *agents = read_test_file(agents_path);
+    ASSERT_NOT_NULL(agents);
+    ASSERT(strstr(agents, "<!-- codebase-memory-mcp:start -->") != NULL);
+
+    if (saved_home_copy) { cbm_setenv("HOME", saved_home_copy, 1); free(saved_home_copy); } else cbm_unsetenv("HOME");
+    if (saved_pi_copy) { cbm_setenv("PI_CODING_AGENT_DIR", saved_pi_copy, 1); free(saved_pi_copy); } else cbm_unsetenv("PI_CODING_AGENT_DIR");
+    if (saved_xdg_copy) { cbm_setenv("XDG_CONFIG_HOME", saved_xdg_copy, 1); free(saved_xdg_copy); } else cbm_unsetenv("XDG_CONFIG_HOME");
+    if (saved_ccd_copy) { cbm_setenv("CLAUDE_CONFIG_DIR", saved_ccd_copy, 1); free(saved_ccd_copy); } else cbm_unsetenv("CLAUDE_CONFIG_DIR");
+    if (saved_path_copy) { cbm_setenv("PATH", saved_path_copy, 1); free(saved_path_copy); }
+    if (saved_shell_copy) { cbm_setenv("SHELL", saved_shell_copy, 1); free(saved_shell_copy); } else cbm_unsetenv("SHELL");
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_uninstall_pi_removes_all) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-pi-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *saved_home = getenv("HOME");
+    char *saved_home_copy = saved_home ? strdup(saved_home) : NULL;
+    const char *saved_pi = getenv("PI_CODING_AGENT_DIR");
+    char *saved_pi_copy = saved_pi ? strdup(saved_pi) : NULL;
+    const char *saved_xdg = getenv("XDG_CONFIG_HOME");
+    char *saved_xdg_copy = saved_xdg ? strdup(saved_xdg) : NULL;
+    const char *saved_ccd = getenv("CLAUDE_CONFIG_DIR");
+    char *saved_ccd_copy = saved_ccd ? strdup(saved_ccd) : NULL;
+    const char *saved_path = getenv("PATH");
+    char *saved_path_copy = saved_path ? strdup(saved_path) : NULL;
+    const char *saved_shell = getenv("SHELL");
+    char *saved_shell_copy = saved_shell ? strdup(saved_shell) : NULL;
+
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_unsetenv("PI_CODING_AGENT_DIR");
+    cbm_unsetenv("CLAUDE_CONFIG_DIR");
+    cbm_setenv("PATH", "/nonexistent", 1);
+    char xdg[512];
+    snprintf(xdg, sizeof(xdg), "%s/.config", tmpdir);
+    cbm_setenv("XDG_CONFIG_HOME", xdg, 1);
+    cbm_setenv("SHELL", "/bin/sh", 1);
+
+    char pi_dir[512];
+    snprintf(pi_dir, sizeof(pi_dir), "%s/.pi/agent", tmpdir);
+    test_mkdirp(pi_dir);
+
+    char *install_argv[] = {"install", "--force"};
+    ASSERT_EQ(cbm_cmd_install(2, install_argv), 0);
+    char *uninstall_argv[] = {"uninstall"};
+    ASSERT_EQ(cbm_cmd_uninstall(1, uninstall_argv), 0);
+
+    struct stat st;
+    char ext_path[1024];
+    snprintf(ext_path, sizeof(ext_path), "%s/extensions/cbmem.ts", pi_dir);
+    ASSERT(stat(ext_path, &st) != 0);
+    char skill_dir[1024];
+    snprintf(skill_dir, sizeof(skill_dir), "%s/.config/agents/skills/codebase-memory", tmpdir);
+    ASSERT(stat(skill_dir, &st) != 0);
+    char agents_path[1024];
+    snprintf(agents_path, sizeof(agents_path), "%s/AGENTS.md", pi_dir);
+    const char *agents = read_test_file(agents_path);
+    ASSERT_NOT_NULL(agents);
+    ASSERT(strstr(agents, "<!-- codebase-memory-mcp:start -->") == NULL);
+
+    if (saved_home_copy) { cbm_setenv("HOME", saved_home_copy, 1); free(saved_home_copy); } else cbm_unsetenv("HOME");
+    if (saved_pi_copy) { cbm_setenv("PI_CODING_AGENT_DIR", saved_pi_copy, 1); free(saved_pi_copy); } else cbm_unsetenv("PI_CODING_AGENT_DIR");
+    if (saved_xdg_copy) { cbm_setenv("XDG_CONFIG_HOME", saved_xdg_copy, 1); free(saved_xdg_copy); } else cbm_unsetenv("XDG_CONFIG_HOME");
+    if (saved_ccd_copy) { cbm_setenv("CLAUDE_CONFIG_DIR", saved_ccd_copy, 1); free(saved_ccd_copy); } else cbm_unsetenv("CLAUDE_CONFIG_DIR");
+    if (saved_path_copy) { cbm_setenv("PATH", saved_path_copy, 1); free(saved_path_copy); }
+    if (saved_shell_copy) { cbm_setenv("SHELL", saved_shell_copy, 1); free(saved_shell_copy); } else cbm_unsetenv("SHELL");
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* issue #388: `install --plan` must emit a machine-readable receipt of planned
  * writes WITHOUT mutating any config (the pre-mutation trust primitive). */
 TEST(cli_install_plan_receipt_no_mutation_issue388) {
@@ -1942,6 +2127,7 @@ TEST(cli_detect_agents_none_found) {
     ASSERT_FALSE(agents.antigravity);
     ASSERT_FALSE(agents.kilocode);
     ASSERT_FALSE(agents.kiro);
+    ASSERT_FALSE(agents.pi);
 
     if (saved_ccd_copy) {
         cbm_setenv("CLAUDE_CONFIG_DIR", saved_ccd_copy, 1);
@@ -3007,6 +3193,10 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_claude_via_env);
     RUN_TEST(cli_detect_agents_finds_codex);
     RUN_TEST(cli_detect_agents_finds_cursor_issue222);
+    RUN_TEST(cli_detect_agents_finds_pi);
+    RUN_TEST(cli_detect_agents_honors_pi_env);
+    RUN_TEST(cli_install_pi_writes_extension_and_skill);
+    RUN_TEST(cli_uninstall_pi_removes_all);
     RUN_TEST(cli_install_plan_receipt_no_mutation_issue388);
     RUN_TEST(cli_codex_session_hook_issue330);
     RUN_TEST(cli_gemini_session_hook_parity);
