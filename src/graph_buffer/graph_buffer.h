@@ -60,7 +60,8 @@ cbm_gbuf_t *cbm_gbuf_new_shared_ids(const char *project, const char *root_path,
 void cbm_gbuf_free(cbm_gbuf_t *gb);
 
 /* Merge all nodes and edges from src into dst.
- * Nodes are merged by QN: on collision, src wins (updates dst node fields).
+ * Nodes are merged by QN: on collision, matching source locations take the
+ * later update, while duplicate code definitions keep the richer source span.
  * New nodes are inserted with their original IDs (from shared ID source).
  * Edges are remapped for any QN-colliding nodes, then inserted with dedup.
  * After merge, src can be safely freed (all data is copied).

@@ -101,7 +101,7 @@ const char *cbm_path_base(const char *path) {
     }
     const char *last_slash = NULL;
     for (const char *p = path; *p; p++) {
-        if (*p == '/') {
+        if (*p == '/' || *p == '\\') {
             last_slash = p;
         }
     }

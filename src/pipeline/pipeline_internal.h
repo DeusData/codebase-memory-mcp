@@ -144,6 +144,10 @@ static inline bool cbm_pipeline_mode_builds_global_semantic_edges(int mode) {
     return mode == CBM_MODE_FULL || mode == CBM_MODE_MODERATE;
 }
 
+static inline bool cbm_pipeline_mode_extracts_macro_nodes(int mode) {
+    return mode == CBM_MODE_FULL;
+}
+
 static inline int cbm_pipeline_mark_replacement_derived_views(cbm_store_t *store,
                                                               const char *project, int mode) {
     static const char *const complete_graph_views[] = {

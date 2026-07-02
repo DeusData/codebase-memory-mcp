@@ -5457,7 +5457,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             (strcmp(kind, "preproc_def") == 0 || strcmp(kind, "preproc_function_def") == 0)) {
             // Gated to full/advanced index modes — macros dominate extraction on
             // macro-dense codebases (e.g. the Linux kernel). See #375.
-            if (cbm_macro_extraction_enabled()) {
+            if (ctx->extract_macros) {
                 extract_c_macro_def(ctx, node);
             }
             continue; // the macro body is a preproc_arg — nothing more to extract

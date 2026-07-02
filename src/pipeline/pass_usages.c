@@ -229,8 +229,9 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
                 errors++;
                 continue;
             }
-            result = cbm_extract_file(source, source_len, files[i].language, ctx->project_name, rel,
-                                      CBM_EXTRACT_BUDGET, NULL, NULL);
+            result = cbm_extract_file_with_options(
+                source, source_len, files[i].language, ctx->project_name, rel, CBM_EXTRACT_BUDGET,
+                NULL, NULL, cbm_pipeline_mode_extracts_macro_nodes(ctx->mode));
             free(source);
             if (!result) {
                 errors++;

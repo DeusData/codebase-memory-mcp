@@ -131,6 +131,102 @@ TEST(gbuf_section_upsert_file_path_is_deterministic) {
     PASS();
 }
 
+static int assert_full_definition_source(const cbm_gbuf_t *gb, const char *qn) {
+    enum {
+        FULL_DEF_START_LINE = 34,
+        FULL_DEF_END_LINE = 43,
+    };
+    const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(gb, qn);
+    ASSERT_NOT_NULL(n);
+    ASSERT_STR_EQ(n->file_path, "src/type.c");
+    ASSERT_EQ(n->start_line, FULL_DEF_START_LINE);
+    ASSERT_EQ(n->end_line, FULL_DEF_END_LINE);
+    ASSERT_STR_EQ(n->properties_json, "{\"source\":\"definition\"}");
+    return 0;
+}
+
+static int assert_install_sh_module_source(const cbm_gbuf_t *gb, const char *qn) {
+    enum {
+        INSTALL_SH_START_LINE = 1,
+        INSTALL_SH_END_LINE = 221,
+    };
+    const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(gb, qn);
+    ASSERT_NOT_NULL(n);
+    ASSERT_STR_EQ(n->label, "Module");
+    ASSERT_STR_EQ(n->file_path, "install.sh");
+    ASSERT_EQ(n->start_line, INSTALL_SH_START_LINE);
+    ASSERT_EQ(n->end_line, INSTALL_SH_END_LINE);
+    ASSERT_STR_EQ(n->properties_json, "{\"source\":\"shell\"}");
+    return 0;
+}
+
+TEST(gbuf_upsert_definition_source_prefers_richer_span) {
+    enum {
+        DECL_START_LINE = 7,
+        DECL_END_LINE = 7,
+        FULL_DEF_START_LINE = 34,
+        FULL_DEF_END_LINE = 43,
+    };
+    const char *qn = "proj.TypeName";
+
+    cbm_gbuf_t *decl_then_def = cbm_gbuf_new("test", "/tmp");
+    int64_t id1 =
+        cbm_gbuf_upsert_node(decl_then_def, "Class", "TypeName", qn, "include/type.h",
+                             DECL_START_LINE, DECL_END_LINE, "{\"source\":\"declaration\"}");
+    int64_t id2 =
+        cbm_gbuf_upsert_node(decl_then_def, "Class", "TypeName", qn, "src/type.c",
+                             FULL_DEF_START_LINE, FULL_DEF_END_LINE,
+                             "{\"source\":\"definition\"}");
+    ASSERT_EQ(id1, id2);
+    ASSERT_EQ(assert_full_definition_source(decl_then_def, qn), 0);
+    cbm_gbuf_free(decl_then_def);
+
+    cbm_gbuf_t *def_then_decl = cbm_gbuf_new("test", "/tmp");
+    id1 = cbm_gbuf_upsert_node(def_then_decl, "Class", "TypeName", qn, "src/type.c",
+                               FULL_DEF_START_LINE, FULL_DEF_END_LINE,
+                               "{\"source\":\"definition\"}");
+    id2 = cbm_gbuf_upsert_node(def_then_decl, "Class", "TypeName", qn, "include/type.h",
+                               DECL_START_LINE, DECL_END_LINE, "{\"source\":\"declaration\"}");
+    ASSERT_EQ(id1, id2);
+    ASSERT_EQ(assert_full_definition_source(def_then_decl, qn), 0);
+    cbm_gbuf_free(def_then_decl);
+
+    PASS();
+}
+
+TEST(gbuf_upsert_module_source_prefers_richer_span) {
+    enum {
+        INSTALL_START_LINE = 1,
+        INSTALL_PS_END_LINE = 155,
+        INSTALL_SH_END_LINE = 221,
+    };
+    const char *qn = "proj.install";
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    int64_t id1 =
+        cbm_gbuf_upsert_node(gb, "Module", "install.ps1", qn, "install.ps1",
+                             INSTALL_START_LINE, INSTALL_PS_END_LINE, "{\"source\":\"powershell\"}");
+    int64_t id2 =
+        cbm_gbuf_upsert_node(gb, "Module", "install.sh", qn, "install.sh", INSTALL_START_LINE,
+                             INSTALL_SH_END_LINE, "{\"source\":\"shell\"}");
+    ASSERT_EQ(id1, id2);
+    ASSERT_EQ(assert_install_sh_module_source(gb, qn), 0);
+    cbm_gbuf_free(gb);
+
+    gb = cbm_gbuf_new("test", "/tmp");
+    id1 = cbm_gbuf_upsert_node(gb, "Module", "install.sh", qn, "install.sh",
+                               INSTALL_START_LINE, INSTALL_SH_END_LINE,
+                               "{\"source\":\"shell\"}");
+    id2 = cbm_gbuf_upsert_node(gb, "Module", "install.ps1", qn, "install.ps1",
+                               INSTALL_START_LINE, INSTALL_PS_END_LINE,
+                               "{\"source\":\"powershell\"}");
+    ASSERT_EQ(id1, id2);
+    ASSERT_EQ(assert_install_sh_module_source(gb, qn), 0);
+    cbm_gbuf_free(gb);
+
+    PASS();
+}
+
 TEST(gbuf_find_by_id) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
     int64_t id = cbm_gbuf_upsert_node(gb, "Function", "foo", "pkg.foo", "foo.go", 1, 5, "{}");
@@ -801,7 +897,7 @@ TEST(gbuf_merge_overlapping_qns) {
     cbm_gbuf_upsert_node(dst, "Function", "fn_old", "pkg.fn", "old.go", 1, 10, "{\"from\":\"dst\"}");
     cbm_gbuf_upsert_node(dst, "Function", "unique_dst", "pkg.unique_dst", "u.go", 1, 5, "{}");
 
-    /* src has same QN with different fields — src should win */
+    /* src has the same QN with a richer source span, so it should win */
     cbm_gbuf_upsert_node(src, "Method", "fn_new", "pkg.fn", "new.go", 20, 30, "{\"from\":\"src\"}");
     cbm_gbuf_upsert_node(src, "Function", "unique_src", "pkg.unique_src", "s.go", 1, 5, "{}");
 
@@ -811,7 +907,7 @@ TEST(gbuf_merge_overlapping_qns) {
     /* Total: 3 nodes (1 merged + 1 dst-only + 1 src-only) */
     ASSERT_EQ(cbm_gbuf_node_count(dst), 3);
 
-    /* Verify src fields won for the overlapping QN */
+    /* Verify the richer src fields won for the overlapping QN */
     const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(dst, "pkg.fn");
     ASSERT_NOT_NULL(n);
     ASSERT_STR_EQ(n->label, "Method");
@@ -871,6 +967,73 @@ TEST(gbuf_merge_section_file_path_is_deterministic) {
 
     cbm_gbuf_free(dst);
     cbm_gbuf_free(src);
+    PASS();
+}
+
+TEST(gbuf_merge_definition_source_prefers_richer_span) {
+    enum {
+        DECL_START_LINE = 7,
+        DECL_END_LINE = 7,
+        FULL_DEF_START_LINE = 34,
+        FULL_DEF_END_LINE = 43,
+    };
+    const char *qn = "proj.TypeName";
+
+    cbm_gbuf_t *dst = cbm_gbuf_new("test", "/tmp");
+    cbm_gbuf_t *src = cbm_gbuf_new("test", "/tmp");
+    cbm_gbuf_upsert_node(dst, "Class", "TypeName", qn, "include/type.h", DECL_START_LINE,
+                         DECL_END_LINE, "{\"source\":\"declaration\"}");
+    cbm_gbuf_upsert_node(src, "Class", "TypeName", qn, "src/type.c", FULL_DEF_START_LINE,
+                         FULL_DEF_END_LINE, "{\"source\":\"definition\"}");
+    ASSERT_EQ(cbm_gbuf_merge(dst, src), 0);
+    ASSERT_EQ(assert_full_definition_source(dst, qn), 0);
+    cbm_gbuf_free(dst);
+    cbm_gbuf_free(src);
+
+    dst = cbm_gbuf_new("test", "/tmp");
+    src = cbm_gbuf_new("test", "/tmp");
+    cbm_gbuf_upsert_node(dst, "Class", "TypeName", qn, "src/type.c", FULL_DEF_START_LINE,
+                         FULL_DEF_END_LINE, "{\"source\":\"definition\"}");
+    cbm_gbuf_upsert_node(src, "Class", "TypeName", qn, "include/type.h", DECL_START_LINE,
+                         DECL_END_LINE, "{\"source\":\"declaration\"}");
+    ASSERT_EQ(cbm_gbuf_merge(dst, src), 0);
+    ASSERT_EQ(assert_full_definition_source(dst, qn), 0);
+    cbm_gbuf_free(dst);
+    cbm_gbuf_free(src);
+
+    PASS();
+}
+
+TEST(gbuf_merge_module_source_prefers_richer_span) {
+    enum {
+        INSTALL_START_LINE = 1,
+        INSTALL_PS_END_LINE = 155,
+        INSTALL_SH_END_LINE = 221,
+    };
+    const char *qn = "proj.install";
+
+    cbm_gbuf_t *dst = cbm_gbuf_new("test", "/tmp");
+    cbm_gbuf_t *src = cbm_gbuf_new("test", "/tmp");
+    cbm_gbuf_upsert_node(dst, "Module", "install.ps1", qn, "install.ps1", INSTALL_START_LINE,
+                         INSTALL_PS_END_LINE, "{\"source\":\"powershell\"}");
+    cbm_gbuf_upsert_node(src, "Module", "install.sh", qn, "install.sh", INSTALL_START_LINE,
+                         INSTALL_SH_END_LINE, "{\"source\":\"shell\"}");
+    ASSERT_EQ(cbm_gbuf_merge(dst, src), 0);
+    ASSERT_EQ(assert_install_sh_module_source(dst, qn), 0);
+    cbm_gbuf_free(dst);
+    cbm_gbuf_free(src);
+
+    dst = cbm_gbuf_new("test", "/tmp");
+    src = cbm_gbuf_new("test", "/tmp");
+    cbm_gbuf_upsert_node(dst, "Module", "install.sh", qn, "install.sh", INSTALL_START_LINE,
+                         INSTALL_SH_END_LINE, "{\"source\":\"shell\"}");
+    cbm_gbuf_upsert_node(src, "Module", "install.ps1", qn, "install.ps1", INSTALL_START_LINE,
+                         INSTALL_PS_END_LINE, "{\"source\":\"powershell\"}");
+    ASSERT_EQ(cbm_gbuf_merge(dst, src), 0);
+    ASSERT_EQ(assert_install_sh_module_source(dst, qn), 0);
+    cbm_gbuf_free(dst);
+    cbm_gbuf_free(src);
+
     PASS();
 }
 
@@ -1338,6 +1501,8 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_upsert_same_qn_updates_all_fields);
     RUN_TEST(gbuf_route_upsert_file_path_is_deterministic);
     RUN_TEST(gbuf_section_upsert_file_path_is_deterministic);
+    RUN_TEST(gbuf_upsert_definition_source_prefers_richer_span);
+    RUN_TEST(gbuf_upsert_module_source_prefers_richer_span);
     RUN_TEST(gbuf_upsert_long_qn);
     RUN_TEST(gbuf_find_by_qn_missing);
     RUN_TEST(gbuf_find_by_id_missing);
@@ -1362,6 +1527,8 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_merge_overlapping_qns);
     RUN_TEST(gbuf_merge_route_file_path_is_deterministic);
     RUN_TEST(gbuf_merge_section_file_path_is_deterministic);
+    RUN_TEST(gbuf_merge_definition_source_prefers_richer_span);
+    RUN_TEST(gbuf_merge_module_source_prefers_richer_span);
     RUN_TEST(gbuf_merge_edge_dedup);
     RUN_TEST(gbuf_merge_empty_src_into_populated_dst);
     RUN_TEST(gbuf_merge_populated_src_into_empty_dst);

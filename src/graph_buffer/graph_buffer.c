@@ -735,6 +735,57 @@ static bool uses_deterministic_source_hint(const char *label) {
     return label && (strcmp(label, "Route") == 0 || strcmp(label, "Section") == 0);
 }
 
+static bool uses_source_span_selection(const char *label) {
+    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
+                     strcmp(label, "Class") == 0 || strcmp(label, "Struct") == 0 ||
+                     strcmp(label, "Interface") == 0 || strcmp(label, "Enum") == 0 ||
+                     strcmp(label, "Trait") == 0 || strcmp(label, "Type") == 0 ||
+                     strcmp(label, "Module") == 0);
+}
+
+static int source_span_lines(int start_line, int end_line) {
+    if (start_line <= 0 || end_line < start_line) {
+        return 0;
+    }
+    return end_line - start_line + SKIP_ONE;
+}
+
+static int cmp_bool_int(bool lhs, bool rhs) {
+    return (int)lhs - (int)rhs;
+}
+
+static int compare_source_location(const char *lhs_path, int lhs_start, int lhs_end,
+                                   const char *rhs_path, int rhs_start, int rhs_end) {
+    const char *lhs = lhs_path ? lhs_path : "";
+    const char *rhs = rhs_path ? rhs_path : "";
+    int diff = cmp_bool_int(lhs[0] != '\0', rhs[0] != '\0');
+    if (diff != 0) {
+        return diff;
+    }
+    diff = source_span_lines(lhs_start, lhs_end) - source_span_lines(rhs_start, rhs_end);
+    if (diff != 0) {
+        return diff;
+    }
+    diff = rhs_start - lhs_start;
+    if (diff != 0) {
+        return diff;
+    }
+    diff = lhs_end - rhs_end;
+    if (diff != 0) {
+        return diff;
+    }
+    diff = strcmp(rhs, lhs);
+    return diff;
+}
+
+static bool same_source_location(const cbm_gbuf_node_t *existing, const char *file_path,
+                                 int start_line, int end_line) {
+    const char *cur = existing && existing->file_path ? existing->file_path : "";
+    const char *next = file_path ? file_path : "";
+    return strcmp(cur, next) == 0 && existing->start_line == start_line &&
+           existing->end_line == end_line;
+}
+
 static const char *select_upsert_file_path(const cbm_gbuf_node_t *existing, const char *label,
                                            const char *file_path) {
     const char *next = file_path ? file_path : "";
@@ -749,6 +800,19 @@ static const char *select_upsert_file_path(const cbm_gbuf_node_t *existing, cons
         return cur;
     }
     return strcmp(next, cur) < 0 ? next : cur;
+}
+
+static bool select_source_span_from_next(const cbm_gbuf_node_t *existing, const char *label,
+                                         const char *file_path, int start_line, int end_line) {
+    if (!existing || same_source_location(existing, file_path, start_line, end_line)) {
+        return true;
+    }
+    if (!uses_source_span_selection(existing->label) && !uses_source_span_selection(label)) {
+        return true;
+    }
+    int cmp = compare_source_location(file_path, start_line, end_line, existing->file_path,
+                                      existing->start_line, existing->end_line);
+    return cmp >= 0;
 }
 
 static const char *select_upsert_name(const cbm_gbuf_node_t *existing, const char *label,
@@ -804,25 +868,38 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
     /* Check if node already exists */
     cbm_gbuf_node_t *existing = cbm_ht_get(gb->node_by_qn, qualified_name);
     if (existing) {
-        const char *selected_name = select_upsert_name(existing, label, name);
-        const char *selected_file_path = select_upsert_file_path(existing, label, file_path);
-        const char *selected_props =
-            select_upsert_properties_json(existing, label, properties_json);
+        bool use_next_source_span =
+            select_source_span_from_next(existing, label, file_path, start_line, end_line);
+        const char *selected_label = use_next_source_span ? label : existing->label;
+        const char *selected_name =
+            use_next_source_span ? select_upsert_name(existing, label, name) : existing->name;
+        const char *selected_file_path =
+            use_next_source_span ? select_upsert_file_path(existing, label, file_path)
+                                 : (existing->file_path ? existing->file_path : "");
+        int selected_start_line = use_next_source_span ? start_line : existing->start_line;
+        int selected_end_line = use_next_source_span ? end_line : existing->end_line;
+        const char *selected_props = use_next_source_span
+                                         ? select_upsert_properties_json(existing, label,
+                                                                         properties_json)
+                                         : existing->properties_json;
         /* Update in-place. name/properties are strdup'd BEFORE freeing old ones
          * (callers may pass existing->name as an argument). label/file_path are
          * interned: gb_intern returns a stable pool pointer (idempotent even when
          * label == existing->label), so the old value is replaced, never freed.
          * Route and Section nodes can intentionally collapse multiple concrete
          * source paths into one QN, so pick display/source hints/properties
-         * deterministically where those fields are only representative hints. */
+         * deterministically where those fields are only representative hints.
+         * Code definitions may also collide between declarations and concrete
+         * definitions; keep the richer source tuple so parallel worker order
+         * cannot decide whether a forward declaration hides the implementation. */
         char *new_name = heap_strdup(selected_name);
         char *new_props = selected_props ? heap_strdup(selected_props) : NULL;
-        existing->label = (char *)gb_intern(gb, label);
+        existing->label = (char *)gb_intern(gb, selected_label);
         free(existing->name);
         existing->name = new_name;
         existing->file_path = (char *)gb_intern(gb, selected_file_path);
-        existing->start_line = start_line;
-        existing->end_line = end_line;
+        existing->start_line = selected_start_line;
+        existing->end_line = selected_end_line;
         if (new_props) {
             free(existing->properties_json);
             existing->properties_json = new_props;
@@ -1376,23 +1453,36 @@ static void free_remap_entry(const char *key, void *val, void *ud) {
 
 /* Handle QN collision: update dst node fields, record remap if IDs differ.
  * Representative source hints are chosen deterministically for labels that can
- * collapse multiple paths into one QN; worker merge order is intentionally not
- * part of the graph contract. label/file_path are re-interned into dst's pool
- * (sn's pointers belong to src). */
+ * collapse multiple paths into one QN, and duplicate code definitions keep the
+ * richer source tuple. Worker merge order is intentionally not part of the
+ * graph contract. label/file_path are re-interned into dst's pool (sn's
+ * pointers belong to src). */
 static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
                                   const cbm_gbuf_node_t *sn, CBMHashTable **remap) {
-    const char *selected_name = select_upsert_name(existing, sn->label, sn->name);
-    const char *selected_file_path = select_upsert_file_path(existing, sn->label, sn->file_path);
-    const char *selected_props =
-        select_upsert_properties_json(existing, sn->label, sn->properties_json);
+    bool use_next_source_span =
+        select_source_span_from_next(existing, sn->label, sn->file_path, sn->start_line,
+                                     sn->end_line);
+    const char *selected_label = use_next_source_span ? sn->label : existing->label;
+    const char *selected_name = use_next_source_span
+                                    ? select_upsert_name(existing, sn->label, sn->name)
+                                    : existing->name;
+    const char *selected_file_path =
+        use_next_source_span ? select_upsert_file_path(existing, sn->label, sn->file_path)
+                             : (existing->file_path ? existing->file_path : "");
+    int selected_start_line = use_next_source_span ? sn->start_line : existing->start_line;
+    int selected_end_line = use_next_source_span ? sn->end_line : existing->end_line;
+    const char *selected_props = use_next_source_span
+                                     ? select_upsert_properties_json(existing, sn->label,
+                                                                     sn->properties_json)
+                                     : existing->properties_json;
     char *new_name = heap_strdup(selected_name);
     char *new_props = selected_props ? heap_strdup(selected_props) : NULL;
-    existing->label = (char *)gb_intern(dst, sn->label);
+    existing->label = (char *)gb_intern(dst, selected_label);
     free(existing->name);
     existing->name = new_name;
     existing->file_path = (char *)gb_intern(dst, selected_file_path);
-    existing->start_line = sn->start_line;
-    existing->end_line = sn->end_line;
+    existing->start_line = selected_start_line;
+    existing->end_line = selected_end_line;
     if (new_props) {
         free(existing->properties_json);
         existing->properties_json = new_props;
