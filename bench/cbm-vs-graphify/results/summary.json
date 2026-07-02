@@ -1,0 +1,101 @@
+{
+  "corpus": {
+    "sha": "3ff76d29a639c5be2ca27c943ce2f87de141b73c",
+    "files": 347,
+    "loc": 187197,
+    "lang": "C (vendored & tree-sitter grammars excluded)"
+  },
+  "layer1_structural": {
+    "cbm": {
+      "nodes": 4595,
+      "edges": 16924,
+      "kinds": 11,
+      "dup_nodes": 0
+    },
+    "graphify_ast": {
+      "nodes": 4077,
+      "links": 14516,
+      "kinds": 1
+    },
+    "function_recall": {
+      "oracle_n": 2281,
+      "cbm": 0.997,
+      "graphify": 0.999
+    },
+    "include_edges": {
+      "oracle_n": 692,
+      "cbm": 326,
+      "graphify": 68,
+      "cbm_recall": 0.256,
+      "graphify_recall": 0.039
+    }
+  },
+  "layer2_qa": {
+    "D1": {
+      "cbm": 4,
+      "graphify": 3.2,
+      "explorer": 3.2
+    },
+    "D2": {
+      "cbm": 3.1,
+      "graphify": 2.8,
+      "explorer": 4
+    },
+    "D3": {
+      "cbm": 4,
+      "graphify": 2.1,
+      "explorer": 4
+    },
+    "D4": {
+      "cbm": 2.5,
+      "graphify": 1.5,
+      "explorer": 4
+    },
+    "D5": {
+      "cbm": 3.8,
+      "graphify": 3.4,
+      "explorer": 2.2
+    },
+    "OVERALL": {
+      "cbm": 3.48,
+      "graphify": 2.6,
+      "explorer": 3.48
+    }
+  },
+  "layer2_explorer_adjusted_overall": 3.95,
+  "layer3_operational": {
+    "cold_build_s": {
+      "cbm_median": 2.44,
+      "cbm_runs": [
+        2.51,
+        2.42,
+        2.44
+      ],
+      "graphify_ast_median": 4.21,
+      "graphify_ast_runs": [
+        4.94,
+        4.18,
+        4.21
+      ]
+    },
+    "disk_bytes": {
+      "cbm_db": 53084160,
+      "graphify_out_total": 33582761,
+      "graphify_graph_json": 6133023
+    },
+    "query_latency_ms": {
+      "cbm_median": 39.95,
+      "graphify_median": 126.11
+    },
+    "incremental_s": {
+      "graphify_update": 3.24,
+      "cbm_reindex_full": 1.47
+    },
+    "token_cost": {
+      "cbm_index": 0,
+      "graphify_ast": 0,
+      "graphify_full_subset_llm_naming_wallclock_s": 705.9,
+      "note": "cbm uses local nomic embeddings (0 API tokens); graphify-AST is deterministic (0 tokens); graphify-FULL semantic/community-naming uses an LLM backend (here local ollama gemma4:26b = 0 API $ but 11.8 min wall-clock for the 16K-LOC subset)."
+    }
+  }
+}

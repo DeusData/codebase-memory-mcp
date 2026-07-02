@@ -1,0 +1,132 @@
+{
+  "structural": {
+    "cbm": {
+      "nodes": 4595,
+      "node_labels": {
+        "Field": 250,
+        "Route": 6,
+        "Macro": 539,
+        "Class": 56,
+        "Variable": 75,
+        "File": 283,
+        "Function": 3082,
+        "Folder": 19,
+        "Module": 283,
+        "Project": 1,
+        "Branch": 1
+      },
+      "edges": 16924,
+      "edge_types": {
+        "DEFINES": 4285,
+        "IMPORTS": 326,
+        "SIMILAR_TO": 307,
+        "SEMANTICALLY_RELATED": 50,
+        "CONTAINS_FILE": 283,
+        "CONTAINS_FOLDER": 18,
+        "CALLS": 3669,
+        "USAGE": 7473,
+        "WRITES": 499,
+        "HAS_BRANCH": 1,
+        "CONFIGURES": 7,
+        "HTTP_CALLS": 6
+      },
+      "dup_nodes": 0,
+      "kind_richness": 11
+    },
+    "graphify_ast": {
+      "nodes": 4077,
+      "links": 14516,
+      "relations": {
+        "contains": 3085,
+        "imports": 68,
+        "calls": 7531,
+        "references": 3832
+      },
+      "kind_richness": 1
+    }
+  },
+  "function_recall": {
+    "oracle_functions": 2281,
+    "cbm": {
+      "function_nodes": 3082,
+      "tp": 2275,
+      "recall_strict": 0.997,
+      "precision": 0.738,
+      "recall_loose_anynode": 0.999,
+      "recall_name_only": 0.999
+    },
+    "graphify": {
+      "function_nodes": 3085,
+      "tp": 2279,
+      "recall_strict": 0.999,
+      "precision": 0.739,
+      "recall_loose_anynode": 0.999,
+      "recall_name_only": 0.999
+    }
+  },
+  "include_recall": {
+    "oracle_include_edges_incorpus": 692,
+    "cbm": {
+      "edges": 326,
+      "tp": 177,
+      "recall": 0.256,
+      "precision": 0.543
+    },
+    "graphify": {
+      "edges": 68,
+      "tp": 27,
+      "recall": 0.039,
+      "precision": 0.397
+    }
+  },
+  "call_parity": [
+    {
+      "sym": "cbm_arena_alloc",
+      "cbm": 31,
+      "gfy": 7,
+      "grep_ub": 403
+    },
+    {
+      "sym": "cbm_arena_strndup",
+      "cbm": 22,
+      "gfy": 0,
+      "grep_ub": 131
+    },
+    {
+      "sym": "cbm_arena_strdup",
+      "cbm": 20,
+      "gfy": 0,
+      "grep_ub": 202
+    },
+    {
+      "sym": "cbm_node_text",
+      "cbm": 20,
+      "gfy": 217,
+      "grep_ub": 358
+    },
+    {
+      "sym": "cbm_arena_sprintf",
+      "cbm": 20,
+      "gfy": 0,
+      "grep_ub": 366
+    },
+    {
+      "sym": "cbm_registry_add_func",
+      "cbm": 20,
+      "gfy": 34,
+      "grep_ub": 6060
+    },
+    {
+      "sym": "cbm_registry_add_type",
+      "cbm": 20,
+      "gfy": 31,
+      "grep_ub": 1281
+    },
+    {
+      "sym": "cbm_type_func",
+      "cbm": 19,
+      "gfy": 44,
+      "grep_ub": 2113
+    }
+  ]
+}

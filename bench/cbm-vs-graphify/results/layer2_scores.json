@@ -1,0 +1,261 @@
+{
+  "summary": {
+    "D1": {
+      "cbm": 4,
+      "graphify": 3.2,
+      "explorer": 3.2
+    },
+    "D2": {
+      "cbm": 3.1,
+      "graphify": 2.8,
+      "explorer": 4
+    },
+    "D3": {
+      "cbm": 4,
+      "graphify": 2.1,
+      "explorer": 4
+    },
+    "D4": {
+      "cbm": 2.5,
+      "graphify": 1.5,
+      "explorer": 4
+    },
+    "D5": {
+      "cbm": 3.8,
+      "graphify": 3.4,
+      "explorer": 2.2
+    },
+    "OVERALL": {
+      "cbm": 3.48,
+      "graphify": 2.6,
+      "explorer": 3.48
+    }
+  },
+  "per_question": [
+    {
+      "id": "D1.1",
+      "dim": "D1",
+      "scores": {
+        "cbm": 4,
+        "graphify": 4,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D1.2",
+      "dim": "D1",
+      "scores": {
+        "cbm": 4,
+        "graphify": 0,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D1.3",
+      "dim": "D1",
+      "scores": {
+        "cbm": 4,
+        "graphify": 4,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D1.4",
+      "dim": "D1",
+      "scores": {
+        "cbm": 4,
+        "graphify": 4,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D1.5",
+      "dim": "D1",
+      "scores": {
+        "cbm": 4,
+        "graphify": 4,
+        "explorer": 0
+      }
+    },
+    {
+      "id": "D2.1",
+      "dim": "D2",
+      "scores": {
+        "cbm": 2,
+        "graphify": 1,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D2.2",
+      "dim": "D2",
+      "scores": {
+        "cbm": 4,
+        "graphify": 4,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D2.3",
+      "dim": "D2",
+      "scores": {
+        "cbm": 3,
+        "graphify": 3.5,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D2.4",
+      "dim": "D2",
+      "scores": {
+        "cbm": 3,
+        "graphify": 2,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D2.5",
+      "dim": "D2",
+      "scores": {
+        "cbm": 3.5,
+        "graphify": 3.5,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D3.1",
+      "dim": "D3",
+      "scores": {
+        "cbm": 4,
+        "graphify": 2,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D3.2",
+      "dim": "D3",
+      "scores": {
+        "cbm": 4,
+        "graphify": 2,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D3.3",
+      "dim": "D3",
+      "scores": {
+        "cbm": 4,
+        "graphify": 2,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D3.4",
+      "dim": "D3",
+      "scores": {
+        "cbm": 4,
+        "graphify": 2.5,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D3.5",
+      "dim": "D3",
+      "scores": {
+        "cbm": 4,
+        "graphify": 2,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D4.1",
+      "dim": "D4",
+      "scores": {
+        "cbm": 4,
+        "graphify": 3,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D4.2",
+      "dim": "D4",
+      "scores": {
+        "cbm": 1,
+        "graphify": 0.5,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D4.3",
+      "dim": "D4",
+      "scores": {
+        "cbm": 4,
+        "graphify": 4,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D4.4",
+      "dim": "D4",
+      "scores": {
+        "cbm": 3.5,
+        "graphify": 0,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D4.5",
+      "dim": "D4",
+      "scores": {
+        "cbm": 0,
+        "graphify": 0,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D5.1",
+      "dim": "D5",
+      "scores": {
+        "cbm": 4,
+        "graphify": 4,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D5.2",
+      "dim": "D5",
+      "scores": {
+        "cbm": 3,
+        "graphify": 2,
+        "explorer": 3
+      }
+    },
+    {
+      "id": "D5.3",
+      "dim": "D5",
+      "scores": {
+        "cbm": 4,
+        "graphify": 3,
+        "explorer": 4
+      }
+    },
+    {
+      "id": "D5.4",
+      "dim": "D5",
+      "scores": {
+        "cbm": 4,
+        "graphify": 4,
+        "explorer": 0
+      }
+    },
+    {
+      "id": "D5.5",
+      "dim": "D5",
+      "scores": {
+        "cbm": 4,
+        "graphify": 4,
+        "explorer": 0
+      }
+    }
+  ]
+}
