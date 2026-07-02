@@ -947,6 +947,62 @@ TEST(source_search_tilde_project_expands) {
     PASS();
 }
 
+TEST(graph_search_tilde_project_autoindexes) {
+    char fake_home[256];
+    snprintf(fake_home, sizeof(fake_home), "/tmp/cbm_tilde_home_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(fake_home));
+
+    char repo_dir[320];
+    snprintf(repo_dir, sizeof(repo_dir), "%s/repo", fake_home);
+    ASSERT_TRUE(cbm_mkdir_p(repo_dir, 0755));
+
+    char src_path[360];
+    snprintf(src_path, sizeof(src_path), "%s/main.c", repo_dir);
+    FILE *f = fopen(src_path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("void tilde_graph_autoindex_sentinel(void) {}\n", f);
+    fclose(f);
+
+    const char *old_home = getenv("HOME");
+    const char *old_auto_index = getenv("CBM_AUTO_INDEX");
+    char *old_home_copy = old_home ? strdup(old_home) : NULL;
+    char *old_auto_index_copy = old_auto_index ? strdup(old_auto_index) : NULL;
+    if (old_home) ASSERT_NOT_NULL(old_home_copy);
+    if (old_auto_index) ASSERT_NOT_NULL(old_auto_index_copy);
+    cbm_setenv("HOME", fake_home, 1);
+    cbm_setenv("CBM_AUTO_INDEX", "true", 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"~/repo\",\"pattern\":\"tilde_graph_autoindex_sentinel\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    bool has_match = resp && strstr(resp, "tilde_graph_autoindex_sentinel") != NULL;
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    if (old_home_copy) {
+        cbm_setenv("HOME", old_home_copy, 1);
+        free(old_home_copy);
+    } else {
+        cbm_unsetenv("HOME");
+    }
+    if (old_auto_index_copy) {
+        cbm_setenv("CBM_AUTO_INDEX", old_auto_index_copy, 1);
+        free(old_auto_index_copy);
+    } else {
+        cbm_unsetenv("CBM_AUTO_INDEX");
+    }
+    cbm_unlink(src_path);
+    cbm_rmdir(repo_dir);
+    cbm_rmdir(fake_home);
+
+    ASSERT_TRUE(has_match);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  project_is_path: path-format project arg routes through slug
  *  conversion in get_project_root (regression for path-based project)
@@ -1254,6 +1310,7 @@ void suite_input_validation(void) {
     RUN_TEST(detect_changes_slug_project_finds_root);
     RUN_TEST(manage_adr_slug_project_finds_root);
     RUN_TEST(source_search_tilde_project_expands);
+    RUN_TEST(graph_search_tilde_project_autoindexes);
     RUN_TEST(source_search_no_project_falls_back_to_session);
     RUN_TEST(path_project_auto_indexes_separate_directory);
     RUN_TEST(path_project_autoindex_respects_file_limit);

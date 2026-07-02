@@ -2098,19 +2098,40 @@ static char *expand_tilde(const char *s) {
     return result;
 }
 
+/* Return the canonical path string used for path-derived project slugs.
+ * realpath() is used when possible; otherwise the tilde-expanded path, or the
+ * original path, is copied so missing paths still produce stable error slugs.
+ * out_realpath_ok tells callers whether the returned string is a realpath()
+ * result for cases where only existing paths should update session_root. */
+static char *project_canonical_path(const char *s, bool *out_realpath_ok) {
+    if (out_realpath_ok) {
+        *out_realpath_ok = false;
+    }
+    if (!project_is_path(s)) return NULL;
+    char *expanded = expand_tilde(s); /* non-NULL only for ~/ paths */
+    const char *to_resolve = expanded ? expanded : s;
+    char *resolved = realpath(to_resolve, NULL);
+    if (resolved) {
+        free(expanded);
+        if (out_realpath_ok) {
+            *out_realpath_ok = true;
+        }
+        return resolved;
+    }
+    char *fallback = heap_strdup(to_resolve);
+    free(expanded);
+    return fallback;
+}
+
 /* Convert a filesystem path to a heap-allocated project slug.
  * Handles ~/ tilde expansion, resolves symlinks and relative components
  * via realpath(3), then derives the slug from the canonical absolute path.
  * Returns NULL if s is not a path. Caller must free the result. */
 static char *project_slug_from_path(const char *s) {
-    if (!project_is_path(s)) return NULL;
-    char *expanded = expand_tilde(s);          /* non-NULL only for ~ paths */
-    const char *to_resolve = expanded ? expanded : s;
-    char *resolved = realpath(to_resolve, NULL); /* NULL if path doesn't exist */
-    const char *canonical = resolved ? resolved : to_resolve;
+    char *canonical = project_canonical_path(s, NULL);
+    if (!canonical) return NULL;
     char *slug = cbm_project_name_from_path(canonical);
-    free(resolved);
-    free(expanded);
+    free(canonical);
     return slug;
 }
 
@@ -2121,15 +2142,15 @@ static project_expand_t expand_project_param(cbm_mcp_server_t *srv, char *raw) {
     /* Rule 0: Path detection — convert paths to project names.
      * Enables: search_graph(project="/path/to/repo") */
     if (project_is_path(raw)) {
-        char *resolved = realpath(raw, NULL);
-        const char *path = resolved ? resolved : raw;
-        char *name = cbm_project_name_from_path(path);
-        if (resolved && srv->session_root[0] == '\0') {
-            snprintf(srv->session_root, sizeof(srv->session_root), "%s", resolved);
+        bool realpath_ok = false;
+        char *canonical = project_canonical_path(raw, &realpath_ok);
+        char *name = canonical ? cbm_project_name_from_path(canonical) : NULL;
+        if (realpath_ok && name && srv->session_root[0] == '\0') {
+            snprintf(srv->session_root, sizeof(srv->session_root), "%s", canonical);
             snprintf(srv->session_project, sizeof(srv->session_project), "%s", name);
         }
         free(raw);
-        free(resolved);
+        free(canonical);
         r.value = name;
         r.mode = MATCH_PREFIX;
         return r;
@@ -2525,12 +2546,7 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
     bool raw_project_path = raw_project_explicit && project_is_path(raw_project);
     char *_raw_path = NULL;
     if (raw_project_path) {
-        char *_exp = expand_tilde(raw_project);
-        _raw_path = realpath(_exp ? _exp : raw_project, NULL);
-        if (!_raw_path && (_exp || raw_project[0] == '/')) {
-            _raw_path = heap_strdup(_exp ? _exp : raw_project);
-        }
-        free(_exp);
+        _raw_path = project_canonical_path(raw_project, NULL);
     }
 
     project_expand_t pe;
