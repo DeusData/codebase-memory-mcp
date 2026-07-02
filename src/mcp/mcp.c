@@ -4940,12 +4940,16 @@ static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
 enum { INDEX_EXCLUDED_DIR_CAP = 25 };
 
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
+    CBM_PROF_START(prof_index_total);
+    CBM_PROF_START(prof_index_args);
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     cbm_normalize_path_sep(repo_path);
 
     if (!repo_path) {
         free(mode_str);
+        CBM_PROF_END("index_repository", "args", prof_index_args);
+        CBM_PROF_END("index_repository", "TOTAL", prof_index_total);
         return cbm_mcp_text_result(
             "{\"error\":\"repo_path is required\","
             "\"hint\":\"Pass the absolute path to the project root directory.\"}", true);
@@ -4955,6 +4959,8 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         free(mode_str);
         char *result = handle_cross_repo_mode(repo_path, args);
         free(repo_path);
+        CBM_PROF_END("index_repository", "cross_repo_mode", prof_index_args);
+        CBM_PROF_END("index_repository", "TOTAL", prof_index_total);
         return result;
     }
 
@@ -4967,30 +4973,39 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     free(mode_str);
 
     bool persistence = cbm_mcp_get_bool_arg(args, "persistence");
+    CBM_PROF_END("index_repository", "args", prof_index_args);
 
+    CBM_PROF_START(prof_index_pipeline_new);
     cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
+    CBM_PROF_END("index_repository", "pipeline_new", prof_index_pipeline_new);
     if (!p) {
         free(repo_path);
+        CBM_PROF_END("index_repository", "TOTAL", prof_index_total);
         return cbm_mcp_text_result(
             "{\"error\":\"failed to create indexing pipeline\","
             "\"hint\":\"Check that repo_path exists and is readable. The directory may be empty or inaccessible.\"}", true);
     }
+    CBM_PROF_START(prof_index_pipeline_config);
     cbm_pipeline_set_persistence(p, persistence);
     cbm_pipeline_apply_config(p, srv->config);
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
+    CBM_PROF_END("index_repository", "pipeline_config", prof_index_pipeline_config);
 
-    /* Close cached store — pipeline will delete + recreate the .db file */
+    /* Close cached store before indexing because full and fallback paths may replace the DB. */
+    CBM_PROF_START(prof_index_close_before);
     if (srv->owns_store && srv->store) {
         cbm_store_close(srv->store);
         srv->store = NULL;
     }
     free(srv->current_project);
     srv->current_project = NULL;
+    CBM_PROF_END("index_repository", "close_cached_store_before", prof_index_close_before);
 
     /* Serialize pipeline runs to prevent concurrent writes.
      * Track active pipeline so signal handler and notifications/cancelled
      * can cancel it mid-run. */
+    CBM_PROF_START(prof_index_locked_run);
     cbm_pipeline_lock();
     atomic_store_explicit(&srv->active_pipeline, p, memory_order_release);
     int rc = cbm_pipeline_run(p);
@@ -4999,13 +5014,16 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     const char *publish_reason = cbm_pipeline_publish_reason(p);
     atomic_store_explicit(&srv->active_pipeline, NULL, memory_order_release);
     cbm_pipeline_unlock();
+    CBM_PROF_END("index_repository", "pipeline_locked_run", prof_index_locked_run);
 
     /* Capture the excluded-subtree list (#411) while the pipeline (which owns
      * the strings) is still alive — the response builder copies them into the
      * JSON doc, so they need only outlive that call, not cbm_pipeline_free. */
+    CBM_PROF_START(prof_index_excluded);
     char **excluded_dirs = NULL;
     int excluded_count = 0;
     cbm_pipeline_get_excluded(p, &excluded_dirs, &excluded_count);
+    CBM_PROF_END("index_repository", "get_excluded", prof_index_excluded);
 
     CBM_PROF_START(prof_index_mem_collect);
     cbm_mem_collect(); /* return mimalloc pages to OS after large indexing */
@@ -5093,6 +5111,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
      * The discover layer collects .gitignore'd / config-excluded directories;
      * emit them as an "excluded" array (copies strings into the JSON doc, so
      * they need only outlive this block — pipeline is freed below). */
+    CBM_PROF_START(prof_index_response_fields);
     if (excluded_count > 0 && excluded_dirs) {
         yyjson_mut_val *arr = yyjson_mut_arr(doc);
         for (int i = 0; i < excluded_count; i++) {
@@ -5107,9 +5126,12 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     if (srv->session_project[0])
         yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
+    CBM_PROF_END("index_repository", "response_fields", prof_index_response_fields);
 
     /* Notify resource-capable clients that graph data changed */
+    CBM_PROF_START(prof_index_notify);
     if (rc == 0) notify_resources_updated(srv);
+    CBM_PROF_END("index_repository", "notify_resources", prof_index_notify);
 
     CBM_PROF_START(prof_index_serialize);
     char *json = yy_doc_to_str(doc);
@@ -5122,6 +5144,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     char *result = cbm_mcp_text_result(json, rc != 0);
     free(json);
     CBM_PROF_END("index_repository", "serialize_cleanup", prof_index_serialize);
+    CBM_PROF_END("index_repository", "TOTAL", prof_index_total);
     return result;
 }
 
@@ -7698,12 +7721,15 @@ static char *inject_update_notice(cbm_mcp_server_t *srv, char *result_json) {
 
 static void write_protocol_json(FILE *out, const char *json, bool content_length_framed) {
     if (!out || !json) return;
+    CBM_PROF_START(prof_mcp_write);
     if (content_length_framed) {
         (void)fprintf(out, MCP_CONTENT_HEADER " %zu\r\n\r\n%s", strlen(json), json);
     } else {
         (void)fprintf(out, "%s\n", json);
     }
     (void)fflush(out);
+    CBM_PROF_END("mcp_write", content_length_framed ? "content_length" : "json_line",
+                 prof_mcp_write);
 }
 
 /* Send a JSON-RPC notification (no id) to the client's protocol stream.
@@ -8160,10 +8186,15 @@ static char *handle_resources_read(cbm_mcp_server_t *srv, const char *params_raw
 /* ── Server request handler ───────────────────────────────────── */
 
 char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
+    CBM_PROF_START(prof_mcp_request_total);
+    CBM_PROF_START(prof_mcp_parse);
     cbm_jsonrpc_request_t req = {0};
     if (cbm_jsonrpc_parse(line, &req) < 0) {
+        CBM_PROF_END("mcp_request", "parse_error", prof_mcp_parse);
+        CBM_PROF_END("mcp_request_total", "parse_error", prof_mcp_request_total);
         return cbm_jsonrpc_format_error(0, JSONRPC_PARSE_ERROR, "Parse error");
     }
+    CBM_PROF_END("mcp_request", "parse", prof_mcp_parse);
 
     /* Notifications (no id) → handle cancellation, then no response */
     if (!req.has_id) {
@@ -8178,6 +8209,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
             }
         }
         cbm_jsonrpc_request_free(&req);
+        CBM_PROF_END("mcp_request_total", "notification", prof_mcp_request_total);
         return NULL;
     }
 
@@ -8197,6 +8229,8 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         result_json = handle_resources_read(srv, req.params_raw, req.id, &err_out);
         if (err_out) {
             /* Error already formatted as JSON-RPC with correct id — return directly */
+            CBM_PROF_END("mcp_request_total", req.method ? req.method : "unknown",
+                         prof_mcp_request_total);
             cbm_jsonrpc_request_free(&req);
             return err_out;
         }
@@ -8205,13 +8239,18 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     } else if (strcmp(req.method, "tools/list") == 0) {
         result_json = cbm_mcp_tools_list(srv);
     } else if (strcmp(req.method, "tools/call") == 0) {
+        CBM_PROF_START(prof_mcp_tool_params);
         char *tool_name = req.params_raw ? cbm_mcp_get_tool_name(req.params_raw) : NULL;
         char *tool_args =
             req.params_raw ? cbm_mcp_get_arguments(req.params_raw) : heap_strdup("{}");
+        CBM_PROF_END("mcp_tool_call", "params", prof_mcp_tool_params);
 
         struct timespec t0;
         cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
+        CBM_PROF_START(prof_mcp_tool_execute);
         result_json = cbm_mcp_handle_tool(srv, tool_name, tool_args);
+        CBM_PROF_END("mcp_tool_execute", tool_name ? tool_name : "missing_tool",
+                     prof_mcp_tool_execute);
         struct timespec t1;
         cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
         long long dur_us = ((long long)(t1.tv_sec - t0.tv_sec) * MCP_S_TO_US) +
@@ -8219,7 +8258,9 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         bool is_err = (result_json != NULL) && (strstr(result_json, "\"isError\":true") != NULL);
         cbm_diag_record_query(dur_us, is_err);
 
+        CBM_PROF_START(prof_mcp_inject_notice);
         result_json = inject_update_notice(srv, result_json);
+        CBM_PROF_END("mcp_tool_call", "inject_update_notice", prof_mcp_inject_notice);
         free(tool_name);
         free(tool_args);
     } else {
@@ -8233,6 +8274,8 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
             .error_json = err_obj,
         };
         char *err = cbm_jsonrpc_format_response(&err_resp);
+        CBM_PROF_END("mcp_request_total", req.method ? req.method : "unknown",
+                     prof_mcp_request_total);
         cbm_jsonrpc_request_free(&req);
         return err;
     }
@@ -8242,8 +8285,11 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         .id_str = req.id_str,
         .result_json = result_json,
     };
+    CBM_PROF_START(prof_mcp_response_format);
     char *out = cbm_jsonrpc_format_response(&resp);
+    CBM_PROF_END("mcp_request", "format_response", prof_mcp_response_format);
     free(result_json);
+    CBM_PROF_END("mcp_request_total", req.method ? req.method : "unknown", prof_mcp_request_total);
     cbm_jsonrpc_request_free(&req);
     return out;
 }

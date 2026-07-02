@@ -94,6 +94,7 @@ struct cbm_pipeline {
     char *project_name;
     cbm_git_context_t git_ctx;
     char *branch_qn;
+    bool git_context_resolved;
     cbm_index_mode_t mode;
     double similarity_threshold; /* Jaccard threshold for SIMILAR edges; <=0 = default (#41) */
     double httplink_min_confidence;
@@ -181,8 +182,6 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->repo_path = cbm_strdup(repo_path);
     p->db_path = db_path ? cbm_strdup(db_path) : NULL;
     p->project_name = cbm_project_name_from_path(repo_path);
-    (void)cbm_git_context_resolve(repo_path, &p->git_ctx);
-    p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
     p->mode = mode;
     p->similarity_threshold = 0.0; /* 0 = use CBM_MINHASH_JACCARD_THRESHOLD default */
     p->httplink_min_confidence = 0.0;
@@ -201,10 +200,32 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     return p;
 }
 
+static int cbm_pipeline_ensure_git_context(cbm_pipeline_t *p) {
+    if (!p) {
+        return CBM_NOT_FOUND;
+    }
+    if (p->git_context_resolved) {
+        return p->branch_qn ? 0 : CBM_NOT_FOUND;
+    }
+
+    cbm_git_context_free(&p->git_ctx);
+    free(p->branch_qn);
+    p->branch_qn = NULL;
+
+    (void)cbm_git_context_resolve(p->repo_path, &p->git_ctx);
+    p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
+    p->git_context_resolved = true;
+    return p->branch_qn ? 0 : CBM_NOT_FOUND;
+}
+
 void cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
     if (!p || !name) return;
     free(p->project_name);
     p->project_name = cbm_strdup(name);
+    free(p->branch_qn);
+    p->branch_qn = p->git_context_resolved
+                       ? cbm_git_context_branch_qn(p->project_name, &p->git_ctx)
+                       : NULL;
 }
 
 void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store) {
@@ -653,6 +674,8 @@ int cbm_pipeline_ensure_file_structure(cbm_gbuf_t *gbuf, const char *project,
 
 static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int file_count) {
     cbm_log_info("pass.start", "pass", "structure", "files", itoa_buf(file_count));
+
+    (void)cbm_pipeline_ensure_git_context(p);
 
     /* Project node */
     cbm_gbuf_upsert_node(p->gbuf, "Project", p->project_name, p->project_name, NULL, 0, 0, "{}");
@@ -1348,6 +1371,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p->flush_store) {
         rc = try_incremental_or_reindex(p, files, file_count);
         if (rc >= 0) {
+            CBM_PROF_END("pipeline", "TOTAL", t_pipeline_total);
             cbm_discover_free(files, file_count);
             return rc;
         }

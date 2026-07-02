@@ -1370,26 +1370,33 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     }
 
     /* Open existing disk DB */
+    CBM_PROF_START(t_incr_open_db);
     cbm_store_t *store = cbm_store_open_path(db_path);
+    CBM_PROF_END("incremental", "1_open_db", t_incr_open_db);
     if (!store) {
         cbm_log_error("incremental.err", "msg", "open_db_failed", "path", db_path);
         return CBM_NOT_FOUND;
     }
 
     /* Load stored file hashes */
+    CBM_PROF_START(t_incr_load_hashes);
     cbm_file_hash_t *stored = NULL;
     int stored_count = 0;
     cbm_store_get_file_hashes(store, project, &stored, &stored_count);
+    CBM_PROF_END_N("incremental", "2_load_hashes", t_incr_load_hashes, stored_count);
 
     /* Classify stored/current files once. This shared result is the future
      * route-decision boundary for exact delta and the existing containment path. */
+    CBM_PROF_START(t_incr_classify);
     cbm_incr_classification_t cls = {0};
     if (incr_classification_build(p, store, project, files, file_count, stored, stored_count,
                                   pass_fingerprint, &cls) != 0) {
+        CBM_PROF_END_N("incremental", "3_classify_failed", t_incr_classify, file_count);
         cbm_store_free_file_hashes(stored, stored_count);
         cbm_store_close(store);
         return CBM_NOT_FOUND;
     }
+    CBM_PROF_END_N("incremental", "3_classify", t_incr_classify, file_count);
 
     char changed_buf[INCR_TS_BUF];
     char unchanged_buf[INCR_TS_BUF];
@@ -1410,17 +1417,21 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * cheap metadata path. Refresh failure is nonfatal; graph state is already
      * current and a later run can hash-confirm again. */
     if (cls.n_changed == 0 && cls.deleted_count == 0) {
+        CBM_PROF_START(t_incr_noop_refresh);
         if (cls.n_metadata_only > 0 &&
             persist_hashes(store, project, files, file_count, cls.mode_skipped,
                            cls.mode_skipped_count) != CBM_STORE_OK) {
             cbm_log_warn("incremental.noop_metadata_refresh_failed", "count",
                          itoa_buf_incr(cls.n_metadata_only));
         }
+        CBM_PROF_END_N("incremental", "4_noop_metadata_refresh", t_incr_noop_refresh,
+                       cls.n_metadata_only);
         cbm_log_info("incremental.noop", "reason", "no_changes");
         cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_NOOP);
         incr_classification_free(&cls);
         cbm_store_free_file_hashes(stored, stored_count);
         cbm_store_close(store);
+        CBM_PROF_END_N("incremental", "TOTAL", t0, file_count);
         return 0;
     }
 
