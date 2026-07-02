@@ -3,6 +3,7 @@
 #include "git/git_command.h"
 
 #include "foundation/compat.h"
+#include "foundation/platform.h"
 #include "foundation/str_util.h"
 
 #include <ctype.h>
@@ -10,7 +11,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
 static bool path_is_absolute(const char *path) {
     if (!path || !path[0]) {
@@ -138,8 +138,7 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
         return CBM_NOT_FOUND;
     }
 
-    struct stat st;
-    out->root_exists = (stat(path, &st) == 0);
+    out->root_exists = cbm_file_exists(path);
     if (!out->root_exists) {
         return 0;
     }

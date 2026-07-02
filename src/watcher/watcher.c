@@ -26,6 +26,7 @@
 #include "foundation/compat.h"
 #include "foundation/compat_thread.h"
 #include "foundation/compat_fs.h"
+#include "foundation/platform.h"
 #include "foundation/str_util.h"
 
 #include <stdio.h>
@@ -33,7 +34,6 @@
 #include <string.h>
 #include <time.h>
 #include <stdatomic.h>
-#include <sys/stat.h>
 
 /* ── Constants ─────────────────────────────────────────────────── */
 
@@ -258,8 +258,7 @@ int cbm_watcher_watch_count(cbm_watcher_t *w) {
 
 /* Init baseline for a project: check if git, get HEAD, count files */
 static void init_baseline(project_state_t *s, const cbm_watcher_t *w) {
-    struct stat st;
-    if (stat(s->root_path, &st) != 0) {
+    if (!cbm_file_exists(s->root_path)) {
         cbm_log_warn("watcher.root_gone", "project", s->project_name, "path", s->root_path);
         s->baseline_done = true;
         s->is_git = false;
