@@ -799,12 +799,7 @@ static bool mcp_test_upsert_fts_node(cbm_store_t *st, const char *project, const
 }
 
 static int mcp_test_rebuild_nodes_fts(cbm_store_t *st) {
-    cbm_store_exec(st, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
-    return cbm_store_exec(st,
-                          "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
-                          "file_path) "
-                          "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
-                          "FROM nodes;");
+    return cbm_store_rebuild_nodes_fts(st);
 }
 
 TEST(tool_search_graph_query_sees_file_delta_fts_updates) {
@@ -1747,6 +1742,24 @@ TEST(tool_index_repository_reports_incremental_containment_reason) {
     ASSERT_NOT_NULL(strstr(resp, "indexed"));
     free(resp);
 
+    char *project = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(project);
+    n = snprintf(req, sizeof(req),
+                 "{\"jsonrpc\":\"2.0\",\"id\":411,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"search_graph\","
+                 "\"arguments\":{\"project\":\"%s\",\"query\":\"Helper\",\"limit\":5}}}",
+                 project);
+    ASSERT(n >= 0 && (size_t)n < sizeof(req));
+    resp = cbm_mcp_server_handle(srv, req);
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+    ASSERT_NOT_NULL(strstr(inner, "Helper"));
+    free(inner);
+    free(resp);
+    free(project);
+
     ASSERT_EQ(th_write_file(TH_PATH(repo, "main.go"),
                             "package main\n\nfunc main() {\n\tHelper()\n\tLeaf()\n}\n\n"
                             "func NewMain() int {\n\treturn 11\n}\n"),
@@ -1768,7 +1781,7 @@ TEST(tool_index_repository_reports_incremental_containment_reason) {
     ASSERT(n >= 0 && (size_t)n < sizeof(req));
     resp = cbm_mcp_server_handle(srv, req);
     ASSERT_NOT_NULL(resp);
-    char *inner = extract_text_content(resp);
+    inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "\"publish_kind\":\"incremental_containment\""));
     ASSERT_NOT_NULL(strstr(inner, "\"publish_reason\":\"changed_batch_too_large\""));

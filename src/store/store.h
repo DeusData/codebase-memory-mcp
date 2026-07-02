@@ -957,4 +957,8 @@ int cbm_store_count_vectors(cbm_store_t *s, const char *project);
  * Returns CBM_STORE_OK on success. */
 int cbm_store_exec(cbm_store_t *s, const char *sql);
 
+/* Rebuild the contentless nodes_fts index from nodes.
+ * Returns OK when FTS5 is unavailable so indexing still works without FTS. */
+int cbm_store_rebuild_nodes_fts(cbm_store_t *s);
+
 #endif /* CBM_STORE_H */

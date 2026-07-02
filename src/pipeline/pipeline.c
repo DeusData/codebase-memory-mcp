@@ -1586,6 +1586,14 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
                         goto cleanup;
                     }
                 }
+                int fts_rc = cbm_store_rebuild_nodes_fts(hash_store);
+                if (fts_rc != CBM_STORE_OK) {
+                    cbm_log_error("pipeline.err", "phase", "rebuild_nodes_fts", "rc",
+                                  itoa_buf(fts_rc));
+                    cbm_store_close(hash_store);
+                    rc = fts_rc;
+                    goto cleanup;
+                }
                 cbm_store_close(hash_store);
                 cbm_log_info("pass.timing", "pass", "persist_hashes", "files",
                              itoa_buf(file_count));
