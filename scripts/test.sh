@@ -57,8 +57,8 @@ verify_compiler "$CC"
 # Step 1: Clean
 scripts/clean.sh
 
-# Step 2 + 3: Build and run tests (with arch prefix on macOS)
-$ARCH_PREFIX make -j"$NPROC" -f Makefile.cbm test $MAKE_ARGS
+# Step 2 + 3: Build and run tests (Makefile applies $ARCHFLAGS on macOS)
+make -j"$NPROC" -f Makefile.cbm test $MAKE_ARGS
 
 # Step 4: C++ large-TU index-hang regression guard (#410). Runs the PROD binary
 # in a subprocess with a wall-clock timeout — a hang must fail, not block the run.
@@ -72,7 +72,7 @@ fi
 # Step 5: Parent-death watchdog regression (#406/#407). Builds the prod stdio
 # binary and verifies it self-exits when its launching parent is killed.
 echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
-$ARCH_PREFIX make -j"$NPROC" -f Makefile.cbm cbm $MAKE_ARGS
+make -j"$NPROC" -f Makefile.cbm cbm $MAKE_ARGS
 bash "$ROOT/tests/test_parent_watchdog.sh"
 
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain

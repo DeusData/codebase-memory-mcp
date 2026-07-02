@@ -12,6 +12,15 @@
 # Linux: gcc/g++ — system default with full sanitizer support
 # CI scripts pass CC/CXX explicitly; don't rely on defaults here
 
+# Target architecture (macOS): build.sh/test.sh export ARCHFLAGS="-arch <arch>"
+# (see scripts/env.sh). Fold it into the compiler drivers with `override` so it
+# reaches EVERY compile and link recipe — including the vendored objects below
+# that use their own *_CFLAGS — and so it survives a command-line `CC=` override.
+# ARCHFLAGS is empty on Linux/Windows and for native direct `make` invocations,
+# leaving CC/CXX unchanged there.
+override CC := $(CC) $(ARCHFLAGS)
+override CXX := $(CXX) $(ARCHFLAGS)
+
 # ── Common flags ─────────────────────────────────────────────────
 
 # Include paths for:

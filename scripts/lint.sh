@@ -36,11 +36,11 @@ bash "$ROOT/scripts/check-no-test-skips.sh"
 
 if $CI_ONLY; then
     echo "=== CI mode: cppcheck + clang-format ==="
-    $ARCH_PREFIX make -j2 -f Makefile.cbm lint-ci "${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}"
+    make -j2 -f Makefile.cbm lint-ci "${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}"
     echo "=== CI linters passed ==="
 else
     echo "=== Full lint: clang-tidy + cppcheck + clang-format ==="
-    $ARCH_PREFIX make -j3 -f Makefile.cbm lint "${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}"
+    make -j3 -f Makefile.cbm lint "${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}"
 fi
 
 echo "=== All linters passed ==="
