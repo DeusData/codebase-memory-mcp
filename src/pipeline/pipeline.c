@@ -62,7 +62,12 @@ bool cbm_pipeline_try_lock(void) {
     return atomic_exchange(&g_pipeline_busy, 1) == 0;
 }
 
-#define LOCK_SPIN_NS 100000000 /* 100ms between lock retries */
+/* Retry interval for the blocking global pipeline lock. This is a polling
+ * interval, not a user-visible timeout; keep it named and derived from the
+ * shared time-unit constants so the latency tradeoff is easy to audit. */
+#define CBM_PIPELINE_LOCK_RETRY_MS 100L
+#define CBM_PIPELINE_LOCK_RETRY_NS \
+    (CBM_PIPELINE_LOCK_RETRY_MS * (long)CBM_NSEC_PER_MSEC)
 
 typedef enum {
     CBM_INCREMENTAL_REINDEX_FAST = 0,
@@ -72,7 +77,7 @@ typedef enum {
 
 void cbm_pipeline_lock(void) {
     while (atomic_exchange(&g_pipeline_busy, 1) != 0) {
-        struct timespec ts = {0, LOCK_SPIN_NS};
+        struct timespec ts = {0, CBM_PIPELINE_LOCK_RETRY_NS};
         cbm_nanosleep(&ts, NULL);
     }
 }
