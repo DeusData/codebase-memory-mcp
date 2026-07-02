@@ -477,6 +477,8 @@ TEST(default_tool_autoindex_description_is_precise) {
     ASSERT_NOT_NULL(strstr(json, "search_code searches"));
     ASSERT_NOT_NULL(strstr(json, "already indexed/current project"));
     ASSERT_NOT_NULL(strstr(json, "Does not index projects"));
+    ASSERT_NOT_NULL(strstr(json, "Use file_pattern to narrow traversal"));
+    ASSERT_NOT_NULL(strstr(json, "anchored literal file regexes"));
     ASSERT_NULL(strstr(json, "Default tools auto-index"));
     ASSERT_NULL(strstr(json, "INSTEAD OF"));
 
