@@ -1639,8 +1639,9 @@ int cbm_remove_codex_mcp(const char *config_path) {
  * and NO newlines. (issues #330 + Gemini/Antigravity parity) */
 #define CMM_SESSION_REMINDER_CMD                                                    \
     "echo \"Code discovery: prefer codebase-memory-mcp (search_graph, trace_path, " \
-    "get_code, query_graph, search_code) over grep/file-read; graph-backed tools "  \
-    "auto-index CWD or explicit repo paths when auto_index=true and under "         \
+    "get_code, query_graph, search_code) before broad grep for structural code "    \
+    "discovery; graph-backed tools auto-index the MCP server CWD or explicit repo " \
+    "paths when auto_index=true and under "                                        \
     "auto_index_limit; search_code needs an indexed project; call _hidden_tools "   \
     "for explicit index_repository.\""
 
