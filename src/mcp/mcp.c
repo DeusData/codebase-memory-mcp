@@ -80,6 +80,7 @@ enum {
 #include <sys/stat.h>
 #include <time.h>
 #include <errno.h>
+#include <stdatomic.h>
 
 /* ── Constants ────────────────────────────────────────────────── */
 
@@ -1067,7 +1068,7 @@ struct cbm_mcp_server {
     bool out_content_length_framed; /* true while handling Content-Length-framed requests */
 
     /* Active pipeline tracking for cancellation support */
-    cbm_pipeline_t *active_pipeline; /* non-NULL while index_repository runs */
+    _Atomic(cbm_pipeline_t *) active_pipeline; /* non-NULL while index_repository runs */
     int64_t active_request_id;       /* JSON-RPC id of the in-progress tool call */
 };
 
@@ -1391,7 +1392,7 @@ bool cbm_mcp_server_has_cached_store(cbm_mcp_server_t *srv) {
 }
 
 cbm_pipeline_t *cbm_mcp_server_active_pipeline(cbm_mcp_server_t *srv) {
-    return srv ? srv->active_pipeline : NULL;
+    return srv ? atomic_load_explicit(&srv->active_pipeline, memory_order_acquire) : NULL;
 }
 
 /* ── Cache dir + project DB path helpers ───────────────────────── */
@@ -4990,12 +4991,12 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
      * Track active pipeline so signal handler and notifications/cancelled
      * can cancel it mid-run. */
     cbm_pipeline_lock();
-    srv->active_pipeline = p;
+    atomic_store_explicit(&srv->active_pipeline, p, memory_order_release);
     int rc = cbm_pipeline_run(p);
     bool graph_changed = cbm_pipeline_graph_changed(p);
     cbm_pipeline_publish_kind_t publish_kind = cbm_pipeline_publish_kind(p);
     const char *publish_reason = cbm_pipeline_publish_reason(p);
-    srv->active_pipeline = NULL;
+    atomic_store_explicit(&srv->active_pipeline, NULL, memory_order_release);
     cbm_pipeline_unlock();
 
     /* Capture the excluded-subtree list (#411) while the pipeline (which owns
@@ -8151,8 +8152,10 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     if (!req.has_id) {
         if (req.method && strcmp(req.method, "notifications/cancelled") == 0) {
             /* MCP cancellation: cancel the active pipeline if request ID matches */
-            if (srv->active_pipeline) {
-                cbm_pipeline_cancel(srv->active_pipeline);
+            cbm_pipeline_t *active =
+                atomic_load_explicit(&srv->active_pipeline, memory_order_acquire);
+            if (active) {
+                cbm_pipeline_cancel(active);
                 cbm_log_info("mcp.cancelled", "request_id_active",
                              srv->active_request_id > 0 ? "yes" : "none");
             }
