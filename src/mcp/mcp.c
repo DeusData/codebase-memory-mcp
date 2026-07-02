@@ -58,6 +58,7 @@ enum {
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
+#include "foundation/profile.h"
 #include "foundation/str_util.h"
 #include "foundation/dump_verify.h"
 #include "foundation/compat_regex.h"
@@ -5006,7 +5007,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     int excluded_count = 0;
     cbm_pipeline_get_excluded(p, &excluded_dirs, &excluded_count);
 
+    CBM_PROF_START(prof_index_mem_collect);
     cbm_mem_collect(); /* return mimalloc pages to OS after large indexing */
+    CBM_PROF_END("index_repository", "post_mem_collect", prof_index_mem_collect);
 
     /* Invalidate cached store so next query reopens the fresh database */
     if (srv->owns_store && srv->store) {
@@ -5030,34 +5033,45 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_bool(doc, root, "graph_changed", graph_changed);
 
     if (rc == 0) {
+        CBM_PROF_START(prof_index_resolve_store);
         cbm_store_t *store = resolve_store(srv, project_name);
+        CBM_PROF_END("index_repository", "resolve_store", prof_index_resolve_store);
         if (store) {
             /* Auto-detect ecosystem and index installed deps from fresh graph.
              * Queries manifest files already indexed by pipeline step 1. */
+            CBM_PROF_START(prof_index_deps);
             int deps_reindexed = cbm_dep_auto_index(
                 project_name, repo_path, store, CBM_DEFAULT_AUTO_DEP_LIMIT, srv->config);
+            CBM_PROF_END("index_repository", "dep_auto_index", prof_index_deps);
 
+            CBM_PROF_START(prof_index_rank_refresh);
             (void)cbm_pagerank_refresh_if_needed(
                 store, project_name, srv->config, graph_changed, deps_reindexed,
                 publish_kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+            CBM_PROF_END("index_repository", "rank_refresh", prof_index_rank_refresh);
             /* Register project with watcher so future file changes trigger auto-reindex */
             if (srv->watcher)
                 cbm_watcher_watch(srv->watcher, project_name, repo_path);
 
+            CBM_PROF_START(prof_index_counts);
             int nodes = cbm_store_count_nodes(store, project_name);
             int edges = cbm_store_count_edges(store, project_name);
+            CBM_PROF_END("index_repository", "count_graph", prof_index_counts);
             yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
             yyjson_mut_obj_add_int(doc, root, "edges", edges);
             if (deps_reindexed > 0)
                 yyjson_mut_obj_add_int(doc, root, "dependencies_indexed", deps_reindexed);
 
+            CBM_PROF_START(prof_index_ecosystem);
             cbm_pkg_manager_t eco = cbm_detect_ecosystem(repo_path);
+            CBM_PROF_END("index_repository", "detect_ecosystem", prof_index_ecosystem);
             if (eco != CBM_PKG_COUNT)
                 yyjson_mut_obj_add_str(doc, root, "detected_ecosystem",
                                        cbm_pkg_manager_str(eco));
 
 
             /* Check ADR presence and suggest creation if missing */
+            CBM_PROF_START(prof_index_adr);
             char adr_path[CBM_SZ_4K];
             int adr_len = snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md",
                                    repo_path);
@@ -5071,6 +5085,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
                     "explore the codebase with get_architecture(aspects=['all']), then use "
                     "manage_adr(mode='store') to persist architectural insights across MCP server runs.");
             }
+            CBM_PROF_END("index_repository", "adr_check", prof_index_adr);
         }
     }
 
@@ -5096,6 +5111,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     /* Notify resource-capable clients that graph data changed */
     if (rc == 0) notify_resources_updated(srv);
 
+    CBM_PROF_START(prof_index_serialize);
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     /* Free the pipeline only after the response doc copied the excluded list. */
@@ -5105,6 +5121,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     char *result = cbm_mcp_text_result(json, rc != 0);
     free(json);
+    CBM_PROF_END("index_repository", "serialize_cleanup", prof_index_serialize);
     return result;
 }
 
