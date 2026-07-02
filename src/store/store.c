@@ -1336,8 +1336,10 @@ int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) 
         out->name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
         out->indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
         out->root_path = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
+        sqlite3_reset(stmt);
         return CBM_STORE_OK;
     }
+    sqlite3_reset(stmt);
     return CBM_STORE_NOT_FOUND;
 }
 
@@ -1353,8 +1355,14 @@ int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
     int cap = ST_INIT_CAP_8;
     int n = 0;
     cbm_project_t *arr = malloc(cap * sizeof(cbm_project_t));
+    if (!arr) {
+        sqlite3_reset(stmt);
+        store_set_error(s, "list_projects out of memory");
+        return CBM_STORE_ERR;
+    }
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         if (n >= cap) {
             cap *= ST_GROWTH;
             arr = safe_realloc(arr, cap * sizeof(cbm_project_t));
@@ -1364,6 +1372,13 @@ int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
         arr[n].root_path = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
         n++;
     }
+    if (step_rc != SQLITE_DONE) {
+        cbm_store_free_projects(arr, n);
+        sqlite3_reset(stmt);
+        store_set_error_sqlite(s, "list_projects");
+        return CBM_STORE_ERR;
+    }
+    sqlite3_reset(stmt);
 
     *out = arr;
     *count = n;

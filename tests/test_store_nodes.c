@@ -273,6 +273,27 @@ TEST(store_project_crud) {
     PASS();
 }
 
+TEST(store_project_reads_reset_cached_statements) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "myproject", "/home/user/myproject"), CBM_STORE_OK);
+
+    cbm_project_t p = {0};
+    ASSERT_EQ(cbm_store_get_project(s, "myproject", &p), CBM_STORE_OK);
+    cbm_project_free_fields(&p);
+
+    cbm_project_t *projects = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_list_projects(s, &projects, &count), CBM_STORE_OK);
+    cbm_store_free_projects(projects, count);
+
+    ASSERT_EQ(cbm_store_drop_indexes(s), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_create_indexes(s), CBM_STORE_OK);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_project_update) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/old/path");
@@ -3591,6 +3612,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_integrity_null_check);
     RUN_TEST(store_integrity_full_path_only_classification);
     RUN_TEST(store_project_crud);
+    RUN_TEST(store_project_reads_reset_cached_statements);
     RUN_TEST(store_project_update);
     RUN_TEST(store_project_delete);
     RUN_TEST(store_node_crud);
