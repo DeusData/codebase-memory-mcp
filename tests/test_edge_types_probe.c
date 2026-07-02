@@ -142,6 +142,66 @@ static int et_edge_present(const EtFile *files, int nfiles, const char *edge, in
     return got >= floor;
 }
 
+enum { ET_ROUTE_ASSERT_MAX = 16 };
+
+/* Assert the exact Route node set. Edge-count smoke tests cannot catch partial
+ * Spring paths such as "/orders" when the real route is "/api/orders", and a
+ * presence-only assertion would still allow stale partial Route nodes to leak. */
+static int et_routes_exact(const EtFile *files, int nfiles, const char **routes) {
+    EtProj lp;
+    cbm_store_t *store = et_index_files(&lp, files, nfiles);
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    int wanted = 0;
+    int found[ET_ROUTE_ASSERT_MAX] = {0};
+    int ok = store != NULL;
+
+    while (routes[wanted] && wanted < ET_ROUTE_ASSERT_MAX) {
+        wanted++;
+    }
+    if (routes[wanted]) {
+        ok = 0;
+    }
+
+    if (!store || cbm_store_find_nodes_by_label(store, lp.project, "Route", &nodes, &node_count) !=
+                      CBM_STORE_OK) {
+        ok = 0;
+    } else {
+        if (node_count != wanted) {
+            ok = 0;
+        }
+        for (int wi = 0; wi < wanted; wi++) {
+            for (int ni = 0; ni < node_count; ni++) {
+                if (nodes[ni].name && strcmp(nodes[ni].name, routes[wi]) == 0) {
+                    found[wi] = 1;
+                    break;
+                }
+            }
+            if (!found[wi]) {
+                ok = 0;
+            }
+        }
+    }
+
+    if (!ok) {
+        fprintf(stderr, "  [ET-ROUTE] FAIL expected=%d actual=%d missing:", wanted, node_count);
+        for (int wi = 0; wi < wanted; wi++) {
+            if (!found[wi]) {
+                fprintf(stderr, " %s", routes[wi]);
+            }
+        }
+        fprintf(stderr, " available:");
+        for (int ni = 0; ni < node_count && ni < ET_ROUTE_ASSERT_MAX; ni++) {
+            fprintf(stderr, " %s", nodes[ni].name ? nodes[ni].name : "<null>");
+        }
+        fprintf(stderr, "\n");
+    }
+
+    cbm_store_free_nodes(nodes, node_count);
+    et_cleanup(&lp, store);
+    return ok;
+}
+
 /* Index meaningful[] plus PARALLEL_PAD_FILES trivial pad files to force the
  * parallel pipeline path (MIN_FILES_FOR_PARALLEL = 50). */
 enum { ET_PARALLEL_PAD = 52, ET_PAD_MAX = 68 /* 52 pad + 16 meaningful */ };
@@ -277,13 +337,12 @@ TEST(handles_gin_go) {
     PASS();
 }
 
-/* Spring (Java) — @RequestMapping decorator sets route_path in extraction.
- * REAL BUG: internal/cbm/extract_defs.c:extract_route_from_decorators only walks
- * ts_node_prev_sibling(func) for decorator nodes of type "call".  Java annotations
- * (@GetMapping/@RequestMapping) live INSIDE the method's `modifiers` child (not a
- * prev_sibling) and are `annotation`/`marker_annotation` nodes (not `call`), so
- * route_path is never set → no Route/HANDLES for Spring controllers. */
+/* Spring (Java) — class-level @RequestMapping must prefix method mappings.
+ * Reproduce-first: a HANDLES count alone can pass with partial routes
+ * ("/orders"), but callers/search_graph need the actual endpoint names
+ * ("/api/orders"). */
 TEST(handles_spring_java) {
+    static const char *routes[] = {"/api/orders", "/api/orders/{id}", NULL};
     static const EtFile f[] = {
         {"OrderController.java",
          "package com.example;\n\n"
@@ -296,31 +355,29 @@ TEST(handles_spring_java) {
          "    @GetMapping(\"/orders/{id}\")\n"
          "    public String getOrder(int id) {\n"
          "        return \"order:\" + id;\n    }\n}\n"}};
-    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
+    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 2));
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
 
-/* Spring (Kotlin) — @RequestMapping/@GetMapping on a Kotlin @RestController.
- * REAL BUG: tree-sitter-kotlin annotation nodes have no `name` field (the name
- * lives in a nested user_type/type_identifier) and carry args under a
- * constructor_invocation `value_arguments` node, so the Java-shaped
- * ts_node_child_by_field_name(annotation, "name") / "arguments" lookups in
- * try_route_from_annotation missed every Kotlin Spring route → route_path never
- * set → no Route/HANDLES. Fixed by annotation_name_node/annotation_args_node. */
+/* Spring (Kotlin) — same prefix contract, including Kotlin's named array form
+ * for class-level RequestMapping values. */
 TEST(handles_spring_kotlin) {
+    static const char *routes[] = {"/internal/v1/api/orders", "/internal/v1/api/orders/{id}", NULL};
     static const EtFile f[] = {
         {"OrderController.kt",
          "package com.example\n\n"
          "import org.springframework.web.bind.annotation.RequestMapping\n"
          "import org.springframework.web.bind.annotation.GetMapping\n\n"
-         "@RequestMapping(\"/api\")\nclass OrderController {\n"
+         "@RequestMapping(value = [\"/internal/v1/api\"])\nclass OrderController {\n"
          "    @GetMapping(\"/orders\")\n"
          "    fun listOrders(): String {\n"
          "        return \"orders\"\n    }\n\n"
          "    @GetMapping(\"/orders/{id}\")\n"
          "    fun getOrder(id: Int): String {\n"
          "        return \"order:\" + id\n    }\n}\n"}};
-    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
+    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 2));
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
 
