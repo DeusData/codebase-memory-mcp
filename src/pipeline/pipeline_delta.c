@@ -248,6 +248,9 @@ static int delta_grow(void **items, int *cap, size_t item_sz) {
     if (!items || !cap || item_sz == 0) {
         return CBM_STORE_ERR;
     }
+    if (*cap > INT_MAX / CBM_DELTA_GROWTH) {
+        return CBM_STORE_ERR;
+    }
     int new_cap = (*cap > 0) ? *cap * CBM_DELTA_GROWTH : CBM_SZ_8;
     void *tmp = realloc(*items, (size_t)new_cap * item_sz);
     if (!tmp) {
@@ -1115,6 +1118,10 @@ static int delta_plan_append_affected_path(cbm_pipeline_file_delta_plan_t *plan,
     }
     char *dup = delta_strdup(path);
     if (!dup) {
+        return CBM_STORE_ERR;
+    }
+    if (plan->affected_count == INT_MAX) {
+        free(dup);
         return CBM_STORE_ERR;
     }
     char **next =
