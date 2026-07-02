@@ -23,9 +23,12 @@
  * only from py_lsp.c, never compiled standalone. */
 #include "py_builtins.c"
 
+#define PY_LSP_MAX_EVAL_DEPTH 64
+
 // Forward decls
 static void py_resolve_calls_in(PyLSPContext *ctx, TSNode node);
 static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node);
+static const CBMType *py_eval_expr_type_inner(PyLSPContext *ctx, TSNode node);
 static void py_process_statement(PyLSPContext *ctx, TSNode node);
 static const CBMRegisteredFunc *py_lookup_attribute(PyLSPContext *ctx, const char *type_qn,
                                                     const char *member_name);
@@ -693,6 +696,18 @@ static const CBMType *py_iterable_element_type(PyLSPContext *ctx, const CBMType 
 }
 
 static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node) {
+    if (!ctx || ts_node_is_null(node))
+        return cbm_type_unknown();
+    if (ctx->eval_depth >= PY_LSP_MAX_EVAL_DEPTH)
+        return cbm_type_unknown();
+
+    ctx->eval_depth++;
+    const CBMType *result = py_eval_expr_type_inner(ctx, node);
+    ctx->eval_depth--;
+    return result ? result : cbm_type_unknown();
+}
+
+static const CBMType *py_eval_expr_type_inner(PyLSPContext *ctx, TSNode node) {
     if (!ctx || ts_node_is_null(node))
         return cbm_type_unknown();
 

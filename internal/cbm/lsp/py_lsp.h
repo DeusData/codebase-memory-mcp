@@ -69,6 +69,9 @@ typedef struct {
     int dict_literal_count;
     int dict_literal_cap;
 
+    // Expression evaluator recursion depth guard.
+    int eval_depth;
+
     // Debug mode (CBM_LSP_DEBUG env, shared across all language LSPs).
     bool debug;
 } PyLSPContext;

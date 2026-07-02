@@ -487,6 +487,27 @@ TEST(lsp_cpp_deep_expression_no_crash) {
     PASS();
 }
 
+TEST(lsp_python_deep_expression_no_crash) {
+    /* Deep parenthesized expressions force repeated py_eval_expr_type
+     * recursion through assignment RHS inference. The evaluator should hit
+     * its depth cap and fall back to unknown instead of overflowing. */
+    const int DEPTH = 256;
+    size_t sz = (size_t)DEPTH * 2 + 256;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *p = src;
+    p += snprintf(p, sz, "def main():\n    value = ");
+    memset(p, '(', DEPTH);
+    p += DEPTH;
+    *p++ = '1';
+    memset(p, ')', DEPTH);
+    p += DEPTH;
+    snprintf(p, sz - (size_t)(p - src), "\n    return value\n");
+    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_PYTHON, "deep_expr.py"));
+    free(src);
+    PASS();
+}
+
 TEST(lsp_java_lambda_args_exceed_params_no_crash) {
     /* A call with MORE arguments than the resolved method's declared params:
      * bind_lambda_args indexed the NULL-terminated signature param_types array
@@ -528,6 +549,7 @@ SUITE(stack_overflow) {
     RUN_TEST(lsp_java_deep_nesting_no_crash);
     RUN_TEST(lsp_java_lambda_args_exceed_params_no_crash);
     RUN_TEST(lsp_cpp_deep_expression_no_crash);
+    RUN_TEST(lsp_python_deep_expression_no_crash);
     RUN_TEST(lsp_ts_cyclic_types_no_crash);
 
     RUN_TEST(js_calls_exceed_512);
