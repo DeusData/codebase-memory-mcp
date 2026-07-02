@@ -4259,9 +4259,12 @@ static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *
     }
 }
 
-/* Write indexed file list for scoped grep. Returns true if scoped. */
+/* Write indexed file list for scoped grep. Returns true if scoped.
+ * When path_filter is provided, apply it before grep so large indexed projects
+ * do not scan unrelated files only to discard them later. */
 static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, const char *root_path,
-                                  const char *filelist) {
+                                  const char *filelist, bool has_path_filter,
+                                  cbm_regex_t *path_regex) {
     cbm_store_t *pre_store = resolve_store(srv, project);
     if (!pre_store) {
         return false;
@@ -4276,6 +4279,13 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
     bool ok = false;
     if (fl) {
         for (int fi = 0; fi < indexed_count; fi++) {
+#ifdef _WIN32
+            cbm_normalize_path_sep(indexed_files[fi]);
+#endif
+            if (has_path_filter && path_regex &&
+                cbm_regexec(path_regex, indexed_files[fi], 0, NULL, 0) != CBM_REG_OK) {
+                continue;
+            }
             /* Use forward slashes so xargs doesn't interpret Windows
              * backslashes as escape sequences (e.g. \n becomes newline).
              * Binary mode to prevent CRLF (xargs would see trailing \r). */
@@ -4512,7 +4522,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     snprintf(filelist, sizeof(filelist), "%s.files", tmpfile);
     bool scoped = false;
 
-    scoped = write_scoped_filelist(srv, project, root_path, filelist);
+    scoped = write_scoped_filelist(srv, project, root_path, filelist, has_path_filter,
+                                   has_path_filter ? &path_regex : NULL);
 
     char cmd[CBM_SZ_4K];
     build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist, root_path);
