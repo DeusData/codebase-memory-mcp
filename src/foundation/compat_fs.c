@@ -202,7 +202,9 @@ int cbm_rmdir(const char *path) {
  * Returns a heap-allocated wide string, or NULL on allocation failure.
  * Quoting follows the MSVC CRT convention: arguments containing spaces,
  * tabs, or double-quotes are wrapped in double-quotes, with backslashes
- * before a closing quote doubled and the quote itself escaped.
+ * before a closing quote doubled and the quote itself escaped. Argument
+ * bytes are treated as UTF-8 and converted to wide via cbm_utf8_to_wide,
+ * so non-ASCII arguments (e.g. a non-ASCII %USERPROFILE%) survive intact.
  * Declared in compat_fs_internal.h so the test suite can drive it. */
 wchar_t *cbm_build_cmdline(const char *const *argv) {
     /* First pass: compute required buffer size. */
@@ -239,13 +241,18 @@ wchar_t *cbm_build_cmdline(const char *const *argv) {
         }
     }
 
-    wchar_t *out = (wchar_t *)malloc(total * sizeof(wchar_t));
-    if (!out) {
+    /* Build the quoted command line in UTF-8 first, then widen it as a
+     * whole via cbm_utf8_to_wide. Every character the quoting logic acts
+     * on (space, tab, '"', '\\') is ASCII and, by UTF-8's design, never
+     * appears inside a multibyte sequence, so operating on raw bytes here
+     * is safe and keeps multibyte argument bytes intact for conversion. */
+    char *buf = (char *)malloc(total);
+    if (!buf) {
         return NULL;
     }
 
-    /* Second pass: write the command line. */
-    wchar_t *w = out;
+    /* Second pass: write the command line bytes. */
+    char *w = buf;
     for (int i = 0; argv[i]; i++) {
         const char *arg = argv[i];
         bool needs_quote = (arg[0] == '\0');
@@ -256,40 +263,43 @@ wchar_t *cbm_build_cmdline(const char *const *argv) {
             }
         }
         if (i > 0) {
-            *w++ = L' ';
+            *w++ = ' ';
         }
         if (needs_quote) {
-            *w++ = L'"';
+            *w++ = '"';
             size_t backslashes = 0;
             for (const char *p = arg; *p; p++) {
                 if (*p == '\\') {
                     backslashes++;
-                    *w++ = L'\\';
+                    *w++ = '\\';
                 } else if (*p == '"') {
                     /* Double the preceding backslashes, then escape the quote. */
                     for (size_t b = 0; b < backslashes; b++) {
-                        *w++ = L'\\';
+                        *w++ = '\\';
                     }
-                    *w++ = L'\\';
-                    *w++ = L'"';
+                    *w++ = '\\';
+                    *w++ = '"';
                     backslashes = 0;
                 } else {
                     backslashes = 0;
-                    *w++ = (wchar_t)(unsigned char)*p;
+                    *w++ = *p;
                 }
             }
             /* Double trailing backslashes before the closing quote. */
             for (size_t b = 0; b < backslashes; b++) {
-                *w++ = L'\\';
+                *w++ = '\\';
             }
-            *w++ = L'"';
+            *w++ = '"';
         } else {
             for (const char *p = arg; *p; p++) {
-                *w++ = (wchar_t)(unsigned char)*p;
+                *w++ = *p;
             }
         }
     }
-    *w = L'\0';
+    *w = '\0';
+
+    wchar_t *out = cbm_utf8_to_wide(buf);
+    free(buf);
     return out;
 }
 
