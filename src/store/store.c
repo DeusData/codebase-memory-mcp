@@ -6282,6 +6282,97 @@ static int search_build_where(const cbm_search_params_t *params, char *where, in
     return nparams;
 }
 
+static int search_execute_sql(cbm_store_t *s, const char *sql, const char *count_sql,
+                              search_bind_t *binds, int bind_idx,
+                              search_like_pool_t *like_pool, bool use_pagerank,
+                              const char *op, cbm_search_output_t *out) {
+    enum {
+        SEARCH_COL_IN_DEG = ST_COL_9,
+        SEARCH_COL_OUT_DEG = CBM_DECIMAL_BASE,
+        SEARCH_COL_PAGERANK = 11
+    };
+    const char *op_base = op ? op : "search";
+    char prepare_op[CBM_SZ_128];
+    char step_op[CBM_SZ_128];
+    snprintf(prepare_op, sizeof(prepare_op), "%s prepare", op_base);
+    snprintf(step_op, sizeof(step_op), "%s step", op_base);
+
+    sqlite3_stmt *cnt_stmt = NULL;
+    int rc = sqlite3_prepare_v2(s->db, count_sql, CBM_NOT_FOUND, &cnt_stmt, NULL);
+    if (rc == SQLITE_OK) {
+        for (int i = 0; i < bind_idx; i++) {
+            bind_text(cnt_stmt, i + SKIP_ONE, binds[i].text);
+        }
+        if (sqlite3_step(cnt_stmt) == SQLITE_ROW) {
+            out->total = sqlite3_column_int(cnt_stmt, 0);
+        }
+        sqlite3_finalize(cnt_stmt);
+    }
+
+    sqlite3_stmt *main_stmt = NULL;
+    rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &main_stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_set_error_sqlite(s, prepare_op);
+        like_pool_free(like_pool);
+        return CBM_STORE_ERR;
+    }
+
+    for (int i = 0; i < bind_idx; i++) {
+        bind_text(main_stmt, i + SKIP_ONE, binds[i].text);
+    }
+
+    int cap = ST_INIT_CAP_16;
+    int n = 0;
+    cbm_search_result_t *results = calloc((size_t)cap, sizeof(cbm_search_result_t));
+    if (!results) {
+        sqlite3_finalize(main_stmt);
+        like_pool_free(like_pool);
+        store_set_error(s, "search out of memory");
+        return CBM_STORE_ERR;
+    }
+
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(main_stmt)) == SQLITE_ROW) {
+        if (n >= cap) {
+            if (store_grow_array(s, (void **)&results, &cap, sizeof(*results),
+                                 "search out of memory", true) != CBM_STORE_OK) {
+                cbm_search_output_t partial = {.results = results, .count = n};
+                cbm_store_search_free(&partial);
+                sqlite3_finalize(main_stmt);
+                like_pool_free(like_pool);
+                return CBM_STORE_ERR;
+            }
+        }
+        if (scan_node(s, main_stmt, &results[n].node) != CBM_STORE_OK) {
+            cbm_search_output_t partial = {.results = results, .count = n + 1};
+            cbm_store_search_free(&partial);
+            sqlite3_finalize(main_stmt);
+            like_pool_free(like_pool);
+            return CBM_STORE_ERR;
+        }
+        results[n].in_degree = sqlite3_column_int(main_stmt, SEARCH_COL_IN_DEG);
+        results[n].out_degree = sqlite3_column_int(main_stmt, SEARCH_COL_OUT_DEG);
+        results[n].pagerank_score =
+            use_pagerank ? sqlite3_column_double(main_stmt, SEARCH_COL_PAGERANK) : 0.0;
+        n++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        cbm_search_output_t partial = {.results = results, .count = n};
+        cbm_store_search_free(&partial);
+        sqlite3_finalize(main_stmt);
+        like_pool_free(like_pool);
+        store_set_error_sqlite(s, step_op);
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_finalize(main_stmt);
+    like_pool_free(like_pool);
+
+    out->results = results;
+    out->count = n;
+    return CBM_STORE_OK;
+}
+
 int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_search_output_t *out) {
     memset(out, 0, sizeof(*out));
     if (!s || !s->db) {
@@ -6479,84 +6570,148 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     }
     strncat(sql, order_limit, sizeof(sql) - strlen(sql) - 1);
 
-    /* Execute count query */
-    sqlite3_stmt *cnt_stmt = NULL;
-    int rc = sqlite3_prepare_v2(s->db, count_sql, CBM_NOT_FOUND, &cnt_stmt, NULL);
-    if (rc == SQLITE_OK) {
-        for (int i = 0; i < bind_idx; i++) {
-            bind_text(cnt_stmt, i + SKIP_ONE, binds[i].text);
-        }
-        if (sqlite3_step(cnt_stmt) == SQLITE_ROW) {
-            out->total = sqlite3_column_int(cnt_stmt, 0);
-        }
-        sqlite3_finalize(cnt_stmt);
-    }
+    return search_execute_sql(s, sql, count_sql, binds, bind_idx, &like_pool, use_pagerank,
+                              "search", out);
+}
 
-    /* Execute main query */
-    sqlite3_stmt *main_stmt = NULL;
-    rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &main_stmt, NULL);
-    if (rc != SQLITE_OK) {
-        store_set_error_sqlite(s, "search prepare");
-        like_pool_free(&like_pool);
+int cbm_store_search_overlay_view(cbm_store_t *s, const cbm_search_params_t *params,
+                                  cbm_search_output_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!s || !s->db || !params) {
         return CBM_STORE_ERR;
     }
 
-    for (int i = 0; i < bind_idx; i++) {
-        bind_text(main_stmt, i + SKIP_ONE, binds[i].text);
-    }
-
-    int cap = ST_INIT_CAP_16;
-    int n = 0;
-    cbm_search_result_t *results = calloc((size_t)cap, sizeof(cbm_search_result_t));
-    if (!results) {
-        sqlite3_finalize(main_stmt);
-        like_pool_free(&like_pool);
-        store_set_error(s, "search out of memory");
-        return CBM_STORE_ERR;
-    }
-
-    int step_rc = SQLITE_OK;
-    while ((step_rc = sqlite3_step(main_stmt)) == SQLITE_ROW) {
-        if (n >= cap) {
-            if (store_grow_array(s, (void **)&results, &cap, sizeof(*results),
-                                 "search out of memory", true) != CBM_STORE_OK) {
-                cbm_search_output_t partial = {.results = results, .count = n};
-                cbm_store_search_free(&partial);
-                sqlite3_finalize(main_stmt);
-                like_pool_free(&like_pool);
-                return CBM_STORE_ERR;
-            }
+    const char *freshness_project =
+        (params->project && params->project[0] && !params->project_pattern) ? params->project : NULL;
+    if (freshness_project) {
+        cbm_store_overlay_node_view_summary_t summary = {0};
+        if (cbm_store_get_overlay_node_view_summary(s, freshness_project, &summary) !=
+                CBM_STORE_OK ||
+            summary.active_file_tombstones <= 0) {
+            return cbm_store_search(s, params, out);
         }
-        if (scan_node(s, main_stmt, &results[n].node) != CBM_STORE_OK) {
-            cbm_search_output_t partial = {.results = results, .count = n + 1};
-            cbm_store_search_free(&partial);
-            sqlite3_finalize(main_stmt);
-            like_pool_free(&like_pool);
-            return CBM_STORE_ERR;
-        }
-        results[n].in_degree = sqlite3_column_int(main_stmt, ST_COL_9);
-        results[n].out_degree = sqlite3_column_int(main_stmt, CBM_DECIMAL_BASE);
-        /* MERGE: fork delta — pagerank_score at column 11 (only when use_pagerank
-         * selected the pr_rank column; otherwise no such column exists). */
-        results[n].pagerank_score =
-            use_pagerank ? sqlite3_column_double(main_stmt, 11) : 0.0;
-        n++;
-    }
-    if (step_rc != SQLITE_DONE) {
-        cbm_search_output_t partial = {.results = results, .count = n};
-        cbm_store_search_free(&partial);
-        sqlite3_finalize(main_stmt);
-        like_pool_free(&like_pool);
-        store_set_error_sqlite(s, "search step");
-        return CBM_STORE_ERR;
     }
 
-    sqlite3_finalize(main_stmt);
-    like_pool_free(&like_pool);
+    out->pagerank_stale =
+        freshness_project &&
+        cbm_store_derived_view_is_stale(s, freshness_project, CBM_STORE_DERIVED_VIEW_PAGERANK);
+    out->linkrank_stale =
+        freshness_project &&
+        cbm_store_derived_view_is_stale(s, freshness_project, CBM_STORE_DERIVED_VIEW_LINKRANK);
+    out->node_degree_stale =
+        freshness_project &&
+        cbm_store_derived_view_is_stale(s, freshness_project, CBM_STORE_DERIVED_VIEW_NODE_DEGREE);
 
-    out->results = results;
-    out->count = n;
-    return CBM_STORE_OK;
+    bool use_pagerank =
+        (!params->sort_by || strcmp(params->sort_by, "relevance") == 0) && !out->pagerank_stale;
+    const char *select_cols =
+        use_pagerank
+            ? "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+              "n.file_path, n.start_line, n.end_line, n.properties, "
+              "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id) AS in_deg, "
+              "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id) AS out_deg, "
+              "COALESCE(pr.rank, 0.0) AS pr_rank "
+            : "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+              "n.file_path, n.start_line, n.end_line, n.properties, "
+              "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id) AS in_deg, "
+              "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id) AS out_deg ";
+    const char *from_join =
+        use_pagerank ? "FROM active_nodes n LEFT JOIN pagerank pr ON pr.node_id = n.id"
+                     : "FROM active_nodes n";
+
+    char active_cte[CBM_SZ_4K];
+    snprintf(active_cte, sizeof(active_cte),
+             "WITH active_files AS ("
+             "  SELECT t.project, t.rel_path, MAX(t.overlay_generation) AS overlay_generation"
+             "  FROM overlay_tombstones t"
+             "  JOIN overlay_generations g"
+             "    ON g.project = t.project AND g.overlay_generation = t.overlay_generation"
+             "  WHERE g.status = ?1 AND t.entity_kind = ?2 AND t.active = %d"
+             "  GROUP BY t.project, t.rel_path"
+             "), active_nodes AS ("
+             "  SELECT n.id, n.project, n.label, n.name, n.qualified_name, n.file_path,"
+             "         n.start_line, n.end_line, n.properties"
+             "  FROM nodes n"
+             "  WHERE NOT EXISTS (SELECT 1 FROM active_files af"
+             "                    WHERE af.project = n.project AND af.rel_path = n.file_path)"
+             "  UNION ALL"
+             "  SELECT %d AS id, n.project, n.label, n.name, n.qualified_name, n.file_path,"
+             "         n.start_line, n.end_line, n.properties"
+             "  FROM overlay_nodes n"
+             "  JOIN active_files af"
+             "    ON af.project = n.project AND af.rel_path = n.rel_path"
+             "   AND af.overlay_generation = n.overlay_generation"
+             "  WHERE n.owned = %d"
+             ") ",
+             STORE_OVERLAY_TOMBSTONE_ACTIVE, CBM_STORE_NO_NODE_ID, STORE_OVERLAY_ROW_OWNED);
+
+    char where[CBM_SZ_2K] = "";
+    search_bind_t binds[ST_SEARCH_MAX_BINDS];
+    search_like_pool_t like_pool = {0};
+    int bind_idx = 0;
+    where_bind_text(binds, &bind_idx, CBM_STORE_OVERLAY_STATUS_READY);
+    where_bind_text(binds, &bind_idx, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    int nparams =
+        search_build_where(params, where, (int)sizeof(where), binds, &bind_idx, &like_pool);
+
+    char sql[CBM_SZ_4K];
+    char count_sql[CBM_SZ_4K];
+    if (nparams > 0) {
+        snprintf(sql, sizeof(sql), "%s%s %s WHERE %s", active_cte, select_cols, from_join, where);
+        snprintf(count_sql, sizeof(count_sql), "%sSELECT COUNT(*) FROM active_nodes n WHERE %s",
+                 active_cte, where);
+    } else {
+        snprintf(sql, sizeof(sql), "%s%s %s", active_cte, select_cols, from_join);
+        snprintf(count_sql, sizeof(count_sql), "%sSELECT COUNT(*) FROM active_nodes n",
+                 active_cte);
+    }
+
+    bool has_degree_filter = (params->min_degree >= 0 || params->max_degree >= 0);
+    search_apply_degree_filter(sql, sizeof(sql), params);
+    if (has_degree_filter) {
+        snprintf(count_sql, sizeof(count_sql), "SELECT COUNT(*) FROM (%s)", sql);
+    }
+
+    int limit = params->limit > 0 ? params->limit : CBM_DEFAULT_SEARCH_LIMIT;
+    int offset = params->offset;
+    const char *name_col = has_degree_filter ? "name" : "n.name";
+    const char *id_col = has_degree_filter ? "id" : "n.id";
+    const char *proj_col = has_degree_filter ? "project" : "n.project";
+    bool scope_has_project = (params->project != NULL || params->project_pattern != NULL);
+    char dep_last[CBM_SZ_128];
+    if (scope_has_project && !params->disable_dep_ranking) {
+        snprintf(dep_last, sizeof(dep_last),
+                 "CASE WHEN %s LIKE '%%.dep.%%' THEN 1 ELSE 0 END, ", proj_col);
+    } else {
+        dep_last[0] = '\0';
+    }
+
+    char order_limit[CBM_SZ_256];
+    if (use_pagerank) {
+        snprintf(order_limit, sizeof(order_limit),
+                 " ORDER BY pr_rank DESC, %s%s, %s LIMIT %d OFFSET %d",
+                 dep_last, name_col, id_col, limit, offset);
+    } else if (params->sort_by && strcmp(params->sort_by, "degree") == 0) {
+        snprintf(order_limit, sizeof(order_limit),
+                 " ORDER BY (in_deg + out_deg) DESC, %s%s, %s LIMIT %d OFFSET %d",
+                 dep_last, name_col, id_col, limit, offset);
+    } else if (params->sort_by && strcmp(params->sort_by, "calls") == 0) {
+        snprintf(order_limit, sizeof(order_limit),
+                 " ORDER BY (in_deg + out_deg) DESC, %s%s, %s LIMIT %d OFFSET %d",
+                 dep_last, name_col, id_col, limit, offset);
+    } else if (params->sort_by && strcmp(params->sort_by, "linkrank") == 0) {
+        snprintf(order_limit, sizeof(order_limit),
+                 " ORDER BY (in_deg + out_deg) DESC, %s%s, %s LIMIT %d OFFSET %d",
+                 dep_last, name_col, id_col, limit, offset);
+    } else {
+        snprintf(order_limit, sizeof(order_limit),
+                 " ORDER BY %s%s, %s LIMIT %d OFFSET %d",
+                 dep_last, name_col, id_col, limit, offset);
+    }
+    strncat(sql, order_limit, sizeof(sql) - strlen(sql) - 1);
+
+    return search_execute_sql(s, sql, count_sql, binds, bind_idx, &like_pool, use_pagerank,
+                              "search_overlay_view", out);
 }
 
 void cbm_store_search_free(cbm_search_output_t *out) {

@@ -1584,6 +1584,123 @@ TEST(store_find_nodes_by_file_overlay_view_returns_latest_ready_rows) {
     PASS();
 }
 
+TEST(store_search_overlay_view_without_ready_overlay_matches_canonical_search) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    cbm_node_t old_main = {.project = "test",
+                           .label = "Function",
+                           .name = "old_main",
+                           .qualified_name = "test.old_main",
+                           .file_path = "main.go",
+                           .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &old_main), 0);
+
+    cbm_search_params_t params = {.project = "test",
+                                  .pattern = "main",
+                                  .sort_by = "name",
+                                  .limit = 10};
+    cbm_search_output_t active = {0};
+    ASSERT_EQ(cbm_store_search_overlay_view(s, &params, &active), CBM_STORE_OK);
+    ASSERT_EQ(active.total, 1);
+    ASSERT_EQ(active.count, 1);
+    ASSERT_GT(active.results[0].node.id, CBM_STORE_NO_NODE_ID);
+    ASSERT_STR_EQ(active.results[0].node.name, "old_main");
+    cbm_store_search_free(&active);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_search_overlay_view_matches_full_rebuild_oracle) {
+    enum { BASE_GENERATION = 1 };
+    cbm_store_t *live = cbm_store_open_memory();
+    cbm_store_t *oracle = cbm_store_open_memory();
+    ASSERT_NOT_NULL(live);
+    ASSERT_NOT_NULL(oracle);
+    ASSERT_EQ(cbm_store_upsert_project(live, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(oracle, "test", "/tmp/test"), CBM_STORE_OK);
+
+    cbm_node_t old_main = {.project = "test",
+                           .label = "Function",
+                           .name = "old_main",
+                           .qualified_name = "test.old_main",
+                           .file_path = "main.go",
+                           .properties_json = "{}"};
+    cbm_node_t stable = {.project = "test",
+                         .label = "Function",
+                         .name = "stable",
+                         .qualified_name = "test.stable",
+                         .file_path = "stable.go",
+                         .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(live, &old_main), 0);
+    ASSERT_GT(cbm_store_upsert_node(live, &stable), 0);
+    ASSERT_GT(cbm_store_upsert_node(oracle, &stable), 0);
+
+    int64_t first_overlay = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(live, "test", BASE_GENERATION,
+                                                   &first_overlay),
+              CBM_STORE_OK);
+    cbm_node_t first_main = {.project = "test",
+                             .label = "Function",
+                             .name = "new_main",
+                             .qualified_name = "test.new_main",
+                             .file_path = "main.go",
+                             .properties_json = "{}"};
+    cbm_store_file_delta_t first_delta = {.project = "test",
+                                          .rel_path = "main.go",
+                                          .generation = BASE_GENERATION,
+                                          .nodes = &first_main,
+                                          .node_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(live, &first_delta, first_overlay),
+              CBM_STORE_OK);
+
+    int64_t second_overlay = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(live, "test", BASE_GENERATION,
+                                                   &second_overlay),
+              CBM_STORE_OK);
+    cbm_node_t newer_main = {.project = "test",
+                             .label = "Function",
+                             .name = "newer_main",
+                             .qualified_name = "test.newer_main",
+                             .file_path = "main.go",
+                             .properties_json = "{}"};
+    cbm_store_file_delta_t second_delta = {.project = "test",
+                                           .rel_path = "main.go",
+                                           .generation = BASE_GENERATION,
+                                           .nodes = &newer_main,
+                                           .node_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(live, &second_delta, second_overlay),
+              CBM_STORE_OK);
+    ASSERT_GT(cbm_store_upsert_node(oracle, &newer_main), 0);
+
+    cbm_search_params_t params = {.project = "test",
+                                  .pattern = "main|stable",
+                                  .sort_by = "name",
+                                  .limit = 10,
+                                  .min_degree = 0};
+    cbm_search_output_t active = {0};
+    cbm_search_output_t expected = {0};
+    ASSERT_EQ(cbm_store_search_overlay_view(live, &params, &active), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_search(oracle, &params, &expected), CBM_STORE_OK);
+    ASSERT_EQ(active.total, expected.total);
+    ASSERT_EQ(active.count, expected.count);
+    ASSERT_EQ(active.count, 2);
+    ASSERT_STR_EQ(active.results[0].node.name, expected.results[0].node.name);
+    ASSERT_STR_EQ(active.results[1].node.name, expected.results[1].node.name);
+    ASSERT_STR_EQ(active.results[0].node.name, "newer_main");
+    ASSERT_STR_EQ(active.results[1].node.name, "stable");
+    ASSERT_EQ(active.results[0].node.id, CBM_STORE_NO_NODE_ID);
+    ASSERT_GT(active.results[1].node.id, CBM_STORE_NO_NODE_ID);
+
+    cbm_store_search_free(&active);
+    cbm_store_search_free(&expected);
+    cbm_store_close(live);
+    cbm_store_close(oracle);
+    PASS();
+}
+
 TEST(store_owner_metadata_crud) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -4321,6 +4438,8 @@ SUITE(store_nodes) {
     RUN_TEST(store_overlay_file_delta_publish_rejects_failed_generation);
     RUN_TEST(store_overlay_node_view_summary_counts_latest_ready_overlay);
     RUN_TEST(store_find_nodes_by_file_overlay_view_returns_latest_ready_rows);
+    RUN_TEST(store_search_overlay_view_without_ready_overlay_matches_canonical_search);
+    RUN_TEST(store_search_overlay_view_matches_full_rebuild_oracle);
     RUN_TEST(store_owner_metadata_crud);
     RUN_TEST(store_rebuild_file_delta_owners_derives_from_graph);
     RUN_TEST(store_import_export_metadata_crud);
