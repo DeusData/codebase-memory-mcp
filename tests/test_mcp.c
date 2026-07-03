@@ -2142,6 +2142,49 @@ TEST(search_code_exact_path_filter_scopes_traversal) {
     PASS();
 }
 
+TEST(search_code_git_worktree_scope_includes_untracked_source) {
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char proj_dir[512];
+    snprintf(proj_dir, sizeof(proj_dir), "%s/project", tmp);
+    char cmd[CBM_SZ_1K];
+#ifdef _WIN32
+    int n = snprintf(cmd, sizeof(cmd), "git -C \"%s\" init -q >NUL 2>NUL", proj_dir);
+#else
+    int n = snprintf(cmd, sizeof(cmd), "git -C \"%s\" init -q >/dev/null 2>/dev/null", proj_dir);
+#endif
+    ASSERT(n >= 0 && (size_t)n < sizeof(cmd));
+    if (system(cmd) != 0) {
+        cbm_mcp_server_free(srv);
+        th_rmtree(tmp);
+        FAIL("git init failed for search_code git worktree test");
+    }
+
+    char extra_path[512];
+    snprintf(extra_path, sizeof(extra_path), "%s/active_edit.go", proj_dir);
+    ASSERT_EQ(th_write_file(extra_path, "package main\nfunc UntrackedNeedle() {}\n"), 0);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":96,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"UntrackedNeedle\","
+                                   "\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"search_scope\":\"git_worktree\""));
+    ASSERT_NOT_NULL(strstr(inner, "UntrackedNeedle"));
+    ASSERT_NULL(strstr(inner, "\"isError\":true"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(tool_detect_changes_no_project) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -3770,6 +3813,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_literal_pipe_warns_issue282);
     RUN_TEST(search_code_ampersand_accepted_issue272);
     RUN_TEST(search_code_exact_path_filter_scopes_traversal);
+    RUN_TEST(search_code_git_worktree_scope_includes_untracked_source);
     RUN_TEST(tool_detect_changes_no_project);
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
