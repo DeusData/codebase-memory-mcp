@@ -781,6 +781,23 @@ def find_project_db(cache_dir: Path) -> Path:
     return dbs[0]
 
 
+def remove_sqlite_sidecars(path: Path) -> None:
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{path}{suffix}")
+        if sidecar.exists():
+            sidecar.unlink()
+
+
+def copy_sqlite_snapshot(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        destination.unlink()
+    remove_sqlite_sidecars(destination)
+    uri = f"{source.resolve().as_uri()}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as src, sqlite3.connect(str(destination)) as dst:
+        src.backup(dst)
+
+
 def decode_sqlite_text(data: bytes) -> str:
     return data.decode("utf-8", "surrogateescape")
 
@@ -1191,7 +1208,7 @@ def run_matrix_case(
     project_db = find_project_db(cache_dir)
     project = str(incremental.get("response", {}).get("project") or project_db.stem)
     incremental_snapshot = case_root / "incremental.db"
-    shutil.copy2(project_db, incremental_snapshot)
+    copy_sqlite_snapshot(project_db, incremental_snapshot)
     removed_dbs = remove_project_dbs(cache_dir)
 
     if args.transport == "mcp":
@@ -1324,7 +1341,7 @@ def run_self_dogfood_case(
             )
 
         incremental_snapshot = case_root / "incremental.db"
-        shutil.copy2(project_db, incremental_snapshot)
+        copy_sqlite_snapshot(project_db, incremental_snapshot)
         removed_dbs = remove_project_dbs(cache_dir)
         if args.transport == "mcp":
             with McpClient(binary, case_env, args.timeout) as client:
