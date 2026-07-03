@@ -1354,6 +1354,48 @@ TEST(tool_index_status_includes_git_metadata) {
     PASS();
 }
 
+TEST(tool_index_status_reports_dirty_metadata) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "status-dirty";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/status-dirty"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    cbm_node_t node = {.project = proj,
+                       .label = "Function",
+                       .name = "StatusRun",
+                       .qualified_name = "status-dirty.StatusRun",
+                       .file_path = "status.c"};
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    cbm_dirty_file_state_t dirty = {.project = proj,
+                                    .rel_path = "status.c",
+                                    .observed_hash = "status-dirty-hash",
+                                    .observed_generation = 14,
+                                    .source = CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX,
+                                    .status = CBM_STORE_DIRTY_STATUS_PENDING};
+    ASSERT_EQ(cbm_store_upsert_dirty_file(st, &dirty), CBM_STORE_OK);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":17,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"index_status\","
+                                   "\"arguments\":{\"project\":\"status-dirty\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"status\":\"ready\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
+    ASSERT_NOT_NULL(strstr(inner, "index_status counts canonical graph rows"));
+    ASSERT_TRUE(has_dirty_freshness_counts(inner, 1, 0));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  TOOL HANDLERS WITH DATA
  * ══════════════════════════════════════════════════════════════════ */
@@ -4027,6 +4069,7 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_warns_on_stale_similarity_edges);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_index_status_includes_git_metadata);
+    RUN_TEST(tool_index_status_reports_dirty_metadata);
 
     /* Tool handlers with validation */
     RUN_TEST(tool_trace_path_not_found);

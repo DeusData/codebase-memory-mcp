@@ -1528,6 +1528,50 @@ TEST(resource_status_returns_not_indexed_when_no_store) {
     PASS();
 }
 
+TEST(resource_status_and_architecture_report_dirty_metadata) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *s = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(s);
+    const char *proj = "_tc_resource_dirty_";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(s, proj, "/tmp/resource-dirty"), CBM_STORE_OK);
+
+    cbm_node_t node = {.project = proj,
+                       .label = "Function",
+                       .name = "ResourceRun",
+                       .qualified_name = "_tc_resource_dirty_.ResourceRun",
+                       .file_path = "resource.c"};
+    ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+
+    cbm_dirty_file_state_t dirty = {.project = proj,
+                                    .rel_path = "resource.c",
+                                    .observed_hash = "resource-dirty-hash",
+                                    .observed_generation = 15,
+                                    .source = CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX,
+                                    .status = CBM_STORE_DIRTY_STATUS_PENDING};
+    ASSERT_EQ(cbm_store_upsert_dirty_file(s, &dirty), CBM_STORE_OK);
+
+    char *status_resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/read\","
+             "\"params\":{\"uri\":\"codebase://status\"}}");
+    ASSERT_NOT_NULL(status_resp);
+    ASSERT_NOT_NULL(strstr(status_resp, "dirty_files_pending"));
+    ASSERT_NOT_NULL(strstr(status_resp, "codebase://status counts canonical graph rows"));
+    free(status_resp);
+
+    char *arch_resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"resources/read\","
+             "\"params\":{\"uri\":\"codebase://architecture\"}}");
+    ASSERT_NOT_NULL(arch_resp);
+    ASSERT_NOT_NULL(strstr(arch_resp, "dirty_files_pending"));
+    ASSERT_NOT_NULL(strstr(arch_resp, "codebase://architecture reads canonical graph summaries"));
+    free(arch_resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* ── 13. Dep search bug regression tests ─────────────────── */
 
 /* Bug 1: resolve_store must route dep project names to parent DB.
@@ -2739,6 +2783,7 @@ SUITE(tool_consolidation) {
     RUN_TEST(resources_read_response_has_contents_array);
     RUN_TEST(resources_read_missing_uri_param);
     RUN_TEST(resources_read_no_params_at_all);
+    RUN_TEST(resource_status_and_architecture_report_dirty_metadata);
     /* Client behavioral differences */
     RUN_TEST(resource_client_gets_context_only_on_first_call);
     RUN_TEST(legacy_client_gets_context_only_on_first_call);
