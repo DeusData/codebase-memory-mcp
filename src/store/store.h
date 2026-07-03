@@ -746,6 +746,11 @@ int cbm_store_delete_file_delta_complete(cbm_store_t *s, const char *project,
 /* ── Search ─────────────────────────────────────────────────────── */
 
 int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_search_output_t *out);
+/* Opt-in active node read view: canonical nodes whose files are not hidden by
+ * active ready overlay file tombstones, plus owned nodes from the latest ready
+ * overlay for each changed file. Overlay rows use id=CBM_STORE_NO_NODE_ID. */
+int cbm_store_search_overlay_view(cbm_store_t *s, const cbm_search_params_t *params,
+                                  cbm_search_output_t *out);
 
 /* Free a search output's allocated memory. */
 void cbm_store_search_free(cbm_search_output_t *out);
