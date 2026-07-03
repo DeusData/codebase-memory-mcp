@@ -24,6 +24,20 @@ typedef struct {
     const char *target_qn;   // e.g. "test.main.foo"
 } CBMDictLiteralEntry;
 
+// Memoization entry for py_eval_expr_type (issue #710). Keyed by the
+// tree-sitter node identity pointer (TSNode.id), which is unique per node
+// within one file's parse tree. NOT the start byte: every leftmost
+// descendant of a chained call expression shares the chain's start byte,
+// so byte-keyed entries would alias distinct nodes and silently corrupt
+// call resolution. `gen` snapshots the scope generation (see
+// py_scope_bind in py_lsp.c); entries from older generations are treated
+// as misses so scope rebinding can never serve a stale type.
+typedef struct {
+    const void *node_id;   // TSNode.id; NULL marks an empty slot
+    uint32_t gen;          // scope generation at insert time
+    const CBMType *result; // full-fidelity result, never NULL in a live entry
+} CBMPyTypeCacheEntry;
+
 // PyLSPContext holds state for one Python file's type evaluation.
 typedef struct {
     CBMArena *arena;
@@ -72,6 +86,17 @@ typedef struct {
     // AST-walk recursion depth for py_resolve_calls_in (guards stack overflow on
     // deeply-nested/cyclic files; see cbm_lsp_max_walk_depth). Zero via memset.
     int walk_depth;
+
+    // py_eval_expr_type memoization + guards (issues #710/#720; mirrors
+    // c_eval_expr_type's guard design in c_lsp.c). All zero via memset —
+    // each file starts with a cold cache and a full budget.
+    CBMPyTypeCacheEntry *type_cache; // open addressing, linear probe, arena-allocated
+    int type_cache_count;            // occupied slots (kept < 75% of cap)
+    int type_cache_cap;              // power-of-two capacity
+    uint32_t type_cache_gen;         // bumped on every scope mutation (O(1) flush)
+    int eval_depth;                  // evaluator recursion depth (PY_LSP_MAX_EVAL_DEPTH)
+    int eval_steps;                  // per-file work budget used (PY_EVAL_MAX_STEPS_PER_FILE)
+    uint32_t eval_truncations;       // depth/budget cutoff count — gates memo inserts
 
     // Debug mode (CBM_LSP_DEBUG env, shared across all language LSPs).
     bool debug;

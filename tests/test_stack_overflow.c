@@ -487,6 +487,31 @@ TEST(lsp_cpp_deep_expression_no_crash) {
     PASS();
 }
 
+TEST(lsp_python_deep_expression_no_crash) {
+    /* Issue #720: a deeply parenthesized assignment RHS drives
+     * py_eval_expr_type into one native recursion frame per paren level
+     * via py_process_statement's RHS inference — a path NOT covered by
+     * the py_resolve_calls_in walk_depth cap (that guards the emit walk,
+     * not the binder's expression evaluation). Pre-guard this SIGSEGVs.
+     * PY_LSP_MAX_EVAL_DEPTH turns it into a graceful unknown. Depth
+     * mirrors lsp_java_deep_nesting_no_crash. */
+    const int DEPTH = 30000;
+    size_t sz = (size_t)DEPTH * 2 + 256;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *p = src;
+    p += snprintf(p, sz, "def main():\n    value = ");
+    memset(p, '(', DEPTH);
+    p += DEPTH;
+    *p++ = '1';
+    memset(p, ')', DEPTH);
+    p += DEPTH;
+    snprintf(p, sz - (size_t)(p - src), "\n    return value\n");
+    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_PYTHON, "deep_expr.py"));
+    free(src);
+    PASS();
+}
+
 TEST(lsp_java_lambda_args_exceed_params_no_crash) {
     /* A call with MORE arguments than the resolved method's declared params:
      * bind_lambda_args indexed the NULL-terminated signature param_types array
@@ -623,6 +648,7 @@ SUITE(stack_overflow) {
     RUN_TEST(lsp_java_deep_nesting_no_crash);
     RUN_TEST(lsp_java_lambda_args_exceed_params_no_crash);
     RUN_TEST(lsp_cpp_deep_expression_no_crash);
+    RUN_TEST(lsp_python_deep_expression_no_crash);
     RUN_TEST(lsp_ts_cyclic_types_no_crash);
     RUN_TEST(lsp_python_deep_nesting_no_crash);
     RUN_TEST(lsp_go_deep_nesting_no_crash);

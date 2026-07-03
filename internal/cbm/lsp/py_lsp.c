@@ -23,6 +23,11 @@
  * only from py_lsp.c, never compiled standalone. */
 #include "py_builtins.c"
 
+/* Guards for py_eval_expr_type — mirrors c_eval_expr_type's guard design
+ * (C_EVAL_DEPTH_LIMIT / C_EVAL_MAX_STEPS_PER_FILE in c_lsp.c). */
+#define PY_LSP_MAX_EVAL_DEPTH 256
+#define PY_EVAL_MAX_STEPS_PER_FILE 10000
+
 // Forward decls
 static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node);
 
@@ -41,6 +46,7 @@ static void py_resolve_calls_in(PyLSPContext *ctx, TSNode node) {
     ctx->walk_depth--;
 }
 static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node);
+static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node);
 static void py_process_statement(PyLSPContext *ctx, TSNode node);
 static const CBMRegisteredFunc *py_lookup_attribute(PyLSPContext *ctx, const char *type_qn,
                                                     const char *member_name);
@@ -57,6 +63,32 @@ static void py_register_lambda(PyLSPContext *ctx, const char *name, TSNode lambd
 static void py_register_dict_literal(PyLSPContext *ctx, const char *name, TSNode dict_node);
 static TSNode py_lookup_lambda(PyLSPContext *ctx, const char *name);
 static const char *py_lookup_dict_dispatch(PyLSPContext *ctx, const char *var, const char *key);
+
+/* ── Scope mutation wrappers ─────────────────────────────────────────────
+ *
+ * py_eval_expr_type memoizes per-node results (see the cache block above
+ * py_eval_expr_type). A cached result is only valid as long as name lookup
+ * resolves exactly as it did when the entry was computed, so every mutation
+ * of the scope chain must invalidate the cache. Bumping the generation
+ * counter is an O(1) whole-cache flush: entries from older generations
+ * never match again. All binds/restores in this file MUST go through these
+ * wrappers — never call cbm_scope_bind(ctx->current_scope, ...) or assign
+ * ctx->current_scope directly (scope pushes are exempt: an empty child
+ * scope delegates every lookup to its parent, changing nothing).
+ *
+ * This is what makes memoization behavior-preserving even when the same
+ * node is legitimately re-evaluated under different bindings — e.g. a
+ * lambda body re-walked per call site with per-call argument types, or
+ * isinstance-narrowed branches. */
+static void py_scope_bind(PyLSPContext *ctx, const char *name, const CBMType *type) {
+    ctx->type_cache_gen++;
+    cbm_scope_bind(ctx->current_scope, name, type);
+}
+
+static void py_scope_restore(PyLSPContext *ctx, CBMScope *saved) {
+    ctx->type_cache_gen++;
+    ctx->current_scope = saved;
+}
 
 void py_lsp_init(PyLSPContext *ctx, CBMArena *arena, const char *source, int source_len,
                  const CBMTypeRegistry *registry, const char *module_qn,
@@ -147,7 +179,7 @@ static void py_bind_dotted_prefixes(PyLSPContext *ctx, const char *qn) {
         const char *short_name = strrchr(prefix, '.');
         const char *bind_short = short_name ? short_name + 1 : prefix;
         if (cbm_type_is_unknown(cbm_scope_lookup(ctx->current_scope, bind_short))) {
-            cbm_scope_bind(ctx->current_scope, bind_short, cbm_type_module(ctx->arena, prefix));
+            py_scope_bind(ctx, bind_short, cbm_type_module(ctx->arena, prefix));
         }
         p = dot + 1;
     }
@@ -178,7 +210,7 @@ void py_lsp_bind_imports(PyLSPContext *ctx) {
             // `import X` / `import X as Y` — bind to MODULE(X).
             t = cbm_type_module(ctx->arena, qn);
         }
-        cbm_scope_bind(ctx->current_scope, local, t);
+        py_scope_bind(ctx, local, t);
         // Always walk the dotted prefix chain. The CBMImport shape
         // can't distinguish `import a.b.c` from `from a.b import c`
         // (both produce local_name=c, module_path=a.b.c), but binding
@@ -621,7 +653,7 @@ static void py_bind_for_target(PyLSPContext *ctx, TSNode left, const CBMType *el
     if (strcmp(lk, "identifier") == 0) {
         char *name = py_node_text(ctx, left);
         if (name)
-            cbm_scope_bind(ctx->current_scope, name, elem_type);
+            py_scope_bind(ctx, name, elem_type);
         return;
     }
     if (strcmp(lk, "pattern_list") == 0 || strcmp(lk, "tuple_pattern") == 0 ||
@@ -655,7 +687,7 @@ static void py_bind_for_target(PyLSPContext *ctx, TSNode left, const CBMType *el
                     bind_type = elems[i];
                 else
                     bind_type = cbm_type_unknown();
-                cbm_scope_bind(ctx->current_scope, nm, bind_type);
+                py_scope_bind(ctx, nm, bind_type);
             }
         }
     }
@@ -707,7 +739,10 @@ static const CBMType *py_iterable_element_type(PyLSPContext *ctx, const CBMType 
     return cbm_type_unknown();
 }
 
-static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node) {
+/* The real recursive-descent evaluator. Never call directly — go through
+ * the memoizing, depth- and budget-guarded py_eval_expr_type wrapper below
+ * (every recursive call inside this body already does). */
+static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node) {
     if (!ctx || ts_node_is_null(node))
         return cbm_type_unknown();
 
@@ -1301,6 +1336,171 @@ static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node) {
     return cbm_type_unknown();
 }
 
+/* ── py_eval_expr_type memoization + guards (issues #710, #720) ──────────
+ *
+ * py_eval_expr_type_uncached re-evaluates a call node's attribute receiver
+ * twice — once in the container special-case and again in the general
+ * attribute path — so an N-link chained call (`Builder().add(x)...add(z)`)
+ * cost O(2^N) evaluations: the #710 indexing hang (~65-link real chains).
+ * Memoizing per node makes each distinct node evaluate at most once per
+ * scope generation, and py_emit_call_for's per-call-node receiver
+ * re-evaluation becomes an O(1) cache hit.
+ *
+ * Key: the tree-sitter node identity pointer (TSNode.id — unique per node
+ * within one parse tree). NOT the node's start byte: in a chained call
+ * every leftmost descendant (the whole chain, each receiver, down to the
+ * root identifier) shares the same start byte, so byte-keyed entries alias
+ * distinct nodes and silently return the wrong type (missing/incorrect
+ * CALLS edges).
+ *
+ * Entries carry the scope generation (see py_scope_bind); stale
+ * generations never match, which keeps caching invisible to resolution
+ * behavior. The table is open-addressing/linear-probe, arena-allocated on
+ * the per-file arena (freed with it; ctx is memset per file so each file
+ * starts cold). */
+
+enum { PY_TYPE_CACHE_INITIAL_CAP = 256 }; /* power of two (index masking) */
+enum { PY_TYPE_CACHE_MAX_CAP = 1 << 26 }; /* hard stop for adversarial files */
+
+static uint32_t py_type_cache_hash(const void *id) {
+    uintptr_t v = (uintptr_t)id >> 3; /* node structs are >=8-byte aligned */
+    return (uint32_t)((v ^ (v >> 29)) * 2654435761u);
+}
+
+/* Returns the cached full-fidelity result for this node, or NULL when the
+ * node has no entry from the current scope generation. Live entries never
+ * store NULL (the wrapper normalizes to cbm_type_unknown() first), so NULL
+ * unambiguously means "miss". */
+static const CBMType *py_type_cache_lookup(const PyLSPContext *ctx, const void *id) {
+    if (!ctx->type_cache || ctx->type_cache_cap == 0 || !id)
+        return NULL;
+    uint32_t mask = (uint32_t)ctx->type_cache_cap - 1;
+    uint32_t idx = py_type_cache_hash(id) & mask;
+    for (int probed = 0; probed < ctx->type_cache_cap; probed++) {
+        const CBMPyTypeCacheEntry *e = &ctx->type_cache[idx];
+        if (!e->node_id)
+            return NULL; /* empty slot: this id was never inserted */
+        if (e->node_id == id)
+            return e->gen == ctx->type_cache_gen ? e->result : NULL;
+        idx = (idx + 1) & mask;
+    }
+    return NULL; /* probe bound: unreachable below the 75% load ceiling */
+}
+
+/* Doubles the table (arena allocation: the old table is abandoned and
+ * freed with the per-file arena). Entries from stale generations are
+ * dropped during the rehash — they can never match again. */
+static bool py_type_cache_grow(PyLSPContext *ctx) {
+    if (ctx->type_cache_cap >= PY_TYPE_CACHE_MAX_CAP)
+        return false;
+    int new_cap = ctx->type_cache_cap ? ctx->type_cache_cap * 2 : PY_TYPE_CACHE_INITIAL_CAP;
+    CBMPyTypeCacheEntry *new_entries = (CBMPyTypeCacheEntry *)cbm_arena_alloc(
+        ctx->arena, (size_t)new_cap * sizeof(CBMPyTypeCacheEntry));
+    if (!new_entries)
+        return false;
+    memset(new_entries, 0, (size_t)new_cap * sizeof(CBMPyTypeCacheEntry));
+
+    CBMPyTypeCacheEntry *old_entries = ctx->type_cache;
+    int old_cap = ctx->type_cache_cap;
+    ctx->type_cache = new_entries;
+    ctx->type_cache_cap = new_cap;
+    ctx->type_cache_count = 0;
+
+    uint32_t mask = (uint32_t)new_cap - 1;
+    for (int i = 0; i < old_cap; i++) {
+        if (!old_entries[i].node_id || old_entries[i].gen != ctx->type_cache_gen)
+            continue;
+        uint32_t idx = py_type_cache_hash(old_entries[i].node_id) & mask;
+        while (new_entries[idx].node_id)
+            idx = (idx + 1) & mask;
+        new_entries[idx] = old_entries[i];
+        ctx->type_cache_count++;
+    }
+    return true;
+}
+
+static void py_type_cache_insert(PyLSPContext *ctx, const void *id, const CBMType *result) {
+    if (!id || !result)
+        return;
+    /* Keep load strictly below 75% so probe chains stay short. If growth
+     * fails (OOM / max cap), REJECT the insert rather than filling up: a
+     * full table would turn every probe loop into a full-table scan, and
+     * an unbounded insert loop on a full table would spin forever. */
+    if (!ctx->type_cache || (ctx->type_cache_count + 1) * 4 > ctx->type_cache_cap * 3) {
+        if (!py_type_cache_grow(ctx) &&
+            (!ctx->type_cache || (ctx->type_cache_count + 1) * 4 > ctx->type_cache_cap * 3))
+            return;
+    }
+    uint32_t mask = (uint32_t)ctx->type_cache_cap - 1;
+    uint32_t idx = py_type_cache_hash(id) & mask;
+    for (int probed = 0; probed < ctx->type_cache_cap; probed++) {
+        CBMPyTypeCacheEntry *e = &ctx->type_cache[idx];
+        if (!e->node_id) {
+            e->node_id = id;
+            e->gen = ctx->type_cache_gen;
+            e->result = result;
+            ctx->type_cache_count++;
+            return;
+        }
+        if (e->node_id == id) {
+            e->gen = ctx->type_cache_gen; /* refresh a stale-generation entry in place */
+            e->result = result;
+            return;
+        }
+        idx = (idx + 1) & mask;
+    }
+    /* Probe bound exhausted — only reachable with a corrupt count; drop the
+     * insert instead of spinning. */
+}
+
+/* Memoizing, depth- and budget-guarded wrapper — the function every call
+ * site in this file goes through. */
+static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node) {
+    if (!ctx || ts_node_is_null(node))
+        return cbm_type_unknown();
+
+    /* Depth cap (issue #720): the evaluator recurses once per expression
+     * nesting level, so a pathologically deep expression (tens of
+     * thousands of parens) overflowed the native stack. Same limit as
+     * C_EVAL_DEPTH_LIMIT. Past the cap: unknown, and NEVER cached. */
+    if (ctx->eval_depth >= PY_LSP_MAX_EVAL_DEPTH) {
+        ctx->eval_truncations++;
+        return cbm_type_unknown();
+    }
+
+    const CBMType *cached = py_type_cache_lookup(ctx, node.id);
+    if (cached)
+        return cached;
+
+    /* Per-file work budget (mirrors C_EVAL_MAX_STEPS_PER_FILE): expression
+     * type evaluation is best-effort, so pathological files degrade to
+     * unknown instead of stalling repository indexing. Only real
+     * evaluations consume budget — cache hits above are O(1). */
+    if (ctx->eval_steps++ > PY_EVAL_MAX_STEPS_PER_FILE) {
+        ctx->eval_truncations++;
+        if (ctx->debug && ctx->eval_steps == PY_EVAL_MAX_STEPS_PER_FILE + 2) {
+            fprintf(stderr, "  [pylsp] expression eval step budget exhausted; returning unknown\n");
+        }
+        return cbm_type_unknown();
+    }
+
+    uint32_t trunc_before = ctx->eval_truncations;
+    ctx->eval_depth++;
+    const CBMType *result = py_eval_expr_type_uncached(ctx, node);
+    ctx->eval_depth--;
+    if (!result)
+        result = cbm_type_unknown();
+
+    /* Only cache full-fidelity results: if any descendant evaluation was
+     * cut off by the depth cap or the step budget, this result may be a
+     * truncated `unknown`. Caching it would poison later evaluations that
+     * reach the same node from a shallower frame (or with fresh budget) —
+     * exactly the reuse the guards are supposed to preserve. */
+    if (ctx->eval_truncations == trunc_before)
+        py_type_cache_insert(ctx, node.id, result);
+    return result;
+}
+
 /* ── statement processing: bind from assignments, for-loops, with-as ──── */
 
 static void py_process_statement(PyLSPContext *ctx, TSNode node) {
@@ -1383,14 +1583,14 @@ static void py_process_statement(PyLSPContext *ctx, TSNode node) {
                 } else {
                     bind_type = elem_type ? elem_type : cbm_type_unknown();
                 }
-                cbm_scope_bind(ctx->current_scope, nm, bind_type);
+                py_scope_bind(ctx, nm, bind_type);
             }
             return;
         }
         if (strcmp(lk, "identifier") == 0) {
             char *name = py_node_text(ctx, left);
             if (name) {
-                cbm_scope_bind(ctx->current_scope, name, rhs_type);
+                py_scope_bind(ctx, name, rhs_type);
                 // Lambda registry: `fn = lambda x: ...`.
                 if (!ts_node_is_null(right) && strcmp(ts_node_type(right), "lambda") == 0) {
                     py_register_lambda(ctx, name, right);
@@ -1526,7 +1726,7 @@ static void py_process_statement(PyLSPContext *ctx, TSNode node) {
                         }
                     }
                 }
-                cbm_scope_bind(ctx->current_scope, name, bind_type);
+                py_scope_bind(ctx, name, bind_type);
             }
         }
         return;
@@ -1577,7 +1777,7 @@ static void py_process_statement(PyLSPContext *ctx, TSNode node) {
                 char *nm = py_node_text(ctx, exc_name);
                 char *tn = py_node_text(ctx, exc_type);
                 if (nm && tn) {
-                    cbm_scope_bind(ctx->current_scope, nm, py_resolve_annotation(ctx, tn));
+                    py_scope_bind(ctx, nm, py_resolve_annotation(ctx, tn));
                 }
             }
         }
@@ -1628,7 +1828,7 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
                     }
                     if (pname) {
                         const CBMType *arg_type = py_eval_expr_type(ctx, a);
-                        cbm_scope_bind(ctx->current_scope, pname, arg_type);
+                        py_scope_bind(ctx, pname, arg_type);
                     }
                 }
             }
@@ -1641,7 +1841,7 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
                 py_resolve_calls_in(ctx, body);
             }
             ctx->enclosing_func_qn = prev_func;
-            ctx->current_scope = saved;
+            py_scope_restore(ctx, saved);
             return;
         }
         // Constructor call (ClassName())
@@ -2025,7 +2225,7 @@ static void py_bind_walrus_in(PyLSPContext *ctx, TSNode node) {
             char *name = py_node_text(ctx, left);
             if (name) {
                 const CBMType *t = py_eval_expr_type(ctx, right);
-                cbm_scope_bind(ctx->current_scope, name, t);
+                py_scope_bind(ctx, name, t);
             }
         }
     }
@@ -2107,7 +2307,7 @@ static void py_walk_if_statement(PyLSPContext *ctx, TSNode if_node) {
             char *name = NULL;
             const CBMType *narrowed = NULL;
             if (py_match_isinstance(ctx, cond, &name, &narrowed) && name && narrowed) {
-                cbm_scope_bind(ctx->current_scope, name, narrowed);
+                py_scope_bind(ctx, name, narrowed);
             }
         }
         // Try `x is not None` narrowing.
@@ -2117,12 +2317,12 @@ static void py_walk_if_statement(PyLSPContext *ctx, TSNode if_node) {
             const CBMType *current = cbm_scope_lookup(ctx->current_scope, none_var);
             if (current && !cbm_type_is_unknown(current)) {
                 const CBMType *narrowed = py_strip_none(ctx, current);
-                cbm_scope_bind(ctx->current_scope, none_var, narrowed);
+                py_scope_bind(ctx, none_var, narrowed);
             }
         }
 
         py_resolve_calls_in(ctx, body);
-        ctx->current_scope = saved;
+        py_scope_restore(ctx, saved);
     }
 
     // Alternative branch: include else / elif. Recurse without narrowing —
@@ -2136,14 +2336,14 @@ static void py_walk_if_statement(PyLSPContext *ctx, TSNode if_node) {
     // enclosing scope so subsequent statements see the narrowed type.
     if (!ts_node_is_null(body) && py_block_terminates(body)) {
         if (neg_isinstance && neg_name && neg_type) {
-            cbm_scope_bind(ctx->current_scope, neg_name, neg_type);
+            py_scope_bind(ctx, neg_name, neg_type);
         }
         if (neg_none_kind == -1 && neg_none_var) {
             // `if x is None: return` -> narrow x to non-None afterwards.
             const CBMType *current = cbm_scope_lookup(ctx->current_scope, neg_none_var);
             if (current && !cbm_type_is_unknown(current)) {
                 const CBMType *narrowed = py_strip_none(ctx, current);
-                cbm_scope_bind(ctx->current_scope, neg_none_var, narrowed);
+                py_scope_bind(ctx, neg_none_var, narrowed);
             }
         }
     }
@@ -2314,7 +2514,7 @@ static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
                         char *cls_text = py_node_text(ctx, cls);
                         if (cls_text) {
                             const CBMType *narrowed = py_resolve_annotation(ctx, cls_text);
-                            cbm_scope_bind(ctx->current_scope, subject_name, narrowed);
+                            py_scope_bind(ctx, subject_name, narrowed);
                         }
                     }
                     // Bind capture sub-patterns to UNKNOWN.
@@ -2325,7 +2525,7 @@ static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
                                 TSNode id = ts_node_named_child(sub, 0);
                                 char *nm = py_node_text(ctx, id);
                                 if (nm)
-                                    cbm_scope_bind(ctx->current_scope, nm, cbm_type_unknown());
+                                    py_scope_bind(ctx, nm, cbm_type_unknown());
                             }
                         }
                     }
@@ -2359,7 +2559,7 @@ static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
                             if (strcmp(ts_node_type(id), "identifier") == 0) {
                                 char *nm = py_node_text(ctx, id);
                                 if (nm && elem_t) {
-                                    cbm_scope_bind(ctx->current_scope, nm, elem_t);
+                                    py_scope_bind(ctx, nm, elem_t);
                                 }
                             }
                             continue;
@@ -2367,7 +2567,7 @@ static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
                         if (strcmp(ek, "identifier") == 0) {
                             char *nm = py_node_text(ctx, elem);
                             if (nm && elem_t) {
-                                cbm_scope_bind(ctx->current_scope, nm, elem_t);
+                                py_scope_bind(ctx, nm, elem_t);
                             }
                             continue;
                         }
@@ -2395,7 +2595,7 @@ static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
                                 if (nm && elem_t) {
                                     const CBMType *lst =
                                         cbm_type_template(ctx->arena, "list", &elem_t, 1);
-                                    cbm_scope_bind(ctx->current_scope, nm, lst);
+                                    py_scope_bind(ctx, nm, lst);
                                 }
                             }
                         }
@@ -2405,7 +2605,7 @@ static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
                 if (!ts_node_is_null(conseq)) {
                     py_resolve_calls_in(ctx, conseq);
                 }
-                ctx->current_scope = saved;
+                py_scope_restore(ctx, saved);
             }
         }
         return;
@@ -2440,7 +2640,7 @@ static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
         for (uint32_t i = 0; i < cnc; i++) {
             py_resolve_calls_in(ctx, ts_node_named_child(node, i));
         }
-        ctx->current_scope = saved;
+        py_scope_restore(ctx, saved);
         return;
     }
 
@@ -3002,7 +3202,7 @@ static void py_bind_parameters(PyLSPContext *ctx, TSNode params) {
             const CBMType *args[3] = {str_t, t, NULL};
             t = cbm_type_template(ctx->arena, "dict", args, 2);
         }
-        cbm_scope_bind(ctx->current_scope, name, t);
+        py_scope_bind(ctx, name, t);
     }
 }
 
@@ -3027,9 +3227,9 @@ static void py_process_function(PyLSPContext *ctx, TSNode func_node, const char 
     // For methods, bind `self`/`cls` AFTER param walk so the receiver type
     // wins over the unannotated `self` / `cls` parameter declaration.
     if (ctx->enclosing_class_qn) {
-        cbm_scope_bind(ctx->current_scope, "self",
+        py_scope_bind(ctx, "self",
                        cbm_type_named(ctx->arena, ctx->enclosing_class_qn));
-        cbm_scope_bind(ctx->current_scope, "cls",
+        py_scope_bind(ctx, "cls",
                        cbm_type_named(ctx->arena, ctx->enclosing_class_qn));
     }
 
@@ -3053,7 +3253,7 @@ static void py_process_function(PyLSPContext *ctx, TSNode func_node, const char 
         }
     }
 
-    ctx->current_scope = saved;
+    py_scope_restore(ctx, saved);
     ctx->enclosing_func_qn = prev_func;
 }
 
@@ -3166,7 +3366,7 @@ static void py_bind_module_classes(PyLSPContext *ctx) {
             continue;
         if (qn[prefix_len] != '.')
             continue;
-        cbm_scope_bind(ctx->current_scope, sname, cbm_type_named(ctx->arena, qn));
+        py_scope_bind(ctx, sname, cbm_type_named(ctx->arena, qn));
     }
 }
 
