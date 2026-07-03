@@ -482,6 +482,11 @@ bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t
 #define CBM_CONFIG_UI_ENABLED "ui_enabled"
 #define CBM_CONFIG_UI_PORT "ui_port"
 
+#define CBM_CONFIG_MEMORY_ENABLED "memory_enabled"
+#define CBM_CONFIG_MEMORY_DIR "memory_dir"
+#define CBM_CONFIG_MEMORY_DEFAULT_SCOPE "memory_default_scope"
+#define CBM_CONFIG_AUTO_UPDATE "auto_update"
+
 /* Whether the background watcher subsystem should run at all (default true).
  * When false, the daemon host skips building and starting the watcher entirely:
  * the poll thread never starts and no projects are registered (#335). Read once
