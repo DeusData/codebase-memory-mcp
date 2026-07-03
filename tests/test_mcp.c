@@ -1170,6 +1170,49 @@ TEST(tool_query_graph_warns_on_stale_route_view) {
     PASS();
 }
 
+TEST(tool_query_graph_reports_dirty_metadata_as_canonical_only) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "query-dirty-metadata";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/query-dirty-metadata"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    cbm_node_t node = {.project = proj,
+                       .label = "Function",
+                       .name = "QueryStillVisible",
+                       .qualified_name = "query.dirty.QueryStillVisible",
+                       .file_path = "src/query_dirty.c"};
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    cbm_dirty_file_state_t dirty = {.project = proj,
+                                    .rel_path = "src/query_dirty.c",
+                                    .observed_hash = "query-dirty-hash",
+                                    .observed_generation = 11,
+                                    .source = CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX,
+                                    .status = CBM_STORE_DIRTY_STATUS_PENDING};
+    ASSERT_EQ(cbm_store_upsert_dirty_file(st, &dirty), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":147,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"query_graph\","
+             "\"arguments\":{\"project\":\"query-dirty-metadata\","
+             "\"query\":\"MATCH (f:Function) RETURN f.name LIMIT 5\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "QueryStillVisible"));
+    ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
+    ASSERT_NOT_NULL(strstr(inner, "query_graph reads canonical graph rows"));
+    ASSERT_TRUE(has_dirty_freshness_counts(inner, 1, 0));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_query_graph_warns_when_broad_query_returns_stale_route) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -3877,6 +3920,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_semantic_query_warns_on_stale_semantic_view);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_query_graph_warns_on_stale_route_view);
+    RUN_TEST(tool_query_graph_reports_dirty_metadata_as_canonical_only);
     RUN_TEST(tool_query_graph_warns_when_broad_query_returns_stale_route);
     RUN_TEST(tool_query_graph_warns_on_stale_semantic_edges);
     RUN_TEST(tool_query_graph_warns_on_stale_similarity_edges);

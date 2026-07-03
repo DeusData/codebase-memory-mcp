@@ -3865,6 +3865,14 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     add_query_graph_derived_warnings(doc, root, store, project, query, &result);
+    int dirty_pending = 0;
+    int dirty_overlay_ready = 0;
+    if (get_dirty_file_counts(store, project, &dirty_pending, &dirty_overlay_ready)) {
+        add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
+        add_response_warning(doc, root,
+                             "query_graph reads canonical graph rows; dirty file changes may "
+                             "be absent until overlay or reindex completes.");
+    }
 
     /* columns */
     yyjson_mut_val *cols = yyjson_mut_arr(doc);
