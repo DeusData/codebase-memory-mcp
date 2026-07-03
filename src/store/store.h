@@ -45,6 +45,7 @@ typedef struct cbm_store cbm_store_t;
 #define CBM_STORE_OVERLAY_STATUS_COMPACTING "compacting"
 #define CBM_STORE_OVERLAY_STATUS_COMPACTED "compacted"
 #define CBM_STORE_OVERLAY_STATUS_FAILED "failed"
+#define CBM_STORE_OVERLAY_TOMBSTONE_FILE "file"
 #define CBM_STORE_DERIVED_GENERATION_UNKNOWN 0
 #define CBM_STORE_DERIVED_KIND_DIRECT "direct"
 #define CBM_STORE_DERIVED_VIEW_NODES_FTS "nodes_fts"
@@ -660,6 +661,13 @@ int cbm_store_set_overlay_generation_status(cbm_store_t *s, const char *project,
                                             const char *status);
 int cbm_store_count_overlay_generations(cbm_store_t *s, const char *project,
                                         const char *status, int *out_count);
+
+/* Publish one file's replacement facts into overlay storage. This does not
+ * mutate canonical nodes/edges; active read paths decide later how to combine
+ * canonical rows, tombstones, and overlay rows. */
+int cbm_store_publish_overlay_file_delta(cbm_store_t *s,
+                                         const cbm_store_file_delta_t *delta,
+                                         int64_t overlay_generation);
 
 /* Record derived-view freshness. Status must be one of CBM_STORE_DERIVED_STATUS_*. */
 int cbm_store_set_derived_view_state(cbm_store_t *s, const char *project,
