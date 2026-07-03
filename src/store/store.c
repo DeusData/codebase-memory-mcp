@@ -49,6 +49,7 @@ enum {
     ST_SEARCH_MAX_BINDS = 32, /* increased: LIKE pre-filter adds binds per pattern */
     ST_LIKE_POOL_MAX = 12,    /* max malloc'd LIKE strings alive during one search */
     ST_LIKE_HINT_MAX = 2,     /* max LIKE hints extracted per regex pattern */
+    ST_SEARCH_CONNECTED_NAMES_LIMIT = 10,
     ST_BFS_EDGE_TYPE_LIMIT = 16,
     ST_MAX_PKGS = 64,
     ST_INIT_CAP_4 = 4,
@@ -6323,7 +6324,7 @@ static bool search_overlay_needs_active_edges(const cbm_search_params_t *params)
     if (!params) {
         return false;
     }
-    if (params->relationship || params->exclude_entry_points ||
+    if (params->relationship || params->exclude_entry_points || params->include_connected ||
         params->min_degree >= 0 || params->max_degree >= 0) {
         return true;
     }
@@ -6388,6 +6389,80 @@ static int search_build_active_overlay_cte(char *buf, size_t buf_sz, bool includ
                  STORE_OVERLAY_ROW_OWNED);
     if (n < 0 || used + (size_t)n >= buf_sz) {
         return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+static int search_overlay_collect_connected_names(cbm_store_t *s, const char *active_cte,
+                                                  const cbm_search_params_t *params,
+                                                  const char *qualified_name,
+                                                  const char ***out_names, int *out_count) {
+    if (!s || !active_cte || !params || !qualified_name || !out_names || !out_count) {
+        return CBM_STORE_ERR;
+    }
+    *out_names = NULL;
+    *out_count = 0;
+
+    char sql[ST_SQL_BUF];
+    int bind_limit = params->relationship ? ST_COL_6 : ST_COL_5;
+    int n = snprintf(sql, sizeof(sql),
+                     "%s"
+                     "SELECT DISTINCT nb.name"
+                     "  FROM active_edges e"
+                     "  JOIN active_nodes nb"
+                     "    ON ((e.source_qn = ?3 AND nb.qualified_name = e.target_qn)"
+                     "     OR (e.target_qn = ?4 AND nb.qualified_name = e.source_qn))"
+                     " WHERE nb.name IS NOT NULL AND nb.name <> ''%s"
+                     " ORDER BY nb.name LIMIT ?%d",
+                     active_cte, params->relationship ? " AND e.type = ?5" : "", bind_limit);
+    if (n < 0 || (size_t)n >= sizeof(sql)) {
+        store_set_error(s, "search_overlay_connected SQL truncated");
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "search_overlay_connected prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    bind_text(stmt, ST_COL_3, qualified_name);
+    bind_text(stmt, ST_COL_4, qualified_name);
+    if (params->relationship) {
+        bind_text(stmt, ST_COL_5, params->relationship);
+    }
+    sqlite3_bind_int(stmt, bind_limit, ST_SEARCH_CONNECTED_NAMES_LIMIT);
+
+    char **names = NULL;
+    int count = 0;
+    int rc = store_collect_text_column(s, stmt, "search_overlay_connected", &names, &count);
+    sqlite3_finalize(stmt);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    *out_names = (const char **)names;
+    *out_count = count;
+    return CBM_STORE_OK;
+}
+
+static int search_overlay_enrich_connected(cbm_store_t *s, const char *active_cte,
+                                           const cbm_search_params_t *params,
+                                           cbm_search_output_t *out) {
+    if (!params->include_connected || !out) {
+        return CBM_STORE_OK;
+    }
+    for (int i = 0; i < out->count; i++) {
+        cbm_search_result_t *result = &out->results[i];
+        if (!result->node.qualified_name || !result->node.qualified_name[0]) {
+            continue;
+        }
+        if (search_overlay_collect_connected_names(s, active_cte, params,
+                                                   result->node.qualified_name,
+                                                   &result->connected_names,
+                                                   &result->connected_count) != CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
     }
     return CBM_STORE_OK;
 }
@@ -6829,8 +6904,16 @@ int cbm_store_search_overlay_view(cbm_store_t *s, const cbm_search_params_t *par
     }
     strncat(sql, order_limit, sizeof(sql) - strlen(sql) - 1);
 
-    return search_execute_sql(s, sql, count_sql, binds, bind_idx, &like_pool, use_pagerank,
-                              "search_overlay_view", out);
+    int rc = search_execute_sql(s, sql, count_sql, binds, bind_idx, &like_pool, use_pagerank,
+                                "search_overlay_view", out);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    if (search_overlay_enrich_connected(s, active_cte, params, out) != CBM_STORE_OK) {
+        cbm_store_search_free(out);
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
 }
 
 void cbm_store_search_free(cbm_search_output_t *out) {

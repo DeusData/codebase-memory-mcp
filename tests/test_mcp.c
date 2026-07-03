@@ -964,15 +964,17 @@ TEST(tool_search_graph_uses_overlay_active_relationship_rows) {
                                    "\"params\":{\"name\":\"search_graph\","
                                    "\"arguments\":{\"project\":\"search-overlay-relationship\","
                                    "\"relationship\":\"CALLS\",\"sort_by\":\"name\","
-                                   "\"limit\":5}}}");
+                                   "\"include_connected\":true,\"limit\":5}}}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "new_main"));
     ASSERT_NOT_NULL(strstr(inner, "stable"));
     ASSERT_NULL(strstr(inner, "old_main"));
+    ASSERT_NOT_NULL(strstr(inner, "\"connected_names\""));
     ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_graph\""));
     ASSERT_NOT_NULL(strstr(inner, "overlay active node and relationship rows"));
+    ASSERT_NOT_NULL(strstr(inner, "include_connected uses active one-hop names"));
 
     free(inner);
     free(resp);

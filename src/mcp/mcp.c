@@ -297,11 +297,10 @@ static void add_overlay_active_node_search_freshness(
         doc, root,
         uses_active_edges
             ? "search_graph graph mode used overlay active node and relationship rows; "
-              "connected-neighbor enrichment, FTS query mode, and trace results remain "
-              "canonical until separately enabled."
-            : "search_graph graph mode used overlay active node rows; connected-neighbor "
-              "enrichment, FTS query mode, and trace results remain canonical until "
-              "separately enabled.");
+              "include_connected uses active one-hop names when requested; FTS query mode "
+              "and trace results remain canonical until separately enabled."
+            : "search_graph graph mode used overlay active node rows; FTS query mode and "
+              "trace results remain canonical until separately enabled.");
 }
 
 static void add_pipeline_exact_delta_stats(yyjson_mut_doc *doc, yyjson_mut_val *root,
@@ -2987,6 +2986,19 @@ static void enrich_connected(yyjson_mut_doc *doc, yyjson_mut_val *item, cbm_stor
     }
 }
 
+static void add_search_result_connected_names(yyjson_mut_doc *doc, yyjson_mut_val *item,
+                                              const cbm_search_result_t *sr) {
+    yyjson_mut_val *conn = yyjson_mut_arr(doc);
+    for (int i = 0; i < sr->connected_count; i++) {
+        if (sr->connected_names[i] && sr->connected_names[i][0]) {
+            yyjson_mut_arr_add_strcpy(doc, conn, sr->connected_names[i]);
+        }
+    }
+    if (yyjson_mut_arr_size(conn) > 0) {
+        yyjson_mut_obj_add_val(doc, item, "connected_names", conn);
+    }
+}
+
 /* Build an FTS5 MATCH expression from a free-form query string by splitting
  * on whitespace and joining the terms with OR.  Each token is also sanitized:
  * anything that isn't alnum or underscore is dropped, so the caller can't
@@ -3239,8 +3251,9 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
  * into those parsed docs. The caller also frees out_pdocs itself. */
 static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                 const cbm_search_output_t *out, cbm_store_t *store,
-                                const char *relationship, bool include_connected, int offset,
-                                int limit, bool compact, const char *session_project,
+                                const char *relationship, bool include_connected,
+                                bool connected_names_authoritative, int offset, int limit,
+                                bool compact, const char *session_project,
                                 yyjson_doc ***out_pdocs, int *out_pdoc_count) {
     yyjson_doc **pdocs = out->count > 0 ? malloc((size_t)out->count * sizeof(yyjson_doc *)) : NULL;
     int pdoc_count = 0;
@@ -3288,7 +3301,9 @@ static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
             yyjson_mut_obj_add_bool(doc, item, "read_only", true);
         }
 
-        if (include_connected && sr->node.id > 0) {
+        if (include_connected && sr->connected_count > 0) {
+            add_search_result_connected_names(doc, item, sr);
+        } else if (include_connected && !connected_names_authoritative && sr->node.id > 0) {
             enrich_connected(doc, item, store, sr->node.id, relationship);
         }
         yyjson_doc *pdoc = enrich_node_properties(doc, item, sr->node.properties_json);
@@ -3738,11 +3753,11 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             CBM_STORE_OK &&
         overlay_summary.active_file_tombstones > 0;
     bool overlay_active_edges_requested =
-        relationship || exclude_entry_points || min_degree >= 0 || max_degree >= 0 ||
+        relationship || include_connected || exclude_entry_points ||
+        min_degree >= 0 || max_degree >= 0 ||
         (sort_by && (strcmp(sort_by, "degree") == 0 || strcmp(sort_by, "calls") == 0 ||
                      strcmp(sort_by, "linkrank") == 0));
-    bool overlay_requires_canonical_edge_ids = include_connected;
-    bool overlay_search_used = overlay_ready_for_nodes && !overlay_requires_canonical_edge_ids;
+    bool overlay_search_used = overlay_ready_for_nodes;
     if (overlay_search_used) {
         cbm_store_search_overlay_view(store, &params, &out);
     } else {
@@ -3760,8 +3775,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
      * results array below, so emitting here would create a duplicate "results"
      * key (yyjson keeps the first on lookup). */
     if (!is_summary) {
-        emit_search_results(doc, root, &out, store, relationship, include_connected, offset,
-                            limit, compact, srv->session_project,
+        emit_search_results(doc, root, &out, store, relationship, include_connected,
+                            overlay_search_used && include_connected, offset, limit, compact,
+                            srv->session_project,
                             &props_docs, &props_doc_count);
     }
 
@@ -3774,11 +3790,6 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     if (overlay_search_used) {
         add_overlay_active_node_search_freshness(doc, root, &overlay_summary,
                                                  overlay_active_edges_requested);
-    } else if (overlay_ready_for_nodes && overlay_requires_canonical_edge_ids) {
-        add_response_warning(doc, root,
-                             "overlay rows are ready, but this search_graph request used "
-                             "canonical graph rows because connected-neighbor enrichment "
-                             "needs canonical edge ids until overlay connected reads are enabled.");
     }
     if (search_graph_uses_route_derived_graph(label, relationship) &&
         cbm_store_derived_view_is_stale(store, project, CBM_STORE_DERIVED_VIEW_ROUTES)) {

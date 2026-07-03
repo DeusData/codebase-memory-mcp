@@ -1775,6 +1775,7 @@ TEST(store_search_overlay_view_uses_active_relationship_edges) {
                                   .relationship = "CALLS",
                                   .sort_by = "name",
                                   .limit = 10,
+                                  .include_connected = true,
                                   .min_degree = 0,
                                   .max_degree = -1};
     cbm_search_output_t active = {0};
@@ -1791,6 +1792,10 @@ TEST(store_search_overlay_view_uses_active_relationship_edges) {
     ASSERT_EQ(active.results[0].node.id, CBM_STORE_NO_NODE_ID);
     ASSERT_GT(active.results[1].in_degree, 0);
     ASSERT_GT(active.results[0].out_degree, 0);
+    ASSERT_EQ(active.results[0].connected_count, 1);
+    ASSERT_EQ(active.results[1].connected_count, 1);
+    ASSERT_STR_EQ(active.results[0].connected_names[0], "stable");
+    ASSERT_STR_EQ(active.results[1].connected_names[0], "new_main");
 
     cbm_store_search_free(&active);
     cbm_store_search_free(&expected);
