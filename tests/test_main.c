@@ -12,6 +12,7 @@ int tf_filter_count = 0;
 #include "test_framework.h"
 #include "foundation/compat.h"
 #include "foundation/constants.h"
+#include "foundation/profile.h"
 #include <sqlite3.h>
 
 /* Forward declarations of suite functions */
@@ -121,6 +122,8 @@ extern void cbm_kind_in_set_free_cache(void);
 #define ENV_OVERWRITE 1
 
 int main(void) {
+    cbm_profile_init();
+
     printf("\n  codebase-memory-mcp  C test suite\n");
 
     /* DEFAULT-ON store isolation: redirect every test index into a per-run
