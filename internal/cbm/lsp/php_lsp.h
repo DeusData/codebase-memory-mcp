@@ -50,6 +50,11 @@ typedef struct {
     /* Recursion guard for php_eval_expr_type. */
     int eval_depth;
 
+    /* AST-walk recursion depth for php_resolve_calls_in_node (guards stack
+     * overflow on deeply-nested/cyclic files; see cbm_lsp_max_walk_depth).
+     * Zero via memset. */
+    int walk_depth;
+
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;
 } PHPLSPContext;

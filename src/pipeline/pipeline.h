@@ -79,6 +79,36 @@ void cbm_pipeline_get_excluded(const cbm_pipeline_t *p, char ***out, int *count)
  * Nodes are the #334 plausibility-gate axis; edges are informational only. */
 void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges);
 
+/* ── Per-file indexing failures (Stage 2 / Track B) ─────────────── */
+
+/* One source file that was skipped during indexing. All strings are owned by
+ * the pipeline (copied on record, freed in cbm_pipeline_free). A skip is the
+ * expected, handled outcome of a bad/oversized file — indexing continues and
+ * the run still reports status "indexed"; these are surfaced (not errors that
+ * fail the run) via MCP `skipped[]` / the CLI / a per-run logfile. */
+typedef struct {
+    char *path;   /* repo-relative path of the skipped file */
+    char *reason; /* human-readable cause (e.g. "oversized (712 MB > 512 MB)",
+                   * "parse timeout", "read failed") */
+    char *phase;  /* "read" | "extract" | "oversized". "cross_lsp" is a RESERVED
+                   * phase string for Track C's crash-attribution signal and is
+                   * intentionally NOT emitted today (the cross-LSP passes are
+                   * best-effort/void with no genuine per-file failure). */
+} cbm_file_error_t;
+
+/* Record a skipped file. path/reason/phase are copied. NULL-safe on p.
+ *
+ * NOT thread-safe: call it from the sequential extraction pass, or from the
+ * parallel merge step (never from inside a parallel worker — workers collect
+ * into per-worker lists and merge sequentially). */
+void cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char *reason,
+                                 const char *phase);
+
+/* Borrowed accessor for the recorded skips (owned by the pipeline, valid until
+ * cbm_pipeline_free()). out and count are set to NULL and 0 when p is NULL or
+ * nothing was skipped. Do not free. */
+void cbm_pipeline_get_file_errors(const cbm_pipeline_t *p, cbm_file_error_t **out, int *count);
+
 /* ── Index lock (prevents concurrent pipeline runs on same DB) ──── */
 
 /* Try to acquire the global index lock. Returns true if acquired,

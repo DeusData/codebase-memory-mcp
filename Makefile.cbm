@@ -112,7 +112,8 @@ FOUNDATION_SRCS = \
     src/foundation/mem.c \
     src/foundation/diagnostics.c \
     src/foundation/profile.c \
-    src/foundation/dump_verify.c
+    src/foundation/dump_verify.c \
+    src/foundation/limits.c
 
 # Existing extraction C code (compiled from current location)
 EXTRACTION_SRCS = \
@@ -345,7 +346,7 @@ TEST_DISCOVER_SRCS = \
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c
+TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 
@@ -567,7 +568,7 @@ $(UNIXCODER_OBJ): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUIL
 OBJS_VENDORED_TEST = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $(GRAMMAR_OBJS_TEST) $(TS_RUNTIME_OBJ_TEST) $(LSP_OBJ_TEST) $(PP_OBJ_TEST) $(LZ4_OBJ_TEST) $(ZSTD_OBJ_TEST) $(UNIXCODER_OBJ)
 
 $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TEST) -o $@ \
+	$(CC) $(CFLAGS_TEST) -Itests -Itests/repro -o $@ \
 		$(ALL_TEST_SRCS) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_TEST) \

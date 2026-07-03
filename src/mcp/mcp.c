@@ -3134,13 +3134,96 @@ static void add_excluded_summary(yyjson_mut_doc *doc, yyjson_mut_val *root, char
     yyjson_mut_obj_add_val(doc, root, "excluded", excluded);
 }
 
+/* Cap on per-file skips embedded in the JSON response — keep it compact on
+ * large repos. The FULL, uncapped list always goes to the per-run logfile;
+ * the JSON carries "count" + "truncated" so nothing is silently hidden. */
+enum { INDEX_SKIPPED_FILE_CAP = 50 };
+
+/* Attach a summary of per-file skips (Stage 2 / Track B). Always emits a
+ * top-level "skipped_count" (0 on clean runs) so consumers can rely on it.
+ * When there are skips, also emits:
+ *   "skipped": {"files":[{path,reason,phase}..(<=50)], "count":N, "truncated":bool}
+ * and, if a per-run logfile was written, "logfile": "<path>".
+ * The run status stays "indexed" — a skipped file is the expected handled
+ * outcome, not a failure. errs[] is borrowed (copied into doc). */
+static void add_skipped_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                const cbm_file_error_t *errs, int count, const char *logfile) {
+    yyjson_mut_obj_add_int(doc, root, "skipped_count", count < 0 ? 0 : count);
+    if (!errs || count <= 0) {
+        return;
+    }
+    yyjson_mut_val *skipped = yyjson_mut_obj(doc);
+    yyjson_mut_val *files = yyjson_mut_arr(doc);
+    int shown = count < INDEX_SKIPPED_FILE_CAP ? count : INDEX_SKIPPED_FILE_CAP;
+    for (int i = 0; i < shown; i++) {
+        yyjson_mut_val *fe = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, fe, "path", errs[i].path ? errs[i].path : "");
+        yyjson_mut_obj_add_strcpy(doc, fe, "reason", errs[i].reason ? errs[i].reason : "");
+        yyjson_mut_obj_add_strcpy(doc, fe, "phase", errs[i].phase ? errs[i].phase : "");
+        yyjson_mut_arr_add_val(files, fe);
+    }
+    yyjson_mut_obj_add_val(doc, skipped, "files", files);
+    yyjson_mut_obj_add_int(doc, skipped, "count", count);
+    yyjson_mut_obj_add_bool(doc, skipped, "truncated", count > INDEX_SKIPPED_FILE_CAP);
+    yyjson_mut_obj_add_val(doc, root, "skipped", skipped);
+    if (logfile && logfile[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "logfile", logfile);
+    }
+}
+
+/* Write the FULL (uncapped) skip list to a per-run logfile — ONLY when >=1 file
+ * was skipped (no logfile on a clean run). Location:
+ *   $CBM_INDEX_LOG (override) else <cache_dir>/logs/<project>-<epoch>.log
+ * Returns true and fills out_path on success. */
+static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs, int count,
+                               char *out_path, size_t out_sz) {
+    if (!errs || count <= 0) {
+        return false;
+    }
+    char path[CBM_SZ_1K];
+    const char *override = getenv("CBM_INDEX_LOG");
+    if (override && override[0]) {
+        snprintf(path, sizeof(path), "%s", override);
+    } else {
+        const char *cdir = cbm_resolve_cache_dir();
+        if (!cdir) {
+            return false;
+        }
+        char logdir[CBM_SZ_1K];
+        snprintf(logdir, sizeof(logdir), "%s/logs", cdir);
+        cbm_mkdir_p(logdir, 0755);
+        snprintf(path, sizeof(path), "%s/%s-%lld.log", logdir, project ? project : "index",
+                 (long long)time(NULL));
+    }
+    FILE *f = cbm_fopen(path, "wb");
+    if (!f) {
+        cbm_log_warn("index.logfile_open_fail", "path", path);
+        return false;
+    }
+    (void)fprintf(f, "# codebase-memory-mcp index skip report\n");
+    (void)fprintf(f, "# project=%s skipped=%d\n", project ? project : "", count);
+    (void)fprintf(f, "# columns: phase\treason\tpath\n");
+    for (int i = 0; i < count; i++) {
+        (void)fprintf(f, "%s\t%s\t%s\n", errs[i].phase ? errs[i].phase : "",
+                      errs[i].reason ? errs[i].reason : "", errs[i].path ? errs[i].path : "");
+    }
+    (void)fclose(f);
+    if (out_path && out_sz) {
+        snprintf(out_path, out_sz, "%s", path);
+    }
+    return true;
+}
+
 /* Build the success portion of the index_repository response.
  * Returns true when status should be "degraded" (#334 plausibility gate). */
 static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *doc,
                                          yyjson_mut_val *root, const char *project_name,
                                          const char *repo_path, bool persistence, cbm_pipeline_t *p,
-                                         char **excluded_dirs, int excluded_count) {
+                                         char **excluded_dirs, int excluded_count,
+                                         const cbm_file_error_t *file_errors, int file_error_count,
+                                         const char *logfile) {
     add_excluded_summary(doc, root, excluded_dirs, excluded_count);
+    add_skipped_summary(doc, root, file_errors, file_error_count, logfile);
 
     int exp_nodes = -1;
     int exp_edges = -1;
@@ -3302,6 +3385,12 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     int excluded_count = 0;
     cbm_pipeline_get_excluded(p, &excluded_dirs, &excluded_count);
 
+    /* Capture the per-file skip list (Stage 2 / Track B) while the pipeline
+     * still owns the strings; the response builder copies them into the doc. */
+    cbm_file_error_t *file_errors = NULL;
+    int file_error_count = 0;
+    cbm_pipeline_get_file_errors(p, &file_errors, &file_error_count);
+
     cbm_mem_collect(); /* return mimalloc pages to OS after large indexing */
 
     /* Invalidate cached store so next query reopens the fresh database */
@@ -3319,8 +3408,15 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_str(doc, root, "project", project_name);
 
     if (rc == 0) {
-        bool degraded = build_index_success_response(srv, doc, root, project_name, repo_path,
-                                                     persistence, p, excluded_dirs, excluded_count);
+        /* Write the per-run logfile ONLY when there were skips (no logfile on a
+         * clean run). The FULL list goes to the file; the JSON caps at 50. */
+        char logfile_path[CBM_SZ_1K];
+        logfile_path[0] = '\0';
+        bool has_logfile = write_skip_logfile(project_name, file_errors, file_error_count,
+                                              logfile_path, sizeof(logfile_path));
+        bool degraded = build_index_success_response(
+            srv, doc, root, project_name, repo_path, persistence, p, excluded_dirs, excluded_count,
+            file_errors, file_error_count, has_logfile ? logfile_path : NULL);
         yyjson_mut_obj_add_str(doc, root, "status", degraded ? "degraded" : "indexed");
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");

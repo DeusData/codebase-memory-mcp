@@ -62,7 +62,22 @@
 
 /* ── forward declarations ─────────────────────────────────────────── */
 
-static void kt_resolve_calls_in_node(KotlinLSPContext *ctx, TSNode node);
+static void kt_resolve_calls_in_node_inner(KotlinLSPContext *ctx, TSNode node);
+
+/* Depth-guarded entry for the AST call-resolution walk. The walk recurses once
+ * per nesting level; a deeply-nested or cyclic file can overflow the native
+ * stack (SIGSEGV) and take down the whole index. Past the cap the subtree is
+ * skipped — its calls stay unresolved, which is graceful degradation, not a
+ * crash. The cap is CBM_LSP_MAX_WALK_DEPTH, env-overridable via the same name.
+ * The walk_depth-- runs after the inner returns, so early returns in the body
+ * never leak the counter. */
+static void kt_resolve_calls_in_node(KotlinLSPContext *ctx, TSNode node) {
+    if (ctx->walk_depth >= cbm_lsp_max_walk_depth())
+        return;
+    ctx->walk_depth++;
+    kt_resolve_calls_in_node_inner(ctx, node);
+    ctx->walk_depth--;
+}
 static void kt_process_class_decl(KotlinLSPContext *ctx, TSNode node);
 static void kt_process_object_decl(KotlinLSPContext *ctx, TSNode node, bool is_companion,
                                    const char *outer_class_qn);
@@ -3174,7 +3189,7 @@ static void kt_process_statement(KotlinLSPContext *ctx, TSNode stmt) {
 /* Generic walker that fires call resolution on every call_expression in
  * a subtree, *without* descending into nested function/class bodies (those
  * are processed separately with their own scope). */
-static void kt_resolve_calls_in_node(KotlinLSPContext *ctx, TSNode node) {
+static void kt_resolve_calls_in_node_inner(KotlinLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node)) {
         return;
     }

@@ -68,6 +68,7 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "foundation/str_util.h"
 #include "foundation/profile.h"
 #include "foundation/compat_regex.h"
+#include "foundation/limits.h"
 #include "cbm.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
@@ -87,22 +88,51 @@ static uint64_t extract_now_ns(void) {
 
 /* ── Helpers (duplicated from pass files — kept static for isolation) ── */
 
-/* Read file into a malloc'd buffer (= mimalloc in production). */
-static char *read_file(const char *path, int *out_len) {
+/* Read file into a malloc'd buffer (= mimalloc in production).
+ * *out_size receives the on-disk size and *out_status the failure reason so the
+ * caller can attribute a skip to the right phase (read vs oversized) instead of
+ * a silent drop. Both out params may be NULL. */
+static char *read_file(const char *path, int *out_len, long *out_size,
+                       cbm_read_status_t *out_status) {
+    if (out_size) {
+        *out_size = 0;
+    }
+    if (out_status) {
+        *out_status = CBM_READ_OK;
+    }
     FILE *f = cbm_fopen(path, "rb");
     if (!f) {
+        if (out_status) {
+            *out_status = CBM_READ_OPEN_FAIL;
+        }
         return NULL;
     }
     (void)fseek(f, 0, SEEK_END);
     long size = ftell(f);
     (void)fseek(f, 0, SEEK_SET);
-    if (size <= 0 || size > (long)CBM_PERCENT * CBM_SZ_1K * CBM_SZ_1K) {
+    if (out_size) {
+        *out_size = size;
+    }
+    if (size <= 0) {
         (void)fclose(f);
+        if (out_status) {
+            *out_status = CBM_READ_EMPTY;
+        }
+        return NULL;
+    }
+    if (size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
+        (void)fclose(f);
+        if (out_status) {
+            *out_status = CBM_READ_OVERSIZED;
+        }
         return NULL;
     }
     char *buf = (char *)malloc((size_t)size + SKIP_ONE);
     if (!buf) {
         (void)fclose(f);
+        if (out_status) {
+            *out_status = CBM_READ_OOM;
+        }
         return NULL;
     }
     size_t nread = fread(buf, SKIP_ONE, (size_t)size, f);
@@ -110,6 +140,50 @@ static char *read_file(const char *path, int *out_len) {
     buf[nread] = '\0';
     *out_len = (int)nread;
     return buf;
+}
+
+/* ── Per-worker skip list (Stage 2 / Track B) ───────────────────────
+ * Each extract worker appends read/extract/oversized skips into its OWN list
+ * (no lock on the hot path); the lists are merged into the pipeline's
+ * cbm_file_error_t array in the existing sequential merge loop. */
+typedef struct {
+    cbm_file_error_t *items;
+    int count;
+    int cap;
+} pp_err_list_t;
+
+/* NULL-safe heap strdup. */
+static char *pp_err_dup(const char *s) {
+    if (!s) {
+        return NULL;
+    }
+    size_t n = strlen(s) + 1;
+    char *d = (char *)malloc(n);
+    if (d) {
+        memcpy(d, s, n);
+    }
+    return d;
+}
+
+static void pp_err_add(pp_err_list_t *list, const char *path, const char *reason,
+                       const char *phase) {
+    if (!list) {
+        return;
+    }
+    if (list->count >= list->cap) {
+        int ncap = list->cap ? list->cap * 2 : 8;
+        cbm_file_error_t *grown =
+            (cbm_file_error_t *)realloc(list->items, (size_t)ncap * sizeof(*grown));
+        if (!grown) {
+            return; /* drop on OOM — never fail extraction to record a skip */
+        }
+        list->items = grown;
+        list->cap = ncap;
+    }
+    list->items[list->count].path = pp_err_dup(path);
+    list->items[list->count].reason = pp_err_dup(reason);
+    list->items[list->count].phase = pp_err_dup(phase);
+    list->count++;
 }
 
 /* Free source buffer. */
@@ -496,7 +570,16 @@ typedef struct {
 
     cbm_pkg_entries_t *pkg_entries; /* per-worker manifest arrays (separate allocation) */
     _Atomic int64_t retained_bytes; /* total source bytes copied into result arenas */
+
+    /* Per-worker skip lists (separate allocation, indexed by worker_id — no hot-
+     * path lock). Merged into the pipeline in the sequential merge loop. */
+    pp_err_list_t *err_lists;
+    _Atomic int oversized_warned; /* throttle for the index.file_oversized WARN */
 } extract_ctx_t;
+
+/* Cap on the number of index.file_oversized WARN lines (the full list still goes
+ * to the response/logfile — this only throttles the stderr noise). */
+enum { PP_OVERSIZED_WARN_MAX = 32 };
 
 /* Insert one definition node (and its route if present) into the local gbuf. */
 static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info_t *fi,
@@ -581,12 +664,34 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
 
         int file_idx = ec->sorted[sort_pos].idx;
         const cbm_file_info_t *fi = &ec->files[file_idx];
+        pp_err_list_t *errs = ec->err_lists ? &ec->err_lists[worker_id] : NULL;
 
         /* Read + extract */
         int source_len = 0;
-        char *source = read_file(fi->path, &source_len);
+        long file_size = 0;
+        cbm_read_status_t rst = CBM_READ_OK;
+        char *source = read_file(fi->path, &source_len, &file_size, &rst);
         if (!source) {
             ws->errors++;
+            if (rst == CBM_READ_OVERSIZED) {
+                /* Never a silent drop: record the oversized skip + a throttled
+                 * WARN so the file surfaces in the response/logfile. */
+                long cap = cbm_max_file_bytes();
+                char reason[96];
+                snprintf(reason, sizeof(reason), "oversized (%lld MB > %lld MB)",
+                         (long long)(file_size / (CBM_SZ_1K * CBM_SZ_1K)),
+                         (long long)(cap / (CBM_SZ_1K * CBM_SZ_1K)));
+                pp_err_add(errs, fi->rel_path, reason, "oversized");
+                if (atomic_fetch_add_explicit(&ec->oversized_warned, SKIP_ONE,
+                                              memory_order_relaxed) < PP_OVERSIZED_WARN_MAX) {
+                    cbm_log_warn("index.file_oversized", "path", fi->rel_path, "size_mb",
+                                 itoa_log((int)(file_size / (CBM_SZ_1K * CBM_SZ_1K))), "cap_mb",
+                                 itoa_log((int)(cap / (CBM_SZ_1K * CBM_SZ_1K))));
+                }
+            } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM) {
+                pp_err_add(errs, fi->rel_path, "read failed", "read");
+            }
+            /* CBM_READ_EMPTY: benign 0-byte file — not reported. */
             continue;
         }
 
@@ -608,9 +713,20 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             log_extract_fail(sort_pos, file_elapsed_ms, fi->rel_path);
             free_source(source);
             ws->errors++;
+            pp_err_add(errs, fi->rel_path, "extract failed", "extract");
             continue;
         }
         log_extract_done(sort_pos, file_elapsed_ms, result->defs.count, fi->rel_path);
+
+        /* Consume the previously-ignored has_error flag: a parse timeout / parse
+         * failure / unsupported-grammar result carries no defs but must still be
+         * reported (phase "extract", reason = the extractor's message). The empty
+         * result flows through unchanged below (the defs loop is a no-op). */
+        if (result->has_error) {
+            pp_err_add(errs, fi->rel_path, result->error_msg ? result->error_msg : "extract failed",
+                       "extract");
+            ws->errors++;
+        }
 
         /* Create definition nodes in local gbuf */
         for (int d = 0; d < result->defs.count; d++) {
@@ -769,6 +885,10 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     /* Per-worker manifest entry arrays (separate from cache-line-aligned worker state) */
     cbm_pkg_entries_t *pkg_entries = calloc(worker_count, sizeof(cbm_pkg_entries_t));
 
+    /* Per-worker skip lists (separate allocation; merged into the pipeline in the
+     * sequential merge loop below). */
+    pp_err_list_t *err_lists = calloc(worker_count, sizeof(pp_err_list_t));
+
     extract_ctx_t ec = {
         .files = files,
         .sorted = sorted,
@@ -781,10 +901,12 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .shared_ids = shared_ids,
         .cancelled = ctx->cancelled,
         .pkg_entries = pkg_entries,
+        .err_lists = err_lists,
     };
     atomic_init(&ec.next_worker_id, 0);
     atomic_init(&ec.next_file_idx, 0);
     atomic_init(&ec.retained_bytes, 0);
+    atomic_init(&ec.oversized_warned, 0);
 
     /* Sub-phase: Dispatch workers (parse + extract per file, PARALLEL) */
     CBM_PROF_START(t_dispatch);
@@ -805,6 +927,24 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         }
     }
     CBM_PROF_END_N("parallel_extract", "4_merge_gbufs_seq", t_merge, total_nodes);
+
+    /* Merge per-worker skip lists into the pipeline (SEQUENTIAL — no lock).
+     * Runs unconditionally (not gated on local_gbuf) so a worker whose files all
+     * failed still surfaces its skips. */
+    if (err_lists) {
+        for (int i = 0; i < worker_count; i++) {
+            for (int j = 0; j < err_lists[i].count; j++) {
+                cbm_pipeline_add_file_error(ctx->pipeline, err_lists[i].items[j].path,
+                                            err_lists[i].items[j].reason,
+                                            err_lists[i].items[j].phase);
+                free(err_lists[i].items[j].path);
+                free(err_lists[i].items[j].reason);
+                free(err_lists[i].items[j].phase);
+            }
+            free(err_lists[i].items);
+        }
+        free(err_lists);
+    }
 
     merge_pkg_entries(ctx, pkg_entries, worker_count);
 
@@ -2422,6 +2562,13 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                 }
                 atomic_fetch_add_explicit(&rc->lsp_cross_processed, SKIP_ONE, memory_order_relaxed);
             } else {
+                /* No retained source → the cross-file LSP refinement no-ops for
+                 * this file. This is a bounded OPTIMIZATION skip, NOT a file
+                 * failure: defs/calls were already extracted and are unaffected.
+                 * Deliberately NOT recorded as a cbm_file_error — doing so would
+                 * flood skipped[] with false positives (itself a false-guard
+                 * bug). The "cross_lsp" phase string is reserved for Track C's
+                 * real crash-attribution signal; leave it unwired here. */
                 atomic_fetch_add_explicit(&rc->lsp_cross_skipped_no_source, SKIP_ONE,
                                           memory_order_relaxed);
             }

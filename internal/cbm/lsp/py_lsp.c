@@ -24,7 +24,22 @@
 #include "py_builtins.c"
 
 // Forward decls
-static void py_resolve_calls_in(PyLSPContext *ctx, TSNode node);
+static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node);
+
+/* Depth-guarded entry for the AST call-resolution walk. The walk recurses once
+ * per nesting level; a deeply-nested or cyclic file can overflow the native
+ * stack (SIGSEGV) and take down the whole index. Past the cap the subtree is
+ * skipped — its calls stay unresolved, which is graceful degradation, not a
+ * crash. The cap is CBM_LSP_MAX_WALK_DEPTH, env-overridable via the same name.
+ * The walk_depth-- runs after the inner returns, so early returns in the body
+ * never leak the counter. */
+static void py_resolve_calls_in(PyLSPContext *ctx, TSNode node) {
+    if (ctx->walk_depth >= cbm_lsp_max_walk_depth())
+        return;
+    ctx->walk_depth++;
+    py_resolve_calls_in_inner(ctx, node);
+    ctx->walk_depth--;
+}
 static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node);
 static void py_process_statement(PyLSPContext *ctx, TSNode node);
 static const CBMRegisteredFunc *py_lookup_attribute(PyLSPContext *ctx, const char *type_qn,
@@ -2199,7 +2214,7 @@ static void py_emit_dunder_call(PyLSPContext *ctx, const CBMType *recv, const ch
     }
 }
 
-static void py_resolve_calls_in(PyLSPContext *ctx, TSNode node) {
+static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
     if (!ctx || ts_node_is_null(node))
         return;
     const char *k = ts_node_type(node);

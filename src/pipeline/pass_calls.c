@@ -23,6 +23,7 @@ enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
 #include "foundation/log.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/limits.h"
 #include "foundation/str_util.h"
 #include "cbm.h"
 #include "service_patterns.h"
@@ -53,7 +54,7 @@ static char *read_file(const char *path, int *out_len) {
     long size = ftell(f);
     (void)fseek(f, 0, SEEK_SET);
 
-    if (size <= 0 || size > (long)CBM_PERCENT * CBM_SZ_1K * CBM_SZ_1K) {
+    if (size <= 0 || size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
         (void)fclose(f);
         return NULL;
     }

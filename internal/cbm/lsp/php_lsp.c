@@ -32,7 +32,22 @@
 extern const TSLanguage *tree_sitter_php_only(void);
 
 /* Forward decls */
-static void php_resolve_calls_in_node(PHPLSPContext *ctx, TSNode node);
+static void php_resolve_calls_in_node_inner(PHPLSPContext *ctx, TSNode node);
+
+/* Depth-guarded entry for the AST call-resolution walk. The walk recurses once
+ * per nesting level; a deeply-nested or cyclic file can overflow the native
+ * stack (SIGSEGV) and take down the whole index. Past the cap the subtree is
+ * skipped — its calls stay unresolved, which is graceful degradation, not a
+ * crash. The cap is CBM_LSP_MAX_WALK_DEPTH, env-overridable via the same name.
+ * The walk_depth-- runs after the inner returns, so early returns in the body
+ * never leak the counter. */
+static void php_resolve_calls_in_node(PHPLSPContext *ctx, TSNode node) {
+    if (ctx->walk_depth >= cbm_lsp_max_walk_depth())
+        return;
+    ctx->walk_depth++;
+    php_resolve_calls_in_node_inner(ctx, node);
+    ctx->walk_depth--;
+}
 static void process_function_like(PHPLSPContext *ctx, TSNode node);
 static void process_class_decl(PHPLSPContext *ctx, TSNode node);
 static const CBMType *php_substitute_template(CBMArena *arena, const CBMType *t,
@@ -2110,7 +2125,7 @@ static void process_if_statement(PHPLSPContext *ctx, TSNode node) {
 }
 
 /* Walk a subtree, binding scope and resolving calls. */
-static void php_resolve_calls_in_node(PHPLSPContext *ctx, TSNode node) {
+static void php_resolve_calls_in_node_inner(PHPLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return;
     const char *kind = ts_node_type(node);

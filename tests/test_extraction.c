@@ -3112,6 +3112,33 @@ TEST(extract_non_perl_method_call_not_flagged_is_method) {
     PASS();
 }
 
+/* #668: walk_defs used a fixed `walk_defs_frame_t stack[4096]` — a ~160 KB
+ * C-stack frame that overflowed small thread stacks (the reporter's crash was in
+ * the "definitions pass" on a large SQL file), and whose `top < 4096` push guards
+ * SILENTLY DROPPED every top-level definition past 4096. The growable heap stack
+ * fixes both: a file with > 4096 top-level defs must extract ALL of them. RED
+ * before the fix (extracted count capped near 4096), GREEN after. */
+TEST(walk_defs_no_truncation_over_4096_issue668) {
+    enum { N = 5000 };
+    /* N top-level Python defs → N Function defs, all direct module children, so
+     * walk_defs pushes all N children at once — the >4096 truncation site. */
+    size_t cap = (size_t)N * 24 + 1;
+    char *src = (char *)malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t off = 0;
+    for (int i = 0; i < N; i++) {
+        off += (size_t)snprintf(src + off, cap - off, "def f%d(): pass\n", i);
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_PYTHON, "t", "big.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int nfuncs = count_defs_with_label(r, "Function");
+    ASSERT(nfuncs >= N); /* all N present — not truncated at the old 4096 cap */
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Suite
  * ═══════════════════════════════════════════════════════════════════ */
@@ -3354,6 +3381,7 @@ SUITE(extraction) {
     RUN_TEST(complexity_recursion_in_loop_unguarded);
     RUN_TEST(complexity_guarded_recursion);
     RUN_TEST(complexity_access_depth_and_params);
+    RUN_TEST(walk_defs_no_truncation_over_4096_issue668);
 
     cbm_shutdown();
 }

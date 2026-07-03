@@ -516,6 +516,101 @@ TEST(lsp_ts_cyclic_types_no_crash) {
     PASS();
 }
 
+/* ─── Deeply-nested calls drive the per-language LSP resolve walkers into
+ * per-nesting-level native recursion. Unguarded, these SIGSEGV and take down
+ * the whole index. Each walker now has a walk_depth cap (CBM_LSP_MAX_WALK_DEPTH,
+ * env-overridable) that skips the too-deep subtree — graceful degradation.
+ * These mirror lsp_java_deep_nesting_no_crash: same fixture shape, one per
+ * previously-unguarded walker (py_resolve_calls_in, resolve_calls_in_node[go],
+ * php_resolve_calls_in_node, kt_resolve_calls_in_node). RED proof: run the
+ * suite with CBM_LSP_MAX_WALK_DEPTH set huge (disabling only these caps) and
+ * each of these four SIGSEGVs — proving the guard, not the fixture, is what
+ * keeps them green. ─── */
+
+TEST(lsp_python_deep_nesting_no_crash) {
+    /* py_resolve_calls_in recurses per nesting level; see the Java analog. */
+    const int DEPTH = 30000;
+    size_t sz = (size_t)DEPTH * 3 + 256;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *p = src;
+    p += snprintf(p, sz, "def f(a):\n    return a\ndef g():\n    return ");
+    for (int i = 0; i < DEPTH; i++) {
+        *p++ = 'f';
+        *p++ = '(';
+    }
+    *p++ = '1';
+    memset(p, ')', DEPTH);
+    p += DEPTH;
+    snprintf(p, sz - (size_t)(p - src), "\n");
+    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_PYTHON, "deep.py"));
+    free(src);
+    PASS();
+}
+
+TEST(lsp_go_deep_nesting_no_crash) {
+    /* resolve_calls_in_node recurses per nesting level; see the Java analog. */
+    const int DEPTH = 30000;
+    size_t sz = (size_t)DEPTH * 3 + 256;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *p = src;
+    p += snprintf(p, sz, "package p\nfunc f(a int) int { return a }\nfunc g() int { return ");
+    for (int i = 0; i < DEPTH; i++) {
+        *p++ = 'f';
+        *p++ = '(';
+    }
+    *p++ = '1';
+    memset(p, ')', DEPTH);
+    p += DEPTH;
+    snprintf(p, sz - (size_t)(p - src), " }\n");
+    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_GO, "deep.go"));
+    free(src);
+    PASS();
+}
+
+TEST(lsp_php_deep_nesting_no_crash) {
+    /* php_resolve_calls_in_node recurses per nesting level; Java analog. */
+    const int DEPTH = 30000;
+    size_t sz = (size_t)DEPTH * 3 + 256;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *p = src;
+    p += snprintf(p, sz, "<?php\nfunction f($a) { return $a; }\nfunction g() { return ");
+    for (int i = 0; i < DEPTH; i++) {
+        *p++ = 'f';
+        *p++ = '(';
+    }
+    *p++ = '1';
+    memset(p, ')', DEPTH);
+    p += DEPTH;
+    snprintf(p, sz - (size_t)(p - src), "; }\n");
+    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_PHP, "deep.php"));
+    free(src);
+    PASS();
+}
+
+TEST(lsp_kotlin_deep_nesting_no_crash) {
+    /* kt_resolve_calls_in_node recurses per nesting level; Java analog. */
+    const int DEPTH = 30000;
+    size_t sz = (size_t)DEPTH * 3 + 256;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *p = src;
+    p += snprintf(p, sz, "fun f(a: Int): Int { return a }\nfun g(): Int { return ");
+    for (int i = 0; i < DEPTH; i++) {
+        *p++ = 'f';
+        *p++ = '(';
+    }
+    *p++ = '1';
+    memset(p, ')', DEPTH);
+    p += DEPTH;
+    snprintf(p, sz - (size_t)(p - src), " }\n");
+    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_KOTLIN, "deep.kt"));
+    free(src);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Suite registration
  * ═══════════════════════════════════════════════════════════════════ */
@@ -529,6 +624,10 @@ SUITE(stack_overflow) {
     RUN_TEST(lsp_java_lambda_args_exceed_params_no_crash);
     RUN_TEST(lsp_cpp_deep_expression_no_crash);
     RUN_TEST(lsp_ts_cyclic_types_no_crash);
+    RUN_TEST(lsp_python_deep_nesting_no_crash);
+    RUN_TEST(lsp_go_deep_nesting_no_crash);
+    RUN_TEST(lsp_php_deep_nesting_no_crash);
+    RUN_TEST(lsp_kotlin_deep_nesting_no_crash);
 
     RUN_TEST(js_calls_exceed_512);
     RUN_TEST(python_calls_exceed_512);
