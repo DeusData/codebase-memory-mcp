@@ -4926,6 +4926,68 @@ int cbm_store_publish_overlay_file_delta(cbm_store_t *s,
     return CBM_STORE_OK;
 }
 
+int cbm_store_get_overlay_node_view_summary(cbm_store_t *s, const char *project,
+                                            cbm_store_overlay_node_view_summary_t *out) {
+    if (out) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (!s || !s->db || !project || !project[0] || !out) {
+        if (s) {
+            store_set_error(s, "overlay_node_view_summary: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    static const char sql[] =
+        "WITH active_files AS ("
+        "  SELECT t.rel_path, MAX(t.overlay_generation) AS overlay_generation"
+        "  FROM overlay_tombstones t"
+        "  JOIN overlay_generations g"
+        "    ON g.project = t.project AND g.overlay_generation = t.overlay_generation"
+        "  WHERE t.project = ?1 AND g.status = ?2 AND t.entity_kind = ?3 AND t.active = ?4"
+        "  GROUP BY t.rel_path"
+        ")"
+        "SELECT "
+        "  (SELECT COUNT(*) FROM overlay_generations g"
+        "    WHERE g.project = ?1 AND g.status = ?2) AS ready_generations,"
+        "  (SELECT COUNT(*) FROM active_files) AS active_files,"
+        "  (SELECT COUNT(*) FROM nodes n"
+        "    WHERE n.project = ?1"
+        "      AND NOT EXISTS (SELECT 1 FROM active_files af"
+        "                      WHERE af.rel_path = n.file_path)) AS canonical_visible,"
+        "  (SELECT COUNT(*) FROM overlay_nodes n"
+        "    JOIN active_files af"
+        "      ON af.rel_path = n.rel_path AND af.overlay_generation = n.overlay_generation"
+        "    WHERE n.project = ?1 AND n.owned = ?5) AS overlay_visible;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "overlay_node_view_summary prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_3, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    sqlite3_bind_int(stmt, ST_COL_4, STORE_OVERLAY_TOMBSTONE_ACTIVE);
+    sqlite3_bind_int(stmt, ST_COL_5, STORE_OVERLAY_ROW_OWNED);
+
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        store_set_error_sqlite(s, "overlay_node_view_summary");
+        return CBM_STORE_ERR;
+    }
+
+    out->overlay_ready_generations = sqlite3_column_int(stmt, 0);
+    out->active_file_tombstones = sqlite3_column_int(stmt, 1);
+    out->canonical_nodes_visible = sqlite3_column_int(stmt, 2);
+    out->overlay_owned_nodes_visible = sqlite3_column_int(stmt, 3);
+    out->total_nodes_visible = out->canonical_nodes_visible + out->overlay_owned_nodes_visible;
+
+    sqlite3_finalize(stmt);
+    return CBM_STORE_OK;
+}
+
 static bool store_file_delta_batch_shape_valid(const cbm_store_file_delta_t *const *deltas,
                                                int delta_count, const char **out_project,
                                                int64_t *out_generation) {

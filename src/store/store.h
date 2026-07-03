@@ -669,6 +669,20 @@ int cbm_store_publish_overlay_file_delta(cbm_store_t *s,
                                          const cbm_store_file_delta_t *delta,
                                          int64_t overlay_generation);
 
+typedef struct {
+    int overlay_ready_generations;
+    int active_file_tombstones;
+    int canonical_nodes_visible;
+    int overlay_owned_nodes_visible;
+    int total_nodes_visible;
+} cbm_store_overlay_node_view_summary_t;
+
+/* Summarize the current node read view as canonical nodes minus files with a
+ * ready overlay tombstone plus owned nodes from the latest ready overlay per file.
+ * This is a read-only helper; it does not change canonical query behavior. */
+int cbm_store_get_overlay_node_view_summary(cbm_store_t *s, const char *project,
+                                            cbm_store_overlay_node_view_summary_t *out);
+
 /* Record derived-view freshness. Status must be one of CBM_STORE_DERIVED_STATUS_*. */
 int cbm_store_set_derived_view_state(cbm_store_t *s, const char *project,
                                      const char *view_name, int64_t generation,
