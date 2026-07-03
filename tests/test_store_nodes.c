@@ -72,6 +72,31 @@ static int store_count_index_generation(cbm_store_t *s, const char *project, int
     return count;
 }
 
+static int store_count_overlay_generation_row(cbm_store_t *s, const char *project,
+                                              int64_t overlay_generation,
+                                              int64_t base_generation, const char *status) {
+    sqlite3_stmt *stmt = NULL;
+    int count = CBM_STORE_ERR;
+    sqlite3 *db = cbm_store_get_db(s);
+    const char *sql = "SELECT COUNT(*) FROM overlay_generations "
+                      "WHERE project = ?1 AND overlay_generation = ?2 "
+                      "AND base_generation = ?3 AND status = ?4 "
+                      "AND created_at <> '' AND updated_at <> ''";
+    if (!db || sqlite3_prepare_v2(db, sql, STORE_TEST_SQLITE_AUTO_LEN, &stmt, NULL) !=
+                   SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_bind_text(stmt, 1, project, STORE_TEST_SQLITE_AUTO_LEN, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 2, overlay_generation);
+    sqlite3_bind_int64(stmt, 3, base_generation);
+    sqlite3_bind_text(stmt, 4, status, STORE_TEST_SQLITE_AUTO_LEN, SQLITE_STATIC);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
 static int store_count_metadata_owners(cbm_store_t *s, int edge, const char *project,
                                        const char *rel_path) {
     sqlite3_stmt *stmt = NULL;
@@ -193,13 +218,13 @@ TEST(store_open_memory_twice) {
 TEST(store_exact_delta_metadata_schema) {
     static const char *tables[] = {
         "index_generations", "file_state",       "node_owners",        "edge_owners",
-        "symbol_exports",   "import_refs",      "derived_view_state",
+        "symbol_exports",   "import_refs",      "derived_view_state",  "overlay_generations",
     };
     static const char *indexes[] = {
         "idx_file_state_hash",       "idx_node_owners_path",      "idx_node_owners_node_id",
         "idx_edge_owners_path",      "idx_edge_owners_edge_id",   "idx_symbol_exports_path",
         "idx_symbol_exports_node_id", "idx_import_refs_target",
-        "idx_derived_view_state_status",
+        "idx_derived_view_state_status", "idx_overlay_generations_status",
     };
 
     cbm_store_t *s = cbm_store_open_memory();
@@ -994,6 +1019,87 @@ TEST(store_index_generation_finish_failed_and_invalid_status) {
                                            CBM_STORE_INDEX_STATUS_FAILED, "", "",
                                            STORE_TEST_COMPLETED_SET),
               1);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_overlay_generation_reservation_status_and_counts) {
+    enum { FIRST_OVERLAY = 1, SECOND_OVERLAY = 2, BASE_GENERATION = 9 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION,
+                                                   &overlay_generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(overlay_generation, FIRST_OVERLAY);
+    ASSERT_EQ(store_count_overlay_generation_row(s, "test", FIRST_OVERLAY, BASE_GENERATION,
+                                                 CBM_STORE_OVERLAY_STATUS_RESERVED),
+              1);
+
+    int count = -1;
+    ASSERT_EQ(cbm_store_count_overlay_generations(s, "test", NULL, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(cbm_store_count_overlay_generations(s, "test",
+                                                  CBM_STORE_OVERLAY_STATUS_RESERVED, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+
+    ASSERT_EQ(cbm_store_set_overlay_generation_status(s, "test", overlay_generation,
+                                                      CBM_STORE_OVERLAY_STATUS_READY),
+              CBM_STORE_OK);
+    ASSERT_EQ(store_count_overlay_generation_row(s, "test", FIRST_OVERLAY, BASE_GENERATION,
+                                                 CBM_STORE_OVERLAY_STATUS_READY),
+              1);
+    ASSERT_EQ(cbm_store_count_overlay_generations(s, "test",
+                                                  CBM_STORE_OVERLAY_STATUS_RESERVED, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(cbm_store_count_overlay_generations(s, "test", CBM_STORE_OVERLAY_STATUS_READY,
+                                                  &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION,
+                                                   &overlay_generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(overlay_generation, SECOND_OVERLAY);
+    ASSERT_EQ(cbm_store_count_overlay_generations(s, "test", NULL, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_overlay_generation_rejects_invalid_inputs) {
+    enum { SENTINEL_GENERATION = 42 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t overlay_generation = SENTINEL_GENERATION;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "missing", 0, &overlay_generation),
+              CBM_STORE_ERR);
+    ASSERT_EQ(overlay_generation, 0);
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", -1, &overlay_generation),
+              CBM_STORE_ERR);
+    ASSERT_EQ(overlay_generation, 0);
+
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", 0, &overlay_generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_set_overlay_generation_status(s, "test", overlay_generation,
+                                                      "almost_ready"),
+              CBM_STORE_ERR);
+    ASSERT_EQ(cbm_store_set_overlay_generation_status(s, "test", overlay_generation + 1,
+                                                      CBM_STORE_OVERLAY_STATUS_READY),
+              CBM_STORE_NOT_FOUND);
+
+    int count = SENTINEL_GENERATION;
+    ASSERT_EQ(cbm_store_count_overlay_generations(s, "test", "almost_ready", &count),
+              CBM_STORE_ERR);
+    ASSERT_EQ(count, 0);
 
     cbm_store_close(s);
     PASS();
@@ -3729,6 +3835,8 @@ SUITE(store_nodes) {
     RUN_TEST(store_index_generation_reservation_requires_project);
     RUN_TEST(store_index_generation_finish_complete);
     RUN_TEST(store_index_generation_finish_failed_and_invalid_status);
+    RUN_TEST(store_overlay_generation_reservation_status_and_counts);
+    RUN_TEST(store_overlay_generation_rejects_invalid_inputs);
     RUN_TEST(store_owner_metadata_crud);
     RUN_TEST(store_rebuild_file_delta_owners_derives_from_graph);
     RUN_TEST(store_import_export_metadata_crud);

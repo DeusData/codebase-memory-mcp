@@ -481,6 +481,16 @@ static int init_schema(cbm_store_t *s) {
         "  status TEXT NOT NULL DEFAULT '" CBM_STORE_INDEX_STATUS_COMPLETE "',"
         "  PRIMARY KEY (project, generation)"
         ");"
+        "CREATE TABLE IF NOT EXISTS overlay_generations ("
+        "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+        "  overlay_generation INTEGER NOT NULL,"
+        "  base_generation INTEGER NOT NULL DEFAULT 0,"
+        "  created_at TEXT NOT NULL,"
+        "  updated_at TEXT NOT NULL,"
+        "  status TEXT NOT NULL DEFAULT '" CBM_STORE_OVERLAY_STATUS_RESERVED "',"
+        "  error TEXT DEFAULT '',"
+        "  PRIMARY KEY (project, overlay_generation)"
+        ");"
         "CREATE TABLE IF NOT EXISTS file_state ("
         "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
         "  rel_path TEXT NOT NULL,"
@@ -602,7 +612,9 @@ static int create_user_indexes(cbm_store_t *s) {
         "CREATE INDEX IF NOT EXISTS idx_derived_view_state_status"
         "  ON derived_view_state(project, status);"
         "CREATE INDEX IF NOT EXISTS idx_dirty_files_status"
-        "  ON dirty_files(project, status);";
+        "  ON dirty_files(project, status);"
+        "CREATE INDEX IF NOT EXISTS idx_overlay_generations_status"
+        "  ON overlay_generations(project, status, overlay_generation);";
     /* NOTE: a partial expression index on json_extract(properties,'$.is_entry_point')
      * was tried for arch_entry_points and REVERTED: json_extract in an index WHERE
      * aborts CREATE INDEX (and thus store open) on any row whose properties JSON is
@@ -3530,6 +3542,177 @@ int cbm_store_finish_index_generation(cbm_store_t *s, const char *project, int64
         return rc;
     }
     return CBM_STORE_OK;
+}
+
+static bool store_overlay_generation_status_valid(const char *status) {
+    return status && (strcmp(status, CBM_STORE_OVERLAY_STATUS_RESERVED) == 0 ||
+                      strcmp(status, CBM_STORE_OVERLAY_STATUS_READY) == 0 ||
+                      strcmp(status, CBM_STORE_OVERLAY_STATUS_COMPACTING) == 0 ||
+                      strcmp(status, CBM_STORE_OVERLAY_STATUS_COMPACTED) == 0 ||
+                      strcmp(status, CBM_STORE_OVERLAY_STATUS_FAILED) == 0);
+}
+
+int cbm_store_reserve_overlay_generation(cbm_store_t *s, const char *project,
+                                         int64_t base_generation,
+                                         int64_t *out_overlay_generation) {
+    if (out_overlay_generation) {
+        *out_overlay_generation = 0;
+    }
+    if (!s || !s->db || !project || !project[0] || base_generation < 0 ||
+        !out_overlay_generation) {
+        if (s) {
+            store_set_error(s, "reserve_overlay_generation: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    int rc = cbm_store_begin(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    int64_t overlay_generation = 0;
+    sqlite3_stmt *stmt = NULL;
+    const char *select_sql =
+        "SELECT COALESCE(MAX(overlay_generation), 0) + 1 "
+        "FROM overlay_generations WHERE project = ?1;";
+    if (sqlite3_prepare_v2(s->db, select_sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "reserve_overlay_generation select prepare");
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        overlay_generation = sqlite3_column_int64(stmt, 0);
+    } else {
+        sqlite3_finalize(stmt);
+        store_set_error_sqlite(s, "reserve_overlay_generation select");
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+
+    const char *insert_sql =
+        "INSERT INTO overlay_generations (project, overlay_generation, base_generation, "
+        "created_at, updated_at, status, error) VALUES (?1, ?2, ?3, ?4, ?4, ?5, '');";
+    if (sqlite3_prepare_v2(s->db, insert_sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "reserve_overlay_generation insert prepare");
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+
+    char ts[CBM_SZ_64];
+    iso_now(ts, sizeof(ts));
+    bind_text(stmt, ST_COL_1, project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    sqlite3_bind_int64(stmt, ST_COL_3, base_generation);
+    bind_text(stmt, ST_COL_4, ts);
+    bind_text(stmt, ST_COL_5, CBM_STORE_OVERLAY_STATUS_RESERVED);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "reserve_overlay_generation insert");
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+
+    rc = cbm_store_commit(s);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+
+    *out_overlay_generation = overlay_generation;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_set_overlay_generation_status(cbm_store_t *s, const char *project,
+                                            int64_t overlay_generation,
+                                            const char *status) {
+    if (!s || !s->db || !project || !project[0] || overlay_generation <= 0 ||
+        !store_overlay_generation_status_valid(status)) {
+        if (s) {
+            store_set_error(s, "set_overlay_generation_status: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    int rc = cbm_store_begin(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "UPDATE overlay_generations SET status = ?3, updated_at = ?4 "
+                      "WHERE project = ?1 AND overlay_generation = ?2;";
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "set_overlay_generation_status prepare");
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+    char ts[CBM_SZ_64];
+    iso_now(ts, sizeof(ts));
+    bind_text(stmt, ST_COL_1, project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    bind_text(stmt, ST_COL_3, status);
+    bind_text(stmt, ST_COL_4, ts);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "set_overlay_generation_status");
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+    if (sqlite3_changes(s->db) != 1) {
+        store_set_error(s, "set_overlay_generation_status: generation not found");
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_NOT_FOUND;
+    }
+
+    rc = cbm_store_commit(s);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_count_overlay_generations(cbm_store_t *s, const char *project,
+                                        const char *status, int *out_count) {
+    if (out_count) {
+        *out_count = 0;
+    }
+    if (!s || !s->db || !project || !project[0] || !out_count ||
+        (status && !store_overlay_generation_status_valid(status))) {
+        if (s) {
+            store_set_error(s, "count_overlay_generations: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT COUNT(*) FROM overlay_generations "
+                      "WHERE project = ?1 AND (?2 IS NULL OR status = ?2);";
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "count_overlay_generations prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    if (status) {
+        bind_text(stmt, ST_COL_2, status);
+    } else {
+        sqlite3_bind_null(stmt, ST_COL_2);
+    }
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        *out_count = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+        return CBM_STORE_OK;
+    }
+    sqlite3_finalize(stmt);
+    store_set_error_sqlite(s, "count_overlay_generations");
+    return CBM_STORE_ERR;
 }
 
 static int store_resolve_node_id(cbm_store_t *s, const char *project, const char *qn,
